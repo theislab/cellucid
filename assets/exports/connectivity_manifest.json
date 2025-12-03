@@ -1,0 +1,1 @@
+{"n_points": 162259, "n_edges": 10537096, "nnz": 21074192, "format": "csr", "indptrPath": "connectivity/indptr.u32.gz", "indicesPath": "connectivity/indices.u32.gz", "dtype": "uint32", "compression": 6}
