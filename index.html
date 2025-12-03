@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>cellucid</title>
+
+  <!-- Favicons -->
+  <link rel="icon" type="image/svg+xml" href="assets/img/favicon.svg" />
+  <link rel="icon" type="image/png" sizes="32x32" href="assets/img/favicon-32x32.png" />
+  <link rel="icon" type="image/png" sizes="16x16" href="assets/img/favicon-16x16.png" />
+  <link rel="apple-touch-icon" sizes="180x180" href="assets/img/apple-touch-icon.png" />
+  <link rel="manifest" href="site.webmanifest" />
+  <meta name="theme-color" content="#ffffff" />
+
+  <!-- Newspaper-style font stack (no behavior change, just design) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=Merriweather:wght@300;400;700&family=Oswald:wght@400;500;600&family=Inter:wght@400;500;600&family=Fira+Code:wght@400;500&display=swap"
+    rel="stylesheet"
+  >
+
+  <link rel="stylesheet" href="assets/css/style.css" />
+</head>
+<body>
+  <canvas id="glcanvas"></canvas>
+
+  <!-- Sidebar toggle button -->
+  <button id="sidebar-toggle" class="sidebar-open" title="Toggle sidebar">✕</button>
+
+  <div id="sidebar">
+    <div class="sidebar-brand" aria-label="cellucid">
+      <img src="assets/img/cellucid-logo.svg" alt="cellucid logo" class="sidebar-logo" />
+    </div>
+
+    <div class="accordion">
+      <details class="accordion-section" open>
+        <summary>Visualization</summary>
+        <div class="accordion-content">
+          <!-- Background -->
+          <div class="control-block">
+            <label for="background-select">Background:</label>
+            <select id="background-select">
+              <option value="white">White (paper)</option>
+              <option value="grid" selected>Grid (3D axes)</option>
+              <option value="light">Light grey</option>
+              <option value="dark">Dark slate</option>
+              <option value="black">Black</option>
+            </select>
+          </div>
+
+          <!-- Render mode -->
+          <div class="control-block">
+            <label for="render-mode">Render mode:</label>
+            <select id="render-mode" class="obs-select">
+              <option value="points">Points</option>
+              <option value="smoke">Volumetric smoke cloud</option>
+            </select>
+          </div>
+
+          <!-- Point rendering controls (points mode only) -->
+          <div id="points-controls" class="visible">
+            <div class="control-block">
+              <label for="point-size">Point size (log):</label>
+              <div class="slider-row">
+                <input id="point-size" type="range" min="0" max="100" step="1" value="30" />
+                <span id="point-size-display" class="slider-value">5.0</span>
+              </div>
+            </div>
+
+            <!-- KNN Connectivity Section -->
+            <div class="control-block" id="connectivity-controls" style="display: none;">
+              <div class="section-divider">
+                <div class="section-title">KNN Connectivity</div>
+              </div>
+
+              <div class="legend-help" style="margin-bottom:6px;">
+                Shows edges between visible cells only.
+              </div>
+
+              <label class="checkbox-inline">
+                <input type="checkbox" id="toggle-connectivity" />
+                Show connectivity edges
+              </label>
+
+              <div id="connectivity-sliders" style="display: none;">
+                <div class="control-block" style="margin-top:6px;">
+                  <label for="connectivity-color">Edge color:</label>
+                  <input type="color" id="connectivity-color" value="#4a4a4a" style="width:50px;height:24px;border:none;cursor:pointer;" />
+                </div>
+
+                <div class="control-block" style="margin-top:6px;">
+                  <label for="connectivity-alpha">Edge opacity:</label>
+                  <div class="slider-row">
+                    <input id="connectivity-alpha" type="range" min="1" max="100" step="1" value="15" />
+                    <span id="connectivity-alpha-display" class="slider-value">0.15</span>
+                  </div>
+                </div>
+
+                <div class="control-block" style="margin-top:6px;">
+                  <label for="connectivity-width">Line width:</label>
+                  <div class="slider-row">
+                    <input id="connectivity-width" type="range" min="1" max="50" step="1" value="10" />
+                    <span id="connectivity-width-display" class="slider-value">1.0</span>
+                  </div>
+                </div>
+
+                <div class="control-block" style="margin-top:6px;">
+                  <label for="connectivity-limit">Max edges:</label>
+                  <div class="slider-row">
+                    <input id="connectivity-limit" type="range" min="1000" max="1000000" step="1000" value="100000" />
+                    <span id="connectivity-limit-display" class="slider-value">100k</span>
+                  </div>
+                </div>
+              </div>
+
+              <div id="connectivity-info" class="legend-help" style="margin-top:4px;"></div>
+            </div>
+          </div>
+
+          <!-- Depth Perception controls -->
+          <div class="control-block" id="depth-controls">
+            <div class="section-title">Depth perception</div>
+            <div class="legend-help">
+              Visual cues for 3D depth and spatial awareness.
+            </div>
+
+            <div class="control-block" style="margin-top:6px;">
+              <label for="lighting-strength">3D lighting:</label>
+              <div class="slider-row">
+                <input id="lighting-strength" type="range" min="0" max="100" step="1" value="60" />
+                <span id="lighting-strength-display" class="slider-value">60</span>
+              </div>
+            </div>
+
+            <div class="control-block" style="margin-top:6px;">
+              <label for="fog-density">Atmospheric fog:</label>
+              <div class="slider-row">
+                <input id="fog-density" type="range" min="0" max="100" step="1" value="50" />
+                <span id="fog-density-display" class="slider-value">50</span>
+              </div>
+            </div>
+
+            <div class="control-block" style="margin-top:6px;">
+              <label for="size-attenuation">Perspective size scaling:</label>
+              <div class="slider-row">
+                <input id="size-attenuation" type="range" min="0" max="100" step="1" value="0" />
+                <span id="size-attenuation-display" class="slider-value">0</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Renderer Settings -->
+          <div class="control-block" id="renderer-controls">
+            <div class="section-title">Renderer settings</div>
+            <div class="legend-help">
+              WebGL2 high-performance rendering options.
+            </div>
+
+            <div class="control-block" style="margin-top:6px;">
+              <label for="hp-shader-quality">Shader quality:</label>
+              <select id="hp-shader-quality" class="obs-select">
+                <option value="full">Full (lighting + fog)</option>
+                <option value="light">Light (circular, no lighting)</option>
+                <option value="ultralight">Ultra-light (square points)</option>
+              </select>
+            </div>
+
+            <div class="control-block" style="margin-top:6px;">
+              <label class="checkbox-inline">
+                <input type="checkbox" id="hp-lod-enabled" checked />
+                Level-of-Detail (Octree LOD)
+              </label>
+            </div>
+
+            <div class="control-block" style="margin-top:6px;">
+              <label class="checkbox-inline">
+                <input type="checkbox" id="hp-frustum-culling" />
+                Frustum culling (experimental)
+              </label>
+            </div>
+          </div>
+
+          <!-- Volumetric smoke controls -->
+          <div class="control-block" id="smoke-controls">
+            <div class="section-title">Volumetric smoke</div>
+            <div class="legend-help">
+              Adjust settings for realistic cloud appearance.
+            </div>
+
+            <div class="field-select" style="margin-top:4px;">
+              <label for="smoke-grid">Density grid resolution:</label>
+              <select id="smoke-grid" class="obs-select">
+                <option value="32">32³ (fast, low detail)</option>
+                <option value="48">48³ (balanced)</option>
+                <option value="64">64³ (detailed)</option>
+                <option value="96">96³ (high detail)</option>
+                <option value="128" selected>128³ (very high)</option>
+                <option value="256">256³ (ultra)</option>
+                <option value="512">512³ (extreme)</option>
+                <option value="1024">1024³ (benchmark)</option>
+              </select>
+            </div>
+
+            <div class="control-block" style="margin-top:6px;">
+              <label for="smoke-steps">Ray quality (GPU cost):</label>
+              <div class="slider-row">
+                <input id="smoke-steps" type="range" min="0" max="100" step="1" value="60" />
+                <span id="smoke-steps-display" class="slider-value">Balanced</span>
+              </div>
+            </div>
+
+            <div class="control-block" style="margin-top:6px;">
+              <label for="smoke-density">Cloud density:</label>
+              <div class="slider-row">
+                <input id="smoke-density" type="range" min="0" max="100" step="1" value="50" />
+                <span id="smoke-density-display" class="slider-value">2.2</span>
+              </div>
+            </div>
+
+            <div class="control-block" style="margin-top:6px;">
+              <label for="smoke-speed">Animation speed:</label>
+              <div class="slider-row">
+                <input id="smoke-speed" type="range" min="0" max="100" step="1" value="80" />
+                <span id="smoke-speed-display" class="slider-value">2.00</span>
+              </div>
+            </div>
+
+            <div class="control-block" style="margin-top:6px;">
+              <label for="smoke-detail">Close-up detail:</label>
+              <div class="slider-row">
+                <input id="smoke-detail" type="range" min="0" max="100" step="1" value="60" />
+                <span id="smoke-detail-display" class="slider-value">3.0</span>
+              </div>
+            </div>
+
+            <div class="control-block" style="margin-top:6px;">
+              <label for="smoke-warp">Turbulence:</label>
+              <div class="slider-row">
+                <input id="smoke-warp" type="range" min="0" max="100" step="1" value="5" />
+                <span id="smoke-warp-display" class="slider-value">0.05</span>
+              </div>
+            </div>
+
+            <div class="control-block" style="margin-top:6px;">
+              <label for="smoke-absorption">Light absorption:</label>
+              <div class="slider-row">
+                <input id="smoke-absorption" type="range" min="0" max="100" step="1" value="50" />
+                <span id="smoke-absorption-display" class="slider-value">1.0</span>
+              </div>
+            </div>
+
+            <div class="control-block" style="margin-top:6px;">
+              <label for="smoke-scatter">Light scattering:</label>
+              <div class="slider-row">
+                <input id="smoke-scatter" type="range" min="0" max="100" step="1" value="0" />
+                <span id="smoke-scatter-display" class="slider-value">0.2</span>
+              </div>
+            </div>
+
+            <div class="control-block" style="margin-top:6px;">
+              <label for="smoke-edge">Edge softness:</label>
+              <div class="slider-row">
+                <input id="smoke-edge" type="range" min="0" max="100" step="1" value="50" />
+                <span id="smoke-edge-display" class="slider-value">1.0</span>
+              </div>
+            </div>
+
+            <div class="control-block" style="margin-top:4px;">
+              <label class="checkbox-inline">
+                <input type="checkbox" id="smoke-half-res" checked />
+                Half-resolution (smoother, faster)
+              </label>
+            </div>
+
+            <div class="control-block" style="margin-top:6px;">
+              <button id="smoke-rebuild-btn" class="reset-btn">
+                Rebuild smoke density
+              </button>
+              <div id="smoke-rebuild-hint" class="legend-help">
+                Smoke density is up to date for current filters.
+              </div>
+            </div>
+          </div>
+
+          <!-- Reset Camera -->
+          <div class="control-block">
+            <button id="reset-camera-btn" class="reset-btn">Reset Camera</button>
+          </div>
+        </div>
+      </details>
+
+      <details class="accordion-section" open>
+        <summary>Compare Views</summary>
+        <div class="accordion-content">
+          <div class="control-block" id="split-view-controls">
+            <div class="section-divider">
+              <div class="section-title">Compare views</div>
+            </div>
+
+            <div class="legend-help" style="margin-bottom: 6px;">
+              Keep snapshots to compare UMAP tweaks. Switch to a single view to edit settings.
+            </div>
+
+            <div class="split-view-row">
+              <button
+                id="split-keep-view-btn"
+                class="reset-btn"
+                title="Freeze current coloring & filters as a new panel"
+              >
+                Keep view
+              </button>
+              <button
+                id="split-clear-btn"
+                class="reset-btn"
+                title="Remove all kept views"
+              >
+                Clear
+              </button>
+            </div>
+
+            <div class="control-block" style="margin-top:10px;">
+              <label for="view-layout-mode">Layout:</label>
+              <select id="view-layout-mode" class="obs-select">
+                <option value="grid">Grid compare</option>
+                <option value="single">Edit selected view</option>
+              </select>
+            </div>
+
+            <div class="control-block">
+              <label for="active-view-select">Active view:</label>
+              <select id="active-view-select" class="obs-select">
+                <option value="live">Live view</option>
+              </select>
+            </div>
+
+            <div id="split-view-badges" class="split-view-badges">
+              <div class="filter-info">
+                No kept views yet. Configure a view and press “Keep view”.
+              </div>
+            </div>
+
+            <div class="split-view-hint legend-help">
+              Small multiples are available in Points mode only.
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <details class="accordion-section" open>
+        <summary>Filtering</summary>
+        <div class="accordion-content">
+          <!-- Color by obs -->
+          <div class="control-block">
+            <div class="field-select">
+              <label for="categorical-field">Categorical obs:</label>
+              <select id="categorical-field" class="obs-select"></select>
+            </div>
+            <div class="field-select">
+              <label for="continuous-field">Continuous obs:</label>
+              <select id="continuous-field" class="obs-select"></select>
+            </div>
+          </div>
+
+          <!-- Gene Expression Dropdown with Search -->
+          <div class="control-block" id="gene-expression-container">
+            <div class="field-select">
+              <label for="gene-expression-search">Gene Expression:</label>
+              <div class="searchable-dropdown">
+                <input 
+                  type="text" 
+                  id="gene-expression-search" 
+                  class="search-input" 
+                  placeholder="Search genes..."
+                  autocomplete="off"
+                />
+                <div id="gene-expression-dropdown" class="dropdown-list"></div>
+                <div id="gene-expression-selected" class="selected-gene"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Outlier Filter (only shown for categorical fields) -->
+          <div class="control-block" id="outlier-filter-container">
+            <label for="outlier-filter">Outlier filter (latent space):</label>
+            <div class="slider-row">
+              <input id="outlier-filter" type="range" min="0" max="100" step="1" value="100" />
+              <span id="outlier-filter-display" class="slider-value">100%</span>
+            </div>
+          </div>
+
+          <!-- Centroid controls (categorical fields only) -->
+          <div class="control-block" id="centroid-controls">
+            <label class="checkbox-inline">
+              <input type="checkbox" id="toggle-centroid-points" />
+              Show centroids
+            </label>
+            <label class="checkbox-inline">
+              <input type="checkbox" id="toggle-centroid-labels" />
+              Labels
+            </label>
+          </div>
+
+          <!-- Legend / category controls -->
+          <div id="legend"></div>
+        </div>
+      </details>
+
+      <details class="accordion-section" open>
+        <summary>Active Filters</summary>
+        <div class="accordion-content">
+          <div id="filter-count" class="filter-info">Showing all points</div>
+          <div id="active-filters" class="filter-info-block">
+            <div class="filter-info">No filters active (showing all points).</div>
+          </div>
+        </div>
+      </details>
+
+      <details class="accordion-section">
+        <summary>Performance Benchmark</summary>
+        <div class="accordion-content">
+          <div class="legend-help" style="margin-bottom:10px;">
+            Test rendering limits with synthetic data (5-10M+ points).
+          </div>
+
+          <!-- Quick presets -->
+          <div class="control-block">
+            <label>Quick test:</label>
+            <div class="benchmark-presets" style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;margin-top:4px;">
+              <button class="btn-small benchmark-preset" data-count="100000">100K</button>
+              <button class="btn-small benchmark-preset" data-count="500000">500K</button>
+              <button class="btn-small benchmark-preset" data-count="1000000">1M</button>
+              <button class="btn-small benchmark-preset" data-count="2000000">2M</button>
+              <button class="btn-small benchmark-preset" data-count="5000000">5M</button>
+              <button class="btn-small benchmark-preset" data-count="10000000">10M</button>
+            </div>
+          </div>
+
+          <!-- Custom count -->
+          <div class="control-block" style="margin-top:8px;">
+            <label for="benchmark-count">Custom point count:</label>
+            <input type="number" id="benchmark-count" value="1000000" min="1000" max="50000000" step="100000" class="obs-select" style="width:120px;padding:5px 8px;" />
+          </div>
+
+          <!-- Pattern selection -->
+          <div class="control-block" style="margin-top:8px;">
+            <label for="benchmark-pattern">Data pattern:</label>
+            <select id="benchmark-pattern" class="obs-select">
+              <option value="glb" selected>3D Model Surface</option>
+              <option value="clusters">Gaussian Clusters (100-200)</option>
+              <option value="uniform">Uniform Random</option>
+              <option value="octopus">Octopus (3D Tentacles)</option>
+              <option value="spirals">3D Spirals</option>
+              <option value="flatumap">2D UMAP (Flat)</option>
+            </select>
+          </div>
+
+          <!-- Run button -->
+          <div class="control-block" style="margin-top:10px;">
+            <button id="benchmark-run" class="btn-small" style="width:100%;padding:8px;background:#4f8cff;color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600;">
+              ▶ Load Synthetic Data
+            </button>
+          </div>
+
+          <!-- Stats display -->
+          <div id="benchmark-stats" style="margin-top:12px;padding:12px;background:#f8f9fa;border:1px solid #e5e7eb;border-radius:0;box-shadow:2px 2px 0 rgba(0,0,0,0.08);font-family:'Fira Code',monospace;font-size:11px;display:none;">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px 16px;">
+              <div>
+                <div style="color:#666;font-size:9px;text-transform:uppercase;letter-spacing:0.5px;">Points</div>
+                <div id="bench-points" style="font-size:18px;font-weight:700;color:#111;">-</div>
+              </div>
+              <div>
+                <div style="color:#666;font-size:9px;text-transform:uppercase;letter-spacing:0.5px;">FPS</div>
+                <div id="bench-fps" style="font-size:18px;font-weight:700;color:#22c55e;">-</div>
+              </div>
+              <div>
+                <div style="color:#666;font-size:9px;text-transform:uppercase;letter-spacing:0.5px;">Frame Time</div>
+                <div id="bench-frametime" style="font-size:13px;color:#333;">-</div>
+              </div>
+              <div>
+                <div style="color:#666;font-size:9px;text-transform:uppercase;letter-spacing:0.5px;">GPU Memory</div>
+                <div id="bench-memory" style="font-size:13px;color:#333;">-</div>
+              </div>
+              <div>
+                <div style="color:#666;font-size:9px;text-transform:uppercase;letter-spacing:0.5px;">LOD Level</div>
+                <div id="bench-lod" style="font-size:13px;color:#333;">-</div>
+              </div>
+              <div>
+                <div style="color:#666;font-size:9px;text-transform:uppercase;letter-spacing:0.5px;">Visible Points</div>
+                <div id="bench-visible" style="font-size:13px;color:#333;">-</div>
+              </div>
+            </div>
+            <!-- Detailed timing stats -->
+            <div id="bench-timing-details" style="margin-top:10px;padding-top:8px;border-top:1px solid #e5e7eb;display:none;">
+              <div style="color:#666;font-size:9px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">Timing Details</div>
+              <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;font-size:10px;">
+                <div><span style="color:#888;">min:</span> <span id="bench-min-ft">-</span></div>
+                <div><span style="color:#888;">p95:</span> <span id="bench-p95-ft">-</span></div>
+                <div><span style="color:#888;">max:</span> <span id="bench-max-ft">-</span></div>
+              </div>
+            </div>
+            <!-- Data generation info -->
+            <div id="bench-gen-info" style="margin-top:8px;font-size:10px;color:#666;display:none;">
+              Generated in <span id="bench-gen-time">-</span>ms
+            </div>
+          </div>
+
+          <div class="legend-help" style="margin-top:8px;">
+            <strong>Tips:</strong> Adjust renderer settings in Visualization section.
+            Reload page to restore original data.
+          </div>
+        </div>
+      </details>
+    </div>
+
+    <div id="stats" class="sr-only">Loading data…</div>
+    <div id="hint" class="sr-only">🖱️ Drag to rotate • Scroll to zoom</div>
+
+    <div id="copyright">
+      © Kemal Inecik · <a href="https://kemalinecik.com" target="_blank" rel="noopener noreferrer">kemalinecik.com</a>
+    </div>
+  </div>
+
+  <!-- HTML layer for centroid labels -->
+  <div id="label-layer"></div>
+  <!-- Titles for small multiple viewports -->
+  <div id="view-title-layer"></div>
+
+  <!-- glMatrix for matrix math -->
+  <script src="https://cdn.jsdelivr.net/npm/gl-matrix@3.4.3/gl-matrix-min.js"></script>
+  <script type="module" src="assets/js/main.js"></script>
+</body>
+</html>

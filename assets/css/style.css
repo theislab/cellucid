@@ -1,0 +1,1211 @@
+/* ========================================================================
+   Global layout & base styles
+   ===================================================================== */
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #ffffff;
+  font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #222;
+}
+
+/* Canvas (scene) */
+#glcanvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: grab;
+}
+
+#glcanvas.dragging {
+  cursor: grabbing;
+}
+
+/* ========================================================================
+   Sidebar – newspaper-inspired, but with pure white background
+   ===================================================================== */
+
+/* Design tokens for the viewer (neutral, no yellow tint) */
+:root {
+  --viewer-paper: #ffffff;
+  --viewer-ink: #111827;
+  --viewer-ink-soft: #4b5563;
+  --viewer-ink-muted: #9ca3af;
+  --viewer-border-strong: 1px solid #111827;
+  --viewer-border-soft: 1px solid #d4d4d4;
+  --viewer-shadow: 4px 4px 0 rgba(0, 0, 0, 0.08);
+  --viewer-radius-card: 6px;
+  --viewer-radius-pill: 999px;
+  --viewer-accent: #111827;
+  --viewer-accent-soft: #374151;
+  --viewer-accent-light: #e5e7eb;
+}
+
+/* Sidebar container: fixed paper column */
+#sidebar {
+  position: fixed;
+  top: 10px;
+  left: 10px;
+  bottom: 10px;
+  width: 260px;
+  background-color: var(--viewer-paper);
+  /* Subtle horizontal rules to suggest paper */
+  background-image: linear-gradient(
+    to bottom,
+    rgba(15, 23, 42, 0.04) 1px,
+    transparent 1px
+  );
+  background-size: 100% 26px;
+  border: var(--viewer-border-strong);
+  border-radius: 0;
+  box-shadow: var(--viewer-shadow);
+  padding: 14px 16px 12px;
+  font-size: 13px;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+  max-height: calc(100vh - 20px);
+  transition: transform 0.3s ease, opacity 0.3s ease;
+}
+
+#sidebar.hidden {
+  transform: translateX(-280px);
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Sidebar toggle tab */
+#sidebar-toggle {
+  position: fixed;
+  top: 10px;
+  left: 10px;
+  width: 38px;
+  height: 34px;
+  background: #ffffff;
+  border: 1px solid #111827;
+  border-radius: 0 var(--viewer-radius-pill) var(--viewer-radius-pill) 0;
+  box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.18);
+  cursor: pointer;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  color: #111827;
+  transition: left 0.3s ease, background 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+}
+
+#sidebar-toggle:hover {
+  background: #f3f4f6;
+  transform: translateY(1px);
+  box-shadow: 1px 1px 0 rgba(0, 0, 0, 0.2);
+}
+
+#sidebar-toggle.sidebar-open {
+  left: calc(10px + 260px + 33px);
+}
+
+/* Masthead style for the logo */
+.sidebar-brand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 6px 8px;
+  margin: 0 0 6px;
+  border-bottom: var(--viewer-border-soft);
+  background: #ffffff;
+}
+
+.sidebar-logo {
+  width: 100%;
+  max-width: 220px;
+  height: auto;
+  display: block;
+}
+
+/* Typography inside sidebar */
+#sidebar h1 {
+  font-size: 16px;
+  margin: 0 0 6px;
+  letter-spacing: 0.3px;
+}
+
+/* Labels = mini newspaper sub-headings */
+#sidebar label {
+  display: inline-block;
+  font-family: "Oswald", system-ui, sans-serif;
+  font-weight: 500;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--viewer-ink-soft);
+}
+
+/* Inline checkbox label utility (for centroid / smoke) */
+.checkbox-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--viewer-ink-soft);
+}
+
+/* Simple field layout */
+.field-select {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.field-select + .field-select {
+  margin-top: 6px;
+}
+
+/* Selects – same paper box style everywhere */
+.obs-select,
+#background-select {
+  width: 100%;
+  margin-top: 4px;
+  padding: 5px 8px;
+  font-size: 11px;
+  border-radius: 0;
+  border: 1px solid #111827;
+  background-color: #ffffff;
+  color: #111827;
+  box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.08);
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, #111827 50%),
+                    linear-gradient(135deg, #111827 50%, transparent 50%);
+  background-position: calc(100% - 14px) 9px, calc(100% - 10px) 9px;
+  background-size: 4px 4px, 4px 4px;
+  background-repeat: no-repeat;
+}
+
+.obs-select:focus,
+#background-select:focus {
+  outline: 2px solid #111827;
+  outline-offset: 1px;
+  box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.15);
+}
+
+/* ========================================================================
+   Accordion sections (paper modules)
+   ===================================================================== */
+
+.control-block {
+  margin-top: 8px;
+}
+
+.accordion {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* Paper card around each details */
+.accordion-section {
+  border: var(--viewer-border-strong);
+  border-radius: 0;
+  overflow: visible; /* allow dropdowns (e.g., gene search) to render outside the card */
+  background: #ffffff;
+  box-shadow: var(--viewer-shadow);
+}
+
+/* Summary as bold, narrow heading stripe */
+.accordion-section summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 8px 12px;
+  font-family: "Oswald", system-ui, sans-serif;
+  font-weight: 500;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #f3f4f6;
+  border-bottom: 1px solid #111827;
+  color: #111827;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.accordion-section summary:hover {
+  background: #e5e7eb;
+  color: #000000;
+}
+
+/* Arrow marker */
+.accordion-section summary::before {
+  content: '';
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border: 2px solid currentColor;
+  border-left-color: transparent;
+  border-top-color: transparent;
+  transform: rotate(45deg);
+  transition: transform 0.2s ease, border-color 0.2s ease;
+  font-size: 10px;
+  color: #444;
+}
+
+.accordion-section[open] summary::before {
+  transform: rotate(135deg);
+}
+
+.accordion-section summary::-webkit-details-marker {
+  display: none;
+}
+
+.accordion-section[open] summary {
+  border-bottom: 1px solid #111827;
+}
+
+.accordion-content {
+  padding: 10px 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* Section titles inside cards */
+.section-divider {
+  border-top: 1px solid rgba(0, 0, 0, 0.12);
+  margin: 8px 0;
+  padding-top: 6px;
+}
+
+.section-title {
+  font-family: "Oswald", system-ui, sans-serif;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--viewer-ink-soft);
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  margin-bottom: 4px;
+}
+
+/* Hint & stats remain visually hidden but accessible */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Sidebar footer link */
+#copyright {
+  font-size: 11px;
+  opacity: 0.85;
+  margin-top: 4px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(0, 0, 0, 0.12);
+}
+
+#copyright a {
+  color: inherit;
+  text-decoration: none;
+}
+
+#copyright a:hover {
+  text-decoration: underline;
+}
+
+/* ========================================================================
+   Sliders – unified track and thumb
+   ===================================================================== */
+
+.slider-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.slider-row input[type="range"] {
+  flex: 1;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 3px;
+  border-radius: var(--viewer-radius-pill);
+  background: #e5e7eb;
+  outline: none;
+}
+
+/* WebKit */
+.slider-row input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #111827;
+  border: 1px solid #020617;
+  box-shadow: 1px 1px 0 rgba(0, 0, 0, 0.35);
+  margin-top: -5.5px;
+}
+
+/* Firefox */
+.slider-row input[type="range"]::-moz-range-track {
+  height: 3px;
+  border-radius: var(--viewer-radius-pill);
+  background: #e5e7eb;
+}
+
+.slider-row input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #111827;
+  border: 1px solid #020617;
+  box-shadow: 1px 1px 0 rgba(0, 0, 0, 0.35);
+}
+
+/* Edge/IE (fallback) */
+.slider-row input[type="range"]::-ms-track {
+  height: 3px;
+  border-radius: var(--viewer-radius-pill);
+  background: transparent;
+  border-color: transparent;
+  color: transparent;
+}
+.slider-row input[type="range"]::-ms-fill-lower,
+.slider-row input[type="range"]::-ms-fill-upper {
+  background: #e5e7eb;
+}
+.slider-row input[type="range"]::-ms-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #111827;
+  border: 1px solid #020617;
+}
+
+/* Slider value readout – monospaced for “instrument” feel */
+.slider-value {
+  font-size: 11px;
+  opacity: 0.85;
+  font-family: "Fira Code", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+
+/* ========================================================================
+   Buttons – consistent pill style across the sidebar
+   ===================================================================== */
+
+/* Primary sidebar button family */
+.reset-btn,
+.toggle-switch,
+.legend-controls button,
+.legend-actions button {
+  font-family: "Oswald", system-ui, sans-serif;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  border-radius: var(--viewer-radius-pill);
+  padding: 6px 10px;
+  border: 1px solid #111827;
+  background: #f9fafb;
+  color: #111827;
+  cursor: pointer;
+  box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.2);
+  transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease, border-color 0.15s ease;
+}
+
+.reset-btn:hover,
+.toggle-switch:hover,
+.legend-controls button:hover,
+.legend-actions button:hover {
+  background: #e5e7eb;
+  transform: translate(-1px, -1px);
+  box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.25);
+}
+
+.reset-btn:active,
+.toggle-switch:active,
+.legend-controls button:active,
+.legend-actions button:active {
+  transform: translate(0, 0);
+  box-shadow: 1px 1px 0 rgba(0, 0, 0, 0.2);
+  background: #d1d5db;
+}
+
+/* Toggle switch pressed state */
+.toggle-switch {
+  min-width: 60px;
+  text-align: center;
+  background: #ffffff;
+}
+
+.toggle-switch[aria-pressed="true"] {
+  background: #111827;
+  color: #ffffff;
+  border-color: #111827;
+}
+
+/* Disabled state (legend action “Filter” when live mode on) */
+.legend-actions button:disabled,
+.legend-actions button.button-disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  background: #f3f4f6;
+  box-shadow: none;
+}
+
+/* Camera / smoke buttons reuse reset-btn */
+
+/* Smoke rebuild “dirty” state */
+#smoke-rebuild-btn.smoke-dirty {
+  background: #111827;
+  color: #ffffff;
+  border-color: #111827;
+  box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.3);
+}
+
+/* Smoke rebuild disabled */
+#smoke-rebuild-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+  box-shadow: none;
+}
+
+/* ========================================================================
+   Legend + colormap menu
+   ===================================================================== */
+
+.legend-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 10px 12px;
+  border: var(--viewer-border-strong);
+  border-radius: 0;
+  background: #ffffff;
+  box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.18);
+}
+
+.legend-section-title {
+  font-family: "Oswald", system-ui, sans-serif;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  opacity: 0.85;
+}
+
+.legend-help {
+  font-size: 10px;
+  opacity: 0.7;
+  margin-top: 2px;
+}
+
+/* Colormap button */
+.colorbar-wrapper {
+  position: relative;
+}
+
+.colorbar-gradient {
+  width: 100%;
+  height: 16px;
+  border-radius: var(--viewer-radius-pill);
+  border: 1px solid #111827;
+  background: #e5e7eb;
+  cursor: pointer;
+  padding: 0;
+  appearance: none;
+  box-shadow: 1px 1px 0 rgba(0, 0, 0, 0.2);
+}
+
+.colorbar-gradient:focus-visible {
+  outline: 2px solid #111827;
+  outline-offset: 1px;
+}
+
+/* Colormap dropdown */
+.colormap-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  background: #ffffff;
+  border: 1px solid #111827;
+  border-radius: 0;
+  box-shadow: 4px 4px 0 rgba(0, 0, 0, 0.22);
+  padding: 6px;
+  display: none;
+  flex-direction: column;
+  gap: 4px;
+  z-index: 120;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.colormap-menu.visible {
+  display: flex;
+}
+
+.colormap-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid transparent;
+  border-radius: 0;
+  padding: 6px 8px;
+  background: #f9fafb;
+  cursor: pointer;
+  font-size: 10px;
+  text-align: left;
+}
+
+.colormap-option:hover {
+  border-color: #111827;
+  background: #e5e7eb;
+}
+
+.colormap-option.active {
+  border-color: #111827;
+  background: #111827;
+  color: #ffffff;
+}
+
+.colormap-preview {
+  flex: 1;
+  min-width: 90px;
+  height: 12px;
+  border-radius: 6px;
+  border: 1px solid rgba(0, 0, 0, 0.15);
+}
+
+.colormap-name {
+  min-width: 72px;
+  font-weight: 700;
+  color: #333;
+  letter-spacing: 0.2px;
+}
+
+/* Legend controls row */
+.legend-controls {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 6px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.14);
+}
+
+.legend-controls button {
+  flex: 1;
+}
+
+/* Category legend line items */
+.legend-item {
+  display: flex;
+  align-items: center;
+  margin-bottom: 3px;
+  position: relative;
+}
+
+.legend-checkbox {
+  width: 14px;
+  height: 14px;
+  margin: 0 4px 0 0;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+/* Color swatch & dropdown palette */
+.legend-swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  margin-right: 6px;
+  border: 1px solid rgba(0, 0, 0, 0.25);
+  flex-shrink: 0;
+  cursor: pointer;
+  position: relative;
+}
+
+.legend-color-input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  min-width: 0;
+  min-height: 0;
+  border: none;
+  padding: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.legend-swatch:hover {
+  border-color: rgba(0, 0, 0, 0.6);
+  box-shadow: 0 0 3px rgba(0, 0, 0, 0.25);
+}
+
+.legend-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ========================================================================
+   Active filter list – chips with consistent style
+   ===================================================================== */
+
+#filter-count {
+  font-size: 11px;
+  font-family: "Merriweather", Georgia, "Times New Roman", serif;
+  margin-bottom: 6px;
+}
+
+#active-filters {
+  margin-top: 2px;
+  height: 140px;
+  overflow-y: auto;
+  padding: 6px 8px;
+  border: 1px solid rgba(0, 0, 0, 0.18);
+  border-radius: 0;
+  background: #f9fafb;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.18);
+}
+
+.filter-info {
+  font-size: 10px;
+  color: #666666;
+  margin-top: 2px;
+}
+
+.filter-info-block {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* Filter chips */
+.filter-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  background: #e5e7eb;
+  border: 1px solid #cbd5e1;
+  transition: background 0.15s ease, opacity 0.15s ease, border-color 0.15s ease;
+}
+
+.filter-item:hover {
+  background: #d1d5db;
+}
+
+.filter-item.disabled {
+  opacity: 0.6;
+  background: #f3f4f6;
+  border-style: dashed;
+}
+
+.filter-item.disabled:hover {
+  background: #e5e7eb;
+}
+
+/* Checkbox inside filter chip */
+.filter-checkbox {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  cursor: pointer;
+  flex-shrink: 0;
+  accent-color: #111827;
+}
+
+/* Filter text */
+.filter-text {
+  flex: 1;
+  font-size: 10px;
+  color: #374151;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.filter-item.disabled .filter-text {
+  color: #9ca3af;
+  text-decoration: line-through;
+}
+
+/* Remove “x” button on chip */
+.filter-remove-btn {
+  background: #ffffff;
+  border-radius: var(--viewer-radius-pill);
+  border: 1px solid #9ca3af;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  color: #6b7280;
+  padding: 0 5px;
+  flex-shrink: 0;
+  transition: color 0.15s ease, background 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+  box-shadow: 1px 1px 0 rgba(0, 0, 0, 0.18);
+}
+
+.filter-remove-btn:hover {
+  color: #ffffff;
+  background: #8b0000;
+  border-color: #8b0000;
+  box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.25);
+}
+
+/* ========================================================================
+   Searchable gene dropdown
+   ===================================================================== */
+
+#gene-expression-container {
+  display: none;
+}
+
+#gene-expression-container.visible {
+  display: block;
+}
+
+.searchable-dropdown {
+  position: relative;
+  width: 100%;
+}
+
+.search-input {
+  width: 100%;
+  padding: 6px 8px;
+  font-size: 11px;
+  border: 1px solid #111827;
+  border-radius: 0;
+  box-sizing: border-box;
+  background: #ffffff;
+  box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.12);
+}
+
+.search-input:focus {
+  outline: 2px solid #111827;
+  outline-offset: 1px;
+  box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.18);
+}
+
+/* Dropdown list of genes */
+.dropdown-list {
+  display: none;
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  max-height: 200px;
+  overflow-y: auto;
+  background: #ffffff;
+  border: 1px solid #111827;
+  border-top: none;
+  border-radius: 0;
+  box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.18);
+  z-index: 100;
+}
+
+.dropdown-list.visible {
+  display: block;
+}
+
+.dropdown-item {
+  padding: 6px 10px;
+  font-size: 11px;
+  cursor: pointer;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.05);
+}
+
+.dropdown-item:last-child {
+  border-bottom: none;
+}
+
+.dropdown-item:hover {
+  background: #e5e7eb;
+}
+
+.dropdown-item.selected {
+  background: #111827;
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.dropdown-no-results {
+  padding: 8px 10px;
+  font-size: 11px;
+  color: #888888;
+  text-align: center;
+}
+
+/* Selected gene pill */
+.selected-gene {
+  display: none;
+  margin-top: 4px;
+  padding: 4px 8px;
+  font-size: 11px;
+  background: #111827;
+  border-radius: var(--viewer-radius-pill);
+  color: #ffffff;
+}
+
+.selected-gene.visible {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.selected-gene .clear-btn {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+  color: #e5e7eb;
+  padding: 0 4px;
+}
+
+.selected-gene .clear-btn:hover {
+  color: #ffffff;
+}
+
+/* ========================================================================
+   Centroid labels overlay
+   ===================================================================== */
+
+#label-layer {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 5;
+  font-size: 11px;
+  color: #000000;
+}
+
+.centroid-label {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  white-space: nowrap;
+  text-shadow:
+    0 0 3px rgba(255, 255, 255, 0.85),
+    0 0 2px rgba(0, 0, 0, 0.6);
+}
+
+/* View title overlay for small multiples */
+#view-title-layer {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 6;
+  font-size: 11px;
+  color: #111827;
+}
+
+.view-title-chip {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  white-space: nowrap;
+  padding: 3px 8px;
+  border-radius: var(--viewer-radius-pill);
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid rgba(15, 23, 42, 0.35);
+  box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.15);
+  font-family: "Oswald", system-ui, sans-serif;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+/* ========================================================================
+   Outlier controls, centroid toggles, smoke panel
+   ===================================================================== */
+
+#outlier-filter-container {
+  display: none;
+}
+
+#outlier-filter-container.visible {
+  display: block;
+}
+
+/* Centroids controls block */
+#centroid-controls {
+  display: none;
+}
+
+#centroid-controls.visible {
+  display: block;
+}
+
+/* Points controls visibility toggle */
+#points-controls {
+  display: none;
+  margin-top: 6px;
+}
+
+#points-controls.visible {
+  display: block;
+}
+
+/* Volumetric smoke controls panel */
+#smoke-controls {
+  display: none;
+  margin-top: 4px;
+  padding: 8px 10px;
+  border-radius: 0;
+  border: 1px dashed #111827;
+  background: #f9fafb;
+}
+
+#smoke-controls.visible {
+  display: block;
+}
+
+/* Depth perception controls panel */
+#depth-controls {
+  margin-top: 4px;
+  padding: 8px 10px;
+  border-radius: 0;
+  border: 1px dashed #111827;
+  background: #f9fafb;
+}
+
+/* Renderer settings controls panel */
+#renderer-controls {
+  margin-top: 4px;
+  padding: 8px 10px;
+  border-radius: 0;
+  border: 1px dashed #111827;
+  background: #f9fafb;
+}
+
+/* Half-res checkbox inherits checkbox-inline for consistency */
+#smoke-half-res {
+  margin-right: 4px;
+}
+
+/* ========================================================================
+   Legend for categorical items (reusing pieces above)
+   ===================================================================== */
+
+/* Already covered above; kept for layout clarity */
+
+.legend-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+/* ========================================================================
+   Misc / global pieces that weren’t sidebar-specific
+   (mostly unchanged from your original)
+   ===================================================================== */
+
+/* Filter base text (also used when no filters) */
+.filter-info {
+  font-size: 10px;
+  color: #666666;
+  margin-top: 2px;
+}
+
+/* Background renderer hint text */
+#stats {
+  font-size: 11px;
+  opacity: 0.8;
+  margin-top: 4px;
+  display: none;
+}
+
+#hint {
+  font-size: 11px;
+  opacity: 0.85;
+  margin-top: 2px;
+  display: none;
+}
+
+/* Volumetric smoke rebuild button base (visual already overridden) */
+#smoke-rebuild-btn {
+  margin-top: 4px;
+  font-size: 11px;
+}
+
+/* Default legend group spacing (already overridden higher) */
+.legend-group {
+  margin-top: 4px;
+}
+
+/* ========================================================================
+   Split-view HUD (small multiples) in sidebar
+   ===================================================================== */
+
+#split-view-controls {
+  margin-top: 8px;
+}
+
+.split-view-row {
+  display: flex;
+  gap: 8px;
+  margin: 6px 0;
+}
+
+.split-view-badges {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 80px;
+  overflow-y: auto;
+  padding: 4px 6px;
+  border: 1px solid rgba(0, 0, 0, 0.14);
+  background: #f9fafb;
+  box-shadow: 1px 1px 0 rgba(0, 0, 0, 0.08);
+}
+
+.split-badge {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  background: #e5e7eb;
+  border: 1px solid #cbd5e1;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.split-badge-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.split-badge-pill {
+  font-family: "Oswald", system-ui, sans-serif;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  padding: 1px 6px;
+  border-radius: var(--viewer-radius-pill);
+  border: 1px solid rgba(15, 23, 42, 0.5);
+  background: #f9fafb;
+}
+
+.split-badge-live .split-badge-pill {
+  background: #111827;
+  color: #ffffff;
+}
+
+.split-badge-remove {
+  background: transparent;
+  border-radius: 999px;
+  border: 1px solid rgba(15, 23, 42, 0.35);
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1;
+  padding: 0 4px;
+}
+
+.split-badge-remove:hover {
+  background: #8b0000;
+  color: #ffffff;
+  border-color: #8b0000;
+}
+
+.split-badge.active {
+  background: #111827;
+  color: #ffffff;
+  border-color: #0f172a;
+}
+
+.split-badge.active .split-badge-pill {
+  background: #0f172a;
+  color: #ffffff;
+  border-color: #0f172a;
+}
+
+.split-badge.active .split-badge-remove {
+  border-color: rgba(255, 255, 255, 0.6);
+  color: #ffffff;
+}
+
+/* Keep the rest of your non-sidebar styles (gl canvas, etc.) exactly as-is.
+   They weren’t changed because your focus was on the sidebar design. */
+
+/* ========================================================================
+   Performance Benchmark Controls
+   ===================================================================== */
+
+.benchmark-presets {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.benchmark-preset,
+.btn-small {
+  padding: 6px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  background: #f5f5f5;
+  border: 1px solid #d4d4d4;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  color: #333;
+}
+
+.benchmark-preset:hover,
+.btn-small:hover {
+  background: #e5e5e5;
+  border-color: #999;
+}
+
+.benchmark-preset:active,
+.btn-small:active {
+  transform: scale(0.98);
+}
+
+#benchmark-run {
+  background: linear-gradient(135deg, #4f8cff 0%, #3366cc 100%);
+  color: #fff;
+  border: none;
+  font-weight: 600;
+}
+
+#benchmark-run:hover {
+  background: linear-gradient(135deg, #3d7aed 0%, #2255bb 100%);
+  box-shadow: 0 2px 8px rgba(79, 140, 255, 0.3);
+}
+
+#benchmark-stats {
+  background: #f8f9fa;
+  border: 1px solid #e5e7eb;
+}

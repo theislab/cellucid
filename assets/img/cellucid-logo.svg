@@ -1,0 +1,114 @@
+<svg
+  width="260"
+  height="80"
+  viewBox="0 0 260 80"
+  xmlns="http://www.w3.org/2000/svg"
+  role="img"
+  aria-labelledby="title desc"
+>
+  <title id="title">cellucid logo</title>
+  <desc id="desc">
+    Grayscale logo combining a stylized cell with a modern wordmark.
+  </desc>
+
+  <defs>
+    <!-- Soft cell interior -->
+    <radialGradient id="cellGradient" cx="30%" cy="25%" r="80%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="1" />
+      <stop offset="45%" stop-color="#e5e7eb" stop-opacity="0.95" />
+      <stop offset="100%" stop-color="#9ca3af" stop-opacity="0.4" />
+    </radialGradient>
+
+    <!-- Orbit / signal gradient (grayscale) -->
+    <linearGradient id="orbitGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#d4d4d4" />
+      <stop offset="50%" stop-color="#6b7280" />
+      <stop offset="100%" stop-color="#111827" />
+    </linearGradient>
+  </defs>
+
+  <!-- ICON -->
+  <g transform="translate(16,8)">
+    <!-- Outer cell membrane -->
+    <circle
+      cx="32"
+      cy="32"
+      r="26"
+      fill="url(#cellGradient)"
+      stroke="#4b5563"
+      stroke-width="1.6"
+      stroke-opacity="0.9"
+    />
+
+    <!-- Open 'C' highlight for lucidity -->
+    <path
+      d="M15 32
+         A17 17 0 0 1 32 15
+         A17 17 0 0 1 46 21"
+      fill="none"
+      stroke="url(#orbitGradient)"
+      stroke-width="3"
+      stroke-linecap="round"
+      stroke-opacity="0.95"
+    />
+
+    <!-- Nucleus -->
+    <circle
+      cx="32"
+      cy="32"
+      r="9"
+      fill="#ffffff"
+      stroke="#4b5563"
+      stroke-width="1.4"
+      stroke-opacity="0.9"
+    />
+    <circle
+      cx="34.5"
+      cy="30.5"
+      r="3.2"
+      fill="#374151"
+      fill-opacity="0.95"
+    />
+
+    <!-- 3D "data cloud" orbit -->
+    <path
+      d="M17 39
+         C 22 45, 42 45, 47 37
+         C 50 32, 46 27, 40 26"
+      fill="none"
+      stroke="url(#orbitGradient)"
+      stroke-width="1.5"
+      stroke-linecap="round"
+      stroke-opacity="0.9"
+    />
+
+    <!-- Orbiting data points -->
+    <circle cx="19" cy="38.5" r="2.1" fill="#4b5563" />
+    <circle cx="42.5" cy="44" r="2.3" fill="#9ca3af" />
+    <circle cx="48.5" cy="36" r="2.1" fill="#6b7280" />
+    <circle cx="40.5" cy="25.5" r="1.9" fill="#111827" />
+
+    <!-- Tiny grid / sampling dots -->
+    <g fill="#111827" fill-opacity="0.22">
+      <circle cx="22" cy="22" r="0.9" />
+      <circle cx="27" cy="43" r="0.9" />
+      <circle cx="37" cy="18" r="0.9" />
+      <circle cx="45" cy="32" r="0.9" />
+    </g>
+  </g>
+
+  <!-- WORDMARK (reduced letter-spacing, dark gray, Oswald) -->
+  <g transform="translate(78, 18)">
+    <text
+      x="0"
+      y="32"
+      font-size="32"
+      font-weight="800"
+      letter-spacing="-0.025em"
+      font-family="'Oswald', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+      fill="#374151"
+    >
+      cellucid
+    </text>
+  </g>
+</svg>

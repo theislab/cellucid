@@ -1,0 +1,39 @@
+# Bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Virtual envs
+.env
+.venv
+env/
+venv/
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data artifacts (keep placeholders)
+data/raw/**
+!data/raw/.gitkeep
+data/experiments/**
+!data/experiments/.gitkeep
+
+# Viewer exports now live under assets
+assets/exports/**
+!assets/exports/.gitkeep
+exports/**
+python/exports/**
+data/_exports/**
+
+# Python packaging artifacts
+python/dist/
+python/build/
+python/*.egg-info
+
+project_context.txt
