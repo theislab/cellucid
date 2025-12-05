@@ -246,3 +246,50 @@ export const COLOR_PICKER_PALETTE = [
   [0.282, 0.820, 0.800],  // Medium Turquoise
   [0.373, 0.620, 0.627]   // Cadet Blue
 ];
+
+const GOLDEN_ANGLE_DEGREES = 137.50776405003785;
+const EXTENDED_CATEGORY_SEEDS = [...CATEGORY_PALETTE, ...COLOR_PICKER_PALETTE];
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function hslToRgb01(h, s, l) {
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const hp = (h % 1) * 6;
+  const x = c * (1 - Math.abs((hp % 2) - 1));
+  let r1 = 0;
+  let g1 = 0;
+  let b1 = 0;
+
+  if (hp < 1) {
+    r1 = c; g1 = x; b1 = 0;
+  } else if (hp < 2) {
+    r1 = x; g1 = c; b1 = 0;
+  } else if (hp < 3) {
+    r1 = 0; g1 = c; b1 = x;
+  } else if (hp < 4) {
+    r1 = 0; g1 = x; b1 = c;
+  } else if (hp < 5) {
+    r1 = x; g1 = 0; b1 = c;
+  } else {
+    r1 = c; g1 = 0; b1 = x;
+  }
+
+  const m = l - c / 2;
+  return [r1 + m, g1 + m, b1 + m];
+}
+
+// Returns a distinct-looking color for the provided category index. Uses the base
+// palette first, then fans out around the color wheel using the golden angle to
+// avoid obvious repeats when there are many categories.
+export function getCategoryColor(idx) {
+  if (idx < EXTENDED_CATEGORY_SEEDS.length) {
+    return EXTENDED_CATEGORY_SEEDS[idx];
+  }
+  const offset = idx - EXTENDED_CATEGORY_SEEDS.length;
+  const hue = ((offset * GOLDEN_ANGLE_DEGREES) % 360) / 360;
+  const sat = clamp(0.62 + 0.1 * Math.sin(offset * 0.8), 0.45, 0.82);
+  const light = clamp(0.54 + 0.12 * Math.cos(offset * 0.6), 0.38, 0.72);
+  return hslToRgb01(hue, sat, light);
+}

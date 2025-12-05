@@ -5,9 +5,9 @@ import {
 } from './gl-utils.js';
 import {
   rgbToCss,
-  CATEGORY_PALETTE,
   COLOR_PICKER_PALETTE,
   CONTINUOUS_COLORMAPS,
+  getCategoryColor,
   getColormap,
   getCssStopsForColormap,
   sampleContinuousColormap
@@ -47,7 +47,9 @@ class DataState {
     this.centroidTransparencies = null;
 
     this._visibilityChangeCallback = null; // called when filters / visibility change
+    this._visibilityChangeCallbacks = new Set();
     this._visibilityScratch = null; // reusable mask for connectivity visibility
+    this._activeCategoryCounts = null;
     this.activeViewId = 'live';
     this.viewContexts = new Map(); // viewId -> per-view context (arrays + field state)
     this._fieldDataCache = new Map(); // field.key -> loaded arrays (shared across views)
@@ -78,6 +80,13 @@ class DataState {
     if (field._categoryFilterEnabled != null) clone._categoryFilterEnabled = field._categoryFilterEnabled;
     if (field._outlierFilterEnabled != null) clone._outlierFilterEnabled = field._outlierFilterEnabled;
     if (field._outlierThreshold != null) clone._outlierThreshold = field._outlierThreshold;
+    if (field._categoryCounts) {
+      clone._categoryCounts = {
+        visible: field._categoryCounts.visible ? [...field._categoryCounts.visible] : null,
+        total: field._categoryCounts.total ? [...field._categoryCounts.total] : null,
+        visibleTotal: field._categoryCounts.visibleTotal || 0
+      };
+    }
     clone._loadingPromise = null;
     return clone;
   }
@@ -338,7 +347,12 @@ class DataState {
       el.dataset.viewId = viewKey;
       el.textContent = String(centroids[i].category);
       this.labelLayer.appendChild(el);
-      this.centroidLabels.push({ el, position: pos });
+      this.centroidLabels.push({ el, position: pos, alpha: 1.0 });
+    }
+    const counts = field._categoryCounts || this._activeCategoryCounts;
+    if (counts) {
+      const changed = this._applyCategoryCountsToCentroids(field, counts);
+      if (changed) this._pushCentroidsToViewer();
     }
     this.viewer.setCentroidLabels(this.centroidLabels, viewKey);
   }
@@ -389,13 +403,27 @@ class DataState {
   // --- Volumetric smoke helpers -------------------------------------------------
 
   setVisibilityChangeCallback(callback) {
-    this._visibilityChangeCallback = typeof callback === 'function' ? callback : null;
+    this._visibilityChangeCallbacks = new Set();
+    if (typeof callback === 'function') {
+      this._visibilityChangeCallbacks.add(callback);
+    }
+  }
+
+  addVisibilityChangeCallback(callback) {
+    if (!this._visibilityChangeCallbacks) {
+      this._visibilityChangeCallbacks = new Set();
+    }
+    if (typeof callback === 'function') {
+      this._visibilityChangeCallbacks.add(callback);
+    }
   }
 
   _notifyVisibilityChange() {
-    if (this._visibilityChangeCallback) {
-      this._visibilityChangeCallback();
-    }
+    if (!this._visibilityChangeCallbacks || this._visibilityChangeCallbacks.size === 0) return;
+    this._visibilityChangeCallbacks.forEach((cb) => {
+      try { cb(); }
+      catch (err) { console.error('Visibility change callback failed', err); }
+    });
   }
 
   // Returns per-point visibility (0 = hidden, 1 = visible) including outlier filtering
@@ -730,6 +758,285 @@ class DataState {
     return this.filteredCount || { shown: this.pointCount, total: this.pointCount };
   }
 
+  computeCategoryCountsForField(field) {
+    if (!field || field.kind !== 'category') return null;
+    const categories = field.categories || [];
+    const codes = field.codes || [];
+    const total = new Array(categories.length).fill(0);
+    const available = new Array(categories.length).fill(0); // respects other filters, ignores this field's category visibility
+    const visible = new Array(categories.length).fill(0); // respects all filters including this field's category visibility
+    const alpha = this.categoryTransparency || [];
+    const outliers = this.outlierQuantilesArray || [];
+    const threshold = this.getCurrentOutlierThreshold();
+    const n = Math.min(this.pointCount, codes.length);
+    const fields = this.obsData?.fields || [];
+    const targetIndex = fields.indexOf(field);
+    const activeVarField =
+      this.activeFieldSource === 'var' && this.activeVarFieldIndex >= 0
+        ? this.varData?.fields?.[this.activeVarFieldIndex]
+        : null;
+    const activeVarValues = activeVarField?.values || [];
+
+    for (let i = 0; i < n; i++) {
+      const code = codes[i];
+      if (code == null || code < 0 || code >= categories.length) continue;
+      total[code]++;
+
+      // Compute visibility from other filters (but ignoring this field's own category visibility)
+      let baseVisible = true;
+      for (let f = 0; f < fields.length; f++) {
+        const fField = fields[f];
+        if (!fField) continue;
+        if (fField === field) {
+          // Ignore this field's category visibility for "available" counts
+          continue;
+        }
+        if (fField.kind === 'category' && fField._categoryVisible) {
+          const categoryFilterEnabled = fField._categoryFilterEnabled !== false;
+          if (categoryFilterEnabled) {
+            const codesOther = fField.codes || [];
+            const catsOther = fField.categories || [];
+            const numCatsOther = catsOther.length;
+            const cCode = codesOther[i];
+            if (cCode != null && cCode >= 0 && cCode < numCatsOther) {
+              const isVis = fField._categoryVisible[cCode] !== false;
+              if (!isVis) { baseVisible = false; break; }
+            }
+          }
+        } else if (
+          fField.kind === 'continuous' &&
+          fField._continuousStats &&
+          fField._continuousFilter
+        ) {
+          const filterEnabled = fField._filterEnabled !== false;
+          if (filterEnabled) {
+            const stats = fField._continuousStats;
+            const filter = fField._continuousFilter;
+            const values = fField.values || [];
+            const fullRange =
+              filter.min <= stats.min + 1e-6 &&
+              filter.max >= stats.max - 1e-6;
+            if (!fullRange) {
+              const v = values[i];
+              if (v === null || Number.isNaN(v) || v < filter.min || v > filter.max) {
+                baseVisible = false;
+                break;
+              }
+            }
+          }
+        }
+      }
+      if (baseVisible && activeVarField && activeVarField.kind === 'continuous') {
+        const filterEnabled = activeVarField._filterEnabled !== false;
+        if (filterEnabled && activeVarField._continuousStats && activeVarField._continuousFilter) {
+          const stats = activeVarField._continuousStats;
+          const filter = activeVarField._continuousFilter;
+          const fullRange =
+            filter.min <= stats.min + 1e-6 &&
+            filter.max >= stats.max - 1e-6;
+          if (!fullRange) {
+            const v = activeVarValues[i];
+            if (v === null || Number.isNaN(v) || v < filter.min || v > filter.max) {
+              baseVisible = false;
+            }
+          }
+        }
+      }
+      if (baseVisible) {
+        const q = outliers[i] ?? -1;
+        if (q >= 0 && q > threshold) {
+          baseVisible = false;
+        }
+      }
+      if (baseVisible) available[code]++;
+
+      // Current visibility already encoded in alpha + outliers
+      const isVisibleNow = (alpha[i] ?? 0) > 0.001;
+      if (!isVisibleNow) continue;
+      const qNow = outliers[i] ?? -1;
+      if (qNow >= 0 && qNow > threshold) continue;
+      visible[code]++;
+    }
+    const visibleTotal = visible.reduce((sum, v) => sum + v, 0);
+    const availableTotal = available.reduce((sum, v) => sum + v, 0);
+    return { total, available, availableTotal, visible, visibleTotal };
+  }
+
+  _computeCountsForContinuous(field, source, { ignoreSelfFilter = false } = {}) {
+    if (!field || field.kind !== 'continuous') return null;
+    const n = this.pointCount || 0;
+    if (!n) return { available: 0, visible: 0 };
+    const obsFields = this.obsData?.fields || [];
+    const activeVarField =
+      this.activeFieldSource === 'var' && this.activeVarFieldIndex >= 0
+        ? this.varData?.fields?.[this.activeVarFieldIndex]
+        : null;
+    const activeVarValues = activeVarField?.values || [];
+    const targetValues = field.values || [];
+    const outliers = this.outlierQuantilesArray || [];
+    const threshold = this.getCurrentOutlierThreshold();
+    let available = 0;
+    let visible = 0;
+
+    for (let i = 0; i < n; i++) {
+      let passes = true;
+
+      for (let f = 0; f < obsFields.length; f++) {
+        const obsField = obsFields[f];
+        if (!obsField) continue;
+        if (obsField.kind === 'category' && obsField._categoryVisible) {
+          const categoryFilterEnabled = obsField._categoryFilterEnabled !== false;
+          if (categoryFilterEnabled) {
+            const codes = obsField.codes || [];
+            const categories = obsField.categories || [];
+            const numCats = categories.length;
+            const code = codes[i];
+            if (code != null && code >= 0 && code < numCats) {
+              const isVisible = obsField._categoryVisible[code] !== false;
+              if (!isVisible) { passes = false; break; }
+            }
+          }
+        } else if (obsField.kind === 'continuous' && obsField._continuousStats && obsField._continuousFilter) {
+          const filterEnabled = obsField._filterEnabled !== false;
+          const isSelf = source === 'obs' && obsField === field;
+          if (filterEnabled && !(isSelf && ignoreSelfFilter)) {
+            const stats = obsField._continuousStats;
+            const filter = obsField._continuousFilter;
+            const values = obsField.values || [];
+            const fullRange =
+              filter.min <= stats.min + 1e-6 &&
+              filter.max >= stats.max - 1e-6;
+            if (!fullRange) {
+              const v = values[i];
+              if (v === null || Number.isNaN(v) || v < filter.min || v > filter.max) {
+                passes = false;
+                break;
+              }
+            }
+          }
+        }
+      }
+      if (!passes) continue;
+
+      if (activeVarField && activeVarField.kind === 'continuous' && activeVarField._continuousStats && activeVarField._continuousFilter) {
+        const filterEnabled = activeVarField._filterEnabled !== false;
+        const isSelfVar = source === 'var' && activeVarField === field;
+        if (filterEnabled && !(isSelfVar && ignoreSelfFilter)) {
+          const stats = activeVarField._continuousStats;
+          const filter = activeVarField._continuousFilter;
+          const fullRange =
+            filter.min <= stats.min + 1e-6 &&
+            filter.max >= stats.max - 1e-6;
+          if (!fullRange) {
+            const v = activeVarValues[i];
+            if (v === null || Number.isNaN(v) || v < filter.min || v > filter.max) {
+              passes = false;
+            }
+          }
+        }
+      }
+      if (!passes) continue;
+
+      // Outliers always apply (they are a separate filter type)
+      const q = outliers[i] ?? -1;
+      if (q >= 0 && q > threshold) continue;
+
+      available++;
+
+      // Apply self filter if it was skipped in the pass phase
+      if (ignoreSelfFilter) {
+        if (field._filterEnabled === false || !field._continuousStats || !field._continuousFilter) {
+          visible++;
+          continue;
+        }
+        const stats = field._continuousStats;
+        const filter = field._continuousFilter;
+        const fullRange =
+          filter.min <= stats.min + 1e-6 &&
+          filter.max >= stats.max - 1e-6;
+        if (!fullRange) {
+          const v = targetValues[i];
+          if (v === null || Number.isNaN(v) || v < filter.min || v > filter.max) {
+            continue;
+          }
+        }
+      }
+      visible++;
+    }
+    return { available, visible };
+  }
+
+  getFilterCellCounts(filter) {
+    if (!filter) return null;
+    if (filter.type === 'category') {
+      const field =
+        filter.source === 'var'
+          ? this.varData?.fields?.[filter.fieldIndex]
+          : this.obsData?.fields?.[filter.fieldIndex];
+      const counts = field?._categoryCounts;
+      if (counts) {
+        return {
+          available: counts.availableTotal ?? counts.available?.reduce((s, v) => s + v, 0) ?? 0,
+          visible: counts.visibleTotal ?? counts.visible?.reduce((s, v) => s + v, 0) ?? 0
+        };
+      }
+      return null;
+    }
+    if (filter.type === 'continuous') {
+      const field =
+        filter.source === 'var'
+          ? this.varData?.fields?.[filter.fieldIndex]
+          : this.obsData?.fields?.[filter.fieldIndex];
+      if (!field) return null;
+      return this._computeCountsForContinuous(field, filter.source, { ignoreSelfFilter: true });
+    }
+    return null;
+  }
+
+  _applyCategoryCountsToCentroids(field, counts) {
+    if (!field || field.kind !== 'category') return false;
+    if (!field.centroids || !this.centroidTransparencies) return false;
+    const categories = field.categories || [];
+    const visibleCounts = counts?.visible || [];
+    const catIndexByName = new Map();
+    categories.forEach((cat, idx) => catIndexByName.set(String(cat), idx));
+    let changed = false;
+    for (let i = 0; i < field.centroids.length; i++) {
+      const c = field.centroids[i];
+      const idx = catIndexByName.get(String(c.category));
+      const count = idx != null ? (visibleCounts[idx] || 0) : 0;
+      const alpha = count > 0 ? 1.0 : 0.0;
+      if (this.centroidTransparencies[i] !== alpha) {
+        this.centroidTransparencies[i] = alpha;
+        changed = true;
+      }
+      if (this.centroidLabels[i]) {
+        this.centroidLabels[i].alpha = alpha;
+      }
+      if (this.centroidLabels[i]?.el) {
+        const shouldShow = alpha > 0;
+        const prevShow = this.centroidLabels[i].el.style.display !== 'none';
+        if (prevShow !== shouldShow) {
+          this.centroidLabels[i].el.style.display = shouldShow ? 'block' : 'none';
+          changed = true;
+        }
+      }
+    }
+    return changed;
+  }
+
+  _updateActiveCategoryCounts() {
+    const field = this.getActiveField();
+    if (!field || field.kind !== 'category') {
+      this._activeCategoryCounts = null;
+      return false;
+    }
+    const counts = this.computeCategoryCountsForField(field);
+    field._categoryCounts = counts;
+    this._activeCategoryCounts = counts;
+    return this._applyCategoryCountsToCentroids(field, counts);
+  }
+
   ensureContinuousMetadata(field) {
     if (!field || field.kind !== 'continuous') return null;
     const needsStats = !field._continuousStats
@@ -929,14 +1236,14 @@ class DataState {
     if (!field._categoryColors) {
       const catColors = new Array(numCats);
       for (let i = 0; i < numCats; i++) {
-        catColors[i] = CATEGORY_PALETTE[i % CATEGORY_PALETTE.length];
+        catColors[i] = getCategoryColor(i);
       }
       field._categoryColors = catColors;
     } else {
       for (let i = 0; i < numCats; i++) {
         const color = field._categoryColors[i];
         if (!color || color.length !== 3) {
-          field._categoryColors[i] = CATEGORY_PALETTE[i % CATEGORY_PALETTE.length];
+          field._categoryColors[i] = getCategoryColor(i);
         }
       }
     }
@@ -970,7 +1277,7 @@ class DataState {
         alpha = 1.0;
       } else {
         const isVisible = catVisible[code] !== false;
-        const c = catColors[code] || CATEGORY_PALETTE[code % CATEGORY_PALETTE.length] || [0.5, 0.5, 0.5];
+        const c = catColors[code] || getCategoryColor(code) || [0.5, 0.5, 0.5];
         if (!isVisible) {
           r = g = b = 0.5;
           alpha = 0.0;
@@ -1026,6 +1333,13 @@ class DataState {
     const catIndexByName = new Map();
     categories.forEach((cat, idx) => catIndexByName.set(String(cat), idx));
 
+    // Pre-compute counts so centroids/labels respect visibility immediately
+    const counts = this.computeCategoryCountsForField(field);
+    if (counts) {
+      field._categoryCounts = counts;
+      this._activeCategoryCounts = counts;
+    }
+
     for (let i = 0; i < centroids.length; i++) {
       const c = centroids[i];
       const pos = c.position || [0, 0, 0];
@@ -1036,7 +1350,7 @@ class DataState {
       const idx = catIndexByName.get(String(c.category));
       let color = [0, 0, 0];
       if (idx != null) {
-        const fallback = CATEGORY_PALETTE[idx % CATEGORY_PALETTE.length] || [0, 0, 0];
+        const fallback = getCategoryColor(idx) || [0, 0, 0];
         color = catColors[idx] || fallback;
       }
       this.centroidColors[3 * i] = color[0];
@@ -1087,12 +1401,14 @@ class DataState {
       };
     }
     this.ensureCategoryMetadata(field);
+    const counts = field._categoryCounts || null;
     return {
       kind: 'category',
       categories: field.categories || [],
       colors: field._categoryColors,
       visible: field._categoryVisible,
-      picker: COLOR_PICKER_PALETTE
+      picker: COLOR_PICKER_PALETTE,
+      counts
     };
   }
 
@@ -1271,7 +1587,9 @@ class DataState {
       }
       this.categoryTransparency[i] = visible ? 1.0 : 0.0;
     }
+    const centroidsChanged = this._updateActiveCategoryCounts();
     this._pushTransparencyToViewer();
+    if (centroidsChanged) this._pushCentroidsToViewer();
     this._syncActiveContext();
     this.updateFilteredCount();
     this.updateFilterSummary();
@@ -1490,7 +1808,7 @@ class DataState {
         r = NEUTRAL_RGB[0]; g = NEUTRAL_RGB[1]; b = NEUTRAL_RGB[2];
       } else {
         const isVisible = catVisible[code] !== false;
-        const c = catColors[code] || CATEGORY_PALETTE[code % CATEGORY_PALETTE.length] || [0.5, 0.5, 0.5];
+        const c = catColors[code] || getCategoryColor(code) || [0.5, 0.5, 0.5];
         if (!isVisible) {
           // Gray out hidden categories (visual indicator), but don't set transparency here
           r = g = b = 0.5;
@@ -1524,14 +1842,14 @@ class DataState {
     this.ensureCategoryMetadata(field);
     const color = field._categoryColors[idx];
     if (color && color.length === 3) return color;
-    const fallback = CATEGORY_PALETTE[idx % CATEGORY_PALETTE.length];
+    const fallback = getCategoryColor(idx);
     if (!field._categoryColors[idx]) field._categoryColors[idx] = fallback;
     return fallback;
   }
 
   setColorForCategory(field, idx, color) {
     this.ensureCategoryMetadata(field);
-    const fallback = CATEGORY_PALETTE[idx % CATEGORY_PALETTE.length];
+    const fallback = getCategoryColor(idx);
     field._categoryColors[idx] = color || fallback;
     this.reapplyCategoryColors(field);
   }
@@ -1542,17 +1860,25 @@ class DataState {
     this.reapplyCategoryColors(field);
   }
 
-  showAllCategories(field) {
+  showAllCategories(field, { onlyAvailable = false } = {}) {
     this.ensureCategoryMetadata(field);
     const categories = field.categories || [];
-    for (let i = 0; i < categories.length; i++) field._categoryVisible[i] = true;
+    const available = onlyAvailable && field._categoryCounts ? field._categoryCounts.available : null;
+    for (let i = 0; i < categories.length; i++) {
+      if (available && (available[i] || 0) <= 0) continue;
+      field._categoryVisible[i] = true;
+    }
     this.reapplyCategoryColors(field);
   }
 
-  hideAllCategories(field) {
+  hideAllCategories(field, { onlyAvailable = false } = {}) {
     this.ensureCategoryMetadata(field);
     const categories = field.categories || [];
-    for (let i = 0; i < categories.length; i++) field._categoryVisible[i] = false;
+    const available = onlyAvailable && field._categoryCounts ? field._categoryCounts.available : null;
+    for (let i = 0; i < categories.length; i++) {
+      if (available && (available[i] || 0) <= 0) continue;
+      field._categoryVisible[i] = false;
+    }
     this.reapplyCategoryColors(field);
   }
 
@@ -1578,6 +1904,7 @@ class DataState {
     this.computeGlobalVisibility();
     this.updateFilterSummary();
     this._syncActiveContext();
+    this._activeCategoryCounts = null;
     return {
       field: null,
       pointCount: this.pointCount,

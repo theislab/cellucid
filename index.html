@@ -3,7 +3,62 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>cellucid</title>
+  <title>cellucid - Interactive Single-Cell Data Visualization</title>
+
+  <!-- SEO Meta Tags -->
+  <meta name="description" content="Cellucid is a high-performance visualization tool for exploring single-cell sequencing data. Visualize millions of cells in 3D with UMAP embeddings, gene expression overlays, and interactive filtering. Free, browser-based, no installation required." />
+  <meta name="keywords" content="single-cell, scRNA-seq, UMAP, visualization, WebGL, bioinformatics, gene expression, 3D visualization, cell atlas" />
+  <meta name="author" content="Kemal Inecik" />
+  <meta name="robots" content="index, follow" />
+  <link rel="canonical" href="https://www.cellucid.com" />
+
+  <!-- Open Graph / Social Media -->
+  <meta property="og:title" content="cellucid - Interactive Single-Cell Data Visualization" />
+  <meta property="og:description" content="Explore single-cell RNA sequencing data in 3D. Visualize millions of cells with UMAP embeddings, gene expression, and interactive filtering. Free and browser-based." />
+  <meta property="og:type" content="website" />
+  <meta property="og:url" content="https://www.cellucid.com" />
+  <meta property="og:image" content="https://www.cellucid.com/assets/img/og-preview.jpg" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+
+  <!-- Twitter Card -->
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="cellucid - Interactive Single-Cell Data Visualization" />
+  <meta name="twitter:description" content="Explore single-cell RNA sequencing data in 3D. Visualize millions of cells with UMAP embeddings, gene expression, and interactive filtering." />
+  <meta name="twitter:image" content="https://www.cellucid.com/assets/img/og-preview.jpg" />
+
+  <!-- Structured Data for Search Engines -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    "name": "cellucid",
+    "description": "A high-performance visualization tool for exploring single-cell RNA sequencing data. Visualize millions of cells in 3D with UMAP embeddings, gene expression overlays, categorical filtering, and interactive exploration.",
+    "url": "https://www.cellucid.com",
+    "applicationCategory": "Scientific Software",
+    "operatingSystem": "Any (Web Browser)",
+    "offers": {
+      "@type": "Offer",
+      "price": "0",
+      "priceCurrency": "USD"
+    },
+    "author": {
+      "@type": "Person",
+      "name": "Kemal Inecik",
+      "url": "https://kemalinecik.com"
+    },
+    "featureList": [
+      "3D UMAP visualization",
+      "Gene expression overlay",
+      "Categorical and continuous obs filtering",
+      "WebGL2 high-performance rendering",
+      "Support for millions of cells",
+      "Volumetric smoke cloud rendering",
+      "KNN connectivity visualization",
+      "Multiple view comparison"
+    ]
+  }
+  </script>
 
   <!-- Google tag (gtag.js) -->
   <script async src="https://www.googletagmanager.com/gtag/js?id=G-K4774ZWGEQ"></script>
@@ -34,6 +89,44 @@
   <link rel="stylesheet" href="assets/css/style.css" />
 </head>
 <body>
+  <!-- SEO: Semantic content for search engines and screen readers (hidden visually) -->
+  <main class="sr-only" aria-label="About cellucid">
+    <h1>cellucid - Interactive Single-Cell Data Visualization</h1>
+    <p>Cellucid is a free, browser-based tool for visualizing single-cell sequencing data in 3D. Built with WebGL2 for high-performance rendering of millions of cells.</p>
+    <h2>Key Features</h2>
+    <ul>
+      <li>3D UMAP and embedding visualization</li>
+      <li>Gene expression overlay with searchable gene list</li>
+      <li>Categorical and continuous observation filtering</li>
+      <li>Support for millions of cells with GPU-accelerated rendering</li>
+      <li>Volumetric smoke cloud visualization mode</li>
+      <li>KNN connectivity graph visualization</li>
+      <li>Multiple view comparison for UMAP parameter exploration</li>
+      <li>Outlier filtering in latent space</li>
+    </ul>
+    <h2>Use Cases</h2>
+    <p>Ideal for researchers working with scRNA-seq data, cell atlases, and dimensional reduction visualizations. Compatible with AnnData exports and standard single-cell analysis pipelines.</p>
+  </main>
+
+  <noscript>
+    <div style="padding: 40px; max-width: 800px; margin: 0 auto; font-family: sans-serif;">
+      <h1>cellucid - Interactive Single-Cell Data Visualization</h1>
+      <p>Cellucid requires JavaScript and WebGL2 to run. Please enable JavaScript in your browser to use this application.</p>
+      <h2>About cellucid</h2>
+      <p>Cellucid is a free, browser-based visualization tool for exploring single-cell sequencing data. Visualize millions of cells in 3D with UMAP embeddings, gene expression overlays, and interactive filtering.</p>
+      <h3>Features</h3>
+      <ul>
+        <li>3D UMAP visualization with GPU-accelerated rendering</li>
+        <li>Gene expression overlay</li>
+        <li>Categorical and continuous obs filtering</li>
+        <li>Support for millions of cells</li>
+        <li>Volumetric smoke cloud rendering</li>
+        <li>KNN connectivity visualization</li>
+      </ul>
+      <p>Created by <a href="https://kemalinecik.com">Kemal Inecik</a></p>
+    </div>
+  </noscript>
+
   <canvas id="glcanvas"></canvas>
 
   <!-- Sidebar toggle button -->

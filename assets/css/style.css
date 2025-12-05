@@ -665,6 +665,22 @@ html, body {
   white-space: nowrap;
 }
 
+.legend-count {
+  font-size: 10px;
+  opacity: 0.75;
+  margin-left: 8px;
+  white-space: nowrap;
+}
+
+.legend-item.legend-item-disabled {
+  opacity: 0.55;
+}
+
+.legend-item.legend-item-disabled .legend-checkbox,
+.legend-item.legend-item-disabled .legend-color-input {
+  cursor: not-allowed;
+}
+
 /* ========================================================================
    Active filter list – chips with consistent style
    ===================================================================== */

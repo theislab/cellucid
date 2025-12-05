@@ -277,13 +277,22 @@ export function initUI({ state, viewer, dom, smoke }) {
         checkbox.addEventListener('change', () => {
           const enabled = checkbox.checked;
           state.toggleFilterEnabled(filter.id, enabled);
+          renderLegend(state.getActiveField());
+          handleOutlierUI(state.getActiveField());
           renderFilterSummary();
+          markSmokeDirty();
         });
         
         const textSpan = document.createElement('span');
         textSpan.className = 'filter-text';
-        textSpan.textContent = filter.text;
-        textSpan.title = filter.text;
+        const counts = state.getFilterCellCounts ? state.getFilterCellCounts(filter) : null;
+        const countText =
+          counts && Number.isFinite(counts.visible) && Number.isFinite(counts.available)
+            ? ` • ${counts.visible.toLocaleString()} / ${counts.available.toLocaleString()} cells`
+            : '';
+        const fullText = filter.text + countText;
+        textSpan.textContent = fullText;
+        textSpan.title = fullText;
         
         const removeBtn = document.createElement('button');
         removeBtn.type = 'button';
@@ -293,7 +302,10 @@ export function initUI({ state, viewer, dom, smoke }) {
         removeBtn.addEventListener('click', (e) => {
           e.stopPropagation();
           state.removeFilter(filter.id);
+          renderLegend(state.getActiveField());
+          handleOutlierUI(state.getActiveField());
           renderFilterSummary();
+          markSmokeDirty();
         });
         
         item.appendChild(checkbox);
@@ -512,6 +524,41 @@ export function initUI({ state, viewer, dom, smoke }) {
       geneExpressionSearch.value = '';
     }
     activateField(-1);
+  }
+
+  function formatCategoryCount(visibleCount, availableCount) {
+    const visible = Number.isFinite(visibleCount) ? visibleCount : 0;
+    const available = Number.isFinite(availableCount) ? availableCount : visible;
+    if (available > 0 && available !== visible) {
+      return `${visible.toLocaleString()} / ${available.toLocaleString()} cells`;
+    }
+    return `${visible.toLocaleString()} cells`;
+  }
+
+  function refreshLegendCategoryCounts() {
+    const activeField = state.getActiveField ? state.getActiveField() : null;
+    if (!activeField || activeField.kind !== 'category') return;
+    const model = state.getLegendModel(activeField);
+    const counts = model?.counts;
+    if (!counts || !legendEl) return;
+    const visibleList = counts.visible || [];
+    const availableList = counts.available || [];
+    const rows = legendEl.querySelectorAll('.legend-item[data-cat-index]');
+    rows.forEach((row) => {
+      const idx = parseInt(row.dataset.catIndex, 10);
+      if (Number.isNaN(idx)) return;
+      const visible = visibleList[idx] || 0;
+      const available = availableList[idx] || 0;
+      const hasCells = available > 0;
+      row.classList.toggle('legend-item-disabled', !hasCells);
+      row.title = hasCells ? '' : 'No cells available in this category after other filters';
+      const checkbox = row.querySelector('.legend-checkbox');
+      if (checkbox) checkbox.disabled = !hasCells;
+      const colorInput = row.querySelector('.legend-color-input');
+      if (colorInput) colorInput.disabled = !hasCells;
+      const countSpan = row.querySelector('.legend-count');
+      if (countSpan) countSpan.textContent = formatCategoryCount(visible, available);
+    });
   }
 
   function renderLegend(field) {
@@ -911,16 +958,16 @@ export function initUI({ state, viewer, dom, smoke }) {
       const showAllBtn = document.createElement('button');
       showAllBtn.textContent = 'Show All';
       showAllBtn.addEventListener('click', () => {
-        state.showAllCategories(field);
-        legendEl.querySelectorAll('.legend-checkbox').forEach(cb => { cb.checked = true; });
+        state.showAllCategories(field, { onlyAvailable: true });
+        legendEl.querySelectorAll('.legend-checkbox:not(:disabled)').forEach(cb => { cb.checked = true; });
         renderFilterSummary();
         markSmokeDirty();
       });
       const hideAllBtn = document.createElement('button');
       hideAllBtn.textContent = 'Hide All';
       hideAllBtn.addEventListener('click', () => {
-        state.hideAllCategories(field);
-        legendEl.querySelectorAll('.legend-checkbox').forEach(cb => { cb.checked = false; });
+        state.hideAllCategories(field, { onlyAvailable: true });
+        legendEl.querySelectorAll('.legend-checkbox:not(:disabled)').forEach(cb => { cb.checked = false; });
         renderFilterSummary();
         markSmokeDirty();
       });
@@ -929,6 +976,9 @@ export function initUI({ state, viewer, dom, smoke }) {
       legendEl.appendChild(controlsDiv);
 
       const categories = model.categories || [];
+      const counts = model.counts || {};
+      const visibleCounts = counts.visible || [];
+      const availableCounts = counts.available || [];
       const sortedIndices = categories.map((cat, idx) => ({ cat: String(cat), idx }))
         .sort((a, b) => a.cat.localeCompare(b.cat, undefined, { numeric: true, sensitivity: 'base' }))
         .map(item => item.idx);
@@ -936,15 +986,22 @@ export function initUI({ state, viewer, dom, smoke }) {
       sortedIndices.forEach(catIdx => {
         const cat = String(categories[catIdx]);
         const isVisible = field._categoryVisible?.[catIdx] !== false;
+        const visibleCount = visibleCounts[catIdx] || 0;
+        const availableCount = availableCounts[catIdx] || 0;
+        const hasCells = availableCount > 0;
 
         const row = document.createElement('div');
         row.className = 'legend-item';
+        row.dataset.catIndex = String(catIdx);
+        if (!hasCells) row.classList.add('legend-item-disabled');
+        row.title = hasCells ? '' : 'No cells available in this category after other filters';
         row.style.position = 'relative';
 
         const checkbox = document.createElement('input');
         checkbox.type = 'checkbox';
         checkbox.className = 'legend-checkbox';
         checkbox.checked = isVisible;
+        checkbox.disabled = !hasCells;
         checkbox.addEventListener('change', (e) => {
           state.setVisibilityForCategory(field, catIdx, e.target.checked);
           renderFilterSummary();
@@ -957,6 +1014,7 @@ export function initUI({ state, viewer, dom, smoke }) {
         const colorInput = document.createElement('input');
         colorInput.type = 'color';
         colorInput.className = 'legend-color-input';
+        colorInput.disabled = !hasCells;
 
         const updateColorUI = () => {
           const nextColor = state.getColorForCategory(field, catIdx);
@@ -978,10 +1036,14 @@ export function initUI({ state, viewer, dom, smoke }) {
         const labelSpan = document.createElement('span');
         labelSpan.className = 'legend-label';
         labelSpan.textContent = cat;
+        const countSpan = document.createElement('span');
+        countSpan.className = 'legend-count';
+        countSpan.textContent = formatCategoryCount(visibleCount, availableCount);
 
         row.appendChild(checkbox);
         row.appendChild(swatch);
         row.appendChild(labelSpan);
+        row.appendChild(countSpan);
         legendEl.appendChild(row);
       });
     }
@@ -1989,10 +2051,14 @@ export function initUI({ state, viewer, dom, smoke }) {
   hintEl.textContent = '🖱️ Drag to rotate • Scroll to zoom • Shift+drag to pan • Press R to reset';
 
   // Wire state visibility callback so the smoke button lights up when filters change
-  if (state.setVisibilityChangeCallback) {
-    state.setVisibilityChangeCallback(() => {
-      markSmokeDirty();
-    });
+  const handleVisibilityChange = () => {
+    markSmokeDirty();
+    refreshLegendCategoryCounts();
+  };
+  if (state.addVisibilityChangeCallback) {
+    state.addVisibilityChangeCallback(handleVisibilityChange);
+  } else if (state.setVisibilityChangeCallback) {
+    state.setVisibilityChangeCallback(handleVisibilityChange);
   }
   markSmokeClean(); // after initial density build
 

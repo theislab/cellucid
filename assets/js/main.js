@@ -492,12 +492,17 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
       }
 
       // Update edges when visibility changes
-      state.setVisibilityChangeCallback(() => {
+      const onVisibilityChange = () => {
         // Rebuild edges if connectivity is shown
         if (connectivityCheckbox?.checked && csrLoaded) {
           buildEdgesForVisibleCells();
         }
-      });
+      };
+      if (state.addVisibilityChangeCallback) {
+        state.addVisibilityChangeCallback(onVisibilityChange);
+      } else {
+        state.setVisibilityChangeCallback(onVisibilityChange);
+      }
 
       // Wire up color picker
       if (connectivityColorInput) {

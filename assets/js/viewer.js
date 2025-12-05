@@ -744,7 +744,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     if (numPoints === 0) return;
     gl.useProgram(centroidProgram);
     gl.uniformMatrix4fv(centroidUniformLocations.mvpMatrix, false, mvpMatrix);
-    gl.uniform1f(centroidUniformLocations.pointSize, basePointSize * 1.8);
+    // Make centroids stand out by rendering them much larger than regular points
+    gl.uniform1f(centroidUniformLocations.pointSize, basePointSize * 4.0);
 
     gl.bindBuffer(gl.ARRAY_BUFFER, centroidPositionBuffer);
     gl.enableVertexAttribArray(centroidAttribLocations.position);
@@ -811,6 +812,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     const height = canvas.clientHeight;
     for (const item of labels) {
       if (!item?.el || !item.position) continue;
+      if (item.alpha != null && item.alpha < 0.01) {
+        item.el.style.display = 'none';
+        continue;
+      }
       vec4.set(tempVec4, item.position[0], item.position[1], item.position[2], 1);
       vec4.transformMat4(tempVec4, tempVec4, mvpMatrix);
       if (tempVec4[3] <= 0) { item.el.style.display = 'none'; continue; }
