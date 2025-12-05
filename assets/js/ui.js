@@ -27,6 +27,16 @@ export function initUI({ state, viewer, dom, smoke }) {
     activeFiltersEl,
     hintEl,
     resetCameraBtn,
+    navigationModeSelect,
+    lookSensitivityInput,
+    lookSensitivityDisplay,
+    moveSpeedInput,
+    moveSpeedDisplay,
+    invertLookCheckbox,
+    pointerLockCheckbox,
+    orbitReverseCheckbox,
+    freeflyControls,
+    orbitControls,
     geneExpressionContainer,
     geneExpressionSearch,
     geneExpressionDropdown,
@@ -241,6 +251,59 @@ export function initUI({ state, viewer, dom, smoke }) {
     const size = sliderToPointSize(pointSizeInput.value);
     viewer.setPointSize(size);
     pointSizeDisplay.textContent = formatPointSize(size);
+  }
+
+  function sliderToLookSensitivity(raw) {
+    const v = Math.max(1, Math.min(30, parseFloat(raw) || 5));
+    return v * 0.0005; // radians per pixel
+  }
+
+  function sliderToMoveSpeed(raw) {
+    const v = Math.max(1, Math.min(500, parseFloat(raw) || 100));
+    return v / 100; // scene units per second
+  }
+
+  function updateLookSensitivity() {
+    if (!lookSensitivityInput) return;
+    const sensitivity = sliderToLookSensitivity(lookSensitivityInput.value);
+    if (lookSensitivityDisplay) {
+      lookSensitivityDisplay.textContent = (parseFloat(lookSensitivityInput.value) / 100).toFixed(2) + 'x';
+    }
+    if (viewer.setLookSensitivity) {
+      viewer.setLookSensitivity(sensitivity);
+    }
+  }
+
+  function updateMoveSpeed() {
+    if (!moveSpeedInput) return;
+    const speed = sliderToMoveSpeed(moveSpeedInput.value);
+    if (moveSpeedDisplay) {
+      moveSpeedDisplay.textContent = speed.toFixed(2) + ' u/s';
+    }
+    if (viewer.setMoveSpeed) {
+      viewer.setMoveSpeed(speed);
+    }
+  }
+
+  function updateNavigationHint(mode = navigationModeSelect?.value || 'orbit') {
+    if (!hintEl) return;
+    if (mode === 'free') {
+      hintEl.textContent =
+        'Free-fly: click+drag to look (or capture pointer, Esc/Q to release) • WASD move • Space/E up • Ctrl/Q down • Shift sprint • R resets';
+    } else {
+      hintEl.textContent =
+        '🖱️ Drag to rotate • Scroll to zoom • Shift+drag to pan • Press R to reset';
+    }
+    hintEl.style.display = 'block';
+  }
+
+  function toggleNavigationPanels(mode) {
+    if (freeflyControls) {
+      freeflyControls.style.display = mode === 'free' ? 'block' : 'none';
+    }
+    if (orbitControls) {
+      orbitControls.style.display = mode === 'free' ? 'none' : 'block';
+    }
   }
 
   function updateStats(fieldInfo) {
@@ -1528,6 +1591,81 @@ export function initUI({ state, viewer, dom, smoke }) {
     sizeAttenuationDisplay.textContent = sizeAttenuationInput.value;
   });
 
+  if (navigationModeSelect) {
+    navigationModeSelect.addEventListener('change', () => {
+      const mode = navigationModeSelect.value === 'free' ? 'free' : 'orbit';
+      if (viewer.setNavigationMode) {
+        viewer.setNavigationMode(mode);
+      }
+      if (mode !== 'free' && pointerLockCheckbox && viewer.setPointerLockEnabled) {
+        pointerLockCheckbox.checked = false;
+        viewer.setPointerLockEnabled(false);
+      }
+      toggleNavigationPanels(mode);
+      updateNavigationHint(mode);
+    });
+  }
+
+  if (lookSensitivityInput) {
+    updateLookSensitivity();
+    lookSensitivityInput.addEventListener('input', updateLookSensitivity);
+  }
+
+  if (moveSpeedInput) {
+    updateMoveSpeed();
+    moveSpeedInput.addEventListener('input', updateMoveSpeed);
+  }
+
+  if (invertLookCheckbox && viewer.setInvertLook) {
+    const setY = viewer.setInvertLookY || viewer.setInvertLook;
+    const setX = viewer.setInvertLookX || viewer.setInvertLook;
+    const apply = (val) => {
+      setY.call(viewer, val);
+      setX.call(viewer, val);
+    };
+    apply(Boolean(invertLookCheckbox.checked));
+    invertLookCheckbox.addEventListener('change', () => {
+      apply(Boolean(invertLookCheckbox.checked));
+    });
+  }
+
+  const applyPointerLock = (checked) => {
+    if (!pointerLockCheckbox || !viewer.setPointerLockEnabled) return;
+    const mode = navigationModeSelect?.value === 'free' ? 'free' : 'orbit';
+    if (mode !== 'free') {
+      pointerLockCheckbox.checked = false;
+      if (hintEl) {
+        hintEl.textContent = 'Pointer capture is only available in Free-fly mode.';
+        hintEl.style.display = 'block';
+      }
+      return;
+    }
+    viewer.setPointerLockEnabled(Boolean(checked));
+  };
+
+  if (pointerLockCheckbox && viewer.setPointerLockEnabled) {
+    pointerLockCheckbox.checked = false;
+    pointerLockCheckbox.addEventListener('change', () => {
+      applyPointerLock(pointerLockCheckbox.checked);
+    });
+  }
+
+  if (pointerLockCheckbox && viewer.setPointerLockChangeHandler) {
+    viewer.setPointerLockChangeHandler((active) => {
+      pointerLockCheckbox.checked = active;
+      if (!active && viewer.getNavigationMode && viewer.getNavigationMode() !== 'free') {
+        pointerLockCheckbox.checked = false;
+      }
+    });
+  }
+
+  if (orbitReverseCheckbox && viewer.setOrbitInvertRotation) {
+    viewer.setOrbitInvertRotation(Boolean(orbitReverseCheckbox.checked));
+    orbitReverseCheckbox.addEventListener('change', () => {
+      viewer.setOrbitInvertRotation(Boolean(orbitReverseCheckbox.checked));
+    });
+  }
+
   outlierFilterInput.addEventListener('input', () => {
     const sliderValue = parseFloat(outlierFilterInput.value);
     const threshold = sliderValue / 100.0;
@@ -1891,6 +2029,36 @@ export function initUI({ state, viewer, dom, smoke }) {
     }
     applyRenderMode(defaultRenderMode);
 
+    if (navigationModeSelect) {
+      const mode = initialUIState.navigationMode || 'orbit';
+      navigationModeSelect.value = mode;
+      if (viewer.setNavigationMode) {
+        viewer.setNavigationMode(mode);
+      }
+      toggleNavigationPanels(mode);
+      updateNavigationHint(mode);
+    }
+
+    if (lookSensitivityInput) {
+      lookSensitivityInput.value = initialUIState.lookSensitivity || '5';
+      updateLookSensitivity();
+    }
+
+    if (moveSpeedInput) {
+      moveSpeedInput.value = initialUIState.moveSpeed || '100';
+      updateMoveSpeed();
+    }
+
+    if (invertLookCheckbox && viewer.setInvertLook) {
+      invertLookCheckbox.checked = Boolean(initialUIState.invertLook);
+      viewer.setInvertLook(Boolean(invertLookCheckbox.checked));
+    }
+
+    if (orbitReverseCheckbox && viewer.setOrbitInvertRotation) {
+      orbitReverseCheckbox.checked = Boolean(initialUIState.orbitInvertRotation);
+      viewer.setOrbitInvertRotation(Boolean(orbitReverseCheckbox.checked));
+    }
+
     if (pointSizeInput) {
       pointSizeInput.value = initialUIState.pointSize;
       applyPointSizeFromSlider();
@@ -1995,7 +2163,6 @@ export function initUI({ state, viewer, dom, smoke }) {
       viewer.resetCamera();
     }
   });
-
   // Initial setup
   viewer.setBackground(backgroundSelect.value);
 
@@ -2043,12 +2210,19 @@ export function initUI({ state, viewer, dom, smoke }) {
     smokeEdge: smokeEdgeInput?.value || '5',
     smokeDirectLight: smokeDirectLightInput?.value || '11',
     cloudResolution: cloudResolutionInput?.value || '15',
-    noiseResolution: noiseResolutionInput?.value || '43'
+    noiseResolution: noiseResolutionInput?.value || '43',
+    navigationMode: navigationModeSelect?.value || 'orbit',
+    lookSensitivity: lookSensitivityInput?.value || '5',
+    moveSpeed: moveSpeedInput?.value || '100',
+    invertLook: invertLookCheckbox?.checked || false,
+    orbitInvertRotation: orbitReverseCheckbox?.checked || false
   };
 
   renderFieldSelects();
   initGeneExpressionDropdown();
-  hintEl.textContent = '🖱️ Drag to rotate • Scroll to zoom • Shift+drag to pan • Press R to reset';
+  const startingNavMode = navigationModeSelect?.value || 'orbit';
+  toggleNavigationPanels(startingNavMode);
+  updateNavigationHint(startingNavMode);
 
   // Wire state visibility callback so the smoke button lights up when filters change
   const handleVisibilityChange = () => {

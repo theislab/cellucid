@@ -53,6 +53,16 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
   const sizeAttenuationDisplay = document.getElementById('size-attenuation-display');
   const hintEl = document.getElementById('hint');
   const resetCameraBtn = document.getElementById('reset-camera-btn');
+  const navigationModeSelect = document.getElementById('navigation-mode');
+  const lookSensitivityInput = document.getElementById('look-sensitivity');
+  const lookSensitivityDisplay = document.getElementById('look-sensitivity-display');
+  const moveSpeedInput = document.getElementById('move-speed');
+  const moveSpeedDisplay = document.getElementById('move-speed-display');
+  const invertLookCheckbox = document.getElementById('invert-look');
+  const pointerLockCheckbox = document.getElementById('pointer-lock');
+  const orbitReverseCheckbox = document.getElementById('orbit-reverse');
+  const freeflyControls = document.getElementById('freefly-controls');
+  const orbitControls = document.getElementById('orbit-controls');
   const geneExpressionContainer = document.getElementById('gene-expression-container');
   const geneExpressionSearch = document.getElementById('gene-expression-search');
   const geneExpressionDropdown = document.getElementById('gene-expression-dropdown');
@@ -221,6 +231,16 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
         sizeAttenuationDisplay,
         hintEl,
         resetCameraBtn,
+        navigationModeSelect,
+        lookSensitivityInput,
+        lookSensitivityDisplay,
+        moveSpeedInput,
+        moveSpeedDisplay,
+        invertLookCheckbox,
+        pointerLockCheckbox,
+        orbitReverseCheckbox,
+        freeflyControls,
+        orbitControls,
         geneExpressionContainer,
         geneExpressionSearch,
         geneExpressionDropdown,

@@ -162,71 +162,18 @@
             </select>
           </div>
 
-          <!-- Point rendering controls (points mode only) -->
-          <div id="points-controls" class="visible">
-            <div class="control-block">
-              <label for="point-size">Point size (log):</label>
-              <div class="slider-row">
-                <input id="point-size" type="range" min="0" max="100" step="1" value="30" />
-                <span id="point-size-display" class="slider-value">5.0</span>
-              </div>
-            </div>
-
-            <!-- KNN Connectivity Section -->
-            <div class="control-block" id="connectivity-controls" style="display: none;">
-              <div class="section-divider">
-                <div class="section-title">KNN Connectivity</div>
-              </div>
-
-              <div class="legend-help" style="margin-bottom:6px;">
-                Shows edges between visible cells only.
-              </div>
-
-              <label class="checkbox-inline">
-                <input type="checkbox" id="toggle-connectivity" />
-                Show connectivity edges
-              </label>
-
-              <div id="connectivity-sliders" style="display: none;">
-                <div class="control-block" style="margin-top:6px;">
-                  <label for="connectivity-color">Edge color:</label>
-                  <input type="color" id="connectivity-color" value="#4a4a4a" style="width:50px;height:24px;border:none;cursor:pointer;" />
-                </div>
-
-                <div class="control-block" style="margin-top:6px;">
-                  <label for="connectivity-alpha">Edge opacity:</label>
-                  <div class="slider-row">
-                    <input id="connectivity-alpha" type="range" min="1" max="100" step="1" value="15" />
-                    <span id="connectivity-alpha-display" class="slider-value">0.15</span>
-                  </div>
-                </div>
-
-                <div class="control-block" style="margin-top:6px;">
-                  <label for="connectivity-width">Line width:</label>
-                  <div class="slider-row">
-                    <input id="connectivity-width" type="range" min="1" max="50" step="1" value="10" />
-                    <span id="connectivity-width-display" class="slider-value">1.0</span>
-                  </div>
-                </div>
-
-                <div class="control-block" style="margin-top:6px;">
-                  <label for="connectivity-limit">Max edges:</label>
-                  <div class="slider-row">
-                    <input id="connectivity-limit" type="range" min="1000" max="1000000" step="1000" value="100000" />
-                    <span id="connectivity-limit-display" class="slider-value">100k</span>
-                  </div>
-                </div>
-              </div>
-
-              <div id="connectivity-info" class="legend-help" style="margin-top:4px;"></div>
-            </div>
-          </div>
-
           <!-- Depth Perception controls -->
           <div class="control-block" id="depth-controls">
             <div class="section-title">Depth perception</div>
             <div class="legend-help">
               Visual cues for 3D depth and spatial awareness.
+            </div>
+            <div class="control-block" style="margin-top:6px;">
+              <label for="point-size">Point size (log):</label>
+              <div class="slider-row">
+                <input id="point-size" type="range" min="0" max="100" step="1" value="30" />
+                <span id="point-size-display" class="slider-value">5.0</span>
+              </div>
             </div>
 
             <div class="control-block" style="margin-top:6px;">
@@ -278,6 +225,63 @@
                 <input type="checkbox" id="hp-frustum-culling" />
                 Frustum culling (experimental)
               </label>
+            </div>
+          </div>
+
+          <!-- Navigation controls -->
+          <div class="control-block" id="navigation-controls">
+            <div class="section-divider">
+              <div class="section-title">Navigation</div>
+            </div>
+            <div class="legend-help">
+              Choose orbit for data-first inspection or AAA free-fly for desk-to-immersive movement.
+            </div>
+            <div class="control-block" style="margin-top:6px;">
+              <label for="navigation-mode">Mode:</label>
+              <select id="navigation-mode" class="obs-select">
+                <option value="orbit">Orbit (default)</option>
+                <option value="free">Free-fly (AAA)</option>
+              </select>
+            </div>
+            <div id="orbit-controls" class="nav-mode-box">
+              <label class="checkbox-inline">
+                <input type="checkbox" id="orbit-reverse" checked />
+                Google Earth-style drag
+              </label>
+            </div>
+            <div id="freefly-controls" class="nav-mode-box" style="display:none;">
+              <div class="control-block" style="margin-top:6px;">
+                <label for="look-sensitivity">Look sensitivity:</label>
+                <div class="slider-row">
+                  <input id="look-sensitivity" type="range" min="1" max="30" step="1" value="5" />
+                  <span id="look-sensitivity-display" class="slider-value">0.05x</span>
+                </div>
+              </div>
+              <div class="control-block" style="margin-top:6px;">
+                <label for="move-speed">Move speed:</label>
+                <div class="slider-row">
+                  <input id="move-speed" type="range" min="1" max="500" step="1" value="100" />
+                  <span id="move-speed-display" class="slider-value">1.00 u/s</span>
+                </div>
+              </div>
+              <div class="control-block" style="margin-top:6px;">
+                <label class="checkbox-inline">
+                  <input type="checkbox" id="invert-look" />
+                  Invert look axes
+                </label>
+              </div>
+              <div class="control-block" style="margin-top:6px;">
+                <label class="checkbox-inline">
+                  <input type="checkbox" id="pointer-lock" />
+                  Capture pointer (lock cursor)
+                </label>
+                <div class="legend-help" style="margin-top:6px;">
+                  Hides the cursor and lets you look without dragging. Press Esc or Q to release.
+                </div>
+              </div>
+              <div class="legend-help" style="margin-top:6px;">
+                Free-fly: click+drag to look • WASD move • Space/E up • Ctrl/Q down • Shift sprint • Wheel dolly.
+              </div>
             </div>
           </div>
 
@@ -386,6 +390,58 @@
 
             <div id="smoke-rebuild-hint" class="legend-help" style="margin-top:8px;">
               Smoke density rebuilds automatically when needed.
+            </div>
+          </div>
+
+          <!-- Point rendering controls (points mode only) -->
+          <div id="points-controls" class="visible">
+            <!-- KNN Connectivity Section -->
+            <div class="control-block" id="connectivity-controls" style="display: none;">
+              <div class="section-divider">
+                <div class="section-title">KNN Connectivity</div>
+              </div>
+
+              <div class="legend-help" style="margin-bottom:6px;">
+                Shows edges between visible cells only.
+              </div>
+
+              <label class="checkbox-inline">
+                <input type="checkbox" id="toggle-connectivity" />
+                Show connectivity edges
+              </label>
+
+              <div id="connectivity-sliders" style="display: none;">
+                <div class="control-block" style="margin-top:6px;">
+                  <label for="connectivity-color">Edge color:</label>
+                  <input type="color" id="connectivity-color" value="#4a4a4a" style="width:50px;height:24px;border:none;cursor:pointer;" />
+                </div>
+
+                <div class="control-block" style="margin-top:6px;">
+                  <label for="connectivity-alpha">Edge opacity:</label>
+                  <div class="slider-row">
+                    <input id="connectivity-alpha" type="range" min="1" max="100" step="1" value="15" />
+                    <span id="connectivity-alpha-display" class="slider-value">0.15</span>
+                  </div>
+                </div>
+
+                <div class="control-block" style="margin-top:6px;">
+                  <label for="connectivity-width">Line width:</label>
+                  <div class="slider-row">
+                    <input id="connectivity-width" type="range" min="1" max="50" step="1" value="10" />
+                    <span id="connectivity-width-display" class="slider-value">1.0</span>
+                  </div>
+                </div>
+
+                <div class="control-block" style="margin-top:6px;">
+                  <label for="connectivity-limit">Max edges:</label>
+                  <div class="slider-row">
+                    <input id="connectivity-limit" type="range" min="1000" max="1000000" step="1000" value="100000" />
+                    <span id="connectivity-limit-display" class="slider-value">100k</span>
+                  </div>
+                </div>
+              </div>
+
+              <div id="connectivity-info" class="legend-help" style="margin-top:4px;"></div>
             </div>
           </div>
 

@@ -24,6 +24,10 @@ html, body {
   cursor: grabbing;
 }
 
+#glcanvas.free-nav {
+  cursor: crosshair;
+}
+
 /* ========================================================================
    Sidebar – newspaper-inspired, but with pure white background
    ===================================================================== */
@@ -1014,6 +1018,14 @@ html, body {
 /* Renderer settings controls panel */
 #renderer-controls {
   margin-top: 4px;
+  padding: 8px 10px;
+  border-radius: 0;
+  border: 1px dashed #111827;
+  background: #f9fafb;
+}
+
+.nav-mode-box {
+  margin-top: 14px;
   padding: 8px 10px;
   border-radius: 0;
   border: 1px dashed #111827;

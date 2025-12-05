@@ -345,9 +345,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   const EDGE_SIDE_OFFSET = 6 * 4;
 
   // Camera
-  const near = 0.1;
+  // Keep near plane tight so points do not disappear too early when orbiting in
+  const near = 0.02;
   const far = 1000.0;
   const fov = 45 * Math.PI / 180;
+  const minOrbitRadius = 0.05;
 
   let basePointSize = 5.0;
   let lightingStrength = 0.6;
@@ -372,6 +374,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   const target = vec3.fromValues(0, 0, 0);
   const eye = vec3.create();
   const up = vec3.fromValues(0, 1, 0);
+  // Google Earth-style orbit by default (drag inverts horizontal)
+  let orbitInvertX = true;
 
   let isDragging = false;
   let dragMode = 'rotate';
@@ -380,6 +384,24 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   let targetRadius = radius;
   let lastTouchDist = 0;
   let animationHandle = null;
+
+  // Navigation (orbit + free-fly)
+  let navigationMode = 'orbit';
+  let lookSensitivity = 0.0025; // radians per pixel
+  let invertLookX = false;
+  let invertLookY = false;
+  let moveSpeed = 1.0; // units per second
+  const sprintMultiplier = 2.2;
+  const activeKeys = new Set();
+  let freeflyPosition = vec3.fromValues(0, 0, 3.0);
+  let freeflyVelocity = vec3.create();
+  let freeflyYaw = Math.PI / 4;
+  let freeflyPitch = 0;
+  let pointerLockEnabled = false;
+  let pointerLockActive = false;
+  let pointerLockChangeHandler = null;
+  let lookActive = false;
+  let lastFrameTime = performance.now();
 
   let velocityTheta = 0;
   let velocityPhi = 0;
@@ -394,10 +416,36 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   const INERTIA_MIN_VELOCITY = 0.0001;
   const VELOCITY_SMOOTHING = 0.3;
 
+  function getOrbitSigns() {
+    // Google Earth style: invert horizontal drag to feel like grabbing the globe
+    const xSign = orbitInvertX ? -1 : 1;
+    // Always keep vertical drag "grab the globe": drag up tilts the globe down
+    const ySign = 1;
+    return { xSign, ySign };
+  }
+
+  function isTypingTarget(target) {
+    if (!target) return false;
+    const tag = target.tagName;
+    return target.isContentEditable || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+  }
+
   // === Event Listeners ===
   canvas.addEventListener('contextmenu', (e) => { e.preventDefault(); return false; });
 
   canvas.addEventListener('mousedown', (e) => {
+    if (navigationMode === 'free') {
+      if (pointerLockEnabled && !pointerLockActive && canvas.requestPointerLock) {
+        canvas.requestPointerLock();
+      } else {
+        lookActive = true;
+        lastX = e.clientX;
+        lastY = e.clientY;
+      }
+      canvas.classList.add('dragging');
+      canvas.style.cursor = pointerLockActive ? 'none' : 'crosshair';
+      return;
+    }
     isDragging = true;
     lastX = e.clientX;
     lastY = e.clientY;
@@ -416,13 +464,21 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   });
 
   window.addEventListener('mouseup', () => {
+    if (navigationMode === 'free') {
+      lookActive = false;
+      isDragging = false;
+      canvas.classList.remove('dragging');
+      canvas.style.cursor = navigationMode === 'free' ? 'crosshair' : 'grab';
+      return;
+    }
     if (isDragging) {
       const timeDelta = performance.now() - lastMoveTime;
       if (timeDelta < 50 && (Math.abs(lastDx) > 0.5 || Math.abs(lastDy) > 0.5)) {
         const rotateSpeed = 0.005;
+        const { xSign, ySign } = getOrbitSigns();
         if (dragMode === 'rotate') {
-          velocityTheta = -lastDx * rotateSpeed * 0.5;
-          velocityPhi = -lastDy * rotateSpeed * 0.5;
+          velocityTheta = -lastDx * rotateSpeed * 0.5 * xSign;
+          velocityPhi = -lastDy * rotateSpeed * 0.5 * ySign;
         } else if (dragMode === 'pan') {
           const forward = vec3.sub(vec3.create(), target, eye);
           vec3.normalize(forward, forward);
@@ -443,6 +499,23 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   });
 
   window.addEventListener('mousemove', (e) => {
+    if (navigationMode === 'free') {
+      if (!lookActive) return;
+      const dx = pointerLockActive ? e.movementX : (e.clientX - lastX);
+      const dy = pointerLockActive ? e.movementY : (e.clientY - lastY);
+      const invertX = invertLookX ? -1 : 1;
+      const invertY = invertLookY ? -1 : 1;
+      freeflyYaw += dx * lookSensitivity * invertX;
+      freeflyPitch -= dy * lookSensitivity * invertY;
+      const PITCH_EPS = 0.001;
+      const MAX_PITCH = Math.PI / 2 - PITCH_EPS;
+      freeflyPitch = Math.max(-MAX_PITCH, Math.min(MAX_PITCH, freeflyPitch));
+      if (!pointerLockActive) {
+        lastX = e.clientX;
+        lastY = e.clientY;
+      }
+      return;
+    }
     if (!isDragging) return;
     const dx = e.clientX - lastX;
     const dy = e.clientY - lastY;
@@ -450,10 +523,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     lastDy = dy * VELOCITY_SMOOTHING + lastDy * (1 - VELOCITY_SMOOTHING);
     lastMoveTime = performance.now();
     const rotateSpeed = 0.005;
+    const { xSign, ySign } = getOrbitSigns();
 
     if (dragMode === 'rotate') {
-      theta -= dx * rotateSpeed;
-      phi -= dy * rotateSpeed;
+      theta -= dx * rotateSpeed * xSign;
+      phi -= dy * rotateSpeed * ySign;
       const EPS = 0.05;
       phi = Math.max(EPS, Math.min(Math.PI - EPS, phi));
       while (theta > Math.PI * 2) theta -= Math.PI * 2;
@@ -475,17 +549,70 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
   canvas.addEventListener('wheel', (e) => {
     e.preventDefault();
+    if (navigationMode === 'free') {
+      return;
+    }
     let delta = e.deltaY;
     if (e.deltaMode === 1) delta *= 16;
     else if (e.deltaMode === 2) delta *= 100;
     delta = Math.max(-100, Math.min(100, delta));
     const sensitivity = 0.001 * targetRadius;
     targetRadius += delta * sensitivity;
-    targetRadius = Math.max(0.1, Math.min(100.0, targetRadius));
+    targetRadius = Math.max(minOrbitRadius, Math.min(100.0, targetRadius));
   }, { passive: false });
+
+  function handlePointerLockChange() {
+    pointerLockActive = document.pointerLockElement === canvas;
+    if (pointerLockActive) {
+      lookActive = true;
+      canvas.classList.add('dragging');
+      canvas.style.cursor = 'none';
+    } else {
+      lookActive = false;
+      pointerLockEnabled = false;
+      canvas.classList.remove('dragging');
+      canvas.style.cursor = navigationMode === 'free' ? 'crosshair' : 'grab';
+    }
+    if (typeof pointerLockChangeHandler === 'function') {
+      pointerLockChangeHandler(pointerLockActive);
+    }
+  }
+
+  document.addEventListener('pointerlockchange', handlePointerLockChange);
+  document.addEventListener('pointerlockerror', () => {
+    pointerLockActive = false;
+    pointerLockEnabled = false;
+    if (typeof pointerLockChangeHandler === 'function') {
+      pointerLockChangeHandler(false);
+    }
+  });
+
+  window.addEventListener('keydown', (e) => {
+    if (isTypingTarget(e.target)) return;
+    const code = e.code;
+    if (pointerLockActive && (code === 'Escape' || code === 'KeyQ')) {
+      if (document.exitPointerLock) document.exitPointerLock();
+      pointerLockEnabled = false;
+      if (typeof pointerLockChangeHandler === 'function') pointerLockChangeHandler(false);
+      return;
+    }
+    if (navigationMode === 'free') {
+      if (code === 'Space' || code === 'KeyW' || code === 'KeyA' || code === 'KeyS' || code === 'KeyD' ||
+          code === 'KeyQ' || code === 'KeyE' || code === 'ControlLeft' || code === 'ControlRight' ||
+          code === 'ShiftLeft' || code === 'ShiftRight') {
+        e.preventDefault();
+      }
+    }
+    activeKeys.add(code);
+  });
+
+  window.addEventListener('keyup', (e) => {
+    activeKeys.delete(e.code);
+  });
 
   // Touch events
   canvas.addEventListener('touchstart', (e) => {
+    if (navigationMode === 'free') return;
     velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
     lastDx = lastDy = 0;
     if (e.touches.length === 1) {
@@ -504,16 +631,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   }, { passive: false });
 
   canvas.addEventListener('touchmove', (e) => {
+    if (navigationMode === 'free') return;
     e.preventDefault();
     if (e.touches.length === 1 && isDragging) {
       const dx = e.touches[0].clientX - lastX;
       const dy = e.touches[0].clientY - lastY;
       lastDx = dx * VELOCITY_SMOOTHING + lastDx * (1 - VELOCITY_SMOOTHING);
-      lastDy = dy * VELOCITY_SMOOTHING + lastDy * (1 - VELOCITY_SMOOTHING);
-      lastMoveTime = performance.now();
-      const rotateSpeed = 0.005;
-      theta -= dx * rotateSpeed;
-      phi -= dy * rotateSpeed;
+    lastDy = dy * VELOCITY_SMOOTHING + lastDy * (1 - VELOCITY_SMOOTHING);
+    lastMoveTime = performance.now();
+    const rotateSpeed = 0.005;
+      const { xSign, ySign } = getOrbitSigns();
+      theta -= dx * rotateSpeed * xSign;
+      phi -= dy * rotateSpeed * ySign;
       const EPS = 0.05;
       phi = Math.max(EPS, Math.min(Math.PI - EPS, phi));
       while (theta > Math.PI * 2) theta -= Math.PI * 2;
@@ -526,18 +655,20 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       const dist = Math.sqrt(dx * dx + dy * dy);
       if (lastTouchDist > 0) {
         targetRadius *= lastTouchDist / dist;
-        targetRadius = Math.max(0.1, Math.min(100.0, targetRadius));
+        targetRadius = Math.max(minOrbitRadius, Math.min(100.0, targetRadius));
       }
       lastTouchDist = dist;
     }
   }, { passive: false });
 
   canvas.addEventListener('touchend', (e) => {
+    if (navigationMode === 'free') return;
     if (isDragging && e.touches.length === 0) {
       const timeDelta = performance.now() - lastMoveTime;
       if (timeDelta < 50 && (Math.abs(lastDx) > 0.5 || Math.abs(lastDy) > 0.5)) {
-        velocityTheta = -lastDx * 0.005 * 0.5;
-        velocityPhi = -lastDy * 0.005 * 0.5;
+        const { xSign, ySign } = getOrbitSigns();
+        velocityTheta = -lastDx * 0.005 * 0.5 * xSign;
+        velocityPhi = -lastDy * 0.005 * 0.5 * ySign;
       }
     }
     isDragging = false;
@@ -545,6 +676,70 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   });
 
   // === Helper Functions ===
+  function getFreeflyAxes() {
+    const forward = vec3.fromValues(
+      Math.cos(freeflyPitch) * Math.cos(freeflyYaw),
+      Math.sin(freeflyPitch),
+      Math.cos(freeflyPitch) * Math.sin(freeflyYaw)
+    );
+    vec3.normalize(forward, forward);
+    const worldUp = vec3.fromValues(0, 1, 0);
+    const right = vec3.cross(vec3.create(), forward, worldUp);
+    if (vec3.length(right) < 1e-6) vec3.set(right, 1, 0, 0);
+    vec3.normalize(right, right);
+    const upVec = vec3.cross(vec3.create(), right, forward);
+    vec3.normalize(upVec, upVec);
+    return { forward, right, upVec };
+  }
+
+  function updateFreefly(dt) {
+    const { forward, right, upVec } = getFreeflyAxes();
+    const move = vec3.create();
+    if (activeKeys.has('KeyW')) vec3.add(move, move, forward);
+    if (activeKeys.has('KeyS')) vec3.sub(move, move, forward);
+    if (activeKeys.has('KeyD')) vec3.add(move, move, right);
+    if (activeKeys.has('KeyA')) vec3.sub(move, move, right);
+    if (activeKeys.has('Space') || activeKeys.has('KeyE')) vec3.add(move, move, upVec);
+    if (activeKeys.has('KeyQ') || activeKeys.has('ControlLeft') || activeKeys.has('ControlRight')) vec3.sub(move, move, upVec);
+
+    const hasInput = vec3.length(move) > 0.0001;
+    if (hasInput) {
+      vec3.normalize(move, move);
+      const sprint = (activeKeys.has('ShiftLeft') || activeKeys.has('ShiftRight')) ? sprintMultiplier : 1;
+      const targetVel = vec3.create();
+      vec3.scale(targetVel, move, moveSpeed * sprint);
+      const lerpAlpha = Math.min(1, dt * 10);
+      vec3.lerp(freeflyVelocity, freeflyVelocity, targetVel, lerpAlpha);
+    } else {
+      vec3.scale(freeflyVelocity, freeflyVelocity, Math.pow(INERTIA_FRICTION, dt * 60));
+      if (vec3.length(freeflyVelocity) < INERTIA_MIN_VELOCITY) {
+        vec3.set(freeflyVelocity, 0, 0, 0);
+      }
+    }
+
+    vec3.scaleAndAdd(freeflyPosition, freeflyPosition, freeflyVelocity, dt);
+  }
+
+  function syncFreeflyFromOrbit() {
+    const forward = vec3.sub(vec3.create(), target, eye);
+    vec3.normalize(forward, forward);
+    vec3.copy(freeflyPosition, eye);
+    freeflyYaw = Math.atan2(forward[2], forward[0]);
+    freeflyPitch = Math.asin(forward[1]);
+    vec3.set(freeflyVelocity, 0, 0, 0);
+  }
+
+  function syncOrbitFromFreefly() {
+    const offset = vec3.sub(vec3.create(), freeflyPosition, target);
+    const r = Math.max(minOrbitRadius, vec3.length(offset));
+    radius = targetRadius = r;
+    theta = Math.atan2(offset[2], offset[0]);
+    const cosPhi = Math.min(1, Math.max(-1, offset[1] / r));
+    phi = Math.acos(cosPhi);
+    const EPS = 0.05;
+    phi = Math.max(EPS, Math.min(Math.PI - EPS, phi));
+  }
+
   function updateInertia() {
     if (Math.abs(velocityTheta) > INERTIA_MIN_VELOCITY || Math.abs(velocityPhi) > INERTIA_MIN_VELOCITY) {
       theta += velocityTheta;
@@ -585,15 +780,28 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   function updateCamera(width, height) {
     const aspect = width / height;
     mat4.perspective(projectionMatrix, fov, aspect, near, far);
-    eye[0] = target[0] + radius * Math.sin(phi) * Math.cos(theta);
-    eye[1] = target[1] + radius * Math.cos(phi);
-    eye[2] = target[2] + radius * Math.sin(phi) * Math.sin(theta);
-    mat4.lookAt(viewMatrix, eye, target, up);
+    if (navigationMode === 'free') {
+      const { forward, upVec } = getFreeflyAxes();
+      vec3.copy(eye, freeflyPosition);
+      const lookTarget = vec3.add(vec3.create(), freeflyPosition, forward);
+      mat4.lookAt(viewMatrix, eye, lookTarget, upVec);
+    } else {
+      eye[0] = target[0] + radius * Math.sin(phi) * Math.cos(theta);
+      eye[1] = target[1] + radius * Math.cos(phi);
+      eye[2] = target[2] + radius * Math.sin(phi) * Math.sin(theta);
+      mat4.lookAt(viewMatrix, eye, target, up);
+    }
   }
 
   function computeFogAnchors() {
-    fogNearMean = Math.max(0, radius - 2);
-    fogFarMean = radius + 2;
+    if (navigationMode === 'free') {
+      const speed = vec3.length(freeflyVelocity);
+      fogNearMean = Math.max(0.5, 1.5 + speed * 0.5);
+      fogFarMean = fogNearMean + 5.0;
+    } else {
+      fogNearMean = Math.max(0, radius - 2);
+      fogFarMean = radius + 2;
+    }
   }
 
   function ensureSmokeTarget(w, h, scale) {
@@ -838,8 +1046,16 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
   function render() {
     animationHandle = requestAnimationFrame(render);
-    updateSmoothZoom();
-    updateInertia();
+    const now = performance.now();
+    const dt = Math.min(0.05, Math.max(0.001, (now - lastFrameTime) / 1000));
+    lastFrameTime = now;
+
+    if (navigationMode === 'free') {
+      updateFreefly(dt);
+    } else {
+      updateSmoothZoom();
+      updateInertia();
+    }
 
     const [width, height] = resizeCanvasToDisplaySize(canvas);
 
@@ -1274,6 +1490,71 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     getCentroidFlags(viewId) { return getViewFlags(viewId); },
     setBackground,
     setRenderMode(mode) { renderMode = mode === 'smoke' ? 'smoke' : 'points'; },
+    setNavigationMode(mode) {
+      const next = mode === 'free' ? 'free' : 'orbit';
+      if (next === navigationMode) return;
+      if (next === 'free') {
+        // Ensure orbit state is synced before switching
+        const width = canvas.clientWidth || canvas.width || 1;
+        const height = canvas.clientHeight || canvas.height || 1;
+        updateCamera(width, height);
+        syncFreeflyFromOrbit();
+        navigationMode = 'free';
+        canvas.classList.add('free-nav');
+        canvas.style.cursor = pointerLockActive ? 'none' : 'crosshair';
+        velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
+        activeKeys.clear();
+        if (pointerLockEnabled && canvas.requestPointerLock) {
+          canvas.requestPointerLock();
+        }
+      } else {
+        navigationMode = 'orbit';
+        syncOrbitFromFreefly();
+        canvas.classList.remove('free-nav');
+        lookActive = false;
+        pointerLockEnabled = false;
+        if (document.pointerLockElement === canvas && document.exitPointerLock) {
+          document.exitPointerLock();
+        }
+        activeKeys.clear();
+        vec3.set(freeflyVelocity, 0, 0, 0);
+        canvas.style.cursor = 'grab';
+      }
+    },
+    getNavigationMode() { return navigationMode; },
+    setLookSensitivity(value) {
+      if (!Number.isFinite(value)) return;
+      lookSensitivity = Math.max(0.0005, Math.min(0.02, value));
+    },
+    setMoveSpeed(value) {
+      if (!Number.isFinite(value)) return;
+      moveSpeed = Math.max(0.01, Math.min(5, value));
+    },
+    setInvertLook(value) { invertLookY = !!value; },
+    setInvertLookY(value) { invertLookY = !!value; },
+    setInvertLookX(value) { invertLookX = !!value; },
+    setOrbitInvertRotation(value) { orbitInvertX = !!value; },
+    setOrbitInvertX(value) { orbitInvertX = !!value; },
+    setPointerLockEnabled(enabled) {
+      const desired = !!enabled && navigationMode === 'free';
+      pointerLockEnabled = desired;
+      if (pointerLockEnabled) {
+        if (canvas.requestPointerLock) {
+          canvas.requestPointerLock();
+        }
+      } else if (document.pointerLockElement === canvas && document.exitPointerLock) {
+        document.exitPointerLock();
+      } else {
+        lookActive = false;
+        pointerLockActive = false;
+        canvas.classList.remove('dragging');
+        canvas.style.cursor = navigationMode === 'free' ? 'crosshair' : 'grab';
+        if (typeof pointerLockChangeHandler === 'function') {
+          pointerLockChangeHandler(false);
+        }
+      }
+    },
+    setPointerLockChangeHandler(fn) { pointerLockChangeHandler = typeof fn === 'function' ? fn : null; },
 
     setSmokeVolume(volumeDesc) {
       if (!volumeDesc || !volumeDesc.data) { smokeTextureInfo = null; return; }
@@ -1415,10 +1696,20 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       radius = targetRadius = 3.0;
       theta = phi = Math.PI / 4;
       vec3.set(target, 0, 0, 0);
+      vec3.set(freeflyPosition, 0, 0, 3.0);
+      vec3.set(freeflyVelocity, 0, 0, 0);
+      freeflyYaw = Math.PI / 4;
+      freeflyPitch = 0;
+      lookActive = false;
+      pointerLockEnabled = false;
+      if (document.pointerLockElement === canvas && document.exitPointerLock) {
+        document.exitPointerLock();
+      }
     },
 
     stopInertia() {
       velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
+      vec3.set(freeflyVelocity, 0, 0, 0);
     },
 
     setViewFocusHandler(fn) { viewFocusHandler = typeof fn === 'function' ? fn : null; },
@@ -1528,6 +1819,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       mat4.multiply(mvpMatrix, mvpMatrix, modelMatrix);
       const invView = mat4.create();
       mat4.invert(invView, viewMatrix);
+      const cameraDistance = navigationMode === 'free'
+        ? vec3.length(freeflyPosition)
+        : radius;
       return {
         mvpMatrix: new Float32Array(mvpMatrix),
         viewMatrix: new Float32Array(viewMatrix),
@@ -1544,7 +1838,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         bgColor: new Float32Array(bgColor),
         lightDir: new Float32Array(lightDir),
         cameraPosition: [invView[12], invView[13], invView[14]],
-        cameraDistance: radius
+        cameraDistance
       };
     },
 
