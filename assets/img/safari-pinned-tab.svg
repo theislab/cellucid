@@ -1,0 +1,27 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <!-- Monochrome mask for Safari pinned tab -->
+  <circle cx="32" cy="32" r="26" fill="#000" />
+  <path
+    d="M15 32
+       A17 17 0 0 1 32 15
+       A17 17 0 0 1 46 21"
+    fill="none"
+    stroke="#000"
+    stroke-width="4"
+    stroke-linecap="round"
+  />
+  <circle cx="32" cy="32" r="10" fill="#000" />
+  <path
+    d="M17 39
+       C 22 45, 42 45, 47 37
+       C 50 32, 46 27, 40 26"
+    fill="none"
+    stroke="#000"
+    stroke-width="3"
+    stroke-linecap="round"
+  />
+  <circle cx="19" cy="38.5" r="2.6" fill="#000" />
+  <circle cx="42.5" cy="44" r="2.8" fill="#000" />
+  <circle cx="48.5" cy="36" r="2.6" fill="#000" />
+  <circle cx="40.5" cy="25.5" r="2.3" fill="#000" />
+</svg>

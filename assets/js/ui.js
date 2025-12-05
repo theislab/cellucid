@@ -33,6 +33,7 @@ export function initUI({ state, viewer, dom, smoke }) {
     moveSpeedInput,
     moveSpeedDisplay,
     invertLookCheckbox,
+    projectilesEnabledCheckbox,
     pointerLockCheckbox,
     orbitReverseCheckbox,
     freeflyControls,
@@ -210,7 +211,7 @@ export function initUI({ state, viewer, dom, smoke }) {
   // Log-scale point size mapping
   const MIN_POINT_SIZE = 1;
   const MAX_POINT_SIZE = 200.0;
-  const DEFAULT_POINT_SIZE = 5.0;
+  const DEFAULT_POINT_SIZE = 1.0;
   const POINT_SIZE_SCALE = MAX_POINT_SIZE / MIN_POINT_SIZE;
 
   function rgbToHex(color) {
@@ -1603,6 +1604,10 @@ export function initUI({ state, viewer, dom, smoke }) {
       }
       toggleNavigationPanels(mode);
       updateNavigationHint(mode);
+      // Blur the select so WASD keys work immediately in free-fly mode
+      if (mode === 'free') {
+        navigationModeSelect.blur();
+      }
     });
   }
 
@@ -1642,6 +1647,14 @@ export function initUI({ state, viewer, dom, smoke }) {
     }
     viewer.setPointerLockEnabled(Boolean(checked));
   };
+
+  if (projectilesEnabledCheckbox && viewer.setProjectilesEnabled) {
+    projectilesEnabledCheckbox.checked = false;
+    viewer.setProjectilesEnabled(false);
+    projectilesEnabledCheckbox.addEventListener('change', () => {
+      viewer.setProjectilesEnabled(projectilesEnabledCheckbox.checked);
+    });
+  }
 
   if (pointerLockCheckbox && viewer.setPointerLockEnabled) {
     pointerLockCheckbox.checked = false;
@@ -2180,6 +2193,8 @@ export function initUI({ state, viewer, dom, smoke }) {
 
   const initialFog = parseFloat(fogDensityInput.value);
   viewer.setFogDensity(Number.isFinite(initialFog) ? initialFog / 100.0 : 0.5);
+  const initialSizeAttenuation = parseFloat(sizeAttenuationInput.value);
+  viewer.setSizeAttenuation(Number.isFinite(initialSizeAttenuation) ? initialSizeAttenuation / 100.0 : 0.65);
   lightingStrengthDisplay.textContent = lightingStrengthInput.value;
   fogDensityDisplay.textContent = fogDensityInput.value;
   sizeAttenuationDisplay.textContent = sizeAttenuationInput.value;
@@ -2201,7 +2216,7 @@ export function initUI({ state, viewer, dom, smoke }) {
     pointSize: pointSizeInput?.value || String(pointSizeToSlider(DEFAULT_POINT_SIZE)),
     lighting: lightingStrengthInput?.value || '60',
     fog: fogDensityInput?.value || '50',
-    sizeAttenuation: sizeAttenuationInput?.value || '0',
+    sizeAttenuation: sizeAttenuationInput?.value || '65',
     smokeGrid: smokeGridInput?.value || '60',
     smokeSteps: smokeStepsInput?.value || '75',
     smokeDensity: smokeDensityInput?.value || '66',

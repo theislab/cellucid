@@ -35,6 +35,8 @@
     "name": "cellucid",
     "description": "A high-performance visualization tool for exploring single-cell RNA sequencing data. Visualize millions of cells in 3D with UMAP embeddings, gene expression overlays, categorical filtering, and interactive exploration.",
     "url": "https://www.cellucid.com",
+    "image": "https://www.cellucid.com/assets/img/og-preview.jpg",
+    "logo": "https://www.cellucid.com/assets/img/android-chrome-512x512.png",
     "applicationCategory": "Scientific Software",
     "operatingSystem": "Any (Web Browser)",
     "offers": {
@@ -71,11 +73,24 @@
   </script>
 
   <!-- Favicons -->
-  <link rel="icon" type="image/svg+xml" href="assets/img/favicon.svg" />
-  <link rel="icon" type="image/png" sizes="32x32" href="assets/img/favicon-32x32.png" />
-  <link rel="icon" type="image/png" sizes="16x16" href="assets/img/favicon-16x16.png" />
-  <link rel="apple-touch-icon" sizes="180x180" href="assets/img/apple-touch-icon.png" />
-  <link rel="manifest" href="site.webmanifest" />
+  <link rel="icon" type="image/png" sizes="256x256" href="/assets/img/favicon-256x256.png" />
+  <link rel="icon" type="image/png" sizes="128x128" href="/assets/img/favicon-128x128.png" />
+  <link rel="icon" type="image/png" sizes="96x96" href="/assets/img/favicon-96x96.png" />
+  <link rel="icon" type="image/png" sizes="64x64" href="/assets/img/favicon-64x64.png" />
+  <link rel="icon" type="image/png" sizes="48x48" href="/assets/img/favicon-48x48.png" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/assets/img/favicon-32x32.png" />
+  <link rel="icon" type="image/png" sizes="16x16" href="/assets/img/favicon-16x16.png" />
+  <link rel="icon" type="image/svg+xml" href="/assets/img/favicon.svg" />
+  <link rel="icon" type="image/x-icon" href="/favicon.ico" />
+  <link rel="apple-touch-icon" sizes="180x180" href="/assets/img/apple-touch-icon.png" />
+  <link rel="apple-touch-icon" sizes="167x167" href="/assets/img/apple-touch-icon-167x167.png" />
+  <link rel="apple-touch-icon" sizes="152x152" href="/assets/img/apple-touch-icon-152x152.png" />
+  <link rel="apple-touch-icon" sizes="120x120" href="/assets/img/apple-touch-icon-120x120.png" />
+  <link rel="mask-icon" href="/assets/img/safari-pinned-tab.svg" color="#111827" />
+  <link rel="manifest" href="/site.webmanifest" />
+  <meta name="msapplication-config" content="/browserconfig.xml" />
+  <meta name="msapplication-TileImage" content="/assets/img/mstile-150x150.png" />
+  <meta name="msapplication-TileColor" content="#111827" />
   <meta name="theme-color" content="#ffffff" />
 
   <!-- Newspaper-style font stack (no behavior change, just design) -->
@@ -171,8 +186,8 @@
             <div class="control-block" style="margin-top:6px;">
               <label for="point-size">Point size (log):</label>
               <div class="slider-row">
-                <input id="point-size" type="range" min="0" max="100" step="1" value="30" />
-                <span id="point-size-display" class="slider-value">5.0</span>
+                <input id="point-size" type="range" min="0" max="100" step="1" value="0" />
+                <span id="point-size-display" class="slider-value">1.00</span>
               </div>
             </div>
 
@@ -195,8 +210,8 @@
             <div class="control-block" style="margin-top:6px;">
               <label for="size-attenuation">Perspective size scaling:</label>
               <div class="slider-row">
-                <input id="size-attenuation" type="range" min="0" max="100" step="1" value="0" />
-                <span id="size-attenuation-display" class="slider-value">0</span>
+                <input id="size-attenuation" type="range" min="0" max="100" step="1" value="65" />
+                <span id="size-attenuation-display" class="slider-value">65</span>
               </div>
             </div>
           </div>
@@ -272,11 +287,17 @@
               </div>
               <div class="control-block" style="margin-top:6px;">
                 <label class="checkbox-inline">
+                  <input type="checkbox" id="projectiles-enabled" />
+                  Projectile shooting
+                </label>
+              </div>
+              <div class="control-block" style="margin-top:6px;">
+                <label class="checkbox-inline">
                   <input type="checkbox" id="pointer-lock" />
-                  Capture pointer (lock cursor)
+                  Capture pointer
                 </label>
                 <div class="legend-help" style="margin-top:6px;">
-                  Hides the cursor and lets you look without dragging. Press Esc or Q to release.
+                  Hides the cursor and lets you look without dragging. Press Esc to release.
                 </div>
               </div>
               <div class="legend-help" style="margin-top:6px;">

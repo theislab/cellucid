@@ -405,6 +405,52 @@ export class Octree {
     return true;
   }
 
+  _boundsIntersectsSphere(bounds, center, radius) {
+    // Clamp point to AABB and measure distance to sphere center
+    const cx = Math.max(bounds.minX, Math.min(center[0], bounds.maxX));
+    const cy = Math.max(bounds.minY, Math.min(center[1], bounds.maxY));
+    const cz = Math.max(bounds.minZ, Math.min(center[2], bounds.maxZ));
+    const dx = cx - center[0];
+    const dy = cy - center[1];
+    const dz = cz - center[2];
+    return (dx * dx + dy * dy + dz * dz) <= radius * radius;
+  }
+
+  queryRadius(center, radius, maxResults = 64) {
+    if (!this.root || radius <= 0) return [];
+    const results = [];
+    const stack = [this.root];
+    const r2 = radius * radius;
+
+    while (stack.length && results.length < maxResults) {
+      const node = stack.pop();
+      if (!node) continue;
+      if (!this._boundsIntersectsSphere(node.bounds, center, radius)) continue;
+
+      if (node.indices) {
+        for (let i = 0; i < node.indices.length && results.length < maxResults; i++) {
+          const idx = node.indices[i];
+          const px = this.positions[idx * 3];
+          const py = this.positions[idx * 3 + 1];
+          const pz = this.positions[idx * 3 + 2];
+          const dx = px - center[0];
+          const dy = py - center[1];
+          const dz = pz - center[2];
+          const dist2 = dx * dx + dy * dy + dz * dz;
+          if (dist2 <= r2) {
+            results.push(idx);
+          }
+        }
+      } else if (node.children) {
+        for (const child of node.children) {
+          if (child) stack.push(child);
+        }
+      }
+    }
+
+    return results;
+  }
+
   getBoundingSphere() {
     const b = this.bounds;
     const centerX = (b.minX + b.maxX) * 0.5;

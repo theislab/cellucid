@@ -27,14 +27,31 @@ in vec3 a_color;
 in float a_alpha;
 
 uniform mat4 u_mvpMatrix;
+uniform mat4 u_viewMatrix;
+uniform mat4 u_modelMatrix;
 uniform float u_pointSize;
+uniform float u_sizeAttenuation;
+uniform float u_viewportHeight;
+uniform float u_fov;
 
 out vec3 v_color;
 out float v_alpha;
 
 void main() {
   gl_Position = u_mvpMatrix * vec4(a_position, 1.0);
-  gl_PointSize = u_pointSize;
+
+  // Compute eye-space depth for perspective scaling (matches HP_VS_FULL)
+  vec4 worldPos = u_modelMatrix * vec4(a_position, 1.0);
+  vec4 eyePos = u_viewMatrix * worldPos;
+  float eyeDepth = -eyePos.z;
+
+  // Perspective point size with attenuation
+  float projectionFactor = u_viewportHeight / (2.0 * tan(u_fov * 0.5));
+  float worldSize = u_pointSize * 0.01;
+  float perspectiveSize = (worldSize * projectionFactor) / max(eyeDepth, 0.001);
+  gl_PointSize = mix(u_pointSize, perspectiveSize, u_sizeAttenuation);
+  gl_PointSize = clamp(gl_PointSize, 0.5, 128.0);
+
   if (a_alpha < 0.01) gl_PointSize = 0.0;
   v_color = a_color;
   v_alpha = a_alpha;
@@ -186,7 +203,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   };
   const centroidUniformLocations = {
     mvpMatrix: gl.getUniformLocation(centroidProgram, 'u_mvpMatrix'),
+    viewMatrix: gl.getUniformLocation(centroidProgram, 'u_viewMatrix'),
+    modelMatrix: gl.getUniformLocation(centroidProgram, 'u_modelMatrix'),
     pointSize: gl.getUniformLocation(centroidProgram, 'u_pointSize'),
+    sizeAttenuation: gl.getUniformLocation(centroidProgram, 'u_sizeAttenuation'),
+    viewportHeight: gl.getUniformLocation(centroidProgram, 'u_viewportHeight'),
+    fov: gl.getUniformLocation(centroidProgram, 'u_fov'),
   };
 
   // === BUFFERS ===
@@ -194,6 +216,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   const centroidPositionBuffer = gl.createBuffer();
   const centroidColorBuffer = gl.createBuffer();
   const centroidAlphaBuffer = gl.createBuffer();
+  // Projectile buffers (tiny count, dynamic)
+  const projectilePositionBuffer = gl.createBuffer();
+  const projectileColorBuffer = gl.createBuffer();
+  const projectileAlphaBuffer = gl.createBuffer();
+  const impactPositionBuffer = gl.createBuffer();
+  const impactColorBuffer = gl.createBuffer();
+  const impactAlphaBuffer = gl.createBuffer();
 
   // Edge buffer for connectivity lines
   const edgeStripBuffer = gl.createBuffer();
@@ -291,6 +320,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   mat4.identity(modelMatrix);
 
   const tempVec4 = vec4.create();
+  const tempVec3 = vec3.create();
+  const tempVec3b = vec3.create();
   const lightDir = vec3.normalize(vec3.create(), [0.5, 0.7, 0.5]);
 
   let positionsArray = null;
@@ -351,10 +382,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   const fov = 45 * Math.PI / 180;
   const minOrbitRadius = 0.05;
 
-  let basePointSize = 5.0;
+  let basePointSize = 1.0;
   let lightingStrength = 0.6;
   let fogDensity = 0.5;
-  let sizeAttenuation = 0.0;
+  let sizeAttenuation = 0.65;
   let outlierThreshold = 1.0;
   let bgColor = [1.0, 1.0, 1.0];
   let fogColor = [1.0, 1.0, 1.0];
@@ -381,6 +412,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   let dragMode = 'rotate';
   let lastX = 0;
   let lastY = 0;
+  let cursorX = 0;  // Current cursor position for aiming (client coords)
+  let cursorY = 0;
   let targetRadius = radius;
   let lastTouchDist = 0;
   let animationHandle = null;
@@ -400,8 +433,30 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   let pointerLockEnabled = false;
   let pointerLockActive = false;
   let pointerLockChangeHandler = null;
+  let projectilesEnabled = false;
+  let pendingShot = false;
   let lookActive = false;
   let lastFrameTime = performance.now();
+
+  // Projectile sandbox (free-fly + pointer lock)
+  const projectiles = [];
+  const impactFlashes = [];
+  let projectileBufferDirty = true;
+  let impactBufferDirty = true;
+  let projectilePositions = new Float32Array();
+  let projectileColors = new Float32Array();
+  let projectileAlphas = new Float32Array();
+  let impactPositions = new Float32Array();
+  let impactColors = new Float32Array();
+  let impactAlphas = new Float32Array();
+  let lastShotTime = 0;
+  let pointBounds = {
+    min: [-1, -1, -1],
+    max: [1, 1, 1],
+    center: [0, 0, 0],
+    radius: 3
+  };
+  let pointCollisionRadius = 0.02;
 
   let velocityTheta = 0;
   let velocityPhi = 0;
@@ -415,6 +470,17 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   const INERTIA_FRICTION = 0.92;
   const INERTIA_MIN_VELOCITY = 0.0001;
   const VELOCITY_SMOOTHING = 0.3;
+  const PROJECTILE_RADIUS = 0.04;
+  const PROJECTILE_SPEED = 2.0;         // Slow enough to watch, fast enough to feel responsive
+  const PROJECTILE_GRAVITY = 9.8 * 0.08; // Very light gravity for gentle arcs
+  const PROJECTILE_DRAG = 0.998;         // Minimal drag - projectiles glide smoothly (per frame at reference rate)
+  const PHYSICS_TICK_RATE = 60;          // Reference frame rate for frame-independent physics (Hz)
+  const PROJECTILE_LIFETIME = 18.0;      // Longer lifetime to travel further
+  const PROJECTILE_BOUNCE = 0.4;         // Softer bounce on data collision
+  const PROJECTILE_FLASH_TIME = 0.35;
+  const MAX_PROJECTILES = 24;
+  const MAX_IMPACT_FLASHES = 96;
+  const SHOT_COOLDOWN_SECONDS = 0.05;
 
   function getOrbitSigns() {
     // Google Earth style: invert horizontal drag to feel like grabbing the globe
@@ -435,15 +501,24 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
   canvas.addEventListener('mousedown', (e) => {
     if (navigationMode === 'free') {
+      const wantsShot = e.button === 0;
+      // Only request pointer lock if user has enabled it via checkbox
       if (pointerLockEnabled && !pointerLockActive && canvas.requestPointerLock) {
+        // Pointer lock enabled but not yet active - request it and queue the shot
+        pendingShot = pendingShot || wantsShot;
         canvas.requestPointerLock();
       } else {
+        // Either pointer lock is disabled, or already active - use normal mouse look
         lookActive = true;
         lastX = e.clientX;
         lastY = e.clientY;
+        if (wantsShot) {
+          spawnProjectile();
+        }
       }
       canvas.classList.add('dragging');
       canvas.style.cursor = pointerLockActive ? 'none' : 'crosshair';
+      e.preventDefault();
       return;
     }
     isDragging = true;
@@ -465,10 +540,16 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
   window.addEventListener('mouseup', () => {
     if (navigationMode === 'free') {
-      lookActive = false;
+      // Keep looking active while pointer lock is held; only stop drag-look when not locked
+      if (!pointerLockActive) {
+        lookActive = false;
+        canvas.classList.remove('dragging');
+        canvas.style.cursor = 'crosshair';
+      } else {
+        canvas.classList.add('dragging');
+        canvas.style.cursor = 'none';
+      }
       isDragging = false;
-      canvas.classList.remove('dragging');
-      canvas.style.cursor = navigationMode === 'free' ? 'crosshair' : 'grab';
       return;
     }
     if (isDragging) {
@@ -499,6 +580,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   });
 
   window.addEventListener('mousemove', (e) => {
+    // Always track cursor position for aiming (when not in pointer lock)
+    if (!pointerLockActive) {
+      cursorX = e.clientX;
+      cursorY = e.clientY;
+    }
     if (navigationMode === 'free') {
       if (!lookActive) return;
       const dx = pointerLockActive ? e.movementX : (e.clientX - lastX);
@@ -570,9 +656,14 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       }
       canvas.classList.add('dragging');
       canvas.style.cursor = 'none';
+      if (pendingShot) {
+        spawnProjectile();
+        pendingShot = false;
+      }
     } else {
       lookActive = false;
       pointerLockEnabled = false;
+      pendingShot = false;
       canvas.classList.remove('dragging');
       canvas.style.cursor = navigationMode === 'free' ? 'crosshair' : 'grab';
     }
@@ -593,7 +684,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   window.addEventListener('keydown', (e) => {
     if (isTypingTarget(e.target)) return;
     const code = e.code;
-    if (pointerLockActive && (code === 'Escape' || code === 'KeyQ')) {
+    if (pointerLockActive && code === 'Escape') {
       if (document.exitPointerLock) document.exitPointerLock();
       pointerLockEnabled = false;
       if (typeof pointerLockChangeHandler === 'function') pointerLockChangeHandler(false);
@@ -679,6 +770,275 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   });
 
   // === Helper Functions ===
+  function computePointBoundsFromPositions(positions) {
+    if (!positions || positions.length < 3) return;
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    const count = positions.length / 3;
+    for (let i = 0; i < count; i++) {
+      const idx = i * 3;
+      const x = positions[idx];
+      const y = positions[idx + 1];
+      const z = positions[idx + 2];
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+      if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+    }
+    const centerX = (minX + maxX) * 0.5;
+    const centerY = (minY + maxY) * 0.5;
+    const centerZ = (minZ + maxZ) * 0.5;
+    const dx = maxX - minX;
+    const dy = maxY - minY;
+    const dz = maxZ - minZ;
+    const radius = Math.max(0.0001, Math.sqrt(dx * dx + dy * dy + dz * dz) * 0.5);
+    pointBounds = {
+      min: [minX, minY, minZ],
+      max: [maxX, maxY, maxZ],
+      center: [centerX, centerY, centerZ],
+      radius
+    };
+    pointCollisionRadius = Math.max(0.01, radius * 0.01);
+  }
+
+  function queryNearbyPoints(center, radius, maxResults = 64) {
+    if (!positionsArray || positionsArray.length < 3) return [];
+    if (hpRenderer?.octree) {
+      const indices = hpRenderer.octree.queryRadius(center, radius, maxResults);
+      return indices.map((idx) => {
+        const base = idx * 3;
+        return {
+          index: idx,
+          position: [positionsArray[base], positionsArray[base + 1], positionsArray[base + 2]],
+          color: colorsArray
+            ? [colorsArray[base], colorsArray[base + 1], colorsArray[base + 2]]
+            : [1, 0.6, 0.2]
+        };
+      });
+    }
+    // Small fallback scan for tiny datasets without an octree
+    const results = [];
+    const maxScan = Math.min(pointCount, 4000);
+    const r2 = radius * radius;
+    for (let i = 0; i < maxScan && results.length < maxResults; i++) {
+      const base = i * 3;
+      const dx = positionsArray[base] - center[0];
+      const dy = positionsArray[base + 1] - center[1];
+      const dz = positionsArray[base + 2] - center[2];
+      const dist2 = dx * dx + dy * dy + dz * dz;
+      if (dist2 <= r2) {
+        results.push({
+          index: i,
+          position: [positionsArray[base], positionsArray[base + 1], positionsArray[base + 2]],
+          color: colorsArray
+            ? [colorsArray[base], colorsArray[base + 1], colorsArray[base + 2]]
+            : [1, 0.6, 0.2]
+        });
+      }
+    }
+    return results;
+  }
+
+  function pickProjectileColor() {
+    if (colorsArray && pointCount > 0) {
+      const idx = Math.floor(Math.random() * pointCount) * 3;
+      return [
+        colorsArray[idx],
+        colorsArray[idx + 1],
+        colorsArray[idx + 2]
+      ];
+    }
+    return [1.0, 0.6, 0.2];
+  }
+
+  function spawnProjectile() {
+    if (navigationMode !== 'free') return;
+    if (!projectilesEnabled) return;
+    const now = performance.now();
+    if (now - lastShotTime < SHOT_COOLDOWN_SECONDS * 1000) return;
+    lastShotTime = now;
+
+    // Use cursor-based aiming when not in pointer lock mode, otherwise use camera forward
+    const aimDirection = pointerLockActive
+      ? getFreeflyAxes().forward
+      : getAimDirectionFromCursor();
+
+    // Start projectile close to camera (0.1 offset balances "from camera" feel with reasonable perspective size)
+    const start = vec3.add(vec3.create(), freeflyPosition, vec3.scale(vec3.create(), aimDirection, 0.1));
+    const vel = vec3.scale(vec3.create(), aimDirection, PROJECTILE_SPEED);
+    projectiles.push({
+      position: start,
+      velocity: vel,
+      color: pickProjectileColor(),
+      radius: PROJECTILE_RADIUS,
+      age: 0
+    });
+    if (projectiles.length > MAX_PROJECTILES) projectiles.shift();
+    projectileBufferDirty = true;
+  }
+
+  function recordImpact(position, color) {
+    impactFlashes.push({
+      position: [position[0], position[1], position[2]],
+      color: color || [1, 1, 1],
+      age: 0,
+      life: PROJECTILE_FLASH_TIME
+    });
+    if (impactFlashes.length > MAX_IMPACT_FLASHES) impactFlashes.shift();
+    impactBufferDirty = true;
+  }
+
+  function updateImpactFlashes(dt) {
+    if (!impactFlashes.length) return;
+    let anyRemoved = false;
+    for (let i = impactFlashes.length - 1; i >= 0; i--) {
+      const flash = impactFlashes[i];
+      flash.age += dt;
+      if (flash.age >= flash.life) {
+        impactFlashes.splice(i, 1);
+        anyRemoved = true;
+      }
+    }
+    if (anyRemoved || dt > 0) impactBufferDirty = true;
+  }
+
+  function stepProjectiles(dt) {
+    if (!projectiles.length) return;
+    const gravityStep = PROJECTILE_GRAVITY * dt;
+    const drag = Math.pow(PROJECTILE_DRAG, dt * PHYSICS_TICK_RATE);
+    const maxRange = pointBounds.radius * 3 + 1.0;
+
+    for (let i = projectiles.length - 1; i >= 0; i--) {
+      const p = projectiles[i];
+      p.age += dt;
+      if (p.age > PROJECTILE_LIFETIME) {
+        projectiles.splice(i, 1);
+        projectileBufferDirty = true;
+        continue;
+      }
+
+      p.velocity[1] -= gravityStep;
+      vec3.scale(p.velocity, p.velocity, drag);
+      vec3.scaleAndAdd(p.position, p.position, p.velocity, dt);
+
+      const dx = p.position[0] - pointBounds.center[0];
+      const dy = p.position[1] - pointBounds.center[1];
+      const dz = p.position[2] - pointBounds.center[2];
+      const distFromCenter = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (distFromCenter > maxRange) {
+        projectiles.splice(i, 1);
+        projectileBufferDirty = true;
+        continue;
+      }
+
+      if (pointCount > 0) {
+        const hits = queryNearbyPoints(p.position, p.radius + pointCollisionRadius, 48);
+        if (hits.length) {
+          vec3.set(tempVec3, 0, 0, 0);
+          for (const hit of hits) {
+            vec3.sub(tempVec3b, p.position, hit.position);
+            const d = vec3.length(tempVec3b);
+            if (d > 1e-4) {
+              vec3.scaleAndAdd(tempVec3, tempVec3, tempVec3b, 1 / d);
+            }
+            recordImpact(hit.position, hit.color);
+          }
+          const nLen = vec3.length(tempVec3);
+          if (nLen > 0) {
+            vec3.scale(tempVec3, tempVec3, 1 / nLen);
+            const vDotN = vec3.dot(p.velocity, tempVec3);
+            if (vDotN < 0) {
+              vec3.scaleAndAdd(p.velocity, p.velocity, tempVec3, -(1 + PROJECTILE_BOUNCE) * vDotN);
+              vec3.scale(p.velocity, p.velocity, 0.92);
+            }
+          }
+        }
+      }
+    }
+
+    if (projectiles.length) projectileBufferDirty = true;
+  }
+
+  function rebuildProjectileBuffers() {
+    const count = projectiles.length;
+    if (count === 0) {
+      projectilePositions = new Float32Array();
+      projectileColors = new Float32Array();
+      projectileAlphas = new Float32Array();
+      gl.bindBuffer(gl.ARRAY_BUFFER, projectilePositionBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, projectilePositions, gl.DYNAMIC_DRAW);
+      gl.bindBuffer(gl.ARRAY_BUFFER, projectileColorBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, projectileColors, gl.DYNAMIC_DRAW);
+      gl.bindBuffer(gl.ARRAY_BUFFER, projectileAlphaBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, projectileAlphas, gl.DYNAMIC_DRAW);
+      projectileBufferDirty = false;
+      return;
+    }
+
+    projectilePositions = new Float32Array(count * 3);
+    projectileColors = new Float32Array(count * 3);
+    projectileAlphas = new Float32Array(count);
+    for (let i = 0; i < count; i++) {
+      const p = projectiles[i];
+      const base = i * 3;
+      projectilePositions[base] = p.position[0];
+      projectilePositions[base + 1] = p.position[1];
+      projectilePositions[base + 2] = p.position[2];
+      projectileColors[base] = p.color[0];
+      projectileColors[base + 1] = p.color[1];
+      projectileColors[base + 2] = p.color[2];
+      projectileAlphas[i] = 1.0;
+    }
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, projectilePositionBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, projectilePositions, gl.DYNAMIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, projectileColorBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, projectileColors, gl.DYNAMIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, projectileAlphaBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, projectileAlphas, gl.DYNAMIC_DRAW);
+    projectileBufferDirty = false;
+  }
+
+  function rebuildImpactBuffers() {
+    const count = impactFlashes.length;
+    if (count === 0) {
+      impactPositions = new Float32Array();
+      impactColors = new Float32Array();
+      impactAlphas = new Float32Array();
+      gl.bindBuffer(gl.ARRAY_BUFFER, impactPositionBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, impactPositions, gl.DYNAMIC_DRAW);
+      gl.bindBuffer(gl.ARRAY_BUFFER, impactColorBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, impactColors, gl.DYNAMIC_DRAW);
+      gl.bindBuffer(gl.ARRAY_BUFFER, impactAlphaBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, impactAlphas, gl.DYNAMIC_DRAW);
+      impactBufferDirty = false;
+      return;
+    }
+
+    impactPositions = new Float32Array(count * 3);
+    impactColors = new Float32Array(count * 3);
+    impactAlphas = new Float32Array(count);
+    for (let i = 0; i < count; i++) {
+      const flash = impactFlashes[i];
+      const base = i * 3;
+      const alpha = Math.max(0, 1 - (flash.age / flash.life));
+      impactPositions[base] = flash.position[0];
+      impactPositions[base + 1] = flash.position[1];
+      impactPositions[base + 2] = flash.position[2];
+      impactColors[base] = flash.color[0];
+      impactColors[base + 1] = flash.color[1];
+      impactColors[base + 2] = flash.color[2];
+      impactAlphas[i] = alpha;
+    }
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, impactPositionBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, impactPositions, gl.DYNAMIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, impactColorBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, impactColors, gl.DYNAMIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, impactAlphaBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, impactAlphas, gl.DYNAMIC_DRAW);
+    impactBufferDirty = false;
+  }
+
   function getFreeflyAxes() {
     const forward = vec3.fromValues(
       Math.cos(freeflyPitch) * Math.cos(freeflyYaw),
@@ -693,6 +1053,47 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     const upVec = vec3.cross(vec3.create(), right, forward);
     vec3.normalize(upVec, upVec);
     return { forward, right, upVec };
+  }
+
+  // Compute aim direction from cursor screen position (for aiming without pointer lock)
+  function getAimDirectionFromCursor() {
+    const rect = canvas.getBoundingClientRect();
+    // Convert cursor position to normalized device coordinates (-1 to 1)
+    const ndcX = ((cursorX - rect.left) / rect.width) * 2 - 1;
+    const ndcY = -((cursorY - rect.top) / rect.height) * 2 + 1;  // Flip Y for GL
+
+    // Create ray in clip space at near plane
+    const nearPoint = vec4.fromValues(ndcX, ndcY, -1, 1);
+    const farPoint = vec4.fromValues(ndcX, ndcY, 1, 1);
+
+    // Get inverse view-projection matrix
+    const aspect = rect.width / rect.height;
+    const tempProj = mat4.create();
+    const tempViewProj = mat4.create();
+    const invViewProj = mat4.create();
+    mat4.perspective(tempProj, fov, aspect, near, far);
+
+    // Build view matrix for freefly mode
+    const { forward: camForward, upVec } = getFreeflyAxes();
+    const tempView = mat4.create();
+    const lookTarget = vec3.add(vec3.create(), freeflyPosition, camForward);
+    mat4.lookAt(tempView, freeflyPosition, lookTarget, upVec);
+
+    mat4.multiply(tempViewProj, tempProj, tempView);
+    mat4.invert(invViewProj, tempViewProj);
+
+    // Unproject to world space
+    vec4.transformMat4(nearPoint, nearPoint, invViewProj);
+    vec4.transformMat4(farPoint, farPoint, invViewProj);
+
+    // Perspective divide
+    vec3.set(tempVec3, nearPoint[0] / nearPoint[3], nearPoint[1] / nearPoint[3], nearPoint[2] / nearPoint[3]);
+    vec3.set(tempVec3b, farPoint[0] / farPoint[3], farPoint[1] / farPoint[3], farPoint[2] / farPoint[3]);
+
+    // Direction from near to far
+    const direction = vec3.sub(vec3.create(), tempVec3b, tempVec3);
+    vec3.normalize(direction, direction);
+    return direction;
   }
 
   function updateFreefly(dt) {
@@ -714,7 +1115,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       const lerpAlpha = Math.min(1, dt * 10);
       vec3.lerp(freeflyVelocity, freeflyVelocity, targetVel, lerpAlpha);
     } else {
-      vec3.scale(freeflyVelocity, freeflyVelocity, Math.pow(INERTIA_FRICTION, dt * 60));
+      vec3.scale(freeflyVelocity, freeflyVelocity, Math.pow(INERTIA_FRICTION, dt * PHYSICS_TICK_RATE));
       if (vec3.length(freeflyVelocity) < INERTIA_MIN_VELOCITY) {
         vec3.set(freeflyVelocity, 0, 0, 0);
       }
@@ -950,13 +1351,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     gl.drawArrays(gl.TRIANGLES, 0, edgeStripVertexCount);
   }
 
-  function drawCentroids(count) {
+  function drawCentroids(count, viewportHeight) {
     const numPoints = count !== undefined ? count : centroidCount;
     if (numPoints === 0) return;
     gl.useProgram(centroidProgram);
     gl.uniformMatrix4fv(centroidUniformLocations.mvpMatrix, false, mvpMatrix);
+    gl.uniformMatrix4fv(centroidUniformLocations.viewMatrix, false, viewMatrix);
+    gl.uniformMatrix4fv(centroidUniformLocations.modelMatrix, false, modelMatrix);
     // Make centroids stand out by rendering them much larger than regular points
     gl.uniform1f(centroidUniformLocations.pointSize, basePointSize * 4.0);
+    gl.uniform1f(centroidUniformLocations.sizeAttenuation, sizeAttenuation);
+    gl.uniform1f(centroidUniformLocations.viewportHeight, viewportHeight);
+    gl.uniform1f(centroidUniformLocations.fov, fov);
 
     gl.bindBuffer(gl.ARRAY_BUFFER, centroidPositionBuffer);
     gl.enableVertexAttribArray(centroidAttribLocations.position);
@@ -971,6 +1377,69 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     gl.vertexAttribPointer(centroidAttribLocations.alpha, 1, gl.FLOAT, false, 0, 0);
 
     gl.drawArrays(gl.POINTS, 0, numPoints);
+  }
+
+  function drawProjectiles(viewportHeight) {
+    const count = projectiles.length;
+    if (count === 0) return;
+
+    gl.useProgram(centroidProgram);
+    gl.uniformMatrix4fv(centroidUniformLocations.mvpMatrix, false, mvpMatrix);
+    gl.uniformMatrix4fv(centroidUniformLocations.viewMatrix, false, viewMatrix);
+    gl.uniformMatrix4fv(centroidUniformLocations.modelMatrix, false, modelMatrix);
+    // Use the same point size as data points so bullets match
+    gl.uniform1f(centroidUniformLocations.pointSize, basePointSize);
+    gl.uniform1f(centroidUniformLocations.sizeAttenuation, sizeAttenuation);
+    gl.uniform1f(centroidUniformLocations.viewportHeight, viewportHeight);
+    gl.uniform1f(centroidUniformLocations.fov, fov);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, projectilePositionBuffer);
+    gl.enableVertexAttribArray(centroidAttribLocations.position);
+    gl.vertexAttribPointer(centroidAttribLocations.position, 3, gl.FLOAT, false, 0, 0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, projectileColorBuffer);
+    gl.enableVertexAttribArray(centroidAttribLocations.color);
+    gl.vertexAttribPointer(centroidAttribLocations.color, 3, gl.FLOAT, false, 0, 0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, projectileAlphaBuffer);
+    gl.enableVertexAttribArray(centroidAttribLocations.alpha);
+    gl.vertexAttribPointer(centroidAttribLocations.alpha, 1, gl.FLOAT, false, 0, 0);
+
+    gl.drawArrays(gl.POINTS, 0, count);
+  }
+
+  function drawImpactFlashes(viewportHeight) {
+    const count = impactFlashes.length;
+    if (count === 0) return;
+
+    gl.useProgram(centroidProgram);
+    gl.uniformMatrix4fv(centroidUniformLocations.mvpMatrix, false, mvpMatrix);
+    gl.uniformMatrix4fv(centroidUniformLocations.viewMatrix, false, viewMatrix);
+    gl.uniformMatrix4fv(centroidUniformLocations.modelMatrix, false, modelMatrix);
+    // Impact flashes are slightly smaller than projectiles (80%)
+    gl.uniform1f(centroidUniformLocations.pointSize, basePointSize * 0.8);
+    gl.uniform1f(centroidUniformLocations.sizeAttenuation, sizeAttenuation);
+    gl.uniform1f(centroidUniformLocations.viewportHeight, viewportHeight);
+    gl.uniform1f(centroidUniformLocations.fov, fov);
+
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, impactPositionBuffer);
+    gl.enableVertexAttribArray(centroidAttribLocations.position);
+    gl.vertexAttribPointer(centroidAttribLocations.position, 3, gl.FLOAT, false, 0, 0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, impactColorBuffer);
+    gl.enableVertexAttribArray(centroidAttribLocations.color);
+    gl.vertexAttribPointer(centroidAttribLocations.color, 3, gl.FLOAT, false, 0, 0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, impactAlphaBuffer);
+    gl.enableVertexAttribArray(centroidAttribLocations.alpha);
+    gl.vertexAttribPointer(centroidAttribLocations.alpha, 1, gl.FLOAT, false, 0, 0);
+
+    gl.drawArrays(gl.POINTS, 0, count);
+
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
   }
 
   function getViewFlags(viewId) {
@@ -1059,6 +1528,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       updateSmoothZoom();
       updateInertia();
     }
+
+    stepProjectiles(dt);
+    updateImpactFlashes(dt);
+    if (projectileBufferDirty) rebuildProjectileBuffers();
+    if (impactBufferDirty) rebuildImpactBuffers();
 
     const [width, height] = resizeCanvasToDisplaySize(canvas);
 
@@ -1215,8 +1689,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     // Draw centroids
     const flags = getViewFlags(vid);
     if (flags.points && numCentroids > 0) {
-      drawCentroids(numCentroids);
+      drawCentroids(numCentroids, height);
     }
+    drawProjectiles(height);
+    drawImpactFlashes(height);
 
     // Update labels
     if (flags.labels) {
@@ -1426,6 +1902,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       positionsArray = positions;
       colorsArray = colors;
       transparencyArray = transparency;
+      computePointBoundsFromPositions(positions);
 
       // Load data into HP renderer
       hpRenderer.loadData(positions, colors, transparency);
@@ -1558,6 +2035,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       }
     },
     setPointerLockChangeHandler(fn) { pointerLockChangeHandler = typeof fn === 'function' ? fn : null; },
+    setProjectilesEnabled(enabled) { projectilesEnabled = !!enabled; },
 
     setSmokeVolume(volumeDesc) {
       if (!volumeDesc || !volumeDesc.data) { smokeTextureInfo = null; return; }
@@ -1705,6 +2183,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       freeflyPitch = 0;
       lookActive = false;
       pointerLockEnabled = false;
+      projectiles.length = 0;
+      impactFlashes.length = 0;
+      projectileBufferDirty = true;
+      impactBufferDirty = true;
       if (document.pointerLockElement === canvas && document.exitPointerLock) {
         document.exitPointerLock();
       }
