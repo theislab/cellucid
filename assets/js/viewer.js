@@ -565,6 +565,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     pointerLockActive = document.pointerLockElement === canvas;
     if (pointerLockActive) {
       lookActive = true;
+      if (typeof canvas.focus === 'function') {
+        canvas.focus();
+      }
       canvas.classList.add('dragging');
       canvas.style.cursor = 'none';
     } else {

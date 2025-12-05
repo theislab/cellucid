@@ -127,7 +127,7 @@
     </div>
   </noscript>
 
-  <canvas id="glcanvas"></canvas>
+  <canvas id="glcanvas" tabindex="0"></canvas>
 
   <!-- Sidebar toggle button -->
   <button id="sidebar-toggle" class="sidebar-open" title="Toggle sidebar">✕</button>
@@ -234,13 +234,13 @@
               <div class="section-title">Navigation</div>
             </div>
             <div class="legend-help">
-              Choose orbit for data-first inspection or AAA free-fly for desk-to-immersive movement.
+              Choose orbit for data-first inspection or free-fly for desk-to-immersive movement.
             </div>
             <div class="control-block" style="margin-top:6px;">
               <label for="navigation-mode">Mode:</label>
               <select id="navigation-mode" class="obs-select">
-                <option value="orbit">Orbit (default)</option>
-                <option value="free">Free-fly (AAA)</option>
+                <option value="orbit">Orbit</option>
+                <option value="free">Free-fly</option>
               </select>
             </div>
             <div id="orbit-controls" class="nav-mode-box">
@@ -280,7 +280,7 @@
                 </div>
               </div>
               <div class="legend-help" style="margin-top:6px;">
-                Free-fly: click+drag to look • WASD move • Space/E up • Ctrl/Q down • Shift sprint • Wheel dolly.
+                Free-fly: click+drag to look • WASD move • Space/E up • Ctrl/Q down • Shift sprint.
               </div>
             </div>
           </div>

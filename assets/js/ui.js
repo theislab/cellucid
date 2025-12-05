@@ -1646,6 +1646,9 @@ export function initUI({ state, viewer, dom, smoke }) {
   if (pointerLockCheckbox && viewer.setPointerLockEnabled) {
     pointerLockCheckbox.checked = false;
     pointerLockCheckbox.addEventListener('change', () => {
+      if (pointerLockCheckbox.checked && typeof pointerLockCheckbox.blur === 'function') {
+        pointerLockCheckbox.blur();
+      }
       applyPointerLock(pointerLockCheckbox.checked);
     });
   }
