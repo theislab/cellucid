@@ -196,101 +196,107 @@
           <div class="control-block" id="smoke-controls">
             <div class="section-title">Volumetric smoke</div>
             <div class="legend-help">
-              Adjust settings for realistic cloud appearance.
+              Physically-based ray-marched smoke. Knobs auto-scale with grid and noise detail.
             </div>
 
-            <div class="field-select" style="margin-top:4px;">
-              <label for="smoke-grid">Density grid resolution:</label>
-              <select id="smoke-grid" class="obs-select">
-                <option value="32">32³ (fast, low detail)</option>
-                <option value="48">48³ (balanced)</option>
-                <option value="64">64³ (detailed)</option>
-                <option value="96">96³ (high detail)</option>
-                <option value="128" selected>128³ (very high)</option>
-                <option value="256">256³ (ultra)</option>
-                <option value="512">512³ (extreme)</option>
-                <option value="1024">1024³ (benchmark)</option>
-              </select>
+            <div class="section-divider">
+              <div class="section-title">Quality & performance</div>
             </div>
-
-            <div class="control-block" style="margin-top:6px;">
-              <label for="smoke-steps">Ray quality (GPU cost):</label>
+            <div class="control-block">
+              <label for="smoke-grid">Grid density:</label>
               <div class="slider-row">
-                <input id="smoke-steps" type="range" min="0" max="100" step="1" value="60" />
-                <span id="smoke-steps-display" class="slider-value">Balanced</span>
+                <input id="smoke-grid" type="range" min="0" max="100" step="1" value="60" />
+                <span id="smoke-grid-display" class="slider-value">256³</span>
+              </div>
+            </div>
+            <div class="control-block" style="margin-top:6px;">
+              <label for="smoke-steps">Ray quality:</label>
+              <div class="slider-row">
+                <input id="smoke-steps" type="range" min="0" max="100" step="1" value="75" />
+                <span id="smoke-steps-display" class="slider-value">High</span>
+              </div>
+            </div>
+            <div class="control-block" style="margin-top:6px;">
+              <label for="cloud-resolution">Render resolution:</label>
+              <div class="slider-row">
+                <input id="cloud-resolution" type="range" min="0" max="100" step="1" value="15" />
+                <span id="cloud-resolution-display" class="slider-value">0.51x</span>
+              </div>
+            </div>
+            <div class="control-block" style="margin-top:6px;">
+              <label for="noise-resolution">Noise detail:</label>
+              <div class="slider-row">
+                <input id="noise-resolution" type="range" min="0" max="100" step="1" value="43" />
+                <span id="noise-resolution-display" class="slider-value">96³</span>
               </div>
             </div>
 
-            <div class="control-block" style="margin-top:6px;">
+            <div class="section-divider">
+              <div class="section-title">Shape & motion</div>
+            </div>
+            <div class="control-block">
               <label for="smoke-density">Cloud density:</label>
               <div class="slider-row">
-                <input id="smoke-density" type="range" min="0" max="100" step="1" value="50" />
-                <span id="smoke-density-display" class="slider-value">2.2</span>
+                <input id="smoke-density" type="range" min="0" max="100" step="1" value="66" />
+                <span id="smoke-density-display" class="slider-value">10.6</span>
               </div>
             </div>
-
             <div class="control-block" style="margin-top:6px;">
-              <label for="smoke-speed">Animation speed:</label>
-              <div class="slider-row">
-                <input id="smoke-speed" type="range" min="0" max="100" step="1" value="80" />
-                <span id="smoke-speed-display" class="slider-value">2.00</span>
-              </div>
-            </div>
-
-            <div class="control-block" style="margin-top:6px;">
-              <label for="smoke-detail">Close-up detail:</label>
+              <label for="smoke-detail">Fine detail:</label>
               <div class="slider-row">
                 <input id="smoke-detail" type="range" min="0" max="100" step="1" value="60" />
-                <span id="smoke-detail-display" class="slider-value">3.0</span>
+                <span id="smoke-detail-display" class="slider-value">3.8</span>
               </div>
             </div>
-
             <div class="control-block" style="margin-top:6px;">
               <label for="smoke-warp">Turbulence:</label>
               <div class="slider-row">
-                <input id="smoke-warp" type="range" min="0" max="100" step="1" value="5" />
-                <span id="smoke-warp-display" class="slider-value">0.05</span>
+                <input id="smoke-warp" type="range" min="0" max="100" step="1" value="10" />
+                <span id="smoke-warp-display" class="slider-value">10%</span>
+              </div>
+            </div>
+            <div class="control-block" style="margin-top:6px;">
+              <label for="smoke-speed">Animation speed:</label>
+              <div class="slider-row">
+                <input id="smoke-speed" type="range" min="0" max="100" step="1" value="40" />
+                <span id="smoke-speed-display" class="slider-value">1.00</span>
+              </div>
+            </div>
+            <div class="control-block" style="margin-top:6px;">
+              <label for="smoke-edge">Edge softness:</label>
+              <div class="slider-row">
+                <input id="smoke-edge" type="range" min="0" max="100" step="1" value="5" />
+                <span id="smoke-edge-display" class="slider-value">0.3</span>
               </div>
             </div>
 
-            <div class="control-block" style="margin-top:6px;">
+            <div class="section-divider">
+              <div class="section-title">Lighting</div>
+            </div>
+            <div class="control-block">
               <label for="smoke-absorption">Light absorption:</label>
               <div class="slider-row">
-                <input id="smoke-absorption" type="range" min="0" max="100" step="1" value="50" />
-                <span id="smoke-absorption-display" class="slider-value">1.0</span>
+                <input id="smoke-absorption" type="range" min="0" max="100" step="1" value="65" />
+                <span id="smoke-absorption-display" class="slider-value">1.5</span>
               </div>
             </div>
-
             <div class="control-block" style="margin-top:6px;">
               <label for="smoke-scatter">Light scattering:</label>
               <div class="slider-row">
                 <input id="smoke-scatter" type="range" min="0" max="100" step="1" value="0" />
-                <span id="smoke-scatter-display" class="slider-value">0.2</span>
+                <span id="smoke-scatter-display" class="slider-value">0.0</span>
               </div>
             </div>
-
             <div class="control-block" style="margin-top:6px;">
-              <label for="smoke-edge">Edge softness:</label>
+              <label for="smoke-direct-light">Direct lighting:</label>
               <div class="slider-row">
-                <input id="smoke-edge" type="range" min="0" max="100" step="1" value="50" />
-                <span id="smoke-edge-display" class="slider-value">1.0</span>
+                <input id="smoke-direct-light" type="range" min="0" max="100" step="1" value="11" />
+                <span id="smoke-direct-light-display" class="slider-value">0.17x</span>
               </div>
             </div>
 
-            <div class="control-block" style="margin-top:4px;">
-              <label class="checkbox-inline">
-                <input type="checkbox" id="smoke-half-res" checked />
-                Half-resolution (smoother, faster)
-              </label>
-            </div>
-
-            <div class="control-block" style="margin-top:6px;">
-              <button id="smoke-rebuild-btn" class="reset-btn">
-                Rebuild smoke density
-              </button>
-              <div id="smoke-rebuild-hint" class="legend-help">
-                Smoke density is up to date for current filters.
-              </div>
+            <div id="smoke-rebuild-hint" class="legend-help" style="margin-top:8px;">
+              Smoke density rebuilds automatically when needed.
             </div>
           </div>
 

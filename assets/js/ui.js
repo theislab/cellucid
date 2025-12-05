@@ -34,7 +34,8 @@ export function initUI({ state, viewer, dom, smoke }) {
     // New smoke controls
     renderModeSelect,
     smokeControls,
-    smokeGridSelect,
+    smokeGridInput,
+    smokeGridDisplay,
     smokeStepsInput,
     smokeStepsDisplay,
     smokeDensityInput,
@@ -51,8 +52,12 @@ export function initUI({ state, viewer, dom, smoke }) {
     smokeScatterDisplay,
     smokeEdgeInput,
     smokeEdgeDisplay,
-    smokeHalfResCheckbox,
-    smokeRebuildBtn,
+    smokeDirectLightInput,
+    smokeDirectLightDisplay,
+    cloudResolutionInput,
+    cloudResolutionDisplay,
+    noiseResolutionInput,
+    noiseResolutionDisplay,
     smokeRebuildHint,
     // Split view HUD
     splitViewControls,
@@ -77,6 +82,7 @@ export function initUI({ state, viewer, dom, smoke }) {
   let smokeDirty = false;
   let smokeBuiltOnce = false;
   let smokeGridSize = 128;
+  let noiseResolutionScale = viewer.getAdaptiveScaleFactor ? viewer.getAdaptiveScaleFactor() : 1;
   let initialUIState = null;
 
   // View selection state
@@ -157,25 +163,37 @@ export function initUI({ state, viewer, dom, smoke }) {
     refreshUIForActiveView();
   }
 
+  // Debounced auto-rebuild for smoke density
+  let smokeRebuildTimeout = null;
+  function scheduleAutoRebuild() {
+    if (smokeRebuildTimeout) clearTimeout(smokeRebuildTimeout);
+    smokeDirty = true;
+    if (smokeRebuildHint) {
+      smokeRebuildHint.textContent = 'Rebuilding smoke density...';
+    }
+    smokeRebuildTimeout = setTimeout(() => {
+      if (rebuildSmokeDensity && renderModeSelect?.value === 'smoke') {
+        rebuildSmokeDensity(smokeGridSize);
+        markSmokeClean();
+      }
+    }, 300); // 300ms debounce
+  }
+
   function markSmokeDirty() {
     smokeDirty = true;
-    if (!smokeRebuildBtn) return;
-    smokeRebuildBtn.disabled = false;
-    smokeRebuildBtn.classList.add('smoke-dirty');
-    if (smokeRebuildHint) {
-      smokeRebuildHint.textContent =
-        'Filters or grid changed: click “Rebuild smoke density” to update the cloud.';
+    // Auto-rebuild when in smoke mode
+    if (renderModeSelect?.value === 'smoke') {
+      scheduleAutoRebuild();
+    } else if (smokeRebuildHint) {
+      smokeRebuildHint.textContent = 'Smoke density will rebuild when switching to smoke mode.';
     }
   }
 
   function markSmokeClean() {
     smokeDirty = false;
     smokeBuiltOnce = true;
-    if (!smokeRebuildBtn) return;
-    smokeRebuildBtn.disabled = true;
-    smokeRebuildBtn.classList.remove('smoke-dirty');
     if (smokeRebuildHint) {
-      smokeRebuildHint.textContent = 'Smoke density is up to date for current filters.';
+      smokeRebuildHint.textContent = 'Smoke density is up to date.';
     }
   }
 
@@ -1482,6 +1500,12 @@ export function initUI({ state, viewer, dom, smoke }) {
     applyRenderMode('points');
   }
 
+  function getResolutionAdaptiveFactor(power = 0.5) {
+    const baseGrid = 128;
+    const gridFactor = Math.pow(smokeGridSize / baseGrid, power);
+    return gridFactor * noiseResolutionScale;
+  }
+
   function updateSmokeStepSlider() {
     if (!smokeStepsInput) return;
     const raw = parseFloat(smokeStepsInput.value);
@@ -1491,16 +1515,28 @@ export function initUI({ state, viewer, dom, smoke }) {
 
     // Map slider to step multiplier (larger = more samples, better quality)
     const eased = Math.pow(t, 3); // Keep mid values similar while giving top end more headroom
-    const stepMultiplier = 0.5 + 4.5 * eased; // [0.5 (fast) .. 5.0 (ultra quality)]
+    const adaptive = getResolutionAdaptiveFactor(0.35);
+    const stepMultiplier = (0.5 + 4.0 * eased) * adaptive; // Adaptive to grid + noise detail
     viewer.setSmokeParams({ stepMultiplier });
   }
 
-  // Smoke density slider
+  // Smoke density slider - adaptive range based on grid resolution
+  // Higher grid resolution needs higher density to be visible (density spread over more voxels)
+  function getAdaptiveDensityRange() {
+    // Base range at 128³ is [0.4 .. 3.2]
+    // Scale up for higher resolutions, down for lower (also reacts to noise detail)
+    const scaleFactor = getResolutionAdaptiveFactor(0.5);
+    const minDensity = 0.4 * scaleFactor;
+    const maxDensity = 8.0 * scaleFactor * 1.4; // Extra headroom for high-res grids
+    return { min: minDensity, max: maxDensity };
+  }
+
   function updateSmokeDensitySlider() {
     if (!smokeDensityInput) return;
     const raw = parseFloat(smokeDensityInput.value);
     const t = Math.max(0, Math.min(100, isFinite(raw) ? raw : 50)) / 100;
-    const density = 0.5 + t * 4.0; // [0.5 .. 4.5]
+    const { min, max } = getAdaptiveDensityRange();
+    const density = min + t * (max - min);
     if (smokeDensityDisplay) smokeDensityDisplay.textContent = density.toFixed(1);
     viewer.setSmokeParams({ density });
   }
@@ -1515,12 +1551,20 @@ export function initUI({ state, viewer, dom, smoke }) {
     viewer.setSmokeParams({ animationSpeed });
   }
 
-  // Detail level slider
+  // Detail level slider - adaptive range based on grid resolution
+  // Higher grid resolution can show more detail
+  function getAdaptiveDetailRange() {
+    const scaleFactor = getResolutionAdaptiveFactor(0.35); // gentle scaling
+    const maxDetail = 5.0 * scaleFactor;
+    return { min: 0, max: maxDetail };
+  }
+
   function updateSmokeDetailSlider() {
     if (!smokeDetailInput) return;
     const raw = parseFloat(smokeDetailInput.value);
     const t = Math.max(0, Math.min(100, isFinite(raw) ? raw : 60)) / 100;
-    const detailLevel = t * 5.0; // [0 .. 5.0] (higher cap for sharper close-ups)
+    const { min, max } = getAdaptiveDetailRange();
+    const detailLevel = min + t * (max - min);
     if (smokeDetailDisplay) smokeDetailDisplay.textContent = detailLevel.toFixed(1);
     viewer.setSmokeParams({ detailLevel });
   }
@@ -1529,9 +1573,10 @@ export function initUI({ state, viewer, dom, smoke }) {
   function updateSmokeWarpSlider() {
     if (!smokeWarpInput) return;
     const raw = parseFloat(smokeWarpInput.value);
-    const t = Math.max(0, Math.min(100, isFinite(raw) ? raw : 5)) / 100;
-    const warpStrength = t * 1.0; // [0 .. 1.0]
-    if (smokeWarpDisplay) smokeWarpDisplay.textContent = warpStrength.toFixed(2);
+    const t = Math.max(0, Math.min(100, isFinite(raw) ? raw : 50)) / 100;
+    // Stronger range: 0-2.0 for more visible turbulence
+    const warpStrength = t * 2.0;
+    if (smokeWarpDisplay) smokeWarpDisplay.textContent = (t * 100).toFixed(0) + '%';
     viewer.setSmokeParams({ warpStrength });
   }
 
@@ -1539,8 +1584,9 @@ export function initUI({ state, viewer, dom, smoke }) {
   function updateSmokeAbsorptionSlider() {
     if (!smokeAbsorptionInput) return;
     const raw = parseFloat(smokeAbsorptionInput.value);
-    const t = Math.max(0, Math.min(100, isFinite(raw) ? raw : 50)) / 100;
-    const lightAbsorption = 0.2 + t * 1.8; // [0.2 .. 2.0]
+    const t = Math.max(0, Math.min(100, isFinite(raw) ? raw : 60)) / 100;
+    const adaptive = getResolutionAdaptiveFactor(0.2);
+    const lightAbsorption = (t * 2.0) * adaptive; // [~0 .. ~3.0] adaptive
     if (smokeAbsorptionDisplay) smokeAbsorptionDisplay.textContent = lightAbsorption.toFixed(1);
     viewer.setSmokeParams({ lightAbsorption });
   }
@@ -1549,8 +1595,8 @@ export function initUI({ state, viewer, dom, smoke }) {
   function updateSmokeScatterSlider() {
     if (!smokeScatterInput) return;
     const raw = parseFloat(smokeScatterInput.value);
-    const t = Math.max(0, Math.min(100, isFinite(raw) ? raw : 0)) / 100;
-    const scatterStrength = 0.2 + t * 1.8; // [0.2 .. 2.0]
+    const t = Math.max(0, Math.min(100, isFinite(raw) ? raw : 55)) / 100;
+    const scatterStrength = (t * 2.0) * getResolutionAdaptiveFactor(0.15); // [~0 .. ~3.0] adaptive
     if (smokeScatterDisplay) smokeScatterDisplay.textContent = scatterStrength.toFixed(1);
     viewer.setSmokeParams({ scatterStrength });
   }
@@ -1563,6 +1609,16 @@ export function initUI({ state, viewer, dom, smoke }) {
     const edgeSoftness = 0.2 + t * 1.8; // [0.2 .. 2.0]
     if (smokeEdgeDisplay) smokeEdgeDisplay.textContent = edgeSoftness.toFixed(1);
     viewer.setSmokeParams({ edgeSoftness });
+  }
+
+  // Direct lighting slider
+  function updateSmokeDirectLightSlider() {
+    if (!smokeDirectLightInput) return;
+    const raw = parseFloat(smokeDirectLightInput.value);
+    const t = Math.max(0, Math.min(100, isFinite(raw) ? raw : 67)) / 100;
+    const directLightIntensity = t * 1.5; // 0..1.5x of base directional light
+    if (smokeDirectLightDisplay) smokeDirectLightDisplay.textContent = directLightIntensity.toFixed(2) + 'x';
+    viewer.setSmokeParams({ directLightIntensity });
   }
 
   if (smokeStepsInput) {
@@ -1621,35 +1677,104 @@ export function initUI({ state, viewer, dom, smoke }) {
     });
   }
 
-  if (smokeGridSelect) {
-    const initialGrid = parseInt(smokeGridSelect.value, 10);
-    if (Number.isFinite(initialGrid) && initialGrid > 0) {
-      smokeGridSize = initialGrid;
+  if (smokeDirectLightInput) {
+    updateSmokeDirectLightSlider();
+    smokeDirectLightInput.addEventListener('input', () => {
+      updateSmokeDirectLightSlider();
+    });
+  }
+
+  // Grid density slider (maps 0-100 to discrete grid sizes)
+  const GRID_SIZES = [32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024];
+  function sliderToGridSize(sliderValue) {
+    const t = Math.max(0, Math.min(100, sliderValue)) / 100;
+    const idx = Math.min(GRID_SIZES.length - 1, Math.floor(t * GRID_SIZES.length));
+    return GRID_SIZES[idx];
+  }
+  function gridSizeToSlider(size) {
+    const idx = GRID_SIZES.indexOf(size);
+    if (idx >= 0) return (idx / GRID_SIZES.length) * 100;
+    // Find closest
+    for (let i = 0; i < GRID_SIZES.length; i++) {
+      if (GRID_SIZES[i] >= size) return (i / GRID_SIZES.length) * 100;
     }
-    smokeGridSelect.addEventListener('change', () => {
-      const g = parseInt(smokeGridSelect.value, 10);
-      if (Number.isFinite(g) && g > 0) {
-        smokeGridSize = g;
-        markSmokeDirty();
-      }
-    });
+    return 100;
   }
 
-  if (smokeHalfResCheckbox && viewer.setSmokeHalfResolution) {
-    viewer.setSmokeHalfResolution(smokeHalfResCheckbox.checked);
-    smokeHalfResCheckbox.addEventListener('change', () => {
-      viewer.setSmokeHalfResolution(smokeHalfResCheckbox.checked);
-    });
+  function updateSmokeGridSlider() {
+    if (!smokeGridInput) return;
+    const raw = parseFloat(smokeGridInput.value);
+    const size = sliderToGridSize(isFinite(raw) ? raw : 50);
+    if (smokeGridDisplay) smokeGridDisplay.textContent = size + '³';
+    if (size !== smokeGridSize) {
+      smokeGridSize = size;
+      // Update other sliders that have adaptive ranges based on grid size
+      updateSmokeDensitySlider();
+      updateSmokeDetailSlider();
+      updateSmokeWarpSlider();
+      updateSmokeAbsorptionSlider();
+      updateSmokeScatterSlider();
+      updateSmokeStepSlider();
+      scheduleAutoRebuild();
+    }
   }
 
-  if (smokeRebuildBtn && typeof rebuildSmokeDensity === 'function') {
-    smokeRebuildBtn.addEventListener('click', () => {
-      const gridSize = smokeGridSize || parseInt(smokeGridSelect?.value, 10) || 128;
-      rebuildSmokeDensity(gridSize);
-      markSmokeClean();
-    });
-    smokeRebuildBtn.disabled = true;
+  if (smokeGridInput) {
+    // Initialize from default value
+    smokeGridSize = sliderToGridSize(parseFloat(smokeGridInput.value) || 50);
+    if (smokeGridDisplay) smokeGridDisplay.textContent = smokeGridSize + '³';
+    smokeGridInput.addEventListener('input', updateSmokeGridSlider);
   }
+
+  // Cloud render resolution slider (0.25x to 2.0x)
+  function updateCloudResolutionSlider() {
+    if (!cloudResolutionInput) return;
+    const raw = parseFloat(cloudResolutionInput.value);
+    const t = Math.max(0, Math.min(100, isFinite(raw) ? raw : 25)) / 100;
+    // Map 0-100 to 0.25-2.0 (exponential for better control at low end)
+    const scale = 0.25 + t * 1.75; // [0.25 .. 2.0]
+    if (cloudResolutionDisplay) cloudResolutionDisplay.textContent = scale.toFixed(2) + 'x';
+    if (viewer.setCloudResolutionScale) {
+      viewer.setCloudResolutionScale(scale);
+    }
+  }
+
+  // Noise texture resolution slider (32 to 256)
+  function updateNoiseResolutionSlider() {
+    if (!noiseResolutionInput) return;
+    const raw = parseFloat(noiseResolutionInput.value);
+    const t = Math.max(0, Math.min(100, isFinite(raw) ? raw : 64)) / 100;
+    // Map 0-100 to 32-256 (discrete steps: 32, 48, 64, 96, 128, 192, 256)
+    const steps = [32, 48, 64, 96, 128, 192, 256];
+    const idx = Math.min(steps.length - 1, Math.floor(t * steps.length));
+    const size = steps[idx];
+    if (noiseResolutionDisplay) noiseResolutionDisplay.textContent = size + '³';
+    if (viewer.setNoiseTextureResolution) {
+      viewer.setNoiseTextureResolution(size);
+    }
+    if (viewer.getAdaptiveScaleFactor) {
+      noiseResolutionScale = viewer.getAdaptiveScaleFactor();
+    }
+    // Re-sync adaptive sliders when noise detail changes
+    updateSmokeDensitySlider();
+    updateSmokeDetailSlider();
+    updateSmokeWarpSlider();
+    updateSmokeAbsorptionSlider();
+    updateSmokeScatterSlider();
+    updateSmokeStepSlider();
+  }
+
+  if (cloudResolutionInput) {
+    updateCloudResolutionSlider();
+    cloudResolutionInput.addEventListener('input', updateCloudResolutionSlider);
+  }
+
+  if (noiseResolutionInput) {
+    updateNoiseResolutionSlider();
+    noiseResolutionInput.addEventListener('input', updateNoiseResolutionSlider);
+  }
+
+  // Auto-rebuild is now handled by scheduleAutoRebuild()
 
   // Gene expression search and dropdown event listeners
   if (geneExpressionSearch) {
@@ -1770,23 +1895,30 @@ export function initUI({ state, viewer, dom, smoke }) {
       updateSmokeEdgeSlider();
     }
 
-    if (smokeGridSelect) {
-      smokeGridSelect.value = initialUIState.smokeGrid;
-      const g = parseInt(initialUIState.smokeGrid, 10);
-      if (Number.isFinite(g) && g > 0) {
-        smokeGridSize = g;
-      }
+    if (smokeDirectLightInput && initialUIState.smokeDirectLight != null) {
+      smokeDirectLightInput.value = initialUIState.smokeDirectLight;
+      updateSmokeDirectLightSlider();
     }
 
-    if (smokeHalfResCheckbox && viewer.setSmokeHalfResolution) {
-      const halfResChecked = Boolean(initialUIState.smokeHalfRes);
-      smokeHalfResCheckbox.checked = halfResChecked;
-      viewer.setSmokeHalfResolution(halfResChecked);
+    if (smokeGridInput) {
+      smokeGridInput.value = initialUIState.smokeGrid;
+      updateSmokeGridSlider();
+    }
+
+    if (cloudResolutionInput && viewer.setCloudResolutionScale) {
+      const cloudResVal = initialUIState.cloudResolution ?? 25;
+      cloudResolutionInput.value = cloudResVal;
+      updateCloudResolutionSlider();
+    }
+
+    if (noiseResolutionInput && viewer.setNoiseTextureResolution) {
+      const noiseResVal = initialUIState.noiseResolution ?? 64;
+      noiseResolutionInput.value = noiseResVal;
+      updateNoiseResolutionSlider();
     }
 
     if (typeof rebuildSmokeDensity === 'function') {
-      const gridSize = smokeGridSize || parseInt(smokeGridSelect?.value, 10) || 128;
-      rebuildSmokeDensity(gridSize);
+      rebuildSmokeDensity(smokeGridSize);
     }
     markSmokeClean();
   }
@@ -1830,6 +1962,7 @@ export function initUI({ state, viewer, dom, smoke }) {
     viewer.setShowCentroidLabels(Boolean(centroidLabelsCheckbox.checked), activeView);
   }
 
+  // Default UI values for visible volumetric clouds
   initialUIState = {
     background: backgroundSelect?.value || 'white',
     renderMode: renderModeSelect?.value || 'points',
@@ -1837,16 +1970,18 @@ export function initUI({ state, viewer, dom, smoke }) {
     lighting: lightingStrengthInput?.value || '60',
     fog: fogDensityInput?.value || '50',
     sizeAttenuation: sizeAttenuationInput?.value || '0',
-    smokeGrid: smokeGridSelect?.value || '128',
-    smokeSteps: smokeStepsInput?.value || '60',
-    smokeDensity: smokeDensityInput?.value || '50',
-    smokeSpeed: smokeSpeedInput?.value || '80',
+    smokeGrid: smokeGridInput?.value || '60',
+    smokeSteps: smokeStepsInput?.value || '75',
+    smokeDensity: smokeDensityInput?.value || '66',
+    smokeSpeed: smokeSpeedInput?.value || '40',
     smokeDetail: smokeDetailInput?.value || '60',
-    smokeWarp: smokeWarpInput?.value || '5',
-    smokeAbsorption: smokeAbsorptionInput?.value || '50',
+    smokeWarp: smokeWarpInput?.value || '10',
+    smokeAbsorption: smokeAbsorptionInput?.value || '65',
     smokeScatter: smokeScatterInput?.value || '0',
-    smokeEdge: smokeEdgeInput?.value || '50',
-    smokeHalfRes: smokeHalfResCheckbox ? Boolean(smokeHalfResCheckbox.checked) : true
+    smokeEdge: smokeEdgeInput?.value || '5',
+    smokeDirectLight: smokeDirectLightInput?.value || '11',
+    cloudResolution: cloudResolutionInput?.value || '15',
+    noiseResolution: noiseResolutionInput?.value || '43'
   };
 
   renderFieldSelects();

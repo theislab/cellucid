@@ -1,0 +1,765 @@
+// GPU-based 3D Noise Texture Generator
+// =====================================
+// Professional-quality noise generation for volumetric clouds
+// Based on techniques from:
+// - Horizon Zero Dawn (Guerrilla Games)
+// - Frostbite Engine (EA DICE)
+// - GPU Gems 3
+//
+// Generates Perlin-Worley and detail noise textures entirely on the GPU
+// Orders of magnitude faster than CPU/Web Worker generation
+
+// Vertex shader for fullscreen quad
+const NOISE_VS = `#version 300 es
+precision highp float;
+in vec2 a_position;
+out vec2 v_uv;
+void main() {
+  v_uv = a_position * 0.5 + 0.5;
+  gl_Position = vec4(a_position, 0.0, 1.0);
+}
+`;
+
+// Fragment shader for Shape Noise (128³ RGBA)
+// R: Perlin-Worley blend (billowy clouds), G: Medium Worley, B: High Worley, A: Erosion Worley
+const SHAPE_NOISE_FS = `#version 300 es
+precision highp float;
+
+in vec2 v_uv;
+uniform float u_slice;      // Current Z slice [0, 1]
+uniform float u_size;       // Texture size (128)
+
+out vec4 fragColor;
+
+// ============================================================================
+// High-quality hash functions (better distribution than sin-based)
+// ============================================================================
+
+// PCG-based hash for better randomness
+uvec3 pcg3d(uvec3 v) {
+  v = v * 1664525u + 1013904223u;
+  v.x += v.y*v.z; v.y += v.z*v.x; v.z += v.x*v.y;
+  v ^= v >> 16u;
+  v.x += v.y*v.z; v.y += v.z*v.x; v.z += v.x*v.y;
+  return v;
+}
+
+vec3 hash3(vec3 p) {
+  uvec3 u = uvec3(ivec3(p * 1000.0) + ivec3(10000));
+  uvec3 h = pcg3d(u);
+  return vec3(h) / float(0xffffffffu);
+}
+
+// Gradient vectors for Perlin noise (better quality than random)
+vec3 grad3(vec3 p) {
+  vec3 h = hash3(p);
+  // Map to unit sphere for better gradient distribution
+  float theta = h.x * 6.28318530718;
+  float phi = acos(h.y * 2.0 - 1.0);
+  return vec3(
+    sin(phi) * cos(theta),
+    sin(phi) * sin(theta),
+    cos(phi)
+  );
+}
+
+// ============================================================================
+// Ken Perlin's Improved Noise (2002)
+// ============================================================================
+
+// Quintic interpolation (smoother than cubic)
+vec3 fade(vec3 t) {
+  return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+float gradientNoise(vec3 p) {
+  vec3 i = floor(p);
+  vec3 f = fract(p);
+  vec3 u = fade(f);
+
+  // Use gradient vectors instead of random vectors
+  float n000 = dot(grad3(i + vec3(0,0,0)), f - vec3(0,0,0));
+  float n100 = dot(grad3(i + vec3(1,0,0)), f - vec3(1,0,0));
+  float n010 = dot(grad3(i + vec3(0,1,0)), f - vec3(0,1,0));
+  float n110 = dot(grad3(i + vec3(1,1,0)), f - vec3(1,1,0));
+  float n001 = dot(grad3(i + vec3(0,0,1)), f - vec3(0,0,1));
+  float n101 = dot(grad3(i + vec3(1,0,1)), f - vec3(1,0,1));
+  float n011 = dot(grad3(i + vec3(0,1,1)), f - vec3(0,1,1));
+  float n111 = dot(grad3(i + vec3(1,1,1)), f - vec3(1,1,1));
+
+  // Trilinear interpolation
+  float nx00 = mix(n000, n100, u.x);
+  float nx10 = mix(n010, n110, u.x);
+  float nx01 = mix(n001, n101, u.x);
+  float nx11 = mix(n011, n111, u.x);
+  float nxy0 = mix(nx00, nx10, u.y);
+  float nxy1 = mix(nx01, nx11, u.y);
+
+  return mix(nxy0, nxy1, u.z);
+}
+
+// FBM (Fractal Brownian Motion) with lacunarity and gain control
+float perlinFBM(vec3 p, int octaves, float lacunarity, float gain) {
+  float value = 0.0;
+  float amplitude = 0.5;
+  float frequency = 1.0;
+  float maxValue = 0.0;
+
+  for (int i = 0; i < 6; i++) {
+    if (i >= octaves) break;
+    value += amplitude * gradientNoise(p * frequency);
+    maxValue += amplitude;
+    amplitude *= gain;
+    frequency *= lacunarity;
+  }
+
+  return (value / maxValue + 1.0) * 0.5;
+}
+
+// ============================================================================
+// Enhanced Worley Noise (Cellular) with F1/F2 distances
+// ============================================================================
+
+vec2 worleyNoise2(vec3 p, float freq, float seed) {
+  p *= freq;
+  vec3 cellId = floor(p);
+  vec3 cellPos = fract(p);
+
+  float minDist1 = 10000.0;  // F1: closest
+  float minDist2 = 10000.0;  // F2: second closest
+
+  // Check 3x3x3 neighborhood
+  for (int x = -1; x <= 1; x++) {
+    for (int y = -1; y <= 1; y++) {
+      for (int z = -1; z <= 1; z++) {
+        vec3 neighbor = vec3(float(x), float(y), float(z));
+        vec3 cellOffset = cellId + neighbor;
+
+        // Wrap for seamless tiling
+        vec3 wrappedCell = mod(cellOffset + freq, freq);
+
+        // Random point in cell using better hash
+        vec3 randomPoint = hash3(wrappedCell + seed * 17.0);
+        vec3 pointPos = neighbor + randomPoint - cellPos;
+
+        float dist = length(pointPos);
+
+        // Track F1 and F2 distances
+        if (dist < minDist1) {
+          minDist2 = minDist1;
+          minDist1 = dist;
+        } else if (dist < minDist2) {
+          minDist2 = dist;
+        }
+      }
+    }
+  }
+
+  return vec2(minDist1, minDist2);
+}
+
+float worleyNoise(vec3 p, float freq, float seed) {
+  return worleyNoise2(p, freq, seed).x;
+}
+
+// Worley FBM - multiple octaves for more natural look
+float worleyFBM(vec3 p, float baseFreq, float seed) {
+  float w1 = 1.0 - worleyNoise(p, baseFreq, seed);
+  float w2 = 1.0 - worleyNoise(p, baseFreq * 2.0, seed + 1.0);
+  float w3 = 1.0 - worleyNoise(p, baseFreq * 4.0, seed + 2.0);
+
+  // FBM weights (standard 1/f distribution)
+  return w1 * 0.625 + w2 * 0.25 + w3 * 0.125;
+}
+
+// ============================================================================
+// Main - Generate High-Quality Shape Noise
+// ============================================================================
+
+void main() {
+  vec3 uvw = vec3(v_uv, u_slice);
+
+  // Scale for noise sampling
+  float scale = 4.0;
+  vec3 scaledPos = uvw * scale;
+
+  // === R Channel: Perlin-Worley Blend (Billowy Cloud Shapes) ===
+  // This is the key technique from Horizon Zero Dawn
+  float perlin = perlinFBM(scaledPos, 5, 2.0, 0.5);
+
+  // Multi-octave Worley for cloud billows
+  float worleyFbm = worleyFBM(uvw, 4.0, 0.0);
+
+  // The magic blend: Perlin provides smooth base, Worley adds billowy structure
+  // Perlin "remaps" the Worley to create defined edges
+  float perlinWorley = perlin;
+  perlinWorley = perlinWorley - (1.0 - worleyFbm) * 0.35;
+  perlinWorley = max(0.0, perlinWorley);
+  // Remap to use full range
+  perlinWorley = perlinWorley / 0.65;
+  perlinWorley = clamp(perlinWorley, 0.0, 1.0);
+
+  // === G Channel: Medium Frequency Worley ===
+  // Used for medium-scale shape modulation
+  float worleyMed = 1.0 - worleyNoise(uvw, 8.0, 3.0);
+
+  // Add slight Perlin modulation for more organic look
+  float perlinMod = perlinFBM(scaledPos * 2.0, 3, 2.0, 0.5);
+  worleyMed = mix(worleyMed, worleyMed * perlinMod, 0.3);
+
+  // === B Channel: High Frequency Worley ===
+  // Used for fine detail and edge definition
+  float worleyHigh = 1.0 - worleyNoise(uvw, 16.0, 4.0);
+
+  // === A Channel: Very High Frequency Worley (Erosion) ===
+  // Used for wispy edge erosion
+  float worleyVeryHigh = 1.0 - worleyNoise(uvw, 32.0, 5.0);
+
+  // Mix in some mid-frequency for better erosion pattern
+  float worleyErosion = 1.0 - worleyNoise(uvw, 24.0, 6.0);
+  worleyVeryHigh = mix(worleyVeryHigh, worleyErosion, 0.3);
+
+  fragColor = vec4(perlinWorley, worleyMed, worleyHigh, worleyVeryHigh);
+}
+`;
+
+// Fragment shader for Detail Noise (128³ RGBA)
+// R: Detail Worley FBM, G: Fine Worley, B: Curl X, A: Curl Y
+// Enhanced for better close-up detail
+const DETAIL_NOISE_FS = `#version 300 es
+precision highp float;
+
+in vec2 v_uv;
+uniform float u_slice;
+uniform float u_size;
+
+out vec4 fragColor;
+
+// PCG-based hash for better randomness (same as shape noise)
+uvec3 pcg3d(uvec3 v) {
+  v = v * 1664525u + 1013904223u;
+  v.x += v.y*v.z; v.y += v.z*v.x; v.z += v.x*v.y;
+  v ^= v >> 16u;
+  v.x += v.y*v.z; v.y += v.z*v.x; v.z += v.x*v.y;
+  return v;
+}
+
+vec3 hash3(vec3 p) {
+  uvec3 u = uvec3(ivec3(p * 1000.0) + ivec3(10000));
+  uvec3 h = pcg3d(u);
+  return vec3(h) / float(0xffffffffu);
+}
+
+vec3 grad3(vec3 p) {
+  vec3 h = hash3(p);
+  float theta = h.x * 6.28318530718;
+  float phi = acos(h.y * 2.0 - 1.0);
+  return vec3(
+    sin(phi) * cos(theta),
+    sin(phi) * sin(theta),
+    cos(phi)
+  );
+}
+
+vec3 fade(vec3 t) {
+  return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+float gradientNoise(vec3 p) {
+  vec3 i = floor(p);
+  vec3 f = fract(p);
+  vec3 u = fade(f);
+
+  float n000 = dot(grad3(i + vec3(0,0,0)), f - vec3(0,0,0));
+  float n100 = dot(grad3(i + vec3(1,0,0)), f - vec3(1,0,0));
+  float n010 = dot(grad3(i + vec3(0,1,0)), f - vec3(0,1,0));
+  float n110 = dot(grad3(i + vec3(1,1,0)), f - vec3(1,1,0));
+  float n001 = dot(grad3(i + vec3(0,0,1)), f - vec3(0,0,1));
+  float n101 = dot(grad3(i + vec3(1,0,1)), f - vec3(1,0,1));
+  float n011 = dot(grad3(i + vec3(0,1,1)), f - vec3(0,1,1));
+  float n111 = dot(grad3(i + vec3(1,1,1)), f - vec3(1,1,1));
+
+  float nx00 = mix(n000, n100, u.x);
+  float nx10 = mix(n010, n110, u.x);
+  float nx01 = mix(n001, n101, u.x);
+  float nx11 = mix(n011, n111, u.x);
+  float nxy0 = mix(nx00, nx10, u.y);
+  float nxy1 = mix(nx01, nx11, u.y);
+
+  return mix(nxy0, nxy1, u.z);
+}
+
+float worleyNoise(vec3 p, float freq, float seed) {
+  p *= freq;
+  vec3 cellId = floor(p);
+  vec3 cellPos = fract(p);
+  float minDist = 10000.0;
+
+  for (int x = -1; x <= 1; x++) {
+    for (int y = -1; y <= 1; y++) {
+      for (int z = -1; z <= 1; z++) {
+        vec3 neighbor = vec3(float(x), float(y), float(z));
+        vec3 cellOffset = cellId + neighbor;
+        vec3 wrappedCell = mod(cellOffset + freq, freq);
+        vec3 randomPoint = hash3(wrappedCell + seed * 17.0);
+        vec3 pointPos = neighbor + randomPoint - cellPos;
+        minDist = min(minDist, length(pointPos));
+      }
+    }
+  }
+
+  return clamp(minDist, 0.0, 1.0);
+}
+
+// Multi-octave Worley for richer detail
+float worleyFBM(vec3 p, float baseFreq, float seed) {
+  float w1 = 1.0 - worleyNoise(p, baseFreq, seed);
+  float w2 = 1.0 - worleyNoise(p, baseFreq * 2.0, seed + 1.0);
+  float w3 = 1.0 - worleyNoise(p, baseFreq * 4.0, seed + 2.0);
+  float w4 = 1.0 - worleyNoise(p, baseFreq * 8.0, seed + 3.0);
+
+  return w1 * 0.5 + w2 * 0.25 + w3 * 0.15 + w4 * 0.1;
+}
+
+// High-quality curl noise via analytical derivatives
+// This creates divergence-free turbulent flow
+vec3 curlNoise(vec3 p) {
+  float eps = 0.0005;  // Smaller epsilon for more accurate derivatives
+
+  // Sample gradient noise at 6 offset positions
+  float n1 = gradientNoise(p + vec3(0, eps, 0));
+  float n2 = gradientNoise(p - vec3(0, eps, 0));
+  float n3 = gradientNoise(p + vec3(0, 0, eps));
+  float n4 = gradientNoise(p - vec3(0, 0, eps));
+  float n5 = gradientNoise(p + vec3(eps, 0, 0));
+  float n6 = gradientNoise(p - vec3(eps, 0, 0));
+
+  // Second noise field with different offset for 3D curl
+  vec3 offset = vec3(31.416, 17.23, -47.853);
+  float m1 = gradientNoise(p + offset + vec3(0, eps, 0));
+  float m2 = gradientNoise(p + offset - vec3(0, eps, 0));
+  float m3 = gradientNoise(p + offset + vec3(0, 0, eps));
+  float m4 = gradientNoise(p + offset - vec3(0, 0, eps));
+  float m5 = gradientNoise(p + offset + vec3(eps, 0, 0));
+  float m6 = gradientNoise(p + offset - vec3(eps, 0, 0));
+
+  float eps2 = 2.0 * eps;
+
+  // Compute curl components from cross product of gradients
+  vec3 curl = vec3(
+    ((n1 - n2) / eps2 - (m3 - m4) / eps2),
+    ((n3 - n4) / eps2 - (n5 - n6) / eps2),
+    ((m5 - m6) / eps2 - (m1 - m2) / eps2)
+  );
+
+  // Normalize and remap to [0, 1]
+  return curl * 0.5 + 0.5;
+}
+
+// Simplified curl for second field
+vec3 curlNoiseSimple(vec3 p) {
+  float eps = 0.001;
+
+  float n1 = gradientNoise(p + vec3(0, eps, 0));
+  float n2 = gradientNoise(p - vec3(0, eps, 0));
+  float n3 = gradientNoise(p + vec3(0, 0, eps));
+  float n4 = gradientNoise(p - vec3(0, 0, eps));
+  float n5 = gradientNoise(p + vec3(eps, 0, 0));
+  float n6 = gradientNoise(p - vec3(eps, 0, 0));
+
+  vec3 offset = vec3(31.416, 0.0, -47.853);
+  float m1 = gradientNoise(p + offset + vec3(0, eps, 0));
+  float m2 = gradientNoise(p + offset - vec3(0, eps, 0));
+  float m3 = gradientNoise(p + offset + vec3(0, 0, eps));
+  float m4 = gradientNoise(p + offset - vec3(0, 0, eps));
+  float m5 = gradientNoise(p + offset + vec3(eps, 0, 0));
+  float m6 = gradientNoise(p + offset - vec3(eps, 0, 0));
+
+  float eps2 = 2.0 * eps;
+  return vec3(
+    ((n1 - n2) / eps2 - (m3 - m4) / eps2) * 0.5 + 0.5,
+    ((n3 - n4) / eps2 - (n5 - n6) / eps2) * 0.5 + 0.5,
+    ((m5 - m6) / eps2 - (m1 - m2) / eps2) * 0.5 + 0.5
+  );
+}
+
+void main() {
+  vec3 uvw = vec3(v_uv, u_slice);
+  float scale = 8.0;
+  vec3 scaledPos = uvw * scale;
+
+  // R: Multi-octave Detail Worley (for rich close-up erosion)
+  float worleyDetail = worleyFBM(uvw, 8.0, 10.0);
+
+  // Add some Perlin modulation for more organic look
+  float perlinMod = (gradientNoise(scaledPos * 1.5) + 1.0) * 0.5;
+  worleyDetail = mix(worleyDetail, worleyDetail * perlinMod, 0.2);
+
+  // G: Very Fine Worley (highest frequency detail)
+  float worleyFine = 1.0 - worleyNoise(uvw, 24.0, 11.0);
+  float worleyUltraFine = 1.0 - worleyNoise(uvw, 32.0, 12.0);
+  worleyFine = worleyFine * 0.7 + worleyUltraFine * 0.3;
+
+  // B, A: Curl noise XY components for turbulent flow
+  vec3 curl = curlNoiseSimple(scaledPos * 0.4);
+
+  fragColor = vec4(worleyDetail, worleyFine, curl.x, curl.y);
+}
+`;
+
+// Blue Noise shader (R2 sequence)
+const BLUE_NOISE_FS = `#version 300 es
+precision highp float;
+
+in vec2 v_uv;
+out vec4 fragColor;
+
+void main() {
+  // R2 sequence - quasi-random with excellent blue noise properties
+  float g = 1.32471795724474602596;  // Plastic constant
+  float a1 = 1.0 / g;
+  float a2 = 1.0 / (g * g);
+
+  // Convert UV to index
+  ivec2 coord = ivec2(gl_FragCoord.xy);
+  int idx = coord.y * 128 + coord.x;
+
+  float r = fract(0.5 + a1 * float(idx));
+  float g_val = fract(0.5 + a2 * float(idx));
+
+  fragColor = vec4(r, g_val, 0.0, 1.0);
+}
+`;
+
+/**
+ * GPU Noise Generator Class
+ * Generates 3D noise textures using WebGL2 fragment shaders
+ */
+export class GPUNoiseGenerator {
+  constructor(gl) {
+    this.gl = gl;
+    this.programs = {};
+    this.quadVAO = null;
+    this.quadVBO = null;
+
+    this._initShaders();
+    this._initQuad();
+  }
+
+  _compileShader(source, type) {
+    const gl = this.gl;
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      console.error('Shader compile error:', gl.getShaderInfoLog(shader));
+      gl.deleteShader(shader);
+      return null;
+    }
+    return shader;
+  }
+
+  _createProgram(vsSource, fsSource) {
+    const gl = this.gl;
+    const vs = this._compileShader(vsSource, gl.VERTEX_SHADER);
+    const fs = this._compileShader(fsSource, gl.FRAGMENT_SHADER);
+
+    if (!vs || !fs) return null;
+
+    const program = gl.createProgram();
+    gl.attachShader(program, vs);
+    gl.attachShader(program, fs);
+    gl.linkProgram(program);
+
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      console.error('Program link error:', gl.getProgramInfoLog(program));
+      gl.deleteProgram(program);
+      return null;
+    }
+
+    gl.deleteShader(vs);
+    gl.deleteShader(fs);
+    return program;
+  }
+
+  _initShaders() {
+    this.programs.shape = this._createProgram(NOISE_VS, SHAPE_NOISE_FS);
+    this.programs.detail = this._createProgram(NOISE_VS, DETAIL_NOISE_FS);
+    this.programs.blueNoise = this._createProgram(NOISE_VS, BLUE_NOISE_FS);
+
+    // Cache uniform locations
+    const gl = this.gl;
+
+    this.uniforms = {};
+
+    if (this.programs.shape) {
+      this.uniforms.shape = {
+        slice: gl.getUniformLocation(this.programs.shape, 'u_slice'),
+        size: gl.getUniformLocation(this.programs.shape, 'u_size')
+      };
+    }
+
+    if (this.programs.detail) {
+      this.uniforms.detail = {
+        slice: gl.getUniformLocation(this.programs.detail, 'u_slice'),
+        size: gl.getUniformLocation(this.programs.detail, 'u_size')
+      };
+    }
+  }
+
+  _initQuad() {
+    const gl = this.gl;
+
+    // Fullscreen quad vertices
+    const vertices = new Float32Array([
+      -1, -1,
+       1, -1,
+      -1,  1,
+       1,  1
+    ]);
+
+    this.quadVAO = gl.createVertexArray();
+    this.quadVBO = gl.createBuffer();
+
+    gl.bindVertexArray(this.quadVAO);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.quadVBO);
+    gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+
+    // Setup attribute for all programs
+    for (const prog of Object.values(this.programs)) {
+      if (prog) {
+        const loc = gl.getAttribLocation(prog, 'a_position');
+        if (loc >= 0) {
+          gl.enableVertexAttribArray(loc);
+          gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+        }
+      }
+    }
+
+    gl.bindVertexArray(null);
+  }
+
+  /**
+   * Generate a 3D noise texture by rendering each Z-slice
+   */
+  _generate3DTexture(program, uniforms, size) {
+    const gl = this.gl;
+    const startTime = performance.now();
+
+    // Create 3D texture
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_3D, texture);
+
+    // Allocate 3D texture storage
+    gl.texImage3D(
+      gl.TEXTURE_3D, 0, gl.RGBA8,
+      size, size, size, 0,
+      gl.RGBA, gl.UNSIGNED_BYTE, null
+    );
+
+    // Create framebuffer for rendering
+    const framebuffer = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+
+    // Save current state
+    const prevViewport = gl.getParameter(gl.VIEWPORT);
+    const prevProgram = gl.getParameter(gl.CURRENT_PROGRAM);
+
+    // Setup for rendering
+    gl.viewport(0, 0, size, size);
+    gl.useProgram(program);
+    gl.bindVertexArray(this.quadVAO);
+
+    gl.uniform1f(uniforms.size, size);
+
+    // Render each Z-slice
+    for (let z = 0; z < size; z++) {
+      // Attach current slice to framebuffer
+      gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, texture, 0, z);
+
+      // Check framebuffer status
+      if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
+        console.error('Framebuffer incomplete for slice', z);
+        continue;
+      }
+
+      // Set slice uniform (normalized 0-1)
+      gl.uniform1f(uniforms.slice, (z + 0.5) / size);
+
+      // Render quad
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
+
+    // Generate mipmaps
+    gl.bindTexture(gl.TEXTURE_3D, texture);
+    gl.generateMipmap(gl.TEXTURE_3D);
+
+    // Set texture parameters
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.REPEAT);
+
+    // Restore state
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.deleteFramebuffer(framebuffer);
+    gl.viewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+    gl.useProgram(prevProgram);
+    gl.bindVertexArray(null);
+
+    const elapsed = performance.now() - startTime;
+    console.log(`  Generated ${size}³ texture in ${elapsed.toFixed(1)}ms`);
+
+    return texture;
+  }
+
+  /**
+   * Generate 2D blue noise texture
+   */
+  _generateBlueNoise() {
+    const gl = this.gl;
+    const size = 128;
+    const startTime = performance.now();
+
+    // Create 2D texture
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG8, size, size, 0, gl.RG, gl.UNSIGNED_BYTE, null);
+
+    // Create framebuffer
+    const framebuffer = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+
+    // Save state
+    const prevViewport = gl.getParameter(gl.VIEWPORT);
+    const prevProgram = gl.getParameter(gl.CURRENT_PROGRAM);
+
+    // Render
+    gl.viewport(0, 0, size, size);
+    gl.useProgram(this.programs.blueNoise);
+    gl.bindVertexArray(this.quadVAO);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+    // Set texture parameters
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+
+    // Restore state
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.deleteFramebuffer(framebuffer);
+    gl.viewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+    gl.useProgram(prevProgram);
+    gl.bindVertexArray(null);
+
+    const elapsed = performance.now() - startTime;
+    console.log(`  Generated blue noise in ${elapsed.toFixed(1)}ms`);
+
+    return { texture, size };
+  }
+
+  /**
+   * Generate all cloud noise textures on GPU
+   * Returns immediately with textures (synchronous, very fast)
+   */
+  generate(shapeSize = 128, detailSize = 32) {
+    console.log('=== Generating Cloud Noise Textures (GPU) ===');
+    const totalStart = performance.now();
+
+    const gl = this.gl;
+
+    // Save current GL state
+    const prevDepthTest = gl.isEnabled(gl.DEPTH_TEST);
+    const prevBlend = gl.isEnabled(gl.BLEND);
+    const prevCullFace = gl.isEnabled(gl.CULL_FACE);
+
+    // Ensure WebGL state is clean for generation
+    gl.disable(gl.DEPTH_TEST);
+    gl.disable(gl.BLEND);
+    gl.disable(gl.CULL_FACE);
+
+    // Generate shape noise (128³)
+    let shape = null;
+    if (this.programs.shape && this.uniforms.shape) {
+      console.log(`Generating shape noise (${shapeSize}³)...`);
+      shape = this._generate3DTexture(
+        this.programs.shape,
+        this.uniforms.shape,
+        shapeSize
+      );
+    } else {
+      console.error('Shape noise program not available');
+    }
+
+    // Generate detail noise (32³)
+    let detail = null;
+    if (this.programs.detail && this.uniforms.detail) {
+      console.log(`Generating detail noise (${detailSize}³)...`);
+      detail = this._generate3DTexture(
+        this.programs.detail,
+        this.uniforms.detail,
+        detailSize
+      );
+    } else {
+      console.error('Detail noise program not available');
+    }
+
+    // Generate blue noise (128²)
+    let blueNoiseResult = { texture: null, size: 128 };
+    if (this.programs.blueNoise) {
+      console.log('Generating blue noise (128²)...');
+      blueNoiseResult = this._generateBlueNoise();
+    } else {
+      console.error('Blue noise program not available');
+    }
+
+    // Restore GL state
+    if (prevDepthTest) gl.enable(gl.DEPTH_TEST);
+    if (prevBlend) gl.enable(gl.BLEND);
+    if (prevCullFace) gl.enable(gl.CULL_FACE);
+
+    const totalElapsed = performance.now() - totalStart;
+    console.log(`=== GPU noise generation complete in ${totalElapsed.toFixed(1)}ms ===`);
+    console.log(`  Shape: ${shapeSize}³ RGBA (${(shapeSize ** 3 * 4 / 1024 / 1024).toFixed(1)}MB)`);
+    console.log(`  Detail: ${detailSize}³ RGBA (${(detailSize ** 3 * 4 / 1024 / 1024).toFixed(2)}MB)`);
+    console.log(`  Blue noise: ${blueNoiseResult.size}² RG`);
+
+    return {
+      shape,
+      detail,
+      blueNoise: blueNoiseResult.texture,
+      shapeSize,
+      detailSize,
+      blueNoiseSize: blueNoiseResult.size
+    };
+  }
+
+  /**
+   * Clean up resources
+   */
+  dispose() {
+    const gl = this.gl;
+
+    for (const prog of Object.values(this.programs)) {
+      if (prog) gl.deleteProgram(prog);
+    }
+
+    if (this.quadVAO) gl.deleteVertexArray(this.quadVAO);
+    if (this.quadVBO) gl.deleteBuffer(this.quadVBO);
+  }
+}
+
+/**
+ * Convenience function to generate cloud noise textures on GPU
+ */
+export function generateCloudNoiseTexturesGPU(gl, shapeSize = 128, detailSize = 32) {
+  const generator = new GPUNoiseGenerator(gl);
+  const textures = generator.generate(shapeSize, detailSize);
+  generator.dispose();
+  return textures;
+}

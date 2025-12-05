@@ -8,7 +8,14 @@
 import { LINE_VS_SOURCE, LINE_FS_SOURCE, GRID_VS_SOURCE, GRID_FS_SOURCE } from './shaders.js';
 import { createProgram, resizeCanvasToDisplaySize } from './gl-utils.js';
 import { SMOKE_VS_SOURCE, SMOKE_FS_SOURCE, SMOKE_COMPOSITE_VS, SMOKE_COMPOSITE_FS } from './smoke-shaders.js';
-import { createDensityAtlasTexture } from './smoke-density.js';
+import { createDensityTexture3D, buildDensityVolumeGPU } from './smoke-density.js';
+import {
+  generateCloudNoiseTextures,
+  setNoiseResolution,
+  getNoiseResolution,
+  getResolutionScaleFactor,
+  REFERENCE_RESOLUTION
+} from './noise-textures.js';
 import { HighPerfRenderer } from './high-perf-renderer.js';
 
 // Simple centroid shader (WebGL2) - for small number of centroid points
@@ -93,13 +100,19 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     cameraPos:         gl.getUniformLocation(smokeProgram, 'u_cameraPos'),
     volumeMin:         gl.getUniformLocation(smokeProgram, 'u_volumeMin'),
     volumeMax:         gl.getUniformLocation(smokeProgram, 'u_volumeMax'),
-    densityTex:        gl.getUniformLocation(smokeProgram, 'u_densityTex'),
+    // Native 3D density texture
+    densityTex3D:      gl.getUniformLocation(smokeProgram, 'u_densityTex3D'),
     gridSize:          gl.getUniformLocation(smokeProgram, 'u_gridSize'),
-    slicesPerRow:      gl.getUniformLocation(smokeProgram, 'u_slicesPerRow'),
-    tileUVSize:        gl.getUniformLocation(smokeProgram, 'u_tileUVSize'),
+    // Pre-computed noise textures
+    shapeNoise:        gl.getUniformLocation(smokeProgram, 'u_shapeNoise'),
+    detailNoise:       gl.getUniformLocation(smokeProgram, 'u_detailNoise'),
+    blueNoise:         gl.getUniformLocation(smokeProgram, 'u_blueNoise'),
+    blueNoiseOffset:   gl.getUniformLocation(smokeProgram, 'u_blueNoiseOffset'),
+    // Colors and lighting
     bgColor:           gl.getUniformLocation(smokeProgram, 'u_bgColor'),
     smokeColor:        gl.getUniformLocation(smokeProgram, 'u_smokeColor'),
     lightDir:          gl.getUniformLocation(smokeProgram, 'u_lightDir'),
+    // Animation and quality
     time:              gl.getUniformLocation(smokeProgram, 'u_time'),
     animationSpeed:    gl.getUniformLocation(smokeProgram, 'u_animationSpeed'),
     densityMultiplier: gl.getUniformLocation(smokeProgram, 'u_densityMultiplier'),
@@ -110,6 +123,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     lightAbsorption:   gl.getUniformLocation(smokeProgram, 'u_lightAbsorption'),
     scatterStrength:   gl.getUniformLocation(smokeProgram, 'u_scatterStrength'),
     edgeSoftness:      gl.getUniformLocation(smokeProgram, 'u_edgeSoftness'),
+    directLight:       gl.getUniformLocation(smokeProgram, 'u_directLightIntensity'),
+    lightSamples:      gl.getUniformLocation(smokeProgram, 'u_lightSamples'),
   };
 
   const compositeAttribLocations = {
@@ -289,22 +304,33 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   let smokeTextureInfo = null;
   const volumeMin = vec3.fromValues(-1, -1, -1);
   const volumeMax = vec3.fromValues(1, 1, 1);
-  let smokeDensity = 2.2;
-  let smokeNoiseScale = 1.5;
-  let smokeWarpStrength = 0.05;
-  let smokeStepMultiplier = 1.5;
-  let smokeAnimationSpeed = 2.0;
-  let smokeDetailLevel = 3.0;
-  let smokeLightAbsorption = 1.0;
-  let smokeScatterStrength = 0.2;
-  let smokeEdgeSoftness = 1.0;
-  const smokeColor = vec3.fromValues(0.92, 0.92, 0.98);
+  // Tuned default values for visible, realistic volumetric clouds
+  let smokeDensity = 10.6;          // UI default cloud density
+  let smokeNoiseScale = getResolutionScaleFactor(); // Keep noise scale stable across resolutions
+  let smokeWarpStrength = 0.2;      // 10% turbulence default
+  let smokeStepMultiplier = 2.8;    // High-quality ray marching default
+  let smokeAnimationSpeed = 1.0;    // Default animation rate
+  let smokeDetailLevel = 3.8;       // UI default fine detail
+  let smokeLightAbsorption = 1.5;   // UI default absorption
+  let smokeScatterStrength = 0.0;   // UI default scattering
+  let smokeEdgeSoftness = 0.3;      // Gentle edge falloff
+  let smokeLightSamples = 6;        // Balanced light quality
+  let smokeDirectLight = 0.17;      // UI default directional intensity
+  // Bright white for visibility
+  const smokeColor = vec3.fromValues(0.98, 0.98, 1.0);
   const startTime = performance.now();
-  let smokeHalfResolution = true;
+  // Cloud resolution scale: 1.0 = full resolution, 0.5 = half resolution
+  // Values > 1.0 render at higher internal resolution (supersampling)
+  let cloudResolutionScale = 0.5; // Default to half-res for performance
   let smokeFramebuffer = null;
   let smokeColorTex = null;
   let smokeTargetWidth = 0;
   let smokeTargetHeight = 0;
+
+  // Pre-computed noise textures for high-performance cloud rendering
+  let cloudNoiseTextures = null;
+  let cloudNoiseResolution = 128; // Current noise texture resolution
+  let frameIndex = 0;
 
   // Connectivity/Edge state
   let edgeCount = 0;
@@ -570,19 +596,19 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     fogFarMean = radius + 2;
   }
 
-  function ensureSmokeTarget(w, h) {
-    const halfW = Math.floor(w / 2) || 1;
-    const halfH = Math.floor(h / 2) || 1;
-    if (smokeFramebuffer && halfW === smokeTargetWidth && halfH === smokeTargetHeight) return;
+  function ensureSmokeTarget(w, h, scale) {
+    const targetW = Math.max(1, Math.floor(w * scale));
+    const targetH = Math.max(1, Math.floor(h * scale));
+    if (smokeFramebuffer && targetW === smokeTargetWidth && targetH === smokeTargetHeight) return;
     if (smokeFramebuffer) {
       gl.deleteFramebuffer(smokeFramebuffer);
       gl.deleteTexture(smokeColorTex);
     }
-    smokeTargetWidth = halfW;
-    smokeTargetHeight = halfH;
+    smokeTargetWidth = targetW;
+    smokeTargetHeight = targetH;
     smokeColorTex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, smokeColorTex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, halfW, halfH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, targetW, targetH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -826,7 +852,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     if (renderMode === 'smoke') {
       gl.viewport(0, 0, width, height);
       gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-      renderSmoke(width, height);
+      // Draw grid first as background reference
+      if (showGrid) {
+        drawGrid();
+      }
+      // Render smoke with alpha blending on top of grid
+      renderSmoke(width, height, showGrid);
       return;
     }
 
@@ -973,8 +1004,41 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     updateLabelLayerVisibility();
   }
 
+  // Track if we're generating noise textures
+  let noiseGenerationInProgress = false;
+
   function renderSmoke(width, height) {
     if (!smokeTextureInfo) return;
+
+    // Generate noise textures on first use (lazy initialization with parallel workers)
+    if (!cloudNoiseTextures && !noiseGenerationInProgress) {
+      noiseGenerationInProgress = true;
+      console.log('[Viewer] Generating cloud noise textures (parallel)...');
+
+      // Use async parallel generation (always returns Promise now)
+      generateCloudNoiseTextures(gl).then(textures => {
+        cloudNoiseTextures = textures;
+        noiseGenerationInProgress = false;
+        console.log('[Viewer] Cloud noise textures ready');
+      }).catch(err => {
+        console.error('[Viewer] Failed to generate noise textures:', err);
+        noiseGenerationInProgress = false;
+      });
+
+      // Show loading state - render simple background
+      gl.viewport(0, 0, width, height);
+      gl.clearColor(bgColor[0], bgColor[1], bgColor[2], 1.0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      return;
+    }
+
+    // Still generating - show loading state
+    if (!cloudNoiseTextures) {
+      gl.viewport(0, 0, width, height);
+      gl.clearColor(bgColor[0], bgColor[1], bgColor[2], 1.0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      return;
+    }
 
     updateCamera(width, height);
     mat4.multiply(viewProjMatrix, projectionMatrix, viewMatrix);
@@ -983,17 +1047,25 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     gl.disable(gl.DEPTH_TEST);
 
+    // Determine if we need an off-screen render target (any scale != 1.0)
+    const needsOffscreen = cloudResolutionScale !== 1.0;
     let targetW = width, targetH = height;
-    if (smokeHalfResolution) {
-      ensureSmokeTarget(width, height);
+    if (needsOffscreen) {
+      ensureSmokeTarget(width, height, cloudResolutionScale);
       targetW = smokeTargetWidth;
       targetH = smokeTargetHeight;
       gl.bindFramebuffer(gl.FRAMEBUFFER, smokeFramebuffer);
       gl.viewport(0, 0, targetW, targetH);
+      // Clear to transparent for proper blending with grid
+      gl.clearColor(0, 0, 0, 0);
       gl.clear(gl.COLOR_BUFFER_BIT);
     } else {
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.viewport(0, 0, width, height);
+      // Enable blending for smoke to blend with grid behind it
+      gl.enable(gl.BLEND);
+      // Use premultiplied alpha blend mode (smoke shader outputs premultiplied color)
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     }
 
     gl.useProgram(smokeProgram);
@@ -1001,17 +1073,19 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     gl.enableVertexAttribArray(smokeAttribLocations.position);
     gl.vertexAttribPointer(smokeAttribLocations.position, 2, gl.FLOAT, false, 0, 0);
 
+    // Camera and volume uniforms
     gl.uniformMatrix4fv(smokeUniformLocations.invViewProj, false, invViewProjMatrix);
     gl.uniform3fv(smokeUniformLocations.cameraPos, eye);
     gl.uniform3fv(smokeUniformLocations.volumeMin, volumeMin);
     gl.uniform3fv(smokeUniformLocations.volumeMax, volumeMax);
     gl.uniform1f(smokeUniformLocations.gridSize, smokeTextureInfo.gridSize);
-    gl.uniform1f(smokeUniformLocations.slicesPerRow, smokeTextureInfo.slicesPerRow);
-    gl.uniform2fv(smokeUniformLocations.tileUVSize, smokeTextureInfo.tileUVSize);
+
+    // Colors and lighting
     gl.uniform3fv(smokeUniformLocations.bgColor, bgColor);
     gl.uniform3fv(smokeUniformLocations.smokeColor, smokeColor);
     gl.uniform3fv(smokeUniformLocations.lightDir, lightDir);
 
+    // Animation and quality parameters
     const timeSeconds = (performance.now() - startTime) * 0.001;
     gl.uniform1f(smokeUniformLocations.time, timeSeconds);
     gl.uniform1f(smokeUniformLocations.animationSpeed, smokeAnimationSpeed);
@@ -1023,15 +1097,45 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     gl.uniform1f(smokeUniformLocations.lightAbsorption, smokeLightAbsorption);
     gl.uniform1f(smokeUniformLocations.scatterStrength, smokeScatterStrength);
     gl.uniform1f(smokeUniformLocations.edgeSoftness, smokeEdgeSoftness);
+    gl.uniform1f(smokeUniformLocations.directLight, smokeDirectLight);
+    gl.uniform1i(smokeUniformLocations.lightSamples, smokeLightSamples);
 
+    // Blue noise offset for temporal jittering (R2 sequence for better distribution)
+    frameIndex++;
+    const phi = 1.618033988749895;  // Golden ratio
+    const blueNoiseOffsetX = ((frameIndex * phi) % 1.0) * 128.0;
+    const blueNoiseOffsetY = ((frameIndex * phi * phi) % 1.0) * 128.0;
+    gl.uniform2f(smokeUniformLocations.blueNoiseOffset, blueNoiseOffsetX, blueNoiseOffsetY);
+
+    // Bind textures
+    // Texture unit 0: Density volume (3D texture)
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, smokeTextureInfo.texture);
-    gl.uniform1i(smokeUniformLocations.densityTex, 0);
+    gl.bindTexture(gl.TEXTURE_3D, smokeTextureInfo.texture);
+    gl.uniform1i(smokeUniformLocations.densityTex3D, 0);
+
+    // Texture unit 1: Shape noise (3D texture)
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_3D, cloudNoiseTextures.shape);
+    gl.uniform1i(smokeUniformLocations.shapeNoise, 1);
+
+    // Texture unit 2: Detail noise (3D texture)
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_3D, cloudNoiseTextures.detail);
+    gl.uniform1i(smokeUniformLocations.detailNoise, 2);
+
+    // Texture unit 3: Blue noise (2D texture)
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, cloudNoiseTextures.blueNoise);
+    gl.uniform1i(smokeUniformLocations.blueNoise, 3);
+
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
-    if (smokeHalfResolution) {
+    if (needsOffscreen) {
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.viewport(0, 0, width, height);
+      // Enable blending for composite pass to blend with grid
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
       gl.useProgram(compositeProgram);
       gl.bindBuffer(gl.ARRAY_BUFFER, smokeQuadBuffer);
       gl.enableVertexAttribArray(compositeAttribLocations.position);
@@ -1044,6 +1148,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       gl.drawArrays(gl.TRIANGLES, 0, 3);
     }
 
+    // Restore default blend mode and re-enable depth test
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     gl.enable(gl.DEPTH_TEST);
   }
 
@@ -1167,7 +1273,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     setSmokeVolume(volumeDesc) {
       if (!volumeDesc || !volumeDesc.data) { smokeTextureInfo = null; return; }
       if (smokeTextureInfo?.texture) gl.deleteTexture(smokeTextureInfo.texture);
-      smokeTextureInfo = createDensityAtlasTexture(gl, volumeDesc);
+      // Use native 3D texture for high-performance rendering
+      smokeTextureInfo = createDensityTexture3D(gl, volumeDesc);
+      console.log(`[Viewer] Created 3D density texture (${volumeDesc.gridSize}³)`);
       if (volumeDesc.boundsMin && volumeDesc.boundsMax) {
         vec3.set(volumeMin, ...volumeDesc.boundsMin);
         vec3.set(volumeMax, ...volumeDesc.boundsMax);
@@ -1175,6 +1283,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         vec3.set(volumeMin, -1, -1, -1);
         vec3.set(volumeMax, 1, 1, 1);
       }
+    },
+
+    // GPU-accelerated smoke volume building (much faster for large point counts)
+    buildSmokeVolumeGPU(positions, options = {}) {
+      const volumeDesc = buildDensityVolumeGPU(gl, positions, options);
+      this.setSmokeVolume(volumeDesc);
+      return volumeDesc;
     },
 
     setSmokeParams(params) {
@@ -1188,9 +1303,84 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       if (typeof params.lightAbsorption === 'number') smokeLightAbsorption = params.lightAbsorption;
       if (typeof params.scatterStrength === 'number') smokeScatterStrength = params.scatterStrength;
       if (typeof params.edgeSoftness === 'number') smokeEdgeSoftness = params.edgeSoftness;
+      if (typeof params.directLightIntensity === 'number') smokeDirectLight = Math.max(0.0, Math.min(2.0, params.directLightIntensity));
+      if (typeof params.lightSamples === 'number') smokeLightSamples = Math.max(1, Math.min(12, params.lightSamples));
     },
 
-    setSmokeHalfResolution(enabled) { smokeHalfResolution = !!enabled; },
+    // Cloud resolution scale: 0.25 to 2.0 (1.0 = full res, 0.5 = half res)
+    setCloudResolutionScale(scale) {
+      cloudResolutionScale = Math.max(0.25, Math.min(2.0, scale));
+      // Force framebuffer recreation on next render
+      smokeTargetWidth = 0;
+      smokeTargetHeight = 0;
+    },
+    getCloudResolutionScale() { return cloudResolutionScale; },
+
+    // Noise texture resolution (regenerates noise textures)
+    setNoiseTextureResolution(size) {
+      const prevScale = getResolutionScaleFactor();
+      const newSize = Math.max(32, Math.min(256, size));
+      if (newSize !== cloudNoiseResolution) {
+        cloudNoiseResolution = newSize;
+        setNoiseResolution(newSize, newSize);
+        const newScale = getResolutionScaleFactor();
+        // Keep perceived noise scale stable as resolution changes
+        smokeNoiseScale *= newScale / prevScale;
+        // Trigger regeneration on next render
+        if (cloudNoiseTextures) {
+          // Clean up old textures
+          if (cloudNoiseTextures.shape) gl.deleteTexture(cloudNoiseTextures.shape);
+          if (cloudNoiseTextures.detail) gl.deleteTexture(cloudNoiseTextures.detail);
+          if (cloudNoiseTextures.blueNoise) gl.deleteTexture(cloudNoiseTextures.blueNoise);
+          cloudNoiseTextures = null;
+        }
+        console.log(`[Viewer] Noise resolution changed to ${newSize}³, will regenerate`);
+      }
+    },
+    getNoiseTextureResolution() { return cloudNoiseResolution; },
+
+    // Get adaptive scale factor for UI sliders (based on noise resolution)
+    getAdaptiveScaleFactor() { return getResolutionScaleFactor(); },
+
+    // Backwards compatibility: setSmokeHalfResolution maps to cloudResolutionScale
+    setSmokeHalfResolution(enabled) {
+      cloudResolutionScale = enabled ? 0.5 : 1.0;
+      smokeTargetWidth = 0;
+      smokeTargetHeight = 0;
+    },
+
+    // Cloud quality presets
+    setSmokeQualityPreset(preset) {
+      switch (preset) {
+        case 'performance':
+          smokeStepMultiplier = 0.6;
+          smokeDetailLevel = 1.0;
+          smokeLightSamples = 3;
+          cloudResolutionScale = 0.5;
+          break;
+        case 'balanced':
+          smokeStepMultiplier = 1.0;
+          smokeDetailLevel = 2.0;
+          smokeLightSamples = 6;
+          cloudResolutionScale = 0.5;
+          break;
+        case 'quality':
+          smokeStepMultiplier = 1.5;
+          smokeDetailLevel = 3.0;
+          smokeLightSamples = 8;
+          cloudResolutionScale = 1.0;
+          break;
+        case 'ultra':
+          smokeStepMultiplier = 2.0;
+          smokeDetailLevel = 4.0;
+          smokeLightSamples = 12;
+          cloudResolutionScale = 1.0;
+          break;
+      }
+      // Force framebuffer recreation
+      smokeTargetWidth = 0;
+      smokeTargetHeight = 0;
+    },
 
     setConnectivityEdges(edgeIndices) {
       if (!edgeIndices || edgeIndices.length === 0) {

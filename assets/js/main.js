@@ -13,7 +13,6 @@ import {
   loadConnectivityIndptr,
   loadConnectivityIndices
 } from './data-loaders.js';
-import { buildDensityVolume } from './smoke-density.js';
 import { SyntheticDataGenerator, PerformanceTracker, formatNumber } from './benchmark.js';
 
 console.log('=== SCATTERPLOT APP STARTING ===');
@@ -62,7 +61,8 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
   // New smoke controls
   const renderModeSelect = document.getElementById('render-mode');
   const smokeControls = document.getElementById('smoke-controls');
-  const smokeGridSelect = document.getElementById('smoke-grid');
+  const smokeGridInput = document.getElementById('smoke-grid');
+  const smokeGridDisplay = document.getElementById('smoke-grid-display');
   const smokeStepsInput = document.getElementById('smoke-steps');
   const smokeStepsDisplay = document.getElementById('smoke-steps-display');
   const smokeDensityInput = document.getElementById('smoke-density');
@@ -79,8 +79,12 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
   const smokeScatterDisplay = document.getElementById('smoke-scatter-display');
   const smokeEdgeInput = document.getElementById('smoke-edge');
   const smokeEdgeDisplay = document.getElementById('smoke-edge-display');
-  const smokeHalfResCheckbox = document.getElementById('smoke-half-res');
-  const smokeRebuildBtn = document.getElementById('smoke-rebuild-btn');
+  const smokeDirectLightInput = document.getElementById('smoke-direct-light');
+  const smokeDirectLightDisplay = document.getElementById('smoke-direct-light-display');
+  const cloudResolutionInput = document.getElementById('cloud-resolution');
+  const cloudResolutionDisplay = document.getElementById('cloud-resolution-display');
+  const noiseResolutionInput = document.getElementById('noise-resolution');
+  const noiseResolutionDisplay = document.getElementById('noise-resolution-display');
   const smokeRebuildHint = document.getElementById('smoke-rebuild-hint');
 
   // Split-view controls (small multiples)
@@ -170,20 +174,18 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
 
     // One-time helper to rebuild density from current visibility + grid
     function rebuildSmokeDensity(gridSizeOverride) {
-      const gridSize =
-        gridSizeOverride ||
-        (smokeGridSelect ? parseInt(smokeGridSelect.value, 10) || 128 : 128);
+      const gridSize = gridSizeOverride || 128;
 
       const visiblePositions = state.getVisiblePositionsForSmoke
         ? state.getVisiblePositionsForSmoke()
         : positions;
 
-      console.log(`Building smoke volume at ${gridSize}^3 from ${visiblePositions.length / 3} visible points…`);
-      const densityVolume = buildDensityVolume(visiblePositions, {
+      console.log(`Building smoke volume at ${gridSize}^3 from ${visiblePositions.length / 3} visible points (GPU)…`);
+      // Use GPU-accelerated splatting for dramatic speedup
+      viewer.buildSmokeVolumeGPU(visiblePositions, {
         gridSize,
         gamma: 0.7
       });
-      viewer.setSmokeVolume(densityVolume);
     }
 
     // Smoke volume is built lazily when switching to smoke mode
@@ -225,7 +227,8 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
         geneExpressionSelected,
         renderModeSelect,
         smokeControls,
-        smokeGridSelect,
+        smokeGridInput,
+        smokeGridDisplay,
         smokeStepsInput,
         smokeStepsDisplay,
         smokeDensityInput,
@@ -242,8 +245,12 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
         smokeScatterDisplay,
         smokeEdgeInput,
         smokeEdgeDisplay,
-        smokeHalfResCheckbox,
-        smokeRebuildBtn,
+        smokeDirectLightInput,
+        smokeDirectLightDisplay,
+        cloudResolutionInput,
+        cloudResolutionDisplay,
+        noiseResolutionInput,
+        noiseResolutionDisplay,
         smokeRebuildHint,
         splitViewControls,
         splitKeepViewBtn,
@@ -263,9 +270,6 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
     if (renderModeSelect) {
       const mode = renderModeSelect.value || 'points';
       viewer.setRenderMode(mode === 'smoke' ? 'smoke' : 'points');
-      if (smokeHalfResCheckbox) {
-        viewer.setSmokeHalfResolution(smokeHalfResCheckbox.checked);
-      }
     }
 
     // Setup connectivity controls if data is available
