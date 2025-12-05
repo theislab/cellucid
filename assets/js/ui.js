@@ -1631,6 +1631,7 @@ export function initUI({ state, viewer, dom, smoke }) {
     apply(Boolean(invertLookCheckbox.checked));
     invertLookCheckbox.addEventListener('change', () => {
       apply(Boolean(invertLookCheckbox.checked));
+      invertLookCheckbox.blur();
     });
   }
 
@@ -1653,16 +1654,15 @@ export function initUI({ state, viewer, dom, smoke }) {
     viewer.setProjectilesEnabled(false);
     projectilesEnabledCheckbox.addEventListener('change', () => {
       viewer.setProjectilesEnabled(projectilesEnabledCheckbox.checked);
+      projectilesEnabledCheckbox.blur();
     });
   }
 
   if (pointerLockCheckbox && viewer.setPointerLockEnabled) {
     pointerLockCheckbox.checked = false;
     pointerLockCheckbox.addEventListener('change', () => {
-      if (pointerLockCheckbox.checked && typeof pointerLockCheckbox.blur === 'function') {
-        pointerLockCheckbox.blur();
-      }
       applyPointerLock(pointerLockCheckbox.checked);
+      pointerLockCheckbox.blur();
     });
   }
 
