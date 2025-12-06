@@ -27,12 +27,13 @@ import {
  * Enables frustum culling and adaptive level-of-detail
  */
 export class Octree {
-  constructor(positions, colors, alphas, maxPointsPerNode = 1000, maxDepth = 8) {
+  constructor(positions, colors, maxPointsPerNode = 1000, maxDepth = 8) {
     this.maxPointsPerNode = maxPointsPerNode;
     this.maxDepth = maxDepth;
     this.positions = positions;
     this.colors = colors;
-    this.alphas = alphas;
+    // Alpha is packed in colors as RGBA uint8 - no separate array needed
+    this.hasPackedAlpha = colors.length === (positions.length / 3) * 4 && colors.BYTES_PER_ELEMENT === 1;
     this.pointCount = positions.length / 3;
 
     // Calculate bounds
@@ -190,23 +191,30 @@ export class Octree {
   _computeAvgColor(indices) {
     let sr = 0, sg = 0, sb = 0;
     const colors = this.colors;
+    const stride = colors.length === this.pointCount * 4 ? 4 : 3;
+    const scale = colors.BYTES_PER_ELEMENT === 1 ? (1 / 255) : 1;
     for (let i = 0; i < indices.length; i++) {
-      const idx = indices[i] * 3;
-      sr += colors[idx];
-      sg += colors[idx + 1];
-      sb += colors[idx + 2];
+      const idx = indices[i] * stride;
+      sr += colors[idx] * scale;
+      sg += colors[idx + 1] * scale;
+      sb += colors[idx + 2] * scale;
     }
     const n = indices.length;
     return [sr / n, sg / n, sb / n];
   }
 
   _computeAvgAlpha(indices) {
-    let sum = 0;
-    const alphas = this.alphas;
-    for (let i = 0; i < indices.length; i++) {
-      sum += alphas[indices[i]];
+    if (!indices.length) return 1.0;
+    // Read alpha from packed RGBA colors (4th byte)
+    if (this.hasPackedAlpha) {
+      let sum = 0;
+      const colors = this.colors;
+      for (let i = 0; i < indices.length; i++) {
+        sum += colors[indices[i] * 4 + 3]; // Alpha is 4th byte (0-255)
+      }
+      return sum / (indices.length * 255); // Normalize to 0-1
     }
-    return sum / indices.length;
+    return 1.0; // No alpha data, default to fully opaque
   }
 
   _computeCentroidFromChildren(node) {
@@ -250,7 +258,9 @@ export class Octree {
     const levels = [];
     const totalPoints = this.pointCount;
 
-    const reductionFactors = [64, 16, 4, 1];
+    // Smooth LOD with ~1.4x steps for imperceptible transitions (17 levels)
+    // Each step increases points by ~40%, below human perception threshold
+    const reductionFactors = [256, 180, 128, 90, 64, 45, 32, 22, 16, 11, 8, 5.6, 4, 2.8, 2, 1.4, 1];
 
     for (let levelIdx = 0; levelIdx < reductionFactors.length; levelIdx++) {
       const factor = reductionFactors[levelIdx];
@@ -261,8 +271,7 @@ export class Octree {
           depth: levelIdx,
           pointCount: totalPoints,
           positions: this.positions,
-          colors: this.colors,
-          alphas: this.alphas,
+          colors: this.colors, // RGBA uint8 with alpha packed
           sizes: null,
           isFullDetail: true
         });
@@ -273,32 +282,33 @@ export class Octree {
       const pointCount = sampledIndices.length;
 
       const positions = new Float32Array(pointCount * 3);
-      const colors = new Float32Array(pointCount * 3);
-      const alphas = new Float32Array(pointCount);
+      // Always use RGBA uint8 format - alpha is packed in 4th byte
+      const colors = new Uint8Array(pointCount * 4);
 
       for (let i = 0; i < pointCount; i++) {
         const srcIdx = sampledIndices[i];
-        const dstIdx = i * 3;
         const srcPosIdx = srcIdx * 3;
+        const dstPosIdx = i * 3;
 
-        positions[dstIdx] = this.positions[srcPosIdx];
-        positions[dstIdx + 1] = this.positions[srcPosIdx + 1];
-        positions[dstIdx + 2] = this.positions[srcPosIdx + 2];
+        positions[dstPosIdx] = this.positions[srcPosIdx];
+        positions[dstPosIdx + 1] = this.positions[srcPosIdx + 1];
+        positions[dstPosIdx + 2] = this.positions[srcPosIdx + 2];
 
-        colors[dstIdx] = this.colors[srcPosIdx];
-        colors[dstIdx + 1] = this.colors[srcPosIdx + 1];
-        colors[dstIdx + 2] = this.colors[srcPosIdx + 2];
-
-        alphas[i] = this.alphas[srcIdx];
+        // Copy RGBA directly - alpha is already packed
+        const colorSrcIdx = srcIdx * 4;
+        const colorDstIdx = i * 4;
+        colors[colorDstIdx] = this.colors[colorSrcIdx];
+        colors[colorDstIdx + 1] = this.colors[colorSrcIdx + 1];
+        colors[colorDstIdx + 2] = this.colors[colorSrcIdx + 2];
+        colors[colorDstIdx + 3] = this.colors[colorSrcIdx + 3];
       }
 
       levels.push({
         depth: levelIdx,
         pointCount,
         positions,
-        colors,
-        alphas,
-        indices: sampledIndices, // Store indices for color/alpha updates
+        colors, // RGBA uint8 with alpha packed
+        indices: sampledIndices, // Store indices for color updates
         sizes: null,
         isFullDetail: false,
         sizeMultiplier: Math.sqrt(factor) * 0.5 + 0.5
@@ -311,40 +321,73 @@ export class Octree {
     return levels;
   }
 
-  _stratifiedSample(targetCount) {
-    const sampledIndices = [];
+  /**
+   * Build a stable hierarchical ordering of all points.
+   * Points are ranked so that coarser LOD levels are always strict subsets of finer levels.
+   * This prevents "popping" when transitioning between LOD levels.
+   *
+   * Uses Morton code (Z-order curve) + bit-reversal for optimal spatial distribution:
+   * - Morton code groups spatially close points together
+   * - Bit-reversal ensures coarse samples are evenly distributed across space
+   */
+  _buildHierarchicalOrder() {
+    if (this._hierarchicalOrder) return this._hierarchicalOrder;
 
-    const leafNodes = [];
-    const collectLeaves = (node) => {
-      if (!node) return;
-      if (node.indices !== null) {
-        leafNodes.push(node);
-      } else if (node.children) {
-        for (const child of node.children) {
-          collectLeaves(child);
-        }
-      }
-    };
-    collectLeaves(this.root);
+    const n = this.pointCount;
+    const positions = this.positions;
+    const bounds = this.bounds;
 
-    if (leafNodes.length === 0) {
-      const step = Math.max(1, Math.floor(this.pointCount / targetCount));
-      for (let i = 0; i < this.pointCount && sampledIndices.length < targetCount; i += step) {
-        sampledIndices.push(i);
+    // Normalize positions to 0-1023 range for 10-bit Morton codes
+    const scaleX = 1023 / Math.max(bounds.maxX - bounds.minX, 0.0001);
+    const scaleY = 1023 / Math.max(bounds.maxY - bounds.minY, 0.0001);
+    const scaleZ = 1023 / Math.max(bounds.maxZ - bounds.minZ, 0.0001);
+
+    // Create array of (index, morton code) pairs
+    const ranked = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const x = Math.floor((positions[i * 3] - bounds.minX) * scaleX) & 1023;
+      const y = Math.floor((positions[i * 3 + 1] - bounds.minY) * scaleY) & 1023;
+      const z = Math.floor((positions[i * 3 + 2] - bounds.minZ) * scaleZ) & 1023;
+
+      // Compute 30-bit Morton code (interleave x, y, z bits)
+      let morton = 0;
+      for (let bit = 0; bit < 10; bit++) {
+        morton |= ((x >> bit) & 1) << (bit * 3);
+        morton |= ((y >> bit) & 1) << (bit * 3 + 1);
+        morton |= ((z >> bit) & 1) << (bit * 3 + 2);
       }
-      return sampledIndices;
+
+      // Bit-reverse the Morton code for hierarchical ordering
+      // This ensures points at index 0, 2, 4... are evenly distributed
+      // while points at 1, 3, 5... fill in the gaps
+      let reversed = 0;
+      let temp = morton;
+      for (let bit = 0; bit < 30; bit++) {
+        reversed = (reversed << 1) | (temp & 1);
+        temp >>= 1;
+      }
+
+      ranked[i] = { idx: i, priority: reversed };
     }
 
-    const totalNodePoints = leafNodes.reduce((sum, n) => sum + n.indices.length, 0);
+    // Sort by bit-reversed Morton code
+    ranked.sort((a, b) => a.priority - b.priority);
 
-    for (const node of leafNodes) {
-      const nodeShare = node.indices.length / totalNodePoints;
-      const nodeSampleCount = Math.max(1, Math.round(targetCount * nodeShare));
-      const step = Math.max(1, Math.floor(node.indices.length / nodeSampleCount));
+    // Extract just the indices in priority order
+    this._hierarchicalOrder = ranked.map(r => r.idx);
+    return this._hierarchicalOrder;
+  }
 
-      for (let i = 0; i < node.indices.length && sampledIndices.length < targetCount; i += step) {
-        sampledIndices.push(node.indices[i]);
-      }
+  _stratifiedSample(targetCount) {
+    // Use hierarchical ordering for stable, subset-based sampling
+    const order = this._buildHierarchicalOrder();
+
+    // Take the first targetCount points from the hierarchical order
+    // This ensures coarser LODs are always subsets of finer LODs
+    const count = Math.min(targetCount, order.length);
+    const sampledIndices = new Array(count);
+    for (let i = 0; i < count; i++) {
+      sampledIndices[i] = order[i];
     }
 
     return sampledIndices;
@@ -353,17 +396,44 @@ export class Octree {
   getLODLevel(distance, viewportHeight, targetPointsOnScreen = 500000) {
     if (this.lodLevels.length === 0) return -1;
 
-    const pixelsPerUnit = viewportHeight / (distance * 2);
+    const numLevels = this.lodLevels.length;
 
-    if (pixelsPerUnit > 1.0) {
-      return this.lodLevels.length - 1;
-    } else if (pixelsPerUnit > 0.3) {
-      return Math.min(this.lodLevels.length - 1, Math.max(0, this.lodLevels.length - 2));
-    } else if (pixelsPerUnit > 0.1) {
-      return Math.min(this.lodLevels.length - 1, Math.max(0, this.lodLevels.length - 3));
-    } else {
-      return 0;
+    // Calculate data diagonal size for scale-independent LOD selection
+    const bounds = this.bounds;
+    const dx = bounds.maxX - bounds.minX;
+    const dy = bounds.maxY - bounds.minY;
+    const dz = bounds.maxZ - bounds.minZ;
+    const dataSize = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
+
+    // Normalize distance relative to data size
+    const distanceRatio = distance / dataSize;
+
+    // Map distance ratio to LOD level
+    const minRatio = 0.3;
+    const maxRatio = 3.0;
+    const clampedRatio = Math.max(minRatio, Math.min(maxRatio, distanceRatio));
+
+    const t = 1.0 - (Math.log(clampedRatio / minRatio) / Math.log(maxRatio / minRatio));
+    const targetLevel = t * (numLevels - 1);
+
+    // Apply hysteresis with large dead zone to prevent oscillation
+    const HYSTERESIS = 0.7;
+
+    if (this._lastLODLevel === undefined) {
+      this._lastLODLevel = Math.round(targetLevel);
     }
+
+    const currentLevel = this._lastLODLevel;
+    let newLevel = currentLevel;
+
+    if (targetLevel > currentLevel + HYSTERESIS && currentLevel < numLevels - 1) {
+      newLevel = currentLevel + 1;
+    } else if (targetLevel < currentLevel - HYSTERESIS && currentLevel > 0) {
+      newLevel = currentLevel - 1;
+    }
+
+    this._lastLODLevel = newLevel;
+    return Math.max(0, Math.min(numLevels - 1, newLevel));
   }
 
   getVisibleIndices(frustumPlanes, maxPoints = Infinity) {
@@ -481,7 +551,7 @@ export const RendererConfig = {
 
   // Feature flags
   USE_INTERLEAVED_BUFFERS: true,
-  USE_LOD: true,
+  USE_LOD: false,
   USE_FRUSTUM_CULLING: false,
 
   // LOD settings
@@ -525,7 +595,6 @@ export class HighPerfRenderer {
       positions: null,
       colors: null,
       alphas: null,
-      culled: null,
     };
 
     // LOD system
@@ -535,6 +604,7 @@ export class HighPerfRenderer {
     // State
     this.pointCount = 0;
     this.currentLOD = -1;
+    this.forceLODLevel = -1; // -1 = auto, 0+ = forced level
     this.useAdaptiveLOD = this.options.USE_LOD;
     this.useFrustumCulling = this.options.USE_FRUSTUM_CULLING;
     this.useInterleavedBuffers = this.options.USE_INTERLEAVED_BUFFERS;
@@ -542,6 +612,10 @@ export class HighPerfRenderer {
     // VAO for WebGL2
     this.vao = null;
     this.lodVaos = [];
+
+    // Index buffer for frustum culling (uses element array instead of copying vertex data)
+    // Much faster than copying vertex data: 4 bytes/point vs 16 bytes/point
+    this.indexBuffer = null;
 
     // Performance stats
     this.stats = {
@@ -551,11 +625,22 @@ export class HighPerfRenderer {
       lodLevel: -1,
       gpuMemoryMB: 0,
       drawCalls: 0,
+      frustumCulled: false,
+      cullPercent: 0,
     };
 
     // Fog bounds
     this.fogNear = 0;
     this.fogFar = 10;
+
+    // Dirty flags for lazy buffer rebuilds (avoids double rebuilds)
+    this._bufferDirty = false;
+    this._lodBuffersDirty = false;
+
+    // Reusable ArrayBuffer to reduce GC pressure
+    this._interleavedArrayBuffer = null;
+    this._interleavedPositionView = null;
+    this._interleavedColorView = null;
 
     this._init();
   }
@@ -566,8 +651,12 @@ export class HighPerfRenderer {
     // Create shader programs
     this._createPrograms();
 
-    // Create VAO
+    // Create VAOs
     this.vao = gl.createVertexArray();
+
+    // Create index buffer for frustum culling (element array buffer)
+    // Uses indexed drawing instead of copying vertex data for much better performance
+    this.indexBuffer = gl.createBuffer();
 
     // GL state
     gl.enable(gl.DEPTH_TEST);
@@ -679,7 +768,7 @@ export class HighPerfRenderer {
     }
   }
 
-  loadData(positions, colors, alphas, options = {}) {
+  loadData(positions, colors, options = {}) {
     const gl = this.gl;
     const {
       buildOctree = this.options.USE_LOD || this.options.USE_FRUSTUM_CULLING,
@@ -690,9 +779,9 @@ export class HighPerfRenderer {
     console.log(`[HighPerfRenderer] Loading ${this.pointCount.toLocaleString()} points...`);
 
     // Store references to original data for frustum culling
+    // Alpha is packed in colors as RGBA uint8 - no separate array needed
     this._positions = positions;
     this._colors = colors;
-    this._alphas = alphas;
 
     this._firstRenderDone = false;
 
@@ -701,8 +790,10 @@ export class HighPerfRenderer {
     // Build octree for LOD and/or frustum culling
     if (buildOctree && this.pointCount > 10000) {
       console.log('[HighPerfRenderer] Building octree for LOD/frustum culling...');
-      this.octree = new Octree(positions, colors, alphas, maxPointsPerNode);
-      console.log(`[HighPerfRenderer] Octree built with ${this.octree.lodLevels.length} LOD levels`);
+      this.octree = new Octree(positions, colors, maxPointsPerNode);
+      // Reset LOD state when new data is loaded
+      this.octree._lastLODLevel = undefined;
+      console.log(`[HighPerfRenderer] Octree built with ${this.octree.lodLevels.length} LOD levels (hierarchical sampling)`);
 
       if (this.options.USE_LOD) {
         this._createLODBuffers();
@@ -710,40 +801,48 @@ export class HighPerfRenderer {
     }
 
     // Create main data buffers
-    this._createInterleavedBuffer(positions, colors, alphas);
+    this._createInterleavedBuffer(positions, colors);
 
     const elapsed = performance.now() - startTime;
     console.log(`[HighPerfRenderer] Data loaded in ${elapsed.toFixed(1)}ms`);
 
     // Calculate GPU memory usage
-    const bytesPerPoint = 28; // interleaved
+    const bytesPerPoint = 16; // interleaved (12 bytes position + 4 bytes RGBA)
     this.stats.gpuMemoryMB = (this.pointCount * bytesPerPoint) / (1024 * 1024);
 
     for (const lod of this.lodBuffers) {
-      this.stats.gpuMemoryMB += (lod.pointCount * 32) / (1024 * 1024);
+      this.stats.gpuMemoryMB += (lod.pointCount * 16) / (1024 * 1024);
     }
 
     return this.stats;
   }
 
-  _createInterleavedBuffer(positions, colors, alphas) {
+  _createInterleavedBuffer(positions, colors) {
     const gl = this.gl;
     const pointCount = positions.length / 3;
 
-    // Create interleaved buffer: [x,y,z, r,g,b, a] per point (28 bytes)
-    const interleavedData = new Float32Array(pointCount * 7);
+    // Create interleaved buffer: [x,y,z (float32), r,g,b,a (uint8)] per point (16 bytes)
+    // colors is Uint8Array with RGBA packed (4 bytes per point) - alpha is in 4th byte
+    const buffer = new ArrayBuffer(pointCount * 16);
+    const positionView = new Float32Array(buffer);
+    const colorView = new Uint8Array(buffer);
 
     for (let i = 0; i < pointCount; i++) {
       const srcIdx = i * 3;
-      const dstIdx = i * 7;
+      const floatOffset = i * 4; // 16 bytes / 4 = 4 floats per point
+      const byteOffset = i * 16 + 12; // color starts at byte 12 within each 16-byte block
 
-      interleavedData[dstIdx] = positions[srcIdx];
-      interleavedData[dstIdx + 1] = positions[srcIdx + 1];
-      interleavedData[dstIdx + 2] = positions[srcIdx + 2];
-      interleavedData[dstIdx + 3] = colors[srcIdx];
-      interleavedData[dstIdx + 4] = colors[srcIdx + 1];
-      interleavedData[dstIdx + 5] = colors[srcIdx + 2];
-      interleavedData[dstIdx + 6] = alphas[i];
+      // Position (3 floats = 12 bytes)
+      positionView[floatOffset] = positions[srcIdx];
+      positionView[floatOffset + 1] = positions[srcIdx + 1];
+      positionView[floatOffset + 2] = positions[srcIdx + 2];
+
+      // Color RGBA (4 uint8 = 4 bytes) - colors is already Uint8Array with RGBA
+      const colorSrcIdx = i * 4;
+      colorView[byteOffset] = colors[colorSrcIdx];
+      colorView[byteOffset + 1] = colors[colorSrcIdx + 1];
+      colorView[byteOffset + 2] = colors[colorSrcIdx + 2];
+      colorView[byteOffset + 3] = colors[colorSrcIdx + 3];
     }
 
     if (!this.buffers.interleaved) {
@@ -751,7 +850,7 @@ export class HighPerfRenderer {
     }
 
     gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.interleaved);
-    gl.bufferData(gl.ARRAY_BUFFER, interleavedData, gl.STATIC_DRAW);
+    gl.bufferData(gl.ARRAY_BUFFER, buffer, gl.STATIC_DRAW);
 
     // Setup VAO
     gl.bindVertexArray(this.vao);
@@ -761,21 +860,19 @@ export class HighPerfRenderer {
 
   _setupInterleavedAttributes() {
     const gl = this.gl;
-    const STRIDE = 28; // 7 floats * 4 bytes
+    const STRIDE = 16; // 12 bytes position + 4 bytes color
 
     gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.interleaved);
 
-    // Position (location 0)
+    // Position (location 0): 3 floats at offset 0
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 3, gl.FLOAT, false, STRIDE, 0);
 
-    // Color (location 1)
+    // Color RGBA (location 1): 4 uint8 at offset 12, normalized to 0.0-1.0
     gl.enableVertexAttribArray(1);
-    gl.vertexAttribPointer(1, 3, gl.FLOAT, false, STRIDE, 12);
+    gl.vertexAttribPointer(1, 4, gl.UNSIGNED_BYTE, true, STRIDE, 12);
 
-    // Alpha (location 2)
-    gl.enableVertexAttribArray(2);
-    gl.vertexAttribPointer(2, 1, gl.FLOAT, false, STRIDE, 24);
+    // Note: Alpha is now packed in color as the 4th component, no separate attribute needed
   }
 
   _createLODBuffers() {
@@ -808,43 +905,48 @@ export class HighPerfRenderer {
 
       const pointCount = level.pointCount;
 
-      // Interleaved buffer: [x,y,z, r,g,b, a] - 28 bytes per point
-      const data = new Float32Array(pointCount * 7);
+      // Interleaved buffer: [x,y,z (float32), r,g,b,a (uint8)] - 16 bytes per point
+      const buffer = new ArrayBuffer(pointCount * 16);
+      const positionView = new Float32Array(buffer);
+      const colorView = new Uint8Array(buffer);
 
+      // LOD colors are always RGBA uint8 with alpha packed
       for (let i = 0; i < pointCount; i++) {
-        const dstIdx = i * 7;
-        const srcIdx = i * 3;
+        const srcPosIdx = i * 3;
+        const floatOffset = i * 4;
+        const byteOffset = i * 16 + 12;
 
-        data[dstIdx] = level.positions[srcIdx];
-        data[dstIdx + 1] = level.positions[srcIdx + 1];
-        data[dstIdx + 2] = level.positions[srcIdx + 2];
-        data[dstIdx + 3] = level.colors[srcIdx];
-        data[dstIdx + 4] = level.colors[srcIdx + 1];
-        data[dstIdx + 5] = level.colors[srcIdx + 2];
-        data[dstIdx + 6] = level.alphas[i];
+        positionView[floatOffset] = level.positions[srcPosIdx];
+        positionView[floatOffset + 1] = level.positions[srcPosIdx + 1];
+        positionView[floatOffset + 2] = level.positions[srcPosIdx + 2];
+
+        // Copy RGBA directly - alpha is already packed in 4th byte
+        const colorSrcIdx = i * 4;
+        colorView[byteOffset] = level.colors[colorSrcIdx];
+        colorView[byteOffset + 1] = level.colors[colorSrcIdx + 1];
+        colorView[byteOffset + 2] = level.colors[colorSrcIdx + 2];
+        colorView[byteOffset + 3] = level.colors[colorSrcIdx + 3];
       }
 
-      const buffer = gl.createBuffer();
-      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-      gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+      const glBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, glBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, buffer, gl.STATIC_DRAW);
 
       // Create VAO for this LOD level
       const vao = gl.createVertexArray();
       gl.bindVertexArray(vao);
 
-      const STRIDE = 28;
+      const STRIDE = 16;
       gl.enableVertexAttribArray(0);
       gl.vertexAttribPointer(0, 3, gl.FLOAT, false, STRIDE, 0);
       gl.enableVertexAttribArray(1);
-      gl.vertexAttribPointer(1, 3, gl.FLOAT, false, STRIDE, 12);
-      gl.enableVertexAttribArray(2);
-      gl.vertexAttribPointer(2, 1, gl.FLOAT, false, STRIDE, 24);
+      gl.vertexAttribPointer(1, 4, gl.UNSIGNED_BYTE, true, STRIDE, 12);
 
       gl.bindVertexArray(null);
       this.lodVaos.push(vao);
 
       this.lodBuffers.push({
-        buffer,
+        buffer: glBuffer,
         vao,
         pointCount,
         depth: level.depth,
@@ -855,26 +957,42 @@ export class HighPerfRenderer {
   }
 
   updateColors(colors) {
-    this._colors = colors;
+    this._colors = colors; // Now Uint8Array with RGBA packed
 
-    // Rebuild entire interleaved buffer (fast single upload)
-    this._rebuildInterleavedBuffer();
-
-    // Also rebuild LOD buffers if they exist
+    // Mark buffers as dirty - actual rebuild deferred to render() to avoid double rebuilds
+    this._bufferDirty = true;
     if (this.octree && this.lodBuffers.length > 0) {
-      this._rebuildLODBuffersWithCurrentData();
+      this._lodBuffersDirty = true;
     }
   }
 
   updateAlphas(alphas) {
-    this._alphas = alphas;
+    // Pack float alphas (0.0-1.0) into the colors array's alpha channel (RGBA uint8)
+    if (!this._colors || !alphas) return;
 
-    // Rebuild entire interleaved buffer (fast single upload)
-    this._rebuildInterleavedBuffer();
+    const n = Math.min(this.pointCount, alphas.length);
+    for (let i = 0; i < n; i++) {
+      this._colors[i * 4 + 3] = Math.round(alphas[i] * 255);
+    }
 
-    // Also rebuild LOD buffers if they exist
+    // Mark buffers as dirty - actual rebuild deferred to render() to avoid double rebuilds
+    this._bufferDirty = true;
     if (this.octree && this.lodBuffers.length > 0) {
+      this._lodBuffersDirty = true;
+    }
+  }
+
+  /**
+   * Force immediate buffer rebuild (use sparingly, prefer letting render() handle it)
+   */
+  flushBufferUpdates() {
+    if (this._bufferDirty) {
+      this._rebuildInterleavedBuffer();
+      this._bufferDirty = false;
+    }
+    if (this._lodBuffersDirty) {
       this._rebuildLODBuffersWithCurrentData();
+      this._lodBuffersDirty = false;
     }
   }
 
@@ -882,31 +1000,49 @@ export class HighPerfRenderer {
     const gl = this.gl;
     const n = this.pointCount;
     const positions = this._positions;
-    const colors = this._colors;
-    const alphas = this._alphas;
+    const colors = this._colors; // Now Uint8Array with RGBA
+    const requiredSize = n * 16;
 
-    // Build interleaved data in one pass
-    const interleavedData = new Float32Array(n * 7);
+    // Reuse ArrayBuffer if same size, otherwise allocate new one (reduces GC pressure)
+    if (!this._interleavedArrayBuffer || this._interleavedArrayBuffer.byteLength !== requiredSize) {
+      this._interleavedArrayBuffer = new ArrayBuffer(requiredSize);
+      this._interleavedPositionView = new Float32Array(this._interleavedArrayBuffer);
+      this._interleavedColorView = new Uint8Array(this._interleavedArrayBuffer);
+    }
+
+    const positionView = this._interleavedPositionView;
+    const colorView = this._interleavedColorView;
+
+    // Build interleaved data: [x,y,z (float32), r,g,b,a (uint8)] - 16 bytes per point
     for (let i = 0; i < n; i++) {
       const srcIdx = i * 3;
-      const dstIdx = i * 7;
-      interleavedData[dstIdx] = positions[srcIdx];
-      interleavedData[dstIdx + 1] = positions[srcIdx + 1];
-      interleavedData[dstIdx + 2] = positions[srcIdx + 2];
-      interleavedData[dstIdx + 3] = colors[srcIdx];
-      interleavedData[dstIdx + 4] = colors[srcIdx + 1];
-      interleavedData[dstIdx + 5] = colors[srcIdx + 2];
-      interleavedData[dstIdx + 6] = alphas[i];
+      const floatOffset = i * 4;
+      const byteOffset = i * 16 + 12;
+
+      positionView[floatOffset] = positions[srcIdx];
+      positionView[floatOffset + 1] = positions[srcIdx + 1];
+      positionView[floatOffset + 2] = positions[srcIdx + 2];
+
+      // Colors already in uint8 RGBA format
+      const colorSrcIdx = i * 4;
+      colorView[byteOffset] = colors[colorSrcIdx];
+      colorView[byteOffset + 1] = colors[colorSrcIdx + 1];
+      colorView[byteOffset + 2] = colors[colorSrcIdx + 2];
+      colorView[byteOffset + 3] = colors[colorSrcIdx + 3];
     }
 
     gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.interleaved);
-    gl.bufferData(gl.ARRAY_BUFFER, interleavedData, gl.DYNAMIC_DRAW);
+    gl.bufferData(gl.ARRAY_BUFFER, this._interleavedArrayBuffer, gl.DYNAMIC_DRAW);
   }
 
   _rebuildLODBuffersWithCurrentData() {
     const gl = this.gl;
-    const colors = this._colors;
-    const alphas = this._alphas;
+    const colors = this._colors; // Now Uint8Array with RGBA
+
+    // Initialize LOD array buffer cache if needed
+    if (!this._lodArrayBuffers) {
+      this._lodArrayBuffers = [];
+    }
 
     // Update each non-full-detail LOD buffer
     for (let lvlIdx = 0; lvlIdx < this.lodBuffers.length; lvlIdx++) {
@@ -917,25 +1053,43 @@ export class HighPerfRenderer {
       if (!level || !level.indices) continue;
 
       const pointCount = level.pointCount;
-      const data = new Float32Array(pointCount * 7);
+      const requiredSize = pointCount * 16;
 
-      // Use the indices to sample from current colors/alphas
+      // Reuse ArrayBuffer if same size (reduces GC pressure)
+      let cached = this._lodArrayBuffers[lvlIdx];
+      if (!cached || cached.buffer.byteLength !== requiredSize) {
+        const buffer = new ArrayBuffer(requiredSize);
+        cached = {
+          buffer,
+          positionView: new Float32Array(buffer),
+          colorView: new Uint8Array(buffer)
+        };
+        this._lodArrayBuffers[lvlIdx] = cached;
+      }
+
+      const positionView = cached.positionView;
+      const colorView = cached.colorView;
+
+      // Use the indices to sample from current colors
       for (let i = 0; i < pointCount; i++) {
         const origIdx = level.indices[i];
-        const srcIdx3 = origIdx * 3;
-        const dstIdx = i * 7;
+        const floatOffset = i * 4;
+        const byteOffset = i * 16 + 12;
 
-        data[dstIdx] = level.positions[i * 3];
-        data[dstIdx + 1] = level.positions[i * 3 + 1];
-        data[dstIdx + 2] = level.positions[i * 3 + 2];
-        data[dstIdx + 3] = colors[srcIdx3];
-        data[dstIdx + 4] = colors[srcIdx3 + 1];
-        data[dstIdx + 5] = colors[srcIdx3 + 2];
-        data[dstIdx + 6] = alphas[origIdx];
+        positionView[floatOffset] = level.positions[i * 3];
+        positionView[floatOffset + 1] = level.positions[i * 3 + 1];
+        positionView[floatOffset + 2] = level.positions[i * 3 + 2];
+
+        // Colors already in uint8 RGBA format
+        const colorSrcIdx = origIdx * 4;
+        colorView[byteOffset] = colors[colorSrcIdx];
+        colorView[byteOffset + 1] = colors[colorSrcIdx + 1];
+        colorView[byteOffset + 2] = colors[colorSrcIdx + 2];
+        colorView[byteOffset + 3] = colors[colorSrcIdx + 3];
       }
 
       gl.bindBuffer(gl.ARRAY_BUFFER, lodBuf.buffer);
-      gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
+      gl.bufferData(gl.ARRAY_BUFFER, cached.buffer, gl.DYNAMIC_DRAW);
     }
   }
 
@@ -961,10 +1115,11 @@ export class HighPerfRenderer {
     this.fogFar = distToCenter + sphere.radius;
   }
 
-  extractFrustumPlanes(mvpMatrix) {
+  extractFrustumPlanes(mvpMatrix, margin = 0.05) {
     const m = mvpMatrix;
     const planes = [];
 
+    // Left, Right, Bottom, Top, Near, Far
     planes.push([m[3] + m[0], m[7] + m[4], m[11] + m[8], m[15] + m[12]]);
     planes.push([m[3] - m[0], m[7] - m[4], m[11] - m[8], m[15] - m[12]]);
     planes.push([m[3] + m[1], m[7] + m[5], m[11] + m[9], m[15] + m[13]]);
@@ -972,13 +1127,19 @@ export class HighPerfRenderer {
     planes.push([m[3] + m[2], m[7] + m[6], m[11] + m[10], m[15] + m[14]]);
     planes.push([m[3] - m[2], m[7] - m[6], m[11] - m[10], m[15] - m[14]]);
 
-    for (const plane of planes) {
+    for (let i = 0; i < planes.length; i++) {
+      const plane = planes[i];
       const len = Math.sqrt(plane[0] * plane[0] + plane[1] * plane[1] + plane[2] * plane[2]);
       if (len > 0) {
         plane[0] /= len;
         plane[1] /= len;
         plane[2] /= len;
         plane[3] /= len;
+      }
+      // Expand left/right/top/bottom planes outward (indices 0-3)
+      // Positive margin pushes planes away from center, enlarging the frustum
+      if (i < 4 && margin > 0) {
+        plane[3] += margin;
       }
     }
 
@@ -1003,6 +1164,12 @@ export class HighPerfRenderer {
     if (!this.buffers.interleaved) {
       console.error('[HighPerfRenderer] No buffers available');
       return this.stats;
+    }
+
+    // Flush any pending buffer updates (deferred from updateColors/updateAlphas)
+    // This ensures we only rebuild once even if both were called
+    if (this._bufferDirty || this._lodBuffersDirty) {
+      this.flushBufferUpdates();
     }
 
     const {
@@ -1032,7 +1199,9 @@ export class HighPerfRenderer {
         activeQuality: this.activeQuality,
         pointSize: pointSize,
         viewportHeight: viewportHeight,
-        useFrustumCulling: this.useFrustumCulling
+        useFrustumCulling: this.useFrustumCulling,
+        useAdaptiveLOD: this.useAdaptiveLOD,
+        hasOctree: !!this.octree
       });
       this._firstRenderDone = true;
     }
@@ -1047,8 +1216,29 @@ export class HighPerfRenderer {
       this.setQuality(quality);
     }
 
-    // Frustum culling path
-    if (this.useFrustumCulling && this.octree) {
+    // Select LOD level first (determines whether to use frustum culling)
+    // Priority: this.forceLODLevel > params.forceLOD > adaptive
+    let lodLevel = this.forceLODLevel >= 0 ? this.forceLODLevel : forceLOD;
+    if (lodLevel < 0 && this.useAdaptiveLOD && this.octree) {
+      lodLevel = this.octree.getLODLevel(cameraDistance, viewportHeight);
+    }
+
+    const useFullDetail = lodLevel < 0 || !this.lodBuffers.length ||
+      lodLevel >= this.lodBuffers.length ||
+      (this.lodBuffers[lodLevel] && this.lodBuffers[lodLevel].isFullDetail);
+
+    // Debug LOD selection - only log when level changes
+    if (this._prevLodLevel !== lodLevel && this.octree && (this.useAdaptiveLOD || this.forceLODLevel >= 0)) {
+      const lodBuf = this.lodBuffers[lodLevel];
+      const pointCount = lodBuf ? lodBuf.pointCount : this.pointCount;
+      const mode = this.forceLODLevel >= 0 ? 'forced' : 'auto';
+      console.log(`[LOD] Transition: level ${this._prevLodLevel ?? 'init'} → ${lodLevel} (${pointCount.toLocaleString()} pts, ${mode})`);
+      this._prevLodLevel = lodLevel;
+    }
+
+    // Frustum culling only applies when at full detail (highest LOD or LOD disabled)
+    // At reduced LOD levels, the point count is already reduced so frustum culling has less benefit
+    if (this.useFrustumCulling && this.octree && useFullDetail) {
       const frustumPlanes = this.extractFrustumPlanes(mvpMatrix);
       this._renderWithFrustumCulling(params, frustumPlanes);
       this.stats.lastFrameTime = performance.now() - frameStart;
@@ -1056,14 +1246,11 @@ export class HighPerfRenderer {
       return this.stats;
     }
 
-    // Select LOD level
-    let lodLevel = forceLOD;
-    if (lodLevel < 0 && this.useAdaptiveLOD && this.octree) {
-      lodLevel = this.octree.getLODLevel(cameraDistance, viewportHeight);
+    // Reset frustum culling stats when not using it
+    if (!this.useFrustumCulling || !useFullDetail) {
+      this.stats.frustumCulled = false;
+      this.stats.cullPercent = 0;
     }
-
-    const useFullDetail = lodLevel < 0 || !this.lodBuffers.length ||
-      lodLevel >= this.lodBuffers.length;
 
     if (useFullDetail) {
       this._renderFullDetail(params);
@@ -1094,33 +1281,55 @@ export class HighPerfRenderer {
       if (visibleNodes.length === 0) {
         this.stats.visiblePoints = 0;
         this.stats.drawCalls = 0;
+        this.stats.frustumCulled = true;
+        this.stats.cullPercent = 100;
         this._cachedCulledCount = 0;
         return;
       }
 
-      const visibleIndices = [];
+      // Count total visible points first to pre-allocate
+      let totalVisible = 0;
+      for (const node of visibleNodes) {
+        if (node.indices) totalVisible += node.indices.length;
+      }
+
+      // Pre-allocate typed array for better performance with millions of points
+      const visibleIndices = new Uint32Array(totalVisible);
+      let writeOffset = 0;
       for (const node of visibleNodes) {
         if (node.indices) {
-          for (let i = 0; i < node.indices.length; i++) {
-            visibleIndices.push(node.indices[i]);
-          }
+          visibleIndices.set(node.indices, writeOffset);
+          writeOffset += node.indices.length;
         }
       }
 
-      // If >85% visible, just render everything
-      if (visibleIndices.length > this.pointCount * 0.85) {
+      const visibleRatio = visibleIndices.length / this.pointCount;
+      const cullPercent = ((1 - visibleRatio) * 100);
+      const visibleCount = visibleIndices.length;
+
+      // If >98% visible, render everything (building culled buffer not worth it)
+      if (visibleRatio > 0.98) {
+        if (this._lastVisibleCount !== this.pointCount) {
+          console.log(`[FrustumCulling] ${this.pointCount.toLocaleString()} visible (full detail, ${cullPercent.toFixed(1)}% culled)`);
+          this._lastVisibleCount = this.pointCount;
+        }
+        this._cachedCulledCount = 0;
+        this.stats.frustumCulled = false;
+        this.stats.cullPercent = cullPercent;
         this._renderFullDetail(params);
         return;
       }
 
-      this._frustumCullFrameCount = (this._frustumCullFrameCount || 0) + 1;
-      if (this._frustumCullFrameCount % 120 === 1) {
-        const cullPercent = ((1 - visibleIndices.length / this.pointCount) * 100).toFixed(1);
-        console.log(`[FrustumCulling] Visible: ${visibleIndices.length.toLocaleString()}/${this.pointCount.toLocaleString()} (${cullPercent}% culled)`);
+      // Log whenever visible count changes
+      if (this._lastVisibleCount !== visibleCount) {
+        console.log(`[FrustumCulling] ${visibleCount.toLocaleString()}/${this.pointCount.toLocaleString()} visible (${cullPercent.toFixed(1)}% culled)`);
+        this._lastVisibleCount = visibleCount;
       }
 
-      this._updateCulledBuffer(visibleIndices);
+      this._updateCulledIndexBuffer(visibleIndices);
       this._cachedCulledCount = visibleIndices.length;
+      this.stats.frustumCulled = true;
+      this.stats.cullPercent = cullPercent;
     }
 
     if (!this._cachedCulledCount || this._cachedCulledCount === 0) {
@@ -1132,6 +1341,7 @@ export class HighPerfRenderer {
     const uniforms = this.uniformLocations.get(this.activeQuality);
 
     if (!program || !uniforms) {
+      console.warn('[FrustumCulling] No program/uniforms available');
       return;
     }
 
@@ -1177,18 +1387,14 @@ export class HighPerfRenderer {
       gl.uniform3fv(uniforms.u_lightDir, lightDir);
     }
 
-    // Bind culled buffer and setup attributes
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.culled);
+    // Bind the main VAO (vertex data) and the index buffer for indexed drawing
+    gl.bindVertexArray(this.vao);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
 
-    const STRIDE = 28;
-    gl.enableVertexAttribArray(0);
-    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, STRIDE, 0);
-    gl.enableVertexAttribArray(1);
-    gl.vertexAttribPointer(1, 3, gl.FLOAT, false, STRIDE, 12);
-    gl.enableVertexAttribArray(2);
-    gl.vertexAttribPointer(2, 1, gl.FLOAT, false, STRIDE, 24);
+    // Draw using indexed rendering - much faster than copying vertex data
+    gl.drawElements(gl.POINTS, this._cachedCulledCount, gl.UNSIGNED_INT, 0);
 
-    gl.drawArrays(gl.POINTS, 0, this._cachedCulledCount);
+    gl.bindVertexArray(null);
 
     this.stats.visiblePoints = this._cachedCulledCount;
     this.stats.lodLevel = -1;
@@ -1201,15 +1407,18 @@ export class HighPerfRenderer {
       return true;
     }
 
-    let maxDiff = 0;
+    // Use sum of squared differences for more stable detection
+    let sumSqDiff = 0;
     for (let i = 0; i < 16; i++) {
-      const diff = Math.abs(mvpMatrix[i] - this._lastFrustumMVP[i]);
-      if (diff > maxDiff) maxDiff = diff;
+      const diff = mvpMatrix[i] - this._lastFrustumMVP[i];
+      sumSqDiff += diff * diff;
     }
 
-    const threshold = 0.001;
+    // Higher threshold to avoid rebuilding on tiny movements
+    // sqrt(0.01) ≈ 0.1 total change across the matrix
+    const threshold = 0.01;
 
-    if (maxDiff > threshold) {
+    if (sumSqDiff > threshold) {
       for (let i = 0; i < 16; i++) {
         this._lastFrustumMVP[i] = mvpMatrix[i];
       }
@@ -1283,38 +1492,15 @@ export class HighPerfRenderer {
     return allInside ? 'inside' : 'partial';
   }
 
-  _updateCulledBuffer(visibleIndices) {
+  _updateCulledIndexBuffer(visibleIndices) {
     const gl = this.gl;
 
-    if (!this.buffers.culled) {
-      this.buffers.culled = gl.createBuffer();
-    }
+    // visibleIndices is already a Uint32Array - upload directly to GPU
+    // This avoids any CPU-side copying, making frustum culling much faster
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, visibleIndices, gl.DYNAMIC_DRAW);
 
-    const pointCount = visibleIndices.length;
-    const data = new Float32Array(pointCount * 7);
-
-    const positions = this._positions;
-    const colors = this._colors;
-    const alphas = this._alphas;
-
-    for (let i = 0; i < pointCount; i++) {
-      const srcIdx = visibleIndices[i];
-      const srcPosIdx = srcIdx * 3;
-      const dstIdx = i * 7;
-
-      data[dstIdx] = positions[srcPosIdx];
-      data[dstIdx + 1] = positions[srcPosIdx + 1];
-      data[dstIdx + 2] = positions[srcPosIdx + 2];
-      data[dstIdx + 3] = colors[srcPosIdx];
-      data[dstIdx + 4] = colors[srcPosIdx + 1];
-      data[dstIdx + 5] = colors[srcPosIdx + 2];
-      data[dstIdx + 6] = alphas[srcIdx];
-    }
-
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.culled);
-    gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
-
-    this._culledPointCount = pointCount;
+    this._culledPointCount = visibleIndices.length;
   }
 
   _renderFullDetail(params) {
@@ -1474,21 +1660,54 @@ export class HighPerfRenderer {
 
   setAdaptiveLOD(enabled) {
     this.useAdaptiveLOD = enabled;
+    console.log(`[HighPerfRenderer] Adaptive LOD ${enabled ? 'enabled' : 'disabled'}`);
+
+    if (enabled && this.pointCount > 0 && this._positions) {
+      // Build octree if needed
+      if (!this.octree) {
+        console.log('[HighPerfRenderer] Building octree for LOD...');
+        this.octree = new Octree(
+          this._positions,
+          this._colors,
+          this.options.LOD_MAX_POINTS_PER_NODE
+        );
+        console.log(`[HighPerfRenderer] Octree built with ${this.octree.lodLevels.length} LOD levels`);
+      }
+
+      // Create LOD buffers if needed
+      if (this.lodBuffers.length === 0) {
+        console.log('[HighPerfRenderer] Creating LOD buffers...');
+        this._createLODBuffers();
+        console.log(`[HighPerfRenderer] Created ${this.lodBuffers.length} LOD buffer levels`);
+      }
+    }
+  }
+
+  setForceLOD(level) {
+    this.forceLODLevel = level;
+    if (level >= 0) {
+      console.log(`[HighPerfRenderer] Force LOD level: ${level}`);
+    } else {
+      console.log('[HighPerfRenderer] LOD mode: Auto');
+    }
   }
 
   setFrustumCulling(enabled) {
     this.useFrustumCulling = enabled;
     console.log(`[HighPerfRenderer] Frustum culling ${enabled ? 'enabled' : 'disabled'}`);
 
+    // Reset frustum culling state
     this._lastFrustumMVP = null;
     this._cachedCulledCount = 0;
+    this._lastVisibleCount = undefined;
+    this.stats.frustumCulled = false;
+    this.stats.cullPercent = 0;
 
     if (enabled && !this.octree && this.pointCount > 0 && this._positions) {
       console.log('[HighPerfRenderer] Building octree for frustum culling...');
       this.octree = new Octree(
         this._positions,
         this._colors,
-        this._alphas,
         this.options.LOD_MAX_POINTS_PER_NODE
       );
       console.log(`[HighPerfRenderer] Octree built with ${this.octree.lodLevels.length} LOD levels`);
@@ -1515,6 +1734,7 @@ export class HighPerfRenderer {
     }
 
     if (this.vao) gl.deleteVertexArray(this.vao);
+    if (this.indexBuffer) gl.deleteBuffer(this.indexBuffer);
     for (const vao of this.lodVaos) {
       gl.deleteVertexArray(vao);
     }
@@ -1528,6 +1748,12 @@ export class HighPerfRenderer {
     this.lodVaos = [];
     this.programs = {};
     this.octree = null;
+
+    // Clear cached ArrayBuffers
+    this._interleavedArrayBuffer = null;
+    this._interleavedPositionView = null;
+    this._interleavedColorView = null;
+    this._lodArrayBuffers = null;
   }
 }
 

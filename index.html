@@ -230,15 +230,23 @@
 
             <div class="control-block" style="margin-top:6px;">
               <label class="checkbox-inline">
-                <input type="checkbox" id="hp-lod-enabled" checked />
-                Level-of-Detail (Octree LOD)
+                <input type="checkbox" id="hp-lod-enabled" />
+                Level-of-Detail (LOD)
               </label>
+            </div>
+
+            <div class="control-block" id="lod-force-container" style="margin-top:4px; margin-left:18px; display:none;">
+              <label for="hp-lod-force">Force LOD level:</label>
+              <div class="slider-row">
+                <input id="hp-lod-force" type="range" min="-1" max="16" step="1" value="-1" />
+                <span id="hp-lod-force-label" class="slider-value">Auto</span>
+              </div>
             </div>
 
             <div class="control-block" style="margin-top:6px;">
               <label class="checkbox-inline">
                 <input type="checkbox" id="hp-frustum-culling" />
-                Frustum culling (experimental)
+                Frustum culling
               </label>
             </div>
           </div>
@@ -628,6 +636,8 @@
             <label for="benchmark-pattern">Data pattern:</label>
             <select id="benchmark-pattern" class="obs-select">
               <option value="glb" selected>3D Model Surface</option>
+              <option value="atlas">Atlas-like (multiscale clusters)</option>
+              <option value="batches">Batch Effects (misaligned)</option>
               <option value="clusters">Gaussian Clusters (100-200)</option>
               <option value="uniform">Uniform Random</option>
               <option value="octopus">Octopus (3D Tentacles)</option>
@@ -686,6 +696,16 @@
             </div>
           </div>
 
+          <div class="control-block" style="margin-top:10px;">
+            <button id="benchmark-report-btn" class="btn-small" style="width:100%;padding:8px;color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600;">
+              Copy situation report
+            </button>
+            <div id="benchmark-report-status" class="legend-help" style="margin-top:6px;">
+              Collects OS/Browser, renderer, and data details for support tickets.
+            </div>
+            <textarea id="benchmark-report-output" readonly style="display:none;"></textarea>
+          </div>
+
           <div class="legend-help" style="margin-top:8px;">
             <strong>Tips:</strong> Adjust renderer settings in Visualization section.
             Reload page to restore original data.
@@ -695,7 +715,6 @@
     </div>
 
     <div id="stats" class="sr-only">Loading data…</div>
-    <div id="hint" class="sr-only">🖱️ Drag to rotate • Scroll to zoom</div>
 
     <div id="copyright">
       © Kemal Inecik · <a href="https://kemalinecik.com" target="_blank" rel="noopener noreferrer">kemalinecik.com</a>
@@ -709,6 +728,6 @@
 
   <!-- glMatrix for matrix math -->
   <script src="https://cdn.jsdelivr.net/npm/gl-matrix@3.4.3/gl-matrix-min.js"></script>
-  <script type="module" src="assets/js/main.js"></script>
+  <script type="module" src="assets/js/app/main.js"></script>
 </body>
 </html>

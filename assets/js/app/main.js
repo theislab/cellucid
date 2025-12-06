@@ -1,5 +1,5 @@
 // App entrypoint: loads data, initializes the viewer/state, and wires the UI.
-import { createViewer } from './viewer.js';
+import { createViewer } from '../rendering/viewer.js';
 import { createDataState } from './state.js';
 import { initUI } from './ui.js';
 import {
@@ -12,8 +12,8 @@ import {
   loadConnectivityManifest,
   loadConnectivityIndptr,
   loadConnectivityIndices
-} from './data-loaders.js';
-import { SyntheticDataGenerator, PerformanceTracker, formatNumber } from './benchmark.js';
+} from '../data/data-loaders.js';
+import { SyntheticDataGenerator, PerformanceTracker, BenchmarkReporter, formatNumber } from '../dev/benchmark.js';
 
 console.log('=== SCATTERPLOT APP STARTING ===');
 
@@ -51,7 +51,6 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
   const fogDensityDisplay = document.getElementById('fog-density-display');
   const sizeAttenuationInput = document.getElementById('size-attenuation');
   const sizeAttenuationDisplay = document.getElementById('size-attenuation-display');
-  const hintEl = document.getElementById('hint');
   const resetCameraBtn = document.getElementById('reset-camera-btn');
   const navigationModeSelect = document.getElementById('navigation-mode');
   const lookSensitivityInput = document.getElementById('look-sensitivity');
@@ -126,6 +125,7 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
     
     const state = createDataState({ viewer, labelLayer });
     console.log('[Main] State created successfully');
+    const benchmarkReporter = new BenchmarkReporter({ viewer, state, canvas });
     
     statsEl.textContent = 'Loading positions…';
 
@@ -230,7 +230,6 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
         fogDensityDisplay,
         sizeAttenuationInput,
         sizeAttenuationDisplay,
-        hintEl,
         resetCameraBtn,
         navigationModeSelect,
         lookSensitivityInput,
@@ -530,10 +529,10 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
       if (connectivityColorInput) {
         connectivityColorInput.addEventListener('input', () => {
           const hex = connectivityColorInput.value;
-          // Parse hex to RGB (0-1 range)
-          const r = parseInt(hex.slice(1, 3), 16) / 255;
-          const g = parseInt(hex.slice(3, 5), 16) / 255;
-          const b = parseInt(hex.slice(5, 7), 16) / 255;
+          // Parse hex to RGB bytes (0-255)
+          const r = parseInt(hex.slice(1, 3), 16);
+          const g = parseInt(hex.slice(3, 5), 16);
+          const b = parseInt(hex.slice(5, 7), 16);
           viewer.setConnectivityColor(r, g, b);
         });
       }
@@ -581,15 +580,56 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
     const benchmarkPatternSelect = document.getElementById('benchmark-pattern');
     const benchmarkStatsEl = document.getElementById('benchmark-stats');
     const benchPresets = document.querySelectorAll('.benchmark-preset');
+    const benchmarkReportBtn = document.getElementById('benchmark-report-btn');
+    const benchmarkReportOutput = document.getElementById('benchmark-report-output');
+    const benchmarkReportStatus = document.getElementById('benchmark-report-status');
 
     // HP renderer controls (always-on HP renderer)
     const hpShaderQuality = document.getElementById('hp-shader-quality');
     const hpFrustumCulling = document.getElementById('hp-frustum-culling');
     const hpLodEnabled = document.getElementById('hp-lod-enabled');
+    const hpLodForceContainer = document.getElementById('lod-force-container');
+    const hpLodForce = document.getElementById('hp-lod-force');
+    const hpLodForceLabel = document.getElementById('hp-lod-force-label');
 
     // Performance tracker for FPS monitoring
     const perfTracker = new PerformanceTracker();
     let benchmarkActive = false;
+    let activeDatasetMode = 'real';
+    let syntheticDatasetInfo = null;
+    let latestPerfSample = null;
+    let latestRendererStats = null;
+
+    const rendererConfigSnapshot = () => ({
+      shaderQuality: hpShaderQuality?.value || 'full',
+      lodEnabled: hpLodEnabled ? hpLodEnabled.checked : true,
+      frustumCulling: hpFrustumCulling ? hpFrustumCulling.checked : false,
+      renderMode: renderModeSelect ? renderModeSelect.value : null
+    });
+
+    const buildDatasetSnapshot = () => {
+      if (activeDatasetMode === 'synthetic' && syntheticDatasetInfo) {
+        return {
+          mode: 'synthetic',
+          ...syntheticDatasetInfo,
+          visiblePoints: syntheticDatasetInfo.visiblePoints ?? syntheticDatasetInfo.pointCount,
+          filters: [],
+          activeFieldKey: null,
+          activeFieldKind: null
+        };
+      }
+      const filtered = state.getFilteredCount ? state.getFilteredCount() : null;
+      const activeField = state.getActiveField ? state.getActiveField() : null;
+      const filters = state.getActiveFiltersStructured ? state.getActiveFiltersStructured() : [];
+      return {
+        mode: 'real',
+        pointCount: state.pointCount || 0,
+        visiblePoints: filtered?.shown ?? state.pointCount,
+        activeFieldKey: activeField?.key || null,
+        activeFieldKind: activeField?.kind || null,
+        filters
+      };
+    };
 
     // Shader quality change
     if (hpShaderQuality) {
@@ -609,6 +649,27 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
     if (hpLodEnabled) {
       hpLodEnabled.addEventListener('change', () => {
         viewer.setAdaptiveLOD(hpLodEnabled.checked);
+        // Show/hide force LOD slider
+        if (hpLodForceContainer) {
+          hpLodForceContainer.style.display = hpLodEnabled.checked ? 'block' : 'none';
+        }
+        // Reset force LOD to auto when enabling
+        if (hpLodEnabled.checked && hpLodForce) {
+          hpLodForce.value = '-1';
+          if (hpLodForceLabel) hpLodForceLabel.textContent = 'Auto';
+          viewer.setForceLOD(-1);
+        }
+      });
+    }
+
+    // Force LOD slider
+    if (hpLodForce) {
+      hpLodForce.addEventListener('input', () => {
+        const val = parseInt(hpLodForce.value, 10);
+        if (hpLodForceLabel) {
+          hpLodForceLabel.textContent = val < 0 ? 'Auto' : String(val);
+        }
+        viewer.setForceLOD(val);
       });
     }
 
@@ -646,6 +707,12 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
         switch (pattern) {
           case 'uniform':
             data = SyntheticDataGenerator.uniformRandom(pointCount);
+            break;
+          case 'atlas':
+            data = SyntheticDataGenerator.atlasLike(pointCount);
+            break;
+          case 'batches':
+            data = SyntheticDataGenerator.batchEffects(pointCount);
             break;
           case 'octopus':
             data = SyntheticDataGenerator.octopus(pointCount);
@@ -693,7 +760,7 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
       // Clear centroids
       viewer.setCentroids({
         positions: new Float32Array(0),
-        colors: new Float32Array(0),
+        colors: new Uint8Array(0), // RGBA uint8
         outlierQuantiles: new Float32Array(0),
         transparency: new Float32Array(0)
       });
@@ -702,6 +769,14 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
       const gpuMemMB = (pointCount * 28 / 1024 / 1024).toFixed(1);
       if (pointsEl) pointsEl.textContent = formatNumber(pointCount);
       if (memoryEl) memoryEl.textContent = gpuMemMB + ' MB';
+
+      activeDatasetMode = 'synthetic';
+      syntheticDatasetInfo = {
+        pointCount,
+        pattern,
+        generationMs: genTime,
+        visiblePoints: pointCount
+      };
 
       // Start performance tracking
       benchmarkActive = true;
@@ -713,6 +788,8 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
 
         const stats = perfTracker.recordFrame();
         const hpStats = viewer.getRendererStats();
+        if (stats) latestPerfSample = stats;
+        if (hpStats) latestRendererStats = hpStats;
 
         if (stats && stats.samples > 5) {
           const displayFps = hpStats?.fps || stats.fps;
@@ -751,12 +828,59 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
       console.log(`Benchmark loaded: ${formatNumber(pointCount)} points, ~${gpuMemMB}MB GPU memory (gen: ${genTime}ms)`);
     }
 
+    async function generateSituationReport() {
+      if (!benchmarkReporter) return;
+      const datasetSnapshot = buildDatasetSnapshot();
+      const rendererStats = viewer.getRendererStats();
+      if (rendererStats) latestRendererStats = rendererStats;
+      const report = benchmarkReporter.buildReport({
+        dataset: datasetSnapshot,
+        rendererConfig: rendererConfigSnapshot(),
+        rendererStats: latestRendererStats,
+        perfStats: latestPerfSample,
+        filteredCount: datasetSnapshot.mode === 'real' && state.getFilteredCount ? state.getFilteredCount() : null,
+        filters: datasetSnapshot.mode === 'real' ? datasetSnapshot.filters : [],
+        activeField: datasetSnapshot.mode === 'real' && state.getActiveField ? state.getActiveField() : null
+      });
+
+      if (benchmarkReportOutput) {
+        benchmarkReportOutput.value = report.text;
+        benchmarkReportOutput.style.display = 'block';
+      }
+      if (benchmarkReportStatus) {
+        benchmarkReportStatus.textContent = `Report ready (${datasetSnapshot.mode} data)`;
+      }
+
+      if (navigator?.clipboard?.writeText) {
+        try {
+          await navigator.clipboard.writeText(report.text);
+          if (benchmarkReportStatus) {
+            benchmarkReportStatus.textContent = 'Report copied to clipboard';
+          }
+        } catch (err) {
+          console.warn('Clipboard copy failed', err);
+          if (benchmarkReportStatus) {
+            benchmarkReportStatus.textContent = 'Copy failed — select the text manually.';
+          }
+        }
+      }
+    }
+
     // Wire up run button
     if (benchmarkRunBtn) {
       benchmarkRunBtn.addEventListener('click', () => {
         const count = parseInt(benchmarkCountInput?.value || '1000000', 10);
         const pattern = benchmarkPatternSelect?.value || 'clusters';
         runBenchmark(count, pattern);
+      });
+    }
+
+    if (benchmarkReportBtn) {
+      benchmarkReportBtn.addEventListener('click', () => {
+        if (benchmarkReportStatus) {
+          benchmarkReportStatus.textContent = 'Generating report...';
+        }
+        generateSituationReport();
       });
     }
 

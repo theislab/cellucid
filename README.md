@@ -9,7 +9,11 @@ Purely static WebGL viewer for 3D UMAP embeddings with interactive coloring, fil
 ## What’s in this repo (theislab/cellucid)
 - `index.html`: single-page entry that wires the UI to the WebGL canvas.
 - `assets/css/`: layout and component styles.
-- `assets/js/`: rendering engine, UI wiring, and data loaders (see `main.js` for entrypoint).
+- `assets/js/`: modular JavaScript (no build step):
+  - `app/`: entrypoint (`main.js`), UI bindings, and state manager.
+  - `rendering/`: WebGL renderer, shaders, density + noise utilities.
+  - `data/`: fetch helpers and color palettes.
+  - `dev/`: benchmarking + synthetic data helpers.
 - `assets/img/`: icons and logos.
 - `assets/exports/`: drop your precomputed data assets here before serving.
 

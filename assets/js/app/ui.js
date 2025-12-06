@@ -25,7 +25,6 @@ export function initUI({ state, viewer, dom, smoke }) {
     outlierFilterDisplay,
     filterCountEl,
     activeFiltersEl,
-    hintEl,
     resetCameraBtn,
     navigationModeSelect,
     lookSensitivityInput,
@@ -209,7 +208,7 @@ export function initUI({ state, viewer, dom, smoke }) {
   }
 
   // Log-scale point size mapping
-  const MIN_POINT_SIZE = 1;
+  const MIN_POINT_SIZE = 0.25;
   const MAX_POINT_SIZE = 200.0;
   const DEFAULT_POINT_SIZE = 1.0;
   const POINT_SIZE_SCALE = MAX_POINT_SIZE / MIN_POINT_SIZE;
@@ -245,6 +244,7 @@ export function initUI({ state, viewer, dom, smoke }) {
   }
 
   function formatPointSize(size) {
+    if (size < 0.1) return size.toFixed(3);
     return size < 10 ? size.toFixed(2) : size.toFixed(1);
   }
 
@@ -284,18 +284,6 @@ export function initUI({ state, viewer, dom, smoke }) {
     if (viewer.setMoveSpeed) {
       viewer.setMoveSpeed(speed);
     }
-  }
-
-  function updateNavigationHint(mode = navigationModeSelect?.value || 'orbit') {
-    if (!hintEl) return;
-    if (mode === 'free') {
-      hintEl.textContent =
-        'Free-fly: click+drag to look (or capture pointer, Esc/Q to release) • WASD move • Space/E up • Ctrl/Q down • Shift sprint • R resets';
-    } else {
-      hintEl.textContent =
-        '🖱️ Drag to rotate • Scroll to zoom • Shift+drag to pan • Press R to reset';
-    }
-    hintEl.style.display = 'block';
   }
 
   function toggleNavigationPanels(mode) {
@@ -1436,12 +1424,6 @@ export function initUI({ state, viewer, dom, smoke }) {
       renderSplitViewBadges();
       updateSplitViewUI();
       pushViewLayoutToViewer();
-
-      if (hintEl) {
-        hintEl.textContent =
-          'Camera is shared across panes – drag in any panel to compare.';
-        hintEl.style.display = 'block';
-      }
     } catch (err) {
       console.error('Failed to keep view:', err);
     }
@@ -1603,7 +1585,6 @@ export function initUI({ state, viewer, dom, smoke }) {
         viewer.setPointerLockEnabled(false);
       }
       toggleNavigationPanels(mode);
-      updateNavigationHint(mode);
       // Blur the select so WASD keys work immediately in free-fly mode
       if (mode === 'free') {
         navigationModeSelect.blur();
@@ -1640,10 +1621,6 @@ export function initUI({ state, viewer, dom, smoke }) {
     const mode = navigationModeSelect?.value === 'free' ? 'free' : 'orbit';
     if (mode !== 'free') {
       pointerLockCheckbox.checked = false;
-      if (hintEl) {
-        hintEl.textContent = 'Pointer capture is only available in Free-fly mode.';
-        hintEl.style.display = 'block';
-      }
       return;
     }
     viewer.setPointerLockEnabled(Boolean(checked));
@@ -1703,11 +1680,6 @@ export function initUI({ state, viewer, dom, smoke }) {
       ) {
         // Don’t allow smoke while we have small multiples
         renderModeSelect.value = 'points';
-        if (hintEl) {
-          hintEl.textContent =
-            'Clear kept views to enable volumetric smoke rendering.';
-          hintEl.style.display = 'block';
-        }
         return;
       }
       applyRenderMode(requested);
@@ -2052,7 +2024,6 @@ export function initUI({ state, viewer, dom, smoke }) {
         viewer.setNavigationMode(mode);
       }
       toggleNavigationPanels(mode);
-      updateNavigationHint(mode);
     }
 
     if (lookSensitivityInput) {
@@ -2182,6 +2153,9 @@ export function initUI({ state, viewer, dom, smoke }) {
   // Initial setup
   viewer.setBackground(backgroundSelect.value);
 
+  if (pointSizeInput && pointSizeInput.value === '0') {
+    pointSizeInput.value = String(pointSizeToSlider(DEFAULT_POINT_SIZE));
+  }
   const initialSliderValue = pointSizeInput.value !== ''
     ? parseFloat(pointSizeInput.value)
     : pointSizeToSlider(DEFAULT_POINT_SIZE);
@@ -2240,7 +2214,6 @@ export function initUI({ state, viewer, dom, smoke }) {
   initGeneExpressionDropdown();
   const startingNavMode = navigationModeSelect?.value || 'orbit';
   toggleNavigationPanels(startingNavMode);
-  updateNavigationHint(startingNavMode);
 
   // Wire state visibility callback so the smoke button lights up when filters change
   const handleVisibilityChange = () => {

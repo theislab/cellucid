@@ -12,7 +12,7 @@
  * - GPU-only fog
  */
 
-import { HighPerfRenderer, RendererConfig, Octree } from './high-perf-renderer.js';
+import { HighPerfRenderer, RendererConfig, Octree } from '../rendering/high-perf-renderer.js';
 
 /**
  * Benchmark configuration for high-performance renderer tests
@@ -80,15 +80,16 @@ export class HighPerfBenchmark {
   /**
    * Load data into the high-performance renderer
    */
-  loadData(positions, colors, alphas) {
+  loadData(positions, colors) {
     if (!this.renderer) {
       this.init();
     }
-    
-    const stats = this.renderer.loadData(positions, colors, alphas, {
+
+    // Alpha is packed in colors as RGBA uint8 - no separate array needed
+    const stats = this.renderer.loadData(positions, colors, {
       buildOctree: this.config.useLOD
     });
-    
+
     console.log('[HighPerfBenchmark] Data loaded:', stats);
     return stats;
   }
@@ -519,7 +520,7 @@ export class SyntheticDataGenerator {
     const startTime = performance.now();
 
     const positions = new Float32Array(count * 3);
-    const colors = new Float32Array(count * 3);
+    const colors = new Uint8Array(count * 4); // RGBA packed as uint8
 
     // Body parameters
     const bodyRadius = 0.3;
@@ -558,10 +559,12 @@ export class SyntheticDataGenerator {
         positions[idx + 1] = bodyCenter[1] + radius * Math.cos(phi) * 0.8;
         positions[idx + 2] = bodyCenter[2] + radius * Math.sin(phi) * Math.sin(theta) * 1.2;
 
-        // Body color with variation
-        colors[idx] = bodyColor[0] + (Math.random() - 0.5) * 0.1;
-        colors[idx + 1] = bodyColor[1] + (Math.random() - 0.5) * 0.1;
-        colors[idx + 2] = bodyColor[2] + (Math.random() - 0.5) * 0.1;
+        // Body color with variation (convert to uint8)
+        const cidx = i * 4;
+        colors[cidx] = Math.round(Math.max(0, Math.min(1, bodyColor[0] + (Math.random() - 0.5) * 0.1)) * 255);
+        colors[cidx + 1] = Math.round(Math.max(0, Math.min(1, bodyColor[1] + (Math.random() - 0.5) * 0.1)) * 255);
+        colors[cidx + 2] = Math.round(Math.max(0, Math.min(1, bodyColor[2] + (Math.random() - 0.5) * 0.1)) * 255);
+        colors[cidx + 3] = 255; // full alpha
       } else {
         // Tentacle point
         const tentacleIdx = Math.floor((r - bodyFreq) / tentacleFreq);
@@ -592,11 +595,13 @@ export class SyntheticDataGenerator {
         positions[idx + 1] = tentY + thickR * Math.sin(thickAngle) * 0.5;
         positions[idx + 2] = tentZ + thickR * Math.sin(thickAngle);
 
-        // Tentacle color - gradient from body color to darker at tips
+        // Tentacle color - gradient from body color to darker at tips (convert to uint8)
         const tentColor = this._hslToRgb(tent.hue, 0.7, 0.5 - t * 0.2);
-        colors[idx] = Math.max(0, Math.min(1, tentColor[0] + (Math.random() - 0.5) * 0.08));
-        colors[idx + 1] = Math.max(0, Math.min(1, tentColor[1] + (Math.random() - 0.5) * 0.08));
-        colors[idx + 2] = Math.max(0, Math.min(1, tentColor[2] + (Math.random() - 0.5) * 0.08));
+        const cidx = i * 4;
+        colors[cidx] = Math.round(Math.max(0, Math.min(1, tentColor[0] + (Math.random() - 0.5) * 0.08)) * 255);
+        colors[cidx + 1] = Math.round(Math.max(0, Math.min(1, tentColor[1] + (Math.random() - 0.5) * 0.08)) * 255);
+        colors[cidx + 2] = Math.round(Math.max(0, Math.min(1, tentColor[2] + (Math.random() - 0.5) * 0.08)) * 255);
+        colors[cidx + 3] = 255; // full alpha
       }
     }
 
@@ -613,7 +618,7 @@ export class SyntheticDataGenerator {
     const startTime = performance.now();
 
     const positions = new Float32Array(count * 3);
-    const colors = new Float32Array(count * 3);
+    const colors = new Uint8Array(count * 4); // RGBA packed as uint8
 
     // Generate spiral configurations
     const spiralConfigs = [];
@@ -675,11 +680,13 @@ export class SyntheticDataGenerator {
       positions[idx + 1] = spiralY + this._gaussianRandom() * thick;
       positions[idx + 2] = spiralZ + this._gaussianRandom() * thick;
 
-      // Color gradient along spiral
+      // Color gradient along spiral (convert to uint8)
       const color = this._hslToRgb(sp.hue + t * 0.1, 0.75, 0.45 + t * 0.15);
-      colors[idx] = Math.max(0, Math.min(1, color[0] + (Math.random() - 0.5) * 0.08));
-      colors[idx + 1] = Math.max(0, Math.min(1, color[1] + (Math.random() - 0.5) * 0.08));
-      colors[idx + 2] = Math.max(0, Math.min(1, color[2] + (Math.random() - 0.5) * 0.08));
+      const cidx = i * 4;
+      colors[cidx] = Math.round(Math.max(0, Math.min(1, color[0] + (Math.random() - 0.5) * 0.08)) * 255);
+      colors[cidx + 1] = Math.round(Math.max(0, Math.min(1, color[1] + (Math.random() - 0.5) * 0.08)) * 255);
+      colors[cidx + 2] = Math.round(Math.max(0, Math.min(1, color[2] + (Math.random() - 0.5) * 0.08)) * 255);
+      colors[cidx + 3] = 255; // full alpha
     }
 
     const elapsed = performance.now() - startTime;
@@ -695,7 +702,7 @@ export class SyntheticDataGenerator {
     const startTime = performance.now();
 
     const positions = new Float32Array(count * 3);
-    const colors = new Float32Array(count * 3);
+    const colors = new Uint8Array(count * 4); // RGBA packed as uint8
 
     // Z-axis scale (nearly flat)
     const zScale = 0.02;
@@ -790,17 +797,247 @@ export class SyntheticDataGenerator {
 
       positions[idx] = x;
       positions[idx + 1] = y;
-      positions[idx + 2] = this._gaussianRandom() * zScale;
+      positions[idx + 2] = 0; // Keep perfectly flat for true 2D
 
-      // Color
-      colors[idx] = Math.max(0, Math.min(1, cluster.color[0] + (Math.random() - 0.5) * 0.06));
-      colors[idx + 1] = Math.max(0, Math.min(1, cluster.color[1] + (Math.random() - 0.5) * 0.06));
-      colors[idx + 2] = Math.max(0, Math.min(1, cluster.color[2] + (Math.random() - 0.5) * 0.06));
+      // Color (convert to uint8)
+      const cidx = i * 4;
+      colors[cidx] = Math.round(Math.max(0, Math.min(1, cluster.color[0] + (Math.random() - 0.5) * 0.06)) * 255);
+      colors[cidx + 1] = Math.round(Math.max(0, Math.min(1, cluster.color[1] + (Math.random() - 0.5) * 0.06)) * 255);
+      colors[cidx + 2] = Math.round(Math.max(0, Math.min(1, cluster.color[2] + (Math.random() - 0.5) * 0.06)) * 255);
+      colors[cidx + 3] = 255; // full alpha
     }
 
     const elapsed = performance.now() - startTime;
     console.log(`Generated in ${elapsed.toFixed(0)}ms`);
     return { positions, colors };
+  }
+
+  /**
+   * Generate atlas-like data with multiscale clusters, bridges, and batches.
+   * Designed to look closer to real embeddings while stressing LOD/culling.
+   */
+  static atlasLike(count, options = {}) {
+    const {
+      batches = 3,
+      cellTypes = Math.max(16, Math.floor(count / 3500)),
+      trajectoryFraction = 0.22,
+      rareFraction = 0.05,
+      layerDepth = 0.35,
+      strongBatchEffects = false,
+      label = 'Atlas-like (multiscale clusters)'
+    } = options;
+
+    console.log(`Generating ${count.toLocaleString()} points (${label})...`);
+    const startTime = performance.now();
+
+    const positions = new Float32Array(count * 3);
+    const colors = new Uint8Array(count * 4); // RGBA packed as uint8
+
+    const clamp01 = (v) => Math.max(0, Math.min(1, v));
+    const safeCellTypes = Math.max(12, Math.min(45, Math.floor(cellTypes)));
+    const trajFrac = clamp01(Math.min(0.35, trajectoryFraction));
+    const rareFrac = clamp01(Math.min(0.12, rareFraction));
+    const anchorFrac = clamp01(1 - trajFrac - rareFrac);
+    const goldenAngle = 2.399963229728653; // Poisson-disc-ish polar layout
+
+    // Batch offsets to simulate lab/batch shifts
+    const batchOffsets = Array.from({ length: Math.max(1, Math.floor(batches)) }, () => ({
+      offset: [
+        (Math.random() - 0.5) * (strongBatchEffects ? 0.45 : 0.18),
+        (Math.random() - 0.5) * (strongBatchEffects ? 0.35 : 0.14),
+        (Math.random() - 0.5) * (strongBatchEffects ? 0.55 : 0.22)
+      ],
+      tint: (Math.random() - 0.5) * (strongBatchEffects ? 0.18 : 0.08)
+    }));
+
+    // Build anchor clusters arranged on a loose ring
+    const anchors = [];
+    for (let i = 0; i < safeCellTypes; i++) {
+      const angle = i * goldenAngle + (Math.random() - 0.5) * 0.1;
+      const radius = 0.25 + Math.random() * 1.15;
+      const layer = ((i % 3) - 1) * layerDepth * 0.5;
+      const center = [
+        Math.cos(angle) * radius + (Math.random() - 0.5) * 0.1,
+        Math.sin(angle) * radius + (Math.random() - 0.5) * 0.1,
+        layer
+      ];
+      const major = 0.025 + Math.random() * 0.05;
+      const minor = major * (0.55 + Math.random() * 0.9);
+      const theta = Math.random() * Math.PI;
+      const color = this._hslToRgb(i / safeCellTypes, 0.68, 0.52);
+      const weight = 0.6 + Math.random() * 1.6;
+
+      anchors.push({
+        center,
+        spread: [major, minor],
+        angle: theta,
+        color,
+        weight,
+        layerOffset: layer + (Math.random() - 0.5) * 0.08,
+        sin: Math.sin(theta),
+        cos: Math.cos(theta)
+      });
+    }
+
+    const anchorWeightTotal = anchors.reduce((s, a) => s + a.weight, 0);
+    let anchorCum = 0;
+    const anchorCumDist = anchors.map((a) => {
+      anchorCum += a.weight / anchorWeightTotal;
+      return anchorCum;
+    });
+
+    // Trajectories between anchors (branchy manifolds)
+    const trajectoryCount = Math.max(5, Math.floor(safeCellTypes * 0.45));
+    const trajectories = [];
+    for (let t = 0; t < trajectoryCount; t++) {
+      const a = anchors[Math.floor(Math.random() * anchors.length)];
+      let b = anchors[Math.floor(Math.random() * anchors.length)];
+      if (a === b) b = anchors[(anchors.indexOf(a) + 1) % anchors.length];
+
+      const midX = (a.center[0] + b.center[0]) / 2 + (Math.random() - 0.5) * 0.25;
+      const midY = (a.center[1] + b.center[1]) / 2 + (Math.random() - 0.5) * 0.25;
+      const arch = (Math.random() - 0.5) * 0.25;
+
+      const spread = 0.015 + Math.random() * 0.03;
+      const weight = 0.4 + Math.random() * 1.1;
+
+      trajectories.push({
+        from: a,
+        to: b,
+        control: [midX, midY, (a.layerOffset + b.layerOffset) / 2 + arch],
+        spread,
+        weight
+      });
+    }
+
+    const trajWeightTotal = trajectories.reduce((s, tr) => s + tr.weight, 0);
+    let trajCum = 0;
+    const trajCumDist = trajectories.map((tr) => {
+      trajCum += tr.weight / trajWeightTotal;
+      return trajCum;
+    });
+
+    const pickAnchor = () => {
+      const r = Math.random();
+      let idx = anchorCumDist.findIndex((c) => r <= c);
+      if (idx < 0) idx = anchors.length - 1;
+      return anchors[idx];
+    };
+
+    const pickTrajectory = () => {
+      const r = Math.random();
+      let idx = trajCumDist.findIndex((c) => r <= c);
+      if (idx < 0) idx = trajectories.length - 1;
+      return trajectories[idx];
+    };
+
+    const anchorPoints = Math.floor(count * anchorFrac);
+    const trajectoryPoints = Math.floor(count * trajFrac);
+    const rarePoints = count - anchorPoints - trajectoryPoints;
+
+    // Anchor clusters
+    for (let i = 0; i < anchorPoints; i++) {
+      const idx = i * 3;
+      const batch = batchOffsets[Math.floor(Math.random() * batchOffsets.length)];
+      const anchor = pickAnchor();
+
+      const dx = this._gaussianRandom() * anchor.spread[0];
+      const dy = this._gaussianRandom() * anchor.spread[1];
+
+      positions[idx] = anchor.center[0] + dx * anchor.cos - dy * anchor.sin + batch.offset[0];
+      positions[idx + 1] = anchor.center[1] + dx * anchor.sin + dy * anchor.cos + batch.offset[1];
+      positions[idx + 2] = anchor.layerOffset + this._gaussianRandom() * 0.03 + batch.offset[2];
+
+      const baseColor = anchor.color;
+      const shade = (Math.random() - 0.5) * 0.08 + batch.tint;
+      const cidx = i * 4;
+      colors[cidx] = Math.round(clamp01(baseColor[0] + shade) * 255);
+      colors[cidx + 1] = Math.round(clamp01(baseColor[1] + shade * 0.6) * 255);
+      colors[cidx + 2] = Math.round(clamp01(baseColor[2] - shade * 0.6) * 255);
+      colors[cidx + 3] = 255;
+    }
+
+    // Trajectory / bridge populations
+    for (let i = anchorPoints; i < anchorPoints + trajectoryPoints; i++) {
+      const idx = i * 3;
+      const batch = batchOffsets[Math.floor(Math.random() * batchOffsets.length)];
+      const traj = pickTrajectory();
+      const t = Math.random();
+      const eased = t * t * (3 - 2 * t); // smoothstep for nicer density
+      const inv = 1 - eased;
+
+      const px = inv * inv * traj.from.center[0] + 2 * inv * eased * traj.control[0] + eased * eased * traj.to.center[0];
+      const py = inv * inv * traj.from.center[1] + 2 * inv * eased * traj.control[1] + eased * eased * traj.to.center[1];
+      const pz = inv * inv * traj.from.layerOffset + 2 * inv * eased * traj.control[2] + eased * eased * traj.to.layerOffset;
+
+      positions[idx] = px + this._gaussianRandom() * traj.spread + batch.offset[0] * 0.6;
+      positions[idx + 1] = py + this._gaussianRandom() * traj.spread + batch.offset[1] * 0.6;
+      positions[idx + 2] = pz + this._gaussianRandom() * traj.spread * 0.6 + batch.offset[2] * 0.8;
+
+      const mixColor = [
+        traj.from.color[0] * (1 - eased) + traj.to.color[0] * eased,
+        traj.from.color[1] * (1 - eased) + traj.to.color[1] * eased,
+        traj.from.color[2] * (1 - eased) + traj.to.color[2] * eased
+      ];
+      const shade = (Math.random() - 0.5) * 0.06 + batch.tint * 0.6;
+      const cidx = i * 4;
+      colors[cidx] = Math.round(clamp01(mixColor[0] + shade) * 255);
+      colors[cidx + 1] = Math.round(clamp01(mixColor[1] + shade * 0.6) * 255);
+      colors[cidx + 2] = Math.round(clamp01(mixColor[2] - shade * 0.4) * 255);
+      colors[cidx + 3] = 255;
+    }
+
+    // Rare micro-clusters and outliers to stress LOD/culling
+    for (let i = anchorPoints + trajectoryPoints; i < count; i++) {
+      const idx = i * 3;
+      const batch = batchOffsets[Math.floor(Math.random() * batchOffsets.length)];
+
+      if (Math.random() < 0.7) {
+        const anchor = pickAnchor();
+        const radius = anchor.spread[0] * (0.2 + Math.random() * 0.4);
+        const theta = Math.random() * Math.PI * 2;
+        positions[idx] = anchor.center[0] + Math.cos(theta) * radius + batch.offset[0] * (strongBatchEffects ? 1 : 0.4);
+        positions[idx + 1] = anchor.center[1] + Math.sin(theta) * radius + batch.offset[1] * (strongBatchEffects ? 1 : 0.4);
+        positions[idx + 2] = anchor.layerOffset + this._gaussianRandom() * 0.02 + batch.offset[2];
+
+        const cidx = i * 4;
+        const shade = 0.1 + (Math.random() - 0.5) * 0.08 + batch.tint;
+        colors[cidx] = Math.round(clamp01(anchor.color[0] + shade) * 255);
+        colors[cidx + 1] = Math.round(clamp01(anchor.color[1] + shade * 0.5) * 255);
+        colors[cidx + 2] = Math.round(clamp01(anchor.color[2] - shade * 0.5) * 255);
+        colors[cidx + 3] = 255;
+      } else {
+        // Far outlier
+        positions[idx] = (Math.random() - 0.5) * 3 + batch.offset[0] * 0.5;
+        positions[idx + 1] = (Math.random() - 0.5) * 3 + batch.offset[1] * 0.5;
+        positions[idx + 2] = (Math.random() - 0.5) * (strongBatchEffects ? 2 : 1) + batch.offset[2] * 0.7;
+
+        const cidx = i * 4;
+        const base = this._hslToRgb(Math.random(), 0.2, 0.55);
+        colors[cidx] = Math.round(clamp01(base[0]) * 255);
+        colors[cidx + 1] = Math.round(clamp01(base[1]) * 255);
+        colors[cidx + 2] = Math.round(clamp01(base[2]) * 255);
+        colors[cidx + 3] = 200 + Math.floor(Math.random() * 55); // slight transparency variance
+      }
+    }
+
+    const elapsed = performance.now() - startTime;
+    console.log(`Generated in ${elapsed.toFixed(0)}ms`);
+    return { positions, colors };
+  }
+
+  /**
+   * Variant of atlasLike with intentionally strong batch shifts for stress tests.
+   */
+  static batchEffects(count, batches = 4) {
+    return this.atlasLike(count, {
+      batches,
+      strongBatchEffects: true,
+      trajectoryFraction: 0.18,
+      rareFraction: 0.06,
+      layerDepth: 0.65,
+      label: 'Batch effects (misaligned batches)'
+    });
   }
 
   /**
@@ -813,7 +1050,7 @@ export class SyntheticDataGenerator {
     const startTime = performance.now();
 
     const positions = new Float32Array(count * 3);
-    const colors = new Float32Array(count * 3);
+    const colors = new Uint8Array(count * 4); // RGBA packed as uint8
 
     // Generate cluster centers with varying sizes
     const clusters = [];
@@ -867,42 +1104,47 @@ export class SyntheticDataGenerator {
       positions[idx + 1] = cluster.center[1] + this._gaussianRandom() * cluster.size * cluster.elongation[1];
       positions[idx + 2] = cluster.center[2] + this._gaussianRandom() * cluster.size * cluster.elongation[2];
 
-      colors[idx] = Math.max(0, Math.min(1, cluster.color[0] + (Math.random() - 0.5) * 0.1));
-      colors[idx + 1] = Math.max(0, Math.min(1, cluster.color[1] + (Math.random() - 0.5) * 0.1));
-      colors[idx + 2] = Math.max(0, Math.min(1, cluster.color[2] + (Math.random() - 0.5) * 0.1));
+      // Convert to uint8
+      const cidx = i * 4;
+      colors[cidx] = Math.round(Math.max(0, Math.min(1, cluster.color[0] + (Math.random() - 0.5) * 0.1)) * 255);
+      colors[cidx + 1] = Math.round(Math.max(0, Math.min(1, cluster.color[1] + (Math.random() - 0.5) * 0.1)) * 255);
+      colors[cidx + 2] = Math.round(Math.max(0, Math.min(1, cluster.color[2] + (Math.random() - 0.5) * 0.1)) * 255);
+      colors[cidx + 3] = 255; // full alpha
     }
-    
+
     const elapsed = performance.now() - startTime;
     console.log(`Generated in ${elapsed.toFixed(0)}ms`);
-    
+
     return { positions, colors };
   }
-  
+
   /**
    * Generate uniform random distribution
    */
   static uniformRandom(count, scale = 2.0) {
     console.log(`Generating ${count.toLocaleString()} random points...`);
     const startTime = performance.now();
-    
+
     const positions = new Float32Array(count * 3);
-    const colors = new Float32Array(count * 3);
-    
+    const colors = new Uint8Array(count * 4); // RGBA packed as uint8
+
     for (let i = 0; i < count; i++) {
       const idx = i * 3;
-      
+
       positions[idx] = (Math.random() - 0.5) * scale * 2;
       positions[idx + 1] = (Math.random() - 0.5) * scale * 2;
       positions[idx + 2] = (Math.random() - 0.5) * scale * 2;
-      
-      colors[idx] = Math.random();
-      colors[idx + 1] = Math.random();
-      colors[idx + 2] = Math.random();
+
+      const cidx = i * 4;
+      colors[cidx] = Math.floor(Math.random() * 256);
+      colors[cidx + 1] = Math.floor(Math.random() * 256);
+      colors[cidx + 2] = Math.floor(Math.random() * 256);
+      colors[cidx + 3] = 255; // full alpha
     }
-    
+
     const elapsed = performance.now() - startTime;
     console.log(`Generated in ${elapsed.toFixed(0)}ms`);
-    
+
     return { positions, colors };
   }
   
@@ -910,7 +1152,7 @@ export class SyntheticDataGenerator {
    * Generate points by sampling from a GLB mesh surface
    * @param {number} count - Number of points to generate
    * @param {ArrayBuffer} glbBuffer - The loaded GLB file as ArrayBuffer
-   * @returns {Object} - { positions: Float32Array, colors: Float32Array }
+   * @returns {Object} - { positions: Float32Array, colors: Uint8Array (RGBA) }
    */
   static fromGLB(count, glbBuffer) {
     console.log(`[GLB] Sampling ${count.toLocaleString()} points from GLB mesh...`);
@@ -948,7 +1190,7 @@ export class SyntheticDataGenerator {
     // Sample points
     console.log('[GLB] Sampling points...');
     const positions = new Float32Array(count * 3);
-    const colors = new Float32Array(count * 3);
+    const colors = new Uint8Array(count * 4); // RGBA packed as uint8
     const logInterval = Math.max(100000, Math.floor(count / 10));
 
     for (let i = 0; i < count; i++) {
@@ -977,10 +1219,12 @@ export class SyntheticDataGenerator {
 
       const color = this._hslToRgb(hue, sat, light);
 
-      // Add slight noise for visual interest
-      colors[idx] = Math.max(0, Math.min(1, color[0] + (Math.random() - 0.5) * 0.05));
-      colors[idx + 1] = Math.max(0, Math.min(1, color[1] + (Math.random() - 0.5) * 0.05));
-      colors[idx + 2] = Math.max(0, Math.min(1, color[2] + (Math.random() - 0.5) * 0.05));
+      // Add slight noise for visual interest (convert to uint8)
+      const cidx = i * 4;
+      colors[cidx] = Math.round(Math.max(0, Math.min(1, color[0] + (Math.random() - 0.5) * 0.05)) * 255);
+      colors[cidx + 1] = Math.round(Math.max(0, Math.min(1, color[1] + (Math.random() - 0.5) * 0.05)) * 255);
+      colors[cidx + 2] = Math.round(Math.max(0, Math.min(1, color[2] + (Math.random() - 0.5) * 0.05)) * 255);
+      colors[cidx + 3] = 255; // full alpha
     }
 
     const elapsed = performance.now() - startTime;
@@ -993,7 +1237,7 @@ export class SyntheticDataGenerator {
    * Load GLB file from URL and sample points
    * @param {number} count - Number of points to generate
    * @param {string} url - URL to the GLB file
-   * @returns {Promise<Object>} - { positions: Float32Array, colors: Float32Array }
+   * @returns {Promise<Object>} - { positions: Float32Array, colors: Uint8Array (RGBA) }
    */
   static async fromGLBUrl(count, url = 'assets/img/kemal-inecik.glb') {
     console.log(`Loading GLB from: ${url}`);
@@ -1095,6 +1339,295 @@ export class PerformanceTracker {
   }
 }
 
+/**
+ * Build a copy-ready situation report with environment + renderer state.
+ * Designed to work for both real data and synthetic benchmarks.
+ */
+export class BenchmarkReporter {
+  constructor({ viewer, state, canvas } = {}) {
+    this.viewer = viewer;
+    this.state = state;
+    this.canvas = canvas;
+  }
+
+  _getGL() {
+    if (this.viewer && typeof this.viewer.getGLContext === 'function') {
+      return this.viewer.getGLContext();
+    }
+    if (this.canvas && typeof this.canvas.getContext === 'function') {
+      return this.canvas.getContext('webgl2') || this.canvas.getContext('webgl');
+    }
+    return null;
+  }
+
+  _collectEnvironment(gl) {
+    const nav = typeof navigator !== 'undefined' ? navigator : {};
+    const scr = typeof screen !== 'undefined' ? screen : {};
+    const connection = nav.connection || nav.mozConnection || nav.webkitConnection;
+    const timezone = (() => {
+      try {
+        return Intl.DateTimeFormat().resolvedOptions().timeZone;
+      } catch {
+        return null;
+      }
+    })();
+    const brands = nav.userAgentData?.brands?.map((b) => b.brand).join(', ');
+    const ua = nav.userAgent || '';
+
+    // Heuristic architecture detection
+    const uaLower = ua.toLowerCase();
+    const platformLower = (nav.userAgentData?.platform || nav.platform || '').toLowerCase();
+    const isArmLike = /arm|aarch64/.test(uaLower) || /arm|aarch64/.test(platformLower);
+    const isApple = /mac/.test(platformLower) || /mac/.test(uaLower);
+    const appleSiliconHint = /apple\s*m[0-9]/i.test(ua) ||
+      (nav.userAgentData?.platform === 'macOS' && isArmLike);
+    const arch = isArmLike ? 'arm64' : /win|intel|x86|amd64/.test(uaLower + platformLower) ? 'x86_64' : 'unknown';
+
+    // JS heap usage (Chrome only)
+    let jsHeap = null;
+    if (typeof performance !== 'undefined' && performance.memory) {
+      const mem = performance.memory;
+      jsHeap = {
+        usedMB: mem.usedJSHeapSize ? +(mem.usedJSHeapSize / 1024 / 1024).toFixed(1) : null,
+        totalMB: mem.totalJSHeapSize ? +(mem.totalJSHeapSize / 1024 / 1024).toFixed(1) : null,
+        limitMB: mem.jsHeapSizeLimit ? +(mem.jsHeapSizeLimit / 1024 / 1024).toFixed(1) : null,
+        source: 'performance.memory'
+      };
+    }
+
+    const env = {
+      browser: brands || nav.userAgent || 'unknown',
+      browserUA: nav.userAgent || null,
+      platform: nav.userAgentData?.platform || nav.platform || 'unknown',
+      language: nav.language || (nav.languages && nav.languages[0]) || null,
+      hardwareConcurrency: nav.hardwareConcurrency || null,
+      deviceMemory: nav.deviceMemory || null,
+      pixelRatio: typeof window !== 'undefined' ? window.devicePixelRatio : null,
+      screen: { width: scr.width, height: scr.height },
+      connection: connection ? (connection.effectiveType || connection.type || null) : null,
+      maxTouchPoints: nav.maxTouchPoints || 0,
+      timezone: timezone || null,
+      arch,
+      isApple,
+      appleSiliconHint: Boolean(appleSiliconHint),
+      jsHeap
+    };
+
+    if (gl) {
+      const debugExt = gl.getExtension('WEBGL_debug_renderer_info');
+      const renderer = debugExt ? gl.getParameter(debugExt.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+      const vendor = debugExt ? gl.getParameter(debugExt.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR);
+      const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+      const shadingLanguage = gl.getParameter(gl.SHADING_LANGUAGE_VERSION);
+      const colorBufferFloat = gl.getExtension('EXT_color_buffer_float') || gl.getExtension('WEBGL_color_buffer_float');
+      const floatTextures = colorBufferFloat || gl.getExtension('OES_texture_float') || gl.getExtension('OES_texture_half_float');
+      const anisoExt =
+        gl.getExtension('EXT_texture_filter_anisotropic') ||
+        gl.getExtension('WEBKIT_EXT_texture_filter_anisotropic') ||
+        gl.getExtension('MOZ_EXT_texture_filter_anisotropic');
+
+      env.webgl = {
+        version: (typeof WebGL2RenderingContext !== 'undefined' && gl instanceof WebGL2RenderingContext) ? 'WebGL2' : 'WebGL1',
+        renderer: renderer || null,
+        vendor: vendor || null,
+        shadingLanguage: shadingLanguage || null,
+        maxTextureSize: maxTextureSize || null,
+        supportsFloatTextures: Boolean(floatTextures),
+        supportsColorBufferFloat: Boolean(colorBufferFloat),
+        maxAnisotropy: anisoExt ? gl.getParameter(anisoExt.MAX_TEXTURE_MAX_ANISOTROPY_EXT) : null
+      };
+    }
+
+    return env;
+  }
+
+  _collectDataSnapshot(context = {}) {
+    const fromState = this.state || null;
+    const filteredCount = context.filteredCount ||
+      (fromState && typeof fromState.getFilteredCount === 'function' ? fromState.getFilteredCount() : null);
+    const activeField = context.activeField ||
+      (fromState && typeof fromState.getActiveField === 'function' ? fromState.getActiveField() : null);
+    const filters = context.filters ||
+      (fromState && typeof fromState.getActiveFiltersStructured === 'function'
+        ? fromState.getActiveFiltersStructured()
+        : []);
+
+    const dataset = context.dataset || {};
+    const pointCount = dataset.pointCount ??
+      (fromState ? fromState.pointCount : null) ??
+      0;
+    const visiblePoints = dataset.visiblePoints ??
+      (filteredCount ? filteredCount.shown : null) ??
+      pointCount;
+
+    return {
+      mode: dataset.mode || 'real',
+      pattern: dataset.pattern || null,
+      generationMs: dataset.generationMs || null,
+      pointCount,
+      visiblePoints,
+      filters,
+      activeFieldKey: dataset.activeFieldKey || activeField?.key || null,
+      activeFieldKind: dataset.activeFieldKind || activeField?.kind || null
+    };
+  }
+
+  _collectRendererSnapshot(gl, context = {}) {
+    const rendererStats = context.rendererStats ||
+      (this.viewer && typeof this.viewer.getRendererStats === 'function' ? this.viewer.getRendererStats() : null) ||
+      {};
+    const perfStats = context.perfStats || null;
+    const rendererConfig = context.rendererConfig || {};
+    const renderMode = rendererConfig.renderMode || context.renderMode || null;
+    const viewport = gl
+      ? { width: gl.drawingBufferWidth, height: gl.drawingBufferHeight }
+      : {
+          width: typeof window !== 'undefined' ? window.innerWidth : null,
+          height: typeof window !== 'undefined' ? window.innerHeight : null
+        };
+
+    const fps = rendererStats.fps || perfStats?.fps || null;
+    const frameTime = rendererStats.lastFrameTime || perfStats?.avgFrameTime || null;
+
+    const estimatedMemoryMB = rendererStats.gpuMemoryMB ||
+      (context.dataset && context.dataset.pointCount
+        ? (context.dataset.pointCount * 28) / (1024 * 1024)
+        : null);
+
+    return {
+      fps,
+      frameTime,
+      rendererStats,
+      perfStats,
+      rendererConfig,
+      renderMode,
+      viewport,
+      estimatedMemoryMB
+    };
+  }
+
+  _detectIssues(env, renderer, data) {
+    const issues = [];
+
+    if (renderer.fps && renderer.fps < 30) {
+      issues.push('FPS below 30 (verify LOD and resolution).');
+    }
+    if (renderer.frameTime && renderer.frameTime > 25) {
+      issues.push('High frame time (>25ms) indicates GPU/CPU bottleneck.');
+    }
+    if (renderer.estimatedMemoryMB && renderer.estimatedMemoryMB > 700) {
+      issues.push('GPU memory estimate exceeds ~700MB; risk of driver eviction.');
+    }
+    if (data.pointCount > 5000000 && renderer.rendererConfig && renderer.rendererConfig.lodEnabled === false) {
+      issues.push('LOD disabled on multi-million point dataset.');
+    }
+    if (data.pointCount > 3000000 && renderer.rendererConfig && renderer.rendererConfig.frustumCulling === false) {
+      issues.push('Frustum culling off for large dataset; enable to reduce fill rate.');
+    }
+    if (env.pixelRatio && env.pixelRatio > 2) {
+      issues.push('High devicePixelRatio (>2) increases fill cost; try browser zoom <100% or lower resolution.');
+    }
+    if (env.hardwareConcurrency && env.hardwareConcurrency < 6) {
+      issues.push('Limited CPU threads (<6); expect slower load or filter updates.');
+    }
+    if (env.deviceMemory && env.deviceMemory < 4) {
+      issues.push('Low device memory (<4GB); large allocations may fail.');
+    }
+    if (env.webgl && env.webgl.maxTextureSize && env.webgl.maxTextureSize < 4096) {
+      issues.push('Low MAX_TEXTURE_SIZE (<4096); texture-heavy effects may degrade.');
+    }
+    if (env.webgl && env.webgl.supportsColorBufferFloat === false) {
+      issues.push('No color_buffer_float; fallback precision may apply.');
+    }
+
+    return issues;
+  }
+
+  buildReport(context = {}) {
+    const gl = this._getGL();
+    const env = this._collectEnvironment(gl);
+    const data = this._collectDataSnapshot(context);
+    const renderer = this._collectRendererSnapshot(gl, { ...context, dataset: data });
+    const issues = this._detectIssues(env, renderer, data);
+    const now = new Date();
+
+    const pctVisible = data.pointCount && data.visiblePoints != null
+      ? ((data.visiblePoints / data.pointCount) * 100).toFixed(1)
+      : null;
+    const filtersActive = data.filters && data.filters.length > 0;
+    const filterLines = filtersActive
+      ? data.filters.slice(0, 5).map(f => f.text || f.id || 'filter')
+      : [];
+    const perf = renderer.perfStats || null;
+    const perfLine = perf
+      ? `FPS ${renderer.fps ?? 'n/a'} • Frame ms avg/p95/min/max: ${perf.avgFrameTime || 'n/a'}/${perf.p95FrameTime || 'n/a'}/${perf.minFrameTime || 'n/a'}/${perf.maxFrameTime || 'n/a'} (samples ${perf.samples || 0})`
+      : `FPS ${renderer.fps ?? 'n/a'} • Frame ms: ${renderer.frameTime != null ? (renderer.frameTime.toFixed ? renderer.frameTime.toFixed(2) : renderer.frameTime) : 'n/a'}`;
+
+    const lines = [];
+    lines.push('cellucid situation report');
+    lines.push('-------------------------');
+    lines.push(`Timestamp: ${now.toISOString()}`);
+
+    lines.push('');
+    lines.push('Data');
+    lines.push(`- Mode: ${data.mode === 'synthetic' ? 'Synthetic' : 'Real'}${data.pattern ? ` (${data.pattern})` : ''}`);
+    lines.push(`- Points: ${formatNumber(data.pointCount)}${pctVisible ? ` • Visible: ${formatNumber(data.visiblePoints)} (${pctVisible}%)` : ''}`);
+    if (data.generationMs != null) {
+      lines.push(`- Synthetic generation: ${data.generationMs} ms`);
+    }
+    if (data.activeFieldKey) {
+      lines.push(`- Active field: ${data.activeFieldKey}${data.activeFieldKind ? ` [${data.activeFieldKind}]` : ''}`);
+    }
+    if (filtersActive) {
+      lines.push(`- Filters (${data.filters.length}): ${filterLines.join(' | ')}${data.filters.length > filterLines.length ? ` (+${data.filters.length - filterLines.length} more)` : ''}`);
+    } else {
+      lines.push('- Filters: none');
+    }
+
+    lines.push('');
+    lines.push('Renderer');
+    lines.push(`- Quality: ${renderer.rendererConfig.shaderQuality || 'auto'} • LOD: ${renderer.rendererConfig.lodEnabled === false ? 'off' : 'on'} • Frustum: ${renderer.rendererConfig.frustumCulling ? 'on' : 'off'} • Mode: ${renderer.renderMode || 'n/a'}`);
+    lines.push(`- ${perfLine}`);
+    lines.push(`- Visible now: ${renderer.rendererStats.visiblePoints != null ? formatNumber(renderer.rendererStats.visiblePoints) : 'n/a'} • LOD level: ${renderer.rendererStats.lodLevel != null ? renderer.rendererStats.lodLevel : '-'}`);
+    lines.push(`- GPU memory est: ${renderer.estimatedMemoryMB ? renderer.estimatedMemoryMB.toFixed(1) : 'n/a'} MB • Draw calls: ${renderer.rendererStats.drawCalls ?? '-'}`);
+    lines.push(`- Viewport: ${renderer.viewport.width || '?'}x${renderer.viewport.height || '?'} @ DPR ${env.pixelRatio || '?'}`);
+
+    lines.push('');
+    lines.push('Environment');
+    lines.push(`- Browser: ${env.browser}`);
+    if (env.browserUA) lines.push(`- User agent: ${env.browserUA}`);
+    lines.push(`- Platform: ${env.platform}${env.timezone ? ` • TZ: ${env.timezone}` : ''} • Arch: ${env.arch || 'n/a'}${env.appleSiliconHint ? ' (Apple Silicon hint)' : ''}`);
+    lines.push(`- Locale: ${env.language || 'n/a'} • Cores: ${env.hardwareConcurrency || 'n/a'} • Device memory: ${env.deviceMemory ? `${env.deviceMemory} GB` : 'n/a'}`);
+    lines.push(`- Screen: ${env.screen.width || '?'}×${env.screen.height || '?'} • DPR: ${env.pixelRatio || 'n/a'} • Connection: ${env.connection || 'n/a'} • Touch points: ${env.maxTouchPoints || 0}`);
+    if (env.jsHeap) {
+      lines.push(`- JS heap: used ${env.jsHeap.usedMB ?? 'n/a'} MB / total ${env.jsHeap.totalMB ?? 'n/a'} MB / limit ${env.jsHeap.limitMB ?? 'n/a'} MB (${env.jsHeap.source})`);
+    }
+    if (env.webgl) {
+      lines.push(`- GPU: ${env.webgl.renderer || 'n/a'} (${env.webgl.vendor || 'vendor n/a'})`);
+      lines.push(`- GPU cores: not exposed to browsers (WebGL hides core counts)`);
+      lines.push(`- WebGL: ${env.webgl.version} • GLSL: ${env.webgl.shadingLanguage || 'n/a'} • Max texture: ${env.webgl.maxTextureSize || 'n/a'} • Float RT: ${env.webgl.supportsColorBufferFloat ? 'yes' : 'no'} • Aniso: ${env.webgl.maxAnisotropy ?? 'n/a'}`);
+    } else {
+      lines.push('- WebGL: unavailable');
+    }
+
+    lines.push('');
+    lines.push('Potential issues');
+    if (issues.length === 0) {
+      lines.push('- None detected');
+    } else {
+      issues.forEach((issue) => lines.push(`- ${issue}`));
+    }
+
+    return {
+      text: lines.join('\n'),
+      env,
+      data,
+      renderer,
+      issues
+    };
+  }
+}
+
 // Format numbers nicely
 export function formatNumber(n) {
   if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
@@ -1111,4 +1644,5 @@ if (typeof window !== 'undefined') {
   window.formatNumber = formatNumber;
   window.GLBParser = GLBParser;
   window.MeshSurfaceSampler = MeshSurfaceSampler;
+  window.BenchmarkReporter = BenchmarkReporter;
 }

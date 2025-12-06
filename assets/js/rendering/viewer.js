@@ -19,12 +19,12 @@ import {
 import { HighPerfRenderer } from './high-perf-renderer.js';
 
 // Simple centroid shader (WebGL2) - for small number of centroid points
+// Uses RGBA uint8 normalized colors (same as main points)
 const CENTROID_VS = `#version 300 es
 precision highp float;
 
 in vec3 a_position;
-in vec3 a_color;
-in float a_alpha;
+in vec4 a_color; // RGBA packed as uint8, auto-normalized by WebGL
 
 uniform mat4 u_mvpMatrix;
 uniform mat4 u_viewMatrix;
@@ -52,9 +52,9 @@ void main() {
   gl_PointSize = mix(u_pointSize, perspectiveSize, u_sizeAttenuation);
   gl_PointSize = clamp(gl_PointSize, 0.5, 128.0);
 
-  if (a_alpha < 0.01) gl_PointSize = 0.0;
-  v_color = a_color;
-  v_alpha = a_alpha;
+  if (a_color.a < 0.01) gl_PointSize = 0.0;
+  v_color = a_color.rgb;
+  v_alpha = a_color.a;
 }
 `;
 
@@ -99,7 +99,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
   // === HIGH-PERFORMANCE RENDERER FOR SCATTER POINTS ===
   const hpRenderer = new HighPerfRenderer(gl, {
-    USE_LOD: true,
+    USE_LOD: false,
     USE_FRUSTUM_CULLING: false,
     USE_INTERLEAVED_BUFFERS: true
   });
@@ -198,8 +198,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   const centroidProgram = createProgram(gl, CENTROID_VS, CENTROID_FS);
   const centroidAttribLocations = {
     position: gl.getAttribLocation(centroidProgram, 'a_position'),
-    color: gl.getAttribLocation(centroidProgram, 'a_color'),
-    alpha: gl.getAttribLocation(centroidProgram, 'a_alpha'),
+    color: gl.getAttribLocation(centroidProgram, 'a_color'), // RGBA uint8 normalized
   };
   const centroidUniformLocations = {
     mvpMatrix: gl.getUniformLocation(centroidProgram, 'u_mvpMatrix'),
@@ -213,16 +212,15 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
   // === BUFFERS ===
   // Centroid buffers (small count, separate from main points)
+  // Color buffer now stores RGBA as uint8 (alpha packed in)
   const centroidPositionBuffer = gl.createBuffer();
-  const centroidColorBuffer = gl.createBuffer();
-  const centroidAlphaBuffer = gl.createBuffer();
+  const centroidColorBuffer = gl.createBuffer(); // RGBA uint8
   // Projectile buffers (tiny count, dynamic)
+  // Color buffers now store RGBA as uint8 (alpha packed in)
   const projectilePositionBuffer = gl.createBuffer();
-  const projectileColorBuffer = gl.createBuffer();
-  const projectileAlphaBuffer = gl.createBuffer();
+  const projectileColorBuffer = gl.createBuffer(); // RGBA uint8
   const impactPositionBuffer = gl.createBuffer();
-  const impactColorBuffer = gl.createBuffer();
-  const impactAlphaBuffer = gl.createBuffer();
+  const impactColorBuffer = gl.createBuffer(); // RGBA uint8
 
   // Edge buffer for connectivity lines
   const edgeStripBuffer = gl.createBuffer();
@@ -322,6 +320,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   const tempVec4 = vec4.create();
   const tempVec3 = vec3.create();
   const tempVec3b = vec3.create();
+  const tempVec3c = vec3.create();
+  const tempVec3d = vec3.create();
+  const tempVec3e = vec3.create();
+  const tempVec3f = vec3.create();
   const lightDir = vec3.normalize(vec3.create(), [0.5, 0.7, 0.5]);
 
   let positionsArray = null;
@@ -370,7 +372,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   let showConnectivity = false;
   let connectivityLineWidth = 1.0;
   let connectivityAlpha = 0.15;
-  const connectivityColor = vec3.fromValues(0.3, 0.3, 0.3);
+  const connectivityColorBytes = new Uint8Array([77, 77, 77]); // ~0.3 in 0-255
+  const connectivityColorVec = vec3.create(); // normalized to 0-1 on use
   const EDGE_STRIDE_BYTES = 7 * 4;
   const EDGE_OTHER_OFFSET = 3 * 4;
   const EDGE_SIDE_OFFSET = 6 * 4;
@@ -438,17 +441,28 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   let lookActive = false;
   let lastFrameTime = performance.now();
 
+  // Helper to fetch a normalized RGB color for a point index.
+  function getNormalizedColor(idx) {
+    if (!colorsArray || !pointCount) return [1.0, 0.6, 0.2];
+    const stride = colorsArray.length === pointCount * 4 ? 4 : 3;
+    const base = idx * stride;
+    const scale = colorsArray.BYTES_PER_ELEMENT === 1 ? (1 / 255) : 1;
+    return [
+      (colorsArray[base] || 0) * scale,
+      (colorsArray[base + 1] || 0) * scale,
+      (colorsArray[base + 2] || 0) * scale
+    ];
+  }
+
   // Projectile sandbox (free-fly + pointer lock)
   const projectiles = [];
   const impactFlashes = [];
   let projectileBufferDirty = true;
   let impactBufferDirty = true;
   let projectilePositions = new Float32Array();
-  let projectileColors = new Float32Array();
-  let projectileAlphas = new Float32Array();
+  let projectileColors = new Uint8Array(); // RGBA packed as uint8
   let impactPositions = new Float32Array();
-  let impactColors = new Float32Array();
-  let impactAlphas = new Float32Array();
+  let impactColors = new Uint8Array(); // RGBA packed as uint8
   let lastShotTime = 0;
   let pointBounds = {
     min: [-1, -1, -1],
@@ -470,16 +484,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   const INERTIA_FRICTION = 0.92;
   const INERTIA_MIN_VELOCITY = 0.0001;
   const VELOCITY_SMOOTHING = 0.3;
-  const PROJECTILE_RADIUS = 0.04;
-  const PROJECTILE_SPEED = 2.0;         // Slow enough to watch, fast enough to feel responsive
-  const PROJECTILE_GRAVITY = 9.8 * 0.08; // Very light gravity for gentle arcs
-  const PROJECTILE_DRAG = 0.998;         // Minimal drag - projectiles glide smoothly (per frame at reference rate)
+  const PROJECTILE_RADIUS = 0.05;
+  const PROJECTILE_SPEED = 3.5;          // Snappy and responsive
+  const PROJECTILE_GRAVITY = 9.8 * 0.15; // Noticeable arcs without feeling heavy
+  const PROJECTILE_DRAG = 0.995;         // Slight drag for natural deceleration
   const PHYSICS_TICK_RATE = 60;          // Reference frame rate for frame-independent physics (Hz)
-  const PROJECTILE_LIFETIME = 18.0;      // Longer lifetime to travel further
-  const PROJECTILE_BOUNCE = 0.4;         // Softer bounce on data collision
-  const PROJECTILE_FLASH_TIME = 0.35;
-  const MAX_PROJECTILES = 24;
-  const MAX_IMPACT_FLASHES = 96;
+  const PROJECTILE_LIFETIME = 12.0;      // Reasonable lifetime
+  const PROJECTILE_BOUNCE = 0.55;        // Moderate bounce - loses energy on impact
+  const PROJECTILE_FLASH_TIME = 0.4;
+  const MAX_PROJECTILES = 32;
+  const MAX_IMPACT_FLASHES = 128;
+  const PROJECTILE_SPREAD = 0;          // No spread - shoots exactly where aimed
+  const PROJECTILE_LOFT = 0.01;         // Upward angle bias for arcing shots
   const SHOT_COOLDOWN_SECONDS = 0.05;
 
   function getOrbitSigns() {
@@ -805,13 +821,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     if (hpRenderer?.octree) {
       const indices = hpRenderer.octree.queryRadius(center, radius, maxResults);
       return indices.map((idx) => {
-        const base = idx * 3;
+        const posBase = idx * 3;
         return {
           index: idx,
-          position: [positionsArray[base], positionsArray[base + 1], positionsArray[base + 2]],
-          color: colorsArray
-            ? [colorsArray[base], colorsArray[base + 1], colorsArray[base + 2]]
-            : [1, 0.6, 0.2]
+          position: [positionsArray[posBase], positionsArray[posBase + 1], positionsArray[posBase + 2]],
+          color: getNormalizedColor(idx)
         };
       });
     }
@@ -820,18 +834,16 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     const maxScan = Math.min(pointCount, 4000);
     const r2 = radius * radius;
     for (let i = 0; i < maxScan && results.length < maxResults; i++) {
-      const base = i * 3;
-      const dx = positionsArray[base] - center[0];
-      const dy = positionsArray[base + 1] - center[1];
-      const dz = positionsArray[base + 2] - center[2];
+      const posBase = i * 3;
+      const dx = positionsArray[posBase] - center[0];
+      const dy = positionsArray[posBase + 1] - center[1];
+      const dz = positionsArray[posBase + 2] - center[2];
       const dist2 = dx * dx + dy * dy + dz * dz;
       if (dist2 <= r2) {
         results.push({
           index: i,
-          position: [positionsArray[base], positionsArray[base + 1], positionsArray[base + 2]],
-          color: colorsArray
-            ? [colorsArray[base], colorsArray[base + 1], colorsArray[base + 2]]
-            : [1, 0.6, 0.2]
+          position: [positionsArray[posBase], positionsArray[posBase + 1], positionsArray[posBase + 2]],
+          color: getNormalizedColor(i)
         });
       }
     }
@@ -840,12 +852,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
   function pickProjectileColor() {
     if (colorsArray && pointCount > 0) {
-      const idx = Math.floor(Math.random() * pointCount) * 3;
-      return [
-        colorsArray[idx],
-        colorsArray[idx + 1],
-        colorsArray[idx + 2]
-      ];
+      const idx = Math.floor(Math.random() * pointCount);
+      return getNormalizedColor(idx);
     }
     return [1.0, 0.6, 0.2];
   }
@@ -858,13 +866,24 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     lastShotTime = now;
 
     // Use cursor-based aiming when not in pointer lock mode, otherwise use camera forward
+    const axes = getFreeflyAxes();
     const aimDirection = pointerLockActive
-      ? getFreeflyAxes().forward
+      ? axes.forward
       : getAimDirectionFromCursor();
 
+    // Add slight random spread and upward loft for arcing shots
+    const spreadDir = vec3.clone(aimDirection);
+    const randRight = (Math.random() - 0.5) * 2 * PROJECTILE_SPREAD;
+    const randUp = (Math.random() - 0.5) * 2 * PROJECTILE_SPREAD;
+    vec3.scaleAndAdd(spreadDir, spreadDir, axes.right, randRight);
+    vec3.scaleAndAdd(spreadDir, spreadDir, axes.upVec, randUp);
+    // Add upward loft for higher arcing trajectory
+    spreadDir[1] += PROJECTILE_LOFT;
+    vec3.normalize(spreadDir, spreadDir);
+
     // Start projectile close to camera (0.1 offset balances "from camera" feel with reasonable perspective size)
-    const start = vec3.add(vec3.create(), freeflyPosition, vec3.scale(vec3.create(), aimDirection, 0.1));
-    const vel = vec3.scale(vec3.create(), aimDirection, PROJECTILE_SPEED);
+    const start = vec3.add(vec3.create(), freeflyPosition, vec3.scale(vec3.create(), spreadDir, 0.1));
+    const vel = vec3.scale(vec3.create(), spreadDir, PROJECTILE_SPEED);
     projectiles.push({
       position: start,
       velocity: vel,
@@ -903,9 +922,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
   function stepProjectiles(dt) {
     if (!projectiles.length) return;
-    const gravityStep = PROJECTILE_GRAVITY * dt;
-    const drag = Math.pow(PROJECTILE_DRAG, dt * PHYSICS_TICK_RATE);
     const maxRange = pointBounds.radius * 3 + 1.0;
+    const collisionRadius = PROJECTILE_RADIUS + pointCollisionRadius;
 
     for (let i = projectiles.length - 1; i >= 0; i--) {
       const p = projectiles[i];
@@ -916,42 +934,134 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         continue;
       }
 
-      p.velocity[1] -= gravityStep;
-      vec3.scale(p.velocity, p.velocity, drag);
-      vec3.scaleAndAdd(p.position, p.position, p.velocity, dt);
+      // Calculate sub-steps based on velocity to prevent tunneling
+      const speed = vec3.length(p.velocity);
+      const moveDistance = speed * dt;
+      // Keep each physics step short so the swept collision check remains robust
+      const maxStepDistance = collisionRadius * 0.75;
+      const numSubSteps = Math.max(2, Math.ceil(moveDistance / maxStepDistance));
+      const subDt = dt / numSubSteps;
+      const gravitySubStep = PROJECTILE_GRAVITY * subDt;
+      const subDrag = Math.pow(PROJECTILE_DRAG, subDt * PHYSICS_TICK_RATE);
 
-      const dx = p.position[0] - pointBounds.center[0];
-      const dy = p.position[1] - pointBounds.center[1];
-      const dz = p.position[2] - pointBounds.center[2];
-      const distFromCenter = Math.sqrt(dx * dx + dy * dy + dz * dz);
-      if (distFromCenter > maxRange) {
-        projectiles.splice(i, 1);
-        projectileBufferDirty = true;
-        continue;
-      }
+      let outOfBounds = false;
 
-      if (pointCount > 0) {
-        const hits = queryNearbyPoints(p.position, p.radius + pointCollisionRadius, 48);
-        if (hits.length) {
-          vec3.set(tempVec3, 0, 0, 0);
-          for (const hit of hits) {
-            vec3.sub(tempVec3b, p.position, hit.position);
-            const d = vec3.length(tempVec3b);
-            if (d > 1e-4) {
-              vec3.scaleAndAdd(tempVec3, tempVec3, tempVec3b, 1 / d);
+      for (let step = 0; step < numSubSteps; step++) {
+        // Store old position for sweep collision detection
+        const oldPosX = p.position[0];
+        const oldPosY = p.position[1];
+        const oldPosZ = p.position[2];
+
+        // Apply physics
+        p.velocity[1] -= gravitySubStep;
+        vec3.scale(p.velocity, p.velocity, subDrag);
+        vec3.scaleAndAdd(p.position, p.position, p.velocity, subDt);
+
+        // Check bounds
+        const dx = p.position[0] - pointBounds.center[0];
+        const dy = p.position[1] - pointBounds.center[1];
+        const dz = p.position[2] - pointBounds.center[2];
+        const distFromCenter = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (distFromCenter > maxRange) {
+          outOfBounds = true;
+          break;
+        }
+
+        // Check collisions with cells - use multiple nearby cells along the swept path
+        // to build a stable surface normal for the bounce.
+        if (pointCount > 0) {
+          const smoothRadius = collisionRadius * 2.5; // Sample wider area for surface normal
+          vec3.set(tempVec3c, p.position[0] - oldPosX, p.position[1] - oldPosY, p.position[2] - oldPosZ);
+          const segLen = vec3.length(tempVec3c);
+          const segLen2 = Math.max(segLen * segLen, 1e-6);
+          if (segLen > 0) vec3.scale(tempVec3d, tempVec3c, 1 / segLen);
+          else vec3.set(tempVec3d, 0, 0, 0);
+
+          // Query once around the swept segment to gather multiple cells for the bounce normal.
+          const midPos = [(oldPosX + p.position[0]) * 0.5, (oldPosY + p.position[1]) * 0.5, (oldPosZ + p.position[2]) * 0.5];
+          const hits = queryNearbyPoints(midPos, smoothRadius + segLen, 96);
+          if (hits.length) {
+            vec3.set(tempVec3, 0, 0, 0);  // normal accumulator
+            vec3.set(tempVec3b, 0, 0, 0); // contact point accumulator
+            let totalWeight = 0;
+            let hasCollision = false;
+            let maxPenetration = 0;
+            let impactColor = null;
+
+            for (const hit of hits) {
+              // Closest point on the segment to the hit cell
+              vec3.set(tempVec3e, hit.position[0] - oldPosX, hit.position[1] - oldPosY, hit.position[2] - oldPosZ);
+              const t = Math.max(0, Math.min(1, vec3.dot(tempVec3e, tempVec3c) / segLen2));
+              const closestX = oldPosX + tempVec3c[0] * t;
+              const closestY = oldPosY + tempVec3c[1] * t;
+              const closestZ = oldPosZ + tempVec3c[2] * t;
+
+              // Vector from closest point on segment to the cell
+              vec3.set(tempVec3f, hit.position[0] - closestX, hit.position[1] - closestY, hit.position[2] - closestZ);
+              const d = vec3.length(tempVec3f);
+              if (d >= collisionRadius) continue;
+
+              hasCollision = true;
+              const penetration = collisionRadius - d;
+              maxPenetration = Math.max(maxPenetration, penetration);
+              if (!impactColor) impactColor = hit.color;
+
+              // Contact normal contribution (fall back to segment direction when extremely close)
+              if (d > 1e-5) {
+                vec3.scale(tempVec3f, tempVec3f, 1 / d);
+              } else {
+                vec3.copy(tempVec3f, tempVec3d);
+              }
+              // Ensure the normal opposes incoming velocity so we always bounce
+              if (vec3.dot(tempVec3f, p.velocity) > 0) vec3.scale(tempVec3f, tempVec3f, -1);
+
+              // Weight favors deeper overlaps so multiple nearby cells steer the normal
+              const weight = 1 + (penetration / collisionRadius);
+              totalWeight += weight;
+              vec3.scaleAndAdd(tempVec3, tempVec3, tempVec3f, weight);
+              vec3.set(tempVec3e, closestX, closestY, closestZ);
+              vec3.scaleAndAdd(tempVec3b, tempVec3b, tempVec3e, weight);
             }
-            recordImpact(hit.position, hit.color);
-          }
-          const nLen = vec3.length(tempVec3);
-          if (nLen > 0) {
-            vec3.scale(tempVec3, tempVec3, 1 / nLen);
-            const vDotN = vec3.dot(p.velocity, tempVec3);
-            if (vDotN < 0) {
-              vec3.scaleAndAdd(p.velocity, p.velocity, tempVec3, -(1 + PROJECTILE_BOUNCE) * vDotN);
-              vec3.scale(p.velocity, p.velocity, 0.92);
+
+            if (hasCollision && totalWeight > 0) {
+              vec3.scale(tempVec3, tempVec3, 1 / totalWeight);
+              vec3.scale(tempVec3b, tempVec3b, 1 / totalWeight);
+              const nLen = vec3.length(tempVec3);
+              if (nLen > 0) {
+                vec3.scale(tempVec3, tempVec3, 1 / nLen);
+                if (vec3.dot(tempVec3, p.velocity) > 0) vec3.scale(tempVec3, tempVec3, -1);
+
+                const vDotN = vec3.dot(p.velocity, tempVec3);
+                vec3.scaleAndAdd(p.velocity, p.velocity, tempVec3, -(1 + PROJECTILE_BOUNCE) * vDotN);
+                vec3.scale(p.velocity, p.velocity, 0.82); // Noticeable slowdown on bounce
+
+                // Push position out of collision to prevent sticking (use averaged contact point)
+                const pushOut = collisionRadius + 0.002 + maxPenetration * 0.25;
+                vec3.scaleAndAdd(p.position, tempVec3b, tempVec3, pushOut);
+
+                // Secondary check to ensure we are fully outside after the bounce
+                const postHits = queryNearbyPoints(p.position, collisionRadius * 1.25, 24);
+                let residualPenetration = 0;
+                for (const post of postHits) {
+                  vec3.sub(tempVec3e, p.position, post.position);
+                  const d2 = vec3.length(tempVec3e);
+                  residualPenetration = Math.max(residualPenetration, collisionRadius - d2);
+                }
+                if (residualPenetration > 0) {
+                  vec3.scaleAndAdd(p.position, p.position, tempVec3, residualPenetration + 0.001);
+                }
+
+                recordImpact(tempVec3b, impactColor || pickProjectileColor());
+              }
             }
           }
         }
+      }
+
+      if (outOfBounds) {
+        projectiles.splice(i, 1);
+        projectileBufferDirty = true;
+        continue;
       }
     }
 
@@ -962,39 +1072,35 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     const count = projectiles.length;
     if (count === 0) {
       projectilePositions = new Float32Array();
-      projectileColors = new Float32Array();
-      projectileAlphas = new Float32Array();
+      projectileColors = new Uint8Array();
       gl.bindBuffer(gl.ARRAY_BUFFER, projectilePositionBuffer);
       gl.bufferData(gl.ARRAY_BUFFER, projectilePositions, gl.DYNAMIC_DRAW);
       gl.bindBuffer(gl.ARRAY_BUFFER, projectileColorBuffer);
       gl.bufferData(gl.ARRAY_BUFFER, projectileColors, gl.DYNAMIC_DRAW);
-      gl.bindBuffer(gl.ARRAY_BUFFER, projectileAlphaBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, projectileAlphas, gl.DYNAMIC_DRAW);
       projectileBufferDirty = false;
       return;
     }
 
     projectilePositions = new Float32Array(count * 3);
-    projectileColors = new Float32Array(count * 3);
-    projectileAlphas = new Float32Array(count);
+    projectileColors = new Uint8Array(count * 4); // RGBA packed
     for (let i = 0; i < count; i++) {
       const p = projectiles[i];
-      const base = i * 3;
-      projectilePositions[base] = p.position[0];
-      projectilePositions[base + 1] = p.position[1];
-      projectilePositions[base + 2] = p.position[2];
-      projectileColors[base] = p.color[0];
-      projectileColors[base + 1] = p.color[1];
-      projectileColors[base + 2] = p.color[2];
-      projectileAlphas[i] = 1.0;
+      const posBase = i * 3;
+      const colBase = i * 4;
+      projectilePositions[posBase] = p.position[0];
+      projectilePositions[posBase + 1] = p.position[1];
+      projectilePositions[posBase + 2] = p.position[2];
+      // Convert float 0-1 to uint8 0-255
+      projectileColors[colBase] = Math.round(p.color[0] * 255);
+      projectileColors[colBase + 1] = Math.round(p.color[1] * 255);
+      projectileColors[colBase + 2] = Math.round(p.color[2] * 255);
+      projectileColors[colBase + 3] = 255; // full alpha
     }
 
     gl.bindBuffer(gl.ARRAY_BUFFER, projectilePositionBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, projectilePositions, gl.DYNAMIC_DRAW);
     gl.bindBuffer(gl.ARRAY_BUFFER, projectileColorBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, projectileColors, gl.DYNAMIC_DRAW);
-    gl.bindBuffer(gl.ARRAY_BUFFER, projectileAlphaBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, projectileAlphas, gl.DYNAMIC_DRAW);
     projectileBufferDirty = false;
   }
 
@@ -1002,40 +1108,36 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     const count = impactFlashes.length;
     if (count === 0) {
       impactPositions = new Float32Array();
-      impactColors = new Float32Array();
-      impactAlphas = new Float32Array();
+      impactColors = new Uint8Array();
       gl.bindBuffer(gl.ARRAY_BUFFER, impactPositionBuffer);
       gl.bufferData(gl.ARRAY_BUFFER, impactPositions, gl.DYNAMIC_DRAW);
       gl.bindBuffer(gl.ARRAY_BUFFER, impactColorBuffer);
       gl.bufferData(gl.ARRAY_BUFFER, impactColors, gl.DYNAMIC_DRAW);
-      gl.bindBuffer(gl.ARRAY_BUFFER, impactAlphaBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, impactAlphas, gl.DYNAMIC_DRAW);
       impactBufferDirty = false;
       return;
     }
 
     impactPositions = new Float32Array(count * 3);
-    impactColors = new Float32Array(count * 3);
-    impactAlphas = new Float32Array(count);
+    impactColors = new Uint8Array(count * 4); // RGBA packed
     for (let i = 0; i < count; i++) {
       const flash = impactFlashes[i];
-      const base = i * 3;
+      const posBase = i * 3;
+      const colBase = i * 4;
       const alpha = Math.max(0, 1 - (flash.age / flash.life));
-      impactPositions[base] = flash.position[0];
-      impactPositions[base + 1] = flash.position[1];
-      impactPositions[base + 2] = flash.position[2];
-      impactColors[base] = flash.color[0];
-      impactColors[base + 1] = flash.color[1];
-      impactColors[base + 2] = flash.color[2];
-      impactAlphas[i] = alpha;
+      impactPositions[posBase] = flash.position[0];
+      impactPositions[posBase + 1] = flash.position[1];
+      impactPositions[posBase + 2] = flash.position[2];
+      // Convert float 0-1 to uint8 0-255
+      impactColors[colBase] = Math.round(flash.color[0] * 255);
+      impactColors[colBase + 1] = Math.round(flash.color[1] * 255);
+      impactColors[colBase + 2] = Math.round(flash.color[2] * 255);
+      impactColors[colBase + 3] = Math.round(alpha * 255); // alpha fades over time
     }
 
     gl.bindBuffer(gl.ARRAY_BUFFER, impactPositionBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, impactPositions, gl.DYNAMIC_DRAW);
     gl.bindBuffer(gl.ARRAY_BUFFER, impactColorBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, impactColors, gl.DYNAMIC_DRAW);
-    gl.bindBuffer(gl.ARRAY_BUFFER, impactAlphaBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, impactAlphas, gl.DYNAMIC_DRAW);
     impactBufferDirty = false;
   }
 
@@ -1332,7 +1434,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     gl.uniformMatrix4fv(lineUniformLocations.mvpMatrix, false, mvpMatrix);
     gl.uniformMatrix4fv(lineUniformLocations.viewMatrix, false, viewMatrix);
     gl.uniformMatrix4fv(lineUniformLocations.modelMatrix, false, modelMatrix);
-    gl.uniform3fv(lineUniformLocations.lineColor, connectivityColor);
+    connectivityColorVec[0] = connectivityColorBytes[0] / 255;
+    connectivityColorVec[1] = connectivityColorBytes[1] / 255;
+    connectivityColorVec[2] = connectivityColorBytes[2] / 255;
+    gl.uniform3fv(lineUniformLocations.lineColor, connectivityColorVec);
     gl.uniform1f(lineUniformLocations.lineAlpha, connectivityAlpha);
     gl.uniform1f(lineUniformLocations.lineWidth, connectivityLineWidth);
     gl.uniform2f(lineUniformLocations.viewportSize, widthPx, heightPx);
@@ -1370,11 +1475,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     gl.bindBuffer(gl.ARRAY_BUFFER, centroidColorBuffer);
     gl.enableVertexAttribArray(centroidAttribLocations.color);
-    gl.vertexAttribPointer(centroidAttribLocations.color, 3, gl.FLOAT, false, 0, 0);
-
-    gl.bindBuffer(gl.ARRAY_BUFFER, centroidAlphaBuffer);
-    gl.enableVertexAttribArray(centroidAttribLocations.alpha);
-    gl.vertexAttribPointer(centroidAttribLocations.alpha, 1, gl.FLOAT, false, 0, 0);
+    gl.vertexAttribPointer(centroidAttribLocations.color, 4, gl.UNSIGNED_BYTE, true, 0, 0); // RGBA uint8 normalized
 
     gl.drawArrays(gl.POINTS, 0, numPoints);
   }
@@ -1399,11 +1500,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     gl.bindBuffer(gl.ARRAY_BUFFER, projectileColorBuffer);
     gl.enableVertexAttribArray(centroidAttribLocations.color);
-    gl.vertexAttribPointer(centroidAttribLocations.color, 3, gl.FLOAT, false, 0, 0);
-
-    gl.bindBuffer(gl.ARRAY_BUFFER, projectileAlphaBuffer);
-    gl.enableVertexAttribArray(centroidAttribLocations.alpha);
-    gl.vertexAttribPointer(centroidAttribLocations.alpha, 1, gl.FLOAT, false, 0, 0);
+    gl.vertexAttribPointer(centroidAttribLocations.color, 4, gl.UNSIGNED_BYTE, true, 0, 0); // RGBA uint8 normalized
 
     gl.drawArrays(gl.POINTS, 0, count);
   }
@@ -1416,8 +1513,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     gl.uniformMatrix4fv(centroidUniformLocations.mvpMatrix, false, mvpMatrix);
     gl.uniformMatrix4fv(centroidUniformLocations.viewMatrix, false, viewMatrix);
     gl.uniformMatrix4fv(centroidUniformLocations.modelMatrix, false, modelMatrix);
-    // Impact flashes are slightly smaller than projectiles (80%)
-    gl.uniform1f(centroidUniformLocations.pointSize, basePointSize * 0.8);
+    // Impact flashes are larger for visual pop
+    gl.uniform1f(centroidUniformLocations.pointSize, basePointSize * 1.8);
     gl.uniform1f(centroidUniformLocations.sizeAttenuation, sizeAttenuation);
     gl.uniform1f(centroidUniformLocations.viewportHeight, viewportHeight);
     gl.uniform1f(centroidUniformLocations.fov, fov);
@@ -1431,11 +1528,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     gl.bindBuffer(gl.ARRAY_BUFFER, impactColorBuffer);
     gl.enableVertexAttribArray(centroidAttribLocations.color);
-    gl.vertexAttribPointer(centroidAttribLocations.color, 3, gl.FLOAT, false, 0, 0);
-
-    gl.bindBuffer(gl.ARRAY_BUFFER, impactAlphaBuffer);
-    gl.enableVertexAttribArray(centroidAttribLocations.alpha);
-    gl.vertexAttribPointer(centroidAttribLocations.alpha, 1, gl.FLOAT, false, 0, 0);
+    gl.vertexAttribPointer(centroidAttribLocations.color, 4, gl.UNSIGNED_BYTE, true, 0, 0); // RGBA uint8 normalized
 
     gl.drawArrays(gl.POINTS, 0, count);
 
@@ -1628,13 +1721,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       }
 
       // Load centroid data for this view (if snapshot has its own)
-      if (view.centroidPositions && view.centroidColors && view.centroidTransparencies) {
+      // centroidColors is now RGBA uint8 (alpha packed in)
+      if (view.centroidPositions && view.centroidColors) {
         gl.bindBuffer(gl.ARRAY_BUFFER, centroidPositionBuffer);
         gl.bufferData(gl.ARRAY_BUFFER, view.centroidPositions, gl.DYNAMIC_DRAW);
         gl.bindBuffer(gl.ARRAY_BUFFER, centroidColorBuffer);
         gl.bufferData(gl.ARRAY_BUFFER, view.centroidColors, gl.DYNAMIC_DRAW);
-        gl.bindBuffer(gl.ARRAY_BUFFER, centroidAlphaBuffer);
-        gl.bufferData(gl.ARRAY_BUFFER, view.centroidTransparencies, gl.DYNAMIC_DRAW);
       }
 
       // Render this viewport with view-specific centroid count
@@ -1904,8 +1996,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       transparencyArray = transparency;
       computePointBoundsFromPositions(positions);
 
-      // Load data into HP renderer
-      hpRenderer.loadData(positions, colors, transparency);
+      // Load data into HP renderer (alpha is packed in colors as RGBA uint8)
+      hpRenderer.loadData(positions, colors);
 
       // Rebuild edge buffer if edges exist
       if (edgeCount > 0 && edgeIndicesArray) rebuildEdgeStripBuffer();
@@ -1926,15 +2018,27 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       // Filtering should be done via transparency array
     },
 
-    setCentroids({ positions, colors, outlierQuantiles, transparency }) {
-      centroidCount = positions ? positions.length / 3 : 0;
-      gl.bindBuffer(gl.ARRAY_BUFFER, centroidPositionBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, positions || new Float32Array(), gl.STATIC_DRAW);
-      gl.bindBuffer(gl.ARRAY_BUFFER, centroidColorBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, colors || new Float32Array(), gl.STATIC_DRAW);
-      gl.bindBuffer(gl.ARRAY_BUFFER, centroidAlphaBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, transparency || new Float32Array(), gl.STATIC_DRAW);
-    },
+  setCentroids({ positions, colors, outlierQuantiles, transparency }) {
+    centroidCount = positions ? positions.length / 3 : 0;
+    gl.bindBuffer(gl.ARRAY_BUFFER, centroidPositionBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, positions || new Float32Array(), gl.STATIC_DRAW);
+
+    // Pack alpha into RGBA byte colors when transparency is provided
+    let packedColors = colors;
+    if (transparency && centroidCount > 0) {
+      const byteColors = colors && colors.length >= centroidCount * 4
+        ? new Uint8Array(colors)
+        : new Uint8Array(centroidCount * 4).fill(255);
+      const len = Math.min(centroidCount, transparency.length);
+      for (let i = 0; i < len; i++) {
+        byteColors[i * 4 + 3] = Math.max(0, Math.min(255, Math.round(transparency[i] * 255)));
+      }
+      packedColors = byteColors;
+    }
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, centroidColorBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, packedColors || new Uint8Array(), gl.STATIC_DRAW); // RGBA uint8
+  },
 
     setCentroidLabels(labels, viewId) {
       const targetId = String(viewId || focusedViewId || LIVE_VIEW_ID);
@@ -2167,8 +2271,14 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     getConnectivityLineWidth() { return connectivityLineWidth; },
     setConnectivityAlpha(alpha) { connectivityAlpha = Math.max(0.01, Math.min(1, alpha)); },
     getConnectivityAlpha() { return connectivityAlpha; },
-    setConnectivityColor(r, g, b) { connectivityColor[0] = r; connectivityColor[1] = g; connectivityColor[2] = b; },
-    getConnectivityColor() { return [connectivityColor[0], connectivityColor[1], connectivityColor[2]]; },
+    setConnectivityColor(r, g, b) {
+      const clampByte = (v) => Math.max(0, Math.min(255, Math.round(v)));
+      connectivityColorBytes[0] = clampByte(r);
+      connectivityColorBytes[1] = clampByte(g);
+      connectivityColorBytes[2] = clampByte(b);
+    },
+    // Returns byte values (0-255)
+    getConnectivityColor() { return [connectivityColorBytes[0], connectivityColorBytes[1], connectivityColorBytes[2]]; },
     hasConnectivityData() { return edgeCount > 0; },
     getEdgeCount() { return edgeCount; },
 
@@ -2209,13 +2319,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         label: config.label || `View ${snapshotViews.length + 1}`,
         fieldKey: config.fieldKey,
         fieldKind: config.fieldKind,
-        colors: config.colors ? new Float32Array(config.colors) : null,
+        colors: config.colors ? new Uint8Array(config.colors) : null, // RGBA uint8
         transparency: config.transparency ? new Float32Array(config.transparency) : null,
         outlierQuantiles: config.outlierQuantiles ? new Float32Array(config.outlierQuantiles) : null,
         centroidPositions: config.centroidPositions ? new Float32Array(config.centroidPositions) : null,
-        centroidColors: config.centroidColors ? new Float32Array(config.centroidColors) : null,
+        centroidColors: config.centroidColors ? new Uint8Array(config.centroidColors) : null, // RGBA uint8
         centroidOutliers: config.centroidOutliers ? new Float32Array(config.centroidOutliers) : null,
-        centroidTransparencies: config.centroidTransparencies ? new Float32Array(config.centroidTransparencies) : null,
         outlierThreshold: config.outlierThreshold ?? 1.0,
         meta: config.meta || {}
       };
@@ -2226,13 +2335,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     updateSnapshotAttributes(id, attrs) {
       const snap = snapshotViews.find(s => s.id === id);
       if (!snap) return false;
-      if (attrs.colors) snap.colors = new Float32Array(attrs.colors);
+      if (attrs.colors) snap.colors = new Uint8Array(attrs.colors); // RGBA uint8
       if (attrs.transparency) snap.transparency = new Float32Array(attrs.transparency);
       if (attrs.outlierQuantiles) snap.outlierQuantiles = new Float32Array(attrs.outlierQuantiles);
       if (attrs.centroidPositions) snap.centroidPositions = new Float32Array(attrs.centroidPositions);
-      if (attrs.centroidColors) snap.centroidColors = new Float32Array(attrs.centroidColors);
+      if (attrs.centroidColors) snap.centroidColors = new Uint8Array(attrs.centroidColors); // RGBA uint8
       if (attrs.centroidOutliers) snap.centroidOutliers = new Float32Array(attrs.centroidOutliers);
-      if (attrs.centroidTransparencies) snap.centroidTransparencies = new Float32Array(attrs.centroidTransparencies);
       if (typeof attrs.outlierThreshold === 'number') snap.outlierThreshold = attrs.outlierThreshold;
       if (attrs.label) snap.label = attrs.label;
       if (attrs.meta) snap.meta = { ...snap.meta, ...attrs.meta };
@@ -2335,6 +2443,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     setShaderQuality(quality) { hpRenderer.setQuality(quality); },
     setFrustumCulling(enabled) { hpRenderer.setFrustumCulling(enabled); },
     setAdaptiveLOD(enabled) { hpRenderer.setAdaptiveLOD(enabled); },
+    setForceLOD(level) { hpRenderer.setForceLOD(level); },
     getRendererStats() { return hpRenderer.getStats(); },
 
     start() {

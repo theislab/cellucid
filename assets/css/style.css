@@ -1062,18 +1062,11 @@ html, body {
   margin-top: 2px;
 }
 
-/* Background renderer hint text */
+/* Background renderer status text */
 #stats {
   font-size: 11px;
   opacity: 0.8;
   margin-top: 4px;
-  display: none;
-}
-
-#hint {
-  font-size: 11px;
-  opacity: 0.85;
-  margin-top: 2px;
   display: none;
 }
 
@@ -1236,4 +1229,38 @@ html, body {
 #benchmark-stats {
   background: #f8f9fa;
   border: 1px solid #e5e7eb;
+}
+
+#benchmark-report-btn {
+  background: linear-gradient(135deg, #111827 0%, #1f2937 100%);
+  color: #fff;
+  border: none;
+  font-weight: 600;
+}
+
+#benchmark-report-btn:hover {
+  background: linear-gradient(135deg, #0b1220 0%, #111827 100%);
+  box-shadow: 0 2px 8px rgba(17, 24, 39, 0.3);
+}
+
+#benchmark-report-output {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  min-height: 140px;
+  margin-top: 6px;
+  font-family: "Fira Code", monospace;
+  font-size: 11px;
+  padding: 8px;
+  border: 1px solid #d4d4d4;
+  border-radius: 4px;
+  background: #ffffff;
+  box-shadow: 1px 1px 0 rgba(0, 0, 0, 0.08);
+  resize: vertical;
+}
+
+#benchmark-report-status {
+  font-size: 10px;
+  color: #374151;
 }

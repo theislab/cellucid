@@ -21,10 +21,9 @@
 export const HP_VS_FULL = `#version 300 es
 precision highp float;
 
-// Interleaved vertex data: pos.xyz + color.rgb + alpha
+// Interleaved vertex data: pos.xyz (float32) + color.rgba (uint8 normalized)
 layout(location = 0) in vec3 a_position;
-layout(location = 1) in vec3 a_color;
-layout(location = 2) in float a_alpha;
+layout(location = 1) in vec4 a_color; // RGBA packed, auto-normalized by WebGL
 
 uniform mat4 u_mvpMatrix;
 uniform mat4 u_viewMatrix;
@@ -54,12 +53,12 @@ void main() {
   gl_PointSize = clamp(gl_PointSize, 0.5, 128.0);
 
   // Early discard for invisible points
-  if (a_alpha < 0.01) {
+  if (a_color.a < 0.01) {
     gl_PointSize = 0.0;
   }
 
-  v_color = a_color;
-  v_alpha = a_alpha;
+  v_color = a_color.rgb;
+  v_alpha = a_color.a;
 }
 `;
 
@@ -122,8 +121,7 @@ export const HP_VS_LIGHT = `#version 300 es
 precision highp float;
 
 layout(location = 0) in vec3 a_position;
-layout(location = 1) in vec3 a_color;
-layout(location = 2) in float a_alpha;
+layout(location = 1) in vec4 a_color; // RGBA packed, auto-normalized by WebGL
 
 uniform mat4 u_mvpMatrix;
 uniform float u_pointSize;
@@ -135,10 +133,10 @@ void main() {
   gl_Position = u_mvpMatrix * vec4(a_position, 1.0);
   gl_PointSize = u_pointSize;
 
-  if (a_alpha < 0.01) gl_PointSize = 0.0;
+  if (a_color.a < 0.01) gl_PointSize = 0.0;
 
-  v_color = a_color;
-  v_alpha = a_alpha;
+  v_color = a_color.rgb;
+  v_alpha = a_color.a;
 }
 `;
 
@@ -187,9 +185,8 @@ export const HP_VS_LOD = `#version 300 es
 precision highp float;
 
 layout(location = 0) in vec3 a_position;
-layout(location = 1) in vec3 a_color;
-layout(location = 2) in float a_alpha;
-layout(location = 3) in float a_lodSize;
+layout(location = 1) in vec4 a_color; // RGBA packed, auto-normalized by WebGL
+layout(location = 2) in float a_lodSize;
 
 uniform mat4 u_mvpMatrix;
 uniform mat4 u_viewMatrix;
@@ -215,13 +212,14 @@ void main() {
   float perspectiveSize = (worldSize * projectionFactor) / max(eyeDepth, 0.001);
   gl_PointSize = clamp(perspectiveSize, 1.0, 256.0);
 
-  v_color = a_color;
-  v_alpha = a_alpha;
+  v_color = a_color.rgb;
+  v_alpha = a_color.a;
 }
 `;
 
 /**
  * Instanced rendering vertex shader - for rendering many identical point sprites
+ * Uses RGBA uint8 packed color (auto-normalized by WebGL)
  */
 export const HP_VS_INSTANCED = `#version 300 es
 precision highp float;
@@ -231,8 +229,7 @@ layout(location = 0) in vec2 a_quadPos;
 
 // Per-instance attributes
 layout(location = 1) in vec3 a_instancePos;
-layout(location = 2) in vec3 a_instanceColor;
-layout(location = 3) in float a_instanceAlpha;
+layout(location = 2) in vec4 a_instanceColor; // RGBA packed as uint8, auto-normalized
 
 uniform mat4 u_mvpMatrix;
 uniform mat4 u_viewMatrix;
@@ -256,8 +253,8 @@ void main() {
 
   gl_Position = clipPos;
   v_quadCoord = a_quadPos;
-  v_color = a_instanceColor;
-  v_alpha = a_instanceAlpha;
+  v_color = a_instanceColor.rgb;
+  v_alpha = a_instanceColor.a;
 }
 `;
 
@@ -292,8 +289,7 @@ precision highp float;
 layout(location = 0) in float a_pointIndex;
 
 uniform sampler2D u_positionTex;
-uniform sampler2D u_colorTex;
-uniform sampler2D u_alphaTex;
+uniform sampler2D u_colorTex; // Now stores RGBA
 uniform int u_texWidth;
 uniform mat4 u_mvpMatrix;
 uniform float u_pointSize;
@@ -311,15 +307,14 @@ vec4 fetchFromTexture(sampler2D tex, float index, int width) {
 void main() {
   vec4 pos = fetchFromTexture(u_positionTex, a_pointIndex, u_texWidth);
   vec4 col = fetchFromTexture(u_colorTex, a_pointIndex, u_texWidth);
-  vec4 alpha = fetchFromTexture(u_alphaTex, a_pointIndex, u_texWidth);
 
   gl_Position = u_mvpMatrix * vec4(pos.xyz, 1.0);
   gl_PointSize = u_pointSize;
 
-  if (alpha.r < 0.01) gl_PointSize = 0.0;
+  if (col.a < 0.01) gl_PointSize = 0.0;
 
   v_color = col.rgb;
-  v_alpha = alpha.r;
+  v_alpha = col.a;
 }
 `;
 

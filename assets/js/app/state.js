@@ -2,7 +2,7 @@
 import {
   normalizePositions,
   applyNormalizationToCentroids
-} from './gl-utils.js';
+} from '../rendering/gl-utils.js';
 import {
   rgbToCss,
   COLOR_PICKER_PALETTE,
@@ -11,9 +11,10 @@ import {
   getColormap,
   getCssStopsForColormap,
   sampleContinuousColormap
-} from './palettes.js';
+} from '../data/palettes.js';
 
-const NEUTRAL_GRAY = 211 / 255; // lightgray default when no field is selected
+const NEUTRAL_GRAY_UINT8 = 211; // lightgray default when no field is selected (0-255)
+const NEUTRAL_GRAY = NEUTRAL_GRAY_UINT8 / 255; // normalized for legacy compatibility
 const NEUTRAL_RGB = [NEUTRAL_GRAY, NEUTRAL_GRAY, NEUTRAL_GRAY];
 
 export function createDataState({ viewer, labelLayer }) {
@@ -41,10 +42,9 @@ class DataState {
 
     this.centroidCount = 0;
     this.centroidPositions = null;
-    this.centroidColors = null;
+    this.centroidColors = null; // RGBA uint8 (alpha packed in)
     this.centroidLabels = [];
     this.centroidOutliers = null;
-    this.centroidTransparencies = null;
 
     this._visibilityChangeCallback = null; // called when filters / visibility change
     this._visibilityChangeCallbacks = new Set();
@@ -117,13 +117,18 @@ class DataState {
       if (!arr) return null;
       return cloneArrays ? new Float32Array(arr) : arr;
     };
-    ctx.colorsArray = wrap(this.colorsArray);
+    // colorsArray is now Uint8Array
+    ctx.colorsArray = this.colorsArray
+      ? (cloneArrays ? new Uint8Array(this.colorsArray) : this.colorsArray)
+      : null;
     ctx.categoryTransparency = wrap(this.categoryTransparency);
     ctx.outlierQuantilesArray = wrap(this.outlierQuantilesArray);
     ctx.centroidPositions = wrap(this.centroidPositions);
-    ctx.centroidColors = wrap(this.centroidColors);
+    // centroidColors is Uint8Array RGBA (alpha packed in)
+    ctx.centroidColors = this.centroidColors
+      ? (cloneArrays ? new Uint8Array(this.centroidColors) : this.centroidColors)
+      : null;
     ctx.centroidOutliers = wrap(this.centroidOutliers);
-    ctx.centroidTransparencies = wrap(this.centroidTransparencies);
     ctx.centroidLabels = this.centroidLabels ? [...this.centroidLabels] : [];
     ctx.filteredCount = this.filteredCount
       ? { ...this.filteredCount }
@@ -143,9 +148,8 @@ class DataState {
     ctx.categoryTransparency = this.categoryTransparency;
     ctx.outlierQuantilesArray = this.outlierQuantilesArray;
     ctx.centroidPositions = this.centroidPositions;
-    ctx.centroidColors = this.centroidColors;
+    ctx.centroidColors = this.centroidColors; // RGBA uint8
     ctx.centroidOutliers = this.centroidOutliers;
-    ctx.centroidTransparencies = this.centroidTransparencies;
     ctx.centroidLabels = this.centroidLabels;
     ctx.filteredCount = this.filteredCount;
   }
@@ -214,9 +218,8 @@ class DataState {
     this.categoryTransparency = ctx.categoryTransparency;
     this.outlierQuantilesArray = ctx.outlierQuantilesArray;
     this.centroidPositions = ctx.centroidPositions;
-    this.centroidColors = ctx.centroidColors;
+    this.centroidColors = ctx.centroidColors; // RGBA uint8
     this.centroidOutliers = ctx.centroidOutliers;
-    this.centroidTransparencies = ctx.centroidTransparencies;
     this.centroidLabels = ctx.centroidLabels || [];
     this.filteredCount = ctx.filteredCount || { shown: this.pointCount, total: this.pointCount };
     this._rebuildLabelLayerFromCentroids();
@@ -279,6 +282,8 @@ class DataState {
   }
 
   _pushTransparencyToViewer() {
+    // Alpha is now packed in colorsArray, so push colors when transparency changes
+    this._pushColorsToViewer();
     if (this._isLiveView()) {
       this.viewer.updateTransparency(this.categoryTransparency);
     } else if (typeof this.viewer.updateSnapshotAttributes === 'function') {
@@ -298,17 +303,15 @@ class DataState {
     if (this._isLiveView()) {
       this.viewer.setCentroids({
         positions: this.centroidPositions || new Float32Array(),
-        colors: this.centroidColors || new Float32Array(),
-        outlierQuantiles: this.centroidOutliers || new Float32Array(),
-        transparency: this.centroidTransparencies || new Float32Array()
+        colors: this.centroidColors || new Uint8Array(), // RGBA uint8 (alpha packed in)
+        outlierQuantiles: this.centroidOutliers || new Float32Array()
       });
       this.viewer.setCentroidLabels(this.centroidLabels, this.activeViewId);
     } else if (typeof this.viewer.updateSnapshotAttributes === 'function') {
       this.viewer.updateSnapshotAttributes(this.activeViewId, {
         centroidPositions: this.centroidPositions || new Float32Array(),
-        centroidColors: this.centroidColors || new Float32Array(),
-        centroidOutliers: this.centroidOutliers || new Float32Array(),
-        centroidTransparencies: this.centroidTransparencies || new Float32Array()
+        centroidColors: this.centroidColors || new Uint8Array(), // RGBA uint8 (alpha packed in)
+        centroidOutliers: this.centroidOutliers || new Float32Array()
       });
       if (typeof this.viewer.setCentroidLabels === 'function') {
         this.viewer.setCentroidLabels(this.centroidLabels, this.activeViewId);
@@ -374,8 +377,15 @@ class DataState {
 
     this.pointCount = positions.length / 3;
 
-    this.colorsArray = new Float32Array(this.pointCount * 3);
-    this.colorsArray.fill(NEUTRAL_GRAY);
+    this.colorsArray = new Uint8Array(this.pointCount * 4); // RGBA packed as uint8
+    // Fill with neutral gray (RGB) and full alpha
+    for (let i = 0; i < this.pointCount; i++) {
+      const idx = i * 4;
+      this.colorsArray[idx] = NEUTRAL_GRAY_UINT8;
+      this.colorsArray[idx + 1] = NEUTRAL_GRAY_UINT8;
+      this.colorsArray[idx + 2] = NEUTRAL_GRAY_UINT8;
+      this.colorsArray[idx + 3] = 255; // full alpha
+    }
     this.outlierQuantilesArray = new Float32Array(this.pointCount);
     this.outlierQuantilesArray.fill(-1.0);
     this.categoryTransparency = new Float32Array(this.pointCount);
@@ -392,7 +402,7 @@ class DataState {
     this.clearCentroids();
     this.viewer.setCentroids({
       positions: new Float32Array(),
-      colors: new Float32Array(),
+      colors: new Uint8Array(), // RGBA uint8 (matches centroid attribute format)
       outlierQuantiles: new Float32Array(),
       transparency: new Float32Array()
     });
@@ -995,7 +1005,7 @@ class DataState {
 
   _applyCategoryCountsToCentroids(field, counts) {
     if (!field || field.kind !== 'category') return false;
-    if (!field.centroids || !this.centroidTransparencies) return false;
+    if (!field.centroids || !this.centroidColors) return false;
     const categories = field.categories || [];
     const visibleCounts = counts?.visible || [];
     const catIndexByName = new Map();
@@ -1005,13 +1015,14 @@ class DataState {
       const c = field.centroids[i];
       const idx = catIndexByName.get(String(c.category));
       const count = idx != null ? (visibleCounts[idx] || 0) : 0;
-      const alpha = count > 0 ? 1.0 : 0.0;
-      if (this.centroidTransparencies[i] !== alpha) {
-        this.centroidTransparencies[i] = alpha;
+      const alpha = count > 0 ? 255 : 0; // uint8 alpha
+      const alphaIdx = i * 4 + 3; // alpha is 4th component in RGBA
+      if (this.centroidColors[alphaIdx] !== alpha) {
+        this.centroidColors[alphaIdx] = alpha;
         changed = true;
       }
       if (this.centroidLabels[i]) {
-        this.centroidLabels[i].alpha = alpha;
+        this.centroidLabels[i].alpha = alpha / 255; // keep float for label logic
       }
       if (this.centroidLabels[i]?.el) {
         const shouldShow = alpha > 0;
@@ -1212,7 +1223,7 @@ class DataState {
       const v = values[i];
       let r, g, b;
       if (v === null || Number.isNaN(v) || (useLog && v <= 0)) {
-        r = NEUTRAL_RGB[0]; g = NEUTRAL_RGB[1]; b = NEUTRAL_RGB[2];
+        r = NEUTRAL_GRAY_UINT8; g = NEUTRAL_GRAY_UINT8; b = NEUTRAL_GRAY_UINT8;
       } else {
         let t;
         if (useLog) {
@@ -1221,12 +1232,26 @@ class DataState {
           t = (v - domainMin) / range;
         }
         const c = sampleContinuousColormap(colormap.id, t);
-        r = c[0]; g = c[1]; b = c[2];
+        // Convert from 0-1 float to 0-255 uint8
+        r = Math.round(c[0] * 255);
+        g = Math.round(c[1] * 255);
+        b = Math.round(c[2] * 255);
       }
-      const j = 3 * i;
+      const j = i * 4;
       this.colorsArray[j] = r;
       this.colorsArray[j + 1] = g;
       this.colorsArray[j + 2] = b;
+      // Alpha will be synced from categoryTransparency in syncColorsAlpha
+    }
+    this._syncColorsAlpha();
+  }
+
+  // Sync alpha from categoryTransparency to packed RGBA colorsArray
+  _syncColorsAlpha() {
+    const n = this.pointCount;
+    const alpha = this.categoryTransparency;
+    for (let i = 0; i < n; i++) {
+      this.colorsArray[i * 4 + 3] = Math.round((alpha[i] ?? 1.0) * 255);
     }
   }
 
@@ -1273,23 +1298,27 @@ class DataState {
       const code = codes[i];
       let r, g, b, alpha;
       if (code == null || code < 0 || code >= numCats) {
-        r = NEUTRAL_RGB[0]; g = NEUTRAL_RGB[1]; b = NEUTRAL_RGB[2];
+        r = NEUTRAL_GRAY_UINT8; g = NEUTRAL_GRAY_UINT8; b = NEUTRAL_GRAY_UINT8;
         alpha = 1.0;
       } else {
         const isVisible = catVisible[code] !== false;
         const c = catColors[code] || getCategoryColor(code) || [0.5, 0.5, 0.5];
         if (!isVisible) {
-          r = g = b = 0.5;
+          r = g = b = 128; // gray in uint8
           alpha = 0.0;
         } else {
-          r = c[0]; g = c[1]; b = c[2];
+          // Convert from 0-1 float to 0-255 uint8
+          r = Math.round(c[0] * 255);
+          g = Math.round(c[1] * 255);
+          b = Math.round(c[2] * 255);
           alpha = 1.0;
         }
       }
-      const j = 3 * i;
+      const j = i * 4;
       this.colorsArray[j] = r;
       this.colorsArray[j + 1] = g;
       this.colorsArray[j + 2] = b;
+      this.colorsArray[j + 3] = Math.round(alpha * 255);
       this.categoryTransparency[i] = alpha;
     }
     this._pushTransparencyToViewer();
@@ -1299,9 +1328,8 @@ class DataState {
   clearCentroids() {
     this.centroidCount = 0;
     this.centroidPositions = null;
-    this.centroidColors = null;
+    this.centroidColors = null; // RGBA uint8
     this.centroidOutliers = null;
-    this.centroidTransparencies = null;
     this.centroidLabels = [];
     this._removeLabelsForView(this.activeViewId);
     if (this.viewer && typeof this.viewer.setCentroidLabels === 'function') {
@@ -1321,11 +1349,9 @@ class DataState {
     const allowLabels = true;
 
     this.centroidPositions = new Float32Array(this.centroidCount * 3);
-    this.centroidColors = new Float32Array(this.centroidCount * 3);
+    this.centroidColors = new Uint8Array(this.centroidCount * 4); // RGBA uint8
     this.centroidOutliers = new Float32Array(this.centroidCount);
     this.centroidOutliers.fill(-1.0);
-    this.centroidTransparencies = new Float32Array(this.centroidCount);
-    this.centroidTransparencies.fill(1.0);
 
     this.centroidLabels = [];
     if (allowLabels && this.labelLayer) this._removeLabelsForView(viewKey);
@@ -1353,9 +1379,12 @@ class DataState {
         const fallback = getCategoryColor(idx) || [0, 0, 0];
         color = catColors[idx] || fallback;
       }
-      this.centroidColors[3 * i] = color[0];
-      this.centroidColors[3 * i + 1] = color[1];
-      this.centroidColors[3 * i + 2] = color[2];
+      // Convert float 0-1 to uint8 0-255, RGBA format
+      const colBase = i * 4;
+      this.centroidColors[colBase] = Math.round(color[0] * 255);
+      this.centroidColors[colBase + 1] = Math.round(color[1] * 255);
+      this.centroidColors[colBase + 2] = Math.round(color[2] * 255);
+      this.centroidColors[colBase + 3] = 255; // full alpha
 
       if (allowLabels && this.labelLayer) {
         const el = document.createElement('div');
@@ -1587,6 +1616,7 @@ class DataState {
       }
       this.categoryTransparency[i] = visible ? 1.0 : 0.0;
     }
+    this._syncColorsAlpha();
     const centroidsChanged = this._updateActiveCategoryCounts();
     this._pushTransparencyToViewer();
     if (centroidsChanged) this._pushCentroidsToViewer();
@@ -1805,22 +1835,26 @@ class DataState {
       const code = codes[i];
       let r, g, b;
       if (code == null || code < 0 || code >= numCats) {
-        r = NEUTRAL_RGB[0]; g = NEUTRAL_RGB[1]; b = NEUTRAL_RGB[2];
+        r = NEUTRAL_GRAY_UINT8; g = NEUTRAL_GRAY_UINT8; b = NEUTRAL_GRAY_UINT8;
       } else {
         const isVisible = catVisible[code] !== false;
         const c = catColors[code] || getCategoryColor(code) || [0.5, 0.5, 0.5];
         if (!isVisible) {
           // Gray out hidden categories (visual indicator), but don't set transparency here
-          r = g = b = 0.5;
+          r = g = b = 128; // gray in uint8
         } else {
-          r = c[0]; g = c[1]; b = c[2];
+          // Convert from 0-1 float to 0-255 uint8
+          r = Math.round(c[0] * 255);
+          g = Math.round(c[1] * 255);
+          b = Math.round(c[2] * 255);
         }
       }
-      const j = 3 * i;
+      const j = i * 4;
       this.colorsArray[j] = r;
       this.colorsArray[j + 1] = g;
       this.colorsArray[j + 2] = b;
     }
+    this._syncColorsAlpha();
     this._pushColorsToViewer();
     // Let computeGlobalVisibility handle transparency/filtering
     this.computeGlobalVisibility();
@@ -1888,7 +1922,16 @@ class DataState {
     this.activeFieldIndex = -1;
     this.activeVarFieldIndex = -1;
     this.activeFieldSource = null;
-    if (this.colorsArray) this.colorsArray.fill(NEUTRAL_GRAY);
+    if (this.colorsArray) {
+      // Fill with neutral gray (RGB) and full alpha
+      for (let i = 0; i < this.pointCount; i++) {
+        const idx = i * 4;
+        this.colorsArray[idx] = NEUTRAL_GRAY_UINT8;
+        this.colorsArray[idx + 1] = NEUTRAL_GRAY_UINT8;
+        this.colorsArray[idx + 2] = NEUTRAL_GRAY_UINT8;
+        this.colorsArray[idx + 3] = 255;
+      }
+    }
     if (!this.categoryTransparency || this.categoryTransparency.length !== this.pointCount) {
       this.categoryTransparency = new Float32Array(this.pointCount);
     }
@@ -1926,7 +1969,7 @@ class DataState {
       label,
       fieldKey,
       fieldKind,
-      colors: this.colorsArray ? new Float32Array(this.colorsArray) : null,
+      colors: this.colorsArray ? new Uint8Array(this.colorsArray) : null,
       transparency: this.categoryTransparency
         ? new Float32Array(this.categoryTransparency)
         : null,
@@ -1937,13 +1980,10 @@ class DataState {
         ? new Float32Array(this.centroidPositions)
         : null,
       centroidColors: this.centroidColors
-        ? new Float32Array(this.centroidColors)
+        ? new Uint8Array(this.centroidColors) // RGBA uint8
         : null,
       centroidOutliers: this.centroidOutliers
         ? new Float32Array(this.centroidOutliers)
-        : null,
-      centroidTransparencies: this.centroidTransparencies
-        ? new Float32Array(this.centroidTransparencies)
         : null,
       outlierThreshold: this.getCurrentOutlierThreshold(),
       filtersText
