@@ -167,9 +167,150 @@ export async function loadPointsBinary(url) {
   return new Float32Array(arrayBuffer);
 }
 
+/**
+ * Convert filename to safe version (must match Python _safe_filename_component)
+ */
+function safeFilenameComponent(name) {
+  let safe = String(name).replace(/[^A-Za-z0-9._-]+/g, '_');
+  safe = safe.replace(/^[._]+|[._]+$/g, '');
+  return safe || 'field';
+}
+
+/**
+ * Expand compact var manifest to original verbose format.
+ * Compact format uses _varSchema + field tuples [key, minValue, maxValue].
+ */
+function expandVarManifest(manifest) {
+  if (manifest._format !== 'compact_v1' || !manifest._varSchema) {
+    return manifest; // Already in original format
+  }
+
+  const schema = manifest._varSchema;
+  const fields = [];
+
+  for (const fieldTuple of (manifest.fields || [])) {
+    const key = fieldTuple[0];
+    const safeKey = safeFilenameComponent(key);
+
+    const field = {
+      key: key,
+      kind: schema.kind,
+      valuesPath: schema.pathPattern.replace('{key}', safeKey),
+      valuesDtype: schema.dtype,
+    };
+
+    if (schema.quantized) {
+      field.quantized = true;
+      field.quantizationBits = schema.quantizationBits;
+      field.minValue = fieldTuple[1];
+      field.maxValue = fieldTuple[2];
+    }
+
+    fields.push(field);
+  }
+
+  // Return expanded manifest without underscore-prefixed keys
+  const result = {};
+  for (const [k, v] of Object.entries(manifest)) {
+    if (!k.startsWith('_')) {
+      result[k] = v;
+    }
+  }
+  result.fields = fields;
+  return result;
+}
+
+/**
+ * Expand compact obs manifest to original verbose format.
+ * Compact format uses _obsSchemas + _continuousFields + _categoricalFields.
+ */
+function expandObsManifest(manifest) {
+  if (manifest._format !== 'compact_v1' || !manifest._obsSchemas) {
+    return manifest; // Already in original format
+  }
+
+  const schemas = manifest._obsSchemas;
+  const fields = [];
+
+  // Expand continuous fields
+  const contSchema = schemas.continuous;
+  if (contSchema) {
+    for (const fieldTuple of (manifest._continuousFields || [])) {
+      const key = fieldTuple[0];
+      const safeKey = safeFilenameComponent(key);
+
+      const field = {
+        key: key,
+        kind: 'continuous',
+        valuesPath: contSchema.pathPattern.replace('{key}', safeKey),
+        valuesDtype: contSchema.dtype,
+        centroids: null,
+        outlierQuantilesPath: null,
+      };
+
+      if (contSchema.quantized) {
+        field.quantized = true;
+        field.quantizationBits = contSchema.quantizationBits;
+        field.minValue = fieldTuple[1];
+        field.maxValue = fieldTuple[2];
+      }
+
+      fields.push(field);
+    }
+  }
+
+  // Expand categorical fields
+  const catSchema = schemas.categorical;
+  if (catSchema) {
+    for (const fieldTuple of (manifest._categoricalFields || [])) {
+      // [key, categories, codesDtype, codesMissingValue, centroids, outlierMin?, outlierMax?]
+      const key = fieldTuple[0];
+      const safeKey = safeFilenameComponent(key);
+      const categories = fieldTuple[1];
+      const codesDtype = fieldTuple[2];
+      const codesMissingValue = fieldTuple[3];
+      const centroids = fieldTuple[4];
+
+      // Determine codes extension from dtype
+      const codesExt = codesDtype === 'uint8' ? 'u8' : 'u16';
+
+      const field = {
+        key: key,
+        kind: 'category',
+        categories: categories,
+        codesPath: catSchema.codesPathPattern.replace('{key}', safeKey).replace('{ext}', codesExt),
+        codesDtype: codesDtype,
+        codesMissingValue: codesMissingValue,
+        outlierQuantilesPath: catSchema.outlierPathPattern.replace('{key}', safeKey),
+        outlierDtype: catSchema.outlierDtype,
+        centroids: centroids,
+      };
+
+      if (catSchema.outlierQuantized) {
+        field.outlierQuantized = true;
+        field.outlierMinValue = fieldTuple[5];
+        field.outlierMaxValue = fieldTuple[6];
+      }
+
+      fields.push(field);
+    }
+  }
+
+  // Return expanded manifest without underscore-prefixed keys
+  const result = {};
+  for (const [k, v] of Object.entries(manifest)) {
+    if (!k.startsWith('_')) {
+      result[k] = v;
+    }
+  }
+  result.fields = fields;
+  return result;
+}
+
 export async function loadObsManifest(url) {
   const response = await fetchOk(url);
-  return response.json();
+  const manifest = await response.json();
+  return expandObsManifest(manifest);
 }
 
 /**
@@ -251,7 +392,8 @@ export async function loadObsFieldData(manifestUrl, field) {
 // Var/gene expression manifest loader
 export async function loadVarManifest(url) {
   const response = await fetchOk(url);
-  return response.json();
+  const manifest = await response.json();
+  return expandVarManifest(manifest);
 }
 
 /**
