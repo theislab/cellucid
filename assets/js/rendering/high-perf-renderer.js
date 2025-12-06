@@ -1780,6 +1780,64 @@ export class HighPerfRenderer {
     return this.lodBuffers.length;
   }
 
+  /**
+   * Get the current LOD level being rendered (-1 = full detail)
+   */
+  getCurrentLODLevel() {
+    return this.stats.lodLevel;
+  }
+
+  /**
+   * Get visibility array for current LOD level.
+   * Returns Float32Array where 1.0 = visible at current LOD, 0.0 = hidden by LOD.
+   * When LOD is disabled or at full detail, returns null (meaning all visible).
+   *
+   * Performance: Reuses cached array, only rebuilds when LOD level changes.
+   */
+  getLodVisibilityArray() {
+    const n = this.pointCount;
+    if (n === 0) return null;
+
+    // If no octree or LOD disabled, all points visible - return null to signal "all visible"
+    if (!this.octree || !this.useAdaptiveLOD || this.stats.lodLevel < 0) {
+      return null;
+    }
+
+    const lodLevel = this.stats.lodLevel;
+    const lodBuffer = this.lodBuffers[lodLevel];
+
+    // Full detail level - all visible
+    if (!lodBuffer || lodBuffer.isFullDetail) {
+      return null;
+    }
+
+    // Return cached array if LOD level hasn't changed
+    if (this._cachedLodVisibility && this._cachedLodVisibilityLevel === lodLevel) {
+      return this._cachedLodVisibility;
+    }
+
+    // Get the LOD level's indices (which original points are included)
+    const level = this.octree.lodLevels[lodLevel];
+    if (!level || !level.indices) {
+      return null;
+    }
+
+    // Reuse or create visibility array
+    if (!this._cachedLodVisibility || this._cachedLodVisibility.length !== n) {
+      this._cachedLodVisibility = new Float32Array(n);
+    }
+
+    // Clear and mark only the points in this LOD level as visible
+    this._cachedLodVisibility.fill(0);
+    const indices = level.indices;
+    for (let i = 0, len = indices.length; i < len; i++) {
+      this._cachedLodVisibility[indices[i]] = 1.0;
+    }
+
+    this._cachedLodVisibilityLevel = lodLevel;
+    return this._cachedLodVisibility;
+  }
+
   dispose() {
     const gl = this.gl;
 

@@ -12,7 +12,7 @@ if (!HAS_DECOMPRESSION_STREAM && !HAS_PAKO) {
 /**
  * Convert ArrayBuffer to typed array based on dtype.
  * @param {ArrayBuffer} buffer - Raw binary data
- * @param {string} dtype - Data type ('float32', 'uint8', 'uint16', 'uint32')
+ * @param {string} dtype - Data type ('float32', 'uint8', 'uint16', 'uint32', 'uint64')
  * @param {string} url - URL for error messages
  * @returns {TypedArray} Appropriate typed array
  */
@@ -26,6 +26,8 @@ function typedArrayFromBuffer(buffer, dtype, url) {
       return new Uint16Array(buffer);
     case 'uint32':
       return new Uint32Array(buffer);
+    case 'uint64':
+      return new BigUint64Array(buffer);
     default:
       throw new Error(`Unsupported dtype "${dtype}" for ${url}`);
   }
@@ -289,28 +291,84 @@ export async function loadObsJson(url) {
   return response.json();
 }
 
-// Connectivity manifest loader
+// ============================================================================
+// CONNECTIVITY / EDGE DATA LOADERS
+// ============================================================================
+// GPU-optimized edge format for instanced rendering with:
+// - Direct GPU upload (no CPU processing)
+// - Instanced rendering with texture lookups
+// - Visibility filtering in shader
+// - Support for uint16, uint32, and uint64 indices
+
+/**
+ * Load connectivity manifest
+ * @param {string} url - URL to connectivity manifest JSON
+ * @returns {Promise<Object>} Connectivity manifest
+ */
 export async function loadConnectivityManifest(url) {
   const response = await fetchOk(url);
   return response.json();
 }
 
-// Load CSR indptr array (small - n_cells + 1 elements)
-export async function loadConnectivityIndptr(manifestUrl, manifest) {
-  if (!manifest || !manifest.indptrPath) {
-    throw new Error('No indptr path in connectivity manifest.');
-  }
-  const url = resolveUrl(manifestUrl, manifest.indptrPath);
-  const buffer = await fetchBinary(url);
-  return typedArrayFromBuffer(buffer, manifest.dtype || 'uint32', url);
+/**
+ * Check if manifest has valid edge format
+ * @param {Object} manifest - Connectivity manifest
+ * @returns {boolean} True if edge format is available
+ */
+export function hasEdgeFormat(manifest) {
+  return manifest && manifest.format === 'edge_pairs' && manifest.sourcesPath && manifest.destinationsPath;
 }
 
-// Load CSR indices array (larger - nnz elements)
-export async function loadConnectivityIndices(manifestUrl, manifest) {
-  if (!manifest || !manifest.indicesPath) {
-    throw new Error('No indices path in connectivity manifest.');
+/**
+ * Load edge sources array (sorted for optimal compression)
+ * @param {string} manifestUrl - Base URL for manifest
+ * @param {Object} manifest - Connectivity manifest
+ * @returns {Promise<Uint16Array|Uint32Array|BigUint64Array>} Edge source indices
+ */
+export async function loadEdgeSources(manifestUrl, manifest) {
+  if (!hasEdgeFormat(manifest)) {
+    throw new Error('Invalid connectivity manifest: missing edge format.');
   }
-  const url = resolveUrl(manifestUrl, manifest.indicesPath);
+  const url = resolveUrl(manifestUrl, manifest.sourcesPath);
   const buffer = await fetchBinary(url);
-  return typedArrayFromBuffer(buffer, manifest.dtype || 'uint32', url);
+  return typedArrayFromBuffer(buffer, manifest.index_dtype, url);
+}
+
+/**
+ * Load edge destinations array (sorted for optimal compression)
+ * @param {string} manifestUrl - Base URL for manifest
+ * @param {Object} manifest - Connectivity manifest
+ * @returns {Promise<Uint16Array|Uint32Array|BigUint64Array>} Edge destination indices
+ */
+export async function loadEdgeDestinations(manifestUrl, manifest) {
+  if (!hasEdgeFormat(manifest)) {
+    throw new Error('Invalid connectivity manifest: missing edge format.');
+  }
+  const url = resolveUrl(manifestUrl, manifest.destinationsPath);
+  const buffer = await fetchBinary(url);
+  return typedArrayFromBuffer(buffer, manifest.index_dtype, url);
+}
+
+/**
+ * Load both edge arrays in parallel
+ * @param {string} manifestUrl - Base URL for manifest
+ * @param {Object} manifest - Connectivity manifest
+ * @returns {Promise<{sources: TypedArray, destinations: TypedArray, nEdges: number, nCells: number, maxNeighbors: number, indexDtype: string}>}
+ */
+export async function loadEdges(manifestUrl, manifest) {
+  if (!hasEdgeFormat(manifest)) {
+    throw new Error('Invalid connectivity manifest: missing edge format.');
+  }
+  const [sources, destinations] = await Promise.all([
+    loadEdgeSources(manifestUrl, manifest),
+    loadEdgeDestinations(manifestUrl, manifest)
+  ]);
+  return {
+    sources,
+    destinations,
+    nEdges: manifest.n_edges,
+    nCells: manifest.n_cells,
+    maxNeighbors: manifest.max_neighbors,
+    indexDtype: manifest.index_dtype
+  };
 }

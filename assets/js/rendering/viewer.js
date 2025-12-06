@@ -5,7 +5,7 @@
  * Keeps smoke, grid, and line rendering.
  */
 
-import { LINE_VS_SOURCE, LINE_FS_SOURCE, GRID_VS_SOURCE, GRID_FS_SOURCE } from './shaders.js';
+import { GRID_VS_SOURCE, GRID_FS_SOURCE, LINE_INSTANCED_VS_SOURCE, LINE_INSTANCED_FS_SOURCE } from './shaders.js';
 import { createProgram, resizeCanvasToDisplaySize } from './gl-utils.js';
 import { SMOKE_VS_SOURCE, SMOKE_FS_SOURCE, SMOKE_COMPOSITE_VS, SMOKE_COMPOSITE_FS } from './smoke-shaders.js';
 import { createDensityTexture3D, buildDensityVolumeGPU } from './smoke-density.js';
@@ -153,25 +153,29 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     intensity:         gl.getUniformLocation(compositeProgram, 'u_intensity'),
   };
 
-  // === LINE PROGRAM ===
-  const lineProgram = createProgram(gl, LINE_VS_SOURCE, LINE_FS_SOURCE);
-  const lineAttribLocations = {
-    position: gl.getAttribLocation(lineProgram, 'a_position'),
-    otherPosition: gl.getAttribLocation(lineProgram, 'a_otherPosition'),
-    side: gl.getAttribLocation(lineProgram, 'a_side'),
+  // === INSTANCED LINE PROGRAM (V2 - GPU-optimized) ===
+  const lineInstancedProgram = createProgram(gl, LINE_INSTANCED_VS_SOURCE, LINE_INSTANCED_FS_SOURCE);
+  const lineInstancedAttribLocations = {
+    quadPos: gl.getAttribLocation(lineInstancedProgram, 'a_quadPos'),
   };
-  const lineUniformLocations = {
-    mvpMatrix:    gl.getUniformLocation(lineProgram, 'u_mvpMatrix'),
-    viewMatrix:   gl.getUniformLocation(lineProgram, 'u_viewMatrix'),
-    modelMatrix:  gl.getUniformLocation(lineProgram, 'u_modelMatrix'),
-    lineColor:    gl.getUniformLocation(lineProgram, 'u_lineColor'),
-    lineAlpha:    gl.getUniformLocation(lineProgram, 'u_lineAlpha'),
-    lineWidth:    gl.getUniformLocation(lineProgram, 'u_lineWidth'),
-    viewportSize: gl.getUniformLocation(lineProgram, 'u_viewportSize'),
-    fogDensity:   gl.getUniformLocation(lineProgram, 'u_fogDensity'),
-    fogNearMean:  gl.getUniformLocation(lineProgram, 'u_fogNearMean'),
-    fogFarMean:   gl.getUniformLocation(lineProgram, 'u_fogFarMean'),
-    fogColor:     gl.getUniformLocation(lineProgram, 'u_fogColor'),
+  const lineInstancedUniformLocations = {
+    mvpMatrix:         gl.getUniformLocation(lineInstancedProgram, 'u_mvpMatrix'),
+    viewMatrix:        gl.getUniformLocation(lineInstancedProgram, 'u_viewMatrix'),
+    modelMatrix:       gl.getUniformLocation(lineInstancedProgram, 'u_modelMatrix'),
+    viewportSize:      gl.getUniformLocation(lineInstancedProgram, 'u_viewportSize'),
+    lineWidth:         gl.getUniformLocation(lineInstancedProgram, 'u_lineWidth'),
+    maxEdges:          gl.getUniformLocation(lineInstancedProgram, 'u_maxEdges'),
+    edgeTexture:       gl.getUniformLocation(lineInstancedProgram, 'u_edgeTexture'),
+    edgeTexDims:       gl.getUniformLocation(lineInstancedProgram, 'u_edgeTexDims'),
+    positionTexture:   gl.getUniformLocation(lineInstancedProgram, 'u_positionTexture'),
+    posTexDims:        gl.getUniformLocation(lineInstancedProgram, 'u_posTexDims'),
+    visibilityTexture: gl.getUniformLocation(lineInstancedProgram, 'u_visibilityTexture'),
+    lineColor:         gl.getUniformLocation(lineInstancedProgram, 'u_lineColor'),
+    lineAlpha:         gl.getUniformLocation(lineInstancedProgram, 'u_lineAlpha'),
+    fogDensity:        gl.getUniformLocation(lineInstancedProgram, 'u_fogDensity'),
+    fogNearMean:       gl.getUniformLocation(lineInstancedProgram, 'u_fogNearMean'),
+    fogFarMean:        gl.getUniformLocation(lineInstancedProgram, 'u_fogFarMean'),
+    fogColor:          gl.getUniformLocation(lineInstancedProgram, 'u_fogColor'),
   };
 
   // === GRID PROGRAM ===
@@ -222,8 +226,28 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   const impactPositionBuffer = gl.createBuffer();
   const impactColorBuffer = gl.createBuffer(); // RGBA uint8
 
-  // Edge buffer for connectivity lines
-  const edgeStripBuffer = gl.createBuffer();
+  // === INSTANCED EDGE RENDERING ===
+  // Quad geometry buffer for instanced edges (6 vertices, 2 triangles)
+  // Each vertex has (x, y) where x = endpoint (-1=src, +1=dst), y = side (-1=left, +1=right)
+  const edgeQuadBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, edgeQuadBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+    // Triangle 1: src-left, src-right, dst-left
+    -1, -1,  -1, 1,  1, -1,
+    // Triangle 2: src-right, dst-right, dst-left
+    -1, 1,  1, 1,  1, -1,
+  ]), gl.STATIC_DRAW);
+
+  // V2 edge textures (created on demand)
+  let edgeTextureV2 = null;
+  let positionTextureV2 = null;
+  let visibilityTextureV2 = null;
+  let edgeTexDimsV2 = [0, 0];
+  let posTexDimsV2 = [0, 0];
+  let nEdgesV2 = 0;
+  let nCellsV2 = 0;
+  let useInstancedEdges = false;  // Whether to use v2 instanced rendering
+  let edgeLodLimit = 0;  // LOD limit for number of edges to render (0 = all)
 
   // Fullscreen triangle for smoke
   const smokeQuadBuffer = gl.createBuffer();
@@ -366,17 +390,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   let frameIndex = 0;
 
   // Connectivity/Edge state
-  let edgeCount = 0;
-  let edgeStripVertexCount = 0;
-  let edgeIndicesArray = null;
   let showConnectivity = false;
   let connectivityLineWidth = 1.0;
-  let connectivityAlpha = 0.15;
+  let connectivityAlpha = 0.60;
   const connectivityColorBytes = new Uint8Array([77, 77, 77]); // ~0.3 in 0-255
   const connectivityColorVec = vec3.create(); // normalized to 0-1 on use
-  const EDGE_STRIDE_BYTES = 7 * 4;
-  const EDGE_OTHER_OFFSET = 3 * 4;
-  const EDGE_SIDE_OFFSET = 6 * 4;
 
   // Camera
   // Keep near plane tight so points do not disappear too early when orbiting in
@@ -1334,42 +1352,183 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
-  function rebuildEdgeStripBuffer() {
-    if (!edgeIndicesArray || !positionsArray) {
-      edgeStripVertexCount = 0;
+  // ============================================================================
+  // INSTANCED EDGE RENDERING - GPU-OPTIMIZED
+  // ============================================================================
+
+  /**
+   * Calculate optimal 2D texture dimensions for a given count
+   * @param {number} count - Number of elements
+   * @returns {[number, number]} - [width, height]
+   */
+  function calcTextureDims(count) {
+    if (count === 0) return [1, 1];
+    const maxSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+    const width = Math.min(Math.ceil(Math.sqrt(count)), maxSize);
+    const height = Math.ceil(count / width);
+    return [width, Math.min(height, maxSize)];
+  }
+
+  /**
+   * Create edge texture from source and destination arrays
+   * @param {Uint16Array|Uint32Array} sources - Source cell indices
+   * @param {Uint16Array|Uint32Array} destinations - Destination cell indices
+   * @param {number} nEdges - Number of edges
+   */
+  function createEdgeTextureV2(sources, destinations, nEdges) {
+    if (edgeTextureV2) {
+      gl.deleteTexture(edgeTextureV2);
+    }
+
+    edgeTexDimsV2 = calcTextureDims(nEdges);
+    const [width, height] = edgeTexDimsV2;
+    const texelCount = width * height;
+
+    // Pack edges into RG32UI texture (2 uint32 per texel)
+    const data = new Uint32Array(texelCount * 2);
+    for (let i = 0; i < nEdges; i++) {
+      data[i * 2] = sources[i];
+      data[i * 2 + 1] = destinations[i];
+    }
+
+    edgeTextureV2 = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, edgeTextureV2);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG32UI, width, height, 0, gl.RG_INTEGER, gl.UNSIGNED_INT, data);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+
+    nEdgesV2 = nEdges;
+    console.log(`[Viewer] Created edge texture V2: ${nEdges} edges, ${width}x${height} texture`);
+  }
+
+  /**
+   * Create position texture from positions array
+   * @param {Float32Array} positions - Flat array of xyz positions
+   * @param {number} nCells - Number of cells
+   */
+  function createPositionTextureV2(positions, nCells) {
+    if (positionTextureV2) {
+      gl.deleteTexture(positionTextureV2);
+    }
+
+    posTexDimsV2 = calcTextureDims(nCells);
+    const [width, height] = posTexDimsV2;
+    const texelCount = width * height;
+
+    // Pack positions into RGB32F texture
+    const data = new Float32Array(texelCount * 3);
+    for (let i = 0; i < nCells; i++) {
+      data[i * 3] = positions[i * 3];
+      data[i * 3 + 1] = positions[i * 3 + 1];
+      data[i * 3 + 2] = positions[i * 3 + 2];
+    }
+
+    positionTextureV2 = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, positionTextureV2);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB32F, width, height, 0, gl.RGB, gl.FLOAT, data);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+
+    nCellsV2 = nCells;
+    console.log(`[Viewer] Created position texture V2: ${nCells} cells, ${width}x${height} texture`);
+  }
+
+  /**
+   * Create or update visibility texture
+   * @param {Float32Array|Uint8Array} visibility - Visibility values (0-1 per cell)
+   */
+  function updateVisibilityTextureV2(visibility) {
+    const nCells = visibility.length;
+    const [width, height] = posTexDimsV2;
+
+    if (!visibilityTextureV2) {
+      visibilityTextureV2 = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, visibilityTextureV2);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    } else {
+      gl.bindTexture(gl.TEXTURE_2D, visibilityTextureV2);
+    }
+
+    // Pad to texture size
+    const texelCount = width * height;
+    const data = new Float32Array(texelCount);
+    for (let i = 0; i < nCells && i < texelCount; i++) {
+      data[i] = visibility[i];
+    }
+
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, width, height, 0, gl.RED, gl.FLOAT, data);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+  }
+
+  /**
+   * Draw connectivity using instanced rendering (V2)
+   */
+  function drawConnectivityInstanced(widthPx, heightPx) {
+    if (!showConnectivity || nEdgesV2 === 0 || !edgeTextureV2 || !positionTextureV2 || !visibilityTextureV2) {
       return;
     }
-    const numEdges = edgeIndicesArray.length / 2;
-    if (numEdges === 0) {
-      edgeStripVertexCount = 0;
-      return;
-    }
-    // 6 vertices per edge (2 triangles)
-    const data = new Float32Array(numEdges * 6 * 7);
-    let offset = 0;
-    for (let e = 0; e < numEdges; e++) {
-      const i0 = edgeIndicesArray[e * 2];
-      const i1 = edgeIndicesArray[e * 2 + 1];
-      const x0 = positionsArray[i0 * 3], y0 = positionsArray[i0 * 3 + 1], z0 = positionsArray[i0 * 3 + 2];
-      const x1 = positionsArray[i1 * 3], y1 = positionsArray[i1 * 3 + 1], z1 = positionsArray[i1 * 3 + 2];
-      // Two triangles forming a quad
-      const verts = [
-        [x0, y0, z0, x1, y1, z1, -1],
-        [x0, y0, z0, x1, y1, z1, 1],
-        [x1, y1, z1, x0, y0, z0, -1],
-        [x0, y0, z0, x1, y1, z1, 1],
-        [x1, y1, z1, x0, y0, z0, -1],
-        [x1, y1, z1, x0, y0, z0, 1],
-      ];
-      for (const v of verts) {
-        data[offset++] = v[0]; data[offset++] = v[1]; data[offset++] = v[2];
-        data[offset++] = v[3]; data[offset++] = v[4]; data[offset++] = v[5];
-        data[offset++] = v[6];
-      }
-    }
-    edgeStripVertexCount = numEdges * 6;
-    gl.bindBuffer(gl.ARRAY_BUFFER, edgeStripBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+
+    gl.useProgram(lineInstancedProgram);
+
+    // Set uniforms
+    gl.uniformMatrix4fv(lineInstancedUniformLocations.mvpMatrix, false, mvpMatrix);
+    gl.uniformMatrix4fv(lineInstancedUniformLocations.viewMatrix, false, viewMatrix);
+    gl.uniformMatrix4fv(lineInstancedUniformLocations.modelMatrix, false, modelMatrix);
+    gl.uniform2f(lineInstancedUniformLocations.viewportSize, widthPx, heightPx);
+    gl.uniform1f(lineInstancedUniformLocations.lineWidth, connectivityLineWidth);
+
+    // LOD: limit edges if set
+    const maxEdges = edgeLodLimit > 0 ? Math.min(edgeLodLimit, nEdgesV2) : nEdgesV2;
+    gl.uniform1i(lineInstancedUniformLocations.maxEdges, maxEdges);
+
+    // Texture dimensions
+    gl.uniform2i(lineInstancedUniformLocations.edgeTexDims, edgeTexDimsV2[0], edgeTexDimsV2[1]);
+    gl.uniform2i(lineInstancedUniformLocations.posTexDims, posTexDimsV2[0], posTexDimsV2[1]);
+
+    // Bind textures
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, edgeTextureV2);
+    gl.uniform1i(lineInstancedUniformLocations.edgeTexture, 0);
+
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, positionTextureV2);
+    gl.uniform1i(lineInstancedUniformLocations.positionTexture, 1);
+
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, visibilityTextureV2);
+    gl.uniform1i(lineInstancedUniformLocations.visibilityTexture, 2);
+
+    // Color and fog uniforms
+    connectivityColorVec[0] = connectivityColorBytes[0] / 255;
+    connectivityColorVec[1] = connectivityColorBytes[1] / 255;
+    connectivityColorVec[2] = connectivityColorBytes[2] / 255;
+    gl.uniform3fv(lineInstancedUniformLocations.lineColor, connectivityColorVec);
+    gl.uniform1f(lineInstancedUniformLocations.lineAlpha, connectivityAlpha);
+    gl.uniform1f(lineInstancedUniformLocations.fogDensity, fogDensity);
+    gl.uniform1f(lineInstancedUniformLocations.fogNearMean, fogNearMean);
+    gl.uniform1f(lineInstancedUniformLocations.fogFarMean, fogFarMean);
+    gl.uniform3fv(lineInstancedUniformLocations.fogColor, fogColor);
+
+    // Bind quad geometry
+    gl.bindBuffer(gl.ARRAY_BUFFER, edgeQuadBuffer);
+    gl.enableVertexAttribArray(lineInstancedAttribLocations.quadPos);
+    gl.vertexAttribPointer(lineInstancedAttribLocations.quadPos, 2, gl.FLOAT, false, 0, 0);
+
+    // Draw instanced
+    gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, nEdgesV2);
+
+    // Cleanup
+    gl.disableVertexAttribArray(lineInstancedAttribLocations.quadPos);
+    gl.activeTexture(gl.TEXTURE0);
   }
 
   function drawGrid() {
@@ -1430,31 +1589,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   }
 
   function drawConnectivityLines(widthPx, heightPx) {
-    if (!showConnectivity || edgeCount === 0 || edgeStripVertexCount === 0) return;
-    gl.useProgram(lineProgram);
-    gl.uniformMatrix4fv(lineUniformLocations.mvpMatrix, false, mvpMatrix);
-    gl.uniformMatrix4fv(lineUniformLocations.viewMatrix, false, viewMatrix);
-    gl.uniformMatrix4fv(lineUniformLocations.modelMatrix, false, modelMatrix);
-    connectivityColorVec[0] = connectivityColorBytes[0] / 255;
-    connectivityColorVec[1] = connectivityColorBytes[1] / 255;
-    connectivityColorVec[2] = connectivityColorBytes[2] / 255;
-    gl.uniform3fv(lineUniformLocations.lineColor, connectivityColorVec);
-    gl.uniform1f(lineUniformLocations.lineAlpha, connectivityAlpha);
-    gl.uniform1f(lineUniformLocations.lineWidth, connectivityLineWidth);
-    gl.uniform2f(lineUniformLocations.viewportSize, widthPx, heightPx);
-    gl.uniform1f(lineUniformLocations.fogDensity, fogDensity);
-    gl.uniform1f(lineUniformLocations.fogNearMean, fogNearMean);
-    gl.uniform1f(lineUniformLocations.fogFarMean, fogFarMean);
-    gl.uniform3fv(lineUniformLocations.fogColor, fogColor);
-
-    gl.bindBuffer(gl.ARRAY_BUFFER, edgeStripBuffer);
-    gl.enableVertexAttribArray(lineAttribLocations.position);
-    gl.vertexAttribPointer(lineAttribLocations.position, 3, gl.FLOAT, false, EDGE_STRIDE_BYTES, 0);
-    gl.enableVertexAttribArray(lineAttribLocations.otherPosition);
-    gl.vertexAttribPointer(lineAttribLocations.otherPosition, 3, gl.FLOAT, false, EDGE_STRIDE_BYTES, EDGE_OTHER_OFFSET);
-    gl.enableVertexAttribArray(lineAttribLocations.side);
-    gl.vertexAttribPointer(lineAttribLocations.side, 1, gl.FLOAT, false, EDGE_STRIDE_BYTES, EDGE_SIDE_OFFSET);
-    gl.drawArrays(gl.TRIANGLES, 0, edgeStripVertexCount);
+    drawConnectivityInstanced(widthPx, heightPx);
   }
 
   function drawCentroids(count, viewportHeight) {
@@ -1998,9 +2133,6 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
       // Load data into HP renderer (alpha is packed in colors as RGBA uint8)
       hpRenderer.loadData(positions, colors);
-
-      // Rebuild edge buffer if edges exist
-      if (edgeCount > 0 && edgeIndicesArray) rebuildEdgeStripBuffer();
     },
 
     updateColors(colors) {
@@ -2253,18 +2385,6 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       smokeTargetHeight = 0;
     },
 
-    setConnectivityEdges(edgeIndices) {
-      if (!edgeIndices || edgeIndices.length === 0) {
-        edgeCount = 0;
-        edgeStripVertexCount = 0;
-        edgeIndicesArray = null;
-        return;
-      }
-      edgeIndicesArray = edgeIndices instanceof Uint32Array ? edgeIndices : new Uint32Array(edgeIndices);
-      edgeCount = edgeIndicesArray.length / 2;
-      rebuildEdgeStripBuffer();
-    },
-
     setShowConnectivity(show) { showConnectivity = !!show; },
     getShowConnectivity() { return showConnectivity; },
     setConnectivityLineWidth(width) { connectivityLineWidth = Math.max(0.1, Math.min(10, width)); },
@@ -2279,8 +2399,98 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     },
     // Returns byte values (0-255)
     getConnectivityColor() { return [connectivityColorBytes[0], connectivityColorBytes[1], connectivityColorBytes[2]]; },
-    hasConnectivityData() { return edgeCount > 0; },
-    getEdgeCount() { return edgeCount; },
+    hasConnectivityData() { return nEdgesV2 > 0; },
+    getEdgeCount() { return nEdgesV2; },
+
+    // ========================================================================
+    // V2 GPU-INSTANCED EDGE API
+    // ========================================================================
+
+    /**
+     * Set up V2 instanced edge rendering with edge data
+     * @param {Object} edgeData - Object with sources, destinations, nEdges, nCells
+     * @param {Float32Array} positions - Cell positions (flat xyz array)
+     */
+    setupEdgesV2(edgeData, positions) {
+      const { sources, destinations, nEdges, nCells } = edgeData;
+
+      if (!sources || !destinations || nEdges === 0) {
+        console.warn('[Viewer] Invalid edge data for V2 setup');
+        return false;
+      }
+
+      // Create textures
+      createEdgeTextureV2(sources, destinations, nEdges);
+      createPositionTextureV2(positions, nCells);
+
+      // Initialize visibility to all visible
+      const visibility = new Float32Array(nCells);
+      visibility.fill(1.0);
+      updateVisibilityTextureV2(visibility);
+
+      useInstancedEdges = true;
+      edgeLodLimit = 0;  // No LOD limit by default
+
+      console.log(`[Viewer] V2 instanced edges enabled: ${nEdges} edges, ${nCells} cells`);
+      return true;
+    },
+
+    /**
+     * Update visibility texture for V2 edges
+     * @param {Float32Array|Uint8Array} visibility - Per-cell visibility (0-1)
+     */
+    updateEdgeVisibilityV2(visibility) {
+      if (!useInstancedEdges || !visibilityTextureV2) {
+        return false;
+      }
+      updateVisibilityTextureV2(visibility);
+      return true;
+    },
+
+    /**
+     * Set LOD limit for V2 edges (0 = no limit)
+     * @param {number} limit - Maximum edges to render
+     */
+    setEdgeLodLimit(limit) {
+      edgeLodLimit = Math.max(0, Math.floor(limit));
+    },
+
+    /**
+     * Get current LOD limit
+     */
+    getEdgeLodLimit() {
+      return edgeLodLimit;
+    },
+
+    /**
+     * Check if V2 instanced edges are enabled
+     */
+    isUsingInstancedEdges() {
+      return useInstancedEdges;
+    },
+
+    /**
+     * Get V2 edge count
+     */
+    getEdgeCountV2() {
+      return nEdgesV2;
+    },
+
+    /**
+     * Disable V2 instanced edges (fall back to legacy)
+     */
+    disableEdgesV2() {
+      useInstancedEdges = false;
+    },
+
+    /**
+     * Enable V2 instanced edges (if set up)
+     */
+    enableEdgesV2() {
+      if (nEdgesV2 > 0 && edgeTextureV2 && positionTextureV2) {
+        useInstancedEdges = true;
+      }
+    },
 
     resetCamera() {
       velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
@@ -2445,6 +2655,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     setAdaptiveLOD(enabled) { hpRenderer.setAdaptiveLOD(enabled); },
     setForceLOD(level) { hpRenderer.setForceLOD(level); },
     getRendererStats() { return hpRenderer.getStats(); },
+
+    // LOD visibility for edge filtering
+    getLodVisibilityArray() { return hpRenderer.getLodVisibilityArray(); },
+    getCurrentLODLevel() { return hpRenderer.getCurrentLODLevel(); },
 
     start() {
       if (!animationHandle) animationHandle = requestAnimationFrame(render);

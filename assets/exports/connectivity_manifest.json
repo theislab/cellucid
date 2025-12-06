@@ -1,1 +1,1 @@
-{"n_points": 162259, "n_edges": 10537096, "nnz": 21074192, "format": "csr", "indptrPath": "connectivity/indptr.u32.gz", "indicesPath": "connectivity/indices.u32.gz", "dtype": "uint32", "compression": 6}
+{"format": "edge_pairs", "n_cells": 162259, "n_edges": 10537096, "max_neighbors": 618, "index_bytes": 4, "index_dtype": "uint32", "sourcesPath": "connectivity/edges.src.bin.gz", "destinationsPath": "connectivity/edges.dst.bin.gz", "compression": 6}

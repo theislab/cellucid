@@ -10,8 +10,8 @@ import {
   loadVarManifest,
   loadVarFieldData,
   loadConnectivityManifest,
-  loadConnectivityIndptr,
-  loadConnectivityIndices
+  hasEdgeFormat,
+  loadEdges
 } from '../data/data-loaders.js';
 import { SyntheticDataGenerator, PerformanceTracker, BenchmarkReporter, formatNumber } from '../dev/benchmark.js';
 
@@ -294,37 +294,94 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
     }
 
     // Setup connectivity controls if data is available
-    if (connectivityManifest && connectivityManifest.n_edges > 0) {
+    if (connectivityManifest && hasEdgeFormat(connectivityManifest)) {
       // Show connectivity controls
       if (connectivityControls) {
         connectivityControls.style.display = 'block';
       }
-      if (connectivityInfo) {
-        const avgNeighbors = (connectivityManifest.nnz / connectivityManifest.n_points).toFixed(1);
-        connectivityInfo.textContent = `${connectivityManifest.n_edges.toLocaleString()} edges (~${avgNeighbors} neighbors/cell)`;
-      }
 
       const totalEdges = connectivityManifest.n_edges;
-      const EDGE_UI_CAP = 5000000;
-      
-      // Set max limit to actual edge count
-      if (connectivityLimitInput) {
-        connectivityLimitInput.max = Math.min(totalEdges, EDGE_UI_CAP);  // Cap UI at 5M
-        connectivityLimitInput.min = Math.min(parseInt(connectivityLimitInput.min || '0', 10) || 0, connectivityLimitInput.max);
-        connectivityLimitInput.value = Math.min(100000, totalEdges);
-        if (connectivityLimitDisplay) {
-          connectivityLimitDisplay.textContent = formatEdgeCount(connectivityLimitInput.value);
+      const EDGE_UI_CAP = 100000000;  // 100M edges max in UI
+
+      // Store edge arrays for accurate visible edge counting
+      let edgeSources = null;
+      let edgeDestinations = null;
+
+      // Cached visibility state for edge counting
+      let cachedCombinedVisibility = null; // Combined: filter AND LOD visibility
+      let lastLodLevel = -1;               // Track LOD level for change detection
+      let actualVisibleEdges = totalEdges;
+
+      // Reusable buffer for combined visibility (avoids GC pressure)
+      let combinedVisibilityBuffer = null;
+
+      // Prefix sum for accurate LOD limit calculation
+      let visibleEdgePrefixSum = null;
+
+      /**
+       * Seeded random number generator (Mulberry32) for reproducible shuffles.
+       * Using a fixed seed ensures the same shuffle every time for consistency.
+       */
+      function mulberry32(seed) {
+        return function() {
+          let t = seed += 0x6D2B79F5;
+          t = Math.imul(t ^ t >>> 15, t | 1);
+          t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+          return ((t ^ t >>> 14) >>> 0) / 4294967296;
+        };
+      }
+
+      /**
+       * Fisher-Yates shuffle for edge arrays (in-place, synchronized).
+       * Uses seeded RNG for reproducibility across sessions.
+       * This ensures "first N edges" is a truly random sample.
+       */
+      function shuffleEdges(sources, destinations) {
+        const n = sources.length;
+        const rng = mulberry32(42); // Fixed seed for reproducibility
+
+        for (let i = n - 1; i > 0; i--) {
+          const j = Math.floor(rng() * (i + 1));
+          // Swap sources
+          const tmpSrc = sources[i];
+          sources[i] = sources[j];
+          sources[j] = tmpSrc;
+          // Swap destinations (same permutation)
+          const tmpDst = destinations[i];
+          destinations[i] = destinations[j];
+          destinations[j] = tmpDst;
         }
       }
 
-      // CSR data storage
-      let csrIndptr = null;
-      let csrIndices = null;
-      let csrLoaded = false;
-      let currentEdgeLimit = parseInt(connectivityLimitInput?.value || 100000);
-      const defaultEdgeStep = parseInt(connectivityLimitInput?.step || '1000', 10) || 1000;
-      
-      // Format edge count for display
+      /**
+       * Combine filter visibility with LOD visibility.
+       * An edge is visible only if BOTH endpoints pass filters AND are visible at current LOD.
+       *
+       * Performance: Reuses buffer, returns filterVis directly when LOD is disabled/full detail.
+       */
+      function getCombinedVisibility() {
+        const filterVis = state.getVisibilityArray();
+        const lodVis = viewer.getLodVisibilityArray();
+
+        if (!filterVis) return null;
+        if (!lodVis) return filterVis; // No LOD active, just use filter visibility (no copy needed)
+
+        const n = filterVis.length;
+
+        // Reuse or create buffer
+        if (!combinedVisibilityBuffer || combinedVisibilityBuffer.length !== n) {
+          combinedVisibilityBuffer = new Float32Array(n);
+        }
+
+        // Combined visibility = filter AND LOD
+        for (let i = 0; i < n; i++) {
+          combinedVisibilityBuffer[i] = (filterVis[i] > 0.5 && lodVis[i] > 0.5) ? 1.0 : 0.0;
+        }
+
+        return combinedVisibilityBuffer;
+      }
+
+      // Format edge count for display (compact)
       function formatEdgeCount(n) {
         n = parseInt(n);
         if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
@@ -332,166 +389,180 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
         return n.toString();
       }
 
-      function syncEdgeLimitRange(eligibleEdges) {
-        if (!connectivityLimitInput || !connectivityLimitDisplay) return;
-        const sliderMax = Math.min(
-          EDGE_UI_CAP,
-          Math.max(0, Math.min(totalEdges, Math.round(eligibleEdges)))
-        );
-        const sliderMin = Math.min(1000, sliderMax);
-        const sliderStep = sliderMax > 0
-          ? Math.max(1, Math.min(defaultEdgeStep, sliderMax))
-          : 1;
+      /**
+       * Count visible edges accurately by checking both endpoints.
+       * Builds a prefix sum for exact LOD limit calculation via binary search.
+       * O(nEdges) but uses typed arrays for speed.
+       * @param {Float32Array} visibility - Per-cell visibility (0 or 1)
+       * @returns {{visibleCount: number}}
+       */
+      function countVisibleEdges(visibility) {
+        if (!edgeSources || !edgeDestinations || !visibility) {
+          visibleEdgePrefixSum = null;
+          return { visibleCount: totalEdges };
+        }
+        const n = edgeSources.length;
 
-        connectivityLimitInput.max = sliderMax;
-        connectivityLimitInput.min = sliderMin;
-        connectivityLimitInput.step = sliderStep;
-
-        if (sliderMax === 0) {
-          currentEdgeLimit = 0;
-          connectivityLimitInput.value = 0;
-        } else {
-          if (currentEdgeLimit > sliderMax) {
-            currentEdgeLimit = sliderMax;
-            connectivityLimitInput.value = sliderMax;
-          } else if (currentEdgeLimit < sliderMin) {
-            currentEdgeLimit = sliderMin;
-            connectivityLimitInput.value = sliderMin;
-          }
+        // Build prefix sum: prefixSum[i] = number of visible edges in [0, i)
+        // Use Uint32Array for memory efficiency (supports up to 4B edges)
+        if (!visibleEdgePrefixSum || visibleEdgePrefixSum.length !== n + 1) {
+          visibleEdgePrefixSum = new Uint32Array(n + 1);
         }
 
-        connectivityLimitDisplay.textContent = formatEdgeCount(currentEdgeLimit);
+        visibleEdgePrefixSum[0] = 0;
+        for (let i = 0; i < n; i++) {
+          const src = edgeSources[i];
+          const dst = edgeDestinations[i];
+          const isVisible = (visibility[src] > 0.5 && visibility[dst] > 0.5) ? 1 : 0;
+          visibleEdgePrefixSum[i + 1] = visibleEdgePrefixSum[i] + isVisible;
+        }
+
+        return { visibleCount: visibleEdgePrefixSum[n] };
       }
 
-      syncEdgeLimitRange(totalEdges);
-      
-      // Seeded random for reproducibility
-      function seededRandom(seed) {
-        const x = Math.sin(seed) * 10000;
-        return x - Math.floor(x);
-      }
-      
-      // Build edges for visible cells only with random sampling
-      function buildEdgesForVisibleCells() {
-        if (!csrLoaded || !csrIndptr || !csrIndices) return;
-        
-        // Get visibility from state
-        const visibility = state.getVisibilityArray();
-        if (!visibility || visibility.length === 0) {
-          if (connectivityInfo) {
-            connectivityInfo.textContent = 'No visibility data available';
-          }
-          viewer.setConnectivityEdges(new Uint32Array(0));
-          return;
+      /**
+       * Find exact LOD limit to show targetVisible edges using binary search on prefix sum.
+       * Since edges are shuffled, this gives us exactly targetVisible random edges.
+       * @param {number} targetVisible - Desired number of visible edges
+       * @param {Float32Array} visibility - Per-cell visibility (unused, prefix sum is pre-built)
+       * @returns {number} - Exact LOD limit
+       */
+      function findLodLimitFast(targetVisible, visibility) {
+        if (!edgeSources || !edgeDestinations) {
+          return targetVisible;
         }
-        
-        // Find visible cell indices
-        const visibleSet = new Set();
-        for (let i = 0; i < visibility.length; i++) {
-          if (visibility[i] > 0.5) {  // Threshold for "visible"
-            visibleSet.add(i);
-          }
+        if (targetVisible >= actualVisibleEdges) {
+          return totalEdges;
         }
-        
-        const numVisible = visibleSet.size;
-        if (numVisible === 0) {
-          viewer.setConnectivityEdges(new Uint32Array(0));
-          if (connectivityInfo) {
-            connectivityInfo.textContent = 'No visible cells';
-          }
-          return;
+        if (actualVisibleEdges <= 0 || targetVisible <= 0) {
+          return 0;
         }
-        
-        // First pass: collect all eligible edges (both endpoints visible)
-        const allEdges = [];
-        for (const cellIdx of visibleSet) {
-          const start = csrIndptr[cellIdx];
-          const end = csrIndptr[cellIdx + 1];
-          for (let j = start; j < end; j++) {
-            const neighborIdx = csrIndices[j];
-            // Only count edge once (cellIdx < neighborIdx) and both must be visible
-            if (neighborIdx > cellIdx && visibleSet.has(neighborIdx)) {
-              allEdges.push(cellIdx, neighborIdx);
+
+        // Use prefix sum with binary search for exact LOD limit
+        if (visibleEdgePrefixSum) {
+          // Binary search: find smallest index i where prefixSum[i] >= targetVisible
+          let lo = 0;
+          let hi = visibleEdgePrefixSum.length - 1;
+          while (lo < hi) {
+            const mid = (lo + hi) >>> 1;
+            if (visibleEdgePrefixSum[mid] < targetVisible) {
+              lo = mid + 1;
+            } else {
+              hi = mid;
             }
           }
+          return lo;
         }
-        
-        const totalEligible = allEdges.length / 2;
-        syncEdgeLimitRange(totalEligible);
-        
-        if (totalEligible === 0) {
-          viewer.setConnectivityEdges(new Uint32Array(0));
-          if (connectivityInfo) {
-            connectivityInfo.textContent = `${numVisible.toLocaleString()} visible cells, no edges between them`;
-          }
-          return;
-        }
-        
-        // Apply limit with random sampling
-        let finalEdges;
-        let wasLimited = false;
-        
-        if (totalEligible <= currentEdgeLimit) {
-          // Use all edges
-          finalEdges = new Uint32Array(allEdges);
-        } else {
-          // Random sample edges
-          wasLimited = true;
-          const indices = [];
-          for (let i = 0; i < totalEligible; i++) {
-            indices.push(i);
-          }
-          
-          // Fisher-Yates shuffle with seed for reproducibility
-          const seed = 12345;
-          for (let i = indices.length - 1; i > 0; i--) {
-            const j = Math.floor(seededRandom(seed + i) * (i + 1));
-            [indices[i], indices[j]] = [indices[j], indices[i]];
-          }
-          
-          // Take first currentEdgeLimit edges
-          const sampled = [];
-          for (let i = 0; i < currentEdgeLimit; i++) {
-            const edgeIdx = indices[i];
-            sampled.push(allEdges[edgeIdx * 2], allEdges[edgeIdx * 2 + 1]);
-          }
-          finalEdges = new Uint32Array(sampled);
-        }
-        
-        const numEdges = finalEdges.length / 2;
-        viewer.setConnectivityEdges(finalEdges);
-        
-        if (connectivityInfo) {
-          if (wasLimited) {
-            connectivityInfo.textContent = `${numEdges.toLocaleString()} of ${totalEligible.toLocaleString()} edges (${numVisible.toLocaleString()} visible cells)`;
-          } else {
-            connectivityInfo.textContent = `${numEdges.toLocaleString()} edges (${numVisible.toLocaleString()} visible cells)`;
-          }
+
+        // Fallback: ratio-based approximation (should rarely happen)
+        const ratio = targetVisible / actualVisibleEdges;
+        return Math.min(totalEdges, Math.round(totalEdges * ratio * 1.05));
+      }
+
+      // Update the connectivity info display
+      function updateConnectivityInfo(visibleEdges, shownEdges) {
+        if (!connectivityInfo) return;
+        connectivityInfo.textContent = `${formatEdgeCount(totalEdges)} total · ${formatEdgeCount(visibleEdges)} visible · ${formatEdgeCount(shownEdges)} shown`;
+      }
+
+      // Track current state - user's preference, NOT auto-adjusted by visibility changes
+      let currentEdgeLimit = Math.min(250000, totalEdges);  // User's desired edge count (stable)
+
+      /**
+       * Update slider range based on visible edges.
+       * - Slider max = visible edges (dynamic)
+       * - User's preference (currentEdgeLimit) stays stable
+       * - Slider value = min(preference, visible) to show what's achievable
+       */
+      function updateSliderRange(visibleEdges) {
+        if (!connectivityLimitInput) return;
+        const cappedMax = Math.min(visibleEdges, EDGE_UI_CAP);
+        const minVal = Math.max(100, Math.min(1000, Math.round(cappedMax * 0.01)));
+
+        connectivityLimitInput.max = cappedMax;
+        connectivityLimitInput.min = minVal;
+
+        // Slider shows achievable value, but preference stays unchanged
+        const achievable = Math.min(currentEdgeLimit, cappedMax);
+        connectivityLimitInput.value = Math.max(minVal, achievable);
+
+        if (connectivityLimitDisplay) {
+          connectivityLimitDisplay.textContent = formatEdgeCount(currentEdgeLimit);
         }
       }
-      
+
+      /**
+       * Apply the current edge limit to the viewer.
+       * Uses accurate LOD calculation based on actual visible edges.
+       *
+       * Edge visibility is based on BOTH filter state AND point LOD.
+       * Only edges where both endpoints pass filters AND are visible at current LOD are shown.
+       */
+      function applyEdgeLodLimit() {
+        if (!cachedCombinedVisibility) {
+          viewer.setEdgeLodLimit(currentEdgeLimit);
+          updateConnectivityInfo(actualVisibleEdges, Math.min(currentEdgeLimit, actualVisibleEdges));
+          return;
+        }
+
+        // Calculate LOD limit to show approximately currentEdgeLimit visible edges
+        const targetVisible = Math.min(currentEdgeLimit, actualVisibleEdges);
+        const lodLimit = findLodLimitFast(targetVisible, cachedCombinedVisibility);
+        viewer.setEdgeLodLimit(lodLimit);
+
+        // The actual shown count is min of desired and available
+        updateConnectivityInfo(actualVisibleEdges, targetVisible);
+      }
+
+      // Initial slider setup and info display
+      updateSliderRange(actualVisibleEdges);
+      updateConnectivityInfo(actualVisibleEdges, Math.min(currentEdgeLimit, actualVisibleEdges));
+
+      // Edge loading state
+      let edgesLoaded = false;
+
       if (connectivityCheckbox) {
         connectivityCheckbox.addEventListener('change', async () => {
           const show = connectivityCheckbox.checked;
-          
-          // Load CSR data on first toggle
-          if (show && !csrLoaded) {
+
+          // Load edge data on first toggle
+          if (show && !edgesLoaded) {
             try {
               if (connectivityInfo) {
                 connectivityInfo.textContent = 'Loading connectivity data...';
               }
-              // Load CSR format
-              const [indptr, indices] = await Promise.all([
-                loadConnectivityIndptr(CONNECTIVITY_MANIFEST_URL, connectivityManifest),
-                loadConnectivityIndices(CONNECTIVITY_MANIFEST_URL, connectivityManifest)
-              ]);
-              csrIndptr = indptr;
-              csrIndices = indices;
-              csrLoaded = true;
-              
-              // Build initial edges for current visibility
-              buildEdgesForVisibleCells();
-              
+
+              console.log('[Main] Loading GPU-optimized edges...');
+              const edgeData = await loadEdges(CONNECTIVITY_MANIFEST_URL, connectivityManifest);
+
+              // Shuffle edges for truly random sampling when using MAX EDGES slider
+              // This ensures "first N edges" gives a representative random sample
+              console.log('[Main] Shuffling edges for random sampling...');
+              shuffleEdges(edgeData.sources, edgeData.destinations);
+
+              // Store edge arrays for accurate visibility counting
+              edgeSources = edgeData.sources;
+              edgeDestinations = edgeData.destinations;
+
+              // Set up instanced rendering with positions from state (uses shuffled edges)
+              viewer.setupEdgesV2(edgeData, state.positionsArray);
+              edgesLoaded = true;
+
+              // Get combined visibility (filter + LOD) and count visible edges
+              cachedCombinedVisibility = getCombinedVisibility();
+              if (cachedCombinedVisibility) {
+                viewer.updateEdgeVisibilityV2(cachedCombinedVisibility);
+                const { visibleCount } = countVisibleEdges(cachedCombinedVisibility);
+                actualVisibleEdges = visibleCount;
+              }
+              lastLodLevel = viewer.getCurrentLODLevel();
+
+              // Update slider range and apply LOD
+              updateSliderRange(actualVisibleEdges);
+              applyEdgeLodLimit();
+
+              console.log(`[Main] Edges loaded: ${edgeData.nEdges} edges, ${edgeData.nCells} cells, visible: ${actualVisibleEdges}`);
+
             } catch (err) {
               console.error('Failed to load connectivity data:', err);
               if (connectivityInfo) {
@@ -500,25 +571,79 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
               connectivityCheckbox.checked = false;
               return;
             }
-          } else if (show && csrLoaded) {
-            // Rebuild edges for current visibility
-            buildEdgesForVisibleCells();
+          } else if (show && edgesLoaded) {
+            // Already loaded - just update combined visibility
+            cachedCombinedVisibility = getCombinedVisibility();
+            if (cachedCombinedVisibility) {
+              viewer.updateEdgeVisibilityV2(cachedCombinedVisibility);
+            }
           }
-          
+
           viewer.setShowConnectivity(show);
           if (connectivitySliders) {
             connectivitySliders.style.display = show ? 'block' : 'none';
           }
+
+          // Start/stop LOD tracking based on visibility
+          if (show && edgesLoaded) {
+            startLodTracking();
+          } else {
+            stopLodTracking();
+          }
         });
       }
 
-      // Update edges when visibility changes
-      const onVisibilityChange = () => {
-        // Rebuild edges if connectivity is shown
-        if (connectivityCheckbox?.checked && csrLoaded) {
-          buildEdgesForVisibleCells();
+      /**
+       * Update edge visibility with combined filter + LOD visibility.
+       * Called when filters change or LOD level changes.
+       */
+      function updateEdgeVisibility() {
+        if (!edgesLoaded) return;
+
+        // Get combined visibility (filter AND LOD)
+        cachedCombinedVisibility = getCombinedVisibility();
+        if (!cachedCombinedVisibility) return;
+
+        viewer.updateEdgeVisibilityV2(cachedCombinedVisibility);
+
+        // Count actual visible edges (both endpoints visible)
+        const { visibleCount } = countVisibleEdges(cachedCombinedVisibility);
+        actualVisibleEdges = visibleCount;
+
+        // Update slider range (dynamic) and apply LOD limit
+        updateSliderRange(actualVisibleEdges);
+        if (connectivityCheckbox?.checked) {
+          applyEdgeLodLimit();
         }
+      }
+
+      // Update edges when filter visibility changes
+      const onVisibilityChange = () => {
+        updateEdgeVisibility();
       };
+
+      // Poll for LOD changes (LOD changes during render based on camera distance)
+      let lodCheckInterval = null;
+      function startLodTracking() {
+        if (lodCheckInterval) return;
+        lodCheckInterval = setInterval(() => {
+          if (!edgesLoaded || !connectivityCheckbox?.checked) return;
+
+          const currentLod = viewer.getCurrentLODLevel();
+          if (currentLod !== lastLodLevel) {
+            console.log(`[Edges] LOD changed: ${lastLodLevel} → ${currentLod}`);
+            lastLodLevel = currentLod;
+            updateEdgeVisibility();
+          }
+        }, 200); // Check every 200ms
+      }
+
+      function stopLodTracking() {
+        if (lodCheckInterval) {
+          clearInterval(lodCheckInterval);
+          lodCheckInterval = null;
+        }
+      }
       if (state.addVisibilityChangeCallback) {
         state.addVisibilityChangeCallback(onVisibilityChange);
       } else {
@@ -529,7 +654,6 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
       if (connectivityColorInput) {
         connectivityColorInput.addEventListener('input', () => {
           const hex = connectivityColorInput.value;
-          // Parse hex to RGB bytes (0-255)
           const r = parseInt(hex.slice(1, 3), 16);
           const g = parseInt(hex.slice(3, 5), 16);
           const b = parseInt(hex.slice(5, 7), 16);
@@ -554,20 +678,19 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
           connectivityWidthDisplay.textContent = width.toFixed(1);
         });
       }
-      
-      // Wire up limit slider
+
+      // Wire up limit slider (LOD control)
       if (connectivityLimitInput && connectivityLimitDisplay) {
         connectivityLimitInput.addEventListener('input', () => {
-          const max = parseInt(connectivityLimitInput.max || EDGE_UI_CAP, 10) || EDGE_UI_CAP;
-          const min = parseInt(connectivityLimitInput.min || '0', 10) || 0;
+          const max = parseInt(connectivityLimitInput.max || EDGE_UI_CAP, 10);
+          const min = parseInt(connectivityLimitInput.min || '1000', 10);
           const requested = parseInt(connectivityLimitInput.value, 10);
           currentEdgeLimit = Math.max(min, Math.min(max, Number.isFinite(requested) ? requested : 0));
           connectivityLimitInput.value = currentEdgeLimit;
           connectivityLimitDisplay.textContent = formatEdgeCount(currentEdgeLimit);
-          // Rebuild edges if currently shown
-          if (connectivityCheckbox?.checked && csrLoaded) {
-            buildEdgesForVisibleCells();
-          }
+
+          // Apply LOD limit using accurate visible edge calculation
+          applyEdgeLodLimit();
         });
       }
     }

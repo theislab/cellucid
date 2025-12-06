@@ -1,57 +1,126 @@
 /**
  * GLSL Shader Sources (WebGL2 / GLSL ES 3.0)
  * ==========================================
- * Shaders for line rendering and grid background.
+ * Shaders for instanced edge rendering and grid background.
  * Point rendering is handled by the high-performance renderer.
  */
 
-// Line shader for connectivity edges (WebGL2)
-export const LINE_VS_SOURCE = `#version 300 es
+// ============================================================================
+// GPU-INSTANCED EDGE SHADER
+// ============================================================================
+// Optimized for rendering millions of edges with:
+// - Edge data stored in texture (no per-edge vertex buffer)
+// - Position lookup from texture
+// - Visibility filtering in shader (no CPU filtering)
+// - Instanced rendering (6 vertices shared across all edges)
+
+export const LINE_INSTANCED_VS_SOURCE = `#version 300 es
 precision highp float;
+precision highp int;
+precision highp usampler2D;
 
-in vec3 a_position;
-in vec3 a_otherPosition;
-in float a_side;
+// Shared quad geometry (6 vertices for 2 triangles)
+// x: -1 = source endpoint, +1 = destination endpoint
+// y: -1 = left side of line, +1 = right side of line
+in vec2 a_quadPos;
 
+// Edge data texture (RG32UI: source index, dest index)
+uniform highp usampler2D u_edgeTexture;
+uniform ivec2 u_edgeTexDims;
+
+// Position texture (RGB32F: x, y, z)
+uniform highp sampler2D u_positionTexture;
+uniform ivec2 u_posTexDims;
+
+// Visibility texture (R8 or R32F: 0.0 = hidden, 1.0 = visible)
+uniform highp sampler2D u_visibilityTexture;
+
+// Transform uniforms
 uniform mat4 u_mvpMatrix;
 uniform mat4 u_viewMatrix;
 uniform mat4 u_modelMatrix;
 uniform vec2 u_viewportSize;
 uniform float u_lineWidth;
 
+// LOD control - limit number of edges rendered
+uniform int u_maxEdges;
+
 out float v_viewDistance;
 
+// Convert linear index to 2D texture coordinate
+ivec2 idxToCoord(int idx, ivec2 dims) {
+  return ivec2(idx % dims.x, idx / dims.x);
+}
+
 void main() {
+  int edgeIdx = gl_InstanceID;
+
+  // LOD: skip edges beyond limit (degenerate triangle)
+  if (edgeIdx >= u_maxEdges) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    return;
+  }
+
+  // Fetch edge (source, destination cell indices)
+  ivec2 edgeCoord = idxToCoord(edgeIdx, u_edgeTexDims);
+  uvec4 edgeData = texelFetch(u_edgeTexture, edgeCoord, 0);
+  int srcIdx = int(edgeData.r);
+  int dstIdx = int(edgeData.g);
+
+  // Fetch visibility for both endpoints
+  ivec2 srcCoord = idxToCoord(srcIdx, u_posTexDims);
+  ivec2 dstCoord = idxToCoord(dstIdx, u_posTexDims);
+  float srcVis = texelFetch(u_visibilityTexture, srcCoord, 0).r;
+  float dstVis = texelFetch(u_visibilityTexture, dstCoord, 0).r;
+
+  // Skip if either endpoint is hidden (degenerate triangle)
+  if (srcVis < 0.5 || dstVis < 0.5) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    return;
+  }
+
+  // Fetch positions
+  vec3 srcPos = texelFetch(u_positionTexture, srcCoord, 0).rgb;
+  vec3 dstPos = texelFetch(u_positionTexture, dstCoord, 0).rgb;
+
+  // Determine which endpoint this vertex belongs to
+  // a_quadPos.x: -1 = source, +1 = destination
+  vec3 myPos = a_quadPos.x < 0.0 ? srcPos : dstPos;
+  vec3 otherPos = a_quadPos.x < 0.0 ? dstPos : srcPos;
+
   // Project both endpoints to clip space
-  vec4 clipStart = u_mvpMatrix * vec4(a_position, 1.0);
-  vec4 clipEnd = u_mvpMatrix * vec4(a_otherPosition, 1.0);
+  vec4 clipMy = u_mvpMatrix * vec4(myPos, 1.0);
+  vec4 clipOther = u_mvpMatrix * vec4(otherPos, 1.0);
 
-  // Convert to screen space (pixels)
-  vec2 ndcStart = clipStart.xy / clipStart.w;
-  vec2 ndcEnd = clipEnd.xy / clipEnd.w;
-  vec2 screenStart = (ndcStart * 0.5 + 0.5) * u_viewportSize;
-  vec2 screenEnd = (ndcEnd * 0.5 + 0.5) * u_viewportSize;
+  // Convert to screen space for consistent line width
+  vec2 ndcMy = clipMy.xy / clipMy.w;
+  vec2 ndcOther = clipOther.xy / clipOther.w;
+  vec2 screenMy = (ndcMy * 0.5 + 0.5) * u_viewportSize;
+  vec2 screenOther = (ndcOther * 0.5 + 0.5) * u_viewportSize;
 
-  // Build a screen-space normal for consistent thickness
-  vec2 dir = screenEnd - screenStart;
-  float dirLen = length(dir);
-  vec2 normal = dirLen > 1e-5 ? vec2(-dir.y, dir.x) / dirLen : vec2(0.0, 1.0);
+  // Build perpendicular direction for line thickness
+  vec2 dir = screenOther - screenMy;
+  float len = length(dir);
+  vec2 normal = len > 0.001 ? vec2(-dir.y, dir.x) / len : vec2(0.0, 1.0);
 
-  // Offset in screen space, then convert back to clip space
-  float halfWidth = max(u_lineWidth * 0.5, 0.0);
-  vec2 offsetScreen = normal * a_side * halfWidth;
+  // Offset perpendicular to line direction
+  // a_quadPos.y: -1 = left side, +1 = right side
+  float halfWidth = max(u_lineWidth * 0.5, 0.5);
+  vec2 offsetScreen = normal * a_quadPos.y * halfWidth;
   vec2 offsetNdc = (offsetScreen / u_viewportSize) * 2.0;
 
-  vec4 clipPos = clipStart;
-  clipPos.xy += offsetNdc * clipPos.w;
+  // Apply offset in clip space
+  gl_Position = clipMy;
+  gl_Position.xy += offsetNdc * clipMy.w;
 
-  vec4 eyePos = u_viewMatrix * u_modelMatrix * vec4(a_position, 1.0);
+  // Compute view distance for fog
+  vec4 eyePos = u_viewMatrix * u_modelMatrix * vec4(myPos, 1.0);
   v_viewDistance = length(eyePos.xyz);
-  gl_Position = clipPos;
 }
 `;
 
-export const LINE_FS_SOURCE = `#version 300 es
+// Fragment shader for instanced edges
+export const LINE_INSTANCED_FS_SOURCE = `#version 300 es
 precision highp float;
 
 in float v_viewDistance;
@@ -66,7 +135,7 @@ uniform vec3 u_fogColor;
 out vec4 fragColor;
 
 void main() {
-  // Apply fog to lines for depth perception
+  // Apply fog for depth perception
   float fogSpan = max(u_fogFarMean - u_fogNearMean, 0.0001);
   float normalizedDistance = max(v_viewDistance - u_fogNearMean, 0.0) / fogSpan;
   float extinction = u_fogDensity * u_fogDensity * 0.6;
