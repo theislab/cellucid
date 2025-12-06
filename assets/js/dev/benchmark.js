@@ -515,22 +515,27 @@ export class SyntheticDataGenerator {
   /**
    * Generate octopus-like structure with body and tentacles
    */
-  static octopus(count, numTentacles = 8) {
+  static octopus(count, numTentacles = 10) {
     console.log(`Generating ${count.toLocaleString()} points (octopus with ${numTentacles} tentacles)...`);
     const startTime = performance.now();
 
     const positions = new Float32Array(count * 3);
     const colors = new Uint8Array(count * 4); // RGBA packed as uint8
 
-    // Body parameters
-    const bodyRadius = 0.3;
-    const bodyCenter = [0, 0.3, 0];
-    const bodyFreq = 0.25; // 25% of points in body
+    // Body parameters - denser core to force overdraw
+    const bodyRadius = 0.36;
+    const bodyCenter = [0, 0.28, 0];
+    const bodyFreq = 0.4; // 40% of points in body to create dense cluster
+    const bodyHotspots = Array.from({ length: 5 }, () => ({
+      theta: Math.random() * Math.PI * 2,
+      phi: Math.PI * 0.5 + (Math.random() - 0.5) * 0.4,
+      boost: 0.4 + Math.random() * 0.7
+    }));
 
-    // Tentacle parameters
-    const tentacleLength = 1.2;
-    const tentacleThickness = 0.04;
-    const tentacleWave = 0.15; // wave amplitude
+    // Tentacle parameters - tighter curls with self-intersections
+    const tentacleLength = 1.1;
+    const tentacleThickness = 0.055;
+    const tentacleWave = 0.18; // wave amplitude
     const tentacleFreq = (1 - bodyFreq) / numTentacles;
 
     // Body color (reddish-orange)
@@ -539,10 +544,15 @@ export class SyntheticDataGenerator {
     // Generate tentacle base angles
     const tentacles = [];
     for (let t = 0; t < numTentacles; t++) {
-      const baseAngle = (t / numTentacles) * Math.PI * 2 + (Math.random() - 0.5) * 0.3;
-      const tiltAngle = Math.PI * 0.6 + (Math.random() - 0.5) * 0.3; // angle from vertical
-      const hue = 0.02 + t * 0.02; // slight color variation per tentacle
-      tentacles.push({ baseAngle, tiltAngle, hue });
+      const baseAngle = (t / numTentacles) * Math.PI * 2 + (Math.random() - 0.5) * 0.28;
+      const tiltAngle = Math.PI * 0.58 + (Math.random() - 0.5) * 0.32; // angle from vertical
+      const hue = 0.02 + t * 0.015; // slight color variation per tentacle
+      const wrapTurns = 2.5 + Math.random() * 2.5; // coils around body
+      const wrapRadius = 0.35 + Math.random() * 0.35;
+      const wrapPhase = Math.random() * Math.PI * 2;
+      const wobblePhase = Math.random() * Math.PI * 2;
+      const suctionBands = 3 + Math.floor(Math.random() * 4);
+      tentacles.push({ baseAngle, tiltAngle, hue, wrapTurns, wrapRadius, wrapPhase, wobblePhase, suctionBands });
     }
 
     for (let i = 0; i < count; i++) {
@@ -550,53 +560,64 @@ export class SyntheticDataGenerator {
       const r = Math.random();
 
       if (r < bodyFreq) {
-        // Body point - ellipsoid shape
-        const theta = Math.random() * Math.PI * 2;
-        const phi = Math.acos(2 * Math.random() - 1);
-        const radius = bodyRadius * Math.pow(Math.random(), 0.33);
+        // Body point - lumpy ellipsoid with dense core
+        const hotspot = bodyHotspots[Math.floor(Math.random() * bodyHotspots.length)];
+        const useHotspot = Math.random() < 0.65;
+        const theta = useHotspot ? hotspot.theta + (Math.random() - 0.5) * 0.35 : Math.random() * Math.PI * 2;
+        const phi = useHotspot ? hotspot.phi + (Math.random() - 0.5) * 0.35 : Math.acos(2 * Math.random() - 1);
+        const radiusScale = useHotspot ? hotspot.boost : 1;
+        const radius = bodyRadius * (0.3 + Math.pow(Math.random(), useHotspot ? 1.35 : 1.8) * 0.9) * radiusScale;
 
-        positions[idx] = bodyCenter[0] + radius * Math.sin(phi) * Math.cos(theta) * 1.2;
-        positions[idx + 1] = bodyCenter[1] + radius * Math.cos(phi) * 0.8;
-        positions[idx + 2] = bodyCenter[2] + radius * Math.sin(phi) * Math.sin(theta) * 1.2;
+        positions[idx] = bodyCenter[0] + radius * Math.sin(phi) * Math.cos(theta) * 1.35;
+        positions[idx + 1] = bodyCenter[1] + radius * Math.cos(phi) * 0.9;
+        positions[idx + 2] = bodyCenter[2] + radius * Math.sin(phi) * Math.sin(theta) * 1.35;
 
         // Body color with variation (convert to uint8)
         const cidx = i * 4;
-        colors[cidx] = Math.round(Math.max(0, Math.min(1, bodyColor[0] + (Math.random() - 0.5) * 0.1)) * 255);
-        colors[cidx + 1] = Math.round(Math.max(0, Math.min(1, bodyColor[1] + (Math.random() - 0.5) * 0.1)) * 255);
-        colors[cidx + 2] = Math.round(Math.max(0, Math.min(1, bodyColor[2] + (Math.random() - 0.5) * 0.1)) * 255);
+        colors[cidx] = Math.round(Math.max(0, Math.min(1, bodyColor[0] + (Math.random() - 0.5) * 0.12)) * 255);
+        colors[cidx + 1] = Math.round(Math.max(0, Math.min(1, bodyColor[1] + (Math.random() - 0.5) * 0.12)) * 255);
+        colors[cidx + 2] = Math.round(Math.max(0, Math.min(1, bodyColor[2] + (Math.random() - 0.5) * 0.12)) * 255);
         colors[cidx + 3] = 255; // full alpha
       } else {
         // Tentacle point
         const tentacleIdx = Math.floor((r - bodyFreq) / tentacleFreq);
         const tent = tentacles[Math.min(tentacleIdx, numTentacles - 1)];
 
-        // Position along tentacle (0 = base, 1 = tip)
-        const t = Math.pow(Math.random(), 0.7); // more points near base
-        const thickness = tentacleThickness * (1 - t * 0.7); // thinner at tip
+        // Position along tentacle (0 = base, 1 = tip), biased toward base for density
+        const t = Math.pow(Math.random(), 1.35);
+        const thickness = tentacleThickness * (1.1 - t * 0.5); // thicker near base
 
         // Base position where tentacle attaches to body
-        const baseX = bodyCenter[0] + bodyRadius * 0.8 * Math.sin(tent.tiltAngle) * Math.cos(tent.baseAngle);
-        const baseY = bodyCenter[1] - bodyRadius * 0.5;
-        const baseZ = bodyCenter[2] + bodyRadius * 0.8 * Math.sin(tent.tiltAngle) * Math.sin(tent.baseAngle);
+        const baseX = bodyCenter[0] + bodyRadius * 0.85 * Math.sin(tent.tiltAngle) * Math.cos(tent.baseAngle);
+        const baseY = bodyCenter[1] - bodyRadius * 0.55 + this._gaussianRandom() * 0.015;
+        const baseZ = bodyCenter[2] + bodyRadius * 0.85 * Math.sin(tent.tiltAngle) * Math.sin(tent.baseAngle);
 
-        // Tentacle curves downward and outward with wave
-        const wave1 = Math.sin(t * Math.PI * 3) * tentacleWave * t;
-        const wave2 = Math.cos(t * Math.PI * 2.5) * tentacleWave * t * 0.5;
+        // Tentacle curls around body with high-frequency wobble
+        const wave1 = Math.sin(t * Math.PI * 4 + tent.wobblePhase) * tentacleWave * t * 1.2;
+        const wave2 = Math.cos(t * Math.PI * 3.5 + tent.wobblePhase * 0.8) * tentacleWave * t;
 
-        const tentX = baseX + t * tentacleLength * Math.sin(tent.tiltAngle) * Math.cos(tent.baseAngle) + wave1;
-        const tentY = baseY - t * tentacleLength * 0.8;
-        const tentZ = baseZ + t * tentacleLength * Math.sin(tent.tiltAngle) * Math.sin(tent.baseAngle) + wave2;
+        const wrapAngle = tent.wrapPhase + t * tent.wrapTurns * Math.PI * 2;
+        const wrapR = tent.wrapRadius * (1 - t * 0.35);
+        const swirlX = Math.cos(wrapAngle) * wrapR;
+        const swirlZ = Math.sin(wrapAngle) * wrapR;
 
-        // Add thickness
+        const bend = Math.sin(t * Math.PI * tent.suctionBands) * 0.25;
+
+        const tentX = baseX + t * tentacleLength * Math.sin(tent.tiltAngle + bend * 0.35) * Math.cos(tent.baseAngle + bend) + wave1 + swirlX;
+        const tentY = baseY - t * tentacleLength * (0.95 - 0.25 * t) + Math.sin(t * Math.PI * 2) * 0.05;
+        const tentZ = baseZ + t * tentacleLength * Math.sin(tent.tiltAngle + bend * 0.35) * Math.sin(tent.baseAngle + bend) + wave2 + swirlZ;
+
+        // Add thickness with suction-band clumping
         const thickAngle = Math.random() * Math.PI * 2;
-        const thickR = Math.sqrt(Math.random()) * thickness;
+        const ring = (Math.sin(t * tent.suctionBands * Math.PI * 2 + tent.wobblePhase) + 1) * 0.5;
+        const thickR = Math.sqrt(Math.random()) * thickness * (1 + ring * 0.65);
 
         positions[idx] = tentX + thickR * Math.cos(thickAngle);
-        positions[idx + 1] = tentY + thickR * Math.sin(thickAngle) * 0.5;
+        positions[idx + 1] = tentY + thickR * Math.sin(thickAngle) * 0.6;
         positions[idx + 2] = tentZ + thickR * Math.sin(thickAngle);
 
-        // Tentacle color - gradient from body color to darker at tips (convert to uint8)
-        const tentColor = this._hslToRgb(tent.hue, 0.7, 0.5 - t * 0.2);
+        // Tentacle color - gradient with darker tips and band highlights (convert to uint8)
+        const tentColor = this._hslToRgb(tent.hue, 0.72, 0.48 - t * 0.22 + ring * 0.08);
         const cidx = i * 4;
         colors[cidx] = Math.round(Math.max(0, Math.min(1, tentColor[0] + (Math.random() - 0.5) * 0.08)) * 255);
         colors[cidx + 1] = Math.round(Math.max(0, Math.min(1, tentColor[1] + (Math.random() - 0.5) * 0.08)) * 255);
@@ -613,7 +634,7 @@ export class SyntheticDataGenerator {
   /**
    * Generate 3D spiral/helix structures
    */
-  static spirals(count, numSpirals = 5) {
+  static spirals(count, numSpirals = 7) {
     console.log(`Generating ${count.toLocaleString()} points (${numSpirals} spirals)...`);
     const startTime = performance.now();
 
@@ -622,36 +643,43 @@ export class SyntheticDataGenerator {
 
     // Generate spiral configurations
     const spiralConfigs = [];
+    const globalBraidPhase = Math.random() * Math.PI * 2;
     for (let s = 0; s < numSpirals; s++) {
       spiralConfigs.push({
         // Starting position
-        startX: (Math.random() - 0.5) * 1.5,
-        startY: (Math.random() - 0.5) * 1.5,
-        startZ: (Math.random() - 0.5) * 1.5,
+        startX: (Math.random() - 0.5) * 0.8,
+        startY: (Math.random() - 0.5) * 0.8,
+        startZ: (Math.random() - 0.5) * 0.8,
         // Direction (normalized)
         dirTheta: Math.random() * Math.PI * 2,
-        dirPhi: Math.random() * Math.PI,
+        dirPhi: Math.PI * 0.35 + Math.random() * Math.PI * 0.6,
         // Spiral parameters
-        radius: 0.1 + Math.random() * 0.2,
-        length: 0.8 + Math.random() * 1.2,
-        turns: 2 + Math.random() * 4,
-        thickness: 0.02 + Math.random() * 0.03,
+        radius: 0.18 + Math.random() * 0.18,
+        length: 0.9 + Math.random() * 1.1,
+        turns: 4 + Math.random() * 4,
+        thickness: 0.035 + Math.random() * 0.035,
         // Color
-        hue: s / numSpirals,
+        hue: s / Math.max(1, numSpirals - 1),
         // Taper
-        taper: Math.random() < 0.5
+        taper: Math.random() < 0.65,
+        orbitRadius: 0.25 + Math.random() * 0.25,
+        orbitTurns: 2 + Math.random() * 3,
+        strandCount: 2 + Math.floor(Math.random() * 3),
+        kink: 0.06 + Math.random() * 0.08,
+        noiseFreq: 2 + Math.random() * 4,
+        orbitPhase: globalBraidPhase + (Math.random() - 0.5) * Math.PI
       });
     }
 
-    const pointsPerSpiral = Math.floor(count / numSpirals);
+    const pointsPerSpiral = Math.max(1, Math.floor(count / numSpirals));
 
     for (let i = 0; i < count; i++) {
       const idx = i * 3;
       const spiralIdx = Math.min(Math.floor(i / pointsPerSpiral), numSpirals - 1);
       const sp = spiralConfigs[spiralIdx];
 
-      // Position along spiral (0-1)
-      const t = Math.random();
+      // Position along spiral (0-1), biased to start for heavier overlap
+      const t = Math.pow(Math.random(), 1.25);
 
       // Direction vectors
       const dirX = Math.sin(sp.dirPhi) * Math.cos(sp.dirTheta);
@@ -665,23 +693,35 @@ export class SyntheticDataGenerator {
       const perp2Y = Math.sin(sp.dirPhi);
       const perp2Z = -Math.cos(sp.dirPhi) * Math.sin(sp.dirTheta);
 
-      // Spiral angle
-      const angle = t * sp.turns * Math.PI * 2;
-      const radius = sp.taper ? sp.radius * (1 - t * 0.5) : sp.radius;
+      // Spiral angle with added turbulence and braiding
+      const orbitAngle = sp.orbitPhase + t * sp.orbitTurns * Math.PI * 2;
+      const orbitR = sp.orbitRadius * (1 - t * 0.3);
 
-      // Position on spiral
+      const strandPhase = (Math.floor(Math.random() * sp.strandCount) / sp.strandCount) * Math.PI * 2;
+      const wobble = Math.sin(t * sp.noiseFreq * Math.PI * 2 + sp.orbitPhase) * sp.kink +
+        Math.cos(t * sp.noiseFreq * Math.PI + sp.orbitPhase * 0.5) * sp.kink * 0.5;
+
+      const angle = t * sp.turns * Math.PI * 2 + strandPhase + wobble;
+      const radius = sp.taper ? sp.radius * (1 - t * 0.6) : sp.radius;
+
+      // Position on spiral with braiding around a shared core
       const spiralX = sp.startX + t * sp.length * dirX + radius * (Math.cos(angle) * perpX + Math.sin(angle) * perp2X);
-      const spiralY = sp.startY + t * sp.length * dirY + radius * Math.sin(angle) * perp2Y;
+      const spiralY = sp.startY + t * sp.length * dirY + radius * (Math.sin(angle) * perp2Y + Math.cos(angle) * 0.05);
       const spiralZ = sp.startZ + t * sp.length * dirZ + radius * (Math.cos(angle) * perpZ + Math.sin(angle) * perp2Z);
 
+      const braidedX = spiralX + Math.cos(orbitAngle) * orbitR;
+      const braidedY = spiralY + Math.sin(orbitAngle * 0.5) * sp.kink * 0.8;
+      const braidedZ = spiralZ + Math.sin(orbitAngle) * orbitR;
+
       // Add thickness
-      const thick = sp.thickness * (sp.taper ? (1 - t * 0.3) : 1);
-      positions[idx] = spiralX + this._gaussianRandom() * thick;
-      positions[idx + 1] = spiralY + this._gaussianRandom() * thick;
-      positions[idx + 2] = spiralZ + this._gaussianRandom() * thick;
+      const thick = sp.thickness * (1.25 - t * 0.35);
+      positions[idx] = braidedX + this._gaussianRandom() * thick;
+      positions[idx + 1] = braidedY + this._gaussianRandom() * thick * 0.9;
+      positions[idx + 2] = braidedZ + this._gaussianRandom() * thick;
 
       // Color gradient along spiral (convert to uint8)
-      const color = this._hslToRgb(sp.hue + t * 0.1, 0.75, 0.45 + t * 0.15);
+      const band = (Math.sin(angle * 0.5 + sp.orbitPhase) + 1) * 0.12;
+      const color = this._hslToRgb((sp.hue + t * 0.12 + band * 0.1) % 1, 0.78, 0.42 + t * 0.18 + band * 0.15);
       const cidx = i * 4;
       colors[cidx] = Math.round(Math.max(0, Math.min(1, color[0] + (Math.random() - 0.5) * 0.08)) * 255);
       colors[cidx + 1] = Math.round(Math.max(0, Math.min(1, color[1] + (Math.random() - 0.5) * 0.08)) * 255);

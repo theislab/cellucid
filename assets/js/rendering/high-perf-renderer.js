@@ -966,7 +966,11 @@ export class HighPerfRenderer {
   }
 
   updateColors(colors) {
+    // Skip if same reference - avoids redundant buffer rebuilds every frame
+    if (colors === this._colors) return;
+
     this._colors = colors; // Now Uint8Array with RGBA packed
+    this._currentAlphas = null; // Reset alpha tracking since colors changed
 
     // Mark buffers as dirty - actual rebuild deferred to render() to avoid double rebuilds
     this._bufferDirty = true;
@@ -976,8 +980,13 @@ export class HighPerfRenderer {
   }
 
   updateAlphas(alphas) {
+    // Skip if same reference - avoids redundant buffer rebuilds every frame
+    if (alphas === this._currentAlphas) return;
+
     // Pack float alphas (0.0-1.0) into the colors array's alpha channel (RGBA uint8)
     if (!this._colors || !alphas) return;
+
+    this._currentAlphas = alphas; // Track current alphas reference
 
     const n = Math.min(this.pointCount, alphas.length);
     for (let i = 0; i < n; i++) {
@@ -989,6 +998,16 @@ export class HighPerfRenderer {
     if (this.octree && this.lodBuffers.length > 0) {
       this._lodBuffersDirty = true;
     }
+  }
+
+  /** Get current colors array reference (for comparison) */
+  getCurrentColors() {
+    return this._colors;
+  }
+
+  /** Get current alphas array reference (for comparison) */
+  getCurrentAlphas() {
+    return this._currentAlphas;
   }
 
   /**

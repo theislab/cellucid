@@ -64,6 +64,8 @@ class DataState {
     this._highlightIdCounter = 0;
     this._highlightChangeCallbacks = new Set();
     this._highlightPageChangeCallbacks = new Set(); // Callbacks when pages change (add/remove/rename/switch)
+    this._cachedHighlightCount = null; // Cached visible highlight count
+    this._cachedTotalHighlightCount = null; // Cached total highlight count
   }
 
   // --- View context helpers ---------------------------------------------------
@@ -144,6 +146,41 @@ class DataState {
       ? { ...this.filteredCount }
       : { shown: this.pointCount, total: this.pointCount };
     return ctx;
+  }
+
+  captureCurrentContext() {
+    return this._buildContextFromCurrent(this.activeViewId || 'live', { cloneArrays: true });
+  }
+
+  restoreContext(ctx, { preserveSnapshots = true } = {}) {
+    if (!ctx) return;
+    this.obsData = this._cloneObsData(ctx.obsData);
+    this.varData = this._cloneVarData(ctx.varData);
+    this.activeFieldIndex = ctx.activeFieldIndex ?? -1;
+    this.activeVarFieldIndex = ctx.activeVarFieldIndex ?? -1;
+    this.activeFieldSource = ctx.activeFieldSource ?? null;
+    this.colorsArray = ctx.colorsArray ? new Uint8Array(ctx.colorsArray) : null;
+    this.categoryTransparency = ctx.categoryTransparency ? new Float32Array(ctx.categoryTransparency) : null;
+    this.outlierQuantilesArray = ctx.outlierQuantilesArray ? new Float32Array(ctx.outlierQuantilesArray) : null;
+    this.centroidPositions = ctx.centroidPositions ? new Float32Array(ctx.centroidPositions) : null;
+    this.centroidColors = ctx.centroidColors ? new Uint8Array(ctx.centroidColors) : null;
+    this.centroidOutliers = ctx.centroidOutliers ? new Float32Array(ctx.centroidOutliers) : null;
+    this.centroidLabels = ctx.centroidLabels ? ctx.centroidLabels.map((c) => (c ? { ...c } : c)) : [];
+    this.filteredCount = ctx.filteredCount ? { ...ctx.filteredCount } : { shown: this.pointCount, total: this.pointCount };
+    if (preserveSnapshots) {
+      this.activeViewId = 'live';
+      this.viewContexts.set('live', this._buildContextFromCurrent('live', { cloneArrays: false }));
+    } else {
+      this._resetViewContexts();
+    }
+    this._syncActiveContext();
+    this._pushColorsToViewer();
+    this._pushTransparencyToViewer();
+    this._pushOutliersToViewer();
+    this._pushCentroidsToViewer();
+    this._pushOutlierThresholdToViewer(this.getCurrentOutlierThreshold());
+    this.computeGlobalVisibility();
+    this.updateFilterSummary();
   }
 
   _syncActiveContext() {
@@ -439,6 +476,8 @@ class DataState {
   }
 
   _notifyVisibilityChange() {
+    // Invalidate only visible highlight count (total doesn't change with visibility)
+    this._invalidateHighlightCountCache(true);
     if (!this._visibilityChangeCallbacks || this._visibilityChangeCallbacks.size === 0) return;
     this._visibilityChangeCallbacks.forEach((cb) => {
       try { cb(); }
@@ -2207,6 +2246,7 @@ class DataState {
 
   _recomputeHighlightArray() {
     this._ensureHighlightArray();
+    this._invalidateHighlightCountCache(); // Invalidate cached counts
     this.highlightArray.fill(0);
     for (const group of this.highlightedGroups) {
       // Skip disabled groups
@@ -2382,6 +2422,41 @@ class DataState {
     return group;
   }
 
+  // Add a highlight group directly with pre-computed cell indices
+  // Used for state restoration where we have the exact cell indices
+  addHighlightDirect(groupData) {
+    if (!groupData || !groupData.cellIndices || groupData.cellIndices.length === 0) {
+      return null;
+    }
+
+    const id = `highlight_${++this._highlightIdCounter}`;
+    const group = {
+      id,
+      type: groupData.type || 'combined',
+      label: groupData.label || `Restored selection (${groupData.cellIndices.length} cells)`,
+      fieldKey: groupData.fieldKey,
+      fieldIndex: groupData.fieldIndex,
+      fieldSource: groupData.fieldSource || 'obs',
+      cellIndices: Array.isArray(groupData.cellIndices) ? groupData.cellIndices : Array.from(groupData.cellIndices),
+      cellCount: groupData.cellIndices.length,
+      enabled: groupData.enabled !== false
+    };
+
+    // Add type-specific fields
+    if (groupData.type === 'category') {
+      group.categoryIndex = groupData.categoryIndex;
+      group.categoryName = groupData.categoryName;
+    } else if (groupData.type === 'range') {
+      group.rangeMin = groupData.rangeMin;
+      group.rangeMax = groupData.rangeMax;
+    }
+
+    this.highlightedGroups.push(group);
+    this._recomputeHighlightArray();
+    this._notifyHighlightChange();
+    return group;
+  }
+
   removeHighlightGroup(groupId) {
     const idx = this.highlightedGroups.findIndex((g) => g.id === groupId);
     if (idx === -1) return false;
@@ -2412,8 +2487,9 @@ class DataState {
   }
 
   getHighlightedCellCount() {
-    // Returns count of highlighted cells that are currently visible
+    // Returns count of highlighted cells that are currently visible (cached)
     if (!this.highlightArray) return 0;
+    if (this._cachedHighlightCount !== null) return this._cachedHighlightCount;
     let count = 0;
     for (let i = 0; i < this.highlightArray.length; i++) {
       if (this.highlightArray[i] > 0) {
@@ -2422,17 +2498,26 @@ class DataState {
         if (isVisible) count++;
       }
     }
+    this._cachedHighlightCount = count;
     return count;
   }
 
   getTotalHighlightedCellCount() {
-    // Returns total count of all highlighted cells, including filtered-out ones
+    // Returns total count of all highlighted cells, including filtered-out ones (cached)
     if (!this.highlightArray) return 0;
+    if (this._cachedTotalHighlightCount !== null) return this._cachedTotalHighlightCount;
     let count = 0;
     for (let i = 0; i < this.highlightArray.length; i++) {
       if (this.highlightArray[i] > 0) count++;
     }
+    this._cachedTotalHighlightCount = count;
     return count;
+  }
+
+  // Invalidate highlight count caches (call when highlight array or visibility changes)
+  _invalidateHighlightCountCache(visibleOnly = false) {
+    this._cachedHighlightCount = null;
+    if (!visibleOnly) this._cachedTotalHighlightCount = null;
   }
 
   // Get the cell index at a screen position (requires viewer support)

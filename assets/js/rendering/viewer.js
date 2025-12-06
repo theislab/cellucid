@@ -375,6 +375,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   let viewLayoutMode = 'grid';
   let focusedViewId = LIVE_VIEW_ID;
   let liveViewLabel = 'Live view';
+  let liveViewHidden = false; // Whether to hide live view from grid
   let viewFocusHandler = typeof onViewFocus === 'function' ? onViewFocus : null;
 
   const viewTitleLayerEl = viewTitleLayer || null;
@@ -2199,16 +2200,22 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     }
 
     // Determine views to render (include centroid data for each view)
-    const allViews = [{
-      id: LIVE_VIEW_ID,
-      label: liveViewLabel,
-      colors: colorsArray,
-      transparency: transparencyArray,
-      centroidPositions: null, // Use current buffers
-      centroidColors: null,
-      centroidTransparencies: null,
-      centroidCount: centroidCount
-    }];
+    const allViews = [];
+
+    // Add live view only if not hidden
+    if (!liveViewHidden) {
+      allViews.push({
+        id: LIVE_VIEW_ID,
+        label: liveViewLabel,
+        colors: colorsArray,
+        transparency: transparencyArray,
+        centroidPositions: null, // Use current buffers
+        centroidColors: null,
+        centroidTransparencies: null,
+        centroidCount: centroidCount
+      });
+    }
+
     for (const snap of snapshotViews) {
       allViews.push({
         id: snap.id,
@@ -2222,11 +2229,20 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       });
     }
 
-    // In single mode or no snapshots, render full screen
-    if (viewLayoutMode === 'single' || snapshotViews.length === 0) {
+    // In single mode or only one view, render full screen
+    if (viewLayoutMode === 'single' || allViews.length <= 1) {
       gl.viewport(0, 0, width, height);
       gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-      renderSingleView(width, height, { x: 0, y: 0, w: 1, h: 1 });
+
+      // If we have exactly one view (e.g., live hidden with 1 snapshot), load its data
+      if (allViews.length === 1) {
+        const view = allViews[0];
+        if (view.colors) hpRenderer.updateColors(view.colors);
+        if (view.transparency) hpRenderer.updateAlphas(view.transparency);
+        renderSingleView(width, height, { x: 0, y: 0, w: 1, h: 1 }, view.id, view.centroidCount);
+      } else {
+        renderSingleView(width, height, { x: 0, y: 0, w: 1, h: 1 });
+      }
       return;
     }
 
@@ -3003,6 +3019,62 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       }
     },
 
+    getCameraState() {
+      return {
+        navigationMode,
+        orbit: {
+          radius,
+          targetRadius,
+          theta,
+          phi,
+          target: [target[0], target[1], target[2]]
+        },
+        freefly: {
+          position: [freeflyPosition[0], freeflyPosition[1], freeflyPosition[2]],
+          yaw: freeflyYaw,
+          pitch: freeflyPitch
+        }
+      };
+    },
+
+    setCameraState(camState) {
+      if (!camState) return;
+      console.log('[Viewer] setCameraState called:', camState.navigationMode, 'orbit:', camState.orbit?.radius?.toFixed(2), 'theta:', camState.orbit?.theta?.toFixed(2));
+
+      // Stop any inertia
+      velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
+      vec3.set(freeflyVelocity, 0, 0, 0);
+
+      // Set navigation mode directly without triggering sync functions
+      if (camState.navigationMode) {
+        const next = camState.navigationMode === 'free' ? 'free' : 'orbit';
+        navigationMode = next;
+        if (next === 'free') {
+          canvas.classList.add('free-nav');
+        } else {
+          canvas.classList.remove('free-nav');
+        }
+      }
+
+      if (camState.orbit) {
+        radius = camState.orbit.radius ?? radius;
+        targetRadius = camState.orbit.targetRadius ?? targetRadius;
+        theta = camState.orbit.theta ?? theta;
+        phi = camState.orbit.phi ?? phi;
+        if (camState.orbit.target) {
+          vec3.set(target, camState.orbit.target[0], camState.orbit.target[1], camState.orbit.target[2]);
+        }
+      }
+      if (camState.freefly) {
+        if (camState.freefly.position) {
+          vec3.set(freeflyPosition, camState.freefly.position[0], camState.freefly.position[1], camState.freefly.position[2]);
+        }
+        freeflyYaw = camState.freefly.yaw ?? freeflyYaw;
+        freeflyPitch = camState.freefly.pitch ?? freeflyPitch;
+      }
+      console.log('[Viewer] Camera state applied. radius:', radius.toFixed(2), 'theta:', theta.toFixed(2), 'phi:', phi.toFixed(2));
+    },
+
     stopInertia() {
       velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
       vec3.set(freeflyVelocity, 0, 0, 0);
@@ -3126,7 +3198,15 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       updateLabelLayerVisibility();
     },
 
-    getViewLayout() { return { mode: viewLayoutMode, activeId: focusedViewId }; },
+    getViewLayout() { return { mode: viewLayoutMode, activeId: focusedViewId, liveViewHidden }; },
+
+    setLiveViewHidden(hidden) {
+      liveViewHidden = Boolean(hidden);
+    },
+
+    getLiveViewHidden() {
+      return liveViewHidden;
+    },
 
     getGLContext() { return gl; },
     isWebGL2() { return true; },

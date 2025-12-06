@@ -322,8 +322,8 @@ html, body {
 /* Section titles inside cards */
 .section-divider {
   border-top: 1px solid rgba(0, 0, 0, 0.12);
-  margin: 8px 0;
-  padding-top: 6px;
+  margin: 6px 0 4px;
+  padding-top: 4px;
 }
 
 .section-title {
@@ -547,6 +547,48 @@ html, body {
   opacity: 0.85;
 }
 
+#legend {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.legend-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.legend-section + .legend-section {
+  border-top: 1px solid rgba(0, 0, 0, 0.12);
+  padding-top: 8px;
+}
+
+.legend-subtitle {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #1f2937;
+}
+
+.legend-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.legend-toggle-label {
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  color: #374151;
+}
+
+.legend-filter {
+  gap: 4px;
+}
+
 .legend-help {
   font-size: 10px;
   opacity: 0.7;
@@ -642,8 +684,7 @@ html, body {
   display: flex;
   gap: 8px;
   margin-bottom: 6px;
-  padding-bottom: 6px;
-  border-bottom: 1px solid rgba(0, 0, 0, 0.14);
+  padding-bottom: 0;
 }
 
 .legend-controls button {
@@ -654,7 +695,7 @@ html, body {
 .legend-item {
   display: flex;
   align-items: center;
-  margin-bottom: 3px;
+  margin-bottom: 1px;
   position: relative;
 }
 
@@ -701,6 +742,7 @@ html, body {
 }
 
 .legend-label {
+  font-size: 10px;
   flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -727,10 +769,16 @@ html, body {
    Active filter list – chips with consistent style
    ===================================================================== */
 
-#filter-count {
+#filter-count,
+#highlight-count {
   font-size: 11px;
   font-family: "Merriweather", Georgia, "Times New Roman", serif;
   margin-bottom: 6px;
+  color: #666666;
+}
+
+#active-filters-container {
+  margin-top: 0px;
 }
 
 #active-filters {
@@ -837,25 +885,18 @@ html, body {
    ===================================================================== */
 
 #highlight-count {
-  position: relative;
-  padding: 8px 10px 8px 14px;
-  border-radius: 6px;
-  border: var(--viewer-border-strong);
-  background: var(--viewer-paper);
-  box-shadow: var(--viewer-shadow);
-  color: var(--viewer-ink);
-  font-weight: 600;
-  letter-spacing: 0.01em;
+  position: static;
+  padding: 0;
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  font-weight: 400;
+  letter-spacing: 0;
 }
 
 #highlight-count::before {
+  display: none;
   content: "";
-  position: absolute;
-  left: 8px;
-  top: 8px;
-  bottom: 8px;
-  width: 3px;
-  background: linear-gradient(180deg, var(--highlight-accent) 0%, var(--highlight-accent-strong) 100%);
 }
 
 #highlight-hint {
@@ -1409,6 +1450,27 @@ html, body {
   margin-top: 4px;
 }
 
+.legend-actions.compact {
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.legend-actions.compact button {
+  padding: 4px 8px;
+  font-size: 9px;
+}
+
+.legend-actions button.primary {
+  background: #111827;
+  color: #ffffff;
+  border-color: #111827;
+}
+
+.legend-actions button.primary:hover {
+  background: #0f172a;
+  color: #ffffff;
+}
+
 /* ========================================================================
    Misc / global pieces that weren’t sidebar-specific
    (mostly unchanged from your original)
@@ -1458,7 +1520,7 @@ html, body {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  max-height: 80px;
+  max-height: 200px;
   overflow-y: auto;
   padding: 4px 6px;
   border: 1px solid rgba(0, 0, 0, 0.14);

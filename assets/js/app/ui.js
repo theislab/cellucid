@@ -81,10 +81,15 @@ export function initUI({ state, viewer, dom, smoke }) {
     splitClearBtn,
     viewLayoutModeSelect,
     activeViewSelect,
-    splitViewBadges
+    splitViewBadges,
+    // Session save/load
+    saveStateBtn,
+    loadStateBtn,
+    sessionStatus
   } = dom;
 
   const rebuildSmokeDensity = smoke?.rebuildSmokeDensity || null;
+  const stateSerializer = arguments[0].stateSerializer || null;
 
   const NONE_FIELD_VALUE = '-1';
   let hasCategoricalFields = false;
@@ -105,6 +110,7 @@ export function initUI({ state, viewer, dom, smoke }) {
   const LIVE_VIEW_ID = 'live';
   let activeViewId = LIVE_VIEW_ID;
   let viewLayoutMode = 'grid'; // 'grid' or 'single'
+  let liveViewHidden = false; // Whether to hide live view from grid
 
   // Create floating range label for continuous selection
   const rangeLabel = document.createElement('div');
@@ -1095,8 +1101,8 @@ export function initUI({ state, viewer, dom, smoke }) {
     }
 
     if (model.kind === 'continuous') {
-      const container = document.createElement('div');
-      container.className = 'legend-group';
+      const colorSection = document.createElement('div');
+      colorSection.className = 'legend-section';
       const colorHeader = document.createElement('div');
       colorHeader.className = 'legend-section-title';
       const colormapLabel = model.colormap?.label || 'Viridis';
@@ -1180,18 +1186,6 @@ export function initUI({ state, viewer, dom, smoke }) {
       minMaxRow.appendChild(minSpan);
       minMaxRow.appendChild(maxSpan);
 
-      const label = document.createElement('div');
-      label.style.fontSize = '10px';
-      label.style.opacity = '0.8';
-      label.style.marginTop = '2px';
-      function setScaleLabelText(isLog, paletteName) {
-        const name = paletteName || 'Viridis';
-        label.textContent = isLog
-          ? `Values mapped to ${name} (log10)`
-          : `Values mapped to ${name}`;
-      }
-      setScaleLabelText(model.colorbar?.scale === 'log' || model.logEnabled, colormapLabel);
-
       const logRow = document.createElement('div');
       logRow.className = 'legend-toggle-row';
       const logLabel = document.createElement('span');
@@ -1232,7 +1226,6 @@ export function initUI({ state, viewer, dom, smoke }) {
         maxSpan.textContent = formatLegendNumber(cMax);
         const isLog = activeModel.colorbar?.scale === 'log' || activeModel.logEnabled;
         colorHeader.textContent = `Color scale (${activeModel.colormap?.label || 'Viridis'})`;
-        setScaleLabelText(isLog, activeModel.colormap?.label);
         setLogToggle(Boolean(activeModel.logEnabled));
         setRescaleToggle(Boolean(activeModel.colorbar?.usingFilter));
       }
@@ -1265,32 +1258,29 @@ export function initUI({ state, viewer, dom, smoke }) {
       rescaleHint.className = 'legend-help';
       rescaleHint.textContent = 'On: colors track sliders; Off: full data range';
 
-      container.appendChild(colorHeader);
-      container.appendChild(colorBarWrapper);
-      container.appendChild(minMaxRow);
-      container.appendChild(label);
-      container.appendChild(logRow);
-      container.appendChild(logHint);
-      container.appendChild(rescaleRow);
-      container.appendChild(rescaleHint);
+      colorSection.appendChild(colorHeader);
+      colorSection.appendChild(colorBarWrapper);
+      colorSection.appendChild(minMaxRow);
+      colorSection.appendChild(logRow);
+      colorSection.appendChild(logHint);
+      colorSection.appendChild(rescaleRow);
+      colorSection.appendChild(rescaleHint);
 
       const range = model.stats.max - model.stats.min || 1;
-      const filterContainer = document.createElement('div');
-      filterContainer.style.marginTop = '4px';
+      const filterSection = document.createElement('div');
+      filterSection.className = 'legend-section legend-filter';
       const filterHeader = document.createElement('div');
       filterHeader.className = 'legend-section-title';
       filterHeader.textContent = 'Filtering';
       const filterTitle = document.createElement('div');
+      filterTitle.className = 'legend-subtitle';
       filterTitle.textContent = 'Visible range';
-      filterTitle.style.fontSize = '10px';
-      filterTitle.style.opacity = '0.8';
-      filterTitle.style.marginBottom = '2px';
       const filterSubtext = document.createElement('div');
       filterSubtext.className = 'legend-help';
-      filterSubtext.textContent = 'Adjust limits; click Filter or enable Live filtering.';
-      filterContainer.appendChild(filterHeader);
-      filterContainer.appendChild(filterTitle);
-      filterContainer.appendChild(filterSubtext);
+      filterSubtext.textContent = 'Adjust limits; click FILTER or enable Live filtering.';
+      filterSection.appendChild(filterHeader);
+      filterSection.appendChild(filterTitle);
+      filterSection.appendChild(filterSubtext);
 
       let liveFilteringEnabled = true;
       let filterBtn = null;
@@ -1331,14 +1321,14 @@ export function initUI({ state, viewer, dom, smoke }) {
 
       liveRow.appendChild(liveLabel);
       liveRow.appendChild(liveToggle);
-      filterContainer.appendChild(liveRow);
-      filterContainer.appendChild(liveHint);
+      filterSection.appendChild(liveRow);
+      filterSection.appendChild(liveHint);
 
       const minRow = document.createElement('div');
       minRow.className = 'slider-row';
       const minLabelEl = document.createElement('span');
+      minLabelEl.className = 'legend-subtitle';
       minLabelEl.textContent = 'Min';
-      minLabelEl.style.fontSize = '10px';
       const minSlider = document.createElement('input');
       minSlider.type = 'range';
       minSlider.min = '0';
@@ -1348,8 +1338,8 @@ export function initUI({ state, viewer, dom, smoke }) {
       const maxRow = document.createElement('div');
       maxRow.className = 'slider-row';
       const maxLabelEl = document.createElement('span');
+      maxLabelEl.className = 'legend-subtitle';
       maxLabelEl.textContent = 'Max';
-      maxLabelEl.style.fontSize = '10px';
       const maxSlider = document.createElement('input');
       maxSlider.type = 'range';
       maxSlider.min = '0';
@@ -1374,34 +1364,23 @@ export function initUI({ state, viewer, dom, smoke }) {
       maxRow.appendChild(maxSlider);
       maxRow.appendChild(maxValueEl);
 
-      filterContainer.appendChild(minRow);
-      filterContainer.appendChild(maxRow);
+      filterSection.appendChild(minRow);
+      filterSection.appendChild(maxRow);
 
       const resetRow = document.createElement('div');
-      resetRow.className = 'legend-actions';
+      resetRow.className = 'legend-actions compact';
       const resetBtn = document.createElement('button');
-      resetBtn.textContent = 'Reset';
-      resetBtn.style.fontSize = '9px';
-      resetBtn.style.padding = '2px 6px';
-      resetBtn.style.borderRadius = '3px';
-      resetBtn.style.border = '1px solid rgba(0,0,0,0.25)';
-      resetBtn.style.background = '#f5f5f5';
-      resetBtn.style.cursor = 'pointer';
+      resetBtn.type = 'button';
+      resetBtn.textContent = 'RESET';
       filterBtn = document.createElement('button');
-      filterBtn.textContent = 'Filter';
-      filterBtn.style.fontSize = '9px';
-      filterBtn.style.padding = '2px 8px';
-      filterBtn.style.borderRadius = '3px';
-      filterBtn.style.border = '1px solid rgba(0,0,0,0.25)';
-      filterBtn.style.background = '#e8eefc';
-      filterBtn.style.cursor = 'pointer';
-      filterBtn.style.fontWeight = '600';
-      resetRow.style.gap = '6px';
+      filterBtn.type = 'button';
+      filterBtn.textContent = 'FILTER';
+      filterBtn.className = 'primary';
       resetRow.appendChild(filterBtn);
       resetRow.appendChild(resetBtn);
-      filterContainer.appendChild(resetRow);
-      container.appendChild(filterContainer);
-      legendEl.appendChild(container);
+      filterSection.appendChild(resetRow);
+      legendEl.appendChild(colorSection);
+      legendEl.appendChild(filterSection);
 
       function getSliderValues() {
         let minValPct = parseFloat(minSlider.value);
@@ -1465,12 +1444,14 @@ export function initUI({ state, viewer, dom, smoke }) {
       updateDisplayFromSliders();
       if (liveFilteringEnabled) applyFilterFromSliders();
     } else {
+      const catSection = document.createElement('div');
+      catSection.className = 'legend-section';
       const title = document.createElement('div');
       title.textContent = 'Click a swatch to pick a color';
       title.style.fontSize = '10px';
       title.style.opacity = '0.8';
       title.style.marginBottom = '4px';
-      legendEl.appendChild(title);
+      catSection.appendChild(title);
 
       const controlsDiv = document.createElement('div');
       controlsDiv.className = 'legend-controls';
@@ -1492,7 +1473,7 @@ export function initUI({ state, viewer, dom, smoke }) {
       });
       controlsDiv.appendChild(showAllBtn);
       controlsDiv.appendChild(hideAllBtn);
-      legendEl.appendChild(controlsDiv);
+      catSection.appendChild(controlsDiv);
 
       const categories = model.categories || [];
       const counts = model.counts || {};
@@ -1563,8 +1544,9 @@ export function initUI({ state, viewer, dom, smoke }) {
         row.appendChild(swatch);
         row.appendChild(labelSpan);
         row.appendChild(countSpan);
-        legendEl.appendChild(row);
+        catSection.appendChild(row);
       });
+      legendEl.appendChild(catSection);
     }
   }
 
@@ -1691,45 +1673,88 @@ export function initUI({ state, viewer, dom, smoke }) {
       ? viewer.getSnapshotViews()
       : [];
 
-    const liveField = state.getActiveField ? state.getActiveField() : null;
-    const liveLabel = liveField ? (liveField.key || 'Active field') : 'All cells';
-
-    // Live badge
-    const liveBadge = document.createElement('div');
-    liveBadge.className = 'split-badge split-badge-live';
-    if (String(activeViewId) === LIVE_VIEW_ID) {
-      liveBadge.classList.add('active');
+    // If live view is hidden but no snapshots exist, show it again
+    if (liveViewHidden && snapshots.length === 0) {
+      liveViewHidden = false;
+      if (typeof viewer.setLiveViewHidden === 'function') {
+        viewer.setLiveViewHidden(false);
+      }
     }
-    liveBadge.addEventListener('click', () => {
-      activeViewId = LIVE_VIEW_ID;
-      if (activeViewSelect) activeViewSelect.value = LIVE_VIEW_ID;
-      syncActiveViewToState();
-      pushViewLayoutToViewer();
-      renderSplitViewBadges();
-    });
 
-    const livePill = document.createElement('span');
-    livePill.className = 'split-badge-pill';
-    livePill.textContent = '① Live';
+    let badgeIndex = 1;
 
-    const liveText = document.createElement('span');
-    liveText.className = 'split-badge-label';
-    liveText.textContent = liveLabel;
+    // Live badge (only if not hidden)
+    if (!liveViewHidden) {
+      const liveField = state.getActiveField ? state.getActiveField() : null;
+      const liveLabel = liveField ? (liveField.key || 'Active field') : 'All cells';
 
-    liveBadge.appendChild(livePill);
-    liveBadge.appendChild(liveText);
-    splitViewBadges.appendChild(liveBadge);
+      const liveBadge = document.createElement('div');
+      liveBadge.className = 'split-badge';
+      if (String(activeViewId) === LIVE_VIEW_ID) {
+        liveBadge.classList.add('active');
+      }
+      liveBadge.addEventListener('click', () => {
+        activeViewId = LIVE_VIEW_ID;
+        if (activeViewSelect) activeViewSelect.value = LIVE_VIEW_ID;
+        syncActiveViewToState();
+        pushViewLayoutToViewer();
+        renderSplitViewBadges();
+      });
 
-    if (!snapshots.length) {
+      const livePill = document.createElement('span');
+      livePill.className = 'split-badge-pill';
+      livePill.textContent = String(badgeIndex);
+
+      const liveText = document.createElement('span');
+      liveText.className = 'split-badge-label';
+      liveText.textContent = liveLabel;
+
+      // Close button for live view (only show if there are snapshots to fall back to)
+      if (snapshots.length > 0) {
+        const liveRemoveBtn = document.createElement('button');
+        liveRemoveBtn.type = 'button';
+        liveRemoveBtn.className = 'split-badge-remove';
+        liveRemoveBtn.title = 'Hide live view from grid';
+        liveRemoveBtn.textContent = '×';
+        liveRemoveBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          liveViewHidden = true;
+          if (typeof viewer.setLiveViewHidden === 'function') {
+            viewer.setLiveViewHidden(true);
+          }
+          // Switch to first snapshot if we were viewing live
+          if (String(activeViewId) === LIVE_VIEW_ID && snapshots.length > 0) {
+            activeViewId = String(snapshots[0].id);
+            if (activeViewSelect) activeViewSelect.value = activeViewId;
+            syncActiveViewToState();
+            pushViewLayoutToViewer();
+          }
+          renderSplitViewBadges();
+          updateSplitViewUI();
+        });
+
+        liveBadge.appendChild(livePill);
+        liveBadge.appendChild(liveText);
+        liveBadge.appendChild(liveRemoveBtn);
+      } else {
+        liveBadge.appendChild(livePill);
+        liveBadge.appendChild(liveText);
+      }
+
+      splitViewBadges.appendChild(liveBadge);
+      badgeIndex++;
+    }
+
+    if (!snapshots.length && !liveViewHidden) {
       const info = document.createElement('div');
       info.className = 'filter-info';
-      info.textContent = 'Configure a view and press “Keep view” to add panels.';
+      info.textContent = 'Configure a view and press "Keep view" to add panels.';
       splitViewBadges.appendChild(info);
       syncActiveViewSelectOptions();
       return;
     }
 
-    snapshots.forEach((snap, idx) => {
+    snapshots.forEach((snap) => {
       const badge = document.createElement('div');
       badge.className = 'split-badge';
       const snapId = String(snap.id);
@@ -1746,11 +1771,11 @@ export function initUI({ state, viewer, dom, smoke }) {
 
       const pill = document.createElement('span');
       pill.className = 'split-badge-pill';
-      pill.textContent = `${idx + 2}`;
+      pill.textContent = String(badgeIndex);
 
       const text = document.createElement('span');
       text.className = 'split-badge-label';
-      const mainLabel = snap.label || snap.fieldKey || `View ${idx + 2}`;
+      const mainLabel = snap.label || snap.fieldKey || `View ${badgeIndex}`;
       text.textContent = mainLabel;
 
       const removeBtn = document.createElement('button');
@@ -1770,6 +1795,25 @@ export function initUI({ state, viewer, dom, smoke }) {
           const ids = viewer.getSnapshotViews().map((v) => v.id);
           state.syncSnapshotContexts(ids);
         }
+        // If this was the active view, switch to live or another snapshot
+        if (snapId === String(activeViewId)) {
+          const remainingSnaps = viewer.getSnapshotViews();
+          if (!liveViewHidden) {
+            activeViewId = LIVE_VIEW_ID;
+          } else if (remainingSnaps.length > 0) {
+            activeViewId = String(remainingSnaps[0].id);
+          } else {
+            // No more snapshots and live is hidden - show live again
+            liveViewHidden = false;
+            if (typeof viewer.setLiveViewHidden === 'function') {
+              viewer.setLiveViewHidden(false);
+            }
+            activeViewId = LIVE_VIEW_ID;
+          }
+          if (activeViewSelect) activeViewSelect.value = activeViewId;
+          syncActiveViewToState();
+          pushViewLayoutToViewer();
+        }
         renderSplitViewBadges();
         updateSplitViewUI();
       });
@@ -1778,6 +1822,7 @@ export function initUI({ state, viewer, dom, smoke }) {
       badge.appendChild(text);
       badge.appendChild(removeBtn);
       splitViewBadges.appendChild(badge);
+      badgeIndex++;
     });
 
     syncActiveViewSelectOptions();
@@ -2773,5 +2818,65 @@ export function initUI({ state, viewer, dom, smoke }) {
   renderSplitViewBadges();
   updateSplitViewUI();
 
-  return { activateField };
+  // Session save/load wiring
+  function refreshUiAfterStateLoad() {
+    // Sync liveViewHidden from viewer
+    if (typeof viewer.getLiveViewHidden === 'function') {
+      liveViewHidden = viewer.getLiveViewHidden();
+    }
+
+    renderHighlightPages();
+    renderHighlightSummary();
+    renderFilterSummary();
+    updateFilterCount();
+    renderLegend(state.getActiveField());
+    handleOutlierUI(state.getActiveField());
+    const counts = state.getFilteredCount();
+    const activeField = state.getActiveField();
+    updateStats({
+      field: activeField,
+      pointCount: counts?.total || 0,
+      centroidInfo: ''
+    });
+    renderSplitViewBadges();
+    updateSplitViewUI();
+  }
+
+  function showSessionStatus(message, isError = false) {
+    if (!sessionStatus) return;
+    sessionStatus.textContent = message;
+    sessionStatus.style.color = isError ? '#f44336' : 'var(--success-color, #4caf50)';
+    sessionStatus.style.display = 'block';
+    setTimeout(() => {
+      sessionStatus.style.display = 'none';
+    }, 3000);
+  }
+
+  if (saveStateBtn && stateSerializer) {
+    saveStateBtn.addEventListener('click', () => {
+      try {
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        stateSerializer.downloadState(`cellucid-state-${timestamp}.json`);
+        showSessionStatus('State saved successfully');
+      } catch (err) {
+        console.error('Failed to save state:', err);
+        showSessionStatus('Failed to save state', true);
+      }
+    });
+  }
+
+  if (loadStateBtn && stateSerializer) {
+    loadStateBtn.addEventListener('click', async () => {
+      try {
+        await stateSerializer.loadStateFromFile();
+        showSessionStatus('State loaded successfully');
+        refreshUiAfterStateLoad();
+      } catch (err) {
+        console.error('Failed to load state:', err);
+        showSessionStatus(err?.message || 'Failed to load state', true);
+      }
+    });
+  }
+
+  return { activateField, refreshUiAfterStateLoad, showSessionStatus };
 }

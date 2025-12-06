@@ -2,6 +2,7 @@
 import { createViewer } from '../rendering/viewer.js';
 import { createDataState } from './state.js';
 import { initUI } from './ui.js';
+import { createStateSerializer } from './state-serializer.js';
 import {
   loadPointsBinary,
   loadObsJson,
@@ -11,7 +12,8 @@ import {
   loadVarFieldData,
   loadConnectivityManifest,
   hasEdgeFormat,
-  loadEdges
+  loadEdges,
+  loadDatasetSignature
 } from '../data/data-loaders.js';
 import { SyntheticDataGenerator, PerformanceTracker, BenchmarkReporter, formatNumber } from '../dev/benchmark.js';
 
@@ -22,6 +24,7 @@ const OBS_MANIFEST_URL = `${EXPORT_BASE_URL}obs_manifest.json`;
 const VAR_MANIFEST_URL = `${EXPORT_BASE_URL}var_manifest.json`;
 const CONNECTIVITY_MANIFEST_URL = `${EXPORT_BASE_URL}connectivity_manifest.json`;
 const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
+const DATASET_HASH_URL = `${EXPORT_BASE_URL}dataset_hash.json`;
 
 (async function bootstrap() {
   const canvas = document.getElementById('glcanvas');
@@ -125,6 +128,22 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
   const connectivityLimitDisplay = document.getElementById('connectivity-limit-display');
   const connectivityInfo = document.getElementById('connectivity-info');
 
+  // Session save/load controls
+  const saveStateBtn = document.getElementById('save-state-btn');
+  const loadStateBtn = document.getElementById('load-state-btn');
+  const sessionStatus = document.getElementById('session-status');
+
+  // Dataset signature for clash detection
+  let datasetSignature = null;
+  try {
+    datasetSignature = await loadDatasetSignature(DATASET_HASH_URL);
+    if (!datasetSignature?.signature) {
+      console.warn('[Main] dataset_hash.json missing or empty; state clash detection will be skipped.');
+    }
+  } catch (err) {
+    console.warn('[Main] Failed to load dataset signature:', err);
+  }
+
   try {
     console.log('[Main] Creating viewer...');
     const viewer = createViewer({ canvas, labelLayer, viewTitleLayer, sidebar });
@@ -209,6 +228,8 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
     // Smoke volume is built lazily when switching to smoke mode
     // (no initial build to save startup time)
 
+    const stateSerializer = createStateSerializer({ state, viewer, sidebar, datasetSignature });
+
     const ui = initUI({
       state,
       viewer,
@@ -291,14 +312,95 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
         splitClearBtn,
         viewLayoutModeSelect,
         activeViewSelect,
-        splitViewBadges
+        splitViewBadges,
+        saveStateBtn,
+        loadStateBtn,
+        sessionStatus
       },
       smoke: {
         rebuildSmokeDensity
-      }
+      },
+      stateSerializer: stateSerializer
     });
 
     await ui.activateField(-1);
+
+    // Discover state snapshots in the exports directory (for automatic restore)
+    async function discoverLocalStateSnapshots(baseUrl) {
+      const candidates = new Set();
+      const stateRegex = /state[^/]*\.json$/i;
+      let resolvedBase = null;
+      try {
+        resolvedBase = new URL(baseUrl, window.location.href);
+      } catch (_err) {
+        resolvedBase = null;
+      }
+
+      const resolveCandidate = (path, overrideBase = null) => {
+        try {
+          const base = overrideBase || resolvedBase || window.location.href;
+          return new URL(path, base).toString();
+        } catch (_err) {
+          return path;
+        }
+      };
+
+      try {
+        const res = await fetch(baseUrl);
+        if (res.ok) {
+          const text = await res.text();
+          const linkRegex = /href="([^"]+)"/gi;
+          let match;
+          while ((match = linkRegex.exec(text)) !== null) {
+            const rawHref = match[1];
+            const cleanHref = rawHref.split('#')[0].split('?')[0];
+            const filename = cleanHref.split('/').pop() || '';
+            if (!stateRegex.test(filename)) continue;
+            candidates.add(resolveCandidate(cleanHref, res.url));
+          }
+        }
+      } catch (err) {
+        console.warn('[Main] Could not inspect exports directory for state files:', err);
+      }
+
+      const fallbackNames = ['cellucid-state.json', 'state.json'];
+      for (const name of fallbackNames) {
+        const candidateUrl = resolveCandidate(name);
+        if (candidates.has(candidateUrl)) continue;
+        try {
+          const headResp = await fetch(candidateUrl, { method: 'HEAD' });
+          if (headResp.ok) {
+            candidates.add(candidateUrl);
+            continue;
+          }
+          if (headResp.status === 405 || headResp.status === 501) {
+            const getResp = await fetch(candidateUrl);
+            if (getResp.ok) {
+              candidates.add(candidateUrl);
+            }
+          }
+        } catch (_err) {
+          // Ignore missing files or servers that disallow HEAD
+        }
+      }
+
+      return Array.from(candidates).sort();
+    }
+
+    async function autoLoadLatestState() {
+      const stateFiles = await discoverLocalStateSnapshots(EXPORT_BASE_URL);
+      if (!stateFiles.length) return;
+      const target = stateFiles[stateFiles.length - 1];
+      console.log('[Main] Auto-loading state snapshot from', target);
+      try {
+        await stateSerializer.loadStateFromUrl(target);
+        ui.refreshUiAfterStateLoad?.();
+        ui.showSessionStatus?.('Loaded saved state from data directory');
+      } catch (err) {
+        console.warn('[Main] Failed to auto-load state:', err);
+        ui.showSessionStatus?.(err?.message || 'Failed to auto-load state', true);
+      }
+    }
 
     // Initial smoke mode setup
     if (renderModeSelect) {
@@ -1030,6 +1132,8 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
         runBenchmark(count, pattern);
       });
     });
+
+    await autoLoadLatestState();
 
     viewer.start();
   } catch (err) {

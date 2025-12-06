@@ -154,6 +154,20 @@
     </div>
 
     <div class="accordion">
+      <details class="accordion-section" id="session-section" open>
+        <summary>Session</summary>
+        <div class="accordion-content">
+          <div class="legend-help">
+            Save or load the complete application state including camera, filters, highlights, and all settings.
+          </div>
+          <div class="control-block" style="display: flex; gap: 8px; margin-top: 8px;">
+            <button id="save-state-btn" class="reset-btn" style="flex: 1;">Save State</button>
+            <button id="load-state-btn" class="reset-btn" style="flex: 1;">Load State</button>
+          </div>
+          <div id="session-status" class="legend-help" style="margin-top: 6px; color: var(--success-color, #4caf50); display: none;"></div>
+        </div>
+      </details>
+
       <details class="accordion-section" open>
         <summary>Visualization</summary>
         <div class="accordion-content">
@@ -593,6 +607,15 @@
 
           <!-- Legend / category controls -->
           <div id="legend"></div>
+
+          <div class="section-divider" aria-hidden="true"></div>
+          <div class="control-block" id="active-filters-container">
+            <div class="section-title">Active filters</div>
+            <div id="filter-count" class="filter-info">Showing all points</div>
+            <div id="active-filters" class="filter-info-block">
+              <div class="filter-info">No filters active (showing all points).</div>
+            </div>
+          </div>
         </div>
       </details>
 
@@ -615,16 +638,6 @@
           </div>
           <div id="highlight-actions" class="highlight-actions" style="display: none;">
             <button type="button" class="btn-small" id="clear-all-highlights">Clear All</button>
-          </div>
-        </div>
-      </details>
-
-      <details class="accordion-section" open>
-        <summary>Active Filters</summary>
-        <div class="accordion-content">
-          <div id="filter-count" class="filter-info">Showing all points</div>
-          <div id="active-filters" class="filter-info-block">
-            <div class="filter-info">No filters active (showing all points).</div>
           </div>
         </div>
       </details>

@@ -1,0 +1,337 @@
+{
+  "version": 1,
+  "created_at": "2025-12-06T19:16:39.620849Z",
+  "signature": "abeda2e0656c109c886d43cb1c6550d3ccf56494cc290e1547d52df867967169",
+  "summary": {
+    "n_cells": 162259,
+    "obs_field_count": 28,
+    "obs_keys": [
+      "handle_anndata",
+      "lab",
+      "protocol",
+      "sample",
+      "stage",
+      "cell_type_authors",
+      "cell_type_lv1",
+      "protocol|lab|stage|sample",
+      "prep_n_counts",
+      "prep_n_genes_by_counts",
+      "prep_pct_counts_mt",
+      "prep_pct_counts_ribo",
+      "prep_pct_counts_bcr",
+      "prep_pct_counts_tcr",
+      "prep_score_mt",
+      "prep_score_ribo",
+      "prep_score_bcr",
+      "prep_score_tcr",
+      "prep_score_cc",
+      "prep_score_cc_s",
+      "prep_score_cc_g2m",
+      "prep_score_scanpy_cc_s",
+      "prep_score_scanpy_cc_g2m",
+      "prep_scanpy_cc_phase",
+      "prep_scanpy_sc_cycling_strength",
+      "qc_fail",
+      "qc_fail_reasons",
+      "cell_type_lv1||protocol|lab|stage|sample"
+    ],
+    "obs_fields_hash": "8f35fa81b546dfe07ce287f0fb646a6593ceaee4bcdab693cd4135d7c40a4f2e",
+    "gene_count": 44910,
+    "gene_list_hash": "743407bb2132dd12f6ed904d9ad9330baff94abea565be3311596a9f58775e4a",
+    "compression": 6,
+    "connectivity_edges": 10537096
+  },
+  "details": {
+    "hash_inputs": {
+      "version": 1,
+      "manifest_format": "compact_v1",
+      "n_cells": 162259,
+      "latent_dims": 17,
+      "obs_keys": [
+        "handle_anndata",
+        "lab",
+        "protocol",
+        "sample",
+        "stage",
+        "cell_type_authors",
+        "cell_type_lv1",
+        "protocol|lab|stage|sample",
+        "prep_n_counts",
+        "prep_n_genes_by_counts",
+        "prep_pct_counts_mt",
+        "prep_pct_counts_ribo",
+        "prep_pct_counts_bcr",
+        "prep_pct_counts_tcr",
+        "prep_score_mt",
+        "prep_score_ribo",
+        "prep_score_bcr",
+        "prep_score_tcr",
+        "prep_score_cc",
+        "prep_score_cc_s",
+        "prep_score_cc_g2m",
+        "prep_score_scanpy_cc_s",
+        "prep_score_scanpy_cc_g2m",
+        "prep_scanpy_cc_phase",
+        "prep_scanpy_sc_cycling_strength",
+        "qc_fail",
+        "qc_fail_reasons",
+        "cell_type_lv1||protocol|lab|stage|sample"
+      ],
+      "obs_fields_hash": "8f35fa81b546dfe07ce287f0fb646a6593ceaee4bcdab693cd4135d7c40a4f2e",
+      "obs_fields": [
+        {
+          "key": "handle_anndata",
+          "kind": "category",
+          "category_count": 11,
+          "categories_hash": "4b269852781653621727613938f90c95457ea2f06b3c2dc152d4ec5c0b581b27",
+          "codes_dtype": "uint8",
+          "outlier_quantized": true,
+          "outlier_quantization_bits": 8
+        },
+        {
+          "key": "lab",
+          "kind": "category",
+          "category_count": 7,
+          "categories_hash": "b24fcdc48d1f5b72a6d3092359e4f83d4aa7b710e87f0ba53e61422875f4cc37",
+          "codes_dtype": "uint8",
+          "outlier_quantized": true,
+          "outlier_quantization_bits": 8
+        },
+        {
+          "key": "protocol",
+          "kind": "category",
+          "category_count": 6,
+          "categories_hash": "b2cd20f059510dc2c8fe646fedac7f5b9e4733073badb524b3c3bd2705fcda9a",
+          "codes_dtype": "uint8",
+          "outlier_quantized": true,
+          "outlier_quantization_bits": 8
+        },
+        {
+          "key": "sample",
+          "kind": "category",
+          "category_count": 59,
+          "categories_hash": "b7f90f4695f958853392b985e834e68750c38f7b83f567ff8906687b358e7625",
+          "codes_dtype": "uint8",
+          "outlier_quantized": true,
+          "outlier_quantization_bits": 8
+        },
+        {
+          "key": "stage",
+          "kind": "category",
+          "category_count": 5,
+          "categories_hash": "6584963c31acb615f5a78e25a349a61030bcf18d7318cc634a3e0cbbce66b240",
+          "codes_dtype": "uint8",
+          "outlier_quantized": true,
+          "outlier_quantization_bits": 8
+        },
+        {
+          "key": "cell_type_authors",
+          "kind": "category",
+          "category_count": 80,
+          "categories_hash": "5aca0e0bcc051c04dcf9dea2f83bcc24d9149e29c78cdd8414026ee44089e59a",
+          "codes_dtype": "uint8",
+          "outlier_quantized": true,
+          "outlier_quantization_bits": 8
+        },
+        {
+          "key": "cell_type_lv1",
+          "kind": "category",
+          "category_count": 9,
+          "categories_hash": "677bb44c7ab5cbca8aaa6f83194695e43dc737dfb9eaa446e2e19d6fc9924a22",
+          "codes_dtype": "uint8",
+          "outlier_quantized": true,
+          "outlier_quantization_bits": 8
+        },
+        {
+          "key": "protocol|lab|stage|sample",
+          "kind": "category",
+          "category_count": 62,
+          "categories_hash": "6b855868e044cf4b64d3c73c9ff9bd8b247ab812787f5e5bcf350db9c163c87e",
+          "codes_dtype": "uint8",
+          "outlier_quantized": true,
+          "outlier_quantization_bits": 8
+        },
+        {
+          "key": "prep_n_counts",
+          "kind": "continuous",
+          "quantized": true,
+          "quantization_bits": 8,
+          "dtype": "uint8"
+        },
+        {
+          "key": "prep_n_genes_by_counts",
+          "kind": "continuous",
+          "quantized": true,
+          "quantization_bits": 8,
+          "dtype": "uint8"
+        },
+        {
+          "key": "prep_pct_counts_mt",
+          "kind": "continuous",
+          "quantized": true,
+          "quantization_bits": 8,
+          "dtype": "uint8"
+        },
+        {
+          "key": "prep_pct_counts_ribo",
+          "kind": "continuous",
+          "quantized": true,
+          "quantization_bits": 8,
+          "dtype": "uint8"
+        },
+        {
+          "key": "prep_pct_counts_bcr",
+          "kind": "continuous",
+          "quantized": true,
+          "quantization_bits": 8,
+          "dtype": "uint8"
+        },
+        {
+          "key": "prep_pct_counts_tcr",
+          "kind": "continuous",
+          "quantized": true,
+          "quantization_bits": 8,
+          "dtype": "uint8"
+        },
+        {
+          "key": "prep_score_mt",
+          "kind": "continuous",
+          "quantized": true,
+          "quantization_bits": 8,
+          "dtype": "uint8"
+        },
+        {
+          "key": "prep_score_ribo",
+          "kind": "continuous",
+          "quantized": true,
+          "quantization_bits": 8,
+          "dtype": "uint8"
+        },
+        {
+          "key": "prep_score_bcr",
+          "kind": "continuous",
+          "quantized": true,
+          "quantization_bits": 8,
+          "dtype": "uint8"
+        },
+        {
+          "key": "prep_score_tcr",
+          "kind": "continuous",
+          "quantized": true,
+          "quantization_bits": 8,
+          "dtype": "uint8"
+        },
+        {
+          "key": "prep_score_cc",
+          "kind": "continuous",
+          "quantized": true,
+          "quantization_bits": 8,
+          "dtype": "uint8"
+        },
+        {
+          "key": "prep_score_cc_s",
+          "kind": "continuous",
+          "quantized": true,
+          "quantization_bits": 8,
+          "dtype": "uint8"
+        },
+        {
+          "key": "prep_score_cc_g2m",
+          "kind": "continuous",
+          "quantized": true,
+          "quantization_bits": 8,
+          "dtype": "uint8"
+        },
+        {
+          "key": "prep_score_scanpy_cc_s",
+          "kind": "continuous",
+          "quantized": true,
+          "quantization_bits": 8,
+          "dtype": "uint8"
+        },
+        {
+          "key": "prep_score_scanpy_cc_g2m",
+          "kind": "continuous",
+          "quantized": true,
+          "quantization_bits": 8,
+          "dtype": "uint8"
+        },
+        {
+          "key": "prep_scanpy_cc_phase",
+          "kind": "category",
+          "category_count": 3,
+          "categories_hash": "6102f5726673d3dd70fbfcdb8216680b5848438ded41ce2d67075fa121e571c1",
+          "codes_dtype": "uint8",
+          "outlier_quantized": true,
+          "outlier_quantization_bits": 8
+        },
+        {
+          "key": "prep_scanpy_sc_cycling_strength",
+          "kind": "continuous",
+          "quantized": true,
+          "quantization_bits": 8,
+          "dtype": "uint8"
+        },
+        {
+          "key": "qc_fail",
+          "kind": "category",
+          "category_count": 1,
+          "categories_hash": "7e6e55368ace86a77858dc00de69db346d86e69c4412689e8d63238c73c9c669",
+          "codes_dtype": "uint8",
+          "outlier_quantized": true,
+          "outlier_quantization_bits": 8
+        },
+        {
+          "key": "qc_fail_reasons",
+          "kind": "category",
+          "category_count": 0,
+          "categories_hash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "codes_dtype": "uint8",
+          "outlier_quantized": true,
+          "outlier_quantization_bits": 8
+        },
+        {
+          "key": "cell_type_lv1||protocol|lab|stage|sample",
+          "kind": "category",
+          "category_count": 352,
+          "categories_hash": "c2ba8c598689c6c42ee64344ab883194309ac28948f2dd796d4a7e8721ccfcee",
+          "codes_dtype": "uint16",
+          "outlier_quantized": true,
+          "outlier_quantization_bits": 8
+        }
+      ],
+      "obs_continuous_quantization": 8,
+      "obs_categorical_dtype": "auto",
+      "var_present": true,
+      "gene_count": 44910,
+      "gene_list_hash": "743407bb2132dd12f6ed904d9ad9330baff94abea565be3311596a9f58775e4a",
+      "var_gene_id_column": "converted_id",
+      "var_quantization": 8,
+      "connectivity": {
+        "n_edges": 10537096,
+        "max_neighbors": null,
+        "index_dtype": "uint32"
+      },
+      "compression": 6,
+      "points_filename": "points.bin.gz",
+      "obs_manifest": "obs_manifest.json",
+      "var_manifest": "var_manifest.json",
+      "connectivity_manifest": "connectivity_manifest.json",
+      "centroid_outlier_quantile": 0.9,
+      "centroid_min_points": 10
+    },
+    "gene_sample": [
+      "C6orf47",
+      "CBWD1",
+      "CBWD2",
+      "CBWD3",
+      "CBWD5",
+      "TSPAN6",
+      "TNMD",
+      "DPM1",
+      "SCYL3",
+      "FIRRM"
+    ],
+    "notes": "signature is sha256 over hash_inputs; compare two dataset_hash.json files to diagnose clashes"
+  }
+}
