@@ -148,6 +148,7 @@
   <button id="sidebar-toggle" class="sidebar-open" title="Toggle sidebar">✕</button>
 
   <div id="sidebar">
+    <div id="sidebar-resize-handle" title="Drag to resize"></div>
     <div class="sidebar-brand" aria-label="cellucid">
       <img src="assets/img/cellucid-logo.svg" alt="cellucid logo" class="sidebar-logo" />
     </div>
@@ -592,6 +593,29 @@
 
           <!-- Legend / category controls -->
           <div id="legend"></div>
+        </div>
+      </details>
+
+      <details class="accordion-section" open id="highlighted-cells-section">
+        <summary>Highlighted Cells</summary>
+        <div class="accordion-content">
+          <!-- Page selector tabs -->
+          <div id="highlight-pages-container">
+            <div id="highlight-pages-tabs">
+              <!-- Page tabs will be added here dynamically -->
+            </div>
+            <button type="button" class="highlight-page-add-btn" id="add-highlight-page" title="Add new page">+</button>
+          </div>
+          <div id="highlight-count" class="filter-info">No cells highlighted</div>
+          <div id="highlight-hint" class="legend-help" style="margin-bottom: 8px;">
+            Alt+click a cell to highlight its group. Alt+drag to select a range.
+          </div>
+          <div id="highlighted-groups">
+            <!-- Highlighted group items will be added here dynamically -->
+          </div>
+          <div id="highlight-actions" class="highlight-actions" style="display: none;">
+            <button type="button" class="btn-small" id="clear-all-highlights">Clear All</button>
+          </div>
         </div>
       </details>
 

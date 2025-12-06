@@ -46,6 +46,10 @@ html, body {
   --viewer-accent: #111827;
   --viewer-accent-soft: #374151;
   --viewer-accent-light: #e5e7eb;
+  --highlight-accent: #1ed8ff;
+  --highlight-accent-strong: #0ea5e9;
+  --highlight-ink: #0b1326;
+  --highlight-soft: #e0f7ff;
 }
 
 /* Sidebar container: fixed paper column */
@@ -78,9 +82,14 @@ html, body {
 }
 
 #sidebar.hidden {
-  transform: translateX(-280px);
+  transform: translateX(calc(-1 * (var(--sidebar-width, 260px) + 20px)));
   opacity: 0;
   pointer-events: none;
+}
+
+#sidebar.resizing {
+  transition: none;
+  user-select: none;
 }
 
 /* Sidebar toggle tab */
@@ -111,7 +120,36 @@ html, body {
 }
 
 #sidebar-toggle.sidebar-open {
-  left: calc(10px + 260px + 33px);
+  left: calc(10px + var(--sidebar-width, 260px) + 33px);
+}
+
+/* Sidebar resize handle */
+#sidebar-resize-handle {
+  position: absolute;
+  top: 0;
+  right: -5px;
+  width: 10px;
+  height: 100%;
+  cursor: ew-resize;
+  z-index: 20;
+}
+
+#sidebar-resize-handle::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  right: 3px;
+  transform: translateY(-50%);
+  width: 4px;
+  height: 40px;
+  background: rgba(0, 0, 0, 0.15);
+  border-radius: 2px;
+  transition: background 0.15s ease;
+}
+
+#sidebar-resize-handle:hover::after,
+#sidebar.resizing #sidebar-resize-handle::after {
+  background: rgba(0, 0, 0, 0.35);
 }
 
 /* Masthead style for the logo */
@@ -792,6 +830,327 @@ html, body {
   background: #8b0000;
   border-color: #8b0000;
   box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.25);
+}
+
+/* ========================================================================
+   Highlighted Cells UI
+   ===================================================================== */
+
+#highlight-count {
+  position: relative;
+  padding: 8px 10px 8px 14px;
+  border-radius: 6px;
+  border: var(--viewer-border-strong);
+  background: var(--viewer-paper);
+  box-shadow: var(--viewer-shadow);
+  color: var(--viewer-ink);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+#highlight-count::before {
+  content: "";
+  position: absolute;
+  left: 8px;
+  top: 8px;
+  bottom: 8px;
+  width: 3px;
+  background: linear-gradient(180deg, var(--highlight-accent) 0%, var(--highlight-accent-strong) 100%);
+}
+
+#highlight-hint {
+  color: var(--viewer-ink-soft);
+}
+
+#highlighted-groups {
+  margin-top: 2px;
+  height: 140px;
+  overflow-y: auto;
+  padding: 6px 8px;
+  border: 1px solid rgba(0, 0, 0, 0.18);
+  border-radius: 0;
+  background: #f9fafb;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.18);
+}
+
+/* Highlight chips - matches filter-item styling */
+.highlight-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  background: #e5e7eb;
+  border: 1px solid #cbd5e1;
+  transition: background 0.15s ease, opacity 0.15s ease, border-color 0.15s ease;
+}
+
+.highlight-item:hover {
+  background: #d1d5db;
+}
+
+.highlight-item.disabled {
+  opacity: 0.6;
+  background: #f3f4f6;
+  border-style: dashed;
+}
+
+.highlight-item.disabled:hover {
+  background: #e5e7eb;
+}
+
+/* Checkbox inside highlight chip */
+.highlight-checkbox {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  cursor: pointer;
+  flex-shrink: 0;
+  accent-color: #111827;
+}
+
+/* Highlight text */
+.highlight-text {
+  flex: 1;
+  font-size: 10px;
+  color: #374151;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.highlight-item.disabled .highlight-text {
+  color: #9ca3af;
+  text-decoration: line-through;
+}
+
+/* Remove "x" button on highlight chip */
+.highlight-remove-btn {
+  background: #ffffff;
+  border-radius: var(--viewer-radius-pill);
+  border: 1px solid #9ca3af;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  color: #6b7280;
+  padding: 0 5px;
+  flex-shrink: 0;
+  transition: color 0.15s ease, background 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+  box-shadow: 1px 1px 0 rgba(0, 0, 0, 0.18);
+}
+
+.highlight-remove-btn:hover {
+  color: #ffffff;
+  background: #8b0000;
+  border-color: #8b0000;
+  box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.25);
+}
+
+.highlight-actions {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: var(--viewer-border-soft);
+}
+
+/* Highlight pages tabs */
+#highlight-pages-container {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 8px;
+  padding-bottom: 8px;
+  border-bottom: var(--viewer-border-soft);
+}
+
+#highlight-pages-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+.highlight-page-tab {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  background: #e5e7eb;
+  border: 1px solid #cbd5e1;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 500;
+  color: #374151;
+  transition: background 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+  max-width: 120px;
+  min-width: 0;
+}
+
+.highlight-page-tab:hover {
+  background: #d1d5db;
+}
+
+.highlight-page-tab.active {
+  background: #111827;
+  color: #ffffff;
+  border-color: #111827;
+  box-shadow: 1px 1px 0 rgba(0, 0, 0, 0.2);
+}
+
+.highlight-page-tab-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.highlight-page-tab-count {
+  font-size: 9px;
+  opacity: 0.7;
+  flex-shrink: 0;
+}
+
+.highlight-page-tab.active .highlight-page-tab-count {
+  opacity: 0.8;
+}
+
+.highlight-page-tab-delete {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  color: inherit;
+  opacity: 0.5;
+  padding: 0 2px;
+  flex-shrink: 0;
+  transition: opacity 0.15s ease;
+}
+
+.highlight-page-tab-delete:hover {
+  opacity: 1;
+  color: #dc2626;
+}
+
+.highlight-page-tab.active .highlight-page-tab-delete:hover {
+  color: #fca5a5;
+}
+
+.highlight-page-add-btn {
+  background: #f3f4f6;
+  border: 1px dashed #9ca3af;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1;
+  color: #6b7280;
+  padding: 4px 8px;
+  flex-shrink: 0;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.highlight-page-add-btn:hover {
+  background: #e5e7eb;
+  border-color: #6b7280;
+  color: #374151;
+}
+
+/* Page tab name input (inline editing) */
+.highlight-page-tab-input {
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid currentColor;
+  font-size: inherit;
+  font-weight: inherit;
+  color: inherit;
+  width: 60px;
+  min-width: 40px;
+  max-width: 100px;
+  padding: 0;
+  margin: 0;
+  outline: none;
+}
+
+.highlight-page-tab-input:focus {
+  border-bottom-color: var(--highlight-accent);
+}
+
+/* Highlight page tab drag-and-drop styles */
+.highlight-page-tab.dragging {
+  opacity: 0.5;
+  cursor: grabbing;
+}
+
+.highlight-page-tab.drag-over {
+  background: #3b82f6;
+  color: #ffffff;
+  border-color: #2563eb;
+  transform: scale(1.05);
+  box-shadow: 0 2px 8px rgba(59, 130, 246, 0.4);
+}
+
+.highlight-page-tab[draggable="true"] {
+  cursor: grab;
+}
+
+/* Page combine menu (intersection/union dropdown) */
+.page-combine-menu {
+  position: fixed;
+  z-index: 1000;
+  background: #ffffff;
+  border: 1px solid #111827;
+  border-radius: 4px;
+  box-shadow: 2px 4px 12px rgba(0, 0, 0, 0.2);
+  padding: 4px 0;
+  min-width: 140px;
+}
+
+.page-combine-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  color: #111827;
+  text-align: left;
+  transition: background 0.1s ease;
+}
+
+.page-combine-option:hover {
+  background: #f3f4f6;
+}
+
+.page-combine-icon {
+  font-size: 16px;
+  font-weight: bold;
+  width: 20px;
+  text-align: center;
+}
+
+/* Selection cursor for canvas - active drag states */
+#glcanvas.selecting {
+  cursor: cell !important;
+}
+
+#glcanvas.selecting-continuous {
+  cursor: ns-resize !important;
+}
+
+/* Highlight mode classes (cursor is controlled via JS based on Alt key) */
+#glcanvas.highlight-categorical,
+#glcanvas.highlight-continuous {
+  /* Classes used for JS to track mode, cursor set dynamically */
 }
 
 /* ========================================================================

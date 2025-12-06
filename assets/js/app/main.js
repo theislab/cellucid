@@ -45,6 +45,13 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
   const outlierFilterDisplay = document.getElementById('outlier-filter-display');
   const filterCountEl = document.getElementById('filter-count');
   const activeFiltersEl = document.getElementById('active-filters');
+  // Highlight UI elements
+  const highlightCountEl = document.getElementById('highlight-count');
+  const highlightedGroupsEl = document.getElementById('highlighted-groups');
+  const highlightActionsEl = document.getElementById('highlight-actions');
+  const clearAllHighlightsBtn = document.getElementById('clear-all-highlights');
+  const highlightPagesTabsEl = document.getElementById('highlight-pages-tabs');
+  const addHighlightPageBtn = document.getElementById('add-highlight-page');
   const lightingStrengthInput = document.getElementById('lighting-strength');
   const lightingStrengthDisplay = document.getElementById('lighting-strength-display');
   const fogDensityInput = document.getElementById('fog-density');
@@ -224,6 +231,12 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
         outlierFilterDisplay,
         filterCountEl,
         activeFiltersEl,
+        highlightCountEl,
+        highlightedGroupsEl,
+        highlightActionsEl,
+        clearAllHighlightsBtn,
+        highlightPagesTabsEl,
+        addHighlightPageBtn,
         lightingStrengthInput,
         lightingStrengthDisplay,
         fogDensityInput,
@@ -966,8 +979,9 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
         activeField: datasetSnapshot.mode === 'real' && state.getActiveField ? state.getActiveField() : null
       });
 
+      const yamlOutput = report.yaml();
       if (benchmarkReportOutput) {
-        benchmarkReportOutput.value = report.text;
+        benchmarkReportOutput.value = yamlOutput;
         benchmarkReportOutput.style.display = 'block';
       }
       if (benchmarkReportStatus) {
@@ -976,7 +990,7 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
 
       if (navigator?.clipboard?.writeText) {
         try {
-          await navigator.clipboard.writeText(report.text);
+          await navigator.clipboard.writeText(yamlOutput);
           if (benchmarkReportStatus) {
             benchmarkReportStatus.textContent = 'Report copied to clipboard';
           }

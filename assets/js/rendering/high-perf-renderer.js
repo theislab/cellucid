@@ -1776,6 +1776,10 @@ export class HighPerfRenderer {
     return { ...this.stats };
   }
 
+  getPositions() {
+    return this._positions;
+  }
+
   getLODLevelCount() {
     return this.lodBuffers.length;
   }

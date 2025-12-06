@@ -124,14 +124,28 @@ layout(location = 0) in vec3 a_position;
 layout(location = 1) in vec4 a_color; // RGBA packed, auto-normalized by WebGL
 
 uniform mat4 u_mvpMatrix;
+uniform mat4 u_viewMatrix;
+uniform mat4 u_modelMatrix;
 uniform float u_pointSize;
+uniform float u_sizeAttenuation;
+uniform float u_viewportHeight;
+uniform float u_fov;
 
 out vec3 v_color;
 out float v_alpha;
 
 void main() {
+  vec4 worldPos = u_modelMatrix * vec4(a_position, 1.0);
+  vec4 eyePos = u_viewMatrix * worldPos;
   gl_Position = u_mvpMatrix * vec4(a_position, 1.0);
-  gl_PointSize = u_pointSize;
+
+  float eyeDepth = -eyePos.z;
+
+  float projectionFactor = u_viewportHeight / (2.0 * tan(u_fov * 0.5));
+  float worldSize = u_pointSize * 0.01;
+  float perspectiveSize = (worldSize * projectionFactor) / max(eyeDepth, 0.001);
+  gl_PointSize = mix(u_pointSize, perspectiveSize, u_sizeAttenuation);
+  gl_PointSize = clamp(gl_PointSize, 1.0, 192.0);
 
   if (a_color.a < 0.01) gl_PointSize = 0.0;
 
@@ -343,6 +357,134 @@ export function getShaders(quality = 'full') {
   }
 }
 
+// ============================================================================
+// HIGHLIGHT RING SHADERS - for rendering selection highlights
+// ============================================================================
+
+/**
+ * Highlight vertex shader - renders highlighted points with a ring effect
+ * Uses same interleaved layout as main points
+ */
+export const HP_VS_HIGHLIGHT = `#version 300 es
+precision highp float;
+
+layout(location = 0) in vec3 a_position;
+layout(location = 1) in vec4 a_color; // RGBA packed - we only use alpha for visibility
+
+uniform mat4 u_mvpMatrix;
+uniform mat4 u_viewMatrix;
+uniform mat4 u_modelMatrix;
+uniform float u_pointSize;
+uniform float u_sizeAttenuation;
+uniform float u_viewportHeight;
+uniform float u_fov;
+uniform float u_highlightScale; // How much larger the highlight ring is (e.g., 1.5)
+
+out float v_alpha;
+
+void main() {
+  vec4 worldPos = u_modelMatrix * vec4(a_position, 1.0);
+  vec4 eyePos = u_viewMatrix * worldPos;
+  gl_Position = u_mvpMatrix * vec4(a_position, 1.0);
+
+  float eyeDepth = -eyePos.z;
+
+  // Perspective point size with attenuation - scaled up for highlight ring
+  float projectionFactor = u_viewportHeight / (2.0 * tan(u_fov * 0.5));
+  float worldSize = u_pointSize * 0.01 * u_highlightScale;
+  float perspectiveSize = (worldSize * projectionFactor) / max(eyeDepth, 0.001);
+  gl_PointSize = mix(u_pointSize * u_highlightScale, perspectiveSize, u_sizeAttenuation);
+  gl_PointSize = clamp(gl_PointSize, 1.0, 192.0);
+
+  // Discard if not highlighted (alpha channel stores highlight state)
+  if (a_color.a < 0.01) {
+    gl_PointSize = 0.0;
+  }
+
+  v_alpha = a_color.a;
+}
+`;
+
+/**
+ * Highlight fragment shader - draws a ring/glow effect
+ */
+export const HP_FS_HIGHLIGHT = `#version 300 es
+precision highp float;
+
+in float v_alpha;
+
+uniform vec3 u_highlightColor;
+uniform float u_ringWidth; // Width of the ring as fraction of radius (e.g., 0.15)
+uniform float u_haloStrength;
+uniform float u_haloShape; // 0 = circle, 1 = square
+
+out vec4 fragColor;
+
+void main() {
+  if (v_alpha < 0.01) discard;
+
+  vec2 coord = gl_PointCoord * 2.0 - 1.0;
+  float axisMax = max(abs(coord.x), abs(coord.y));
+  float r = mix(length(coord), axisMax, step(0.5, u_haloShape));
+  if (r > 1.0) discard; // enforce circular or square bounds based on shape
+
+  float innerRadius = 1.0 - u_ringWidth;
+
+  // Crisp rim that hugs the boundary
+  float rim = smoothstep(innerRadius - 0.05, innerRadius + 0.02, r);
+
+  // Soft fill so highlighted cells stay legible
+  float fill = 1.0 - smoothstep(innerRadius - 0.10, innerRadius + 0.12, r);
+
+  // Outer halo that fades before the sprite edge
+  float halo = smoothstep(0.55, 0.9, r) * (1.0 - smoothstep(0.9, 1.02, r));
+  halo *= u_haloStrength;
+
+  float alpha = rim * 0.92 + fill * 0.30 + halo;
+  if (alpha < 0.01) discard;
+
+  // Keep the core golden and avoid washing out to white
+  vec3 color = mix(u_highlightColor, vec3(1.0, 0.9, 0.45), fill * 0.18);
+  fragColor = vec4(color, alpha * v_alpha);
+}
+`;
+
+/**
+ * Alternative highlight shader with pulsing glow effect
+ */
+export const HP_FS_HIGHLIGHT_GLOW = `#version 300 es
+precision highp float;
+
+in float v_alpha;
+
+uniform vec3 u_highlightColor;
+uniform float u_time;
+
+out vec4 fragColor;
+
+void main() {
+  if (v_alpha < 0.01) discard;
+
+  vec2 coord = gl_PointCoord * 2.0 - 1.0;
+  float r = length(coord);
+
+  if (r > 1.0) discard;
+
+  // Pulsing glow effect
+  float pulse = 0.7 + 0.3 * sin(u_time * 3.0);
+
+  // Outer ring
+  float ring = smoothstep(0.7, 0.85, r) * smoothstep(1.0, 0.9, r);
+
+  // Inner glow (subtle fill)
+  float innerGlow = (1.0 - r) * 0.15;
+
+  float alpha = (ring + innerGlow) * pulse * v_alpha;
+
+  fragColor = vec4(u_highlightColor, alpha);
+}
+`;
+
 export default {
   HP_VS_FULL,
   HP_FS_FULL,
@@ -353,5 +495,8 @@ export default {
   HP_VS_INSTANCED,
   HP_FS_INSTANCED,
   HP_VS_TEXTURE,
+  HP_VS_HIGHLIGHT,
+  HP_FS_HIGHLIGHT,
+  HP_FS_HIGHLIGHT_GLOW,
   getShaders
 };

@@ -17,6 +17,7 @@ import {
   REFERENCE_RESOLUTION
 } from './noise-textures.js';
 import { HighPerfRenderer } from './high-perf-renderer.js';
+import { HP_VS_HIGHLIGHT, HP_FS_HIGHLIGHT } from './high-perf-shaders.js';
 
 // Simple centroid shader (WebGL2) - for small number of centroid points
 // Uses RGBA uint8 normalized colors (same as main points)
@@ -213,6 +214,54 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     viewportHeight: gl.getUniformLocation(centroidProgram, 'u_viewportHeight'),
     fov: gl.getUniformLocation(centroidProgram, 'u_fov'),
   };
+
+  // === HIGHLIGHT PROGRAM (for selection rings) ===
+  const highlightProgram = createProgram(gl, HP_VS_HIGHLIGHT, HP_FS_HIGHLIGHT);
+  const highlightAttribLocations = {
+    position: gl.getAttribLocation(highlightProgram, 'a_position'),
+    color: gl.getAttribLocation(highlightProgram, 'a_color'),
+  };
+  const highlightUniformLocations = {
+    mvpMatrix: gl.getUniformLocation(highlightProgram, 'u_mvpMatrix'),
+    viewMatrix: gl.getUniformLocation(highlightProgram, 'u_viewMatrix'),
+    modelMatrix: gl.getUniformLocation(highlightProgram, 'u_modelMatrix'),
+    pointSize: gl.getUniformLocation(highlightProgram, 'u_pointSize'),
+    sizeAttenuation: gl.getUniformLocation(highlightProgram, 'u_sizeAttenuation'),
+    viewportHeight: gl.getUniformLocation(highlightProgram, 'u_viewportHeight'),
+    fov: gl.getUniformLocation(highlightProgram, 'u_fov'),
+    highlightScale: gl.getUniformLocation(highlightProgram, 'u_highlightScale'),
+    highlightColor: gl.getUniformLocation(highlightProgram, 'u_highlightColor'),
+    ringWidth: gl.getUniformLocation(highlightProgram, 'u_ringWidth'),
+    haloStrength: gl.getUniformLocation(highlightProgram, 'u_haloStrength'),
+    haloShape: gl.getUniformLocation(highlightProgram, 'u_haloShape'),
+  };
+
+  // Highlight state
+  let highlightArray = null; // Uint8Array, per-point highlight intensity
+  let highlightBuffer = null; // WebGL buffer for interleaved highlight data
+  let highlightPointCount = 0;
+  // Golden accent (halo) with defined halo shape
+  let highlightColor = [1.0, 0.85, 0.0]; // bright yellow
+  let highlightScale = 2.0; // How much larger than normal points
+  let highlightRingWidth = 0.22; // Ring thickness
+  let highlightHaloStrength = 0.6; // Halo opacity contribution
+  // 0 = circle, 1 = square
+  let highlightHaloShape = 0.0;
+  const highlightStylesByQuality = {
+    full: { scale: 2.0, ringWidth: 0.22, haloStrength: 0.65, haloShape: 0.0 },
+    light: { scale: 1.9, ringWidth: 0.24, haloStrength: 0.50, haloShape: 0.0 },
+    ultralight: { scale: 1.7, ringWidth: 0.26, haloStrength: 0.40, haloShape: 1.0 } // square halo for square points
+  };
+  let currentShaderQuality = 'full';
+
+  function applyHighlightStyleForQuality(quality) {
+    const style = highlightStylesByQuality[quality] || highlightStylesByQuality.full;
+    highlightScale = style.scale;
+    highlightRingWidth = style.ringWidth;
+    highlightHaloStrength = style.haloStrength;
+    highlightHaloShape = style.haloShape;
+  }
+  applyHighlightStyleForQuality(currentShaderQuality);
 
   // === BUFFERS ===
   // Centroid buffers (small count, separate from main points)
@@ -538,6 +587,30 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   canvas.addEventListener('contextmenu', (e) => { e.preventDefault(); return false; });
 
   canvas.addEventListener('mousedown', (e) => {
+    // Cell selection mode: Alt+click (or Alt+drag for range selection)
+    // Only enter selection mode if a field is active (highlightMode is not 'none')
+    if (e.altKey && cellSelectionEnabled && e.button === 0 && highlightMode !== 'none') {
+      const cellIdx = pickCellAtScreen(e.clientX, e.clientY);
+      if (cellIdx >= 0) {
+        selectionDragStart = {
+          x: e.clientX,
+          y: e.clientY,
+          cellIndex: cellIdx
+        };
+        selectionDragCurrent = { x: e.clientX, y: e.clientY };
+        // Set cursor based on highlight mode
+        if (highlightMode === 'continuous') {
+          canvas.style.cursor = 'ns-resize';
+          canvas.classList.add('selecting-continuous');
+        } else if (highlightMode === 'categorical') {
+          canvas.style.cursor = 'cell';
+          canvas.classList.add('selecting');
+        }
+      }
+      e.preventDefault();
+      return;
+    }
+
     if (navigationMode === 'free') {
       const wantsShot = e.button === 0;
       // Only request pointer lock if user has enabled it via checkbox
@@ -576,7 +649,34 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     canvas.classList.add('dragging');
   });
 
-  window.addEventListener('mouseup', () => {
+  window.addEventListener('mouseup', (e) => {
+    // Complete cell selection if in progress
+    if (selectionDragStart) {
+      const dragDistance = selectionDragCurrent
+        ? Math.abs(selectionDragCurrent.y - selectionDragStart.y)
+        : 0;
+
+      // Emit selection event
+      if (cellSelectionCallback) {
+        cellSelectionCallback({
+          type: dragDistance > 10 ? 'range' : 'click',
+          cellIndex: selectionDragStart.cellIndex,
+          dragDeltaY: selectionDragCurrent ? selectionDragCurrent.y - selectionDragStart.y : 0,
+          startX: selectionDragStart.x,
+          startY: selectionDragStart.y,
+          endX: selectionDragCurrent?.x ?? selectionDragStart.x,
+          endY: selectionDragCurrent?.y ?? selectionDragStart.y
+        });
+      }
+
+      selectionDragStart = null;
+      selectionDragCurrent = null;
+      canvas.classList.remove('selecting');
+      canvas.classList.remove('selecting-continuous');
+      updateCursorForHighlightMode();
+      return;
+    }
+
     if (navigationMode === 'free') {
       // Keep looking active while pointer lock is held; only stop drag-look when not locked
       if (!pointerLockActive) {
@@ -614,7 +714,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     }
     isDragging = false;
     canvas.classList.remove('dragging');
-    canvas.style.cursor = 'grab';
+    updateCursorForHighlightMode();
   });
 
   window.addEventListener('mousemove', (e) => {
@@ -623,6 +723,25 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       cursorX = e.clientX;
       cursorY = e.clientY;
     }
+
+    // Track selection drag
+    if (selectionDragStart) {
+      selectionDragCurrent = { x: e.clientX, y: e.clientY };
+      // Emit preview event for live updating during drag
+      if (selectionPreviewCallback) {
+        selectionPreviewCallback({
+          type: 'preview',
+          cellIndex: selectionDragStart.cellIndex,
+          dragDeltaY: selectionDragCurrent.y - selectionDragStart.y,
+          startX: selectionDragStart.x,
+          startY: selectionDragStart.y,
+          endX: selectionDragCurrent.x,
+          endY: selectionDragCurrent.y
+        });
+      }
+      return;
+    }
+
     if (navigationMode === 'free') {
       if (!lookActive) return;
       const dx = pointerLockActive ? e.movementX : (e.clientX - lastX);
@@ -685,6 +804,45 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     targetRadius = Math.max(minOrbitRadius, Math.min(100.0, targetRadius));
   }, { passive: false });
 
+  // Alt key handling for highlight mode cursor
+  let altKeyDown = false;
+
+  function updateCursorForHighlightMode() {
+    // Don't change cursor during free navigation or active drags
+    if (navigationMode === 'free') return;
+    if (isDragging) return; // orbit drag in progress
+    if (selectionDragStart) return; // cell selection drag in progress
+
+    // Set cursor based on Alt key and highlight mode
+    if (altKeyDown && highlightMode === 'continuous') {
+      canvas.style.cursor = 'ns-resize';
+    } else if (altKeyDown && highlightMode === 'categorical') {
+      canvas.style.cursor = 'cell';
+    } else {
+      canvas.style.cursor = 'grab';
+    }
+  }
+
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Alt' && !altKeyDown) {
+      altKeyDown = true;
+      updateCursorForHighlightMode();
+    }
+  });
+
+  window.addEventListener('keyup', (e) => {
+    if (e.key === 'Alt') {
+      altKeyDown = false;
+      updateCursorForHighlightMode();
+    }
+  });
+
+  // Also update when window loses focus (Alt might be released while window unfocused)
+  window.addEventListener('blur', () => {
+    altKeyDown = false;
+    updateCursorForHighlightMode();
+  });
+
   function handlePointerLockChange() {
     pointerLockActive = document.pointerLockElement === canvas;
     if (pointerLockActive) {
@@ -703,7 +861,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       pointerLockEnabled = false;
       pendingShot = false;
       canvas.classList.remove('dragging');
-      canvas.style.cursor = navigationMode === 'free' ? 'crosshair' : 'grab';
+      if (navigationMode === 'free') {
+        canvas.style.cursor = 'crosshair';
+      } else {
+        updateCursorForHighlightMode();
+      }
     }
     if (typeof pointerLockChangeHandler === 'function') {
       pointerLockChangeHandler(pointerLockActive);
@@ -1670,6 +1832,245 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
   }
 
+  // === HIGHLIGHT RENDERING ===
+  // Rebuild the highlight buffer with positions of highlighted cells
+  // Only includes cells that are both highlighted AND visible (transparency > 0)
+  function rebuildHighlightBuffer(highlightData, positions, transparency) {
+    if (!highlightData || !positions) {
+      highlightPointCount = 0;
+      return;
+    }
+
+    // Count highlighted AND visible cells
+    let count = 0;
+    for (let i = 0; i < highlightData.length; i++) {
+      if (highlightData[i] > 0) {
+        // Only count if visible (no transparency array = all visible, or transparency > 0)
+        const isVisible = !transparency || transparency[i] > 0;
+        if (isVisible) count++;
+      }
+    }
+
+    if (count === 0) {
+      highlightPointCount = 0;
+      return;
+    }
+
+    // Create interleaved buffer: pos (3 floats) + color (4 uint8 packed as 1 float via view)
+    // Using same layout as main points: 16 bytes per point (12 bytes pos + 4 bytes RGBA)
+    const BYTES_PER_POINT = 16;
+    const bufferData = new ArrayBuffer(count * BYTES_PER_POINT);
+    const posView = new Float32Array(bufferData);
+    const colorView = new Uint8Array(bufferData);
+
+    let outIdx = 0;
+    for (let i = 0; i < highlightData.length; i++) {
+      if (highlightData[i] > 0) {
+        // Only include if visible
+        const isVisible = !transparency || transparency[i] > 0;
+        if (!isVisible) continue;
+
+        const posOffset = outIdx * 4; // 4 floats per point (3 pos + 1 color-as-float)
+        const colorOffset = outIdx * BYTES_PER_POINT + 12; // color at byte 12
+
+        posView[posOffset] = positions[i * 3];
+        posView[posOffset + 1] = positions[i * 3 + 1];
+        posView[posOffset + 2] = positions[i * 3 + 2];
+
+        // RGBA: full alpha for visibility, use highlight intensity
+        colorView[colorOffset] = 255;     // R
+        colorView[colorOffset + 1] = 255; // G
+        colorView[colorOffset + 2] = 255; // B
+        colorView[colorOffset + 3] = highlightData[i]; // A = highlight intensity
+
+        outIdx++;
+      }
+    }
+
+    if (!highlightBuffer) {
+      highlightBuffer = gl.createBuffer();
+    }
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, highlightBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, bufferData, gl.DYNAMIC_DRAW);
+
+    highlightPointCount = count;
+  }
+
+  function drawHighlights(viewportHeight) {
+    if (highlightPointCount === 0 || !highlightBuffer) return;
+
+    gl.useProgram(highlightProgram);
+
+    // Set uniforms
+    gl.uniformMatrix4fv(highlightUniformLocations.mvpMatrix, false, mvpMatrix);
+    gl.uniformMatrix4fv(highlightUniformLocations.viewMatrix, false, viewMatrix);
+    gl.uniformMatrix4fv(highlightUniformLocations.modelMatrix, false, modelMatrix);
+    // Adapt halo sizing for square sprites so halo grows/shrinks with actual marker size
+    let effectiveScale = highlightScale;
+    let effectiveRingWidth = highlightRingWidth;
+    let effectiveHaloStrength = highlightHaloStrength;
+    if (highlightHaloShape > 0.5) {
+      const haloBoost = Math.min(1.5, Math.max(0, basePointSize * (0.01 + sizeAttenuation * 0.02)));
+      effectiveScale = highlightScale + haloBoost;
+      effectiveRingWidth = Math.min(0.35, highlightRingWidth + haloBoost * 0.03);
+      effectiveHaloStrength = Math.min(1.0, highlightHaloStrength + haloBoost * 0.15);
+    }
+
+    gl.uniform1f(highlightUniformLocations.pointSize, basePointSize);
+    gl.uniform1f(highlightUniformLocations.sizeAttenuation, sizeAttenuation);
+    gl.uniform1f(highlightUniformLocations.viewportHeight, viewportHeight);
+    gl.uniform1f(highlightUniformLocations.fov, fov);
+    gl.uniform1f(highlightUniformLocations.highlightScale, effectiveScale);
+    gl.uniform3fv(highlightUniformLocations.highlightColor, highlightColor);
+    gl.uniform1f(highlightUniformLocations.ringWidth, effectiveRingWidth);
+    gl.uniform1f(highlightUniformLocations.haloStrength, effectiveHaloStrength);
+    gl.uniform1f(highlightUniformLocations.haloShape, highlightHaloShape);
+
+    // Bind interleaved buffer
+    const BYTES_PER_POINT = 16;
+    gl.bindBuffer(gl.ARRAY_BUFFER, highlightBuffer);
+
+    // Position attribute (3 floats at offset 0)
+    gl.enableVertexAttribArray(highlightAttribLocations.position);
+    gl.vertexAttribPointer(highlightAttribLocations.position, 3, gl.FLOAT, false, BYTES_PER_POINT, 0);
+
+    // Color attribute (4 uint8 at offset 12)
+    gl.enableVertexAttribArray(highlightAttribLocations.color);
+    gl.vertexAttribPointer(highlightAttribLocations.color, 4, gl.UNSIGNED_BYTE, true, BYTES_PER_POINT, 12);
+
+    // Enable additive blending for glow effect
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+
+    gl.drawArrays(gl.POINTS, 0, highlightPointCount);
+
+    // Restore normal blending
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  }
+
+  // === CELL PICKING ===
+  // Convert screen coordinates to a ray and find the nearest cell
+  function screenToRay(screenX, screenY, canvasWidth, canvasHeight) {
+    // Normalize to clip space (-1 to 1)
+    const ndcX = (screenX / canvasWidth) * 2 - 1;
+    const ndcY = 1 - (screenY / canvasHeight) * 2;
+
+    // Create inverse view-projection matrix
+    const viewProj = mat4.create();
+    mat4.multiply(viewProj, projectionMatrix, viewMatrix);
+    const invViewProj = mat4.create();
+    if (!mat4.invert(invViewProj, viewProj)) {
+      return null;
+    }
+
+    // Unproject near and far points
+    const nearPoint = vec4.fromValues(ndcX, ndcY, -1, 1);
+    const farPoint = vec4.fromValues(ndcX, ndcY, 1, 1);
+
+    vec4.transformMat4(nearPoint, nearPoint, invViewProj);
+    vec4.transformMat4(farPoint, farPoint, invViewProj);
+
+    // Perspective divide
+    const near3 = vec3.fromValues(
+      nearPoint[0] / nearPoint[3],
+      nearPoint[1] / nearPoint[3],
+      nearPoint[2] / nearPoint[3]
+    );
+    const far3 = vec3.fromValues(
+      farPoint[0] / farPoint[3],
+      farPoint[1] / farPoint[3],
+      farPoint[2] / farPoint[3]
+    );
+
+    // Ray direction
+    const dir = vec3.create();
+    vec3.subtract(dir, far3, near3);
+    vec3.normalize(dir, dir);
+
+    return { origin: near3, direction: dir };
+  }
+
+  function pickCellAtScreen(screenX, screenY) {
+    const rect = canvas.getBoundingClientRect();
+    const localX = screenX - rect.left;
+    const localY = screenY - rect.top;
+
+    const ray = screenToRay(localX, localY, rect.width, rect.height);
+    if (!ray) return -1;
+
+    const positions = hpRenderer.getPositions();
+    if (!positions) return -1;
+
+    const octree = hpRenderer.octree;
+
+    // Sample along the ray to find the nearest cell
+    const maxDistance = radius * 4; // Max ray distance
+    const sampleStep = 0.02; // Step size along ray
+    const searchRadius = 0.03; // Search radius around each sample point
+
+    let nearestCell = -1;
+    let nearestDist = Infinity;
+
+    for (let t = 0; t < maxDistance; t += sampleStep) {
+      const samplePoint = [
+        ray.origin[0] + ray.direction[0] * t,
+        ray.origin[1] + ray.direction[1] * t,
+        ray.origin[2] + ray.direction[2] * t
+      ];
+
+      // Query cells near this point
+      let candidates;
+      if (octree) {
+        candidates = octree.queryRadius(samplePoint, searchRadius, 16);
+      } else {
+        // Fallback: brute force search (slow)
+        candidates = [];
+        const r2 = searchRadius * searchRadius;
+        const n = positions.length / 3;
+        for (let i = 0; i < n && candidates.length < 16; i++) {
+          const dx = positions[i * 3] - samplePoint[0];
+          const dy = positions[i * 3 + 1] - samplePoint[1];
+          const dz = positions[i * 3 + 2] - samplePoint[2];
+          if (dx * dx + dy * dy + dz * dz <= r2) {
+            candidates.push(i);
+          }
+        }
+      }
+
+      // Find the closest cell to the ray origin
+      for (const idx of candidates) {
+        const px = positions[idx * 3];
+        const py = positions[idx * 3 + 1];
+        const pz = positions[idx * 3 + 2];
+
+        // Distance from cell to ray origin
+        const dist = Math.sqrt(
+          (px - ray.origin[0]) ** 2 +
+          (py - ray.origin[1]) ** 2 +
+          (pz - ray.origin[2]) ** 2
+        );
+
+        if (dist < nearestDist) {
+          nearestDist = dist;
+          nearestCell = idx;
+        }
+      }
+
+      // If we found something, stop early
+      if (nearestCell >= 0) break;
+    }
+
+    return nearestCell;
+  }
+
+  // Cell selection state
+  let cellSelectionEnabled = true;
+  let cellSelectionCallback = null; // Called when user selects cells
+  let selectionPreviewCallback = null; // Called during drag for live preview
+  let selectionDragStart = null; // { x, y, cellIndex, value } for drag selection
+  let selectionDragCurrent = null;
+  let highlightMode = 'none'; // 'none', 'categorical', or 'continuous'
+
   function getViewFlags(viewId) {
     const key = String(viewId || LIVE_VIEW_ID);
     const flags = viewCentroidFlags.get(key);
@@ -1706,10 +2107,20 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
   function updateLabelLayerVisibility() {
     let anyVisible = false;
+    const singleMode = viewLayoutMode === 'single';
+    const focusKey = String(focusedViewId || LIVE_VIEW_ID);
     for (const [viewId, labels] of viewCentroidLabels.entries()) {
       const flags = getViewFlags(viewId);
       if (!flags.labels || !labels.length) continue;
-      if (labels.some(item => item?.el && item.el.style.display !== 'none')) { anyVisible = true; break; }
+      const isActiveView = String(viewId) === focusKey;
+      if (singleMode && !isActiveView) {
+        hideLabelsForView(viewId);
+        continue;
+      }
+      if (labels.some(item => item?.el && item.el.style.display !== 'none')) {
+        anyVisible = true;
+        if (singleMode) break;
+      }
     }
     if (labelLayer) labelLayer.style.display = anyVisible ? 'block' : 'none';
   }
@@ -1909,6 +2320,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       cameraPosition,
       cameraDistance: radius
     });
+
+    // Draw highlights (selection rings) on top of scatter points
+    drawHighlights(height);
 
     // Draw connectivity lines
     drawConnectivityLines(width, height);
@@ -2143,11 +2557,84 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     updateTransparency(alphaArray) {
       transparencyArray = alphaArray;
       hpRenderer.updateAlphas(alphaArray);
+      // Rebuild highlight buffer when visibility changes (filter applied/removed)
+      if (highlightArray) {
+        const positions = hpRenderer.getPositions ? hpRenderer.getPositions() : null;
+        rebuildHighlightBuffer(highlightArray, positions, transparencyArray);
+      }
     },
 
     updateOutlierQuantiles(outliers) {
       // HP renderer doesn't use outlier quantiles directly
       // Filtering should be done via transparency array
+    },
+
+    updateHighlight(highlightData) {
+      highlightArray = highlightData;
+      // Rebuild highlight buffer using current positions and transparency from HP renderer
+      const positions = hpRenderer.getPositions ? hpRenderer.getPositions() : null;
+      rebuildHighlightBuffer(highlightData, positions, transparencyArray);
+    },
+
+    setHighlightStyle(options = {}) {
+      if (options.color) highlightColor = options.color;
+      if (options.scale != null) highlightScale = options.scale;
+      if (options.ringWidth != null) highlightRingWidth = options.ringWidth;
+      if (options.haloStrength != null) highlightHaloStrength = options.haloStrength;
+      if (options.haloShape != null) highlightHaloShape = options.haloShape;
+    },
+
+    getHighlightedCount() {
+      return highlightPointCount;
+    },
+
+    // Cell selection/picking API
+    pickCellAtScreen(screenX, screenY) {
+      return pickCellAtScreen(screenX, screenY);
+    },
+
+    setCellSelectionCallback(callback) {
+      cellSelectionCallback = callback;
+    },
+
+    setCellSelectionEnabled(enabled) {
+      cellSelectionEnabled = enabled;
+    },
+
+    getCellSelectionEnabled() {
+      return cellSelectionEnabled;
+    },
+
+    setSelectionPreviewCallback(callback) {
+      selectionPreviewCallback = callback;
+    },
+
+    setHighlightMode(mode) {
+      // mode: 'none', 'categorical', or 'continuous'
+      highlightMode = mode || 'none';
+      // Abort any in-progress selection when mode changes
+      selectionDragStart = null;
+      selectionDragCurrent = null;
+      // Clear any stale selection classes (CSS !important would override cursor)
+      canvas.classList.remove('selecting');
+      canvas.classList.remove('selecting-continuous');
+      // Update canvas classes for styling
+      if (highlightMode === 'continuous') {
+        canvas.classList.add('highlight-continuous');
+        canvas.classList.remove('highlight-categorical');
+      } else if (highlightMode === 'categorical') {
+        canvas.classList.add('highlight-categorical');
+        canvas.classList.remove('highlight-continuous');
+      } else {
+        canvas.classList.remove('highlight-categorical');
+        canvas.classList.remove('highlight-continuous');
+      }
+      // Update cursor based on current Alt key state
+      updateCursorForHighlightMode();
+    },
+
+    getHighlightMode() {
+      return highlightMode;
     },
 
   setCentroids({ positions, colors, outlierQuantiles, transparency }) {
@@ -2234,7 +2721,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         }
         activeKeys.clear();
         vec3.set(freeflyVelocity, 0, 0, 0);
-        canvas.style.cursor = 'grab';
+        updateCursorForHighlightMode();
       }
     },
     getNavigationMode() { return navigationMode; },
@@ -2264,7 +2751,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         lookActive = false;
         pointerLockActive = false;
         canvas.classList.remove('dragging');
-        canvas.style.cursor = navigationMode === 'free' ? 'crosshair' : 'grab';
+        if (navigationMode === 'free') {
+          canvas.style.cursor = 'crosshair';
+        } else {
+          updateCursorForHighlightMode();
+        }
         if (typeof pointerLockChangeHandler === 'function') {
           pointerLockChangeHandler(false);
         }
@@ -2566,13 +3057,30 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       const idx = snapshotViews.findIndex(s => s.id === id);
       if (idx >= 0) {
         snapshotViews.splice(idx, 1);
+        const key = String(id);
+        if (key !== LIVE_VIEW_ID) {
+          removeLabelsForView(key);
+          viewCentroidFlags.delete(key);
+        }
         if (focusedViewId === id) focusedViewId = LIVE_VIEW_ID;
+        updateLabelLayerVisibility();
       }
     },
 
     clearSnapshotViews() {
       snapshotViews.length = 0;
       focusedViewId = LIVE_VIEW_ID;
+      for (const key of Array.from(viewCentroidLabels.keys())) {
+        if (String(key) !== LIVE_VIEW_ID) {
+          removeLabelsForView(key);
+        }
+      }
+      for (const key of Array.from(viewCentroidFlags.keys())) {
+        if (String(key) !== LIVE_VIEW_ID) {
+          viewCentroidFlags.delete(key);
+        }
+      }
+      updateLabelLayerVisibility();
       // Restore live view data
       if (colorsArray) hpRenderer.updateColors(colorsArray);
       if (transparencyArray) hpRenderer.updateAlphas(transparencyArray);
@@ -2608,6 +3116,14 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
           }
         }
       }
+      if (viewLayoutMode === 'single') {
+        for (const key of viewCentroidLabels.keys()) {
+          if (String(key) !== String(focusedViewId || LIVE_VIEW_ID)) {
+            hideLabelsForView(key);
+          }
+        }
+      }
+      updateLabelLayerVisibility();
     },
 
     getViewLayout() { return { mode: viewLayoutMode, activeId: focusedViewId }; },
@@ -2650,7 +3166,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     clearExternalRenderer() {},
 
     // HP renderer controls
-    setShaderQuality(quality) { hpRenderer.setQuality(quality); },
+    setShaderQuality(quality) {
+      currentShaderQuality = quality || 'full';
+      applyHighlightStyleForQuality(currentShaderQuality);
+      hpRenderer.setQuality(currentShaderQuality);
+    },
     setFrustumCulling(enabled) { hpRenderer.setFrustumCulling(enabled); },
     setAdaptiveLOD(enabled) { hpRenderer.setAdaptiveLOD(enabled); },
     setForceLOD(level) { hpRenderer.setForceLOD(level); },

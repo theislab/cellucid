@@ -54,6 +54,16 @@ class DataState {
     this.viewContexts = new Map(); // viewId -> per-view context (arrays + field state)
     this._fieldDataCache = new Map(); // field.key -> loaded arrays (shared across views)
     this._varFieldDataCache = new Map(); // var.field.key -> loaded arrays
+
+    // Cell highlighting/selection state - multi-page system
+    // Each page contains its own independent set of highlight groups
+    this.highlightPages = []; // Array of { id, name, highlightedGroups: [] }
+    this.activePageId = null; // Currently active page ID
+    this._highlightPageIdCounter = 0;
+    this.highlightArray = null; // Uint8Array per-point highlight intensity (0-255)
+    this._highlightIdCounter = 0;
+    this._highlightChangeCallbacks = new Set();
+    this._highlightPageChangeCallbacks = new Set(); // Callbacks when pages change (add/remove/rename/switch)
   }
 
   // --- View context helpers ---------------------------------------------------
@@ -1988,5 +1998,483 @@ class DataState {
       outlierThreshold: this.getCurrentOutlierThreshold(),
       filtersText
     };
+  }
+
+  // --- Cell Highlighting/Selection API -------------------------------------------
+
+  addHighlightChangeCallback(callback) {
+    if (typeof callback === 'function') {
+      this._highlightChangeCallbacks.add(callback);
+    }
+  }
+
+  removeHighlightChangeCallback(callback) {
+    this._highlightChangeCallbacks.delete(callback);
+  }
+
+  _notifyHighlightChange() {
+    this._highlightChangeCallbacks.forEach((cb) => {
+      try { cb(); }
+      catch (err) { console.error('Highlight change callback failed', err); }
+    });
+  }
+
+  // --- Highlight Page Management ---
+
+  addHighlightPageChangeCallback(callback) {
+    if (typeof callback === 'function') {
+      this._highlightPageChangeCallbacks.add(callback);
+    }
+  }
+
+  removeHighlightPageChangeCallback(callback) {
+    this._highlightPageChangeCallbacks.delete(callback);
+  }
+
+  _notifyHighlightPageChange() {
+    this._highlightPageChangeCallbacks.forEach((cb) => {
+      try { cb(); }
+      catch (err) { console.error('Highlight page change callback failed', err); }
+    });
+  }
+
+  _getActivePage() {
+    if (!this.activePageId) return null;
+    return this.highlightPages.find((p) => p.id === this.activePageId) || null;
+  }
+
+  // Get highlighted groups for the active page (backwards compatible)
+  get highlightedGroups() {
+    const page = this._getActivePage();
+    return page ? page.highlightedGroups : [];
+  }
+
+  // Set highlighted groups for the active page
+  set highlightedGroups(groups) {
+    const page = this._getActivePage();
+    if (page) {
+      page.highlightedGroups = groups;
+    }
+  }
+
+  getHighlightPages() {
+    return this.highlightPages;
+  }
+
+  getActivePageId() {
+    return this.activePageId;
+  }
+
+  getActivePage() {
+    return this._getActivePage();
+  }
+
+  createHighlightPage(name = null) {
+    const id = `page_${++this._highlightPageIdCounter}`;
+    const pageName = name || `Page ${this.highlightPages.length + 1}`;
+    const page = {
+      id,
+      name: pageName,
+      highlightedGroups: []
+    };
+    this.highlightPages.push(page);
+
+    // If this is the first page, make it active
+    if (this.highlightPages.length === 1) {
+      this.activePageId = id;
+    }
+
+    this._notifyHighlightPageChange();
+    return page;
+  }
+
+  switchToPage(pageId) {
+    const page = this.highlightPages.find((p) => p.id === pageId);
+    if (!page) return false;
+
+    if (this.activePageId === pageId) return true;
+
+    this.activePageId = pageId;
+    this._recomputeHighlightArray();
+    this._notifyHighlightChange();
+    this._notifyHighlightPageChange();
+    return true;
+  }
+
+  deleteHighlightPage(pageId) {
+    const idx = this.highlightPages.findIndex((p) => p.id === pageId);
+    if (idx === -1) return false;
+
+    // Don't allow deleting the last page
+    if (this.highlightPages.length <= 1) return false;
+
+    this.highlightPages.splice(idx, 1);
+
+    // If we deleted the active page, switch to another
+    if (this.activePageId === pageId) {
+      this.activePageId = this.highlightPages[0].id;
+      this._recomputeHighlightArray();
+      this._notifyHighlightChange();
+    }
+
+    this._notifyHighlightPageChange();
+    return true;
+  }
+
+  renameHighlightPage(pageId, newName) {
+    const page = this.highlightPages.find((p) => p.id === pageId);
+    if (!page) return false;
+    page.name = newName;
+    this._notifyHighlightPageChange();
+    return true;
+  }
+
+  /**
+   * Combine two highlight pages using intersection or union
+   * @param {string} pageId1 - First page ID
+   * @param {string} pageId2 - Second page ID
+   * @param {'intersection' | 'union'} operation - The set operation to perform
+   * @returns {Object|null} The newly created page, or null if failed
+   */
+  combineHighlightPages(pageId1, pageId2, operation) {
+    const page1 = this.highlightPages.find((p) => p.id === pageId1);
+    const page2 = this.highlightPages.find((p) => p.id === pageId2);
+    if (!page1 || !page2) return null;
+
+    // Collect all highlighted cell indices from each page
+    const getCellSet = (page) => {
+      const cellSet = new Set();
+      for (const group of page.highlightedGroups) {
+        if (group.enabled === false) continue;
+        if (group.cellIndices) {
+          for (const idx of group.cellIndices) {
+            cellSet.add(idx);
+          }
+        }
+      }
+      return cellSet;
+    };
+
+    const set1 = getCellSet(page1);
+    const set2 = getCellSet(page2);
+
+    let resultIndices;
+    let operationSymbol;
+    if (operation === 'intersection') {
+      // Cells that are in BOTH pages
+      resultIndices = [...set1].filter((idx) => set2.has(idx));
+      operationSymbol = '∩';
+    } else {
+      // Union: cells that are in EITHER page
+      resultIndices = [...new Set([...set1, ...set2])];
+      operationSymbol = '∪';
+    }
+
+    // Create the new page with derived name
+    const newName = `${page1.name} ${operationSymbol} ${page2.name}`;
+    const newPage = this.createHighlightPage(newName);
+
+    // Add a single combined group if there are results
+    if (resultIndices.length > 0) {
+      const groupId = `highlight_${++this._highlightIdCounter}`;
+      const group = {
+        id: groupId,
+        type: 'combined',
+        label: `${operation === 'intersection' ? 'Intersection' : 'Union'} of ${page1.name} & ${page2.name}`,
+        cellIndices: resultIndices,
+        cellCount: resultIndices.length,
+        enabled: true
+      };
+      newPage.highlightedGroups.push(group);
+    }
+
+    this._notifyHighlightPageChange();
+    return newPage;
+  }
+
+  // Ensure at least one page exists
+  ensureHighlightPage() {
+    if (this.highlightPages.length === 0) {
+      this.createHighlightPage('Page 1');
+    }
+  }
+
+  _ensureHighlightArray() {
+    if (!this.highlightArray || this.highlightArray.length !== this.pointCount) {
+      this.highlightArray = new Uint8Array(this.pointCount);
+    }
+  }
+
+  _recomputeHighlightArray() {
+    this._ensureHighlightArray();
+    this.highlightArray.fill(0);
+    for (const group of this.highlightedGroups) {
+      // Skip disabled groups
+      if (group.enabled === false) continue;
+      const indices = group.cellIndices;
+      if (!indices) continue;
+      for (let i = 0; i < indices.length; i++) {
+        const idx = indices[i];
+        if (idx >= 0 && idx < this.pointCount) {
+          this.highlightArray[idx] = 255;
+        }
+      }
+    }
+    this._pushHighlightToViewer();
+  }
+
+  _pushHighlightToViewer() {
+    if (this.viewer && typeof this.viewer.updateHighlight === 'function') {
+      this.viewer.updateHighlight(this.highlightArray);
+    }
+  }
+
+  // Get cell indices for a categorical selection
+  // Only includes cells that are currently visible (pass all active filters)
+  getCellIndicesForCategory(fieldIndex, categoryIndex, source = 'obs') {
+    const field = source === 'var'
+      ? this.varData?.fields?.[fieldIndex]
+      : this.obsData?.fields?.[fieldIndex];
+    if (!field || field.kind !== 'category') return [];
+    const codes = field.codes || [];
+    const indices = [];
+    for (let i = 0; i < codes.length; i++) {
+      if (codes[i] === categoryIndex) {
+        // Only include cells that are currently visible (not filtered out)
+        const isVisible = !this.categoryTransparency || this.categoryTransparency[i] > 0;
+        if (isVisible) {
+          indices.push(i);
+        }
+      }
+    }
+    return indices;
+  }
+
+  // Get cell indices for a continuous range selection
+  // Only includes cells that are currently visible (pass all active filters)
+  getCellIndicesForRange(fieldIndex, minVal, maxVal, source = 'obs') {
+    const field = source === 'var'
+      ? this.varData?.fields?.[fieldIndex]
+      : this.obsData?.fields?.[fieldIndex];
+    if (!field || field.kind !== 'continuous') return [];
+    const values = field.values || [];
+    const indices = [];
+    for (let i = 0; i < values.length; i++) {
+      const v = values[i];
+      if (v !== null && !Number.isNaN(v) && v >= minVal && v <= maxVal) {
+        // Only include cells that are currently visible (not filtered out)
+        const isVisible = !this.categoryTransparency || this.categoryTransparency[i] > 0;
+        if (isVisible) {
+          indices.push(i);
+        }
+      }
+    }
+    return indices;
+  }
+
+  // Set a preview highlight for a continuous range (shown during drag)
+  // This temporarily shows what would be highlighted without committing it
+  setPreviewHighlightForRange(fieldIndex, minVal, maxVal, source = 'obs') {
+    const field = source === 'var'
+      ? this.varData?.fields?.[fieldIndex]
+      : this.obsData?.fields?.[fieldIndex];
+    if (!field || field.kind !== 'continuous') {
+      this.clearPreviewHighlight();
+      return;
+    }
+
+    const cellIndices = this.getCellIndicesForRange(fieldIndex, minVal, maxVal, source);
+
+    this._ensureHighlightArray();
+    // Start with existing permanent highlights
+    this.highlightArray.fill(0);
+    for (const group of this.highlightedGroups) {
+      const indices = group.cellIndices;
+      if (!indices) continue;
+      for (let i = 0; i < indices.length; i++) {
+        const idx = indices[i];
+        if (idx >= 0 && idx < this.pointCount) {
+          this.highlightArray[idx] = 255;
+        }
+      }
+    }
+    // Add preview highlights on top
+    for (let i = 0; i < cellIndices.length; i++) {
+      const idx = cellIndices[i];
+      if (idx >= 0 && idx < this.pointCount) {
+        this.highlightArray[idx] = 255;
+      }
+    }
+    this._pushHighlightToViewer();
+  }
+
+  // Clear preview highlight (restore to only permanent highlights)
+  clearPreviewHighlight() {
+    this._recomputeHighlightArray();
+  }
+
+  // Add a highlighted group from a categorical selection
+  addHighlightFromCategory(fieldIndex, categoryIndex, source = 'obs') {
+    const field = source === 'var'
+      ? this.varData?.fields?.[fieldIndex]
+      : this.obsData?.fields?.[fieldIndex];
+    if (!field || field.kind !== 'category') return null;
+    const categories = field.categories || [];
+    const categoryName = categories[categoryIndex];
+    if (categoryName === undefined) return null;
+
+    const cellIndices = this.getCellIndicesForCategory(fieldIndex, categoryIndex, source);
+    if (cellIndices.length === 0) return null;
+
+    const id = `highlight_${++this._highlightIdCounter}`;
+    const group = {
+      id,
+      type: 'category',
+      label: `${field.key}: ${categoryName}`,
+      fieldKey: field.key,
+      fieldIndex,
+      fieldSource: source,
+      categoryIndex,
+      categoryName,
+      cellIndices,
+      cellCount: cellIndices.length
+    };
+
+    this.highlightedGroups.push(group);
+    this._recomputeHighlightArray();
+    this._notifyHighlightChange();
+    return group;
+  }
+
+  // Add a highlighted group from a continuous range selection
+  addHighlightFromRange(fieldIndex, minVal, maxVal, source = 'obs') {
+    const field = source === 'var'
+      ? this.varData?.fields?.[fieldIndex]
+      : this.obsData?.fields?.[fieldIndex];
+    if (!field || field.kind !== 'continuous') return null;
+
+    const cellIndices = this.getCellIndicesForRange(fieldIndex, minVal, maxVal, source);
+    if (cellIndices.length === 0) return null;
+
+    const id = `highlight_${++this._highlightIdCounter}`;
+    const formatVal = (v) => {
+      if (Math.abs(v) >= 1000 || (Math.abs(v) > 0 && Math.abs(v) < 0.01)) {
+        return v.toExponential(2);
+      }
+      return v.toFixed(2);
+    };
+    const group = {
+      id,
+      type: 'range',
+      label: `${field.key}: ${formatVal(minVal)} – ${formatVal(maxVal)}`,
+      fieldKey: field.key,
+      fieldIndex,
+      fieldSource: source,
+      rangeMin: minVal,
+      rangeMax: maxVal,
+      cellIndices,
+      cellCount: cellIndices.length
+    };
+
+    this.highlightedGroups.push(group);
+    this._recomputeHighlightArray();
+    this._notifyHighlightChange();
+    return group;
+  }
+
+  removeHighlightGroup(groupId) {
+    const idx = this.highlightedGroups.findIndex((g) => g.id === groupId);
+    if (idx === -1) return false;
+    this.highlightedGroups.splice(idx, 1);
+    this._recomputeHighlightArray();
+    this._notifyHighlightChange();
+    return true;
+  }
+
+  toggleHighlightEnabled(groupId, enabled) {
+    const group = this.highlightedGroups.find((g) => g.id === groupId);
+    if (!group) return false;
+    group.enabled = enabled;
+    this._recomputeHighlightArray();
+    this._notifyHighlightChange();
+    return true;
+  }
+
+  clearAllHighlights() {
+    if (this.highlightedGroups.length === 0) return;
+    this.highlightedGroups = [];
+    this._recomputeHighlightArray();
+    this._notifyHighlightChange();
+  }
+
+  getHighlightedGroups() {
+    return this.highlightedGroups;
+  }
+
+  getHighlightedCellCount() {
+    // Returns count of highlighted cells that are currently visible
+    if (!this.highlightArray) return 0;
+    let count = 0;
+    for (let i = 0; i < this.highlightArray.length; i++) {
+      if (this.highlightArray[i] > 0) {
+        // Only count if visible (no transparency = visible, or transparency > 0)
+        const isVisible = !this.categoryTransparency || this.categoryTransparency[i] > 0;
+        if (isVisible) count++;
+      }
+    }
+    return count;
+  }
+
+  getTotalHighlightedCellCount() {
+    // Returns total count of all highlighted cells, including filtered-out ones
+    if (!this.highlightArray) return 0;
+    let count = 0;
+    for (let i = 0; i < this.highlightArray.length; i++) {
+      if (this.highlightArray[i] > 0) count++;
+    }
+    return count;
+  }
+
+  // Get the cell index at a screen position (requires viewer support)
+  getCellAtScreenPosition(x, y) {
+    if (this.viewer && typeof this.viewer.pickCellAtScreen === 'function') {
+      return this.viewer.pickCellAtScreen(x, y);
+    }
+    return -1;
+  }
+
+  // Get category index for a cell
+  getCategoryForCell(cellIndex, fieldIndex, source = 'obs') {
+    const field = source === 'var'
+      ? this.varData?.fields?.[fieldIndex]
+      : this.obsData?.fields?.[fieldIndex];
+    if (!field || field.kind !== 'category') return -1;
+    const codes = field.codes || [];
+    if (cellIndex < 0 || cellIndex >= codes.length) return -1;
+    return codes[cellIndex];
+  }
+
+  // Get value for a cell in a continuous field
+  getValueForCell(cellIndex, fieldIndex, source = 'obs') {
+    const field = source === 'var'
+      ? this.varData?.fields?.[fieldIndex]
+      : this.obsData?.fields?.[fieldIndex];
+    if (!field || field.kind !== 'continuous') return null;
+    const values = field.values || [];
+    if (cellIndex < 0 || cellIndex >= values.length) return null;
+    return values[cellIndex];
+  }
+
+  // Get all highlighted cell indices (unique, merged from all groups)
+  getAllHighlightedCellIndices() {
+    const set = new Set();
+    for (const group of this.highlightedGroups) {
+      if (group.cellIndices) {
+        for (const idx of group.cellIndices) {
+          set.add(idx);
+        }
+      }
+    }
+    return Array.from(set);
   }
 }

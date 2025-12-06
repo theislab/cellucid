@@ -25,6 +25,12 @@ export function initUI({ state, viewer, dom, smoke }) {
     outlierFilterDisplay,
     filterCountEl,
     activeFiltersEl,
+    highlightCountEl,
+    highlightedGroupsEl,
+    highlightActionsEl,
+    clearAllHighlightsBtn,
+    highlightPagesTabsEl,
+    addHighlightPageBtn,
     resetCameraBtn,
     navigationModeSelect,
     lookSensitivityInput,
@@ -99,6 +105,42 @@ export function initUI({ state, viewer, dom, smoke }) {
   const LIVE_VIEW_ID = 'live';
   let activeViewId = LIVE_VIEW_ID;
   let viewLayoutMode = 'grid'; // 'grid' or 'single'
+
+  // Create floating range label for continuous selection
+  const rangeLabel = document.createElement('div');
+  rangeLabel.id = 'selection-range-label';
+  rangeLabel.style.cssText = `
+    position: fixed;
+    pointer-events: none;
+    background: rgba(0, 0, 0, 0.8);
+    color: #fff;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-family: monospace;
+    white-space: nowrap;
+    z-index: 10000;
+    display: none;
+    transform: translate(12px, -50%);
+  `;
+  document.body.appendChild(rangeLabel);
+
+  function showRangeLabel(x, y, minVal, maxVal) {
+    const formatVal = (v) => {
+      if (Math.abs(v) >= 1000 || (Math.abs(v) < 0.01 && v !== 0)) {
+        return v.toExponential(2);
+      }
+      return v.toFixed(2);
+    };
+    rangeLabel.textContent = `${formatVal(minVal)} → ${formatVal(maxVal)}`;
+    rangeLabel.style.left = x + 'px';
+    rangeLabel.style.top = y + 'px';
+    rangeLabel.style.display = 'block';
+  }
+
+  function hideRangeLabel() {
+    rangeLabel.style.display = 'none';
+  }
 
   function refreshUIForActiveView() {
     const source = state.activeFieldSource || null;
@@ -378,6 +420,431 @@ export function initUI({ state, viewer, dom, smoke }) {
     if (viewer?.hasSnapshots && viewer.hasSnapshots()) {
       renderSplitViewBadges();
     }
+  }
+
+  // === HIGHLIGHT UI ===
+  function renderHighlightSummary() {
+    if (!highlightedGroupsEl || !highlightCountEl) return;
+
+    const groups = state.getHighlightedGroups();
+    const visibleCount = state.getHighlightedCellCount();
+    const totalCount = state.getTotalHighlightedCellCount ? state.getTotalHighlightedCellCount() : visibleCount;
+
+    // Update count - show both visible and total if they differ
+    if (totalCount === 0) {
+      highlightCountEl.textContent = 'No cells highlighted';
+    } else if (visibleCount === totalCount) {
+      highlightCountEl.textContent = `${totalCount.toLocaleString()} cells highlighted`;
+    } else {
+      highlightCountEl.textContent = `${visibleCount.toLocaleString()} of ${totalCount.toLocaleString()} highlighted cells visible`;
+    }
+
+    // Show/hide actions
+    if (highlightActionsEl) {
+      highlightActionsEl.style.display = groups.length > 0 ? 'block' : 'none';
+    }
+
+    // Render groups list
+    highlightedGroupsEl.innerHTML = '';
+
+    if (groups.length === 0) {
+      return;
+    }
+
+    groups.forEach((group) => {
+      const enabled = group.enabled !== false; // default true
+      const item = document.createElement('div');
+      item.className = 'highlight-item' + (enabled ? '' : ' disabled');
+      item.dataset.highlightId = group.id;
+
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.className = 'highlight-checkbox';
+      checkbox.checked = enabled;
+      checkbox.title = enabled ? 'Disable this highlight' : 'Enable this highlight';
+      checkbox.addEventListener('change', () => {
+        state.toggleHighlightEnabled(group.id, checkbox.checked);
+      });
+
+      const textSpan = document.createElement('span');
+      textSpan.className = 'highlight-text';
+      textSpan.textContent = `${group.label} (${group.cellCount.toLocaleString()})`;
+      textSpan.title = group.label;
+
+      const removeBtn = document.createElement('button');
+      removeBtn.type = 'button';
+      removeBtn.className = 'highlight-remove-btn';
+      removeBtn.innerHTML = '×';
+      removeBtn.title = 'Remove this highlight';
+      removeBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        state.removeHighlightGroup(group.id);
+      });
+
+      item.appendChild(checkbox);
+      item.appendChild(textSpan);
+      item.appendChild(removeBtn);
+      highlightedGroupsEl.appendChild(item);
+    });
+  }
+
+  // === HIGHLIGHT PAGES UI ===
+  let draggedPageId = null;
+
+  function showPageCombineMenu(targetPageId, x, y) {
+    // Remove any existing menu
+    const existingMenu = document.getElementById('page-combine-menu');
+    if (existingMenu) existingMenu.remove();
+
+    const sourcePageId = draggedPageId;
+    if (!sourcePageId || sourcePageId === targetPageId) return;
+
+    const menu = document.createElement('div');
+    menu.id = 'page-combine-menu';
+    menu.className = 'page-combine-menu';
+    menu.style.left = `${x}px`;
+    menu.style.top = `${y}px`;
+
+    const intersectionBtn = document.createElement('button');
+    intersectionBtn.className = 'page-combine-option';
+    intersectionBtn.innerHTML = '<span class="page-combine-icon">&#8745;</span> Intersection';
+    intersectionBtn.title = 'Create page with cells in BOTH pages';
+    intersectionBtn.addEventListener('click', () => {
+      const newPage = state.combineHighlightPages(sourcePageId, targetPageId, 'intersection');
+      if (newPage) {
+        state.switchToPage(newPage.id);
+      }
+      menu.remove();
+    });
+
+    const unionBtn = document.createElement('button');
+    unionBtn.className = 'page-combine-option';
+    unionBtn.innerHTML = '<span class="page-combine-icon">&#8746;</span> Union';
+    unionBtn.title = 'Create page with cells in EITHER page';
+    unionBtn.addEventListener('click', () => {
+      const newPage = state.combineHighlightPages(sourcePageId, targetPageId, 'union');
+      if (newPage) {
+        state.switchToPage(newPage.id);
+      }
+      menu.remove();
+    });
+
+    menu.appendChild(intersectionBtn);
+    menu.appendChild(unionBtn);
+    document.body.appendChild(menu);
+
+    // Close menu when clicking outside
+    const closeMenu = (e) => {
+      if (!menu.contains(e.target)) {
+        menu.remove();
+        document.removeEventListener('mousedown', closeMenu);
+      }
+    };
+    setTimeout(() => document.addEventListener('mousedown', closeMenu), 0);
+  }
+
+  function renderHighlightPages() {
+    if (!highlightPagesTabsEl) return;
+
+    const pages = state.getHighlightPages();
+    const activePageId = state.getActivePageId();
+
+    highlightPagesTabsEl.innerHTML = '';
+
+    pages.forEach((page) => {
+      const isActive = page.id === activePageId;
+      const groupCount = page.highlightedGroups.length;
+
+      const tab = document.createElement('div');
+      tab.className = 'highlight-page-tab' + (isActive ? ' active' : '');
+      tab.dataset.pageId = page.id;
+
+      // Make tab draggable
+      tab.draggable = true;
+
+      tab.addEventListener('dragstart', (e) => {
+        draggedPageId = page.id;
+        tab.classList.add('dragging');
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', page.id);
+      });
+
+      tab.addEventListener('dragend', () => {
+        tab.classList.remove('dragging');
+        // Remove drag-over class from all tabs
+        highlightPagesTabsEl.querySelectorAll('.highlight-page-tab').forEach((t) => {
+          t.classList.remove('drag-over');
+        });
+      });
+
+      tab.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+      });
+
+      tab.addEventListener('dragenter', (e) => {
+        e.preventDefault();
+        if (draggedPageId && draggedPageId !== page.id) {
+          tab.classList.add('drag-over');
+        }
+      });
+
+      tab.addEventListener('dragleave', () => {
+        tab.classList.remove('drag-over');
+      });
+
+      tab.addEventListener('drop', (e) => {
+        e.preventDefault();
+        tab.classList.remove('drag-over');
+        if (draggedPageId && draggedPageId !== page.id) {
+          showPageCombineMenu(page.id, e.clientX, e.clientY);
+        }
+      });
+
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'highlight-page-tab-name';
+      nameSpan.textContent = page.name;
+      nameSpan.title = page.name;
+
+      // Double-click to rename
+      nameSpan.addEventListener('dblclick', (e) => {
+        e.stopPropagation();
+        startPageRename(tab, page);
+      });
+
+      const countSpan = document.createElement('span');
+      countSpan.className = 'highlight-page-tab-count';
+      countSpan.textContent = `(${groupCount})`;
+
+      tab.appendChild(nameSpan);
+      tab.appendChild(countSpan);
+
+      // Only show delete button if there's more than one page
+      if (pages.length > 1) {
+        const deleteBtn = document.createElement('button');
+        deleteBtn.type = 'button';
+        deleteBtn.className = 'highlight-page-tab-delete';
+        deleteBtn.innerHTML = '×';
+        deleteBtn.title = 'Delete this page';
+        deleteBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          state.deleteHighlightPage(page.id);
+        });
+        tab.appendChild(deleteBtn);
+      }
+
+      // Click to switch page
+      tab.addEventListener('click', () => {
+        if (!isActive) {
+          state.switchToPage(page.id);
+        }
+      });
+
+      highlightPagesTabsEl.appendChild(tab);
+    });
+  }
+
+  function startPageRename(tabEl, page) {
+    const nameSpan = tabEl.querySelector('.highlight-page-tab-name');
+    if (!nameSpan) return;
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'highlight-page-tab-input';
+    input.value = page.name;
+
+    const finishRename = () => {
+      const newName = input.value.trim() || page.name;
+      state.renameHighlightPage(page.id, newName);
+    };
+
+    input.addEventListener('blur', finishRename);
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        input.blur();
+      } else if (e.key === 'Escape') {
+        input.value = page.name;
+        input.blur();
+      }
+    });
+
+    nameSpan.textContent = '';
+    nameSpan.appendChild(input);
+    input.focus();
+    input.select();
+  }
+
+  // Handle cell selection from viewer
+  function handleCellSelection(selectionEvent) {
+    // Hide the range label when selection completes
+    hideRangeLabel();
+
+    const activeField = state.getActiveField();
+    if (!activeField) {
+      console.log('[UI] No active field for cell selection');
+      return;
+    }
+
+    const cellIndex = selectionEvent.cellIndex;
+    const fieldIndex = state.activeFieldSource === 'var'
+      ? state.activeVarFieldIndex
+      : state.activeFieldIndex;
+    const source = state.activeFieldSource || 'obs';
+
+    if (activeField.kind === 'category') {
+      // Categorical: select all cells in the same category
+      const categoryIndex = state.getCategoryForCell(cellIndex, fieldIndex, source);
+      if (categoryIndex >= 0) {
+        state.addHighlightFromCategory(fieldIndex, categoryIndex, source);
+      }
+    } else if (activeField.kind === 'continuous') {
+      // Continuous: use drag distance to determine range
+      const clickedValue = state.getValueForCell(cellIndex, fieldIndex, source);
+      if (clickedValue == null) return;
+
+      const stats = activeField._continuousStats || { min: 0, max: 1 };
+      const valueRange = stats.max - stats.min;
+
+      if (selectionEvent.type === 'range' && selectionEvent.dragDeltaY !== 0) {
+        // Drag selection: calculate range based on drag direction and distance
+        const dragScale = 0.005; // pixels to value ratio
+        const dragAmount = -selectionEvent.dragDeltaY * dragScale * valueRange;
+
+        let minVal, maxVal;
+        if (dragAmount > 0) {
+          // Dragged up: select from clicked value to higher
+          minVal = clickedValue;
+          maxVal = Math.min(stats.max, clickedValue + dragAmount);
+        } else {
+          // Dragged down: select from lower to clicked value
+          minVal = Math.max(stats.min, clickedValue + dragAmount);
+          maxVal = clickedValue;
+        }
+
+        state.addHighlightFromRange(fieldIndex, minVal, maxVal, source);
+      } else {
+        // Single click: select a small range around the clicked value
+        const rangeSize = valueRange * 0.1; // 10% of range
+        const minVal = Math.max(stats.min, clickedValue - rangeSize / 2);
+        const maxVal = Math.min(stats.max, clickedValue + rangeSize / 2);
+        state.addHighlightFromRange(fieldIndex, minVal, maxVal, source);
+      }
+    }
+  }
+
+  // Wire up highlight callbacks
+  if (state.addHighlightChangeCallback) {
+    state.addHighlightChangeCallback(() => {
+      renderHighlightSummary();
+      renderHighlightPages(); // Update page tab counts
+      // Update viewer with new highlight data
+      if (viewer.updateHighlight && state.highlightArray) {
+        viewer.updateHighlight(state.highlightArray);
+      }
+    });
+  }
+
+  // Wire up highlight page change callbacks
+  if (state.addHighlightPageChangeCallback) {
+    state.addHighlightPageChangeCallback(() => {
+      renderHighlightPages();
+      renderHighlightSummary();
+    });
+  }
+
+  // Initialize first highlight page if none exist
+  if (state.ensureHighlightPage) {
+    state.ensureHighlightPage();
+    renderHighlightPages();
+  }
+
+  // Wire up add page button
+  if (addHighlightPageBtn) {
+    addHighlightPageBtn.addEventListener('click', () => {
+      state.createHighlightPage();
+      // Switch to the newly created page
+      const pages = state.getHighlightPages();
+      if (pages.length > 0) {
+        const newPage = pages[pages.length - 1];
+        state.switchToPage(newPage.id);
+      }
+    });
+  }
+
+  // Wire up cell selection callback
+  if (viewer.setCellSelectionCallback) {
+    viewer.setCellSelectionCallback(handleCellSelection);
+  }
+
+  // Handle preview during continuous drag
+  function handleSelectionPreview(previewEvent) {
+    const activeField = state.getActiveField ? state.getActiveField() : null;
+    if (!activeField || activeField.kind !== 'continuous') {
+      hideRangeLabel();
+      return;
+    }
+
+    const fieldIndex = state.activeFieldSource === 'var'
+      ? state.activeVarFieldIndex
+      : state.activeFieldIndex;
+    const source = state.activeFieldSource || 'obs';
+
+    const cellIndex = previewEvent.cellIndex;
+    const clickedValue = state.getValueForCell(cellIndex, fieldIndex, source);
+    if (clickedValue == null) {
+      hideRangeLabel();
+      return;
+    }
+
+    const stats = activeField._continuousStats || { min: 0, max: 1 };
+    const valueRange = stats.max - stats.min;
+    const dragScale = 0.005;
+    const dragAmount = -previewEvent.dragDeltaY * dragScale * valueRange;
+
+    let minVal, maxVal;
+    if (dragAmount > 0) {
+      minVal = clickedValue;
+      maxVal = Math.min(stats.max, clickedValue + dragAmount);
+    } else {
+      minVal = Math.max(stats.min, clickedValue + dragAmount);
+      maxVal = clickedValue;
+    }
+
+    // Update preview highlighting
+    if (state.setPreviewHighlightForRange) {
+      state.setPreviewHighlightForRange(fieldIndex, minVal, maxVal, source);
+    }
+
+    // Show range label next to cursor
+    showRangeLabel(previewEvent.endX, previewEvent.endY, minVal, maxVal);
+  }
+
+  // Wire up selection preview callback
+  if (viewer.setSelectionPreviewCallback) {
+    viewer.setSelectionPreviewCallback(handleSelectionPreview);
+  }
+
+  // Update highlight mode based on active field
+  function updateHighlightMode() {
+    if (!viewer.setHighlightMode) return;
+    const activeField = state.getActiveField ? state.getActiveField() : null;
+    if (!activeField) {
+      viewer.setHighlightMode('none');
+    } else if (activeField.kind === 'continuous') {
+      viewer.setHighlightMode('continuous');
+    } else if (activeField.kind === 'category') {
+      viewer.setHighlightMode('categorical');
+    } else {
+      viewer.setHighlightMode('none');
+    }
+  }
+
+  // Wire up clear all button
+  if (clearAllHighlightsBtn) {
+    clearAllHighlightsBtn.addEventListener('click', () => {
+      state.clearAllHighlights();
+    });
   }
 
   function getFieldsByKind(kind) {
@@ -1506,30 +1973,32 @@ export function initUI({ state, viewer, dom, smoke }) {
 
   // --- Event wiring ---
 
-  categoricalFieldSelect.addEventListener('change', () => {
+  categoricalFieldSelect.addEventListener('change', async () => {
     const idx = parseInt(categoricalFieldSelect.value, 10);
     if (Number.isNaN(idx)) return;
     if (idx >= 0) {
       if (continuousFieldSelect.value !== NONE_FIELD_VALUE) {
         continuousFieldSelect.value = NONE_FIELD_VALUE;
       }
-      activateField(idx);
+      await activateField(idx);
     } else if (continuousFieldSelect.value === NONE_FIELD_VALUE) {
-      activateField(-1);
+      await activateField(-1);
     }
+    updateHighlightMode();
   });
 
-  continuousFieldSelect.addEventListener('change', () => {
+  continuousFieldSelect.addEventListener('change', async () => {
     const idx = parseInt(continuousFieldSelect.value, 10);
     if (Number.isNaN(idx)) return;
     if (idx >= 0) {
       if (categoricalFieldSelect.value !== NONE_FIELD_VALUE) {
         categoricalFieldSelect.value = NONE_FIELD_VALUE;
       }
-      activateField(idx);
+      await activateField(idx);
     } else if (categoricalFieldSelect.value === NONE_FIELD_VALUE) {
-      activateField(-1);
+      await activateField(-1);
     }
+    updateHighlightMode();
   });
 
   sidebarToggle.addEventListener('click', () => {
@@ -1537,6 +2006,48 @@ export function initUI({ state, viewer, dom, smoke }) {
     sidebarToggle.classList.toggle('sidebar-open');
     sidebarToggle.textContent = sidebar.classList.contains('hidden') ? '☰' : '✕';
   });
+
+  // Sidebar resize functionality
+  const sidebarResizeHandle = document.getElementById('sidebar-resize-handle');
+  const MIN_SIDEBAR_WIDTH = 260;
+  const MAX_SIDEBAR_WIDTH = 520; // 2x the minimum width
+
+  if (sidebarResizeHandle) {
+    let isResizing = false;
+    let startX = 0;
+    let startWidth = 0;
+
+    const updateSidebarWidth = (width) => {
+      const clampedWidth = Math.max(MIN_SIDEBAR_WIDTH, Math.min(MAX_SIDEBAR_WIDTH, width));
+      sidebar.style.width = `${clampedWidth}px`;
+      document.documentElement.style.setProperty('--sidebar-width', `${clampedWidth}px`);
+    };
+
+    sidebarResizeHandle.addEventListener('mousedown', (e) => {
+      isResizing = true;
+      startX = e.clientX;
+      startWidth = sidebar.offsetWidth;
+      sidebar.classList.add('resizing');
+      document.body.style.cursor = 'ew-resize';
+      document.body.style.userSelect = 'none';
+      e.preventDefault();
+    });
+
+    document.addEventListener('mousemove', (e) => {
+      if (!isResizing) return;
+      const deltaX = e.clientX - startX;
+      updateSidebarWidth(startWidth + deltaX);
+    });
+
+    document.addEventListener('mouseup', () => {
+      if (isResizing) {
+        isResizing = false;
+        sidebar.classList.remove('resizing');
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+      }
+    });
+  }
 
   pointSizeInput.addEventListener('input', () => {
     applyPointSizeFromSlider();
@@ -2211,14 +2722,17 @@ export function initUI({ state, viewer, dom, smoke }) {
   };
 
   renderFieldSelects();
+  updateHighlightMode();
   initGeneExpressionDropdown();
   const startingNavMode = navigationModeSelect?.value || 'orbit';
   toggleNavigationPanels(startingNavMode);
 
   // Wire state visibility callback so the smoke button lights up when filters change
+  // Also update highlight summary since visible highlighted count may change
   const handleVisibilityChange = () => {
     markSmokeDirty();
     refreshLegendCategoryCounts();
+    renderHighlightSummary(); // Update highlight count when visibility changes
   };
   if (state.addVisibilityChangeCallback) {
     state.addVisibilityChangeCallback(handleVisibilityChange);
