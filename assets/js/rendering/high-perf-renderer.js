@@ -633,6 +633,9 @@ export class HighPerfRenderer {
     this.fogNear = 0;
     this.fogFar = 10;
 
+    // Cached bounding sphere (computed from positions, independent of octree)
+    this._boundingSphere = null;
+
     // Dirty flags for lazy buffer rebuilds (avoids double rebuilds)
     this._bufferDirty = false;
     this._lodBuffersDirty = false;
@@ -795,9 +798,15 @@ export class HighPerfRenderer {
       this.octree._lastLODLevel = undefined;
       console.log(`[HighPerfRenderer] Octree built with ${this.octree.lodLevels.length} LOD levels (hierarchical sampling)`);
 
+      // Reuse octree's bounding sphere (avoids duplicate bounds computation)
+      this._boundingSphere = this.octree.getBoundingSphere();
+
       if (this.options.USE_LOD) {
         this._createLODBuffers();
       }
+    } else {
+      // No octree - compute bounding sphere directly for consistent fog
+      this._boundingSphere = this._computeBoundingSphere(positions);
     }
 
     // Create main data buffers
@@ -1098,14 +1107,51 @@ export class HighPerfRenderer {
     this.fogFar = far;
   }
 
+  _computeBoundingSphere(positions) {
+    const count = positions.length / 3;
+    if (count === 0) return { center: [0, 0, 0], radius: 1 };
+
+    // Compute bounding box
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+
+    for (let i = 0; i < count; i++) {
+      const idx = i * 3;
+      const x = positions[idx];
+      const y = positions[idx + 1];
+      const z = positions[idx + 2];
+
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (z < minZ) minZ = z;
+      if (x > maxX) maxX = x;
+      if (y > maxY) maxY = y;
+      if (z > maxZ) maxZ = z;
+    }
+
+    // Compute center and radius from bounding box
+    const centerX = (minX + maxX) * 0.5;
+    const centerY = (minY + maxY) * 0.5;
+    const centerZ = (minZ + maxZ) * 0.5;
+
+    const dx = maxX - minX;
+    const dy = maxY - minY;
+    const dz = maxZ - minZ;
+    const radius = Math.sqrt(dx * dx + dy * dy + dz * dz) * 0.5;
+
+    return { center: [centerX, centerY, centerZ], radius };
+  }
+
   autoComputeFogRange(cameraPosition) {
-    if (!this.octree) {
+    // Use cached bounding sphere (computed in loadData), fall back to octree or defaults
+    const sphere = this._boundingSphere || (this.octree ? this.octree.getBoundingSphere() : null);
+
+    if (!sphere) {
       this.fogNear = 0;
       this.fogFar = 10;
       return;
     }
 
-    const sphere = this.octree.getBoundingSphere();
     const dx = cameraPosition[0] - sphere.center[0];
     const dy = cameraPosition[1] - sphere.center[1];
     const dz = cameraPosition[2] - sphere.center[2];
@@ -1705,6 +1751,18 @@ export class HighPerfRenderer {
 
     if (enabled && !this.octree && this.pointCount > 0 && this._positions) {
       console.log('[HighPerfRenderer] Building octree for frustum culling...');
+      this.octree = new Octree(
+        this._positions,
+        this._colors,
+        this.options.LOD_MAX_POINTS_PER_NODE
+      );
+      console.log(`[HighPerfRenderer] Octree built with ${this.octree.lodLevels.length} LOD levels`);
+    }
+  }
+
+  ensureOctree() {
+    if (!this.octree && this.pointCount > 0 && this._positions) {
+      console.log('[HighPerfRenderer] Building octree for collision detection...');
       this.octree = new Octree(
         this._positions,
         this._colors,

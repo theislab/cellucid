@@ -484,14 +484,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   const INERTIA_FRICTION = 0.92;
   const INERTIA_MIN_VELOCITY = 0.0001;
   const VELOCITY_SMOOTHING = 0.3;
-  const PROJECTILE_RADIUS = 0.05;
-  const PROJECTILE_SPEED = 3.5;          // Snappy and responsive
+  const PROJECTILE_RADIUS = 0.05;        // Bigger projectile
+  const PROJECTILE_TRAIL_DELAY = 0.12;   // Seconds before trail starts
+  const PROJECTILE_SPEED = 3.0;          // Snappy and responsive
   const PROJECTILE_GRAVITY = 9.8 * 0.15; // Noticeable arcs without feeling heavy
-  const PROJECTILE_DRAG = 0.995;         // Slight drag for natural deceleration
+  const PROJECTILE_DRAG = 0.998;         // Slight drag for natural deceleration
   const PHYSICS_TICK_RATE = 60;          // Reference frame rate for frame-independent physics (Hz)
   const PROJECTILE_LIFETIME = 12.0;      // Reasonable lifetime
-  const PROJECTILE_BOUNCE = 0.55;        // Moderate bounce - loses energy on impact
-  const PROJECTILE_FLASH_TIME = 0.4;
+  const PROJECTILE_BOUNCE = 0.1;         // Low restitution - loses most energy on impact
+  const PROJECTILE_FRICTION = 0.7;       // High tangential friction on bounce
+  const PROJECTILE_TRAIL_LENGTH = 16;    // Number of trail segments
+  const PROJECTILE_TRAIL_SPACING = 0.004; // Seconds between trail samples (~60fps)
+  const PROJECTILE_FLASH_TIME = 0.6;
   const MAX_PROJECTILES = 32;
   const MAX_IMPACT_FLASHES = 128;
   const PROJECTILE_SPREAD = 0;          // No spread - shoots exactly where aimed
@@ -818,36 +822,19 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
   function queryNearbyPoints(center, radius, maxResults = 64) {
     if (!positionsArray || positionsArray.length < 3) return [];
-    if (hpRenderer?.octree) {
-      const indices = hpRenderer.octree.queryRadius(center, radius, maxResults);
-      return indices.map((idx) => {
-        const posBase = idx * 3;
-        return {
-          index: idx,
-          position: [positionsArray[posBase], positionsArray[posBase + 1], positionsArray[posBase + 2]],
-          color: getNormalizedColor(idx)
-        };
-      });
+    if (!hpRenderer?.octree) {
+      hpRenderer?.ensureOctree();
     }
-    // Small fallback scan for tiny datasets without an octree
-    const results = [];
-    const maxScan = Math.min(pointCount, 4000);
-    const r2 = radius * radius;
-    for (let i = 0; i < maxScan && results.length < maxResults; i++) {
-      const posBase = i * 3;
-      const dx = positionsArray[posBase] - center[0];
-      const dy = positionsArray[posBase + 1] - center[1];
-      const dz = positionsArray[posBase + 2] - center[2];
-      const dist2 = dx * dx + dy * dy + dz * dz;
-      if (dist2 <= r2) {
-        results.push({
-          index: i,
-          position: [positionsArray[posBase], positionsArray[posBase + 1], positionsArray[posBase + 2]],
-          color: getNormalizedColor(i)
-        });
-      }
-    }
-    return results;
+    if (!hpRenderer?.octree) return [];
+    const indices = hpRenderer.octree.queryRadius(center, radius, maxResults);
+    return indices.map((idx) => {
+      const posBase = idx * 3;
+      return {
+        index: idx,
+        position: [positionsArray[posBase], positionsArray[posBase + 1], positionsArray[posBase + 2]],
+        color: getNormalizedColor(idx)
+      };
+    });
   }
 
   function pickProjectileColor() {
@@ -881,15 +868,17 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     spreadDir[1] += PROJECTILE_LOFT;
     vec3.normalize(spreadDir, spreadDir);
 
-    // Start projectile close to camera (0.1 offset balances "from camera" feel with reasonable perspective size)
-    const start = vec3.add(vec3.create(), freeflyPosition, vec3.scale(vec3.create(), spreadDir, 0.1));
+    // Start projectile very close to camera for bigger initial appearance
+    const start = vec3.add(vec3.create(), freeflyPosition, vec3.scale(vec3.create(), spreadDir, 0.02));
     const vel = vec3.scale(vec3.create(), spreadDir, PROJECTILE_SPEED);
     projectiles.push({
       position: start,
       velocity: vel,
       color: pickProjectileColor(),
       radius: PROJECTILE_RADIUS,
-      age: 0
+      age: 0,
+      trail: [],           // Ring buffer of past positions [x,y,z, x,y,z, ...]
+      trailTime: -PROJECTILE_TRAIL_DELAY  // Negative = delay before trail starts
     });
     if (projectiles.length > MAX_PROJECTILES) projectiles.shift();
     projectileBufferDirty = true;
@@ -934,6 +923,19 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         continue;
       }
 
+      // Sample trail position at regular intervals
+      p.trailTime += dt;
+      if (p.trailTime >= PROJECTILE_TRAIL_SPACING) {
+        p.trailTime = 0;
+        // Push current position to trail (stored as flat array for performance)
+        p.trail.push(p.position[0], p.position[1], p.position[2]);
+        // Trim trail to max length (each position is 3 floats)
+        const maxTrailFloats = PROJECTILE_TRAIL_LENGTH * 3;
+        if (p.trail.length > maxTrailFloats) {
+          p.trail.splice(0, 3); // Remove oldest position
+        }
+      }
+
       // Calculate sub-steps based on velocity to prevent tunneling
       const speed = vec3.length(p.velocity);
       const moveDistance = speed * dt;
@@ -947,11 +949,6 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       let outOfBounds = false;
 
       for (let step = 0; step < numSubSteps; step++) {
-        // Store old position for sweep collision detection
-        const oldPosX = p.position[0];
-        const oldPosY = p.position[1];
-        const oldPosZ = p.position[2];
-
         // Apply physics
         p.velocity[1] -= gravitySubStep;
         vec3.scale(p.velocity, p.velocity, subDrag);
@@ -967,93 +964,59 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
           break;
         }
 
-        // Check collisions with cells - use multiple nearby cells along the swept path
-        // to build a stable surface normal for the bounce.
-        if (pointCount > 0) {
-          const smoothRadius = collisionRadius * 2.5; // Sample wider area for surface normal
-          vec3.set(tempVec3c, p.position[0] - oldPosX, p.position[1] - oldPosY, p.position[2] - oldPosZ);
-          const segLen = vec3.length(tempVec3c);
-          const segLen2 = Math.max(segLen * segLen, 1e-6);
-          if (segLen > 0) vec3.scale(tempVec3d, tempVec3c, 1 / segLen);
-          else vec3.set(tempVec3d, 0, 0, 0);
+        // Check collisions with cells - find the closest cell for a clean bounce
+        if (pointCount > 0 && !p.resting) {
+          // Query nearby points around current position
+          const hits = queryNearbyPoints(p.position, collisionRadius * 1.5, 32);
 
-          // Query once around the swept segment to gather multiple cells for the bounce normal.
-          const midPos = [(oldPosX + p.position[0]) * 0.5, (oldPosY + p.position[1]) * 0.5, (oldPosZ + p.position[2]) * 0.5];
-          const hits = queryNearbyPoints(midPos, smoothRadius + segLen, 96);
-          if (hits.length) {
-            vec3.set(tempVec3, 0, 0, 0);  // normal accumulator
-            vec3.set(tempVec3b, 0, 0, 0); // contact point accumulator
-            let totalWeight = 0;
-            let hasCollision = false;
-            let maxPenetration = 0;
-            let impactColor = null;
+          // Find the closest colliding cell
+          let closestHit = null;
+          let closestDist = Infinity;
 
-            for (const hit of hits) {
-              // Closest point on the segment to the hit cell
-              vec3.set(tempVec3e, hit.position[0] - oldPosX, hit.position[1] - oldPosY, hit.position[2] - oldPosZ);
-              const t = Math.max(0, Math.min(1, vec3.dot(tempVec3e, tempVec3c) / segLen2));
-              const closestX = oldPosX + tempVec3c[0] * t;
-              const closestY = oldPosY + tempVec3c[1] * t;
-              const closestZ = oldPosZ + tempVec3c[2] * t;
+          for (const hit of hits) {
+            vec3.sub(tempVec3, p.position, hit.position);
+            const d = vec3.length(tempVec3);
+            if (d < collisionRadius && d < closestDist) {
+              closestDist = d;
+              closestHit = hit;
+            }
+          }
 
-              // Vector from closest point on segment to the cell
-              vec3.set(tempVec3f, hit.position[0] - closestX, hit.position[1] - closestY, hit.position[2] - closestZ);
-              const d = vec3.length(tempVec3f);
-              if (d >= collisionRadius) continue;
-
-              hasCollision = true;
-              const penetration = collisionRadius - d;
-              maxPenetration = Math.max(maxPenetration, penetration);
-              if (!impactColor) impactColor = hit.color;
-
-              // Contact normal contribution (fall back to segment direction when extremely close)
-              if (d > 1e-5) {
-                vec3.scale(tempVec3f, tempVec3f, 1 / d);
-              } else {
-                vec3.copy(tempVec3f, tempVec3d);
-              }
-              // Ensure the normal opposes incoming velocity so we always bounce
-              if (vec3.dot(tempVec3f, p.velocity) > 0) vec3.scale(tempVec3f, tempVec3f, -1);
-
-              // Weight favors deeper overlaps so multiple nearby cells steer the normal
-              const weight = 1 + (penetration / collisionRadius);
-              totalWeight += weight;
-              vec3.scaleAndAdd(tempVec3, tempVec3, tempVec3f, weight);
-              vec3.set(tempVec3e, closestX, closestY, closestZ);
-              vec3.scaleAndAdd(tempVec3b, tempVec3b, tempVec3e, weight);
+          if (closestHit) {
+            // Calculate clean surface normal from closest cell
+            vec3.sub(tempVec3, p.position, closestHit.position);
+            const d = vec3.length(tempVec3);
+            if (d > 1e-5) {
+              vec3.scale(tempVec3, tempVec3, 1 / d); // Normalize
+            } else {
+              // Fallback: use opposite of velocity direction
+              vec3.normalize(tempVec3, p.velocity);
+              vec3.scale(tempVec3, tempVec3, -1);
             }
 
-            if (hasCollision && totalWeight > 0) {
-              vec3.scale(tempVec3, tempVec3, 1 / totalWeight);
-              vec3.scale(tempVec3b, tempVec3b, 1 / totalWeight);
-              const nLen = vec3.length(tempVec3);
-              if (nLen > 0) {
-                vec3.scale(tempVec3, tempVec3, 1 / nLen);
-                if (vec3.dot(tempVec3, p.velocity) > 0) vec3.scale(tempVec3, tempVec3, -1);
-
-                const vDotN = vec3.dot(p.velocity, tempVec3);
-                vec3.scaleAndAdd(p.velocity, p.velocity, tempVec3, -(1 + PROJECTILE_BOUNCE) * vDotN);
-                vec3.scale(p.velocity, p.velocity, 0.82); // Noticeable slowdown on bounce
-
-                // Push position out of collision to prevent sticking (use averaged contact point)
-                const pushOut = collisionRadius + 0.002 + maxPenetration * 0.25;
-                vec3.scaleAndAdd(p.position, tempVec3b, tempVec3, pushOut);
-
-                // Secondary check to ensure we are fully outside after the bounce
-                const postHits = queryNearbyPoints(p.position, collisionRadius * 1.25, 24);
-                let residualPenetration = 0;
-                for (const post of postHits) {
-                  vec3.sub(tempVec3e, p.position, post.position);
-                  const d2 = vec3.length(tempVec3e);
-                  residualPenetration = Math.max(residualPenetration, collisionRadius - d2);
-                }
-                if (residualPenetration > 0) {
-                  vec3.scaleAndAdd(p.position, p.position, tempVec3, residualPenetration + 0.001);
-                }
-
-                recordImpact(tempVec3b, impactColor || pickProjectileColor());
-              }
+            // Ensure normal points away from surface (opposes incoming velocity)
+            const vDotN = vec3.dot(p.velocity, tempVec3);
+            if (vDotN > 0) {
+              vec3.scale(tempVec3, tempVec3, -1);
             }
+            // Decompose velocity into normal and tangent components
+            vec3.scale(tempVec3b, tempVec3, vDotN); // Normal component
+            vec3.sub(tempVec3c, p.velocity, tempVec3b); // Tangent component
+
+            // Apply restitution to normal component (bounce)
+            vec3.scale(tempVec3b, tempVec3b, -PROJECTILE_BOUNCE);
+
+            // Apply friction to tangent component (slide)
+            vec3.scale(tempVec3c, tempVec3c, PROJECTILE_FRICTION);
+
+            // Combine for new velocity
+            vec3.add(p.velocity, tempVec3b, tempVec3c);
+
+            // Push position out of collision cleanly
+            const penetration = collisionRadius - d;
+            vec3.scaleAndAdd(p.position, p.position, tempVec3, penetration + 0.003);
+
+            recordImpact(closestHit.position, closestHit.color || pickProjectileColor());
           }
         }
       }
@@ -1068,11 +1031,15 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     if (projectiles.length) projectileBufferDirty = true;
   }
 
+  // Track total projectile points for draw call
+  let projectilePointCount = 0;
+
   function rebuildProjectileBuffers() {
     const count = projectiles.length;
     if (count === 0) {
       projectilePositions = new Float32Array();
       projectileColors = new Uint8Array();
+      projectilePointCount = 0;
       gl.bindBuffer(gl.ARRAY_BUFFER, projectilePositionBuffer);
       gl.bufferData(gl.ARRAY_BUFFER, projectilePositions, gl.DYNAMIC_DRAW);
       gl.bindBuffer(gl.ARRAY_BUFFER, projectileColorBuffer);
@@ -1081,22 +1048,56 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       return;
     }
 
-    projectilePositions = new Float32Array(count * 3);
-    projectileColors = new Uint8Array(count * 4); // RGBA packed
+    // Count total points: head + trail for each projectile
+    let totalPoints = 0;
+    for (let i = 0; i < count; i++) {
+      totalPoints += 1 + (projectiles[i].trail.length / 3);
+    }
+
+    projectilePositions = new Float32Array(totalPoints * 3);
+    projectileColors = new Uint8Array(totalPoints * 4);
+    let pointIndex = 0;
+
     for (let i = 0; i < count; i++) {
       const p = projectiles[i];
-      const posBase = i * 3;
-      const colBase = i * 4;
+      const r = Math.round(p.color[0] * 255);
+      const g = Math.round(p.color[1] * 255);
+      const b = Math.round(p.color[2] * 255);
+      const trailCount = p.trail.length / 3;
+
+      // Write trail points first (oldest to newest, fading alpha)
+      for (let t = 0; t < trailCount; t++) {
+        const posBase = pointIndex * 3;
+        const colBase = pointIndex * 4;
+        const trailBase = t * 3;
+
+        projectilePositions[posBase] = p.trail[trailBase];
+        projectilePositions[posBase + 1] = p.trail[trailBase + 1];
+        projectilePositions[posBase + 2] = p.trail[trailBase + 2];
+
+        // Alpha fades from ~20 (oldest) to ~180 (newest)
+        const alpha = Math.round(20 + (t / Math.max(1, trailCount - 1)) * 160);
+        projectileColors[colBase] = r;
+        projectileColors[colBase + 1] = g;
+        projectileColors[colBase + 2] = b;
+        projectileColors[colBase + 3] = alpha;
+        pointIndex++;
+      }
+
+      // Write head point (full alpha, brightest)
+      const posBase = pointIndex * 3;
+      const colBase = pointIndex * 4;
       projectilePositions[posBase] = p.position[0];
       projectilePositions[posBase + 1] = p.position[1];
       projectilePositions[posBase + 2] = p.position[2];
-      // Convert float 0-1 to uint8 0-255
-      projectileColors[colBase] = Math.round(p.color[0] * 255);
-      projectileColors[colBase + 1] = Math.round(p.color[1] * 255);
-      projectileColors[colBase + 2] = Math.round(p.color[2] * 255);
-      projectileColors[colBase + 3] = 255; // full alpha
+      projectileColors[colBase] = r;
+      projectileColors[colBase + 1] = g;
+      projectileColors[colBase + 2] = b;
+      projectileColors[colBase + 3] = 255;
+      pointIndex++;
     }
 
+    projectilePointCount = totalPoints;
     gl.bindBuffer(gl.ARRAY_BUFFER, projectilePositionBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, projectilePositions, gl.DYNAMIC_DRAW);
     gl.bindBuffer(gl.ARRAY_BUFFER, projectileColorBuffer);
@@ -1481,8 +1482,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   }
 
   function drawProjectiles(viewportHeight) {
-    const count = projectiles.length;
-    if (count === 0) return;
+    if (projectilePointCount === 0) return;
 
     gl.useProgram(centroidProgram);
     gl.uniformMatrix4fv(centroidUniformLocations.mvpMatrix, false, mvpMatrix);
@@ -1502,7 +1502,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     gl.enableVertexAttribArray(centroidAttribLocations.color);
     gl.vertexAttribPointer(centroidAttribLocations.color, 4, gl.UNSIGNED_BYTE, true, 0, 0); // RGBA uint8 normalized
 
-    gl.drawArrays(gl.POINTS, 0, count);
+    gl.drawArrays(gl.POINTS, 0, projectilePointCount);
   }
 
   function drawImpactFlashes(viewportHeight) {
