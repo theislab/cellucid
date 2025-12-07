@@ -862,6 +862,7 @@ class DataState {
     this._pushOutlierThresholdToViewer(this.getCurrentOutlierThreshold());
     this.computeGlobalVisibility();
     this._syncActiveContext();
+    this._pushActiveViewLabelToViewer();
 
     const centroidInfo =
       field.kind === 'category' && field.centroids ? ` • Centroids: ${field.centroids.length}` : '';
@@ -893,6 +894,7 @@ class DataState {
     this._pushOutlierThresholdToViewer(1.0);
     this.computeGlobalVisibility();
     this._syncActiveContext();
+    this._pushActiveViewLabelToViewer();
 
     return {
       field,

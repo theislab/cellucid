@@ -130,7 +130,6 @@ export function createStateSerializer({ state, viewer, sidebar }) {
     'navigation-mode',      // Camera-related, handled separately
     'categorical-field',    // Dynamically populated, handled via activeFields
     'continuous-field',     // Dynamically populated, handled via activeFields
-    'active-view-select',   // Dynamically populated
     'outlier-filter',       // Per-field state, restored after active field is set
     'gene-expression-search', // Restored via activeFields
   ]);

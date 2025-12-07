@@ -500,10 +500,6 @@
         <summary>Compare Views</summary>
         <div class="accordion-content">
           <div class="control-block" id="split-view-controls">
-            <div class="section-divider">
-              <div class="section-title">Compare views</div>
-            </div>
-
             <div class="legend-help" style="margin-bottom: 6px;">
               Keep snapshots to compare UMAP tweaks. Switch to a single view to edit settings.
             </div>
@@ -523,6 +519,18 @@
               >
                 Clear
               </button>
+              <button
+                id="camera-lock-btn"
+                class="reset-btn camera-lock-btn"
+                title="Cameras linked (click to unlink)"
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path class="lock-linked" d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
+                  <path class="lock-linked" d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
+                  <path class="lock-unlinked" style="display:none" d="M18.84 12.25l1.72-1.71a5 5 0 0 0-7.07-7.07l-3 3a5 5 0 0 0 0 7.07"/>
+                  <path class="lock-unlinked" style="display:none" d="M5.16 11.75l-1.72 1.71a5 5 0 0 0 7.07 7.07l3-3a5 5 0 0 0 0-7.07"/>
+                </svg>
+              </button>
             </div>
 
             <div class="control-block" style="margin-top:10px;">
@@ -530,13 +538,6 @@
               <select id="view-layout-mode" class="obs-select">
                 <option value="grid">Grid compare</option>
                 <option value="single">Edit selected view</option>
-              </select>
-            </div>
-
-            <div class="control-block">
-              <label for="active-view-select">Active view:</label>
-              <select id="active-view-select" class="obs-select">
-                <option value="live">Live view</option>
               </select>
             </div>
 
@@ -564,17 +565,14 @@
               <label for="continuous-field">Continuous obs:</label>
               <select id="continuous-field" class="obs-select"></select>
             </div>
-          </div>
-
-          <!-- Gene Expression Dropdown with Search -->
-          <div class="control-block" id="gene-expression-container">
-            <div class="field-select">
+            <!-- Gene Expression Dropdown with Search -->
+            <div class="field-select" id="gene-expression-container">
               <label for="gene-expression-search">Gene Expression:</label>
               <div class="searchable-dropdown">
-                <input 
-                  type="text" 
-                  id="gene-expression-search" 
-                  class="search-input" 
+                <input
+                  type="text"
+                  id="gene-expression-search"
+                  class="search-input"
                   placeholder="Search genes..."
                   autocomplete="off"
                 />
@@ -584,31 +582,34 @@
             </div>
           </div>
 
-          <!-- Outlier Filter (only shown for categorical fields) -->
-          <div class="control-block" id="outlier-filter-container">
-            <label for="outlier-filter">Outlier filter (latent space):</label>
-            <div class="slider-row">
-              <input id="outlier-filter" type="range" min="0" max="100" step="1" value="100" />
-              <span id="outlier-filter-display" class="slider-value">100%</span>
+          <!-- Display Options (dashed box) -->
+          <div class="display-options-box" id="display-options-container">
+            <div class="section-title">Display Options</div>
+
+            <!-- Outlier Filter (only shown for categorical fields) -->
+            <div class="control-block" id="outlier-filter-container">
+              <label for="outlier-filter">Outlier filter (latent space):</label>
+              <div class="slider-row">
+                <input id="outlier-filter" type="range" min="0" max="100" step="1" value="100" />
+                <span id="outlier-filter-display" class="slider-value">100%</span>
+              </div>
             </div>
+
+            <!-- Centroid controls (categorical fields only) -->
+            <div class="control-block" id="centroid-controls">
+              <label class="checkbox-inline">
+                <input type="checkbox" id="toggle-centroid-points" />
+                Show centroids
+              </label>
+              <label class="checkbox-inline">
+                <input type="checkbox" id="toggle-centroid-labels" />
+                Labels
+              </label>
+            </div>
+
+            <!-- Legend / category controls -->
+            <div id="legend"></div>
           </div>
-
-          <!-- Centroid controls (categorical fields only) -->
-          <div class="control-block" id="centroid-controls">
-            <label class="checkbox-inline">
-              <input type="checkbox" id="toggle-centroid-points" />
-              Show centroids
-            </label>
-            <label class="checkbox-inline">
-              <input type="checkbox" id="toggle-centroid-labels" />
-              Labels
-            </label>
-          </div>
-
-          <!-- Legend / category controls -->
-          <div id="legend"></div>
-
-          <div class="section-divider" aria-hidden="true"></div>
           <div class="control-block" id="active-filters-container">
             <div class="section-title">Active filters</div>
             <div id="filter-count" class="filter-info">Showing all points</div>

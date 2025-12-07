@@ -202,11 +202,17 @@ html, body {
 .field-select {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 6px;
 }
 
 .field-select + .field-select {
   margin-top: 6px;
+}
+
+.field-select select,
+.field-select .searchable-dropdown,
+.field-select .obs-select {
+  margin-top: 0;
 }
 
 /* Selects – same paper box style everywhere */
@@ -1215,7 +1221,7 @@ html, body {
 
 .search-input {
   width: 100%;
-  padding: 6px 8px;
+  padding: 5px 8px;
   font-size: 11px;
   border: 1px solid #111827;
   border-radius: 0;
@@ -1434,6 +1440,48 @@ html, body {
   background: #f9fafb;
 }
 
+/* Display options box in Filtering accordion */
+.display-options-box {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 0;
+  border: 1px dashed #111827;
+  background: #f9fafb;
+}
+
+.display-options-box .section-title {
+  margin-bottom: 8px;
+}
+
+.display-options-box #legend {
+  margin-top: 8px;
+}
+
+.display-options-box .legend-group {
+  border: none;
+  box-shadow: none;
+  padding: 0;
+  background: transparent;
+}
+
+/* Compact buttons inside display options box */
+.display-options-box .legend-controls,
+.display-options-box .legend-actions {
+  gap: 4px;
+}
+
+.display-options-box .legend-controls button,
+.display-options-box .legend-actions button,
+.display-options-box .toggle-switch {
+  padding: 4px 8px;
+  font-size: 9px;
+  box-shadow: 1px 1px 0 rgba(0, 0, 0, 0.15);
+}
+
+.display-options-box .toggle-switch {
+  min-width: 50px;
+}
+
 /* Half-res checkbox inherits checkbox-inline for consistency */
 #smoke-half-res {
   margin-right: 4px;
@@ -1518,6 +1566,25 @@ html, body {
   margin: 6px 0;
 }
 
+.camera-lock-btn {
+  padding: 4px 6px;
+  min-width: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.camera-lock-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.camera-lock-btn.camera-unlocked {
+  background: #dbeafe;
+  border-color: #3b82f6;
+  color: #1d4ed8;
+}
+
 .split-view-badges {
   display: flex;
   flex-direction: column;
@@ -1561,11 +1628,6 @@ html, body {
   background: #f9fafb;
 }
 
-.split-badge-live .split-badge-pill {
-  background: #111827;
-  color: #ffffff;
-}
-
 .split-badge-remove {
   background: transparent;
   border-radius: 999px;
@@ -1597,6 +1659,15 @@ html, body {
 .split-badge.active .split-badge-remove {
   border-color: rgba(255, 255, 255, 0.6);
   color: #ffffff;
+}
+
+.split-badge.active-camera {
+  box-shadow: 0 0 0 2px #3b82f6;
+}
+
+.split-badge.active-camera .split-badge-pill::after {
+  content: " \2316";
+  font-size: 8px;
 }
 
 /* Keep the rest of your non-sidebar styles (gl canvas, etc.) exactly as-is.

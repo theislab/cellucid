@@ -79,8 +79,8 @@ export function initUI({ state, viewer, dom, smoke }) {
     splitViewControls,
     splitKeepViewBtn,
     splitClearBtn,
+    cameraLockBtn,
     viewLayoutModeSelect,
-    activeViewSelect,
     splitViewBadges,
     // Session save/load
     saveStateBtn,
@@ -133,10 +133,18 @@ export function initUI({ state, viewer, dom, smoke }) {
 
   function showRangeLabel(x, y, minVal, maxVal) {
     const formatVal = (v) => {
-      if (Math.abs(v) >= 1000 || (Math.abs(v) < 0.01 && v !== 0)) {
-        return v.toExponential(2);
+      if (v === 0) return '0';
+      const abs = Math.abs(v);
+      const sign = v < 0 ? '-' : '';
+      if (abs >= 10000 || (abs > 0 && abs < 0.01)) {
+        const exp = Math.floor(Math.log10(abs));
+        const mantissa = abs / Math.pow(10, exp);
+        const m = mantissa < 10 ? mantissa.toFixed(1).replace(/\.0$/, '') : Math.round(mantissa);
+        return `${sign}${m}e${exp}`;
       }
-      return v.toFixed(2);
+      if (abs >= 100) return sign + abs.toFixed(0);
+      if (abs >= 10) return sign + abs.toFixed(1);
+      return sign + abs.toFixed(2);
     };
     rangeLabel.textContent = `${formatVal(minVal)} → ${formatVal(maxVal)}`;
     rangeLabel.style.left = x + 'px';
@@ -182,6 +190,9 @@ export function initUI({ state, viewer, dom, smoke }) {
       continuousFieldSelect.value = NONE_FIELD_VALUE;
       const geneIdx = geneFieldList.findIndex(({ idx }) => idx === varIdx);
       selectedGeneIndex = geneIdx;
+      if (geneExpressionSearch && activeField) {
+        geneExpressionSearch.value = activeField.key || '';
+      }
       updateSelectedGeneDisplay();
     } else {
       categoricalFieldSelect.value = NONE_FIELD_VALUE;
@@ -1003,6 +1014,9 @@ export function initUI({ state, viewer, dom, smoke }) {
   async function selectGene(idx) {
     if (idx < 0 || idx >= geneFieldList.length) return;
     
+    const field = geneFieldList[idx].field;
+    const originalIdx = geneFieldList[idx].idx;
+
     hideGeneDropdown();
     selectedGeneIndex = idx;
     
@@ -1010,13 +1024,10 @@ export function initUI({ state, viewer, dom, smoke }) {
     continuousFieldSelect.value = NONE_FIELD_VALUE;
     
     if (geneExpressionSearch) {
-      geneExpressionSearch.value = '';
+      geneExpressionSearch.value = field.key || '';
     }
     
     updateSelectedGeneDisplay();
-    
-    const field = geneFieldList[idx].field;
-    const originalIdx = geneFieldList[idx].idx;
     
     try {
       forceDisableFieldSelects = true;
@@ -1092,12 +1103,24 @@ export function initUI({ state, viewer, dom, smoke }) {
     const model = state.getLegendModel(field);
     if (!model) return;
 
+    // Compact number formatter: keeps width ~5 chars, uses short sci notation
     function formatLegendNumber(value) {
       if (value === null || value === undefined || !Number.isFinite(value)) return '—';
+      if (value === 0) return '0';
       const abs = Math.abs(value);
-      if (abs >= 1000 || (abs > 0 && abs < 0.01)) return value.toExponential(2);
-      if (abs >= 10) return value.toFixed(1);
-      return value.toFixed(2);
+      const sign = value < 0 ? '-' : '';
+      // Use scientific notation for large/small numbers
+      if (abs >= 10000 || (abs > 0 && abs < 0.01)) {
+        const exp = Math.floor(Math.log10(abs));
+        const mantissa = abs / Math.pow(10, exp);
+        // Format mantissa compactly
+        const m = mantissa < 10 ? mantissa.toFixed(1).replace(/\.0$/, '') : Math.round(mantissa);
+        return `${sign}${m}e${exp}`;
+      }
+      // Regular numbers
+      if (abs >= 100) return sign + abs.toFixed(0);
+      if (abs >= 10) return sign + abs.toFixed(1);
+      return sign + abs.toFixed(2);
     }
 
     if (model.kind === 'continuous') {
@@ -1399,8 +1422,8 @@ export function initUI({ state, viewer, dom, smoke }) {
 
       function updateDisplayFromSliders() {
         const { newMin, newMax } = getSliderValues();
-        minValueEl.textContent = newMin.toFixed(2);
-        maxValueEl.textContent = newMax.toFixed(2);
+        minValueEl.textContent = formatLegendNumber(newMin);
+        maxValueEl.textContent = formatLegendNumber(newMax);
         if (rescaleToggle.getAttribute('aria-pressed') === 'true') {
           state.setContinuousColorRange(state.activeFieldIndex, newMin, newMax);
           refreshColorbarLabels();
@@ -1631,35 +1654,12 @@ export function initUI({ state, viewer, dom, smoke }) {
   }
 
   function syncActiveViewSelectOptions() {
-    if (!activeViewSelect) return;
-
+    // Validate activeViewId is still valid (live or an existing snapshot)
     const snapshots = typeof viewer.getSnapshotViews === 'function'
       ? viewer.getSnapshotViews()
       : [];
-
-    activeViewSelect.innerHTML = '';
-
-    const addOption = (value, label) => {
-      const opt = document.createElement('option');
-      opt.value = String(value);
-      opt.textContent = label;
-      activeViewSelect.appendChild(opt);
-    };
-
-    addOption(LIVE_VIEW_ID, 'Live view');
-
-    snapshots.forEach((snap, idx) => {
-      const label = snap.label || snap.fieldKey || `View ${idx + 2}`;
-      addOption(String(snap.id), `View ${idx + 2}: ${label}`);
-    });
-
-    const hasSelected = Array.from(activeViewSelect.options)
-      .some((opt) => opt.value === String(activeViewId));
-
-    if (hasSelected) {
-      activeViewSelect.value = String(activeViewId);
-    } else {
-      activeViewSelect.value = LIVE_VIEW_ID;
+    const validIds = new Set([LIVE_VIEW_ID, ...snapshots.map(s => String(s.id))]);
+    if (!validIds.has(String(activeViewId))) {
       activeViewId = LIVE_VIEW_ID;
     }
   }
@@ -1673,8 +1673,9 @@ export function initUI({ state, viewer, dom, smoke }) {
       ? viewer.getSnapshotViews()
       : [];
 
-    // If live view is hidden but no snapshots exist, show it again
-    if (liveViewHidden && snapshots.length === 0) {
+    // If live view is hidden and 0-1 snapshots remain, restore live view.
+    // This prevents getting stuck with a phantom snapshot that can't be closed.
+    if (liveViewHidden && snapshots.length <= 1) {
       liveViewHidden = false;
       if (typeof viewer.setLiveViewHidden === 'function') {
         viewer.setLiveViewHidden(false);
@@ -1683,20 +1684,26 @@ export function initUI({ state, viewer, dom, smoke }) {
 
     let badgeIndex = 1;
 
-    // Live badge (only if not hidden)
+    // View 1 badge (only if not hidden)
     if (!liveViewHidden) {
-      // Use view-specific field info, not current active field
-      const liveField = state.getFieldForView ? state.getFieldForView('live') : (state.getActiveField ? state.getActiveField() : null);
-      const liveLabel = liveField ? (liveField.key || 'Active field') : 'All cells';
+      // Use same label format as snapshots (from viewer)
+      const liveLabel = typeof viewer.getLiveViewLabel === 'function'
+        ? viewer.getLiveViewLabel()
+        : 'All cells';
 
       const liveBadge = document.createElement('div');
       liveBadge.className = 'split-badge';
       if (String(activeViewId) === LIVE_VIEW_ID) {
         liveBadge.classList.add('active');
       }
+      // Show active camera indicator when cameras are unlocked
+      const camerasLocked = typeof viewer.getCamerasLocked === 'function' ? viewer.getCamerasLocked() : true;
+      const focusedId = typeof viewer.getFocusedViewId === 'function' ? viewer.getFocusedViewId() : LIVE_VIEW_ID;
+      if (!camerasLocked && focusedId === LIVE_VIEW_ID) {
+        liveBadge.classList.add('active-camera');
+      }
       liveBadge.addEventListener('click', () => {
         activeViewId = LIVE_VIEW_ID;
-        if (activeViewSelect) activeViewSelect.value = LIVE_VIEW_ID;
         syncActiveViewToState();
         pushViewLayoutToViewer();
         renderSplitViewBadges();
@@ -1715,20 +1722,48 @@ export function initUI({ state, viewer, dom, smoke }) {
         const liveRemoveBtn = document.createElement('button');
         liveRemoveBtn.type = 'button';
         liveRemoveBtn.className = 'split-badge-remove';
-        liveRemoveBtn.title = 'Hide live view from grid';
+        liveRemoveBtn.title = 'Remove this view';
         liveRemoveBtn.textContent = '×';
-        liveRemoveBtn.addEventListener('click', (e) => {
+        liveRemoveBtn.addEventListener('mousedown', (e) => {
+          e.preventDefault();
           e.stopPropagation();
-          liveViewHidden = true;
-          if (typeof viewer.setLiveViewHidden === 'function') {
-            viewer.setLiveViewHidden(true);
-          }
-          // Switch to first snapshot if we were viewing live
-          if (String(activeViewId) === LIVE_VIEW_ID && snapshots.length > 0) {
-            activeViewId = String(snapshots[0].id);
-            if (activeViewSelect) activeViewSelect.value = activeViewId;
+        });
+        liveRemoveBtn.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          // Get fresh snapshots to avoid stale closure
+          const currentSnapshots = typeof viewer.getSnapshotViews === 'function'
+            ? viewer.getSnapshotViews()
+            : [];
+          if (currentSnapshots.length === 0) return; // Safety check
+
+          if (currentSnapshots.length === 1) {
+            // Only 2 views (live + 1 snapshot): remove the snapshot instead of hiding live
+            // This ensures clicking X on either view yields the same result
+            const snapToRemove = currentSnapshots[0];
+            if (typeof viewer.removeSnapshotView === 'function') {
+              viewer.removeSnapshotView(snapToRemove.id);
+            }
+            if (typeof state.removeView === 'function') {
+              state.removeView(snapToRemove.id);
+            }
+            if (typeof state.syncSnapshotContexts === 'function') {
+              state.syncSnapshotContexts([]);
+            }
+            activeViewId = LIVE_VIEW_ID;
             syncActiveViewToState();
             pushViewLayoutToViewer();
+          } else {
+            // Multiple snapshots: hide live view and switch to first snapshot
+            liveViewHidden = true;
+            if (typeof viewer.setLiveViewHidden === 'function') {
+              viewer.setLiveViewHidden(true);
+            }
+            if (String(activeViewId) === LIVE_VIEW_ID) {
+              activeViewId = String(currentSnapshots[0].id);
+              syncActiveViewToState();
+              pushViewLayoutToViewer();
+            }
           }
           renderSplitViewBadges();
           updateSplitViewUI();
@@ -1762,9 +1797,14 @@ export function initUI({ state, viewer, dom, smoke }) {
       if (snapId === String(activeViewId)) {
         badge.classList.add('active');
       }
+      // Show active camera indicator when cameras are unlocked
+      const camerasLockedSnap = typeof viewer.getCamerasLocked === 'function' ? viewer.getCamerasLocked() : true;
+      const focusedIdSnap = typeof viewer.getFocusedViewId === 'function' ? viewer.getFocusedViewId() : LIVE_VIEW_ID;
+      if (!camerasLockedSnap && focusedIdSnap === snapId) {
+        badge.classList.add('active-camera');
+      }
       badge.addEventListener('click', () => {
         activeViewId = snapId;
-        if (activeViewSelect) activeViewSelect.value = snapId;
         syncActiveViewToState();
         pushViewLayoutToViewer();
         renderSplitViewBadges();
@@ -1779,49 +1819,64 @@ export function initUI({ state, viewer, dom, smoke }) {
       const mainLabel = snap.label || snap.fieldKey || `View ${badgeIndex}`;
       text.textContent = mainLabel;
 
-      const removeBtn = document.createElement('button');
-      removeBtn.type = 'button';
-      removeBtn.className = 'split-badge-remove';
-      removeBtn.title = 'Remove this kept view';
-      removeBtn.textContent = '×';
-      removeBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        if (typeof viewer.removeSnapshotView === 'function') {
-          viewer.removeSnapshotView(snap.id);
-        }
-        if (typeof state.removeView === 'function') {
-          state.removeView(snap.id);
-        }
-        if (typeof state.syncSnapshotContexts === 'function' && typeof viewer.getSnapshotViews === 'function') {
-          const ids = viewer.getSnapshotViews().map((v) => v.id);
-          state.syncSnapshotContexts(ids);
-        }
-        // If this was the active view, switch to live or another snapshot
-        if (snapId === String(activeViewId)) {
-          const remainingSnaps = viewer.getSnapshotViews();
-          if (!liveViewHidden) {
-            activeViewId = LIVE_VIEW_ID;
-          } else if (remainingSnaps.length > 0) {
-            activeViewId = String(remainingSnaps[0].id);
-          } else {
-            // No more snapshots and live is hidden - show live again
-            liveViewHidden = false;
-            if (typeof viewer.setLiveViewHidden === 'function') {
-              viewer.setLiveViewHidden(false);
-            }
-            activeViewId = LIVE_VIEW_ID;
-          }
-          if (activeViewSelect) activeViewSelect.value = activeViewId;
-          syncActiveViewToState();
-          pushViewLayoutToViewer();
-        }
-        renderSplitViewBadges();
-        updateSplitViewUI();
-      });
-
       badge.appendChild(pill);
       badge.appendChild(text);
-      badge.appendChild(removeBtn);
+
+      // Only show close button if there's another view to fall back to
+      // (either live view is available, or there are multiple snapshots)
+      if (!liveViewHidden || snapshots.length > 1) {
+        const removeBtn = document.createElement('button');
+        removeBtn.type = 'button';
+        removeBtn.className = 'split-badge-remove';
+        removeBtn.title = 'Remove this view';
+        removeBtn.textContent = '×';
+        removeBtn.addEventListener('mousedown', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+        });
+        removeBtn.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          if (typeof viewer.removeSnapshotView === 'function') {
+            viewer.removeSnapshotView(snap.id);
+          }
+          if (typeof state.removeView === 'function') {
+            state.removeView(snap.id);
+          }
+          if (typeof state.syncSnapshotContexts === 'function' && typeof viewer.getSnapshotViews === 'function') {
+            const ids = viewer.getSnapshotViews().map((v) => v.id);
+            state.syncSnapshotContexts(ids);
+          }
+          // Sync liveViewHidden with viewer (viewer auto-restores when last snapshot removed)
+          if (typeof viewer.getLiveViewHidden === 'function') {
+            liveViewHidden = viewer.getLiveViewHidden();
+          }
+          const remainingSnaps = viewer.getSnapshotViews();
+          // If this was the active view OR active view no longer exists, switch views
+          const activeExists = snapId !== String(activeViewId) &&
+            (activeViewId === LIVE_VIEW_ID || remainingSnaps.some(s => String(s.id) === String(activeViewId)));
+          if (snapId === String(activeViewId) || !activeExists) {
+            if (!liveViewHidden) {
+              activeViewId = LIVE_VIEW_ID;
+            } else if (remainingSnaps.length > 0) {
+              activeViewId = String(remainingSnaps[0].id);
+            } else {
+              // No more snapshots and live is hidden - show live again
+              liveViewHidden = false;
+              if (typeof viewer.setLiveViewHidden === 'function') {
+                viewer.setLiveViewHidden(false);
+              }
+              activeViewId = LIVE_VIEW_ID;
+            }
+            syncActiveViewToState();
+            pushViewLayoutToViewer();
+          }
+          renderSplitViewBadges();
+          updateSplitViewUI();
+        });
+        badge.appendChild(removeBtn);
+      }
+
       splitViewBadges.appendChild(badge);
       badgeIndex++;
     });
@@ -1833,7 +1888,6 @@ export function initUI({ state, viewer, dom, smoke }) {
     if (!viewId) return;
     activeViewId = String(viewId);
     syncActiveViewSelectOptions();
-    if (activeViewSelect) activeViewSelect.value = activeViewId;
     renderSplitViewBadges();
     updateSplitViewUI();
   }
@@ -1862,23 +1916,11 @@ export function initUI({ state, viewer, dom, smoke }) {
       splitClearBtn.disabled = !hasSnaps;
     }
 
-    if (activeViewSelect) {
-      const selectedExists =
-        activeViewId === LIVE_VIEW_ID ||
-        snapshots.some((snap) => String(snap.id) === String(activeViewId));
-      if (!selectedExists) {
-        activeViewId = LIVE_VIEW_ID;
-        activeViewSelect.value = LIVE_VIEW_ID;
-      }
-      activeViewSelect.disabled = !modeIsPoints;
-    }
-
     if (viewLayoutModeSelect) {
       if (!modeIsPoints) {
         viewLayoutMode = 'single';
         viewLayoutModeSelect.value = 'single';
         activeViewId = LIVE_VIEW_ID;
-        if (activeViewSelect) activeViewSelect.value = LIVE_VIEW_ID;
       } else {
         viewLayoutMode = viewLayoutModeSelect.value === 'single' ? 'single' : 'grid';
       }
@@ -1926,7 +1968,6 @@ export function initUI({ state, viewer, dom, smoke }) {
       }
       if (created.id) {
         activeViewId = String(created.id);
-        if (activeViewSelect) activeViewSelect.value = String(created.id);
       }
 
       // Switch to grid mode to show the comparison
@@ -1945,7 +1986,7 @@ export function initUI({ state, viewer, dom, smoke }) {
   function handleClearViews() {
     if (!viewer.clearSnapshotViews) return;
     activeViewId = LIVE_VIEW_ID;
-    if (activeViewSelect) activeViewSelect.value = LIVE_VIEW_ID;
+    liveViewHidden = false; // Restore live view visibility
     viewLayoutMode = 'grid';
     if (viewLayoutModeSelect) viewLayoutModeSelect.value = 'grid';
     viewer.clearSnapshotViews();
@@ -2008,6 +2049,9 @@ export function initUI({ state, viewer, dom, smoke }) {
       renderFilterSummary();
       updateStats(info);
       markSmokeDirty();
+      // Update view labels to reflect field change
+      syncActiveViewSelectOptions();
+      renderSplitViewBadges();
     } catch (err) {
       console.error(err);
       statsEl.textContent = 'Error: ' + err.message;
@@ -2524,6 +2568,9 @@ export function initUI({ state, viewer, dom, smoke }) {
   // Gene expression search and dropdown event listeners
   if (geneExpressionSearch) {
     geneExpressionSearch.addEventListener('focus', () => {
+      if (selectedGeneIndex >= 0) {
+        geneExpressionSearch.value = '';
+      }
       showGeneDropdown();
     });
 
@@ -2543,6 +2590,15 @@ export function initUI({ state, viewer, dom, smoke }) {
         if (firstItem) {
           const idx = parseInt(firstItem.dataset.index, 10);
           selectGene(idx);
+        }
+      }
+    });
+
+    geneExpressionSearch.addEventListener('blur', () => {
+      if (selectedGeneIndex >= 0 && !geneExpressionSearch.value) {
+        const field = geneFieldList[selectedGeneIndex]?.field;
+        if (field) {
+          geneExpressionSearch.value = field.key || '';
         }
       }
     });
@@ -2800,20 +2856,30 @@ export function initUI({ state, viewer, dom, smoke }) {
   if (splitClearBtn) {
     splitClearBtn.addEventListener('click', handleClearViews);
   }
+  if (cameraLockBtn) {
+    function updateCameraLockUI() {
+      const locked = viewer.getCamerasLocked();
+      const linkedPaths = cameraLockBtn.querySelectorAll('.lock-linked');
+      const unlinkedPaths = cameraLockBtn.querySelectorAll('.lock-unlinked');
+      linkedPaths.forEach(p => p.style.display = locked ? '' : 'none');
+      unlinkedPaths.forEach(p => p.style.display = locked ? 'none' : '');
+      cameraLockBtn.title = locked ? 'Cameras linked (click to unlink)' : 'Cameras independent (click to link)';
+      cameraLockBtn.classList.toggle('camera-unlocked', !locked);
+    }
+    cameraLockBtn.addEventListener('click', () => {
+      const newLocked = !viewer.getCamerasLocked();
+      viewer.setCamerasLocked(newLocked);
+      updateCameraLockUI();
+      renderSplitViewBadges(); // Refresh badges to show active view indicator
+    });
+    updateCameraLockUI();
+  }
   if (viewLayoutModeSelect) {
     viewLayoutModeSelect.addEventListener('change', () => {
       viewLayoutMode = viewLayoutModeSelect.value === 'single' ? 'single' : 'grid';
       pushViewLayoutToViewer();
       renderSplitViewBadges();
       updateSplitViewUI();
-    });
-  }
-  if (activeViewSelect) {
-    activeViewSelect.addEventListener('change', () => {
-      activeViewId = activeViewSelect.value || LIVE_VIEW_ID;
-      syncActiveViewToState();
-      pushViewLayoutToViewer();
-      renderSplitViewBadges();
     });
   }
   renderSplitViewBadges();

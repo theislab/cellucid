@@ -109,8 +109,8 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
   const splitViewControls = document.getElementById('split-view-controls');
   const splitKeepViewBtn = document.getElementById('split-keep-view-btn');
   const splitClearBtn = document.getElementById('split-clear-btn');
+  const cameraLockBtn = document.getElementById('camera-lock-btn');
   const viewLayoutModeSelect = document.getElementById('view-layout-mode');
-  const activeViewSelect = document.getElementById('active-view-select');
   const splitViewBadges = document.getElementById('split-view-badges');
 
   // Connectivity controls
@@ -296,8 +296,8 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
         splitViewControls,
         splitKeepViewBtn,
         splitClearBtn,
+        cameraLockBtn,
         viewLayoutModeSelect,
-        activeViewSelect,
         splitViewBadges,
         saveStateBtn,
         loadStateBtn,

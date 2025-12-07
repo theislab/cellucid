@@ -303,6 +303,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   let useInstancedEdges = false;  // Whether to use v2 instanced rendering
   let edgeLodLimit = 0;  // LOD limit for number of edges to render (0 = all)
 
+  // Centroid snapshot buffers - pre-uploaded GPU buffers for each snapshot view
+  // Eliminates per-frame CPU→GPU uploads in multiview mode
+  const centroidSnapshotBuffers = new Map(); // viewId -> { vao, buffer, count }
+
   // Fullscreen triangle for smoke
   const smokeQuadBuffer = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, smokeQuadBuffer);
@@ -379,9 +383,17 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   let nextSnapshotId = 1;
   let viewLayoutMode = 'grid';
   let focusedViewId = LIVE_VIEW_ID;
-  let liveViewLabel = 'Live view';
+  let liveViewLabel = 'View 1';
   let liveViewHidden = false; // Whether to hide live view from grid
   let viewFocusHandler = typeof onViewFocus === 'function' ? onViewFocus : null;
+
+  // Camera lock state for independent view navigation
+  let camerasLocked = true;           // Default: all views share camera
+  let liveCameraState = null;         // Camera state for live view when unlocked
+
+  // Cached view matrices for unlocked camera mode (avoids per-frame recalculation)
+  const cachedViewMatrices = new Map();  // viewId -> { viewMatrix: Float32Array, radius: number, dirty: boolean }
+  let cachedGridProjection = null;       // { aspect: number, matrix: Float32Array } - shared by all grid cells
 
   const viewTitleLayerEl = viewTitleLayer || null;
   const sidebarEl = sidebar || null;
@@ -619,6 +631,25 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       return;
     }
 
+    // Switch active view on click when cameras are unlocked in grid mode
+    if (!camerasLocked && viewLayoutMode === 'grid') {
+      const clickedViewId = getViewIdAtScreenPosition(e.clientX, e.clientY);
+      if (clickedViewId && clickedViewId !== focusedViewId) {
+        // Save current camera to previous view
+        setViewCameraState(focusedViewId, getCurrentCameraStateInternal());
+        // Stop any ongoing inertia (so it doesn't carry to new view)
+        velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
+        vec3.set(freeflyVelocity, 0, 0, 0);
+        // Switch focus
+        focusedViewId = clickedViewId;
+        // Load new view's camera
+        const newCam = getViewCameraState(focusedViewId);
+        if (newCam) applyCameraStateTemporarily(newCam);
+        // Notify UI
+        if (viewFocusHandler) viewFocusHandler(focusedViewId);
+      }
+    }
+
     if (navigationMode === 'free') {
       const wantsShot = e.button === 0;
       // Only request pointer lock if user has enabled it via checkbox
@@ -723,6 +754,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     isDragging = false;
     canvas.classList.remove('dragging');
     updateCursorForHighlightMode();
+
+    // Save camera state to active view when unlocked
+    if (!camerasLocked) {
+      setViewCameraState(focusedViewId, getCurrentCameraStateInternal());
+    }
   });
 
   window.addEventListener('mousemove', (e) => {
@@ -810,6 +846,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     const sensitivity = 0.001 * targetRadius;
     targetRadius += delta * sensitivity;
     targetRadius = Math.max(minOrbitRadius, Math.min(100.0, targetRadius));
+
+    // Save camera state to active view when unlocked
+    if (!camerasLocked) {
+      setViewCameraState(focusedViewId, getCurrentCameraStateInternal());
+    }
   }, { passive: false });
 
   // Alt key handling for highlight mode cursor
@@ -1793,6 +1834,88 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     gl.drawArrays(gl.POINTS, 0, numPoints);
   }
 
+  // === CENTROID SNAPSHOT BUFFER MANAGEMENT ===
+  // Pre-upload centroid data to GPU once per snapshot (eliminates per-frame uploads)
+
+  function createCentroidSnapshotBuffer(viewId, positions, colors) {
+    if (!positions || !colors) return false;
+    const count = positions.length / 3;
+    if (count === 0) return false;
+
+    // Delete existing if updating
+    deleteCentroidSnapshotBuffer(viewId);
+
+    // Build interleaved buffer: 16 bytes per point (12 pos + 4 color)
+    const STRIDE = 16;
+    const buffer = new ArrayBuffer(count * STRIDE);
+    const posView = new Float32Array(buffer);
+    const colorView = new Uint8Array(buffer);
+
+    for (let i = 0; i < count; i++) {
+      const floatOffset = i * 4;
+      const byteOffset = i * STRIDE + 12;
+
+      posView[floatOffset] = positions[i * 3];
+      posView[floatOffset + 1] = positions[i * 3 + 1];
+      posView[floatOffset + 2] = positions[i * 3 + 2];
+
+      colorView[byteOffset] = colors[i * 4];
+      colorView[byteOffset + 1] = colors[i * 4 + 1];
+      colorView[byteOffset + 2] = colors[i * 4 + 2];
+      colorView[byteOffset + 3] = colors[i * 4 + 3];
+    }
+
+    // Create GPU buffer (STATIC_DRAW - uploaded once)
+    const glBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, glBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, buffer, gl.STATIC_DRAW);
+
+    // Create VAO for fast rendering
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, glBuffer);
+    gl.enableVertexAttribArray(centroidAttribLocations.position);
+    gl.vertexAttribPointer(centroidAttribLocations.position, 3, gl.FLOAT, false, STRIDE, 0);
+    gl.enableVertexAttribArray(centroidAttribLocations.color);
+    gl.vertexAttribPointer(centroidAttribLocations.color, 4, gl.UNSIGNED_BYTE, true, STRIDE, 12);
+    gl.bindVertexArray(null);
+
+    centroidSnapshotBuffers.set(viewId, { vao, buffer: glBuffer, count });
+    return true;
+  }
+
+  function deleteCentroidSnapshotBuffer(viewId) {
+    const existing = centroidSnapshotBuffers.get(viewId);
+    if (existing) {
+      gl.deleteVertexArray(existing.vao);
+      gl.deleteBuffer(existing.buffer);
+      centroidSnapshotBuffers.delete(viewId);
+    }
+  }
+
+  function hasCentroidSnapshotBuffer(viewId) {
+    return centroidSnapshotBuffers.has(viewId);
+  }
+
+  function drawCentroidsWithSnapshot(viewId, viewportHeight) {
+    const snapshot = centroidSnapshotBuffers.get(viewId);
+    if (!snapshot || snapshot.count === 0) return;
+
+    gl.useProgram(centroidProgram);
+    gl.uniformMatrix4fv(centroidUniformLocations.mvpMatrix, false, mvpMatrix);
+    gl.uniformMatrix4fv(centroidUniformLocations.viewMatrix, false, viewMatrix);
+    gl.uniformMatrix4fv(centroidUniformLocations.modelMatrix, false, modelMatrix);
+    gl.uniform1f(centroidUniformLocations.pointSize, basePointSize * 4.0);
+    gl.uniform1f(centroidUniformLocations.sizeAttenuation, sizeAttenuation);
+    gl.uniform1f(centroidUniformLocations.viewportHeight, viewportHeight);
+    gl.uniform1f(centroidUniformLocations.fov, fov);
+
+    // Single VAO bind - no per-frame buffer uploads!
+    gl.bindVertexArray(snapshot.vao);
+    gl.drawArrays(gl.POINTS, 0, snapshot.count);
+    gl.bindVertexArray(null);
+  }
+
   function drawProjectiles(viewportHeight) {
     if (projectilePointCount === 0) return;
 
@@ -2190,6 +2313,89 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     if (labelLayer) labelLayer.style.display = anyVisible ? 'block' : 'none';
   }
 
+  /**
+   * Update view title chips (positioned at top-center of each viewport in grid mode)
+   * @param {Array} views - Array of view objects with id and label
+   * @param {number} cols - Number of columns in grid
+   * @param {number} rows - Number of rows in grid
+   */
+  function updateViewTitles(views, cols, rows) {
+    if (!viewTitleLayerEl) return;
+
+    // Generate a key to detect if we need to rebuild chips
+    const titleKey = views.map(v => `${v.id}:${v.label}`).join('|') + `|${cols}x${rows}`;
+    if (titleKey === lastTitleKey && viewTitleEntries.length === views.length) {
+      // Just update positions (in case canvas resized)
+      repositionViewTitles(views, cols, rows);
+      return;
+    }
+    lastTitleKey = titleKey;
+
+    // Clear existing chips
+    viewTitleEntries.forEach(entry => entry.el?.remove());
+    viewTitleEntries = [];
+
+    // Create chips for each view
+    const width = canvas.clientWidth;
+    const height = canvas.clientHeight;
+
+    views.forEach((view, i) => {
+      const chip = document.createElement('div');
+      chip.className = 'view-title-chip';
+      chip.textContent = view.label || view.id;
+      chip.dataset.viewId = view.id;
+
+      // Click handler to focus this view
+      chip.addEventListener('click', () => {
+        focusedViewId = view.id;
+        if (viewFocusHandler) viewFocusHandler(view.id);
+      });
+
+      // Calculate position: center-top of each viewport cell
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      const cellW = width / cols;
+      const cellH = height / rows;
+      const x = col * cellW + cellW / 2;
+      const y = row * cellH + 20; // 20px from top of cell
+
+      chip.style.left = `${x}px`;
+      chip.style.top = `${y}px`;
+
+      viewTitleLayerEl.appendChild(chip);
+      viewTitleEntries.push({ el: chip, viewId: view.id });
+    });
+  }
+
+  function repositionViewTitles(views, cols, rows) {
+    const width = canvas.clientWidth;
+    const height = canvas.clientHeight;
+
+    viewTitleEntries.forEach((entry, i) => {
+      if (!entry.el || i >= views.length) return;
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      const cellW = width / cols;
+      const cellH = height / rows;
+      const x = col * cellW + cellW / 2;
+      const y = row * cellH + 20;
+      entry.el.style.left = `${x}px`;
+      entry.el.style.top = `${y}px`;
+    });
+  }
+
+  function hideViewTitles() {
+    viewTitleEntries.forEach(entry => {
+      if (entry.el) entry.el.style.display = 'none';
+    });
+  }
+
+  function showViewTitles() {
+    viewTitleEntries.forEach(entry => {
+      if (entry.el) entry.el.style.display = '';
+    });
+  }
+
   function updateCentroidLabelPositions(labels, viewportNorm) {
     // Use CSS pixels (clientWidth/Height) not device pixels (width/height)
     const width = canvas.clientWidth;
@@ -2287,7 +2493,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         centroidPositions: null, // Use current buffers
         centroidColors: null,
         centroidTransparencies: null,
-        centroidCount: centroidCount
+        centroidCount: centroidCount,
+        cameraState: liveCameraState  // Include camera state directly
       });
     }
 
@@ -2300,7 +2507,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         centroidPositions: snap.centroidPositions,
         centroidColors: snap.centroidColors,
         centroidTransparencies: snap.centroidTransparencies,
-        centroidCount: snap.centroidPositions ? snap.centroidPositions.length / 3 : 0
+        centroidCount: snap.centroidPositions ? snap.centroidPositions.length / 3 : 0,
+        cameraState: snap.cameraState  // Include camera state directly
       });
     }
 
@@ -2323,6 +2531,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       } else {
         renderSingleView(width, height, { x: 0, y: 0, w: 1, h: 1 });
       }
+      hideViewTitles(); // No titles in single/fullscreen mode
       return;
     }
 
@@ -2335,18 +2544,54 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     const cols = viewCount <= 3 ? viewCount : Math.ceil(Math.sqrt(viewCount));
     const rows = Math.ceil(viewCount / cols);
 
+    // Update view title chips
+    updateViewTitles(allViews, cols, rows);
+    showViewTitles();
+
+    // Pre-compute viewport dimensions (same for all cells in uniform grid)
+    const vw = Math.floor(width / cols);
+    const vh = Math.floor(height / rows);
+    const vpAspect = vw / vh;
+
+    // OPTIMIZATION: Cache projection matrix for grid cells (all have same aspect ratio)
+    if (!cachedGridProjection || cachedGridProjection.aspect !== vpAspect) {
+      cachedGridProjection = {
+        aspect: vpAspect,
+        matrix: mat4.create()
+      };
+      mat4.perspective(cachedGridProjection.matrix, fov, vpAspect, near, far);
+    }
+
+    // Store active view's matrices (computed once in updateCamera before this loop)
+    const activeViewMatrix = mat4.clone(viewMatrix);
+    const activeRadius = radius;
+
     for (let i = 0; i < viewCount; i++) {
       const view = allViews[i];
       const col = i % cols;
       const row = Math.floor(i / cols);
-      const vw = Math.floor(width / cols);
-      const vh = Math.floor(height / rows);
       const vx = col * vw;
       const vy = (rows - 1 - row) * vh; // Flip Y for GL
 
-      // Update projection matrix with correct aspect ratio for this viewport
-      const vpAspect = vw / vh;
-      mat4.perspective(projectionMatrix, fov, vpAspect, near, far);
+      const isActiveView = view.id === focusedViewId;
+
+      // OPTIMIZATION: Use cached view matrices instead of per-frame recalculation
+      // No global state modification, no applyCameraStateTemporarily, no updateCamera
+      if (!camerasLocked && !isActiveView) {
+        const cached = cachedViewMatrices.get(view.id);
+        if (cached) {
+          // Use pre-computed cached viewMatrix directly
+          mat4.copy(viewMatrix, cached.viewMatrix);
+          radius = cached.radius;
+        }
+      } else if (!isActiveView) {
+        // Locked mode: restore active view's matrix for non-active views
+        mat4.copy(viewMatrix, activeViewMatrix);
+        radius = activeRadius;
+      }
+
+      // OPTIMIZATION: Use cached projection matrix (same for all grid cells)
+      mat4.copy(projectionMatrix, cachedGridProjection.matrix);
       mat4.multiply(mvpMatrix, projectionMatrix, viewMatrix);
       mat4.multiply(mvpMatrix, mvpMatrix, modelMatrix);
 
@@ -2366,13 +2611,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         hasSnapshotBuffer = true;
       }
 
-      // Load centroid data for this view (if snapshot has its own)
-      // centroidColors is now RGBA uint8 (alpha packed in)
-      if (view.centroidPositions && view.centroidColors) {
-        gl.bindBuffer(gl.ARRAY_BUFFER, centroidPositionBuffer);
-        gl.bufferData(gl.ARRAY_BUFFER, view.centroidPositions, gl.DYNAMIC_DRAW);
-        gl.bindBuffer(gl.ARRAY_BUFFER, centroidColorBuffer);
-        gl.bufferData(gl.ARRAY_BUFFER, view.centroidColors, gl.DYNAMIC_DRAW);
+      // Lazily create centroid snapshot buffer if not exists (uploaded once, not per-frame)
+      if (view.centroidPositions && view.centroidColors && !hasCentroidSnapshotBuffer(view.id)) {
+        createCentroidSnapshotBuffer(view.id, view.centroidPositions, view.centroidColors);
       }
 
       // Render this viewport - use snapshot buffer if available (no data upload!)
@@ -2382,8 +2623,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       gl.disable(gl.SCISSOR_TEST);
     }
 
-    // Restore projection matrix for full canvas aspect (no need to restore buffer data -
-    // live view uses main buffer which wasn't modified if snapshots used their own buffers)
+    // Restore active view's state after grid render
+    mat4.copy(viewMatrix, activeViewMatrix);
+    radius = activeRadius;
+
+    // Restore projection matrix for full canvas aspect
     mat4.perspective(projectionMatrix, fov, width / height, near, far);
     mat4.multiply(mvpMatrix, projectionMatrix, viewMatrix);
     mat4.multiply(mvpMatrix, mvpMatrix, modelMatrix);
@@ -2435,7 +2679,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     // Draw centroids
     const flags = getViewFlags(vid);
     if (flags.points && numCentroids > 0) {
-      drawCentroids(numCentroids, height);
+      // Use snapshot buffer if available (no per-frame upload), otherwise use live buffer
+      if (hasCentroidSnapshotBuffer(vid)) {
+        drawCentroidsWithSnapshot(vid, height);
+      } else {
+        drawCentroids(numCentroids, height);
+      }
     }
     drawProjectiles(height);
     drawImpactFlashes(height);
@@ -2639,6 +2888,148 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         bgColor = [1, 1, 1];
         fogColor = [1, 1, 1];
     }
+  }
+
+  // === Per-view camera helpers ===
+  function getViewCameraState(viewId) {
+    if (viewId === LIVE_VIEW_ID) {
+      return liveCameraState || getCurrentCameraStateInternal();
+    }
+    const snap = snapshotViews.find(s => s.id === viewId);
+    return snap?.cameraState || getCurrentCameraStateInternal();
+  }
+
+  function setViewCameraState(viewId, camState) {
+    if (viewId === LIVE_VIEW_ID) {
+      liveCameraState = camState;
+    } else {
+      const snap = snapshotViews.find(s => s.id === viewId);
+      if (snap) snap.cameraState = camState;
+    }
+    // Update cached view matrix for this view (avoids per-frame recalculation)
+    if (!camerasLocked) {
+      updateCachedViewMatrix(viewId, camState);
+    }
+  }
+
+  function getCurrentCameraStateInternal() {
+    return {
+      navigationMode,
+      orbit: {
+        radius,
+        targetRadius,
+        theta,
+        phi,
+        target: [target[0], target[1], target[2]]
+      },
+      freefly: {
+        position: [freeflyPosition[0], freeflyPosition[1], freeflyPosition[2]],
+        yaw: freeflyYaw,
+        pitch: freeflyPitch
+      }
+    };
+  }
+
+  function applyCameraStateTemporarily(camState) {
+    if (!camState) return;
+    if (camState.orbit) {
+      radius = camState.orbit.radius ?? radius;
+      targetRadius = camState.orbit.targetRadius ?? targetRadius;
+      theta = camState.orbit.theta ?? theta;
+      phi = camState.orbit.phi ?? phi;
+      if (camState.orbit.target) {
+        vec3.set(target, camState.orbit.target[0], camState.orbit.target[1], camState.orbit.target[2]);
+      }
+    }
+    if (camState.freefly) {
+      if (camState.freefly.position) {
+        vec3.set(freeflyPosition, camState.freefly.position[0], camState.freefly.position[1], camState.freefly.position[2]);
+      }
+      freeflyYaw = camState.freefly.yaw ?? freeflyYaw;
+      freeflyPitch = camState.freefly.pitch ?? freeflyPitch;
+    }
+  }
+
+  // Compute viewMatrix from cameraState WITHOUT modifying global state (for cached rendering)
+  function computeViewMatrixFromState(camState, outViewMatrix) {
+    if (!camState) return null;
+    const navMode = camState.navigationMode || 'orbit';
+    if (navMode === 'free' && camState.freefly) {
+      const pos = camState.freefly.position || [0, 0, 5];
+      const yaw = camState.freefly.yaw || 0;
+      const pitch = camState.freefly.pitch || 0;
+      // Compute forward vector from yaw/pitch
+      const cosPitch = Math.cos(pitch);
+      const forward = [
+        Math.sin(yaw) * cosPitch,
+        Math.sin(pitch),
+        -Math.cos(yaw) * cosPitch
+      ];
+      const lookTarget = [pos[0] + forward[0], pos[1] + forward[1], pos[2] + forward[2]];
+      // Up vector for freefly
+      const upVec = [
+        -Math.sin(yaw) * Math.sin(pitch),
+        Math.cos(pitch),
+        Math.cos(yaw) * Math.sin(pitch)
+      ];
+      mat4.lookAt(outViewMatrix, pos, lookTarget, upVec);
+    } else if (camState.orbit) {
+      const r = camState.orbit.radius ?? 5;
+      const t = camState.orbit.theta ?? 0;
+      const p = camState.orbit.phi ?? Math.PI / 2;
+      const tgt = camState.orbit.target || [0, 0, 0];
+      const eyePos = [
+        tgt[0] + r * Math.sin(p) * Math.cos(t),
+        tgt[1] + r * Math.cos(p),
+        tgt[2] + r * Math.sin(p) * Math.sin(t)
+      ];
+      mat4.lookAt(outViewMatrix, eyePos, tgt, up);
+    }
+    return outViewMatrix;
+  }
+
+  // Update cached view matrix for a specific view (call when camera changes)
+  function updateCachedViewMatrix(viewId, camState) {
+    if (!camState) {
+      cachedViewMatrices.delete(viewId);
+      return;
+    }
+    let cached = cachedViewMatrices.get(viewId);
+    if (!cached) {
+      cached = { viewMatrix: mat4.create(), radius: 0 };
+      cachedViewMatrices.set(viewId, cached);
+    }
+    computeViewMatrixFromState(camState, cached.viewMatrix);
+    cached.radius = camState.orbit?.radius ?? radius;
+  }
+
+  // Invalidate all cached matrices (call when switching lock modes)
+  function invalidateAllCachedMatrices() {
+    cachedViewMatrices.clear();
+    cachedGridProjection = null;
+  }
+
+  function getViewIdAtScreenPosition(screenX, screenY) {
+    const rect = canvas.getBoundingClientRect();
+    const localX = screenX - rect.left;
+    const localY = screenY - rect.top;
+
+    const viewCount = (liveViewHidden ? 0 : 1) + snapshotViews.length;
+    if (viewLayoutMode !== 'grid' || viewCount <= 1) return focusedViewId;
+
+    const cols = viewCount <= 3 ? viewCount : Math.ceil(Math.sqrt(viewCount));
+    const rows = Math.ceil(viewCount / cols);
+    const cellW = rect.width / cols;
+    const cellH = rect.height / rows;
+    const col = Math.floor(localX / cellW);
+    const row = Math.floor(localY / cellH);
+    const viewIndex = row * cols + col;
+
+    const allViews = [];
+    if (!liveViewHidden) allViews.push({ id: LIVE_VIEW_ID });
+    snapshotViews.forEach(s => allViews.push({ id: s.id }));
+
+    return allViews[viewIndex]?.id || focusedViewId;
   }
 
   // === Public API ===
@@ -3171,16 +3562,58 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       vec3.set(freeflyVelocity, 0, 0, 0);
     },
 
+    // Camera lock API for independent view navigation
+    setCamerasLocked(locked) {
+      const wasLocked = camerasLocked;
+      camerasLocked = Boolean(locked);
+
+      if (wasLocked && !camerasLocked) {
+        // Transitioning to unlocked: initialize all view cameras from current state
+        const currentCam = getCurrentCameraStateInternal();
+        liveCameraState = liveCameraState || JSON.parse(JSON.stringify(currentCam));
+        for (const snap of snapshotViews) {
+          if (!snap.cameraState) {
+            snap.cameraState = JSON.parse(JSON.stringify(currentCam));
+          }
+        }
+        // Pre-compute cached view matrices for all views (avoids per-frame recalculation)
+        updateCachedViewMatrix(LIVE_VIEW_ID, liveCameraState);
+        for (const snap of snapshotViews) {
+          updateCachedViewMatrix(snap.id, snap.cameraState);
+        }
+      } else if (!wasLocked && camerasLocked) {
+        // Transitioning to locked: adopt active view's camera as global
+        const activeCam = getViewCameraState(focusedViewId);
+        if (activeCam) {
+          applyCameraStateTemporarily(activeCam);
+        }
+        // Clear cached matrices (not needed in locked mode)
+        invalidateAllCachedMatrices();
+      }
+    },
+
+    getCamerasLocked() { return camerasLocked; },
+    getFocusedViewId() { return focusedViewId; },
+
+    getViewCameraState(viewId) { return getViewCameraState(viewId); },
+    setViewCameraState(viewId, camState) { setViewCameraState(viewId, camState); },
+
     setViewFocusHandler(fn) { viewFocusHandler = typeof fn === 'function' ? fn : null; },
-    setLiveViewLabel(label) { liveViewLabel = label || 'Live view'; },
+    setLiveViewLabel(label) { liveViewLabel = label || 'View 1'; },
+    getLiveViewLabel() { return liveViewLabel; },
 
     // Snapshot API - stores view configs for multiview
     createSnapshotView(config) {
       if (snapshotViews.length >= MAX_SNAPSHOTS) return null;
       const id = `snap_${nextSnapshotId++}`;
+      // Inherit camera from live view at snapshot time
+      const inheritedCamera = config.cameraState ||
+        (camerasLocked ? getCurrentCameraStateInternal() :
+          JSON.parse(JSON.stringify(liveCameraState || getCurrentCameraStateInternal())));
+
       const snapshot = {
         id,
-        label: config.label || `View ${snapshotViews.length + 1}`,
+        label: config.label || `View ${snapshotViews.length + 2}`,
         fieldKey: config.fieldKey,
         fieldKind: config.fieldKind,
         colors: config.colors ? new Uint8Array(config.colors) : null, // RGBA uint8
@@ -3190,13 +3623,24 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         centroidColors: config.centroidColors ? new Uint8Array(config.centroidColors) : null, // RGBA uint8
         centroidOutliers: config.centroidOutliers ? new Float32Array(config.centroidOutliers) : null,
         outlierThreshold: config.outlierThreshold ?? 1.0,
-        meta: config.meta || {}
+        meta: config.meta || {},
+        cameraState: inheritedCamera  // Per-view camera state
       };
       snapshotViews.push(snapshot);
 
       // Create GPU buffer for this snapshot (uploaded once, not per-frame)
       if (snapshot.colors && hpRenderer) {
         hpRenderer.createSnapshotBuffer(id, snapshot.colors, snapshot.transparency);
+      }
+
+      // Create centroid GPU buffer for this snapshot (uploaded once)
+      if (snapshot.centroidPositions && snapshot.centroidColors) {
+        createCentroidSnapshotBuffer(id, snapshot.centroidPositions, snapshot.centroidColors);
+      }
+
+      // Pre-compute cached view matrix for this snapshot (if cameras unlocked)
+      if (!camerasLocked) {
+        updateCachedViewMatrix(id, inheritedCamera);
       }
 
       return { id, label: snapshot.label };
@@ -3222,6 +3666,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         hpRenderer.updateSnapshotBuffer(id, snap.colors, snap.transparency);
       }
 
+      // Re-upload centroid GPU buffer if changed
+      if ((attrs.centroidPositions || attrs.centroidColors) && snap.centroidPositions && snap.centroidColors) {
+        createCentroidSnapshotBuffer(id, snap.centroidPositions, snap.centroidColors);
+      }
+
       // If this is the focused view in single mode, update HP renderer's main buffer too
       if (viewLayoutMode === 'single' && focusedViewId === id) {
         if (snap.colors) hpRenderer.updateColors(snap.colors);
@@ -3237,6 +3686,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         if (hpRenderer) {
           hpRenderer.deleteSnapshotBuffer(id);
         }
+        // Delete centroid GPU buffer for this snapshot
+        deleteCentroidSnapshotBuffer(id);
+        // Clean up cached view matrix
+        cachedViewMatrices.delete(id);
         snapshotViews.splice(idx, 1);
         const key = String(id);
         if (key !== LIVE_VIEW_ID) {
@@ -3244,6 +3697,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
           viewCentroidFlags.delete(key);
         }
         if (focusedViewId === id) focusedViewId = LIVE_VIEW_ID;
+        // If no snapshots left and live was hidden, restore it
+        if (snapshotViews.length === 0 && liveViewHidden) {
+          liveViewHidden = false;
+        }
         updateLabelLayerVisibility();
       }
     },
@@ -3253,8 +3710,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       if (hpRenderer) {
         hpRenderer.deleteAllSnapshotBuffers();
       }
+      // Delete all centroid snapshot GPU buffers
+      for (const id of centroidSnapshotBuffers.keys()) {
+        deleteCentroidSnapshotBuffer(id);
+      }
       snapshotViews.length = 0;
       focusedViewId = LIVE_VIEW_ID;
+      liveViewHidden = false; // Restore live view visibility
       for (const key of Array.from(viewCentroidLabels.keys())) {
         if (String(key) !== LIVE_VIEW_ID) {
           removeLabelsForView(key);
