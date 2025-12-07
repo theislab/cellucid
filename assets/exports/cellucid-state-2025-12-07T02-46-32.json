@@ -1,0 +1,316 @@
+{
+  "version": 3,
+  "timestamp": "2025-12-07T02:46:32.949Z",
+  "camera": {
+    "navigationMode": "orbit",
+    "orbit": {
+      "radius": 1.2100767069084246,
+      "targetRadius": 1.2100767069084246,
+      "theta": 3.702643997773402,
+      "phi": 1.4342296114040756,
+      "target": [
+        0,
+        0,
+        0
+      ]
+    },
+    "freefly": {
+      "position": [
+        0,
+        0,
+        3
+      ],
+      "yaw": 0.7853981633974483,
+      "pitch": 0
+    }
+  },
+  "uiControls": {
+    "point-size": {
+      "type": "range",
+      "value": "22"
+    },
+    "lighting-strength": {
+      "type": "range",
+      "value": "65"
+    },
+    "fog-density": {
+      "type": "range",
+      "value": "50"
+    },
+    "size-attenuation": {
+      "type": "range",
+      "value": "70"
+    },
+    "hp-lod-enabled": {
+      "type": "checkbox",
+      "checked": false
+    },
+    "hp-lod-force": {
+      "type": "range",
+      "value": "-1"
+    },
+    "hp-frustum-culling": {
+      "type": "checkbox",
+      "checked": false
+    },
+    "orbit-reverse": {
+      "type": "checkbox",
+      "checked": true
+    },
+    "look-sensitivity": {
+      "type": "range",
+      "value": "5"
+    },
+    "move-speed": {
+      "type": "range",
+      "value": "100"
+    },
+    "invert-look": {
+      "type": "checkbox",
+      "checked": false
+    },
+    "projectiles-enabled": {
+      "type": "checkbox",
+      "checked": false
+    },
+    "pointer-lock": {
+      "type": "checkbox",
+      "checked": false
+    },
+    "smoke-grid": {
+      "type": "range",
+      "value": "60"
+    },
+    "smoke-steps": {
+      "type": "range",
+      "value": "75"
+    },
+    "cloud-resolution": {
+      "type": "range",
+      "value": "15"
+    },
+    "noise-resolution": {
+      "type": "range",
+      "value": "43"
+    },
+    "smoke-density": {
+      "type": "range",
+      "value": "66"
+    },
+    "smoke-detail": {
+      "type": "range",
+      "value": "60"
+    },
+    "smoke-warp": {
+      "type": "range",
+      "value": "10"
+    },
+    "smoke-speed": {
+      "type": "range",
+      "value": "40"
+    },
+    "smoke-edge": {
+      "type": "range",
+      "value": "5"
+    },
+    "smoke-absorption": {
+      "type": "range",
+      "value": "65"
+    },
+    "smoke-scatter": {
+      "type": "range",
+      "value": "0"
+    },
+    "smoke-direct-light": {
+      "type": "range",
+      "value": "11"
+    },
+    "toggle-connectivity": {
+      "type": "checkbox",
+      "checked": false
+    },
+    "connectivity-color": {
+      "type": "color",
+      "value": "#4a4a4a"
+    },
+    "connectivity-alpha": {
+      "type": "range",
+      "value": "60"
+    },
+    "connectivity-width": {
+      "type": "range",
+      "value": "10"
+    },
+    "connectivity-limit": {
+      "type": "range",
+      "value": "250000"
+    },
+    "gene-expression-search": {
+      "type": "text",
+      "value": ""
+    },
+    "outlier-filter": {
+      "type": "range",
+      "value": "100"
+    },
+    "toggle-centroid-points": {
+      "type": "checkbox",
+      "checked": false
+    },
+    "toggle-centroid-labels": {
+      "type": "checkbox",
+      "checked": false
+    },
+    "benchmark-count": {
+      "type": "number",
+      "value": "1000000"
+    },
+    "background-select": {
+      "type": "select",
+      "value": "grid"
+    },
+    "render-mode": {
+      "type": "select",
+      "value": "points"
+    },
+    "hp-shader-quality": {
+      "type": "select",
+      "value": "full"
+    },
+    "navigation-mode": {
+      "type": "select",
+      "value": "orbit"
+    },
+    "view-layout-mode": {
+      "type": "select",
+      "value": "grid"
+    },
+    "active-view-select": {
+      "type": "select",
+      "value": "live"
+    },
+    "categorical-field": {
+      "type": "select",
+      "value": "22"
+    },
+    "continuous-field": {
+      "type": "select",
+      "value": "-1"
+    },
+    "benchmark-pattern": {
+      "type": "select",
+      "value": "glb"
+    },
+    "accordion:Session": {
+      "type": "details",
+      "open": true
+    },
+    "accordion:Visualization": {
+      "type": "details",
+      "open": true
+    },
+    "accordion:Compare Views": {
+      "type": "details",
+      "open": true
+    },
+    "accordion:Filtering": {
+      "type": "details",
+      "open": true
+    },
+    "accordion:Highlighted Cells": {
+      "type": "details",
+      "open": true
+    },
+    "accordion:Performance Benchmark": {
+      "type": "details",
+      "open": false
+    }
+  },
+  "highlightPages": [
+    {
+      "id": "page_1",
+      "name": "Page 1",
+      "highlightedGroups": []
+    }
+  ],
+  "activePageId": "page_1",
+  "activePageName": "Page 1",
+  "filters": {
+    "obs:cell_type_lv1": {
+      "kind": "category",
+      "filterEnabled": true,
+      "visibility": {
+        "0": true,
+        "1": true,
+        "2": true,
+        "3": true,
+        "4": true,
+        "5": true,
+        "6": true,
+        "7": true,
+        "8": true
+      },
+      "colors": {
+        "8": [
+          0.7098039215686275,
+          0.10196078431372549,
+          0
+        ]
+      },
+      "colormapId": null
+    }
+  },
+  "activeFields": {
+    "activeFieldKey": "cell_type_lv1",
+    "activeFieldSource": "obs",
+    "activeVarFieldKey": null
+  },
+  "multiview": {
+    "layout": {
+      "mode": "grid",
+      "activeId": "live",
+      "liveViewHidden": false
+    },
+    "snapshots": []
+  },
+  "datasetSignature": "abeda2e0656c109c886d43cb1c6550d3ccf56494cc290e1547d52df867967169",
+  "datasetSummary": {
+    "n_cells": 162259,
+    "obs_field_count": 28,
+    "obs_keys": [
+      "handle_anndata",
+      "lab",
+      "protocol",
+      "sample",
+      "stage",
+      "cell_type_authors",
+      "cell_type_lv1",
+      "protocol|lab|stage|sample",
+      "prep_n_counts",
+      "prep_n_genes_by_counts",
+      "prep_pct_counts_mt",
+      "prep_pct_counts_ribo",
+      "prep_pct_counts_bcr",
+      "prep_pct_counts_tcr",
+      "prep_score_mt",
+      "prep_score_ribo",
+      "prep_score_bcr",
+      "prep_score_tcr",
+      "prep_score_cc",
+      "prep_score_cc_s",
+      "prep_score_cc_g2m",
+      "prep_score_scanpy_cc_s",
+      "prep_score_scanpy_cc_g2m",
+      "prep_scanpy_cc_phase",
+      "prep_scanpy_sc_cycling_strength",
+      "qc_fail",
+      "qc_fail_reasons",
+      "cell_type_lv1||protocol|lab|stage|sample"
+    ],
+    "obs_fields_hash": "8f35fa81b546dfe07ce287f0fb646a6593ceaee4bcdab693cd4135d7c40a4f2e",
+    "gene_count": 44910,
+    "gene_list_hash": "743407bb2132dd12f6ed904d9ad9330baff94abea565be3311596a9f58775e4a",
+    "compression": 6,
+    "connectivity_edges": 10537096
+  }
+}

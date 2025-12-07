@@ -2828,7 +2828,7 @@ export function initUI({ state, viewer, dom, smoke }) {
     renderHighlightPages();
     renderHighlightSummary();
     renderFilterSummary();
-    updateFilterCount();
+    state.updateFilteredCount();
     renderLegend(state.getActiveField());
     handleOutlierUI(state.getActiveField());
     const counts = state.getFilteredCount();

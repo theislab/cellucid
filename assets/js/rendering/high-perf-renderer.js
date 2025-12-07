@@ -771,14 +771,14 @@ export class HighPerfRenderer {
     const uniforms = {};
 
     const uniformNames = [
-      'u_mvpMatrix', 'u_viewMatrix', 'u_modelMatrix',
+      'u_mvpMatrix', 'u_viewMatrix', 'u_modelMatrix', 'u_projectionMatrix',
       'u_pointSize', 'u_sizeAttenuation', 'u_viewportHeight', 'u_fov',
       'u_lightingStrength', 'u_fogDensity', 'u_fogNear', 'u_fogFar',
       'u_fogColor', 'u_lightDir',
       // Alpha texture uniforms for efficient alpha-only updates
-      'u_alphaTex', 'u_alphaTexWidth', 'u_useAlphaTex',
+      'u_alphaTex', 'u_alphaTexWidth', 'u_invAlphaTexWidth', 'u_useAlphaTex',
       // LOD index texture uniforms (for mapping LOD vertex to original index)
-      'u_lodIndexTex', 'u_lodIndexTexWidth', 'u_useLodIndexTex'
+      'u_lodIndexTex', 'u_lodIndexTexWidth', 'u_invLodIndexTexWidth', 'u_useLodIndexTex'
     ];
 
     for (const name of uniformNames) {
@@ -1527,6 +1527,7 @@ export class HighPerfRenderer {
       mvpMatrix,
       viewMatrix,
       modelMatrix,
+      projectionMatrix,
       pointSize = 5.0,
       sizeAttenuation = 0.0,
       viewportHeight,
@@ -1618,7 +1619,7 @@ export class HighPerfRenderer {
   _renderWithFrustumCulling(params, frustumPlanes) {
     const gl = this.gl;
     const {
-      mvpMatrix, viewMatrix, modelMatrix,
+      mvpMatrix, viewMatrix, modelMatrix, projectionMatrix,
       pointSize, sizeAttenuation, viewportHeight, fov,
       lightingStrength, fogDensity, fogColor, lightDir
     } = params;
@@ -1715,6 +1716,9 @@ export class HighPerfRenderer {
     }
     if (uniforms.u_modelMatrix !== null) {
       gl.uniformMatrix4fv(uniforms.u_modelMatrix, false, modelMatrix);
+    }
+    if (uniforms.u_projectionMatrix !== null && projectionMatrix) {
+      gl.uniformMatrix4fv(uniforms.u_projectionMatrix, false, projectionMatrix);
     }
     if (uniforms.u_pointSize !== null) {
       gl.uniform1f(uniforms.u_pointSize, pointSize);
@@ -1875,7 +1879,7 @@ export class HighPerfRenderer {
   _renderFullDetail(params) {
     const gl = this.gl;
     const {
-      mvpMatrix, viewMatrix, modelMatrix,
+      mvpMatrix, viewMatrix, modelMatrix, projectionMatrix,
       pointSize, sizeAttenuation, viewportHeight, fov,
       lightingStrength, fogDensity, fogColor, lightDir
     } = params;
@@ -1903,6 +1907,9 @@ export class HighPerfRenderer {
     }
     if (uniforms.u_modelMatrix) {
       gl.uniformMatrix4fv(uniforms.u_modelMatrix, false, modelMatrix);
+    }
+    if (uniforms.u_projectionMatrix !== null && projectionMatrix) {
+      gl.uniformMatrix4fv(uniforms.u_projectionMatrix, false, projectionMatrix);
     }
 
     gl.uniform1f(uniforms.u_pointSize, pointSize);
@@ -1972,6 +1979,9 @@ export class HighPerfRenderer {
       if (uniforms.u_alphaTexWidth !== null) {
         gl.uniform1i(uniforms.u_alphaTexWidth, this._alphaTexWidth);
       }
+      if (uniforms.u_invAlphaTexWidth !== null && this._alphaTexWidth > 0) {
+        gl.uniform1f(uniforms.u_invAlphaTexWidth, 1.0 / this._alphaTexWidth);
+      }
       if (uniforms.u_useAlphaTex !== null) {
         gl.uniform1i(uniforms.u_useAlphaTex, 1); // true
       }
@@ -1986,6 +1996,9 @@ export class HighPerfRenderer {
         }
         if (uniforms.u_lodIndexTexWidth !== null) {
           gl.uniform1i(uniforms.u_lodIndexTexWidth, lodIdxTex.width);
+        }
+        if (uniforms.u_invLodIndexTexWidth !== null && lodIdxTex.width > 0) {
+          gl.uniform1f(uniforms.u_invLodIndexTexWidth, 1.0 / lodIdxTex.width);
         }
         if (uniforms.u_useLodIndexTex !== null) {
           gl.uniform1i(uniforms.u_useLodIndexTex, 1); // true
@@ -2017,7 +2030,7 @@ export class HighPerfRenderer {
     }
 
     const {
-      mvpMatrix, viewMatrix, modelMatrix,
+      mvpMatrix, viewMatrix, modelMatrix, projectionMatrix,
       pointSize, sizeAttenuation, viewportHeight, fov,
       lightingStrength, fogDensity, fogColor, lightDir
     } = params;
@@ -2042,6 +2055,9 @@ export class HighPerfRenderer {
     }
     if (uniforms.u_modelMatrix !== null) {
       gl.uniformMatrix4fv(uniforms.u_modelMatrix, false, modelMatrix);
+    }
+    if (uniforms.u_projectionMatrix !== null && projectionMatrix) {
+      gl.uniformMatrix4fv(uniforms.u_projectionMatrix, false, projectionMatrix);
     }
     if (uniforms.u_pointSize !== null) {
       gl.uniform1f(uniforms.u_pointSize, adjustedPointSize);
@@ -2424,7 +2440,7 @@ export class HighPerfRenderer {
 
     const gl = this.gl;
     const {
-      mvpMatrix, viewMatrix, modelMatrix,
+      mvpMatrix, viewMatrix, modelMatrix, projectionMatrix,
       pointSize = 5.0, sizeAttenuation = 0.0, viewportHeight, fov,
       lightingStrength = 0.6, fogDensity = 0.5,
       fogColor = [1, 1, 1], lightDir = [0.5, 0.7, 0.5],
@@ -2457,6 +2473,7 @@ export class HighPerfRenderer {
     if (uniforms.u_mvpMatrix !== null) gl.uniformMatrix4fv(uniforms.u_mvpMatrix, false, mvpMatrix);
     if (uniforms.u_viewMatrix !== null) gl.uniformMatrix4fv(uniforms.u_viewMatrix, false, viewMatrix);
     if (uniforms.u_modelMatrix !== null) gl.uniformMatrix4fv(uniforms.u_modelMatrix, false, modelMatrix);
+    if (uniforms.u_projectionMatrix !== null && projectionMatrix) gl.uniformMatrix4fv(uniforms.u_projectionMatrix, false, projectionMatrix);
     if (uniforms.u_pointSize !== null) gl.uniform1f(uniforms.u_pointSize, pointSize);
     if (uniforms.u_sizeAttenuation !== null) gl.uniform1f(uniforms.u_sizeAttenuation, sizeAttenuation);
     if (uniforms.u_viewportHeight !== null) gl.uniform1f(uniforms.u_viewportHeight, viewportHeight);
@@ -2467,6 +2484,10 @@ export class HighPerfRenderer {
     if (uniforms.u_fogFar !== null) gl.uniform1f(uniforms.u_fogFar, this.fogFar);
     if (uniforms.u_fogColor !== null) gl.uniform3fv(uniforms.u_fogColor, fogColor);
     if (uniforms.u_lightDir !== null) gl.uniform3fv(uniforms.u_lightDir, lightDir);
+
+    // Disable alpha texture - snapshots have alpha baked into their interleaved buffer
+    if (uniforms.u_useAlphaTex !== null) gl.uniform1i(uniforms.u_useAlphaTex, 0);
+    if (uniforms.u_useLodIndexTex !== null) gl.uniform1i(uniforms.u_useLodIndexTex, 0);
 
     // Bind snapshot's VAO (no data upload!)
     gl.bindVertexArray(snapshot.vao);

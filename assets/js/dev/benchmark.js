@@ -1280,8 +1280,11 @@ export class SyntheticDataGenerator {
    * @returns {Promise<Object>} - { positions: Float32Array, colors: Uint8Array (RGBA) }
    */
   static async fromGLBUrl(count, url = 'assets/img/kemal-inecik.glb') {
-    console.log(`Loading GLB from: ${url}`);
-    const response = await fetch(url);
+    const resolvedUrl = typeof window !== 'undefined'
+      ? new URL(url, window.location.href).toString()
+      : url;
+    console.log(`Loading GLB from: ${resolvedUrl}`);
+    const response = await fetch(resolvedUrl, { cache: 'no-store' });
     if (!response.ok) {
       throw new Error(`Failed to load GLB: ${response.status} ${response.statusText}`);
     }
@@ -2357,10 +2360,10 @@ export class BenchmarkReporter {
   }
 
   _collectRendererSnapshot(gl, context = {}) {
-    const rendererStats = context.rendererStats ||
-      (this.viewer && typeof this.viewer.getRendererStats === 'function' ? this.viewer.getRendererStats() : null) ||
+    const rendererStats = context.rendererStats ??
+      (this.viewer && typeof this.viewer.getRendererStats === 'function' ? this.viewer.getRendererStats() : null) ??
       {};
-    const perfStats = context.perfStats || null;
+    const perfStats = context.perfStats ?? null;
     const rendererConfig = context.rendererConfig || {};
     const renderMode = rendererConfig.renderMode || context.renderMode || null;
     const viewport = gl
@@ -2370,10 +2373,11 @@ export class BenchmarkReporter {
           height: typeof window !== 'undefined' ? window.innerHeight : null
         };
 
-    const fps = rendererStats.fps || perfStats?.fps || null;
-    const frameTime = rendererStats.lastFrameTime || perfStats?.avgFrameTime || null;
+    const fps = perfStats?.fps ?? rendererStats.fps ?? null;
+    const frameTime = perfStats?.avgFrameTime ?? rendererStats.lastFrameTime ?? null;
+    const renderFrameMs = rendererStats.lastFrameTime ?? null;
 
-    const estimatedMemoryMB = rendererStats.gpuMemoryMB ||
+    const estimatedMemoryMB = rendererStats.gpuMemoryMB ??
       (context.dataset && context.dataset.pointCount
         ? (context.dataset.pointCount * 28) / (1024 * 1024)
         : null);
@@ -2381,6 +2385,7 @@ export class BenchmarkReporter {
     return {
       fps,
       frameTime,
+      renderFrameMs,
       rendererStats,
       perfStats,
       rendererConfig,

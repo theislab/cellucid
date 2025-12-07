@@ -208,7 +208,6 @@ const DATASET_HASH_URL = `${EXPORT_BASE_URL}dataset_hash.json`;
 
     // Normalize / init scatter state
     state.initScene(positions, obs);
-
     // One-time helper to rebuild density from current visibility + grid
     function rebuildSmokeDensity(gridSizeOverride) {
       const gridSize = gridSizeOverride || 128;
@@ -843,6 +842,18 @@ const DATASET_HASH_URL = `${EXPORT_BASE_URL}dataset_hash.json`;
     const benchmarkReportBtn = document.getElementById('benchmark-report-btn');
     const benchmarkReportOutput = document.getElementById('benchmark-report-output');
     const benchmarkReportStatus = document.getElementById('benchmark-report-status');
+    const benchPointsEl = document.getElementById('bench-points');
+    const benchFpsEl = document.getElementById('bench-fps');
+    const benchFrametimeEl = document.getElementById('bench-frametime');
+    const benchMemoryEl = document.getElementById('bench-memory');
+    const benchLodEl = document.getElementById('bench-lod');
+    const benchVisibleEl = document.getElementById('bench-visible');
+    const benchTimingDetailsEl = document.getElementById('bench-timing-details');
+    const benchMinFtEl = document.getElementById('bench-min-ft');
+    const benchP95FtEl = document.getElementById('bench-p95-ft');
+    const benchMaxFtEl = document.getElementById('bench-max-ft');
+    const benchGenInfoEl = document.getElementById('bench-gen-info');
+    const benchGenTimeEl = document.getElementById('bench-gen-time');
 
     // HP renderer controls (always-on HP renderer)
     const hpShaderQuality = document.getElementById('hp-shader-quality');
@@ -859,6 +870,7 @@ const DATASET_HASH_URL = `${EXPORT_BASE_URL}dataset_hash.json`;
     let syntheticDatasetInfo = null;
     let latestPerfSample = null;
     let latestRendererStats = null;
+    let perfLoopHandle = null;
 
     const rendererConfigSnapshot = () => ({
       shaderQuality: hpShaderQuality?.value || 'full',
@@ -890,6 +902,113 @@ const DATASET_HASH_URL = `${EXPORT_BASE_URL}dataset_hash.json`;
         filters
       };
     };
+
+    const formatMs = (val) => {
+      if (val == null) return null;
+      return typeof val === 'number' ? val.toFixed(2) : String(val);
+    };
+
+    const ensureBenchmarkStatsVisible = () => {
+      if (benchmarkStatsEl) {
+        benchmarkStatsEl.style.display = 'block';
+      }
+    };
+
+    // Use the HTML-selected pattern by default (GLB in markup); no override here
+
+    const renderBenchmarkStats = (stats, hpStats, datasetSnapshot) => {
+      const pointCount = datasetSnapshot?.pointCount ?? 0;
+      const visiblePoints = datasetSnapshot?.visiblePoints ?? pointCount;
+      const generationMs = datasetSnapshot?.generationMs ?? null;
+
+      if (benchPointsEl) benchPointsEl.textContent = formatNumber(visiblePoints ?? pointCount ?? 0);
+      if (benchVisibleEl) benchVisibleEl.textContent = formatNumber(visiblePoints ?? pointCount ?? 0);
+
+      if (benchMemoryEl) {
+        const gpuMemMB = ((pointCount ?? visiblePoints ?? 0) * 28 / 1024 / 1024).toFixed(1);
+        benchMemoryEl.textContent = `${gpuMemMB} MB`;
+      }
+
+      if (benchGenInfoEl && benchGenTimeEl) {
+        if (generationMs != null) {
+          benchGenTimeEl.textContent = generationMs;
+          benchGenInfoEl.style.display = 'block';
+        } else {
+          benchGenInfoEl.style.display = 'none';
+        }
+      }
+
+      if (stats && stats.samples > 1) {
+        const displayFps = stats?.fps ?? hpStats?.fps ?? 0;
+        const displayFrameTime = formatMs(stats?.avgFrameTime ?? hpStats?.lastFrameTime);
+        const renderFrameTime = formatMs(hpStats?.lastFrameTime);
+
+        if (benchFpsEl) {
+          benchFpsEl.textContent = displayFps ?? '-';
+          benchFpsEl.style.color = displayFps > 55 ? '#22c55e' : displayFps > 30 ? '#f59e0b' : '#ef4444';
+        }
+        if (benchFrametimeEl) {
+          const frameText = displayFrameTime != null ? `${displayFrameTime} ms` : '-';
+          benchFrametimeEl.textContent = renderFrameTime ? `${frameText} (render ${renderFrameTime} ms)` : frameText;
+        }
+
+        if (stats.samples >= 30 && benchTimingDetailsEl) {
+          benchTimingDetailsEl.style.display = 'block';
+          if (benchMinFtEl) benchMinFtEl.textContent = stats.minFrameTime + ' ms';
+          if (benchP95FtEl) benchP95FtEl.textContent = stats.p95FrameTime + ' ms';
+          if (benchMaxFtEl) benchMaxFtEl.textContent = stats.maxFrameTime + ' ms';
+        } else if (benchTimingDetailsEl) {
+          benchTimingDetailsEl.style.display = 'none';
+        }
+      } else {
+        if (benchFpsEl) benchFpsEl.textContent = '-';
+        if (benchFrametimeEl) benchFrametimeEl.textContent = '-';
+        if (benchTimingDetailsEl) benchTimingDetailsEl.style.display = 'none';
+      }
+
+      if (hpStats) {
+        if (benchLodEl) benchLodEl.textContent = hpStats.lodLevel === -1 ? 'Full' : `Level ${hpStats.lodLevel}`;
+        if (benchVisibleEl) benchVisibleEl.textContent = formatNumber(hpStats.visiblePoints ?? visiblePoints ?? 0);
+      } else {
+        if (benchLodEl) benchLodEl.textContent = '-';
+      }
+    };
+
+    const startPerfMonitoring = ({ resetTracker = false } = {}) => {
+      ensureBenchmarkStatsVisible();
+
+      if (resetTracker || !benchmarkActive) {
+        perfTracker.start();
+      }
+      benchmarkActive = true;
+
+      const tick = () => {
+        if (!benchmarkActive) {
+          perfLoopHandle = null;
+          return;
+        }
+
+        const stats = perfTracker.recordFrame();
+        const hpStats = viewer.getRendererStats();
+        if (stats) latestPerfSample = stats;
+        if (hpStats) latestRendererStats = hpStats;
+
+        const datasetSnapshot = buildDatasetSnapshot();
+        renderBenchmarkStats(stats, hpStats, datasetSnapshot);
+
+        perfLoopHandle = requestAnimationFrame(tick);
+      };
+
+      if (!perfLoopHandle) {
+        perfLoopHandle = requestAnimationFrame(tick);
+      }
+    };
+
+    // Kick off benchmarking HUD for real data once base dataset is loaded
+    activeDatasetMode = 'real';
+    syntheticDatasetInfo = null;
+    renderBenchmarkStats(null, viewer.getRendererStats(), buildDatasetSnapshot());
+    startPerfMonitoring({ resetTracker: true });
 
     // Shader quality change
     if (hpShaderQuality) {
@@ -936,29 +1055,12 @@ const DATASET_HASH_URL = `${EXPORT_BASE_URL}dataset_hash.json`;
     async function runBenchmark(pointCount, pattern) {
       console.log(`Running benchmark: ${formatNumber(pointCount)} points (${pattern})`);
 
-      // Show stats panel
-      if (benchmarkStatsEl) {
-        benchmarkStatsEl.style.display = 'block';
-      }
-
-      // Get all stat elements
-      const pointsEl = document.getElementById('bench-points');
-      const fpsEl = document.getElementById('bench-fps');
-      const frametimeEl = document.getElementById('bench-frametime');
-      const memoryEl = document.getElementById('bench-memory');
-      const lodEl = document.getElementById('bench-lod');
-      const visibleEl = document.getElementById('bench-visible');
-      const timingDetailsEl = document.getElementById('bench-timing-details');
-      const minFtEl = document.getElementById('bench-min-ft');
-      const p95FtEl = document.getElementById('bench-p95-ft');
-      const maxFtEl = document.getElementById('bench-max-ft');
-      const genInfoEl = document.getElementById('bench-gen-info');
-      const genTimeEl = document.getElementById('bench-gen-time');
-
-      if (pointsEl) pointsEl.textContent = 'Loading...';
-      if (fpsEl) fpsEl.textContent = '-';
-      if (timingDetailsEl) timingDetailsEl.style.display = 'none';
-      if (genInfoEl) genInfoEl.style.display = 'none';
+      ensureBenchmarkStatsVisible();
+      if (benchPointsEl) benchPointsEl.textContent = 'Loading...';
+      if (benchFpsEl) benchFpsEl.textContent = '-';
+      if (benchFrametimeEl) benchFrametimeEl.textContent = '-';
+      if (benchTimingDetailsEl) benchTimingDetailsEl.style.display = 'none';
+      if (benchGenInfoEl) benchGenInfoEl.style.display = 'none';
 
       // Generate synthetic data with timing
       let data;
@@ -985,7 +1087,7 @@ const DATASET_HASH_URL = `${EXPORT_BASE_URL}dataset_hash.json`;
             break;
           case 'glb':
             // Async loading from GLB file
-            if (pointsEl) pointsEl.textContent = 'Loading GLB...';
+            if (benchPointsEl) benchPointsEl.textContent = 'Loading GLB...';
             data = await SyntheticDataGenerator.fromGLBUrl(pointCount);
             break;
           case 'clusters':
@@ -994,20 +1096,29 @@ const DATASET_HASH_URL = `${EXPORT_BASE_URL}dataset_hash.json`;
         }
       } catch (err) {
         console.error('Failed to generate data:', err);
-        if (pointsEl) pointsEl.textContent = 'Error: ' + err.message;
+        const message = pattern === 'glb'
+          ? `GLB load failed: ${err.message || err}`
+          : `Error: ${err.message || err}`;
+        if (benchPointsEl) benchPointsEl.textContent = message;
         return;
       }
       const genTime = Math.round(performance.now() - genStart);
 
       // Show generation time
-      if (genInfoEl && genTimeEl) {
-        genTimeEl.textContent = genTime;
-        genInfoEl.style.display = 'block';
+      if (benchGenInfoEl && benchGenTimeEl) {
+        benchGenTimeEl.textContent = genTime;
+        benchGenInfoEl.style.display = 'block';
       }
 
       // Create transparency and outlier arrays
       const transparency = new Float32Array(pointCount).fill(1.0);
       const outlierQuantiles = new Float32Array(pointCount).fill(-1.0);
+
+      // Ensure point rendering mode for benchmarks
+      if (renderModeSelect && renderModeSelect.value !== 'points') {
+        renderModeSelect.value = 'points';
+        viewer.setRenderMode('points');
+      }
 
       // Load into viewer (HP renderer is always used)
       viewer.setData({
@@ -1025,11 +1136,6 @@ const DATASET_HASH_URL = `${EXPORT_BASE_URL}dataset_hash.json`;
         transparency: new Float32Array(0)
       });
 
-      // Update stats display
-      const gpuMemMB = (pointCount * 28 / 1024 / 1024).toFixed(1);
-      if (pointsEl) pointsEl.textContent = formatNumber(pointCount);
-      if (memoryEl) memoryEl.textContent = gpuMemMB + ' MB';
-
       activeDatasetMode = 'synthetic';
       syntheticDatasetInfo = {
         pointCount,
@@ -1038,52 +1144,11 @@ const DATASET_HASH_URL = `${EXPORT_BASE_URL}dataset_hash.json`;
         visiblePoints: pointCount
       };
 
-      // Start performance tracking
-      benchmarkActive = true;
-      perfTracker.start();
+      const gpuMemMB = (pointCount * 28 / 1024 / 1024).toFixed(1);
 
-      // Update FPS display periodically
-      const updateStats = () => {
-        if (!benchmarkActive) return;
-
-        const stats = perfTracker.recordFrame();
-        const hpStats = viewer.getRendererStats();
-        if (stats) latestPerfSample = stats;
-        if (hpStats) latestRendererStats = hpStats;
-
-        if (stats && stats.samples > 5) {
-          const displayFps = hpStats?.fps || stats.fps;
-          const displayFrameTime = hpStats?.lastFrameTime?.toFixed(2) || stats.avgFrameTime;
-
-          if (fpsEl) {
-            fpsEl.textContent = displayFps;
-            // Color coding: green > 55fps, yellow > 30fps, red < 30fps
-            fpsEl.style.color = displayFps > 55 ? '#22c55e' : displayFps > 30 ? '#f59e0b' : '#ef4444';
-          }
-          if (frametimeEl) frametimeEl.textContent = displayFrameTime + ' ms';
-
-          // Show detailed timing stats after enough samples
-          if (stats.samples >= 30 && timingDetailsEl) {
-            timingDetailsEl.style.display = 'block';
-            if (minFtEl) minFtEl.textContent = stats.minFrameTime + ' ms';
-            if (p95FtEl) p95FtEl.textContent = stats.p95FrameTime + ' ms';
-            if (maxFtEl) maxFtEl.textContent = stats.maxFrameTime + ' ms';
-          }
-
-          // HP renderer stats
-          if (hpStats) {
-            if (lodEl) lodEl.textContent = hpStats.lodLevel === -1 ? 'Full' : `Level ${hpStats.lodLevel}`;
-            if (visibleEl) visibleEl.textContent = formatNumber(hpStats.visiblePoints);
-          } else {
-            if (lodEl) lodEl.textContent = '-';
-            if (visibleEl) visibleEl.textContent = formatNumber(pointCount);
-          }
-        }
-
-        requestAnimationFrame(updateStats);
-      };
-
-      requestAnimationFrame(updateStats);
+      // Refresh stat panel immediately and start perf tracking loop
+      renderBenchmarkStats(null, viewer.getRendererStats(), buildDatasetSnapshot());
+      startPerfMonitoring({ resetTracker: true });
 
       console.log(`Benchmark loaded: ${formatNumber(pointCount)} points, ~${gpuMemMB}MB GPU memory (gen: ${genTime}ms)`);
     }

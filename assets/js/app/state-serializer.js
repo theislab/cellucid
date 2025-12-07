@@ -10,6 +10,18 @@
  * - Multiview/snapshot configurations
  */
 
+import { getCategoryColor } from '../data/palettes.js';
+
+/**
+ * Compare two RGB colors for equality within a small epsilon
+ */
+function colorsEqual(a, b, epsilon = 1e-4) {
+  if (!a || !b) return !a && !b;
+  return Math.abs(a[0] - b[0]) < epsilon &&
+         Math.abs(a[1] - b[1]) < epsilon &&
+         Math.abs(a[2] - b[2]) < epsilon;
+}
+
 export function createStateSerializer({ state, viewer, sidebar, datasetSignature }) {
   // v3: multiview restore, full filter capture, stronger post-restore syncing
   const VERSION = 3;
@@ -62,6 +74,16 @@ export function createStateSerializer({ state, viewer, sidebar, datasetSignature
       }
     }
     if (field._colormapId) return true;
+    // Check if any category colors have been changed from defaults
+    if (field._categoryColors) {
+      for (let i = 0; i < field._categoryColors.length; i++) {
+        const color = field._categoryColors[i];
+        if (color) {
+          const defaultColor = getCategoryColor(i);
+          if (!colorsEqual(color, defaultColor)) return true;
+        }
+      }
+    }
     return false;
   }
 
@@ -81,7 +103,14 @@ export function createStateSerializer({ state, viewer, sidebar, datasetSignature
       if (minChanged || maxChanged) return true;
     }
 
-    if (field._continuousColorRange) return true;
+    // Check if colorRange differs from the stats (default is to use stats range)
+    if (field._continuousColorRange && field._continuousStats) {
+      const stats = field._continuousStats;
+      const colorRange = field._continuousColorRange;
+      const minChanged = Math.abs(colorRange.min - stats.min) > 1e-6;
+      const maxChanged = Math.abs(colorRange.max - stats.max) > 1e-6;
+      if (minChanged || maxChanged) return true;
+    }
     if (field._useFilterColorRange) return true;
     if (field._useLogScale) return true;
 
@@ -89,7 +118,8 @@ export function createStateSerializer({ state, viewer, sidebar, datasetSignature
     if (!outlierEnabled) return true;
     if (outlierEnabled && field._outlierThreshold != null && field._outlierThreshold < 0.9999) return true;
 
-    if (field._colormapId) return true;
+    // Check if colormap differs from the default ('viridis')
+    if (field._colormapId && field._colormapId !== 'viridis') return true;
     return false;
   }
 
@@ -276,10 +306,16 @@ export function createStateSerializer({ state, viewer, sidebar, datasetSignature
             visibility[catIdx] = visible;
           });
         }
+        // Only save colors that differ from the default palette
         const colors = {};
         if (field._categoryColors) {
           field._categoryColors.forEach((color, catIdx) => {
-            if (color) colors[catIdx] = [...color];
+            if (color) {
+              const defaultColor = getCategoryColor(catIdx);
+              if (!colorsEqual(color, defaultColor)) {
+                colors[catIdx] = [...color];
+              }
+            }
           });
         }
         filters[key] = {

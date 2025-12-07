@@ -29,6 +29,7 @@ layout(location = 1) in vec4 a_color; // RGBA packed, auto-normalized by WebGL
 uniform mat4 u_mvpMatrix;
 uniform mat4 u_viewMatrix;
 uniform mat4 u_modelMatrix;
+uniform mat4 u_projectionMatrix;
 uniform float u_pointSize;
 uniform float u_sizeAttenuation;
 uniform float u_viewportHeight;
@@ -37,6 +38,7 @@ uniform float u_fov;
 // Alpha texture for efficient alpha-only updates (avoids full buffer rebuild)
 uniform sampler2D u_alphaTex;
 uniform int u_alphaTexWidth;
+uniform float u_invAlphaTexWidth;
 uniform bool u_useAlphaTex;
 
 out vec3 v_color;
@@ -44,9 +46,8 @@ out float v_viewDistance;
 out float v_alpha;
 
 void main() {
-  vec4 worldPos = u_modelMatrix * vec4(a_position, 1.0);
-  vec4 eyePos = u_viewMatrix * worldPos;
-  gl_Position = u_mvpMatrix * vec4(a_position, 1.0);
+  vec4 eyePos = u_viewMatrix * u_modelMatrix * vec4(a_position, 1.0);
+  gl_Position = u_projectionMatrix * eyePos;
 
   float eyeDepth = -eyePos.z;
   v_viewDistance = length(eyePos.xyz);
@@ -54,7 +55,7 @@ void main() {
   // Fetch alpha from texture if enabled, otherwise use vertex attribute
   float alpha;
   if (u_useAlphaTex && u_alphaTexWidth > 0) {
-    int y = gl_VertexID / u_alphaTexWidth;
+    int y = int(float(gl_VertexID) * u_invAlphaTexWidth);
     int x = gl_VertexID - y * u_alphaTexWidth;
     alpha = texelFetch(u_alphaTex, ivec2(x, y), 0).r;
   } else {
@@ -143,6 +144,7 @@ layout(location = 1) in vec4 a_color; // RGBA packed, auto-normalized by WebGL
 uniform mat4 u_mvpMatrix;
 uniform mat4 u_viewMatrix;
 uniform mat4 u_modelMatrix;
+uniform mat4 u_projectionMatrix;
 uniform float u_pointSize;
 uniform float u_sizeAttenuation;
 uniform float u_viewportHeight;
@@ -151,22 +153,22 @@ uniform float u_fov;
 // Alpha texture for efficient alpha-only updates
 uniform sampler2D u_alphaTex;
 uniform int u_alphaTexWidth;
+uniform float u_invAlphaTexWidth;
 uniform bool u_useAlphaTex;
 
 out vec3 v_color;
 out float v_alpha;
 
 void main() {
-  vec4 worldPos = u_modelMatrix * vec4(a_position, 1.0);
-  vec4 eyePos = u_viewMatrix * worldPos;
-  gl_Position = u_mvpMatrix * vec4(a_position, 1.0);
+  vec4 eyePos = u_viewMatrix * u_modelMatrix * vec4(a_position, 1.0);
+  gl_Position = u_projectionMatrix * eyePos;
 
   float eyeDepth = -eyePos.z;
 
   // Fetch alpha from texture if enabled
   float alpha;
   if (u_useAlphaTex && u_alphaTexWidth > 0) {
-    int y = gl_VertexID / u_alphaTexWidth;
+    int y = int(float(gl_VertexID) * u_invAlphaTexWidth);
     int x = gl_VertexID - y * u_alphaTexWidth;
     alpha = texelFetch(u_alphaTex, ivec2(x, y), 0).r;
   } else {
@@ -238,6 +240,7 @@ layout(location = 2) in float a_lodSize;
 uniform mat4 u_mvpMatrix;
 uniform mat4 u_viewMatrix;
 uniform mat4 u_modelMatrix;
+uniform mat4 u_projectionMatrix;
 uniform float u_pointSize;
 uniform float u_viewportHeight;
 uniform float u_fov;
@@ -245,10 +248,12 @@ uniform float u_fov;
 // Alpha texture for efficient alpha-only updates
 uniform sampler2D u_alphaTex;
 uniform int u_alphaTexWidth;
+uniform float u_invAlphaTexWidth;
 uniform bool u_useAlphaTex;
 // For LOD: maps LOD vertex index to original point index for alpha lookup
 uniform sampler2D u_lodIndexTex;
 uniform int u_lodIndexTexWidth;
+uniform float u_invLodIndexTexWidth;
 uniform bool u_useLodIndexTex;
 
 out vec3 v_color;
@@ -257,7 +262,7 @@ out float v_alpha;
 
 void main() {
   vec4 eyePos = u_viewMatrix * u_modelMatrix * vec4(a_position, 1.0);
-  gl_Position = u_mvpMatrix * vec4(a_position, 1.0);
+  gl_Position = u_projectionMatrix * eyePos;
 
   float eyeDepth = -eyePos.z;
   v_viewDistance = length(eyePos.xyz);
@@ -268,13 +273,13 @@ void main() {
     int origIdx;
     if (u_useLodIndexTex && u_lodIndexTexWidth > 0) {
       // LOD mode: lookup original index from index texture
-      int iy = gl_VertexID / u_lodIndexTexWidth;
+      int iy = int(float(gl_VertexID) * u_invLodIndexTexWidth);
       int ix = gl_VertexID - iy * u_lodIndexTexWidth;
       origIdx = int(texelFetch(u_lodIndexTex, ivec2(ix, iy), 0).r);
     } else {
       origIdx = gl_VertexID;
     }
-    int y = origIdx / u_alphaTexWidth;
+    int y = int(float(origIdx) * u_invAlphaTexWidth);
     int x = origIdx - y * u_alphaTexWidth;
     alpha = texelFetch(u_alphaTex, ivec2(x, y), 0).r;
   } else {
@@ -368,22 +373,23 @@ layout(location = 0) in float a_pointIndex;
 uniform sampler2D u_positionTex;
 uniform sampler2D u_colorTex; // Now stores RGBA
 uniform int u_texWidth;
+uniform float u_invTexWidth;
 uniform mat4 u_mvpMatrix;
 uniform float u_pointSize;
 
 out vec3 v_color;
 out float v_alpha;
 
-vec4 fetchFromTexture(sampler2D tex, float index, int width) {
-  int idx = int(index);
-  int y = idx / width;
+vec4 fetchFromTexture(sampler2D tex, int idx, int width, float invWidth) {
+  int y = int(float(idx) * invWidth);
   int x = idx - y * width;
   return texelFetch(tex, ivec2(x, y), 0);
 }
 
 void main() {
-  vec4 pos = fetchFromTexture(u_positionTex, a_pointIndex, u_texWidth);
-  vec4 col = fetchFromTexture(u_colorTex, a_pointIndex, u_texWidth);
+  int idx = int(a_pointIndex);
+  vec4 pos = fetchFromTexture(u_positionTex, idx, u_texWidth, u_invTexWidth);
+  vec4 col = fetchFromTexture(u_colorTex, idx, u_texWidth, u_invTexWidth);
 
   gl_Position = u_mvpMatrix * vec4(pos.xyz, 1.0);
   gl_PointSize = u_pointSize;
@@ -437,6 +443,7 @@ layout(location = 1) in vec4 a_color; // RGBA packed - we only use alpha for vis
 uniform mat4 u_mvpMatrix;
 uniform mat4 u_viewMatrix;
 uniform mat4 u_modelMatrix;
+uniform mat4 u_projectionMatrix;
 uniform float u_pointSize;
 uniform float u_sizeAttenuation;
 uniform float u_viewportHeight;
@@ -446,9 +453,8 @@ uniform float u_highlightScale; // How much larger the highlight ring is (e.g., 
 out float v_alpha;
 
 void main() {
-  vec4 worldPos = u_modelMatrix * vec4(a_position, 1.0);
-  vec4 eyePos = u_viewMatrix * worldPos;
-  gl_Position = u_mvpMatrix * vec4(a_position, 1.0);
+  vec4 eyePos = u_viewMatrix * u_modelMatrix * vec4(a_position, 1.0);
+  gl_Position = u_projectionMatrix * eyePos;
 
   float eyeDepth = -eyePos.z;
 

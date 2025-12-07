@@ -2143,6 +2143,14 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     // Use CSS pixels (clientWidth/Height) not device pixels (width/height)
     const width = canvas.clientWidth;
     const height = canvas.clientHeight;
+    // Viewport bounds in CSS pixels
+    const vpX = viewportNorm.x * width;
+    const vpY = viewportNorm.y * height;
+    const vpW = viewportNorm.w * width;
+    const vpH = viewportNorm.h * height;
+    // Small margin to hide labels that are partially outside (avoids text clipping at edges)
+    const margin = 5;
+
     for (const item of labels) {
       if (!item?.el || !item.position) continue;
       if (item.alpha != null && item.alpha < 0.01) {
@@ -2154,15 +2162,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       if (tempVec4[3] <= 0) { item.el.style.display = 'none'; continue; }
       const ndcX = tempVec4[0] / tempVec4[3];
       const ndcY = tempVec4[1] / tempVec4[3];
-      // viewportNorm: x,y are top-left corner in CSS coords (normalized 0-1)
-      const vpX = viewportNorm.x * width;
-      const vpY = viewportNorm.y * height;
-      const vpW = viewportNorm.w * width;
-      const vpH = viewportNorm.h * height;
       // NDC x: -1 = left, +1 = right
       const screenX = vpX + (ndcX * 0.5 + 0.5) * vpW;
       // NDC y: -1 = bottom, +1 = top; CSS y: 0 = top, increases downward
       const screenY = vpY + (0.5 - ndcY * 0.5) * vpH;
+
+      // Clip labels to viewport bounds (prevents bleeding into adjacent views)
+      if (screenX < vpX + margin || screenX > vpX + vpW - margin ||
+          screenY < vpY + margin || screenY > vpY + vpH - margin) {
+        item.el.style.display = 'none';
+        continue;
+      }
+
       item.el.style.display = 'block';
       item.el.style.left = `${screenX}px`;
       item.el.style.top = `${screenY}px`;
@@ -2343,6 +2354,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       mvpMatrix,
       viewMatrix,
       modelMatrix,
+      projectionMatrix,
       pointSize: basePointSize,
       sizeAttenuation,
       viewportHeight: height,
