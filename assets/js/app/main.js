@@ -712,7 +712,7 @@ const DATASET_HASH_URL = `${EXPORT_BASE_URL}dataset_hash.json`;
        * Update edge visibility with combined filter + LOD visibility.
        * Called when filters change or LOD level changes.
        */
-      function updateEdgeVisibility() {
+      function updateEdgeVisibilityCore() {
         if (!edgesLoaded) return;
 
         // Get combined visibility (filter AND LOD)
@@ -730,6 +730,28 @@ const DATASET_HASH_URL = `${EXPORT_BASE_URL}dataset_hash.json`;
         if (connectivityCheckbox?.checked) {
           applyEdgeLodLimit();
         }
+      }
+
+      // Throttled version: executes immediately, then ignores calls for 32ms
+      // with a trailing call if any were skipped
+      let edgeVisibilityThrottleTimer = null;
+      let edgeVisibilityPending = false;
+      function updateEdgeVisibility() {
+        if (edgeVisibilityThrottleTimer) {
+          // Already throttling, mark pending for trailing execution
+          edgeVisibilityPending = true;
+          return;
+        }
+        // Execute immediately
+        updateEdgeVisibilityCore();
+        // Start throttle period
+        edgeVisibilityThrottleTimer = setTimeout(() => {
+          edgeVisibilityThrottleTimer = null;
+          if (edgeVisibilityPending) {
+            edgeVisibilityPending = false;
+            updateEdgeVisibilityCore();
+          }
+        }, 32); // ~2 frames at 60fps
       }
 
       // Update edges when filter visibility changes

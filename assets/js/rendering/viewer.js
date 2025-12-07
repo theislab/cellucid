@@ -6,7 +6,7 @@
  */
 
 import { GRID_VS_SOURCE, GRID_FS_SOURCE, LINE_INSTANCED_VS_SOURCE, LINE_INSTANCED_FS_SOURCE } from './shaders.js';
-import { createProgram, resizeCanvasToDisplaySize } from './gl-utils.js';
+import { createProgram, createCanvasResizeObserver } from './gl-utils.js';
 import { SMOKE_VS_SOURCE, SMOKE_FS_SOURCE, SMOKE_COMPOSITE_VS, SMOKE_COMPOSITE_FS } from './smoke-shaders.js';
 import { createDensityTexture3D, buildDensityVolumeGPU } from './smoke-density.js';
 import {
@@ -93,6 +93,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   }
 
   console.log('[Viewer] Using WebGL2');
+
+  // ResizeObserver-based canvas sizing to avoid per-frame layout reads
+  const canvasResizeObserver = createCanvasResizeObserver(canvas);
 
   const mat4 = glMatrix.mat4;
   const vec3 = glMatrix.vec3;
@@ -291,6 +294,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   let edgeTextureV2 = null;
   let positionTextureV2 = null;
   let visibilityTextureV2 = null;
+  let visibilityScratchBuffer = null;  // Reusable buffer to avoid allocations
   let edgeTexDimsV2 = [0, 0];
   let posTexDimsV2 = [0, 0];
   let nEdgesV2 = 0;
@@ -389,6 +393,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   const mvpMatrix = mat4.create();
   const viewProjMatrix = mat4.create();
   const invViewProjMatrix = mat4.create();
+  const tempInvViewMatrix = mat4.create();
   mat4.identity(modelMatrix);
 
   const tempVec4 = vec4.create();
@@ -403,6 +408,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   let positionsArray = null;
   let colorsArray = null;
   let transparencyArray = null;
+  let currentLoadedViewId = null; // Track which view's data is loaded in hpRenderer (for perf optimization)
   let fogNearMean = 0.0;
   let fogFarMean = 1.0;
 
@@ -1609,26 +1615,33 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   function updateVisibilityTextureV2(visibility) {
     const nCells = visibility.length;
     const [width, height] = posTexDimsV2;
+    const texelCount = width * height;
+
+    // Reuse scratch buffer if size matches, otherwise reallocate
+    if (!visibilityScratchBuffer || visibilityScratchBuffer.length !== texelCount) {
+      visibilityScratchBuffer = new Float32Array(texelCount);
+    }
+
+    // Copy visibility data and zero-pad remainder
+    for (let i = 0; i < texelCount; i++) {
+      visibilityScratchBuffer[i] = i < nCells ? visibility[i] : 0;
+    }
 
     if (!visibilityTextureV2) {
+      // First time: create texture and upload with texImage2D
       visibilityTextureV2 = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_2D, visibilityTextureV2);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, width, height, 0, gl.RED, gl.FLOAT, visibilityScratchBuffer);
     } else {
+      // Subsequent updates: use texSubImage2D (faster, no reallocation on GPU)
       gl.bindTexture(gl.TEXTURE_2D, visibilityTextureV2);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, width, height, gl.RED, gl.FLOAT, visibilityScratchBuffer);
     }
 
-    // Pad to texture size
-    const texelCount = width * height;
-    const data = new Float32Array(texelCount);
-    for (let i = 0; i < nCells && i < texelCount; i++) {
-      data[i] = visibility[i];
-    }
-
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, width, height, 0, gl.RED, gl.FLOAT, data);
     gl.bindTexture(gl.TEXTURE_2D, null);
   }
 
@@ -2174,7 +2187,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     if (projectileBufferDirty) rebuildProjectileBuffers();
     if (impactBufferDirty) rebuildImpactBuffers();
 
-    const [width, height] = resizeCanvasToDisplaySize(canvas);
+    const [width, height] = canvasResizeObserver.getSize();
 
     if (!pointCount) {
       gl.viewport(0, 0, width, height);
@@ -2237,8 +2250,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       // If we have exactly one view (e.g., live hidden with 1 snapshot), load its data
       if (allViews.length === 1) {
         const view = allViews[0];
-        if (view.colors) hpRenderer.updateColors(view.colors);
-        if (view.transparency) hpRenderer.updateAlphas(view.transparency);
+        // Only update buffers when switching views (not every frame)
+        // Live view updates are handled by state.js via viewer.updateColors/updateTransparency
+        if (view.id !== LIVE_VIEW_ID && view.id !== currentLoadedViewId) {
+          if (view.colors) hpRenderer.updateColors(view.colors);
+          if (view.transparency) hpRenderer.updateAlphas(view.transparency);
+          currentLoadedViewId = view.id;
+        }
         renderSingleView(width, height, { x: 0, y: 0, w: 1, h: 1 }, view.id, view.centroidCount);
       } else {
         renderSingleView(width, height, { x: 0, y: 0, w: 1, h: 1 });
@@ -2276,10 +2294,14 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       gl.scissor(vx, vy, vw, vh);
       gl.clear(gl.DEPTH_BUFFER_BIT);
 
-      // Load this view's data into HP renderer
-      if (view.colors && view.transparency) {
-        hpRenderer.updateColors(view.colors);
-        hpRenderer.updateAlphas(view.transparency);
+      // Check if this snapshot has a pre-uploaded GPU buffer (avoids per-frame re-upload)
+      let hasSnapshotBuffer = view.id !== LIVE_VIEW_ID && hpRenderer.hasSnapshotBuffer(view.id);
+
+      // For snapshots without GPU buffers, lazily create one (uploaded once, not per-frame)
+      // Skip live view - state.js handles updates via viewer.updateColors/updateTransparency
+      if (view.id !== LIVE_VIEW_ID && !hasSnapshotBuffer && view.colors && view.transparency) {
+        hpRenderer.createSnapshotBuffer(view.id, view.colors, view.transparency);
+        hasSnapshotBuffer = true;
       }
 
       // Load centroid data for this view (if snapshot has its own)
@@ -2291,23 +2313,21 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         gl.bufferData(gl.ARRAY_BUFFER, view.centroidColors, gl.DYNAMIC_DRAW);
       }
 
-      // Render this viewport with view-specific centroid count
-      renderSingleView(vw, vh, { x: col / cols, y: row / rows, w: 1 / cols, h: 1 / rows }, view.id, view.centroidCount);
+      // Render this viewport - use snapshot buffer if available (no data upload!)
+      const snapshotId = hasSnapshotBuffer ? view.id : null;
+      renderSingleView(vw, vh, { x: col / cols, y: row / rows, w: 1 / cols, h: 1 / rows }, view.id, view.centroidCount, snapshotId);
 
       gl.disable(gl.SCISSOR_TEST);
     }
 
-    // Restore projection matrix for full canvas aspect and live view data
+    // Restore projection matrix for full canvas aspect (no need to restore buffer data -
+    // live view uses main buffer which wasn't modified if snapshots used their own buffers)
     mat4.perspective(projectionMatrix, fov, width / height, near, far);
     mat4.multiply(mvpMatrix, projectionMatrix, viewMatrix);
     mat4.multiply(mvpMatrix, mvpMatrix, modelMatrix);
-    if (colorsArray && transparencyArray) {
-      hpRenderer.updateColors(colorsArray);
-      hpRenderer.updateAlphas(transparencyArray);
-    }
   }
 
-  function renderSingleView(width, height, viewport, viewId, overrideCentroidCount) {
+  function renderSingleView(width, height, viewport, viewId, overrideCentroidCount, snapshotBufferId = null) {
     const vid = viewId || focusedViewId || LIVE_VIEW_ID;
     const numCentroids = overrideCentroidCount !== undefined ? overrideCentroidCount : centroidCount;
 
@@ -2315,12 +2335,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     drawGrid();
 
     // Get camera position for HP renderer
-    const invView = mat4.create();
-    mat4.invert(invView, viewMatrix);
-    const cameraPosition = [invView[12], invView[13], invView[14]];
+    mat4.invert(tempInvViewMatrix, viewMatrix);
+    const cameraPosition = [tempInvViewMatrix[12], tempInvViewMatrix[13], tempInvViewMatrix[14]];
 
-    // Render scatter points with HP renderer
-    hpRenderer.render({
+    // Render params shared by both render paths
+    const renderParams = {
       mvpMatrix,
       viewMatrix,
       modelMatrix,
@@ -2335,7 +2354,14 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       lightDir,
       cameraPosition,
       cameraDistance: radius
-    });
+    };
+
+    // Render scatter points - use snapshot buffer if available (no data upload!)
+    if (snapshotBufferId) {
+      hpRenderer.renderWithSnapshot(snapshotBufferId, renderParams);
+    } else {
+      hpRenderer.render(renderParams);
+    }
 
     // Draw highlights (selection rings) on top of scatter points
     drawHighlights(height);
@@ -2568,11 +2594,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     updateColors(colors) {
       colorsArray = colors;
       hpRenderer.updateColors(colors);
+      currentLoadedViewId = LIVE_VIEW_ID; // Mark live view as loaded
     },
 
     updateTransparency(alphaArray) {
       transparencyArray = alphaArray;
       hpRenderer.updateAlphas(alphaArray);
+      currentLoadedViewId = LIVE_VIEW_ID; // Mark live view as loaded
       // Rebuild highlight buffer when visibility changes (filter applied/removed)
       if (highlightArray) {
         const positions = hpRenderer.getPositions ? hpRenderer.getPositions() : null;
@@ -3102,12 +3130,20 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         meta: config.meta || {}
       };
       snapshotViews.push(snapshot);
+
+      // Create GPU buffer for this snapshot (uploaded once, not per-frame)
+      if (snapshot.colors && hpRenderer) {
+        hpRenderer.createSnapshotBuffer(id, snapshot.colors, snapshot.transparency);
+      }
+
       return { id, label: snapshot.label };
     },
 
     updateSnapshotAttributes(id, attrs) {
       const snap = snapshotViews.find(s => s.id === id);
       if (!snap) return false;
+      const colorsChanged = !!attrs.colors;
+      const transparencyChanged = !!attrs.transparency;
       if (attrs.colors) snap.colors = new Uint8Array(attrs.colors); // RGBA uint8
       if (attrs.transparency) snap.transparency = new Float32Array(attrs.transparency);
       if (attrs.outlierQuantiles) snap.outlierQuantiles = new Float32Array(attrs.outlierQuantiles);
@@ -3117,7 +3153,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       if (typeof attrs.outlierThreshold === 'number') snap.outlierThreshold = attrs.outlierThreshold;
       if (attrs.label) snap.label = attrs.label;
       if (attrs.meta) snap.meta = { ...snap.meta, ...attrs.meta };
-      // If this is the focused view in single mode, update HP renderer
+
+      // Update snapshot's GPU buffer if colors or transparency changed
+      if ((colorsChanged || transparencyChanged) && snap.colors && hpRenderer) {
+        hpRenderer.updateSnapshotBuffer(id, snap.colors, snap.transparency);
+      }
+
+      // If this is the focused view in single mode, update HP renderer's main buffer too
       if (viewLayoutMode === 'single' && focusedViewId === id) {
         if (snap.colors) hpRenderer.updateColors(snap.colors);
         if (snap.transparency) hpRenderer.updateAlphas(snap.transparency);
@@ -3128,6 +3170,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     removeSnapshotView(id) {
       const idx = snapshotViews.findIndex(s => s.id === id);
       if (idx >= 0) {
+        // Delete GPU buffer for this snapshot
+        if (hpRenderer) {
+          hpRenderer.deleteSnapshotBuffer(id);
+        }
         snapshotViews.splice(idx, 1);
         const key = String(id);
         if (key !== LIVE_VIEW_ID) {
@@ -3140,6 +3186,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     },
 
     clearSnapshotViews() {
+      // Delete all snapshot GPU buffers
+      if (hpRenderer) {
+        hpRenderer.deleteAllSnapshotBuffers();
+      }
       snapshotViews.length = 0;
       focusedViewId = LIVE_VIEW_ID;
       for (const key of Array.from(viewCentroidLabels.keys())) {
@@ -3212,12 +3262,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     isWebGL2() { return true; },
 
     getRenderState() {
-      const [width, height] = resizeCanvasToDisplaySize(canvas);
+      const [width, height] = canvasResizeObserver.getSize();
       updateCamera(width, height);
       mat4.multiply(mvpMatrix, projectionMatrix, viewMatrix);
       mat4.multiply(mvpMatrix, mvpMatrix, modelMatrix);
-      const invView = mat4.create();
-      mat4.invert(invView, viewMatrix);
+      mat4.invert(tempInvViewMatrix, viewMatrix);
       const cameraDistance = navigationMode === 'free'
         ? vec3.length(freeflyPosition)
         : radius;

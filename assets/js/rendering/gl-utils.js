@@ -28,6 +28,42 @@ export function createProgram(gl, vsSource, fsSource) {
   return program;
 }
 
+/**
+ * Creates a ResizeObserver-based canvas size tracker to avoid per-frame layout reads.
+ * Returns an object with a getSize() method that returns cached dimensions.
+ */
+export function createCanvasResizeObserver(canvas) {
+  const dpr = window.devicePixelRatio || 1;
+  let cachedWidth = Math.floor(canvas.clientWidth * dpr);
+  let cachedHeight = Math.floor(canvas.clientHeight * dpr);
+
+  const observer = new ResizeObserver(entries => {
+    const entry = entries[0];
+    const currentDpr = window.devicePixelRatio || 1;
+    cachedWidth = Math.floor(entry.contentRect.width * currentDpr);
+    cachedHeight = Math.floor(entry.contentRect.height * currentDpr);
+  });
+  observer.observe(canvas);
+
+  return {
+    /**
+     * Returns current display size and resizes canvas if needed.
+     * No layout read occurs - uses cached values from ResizeObserver.
+     */
+    getSize() {
+      if (canvas.width !== cachedWidth || canvas.height !== cachedHeight) {
+        canvas.width = cachedWidth;
+        canvas.height = cachedHeight;
+      }
+      return [cachedWidth, cachedHeight];
+    },
+    disconnect() {
+      observer.disconnect();
+    }
+  };
+}
+
+/** @deprecated Use createCanvasResizeObserver instead to avoid per-frame layout reads */
 export function resizeCanvasToDisplaySize(canvas) {
   const dpr = window.devicePixelRatio || 1;
   const displayWidth = Math.floor(canvas.clientWidth * dpr);

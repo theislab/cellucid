@@ -17,6 +17,7 @@
 
 /**
  * Full-featured vertex shader with all lighting and fog calculations on GPU
+ * Alpha is fetched from a separate texture for efficient updates (avoids full buffer rebuild)
  */
 export const HP_VS_FULL = `#version 300 es
 precision highp float;
@@ -33,6 +34,11 @@ uniform float u_sizeAttenuation;
 uniform float u_viewportHeight;
 uniform float u_fov;
 
+// Alpha texture for efficient alpha-only updates (avoids full buffer rebuild)
+uniform sampler2D u_alphaTex;
+uniform int u_alphaTexWidth;
+uniform bool u_useAlphaTex;
+
 out vec3 v_color;
 out float v_viewDistance;
 out float v_alpha;
@@ -45,6 +51,16 @@ void main() {
   float eyeDepth = -eyePos.z;
   v_viewDistance = length(eyePos.xyz);
 
+  // Fetch alpha from texture if enabled, otherwise use vertex attribute
+  float alpha;
+  if (u_useAlphaTex && u_alphaTexWidth > 0) {
+    int y = gl_VertexID / u_alphaTexWidth;
+    int x = gl_VertexID - y * u_alphaTexWidth;
+    alpha = texelFetch(u_alphaTex, ivec2(x, y), 0).r;
+  } else {
+    alpha = a_color.a;
+  }
+
   // Perspective point size with attenuation
   float projectionFactor = u_viewportHeight / (2.0 * tan(u_fov * 0.5));
   float worldSize = u_pointSize * 0.01;
@@ -53,12 +69,12 @@ void main() {
   gl_PointSize = clamp(gl_PointSize, 0.5, 128.0);
 
   // Early discard for invisible points
-  if (a_color.a < 0.01) {
+  if (alpha < 0.01) {
     gl_PointSize = 0.0;
   }
 
   v_color = a_color.rgb;
-  v_alpha = a_color.a;
+  v_alpha = alpha;
 }
 `;
 
@@ -116,6 +132,7 @@ void main() {
 
 /**
  * LIGHTWEIGHT vertex shader - minimal calculations for maximum FPS
+ * Alpha is fetched from a separate texture for efficient updates
  */
 export const HP_VS_LIGHT = `#version 300 es
 precision highp float;
@@ -131,6 +148,11 @@ uniform float u_sizeAttenuation;
 uniform float u_viewportHeight;
 uniform float u_fov;
 
+// Alpha texture for efficient alpha-only updates
+uniform sampler2D u_alphaTex;
+uniform int u_alphaTexWidth;
+uniform bool u_useAlphaTex;
+
 out vec3 v_color;
 out float v_alpha;
 
@@ -141,16 +163,26 @@ void main() {
 
   float eyeDepth = -eyePos.z;
 
+  // Fetch alpha from texture if enabled
+  float alpha;
+  if (u_useAlphaTex && u_alphaTexWidth > 0) {
+    int y = gl_VertexID / u_alphaTexWidth;
+    int x = gl_VertexID - y * u_alphaTexWidth;
+    alpha = texelFetch(u_alphaTex, ivec2(x, y), 0).r;
+  } else {
+    alpha = a_color.a;
+  }
+
   float projectionFactor = u_viewportHeight / (2.0 * tan(u_fov * 0.5));
   float worldSize = u_pointSize * 0.01;
   float perspectiveSize = (worldSize * projectionFactor) / max(eyeDepth, 0.001);
   gl_PointSize = mix(u_pointSize, perspectiveSize, u_sizeAttenuation);
   gl_PointSize = clamp(gl_PointSize, 1.0, 192.0);
 
-  if (a_color.a < 0.01) gl_PointSize = 0.0;
+  if (alpha < 0.01) gl_PointSize = 0.0;
 
   v_color = a_color.rgb;
-  v_alpha = a_color.a;
+  v_alpha = alpha;
 }
 `;
 
@@ -194,6 +226,7 @@ void main() {
 
 /**
  * LOD vertex shader - supports variable point sizes based on aggregation level
+ * Uses alpha texture with index remapping for LOD levels
  */
 export const HP_VS_LOD = `#version 300 es
 precision highp float;
@@ -209,6 +242,15 @@ uniform float u_pointSize;
 uniform float u_viewportHeight;
 uniform float u_fov;
 
+// Alpha texture for efficient alpha-only updates
+uniform sampler2D u_alphaTex;
+uniform int u_alphaTexWidth;
+uniform bool u_useAlphaTex;
+// For LOD: maps LOD vertex index to original point index for alpha lookup
+uniform sampler2D u_lodIndexTex;
+uniform int u_lodIndexTexWidth;
+uniform bool u_useLodIndexTex;
+
 out vec3 v_color;
 out float v_viewDistance;
 out float v_alpha;
@@ -220,14 +262,35 @@ void main() {
   float eyeDepth = -eyePos.z;
   v_viewDistance = length(eyePos.xyz);
 
+  // Fetch alpha from texture if enabled
+  float alpha;
+  if (u_useAlphaTex && u_alphaTexWidth > 0) {
+    int origIdx;
+    if (u_useLodIndexTex && u_lodIndexTexWidth > 0) {
+      // LOD mode: lookup original index from index texture
+      int iy = gl_VertexID / u_lodIndexTexWidth;
+      int ix = gl_VertexID - iy * u_lodIndexTexWidth;
+      origIdx = int(texelFetch(u_lodIndexTex, ivec2(ix, iy), 0).r);
+    } else {
+      origIdx = gl_VertexID;
+    }
+    int y = origIdx / u_alphaTexWidth;
+    int x = origIdx - y * u_alphaTexWidth;
+    alpha = texelFetch(u_alphaTex, ivec2(x, y), 0).r;
+  } else {
+    alpha = a_color.a;
+  }
+
   // Size based on LOD level (aggregated points are larger)
   float projectionFactor = u_viewportHeight / (2.0 * tan(u_fov * 0.5));
   float worldSize = u_pointSize * 0.01 * a_lodSize;
   float perspectiveSize = (worldSize * projectionFactor) / max(eyeDepth, 0.001);
   gl_PointSize = clamp(perspectiveSize, 1.0, 256.0);
 
+  if (alpha < 0.01) gl_PointSize = 0.0;
+
   v_color = a_color.rgb;
-  v_alpha = a_color.a;
+  v_alpha = alpha;
 }
 `;
 

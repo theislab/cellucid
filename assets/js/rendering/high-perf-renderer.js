@@ -597,6 +597,17 @@ export class HighPerfRenderer {
       alphas: null,
     };
 
+    // Alpha texture for efficient alpha-only updates (avoids full buffer rebuild)
+    // Using a texture allows updating alpha with texSubImage2D instead of bufferData
+    this._alphaTexture = null;
+    this._alphaTexWidth = 0;
+    this._alphaTexHeight = 0;
+    this._alphaTexData = null; // Uint8Array for texture upload
+    this._useAlphaTexture = false; // Whether alpha texture is active
+
+    // LOD index textures for alpha lookup (maps LOD vertex index to original index)
+    this._lodIndexTextures = [];
+
     // LOD system
     this.octree = null;
     this.lodBuffers = [];
@@ -612,6 +623,10 @@ export class HighPerfRenderer {
     // VAO for WebGL2
     this.vao = null;
     this.lodVaos = [];
+
+    // Snapshot buffers for multi-view rendering (avoids re-uploading per frame)
+    // Map<snapshotId, { vao, buffer, pointCount }>
+    this.snapshotBuffers = new Map();
 
     // Index buffer for frustum culling (uses element array instead of copying vertex data)
     // Much faster than copying vertex data: 4 bytes/point vs 16 bytes/point
@@ -639,11 +654,24 @@ export class HighPerfRenderer {
     // Dirty flags for lazy buffer rebuilds (avoids double rebuilds)
     this._bufferDirty = false;
     this._lodBuffersDirty = false;
+    // Fast-path flag: when only alpha changed, skip position repacking
+    this._alphaOnlyDirty = false;
+    this._lodAlphaOnlyDirty = false;
 
     // Reusable ArrayBuffer to reduce GC pressure
     this._interleavedArrayBuffer = null;
     this._interleavedPositionView = null;
     this._interleavedColorView = null;
+
+    // Pooled frustum planes array (6 planes × 4 components = 24 floats) to avoid allocations
+    this._frustumPlanes = [
+      new Float32Array(4), new Float32Array(4), new Float32Array(4),
+      new Float32Array(4), new Float32Array(4), new Float32Array(4)
+    ];
+
+    // Pooled visible indices buffer for frustum culling (grows as needed)
+    this._visibleIndicesBuffer = null;
+    this._visibleIndicesCapacity = 0;
 
     this._init();
   }
@@ -746,7 +774,11 @@ export class HighPerfRenderer {
       'u_mvpMatrix', 'u_viewMatrix', 'u_modelMatrix',
       'u_pointSize', 'u_sizeAttenuation', 'u_viewportHeight', 'u_fov',
       'u_lightingStrength', 'u_fogDensity', 'u_fogNear', 'u_fogFar',
-      'u_fogColor', 'u_lightDir'
+      'u_fogColor', 'u_lightDir',
+      // Alpha texture uniforms for efficient alpha-only updates
+      'u_alphaTex', 'u_alphaTexWidth', 'u_useAlphaTex',
+      // LOD index texture uniforms (for mapping LOD vertex to original index)
+      'u_lodIndexTex', 'u_lodIndexTexWidth', 'u_useLodIndexTex'
     ];
 
     for (const name of uniformNames) {
@@ -811,6 +843,14 @@ export class HighPerfRenderer {
 
     // Create main data buffers
     this._createInterleavedBuffer(positions, colors);
+
+    // Create alpha texture for efficient alpha-only updates
+    this._createAlphaTexture(this.pointCount);
+
+    // Create LOD index textures if using LOD
+    if (this.options.USE_LOD && this.octree) {
+      this._createLODIndexTextures();
+    }
 
     const elapsed = performance.now() - startTime;
     console.log(`[HighPerfRenderer] Data loaded in ${elapsed.toFixed(1)}ms`);
@@ -882,6 +922,137 @@ export class HighPerfRenderer {
     gl.vertexAttribPointer(1, 4, gl.UNSIGNED_BYTE, true, STRIDE, 12);
 
     // Note: Alpha is now packed in color as the 4th component, no separate attribute needed
+  }
+
+  /**
+   * Create or resize the alpha texture for efficient alpha-only updates.
+   * Uses R8 format (1 byte per point) instead of rebuilding the 16-byte interleaved buffer.
+   * @param {number} pointCount - Number of points to allocate for
+   */
+  _createAlphaTexture(pointCount) {
+    const gl = this.gl;
+
+    // Calculate texture dimensions (use power-of-2 width for better GPU compatibility)
+    // Max texture size is typically 4096-16384, so we use a 2D layout
+    const maxWidth = Math.min(4096, gl.getParameter(gl.MAX_TEXTURE_SIZE));
+    this._alphaTexWidth = Math.min(pointCount, maxWidth);
+    this._alphaTexHeight = Math.ceil(pointCount / this._alphaTexWidth);
+
+    // Allocate texture data buffer (reuse if same size)
+    const requiredSize = this._alphaTexWidth * this._alphaTexHeight;
+    if (!this._alphaTexData || this._alphaTexData.length !== requiredSize) {
+      this._alphaTexData = new Uint8Array(requiredSize);
+      // Initialize to fully opaque
+      this._alphaTexData.fill(255);
+    }
+
+    // Create or reuse texture
+    if (!this._alphaTexture) {
+      this._alphaTexture = gl.createTexture();
+    }
+
+    gl.bindTexture(gl.TEXTURE_2D, this._alphaTexture);
+
+    // Use R8 format (single channel, 1 byte per texel) - WebGL2 only
+    gl.texImage2D(
+      gl.TEXTURE_2D, 0, gl.R8,
+      this._alphaTexWidth, this._alphaTexHeight, 0,
+      gl.RED, gl.UNSIGNED_BYTE, this._alphaTexData
+    );
+
+    // Use NEAREST filtering for exact texel fetch (no interpolation)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    gl.bindTexture(gl.TEXTURE_2D, null);
+
+    console.log(`[HighPerfRenderer] Created alpha texture: ${this._alphaTexWidth}x${this._alphaTexHeight} (${pointCount} points)`);
+  }
+
+  /**
+   * Update the alpha texture with new alpha values.
+   * Uses texSubImage2D for efficient partial updates (much faster than bufferData).
+   * @param {Float32Array} alphas - Alpha values (0.0-1.0) for each point
+   */
+  _updateAlphaTexture(alphas) {
+    const gl = this.gl;
+    const n = Math.min(this.pointCount, alphas.length);
+
+    // Convert float alphas to uint8 and store in texture data
+    // Using bitwise OR for fast rounding (avoids Math.round() overhead on millions of points)
+    for (let i = 0; i < n; i++) {
+      this._alphaTexData[i] = (alphas[i] * 255 + 0.5) | 0;
+    }
+
+    // Upload to texture using texSubImage2D (faster than full texImage2D)
+    gl.bindTexture(gl.TEXTURE_2D, this._alphaTexture);
+    gl.texSubImage2D(
+      gl.TEXTURE_2D, 0,
+      0, 0, this._alphaTexWidth, this._alphaTexHeight,
+      gl.RED, gl.UNSIGNED_BYTE, this._alphaTexData
+    );
+    gl.bindTexture(gl.TEXTURE_2D, null);
+
+    this._useAlphaTexture = true;
+  }
+
+  /**
+   * Create LOD index textures for alpha lookup.
+   * Each LOD level needs a texture mapping its vertex indices to original point indices.
+   */
+  _createLODIndexTextures() {
+    const gl = this.gl;
+
+    // Clean up existing textures
+    for (const tex of this._lodIndexTextures) {
+      if (tex.texture) gl.deleteTexture(tex.texture);
+    }
+    this._lodIndexTextures = [];
+
+    if (!this.octree || !this.octree.lodLevels) return;
+
+    const maxWidth = Math.min(4096, gl.getParameter(gl.MAX_TEXTURE_SIZE));
+
+    for (let lvlIdx = 0; lvlIdx < this.octree.lodLevels.length; lvlIdx++) {
+      const level = this.octree.lodLevels[lvlIdx];
+
+      if (level.isFullDetail || !level.indices) {
+        // Full detail uses gl_VertexID directly, no index texture needed
+        this._lodIndexTextures.push({ texture: null, width: 0, height: 0 });
+        continue;
+      }
+
+      const pointCount = level.indices.length;
+      const texWidth = Math.min(pointCount, maxWidth);
+      const texHeight = Math.ceil(pointCount / texWidth);
+      const texSize = texWidth * texHeight;
+
+      // Create Float32 texture to store indices (R32F format)
+      // Using float because indices can be large (> 65535)
+      const indexData = new Float32Array(texSize);
+      for (let i = 0; i < pointCount; i++) {
+        indexData[i] = level.indices[i];
+      }
+
+      const texture = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.texImage2D(
+        gl.TEXTURE_2D, 0, gl.R32F,
+        texWidth, texHeight, 0,
+        gl.RED, gl.FLOAT, indexData
+      );
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.bindTexture(gl.TEXTURE_2D, null);
+
+      this._lodIndexTextures.push({ texture, width: texWidth, height: texHeight });
+    }
+
+    console.log(`[HighPerfRenderer] Created ${this._lodIndexTextures.filter(t => t.texture).length} LOD index textures`);
   }
 
   _createLODBuffers() {
@@ -966,8 +1137,9 @@ export class HighPerfRenderer {
   }
 
   updateColors(colors) {
-    // Skip if same reference - avoids redundant buffer rebuilds every frame
-    if (colors === this._colors) return;
+    // Note: Reference check removed - callers often modify arrays in-place,
+    // so same reference doesn't mean same content.
+    if (!colors) return;
 
     this._colors = colors; // Now Uint8Array with RGBA packed
     this._currentAlphas = null; // Reset alpha tracking since colors changed
@@ -980,23 +1152,39 @@ export class HighPerfRenderer {
   }
 
   updateAlphas(alphas) {
-    // Skip if same reference - avoids redundant buffer rebuilds every frame
-    if (alphas === this._currentAlphas) return;
-
-    // Pack float alphas (0.0-1.0) into the colors array's alpha channel (RGBA uint8)
-    if (!this._colors || !alphas) return;
+    // Note: Reference check removed - callers often modify arrays in-place,
+    // so same reference doesn't mean same content.
+    if (!alphas) return;
 
     this._currentAlphas = alphas; // Track current alphas reference
+
+    // Use alpha texture for efficient updates (avoids full buffer rebuild)
+    // This is ~16x faster: uploading N bytes vs N*16 bytes
+    if (this._alphaTexture) {
+      this._updateAlphaTexture(alphas);
+      // No need to set buffer dirty flags - texture handles alpha now
+      return;
+    }
+
+    // Fallback: pack into colors array if no alpha texture (shouldn't happen normally)
+    if (!this._colors) return;
 
     const n = Math.min(this.pointCount, alphas.length);
     for (let i = 0; i < n; i++) {
       this._colors[i * 4 + 3] = Math.round(alphas[i] * 255);
     }
 
-    // Mark buffers as dirty - actual rebuild deferred to render() to avoid double rebuilds
-    this._bufferDirty = true;
-    if (this.octree && this.lodBuffers.length > 0) {
-      this._lodBuffersDirty = true;
+    // Use alpha-only fast path if buffer already exists (skip position repacking)
+    if (this._interleavedArrayBuffer) {
+      this._alphaOnlyDirty = true;
+      if (this.octree && this.lodBuffers.length > 0) {
+        this._lodAlphaOnlyDirty = true;
+      }
+    } else {
+      this._bufferDirty = true;
+      if (this.octree && this.lodBuffers.length > 0) {
+        this._lodBuffersDirty = true;
+      }
     }
   }
 
@@ -1014,13 +1202,81 @@ export class HighPerfRenderer {
    * Force immediate buffer rebuild (use sparingly, prefer letting render() handle it)
    */
   flushBufferUpdates() {
+    // Full rebuild takes precedence over alpha-only
     if (this._bufferDirty) {
       this._rebuildInterleavedBuffer();
       this._bufferDirty = false;
+      this._alphaOnlyDirty = false; // Clear alpha flag since full rebuild includes it
+    } else if (this._alphaOnlyDirty) {
+      // Fast path: only update alpha bytes, skip position repacking
+      this._updateAlphaOnly();
+      this._alphaOnlyDirty = false;
     }
+
     if (this._lodBuffersDirty) {
       this._rebuildLODBuffersWithCurrentData();
       this._lodBuffersDirty = false;
+      this._lodAlphaOnlyDirty = false;
+    } else if (this._lodAlphaOnlyDirty) {
+      this._updateLODAlphaOnly();
+      this._lodAlphaOnlyDirty = false;
+    }
+  }
+
+  /**
+   * LEGACY FALLBACK: update only alpha bytes in existing interleaved buffer.
+   * Only used if alpha texture is not available.
+   * Prefer _updateAlphaTexture() for better performance.
+   */
+  _updateAlphaOnly() {
+    const gl = this.gl;
+    const n = this.pointCount;
+    const colors = this._colors;
+    const colorView = this._interleavedColorView;
+
+    if (!colorView || !colors) return;
+
+    // Only update the alpha byte at offset 15 in each 16-byte stride
+    for (let i = 0; i < n; i++) {
+      colorView[i * 16 + 15] = colors[i * 4 + 3];
+    }
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.interleaved);
+    gl.bufferData(gl.ARRAY_BUFFER, this._interleavedArrayBuffer, gl.DYNAMIC_DRAW);
+  }
+
+  /**
+   * LEGACY FALLBACK: update only alpha bytes in LOD buffers.
+   * Only used if alpha texture is not available.
+   * Prefer _updateAlphaTexture() for better performance.
+   */
+  _updateLODAlphaOnly() {
+    const gl = this.gl;
+    const colors = this._colors;
+
+    if (!this._lodArrayBuffers) return;
+
+    for (let lvlIdx = 0; lvlIdx < this.lodBuffers.length; lvlIdx++) {
+      const lodBuf = this.lodBuffers[lvlIdx];
+      if (lodBuf.isFullDetail) continue;
+
+      const level = this.octree.lodLevels[lvlIdx];
+      if (!level || !level.indices) continue;
+
+      const cached = this._lodArrayBuffers[lvlIdx];
+      if (!cached) continue;
+
+      const colorView = cached.colorView;
+      const pointCount = level.pointCount;
+
+      // Only update the alpha byte using original indices
+      for (let i = 0; i < pointCount; i++) {
+        const origIdx = level.indices[i];
+        colorView[i * 16 + 15] = colors[origIdx * 4 + 3];
+      }
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, lodBuf.buffer);
+      gl.bufferData(gl.ARRAY_BUFFER, cached.buffer, gl.DYNAMIC_DRAW);
     }
   }
 
@@ -1182,17 +1438,47 @@ export class HighPerfRenderer {
 
   extractFrustumPlanes(mvpMatrix, margin = 0.05) {
     const m = mvpMatrix;
-    const planes = [];
+    // Reuse pre-allocated planes array to avoid GC allocations every frame
+    const planes = this._frustumPlanes;
 
-    // Left, Right, Bottom, Top, Near, Far
-    planes.push([m[3] + m[0], m[7] + m[4], m[11] + m[8], m[15] + m[12]]);
-    planes.push([m[3] - m[0], m[7] - m[4], m[11] - m[8], m[15] - m[12]]);
-    planes.push([m[3] + m[1], m[7] + m[5], m[11] + m[9], m[15] + m[13]]);
-    planes.push([m[3] - m[1], m[7] - m[5], m[11] - m[9], m[15] - m[13]]);
-    planes.push([m[3] + m[2], m[7] + m[6], m[11] + m[10], m[15] + m[14]]);
-    planes.push([m[3] - m[2], m[7] - m[6], m[11] - m[10], m[15] - m[14]]);
+    // Left plane
+    planes[0][0] = m[3] + m[0];
+    planes[0][1] = m[7] + m[4];
+    planes[0][2] = m[11] + m[8];
+    planes[0][3] = m[15] + m[12];
 
-    for (let i = 0; i < planes.length; i++) {
+    // Right plane
+    planes[1][0] = m[3] - m[0];
+    planes[1][1] = m[7] - m[4];
+    planes[1][2] = m[11] - m[8];
+    planes[1][3] = m[15] - m[12];
+
+    // Bottom plane
+    planes[2][0] = m[3] + m[1];
+    planes[2][1] = m[7] + m[5];
+    planes[2][2] = m[11] + m[9];
+    planes[2][3] = m[15] + m[13];
+
+    // Top plane
+    planes[3][0] = m[3] - m[1];
+    planes[3][1] = m[7] - m[5];
+    planes[3][2] = m[11] - m[9];
+    planes[3][3] = m[15] - m[13];
+
+    // Near plane
+    planes[4][0] = m[3] + m[2];
+    planes[4][1] = m[7] + m[6];
+    planes[4][2] = m[11] + m[10];
+    planes[4][3] = m[15] + m[14];
+
+    // Far plane
+    planes[5][0] = m[3] - m[2];
+    planes[5][1] = m[7] - m[6];
+    planes[5][2] = m[11] - m[10];
+    planes[5][3] = m[15] - m[14];
+
+    // Normalize planes and apply margin
+    for (let i = 0; i < 6; i++) {
       const plane = planes[i];
       const len = Math.sqrt(plane[0] * plane[0] + plane[1] * plane[1] + plane[2] * plane[2]);
       if (len > 0) {
@@ -1233,7 +1519,7 @@ export class HighPerfRenderer {
 
     // Flush any pending buffer updates (deferred from updateColors/updateAlphas)
     // This ensures we only rebuild once even if both were called
-    if (this._bufferDirty || this._lodBuffersDirty) {
+    if (this._bufferDirty || this._lodBuffersDirty || this._alphaOnlyDirty || this._lodAlphaOnlyDirty) {
       this.flushBufferUpdates();
     }
 
@@ -1352,23 +1638,32 @@ export class HighPerfRenderer {
         return;
       }
 
-      // Count total visible points first to pre-allocate
+      // Count total visible points first to determine buffer size
       let totalVisible = 0;
       for (const node of visibleNodes) {
         if (node.indices) totalVisible += node.indices.length;
       }
 
-      // Pre-allocate typed array for better performance with millions of points
-      const visibleIndices = new Uint32Array(totalVisible);
+      // Reuse pooled buffer, only grow when capacity exceeded (avoids GC allocations)
+      if (!this._visibleIndicesBuffer || this._visibleIndicesCapacity < totalVisible) {
+        // Grow with 25% headroom to reduce future reallocations
+        this._visibleIndicesCapacity = Math.ceil(totalVisible * 1.25);
+        this._visibleIndicesBuffer = new Uint32Array(this._visibleIndicesCapacity);
+      }
+
+      // Fill the pooled buffer with visible indices
       let writeOffset = 0;
       for (const node of visibleNodes) {
         if (node.indices) {
-          visibleIndices.set(node.indices, writeOffset);
+          this._visibleIndicesBuffer.set(node.indices, writeOffset);
           writeOffset += node.indices.length;
         }
       }
 
-      const visibleRatio = visibleIndices.length / this.pointCount;
+      // Create a view of only the used portion (no allocation, just a view)
+      const visibleIndices = this._visibleIndicesBuffer.subarray(0, totalVisible);
+
+      const visibleRatio = totalVisible / this.pointCount;
       const cullPercent = ((1 - visibleRatio) * 100);
       const visibleCount = visibleIndices.length;
 
@@ -1452,6 +1747,11 @@ export class HighPerfRenderer {
       gl.uniform3fv(uniforms.u_lightDir, lightDir);
     }
 
+    // Bind alpha texture for efficient alpha lookups
+    // Note: With indexed drawing (drawElements), gl_VertexID is the index value,
+    // which correctly maps to the original point index in our alpha texture
+    this._bindAlphaTexture(gl, uniforms);
+
     // Bind the main VAO (vertex data) and the index buffer for indexed drawing
     gl.bindVertexArray(this.vao);
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
@@ -1460,6 +1760,10 @@ export class HighPerfRenderer {
     gl.drawElements(gl.POINTS, this._cachedCulledCount, gl.UNSIGNED_INT, 0);
 
     gl.bindVertexArray(null);
+
+    // Unbind alpha texture
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, null);
 
     this.stats.visiblePoints = this._cachedCulledCount;
     this.stats.lodLevel = -1;
@@ -1631,6 +1935,9 @@ export class HighPerfRenderer {
       gl.uniform3fv(uniforms.u_lightDir, lightDir);
     }
 
+    // Bind alpha texture for efficient alpha lookups (texture unit 0)
+    this._bindAlphaTexture(gl, uniforms);
+
     // Bind VAO
     gl.bindVertexArray(this.vao);
 
@@ -1639,9 +1946,65 @@ export class HighPerfRenderer {
 
     gl.bindVertexArray(null);
 
+    // Unbind alpha texture
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+
     this.stats.visiblePoints = this.pointCount;
     this.stats.lodLevel = -1;
     this.stats.drawCalls = 1;
+  }
+
+  /**
+   * Bind alpha texture and set uniforms for alpha texture lookup.
+   * @param {WebGL2RenderingContext} gl
+   * @param {Object} uniforms - Cached uniform locations
+   * @param {number} [lodLevel=-1] - LOD level for index texture binding (-1 for full detail)
+   */
+  _bindAlphaTexture(gl, uniforms, lodLevel = -1) {
+    // Bind alpha texture to texture unit 0
+    if (this._useAlphaTexture && this._alphaTexture) {
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this._alphaTexture);
+      if (uniforms.u_alphaTex !== null) {
+        gl.uniform1i(uniforms.u_alphaTex, 0); // Texture unit 0
+      }
+      if (uniforms.u_alphaTexWidth !== null) {
+        gl.uniform1i(uniforms.u_alphaTexWidth, this._alphaTexWidth);
+      }
+      if (uniforms.u_useAlphaTex !== null) {
+        gl.uniform1i(uniforms.u_useAlphaTex, 1); // true
+      }
+
+      // Bind LOD index texture if rendering LOD level (texture unit 1)
+      if (lodLevel >= 0 && this._lodIndexTextures[lodLevel]?.texture) {
+        const lodIdxTex = this._lodIndexTextures[lodLevel];
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, lodIdxTex.texture);
+        if (uniforms.u_lodIndexTex !== null) {
+          gl.uniform1i(uniforms.u_lodIndexTex, 1); // Texture unit 1
+        }
+        if (uniforms.u_lodIndexTexWidth !== null) {
+          gl.uniform1i(uniforms.u_lodIndexTexWidth, lodIdxTex.width);
+        }
+        if (uniforms.u_useLodIndexTex !== null) {
+          gl.uniform1i(uniforms.u_useLodIndexTex, 1); // true
+        }
+      } else {
+        // No LOD index texture needed
+        if (uniforms.u_useLodIndexTex !== null) {
+          gl.uniform1i(uniforms.u_useLodIndexTex, 0); // false
+        }
+      }
+    } else {
+      // Alpha texture not active - use vertex attribute alpha
+      if (uniforms.u_useAlphaTex !== null) {
+        gl.uniform1i(uniforms.u_useAlphaTex, 0); // false
+      }
+      if (uniforms.u_useLodIndexTex !== null) {
+        gl.uniform1i(uniforms.u_useLodIndexTex, 0); // false
+      }
+    }
   }
 
   _renderLOD(lodLevel, params) {
@@ -1711,12 +2074,21 @@ export class HighPerfRenderer {
       gl.uniform3fv(uniforms.u_lightDir, lightDir);
     }
 
+    // Bind alpha texture with LOD index texture for proper alpha lookup
+    this._bindAlphaTexture(gl, uniforms, lodLevel);
+
     // Bind VAO
     gl.bindVertexArray(lod.vao);
 
     gl.drawArrays(gl.POINTS, 0, lod.pointCount);
 
     gl.bindVertexArray(null);
+
+    // Unbind textures
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, null);
 
     this.stats.visiblePoints = lod.pointCount;
     this.stats.lodLevel = lodLevel;
@@ -1861,6 +2233,255 @@ export class HighPerfRenderer {
     return this._cachedLodVisibility;
   }
 
+  // ===========================================================================
+  // SNAPSHOT BUFFER MANAGEMENT (for multi-view rendering without re-uploads)
+  // ===========================================================================
+
+  /**
+   * Create a GPU buffer for a snapshot view. Call this once when snapshot is created.
+   * The buffer stores interleaved position+color data and is only uploaded once.
+   * @param {string} id - Unique snapshot identifier
+   * @param {Uint8Array} colors - RGBA colors (4 bytes per point)
+   * @param {Float32Array} [alphas] - Optional alpha values (0-1), merged into colors
+   * @returns {boolean} Success
+   */
+  createSnapshotBuffer(id, colors, alphas = null) {
+    if (!this._positions || this.pointCount === 0) {
+      console.warn('[HighPerfRenderer] Cannot create snapshot buffer: no data loaded');
+      return false;
+    }
+
+    const gl = this.gl;
+    const n = this.pointCount;
+    const positions = this._positions;
+
+    // Create a copy of colors to avoid modifying the original
+    const snapshotColors = new Uint8Array(colors);
+
+    // Merge alphas into the color array if provided
+    if (alphas) {
+      const alphaCount = Math.min(n, alphas.length);
+      for (let i = 0; i < alphaCount; i++) {
+        snapshotColors[i * 4 + 3] = Math.round(alphas[i] * 255);
+      }
+    }
+
+    // Build interleaved buffer: [x,y,z (float32), r,g,b,a (uint8)] = 16 bytes per point
+    const buffer = new ArrayBuffer(n * 16);
+    const positionView = new Float32Array(buffer);
+    const colorView = new Uint8Array(buffer);
+
+    for (let i = 0; i < n; i++) {
+      const srcIdx = i * 3;
+      const floatOffset = i * 4;
+      const byteOffset = i * 16 + 12;
+
+      positionView[floatOffset] = positions[srcIdx];
+      positionView[floatOffset + 1] = positions[srcIdx + 1];
+      positionView[floatOffset + 2] = positions[srcIdx + 2];
+
+      const colorSrcIdx = i * 4;
+      colorView[byteOffset] = snapshotColors[colorSrcIdx];
+      colorView[byteOffset + 1] = snapshotColors[colorSrcIdx + 1];
+      colorView[byteOffset + 2] = snapshotColors[colorSrcIdx + 2];
+      colorView[byteOffset + 3] = snapshotColors[colorSrcIdx + 3];
+    }
+
+    // Delete existing buffer if updating
+    if (this.snapshotBuffers.has(id)) {
+      this.deleteSnapshotBuffer(id);
+    }
+
+    // Create GPU buffer
+    const glBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, glBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, buffer, gl.STATIC_DRAW);
+
+    // Create VAO for this snapshot
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+
+    const STRIDE = 16;
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, STRIDE, 0);
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 4, gl.UNSIGNED_BYTE, true, STRIDE, 12);
+
+    gl.bindVertexArray(null);
+
+    this.snapshotBuffers.set(id, {
+      vao,
+      buffer: glBuffer,
+      pointCount: n
+    });
+
+    console.log(`[HighPerfRenderer] Created snapshot buffer "${id}" (${n.toLocaleString()} points, ${(n * 16 / 1024 / 1024).toFixed(1)} MB)`);
+    return true;
+  }
+
+  /**
+   * Update an existing snapshot buffer with new colors/alphas.
+   * More efficient than delete+create as it reuses the GPU buffer.
+   * @param {string} id - Snapshot identifier
+   * @param {Uint8Array} colors - RGBA colors
+   * @param {Float32Array} [alphas] - Optional alpha values
+   * @returns {boolean} Success
+   */
+  updateSnapshotBuffer(id, colors, alphas = null) {
+    const snapshot = this.snapshotBuffers.get(id);
+    if (!snapshot) {
+      // Create new buffer if it doesn't exist
+      return this.createSnapshotBuffer(id, colors, alphas);
+    }
+
+    const gl = this.gl;
+    const n = this.pointCount;
+    const positions = this._positions;
+
+    // Create merged colors
+    const snapshotColors = new Uint8Array(colors);
+    if (alphas) {
+      const alphaCount = Math.min(n, alphas.length);
+      for (let i = 0; i < alphaCount; i++) {
+        snapshotColors[i * 4 + 3] = Math.round(alphas[i] * 255);
+      }
+    }
+
+    // Rebuild interleaved data
+    const buffer = new ArrayBuffer(n * 16);
+    const positionView = new Float32Array(buffer);
+    const colorView = new Uint8Array(buffer);
+
+    for (let i = 0; i < n; i++) {
+      const srcIdx = i * 3;
+      const floatOffset = i * 4;
+      const byteOffset = i * 16 + 12;
+
+      positionView[floatOffset] = positions[srcIdx];
+      positionView[floatOffset + 1] = positions[srcIdx + 1];
+      positionView[floatOffset + 2] = positions[srcIdx + 2];
+
+      const colorSrcIdx = i * 4;
+      colorView[byteOffset] = snapshotColors[colorSrcIdx];
+      colorView[byteOffset + 1] = snapshotColors[colorSrcIdx + 1];
+      colorView[byteOffset + 2] = snapshotColors[colorSrcIdx + 2];
+      colorView[byteOffset + 3] = snapshotColors[colorSrcIdx + 3];
+    }
+
+    // Update existing buffer
+    gl.bindBuffer(gl.ARRAY_BUFFER, snapshot.buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, buffer, gl.STATIC_DRAW);
+
+    return true;
+  }
+
+  /**
+   * Delete a snapshot's GPU resources.
+   * @param {string} id - Snapshot identifier
+   */
+  deleteSnapshotBuffer(id) {
+    const snapshot = this.snapshotBuffers.get(id);
+    if (!snapshot) return;
+
+    const gl = this.gl;
+    if (snapshot.buffer) gl.deleteBuffer(snapshot.buffer);
+    if (snapshot.vao) gl.deleteVertexArray(snapshot.vao);
+
+    this.snapshotBuffers.delete(id);
+    console.log(`[HighPerfRenderer] Deleted snapshot buffer "${id}"`);
+  }
+
+  /**
+   * Delete all snapshot buffers. Call when clearing all snapshots.
+   */
+  deleteAllSnapshotBuffers() {
+    for (const id of this.snapshotBuffers.keys()) {
+      this.deleteSnapshotBuffer(id);
+    }
+  }
+
+  /**
+   * Check if a snapshot buffer exists.
+   * @param {string} id - Snapshot identifier
+   * @returns {boolean}
+   */
+  hasSnapshotBuffer(id) {
+    return this.snapshotBuffers.has(id);
+  }
+
+  /**
+   * Render using a snapshot's pre-uploaded buffer. No data upload occurs.
+   * @param {string} id - Snapshot identifier
+   * @param {Object} params - Render parameters (same as render())
+   * @returns {Object} Stats
+   */
+  renderWithSnapshot(id, params) {
+    const snapshot = this.snapshotBuffers.get(id);
+    if (!snapshot) {
+      console.warn(`[HighPerfRenderer] Snapshot buffer "${id}" not found, falling back to main buffer`);
+      return this.render(params);
+    }
+
+    const gl = this.gl;
+    const {
+      mvpMatrix, viewMatrix, modelMatrix,
+      pointSize = 5.0, sizeAttenuation = 0.0, viewportHeight, fov,
+      lightingStrength = 0.6, fogDensity = 0.5,
+      fogColor = [1, 1, 1], lightDir = [0.5, 0.7, 0.5],
+      cameraPosition = [0, 0, 3], quality = this.activeQuality
+    } = params;
+
+    const frameStart = performance.now();
+
+    // Auto-compute fog range
+    if (params.autoFog !== false) {
+      this.autoComputeFogRange(cameraPosition);
+    }
+
+    // Set quality if changed
+    if (quality !== this.activeQuality) {
+      this.setQuality(quality);
+    }
+
+    const program = this.activeProgram;
+    const uniforms = this.uniformLocations.get(this.activeQuality);
+
+    if (!program || !uniforms) {
+      console.error('[HighPerfRenderer] No program/uniforms for snapshot render');
+      return this.stats;
+    }
+
+    gl.useProgram(program);
+
+    // Set uniforms
+    if (uniforms.u_mvpMatrix !== null) gl.uniformMatrix4fv(uniforms.u_mvpMatrix, false, mvpMatrix);
+    if (uniforms.u_viewMatrix !== null) gl.uniformMatrix4fv(uniforms.u_viewMatrix, false, viewMatrix);
+    if (uniforms.u_modelMatrix !== null) gl.uniformMatrix4fv(uniforms.u_modelMatrix, false, modelMatrix);
+    if (uniforms.u_pointSize !== null) gl.uniform1f(uniforms.u_pointSize, pointSize);
+    if (uniforms.u_sizeAttenuation !== null) gl.uniform1f(uniforms.u_sizeAttenuation, sizeAttenuation);
+    if (uniforms.u_viewportHeight !== null) gl.uniform1f(uniforms.u_viewportHeight, viewportHeight);
+    if (uniforms.u_fov !== null) gl.uniform1f(uniforms.u_fov, fov);
+    if (uniforms.u_lightingStrength !== null) gl.uniform1f(uniforms.u_lightingStrength, lightingStrength);
+    if (uniforms.u_fogDensity !== null) gl.uniform1f(uniforms.u_fogDensity, fogDensity);
+    if (uniforms.u_fogNear !== null) gl.uniform1f(uniforms.u_fogNear, this.fogNear);
+    if (uniforms.u_fogFar !== null) gl.uniform1f(uniforms.u_fogFar, this.fogFar);
+    if (uniforms.u_fogColor !== null) gl.uniform3fv(uniforms.u_fogColor, fogColor);
+    if (uniforms.u_lightDir !== null) gl.uniform3fv(uniforms.u_lightDir, lightDir);
+
+    // Bind snapshot's VAO (no data upload!)
+    gl.bindVertexArray(snapshot.vao);
+    gl.drawArrays(gl.POINTS, 0, snapshot.pointCount);
+    gl.bindVertexArray(null);
+
+    this.stats.visiblePoints = snapshot.pointCount;
+    this.stats.lodLevel = -1;
+    this.stats.drawCalls = 1;
+    this.stats.lastFrameTime = performance.now() - frameStart;
+    this.stats.fps = Math.round(1000 / Math.max(this.stats.lastFrameTime, 1));
+
+    return this.stats;
+  }
+
   dispose() {
     const gl = this.gl;
 
@@ -1878,6 +2499,9 @@ export class HighPerfRenderer {
       gl.deleteVertexArray(vao);
     }
 
+    // Clean up snapshot buffers
+    this.deleteAllSnapshotBuffers();
+
     for (const program of Object.values(this.programs)) {
       if (program) gl.deleteProgram(program);
     }
@@ -1893,6 +2517,20 @@ export class HighPerfRenderer {
     this._interleavedPositionView = null;
     this._interleavedColorView = null;
     this._lodArrayBuffers = null;
+
+    // Clean up alpha texture
+    if (this._alphaTexture) {
+      gl.deleteTexture(this._alphaTexture);
+      this._alphaTexture = null;
+    }
+    this._alphaTexData = null;
+    this._useAlphaTexture = false;
+
+    // Clean up LOD index textures
+    for (const tex of this._lodIndexTextures) {
+      if (tex.texture) gl.deleteTexture(tex.texture);
+    }
+    this._lodIndexTextures = [];
   }
 }
 
