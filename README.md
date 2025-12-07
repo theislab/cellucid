@@ -38,6 +38,7 @@ open http://localhost:8000/index.html
 ## Hosting tips
 - Pre-compress `assets/exports/*` with gzip/Brotli and configure your server to send `Content-Encoding`.
 - Keep `assets/exports/` outside of version control; the repo ignores it by default.
+- Static hosts that disable directory listings (e.g., GitHub Pages) need a `assets/exports/state-snapshots.json` manifest listing your state files so auto-restore can find them.
 
 ## Contributing
 This repository is intentionally buildless and self-contained. If you update the UI or rendering code, keep paths rooted under `assets/` and avoid adding runtime build steps so the site stays portable. Data preparation and Python code should live in the companion `theislab/cellucid-data` repository.

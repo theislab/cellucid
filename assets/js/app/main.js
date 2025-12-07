@@ -12,8 +12,7 @@ import {
   loadVarFieldData,
   loadConnectivityManifest,
   hasEdgeFormat,
-  loadEdges,
-  loadDatasetSignature
+  loadEdges
 } from '../data/data-loaders.js';
 import { SyntheticDataGenerator, PerformanceTracker, BenchmarkReporter, formatNumber } from '../dev/benchmark.js';
 
@@ -24,7 +23,6 @@ const OBS_MANIFEST_URL = `${EXPORT_BASE_URL}obs_manifest.json`;
 const VAR_MANIFEST_URL = `${EXPORT_BASE_URL}var_manifest.json`;
 const CONNECTIVITY_MANIFEST_URL = `${EXPORT_BASE_URL}connectivity_manifest.json`;
 const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
-const DATASET_HASH_URL = `${EXPORT_BASE_URL}dataset_hash.json`;
 
 (async function bootstrap() {
   const canvas = document.getElementById('glcanvas');
@@ -133,17 +131,6 @@ const DATASET_HASH_URL = `${EXPORT_BASE_URL}dataset_hash.json`;
   const loadStateBtn = document.getElementById('load-state-btn');
   const sessionStatus = document.getElementById('session-status');
 
-  // Dataset signature for clash detection
-  let datasetSignature = null;
-  try {
-    datasetSignature = await loadDatasetSignature(DATASET_HASH_URL);
-    if (!datasetSignature?.signature) {
-      console.warn('[Main] dataset_hash.json missing or empty; state clash detection will be skipped.');
-    }
-  } catch (err) {
-    console.warn('[Main] Failed to load dataset signature:', err);
-  }
-
   try {
     console.log('[Main] Creating viewer...');
     const viewer = createViewer({ canvas, labelLayer, viewTitleLayer, sidebar });
@@ -227,7 +214,7 @@ const DATASET_HASH_URL = `${EXPORT_BASE_URL}dataset_hash.json`;
     // Smoke volume is built lazily when switching to smoke mode
     // (no initial build to save startup time)
 
-    const stateSerializer = createStateSerializer({ state, viewer, sidebar, datasetSignature });
+    const stateSerializer = createStateSerializer({ state, viewer, sidebar });
 
     const ui = initUI({
       state,
@@ -344,6 +331,46 @@ const DATASET_HASH_URL = `${EXPORT_BASE_URL}dataset_hash.json`;
         }
       };
 
+      // Prefer an explicit manifest so we don't depend on directory listings (which are disabled on GitHub Pages)
+      // Try the explicit manifest we ship with data; avoid probing non-existent alternates to keep consoles clean
+      const manifestNames = ['state-snapshots.json'];
+      let manifestFound = false;
+      for (const manifestName of manifestNames) {
+        const manifestUrl = resolveCandidate(manifestName);
+        try {
+          const res = await fetch(manifestUrl);
+          if (!res.ok) continue;
+          const payload = await res.json();
+          const entries = Array.isArray(payload)
+            ? payload
+            : payload?.states || payload?.files || payload?.snapshots || [];
+          if (!Array.isArray(entries)) continue;
+          manifestFound = true;
+
+          entries.forEach((entry) => {
+            const entryPath = typeof entry === 'string'
+              ? entry
+              : entry?.url || entry?.path || entry?.href || entry?.name;
+            if (!entryPath) return;
+            const filename = entryPath.split('/').pop() || '';
+            if (!stateRegex.test(filename)) return;
+            candidates.add(resolveCandidate(entryPath, res.url));
+          });
+        } catch (err) {
+          console.warn('[Main] Could not load state manifest:', manifestUrl, err);
+        }
+      }
+
+      // If manifest provided entries, return them without probing missing defaults
+      if (manifestFound && candidates.size > 0) {
+        const sorted = Array.from(candidates).sort();
+        const filtered = sorted.filter((url) => {
+          const name = url.split('/').pop() || '';
+          return !/state[-_]?snapshots\.json$/i.test(name) && !/state[-_]?manifest\.json$/i.test(name);
+        });
+        return filtered.length ? filtered : sorted;
+      }
+
       try {
         const res = await fetch(baseUrl);
         if (res.ok) {
@@ -363,27 +390,35 @@ const DATASET_HASH_URL = `${EXPORT_BASE_URL}dataset_hash.json`;
       }
 
       const fallbackNames = ['cellucid-state.json', 'state.json'];
-      for (const name of fallbackNames) {
-        const candidateUrl = resolveCandidate(name);
-        if (candidates.has(candidateUrl)) continue;
-        try {
-          const headResp = await fetch(candidateUrl, { method: 'HEAD' });
-          if (headResp.ok) {
-            candidates.add(candidateUrl);
-            continue;
-          }
-          if (headResp.status === 405 || headResp.status === 501) {
-            const getResp = await fetch(candidateUrl);
-            if (getResp.ok) {
+      if (candidates.size === 0) {
+        for (const name of fallbackNames) {
+          const candidateUrl = resolveCandidate(name);
+          if (candidates.has(candidateUrl)) continue;
+          try {
+            const headResp = await fetch(candidateUrl, { method: 'HEAD' });
+            if (headResp.ok) {
               candidates.add(candidateUrl);
+              continue;
             }
+            if (headResp.status === 405 || headResp.status === 501) {
+              const getResp = await fetch(candidateUrl);
+              if (getResp.ok) {
+                candidates.add(candidateUrl);
+              }
+            }
+          } catch (_err) {
+            // Ignore missing files or servers that disallow HEAD
           }
-        } catch (_err) {
-          // Ignore missing files or servers that disallow HEAD
         }
       }
 
-      return Array.from(candidates).sort();
+      // Prefer real snapshot files over manifest/metadata files when multiple matches exist
+      const sorted = Array.from(candidates).sort();
+      const filtered = sorted.filter((url) => {
+        const name = url.split('/').pop() || '';
+        return !/state[-_]?snapshots\.json$/i.test(name) && !/state[-_]?manifest\.json$/i.test(name);
+      });
+      return filtered.length ? filtered : sorted;
     }
 
     async function autoLoadLatestState() {
@@ -842,6 +877,7 @@ const DATASET_HASH_URL = `${EXPORT_BASE_URL}dataset_hash.json`;
     const benchmarkReportBtn = document.getElementById('benchmark-report-btn');
     const benchmarkReportOutput = document.getElementById('benchmark-report-output');
     const benchmarkReportStatus = document.getElementById('benchmark-report-status');
+    const benchmarkSection = document.getElementById('benchmark-section');
     const benchPointsEl = document.getElementById('bench-points');
     const benchFpsEl = document.getElementById('bench-fps');
     const benchFrametimeEl = document.getElementById('bench-frametime');
@@ -1004,11 +1040,23 @@ const DATASET_HASH_URL = `${EXPORT_BASE_URL}dataset_hash.json`;
       }
     };
 
-    // Kick off benchmarking HUD for real data once base dataset is loaded
+    const stopPerfMonitoring = () => {
+      benchmarkActive = false;
+      perfTracker.stop();
+      if (perfLoopHandle) {
+        cancelAnimationFrame(perfLoopHandle);
+        perfLoopHandle = null;
+      }
+    };
+
+    const activateBenchmarkingPanel = ({ resetTracker = false } = {}) => {
+      renderBenchmarkStats(null, viewer.getRendererStats(), buildDatasetSnapshot());
+      startPerfMonitoring({ resetTracker });
+    };
+
+    // Initialize benchmarking state for real data; monitoring starts when the benchmarking accordion opens
     activeDatasetMode = 'real';
     syntheticDatasetInfo = null;
-    renderBenchmarkStats(null, viewer.getRendererStats(), buildDatasetSnapshot());
-    startPerfMonitoring({ resetTracker: true });
 
     // Shader quality change
     if (hpShaderQuality) {
@@ -1049,6 +1097,16 @@ const DATASET_HASH_URL = `${EXPORT_BASE_URL}dataset_hash.json`;
           hpLodForceLabel.textContent = val < 0 ? 'Auto' : String(val);
         }
         viewer.setForceLOD(val);
+      });
+    }
+
+    if (benchmarkSection) {
+      benchmarkSection.addEventListener('toggle', () => {
+        if (benchmarkSection.open) {
+          activateBenchmarkingPanel({ resetTracker: true });
+        } else {
+          stopPerfMonitoring();
+        }
       });
     }
 
@@ -1147,8 +1205,7 @@ const DATASET_HASH_URL = `${EXPORT_BASE_URL}dataset_hash.json`;
       const gpuMemMB = (pointCount * 28 / 1024 / 1024).toFixed(1);
 
       // Refresh stat panel immediately and start perf tracking loop
-      renderBenchmarkStats(null, viewer.getRendererStats(), buildDatasetSnapshot());
-      startPerfMonitoring({ resetTracker: true });
+      activateBenchmarkingPanel({ resetTracker: true });
 
       console.log(`Benchmark loaded: ${formatNumber(pointCount)} points, ~${gpuMemMB}MB GPU memory (gen: ${genTime}ms)`);
     }

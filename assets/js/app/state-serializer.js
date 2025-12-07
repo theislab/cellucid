@@ -22,45 +22,9 @@ function colorsEqual(a, b, epsilon = 1e-4) {
          Math.abs(a[2] - b[2]) < epsilon;
 }
 
-export function createStateSerializer({ state, viewer, sidebar, datasetSignature }) {
+export function createStateSerializer({ state, viewer, sidebar }) {
   // v3: multiview restore, full filter capture, stronger post-restore syncing
   const VERSION = 3;
-  const currentDatasetSignature =
-    datasetSignature?.signature || datasetSignature?.signature_sha256 || datasetSignature?.hash || null;
-  const currentDatasetSummary =
-    datasetSignature?.summary || datasetSignature?.details?.summary || datasetSignature?.details || null;
-  const currentDatasetDetails = datasetSignature?.details || datasetSignature || null;
-
-  function extractSummary(summary) {
-    if (!summary) return null;
-    if (summary.summary) return summary.summary;
-    return summary;
-  }
-
-  function buildDatasetMismatchMessage(savedSummary, liveSummary) {
-    const saved = extractSummary(savedSummary) || {};
-    const live = extractSummary(liveSummary) || {};
-    const diffs = [];
-    if (saved.n_cells != null && live.n_cells != null && saved.n_cells !== live.n_cells) {
-      diffs.push(`cell count differs (state ${saved.n_cells} vs current ${live.n_cells})`);
-    }
-    if (saved.obs_fields_hash && live.obs_fields_hash && saved.obs_fields_hash !== live.obs_fields_hash) {
-      diffs.push('obs fields differ');
-    }
-    if (saved.gene_list_hash && live.gene_list_hash && saved.gene_list_hash !== live.gene_list_hash) {
-      diffs.push('gene list differs');
-    }
-    if (saved.compression !== undefined && live.compression !== undefined && saved.compression !== live.compression) {
-      diffs.push('compression settings differ');
-    }
-    if (saved.connectivity_edges != null && live.connectivity_edges != null && saved.connectivity_edges !== live.connectivity_edges) {
-      diffs.push('connectivity edge counts differ');
-    }
-    const reason = diffs.length
-      ? diffs.join('; ')
-      : 'dataset signatures do not match';
-    return `${reason}. Compare dataset_hash.json files for full context.`;
-  }
 
   /**
    * Determine if a categorical field has been modified from defaults
@@ -230,27 +194,39 @@ export function createStateSerializer({ state, viewer, sidebar, datasetSignature
 
     try {
       if (data.type === 'checkbox' && el.type === 'checkbox') {
-        el.checked = data.checked;
-        el.dispatchEvent(new Event('change', { bubbles: true }));
+        // Avoid dispatching change events if state is already in sync (saves expensive recomputations)
+        if (el.checked !== data.checked) {
+          el.checked = data.checked;
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        }
       } else if (data.type === 'select' && el.tagName === 'SELECT') {
         // Check if the option exists
         const optionExists = Array.from(el.options).some(opt => opt.value === data.value);
         if (optionExists) {
-          el.value = data.value;
-          el.dispatchEvent(new Event('change', { bubbles: true }));
+          if (el.value !== data.value) {
+            el.value = data.value;
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+          }
         } else {
           console.warn(`[StateSerializer] Option '${data.value}' not found in select '${id}'`);
         }
       } else if ((data.type === 'range' || data.type === 'number') && el.type === data.type) {
-        el.value = data.value;
-        el.dispatchEvent(new Event('input', { bubbles: true }));
+        const nextValue = String(data.value);
+        if (el.value !== nextValue) {
+          el.value = nextValue;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+        }
       } else if (data.type === 'color' && el.type === 'color') {
-        el.value = data.value;
-        el.dispatchEvent(new Event('input', { bubbles: true }));
+        if (el.value !== data.value) {
+          el.value = data.value;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+        }
       } else if (data.type === 'text' && (el.type === 'text' || el.type === 'search')) {
-        el.value = data.value;
-        // Also dispatch input event for search fields that might have handlers
-        el.dispatchEvent(new Event('input', { bubbles: true }));
+        if (el.value !== data.value) {
+          el.value = data.value;
+          // Also dispatch input event for search fields that might have handlers
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+        }
       }
     } catch (err) {
       console.error(`[StateSerializer] Error restoring control '${id}':`, err);
@@ -441,74 +417,205 @@ export function createStateSerializer({ state, viewer, sidebar, datasetSignature
       activePageName,
       filters: serializeFilters(),
       activeFields: serializeActiveFields(),
-      multiview: serializeMultiview(),
-      datasetSignature: currentDatasetSignature || null,
-      datasetSummary: currentDatasetSummary || null
+      multiview: serializeMultiview()
     };
+  }
+
+  /**
+   * Validate that a parsed JSON object looks like a real state snapshot.
+   * Helps avoid silently "loading" unrelated files (e.g., the manifest itself).
+   */
+  function validateSnapshotShape(snapshot, label = 'state file') {
+    const isObject = snapshot && typeof snapshot === 'object' && !Array.isArray(snapshot);
+    if (!isObject) {
+      throw new Error(`Invalid ${label}: expected a state JSON object.`);
+    }
+    const hasStateFields = snapshot.version != null
+      || snapshot.camera
+      || snapshot.filters
+      || snapshot.activeFields
+      || snapshot.uiControls
+      || snapshot.multiview;
+    if (!hasStateFields) {
+      const keys = Object.keys(snapshot || {}).slice(0, 5).join(', ') || 'none';
+      throw new Error(`File ${label} does not look like a cellucid state (found keys: ${keys}).`);
+    }
   }
 
   /**
    * Restore filters to fields
    * Includes colormapId and continuousColorRange restoration
+   * Returns counts so callers can avoid noisy logs when nothing is applied
    */
   async function restoreFilters(filters) {
-    if (!filters) return;
+    if (!filters) return { restored: 0, skippedNoop: 0 };
 
-    for (const [key, data] of Object.entries(filters)) {
+    const entries = Object.entries(filters);
+    if (!entries.length) return { restored: 0, skippedNoop: 0 };
+
+    let restored = 0;
+    let skippedNoop = 0;
+
+    const isCategoryFilterNoop = (data) => {
+      if (!data) return true;
+      if (data.filterEnabled === false) return false;
+      if (data.colormapId) return false;
+      if (data.colors && Object.keys(data.colors).length > 0) return false;
+      if (data.visibility) {
+        for (const v of Object.values(data.visibility)) {
+          if (v === false) return false;
+        }
+      }
+      return true;
+    };
+
+    const isContinuousFilterNoop = (data) => {
+      if (!data) return true;
+      if (data.filterEnabled === false) return false;
+      if (data.filter) return false;
+      if (data.colorRange) return false;
+      if (data.useLogScale) return false;
+      if (data.useFilterColorRange) return false;
+      if (data.outlierFilterEnabled === false) return false;
+      if (typeof data.outlierThreshold === 'number' && data.outlierThreshold < 0.9999) return false;
+      if (data.colormapId) return false;
+      return true;
+    };
+
+    const obsFields = state.getFields?.() || [];
+    const varFields = state.getVarFields?.() || [];
+    const obsLookup = new Map();
+    const varLookup = new Map();
+
+    obsFields.forEach((field, idx) => {
+      if (field?.key) obsLookup.set(field.key, idx);
+    });
+    varFields.forEach((field, idx) => {
+      if (field?.key) varLookup.set(field.key, idx);
+    });
+
+    const toRestore = [];
+
+    for (const [key, data] of entries) {
       const [source, fieldKey] = key.split(':');
-      if (!fieldKey) continue;
+      if (!fieldKey) {
+        skippedNoop += 1;
+        continue;
+      }
 
-      const fields = source === 'var' ? (state.getVarFields?.() || []) : (state.getFields?.() || []);
-      const fieldIndex = fields.findIndex(f => f?.key === fieldKey);
-      if (fieldIndex < 0) continue;
+      const lookup = source === 'var' ? varLookup : obsLookup;
+      const fields = source === 'var' ? varFields : obsFields;
+      const fieldIndex = lookup.get(fieldKey);
+
+      if (fieldIndex == null || fieldIndex < 0) {
+        skippedNoop += 1;
+        continue;
+      }
 
       const field = fields[fieldIndex];
-      if (!field) continue;
-
-      // Ensure field data is loaded
-      if (source === 'var') {
-        await state.ensureVarFieldLoaded?.(fieldIndex);
-      } else {
-        await state.ensureFieldLoaded?.(fieldIndex);
+      if (!field) {
+        skippedNoop += 1;
+        continue;
       }
 
-      if (data.kind === 'category' && field.kind === 'category') {
-        // Restore category visibility
-        if (data.visibility) {
-          Object.entries(data.visibility).forEach(([catIdx, visible]) => {
-            state.setVisibilityForCategory?.(field, parseInt(catIdx), visible);
-          });
-        }
-        // Restore category colors
-        if (data.colors) {
-          Object.entries(data.colors).forEach(([catIdx, color]) => {
-            state.setColorForCategory?.(field, parseInt(catIdx), color);
-          });
-        }
-        field._categoryFilterEnabled = data.filterEnabled !== false;
-        // Restore colormap if specified
-        if (data.colormapId) {
-          field._colormapId = data.colormapId;
-        }
-      } else if (data.kind === 'continuous' && field.kind === 'continuous') {
-        if (data.filter) {
-          field._continuousFilter = { ...data.filter };
-        }
-        // Restore continuous color range
-        if (data.colorRange) {
-          field._continuousColorRange = { ...data.colorRange };
-        }
-        field._filterEnabled = data.filterEnabled !== false;
-        field._useLogScale = data.useLogScale ?? false;
-        field._useFilterColorRange = data.useFilterColorRange ?? false;
-        field._outlierFilterEnabled = data.outlierFilterEnabled ?? false;
-        field._outlierThreshold = data.outlierThreshold ?? 1.0;
-        // Restore colormap if specified
-        if (data.colormapId) {
-          field._colormapId = data.colormapId;
-        }
+      const isNoop =
+        data.kind === 'category'
+          ? isCategoryFilterNoop(data)
+          : data.kind === 'continuous'
+            ? isContinuousFilterNoop(data)
+            : true;
+
+      if (isNoop) {
+        skippedNoop += 1;
+        continue;
       }
+
+      toRestore.push({ source, fieldIndex, data });
     }
+
+    if (!toRestore.length) {
+      return { restored: 0, skippedNoop };
+    }
+
+    // Preload all referenced fields in parallel so filter restore does not serialize network fetches
+    const preloadPromises = toRestore
+      .map(({ source, fieldIndex }) => {
+        if (source === 'var') {
+          return state.ensureVarFieldLoaded?.(fieldIndex);
+        }
+        return state.ensureFieldLoaded?.(fieldIndex);
+      })
+      .filter(Boolean);
+
+    if (preloadPromises.length > 0) {
+      await Promise.all(preloadPromises);
+    }
+
+    // Enter batch mode to suppress expensive recomputations during bulk filter restoration
+    // This reduces N calls to computeGlobalVisibility() down to 1
+    state.beginBatch?.();
+
+    try {
+      for (const { source, fieldIndex, data } of toRestore) {
+        const fields = source === 'var' ? (state.getVarFields?.() || []) : (state.getFields?.() || []);
+        const field = fields[fieldIndex];
+        if (!field) {
+          skippedNoop += 1;
+          continue;
+        }
+
+        if (data.kind === 'category' && field.kind === 'category') {
+          // Restore category visibility
+          if (data.visibility) {
+            Object.entries(data.visibility).forEach(([catIdx, visible]) => {
+              state.setVisibilityForCategory?.(field, parseInt(catIdx, 10), visible);
+            });
+          }
+          // Restore category colors
+          if (data.colors) {
+            Object.entries(data.colors).forEach(([catIdx, color]) => {
+              state.setColorForCategory?.(field, parseInt(catIdx, 10), color);
+            });
+          }
+          field._categoryFilterEnabled = data.filterEnabled !== false;
+          // Restore colormap if specified
+          if (data.colormapId) {
+            field._colormapId = data.colormapId;
+          }
+          restored += 1;
+          continue;
+        }
+
+        if (data.kind === 'continuous' && field.kind === 'continuous') {
+          if (data.filter) {
+            field._continuousFilter = { ...data.filter };
+          }
+          // Restore continuous color range
+          if (data.colorRange) {
+            field._continuousColorRange = { ...data.colorRange };
+          }
+          field._filterEnabled = data.filterEnabled !== false;
+          field._useLogScale = data.useLogScale ?? false;
+          field._useFilterColorRange = data.useFilterColorRange ?? false;
+          field._outlierFilterEnabled = data.outlierFilterEnabled ?? false;
+          field._outlierThreshold = data.outlierThreshold ?? 1.0;
+          // Restore colormap if specified
+          if (data.colormapId) {
+            field._colormapId = data.colormapId;
+          }
+          restored += 1;
+          continue;
+        }
+
+        // Field kind mismatch or unknown data; treat as skip
+        skippedNoop += 1;
+      }
+    } finally {
+      // Exit batch mode - triggers single consolidated recomputation
+      state.endBatch?.();
+    }
+
+    return { restored, skippedNoop };
   }
 
   /**
@@ -800,7 +907,10 @@ export function createStateSerializer({ state, viewer, sidebar, datasetSignature
       }
 
       if (snap.filters) {
-        await restoreFilters(snap.filters);
+        const { restored } = await restoreFilters(snap.filters);
+        if (restored > 0) {
+          console.log(`[StateSerializer] Restored ${restored} filter${restored === 1 ? '' : 's'} for snapshot ${snap.label || snap.id}`);
+        }
       }
       if (snap.activeFields) {
         await restoreActiveFields(snap.activeFields);
@@ -873,17 +983,6 @@ export function createStateSerializer({ state, viewer, sidebar, datasetSignature
       console.warn(`State snapshot version ${snapshot.version} is newer than supported ${VERSION}`);
     }
 
-    const snapshotDatasetSignature = snapshot.datasetSignature || null;
-    if (snapshotDatasetSignature && currentDatasetSignature && snapshotDatasetSignature !== currentDatasetSignature) {
-      const mismatchReason = buildDatasetMismatchMessage(snapshot.datasetSummary || snapshot.datasetDetails, currentDatasetSummary);
-      throw new Error(
-        `Dataset mismatch: state was saved for dataset hash ${snapshotDatasetSignature} `
-        + `but current dataset hash is ${currentDatasetSignature}. ${mismatchReason}`
-      );
-    } else if (snapshotDatasetSignature && !currentDatasetSignature) {
-      console.warn('[StateSerializer] Snapshot has dataset hash but current dataset is missing dataset_hash.json; clash detection skipped.');
-    }
-
     const controls = snapshot.uiControls || {};
 
     // 1. Restore UI controls first (checkboxes, selects, ranges)
@@ -893,8 +992,12 @@ export function createStateSerializer({ state, viewer, sidebar, datasetSignature
 
     // 2. Restore filters (field-level filter settings)
     if (snapshot.filters) {
-      console.log('[StateSerializer] Restoring filters');
-      await restoreFilters(snapshot.filters);
+      const { restored, skippedNoop } = await restoreFilters(snapshot.filters);
+      if (restored > 0) {
+        console.log(`[StateSerializer] Restored filters (${restored} field${restored === 1 ? '' : 's'}${skippedNoop ? `, skipped ${skippedNoop} no-op` : ''})`);
+      } else if (skippedNoop > 0) {
+        console.log(`[StateSerializer] No filter changes to restore (skipped ${skippedNoop} no-op entries)`);
+      }
     }
 
     // 3. Restore active fields and update field selects
@@ -1038,6 +1141,7 @@ export function createStateSerializer({ state, viewer, sidebar, datasetSignature
         try {
           const text = await file.text();
           const snapshot = JSON.parse(text);
+          validateSnapshotShape(snapshot, file.name || 'uploaded file');
           await deserialize(snapshot);
           resolve();
         } catch (err) {
@@ -1062,6 +1166,7 @@ export function createStateSerializer({ state, viewer, sidebar, datasetSignature
       throw new Error(`Failed to fetch state from ${url} (${response.status} ${response.statusText})`);
     }
     const snapshot = await response.json();
+    validateSnapshotShape(snapshot, url);
     await deserialize(snapshot);
   }
 

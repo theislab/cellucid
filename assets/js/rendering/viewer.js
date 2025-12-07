@@ -228,6 +228,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     mvpMatrix: gl.getUniformLocation(highlightProgram, 'u_mvpMatrix'),
     viewMatrix: gl.getUniformLocation(highlightProgram, 'u_viewMatrix'),
     modelMatrix: gl.getUniformLocation(highlightProgram, 'u_modelMatrix'),
+    projectionMatrix: gl.getUniformLocation(highlightProgram, 'u_projectionMatrix'),
     pointSize: gl.getUniformLocation(highlightProgram, 'u_pointSize'),
     sizeAttenuation: gl.getUniformLocation(highlightProgram, 'u_sizeAttenuation'),
     viewportHeight: gl.getUniformLocation(highlightProgram, 'u_viewportHeight'),
@@ -1920,6 +1921,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     gl.uniformMatrix4fv(highlightUniformLocations.mvpMatrix, false, mvpMatrix);
     gl.uniformMatrix4fv(highlightUniformLocations.viewMatrix, false, viewMatrix);
     gl.uniformMatrix4fv(highlightUniformLocations.modelMatrix, false, modelMatrix);
+    gl.uniformMatrix4fv(highlightUniformLocations.projectionMatrix, false, projectionMatrix);
     // Adapt halo sizing for square sprites so halo grows/shrinks with actual marker size
     let effectiveScale = highlightScale;
     let effectiveRingWidth = highlightRingWidth;
@@ -1964,14 +1966,22 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
   // === CELL PICKING ===
   // Convert screen coordinates to a ray and find the nearest cell
-  function screenToRay(screenX, screenY, canvasWidth, canvasHeight) {
+  // Optional viewportAspect parameter allows using a different aspect ratio than the global projection matrix
+  function screenToRay(screenX, screenY, canvasWidth, canvasHeight, viewportAspect = null) {
     // Normalize to clip space (-1 to 1)
     const ndcX = (screenX / canvasWidth) * 2 - 1;
     const ndcY = 1 - (screenY / canvasHeight) * 2;
 
     // Create inverse view-projection matrix
+    // If a custom viewport aspect is provided, create a temporary projection matrix
     const viewProj = mat4.create();
-    mat4.multiply(viewProj, projectionMatrix, viewMatrix);
+    if (viewportAspect !== null) {
+      const tempProj = mat4.create();
+      mat4.perspective(tempProj, fov, viewportAspect, near, far);
+      mat4.multiply(viewProj, tempProj, viewMatrix);
+    } else {
+      mat4.multiply(viewProj, projectionMatrix, viewMatrix);
+    }
     const invViewProj = mat4.create();
     if (!mat4.invert(invViewProj, viewProj)) {
       return null;
@@ -2009,7 +2019,38 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     const localX = screenX - rect.left;
     const localY = screenY - rect.top;
 
-    const ray = screenToRay(localX, localY, rect.width, rect.height);
+    // Determine viewport dimensions based on view layout
+    let vpLocalX = localX;
+    let vpLocalY = localY;
+    let vpWidth = rect.width;
+    let vpHeight = rect.height;
+
+    // Count active views (same logic as render())
+    const viewCount = (liveViewHidden ? 0 : 1) + snapshotViews.length;
+
+    // In grid mode with multiple views, find which viewport was clicked
+    if (viewLayoutMode === 'grid' && viewCount > 1) {
+      const cols = viewCount <= 3 ? viewCount : Math.ceil(Math.sqrt(viewCount));
+      const rows = Math.ceil(viewCount / cols);
+      vpWidth = rect.width / cols;
+      vpHeight = rect.height / rows;
+
+      // Determine which viewport cell was clicked
+      const col = Math.floor(localX / vpWidth);
+      const row = Math.floor(localY / vpHeight);
+
+      // Clamp to valid range
+      const clampedCol = Math.max(0, Math.min(col, cols - 1));
+      const clampedRow = Math.max(0, Math.min(row, rows - 1));
+
+      // Convert to viewport-local coordinates
+      vpLocalX = localX - clampedCol * vpWidth;
+      vpLocalY = localY - clampedRow * vpHeight;
+    }
+
+    // Compute viewport aspect ratio for correct projection
+    const vpAspect = vpWidth / vpHeight;
+    const ray = screenToRay(vpLocalX, vpLocalY, vpWidth, vpHeight, vpAspect);
     if (!ray) return -1;
 
     const positions = hpRenderer.getPositions();
@@ -2051,21 +2092,31 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         }
       }
 
-      // Find the closest cell to the ray origin
+      // Find the cell closest to the ray (perpendicular distance)
       for (const idx of candidates) {
         const px = positions[idx * 3];
         const py = positions[idx * 3 + 1];
         const pz = positions[idx * 3 + 2];
 
-        // Distance from cell to ray origin
-        const dist = Math.sqrt(
-          (px - ray.origin[0]) ** 2 +
-          (py - ray.origin[1]) ** 2 +
-          (pz - ray.origin[2]) ** 2
-        );
+        // Vector from ray origin to point
+        const opx = px - ray.origin[0];
+        const opy = py - ray.origin[1];
+        const opz = pz - ray.origin[2];
 
-        if (dist < nearestDist) {
-          nearestDist = dist;
+        // Project onto ray direction to get closest point on ray
+        const tProj = opx * ray.direction[0] + opy * ray.direction[1] + opz * ray.direction[2];
+
+        // Skip if point is behind camera
+        if (tProj < 0) continue;
+
+        // Perpendicular distance from point to ray (cross product magnitude)
+        const crossX = opy * ray.direction[2] - opz * ray.direction[1];
+        const crossY = opz * ray.direction[0] - opx * ray.direction[2];
+        const crossZ = opx * ray.direction[1] - opy * ray.direction[0];
+        const perpDist = Math.sqrt(crossX * crossX + crossY * crossY + crossZ * crossZ);
+
+        if (perpDist < nearestDist) {
+          nearestDist = perpDist;
           nearestCell = idx;
         }
       }

@@ -1685,7 +1685,8 @@ export function initUI({ state, viewer, dom, smoke }) {
 
     // Live badge (only if not hidden)
     if (!liveViewHidden) {
-      const liveField = state.getActiveField ? state.getActiveField() : null;
+      // Use view-specific field info, not current active field
+      const liveField = state.getFieldForView ? state.getFieldForView('live') : (state.getActiveField ? state.getActiveField() : null);
       const liveLabel = liveField ? (liveField.key || 'Active field') : 'All cells';
 
       const liveBadge = document.createElement('div');

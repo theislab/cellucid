@@ -126,29 +126,6 @@ async function fetchBinary(url) {
 }
 
 /**
- * Load dataset signature/metadata for clash detection.
- * Returns { signature, summary, details }
- */
-export async function loadDatasetSignature(url) {
-  try {
-    const response = await fetch(url);
-    if (!response.ok) {
-      throw new Error(`Dataset signature not found (${response.status} ${response.statusText})`);
-    }
-    const data = await response.json();
-    const signature = data.signature || data.hash || null;
-    return {
-      signature,
-      summary: data.summary || null,
-      details: data
-    };
-  } catch (err) {
-    console.warn(`[Data] Dataset signature not available at ${url}:`, err);
-    return { signature: null, summary: null, details: null, error: err?.message || String(err) };
-  }
-}
-
-/**
  * Load points binary, trying .gz version first if the URL doesn't already end in .gz
  * This handles both compressed and uncompressed data transparently.
  */

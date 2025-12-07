@@ -66,6 +66,44 @@ class DataState {
     this._highlightPageChangeCallbacks = new Set(); // Callbacks when pages change (add/remove/rename/switch)
     this._cachedHighlightCount = null; // Cached visible highlight count
     this._cachedTotalHighlightCount = null; // Cached total highlight count
+
+    // Batch mode: suppresses expensive recomputations during bulk filter restoration
+    this._batchMode = false;
+    this._batchDirty = { visibility: false, colors: false, affectedFields: new Set() };
+  }
+
+  // --- Batch mode for bulk operations -----------------------------------------
+
+  /**
+   * Enter batch mode to suppress expensive recomputations during bulk filter changes.
+   * Call endBatch() when done to apply all changes in a single recompute.
+   */
+  beginBatch() {
+    this._batchMode = true;
+    this._batchDirty = { visibility: false, colors: false, affectedFields: new Set() };
+  }
+
+  /**
+   * Exit batch mode and perform a single consolidated recomputation.
+   * Reapplies colors for affected fields and recomputes global visibility once.
+   */
+  endBatch() {
+    if (!this._batchMode) return;
+    this._batchMode = false;
+
+    // Reapply colors for all affected fields (handles color array updates)
+    if (this._batchDirty.colors && this._batchDirty.affectedFields.size > 0) {
+      for (const field of this._batchDirty.affectedFields) {
+        if (field) this._reapplyCategoryColorsNoRecompute(field);
+      }
+    }
+
+    // Single visibility recomputation after all filter changes
+    if (this._batchDirty.visibility || this._batchDirty.colors) {
+      this.computeGlobalVisibility();
+    }
+
+    this._batchDirty = { visibility: false, colors: false, affectedFields: new Set() };
   }
 
   // --- View context helpers ---------------------------------------------------
@@ -252,23 +290,49 @@ class DataState {
     const key = String(viewId || 'live');
     const ctx = this.viewContexts.get(key) || this.viewContexts.get('live');
     if (!ctx) return null;
+
+    // Save current view's state before switching (ensures filter isolation)
+    const prevKey = String(this.activeViewId || 'live');
+    if (prevKey !== key) {
+      const prevCtx = this.viewContexts.get(prevKey);
+      if (prevCtx) {
+        // Clone field state to ensure filter settings are preserved independently
+        prevCtx.obsData = this._cloneObsData(this.obsData);
+        prevCtx.varData = this._cloneVarData(this.varData);
+        prevCtx.activeFieldIndex = this.activeFieldIndex;
+        prevCtx.activeVarFieldIndex = this.activeVarFieldIndex;
+        prevCtx.activeFieldSource = this.activeFieldSource;
+        prevCtx.colorsArray = this.colorsArray ? new Uint8Array(this.colorsArray) : null;
+        prevCtx.categoryTransparency = this.categoryTransparency ? new Float32Array(this.categoryTransparency) : null;
+        prevCtx.outlierQuantilesArray = this.outlierQuantilesArray ? new Float32Array(this.outlierQuantilesArray) : null;
+        prevCtx.centroidPositions = this.centroidPositions ? new Float32Array(this.centroidPositions) : null;
+        prevCtx.centroidColors = this.centroidColors ? new Uint8Array(this.centroidColors) : null;
+        prevCtx.centroidOutliers = this.centroidOutliers ? new Float32Array(this.centroidOutliers) : null;
+        prevCtx.centroidLabels = this.centroidLabels ? this.centroidLabels.map(c => c ? { ...c } : c) : [];
+        prevCtx.filteredCount = this.filteredCount ? { ...this.filteredCount } : { shown: this.pointCount, total: this.pointCount };
+      }
+    }
+
     this.activeViewId = ctx.id;
     if (this.viewer && typeof this.viewer.setViewLayout === 'function') {
       this.viewer.setViewLayout('grid', this.activeViewId);
     }
-    this.obsData = ctx.obsData;
-    this.varData = ctx.varData;
+    // Clone obsData/varData to ensure this view's state is independent
+    this.obsData = this._cloneObsData(ctx.obsData);
+    this.varData = this._cloneVarData(ctx.varData);
     this.activeFieldIndex = ctx.activeFieldIndex ?? -1;
     this.activeVarFieldIndex = ctx.activeVarFieldIndex ?? -1;
     this.activeFieldSource = ctx.activeFieldSource ?? null;
-    this.colorsArray = ctx.colorsArray;
-    this.categoryTransparency = ctx.categoryTransparency;
-    this.outlierQuantilesArray = ctx.outlierQuantilesArray;
-    this.centroidPositions = ctx.centroidPositions;
-    this.centroidColors = ctx.centroidColors; // RGBA uint8
-    this.centroidOutliers = ctx.centroidOutliers;
-    this.centroidLabels = ctx.centroidLabels || [];
-    this.filteredCount = ctx.filteredCount || { shown: this.pointCount, total: this.pointCount };
+    this.colorsArray = ctx.colorsArray ? new Uint8Array(ctx.colorsArray) : null;
+    this.categoryTransparency = ctx.categoryTransparency ? new Float32Array(ctx.categoryTransparency) : null;
+    this.outlierQuantilesArray = ctx.outlierQuantilesArray ? new Float32Array(ctx.outlierQuantilesArray) : null;
+    this.centroidPositions = ctx.centroidPositions ? new Float32Array(ctx.centroidPositions) : null;
+    this.centroidColors = ctx.centroidColors ? new Uint8Array(ctx.centroidColors) : null;
+    this.centroidOutliers = ctx.centroidOutliers ? new Float32Array(ctx.centroidOutliers) : null;
+    this.centroidLabels = ctx.centroidLabels ? ctx.centroidLabels.map(c => c ? { ...c } : c) : [];
+    this.filteredCount = ctx.filteredCount ? { ...ctx.filteredCount } : { shown: this.pointCount, total: this.pointCount };
+    // Reinitialize the active field to ensure category counts and metadata are up-to-date
+    this._reinitializeActiveField();
     this._rebuildLabelLayerFromCentroids();
     this._pushColorsToViewer();
     this._pushTransparencyToViewer();
@@ -278,6 +342,30 @@ class DataState {
     this.updateFilterSummary();
     this._syncActiveContext();
     return this.activeViewId;
+  }
+
+  /**
+   * Reinitialize the active field's metadata after switching views.
+   * Ensures category counts and metadata are available for the legend UI.
+   * Does NOT recompute colors/transparency - those are loaded from the context.
+   */
+  _reinitializeActiveField() {
+    const field = this.getActiveField();
+    if (!field || !field.loaded) return;
+
+    if (field.kind === 'continuous') {
+      // Ensure continuous metadata exists
+      this.ensureContinuousMetadata(field);
+    } else if (field.kind === 'category') {
+      // Ensure category metadata (colors, visibility maps)
+      this.ensureCategoryMetadata(field);
+      // Recompute category counts based on current transparency/visibility
+      const counts = this.computeCategoryCountsForField(field);
+      if (counts) {
+        field._categoryCounts = counts;
+        this._activeCategoryCounts = counts;
+      }
+    }
   }
 
   createViewFromActive(viewId) {
@@ -557,6 +645,78 @@ class DataState {
       return this.getVarFields()[this.activeVarFieldIndex];
     }
     return this.getFields()[this.activeFieldIndex];
+  }
+
+  /**
+   * Get the active field for a specific view (without switching to it).
+   * Returns null if viewId is invalid or has no active field.
+   */
+  getFieldForView(viewId) {
+    const key = String(viewId || 'live');
+    if (key === String(this.activeViewId)) {
+      return this.getActiveField();
+    }
+    const ctx = this.viewContexts.get(key);
+    if (!ctx) return null;
+    const source = ctx.activeFieldSource;
+    if (source === 'var') {
+      const varFields = ctx.varData?.fields || [];
+      const idx = ctx.activeVarFieldIndex ?? -1;
+      return idx >= 0 ? varFields[idx] : null;
+    }
+    const obsFields = ctx.obsData?.fields || [];
+    const idx = ctx.activeFieldIndex ?? -1;
+    return idx >= 0 ? obsFields[idx] : null;
+  }
+
+  /**
+   * Get the filter summary for a specific view (without switching to it).
+   */
+  getFilterSummaryForView(viewId) {
+    const key = String(viewId || 'live');
+    if (key === String(this.activeViewId)) {
+      return this.getFilterSummaryLines();
+    }
+    const ctx = this.viewContexts.get(key);
+    if (!ctx || !ctx.obsData || !ctx.obsData.fields) return [];
+
+    const filters = [];
+    const fields = ctx.obsData.fields;
+
+    for (let fi = 0; fi < fields.length; fi++) {
+      const field = fields[fi];
+      if (!field) continue;
+      const fieldKey = field.key || `Field ${fi + 1}`;
+
+      // Check continuous filter
+      if (field.kind === 'continuous' && field._continuousStats && field._continuousFilter) {
+        const stats = field._continuousStats;
+        const filter = field._continuousFilter;
+        const fullRange = filter.min <= stats.min + 1e-6 && filter.max >= stats.max - 1e-6;
+        if (!fullRange && field._filterEnabled !== false) {
+          filters.push(`${fieldKey}: ${filter.min.toFixed(2)} – ${filter.max.toFixed(2)}`);
+        }
+      }
+
+      // Check category filter
+      if (field.kind === 'category') {
+        const categories = field.categories || [];
+        const visibleMap = field._categoryVisible || {};
+        const hiddenNames = [];
+        for (let i = 0; i < categories.length; i++) {
+          if (visibleMap[i] === false) {
+            hiddenNames.push(String(categories[i]));
+          }
+        }
+        if (hiddenNames.length > 0 && field._categoryFilterEnabled !== false) {
+          const preview = hiddenNames.slice(0, 2).join(', ');
+          const extra = hiddenNames.length > 2 ? ` +${hiddenNames.length - 2}` : '';
+          filters.push(`${fieldKey}: hiding ${preview}${extra}`);
+        }
+      }
+    }
+
+    return filters.length > 0 ? filters : ['No filters active'];
   }
 
   setFieldLoader(loaderFn) {
@@ -1872,6 +2032,17 @@ class DataState {
 
   reapplyCategoryColors(field) {
     if (!field || field.kind !== 'category') return;
+    this._reapplyCategoryColorsNoRecompute(field);
+    // Let computeGlobalVisibility handle transparency/filtering
+    this.computeGlobalVisibility();
+  }
+
+  /**
+   * Update color array for a category field without triggering visibility recomputation.
+   * Used by batch mode to defer the expensive computeGlobalVisibility() call.
+   */
+  _reapplyCategoryColorsNoRecompute(field) {
+    if (!field || field.kind !== 'category') return;
     const n = this.pointCount;
     const categories = field.categories || [];
     const codes = field.codes || [];
@@ -1905,8 +2076,6 @@ class DataState {
     }
     this._syncColorsAlpha();
     this._pushColorsToViewer();
-    // Let computeGlobalVisibility handle transparency/filtering
-    this.computeGlobalVisibility();
   }
 
   getLegendModel(field) {
@@ -1934,13 +2103,24 @@ class DataState {
     this.ensureCategoryMetadata(field);
     const fallback = getCategoryColor(idx);
     field._categoryColors[idx] = color || fallback;
-    this.reapplyCategoryColors(field);
+    if (this._batchMode) {
+      this._batchDirty.colors = true;
+      this._batchDirty.affectedFields.add(field);
+    } else {
+      this.reapplyCategoryColors(field);
+    }
   }
 
   setVisibilityForCategory(field, idx, visible) {
     this.ensureCategoryMetadata(field);
     field._categoryVisible[idx] = visible;
-    this.reapplyCategoryColors(field);
+    if (this._batchMode) {
+      this._batchDirty.visibility = true;
+      this._batchDirty.colors = true; // visibility changes affect color display
+      this._batchDirty.affectedFields.add(field);
+    } else {
+      this.reapplyCategoryColors(field);
+    }
   }
 
   showAllCategories(field, { onlyAvailable = false } = {}) {

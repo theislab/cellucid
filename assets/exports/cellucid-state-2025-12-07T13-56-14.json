@@ -1,13 +1,13 @@
 {
   "version": 3,
-  "timestamp": "2025-12-07T02:46:32.949Z",
+  "timestamp": "2025-12-07T13:56:14.144Z",
   "camera": {
     "navigationMode": "orbit",
     "orbit": {
-      "radius": 1.2100767069084246,
-      "targetRadius": 1.2100767069084246,
-      "theta": 3.702643997773402,
-      "phi": 1.4342296114040756,
+      "radius": 1.355233656121385,
+      "targetRadius": 1.355233656121385,
+      "theta": 3.7253981633974473,
+      "phi": 1.4103981633974465,
       "target": [
         0,
         0,
@@ -27,11 +27,11 @@
   "uiControls": {
     "point-size": {
       "type": "range",
-      "value": "22"
+      "value": "27"
     },
     "lighting-strength": {
       "type": "range",
-      "value": "65"
+      "value": "60"
     },
     "fog-density": {
       "type": "range",
@@ -155,11 +155,11 @@
     },
     "toggle-centroid-points": {
       "type": "checkbox",
-      "checked": false
+      "checked": true
     },
     "toggle-centroid-labels": {
       "type": "checkbox",
-      "checked": false
+      "checked": true
     },
     "benchmark-count": {
       "type": "number",
@@ -272,45 +272,5 @@
       "liveViewHidden": false
     },
     "snapshots": []
-  },
-  "datasetSignature": "abeda2e0656c109c886d43cb1c6550d3ccf56494cc290e1547d52df867967169",
-  "datasetSummary": {
-    "n_cells": 162259,
-    "obs_field_count": 28,
-    "obs_keys": [
-      "handle_anndata",
-      "lab",
-      "protocol",
-      "sample",
-      "stage",
-      "cell_type_authors",
-      "cell_type_lv1",
-      "protocol|lab|stage|sample",
-      "prep_n_counts",
-      "prep_n_genes_by_counts",
-      "prep_pct_counts_mt",
-      "prep_pct_counts_ribo",
-      "prep_pct_counts_bcr",
-      "prep_pct_counts_tcr",
-      "prep_score_mt",
-      "prep_score_ribo",
-      "prep_score_bcr",
-      "prep_score_tcr",
-      "prep_score_cc",
-      "prep_score_cc_s",
-      "prep_score_cc_g2m",
-      "prep_score_scanpy_cc_s",
-      "prep_score_scanpy_cc_g2m",
-      "prep_scanpy_cc_phase",
-      "prep_scanpy_sc_cycling_strength",
-      "qc_fail",
-      "qc_fail_reasons",
-      "cell_type_lv1||protocol|lab|stage|sample"
-    ],
-    "obs_fields_hash": "8f35fa81b546dfe07ce287f0fb646a6593ceaee4bcdab693cd4135d7c40a4f2e",
-    "gene_count": 44910,
-    "gene_list_hash": "743407bb2132dd12f6ed904d9ad9330baff94abea565be3311596a9f58775e4a",
-    "compression": 6,
-    "connectivity_edges": 10537096
   }
 }
