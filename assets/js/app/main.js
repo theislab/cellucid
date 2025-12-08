@@ -41,6 +41,7 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
   const centroidLabelsCheckbox = document.getElementById('toggle-centroid-labels');
   const sidebar = document.getElementById('sidebar');
   const sidebarToggle = document.getElementById('sidebar-toggle');
+  const displayOptionsContainer = document.getElementById('display-options-container');
   const outlierFilterContainer = document.getElementById('outlier-filter-container');
   const outlierFilterInput = document.getElementById('outlier-filter');
   const outlierFilterDisplay = document.getElementById('outlier-filter-display');
@@ -48,11 +49,13 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
   const activeFiltersEl = document.getElementById('active-filters');
   // Highlight UI elements
   const highlightCountEl = document.getElementById('highlight-count');
-  const highlightedGroupsEl = document.getElementById('highlighted-groups');
+  const highlightedGroupsEl = document.getElementById('highlighted-groups-list');
   const highlightActionsEl = document.getElementById('highlight-actions');
   const clearAllHighlightsBtn = document.getElementById('clear-all-highlights');
   const highlightPagesTabsEl = document.getElementById('highlight-pages-tabs');
   const addHighlightPageBtn = document.getElementById('add-highlight-page');
+  const highlightModeButtons = Array.from(document.querySelectorAll('.highlight-mode-btn'));
+  const highlightModeDescription = document.getElementById('highlight-mode-description');
   const lightingStrengthInput = document.getElementById('lighting-strength');
   const lightingStrengthDisplay = document.getElementById('lighting-strength-display');
   const fogDensityInput = document.getElementById('fog-density');
@@ -111,7 +114,9 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
   const splitClearBtn = document.getElementById('split-clear-btn');
   const cameraLockBtn = document.getElementById('camera-lock-btn');
   const viewLayoutModeSelect = document.getElementById('view-layout-mode');
-  const splitViewBadges = document.getElementById('split-view-badges');
+  const splitViewBadgesBox = document.getElementById('split-view-badges-box');
+  const splitViewBadges = document.getElementById('split-view-badges-list');
+  const splitViewBoxTitle = document.querySelector('.split-view-box-title');
 
   // Connectivity controls
   const connectivityControls = document.getElementById('connectivity-controls');
@@ -224,6 +229,7 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
         categoricalFieldSelect,
         continuousFieldSelect,
         legendEl,
+        displayOptionsContainer,
         pointSizeInput,
         pointSizeDisplay,
         backgroundSelect,
@@ -244,6 +250,8 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
         clearAllHighlightsBtn,
         highlightPagesTabsEl,
         addHighlightPageBtn,
+        highlightModeButtons,
+        highlightModeDescription,
         lightingStrengthInput,
         lightingStrengthDisplay,
         fogDensityInput,
@@ -298,7 +306,9 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
         splitClearBtn,
         cameraLockBtn,
         viewLayoutModeSelect,
+        splitViewBadgesBox,
         splitViewBadges,
+        splitViewBoxTitle,
         saveStateBtn,
         loadStateBtn,
         sessionStatus

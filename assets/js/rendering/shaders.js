@@ -157,13 +157,16 @@ in vec3 a_position;
 uniform mat4 u_mvpMatrix;
 uniform mat4 u_viewMatrix;
 uniform mat4 u_modelMatrix;
+uniform float u_gridSize;
 
 out vec3 v_worldPos;
+out vec3 v_localPos;
 out float v_viewDistance;
 
 void main() {
   vec4 worldPos = u_modelMatrix * vec4(a_position, 1.0);
   v_worldPos = worldPos.xyz;
+  v_localPos = a_position / u_gridSize; // Normalized -1 to 1
 
   vec4 eyePos = u_viewMatrix * worldPos;
   v_viewDistance = length(eyePos.xyz);
@@ -176,6 +179,7 @@ export const GRID_FS_SOURCE = `#version 300 es
 precision highp float;
 
 in vec3 v_worldPos;
+in vec3 v_localPos;
 in float v_viewDistance;
 
 uniform vec3 u_gridColor;
@@ -183,38 +187,66 @@ uniform vec3 u_bgColor;
 uniform float u_gridSpacing;
 uniform float u_gridLineWidth;
 uniform float u_gridOpacity;
-uniform int u_planeType; // 0=XY, 1=XZ, 2=YZ
+uniform float u_planeAlpha;      // Per-plane visibility (smooth fade)
+uniform int u_planeType;         // 0=XY, 1=XZ, 2=YZ
 uniform float u_fogDensity;
 uniform float u_fogNearMean;
 uniform float u_fogFarMean;
+uniform vec3 u_axisXColor;       // Axis colors for scientific look
+uniform vec3 u_axisYColor;
+uniform vec3 u_axisZColor;
+uniform float u_gridSize;
 
 out vec4 fragColor;
 
 float gridLine(float coord, float spacing, float lineWidth) {
   float f = abs(fract(coord / spacing + 0.5) - 0.5) * spacing;
   float lineHalf = lineWidth * 0.5;
-  // Smooth anti-aliased line using screen-space derivatives
   float derivative = fwidth(coord);
   return 1.0 - smoothstep(lineHalf - derivative, lineHalf + derivative, f);
 }
 
+// Axis line detection - thicker lines at edges where planes meet
+float axisLine(float coord, float gridSize, float lineWidth) {
+  float edgeDist = min(abs(coord + gridSize), abs(coord - gridSize));
+  float derivative = fwidth(coord);
+  float axisWidth = lineWidth * 2.5;
+  return 1.0 - smoothstep(axisWidth - derivative, axisWidth + derivative, edgeDist);
+}
+
 void main() {
   float line = 0.0;
+  float axisLine1 = 0.0, axisLine2 = 0.0;
+
+  // Grid line width for main grid
+  float mainLineWidth = u_gridLineWidth;
 
   // Select coordinates based on plane type
   if (u_planeType == 0) {
-    // XY plane (back wall) - grid on X and Y
-    line = max(gridLine(v_worldPos.x, u_gridSpacing, u_gridLineWidth),
-               gridLine(v_worldPos.y, u_gridSpacing, u_gridLineWidth));
+    // XY plane (front/back wall) - grid on X and Y
+    line = max(gridLine(v_worldPos.x, u_gridSpacing, mainLineWidth),
+               gridLine(v_worldPos.y, u_gridSpacing, mainLineWidth));
+    // Edge lines at boundaries
+    axisLine1 = axisLine(v_worldPos.y, u_gridSize, mainLineWidth);
+    axisLine2 = axisLine(v_worldPos.x, u_gridSize, mainLineWidth);
   } else if (u_planeType == 1) {
-    // XZ plane (floor) - grid on X and Z
-    line = max(gridLine(v_worldPos.x, u_gridSpacing, u_gridLineWidth),
-               gridLine(v_worldPos.z, u_gridSpacing, u_gridLineWidth));
+    // XZ plane (floor/ceiling) - grid on X and Z
+    line = max(gridLine(v_worldPos.x, u_gridSpacing, mainLineWidth),
+               gridLine(v_worldPos.z, u_gridSpacing, mainLineWidth));
+    // Edge lines at boundaries
+    axisLine1 = axisLine(v_worldPos.z, u_gridSize, mainLineWidth);
+    axisLine2 = axisLine(v_worldPos.x, u_gridSize, mainLineWidth);
   } else {
     // YZ plane (side wall) - grid on Y and Z
-    line = max(gridLine(v_worldPos.y, u_gridSpacing, u_gridLineWidth),
-               gridLine(v_worldPos.z, u_gridSpacing, u_gridLineWidth));
+    line = max(gridLine(v_worldPos.y, u_gridSpacing, mainLineWidth),
+               gridLine(v_worldPos.z, u_gridSpacing, mainLineWidth));
+    // Edge lines at boundaries
+    axisLine1 = axisLine(v_worldPos.z, u_gridSize, mainLineWidth);
+    axisLine2 = axisLine(v_worldPos.y, u_gridSize, mainLineWidth);
   }
+
+  // Combine axis lines uniformly (max instead of additive blend)
+  float combinedAxis = max(axisLine1, axisLine2);
 
   // Apply fog for depth
   float fogSpan = max(u_fogFarMean - u_fogNearMean, 0.0001);
@@ -222,10 +254,22 @@ void main() {
   float extinction = u_fogDensity * u_fogDensity * 0.4;
   float transmittance = exp(-extinction * normalizedDistance);
 
+  // Combine plane alpha with opacity for smooth transitions
+  float effectiveOpacity = u_gridOpacity * u_planeAlpha;
+
   // Mix grid with background
   vec3 gridColorFogged = mix(u_bgColor, u_gridColor, transmittance);
-  vec3 finalColor = mix(u_bgColor, gridColorFogged, line * u_gridOpacity);
-  float alpha = mix(0.95, 1.0, line * u_gridOpacity * transmittance);
+  vec3 finalColor = mix(u_bgColor, gridColorFogged, line * effectiveOpacity);
+
+  // Blend in unified axis color at edges (same thickness for all)
+  float axisIntensity = 0.6 * transmittance * u_planeAlpha;
+  finalColor = mix(finalColor, u_axisXColor, combinedAxis * axisIntensity);
+
+  // Smooth alpha - fully transparent when plane is hidden
+  float alpha = effectiveOpacity * (0.85 + 0.15 * line * transmittance);
+
+  // Discard nearly invisible fragments
+  if (alpha < 0.01) discard;
 
   fragColor = vec4(finalColor, alpha);
 }

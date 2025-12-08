@@ -66,6 +66,7 @@ class DataState {
     this._highlightPageChangeCallbacks = new Set(); // Callbacks when pages change (add/remove/rename/switch)
     this._cachedHighlightCount = null; // Cached visible highlight count
     this._cachedTotalHighlightCount = null; // Cached total highlight count
+    this._cachedHighlightLodLevel = null; // LOD level used for cached visible highlight count
 
     // Batch mode: suppresses expensive recomputations during bulk filter restoration
     this._batchMode = false;
@@ -1846,7 +1847,7 @@ class DataState {
   getFilterSummaryLines() {
     // Returns array of strings for backward compatibility
     const filters = this.getActiveFiltersStructured();
-    if (filters.length === 0) return ['No filters active (showing all points).'];
+    if (filters.length === 0) return ['No filters active'];
     return filters.map(f => f.text);
   }
 
@@ -2671,16 +2672,26 @@ class DataState {
   getHighlightedCellCount() {
     // Returns count of highlighted cells that are currently visible (cached)
     if (!this.highlightArray) return 0;
-    if (this._cachedHighlightCount !== null) return this._cachedHighlightCount;
+    const lodVisibility = this.viewer?.getLodVisibilityArray ? this.viewer.getLodVisibilityArray() : null;
+    const lodLevel = this.viewer?.getCurrentLODLevel ? this.viewer.getCurrentLODLevel() : -1;
+    const lodSignature = lodVisibility ? (lodLevel ?? -1) : -1;
+
+    if (this._cachedHighlightCount !== null && this._cachedHighlightLodLevel === lodSignature) {
+      return this._cachedHighlightCount;
+    }
+
     let count = 0;
     for (let i = 0; i < this.highlightArray.length; i++) {
       if (this.highlightArray[i] > 0) {
         // Only count if visible (no transparency = visible, or transparency > 0)
-        const isVisible = !this.categoryTransparency || this.categoryTransparency[i] > 0;
+        const visibleByAlpha = !this.categoryTransparency || this.categoryTransparency[i] > 0;
+        const visibleByLod = !lodVisibility || lodVisibility[i] > 0;
+        const isVisible = visibleByAlpha && visibleByLod;
         if (isVisible) count++;
       }
     }
     this._cachedHighlightCount = count;
+    this._cachedHighlightLodLevel = lodSignature;
     return count;
   }
 
@@ -2699,6 +2710,7 @@ class DataState {
   // Invalidate highlight count caches (call when highlight array or visibility changes)
   _invalidateHighlightCountCache(visibleOnly = false) {
     this._cachedHighlightCount = null;
+    this._cachedHighlightLodLevel = null;
     if (!visibleOnly) this._cachedTotalHighlightCount = null;
   }
 

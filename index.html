@@ -175,10 +175,9 @@
           <div class="control-block">
             <label for="background-select">Background:</label>
             <select id="background-select">
-              <option value="white">White (paper)</option>
-              <option value="grid" selected>Grid (3D axes)</option>
-              <option value="light">Light grey</option>
-              <option value="dark">Dark slate</option>
+              <option value="grid" selected>Grid (light)</option>
+              <option value="grid-dark">Grid (dark)</option>
+              <option value="white">White</option>
               <option value="black">Black</option>
             </select>
           </div>
@@ -500,7 +499,7 @@
         <summary>Compare Views</summary>
         <div class="accordion-content">
           <div class="control-block" id="split-view-controls">
-            <div class="legend-help" style="margin-bottom: 6px;">
+            <div class="legend-help split-view-intro">
               Keep snapshots to compare UMAP tweaks. Switch to a single view to edit settings.
             </div>
 
@@ -513,23 +512,13 @@
                 Keep view
               </button>
               <button
-                id="split-clear-btn"
-                class="reset-btn"
-                title="Remove all kept views"
-              >
-                Clear
-              </button>
-              <button
                 id="camera-lock-btn"
-                class="reset-btn camera-lock-btn"
-                title="Cameras linked (click to unlink)"
+                class="toggle-switch camera-lock-btn"
+                type="button"
+                aria-pressed="false"
+                title="Cameras independent (click to link)"
               >
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path class="lock-linked" d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
-                  <path class="lock-linked" d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
-                  <path class="lock-unlinked" style="display:none" d="M18.84 12.25l1.72-1.71a5 5 0 0 0-7.07-7.07l-3 3a5 5 0 0 0 0 7.07"/>
-                  <path class="lock-unlinked" style="display:none" d="M5.16 11.75l-1.72 1.71a5 5 0 0 0 7.07 7.07l3-3a5 5 0 0 0 0-7.07"/>
-                </svg>
+                Locked Cam
               </button>
             </div>
 
@@ -541,13 +530,19 @@
               </select>
             </div>
 
-            <div id="split-view-badges" class="split-view-badges">
-              <div class="filter-info">
-                No kept views yet. Configure a view and press “Keep view”.
+            <div id="split-view-badges-box" class="split-view-badges-box">
+              <div id="split-view-badges-list" class="split-view-badges"></div>
+              <div class="split-view-hint legend-help"></div>
+              <div class="legend-actions compact split-view-actions">
+                <button
+                  id="split-clear-btn"
+                  class="reset-btn"
+                  title="Remove all kept views"
+                >
+                  Clear
+                </button>
               </div>
             </div>
-
-            <div class="split-view-hint legend-help"></div>
           </div>
         </div>
       </details>
@@ -614,7 +609,7 @@
             <div class="section-title">Active filters</div>
             <div id="filter-count" class="filter-info">Showing all points</div>
             <div id="active-filters" class="filter-info-block">
-              <div class="filter-info">No filters active (showing all points).</div>
+              <div class="filter-info">No filters active</div>
             </div>
           </div>
         </div>
@@ -623,6 +618,18 @@
       <details class="accordion-section" open id="highlighted-cells-section">
         <summary>Highlighted Cells</summary>
         <div class="accordion-content">
+          <div class="highlight-mode-box">
+            <div class="section-title">Highlight mode</div>
+            <div class="highlight-mode-buttons" role="group" aria-label="Highlight mode selection">
+              <button type="button" class="toggle-switch highlight-mode-btn" data-mode="annotation" aria-pressed="true">Annotation based</button>
+              <button type="button" class="toggle-switch highlight-mode-btn" data-mode="knn">KNN drag</button>
+              <button type="button" class="toggle-switch highlight-mode-btn" data-mode="proximity">Proximity drag</button>
+              <button type="button" class="toggle-switch highlight-mode-btn" data-mode="lasso">Lasso</button>
+            </div>
+            <div id="highlight-mode-description" class="legend-help">
+              Alt+click a cell to highlight its group. Alt+drag to select a range.
+            </div>
+          </div>
           <!-- Page selector tabs -->
           <div id="highlight-pages-container">
             <div id="highlight-pages-tabs">
@@ -630,12 +637,11 @@
             </div>
             <button type="button" class="highlight-page-add-btn" id="add-highlight-page" title="Add new page">+</button>
           </div>
-          <div id="highlight-count" class="filter-info">No cells highlighted</div>
-          <div id="highlight-hint" class="legend-help" style="margin-bottom: 8px;">
-            Alt+click a cell to highlight its group. Alt+drag to select a range.
-          </div>
-          <div id="highlighted-groups">
-            <!-- Highlighted group items will be added here dynamically -->
+          <div id="highlighted-groups" class="highlighted-groups-box">
+            <div id="highlight-count" class="filter-info highlight-count-inline">No cells highlighted</div>
+            <div id="highlighted-groups-list">
+              <!-- Highlighted group items will be added here dynamically -->
+            </div>
           </div>
           <div id="highlight-actions" class="highlight-actions" style="display: none;">
             <button type="button" class="btn-small" id="clear-all-highlights">Clear All</button>
@@ -647,7 +653,7 @@
         <summary>Performance Benchmark</summary>
         <div class="accordion-content">
           <div class="legend-help" style="margin-bottom:10px;">
-            Test rendering limits with synthetic data (5-10M+ points).
+            Test rendering limits with synthetic data
           </div>
 
           <!-- Quick presets -->
@@ -657,9 +663,9 @@
               <button class="btn-small benchmark-preset" data-count="100000">100K</button>
               <button class="btn-small benchmark-preset" data-count="500000">500K</button>
               <button class="btn-small benchmark-preset" data-count="1000000">1M</button>
-              <button class="btn-small benchmark-preset" data-count="2000000">2M</button>
               <button class="btn-small benchmark-preset" data-count="5000000">5M</button>
               <button class="btn-small benchmark-preset" data-count="10000000">10M</button>
+              <button class="btn-small benchmark-preset" data-count="20000000">20M</button>
             </div>
           </div>
 

@@ -5,6 +5,7 @@ export function initUI({ state, viewer, dom, smoke }) {
     categoricalFieldSelect,
     continuousFieldSelect,
     legendEl,
+    displayOptionsContainer,
     pointSizeInput,
     pointSizeDisplay,
     backgroundSelect,
@@ -31,6 +32,8 @@ export function initUI({ state, viewer, dom, smoke }) {
     clearAllHighlightsBtn,
     highlightPagesTabsEl,
     addHighlightPageBtn,
+    highlightModeButtons,
+    highlightModeDescription,
     resetCameraBtn,
     navigationModeSelect,
     lookSensitivityInput,
@@ -81,7 +84,9 @@ export function initUI({ state, viewer, dom, smoke }) {
     splitClearBtn,
     cameraLockBtn,
     viewLayoutModeSelect,
+    splitViewBadgesBox,
     splitViewBadges,
+    splitViewBoxTitle,
     // Session save/load
     saveStateBtn,
     loadStateBtn,
@@ -130,6 +135,14 @@ export function initUI({ state, viewer, dom, smoke }) {
     transform: translate(12px, -50%);
   `;
   document.body.appendChild(rangeLabel);
+
+  // Hide display options by default until a field is active
+  setDisplayOptionsVisibility(null);
+
+  function setDisplayOptionsVisibility(field) {
+    if (!displayOptionsContainer) return;
+    displayOptionsContainer.style.display = field ? 'block' : 'none';
+  }
 
   function showRangeLabel(x, y, minVal, maxVal) {
     const formatVal = (v) => {
@@ -372,7 +385,7 @@ export function initUI({ state, viewer, dom, smoke }) {
     if (filters.length === 0) {
       const line = document.createElement('div');
       line.className = 'filter-info';
-      line.textContent = 'No filters active (showing all points).';
+      line.textContent = 'No filters active';
       activeFiltersEl.appendChild(line);
     } else {
       filters.forEach((filter) => {
@@ -440,6 +453,51 @@ export function initUI({ state, viewer, dom, smoke }) {
   }
 
   // === HIGHLIGHT UI ===
+  const highlightModeButtonsList = Array.isArray(highlightModeButtons)
+    ? highlightModeButtons
+    : (highlightModeButtons ? [highlightModeButtons] : []);
+  const highlightModeDescriptionEl = highlightModeDescription || null;
+  const highlightModeCopy = {
+    annotation: 'Alt+click a cell to highlight its group. Alt+drag to select a range.',
+    knn: 'Placeholder: KNN drag will expand highlights along nearest-neighbor links.',
+    proximity: 'Placeholder: Proximity drag will sweep a local radius around your drag path.',
+    lasso: 'Placeholder: Lasso will free-draw a boundary to capture nearby cells.'
+  };
+  let activeHighlightMode = 'annotation';
+
+  function setHighlightModeUI(mode) {
+    activeHighlightMode = mode;
+    if (highlightModeButtonsList && highlightModeButtonsList.length) {
+      highlightModeButtonsList.forEach((btn) => {
+        const isActive = btn?.dataset?.mode === mode;
+        btn?.setAttribute?.('aria-pressed', isActive ? 'true' : 'false');
+      });
+    }
+    if (highlightModeDescriptionEl) {
+      const text = highlightModeCopy[mode] || '';
+      highlightModeDescriptionEl.textContent = text;
+      highlightModeDescriptionEl.style.display = text ? 'block' : 'none';
+    }
+  }
+
+  function initHighlightModeButtons() {
+    if (!highlightModeButtonsList || highlightModeButtonsList.length === 0) {
+      setHighlightModeUI(activeHighlightMode);
+      return;
+    }
+
+    highlightModeButtonsList.forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const nextMode = btn.dataset.mode || 'annotation';
+        setHighlightModeUI(nextMode);
+      });
+    });
+
+    const pressed = highlightModeButtonsList.find((btn) => btn.getAttribute('aria-pressed') === 'true');
+    const initialMode = pressed?.dataset?.mode || activeHighlightMode;
+    setHighlightModeUI(initialMode);
+  }
+
   function renderHighlightSummary() {
     if (!highlightedGroupsEl || !highlightCountEl) return;
 
@@ -770,6 +828,21 @@ export function initUI({ state, viewer, dom, smoke }) {
     });
   }
 
+  // LOD changes can hide/show highlighted cells without changing the selection itself.
+  // Poll the current LOD level so the highlight summary stays accurate.
+  if (viewer.getCurrentLODLevel && viewer.getLodVisibilityArray) {
+    let lastHighlightLodLevel = viewer.getCurrentLODLevel();
+    setInterval(() => {
+      const currentLod = viewer.getCurrentLODLevel();
+      if (currentLod === lastHighlightLodLevel) return;
+      lastHighlightLodLevel = currentLod;
+      // Only update when highlights exist to avoid extra DOM churn
+      if ((state.getHighlightedGroups?.() || []).length > 0) {
+        renderHighlightSummary();
+      }
+    }, 200);
+  }
+
   // Initialize first highlight page if none exist
   if (state.ensureHighlightPage) {
     state.ensureHighlightPage();
@@ -856,6 +929,8 @@ export function initUI({ state, viewer, dom, smoke }) {
       viewer.setHighlightMode('none');
     }
   }
+
+  initHighlightModeButtons();
 
   // Wire up clear all button
   if (clearAllHighlightsBtn) {
@@ -1098,6 +1173,7 @@ export function initUI({ state, viewer, dom, smoke }) {
   }
 
   function renderLegend(field) {
+    setDisplayOptionsVisibility(field);
     legendEl.innerHTML = '';
     if (!field) return;
     const model = state.getLegendModel(field);
@@ -1781,15 +1857,6 @@ export function initUI({ state, viewer, dom, smoke }) {
       badgeIndex++;
     }
 
-    if (!snapshots.length && !liveViewHidden) {
-      const info = document.createElement('div');
-      info.className = 'filter-info';
-      info.textContent = 'Configure a view and press "Keep view" to add panels.';
-      splitViewBadges.appendChild(info);
-      syncActiveViewSelectOptions();
-      return;
-    }
-
     snapshots.forEach((snap) => {
       const badge = document.createElement('div');
       badge.className = 'split-badge';
@@ -1903,6 +1970,13 @@ export function initUI({ state, viewer, dom, smoke }) {
       state.syncSnapshotContexts(snapshots.map((s) => s.id));
     }
     const hasSnaps = snapshots.length > 0;
+    const hasMultipleViews = snapshots.length > 0; // live view + snapshots
+    if (splitViewBadgesBox) {
+      splitViewBadgesBox.style.display = hasMultipleViews ? '' : 'none';
+    }
+    if (splitViewBoxTitle) {
+      splitViewBoxTitle.style.display = hasMultipleViews ? '' : 'none';
+    }
 
     syncActiveViewSelectOptions();
 
@@ -1914,6 +1988,14 @@ export function initUI({ state, viewer, dom, smoke }) {
     }
     if (splitClearBtn) {
       splitClearBtn.disabled = !hasSnaps;
+    }
+    if (cameraLockBtn) {
+      cameraLockBtn.disabled = !hasMultipleViews;
+      cameraLockBtn.title = hasMultipleViews
+        ? (viewer.getCamerasLocked()
+            ? 'Cameras linked (click to unlink)'
+            : 'Cameras independent (click to link)')
+        : 'Add a kept view to link cameras';
     }
 
     if (viewLayoutModeSelect) {
@@ -2019,6 +2101,7 @@ export function initUI({ state, viewer, dom, smoke }) {
         geneExpressionSearch.value = '';
       }
       legendEl.innerHTML = '';
+      setDisplayOptionsVisibility(null);
       handleOutlierUI(null);
       renderFilterSummary();
       if (cleared) {
@@ -2859,12 +2942,10 @@ export function initUI({ state, viewer, dom, smoke }) {
   if (cameraLockBtn) {
     function updateCameraLockUI() {
       const locked = viewer.getCamerasLocked();
-      const linkedPaths = cameraLockBtn.querySelectorAll('.lock-linked');
-      const unlinkedPaths = cameraLockBtn.querySelectorAll('.lock-unlinked');
-      linkedPaths.forEach(p => p.style.display = locked ? '' : 'none');
-      unlinkedPaths.forEach(p => p.style.display = locked ? 'none' : '');
+      // Active (black) state represents Unlocked; normal represents Locked
+      cameraLockBtn.setAttribute('aria-pressed', locked ? 'false' : 'true');
+      cameraLockBtn.textContent = locked ? 'Locked Cam' : 'Unlocked Cam';
       cameraLockBtn.title = locked ? 'Cameras linked (click to unlink)' : 'Cameras independent (click to link)';
-      cameraLockBtn.classList.toggle('camera-unlocked', !locked);
     }
     cameraLockBtn.addEventListener('click', () => {
       const newLocked = !viewer.getCamerasLocked();

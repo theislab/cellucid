@@ -52,6 +52,9 @@ export class Octree {
     console.time('LOD generation');
     this.lodLevels = this._generateLODLevels();
     console.timeEnd('LOD generation');
+
+    // Pre-compute LOD indices per octree node for fast frustum culling
+    this._buildLODNodeMappings();
   }
 
   _createIndexArray(count) {
@@ -393,7 +396,14 @@ export class Octree {
     return sampledIndices;
   }
 
-  getLODLevel(distance, viewportHeight, targetPointsOnScreen = 500000) {
+  /**
+   * Get LOD level for a given camera distance.
+   * @param {number} distance - Camera distance from target
+   * @param {number} viewportHeight - Viewport height in pixels
+   * @param {number} previousLevel - Previous LOD level for this view (for hysteresis). Pass -1 or undefined for first call.
+   * @returns {number} LOD level (0 = highest detail)
+   */
+  getLODLevel(distance, viewportHeight, previousLevel = -1) {
     if (this.lodLevels.length === 0) return -1;
 
     const numLevels = this.lodLevels.length;
@@ -419,11 +429,8 @@ export class Octree {
     // Apply hysteresis with large dead zone to prevent oscillation
     const HYSTERESIS = 0.7;
 
-    if (this._lastLODLevel === undefined) {
-      this._lastLODLevel = Math.round(targetLevel);
-    }
-
-    const currentLevel = this._lastLODLevel;
+    // Use passed previousLevel for per-view hysteresis (instead of global state)
+    const currentLevel = previousLevel >= 0 ? previousLevel : Math.round(targetLevel);
     let newLevel = currentLevel;
 
     if (targetLevel > currentLevel + HYSTERESIS && currentLevel < numLevels - 1) {
@@ -432,7 +439,6 @@ export class Octree {
       newLevel = currentLevel - 1;
     }
 
-    this._lastLODLevel = newLevel;
     return Math.max(0, Math.min(numLevels - 1, newLevel));
   }
 
@@ -533,6 +539,78 @@ export class Octree {
     const radius = Math.sqrt(dx * dx + dy * dy + dz * dz) * 0.5;
 
     return { center: [centerX, centerY, centerZ], radius };
+  }
+
+  /**
+   * Pre-compute which LOD buffer vertices belong to each octree leaf node.
+   * This eliminates O(LOD points) iteration during frustum culling.
+   */
+  _buildLODNodeMappings() {
+    console.time('LOD node mapping');
+
+    for (let levelIdx = 0; levelIdx < this.lodLevels.length; levelIdx++) {
+      const level = this.lodLevels[levelIdx];
+      if (level.isFullDetail) continue;
+
+      // Build reverse map: originalIndex -> lodVertexIndex
+      const reverseMap = new Map();
+      for (let lodVertexIdx = 0; lodVertexIdx < level.indices.length; lodVertexIdx++) {
+        reverseMap.set(level.indices[lodVertexIdx], lodVertexIdx);
+      }
+
+      // Attach LOD indices to each leaf node
+      this._attachLODIndicesToNodes(this.root, levelIdx, reverseMap);
+    }
+
+    console.timeEnd('LOD node mapping');
+  }
+
+  _attachLODIndicesToNodes(node, levelIdx, reverseMap) {
+    if (!node) return;
+
+    if (node.indices) {
+      // Leaf node - compute LOD vertex indices for this node
+      const lodIndices = [];
+      for (let i = 0; i < node.indices.length; i++) {
+        const lodVertexIdx = reverseMap.get(node.indices[i]);
+        if (lodVertexIdx !== undefined) {
+          lodIndices.push(lodVertexIdx);
+        }
+      }
+      // Store as typed array for efficiency
+      if (!node.lodIndices) node.lodIndices = {};
+      node.lodIndices[levelIdx] = lodIndices.length > 0
+        ? new Uint32Array(lodIndices)
+        : null;
+    } else if (node.children) {
+      for (const child of node.children) {
+        this._attachLODIndicesToNodes(child, levelIdx, reverseMap);
+      }
+    }
+  }
+
+  /**
+   * Validate that octree contains all original points.
+   * Returns the total count of points in all leaf nodes.
+   */
+  validatePointCount() {
+    let count = 0;
+    const countLeaves = (node) => {
+      if (!node) return;
+      if (node.indices) {
+        count += node.indices.length;
+      } else if (node.children) {
+        for (const child of node.children) {
+          countLeaves(child);
+        }
+      }
+    };
+    countLeaves(this.root);
+    const valid = count === this.pointCount;
+    if (!valid) {
+      console.error(`[Octree] Point count mismatch: octree has ${count}, expected ${this.pointCount}`);
+    }
+    return { count, expected: this.pointCount, valid };
   }
 }
 
@@ -673,6 +751,10 @@ export class HighPerfRenderer {
     this._visibleIndicesBuffer = null;
     this._visibleIndicesCapacity = 0;
 
+    // Per-view state for multi-view rendering (frustum culling and LOD)
+    // Each view needs its own cache to avoid cross-view interference
+    this._perViewState = new Map(); // viewId -> { lastFrustumMVP, cachedCulledCount, prevLodLevel }
+
     this._init();
   }
 
@@ -697,6 +779,69 @@ export class HighPerfRenderer {
 
     // Set default quality
     this.setQuality(this.activeQuality);
+  }
+
+  /**
+   * Get or create per-view state for multi-view rendering.
+   * Each view maintains its own frustum cache, LOD state, index buffer, AND frustum planes to avoid cross-view interference.
+   * @param {string} viewId - View identifier (defaults to 'default' for single-view mode)
+   * @returns {Object} Per-view state object with lastFrustumMVP, cachedCulledCount, prevLodLevel, indexBuffer, frustumPlanes
+   */
+  _getViewState(viewId = 'default') {
+    if (!this._perViewState.has(viewId)) {
+      // Create per-view index buffer for frustum culling
+      const gl = this.gl;
+      const indexBuffer = gl.createBuffer();
+      this._perViewState.set(viewId, {
+        lastFrustumMVP: null,
+        cachedCulledCount: 0,
+        cachedVisibleIndices: null,
+        cachedLodVisibleIndices: null,  // For LOD + frustum culling combined
+        cachedLodLevel: -1,              // LOD level for which indices were cached
+        cachedLodIsCulled: false,        // Whether cached indices are frustum-culled (vs full LOD)
+        prevLodLevel: undefined,         // For logging LOD changes
+        lastLodLevel: -1,                // For per-view LOD hysteresis
+        lastVisibleCount: undefined,     // For logging visible count changes
+        indexBuffer: indexBuffer,        // Per-view index buffer (avoids shared buffer conflicts)
+        indexBufferSize: 0,              // Current size of uploaded index buffer
+        // Per-view frustum planes to avoid shared state issues in multi-view rendering
+        frustumPlanes: [
+          new Float32Array(4), new Float32Array(4), new Float32Array(4),
+          new Float32Array(4), new Float32Array(4), new Float32Array(4)
+        ]
+      });
+    }
+    return this._perViewState.get(viewId);
+  }
+
+  /**
+   * Clear per-view state for a specific view (call when view is removed)
+   * @param {string} viewId - View identifier to clear
+   */
+  clearViewState(viewId) {
+    const viewState = this._perViewState.get(viewId);
+    if (viewState) {
+      // Clean up the per-view index buffer
+      const gl = this.gl;
+      if (viewState.indexBuffer) {
+        gl.deleteBuffer(viewState.indexBuffer);
+      }
+      this._perViewState.delete(viewId);
+    }
+  }
+
+  /**
+   * Clear all per-view state (call on data reload or major state reset)
+   */
+  clearAllViewState() {
+    // Clean up all per-view index buffers before clearing
+    const gl = this.gl;
+    for (const viewState of this._perViewState.values()) {
+      if (viewState.indexBuffer) {
+        gl.deleteBuffer(viewState.indexBuffer);
+      }
+    }
+    this._perViewState.clear();
   }
 
   _createPrograms() {
@@ -813,19 +958,42 @@ export class HighPerfRenderer {
     this.pointCount = positions.length / 3;
     console.log(`[HighPerfRenderer] Loading ${this.pointCount.toLocaleString()} points...`);
 
+    // Normalize colors to RGBA Uint8Array format
+    // This ensures all downstream code can safely assume 4-component colors
+    const expectedRGBA = this.pointCount * 4;
+    const expectedRGB = this.pointCount * 3;
+    let normalizedColors = colors;
+
+    if (colors.length === expectedRGB) {
+      // Convert RGB to RGBA (add alpha = 255)
+      console.log('[HighPerfRenderer] Converting RGB colors to RGBA');
+      normalizedColors = new Uint8Array(expectedRGBA);
+      for (let i = 0; i < this.pointCount; i++) {
+        normalizedColors[i * 4]     = colors[i * 3];
+        normalizedColors[i * 4 + 1] = colors[i * 3 + 1];
+        normalizedColors[i * 4 + 2] = colors[i * 3 + 2];
+        normalizedColors[i * 4 + 3] = 255; // Fully opaque
+      }
+    } else if (colors.length !== expectedRGBA) {
+      console.error(`[HighPerfRenderer] Invalid colors array length: ${colors.length}, expected ${expectedRGBA} (RGBA) or ${expectedRGB} (RGB)`);
+    }
+
     // Store references to original data for frustum culling
     // Alpha is packed in colors as RGBA uint8 - no separate array needed
     this._positions = positions;
-    this._colors = colors;
+    this._colors = normalizedColors;
 
     this._firstRenderDone = false;
+
+    // Clear all per-view state (cached frustum culling indices become invalid with new data)
+    this.clearAllViewState();
 
     const startTime = performance.now();
 
     // Build octree for LOD and/or frustum culling
     if (buildOctree && this.pointCount > 10000) {
       console.log('[HighPerfRenderer] Building octree for LOD/frustum culling...');
-      this.octree = new Octree(positions, colors, maxPointsPerNode);
+      this.octree = new Octree(positions, normalizedColors, maxPointsPerNode);
       // Reset LOD state when new data is loaded
       this.octree._lastLODLevel = undefined;
       console.log(`[HighPerfRenderer] Octree built with ${this.octree.lodLevels.length} LOD levels (hierarchical sampling)`);
@@ -842,7 +1010,7 @@ export class HighPerfRenderer {
     }
 
     // Create main data buffers
-    this._createInterleavedBuffer(positions, colors);
+    this._createInterleavedBuffer(positions, normalizedColors);
 
     // Create alpha texture for efficient alpha-only updates
     this._createAlphaTexture(this.pointCount);
@@ -1141,7 +1309,23 @@ export class HighPerfRenderer {
     // so same reference doesn't mean same content.
     if (!colors) return;
 
-    this._colors = colors; // Now Uint8Array with RGBA packed
+    // Normalize colors to RGBA if needed (same logic as loadData)
+    const expectedRGBA = this.pointCount * 4;
+    const expectedRGB = this.pointCount * 3;
+    let normalizedColors = colors;
+
+    if (colors.length === expectedRGB) {
+      // Convert RGB to RGBA (add alpha = 255)
+      normalizedColors = new Uint8Array(expectedRGBA);
+      for (let i = 0; i < this.pointCount; i++) {
+        normalizedColors[i * 4]     = colors[i * 3];
+        normalizedColors[i * 4 + 1] = colors[i * 3 + 1];
+        normalizedColors[i * 4 + 2] = colors[i * 3 + 2];
+        normalizedColors[i * 4 + 3] = 255;
+      }
+    }
+
+    this._colors = normalizedColors; // Uint8Array with RGBA packed
     this._currentAlphas = null; // Reset alpha tracking since colors changed
 
     // Mark buffers as dirty - actual rebuild deferred to render() to avoid double rebuilds
@@ -1436,10 +1620,16 @@ export class HighPerfRenderer {
     this.fogFar = distToCenter + sphere.radius;
   }
 
-  extractFrustumPlanes(mvpMatrix, margin = 0.05) {
+  /**
+   * Extract frustum planes from MVP matrix.
+   * @param {Float32Array} mvpMatrix - Model-View-Projection matrix
+   * @param {Array<Float32Array>} [targetPlanes] - Optional per-view planes array to write to (for multi-view rendering)
+   * @returns {Array<Float32Array>} The 6 frustum planes
+   */
+  extractFrustumPlanes(mvpMatrix, targetPlanes = null) {
     const m = mvpMatrix;
-    // Reuse pre-allocated planes array to avoid GC allocations every frame
-    const planes = this._frustumPlanes;
+    // Use per-view planes if provided, otherwise fall back to shared planes
+    const planes = targetPlanes || this._frustumPlanes;
 
     // Left plane
     planes[0][0] = m[3] + m[0];
@@ -1477,7 +1667,15 @@ export class HighPerfRenderer {
     planes[5][2] = m[11] - m[10];
     planes[5][3] = m[15] - m[14];
 
-    // Normalize planes and apply margin
+    // Compute scale-aware margin based on bounding sphere
+    // This ensures the margin is appropriate regardless of scene scale
+    const sphere = this._boundingSphere || (this.octree ? this.octree.getBoundingSphere() : null);
+    const sceneScale = sphere ? sphere.radius : 1.0;
+    // Base margin of 10% of scene scale, minimum 0.2 for small scenes
+    // Increased from 5% to be more generous in multi-view scenarios
+    const baseMargin = Math.max(0.2, sceneScale * 0.10);
+
+    // Normalize planes and apply scale-aware margin
     for (let i = 0; i < 6; i++) {
       const plane = planes[i];
       const len = Math.sqrt(plane[0] * plane[0] + plane[1] * plane[1] + plane[2] * plane[2]);
@@ -1487,11 +1685,21 @@ export class HighPerfRenderer {
         plane[2] /= len;
         plane[3] /= len;
       }
-      // Expand left/right/top/bottom planes outward (indices 0-3)
-      // Positive margin pushes planes away from center, enlarging the frustum
-      if (i < 4 && margin > 0) {
-        plane[3] += margin;
+      // Expand planes outward - positive margin pushes planes away from center, enlarging the frustum
+      // Use generous margins to prevent aggressive culling in multi-view mode
+      let planeMargin;
+      if (i === 5) {
+        // Far plane: largest margin to prevent popping at distance
+        planeMargin = baseMargin * 8.0;
+      } else if (i === 4) {
+        // Near plane: moderate margin
+        planeMargin = baseMargin * 3.0;
+      } else {
+        // Side planes (left, right, top, bottom): very generous margin for multi-view
+        // This ensures points near frustum edges aren't incorrectly culled
+        planeMargin = baseMargin * 2.5;
       }
+      plane[3] += planeMargin;
     }
 
     return planes;
@@ -1539,8 +1747,12 @@ export class HighPerfRenderer {
       cameraDistance = 3.0,
       cameraPosition = [0, 0, 3],
       forceLOD = -1,
-      quality = this.activeQuality
+      quality = this.activeQuality,
+      viewId = 'default'  // Per-view state identifier for multi-view rendering
     } = params;
+
+    // Get per-view state for frustum culling and LOD caching
+    const viewState = this._getViewState(viewId);
 
     const gl = this.gl;
     const frameStart = performance.now();
@@ -1572,37 +1784,57 @@ export class HighPerfRenderer {
     // Priority: this.forceLODLevel > params.forceLOD > adaptive
     let lodLevel = this.forceLODLevel >= 0 ? this.forceLODLevel : forceLOD;
     if (lodLevel < 0 && this.useAdaptiveLOD && this.octree) {
-      lodLevel = this.octree.getLODLevel(cameraDistance, viewportHeight);
+      // Pass per-view lastLodLevel for hysteresis (prevents oscillation per-view)
+      lodLevel = this.octree.getLODLevel(cameraDistance, viewportHeight, viewState.lastLodLevel);
+      viewState.lastLodLevel = lodLevel;  // Store for next frame's hysteresis
+    }
+
+    // Safeguard: if LOD is disabled, ensure lodLevel stays -1
+    if (!this.useAdaptiveLOD && this.forceLODLevel < 0 && forceLOD < 0) {
+      lodLevel = -1;
     }
 
     const useFullDetail = lodLevel < 0 || !this.lodBuffers.length ||
       lodLevel >= this.lodBuffers.length ||
       (this.lodBuffers[lodLevel] && this.lodBuffers[lodLevel].isFullDetail);
 
-    // Debug LOD selection - only log when level changes
-    if (this._prevLodLevel !== lodLevel && this.octree && (this.useAdaptiveLOD || this.forceLODLevel >= 0)) {
+    // Debug LOD selection - only log when level changes (per-view tracking)
+    if (viewState.prevLodLevel !== lodLevel && this.octree && (this.useAdaptiveLOD || this.forceLODLevel >= 0)) {
       const lodBuf = this.lodBuffers[lodLevel];
       const pointCount = lodBuf ? lodBuf.pointCount : this.pointCount;
       const mode = this.forceLODLevel >= 0 ? 'forced' : 'auto';
-      console.log(`[LOD] Transition: level ${this._prevLodLevel ?? 'init'} → ${lodLevel} (${pointCount.toLocaleString()} pts, ${mode})`);
-      this._prevLodLevel = lodLevel;
+      console.log(`[LOD] View ${viewId}: level ${viewState.prevLodLevel ?? 'init'} → ${lodLevel} (${pointCount.toLocaleString()} pts, ${mode})`);
+      viewState.prevLodLevel = lodLevel;
     }
 
-    // Frustum culling only applies when at full detail (highest LOD or LOD disabled)
-    // At reduced LOD levels, the point count is already reduced so frustum culling has less benefit
-    if (this.useFrustumCulling && this.octree && useFullDetail) {
-      const frustumPlanes = this.extractFrustumPlanes(mvpMatrix);
-      this._renderWithFrustumCulling(params, frustumPlanes);
+    // Frustum culling can be combined with LOD for maximum performance
+    // Each view gets independent frustum culling via its own per-view state and frustum planes
+    if (this.useFrustumCulling && this.octree) {
+      // Use per-view frustum planes to avoid shared state issues in multi-view rendering
+      const frustumPlanes = this.extractFrustumPlanes(mvpMatrix, viewState.frustumPlanes);
+
+      // Debug: log render path on first frame or when path changes
+      const renderPath = useFullDetail ? 'frustum-only' : 'LOD+frustum';
+      if (viewState._lastRenderPath !== renderPath) {
+        console.log(`[Render] View ${viewId}: ${renderPath} (lodLevel=${lodLevel}, useAdaptiveLOD=${this.useAdaptiveLOD}, lodBuffers=${this.lodBuffers.length})`);
+        viewState._lastRenderPath = renderPath;
+      }
+
+      if (useFullDetail) {
+        // Full detail: standard frustum culling
+        this._renderWithFrustumCulling(params, frustumPlanes, viewState);
+      } else {
+        // LOD active: combined LOD + frustum culling for maximum performance
+        this._renderLODWithFrustumCulling(lodLevel, params, frustumPlanes, viewState);
+      }
       this.stats.lastFrameTime = performance.now() - frameStart;
       this.stats.fps = Math.round(1000 / Math.max(this.stats.lastFrameTime, 1));
       return this.stats;
     }
 
     // Reset frustum culling stats when not using it
-    if (!this.useFrustumCulling || !useFullDetail) {
-      this.stats.frustumCulled = false;
-      this.stats.cullPercent = 0;
-    }
+    this.stats.frustumCulled = false;
+    this.stats.cullPercent = 0;
 
     if (useFullDetail) {
       this._renderFullDetail(params);
@@ -1616,26 +1848,43 @@ export class HighPerfRenderer {
     return this.stats;
   }
 
-  _renderWithFrustumCulling(params, frustumPlanes) {
+  _renderWithFrustumCulling(params, frustumPlanes, viewState) {
     const gl = this.gl;
     const {
       mvpMatrix, viewMatrix, modelMatrix, projectionMatrix,
       pointSize, sizeAttenuation, viewportHeight, fov,
-      lightingStrength, fogDensity, fogColor, lightDir
+      lightingStrength, fogDensity, fogColor, lightDir,
+      viewId = 'default'
     } = params;
 
-    const needsUpdate = this._checkFrustumCacheValid(mvpMatrix);
+    // One-time validation: ensure octree contains all points
+    if (!this._octreeValidated && this.octree) {
+      const validation = this.octree.validatePointCount();
+      if (!validation.valid) {
+        console.error(`[FrustumCulling] Octree validation failed - some points may be missing`);
+      }
+      this._octreeValidated = true;
+    }
+
+    const needsUpdate = this._checkFrustumCacheValid(mvpMatrix, viewState);
 
     if (needsUpdate) {
       const visibleNodes = [];
       this._collectVisibleNodes(this.octree.root, frustumPlanes, visibleNodes);
 
       if (visibleNodes.length === 0) {
-        this.stats.visiblePoints = 0;
-        this.stats.drawCalls = 0;
-        this.stats.frustumCulled = true;
-        this.stats.cullPercent = 100;
-        this._cachedCulledCount = 0;
+        // Frustum culling says nothing is visible - this likely means the frustum
+        // calculation has edge cases. Fall back to full detail rather than showing nothing.
+        // Only log once per view (not every frame)
+        if (!viewState._noVisibleNodesWarned) {
+          console.warn(`[FrustumCulling] View ${viewId}: No visible nodes - falling back to full detail`);
+          viewState._noVisibleNodesWarned = true;
+        }
+        viewState.cachedCulledCount = 0;
+        viewState.cachedVisibleIndices = null;
+        this.stats.frustumCulled = false;
+        this.stats.cullPercent = 0;
+        this._renderFullDetail(params);
         return;
       }
 
@@ -1670,30 +1919,33 @@ export class HighPerfRenderer {
 
       // If >98% visible, render everything (building culled buffer not worth it)
       if (visibleRatio > 0.98) {
-        if (this._lastVisibleCount !== this.pointCount) {
-          console.log(`[FrustumCulling] ${this.pointCount.toLocaleString()} visible (full detail, ${cullPercent.toFixed(1)}% culled)`);
-          this._lastVisibleCount = this.pointCount;
-        }
-        this._cachedCulledCount = 0;
+        viewState.cachedCulledCount = 0;
+        viewState.cachedVisibleIndices = null;
+        viewState._noVisibleNodesWarned = false;  // Reset warning flag
         this.stats.frustumCulled = false;
         this.stats.cullPercent = cullPercent;
         this._renderFullDetail(params);
         return;
       }
 
-      // Log whenever visible count changes
-      if (this._lastVisibleCount !== visibleCount) {
-        console.log(`[FrustumCulling] ${visibleCount.toLocaleString()}/${this.pointCount.toLocaleString()} visible (${cullPercent.toFixed(1)}% culled)`);
-        this._lastVisibleCount = visibleCount;
+      // Log only on significant change (>10% of total points)
+      if (this._isSignificantChange(viewState.lastVisibleCount, visibleCount, this.pointCount)) {
+        console.log(`[FrustumCulling] View ${viewId}: ${visibleCount.toLocaleString()}/${this.pointCount.toLocaleString()} visible (${cullPercent.toFixed(1)}% culled)`);
+        viewState.lastVisibleCount = visibleCount;
       }
 
-      this._updateCulledIndexBuffer(visibleIndices);
-      this._cachedCulledCount = visibleIndices.length;
+      // Store visible indices in per-view state (for cache validation)
+      viewState.cachedVisibleIndices = new Uint32Array(visibleIndices);
+      viewState.cachedCulledCount = visibleIndices.length;
+      viewState._noVisibleNodesWarned = false;  // Reset warning flag since we have visible nodes
+
+      // Upload to per-view index buffer (each view has its own buffer to avoid conflicts)
+      this._uploadToViewIndexBuffer(viewState, visibleIndices);
       this.stats.frustumCulled = true;
       this.stats.cullPercent = cullPercent;
     }
 
-    if (!this._cachedCulledCount || this._cachedCulledCount === 0) {
+    if (!viewState.cachedCulledCount || viewState.cachedCulledCount === 0) {
       this._renderFullDetail(params);
       return;
     }
@@ -1751,17 +2003,25 @@ export class HighPerfRenderer {
       gl.uniform3fv(uniforms.u_lightDir, lightDir);
     }
 
+    // Defensive check: ensure index buffer is valid before drawing
+    // If indexBufferSize doesn't match cachedCulledCount, the buffer might be stale
+    if (viewState.indexBufferSize !== viewState.cachedCulledCount) {
+      console.warn(`[FrustumCulling] View ${viewId}: Index buffer size mismatch (${viewState.indexBufferSize} vs ${viewState.cachedCulledCount}) - falling back to full detail`);
+      this._renderFullDetail(params);
+      return;
+    }
+
     // Bind alpha texture for efficient alpha lookups
     // Note: With indexed drawing (drawElements), gl_VertexID is the index value,
     // which correctly maps to the original point index in our alpha texture
     this._bindAlphaTexture(gl, uniforms);
 
-    // Bind the main VAO (vertex data) and the index buffer for indexed drawing
+    // Bind the main VAO (vertex data) and the per-view index buffer for indexed drawing
     gl.bindVertexArray(this.vao);
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, viewState.indexBuffer);
 
     // Draw using indexed rendering - much faster than copying vertex data
-    gl.drawElements(gl.POINTS, this._cachedCulledCount, gl.UNSIGNED_INT, 0);
+    gl.drawElements(gl.POINTS, viewState.cachedCulledCount, gl.UNSIGNED_INT, 0);
 
     gl.bindVertexArray(null);
 
@@ -1769,31 +2029,36 @@ export class HighPerfRenderer {
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, null);
 
-    this.stats.visiblePoints = this._cachedCulledCount;
+    this.stats.visiblePoints = viewState.cachedCulledCount;
     this.stats.lodLevel = -1;
     this.stats.drawCalls = 1;
   }
 
-  _checkFrustumCacheValid(mvpMatrix) {
-    if (!this._lastFrustumMVP) {
-      this._lastFrustumMVP = new Float32Array(mvpMatrix);
+  _checkFrustumCacheValid(mvpMatrix, viewState) {
+    if (!viewState.lastFrustumMVP) {
+      // First time for this view - create a COPY of the mvpMatrix (not a reference)
+      viewState.lastFrustumMVP = new Float32Array(16);
+      for (let i = 0; i < 16; i++) {
+        viewState.lastFrustumMVP[i] = mvpMatrix[i];
+      }
       return true;
     }
 
     // Use sum of squared differences for more stable detection
     let sumSqDiff = 0;
     for (let i = 0; i < 16; i++) {
-      const diff = mvpMatrix[i] - this._lastFrustumMVP[i];
+      const diff = mvpMatrix[i] - viewState.lastFrustumMVP[i];
       sumSqDiff += diff * diff;
     }
 
-    // Higher threshold to avoid rebuilding on tiny movements
-    // sqrt(0.01) ≈ 0.1 total change across the matrix
-    const threshold = 0.01;
+    // Very low threshold to catch even small camera movements
+    // In multi-view mode, each view has different frustum, so we need to be sensitive
+    // 0.0001 means even tiny changes (0.001 per element average) trigger update
+    const threshold = 0.0001;
 
     if (sumSqDiff > threshold) {
       for (let i = 0; i < 16; i++) {
-        this._lastFrustumMVP[i] = mvpMatrix[i];
+        viewState.lastFrustumMVP[i] = mvpMatrix[i];
       }
       return true;
     }
@@ -1865,14 +2130,41 @@ export class HighPerfRenderer {
     return allInside ? 'inside' : 'partial';
   }
 
+  /**
+   * Upload indices to the per-view index buffer for frustum culling.
+   * Each view has its own index buffer to avoid cross-view conflicts.
+   * @param {Object} viewState - Per-view state object containing indexBuffer
+   * @param {Uint32Array} visibleIndices - Array of visible point indices
+   */
+  _uploadToViewIndexBuffer(viewState, visibleIndices) {
+    const gl = this.gl;
+    // Unbind any VAO first to ensure we're modifying global element buffer state
+    // This prevents accidentally modifying a VAO's element buffer binding
+    gl.bindVertexArray(null);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, viewState.indexBuffer);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, visibleIndices, gl.DYNAMIC_DRAW);
+    viewState.indexBufferSize = visibleIndices.length;
+    // Unbind element buffer to clean state
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
+  }
+
+  /**
+   * Check if visible count change is significant enough to log.
+   * Logs on first call and when cull percentage changes by >10 percentage points.
+   */
+  _isSignificantChange(lastCount, newCount, totalCount) {
+    if (lastCount === undefined || lastCount === null) return true;
+    if (totalCount === 0) return false;
+    const lastPercent = (lastCount / totalCount) * 100;
+    const newPercent = (newCount / totalCount) * 100;
+    return Math.abs(newPercent - lastPercent) > 10;
+  }
+
+  // Legacy method for backward compatibility
   _updateCulledIndexBuffer(visibleIndices) {
     const gl = this.gl;
-
-    // visibleIndices is already a Uint32Array - upload directly to GPU
-    // This avoids any CPU-side copying, making frustum culling much faster
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, visibleIndices, gl.DYNAMIC_DRAW);
-
     this._culledPointCount = visibleIndices.length;
   }
 
@@ -1912,7 +2204,9 @@ export class HighPerfRenderer {
       gl.uniformMatrix4fv(uniforms.u_projectionMatrix, false, projectionMatrix);
     }
 
-    gl.uniform1f(uniforms.u_pointSize, pointSize);
+    if (uniforms.u_pointSize !== null) {
+      gl.uniform1f(uniforms.u_pointSize, pointSize);
+    }
 
     if (uniforms.u_sizeAttenuation) {
       gl.uniform1f(uniforms.u_sizeAttenuation, sizeAttenuation);
@@ -2037,11 +2331,11 @@ export class HighPerfRenderer {
 
     const adjustedPointSize = pointSize * (lod.sizeMultiplier || 1.0);
 
-    const program = this.programs.full;
-    let uniforms = this.uniformLocations.get('full');
+    const program = this.activeProgram;
+    let uniforms = this.uniformLocations.get(this.activeQuality);
 
     if (!uniforms || !program) {
-      console.error('[HighPerfRenderer] No valid program for LOD rendering');
+      console.error('[HighPerfRenderer] No valid program for LOD rendering, quality:', this.activeQuality);
       return;
     }
 
@@ -2111,6 +2405,192 @@ export class HighPerfRenderer {
     this.stats.drawCalls = 1;
   }
 
+  /**
+   * Render with combined LOD and frustum culling.
+   * This provides maximum performance by both reducing point count (LOD) and
+   * culling out-of-view points (frustum culling) simultaneously.
+   * Uses per-view index buffer to avoid cross-view conflicts.
+   * @private
+   */
+  _renderLODWithFrustumCulling(lodLevel, params, frustumPlanes, viewState) {
+    const gl = this.gl;
+    const lod = this.lodBuffers[lodLevel];
+
+    if (!lod || lod.isFullDetail) {
+      // Fall back to standard frustum culling at full detail
+      this._renderWithFrustumCulling(params, frustumPlanes, viewState);
+      return;
+    }
+
+    // One-time validation: ensure LOD indices are properly initialized
+    if (!this._lodIndicesValidated?.[lodLevel] && this.octree) {
+      let totalLodIndices = 0;
+      const countLodIndices = (node) => {
+        if (!node) return;
+        if (node.indices && node.lodIndices?.[lodLevel]) {
+          totalLodIndices += node.lodIndices[lodLevel].length;
+        } else if (node.children) {
+          for (const child of node.children) countLodIndices(child);
+        }
+      };
+      countLodIndices(this.octree.root);
+      const expectedCount = lod.pointCount;
+      if (totalLodIndices !== expectedCount) {
+        console.warn(`[LOD+Frustum] LOD ${lodLevel} indices mismatch: nodes have ${totalLodIndices}, LOD buffer has ${expectedCount}`);
+      }
+      if (!this._lodIndicesValidated) this._lodIndicesValidated = {};
+      this._lodIndicesValidated[lodLevel] = true;
+    }
+
+    const {
+      mvpMatrix, viewMatrix, modelMatrix, projectionMatrix,
+      pointSize, sizeAttenuation, viewportHeight, fov,
+      lightingStrength, fogDensity, fogColor, lightDir,
+      viewId = 'default'
+    } = params;
+
+    // Check if we need to recompute the frustum-culled LOD indices
+    const frustumChanged = this._checkFrustumCacheValid(mvpMatrix, viewState);
+    const lodLevelChanged = viewState.cachedLodLevel !== lodLevel;
+    const needsUpdate = frustumChanged || lodLevelChanged;
+
+    if (needsUpdate) {
+      // Step 1: Collect visible octree nodes
+      const visibleNodes = [];
+      this._collectVisibleNodes(this.octree.root, frustumPlanes, visibleNodes);
+
+      if (visibleNodes.length === 0) {
+        // Fallback to LOD without frustum culling when no visible nodes
+        // Only log once per view (not every frame)
+        if (!viewState._noVisibleNodesWarned) {
+          console.warn(`[LOD+Frustum] View ${viewId}: No visible nodes - falling back to LOD without frustum`);
+          viewState._noVisibleNodesWarned = true;
+        }
+        viewState.cachedCulledCount = 0;
+        viewState.cachedLodVisibleIndices = null;
+        viewState.cachedLodLevel = lodLevel;
+        viewState.cachedLodIsCulled = false;
+        this.stats.frustumCulled = false;
+        this.stats.cullPercent = 0;
+        this.stats.lodLevel = lodLevel;
+        this._renderLOD(lodLevel, params);
+        return;
+      }
+
+      // Step 2: Collect pre-computed LOD indices from visible nodes - O(visible nodes)
+      // Each node has pre-computed lodIndices[level] mapping to LOD buffer vertices
+      const visibleLodIndices = [];
+      for (const node of visibleNodes) {
+        const nodeLodIndices = node.lodIndices?.[lodLevel];
+        if (nodeLodIndices) {
+          for (let i = 0; i < nodeLodIndices.length; i++) {
+            visibleLodIndices.push(nodeLodIndices[i]);
+          }
+        }
+      }
+
+      const visibleCount = visibleLodIndices.length;
+      const totalLodPoints = lod.pointCount;
+      const visibleRatio = visibleCount / totalLodPoints;
+      const cullPercent = ((1 - visibleRatio) * 100);
+
+      // If >98% visible, render full LOD without culling
+      if (visibleRatio > 0.98) {
+        viewState.cachedCulledCount = 0;
+        viewState.cachedLodVisibleIndices = null;
+        viewState.cachedLodLevel = lodLevel;
+        viewState.cachedLodIsCulled = false;
+        viewState._noVisibleNodesWarned = false;  // Reset warning flag
+        this.stats.frustumCulled = false;
+        this.stats.cullPercent = cullPercent;
+        this._renderLOD(lodLevel, params);
+        return;
+      }
+
+      // Log only on significant change (>10% of total points)
+      if (this._isSignificantChange(viewState.lastVisibleCount, visibleCount, totalLodPoints)) {
+        console.log(`[LOD+Frustum] View ${viewId}: LOD ${lodLevel} - ${visibleCount.toLocaleString()}/${totalLodPoints.toLocaleString()} visible (${cullPercent.toFixed(1)}% culled)`);
+        viewState.lastVisibleCount = visibleCount;
+      }
+
+      // Store the filtered indices for this view
+      const indicesArray = new Uint32Array(visibleLodIndices);
+      viewState.cachedLodVisibleIndices = indicesArray;
+      viewState.cachedCulledCount = visibleCount;
+      viewState.cachedLodLevel = lodLevel;
+      viewState.cachedLodIsCulled = true;  // Mark as culled indices (not full LOD)
+      viewState._noVisibleNodesWarned = false;  // Reset warning flag since we have visible nodes
+
+      // Upload to per-view index buffer
+      this._uploadToViewIndexBuffer(viewState, indicesArray);
+      this.stats.frustumCulled = true;
+      this.stats.cullPercent = cullPercent;
+    }
+
+    // If no visible points after culling, skip rendering
+    if (!viewState.cachedCulledCount || viewState.cachedCulledCount === 0) {
+      this._renderLOD(lodLevel, params);
+      return;
+    }
+
+    // Render using LOD buffer with indexed drawing
+    const adjustedPointSize = pointSize * (lod.sizeMultiplier || 1.0);
+
+    const program = this.activeProgram;
+    const uniforms = this.uniformLocations.get(this.activeQuality);
+
+    if (!uniforms || !program) {
+      console.error('[HighPerfRenderer] No valid program for LOD+Frustum rendering, quality:', this.activeQuality);
+      return;
+    }
+
+    gl.useProgram(program);
+
+    if (uniforms.u_mvpMatrix !== null) gl.uniformMatrix4fv(uniforms.u_mvpMatrix, false, mvpMatrix);
+    if (uniforms.u_viewMatrix !== null) gl.uniformMatrix4fv(uniforms.u_viewMatrix, false, viewMatrix);
+    if (uniforms.u_modelMatrix !== null) gl.uniformMatrix4fv(uniforms.u_modelMatrix, false, modelMatrix);
+    if (uniforms.u_projectionMatrix !== null && projectionMatrix) gl.uniformMatrix4fv(uniforms.u_projectionMatrix, false, projectionMatrix);
+    if (uniforms.u_pointSize !== null) gl.uniform1f(uniforms.u_pointSize, adjustedPointSize);
+    if (uniforms.u_sizeAttenuation !== null) gl.uniform1f(uniforms.u_sizeAttenuation, sizeAttenuation);
+    if (uniforms.u_viewportHeight !== null) gl.uniform1f(uniforms.u_viewportHeight, viewportHeight);
+    if (uniforms.u_fov !== null) gl.uniform1f(uniforms.u_fov, fov);
+    if (uniforms.u_lightingStrength !== null) gl.uniform1f(uniforms.u_lightingStrength, lightingStrength);
+    if (uniforms.u_fogDensity !== null) gl.uniform1f(uniforms.u_fogDensity, fogDensity);
+    if (uniforms.u_fogNear !== null) gl.uniform1f(uniforms.u_fogNear, this.fogNear);
+    if (uniforms.u_fogFar !== null) gl.uniform1f(uniforms.u_fogFar, this.fogFar);
+    if (uniforms.u_fogColor !== null) gl.uniform3fv(uniforms.u_fogColor, fogColor);
+    if (uniforms.u_lightDir !== null) gl.uniform3fv(uniforms.u_lightDir, lightDir);
+
+    // Defensive check: ensure index buffer is valid before drawing
+    if (viewState.indexBufferSize !== viewState.cachedCulledCount) {
+      console.warn(`[LOD+Frustum] View ${viewId}: Index buffer size mismatch - falling back to LOD without frustum`);
+      this._renderLOD(lodLevel, params);
+      return;
+    }
+
+    // Bind alpha texture with LOD index texture for proper alpha lookup
+    this._bindAlphaTexture(gl, uniforms, lodLevel);
+
+    // Bind LOD VAO and per-view index buffer for indexed drawing
+    gl.bindVertexArray(lod.vao);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, viewState.indexBuffer);
+
+    // Draw using indexed rendering into the LOD buffer
+    gl.drawElements(gl.POINTS, viewState.cachedCulledCount, gl.UNSIGNED_INT, 0);
+
+    gl.bindVertexArray(null);
+
+    // Unbind textures
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+
+    this.stats.visiblePoints = viewState.cachedCulledCount;
+    this.stats.lodLevel = lodLevel;
+    this.stats.drawCalls = 1;
+  }
+
   setAdaptiveLOD(enabled) {
     this.useAdaptiveLOD = enabled;
     console.log(`[HighPerfRenderer] Adaptive LOD ${enabled ? 'enabled' : 'disabled'}`);
@@ -2136,6 +2616,29 @@ export class HighPerfRenderer {
     }
   }
 
+  /**
+   * Print current renderer status to console for debugging.
+   * Call this from console: renderer.debugStatus()
+   */
+  debugStatus() {
+    const status = {
+      pointCount: this.pointCount,
+      useAdaptiveLOD: this.useAdaptiveLOD,
+      useFrustumCulling: this.useFrustumCulling,
+      forceLODLevel: this.forceLODLevel,
+      lodBuffersCount: this.lodBuffers.length,
+      hasOctree: !!this.octree,
+      octreePointCount: this.octree?.pointCount,
+      stats: { ...this.stats }
+    };
+    console.log('[HighPerfRenderer] Current Status:', status);
+    if (this.octree) {
+      const validation = this.octree.validatePointCount();
+      console.log('[HighPerfRenderer] Octree Validation:', validation);
+    }
+    return status;
+  }
+
   setForceLOD(level) {
     this.forceLODLevel = level;
     if (level >= 0) {
@@ -2149,10 +2652,8 @@ export class HighPerfRenderer {
     this.useFrustumCulling = enabled;
     console.log(`[HighPerfRenderer] Frustum culling ${enabled ? 'enabled' : 'disabled'}`);
 
-    // Reset frustum culling state
-    this._lastFrustumMVP = null;
-    this._cachedCulledCount = 0;
-    this._lastVisibleCount = undefined;
+    // Reset frustum culling state (per-view state and stats)
+    this.clearAllViewState();
     this.stats.frustumCulled = false;
     this.stats.cullPercent = 0;
 
@@ -2196,6 +2697,17 @@ export class HighPerfRenderer {
    */
   getCurrentLODLevel() {
     return this.stats.lodLevel;
+  }
+
+  /**
+   * Get the size multiplier for the current LOD level (1.0 for full detail).
+   */
+  getCurrentLODSizeMultiplier() {
+    const lodLevel = this.stats.lodLevel;
+    if (lodLevel == null || lodLevel < 0) return 1.0;
+    const lodBuf = this.lodBuffers?.[lodLevel];
+    if (!lodBuf || lodBuf.isFullDetail) return 1.0;
+    return lodBuf.sizeMultiplier || 1.0;
   }
 
   /**
@@ -2257,7 +2769,7 @@ export class HighPerfRenderer {
    * Create a GPU buffer for a snapshot view. Call this once when snapshot is created.
    * The buffer stores interleaved position+color data and is only uploaded once.
    * @param {string} id - Unique snapshot identifier
-   * @param {Uint8Array} colors - RGBA colors (4 bytes per point)
+   * @param {Uint8Array} colors - RGB (3 bytes) or RGBA (4 bytes) colors per point
    * @param {Float32Array} [alphas] - Optional alpha values (0-1), merged into colors
    * @returns {boolean} Success
    */
@@ -2271,8 +2783,24 @@ export class HighPerfRenderer {
     const n = this.pointCount;
     const positions = this._positions;
 
-    // Create a copy of colors to avoid modifying the original
-    const snapshotColors = new Uint8Array(colors);
+    // Normalize colors to RGBA if needed
+    const expectedRGBA = n * 4;
+    const expectedRGB = n * 3;
+    let snapshotColors;
+
+    if (colors.length === expectedRGB) {
+      // Convert RGB to RGBA
+      snapshotColors = new Uint8Array(expectedRGBA);
+      for (let i = 0; i < n; i++) {
+        snapshotColors[i * 4]     = colors[i * 3];
+        snapshotColors[i * 4 + 1] = colors[i * 3 + 1];
+        snapshotColors[i * 4 + 2] = colors[i * 3 + 2];
+        snapshotColors[i * 4 + 3] = 255;
+      }
+    } else {
+      // Create a copy of colors to avoid modifying the original
+      snapshotColors = new Uint8Array(colors);
+    }
 
     // Merge alphas into the color array if provided
     if (alphas) {
@@ -2326,6 +2854,7 @@ export class HighPerfRenderer {
     gl.bindVertexArray(null);
 
     this.snapshotBuffers.set(id, {
+      id,
       vao,
       buffer: glBuffer,
       pointCount: n
@@ -2339,7 +2868,7 @@ export class HighPerfRenderer {
    * Update an existing snapshot buffer with new colors/alphas.
    * More efficient than delete+create as it reuses the GPU buffer.
    * @param {string} id - Snapshot identifier
-   * @param {Uint8Array} colors - RGBA colors
+   * @param {Uint8Array} colors - RGB (3 bytes) or RGBA (4 bytes) colors per point
    * @param {Float32Array} [alphas] - Optional alpha values
    * @returns {boolean} Success
    */
@@ -2354,8 +2883,24 @@ export class HighPerfRenderer {
     const n = this.pointCount;
     const positions = this._positions;
 
-    // Create merged colors
-    const snapshotColors = new Uint8Array(colors);
+    // Normalize colors to RGBA if needed
+    const expectedRGBA = n * 4;
+    const expectedRGB = n * 3;
+    let snapshotColors;
+
+    if (colors.length === expectedRGB) {
+      // Convert RGB to RGBA
+      snapshotColors = new Uint8Array(expectedRGBA);
+      for (let i = 0; i < n; i++) {
+        snapshotColors[i * 4]     = colors[i * 3];
+        snapshotColors[i * 4 + 1] = colors[i * 3 + 1];
+        snapshotColors[i * 4 + 2] = colors[i * 3 + 2];
+        snapshotColors[i * 4 + 3] = 255;
+      }
+    } else {
+      snapshotColors = new Uint8Array(colors);
+    }
+
     if (alphas) {
       const alphaCount = Math.min(n, alphas.length);
       for (let i = 0; i < alphaCount; i++) {
@@ -2427,6 +2972,7 @@ export class HighPerfRenderer {
 
   /**
    * Render using a snapshot's pre-uploaded buffer. No data upload occurs.
+   * Supports frustum culling and LOD for all views (not just the live view).
    * @param {string} id - Snapshot identifier
    * @param {Object} params - Render parameters (same as render())
    * @returns {Object} Stats
@@ -2444,10 +2990,15 @@ export class HighPerfRenderer {
       pointSize = 5.0, sizeAttenuation = 0.0, viewportHeight, fov,
       lightingStrength = 0.6, fogDensity = 0.5,
       fogColor = [1, 1, 1], lightDir = [0.5, 0.7, 0.5],
-      cameraPosition = [0, 0, 3], quality = this.activeQuality
+      cameraPosition = [0, 0, 3], cameraDistance = 3.0,
+      quality = this.activeQuality,
+      viewId  // Per-view state identifier (required for multi-view rendering!)
     } = params;
 
     const frameStart = performance.now();
+
+    // Get per-view state for frustum culling and LOD caching
+    const viewState = this._getViewState(viewId);
 
     // Auto-compute fog range
     if (params.autoFog !== false) {
@@ -2459,6 +3010,63 @@ export class HighPerfRenderer {
       this.setQuality(quality);
     }
 
+    // Select LOD level - priority: forceLODLevel > params.forceLOD > adaptive
+    // Same logic as render() to ensure slider affects all views
+    let lodLevel = this.forceLODLevel >= 0 ? this.forceLODLevel : (params.forceLOD ?? -1);
+    if (lodLevel < 0 && this.useAdaptiveLOD && this.octree) {
+      lodLevel = this.octree.getLODLevel(cameraDistance, viewportHeight, viewState.lastLodLevel);
+      viewState.lastLodLevel = lodLevel;
+    }
+
+    // Get size multiplier from LOD level for visual consistency
+    let sizeMultiplier = 1.0;
+    if (lodLevel >= 0 && lodLevel < this.lodBuffers.length) {
+      const lod = this.lodBuffers[lodLevel];
+      if (lod && !lod.isFullDetail) {
+        sizeMultiplier = lod.sizeMultiplier || 1.0;
+      }
+    }
+
+    // Debug LOD selection for snapshots - only log when level changes (per-view)
+    if (viewState.prevLodLevel !== lodLevel && this.octree && (this.useAdaptiveLOD || this.forceLODLevel >= 0)) {
+      const pointCount = this.octree.lodLevels[lodLevel]?.pointCount || this.pointCount;
+      const mode = this.forceLODLevel >= 0 ? 'forced' : 'auto';
+      console.log(`[LOD] Snapshot ${viewId}: level ${viewState.prevLodLevel ?? 'init'} → ${lodLevel} (${pointCount.toLocaleString()} pts, ${mode})`);
+      viewState.prevLodLevel = lodLevel;
+    }
+
+    // Determine if we should use full detail or LOD
+    const useFullDetail = lodLevel < 0 || !this.lodBuffers.length ||
+      lodLevel >= this.lodBuffers.length ||
+      (this.lodBuffers[lodLevel] && this.lodBuffers[lodLevel].isFullDetail);
+
+    // Frustum culling and LOD can be combined for snapshots too
+    // Snapshots share positions with main buffer, so octree indices work
+    // Use per-view frustum planes to avoid shared state issues in multi-view rendering
+    if (this.useFrustumCulling && this.octree) {
+      const frustumPlanes = this.extractFrustumPlanes(mvpMatrix, viewState.frustumPlanes);
+      if (useFullDetail) {
+        // Full detail: standard frustum culling
+        this._renderSnapshotWithFrustumCulling(snapshot, params, frustumPlanes, viewState, sizeMultiplier);
+      } else {
+        // LOD active: combined LOD + frustum culling
+        this._renderSnapshotLODWithFrustumCulling(snapshot, lodLevel, params, frustumPlanes, viewState);
+      }
+      this.stats.lastFrameTime = performance.now() - frameStart;
+      this.stats.fps = Math.round(1000 / Math.max(this.stats.lastFrameTime, 1));
+      return this.stats;
+    }
+
+    // No frustum culling - check if we should use LOD
+    if (!useFullDetail) {
+      // Render with LOD using indexed drawing into snapshot buffer
+      this._renderSnapshotWithLOD(snapshot, lodLevel, params, viewState);
+      this.stats.lastFrameTime = performance.now() - frameStart;
+      this.stats.fps = Math.round(1000 / Math.max(this.stats.lastFrameTime, 1));
+      return this.stats;
+    }
+
+    // No frustum culling - render all points with snapshot VAO
     const program = this.activeProgram;
     const uniforms = this.uniformLocations.get(this.activeQuality);
 
@@ -2470,11 +3078,12 @@ export class HighPerfRenderer {
     gl.useProgram(program);
 
     // Set uniforms
+    const adjustedPointSize = pointSize * sizeMultiplier;
     if (uniforms.u_mvpMatrix !== null) gl.uniformMatrix4fv(uniforms.u_mvpMatrix, false, mvpMatrix);
     if (uniforms.u_viewMatrix !== null) gl.uniformMatrix4fv(uniforms.u_viewMatrix, false, viewMatrix);
     if (uniforms.u_modelMatrix !== null) gl.uniformMatrix4fv(uniforms.u_modelMatrix, false, modelMatrix);
     if (uniforms.u_projectionMatrix !== null && projectionMatrix) gl.uniformMatrix4fv(uniforms.u_projectionMatrix, false, projectionMatrix);
-    if (uniforms.u_pointSize !== null) gl.uniform1f(uniforms.u_pointSize, pointSize);
+    if (uniforms.u_pointSize !== null) gl.uniform1f(uniforms.u_pointSize, adjustedPointSize);
     if (uniforms.u_sizeAttenuation !== null) gl.uniform1f(uniforms.u_sizeAttenuation, sizeAttenuation);
     if (uniforms.u_viewportHeight !== null) gl.uniform1f(uniforms.u_viewportHeight, viewportHeight);
     if (uniforms.u_fov !== null) gl.uniform1f(uniforms.u_fov, fov);
@@ -2489,13 +3098,17 @@ export class HighPerfRenderer {
     if (uniforms.u_useAlphaTex !== null) gl.uniform1i(uniforms.u_useAlphaTex, 0);
     if (uniforms.u_useLodIndexTex !== null) gl.uniform1i(uniforms.u_useLodIndexTex, 0);
 
+    // Reset frustum culling stats
+    this.stats.frustumCulled = false;
+    this.stats.cullPercent = 0;
+
     // Bind snapshot's VAO (no data upload!)
     gl.bindVertexArray(snapshot.vao);
     gl.drawArrays(gl.POINTS, 0, snapshot.pointCount);
     gl.bindVertexArray(null);
 
     this.stats.visiblePoints = snapshot.pointCount;
-    this.stats.lodLevel = -1;
+    this.stats.lodLevel = lodLevel;
     this.stats.drawCalls = 1;
     this.stats.lastFrameTime = performance.now() - frameStart;
     this.stats.fps = Math.round(1000 / Math.max(this.stats.lastFrameTime, 1));
@@ -2503,8 +3116,437 @@ export class HighPerfRenderer {
     return this.stats;
   }
 
+  /**
+   * Render snapshot with frustum culling using indexed drawing.
+   * Snapshots share positions with main buffer, so the same octree/indices work.
+   * Uses per-view index buffer to avoid cross-view conflicts.
+   * @private
+   */
+  _renderSnapshotWithFrustumCulling(snapshot, params, frustumPlanes, viewState, sizeMultiplier = 1.0) {
+    const gl = this.gl;
+    const {
+      mvpMatrix, viewMatrix, modelMatrix, projectionMatrix,
+      pointSize, sizeAttenuation, viewportHeight, fov,
+      lightingStrength, fogDensity, fogColor, lightDir,
+      viewId = snapshot.id
+    } = params;
+
+    const needsUpdate = this._checkFrustumCacheValid(mvpMatrix, viewState);
+
+    if (needsUpdate) {
+      const visibleNodes = [];
+      this._collectVisibleNodes(this.octree.root, frustumPlanes, visibleNodes);
+
+      if (visibleNodes.length === 0) {
+        // Fallback to full detail when no visible nodes (e.g., camera too distant)
+        // Only log once per view (not every frame)
+        if (!viewState._noVisibleNodesWarned) {
+          console.warn(`[FrustumCulling] Snapshot ${viewId}: No visible nodes - falling back to full detail`);
+          viewState._noVisibleNodesWarned = true;
+        }
+        viewState.cachedCulledCount = 0;
+        viewState.cachedVisibleIndices = null;
+        this.stats.frustumCulled = false;
+        this.stats.cullPercent = 0;
+        this._renderSnapshotFullDetail(snapshot, params, sizeMultiplier);
+        return;
+      }
+
+      // Count total visible points
+      let totalVisible = 0;
+      for (const node of visibleNodes) {
+        if (node.indices) totalVisible += node.indices.length;
+      }
+
+      // Reuse pooled buffer
+      if (!this._visibleIndicesBuffer || this._visibleIndicesCapacity < totalVisible) {
+        this._visibleIndicesCapacity = Math.ceil(totalVisible * 1.25);
+        this._visibleIndicesBuffer = new Uint32Array(this._visibleIndicesCapacity);
+      }
+
+      let writeOffset = 0;
+      for (const node of visibleNodes) {
+        if (node.indices) {
+          this._visibleIndicesBuffer.set(node.indices, writeOffset);
+          writeOffset += node.indices.length;
+        }
+      }
+
+      const visibleIndices = this._visibleIndicesBuffer.subarray(0, totalVisible);
+      const visibleRatio = totalVisible / snapshot.pointCount;
+      const cullPercent = ((1 - visibleRatio) * 100);
+
+      // If >98% visible, render everything
+      if (visibleRatio > 0.98) {
+        viewState.cachedCulledCount = 0;
+        viewState.cachedVisibleIndices = null;
+        viewState._noVisibleNodesWarned = false;  // Reset warning flag
+        this.stats.frustumCulled = false;
+        this.stats.cullPercent = cullPercent;
+        this._renderSnapshotFullDetail(snapshot, params, sizeMultiplier);
+        return;
+      }
+
+      // Log only on significant change (>10% of total points)
+      if (this._isSignificantChange(viewState.lastVisibleCount, visibleIndices.length, snapshot.pointCount)) {
+        console.log(`[FrustumCulling] Snapshot ${viewId}: ${visibleIndices.length.toLocaleString()}/${snapshot.pointCount.toLocaleString()} visible (${cullPercent.toFixed(1)}% culled)`);
+        viewState.lastVisibleCount = visibleIndices.length;
+      }
+
+      viewState.cachedVisibleIndices = new Uint32Array(visibleIndices);
+      viewState.cachedCulledCount = visibleIndices.length;
+      viewState._noVisibleNodesWarned = false;  // Reset warning flag since we have visible nodes
+
+      // Upload to per-view index buffer (each view has its own buffer)
+      this._uploadToViewIndexBuffer(viewState, visibleIndices);
+      this.stats.frustumCulled = true;
+      this.stats.cullPercent = cullPercent;
+    }
+
+    if (!viewState.cachedCulledCount || viewState.cachedCulledCount === 0) {
+      this._renderSnapshotFullDetail(snapshot, params, sizeMultiplier);
+      return;
+    }
+
+    const program = this.activeProgram;
+    const uniforms = this.uniformLocations.get(this.activeQuality);
+
+    if (!program || !uniforms) {
+      console.warn('[FrustumCulling] No program/uniforms for snapshot render');
+      return;
+    }
+
+    gl.useProgram(program);
+
+    const adjustedPointSize = pointSize * sizeMultiplier;
+    if (uniforms.u_mvpMatrix !== null) gl.uniformMatrix4fv(uniforms.u_mvpMatrix, false, mvpMatrix);
+    if (uniforms.u_viewMatrix !== null) gl.uniformMatrix4fv(uniforms.u_viewMatrix, false, viewMatrix);
+    if (uniforms.u_modelMatrix !== null) gl.uniformMatrix4fv(uniforms.u_modelMatrix, false, modelMatrix);
+    if (uniforms.u_projectionMatrix !== null && projectionMatrix) gl.uniformMatrix4fv(uniforms.u_projectionMatrix, false, projectionMatrix);
+    if (uniforms.u_pointSize !== null) gl.uniform1f(uniforms.u_pointSize, adjustedPointSize);
+    if (uniforms.u_sizeAttenuation !== null) gl.uniform1f(uniforms.u_sizeAttenuation, sizeAttenuation);
+    if (uniforms.u_viewportHeight !== null) gl.uniform1f(uniforms.u_viewportHeight, viewportHeight);
+    if (uniforms.u_fov !== null) gl.uniform1f(uniforms.u_fov, fov);
+    if (uniforms.u_lightingStrength !== null) gl.uniform1f(uniforms.u_lightingStrength, lightingStrength);
+    if (uniforms.u_fogDensity !== null) gl.uniform1f(uniforms.u_fogDensity, fogDensity);
+    if (uniforms.u_fogNear !== null) gl.uniform1f(uniforms.u_fogNear, this.fogNear);
+    if (uniforms.u_fogFar !== null) gl.uniform1f(uniforms.u_fogFar, this.fogFar);
+    if (uniforms.u_fogColor !== null) gl.uniform3fv(uniforms.u_fogColor, fogColor);
+    if (uniforms.u_lightDir !== null) gl.uniform3fv(uniforms.u_lightDir, lightDir);
+
+    // Disable alpha texture - snapshots have alpha baked in
+    if (uniforms.u_useAlphaTex !== null) gl.uniform1i(uniforms.u_useAlphaTex, 0);
+    if (uniforms.u_useLodIndexTex !== null) gl.uniform1i(uniforms.u_useLodIndexTex, 0);
+
+    // Defensive check: ensure index buffer is valid before drawing
+    if (viewState.indexBufferSize !== viewState.cachedCulledCount) {
+      console.warn(`[FrustumCulling] Snapshot ${viewId}: Index buffer size mismatch - falling back to full detail`);
+      this._renderSnapshotFullDetail(snapshot, params, sizeMultiplier);
+      return;
+    }
+
+    // Bind snapshot VAO and per-view index buffer for indexed drawing
+    gl.bindVertexArray(snapshot.vao);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, viewState.indexBuffer);
+    gl.drawElements(gl.POINTS, viewState.cachedCulledCount, gl.UNSIGNED_INT, 0);
+    gl.bindVertexArray(null);
+
+    this.stats.visiblePoints = viewState.cachedCulledCount;
+    this.stats.lodLevel = -1;
+    this.stats.drawCalls = 1;
+  }
+
+  /**
+   * Render snapshot at full detail (no frustum culling).
+   * @private
+   */
+  _renderSnapshotFullDetail(snapshot, params, sizeMultiplier = 1.0) {
+    const gl = this.gl;
+    const {
+      mvpMatrix, viewMatrix, modelMatrix, projectionMatrix,
+      pointSize, sizeAttenuation, viewportHeight, fov,
+      lightingStrength, fogDensity, fogColor, lightDir
+    } = params;
+
+    const program = this.activeProgram;
+    const uniforms = this.uniformLocations.get(this.activeQuality);
+
+    if (!program || !uniforms) return;
+
+    gl.useProgram(program);
+
+    const adjustedPointSize = pointSize * sizeMultiplier;
+    if (uniforms.u_mvpMatrix !== null) gl.uniformMatrix4fv(uniforms.u_mvpMatrix, false, mvpMatrix);
+    if (uniforms.u_viewMatrix !== null) gl.uniformMatrix4fv(uniforms.u_viewMatrix, false, viewMatrix);
+    if (uniforms.u_modelMatrix !== null) gl.uniformMatrix4fv(uniforms.u_modelMatrix, false, modelMatrix);
+    if (uniforms.u_projectionMatrix !== null && projectionMatrix) gl.uniformMatrix4fv(uniforms.u_projectionMatrix, false, projectionMatrix);
+    if (uniforms.u_pointSize !== null) gl.uniform1f(uniforms.u_pointSize, adjustedPointSize);
+    if (uniforms.u_sizeAttenuation !== null) gl.uniform1f(uniforms.u_sizeAttenuation, sizeAttenuation);
+    if (uniforms.u_viewportHeight !== null) gl.uniform1f(uniforms.u_viewportHeight, viewportHeight);
+    if (uniforms.u_fov !== null) gl.uniform1f(uniforms.u_fov, fov);
+    if (uniforms.u_lightingStrength !== null) gl.uniform1f(uniforms.u_lightingStrength, lightingStrength);
+    if (uniforms.u_fogDensity !== null) gl.uniform1f(uniforms.u_fogDensity, fogDensity);
+    if (uniforms.u_fogNear !== null) gl.uniform1f(uniforms.u_fogNear, this.fogNear);
+    if (uniforms.u_fogFar !== null) gl.uniform1f(uniforms.u_fogFar, this.fogFar);
+    if (uniforms.u_fogColor !== null) gl.uniform3fv(uniforms.u_fogColor, fogColor);
+    if (uniforms.u_lightDir !== null) gl.uniform3fv(uniforms.u_lightDir, lightDir);
+
+    // Disable alpha texture
+    if (uniforms.u_useAlphaTex !== null) gl.uniform1i(uniforms.u_useAlphaTex, 0);
+    if (uniforms.u_useLodIndexTex !== null) gl.uniform1i(uniforms.u_useLodIndexTex, 0);
+
+    gl.bindVertexArray(snapshot.vao);
+    gl.drawArrays(gl.POINTS, 0, snapshot.pointCount);
+    gl.bindVertexArray(null);
+
+    this.stats.visiblePoints = snapshot.pointCount;
+    this.stats.lodLevel = -1;
+    this.stats.drawCalls = 1;
+  }
+
+  /**
+   * Render snapshot with LOD (no frustum culling).
+   * Uses indexed drawing into the snapshot buffer with LOD-selected indices.
+   * @private
+   */
+  _renderSnapshotWithLOD(snapshot, lodLevel, params, viewState) {
+    const gl = this.gl;
+    const lod = this.lodBuffers[lodLevel];
+
+    if (!lod || lod.isFullDetail) {
+      this._renderSnapshotFullDetail(snapshot, params, lod?.sizeMultiplier || 1.0);
+      return;
+    }
+
+    const {
+      mvpMatrix, viewMatrix, modelMatrix, projectionMatrix,
+      pointSize, sizeAttenuation, viewportHeight, fov,
+      lightingStrength, fogDensity, fogColor, lightDir
+    } = params;
+
+    // Check if LOD level changed and we need to rebuild the index buffer
+    const lodLevelChanged = viewState.cachedLodLevel !== lodLevel;
+
+    if (lodLevelChanged) {
+      // Get the LOD level's original indices (which points to render)
+      const lodOriginalIndices = this.octree.lodLevels[lodLevel].indices;
+
+      // Upload LOD indices to per-view index buffer
+      const indicesArray = new Uint32Array(lodOriginalIndices);
+      this._uploadToViewIndexBuffer(viewState, indicesArray);
+      viewState.cachedCulledCount = lodOriginalIndices.length;
+      viewState.cachedLodLevel = lodLevel;
+      viewState.cachedLodIsCulled = false;  // Mark as full LOD indices (not culled)
+
+      // Note: LOD level change is already logged by renderSnapshot at line ~2809
+      // Only log here if this is called directly (not from frustum culling fallback)
+      // We use prevLodLevel to avoid duplicate logging
+    }
+
+    const adjustedPointSize = pointSize * (lod.sizeMultiplier || 1.0);
+
+    const program = this.activeProgram;
+    const uniforms = this.uniformLocations.get(this.activeQuality);
+
+    if (!program || !uniforms) return;
+
+    gl.useProgram(program);
+
+    if (uniforms.u_mvpMatrix !== null) gl.uniformMatrix4fv(uniforms.u_mvpMatrix, false, mvpMatrix);
+    if (uniforms.u_viewMatrix !== null) gl.uniformMatrix4fv(uniforms.u_viewMatrix, false, viewMatrix);
+    if (uniforms.u_modelMatrix !== null) gl.uniformMatrix4fv(uniforms.u_modelMatrix, false, modelMatrix);
+    if (uniforms.u_projectionMatrix !== null && projectionMatrix) gl.uniformMatrix4fv(uniforms.u_projectionMatrix, false, projectionMatrix);
+    if (uniforms.u_pointSize !== null) gl.uniform1f(uniforms.u_pointSize, adjustedPointSize);
+    if (uniforms.u_sizeAttenuation !== null) gl.uniform1f(uniforms.u_sizeAttenuation, sizeAttenuation);
+    if (uniforms.u_viewportHeight !== null) gl.uniform1f(uniforms.u_viewportHeight, viewportHeight);
+    if (uniforms.u_fov !== null) gl.uniform1f(uniforms.u_fov, fov);
+    if (uniforms.u_lightingStrength !== null) gl.uniform1f(uniforms.u_lightingStrength, lightingStrength);
+    if (uniforms.u_fogDensity !== null) gl.uniform1f(uniforms.u_fogDensity, fogDensity);
+    if (uniforms.u_fogNear !== null) gl.uniform1f(uniforms.u_fogNear, this.fogNear);
+    if (uniforms.u_fogFar !== null) gl.uniform1f(uniforms.u_fogFar, this.fogFar);
+    if (uniforms.u_fogColor !== null) gl.uniform3fv(uniforms.u_fogColor, fogColor);
+    if (uniforms.u_lightDir !== null) gl.uniform3fv(uniforms.u_lightDir, lightDir);
+
+    // Disable alpha texture - snapshots have alpha baked in
+    if (uniforms.u_useAlphaTex !== null) gl.uniform1i(uniforms.u_useAlphaTex, 0);
+    if (uniforms.u_useLodIndexTex !== null) gl.uniform1i(uniforms.u_useLodIndexTex, 0);
+
+    // Bind snapshot VAO and per-view index buffer for indexed drawing
+    gl.bindVertexArray(snapshot.vao);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, viewState.indexBuffer);
+    gl.drawElements(gl.POINTS, viewState.cachedCulledCount, gl.UNSIGNED_INT, 0);
+    gl.bindVertexArray(null);
+
+    this.stats.visiblePoints = viewState.cachedCulledCount;
+    this.stats.lodLevel = lodLevel;
+    this.stats.drawCalls = 1;
+    this.stats.frustumCulled = false;
+    this.stats.cullPercent = 0;
+  }
+
+  /**
+   * Render snapshot with combined LOD and frustum culling.
+   * Uses indexed drawing into the snapshot buffer with filtered indices.
+   * @private
+   */
+  _renderSnapshotLODWithFrustumCulling(snapshot, lodLevel, params, frustumPlanes, viewState) {
+    const gl = this.gl;
+    const lod = this.lodBuffers[lodLevel];
+
+    if (!lod || lod.isFullDetail) {
+      this._renderSnapshotWithFrustumCulling(snapshot, params, frustumPlanes, viewState, 1.0);
+      return;
+    }
+
+    const {
+      mvpMatrix, viewMatrix, modelMatrix, projectionMatrix,
+      pointSize, sizeAttenuation, viewportHeight, fov,
+      lightingStrength, fogDensity, fogColor, lightDir,
+      viewId = snapshot.id
+    } = params;
+
+    // Check if we need to recompute the frustum-culled LOD indices
+    const frustumChanged = this._checkFrustumCacheValid(mvpMatrix, viewState);
+    const lodLevelChanged = viewState.cachedLodLevel !== lodLevel;
+    const needsUpdate = frustumChanged || lodLevelChanged;
+
+    if (needsUpdate) {
+      // Step 1: Collect visible octree nodes
+      const visibleNodes = [];
+      this._collectVisibleNodes(this.octree.root, frustumPlanes, visibleNodes);
+
+      if (visibleNodes.length === 0) {
+        // Fallback to LOD without frustum culling when no visible nodes
+        // Only log once per view (not every frame)
+        if (!viewState._noVisibleNodesWarned) {
+          console.warn(`[LOD+Frustum] Snapshot ${viewId}: No visible nodes - falling back to LOD without frustum`);
+          viewState._noVisibleNodesWarned = true;
+        }
+        // Only force re-upload if LOD level changed OR we were in culled mode
+        if (viewState.cachedLodLevel !== lodLevel || viewState.cachedLodIsCulled) {
+          viewState.cachedLodLevel = -1;  // Force _renderSnapshotWithLOD to re-upload full LOD indices
+          // Note: cachedCulledCount will be set correctly by _renderSnapshotWithLOD
+        }
+        // When NOT re-uploading, cachedCulledCount retains the correct full LOD count from previous upload
+        this.stats.frustumCulled = false;
+        this.stats.cullPercent = 0;
+        this.stats.lodLevel = lodLevel;
+        this._renderSnapshotWithLOD(snapshot, lodLevel, params, viewState);
+        return;
+      }
+
+      // Step 2: Build a Set of visible original point indices
+      const visibleOriginalSet = new Set();
+      for (const node of visibleNodes) {
+        if (node.indices) {
+          for (const idx of node.indices) {
+            visibleOriginalSet.add(idx);
+          }
+        }
+      }
+
+      // Step 3: Get LOD level's indices and filter by visibility
+      const lodOriginalIndices = this.octree.lodLevels[lodLevel].indices;
+      const visibleLodIndices = [];
+      for (const originalIdx of lodOriginalIndices) {
+        if (visibleOriginalSet.has(originalIdx)) {
+          visibleLodIndices.push(originalIdx);
+        }
+      }
+
+      const visibleCount = visibleLodIndices.length;
+      const totalLodPoints = lodOriginalIndices.length;
+      const visibleRatio = visibleCount / totalLodPoints;
+      const cullPercent = ((1 - visibleRatio) * 100);
+
+      // If >98% visible, render full LOD without frustum culling
+      if (visibleRatio > 0.98) {
+        // Only force re-upload if LOD level changed OR we were in culled mode
+        // This prevents repeated uploads/logs when staying in >98% visible state
+        if (viewState.cachedLodLevel !== lodLevel || viewState.cachedLodIsCulled) {
+          viewState.cachedLodLevel = -1;  // Force _renderSnapshotWithLOD to upload full LOD indices
+          // Note: cachedCulledCount will be set correctly by _renderSnapshotWithLOD
+        }
+        // When NOT re-uploading, cachedCulledCount retains the correct full LOD count from previous upload
+        this.stats.frustumCulled = false;
+        this.stats.cullPercent = cullPercent;
+        this._renderSnapshotWithLOD(snapshot, lodLevel, params, viewState);
+        return;
+      }
+
+      // Log only on significant change (>10% of total points)
+      if (this._isSignificantChange(viewState.lastVisibleCount, visibleCount, totalLodPoints)) {
+        console.log(`[LOD+Frustum] Snapshot ${viewId}: LOD ${lodLevel} - ${visibleCount.toLocaleString()}/${totalLodPoints.toLocaleString()} visible (${cullPercent.toFixed(1)}% culled)`);
+        viewState.lastVisibleCount = visibleCount;
+      }
+
+      // Upload filtered indices to per-view buffer
+      const indicesArray = new Uint32Array(visibleLodIndices);
+      this._uploadToViewIndexBuffer(viewState, indicesArray);
+      viewState.cachedCulledCount = visibleCount;
+      viewState.cachedLodLevel = lodLevel;
+      viewState.cachedLodIsCulled = true;  // Mark as culled indices (not full LOD)
+      viewState._noVisibleNodesWarned = false;  // Reset warning flag since we have visible nodes
+      this.stats.frustumCulled = true;
+      this.stats.cullPercent = cullPercent;
+    }
+
+    if (!viewState.cachedCulledCount || viewState.cachedCulledCount === 0) {
+      this._renderSnapshotWithLOD(snapshot, lodLevel, params, viewState);
+      return;
+    }
+
+    const adjustedPointSize = pointSize * (lod.sizeMultiplier || 1.0);
+
+    const program = this.activeProgram;
+    const uniforms = this.uniformLocations.get(this.activeQuality);
+
+    if (!program || !uniforms) return;
+
+    gl.useProgram(program);
+
+    if (uniforms.u_mvpMatrix !== null) gl.uniformMatrix4fv(uniforms.u_mvpMatrix, false, mvpMatrix);
+    if (uniforms.u_viewMatrix !== null) gl.uniformMatrix4fv(uniforms.u_viewMatrix, false, viewMatrix);
+    if (uniforms.u_modelMatrix !== null) gl.uniformMatrix4fv(uniforms.u_modelMatrix, false, modelMatrix);
+    if (uniforms.u_projectionMatrix !== null && projectionMatrix) gl.uniformMatrix4fv(uniforms.u_projectionMatrix, false, projectionMatrix);
+    if (uniforms.u_pointSize !== null) gl.uniform1f(uniforms.u_pointSize, adjustedPointSize);
+    if (uniforms.u_sizeAttenuation !== null) gl.uniform1f(uniforms.u_sizeAttenuation, sizeAttenuation);
+    if (uniforms.u_viewportHeight !== null) gl.uniform1f(uniforms.u_viewportHeight, viewportHeight);
+    if (uniforms.u_fov !== null) gl.uniform1f(uniforms.u_fov, fov);
+    if (uniforms.u_lightingStrength !== null) gl.uniform1f(uniforms.u_lightingStrength, lightingStrength);
+    if (uniforms.u_fogDensity !== null) gl.uniform1f(uniforms.u_fogDensity, fogDensity);
+    if (uniforms.u_fogNear !== null) gl.uniform1f(uniforms.u_fogNear, this.fogNear);
+    if (uniforms.u_fogFar !== null) gl.uniform1f(uniforms.u_fogFar, this.fogFar);
+    if (uniforms.u_fogColor !== null) gl.uniform3fv(uniforms.u_fogColor, fogColor);
+    if (uniforms.u_lightDir !== null) gl.uniform3fv(uniforms.u_lightDir, lightDir);
+
+    // Disable alpha texture - snapshots have alpha baked in
+    if (uniforms.u_useAlphaTex !== null) gl.uniform1i(uniforms.u_useAlphaTex, 0);
+    if (uniforms.u_useLodIndexTex !== null) gl.uniform1i(uniforms.u_useLodIndexTex, 0);
+
+    // Defensive check: ensure index buffer is valid before drawing
+    if (viewState.indexBufferSize !== viewState.cachedCulledCount) {
+      console.warn(`[LOD+Frustum] Snapshot ${viewId}: Index buffer size mismatch - falling back to LOD without frustum`);
+      this._renderSnapshotWithLOD(snapshot, lodLevel, params, viewState);
+      return;
+    }
+
+    // Bind snapshot VAO and per-view index buffer
+    gl.bindVertexArray(snapshot.vao);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, viewState.indexBuffer);
+    gl.drawElements(gl.POINTS, viewState.cachedCulledCount, gl.UNSIGNED_INT, 0);
+    gl.bindVertexArray(null);
+
+    this.stats.visiblePoints = viewState.cachedCulledCount;
+    this.stats.lodLevel = lodLevel;
+    this.stats.drawCalls = 1;
+  }
+
   dispose() {
     const gl = this.gl;
+
+    // Clean up per-view index buffers first
+    this.clearAllViewState();
 
     for (const buffer of Object.values(this.buffers)) {
       if (buffer) gl.deleteBuffer(buffer);

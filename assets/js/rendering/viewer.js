@@ -196,10 +196,15 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     gridSpacing:  gl.getUniformLocation(gridProgram, 'u_gridSpacing'),
     gridLineWidth: gl.getUniformLocation(gridProgram, 'u_gridLineWidth'),
     gridOpacity:  gl.getUniformLocation(gridProgram, 'u_gridOpacity'),
+    planeAlpha:   gl.getUniformLocation(gridProgram, 'u_planeAlpha'),
     planeType:    gl.getUniformLocation(gridProgram, 'u_planeType'),
     fogDensity:   gl.getUniformLocation(gridProgram, 'u_fogDensity'),
     fogNearMean:  gl.getUniformLocation(gridProgram, 'u_fogNearMean'),
     fogFarMean:   gl.getUniformLocation(gridProgram, 'u_fogFarMean'),
+    axisXColor:   gl.getUniformLocation(gridProgram, 'u_axisXColor'),
+    axisYColor:   gl.getUniformLocation(gridProgram, 'u_axisYColor'),
+    axisZColor:   gl.getUniformLocation(gridProgram, 'u_axisZColor'),
+    gridSize:     gl.getUniformLocation(gridProgram, 'u_gridSize'),
   };
 
   // === CENTROID PROGRAM (simple WebGL2 shader for small centroid count) ===
@@ -244,6 +249,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   let highlightArray = null; // Uint8Array, per-point highlight intensity
   let highlightBuffer = null; // WebGL buffer for interleaved highlight data
   let highlightPointCount = 0;
+  let highlightBufferLodSignature = null; // Tracks LOD level used to build the highlight buffer
   // Golden accent (halo) with defined halo shape
   let highlightColor = [1.0, 0.85, 0.0]; // bright yellow
   let highlightScale = 2.0; // How much larger than normal points
@@ -312,10 +318,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   gl.bindBuffer(gl.ARRAY_BUFFER, smokeQuadBuffer);
   gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
 
-  // Grid plane buffers - 5 sides (bottom + 4 walls, no top)
+  // Grid plane buffers - 6 sides (complete box)
   const GRID_SIZE = 2.0;
   const gridPlaneBuffers = {
     bottom: gl.createBuffer(),  // XZ plane at y=-s (floor)
+    top: gl.createBuffer(),     // XZ plane at y=+s (ceiling)
     back: gl.createBuffer(),    // XY plane at z=-s
     front: gl.createBuffer(),   // XY plane at z=+s
     left: gl.createBuffer(),    // YZ plane at x=-s
@@ -330,6 +337,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
       -s, -s, -s,  s, -s, -s,  s, -s, s,
       -s, -s, -s,  s, -s, s,  -s, -s, s
+    ]), gl.STATIC_DRAW);
+
+    // Top ceiling (XZ plane at y=+s)
+    gl.bindBuffer(gl.ARRAY_BUFFER, gridPlaneBuffers.top);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+      -s, s, -s,  s, s, -s,  s, s, s,
+      -s, s, -s,  s, s, s,  -s, s, s
     ]), gl.STATIC_DRAW);
 
     // Back wall (XY plane at z=-s)
@@ -477,16 +491,23 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   let fogDensity = 0.5;
   let sizeAttenuation = 0.65;
   let outlierThreshold = 1.0;
-  let bgColor = [1.0, 1.0, 1.0];
-  let fogColor = [1.0, 1.0, 1.0];
+  let bgColor = [0.96, 0.96, 0.98];
+  let fogColor = [0.96, 0.96, 0.98];
 
-  // Grid state - grid is default background
+  // Grid state - grid is default background (matches 'grid' light mode)
   let showGrid = true;
-  let gridColor = [0.7, 0.7, 0.7];
-  let gridBgColor = [0.97, 0.97, 0.97];
+  let gridColor = [0.45, 0.45, 0.48];   // Medium gray - visible on light bg
+  let gridBgColor = [0.96, 0.96, 0.98]; // Must match bgColor exactly
   let gridSpacing = 0.2;
-  let gridLineWidth = 0.006;
-  let gridOpacity = 0.55;
+  let gridLineWidth = 0.008;
+  let gridOpacity = 0.75;
+  // Target values for smooth grid transitions
+  let targetGridOpacity = 0.75;
+  let gridTransitionSpeed = 3.0;  // Opacity change per second
+  // Scientific grayscale axis colors (no distracting colors)
+  let axisXColor = [0.35, 0.35, 0.35];  // Neutral gray for all axes
+  let axisYColor = [0.35, 0.35, 0.35];
+  let axisZColor = [0.35, 0.35, 0.35];
 
   // Interaction
   let radius = 3.0;
@@ -1750,7 +1771,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   }
 
   function drawGrid() {
-    if (!showGrid) return;
+    // Allow fade-out transition to complete before stopping render
+    if (gridOpacity <= 0) return;
     gl.useProgram(gridProgram);
     gl.uniformMatrix4fv(gridUniformLocations.mvpMatrix, false, mvpMatrix);
     gl.uniformMatrix4fv(gridUniformLocations.viewMatrix, false, viewMatrix);
@@ -1763,47 +1785,71 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     gl.uniform1f(gridUniformLocations.fogDensity, fogDensity);
     gl.uniform1f(gridUniformLocations.fogNearMean, fogNearMean);
     gl.uniform1f(gridUniformLocations.fogFarMean, fogFarMean);
+    gl.uniform1f(gridUniformLocations.gridSize, GRID_SIZE);
+
+    // Scientific axis colors (RGB for XYZ)
+    gl.uniform3fv(gridUniformLocations.axisXColor, axisXColor);
+    gl.uniform3fv(gridUniformLocations.axisYColor, axisYColor);
+    gl.uniform3fv(gridUniformLocations.axisZColor, axisZColor);
 
     gl.depthMask(false);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
-    // Build list of visible planes based on camera position relative to target
-    // Only show planes that are "behind" the data from camera's perspective
-    // planeType: 0=XY (back/front walls), 1=XZ (floor), 2=YZ (left/right walls)
-    const planes = [];
-
-    // Bottom floor (y=-s): visible when camera is above target
-    if (eye[1] > target[1]) {
-      planes.push({ buffer: gridPlaneBuffers.bottom, type: 1 });
+    // Calculate view direction from camera to target
+    const viewDir = [
+      target[0] - eye[0],
+      target[1] - eye[1],
+      target[2] - eye[2]
+    ];
+    const viewLen = Math.sqrt(viewDir[0]*viewDir[0] + viewDir[1]*viewDir[1] + viewDir[2]*viewDir[2]);
+    if (viewLen > 0) {
+      viewDir[0] /= viewLen;
+      viewDir[1] /= viewLen;
+      viewDir[2] /= viewLen;
     }
 
-    // Back wall (z=-s): visible when camera is in front (z > target.z)
-    if (eye[2] > target[2]) {
-      planes.push({ buffer: gridPlaneBuffers.back, type: 0 });
-    }
+    // Plane normals (outward facing from box center)
+    // We want to show planes that are "behind" the data (facing away from camera)
+    // A plane is visible when dot(viewDir, planeNormal) > 0 (camera looking toward plane)
+    const planes = [
+      { buffer: gridPlaneBuffers.bottom, type: 1, normal: [0, -1, 0] },  // floor y=-s
+      { buffer: gridPlaneBuffers.top,    type: 1, normal: [0, 1, 0] },   // ceiling y=+s
+      { buffer: gridPlaneBuffers.back,   type: 0, normal: [0, 0, -1] },  // back z=-s
+      { buffer: gridPlaneBuffers.front,  type: 0, normal: [0, 0, 1] },   // front z=+s
+      { buffer: gridPlaneBuffers.left,   type: 2, normal: [-1, 0, 0] },  // left x=-s
+      { buffer: gridPlaneBuffers.right,  type: 2, normal: [1, 0, 0] },   // right x=+s
+    ];
 
-    // Front wall (z=+s): visible when camera is behind (z < target.z)
-    if (eye[2] < target[2]) {
-      planes.push({ buffer: gridPlaneBuffers.front, type: 0 });
-    }
-
-    // Left wall (x=-s): visible when camera is to the right (x > target.x)
-    if (eye[0] > target[0]) {
-      planes.push({ buffer: gridPlaneBuffers.left, type: 2 });
-    }
-
-    // Right wall (x=+s): visible when camera is to the left (x < target.x)
-    if (eye[0] < target[0]) {
-      planes.push({ buffer: gridPlaneBuffers.right, type: 2 });
-    }
-
+    // Render planes with smooth alpha based on viewing angle
     for (const plane of planes) {
+      // Dot product: positive = camera looking toward this plane (plane is visible)
+      const dot = viewDir[0]*plane.normal[0] + viewDir[1]*plane.normal[1] + viewDir[2]*plane.normal[2];
+
+      // Smooth transition: fade in when dot > 0, fade out when dot < 0
+      // Use smoothstep for gradual transition around the threshold
+      const fadeRange = 0.15; // How gradual the transition is
+      const alpha = smoothstep(-fadeRange, fadeRange, dot);
+
+      // Skip fully transparent planes
+      if (alpha < 0.01) continue;
+
+      gl.uniform1f(gridUniformLocations.planeAlpha, alpha);
       gl.uniform1i(gridUniformLocations.planeType, plane.type);
       gl.bindBuffer(gl.ARRAY_BUFFER, plane.buffer);
       gl.enableVertexAttribArray(gridAttribLocations.position);
       gl.vertexAttribPointer(gridAttribLocations.position, 3, gl.FLOAT, false, 0, 0);
       gl.drawArrays(gl.TRIANGLES, 0, 6);
     }
+
+    gl.disable(gl.BLEND);
     gl.depthMask(true);
+  }
+
+  // Smoothstep helper for smooth transitions
+  function smoothstep(edge0, edge1, x) {
+    const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
+    return t * t * (3 - 2 * t);
   }
 
   function drawConnectivityLines(widthPx, heightPx) {
@@ -1973,9 +2019,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   // === HIGHLIGHT RENDERING ===
   // Rebuild the highlight buffer with positions of highlighted cells
   // Only includes cells that are both highlighted AND visible (transparency > 0)
-  function rebuildHighlightBuffer(highlightData, positions, transparency) {
+  function rebuildHighlightBuffer(highlightData, positions, transparency, lodVisibility = null, lodSignature = null) {
+    // Track which visibility mask (LOD level) the buffer was built against
+    const visibilitySignature = lodVisibility ? (lodSignature ?? -2) : -1;
+
     if (!highlightData || !positions) {
       highlightPointCount = 0;
+      highlightBufferLodSignature = visibilitySignature;
       return;
     }
 
@@ -1984,13 +2034,16 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     for (let i = 0; i < highlightData.length; i++) {
       if (highlightData[i] > 0) {
         // Only count if visible (no transparency array = all visible, or transparency > 0)
-        const isVisible = !transparency || transparency[i] > 0;
+        const visibleByAlpha = !transparency || transparency[i] > 0;
+        const visibleByLod = !lodVisibility || lodVisibility[i] > 0;
+        const isVisible = visibleByAlpha && visibleByLod;
         if (isVisible) count++;
       }
     }
 
     if (count === 0) {
       highlightPointCount = 0;
+      highlightBufferLodSignature = visibilitySignature;
       return;
     }
 
@@ -2005,7 +2058,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     for (let i = 0; i < highlightData.length; i++) {
       if (highlightData[i] > 0) {
         // Only include if visible
-        const isVisible = !transparency || transparency[i] > 0;
+        const visibleByAlpha = !transparency || transparency[i] > 0;
+        const visibleByLod = !lodVisibility || lodVisibility[i] > 0;
+        const isVisible = visibleByAlpha && visibleByLod;
         if (!isVisible) continue;
 
         const posOffset = outIdx * 4; // 4 floats per point (3 pos + 1 color-as-float)
@@ -2033,12 +2088,21 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     gl.bufferData(gl.ARRAY_BUFFER, bufferData, gl.DYNAMIC_DRAW);
 
     highlightPointCount = count;
+    highlightBufferLodSignature = visibilitySignature;
   }
 
   function drawHighlights(viewportHeight) {
     if (highlightPointCount === 0 || !highlightBuffer) return;
 
+    // Draw highlights on top of everything (no depth test)
+    const depthWasEnabled = gl.isEnabled(gl.DEPTH_TEST);
+    if (depthWasEnabled) gl.disable(gl.DEPTH_TEST);
+
     gl.useProgram(highlightProgram);
+
+    // Match highlight size to current LOD-scaled point size so rings hug the glyphs
+    const lodSizeMultiplier = hpRenderer.getCurrentLODSizeMultiplier ? hpRenderer.getCurrentLODSizeMultiplier() : 1.0;
+    const highlightPointSize = basePointSize * lodSizeMultiplier;
 
     // Set uniforms
     gl.uniformMatrix4fv(highlightUniformLocations.mvpMatrix, false, mvpMatrix);
@@ -2056,7 +2120,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       effectiveHaloStrength = Math.min(1.0, highlightHaloStrength + haloBoost * 0.15);
     }
 
-    gl.uniform1f(highlightUniformLocations.pointSize, basePointSize);
+    gl.uniform1f(highlightUniformLocations.pointSize, highlightPointSize);
     gl.uniform1f(highlightUniformLocations.sizeAttenuation, sizeAttenuation);
     gl.uniform1f(highlightUniformLocations.viewportHeight, viewportHeight);
     gl.uniform1f(highlightUniformLocations.fov, fov);
@@ -2085,6 +2149,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     // Restore normal blending
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    if (depthWasEnabled) gl.enable(gl.DEPTH_TEST);
   }
 
   // === CELL PICKING ===
@@ -2455,6 +2520,19 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     if (projectileBufferDirty) rebuildProjectileBuffers();
     if (impactBufferDirty) rebuildImpactBuffers();
 
+    // Smooth grid opacity transition
+    if (showGrid) {
+      // Fade in towards target
+      if (gridOpacity < targetGridOpacity) {
+        gridOpacity = Math.min(targetGridOpacity, gridOpacity + gridTransitionSpeed * dt);
+      }
+    } else {
+      // Fade out towards zero
+      if (gridOpacity > 0) {
+        gridOpacity = Math.max(0, gridOpacity - gridTransitionSpeed * dt);
+      }
+    }
+
     const [width, height] = canvasResizeObserver.getSize();
 
     if (!pointCount) {
@@ -2471,12 +2549,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     if (renderMode === 'smoke') {
       gl.viewport(0, 0, width, height);
       gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-      // Draw grid first as background reference
-      if (showGrid) {
+      // Draw grid first as background reference (render during fade-out too)
+      if (gridOpacity > 0) {
         drawGrid();
       }
       // Render smoke with alpha blending on top of grid
-      renderSmoke(width, height, showGrid);
+      renderSmoke(width, height, gridOpacity > 0);
       return;
     }
 
@@ -2566,62 +2644,79 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     const activeViewMatrix = mat4.clone(viewMatrix);
     const activeRadius = radius;
 
+    // Frustum culling and LOD work per-view: each renderSingleView call receives
+    // the correct mvpMatrix and cameraDistance for that view's camera
+
     for (let i = 0; i < viewCount; i++) {
-      const view = allViews[i];
-      const col = i % cols;
-      const row = Math.floor(i / cols);
-      const vx = col * vw;
-      const vy = (rows - 1 - row) * vh; // Flip Y for GL
+        const view = allViews[i];
+        const col = i % cols;
+        const row = Math.floor(i / cols);
+        const vx = col * vw;
+        const vy = (rows - 1 - row) * vh; // Flip Y for GL
 
-      const isActiveView = view.id === focusedViewId;
+        const isActiveView = view.id === focusedViewId;
 
-      // OPTIMIZATION: Use cached view matrices instead of per-frame recalculation
-      // No global state modification, no applyCameraStateTemporarily, no updateCamera
-      if (!camerasLocked && !isActiveView) {
-        const cached = cachedViewMatrices.get(view.id);
-        if (cached) {
-          // Use pre-computed cached viewMatrix directly
-          mat4.copy(viewMatrix, cached.viewMatrix);
-          radius = cached.radius;
+        // OPTIMIZATION: Use cached view matrices instead of per-frame recalculation
+        // No global state modification, no applyCameraStateTemporarily, no updateCamera
+        if (isActiveView) {
+          // Active view: always use the freshly computed activeViewMatrix
+          mat4.copy(viewMatrix, activeViewMatrix);
+          radius = activeRadius;
+        } else if (!camerasLocked) {
+          const cached = cachedViewMatrices.get(view.id);
+          if (cached) {
+            // Use pre-computed cached viewMatrix directly
+            mat4.copy(viewMatrix, cached.viewMatrix);
+            radius = cached.radius;
+          } else {
+            // Fallback: no cache exists yet, use active view's matrix and create cache
+            // This happens for views that haven't been focused yet
+            mat4.copy(viewMatrix, activeViewMatrix);
+            radius = activeRadius;
+            // Initialize cache from current state so future renders have something
+            const camState = getViewCameraState(view.id);
+            if (camState) {
+              updateCachedViewMatrix(view.id, camState);
+            }
+          }
+        } else {
+          // Locked mode: non-active views use active view's matrix
+          mat4.copy(viewMatrix, activeViewMatrix);
+          radius = activeRadius;
         }
-      } else if (!isActiveView) {
-        // Locked mode: restore active view's matrix for non-active views
-        mat4.copy(viewMatrix, activeViewMatrix);
-        radius = activeRadius;
+
+        // OPTIMIZATION: Use cached projection matrix (same for all grid cells)
+        mat4.copy(projectionMatrix, cachedGridProjection.matrix);
+        mat4.multiply(mvpMatrix, projectionMatrix, viewMatrix);
+        mat4.multiply(mvpMatrix, mvpMatrix, modelMatrix);
+
+        // Set viewport and clear depth for this pane
+        gl.viewport(vx, vy, vw, vh);
+        gl.enable(gl.SCISSOR_TEST);
+        gl.scissor(vx, vy, vw, vh);
+        gl.clear(gl.DEPTH_BUFFER_BIT);
+
+        // Check if this snapshot has a pre-uploaded GPU buffer (avoids per-frame re-upload)
+        let hasSnapshotBuffer = view.id !== LIVE_VIEW_ID && hpRenderer.hasSnapshotBuffer(view.id);
+
+        // For snapshots without GPU buffers, lazily create one (uploaded once, not per-frame)
+        // Skip live view - state.js handles updates via viewer.updateColors/updateTransparency
+        if (view.id !== LIVE_VIEW_ID && !hasSnapshotBuffer && view.colors && view.transparency) {
+          hpRenderer.createSnapshotBuffer(view.id, view.colors, view.transparency);
+          hasSnapshotBuffer = true;
+        }
+
+        // Lazily create centroid snapshot buffer if not exists (uploaded once, not per-frame)
+        if (view.centroidPositions && view.centroidColors && !hasCentroidSnapshotBuffer(view.id)) {
+          createCentroidSnapshotBuffer(view.id, view.centroidPositions, view.centroidColors);
+        }
+
+        // Render this viewport - use snapshot buffer if available (no data upload!)
+        const snapshotId = hasSnapshotBuffer ? view.id : null;
+        renderSingleView(vw, vh, { x: col / cols, y: row / rows, w: 1 / cols, h: 1 / rows }, view.id, view.centroidCount, snapshotId);
+
+        gl.disable(gl.SCISSOR_TEST);
       }
-
-      // OPTIMIZATION: Use cached projection matrix (same for all grid cells)
-      mat4.copy(projectionMatrix, cachedGridProjection.matrix);
-      mat4.multiply(mvpMatrix, projectionMatrix, viewMatrix);
-      mat4.multiply(mvpMatrix, mvpMatrix, modelMatrix);
-
-      // Set viewport and clear depth for this pane
-      gl.viewport(vx, vy, vw, vh);
-      gl.enable(gl.SCISSOR_TEST);
-      gl.scissor(vx, vy, vw, vh);
-      gl.clear(gl.DEPTH_BUFFER_BIT);
-
-      // Check if this snapshot has a pre-uploaded GPU buffer (avoids per-frame re-upload)
-      let hasSnapshotBuffer = view.id !== LIVE_VIEW_ID && hpRenderer.hasSnapshotBuffer(view.id);
-
-      // For snapshots without GPU buffers, lazily create one (uploaded once, not per-frame)
-      // Skip live view - state.js handles updates via viewer.updateColors/updateTransparency
-      if (view.id !== LIVE_VIEW_ID && !hasSnapshotBuffer && view.colors && view.transparency) {
-        hpRenderer.createSnapshotBuffer(view.id, view.colors, view.transparency);
-        hasSnapshotBuffer = true;
-      }
-
-      // Lazily create centroid snapshot buffer if not exists (uploaded once, not per-frame)
-      if (view.centroidPositions && view.centroidColors && !hasCentroidSnapshotBuffer(view.id)) {
-        createCentroidSnapshotBuffer(view.id, view.centroidPositions, view.centroidColors);
-      }
-
-      // Render this viewport - use snapshot buffer if available (no data upload!)
-      const snapshotId = hasSnapshotBuffer ? view.id : null;
-      renderSingleView(vw, vh, { x: col / cols, y: row / rows, w: 1 / cols, h: 1 / rows }, view.id, view.centroidCount, snapshotId);
-
-      gl.disable(gl.SCISSOR_TEST);
-    }
 
     // Restore active view's state after grid render
     mat4.copy(viewMatrix, activeViewMatrix);
@@ -2660,7 +2755,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       fogColor,
       lightDir,
       cameraPosition,
-      cameraDistance: radius
+      cameraDistance: radius,
+      viewId: vid  // Per-view identifier for LOD and frustum culling state
     };
 
     // Render scatter points - use snapshot buffer if available (no data upload!)
@@ -2668,6 +2764,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       hpRenderer.renderWithSnapshot(snapshotBufferId, renderParams);
     } else {
       hpRenderer.render(renderParams);
+    }
+
+    // Sync highlight buffer with current visibility (filters + LOD)
+    if (highlightArray) {
+      const lodVisibility = hpRenderer.getLodVisibilityArray ? hpRenderer.getLodVisibilityArray() : null;
+      const lodLevel = hpRenderer.getCurrentLODLevel ? hpRenderer.getCurrentLODLevel() : -1;
+      const lodSignature = lodVisibility ? (lodLevel ?? -1) : -1;
+      const needsHighlightRefresh = !highlightBuffer || highlightBufferLodSignature !== lodSignature;
+      if (needsHighlightRefresh) {
+        const positions = hpRenderer.getPositions ? hpRenderer.getPositions() : positionsArray;
+        rebuildHighlightBuffer(highlightArray, positions, transparencyArray, lodVisibility, lodSignature);
+      }
     }
 
     // Draw highlights (selection rings) on top of scatter points
@@ -2853,33 +2961,44 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     switch (mode) {
       case 'grid':
         showGrid = true;
-        gl.clearColor(1, 1, 1, 1);
-        document.body.style.backgroundColor = '#ffffff';
-        bgColor = [1, 1, 1];
-        fogColor = [1, 1, 1];
-        gridColor = [0.7, 0.7, 0.7];
-        gridBgColor = [0.97, 0.97, 0.97];
-        gridSpacing = 0.2;
-        gridLineWidth = 0.006;
-        gridOpacity = 0.55;
-        break;
-      case 'light':
+        targetGridOpacity = 0.75;
         gl.clearColor(0.96, 0.96, 0.98, 1);
         document.body.style.backgroundColor = '#f5f5fa';
         bgColor = [0.96, 0.96, 0.98];
         fogColor = [0.96, 0.96, 0.98];
+        gridColor = [0.45, 0.45, 0.48];   // Medium gray - visible on light bg
+        gridBgColor = [0.96, 0.96, 0.98]; // Must match bgColor exactly
+        gridSpacing = 0.2;
+        gridLineWidth = 0.008;
+        // Grayscale axis colors for scientific look
+        axisXColor = [0.55, 0.55, 0.55];
+        axisYColor = [0.55, 0.55, 0.55];
+        axisZColor = [0.55, 0.55, 0.55];
         break;
-      case 'dark':
-        gl.clearColor(0.08, 0.09, 0.12, 1);
-        document.body.style.backgroundColor = '#111319';
-        bgColor = [0.08, 0.09, 0.12];
-        fogColor = [0.08, 0.09, 0.12];
+      case 'grid-dark':
+        showGrid = true;
+        targetGridOpacity = 0.75;
+        gl.clearColor(0.08, 0.09, 0.1, 1);
+        document.body.style.backgroundColor = '#14161a';
+        bgColor = [0.08, 0.09, 0.1];
+        fogColor = [0.08, 0.09, 0.1];
+        gridColor = [0.38, 0.38, 0.42];   // Subtle gray lines
+        gridBgColor = [0.08, 0.09, 0.1];
+        gridSpacing = 0.2;
+        gridLineWidth = 0.008;
+        // Grayscale axis colors for scientific look
+        axisXColor = [0.5, 0.5, 0.5];
+        axisYColor = [0.5, 0.5, 0.5];
+        axisZColor = [0.5, 0.5, 0.5];
         break;
       case 'black':
         gl.clearColor(0, 0, 0, 1);
         document.body.style.backgroundColor = '#000000';
         bgColor = [0, 0, 0];
         fogColor = [0.05, 0.05, 0.08];
+        // Match grid bg to main bg for clean fade-out
+        gridBgColor = [0, 0, 0];
+        gridColor = [0.3, 0.3, 0.3];
         break;
       case 'white':
       default:
@@ -2887,6 +3006,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         document.body.style.backgroundColor = '#ffffff';
         bgColor = [1, 1, 1];
         fogColor = [1, 1, 1];
+        // Match grid bg to main bg for clean fade-out
+        gridBgColor = [1, 1, 1];
+        gridColor = [0.7, 0.7, 0.7];
     }
   }
 
@@ -3058,7 +3180,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       // Rebuild highlight buffer when visibility changes (filter applied/removed)
       if (highlightArray) {
         const positions = hpRenderer.getPositions ? hpRenderer.getPositions() : null;
-        rebuildHighlightBuffer(highlightArray, positions, transparencyArray);
+        const lodVisibility = hpRenderer.getLodVisibilityArray ? hpRenderer.getLodVisibilityArray() : null;
+        const lodLevel = hpRenderer.getCurrentLODLevel ? hpRenderer.getCurrentLODLevel() : -1;
+        const lodSignature = lodVisibility ? (lodLevel ?? -1) : -1;
+        rebuildHighlightBuffer(highlightArray, positions, transparencyArray, lodVisibility, lodSignature);
       }
     },
 
@@ -3071,7 +3196,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       highlightArray = highlightData;
       // Rebuild highlight buffer using current positions and transparency from HP renderer
       const positions = hpRenderer.getPositions ? hpRenderer.getPositions() : null;
-      rebuildHighlightBuffer(highlightData, positions, transparencyArray);
+      const lodVisibility = hpRenderer.getLodVisibilityArray ? hpRenderer.getLodVisibilityArray() : null;
+      const lodLevel = hpRenderer.getCurrentLODLevel ? hpRenderer.getCurrentLODLevel() : -1;
+      const lodSignature = lodVisibility ? (lodLevel ?? -1) : -1;
+      rebuildHighlightBuffer(highlightData, positions, transparencyArray, lodVisibility, lodSignature);
     },
 
     setHighlightStyle(options = {}) {
@@ -3685,6 +3813,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         // Delete GPU buffer for this snapshot
         if (hpRenderer) {
           hpRenderer.deleteSnapshotBuffer(id);
+          hpRenderer.clearViewState(id);  // Clear per-view LOD/frustum culling state
         }
         // Delete centroid GPU buffer for this snapshot
         deleteCentroidSnapshotBuffer(id);
@@ -3706,13 +3835,21 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     },
 
     clearSnapshotViews() {
-      // Delete all snapshot GPU buffers
+      // Delete all snapshot GPU buffers and per-view state (not live view)
       if (hpRenderer) {
         hpRenderer.deleteAllSnapshotBuffers();
+        // Clear per-view state for each snapshot individually (preserve live view state)
+        for (const snap of snapshotViews) {
+          hpRenderer.clearViewState(snap.id);
+        }
       }
       // Delete all centroid snapshot GPU buffers
       for (const id of centroidSnapshotBuffers.keys()) {
         deleteCentroidSnapshotBuffer(id);
+      }
+      // Clean up cached view matrices for snapshots (preserve live view)
+      for (const snap of snapshotViews) {
+        cachedViewMatrices.delete(snap.id);
       }
       snapshotViews.length = 0;
       focusedViewId = LIVE_VIEW_ID;
@@ -3829,6 +3966,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     setAdaptiveLOD(enabled) { hpRenderer.setAdaptiveLOD(enabled); },
     setForceLOD(level) { hpRenderer.setForceLOD(level); },
     getRendererStats() { return hpRenderer.getStats(); },
+    debugRendererStatus() { return hpRenderer.debugStatus(); },
 
     // LOD visibility for edge filtering
     getLodVisibilityArray() { return hpRenderer.getLodVisibilityArray(); },
