@@ -4581,6 +4581,17 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       }
     },
 
+    // Restore lasso state for undo/redo
+    restoreLassoState(candidates, step) {
+      if (candidates && candidates.length > 0) {
+        lassoCandidateSet = new Set(candidates);
+        lassoStepCount = step;
+      } else {
+        lassoCandidateSet = null;
+        lassoStepCount = 0;
+      }
+    },
+
     // Proximity drag selection API
     setProximityEnabled(enabled) {
       proximityEnabled = Boolean(enabled);
@@ -4655,6 +4666,17 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
           candidates: [],
           cancelled: true
         });
+      }
+    },
+
+    // Restore proximity state for undo/redo
+    restoreProximityState(candidates, step) {
+      if (candidates && candidates.length > 0) {
+        proximityCandidateSet = new Set(candidates);
+        proximityStepCount = step;
+      } else {
+        proximityCandidateSet = null;
+        proximityStepCount = 0;
       }
     },
 
@@ -4761,6 +4783,17 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
           candidates: [],
           cancelled: true
         });
+      }
+    },
+
+    // Restore KNN state for undo/redo
+    restoreKnnState(candidates, step) {
+      if (candidates && candidates.length > 0) {
+        knnCandidateSet = new Set(candidates);
+        knnStepCount = step;
+      } else {
+        knnCandidateSet = null;
+        knnStepCount = 0;
       }
     },
 

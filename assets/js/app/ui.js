@@ -468,6 +468,22 @@ export function initUI({ state, viewer, dom, smoke }) {
   // Annotation selection state (multi-step with confirm/cancel)
   let annotationCandidateSet = null; // Set of candidate cell indices
   let annotationStepCount = 0;
+  // Undo/redo history for annotation mode (max 5 steps)
+  let annotationHistory = []; // [{candidates: Set, step: number}, ...]
+  let annotationRedoStack = [];
+  const MAX_HISTORY_STEPS = 5;
+
+  // Undo/redo history for lasso mode
+  let lassoHistory = [];
+  let lassoRedoStack = [];
+
+  // Undo/redo history for proximity mode
+  let proximityHistory = [];
+  let proximityRedoStack = [];
+
+  // Undo/redo history for KNN mode
+  let knnHistory = [];
+  let knnRedoStack = [];
 
   function setHighlightModeUI(mode) {
     const wasLasso = activeHighlightMode === 'lasso';
@@ -488,6 +504,8 @@ export function initUI({ state, viewer, dom, smoke }) {
       // Reset UI-managed annotation state
       annotationCandidateSet = null;
       annotationStepCount = 0;
+      annotationHistory = [];
+      annotationRedoStack = [];
       viewer.cancelAnnotationSelection?.();
       if (state.clearPreviewHighlight) {
         state.clearPreviewHighlight();
@@ -496,6 +514,8 @@ export function initUI({ state, viewer, dom, smoke }) {
 
     // Cancel any in-progress lasso selection when switching away from lasso mode
     if (wasLasso && mode !== 'lasso') {
+      lassoHistory = [];
+      lassoRedoStack = [];
       viewer.cancelLassoSelection?.();
       // Clear preview highlight
       if (state.clearPreviewHighlight) {
@@ -505,6 +525,8 @@ export function initUI({ state, viewer, dom, smoke }) {
 
     // Cancel any in-progress proximity selection when switching away from proximity mode
     if (wasProximity && mode !== 'proximity') {
+      proximityHistory = [];
+      proximityRedoStack = [];
       viewer.cancelProximitySelection?.();
       // Clear preview highlight
       if (state.clearPreviewHighlight) {
@@ -514,6 +536,8 @@ export function initUI({ state, viewer, dom, smoke }) {
 
     // Cancel any in-progress KNN selection when switching away from KNN mode
     if (wasKnn && mode !== 'knn') {
+      knnHistory = [];
+      knnRedoStack = [];
       viewer.cancelKnnSelection?.();
       // Clear preview highlight
       if (state.clearPreviewHighlight) {
@@ -901,6 +925,8 @@ export function initUI({ state, viewer, dom, smoke }) {
     if (stepEvent.cancelled) {
       annotationCandidateSet = null;
       annotationStepCount = 0;
+      annotationHistory = [];
+      annotationRedoStack = [];
       updateAnnotationUI(null);
       if (state.clearPreviewHighlight) {
         state.clearPreviewHighlight();
@@ -919,6 +945,18 @@ export function initUI({ state, viewer, dom, smoke }) {
 
     const mode = stepEvent.mode || 'intersect';
     const newCellIndices = computeAnnotationCellIndices(stepEvent);
+
+    // Save current state to history before modification
+    annotationHistory.push({
+      candidates: annotationCandidateSet ? new Set(annotationCandidateSet) : null,
+      step: annotationStepCount
+    });
+    // Limit history size
+    if (annotationHistory.length > MAX_HISTORY_STEPS) {
+      annotationHistory.shift();
+    }
+    // Clear redo stack on new action
+    annotationRedoStack = [];
 
     if (newCellIndices.length === 0 && mode !== 'subtract') {
       return;
@@ -1003,6 +1041,8 @@ export function initUI({ state, viewer, dom, smoke }) {
       console.log('[UI] Annotation selection empty');
       annotationCandidateSet = null;
       annotationStepCount = 0;
+      annotationHistory = [];
+      annotationRedoStack = [];
       updateAnnotationUI(null);
       return;
     }
@@ -1021,6 +1061,8 @@ export function initUI({ state, viewer, dom, smoke }) {
     // Reset state
     annotationCandidateSet = null;
     annotationStepCount = 0;
+    annotationHistory = [];
+    annotationRedoStack = [];
     updateAnnotationUI(null);
 
     // Clear preview
@@ -1032,6 +1074,76 @@ export function initUI({ state, viewer, dom, smoke }) {
     viewer.confirmAnnotationSelection?.();
   }
 
+  // Undo last annotation step
+  function handleAnnotationUndo() {
+    if (annotationHistory.length === 0) return;
+
+    // Save current state to redo stack
+    annotationRedoStack.push({
+      candidates: annotationCandidateSet ? new Set(annotationCandidateSet) : null,
+      step: annotationStepCount
+    });
+
+    // Restore previous state
+    const prevState = annotationHistory.pop();
+    annotationCandidateSet = prevState.candidates;
+    annotationStepCount = prevState.step;
+
+    // Update UI - keep controls visible if redo is available
+    if (annotationCandidateSet && annotationCandidateSet.size > 0) {
+      updateAnnotationUI({
+        step: annotationStepCount,
+        candidateCount: annotationCandidateSet.size,
+        mode: 'intersect'
+      });
+      state.setPreviewHighlightFromIndices?.([...annotationCandidateSet]);
+    } else {
+      // Show "step 0" state but keep controls for redo
+      updateAnnotationUI({
+        step: 0,
+        candidateCount: 0,
+        mode: 'intersect',
+        keepControls: true
+      });
+      state.clearPreviewHighlight?.();
+    }
+  }
+
+  // Redo annotation step
+  function handleAnnotationRedo() {
+    if (annotationRedoStack.length === 0) return;
+
+    // Save current state to history
+    annotationHistory.push({
+      candidates: annotationCandidateSet ? new Set(annotationCandidateSet) : null,
+      step: annotationStepCount
+    });
+
+    // Restore redo state
+    const redoState = annotationRedoStack.pop();
+    annotationCandidateSet = redoState.candidates;
+    annotationStepCount = redoState.step;
+
+    // Update UI
+    if (annotationCandidateSet && annotationCandidateSet.size > 0) {
+      updateAnnotationUI({
+        step: annotationStepCount,
+        candidateCount: annotationCandidateSet.size,
+        mode: 'intersect'
+      });
+      state.setPreviewHighlightFromIndices?.([...annotationCandidateSet]);
+    } else {
+      // Show "step 0" state but keep controls for undo
+      updateAnnotationUI({
+        step: 0,
+        candidateCount: 0,
+        mode: 'intersect',
+        keepControls: true
+      });
+      state.clearPreviewHighlight?.();
+    }
+  }
+
   // Update annotation UI based on current state
   function updateAnnotationUI(stepEvent) {
     if (!highlightModeDescriptionEl) return;
@@ -1039,12 +1151,49 @@ export function initUI({ state, viewer, dom, smoke }) {
     const activeField = state.getActiveField();
     const isCategorical = activeField?.kind === 'category';
 
-    if (!stepEvent || stepEvent.step === 0) {
+    // Remove controls only if no stepEvent and not keeping controls for undo/redo
+    if (!stepEvent || (stepEvent.step === 0 && !stepEvent.keepControls)) {
       // No selection in progress - show default description
       highlightModeDescriptionEl.innerHTML = highlightModeCopy.annotation;
       // Remove any existing controls
       const existingControls = document.getElementById('annotation-step-controls');
       if (existingControls) existingControls.remove();
+    } else if (stepEvent.step === 0 && stepEvent.keepControls) {
+      // Step 0 but keep controls visible for undo/redo
+      const helpText = isCategorical
+        ? 'Alt to replace, Shift+Alt to add, Ctrl+Alt to subtract'
+        : 'Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract';
+      const stepInfo = `<strong>No selection</strong><br><small>${helpText}</small>`;
+
+      // Ensure controls exist
+      let controls = document.getElementById('annotation-step-controls');
+      if (!controls) {
+        controls = document.createElement('div');
+        controls.id = 'annotation-step-controls';
+        controls.className = 'lasso-step-controls';
+        controls.innerHTML = `
+          <button type="button" class="btn-small lasso-confirm" id="annotation-confirm-btn">Confirm</button>
+          <button type="button" class="btn-small btn-undo" id="annotation-undo-btn" title="Undo">↩</button>
+          <button type="button" class="btn-small btn-redo" id="annotation-redo-btn" title="Redo">↪</button>
+          <button type="button" class="btn-small lasso-cancel" id="annotation-cancel-btn">Cancel</button>
+        `;
+        highlightModeDescriptionEl.parentElement.appendChild(controls);
+
+        document.getElementById('annotation-undo-btn').addEventListener('click', () => handleAnnotationUndo());
+        document.getElementById('annotation-redo-btn').addEventListener('click', () => handleAnnotationRedo());
+        document.getElementById('annotation-confirm-btn').addEventListener('click', () => handleAnnotationConfirm());
+        document.getElementById('annotation-cancel-btn').addEventListener('click', () => viewer.cancelAnnotationSelection?.());
+      }
+
+      // Update button states
+      const undoBtn = document.getElementById('annotation-undo-btn');
+      const redoBtn = document.getElementById('annotation-redo-btn');
+      const confirmBtn = document.getElementById('annotation-confirm-btn');
+      if (undoBtn) undoBtn.disabled = annotationHistory.length === 0;
+      if (redoBtn) redoBtn.disabled = annotationRedoStack.length === 0;
+      if (confirmBtn) confirmBtn.disabled = true; // Can't confirm with no selection
+
+      highlightModeDescriptionEl.innerHTML = stepInfo;
     } else {
       // Selection in progress - show step info and controls
       let modeLabel = '';
@@ -1077,11 +1226,19 @@ export function initUI({ state, viewer, dom, smoke }) {
         controls.className = 'lasso-step-controls'; // Reuse same styling
         controls.innerHTML = `
           <button type="button" class="btn-small lasso-confirm" id="annotation-confirm-btn">Confirm</button>
+          <button type="button" class="btn-small btn-undo" id="annotation-undo-btn" title="Undo">↩</button>
+          <button type="button" class="btn-small btn-redo" id="annotation-redo-btn" title="Redo">↪</button>
           <button type="button" class="btn-small lasso-cancel" id="annotation-cancel-btn">Cancel</button>
         `;
         highlightModeDescriptionEl.parentElement.appendChild(controls);
 
         // Wire up button events
+        document.getElementById('annotation-undo-btn').addEventListener('click', () => {
+          handleAnnotationUndo();
+        });
+        document.getElementById('annotation-redo-btn').addEventListener('click', () => {
+          handleAnnotationRedo();
+        });
         document.getElementById('annotation-confirm-btn').addEventListener('click', () => {
           handleAnnotationConfirm();
         });
@@ -1090,6 +1247,12 @@ export function initUI({ state, viewer, dom, smoke }) {
           viewer.cancelAnnotationSelection?.();
         });
       }
+
+      // Update undo/redo button states
+      const undoBtn = document.getElementById('annotation-undo-btn');
+      const redoBtn = document.getElementById('annotation-redo-btn');
+      if (undoBtn) undoBtn.disabled = annotationHistory.length === 0;
+      if (redoBtn) redoBtn.disabled = annotationRedoStack.length === 0;
 
       highlightModeDescriptionEl.innerHTML = stepInfo;
     }
@@ -1154,6 +1317,10 @@ export function initUI({ state, viewer, dom, smoke }) {
     viewer.setSelectionStepCallback(handleAnnotationStep);
   }
 
+  // Track last lasso state for history
+  let lastLassoCandidates = null;
+  let lastLassoStep = 0;
+
   // Handle final lasso selection (after confirm)
   function handleLassoSelection(lassoEvent) {
     if (!lassoEvent.cellIndices || lassoEvent.cellIndices.length === 0) {
@@ -1173,14 +1340,22 @@ export function initUI({ state, viewer, dom, smoke }) {
       console.log(`[UI] Lasso selected ${lassoEvent.cellCount} cells from ${lassoEvent.steps} view(s)`);
     }
 
-    // Reset UI state
+    // Reset UI state and history
+    lassoHistory = [];
+    lassoRedoStack = [];
+    lastLassoCandidates = null;
+    lastLassoStep = 0;
     updateLassoUI(null);
   }
 
   // Handle lasso step updates (multi-step mode)
   function handleLassoStep(stepEvent) {
     if (stepEvent.cancelled) {
-      // Selection was cancelled
+      // Selection was cancelled - clear history
+      lassoHistory = [];
+      lassoRedoStack = [];
+      lastLassoCandidates = null;
+      lastLassoStep = 0;
       updateLassoUI(null);
       // Clear preview highlight
       if (state.clearPreviewHighlight) {
@@ -1188,6 +1363,22 @@ export function initUI({ state, viewer, dom, smoke }) {
       }
       return;
     }
+
+    // Save previous state to history before update
+    if (lastLassoCandidates !== null || lastLassoStep > 0) {
+      lassoHistory.push({
+        candidates: lastLassoCandidates ? [...lastLassoCandidates] : null,
+        step: lastLassoStep
+      });
+      if (lassoHistory.length > MAX_HISTORY_STEPS) {
+        lassoHistory.shift();
+      }
+      lassoRedoStack = [];
+    }
+
+    // Track current state for next history save
+    lastLassoCandidates = stepEvent.candidates ? [...stepEvent.candidates] : null;
+    lastLassoStep = stepEvent.step;
 
     // Update UI with current step info
     updateLassoUI(stepEvent);
@@ -1198,16 +1389,116 @@ export function initUI({ state, viewer, dom, smoke }) {
     }
   }
 
+  // Undo last lasso step
+  function handleLassoUndo() {
+    if (lassoHistory.length === 0) return;
+
+    // Save current state to redo stack
+    lassoRedoStack.push({
+      candidates: lastLassoCandidates ? [...lastLassoCandidates] : null,
+      step: lastLassoStep
+    });
+
+    // Restore previous state
+    const prevState = lassoHistory.pop();
+    lastLassoCandidates = prevState.candidates;
+    lastLassoStep = prevState.step;
+
+    // Update viewer state
+    viewer.restoreLassoState?.(prevState.candidates, prevState.step);
+
+    // Update UI - keep controls visible for redo
+    if (prevState.candidates && prevState.candidates.length > 0) {
+      updateLassoUI({
+        step: prevState.step,
+        candidateCount: prevState.candidates.length,
+        candidates: prevState.candidates,
+        mode: 'intersect'
+      });
+      state.setPreviewHighlightFromIndices?.(prevState.candidates);
+    } else {
+      updateLassoUI({ step: 0, candidateCount: 0, mode: 'intersect', keepControls: true });
+      state.clearPreviewHighlight?.();
+    }
+  }
+
+  // Redo lasso step
+  function handleLassoRedo() {
+    if (lassoRedoStack.length === 0) return;
+
+    // Save current state to history
+    lassoHistory.push({
+      candidates: lastLassoCandidates ? [...lastLassoCandidates] : null,
+      step: lastLassoStep
+    });
+
+    // Restore redo state
+    const redoState = lassoRedoStack.pop();
+    lastLassoCandidates = redoState.candidates;
+    lastLassoStep = redoState.step;
+
+    // Update viewer state
+    viewer.restoreLassoState?.(redoState.candidates, redoState.step);
+
+    // Update UI
+    if (redoState.candidates && redoState.candidates.length > 0) {
+      updateLassoUI({
+        step: redoState.step,
+        candidateCount: redoState.candidates.length,
+        candidates: redoState.candidates,
+        mode: 'intersect'
+      });
+      state.setPreviewHighlightFromIndices?.(redoState.candidates);
+    } else {
+      updateLassoUI({ step: 0, candidateCount: 0, mode: 'intersect', keepControls: true });
+      state.clearPreviewHighlight?.();
+    }
+  }
+
   // Update lasso UI based on current state
   function updateLassoUI(stepEvent) {
     if (!highlightModeDescriptionEl) return;
 
-    if (!stepEvent || stepEvent.step === 0) {
+    if (!stepEvent || (stepEvent.step === 0 && !stepEvent.keepControls)) {
       // No selection in progress - show default description
       highlightModeDescriptionEl.innerHTML = highlightModeCopy.lasso;
       // Remove any existing lasso controls
       const existingControls = document.getElementById('lasso-step-controls');
       if (existingControls) existingControls.remove();
+    } else if (stepEvent.step === 0 && stepEvent.keepControls) {
+      // Step 0 but keep controls visible for undo/redo
+      const stepInfo = `<strong>No selection</strong><br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>`;
+
+      let controls = document.getElementById('lasso-step-controls');
+      if (!controls) {
+        controls = document.createElement('div');
+        controls.id = 'lasso-step-controls';
+        controls.className = 'lasso-step-controls';
+        controls.innerHTML = `
+          <button type="button" class="btn-small lasso-confirm" id="lasso-confirm-btn">Confirm</button>
+          <button type="button" class="btn-small btn-undo" id="lasso-undo-btn" title="Undo">↩</button>
+          <button type="button" class="btn-small btn-redo" id="lasso-redo-btn" title="Redo">↪</button>
+          <button type="button" class="btn-small lasso-cancel" id="lasso-cancel-btn">Cancel</button>
+        `;
+        highlightModeDescriptionEl.parentElement.appendChild(controls);
+
+        document.getElementById('lasso-undo-btn').addEventListener('click', () => handleLassoUndo());
+        document.getElementById('lasso-redo-btn').addEventListener('click', () => handleLassoRedo());
+        document.getElementById('lasso-confirm-btn').addEventListener('click', () => {
+          viewer.confirmLassoSelection?.();
+          if (state.clearPreviewHighlight) state.clearPreviewHighlight();
+        });
+        document.getElementById('lasso-cancel-btn').addEventListener('click', () => viewer.cancelLassoSelection?.());
+      }
+
+      const undoBtn = document.getElementById('lasso-undo-btn');
+      const redoBtn = document.getElementById('lasso-redo-btn');
+      const confirmBtn = document.getElementById('lasso-confirm-btn');
+      if (undoBtn) undoBtn.disabled = lassoHistory.length === 0;
+      if (redoBtn) redoBtn.disabled = lassoRedoStack.length === 0;
+      if (confirmBtn) confirmBtn.disabled = true;
+
+      highlightModeDescriptionEl.innerHTML = stepInfo;
     } else {
       // Selection in progress - show step info and controls
       let modeLabel = '';
@@ -1228,11 +1519,19 @@ export function initUI({ state, viewer, dom, smoke }) {
         controls.className = 'lasso-step-controls';
         controls.innerHTML = `
           <button type="button" class="btn-small lasso-confirm" id="lasso-confirm-btn">Confirm</button>
+          <button type="button" class="btn-small btn-undo" id="lasso-undo-btn" title="Undo">↩</button>
+          <button type="button" class="btn-small btn-redo" id="lasso-redo-btn" title="Redo">↪</button>
           <button type="button" class="btn-small lasso-cancel" id="lasso-cancel-btn">Cancel</button>
         `;
         highlightModeDescriptionEl.parentElement.appendChild(controls);
 
         // Wire up button events
+        document.getElementById('lasso-undo-btn').addEventListener('click', () => {
+          handleLassoUndo();
+        });
+        document.getElementById('lasso-redo-btn').addEventListener('click', () => {
+          handleLassoRedo();
+        });
         document.getElementById('lasso-confirm-btn').addEventListener('click', () => {
           viewer.confirmLassoSelection?.();
           // Clear preview
@@ -1244,6 +1543,12 @@ export function initUI({ state, viewer, dom, smoke }) {
           viewer.cancelLassoSelection?.();
         });
       }
+
+      // Update undo/redo button states
+      const undoBtn = document.getElementById('lasso-undo-btn');
+      const redoBtn = document.getElementById('lasso-redo-btn');
+      if (undoBtn) undoBtn.disabled = lassoHistory.length === 0;
+      if (redoBtn) redoBtn.disabled = lassoRedoStack.length === 0;
 
       highlightModeDescriptionEl.innerHTML = stepInfo;
     }
@@ -1258,6 +1563,10 @@ export function initUI({ state, viewer, dom, smoke }) {
   }
 
   // === PROXIMITY DRAG HANDLERS ===
+
+  // Track last proximity state for history
+  let lastProximityCandidates = null;
+  let lastProximityStep = 0;
 
   // Handle final proximity selection (when confirmed)
   function handleProximitySelection(proximityEvent) {
@@ -1278,14 +1587,22 @@ export function initUI({ state, viewer, dom, smoke }) {
       console.log(`[UI] Proximity selected ${proximityEvent.cellCount} cells from ${proximityEvent.steps} drag(s)`);
     }
 
-    // Reset UI state
+    // Reset UI state and history
+    proximityHistory = [];
+    proximityRedoStack = [];
+    lastProximityCandidates = null;
+    lastProximityStep = 0;
     updateProximityUI(null);
   }
 
   // Handle proximity step updates (multi-step mode)
   function handleProximityStep(stepEvent) {
     if (stepEvent.cancelled) {
-      // Selection was cancelled
+      // Selection was cancelled - clear history
+      proximityHistory = [];
+      proximityRedoStack = [];
+      lastProximityCandidates = null;
+      lastProximityStep = 0;
       updateProximityUI(null);
       // Clear preview highlight
       if (state.clearPreviewHighlight) {
@@ -1294,12 +1611,94 @@ export function initUI({ state, viewer, dom, smoke }) {
       return;
     }
 
+    // Save previous state to history before update
+    if (lastProximityCandidates !== null || lastProximityStep > 0) {
+      proximityHistory.push({
+        candidates: lastProximityCandidates ? [...lastProximityCandidates] : null,
+        step: lastProximityStep
+      });
+      if (proximityHistory.length > MAX_HISTORY_STEPS) {
+        proximityHistory.shift();
+      }
+      proximityRedoStack = [];
+    }
+
+    // Track current state for next history save
+    lastProximityCandidates = stepEvent.candidates ? [...stepEvent.candidates] : null;
+    lastProximityStep = stepEvent.step;
+
     // Update UI with current step info
     updateProximityUI(stepEvent);
 
     // Show preview highlight of current candidates
     if (stepEvent.candidates && stepEvent.candidates.length > 0) {
       state.setPreviewHighlightFromIndices?.(stepEvent.candidates);
+    }
+  }
+
+  // Undo last proximity step
+  function handleProximityUndo() {
+    if (proximityHistory.length === 0) return;
+
+    // Save current state to redo stack
+    proximityRedoStack.push({
+      candidates: lastProximityCandidates ? [...lastProximityCandidates] : null,
+      step: lastProximityStep
+    });
+
+    // Restore previous state
+    const prevState = proximityHistory.pop();
+    lastProximityCandidates = prevState.candidates;
+    lastProximityStep = prevState.step;
+
+    // Update viewer state
+    viewer.restoreProximityState?.(prevState.candidates, prevState.step);
+
+    // Update UI - keep controls visible for redo
+    if (prevState.candidates && prevState.candidates.length > 0) {
+      updateProximityUI({
+        step: prevState.step,
+        candidateCount: prevState.candidates.length,
+        candidates: prevState.candidates,
+        mode: 'intersect'
+      });
+      state.setPreviewHighlightFromIndices?.(prevState.candidates);
+    } else {
+      updateProximityUI({ step: 0, candidateCount: 0, mode: 'intersect', keepControls: true });
+      state.clearPreviewHighlight?.();
+    }
+  }
+
+  // Redo proximity step
+  function handleProximityRedo() {
+    if (proximityRedoStack.length === 0) return;
+
+    // Save current state to history
+    proximityHistory.push({
+      candidates: lastProximityCandidates ? [...lastProximityCandidates] : null,
+      step: lastProximityStep
+    });
+
+    // Restore redo state
+    const redoState = proximityRedoStack.pop();
+    lastProximityCandidates = redoState.candidates;
+    lastProximityStep = redoState.step;
+
+    // Update viewer state
+    viewer.restoreProximityState?.(redoState.candidates, redoState.step);
+
+    // Update UI
+    if (redoState.candidates && redoState.candidates.length > 0) {
+      updateProximityUI({
+        step: redoState.step,
+        candidateCount: redoState.candidates.length,
+        candidates: redoState.candidates,
+        mode: 'intersect'
+      });
+      state.setPreviewHighlightFromIndices?.(redoState.candidates);
+    } else {
+      updateProximityUI({ step: 0, candidateCount: 0, mode: 'intersect', keepControls: true });
+      state.clearPreviewHighlight?.();
     }
   }
 
@@ -1317,12 +1716,46 @@ export function initUI({ state, viewer, dom, smoke }) {
   function updateProximityUI(stepEvent) {
     if (!highlightModeDescriptionEl) return;
 
-    if (!stepEvent || stepEvent.step === 0) {
+    if (!stepEvent || (stepEvent.step === 0 && !stepEvent.keepControls)) {
       // No selection in progress - show default description
       highlightModeDescriptionEl.innerHTML = highlightModeCopy.proximity;
       // Remove any existing proximity controls
       const existingControls = document.getElementById('proximity-step-controls');
       if (existingControls) existingControls.remove();
+    } else if (stepEvent.step === 0 && stepEvent.keepControls) {
+      // Step 0 but keep controls visible for undo/redo
+      const stepInfo = `<strong>No selection</strong><br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>`;
+
+      let controls = document.getElementById('proximity-step-controls');
+      if (!controls) {
+        controls = document.createElement('div');
+        controls.id = 'proximity-step-controls';
+        controls.className = 'lasso-step-controls';
+        controls.innerHTML = `
+          <button type="button" class="btn-small lasso-confirm" id="proximity-confirm-btn">Confirm</button>
+          <button type="button" class="btn-small btn-undo" id="proximity-undo-btn" title="Undo">↩</button>
+          <button type="button" class="btn-small btn-redo" id="proximity-redo-btn" title="Redo">↪</button>
+          <button type="button" class="btn-small lasso-cancel" id="proximity-cancel-btn">Cancel</button>
+        `;
+        highlightModeDescriptionEl.parentElement.appendChild(controls);
+
+        document.getElementById('proximity-undo-btn').addEventListener('click', () => handleProximityUndo());
+        document.getElementById('proximity-redo-btn').addEventListener('click', () => handleProximityRedo());
+        document.getElementById('proximity-confirm-btn').addEventListener('click', () => {
+          viewer.confirmProximitySelection?.();
+          if (state.clearPreviewHighlight) state.clearPreviewHighlight();
+        });
+        document.getElementById('proximity-cancel-btn').addEventListener('click', () => viewer.cancelProximitySelection?.());
+      }
+
+      const undoBtn = document.getElementById('proximity-undo-btn');
+      const redoBtn = document.getElementById('proximity-redo-btn');
+      const confirmBtn = document.getElementById('proximity-confirm-btn');
+      if (undoBtn) undoBtn.disabled = proximityHistory.length === 0;
+      if (redoBtn) redoBtn.disabled = proximityRedoStack.length === 0;
+      if (confirmBtn) confirmBtn.disabled = true;
+
+      highlightModeDescriptionEl.innerHTML = stepInfo;
     } else {
       // Selection in progress - show step info and controls
       let modeLabel = '';
@@ -1343,11 +1776,19 @@ export function initUI({ state, viewer, dom, smoke }) {
         controls.className = 'lasso-step-controls'; // Reuse same styling
         controls.innerHTML = `
           <button type="button" class="btn-small lasso-confirm" id="proximity-confirm-btn">Confirm</button>
+          <button type="button" class="btn-small btn-undo" id="proximity-undo-btn" title="Undo">↩</button>
+          <button type="button" class="btn-small btn-redo" id="proximity-redo-btn" title="Redo">↪</button>
           <button type="button" class="btn-small lasso-cancel" id="proximity-cancel-btn">Cancel</button>
         `;
         highlightModeDescriptionEl.parentElement.appendChild(controls);
 
         // Wire up button events
+        document.getElementById('proximity-undo-btn').addEventListener('click', () => {
+          handleProximityUndo();
+        });
+        document.getElementById('proximity-redo-btn').addEventListener('click', () => {
+          handleProximityRedo();
+        });
         document.getElementById('proximity-confirm-btn').addEventListener('click', () => {
           viewer.confirmProximitySelection?.();
           // Clear preview
@@ -1359,6 +1800,12 @@ export function initUI({ state, viewer, dom, smoke }) {
           viewer.cancelProximitySelection?.();
         });
       }
+
+      // Update undo/redo button states
+      const undoBtn = document.getElementById('proximity-undo-btn');
+      const redoBtn = document.getElementById('proximity-redo-btn');
+      if (undoBtn) undoBtn.disabled = proximityHistory.length === 0;
+      if (redoBtn) redoBtn.disabled = proximityRedoStack.length === 0;
 
       highlightModeDescriptionEl.innerHTML = stepInfo;
     }
@@ -1376,6 +1823,10 @@ export function initUI({ state, viewer, dom, smoke }) {
   }
 
   // === KNN DRAG HANDLERS ===
+
+  // Track last KNN state for history
+  let lastKnnCandidates = null;
+  let lastKnnStep = 0;
 
   // Handle final KNN selection (when confirmed)
   function handleKnnSelection(knnEvent) {
@@ -1396,14 +1847,22 @@ export function initUI({ state, viewer, dom, smoke }) {
       console.log(`[UI] KNN selected ${knnEvent.cellCount} cells from ${knnEvent.steps} selection(s)`);
     }
 
-    // Reset UI state
+    // Reset UI state and history
+    knnHistory = [];
+    knnRedoStack = [];
+    lastKnnCandidates = null;
+    lastKnnStep = 0;
     updateKnnUI(null);
   }
 
   // Handle KNN step updates (multi-step mode)
   function handleKnnStep(stepEvent) {
     if (stepEvent.cancelled) {
-      // Selection was cancelled
+      // Selection was cancelled - clear history
+      knnHistory = [];
+      knnRedoStack = [];
+      lastKnnCandidates = null;
+      lastKnnStep = 0;
       updateKnnUI(null);
       // Clear preview highlight
       if (state.clearPreviewHighlight) {
@@ -1412,12 +1871,96 @@ export function initUI({ state, viewer, dom, smoke }) {
       return;
     }
 
+    // Save previous state to history before update
+    if (lastKnnCandidates !== null || lastKnnStep > 0) {
+      knnHistory.push({
+        candidates: lastKnnCandidates ? [...lastKnnCandidates] : null,
+        step: lastKnnStep
+      });
+      if (knnHistory.length > MAX_HISTORY_STEPS) {
+        knnHistory.shift();
+      }
+      knnRedoStack = [];
+    }
+
+    // Track current state for next history save
+    lastKnnCandidates = stepEvent.candidates ? [...stepEvent.candidates] : null;
+    lastKnnStep = stepEvent.step;
+
     // Update UI with current step info
     updateKnnUI(stepEvent);
 
     // Show preview highlight of current candidates
     if (stepEvent.candidates && stepEvent.candidates.length > 0) {
       state.setPreviewHighlightFromIndices?.(stepEvent.candidates);
+    }
+  }
+
+  // Undo last KNN step
+  function handleKnnUndo() {
+    if (knnHistory.length === 0) return;
+
+    // Save current state to redo stack
+    knnRedoStack.push({
+      candidates: lastKnnCandidates ? [...lastKnnCandidates] : null,
+      step: lastKnnStep
+    });
+
+    // Restore previous state
+    const prevState = knnHistory.pop();
+    lastKnnCandidates = prevState.candidates;
+    lastKnnStep = prevState.step;
+
+    // Update viewer state
+    viewer.restoreKnnState?.(prevState.candidates, prevState.step);
+
+    // Update UI - keep controls visible for redo
+    if (prevState.candidates && prevState.candidates.length > 0) {
+      updateKnnUI({
+        step: prevState.step,
+        candidateCount: prevState.candidates.length,
+        candidates: prevState.candidates,
+        mode: 'intersect',
+        degree: 0
+      });
+      state.setPreviewHighlightFromIndices?.(prevState.candidates);
+    } else {
+      updateKnnUI({ step: 0, candidateCount: 0, mode: 'intersect', degree: 0, keepControls: true });
+      state.clearPreviewHighlight?.();
+    }
+  }
+
+  // Redo KNN step
+  function handleKnnRedo() {
+    if (knnRedoStack.length === 0) return;
+
+    // Save current state to history
+    knnHistory.push({
+      candidates: lastKnnCandidates ? [...lastKnnCandidates] : null,
+      step: lastKnnStep
+    });
+
+    // Restore redo state
+    const redoState = knnRedoStack.pop();
+    lastKnnCandidates = redoState.candidates;
+    lastKnnStep = redoState.step;
+
+    // Update viewer state
+    viewer.restoreKnnState?.(redoState.candidates, redoState.step);
+
+    // Update UI
+    if (redoState.candidates && redoState.candidates.length > 0) {
+      updateKnnUI({
+        step: redoState.step,
+        candidateCount: redoState.candidates.length,
+        candidates: redoState.candidates,
+        mode: 'intersect',
+        degree: 0
+      });
+      state.setPreviewHighlightFromIndices?.(redoState.candidates);
+    } else {
+      updateKnnUI({ step: 0, candidateCount: 0, mode: 'intersect', degree: 0, keepControls: true });
+      state.clearPreviewHighlight?.();
     }
   }
 
@@ -1435,12 +1978,46 @@ export function initUI({ state, viewer, dom, smoke }) {
   function updateKnnUI(stepEvent) {
     if (!highlightModeDescriptionEl) return;
 
-    if (!stepEvent || stepEvent.step === 0) {
+    if (!stepEvent || (stepEvent.step === 0 && !stepEvent.keepControls)) {
       // No selection in progress - show default description
       highlightModeDescriptionEl.innerHTML = highlightModeCopy.knn;
       // Remove any existing KNN controls
       const existingControls = document.getElementById('knn-step-controls');
       if (existingControls) existingControls.remove();
+    } else if (stepEvent.step === 0 && stepEvent.keepControls) {
+      // Step 0 but keep controls visible for undo/redo
+      const stepInfo = `<strong>No selection</strong><br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>`;
+
+      let controls = document.getElementById('knn-step-controls');
+      if (!controls) {
+        controls = document.createElement('div');
+        controls.id = 'knn-step-controls';
+        controls.className = 'lasso-step-controls';
+        controls.innerHTML = `
+          <button type="button" class="btn-small lasso-confirm" id="knn-confirm-btn">Confirm</button>
+          <button type="button" class="btn-small btn-undo" id="knn-undo-btn" title="Undo">↩</button>
+          <button type="button" class="btn-small btn-redo" id="knn-redo-btn" title="Redo">↪</button>
+          <button type="button" class="btn-small lasso-cancel" id="knn-cancel-btn">Cancel</button>
+        `;
+        highlightModeDescriptionEl.parentElement.appendChild(controls);
+
+        document.getElementById('knn-undo-btn').addEventListener('click', () => handleKnnUndo());
+        document.getElementById('knn-redo-btn').addEventListener('click', () => handleKnnRedo());
+        document.getElementById('knn-confirm-btn').addEventListener('click', () => {
+          viewer.confirmKnnSelection?.();
+          if (state.clearPreviewHighlight) state.clearPreviewHighlight();
+        });
+        document.getElementById('knn-cancel-btn').addEventListener('click', () => viewer.cancelKnnSelection?.());
+      }
+
+      const undoBtn = document.getElementById('knn-undo-btn');
+      const redoBtn = document.getElementById('knn-redo-btn');
+      const confirmBtn = document.getElementById('knn-confirm-btn');
+      if (undoBtn) undoBtn.disabled = knnHistory.length === 0;
+      if (redoBtn) redoBtn.disabled = knnRedoStack.length === 0;
+      if (confirmBtn) confirmBtn.disabled = true;
+
+      highlightModeDescriptionEl.innerHTML = stepInfo;
     } else {
       // Selection in progress - show step info and controls
       let modeLabel = '';
@@ -1462,11 +2039,19 @@ export function initUI({ state, viewer, dom, smoke }) {
         controls.className = 'lasso-step-controls'; // Reuse same styling
         controls.innerHTML = `
           <button type="button" class="btn-small lasso-confirm" id="knn-confirm-btn">Confirm</button>
+          <button type="button" class="btn-small btn-undo" id="knn-undo-btn" title="Undo">↩</button>
+          <button type="button" class="btn-small btn-redo" id="knn-redo-btn" title="Redo">↪</button>
           <button type="button" class="btn-small lasso-cancel" id="knn-cancel-btn">Cancel</button>
         `;
         highlightModeDescriptionEl.parentElement.appendChild(controls);
 
         // Wire up button events
+        document.getElementById('knn-undo-btn').addEventListener('click', () => {
+          handleKnnUndo();
+        });
+        document.getElementById('knn-redo-btn').addEventListener('click', () => {
+          handleKnnRedo();
+        });
         document.getElementById('knn-confirm-btn').addEventListener('click', () => {
           viewer.confirmKnnSelection?.();
           // Clear preview
@@ -1478,6 +2063,12 @@ export function initUI({ state, viewer, dom, smoke }) {
           viewer.cancelKnnSelection?.();
         });
       }
+
+      // Update undo/redo button states
+      const undoBtn = document.getElementById('knn-undo-btn');
+      const redoBtn = document.getElementById('knn-redo-btn');
+      if (undoBtn) undoBtn.disabled = knnHistory.length === 0;
+      if (redoBtn) redoBtn.disabled = knnRedoStack.length === 0;
 
       highlightModeDescriptionEl.innerHTML = stepInfo;
     }
