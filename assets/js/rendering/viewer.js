@@ -662,6 +662,29 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         lassoMode = 'intersect';
       }
       lassoPath = [{ x: localX, y: localY }];
+
+      // Capture view context at lasso start (for correct cell picking even if view switches)
+      const vpInfo = getViewportInfoAtScreen(e.clientX, e.clientY);
+      const capturedViewMatrix = mat4.create();
+      // Get the view matrix for the clicked viewport
+      if (!camerasLocked && vpInfo.viewId !== focusedViewId) {
+        // Clicked in a non-focused view - use its cached camera state
+        const camState = getViewCameraState(vpInfo.viewId);
+        if (camState) {
+          computeViewMatrixFromState(camState, capturedViewMatrix);
+        } else {
+          mat4.copy(capturedViewMatrix, viewMatrix);
+        }
+      } else {
+        // Clicked in focused view or cameras locked - use current viewMatrix
+        mat4.copy(capturedViewMatrix, viewMatrix);
+      }
+      lassoViewContext = {
+        viewId: vpInfo.viewId,
+        viewport: vpInfo,
+        viewMatrix: capturedViewMatrix
+      };
+
       canvas.style.cursor = 'crosshair';
       canvas.classList.add('lassoing');
       drawLasso();
@@ -839,7 +862,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     }
 
     // Switch active view on click when cameras are unlocked in grid mode
-    if (!camerasLocked && viewLayoutMode === 'grid') {
+    // Skip if any highlighter mode is active (lasso, proximity, KNN, cell selection)
+    const highlighterActive = isLassoing || isProximityDragging || isKnnDragging || selectionDragStart;
+    if (!camerasLocked && viewLayoutMode === 'grid' && !highlighterActive) {
       const clickedViewId = getViewIdAtScreenPosition(e.clientX, e.clientY);
       if (clickedViewId && clickedViewId !== focusedViewId) {
         // Save current camera to previous view
@@ -2963,6 +2988,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   let lassoEnabled = false; // Whether lasso mode is active
   let lassoPath = []; // Array of {x, y} screen coordinates
   let isLassoing = false; // Whether user is currently drawing
+  let lassoViewContext = null; // { viewId, viewport, viewMatrix } - captured when lasso starts
   let lassoCallback = null; // Called with final selection (after confirm)
   let lassoPreviewCallback = null; // Called during drawing for preview
 
@@ -3076,6 +3102,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     lassoCtx.scale(dpr, dpr);
     lassoCtx.clearRect(0, 0, rect.width, rect.height);
     lassoPath = [];
+    lassoViewContext = null;
   }
 
   // Draw proximity selection visualization on overlay
@@ -3544,34 +3571,41 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     const rect = canvas.getBoundingClientRect();
 
-    // Determine viewport dimensions based on view layout (same logic as pickCellAtScreen)
+    // Use captured view context if available (for correct picking even if view switched)
     let vpOffsetX = 0;
     let vpOffsetY = 0;
     let vpWidth = rect.width;
     let vpHeight = rect.height;
+    let lassoViewMatrix = viewMatrix; // Default to current view matrix
 
-    // Count active views
-    const viewCount = (liveViewHidden ? 0 : 1) + snapshotViews.length;
+    if (lassoViewContext && lassoViewContext.viewport) {
+      // Use captured viewport and view matrix from when lasso started
+      const vp = lassoViewContext.viewport;
+      vpOffsetX = vp.vpOffsetX;
+      vpOffsetY = vp.vpOffsetY;
+      vpWidth = vp.vpWidth;
+      vpHeight = vp.vpHeight;
+      lassoViewMatrix = lassoViewContext.viewMatrix;
+    } else {
+      // Fallback: determine viewport from first lasso point (legacy behavior)
+      const viewCount = (liveViewHidden ? 0 : 1) + snapshotViews.length;
 
-    // In grid mode with multiple views, find which viewport the lasso is in
-    if (viewLayoutMode === 'grid' && viewCount > 1) {
-      const cols = viewCount <= 3 ? viewCount : Math.ceil(Math.sqrt(viewCount));
-      const rows = Math.ceil(viewCount / cols);
-      vpWidth = rect.width / cols;
-      vpHeight = rect.height / rows;
+      if (viewLayoutMode === 'grid' && viewCount > 1) {
+        const cols = viewCount <= 3 ? viewCount : Math.ceil(Math.sqrt(viewCount));
+        const rows = Math.ceil(viewCount / cols);
+        vpWidth = rect.width / cols;
+        vpHeight = rect.height / rows;
 
-      // Use the first point of the lasso to determine which viewport
-      const firstPt = lassoPath[0];
-      const col = Math.floor(firstPt.x / vpWidth);
-      const row = Math.floor(firstPt.y / vpHeight);
+        const firstPt = lassoPath[0];
+        const col = Math.floor(firstPt.x / vpWidth);
+        const row = Math.floor(firstPt.y / vpHeight);
 
-      // Clamp to valid range
-      const clampedCol = Math.max(0, Math.min(col, cols - 1));
-      const clampedRow = Math.max(0, Math.min(row, rows - 1));
+        const clampedCol = Math.max(0, Math.min(col, cols - 1));
+        const clampedRow = Math.max(0, Math.min(row, rows - 1));
 
-      // Calculate viewport offset
-      vpOffsetX = clampedCol * vpWidth;
-      vpOffsetY = clampedRow * vpHeight;
+        vpOffsetX = clampedCol * vpWidth;
+        vpOffsetY = clampedRow * vpHeight;
+      }
     }
 
     // Convert lasso path to viewport-local coordinates
@@ -3587,9 +3621,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     const vpProjection = mat4.create();
     mat4.perspective(vpProjection, fov, vpAspect, near, far);
 
-    // Compute MVP with viewport-correct projection
+    // Compute MVP with viewport-correct projection (using captured view matrix)
     const vpMvpMatrix = mat4.create();
-    mat4.multiply(vpMvpMatrix, vpProjection, viewMatrix);
+    mat4.multiply(vpMvpMatrix, vpProjection, lassoViewMatrix);
     mat4.multiply(vpMvpMatrix, vpMvpMatrix, modelMatrix);
 
     const selectedIndices = [];
@@ -3706,7 +3740,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
       // Click handler to focus this view
       chip.addEventListener('click', () => {
-        focusedViewId = view.id;
+        if (view.id !== focusedViewId) {
+          // Save current camera to previous view before switching
+          if (!camerasLocked) {
+            setViewCameraState(focusedViewId, getCurrentCameraStateInternal());
+          }
+          focusedViewId = view.id;
+          // Load new view's camera
+          if (!camerasLocked) {
+            const newCam = getViewCameraState(focusedViewId);
+            if (newCam) applyCameraStateTemporarily(newCam);
+          }
+        }
         if (viewFocusHandler) viewFocusHandler(view.id);
       });
 
@@ -3963,14 +4008,21 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
             mat4.copy(viewMatrix, cached.viewMatrix);
             radius = cached.radius;
           } else {
-            // Fallback: no cache exists yet, use active view's matrix and create cache
-            // This happens for views that haven't been focused yet
-            mat4.copy(viewMatrix, activeViewMatrix);
-            radius = activeRadius;
-            // Initialize cache from current state so future renders have something
+            // No cache exists yet - compute correct matrix immediately from camera state
+            // This avoids a one-frame jump where the wrong camera would be used
             const camState = getViewCameraState(view.id);
             if (camState) {
+              // Compute and cache the view matrix from camera state
+              const tempViewMatrix = mat4.create();
+              computeViewMatrixFromState(camState, tempViewMatrix);
+              mat4.copy(viewMatrix, tempViewMatrix);
+              radius = camState.orbit?.radius ?? activeRadius;
+              // Cache for future frames
               updateCachedViewMatrix(view.id, camState);
+            } else {
+              // Truly no camera state - use active view as last resort
+              mat4.copy(viewMatrix, activeViewMatrix);
+              radius = activeRadius;
             }
           }
         } else {
@@ -5515,8 +5567,17 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     setViewLayout(mode, activeId) {
       viewLayoutMode = mode === 'single' ? 'single' : 'grid';
-      if (activeId) {
+      if (activeId && activeId !== focusedViewId) {
+        // Save current camera to previous view before switching (if unlocked)
+        if (!camerasLocked) {
+          setViewCameraState(focusedViewId, getCurrentCameraStateInternal());
+        }
         focusedViewId = activeId;
+        // Load new view's camera (if unlocked)
+        if (!camerasLocked) {
+          const newCam = getViewCameraState(focusedViewId);
+          if (newCam) applyCameraStateTemporarily(newCam);
+        }
         // In single mode, load the focused view's data into HP renderer
         if (viewLayoutMode === 'single') {
           if (activeId === LIVE_VIEW_ID) {
