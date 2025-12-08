@@ -460,23 +460,62 @@ export function initUI({ state, viewer, dom, smoke }) {
   const highlightModeCopy = {
     annotation: 'Alt+click a cell to highlight its group. Alt+drag to select a range.',
     knn: 'Placeholder: KNN drag will expand highlights along nearest-neighbor links.',
-    proximity: 'Placeholder: Proximity drag will sweep a local radius around your drag path.',
-    lasso: 'Placeholder: Lasso will free-draw a boundary to capture nearby cells.'
+    proximity: 'Alt+click a cell and drag outward to select by 3D proximity. Drag farther to expand selection radius.',
+    lasso: 'Hold Alt and draw to select. Rotate and draw again: Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract.'
   };
   let activeHighlightMode = 'annotation';
 
   function setHighlightModeUI(mode) {
+    const wasLasso = activeHighlightMode === 'lasso';
+    const wasProximity = activeHighlightMode === 'proximity';
     activeHighlightMode = mode;
+
     if (highlightModeButtonsList && highlightModeButtonsList.length) {
       highlightModeButtonsList.forEach((btn) => {
         const isActive = btn?.dataset?.mode === mode;
         btn?.setAttribute?.('aria-pressed', isActive ? 'true' : 'false');
       });
     }
+
+    // Cancel any in-progress lasso selection when switching away from lasso mode
+    if (wasLasso && mode !== 'lasso') {
+      viewer.cancelLassoSelection?.();
+      // Clear preview highlight
+      if (state.clearPreviewHighlight) {
+        state.clearPreviewHighlight();
+      }
+    }
+
+    // Cancel any in-progress proximity selection when switching away from proximity mode
+    if (wasProximity && mode !== 'proximity') {
+      viewer.cancelProximitySelection?.();
+      // Clear preview highlight
+      if (state.clearPreviewHighlight) {
+        state.clearPreviewHighlight();
+      }
+    }
+
+    // Remove lasso/proximity controls UI when switching modes
+    const existingControls = document.getElementById('lasso-step-controls');
+    if (existingControls) existingControls.remove();
+    const existingProximityControls = document.getElementById('proximity-step-controls');
+    if (existingProximityControls) existingProximityControls.remove();
+
+    // Update description text (use textContent to clear any innerHTML from lasso UI)
     if (highlightModeDescriptionEl) {
       const text = highlightModeCopy[mode] || '';
       highlightModeDescriptionEl.textContent = text;
       highlightModeDescriptionEl.style.display = text ? 'block' : 'none';
+    }
+
+    // Enable/disable lasso mode in viewer
+    if (viewer.setLassoEnabled) {
+      viewer.setLassoEnabled(mode === 'lasso');
+    }
+
+    // Enable/disable proximity mode in viewer
+    if (viewer.setProximityEnabled) {
+      viewer.setProximityEnabled(mode === 'proximity');
     }
   }
 
@@ -865,6 +904,227 @@ export function initUI({ state, viewer, dom, smoke }) {
   // Wire up cell selection callback
   if (viewer.setCellSelectionCallback) {
     viewer.setCellSelectionCallback(handleCellSelection);
+  }
+
+  // Handle final lasso selection (after confirm)
+  function handleLassoSelection(lassoEvent) {
+    if (!lassoEvent.cellIndices || lassoEvent.cellIndices.length === 0) {
+      console.log('[UI] Lasso selection empty');
+      return;
+    }
+
+    // Add highlight directly with cell indices
+    const stepsLabel = lassoEvent.steps > 1 ? ` (${lassoEvent.steps} views)` : '';
+    const group = state.addHighlightDirect({
+      type: 'lasso',
+      label: `Lasso${stepsLabel} (${lassoEvent.cellCount.toLocaleString()} cells)`,
+      cellIndices: lassoEvent.cellIndices
+    });
+
+    if (group) {
+      console.log(`[UI] Lasso selected ${lassoEvent.cellCount} cells from ${lassoEvent.steps} view(s)`);
+    }
+
+    // Reset UI state
+    updateLassoUI(null);
+  }
+
+  // Handle lasso step updates (multi-step mode)
+  function handleLassoStep(stepEvent) {
+    if (stepEvent.cancelled) {
+      // Selection was cancelled
+      updateLassoUI(null);
+      // Clear preview highlight
+      if (state.clearPreviewHighlight) {
+        state.clearPreviewHighlight();
+      }
+      return;
+    }
+
+    // Update UI with current step info
+    updateLassoUI(stepEvent);
+
+    // Show preview highlight of current candidates
+    if (stepEvent.candidates && stepEvent.candidates.length > 0) {
+      state.setPreviewHighlightFromIndices?.(stepEvent.candidates);
+    }
+  }
+
+  // Update lasso UI based on current state
+  function updateLassoUI(stepEvent) {
+    if (!highlightModeDescriptionEl) return;
+
+    if (!stepEvent || stepEvent.step === 0) {
+      // No selection in progress - show default description
+      highlightModeDescriptionEl.innerHTML = highlightModeCopy.lasso;
+      // Remove any existing lasso controls
+      const existingControls = document.getElementById('lasso-step-controls');
+      if (existingControls) existingControls.remove();
+    } else {
+      // Selection in progress - show step info and controls
+      let modeLabel = '';
+      if (stepEvent.mode === 'union') {
+        modeLabel = ' <span class="lasso-mode-tag union">+added</span>';
+      } else if (stepEvent.mode === 'subtract') {
+        modeLabel = ' <span class="lasso-mode-tag subtract">−removed</span>';
+      } else if (stepEvent.step > 1) {
+        modeLabel = ' <span class="lasso-mode-tag intersect">intersected</span>';
+      }
+      const stepInfo = `<strong>Step ${stepEvent.step}:</strong> ${stepEvent.candidateCount.toLocaleString()} cells${modeLabel}<br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>`;
+
+      // Check if controls already exist
+      let controls = document.getElementById('lasso-step-controls');
+      if (!controls) {
+        controls = document.createElement('div');
+        controls.id = 'lasso-step-controls';
+        controls.className = 'lasso-step-controls';
+        controls.innerHTML = `
+          <button type="button" class="btn-small lasso-confirm" id="lasso-confirm-btn">Confirm</button>
+          <button type="button" class="btn-small lasso-cancel" id="lasso-cancel-btn">Cancel</button>
+        `;
+        highlightModeDescriptionEl.parentElement.appendChild(controls);
+
+        // Wire up button events
+        document.getElementById('lasso-confirm-btn').addEventListener('click', () => {
+          viewer.confirmLassoSelection?.();
+          // Clear preview
+          if (state.clearPreviewHighlight) {
+            state.clearPreviewHighlight();
+          }
+        });
+        document.getElementById('lasso-cancel-btn').addEventListener('click', () => {
+          viewer.cancelLassoSelection?.();
+        });
+      }
+
+      highlightModeDescriptionEl.innerHTML = stepInfo;
+    }
+  }
+
+  // Wire up lasso callbacks
+  if (viewer.setLassoCallback) {
+    viewer.setLassoCallback(handleLassoSelection);
+  }
+  if (viewer.setLassoStepCallback) {
+    viewer.setLassoStepCallback(handleLassoStep);
+  }
+
+  // === PROXIMITY DRAG HANDLERS ===
+
+  // Handle final proximity selection (when confirmed)
+  function handleProximitySelection(proximityEvent) {
+    if (!proximityEvent || !proximityEvent.cellIndices || proximityEvent.cellIndices.length === 0) {
+      console.log('[UI] Proximity selection empty');
+      return;
+    }
+
+    // Add highlight directly with cell indices (same as lasso)
+    const stepsLabel = proximityEvent.steps > 1 ? ` (${proximityEvent.steps} drags)` : '';
+    const group = state.addHighlightDirect({
+      type: 'proximity',
+      label: `Proximity${stepsLabel} (${proximityEvent.cellCount.toLocaleString()} cells)`,
+      cellIndices: proximityEvent.cellIndices
+    });
+
+    if (group) {
+      console.log(`[UI] Proximity selected ${proximityEvent.cellCount} cells from ${proximityEvent.steps} drag(s)`);
+    }
+
+    // Reset UI state
+    updateProximityUI(null);
+  }
+
+  // Handle proximity step updates (multi-step mode)
+  function handleProximityStep(stepEvent) {
+    if (stepEvent.cancelled) {
+      // Selection was cancelled
+      updateProximityUI(null);
+      // Clear preview highlight
+      if (state.clearPreviewHighlight) {
+        state.clearPreviewHighlight();
+      }
+      return;
+    }
+
+    // Update UI with current step info
+    updateProximityUI(stepEvent);
+
+    // Show preview highlight of current candidates
+    if (stepEvent.candidates && stepEvent.candidates.length > 0) {
+      state.setPreviewHighlightFromIndices?.(stepEvent.candidates);
+    }
+  }
+
+  // Handle live preview during proximity drag
+  function handleProximityPreview(previewEvent) {
+    if (!previewEvent || !previewEvent.cellIndices) return;
+
+    // Show preview highlight during drag
+    if (previewEvent.cellIndices.length > 0) {
+      state.setPreviewHighlightFromIndices?.(previewEvent.cellIndices);
+    }
+  }
+
+  // Update proximity UI based on current state
+  function updateProximityUI(stepEvent) {
+    if (!highlightModeDescriptionEl) return;
+
+    if (!stepEvent || stepEvent.step === 0) {
+      // No selection in progress - show default description
+      highlightModeDescriptionEl.innerHTML = highlightModeCopy.proximity;
+      // Remove any existing proximity controls
+      const existingControls = document.getElementById('proximity-step-controls');
+      if (existingControls) existingControls.remove();
+    } else {
+      // Selection in progress - show step info and controls
+      let modeLabel = '';
+      if (stepEvent.mode === 'union') {
+        modeLabel = ' <span class="lasso-mode-tag union">+added</span>';
+      } else if (stepEvent.mode === 'subtract') {
+        modeLabel = ' <span class="lasso-mode-tag subtract">−removed</span>';
+      } else if (stepEvent.step > 1) {
+        modeLabel = ' <span class="lasso-mode-tag intersect">intersected</span>';
+      }
+      const stepInfo = `<strong>Step ${stepEvent.step}:</strong> ${stepEvent.candidateCount.toLocaleString()} cells${modeLabel}<br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>`;
+
+      // Check if controls already exist
+      let controls = document.getElementById('proximity-step-controls');
+      if (!controls) {
+        controls = document.createElement('div');
+        controls.id = 'proximity-step-controls';
+        controls.className = 'lasso-step-controls'; // Reuse same styling
+        controls.innerHTML = `
+          <button type="button" class="btn-small lasso-confirm" id="proximity-confirm-btn">Confirm</button>
+          <button type="button" class="btn-small lasso-cancel" id="proximity-cancel-btn">Cancel</button>
+        `;
+        highlightModeDescriptionEl.parentElement.appendChild(controls);
+
+        // Wire up button events
+        document.getElementById('proximity-confirm-btn').addEventListener('click', () => {
+          viewer.confirmProximitySelection?.();
+          // Clear preview
+          if (state.clearPreviewHighlight) {
+            state.clearPreviewHighlight();
+          }
+        });
+        document.getElementById('proximity-cancel-btn').addEventListener('click', () => {
+          viewer.cancelProximitySelection?.();
+        });
+      }
+
+      highlightModeDescriptionEl.innerHTML = stepInfo;
+    }
+  }
+
+  // Wire up proximity callbacks
+  if (viewer.setProximityCallback) {
+    viewer.setProximityCallback(handleProximitySelection);
+  }
+  if (viewer.setProximityStepCallback) {
+    viewer.setProximityStepCallback(handleProximityStep);
+  }
+  if (viewer.setProximityPreviewCallback) {
+    viewer.setProximityPreviewCallback(handleProximityPreview);
   }
 
   // Handle preview during continuous drag

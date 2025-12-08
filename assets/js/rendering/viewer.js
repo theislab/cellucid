@@ -243,6 +243,16 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     ringWidth: gl.getUniformLocation(highlightProgram, 'u_ringWidth'),
     haloStrength: gl.getUniformLocation(highlightProgram, 'u_haloStrength'),
     haloShape: gl.getUniformLocation(highlightProgram, 'u_haloShape'),
+    ringStyle: gl.getUniformLocation(highlightProgram, 'u_ringStyle'),
+    time: gl.getUniformLocation(highlightProgram, 'u_time'),
+    // Atmospheric fog uniforms
+    fogDensity: gl.getUniformLocation(highlightProgram, 'u_fogDensity'),
+    fogNear: gl.getUniformLocation(highlightProgram, 'u_fogNear'),
+    fogFar: gl.getUniformLocation(highlightProgram, 'u_fogFar'),
+    fogColor: gl.getUniformLocation(highlightProgram, 'u_fogColor'),
+    // Lighting uniforms (same as HP_FS_FULL)
+    lightingStrength: gl.getUniformLocation(highlightProgram, 'u_lightingStrength'),
+    lightDir: gl.getUniformLocation(highlightProgram, 'u_lightDir'),
   };
 
   // Highlight state
@@ -250,17 +260,19 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   let highlightBuffer = null; // WebGL buffer for interleaved highlight data
   let highlightPointCount = 0;
   let highlightBufferLodSignature = null; // Tracks LOD level used to build the highlight buffer
-  // Golden accent (halo) with defined halo shape
-  let highlightColor = [1.0, 0.85, 0.0]; // bright yellow
-  let highlightScale = 2.0; // How much larger than normal points
-  let highlightRingWidth = 0.22; // Ring thickness
-  let highlightHaloStrength = 0.6; // Halo opacity contribution
+  // Ethereal cyan-white halo color (shines on both dark and light backgrounds)
+  let highlightColor = [0.4, 0.85, 1.0]; // cyan-white for that heavenly glow
+  let highlightScale = 1.8; // How much larger than normal points
+  let highlightRingWidth = 0.40; // Ring thickness (adaptive minimum kicks in at small sizes)
+  let highlightHaloStrength = 0.7; // Halo opacity contribution
   // 0 = circle, 1 = square
   let highlightHaloShape = 0.0;
+  // 0 = torus 3D, 1 = flat circle ring, 2 = flat square ring
+  let highlightRingStyle = 0.0;
   const highlightStylesByQuality = {
-    full: { scale: 2.0, ringWidth: 0.22, haloStrength: 0.65, haloShape: 0.0 },
-    light: { scale: 1.9, ringWidth: 0.24, haloStrength: 0.50, haloShape: 0.0 },
-    ultralight: { scale: 1.7, ringWidth: 0.26, haloStrength: 0.40, haloShape: 1.0 } // square halo for square points
+    full: { scale: 1.75, ringWidth: 0.42, haloStrength: 0.65, haloShape: 0.0, ringStyle: 0.0 },
+    light: { scale: 1.70, ringWidth: 0.44, haloStrength: 0.60, haloShape: 0.0, ringStyle: 1.0 },
+    ultralight: { scale: 1.65, ringWidth: 0.46, haloStrength: 0.55, haloShape: 0.35, ringStyle: 2.0 }
   };
   let currentShaderQuality = 'full';
 
@@ -270,6 +282,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     highlightRingWidth = style.ringWidth;
     highlightHaloStrength = style.haloStrength;
     highlightHaloShape = style.haloShape;
+    highlightRingStyle = style.ringStyle;
   }
   applyHighlightStyleForQuality(currentShaderQuality);
 
@@ -627,7 +640,126 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   // === Event Listeners ===
   canvas.addEventListener('contextmenu', (e) => { e.preventDefault(); return false; });
 
+  // Track lasso mode based on modifier keys
+  // 'intersect' = Alt only, 'union' = Shift+Alt, 'subtract' = Ctrl+Alt
+  let lassoMode = 'intersect';
+
   canvas.addEventListener('mousedown', (e) => {
+    // Lasso mode: Alt+click to draw lasso selection
+    // Alt = intersect, Shift+Alt = union (add), Ctrl+Alt = subtract
+    if (e.altKey && lassoEnabled && e.button === 0) {
+      const rect = canvas.getBoundingClientRect();
+      const localX = e.clientX - rect.left;
+      const localY = e.clientY - rect.top;
+
+      isLassoing = true;
+      // Determine mode based on modifier keys (Ctrl takes priority over Shift)
+      if (e.ctrlKey || e.metaKey) {
+        lassoMode = 'subtract';
+      } else if (e.shiftKey) {
+        lassoMode = 'union';
+      } else {
+        lassoMode = 'intersect';
+      }
+      lassoPath = [{ x: localX, y: localY }];
+      canvas.style.cursor = 'crosshair';
+      canvas.classList.add('lassoing');
+      drawLasso();
+      e.preventDefault();
+      return;
+    }
+
+    // Proximity drag mode: Alt+click to start proximity selection
+    // Click on a cell to set center, then drag to expand selection radius
+    // When refining an existing selection, allow clicking anywhere (not just on cells)
+    if (e.altKey && proximityEnabled && e.button === 0) {
+      const cellIdx = pickCellAtScreen(e.clientX, e.clientY);
+      const positions = hpRenderer.getPositions();
+
+      // Determine mode based on modifier keys
+      let proximityMode = 'intersect';
+      if (e.ctrlKey || e.metaKey) {
+        proximityMode = 'subtract';
+      } else if (e.shiftKey) {
+        proximityMode = 'union';
+      }
+
+      let worldPos = null;
+      let clickedCellIdx = cellIdx;
+
+      if (cellIdx >= 0 && positions) {
+        // Clicked on a cell - use its position
+        worldPos = [
+          positions[cellIdx * 3],
+          positions[cellIdx * 3 + 1],
+          positions[cellIdx * 3 + 2]
+        ];
+      } else if (proximityCandidateSet && proximityCandidateSet.size > 0 && positions) {
+        // No cell clicked, but we have an existing selection
+        // Use ray-plane intersection to get a 3D position
+        // The plane passes through the centroid of the existing selection
+
+        // Compute centroid of existing selection
+        let cx = 0, cy = 0, cz = 0;
+        for (const idx of proximityCandidateSet) {
+          cx += positions[idx * 3];
+          cy += positions[idx * 3 + 1];
+          cz += positions[idx * 3 + 2];
+        }
+        const count = proximityCandidateSet.size;
+        cx /= count; cy /= count; cz /= count;
+
+        // Get screen ray
+        const rect = canvas.getBoundingClientRect();
+        const localX = e.clientX - rect.left;
+        const localY = e.clientY - rect.top;
+        const ray = screenToRay(localX, localY, rect.width, rect.height);
+
+        if (ray) {
+          // Intersect ray with plane at centroid (plane normal = view direction)
+          const viewDir = vec3.sub(vec3.create(), target, eye);
+          vec3.normalize(viewDir, viewDir);
+
+          // Plane equation: dot(viewDir, p - centroid) = 0
+          // Ray: p = origin + t * direction
+          // Solve for t: dot(viewDir, origin + t*dir - centroid) = 0
+          const centroid = [cx, cy, cz];
+          const denom = viewDir[0] * ray.direction[0] + viewDir[1] * ray.direction[1] + viewDir[2] * ray.direction[2];
+
+          if (Math.abs(denom) > 1e-6) {
+            const diff = [centroid[0] - ray.origin[0], centroid[1] - ray.origin[1], centroid[2] - ray.origin[2]];
+            const t = (viewDir[0] * diff[0] + viewDir[1] * diff[1] + viewDir[2] * diff[2]) / denom;
+
+            if (t > 0) {
+              worldPos = [
+                ray.origin[0] + t * ray.direction[0],
+                ray.origin[1] + t * ray.direction[1],
+                ray.origin[2] + t * ray.direction[2]
+              ];
+              clickedCellIdx = -1; // No specific cell clicked
+            }
+          }
+        }
+      }
+
+      if (worldPos) {
+        proximityCenter = {
+          screenX: e.clientX,
+          screenY: e.clientY,
+          worldPos: worldPos,
+          cellIndex: clickedCellIdx,
+          mode: proximityMode
+        };
+        proximityCurrentRadius = 0;
+        isProximityDragging = true;
+        canvas.style.cursor = 'crosshair';
+        canvas.classList.add('proximity-dragging');
+        drawProximityIndicator();
+        e.preventDefault();
+        return;
+      }
+    }
+
     // Cell selection mode: Alt+click (or Alt+drag for range selection)
     // Only enter selection mode if a field is active (highlightMode is not 'none')
     if (e.altKey && cellSelectionEnabled && e.button === 0 && highlightMode !== 'none') {
@@ -710,6 +842,117 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   });
 
   window.addEventListener('mouseup', (e) => {
+    // Complete lasso selection if in progress
+    if (isLassoing) {
+      isLassoing = false;
+      canvas.classList.remove('lassoing');
+
+      // Only process if we have a valid polygon (at least 3 points)
+      if (lassoPath.length >= 3) {
+        const selectedIndices = findCellsInLasso();
+
+        if (selectedIndices.length > 0 || lassoMode === 'subtract') {
+          const newSet = new Set(selectedIndices);
+
+          // Multi-step mode: union, subtract, or intersect based on modifier keys
+          if (lassoCandidateSet === null) {
+            // First step: initialize candidate set (subtract on first step does nothing)
+            if (lassoMode !== 'subtract') {
+              lassoCandidateSet = new Set(selectedIndices);
+            }
+          } else if (lassoMode === 'union') {
+            // Union mode (Shift+Alt): add new cells to existing selection
+            for (const idx of selectedIndices) {
+              lassoCandidateSet.add(idx);
+            }
+          } else if (lassoMode === 'subtract') {
+            // Subtract mode (Ctrl+Alt): remove cells from existing selection
+            for (const idx of selectedIndices) {
+              lassoCandidateSet.delete(idx);
+            }
+          } else {
+            // Intersect mode (Alt only): keep only cells in both selections
+            lassoCandidateSet = new Set([...lassoCandidateSet].filter(idx => newSet.has(idx)));
+          }
+
+          if (lassoCandidateSet) {
+            lassoStepCount++;
+
+            // Notify about step completion
+            if (lassoStepCallback) {
+              lassoStepCallback({
+                step: lassoStepCount,
+                candidateCount: lassoCandidateSet.size,
+                candidates: [...lassoCandidateSet],
+                mode: lassoMode
+              });
+            }
+          }
+        }
+      }
+
+      clearLasso();
+      updateCursorForHighlightMode();
+      return;
+    }
+
+    // Complete proximity drag selection if in progress
+    if (isProximityDragging) {
+      isProximityDragging = false;
+      canvas.classList.remove('proximity-dragging');
+
+      // Only process if we have a valid selection (radius > 0)
+      if (proximityCenter && proximityCurrentRadius > 0) {
+        const selectedIndices = findCellsInProximity(proximityCenter.worldPos, proximityCurrentRadius);
+        const mode = proximityCenter.mode || 'intersect';
+
+        if (selectedIndices.length > 0 || mode === 'subtract') {
+          const newSet = new Set(selectedIndices);
+
+          // Multi-step mode: union, subtract, or intersect based on modifier keys
+          if (proximityCandidateSet === null) {
+            // First step: initialize candidate set
+            if (mode !== 'subtract') {
+              proximityCandidateSet = new Set(selectedIndices);
+            }
+          } else if (mode === 'union') {
+            // Union mode (Shift+Alt): add new cells to existing selection
+            for (const idx of selectedIndices) {
+              proximityCandidateSet.add(idx);
+            }
+          } else if (mode === 'subtract') {
+            // Subtract mode (Ctrl+Alt): remove cells from existing selection
+            for (const idx of selectedIndices) {
+              proximityCandidateSet.delete(idx);
+            }
+          } else {
+            // Intersect mode (Alt only): keep only cells in both selections
+            proximityCandidateSet = new Set([...proximityCandidateSet].filter(idx => newSet.has(idx)));
+          }
+
+          if (proximityCandidateSet) {
+            proximityStepCount++;
+
+            // Notify about step completion
+            if (proximityStepCallback) {
+              proximityStepCallback({
+                step: proximityStepCount,
+                candidateCount: proximityCandidateSet.size,
+                candidates: [...proximityCandidateSet],
+                mode: mode,
+                centerCellIndex: proximityCenter.cellIndex,
+                radius: proximityCurrentRadius
+              });
+            }
+          }
+        }
+      }
+
+      clearProximityIndicator();
+      updateCursorForHighlightMode();
+      return;
+    }
+
     // Complete cell selection if in progress
     if (selectionDragStart) {
       const dragDistance = selectionDragCurrent
@@ -787,6 +1030,86 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     if (!pointerLockActive) {
       cursorX = e.clientX;
       cursorY = e.clientY;
+    }
+
+    // Track lasso drawing
+    if (isLassoing) {
+      const rect = canvas.getBoundingClientRect();
+      const localX = e.clientX - rect.left;
+      const localY = e.clientY - rect.top;
+
+      // Add point to path (with minimum distance to avoid too many points)
+      const lastPt = lassoPath[lassoPath.length - 1];
+      const dx = localX - lastPt.x;
+      const dy = localY - lastPt.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist >= 3) { // Minimum 3px between points
+        lassoPath.push({ x: localX, y: localY });
+        drawLasso();
+
+        // Call preview callback if set
+        if (lassoPreviewCallback && lassoPath.length >= 3) {
+          const previewIndices = findCellsInLasso();
+          lassoPreviewCallback({
+            type: 'lasso-preview',
+            cellIndices: previewIndices,
+            cellCount: previewIndices.length,
+            polygon: [...lassoPath]
+          });
+        }
+      }
+      return;
+    }
+
+    // Track proximity drag - expand selection radius as user drags
+    if (isProximityDragging && proximityCenter) {
+      // Calculate drag distance from starting point (use total distance, direction doesn't matter)
+      const dx = e.clientX - proximityCenter.screenX;
+      const dy = e.clientY - proximityCenter.screenY;
+      const pixelDist = Math.sqrt(dx * dx + dy * dy);
+
+      // Convert pixel distance to world radius
+      proximityCurrentRadius = pixelDistanceToWorldRadius(pixelDist);
+
+      // Update visual indicator
+      drawProximityIndicator();
+
+      // Call preview callback if set
+      if (proximityPreviewCallback && proximityCurrentRadius > 0) {
+        const newIndices = findCellsInProximity(proximityCenter.worldPos, proximityCurrentRadius);
+        const mode = proximityCenter.mode || 'intersect';
+
+        // Compute combined preview based on mode and existing candidates
+        let combinedIndices;
+        if (proximityCandidateSet === null || proximityCandidateSet.size === 0) {
+          // No existing selection - just show new indices
+          combinedIndices = newIndices;
+        } else if (mode === 'union') {
+          // Union: show existing + new
+          const combined = new Set(proximityCandidateSet);
+          for (const idx of newIndices) combined.add(idx);
+          combinedIndices = [...combined];
+        } else if (mode === 'subtract') {
+          // Subtract: show existing minus new
+          const newSet = new Set(newIndices);
+          combinedIndices = [...proximityCandidateSet].filter(idx => !newSet.has(idx));
+        } else {
+          // Intersect: show intersection of existing and new
+          const newSet = new Set(newIndices);
+          combinedIndices = [...proximityCandidateSet].filter(idx => newSet.has(idx));
+        }
+
+        proximityPreviewCallback({
+          type: 'proximity-preview',
+          cellIndices: combinedIndices,
+          cellCount: combinedIndices.length,
+          newCellCount: newIndices.length,
+          centerCellIndex: proximityCenter.cellIndex,
+          radius: proximityCurrentRadius,
+          mode: mode
+        });
+      }
+      return;
     }
 
     // Track selection drag
@@ -882,9 +1205,15 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     if (navigationMode === 'free') return;
     if (isDragging) return; // orbit drag in progress
     if (selectionDragStart) return; // cell selection drag in progress
+    if (isLassoing) return; // lasso in progress
+    if (isProximityDragging) return; // proximity drag in progress
 
-    // Set cursor based on Alt key and highlight mode
-    if (altKeyDown && highlightMode === 'continuous') {
+    // Set cursor based on Alt key and mode
+    if (altKeyDown && lassoEnabled) {
+      canvas.style.cursor = 'crosshair';
+    } else if (altKeyDown && proximityEnabled) {
+      canvas.style.cursor = 'crosshair';
+    } else if (altKeyDown && highlightMode === 'continuous') {
       canvas.style.cursor = 'ns-resize';
     } else if (altKeyDown && highlightMode === 'categorical') {
       canvas.style.cursor = 'cell';
@@ -2094,9 +2423,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   function drawHighlights(viewportHeight) {
     if (highlightPointCount === 0 || !highlightBuffer) return;
 
-    // Draw highlights on top of everything (no depth test)
+    // Draw highlights sharing depth with dots so halos never float
     const depthWasEnabled = gl.isEnabled(gl.DEPTH_TEST);
-    if (depthWasEnabled) gl.disable(gl.DEPTH_TEST);
+    const depthMaskWasEnabled = gl.getParameter(gl.DEPTH_WRITEMASK);
+    if (!depthWasEnabled) gl.enable(gl.DEPTH_TEST);
+    gl.depthMask(false);
 
     gl.useProgram(highlightProgram);
 
@@ -2114,21 +2445,36 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     let effectiveRingWidth = highlightRingWidth;
     let effectiveHaloStrength = highlightHaloStrength;
     if (highlightHaloShape > 0.5) {
+      // Boost parameters for square sprites
       const haloBoost = Math.min(1.5, Math.max(0, basePointSize * (0.01 + sizeAttenuation * 0.02)));
-      effectiveScale = highlightScale + haloBoost;
-      effectiveRingWidth = Math.min(0.35, highlightRingWidth + haloBoost * 0.03);
-      effectiveHaloStrength = Math.min(1.0, highlightHaloStrength + haloBoost * 0.15);
+      effectiveScale = highlightScale + haloBoost * 0.5;
+      effectiveRingWidth = Math.min(0.5, highlightRingWidth + haloBoost * 0.02);
+      effectiveHaloStrength = Math.min(1.0, highlightHaloStrength + haloBoost * 0.1);
     }
 
     gl.uniform1f(highlightUniformLocations.pointSize, highlightPointSize);
     gl.uniform1f(highlightUniformLocations.sizeAttenuation, sizeAttenuation);
-    gl.uniform1f(highlightUniformLocations.viewportHeight, viewportHeight);
-    gl.uniform1f(highlightUniformLocations.fov, fov);
-    gl.uniform1f(highlightUniformLocations.highlightScale, effectiveScale);
+  gl.uniform1f(highlightUniformLocations.viewportHeight, viewportHeight);
+  gl.uniform1f(highlightUniformLocations.fov, fov);
+  gl.uniform1f(highlightUniformLocations.highlightScale, effectiveScale);
     gl.uniform3fv(highlightUniformLocations.highlightColor, highlightColor);
     gl.uniform1f(highlightUniformLocations.ringWidth, effectiveRingWidth);
     gl.uniform1f(highlightUniformLocations.haloStrength, effectiveHaloStrength);
     gl.uniform1f(highlightUniformLocations.haloShape, highlightHaloShape);
+    gl.uniform1f(highlightUniformLocations.ringStyle, highlightRingStyle);
+    // Animated glow time
+    const highlightTime = (performance.now() - startTime) * 0.001;
+    gl.uniform1f(highlightUniformLocations.time, highlightTime);
+
+    // Set fog uniforms (same values as 3D point shaders)
+    gl.uniform1f(highlightUniformLocations.fogDensity, fogDensity);
+    gl.uniform1f(highlightUniformLocations.fogNear, hpRenderer.fogNear);
+    gl.uniform1f(highlightUniformLocations.fogFar, hpRenderer.fogFar);
+    gl.uniform3fv(highlightUniformLocations.fogColor, fogColor);
+
+    // Set lighting uniforms (same values as 3D point shaders)
+    gl.uniform1f(highlightUniformLocations.lightingStrength, lightingStrength);
+    gl.uniform3fv(highlightUniformLocations.lightDir, lightDir);
 
     // Bind interleaved buffer
     const BYTES_PER_POINT = 16;
@@ -2142,14 +2488,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     gl.enableVertexAttribArray(highlightAttribLocations.color);
     gl.vertexAttribPointer(highlightAttribLocations.color, 4, gl.UNSIGNED_BYTE, true, BYTES_PER_POINT, 12);
 
-    // Enable additive blending for glow effect
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+    // Use standard alpha blending - the shader handles visibility on all backgrounds
+    // through its internal color composition with proper luminance
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
     gl.drawArrays(gl.POINTS, 0, highlightPointCount);
-
-    // Restore normal blending
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-    if (depthWasEnabled) gl.enable(gl.DEPTH_TEST);
+    gl.depthMask(depthMaskWasEnabled);
+    if (!depthWasEnabled) gl.disable(gl.DEPTH_TEST);
   }
 
   // === CELL PICKING ===
@@ -2323,6 +2668,357 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   let selectionDragStart = null; // { x, y, cellIndex, value } for drag selection
   let selectionDragCurrent = null;
   let highlightMode = 'none'; // 'none', 'categorical', or 'continuous'
+
+  // === LASSO SELECTION STATE ===
+  let lassoEnabled = false; // Whether lasso mode is active
+  let lassoPath = []; // Array of {x, y} screen coordinates
+  let isLassoing = false; // Whether user is currently drawing
+  let lassoCallback = null; // Called with final selection (after confirm)
+  let lassoPreviewCallback = null; // Called during drawing for preview
+
+  // Multi-step lasso selection state
+  let lassoCandidateSet = null; // Set of candidate cell indices (null = no selection in progress)
+  let lassoStepCount = 0; // Number of lasso steps completed
+  let lassoStepCallback = null; // Called after each step with { step, candidateCount, candidates }
+
+  // === PROXIMITY DRAG SELECTION STATE ===
+  let proximityEnabled = false; // Whether proximity drag mode is active
+  let isProximityDragging = false; // Whether user is currently dragging
+  let proximityCenter = null; // { screenX, screenY, worldPos: [x, y, z], cellIndex }
+  let proximityCurrentRadius = 0; // Current selection radius in world units
+  let proximityCallback = null; // Called with final selection
+  let proximityPreviewCallback = null; // Called during drag for live preview
+  let proximityStepCallback = null; // Called after each step (for multi-step mode)
+  let proximityCandidateSet = null; // Set of candidate cell indices (for multi-step mode)
+  let proximityStepCount = 0; // Number of proximity steps completed
+
+  // Create lasso overlay canvas
+  const lassoCanvas = document.createElement('canvas');
+  lassoCanvas.id = 'lasso-overlay';
+  lassoCanvas.style.cssText = `
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    z-index: 10;
+  `;
+  canvas.parentElement.style.position = 'relative';
+  canvas.parentElement.appendChild(lassoCanvas);
+  const lassoCtx = lassoCanvas.getContext('2d');
+
+  // Sync lasso canvas size with main canvas
+  function syncLassoCanvasSize() {
+    const rect = canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    lassoCanvas.width = rect.width * dpr;
+    lassoCanvas.height = rect.height * dpr;
+    lassoCanvas.style.width = rect.width + 'px';
+    lassoCanvas.style.height = rect.height + 'px';
+    lassoCtx.scale(dpr, dpr);
+  }
+
+  // Initial sync and observe resize
+  syncLassoCanvasSize();
+  const lassoResizeObserver = new ResizeObserver(syncLassoCanvasSize);
+  lassoResizeObserver.observe(canvas);
+
+  // Draw lasso path on overlay using website's color scheme (#111827 = rgb(17, 24, 39))
+  function drawLasso() {
+    const rect = canvas.getBoundingClientRect();
+    lassoCtx.setTransform(1, 0, 0, 1, 0, 0);
+    const dpr = window.devicePixelRatio || 1;
+    lassoCtx.scale(dpr, dpr);
+    lassoCtx.clearRect(0, 0, rect.width, rect.height);
+
+    if (lassoPath.length < 2) return;
+
+    // Draw filled polygon with transparency
+    lassoCtx.beginPath();
+    lassoCtx.moveTo(lassoPath[0].x, lassoPath[0].y);
+    for (let i = 1; i < lassoPath.length; i++) {
+      lassoCtx.lineTo(lassoPath[i].x, lassoPath[i].y);
+    }
+    lassoCtx.closePath();
+
+    // Semi-transparent fill
+    lassoCtx.fillStyle = 'rgba(17, 24, 39, 0.08)';
+    lassoCtx.fill();
+
+    // Stroke the outline
+    lassoCtx.strokeStyle = 'rgba(17, 24, 39, 0.7)';
+    lassoCtx.lineWidth = 2;
+    lassoCtx.setLineDash([4, 3]);
+    lassoCtx.stroke();
+
+    // Draw dots at each vertex
+    lassoCtx.setLineDash([]);
+    lassoCtx.fillStyle = 'rgba(17, 24, 39, 0.9)';
+    for (const pt of lassoPath) {
+      lassoCtx.beginPath();
+      lassoCtx.arc(pt.x, pt.y, 3, 0, Math.PI * 2);
+      lassoCtx.fill();
+    }
+  }
+
+  // Clear lasso drawing
+  function clearLasso() {
+    const rect = canvas.getBoundingClientRect();
+    lassoCtx.setTransform(1, 0, 0, 1, 0, 0);
+    const dpr = window.devicePixelRatio || 1;
+    lassoCtx.scale(dpr, dpr);
+    lassoCtx.clearRect(0, 0, rect.width, rect.height);
+    lassoPath = [];
+  }
+
+  // Draw proximity selection visualization on overlay
+  function drawProximityIndicator() {
+    const rect = canvas.getBoundingClientRect();
+    lassoCtx.setTransform(1, 0, 0, 1, 0, 0);
+    const dpr = window.devicePixelRatio || 1;
+    lassoCtx.scale(dpr, dpr);
+    lassoCtx.clearRect(0, 0, rect.width, rect.height);
+
+    if (!proximityCenter || proximityCurrentRadius <= 0) return;
+
+    // Project the center point to screen
+    const [vpWidth, vpHeight] = canvasResizeObserver.getSize();
+    updateCamera(vpWidth, vpHeight);
+    mat4.multiply(mvpMatrix, projectionMatrix, viewMatrix);
+    mat4.multiply(mvpMatrix, mvpMatrix, modelMatrix);
+
+    const centerScreen = projectPointToScreen(
+      proximityCenter.worldPos[0],
+      proximityCenter.worldPos[1],
+      proximityCenter.worldPos[2],
+      mvpMatrix, rect.width, rect.height
+    );
+    if (!centerScreen) return;
+
+    // Estimate screen radius by projecting a point at the edge of the sphere
+    // Use the camera's right vector to find a point on the sphere's edge
+    const edgeX = proximityCenter.worldPos[0] + proximityCurrentRadius;
+    const edgeScreen = projectPointToScreen(
+      edgeX,
+      proximityCenter.worldPos[1],
+      proximityCenter.worldPos[2],
+      mvpMatrix, rect.width, rect.height
+    );
+
+    let screenRadius = 50; // Default fallback
+    if (edgeScreen) {
+      const dx = edgeScreen.x - centerScreen.x;
+      const dy = edgeScreen.y - centerScreen.y;
+      screenRadius = Math.sqrt(dx * dx + dy * dy);
+    }
+
+    // Draw the selection sphere indicator using website's color scheme (#111827 = rgb(17, 24, 39))
+    // Matching lasso style: fill + dashed stroke + center dot
+
+    // Selection circle with fill
+    lassoCtx.beginPath();
+    lassoCtx.arc(centerScreen.x, centerScreen.y, screenRadius, 0, Math.PI * 2);
+    lassoCtx.fillStyle = 'rgba(17, 24, 39, 0.08)';
+    lassoCtx.fill();
+    lassoCtx.strokeStyle = 'rgba(17, 24, 39, 0.7)';
+    lassoCtx.lineWidth = 2;
+    lassoCtx.setLineDash([4, 3]);
+    lassoCtx.stroke();
+
+    // Center point marker (same size as lasso vertex dots)
+    lassoCtx.setLineDash([]);
+    lassoCtx.beginPath();
+    lassoCtx.arc(centerScreen.x, centerScreen.y, 3, 0, Math.PI * 2);
+    lassoCtx.fillStyle = 'rgba(17, 24, 39, 0.9)';
+    lassoCtx.fill();
+  }
+
+  // Clear proximity indicator
+  function clearProximityIndicator() {
+    const rect = canvas.getBoundingClientRect();
+    lassoCtx.setTransform(1, 0, 0, 1, 0, 0);
+    const dpr = window.devicePixelRatio || 1;
+    lassoCtx.scale(dpr, dpr);
+    lassoCtx.clearRect(0, 0, rect.width, rect.height);
+    proximityCenter = null;
+    proximityCurrentRadius = 0;
+  }
+
+  // Find all cells within 3D proximity radius of center point
+  function findCellsInProximity(centerPos, radius3D) {
+    if (!centerPos || radius3D <= 0) return [];
+
+    const positions = hpRenderer.getPositions();
+    if (!positions) return [];
+
+    // Use octree for efficient spatial query
+    if (!hpRenderer?.octree) {
+      hpRenderer?.ensureOctree();
+    }
+
+    const selectedIndices = [];
+    const alphas = transparencyArray;
+    const radiusSq = radius3D * radius3D;
+
+    if (hpRenderer?.octree) {
+      // Use octree query - much faster for large datasets
+      const candidates = hpRenderer.octree.queryRadius(centerPos, radius3D, 100000);
+      for (const idx of candidates) {
+        // Skip fully transparent (filtered out) points
+        if (alphas && alphas[idx] === 0) continue;
+        selectedIndices.push(idx);
+      }
+    } else {
+      // Fallback: brute force (slow but works without octree)
+      const n = positions.length / 3;
+      for (let i = 0; i < n; i++) {
+        if (alphas && alphas[i] === 0) continue;
+        const dx = positions[i * 3] - centerPos[0];
+        const dy = positions[i * 3 + 1] - centerPos[1];
+        const dz = positions[i * 3 + 2] - centerPos[2];
+        if (dx * dx + dy * dy + dz * dz <= radiusSq) {
+          selectedIndices.push(i);
+        }
+      }
+    }
+
+    return selectedIndices;
+  }
+
+  // Convert pixel drag distance to world radius
+  // Uses the data bounds to create an intuitive mapping
+  function pixelDistanceToWorldRadius(pixelDist) {
+    // Map drag distance to world radius
+    // 100 pixels of drag = ~10% of the data radius
+    // This creates a nice smooth expansion as you drag
+    const scaleFactor = targetRadius * 0.001; // Adjust sensitivity
+    return pixelDist * scaleFactor;
+  }
+
+  // Project a 3D point to screen coordinates
+  function projectPointToScreen(px, py, pz, mvp, vpWidth, vpHeight) {
+    // Apply MVP matrix: clipPos = mvp * vec4(pos, 1.0)
+    const clipX = mvp[0] * px + mvp[4] * py + mvp[8] * pz + mvp[12];
+    const clipY = mvp[1] * px + mvp[5] * py + mvp[9] * pz + mvp[13];
+    const clipZ = mvp[2] * px + mvp[6] * py + mvp[10] * pz + mvp[14];
+    const clipW = mvp[3] * px + mvp[7] * py + mvp[11] * pz + mvp[15];
+
+    // Perspective divide
+    if (Math.abs(clipW) < 1e-10) return null;
+    const ndcX = clipX / clipW;
+    const ndcY = clipY / clipW;
+    const ndcZ = clipZ / clipW;
+
+    // Check if point is behind camera or outside clip space
+    if (ndcZ < -1 || ndcZ > 1) return null;
+
+    // Convert to screen coordinates
+    const screenX = (ndcX + 1) * 0.5 * vpWidth;
+    const screenY = (1 - ndcY) * 0.5 * vpHeight;
+
+    return { x: screenX, y: screenY, depth: ndcZ };
+  }
+
+  // Point-in-polygon test using ray casting algorithm
+  function pointInPolygon(x, y, polygon) {
+    if (polygon.length < 3) return false;
+
+    let inside = false;
+    for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+      const xi = polygon[i].x, yi = polygon[i].y;
+      const xj = polygon[j].x, yj = polygon[j].y;
+
+      if (((yi > y) !== (yj > y)) &&
+          (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) {
+        inside = !inside;
+      }
+    }
+    return inside;
+  }
+
+  // Find all cells inside the lasso polygon
+  function findCellsInLasso() {
+    if (lassoPath.length < 3) return [];
+
+    const positions = hpRenderer.getPositions();
+    if (!positions) return [];
+
+    const rect = canvas.getBoundingClientRect();
+
+    // Determine viewport dimensions based on view layout (same logic as pickCellAtScreen)
+    let vpOffsetX = 0;
+    let vpOffsetY = 0;
+    let vpWidth = rect.width;
+    let vpHeight = rect.height;
+
+    // Count active views
+    const viewCount = (liveViewHidden ? 0 : 1) + snapshotViews.length;
+
+    // In grid mode with multiple views, find which viewport the lasso is in
+    if (viewLayoutMode === 'grid' && viewCount > 1) {
+      const cols = viewCount <= 3 ? viewCount : Math.ceil(Math.sqrt(viewCount));
+      const rows = Math.ceil(viewCount / cols);
+      vpWidth = rect.width / cols;
+      vpHeight = rect.height / rows;
+
+      // Use the first point of the lasso to determine which viewport
+      const firstPt = lassoPath[0];
+      const col = Math.floor(firstPt.x / vpWidth);
+      const row = Math.floor(firstPt.y / vpHeight);
+
+      // Clamp to valid range
+      const clampedCol = Math.max(0, Math.min(col, cols - 1));
+      const clampedRow = Math.max(0, Math.min(row, rows - 1));
+
+      // Calculate viewport offset
+      vpOffsetX = clampedCol * vpWidth;
+      vpOffsetY = clampedRow * vpHeight;
+    }
+
+    // Convert lasso path to viewport-local coordinates
+    const localLassoPath = lassoPath.map(pt => ({
+      x: pt.x - vpOffsetX,
+      y: pt.y - vpOffsetY
+    }));
+
+    // Get current MVP matrix with correct aspect ratio for the viewport
+    const vpAspect = vpWidth / vpHeight;
+
+    // Create projection matrix with viewport aspect ratio
+    const vpProjection = mat4.create();
+    mat4.perspective(vpProjection, fov, vpAspect, near, far);
+
+    // Compute MVP with viewport-correct projection
+    const vpMvpMatrix = mat4.create();
+    mat4.multiply(vpMvpMatrix, vpProjection, viewMatrix);
+    mat4.multiply(vpMvpMatrix, vpMvpMatrix, modelMatrix);
+
+    const selectedIndices = [];
+    const n = positions.length / 3;
+
+    // Also check visibility (transparency > 0 means visible)
+    const alphas = transparencyArray;
+
+    for (let i = 0; i < n; i++) {
+      // Skip fully transparent (filtered out) points
+      if (alphas && alphas[i] === 0) continue;
+
+      const px = positions[i * 3];
+      const py = positions[i * 3 + 1];
+      const pz = positions[i * 3 + 2];
+
+      // Project using viewport dimensions
+      const screenPos = projectPointToScreen(px, py, pz, vpMvpMatrix, vpWidth, vpHeight);
+      if (!screenPos) continue;
+
+      if (pointInPolygon(screenPos.x, screenPos.y, localLassoPath)) {
+        selectedIndices.push(i);
+      }
+    }
+
+    return selectedIndices;
+  }
 
   function getViewFlags(viewId) {
     const key = String(viewId || LIVE_VIEW_ID);
@@ -3261,6 +3957,169 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     getHighlightMode() {
       return highlightMode;
+    },
+
+    // Lasso selection API
+    setLassoEnabled(enabled) {
+      lassoEnabled = Boolean(enabled);
+      if (!lassoEnabled) {
+        // Clear any in-progress lasso
+        if (isLassoing) {
+          isLassoing = false;
+          clearLasso();
+          canvas.classList.remove('lassoing');
+        }
+      }
+      // Update cursor style
+      if (lassoEnabled) {
+        canvas.classList.add('lasso-mode');
+      } else {
+        canvas.classList.remove('lasso-mode');
+      }
+      updateCursorForHighlightMode();
+    },
+
+    getLassoEnabled() {
+      return lassoEnabled;
+    },
+
+    setLassoCallback(callback) {
+      lassoCallback = callback;
+    },
+
+    setLassoPreviewCallback(callback) {
+      lassoPreviewCallback = callback;
+    },
+
+    clearLasso() {
+      if (isLassoing) {
+        isLassoing = false;
+        canvas.classList.remove('lassoing');
+      }
+      clearLasso();
+    },
+
+    // Multi-step lasso selection API
+    setLassoStepCallback(callback) {
+      lassoStepCallback = callback;
+    },
+
+    getLassoState() {
+      return {
+        inProgress: lassoCandidateSet !== null,
+        stepCount: lassoStepCount,
+        candidateCount: lassoCandidateSet ? lassoCandidateSet.size : 0
+      };
+    },
+
+    confirmLassoSelection() {
+      if (lassoCandidateSet && lassoCandidateSet.size > 0) {
+        const finalIndices = [...lassoCandidateSet];
+        // Call the final callback
+        if (lassoCallback) {
+          lassoCallback({
+            type: 'lasso',
+            cellIndices: finalIndices,
+            cellCount: finalIndices.length,
+            steps: lassoStepCount
+          });
+        }
+      }
+      // Reset multi-step state
+      lassoCandidateSet = null;
+      lassoStepCount = 0;
+    },
+
+    cancelLassoSelection() {
+      // Reset multi-step state without calling callback
+      lassoCandidateSet = null;
+      lassoStepCount = 0;
+      // Notify UI of cancellation
+      if (lassoStepCallback) {
+        lassoStepCallback({
+          step: 0,
+          candidateCount: 0,
+          candidates: [],
+          cancelled: true
+        });
+      }
+    },
+
+    // Proximity drag selection API
+    setProximityEnabled(enabled) {
+      proximityEnabled = Boolean(enabled);
+      if (!proximityEnabled) {
+        // Clear any in-progress proximity drag
+        if (isProximityDragging) {
+          isProximityDragging = false;
+          clearProximityIndicator();
+          canvas.classList.remove('proximity-dragging');
+        }
+      }
+      // Update cursor style
+      if (proximityEnabled) {
+        canvas.classList.add('proximity-mode');
+      } else {
+        canvas.classList.remove('proximity-mode');
+      }
+      updateCursorForHighlightMode();
+    },
+
+    getProximityEnabled() {
+      return proximityEnabled;
+    },
+
+    setProximityCallback(callback) {
+      proximityCallback = callback;
+    },
+
+    setProximityPreviewCallback(callback) {
+      proximityPreviewCallback = callback;
+    },
+
+    setProximityStepCallback(callback) {
+      proximityStepCallback = callback;
+    },
+
+    getProximityState() {
+      return {
+        inProgress: proximityCandidateSet !== null,
+        stepCount: proximityStepCount,
+        candidateCount: proximityCandidateSet ? proximityCandidateSet.size : 0
+      };
+    },
+
+    confirmProximitySelection() {
+      if (proximityCandidateSet && proximityCandidateSet.size > 0) {
+        const finalIndices = [...proximityCandidateSet];
+        // Call the final callback
+        if (proximityCallback) {
+          proximityCallback({
+            type: 'proximity',
+            cellIndices: finalIndices,
+            cellCount: finalIndices.length,
+            steps: proximityStepCount
+          });
+        }
+      }
+      // Reset multi-step state
+      proximityCandidateSet = null;
+      proximityStepCount = 0;
+    },
+
+    cancelProximitySelection() {
+      // Reset multi-step state without calling callback
+      proximityCandidateSet = null;
+      proximityStepCount = 0;
+      // Notify UI of cancellation
+      if (proximityStepCallback) {
+        proximityStepCallback({
+          step: 0,
+          candidateCount: 0,
+          candidates: [],
+          cancelled: true
+        });
+      }
     },
 
   setCentroids({ positions, colors, outlierQuantiles, transparency }) {

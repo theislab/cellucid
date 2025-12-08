@@ -2536,6 +2536,37 @@ class DataState {
     this._recomputeHighlightArray();
   }
 
+  // Set a preview highlight from an array of cell indices (used for lasso preview)
+  setPreviewHighlightFromIndices(cellIndices) {
+    if (!cellIndices || cellIndices.length === 0) {
+      this.clearPreviewHighlight();
+      return;
+    }
+
+    this._ensureHighlightArray();
+    // Start with existing permanent highlights
+    this.highlightArray.fill(0);
+    for (const group of this.highlightedGroups) {
+      if (group.enabled === false) continue;
+      const indices = group.cellIndices;
+      if (!indices) continue;
+      for (let i = 0; i < indices.length; i++) {
+        const idx = indices[i];
+        if (idx >= 0 && idx < this.pointCount) {
+          this.highlightArray[idx] = 255;
+        }
+      }
+    }
+    // Add preview highlights on top
+    for (let i = 0; i < cellIndices.length; i++) {
+      const idx = cellIndices[i];
+      if (idx >= 0 && idx < this.pointCount) {
+        this.highlightArray[idx] = 255;
+      }
+    }
+    this._pushHighlightToViewer();
+  }
+
   // Add a highlighted group from a categorical selection
   addHighlightFromCategory(fieldIndex, categoryIndex, source = 'obs') {
     const field = source === 'var'

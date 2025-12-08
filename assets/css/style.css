@@ -1231,6 +1231,87 @@ html, body {
   /* Classes used for JS to track mode, cursor set dynamically */
 }
 
+/* Lasso selection mode */
+#glcanvas.lasso-mode {
+  /* Lasso mode active - cursor controlled via JS */
+}
+
+#glcanvas.lassoing {
+  cursor: crosshair !important;
+}
+
+/* Lasso overlay canvas */
+#lasso-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 10;
+}
+
+/* Lasso/Proximity multi-step controls */
+.lasso-step-controls {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.lasso-step-controls .btn-small {
+  font-family: "Oswald", system-ui, sans-serif;
+  font-size: 9px;
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  border-radius: var(--viewer-radius-pill);
+  padding: 4px 8px;
+  cursor: pointer;
+  background: #f9fafb;
+  color: #111827;
+  border: 1px solid #111827;
+  box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.2);
+  transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+}
+
+.lasso-step-controls .btn-small:hover {
+  background: #e5e7eb;
+  transform: translate(-1px, -1px);
+  box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.25);
+}
+
+.lasso-step-controls .btn-small:active {
+  transform: translate(0, 0);
+  box-shadow: 1px 1px 0 rgba(0, 0, 0, 0.2);
+  background: #d1d5db;
+}
+
+/* Lasso mode indicator tags */
+.lasso-mode-tag {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  margin-left: 4px;
+}
+
+.lasso-mode-tag.union {
+  background: rgba(76, 175, 80, 0.2);
+  color: #4caf50;
+}
+
+.lasso-mode-tag.subtract {
+  background: rgba(244, 67, 54, 0.2);
+  color: #f44336;
+}
+
+.lasso-mode-tag.intersect {
+  background: rgba(79, 140, 255, 0.2);
+  color: #4f8cff;
+}
+
 /* ========================================================================
    Searchable gene dropdown
    ===================================================================== */

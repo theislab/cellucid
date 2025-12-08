@@ -451,19 +451,31 @@ uniform float u_fov;
 uniform float u_highlightScale; // How much larger the highlight ring is (e.g., 1.5)
 
 out float v_alpha;
+out float v_pointSize;    // Highlight sprite size
+out float v_dotSize;      // What the actual dot size would be (for accurate inner radius)
+out float v_viewDistance; // For atmospheric fog
 
 void main() {
   vec4 eyePos = u_viewMatrix * u_modelMatrix * vec4(a_position, 1.0);
   gl_Position = u_projectionMatrix * eyePos;
 
   float eyeDepth = -eyePos.z;
+  v_viewDistance = length(eyePos.xyz);
 
-  // Perspective point size with attenuation - scaled up for highlight ring
+  // Calculate what the DOT size would be (same formula as main dot shader)
   float projectionFactor = u_viewportHeight / (2.0 * tan(u_fov * 0.5));
-  float worldSize = u_pointSize * 0.01 * u_highlightScale;
-  float perspectiveSize = (worldSize * projectionFactor) / max(eyeDepth, 0.001);
-  gl_PointSize = mix(u_pointSize * u_highlightScale, perspectiveSize, u_sizeAttenuation);
-  gl_PointSize = clamp(gl_PointSize, 1.0, 192.0);
+  float dotWorldSize = u_pointSize * 0.01;
+  float dotPerspective = (dotWorldSize * projectionFactor) / max(eyeDepth, 0.001);
+  float dotSize = mix(u_pointSize, dotPerspective, u_sizeAttenuation);
+  dotSize = clamp(dotSize, 0.5, 128.0); // Same clamp as main dots!
+  v_dotSize = dotSize;
+
+  // Highlight sprite scales proportionally with dot using constant multiplier
+  // This ensures consistent visual appearance at all zoom levels
+  float highlightSize = dotSize * u_highlightScale;
+  highlightSize = clamp(highlightSize, 1.0, 256.0);
+  gl_PointSize = highlightSize;
+  v_pointSize = highlightSize;
 
   // Discard if not highlighted (alpha channel stores highlight state)
   if (a_color.a < 0.01) {
@@ -475,46 +487,274 @@ void main() {
 `;
 
 /**
- * Highlight fragment shader - draws a ring/glow effect
+ * Highlight fragment shader - draws a beautiful 3D torus ring with metallic sheen
+ * Features:
+ * - True 3D torus cross-section with proper normals
+ * - Metallic/iridescent shading with rim lighting
+ * - Accurate inner radius matching actual dot size at all zoom levels
+ * - Ethereal glow emanating from the ring
  */
 export const HP_FS_HIGHLIGHT = `#version 300 es
 precision highp float;
 
 in float v_alpha;
+in float v_pointSize; // Highlight sprite size
+in float v_dotSize;   // Actual dot size for accurate inner radius
+in float v_viewDistance; // For atmospheric fog
 
 uniform vec3 u_highlightColor;
-uniform float u_ringWidth; // Width of the ring as fraction of radius (e.g., 0.15)
+uniform float u_ringWidth;
 uniform float u_haloStrength;
 uniform float u_haloShape; // 0 = circle, 1 = square
+uniform float u_highlightScale;
+uniform float u_ringStyle; // 0 = 3D torus, 1 = flat circle, 2 = flat square
+uniform float u_time; // For animated glow
+
+// Atmospheric fog uniforms (same as HP_FS_FULL)
+uniform float u_fogDensity;
+uniform float u_fogNear;
+uniform float u_fogFar;
+uniform vec3 u_fogColor;
+
+// Lighting uniforms (same as HP_FS_FULL)
+uniform float u_lightingStrength;
+uniform vec3 u_lightDir;
 
 out vec4 fragColor;
+
+// Helper function to apply atmospheric fog (Beer-Lambert law)
+vec3 applyFog(vec3 color) {
+  float fogSpan = max(u_fogFar - u_fogNear, 0.0001);
+  float normalizedDistance = max(v_viewDistance - u_fogNear, 0.0) / fogSpan;
+  float extinction = u_fogDensity * u_fogDensity * 0.6;
+  float transmittance = exp(-extinction * normalizedDistance);
+  return mix(u_fogColor, color, transmittance);
+}
+
+float getFogTransmittance() {
+  float fogSpan = max(u_fogFar - u_fogNear, 0.0001);
+  float normalizedDistance = max(v_viewDistance - u_fogNear, 0.0) / fogSpan;
+  float extinction = u_fogDensity * u_fogDensity * 0.6;
+  return exp(-extinction * normalizedDistance);
+}
 
 void main() {
   if (v_alpha < 0.01) discard;
 
   vec2 coord = gl_PointCoord * 2.0 - 1.0;
-  float axisMax = max(abs(coord.x), abs(coord.y));
-  float r = mix(length(coord), axisMax, step(0.5, u_haloShape));
-  if (r > 1.0) discard; // enforce circular or square bounds based on shape
+  float rCircle = length(coord);
+  float rSquare = max(abs(coord.x), abs(coord.y));
+  float baseR = (u_ringStyle > 1.5) ? rSquare : rCircle;
+  float shapeR = (u_ringStyle > 1.5) ? rSquare : mix(rCircle, rSquare, u_haloShape);
 
-  float innerRadius = 1.0 - u_ringWidth;
+  if (shapeR > 1.0) discard;
 
-  // Crisp rim that hugs the boundary
-  float rim = smoothstep(innerRadius - 0.05, innerRadius + 0.02, r);
+  // === CONSTANT MULTIPLIER RING GEOMETRY ===
+  // Inner radius = where the dot ends (1/highlightScale) with small gap
+  // Outer radius = innerRadius * constant ring ratio
+  // This ensures consistent proportions at ALL zoom levels
 
-  // Soft fill so highlighted cells stay legible
-  float fill = 1.0 - smoothstep(innerRadius - 0.10, innerRadius + 0.12, r);
+  const float INNER_GAP = 1.08;      // 8% gap between dot edge and ring inner edge
+  const float RING_RATIO = 1.65;     // Outer radius is 55% larger than inner radius
 
-  // Outer halo that fades before the sprite edge
-  float halo = smoothstep(0.55, 0.9, r) * (1.0 - smoothstep(0.9, 1.02, r));
-  halo *= u_haloStrength;
+  // The dot occupies radius (1/u_highlightScale) in normalized sprite coords
+  // Add small gap so ring doesn't touch the dot
+  float innerRadius = (1.0 / u_highlightScale) * INNER_GAP;
 
-  float alpha = rim * 0.92 + fill * 0.30 + halo;
-  if (alpha < 0.01) discard;
+  // Outer radius is constant multiple of inner
+  float outerRadius = innerRadius * RING_RATIO;
 
-  // Keep the core golden and avoid washing out to white
-  vec3 color = mix(u_highlightColor, vec3(1.0, 0.9, 0.45), fill * 0.18);
-  fragColor = vec4(color, alpha * v_alpha);
+  // Derive tube geometry from inner/outer
+  float tubeRadius = (outerRadius - innerRadius) * 0.5;
+  float majorRadius = innerRadius + tubeRadius;
+
+  // Apply u_ringWidth as a scaling factor on tube thickness
+  tubeRadius *= (0.5 + u_ringWidth * 0.5);
+  // Recalculate outer after adjusting tube
+  outerRadius = innerRadius + tubeRadius * 2.0;
+  majorRadius = innerRadius + tubeRadius;
+
+  // Clamp to ensure ring stays within sprite bounds
+  if (outerRadius > 0.95) {
+    float scale = 0.95 / outerRadius;
+    innerRadius *= scale;
+    outerRadius *= scale;
+    tubeRadius *= scale;
+    majorRadius = innerRadius + tubeRadius;
+  }
+
+  float radial = length(coord);
+  float aa = fwidth(radial) * 1.5 + 0.003;
+
+  // The dot radius in normalized coords (where the actual dot ends)
+  float dotRadius = 1.0 / u_highlightScale;
+
+  if (u_ringStyle < 0.5) {
+    // ============================================
+    // 3D TORUS RING + DOT - Full quality
+    // Renders BOTH the dot and the ring around it
+    // ============================================
+
+    // Check if we're inside the DOT area (extends to innerRadius to fill gap)
+    // This prevents underlying main point colors bleeding through when zoomed in close
+    bool inDot = radial < innerRadius;
+
+    // Distance from the ring's center circle
+    float distFromRing = abs(radial - majorRadius);
+
+    // Check if we're within the ring tube
+    bool inRing = distFromRing <= tubeRadius + aa * 2.0;
+
+    // Discard if outside both dot and ring (no outer glow)
+    if (!inDot && !inRing) discard;
+
+    vec3 finalColor;
+    float finalAlpha;
+
+    if (inDot) {
+      // === RENDER THE DOT (including gap region up to innerRadius) ===
+      // Scale coord to dot's local space, same approach as HP_FS_FULL
+      // Gap region (radial > dotRadius) gets z=0 edge lighting naturally
+      vec2 localCoord = coord / dotRadius;
+      float localR2 = dot(localCoord, localCoord);
+      float z = sqrt(max(1.0 - localR2, 0.0));
+      vec3 normal = vec3(localCoord.x, -localCoord.y, z);
+
+      // Glow factor: 0.0 = normal (matches unhighlighted cells), 1.0 = full glow
+      float glowFactor = 0.5 + 0.5 * sin(u_time * 4.0);
+
+      // === BASE LIGHTING (exactly matches HP_FS_FULL at glowFactor=0) ===
+      vec3 lightDir = normalize(u_lightDir);
+      float NdotL = max(dot(normal, lightDir), 0.0);
+      float ambient = 0.4;
+      float diffuse = 0.6 * NdotL;
+      vec3 viewDir = vec3(0.0, 0.0, 1.0);
+      vec3 halfDir = normalize(lightDir + viewDir);
+      float specular = pow(max(dot(normal, halfDir), 0.0), 32.0) * 0.3;
+
+      // Lit color (same formula as HP_FS_FULL)
+      vec3 litColor = u_highlightColor * (ambient + diffuse) + vec3(specular);
+      // Apply lighting strength (same as HP_FS_FULL)
+      vec3 baseColor = mix(u_highlightColor, litColor, u_lightingStrength);
+
+      // === GLOW ADDITIONS (only when glowFactor > 0) ===
+      // Extra brightness
+      float extraBrightness = glowFactor * 0.3;
+      // Extra specular
+      float extraSpecular = glowFactor * 0.2 * pow(max(dot(normal, halfDir), 0.0), 32.0);
+      // Rim glow
+      float rimFactor = 1.0 - z;
+      float rimGlow = glowFactor * rimFactor * 0.25;
+      // Subtle emission
+      float emission = glowFactor * 0.1;
+
+      vec3 dotColor = baseColor * (1.0 + extraBrightness) + vec3(extraSpecular) + u_highlightColor * (rimGlow + emission);
+
+      finalColor = dotColor;
+
+      // Hard edge at dot boundary - no soft fade
+      finalAlpha = (radial <= dotRadius) ? v_alpha : 0.0;
+
+    } else if (inRing) {
+      // === RENDER THE RING ===
+      // Calculate the "height" on the torus surface (circular cross-section)
+      float tubeT = distFromRing / tubeRadius;
+      float zNorm = sqrt(max(1.0 - tubeT * tubeT, 0.0));
+
+      // Normal calculation for torus surface
+      vec2 radialDir = coord / max(radial, 0.001);
+      float radialSign = sign(radial - majorRadius);
+
+      vec3 normal = normalize(vec3(
+        radialDir * radialSign * tubeT,
+        zNorm
+      ));
+
+      // Glow factor synced with dot (0.0 = dim, 1.0 = full glow)
+      float glowFactor = 0.5 + 0.5 * sin(u_time * 4.0);
+      float shimmer = 0.5 + 0.5 * sin(u_time * 8.0 + radial * 3.14159);
+
+      // === LIGHTING using u_lightDir ===
+      vec3 lightDir = normalize(u_lightDir);
+      vec3 viewDir = vec3(0.0, 0.0, 1.0);
+
+      // === BASE LIGHTING (same formula as HP_FS_FULL at glowFactor=0) ===
+      float NdotL = max(dot(normal, lightDir), 0.0);
+      float ambient = 0.4;
+      float diffuse = 0.6 * NdotL;
+      vec3 halfVec = normalize(lightDir + viewDir);
+      float specular = pow(max(dot(normal, halfVec), 0.0), 32.0) * 0.3;
+
+      // Lit color (same formula as HP_FS_FULL)
+      vec3 litColor = u_highlightColor * (ambient + diffuse) + vec3(specular);
+      // Apply lighting strength (same as HP_FS_FULL)
+      vec3 baseColor = mix(u_highlightColor, litColor, u_lightingStrength);
+
+      // === GLOW ADDITIONS (only when glowFactor > 0) ===
+      float fresnel = pow(1.0 - max(dot(normal, viewDir), 0.0), 3.0);
+      vec3 warmWhite = vec3(1.0, 0.98, 0.95);
+
+      // Extra brightness
+      float extraBrightness = glowFactor * 0.4;
+      // Extra specular with shimmer
+      float extraSpec = glowFactor * shimmer * pow(max(dot(normal, halfVec), 0.0), 32.0) * 0.5;
+      // Rim glow
+      float rimGlow = glowFactor * fresnel * 0.4;
+      // Subtle emission
+      float emission = glowFactor * 0.15;
+
+      vec3 ringColor = baseColor * (1.0 + extraBrightness) + warmWhite * extraSpec;
+      ringColor = mix(ringColor, u_highlightColor * 1.3, rimGlow);
+      ringColor += u_highlightColor * emission;
+
+      // Hard edge on tube boundary - no soft fade that creates white outline
+      bool withinTube = distFromRing <= tubeRadius;
+
+      finalColor = ringColor;
+      finalAlpha = withinTube ? (0.95 * v_alpha) : 0.0;
+    }
+
+    if (finalAlpha < 0.01) discard;
+
+    // Apply atmospheric fog
+    vec3 foggedColor = applyFog(finalColor);
+    float transmittance = getFogTransmittance();
+    float foggedAlpha = (0.1 + 0.9 * transmittance) * finalAlpha;
+
+    fragColor = vec4(foggedColor, foggedAlpha);
+    return;
+  }
+
+  // ============================================
+  // FLAT RING + DOT VARIANTS (Light/Ultralight quality)
+  // Minimal cost: flat colors, no shading calculations
+  // High-contrast center for popup effect
+  // ============================================
+
+  // Center highlight radius (40% of dot for visible pop)
+  float centerRadius = innerRadius * 0.4;
+
+  // CENTER - high contrast bright spot (circle or square based on mode)
+  if (baseR < centerRadius) {
+    // Bright center: boost highlight color
+    vec3 centerColor = min(u_highlightColor * 1.4 + vec3(0.15), vec3(1.0));
+    fragColor = vec4(centerColor, v_alpha);
+    return;
+  }
+
+  // DOT AREA - standard highlight color
+  if (baseR < innerRadius) {
+    fragColor = vec4(u_highlightColor, v_alpha);
+    return;
+  }
+
+  // RING AREA - flat fill, slightly darker than dot
+  if (baseR <= outerRadius) {
+    fragColor = vec4(u_highlightColor * 0.75, v_alpha * 0.95);
+    return;
+  }
+
+  discard;
 }
 `;
 
