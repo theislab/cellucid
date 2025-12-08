@@ -1229,9 +1229,24 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
         // Compute combined preview based on mode and existing candidates
         let combinedIndices;
-        if (proximityCandidateSet === null || proximityCandidateSet.size === 0) {
-          // No existing selection - just show new indices
-          combinedIndices = newIndices;
+        if (proximityCandidateSet === null) {
+          // First step - no selection started yet
+          if (mode === 'subtract') {
+            // Subtract from nothing = empty (can't remove from nothing)
+            combinedIndices = [];
+          } else {
+            // Union or intersect starts fresh selection
+            combinedIndices = newIndices;
+          }
+        } else if (proximityCandidateSet.size === 0) {
+          // Selection exists but is empty (e.g., after operations that removed all cells)
+          if (mode === 'union') {
+            // Union with empty = new indices
+            combinedIndices = newIndices;
+          } else {
+            // Intersect or subtract with empty = empty (intersection/subtraction with nothing is nothing)
+            combinedIndices = [];
+          }
         } else if (mode === 'union') {
           // Union: show existing + new
           const combined = new Set(proximityCandidateSet);
@@ -1290,9 +1305,24 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
           // Compute combined preview based on mode and existing candidates
           let combinedIndices;
-          if (knnCandidateSet === null || knnCandidateSet.size === 0) {
-            // No existing selection - just show new indices
-            combinedIndices = newIndices;
+          if (knnCandidateSet === null) {
+            // First step - no selection started yet
+            if (mode === 'subtract') {
+              // Subtract from nothing = empty (can't remove from nothing)
+              combinedIndices = [];
+            } else {
+              // Union or intersect starts fresh selection
+              combinedIndices = newIndices;
+            }
+          } else if (knnCandidateSet.size === 0) {
+            // Selection exists but is empty (e.g., after operations that removed all cells)
+            if (mode === 'union') {
+              // Union with empty = new indices
+              combinedIndices = newIndices;
+            } else {
+              // Intersect or subtract with empty = empty (intersection/subtraction with nothing is nothing)
+              combinedIndices = [];
+            }
           } else if (mode === 'union') {
             // Union: show existing + new
             const combined = new Set(knnCandidateSet);
@@ -1501,8 +1531,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       return;
     }
     if (navigationMode === 'free') {
-      if (code === 'Space' || code === 'KeyW' || code === 'KeyA' || code === 'KeyS' || code === 'KeyD' ||
-          code === 'KeyQ' || code === 'KeyE' || code === 'ControlLeft' || code === 'ControlRight' ||
+      if (code === 'KeyW' || code === 'KeyA' || code === 'KeyS' || code === 'KeyD' ||
+          code === 'KeyQ' || code === 'KeyE' ||
           code === 'ShiftLeft' || code === 'ShiftRight') {
         e.preventDefault();
       }
@@ -1996,8 +2026,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     if (activeKeys.has('KeyS')) vec3.sub(move, move, forward);
     if (activeKeys.has('KeyD')) vec3.add(move, move, right);
     if (activeKeys.has('KeyA')) vec3.sub(move, move, right);
-    if (activeKeys.has('Space') || activeKeys.has('KeyE')) vec3.add(move, move, upVec);
-    if (activeKeys.has('KeyQ') || activeKeys.has('ControlLeft') || activeKeys.has('ControlRight')) vec3.sub(move, move, upVec);
+    if (activeKeys.has('KeyE')) vec3.add(move, move, upVec);
+    if (activeKeys.has('KeyQ')) vec3.sub(move, move, upVec);
 
     const hasInput = vec3.length(move) > 0.0001;
     if (hasInput) {

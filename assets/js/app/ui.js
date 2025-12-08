@@ -1325,6 +1325,14 @@ export function initUI({ state, viewer, dom, smoke }) {
   function handleLassoSelection(lassoEvent) {
     if (!lassoEvent.cellIndices || lassoEvent.cellIndices.length === 0) {
       console.log('[UI] Lasso selection empty');
+      // Clear preview highlight since selection is empty
+      state.clearPreviewHighlight?.();
+      // Reset UI state and history
+      lassoHistory = [];
+      lassoRedoStack = [];
+      lastLassoCandidates = null;
+      lastLassoStep = 0;
+      updateLassoUI(null);
       return;
     }
 
@@ -1383,9 +1391,12 @@ export function initUI({ state, viewer, dom, smoke }) {
     // Update UI with current step info
     updateLassoUI(stepEvent);
 
-    // Show preview highlight of current candidates
+    // Show preview highlight of current candidates, or clear if empty
     if (stepEvent.candidates && stepEvent.candidates.length > 0) {
       state.setPreviewHighlightFromIndices?.(stepEvent.candidates);
+    } else {
+      // Selection is empty (e.g., after subtract) - clear the highlight
+      state.clearPreviewHighlight?.();
     }
   }
 
@@ -1572,6 +1583,14 @@ export function initUI({ state, viewer, dom, smoke }) {
   function handleProximitySelection(proximityEvent) {
     if (!proximityEvent || !proximityEvent.cellIndices || proximityEvent.cellIndices.length === 0) {
       console.log('[UI] Proximity selection empty');
+      // Clear preview highlight since selection is empty
+      state.clearPreviewHighlight?.();
+      // Reset UI state and history
+      proximityHistory = [];
+      proximityRedoStack = [];
+      lastProximityCandidates = null;
+      lastProximityStep = 0;
+      updateProximityUI(null);
       return;
     }
 
@@ -1630,9 +1649,12 @@ export function initUI({ state, viewer, dom, smoke }) {
     // Update UI with current step info
     updateProximityUI(stepEvent);
 
-    // Show preview highlight of current candidates
+    // Show preview highlight of current candidates, or clear if empty
     if (stepEvent.candidates && stepEvent.candidates.length > 0) {
       state.setPreviewHighlightFromIndices?.(stepEvent.candidates);
+    } else {
+      // Selection is empty (e.g., after subtract) - clear the highlight
+      state.clearPreviewHighlight?.();
     }
   }
 
@@ -1706,9 +1728,12 @@ export function initUI({ state, viewer, dom, smoke }) {
   function handleProximityPreview(previewEvent) {
     if (!previewEvent || !previewEvent.cellIndices) return;
 
-    // Show preview highlight during drag
+    // Show preview highlight during drag, or clear if empty
     if (previewEvent.cellIndices.length > 0) {
       state.setPreviewHighlightFromIndices?.(previewEvent.cellIndices);
+    } else {
+      // Preview is empty (e.g., subtract mode with no overlap) - clear the highlight
+      state.clearPreviewHighlight?.();
     }
   }
 
@@ -1832,6 +1857,14 @@ export function initUI({ state, viewer, dom, smoke }) {
   function handleKnnSelection(knnEvent) {
     if (!knnEvent || !knnEvent.cellIndices || knnEvent.cellIndices.length === 0) {
       console.log('[UI] KNN selection empty');
+      // Clear preview highlight since selection is empty
+      state.clearPreviewHighlight?.();
+      // Reset UI state and history
+      knnHistory = [];
+      knnRedoStack = [];
+      lastKnnCandidates = null;
+      lastKnnStep = 0;
+      updateKnnUI(null);
       return;
     }
 
@@ -1890,9 +1923,12 @@ export function initUI({ state, viewer, dom, smoke }) {
     // Update UI with current step info
     updateKnnUI(stepEvent);
 
-    // Show preview highlight of current candidates
+    // Show preview highlight of current candidates, or clear if empty
     if (stepEvent.candidates && stepEvent.candidates.length > 0) {
       state.setPreviewHighlightFromIndices?.(stepEvent.candidates);
+    } else {
+      // Selection is empty (e.g., after subtract) - clear the highlight
+      state.clearPreviewHighlight?.();
     }
   }
 
@@ -1968,9 +2004,12 @@ export function initUI({ state, viewer, dom, smoke }) {
   function handleKnnPreview(previewEvent) {
     if (!previewEvent || !previewEvent.cellIndices) return;
 
-    // Show preview highlight during drag
+    // Show preview highlight during drag, or clear if empty
     if (previewEvent.cellIndices.length > 0) {
       state.setPreviewHighlightFromIndices?.(previewEvent.cellIndices);
+    } else {
+      // Preview is empty (e.g., subtract mode with no overlap) - clear the highlight
+      state.clearPreviewHighlight?.();
     }
   }
 
@@ -2125,9 +2164,24 @@ export function initUI({ state, viewer, dom, smoke }) {
 
     // Compute combined preview based on mode and existing candidates (mirrors proximity behavior)
     let combinedIndices;
-    if (annotationCandidateSet === null || annotationCandidateSet.size === 0) {
-      // No existing selection - just show new indices
-      combinedIndices = newIndices;
+    if (annotationCandidateSet === null) {
+      // First step - no selection started yet
+      if (mode === 'subtract') {
+        // Subtract from nothing = empty (can't remove from nothing)
+        combinedIndices = [];
+      } else {
+        // Union or intersect starts fresh selection
+        combinedIndices = newIndices;
+      }
+    } else if (annotationCandidateSet.size === 0) {
+      // Selection exists but is empty (e.g., after operations that removed all cells)
+      if (mode === 'union') {
+        // Union with empty = new indices
+        combinedIndices = newIndices;
+      } else {
+        // Intersect or subtract with empty = empty (intersection/subtraction with nothing is nothing)
+        combinedIndices = [];
+      }
     } else if (mode === 'union') {
       // Union: show existing + new
       const combined = new Set(annotationCandidateSet);
