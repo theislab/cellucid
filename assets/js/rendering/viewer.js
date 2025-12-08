@@ -760,15 +760,65 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       }
     }
 
+    // KNN drag mode: Alt+click on a cell to start KNN selection
+    // Drag up/down to expand/contract the degree of neighbors
+    if (e.altKey && knnEnabled && e.button === 0) {
+      const cellIdx = pickCellAtScreen(e.clientX, e.clientY);
+
+      // Determine mode based on modifier keys
+      let knnMode = 'intersect';
+      if (e.ctrlKey || e.metaKey) {
+        knnMode = 'subtract';
+      } else if (e.shiftKey) {
+        knnMode = 'union';
+      }
+
+      if (cellIdx >= 0) {
+        // Note: pickCellAtScreen already skips filtered cells (alpha=0)
+
+        // Check if edges are loaded, if not trigger load callback
+        if (!knnEdgesLoaded && knnEdgeLoadCallback) {
+          knnEdgeLoadCallback();
+          // Wait for edges to load - the callback will handle it
+          return;
+        }
+
+        knnSeedCell = {
+          screenX: e.clientX,
+          screenY: e.clientY,
+          cellIndex: cellIdx,
+          mode: knnMode
+        };
+        knnCurrentDegree = 0;
+        knnDegreesCache = null;
+        knnMaxCachedDegree = -1;
+        isKnnDragging = true;
+        canvas.style.cursor = 'ns-resize';
+        canvas.classList.add('knn-dragging');
+        drawKnnIndicator();
+        e.preventDefault();
+        return;
+      }
+    }
+
     // Cell selection mode: Alt+click (or Alt+drag for range selection)
     // Only enter selection mode if a field is active (highlightMode is not 'none')
+    // Modifier keys: Alt = intersect (continuous only), Shift+Alt = union, Ctrl+Alt = subtract
     if (e.altKey && cellSelectionEnabled && e.button === 0 && highlightMode !== 'none') {
       const cellIdx = pickCellAtScreen(e.clientX, e.clientY);
       if (cellIdx >= 0) {
+        // Determine selection mode based on modifier keys (same as lasso/proximity/KNN)
+        let selectionMode = 'intersect'; // Alt only
+        if (e.shiftKey) {
+          selectionMode = 'union'; // Shift+Alt
+        } else if (e.ctrlKey || e.metaKey) {
+          selectionMode = 'subtract'; // Ctrl+Alt (or Cmd+Alt on Mac)
+        }
         selectionDragStart = {
           x: e.clientX,
           y: e.clientY,
-          cellIndex: cellIdx
+          cellIndex: cellIdx,
+          mode: selectionMode
         };
         selectionDragCurrent = { x: e.clientX, y: e.clientY };
         // Set cursor based on highlight mode
@@ -953,24 +1003,93 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       return;
     }
 
+    // Complete KNN drag selection if in progress
+    if (isKnnDragging) {
+      isKnnDragging = false;
+      canvas.classList.remove('knn-dragging');
+
+      // Only process if we have a valid selection (degree >= 0 with adjacency)
+      if (knnSeedCell && knnAdjacencyList) {
+        const { allCells } = findKnnNeighborsUpToDegree(
+          knnSeedCell.cellIndex,
+          knnCurrentDegree,
+          knnAdjacencyList,
+          transparencyArray
+        );
+        const selectedIndices = [...allCells];
+        const mode = knnSeedCell.mode || 'intersect';
+
+        if (selectedIndices.length > 0 || mode === 'subtract') {
+          const newSet = new Set(selectedIndices);
+
+          // Multi-step mode: union, subtract, or intersect based on modifier keys
+          if (knnCandidateSet === null) {
+            // First step: initialize candidate set
+            if (mode !== 'subtract') {
+              knnCandidateSet = new Set(selectedIndices);
+            }
+          } else if (mode === 'union') {
+            // Union mode (Shift+Alt): add new cells to existing selection
+            for (const idx of selectedIndices) {
+              knnCandidateSet.add(idx);
+            }
+          } else if (mode === 'subtract') {
+            // Subtract mode (Ctrl+Alt): remove cells from existing selection
+            for (const idx of selectedIndices) {
+              knnCandidateSet.delete(idx);
+            }
+          } else {
+            // Intersect mode (Alt only): keep only cells in both selections
+            knnCandidateSet = new Set([...knnCandidateSet].filter(idx => newSet.has(idx)));
+          }
+
+          if (knnCandidateSet) {
+            knnStepCount++;
+
+            // Notify about step completion
+            if (knnStepCallback) {
+              knnStepCallback({
+                step: knnStepCount,
+                candidateCount: knnCandidateSet.size,
+                candidates: [...knnCandidateSet],
+                mode: mode,
+                seedCellIndex: knnSeedCell.cellIndex,
+                degree: knnCurrentDegree
+              });
+            }
+          }
+        }
+      }
+
+      clearKnnIndicator();
+      updateCursorForHighlightMode();
+      return;
+    }
+
     // Complete cell selection if in progress
     if (selectionDragStart) {
       const dragDistance = selectionDragCurrent
         ? Math.abs(selectionDragCurrent.y - selectionDragStart.y)
         : 0;
+      const mode = selectionDragStart.mode || 'intersect';
 
-      // Emit selection event
-      if (cellSelectionCallback) {
-        cellSelectionCallback({
+      // Emit step event (UI manages candidate set and confirm/cancel flow)
+      if (selectionStepCallback) {
+        selectionStepCallback({
           type: dragDistance > 10 ? 'range' : 'click',
           cellIndex: selectionDragStart.cellIndex,
           dragDeltaY: selectionDragCurrent ? selectionDragCurrent.y - selectionDragStart.y : 0,
           startX: selectionDragStart.x,
           startY: selectionDragStart.y,
           endX: selectionDragCurrent?.x ?? selectionDragStart.x,
-          endY: selectionDragCurrent?.y ?? selectionDragStart.y
+          endY: selectionDragCurrent?.y ?? selectionDragStart.y,
+          mode: mode
         });
       }
+
+      // Track that annotation selection is in progress
+      annotationStepCount++;
+      annotationLastMode = mode;
 
       selectionDragStart = null;
       selectionDragCurrent = null;
@@ -1112,6 +1231,68 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       return;
     }
 
+    // Track KNN drag - expand/contract degree as user drags
+    if (isKnnDragging && knnSeedCell && knnAdjacencyList) {
+      // Calculate drag distance from starting point
+      // Use vertical distance for degree: drag up = more neighbors, drag down = fewer
+      const dy = knnSeedCell.screenY - e.clientY; // Inverted so up = positive
+      const pixelDist = Math.max(0, dy);
+
+      // Convert pixel distance to degree
+      const newDegree = pixelDistanceToKnnDegree(pixelDist);
+
+      // Only update if degree changed
+      if (newDegree !== knnCurrentDegree) {
+        knnCurrentDegree = newDegree;
+
+        // Update visual indicator
+        drawKnnIndicator();
+
+        // Call preview callback if set
+        if (knnPreviewCallback) {
+          const { allCells } = findKnnNeighborsUpToDegree(
+            knnSeedCell.cellIndex,
+            knnCurrentDegree,
+            knnAdjacencyList,
+            transparencyArray
+          );
+          const newIndices = [...allCells];
+          const mode = knnSeedCell.mode || 'intersect';
+
+          // Compute combined preview based on mode and existing candidates
+          let combinedIndices;
+          if (knnCandidateSet === null || knnCandidateSet.size === 0) {
+            // No existing selection - just show new indices
+            combinedIndices = newIndices;
+          } else if (mode === 'union') {
+            // Union: show existing + new
+            const combined = new Set(knnCandidateSet);
+            for (const idx of newIndices) combined.add(idx);
+            combinedIndices = [...combined];
+          } else if (mode === 'subtract') {
+            // Subtract: show existing minus new
+            const newSet = new Set(newIndices);
+            combinedIndices = [...knnCandidateSet].filter(idx => !newSet.has(idx));
+          } else {
+            // Intersect: show intersection of existing and new
+            const newSet = new Set(newIndices);
+            combinedIndices = [...knnCandidateSet].filter(idx => newSet.has(idx));
+          }
+
+          knnPreviewCallback({
+            type: 'knn-preview',
+            cellIndices: combinedIndices,
+            cellCount: combinedIndices.length,
+            newCellCount: newIndices.length,
+            seedCellIndex: knnSeedCell.cellIndex,
+            degree: knnCurrentDegree,
+            mode: mode
+          });
+        }
+      }
+      return;
+    }
+
     // Track selection drag
     if (selectionDragStart) {
       selectionDragCurrent = { x: e.clientX, y: e.clientY };
@@ -1124,7 +1305,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
           startX: selectionDragStart.x,
           startY: selectionDragStart.y,
           endX: selectionDragCurrent.x,
-          endY: selectionDragCurrent.y
+          endY: selectionDragCurrent.y,
+          mode: selectionDragStart.mode || 'intersect'
         });
       }
       return;
@@ -2125,18 +2307,15 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
-    // Calculate view direction from camera to target
+    // Extract view direction from view matrix (works correctly in multiview unlocked camera mode)
+    // The view matrix's third row (column-major indices 2, 6, 10) gives the camera's forward axis
+    // This is the direction from camera toward target, which is what we need for plane visibility
     const viewDir = [
-      target[0] - eye[0],
-      target[1] - eye[1],
-      target[2] - eye[2]
+      -viewMatrix[2],
+      -viewMatrix[6],
+      -viewMatrix[10]
     ];
-    const viewLen = Math.sqrt(viewDir[0]*viewDir[0] + viewDir[1]*viewDir[1] + viewDir[2]*viewDir[2]);
-    if (viewLen > 0) {
-      viewDir[0] /= viewLen;
-      viewDir[1] /= viewLen;
-      viewDir[2] /= viewLen;
-    }
+    // The view matrix's rotation part is orthonormal, so viewDir is already normalized
 
     // Plane normals (outward facing from box center)
     // We want to show planes that are "behind" the data (facing away from camera)
@@ -2500,20 +2679,22 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   // === CELL PICKING ===
   // Convert screen coordinates to a ray and find the nearest cell
   // Optional viewportAspect parameter allows using a different aspect ratio than the global projection matrix
-  function screenToRay(screenX, screenY, canvasWidth, canvasHeight, viewportAspect = null) {
+  function screenToRay(screenX, screenY, canvasWidth, canvasHeight, viewportAspect = null, customViewMatrix = null) {
     // Normalize to clip space (-1 to 1)
     const ndcX = (screenX / canvasWidth) * 2 - 1;
     const ndcY = 1 - (screenY / canvasHeight) * 2;
 
     // Create inverse view-projection matrix
     // If a custom viewport aspect is provided, create a temporary projection matrix
+    // If a custom view matrix is provided, use it instead of the global viewMatrix
     const viewProj = mat4.create();
+    const effectiveViewMatrix = customViewMatrix || viewMatrix;
     if (viewportAspect !== null) {
       const tempProj = mat4.create();
       mat4.perspective(tempProj, fov, viewportAspect, near, far);
-      mat4.multiply(viewProj, tempProj, viewMatrix);
+      mat4.multiply(viewProj, tempProj, effectiveViewMatrix);
     } else {
-      mat4.multiply(viewProj, projectionMatrix, viewMatrix);
+      mat4.multiply(viewProj, projectionMatrix, effectiveViewMatrix);
     }
     const invViewProj = mat4.create();
     if (!mat4.invert(invViewProj, viewProj)) {
@@ -2557,6 +2738,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     let vpLocalY = localY;
     let vpWidth = rect.width;
     let vpHeight = rect.height;
+    let clickedViewId = focusedViewId;
 
     // Count active views (same logic as render())
     const viewCount = (liveViewHidden ? 0 : 1) + snapshotViews.length;
@@ -2579,11 +2761,42 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       // Convert to viewport-local coordinates
       vpLocalX = localX - clampedCol * vpWidth;
       vpLocalY = localY - clampedRow * vpHeight;
+
+      // Determine which view was clicked
+      const viewIndex = clampedRow * cols + clampedCol;
+      const allViews = [];
+      if (!liveViewHidden) allViews.push({ id: LIVE_VIEW_ID });
+      snapshotViews.forEach(s => allViews.push({ id: s.id }));
+      clickedViewId = allViews[viewIndex]?.id || focusedViewId;
+    }
+
+    // Get the correct view matrix for the clicked viewport
+    // If cameras are unlocked, each view has its own camera
+    let effectiveViewMatrix = null;
+    if (!camerasLocked && viewCount > 1) {
+      // Try to get cached view matrix first (faster)
+      const cached = cachedViewMatrices.get(clickedViewId);
+      if (cached && cached.viewMatrix) {
+        effectiveViewMatrix = cached.viewMatrix;
+      } else {
+        // Compute view matrix from camera state
+        const camState = getViewCameraState(clickedViewId);
+        if (camState) {
+          effectiveViewMatrix = mat4.create();
+          computeViewMatrixFromState(camState, effectiveViewMatrix);
+        }
+      }
+      // If we still don't have a view matrix, force update camera and use current
+      if (!effectiveViewMatrix) {
+        const [w, h] = canvasResizeObserver.getSize();
+        updateCamera(w, h);
+        // viewMatrix is now up to date, screenToRay will use it as fallback
+      }
     }
 
     // Compute viewport aspect ratio for correct projection
     const vpAspect = vpWidth / vpHeight;
-    const ray = screenToRay(vpLocalX, vpLocalY, vpWidth, vpHeight, vpAspect);
+    const ray = screenToRay(vpLocalX, vpLocalY, vpWidth, vpHeight, vpAspect, effectiveViewMatrix);
     if (!ray) return -1;
 
     const positions = hpRenderer.getPositions();
@@ -2627,6 +2840,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
       // Find the cell closest to the ray (perpendicular distance)
       for (const idx of candidates) {
+        // Skip filtered-out cells (alpha = 0)
+        if (transparencyArray && transparencyArray[idx] === 0) continue;
+
         const px = positions[idx * 3];
         const py = positions[idx * 3 + 1];
         const pz = positions[idx * 3 + 2];
@@ -2663,11 +2879,14 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
   // Cell selection state
   let cellSelectionEnabled = true;
-  let cellSelectionCallback = null; // Called when user selects cells
+  let cellSelectionCallback = null; // Legacy callback (kept for compatibility)
   let selectionPreviewCallback = null; // Called during drag for live preview
-  let selectionDragStart = null; // { x, y, cellIndex, value } for drag selection
+  let selectionStepCallback = null; // Called after each step (UI manages candidate set)
+  let selectionDragStart = null; // { x, y, cellIndex, mode } for drag selection
   let selectionDragCurrent = null;
   let highlightMode = 'none'; // 'none', 'categorical', or 'continuous'
+  let annotationStepCount = 0; // Number of annotation steps completed (UI tracks actual candidates)
+  let annotationLastMode = 'intersect'; // Last mode used for labeling
 
   // === LASSO SELECTION STATE ===
   let lassoEnabled = false; // Whether lasso mode is active
@@ -2691,6 +2910,22 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   let proximityStepCallback = null; // Called after each step (for multi-step mode)
   let proximityCandidateSet = null; // Set of candidate cell indices (for multi-step mode)
   let proximityStepCount = 0; // Number of proximity steps completed
+
+  // === KNN DRAG SELECTION STATE ===
+  let knnEnabled = false; // Whether KNN drag mode is active
+  let isKnnDragging = false; // Whether user is currently dragging
+  let knnSeedCell = null; // { screenX, screenY, cellIndex, mode }
+  let knnCurrentDegree = 0; // Current degree of neighbors (0 = just seed, 1 = first neighbors, etc.)
+  let knnCallback = null; // Called with final selection
+  let knnPreviewCallback = null; // Called during drag for live preview
+  let knnStepCallback = null; // Called after each step (for multi-step mode)
+  let knnCandidateSet = null; // Set of candidate cell indices (for multi-step mode)
+  let knnStepCount = 0; // Number of KNN steps completed
+  let knnAdjacencyList = null; // Map<cellIndex, Set<neighborIndices>> built from edges
+  let knnEdgesLoaded = false; // Whether edges have been loaded for KNN
+  let knnEdgeLoadCallback = null; // Callback when edges need to be loaded
+  let knnDegreesCache = null; // Cache of cells at each degree { degree: Set<cellIndices> }
+  let knnMaxCachedDegree = -1; // Highest degree computed in cache
 
   // Create lasso overlay canvas
   const lassoCanvas = document.createElement('canvas');
@@ -2894,6 +3129,272 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     // This creates a nice smooth expansion as you drag
     const scaleFactor = targetRadius * 0.001; // Adjust sensitivity
     return pixelDist * scaleFactor;
+  }
+
+  // === KNN HELPER FUNCTIONS ===
+
+  // Build adjacency list from edge arrays for fast neighbor lookup
+  // This is O(n_edges) and only needs to be done once when edges are loaded
+  // Uses Uint32Array for neighbors to improve cache locality and iteration speed
+  function buildKnnAdjacencyList(sources, destinations) {
+    const nEdges = sources.length;
+
+    // First pass: count neighbors for each cell
+    const neighborCounts = new Map();
+    for (let i = 0; i < nEdges; i++) {
+      const src = sources[i];
+      const dst = destinations[i];
+      neighborCounts.set(src, (neighborCounts.get(src) || 0) + 1);
+      neighborCounts.set(dst, (neighborCounts.get(dst) || 0) + 1);
+    }
+
+    // Second pass: allocate arrays and fill them
+    const adjacency = new Map();
+    const fillIndex = new Map();
+
+    for (const [cell, count] of neighborCounts) {
+      adjacency.set(cell, new Uint32Array(count));
+      fillIndex.set(cell, 0);
+    }
+
+    for (let i = 0; i < nEdges; i++) {
+      const src = sources[i];
+      const dst = destinations[i];
+
+      const srcArr = adjacency.get(src);
+      const dstArr = adjacency.get(dst);
+      const srcIdx = fillIndex.get(src);
+      const dstIdx = fillIndex.get(dst);
+
+      srcArr[srcIdx] = dst;
+      dstArr[dstIdx] = src;
+
+      fillIndex.set(src, srcIdx + 1);
+      fillIndex.set(dst, dstIdx + 1);
+    }
+
+    return adjacency;
+  }
+
+  // Incremental BFS for KNN neighbors - uses caching for performance
+  // When degree increases, extends from cached frontier instead of recomputing
+  // Returns { allCells: Set, byDegree: Map<degree, Set<cellIndices>>, frontier: Array }
+  function findKnnNeighborsUpToDegree(seedCell, maxDegree, adjacency, alphas) {
+    // Check if seed cell is filtered out
+    if (alphas && alphas[seedCell] === 0) {
+      return { allCells: new Set(), byDegree: new Map(), frontier: [] };
+    }
+
+    if (!adjacency || maxDegree < 0) {
+      return { allCells: new Set([seedCell]), byDegree: new Map([[0, new Set([seedCell])]]), frontier: [seedCell] };
+    }
+
+    // Check if we can use cached results (same seed, extending to higher degree)
+    if (knnDegreesCache &&
+        knnDegreesCache.seedCell === seedCell &&
+        knnMaxCachedDegree >= 0 &&
+        maxDegree >= knnMaxCachedDegree) {
+
+      // If we already have results for this degree, return them
+      if (maxDegree === knnMaxCachedDegree) {
+        return {
+          allCells: knnDegreesCache.visited,
+          byDegree: knnDegreesCache.byDegree,
+          frontier: knnDegreesCache.frontier
+        };
+      }
+
+      // Extend from cached frontier
+      let currentFrontier = knnDegreesCache.frontier;
+      const visited = knnDegreesCache.visited;
+      const byDegree = knnDegreesCache.byDegree;
+
+      for (let degree = knnMaxCachedDegree + 1; degree <= maxDegree; degree++) {
+        const nextFrontier = [];
+        const degreeCells = new Set();
+
+        for (let i = 0; i < currentFrontier.length; i++) {
+          const cell = currentFrontier[i];
+          const neighbors = adjacency.get(cell);
+          if (!neighbors) continue;
+
+          const len = neighbors.length;
+          for (let j = 0; j < len; j++) {
+            const neighbor = neighbors[j];
+            if (visited.has(neighbor)) continue;
+            // Skip filtered-out cells
+            if (alphas && alphas[neighbor] === 0) continue;
+
+            visited.add(neighbor);
+            degreeCells.add(neighbor);
+            nextFrontier.push(neighbor);
+          }
+        }
+
+        if (degreeCells.size > 0) {
+          byDegree.set(degree, degreeCells);
+        }
+
+        currentFrontier = nextFrontier;
+        knnDegreesCache.frontier = currentFrontier;
+        knnMaxCachedDegree = degree;
+
+        // Early exit if no more cells to explore
+        if (nextFrontier.length === 0) break;
+      }
+
+      return { allCells: visited, byDegree, frontier: currentFrontier };
+    }
+
+    // Fresh computation - build from scratch
+    const visited = new Set([seedCell]);
+    const byDegree = new Map();
+    byDegree.set(0, new Set([seedCell]));
+
+    // Initialize cache
+    knnDegreesCache = {
+      seedCell,
+      visited,
+      byDegree,
+      frontier: [seedCell]
+    };
+    knnMaxCachedDegree = 0;
+
+    if (maxDegree === 0) {
+      return { allCells: visited, byDegree, frontier: [seedCell] };
+    }
+
+    // BFS level by level
+    let currentFrontier = [seedCell];
+
+    for (let degree = 1; degree <= maxDegree; degree++) {
+      const nextFrontier = [];
+      const degreeCells = new Set();
+
+      for (let i = 0; i < currentFrontier.length; i++) {
+        const cell = currentFrontier[i];
+        const neighbors = adjacency.get(cell);
+        if (!neighbors) continue;
+
+        const len = neighbors.length;
+        for (let j = 0; j < len; j++) {
+          const neighbor = neighbors[j];
+          if (visited.has(neighbor)) continue;
+          // Skip filtered-out cells
+          if (alphas && alphas[neighbor] === 0) continue;
+
+          visited.add(neighbor);
+          degreeCells.add(neighbor);
+          nextFrontier.push(neighbor);
+        }
+      }
+
+      if (degreeCells.size > 0) {
+        byDegree.set(degree, degreeCells);
+      }
+
+      currentFrontier = nextFrontier;
+      knnDegreesCache.frontier = currentFrontier;
+      knnMaxCachedDegree = degree;
+
+      // Early exit if no more cells to explore
+      if (nextFrontier.length === 0) break;
+    }
+
+    return { allCells: visited, byDegree, frontier: currentFrontier };
+  }
+
+  // Convert pixel drag distance to KNN degree
+  // Drag distance maps to degrees: ~30px per degree
+  function pixelDistanceToKnnDegree(pixelDist) {
+    // Use vertical component for degree (up = increase, down = decrease from starting point)
+    // 30 pixels per degree gives good granularity
+    return Math.max(0, Math.floor(pixelDist / 30));
+  }
+
+  // Draw KNN selection visualization on overlay
+  function drawKnnIndicator() {
+    const rect = canvas.getBoundingClientRect();
+    lassoCtx.setTransform(1, 0, 0, 1, 0, 0);
+    const dpr = window.devicePixelRatio || 1;
+    lassoCtx.scale(dpr, dpr);
+    lassoCtx.clearRect(0, 0, rect.width, rect.height);
+
+    if (!knnSeedCell) return;
+
+    // Project the seed cell to screen
+    const positions = hpRenderer.getPositions();
+    if (!positions) return;
+
+    const [vpWidth, vpHeight] = canvasResizeObserver.getSize();
+    updateCamera(vpWidth, vpHeight);
+    mat4.multiply(mvpMatrix, projectionMatrix, viewMatrix);
+    mat4.multiply(mvpMatrix, mvpMatrix, modelMatrix);
+
+    const px = positions[knnSeedCell.cellIndex * 3];
+    const py = positions[knnSeedCell.cellIndex * 3 + 1];
+    const pz = positions[knnSeedCell.cellIndex * 3 + 2];
+
+    const centerScreen = projectPointToScreen(px, py, pz, mvpMatrix, rect.width, rect.height);
+    if (!centerScreen) return;
+
+    // Draw concentric rings to show degree levels (up to current degree)
+    const baseRadius = 20;
+    const ringSpacing = 15;
+
+    // Draw outer rings (lighter) to current degree
+    for (let d = knnCurrentDegree; d >= 0; d--) {
+      const ringRadius = baseRadius + d * ringSpacing;
+      const alpha = d === knnCurrentDegree ? 0.7 : 0.15;
+
+      lassoCtx.beginPath();
+      lassoCtx.arc(centerScreen.x, centerScreen.y, ringRadius, 0, Math.PI * 2);
+
+      if (d === knnCurrentDegree) {
+        // Current degree: filled with dashed stroke (like proximity)
+        lassoCtx.fillStyle = `rgba(17, 24, 39, 0.08)`;
+        lassoCtx.fill();
+        lassoCtx.strokeStyle = `rgba(17, 24, 39, ${alpha})`;
+        lassoCtx.lineWidth = 2;
+        lassoCtx.setLineDash([4, 3]);
+        lassoCtx.stroke();
+      } else {
+        // Inner degrees: just a thin ring
+        lassoCtx.strokeStyle = `rgba(17, 24, 39, ${alpha})`;
+        lassoCtx.lineWidth = 1;
+        lassoCtx.setLineDash([]);
+        lassoCtx.stroke();
+      }
+    }
+
+    // Center point marker
+    lassoCtx.setLineDash([]);
+    lassoCtx.beginPath();
+    lassoCtx.arc(centerScreen.x, centerScreen.y, 4, 0, Math.PI * 2);
+    lassoCtx.fillStyle = 'rgba(17, 24, 39, 0.9)';
+    lassoCtx.fill();
+
+    // Degree label
+    lassoCtx.font = 'bold 12px system-ui, sans-serif';
+    lassoCtx.textAlign = 'center';
+    lassoCtx.textBaseline = 'middle';
+    lassoCtx.fillStyle = 'rgba(17, 24, 39, 0.9)';
+    const labelY = centerScreen.y - baseRadius - knnCurrentDegree * ringSpacing - 12;
+    const degreeLabel = knnCurrentDegree === 0 ? 'seed' : `${knnCurrentDegree}°`;
+    lassoCtx.fillText(degreeLabel, centerScreen.x, labelY);
+  }
+
+  // Clear KNN indicator
+  function clearKnnIndicator() {
+    const rect = canvas.getBoundingClientRect();
+    lassoCtx.setTransform(1, 0, 0, 1, 0, 0);
+    const dpr = window.devicePixelRatio || 1;
+    lassoCtx.scale(dpr, dpr);
+    lassoCtx.clearRect(0, 0, rect.width, rect.height);
+    knnSeedCell = null;
+    knnCurrentDegree = 0;
+    knnDegreesCache = null;
+    knnMaxCachedDegree = -1;
   }
 
   // Project a 3D point to screen coordinates
@@ -3919,6 +4420,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       cellSelectionCallback = callback;
     },
 
+    setSelectionStepCallback(callback) {
+      selectionStepCallback = callback;
+    },
+
     setCellSelectionEnabled(enabled) {
       cellSelectionEnabled = enabled;
     },
@@ -3931,12 +4436,43 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       selectionPreviewCallback = callback;
     },
 
+    getAnnotationState() {
+      return {
+        inProgress: annotationStepCount > 0,
+        stepCount: annotationStepCount,
+        lastMode: annotationLastMode
+      };
+    },
+
+    confirmAnnotationSelection() {
+      // Called by UI when user confirms - UI manages the actual highlight addition
+      // Just reset viewer state
+      annotationStepCount = 0;
+      annotationLastMode = 'intersect';
+    },
+
+    cancelAnnotationSelection() {
+      // Reset state and notify UI
+      annotationStepCount = 0;
+      annotationLastMode = 'intersect';
+      if (selectionStepCallback) {
+        selectionStepCallback({
+          cancelled: true,
+          step: 0,
+          candidateCount: 0
+        });
+      }
+    },
+
     setHighlightMode(mode) {
       // mode: 'none', 'categorical', or 'continuous'
       highlightMode = mode || 'none';
       // Abort any in-progress selection when mode changes
       selectionDragStart = null;
       selectionDragCurrent = null;
+      // Reset annotation multi-step state
+      annotationStepCount = 0;
+      annotationLastMode = 'intersect';
       // Clear any stale selection classes (CSS !important would override cursor)
       canvas.classList.remove('selecting');
       canvas.classList.remove('selecting-continuous');
@@ -4114,6 +4650,112 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       // Notify UI of cancellation
       if (proximityStepCallback) {
         proximityStepCallback({
+          step: 0,
+          candidateCount: 0,
+          candidates: [],
+          cancelled: true
+        });
+      }
+    },
+
+    // KNN drag selection API
+    setKnnEnabled(enabled) {
+      knnEnabled = Boolean(enabled);
+      if (!knnEnabled) {
+        // Clear any in-progress KNN drag
+        if (isKnnDragging) {
+          isKnnDragging = false;
+          clearKnnIndicator();
+          canvas.classList.remove('knn-dragging');
+        }
+      } else {
+        // Pre-load edges when KNN mode is enabled
+        if (!knnEdgesLoaded && knnEdgeLoadCallback) {
+          knnEdgeLoadCallback();
+        }
+      }
+      // Update cursor style
+      if (knnEnabled) {
+        canvas.classList.add('knn-mode');
+      } else {
+        canvas.classList.remove('knn-mode');
+      }
+      updateCursorForHighlightMode();
+    },
+
+    getKnnEnabled() {
+      return knnEnabled;
+    },
+
+    setKnnCallback(callback) {
+      knnCallback = callback;
+    },
+
+    setKnnPreviewCallback(callback) {
+      knnPreviewCallback = callback;
+    },
+
+    setKnnStepCallback(callback) {
+      knnStepCallback = callback;
+    },
+
+    setKnnEdgeLoadCallback(callback) {
+      knnEdgeLoadCallback = callback;
+    },
+
+    getKnnState() {
+      return {
+        inProgress: knnCandidateSet !== null,
+        stepCount: knnStepCount,
+        candidateCount: knnCandidateSet ? knnCandidateSet.size : 0,
+        edgesLoaded: knnEdgesLoaded
+      };
+    },
+
+    // Load KNN edges from edge arrays and build adjacency list
+    loadKnnEdges(sources, destinations) {
+      if (!sources || !destinations || sources.length === 0) {
+        console.warn('[Viewer] Invalid edge data for KNN');
+        return false;
+      }
+      console.log(`[Viewer] Building KNN adjacency list from ${sources.length} edges...`);
+      const startTime = performance.now();
+      knnAdjacencyList = buildKnnAdjacencyList(sources, destinations);
+      knnEdgesLoaded = true;
+      const elapsed = performance.now() - startTime;
+      console.log(`[Viewer] KNN adjacency list built in ${elapsed.toFixed(1)}ms (${knnAdjacencyList.size} nodes)`);
+      return true;
+    },
+
+    isKnnEdgesLoaded() {
+      return knnEdgesLoaded;
+    },
+
+    confirmKnnSelection() {
+      if (knnCandidateSet && knnCandidateSet.size > 0) {
+        const finalIndices = [...knnCandidateSet];
+        // Call the final callback
+        if (knnCallback) {
+          knnCallback({
+            type: 'knn',
+            cellIndices: finalIndices,
+            cellCount: finalIndices.length,
+            steps: knnStepCount
+          });
+        }
+      }
+      // Reset multi-step state
+      knnCandidateSet = null;
+      knnStepCount = 0;
+    },
+
+    cancelKnnSelection() {
+      // Reset multi-step state without calling callback
+      knnCandidateSet = null;
+      knnStepCount = 0;
+      // Notify UI of cancellation
+      if (knnStepCallback) {
+        knnStepCallback({
           step: 0,
           candidateCount: 0,
           candidates: [],

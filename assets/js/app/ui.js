@@ -458,16 +458,22 @@ export function initUI({ state, viewer, dom, smoke }) {
     : (highlightModeButtons ? [highlightModeButtons] : []);
   const highlightModeDescriptionEl = highlightModeDescription || null;
   const highlightModeCopy = {
-    annotation: 'Alt+click a cell to highlight its group. Alt+drag to select a range.',
-    knn: 'Placeholder: KNN drag will expand highlights along nearest-neighbor links.',
-    proximity: 'Alt+click a cell and drag outward to select by 3D proximity. Drag farther to expand selection radius.',
+    annotation: 'Alt+click a cell to select. Shift+Alt to add, Ctrl+Alt to subtract. For continuous: Alt intersects.',
+    knn: 'Alt+click and drag up to expand along neighbors. Shift+Alt to add, Ctrl+Alt to subtract.',
+    proximity: 'Alt+click and drag to select by 3D proximity. Shift+Alt to add, Ctrl+Alt to subtract.',
     lasso: 'Hold Alt and draw to select. Rotate and draw again: Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract.'
   };
   let activeHighlightMode = 'annotation';
 
+  // Annotation selection state (multi-step with confirm/cancel)
+  let annotationCandidateSet = null; // Set of candidate cell indices
+  let annotationStepCount = 0;
+
   function setHighlightModeUI(mode) {
     const wasLasso = activeHighlightMode === 'lasso';
     const wasProximity = activeHighlightMode === 'proximity';
+    const wasKnn = activeHighlightMode === 'knn';
+    const wasAnnotation = activeHighlightMode === 'annotation';
     activeHighlightMode = mode;
 
     if (highlightModeButtonsList && highlightModeButtonsList.length) {
@@ -475,6 +481,17 @@ export function initUI({ state, viewer, dom, smoke }) {
         const isActive = btn?.dataset?.mode === mode;
         btn?.setAttribute?.('aria-pressed', isActive ? 'true' : 'false');
       });
+    }
+
+    // Cancel any in-progress annotation selection when switching away from annotation mode
+    if (wasAnnotation && mode !== 'annotation') {
+      // Reset UI-managed annotation state
+      annotationCandidateSet = null;
+      annotationStepCount = 0;
+      viewer.cancelAnnotationSelection?.();
+      if (state.clearPreviewHighlight) {
+        state.clearPreviewHighlight();
+      }
     }
 
     // Cancel any in-progress lasso selection when switching away from lasso mode
@@ -495,11 +512,24 @@ export function initUI({ state, viewer, dom, smoke }) {
       }
     }
 
-    // Remove lasso/proximity controls UI when switching modes
+    // Cancel any in-progress KNN selection when switching away from KNN mode
+    if (wasKnn && mode !== 'knn') {
+      viewer.cancelKnnSelection?.();
+      // Clear preview highlight
+      if (state.clearPreviewHighlight) {
+        state.clearPreviewHighlight();
+      }
+    }
+
+    // Remove lasso/proximity/knn/annotation controls UI when switching modes
     const existingControls = document.getElementById('lasso-step-controls');
     if (existingControls) existingControls.remove();
     const existingProximityControls = document.getElementById('proximity-step-controls');
     if (existingProximityControls) existingProximityControls.remove();
+    const existingKnnControls = document.getElementById('knn-step-controls');
+    if (existingKnnControls) existingKnnControls.remove();
+    const existingAnnotationControls = document.getElementById('annotation-step-controls');
+    if (existingAnnotationControls) existingAnnotationControls.remove();
 
     // Update description text (use textContent to clear any innerHTML from lasso UI)
     if (highlightModeDescriptionEl) {
@@ -516,6 +546,37 @@ export function initUI({ state, viewer, dom, smoke }) {
     // Enable/disable proximity mode in viewer
     if (viewer.setProximityEnabled) {
       viewer.setProximityEnabled(mode === 'proximity');
+    }
+
+    // Enable/disable KNN mode in viewer and pre-load edges
+    if (viewer.setKnnEnabled) {
+      viewer.setKnnEnabled(mode === 'knn');
+
+      // Pre-load edges when KNN mode is activated
+      if (mode === 'knn' && !viewer.isKnnEdgesLoaded?.()) {
+        // Show loading message
+        if (highlightModeDescriptionEl) {
+          highlightModeDescriptionEl.innerHTML = '<em>Loading neighbor graph...</em>';
+        }
+        // Trigger async edge loading - the callback in main.js will handle it
+        // After loading completes, update the description
+        let attempts = 0;
+        const maxAttempts = 100; // 10 seconds max wait
+        const checkLoaded = setInterval(() => {
+          attempts++;
+          if (viewer.isKnnEdgesLoaded?.()) {
+            clearInterval(checkLoaded);
+            if (highlightModeDescriptionEl && activeHighlightMode === 'knn') {
+              highlightModeDescriptionEl.innerHTML = highlightModeCopy.knn;
+            }
+          } else if (attempts >= maxAttempts) {
+            clearInterval(checkLoaded);
+            if (highlightModeDescriptionEl && activeHighlightMode === 'knn') {
+              highlightModeDescriptionEl.innerHTML = '<em style="color: #666;">KNN requires connectivity data. Enable "Show edges" first or check if data is available.</em>';
+            }
+          }
+        }, 100);
+      }
     }
   }
 
@@ -789,16 +850,12 @@ export function initUI({ state, viewer, dom, smoke }) {
     input.select();
   }
 
-  // Handle cell selection from viewer
-  function handleCellSelection(selectionEvent) {
-    // Hide the range label when selection completes
-    hideRangeLabel();
+  // === ANNOTATION SELECTION HANDLERS ===
 
+  // Compute cell indices from selection event
+  function computeAnnotationCellIndices(selectionEvent) {
     const activeField = state.getActiveField();
-    if (!activeField) {
-      console.log('[UI] No active field for cell selection');
-      return;
-    }
+    if (!activeField) return [];
 
     const cellIndex = selectionEvent.cellIndex;
     const fieldIndex = state.activeFieldSource === 'var'
@@ -807,43 +864,234 @@ export function initUI({ state, viewer, dom, smoke }) {
     const source = state.activeFieldSource || 'obs';
 
     if (activeField.kind === 'category') {
-      // Categorical: select all cells in the same category
       const categoryIndex = state.getCategoryForCell(cellIndex, fieldIndex, source);
-      if (categoryIndex >= 0) {
-        state.addHighlightFromCategory(fieldIndex, categoryIndex, source);
-      }
+      if (categoryIndex < 0) return [];
+      return state.getCellIndicesForCategory(fieldIndex, categoryIndex, source);
     } else if (activeField.kind === 'continuous') {
-      // Continuous: use drag distance to determine range
       const clickedValue = state.getValueForCell(cellIndex, fieldIndex, source);
-      if (clickedValue == null) return;
+      if (clickedValue == null) return [];
 
       const stats = activeField._continuousStats || { min: 0, max: 1 };
       const valueRange = stats.max - stats.min;
 
+      let minVal, maxVal;
       if (selectionEvent.type === 'range' && selectionEvent.dragDeltaY !== 0) {
-        // Drag selection: calculate range based on drag direction and distance
-        const dragScale = 0.005; // pixels to value ratio
+        const dragScale = 0.005;
         const dragAmount = -selectionEvent.dragDeltaY * dragScale * valueRange;
-
-        let minVal, maxVal;
         if (dragAmount > 0) {
-          // Dragged up: select from clicked value to higher
           minVal = clickedValue;
           maxVal = Math.min(stats.max, clickedValue + dragAmount);
         } else {
-          // Dragged down: select from lower to clicked value
           minVal = Math.max(stats.min, clickedValue + dragAmount);
           maxVal = clickedValue;
         }
-
-        state.addHighlightFromRange(fieldIndex, minVal, maxVal, source);
       } else {
-        // Single click: select a small range around the clicked value
-        const rangeSize = valueRange * 0.1; // 10% of range
-        const minVal = Math.max(stats.min, clickedValue - rangeSize / 2);
-        const maxVal = Math.min(stats.max, clickedValue + rangeSize / 2);
-        state.addHighlightFromRange(fieldIndex, minVal, maxVal, source);
+        const rangeSize = valueRange * 0.1;
+        minVal = Math.max(stats.min, clickedValue - rangeSize / 2);
+        maxVal = Math.min(stats.max, clickedValue + rangeSize / 2);
       }
+      return state.getCellIndicesForRange(fieldIndex, minVal, maxVal, source);
+    }
+    return [];
+  }
+
+  // Handle annotation step (each Alt+click/drag)
+  function handleAnnotationStep(stepEvent) {
+    // Handle cancellation
+    if (stepEvent.cancelled) {
+      annotationCandidateSet = null;
+      annotationStepCount = 0;
+      updateAnnotationUI(null);
+      if (state.clearPreviewHighlight) {
+        state.clearPreviewHighlight();
+      }
+      return;
+    }
+
+    // Hide range label
+    hideRangeLabel();
+
+    const activeField = state.getActiveField();
+    if (!activeField) {
+      console.log('[UI] No active field for annotation selection');
+      return;
+    }
+
+    const mode = stepEvent.mode || 'intersect';
+    const newCellIndices = computeAnnotationCellIndices(stepEvent);
+
+    if (newCellIndices.length === 0 && mode !== 'subtract') {
+      return;
+    }
+
+    const newSet = new Set(newCellIndices);
+    let effectiveMode = mode;
+
+    // Apply mode to candidate set based on field type
+    if (activeField.kind === 'category') {
+      // CATEGORICAL: Alt = replace, Shift+Alt = add, Ctrl+Alt = subtract
+      if (mode === 'intersect') {
+        // Alt for categorical = REPLACE (not intersect)
+        // Clear existing and set to new category
+        annotationCandidateSet = new Set(newCellIndices);
+        effectiveMode = 'replace';
+      } else if (mode === 'union') {
+        // Shift+Alt = add to existing
+        if (annotationCandidateSet === null) {
+          annotationCandidateSet = new Set(newCellIndices);
+        } else {
+          for (const idx of newCellIndices) {
+            annotationCandidateSet.add(idx);
+          }
+        }
+      } else if (mode === 'subtract') {
+        // Ctrl+Alt = remove from existing
+        if (annotationCandidateSet !== null) {
+          for (const idx of newCellIndices) {
+            annotationCandidateSet.delete(idx);
+          }
+        }
+      }
+    } else {
+      // CONTINUOUS: Works like proximity drag
+      // Alt = intersect, Shift+Alt = add, Ctrl+Alt = subtract
+      if (annotationCandidateSet === null) {
+        // First step: initialize candidate set (except subtract which does nothing)
+        if (mode !== 'subtract') {
+          annotationCandidateSet = new Set(newCellIndices);
+        }
+      } else if (mode === 'union') {
+        // Shift+Alt = add to existing
+        for (const idx of newCellIndices) {
+          annotationCandidateSet.add(idx);
+        }
+      } else if (mode === 'subtract') {
+        // Ctrl+Alt = remove from existing
+        for (const idx of newCellIndices) {
+          annotationCandidateSet.delete(idx);
+        }
+      } else {
+        // Alt = intersect with existing
+        annotationCandidateSet = new Set([...annotationCandidateSet].filter(idx => newSet.has(idx)));
+      }
+    }
+
+    // Only count as a step if we have a valid candidate set (mirrors proximity behavior)
+    if (annotationCandidateSet) {
+      annotationStepCount++;
+
+      // Update UI with step info
+      updateAnnotationUI({
+        step: annotationStepCount,
+        candidateCount: annotationCandidateSet.size,
+        mode: effectiveMode
+      });
+
+      // Update preview highlight (even if empty, to clear previous preview)
+      if (annotationCandidateSet.size > 0) {
+        state.setPreviewHighlightFromIndices?.([...annotationCandidateSet]);
+      } else {
+        // Clear preview when selection is empty
+        state.clearPreviewHighlight?.();
+      }
+    }
+  }
+
+  // Handle final annotation selection (when confirmed)
+  function handleAnnotationConfirm() {
+    if (!annotationCandidateSet || annotationCandidateSet.size === 0) {
+      console.log('[UI] Annotation selection empty');
+      annotationCandidateSet = null;
+      annotationStepCount = 0;
+      updateAnnotationUI(null);
+      return;
+    }
+
+    const cellIndices = [...annotationCandidateSet];
+    const stepsLabel = annotationStepCount > 1 ? ` (${annotationStepCount} steps)` : '';
+
+    state.addHighlightDirect({
+      type: 'annotation',
+      label: `Annotation${stepsLabel} (${cellIndices.length.toLocaleString()} cells)`,
+      cellIndices: cellIndices
+    });
+
+    console.log(`[UI] Annotation selected ${cellIndices.length} cells from ${annotationStepCount} step(s)`);
+
+    // Reset state
+    annotationCandidateSet = null;
+    annotationStepCount = 0;
+    updateAnnotationUI(null);
+
+    // Clear preview
+    if (state.clearPreviewHighlight) {
+      state.clearPreviewHighlight();
+    }
+
+    // Notify viewer
+    viewer.confirmAnnotationSelection?.();
+  }
+
+  // Update annotation UI based on current state
+  function updateAnnotationUI(stepEvent) {
+    if (!highlightModeDescriptionEl) return;
+
+    const activeField = state.getActiveField();
+    const isCategorical = activeField?.kind === 'category';
+
+    if (!stepEvent || stepEvent.step === 0) {
+      // No selection in progress - show default description
+      highlightModeDescriptionEl.innerHTML = highlightModeCopy.annotation;
+      // Remove any existing controls
+      const existingControls = document.getElementById('annotation-step-controls');
+      if (existingControls) existingControls.remove();
+    } else {
+      // Selection in progress - show step info and controls
+      let modeLabel = '';
+      if (stepEvent.mode === 'union') {
+        modeLabel = ' <span class="lasso-mode-tag union">+added</span>';
+      } else if (stepEvent.mode === 'subtract') {
+        modeLabel = ' <span class="lasso-mode-tag subtract">−removed</span>';
+      } else if (stepEvent.mode === 'replace') {
+        // Categorical replace - only show label if not first step
+        if (stepEvent.step > 1) {
+          modeLabel = ' <span class="lasso-mode-tag intersect">replaced</span>';
+        }
+      } else if (stepEvent.step > 1) {
+        // Continuous intersect
+        modeLabel = ' <span class="lasso-mode-tag intersect">intersected</span>';
+      }
+
+      // Different help text for categorical vs continuous
+      const helpText = isCategorical
+        ? 'Alt to replace, Shift+Alt to add, Ctrl+Alt to subtract'
+        : 'Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract';
+
+      const stepInfo = `<strong>Step ${stepEvent.step}:</strong> ${stepEvent.candidateCount.toLocaleString()} cells${modeLabel}<br><small>${helpText}</small>`;
+
+      // Check if controls already exist
+      let controls = document.getElementById('annotation-step-controls');
+      if (!controls) {
+        controls = document.createElement('div');
+        controls.id = 'annotation-step-controls';
+        controls.className = 'lasso-step-controls'; // Reuse same styling
+        controls.innerHTML = `
+          <button type="button" class="btn-small lasso-confirm" id="annotation-confirm-btn">Confirm</button>
+          <button type="button" class="btn-small lasso-cancel" id="annotation-cancel-btn">Cancel</button>
+        `;
+        highlightModeDescriptionEl.parentElement.appendChild(controls);
+
+        // Wire up button events
+        document.getElementById('annotation-confirm-btn').addEventListener('click', () => {
+          handleAnnotationConfirm();
+        });
+        document.getElementById('annotation-cancel-btn').addEventListener('click', () => {
+          // Mirror proximity pattern: call viewer cancel which sends cancelled event to handleAnnotationStep
+          viewer.cancelAnnotationSelection?.();
+        });
+      }
+
+      highlightModeDescriptionEl.innerHTML = stepInfo;
     }
   }
 
@@ -901,9 +1149,9 @@ export function initUI({ state, viewer, dom, smoke }) {
     });
   }
 
-  // Wire up cell selection callback
-  if (viewer.setCellSelectionCallback) {
-    viewer.setCellSelectionCallback(handleCellSelection);
+  // Wire up annotation selection step callback
+  if (viewer.setSelectionStepCallback) {
+    viewer.setSelectionStepCallback(handleAnnotationStep);
   }
 
   // Handle final lasso selection (after confirm)
@@ -1127,6 +1375,125 @@ export function initUI({ state, viewer, dom, smoke }) {
     viewer.setProximityPreviewCallback(handleProximityPreview);
   }
 
+  // === KNN DRAG HANDLERS ===
+
+  // Handle final KNN selection (when confirmed)
+  function handleKnnSelection(knnEvent) {
+    if (!knnEvent || !knnEvent.cellIndices || knnEvent.cellIndices.length === 0) {
+      console.log('[UI] KNN selection empty');
+      return;
+    }
+
+    // Add highlight directly with cell indices (same as lasso/proximity)
+    const stepsLabel = knnEvent.steps > 1 ? ` (${knnEvent.steps} selections)` : '';
+    const group = state.addHighlightDirect({
+      type: 'knn',
+      label: `KNN${stepsLabel} (${knnEvent.cellCount.toLocaleString()} cells)`,
+      cellIndices: knnEvent.cellIndices
+    });
+
+    if (group) {
+      console.log(`[UI] KNN selected ${knnEvent.cellCount} cells from ${knnEvent.steps} selection(s)`);
+    }
+
+    // Reset UI state
+    updateKnnUI(null);
+  }
+
+  // Handle KNN step updates (multi-step mode)
+  function handleKnnStep(stepEvent) {
+    if (stepEvent.cancelled) {
+      // Selection was cancelled
+      updateKnnUI(null);
+      // Clear preview highlight
+      if (state.clearPreviewHighlight) {
+        state.clearPreviewHighlight();
+      }
+      return;
+    }
+
+    // Update UI with current step info
+    updateKnnUI(stepEvent);
+
+    // Show preview highlight of current candidates
+    if (stepEvent.candidates && stepEvent.candidates.length > 0) {
+      state.setPreviewHighlightFromIndices?.(stepEvent.candidates);
+    }
+  }
+
+  // Handle live preview during KNN drag
+  function handleKnnPreview(previewEvent) {
+    if (!previewEvent || !previewEvent.cellIndices) return;
+
+    // Show preview highlight during drag
+    if (previewEvent.cellIndices.length > 0) {
+      state.setPreviewHighlightFromIndices?.(previewEvent.cellIndices);
+    }
+  }
+
+  // Update KNN UI based on current state
+  function updateKnnUI(stepEvent) {
+    if (!highlightModeDescriptionEl) return;
+
+    if (!stepEvent || stepEvent.step === 0) {
+      // No selection in progress - show default description
+      highlightModeDescriptionEl.innerHTML = highlightModeCopy.knn;
+      // Remove any existing KNN controls
+      const existingControls = document.getElementById('knn-step-controls');
+      if (existingControls) existingControls.remove();
+    } else {
+      // Selection in progress - show step info and controls
+      let modeLabel = '';
+      if (stepEvent.mode === 'union') {
+        modeLabel = ' <span class="lasso-mode-tag union">+added</span>';
+      } else if (stepEvent.mode === 'subtract') {
+        modeLabel = ' <span class="lasso-mode-tag subtract">−removed</span>';
+      } else if (stepEvent.step > 1) {
+        modeLabel = ' <span class="lasso-mode-tag intersect">intersected</span>';
+      }
+      const degreeLabel = stepEvent.degree === 0 ? 'seed only' : `${stepEvent.degree}° neighbors`;
+      const stepInfo = `<strong>Step ${stepEvent.step}:</strong> ${stepEvent.candidateCount.toLocaleString()} cells (${degreeLabel})${modeLabel}<br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>`;
+
+      // Check if controls already exist
+      let controls = document.getElementById('knn-step-controls');
+      if (!controls) {
+        controls = document.createElement('div');
+        controls.id = 'knn-step-controls';
+        controls.className = 'lasso-step-controls'; // Reuse same styling
+        controls.innerHTML = `
+          <button type="button" class="btn-small lasso-confirm" id="knn-confirm-btn">Confirm</button>
+          <button type="button" class="btn-small lasso-cancel" id="knn-cancel-btn">Cancel</button>
+        `;
+        highlightModeDescriptionEl.parentElement.appendChild(controls);
+
+        // Wire up button events
+        document.getElementById('knn-confirm-btn').addEventListener('click', () => {
+          viewer.confirmKnnSelection?.();
+          // Clear preview
+          if (state.clearPreviewHighlight) {
+            state.clearPreviewHighlight();
+          }
+        });
+        document.getElementById('knn-cancel-btn').addEventListener('click', () => {
+          viewer.cancelKnnSelection?.();
+        });
+      }
+
+      highlightModeDescriptionEl.innerHTML = stepInfo;
+    }
+  }
+
+  // Wire up KNN callbacks
+  if (viewer.setKnnCallback) {
+    viewer.setKnnCallback(handleKnnSelection);
+  }
+  if (viewer.setKnnStepCallback) {
+    viewer.setKnnStepCallback(handleKnnStep);
+  }
+  if (viewer.setKnnPreviewCallback) {
+    viewer.setKnnPreviewCallback(handleKnnPreview);
+  }
+
   // Handle preview during continuous drag
   function handleSelectionPreview(previewEvent) {
     const activeField = state.getActiveField ? state.getActiveField() : null;
@@ -1161,9 +1528,35 @@ export function initUI({ state, viewer, dom, smoke }) {
       maxVal = clickedValue;
     }
 
-    // Update preview highlighting
-    if (state.setPreviewHighlightForRange) {
-      state.setPreviewHighlightForRange(fieldIndex, minVal, maxVal, source);
+    // Get new cell indices for the current drag range
+    const newIndices = state.getCellIndicesForRange(fieldIndex, minVal, maxVal, source);
+    const mode = previewEvent.mode || 'intersect';
+
+    // Compute combined preview based on mode and existing candidates (mirrors proximity behavior)
+    let combinedIndices;
+    if (annotationCandidateSet === null || annotationCandidateSet.size === 0) {
+      // No existing selection - just show new indices
+      combinedIndices = newIndices;
+    } else if (mode === 'union') {
+      // Union: show existing + new
+      const combined = new Set(annotationCandidateSet);
+      for (const idx of newIndices) combined.add(idx);
+      combinedIndices = [...combined];
+    } else if (mode === 'subtract') {
+      // Subtract: show existing minus new
+      const newSet = new Set(newIndices);
+      combinedIndices = [...annotationCandidateSet].filter(idx => !newSet.has(idx));
+    } else {
+      // Intersect: show intersection of existing and new
+      const newSet = new Set(newIndices);
+      combinedIndices = [...annotationCandidateSet].filter(idx => newSet.has(idx));
+    }
+
+    // Update preview highlighting with combined result
+    if (state.setPreviewHighlightFromIndices && combinedIndices.length > 0) {
+      state.setPreviewHighlightFromIndices(combinedIndices);
+    } else if (state.clearPreviewHighlight) {
+      state.clearPreviewHighlight();
     }
 
     // Show range label next to cursor

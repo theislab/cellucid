@@ -1286,30 +1286,25 @@ html, body {
   background: #d1d5db;
 }
 
-/* Lasso mode indicator tags */
+/* Selection mode indicator tags (used across all highlight modes) */
 .lasso-mode-tag {
   display: inline-block;
-  padding: 1px 6px;
+  padding: 2px 6px;
   border-radius: 3px;
-  font-size: 10px;
-  font-weight: 600;
+  font-size: 9px;
+  font-weight: 700;
   text-transform: uppercase;
-  margin-left: 4px;
+  letter-spacing: 0.5px;
+  margin-left: 6px;
+  border: 1px solid currentColor;
 }
 
-.lasso-mode-tag.union {
-  background: rgba(76, 175, 80, 0.2);
-  color: #4caf50;
-}
-
-.lasso-mode-tag.subtract {
-  background: rgba(244, 67, 54, 0.2);
-  color: #f44336;
-}
-
+.lasso-mode-tag.union,
+.lasso-mode-tag.subtract,
 .lasso-mode-tag.intersect {
-  background: rgba(79, 140, 255, 0.2);
-  color: #4f8cff;
+  background: #e5e7eb;
+  color: #374151;
+  border-color: #9ca3af;
 }
 
 /* ========================================================================

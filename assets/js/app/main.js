@@ -722,6 +722,11 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
 
               console.log(`[Main] Edges loaded: ${edgeData.nEdges} edges, ${edgeData.nCells} cells, visible: ${actualVisibleEdges}`);
 
+              // Also load edges into KNN adjacency list for KNN drag mode
+              if (viewer.loadKnnEdges) {
+                viewer.loadKnnEdges(edgeData.sources, edgeData.destinations);
+              }
+
             } catch (err) {
               console.error('Failed to load connectivity data:', err);
               if (connectivityInfo) {
@@ -872,6 +877,44 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
 
           // Apply LOD limit using accurate visible edge calculation
           applyEdgeLodLimit();
+        });
+      }
+
+      // Set up KNN edge load callback - triggers when KNN mode needs edges
+      // This loads edges on-demand when user first tries to use KNN drag
+      if (viewer.setKnnEdgeLoadCallback) {
+        viewer.setKnnEdgeLoadCallback(async () => {
+          // If edges are already loaded, just build the adjacency list
+          if (edgesLoaded && edgeSources && edgeDestinations) {
+            if (!viewer.isKnnEdgesLoaded()) {
+              viewer.loadKnnEdges(edgeSources, edgeDestinations);
+            }
+            return;
+          }
+
+          // Otherwise, load edges first
+          try {
+            console.log('[Main] Loading edges for KNN mode...');
+            const edgeData = await loadEdges(CONNECTIVITY_MANIFEST_URL, connectivityManifest);
+
+            // Shuffle for random sampling (if not already done)
+            shuffleEdges(edgeData.sources, edgeData.destinations);
+
+            // Store edge arrays
+            edgeSources = edgeData.sources;
+            edgeDestinations = edgeData.destinations;
+
+            // Set up V2 rendering (for potential edge display)
+            viewer.setupEdgesV2(edgeData, state.positionsArray);
+            edgesLoaded = true;
+
+            // Build KNN adjacency list
+            viewer.loadKnnEdges(edgeData.sources, edgeData.destinations);
+
+            console.log(`[Main] KNN edges loaded: ${edgeData.nEdges} edges`);
+          } catch (err) {
+            console.error('[Main] Failed to load edges for KNN:', err);
+          }
         });
       }
     }
