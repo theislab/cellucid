@@ -1,13 +1,13 @@
 {
   "version": 3,
-  "timestamp": "2025-12-07T13:56:14.144Z",
+  "timestamp": "2025-12-08T16:26:20.330Z",
   "camera": {
     "navigationMode": "orbit",
     "orbit": {
-      "radius": 1.355233656121385,
-      "targetRadius": 1.355233656121385,
-      "theta": 3.7253981633974473,
-      "phi": 1.4103981633974465,
+      "radius": 1.0690902609366484,
+      "targetRadius": 1.0690902609366484,
+      "theta": 3.7434766771037165,
+      "phi": 1.487562319220339,
       "target": [
         0,
         0,
@@ -27,7 +27,7 @@
   "uiControls": {
     "point-size": {
       "type": "range",
-      "value": "27"
+      "value": "21"
     },
     "lighting-strength": {
       "type": "range",
@@ -185,10 +185,6 @@
       "type": "select",
       "value": "grid"
     },
-    "active-view-select": {
-      "type": "select",
-      "value": "live"
-    },
     "categorical-field": {
       "type": "select",
       "value": "22"
@@ -235,31 +231,7 @@
   ],
   "activePageId": "page_1",
   "activePageName": "Page 1",
-  "filters": {
-    "obs:cell_type_lv1": {
-      "kind": "category",
-      "filterEnabled": true,
-      "visibility": {
-        "0": true,
-        "1": true,
-        "2": true,
-        "3": true,
-        "4": true,
-        "5": true,
-        "6": true,
-        "7": true,
-        "8": true
-      },
-      "colors": {
-        "8": [
-          0.7098039215686275,
-          0.10196078431372549,
-          0
-        ]
-      },
-      "colormapId": null
-    }
-  },
+  "filters": {},
   "activeFields": {
     "activeFieldKey": "cell_type_lv1",
     "activeFieldSource": "obs",

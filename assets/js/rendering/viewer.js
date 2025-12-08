@@ -743,12 +743,14 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       }
 
       if (worldPos) {
+        const vpInfo = getViewportInfoAtScreen(e.clientX, e.clientY);
         proximityCenter = {
           screenX: e.clientX,
           screenY: e.clientY,
           worldPos: worldPos,
           cellIndex: clickedCellIdx,
-          mode: proximityMode
+          mode: proximityMode,
+          viewport: vpInfo
         };
         proximityCurrentRadius = 0;
         isProximityDragging = true;
@@ -783,11 +785,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
           return;
         }
 
+        const vpInfo = getViewportInfoAtScreen(e.clientX, e.clientY);
         knnSeedCell = {
           screenX: e.clientX,
           screenY: e.clientY,
           cellIndex: cellIdx,
-          mode: knnMode
+          mode: knnMode,
+          viewport: vpInfo
         };
         knnCurrentDegree = 0;
         knnDegreesCache = null;
@@ -1233,10 +1237,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     // Track KNN drag - expand/contract degree as user drags
     if (isKnnDragging && knnSeedCell && knnAdjacencyList) {
-      // Calculate drag distance from starting point
-      // Use vertical distance for degree: drag up = more neighbors, drag down = fewer
-      const dy = knnSeedCell.screenY - e.clientY; // Inverted so up = positive
-      const pixelDist = Math.max(0, dy);
+      // Calculate drag distance from starting point (any direction, like proximity)
+      const dx = e.clientX - knnSeedCell.screenX;
+      const dy = e.clientY - knnSeedCell.screenY;
+      const pixelDist = Math.sqrt(dx * dx + dy * dy);
 
       // Convert pixel distance to degree
       const newDegree = pixelDistanceToKnnDegree(pixelDist);
@@ -2728,6 +2732,73 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     return { origin: near3, direction: dir };
   }
 
+  // Get viewport info for a screen position (handles multiview grid layout)
+  function getViewportInfoAtScreen(screenX, screenY) {
+    const rect = canvas.getBoundingClientRect();
+    const localX = screenX - rect.left;
+    const localY = screenY - rect.top;
+
+    let vpLocalX = localX;
+    let vpLocalY = localY;
+    let vpWidth = rect.width;
+    let vpHeight = rect.height;
+    let vpOffsetX = 0;
+    let vpOffsetY = 0;
+    let clickedViewId = focusedViewId;
+
+    const viewCount = (liveViewHidden ? 0 : 1) + snapshotViews.length;
+
+    if (viewLayoutMode === 'grid' && viewCount > 1) {
+      const cols = viewCount <= 3 ? viewCount : Math.ceil(Math.sqrt(viewCount));
+      const rows = Math.ceil(viewCount / cols);
+      vpWidth = rect.width / cols;
+      vpHeight = rect.height / rows;
+
+      const col = Math.floor(localX / vpWidth);
+      const row = Math.floor(localY / vpHeight);
+      const clampedCol = Math.max(0, Math.min(col, cols - 1));
+      const clampedRow = Math.max(0, Math.min(row, rows - 1));
+
+      vpOffsetX = clampedCol * vpWidth;
+      vpOffsetY = clampedRow * vpHeight;
+      vpLocalX = localX - vpOffsetX;
+      vpLocalY = localY - vpOffsetY;
+
+      const viewIndex = clampedRow * cols + clampedCol;
+      const allViews = [];
+      if (!liveViewHidden) allViews.push({ id: LIVE_VIEW_ID });
+      snapshotViews.forEach(s => allViews.push({ id: s.id }));
+      clickedViewId = allViews[viewIndex]?.id || focusedViewId;
+    }
+
+    // Get effective view matrix for the viewport
+    let effectiveViewMatrix = null;
+    if (!camerasLocked && viewCount > 1) {
+      const cached = cachedViewMatrices.get(clickedViewId);
+      if (cached && cached.viewMatrix) {
+        effectiveViewMatrix = cached.viewMatrix;
+      } else {
+        const camState = getViewCameraState(clickedViewId);
+        if (camState) {
+          effectiveViewMatrix = mat4.create();
+          computeViewMatrixFromState(camState, effectiveViewMatrix);
+        }
+      }
+    }
+
+    return {
+      vpWidth,
+      vpHeight,
+      vpOffsetX,
+      vpOffsetY,
+      vpLocalX,
+      vpLocalY,
+      viewId: clickedViewId,
+      effectiveViewMatrix,
+      vpAspect: vpWidth / vpHeight
+    };
+  }
+
   function pickCellAtScreen(screenX, screenY) {
     const rect = canvas.getBoundingClientRect();
     const localX = screenX - rect.left;
@@ -3017,28 +3088,36 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     if (!proximityCenter || proximityCurrentRadius <= 0) return;
 
-    // Project the center point to screen
-    const [vpWidth, vpHeight] = canvasResizeObserver.getSize();
-    updateCamera(vpWidth, vpHeight);
-    mat4.multiply(mvpMatrix, projectionMatrix, viewMatrix);
-    mat4.multiply(mvpMatrix, mvpMatrix, modelMatrix);
+    // Get viewport info (stored when drag started, for multiview support)
+    const vp = proximityCenter.viewport;
+    const vpWidth = vp ? vp.vpWidth : rect.width;
+    const vpHeight = vp ? vp.vpHeight : rect.height;
+    const vpOffsetX = vp ? vp.vpOffsetX : 0;
+    const vpOffsetY = vp ? vp.vpOffsetY : 0;
+
+    // Build MVP matrix with correct view matrix for the viewport
+    const localMvp = mat4.create();
+    const localProj = mat4.create();
+    mat4.perspective(localProj, fov, vpWidth / vpHeight, near, far);
+    const effectiveView = (vp && vp.effectiveViewMatrix) ? vp.effectiveViewMatrix : viewMatrix;
+    mat4.multiply(localMvp, localProj, effectiveView);
+    mat4.multiply(localMvp, localMvp, modelMatrix);
 
     const centerScreen = projectPointToScreen(
       proximityCenter.worldPos[0],
       proximityCenter.worldPos[1],
       proximityCenter.worldPos[2],
-      mvpMatrix, rect.width, rect.height
+      localMvp, vpWidth, vpHeight
     );
     if (!centerScreen) return;
 
     // Estimate screen radius by projecting a point at the edge of the sphere
-    // Use the camera's right vector to find a point on the sphere's edge
     const edgeX = proximityCenter.worldPos[0] + proximityCurrentRadius;
     const edgeScreen = projectPointToScreen(
       edgeX,
       proximityCenter.worldPos[1],
       proximityCenter.worldPos[2],
-      mvpMatrix, rect.width, rect.height
+      localMvp, vpWidth, vpHeight
     );
 
     let screenRadius = 50; // Default fallback
@@ -3048,12 +3127,16 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       screenRadius = Math.sqrt(dx * dx + dy * dy);
     }
 
+    // Offset to correct viewport position in multiview mode
+    const drawX = centerScreen.x + vpOffsetX;
+    const drawY = centerScreen.y + vpOffsetY;
+
     // Draw the selection sphere indicator using website's color scheme (#111827 = rgb(17, 24, 39))
     // Matching lasso style: fill + dashed stroke + center dot
 
     // Selection circle with fill
     lassoCtx.beginPath();
-    lassoCtx.arc(centerScreen.x, centerScreen.y, screenRadius, 0, Math.PI * 2);
+    lassoCtx.arc(drawX, drawY, screenRadius, 0, Math.PI * 2);
     lassoCtx.fillStyle = 'rgba(17, 24, 39, 0.08)';
     lassoCtx.fill();
     lassoCtx.strokeStyle = 'rgba(17, 24, 39, 0.7)';
@@ -3064,7 +3147,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     // Center point marker (same size as lasso vertex dots)
     lassoCtx.setLineDash([]);
     lassoCtx.beginPath();
-    lassoCtx.arc(centerScreen.x, centerScreen.y, 3, 0, Math.PI * 2);
+    lassoCtx.arc(drawX, drawY, 3, 0, Math.PI * 2);
     lassoCtx.fillStyle = 'rgba(17, 24, 39, 0.9)';
     lassoCtx.fill();
   }
@@ -3326,17 +3409,31 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     const positions = hpRenderer.getPositions();
     if (!positions) return;
 
-    const [vpWidth, vpHeight] = canvasResizeObserver.getSize();
-    updateCamera(vpWidth, vpHeight);
-    mat4.multiply(mvpMatrix, projectionMatrix, viewMatrix);
-    mat4.multiply(mvpMatrix, mvpMatrix, modelMatrix);
+    // Get viewport info (stored when drag started, for multiview support)
+    const vp = knnSeedCell.viewport;
+    const vpWidth = vp ? vp.vpWidth : rect.width;
+    const vpHeight = vp ? vp.vpHeight : rect.height;
+    const vpOffsetX = vp ? vp.vpOffsetX : 0;
+    const vpOffsetY = vp ? vp.vpOffsetY : 0;
+
+    // Build MVP matrix with correct view matrix for the viewport
+    const localMvp = mat4.create();
+    const localProj = mat4.create();
+    mat4.perspective(localProj, fov, vpWidth / vpHeight, near, far);
+    const effectiveView = (vp && vp.effectiveViewMatrix) ? vp.effectiveViewMatrix : viewMatrix;
+    mat4.multiply(localMvp, localProj, effectiveView);
+    mat4.multiply(localMvp, localMvp, modelMatrix);
 
     const px = positions[knnSeedCell.cellIndex * 3];
     const py = positions[knnSeedCell.cellIndex * 3 + 1];
     const pz = positions[knnSeedCell.cellIndex * 3 + 2];
 
-    const centerScreen = projectPointToScreen(px, py, pz, mvpMatrix, rect.width, rect.height);
+    const centerScreen = projectPointToScreen(px, py, pz, localMvp, vpWidth, vpHeight);
     if (!centerScreen) return;
+
+    // Offset to correct viewport position in multiview mode
+    const drawX = centerScreen.x + vpOffsetX;
+    const drawY = centerScreen.y + vpOffsetY;
 
     // Draw concentric rings to show degree levels (up to current degree)
     const baseRadius = 20;
@@ -3348,7 +3445,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       const alpha = d === knnCurrentDegree ? 0.7 : 0.15;
 
       lassoCtx.beginPath();
-      lassoCtx.arc(centerScreen.x, centerScreen.y, ringRadius, 0, Math.PI * 2);
+      lassoCtx.arc(drawX, drawY, ringRadius, 0, Math.PI * 2);
 
       if (d === knnCurrentDegree) {
         // Current degree: filled with dashed stroke (like proximity)
@@ -3370,7 +3467,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     // Center point marker
     lassoCtx.setLineDash([]);
     lassoCtx.beginPath();
-    lassoCtx.arc(centerScreen.x, centerScreen.y, 4, 0, Math.PI * 2);
+    lassoCtx.arc(drawX, drawY, 4, 0, Math.PI * 2);
     lassoCtx.fillStyle = 'rgba(17, 24, 39, 0.9)';
     lassoCtx.fill();
 
@@ -3379,9 +3476,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     lassoCtx.textAlign = 'center';
     lassoCtx.textBaseline = 'middle';
     lassoCtx.fillStyle = 'rgba(17, 24, 39, 0.9)';
-    const labelY = centerScreen.y - baseRadius - knnCurrentDegree * ringSpacing - 12;
+    const labelY = drawY - baseRadius - knnCurrentDegree * ringSpacing - 12;
     const degreeLabel = knnCurrentDegree === 0 ? 'seed' : `${knnCurrentDegree}°`;
-    lassoCtx.fillText(degreeLabel, centerScreen.x, labelY);
+    lassoCtx.fillText(degreeLabel, drawX, labelY);
   }
 
   // Clear KNN indicator

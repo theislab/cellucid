@@ -653,28 +653,34 @@ export function colormapViridis(t) {
 
 export const VIRIDIS_CSS_STOPS = getCssStopsForColormap('viridis');
 
-// Color-blind friendly palette mixing Okabe-Ito and Paul Tol tones for academic-looking figures.
+// Vibrant colorblind-friendly palette (PROTAN/DEUTAN safe).
+// Optimized for 3D visualization: high saturation, max adjacent contrast.
+// Sources: Okabe-Ito (boosted), IBM Design, Paul Tol bright.
 export const CATEGORY_PALETTE = [
-  [0.000, 0.447, 0.698],
-  [0.902, 0.624, 0.000],
-  [0.000, 0.620, 0.451],
-  [0.835, 0.369, 0.000],
-  [0.800, 0.475, 0.655],
-  [0.337, 0.706, 0.914],
-  [0.941, 0.894, 0.259],
-  [0.200, 0.133, 0.533],
-  [0.533, 0.800, 0.933],
-  [0.067, 0.467, 0.200],
-  [0.267, 0.667, 0.600],
-  [0.600, 0.600, 0.200],
-  [0.867, 0.800, 0.467],
-  [0.800, 0.400, 0.467],
-  [0.533, 0.133, 0.333],
-  [0.667, 0.267, 0.600],
-  [0.373, 0.620, 0.627],
-  [0.298, 0.298, 0.298],
-  [0.702, 0.702, 0.702],
-  [0.424, 0.357, 0.482]
+  [1.000, 0.600, 0.000],  // #FF9900 - Bright orange
+  [0.000, 0.467, 0.784],  // #0077C8 - Vivid cerulean
+  [0.678, 0.314, 0.878],  // #AD50E0 - Electric violet
+  [1.000, 0.898, 0.000],  // #FFE500 - Bright yellow
+  [0.000, 0.718, 0.514],  // #00B783 - Vibrant teal
+  [0.902, 0.098, 0.467],  // #E61977 - Hot magenta
+  [0.298, 0.686, 0.933],  // #4CAFEE - Sky blue
+  [0.820, 0.373, 0.000],  // #D15F00 - Burnt orange
+  [0.000, 0.620, 0.620],  // #009E9E - Deep cyan
+  [0.490, 0.341, 0.761],  // #7D57C2 - Iris purple
+  [0.980, 0.502, 0.196],  // #FA8032 - Tangerine
+  [0.361, 0.424, 0.820],  // #5C6CD1 - Cornflower
+  [0.000, 0.545, 0.431],  // #008B6E - Sea green
+  [0.867, 0.180, 0.357],  // #DD2E5B - Raspberry
+  [0.455, 0.678, 0.882],  // #74ADE1 - Periwinkle
+  [0.925, 0.694, 0.000],  // #ECB100 - Amber
+  [0.576, 0.224, 0.655],  // #9339A7 - Plum
+  [0.204, 0.592, 0.718],  // #3497B7 - Steel blue
+  [0.796, 0.294, 0.180],  // #CB4B2E - Vermilion
+  [0.439, 0.502, 0.753],  // #7080C0 - Slate violet
+  [0.000, 0.659, 0.569],  // #00A891 - Jade
+  [0.573, 0.580, 0.890],  // #9294E3 - Lavender
+  [0.761, 0.580, 0.067],  // #C29411 - Old gold
+  [0.204, 0.467, 0.537],  // #347789 - Teal blue
 ];
 
 export const COLOR_PICKER_PALETTE = [
