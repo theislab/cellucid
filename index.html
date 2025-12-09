@@ -157,6 +157,42 @@
       <details class="accordion-section" id="session-section" open>
         <summary>Session</summary>
         <div class="accordion-content">
+          <!-- Dataset Selector -->
+          <div class="control-block dataset-selector-block">
+            <div class="section-title">Dataset</div>
+
+            <!-- Demo dataset dropdown -->
+            <div class="control-block" style="margin-top:6px;">
+              <label for="dataset-select">Demo datasets:</label>
+              <select id="dataset-select" class="obs-select">
+                <option value="" disabled selected>Loading...</option>
+              </select>
+            </div>
+
+            <!-- Dataset info display -->
+            <div id="dataset-info" class="dataset-info">
+              <span id="dataset-cells">–</span> cells ·
+              <span id="dataset-genes">–</span> genes
+            </div>
+
+            <!-- User directory selector -->
+            <div class="control-block" id="user-data-block" style="margin-top:10px;">
+              <div class="legend-help">Or load your own data:</div>
+              <div class="user-data-row" style="display:flex; gap:6px; margin-top:6px;">
+                <input type="text" id="user-data-path" class="user-data-path"
+                       placeholder="No directory selected" readonly />
+                <button id="user-data-browse-btn" class="btn-small">Browse...</button>
+                <!-- Hidden file input for cross-browser directory selection -->
+                <input type="file" id="user-data-file-input" webkitdirectory directory multiple
+                       style="display:none;" />
+              </div>
+              <div id="user-data-status" class="legend-help" style="margin-top:4px;"></div>
+            </div>
+          </div>
+
+          <div class="section-divider"></div>
+
+          <!-- Session state save/load -->
           <div class="legend-help">
             Save or load the complete application state including camera, filters, highlights, and all settings.
           </div>

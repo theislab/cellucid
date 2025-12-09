@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "default": "apidip",
+  "datasets": [
+    { "id": "apidip", "path": "apidip/", "name": "Apidip" }
+  ]
+}

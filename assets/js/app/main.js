@@ -14,15 +14,21 @@ import {
   hasEdgeFormat,
   loadEdges
 } from '../data/data-loaders.js';
+import { getDataSourceManager } from '../data/data-source-manager.js';
+import { createLocalUserDirDataSource } from '../data/local-user-source.js';
 import { SyntheticDataGenerator, PerformanceTracker, BenchmarkReporter, formatNumber } from '../dev/benchmark.js';
 
 console.log('=== SCATTERPLOT APP STARTING ===');
 
-const EXPORT_BASE_URL = 'assets/exports/';
-const OBS_MANIFEST_URL = `${EXPORT_BASE_URL}obs_manifest.json`;
-const VAR_MANIFEST_URL = `${EXPORT_BASE_URL}var_manifest.json`;
-const CONNECTIVITY_MANIFEST_URL = `${EXPORT_BASE_URL}connectivity_manifest.json`;
-const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
+// Default export base URL (will be updated by DataSourceManager)
+let EXPORT_BASE_URL = 'assets/exports/';
+
+// Helper to get URLs based on current dataset
+function getObsManifestUrl() { return `${EXPORT_BASE_URL}obs_manifest.json`; }
+function getVarManifestUrl() { return `${EXPORT_BASE_URL}var_manifest.json`; }
+function getConnectivityManifestUrl() { return `${EXPORT_BASE_URL}connectivity_manifest.json`; }
+function getLegacyObsUrl() { return `${EXPORT_BASE_URL}obs_values.json`; }
+function getPointsUrl() { return `${EXPORT_BASE_URL}points.bin`; }
 
 (async function bootstrap() {
   const canvas = document.getElementById('glcanvas');
@@ -136,6 +142,17 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
   const loadStateBtn = document.getElementById('load-state-btn');
   const sessionStatus = document.getElementById('session-status');
 
+  // Dataset selector controls
+  const datasetSelect = document.getElementById('dataset-select');
+  const datasetInfo = document.getElementById('dataset-info');
+  const datasetCellsEl = document.getElementById('dataset-cells');
+  const datasetGenesEl = document.getElementById('dataset-genes');
+  const userDataBlock = document.getElementById('user-data-block');
+  const userDataPath = document.getElementById('user-data-path');
+  const userDataBrowseBtn = document.getElementById('user-data-browse-btn');
+  const userDataFileInput = document.getElementById('user-data-file-input');
+  const userDataStatus = document.getElementById('user-data-status');
+
   try {
     console.log('[Main] Creating viewer...');
     const viewer = createViewer({ canvas, labelLayer, viewTitleLayer, sidebar });
@@ -147,18 +164,51 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
     
     statsEl.textContent = 'Loading positions…';
 
-    const positionsPromise = loadPointsBinary(`${EXPORT_BASE_URL}points.bin`);
+    // Initialize DataSourceManager
+    const dataSourceManager = getDataSourceManager();
+
+    // Always register user directory source (works in all browsers via file input fallback)
+    const userSource = createLocalUserDirDataSource();
+    dataSourceManager.registerSource('local-user', userSource);
+
+    // Initialize with default sources
+    await dataSourceManager.initialize();
+
+    // Check URL parameters for dataset selection
+    const urlParams = new URLSearchParams(window.location.search);
+    const requestedDataset = urlParams.get('dataset');
+    const requestedSource = urlParams.get('source') || 'local-demo';
+
+    if (requestedDataset && requestedSource === 'local-demo') {
+      // Try to switch to the requested dataset
+      try {
+        const demoSource = dataSourceManager.getSource('local-demo');
+        if (demoSource && await demoSource.hasDataset(requestedDataset)) {
+          await dataSourceManager.switchToDataset('local-demo', requestedDataset);
+          console.log(`[Main] Loaded dataset from URL param: ${requestedDataset}`);
+        } else {
+          console.warn(`[Main] Requested dataset '${requestedDataset}' not found, using default`);
+        }
+      } catch (err) {
+        console.warn(`[Main] Failed to load requested dataset '${requestedDataset}':`, err);
+      }
+    }
+
+    EXPORT_BASE_URL = dataSourceManager.getCurrentBaseUrl() || EXPORT_BASE_URL;
+    console.log(`[Main] Using dataset base URL: ${EXPORT_BASE_URL}`);
+
+    const positionsPromise = loadPointsBinary(getPointsUrl());
 
     let obs = null;
     try {
-      obs = await loadObsManifest(OBS_MANIFEST_URL);
-      state.setFieldLoader((field) => loadObsFieldData(OBS_MANIFEST_URL, field));
+      obs = await loadObsManifest(getObsManifestUrl());
+      state.setFieldLoader((field) => loadObsFieldData(getObsManifestUrl(), field));
       statsEl.textContent = 'Loaded obs manifest (lazy-loading fields)…';
     } catch (err) {
       if (err?.status === 404) {
         console.warn('obs_manifest.json not found, falling back to obs_values.json');
         try {
-          obs = await loadObsJson(LEGACY_OBS_URL);
+          obs = await loadObsJson(getLegacyObsUrl());
           statsEl.textContent = 'Loaded legacy obs JSON (full payload).';
         } catch (err2) {
           console.warn('obs_values.json also not found, using empty obs');
@@ -171,8 +221,8 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
 
     // Try to load var manifest for gene expression
     try {
-      const varManifest = await loadVarManifest(VAR_MANIFEST_URL);
-      state.setVarFieldLoader((field) => loadVarFieldData(VAR_MANIFEST_URL, field));
+      const varManifest = await loadVarManifest(getVarManifestUrl());
+      state.setVarFieldLoader((field) => loadVarFieldData(getVarManifestUrl(), field));
       state.initVarData(varManifest);
       console.log(`Loaded var manifest with ${varManifest?.fields?.length || 0} genes.`);
     } catch (err) {
@@ -186,7 +236,7 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
     // Try to load connectivity manifest for KNN edges
     let connectivityManifest = null;
     try {
-      connectivityManifest = await loadConnectivityManifest(CONNECTIVITY_MANIFEST_URL);
+      connectivityManifest = await loadConnectivityManifest(getConnectivityManifestUrl());
       console.log(`Loaded connectivity manifest with ${connectivityManifest?.n_edges?.toLocaleString() || 0} edges.`);
     } catch (err) {
       if (err?.status === 404) {
@@ -311,12 +361,23 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
         splitViewBoxTitle,
         saveStateBtn,
         loadStateBtn,
-        sessionStatus
+        sessionStatus,
+        // Dataset selector
+        datasetSelect,
+        datasetInfo,
+        datasetCellsEl,
+        datasetGenesEl,
+        userDataBlock,
+        userDataPath,
+        userDataBrowseBtn,
+        userDataFileInput,
+        userDataStatus
       },
       smoke: {
         rebuildSmokeDensity
       },
-      stateSerializer: stateSerializer
+      stateSerializer: stateSerializer,
+      dataSourceManager: dataSourceManager
     });
 
     await ui.activateField(-1);
@@ -692,7 +753,7 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
               }
 
               console.log('[Main] Loading GPU-optimized edges...');
-              const edgeData = await loadEdges(CONNECTIVITY_MANIFEST_URL, connectivityManifest);
+              const edgeData = await loadEdges(getConnectivityManifestUrl(), connectivityManifest);
 
               // Shuffle edges for truly random sampling when using MAX EDGES slider
               // This ensures "first N edges" gives a representative random sample
@@ -895,7 +956,7 @@ const LEGACY_OBS_URL = `${EXPORT_BASE_URL}obs_values.json`;
           // Otherwise, load edges first
           try {
             console.log('[Main] Loading edges for KNN mode...');
-            const edgeData = await loadEdges(CONNECTIVITY_MANIFEST_URL, connectivityManifest);
+            const edgeData = await loadEdges(getConnectivityManifestUrl(), connectivityManifest);
 
             // Shuffle for random sampling (if not already done)
             shuffleEdges(edgeData.sources, edgeData.destinations);

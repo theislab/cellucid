@@ -1,5 +1,79 @@
 // Fetch helpers for loading binary positions and obs payloads (manifest + per-field data).
 // Supports quantized data with transparent dequantization and gzip-compressed files.
+// Supports custom protocols (local-user://, future: remote://, jupyter://) via DataSourceManager.
+
+import { getDataSourceManager } from './data-source-manager.js';
+import { isLocalUserUrl, resolveUrl } from './data-source.js';
+
+// ============================================================================
+// UNIFIED URL RESOLUTION (delegates to DataSourceManager)
+// ============================================================================
+
+/**
+ * Resolve any URL (including custom protocols) to a fetchable URL.
+ * Delegates to DataSourceManager for all protocol handling.
+ * @param {string} url - URL to resolve (may be local-user://, remote://, jupyter://, etc.)
+ * @returns {Promise<string>} Standard fetchable URL (http://, https://, blob://, data://)
+ */
+async function resolveAnyUrl(url) {
+  return getDataSourceManager().resolveUrl(url);
+}
+
+/**
+ * Fetch binary data with automatic custom protocol handling and gzip decompression
+ * @param {string} url - URL to fetch (may use custom protocol)
+ * @returns {Promise<ArrayBuffer>}
+ */
+async function fetchBinaryWithProtocol(url) {
+  const resolvedUrl = await resolveAnyUrl(url);
+  const response = await fetch(resolvedUrl);
+
+  if (!response.ok) {
+    throw new Error(`Failed to load: ${url}`);
+  }
+
+  const isGzipped = url.endsWith('.gz');
+
+  if (isGzipped && typeof DecompressionStream !== 'undefined') {
+    const ds = new DecompressionStream('gzip');
+    const decompressedStream = response.body.pipeThrough(ds);
+    const decompressedResponse = new Response(decompressedStream);
+    return decompressedResponse.arrayBuffer();
+  } else if (isGzipped && typeof pako !== 'undefined') {
+    const compressedBuffer = await response.arrayBuffer();
+    const decompressed = pako.inflate(new Uint8Array(compressedBuffer));
+    return decompressed.buffer;
+  } else if (isGzipped) {
+    throw new Error('Gzip decompression not supported. Use a modern browser or include pako library.');
+  }
+
+  return response.arrayBuffer();
+}
+
+/**
+ * Fetch JSON with automatic custom protocol handling
+ * @param {string} url - URL to fetch (may use custom protocol)
+ * @returns {Promise<any>}
+ */
+async function fetchJsonWithProtocol(url) {
+  const resolvedUrl = await resolveAnyUrl(url);
+  const response = await fetch(resolvedUrl);
+
+  if (!response.ok) {
+    throw new Error(`Failed to load: ${url}`);
+  }
+
+  return response.json();
+}
+
+// Legacy compatibility aliases (used in existing code)
+const getLocalUserFileUrl = async (url) => resolveAnyUrl(url);
+const fetchLocalUserBinary = fetchBinaryWithProtocol;
+const fetchLocalUserJson = fetchJsonWithProtocol;
+
+// ============================================================================
+// BROWSER CAPABILITY CHECK
+// ============================================================================
 
 // Check browser capabilities at startup
 const HAS_DECOMPRESSION_STREAM = typeof DecompressionStream !== 'undefined';
@@ -65,16 +139,20 @@ function dequantize(quantized, minValue, maxValue, bits) {
   return result;
 }
 
-function resolveUrl(base, relative) {
-  try {
-    const baseUrl = base ? new URL(base, window.location.href) : new URL(window.location.href);
-    return new URL(relative, baseUrl).toString();
-  } catch (_err) {
-    return relative;
-  }
-}
 
 async function fetchOk(url) {
+  // Handle local-user:// URLs
+  if (isLocalUserUrl(url)) {
+    const objectUrl = await getLocalUserFileUrl(url);
+    const response = await fetch(objectUrl);
+    if (!response.ok) {
+      const err = new Error('Failed to load local file ' + url + ': ' + response.statusText);
+      err.status = response.status;
+      throw err;
+    }
+    return response;
+  }
+
   const response = await fetch(url);
   if (!response.ok) {
     const err = new Error('Failed to load ' + url + ': ' + response.statusText);
@@ -87,16 +165,22 @@ async function fetchOk(url) {
 /**
  * Fetch binary data, automatically decompressing gzip if URL ends with .gz
  * Uses native DecompressionStream API (modern browsers).
- * 
+ * Supports local-user:// protocol for user directories.
+ *
  * @param {string} url - URL to fetch
- * @returns {ArrayBuffer} Decompressed binary data
+ * @returns {Promise<ArrayBuffer>} Decompressed binary data
  */
 async function fetchBinary(url) {
+  // Handle local-user:// URLs with dedicated handler
+  if (isLocalUserUrl(url)) {
+    return fetchLocalUserBinary(url);
+  }
+
   const response = await fetchOk(url);
-  
+
   // Check if this is a gzipped file by URL extension
   const isGzipped = url.endsWith('.gz');
-  
+
   if (isGzipped && typeof DecompressionStream !== 'undefined') {
     // Use native DecompressionStream API for decompression
     try {
@@ -120,7 +204,7 @@ async function fetchBinary(url) {
       throw new Error('Gzip decompression not supported in this browser. Regenerate data with compression=None');
     }
   }
-  
+
   // Not gzipped, return as-is
   return response.arrayBuffer();
 }
@@ -128,6 +212,7 @@ async function fetchBinary(url) {
 /**
  * Load points binary, trying .gz version first if the URL doesn't already end in .gz
  * This handles both compressed and uncompressed data transparently.
+ * Supports local-user:// protocol for user directories.
  */
 export async function loadPointsBinary(url) {
   // If URL already ends with .gz, just fetch it directly
@@ -135,8 +220,24 @@ export async function loadPointsBinary(url) {
     const arrayBuffer = await fetchBinary(url);
     return new Float32Array(arrayBuffer);
   }
-  
-  // Try .gz version first
+
+  // For local-user:// URLs, check if .gz version exists in the file list
+  if (isLocalUserUrl(url)) {
+    const gzUrl = url + '.gz';
+    try {
+      // Try to get the .gz file URL - this will throw if file doesn't exist
+      const arrayBuffer = await fetchLocalUserBinary(gzUrl);
+      console.log('Found compressed points file:', gzUrl);
+      return new Float32Array(arrayBuffer);
+    } catch (_e) {
+      // .gz version doesn't exist, try uncompressed
+      console.log('Loading uncompressed points file:', url);
+      const arrayBuffer = await fetchLocalUserBinary(url);
+      return new Float32Array(arrayBuffer);
+    }
+  }
+
+  // For regular URLs, try .gz version first via HTTP
   const gzUrl = url + '.gz';
   try {
     const response = await fetch(gzUrl);
@@ -160,7 +261,7 @@ export async function loadPointsBinary(url) {
   } catch (e) {
     console.log('Compressed file not available or failed:', e.message || e);
   }
-  
+
   // Fall back to original URL (non-gzipped)
   console.log('Loading uncompressed points file:', url);
   const arrayBuffer = await fetchBinary(url);
@@ -179,8 +280,10 @@ function safeFilenameComponent(name) {
 /**
  * Expand compact var manifest to original verbose format.
  * Compact format uses _varSchema + field tuples [key, minValue, maxValue].
+ * @param {Object} manifest - Raw manifest (possibly compact)
+ * @returns {Object} Expanded manifest with fields array
  */
-function expandVarManifest(manifest) {
+export function expandVarManifest(manifest) {
   if (manifest._format !== 'compact_v1' || !manifest._varSchema) {
     return manifest; // Already in original format
   }
@@ -223,8 +326,10 @@ function expandVarManifest(manifest) {
 /**
  * Expand compact obs manifest to original verbose format.
  * Compact format uses _obsSchemas + _continuousFields + _categoricalFields.
+ * @param {Object} manifest - Raw manifest (possibly compact)
+ * @returns {Object} Expanded manifest with fields array
  */
-function expandObsManifest(manifest) {
+export function expandObsManifest(manifest) {
   if (manifest._format !== 'compact_v1' || !manifest._obsSchemas) {
     return manifest; // Already in original format
   }
@@ -308,6 +413,12 @@ function expandObsManifest(manifest) {
 }
 
 export async function loadObsManifest(url) {
+  // Handle local-user:// URLs
+  if (isLocalUserUrl(url)) {
+    const manifest = await fetchLocalUserJson(url);
+    return expandObsManifest(manifest);
+  }
+
   const response = await fetchOk(url);
   const manifest = await response.json();
   return expandObsManifest(manifest);
@@ -391,6 +502,12 @@ export async function loadObsFieldData(manifestUrl, field) {
 
 // Var/gene expression manifest loader
 export async function loadVarManifest(url) {
+  // Handle local-user:// URLs
+  if (isLocalUserUrl(url)) {
+    const manifest = await fetchLocalUserJson(url);
+    return expandVarManifest(manifest);
+  }
+
   const response = await fetchOk(url);
   const manifest = await response.json();
   return expandVarManifest(manifest);
@@ -429,6 +546,11 @@ export async function loadVarFieldData(manifestUrl, field) {
 
 // Legacy loader kept for backward compatibility (single large JSON payload).
 export async function loadObsJson(url) {
+  // Handle local-user:// URLs
+  if (isLocalUserUrl(url)) {
+    return fetchLocalUserJson(url);
+  }
+
   const response = await fetchOk(url);
   return response.json();
 }
@@ -448,6 +570,11 @@ export async function loadObsJson(url) {
  * @returns {Promise<Object>} Connectivity manifest
  */
 export async function loadConnectivityManifest(url) {
+  // Handle local-user:// URLs
+  if (isLocalUserUrl(url)) {
+    return fetchLocalUserJson(url);
+  }
+
   const response = await fetchOk(url);
   return response.json();
 }

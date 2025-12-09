@@ -13,6 +13,7 @@
  */
 
 import { HighPerfRenderer, RendererConfig, Octree } from '../rendering/high-perf-renderer.js';
+import { formatCellCount as formatNumber } from '../data/data-source.js';
 
 /**
  * Benchmark configuration for high-performance renderer tests
@@ -2601,12 +2602,8 @@ export function formatBytes(bytes) {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
-// Format numbers nicely
-export function formatNumber(n) {
-  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
-  if (n >= 1000) return (n / 1000).toFixed(0) + 'K';
-  return n.toString();
-}
+// Re-export formatNumber for backward compatibility (imported at top of file)
+export { formatNumber };
 
 // Export for global access
 if (typeof window !== 'undefined') {

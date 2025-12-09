@@ -1930,3 +1930,119 @@ html, body {
   font-size: 10px;
   color: #374151;
 }
+
+/* ========================================================================
+   Dataset Selector Styles
+   ===================================================================== */
+
+.dataset-selector-block {
+  padding-bottom: 8px;
+}
+
+.dataset-info {
+  font-size: 11px;
+  color: var(--viewer-ink-muted);
+  margin-top: 6px;
+  padding: 6px 10px;
+  background: #f8f9fa;
+  border: 1px solid #e5e7eb;
+  border-radius: 3px;
+  font-family: "Fira Code", monospace;
+}
+
+.dataset-info.loading {
+  color: var(--viewer-ink-soft);
+  font-style: italic;
+}
+
+.dataset-info.error {
+  color: #dc2626;
+  background: #fef2f2;
+  border-color: #fecaca;
+}
+
+.user-data-row {
+  display: flex;
+  gap: 6px;
+  align-items: stretch;
+}
+
+.user-data-path {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 10px;
+  font-size: 11px;
+  font-family: "Fira Code", monospace;
+  background: #f8f9fa;
+  border: 1px solid #d4d4d4;
+  border-radius: 3px;
+  color: var(--viewer-ink-soft);
+  cursor: default;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.user-data-path:focus {
+  outline: none;
+  border-color: var(--viewer-accent);
+}
+
+.user-data-path.active {
+  background: #f0f9ff;
+  border-color: #0ea5e9;
+  color: var(--viewer-ink);
+}
+
+#user-data-browse-btn {
+  flex-shrink: 0;
+  padding: 6px 12px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+#user-data-status {
+  font-size: 10px;
+  min-height: 14px;
+}
+
+#user-data-status.error {
+  color: #dc2626;
+}
+
+#user-data-status.success {
+  color: #16a34a;
+}
+
+#user-data-status.loading {
+  color: var(--viewer-ink-soft);
+  font-style: italic;
+}
+
+/* Style user data block if File System Access API is not supported */
+#user-data-block.unsupported {
+  opacity: 0.5;
+}
+
+#user-data-block.unsupported .user-data-path {
+  font-style: italic;
+}
+
+#user-data-block.unsupported #user-data-browse-btn {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+/* Dataset select dropdown enhancements */
+#dataset-select {
+  width: 100%;
+}
+
+#dataset-select option {
+  padding: 4px 8px;
+}
+
+#dataset-select option:disabled {
+  color: var(--viewer-ink-muted);
+  font-style: italic;
+}

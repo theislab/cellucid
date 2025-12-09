@@ -1,5 +1,9 @@
 // UI wiring: binds DOM controls to state/viewer, renders legends and filter summaries.
-export function initUI({ state, viewer, dom, smoke }) {
+import { formatCellCount as formatDataNumber } from '../data/data-source.js';
+
+export function initUI({ state, viewer, dom, smoke, dataSourceManager }) {
+  console.log('[UI] initUI called with dataSourceManager:', !!dataSourceManager);
+
   const {
     statsEl,
     categoricalFieldSelect,
@@ -90,7 +94,17 @@ export function initUI({ state, viewer, dom, smoke }) {
     // Session save/load
     saveStateBtn,
     loadStateBtn,
-    sessionStatus
+    sessionStatus,
+    // Dataset selector
+    datasetSelect,
+    datasetInfo,
+    datasetCellsEl,
+    datasetGenesEl,
+    userDataBlock,
+    userDataPath,
+    userDataBrowseBtn,
+    userDataFileInput,
+    userDataStatus
   } = dom;
 
   const rebuildSmokeDensity = smoke?.rebuildSmokeDensity || null;
@@ -4321,6 +4335,286 @@ export function initUI({ state, viewer, dom, smoke }) {
         console.error('Failed to load state:', err);
         showSessionStatus(err?.message || 'Failed to load state', true);
       }
+    });
+  }
+
+  // =========================================================================
+  // Dataset Selector
+  // =========================================================================
+
+  /**
+   * Update the dataset info display
+   * @param {Object|null} metadata - Dataset metadata
+   */
+  function updateDatasetInfo(metadata) {
+    if (!datasetInfo || !datasetCellsEl || !datasetGenesEl) return;
+
+    if (!metadata) {
+      datasetCellsEl.textContent = '–';
+      datasetGenesEl.textContent = '–';
+      datasetInfo.classList.remove('loading', 'error');
+      return;
+    }
+
+    const stats = metadata.stats || {};
+    datasetCellsEl.textContent = formatDataNumber(stats.n_cells);
+    datasetGenesEl.textContent = formatDataNumber(stats.n_genes);
+    datasetInfo.classList.remove('loading', 'error');
+  }
+
+  /**
+   * Populate the dataset dropdown with available datasets from all sources
+   */
+  async function populateDatasetDropdown() {
+    console.log('[UI] populateDatasetDropdown called', { datasetSelect, dataSourceManager });
+
+    if (!datasetSelect) {
+      console.warn('[UI] Dataset select element not found');
+      return;
+    }
+    if (!dataSourceManager) {
+      console.warn('[UI] DataSourceManager not provided');
+      datasetSelect.innerHTML = '<option value="" disabled>Manager not available</option>';
+      return;
+    }
+
+    datasetSelect.innerHTML = '<option value="" disabled>Loading...</option>';
+
+    try {
+      console.log('[UI] Calling getAllDatasets...');
+
+      // Add timeout to detect hanging
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('Timeout: getAllDatasets took more than 10s')), 10000)
+      );
+
+      // Get datasets from all sources (with timeout)
+      const allSourceDatasets = await Promise.race([
+        dataSourceManager.getAllDatasets(),
+        timeoutPromise
+      ]);
+
+      console.log('[UI] getAllDatasets returned:', allSourceDatasets);
+
+      // Flatten and collect all datasets with their source type
+      const allDatasets = [];
+      for (const { sourceType, datasets } of allSourceDatasets) {
+        for (const dataset of datasets) {
+          allDatasets.push({ ...dataset, sourceType });
+        }
+      }
+
+      if (allDatasets.length === 0) {
+        datasetSelect.innerHTML = '<option value="" disabled>No datasets found</option>';
+        return;
+      }
+
+      datasetSelect.innerHTML = '';
+
+      // Group by source type if there are multiple sources with data
+      const sourcesWithData = allSourceDatasets.filter(s => s.datasets.length > 0);
+      const useGroups = sourcesWithData.length > 1;
+
+      if (useGroups) {
+        // Create optgroups for each source
+        for (const { sourceType, datasets } of sourcesWithData) {
+          const group = document.createElement('optgroup');
+          group.label = sourceType === 'local-demo' ? 'Demo Datasets' :
+                        sourceType === 'local-user' ? 'Your Data' :
+                        sourceType;
+
+          for (const dataset of datasets) {
+            const option = document.createElement('option');
+            option.value = dataset.id;
+            option.dataset.sourceType = sourceType;
+            const cellCount = dataset.stats?.n_cells ? ` (${formatDataNumber(dataset.stats.n_cells)} cells)` : '';
+            option.textContent = `${dataset.name}${cellCount}`;
+            group.appendChild(option);
+          }
+
+          datasetSelect.appendChild(group);
+        }
+      } else {
+        // Simple flat list
+        for (const dataset of allDatasets) {
+          const option = document.createElement('option');
+          option.value = dataset.id;
+          option.dataset.sourceType = dataset.sourceType;
+          const cellCount = dataset.stats?.n_cells ? ` (${formatDataNumber(dataset.stats.n_cells)} cells)` : '';
+          option.textContent = `${dataset.name}${cellCount}`;
+          datasetSelect.appendChild(option);
+        }
+      }
+
+      // Select the current dataset if any
+      const currentId = dataSourceManager.getCurrentDatasetId();
+      if (currentId) {
+        datasetSelect.value = currentId;
+        updateDatasetInfo(dataSourceManager.getCurrentMetadata());
+      }
+    } catch (err) {
+      console.error('[UI] Failed to populate dataset dropdown:', err);
+      datasetSelect.innerHTML = '<option value="" disabled>Error loading datasets</option>';
+    }
+  }
+
+  /**
+   * Handle dataset selection change - reloads page with new dataset
+   * @param {string} datasetId - The selected dataset ID
+   * @param {string} [sourceType='local-demo'] - The source type for the dataset
+   */
+  async function handleDatasetChange(datasetId, sourceType = 'local-demo') {
+    if (!dataSourceManager || !datasetId) return;
+
+    // Check if this is already the current dataset
+    const currentId = dataSourceManager.getCurrentDatasetId();
+    const currentSourceType = dataSourceManager.getCurrentSourceType();
+    if (currentId === datasetId && currentSourceType === sourceType) {
+      return; // No change needed
+    }
+
+    // User-loaded datasets can't be restored via URL (browser security)
+    if (sourceType === 'local-user') {
+      showSessionStatus('User data requires re-selection after page reload', true);
+      return;
+    }
+
+    try {
+      if (datasetInfo) {
+        datasetInfo.classList.add('loading');
+        datasetCellsEl.textContent = '...';
+        datasetGenesEl.textContent = '...';
+      }
+
+      showSessionStatus('Switching dataset...', false);
+
+      // Store the selected dataset in URL and reload
+      // This ensures all data is properly reloaded with the new dataset
+      const url = new URL(window.location.href);
+      url.searchParams.set('dataset', datasetId);
+      if (sourceType !== 'local-demo') {
+        url.searchParams.set('source', sourceType);
+      } else {
+        url.searchParams.delete('source');
+      }
+
+      // Small delay to show the status message before reload
+      setTimeout(() => {
+        window.location.href = url.toString();
+      }, 100);
+
+    } catch (err) {
+      console.error('[UI] Failed to switch dataset:', err);
+      if (datasetInfo) datasetInfo.classList.add('error');
+      showSessionStatus(`Failed to switch dataset: ${err.message}`, true);
+    }
+  }
+
+  // Initialize dataset selector
+  console.log('[UI] Dataset selector initialization:', {
+    datasetSelect: !!datasetSelect,
+    dataSourceManager: !!dataSourceManager,
+    datasetInfo: !!datasetInfo,
+    userDataBlock: !!userDataBlock,
+    userDataPath: !!userDataPath,
+    userDataBrowseBtn: !!userDataBrowseBtn
+  });
+
+  if (datasetSelect && dataSourceManager) {
+    // Populate dropdown
+    populateDatasetDropdown();
+
+    // Handle selection changes
+    datasetSelect.addEventListener('change', (e) => {
+      const selectedOption = e.target.selectedOptions[0];
+      const sourceType = selectedOption?.dataset?.sourceType || 'local-demo';
+      handleDatasetChange(e.target.value, sourceType);
+    });
+  } else {
+    console.warn('[UI] Dataset selector not initialized - missing elements:', {
+      datasetSelect: datasetSelect,
+      dataSourceManager: dataSourceManager
+    });
+  }
+
+  // Initialize user data directory picker (works in all browsers via webkitdirectory)
+  console.log('[UI] User data block initialization');
+
+  // Handle file input change
+  if (userDataFileInput && dataSourceManager) {
+    userDataFileInput.addEventListener('change', async (e) => {
+      const files = e.target.files;
+      if (!files || files.length === 0) return;
+
+      const userSource = dataSourceManager.getSource('local-user');
+      if (!userSource) {
+        showSessionStatus('User data source not available', true);
+        return;
+      }
+
+      try {
+        if (userDataStatus) {
+          userDataStatus.textContent = 'Loading files...';
+          userDataStatus.className = 'legend-help loading';
+        }
+
+        const metadata = await userSource.loadFromFileList(files);
+
+        // Update UI with loaded data
+        if (userDataPath) {
+          userDataPath.value = userSource.getPath() || 'Selected';
+          userDataPath.classList.add('active');
+        }
+
+        if (userDataStatus) {
+          userDataStatus.textContent = `Loaded: ${formatDataNumber(metadata.stats?.n_cells)} cells`;
+          userDataStatus.className = 'legend-help success';
+        }
+
+        updateDatasetInfo(metadata);
+
+        // Deselect demo dataset dropdown
+        if (datasetSelect) {
+          datasetSelect.value = '';
+        }
+
+        // Switch to the user data source
+        try {
+          await dataSourceManager.switchToDataset('local-user', userSource.datasetId);
+          showSessionStatus(`User data ready: ${formatDataNumber(metadata.stats?.n_cells)} cells. Refresh page to visualize.`, false);
+
+          // Note: Browser security prevents auto-reload from preserving file handles.
+          // The user must manually refresh while the data is still in memory,
+          // or use the prepare_data.py workflow to create permanent exports.
+          console.log('[UI] User data loaded and source switched. Page refresh will use cached files.');
+        } catch (switchErr) {
+          console.warn('[UI] Could not auto-switch to user source:', switchErr);
+          showSessionStatus('User data validated. Select "Load" to apply.', false);
+        }
+
+      } catch (err) {
+        console.error('[UI] Failed to load user directory:', err);
+
+        if (userDataPath) {
+          userDataPath.value = '';
+          userDataPath.classList.remove('active');
+        }
+
+        if (userDataStatus) {
+          userDataStatus.textContent = err.getUserMessage?.() || err.message || 'Failed to load';
+          userDataStatus.className = 'legend-help error';
+        }
+      }
+
+      // Reset the input so the same folder can be selected again
+      userDataFileInput.value = '';
+    });
+  }
+
+  // Browse button triggers the hidden file input
+  if (userDataBrowseBtn && userDataFileInput) {
+    userDataBrowseBtn.addEventListener('click', () => {
+      userDataFileInput.click();
     });
   }
 

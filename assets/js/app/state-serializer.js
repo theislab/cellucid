@@ -8,9 +8,11 @@
  * - Field filter states
  * - Active field selections
  * - Multiview/snapshot configurations
+ * - Data source and dataset information
  */
 
 import { getCategoryColor } from '../data/palettes.js';
+import { getDataSourceManager } from '../data/data-source-manager.js';
 
 /**
  * Compare two RGB colors for equality within a small epsilon
@@ -406,9 +408,15 @@ export function createStateSerializer({ state, viewer, sidebar }) {
   function serialize() {
     const activePageId = state.getActivePageId ? state.getActivePageId() : state.activePageId;
     const activePageName = state.getActivePage ? state.getActivePage()?.name : null;
+
+    // Get data source state
+    const dataSourceManager = getDataSourceManager();
+    const dataSource = dataSourceManager?.getStateSnapshot() || null;
+
     return {
       version: VERSION,
       timestamp: new Date().toISOString(),
+      dataSource,
       camera: viewer.getCameraState?.() || null,
       uiControls: collectUIControls(),
       highlightPages: serializeHighlightPages(),
@@ -980,6 +988,26 @@ export function createStateSerializer({ state, viewer, sidebar }) {
     // Version check
     if (snapshot.version && snapshot.version > VERSION) {
       console.warn(`State snapshot version ${snapshot.version} is newer than supported ${VERSION}`);
+    }
+
+    // Check data source compatibility
+    if (snapshot.dataSource) {
+      const dataSourceManager = getDataSourceManager();
+      const currentSource = dataSourceManager?.getStateSnapshot();
+
+      if (currentSource?.sourceType !== snapshot.dataSource.sourceType ||
+          currentSource?.datasetId !== snapshot.dataSource.datasetId) {
+        console.warn(
+          `[StateSerializer] State was saved with dataset '${snapshot.dataSource.datasetId}' ` +
+          `(${snapshot.dataSource.sourceType}) but current dataset is '${currentSource?.datasetId}' ` +
+          `(${currentSource?.sourceType}). Some state may not restore correctly.`
+        );
+
+        // If user path is stored, log it for reference
+        if (snapshot.dataSource.userPath) {
+          console.log(`[StateSerializer] Original user data path: ${snapshot.dataSource.userPath}`);
+        }
+      }
     }
 
     const controls = snapshot.uiControls || {};
