@@ -222,6 +222,46 @@ export class DataSourceManager {
   }
 
   /**
+   * Clear the active dataset selection (no dataset loaded)
+   * @param {Object} [options]
+   * @param {boolean} [options.silent=false] - Don't notify listeners
+   */
+  clearActiveDataset(options = {}) {
+    const { silent = false } = options;
+
+    if (!this.activeSource && !this.activeDatasetId) {
+      return;
+    }
+
+    const previousSource = this.activeSource;
+    const previousSourceType = previousSource?.getType?.() || null;
+    const previousDatasetId = this.activeDatasetId;
+
+    if (previousSource && typeof previousSource.onDeactivate === 'function') {
+      try {
+        previousSource.onDeactivate();
+      } catch (err) {
+        console.warn('[DataSourceManager] Error in source onDeactivate during clear:', err);
+      }
+    }
+
+    this.activeSource = null;
+    this.activeDatasetId = null;
+    this.activeDatasetMetadata = null;
+
+    if (!silent) {
+      this._notifyDatasetChange({
+        sourceType: null,
+        datasetId: null,
+        metadata: null,
+        baseUrl: null,
+        previousSourceType,
+        previousDatasetId
+      });
+    }
+  }
+
+  /**
    * Get the base URL for the current dataset
    * @returns {string|null}
    */

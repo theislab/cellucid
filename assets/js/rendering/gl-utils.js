@@ -76,6 +76,12 @@ export function resizeCanvasToDisplaySize(canvas) {
 }
 
 export function normalizePositions(positions) {
+  if (!positions || positions.length === 0) {
+    return {
+      center: [0, 0, 0],
+      scale: 1
+    };
+  }
   const n = positions.length / 3;
   let minX = Infinity, minY = Infinity, minZ = Infinity;
   let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;

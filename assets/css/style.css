@@ -1932,21 +1932,17 @@ html, body {
 }
 
 /* ========================================================================
-   Dataset Selector Styles
+   Dataset & Session Styles
    ===================================================================== */
-
-.dataset-selector-block {
-  padding-bottom: 8px;
-}
 
 .dataset-info {
   font-size: 11px;
   color: var(--viewer-ink-muted);
   margin-top: 6px;
-  padding: 6px 10px;
-  background: #f8f9fa;
-  border: 1px solid #e5e7eb;
-  border-radius: 3px;
+  padding: 8px 10px;
+  background: #f9fafb;
+  border: 1px dashed #111827;
+  border-radius: 0;
   font-family: "Fira Code", monospace;
 }
 
@@ -1958,46 +1954,84 @@ html, body {
 .dataset-info.error {
   color: #dc2626;
   background: #fef2f2;
-  border-color: #fecaca;
+  border-color: #dc2626;
+}
+
+.dataset-info-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 0;
+  border-bottom: 1px solid #eceff3;
+}
+
+.dataset-info-row:last-child {
+  border-bottom: none;
+}
+
+.dataset-info-label {
+  flex: 0 0 82px;
+  text-transform: uppercase;
+  font-size: 10px;
+  color: #6b7280;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.dataset-info-value {
+  flex: 1 1 auto;
+  text-align: right;
+  color: #111827;
+  font-size: 10px;
+  letter-spacing: -0.01em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dataset-info-ellipsis {
+  max-width: 180px;
 }
 
 .user-data-row {
   display: flex;
   gap: 6px;
   align-items: stretch;
+  margin-top: 6px;
 }
 
 .user-data-path {
   flex: 1;
   min-width: 0;
-  padding: 6px 10px;
-  font-size: 11px;
+  padding: 5px 8px;
+  font-size: 10px;
   font-family: "Fira Code", monospace;
-  background: #f8f9fa;
-  border: 1px solid #d4d4d4;
-  border-radius: 3px;
+  background: #ffffff;
+  border: 1px solid #111827;
+  border-radius: 0;
   color: var(--viewer-ink-soft);
   cursor: default;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.08);
 }
 
 .user-data-path:focus {
-  outline: none;
-  border-color: var(--viewer-accent);
+  outline: 2px solid #111827;
+  outline-offset: 1px;
+  box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.15);
 }
 
 .user-data-path.active {
-  background: #f0f9ff;
-  border-color: #0ea5e9;
+  background: #ffffff;
+  border-color: #111827;
   color: var(--viewer-ink);
 }
 
 #user-data-browse-btn {
   flex-shrink: 0;
-  padding: 6px 12px;
-  font-size: 11px;
   white-space: nowrap;
 }
 

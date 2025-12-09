@@ -145,13 +145,20 @@ function getPointsUrl() { return `${EXPORT_BASE_URL}points.bin`; }
   // Dataset selector controls
   const datasetSelect = document.getElementById('dataset-select');
   const datasetInfo = document.getElementById('dataset-info');
+  const datasetNameEl = document.getElementById('dataset-name');
+  const datasetSourceEl = document.getElementById('dataset-source');
+  const datasetDescriptionEl = document.getElementById('dataset-description');
+  const datasetUrlEl = document.getElementById('dataset-url');
   const datasetCellsEl = document.getElementById('dataset-cells');
   const datasetGenesEl = document.getElementById('dataset-genes');
+  const datasetObsEl = document.getElementById('dataset-obs');
+  const datasetConnectivityEl = document.getElementById('dataset-connectivity');
   const userDataBlock = document.getElementById('user-data-block');
   const userDataPath = document.getElementById('user-data-path');
   const userDataBrowseBtn = document.getElementById('user-data-browse-btn');
   const userDataFileInput = document.getElementById('user-data-file-input');
   const userDataStatus = document.getElementById('user-data-status');
+  let ui = null;
 
   try {
     console.log('[Main] Creating viewer...');
@@ -246,6 +253,121 @@ function getPointsUrl() { return `${EXPORT_BASE_URL}points.bin`; }
       }
     }
 
+    // In-place dataset reload for sources that cannot survive a page refresh (e.g., local-user)
+    async function reloadActiveDatasetInPlace(metadataOverride = null) {
+      const baseUrl = dataSourceManager.getCurrentBaseUrl();
+      const activeMetadata = metadataOverride || dataSourceManager.getCurrentMetadata?.() || null;
+      if (!baseUrl) {
+        ui?.showSessionStatus?.('No dataset selected', true);
+        return;
+      }
+
+      EXPORT_BASE_URL = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
+      statsEl.textContent = 'Loading positions…';
+
+      // Indicate loading in dataset info block
+      if (datasetInfo) {
+        datasetInfo.classList.remove('error');
+        datasetInfo.classList.add('loading');
+      }
+      if (datasetCellsEl) datasetCellsEl.textContent = '...';
+      if (datasetGenesEl) datasetGenesEl.textContent = '...';
+
+      // Disable connectivity visuals when switching datasets without reload
+      if (connectivityCheckbox) {
+        connectivityCheckbox.checked = false;
+        connectivityCheckbox.disabled = true;
+      }
+      if (connectivityControls) {
+        connectivityControls.style.display = 'none';
+      }
+      if (connectivitySliders) {
+        connectivitySliders.style.display = 'none';
+      }
+      if (viewer.setShowConnectivity) viewer.setShowConnectivity(false);
+      if (viewer.disableEdgesV2) viewer.disableEdgesV2();
+      connectivityManifest = null;
+
+      try {
+        const positionsPromiseReload = loadPointsBinary(getPointsUrl());
+
+        let nextObs = null;
+        try {
+          nextObs = await loadObsManifest(getObsManifestUrl());
+          state.setFieldLoader((field) => loadObsFieldData(getObsManifestUrl(), field));
+          statsEl.textContent = 'Loaded obs manifest (lazy-loading fields)…';
+        } catch (err) {
+          if (err?.status === 404) {
+            console.warn('obs_manifest.json not found, falling back to obs_values.json');
+            try {
+              nextObs = await loadObsJson(getLegacyObsUrl());
+              statsEl.textContent = 'Loaded legacy obs JSON (full payload).';
+            } catch (err2) {
+              console.warn('obs_values.json also not found, using empty obs');
+              nextObs = { fields: [], count: 0 };
+            }
+          } else {
+            throw err;
+          }
+        }
+
+        // Reload var manifest (optional)
+        try {
+          const nextVarManifest = await loadVarManifest(getVarManifestUrl());
+          state.setVarFieldLoader((field) => loadVarFieldData(getVarManifestUrl(), field));
+          state.initVarData(nextVarManifest);
+          console.log(`[Main] Reloaded var manifest with ${nextVarManifest?.fields?.length || 0} genes.`);
+        } catch (err) {
+          state.setVarFieldLoader?.(null);
+          state.varData = null;
+          if (err?.status === 404) {
+            console.log('[Main] var_manifest.json not found for reloaded dataset (gene expression disabled).');
+          } else {
+            console.warn('[Main] Error loading var manifest for reloaded dataset:', err);
+          }
+        }
+
+        // Skip connectivity reload in-place (would require fresh edge state); hide controls for now
+        connectivityManifest = null;
+
+        const nextPositions = await positionsPromiseReload;
+
+        state.initScene(nextPositions, nextObs);
+        if (state.clearActiveField) {
+          state.clearActiveField();
+        }
+        if (state.clearAllHighlights) {
+          state.clearAllHighlights();
+        }
+
+        // Refresh dataset-aware UI controls (field dropdowns, gene search, stats)
+        ui?.refreshDatasetUI?.(activeMetadata || null);
+        await ui?.activateField?.(-1);
+
+        if (activeMetadata?.stats) {
+          if (datasetCellsEl && activeMetadata.stats.n_cells != null) {
+            datasetCellsEl.textContent = formatNumber(activeMetadata.stats.n_cells);
+          }
+          if (datasetGenesEl && activeMetadata.stats.n_genes != null) {
+            datasetGenesEl.textContent = formatNumber(activeMetadata.stats.n_genes);
+          }
+        }
+        if (datasetInfo) {
+          datasetInfo.classList.remove('loading', 'error');
+        }
+        ui?.showSessionStatus?.('Dataset loaded', false);
+      } catch (err) {
+        console.error('[Main] Failed to reload dataset in-place:', err);
+        statsEl.textContent = 'Failed to load dataset';
+        ui?.showSessionStatus?.(err?.message || 'Failed to load dataset', true);
+        if (datasetInfo) datasetInfo.classList.add('error');
+      } finally {
+        if (connectivityCheckbox) {
+          connectivityCheckbox.disabled = false;
+        }
+      }
+    }
+
     const positions = await positionsPromise;
 
     // Normalize / init scatter state
@@ -271,7 +393,7 @@ function getPointsUrl() { return `${EXPORT_BASE_URL}points.bin`; }
 
     const stateSerializer = createStateSerializer({ state, viewer, sidebar });
 
-    const ui = initUI({
+    ui = initUI({
       state,
       viewer,
       dom: {
@@ -365,8 +487,14 @@ function getPointsUrl() { return `${EXPORT_BASE_URL}points.bin`; }
         // Dataset selector
         datasetSelect,
         datasetInfo,
+        datasetNameEl,
+        datasetSourceEl,
+        datasetDescriptionEl,
+        datasetUrlEl,
         datasetCellsEl,
         datasetGenesEl,
+        datasetObsEl,
+        datasetConnectivityEl,
         userDataBlock,
         userDataPath,
         userDataBrowseBtn,
@@ -376,6 +504,7 @@ function getPointsUrl() { return `${EXPORT_BASE_URL}points.bin`; }
       smoke: {
         rebuildSmokeDensity
       },
+      reloadActiveDataset: reloadActiveDatasetInPlace,
       stateSerializer: stateSerializer,
       dataSourceManager: dataSourceManager
     });

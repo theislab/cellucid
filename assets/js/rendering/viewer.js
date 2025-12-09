@@ -1611,7 +1611,15 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
   // === Helper Functions ===
   function computePointBoundsFromPositions(positions) {
-    if (!positions || positions.length < 3) return;
+    if (!positions || positions.length < 3) {
+      pointBounds = {
+        min: [-1, -1, -1],
+        max: [1, 1, 1],
+        center: [0, 0, 0],
+        radius: 3
+      };
+      return;
+    }
     let minX = Infinity, minY = Infinity, minZ = Infinity;
     let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
     const count = positions.length / 3;

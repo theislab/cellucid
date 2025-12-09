@@ -158,49 +158,79 @@
         <summary>Session</summary>
         <div class="accordion-content">
           <!-- Dataset Selector -->
-          <div class="control-block dataset-selector-block">
-            <div class="section-title">Dataset</div>
+          <div class="control-block">
+            <label for="dataset-select">Sample datasets:</label>
+            <select id="dataset-select" class="obs-select">
+              <option value="" disabled selected>Loading...</option>
+            </select>
+          </div>
 
-            <!-- Demo dataset dropdown -->
-            <div class="control-block" style="margin-top:6px;">
-              <label for="dataset-select">Demo datasets:</label>
-              <select id="dataset-select" class="obs-select">
-                <option value="" disabled selected>Loading...</option>
-              </select>
+          <!-- Dataset info display -->
+          <div id="dataset-info" class="dataset-info">
+            <div class="dataset-info-row">
+              <span class="dataset-info-label">Dataset</span>
+              <span id="dataset-name" class="dataset-info-value">–</span>
             </div>
-
-            <!-- Dataset info display -->
-            <div id="dataset-info" class="dataset-info">
-              <span id="dataset-cells">–</span> cells ·
-              <span id="dataset-genes">–</span> genes
+            <div class="dataset-info-row">
+              <span class="dataset-info-label">Source</span>
+              <span id="dataset-source" class="dataset-info-value">–</span>
             </div>
-
-            <!-- User directory selector -->
-            <div class="control-block" id="user-data-block" style="margin-top:10px;">
-              <div class="legend-help">Or load your own data:</div>
-              <div class="user-data-row" style="display:flex; gap:6px; margin-top:6px;">
-                <input type="text" id="user-data-path" class="user-data-path"
-                       placeholder="No directory selected" readonly />
-                <button id="user-data-browse-btn" class="btn-small">Browse...</button>
-                <!-- Hidden file input for cross-browser directory selection -->
-                <input type="file" id="user-data-file-input" webkitdirectory directory multiple
-                       style="display:none;" />
-              </div>
-              <div id="user-data-status" class="legend-help" style="margin-top:4px;"></div>
+            <div class="dataset-info-row">
+              <span class="dataset-info-label">Description</span>
+              <span id="dataset-description" class="dataset-info-value dataset-info-ellipsis" title="—">—</span>
+            </div>
+            <div class="dataset-info-row">
+              <span class="dataset-info-label">URL</span>
+              <span id="dataset-url" class="dataset-info-value dataset-info-ellipsis" title="—">—</span>
+            </div>
+            <div class="dataset-info-row">
+              <span class="dataset-info-label">Cells</span>
+              <span id="dataset-cells" class="dataset-info-value">–</span>
+            </div>
+            <div class="dataset-info-row">
+              <span class="dataset-info-label">Genes</span>
+              <span id="dataset-genes" class="dataset-info-value">–</span>
+            </div>
+            <div class="dataset-info-row">
+              <span class="dataset-info-label">Obs fields</span>
+              <span id="dataset-obs" class="dataset-info-value">–</span>
+            </div>
+            <div class="dataset-info-row">
+              <span class="dataset-info-label">Connectivity</span>
+              <span id="dataset-connectivity" class="dataset-info-value">–</span>
             </div>
           </div>
 
-          <div class="section-divider"></div>
+          <!-- User directory selector -->
+          <div class="control-block" id="user-data-block" style="margin-top: 4px;">
+            <label>Load your data:</label>
+            <div class="legend-help">
+              Load a prepared local directory.
+            </div>
+            <label class="sr-only" for="user-data-path">Selected data path</label>
+            <div class="user-data-row">
+              <input type="text" id="user-data-path" class="user-data-path"
+                     placeholder="No directory selected" readonly />
+              <button id="user-data-browse-btn" class="reset-btn">Browse...</button>
+              <!-- Hidden file input for cross-browser directory selection -->
+              <input type="file" id="user-data-file-input" webkitdirectory directory multiple
+                     style="display:none;" />
+            </div>
+            <div id="user-data-status" class="legend-help" style="margin-top:4px;"></div>
+          </div>
 
           <!-- Session state save/load -->
-          <div class="legend-help">
-            Save or load the complete application state including camera, filters, highlights, and all settings.
+          <div class="control-block" id="session-state-controls" style="margin-top: -10px;">
+            <label>Session state:</label>
+            <div class="legend-help">
+              Save or load the complete application state including camera, filters, highlights, and all settings.
+            </div>
+            <div class="control-block" style="display: flex; gap: 8px; margin-top: 6px;">
+              <button id="save-state-btn" class="reset-btn" style="flex: 1;">Save State</button>
+              <button id="load-state-btn" class="reset-btn" style="flex: 1;">Load State</button>
+            </div>
+            <div id="session-status" class="legend-help" style="margin-top: 6px; color: var(--success-color, #4caf50); display: none;"></div>
           </div>
-          <div class="control-block" style="display: flex; gap: 8px; margin-top: 8px;">
-            <button id="save-state-btn" class="reset-btn" style="flex: 1;">Save State</button>
-            <button id="load-state-btn" class="reset-btn" style="flex: 1;">Load State</button>
-          </div>
-          <div id="session-status" class="legend-help" style="margin-top: 6px; color: var(--success-color, #4caf50); display: none;"></div>
         </div>
       </details>
 
@@ -229,7 +259,7 @@
 
           <!-- Depth Perception controls -->
           <div class="control-block" id="depth-controls">
-            <div class="section-title">Depth perception</div>
+            <label>Depth perception:</label>
             <div class="legend-help">
               Visual cues for 3D depth and spatial awareness.
             </div>
@@ -268,7 +298,7 @@
 
           <!-- Renderer Settings -->
           <div class="control-block" id="renderer-controls">
-            <div class="section-title">Renderer settings</div>
+            <label>Renderer settings:</label>
             <div class="control-block" style="margin-top:6px;">
               <label for="hp-shader-quality">Shader quality:</label>
               <select id="hp-shader-quality" class="obs-select">
@@ -303,9 +333,7 @@
 
           <!-- Navigation controls -->
           <div class="control-block" id="navigation-controls">
-            <div class="section-divider">
-              <div class="section-title">Navigation</div>
-            </div>
+            <label>Navigation:</label>
             <div class="legend-help">
               Choose orbit for data-first inspection or free-fly for desk-to-immersive movement.
             </div>
@@ -366,14 +394,12 @@
 
           <!-- Volumetric smoke controls -->
           <div class="control-block" id="smoke-controls">
-            <div class="section-title">Volumetric smoke</div>
+            <label>Volumetric smoke:</label>
             <div class="legend-help">
               Physically-based ray-marched smoke. Knobs auto-scale with grid and noise detail.
             </div>
 
-            <div class="section-divider">
-              <div class="section-title">Quality & performance</div>
-            </div>
+            <label>Quality & performance:</label>
             <div class="control-block">
               <label for="smoke-grid">Grid density:</label>
               <div class="slider-row">
@@ -403,9 +429,7 @@
               </div>
             </div>
 
-            <div class="section-divider">
-              <div class="section-title">Shape & motion</div>
-            </div>
+            <label>Shape & motion:</label>
             <div class="control-block">
               <label for="smoke-density">Cloud density:</label>
               <div class="slider-row">
@@ -442,9 +466,7 @@
               </div>
             </div>
 
-            <div class="section-divider">
-              <div class="section-title">Lighting</div>
-            </div>
+            <label>Lighting:</label>
             <div class="control-block">
               <label for="smoke-absorption">Light absorption:</label>
               <div class="slider-row">
@@ -476,9 +498,7 @@
           <div id="points-controls" class="visible">
             <!-- KNN Connectivity Section -->
             <div class="control-block" id="connectivity-controls" style="display: none;">
-              <div class="section-divider">
-                <div class="section-title">KNN Connectivity</div>
-              </div>
+              <label>KNN Connectivity:</label>
 
               <div class="legend-help" style="margin-bottom:6px;">
                 Shows edges between visible cells only.
@@ -615,7 +635,7 @@
 
           <!-- Display Options (dashed box) -->
           <div class="display-options-box" id="display-options-container">
-            <div class="section-title">Display Options</div>
+            <label>Display options:</label>
 
             <!-- Outlier Filter (only shown for categorical fields) -->
             <div class="control-block" id="outlier-filter-container">
@@ -642,7 +662,7 @@
             <div id="legend"></div>
           </div>
           <div class="control-block" id="active-filters-container">
-            <div class="section-title">Active filters</div>
+            <label>Active filters:</label>
             <div id="filter-count" class="filter-info">Showing all points</div>
             <div id="active-filters" class="filter-info-block">
               <div class="filter-info">No filters active</div>
@@ -655,7 +675,7 @@
         <summary>Highlighted Cells</summary>
         <div class="accordion-content">
           <div class="highlight-mode-box">
-            <div class="section-title">Highlight mode</div>
+            <label>Highlight mode:</label>
             <div class="highlight-mode-buttons" role="group" aria-label="Highlight mode selection">
               <button type="button" class="toggle-switch highlight-mode-btn" data-mode="annotation" aria-pressed="true">Annotation based</button>
               <button type="button" class="toggle-switch highlight-mode-btn" data-mode="knn">KNN drag</button>

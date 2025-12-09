@@ -1,7 +1,7 @@
 // UI wiring: binds DOM controls to state/viewer, renders legends and filter summaries.
 import { formatCellCount as formatDataNumber } from '../data/data-source.js';
 
-export function initUI({ state, viewer, dom, smoke, dataSourceManager }) {
+export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadActiveDataset }) {
   console.log('[UI] initUI called with dataSourceManager:', !!dataSourceManager);
 
   const {
@@ -98,8 +98,14 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager }) {
     // Dataset selector
     datasetSelect,
     datasetInfo,
+    datasetNameEl,
+    datasetSourceEl,
+    datasetDescriptionEl,
+    datasetUrlEl,
     datasetCellsEl,
     datasetGenesEl,
+    datasetObsEl,
+    datasetConnectivityEl,
     userDataBlock,
     userDataPath,
     userDataBrowseBtn,
@@ -109,8 +115,10 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager }) {
 
   const rebuildSmokeDensity = smoke?.rebuildSmokeDensity || null;
   const stateSerializer = arguments[0].stateSerializer || null;
+  const reloadDataset = reloadActiveDataset || null;
 
   const NONE_FIELD_VALUE = '-1';
+  const NONE_DATASET_VALUE = '__none__';
   let hasCategoricalFields = false;
   let hasContinuousFields = false;
   let forceDisableFieldSelects = false;
@@ -4014,6 +4022,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager }) {
 
     viewer.resetCamera();
     const defaultRenderMode = initialUIState.renderMode || 'points';
+    const navMode = initialUIState.navigationMode || 'orbit';
 
     if (backgroundSelect) {
       backgroundSelect.value = initialUIState.background;
@@ -4026,12 +4035,11 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager }) {
     applyRenderMode(defaultRenderMode);
 
     if (navigationModeSelect) {
-      const mode = initialUIState.navigationMode || 'orbit';
-      navigationModeSelect.value = mode;
+      navigationModeSelect.value = navMode;
       if (viewer.setNavigationMode) {
-        viewer.setNavigationMode(mode);
+        viewer.setNavigationMode(navMode);
       }
-      toggleNavigationPanels(mode);
+      toggleNavigationPanels(navMode);
     }
 
     if (lookSensitivityInput) {
@@ -4346,20 +4354,73 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager }) {
    * Update the dataset info display
    * @param {Object|null} metadata - Dataset metadata
    */
-  function updateDatasetInfo(metadata) {
+  function updateDatasetInfo(metadata, sourceTypeOverride = null) {
     if (!datasetInfo || !datasetCellsEl || !datasetGenesEl) return;
 
-    if (!metadata) {
+    const resetValues = () => {
+      if (datasetNameEl) datasetNameEl.textContent = '—';
+      if (datasetSourceEl) datasetSourceEl.textContent = '—';
+      if (datasetDescriptionEl) {
+        datasetDescriptionEl.textContent = '—';
+        datasetDescriptionEl.title = '—';
+      }
+      if (datasetUrlEl) {
+        datasetUrlEl.textContent = '—';
+        datasetUrlEl.title = '—';
+      }
       datasetCellsEl.textContent = '–';
       datasetGenesEl.textContent = '–';
+      if (datasetObsEl) datasetObsEl.textContent = '–';
+      if (datasetConnectivityEl) datasetConnectivityEl.textContent = '–';
       datasetInfo.classList.remove('loading', 'error');
+    };
+
+    if (!metadata) {
+      resetValues();
       return;
     }
 
     const stats = metadata.stats || {};
+    const sourceLabel = (sourceTypeOverride || dataSourceManager?.getCurrentSourceType?.() || 'demo')
+      .replace(/[-_]+/g, ' ')
+      .replace(/\b\w/g, (c) => c.toUpperCase());
+
+    if (datasetNameEl) datasetNameEl.textContent = metadata.name || metadata.id || 'Dataset';
+    if (datasetSourceEl) datasetSourceEl.textContent = sourceLabel;
+    if (datasetDescriptionEl) {
+      const desc = metadata.description || '—';
+      datasetDescriptionEl.textContent = desc;
+      datasetDescriptionEl.title = desc;
+    }
+    if (datasetUrlEl) {
+      const url = metadata.source?.url || metadata.url || '—';
+      datasetUrlEl.textContent = url;
+      datasetUrlEl.title = url;
+    }
     datasetCellsEl.textContent = formatDataNumber(stats.n_cells);
     datasetGenesEl.textContent = formatDataNumber(stats.n_genes);
+    if (datasetObsEl) datasetObsEl.textContent = formatDataNumber(stats.n_obs_fields);
+    if (datasetConnectivityEl) {
+      if (stats.has_connectivity) {
+        const edgeText = stats.n_edges ? `${formatDataNumber(stats.n_edges)} edges` : 'Available';
+        datasetConnectivityEl.textContent = edgeText;
+      } else {
+        datasetConnectivityEl.textContent = 'None';
+      }
+    }
     datasetInfo.classList.remove('loading', 'error');
+  }
+
+  /**
+   * Refresh dataset-aware UI (field dropdowns, gene search, info panel)
+   * @param {Object|null} metadata - Dataset metadata
+   */
+  function refreshDatasetUI(metadata) {
+    renderFieldSelects();
+    initGeneExpressionDropdown();
+    clearGeneSelection();
+    refreshUIForActiveView();
+    updateDatasetInfo(metadata || (dataSourceManager?.getCurrentMetadata?.() || null));
   }
 
   /**
@@ -4404,12 +4465,28 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager }) {
         }
       }
 
+      datasetSelect.innerHTML = '';
+
+      const addNoneOption = () => {
+        const noneOption = document.createElement('option');
+        noneOption.value = NONE_DATASET_VALUE;
+        noneOption.textContent = 'None';
+        datasetSelect.appendChild(noneOption);
+        return noneOption;
+      };
+
+      addNoneOption();
+
       if (allDatasets.length === 0) {
-        datasetSelect.innerHTML = '<option value="" disabled>No datasets found</option>';
+        const emptyMsg = document.createElement('option');
+        emptyMsg.value = '';
+        emptyMsg.disabled = true;
+        emptyMsg.textContent = 'No datasets found';
+        datasetSelect.appendChild(emptyMsg);
+        datasetSelect.value = NONE_DATASET_VALUE;
+        updateDatasetInfo(null);
         return;
       }
-
-      datasetSelect.innerHTML = '';
 
       // Group by source type if there are multiple sources with data
       const sourcesWithData = allSourceDatasets.filter(s => s.datasets.length > 0);
@@ -4446,11 +4523,14 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager }) {
         }
       }
 
-      // Select the current dataset if any
+      // Select the current dataset if any; fall back to None
       const currentId = dataSourceManager.getCurrentDatasetId();
       if (currentId) {
         datasetSelect.value = currentId;
         updateDatasetInfo(dataSourceManager.getCurrentMetadata());
+      } else if (datasetSelect.querySelector(`option[value=\"${NONE_DATASET_VALUE}\"]`)) {
+        datasetSelect.value = NONE_DATASET_VALUE;
+        updateDatasetInfo(null);
       }
     } catch (err) {
       console.error('[UI] Failed to populate dataset dropdown:', err);
@@ -4473,12 +4553,6 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager }) {
       return; // No change needed
     }
 
-    // User-loaded datasets can't be restored via URL (browser security)
-    if (sourceType === 'local-user') {
-      showSessionStatus('User data requires re-selection after page reload', true);
-      return;
-    }
-
     try {
       if (datasetInfo) {
         datasetInfo.classList.add('loading');
@@ -4488,8 +4562,18 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager }) {
 
       showSessionStatus('Switching dataset...', false);
 
-      // Store the selected dataset in URL and reload
-      // This ensures all data is properly reloaded with the new dataset
+      await dataSourceManager.switchToDataset(sourceType, datasetId);
+
+      // Local-user datasets must be loaded in-place to keep file handles alive
+      if (sourceType === 'local-user') {
+        if (typeof reloadDataset === 'function') {
+          await reloadDataset(dataSourceManager.getCurrentMetadata?.());
+        }
+        showSessionStatus('Dataset loaded', false);
+        return;
+      }
+
+      // Store the selected dataset in URL and reload for server-hosted sources
       const url = new URL(window.location.href);
       url.searchParams.set('dataset', datasetId);
       if (sourceType !== 'local-demo') {
@@ -4510,6 +4594,44 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager }) {
     }
   }
 
+  /**
+   * Handle selecting the "None" dataset option - clear data and UI state
+   */
+  function handleNoneDatasetSelection() {
+    if (typeof dataSourceManager?.clearActiveDataset === 'function') {
+      dataSourceManager.clearActiveDataset();
+    }
+
+    // Clear data/state
+    if (state?.initScene) {
+      state.setFieldLoader?.(null);
+      state.setVarFieldLoader?.(null);
+      state.varData = null;
+      state.initScene(new Float32Array(), { fields: [], count: 0 });
+      state.clearActiveField?.();
+      state.clearAllHighlights?.();
+      state.clearSnapshotViews?.();
+    }
+    if (typeof viewer?.clearSnapshotViews === 'function') {
+      viewer.clearSnapshotViews();
+    }
+    if (typeof viewer?.updateHighlight === 'function') {
+      viewer.updateHighlight(new Uint8Array());
+    }
+
+    // Reset UI affordances
+    clearGeneSelection();
+    clearFieldSelections();
+    refreshDatasetUI(null);
+    if (datasetSelect) {
+      datasetSelect.value = NONE_DATASET_VALUE;
+    }
+    if (statsEl) {
+      statsEl.textContent = 'No dataset selected';
+    }
+    showSessionStatus('No dataset selected', false);
+  }
+
   // Initialize dataset selector
   console.log('[UI] Dataset selector initialization:', {
     datasetSelect: !!datasetSelect,
@@ -4520,15 +4642,44 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager }) {
     userDataBrowseBtn: !!userDataBrowseBtn
   });
 
+
   if (datasetSelect && dataSourceManager) {
     // Populate dropdown
     populateDatasetDropdown();
 
+    // Keep dropdown in sync with source changes and dataset switches
+    if (typeof dataSourceManager.onSourcesChange === 'function') {
+      dataSourceManager.onSourcesChange(() => {
+        populateDatasetDropdown();
+      });
+    }
+    if (typeof dataSourceManager.onDatasetChange === 'function') {
+      dataSourceManager.onDatasetChange((event) => {
+        try {
+          if (datasetSelect) {
+            if (event?.datasetId) {
+              datasetSelect.value = event.datasetId;
+            } else if (datasetSelect.querySelector(`option[value=\"${NONE_DATASET_VALUE}\"]`)) {
+              datasetSelect.value = NONE_DATASET_VALUE;
+            }
+          }
+        } catch (_) {
+          /* ignore */
+        }
+        updateDatasetInfo(event?.metadata || null, event?.sourceType || null);
+      });
+    }
+
     // Handle selection changes
     datasetSelect.addEventListener('change', (e) => {
+      const selectedValue = e.target.value;
+      if (selectedValue === NONE_DATASET_VALUE) {
+        handleNoneDatasetSelection();
+        return;
+      }
       const selectedOption = e.target.selectedOptions[0];
       const sourceType = selectedOption?.dataset?.sourceType || 'local-demo';
-      handleDatasetChange(e.target.value, sourceType);
+      handleDatasetChange(selectedValue, sourceType);
     });
   } else {
     console.warn('[UI] Dataset selector not initialized - missing elements:', {
@@ -4536,6 +4687,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager }) {
       dataSourceManager: dataSourceManager
     });
   }
+
 
   // Initialize user data directory picker (works in all browsers via webkitdirectory)
   console.log('[UI] User data block initialization');
@@ -4575,18 +4727,17 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager }) {
 
         // Deselect demo dataset dropdown
         if (datasetSelect) {
-          datasetSelect.value = '';
+          datasetSelect.value = NONE_DATASET_VALUE;
         }
 
         // Switch to the user data source
         try {
           await dataSourceManager.switchToDataset('local-user', userSource.datasetId);
-          showSessionStatus(`User data ready: ${formatDataNumber(metadata.stats?.n_cells)} cells. Refresh page to visualize.`, false);
-
-          // Note: Browser security prevents auto-reload from preserving file handles.
-          // The user must manually refresh while the data is still in memory,
-          // or use the prepare_data.py workflow to create permanent exports.
-          console.log('[UI] User data loaded and source switched. Page refresh will use cached files.');
+          if (typeof reloadDataset === 'function') {
+            await reloadDataset(metadata);
+          }
+          populateDatasetDropdown();
+          showSessionStatus(`User data ready: ${formatDataNumber(metadata.stats?.n_cells)} cells.`, false);
         } catch (switchErr) {
           console.warn('[UI] Could not auto-switch to user source:', switchErr);
           showSessionStatus('User data validated. Select "Load" to apply.', false);
@@ -4618,5 +4769,5 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager }) {
     });
   }
 
-  return { activateField, refreshUiAfterStateLoad, showSessionStatus };
+  return { activateField, refreshUiAfterStateLoad, showSessionStatus, refreshDatasetUI };
 }

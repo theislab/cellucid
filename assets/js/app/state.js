@@ -2690,7 +2690,6 @@ class DataState {
   }
 
   clearAllHighlights() {
-    if (this.highlightedGroups.length === 0) return;
     this.highlightedGroups = [];
     this._recomputeHighlightArray();
     this._notifyHighlightChange();
