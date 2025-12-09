@@ -1,7 +1,8 @@
 {
   "version": 1,
-  "default": "apidip",
+  "default": "suo",
   "datasets": [
+    { "id": "suo", "path": "suo/", "name": "Suo" },
     { "id": "apidip", "path": "apidip/", "name": "Apidip" }
   ]
 }

@@ -527,6 +527,55 @@ export class Octree {
     return results;
   }
 
+  /**
+   * Query points within radius at a specific LOD level.
+   * Returns indices into the LOD level's positions array (not original indices).
+   * @param {Array} center - [x, y, z] center point
+   * @param {number} radius - Search radius
+   * @param {number} lodLevel - LOD level to query (0 = lowest detail, max = full detail)
+   * @param {number} maxResults - Maximum results to return
+   * @returns {Array} Array of { lodIndex, position, originalIndex }
+   */
+  queryRadiusAtLOD(center, radius, lodLevel, maxResults = 64) {
+    if (radius <= 0) return [];
+
+    // Clamp LOD level to valid range
+    const numLevels = this.lodLevels.length;
+    if (numLevels === 0) return this.queryRadius(center, radius, maxResults).map(idx => ({
+      lodIndex: idx,
+      originalIndex: idx,
+      position: [this.positions[idx * 3], this.positions[idx * 3 + 1], this.positions[idx * 3 + 2]]
+    }));
+
+    const level = this.lodLevels[Math.max(0, Math.min(lodLevel, numLevels - 1))];
+    const positions = level.positions;
+    const pointCount = level.pointCount;
+    const isFullDetail = level.isFullDetail;
+
+    const results = [];
+    const r2 = radius * radius;
+
+    // Simple brute force over LOD positions (LOD levels are small enough)
+    for (let i = 0; i < pointCount && results.length < maxResults; i++) {
+      const px = positions[i * 3];
+      const py = positions[i * 3 + 1];
+      const pz = positions[i * 3 + 2];
+      const dx = px - center[0];
+      const dy = py - center[1];
+      const dz = pz - center[2];
+      const dist2 = dx * dx + dy * dy + dz * dz;
+      if (dist2 <= r2) {
+        results.push({
+          lodIndex: i,
+          originalIndex: isFullDetail ? i : level.indices[i],
+          position: [px, py, pz]
+        });
+      }
+    }
+
+    return results;
+  }
+
   getBoundingSphere() {
     const b = this.bounds;
     const centerX = (b.minX + b.maxX) * 0.5;

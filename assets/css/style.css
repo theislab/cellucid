@@ -1465,6 +1465,20 @@ html, body {
     0 0 2px rgba(0, 0, 0, 0.6);
 }
 
+/* Orbit anchor annotation overlay */
+#orbit-anchor-annotation {
+  position: fixed;
+  pointer-events: none;
+  z-index: 7;
+  font-family: "Fira Code", "SF Mono", "Monaco", monospace;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  transition: opacity 0.15s ease, left 0.05s ease, top 0.05s ease;
+  line-height: 1.4;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+
 /* View title overlay for small multiples */
 #view-title-layer {
   position: fixed;

@@ -48,6 +48,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     projectilesEnabledCheckbox,
     pointerLockCheckbox,
     orbitReverseCheckbox,
+    showOrbitAnchorCheckbox,
     freeflyControls,
     orbitControls,
     geneExpressionContainer,
@@ -3663,6 +3664,14 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     });
   }
 
+  // Orbit anchor visibility (scientific visualization of orbit center)
+  if (showOrbitAnchorCheckbox && viewer.setShowOrbitAnchor) {
+    viewer.setShowOrbitAnchor(Boolean(showOrbitAnchorCheckbox.checked));
+    showOrbitAnchorCheckbox.addEventListener('change', () => {
+      viewer.setShowOrbitAnchor(Boolean(showOrbitAnchorCheckbox.checked));
+    });
+  }
+
   outlierFilterInput.addEventListener('input', () => {
     const sliderValue = parseFloat(outlierFilterInput.value);
     const threshold = sliderValue / 100.0;
@@ -4062,6 +4071,11 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       viewer.setOrbitInvertRotation(Boolean(orbitReverseCheckbox.checked));
     }
 
+    if (showOrbitAnchorCheckbox && viewer.setShowOrbitAnchor) {
+      showOrbitAnchorCheckbox.checked = initialUIState.showOrbitAnchor ?? true;
+      viewer.setShowOrbitAnchor(Boolean(showOrbitAnchorCheckbox.checked));
+    }
+
     if (pointSizeInput) {
       pointSizeInput.value = initialUIState.pointSize;
       applyPointSizeFromSlider();
@@ -4223,7 +4237,8 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     lookSensitivity: lookSensitivityInput?.value || '5',
     moveSpeed: moveSpeedInput?.value || '100',
     invertLook: invertLookCheckbox?.checked || false,
-    orbitInvertRotation: orbitReverseCheckbox?.checked || false
+    orbitInvertRotation: orbitReverseCheckbox?.checked || false,
+    showOrbitAnchor: showOrbitAnchorCheckbox?.checked ?? true
   };
 
   renderFieldSelects();

@@ -78,6 +78,7 @@ function getPointsUrl() { return `${EXPORT_BASE_URL}points.bin`; }
   const projectilesEnabledCheckbox = document.getElementById('projectiles-enabled');
   const pointerLockCheckbox = document.getElementById('pointer-lock');
   const orbitReverseCheckbox = document.getElementById('orbit-reverse');
+  const showOrbitAnchorCheckbox = document.getElementById('show-orbit-anchor');
   const freeflyControls = document.getElementById('freefly-controls');
   const orbitControls = document.getElementById('orbit-controls');
   const geneExpressionContainer = document.getElementById('gene-expression-container');
@@ -440,6 +441,7 @@ function getPointsUrl() { return `${EXPORT_BASE_URL}points.bin`; }
         projectilesEnabledCheckbox,
         pointerLockCheckbox,
         orbitReverseCheckbox,
+        showOrbitAnchorCheckbox,
         freeflyControls,
         orbitControls,
         geneExpressionContainer,
