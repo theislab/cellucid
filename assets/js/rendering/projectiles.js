@@ -26,6 +26,13 @@ export function createProjectileSystem({
   centroidProgram,
   centroidAttribLocations,
   centroidUniformLocations,
+  // For charge indicator
+  getLassoCtx,
+  getPointerLockActive,
+  getNavigationMode,
+  // For grid collision
+  getGridBounds,
+  isGridVisible,
 }) {
   // Projectile buffers (small, dynamic)
   // Color buffers store RGBA as uint8 (alpha packed in)
@@ -65,10 +72,10 @@ export function createProjectileSystem({
   const PROJECTILE_TRAIL_DELAY = 0.12;   // Seconds before trail starts
   const PROJECTILE_SPEED = 3.0;          // Snappy and responsive
   const PROJECTILE_GRAVITY = 9.8 * 0.15; // Noticeable arcs without feeling heavy
-  const PROJECTILE_DRAG = 0.998;         // Slight drag for natural deceleration
+  const PROJECTILE_DRAG = 0.995;         // Increased drag for smoother deceleration
   const PROJECTILE_LIFETIME = 12.0;      // Reasonable lifetime
-  const PROJECTILE_BOUNCE = 0.1;         // Low restitution - loses most energy on impact
-  const PROJECTILE_FRICTION = 0.7;       // High tangential friction on bounce
+  const PROJECTILE_BOUNCE = 0.35;        // Moderate restitution for visible bounces
+  const PROJECTILE_FRICTION = 0.85;      // Higher friction for more energy loss on slide
   const PROJECTILE_TRAIL_LENGTH = 16;    // Number of trail segments
   const PROJECTILE_TRAIL_SPACING = 0.004; // Seconds between trail samples (~60fps)
   const PROJECTILE_FLASH_TIME = 0.6;
@@ -77,6 +84,22 @@ export function createProjectileSystem({
   const PROJECTILE_SPREAD = 0;          // No spread - shoots exactly where aimed
   const PROJECTILE_LOFT = 0.01;         // Upward angle bias for arcing shots
   const SHOT_COOLDOWN_SECONDS = 0.05;
+  const COLLISION_COOLDOWN = 0.05;      // Seconds between bounces (prevents multi-cell chaos)
+  const MAX_VELOCITY = 8.0;             // Cap velocity to prevent runaway speeds
+  const MIN_BOUNCE_VELOCITY = 0.1;      // Below this speed, projectile stops bouncing
+
+  // Charge system constants
+  const MIN_CHARGE_TIME = 0.08;         // Seconds before charge starts building
+  const MAX_CHARGE_TIME = 1.0;          // Seconds to reach full charge
+  const MIN_SPEED_MULT = 1.0;           // Speed multiplier at min charge
+  const MAX_SPEED_MULT = 3.5;           // Speed multiplier at full charge
+  const VISUAL_CHARGE_DELAY = 0.2;      // Seconds before indicator appears (quick shots show nothing)
+
+  // Charge system state
+  let isCharging = false;
+  let chargeStartTime = 0;
+  let chargeLevel = 0;
+  let chargeViewportInfo = null;
 
   // Track total projectile points for draw call
   let projectilePointCount = 0;
@@ -259,7 +282,8 @@ export function createProjectileSystem({
   }
 
   // viewportInfo: optional { vpWidth, vpHeight, vpOffsetX, vpOffsetY, vpAspect, cameraPosition, cameraAxes }
-  function spawnProjectile({ navigationMode, pointerLockActive, viewportInfo }) {
+  // speedMultiplier: optional speed boost (1.0 = default, higher = faster)
+  function spawnProjectile({ navigationMode, pointerLockActive, viewportInfo, speedMultiplier = 1.0 }) {
     if (navigationMode !== 'free') return;
     if (!projectilesEnabled) return;
     const now = performance.now();
@@ -281,17 +305,19 @@ export function createProjectileSystem({
     const randUp = (Math.random() - 0.5) * 2 * PROJECTILE_SPREAD;
     vec3.scaleAndAdd(spreadDir, spreadDir, axes.right, randRight);
     vec3.scaleAndAdd(spreadDir, spreadDir, axes.upVec, randUp);
-    // Add upward loft for higher arcing trajectory
-    spreadDir[1] += PROJECTILE_LOFT;
+    // Add upward loft for higher arcing trajectory (scaled with speed for charged shots)
+    spreadDir[1] += PROJECTILE_LOFT * speedMultiplier;
     vec3.normalize(spreadDir, spreadDir);
 
     // Start projectile very close to camera for bigger initial appearance
     const start = vec3.add(
       vec3.create(),
       cameraPosition,
-      vec3.scale(vec3.create(), spreadDir, 0.02),
+      vec3.scale(vec3.create(), spreadDir, 0.005),
     );
-    const vel = vec3.scale(vec3.create(), spreadDir, PROJECTILE_SPEED);
+    // Apply speed multiplier for charged shots
+    const finalSpeed = PROJECTILE_SPEED * Math.max(1.0, speedMultiplier);
+    const vel = vec3.scale(vec3.create(), spreadDir, finalSpeed);
     projectiles.push({
       position: start,
       velocity: vel,
@@ -300,6 +326,7 @@ export function createProjectileSystem({
       age: 0,
       trail: [],           // Ring buffer of past positions [x,y,z, x,y,z, ...]
       trailTime: -PROJECTILE_TRAIL_DELAY,  // Negative = delay before trail starts
+      lastBounceTime: 0,   // Cooldown to prevent multi-cell bounce chaos
     });
     if (projectiles.length > MAX_PROJECTILES) projectiles.shift();
     projectileBufferDirty = true;
@@ -360,9 +387,10 @@ export function createProjectileSystem({
       // Calculate sub-steps based on velocity to prevent tunneling
       const speed = vec3.length(p.velocity);
       const moveDistance = speed * dt;
-      // Keep each physics step short so the swept collision check remains robust
-      const maxStepDistance = collisionRadius * 0.75;
-      const numSubSteps = Math.max(2, Math.ceil(moveDistance / maxStepDistance));
+      // Keep each physics step very short to prevent tunneling through cells
+      // Use half the collision radius to ensure we never skip over a cell
+      const maxStepDistance = collisionRadius * 0.4;
+      const numSubSteps = Math.max(4, Math.ceil(moveDistance / maxStepDistance));
       const subDt = dt / numSubSteps;
       const gravitySubStep = PROJECTILE_GRAVITY * subDt;
       const subDrag = Math.pow(PROJECTILE_DRAG, subDt * physicsTickRate);
@@ -385,31 +413,47 @@ export function createProjectileSystem({
           break;
         }
 
-        // Check collisions with cells - find the closest cell for a clean bounce
+        // Check collisions with cells - use averaged normal for smooth surfaces
         const pointCount = getPointCount();
-        if (pointCount > 0 && !p.resting) {
-          // Query nearby points around current position
-          const hits = queryNearbyPoints(p.position, collisionRadius * 1.5, 32);
+        const canBounce = p.age - p.lastBounceTime >= COLLISION_COOLDOWN;
 
-          // Find the closest colliding cell
+        if (pointCount > 0 && !p.resting && canBounce) {
+          // Query nearby points around current position
+          const hits = queryNearbyPoints(p.position, collisionRadius * 2.0, 48);
+
+          // Find all colliding cells and compute weighted average normal
+          let totalWeight = 0;
+          const avgNormal = [0, 0, 0];
           let closestHit = null;
           let closestDist = Infinity;
 
           for (const hit of hits) {
             vec3.sub(tempVec3, p.position, hit.position);
             const d = vec3.length(tempVec3);
-            if (d < collisionRadius && d < closestDist) {
-              closestDist = d;
-              closestHit = hit;
+            if (d < collisionRadius * 1.2) {
+              // Weight by inverse distance - closer cells contribute more
+              const weight = 1.0 / Math.max(d, 0.001);
+              if (d > 1e-5) {
+                avgNormal[0] += (tempVec3[0] / d) * weight;
+                avgNormal[1] += (tempVec3[1] / d) * weight;
+                avgNormal[2] += (tempVec3[2] / d) * weight;
+              }
+              totalWeight += weight;
+
+              if (d < closestDist) {
+                closestDist = d;
+                closestHit = hit;
+              }
             }
           }
 
-          if (closestHit) {
-            // Calculate clean surface normal from closest cell
-            vec3.sub(tempVec3, p.position, closestHit.position);
-            const d = vec3.length(tempVec3);
-            if (d > 1e-5) {
-              vec3.scale(tempVec3, tempVec3, 1 / d); // Normalize
+          if (closestHit && totalWeight > 0) {
+            // Normalize the averaged normal
+            const nLen = Math.sqrt(avgNormal[0]**2 + avgNormal[1]**2 + avgNormal[2]**2);
+            if (nLen > 1e-5) {
+              tempVec3[0] = avgNormal[0] / nLen;
+              tempVec3[1] = avgNormal[1] / nLen;
+              tempVec3[2] = avgNormal[2] / nLen;
             } else {
               // Fallback: use opposite of velocity direction
               vec3.normalize(tempVec3, p.velocity);
@@ -417,28 +461,107 @@ export function createProjectileSystem({
             }
 
             // Ensure normal points away from surface (opposes incoming velocity)
-            const vDotN = vec3.dot(p.velocity, tempVec3);
+            let vDotN = vec3.dot(p.velocity, tempVec3);
             if (vDotN > 0) {
               vec3.scale(tempVec3, tempVec3, -1);
+              vDotN = -vDotN; // Recalculate after flip!
             }
-            // Decompose velocity into normal and tangent components
-            vec3.scale(tempVec3b, tempVec3, vDotN); // Normal component
-            vec3.sub(tempVec3c, p.velocity, tempVec3b); // Tangent component
 
-            // Apply restitution to normal component (bounce)
-            vec3.scale(tempVec3b, tempVec3b, -PROJECTILE_BOUNCE);
+            // Check if moving fast enough to bounce
+            const speed = vec3.length(p.velocity);
+            if (speed < MIN_BOUNCE_VELOCITY) {
+              // Too slow - stop the projectile
+              vec3.set(p.velocity, 0, 0, 0);
+              p.resting = true;
+            } else {
+              // Decompose velocity into normal and tangent components
+              // vDotN is negative, so tempVec3b points into the surface
+              vec3.scale(tempVec3b, tempVec3, vDotN); // Normal component (into surface)
+              vec3.sub(tempVec3c, p.velocity, tempVec3b); // Tangent component
 
-            // Apply friction to tangent component (slide)
-            vec3.scale(tempVec3c, tempVec3c, PROJECTILE_FRICTION);
+              // Reflect and reduce normal component (bounce with energy loss)
+              vec3.scale(tempVec3b, tempVec3b, -PROJECTILE_BOUNCE);
 
-            // Combine for new velocity
-            vec3.add(p.velocity, tempVec3b, tempVec3c);
+              // Reduce tangent component (friction)
+              vec3.scale(tempVec3c, tempVec3c, 1.0 - PROJECTILE_FRICTION);
 
-            // Push position out of collision cleanly
-            const penetration = collisionRadius - d;
-            vec3.scaleAndAdd(p.position, p.position, tempVec3, penetration + 0.003);
+              // Combine for new velocity
+              vec3.add(p.velocity, tempVec3b, tempVec3c);
+
+              // Clamp velocity to prevent runaway speeds
+              const newSpeed = vec3.length(p.velocity);
+              if (newSpeed > MAX_VELOCITY) {
+                vec3.scale(p.velocity, p.velocity, MAX_VELOCITY / newSpeed);
+              }
+
+              // Push position out of collision cleanly
+              const penetration = collisionRadius - closestDist;
+              if (penetration > 0) {
+                vec3.scaleAndAdd(p.position, p.position, tempVec3, penetration + 0.005);
+              }
+
+              // Record bounce time to prevent rapid multi-bounces
+              p.lastBounceTime = p.age;
+            }
 
             recordImpact(closestHit.position, closestHit.color || pickProjectileColor());
+          }
+        }
+
+        // Check collision with grid planes (box bounds)
+        if (isGridVisible?.() && !p.resting) {
+          const gridBounds = getGridBounds?.();
+          if (gridBounds) {
+            const { min: gMin, max: gMax } = gridBounds;
+            const pos = p.position;
+            const vel = p.velocity;
+            const radius = PROJECTILE_RADIUS * 0.5; // Smaller collision radius for grid
+
+            // Check each axis for grid plane collision
+            // X axis (left/right walls)
+            if (pos[0] - radius < gMin && vel[0] < 0) {
+              pos[0] = gMin + radius;
+              vel[0] = -vel[0] * PROJECTILE_BOUNCE;
+              vel[1] *= (1.0 - PROJECTILE_FRICTION * 0.5);
+              vel[2] *= (1.0 - PROJECTILE_FRICTION * 0.5);
+              p.lastBounceTime = p.age;
+            } else if (pos[0] + radius > gMax && vel[0] > 0) {
+              pos[0] = gMax - radius;
+              vel[0] = -vel[0] * PROJECTILE_BOUNCE;
+              vel[1] *= (1.0 - PROJECTILE_FRICTION * 0.5);
+              vel[2] *= (1.0 - PROJECTILE_FRICTION * 0.5);
+              p.lastBounceTime = p.age;
+            }
+
+            // Y axis (floor/ceiling)
+            if (pos[1] - radius < gMin && vel[1] < 0) {
+              pos[1] = gMin + radius;
+              vel[1] = -vel[1] * PROJECTILE_BOUNCE;
+              vel[0] *= (1.0 - PROJECTILE_FRICTION * 0.5);
+              vel[2] *= (1.0 - PROJECTILE_FRICTION * 0.5);
+              p.lastBounceTime = p.age;
+            } else if (pos[1] + radius > gMax && vel[1] > 0) {
+              pos[1] = gMax - radius;
+              vel[1] = -vel[1] * PROJECTILE_BOUNCE;
+              vel[0] *= (1.0 - PROJECTILE_FRICTION * 0.5);
+              vel[2] *= (1.0 - PROJECTILE_FRICTION * 0.5);
+              p.lastBounceTime = p.age;
+            }
+
+            // Z axis (front/back walls)
+            if (pos[2] - radius < gMin && vel[2] < 0) {
+              pos[2] = gMin + radius;
+              vel[2] = -vel[2] * PROJECTILE_BOUNCE;
+              vel[0] *= (1.0 - PROJECTILE_FRICTION * 0.5);
+              vel[1] *= (1.0 - PROJECTILE_FRICTION * 0.5);
+              p.lastBounceTime = p.age;
+            } else if (pos[2] + radius > gMax && vel[2] > 0) {
+              pos[2] = gMax - radius;
+              vel[2] = -vel[2] * PROJECTILE_BOUNCE;
+              vel[0] *= (1.0 - PROJECTILE_FRICTION * 0.5);
+              vel[1] *= (1.0 - PROJECTILE_FRICTION * 0.5);
+              p.lastBounceTime = p.age;
+            }
           }
         }
       }
@@ -645,13 +768,173 @@ export function createProjectileSystem({
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
   }
 
+  // ========== Charge Indicator System ==========
+
+  function drawChargeIndicator() {
+    if (!isCharging || getNavigationMode() !== 'free' || !projectilesEnabled) return;
+
+    const lassoCtx = getLassoCtx();
+    if (!lassoCtx) return;
+
+    // Update charge level
+    const chargeTime = (performance.now() - chargeStartTime) / 1000;
+    if (chargeTime < MIN_CHARGE_TIME) {
+      chargeLevel = 0;
+    } else {
+      chargeLevel = Math.min(1.0, (chargeTime - MIN_CHARGE_TIME) / (MAX_CHARGE_TIME - MIN_CHARGE_TIME));
+    }
+
+    // Don't show indicator for quick shots - only after holding 200ms+
+    if (chargeTime < VISUAL_CHARGE_DELAY) return;
+
+    const rect = canvas.getBoundingClientRect();
+    lassoCtx.setTransform(1, 0, 0, 1, 0, 0);
+    const dpr = window.devicePixelRatio || 1;
+    lassoCtx.scale(dpr, dpr);
+
+    // Get cursor position (use center of screen if in pointer lock)
+    let cx, cy;
+    if (getPointerLockActive()) {
+      cx = rect.width / 2;
+      cy = rect.height / 2;
+    } else {
+      const cursor = getCursorPosition();
+      cx = cursor.x - rect.left;
+      cy = cursor.y - rect.top;
+    }
+
+    // Ring parameters - compact design
+    const outerRadius = 20;
+    const ringWidth = 8;
+
+    // Clear previous frame's indicator area
+    lassoCtx.clearRect(cx - 30, cy - 30, 60, 60);
+
+    // Color interpolation: white → yellow → orange → red
+    let r, g, b;
+    if (chargeLevel < 0.33) {
+      const t = chargeLevel * 3;
+      r = 255;
+      g = 255;
+      b = Math.round(255 * (1 - t));
+    } else if (chargeLevel < 0.66) {
+      const t = (chargeLevel - 0.33) * 3;
+      r = 255;
+      g = Math.round(255 - t * 90);
+      b = 0;
+    } else {
+      const t = (chargeLevel - 0.66) * 3;
+      r = 255;
+      g = Math.round(165 - t * 165);
+      b = 0;
+    }
+    const arcColor = `rgb(${r}, ${g}, ${b})`;
+
+    // Draw background ring (subtle dark outline)
+    lassoCtx.beginPath();
+    lassoCtx.arc(cx, cy, outerRadius - ringWidth / 2, 0, Math.PI * 2);
+    lassoCtx.strokeStyle = 'rgba(0, 0, 0, 0.4)';
+    lassoCtx.lineWidth = ringWidth + 2;
+    lassoCtx.stroke();
+
+    // Draw empty ring track
+    lassoCtx.beginPath();
+    lassoCtx.arc(cx, cy, outerRadius - ringWidth / 2, 0, Math.PI * 2);
+    lassoCtx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
+    lassoCtx.lineWidth = ringWidth;
+    lassoCtx.stroke();
+
+    // Draw filled arc (starts at top, goes clockwise)
+    const startAngle = -Math.PI / 2;
+    const endAngle = startAngle + (chargeLevel * Math.PI * 2);
+
+    lassoCtx.beginPath();
+    lassoCtx.arc(cx, cy, outerRadius - ringWidth / 2, startAngle, endAngle);
+    lassoCtx.strokeStyle = arcColor;
+    lassoCtx.lineWidth = ringWidth;
+    lassoCtx.lineCap = 'round';
+    lassoCtx.stroke();
+    lassoCtx.lineCap = 'butt';
+
+    // Glow effect at high charge
+    if (chargeLevel >= 0.7) {
+      const glowIntensity = (chargeLevel - 0.7) / 0.3;
+      const pulse = chargeLevel >= 0.95 ? (0.6 + 0.4 * Math.sin(performance.now() * 0.015)) : 1;
+      lassoCtx.beginPath();
+      lassoCtx.arc(cx, cy, outerRadius - ringWidth / 2, startAngle, endAngle);
+      lassoCtx.strokeStyle = arcColor;
+      lassoCtx.lineWidth = ringWidth;
+      lassoCtx.shadowColor = arcColor;
+      lassoCtx.shadowBlur = 8 * glowIntensity * pulse;
+      lassoCtx.stroke();
+      lassoCtx.shadowBlur = 0;
+    }
+  }
+
+  function clearChargeIndicator() {
+    const lassoCtx = getLassoCtx();
+    if (!lassoCtx) return;
+    const rect = canvas.getBoundingClientRect();
+    lassoCtx.setTransform(1, 0, 0, 1, 0, 0);
+    const dpr = window.devicePixelRatio || 1;
+    lassoCtx.scale(dpr, dpr);
+    lassoCtx.clearRect(0, 0, rect.width, rect.height);
+  }
+
+  function startCharging(viewportInfo) {
+    isCharging = true;
+    chargeStartTime = performance.now();
+    chargeLevel = 0;
+    chargeViewportInfo = viewportInfo;
+  }
+
+  function cancelCharging() {
+    if (isCharging) {
+      isCharging = false;
+      chargeLevel = 0;
+      chargeViewportInfo = null;
+      clearChargeIndicator();
+    }
+  }
+
+  function stopChargingAndFire({ navigationMode, pointerLockActive, viewportInfo }) {
+    if (!isCharging) return;
+
+    isCharging = false;
+    const chargeTime = (performance.now() - chargeStartTime) / 1000;
+
+    // Calculate speed multiplier based on charge time
+    let speedMultiplier = MIN_SPEED_MULT;
+    if (chargeTime >= MIN_CHARGE_TIME) {
+      const chargeProgress = Math.min(1.0, (chargeTime - MIN_CHARGE_TIME) / (MAX_CHARGE_TIME - MIN_CHARGE_TIME));
+      speedMultiplier = MIN_SPEED_MULT + chargeProgress * (MAX_SPEED_MULT - MIN_SPEED_MULT);
+    }
+
+    // Fire the projectile
+    spawnProjectile({ navigationMode, pointerLockActive, viewportInfo, speedMultiplier });
+
+    // Clear indicator
+    clearChargeIndicator();
+    chargeLevel = 0;
+    chargeViewportInfo = null;
+  }
+
+  function updateChargeUI() {
+    if (isCharging) {
+      drawChargeIndicator();
+    } else if (chargeLevel > 0) {
+      clearChargeIndicator();
+      chargeLevel = 0;
+    }
+  }
+
   return {
     computePointBoundsFromPositions,
     getPointBoundsRadius() {
       return pointBounds.radius;
     },
-    spawn({ navigationMode, pointerLockActive, viewportInfo }) {
-      spawnProjectile({ navigationMode, pointerLockActive, viewportInfo });
+    spawn({ navigationMode, pointerLockActive, viewportInfo, speedMultiplier = 1.0 }) {
+      spawnProjectile({ navigationMode, pointerLockActive, viewportInfo, speedMultiplier });
     },
     update(dt) {
       stepProjectiles(dt);
@@ -696,6 +979,12 @@ export function createProjectileSystem({
       projectileBufferDirty = true;
       impactBufferDirty = true;
     },
+    // Charge system
+    startCharging,
+    cancelCharging,
+    stopChargingAndFire,
+    updateChargeUI,
+    isCharging() { return isCharging; },
   };
 }
 

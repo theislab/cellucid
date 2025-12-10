@@ -46,6 +46,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     moveSpeedDisplay,
     invertLookCheckbox,
     projectilesEnabledCheckbox,
+    projectileInfoEl,
     pointerLockCheckbox,
     orbitReverseCheckbox,
     showOrbitAnchorCheckbox,
@@ -3635,7 +3636,29 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     projectilesEnabledCheckbox.checked = false;
     viewer.setProjectilesEnabled(false);
     projectilesEnabledCheckbox.addEventListener('change', () => {
-      viewer.setProjectilesEnabled(projectilesEnabledCheckbox.checked);
+      const enabled = projectilesEnabledCheckbox.checked;
+
+      if (enabled && !viewer.isProjectileOctreeReady?.()) {
+        // Show loading message while building collision octree
+        if (projectileInfoEl) {
+          projectileInfoEl.style.display = 'block';
+          projectileInfoEl.innerHTML = '<em>Building collision tree...</em>';
+        }
+        viewer.setProjectilesEnabled(true, () => {
+          // Octree ready - hide loading message
+          if (projectileInfoEl) {
+            projectileInfoEl.innerHTML = '<em style="color: #4a4;">Ready! Click to shoot, hold to charge.</em>';
+            setTimeout(() => {
+              projectileInfoEl.style.display = 'none';
+            }, 2000);
+          }
+        });
+      } else {
+        viewer.setProjectilesEnabled(enabled);
+        if (projectileInfoEl) {
+          projectileInfoEl.style.display = 'none';
+        }
+      }
       projectilesEnabledCheckbox.blur();
     });
   }
@@ -4396,9 +4419,15 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     }
 
     const stats = metadata.stats || {};
-    const sourceLabel = (sourceTypeOverride || dataSourceManager?.getCurrentSourceType?.() || 'demo')
+    const sourceTypeLabel = (sourceTypeOverride || dataSourceManager?.getCurrentSourceType?.() || 'demo')
       .replace(/[-_]+/g, ' ')
       .replace(/\b\w/g, (c) => c.toUpperCase());
+
+    // Prefer dataset's own source name (from dataset_identity.json).
+    // Only fall back to the source-type label (e.g., "Local Demo")
+    // if the dataset source name is missing or empty.
+    const sourceName = (metadata.source?.name || '').trim();
+    const sourceLabel = sourceName || sourceTypeLabel;
 
     if (datasetNameEl) datasetNameEl.textContent = metadata.name || metadata.id || 'Dataset';
     if (datasetSourceEl) datasetSourceEl.textContent = sourceLabel;

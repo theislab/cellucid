@@ -76,6 +76,7 @@ function getPointsUrl() { return `${EXPORT_BASE_URL}points.bin`; }
   const moveSpeedDisplay = document.getElementById('move-speed-display');
   const invertLookCheckbox = document.getElementById('invert-look');
   const projectilesEnabledCheckbox = document.getElementById('projectiles-enabled');
+  const projectileInfoEl = document.getElementById('projectile-info');
   const pointerLockCheckbox = document.getElementById('pointer-lock');
   const orbitReverseCheckbox = document.getElementById('orbit-reverse');
   const showOrbitAnchorCheckbox = document.getElementById('show-orbit-anchor');
@@ -439,6 +440,7 @@ function getPointsUrl() { return `${EXPORT_BASE_URL}points.bin`; }
         moveSpeedDisplay,
         invertLookCheckbox,
         projectilesEnabledCheckbox,
+        projectileInfoEl,
         pointerLockCheckbox,
         orbitReverseCheckbox,
         showOrbitAnchorCheckbox,

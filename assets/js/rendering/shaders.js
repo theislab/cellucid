@@ -248,25 +248,40 @@ void main() {
   // Combine axis lines uniformly (max instead of additive blend)
   float combinedAxis = max(axisLine1, axisLine2);
 
-  // Apply fog for depth
-  float fogSpan = max(u_fogFarMean - u_fogNearMean, 0.0001);
-  float normalizedDistance = max(v_viewDistance - u_fogNearMean, 0.0) / fogSpan;
-  float extinction = u_fogDensity * u_fogDensity * 0.4;
-  float transmittance = exp(-extinction * normalizedDistance);
+  // === Perceptual Synchronization for Grid Lines and Surfaces ===
+  // Problem: Thin grid lines become imperceptible before thick axis lines
+  // due to line thinness reducing perceptual contrast at low alpha values.
+  // Solution: Decouple color intensity from alpha fading using perceptual curves.
 
-  // Combine plane alpha with opacity for smooth transitions
+  // Base effective opacity for all grid elements
   float effectiveOpacity = u_gridOpacity * u_planeAlpha;
 
-  // Mix grid with background
-  vec3 gridColorFogged = mix(u_bgColor, u_gridColor, transmittance);
-  vec3 finalColor = mix(u_bgColor, gridColorFogged, line * effectiveOpacity);
+  // Perceptual compensation curves:
+  // - Thin lines need boosted color to remain visible at low opacity
+  // - Thick axis lines need less boost (their thickness provides visibility)
+  // - Use power curves: lower exponent = more boost at low values
 
-  // Blend in unified axis color at edges (same thickness for all)
-  float axisIntensity = 0.6 * transmittance * u_planeAlpha;
+  // Grid line color curve: aggressive boost for thin lines
+  // pow(x, 0.55) keeps lines visible longer as opacity drops
+  float lineColorStrength = pow(effectiveOpacity, 0.55);
+
+  // Axis line color curve: moderate boost to sync with grid lines
+  // pow(x, 0.7) provides less boost since axis lines are 2.5x thicker
+  float axisColorStrength = pow(effectiveOpacity, 0.7);
+
+  // Grid line color mixing - uses boosted color strength
+  vec3 finalColor = mix(u_bgColor, u_gridColor, line * lineColorStrength);
+
+  // Axis lines use unified opacity base with perceptual curve
+  // (Previously used u_planeAlpha alone, causing desync with grid lines)
+  float axisIntensity = 0.6 * axisColorStrength;
   finalColor = mix(finalColor, u_axisXColor, combinedAxis * axisIntensity);
 
-  // Smooth alpha - fully transparent when plane is hidden
-  float alpha = effectiveOpacity * (0.85 + 0.15 * line * transmittance);
+  // === Surface Alpha for Smooth Background Blending ===
+  // Surface alpha uses linear effectiveOpacity for smooth fade to background
+  // Line/axis presence adds slight alpha boost for edge definition
+  float linePresence = max(line, combinedAxis * 0.7);
+  float alpha = effectiveOpacity * (0.85 + 0.15 * linePresence);
 
   // Discard nearly invisible fragments
   if (alpha < 0.01) discard;

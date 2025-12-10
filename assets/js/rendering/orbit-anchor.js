@@ -1,9 +1,9 @@
-// orbit-anchor.js - Professional Scientific Compass Visualization
-// Clean, minimal design inspired by precision scientific instruments
+// orbit-anchor.js - Precision Scientific Compass
+// Compact, elegant design inspired by marine navigation instruments and gyrocompasses
 // Features:
-// - Slim compass ring with fine graduations
-// - Elegant needle design
-// - Vertical elevation arc with clear degree markings
+// - Slim gimbal rings with fine graduations
+// - Classic compass needle with luminous north marker
+// - Precision elevation clinometer
 // - Per-view independent state for unlocked camera mode
 
 // === SHADERS ===
@@ -67,10 +67,11 @@ void main() {
   float NdotL = max(dot(N, L), 0.0);
   float NdotH = max(dot(N, H), 0.0);
 
-  float ambient = 0.35;
-  float diffuse = 0.55 * NdotL;
-  float specular = pow(NdotH, 64.0) * 0.25;
-  float fresnel = pow(1.0 - max(dot(N, V), 0.0), 3.0) * 0.15;
+  // Metallic instrument lighting
+  float ambient = 0.30;
+  float diffuse = 0.50 * NdotL;
+  float specular = pow(NdotH, 80.0) * 0.35;
+  float fresnel = pow(1.0 - max(dot(N, V), 0.0), 3.5) * 0.20;
 
   float lighting = mix(1.0, ambient + diffuse + specular + fresnel, u_lightingStrength);
   vec3 litColor = v_color.rgb * lighting + v_color.rgb * u_emissive * 0.5;
@@ -286,66 +287,76 @@ export class OrbitAnchorRenderer {
     }
   }
 
-  // Professional scientific color palette
+  // Professional scientific instrument color palette
   getColors(bgColor) {
     const luminance = bgColor[0] * 0.299 + bgColor[1] * 0.587 + bgColor[2] * 0.114;
     const isDark = luminance < 0.5;
 
     if (isDark) {
       return {
-        // Chrome/steel ring
-        ring: [0.75, 0.78, 0.82, 0.90],
-        ringInner: [0.65, 0.68, 0.72, 0.85],
-        // Fine tick marks
-        tickMinor: [0.60, 0.63, 0.68, 0.70],
-        tickMajor: [0.80, 0.82, 0.85, 0.90],
-        tickCardinal: [0.90, 0.92, 0.95, 1.0],
-        // North indicator - red
-        north: [0.95, 0.25, 0.20, 1.0],
-        // Center pivot - small and precise
-        center: [0.85, 0.87, 0.90, 1.0],
-        // Azimuth needle - cyan/blue
-        needle: [0.30, 0.75, 0.95, 1.0],
-        needleTip: [0.50, 0.85, 1.0, 1.0],
-        // Elevation arc - subtle blue
-        arc: [0.45, 0.65, 0.85, 0.75],
-        arcTick: [0.55, 0.72, 0.88, 0.85],
-        // Elevation indicator - warm gold
-        elevIndicator: [1.0, 0.78, 0.20, 1.0],
-        elevGlow: [1.0, 0.85, 0.40, 0.50],
+        // Brushed brass/bronze bezel - classic instrument
+        bezel: [0.72, 0.58, 0.38, 0.92],
+        bezelHighlight: [0.82, 0.68, 0.48, 0.95],
+        bezelShadow: [0.55, 0.42, 0.28, 0.88],
+        // Inner dial - ivory/cream like vintage instruments
+        dial: [0.92, 0.90, 0.85, 0.15],
+        // Graduation marks - bright and visible on dark backgrounds
+        tickFine: [0.72, 0.74, 0.78, 0.65],
+        tickMajor: [0.82, 0.84, 0.88, 0.85],
+        tickCardinal: [0.92, 0.94, 0.96, 0.95],
+        // North marker - classic red
+        north: [0.92, 0.20, 0.15, 1.0],
+        northGlow: [1.0, 0.30, 0.25, 0.60],
+        // Compass needle - blued steel
+        needleNorth: [0.92, 0.20, 0.15, 1.0],
+        needleSouth: [0.22, 0.28, 0.42, 0.95],
+        needleCenter: [0.70, 0.72, 0.75, 1.0],
+        // Gimbal ring - polished steel
+        gimbal: [0.78, 0.80, 0.84, 0.85],
+        gimbalDark: [0.55, 0.58, 0.62, 0.80],
+        // Elevation arc - matches gimbal ring
+        arc: [0.78, 0.80, 0.84, 0.85],
+        arcTick: [0.72, 0.74, 0.78, 0.80],
+        // Elevation indicator - luminous
+        elevMarker: [0.95, 0.85, 0.30, 1.0],
+        elevGlow: [1.0, 0.92, 0.50, 0.45],
       };
     } else {
       return {
-        // Darker steel for light backgrounds
-        ring: [0.35, 0.38, 0.42, 0.88],
-        ringInner: [0.45, 0.48, 0.52, 0.82],
-        // Tick marks
-        tickMinor: [0.50, 0.52, 0.55, 0.60],
-        tickMajor: [0.35, 0.38, 0.42, 0.85],
-        tickCardinal: [0.25, 0.28, 0.32, 1.0],
-        // North indicator
-        north: [0.85, 0.18, 0.12, 1.0],
-        // Center pivot
-        center: [0.30, 0.32, 0.35, 1.0],
-        // Azimuth needle
-        needle: [0.15, 0.50, 0.75, 1.0],
-        needleTip: [0.20, 0.55, 0.80, 1.0],
-        // Elevation arc
-        arc: [0.30, 0.50, 0.70, 0.70],
-        arcTick: [0.25, 0.45, 0.65, 0.80],
+        // Darker brass for light backgrounds
+        bezel: [0.50, 0.40, 0.25, 0.90],
+        bezelHighlight: [0.62, 0.50, 0.32, 0.92],
+        bezelShadow: [0.38, 0.30, 0.18, 0.85],
+        // Inner dial
+        dial: [0.15, 0.15, 0.18, 0.08],
+        // Graduation marks
+        tickFine: [0.35, 0.35, 0.38, 0.50],
+        tickMajor: [0.22, 0.22, 0.25, 0.75],
+        tickCardinal: [0.12, 0.12, 0.15, 0.90],
+        // North marker
+        north: [0.78, 0.12, 0.10, 1.0],
+        northGlow: [0.90, 0.25, 0.20, 0.50],
+        // Compass needle
+        needleNorth: [0.78, 0.12, 0.10, 1.0],
+        needleSouth: [0.25, 0.28, 0.40, 0.92],
+        needleCenter: [0.45, 0.48, 0.52, 1.0],
+        // Gimbal ring
+        gimbal: [0.45, 0.48, 0.52, 0.82],
+        gimbalDark: [0.32, 0.35, 0.40, 0.78],
+        // Elevation arc - matches gimbal ring
+        arc: [0.45, 0.48, 0.52, 0.82],
+        arcTick: [0.35, 0.38, 0.42, 0.75],
         // Elevation indicator
-        elevIndicator: [0.90, 0.60, 0.10, 1.0],
-        elevGlow: [0.95, 0.70, 0.20, 0.45],
+        elevMarker: [0.85, 0.65, 0.15, 1.0],
+        elevGlow: [0.92, 0.75, 0.25, 0.40],
       };
     }
   }
 
-  // Fixed anchor radius based on data bounds
+  // Compact anchor radius - precision instrument scale
   computeAnchorRadius(pointBoundsRadius) {
-    // Make the compass a prominent gyroscopic instrument at the center of the data.
-    // Slightly larger than previous versions so it reads clearly even in dense scenes.
     const base = (pointBoundsRadius || 1.0);
-    return base * 0.04;
+    return base * 0.018;  // Very compact, precise size
   }
 
   // === 3D GEOMETRY BUILDERS ===
@@ -411,7 +422,59 @@ export class OrbitAnchorRenderer {
     return { positions, normals, colors, indices, vertexCount: positions.length / 3 };
   }
 
-  // Thin torus for ring
+  // Beveled torus for bezel ring
+  _generateBeveledTorus(cx, cy, cz, majorRadius, minorRadius, majorSegs, minorSegs, innerColor, outerColor, axis = 'y') {
+    const positions = [], normals = [], colors = [], indices = [];
+
+    for (let i = 0; i <= majorSegs; i++) {
+      const u = (i / majorSegs) * Math.PI * 2;
+      const cosU = Math.cos(u), sinU = Math.sin(u);
+
+      for (let j = 0; j <= minorSegs; j++) {
+        const v = (j / minorSegs) * Math.PI * 2;
+        const cosV = Math.cos(v), sinV = Math.sin(v);
+
+        // Blend colors based on position on minor circle
+        const blend = (Math.sin(v) + 1.0) * 0.5;
+        const color = [
+          innerColor[0] * (1 - blend) + outerColor[0] * blend,
+          innerColor[1] * (1 - blend) + outerColor[1] * blend,
+          innerColor[2] * (1 - blend) + outerColor[2] * blend,
+          innerColor[3] * (1 - blend) + outerColor[3] * blend,
+        ];
+
+        const tubeRadius = majorRadius + minorRadius * cosV;
+
+        let px, py, pz, nx, ny, nz;
+        if (axis === 'y') {
+          px = tubeRadius * cosU; py = minorRadius * sinV; pz = tubeRadius * sinU;
+          nx = cosV * cosU; ny = sinV; nz = cosV * sinU;
+        } else if (axis === 'x') {
+          py = tubeRadius * cosU; pz = tubeRadius * sinU; px = minorRadius * sinV;
+          ny = cosV * cosU; nz = cosV * sinU; nx = sinV;
+        } else {
+          px = tubeRadius * cosU; pz = minorRadius * sinV; py = tubeRadius * sinU;
+          nx = cosV * cosU; nz = sinV; ny = cosV * sinU;
+        }
+
+        positions.push(cx + px, cy + py, cz + pz);
+        normals.push(nx, ny, nz);
+        colors.push(color[0], color[1], color[2], color[3]);
+      }
+    }
+
+    for (let i = 0; i < majorSegs; i++) {
+      for (let j = 0; j < minorSegs; j++) {
+        const a = i * (minorSegs + 1) + j;
+        const b = a + minorSegs + 1;
+        indices.push(a, b, a + 1, a + 1, b, b + 1);
+      }
+    }
+
+    return { positions, normals, colors, indices, vertexCount: positions.length / 3 };
+  }
+
+  // Simple torus
   _generateTorus(cx, cy, cz, majorRadius, minorRadius, majorSegs, minorSegs, color, axis = 'y', startAngle = 0, endAngle = Math.PI * 2) {
     const positions = [], normals = [], colors = [], indices = [];
     const angleRange = endAngle - startAngle;
@@ -454,7 +517,7 @@ export class OrbitAnchorRenderer {
     return { positions, normals, colors, indices, vertexCount: positions.length / 3 };
   }
 
-  // Cylinder for tick marks
+  // Cylinder for tick marks and needle
   _generateCylinder(x1, y1, z1, x2, y2, z2, radius, segments, color) {
     const positions = [], normals = [], colors = [], indices = [];
     const dx = x2 - x1, dy = y2 - y1, dz = z2 - z1;
@@ -488,34 +551,71 @@ export class OrbitAnchorRenderer {
     return { positions, normals, colors, indices, vertexCount: positions.length / 3 };
   }
 
-  // Diamond/rhombus shape for needle tip
-  _generateDiamond(cx, cy, cz, length, width, height, color, rotationY = 0) {
+  // Tapered cylinder for needle
+  _generateTaperedCylinder(x1, y1, z1, x2, y2, z2, radius1, radius2, segments, color) {
     const positions = [], normals = [], colors = [], indices = [];
+    const dx = x2 - x1, dy = y2 - y1, dz = z2 - z1;
+    const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (len < 0.0001) return { positions: [], normals: [], colors: [], indices: [], vertexCount: 0 };
 
-    // Diamond vertices: front tip, back tip, left, right, top, bottom
+    const ax = dx / len, ay = dy / len, az = dz / len;
+    let px, py, pz;
+    if (Math.abs(ay) < 0.9) { px = -az; py = 0; pz = ax; }
+    else { px = 1; py = 0; pz = 0; }
+    const pLen = Math.sqrt(px * px + py * py + pz * pz);
+    px /= pLen; py /= pLen; pz /= pLen;
+    const qx = ay * pz - az * py, qy = az * px - ax * pz, qz = ax * py - ay * px;
+
+    // First cap (larger radius)
+    for (let i = 0; i <= segments; i++) {
+      const angle = (i / segments) * Math.PI * 2;
+      const c = Math.cos(angle), s = Math.sin(angle);
+      const nx = px * c + qx * s, ny = py * c + qy * s, nz = pz * c + qz * s;
+      positions.push(x1 + nx * radius1, y1 + ny * radius1, z1 + nz * radius1);
+      normals.push(nx, ny, nz);
+      colors.push(color[0], color[1], color[2], color[3]);
+    }
+
+    // Second cap (smaller radius)
+    for (let i = 0; i <= segments; i++) {
+      const angle = (i / segments) * Math.PI * 2;
+      const c = Math.cos(angle), s = Math.sin(angle);
+      const nx = px * c + qx * s, ny = py * c + qy * s, nz = pz * c + qz * s;
+      positions.push(x2 + nx * radius2, y2 + ny * radius2, z2 + nz * radius2);
+      normals.push(nx, ny, nz);
+      colors.push(color[0], color[1], color[2], color[3]);
+    }
+
+    for (let i = 0; i < segments; i++) {
+      indices.push(i, i + segments + 1, i + 1, i + 1, i + segments + 1, i + segments + 2);
+    }
+
+    return { positions, normals, colors, indices, vertexCount: positions.length / 3 };
+  }
+
+  // Diamond tip for needle
+  _generateDiamondTip(cx, cy, cz, length, width, height, color, rotationY = 0) {
+    const positions = [], normals = [], colors = [], indices = [];
     const cosR = Math.cos(rotationY), sinR = Math.sin(rotationY);
 
     const verts = [
-      [length, 0, 0],      // front tip
-      [-length * 0.3, 0, 0], // back
-      [0, 0, width],       // left
-      [0, 0, -width],      // right
-      [0, height, 0],      // top
-      [0, -height, 0],     // bottom
+      [length, 0, 0],           // tip
+      [-length * 0.2, 0, 0],    // back
+      [0, 0, width],            // left
+      [0, 0, -width],           // right
+      [0, height, 0],           // top
+      [0, -height, 0],          // bottom
     ];
 
-    // Rotate and translate
     const transformed = verts.map(v => [
       cx + v[0] * cosR - v[2] * sinR,
       cy + v[1],
       cz + v[0] * sinR + v[2] * cosR
     ]);
 
-    // Faces: front-top-left, front-top-right, front-bottom-left, front-bottom-right
-    //        back-top-left, back-top-right, back-bottom-left, back-bottom-right
     const faces = [
-      [0, 4, 2], [0, 3, 4], [0, 2, 5], [0, 5, 3],  // front faces
-      [1, 2, 4], [1, 4, 3], [1, 5, 2], [1, 3, 5],  // back faces
+      [0, 4, 2], [0, 3, 4], [0, 2, 5], [0, 5, 3],
+      [1, 2, 4], [1, 4, 3], [1, 5, 2], [1, 3, 5],
     ];
 
     for (const face of faces) {
@@ -540,7 +640,7 @@ export class OrbitAnchorRenderer {
     return { positions, normals, colors, indices, vertexCount: positions.length / 3 };
   }
 
-  // Build 3D compass geometry - Professional scientific design
+  // Build 3D compass geometry - Precision scientific instrument
   buildGeometry3D(cx, cy, cz, r, viewTheta, viewPhi, bgColor) {
     const palette = this.getColors(bgColor);
 
@@ -562,56 +662,46 @@ export class OrbitAnchorRenderer {
       lineColors.push(...color, ...color);
     };
 
-    // === MAIN OUTER GYRO RING (3D compass body) ===
-    // Compact, high-visibility ring that frames the orbit target without dominating.
-    const ringRadius = r * 0.65;
-    const ringThickness = r * 0.014;
-    const mainRing = this._generateTorus(cx, cy, cz, ringRadius, ringThickness, 80, 14, palette.ring, 'y');
-    mergeGeometry(mainRing);
+    // === OUTER BEZEL RING - Beveled brass/bronze ===
+    const bezelRadius = r * 0.82;
+    const bezelThickness = r * 0.045;
+    const bezel = this._generateBeveledTorus(cx, cy, cz, bezelRadius, bezelThickness, 64, 12, palette.bezelShadow, palette.bezelHighlight, 'y');
+    mergeGeometry(bezel);
 
-    // Inner chapter ring gives a real-compass feel and breaks up the face.
-    const innerRingRadius = ringRadius * 0.75;
-    const innerRingThickness = ringThickness * 0.6;
-    const innerRing = this._generateTorus(cx, cy, cz, innerRingRadius, innerRingThickness, 72, 10, palette.ringInner, 'y');
-    mergeGeometry(innerRing);
+    // === INNER DIAL RING - thin chapter ring (moved inward for tick room) ===
+    const dialRadius = bezelRadius * 0.78;
+    const dialThickness = r * 0.016;
+    const dialRing = this._generateTorus(cx, cy, cz, dialRadius, dialThickness, 56, 8, palette.gimbal, 'y');
+    mergeGeometry(dialRing);
 
-    // Max tick length so that cardinal ticks reach exactly to the outer ring.
-    const maxTickLen = ringRadius - innerRingRadius;
+    // === CENTER PIVOT - polished steel jewel mount ===
+    const pivotSphere = this._generateSphere(cx, cy, cz, r * 0.09, 2, palette.needleCenter);
+    mergeGeometry(pivotSphere);
 
-    // === CENTER PIVOT - compact, precise sphere that anchors all rings ===
-    const centerSphere = this._generateSphere(cx, cy, cz, r * 0.030, 2, palette.center);
-    mergeGeometry(centerSphere);
-
-    // === TICK MARKS - cardinal / major / minor, like a real compass ===
-    // 10° spacing feels scientific but not cluttered.
-    for (let deg = 0; deg < 360; deg += 10) {
+    // === GRADUATION MARKS ===
+    // Fine ticks every 5°, major every 15°, cardinal every 90°
+    for (let deg = 0; deg < 360; deg += 5) {
       const angle = deg * Math.PI / 180;
       const isCardinal = deg % 90 === 0;
-      const isMajor = deg % 30 === 0;
-      const isMinor = !isCardinal && !isMajor;
+      const isMajor = deg % 15 === 0;
 
-      // Ticks run from the inner ring toward the outer ring.
-      // Cardinal ticks end exactly on the outer ring so that:
-      // outer radius = inner radius + tick length.
       let tickInner, tickOuter, tickRadius, tickColor;
 
-      const baseInner = innerRingRadius;
-
       if (isCardinal) {
-        tickInner = baseInner;
-        tickOuter = baseInner + maxTickLen; // = ringRadius
-        tickRadius = r * 0.006;
+        tickInner = dialRadius * 1.03;
+        tickOuter = bezelRadius * 0.94;
+        tickRadius = r * 0.011;
         tickColor = deg === 0 ? palette.north : palette.tickCardinal;
       } else if (isMajor) {
-        tickInner = baseInner + maxTickLen * 0.15;
-        tickOuter = baseInner + maxTickLen * 0.75;
-        tickRadius = r * 0.0045;
+        tickInner = dialRadius * 1.06;
+        tickOuter = bezelRadius * 0.92;
+        tickRadius = r * 0.007;
         tickColor = palette.tickMajor;
       } else {
-        tickInner = baseInner + maxTickLen * 0.30;
-        tickOuter = baseInner + maxTickLen * 0.55;
-        tickRadius = r * 0.0035;
-        tickColor = palette.tickMinor;
+        tickInner = dialRadius * 1.07;
+        tickOuter = bezelRadius * 0.90;
+        tickRadius = r * 0.0045;
+        tickColor = palette.tickFine;
       }
 
       const cosA = Math.cos(angle), sinA = Math.sin(angle);
@@ -623,122 +713,118 @@ export class OrbitAnchorRenderer {
       mergeGeometry(tick);
     }
 
-    // === NORTH ARROW - luminous marker on the outer gyro ring ===
-    const northDist = ringRadius + r * 0.045;
-    const northTip = this._generateDiamond(
-      cx + northDist, cy + r * 0.018, cz,
-      r * 0.040, r * 0.022, r * 0.013,
+    // === NORTH MARKER - luminous triangle ===
+    const northDist = bezelRadius + r * 0.065;
+    const northTip = this._generateDiamondTip(
+      cx + northDist, cy + r * 0.025, cz,
+      r * 0.065, r * 0.04, r * 0.02,
       palette.north, 0
     );
     mergeGeometry(northTip);
 
-    // === AZIMUTH NEEDLE - points to camera heading ===
-    // Adjust needle angle: viewTheta is the azimuth, add PI to point toward camera
+    // North glow
+    const northGlow = this._generateSphere(cx + northDist, cy + r * 0.025, cz, r * 0.032, 1, palette.northGlow);
+    mergeGeometry(northGlow);
+
+    // === COMPASS NEEDLE - classic two-tone design ===
     const needleAngle = viewTheta + Math.PI;
-    const needleLen = innerRingRadius - r * 0.05;
-    const needleStart = r * 0.055;
+    const needleLen = dialRadius * 0.90;
+    const needleStart = r * 0.12;
+    const needleHeight = r * 0.032;
 
-    // Needle body - slim cylinder floating slightly above the face
-    const needleBody = this._generateCylinder(
-      cx + Math.cos(needleAngle) * needleStart, cy + r * 0.020, cz + Math.sin(needleAngle) * needleStart,
-      cx + Math.cos(needleAngle) * needleLen,   cy + r * 0.020, cz + Math.sin(needleAngle) * needleLen,
-      r * 0.006, 8, palette.needle
+    // North half (red) - tapered
+    const cosN = Math.cos(needleAngle), sinN = Math.sin(needleAngle);
+    const northNeedle = this._generateTaperedCylinder(
+      cx + cosN * needleStart, cy + needleHeight, cz + sinN * needleStart,
+      cx + cosN * needleLen, cy + needleHeight, cz + sinN * needleLen,
+      r * 0.016, r * 0.005, 8, palette.needleNorth
     );
-    mergeGeometry(needleBody);
+    mergeGeometry(northNeedle);
 
-    // Needle tip - diamond shape at the forward end
-    const needleTip = this._generateDiamond(
-      cx + Math.cos(needleAngle) * needleLen, cy + r * 0.020, cz + Math.sin(needleAngle) * needleLen,
-      r * 0.030, r * 0.018, r * 0.011,
-      palette.needleTip, needleAngle
+    // North tip
+    const northNeedleTip = this._generateDiamondTip(
+      cx + cosN * needleLen, cy + needleHeight, cz + sinN * needleLen,
+      r * 0.045, r * 0.02, r * 0.013,
+      palette.needleNorth, needleAngle
     );
-    mergeGeometry(needleTip);
+    mergeGeometry(northNeedleTip);
 
-    // === ELEVATION ARC - slim vertical semicircle kept close to the compass ===
-    const arcRadius = innerRingRadius * 0.70;
-    const arcThickness = r * 0.007;
-    const arcRotation = 0;  // Fixed at North (0°) direction
+    // South half (blued steel) - tapered opposite direction
+    const southAngle = needleAngle + Math.PI;
+    const cosS = Math.cos(southAngle), sinS = Math.sin(southAngle);
+    const southNeedle = this._generateTaperedCylinder(
+      cx + cosS * needleStart, cy + needleHeight, cz + sinS * needleStart,
+      cx + cosS * needleLen * 0.60, cy + needleHeight, cz + sinS * needleLen * 0.60,
+      r * 0.016, r * 0.008, 8, palette.needleSouth
+    );
+    mergeGeometry(southNeedle);
 
-    // Create arc as series of small segments
-    const arcSegs = 40;
+    // South tail
+    const southTail = this._generateDiamondTip(
+      cx + cosS * needleLen * 0.60, cy + needleHeight, cz + sinS * needleLen * 0.60,
+      r * 0.032, r * 0.016, r * 0.010,
+      palette.needleSouth, southAngle
+    );
+    mergeGeometry(southTail);
+
+    // === GIMBAL/CLINOMETER RING - elevation arc (matches inner dial) ===
+    const arcRadius = dialRadius * 0.68;
+    const arcThickness = dialThickness;  // Match inner dial thickness
+    const arcSegs = 36;
+
+    // Create vertical arc facing north (fixed orientation for stability)
     for (let i = 0; i < arcSegs; i++) {
-      // Arc goes from -90° to +90° (bottom to top)
       const el1 = -Math.PI * 0.5 + (i / arcSegs) * Math.PI;
       const el2 = -Math.PI * 0.5 + ((i + 1) / arcSegs) * Math.PI;
 
       const x1 = arcRadius * Math.cos(el1), y1 = arcRadius * Math.sin(el1);
       const x2 = arcRadius * Math.cos(el2), y2 = arcRadius * Math.sin(el2);
 
-      // Rotate to face camera
-      const wx1 = x1 * Math.cos(arcRotation), wz1 = -x1 * Math.sin(arcRotation);
-      const wx2 = x2 * Math.cos(arcRotation), wz2 = -x2 * Math.sin(arcRotation);
-
       const arcSeg = this._generateCylinder(
-        cx + wx1, cy + y1, cz + wz1,
-        cx + wx2, cy + y2, cz + wz2,
+        cx + x1, cy + y1, cz,
+        cx + x2, cy + y2, cz,
         arcThickness, 6, palette.arc
       );
       mergeGeometry(arcSeg);
     }
 
-    // === ELEVATION TICK MARKS ===
-    const elevTicks = [-90, -60, -30, 0, 30, 60, 90];
-    for (const deg of elevTicks) {
+    // Clinometer graduation
+    for (const deg of [-90, -60, -30, 0, 30, 60, 90]) {
       const elRad = deg * Math.PI / 180;
       const isMajor = deg === 0 || Math.abs(deg) === 90;
 
       const arcX = arcRadius * Math.cos(elRad);
       const arcY = arcRadius * Math.sin(elRad);
-      const worldX = arcX * Math.cos(arcRotation);
-      const worldZ = -arcX * Math.sin(arcRotation);
 
-      const tickLen = isMajor ? r * 0.022 : r * 0.015;
-      const tickRadius = isMajor ? r * 0.0050 : r * 0.0035;
-
-      // Tick extends outward from arc
+      const tickLen = isMajor ? r * 0.035 : r * 0.020;
+      const tickRadius = isMajor ? r * 0.007 : r * 0.004;
       const outX = (arcRadius + tickLen) * Math.cos(elRad);
       const outY = (arcRadius + tickLen) * Math.sin(elRad);
-      const owx = outX * Math.cos(arcRotation);
-      const owz = -outX * Math.sin(arcRotation);
 
       const tick = this._generateCylinder(
-        cx + worldX, cy + arcY, cz + worldZ,
-        cx + owx, cy + outY, cz + owz,
+        cx + arcX, cy + arcY, cz,
+        cx + outX, cy + outY, cz,
         tickRadius, 5, palette.arcTick
       );
       mergeGeometry(tick);
     }
 
-    // === ELEVATION INDICATOR ===
-    // Adjust elevation by -90° to match coordinate system:
-    // - viewPhi = PI/2 (90°, horizontal view) → shows at 0° on arc (middle)
-    // - viewPhi = PI (180°, looking up) → shows at +90° (top)
-    // - viewPhi = 0 (looking down) → shows at -90° (bottom)
+    // === ELEVATION INDICATOR - luminous marker ===
     const adjustedPhi = viewPhi - Math.PI * 0.5;
     const clampedEl = Math.max(-Math.PI * 0.5, Math.min(Math.PI * 0.5, adjustedPhi));
 
     const elX = arcRadius * Math.cos(clampedEl);
     const elY = arcRadius * Math.sin(clampedEl);
-    const elWX = elX * Math.cos(arcRotation);
-    const elWZ = -elX * Math.sin(arcRotation);
 
-    // Main indicator sphere
-    const elevSphere = this._generateSphere(
-      cx + elWX, cy + elY, cz + elWZ,
-      r * 0.026, 2, palette.elevIndicator
-    );
+    const elevSphere = this._generateSphere(cx + elX, cy + elY, cz, r * 0.040, 2, palette.elevMarker);
     mergeGeometry(elevSphere);
 
-    // Subtle glow ring
-    const glowRing = this._generateTorus(
-      cx + elWX, cy + elY, cz + elWZ,
-      r * 0.035, r * 0.004, 12, 6, palette.elevGlow, 'z'
-    );
-    mergeGeometry(glowRing);
+    const elevGlow = this._generateTorus(cx + elX, cy + elY, cz, r * 0.052, r * 0.008, 12, 6, palette.elevGlow, 'z');
+    mergeGeometry(elevGlow);
 
-    // === SUBTLE CROSSHAIR at center ===
-    const crossLen = innerRingRadius * 0.68;
-    const crossColor = [palette.tickMinor[0], palette.tickMinor[1], palette.tickMinor[2], 0.55];
+    // === FINE CROSSHAIR at center ===
+    const crossLen = dialRadius * 0.55;
+    const crossColor = [palette.tickFine[0], palette.tickFine[1], palette.tickFine[2], 0.40];
     addLine(cx - crossLen, cy, cz, cx + crossLen, cy, cz, crossColor, [0, 1, 0]);
     addLine(cx, cy, cz - crossLen, cx, cy, cz + crossLen, crossColor, [0, 1, 0]);
 
@@ -756,8 +842,7 @@ export class OrbitAnchorRenderer {
     };
   }
 
-  // Build 2D compass geometry - Uses triangles for thick, visible lines
-  // This creates a clean, minimal but VISIBLE design for light/ultralight shaders
+  // Build 2D compass geometry - Clean, minimal design for light/ultralight shaders
   buildGeometry2D(cx, cy, cz, r, viewTheta, viewPhi, bgColor) {
     const positions = [];
     const normals = [];
@@ -768,7 +853,7 @@ export class OrbitAnchorRenderer {
     const addVertex = (x, y, z, color) => {
       const idx = positions.length / 3;
       positions.push(x, y, z);
-      normals.push(0, 1, 0);  // All normals point up for 2D
+      normals.push(0, 1, 0);
       colors.push(color[0], color[1], color[2], color[3]);
       return idx;
     };
@@ -777,17 +862,15 @@ export class OrbitAnchorRenderer {
       indices.push(i1, i2, i3);
     };
 
-    // Draw a thick line as a flat quad (billboard-style, lying flat)
+    // Thick line as flat quad
     const addThickLine = (x1, y1, z1, x2, y2, z2, color, width) => {
       const dx = x2 - x1, dz = z2 - z1;
       const len = Math.sqrt(dx * dx + dz * dz);
       if (len < 0.0001) return;
 
-      // Perpendicular vector in XZ plane
       const px = -dz / len * width;
       const pz = dx / len * width;
 
-      // Create quad corners
       const i1 = addVertex(x1 + px, y1, z1 + pz, color);
       const i2 = addVertex(x1 - px, y1, z1 - pz, color);
       const i3 = addVertex(x2 + px, y2, z2 + pz, color);
@@ -797,13 +880,12 @@ export class OrbitAnchorRenderer {
       addTriangle(i2, i4, i3);
     };
 
-    // Draw a thick 3D line (for elevation arc)
+    // 3D thick line for elevation arc
     const addThickLine3D = (x1, y1, z1, x2, y2, z2, color, width) => {
       const dx = x2 - x1, dz = z2 - z1;
       const lenXZ = Math.sqrt(dx * dx + dz * dz);
       if (lenXZ < 0.0001) return;
 
-      // Get perpendicular in XZ plane
       const px = -dz / lenXZ * width;
       const pz = dx / lenXZ * width;
 
@@ -816,7 +898,7 @@ export class OrbitAnchorRenderer {
       addTriangle(i2, i4, i3);
     };
 
-    // Draw a filled circle (flat disc)
+    // Filled disc
     const addDisc = (ccx, ccy, ccz, radius, segments, color) => {
       const centerIdx = addVertex(ccx, ccy, ccz, color);
       const firstIdx = positions.length / 3;
@@ -831,7 +913,7 @@ export class OrbitAnchorRenderer {
       }
     };
 
-    // Draw ring (thick circle outline)
+    // Ring outline
     const addRing = (ccx, ccy, ccz, innerRadius, outerRadius, segments, color) => {
       const firstInner = positions.length / 3;
 
@@ -849,7 +931,7 @@ export class OrbitAnchorRenderer {
       }
     };
 
-    // Draw filled triangle
+    // Filled triangle
     const addFilledTriangle = (x1, y1, z1, x2, y2, z2, x3, y3, z3, color) => {
       const i1 = addVertex(x1, y1, z1, color);
       const i2 = addVertex(x2, y2, z2, color);
@@ -857,54 +939,44 @@ export class OrbitAnchorRenderer {
       addTriangle(i1, i2, i3);
     };
 
-    const baseWidth = r * 0.010;  // Base line width
-    const ringRadius = r * 0.65;
-    const ringWidth = r * 0.015;
-    const innerRingRadius = ringRadius * 0.75;
-    const innerRingWidth = ringWidth * 0.60;
-    const maxTickLen = ringRadius - innerRingRadius;
+    const baseWidth = r * 0.016;
+    const bezelRadius = r * 0.82;
+    const bezelWidth = r * 0.032;
+    const dialRadius = bezelRadius * 0.78;  // Moved inward for tick room
+    const dialWidth = r * 0.014;
 
-    // === MAIN OUTER RING - gyro bezel ===
-    addRing(cx, cy, cz, ringRadius - ringWidth, ringRadius + ringWidth, 80, palette.ring);
+    // === OUTER BEZEL ===
+    addRing(cx, cy, cz, bezelRadius - bezelWidth, bezelRadius + bezelWidth, 64, palette.bezel);
 
-    // === INNER CHAPTER RING ===
-    addRing(
-      cx,
-      cy,
-      cz,
-      innerRingRadius - innerRingWidth,
-      innerRingRadius + innerRingWidth,
-      72,
-      palette.ringInner
-    );
+    // === INNER DIAL RING ===
+    addRing(cx, cy, cz, dialRadius - dialWidth, dialRadius + dialWidth, 56, palette.gimbal);
 
-    // === CENTER DISC ===
-    addDisc(cx, cy + r * 0.002, cz, r * 0.038, 16, palette.center);
+    // === CENTER PIVOT ===
+    addDisc(cx, cy + r * 0.002, cz, r * 0.085, 16, palette.needleCenter);
 
-    // === TICK MARKS ===
-    for (let deg = 0; deg < 360; deg += 10) {
+    // === GRADUATION MARKS ===
+    for (let deg = 0; deg < 360; deg += 5) {
       const angle = deg * Math.PI / 180;
       const isCardinal = deg % 90 === 0;
-      const isMajor = deg % 30 === 0;
+      const isMajor = deg % 15 === 0;
 
-      const tickBaseInner = innerRingRadius;
       let tickInner, tickOuter, tickWidth, tickColor;
 
       if (isCardinal) {
-        tickInner = tickBaseInner;
-        tickOuter = tickBaseInner + maxTickLen; // = ringRadius
-        tickWidth = baseWidth * 1.6;
+        tickInner = dialRadius * 1.03;
+        tickOuter = bezelRadius * 0.94;
+        tickWidth = baseWidth * 2.0;
         tickColor = deg === 0 ? palette.north : palette.tickCardinal;
       } else if (isMajor) {
-        tickInner = tickBaseInner + maxTickLen * 0.15;
-        tickOuter = tickBaseInner + maxTickLen * 0.75;
-        tickWidth = baseWidth * 1.2;
+        tickInner = dialRadius * 1.06;
+        tickOuter = bezelRadius * 0.92;
+        tickWidth = baseWidth * 1.4;
         tickColor = palette.tickMajor;
       } else {
-        tickInner = tickBaseInner + maxTickLen * 0.30;
-        tickOuter = tickBaseInner + maxTickLen * 0.55;
-        tickWidth = baseWidth * 0.9;
-        tickColor = palette.tickMinor;
+        tickInner = dialRadius * 1.07;
+        tickOuter = bezelRadius * 0.90;
+        tickWidth = baseWidth * 1.0;
+        tickColor = palette.tickFine;
       }
 
       const cosA = Math.cos(angle), sinA = Math.sin(angle);
@@ -915,40 +987,63 @@ export class OrbitAnchorRenderer {
       );
     }
 
-    // === NORTH ARROW - luminous marker on gyro ring ===
-    const northBase = ringRadius + ringWidth * 1.6;
-    const northTip = ringRadius + ringWidth * 2.8;
-    const northWidth = r * 0.035;
+    // === NORTH MARKER ===
+    const northBase = bezelRadius + bezelWidth * 1.2;
+    const northTipDist = bezelRadius + bezelWidth * 2.5;
+    const northWidth = r * 0.055;
     addFilledTriangle(
-      cx + northTip, cy + r * 0.003, cz,
+      cx + northTipDist, cy + r * 0.004, cz,
       cx + northBase, cy, cz - northWidth,
       cx + northBase, cy, cz + northWidth,
       palette.north
     );
 
-    // === AZIMUTH NEEDLE - tapered thick line ===
+    // === COMPASS NEEDLE ===
     const needleAngle = viewTheta + Math.PI;
-    const needleLen = innerRingRadius - r * 0.045;
-    const needleStart = r * 0.060;
+    const needleLen = dialRadius * 0.90;
+    const needleStart = r * 0.12;
     const cosN = Math.cos(needleAngle), sinN = Math.sin(needleAngle);
 
-    // Needle as filled triangle (tapered)
+    // North needle (tapered triangle)
+    const needleTipX = cx + cosN * needleLen;
+    const needleTipZ = cz + sinN * needleLen;
+    const needleBaseX = cx + cosN * needleStart;
+    const needleBaseZ = cz + sinN * needleStart;
+    const perpCos = Math.cos(needleAngle + Math.PI/2);
+    const perpSin = Math.sin(needleAngle + Math.PI/2);
+
     addFilledTriangle(
-      cx + cosN * needleLen, cy + r * 0.003, cz + sinN * needleLen,
-      cx + cosN * needleStart + Math.cos(needleAngle + Math.PI/2) * baseWidth * 2, cy, cz + sinN * needleStart + Math.sin(needleAngle + Math.PI/2) * baseWidth * 2,
-      cx + cosN * needleStart + Math.cos(needleAngle - Math.PI/2) * baseWidth * 2, cy, cz + sinN * needleStart + Math.sin(needleAngle - Math.PI/2) * baseWidth * 2,
-      palette.needle
+      needleTipX, cy + r * 0.004, needleTipZ,
+      needleBaseX + perpCos * baseWidth * 2.2, cy, needleBaseZ + perpSin * baseWidth * 2.2,
+      needleBaseX - perpCos * baseWidth * 2.2, cy, needleBaseZ - perpSin * baseWidth * 2.2,
+      palette.needleNorth
     );
 
     // Needle tip disc
-    addDisc(cx + cosN * needleLen, cy + r * 0.003, cz + sinN * needleLen, r * 0.025, 12, palette.needleTip);
+    addDisc(needleTipX, cy + r * 0.004, needleTipZ, r * 0.030, 10, palette.needleNorth);
 
-    // === ELEVATION ARC - thick arc kept close to compass ===
-    const arcRadius2 = innerRingRadius * 0.70;
-    const arcWidth = baseWidth * 1.0;
-    const arcSegs = 32;
-    const arcRotation2D = 0;  // Fixed at North (0°) direction
-    const cosArc = Math.cos(arcRotation2D), sinArc = Math.sin(arcRotation2D);
+    // South needle (shorter, different color)
+    const southAngle = needleAngle + Math.PI;
+    const cosS = Math.cos(southAngle), sinS = Math.sin(southAngle);
+    const southLen = needleLen * 0.60;
+    const southTipX = cx + cosS * southLen;
+    const southTipZ = cz + sinS * southLen;
+    const southBaseX = cx + cosS * needleStart;
+    const southBaseZ = cz + sinS * needleStart;
+    const sPerpCos = Math.cos(southAngle + Math.PI/2);
+    const sPerpSin = Math.sin(southAngle + Math.PI/2);
+
+    addFilledTriangle(
+      southTipX, cy + r * 0.004, southTipZ,
+      southBaseX + sPerpCos * baseWidth * 2.0, cy, southBaseZ + sPerpSin * baseWidth * 2.0,
+      southBaseX - sPerpCos * baseWidth * 2.0, cy, southBaseZ - sPerpSin * baseWidth * 2.0,
+      palette.needleSouth
+    );
+
+    // === ELEVATION ARC (matches inner dial) ===
+    const arcRadius2 = dialRadius * 0.68;
+    const arcWidth = dialWidth;  // Match inner dial width
+    const arcSegs = 28;
 
     for (let i = 0; i < arcSegs; i++) {
       const el1 = -Math.PI * 0.5 + (i / arcSegs) * Math.PI;
@@ -957,50 +1052,39 @@ export class OrbitAnchorRenderer {
       const x1 = arcRadius2 * Math.cos(el1), y1 = arcRadius2 * Math.sin(el1);
       const x2 = arcRadius2 * Math.cos(el2), y2 = arcRadius2 * Math.sin(el2);
 
-      const wx1 = x1 * cosArc, wz1 = -x1 * sinArc;
-      const wx2 = x2 * cosArc, wz2 = -x2 * sinArc;
-
-      addThickLine3D(cx + wx1, cy + y1, cz + wz1, cx + wx2, cy + y2, cz + wz2, palette.arc, arcWidth);
+      addThickLine3D(cx + x1, cy + y1, cz, cx + x2, cy + y2, cz, palette.arc, arcWidth);
     }
 
-    // === ELEVATION TICKS ===
+    // Elevation ticks
     for (const deg of [-90, -45, 0, 45, 90]) {
       const elRad = deg * Math.PI / 180;
       const isMajor = deg === 0 || Math.abs(deg) === 90;
 
       const arcX = arcRadius2 * Math.cos(elRad);
       const arcY = arcRadius2 * Math.sin(elRad);
-      const worldX = arcX * cosArc;
-      const worldZ = -arcX * sinArc;
 
-      const tickLen = isMajor ? r * 0.032 : r * 0.020;
+      const tickLen = isMajor ? r * 0.038 : r * 0.024;
       const outX = (arcRadius2 + tickLen) * Math.cos(elRad);
       const outY = (arcRadius2 + tickLen) * Math.sin(elRad);
-      const owx = outX * cosArc;
-      const owz = -outX * sinArc;
 
       addThickLine3D(
-        cx + worldX, cy + arcY, cz + worldZ,
-        cx + owx, cy + outY, cz + owz,
-        palette.arcTick, isMajor ? baseWidth * 1.2 : baseWidth * 0.8
+        cx + arcX, cy + arcY, cz,
+        cx + outX, cy + outY, cz,
+        palette.arcTick, isMajor ? baseWidth * 1.6 : baseWidth * 1.0
       );
     }
 
-    // === ELEVATION INDICATOR - filled disc ===
-    // Adjust by -90° to match coordinate system
+    // === ELEVATION INDICATOR ===
     const adjustedPhi = viewPhi - Math.PI * 0.5;
     const clampedEl = Math.max(-Math.PI * 0.5, Math.min(Math.PI * 0.5, adjustedPhi));
     const elX = arcRadius2 * Math.cos(clampedEl);
     const elY = arcRadius2 * Math.sin(clampedEl);
-    const elWX = elX * cosArc;
-    const elWZ = -elX * sinArc;
 
-    // Indicator as bright disc
-    addDisc(cx + elWX, cy + elY, cz + elWZ, r * 0.04, 12, palette.elevIndicator);
+    addDisc(cx + elX, cy + elY, cz, r * 0.045, 12, palette.elevMarker);
 
-    // Glow ring around indicator
-    const glowColor = [palette.elevIndicator[0], palette.elevIndicator[1], palette.elevIndicator[2], palette.elevIndicator[3] * 0.4];
-    addRing(cx + elWX, cy + elY, cz + elWZ, r * 0.04, r * 0.055, 12, glowColor);
+    // Glow ring
+    const glowColor = [palette.elevMarker[0], palette.elevMarker[1], palette.elevMarker[2], palette.elevMarker[3] * 0.35];
+    addRing(cx + elX, cy + elY, cz, r * 0.045, r * 0.062, 12, glowColor);
 
     return {
       positions: new Float32Array(positions),
@@ -1009,7 +1093,7 @@ export class OrbitAnchorRenderer {
       indices: new Uint16Array(indices),
       indexCount: indices.length,
       vertexCount: positions.length / 3,
-      useTriangles: true  // Flag to indicate this uses indexed triangles
+      useTriangles: true
     };
   }
 
@@ -1149,7 +1233,7 @@ export class OrbitAnchorRenderer {
       gl.uniform3fv(this.uniforms3D.fogColor, fogColor);
       gl.uniform1f(this.uniforms3D.lightingStrength, lightingStrength);
       gl.uniform3fv(this.uniforms3D.lightDir, lightDir);
-      gl.uniform1f(this.uniforms3D.emissive, 0.15);
+      gl.uniform1f(this.uniforms3D.emissive, 0.12);
 
       gl.bindBuffer(gl.ARRAY_BUFFER, viewState.positionBuffer);
       gl.enableVertexAttribArray(this.attribs3D.position);
@@ -1185,8 +1269,7 @@ export class OrbitAnchorRenderer {
       gl.disableVertexAttribArray(this.attribs3D.normal);
       gl.disableVertexAttribArray(this.attribs3D.color);
     } else {
-      // 2D mode now uses triangles for thick, visible lines
-      // Use the 3D program but with minimal lighting for flat appearance
+      // 2D mode uses triangles with minimal lighting
       gl.useProgram(this.program3D);
       gl.uniformMatrix4fv(this.uniforms3D.mvpMatrix, false, mvpMatrix);
       gl.uniformMatrix4fv(this.uniforms3D.viewMatrix, false, viewMatrix);
@@ -1196,9 +1279,9 @@ export class OrbitAnchorRenderer {
       gl.uniform1f(this.uniforms3D.fogNear, fogNear);
       gl.uniform1f(this.uniforms3D.fogFar, fogFar);
       gl.uniform3fv(this.uniforms3D.fogColor, fogColor);
-      gl.uniform1f(this.uniforms3D.lightingStrength, 0.3);  // Subtle lighting for 2D
+      gl.uniform1f(this.uniforms3D.lightingStrength, 0.25);
       gl.uniform3fv(this.uniforms3D.lightDir, lightDir);
-      gl.uniform1f(this.uniforms3D.emissive, 0.4);  // Higher emissive for flatter look
+      gl.uniform1f(this.uniforms3D.emissive, 0.45);
 
       gl.bindBuffer(gl.ARRAY_BUFFER, viewState.positionBuffer);
       gl.enableVertexAttribArray(this.attribs3D.position);
