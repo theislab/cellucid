@@ -55,6 +55,11 @@ class DataState {
     this._fieldDataCache = new Map(); // field.key -> loaded arrays (shared across views)
     this._varFieldDataCache = new Map(); // var.field.key -> loaded arrays
 
+    // Multi-dimensional embedding support
+    this.dimensionManager = null; // Set via setDimensionManager()
+    this.activeDimensionLevel = 3; // Current dimension level for live view (1, 2, 3, or 4)
+    this._dimensionChangeCallbacks = new Set();
+
     // Cell highlighting/selection state - multi-page system
     // Each page contains its own independent set of highlight groups
     this.highlightPages = []; // Array of { id, name, highlightedGroups: [] }
@@ -105,6 +110,326 @@ class DataState {
     }
 
     this._batchDirty = { visibility: false, colors: false, affectedFields: new Set() };
+  }
+
+  // --- Multi-dimensional embedding methods -----------------------------------
+
+  /**
+   * Set the dimension manager instance
+   * @param {DimensionManager} manager - The dimension manager
+   */
+  setDimensionManager(manager) {
+    this.dimensionManager = manager;
+    if (manager) {
+      this.activeDimensionLevel = manager.getDefaultDimension();
+    }
+  }
+
+  /**
+   * Get dimension manager
+   * @returns {DimensionManager|null}
+   */
+  getDimensionManager() {
+    return this.dimensionManager;
+  }
+
+  /**
+   * Get current dimension level for the active view
+   * @returns {number} Dimension level (1, 2, 3, or 4)
+   */
+  getDimensionLevel() {
+    return this.activeDimensionLevel;
+  }
+
+  /**
+   * Get dimension level for a specific view
+   * @param {string} viewId - View identifier
+   * @returns {number} Dimension level (1, 2, 3, or 4)
+   */
+  getViewDimensionLevel(viewId) {
+    const ctx = this.viewContexts.get(String(viewId));
+    if (ctx && ctx.dimensionLevel !== undefined) {
+      return ctx.dimensionLevel;
+    }
+    return this.dimensionManager?.getDefaultDimension() ?? 3;
+  }
+
+  /**
+   * Set dimension level for the active view (or a specific view)
+   * @param {number} level - Dimension level (1, 2, 3, or 4)
+   * @param {Object} options - Options
+   * @param {boolean} options.updateViewer - Whether to update viewer positions
+   * @param {string} options.viewId - Specific view ID to update (defaults to active view)
+   * @returns {Promise<void>}
+   */
+  async setDimensionLevel(level, { updateViewer = true, viewId = null } = {}) {
+    if (!this.dimensionManager) {
+      console.warn('[State] No dimension manager set');
+      return;
+    }
+
+    if (!this.dimensionManager.hasDimension(level)) {
+      console.warn(`[State] Dimension ${level}D not available`);
+      return;
+    }
+
+    // Handle 4D error
+    if (level === 4) {
+      throw new Error('4D visualization is not yet implemented');
+    }
+
+    // Determine which view to update
+    const targetViewId = viewId ?? this.activeViewId;
+    const isActiveView = String(targetViewId) === String(this.activeViewId);
+
+    // Get the view context
+    const ctx = this.viewContexts.get(String(targetViewId));
+    const previousLevel = isActiveView ? this.activeDimensionLevel : (ctx?.dimensionLevel ?? this.activeDimensionLevel);
+
+    // Skip if no change
+    if (previousLevel === level) {
+      return;
+    }
+
+    // Update the view context's dimension level
+    if (ctx) {
+      ctx.dimensionLevel = level;
+    }
+
+    // Update dimension manager's per-view tracking
+    this.dimensionManager.setViewDimension(targetViewId, level);
+
+    // If this is the active view, also update activeDimensionLevel
+    if (isActiveView) {
+      this.activeDimensionLevel = level;
+    }
+
+    // Load positions for the new dimension
+    if (updateViewer && this.viewer) {
+      try {
+        const positions3D = await this.dimensionManager.getPositions3D(level);
+
+        // IMPORTANT: Use 'live' check, NOT isActiveView, to determine which buffer to update.
+        // Snapshot views should ALWAYS update their snapshot buffers, even if "active" in UI.
+        // Only the live view should update main positions.
+        const isLiveView = String(targetViewId) === 'live';
+
+        if (isLiveView) {
+          // Live view: update main positions
+          this._updateViewerPositions(positions3D);
+
+          // Rebuild centroids for the new dimension
+          // IMPORTANT: Temporarily set activeDimensionLevel so buildCentroidsForField uses correct dimension
+          const savedDimLevel = this.activeDimensionLevel;
+          this.activeDimensionLevel = level;
+          // Use getFieldForView to get live's field, NOT getActiveField which returns active view's field
+          const liveField = this.getFieldForView('live');
+          if (liveField && liveField.kind === 'category') {
+            this.buildCentroidsForField(liveField, { viewId: 'live' });
+            // Push directly to live view's centroid buffers (don't use _pushCentroidsToViewer
+            // which checks activeViewId and might push to wrong view)
+            if (this.viewer) {
+              this.viewer.setCentroids({
+                positions: this.centroidPositions || new Float32Array(),
+                colors: this.centroidColors || new Uint8Array(),
+                outlierQuantiles: this.centroidOutliers || new Float32Array()
+              });
+              if (this.viewer.setCentroidLabels) {
+                this.viewer.setCentroidLabels(this.centroidLabels, 'live');
+              }
+            }
+            // Save centroids to live view's context (consistent with snapshot handling)
+            if (ctx) {
+              ctx.centroidPositions = this.centroidPositions ? new Float32Array(this.centroidPositions) : null;
+              ctx.centroidColors = this.centroidColors ? new Uint8Array(this.centroidColors) : null;
+              ctx.centroidOutliers = this.centroidOutliers ? new Float32Array(this.centroidOutliers) : null;
+              ctx.centroidLabels = this.centroidLabels ? this.centroidLabels.map(c => c ? { ...c } : c) : [];
+            }
+          }
+          // Restore if live wasn't active (but keep if it was, which was already set above)
+          if (!isActiveView) {
+            this.activeDimensionLevel = savedDimLevel;
+            // IMPORTANT: Restore active view's centroid state since buildCentroidsForField
+            // overwrote it with live's data
+            const activeCtx = this.viewContexts.get(String(this.activeViewId));
+            if (activeCtx) {
+              this.centroidPositions = activeCtx.centroidPositions ? new Float32Array(activeCtx.centroidPositions) : null;
+              this.centroidColors = activeCtx.centroidColors ? new Uint8Array(activeCtx.centroidColors) : null;
+              this.centroidOutliers = activeCtx.centroidOutliers ? new Float32Array(activeCtx.centroidOutliers) : null;
+              this.centroidLabels = activeCtx.centroidLabels || [];
+            }
+          }
+        } else {
+          // Snapshot view: update viewer's per-view position cache
+          // The viewer will use this to update the snapshot buffer
+          if (this.viewer.setViewPositions) {
+            this.viewer.setViewPositions(targetViewId, positions3D);
+          }
+
+          // Rebuild centroids for this snapshot view using its new dimension
+          // We need to temporarily set activeDimensionLevel for buildCentroidsForField
+          const savedDimLevel = this.activeDimensionLevel;
+          this.activeDimensionLevel = level;
+
+          // Get the field for this snapshot view from its context
+          const snapshotField = this.getFieldForView(targetViewId);
+          if (snapshotField && snapshotField.kind === 'category') {
+            this.buildCentroidsForField(snapshotField, { viewId: targetViewId });
+            // Update the snapshot's centroid data in viewer
+            if (this.viewer.updateSnapshotAttributes) {
+              this.viewer.updateSnapshotAttributes(targetViewId, {
+                centroidPositions: this.centroidPositions || new Float32Array(),
+                centroidColors: this.centroidColors || new Uint8Array(),
+                centroidOutliers: this.centroidOutliers || new Float32Array()
+              });
+            }
+            // Update centroid labels for this view
+            if (this.viewer.setCentroidLabels) {
+              this.viewer.setCentroidLabels(this.centroidLabels, targetViewId);
+            }
+            // Also save centroids to the view's context
+            if (ctx) {
+              ctx.centroidPositions = this.centroidPositions ? new Float32Array(this.centroidPositions) : null;
+              ctx.centroidColors = this.centroidColors ? new Uint8Array(this.centroidColors) : null;
+              ctx.centroidOutliers = this.centroidOutliers ? new Float32Array(this.centroidOutliers) : null;
+              ctx.centroidLabels = this.centroidLabels ? this.centroidLabels.map(c => c ? { ...c } : c) : [];
+            }
+          }
+
+          // Restore activeDimensionLevel
+          this.activeDimensionLevel = savedDimLevel;
+
+          // IMPORTANT: If this snapshot is not the active view, restore active view's centroid state
+          // since buildCentroidsForField overwrote it with snapshot's data
+          if (!isActiveView) {
+            const activeCtx = this.viewContexts.get(String(this.activeViewId));
+            if (activeCtx) {
+              this.centroidPositions = activeCtx.centroidPositions ? new Float32Array(activeCtx.centroidPositions) : null;
+              this.centroidColors = activeCtx.centroidColors ? new Uint8Array(activeCtx.centroidColors) : null;
+              this.centroidOutliers = activeCtx.centroidOutliers ? new Float32Array(activeCtx.centroidOutliers) : null;
+              this.centroidLabels = activeCtx.centroidLabels || [];
+            }
+          }
+        }
+      } catch (err) {
+        console.error(`[State] Failed to load ${level}D positions:`, err);
+        // Revert to previous level
+        if (ctx) ctx.dimensionLevel = previousLevel;
+        if (isActiveView) this.activeDimensionLevel = previousLevel;
+        this.dimensionManager.setViewDimension(targetViewId, previousLevel);
+        throw err;
+      }
+    }
+
+    // Update viewer's per-view dimension tracking for multiview rendering
+    if (this.viewer && this.viewer.setViewDimension) {
+      this.viewer.setViewDimension(targetViewId, level);
+    }
+
+    // Notify callbacks (only if active view changed, or always for UI sync)
+    if (isActiveView) {
+      this._notifyDimensionChange();
+    }
+  }
+
+  /**
+   * Set dimension level for a specific view (convenience method for multiview)
+   * @param {string} viewId - View identifier
+   * @param {number} level - Dimension level (1, 2, 3, or 4)
+   * @returns {Promise<void>}
+   */
+  async setViewDimensionLevel(viewId, level) {
+    return this.setDimensionLevel(level, { viewId, updateViewer: true });
+  }
+
+  /**
+   * Update viewer with new positions
+   * @param {Float32Array} positions3D - 3D positions array
+   */
+  _updateViewerPositions(positions3D) {
+    if (!this.viewer) return;
+
+    // Store as current positions
+    this.positionsArray = positions3D;
+
+    // Update viewer data
+    if (this.viewer.updatePositions) {
+      this.viewer.updatePositions(positions3D);
+    } else if (this.viewer.setData) {
+      // Full data reload if no incremental update available
+      this.viewer.setData({
+        positions: positions3D,
+        colors: this.colorsArray,
+        outlierQuantiles: this.outlierQuantilesArray,
+        transparency: this.categoryTransparency
+      });
+    }
+  }
+
+  /**
+   * Add callback for dimension changes
+   * @param {Function} callback - Callback function
+   */
+  addDimensionChangeCallback(callback) {
+    if (typeof callback === 'function') {
+      this._dimensionChangeCallbacks.add(callback);
+    }
+  }
+
+  /**
+   * Remove dimension change callback
+   * @param {Function} callback - Callback to remove
+   */
+  removeDimensionChangeCallback(callback) {
+    this._dimensionChangeCallbacks.delete(callback);
+  }
+
+  /**
+   * Notify all dimension change callbacks
+   */
+  _notifyDimensionChange() {
+    const level = this.activeDimensionLevel;
+    this._dimensionChangeCallbacks.forEach((cb) => {
+      try {
+        cb(level);
+      } catch (err) {
+        console.error('[State] Dimension change callback failed:', err);
+      }
+    });
+  }
+
+  /**
+   * Reset dimension level without loading positions (for dataset reload)
+   * Used when switching datasets - positions are already loaded via initScene
+   * @param {number} level - New dimension level
+   */
+  resetDimensionLevel(level) {
+    this.activeDimensionLevel = level;
+
+    // Clear all view context dimension levels
+    for (const ctx of this.viewContexts.values()) {
+      ctx.dimensionLevel = level;
+    }
+
+    // Notify callbacks
+    this._notifyDimensionChange();
+  }
+
+  /**
+   * Get available dimensions from dimension manager
+   * @returns {number[]} Array of available dimension levels
+   */
+  getAvailableDimensions() {
+    return this.dimensionManager?.getAvailableDimensions() ?? [3];
+  }
+
+  /**
+   * Check if a specific dimension is available
+   * @param {number} dim - Dimension level
+   * @returns {boolean}
+   */
+  hasDimension(dim) {
+    return this.dimensionManager?.hasDimension(dim) ?? (dim === 3);
   }
 
   // --- View context helpers ---------------------------------------------------
@@ -161,7 +486,8 @@ class DataState {
       varData: this._cloneVarData(this.varData),
       activeFieldIndex: this.activeFieldIndex,
       activeVarFieldIndex: this.activeVarFieldIndex,
-      activeFieldSource: this.activeFieldSource
+      activeFieldSource: this.activeFieldSource,
+      dimensionLevel: this.activeDimensionLevel // Include dimension level in context
     };
 
     const wrap = (arr) => {
@@ -238,6 +564,8 @@ class DataState {
     ctx.centroidOutliers = this.centroidOutliers;
     ctx.centroidLabels = this.centroidLabels;
     ctx.filteredCount = this.filteredCount;
+    // Sync dimension level to context
+    ctx.dimensionLevel = this.activeDimensionLevel;
   }
 
   _resetViewContexts() {
@@ -311,6 +639,8 @@ class DataState {
         prevCtx.centroidOutliers = this.centroidOutliers ? new Float32Array(this.centroidOutliers) : null;
         prevCtx.centroidLabels = this.centroidLabels ? this.centroidLabels.map(c => c ? { ...c } : c) : [];
         prevCtx.filteredCount = this.filteredCount ? { ...this.filteredCount } : { shown: this.pointCount, total: this.pointCount };
+        // Save dimension level for the previous view so it can be restored when switching back
+        prevCtx.dimensionLevel = this.activeDimensionLevel;
       }
     }
 
@@ -332,6 +662,20 @@ class DataState {
     this.centroidOutliers = ctx.centroidOutliers ? new Float32Array(ctx.centroidOutliers) : null;
     this.centroidLabels = ctx.centroidLabels ? ctx.centroidLabels.map(c => c ? { ...c } : c) : [];
     this.filteredCount = ctx.filteredCount ? { ...ctx.filteredCount } : { shown: this.pointCount, total: this.pointCount };
+
+    // IMPORTANT: Sync dimension level from the view's context
+    // This ensures the active dimension level matches the view being switched to
+    const viewDimLevel = ctx.dimensionLevel ?? this.dimensionManager?.getDefaultDimension() ?? 3;
+    if (viewDimLevel !== this.activeDimensionLevel) {
+      this.activeDimensionLevel = viewDimLevel;
+      // Update dimension manager's tracking (no position loading needed - view already has its positions)
+      if (this.dimensionManager) {
+        this.dimensionManager.setViewDimension(ctx.id, viewDimLevel);
+      }
+      // Notify dimension change callbacks (e.g., UI slider update)
+      this._notifyDimensionChange();
+    }
+
     // Reinitialize the active field to ensure category counts and metadata are up-to-date
     this._reinitializeActiveField();
     this._rebuildLabelLayerFromCentroids();
@@ -463,17 +807,32 @@ class DataState {
     }
   }
 
+  /**
+   * Get centroids for the current dimension from a field
+   * @param {Object} field - The field object with centroidsByDim
+   * @returns {Array} Centroid array for current dimension
+   */
+  _getCentroidsForCurrentDim(field) {
+    if (!field) return [];
+    const currentDim = this.activeDimensionLevel || 3;
+    const centroidsByDim = field.centroidsByDim || {};
+    return centroidsByDim[String(currentDim)]
+      || centroidsByDim[currentDim]
+      || field.centroids  // Legacy fallback
+      || [];
+  }
+
   _rebuildLabelLayerFromCentroids() {
     if (!this.labelLayer || !this.viewer) return;
     const viewKey = String(this.activeViewId || 'live');
     this._removeLabelsForView(viewKey);
     this.centroidLabels = [];
     const field = this.getActiveField ? this.getActiveField() : null;
-    if (!field || field.kind !== 'category' || !this.centroidPositions || !field.centroids) {
+    const centroids = this._getCentroidsForCurrentDim(field);
+    if (!field || field.kind !== 'category' || !this.centroidPositions || centroids.length === 0) {
       this.viewer.setCentroidLabels([], viewKey);
       return;
     }
-    const centroids = field.centroids || [];
     const max = Math.min(centroids.length, this.centroidPositions.length / 3);
     for (let i = 0; i < max; i++) {
       const pos = [
@@ -865,8 +1224,9 @@ class DataState {
     this._syncActiveContext();
     this._pushActiveViewLabelToViewer();
 
+    const currentCentroids = this._getCentroidsForCurrentDim(field);
     const centroidInfo =
-      field.kind === 'category' && field.centroids ? ` • Centroids: ${field.centroids.length}` : '';
+      field.kind === 'category' && currentCentroids.length > 0 ? ` • Centroids: ${currentCentroids.length}` : '';
     return {
       field,
       pointCount: this.pointCount,
@@ -1217,14 +1577,15 @@ class DataState {
 
   _applyCategoryCountsToCentroids(field, counts) {
     if (!field || field.kind !== 'category') return false;
-    if (!field.centroids || !this.centroidColors) return false;
+    const centroids = this._getCentroidsForCurrentDim(field);
+    if (centroids.length === 0 || !this.centroidColors) return false;
     const categories = field.categories || [];
     const visibleCounts = counts?.visible || [];
     const catIndexByName = new Map();
     categories.forEach((cat, idx) => catIndexByName.set(String(cat), idx));
     let changed = false;
-    for (let i = 0; i < field.centroids.length; i++) {
-      const c = field.centroids[i];
+    for (let i = 0; i < centroids.length; i++) {
+      const c = centroids[i];
       const idx = catIndexByName.get(String(c.category));
       const count = idx != null ? (visibleCounts[idx] || 0) : 0;
       const alpha = count > 0 ? 255 : 0; // uint8 alpha
@@ -1551,12 +1912,28 @@ class DataState {
     this._syncActiveContext();
   }
 
-  buildCentroidsForField(field) {
-    const centroids = field.centroids || [];
+  buildCentroidsForField(field, { viewId = null } = {}) {
+    // Get dimension-specific centroids based on current dimension level
+    const currentDim = this.activeDimensionLevel || 3;
+    const centroidsByDim = field.centroidsByDim || {};
+
+    // Get centroids for current dimension, falling back through dimensions
+    let centroids = centroidsByDim[String(currentDim)]
+      || centroidsByDim[currentDim]
+      || field.centroids  // Legacy fallback
+      || [];
+
+    // Determine the native dimension of these centroids (from position array length)
+    let nativeDim = 3;
+    if (centroids.length > 0 && centroids[0].position) {
+      nativeDim = centroids[0].position.length;
+    }
+
     const categories = field.categories || [];
     this.ensureCategoryMetadata(field);
     const catColors = field._categoryColors || [];
-    const viewKey = String(this.activeViewId || 'live');
+    // Use provided viewId or fall back to activeViewId
+    const viewKey = String(viewId || this.activeViewId || 'live');
     this.centroidCount = centroids.length;
     const allowLabels = true;
 
@@ -1572,18 +1949,28 @@ class DataState {
     categories.forEach((cat, idx) => catIndexByName.set(String(cat), idx));
 
     // Pre-compute counts so centroids/labels respect visibility immediately
-    const counts = this.computeCategoryCountsForField(field);
-    if (counts) {
-      field._categoryCounts = counts;
-      this._activeCategoryCounts = counts;
+    // Only compute and save counts when building for the active view, as
+    // computeCategoryCountsForField uses active view's transparency/filters
+    const isActiveView = viewKey === String(this.activeViewId);
+    if (isActiveView) {
+      const counts = this.computeCategoryCountsForField(field);
+      if (counts) {
+        field._categoryCounts = counts;
+        this._activeCategoryCounts = counts;
+      }
     }
 
     for (let i = 0; i < centroids.length; i++) {
       const c = centroids[i];
       const pos = c.position || [0, 0, 0];
-      this.centroidPositions[3 * i] = pos[0];
-      this.centroidPositions[3 * i + 1] = pos[1];
-      this.centroidPositions[3 * i + 2] = pos[2];
+
+      // Pad lower-dimensional positions to 3D for rendering
+      // 1D: [x] -> [x, 0, 0]
+      // 2D: [x, y] -> [x, y, 0]
+      // 3D: [x, y, z] -> [x, y, z]
+      this.centroidPositions[3 * i] = pos[0] || 0;
+      this.centroidPositions[3 * i + 1] = nativeDim >= 2 ? (pos[1] || 0) : 0;
+      this.centroidPositions[3 * i + 2] = nativeDim >= 3 ? (pos[2] || 0) : 0;
 
       const idx = catIndexByName.get(String(c.category));
       let color = [0, 0, 0];
@@ -1598,17 +1985,24 @@ class DataState {
       this.centroidColors[colBase + 2] = Math.round(color[2] * 255);
       this.centroidColors[colBase + 3] = 255; // full alpha
 
+      // Store 3D position for labels
+      const pos3D = [
+        this.centroidPositions[3 * i],
+        this.centroidPositions[3 * i + 1],
+        this.centroidPositions[3 * i + 2]
+      ];
+
       if (allowLabels && this.labelLayer) {
         const el = document.createElement('div');
         el.className = 'centroid-label';
         el.dataset.viewId = viewKey;
         el.textContent = String(c.category);
         this.labelLayer.appendChild(el);
-        this.centroidLabels.push({ el, position: [pos[0], pos[1], pos[2]] });
+        this.centroidLabels.push({ el, position: pos3D });
       }
     }
     if (typeof this.viewer.setCentroidLabels === 'function') {
-      this.viewer.setCentroidLabels(this.centroidLabels, this.activeViewId);
+      this.viewer.setCentroidLabels(this.centroidLabels, viewKey);
     }
   }
 
@@ -2218,7 +2612,8 @@ class DataState {
         ? new Float32Array(this.centroidOutliers)
         : null,
       outlierThreshold: this.getCurrentOutlierThreshold(),
-      filtersText
+      filtersText,
+      dimensionLevel: this.activeDimensionLevel // Include dimension level for Keep View
     };
   }
 

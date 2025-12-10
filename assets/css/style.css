@@ -1856,6 +1856,41 @@ html, body {
   font-size: 8px;
 }
 
+/* Dimension indicator on view badges */
+.split-badge-dim {
+  font-family: "Oswald", system-ui, sans-serif;
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  padding: 2px 5px;
+  margin-left: 4px;
+  border-radius: 4px;
+  background: #e0f2fe;
+  color: #0369a1;
+  border: 1px solid #7dd3fc;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+  flex-shrink: 0;
+}
+
+.split-badge-dim:hover {
+  background: #0ea5e9;
+  color: #ffffff;
+  border-color: #0ea5e9;
+}
+
+.split-badge.active .split-badge-dim {
+  background: #1e3a5f;
+  color: #7dd3fc;
+  border-color: #38bdf8;
+}
+
+.split-badge.active .split-badge-dim:hover {
+  background: #0ea5e9;
+  color: #ffffff;
+  border-color: #0ea5e9;
+}
+
 /* Keep the rest of your non-sidebar styles (gl canvas, etc.) exactly as-is.
    They weren’t changed because your focus was on the sidebar design. */
 
@@ -2093,4 +2128,64 @@ html, body {
 #dataset-select option:disabled {
   color: var(--viewer-ink-muted);
   font-style: italic;
+}
+
+/* ========================================================================
+   Dimension Selector Buttons
+   ===================================================================== */
+
+.dimension-controls {
+  margin-top: 10px;
+}
+
+.dimension-buttons-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.dimension-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--viewer-ink-soft);
+  margin-right: 4px;
+}
+
+.dimension-buttons {
+  display: flex;
+  gap: 4px;
+}
+
+.dimension-btn {
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  border: 1px solid var(--viewer-ink-muted);
+  border-radius: 4px;
+  background: var(--viewer-paper);
+  color: var(--viewer-ink-soft);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.dimension-btn:hover {
+  border-color: var(--viewer-ink);
+  color: var(--viewer-ink);
+  background: var(--viewer-accent-light);
+}
+
+.dimension-btn.active {
+  background: var(--viewer-ink);
+  color: var(--viewer-paper);
+  border-color: var(--viewer-ink);
+}
+
+.dimension-btn.active:hover {
+  background: var(--viewer-accent-soft);
+}
+
+.dimension-loading {
+  font-size: 11px;
+  color: var(--viewer-ink-muted);
+  margin-left: 8px;
 }

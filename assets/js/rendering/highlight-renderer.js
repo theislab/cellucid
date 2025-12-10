@@ -406,36 +406,45 @@ export function clearProximityOverlay({ canvas, lassoCtx }) {
   clearLassoOverlay({ canvas, lassoCtx });
 }
 
-export function findCellsInProximity({ hpRenderer, transparencyArray, centerPos, radius3D }) {
+export function findCellsInProximity({ hpRenderer, transparencyArray, centerPos, radius3D, viewPositions = null }) {
   if (!centerPos || radius3D <= 0) return [];
 
-  const positions = hpRenderer.getPositions();
+  // Use view-specific positions if provided, otherwise fall back to main positions
+  const mainPositions = hpRenderer.getPositions();
+  const positions = viewPositions || mainPositions;
   if (!positions) return [];
-
-  if (!hpRenderer.octree) {
-    hpRenderer.ensureOctree?.();
-  }
 
   const selectedIndices = [];
   const alphas = transparencyArray;
   const radiusSq = radius3D * radius3D;
 
-  if (hpRenderer.octree) {
-    const candidates = hpRenderer.octree.queryRadius(centerPos, radius3D, 100000);
-    for (const idx of candidates) {
-      if (alphas && alphas[idx] === 0) continue;
-      selectedIndices.push(idx);
+  // Only use octree if we're using main positions (octree is built from main positions)
+  // For view-specific positions (different dimension), use brute-force search
+  const useOctree = !viewPositions && hpRenderer.octree;
+
+  if (useOctree) {
+    if (!hpRenderer.octree) {
+      hpRenderer.ensureOctree?.();
     }
-  } else {
-    const n = positions.length / 3;
-    for (let i = 0; i < n; i++) {
-      if (alphas && alphas[i] === 0) continue;
-      const dx = positions[i * 3] - centerPos[0];
-      const dy = positions[i * 3 + 1] - centerPos[1];
-      const dz = positions[i * 3 + 2] - centerPos[2];
-      if (dx * dx + dy * dy + dz * dz <= radiusSq) {
-        selectedIndices.push(i);
+    if (hpRenderer.octree) {
+      const candidates = hpRenderer.octree.queryRadius(centerPos, radius3D, 100000);
+      for (const idx of candidates) {
+        if (alphas && alphas[idx] === 0) continue;
+        selectedIndices.push(idx);
       }
+      return selectedIndices;
+    }
+  }
+
+  // Brute-force search for view-specific positions or when octree unavailable
+  const n = positions.length / 3;
+  for (let i = 0; i < n; i++) {
+    if (alphas && alphas[i] === 0) continue;
+    const dx = positions[i * 3] - centerPos[0];
+    const dy = positions[i * 3 + 1] - centerPos[1];
+    const dz = positions[i * 3 + 2] - centerPos[2];
+    if (dx * dx + dy * dy + dz * dz <= radiusSq) {
+      selectedIndices.push(i);
     }
   }
 
@@ -455,6 +464,7 @@ export class HighlightTools {
     getViewportInfoAtScreen,
     getRenderContext,
     getNavigationState = () => ({ navigationMode: 'orbit', isDragging: false }),
+    getViewPositions = null,  // Optional: (viewId) => Float32Array of positions
     startTime = performance.now(),
     shaderQuality = 'full'
   }) {
@@ -468,6 +478,7 @@ export class HighlightTools {
     this.getViewportInfoAtScreen = getViewportInfoAtScreen;
     this.getRenderContext = getRenderContext;
     this.getNavigationState = getNavigationState;
+    this.getViewPositions = getViewPositions;
 
     this.highlightRenderer = new HighlightRenderer(gl, hpRenderer, startTime);
     this.highlightRenderer.setQuality(shaderQuality);
@@ -522,6 +533,9 @@ export class HighlightTools {
     this.knnEdgeLoadCallback = null;
 
     this.altKeyDown = false;
+
+    // Track last used positions for multiview dimension support
+    this._lastUsedPositions = null;
   }
 
   // === Highlight rendering ===
@@ -551,15 +565,23 @@ export class HighlightTools {
     this.highlightRenderer.rebuildBuffer(this.highlightArray, positions, transparencyArray, lodVisibility, lodSignature);
   }
 
-  syncHighlightBufferForLod() {
+  syncHighlightBufferForLod(viewPositions = null) {
     if (!this.highlightArray || !this.highlightRenderer) return;
     const lodVisibility = this.hpRenderer.getLodVisibilityArray ? this.hpRenderer.getLodVisibilityArray() : null;
     const lodLevel = this.hpRenderer.getCurrentLODLevel ? this.hpRenderer.getCurrentLODLevel() : -1;
     const lodSignature = lodVisibility ? (lodLevel ?? -1) : -1;
-    if (this.highlightRenderer.needsRefresh(lodSignature)) {
+
+    // When view-specific positions are provided, always rebuild since we can't easily
+    // cache per-view buffers (positions change with dimension). In practice this is fast
+    // since highlight counts are typically small (<10k cells).
+    const positionsChanged = viewPositions && viewPositions !== this._lastUsedPositions;
+
+    if (this.highlightRenderer.needsRefresh(lodSignature) || positionsChanged) {
       const ctx = this.getRenderContext?.() || {};
-      const positions = this.hpRenderer.getPositions ? this.hpRenderer.getPositions() : null;
+      // Use view-specific positions if provided, otherwise use global positions
+      const positions = viewPositions || (this.hpRenderer.getPositions ? this.hpRenderer.getPositions() : null);
       this.highlightRenderer.rebuildBuffer(this.highlightArray, positions, ctx.transparencyArray, lodVisibility, lodSignature);
+      this._lastUsedPositions = positions;
     }
   }
 
@@ -583,8 +605,9 @@ export class HighlightTools {
   }
 
   // Sync LOD visibility and draw highlights in one call (used by viewer render loop)
-  renderHighlights(drawParams = {}) {
-    this.syncHighlightBufferForLod();
+  // viewPositions: Optional per-view positions for multi-dimensional support
+  renderHighlights(drawParams = {}, viewPositions = null) {
+    this.syncHighlightBufferForLod(viewPositions);
     this.drawHighlights(drawParams);
   }
 
@@ -1052,7 +1075,11 @@ export class HighlightTools {
 
     if (e.altKey && this.proximityEnabled && e.button === 0) {
       const cellIdx = this.pickCellAtScreen ? this.pickCellAtScreen(e.clientX, e.clientY) : -1;
-      const positions = this.hpRenderer.getPositions ? this.hpRenderer.getPositions() : null;
+
+      // Get view-specific positions for multi-dimensional support
+      const vpInfo = this.getViewportInfoAtScreen ? this.getViewportInfoAtScreen(e.clientX, e.clientY) : null;
+      const viewId = vpInfo?.viewId;
+      const positions = this.getViewPositions ? this.getViewPositions(viewId) : (this.hpRenderer.getPositions ? this.hpRenderer.getPositions() : null);
 
       let proximityMode = 'intersect';
       if (e.ctrlKey || e.metaKey) {
@@ -1109,14 +1136,14 @@ export class HighlightTools {
       }
 
       if (worldPos) {
-        const vpInfo = this.getViewportInfoAtScreen ? this.getViewportInfoAtScreen(e.clientX, e.clientY) : null;
         this.proximityCenter = {
           screenX: e.clientX,
           screenY: e.clientY,
           worldPos: worldPos,
           cellIndex: clickedCellIdx,
           mode: proximityMode,
-          viewport: vpInfo
+          viewport: vpInfo,
+          viewId: viewId  // Store viewId for multi-dimensional support
         };
         this.proximityCurrentRadius = 0;
         this.isProximityDragging = true;
@@ -1234,6 +1261,9 @@ export class HighlightTools {
         drawLasso({ canvas: this.canvas, lassoCtx: this.lassoCtx, lassoPath: this.lassoPath });
 
         if (this.lassoPreviewCallback && this.lassoPath.length >= 3) {
+          // Get view-specific positions for multi-dimensional support
+          const viewId = this.lassoViewContext?.viewId;
+          const viewPositions = this.getViewPositions ? this.getViewPositions(viewId) : null;
           const previewIndices = findCellsInLasso({
             lassoPath: this.lassoPath,
             lassoViewContext: this.lassoViewContext,
@@ -1248,7 +1278,8 @@ export class HighlightTools {
             liveViewHidden: ctx.liveViewHidden,
             snapshotViews: ctx.snapshotViews || [],
             viewLayoutMode: ctx.viewLayoutMode,
-            transparencyArray: ctx.transparencyArray
+            transparencyArray: ctx.transparencyArray,
+            viewPositions
           });
           this.lassoPreviewCallback({
             type: 'lasso-preview',
@@ -1282,11 +1313,15 @@ export class HighlightTools {
       });
 
       if (this.proximityPreviewCallback && this.proximityCurrentRadius > 0) {
+        // Get view-specific positions for multi-dimensional support
+        const viewId = this.proximityCenter?.viewId;
+        const viewPositions = this.getViewPositions ? this.getViewPositions(viewId) : null;
         const newIndices = findCellsInProximity({
           hpRenderer: this.hpRenderer,
           transparencyArray: ctx.transparencyArray,
           centerPos: this.proximityCenter.worldPos,
-          radius3D: this.proximityCurrentRadius
+          radius3D: this.proximityCurrentRadius,
+          viewPositions
         });
         const mode = this.proximityCenter.mode || 'intersect';
 
@@ -1412,6 +1447,9 @@ export class HighlightTools {
       this.isLassoing = false;
       this.canvas.classList.remove('lassoing');
       if (this.lassoPath.length >= 3) {
+        // Get view-specific positions for multi-dimensional support
+        const viewId = this.lassoViewContext?.viewId;
+        const viewPositions = this.getViewPositions ? this.getViewPositions(viewId) : null;
         const selectedIndices = findCellsInLasso({
           lassoPath: this.lassoPath,
           lassoViewContext: this.lassoViewContext,
@@ -1426,7 +1464,8 @@ export class HighlightTools {
           liveViewHidden: ctx.liveViewHidden,
           snapshotViews: ctx.snapshotViews || [],
           viewLayoutMode: ctx.viewLayoutMode,
-          transparencyArray: ctx.transparencyArray
+          transparencyArray: ctx.transparencyArray,
+          viewPositions
         });
         if (selectedIndices.length > 0 || this.lassoMode === 'subtract') {
           const newSet = new Set(selectedIndices);
@@ -1472,11 +1511,15 @@ export class HighlightTools {
       this.canvas.classList.remove('proximity-dragging');
 
       if (this.proximityCurrentRadius > 0) {
+        // Get view-specific positions for multi-dimensional support
+        const viewId = this.proximityCenter?.viewId;
+        const viewPositions = this.getViewPositions ? this.getViewPositions(viewId) : null;
         const newIndices = findCellsInProximity({
           hpRenderer: this.hpRenderer,
           transparencyArray: ctx.transparencyArray,
           centerPos: this.proximityCenter.worldPos,
-          radius3D: this.proximityCurrentRadius
+          radius3D: this.proximityCurrentRadius,
+          viewPositions
         });
         const mode = this.proximityCenter.mode || 'intersect';
         const newSet = new Set(newIndices);
@@ -1916,11 +1959,13 @@ export function findCellsInLasso({
   liveViewHidden,
   snapshotViews,
   viewLayoutMode,
-  transparencyArray
+  transparencyArray,
+  viewPositions = null  // Optional: view-specific positions for multi-dimensional support
 }) {
   if (!lassoPath || lassoPath.length < 3) return [];
 
-  const positions = hpRenderer.getPositions();
+  // Use view-specific positions if provided, otherwise fall back to main positions
+  const positions = viewPositions || hpRenderer.getPositions();
   if (!positions) return [];
 
   const rect = canvas.getBoundingClientRect();

@@ -1083,6 +1083,75 @@ export class HighPerfRenderer {
     return this.stats;
   }
 
+  /**
+   * Update positions only (for dimension switching) - keeps existing colors and transparency
+   * More efficient than full loadData when only positions change
+   * @param {Float32Array} positions - New positions array (n_points * 3)
+   */
+  updatePositions(positions) {
+    if (!positions) return;
+
+    const expectedLength = this.pointCount * 3;
+    if (positions.length !== expectedLength) {
+      console.error(`[HighPerfRenderer] updatePositions: expected ${expectedLength} floats, got ${positions.length}`);
+      return;
+    }
+
+    console.log(`[HighPerfRenderer] Updating positions for ${this.pointCount.toLocaleString()} points...`);
+    const startTime = performance.now();
+
+    // Store new positions
+    this._positions = positions;
+
+    // Clear per-view frustum cache (positions changed)
+    this.clearAllViewState();
+    this._firstRenderDone = false;
+
+    // Update bounding sphere
+    this._boundingSphere = this._computeBoundingSphere(positions);
+
+    // Rebuild interleaved buffer with new positions (keeps existing colors)
+    if (this._colors) {
+      this._createInterleavedBuffer(positions, this._colors);
+    }
+
+    // Rebuild octree if LOD/frustum culling is enabled
+    if ((this.options.USE_LOD || this.options.USE_FRUSTUM_CULLING) && this.pointCount > 10000) {
+      if (this._colors) {
+        this.octree = new Octree(positions, this._colors, this.options.LOD_MAX_POINTS_PER_NODE);
+        this.octree._lastLODLevel = undefined;
+        this._boundingSphere = this.octree.getBoundingSphere();
+
+        if (this.options.USE_LOD) {
+          this._createLODBuffers();
+          this._createLODIndexTextures();
+        }
+      }
+    }
+
+    const elapsed = performance.now() - startTime;
+    console.log(`[HighPerfRenderer] Positions updated in ${elapsed.toFixed(1)}ms`);
+  }
+
+  /**
+   * Rebuild octree (called when positions change or on demand)
+   */
+  rebuildOctree() {
+    if (!this._positions || !this._colors) return;
+
+    if ((this.options.USE_LOD || this.options.USE_FRUSTUM_CULLING) && this.pointCount > 10000) {
+      console.log('[HighPerfRenderer] Rebuilding octree...');
+      this.octree = new Octree(this._positions, this._colors, this.options.LOD_MAX_POINTS_PER_NODE);
+      this.octree._lastLODLevel = undefined;
+      this._boundingSphere = this.octree.getBoundingSphere();
+
+      if (this.options.USE_LOD) {
+        this._createLODBuffers();
+        this._createLODIndexTextures();
+      }
+    }
+  }
+
   _createInterleavedBuffer(positions, colors) {
     const gl = this.gl;
     const pointCount = positions.length / 3;
@@ -2820,9 +2889,10 @@ export class HighPerfRenderer {
    * @param {string} id - Unique snapshot identifier
    * @param {Uint8Array} colors - RGB (3 bytes) or RGBA (4 bytes) colors per point
    * @param {Float32Array} [alphas] - Optional alpha values (0-1), merged into colors
+   * @param {Float32Array} [viewPositions] - Optional per-view positions (for multi-dimensional support)
    * @returns {boolean} Success
    */
-  createSnapshotBuffer(id, colors, alphas = null) {
+  createSnapshotBuffer(id, colors, alphas = null, viewPositions = null) {
     if (!this._positions || this.pointCount === 0) {
       console.warn('[HighPerfRenderer] Cannot create snapshot buffer: no data loaded');
       return false;
@@ -2830,7 +2900,8 @@ export class HighPerfRenderer {
 
     const gl = this.gl;
     const n = this.pointCount;
-    const positions = this._positions;
+    // Use view-specific positions if provided, otherwise use global positions
+    const positions = viewPositions || this._positions;
 
     // Normalize colors to RGBA if needed
     const expectedRGBA = n * 4;
@@ -2906,7 +2977,9 @@ export class HighPerfRenderer {
       id,
       vao,
       buffer: glBuffer,
-      pointCount: n
+      pointCount: n,
+      // Store positions reference for future updates (dimension switching)
+      positions: viewPositions || this._positions
     });
 
     console.log(`[HighPerfRenderer] Created snapshot buffer "${id}" (${n.toLocaleString()} points, ${(n * 16 / 1024 / 1024).toFixed(1)} MB)`);
@@ -2919,18 +2992,20 @@ export class HighPerfRenderer {
    * @param {string} id - Snapshot identifier
    * @param {Uint8Array} colors - RGB (3 bytes) or RGBA (4 bytes) colors per point
    * @param {Float32Array} [alphas] - Optional alpha values
+   * @param {Float32Array} [viewPositions] - Optional per-view positions (for multi-dimensional support)
    * @returns {boolean} Success
    */
-  updateSnapshotBuffer(id, colors, alphas = null) {
+  updateSnapshotBuffer(id, colors, alphas = null, viewPositions = null) {
     const snapshot = this.snapshotBuffers.get(id);
     if (!snapshot) {
       // Create new buffer if it doesn't exist
-      return this.createSnapshotBuffer(id, colors, alphas);
+      return this.createSnapshotBuffer(id, colors, alphas, viewPositions);
     }
 
     const gl = this.gl;
     const n = this.pointCount;
-    const positions = this._positions;
+    // Use view-specific positions if provided, otherwise use stored snapshot positions, or global positions
+    const positions = viewPositions || snapshot.positions || this._positions;
 
     // Normalize colors to RGBA if needed
     const expectedRGBA = n * 4;
@@ -2982,6 +3057,74 @@ export class HighPerfRenderer {
     gl.bindBuffer(gl.ARRAY_BUFFER, snapshot.buffer);
     gl.bufferData(gl.ARRAY_BUFFER, buffer, gl.STATIC_DRAW);
 
+    // Update stored positions reference if provided
+    if (viewPositions) {
+      snapshot.positions = viewPositions;
+    }
+
+    return true;
+  }
+
+  /**
+   * Update only the positions for a snapshot buffer (for dimension switching).
+   * Preserves existing colors. More efficient than full buffer recreation.
+   * @param {string} id - Snapshot identifier
+   * @param {Float32Array} viewPositions - New positions for the view
+   * @returns {boolean} Success
+   */
+  updateSnapshotPositions(id, viewPositions) {
+    const snapshot = this.snapshotBuffers.get(id);
+    if (!snapshot) {
+      console.warn(`[HighPerfRenderer] Cannot update positions: snapshot "${id}" not found`);
+      return false;
+    }
+
+    if (!viewPositions || viewPositions.length !== this.pointCount * 3) {
+      console.warn(`[HighPerfRenderer] Invalid positions array for snapshot "${id}"`);
+      return false;
+    }
+
+    const gl = this.gl;
+    const n = this.pointCount;
+
+    // Read back existing colors from GPU buffer
+    // (This is expensive but only happens on dimension switch, not every frame)
+    // Alternative: store colors separately in snapshot object
+    const existingBuffer = new ArrayBuffer(n * 16);
+    gl.bindBuffer(gl.ARRAY_BUFFER, snapshot.buffer);
+    gl.getBufferSubData(gl.ARRAY_BUFFER, 0, new Uint8Array(existingBuffer));
+
+    const existingColorView = new Uint8Array(existingBuffer);
+    const newBuffer = new ArrayBuffer(n * 16);
+    const newPositionView = new Float32Array(newBuffer);
+    const newColorView = new Uint8Array(newBuffer);
+
+    // Rebuild buffer with new positions and existing colors
+    for (let i = 0; i < n; i++) {
+      const srcIdx = i * 3;
+      const floatOffset = i * 4;
+      const byteOffset = i * 16 + 12;
+      const existingByteOffset = i * 16 + 12;
+
+      // New positions
+      newPositionView[floatOffset] = viewPositions[srcIdx];
+      newPositionView[floatOffset + 1] = viewPositions[srcIdx + 1];
+      newPositionView[floatOffset + 2] = viewPositions[srcIdx + 2];
+
+      // Preserve existing colors
+      newColorView[byteOffset] = existingColorView[existingByteOffset];
+      newColorView[byteOffset + 1] = existingColorView[existingByteOffset + 1];
+      newColorView[byteOffset + 2] = existingColorView[existingByteOffset + 2];
+      newColorView[byteOffset + 3] = existingColorView[existingByteOffset + 3];
+    }
+
+    // Upload new buffer
+    gl.bufferData(gl.ARRAY_BUFFER, newBuffer, gl.STATIC_DRAW);
+
+    // Update stored positions reference
+    snapshot.positions = viewPositions;
+
+    console.log(`[HighPerfRenderer] Updated positions for snapshot "${id}"`);
     return true;
   }
 

@@ -93,6 +93,10 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     splitViewBadgesBox,
     splitViewBadges,
     splitViewBoxTitle,
+    // Dimension controls
+    dimensionControls,
+    dimensionButtons,
+    dimensionLoading,
     // Session save/load
     saveStateBtn,
     loadStateBtn,
@@ -244,10 +248,18 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     renderLegend(activeField);
     handleOutlierUI(activeField);
     renderFilterSummary();
-    const centroidInfo =
-      activeField && activeField.kind === 'category' && activeField.centroids
-        ? ` • Centroids: ${activeField.centroids.length}`
-        : '';
+    // Get centroids for current dimension
+    let centroidCount = 0;
+    if (activeField && activeField.kind === 'category') {
+      const currentDim = state.getDimensionLevel?.() || 3;
+      const centroidsByDim = activeField.centroidsByDim || {};
+      const dimCentroids = centroidsByDim[String(currentDim)]
+        || centroidsByDim[currentDim]
+        || activeField.centroids  // Legacy fallback
+        || [];
+      centroidCount = dimCentroids.length;
+    }
+    const centroidInfo = centroidCount > 0 ? ` • Centroids: ${centroidCount}` : '';
     updateStats({
       field: activeField,
       pointCount: counts.total,
@@ -267,6 +279,31 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       state.setActiveView(activeViewId);
     }
     refreshUIForActiveView();
+    // Sync dimension slider to reflect the active view's dimension level
+    syncDimensionSliderToActiveView();
+  }
+
+  /**
+   * Sync dimension buttons to reflect the active view's dimension level.
+   * Called when switching between views to ensure the buttons show the correct state.
+   */
+  function syncDimensionSliderToActiveView() {
+    if (!dimensionButtons) return;
+    const viewDim = state.getViewDimensionLevel?.(activeViewId) ?? state.getDimensionLevel?.() ?? 3;
+    updateDimensionButtonsActiveState(viewDim);
+  }
+
+  /**
+   * Update the active state of dimension buttons
+   * @param {number} activeDim - The active dimension level
+   */
+  function updateDimensionButtonsActiveState(activeDim) {
+    if (!dimensionButtons) return;
+    const buttons = dimensionButtons.querySelectorAll('.dimension-btn');
+    buttons.forEach(btn => {
+      const btnDim = parseInt(btn.dataset.dim, 10);
+      btn.classList.toggle('active', btnDim === activeDim);
+    });
   }
 
   // Debounced auto-rebuild for smoke density
@@ -3062,6 +3099,76 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     }
   }
 
+  /**
+   * Helper to create a dimension indicator element for view badges.
+   * Shows current dimension level and allows cycling through available dimensions.
+   * @param {string} viewId - The view ID
+   * @param {number} currentDim - Current dimension level (for display only)
+   * @returns {HTMLElement|null} Dimension indicator element or null if not needed
+   */
+  function createDimensionIndicator(viewId, currentDim) {
+    const availableDims = state.getAvailableDimensions?.() || [3];
+    // Filter out 4D (not implemented) and only show if multiple dims available
+    const usableDims = availableDims.filter(d => d !== 4);
+    if (usableDims.length <= 1) return null;
+
+    const dimIndicator = document.createElement('span');
+    dimIndicator.className = 'split-badge-dim';
+    dimIndicator.textContent = `${currentDim}D`;
+    dimIndicator.title = 'Click to cycle dimension (1D/2D/3D)';
+    // Store viewId as data attribute for click handler
+    dimIndicator.dataset.viewId = String(viewId);
+
+    // Click to cycle through dimensions
+    dimIndicator.addEventListener('click', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+
+      // Prevent rapid clicks from causing race conditions
+      if (dimensionChangeBusy) return;
+
+      const targetViewId = String(e.currentTarget.dataset.viewId || LIVE_VIEW_ID);
+
+      // Get current dimension for this specific view BEFORE any state changes
+      const freshCurrentDim = state.getViewDimensionLevel?.(targetViewId) ?? state.getDimensionLevel?.() ?? 3;
+
+      // Find next available dimension in cycle order (priority: 3 > 2 > 1)
+      const sortedDims = [...usableDims].sort((a, b) => b - a); // descending: 3, 2, 1
+      const currentIdx = sortedDims.indexOf(freshCurrentDim);
+      const nextIdx = (currentIdx + 1) % sortedDims.length;
+      const nextDim = sortedDims[nextIdx];
+
+      dimensionChangeBusy = true;
+      try {
+        // Change dimension for the specific view WITHOUT activating it first.
+        // This ensures snapshot views update their snapshot buffers, not main positions.
+        if (state.setDimensionLevel) {
+          await state.setDimensionLevel(nextDim, { viewId: targetViewId });
+        }
+
+        // NOW sync UI's activeViewId and state to keep controls in sync with this view
+        if (String(activeViewId) !== targetViewId) {
+          activeViewId = targetViewId;
+          // Sync state's active view AFTER dimension change completed successfully
+          // This ensures future operations target the correct view
+          syncActiveViewToState();
+          pushViewLayoutToViewer();
+        }
+
+        // Re-render badges to show updated dimension
+        renderSplitViewBadges();
+        // Sync dimension slider to reflect the targeted view
+        syncDimensionSliderToActiveView();
+      } catch (err) {
+        console.error('[UI] Failed to change dimension:', err);
+      } finally {
+        dimensionChangeBusy = false;
+      }
+    });
+
+    return dimIndicator;
+  }
+
   function renderSplitViewBadges() {
     if (!splitViewBadges) return;
 
@@ -3114,6 +3221,10 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       const liveText = document.createElement('span');
       liveText.className = 'split-badge-label';
       liveText.textContent = liveLabel;
+
+      // Add dimension indicator for live view
+      const liveDim = state.getViewDimensionLevel?.(LIVE_VIEW_ID) ?? state.getDimensionLevel?.() ?? 3;
+      const liveDimIndicator = createDimensionIndicator(LIVE_VIEW_ID, liveDim);
 
       // Close button for live view (only show if there are snapshots to fall back to)
       if (snapshots.length > 0) {
@@ -3169,10 +3280,12 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
 
         liveBadge.appendChild(livePill);
         liveBadge.appendChild(liveText);
+        if (liveDimIndicator) liveBadge.appendChild(liveDimIndicator);
         liveBadge.appendChild(liveRemoveBtn);
       } else {
         liveBadge.appendChild(livePill);
         liveBadge.appendChild(liveText);
+        if (liveDimIndicator) liveBadge.appendChild(liveDimIndicator);
       }
 
       splitViewBadges.appendChild(liveBadge);
@@ -3208,8 +3321,13 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       const mainLabel = snap.label || snap.fieldKey || `View ${badgeIndex}`;
       text.textContent = mainLabel;
 
+      // Add dimension indicator for snapshot view
+      const snapDim = state.getViewDimensionLevel?.(snapId) ?? snap.dimensionLevel ?? 3;
+      const snapDimIndicator = createDimensionIndicator(snapId, snapDim);
+
       badge.appendChild(pill);
       badge.appendChild(text);
+      if (snapDimIndicator) badge.appendChild(snapDimIndicator);
 
       // Only show close button if there's another view to fall back to
       // (either live view is available, or there are multiple snapshots)
@@ -3275,10 +3393,24 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
 
   function focusViewFromOverlay(viewId) {
     if (!viewId) return;
-    activeViewId = String(viewId);
+    const newViewId = String(viewId);
+    const viewChanged = activeViewId !== newViewId;
+    activeViewId = newViewId;
+
+    // Sync state's active view to match viewer's focused view
+    // This ensures state operations target the correct view
+    if (viewChanged && typeof state.setActiveView === 'function') {
+      state.setActiveView(newViewId);
+    }
+
     syncActiveViewSelectOptions();
     renderSplitViewBadges();
     updateSplitViewUI();
+
+    // Sync dimension buttons to reflect the newly focused view's dimension level
+    if (viewChanged) {
+      syncDimensionSliderToActiveView();
+    }
   }
 
   function updateSplitViewUI() {
@@ -3358,6 +3490,8 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
         centroidOutliers: payload.centroidOutliers,
         centroidTransparencies: payload.centroidTransparencies,
         outlierThreshold: payload.outlierThreshold,
+        dimensionLevel: payload.dimensionLevel, // Preserve dimension level for Keep View
+        sourceViewId: activeViewId || LIVE_VIEW_ID, // Source view for positions
         meta: { filtersText: payload.filtersText || [] }
       };
 
@@ -3365,6 +3499,12 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       if (!created) return;
       if (typeof state.createViewFromActive === 'function') {
         state.createViewFromActive(created.id);
+      }
+
+      // Copy dimension level to new view in dimension manager
+      const dimManager = state.getDimensionManager?.();
+      if (dimManager && created.id) {
+        dimManager.copyViewDimension(activeViewId || LIVE_VIEW_ID, created.id);
       }
       if (typeof state.syncSnapshotContexts === 'function' && typeof viewer.getSnapshotViews === 'function') {
         const ids = viewer.getSnapshotViews().map((v) => v.id);
@@ -4321,6 +4461,117 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       updateSplitViewUI();
     });
   }
+
+  // --- Dimension Buttons Wiring ---
+  let dimensionChangeBusy = false;
+
+  /**
+   * Render dimension buttons based on available dimensions.
+   * Buttons always control the currently active view (live or snapshot).
+   */
+  function updateDimensionButtonsUI() {
+    if (!dimensionControls || !dimensionButtons) return;
+
+    const availableDimensions = state.getAvailableDimensions?.() || [3];
+    const hasMultipleDimensions = availableDimensions.length > 1;
+
+    // Show/hide dimension controls based on whether multiple dimensions are available
+    dimensionControls.style.display = hasMultipleDimensions ? '' : 'none';
+
+    if (!hasMultipleDimensions) return;
+
+    const activeView = typeof state.getActiveViewId === 'function'
+      ? state.getActiveViewId()
+      : LIVE_VIEW_ID;
+    const currentDim = state.getViewDimensionLevel?.(activeView) ?? state.getDimensionLevel?.() ?? 3;
+
+    // Clear existing buttons
+    dimensionButtons.innerHTML = '';
+
+    // Create buttons for each available dimension (1D–4D).
+    // 4D is shown but disabled as a future hook when not implemented/available.
+    const sortedDims = [1, 2, 3, 4].filter((d) => availableDimensions.includes(d));
+    for (const dim of sortedDims) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'dimension-btn' + (dim === currentDim ? ' active' : '');
+      btn.dataset.dim = dim;
+      btn.textContent = `${dim}D`;
+
+      const isFourD = dim === 4;
+      if (isFourD) {
+        // 4D: expose as disabled control to signal future support
+        btn.disabled = true;
+        btn.title = '4D embedding: reserved for future versions';
+      } else {
+        btn.title = `Switch this view to ${dim}D embedding`;
+        // IMPORTANT: Don't capture activeView in closure - read activeViewId at click time
+        // This ensures the button always affects the currently active view
+        btn.addEventListener('click', () => handleDimensionChange(dim));
+      }
+
+      dimensionButtons.appendChild(btn);
+    }
+  }
+
+  async function handleDimensionChange(newLevel, targetViewId = null) {
+    if (dimensionChangeBusy) return;
+    if (!state.setDimensionLevel) return;
+
+    // Check if dimension is available
+    const availableDimensions = state.getAvailableDimensions?.() || [3];
+    if (!availableDimensions.includes(newLevel)) {
+      return;
+    }
+
+    // Determine target view: use provided targetViewId, then UI's activeViewId, then viewer's focused view
+    // The viewer's focused view is the authoritative source for which view the user is interacting with
+    const viewerFocusedView = typeof viewer.getFocusedViewId === 'function' ? viewer.getFocusedViewId() : null;
+    const viewId = targetViewId ?? activeViewId ?? viewerFocusedView ?? LIVE_VIEW_ID;
+
+    // Sync UI's activeViewId with the target view to keep them consistent
+    if (activeViewId !== viewId) {
+      activeViewId = viewId;
+      syncActiveViewSelectOptions();
+      renderSplitViewBadges();
+    }
+
+    const currentDim = state.getViewDimensionLevel?.(viewId) ?? state.getDimensionLevel?.() ?? 3;
+    if (newLevel === currentDim) return;
+
+    dimensionChangeBusy = true;
+    if (dimensionLoading) dimensionLoading.style.display = '';
+
+    // Immediately update button state for responsive feel
+    updateDimensionButtonsActiveState(newLevel);
+
+    try {
+      await state.setDimensionLevel(newLevel, { viewId });
+      // Update the dimension badges in the view badges after successful change
+      renderSplitViewBadges();
+    } catch (err) {
+      console.error('[UI] Failed to change dimension:', err);
+      // Revert button state
+      updateDimensionButtonsActiveState(currentDim);
+      showSessionStatus?.(err.message || 'Failed to change dimension', true);
+    } finally {
+      dimensionChangeBusy = false;
+      if (dimensionLoading) dimensionLoading.style.display = 'none';
+    }
+  }
+
+  // Listen for dimension changes from other sources (e.g., state restoration)
+  if (state.addDimensionChangeCallback) {
+    state.addDimensionChangeCallback((level) => {
+      if (!dimensionChangeBusy) {
+        updateDimensionButtonsActiveState(level);
+      }
+    });
+  }
+
+  // Initial UI update
+  updateDimensionButtonsUI();
+
   renderSplitViewBadges();
   updateSplitViewUI();
 
@@ -4456,7 +4707,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
   }
 
   /**
-   * Refresh dataset-aware UI (field dropdowns, gene search, info panel)
+   * Refresh dataset-aware UI (field dropdowns, gene search, info panel, dimension controls)
    * @param {Object|null} metadata - Dataset metadata
    */
   function refreshDatasetUI(metadata) {
@@ -4465,6 +4716,8 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     clearGeneSelection();
     refreshUIForActiveView();
     updateDatasetInfo(metadata || (dataSourceManager?.getCurrentMetadata?.() || null));
+    // Update dimension buttons when dataset changes (different datasets may have different available dimensions)
+    updateDimensionButtonsUI();
   }
 
   /**

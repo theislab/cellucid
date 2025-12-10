@@ -27,7 +27,7 @@ data/experiments/**
 # Viewer exports now live under assets
 # assets/exports/**
 !assets/exports/.gitkeep
-# exports/**
+# exports/_**
 # python/exports/**
 data/_exports/**
 
@@ -37,3 +37,4 @@ python/build/
 python/*.egg-info
 
 project_context.txt
+/assets/exports/_*/

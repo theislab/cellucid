@@ -150,14 +150,19 @@ export class LocalUserDirDataSource {
       }
     }
 
-    // Check for points file
+    // Check for dimensional points files (3D preferred, then 2D, then 1D)
     let pointsFile = null;
-    if (this._fileExists(DATA_CONFIG.POINTS_FILE + '.gz')) {
-      pointsFile = DATA_CONFIG.POINTS_FILE + '.gz';
-    } else if (this._fileExists(DATA_CONFIG.POINTS_FILE)) {
-      pointsFile = DATA_CONFIG.POINTS_FILE;
-    } else {
-      missing.push(DATA_CONFIG.POINTS_FILE);
+    for (const candidate of DATA_CONFIG.POINTS_FILES) {
+      if (this._fileExists(candidate + '.gz')) {
+        pointsFile = candidate + '.gz';
+        break;
+      } else if (this._fileExists(candidate)) {
+        pointsFile = candidate;
+        break;
+      }
+    }
+    if (!pointsFile) {
+      missing.push('points_Xd.bin (at least one of: ' + DATA_CONFIG.POINTS_FILES.join(', ') + ')');
     }
 
     if (missing.length > 0) {
@@ -221,7 +226,7 @@ export class LocalUserDirDataSource {
 
   /**
    * Load dataset metadata
-   * @param {string} pointsFile - Name of the points file (e.g., 'points.bin' or 'points.bin.gz')
+   * @param {string} pointsFile - Name of the points file (e.g., 'points_3d.bin' or 'points_2d.bin.gz')
    * @private
    */
   async _loadMetadata(pointsFile) {

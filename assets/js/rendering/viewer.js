@@ -364,6 +364,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   const cachedViewMatrices = new Map();  // viewId -> { viewMatrix: Float32Array, radius: number, dirty: boolean }
   let cachedGridProjection = null;       // { aspect: number, matrix: Float32Array } - shared by all grid cells
 
+  // Per-view dimension tracking for multi-dimensional support
+  const viewDimensionLevels = new Map();  // viewId -> dimension level (1, 2, 3, or 4)
+  const viewPositionsCache = new Map();   // viewId -> Float32Array positions
+
   const viewTitleLayerEl = viewTitleLayer || null;
   const sidebarEl = sidebar || null;
   let viewTitleEntries = [];
@@ -426,6 +430,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     getViewportInfoAtScreen,
     getRenderContext: () => getHighlightContext(),
     getNavigationState: () => ({ navigationMode, isDragging }),
+    // Provide view-specific positions for multi-dimensional selection support
+    getViewPositions: (viewId) => {
+      if (!viewId) return positionsArray;
+      return viewPositionsCache.get(String(viewId)) || positionsArray;
+    },
     startTime,
     shaderQuality: currentShaderQuality
   });
@@ -588,20 +597,28 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     }
 
     const highlighterActive = highlightTools?.isInteractionActive?.();
-    if (!camerasLocked && viewLayoutMode === 'grid' && !highlighterActive) {
+    // In grid mode, ALWAYS update focused view when clicking in a different view's area.
+    // This ensures dimension controls and other view-specific operations target the correct view.
+    // Camera save/restore only happens when cameras are unlocked.
+    if (viewLayoutMode === 'grid' && !highlighterActive) {
       const clickedViewId = getViewIdAtScreenPosition(e.clientX, e.clientY);
       if (clickedViewId && clickedViewId !== focusedViewId) {
-        // Save current camera to previous view
-        setViewCameraState(focusedViewId, getCurrentCameraStateInternal());
-        // Stop any ongoing inertia (so it doesn't carry to new view)
-        velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
-        vec3.set(freeflyVelocity, 0, 0, 0);
-        // Switch focus
+        // Only save/restore cameras when unlocked
+        if (!camerasLocked) {
+          // Save current camera to previous view
+          setViewCameraState(focusedViewId, getCurrentCameraStateInternal());
+          // Stop any ongoing inertia (so it doesn't carry to new view)
+          velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
+          vec3.set(freeflyVelocity, 0, 0, 0);
+        }
+        // Switch focus (always, regardless of camera lock state)
         focusedViewId = clickedViewId;
-        // Load new view's camera
-        const newCam = getViewCameraState(focusedViewId);
-        if (newCam) applyCameraStateTemporarily(newCam);
-        // Notify UI
+        // Load new view's camera (only when unlocked)
+        if (!camerasLocked) {
+          const newCam = getViewCameraState(focusedViewId);
+          if (newCam) applyCameraStateTemporarily(newCam);
+        }
+        // Notify UI (always, so dimension buttons target the clicked view)
         if (viewFocusHandler) viewFocusHandler(focusedViewId);
       }
     }
@@ -2267,7 +2284,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     }
 
     // Draw highlights (selection rings) on top of scatter points
-    highlightTools?.renderHighlights?.(renderParams);
+    // Use view-specific positions for multi-dimensional support
+    const viewPos = viewPositionsCache.get(vid) || positionsArray;
+    highlightTools?.renderHighlights?.(renderParams, viewPos);
 
     // Draw connectivity lines
     drawConnectivityLines(width, height);
@@ -2767,6 +2786,126 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     updateOutlierQuantiles(outliers) {
       // HP renderer doesn't use outlier quantiles directly
       // Filtering should be done via transparency array
+    },
+
+    /**
+     * Update positions for dimension switching (maintains same point count and indices)
+     * @param {Float32Array} positions - New 3D positions array (n_points * 3)
+     */
+    updatePositions(positions) {
+      if (!positions || positions.length !== pointCount * 3) {
+        console.error('[Viewer] updatePositions: position count mismatch');
+        return;
+      }
+      positionsArray = positions;
+      // Also update the view positions cache to keep live view positions consistent
+      // This ensures viewPositionsCache.get('live') returns the same positions as positionsArray
+      viewPositionsCache.set(LIVE_VIEW_ID, positions);
+      computePointBoundsFromPositions(positions);
+
+      // Update HP renderer with new positions (keeps existing colors/transparency)
+      if (hpRenderer && hpRenderer.updatePositions) {
+        hpRenderer.updatePositions(positions);
+      } else if (hpRenderer && hpRenderer.loadData) {
+        // Fallback: full reload if incremental update not available
+        hpRenderer.loadData(positions, colorsArray);
+      }
+
+      // Rebuild octree for picking/projectiles if needed
+      if (hpRenderer && hpRenderer.rebuildOctree) {
+        hpRenderer.rebuildOctree();
+      }
+
+      currentLoadedViewId = LIVE_VIEW_ID;
+    },
+
+    /**
+     * Get current positions array
+     * @returns {Float32Array|null}
+     */
+    getPositions() {
+      return positionsArray;
+    },
+
+    /**
+     * Get point count
+     * @returns {number}
+     */
+    getPointCount() {
+      return pointCount;
+    },
+
+    /**
+     * Set dimension level for a specific view (for multi-dimensional support)
+     * @param {string} viewId - View identifier
+     * @param {number} level - Dimension level (1, 2, 3, or 4)
+     */
+    setViewDimension(viewId, level) {
+      const vid = String(viewId);
+      viewDimensionLevels.set(vid, level);
+
+      // Also update the snapshot object if this is a snapshot view
+      const snap = snapshotViews.find(s => s.id === vid);
+      if (snap) {
+        snap.dimensionLevel = level;
+      }
+    },
+
+    /**
+     * Get dimension level for a specific view
+     * @param {string} viewId - View identifier
+     * @returns {number} Dimension level (defaults to 3)
+     */
+    getViewDimension(viewId) {
+      return viewDimensionLevels.get(String(viewId)) ?? 3;
+    },
+
+    /**
+     * Set positions for a specific view (for multi-dimensional support in multiview)
+     * Updates the snapshot buffer with new positions if the view has one.
+     * @param {string} viewId - View identifier
+     * @param {Float32Array} positions - 3D positions array
+     */
+    setViewPositions(viewId, positions) {
+      const vid = String(viewId);
+      viewPositionsCache.set(vid, positions);
+
+      // If this is the live view, update the main positions
+      if (vid === LIVE_VIEW_ID) {
+        positionsArray = positions;
+        computePointBoundsFromPositions(positions);
+        if (hpRenderer && hpRenderer.updatePositions) {
+          hpRenderer.updatePositions(positions);
+        }
+      } else {
+        // For snapshot views, update the snapshot buffer positions
+        if (hpRenderer && hpRenderer.updateSnapshotPositions) {
+          hpRenderer.updateSnapshotPositions(vid, positions);
+        }
+      }
+    },
+
+    /**
+     * Get positions for a specific view
+     * @param {string} viewId - View identifier
+     * @returns {Float32Array|null} Positions array or null
+     */
+    getViewPositions(viewId) {
+      const vid = String(viewId);
+      if (vid === LIVE_VIEW_ID) {
+        return positionsArray;
+      }
+      return viewPositionsCache.get(vid) || positionsArray;
+    },
+
+    /**
+     * Clear view dimension and position cache for a view (on view removal)
+     * @param {string} viewId - View identifier
+     */
+    clearViewDimensionState(viewId) {
+      const vid = String(viewId);
+      viewDimensionLevels.delete(vid);
+      viewPositionsCache.delete(vid);
     },
 
     updateHighlight(highlightData) {
@@ -3450,6 +3589,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         (camerasLocked ? getCurrentCameraStateInternal() :
           JSON.parse(JSON.stringify(liveCameraState || getCurrentCameraStateInternal())));
 
+      // Get initial dimension level from config or inherit from current live view
+      const initialDimLevel = config.dimensionLevel ?? viewDimensionLevels.get(LIVE_VIEW_ID) ?? 3;
+
       const snapshot = {
         id,
         label: config.label || `View ${snapshotViews.length + 2}`,
@@ -3463,13 +3605,25 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         centroidOutliers: config.centroidOutliers ? new Float32Array(config.centroidOutliers) : null,
         outlierThreshold: config.outlierThreshold ?? 1.0,
         meta: config.meta || {},
-        cameraState: inheritedCamera  // Per-view camera state
+        cameraState: inheritedCamera,  // Per-view camera state
+        dimensionLevel: initialDimLevel  // Per-view dimension level for multi-dimensional support
       };
       snapshotViews.push(snapshot);
 
+      // Track dimension level for this view
+      viewDimensionLevels.set(id, initialDimLevel);
+
+      // Get dimension-specific positions for this snapshot
+      // Use the source view's positions (active view when "Keep View" was clicked)
+      const sourceViewId = config.sourceViewId || LIVE_VIEW_ID;
+      const sourcePositions = viewPositionsCache.get(String(sourceViewId)) || positionsArray;
+      // Cache positions for this snapshot view (used by highlight rendering)
+      viewPositionsCache.set(id, sourcePositions);
+
       // Create GPU buffer for this snapshot (uploaded once, not per-frame)
+      // Pass dimension-specific positions so the snapshot renders correctly
       if (snapshot.colors && hpRenderer) {
-        hpRenderer.createSnapshotBuffer(id, snapshot.colors, snapshot.transparency);
+        hpRenderer.createSnapshotBuffer(id, snapshot.colors, snapshot.transparency, sourcePositions);
       }
 
       // Create centroid GPU buffer for this snapshot (uploaded once)
@@ -3532,6 +3686,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         orbitAnchorRenderer.deleteViewState(id);
         // Clean up cached view matrix
         cachedViewMatrices.delete(id);
+        // Clean up per-view dimension state
+        viewDimensionLevels.delete(id);
+        viewPositionsCache.delete(id);
         snapshotViews.splice(idx, 1);
         const key = String(id);
         if (key !== LIVE_VIEW_ID) {
@@ -3562,9 +3719,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       for (const id of centroidSnapshotBuffers.keys()) {
         deleteCentroidSnapshotBuffer(id);
       }
-      // Clean up cached view matrices for snapshots (preserve live view)
+      // Clean up cached view matrices and dimension state for snapshots (preserve live view)
       for (const snap of snapshotViews) {
         cachedViewMatrices.delete(snap.id);
+        viewDimensionLevels.delete(snap.id);
+        viewPositionsCache.delete(snap.id);
       }
       snapshotViews.length = 0;
       focusedViewId = LIVE_VIEW_ID;

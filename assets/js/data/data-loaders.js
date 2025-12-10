@@ -368,16 +368,30 @@ export function expandObsManifest(manifest) {
   const catSchema = schemas.categorical;
   if (catSchema) {
     for (const fieldTuple of (manifest._categoricalFields || [])) {
-      // [key, categories, codesDtype, codesMissingValue, centroids, outlierMin?, outlierMax?]
+      // [key, categories, codesDtype, codesMissingValue, centroidsByDim, outlierMin?, outlierMax?]
+      // centroidsByDim is a dict: {"1": [...], "2": [...], "3": [...]} for per-dimension centroids
+      // OR legacy format: [{category, position, n_points}, ...] for single dimension (3D)
       const key = fieldTuple[0];
       const safeKey = safeFilenameComponent(key);
       const categories = fieldTuple[1];
       const codesDtype = fieldTuple[2];
       const codesMissingValue = fieldTuple[3];
-      const centroids = fieldTuple[4];
+      const centroidsData = fieldTuple[4];
 
       // Determine codes extension from dtype
       const codesExt = codesDtype === 'uint8' ? 'u8' : 'u16';
+
+      // Handle both legacy (array) and new (dict by dimension) centroid formats
+      let centroidsByDim;
+      if (Array.isArray(centroidsData)) {
+        // Legacy format: single array of centroids (assume 3D)
+        centroidsByDim = { '3': centroidsData };
+      } else if (centroidsData && typeof centroidsData === 'object') {
+        // New format: dict keyed by dimension
+        centroidsByDim = centroidsData;
+      } else {
+        centroidsByDim = {};
+      }
 
       const field = {
         key: key,
@@ -388,7 +402,9 @@ export function expandObsManifest(manifest) {
         codesMissingValue: codesMissingValue,
         outlierQuantilesPath: catSchema.outlierPathPattern.replace('{key}', safeKey),
         outlierDtype: catSchema.outlierDtype,
-        centroids: centroids,
+        centroidsByDim: centroidsByDim,
+        // For backward compatibility, also provide centroids as the 3D version (or highest available)
+        centroids: centroidsByDim['3'] || centroidsByDim['2'] || centroidsByDim['1'] || [],
       };
 
       if (catSchema.outlierQuantized) {
@@ -639,5 +655,48 @@ export async function loadEdges(manifestUrl, manifest) {
     nCells: manifest.n_cells,
     maxNeighbors: manifest.max_neighbors,
     indexDtype: manifest.index_dtype
+  };
+}
+
+// ============================================================================
+// DATASET IDENTITY LOADER (includes multi-dimensional embeddings metadata)
+// ============================================================================
+
+/**
+ * Load dataset identity JSON (includes embeddings metadata for multi-dimensional support)
+ * @param {string} url - URL to dataset_identity.json
+ * @returns {Promise<Object>} Dataset identity with embeddings metadata
+ */
+export async function loadDatasetIdentity(url) {
+  // Handle local-user:// URLs
+  if (isLocalUserUrl(url)) {
+    return fetchLocalUserJson(url);
+  }
+
+  const response = await fetchOk(url);
+  return response.json();
+}
+
+/**
+ * Extract embeddings metadata from dataset identity
+ * @param {Object} identity - Dataset identity object
+ * @returns {Object|null} Embeddings metadata or null if not present
+ */
+export function getEmbeddingsMetadata(identity) {
+  if (!identity) return null;
+
+  // Version 2+ has explicit embeddings field
+  if (identity.embeddings) {
+    return identity.embeddings;
+  }
+
+  // Version 1 (legacy): assume only 3D is available
+  // Note: points.bin is deprecated, use points_3d.bin for new exports
+  return {
+    available_dimensions: [3],
+    default_dimension: 3,
+    files: {
+      '3d': 'points_3d.bin'
+    }
   };
 }

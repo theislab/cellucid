@@ -4,7 +4,6 @@ import { createDataState } from './state.js';
 import { initUI } from './ui.js';
 import { createStateSerializer } from './state-serializer.js';
 import {
-  loadPointsBinary,
   loadObsJson,
   loadObsManifest,
   loadObsFieldData,
@@ -12,8 +11,11 @@ import {
   loadVarFieldData,
   loadConnectivityManifest,
   hasEdgeFormat,
-  loadEdges
+  loadEdges,
+  loadDatasetIdentity,
+  getEmbeddingsMetadata
 } from '../data/data-loaders.js';
+import { createDimensionManager } from '../data/dimension-manager.js';
 import { getDataSourceManager } from '../data/data-source-manager.js';
 import { createLocalUserDirDataSource } from '../data/local-user-source.js';
 import { SyntheticDataGenerator, PerformanceTracker, BenchmarkReporter, formatNumber } from '../dev/benchmark.js';
@@ -28,7 +30,7 @@ function getObsManifestUrl() { return `${EXPORT_BASE_URL}obs_manifest.json`; }
 function getVarManifestUrl() { return `${EXPORT_BASE_URL}var_manifest.json`; }
 function getConnectivityManifestUrl() { return `${EXPORT_BASE_URL}connectivity_manifest.json`; }
 function getLegacyObsUrl() { return `${EXPORT_BASE_URL}obs_values.json`; }
-function getPointsUrl() { return `${EXPORT_BASE_URL}points.bin`; }
+function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.json`; }
 
 (async function bootstrap() {
   const canvas = document.getElementById('glcanvas');
@@ -206,7 +208,36 @@ function getPointsUrl() { return `${EXPORT_BASE_URL}points.bin`; }
     EXPORT_BASE_URL = dataSourceManager.getCurrentBaseUrl() || EXPORT_BASE_URL;
     console.log(`[Main] Using dataset base URL: ${EXPORT_BASE_URL}`);
 
-    const positionsPromise = loadPointsBinary(getPointsUrl());
+    // Initialize dimension manager for multi-dimensional embeddings
+    const dimensionManager = createDimensionManager({ baseUrl: EXPORT_BASE_URL });
+
+    // Try to load dataset identity for embeddings metadata
+    let datasetIdentity = null;
+    try {
+      datasetIdentity = await loadDatasetIdentity(getDatasetIdentityUrl());
+      const embeddingsMetadata = getEmbeddingsMetadata(datasetIdentity);
+      dimensionManager.initFromMetadata(embeddingsMetadata);
+      console.log(`[Main] Loaded dataset identity v${datasetIdentity.version || 1}`);
+    } catch (err) {
+      if (err?.status === 404) {
+        console.log('[Main] dataset_identity.json not found, using default 3D embeddings');
+        // Use default 3D-only embeddings (points_3d.bin is the standard filename)
+        dimensionManager.initFromMetadata({
+          available_dimensions: [3],
+          default_dimension: 3,
+          files: { '3d': 'points_3d.bin' }
+        });
+      } else {
+        console.warn('[Main] Error loading dataset identity:', err);
+      }
+    }
+
+    // Set dimension manager on state
+    state.setDimensionManager(dimensionManager);
+
+    // Load positions using dimension manager
+    const defaultDim = dimensionManager.getDefaultDimension();
+    const positionsPromise = dimensionManager.getPositions3D(defaultDim);
 
     let obs = null;
     try {
@@ -291,7 +322,38 @@ function getPointsUrl() { return `${EXPORT_BASE_URL}points.bin`; }
       connectivityManifest = null;
 
       try {
-        const positionsPromiseReload = loadPointsBinary(getPointsUrl());
+        // Reinitialize dimension manager with new dataset's embeddings metadata
+        dimensionManager.clearCache();
+        dimensionManager.setBaseUrl(EXPORT_BASE_URL);
+
+        // Try to load new dataset_identity.json for embeddings metadata
+        try {
+          const newDatasetIdentity = await loadDatasetIdentity(getDatasetIdentityUrl());
+          const newEmbeddingsMetadata = getEmbeddingsMetadata(newDatasetIdentity);
+          dimensionManager.initFromMetadata(newEmbeddingsMetadata);
+          console.log(`[Main] Reloaded dataset identity v${newDatasetIdentity.version || 1}`);
+        } catch (err) {
+          if (err?.status === 404) {
+            console.log('[Main] dataset_identity.json not found for reloaded dataset, using default 3D embeddings');
+            dimensionManager.initFromMetadata({
+              available_dimensions: [3],
+              default_dimension: 3,
+              files: { '3d': 'points_3d.bin' }
+            });
+          } else {
+            console.warn('[Main] Error loading dataset identity for reloaded dataset:', err);
+            // Fall back to 3D-only
+            dimensionManager.initFromMetadata({
+              available_dimensions: [3],
+              default_dimension: 3,
+              files: { '3d': 'points_3d.bin' }
+            });
+          }
+        }
+
+        // Load positions through dimension manager for proper multi-dimensional support
+        const newDefaultDim = dimensionManager.getDefaultDimension();
+        const positionsPromiseReload = dimensionManager.getPositions3D(newDefaultDim);
 
         let nextObs = null;
         try {
@@ -342,7 +404,13 @@ function getPointsUrl() { return `${EXPORT_BASE_URL}points.bin`; }
           state.clearAllHighlights();
         }
 
-        // Refresh dataset-aware UI controls (field dropdowns, gene search, stats)
+        // Reset dimension level to the new dataset's default
+        dimensionManager.clearViewDimensions();
+        if (state.resetDimensionLevel) {
+          state.resetDimensionLevel(newDefaultDim);
+        }
+
+        // Refresh dataset-aware UI controls (field dropdowns, gene search, stats, dimension slider)
         ui?.refreshDatasetUI?.(activeMetadata || null);
         await ui?.activateField?.(-1);
 
@@ -485,6 +553,10 @@ function getPointsUrl() { return `${EXPORT_BASE_URL}points.bin`; }
         splitViewBadgesBox,
         splitViewBadges,
         splitViewBoxTitle,
+        // Dimension controls
+        dimensionControls: document.getElementById('dimension-controls'),
+        dimensionButtons: document.getElementById('dimension-buttons'),
+        dimensionLoading: document.getElementById('dimension-loading'),
         saveStateBtn,
         loadStateBtn,
         sessionStatus,

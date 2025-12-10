@@ -64,8 +64,8 @@ export const DATA_CONFIG = {
     'obs_manifest.json'
   ],
 
-  // Points file (may have .gz extension)
-  POINTS_FILE: 'points.bin',
+  // Points files - check for dimensional files (3D preferred, then 2D, then 1D)
+  POINTS_FILES: ['points_3d.bin', 'points_2d.bin', 'points_1d.bin'],
 
   // Metadata file name
   DATASET_IDENTITY_FILE: 'dataset_identity.json',
@@ -78,7 +78,7 @@ export const DATA_CONFIG = {
 
   // Supported schema versions
   SUPPORTED_MANIFEST_VERSIONS: [1],
-  SUPPORTED_IDENTITY_VERSIONS: [1]
+  SUPPORTED_IDENTITY_VERSIONS: [1, 2]
 };
 
 /**
@@ -240,16 +240,22 @@ export async function validateDatasetStructure(baseUrl, _sourceType) {
   const missing = [];
   let pointsFile = null;
 
-  // Check for points file (may have .gz extension)
-  const pointsUrl = resolveUrl(baseUrl, DATA_CONFIG.POINTS_FILE);
-  const pointsGzUrl = pointsUrl + '.gz';
+  // Check for dimensional points files (3D preferred, then 2D, then 1D)
+  for (const candidate of DATA_CONFIG.POINTS_FILES) {
+    const pointsUrl = resolveUrl(baseUrl, candidate);
+    const pointsGzUrl = pointsUrl + '.gz';
 
-  if (await urlExists(pointsGzUrl)) {
-    pointsFile = DATA_CONFIG.POINTS_FILE + '.gz';
-  } else if (await urlExists(pointsUrl)) {
-    pointsFile = DATA_CONFIG.POINTS_FILE;
-  } else {
-    missing.push(DATA_CONFIG.POINTS_FILE);
+    if (await urlExists(pointsGzUrl)) {
+      pointsFile = candidate + '.gz';
+      break;
+    } else if (await urlExists(pointsUrl)) {
+      pointsFile = candidate;
+      break;
+    }
+  }
+
+  if (!pointsFile) {
+    missing.push('points_Xd.bin (at least one of: ' + DATA_CONFIG.POINTS_FILES.join(', ') + ')');
   }
 
   // Check required files
@@ -524,7 +530,7 @@ export function parseLocalUserUrl(url) {
  *   manager.registerProtocol('remote://', 'remote');
  *
  * This allows data-loaders.js to automatically resolve URLs like:
- *   'remote://server.example.com/dataset/points.bin'
+ *   'remote://server.example.com/dataset/points_3d.bin'
  */
 
 /**
