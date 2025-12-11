@@ -1506,6 +1506,23 @@ html, body {
   text-transform: uppercase;
   pointer-events: auto;
   cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.view-title-chip:hover {
+  background: rgba(245, 245, 245, 0.95);
+}
+
+.view-title-chip.active {
+  background: #0f172a;
+  color: #ffffff;
+  border-color: #0f172a;
+  box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.25);
+}
+
+.view-title-chip.active:hover {
+  background: #1e293b;
+  border-color: #1e293b;
 }
 
 /* ========================================================================
@@ -1786,8 +1803,7 @@ html, body {
 .split-badge {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 6px;
+  gap: 4px;
   padding: 3px 6px;
   border-radius: 4px;
   font-size: 10px;
@@ -1798,6 +1814,7 @@ html, body {
 }
 
 .split-badge-label {
+  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1822,6 +1839,7 @@ html, body {
   font-size: 11px;
   line-height: 1;
   padding: 0 4px;
+  margin-left: 12px;
 }
 
 .split-badge-remove:hover {
@@ -1851,44 +1869,95 @@ html, body {
   box-shadow: 0 0 0 2px #3b82f6;
 }
 
-.split-badge.active-camera .split-badge-pill::after {
-  content: " \2316";
-  font-size: 8px;
+/* Camera indicator - separate element outside the pill */
+.split-badge-camera {
+  font-size: 10px;
+  opacity: 0;
+  margin-left: -2px;
+}
+
+.split-badge.active-camera .split-badge-camera {
+  opacity: 1;
 }
 
 /* Dimension indicator on view badges */
 .split-badge-dim {
-  font-family: "Oswald", system-ui, sans-serif;
+  font-family: inherit;
   font-size: 9px;
-  font-weight: 600;
+  font-weight: 500;
   text-transform: uppercase;
-  padding: 2px 5px;
-  margin-left: 4px;
-  border-radius: 4px;
-  background: #e0f2fe;
-  color: #0369a1;
-  border: 1px solid #7dd3fc;
+  letter-spacing: 0.02em;
+  padding: 1px 5px;
+  margin-left: 0;
+  border-radius: var(--viewer-radius-pill);
+  background: transparent;
+  color: rgba(15, 23, 42, 0.55);
+  border: 1px solid rgba(15, 23, 42, 0.25);
   cursor: pointer;
   transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
   flex-shrink: 0;
 }
 
 .split-badge-dim:hover {
-  background: #0ea5e9;
-  color: #ffffff;
-  border-color: #0ea5e9;
+  background: rgba(15, 23, 42, 0.06);
+  color: rgba(15, 23, 42, 0.75);
+  border-color: rgba(15, 23, 42, 0.4);
+}
+
+.split-badge-dim:active {
+  background: rgba(15, 23, 42, 0.1);
 }
 
 .split-badge.active .split-badge-dim {
-  background: #1e3a5f;
-  color: #7dd3fc;
-  border-color: #38bdf8;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.6);
+  border-color: rgba(255, 255, 255, 0.35);
 }
 
 .split-badge.active .split-badge-dim:hover {
-  background: #0ea5e9;
-  color: #ffffff;
-  border-color: #0ea5e9;
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.85);
+  border-color: rgba(255, 255, 255, 0.5);
+}
+
+/* Navigation mode indicator on view badges (only shown when cameras unlocked) */
+.split-badge-nav {
+  font-family: inherit;
+  font-size: 9px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  padding: 1px 5px;
+  margin-left: 0;
+  border-radius: var(--viewer-radius-pill);
+  background: transparent;
+  color: rgba(15, 23, 42, 0.55);
+  border: 1px solid rgba(15, 23, 42, 0.25);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+  flex-shrink: 0;
+}
+
+.split-badge-nav:hover {
+  background: rgba(15, 23, 42, 0.06);
+  color: rgba(15, 23, 42, 0.75);
+  border-color: rgba(15, 23, 42, 0.4);
+}
+
+.split-badge-nav:active {
+  background: rgba(15, 23, 42, 0.1);
+}
+
+.split-badge.active .split-badge-nav {
+  background: transparent;
+  color: rgba(255, 255, 255, 0.6);
+  border-color: rgba(255, 255, 255, 0.35);
+}
+
+.split-badge.active .split-badge-nav:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.85);
+  border-color: rgba(255, 255, 255, 0.5);
 }
 
 /* Keep the rest of your non-sidebar styles (gl canvas, etc.) exactly as-is.
@@ -2131,57 +2200,11 @@ html, body {
 }
 
 /* ========================================================================
-   Dimension Selector Buttons
+   Dimension Selector
    ===================================================================== */
 
 .dimension-controls {
   margin-top: 10px;
-}
-
-.dimension-buttons-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.dimension-label {
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--viewer-ink-soft);
-  margin-right: 4px;
-}
-
-.dimension-buttons {
-  display: flex;
-  gap: 4px;
-}
-
-.dimension-btn {
-  padding: 4px 10px;
-  font-size: 12px;
-  font-weight: 500;
-  border: 1px solid var(--viewer-ink-muted);
-  border-radius: 4px;
-  background: var(--viewer-paper);
-  color: var(--viewer-ink-soft);
-  cursor: pointer;
-  transition: all 0.15s ease;
-}
-
-.dimension-btn:hover {
-  border-color: var(--viewer-ink);
-  color: var(--viewer-ink);
-  background: var(--viewer-accent-light);
-}
-
-.dimension-btn.active {
-  background: var(--viewer-ink);
-  color: var(--viewer-paper);
-  border-color: var(--viewer-ink);
-}
-
-.dimension-btn.active:hover {
-  background: var(--viewer-accent-soft);
 }
 
 .dimension-loading {

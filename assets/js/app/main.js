@@ -84,6 +84,9 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
   const showOrbitAnchorCheckbox = document.getElementById('show-orbit-anchor');
   const freeflyControls = document.getElementById('freefly-controls');
   const orbitControls = document.getElementById('orbit-controls');
+  const planarControls = document.getElementById('planar-controls');
+  const planarZoomToCursorCheckbox = document.getElementById('planar-zoom-to-cursor');
+  const planarInvertAxesCheckbox = document.getElementById('planar-invert-axes');
   const geneExpressionContainer = document.getElementById('gene-expression-container');
   const geneExpressionSearch = document.getElementById('gene-expression-search');
   const geneExpressionDropdown = document.getElementById('gene-expression-dropdown');
@@ -514,6 +517,9 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         showOrbitAnchorCheckbox,
         freeflyControls,
         orbitControls,
+        planarControls,
+        planarZoomToCursorCheckbox,
+        planarInvertAxesCheckbox,
         geneExpressionContainer,
         geneExpressionSearch,
         geneExpressionDropdown,
@@ -555,7 +561,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         splitViewBoxTitle,
         // Dimension controls
         dimensionControls: document.getElementById('dimension-controls'),
-        dimensionButtons: document.getElementById('dimension-buttons'),
+        dimensionSelect: document.getElementById('dimension-select'),
         dimensionLoading: document.getElementById('dimension-loading'),
         saveStateBtn,
         loadStateBtn,

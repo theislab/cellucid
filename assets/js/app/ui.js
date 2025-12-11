@@ -52,6 +52,9 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     showOrbitAnchorCheckbox,
     freeflyControls,
     orbitControls,
+    planarControls,
+    planarZoomToCursorCheckbox,
+    planarInvertAxesCheckbox,
     geneExpressionContainer,
     geneExpressionSearch,
     geneExpressionDropdown,
@@ -95,7 +98,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     splitViewBoxTitle,
     // Dimension controls
     dimensionControls,
-    dimensionButtons,
+    dimensionSelect,
     dimensionLoading,
     // Session save/load
     saveStateBtn,
@@ -284,26 +287,22 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
   }
 
   /**
-   * Sync dimension buttons to reflect the active view's dimension level.
-   * Called when switching between views to ensure the buttons show the correct state.
+   * Sync dimension dropdown to reflect the active view's dimension level.
+   * Called when switching between views to ensure the dropdown shows the correct state.
    */
   function syncDimensionSliderToActiveView() {
-    if (!dimensionButtons) return;
+    if (!dimensionSelect) return;
     const viewDim = state.getViewDimensionLevel?.(activeViewId) ?? state.getDimensionLevel?.() ?? 3;
-    updateDimensionButtonsActiveState(viewDim);
+    updateDimensionSelectValue(viewDim);
   }
 
   /**
-   * Update the active state of dimension buttons
+   * Update the selected value of dimension dropdown
    * @param {number} activeDim - The active dimension level
    */
-  function updateDimensionButtonsActiveState(activeDim) {
-    if (!dimensionButtons) return;
-    const buttons = dimensionButtons.querySelectorAll('.dimension-btn');
-    buttons.forEach(btn => {
-      const btnDim = parseInt(btn.dataset.dim, 10);
-      btn.classList.toggle('active', btnDim === activeDim);
-    });
+  function updateDimensionSelectValue(activeDim) {
+    if (!dimensionSelect) return;
+    dimensionSelect.value = String(activeDim);
   }
 
   // Debounced auto-rebuild for smoke density
@@ -424,7 +423,10 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       freeflyControls.style.display = mode === 'free' ? 'block' : 'none';
     }
     if (orbitControls) {
-      orbitControls.style.display = mode === 'free' ? 'none' : 'block';
+      orbitControls.style.display = mode === 'orbit' ? 'block' : 'none';
+    }
+    if (planarControls) {
+      planarControls.style.display = mode === 'planar' ? 'block' : 'none';
     }
   }
 
@@ -3146,19 +3148,13 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
           await state.setDimensionLevel(nextDim, { viewId: targetViewId });
         }
 
-        // NOW sync UI's activeViewId and state to keep controls in sync with this view
-        if (String(activeViewId) !== targetViewId) {
-          activeViewId = targetViewId;
-          // Sync state's active view AFTER dimension change completed successfully
-          // This ensures future operations target the correct view
-          syncActiveViewToState();
-          pushViewLayoutToViewer();
-        }
-
         // Re-render badges to show updated dimension
         renderSplitViewBadges();
-        // Sync dimension slider to reflect the targeted view
-        syncDimensionSliderToActiveView();
+
+        // Only sync dimension controls if this is already the active view
+        if (String(activeViewId) === targetViewId) {
+          syncDimensionSliderToActiveView();
+        }
       } catch (err) {
         console.error('[UI] Failed to change dimension:', err);
       } finally {
@@ -3167,6 +3163,66 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     });
 
     return dimIndicator;
+  }
+
+  // Navigation mode indicator for view badges (only shown when cameras are unlocked)
+  const NAV_MODE_LABELS = { orbit: 'Orb', planar: 'Pan', free: 'Fly' };
+  const NAV_MODE_CYCLE = ['orbit', 'planar', 'free'];
+
+  function createNavigationIndicator(viewId, currentMode) {
+    const camerasLocked = typeof viewer.getCamerasLocked === 'function' ? viewer.getCamerasLocked() : true;
+    // Only show navigation badges when cameras are unlocked
+    if (camerasLocked) return null;
+
+    const navIndicator = document.createElement('span');
+    navIndicator.className = 'split-badge-nav';
+    navIndicator.textContent = NAV_MODE_LABELS[currentMode] || 'Orb';
+    navIndicator.title = 'Click to cycle navigation mode (Orbit/Planar/Free-fly)';
+    navIndicator.dataset.viewId = String(viewId);
+
+    // Click to cycle through navigation modes
+    navIndicator.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+
+      const targetViewId = String(e.currentTarget.dataset.viewId || LIVE_VIEW_ID);
+
+      // Get current navigation mode for this specific view
+      const freshCurrentMode = typeof viewer.getViewNavigationMode === 'function'
+        ? viewer.getViewNavigationMode(targetViewId)
+        : 'orbit';
+
+      // Find next mode in cycle
+      const currentIdx = NAV_MODE_CYCLE.indexOf(freshCurrentMode);
+      const nextIdx = (currentIdx + 1) % NAV_MODE_CYCLE.length;
+      const nextMode = NAV_MODE_CYCLE[nextIdx];
+
+      // Check if this is the focused view
+      const focusedId = typeof viewer.getFocusedViewId === 'function' ? viewer.getFocusedViewId() : LIVE_VIEW_ID;
+      const isFocusedView = targetViewId === focusedId;
+
+      // For the focused view, use setNavigationMode for proper initialization
+      // (syncFreeflyFromOrbit, cursor setup, etc.)
+      if (isFocusedView && typeof viewer.setNavigationMode === 'function') {
+        viewer.setNavigationMode(nextMode);
+      }
+
+      // Set navigation mode for this specific view (stores in camera state)
+      if (typeof viewer.setViewNavigationMode === 'function') {
+        viewer.setViewNavigationMode(targetViewId, nextMode);
+      }
+
+      // Re-render badges to show updated mode
+      renderSplitViewBadges();
+
+      // Sync navigation UI if this is the active/focused view
+      if (isFocusedView && navigationModeSelect) {
+        navigationModeSelect.value = nextMode;
+        toggleNavigationPanels(nextMode);
+      }
+    });
+
+    return navIndicator;
   }
 
   function renderSplitViewBadges() {
@@ -3212,11 +3268,24 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
         syncActiveViewToState();
         pushViewLayoutToViewer();
         renderSplitViewBadges();
+        // Sync navigation dropdown when cameras are unlocked
+        const camLocked = typeof viewer.getCamerasLocked === 'function' ? viewer.getCamerasLocked() : true;
+        if (!camLocked && navigationModeSelect) {
+          const viewNavMode = typeof viewer.getViewNavigationMode === 'function'
+            ? viewer.getViewNavigationMode(LIVE_VIEW_ID) : 'orbit';
+          navigationModeSelect.value = viewNavMode;
+          toggleNavigationPanels(viewNavMode);
+        }
       });
 
       const livePill = document.createElement('span');
       livePill.className = 'split-badge-pill';
       livePill.textContent = String(badgeIndex);
+
+      // Camera indicator (shows when this view has active camera in unlocked mode)
+      const liveCameraIndicator = document.createElement('span');
+      liveCameraIndicator.className = 'split-badge-camera';
+      liveCameraIndicator.textContent = '\u2316';
 
       const liveText = document.createElement('span');
       liveText.className = 'split-badge-label';
@@ -3225,6 +3294,12 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       // Add dimension indicator for live view
       const liveDim = state.getViewDimensionLevel?.(LIVE_VIEW_ID) ?? state.getDimensionLevel?.() ?? 3;
       const liveDimIndicator = createDimensionIndicator(LIVE_VIEW_ID, liveDim);
+
+      // Add navigation mode indicator for live view (only when cameras unlocked)
+      const liveNavMode = typeof viewer.getViewNavigationMode === 'function'
+        ? viewer.getViewNavigationMode(LIVE_VIEW_ID)
+        : 'orbit';
+      const liveNavIndicator = createNavigationIndicator(LIVE_VIEW_ID, liveNavMode);
 
       // Close button for live view (only show if there are snapshots to fall back to)
       if (snapshots.length > 0) {
@@ -3279,13 +3354,17 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
         });
 
         liveBadge.appendChild(livePill);
+        liveBadge.appendChild(liveCameraIndicator);
         liveBadge.appendChild(liveText);
         if (liveDimIndicator) liveBadge.appendChild(liveDimIndicator);
+        if (liveNavIndicator) liveBadge.appendChild(liveNavIndicator);
         liveBadge.appendChild(liveRemoveBtn);
       } else {
         liveBadge.appendChild(livePill);
+        liveBadge.appendChild(liveCameraIndicator);
         liveBadge.appendChild(liveText);
         if (liveDimIndicator) liveBadge.appendChild(liveDimIndicator);
+        if (liveNavIndicator) liveBadge.appendChild(liveNavIndicator);
       }
 
       splitViewBadges.appendChild(liveBadge);
@@ -3310,11 +3389,24 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
         syncActiveViewToState();
         pushViewLayoutToViewer();
         renderSplitViewBadges();
+        // Sync navigation dropdown when cameras are unlocked
+        const camLocked = typeof viewer.getCamerasLocked === 'function' ? viewer.getCamerasLocked() : true;
+        if (!camLocked && navigationModeSelect) {
+          const viewNavMode = typeof viewer.getViewNavigationMode === 'function'
+            ? viewer.getViewNavigationMode(snapId) : 'orbit';
+          navigationModeSelect.value = viewNavMode;
+          toggleNavigationPanels(viewNavMode);
+        }
       });
 
       const pill = document.createElement('span');
       pill.className = 'split-badge-pill';
       pill.textContent = String(badgeIndex);
+
+      // Camera indicator (shows when this view has active camera in unlocked mode)
+      const cameraIndicator = document.createElement('span');
+      cameraIndicator.className = 'split-badge-camera';
+      cameraIndicator.textContent = '\u2316';
 
       const text = document.createElement('span');
       text.className = 'split-badge-label';
@@ -3325,9 +3417,17 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       const snapDim = state.getViewDimensionLevel?.(snapId) ?? snap.dimensionLevel ?? 3;
       const snapDimIndicator = createDimensionIndicator(snapId, snapDim);
 
+      // Add navigation mode indicator for snapshot view (only when cameras unlocked)
+      const snapNavMode = typeof viewer.getViewNavigationMode === 'function'
+        ? viewer.getViewNavigationMode(snapId)
+        : (snap.cameraState?.navigationMode || 'orbit');
+      const snapNavIndicator = createNavigationIndicator(snapId, snapNavMode);
+
       badge.appendChild(pill);
+      badge.appendChild(cameraIndicator);
       badge.appendChild(text);
       if (snapDimIndicator) badge.appendChild(snapDimIndicator);
+      if (snapNavIndicator) badge.appendChild(snapNavIndicator);
 
       // Only show close button if there's another view to fall back to
       // (either live view is available, or there are multiple snapshots)
@@ -3410,6 +3510,16 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     // Sync dimension buttons to reflect the newly focused view's dimension level
     if (viewChanged) {
       syncDimensionSliderToActiveView();
+    }
+
+    // Sync navigation mode dropdown when cameras are unlocked (per-view nav mode)
+    const camerasLocked = typeof viewer.getCamerasLocked === 'function' ? viewer.getCamerasLocked() : true;
+    if (viewChanged && !camerasLocked && navigationModeSelect) {
+      const viewNavMode = typeof viewer.getViewNavigationMode === 'function'
+        ? viewer.getViewNavigationMode(newViewId)
+        : 'orbit';
+      navigationModeSelect.value = viewNavMode;
+      toggleNavigationPanels(viewNavMode);
     }
   }
 
@@ -3722,9 +3832,17 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
 
   if (navigationModeSelect) {
     navigationModeSelect.addEventListener('change', () => {
-      const mode = navigationModeSelect.value === 'free' ? 'free' : 'orbit';
+      const selectValue = navigationModeSelect.value;
+      const mode = selectValue === 'free' ? 'free' : (selectValue === 'planar' ? 'planar' : 'orbit');
       if (viewer.setNavigationMode) {
         viewer.setNavigationMode(mode);
+      }
+      // When cameras are unlocked, also update the focused view's stored navigation mode
+      const camerasLocked = typeof viewer.getCamerasLocked === 'function' ? viewer.getCamerasLocked() : true;
+      if (!camerasLocked && typeof viewer.setViewNavigationMode === 'function') {
+        const focusedId = typeof viewer.getFocusedViewId === 'function' ? viewer.getFocusedViewId() : LIVE_VIEW_ID;
+        viewer.setViewNavigationMode(focusedId, mode);
+        renderSplitViewBadges(); // Update badge to show new mode
       }
       if (mode !== 'free' && pointerLockCheckbox && viewer.setPointerLockEnabled) {
         pointerLockCheckbox.checked = false;
@@ -3824,6 +3942,22 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     viewer.setOrbitInvertRotation(Boolean(orbitReverseCheckbox.checked));
     orbitReverseCheckbox.addEventListener('change', () => {
       viewer.setOrbitInvertRotation(Boolean(orbitReverseCheckbox.checked));
+    });
+  }
+
+  // Planar zoom-to-cursor option (pinch-style zoom)
+  if (planarZoomToCursorCheckbox && viewer.setPlanarZoomToCursor) {
+    viewer.setPlanarZoomToCursor(Boolean(planarZoomToCursorCheckbox.checked));
+    planarZoomToCursorCheckbox.addEventListener('change', () => {
+      viewer.setPlanarZoomToCursor(Boolean(planarZoomToCursorCheckbox.checked));
+    });
+  }
+
+  // Planar invert axes option
+  if (planarInvertAxesCheckbox && viewer.setPlanarInvertAxes) {
+    viewer.setPlanarInvertAxes(Boolean(planarInvertAxesCheckbox.checked));
+    planarInvertAxesCheckbox.addEventListener('change', () => {
+      viewer.setPlanarInvertAxes(Boolean(planarInvertAxesCheckbox.checked));
     });
   }
 
@@ -4234,6 +4368,16 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       viewer.setOrbitInvertRotation(Boolean(orbitReverseCheckbox.checked));
     }
 
+    if (planarZoomToCursorCheckbox && viewer.setPlanarZoomToCursor) {
+      planarZoomToCursorCheckbox.checked = Boolean(initialUIState.planarZoomToCursor);
+      viewer.setPlanarZoomToCursor(Boolean(planarZoomToCursorCheckbox.checked));
+    }
+
+    if (planarInvertAxesCheckbox && viewer.setPlanarInvertAxes) {
+      planarInvertAxesCheckbox.checked = Boolean(initialUIState.planarInvertAxes);
+      viewer.setPlanarInvertAxes(Boolean(planarInvertAxesCheckbox.checked));
+    }
+
     if (showOrbitAnchorCheckbox && viewer.setShowOrbitAnchor) {
       showOrbitAnchorCheckbox.checked = initialUIState.showOrbitAnchor ?? true;
       viewer.setShowOrbitAnchor(Boolean(showOrbitAnchorCheckbox.checked));
@@ -4401,7 +4545,9 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     moveSpeed: moveSpeedInput?.value || '100',
     invertLook: invertLookCheckbox?.checked || false,
     orbitInvertRotation: orbitReverseCheckbox?.checked || false,
-    showOrbitAnchor: showOrbitAnchorCheckbox?.checked ?? true
+    showOrbitAnchor: showOrbitAnchorCheckbox?.checked ?? true,
+    planarZoomToCursor: planarZoomToCursorCheckbox?.checked ?? true,
+    planarInvertAxes: planarInvertAxesCheckbox?.checked || false
   };
 
   renderFieldSelects();
@@ -4462,15 +4608,15 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     });
   }
 
-  // --- Dimension Buttons Wiring ---
+  // --- Dimension Dropdown Wiring ---
   let dimensionChangeBusy = false;
 
   /**
-   * Render dimension buttons based on available dimensions.
-   * Buttons always control the currently active view (live or snapshot).
+   * Render dimension dropdown options based on available dimensions.
+   * Dropdown always controls the currently active view (live or snapshot).
    */
-  function updateDimensionButtonsUI() {
-    if (!dimensionControls || !dimensionButtons) return;
+  function updateDimensionSelectUI() {
+    if (!dimensionControls || !dimensionSelect) return;
 
     const availableDimensions = state.getAvailableDimensions?.() || [3];
     const hasMultipleDimensions = availableDimensions.length > 1;
@@ -4485,33 +4631,39 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       : LIVE_VIEW_ID;
     const currentDim = state.getViewDimensionLevel?.(activeView) ?? state.getDimensionLevel?.() ?? 3;
 
-    // Clear existing buttons
-    dimensionButtons.innerHTML = '';
+    // Clear existing options
+    dimensionSelect.innerHTML = '';
 
-    // Create buttons for each available dimension (1D–4D).
+    // Create options for each available dimension (1D–4D).
     // 4D is shown but disabled as a future hook when not implemented/available.
     const sortedDims = [1, 2, 3, 4].filter((d) => availableDimensions.includes(d));
     for (const dim of sortedDims) {
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'dimension-btn' + (dim === currentDim ? ' active' : '');
-      btn.dataset.dim = dim;
-      btn.textContent = `${dim}D`;
+      const option = document.createElement('option');
+      option.value = String(dim);
+      option.textContent = `${dim}D`;
 
       const isFourD = dim === 4;
       if (isFourD) {
         // 4D: expose as disabled control to signal future support
-        btn.disabled = true;
-        btn.title = '4D embedding: reserved for future versions';
-      } else {
-        btn.title = `Switch this view to ${dim}D embedding`;
-        // IMPORTANT: Don't capture activeView in closure - read activeViewId at click time
-        // This ensures the button always affects the currently active view
-        btn.addEventListener('click', () => handleDimensionChange(dim));
+        option.disabled = true;
+        option.title = '4D embedding: reserved for future versions';
       }
 
-      dimensionButtons.appendChild(btn);
+      dimensionSelect.appendChild(option);
     }
+
+    // Set current value
+    dimensionSelect.value = String(currentDim);
+  }
+
+  // Add change event listener for dimension dropdown
+  if (dimensionSelect) {
+    dimensionSelect.addEventListener('change', (e) => {
+      const newDim = parseInt(e.target.value, 10);
+      if (!isNaN(newDim)) {
+        handleDimensionChange(newDim);
+      }
+    });
   }
 
   async function handleDimensionChange(newLevel, targetViewId = null) {
@@ -4542,8 +4694,8 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     dimensionChangeBusy = true;
     if (dimensionLoading) dimensionLoading.style.display = '';
 
-    // Immediately update button state for responsive feel
-    updateDimensionButtonsActiveState(newLevel);
+    // Immediately update dropdown value for responsive feel
+    updateDimensionSelectValue(newLevel);
 
     try {
       await state.setDimensionLevel(newLevel, { viewId });
@@ -4551,8 +4703,8 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       renderSplitViewBadges();
     } catch (err) {
       console.error('[UI] Failed to change dimension:', err);
-      // Revert button state
-      updateDimensionButtonsActiveState(currentDim);
+      // Revert dropdown value
+      updateDimensionSelectValue(currentDim);
       showSessionStatus?.(err.message || 'Failed to change dimension', true);
     } finally {
       dimensionChangeBusy = false;
@@ -4564,13 +4716,13 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
   if (state.addDimensionChangeCallback) {
     state.addDimensionChangeCallback((level) => {
       if (!dimensionChangeBusy) {
-        updateDimensionButtonsActiveState(level);
+        updateDimensionSelectValue(level);
       }
     });
   }
 
   // Initial UI update
-  updateDimensionButtonsUI();
+  updateDimensionSelectUI();
 
   renderSplitViewBadges();
   updateSplitViewUI();
@@ -4716,8 +4868,8 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     clearGeneSelection();
     refreshUIForActiveView();
     updateDatasetInfo(metadata || (dataSourceManager?.getCurrentMetadata?.() || null));
-    // Update dimension buttons when dataset changes (different datasets may have different available dimensions)
-    updateDimensionButtonsUI();
+    // Update dimension dropdown when dataset changes (different datasets may have different available dimensions)
+    updateDimensionSelectUI();
   }
 
   /**

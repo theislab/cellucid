@@ -340,8 +340,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   // === Scene Variables ===
   let pointCount = 0;
   let centroidCount = 0;
-  let defaultShowCentroidPoints = true;
-  let defaultShowCentroidLabels = true;
+  let defaultShowCentroidPoints = false;
+  let defaultShowCentroidLabels = false;
   const viewCentroidFlags = new Map();
   const viewCentroidLabels = new Map();
 
@@ -514,11 +514,15 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   let lastTouchDist = 0;
   let animationHandle = null;
 
-  // Navigation (orbit + free-fly)
+  // Navigation (orbit + free-fly + planar)
   let navigationMode = 'orbit';
   let lookSensitivity = 0.0025; // radians per pixel
   let invertLookX = false;
   let invertLookY = false;
+  // Planar mode: zoom to cursor (pinch-style) vs center zoom
+  let planarZoomToCursor = true;
+  // Planar mode: invert pan axes
+  let planarInvertAxes = false;
   let moveSpeed = 1.0; // units per second
   const sprintMultiplier = 2.2;
   const activeKeys = new Set();
@@ -530,6 +534,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   let pointerLockActive = false;
   let pointerLockChangeHandler = null;
   let pendingShot = false;
+  let pendingShotViewportInfo = null;  // Cached viewport info for pointer lock shots
   let lookActive = false;
   let lastFrameTime = performance.now();
 
@@ -628,6 +633,21 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       // Only request pointer lock if user has enabled it via checkbox
       if (pointerLockEnabled && !pointerLockActive && canvas.requestPointerLock) {
         // Pointer lock enabled but not yet active - request it and queue the shot
+        // Capture viewport info NOW (before pointer lock changes cursor behavior)
+        if (wantsShot) {
+          const vpInfo = getViewportInfoAtScreen(e.clientX, e.clientY);
+          // Use getCameraForView which correctly handles non-focused views via cached view matrix
+          const { position: cameraPosition, axes: cameraAxes } = getCameraForView(vpInfo.viewId);
+          pendingShotViewportInfo = {
+            vpWidth: vpInfo.vpWidth,
+            vpHeight: vpInfo.vpHeight,
+            vpOffsetX: vpInfo.vpOffsetX,
+            vpOffsetY: vpInfo.vpOffsetY,
+            vpAspect: vpInfo.vpAspect,
+            cameraPosition,
+            cameraAxes
+          };
+        }
         pendingShot = pendingShot || wantsShot;
         canvas.requestPointerLock();
       } else {
@@ -638,8 +658,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         if (wantsShot) {
           // Start charging instead of firing immediately
           const vpInfo = getViewportInfoAtScreen(e.clientX, e.clientY);
-          const camState = !camerasLocked ? getViewCameraState(vpInfo.viewId) : null;
-          const { position: cameraPosition, axes: cameraAxes } = getCameraFromState(camState);
+          // Use getCameraForView which correctly handles non-focused views via cached view matrix
+          const { position: cameraPosition, axes: cameraAxes } = getCameraForView(vpInfo.viewId);
           projectileSystem.startCharging({
             vpWidth: vpInfo.vpWidth,
             vpHeight: vpInfo.vpHeight,
@@ -663,7 +683,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
     lastDx = lastDy = 0;
 
-    if (e.button === 2 || e.shiftKey) {
+    if (navigationMode === 'planar') {
+      // Planar mode: always pan (no rotation)
+      dragMode = 'pan';
+      canvas.style.cursor = 'move';
+    } else if (e.button === 2 || e.shiftKey) {
       dragMode = 'pan';
       canvas.style.cursor = 'move';
     } else {
@@ -680,14 +704,16 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     // Fire charged projectile on release
     if (projectileSystem.isCharging() && e.button === 0) {
-      const vpInfo = getViewportInfoAtScreen(e.clientX, e.clientY);
-      const camState = !camerasLocked ? getViewCameraState(vpInfo.viewId) : null;
-      const { position: cameraPosition, axes: cameraAxes } = getCameraFromState(camState);
-
-      projectileSystem.stopChargingAndFire({
-        navigationMode,
-        pointerLockActive,
-        viewportInfo: {
+      // When pointer lock is active, use the viewport info captured at click time
+      // (cursor position is locked, so e.clientX/Y would give wrong viewport)
+      let viewportInfo;
+      if (pointerLockActive && pendingShotViewportInfo) {
+        viewportInfo = pendingShotViewportInfo;
+      } else {
+        const vpInfo = getViewportInfoAtScreen(e.clientX, e.clientY);
+        // Use getCameraForView which correctly handles non-focused views via cached view matrix
+        const { position: cameraPosition, axes: cameraAxes } = getCameraForView(vpInfo.viewId);
+        viewportInfo = {
           vpWidth: vpInfo.vpWidth,
           vpHeight: vpInfo.vpHeight,
           vpOffsetX: vpInfo.vpOffsetX,
@@ -695,8 +721,17 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
           vpAspect: vpInfo.vpAspect,
           cameraPosition,
           cameraAxes
-        }
+        };
+      }
+
+      projectileSystem.stopChargingAndFire({
+        navigationMode,
+        pointerLockActive,
+        viewportInfo
       });
+
+      // Clear stored viewport info after firing
+      pendingShotViewportInfo = null;
     }
 
     if (navigationMode === 'free') {
@@ -789,15 +824,23 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       while (theta > Math.PI * 2) theta -= Math.PI * 2;
       while (theta < 0) theta += Math.PI * 2;
     } else if (dragMode === 'pan') {
-      const forward = vec3.sub(vec3.create(), target, eye);
-      vec3.normalize(forward, forward);
-      const camRight = vec3.cross(vec3.create(), forward, up);
-      vec3.normalize(camRight, camRight);
-      const camUp = vec3.cross(vec3.create(), camRight, forward);
-      vec3.normalize(camUp, camUp);
       const panSpeed = radius * 0.002;
-      vec3.scaleAndAdd(target, target, camRight, -dx * panSpeed);
-      vec3.scaleAndAdd(target, target, camUp, dy * panSpeed);
+      if (navigationMode === 'planar') {
+        // Planar mode: pan in X and Y (camera looks down Z axis)
+        const invertX = planarInvertAxes ? 1 : -1;
+        const invertY = planarInvertAxes ? -1 : 1;
+        target[0] += dx * panSpeed * invertX;
+        target[1] += dy * panSpeed * invertY;
+      } else {
+        const forward = vec3.sub(vec3.create(), target, eye);
+        vec3.normalize(forward, forward);
+        const camRight = vec3.cross(vec3.create(), forward, up);
+        vec3.normalize(camRight, camRight);
+        const camUp = vec3.cross(vec3.create(), camRight, forward);
+        vec3.normalize(camUp, camUp);
+        vec3.scaleAndAdd(target, target, camRight, -dx * panSpeed);
+        vec3.scaleAndAdd(target, target, camUp, dy * panSpeed);
+      }
     }
     lastX = e.clientX;
     lastY = e.clientY;
@@ -813,8 +856,36 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     else if (e.deltaMode === 2) delta *= 100;
     delta = Math.max(-100, Math.min(100, delta));
     const sensitivity = 0.001 * targetRadius;
+    const oldRadius = targetRadius;
     targetRadius += delta * sensitivity;
     targetRadius = Math.max(minOrbitRadius, Math.min(100.0, targetRadius));
+
+    // Planar zoom-to-cursor: adjust target so cursor stays at same world position
+    if (navigationMode === 'planar' && planarZoomToCursor) {
+      const rect = canvas.getBoundingClientRect();
+      const canvasX = e.clientX - rect.left;
+      const canvasY = e.clientY - rect.top;
+      const canvasWidth = rect.width;
+      const canvasHeight = rect.height;
+      // Normalized device coords (-1 to 1)
+      const ndcX = (canvasX / canvasWidth) * 2 - 1;
+      const ndcY = -((canvasY / canvasHeight) * 2 - 1);
+      // In planar mode with perspective, calculate world offset at target plane
+      const aspect = canvasWidth / canvasHeight;
+      const halfHeight = oldRadius * Math.tan(fov / 2);
+      const halfWidth = halfHeight * aspect;
+      // World position under cursor before zoom (X and Y plane)
+      const worldX = target[0] + ndcX * halfWidth;
+      const worldY = target[1] + ndcY * halfHeight;
+      // After zoom, recalculate what the new half extents would be
+      const newHalfHeight = targetRadius * Math.tan(fov / 2);
+      const newHalfWidth = newHalfHeight * aspect;
+      // Adjust target so that worldX, worldY stays under cursor
+      target[0] = worldX - ndcX * newHalfWidth;
+      target[1] = worldY - ndcY * newHalfHeight;
+      // Make zoom instant to avoid wobble from smooth interpolation
+      radius = targetRadius;
+    }
 
     // Save camera state to active view when unlocked
     if (!camerasLocked) {
@@ -854,17 +925,17 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       }
       canvas.classList.add('dragging');
       canvas.style.cursor = 'none';
-      if (pendingShot) {
+      if (pendingShot && pendingShotViewportInfo) {
         // Start charging when pointer lock activates (fire on mouseup)
-        const camState = !camerasLocked ? getViewCameraState(focusedViewId) : null;
-        const { position: cameraPosition, axes: cameraAxes } = getCameraFromState(camState);
-        projectileSystem.startCharging({ cameraPosition, cameraAxes });
+        // Use the viewport info captured at click time (correct view's camera)
+        projectileSystem.startCharging(pendingShotViewportInfo);
         pendingShot = false;
       }
     } else {
       lookActive = false;
       pointerLockEnabled = false;
       pendingShot = false;
+      pendingShotViewportInfo = null;  // Clear stored viewport info
       // Cancel charging if pointer lock is released
       projectileSystem.cancelCharging();
       canvas.classList.remove('dragging');
@@ -918,7 +989,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     lastDx = lastDy = 0;
     if (e.touches.length === 1) {
       isDragging = true;
-      dragMode = 'rotate';
+      // Planar mode: always pan (no rotation)
+      dragMode = navigationMode === 'planar' ? 'pan' : 'rotate';
       lastX = e.touches[0].clientX;
       lastY = e.touches[0].clientY;
       lastMoveTime = performance.now();
@@ -938,16 +1010,25 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       const dx = e.touches[0].clientX - lastX;
       const dy = e.touches[0].clientY - lastY;
       lastDx = dx * VELOCITY_SMOOTHING + lastDx * (1 - VELOCITY_SMOOTHING);
-    lastDy = dy * VELOCITY_SMOOTHING + lastDy * (1 - VELOCITY_SMOOTHING);
-    lastMoveTime = performance.now();
-    const rotateSpeed = 0.005;
-      const { xSign, ySign } = getOrbitSigns();
-      theta -= dx * rotateSpeed * xSign;
-      phi -= dy * rotateSpeed * ySign;
-      const EPS = 0.05;
-      phi = Math.max(EPS, Math.min(Math.PI - EPS, phi));
-      while (theta > Math.PI * 2) theta -= Math.PI * 2;
-      while (theta < 0) theta += Math.PI * 2;
+      lastDy = dy * VELOCITY_SMOOTHING + lastDy * (1 - VELOCITY_SMOOTHING);
+      lastMoveTime = performance.now();
+      if (navigationMode === 'planar') {
+        // Planar mode: pan in X and Y (camera looks down Z axis)
+        const panSpeed = radius * 0.002;
+        const invertX = planarInvertAxes ? 1 : -1;
+        const invertY = planarInvertAxes ? -1 : 1;
+        target[0] += dx * panSpeed * invertX;
+        target[1] += dy * panSpeed * invertY;
+      } else {
+        const rotateSpeed = 0.005;
+        const { xSign, ySign } = getOrbitSigns();
+        theta -= dx * rotateSpeed * xSign;
+        phi -= dy * rotateSpeed * ySign;
+        const EPS = 0.05;
+        phi = Math.max(EPS, Math.min(Math.PI - EPS, phi));
+        while (theta > Math.PI * 2) theta -= Math.PI * 2;
+        while (theta < 0) theta += Math.PI * 2;
+      }
       lastX = e.touches[0].clientX;
       lastY = e.touches[0].clientY;
     } else if (e.touches.length === 2) {
@@ -997,6 +1078,27 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     return { forward, right, upVec };
   }
 
+  // Extract camera position and axes from a view matrix (for multiview projectile support)
+  // This is more reliable than camera state for non-focused views since view matrices
+  // are always correctly computed during rendering
+  function getCameraFromViewMatrix(viewMatrixArr) {
+    if (!viewMatrixArr) return null;
+    // Invert the view matrix to get camera world transform
+    const invView = mat4.create();
+    if (!mat4.invert(invView, viewMatrixArr)) return null;
+    // Camera position is the translation component of the inverted view matrix
+    const position = vec3.fromValues(invView[12], invView[13], invView[14]);
+    // Extract axes from the inverted view matrix (camera's world orientation)
+    // Column 0 = right, Column 1 = up, Column 2 = forward (negated in view space)
+    const right = vec3.fromValues(invView[0], invView[1], invView[2]);
+    const upVec = vec3.fromValues(invView[4], invView[5], invView[6]);
+    const forward = vec3.fromValues(-invView[8], -invView[9], -invView[10]);
+    vec3.normalize(right, right);
+    vec3.normalize(upVec, upVec);
+    vec3.normalize(forward, forward);
+    return { position, axes: { forward, right, upVec } };
+  }
+
   // Compute camera position and axes from a camera state (for multiview projectile support)
   function getCameraFromState(camState) {
     if (!camState) {
@@ -1024,6 +1126,25 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     }
     // For orbit mode, return current global state (projectiles only work in freefly)
     return { position: freeflyPosition, axes: getFreeflyAxes() };
+  }
+
+  // Get camera position and axes for a specific view (multiview support)
+  // Uses cached view matrix for non-focused views (more reliable than camera state)
+  function getCameraForView(viewId) {
+    const isFocused = viewId === focusedViewId;
+    // For the focused view, use global state (always up-to-date)
+    if (isFocused || camerasLocked) {
+      return { position: freeflyPosition, axes: getFreeflyAxes() };
+    }
+    // For non-focused views, try cached view matrix first (most reliable)
+    const cached = cachedViewMatrices.get(viewId);
+    if (cached && cached.viewMatrix) {
+      const fromMatrix = getCameraFromViewMatrix(cached.viewMatrix);
+      if (fromMatrix) return fromMatrix;
+    }
+    // Fall back to camera state
+    const camState = getViewCameraState(viewId);
+    return getCameraFromState(camState);
   }
 
   function updateFreefly(dt) {
@@ -1119,6 +1240,14 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       vec3.copy(eye, freeflyPosition);
       const lookTarget = vec3.add(vec3.create(), freeflyPosition, forward);
       mat4.lookAt(viewMatrix, eye, lookTarget, upVec);
+    } else if (navigationMode === 'planar') {
+      // Planar mode: camera looks at the XY plane from the Z axis
+      // Camera positioned in front of the target on Z axis
+      eye[0] = target[0];
+      eye[1] = target[1];
+      eye[2] = target[2] + radius;  // Camera in front on Z axis
+      // Y-axis is up on screen
+      mat4.lookAt(viewMatrix, eye, target, up);
     } else {
       eye[0] = target[0] + radius * Math.sin(phi) * Math.cos(theta);
       eye[1] = target[1] + radius * Math.cos(phi);
@@ -1906,6 +2035,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     views.forEach((view, i) => {
       const chip = document.createElement('div');
       chip.className = 'view-title-chip';
+      // Mark active view
+      if (view.id === focusedViewId) {
+        chip.classList.add('active');
+      }
       chip.textContent = view.label || view.id;
       chip.dataset.viewId = view.id;
 
@@ -1922,6 +2055,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
             const newCam = getViewCameraState(focusedViewId);
             if (newCam) applyCameraStateTemporarily(newCam);
           }
+          // Update active state on title chips
+          updateViewTitleActiveState();
         }
         if (viewFocusHandler) viewFocusHandler(view.id);
       });
@@ -1968,6 +2103,17 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   function showViewTitles() {
     viewTitleEntries.forEach(entry => {
       if (entry.el) entry.el.style.display = '';
+    });
+  }
+
+  function updateViewTitleActiveState() {
+    viewTitleEntries.forEach(entry => {
+      if (!entry.el) return;
+      if (entry.viewId === focusedViewId) {
+        entry.el.classList.add('active');
+      } else {
+        entry.el.classList.remove('active');
+      }
     });
   }
 
@@ -2590,6 +2736,119 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     }
   }
 
+  // === Per-view navigation mode helpers ===
+  function getViewNavigationMode(viewId) {
+    const camState = getViewCameraState(viewId);
+    return camState?.navigationMode || navigationMode;
+  }
+
+  // Sync freefly data from orbit data within a camera state (for non-focused views)
+  function syncFreeflyInCameraState(camState) {
+    if (!camState || !camState.orbit) return;
+    const orb = camState.orbit;
+    const r = orb.radius ?? 5;
+    const t = orb.theta ?? 0;
+    const p = orb.phi ?? Math.PI / 2;
+    const tgt = orb.target || [0, 0, 0];
+    // Compute eye position from orbit params
+    const eyePos = [
+      tgt[0] + r * Math.sin(p) * Math.cos(t),
+      tgt[1] + r * Math.cos(p),
+      tgt[2] + r * Math.sin(p) * Math.sin(t)
+    ];
+    // Compute forward direction
+    const forward = [tgt[0] - eyePos[0], tgt[1] - eyePos[1], tgt[2] - eyePos[2]];
+    const fwdLen = Math.sqrt(forward[0] * forward[0] + forward[1] * forward[1] + forward[2] * forward[2]);
+    if (fwdLen > 1e-6) {
+      forward[0] /= fwdLen; forward[1] /= fwdLen; forward[2] /= fwdLen;
+    }
+    // Compute yaw and pitch from forward
+    const syncedYaw = Math.atan2(forward[2], forward[0]);
+    const syncedPitch = Math.asin(Math.min(1, Math.max(-1, forward[1])));
+    camState.freefly = {
+      position: eyePos,
+      yaw: syncedYaw,
+      pitch: syncedPitch
+    };
+  }
+
+  function setViewNavigationMode(viewId, mode) {
+    // For the focused view, get fresh camera state that includes current global position
+    const isFocused = viewId === focusedViewId;
+
+    // Handle live view specially - ensure liveCameraState exists
+    if (viewId === LIVE_VIEW_ID) {
+      if (!liveCameraState || isFocused) {
+        // Always refresh camera state for focused view to capture current position
+        liveCameraState = getCurrentCameraStateInternal();
+      }
+      // When switching to free-fly, ensure freefly data is synced from orbit
+      if (mode === 'free' && !isFocused) {
+        syncFreeflyInCameraState(liveCameraState);
+      }
+      liveCameraState.navigationMode = mode;
+      if (!camerasLocked) {
+        updateCachedViewMatrix(viewId, liveCameraState);
+      }
+    } else {
+      // Handle snapshot views
+      const snap = snapshotViews.find(s => s.id === viewId);
+      if (snap) {
+        if (!snap.cameraState || isFocused) {
+          // Always refresh camera state for focused view to capture current position
+          snap.cameraState = getCurrentCameraStateInternal();
+        }
+        // When switching to free-fly, ensure freefly data is synced from orbit
+        if (mode === 'free' && !isFocused) {
+          syncFreeflyInCameraState(snap.cameraState);
+        }
+        snap.cameraState.navigationMode = mode;
+        if (!camerasLocked) {
+          updateCachedViewMatrix(viewId, snap.cameraState);
+        }
+      }
+    }
+    // If this is the focused view, also update the global navigation mode
+    if (isFocused) {
+      applyNavigationModeDirectly(mode);
+    }
+  }
+
+  // Apply navigation mode directly without triggering UI sync (internal use)
+  // Used when switching views - applies stored freefly params, doesn't sync from orbit
+  function applyNavigationModeDirectly(mode) {
+    const prev = navigationMode;
+    if (mode === prev) return;
+    navigationMode = mode;
+    canvas.classList.remove('free-nav', 'planar-nav');
+
+    // Reset velocities and active keys when changing modes
+    velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
+    vec3.set(freeflyVelocity, 0, 0, 0);
+    activeKeys.clear();
+
+    if (mode === 'free') {
+      canvas.classList.add('free-nav');
+      canvas.style.cursor = pointerLockActive ? 'none' : 'crosshair';
+    } else if (mode === 'planar') {
+      canvas.classList.add('planar-nav');
+      lookActive = false;
+      // Exit pointer lock when switching away from freefly
+      if (document.pointerLockElement === canvas && document.exitPointerLock) {
+        document.exitPointerLock();
+      }
+      updateCursorForHighlightMode();
+    } else {
+      // orbit mode
+      lookActive = false;
+      // Exit pointer lock when switching away from freefly
+      if (document.pointerLockElement === canvas && document.exitPointerLock) {
+        document.exitPointerLock();
+      }
+      updateCursorForHighlightMode();
+    }
+  }
+
   function getCurrentCameraStateInternal() {
     // Sync the inactive mode from the active mode before saving
     // This ensures both orbit and freefly params are current/equivalent
@@ -2640,8 +2899,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     }
   }
 
-  function applyCameraStateTemporarily(camState) {
+  function applyCameraStateTemporarily(camState, { applyNavMode = true } = {}) {
     if (!camState) return;
+    // Apply navigation mode if requested (when switching views with unlocked cameras)
+    if (applyNavMode && camState.navigationMode) {
+      applyNavigationModeDirectly(camState.navigationMode);
+    }
     if (camState.orbit) {
       radius = camState.orbit.radius ?? radius;
       targetRadius = camState.orbit.targetRadius ?? targetRadius;
@@ -2697,6 +2960,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         right[0] * forward[1] - right[1] * forward[0]
       ];
       mat4.lookAt(outViewMatrix, pos, lookTarget, upVec);
+    } else if (navMode === 'planar' && camState.orbit) {
+      // Planar mode: camera looks at XY plane from the Z axis
+      const r = camState.orbit.radius ?? 5;
+      const tgt = camState.orbit.target || [0, 0, 0];
+      const eyePos = [tgt[0], tgt[1], tgt[2] + r];
+      mat4.lookAt(outViewMatrix, eyePos, tgt, up);
     } else if (camState.orbit) {
       const r = camState.orbit.radius ?? 5;
       const t = camState.orbit.theta ?? 0;
@@ -3154,7 +3423,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     setBackground,
     setRenderMode(mode) { renderMode = mode === 'smoke' ? 'smoke' : 'points'; },
     setNavigationMode(mode) {
-      const next = mode === 'free' ? 'free' : 'orbit';
+      const next = mode === 'free' ? 'free' : (mode === 'planar' ? 'planar' : 'orbit');
       if (next === navigationMode) return;
       if (next === 'free') {
         // Ensure orbit state is synced before switching
@@ -3164,16 +3433,38 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         syncFreeflyFromOrbit();
         navigationMode = 'free';
         canvas.classList.add('free-nav');
+        canvas.classList.remove('planar-nav');
         canvas.style.cursor = pointerLockActive ? 'none' : 'crosshair';
         velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
         activeKeys.clear();
         if (pointerLockEnabled && canvas.requestPointerLock) {
           canvas.requestPointerLock();
         }
-      } else {
-        navigationMode = 'orbit';
-        syncOrbitFromFreefly();
+      } else if (next === 'planar') {
+        // Planar mode: fix camera to look at XY plane
+        if (navigationMode === 'free') {
+          syncOrbitFromFreefly();
+        }
+        navigationMode = 'planar';
         canvas.classList.remove('free-nav');
+        canvas.classList.add('planar-nav');
+        lookActive = false;
+        pointerLockEnabled = false;
+        if (document.pointerLockElement === canvas && document.exitPointerLock) {
+          document.exitPointerLock();
+        }
+        activeKeys.clear();
+        vec3.set(freeflyVelocity, 0, 0, 0);
+        velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
+        updateCursorForHighlightMode();
+      } else {
+        // Orbit mode
+        if (navigationMode === 'free') {
+          syncOrbitFromFreefly();
+        }
+        navigationMode = 'orbit';
+        canvas.classList.remove('free-nav');
+        canvas.classList.remove('planar-nav');
         lookActive = false;
         pointerLockEnabled = false;
         if (document.pointerLockElement === canvas && document.exitPointerLock) {
@@ -3198,6 +3489,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     setInvertLookX(value) { invertLookX = !!value; },
     setOrbitInvertRotation(value) { orbitInvertX = !!value; },
     setOrbitInvertX(value) { orbitInvertX = !!value; },
+    setPlanarZoomToCursor(value) { planarZoomToCursor = !!value; },
+    setPlanarInvertAxes(value) { planarInvertAxes = !!value; },
     setPointerLockEnabled(enabled) {
       const desired = !!enabled && navigationMode === 'free';
       pointerLockEnabled = desired;
@@ -3507,12 +3800,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
       // Set navigation mode directly without triggering sync functions
       if (camState.navigationMode) {
-        const next = camState.navigationMode === 'free' ? 'free' : 'orbit';
+        const next = camState.navigationMode === 'free' ? 'free' : (camState.navigationMode === 'planar' ? 'planar' : 'orbit');
         navigationMode = next;
+        canvas.classList.remove('free-nav', 'planar-nav');
         if (next === 'free') {
           canvas.classList.add('free-nav');
-        } else {
-          canvas.classList.remove('free-nav');
+        } else if (next === 'planar') {
+          canvas.classList.add('planar-nav');
         }
       }
 
@@ -3548,10 +3842,22 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       if (wasLocked && !camerasLocked) {
         // Transitioning to unlocked: initialize all view cameras from current state
         const currentCam = getCurrentCameraStateInternal();
-        liveCameraState = liveCameraState || JSON.parse(JSON.stringify(currentCam));
+        if (!liveCameraState) {
+          liveCameraState = JSON.parse(JSON.stringify(currentCam));
+        } else {
+          // Update existing camera state with current navigation mode and camera position
+          liveCameraState.navigationMode = currentCam.navigationMode;
+          liveCameraState.orbit = JSON.parse(JSON.stringify(currentCam.orbit));
+          liveCameraState.freefly = JSON.parse(JSON.stringify(currentCam.freefly));
+        }
         for (const snap of snapshotViews) {
           if (!snap.cameraState) {
             snap.cameraState = JSON.parse(JSON.stringify(currentCam));
+          } else {
+            // Update existing camera state with current navigation mode and camera position
+            snap.cameraState.navigationMode = currentCam.navigationMode;
+            snap.cameraState.orbit = JSON.parse(JSON.stringify(currentCam.orbit));
+            snap.cameraState.freefly = JSON.parse(JSON.stringify(currentCam.freefly));
           }
         }
         // Pre-compute cached view matrices for all views (avoids per-frame recalculation)
@@ -3575,6 +3881,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     getViewCameraState(viewId) { return getViewCameraState(viewId); },
     setViewCameraState(viewId, camState) { setViewCameraState(viewId, camState); },
+
+    // Per-view navigation mode (only relevant when cameras are unlocked)
+    getViewNavigationMode(viewId) { return getViewNavigationMode(viewId); },
+    setViewNavigationMode(viewId, mode) { setViewNavigationMode(viewId, mode); },
 
     setViewFocusHandler(fn) { viewFocusHandler = typeof fn === 'function' ? fn : null; },
     setLiveViewLabel(label) { liveViewLabel = label || 'View 1'; },
@@ -3764,6 +4074,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
           setViewCameraState(focusedViewId, getCurrentCameraStateInternal());
         }
         focusedViewId = activeId;
+        // Update active state on title chips
+        updateViewTitleActiveState();
         // Load new view's camera (if unlocked)
         if (!camerasLocked) {
           const newCam = getViewCameraState(focusedViewId);

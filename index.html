@@ -331,72 +331,6 @@
             </div>
           </div>
 
-          <!-- Navigation controls -->
-          <div class="control-block" id="navigation-controls">
-            <label>Navigation:</label>
-            <div class="legend-help">
-              Choose orbit for data-first inspection or free-fly for desk-to-immersive movement.
-            </div>
-            <div class="control-block" style="margin-top:6px;">
-              <label for="navigation-mode">Mode:</label>
-              <select id="navigation-mode" class="obs-select">
-                <option value="orbit">Orbit</option>
-                <option value="free">Free-fly</option>
-              </select>
-            </div>
-            <div id="orbit-controls" class="nav-mode-box">
-              <label class="checkbox-inline">
-                <input type="checkbox" id="orbit-reverse" checked />
-                Google Earth-style drag
-              </label>
-              <label class="checkbox-inline">
-                <input type="checkbox" id="show-orbit-anchor" checked />
-                Show orbit anchor
-              </label>
-            </div>
-            <div id="freefly-controls" class="nav-mode-box" style="display:none;">
-              <div class="control-block" style="margin-top:6px;">
-                <label for="look-sensitivity">Look sensitivity:</label>
-                <div class="slider-row">
-                  <input id="look-sensitivity" type="range" min="1" max="30" step="1" value="5" />
-                  <span id="look-sensitivity-display" class="slider-value">0.05x</span>
-                </div>
-              </div>
-              <div class="control-block" style="margin-top:6px;">
-                <label for="move-speed">Move speed:</label>
-                <div class="slider-row">
-                  <input id="move-speed" type="range" min="1" max="500" step="1" value="100" />
-                  <span id="move-speed-display" class="slider-value">1.00 u/s</span>
-                </div>
-              </div>
-              <div class="control-block" style="margin-top:6px;">
-                <label class="checkbox-inline">
-                  <input type="checkbox" id="invert-look" />
-                  Invert look axes
-                </label>
-              </div>
-              <div class="control-block" style="margin-top:6px;">
-                <label class="checkbox-inline">
-                  <input type="checkbox" id="projectiles-enabled" />
-                  Projectile shooting
-                </label>
-                <div id="projectile-info" class="legend-help" style="margin-top:4px; display:none;"></div>
-              </div>
-              <div class="control-block" style="margin-top:6px;">
-                <label class="checkbox-inline">
-                  <input type="checkbox" id="pointer-lock" />
-                  Capture pointer
-                </label>
-                <div class="legend-help" style="margin-top:6px;">
-                  Hides the cursor and lets you look without dragging. Press Esc to release.
-                </div>
-              </div>
-              <div class="legend-help" style="margin-top:6px;">
-                Free-fly: click+drag to look • WASD move • E up • Q down • Shift sprint.
-              </div>
-            </div>
-          </div>
-
           <!-- Volumetric smoke controls -->
           <div class="control-block" id="smoke-controls">
             <label>Volumetric smoke:</label>
@@ -559,12 +493,14 @@
       <details class="accordion-section" open>
         <summary>Compare Views</summary>
         <div class="accordion-content">
+          <!-- Multiview controls -->
           <div class="control-block" id="split-view-controls">
-            <div class="legend-help split-view-intro">
+            <label>Multiview:</label>
+            <div class="legend-help">
               Keep snapshots to compare UMAP tweaks. Switch to a single view to edit settings.
             </div>
 
-            <div class="split-view-row">
+            <div class="split-view-row" style="margin-top:6px;">
               <button
                 id="split-keep-view-btn"
                 class="reset-btn"
@@ -583,32 +519,17 @@
               </button>
             </div>
 
-            <div class="control-block" style="margin-top:10px;">
-              <label for="view-layout-mode">Layout:</label>
-              <select id="view-layout-mode" class="obs-select">
-                <option value="grid">Grid compare</option>
-                <option value="single">Edit selected view</option>
-              </select>
-            </div>
-
-            <!-- Dimension Level Selector -->
-            <div id="dimension-controls" class="control-block dimension-controls" style="margin-top:10px; display:none;">
-              <div class="legend-help dimension-intro" style="margin-bottom:6px;">
-                Switch between embeddings for the current view.
-              </div>
-              <div class="dimension-buttons-row">
-                <label class="dimension-label">Dimension:</label>
-                <div id="dimension-buttons" class="dimension-buttons">
-                  <!-- Buttons are dynamically generated based on available dimensions -->
-                </div>
-                <span id="dimension-loading" class="dimension-loading" style="display:none;">Loading...</span>
-              </div>
-            </div>
-
             <div id="split-view-badges-box" class="split-view-badges-box">
               <div id="split-view-badges-list" class="split-view-badges"></div>
               <div class="split-view-hint legend-help"></div>
-              <div class="legend-actions compact split-view-actions">
+              <div class="legend-actions compact split-view-actions" style="display:flex; justify-content:space-between; align-items:center;">
+                <div style="display:flex; align-items:center; gap:6px;">
+                  <span class="legend-help" style="margin:0;">Layout:</span>
+                  <select id="view-layout-mode" class="obs-select" style="width:100px;">
+                    <option value="grid">Grid compare</option>
+                    <option value="single">Edit selected view</option>
+                  </select>
+                </div>
                 <button
                   id="split-clear-btn"
                   class="reset-btn"
@@ -616,6 +537,98 @@
                 >
                   Clear
                 </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Dimension Level Selector -->
+          <div id="dimension-controls" class="control-block dimension-controls" style="display:none;">
+            <label>Embedding:</label>
+            <div class="legend-help">
+              Switch between embeddings for the current view.
+            </div>
+            <div class="control-block" style="margin-top:6px;">
+              <label for="dimension-select">Dimension:</label>
+              <select id="dimension-select" class="obs-select">
+                <!-- Options are dynamically generated based on available dimensions -->
+              </select>
+              <span id="dimension-loading" class="dimension-loading" style="display:none;">Loading...</span>
+            </div>
+          </div>
+
+          <!-- Navigation controls -->
+          <div class="control-block" id="navigation-controls">
+            <label>Navigation:</label>
+            <div class="legend-help">
+              Choose orbit for 3D exploration, planar for 2D embeddings, or free-fly for immersive movement.
+            </div>
+            <div class="control-block" style="margin-top:6px;">
+              <label for="navigation-mode">Mode:</label>
+              <select id="navigation-mode" class="obs-select">
+                <option value="orbit">Orbit</option>
+                <option value="planar">Planar</option>
+                <option value="free">Free-fly</option>
+              </select>
+            </div>
+            <div id="orbit-controls" class="nav-mode-box">
+              <label class="checkbox-inline">
+                <input type="checkbox" id="orbit-reverse" checked />
+                Google Earth-style drag
+              </label>
+              <label class="checkbox-inline">
+                <input type="checkbox" id="show-orbit-anchor" checked />
+                Show orbit anchor
+              </label>
+            </div>
+            <div id="planar-controls" class="nav-mode-box" style="display:none;">
+              <label class="checkbox-inline">
+                <input type="checkbox" id="planar-zoom-to-cursor" checked />
+                Zoom to cursor (pinch-style)
+              </label>
+              <label class="checkbox-inline">
+                <input type="checkbox" id="planar-invert-axes" />
+                Invert look axes
+              </label>
+            </div>
+            <div id="freefly-controls" class="nav-mode-box" style="display:none;">
+              <div class="control-block" style="margin-top:6px;">
+                <label for="look-sensitivity">Look sensitivity:</label>
+                <div class="slider-row">
+                  <input id="look-sensitivity" type="range" min="1" max="30" step="1" value="5" />
+                  <span id="look-sensitivity-display" class="slider-value">0.05x</span>
+                </div>
+              </div>
+              <div class="control-block" style="margin-top:6px;">
+                <label for="move-speed">Move speed:</label>
+                <div class="slider-row">
+                  <input id="move-speed" type="range" min="1" max="500" step="1" value="100" />
+                  <span id="move-speed-display" class="slider-value">1.00 u/s</span>
+                </div>
+              </div>
+              <div class="control-block" style="margin-top:6px;">
+                <label class="checkbox-inline">
+                  <input type="checkbox" id="invert-look" />
+                  Invert look axes
+                </label>
+              </div>
+              <div class="control-block" style="margin-top:6px;">
+                <label class="checkbox-inline">
+                  <input type="checkbox" id="projectiles-enabled" />
+                  Projectile shooting
+                </label>
+                <div id="projectile-info" class="legend-help" style="margin-top:4px; display:none;"></div>
+              </div>
+              <div class="control-block" style="margin-top:6px;">
+                <label class="checkbox-inline">
+                  <input type="checkbox" id="pointer-lock" />
+                  Capture pointer
+                </label>
+                <div class="legend-help" style="margin-top:6px;">
+                  Hides the cursor and lets you look without dragging. Press Esc to release.
+                </div>
+              </div>
+              <div class="legend-help" style="margin-top:6px;">
+                Free-fly: click+drag to look • WASD move • E up • Q down • Shift sprint.
               </div>
             </div>
           </div>
@@ -673,7 +686,7 @@
               </label>
               <label class="checkbox-inline">
                 <input type="checkbox" id="toggle-centroid-labels" />
-                Labels
+                Show labels
               </label>
             </div>
 
