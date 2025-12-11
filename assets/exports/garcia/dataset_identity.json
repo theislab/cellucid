@@ -1,0 +1,120 @@
+{
+  "version": 2,
+  "id": "garcia",
+  "name": "garcia",
+  "description": "Single-cell roadmap of human gonadal development",
+  "created_at": "2025-12-11T15:07:52Z",
+  "cellucid_data_version": "0.0.0",
+  "stats": {
+    "n_cells": 219731,
+    "n_genes": 8192,
+    "n_obs_fields": 16,
+    "n_categorical_fields": 14,
+    "n_continuous_fields": 2,
+    "has_connectivity": true,
+    "n_edges": 2683515
+  },
+  "embeddings": {
+    "available_dimensions": [
+      1,
+      2,
+      3
+    ],
+    "default_dimension": 3,
+    "files": {
+      "1d": "points_1d.bin.gz",
+      "2d": "points_2d.bin.gz",
+      "3d": "points_3d.bin.gz"
+    }
+  },
+  "obs_fields": [
+    {
+      "key": "sample_ID",
+      "kind": "category",
+      "n_categories": 52
+    },
+    {
+      "key": "organ",
+      "kind": "category",
+      "n_categories": 1
+    },
+    {
+      "key": "age",
+      "kind": "continuous"
+    },
+    {
+      "key": "cell_type",
+      "kind": "category",
+      "n_categories": 36
+    },
+    {
+      "key": "sex",
+      "kind": "category",
+      "n_categories": 2
+    },
+    {
+      "key": "sex_inferred",
+      "kind": "category",
+      "n_categories": 2
+    },
+    {
+      "key": "concatenated_integration_covariates",
+      "kind": "category",
+      "n_categories": 52
+    },
+    {
+      "key": "integration_donor",
+      "kind": "category",
+      "n_categories": 52
+    },
+    {
+      "key": "integration_biological_unit",
+      "kind": "category",
+      "n_categories": 1
+    },
+    {
+      "key": "integration_sample_status",
+      "kind": "category",
+      "n_categories": 2
+    },
+    {
+      "key": "integration_library_platform_coarse",
+      "kind": "category",
+      "n_categories": 1
+    },
+    {
+      "key": "n_genes",
+      "kind": "continuous"
+    },
+    {
+      "key": "LVL3",
+      "kind": "category",
+      "n_categories": 36
+    },
+    {
+      "key": "LVL2",
+      "kind": "category",
+      "n_categories": 20
+    },
+    {
+      "key": "LVL1",
+      "kind": "category",
+      "n_categories": 9
+    },
+    {
+      "key": "LVL0",
+      "kind": "category",
+      "n_categories": 4
+    }
+  ],
+  "export_settings": {
+    "compression": 6,
+    "var_quantization": 8,
+    "obs_continuous_quantization": 8,
+    "obs_categorical_dtype": "auto"
+  },
+  "source": {
+    "name": "E-MTAB-10551",
+    "url": "https://www.ebi.ac.uk/biostudies/arrayexpress/studies/E-MTAB-10551"
+  }
+}

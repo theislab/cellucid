@@ -1,0 +1,1 @@
+{"format": "edge_pairs", "n_cells": 131636, "n_edges": 1547352, "max_neighbors": 229, "index_bytes": 4, "index_dtype": "uint32", "sourcesPath": "connectivity/edges.src.bin.gz", "destinationsPath": "connectivity/edges.dst.bin.gz", "compression": 6}

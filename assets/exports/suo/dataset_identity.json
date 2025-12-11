@@ -3,14 +3,14 @@
   "id": "suo",
   "name": "suo",
   "description": "Mapping the developing human immune system across organs",
-  "created_at": "2025-12-10T15:53:09Z",
-  "cellucid_data_version": "0.0.1a0",
+  "created_at": "2025-12-11T22:01:35Z",
+  "cellucid_data_version": "0.0.0",
   "stats": {
     "n_cells": 561947,
     "n_genes": 8192,
-    "n_obs_fields": 18,
-    "n_categorical_fields": 15,
-    "n_continuous_fields": 3,
+    "n_obs_fields": 16,
+    "n_categorical_fields": 14,
+    "n_continuous_fields": 2,
     "has_connectivity": true,
     "n_edges": 6277388
   },
@@ -40,8 +40,7 @@
     },
     {
       "key": "age",
-      "kind": "category",
-      "n_categories": 12
+      "kind": "continuous"
     },
     {
       "key": "cell_type",
@@ -85,14 +84,6 @@
     },
     {
       "key": "n_genes",
-      "kind": "continuous"
-    },
-    {
-      "key": "_scvi_batch",
-      "kind": "continuous"
-    },
-    {
-      "key": "_scvi_labels",
       "kind": "continuous"
     },
     {
