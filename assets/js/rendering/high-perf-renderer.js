@@ -16,7 +16,7 @@ import {
   HP_VS_LIGHT, HP_FS_LIGHT, HP_FS_ULTRALIGHT,
   HP_VS_LOD,
   getShaders
-} from './high-perf-shaders.js';
+} from './shaders/high-perf-shaders.js';
 
 // ============================================================================
 // CONSTANTS
@@ -382,7 +382,7 @@ export class SpatialIndex {
         indices: sampledIndices, // Store indices for color updates
         sizes: null,
         isFullDetail: false,
-        sizeMultiplier: Math.sqrt(factor) * 0.5 + 0.5
+        sizeMultiplier: Math.sqrt(factor) * 0.2 + 0.8
       });
     }
 
@@ -799,15 +799,6 @@ export class SpatialIndex {
   }
 }
 
-/**
- * Backward compatibility alias - Octree is now SpatialIndex with dimensionLevel=3
- */
-export class Octree extends SpatialIndex {
-  constructor(positions, colors, maxPointsPerNode = 1000, maxDepth = 8) {
-    super(positions, colors, 3, maxPointsPerNode, maxDepth);
-  }
-}
-
 // ============================================================================
 // HIGH PERFORMANCE RENDERER (WebGL2 Only)
 // ============================================================================
@@ -878,7 +869,8 @@ export class HighPerfRenderer {
     this._useAlphaTexture = false; // Whether alpha texture is active
 
     // LOD index textures for alpha lookup (maps LOD vertex index to original index)
-    this._lodIndexTextures = [];
+    // Dimension-aware: Map<dimensionLevel, Array<{texture, width, height}>>
+    this._lodIndexTexturesByDimension = new Map();
 
     // LOD system - dimension-aware spatial indexing
     this.spatialIndices = new Map();  // Per-dimension spatial indices: Map<dimensionLevel, SpatialIndex>
@@ -1228,13 +1220,13 @@ export class HighPerfRenderer {
     const gl = this.gl;
     // Only build spatial index if LOD/frustum culling is currently enabled at runtime
     const defaultBuildSpatialIndex = this.useAdaptiveLOD || this.useFrustumCulling;
-    // Support both buildSpatialIndex and deprecated buildOctree option
-    const buildSpatialIndex = options.buildSpatialIndex ?? options.buildOctree ?? defaultBuildSpatialIndex;
+    const buildSpatialIndex = options.buildSpatialIndex ?? defaultBuildSpatialIndex;
     const { dimensionLevel } = options;  // Caller should specify dimension level
 
     // Clear per-dimension spatial indices cache when loading new data
     this.spatialIndices.clear();
     this.lodBuffersByDimension.clear();
+    this._clearLodIndexTextures();  // Clear dimension-aware LOD index textures
     // Use provided dimensionLevel, or keep current if not specified
     if (dimensionLevel !== undefined) {
       this.currentDimensionLevel = Math.max(1, Math.min(3, dimensionLevel));
@@ -1305,7 +1297,7 @@ export class HighPerfRenderer {
     // Create LOD index textures if using LOD (check runtime state)
     const currentSpatialIndex = this.spatialIndices.get(this.currentDimensionLevel);
     if ((this.useAdaptiveLOD || this.options.USE_LOD) && currentSpatialIndex) {
-      this._createLODIndexTextures();
+      this._createLODIndexTextures(this.currentDimensionLevel);
     }
 
     const elapsed = performance.now() - startTime;
@@ -1362,9 +1354,12 @@ export class HighPerfRenderer {
     // Cache it
     this.spatialIndices.set(dim, spatialIndex);
 
-    // Also create LOD buffers for this dimension if LOD is enabled
+    // Also create LOD buffers and index textures for this dimension if LOD is enabled
     if (this.useAdaptiveLOD || this.options.USE_LOD) {
       this._createLODBuffersForDimension(dim, spatialIndex);
+      // CRITICAL: Also create LOD index textures for this dimension
+      // These are needed for alpha lookup in LOD mode (maps LOD vertex → original index)
+      this._createLODIndexTextures(dim);
     }
 
     return spatialIndex;
@@ -1471,6 +1466,11 @@ export class HighPerfRenderer {
     const spatialIndex = this.spatialIndices.get(dim);
     if (spatialIndex && (this.useAdaptiveLOD || this.options.USE_LOD)) {
       this._createLODBuffersForDimension(dim, spatialIndex);
+      // Also create LOD index textures for this dimension if not already present
+      const lodIndexTextures = this._getLodIndexTexturesForDimension(dim);
+      if (!lodIndexTextures || lodIndexTextures.length === 0) {
+        this._createLODIndexTextures(dim);
+      }
       return this.lodBuffersByDimension.get(dim) || [];
     }
 
@@ -1525,6 +1525,7 @@ export class HighPerfRenderer {
     // We'll rebuild lazily when needed
     this.spatialIndices.clear();
     this.lodBuffersByDimension.clear();
+    this._clearLodIndexTextures();  // Clear dimension-aware LOD index textures
 
     // Update bounding sphere
     this._boundingSphere = this._computeBoundingSphere(positions);
@@ -1548,7 +1549,7 @@ export class HighPerfRenderer {
 
           // Rebuild LOD index textures if LOD is enabled
           if (this.useAdaptiveLOD || this.options.USE_LOD) {
-            this._createLODIndexTextures();
+            this._createLODIndexTextures(newDimLevel);
           }
         }
       }
@@ -1573,6 +1574,7 @@ export class HighPerfRenderer {
       // Clear spatial indices cache - will rebuild for current dimension
       this.spatialIndices.clear();
       this.lodBuffersByDimension.clear();
+      this._clearLodIndexTextures();  // Clear dimension-aware LOD index textures
 
       // Use dimension-aware spatial index
       const spatialIndex = this.getSpatialIndexForDimension(this.currentDimensionLevel);
@@ -1591,7 +1593,7 @@ export class HighPerfRenderer {
 
         // Rebuild LOD index textures if LOD is enabled
         if (this.useAdaptiveLOD || this.options.USE_LOD) {
-          this._createLODIndexTextures();
+          this._createLODIndexTextures(this.currentDimensionLevel);
         }
       }
     }
@@ -1730,30 +1732,38 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Create LOD index textures for alpha lookup.
+   * Create LOD index textures for alpha lookup for a specific dimension.
    * Each LOD level needs a texture mapping its vertex indices to original point indices.
+   * @param {number} [dimensionLevel] - Dimension level to create textures for (defaults to currentDimensionLevel)
    */
-  _createLODIndexTextures() {
+  _createLODIndexTextures(dimensionLevel = this.currentDimensionLevel) {
     const gl = this.gl;
+    const dim = dimensionLevel;
 
-    // Clean up existing textures
-    for (const tex of this._lodIndexTextures) {
-      if (tex.texture) gl.deleteTexture(tex.texture);
+    // Clean up existing textures for this dimension only
+    const existingTextures = this._lodIndexTexturesByDimension.get(dim);
+    if (existingTextures) {
+      for (const tex of existingTextures) {
+        if (tex.texture) gl.deleteTexture(tex.texture);
+      }
     }
-    this._lodIndexTextures = [];
 
-    // Get spatial index for current dimension
-    const spatialIndex = this.spatialIndices.get(this.currentDimensionLevel);
-    if (!spatialIndex || !spatialIndex.lodLevels) return;
+    // Get spatial index for the specified dimension
+    const spatialIndex = this.spatialIndices.get(dim);
+    if (!spatialIndex || !spatialIndex.lodLevels) {
+      this._lodIndexTexturesByDimension.set(dim, []);
+      return;
+    }
 
     const maxWidth = Math.min(4096, gl.getParameter(gl.MAX_TEXTURE_SIZE));
+    const lodIndexTextures = [];
 
     for (let lvlIdx = 0; lvlIdx < spatialIndex.lodLevels.length; lvlIdx++) {
       const level = spatialIndex.lodLevels[lvlIdx];
 
       if (level.isFullDetail || !level.indices) {
         // Full detail uses gl_VertexID directly, no index texture needed
-        this._lodIndexTextures.push({ texture: null, width: 0, height: 0 });
+        lodIndexTextures.push({ texture: null, width: 0, height: 0 });
         continue;
       }
 
@@ -1782,21 +1792,34 @@ export class HighPerfRenderer {
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
       gl.bindTexture(gl.TEXTURE_2D, null);
 
-      this._lodIndexTextures.push({ texture, width: texWidth, height: texHeight });
+      lodIndexTextures.push({ texture, width: texWidth, height: texHeight });
     }
 
-    console.log(`[HighPerfRenderer] Created ${this._lodIndexTextures.filter(t => t.texture).length} LOD index textures`);
+    this._lodIndexTexturesByDimension.set(dim, lodIndexTextures);
+    console.log(`[HighPerfRenderer] Created ${lodIndexTextures.filter(t => t.texture).length} LOD index textures for ${dim}D`);
   }
 
   /**
-   * @deprecated Use _createLODBuffersForDimension() instead.
-   * This method now delegates to the dimension-aware version.
+   * Get LOD index textures for a specific dimension level.
+   * @param {number} dimensionLevel - The dimension level (1, 2, or 3)
+   * @returns {Array} LOD index textures array for the dimension (may be empty)
    */
-  _createLODBuffers() {
-    const spatialIndex = this.spatialIndices.get(this.currentDimensionLevel);
-    if (spatialIndex) {
-      this._createLODBuffersForDimension(this.currentDimensionLevel, spatialIndex);
+  _getLodIndexTexturesForDimension(dimensionLevel) {
+    return this._lodIndexTexturesByDimension.get(dimensionLevel) || [];
+  }
+
+  /**
+   * Clear all LOD index textures (all dimensions).
+   * Call this when spatial indices or LOD buffers are cleared.
+   */
+  _clearLodIndexTextures() {
+    const gl = this.gl;
+    for (const lodIndexTextures of this._lodIndexTexturesByDimension.values()) {
+      for (const tex of lodIndexTextures) {
+        if (tex.texture) gl.deleteTexture(tex.texture);
+      }
     }
+    this._lodIndexTexturesByDimension.clear();
   }
 
   updateColors(colors) {
@@ -1850,8 +1873,13 @@ export class HighPerfRenderer {
 
     this._currentAlphas = alphas; // Track current alphas reference
 
-    // Invalidate LOD visibility cache since filter/transparency changed
-    this.invalidateLodVisibilityCache();
+    // NOTE: We intentionally do NOT call invalidateLodVisibilityCache() here.
+    // LOD visibility is purely spatial (which points exist at current LOD level).
+    // Alpha/filter visibility is data-driven and orthogonal to LOD.
+    // Consumers should use getCombinedVisibilityForView() which combines LOD + alpha.
+    // Calling invalidateLodVisibilityCache() here was wasteful - it forced O(n) cache
+    // rebuilds on every filter change, but the rebuilt values were identical since
+    // getLodVisibilityArray() doesn't incorporate alpha values.
 
     // Use alpha texture for efficient updates (avoids full buffer rebuild)
     // This is ~16x faster: uploading N bytes vs N*16 bytes
@@ -2462,12 +2490,12 @@ export class HighPerfRenderer {
     } = params;
 
     // One-time validation: ensure spatial index contains all points
-    if (!this._octreeValidated && spatialIndex) {
+    if (!this._spatialIndexValidated && spatialIndex) {
       const validation = spatialIndex.validatePointCount();
       if (!validation.valid) {
         console.error(`[FrustumCulling] Spatial index validation failed - some points may be missing`);
       }
-      this._octreeValidated = true;
+      this._spatialIndexValidated = true;
     }
 
     const needsUpdate = this._checkFrustumCacheValid(mvpMatrix, viewState, dimensionLevel);
@@ -2894,8 +2922,9 @@ export class HighPerfRenderer {
    * @param {WebGL2RenderingContext} gl
    * @param {Object} uniforms - Cached uniform locations
    * @param {number} [lodLevel=-1] - LOD level for index texture binding (-1 for full detail)
+   * @param {number} [dimensionLevel] - Dimension level for LOD index texture lookup (defaults to currentDimensionLevel)
    */
-  _bindAlphaTexture(gl, uniforms, lodLevel = -1) {
+  _bindAlphaTexture(gl, uniforms, lodLevel = -1, dimensionLevel = this.currentDimensionLevel) {
     // Bind alpha texture to texture unit 0
     if (this._useAlphaTexture && this._alphaTexture) {
       gl.activeTexture(gl.TEXTURE0);
@@ -2914,8 +2943,10 @@ export class HighPerfRenderer {
       }
 
       // Bind LOD index texture if rendering LOD level (texture unit 1)
-      if (lodLevel >= 0 && this._lodIndexTextures[lodLevel]?.texture) {
-        const lodIdxTex = this._lodIndexTextures[lodLevel];
+      // Use dimension-aware LOD index textures to match LOD buffers
+      const lodIndexTextures = this._getLodIndexTexturesForDimension(dimensionLevel);
+      if (lodLevel >= 0 && lodIndexTextures[lodLevel]?.texture) {
+        const lodIdxTex = lodIndexTextures[lodLevel];
         gl.activeTexture(gl.TEXTURE1);
         gl.bindTexture(gl.TEXTURE_2D, lodIdxTex.texture);
         if (uniforms.u_lodIndexTex !== null) {
@@ -3020,7 +3051,8 @@ export class HighPerfRenderer {
     }
 
     // Bind alpha texture with LOD index texture for proper alpha lookup
-    this._bindAlphaTexture(gl, uniforms, lodLevel);
+    // Pass dimensionLevel to get the correct LOD index textures for this dimension
+    this._bindAlphaTexture(gl, uniforms, lodLevel, dimensionLevel);
 
     // Bind VAO
     gl.bindVertexArray(lod.vao);
@@ -3218,7 +3250,8 @@ export class HighPerfRenderer {
     }
 
     // Bind alpha texture with LOD index texture for proper alpha lookup
-    this._bindAlphaTexture(gl, uniforms, lodLevel);
+    // Pass dimensionLevel to get the correct LOD index textures for this dimension
+    this._bindAlphaTexture(gl, uniforms, lodLevel, dimensionLevel);
 
     // Bind LOD VAO and per-view index buffer for indexed drawing
     gl.bindVertexArray(lod.vao);
@@ -3260,6 +3293,7 @@ export class HighPerfRenderer {
           // Clear all cached spatial indices
           this.spatialIndices.clear();
           this.lodBuffersByDimension.clear();
+          this._clearLodIndexTextures();  // Clear dimension-aware LOD index textures
         } else {
           console.log(`[HighPerfRenderer] Building ${dimLevel}D spatial index for LOD...`);
         }
@@ -3286,14 +3320,14 @@ export class HighPerfRenderer {
         }
       }
 
-      // Create LOD index textures if needed
+      // Create LOD index textures if needed for this dimension
       const lodBuffers = this.getLodBuffersForDimension(dimLevel);
       const spatialIndex = this.spatialIndices.get(dimLevel);
       if (spatialIndex && lodBuffers.length > 0) {
-        if (!this._lodIndexTextures || this._lodIndexTextures.length === 0) {
-          console.log('[HighPerfRenderer] Creating LOD index textures...');
-          this._createLODIndexTextures();
-          console.log(`[HighPerfRenderer] Created ${lodBuffers.length} LOD buffer levels`);
+        const lodIndexTextures = this._getLodIndexTexturesForDimension(dimLevel);
+        if (!lodIndexTextures || lodIndexTextures.length === 0) {
+          console.log(`[HighPerfRenderer] Creating LOD index textures for ${dimLevel}D...`);
+          this._createLODIndexTextures(dimLevel);
         }
       }
     }
@@ -3357,21 +3391,13 @@ export class HighPerfRenderer {
           console.log(`[HighPerfRenderer] ${dimLevel}D spatial index stale, rebuilding for frustum culling...`);
           this.spatialIndices.clear();
           this.lodBuffersByDimension.clear();
+          this._clearLodIndexTextures();  // Clear dimension-aware LOD index textures
         } else {
           console.log(`[HighPerfRenderer] Building ${dimLevel}D spatial index for frustum culling...`);
         }
         this.getSpatialIndexForDimension(dimLevel);
       }
     }
-  }
-
-  /**
-   * @deprecated Use getSpatialIndex(dimensionLevel) instead.
-   * Backward compatibility getter - returns the 3D spatial index (octree).
-   * @returns {SpatialIndex|null} The 3D spatial index, or null if not built
-   */
-  get octree() {
-    return this.spatialIndices.get(3) || null;
   }
 
   /**
@@ -3422,6 +3448,7 @@ export class HighPerfRenderer {
           this.clearAllViewState();
           this.spatialIndices.clear();
           this.lodBuffersByDimension.clear();
+          this._clearLodIndexTextures();  // Clear dimension-aware LOD index textures
         } else {
           console.log(`[HighPerfRenderer] Building ${dimLevel}D spatial index...`);
         }
@@ -3619,7 +3646,7 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Get visibility mask for a specific view based on LOD level.
+   * Get visibility mask for a specific view combining LOD level AND alpha/filter visibility.
    * This is used for highlight rendering to ensure highlights match what's rendered.
    *
    * NOTE: We intentionally use LOD-only visibility (not frustum) because:
@@ -3628,17 +3655,70 @@ export class HighPerfRenderer {
    * 3. With LOD-only visibility, cells entering the frustum are immediately highlighted
    *
    * @param {string|number} viewId - View ID for per-view LOD level lookup
+   * @param {number} [alphaThreshold=0.01] - Minimum alpha to be considered visible
    * @returns {Float32Array|null} Visibility mask (1.0 = visible, 0.0 = hidden), or null if all visible
    */
-  getCombinedVisibilityForView(viewId) {
+  getCombinedVisibilityForView(viewId, alphaThreshold = 0.01) {
     const vid = String(viewId);
     const viewState = this._perViewState.get(vid);
 
     // Get LOD level for this view
     const lodLevel = viewState?.lastLodLevel ?? this.stats.lodLevel ?? -1;
 
-    // Delegate to LOD visibility (GPU handles frustum clipping automatically)
-    return this.getLodVisibilityArray(lodLevel, viewId);
+    // Get LOD visibility (which points are in this LOD level)
+    const lodVis = this.getLodVisibilityArray(lodLevel, viewId);
+    const alphas = this._currentAlphas;
+    const n = this.pointCount;
+
+    // If no LOD filtering and no alpha filtering, return null (all visible)
+    if (!lodVis && !alphas) return null;
+
+    // LOD only - no alpha filtering active
+    if (!alphas) return lodVis;
+
+    // Alpha only - no LOD filtering (full detail)
+    if (!lodVis) {
+      // Quick check: are any points actually filtered out?
+      let hasFiltered = false;
+      for (let i = 0; i < n; i++) {
+        if (alphas[i] < alphaThreshold) {
+          hasFiltered = true;
+          break;
+        }
+      }
+      if (!hasFiltered) return null;
+
+      // Build alpha-only visibility array
+      // Reuse per-view cache to avoid allocation
+      if (!viewState) {
+        // No view state, create temporary array
+        const vis = new Float32Array(n);
+        for (let i = 0; i < n; i++) {
+          vis[i] = alphas[i] >= alphaThreshold ? 1.0 : 0.0;
+        }
+        return vis;
+      }
+
+      // Reuse cached array if possible
+      if (!viewState.cachedCombinedVisibility || viewState.cachedCombinedVisibility.length !== n) {
+        viewState.cachedCombinedVisibility = new Float32Array(n);
+      }
+      for (let i = 0; i < n; i++) {
+        viewState.cachedCombinedVisibility[i] = alphas[i] >= alphaThreshold ? 1.0 : 0.0;
+      }
+      return viewState.cachedCombinedVisibility;
+    }
+
+    // Both LOD and alpha filtering active - combine them
+    // A point is visible only if it's in the LOD level AND passes alpha threshold
+    const vs = viewState || this._getViewState(viewId);
+    if (!vs.cachedCombinedVisibility || vs.cachedCombinedVisibility.length !== n) {
+      vs.cachedCombinedVisibility = new Float32Array(n);
+    }
+    for (let i = 0; i < n; i++) {
+      vs.cachedCombinedVisibility[i] = (lodVis[i] > 0 && alphas[i] >= alphaThreshold) ? 1.0 : 0.0;
+    }
+    return vs.cachedCombinedVisibility;
   }
 
   /**
@@ -4125,15 +4205,19 @@ export class HighPerfRenderer {
     // Custom positions use snapshot.spatialIndex instead
     const needsSpatialIndex = this.useAdaptiveLOD || this.useFrustumCulling;
     const mainSpatialIndex = (!hasCustomPositions && needsSpatialIndex) ? this.getSpatialIndexForDimension(dimensionLevel) : null;
+
+    // For adaptive LOD, use snapshot's spatial index for custom positions (if available)
+    // This enables LOD for 1D/2D views that have their own spatial index built from custom positions
+    const lodSpatialIndex = hasCustomPositions ? snapshot.spatialIndex : mainSpatialIndex;
     const lodBuffersForDim = this.getLodBuffersForDimension(dimensionLevel);
 
     // Select LOD level - priority: forceLODLevel > params.forceLOD > adaptive
     // Same logic as render() to ensure slider affects all views
     let lodLevel = this.forceLODLevel >= 0 ? this.forceLODLevel : (params.forceLOD ?? -1);
-    if (lodLevel < 0 && this.useAdaptiveLOD && mainSpatialIndex) {
+    if (lodLevel < 0 && this.useAdaptiveLOD && lodSpatialIndex) {
       // Pass dimensionLevel for correct 2D/3D diagonal calculation
       // Pass snapshot bounds when available (for custom positions that differ from octree)
-      lodLevel = mainSpatialIndex.getLODLevel(cameraDistance, viewportHeight, viewState.lastLodLevel, dimensionLevel, snapshot.bounds);
+      lodLevel = lodSpatialIndex.getLODLevel(cameraDistance, viewportHeight, viewState.lastLodLevel, dimensionLevel, snapshot.bounds);
     }
 
     // Always update per-view LOD level for highlight rendering and other consumers
@@ -4149,8 +4233,8 @@ export class HighPerfRenderer {
     }
 
     // Debug LOD selection for snapshots - only log when level changes (per-view)
-    if (viewState.prevLodLevel !== lodLevel && mainSpatialIndex && (this.useAdaptiveLOD || this.forceLODLevel >= 0)) {
-      const pointCount = mainSpatialIndex.lodLevels[lodLevel]?.pointCount || this.pointCount;
+    if (viewState.prevLodLevel !== lodLevel && lodSpatialIndex && (this.useAdaptiveLOD || this.forceLODLevel >= 0)) {
+      const pointCount = lodSpatialIndex.lodLevels[lodLevel]?.pointCount || this.pointCount;
       const mode = this.forceLODLevel >= 0 ? 'forced' : 'auto';
       console.log(`[LOD] Snapshot ${viewId}: level ${viewState.prevLodLevel ?? 'init'} → ${lodLevel} (${pointCount.toLocaleString()} pts, ${mode}, dim=${dimensionLevel})`);
       viewState.prevLodLevel = lodLevel;
@@ -4219,7 +4303,8 @@ export class HighPerfRenderer {
     // No frustum culling - check if we should use LOD
     if (!useFullDetail) {
       // Render with LOD using indexed drawing into snapshot buffer
-      this._renderSnapshotWithLOD(snapshot, lodLevel, params, viewState, useAlphaTexture, mainSpatialIndex, lodBuffersForDim);
+      // Use lodSpatialIndex for custom positions (snapshot.spatialIndex) or main spatial index
+      this._renderSnapshotWithLOD(snapshot, lodLevel, params, viewState, useAlphaTexture, lodSpatialIndex, lodBuffersForDim);
       this.stats.lastFrameTime = performance.now() - frameStart;
       this.stats.fps = Math.round(1000 / Math.max(this.stats.lastFrameTime, 1));
       return this.stats;
@@ -4578,9 +4663,14 @@ export class HighPerfRenderer {
     if (uniforms.u_lightDir !== null) gl.uniform3fv(uniforms.u_lightDir, lightDir);
 
     // Alpha texture handling: if useAlphaTexture is true, use real-time alpha from texture
-    // For LOD with alpha texture, we need the LOD index texture to map LOD vertex to original index
+    // IMPORTANT: For snapshot LOD with indexed drawing, the index buffer contains ORIGINAL indices
+    // (from tree.lodLevels[level].indices), so gl_VertexID is already the original index.
+    // We must NOT use the LOD index texture (pass -1) because:
+    // - LOD index texture maps LOD vertex index (0 to lodPointCount-1) → original index
+    // - But here gl_VertexID is already the original index from the element array buffer
+    // Using LOD index texture would produce garbage lookups (e.g., u_lodIndexTex[originalIdx] is undefined)
     if (useAlphaTexture && this._useAlphaTexture && this._alphaTexture) {
-      this._bindAlphaTexture(gl, uniforms, lodLevel);
+      this._bindAlphaTexture(gl, uniforms, -1);  // -1 = no LOD index texture, gl_VertexID is already original
     } else {
       if (uniforms.u_useAlphaTex !== null) gl.uniform1i(uniforms.u_useAlphaTex, 0);
       if (uniforms.u_useLodIndexTex !== null) gl.uniform1i(uniforms.u_useLodIndexTex, 0);
@@ -4594,8 +4684,6 @@ export class HighPerfRenderer {
 
     // Unbind textures if they were used
     if (useAlphaTexture && this._useAlphaTexture && this._alphaTexture) {
-      gl.activeTexture(gl.TEXTURE1);
-      gl.bindTexture(gl.TEXTURE_2D, null);
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, null);
     }
@@ -4787,9 +4875,11 @@ export class HighPerfRenderer {
     if (uniforms.u_lightDir !== null) gl.uniform3fv(uniforms.u_lightDir, lightDir);
 
     // Alpha texture handling: if useAlphaTexture is true, use real-time alpha from texture
-    // For LOD with alpha texture, we need the LOD index texture to map LOD vertex to original index
+    // IMPORTANT: For snapshot LOD+frustum with indexed drawing, the index buffer contains ORIGINAL indices
+    // (filtered subset of lodOriginalIndices), so gl_VertexID is already the original index.
+    // We must NOT use the LOD index texture (pass -1) - same reasoning as _renderSnapshotWithLOD.
     if (useAlphaTexture && this._useAlphaTexture && this._alphaTexture) {
-      this._bindAlphaTexture(gl, uniforms, lodLevel);
+      this._bindAlphaTexture(gl, uniforms, -1);  // -1 = no LOD index texture, gl_VertexID is already original
     } else {
       if (uniforms.u_useAlphaTex !== null) gl.uniform1i(uniforms.u_useAlphaTex, 0);
       if (uniforms.u_useLodIndexTex !== null) gl.uniform1i(uniforms.u_useLodIndexTex, 0);
@@ -4810,8 +4900,6 @@ export class HighPerfRenderer {
 
     // Unbind textures if they were used
     if (useAlphaTexture && this._useAlphaTexture && this._alphaTexture) {
-      gl.activeTexture(gl.TEXTURE1);
-      gl.bindTexture(gl.TEXTURE_2D, null);
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, null);
     }
@@ -4856,6 +4944,7 @@ export class HighPerfRenderer {
 
     this.buffers = {};
     this.lodBuffersByDimension.clear();
+    this._clearLodIndexTextures();  // Clear dimension-aware LOD index textures
     this.lodVaos = [];
     this.programs = {};
     this.spatialIndices.clear();
@@ -4873,12 +4962,7 @@ export class HighPerfRenderer {
     }
     this._alphaTexData = null;
     this._useAlphaTexture = false;
-
-    // Clean up LOD index textures
-    for (const tex of this._lodIndexTextures) {
-      if (tex.texture) gl.deleteTexture(tex.texture);
-    }
-    this._lodIndexTextures = [];
+    // LOD index textures already cleared by _clearLodIndexTextures() above
   }
 }
 

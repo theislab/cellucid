@@ -40,6 +40,11 @@ uniform sampler2D u_alphaTex;
 uniform int u_alphaTexWidth;
 uniform float u_invAlphaTexWidth;
 uniform bool u_useAlphaTex;
+// For LOD: maps LOD vertex index to original point index for alpha lookup
+uniform sampler2D u_lodIndexTex;
+uniform int u_lodIndexTexWidth;
+uniform float u_invLodIndexTexWidth;
+uniform bool u_useLodIndexTex;
 
 out vec3 v_color;
 out float v_viewDistance;
@@ -55,8 +60,17 @@ void main() {
   // Fetch alpha from texture if enabled, otherwise use vertex attribute
   float alpha;
   if (u_useAlphaTex && u_alphaTexWidth > 0) {
-    int y = int(float(gl_VertexID) * u_invAlphaTexWidth);
-    int x = gl_VertexID - y * u_alphaTexWidth;
+    int origIdx;
+    if (u_useLodIndexTex && u_lodIndexTexWidth > 0) {
+      // LOD mode: lookup original index from index texture
+      int iy = int(float(gl_VertexID) * u_invLodIndexTexWidth);
+      int ix = gl_VertexID - iy * u_lodIndexTexWidth;
+      origIdx = int(texelFetch(u_lodIndexTex, ivec2(ix, iy), 0).r);
+    } else {
+      origIdx = gl_VertexID;
+    }
+    int y = int(float(origIdx) * u_invAlphaTexWidth);
+    int x = origIdx - y * u_alphaTexWidth;
     alpha = texelFetch(u_alphaTex, ivec2(x, y), 0).r;
   } else {
     alpha = a_color.a;
@@ -155,6 +169,11 @@ uniform sampler2D u_alphaTex;
 uniform int u_alphaTexWidth;
 uniform float u_invAlphaTexWidth;
 uniform bool u_useAlphaTex;
+// For LOD: maps LOD vertex index to original point index for alpha lookup
+uniform sampler2D u_lodIndexTex;
+uniform int u_lodIndexTexWidth;
+uniform float u_invLodIndexTexWidth;
+uniform bool u_useLodIndexTex;
 
 out vec3 v_color;
 out float v_alpha;
@@ -168,8 +187,17 @@ void main() {
   // Fetch alpha from texture if enabled
   float alpha;
   if (u_useAlphaTex && u_alphaTexWidth > 0) {
-    int y = int(float(gl_VertexID) * u_invAlphaTexWidth);
-    int x = gl_VertexID - y * u_alphaTexWidth;
+    int origIdx;
+    if (u_useLodIndexTex && u_lodIndexTexWidth > 0) {
+      // LOD mode: lookup original index from index texture
+      int iy = int(float(gl_VertexID) * u_invLodIndexTexWidth);
+      int ix = gl_VertexID - iy * u_lodIndexTexWidth;
+      origIdx = int(texelFetch(u_lodIndexTex, ivec2(ix, iy), 0).r);
+    } else {
+      origIdx = gl_VertexID;
+    }
+    int y = int(float(origIdx) * u_invAlphaTexWidth);
+    int x = origIdx - y * u_alphaTexWidth;
     alpha = texelFetch(u_alphaTex, ivec2(x, y), 0).r;
   } else {
     alpha = a_color.a;

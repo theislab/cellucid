@@ -774,8 +774,14 @@ class DataState {
   }
 
   _pushTransparencyToViewer() {
-    // Alpha is now packed in colorsArray, so push colors when transparency changes
-    this._pushColorsToViewer();
+    // IMPORTANT: Do NOT call _pushColorsToViewer() here!
+    // The alpha texture fast path in hp-renderer handles transparency updates efficiently
+    // without requiring full buffer rebuilds. Calling updateColors() here would set
+    // _bufferDirty and _lodBuffersDirty, negating the alpha texture optimization
+    // and causing stuttering on large datasets during filter changes.
+    // The updateTransparency/updateAlphas path handles both:
+    // - Alpha texture case: just updates texture (fast, ~16x faster than buffer rebuild)
+    // - Fallback case: uses alpha-only dirty flag for efficient partial buffer update
     if (this._isLiveView()) {
       this.viewer.updateTransparency(this.categoryTransparency);
     } else if (typeof this.viewer.updateSnapshotAttributes === 'function') {
@@ -2906,19 +2912,30 @@ class DataState {
     }
   }
 
-  // Get cell indices for a categorical selection
-  // Only includes cells that are currently visible (pass all active filters)
-  getCellIndicesForCategory(fieldIndex, categoryIndex, source = 'obs') {
+  /**
+   * Get cell indices for a categorical selection.
+   * Only includes cells that are currently visible (pass all active filters).
+   * @param {number} fieldIndex - Field index in obs/var data
+   * @param {number} categoryIndex - Category index to match
+   * @param {string} [source='obs'] - Data source ('obs' or 'var')
+   * @param {Float32Array} [viewTransparency] - Optional per-view transparency array.
+   *   If provided, uses this for filtering instead of state.categoryTransparency.
+   *   This allows selections to respect view-specific filters in multi-view mode.
+   * @returns {number[]} Array of cell indices matching the category and passing filters
+   */
+  getCellIndicesForCategory(fieldIndex, categoryIndex, source = 'obs', viewTransparency = null) {
     const field = source === 'var'
       ? this.varData?.fields?.[fieldIndex]
       : this.obsData?.fields?.[fieldIndex];
     if (!field || field.kind !== 'category') return [];
     const codes = field.codes || [];
     const indices = [];
+    // Use provided viewTransparency if available, otherwise fall back to state transparency
+    const transparency = viewTransparency || this.categoryTransparency;
     for (let i = 0; i < codes.length; i++) {
       if (codes[i] === categoryIndex) {
-        // Only include cells that are currently visible (not filtered out)
-        const isVisible = !this.categoryTransparency || this.categoryTransparency[i] > 0;
+        // Only include cells that are currently visible (not filtered out in the target view)
+        const isVisible = !transparency || transparency[i] > 0;
         if (isVisible) {
           indices.push(i);
         }
@@ -2927,69 +2944,38 @@ class DataState {
     return indices;
   }
 
-  // Get cell indices for a continuous range selection
-  // Only includes cells that are currently visible (pass all active filters)
-  getCellIndicesForRange(fieldIndex, minVal, maxVal, source = 'obs') {
+  /**
+   * Get cell indices for a continuous range selection.
+   * Only includes cells that are currently visible (pass all active filters).
+   * @param {number} fieldIndex - Field index in obs/var data
+   * @param {number} minVal - Minimum value for range
+   * @param {number} maxVal - Maximum value for range
+   * @param {string} [source='obs'] - Data source ('obs' or 'var')
+   * @param {Float32Array} [viewTransparency] - Optional per-view transparency array.
+   *   If provided, uses this for filtering instead of state.categoryTransparency.
+   *   This allows selections to respect view-specific filters in multi-view mode.
+   * @returns {number[]} Array of cell indices within range and passing filters
+   */
+  getCellIndicesForRange(fieldIndex, minVal, maxVal, source = 'obs', viewTransparency = null) {
     const field = source === 'var'
       ? this.varData?.fields?.[fieldIndex]
       : this.obsData?.fields?.[fieldIndex];
     if (!field || field.kind !== 'continuous') return [];
     const values = field.values || [];
     const indices = [];
+    // Use provided viewTransparency if available, otherwise fall back to state transparency
+    const transparency = viewTransparency || this.categoryTransparency;
     for (let i = 0; i < values.length; i++) {
       const v = values[i];
       if (v !== null && !Number.isNaN(v) && v >= minVal && v <= maxVal) {
-        // Only include cells that are currently visible (not filtered out)
-        const isVisible = !this.categoryTransparency || this.categoryTransparency[i] > 0;
+        // Only include cells that are currently visible (not filtered out in the target view)
+        const isVisible = !transparency || transparency[i] > 0;
         if (isVisible) {
           indices.push(i);
         }
       }
     }
     return indices;
-  }
-
-  // Set a preview highlight for a continuous range (shown during drag)
-  // This temporarily shows what would be highlighted without committing it
-  setPreviewHighlightForRange(fieldIndex, minVal, maxVal, source = 'obs') {
-    const field = source === 'var'
-      ? this.varData?.fields?.[fieldIndex]
-      : this.obsData?.fields?.[fieldIndex];
-    if (!field || field.kind !== 'continuous') {
-      this.clearPreviewHighlight();
-      return;
-    }
-
-    const cellIndices = this.getCellIndicesForRange(fieldIndex, minVal, maxVal, source);
-
-    this._ensureHighlightArray();
-    // Start with existing permanent highlights
-    this.highlightArray.fill(0);
-
-    // Collect all highlighted indices (avoids O(n) scan in renderer)
-    const allHighlightedIndices = [];
-
-    for (const group of this.highlightedGroups) {
-      if (group.enabled === false) continue;
-      const indices = group.cellIndices;
-      if (!indices) continue;
-      for (let i = 0; i < indices.length; i++) {
-        const idx = indices[i];
-        if (idx >= 0 && idx < this.pointCount && this.highlightArray[idx] === 0) {
-          this.highlightArray[idx] = 255;
-          allHighlightedIndices.push(idx);
-        }
-      }
-    }
-    // Add preview highlights on top
-    for (let i = 0; i < cellIndices.length; i++) {
-      const idx = cellIndices[i];
-      if (idx >= 0 && idx < this.pointCount && this.highlightArray[idx] === 0) {
-        this.highlightArray[idx] = 255;
-        allHighlightedIndices.push(idx);
-      }
-    }
-    this._pushHighlightToViewer(allHighlightedIndices);
   }
 
   // Clear preview highlight (restore to only permanent highlights)

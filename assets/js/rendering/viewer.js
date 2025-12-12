@@ -5,86 +5,14 @@
  * Keeps smoke, grid, and line rendering.
  */
 
-import { GRID_VS_SOURCE, GRID_FS_SOURCE, LINE_INSTANCED_VS_SOURCE, LINE_INSTANCED_FS_SOURCE } from './shaders.js';
+import { GRID_VS_SOURCE, GRID_FS_SOURCE, LINE_INSTANCED_VS_SOURCE, LINE_INSTANCED_FS_SOURCE } from './shaders/edge-grid-shaders.js';
 import { createProgram, createCanvasResizeObserver } from './gl-utils.js';
-import { SMOKE_VS_SOURCE, SMOKE_FS_SOURCE, SMOKE_COMPOSITE_VS, SMOKE_COMPOSITE_FS } from './smoke-shaders.js';
-import { createDensityTexture3D, buildDensityVolumeGPU } from './smoke-density.js';
-import {
-  generateCloudNoiseTextures,
-  setNoiseResolution,
-  getNoiseResolution,
-  getResolutionScaleFactor,
-  REFERENCE_RESOLUTION
-} from './noise-textures.js';
+import { CENTROID_VS, CENTROID_FS } from './shaders/centroid-shaders.js';
+import { SmokeRenderer } from './smoke-cloud/smoke-renderer.js';
 import { HighPerfRenderer } from './high-perf-renderer.js';
 import { HighlightTools } from './highlight-renderer.js';
 import { OrbitAnchorRenderer } from './orbit-anchor.js';
 import { createProjectileSystem } from './projectiles.js';
-
-// Simple centroid shader (WebGL2) - for small number of centroid points
-// Uses RGBA uint8 normalized colors (same as main points)
-const CENTROID_VS = `#version 300 es
-precision highp float;
-
-in vec3 a_position;
-in vec4 a_color; // RGBA packed as uint8, auto-normalized by WebGL
-
-uniform mat4 u_mvpMatrix;
-uniform mat4 u_viewMatrix;
-uniform mat4 u_modelMatrix;
-uniform float u_pointSize;
-uniform float u_sizeAttenuation;
-uniform float u_viewportHeight;
-uniform float u_fov;
-
-out vec3 v_color;
-out float v_alpha;
-
-void main() {
-  gl_Position = u_mvpMatrix * vec4(a_position, 1.0);
-
-  // Compute eye-space depth for perspective scaling (matches HP_VS_FULL)
-  vec4 worldPos = u_modelMatrix * vec4(a_position, 1.0);
-  vec4 eyePos = u_viewMatrix * worldPos;
-  float eyeDepth = -eyePos.z;
-
-  // Perspective point size with attenuation
-  float projectionFactor = u_viewportHeight / (2.0 * tan(u_fov * 0.5));
-  float worldSize = u_pointSize * 0.01;
-  float perspectiveSize = (worldSize * projectionFactor) / max(eyeDepth, 0.001);
-  gl_PointSize = mix(u_pointSize, perspectiveSize, u_sizeAttenuation);
-  gl_PointSize = clamp(gl_PointSize, 0.5, 128.0);
-
-  if (a_color.a < 0.01) gl_PointSize = 0.0;
-  v_color = a_color.rgb;
-  v_alpha = a_color.a;
-}
-`;
-
-const CENTROID_FS = `#version 300 es
-precision highp float;
-
-in vec3 v_color;
-in float v_alpha;
-
-out vec4 fragColor;
-
-void main() {
-  if (v_alpha < 0.01) discard;
-  vec2 coord = gl_PointCoord * 2.0 - 1.0;
-  float r2 = dot(coord, coord);
-  if (r2 > 1.0) discard;
-
-  // Simple sphere shading
-  float z = sqrt(1.0 - r2);
-  vec3 normal = vec3(coord.x, -coord.y, z);
-  vec3 lightDir = normalize(vec3(0.5, 0.7, 0.5));
-  float NdotL = max(dot(normal, lightDir), 0.0);
-  float lighting = 0.4 + 0.6 * NdotL;
-
-  fragColor = vec4(v_color * lighting, v_alpha);
-}
-`;
 
 export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onViewFocus }) {
   // WebGL2 ONLY - no fallback
@@ -116,53 +44,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   const orbitAnchorRenderer = new OrbitAnchorRenderer(gl, canvas);
   console.log('[Viewer] OrbitAnchorRenderer initialized');
 
-  // === SMOKE PROGRAM ===
-  const smokeProgram = createProgram(gl, SMOKE_VS_SOURCE, SMOKE_FS_SOURCE);
-  const compositeProgram = createProgram(gl, SMOKE_COMPOSITE_VS, SMOKE_COMPOSITE_FS);
-
-  const smokeAttribLocations = {
-    position: gl.getAttribLocation(smokeProgram, 'a_position'),
-  };
-  const smokeUniformLocations = {
-    invViewProj:       gl.getUniformLocation(smokeProgram, 'u_invViewProj'),
-    cameraPos:         gl.getUniformLocation(smokeProgram, 'u_cameraPos'),
-    volumeMin:         gl.getUniformLocation(smokeProgram, 'u_volumeMin'),
-    volumeMax:         gl.getUniformLocation(smokeProgram, 'u_volumeMax'),
-    // Native 3D density texture
-    densityTex3D:      gl.getUniformLocation(smokeProgram, 'u_densityTex3D'),
-    gridSize:          gl.getUniformLocation(smokeProgram, 'u_gridSize'),
-    // Pre-computed noise textures
-    shapeNoise:        gl.getUniformLocation(smokeProgram, 'u_shapeNoise'),
-    detailNoise:       gl.getUniformLocation(smokeProgram, 'u_detailNoise'),
-    blueNoise:         gl.getUniformLocation(smokeProgram, 'u_blueNoise'),
-    blueNoiseOffset:   gl.getUniformLocation(smokeProgram, 'u_blueNoiseOffset'),
-    // Colors and lighting
-    bgColor:           gl.getUniformLocation(smokeProgram, 'u_bgColor'),
-    smokeColor:        gl.getUniformLocation(smokeProgram, 'u_smokeColor'),
-    lightDir:          gl.getUniformLocation(smokeProgram, 'u_lightDir'),
-    // Animation and quality
-    time:              gl.getUniformLocation(smokeProgram, 'u_time'),
-    animationSpeed:    gl.getUniformLocation(smokeProgram, 'u_animationSpeed'),
-    densityMultiplier: gl.getUniformLocation(smokeProgram, 'u_densityMultiplier'),
-    stepMultiplier:    gl.getUniformLocation(smokeProgram, 'u_stepMultiplier'),
-    noiseScale:        gl.getUniformLocation(smokeProgram, 'u_noiseScale'),
-    warpStrength:      gl.getUniformLocation(smokeProgram, 'u_warpStrength'),
-    detailLevel:       gl.getUniformLocation(smokeProgram, 'u_detailLevel'),
-    lightAbsorption:   gl.getUniformLocation(smokeProgram, 'u_lightAbsorption'),
-    scatterStrength:   gl.getUniformLocation(smokeProgram, 'u_scatterStrength'),
-    edgeSoftness:      gl.getUniformLocation(smokeProgram, 'u_edgeSoftness'),
-    directLight:       gl.getUniformLocation(smokeProgram, 'u_directLightIntensity'),
-    lightSamples:      gl.getUniformLocation(smokeProgram, 'u_lightSamples'),
-  };
-
-  const compositeAttribLocations = {
-    position: gl.getAttribLocation(compositeProgram, 'a_position'),
-  };
-  const compositeUniformLocations = {
-    smokeTex:          gl.getUniformLocation(compositeProgram, 'u_smokeTex'),
-    inverseResolution: gl.getUniformLocation(compositeProgram, 'u_inverseResolution'),
-    intensity:         gl.getUniformLocation(compositeProgram, 'u_intensity'),
-  };
+  // === SMOKE RENDERER ===
+  const smokeRenderer = new SmokeRenderer(gl, createProgram);
+  console.log('[Viewer] SmokeRenderer initialized');
 
   // === INSTANCED LINE PROGRAM (V2 - GPU-optimized) ===
   const lineInstancedProgram = createProgram(gl, LINE_INSTANCED_VS_SOURCE, LINE_INSTANCED_FS_SOURCE);
@@ -267,11 +151,6 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   // Centroid snapshot buffers - pre-uploaded GPU buffers for each snapshot view
   // Eliminates per-frame CPU→GPU uploads in multiview mode
   const centroidSnapshotBuffers = new Map(); // viewId -> { vao, buffer, count }
-
-  // Fullscreen triangle for smoke
-  const smokeQuadBuffer = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, smokeQuadBuffer);
-  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
 
   // Grid plane buffers - 6 sides (complete box)
   const GRID_SIZE = 2.0;
@@ -398,25 +277,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   let fogNearMean = 0.0;
   let fogFarMean = 1.0;
 
-  // Volumetric smoke state
+  // Render mode state
   let renderMode = 'points';
-  let smokeTextureInfo = null;
-  const volumeMin = vec3.fromValues(-1, -1, -1);
-  const volumeMax = vec3.fromValues(1, 1, 1);
-  // Tuned default values for visible, realistic volumetric clouds
-  let smokeDensity = 10.6;          // UI default cloud density
-  let smokeNoiseScale = getResolutionScaleFactor(); // Keep noise scale stable across resolutions
-  let smokeWarpStrength = 0.2;      // 10% turbulence default
-  let smokeStepMultiplier = 2.8;    // High-quality ray marching default
-  let smokeAnimationSpeed = 1.0;    // Default animation rate
-  let smokeDetailLevel = 3.8;       // UI default fine detail
-  let smokeLightAbsorption = 1.5;   // UI default absorption
-  let smokeScatterStrength = 0.0;   // UI default scattering
-  let smokeEdgeSoftness = 0.3;      // Gentle edge falloff
-  let smokeLightSamples = 6;        // Balanced light quality
-  let smokeDirectLight = 0.17;      // UI default directional intensity
-  // Bright white for visibility
-  const smokeColor = vec3.fromValues(0.98, 0.98, 1.0);
   const startTime = performance.now();
   // Initialize highlight tools after shared start time is available
   highlightTools = new HighlightTools({
@@ -435,21 +297,20 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       if (!viewId) return positionsArray;
       return viewPositionsCache.get(String(viewId)) || positionsArray;
     },
+    // Provide view-specific transparency for per-view filtering support
+    // Each view may have different filters, so selection tools must respect them
+    getViewTransparency: (viewId) => {
+      if (!viewId || viewId === LIVE_VIEW_ID) return transparencyArray;
+      const snapshot = snapshotViews.find(s => s.id === viewId);
+      // Use snapshot's own transparency if it doesn't share live transparency
+      if (snapshot && !snapshot.sharesLiveTransparency && snapshot.transparency) {
+        return snapshot.transparency;
+      }
+      return transparencyArray;
+    },
     startTime,
     shaderQuality: currentShaderQuality
   });
-  // Cloud resolution scale: 1.0 = full resolution, 0.5 = half resolution
-  // Values > 1.0 render at higher internal resolution (supersampling)
-  let cloudResolutionScale = 0.5; // Default to half-res for performance
-  let smokeFramebuffer = null;
-  let smokeColorTex = null;
-  let smokeTargetWidth = 0;
-  let smokeTargetHeight = 0;
-
-  // Pre-computed noise textures for high-performance cloud rendering
-  let cloudNoiseTextures = null;
-  let cloudNoiseResolution = 128; // Current noise texture resolution
-  let frameIndex = 0;
 
   // Connectivity/Edge state
   let showConnectivity = false;
@@ -1269,29 +1130,6 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     }
   }
 
-  function ensureSmokeTarget(w, h, scale) {
-    const targetW = Math.max(1, Math.floor(w * scale));
-    const targetH = Math.max(1, Math.floor(h * scale));
-    if (smokeFramebuffer && targetW === smokeTargetWidth && targetH === smokeTargetHeight) return;
-    if (smokeFramebuffer) {
-      gl.deleteFramebuffer(smokeFramebuffer);
-      gl.deleteTexture(smokeColorTex);
-    }
-    smokeTargetWidth = targetW;
-    smokeTargetHeight = targetH;
-    smokeColorTex = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, smokeColorTex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, targetW, targetH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    smokeFramebuffer = gl.createFramebuffer();
-    gl.bindFramebuffer(gl.FRAMEBUFFER, smokeFramebuffer);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, smokeColorTex, 0);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  }
-
   // ============================================================================
   // INSTANCED EDGE RENDERING - GPU-OPTIMIZED
   // ============================================================================
@@ -1925,8 +1763,16 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     const viewDimLevel = viewDimensionLevels.get(String(clickedViewId)) ?? viewDimensionLevels.get(LIVE_VIEW_ID) ?? 3;
     const spatialIndex = hpRenderer.getSpatialIndex(viewDimLevel);
 
-    // Cache highlight array reference for faster access in tight loop
-    const highlightArray = highlightTools?.highlightArray;
+    // Get view-specific transparency array for filtering check
+    // Each view may have different filters, so we need the clicked view's transparency
+    let viewTransparencyArray = transparencyArray; // Default to live view
+    if (clickedViewId !== LIVE_VIEW_ID) {
+      const clickedSnapshot = snapshotViews.find(s => s.id === clickedViewId);
+      // Use snapshot's own transparency only if it doesn't share live transparency
+      if (clickedSnapshot && !clickedSnapshot.sharesLiveTransparency && clickedSnapshot.transparency) {
+        viewTransparencyArray = clickedSnapshot.transparency;
+      }
+    }
 
     // Sample along the ray to find the nearest cell
     // Limit iterations to prevent lag (max 500 samples)
@@ -1965,11 +1811,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
       // Find the cell closest to the ray (perpendicular distance)
       for (const idx of candidates) {
-        // Cell is pickable if: visible (alpha > 0) OR already highlighted
-        // This allows interacting with highlighted cells even if filtered in current view
-        const isVisible = !transparencyArray || transparencyArray[idx] > 0;
-        const isHighlighted = highlightArray && highlightArray[idx] > 0;
-        if (!isVisible && !isHighlighted) continue;
+        // Cell is pickable only if visible (not filtered out in this view)
+        // Filtered-out cells cannot be interacted with, even if highlighted in another view
+        // Use view-specific transparency so each view's filters are respected
+        const isVisible = !viewTransparencyArray || viewTransparencyArray[idx] > 0;
+        if (!isVisible) continue;
 
         const px = positions[idx * 3];
         const py = positions[idx * 3 + 1];
@@ -2018,7 +1864,20 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       transparencyArray,
       targetRadius,
       target,
-      eye
+      eye,
+      // Helper to get view-specific transparency for selection operations
+      // Each view may have different filters, so use this to respect per-view filtering
+      getViewTransparency: (viewId) => {
+        if (!viewId || viewId === LIVE_VIEW_ID) {
+          return transparencyArray;
+        }
+        const snapshot = snapshotViews.find(s => s.id === viewId);
+        // Use snapshot's own transparency only if it doesn't share live transparency
+        if (snapshot && !snapshot.sharesLiveTransparency && snapshot.transparency) {
+          return snapshot.transparency;
+        }
+        return transparencyArray;
+      }
     };
   }
 
@@ -2279,8 +2138,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       if (gridOpacity > 0) {
         drawGrid();
       }
+      // Compute inverse view-projection matrix for smoke ray marching
+      mat4.multiply(viewProjMatrix, projectionMatrix, viewMatrix);
+      mat4.invert(invViewProjMatrix, viewProjMatrix);
       // Render smoke with alpha blending on top of grid
-      renderSmoke(width, height, gridOpacity > 0);
+      smokeRenderer.render({
+        invViewProjMatrix,
+        eye,
+        lightDir,
+        bgColor,
+        width,
+        height
+      });
       return;
     }
 
@@ -2324,9 +2193,22 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       // If we have exactly one view (e.g., live hidden with 1 snapshot), load its data
       if (allViews.length === 1) {
         const view = allViews[0];
-        // Only update buffers when switching views (not every frame)
+
+        // Check if this snapshot has a pre-uploaded GPU buffer
+        // Same logic as grid mode to avoid inconsistent render paths
+        let hasSnapshotBuffer = view.id !== LIVE_VIEW_ID && hpRenderer.hasSnapshotBuffer(view.id);
+
+        // For snapshots without GPU buffers, lazily create one (uploaded once, not per-frame)
+        if (view.id !== LIVE_VIEW_ID && !hasSnapshotBuffer && view.colors && view.transparency) {
+          const viewPositions = viewPositionsCache.get(String(view.id)) || positionsArray;
+          hpRenderer.createSnapshotBuffer(view.id, view.colors, view.transparency, viewPositions);
+          hasSnapshotBuffer = true;
+        }
+
+        // Only update main buffer when NO snapshot buffer exists (fallback path)
+        // When snapshot buffer exists, use it directly - main buffer updates are ignored
         // Live view updates are handled by state.js via viewer.updateColors/updateTransparency
-        if (view.id !== LIVE_VIEW_ID && view.id !== currentLoadedViewId) {
+        if (!hasSnapshotBuffer && view.id !== LIVE_VIEW_ID && view.id !== currentLoadedViewId) {
           if (view.colors) hpRenderer.updateColors(view.colors);
           if (view.transparency) hpRenderer.updateAlphas(view.transparency);
           currentLoadedViewId = view.id;
@@ -2334,7 +2216,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
           // Reset tracking when switching back to live view
           currentLoadedViewId = null;
         }
-        renderSingleView(width, height, { x: 0, y: 0, w: 1, h: 1 }, view.id, view.centroidCount);
+
+        // Pass snapshot buffer ID if available (uses immutable snapshot, consistent with grid mode)
+        const snapshotId = hasSnapshotBuffer ? view.id : null;
+        renderSingleView(width, height, { x: 0, y: 0, w: 1, h: 1 }, view.id, view.centroidCount, snapshotId);
       } else {
         // Multi-view mode: reset tracking since we use snapshot buffers
         if (currentLoadedViewId !== null) {
@@ -2482,6 +2367,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     mat4.invert(tempInvViewMatrix, viewMatrix);
     const cameraPosition = [tempInvViewMatrix[12], tempInvViewMatrix[13], tempInvViewMatrix[14]];
 
+    // Check if this snapshot shares live transparency (uses alpha texture for efficient updates)
+    const snapshot = snapshotViews.find(s => s.id === vid);
+    const useAlphaTexture = snapshot?.sharesLiveTransparency ?? false;
+
     // Render params shared by both render paths
     // Get dimension level for this view (used for LOD and frustum culling calculations)
     const dimLevel = viewDimensionLevels.get(vid) ?? 3;
@@ -2502,7 +2391,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       cameraPosition,
       cameraDistance: radius,
       viewId: vid,  // Per-view identifier for LOD and frustum culling state
-      dimensionLevel: dimLevel  // Current dimension level for correct 2D/3D LOD calculation
+      dimensionLevel: dimLevel,  // Current dimension level for correct 2D/3D LOD calculation
+      useAlphaTexture  // For sharesLiveTransparency snapshots, sample alpha from live texture
     };
 
     // Render scatter points - use snapshot buffer if available (no data upload!)
@@ -2513,9 +2403,14 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     }
 
     // Draw highlights (selection rings) on top of scatter points
-    // Use view-specific positions for multi-dimensional support
+    // Use view-specific positions and transparency for multi-view support
     const viewPos = viewPositionsCache.get(vid) || positionsArray;
-    highlightTools?.renderHighlights?.(renderParams, viewPos);
+    // Get view-specific transparency: snapshots may have their own filters
+    // Use snapshot's transparency if it exists and doesn't share live, otherwise use live
+    const viewTransp = (snapshot && !snapshot.sharesLiveTransparency && snapshot.transparency)
+      ? snapshot.transparency
+      : transparencyArray;
+    highlightTools?.renderHighlights?.(renderParams, viewPos, viewTransp);
 
     // Draw connectivity lines
     drawConnectivityLines(width, height);
@@ -2582,155 +2477,6 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       hideLabelsForView(vid);
     }
     updateLabelLayerVisibility();
-  }
-
-  // Track if we're generating noise textures
-  let noiseGenerationInProgress = false;
-
-  function renderSmoke(width, height) {
-    if (!smokeTextureInfo) return;
-
-    // Generate noise textures on first use (lazy initialization with parallel workers)
-    if (!cloudNoiseTextures && !noiseGenerationInProgress) {
-      noiseGenerationInProgress = true;
-      console.log('[Viewer] Generating cloud noise textures (parallel)...');
-
-      // Use async parallel generation (always returns Promise now)
-      generateCloudNoiseTextures(gl).then(textures => {
-        cloudNoiseTextures = textures;
-        noiseGenerationInProgress = false;
-        console.log('[Viewer] Cloud noise textures ready');
-      }).catch(err => {
-        console.error('[Viewer] Failed to generate noise textures:', err);
-        noiseGenerationInProgress = false;
-      });
-
-      // Show loading state - render simple background
-      gl.viewport(0, 0, width, height);
-      gl.clearColor(bgColor[0], bgColor[1], bgColor[2], 1.0);
-      gl.clear(gl.COLOR_BUFFER_BIT);
-      return;
-    }
-
-    // Still generating - show loading state
-    if (!cloudNoiseTextures) {
-      gl.viewport(0, 0, width, height);
-      gl.clearColor(bgColor[0], bgColor[1], bgColor[2], 1.0);
-      gl.clear(gl.COLOR_BUFFER_BIT);
-      return;
-    }
-
-    updateCamera(width, height);
-    mat4.multiply(viewProjMatrix, projectionMatrix, viewMatrix);
-    const ok = mat4.invert(invViewProjMatrix, viewProjMatrix);
-    if (!ok) return;
-
-    gl.disable(gl.DEPTH_TEST);
-
-    // Determine if we need an off-screen render target (any scale != 1.0)
-    const needsOffscreen = cloudResolutionScale !== 1.0;
-    let targetW = width, targetH = height;
-    if (needsOffscreen) {
-      ensureSmokeTarget(width, height, cloudResolutionScale);
-      targetW = smokeTargetWidth;
-      targetH = smokeTargetHeight;
-      gl.bindFramebuffer(gl.FRAMEBUFFER, smokeFramebuffer);
-      gl.viewport(0, 0, targetW, targetH);
-      // Clear to transparent for proper blending with grid
-      gl.clearColor(0, 0, 0, 0);
-      gl.clear(gl.COLOR_BUFFER_BIT);
-    } else {
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-      gl.viewport(0, 0, width, height);
-      // Enable blending for smoke to blend with grid behind it
-      gl.enable(gl.BLEND);
-      // Use premultiplied alpha blend mode (smoke shader outputs premultiplied color)
-      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-    }
-
-    gl.useProgram(smokeProgram);
-    gl.bindBuffer(gl.ARRAY_BUFFER, smokeQuadBuffer);
-    gl.enableVertexAttribArray(smokeAttribLocations.position);
-    gl.vertexAttribPointer(smokeAttribLocations.position, 2, gl.FLOAT, false, 0, 0);
-
-    // Camera and volume uniforms
-    gl.uniformMatrix4fv(smokeUniformLocations.invViewProj, false, invViewProjMatrix);
-    gl.uniform3fv(smokeUniformLocations.cameraPos, eye);
-    gl.uniform3fv(smokeUniformLocations.volumeMin, volumeMin);
-    gl.uniform3fv(smokeUniformLocations.volumeMax, volumeMax);
-    gl.uniform1f(smokeUniformLocations.gridSize, smokeTextureInfo.gridSize);
-
-    // Colors and lighting
-    gl.uniform3fv(smokeUniformLocations.bgColor, bgColor);
-    gl.uniform3fv(smokeUniformLocations.smokeColor, smokeColor);
-    gl.uniform3fv(smokeUniformLocations.lightDir, lightDir);
-
-    // Animation and quality parameters
-    const timeSeconds = (performance.now() - startTime) * 0.001;
-    gl.uniform1f(smokeUniformLocations.time, timeSeconds);
-    gl.uniform1f(smokeUniformLocations.animationSpeed, smokeAnimationSpeed);
-    gl.uniform1f(smokeUniformLocations.densityMultiplier, smokeDensity);
-    gl.uniform1f(smokeUniformLocations.stepMultiplier, smokeStepMultiplier);
-    gl.uniform1f(smokeUniformLocations.noiseScale, smokeNoiseScale);
-    gl.uniform1f(smokeUniformLocations.warpStrength, smokeWarpStrength);
-    gl.uniform1f(smokeUniformLocations.detailLevel, smokeDetailLevel);
-    gl.uniform1f(smokeUniformLocations.lightAbsorption, smokeLightAbsorption);
-    gl.uniform1f(smokeUniformLocations.scatterStrength, smokeScatterStrength);
-    gl.uniform1f(smokeUniformLocations.edgeSoftness, smokeEdgeSoftness);
-    gl.uniform1f(smokeUniformLocations.directLight, smokeDirectLight);
-    gl.uniform1i(smokeUniformLocations.lightSamples, smokeLightSamples);
-
-    // Blue noise offset for temporal jittering (R2 sequence for better distribution)
-    frameIndex++;
-    const phi = 1.618033988749895;  // Golden ratio
-    const blueNoiseOffsetX = ((frameIndex * phi) % 1.0) * 128.0;
-    const blueNoiseOffsetY = ((frameIndex * phi * phi) % 1.0) * 128.0;
-    gl.uniform2f(smokeUniformLocations.blueNoiseOffset, blueNoiseOffsetX, blueNoiseOffsetY);
-
-    // Bind textures
-    // Texture unit 0: Density volume (3D texture)
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_3D, smokeTextureInfo.texture);
-    gl.uniform1i(smokeUniformLocations.densityTex3D, 0);
-
-    // Texture unit 1: Shape noise (3D texture)
-    gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_3D, cloudNoiseTextures.shape);
-    gl.uniform1i(smokeUniformLocations.shapeNoise, 1);
-
-    // Texture unit 2: Detail noise (3D texture)
-    gl.activeTexture(gl.TEXTURE2);
-    gl.bindTexture(gl.TEXTURE_3D, cloudNoiseTextures.detail);
-    gl.uniform1i(smokeUniformLocations.detailNoise, 2);
-
-    // Texture unit 3: Blue noise (2D texture)
-    gl.activeTexture(gl.TEXTURE3);
-    gl.bindTexture(gl.TEXTURE_2D, cloudNoiseTextures.blueNoise);
-    gl.uniform1i(smokeUniformLocations.blueNoise, 3);
-
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
-
-    if (needsOffscreen) {
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-      gl.viewport(0, 0, width, height);
-      // Enable blending for composite pass to blend with grid
-      gl.enable(gl.BLEND);
-      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-      gl.useProgram(compositeProgram);
-      gl.bindBuffer(gl.ARRAY_BUFFER, smokeQuadBuffer);
-      gl.enableVertexAttribArray(compositeAttribLocations.position);
-      gl.vertexAttribPointer(compositeAttribLocations.position, 2, gl.FLOAT, false, 0, 0);
-      gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, smokeColorTex);
-      gl.uniform1i(compositeUniformLocations.smokeTex, 0);
-      gl.uniform2f(compositeUniformLocations.inverseResolution, 1 / targetW, 1 / targetH);
-      gl.uniform1f(compositeUniformLocations.intensity, 1.0);
-      gl.drawArrays(gl.TRIANGLES, 0, 3);
-    }
-
-    // Restore default blend mode and re-enable depth test
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-    gl.enable(gl.DEPTH_TEST);
   }
 
   function setBackground(mode) {
@@ -3140,14 +2886,14 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       // Rebuild highlight buffer when visibility changes (filter applied/removed)
       highlightTools?.handleTransparencyChange?.(alphaArray);
 
-      // Propagate transparency changes to snapshot buffers that share transparency with live view
-      // This ensures filter changes affect all views in grid mode when sharesLiveTransparency is true
+      // Propagate transparency reference to snapshots that share transparency with live view
+      // NOTE: We do NOT rebuild snapshot GPU buffers here - that was ~16x slower than necessary.
+      // Instead, renderWithSnapshot() uses useAlphaTexture=true for these snapshots, which
+      // samples alpha from the live alpha texture (already uploaded via updateAlphas above).
+      // This reduces GPU uploads from N*16 bytes (full buffer) to N bytes (alpha texture only).
       for (const snap of snapshotViews) {
-        if (snap.sharesLiveTransparency && hpRenderer.hasSnapshotBuffer(snap.id)) {
-          // Update snapshot buffer with new transparency from live view
-          const viewPositions = viewPositionsCache.get(String(snap.id)) || positionsArray;
-          hpRenderer.updateSnapshotBuffer(snap.id, snap.colors, alphaArray, viewPositions);
-          // Also update the snapshot's transparency reference so it stays in sync
+        if (snap.sharesLiveTransparency) {
+          // Just update the transparency reference - rendering will use the live alpha texture
           snap.transparency = alphaArray;
         }
       }
@@ -3286,6 +3032,24 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         return positionsArray;
       }
       return viewPositionsCache.get(vid) || positionsArray;
+    },
+
+    /**
+     * Get transparency array for a specific view.
+     * Used by selection tools to respect per-view filtering in multi-view mode.
+     * @param {string} viewId - View identifier
+     * @returns {Float32Array|null} Transparency array (0 = hidden, >0 = visible)
+     */
+    getViewTransparency(viewId) {
+      if (!viewId || viewId === LIVE_VIEW_ID) {
+        return transparencyArray;
+      }
+      const snapshot = snapshotViews.find(s => s.id === viewId);
+      // Use snapshot's own transparency if it doesn't share live transparency
+      if (snapshot && !snapshot.sharesLiveTransparency && snapshot.transparency) {
+        return snapshot.transparency;
+      }
+      return transparencyArray;
     },
 
     /**
@@ -3678,117 +3442,17 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     setShowOrbitAnchor(show) { orbitAnchorRenderer.setShowAnchor(show); },
     getShowOrbitAnchor() { return orbitAnchorRenderer.getShowAnchor(); },
 
-    setSmokeVolume(volumeDesc) {
-      if (!volumeDesc || !volumeDesc.data) { smokeTextureInfo = null; return; }
-      if (smokeTextureInfo?.texture) gl.deleteTexture(smokeTextureInfo.texture);
-      // Use native 3D texture for high-performance rendering
-      smokeTextureInfo = createDensityTexture3D(gl, volumeDesc);
-      console.log(`[Viewer] Created 3D density texture (${volumeDesc.gridSize}³)`);
-      if (volumeDesc.boundsMin && volumeDesc.boundsMax) {
-        vec3.set(volumeMin, ...volumeDesc.boundsMin);
-        vec3.set(volumeMax, ...volumeDesc.boundsMax);
-      } else {
-        vec3.set(volumeMin, -1, -1, -1);
-        vec3.set(volumeMax, 1, 1, 1);
-      }
-    },
-
-    // GPU-accelerated smoke volume building (much faster for large point counts)
-    buildSmokeVolumeGPU(positions, options = {}) {
-      const volumeDesc = buildDensityVolumeGPU(gl, positions, options);
-      this.setSmokeVolume(volumeDesc);
-      return volumeDesc;
-    },
-
-    setSmokeParams(params) {
-      if (!params) return;
-      if (typeof params.density === 'number') smokeDensity = params.density;
-      if (typeof params.noiseScale === 'number') smokeNoiseScale = params.noiseScale;
-      if (typeof params.warpStrength === 'number') smokeWarpStrength = params.warpStrength;
-      if (typeof params.stepMultiplier === 'number') smokeStepMultiplier = params.stepMultiplier;
-      if (typeof params.animationSpeed === 'number') smokeAnimationSpeed = params.animationSpeed;
-      if (typeof params.detailLevel === 'number') smokeDetailLevel = params.detailLevel;
-      if (typeof params.lightAbsorption === 'number') smokeLightAbsorption = params.lightAbsorption;
-      if (typeof params.scatterStrength === 'number') smokeScatterStrength = params.scatterStrength;
-      if (typeof params.edgeSoftness === 'number') smokeEdgeSoftness = params.edgeSoftness;
-      if (typeof params.directLightIntensity === 'number') smokeDirectLight = Math.max(0.0, Math.min(2.0, params.directLightIntensity));
-      if (typeof params.lightSamples === 'number') smokeLightSamples = Math.max(1, Math.min(12, params.lightSamples));
-    },
-
-    // Cloud resolution scale: 0.25 to 2.0 (1.0 = full res, 0.5 = half res)
-    setCloudResolutionScale(scale) {
-      cloudResolutionScale = Math.max(0.25, Math.min(2.0, scale));
-      // Force framebuffer recreation on next render
-      smokeTargetWidth = 0;
-      smokeTargetHeight = 0;
-    },
-    getCloudResolutionScale() { return cloudResolutionScale; },
-
-    // Noise texture resolution (regenerates noise textures)
-    setNoiseTextureResolution(size) {
-      const prevScale = getResolutionScaleFactor();
-      const newSize = Math.max(32, Math.min(256, size));
-      if (newSize !== cloudNoiseResolution) {
-        cloudNoiseResolution = newSize;
-        setNoiseResolution(newSize, newSize);
-        const newScale = getResolutionScaleFactor();
-        // Keep perceived noise scale stable as resolution changes
-        smokeNoiseScale *= newScale / prevScale;
-        // Trigger regeneration on next render
-        if (cloudNoiseTextures) {
-          // Clean up old textures
-          if (cloudNoiseTextures.shape) gl.deleteTexture(cloudNoiseTextures.shape);
-          if (cloudNoiseTextures.detail) gl.deleteTexture(cloudNoiseTextures.detail);
-          if (cloudNoiseTextures.blueNoise) gl.deleteTexture(cloudNoiseTextures.blueNoise);
-          cloudNoiseTextures = null;
-        }
-        console.log(`[Viewer] Noise resolution changed to ${newSize}³, will regenerate`);
-      }
-    },
-    getNoiseTextureResolution() { return cloudNoiseResolution; },
-
-    // Get adaptive scale factor for UI sliders (based on noise resolution)
-    getAdaptiveScaleFactor() { return getResolutionScaleFactor(); },
-
-    // Backwards compatibility: setSmokeHalfResolution maps to cloudResolutionScale
-    setSmokeHalfResolution(enabled) {
-      cloudResolutionScale = enabled ? 0.5 : 1.0;
-      smokeTargetWidth = 0;
-      smokeTargetHeight = 0;
-    },
-
-    // Cloud quality presets
-    setSmokeQualityPreset(preset) {
-      switch (preset) {
-        case 'performance':
-          smokeStepMultiplier = 0.6;
-          smokeDetailLevel = 1.0;
-          smokeLightSamples = 3;
-          cloudResolutionScale = 0.5;
-          break;
-        case 'balanced':
-          smokeStepMultiplier = 1.0;
-          smokeDetailLevel = 2.0;
-          smokeLightSamples = 6;
-          cloudResolutionScale = 0.5;
-          break;
-        case 'quality':
-          smokeStepMultiplier = 1.5;
-          smokeDetailLevel = 3.0;
-          smokeLightSamples = 8;
-          cloudResolutionScale = 1.0;
-          break;
-        case 'ultra':
-          smokeStepMultiplier = 2.0;
-          smokeDetailLevel = 4.0;
-          smokeLightSamples = 12;
-          cloudResolutionScale = 1.0;
-          break;
-      }
-      // Force framebuffer recreation
-      smokeTargetWidth = 0;
-      smokeTargetHeight = 0;
-    },
+    // Smoke renderer API (delegates to SmokeRenderer)
+    setSmokeVolume(volumeDesc) { smokeRenderer.setVolume(volumeDesc); },
+    buildSmokeVolumeGPU(positions, options = {}) { return smokeRenderer.buildVolumeGPU(positions, options); },
+    setSmokeParams(params) { smokeRenderer.setParams(params); },
+    setCloudResolutionScale(scale) { smokeRenderer.setResolutionScale(scale); },
+    getCloudResolutionScale() { return smokeRenderer.getResolutionScale(); },
+    setNoiseTextureResolution(size) { smokeRenderer.setNoiseTextureResolution(size); },
+    getNoiseTextureResolution() { return smokeRenderer.getNoiseTextureResolution(); },
+    getAdaptiveScaleFactor() { return smokeRenderer.getAdaptiveScaleFactor(); },
+    setSmokeHalfResolution(enabled) { smokeRenderer.setHalfResolution(enabled); },
+    setSmokeQualityPreset(preset) { smokeRenderer.setQualityPreset(preset); },
 
     setShowConnectivity(show) { showConnectivity = !!show; },
     getShowConnectivity() { return showConnectivity; },
@@ -4316,9 +3980,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     getRendererStats() { return hpRenderer.getStats(); },
     debugRendererStatus() { return hpRenderer.debugStatus(); },
 
-    // LOD visibility for edge filtering
-    getLodVisibilityArray() { return hpRenderer.getLodVisibilityArray(); },
-    getCurrentLODLevel() { return hpRenderer.getCurrentLODLevel(); },
+    // LOD visibility for edge filtering and highlight rendering
+    // These now support per-view LOD tracking in multiview mode
+    getLodVisibilityArray(viewId, dimensionLevel) {
+      return hpRenderer.getLodVisibilityArray(undefined, viewId, dimensionLevel);
+    },
+    getCurrentLODLevel(viewId) {
+      return hpRenderer.getCurrentLODLevel(viewId);
+    },
+    // Combined LOD + alpha visibility (preferred for consumers that need filter-aware visibility)
+    getCombinedVisibilityForView(viewId, alphaThreshold) {
+      return hpRenderer.getCombinedVisibilityForView(viewId, alphaThreshold);
+    },
 
     start() {
       if (!animationHandle) animationHandle = requestAnimationFrame(render);

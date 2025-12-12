@@ -104,11 +104,11 @@
     },
     "noise-resolution": {
       "type": "range",
-      "value": "43"
+      "value": "58"
     },
     "smoke-density": {
       "type": "range",
-      "value": "66"
+      "value": "56"
     },
     "smoke-detail": {
       "type": "range",
@@ -124,7 +124,7 @@
     },
     "smoke-edge": {
       "type": "range",
-      "value": "5"
+      "value": "0"
     },
     "smoke-absorption": {
       "type": "range",
@@ -136,7 +136,7 @@
     },
     "smoke-direct-light": {
       "type": "range",
-      "value": "11"
+      "value": "3"
     },
     "toggle-connectivity": {
       "type": "checkbox",

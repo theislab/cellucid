@@ -982,8 +982,15 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
 
   // === ANNOTATION SELECTION HANDLERS ===
 
-  // Compute cell indices from selection event
-  function computeAnnotationCellIndices(selectionEvent) {
+  /**
+   * Compute cell indices from selection event.
+   * Uses view-specific transparency for per-view filtering in multi-view mode.
+   * @param {Object} selectionEvent - Selection event with cellIndex, type, etc.
+   * @param {Float32Array} [viewTransparency] - Optional per-view transparency array.
+   *   If provided, selection will respect this view's filters.
+   * @returns {number[]} Array of cell indices matching the selection criteria
+   */
+  function computeAnnotationCellIndices(selectionEvent, viewTransparency = null) {
     const activeField = state.getActiveField();
     if (!activeField) return [];
 
@@ -996,7 +1003,8 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     if (activeField.kind === 'category') {
       const categoryIndex = state.getCategoryForCell(cellIndex, fieldIndex, source);
       if (categoryIndex < 0) return [];
-      return state.getCellIndicesForCategory(fieldIndex, categoryIndex, source);
+      // Pass viewTransparency so selection respects per-view filters
+      return state.getCellIndicesForCategory(fieldIndex, categoryIndex, source, viewTransparency);
     } else if (activeField.kind === 'continuous') {
       const clickedValue = state.getValueForCell(cellIndex, fieldIndex, source);
       if (clickedValue == null) return [];
@@ -1020,7 +1028,8 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
         minVal = Math.max(stats.min, clickedValue - rangeSize / 2);
         maxVal = Math.min(stats.max, clickedValue + rangeSize / 2);
       }
-      return state.getCellIndicesForRange(fieldIndex, minVal, maxVal, source);
+      // Pass viewTransparency so selection respects per-view filters
+      return state.getCellIndicesForRange(fieldIndex, minVal, maxVal, source, viewTransparency);
     }
     return [];
   }
@@ -1049,8 +1058,12 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       return;
     }
 
+    // Get view-specific transparency for per-view filtering in multi-view mode
+    // This ensures selections in View B respect View B's filters, not the live view's
+    const viewTransparency = viewer.getViewTransparency?.(stepEvent.viewId) ?? null;
+
     const mode = stepEvent.mode || 'intersect';
-    const newCellIndices = computeAnnotationCellIndices(stepEvent);
+    const newCellIndices = computeAnnotationCellIndices(stepEvent, viewTransparency);
 
     // Save current state to history before modification
     annotationHistory.push({
@@ -2267,8 +2280,12 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       maxVal = clickedValue;
     }
 
-    // Get new cell indices for the current drag range
-    const newIndices = state.getCellIndicesForRange(fieldIndex, minVal, maxVal, source);
+    // Get view-specific transparency for per-view filtering in multi-view mode
+    // This ensures preview in View B respects View B's filters
+    const viewTransparency = viewer.getViewTransparency?.(previewEvent.viewId) ?? null;
+
+    // Get new cell indices for the current drag range, respecting per-view filtering
+    const newIndices = state.getCellIndicesForRange(fieldIndex, minVal, maxVal, source, viewTransparency);
     const mode = previewEvent.mode || 'intersect';
 
     // Compute combined preview based on mode and existing candidates (mirrors proximity behavior)
@@ -4576,16 +4593,16 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     sizeAttenuation: sizeAttenuationInput?.value || '65',
     smokeGrid: smokeGridInput?.value || '60',
     smokeSteps: smokeStepsInput?.value || '75',
-    smokeDensity: smokeDensityInput?.value || '66',
+    smokeDensity: smokeDensityInput?.value || '56',
     smokeSpeed: smokeSpeedInput?.value || '40',
     smokeDetail: smokeDetailInput?.value || '60',
     smokeWarp: smokeWarpInput?.value || '10',
     smokeAbsorption: smokeAbsorptionInput?.value || '65',
     smokeScatter: smokeScatterInput?.value || '0',
-    smokeEdge: smokeEdgeInput?.value || '5',
-    smokeDirectLight: smokeDirectLightInput?.value || '11',
+    smokeEdge: smokeEdgeInput?.value || '0',
+    smokeDirectLight: smokeDirectLightInput?.value || '3',
     cloudResolution: cloudResolutionInput?.value || '15',
-    noiseResolution: noiseResolutionInput?.value || '43',
+    noiseResolution: noiseResolutionInput?.value || '58',
     navigationMode: navigationModeSelect?.value || 'orbit',
     lookSensitivity: lookSensitivityInput?.value || '5',
     moveSpeed: moveSpeedInput?.value || '100',
