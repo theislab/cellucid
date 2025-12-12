@@ -1365,9 +1365,11 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
         if (stats.samples >= 30 && benchTimingDetailsEl) {
           benchTimingDetailsEl.style.display = 'block';
-          if (benchMinFtEl) benchMinFtEl.textContent = stats.minFrameTime + ' ms';
-          if (benchP95FtEl) benchP95FtEl.textContent = stats.p95FrameTime + ' ms';
-          if (benchMaxFtEl) benchMaxFtEl.textContent = stats.maxFrameTime + ' ms';
+          // Format timing values with 2 decimal places
+          const formatTiming = (val) => typeof val === 'number' ? val.toFixed(2) : val;
+          if (benchMinFtEl) benchMinFtEl.textContent = formatTiming(stats.minFrameTime) + ' ms';
+          if (benchP95FtEl) benchP95FtEl.textContent = formatTiming(stats.p95FrameTime) + ' ms';
+          if (benchMaxFtEl) benchMaxFtEl.textContent = formatTiming(stats.maxFrameTime) + ' ms';
         } else if (benchTimingDetailsEl) {
           benchTimingDetailsEl.style.display = 'none';
         }

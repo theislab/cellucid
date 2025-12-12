@@ -2102,12 +2102,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     let nearestCell = -1;
     let nearestDist = Infinity;
 
+    const samplePoint = [0, 0, 0];
     for (let t = 0; t < maxDistance; t += sampleStep) {
-      const samplePoint = [
-        ray.origin[0] + ray.direction[0] * t,
-        ray.origin[1] + ray.direction[1] * t,
-        ray.origin[2] + ray.direction[2] * t
-      ];
+      samplePoint[0] = ray.origin[0] + ray.direction[0] * t;
+      samplePoint[1] = ray.origin[1] + ray.direction[1] * t;
+      samplePoint[2] = ray.origin[2] + ray.direction[2] * t;
 
       // Query cells near this point - increase limit for better coverage
       let candidates;
@@ -2797,20 +2796,21 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     });
 
     // Draw orbit anchor compass visualization (only in orbit navigation mode)
-    // Get camera state for this view (supports per-view cameras in unlocked mode)
-    let viewTheta = theta;
-    let viewPhi = phi;
-    let viewTarget = target;
-    let viewRadius = radius;
-    if (!camerasLocked && vid !== focusedViewId) {
-      const camState = getViewCameraState(vid);
-      if (camState && camState.orbit) {
-        viewTheta = camState.orbit.theta ?? theta;
-        viewPhi = camState.orbit.phi ?? phi;
-        viewTarget = camState.orbit.target ?? target;
-        viewRadius = camState.orbit.radius ?? radius;
+    if (navigationMode === 'orbit') {
+      // Get camera state for this view (supports per-view cameras in unlocked mode)
+      let viewTheta = theta;
+      let viewPhi = phi;
+      let viewTarget = target;
+      let viewRadius = radius;
+      if (!camerasLocked && vid !== focusedViewId) {
+        const camState = getViewCameraState(vid);
+        if (camState && camState.orbit) {
+          viewTheta = camState.orbit.theta ?? theta;
+          viewPhi = camState.orbit.phi ?? phi;
+          viewTarget = camState.orbit.target ?? target;
+          viewRadius = camState.orbit.radius ?? radius;
+        }
       }
-    }
       orbitAnchorRenderer.draw({
         viewId: vid,
         viewTheta,
@@ -2818,17 +2818,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         viewTarget,
         viewRadius,
         pointBoundsRadius: projectileSystem.getPointBoundsRadius(),
-      bgColor,
-      use3D: currentShaderQuality === 'full',
-      mvpMatrix,
-      viewMatrix,
-      modelMatrix,
-      fogDensity,
-      fogColor,
-      lightingStrength,
-      lightDir,
-      navigationMode
-    });
+        bgColor,
+        use3D: currentShaderQuality === 'full',
+        mvpMatrix,
+        viewMatrix,
+        modelMatrix,
+        fogDensity,
+        fogColor,
+        lightingStrength,
+        lightDir,
+        navigationMode
+      });
+    }
 
     // Update labels
     if (flags.labels) {

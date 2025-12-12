@@ -23,12 +23,94 @@ export const BenchmarkConfig = {
   QUALITY_FULL: 'full',           // Full lighting and fog
   QUALITY_LIGHT: 'light',         // Simplified lighting
   QUALITY_ULTRALIGHT: 'ultralight', // Maximum performance
-  
+
   // Test scenarios
   TEST_LOD: 'lod',
   TEST_FRUSTUM_CULLING: 'frustum',
   TEST_INTERLEAVED: 'interleaved',
-  TEST_SHADER_QUALITY: 'shader'
+  TEST_SHADER_QUALITY: 'shader',
+
+  // Default test parameters
+  DEFAULT_FRAMES_PER_TEST: 60,
+  DEFAULT_WARMUP_FRAMES: 10,
+  DEFAULT_MULTI_RUN_COUNT: 3,
+  DEFAULT_COOLDOWN_MS: 500,
+
+  // Thresholds for performance classification
+  THRESHOLDS: {
+    FPS: {
+      EXCELLENT: 60,    // >= 60 FPS
+      GOOD: 45,         // >= 45 FPS
+      ACCEPTABLE: 30,   // >= 30 FPS
+      POOR: 15          // >= 15 FPS, below is critical
+    },
+    FRAME_TIME: {
+      EXCELLENT: 16.67, // <= 16.67ms (60 FPS)
+      GOOD: 22.22,      // <= 22.22ms (45 FPS)
+      ACCEPTABLE: 33.33, // <= 33.33ms (30 FPS)
+      POOR: 66.67       // <= 66.67ms (15 FPS)
+    },
+    JANK_PERCENT: {
+      GOOD: 2,          // <= 2% jank frames
+      ACCEPTABLE: 5,    // <= 5%
+      POOR: 10          // <= 10%, above is critical
+    },
+    CV: {
+      STABLE: 10,       // CV <= 10% is stable
+      MODERATE: 25,     // CV <= 25% is moderate
+      UNSTABLE: 50      // CV <= 50% is unstable, above is highly unstable
+    }
+  },
+
+  // Test suite configurations
+  TEST_SUITE: {
+    STANDARD: [
+      { name: 'Full Quality', quality: 'full', lod: true },
+      { name: 'Light Quality', quality: 'light', lod: true },
+      { name: 'Ultralight Quality', quality: 'ultralight', lod: true },
+      { name: 'No LOD', quality: 'full', lod: false },
+      { name: 'With LOD', quality: 'full', lod: true }
+    ],
+    EXTENDED: [
+      { name: 'Full Quality', quality: 'full', lod: true },
+      { name: 'Light Quality', quality: 'light', lod: true },
+      { name: 'Ultralight Quality', quality: 'ultralight', lod: true },
+      { name: 'No LOD', quality: 'full', lod: false },
+      { name: 'With LOD', quality: 'full', lod: true },
+      { name: 'With Frustum Culling', quality: 'full', lod: true, frustumCulling: true }
+    ],
+    MINIMAL: [
+      { name: 'Standard', quality: 'full', lod: true },
+      { name: 'Performance', quality: 'ultralight', lod: true }
+    ]
+  },
+
+  /**
+   * Classify performance based on FPS
+   * @param {number} fps - Frames per second
+   * @returns {string} Performance classification
+   */
+  classifyFPS(fps) {
+    const t = this.THRESHOLDS.FPS;
+    if (fps >= t.EXCELLENT) return 'excellent';
+    if (fps >= t.GOOD) return 'good';
+    if (fps >= t.ACCEPTABLE) return 'acceptable';
+    if (fps >= t.POOR) return 'poor';
+    return 'critical';
+  },
+
+  /**
+   * Classify stability based on coefficient of variation
+   * @param {number} cv - Coefficient of variation (percentage)
+   * @returns {string} Stability classification
+   */
+  classifyStability(cv) {
+    const t = this.THRESHOLDS.CV;
+    if (cv <= t.STABLE) return 'stable';
+    if (cv <= t.MODERATE) return 'moderate';
+    if (cv <= t.UNSTABLE) return 'unstable';
+    return 'highly_unstable';
+  }
 };
 
 /**
@@ -188,69 +270,333 @@ export class HighPerfBenchmark {
   }
   
   /**
-   * Run a comprehensive benchmark test
+   * Run a comprehensive benchmark test suite
+   * @param {number} pointCount - Number of points being tested (for reference)
+   * @param {Function} onProgress - Progress callback
+   * @param {Object} options - Test options
+   * @returns {Promise<Array>} Array of test results
    */
-  async runBenchmarkSuite(pointCount, onProgress) {
+  async runBenchmarkSuite(pointCount, onProgress, options = {}) {
+    const {
+      framesPerTest = BenchmarkConfig.DEFAULT_FRAMES_PER_TEST,
+      warmupFrames = BenchmarkConfig.DEFAULT_WARMUP_FRAMES,
+      includeExtended = false,
+      testSuite = null,  // Custom test suite override
+      validateResults = true
+    } = options;
+
+    // Select test suite: custom, extended, or standard
+    const suite = testSuite ||
+      (includeExtended ? BenchmarkConfig.TEST_SUITE.EXTENDED : BenchmarkConfig.TEST_SUITE.STANDARD);
+
     const results = [];
-    
-    // Test 1: Standard quality
-    if (onProgress) onProgress('Testing full quality...');
-    this.setShaderQuality('full');
-    results.push(await this._runTimedTest('Full Quality', 60));
-    
-    // Test 2: Light quality
-    if (onProgress) onProgress('Testing light quality...');
-    this.setShaderQuality('light');
-    results.push(await this._runTimedTest('Light Quality', 60));
-    
-    // Test 3: Ultralight quality
-    if (onProgress) onProgress('Testing ultralight quality...');
-    this.setShaderQuality('ultralight');
-    results.push(await this._runTimedTest('Ultralight Quality', 60));
-    
-    // Test 4: LOD disabled
-    if (onProgress) onProgress('Testing without LOD...');
-    this.setLODEnabled(false);
-    this.setShaderQuality('full');
-    results.push(await this._runTimedTest('No LOD', 60));
-    
-    // Test 5: LOD enabled
-    if (onProgress) onProgress('Testing with LOD...');
-    this.setLODEnabled(true);
-    results.push(await this._runTimedTest('With LOD', 60));
-    
-    this.testResults = results;
-    return results;
+
+    // Save original settings to restore later
+    const originalConfig = {
+      useLOD: this.config.useLOD,
+      useFrustumCulling: this.config.useFrustumCulling,
+      shaderQuality: this.config.shaderQuality,
+      forceLODLevel: this.config.forceLODLevel
+    };
+
+    try {
+      // Run each test in the suite
+      for (let i = 0; i < suite.length; i++) {
+        const test = suite[i];
+        const progress = i / suite.length;
+
+        if (onProgress) {
+          onProgress({
+            test: test.name.toLowerCase().replace(/\s+/g, '_'),
+            status: 'running',
+            progress,
+            testIndex: i,
+            totalTests: suite.length
+          });
+        }
+
+        // Apply test configuration
+        this.setShaderQuality(test.quality || BenchmarkConfig.QUALITY_FULL);
+        this.setLODEnabled(test.lod !== false);
+        if (test.frustumCulling !== undefined) {
+          this.setFrustumCullingEnabled(test.frustumCulling);
+        }
+
+        // Run the test
+        const result = await this._runTimedTest(test.name, framesPerTest, warmupFrames);
+
+        // Add performance classification
+        result.classification = {
+          performance: BenchmarkConfig.classifyFPS(result.fps),
+          stability: result.stdDev && result.avgFrameTime
+            ? BenchmarkConfig.classifyStability((result.stdDev / result.avgFrameTime) * 100)
+            : 'unknown'
+        };
+
+        // Validate if requested
+        if (validateResults) {
+          result.validation = this.validateResults(result);
+        }
+
+        results.push(result);
+      }
+
+      // Add metadata to results
+      const metadata = {
+        pointCount,
+        timestamp: new Date().toISOString(),
+        testCount: results.length,
+        framesPerTest,
+        warmupFrames,
+        suiteType: testSuite ? 'custom' : (includeExtended ? 'extended' : 'standard')
+      };
+
+      // Calculate suite-level summary
+      const summary = {
+        bestFPS: Math.max(...results.map(r => r.fps)),
+        worstFPS: Math.min(...results.map(r => r.fps)),
+        avgFPS: results.reduce((sum, r) => sum + r.fps, 0) / results.length,
+        bestTest: results.reduce((best, r) => r.fps > best.fps ? r : best).name,
+        worstTest: results.reduce((worst, r) => r.fps < worst.fps ? r : worst).name,
+        overallClassification: BenchmarkConfig.classifyFPS(
+          results.reduce((sum, r) => sum + r.fps, 0) / results.length
+        )
+      };
+
+      this.testResults = { results, metadata, summary };
+
+      if (onProgress) {
+        onProgress({
+          test: 'complete',
+          status: 'done',
+          progress: 1,
+          summary
+        });
+      }
+
+      return { results, metadata, summary };
+    } finally {
+      // Restore original settings
+      this.config.useLOD = originalConfig.useLOD;
+      this.config.useFrustumCulling = originalConfig.useFrustumCulling;
+      this.config.shaderQuality = originalConfig.shaderQuality;
+      this.config.forceLODLevel = originalConfig.forceLODLevel;
+
+      if (this.renderer) {
+        this.renderer.setAdaptiveLOD(originalConfig.useLOD);
+        this.renderer.setFrustumCulling(originalConfig.useFrustumCulling);
+        this.renderer.setQuality(originalConfig.shaderQuality);
+      }
+    }
   }
-  
-  async _runTimedTest(name, frames) {
+
+  /**
+   * Run a timed test with proper warmup and rendering trigger
+   * @param {string} name - Test name
+   * @param {number} frames - Number of frames to measure
+   * @param {number} warmupFrames - Number of warmup frames to skip
+   * @returns {Promise<Object>} Test results with all metrics as numbers
+   */
+  async _runTimedTest(name, frames, warmupFrames = 10) {
     return new Promise((resolve) => {
       const frameTimes = [];
-      let frameCount = 0;
-      
+      let totalFrameAttempts = 0;
+      let skippedFrames = 0;
+      let warmupCount = 0;
+      let lastFrameStart = performance.now();
+
       const measure = () => {
-        if (frameCount >= frames) {
-          const avg = frameTimes.reduce((a, b) => a + b, 0) / frameTimes.length;
+        const now = performance.now();
+        const frameTime = now - lastFrameStart;
+        lastFrameStart = now;
+
+        // Warmup phase - skip these frames
+        if (warmupCount < warmupFrames) {
+          warmupCount++;
+          // Force a render during warmup to stabilize GPU state
+          if (this.renderer) {
+            this.renderer.render({});
+          }
+          requestAnimationFrame(measure);
+          return;
+        }
+
+        // Measurement phase - continue until we have enough valid frames
+        if (frameTimes.length >= frames) {
+          // Calculate comprehensive statistics (all as numbers)
+          const sorted = [...frameTimes].sort((a, b) => a - b);
+          const n = sorted.length;
+          const sum = sorted.reduce((a, b) => a + b, 0);
+          const avg = sum / n;
           const fps = 1000 / avg;
+
+          // Calculate standard deviation
+          const sumSquares = sorted.reduce((a, b) => a + b * b, 0);
+          const variance = (sumSquares / n) - (avg * avg);
+          const stdDev = Math.sqrt(Math.max(0, variance));
+
+          // Percentiles with bounds checking and interpolation
+          const getPercentile = (p) => {
+            if (n === 0) return 0;
+            if (n === 1) return sorted[0];
+            const idx = p * (n - 1);
+            const lower = Math.floor(idx);
+            const upper = Math.ceil(idx);
+            if (lower === upper) return sorted[lower];
+            // Linear interpolation for more accurate percentiles
+            const frac = idx - lower;
+            return sorted[lower] * (1 - frac) + sorted[upper] * frac;
+          };
+
+          const medianFrameTime = getPercentile(0.50);
+          const p95FrameTime = getPercentile(0.95);
+          const p99FrameTime = getPercentile(0.99);
+
+          // Jank detection (frames > 1.5x average)
+          const jankThreshold = avg * 1.5;
+          const jankFrames = frameTimes.filter(t => t > jankThreshold).length;
+
+          // Use actual measured frame count for accuracy
+          const measuredFrames = frameTimes.length;
+
           resolve({
             name,
-            avgFrameTime: avg.toFixed(2),
+            // All values as numbers for consistency
+            avgFrameTime: avg,
             fps: Math.round(fps),
-            frames: frameCount
+            fpsRaw: fps, // Keep unrounded FPS for accurate comparisons
+            minFrameTime: sorted[0],
+            maxFrameTime: sorted[n - 1],
+            medianFrameTime,
+            p95FrameTime,
+            p99FrameTime,
+            stdDev,
+            frames: measuredFrames,
+            totalFrameAttempts,
+            skippedFrames,
+            warmupFrames,
+            jankFrames,
+            jankPercent: (jankFrames / measuredFrames) * 100,
+            // Raw data for further analysis
+            rawFrameTimes: frameTimes
           });
           return;
         }
-        
-        const stats = this.getStats();
-        if (stats) {
-          frameTimes.push(stats.lastFrameTime);
+
+        // Force a render to get accurate frame timing
+        if (this.renderer) {
+          this.renderer.render({});
         }
-        frameCount++;
+
+        totalFrameAttempts++;
+
+        // Only record valid frame times (skip first frame which may include setup)
+        // Also skip obviously invalid frames (tab hidden, extreme outliers)
+        if (totalFrameAttempts > 1 && frameTime > 0.1 && frameTime < 1000) {
+          frameTimes.push(frameTime);
+        } else if (totalFrameAttempts > 1) {
+          skippedFrames++;
+        }
+
         requestAnimationFrame(measure);
       };
-      
+
       requestAnimationFrame(measure);
     });
+  }
+
+  /**
+   * Compare two benchmark runs and identify regressions/improvements
+   * @param {Object} baseline - Baseline benchmark results
+   * @param {Object} current - Current benchmark results
+   * @param {Object} options - Comparison options
+   * @returns {Object} Comparison analysis
+   */
+  compareBenchmarks(baseline, current, options = {}) {
+    const {
+      regressionThreshold = 5,  // % FPS drop to consider regression
+      improvementThreshold = 5,  // % FPS gain to consider improvement
+      criticalThreshold = 20,    // % FPS drop for critical severity
+      warningThreshold = 10      // % FPS drop for warning severity
+    } = options;
+
+    const comparisons = [];
+
+    for (const currentTest of current.results) {
+      const baselineTest = baseline.results.find(b => b.name === currentTest.name);
+      if (!baselineTest) continue;
+
+      // Use raw (unrounded) FPS for accurate comparison, fall back to rounded if unavailable
+      const baselineFps = baselineTest.fpsRaw ?? baselineTest.fps;
+      const currentFps = currentTest.fpsRaw ?? currentTest.fps;
+
+      // Calculate changes using raw values for precision
+      const fpsChange = baselineFps > 0
+        ? ((currentFps - baselineFps) / baselineFps) * 100
+        : 0;
+      const frameTimeChange = baselineTest.avgFrameTime > 0
+        ? ((currentTest.avgFrameTime - baselineTest.avgFrameTime) / baselineTest.avgFrameTime) * 100
+        : 0;
+
+      // Calculate statistical significance (basic approach using stdDev)
+      const baselineStdDev = baselineTest.stdDev ?? 0;
+      const currentStdDev = currentTest.stdDev ?? 0;
+      const pooledStdDev = Math.sqrt((baselineStdDev ** 2 + currentStdDev ** 2) / 2);
+      const frameTimeDiff = Math.abs(currentTest.avgFrameTime - baselineTest.avgFrameTime);
+      const isStatisticallySignificant = pooledStdDev > 0
+        ? frameTimeDiff > (pooledStdDev * 2) // > 2 standard deviations
+        : true;
+
+      comparisons.push({
+        name: currentTest.name,
+        baseline: {
+          fps: baselineTest.fps,
+          fpsRaw: baselineFps,
+          avgFrameTime: baselineTest.avgFrameTime,
+          stdDev: baselineStdDev
+        },
+        current: {
+          fps: currentTest.fps,
+          fpsRaw: currentFps,
+          avgFrameTime: currentTest.avgFrameTime,
+          stdDev: currentStdDev
+        },
+        changes: {
+          fpsChange,
+          frameTimeChange,
+          absoluteFpsDiff: currentFps - baselineFps,
+          absoluteFrameTimeDiff: currentTest.avgFrameTime - baselineTest.avgFrameTime,
+          isRegression: fpsChange < -regressionThreshold,
+          isImprovement: fpsChange > improvementThreshold,
+          isStatisticallySignificant,
+          severity: fpsChange < -criticalThreshold ? 'critical'
+            : fpsChange < -warningThreshold ? 'warning'
+            : fpsChange > improvementThreshold ? 'improved'
+            : 'ok'
+        }
+      });
+    }
+
+    // Calculate overall summary statistics
+    const avgFpsChange = comparisons.length > 0
+      ? comparisons.reduce((sum, c) => sum + c.changes.fpsChange, 0) / comparisons.length
+      : 0;
+
+    return {
+      comparisons,
+      summary: {
+        regressions: comparisons.filter(c => c.changes.isRegression).length,
+        improvements: comparisons.filter(c => c.changes.isImprovement).length,
+        stable: comparisons.filter(c => !c.changes.isRegression && !c.changes.isImprovement).length,
+        significantChanges: comparisons.filter(c => c.changes.isStatisticallySignificant &&
+          (c.changes.isRegression || c.changes.isImprovement)).length,
+        avgFpsChange,
+        overallStatus: avgFpsChange < -criticalThreshold ? 'critical'
+          : avgFpsChange < -warningThreshold ? 'warning'
+          : avgFpsChange > improvementThreshold ? 'improved'
+          : 'stable'
+      }
+    };
   }
   
   /**
@@ -261,7 +607,578 @@ export class HighPerfBenchmark {
       this.renderer.dispose();
       this.renderer = null;
     }
+    if (this.gpuTimer) {
+      this.gpuTimer.dispose();
+      this.gpuTimer = null;
+    }
     this.isActive = false;
+  }
+
+  /**
+   * Initialize GPU timer for precise GPU timing measurements
+   * @returns {GPUTimer|null} GPU timer instance or null if unavailable
+   */
+  initGPUTimer() {
+    if (!this.renderer) {
+      console.warn('[HighPerfBenchmark] Renderer not initialized, cannot create GPU timer');
+      return null;
+    }
+    const gl = this.renderer.gl;
+    if (!gl) return null;
+
+    this.gpuTimer = new GPUTimer(gl);
+    return this.gpuTimer;
+  }
+
+  /**
+   * Run a benchmark multiple times and average the results for reliability
+   * @param {string} name - Test name
+   * @param {number} runs - Number of runs to average
+   * @param {number} frames - Frames per run
+   * @param {number} warmupFrames - Warmup frames per run
+   * @param {Object} options - Additional options
+   * @returns {Promise<Object>} Averaged results with statistical analysis
+   */
+  async runMultiRunBenchmark(name, runs = 3, frames = 60, warmupFrames = 10, options = {}) {
+    const {
+      cooldownMs = 500,      // Time between runs to let GPU cool
+      removeOutliers = true,  // Remove statistical outliers
+      outlierThreshold = 2.5  // IQR multiplier for outlier detection
+    } = options;
+
+    const allResults = [];
+    const memorySnapshots = [];
+
+    console.log(`[Benchmark] Starting ${runs}-run benchmark: ${name}`);
+
+    for (let run = 0; run < runs; run++) {
+      // Track memory before run
+      const memBefore = this._getMemorySnapshot();
+
+      // Wait for cooldown between runs (except first)
+      if (run > 0 && cooldownMs > 0) {
+        await new Promise(resolve => setTimeout(resolve, cooldownMs));
+      }
+
+      const result = await this._runTimedTest(`${name} (run ${run + 1})`, frames, warmupFrames);
+      allResults.push(result);
+
+      // Track memory after run
+      const memAfter = this._getMemorySnapshot();
+      memorySnapshots.push({
+        run: run + 1,
+        before: memBefore,
+        after: memAfter,
+        delta: memAfter && memBefore ? memAfter.usedMB - memBefore.usedMB : null
+      });
+
+      console.log(`[Benchmark] Run ${run + 1}/${runs}: ${result.fps} FPS, ${result.avgFrameTime.toFixed(2)}ms avg`);
+    }
+
+    // Collect all frame times across runs
+    let allFrameTimes = allResults.flatMap(r => r.rawFrameTimes);
+
+    // Detect and optionally remove outliers
+    const outlierAnalysis = this._detectOutliers(allFrameTimes, outlierThreshold);
+
+    if (removeOutliers && outlierAnalysis.outliers.length > 0) {
+      allFrameTimes = outlierAnalysis.filtered;
+      console.log(`[Benchmark] Removed ${outlierAnalysis.outliers.length} outliers`);
+    }
+
+    // Calculate combined statistics
+    const sorted = [...allFrameTimes].sort((a, b) => a - b);
+    const n = sorted.length;
+    const sum = sorted.reduce((a, b) => a + b, 0);
+    const avg = sum / n;
+    const fps = 1000 / avg;
+
+    // Standard deviation
+    const sumSquares = sorted.reduce((a, b) => a + b * b, 0);
+    const variance = (sumSquares / n) - (avg * avg);
+    const stdDev = Math.sqrt(Math.max(0, variance));
+
+    // Confidence interval (95%)
+    const standardError = stdDev / Math.sqrt(n);
+    const marginOfError = 1.96 * standardError; // 95% CI
+    const confidenceInterval = {
+      lower: avg - marginOfError,
+      upper: avg + marginOfError,
+      marginOfError,
+      confidenceLevel: 0.95
+    };
+
+    // Percentiles
+    const getPercentile = (p) => {
+      if (n === 0) return 0;
+      if (n === 1) return sorted[0];
+      const idx = p * (n - 1);
+      const lower = Math.floor(idx);
+      const upper = Math.ceil(idx);
+      if (lower === upper) return sorted[lower];
+      const frac = idx - lower;
+      return sorted[lower] * (1 - frac) + sorted[upper] * frac;
+    };
+
+    // Detect thermal throttling (performance degradation across runs)
+    const thermalAnalysis = this._detectThermalThrottling(allResults);
+
+    // Jank analysis
+    const jankThreshold = avg * 1.5;
+    const jankFrames = allFrameTimes.filter(t => t > jankThreshold).length;
+
+    return {
+      name,
+      runs,
+      // Combined metrics
+      fps: Math.round(fps),
+      fpsRaw: fps,
+      avgFrameTime: avg,
+      minFrameTime: sorted[0],
+      maxFrameTime: sorted[n - 1],
+      medianFrameTime: getPercentile(0.50),
+      p95FrameTime: getPercentile(0.95),
+      p99FrameTime: getPercentile(0.99),
+      stdDev,
+      variance,
+
+      // Statistical reliability
+      confidenceInterval,
+      coefficientOfVariation: (stdDev / avg) * 100, // CV as percentage
+
+      // Outlier info
+      outlierAnalysis: {
+        detected: outlierAnalysis.outliers.length,
+        removed: removeOutliers ? outlierAnalysis.outliers.length : 0,
+        threshold: outlierThreshold
+      },
+
+      // Jank
+      jankFrames,
+      jankPercent: (jankFrames / n) * 100,
+
+      // Thermal throttling
+      thermalThrottling: thermalAnalysis,
+
+      // Memory
+      memoryAnalysis: {
+        snapshots: memorySnapshots,
+        avgDelta: memorySnapshots.filter(m => m.delta != null).reduce((s, m) => s + m.delta, 0) /
+          memorySnapshots.filter(m => m.delta != null).length || null
+      },
+
+      // Per-run breakdown
+      perRunResults: allResults.map(r => ({
+        fps: r.fps,
+        avgFrameTime: r.avgFrameTime,
+        stdDev: r.stdDev
+      })),
+
+      // Raw data
+      totalFrames: n,
+      rawFrameTimes: allFrameTimes
+    };
+  }
+
+  /**
+   * Detect statistical outliers using IQR method
+   * @private
+   */
+  _detectOutliers(frameTimes, threshold = 2.5) {
+    if (frameTimes.length < 4) {
+      return { outliers: [], filtered: frameTimes, bounds: null };
+    }
+
+    const sorted = [...frameTimes].sort((a, b) => a - b);
+    const n = sorted.length;
+
+    // Calculate quartiles
+    const q1Idx = Math.floor(n * 0.25);
+    const q3Idx = Math.floor(n * 0.75);
+    const q1 = sorted[q1Idx];
+    const q3 = sorted[q3Idx];
+    const iqr = q3 - q1;
+
+    // Define outlier bounds
+    const lowerBound = q1 - threshold * iqr;
+    const upperBound = q3 + threshold * iqr;
+
+    const outliers = [];
+    const filtered = [];
+
+    for (const value of frameTimes) {
+      if (value < lowerBound || value > upperBound) {
+        outliers.push(value);
+      } else {
+        filtered.push(value);
+      }
+    }
+
+    return {
+      outliers,
+      filtered,
+      bounds: { lower: lowerBound, upper: upperBound, q1, q3, iqr }
+    };
+  }
+
+  /**
+   * Detect thermal throttling by analyzing performance degradation across runs
+   * @private
+   */
+  _detectThermalThrottling(runResults) {
+    if (runResults.length < 2) {
+      return { detected: false, severity: 'none', message: 'Insufficient runs for analysis' };
+    }
+
+    // Compare first run vs last run FPS
+    const firstRun = runResults[0];
+    const lastRun = runResults[runResults.length - 1];
+    const fpsDropPercent = ((firstRun.fps - lastRun.fps) / firstRun.fps) * 100;
+
+    // Calculate trend across all runs
+    const fpsTrend = runResults.map((r, i) => ({ run: i + 1, fps: r.fps }));
+    const avgFpsChange = runResults.slice(1).reduce((sum, r, i) => {
+      return sum + (r.fps - runResults[i].fps);
+    }, 0) / (runResults.length - 1);
+
+    let severity = 'none';
+    let detected = false;
+    let message = 'No thermal throttling detected';
+
+    if (fpsDropPercent > 15) {
+      severity = 'severe';
+      detected = true;
+      message = `Severe throttling: ${fpsDropPercent.toFixed(1)}% FPS drop from first to last run`;
+    } else if (fpsDropPercent > 8) {
+      severity = 'moderate';
+      detected = true;
+      message = `Moderate throttling: ${fpsDropPercent.toFixed(1)}% FPS drop`;
+    } else if (fpsDropPercent > 3) {
+      severity = 'mild';
+      detected = true;
+      message = `Mild throttling: ${fpsDropPercent.toFixed(1)}% FPS drop`;
+    }
+
+    return {
+      detected,
+      severity,
+      message,
+      fpsDropPercent,
+      avgFpsChange,
+      trend: fpsTrend,
+      recommendation: detected
+        ? 'Consider adding longer cooldown between runs or reducing test duration'
+        : null
+    };
+  }
+
+  /**
+   * Get current memory snapshot (Chrome only)
+   * @private
+   */
+  _getMemorySnapshot() {
+    if (typeof performance !== 'undefined' && performance.memory) {
+      return {
+        usedMB: performance.memory.usedJSHeapSize / (1024 * 1024),
+        totalMB: performance.memory.totalJSHeapSize / (1024 * 1024),
+        limitMB: performance.memory.jsHeapSizeLimit / (1024 * 1024)
+      };
+    }
+    return null;
+  }
+
+  /**
+   * Validate benchmark results for sanity
+   * @param {Object} results - Benchmark results to validate
+   * @returns {Object} Validation result with issues array
+   */
+  validateResults(results) {
+    const issues = [];
+
+    // Check FPS is reasonable
+    if (results.fps <= 0) {
+      issues.push({ severity: 'error', field: 'fps', message: 'FPS is zero or negative' });
+    } else if (results.fps > 1000) {
+      issues.push({ severity: 'warning', field: 'fps', message: 'FPS unrealistically high (>1000)' });
+    }
+
+    // Check frame times are positive
+    if (results.avgFrameTime <= 0) {
+      issues.push({ severity: 'error', field: 'avgFrameTime', message: 'Average frame time is zero or negative' });
+    }
+
+    // Check min/max relationship
+    if (results.minFrameTime > results.maxFrameTime) {
+      issues.push({ severity: 'error', field: 'minMaxFrameTime', message: 'Min frame time > max frame time' });
+    }
+
+    // Check percentile ordering
+    if (results.medianFrameTime > results.p95FrameTime) {
+      issues.push({ severity: 'warning', field: 'percentiles', message: 'Median > P95 (unexpected)' });
+    }
+    if (results.p95FrameTime > results.p99FrameTime) {
+      issues.push({ severity: 'warning', field: 'percentiles', message: 'P95 > P99 (unexpected)' });
+    }
+
+    // Check standard deviation is non-negative
+    if (results.stdDev < 0) {
+      issues.push({ severity: 'error', field: 'stdDev', message: 'Standard deviation is negative' });
+    }
+
+    // Check jank percentage is in valid range
+    if (results.jankPercent < 0 || results.jankPercent > 100) {
+      issues.push({ severity: 'error', field: 'jankPercent', message: 'Jank percentage out of range [0, 100]' });
+    }
+
+    // Check frame count matches raw data
+    if (results.rawFrameTimes && results.frames !== results.rawFrameTimes.length) {
+      issues.push({
+        severity: 'warning',
+        field: 'frames',
+        message: `Frame count (${results.frames}) doesn't match raw data length (${results.rawFrameTimes.length})`
+      });
+    }
+
+    // Check coefficient of variation (high = unstable)
+    if (results.coefficientOfVariation && results.coefficientOfVariation > 50) {
+      issues.push({
+        severity: 'warning',
+        field: 'stability',
+        message: `High coefficient of variation (${results.coefficientOfVariation.toFixed(1)}%) indicates unstable performance`
+      });
+    }
+
+    return {
+      valid: issues.filter(i => i.severity === 'error').length === 0,
+      issues,
+      errorCount: issues.filter(i => i.severity === 'error').length,
+      warningCount: issues.filter(i => i.severity === 'warning').length
+    };
+  }
+
+  /**
+   * Save benchmark results to localStorage as a baseline
+   * @param {Object} results - Benchmark results
+   * @param {string} key - Storage key
+   */
+  saveBaseline(results, key = 'benchmark-baseline') {
+    if (typeof localStorage === 'undefined') {
+      console.warn('[HighPerfBenchmark] localStorage not available');
+      return false;
+    }
+
+    const baseline = {
+      results,
+      savedAt: new Date().toISOString(),
+      userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : null
+    };
+
+    try {
+      localStorage.setItem(key, JSON.stringify(baseline));
+      console.log(`[HighPerfBenchmark] Baseline saved to "${key}"`);
+      return true;
+    } catch (e) {
+      console.error('[HighPerfBenchmark] Failed to save baseline:', e);
+      return false;
+    }
+  }
+
+  /**
+   * Load baseline from localStorage
+   * @param {string} key - Storage key
+   * @returns {Object|null} Baseline data or null
+   */
+  loadBaseline(key = 'benchmark-baseline') {
+    if (typeof localStorage === 'undefined') {
+      return null;
+    }
+
+    try {
+      const data = localStorage.getItem(key);
+      if (!data) return null;
+      return JSON.parse(data);
+    } catch (e) {
+      console.error('[HighPerfBenchmark] Failed to load baseline:', e);
+      return null;
+    }
+  }
+
+  /**
+   * Delete baseline from localStorage
+   * @param {string} key - Storage key
+   */
+  deleteBaseline(key = 'benchmark-baseline') {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.removeItem(key);
+    }
+  }
+
+  /**
+   * Run benchmark with GPU timing (if available)
+   * @param {string} name - Test name
+   * @param {number} frames - Number of frames
+   * @param {number} warmupFrames - Warmup frames
+   * @returns {Promise<Object>} Results including GPU timing
+   */
+  async runTimedTestWithGPU(name, frames = 60, warmupFrames = 10) {
+    // Initialize GPU timer if not already done
+    if (!this.gpuTimer) {
+      this.initGPUTimer();
+    }
+
+    const result = await this._runTimedTestWithGPUTiming(name, frames, warmupFrames);
+    return result;
+  }
+
+  /**
+   * Internal method to run timed test with GPU timing
+   * @private
+   */
+  async _runTimedTestWithGPUTiming(name, frames, warmupFrames = 10) {
+    return new Promise((resolve) => {
+      const frameTimes = [];
+      const gpuFrameTimes = [];
+      let totalFrameAttempts = 0;
+      let warmupCount = 0;
+      let lastFrameStart = performance.now();
+
+      const measure = () => {
+        const now = performance.now();
+        const frameTime = now - lastFrameStart;
+        lastFrameStart = now;
+
+        // Poll GPU timer for completed results
+        if (this.gpuTimer) {
+          const gpuResults = this.gpuTimer.poll();
+          for (const result of gpuResults) {
+            gpuFrameTimes.push(result.gpuTimeMs);
+          }
+        }
+
+        // Warmup phase
+        if (warmupCount < warmupFrames) {
+          warmupCount++;
+          if (this.renderer) {
+            if (this.gpuTimer) {
+              const query = this.gpuTimer.begin('warmup');
+              this.renderer.render({});
+              this.gpuTimer.end(query);
+            } else {
+              this.renderer.render({});
+            }
+          }
+          requestAnimationFrame(measure);
+          return;
+        }
+
+        // Measurement phase
+        if (frameTimes.length >= frames) {
+          // Final poll for remaining GPU timings
+          if (this.gpuTimer) {
+            // Give GPU time to finish
+            setTimeout(() => {
+              const finalResults = this.gpuTimer.poll();
+              for (const result of finalResults) {
+                gpuFrameTimes.push(result.gpuTimeMs);
+              }
+
+              resolve(this._buildResultsWithGPU(name, frameTimes, gpuFrameTimes, totalFrameAttempts, warmupFrames));
+            }, 50);
+            return;
+          }
+
+          resolve(this._buildResultsWithGPU(name, frameTimes, gpuFrameTimes, totalFrameAttempts, warmupFrames));
+          return;
+        }
+
+        // Render with GPU timing
+        if (this.renderer) {
+          if (this.gpuTimer) {
+            const query = this.gpuTimer.begin('frame');
+            this.renderer.render({});
+            this.gpuTimer.end(query);
+          } else {
+            this.renderer.render({});
+          }
+        }
+
+        totalFrameAttempts++;
+
+        if (totalFrameAttempts > 1 && frameTime > 0.1 && frameTime < 1000) {
+          frameTimes.push(frameTime);
+        }
+
+        requestAnimationFrame(measure);
+      };
+
+      requestAnimationFrame(measure);
+    });
+  }
+
+  /**
+   * Build results object including GPU timing data
+   * @private
+   */
+  _buildResultsWithGPU(name, frameTimes, gpuFrameTimes, totalFrameAttempts, warmupFrames) {
+    const sorted = [...frameTimes].sort((a, b) => a - b);
+    const n = sorted.length;
+    const sum = sorted.reduce((a, b) => a + b, 0);
+    const avg = sum / n;
+    const fps = 1000 / avg;
+
+    const sumSquares = sorted.reduce((a, b) => a + b * b, 0);
+    const variance = (sumSquares / n) - (avg * avg);
+    const stdDev = Math.sqrt(Math.max(0, variance));
+
+    const getPercentile = (p) => {
+      if (n === 0) return 0;
+      if (n === 1) return sorted[0];
+      const idx = p * (n - 1);
+      const lower = Math.floor(idx);
+      const upper = Math.ceil(idx);
+      if (lower === upper) return sorted[lower];
+      const frac = idx - lower;
+      return sorted[lower] * (1 - frac) + sorted[upper] * frac;
+    };
+
+    // GPU timing statistics
+    let gpuStats = null;
+    if (gpuFrameTimes.length > 0) {
+      const gpuSorted = [...gpuFrameTimes].sort((a, b) => a - b);
+      const gpuSum = gpuSorted.reduce((a, b) => a + b, 0);
+      const gpuAvg = gpuSum / gpuSorted.length;
+      gpuStats = {
+        avgGpuTime: gpuAvg,
+        minGpuTime: gpuSorted[0],
+        maxGpuTime: gpuSorted[gpuSorted.length - 1],
+        samples: gpuSorted.length,
+        gpuBoundRatio: gpuAvg / avg // Ratio of GPU time to total frame time
+      };
+    }
+
+    const jankThreshold = avg * 1.5;
+    const jankFrames = frameTimes.filter(t => t > jankThreshold).length;
+
+    return {
+      name,
+      avgFrameTime: avg,
+      fps: Math.round(fps),
+      fpsRaw: fps,
+      minFrameTime: sorted[0],
+      maxFrameTime: sorted[n - 1],
+      medianFrameTime: getPercentile(0.50),
+      p95FrameTime: getPercentile(0.95),
+      p99FrameTime: getPercentile(0.99),
+      stdDev,
+      frames: n,
+      totalFrameAttempts,
+      warmupFrames,
+      jankFrames,
+      jankPercent: (jankFrames / n) * 100,
+      gpuTiming: gpuStats,
+      rawFrameTimes: frameTimes,
+      rawGpuFrameTimes: gpuFrameTimes.length > 0 ? gpuFrameTimes : null
+    };
   }
 }
 
@@ -1334,61 +2251,606 @@ export class SyntheticDataGenerator {
 }
 
 /**
+ * GPU Timer using EXT_disjoint_timer_query_webgl2 extension
+ *
+ * Provides precise GPU timing measurements using async query objects.
+ * Falls back gracefully when the extension is unavailable.
+ */
+export class GPUTimer {
+  constructor(gl) {
+    this.gl = gl;
+    this.ext = null;
+    this.available = false;
+    this.pendingQueries = [];
+    this.completedTimings = [];
+    this.maxCompletedTimings = 120;
+
+    this._init();
+  }
+
+  _init() {
+    if (!this.gl) return;
+
+    // Try to get the timer query extension
+    this.ext = this.gl.getExtension('EXT_disjoint_timer_query_webgl2');
+    if (!this.ext) {
+      // Try WebGL1 version as fallback
+      this.ext = this.gl.getExtension('EXT_disjoint_timer_query');
+    }
+
+    this.available = !!this.ext;
+
+    if (this.available) {
+      console.log('[GPUTimer] EXT_disjoint_timer_query available');
+    } else {
+      console.log('[GPUTimer] GPU timing extension not available; using fallback');
+    }
+  }
+
+  /**
+   * Check if GPU timing is available
+   */
+  isAvailable() {
+    return this.available;
+  }
+
+  /**
+   * Begin a GPU timing measurement
+   * @param {string} label - Label for this measurement
+   * @returns {Object|null} Query object or null if unavailable
+   */
+  begin(label = 'frame') {
+    if (!this.available) return null;
+
+    const gl = this.gl;
+    const query = gl.createQuery();
+
+    gl.beginQuery(this.ext.TIME_ELAPSED_EXT, query);
+
+    return { query, label, startTime: performance.now() };
+  }
+
+  /**
+   * End a GPU timing measurement
+   * @param {Object} queryInfo - Query object from begin()
+   */
+  end(queryInfo) {
+    if (!this.available || !queryInfo) return;
+
+    const gl = this.gl;
+    gl.endQuery(this.ext.TIME_ELAPSED_EXT);
+
+    queryInfo.endCPUTime = performance.now();
+    this.pendingQueries.push(queryInfo);
+  }
+
+  /**
+   * Poll for completed query results (non-blocking)
+   * Call this periodically (e.g., each frame) to collect results
+   * @returns {Array} Array of completed timing results
+   */
+  poll() {
+    if (!this.available || this.pendingQueries.length === 0) {
+      return [];
+    }
+
+    const gl = this.gl;
+    const completed = [];
+
+    // Check for GPU disjoint (timer was interrupted)
+    const disjoint = gl.getParameter(this.ext.GPU_DISJOINT_EXT);
+
+    // Process pending queries
+    const stillPending = [];
+    for (const queryInfo of this.pendingQueries) {
+      const available = gl.getQueryParameter(queryInfo.query, gl.QUERY_RESULT_AVAILABLE);
+
+      if (available) {
+        if (disjoint) {
+          // Timer was interrupted, discard this result
+          gl.deleteQuery(queryInfo.query);
+          continue;
+        }
+
+        // Get the result (in nanoseconds)
+        const gpuTimeNs = gl.getQueryParameter(queryInfo.query, gl.QUERY_RESULT);
+        const gpuTimeMs = gpuTimeNs / 1_000_000;
+
+        const result = {
+          label: queryInfo.label,
+          gpuTimeMs,
+          cpuTimeMs: queryInfo.endCPUTime - queryInfo.startTime,
+          timestamp: queryInfo.startTime
+        };
+
+        completed.push(result);
+        this.completedTimings.push(result);
+
+        // Trim completed timings
+        if (this.completedTimings.length > this.maxCompletedTimings) {
+          this.completedTimings.shift();
+        }
+
+        gl.deleteQuery(queryInfo.query);
+      } else {
+        stillPending.push(queryInfo);
+      }
+    }
+
+    this.pendingQueries = stillPending;
+    return completed;
+  }
+
+  /**
+   * Get statistics from completed GPU timings
+   * @returns {Object} GPU timing statistics
+   */
+  getStats() {
+    if (this.completedTimings.length === 0) {
+      return {
+        available: this.available,
+        samples: 0,
+        avgGpuTimeMs: 0,
+        minGpuTimeMs: 0,
+        maxGpuTimeMs: 0,
+        avgCpuTimeMs: 0,
+        gpuCpuRatio: 0
+      };
+    }
+
+    const gpuTimes = this.completedTimings.map(t => t.gpuTimeMs);
+    const cpuTimes = this.completedTimings.map(t => t.cpuTimeMs);
+
+    const avgGpu = gpuTimes.reduce((a, b) => a + b, 0) / gpuTimes.length;
+    const avgCpu = cpuTimes.reduce((a, b) => a + b, 0) / cpuTimes.length;
+
+    return {
+      available: this.available,
+      samples: this.completedTimings.length,
+      avgGpuTimeMs: avgGpu,
+      minGpuTimeMs: Math.min(...gpuTimes),
+      maxGpuTimeMs: Math.max(...gpuTimes),
+      avgCpuTimeMs: avgCpu,
+      gpuCpuRatio: avgCpu > 0 ? avgGpu / avgCpu : 0
+    };
+  }
+
+  /**
+   * Clear all timings and pending queries
+   */
+  reset() {
+    // Clean up pending queries
+    if (this.available) {
+      for (const queryInfo of this.pendingQueries) {
+        this.gl.deleteQuery(queryInfo.query);
+      }
+    }
+    this.pendingQueries = [];
+    this.completedTimings = [];
+  }
+
+  /**
+   * Dispose of resources
+   */
+  dispose() {
+    this.reset();
+    this.ext = null;
+    this.available = false;
+  }
+}
+
+/**
  * Performance Statistics Tracker
+ *
+ * Tracks frame timing statistics using a circular buffer for O(1) insertions.
+ * Provides comprehensive metrics including percentiles, jank detection,
+ * standard deviation, and performance budget tracking.
  */
 export class PerformanceTracker {
-  constructor() {
-    this.frameTimes = [];
-    this.maxSamples = 120;
+  /**
+   * @param {Object} options - Configuration options
+   * @param {number} options.maxSamples - Maximum samples to keep (default: 120)
+   * @param {number} options.targetFrameTime - Target frame time in ms for budget tracking (default: 16.67 for 60fps)
+   * @param {number} options.jankThreshold - Multiplier for detecting jank frames (default: 1.5x average)
+   * @param {number} options.warmupFrames - Number of initial frames to skip (default: 3)
+   */
+  constructor(options = {}) {
+    this.maxSamples = options.maxSamples ?? 120;
+    this.targetFrameTime = options.targetFrameTime ?? 16.67; // 60fps target
+    this.jankThreshold = options.jankThreshold ?? 1.5;
+    this.warmupFrames = options.warmupFrames ?? 3;
+
+    // Circular buffer for O(1) insertions
+    this._buffer = new Float64Array(this.maxSamples);
+    this._head = 0;
+    this._count = 0;
+
+    // Frame tracking
     this.lastTime = 0;
     this.running = false;
+    this._frameNumber = 0;
+    this._warmupComplete = false;
+
+    // Cumulative stats (for efficiency)
+    this._sum = 0;
+    this._sumSquares = 0;
+    this._min = Infinity;
+    this._max = -Infinity;
+
+    // Jank tracking
+    this._jankFrames = 0;
+    this._consecutiveJanks = 0;
+    this._maxConsecutiveJanks = 0;
+
+    // Budget tracking
+    this._overBudgetFrames = 0;
+
+    // Historical snapshots for trend analysis
+    this._history = [];
+    this._historyMaxSize = 60; // Keep last 60 snapshots
+    this._lastSnapshotTime = 0;
+    this._snapshotInterval = 1000; // Snapshot every 1 second
   }
-  
+
+  /**
+   * Start tracking frames
+   */
   start() {
-    this.frameTimes = [];
+    this.reset();
     this.lastTime = performance.now();
     this.running = true;
   }
-  
+
+  /**
+   * Reset all statistics
+   */
+  reset() {
+    this._buffer.fill(0);
+    this._head = 0;
+    this._count = 0;
+    this._sum = 0;
+    this._sumSquares = 0;
+    this._min = Infinity;
+    this._max = -Infinity;
+    this._frameNumber = 0;
+    this._warmupComplete = false;
+    this._jankFrames = 0;
+    this._consecutiveJanks = 0;
+    this._maxConsecutiveJanks = 0;
+    this._overBudgetFrames = 0;
+    this._history = [];
+    this._lastSnapshotTime = 0;
+  }
+
+  /**
+   * Record a frame and return current statistics
+   * @returns {Object|null} Current statistics or null if not running
+   */
   recordFrame() {
     if (!this.running) return null;
-    
+
     const now = performance.now();
     const frameTime = now - this.lastTime;
     this.lastTime = now;
-    
-    // Skip first frame (usually longer)
-    if (this.frameTimes.length > 0 || frameTime < 100) {
-      this.frameTimes.push(frameTime);
-      if (this.frameTimes.length > this.maxSamples) {
-        this.frameTimes.shift();
-      }
+    this._frameNumber++;
+
+    // Skip warmup frames (usually have initialization overhead)
+    if (this._frameNumber <= this.warmupFrames) {
+      return this.getStats();
     }
-    
+    this._warmupComplete = true;
+
+    // Skip obviously invalid frames (e.g., tab was hidden)
+    if (frameTime > 1000 || frameTime < 0.1) {
+      return this.getStats();
+    }
+
+    // Calculate jank threshold BEFORE adding the current frame
+    // This prevents the current frame from affecting its own jank detection
+    const prevCount = this._count;
+    const prevAvg = prevCount > 0 ? this._sum / prevCount : this.targetFrameTime;
+    const jankThreshold = prevAvg * this.jankThreshold;
+
+    // Add to circular buffer
+    this._addSample(frameTime);
+
+    // Update budget tracking
+    if (frameTime > this.targetFrameTime) {
+      this._overBudgetFrames++;
+    }
+
+    // Detect jank using the previous average (before this frame was added)
+    const isJank = frameTime > jankThreshold;
+    if (isJank) {
+      this._jankFrames++;
+      this._consecutiveJanks++;
+      this._maxConsecutiveJanks = Math.max(this._maxConsecutiveJanks, this._consecutiveJanks);
+    } else {
+      this._consecutiveJanks = 0;
+    }
+
+    // Take periodic snapshots for trend analysis
+    if (now - this._lastSnapshotTime > this._snapshotInterval && this._count >= 10) {
+      this._takeSnapshot(now);
+    }
+
     return this.getStats();
   }
-  
+
+  /**
+   * Add a sample to the circular buffer
+   * @private
+   */
+  _addSample(frameTime) {
+    // Track if we need to recalculate min/max
+    let needsMinMaxRecalc = false;
+
+    // Remove oldest value from cumulative stats if buffer is full
+    if (this._count === this.maxSamples) {
+      const oldValue = this._buffer[this._head];
+      this._sum -= oldValue;
+      this._sumSquares -= oldValue * oldValue;
+
+      // If we're removing the current min or max, we need to recalculate
+      // Use small epsilon for floating point comparison
+      if (Math.abs(oldValue - this._min) < 0.001 || Math.abs(oldValue - this._max) < 0.001) {
+        needsMinMaxRecalc = true;
+      }
+    } else {
+      this._count++;
+    }
+
+    // Add new value
+    this._buffer[this._head] = frameTime;
+    this._head = (this._head + 1) % this.maxSamples;
+
+    // Update cumulative stats
+    this._sum += frameTime;
+    this._sumSquares += frameTime * frameTime;
+
+    // Recalculate min/max if needed, otherwise just update incrementally
+    if (needsMinMaxRecalc) {
+      this._recalculateMinMax();
+    } else {
+      if (frameTime < this._min) this._min = frameTime;
+      if (frameTime > this._max) this._max = frameTime;
+    }
+  }
+
+  /**
+   * Recalculate min/max from current buffer contents
+   * @private
+   */
+  _recalculateMinMax() {
+    this._min = Infinity;
+    this._max = -Infinity;
+
+    const start = this._count === this.maxSamples ? this._head : 0;
+    for (let i = 0; i < this._count; i++) {
+      const value = this._buffer[(start + i) % this.maxSamples];
+      if (value < this._min) this._min = value;
+      if (value > this._max) this._max = value;
+    }
+  }
+
+  /**
+   * Get all samples as a sorted array
+   * @private
+   */
+  _getSortedSamples() {
+    const samples = [];
+    const start = this._count === this.maxSamples ? this._head : 0;
+    for (let i = 0; i < this._count; i++) {
+      samples.push(this._buffer[(start + i) % this.maxSamples]);
+    }
+    return samples.sort((a, b) => a - b);
+  }
+
+  /**
+   * Take a snapshot for trend analysis
+   * @private
+   */
+  _takeSnapshot(now) {
+    const stats = this.getStats();
+    this._history.push({
+      timestamp: now,
+      fps: stats.fps,
+      avgFrameTime: stats.avgFrameTime,
+      p95FrameTime: stats.p95FrameTime,
+      jankPercent: stats.jankPercent
+    });
+
+    // Trim history
+    if (this._history.length > this._historyMaxSize) {
+      this._history.shift();
+    }
+
+    this._lastSnapshotTime = now;
+  }
+
+  /**
+   * Stop tracking
+   */
   stop() {
     this.running = false;
   }
-  
+
+  /**
+   * Get comprehensive statistics (all values as numbers for consistency)
+   * @returns {Object} Statistics object
+   */
   getStats() {
-    if (this.frameTimes.length === 0) {
-      return { fps: 0, avgFrameTime: 0, minFrameTime: 0, maxFrameTime: 0, samples: 0 };
+    if (this._count === 0) {
+      return {
+        fps: 0,
+        avgFrameTime: 0,
+        minFrameTime: 0,
+        maxFrameTime: 0,
+        medianFrameTime: 0,
+        p95FrameTime: 0,
+        p99FrameTime: 0,
+        stdDev: 0,
+        variance: 0,
+        samples: 0,
+        jankFrames: 0,
+        jankPercent: 0,
+        maxConsecutiveJanks: 0,
+        overBudgetFrames: 0,
+        overBudgetPercent: 0,
+        budgetMs: this.targetFrameTime,
+        warmupComplete: this._warmupComplete
+      };
     }
-    
-    const sorted = [...this.frameTimes].sort((a, b) => a - b);
-    const sum = sorted.reduce((a, b) => a + b, 0);
-    const avg = sum / sorted.length;
-    
+
+    const sorted = this._getSortedSamples();
+    const avg = this._sum / this._count;
+
+    // Calculate standard deviation
+    const variance = (this._sumSquares / this._count) - (avg * avg);
+    const stdDev = Math.sqrt(Math.max(0, variance));
+
+    // Recalculate accurate min/max from samples
+    const min = sorted[0];
+    const max = sorted[sorted.length - 1];
+
+    // Percentiles
+    const p50Idx = Math.floor(sorted.length * 0.50);
+    const p95Idx = Math.floor(sorted.length * 0.95);
+    const p99Idx = Math.floor(sorted.length * 0.99);
+
     return {
+      // Primary metrics (all numbers)
       fps: Math.round(1000 / avg),
-      avgFrameTime: avg.toFixed(2),
-      minFrameTime: sorted[0].toFixed(2),
-      maxFrameTime: sorted[sorted.length - 1].toFixed(2),
-      p95FrameTime: sorted[Math.floor(sorted.length * 0.95)]?.toFixed(2) || '0',
-      samples: sorted.length
+      avgFrameTime: avg,
+      minFrameTime: min,
+      maxFrameTime: max,
+      medianFrameTime: sorted[p50Idx] ?? 0,
+      p95FrameTime: sorted[p95Idx] ?? max,
+      p99FrameTime: sorted[p99Idx] ?? max,
+
+      // Statistical measures
+      stdDev: stdDev,
+      variance: variance,
+
+      // Sample info
+      samples: this._count,
+      warmupComplete: this._warmupComplete,
+
+      // Jank metrics
+      jankFrames: this._jankFrames,
+      jankPercent: this._count > 0 ? (this._jankFrames / this._count) * 100 : 0,
+      maxConsecutiveJanks: this._maxConsecutiveJanks,
+
+      // Budget metrics
+      overBudgetFrames: this._overBudgetFrames,
+      overBudgetPercent: this._count > 0 ? (this._overBudgetFrames / this._count) * 100 : 0,
+      budgetMs: this.targetFrameTime,
+
+      // Trend data
+      history: this._history.length > 0 ? this._history : null
     };
+  }
+
+  /**
+   * Get a formatted stats object with string values for display
+   * @returns {Object} Formatted statistics
+   */
+  getFormattedStats() {
+    const stats = this.getStats();
+    return {
+      fps: stats.fps,
+      avgFrameTime: stats.avgFrameTime.toFixed(2),
+      minFrameTime: stats.minFrameTime.toFixed(2),
+      maxFrameTime: stats.maxFrameTime.toFixed(2),
+      medianFrameTime: stats.medianFrameTime.toFixed(2),
+      p95FrameTime: stats.p95FrameTime.toFixed(2),
+      p99FrameTime: stats.p99FrameTime.toFixed(2),
+      stdDev: stats.stdDev.toFixed(2),
+      samples: stats.samples,
+      jankPercent: stats.jankPercent.toFixed(1) + '%',
+      overBudgetPercent: stats.overBudgetPercent.toFixed(1) + '%'
+    };
+  }
+
+  /**
+   * Get histogram data for frame time distribution
+   * @param {number} bucketCount - Number of buckets (default: 10)
+   * @returns {Array} Array of {min, max, count, percent}
+   */
+  getHistogram(bucketCount = 10) {
+    if (this._count === 0) return [];
+
+    const sorted = this._getSortedSamples();
+    const min = sorted[0];
+    const max = sorted[sorted.length - 1];
+    const range = max - min;
+
+    // Handle edge case where all samples are identical (or nearly identical)
+    if (range < 0.001) {
+      // All samples are essentially the same value - return single bucket
+      return [{
+        min: min - 0.5,
+        max: max + 0.5,
+        count: this._count,
+        percent: 100,
+        label: `${min.toFixed(2)}ms`
+      }];
+    }
+
+    // Use actual range for bucket size calculation
+    const bucketSize = range / bucketCount;
+
+    const buckets = Array.from({ length: bucketCount }, (_, i) => ({
+      min: min + i * bucketSize,
+      max: min + (i + 1) * bucketSize,
+      count: 0,
+      percent: 0,
+      label: `${(min + i * bucketSize).toFixed(1)}-${(min + (i + 1) * bucketSize).toFixed(1)}ms`
+    }));
+
+    for (const value of sorted) {
+      const bucketIdx = Math.min(
+        Math.floor((value - min) / bucketSize),
+        bucketCount - 1
+      );
+      buckets[bucketIdx].count++;
+    }
+
+    for (const bucket of buckets) {
+      bucket.percent = (bucket.count / this._count) * 100;
+    }
+
+    return buckets;
+  }
+
+  /**
+   * Detect performance trend (improving, stable, degrading)
+   * @returns {Object} Trend analysis
+   */
+  getTrend() {
+    if (this._history.length < 5) {
+      return { trend: 'insufficient_data', confidence: 0 };
+    }
+
+    const recent = this._history.slice(-5);
+    const older = this._history.slice(-10, -5);
+
+    if (older.length === 0) {
+      return { trend: 'insufficient_data', confidence: 0 };
+    }
+
+    const recentAvgFps = recent.reduce((s, h) => s + h.fps, 0) / recent.length;
+    const olderAvgFps = older.reduce((s, h) => s + h.fps, 0) / older.length;
+
+    const change = (recentAvgFps - olderAvgFps) / olderAvgFps;
+
+    if (Math.abs(change) < 0.05) {
+      return { trend: 'stable', change, confidence: 0.8 };
+    } else if (change > 0) {
+      return { trend: 'improving', change, confidence: Math.min(change * 10, 1) };
+    } else {
+      return { trend: 'degrading', change, confidence: Math.min(-change * 10, 1) };
+    }
   }
 }
 
@@ -2405,54 +3867,278 @@ export class BenchmarkReporter {
     };
   }
 
-  _detectIssues(env, renderer, data) {
-    const issues = [];
+  /**
+   * Issue severity levels
+   */
+  static SEVERITY = {
+    CRITICAL: 'critical',  // Performance is severely impacted, likely unusable
+    WARNING: 'warning',    // Performance is degraded but usable
+    INFO: 'info',          // Informational, may affect some use cases
+    SUGGESTION: 'suggestion' // Optimization opportunity
+  };
 
-    if (renderer.fps && renderer.fps < 30) {
-      issues.push('FPS below 30 (verify LOD and resolution).');
+  /**
+   * Default thresholds for issue detection (can be overridden via constructor)
+   */
+  static DEFAULT_THRESHOLDS = {
+    fps: {
+      critical: 15,
+      warning: 30,
+      target: 60
+    },
+    frameTime: {
+      critical: 50,   // 20 FPS
+      warning: 33,    // 30 FPS
+      target: 16.67   // 60 FPS
+    },
+    memory: {
+      critical: 1000, // 1GB GPU memory
+      warning: 700,   // 700MB
+      high: 500       // 500MB (info)
+    },
+    pointCount: {
+      requiresLOD: 1000000,      // 1M points
+      requiresCulling: 500000,  // 500K points
+      large: 5000000             // 5M points
+    },
+    cpu: {
+      limited: 4,
+      adequate: 6
+    },
+    deviceMemory: {
+      critical: 2,  // 2GB
+      warning: 4    // 4GB
+    },
+    jank: {
+      critical: 10, // 10% jank frames
+      warning: 5    // 5% jank frames
     }
-    if (renderer.frameTime && renderer.frameTime > 25) {
-      issues.push('High frame time (>25ms) indicates GPU/CPU bottleneck.');
+  };
+
+  /**
+   * Detect performance issues with severity levels and detailed metadata
+   * @param {Object} env - Environment information
+   * @param {Object} renderer - Renderer statistics
+   * @param {Object} data - Data snapshot
+   * @param {Object} perfStats - Performance tracker stats (optional)
+   * @param {Object} thresholds - Custom thresholds (optional)
+   * @returns {Array<Object>} Array of issue objects with severity and metadata
+   */
+  _detectIssues(env, renderer, data, perfStats = null, thresholds = null) {
+    const issues = [];
+    const t = thresholds || BenchmarkReporter.DEFAULT_THRESHOLDS;
+    const S = BenchmarkReporter.SEVERITY;
+
+    // Helper to add issues
+    const addIssue = (severity, category, message, details = {}) => {
+      issues.push({
+        severity,
+        category,
+        message,
+        details,
+        timestamp: Date.now()
+      });
+    };
+
+    // FPS Issues
+    if (renderer.fps != null) {
+      if (renderer.fps < t.fps.critical) {
+        addIssue(S.CRITICAL, 'performance', `Critical: FPS is ${renderer.fps} (below ${t.fps.critical})`, {
+          current: renderer.fps,
+          threshold: t.fps.critical,
+          recommendation: 'Enable LOD, reduce point count, or use ultralight shader'
+        });
+      } else if (renderer.fps < t.fps.warning) {
+        addIssue(S.WARNING, 'performance', `FPS is ${renderer.fps} (target: ${t.fps.target})`, {
+          current: renderer.fps,
+          threshold: t.fps.warning,
+          recommendation: 'Consider enabling LOD or using light/ultralight shader'
+        });
+      }
     }
-    if (renderer.estimatedMemoryMB && renderer.estimatedMemoryMB > 700) {
-      issues.push('GPU memory estimate exceeds ~700MB; risk of driver eviction.');
+
+    // Frame time issues
+    if (renderer.frameTime != null) {
+      if (renderer.frameTime > t.frameTime.critical) {
+        addIssue(S.CRITICAL, 'performance', `Frame time ${renderer.frameTime.toFixed(1)}ms exceeds ${t.frameTime.critical}ms`, {
+          current: renderer.frameTime,
+          threshold: t.frameTime.critical,
+          recommendation: 'GPU or CPU bottleneck detected; reduce workload'
+        });
+      } else if (renderer.frameTime > t.frameTime.warning) {
+        addIssue(S.WARNING, 'performance', `Frame time ${renderer.frameTime.toFixed(1)}ms exceeds ${t.frameTime.warning}ms target`, {
+          current: renderer.frameTime,
+          threshold: t.frameTime.warning
+        });
+      }
     }
-    if (data.pointCount > 5000000 && renderer.rendererConfig && renderer.rendererConfig.lodEnabled === false) {
-      issues.push('LOD disabled on multi-million point dataset.');
+
+    // Jank detection (from PerformanceTracker stats)
+    if (perfStats?.jankPercent != null) {
+      if (perfStats.jankPercent > t.jank.critical) {
+        addIssue(S.WARNING, 'stability', `High jank rate: ${perfStats.jankPercent.toFixed(1)}% of frames`, {
+          current: perfStats.jankPercent,
+          threshold: t.jank.critical,
+          maxConsecutiveJanks: perfStats.maxConsecutiveJanks,
+          recommendation: 'Reduce workload variance; check for GC pressure'
+        });
+      } else if (perfStats.jankPercent > t.jank.warning) {
+        addIssue(S.INFO, 'stability', `Moderate jank: ${perfStats.jankPercent.toFixed(1)}% of frames`, {
+          current: perfStats.jankPercent,
+          threshold: t.jank.warning
+        });
+      }
     }
-    if (data.pointCount > 3000000 && renderer.rendererConfig && renderer.rendererConfig.frustumCulling === false) {
-      issues.push('Frustum culling off for large dataset; enable to reduce fill rate.');
+
+    // Memory issues
+    if (renderer.estimatedMemoryMB != null) {
+      if (renderer.estimatedMemoryMB > t.memory.critical) {
+        addIssue(S.CRITICAL, 'memory', `GPU memory ~${renderer.estimatedMemoryMB.toFixed(0)}MB exceeds safe limit`, {
+          current: renderer.estimatedMemoryMB,
+          threshold: t.memory.critical,
+          recommendation: 'Risk of driver eviction; reduce point count or resolution'
+        });
+      } else if (renderer.estimatedMemoryMB > t.memory.warning) {
+        addIssue(S.WARNING, 'memory', `GPU memory ~${renderer.estimatedMemoryMB.toFixed(0)}MB is high`, {
+          current: renderer.estimatedMemoryMB,
+          threshold: t.memory.warning
+        });
+      }
     }
-    if (env.pixelRatio && env.pixelRatio > 2) {
-      issues.push('High devicePixelRatio (>2) increases fill cost; try browser zoom <100% or lower resolution.');
+
+    // LOD configuration issues
+    if (data.pointCount > t.pointCount.large) {
+      if (renderer.rendererConfig?.lodEnabled === false) {
+        addIssue(S.CRITICAL, 'config', 'LOD disabled on very large dataset', {
+          pointCount: data.pointCount,
+          threshold: t.pointCount.large,
+          recommendation: 'Enable LOD for datasets over 5M points'
+        });
+      }
+    } else if (data.pointCount > t.pointCount.requiresLOD) {
+      if (renderer.rendererConfig?.lodEnabled === false) {
+        addIssue(S.WARNING, 'config', 'LOD disabled on large dataset', {
+          pointCount: data.pointCount,
+          threshold: t.pointCount.requiresLOD,
+          recommendation: 'Enable LOD for better performance'
+        });
+      }
     }
-    if (env.hardwareConcurrency && env.hardwareConcurrency < 6) {
-      issues.push('Limited CPU threads (<6); expect slower load or filter updates.');
+
+    // Frustum culling configuration
+    if (data.pointCount > t.pointCount.requiresCulling && renderer.rendererConfig?.frustumCulling === false) {
+      addIssue(S.SUGGESTION, 'config', 'Frustum culling disabled', {
+        pointCount: data.pointCount,
+        threshold: t.pointCount.requiresCulling,
+        recommendation: 'Enable frustum culling to reduce fill rate'
+      });
     }
-    if (env.deviceMemory && env.deviceMemory < 4) {
-      issues.push('Low device memory (<4GB); large allocations may fail.');
+
+    // Hardware issues
+    if (env.pixelRatio != null && env.pixelRatio > 2) {
+      addIssue(S.INFO, 'hardware', `High DPI display (${env.pixelRatio}x) increases fill cost`, {
+        current: env.pixelRatio,
+        recommendation: 'Consider browser zoom <100% or canvas resolution scaling'
+      });
     }
-    if (env.webgl && env.webgl.maxTextureSize && env.webgl.maxTextureSize < 4096) {
-      issues.push('Low MAX_TEXTURE_SIZE (<4096); texture-heavy effects may degrade.');
+
+    if (env.hardwareConcurrency != null && env.hardwareConcurrency < t.cpu.limited) {
+      addIssue(S.WARNING, 'hardware', `Limited CPU cores (${env.hardwareConcurrency})`, {
+        current: env.hardwareConcurrency,
+        threshold: t.cpu.limited,
+        recommendation: 'Expect slower data loading and filter updates'
+      });
+    } else if (env.hardwareConcurrency != null && env.hardwareConcurrency < t.cpu.adequate) {
+      addIssue(S.INFO, 'hardware', `Moderate CPU cores (${env.hardwareConcurrency})`, {
+        current: env.hardwareConcurrency,
+        threshold: t.cpu.adequate
+      });
     }
-    if (env.webgl && env.webgl.supportsColorBufferFloat === false) {
-      issues.push('No color_buffer_float; fallback precision may apply.');
+
+    if (env.deviceMemory != null && env.deviceMemory < t.deviceMemory.critical) {
+      addIssue(S.CRITICAL, 'hardware', `Very low device memory (${env.deviceMemory}GB)`, {
+        current: env.deviceMemory,
+        threshold: t.deviceMemory.critical,
+        recommendation: 'Large datasets may fail to load'
+      });
+    } else if (env.deviceMemory != null && env.deviceMemory < t.deviceMemory.warning) {
+      addIssue(S.WARNING, 'hardware', `Low device memory (${env.deviceMemory}GB)`, {
+        current: env.deviceMemory,
+        threshold: t.deviceMemory.warning
+      });
     }
+
+    // WebGL capability issues
+    if (env.webgl) {
+      if (env.webgl.maxTextureSize && env.webgl.maxTextureSize < 4096) {
+        addIssue(S.WARNING, 'webgl', `Low MAX_TEXTURE_SIZE (${env.webgl.maxTextureSize})`, {
+          current: env.webgl.maxTextureSize,
+          threshold: 4096,
+          recommendation: 'Texture-heavy effects may degrade'
+        });
+      }
+      if (env.webgl.supportsColorBufferFloat === false) {
+        addIssue(S.INFO, 'webgl', 'Color buffer float not supported', {
+          recommendation: 'Fallback precision may apply for some effects'
+        });
+      }
+    }
+
+    // Sort by severity (critical first)
+    const severityOrder = { critical: 0, warning: 1, info: 2, suggestion: 3 };
+    issues.sort((a, b) => severityOrder[a.severity] - severityOrder[b.severity]);
 
     return issues;
   }
 
   /**
+   * Get issues filtered by severity
+   * @param {Array} issues - Array of issues
+   * @param {string} minSeverity - Minimum severity to include
+   * @returns {Array} Filtered issues
+   */
+  static filterIssuesBySeverity(issues, minSeverity = 'info') {
+    const severityOrder = { critical: 0, warning: 1, info: 2, suggestion: 3 };
+    const minLevel = severityOrder[minSeverity] ?? 2;
+    return issues.filter(i => severityOrder[i.severity] <= minLevel);
+  }
+
+  /**
+   * Get issue summary counts by severity
+   * @param {Array} issues - Array of issues
+   * @returns {Object} Counts by severity
+   */
+  static getIssueSummary(issues) {
+    const summary = { critical: 0, warning: 0, info: 0, suggestion: 0, total: issues.length };
+    for (const issue of issues) {
+      if (summary[issue.severity] !== undefined) {
+        summary[issue.severity]++;
+      }
+    }
+    return summary;
+  }
+
+  /**
+   * Format issues as simple strings (legacy format)
+   * @param {Array} issues - Array of issue objects
+   * @returns {Array<string>} Array of message strings
+   */
+  static formatIssuesAsStrings(issues) {
+    return issues.map(i => `[${i.severity.toUpperCase()}] ${i.message}`);
+  }
+
+  /**
    * Build a comprehensive report with all available information.
    * Returns structured JSON data with helper methods for export.
+   * @param {Object} context - Context data (perfStats, rendererStats, etc.)
+   * @returns {Object} Report object with data and export methods
    */
   buildReport(context = {}) {
     const gl = this._getGL();
     const nav = typeof navigator !== 'undefined' ? navigator : {};
     const scr = typeof screen !== 'undefined' ? screen : {};
 
-    // Collect all information
-    const env = this._collectEnvironment(gl);
+    // Collect all information (avoiding duplicate collection)
     const hardware = this._collectHardware(nav, scr);
     const browser = this._collectBrowser(nav);
     const network = this._collectNetwork(nav);
@@ -2463,7 +4149,26 @@ export class BenchmarkReporter {
 
     const data = this._collectDataSnapshot(context);
     const renderer = this._collectRendererSnapshot(gl, { ...context, dataset: data });
-    const issues = this._detectIssues(env, renderer, data);
+
+    // Build compact env object for issue detection (avoiding full re-collection)
+    const env = {
+      pixelRatio: hardware.viewport?.devicePixelRatio || null,
+      hardwareConcurrency: hardware.cpu.cores,
+      deviceMemory: hardware.memory.deviceMemoryGB,
+      webgl: webgl ? {
+        maxTextureSize: webgl.params.maxTextureSize,
+        supportsColorBufferFloat: webgl.extensions.keyExtensions['EXT_color_buffer_float'] ||
+          webgl.extensions.keyExtensions['WEBGL_color_buffer_float']
+      } : null,
+      timezone: (() => {
+        try { return Intl.DateTimeFormat().resolvedOptions().timeZone; }
+        catch { return null; }
+      })()
+    };
+
+    // Detect issues with new severity system (pass perfStats for jank detection)
+    const issues = this._detectIssues(env, renderer, data, context.perfStats);
+    const issueSummary = BenchmarkReporter.getIssueSummary(issues);
     const now = new Date();
 
     // Build structured report
@@ -2471,8 +4176,8 @@ export class BenchmarkReporter {
       meta: {
         generated: now.toISOString(),
         generatedLocal: now.toLocaleString(),
-        timezone: env.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone,
-        version: '2.0'
+        timezone: env.timezone,
+        version: '3.0' // Bumped version for new issue format
       },
       hardware,
       browser,
@@ -2484,10 +4189,13 @@ export class BenchmarkReporter {
       renderer,
       data,
       issues,
-      env
+      issueSummary
     };
 
-    // Minimal text summary
+    // Minimal text summary with severity breakdown
+    const issueText = issueSummary.total === 0 ? 'none' :
+      `${issueSummary.total} (${issueSummary.critical} critical, ${issueSummary.warning} warning)`;
+
     const summary = [
       `Cellucid Report | ${now.toISOString()}`,
       `CPU: ${hardware.cpu.cores || '?'} cores, ${hardware.cpu.architecture.detected}`,
@@ -2497,8 +4205,8 @@ export class BenchmarkReporter {
       `Network: ${network.online ? 'online' : 'offline'}${network.connection ? ` (${network.connection.effectiveType})` : ''}`,
       `Memory: ${hardware.memory.deviceMemoryGB || '?'}GB device${hardware.memory.jsHeap.available ? `, ${hardware.memory.jsHeap.usedMB}MB heap` : ''}`,
       `Points: ${formatNumber(data.pointCount)} total, ${formatNumber(data.visiblePoints)} visible`,
-      `FPS: ${renderer.fps ?? 'n/a'}${renderer.frameTime != null ? ` (${renderer.frameTime.toFixed ? renderer.frameTime.toFixed(1) : renderer.frameTime}ms)` : ''}`,
-      `Issues: ${issues.length === 0 ? 'none' : issues.length}`
+      `FPS: ${renderer.fps ?? 'n/a'}${renderer.frameTime != null ? ` (${typeof renderer.frameTime === 'number' ? renderer.frameTime.toFixed(1) : renderer.frameTime}ms)` : ''}`,
+      `Issues: ${issueText}`
     ].join('\n');
 
     return {
@@ -2611,6 +4319,203 @@ export function formatBytes(bytes) {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
+/**
+ * Benchmark Data Exporter
+ *
+ * Provides utilities to export benchmark results to various formats
+ * including CSV, JSON Lines, and structured JSON.
+ */
+export class BenchmarkExporter {
+  /**
+   * Export benchmark results to CSV format
+   * @param {Object} benchmarkResults - Results from runBenchmarkSuite
+   * @returns {string} CSV formatted string
+   */
+  static toCSV(benchmarkResults) {
+    const { results, metadata } = benchmarkResults;
+    if (!results || results.length === 0) return '';
+
+    // Define columns
+    const columns = [
+      'name', 'fps', 'avgFrameTime', 'minFrameTime', 'maxFrameTime',
+      'medianFrameTime', 'p95FrameTime', 'p99FrameTime', 'stdDev',
+      'frames', 'jankFrames', 'jankPercent'
+    ];
+
+    // Header row
+    const header = columns.join(',');
+
+    // Data rows
+    const rows = results.map(result => {
+      return columns.map(col => {
+        const value = result[col];
+        if (value == null) return '';
+        if (typeof value === 'string') return `"${value.replace(/"/g, '""')}"`;
+        if (typeof value === 'number') return value.toFixed ? value.toFixed(4) : value;
+        return value;
+      }).join(',');
+    });
+
+    // Add metadata as comment header
+    const metaLines = [
+      `# Benchmark Export`,
+      `# Generated: ${metadata?.timestamp || new Date().toISOString()}`,
+      `# Point Count: ${metadata?.pointCount || 'unknown'}`,
+      `# Frames Per Test: ${metadata?.framesPerTest || 'unknown'}`,
+      `# Warmup Frames: ${metadata?.warmupFrames || 'unknown'}`,
+      ''
+    ];
+
+    return metaLines.join('\n') + header + '\n' + rows.join('\n');
+  }
+
+  /**
+   * Export benchmark results to JSON Lines format (one JSON object per line)
+   * Useful for streaming and appending to log files
+   * @param {Object} benchmarkResults - Results from runBenchmarkSuite
+   * @returns {string} JSON Lines formatted string
+   */
+  static toJSONLines(benchmarkResults) {
+    const { results, metadata } = benchmarkResults;
+    if (!results || results.length === 0) return '';
+
+    const timestamp = metadata?.timestamp || new Date().toISOString();
+
+    return results.map(result => {
+      const entry = {
+        timestamp,
+        pointCount: metadata?.pointCount,
+        ...result
+      };
+      // Remove rawFrameTimes to keep lines manageable
+      delete entry.rawFrameTimes;
+      return JSON.stringify(entry);
+    }).join('\n');
+  }
+
+  /**
+   * Export performance tracker history to CSV
+   * @param {Array} history - History from PerformanceTracker
+   * @returns {string} CSV formatted string
+   */
+  static historyToCSV(history) {
+    if (!history || history.length === 0) return '';
+
+    const columns = ['timestamp', 'fps', 'avgFrameTime', 'p95FrameTime', 'jankPercent'];
+    const header = columns.join(',');
+
+    const rows = history.map(entry => {
+      return columns.map(col => {
+        const value = entry[col];
+        if (value == null) return '';
+        if (typeof value === 'number') return value.toFixed(4);
+        return value;
+      }).join(',');
+    });
+
+    return header + '\n' + rows.join('\n');
+  }
+
+  /**
+   * Export frame times as raw data for external analysis
+   * @param {Array} frameTimes - Array of frame times in ms
+   * @param {Object} options - Export options
+   * @returns {string} Formatted string based on options.format
+   */
+  static frameTimesToFormat(frameTimes, options = {}) {
+    const { format = 'json', includeStats = true } = options;
+
+    if (!frameTimes || frameTimes.length === 0) return '';
+
+    const data = {
+      frameTimes,
+      count: frameTimes.length
+    };
+
+    if (includeStats) {
+      const sorted = [...frameTimes].sort((a, b) => a - b);
+      const sum = sorted.reduce((a, b) => a + b, 0);
+      const avg = sum / sorted.length;
+      const sumSquares = sorted.reduce((a, b) => a + b * b, 0);
+      const variance = (sumSquares / sorted.length) - (avg * avg);
+
+      data.stats = {
+        avg,
+        min: sorted[0],
+        max: sorted[sorted.length - 1],
+        median: sorted[Math.floor(sorted.length * 0.5)],
+        p95: sorted[Math.floor(sorted.length * 0.95)],
+        stdDev: Math.sqrt(Math.max(0, variance))
+      };
+    }
+
+    switch (format) {
+      case 'csv':
+        return frameTimes.join('\n');
+      case 'json':
+        return JSON.stringify(data, null, 2);
+      case 'jsonl':
+        return frameTimes.map((t, i) => JSON.stringify({ frame: i, timeMs: t })).join('\n');
+      default:
+        return JSON.stringify(data);
+    }
+  }
+
+  /**
+   * Create a downloadable file from export data
+   * @param {string} data - Export data string
+   * @param {string} filename - Filename for download
+   * @param {string} mimeType - MIME type
+   */
+  static download(data, filename, mimeType = 'text/plain') {
+    if (typeof document === 'undefined') {
+      console.warn('[BenchmarkExporter] download() requires browser environment');
+      return;
+    }
+
+    const blob = new Blob([data], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  /**
+   * Convenience method to export and download benchmark results
+   * @param {Object} benchmarkResults - Results from runBenchmarkSuite
+   * @param {string} format - 'csv', 'json', or 'jsonl'
+   */
+  static exportAndDownload(benchmarkResults, format = 'csv') {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    let data, filename, mimeType;
+
+    switch (format) {
+      case 'csv':
+        data = this.toCSV(benchmarkResults);
+        filename = `benchmark-${timestamp}.csv`;
+        mimeType = 'text/csv';
+        break;
+      case 'jsonl':
+        data = this.toJSONLines(benchmarkResults);
+        filename = `benchmark-${timestamp}.jsonl`;
+        mimeType = 'application/x-ndjson';
+        break;
+      case 'json':
+      default:
+        data = JSON.stringify(benchmarkResults, null, 2);
+        filename = `benchmark-${timestamp}.json`;
+        mimeType = 'application/json';
+        break;
+    }
+
+    this.download(data, filename, mimeType);
+  }
+}
+
 // Re-export formatNumber for backward compatibility (imported at top of file)
 export { formatNumber };
 
@@ -2625,4 +4530,6 @@ if (typeof window !== 'undefined') {
   window.GLBParser = GLBParser;
   window.MeshSurfaceSampler = MeshSurfaceSampler;
   window.BenchmarkReporter = BenchmarkReporter;
+  window.GPUTimer = GPUTimer;
+  window.BenchmarkExporter = BenchmarkExporter;
 }

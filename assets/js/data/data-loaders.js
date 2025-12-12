@@ -141,19 +141,8 @@ function dequantize(quantized, minValue, maxValue, bits) {
 
 
 async function fetchOk(url) {
-  // Handle local-user:// URLs
-  if (isLocalUserUrl(url)) {
-    const objectUrl = await getLocalUserFileUrl(url);
-    const response = await fetch(objectUrl);
-    if (!response.ok) {
-      const err = new Error('Failed to load local file ' + url + ': ' + response.statusText);
-      err.status = response.status;
-      throw err;
-    }
-    return response;
-  }
-
-  const response = await fetch(url);
+  const resolvedUrl = await resolveAnyUrl(url);
+  const response = await fetch(resolvedUrl);
   if (!response.ok) {
     const err = new Error('Failed to load ' + url + ': ' + response.statusText);
     err.status = response.status;
@@ -171,11 +160,6 @@ async function fetchOk(url) {
  * @returns {Promise<ArrayBuffer>} Decompressed binary data
  */
 async function fetchBinary(url) {
-  // Handle local-user:// URLs with dedicated handler
-  if (isLocalUserUrl(url)) {
-    return fetchLocalUserBinary(url);
-  }
-
   const response = await fetchOk(url);
 
   // Check if this is a gzipped file by URL extension
@@ -221,8 +205,16 @@ export async function loadPointsBinary(url) {
     return new Float32Array(arrayBuffer);
   }
 
+  const supportsGzip = HAS_DECOMPRESSION_STREAM || HAS_PAKO;
+
   // For local-user:// URLs, check if .gz version exists in the file list
   if (isLocalUserUrl(url)) {
+    if (!supportsGzip) {
+      console.log('Loading uncompressed points file:', url);
+      const arrayBuffer = await fetchLocalUserBinary(url);
+      return new Float32Array(arrayBuffer);
+    }
+
     const gzUrl = url + '.gz';
     try {
       // Try to get the .gz file URL - this will throw if file doesn't exist
@@ -241,19 +233,22 @@ export async function loadPointsBinary(url) {
   // resolve the protocol first, then try .gz version
   const gzUrl = url + '.gz';
   try {
+    if (!supportsGzip) {
+      throw new Error('Gzip decompression not supported');
+    }
     // Resolve custom protocol (if any) before fetching
     const resolvedGzUrl = await resolveAnyUrl(gzUrl);
     const response = await fetch(resolvedGzUrl);
     if (response.ok) {
       console.log('Found compressed points file:', gzUrl);
       // Gzip version exists, decompress it
-      if (typeof DecompressionStream !== 'undefined') {
+      if (HAS_DECOMPRESSION_STREAM) {
         const ds = new DecompressionStream('gzip');
         const decompressedStream = response.body.pipeThrough(ds);
         const decompressedResponse = new Response(decompressedStream);
         const arrayBuffer = await decompressedResponse.arrayBuffer();
         return new Float32Array(arrayBuffer);
-      } else if (typeof pako !== 'undefined') {
+      } else if (HAS_PAKO) {
         const compressedBuffer = await response.arrayBuffer();
         const decompressed = pako.inflate(new Uint8Array(compressedBuffer));
         return new Float32Array(decompressed.buffer);

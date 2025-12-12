@@ -383,101 +383,98 @@ body.dock-resizing * {
   inset: 0;
   pointer-events: none;
   z-index: 90;
-  /* GPU layer for all floating panels - compositor hint */
   transform: translateZ(0);
   contain: layout style;
-  /* Isolation creates new stacking context */
   isolation: isolate;
 }
 
+/* REDESIGNED: Floating panel with proper scroll containment */
 .accordion-section.accordion-floating {
   pointer-events: auto;
   position: fixed;
   max-width: calc(100vw - 16px);
-  max-height: calc(100vh - 16px);
   font-size: 13px;
   color: var(--viewer-ink);
+  /* CRITICAL: Use flex column for proper content sizing */
   display: flex;
   flex-direction: column;
+  /* CRITICAL: overflow hidden on container, scroll on content */
   overflow: hidden;
   border: var(--viewer-border-strong);
   background: var(--viewer-paper);
-  /* Match sidebar section shadow exactly */
   box-shadow: var(--viewer-shadow);
-  /* GPU optimizations - create compositor layer */
   contain: layout style;
   transform: translateZ(0);
   backface-visibility: hidden;
   -webkit-backface-visibility: hidden;
-  /* Optimize text rendering during transforms */
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  /* Enable hardware acceleration for all transforms */
-  transform-style: preserve-3d;
 }
 
 .accordion-section.accordion-floating .accordion-dock-btn {
   display: inline-flex;
 }
 
+.accordion-section.accordion-floating > summary {
+  flex: 0 0 auto;
+}
+
+/* REDESIGNED: Floating panel content with explicit scroll containment */
 .accordion-section.accordion-floating .accordion-content {
+  /* Let JS set max-height for proper containment */
   flex: 1 1 auto;
   min-height: 0;
-  overflow-y: auto;
-  overflow-x: hidden;
+  box-sizing: border-box;
+  /* Scroll is enabled via inline styles from JS */
   background: var(--viewer-paper);
-  /* Ensure scrollbar is always available when needed */
-  scrollbar-gutter: stable;
-  /* GPU optimization for scrolling - use compositor layer */
-  transform: translateZ(0);
-  -webkit-overflow-scrolling: touch;
-  /* Contain paint for better performance */
-  contain: paint;
-  /* Smooth scroll behavior */
-  scroll-behavior: smooth;
-}
-
-/* Force scrollbar visibility when content is tall (height > 500px clamped) */
-.accordion-section.accordion-floating .accordion-content.needs-scroll {
-  overflow-y: scroll;
-  /* Make scrollbar always visible on capable browsers */
+  /* Native scrollbar styling */
   scrollbar-width: thin;
-  scrollbar-color: rgba(0, 0, 0, 0.3) rgba(0, 0, 0, 0.05);
+  scrollbar-color: rgba(0, 0, 0, 0.4) rgba(0, 0, 0, 0.1);
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
 }
 
-/* Max height constraint for floating panel content - enables scrolling */
-.accordion-section.accordion-floating .accordion-content {
-  max-height: calc(100% - 40px); /* Account for summary header height */
-}
-
-/* Scrollbar styling for floating panels */
+/* WebKit scrollbar styling - more visible */
 .accordion-section.accordion-floating .accordion-content::-webkit-scrollbar {
   width: 10px;
+  height: 10px;
 }
 
 .accordion-section.accordion-floating .accordion-content::-webkit-scrollbar-track {
-  background: rgba(0, 0, 0, 0.05);
+  background: rgba(0, 0, 0, 0.08);
   border-radius: 5px;
+  margin: 4px;
 }
 
 .accordion-section.accordion-floating .accordion-content::-webkit-scrollbar-thumb {
-  background: rgba(0, 0, 0, 0.25);
+  background: rgba(0, 0, 0, 0.35);
   border-radius: 5px;
   border: 2px solid transparent;
   background-clip: padding-box;
+  min-height: 40px;
 }
 
 .accordion-section.accordion-floating .accordion-content::-webkit-scrollbar-thumb:hover {
-  background: rgba(0, 0, 0, 0.4);
-  background-clip: padding-box;
-}
-
-.accordion-section.accordion-floating .accordion-content::-webkit-scrollbar-thumb:active {
   background: rgba(0, 0, 0, 0.5);
   background-clip: padding-box;
 }
 
-/* Fix collapsed state in floating mode - hide content properly */
+.accordion-section.accordion-floating .accordion-content::-webkit-scrollbar-thumb:active {
+  background: rgba(0, 0, 0, 0.6);
+  background-clip: padding-box;
+}
+
+/* Force scrollbar visibility when content overflows */
+.accordion-section.accordion-floating .accordion-content.has-overflow {
+  overflow-y: scroll !important;
+}
+
+/* Keep content visible during drag */
+.accordion-section.accordion-floating.dragging .accordion-content {
+  pointer-events: none;
+}
+
+/* Fix collapsed state in floating mode */
 .accordion-section.accordion-floating:not([open]) {
   height: auto !important;
 }
@@ -491,30 +488,7 @@ body.dock-dragging,
 body.dock-resizing {
   user-select: none !important;
   -webkit-user-select: none !important;
-  /* Prevent any layout shifts during drag */
   overflow-anchor: none;
-  /* Prevent scroll during drag */
-  overflow: hidden;
-  /* Hint to browser about heavy compositing */
-  will-change: auto;
-}
-
-body.dock-dragging *,
-body.dock-resizing * {
-  cursor: inherit !important;
-}
-
-/* Disable expensive operations on entire page during drag */
-body.dock-dragging > *:not(#floating-panels-root) {
-  pointer-events: none;
-  /* Reduce paint complexity on non-dragged elements */
-  opacity: 0.999; /* Force compositor layer without visible change */
-}
-
-/* Freeze sidebar during drag to prevent any reflow */
-body.dock-dragging #sidebar {
-  contain: strict;
-  content-visibility: auto;
 }
 
 body.dock-dragging {
@@ -525,63 +499,31 @@ body.dock-resizing {
   cursor: ew-resize !important;
 }
 
-/* GPU layer preparation - applied on pointerdown before drag starts */
-.accordion-section.accordion-floating.drag-prepared,
-.accordion-section.drag-prepared {
-  /* Force GPU compositor layer creation */
-  will-change: transform;
-  /* Isolate from rest of document - prevents layout propagation */
-  isolation: isolate;
-  /* Hint to browser this element will be transformed */
-  transform: translateZ(0);
-  backface-visibility: hidden;
-  -webkit-backface-visibility: hidden;
+/* During drag, floating root becomes interaction shield */
+#floating-panels-root.drag-overlay-active {
+  pointer-events: auto;
+  cursor: grabbing;
 }
 
-/* Freeze content during drag for maximum performance */
-.accordion-section.accordion-floating.drag-prepared .accordion-content,
-.accordion-section.drag-prepared .accordion-content {
-  /* Completely hide content during drag - skip all rendering */
-  content-visibility: hidden;
-  contain-intrinsic-size: auto 300px;
-  /* Disable pointer events on content - reduces hit testing overhead */
-  pointer-events: none;
-  /* Prevent any scroll during drag */
-  overflow: hidden !important;
-}
-
+/* REDESIGNED: Dragging state - GPU optimized with proper containment */
 .accordion-section.accordion-floating.dragging {
-  /* Disable all transitions and animations during drag */
   transition: none !important;
   animation: none !important;
-  /* Slightly larger shadow while dragging - paper lifted effect */
+  /* Elevated shadow while dragging */
   box-shadow: 8px 8px 0 rgba(0, 0, 0, 0.15);
   opacity: 0.95;
-  /* Full containment during drag for performance */
-  contain: strict;
-  /* GPU compositing hints - force hardware acceleration */
-  transform-style: preserve-3d;
-  perspective: 1000px;
+  contain: layout style;
+  will-change: transform;
   backface-visibility: hidden;
   -webkit-backface-visibility: hidden;
-  /* Prevent any reflow from affecting this element */
+  /* Keep overflow hidden - content is already constrained */
   overflow: hidden;
-}
-
-/* Disable all child transitions during drag for smooth 60fps */
-.accordion-section.accordion-floating.dragging *,
-.accordion-section.accordion-floating.dragging *::before,
-.accordion-section.accordion-floating.dragging *::after {
-  transition: none !important;
-  animation: none !important;
-  /* Disable pointer events on all children */
-  pointer-events: none !important;
 }
 
 .accordion-section.accordion-floating.resizing {
   transition: none !important;
   animation: none !important;
-  contain: strict;
+  contain: layout style;
 }
 
 /* Bottom-right corner resize handle - hidden, using width handle instead */
@@ -624,63 +566,124 @@ body.dock-resizing {
   display: block;
 }
 
-/* Detach/attach animations - paper lifting aesthetic with GPU acceleration */
-.accordion-section.floating-enter {
-  animation: accordion-float-in 0.2s cubic-bezier(0.22, 1, 0.36, 1);
-  /* Force GPU layer during animation */
-  will-change: transform, opacity;
-  backface-visibility: hidden;
+/* Keep the resize grab area off the scrollbars (header-only). */
+.accordion-section.accordion-floating .accordion-width-handle {
+  bottom: auto;
+  height: 40px;
 }
 
-@keyframes accordion-float-in {
+/* ═══════════════════════════════════════════════════════════════════════════ */
+/* Detach/Attach Animations - Sharp, minimal, paper-lifting aesthetic          */
+/* ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Undock animation - panel lifts off with subtle scale and shadow */
+@keyframes undock-lift {
   0% {
-    opacity: 0.85;
-    transform: translate3d(0, 0, 0) scale(0.97);
+    opacity: 0.6;
+    transform: translateZ(0) scale(0.96);
+    box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.05);
   }
   100% {
     opacity: 1;
-    transform: translate3d(0, 0, 0) scale(1);
+    transform: translateZ(0) scale(1);
+    box-shadow: 4px 4px 0 rgba(0, 0, 0, 0.1);
   }
 }
 
-.accordion-section.dock-flash {
-  animation: accordion-dock-flash 0.25s cubic-bezier(0.22, 1, 0.36, 1);
-  /* Force GPU layer during animation */
-  will-change: transform, box-shadow;
-  backface-visibility: hidden;
-}
-
-@keyframes accordion-dock-flash {
+/* Dock animation - panel settles back with quick fade */
+@keyframes dock-settle {
   0% {
-    transform: scale(1.015);
-    box-shadow: 0 0 0 2px rgba(14, 165, 233, 0.6), var(--viewer-shadow);
-  }
-  50% {
-    box-shadow: 0 0 0 2px rgba(14, 165, 233, 0.3), var(--viewer-shadow);
+    opacity: 0;
+    transform: scale(1.03);
+    box-shadow: 6px 6px 0 rgba(0, 0, 0, 0.12);
   }
   100% {
+    opacity: 1;
     transform: scale(1);
-    box-shadow: 0 0 0 0 rgba(14, 165, 233, 0), var(--viewer-shadow);
+    box-shadow: var(--viewer-shadow);
   }
 }
 
+.accordion-section.floating-enter {
+  animation: undock-lift 160ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.accordion-section.dock-settle {
+  animation: dock-settle 140ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* Dock zone indicators - design-consistent dark gray */
 #sidebar.dock-drop-active {
-  outline: 2px dashed rgba(14, 165, 233, 0.5);
+  outline: 2px dashed #111827;
   outline-offset: 4px;
   transition: outline-color 0.15s ease, outline-offset 0.15s ease, background 0.15s ease;
 }
 
 #sidebar.dock-drop-hover {
-  outline: 3px solid var(--highlight-accent-strong);
+  outline: 2px solid #111827;
   outline-offset: 2px;
-  background: rgba(14, 165, 233, 0.03);
+  background: rgba(17, 24, 39, 0.03);
 }
 
-/* Placeholder to prevent sidebar reflow during undock */
+/* ═══════════════════════════════════════════════════════════════════════════ */
+/* Drag Ghost - lightweight preview element for zero-lag dragging              */
+/* ═══════════════════════════════════════════════════════════════════════════ */
+
+.drag-ghost {
+  position: fixed;
+  pointer-events: none;
+  z-index: 9999;
+  background: #ffffff;
+  border: 1px solid #111827;
+  box-shadow: 4px 4px 0 rgba(0, 0, 0, 0.12);
+  font-family: "Oswald", system-ui, sans-serif;
+  font-weight: 500;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  color: #111827;
+  padding: 8px 12px;
+  /* GPU accelerated */
+  will-change: transform, box-shadow, border-width;
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+  /* Smooth transitions for state changes */
+  transition: box-shadow 120ms ease-out, border-width 120ms ease-out;
+}
+
+/* Ghost elevates when outside detach zone - smooth lift effect */
+.drag-ghost.will-detach {
+  border-width: 2px;
+  box-shadow: 8px 8px 0 rgba(0, 0, 0, 0.18);
+}
+
+/* Original element dimmed while being dragged - smooth fade */
+.accordion-section.drag-source {
+  opacity: 0.3;
+  outline: 2px dashed #111827;
+  outline-offset: -2px;
+  transition: opacity 100ms ease-out;
+}
+
+/* Placeholder to prevent sidebar reflow during undock - GPU optimized */
 .accordion-dock-placeholder {
   box-sizing: border-box;
   pointer-events: none;
-  /* Placeholder is invisible but maintains height during undock */
+  /* Invisible but maintains height during undock */
+  contain: strict;
+  /* Prevent any visual rendering */
+  visibility: hidden;
+}
+
+/* Optimize sidebar during drag - disable transitions and contain layout */
+body.dock-dragging .sidebar-scroll {
+  /* Strict containment during drag prevents reflow propagation */
+  contain: strict;
+}
+
+body.dock-dragging .accordion-section:not(.accordion-floating) {
+  /* Disable transitions on docked sections during drag */
+  transition: none !important;
 }
 
 .accordion-section summary:hover {
@@ -2372,40 +2375,54 @@ body.dock-resizing {
   margin-top: 4px;
 }
 
+/* Benchmark buttons - matching reset-btn design */
 .benchmark-preset,
 .btn-small {
+  font-family: "Oswald", system-ui, sans-serif;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  border-radius: var(--viewer-radius-pill);
   padding: 6px 10px;
-  font-size: 11px;
-  font-weight: 600;
-  background: #f5f5f5;
-  border: 1px solid #d4d4d4;
-  border-radius: 4px;
+  border: 1px solid #111827;
+  background: #f9fafb;
+  color: #111827;
   cursor: pointer;
-  transition: all 0.15s ease;
-  color: #333;
+  box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.2);
+  transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease, border-color 0.15s ease;
 }
 
 .benchmark-preset:hover,
 .btn-small:hover {
-  background: #e5e5e5;
-  border-color: #999;
+  background: #e5e7eb;
+  transform: translate(-1px, -1px);
+  box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.25);
 }
 
 .benchmark-preset:active,
 .btn-small:active {
-  transform: scale(0.98);
+  transform: translate(0, 0);
+  box-shadow: 1px 1px 0 rgba(0, 0, 0, 0.2);
+  background: #d1d5db;
 }
 
+/* Primary action button (Load Synthetic Data) */
 #benchmark-run {
-  background: linear-gradient(135deg, #4f8cff 0%, #3366cc 100%);
-  color: #fff;
-  border: none;
-  font-weight: 600;
+  background: #111827;
+  color: #f9fafb;
+  border: 1px solid #111827;
 }
 
 #benchmark-run:hover {
-  background: linear-gradient(135deg, #3d7aed 0%, #2255bb 100%);
-  box-shadow: 0 2px 8px rgba(79, 140, 255, 0.3);
+  background: #1f2937;
+  transform: translate(-1px, -1px);
+  box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.25);
+}
+
+#benchmark-run:active {
+  transform: translate(0, 0);
+  box-shadow: 1px 1px 0 rgba(0, 0, 0, 0.2);
+  background: #374151;
 }
 
 #benchmark-stats {
@@ -2413,16 +2430,23 @@ body.dock-resizing {
   border: 1px solid #e5e7eb;
 }
 
+/* Secondary action button (Copy situation report) */
 #benchmark-report-btn {
-  background: linear-gradient(135deg, #111827 0%, #1f2937 100%);
-  color: #fff;
-  border: none;
-  font-weight: 600;
+  background: #f9fafb;
+  color: #111827;
+  border: 1px solid #111827;
 }
 
 #benchmark-report-btn:hover {
-  background: linear-gradient(135deg, #0b1220 0%, #111827 100%);
-  box-shadow: 0 2px 8px rgba(17, 24, 39, 0.3);
+  background: #e5e7eb;
+  transform: translate(-1px, -1px);
+  box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.25);
+}
+
+#benchmark-report-btn:active {
+  transform: translate(0, 0);
+  box-shadow: 1px 1px 0 rgba(0, 0, 0, 0.2);
+  background: #d1d5db;
 }
 
 #benchmark-report-output {
