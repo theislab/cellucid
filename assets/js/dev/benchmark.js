@@ -6,13 +6,13 @@
  *
  * Uses HighPerfRenderer (WebGL2) for all benchmarking:
  * - Interleaved vertex buffers
- * - Level-of-Detail (LOD) with octree
+ * - Level-of-Detail (LOD) with spatial index
  * - Frustum culling
  * - Lightweight shaders
  * - GPU-only fog
  */
 
-import { HighPerfRenderer, RendererConfig, Octree } from '../rendering/high-perf-renderer.js';
+import { HighPerfRenderer, RendererConfig } from '../rendering/high-perf-renderer.js';
 import { formatCellCount as formatNumber } from '../data/data-source.js';
 
 /**
@@ -47,7 +47,8 @@ export class HighPerfBenchmark {
       useFrustumCulling: false,
       useInterleavedBuffers: true,
       shaderQuality: 'full',
-      forceLODLevel: -1  // -1 = auto
+      forceLODLevel: -1,  // -1 = auto
+      dimensionLevel: 3   // 1=1D, 2=2D, 3=3D
     };
   }
   
@@ -80,15 +81,21 @@ export class HighPerfBenchmark {
   
   /**
    * Load data into the high-performance renderer
+   * @param {Float32Array} positions - Position data (n * 3)
+   * @param {Uint8Array} colors - Color data (RGBA)
+   * @param {number} [dimensionLevel] - Optional dimension level override (1, 2, or 3)
    */
-  loadData(positions, colors) {
+  loadData(positions, colors, dimensionLevel = undefined) {
     if (!this.renderer) {
       this.init();
     }
 
+    const dimLevel = dimensionLevel ?? this.config.dimensionLevel;
+
     // Alpha is packed in colors as RGBA uint8 - no separate array needed
     const stats = this.renderer.loadData(positions, colors, {
-      buildOctree: this.config.useLOD
+      buildSpatialIndex: this.config.useLOD,
+      dimensionLevel: dimLevel
     });
 
     console.log('[HighPerfBenchmark] Data loaded:', stats);
@@ -164,13 +171,15 @@ export class HighPerfBenchmark {
    * Get LOD level information
    */
   getLODInfo() {
-    if (!this.renderer || !this.renderer.octree) {
+    const dimLevel = this.renderer?.currentDimensionLevel ?? this.config.dimensionLevel;
+    if (!this.renderer || !this.renderer.hasSpatialIndex(dimLevel)) {
       return null;
     }
-    
+
+    const lodBuffers = this.renderer.getLodBuffersForDimension(dimLevel);
     return {
-      levelCount: this.renderer.getLODLevelCount(),
-      levels: this.renderer.lodBuffers.map((lod, i) => ({
+      levelCount: this.renderer.getLODLevelCount(dimLevel),
+      levels: lodBuffers.map((lod, i) => ({
         level: i,
         pointCount: lod.pointCount,
         depth: lod.depth
@@ -629,7 +638,7 @@ export class SyntheticDataGenerator {
 
     const elapsed = performance.now() - startTime;
     console.log(`Generated in ${elapsed.toFixed(0)}ms`);
-    return { positions, colors };
+    return { positions, colors, dimensionLevel: 3 };
   }
 
   /**
@@ -732,7 +741,7 @@ export class SyntheticDataGenerator {
 
     const elapsed = performance.now() - startTime;
     console.log(`Generated in ${elapsed.toFixed(0)}ms`);
-    return { positions, colors };
+    return { positions, colors, dimensionLevel: 3 };
   }
 
   /**
@@ -850,7 +859,7 @@ export class SyntheticDataGenerator {
 
     const elapsed = performance.now() - startTime;
     console.log(`Generated in ${elapsed.toFixed(0)}ms`);
-    return { positions, colors };
+    return { positions, colors, dimensionLevel: 2 };
   }
 
   /**
@@ -1064,7 +1073,7 @@ export class SyntheticDataGenerator {
 
     const elapsed = performance.now() - startTime;
     console.log(`Generated in ${elapsed.toFixed(0)}ms`);
-    return { positions, colors };
+    return { positions, colors, dimensionLevel: 3 };
   }
 
   /**
@@ -1156,7 +1165,7 @@ export class SyntheticDataGenerator {
     const elapsed = performance.now() - startTime;
     console.log(`Generated in ${elapsed.toFixed(0)}ms`);
 
-    return { positions, colors };
+    return { positions, colors, dimensionLevel: 3 };
   }
 
   /**
@@ -1186,14 +1195,14 @@ export class SyntheticDataGenerator {
     const elapsed = performance.now() - startTime;
     console.log(`Generated in ${elapsed.toFixed(0)}ms`);
 
-    return { positions, colors };
+    return { positions, colors, dimensionLevel: 3 };
   }
-  
+
   /**
    * Generate points by sampling from a GLB mesh surface
    * @param {number} count - Number of points to generate
    * @param {ArrayBuffer} glbBuffer - The loaded GLB file as ArrayBuffer
-   * @returns {Object} - { positions: Float32Array, colors: Uint8Array (RGBA) }
+   * @returns {Object} - { positions: Float32Array, colors: Uint8Array (RGBA), dimensionLevel: number }
    */
   static fromGLB(count, glbBuffer) {
     console.log(`[GLB] Sampling ${count.toLocaleString()} points from GLB mesh...`);
@@ -1271,14 +1280,14 @@ export class SyntheticDataGenerator {
     const elapsed = performance.now() - startTime;
     console.log(`[GLB] Done! Sampled ${count.toLocaleString()} points in ${elapsed.toFixed(0)}ms`);
 
-    return { positions, colors };
+    return { positions, colors, dimensionLevel: 3 };
   }
 
   /**
    * Load GLB file from URL and sample points
    * @param {number} count - Number of points to generate
    * @param {string} url - URL to the GLB file
-   * @returns {Promise<Object>} - { positions: Float32Array, colors: Uint8Array (RGBA) }
+   * @returns {Promise<Object>} - { positions: Float32Array, colors: Uint8Array (RGBA), dimensionLevel: number }
    */
   static async fromGLBUrl(count, url = 'assets/img/kemal-inecik.glb') {
     const resolvedUrl = typeof window !== 'undefined'

@@ -321,17 +321,21 @@ class DimensionManager {
 
   /**
    * Get dimension info for UI display
-   * @returns {Object[]} Array of {dim, label, available, loaded}
+   * @returns {Object[]} Array of {dim, label, available, loaded, isDefault, notImplemented}
    */
   getDimensionInfo() {
-    return [1, 2, 3, 4].map(dim => ({
-      dim,
-      label: `${dim}D`,
-      available: this.hasDimension(dim),
-      loaded: this.isLoaded(dim),
-      isDefault: dim === this.defaultDimension,
-      notImplemented: dim === 4
-    }));
+    return [1, 2, 3, 4].map(dim => {
+      const notImplemented = dim === 4;
+      return {
+        dim,
+        label: `${dim}D`,
+        // 4D is not available until implemented, even if data exists
+        available: notImplemented ? false : this.hasDimension(dim),
+        loaded: this.isLoaded(dim),
+        isDefault: dim === this.defaultDimension,
+        notImplemented
+      };
+    });
   }
 }
 

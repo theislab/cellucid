@@ -14,8 +14,6 @@ import {
 } from '../data/palettes.js';
 
 const NEUTRAL_GRAY_UINT8 = 211; // lightgray default when no field is selected (0-255)
-const NEUTRAL_GRAY = NEUTRAL_GRAY_UINT8 / 255; // normalized for legacy compatibility
-const NEUTRAL_RGB = [NEUTRAL_GRAY, NEUTRAL_GRAY, NEUTRAL_GRAY];
 
 export function createDataState({ viewer, labelLayer }) {
   return new DataState(viewer, labelLayer);
@@ -65,7 +63,7 @@ class DataState {
     this.highlightPages = []; // Array of { id, name, highlightedGroups: [] }
     this.activePageId = null; // Currently active page ID
     this._highlightPageIdCounter = 0;
-    this.highlightArray = null; // Uint8Array per-point highlight intensity (0-255)
+    this.highlightArray = new Uint8Array(0); // Uint8Array per-point highlight intensity (0-255)
     this._highlightIdCounter = 0;
     this._highlightChangeCallbacks = new Set();
     this._highlightPageChangeCallbacks = new Set(); // Callbacks when pages change (add/remove/rename/switch)
@@ -75,6 +73,7 @@ class DataState {
 
     // Batch mode: suppresses expensive recomputations during bulk filter restoration
     this._batchMode = false;
+    this._batchDepth = 0; // Track nested batch calls
     this._batchDirty = { visibility: false, colors: false, affectedFields: new Set() };
   }
 
@@ -85,8 +84,11 @@ class DataState {
    * Call endBatch() when done to apply all changes in a single recompute.
    */
   beginBatch() {
-    this._batchMode = true;
-    this._batchDirty = { visibility: false, colors: false, affectedFields: new Set() };
+    this._batchDepth++;
+    if (this._batchDepth === 1) {
+      this._batchMode = true;
+      this._batchDirty = { visibility: false, colors: false, affectedFields: new Set() };
+    }
   }
 
   /**
@@ -94,7 +96,9 @@ class DataState {
    * Reapplies colors for affected fields and recomputes global visibility once.
    */
   endBatch() {
-    if (!this._batchMode) return;
+    if (this._batchDepth <= 0) return;
+    this._batchDepth--;
+    if (this._batchDepth > 0) return; // Still nested, don't flush yet
     this._batchMode = false;
 
     // Reapply colors for all affected fields (handles color array updates)
@@ -220,43 +224,47 @@ class DataState {
 
           // Rebuild centroids for the new dimension
           // IMPORTANT: Temporarily set activeDimensionLevel so buildCentroidsForField uses correct dimension
+          // Use try/finally to guarantee restoration even if an exception occurs
           const savedDimLevel = this.activeDimensionLevel;
           this.activeDimensionLevel = level;
-          // Use getFieldForView to get live's field, NOT getActiveField which returns active view's field
-          const liveField = this.getFieldForView('live');
-          if (liveField && liveField.kind === 'category') {
-            this.buildCentroidsForField(liveField, { viewId: 'live' });
-            // Push directly to live view's centroid buffers (don't use _pushCentroidsToViewer
-            // which checks activeViewId and might push to wrong view)
-            if (this.viewer) {
-              this.viewer.setCentroids({
-                positions: this.centroidPositions || new Float32Array(),
-                colors: this.centroidColors || new Uint8Array(),
-                outlierQuantiles: this.centroidOutliers || new Float32Array()
-              });
-              if (this.viewer.setCentroidLabels) {
-                this.viewer.setCentroidLabels(this.centroidLabels, 'live');
+          try {
+            // Use getFieldForView to get live's field, NOT getActiveField which returns active view's field
+            const liveField = this.getFieldForView('live');
+            if (liveField && liveField.kind === 'category') {
+              this.buildCentroidsForField(liveField, { viewId: 'live' });
+              // Push directly to live view's centroid buffers (don't use _pushCentroidsToViewer
+              // which checks activeViewId and might push to wrong view)
+              if (this.viewer) {
+                this.viewer.setCentroids({
+                  positions: this.centroidPositions || new Float32Array(),
+                  colors: this.centroidColors || new Uint8Array(),
+                  outlierQuantiles: this.centroidOutliers || new Float32Array()
+                });
+                if (this.viewer.setCentroidLabels) {
+                  this.viewer.setCentroidLabels(this.centroidLabels, 'live');
+                }
+              }
+              // Save centroids to live view's context (consistent with snapshot handling)
+              if (ctx) {
+                ctx.centroidPositions = this.centroidPositions ? new Float32Array(this.centroidPositions) : null;
+                ctx.centroidColors = this.centroidColors ? new Uint8Array(this.centroidColors) : null;
+                ctx.centroidOutliers = this.centroidOutliers ? new Float32Array(this.centroidOutliers) : null;
+                ctx.centroidLabels = this.centroidLabels ? this.centroidLabels.map(c => c ? { ...c } : c) : [];
               }
             }
-            // Save centroids to live view's context (consistent with snapshot handling)
-            if (ctx) {
-              ctx.centroidPositions = this.centroidPositions ? new Float32Array(this.centroidPositions) : null;
-              ctx.centroidColors = this.centroidColors ? new Uint8Array(this.centroidColors) : null;
-              ctx.centroidOutliers = this.centroidOutliers ? new Float32Array(this.centroidOutliers) : null;
-              ctx.centroidLabels = this.centroidLabels ? this.centroidLabels.map(c => c ? { ...c } : c) : [];
-            }
-          }
-          // Restore if live wasn't active (but keep if it was, which was already set above)
-          if (!isActiveView) {
-            this.activeDimensionLevel = savedDimLevel;
-            // IMPORTANT: Restore active view's centroid state since buildCentroidsForField
-            // overwrote it with live's data
-            const activeCtx = this.viewContexts.get(String(this.activeViewId));
-            if (activeCtx) {
-              this.centroidPositions = activeCtx.centroidPositions ? new Float32Array(activeCtx.centroidPositions) : null;
-              this.centroidColors = activeCtx.centroidColors ? new Uint8Array(activeCtx.centroidColors) : null;
-              this.centroidOutliers = activeCtx.centroidOutliers ? new Float32Array(activeCtx.centroidOutliers) : null;
-              this.centroidLabels = activeCtx.centroidLabels || [];
+          } finally {
+            // Restore if live wasn't active (but keep if it was, which was already set above)
+            if (!isActiveView) {
+              this.activeDimensionLevel = savedDimLevel;
+              // IMPORTANT: Restore active view's centroid state since buildCentroidsForField
+              // overwrote it with live's data
+              const activeCtx = this.viewContexts.get(String(this.activeViewId));
+              if (activeCtx) {
+                this.centroidPositions = activeCtx.centroidPositions ? new Float32Array(activeCtx.centroidPositions) : null;
+                this.centroidColors = activeCtx.centroidColors ? new Uint8Array(activeCtx.centroidColors) : null;
+                this.centroidOutliers = activeCtx.centroidOutliers ? new Float32Array(activeCtx.centroidOutliers) : null;
+                this.centroidLabels = activeCtx.centroidLabels || [];
+              }
             }
           }
         } else {
@@ -268,46 +276,48 @@ class DataState {
 
           // Rebuild centroids for this snapshot view using its new dimension
           // We need to temporarily set activeDimensionLevel for buildCentroidsForField
+          // Use try/finally to guarantee restoration even if an exception occurs
           const savedDimLevel = this.activeDimensionLevel;
           this.activeDimensionLevel = level;
-
-          // Get the field for this snapshot view from its context
-          const snapshotField = this.getFieldForView(targetViewId);
-          if (snapshotField && snapshotField.kind === 'category') {
-            this.buildCentroidsForField(snapshotField, { viewId: targetViewId });
-            // Update the snapshot's centroid data in viewer
-            if (this.viewer.updateSnapshotAttributes) {
-              this.viewer.updateSnapshotAttributes(targetViewId, {
-                centroidPositions: this.centroidPositions || new Float32Array(),
-                centroidColors: this.centroidColors || new Uint8Array(),
-                centroidOutliers: this.centroidOutliers || new Float32Array()
-              });
+          try {
+            // Get the field for this snapshot view from its context
+            const snapshotField = this.getFieldForView(targetViewId);
+            if (snapshotField && snapshotField.kind === 'category') {
+              this.buildCentroidsForField(snapshotField, { viewId: targetViewId });
+              // Update the snapshot's centroid data in viewer
+              if (this.viewer.updateSnapshotAttributes) {
+                this.viewer.updateSnapshotAttributes(targetViewId, {
+                  centroidPositions: this.centroidPositions || new Float32Array(),
+                  centroidColors: this.centroidColors || new Uint8Array(),
+                  centroidOutliers: this.centroidOutliers || new Float32Array()
+                });
+              }
+              // Update centroid labels for this view
+              if (this.viewer.setCentroidLabels) {
+                this.viewer.setCentroidLabels(this.centroidLabels, targetViewId);
+              }
+              // Also save centroids to the view's context
+              if (ctx) {
+                ctx.centroidPositions = this.centroidPositions ? new Float32Array(this.centroidPositions) : null;
+                ctx.centroidColors = this.centroidColors ? new Uint8Array(this.centroidColors) : null;
+                ctx.centroidOutliers = this.centroidOutliers ? new Float32Array(this.centroidOutliers) : null;
+                ctx.centroidLabels = this.centroidLabels ? this.centroidLabels.map(c => c ? { ...c } : c) : [];
+              }
             }
-            // Update centroid labels for this view
-            if (this.viewer.setCentroidLabels) {
-              this.viewer.setCentroidLabels(this.centroidLabels, targetViewId);
-            }
-            // Also save centroids to the view's context
-            if (ctx) {
-              ctx.centroidPositions = this.centroidPositions ? new Float32Array(this.centroidPositions) : null;
-              ctx.centroidColors = this.centroidColors ? new Uint8Array(this.centroidColors) : null;
-              ctx.centroidOutliers = this.centroidOutliers ? new Float32Array(this.centroidOutliers) : null;
-              ctx.centroidLabels = this.centroidLabels ? this.centroidLabels.map(c => c ? { ...c } : c) : [];
-            }
-          }
+          } finally {
+            // Restore activeDimensionLevel
+            this.activeDimensionLevel = savedDimLevel;
 
-          // Restore activeDimensionLevel
-          this.activeDimensionLevel = savedDimLevel;
-
-          // IMPORTANT: If this snapshot is not the active view, restore active view's centroid state
-          // since buildCentroidsForField overwrote it with snapshot's data
-          if (!isActiveView) {
-            const activeCtx = this.viewContexts.get(String(this.activeViewId));
-            if (activeCtx) {
-              this.centroidPositions = activeCtx.centroidPositions ? new Float32Array(activeCtx.centroidPositions) : null;
-              this.centroidColors = activeCtx.centroidColors ? new Uint8Array(activeCtx.centroidColors) : null;
-              this.centroidOutliers = activeCtx.centroidOutliers ? new Float32Array(activeCtx.centroidOutliers) : null;
-              this.centroidLabels = activeCtx.centroidLabels || [];
+            // IMPORTANT: If this snapshot is not the active view, restore active view's centroid state
+            // since buildCentroidsForField overwrote it with snapshot's data
+            if (!isActiveView) {
+              const activeCtx = this.viewContexts.get(String(this.activeViewId));
+              if (activeCtx) {
+                this.centroidPositions = activeCtx.centroidPositions ? new Float32Array(activeCtx.centroidPositions) : null;
+                this.centroidColors = activeCtx.centroidColors ? new Uint8Array(activeCtx.centroidColors) : null;
+                this.centroidOutliers = activeCtx.centroidOutliers ? new Float32Array(activeCtx.centroidOutliers) : null;
+                this.centroidLabels = activeCtx.centroidLabels || [];
+              }
             }
           }
         }
@@ -551,19 +561,21 @@ class DataState {
   _syncActiveContext() {
     const ctx = this.viewContexts.get(String(this.activeViewId));
     if (!ctx) return;
-    ctx.obsData = this.obsData;
-    ctx.varData = this.varData;
+    // Clone obsData and varData to prevent shared mutation
+    ctx.obsData = this._cloneObsData(this.obsData);
+    ctx.varData = this._cloneVarData(this.varData);
     ctx.activeFieldIndex = this.activeFieldIndex;
     ctx.activeVarFieldIndex = this.activeVarFieldIndex;
     ctx.activeFieldSource = this.activeFieldSource;
-    ctx.colorsArray = this.colorsArray;
-    ctx.categoryTransparency = this.categoryTransparency;
-    ctx.outlierQuantilesArray = this.outlierQuantilesArray;
-    ctx.centroidPositions = this.centroidPositions;
-    ctx.centroidColors = this.centroidColors; // RGBA uint8
-    ctx.centroidOutliers = this.centroidOutliers;
-    ctx.centroidLabels = this.centroidLabels;
-    ctx.filteredCount = this.filteredCount;
+    // Clone arrays to prevent shared mutation between views
+    ctx.colorsArray = this.colorsArray ? new Uint8Array(this.colorsArray) : null;
+    ctx.categoryTransparency = this.categoryTransparency ? new Float32Array(this.categoryTransparency) : null;
+    ctx.outlierQuantilesArray = this.outlierQuantilesArray ? new Float32Array(this.outlierQuantilesArray) : null;
+    ctx.centroidPositions = this.centroidPositions ? new Float32Array(this.centroidPositions) : null;
+    ctx.centroidColors = this.centroidColors ? new Uint8Array(this.centroidColors) : null; // RGBA uint8
+    ctx.centroidOutliers = this.centroidOutliers ? new Float32Array(this.centroidOutliers) : null;
+    ctx.centroidLabels = this.centroidLabels ? [...this.centroidLabels] : [];
+    ctx.filteredCount = this.filteredCount ? { ...this.filteredCount } : { shown: 0, total: 0 };
     // Sync dimension level to context
     ctx.dimensionLevel = this.activeDimensionLevel;
   }
@@ -902,6 +914,17 @@ class DataState {
       transparency: new Float32Array()
     });
     this.viewer.setCentroidLabels([]);
+
+    // Reset highlight state on dataset reload
+    this.highlightPages = [];
+    this.activePageId = null;
+    this._highlightPageIdCounter = 0;
+    this.highlightArray = new Uint8Array(this.pointCount);
+    this._highlightIdCounter = 0;
+    this._cachedHighlightCount = null;
+    this._cachedTotalHighlightCount = null;
+    this._cachedHighlightLodLevel = null;
+
     this._resetViewContexts();
   }
 
@@ -1325,12 +1348,18 @@ class DataState {
     const threshold = this.getCurrentOutlierThreshold();
     const outliers = this.outlierQuantilesArray || [];
     const alpha = this.categoryTransparency || [];
+    // Check if outlier filter is enabled for the active field
+    const activeField = this.getActiveField();
+    const outlierFilterEnabled = activeField?._outlierFilterEnabled !== false;
     let shown = 0;
     for (let i = 0; i < total; i++) {
       const visible = (alpha[i] ?? 0) > 0.001;
       if (!visible) continue;
-      const q = outliers[i] ?? -1;
-      if (q >= 0 && q > threshold) continue;
+      // Only apply outlier filter if enabled
+      if (outlierFilterEnabled) {
+        const q = outliers[i] ?? -1;
+        if (q >= 0 && q > threshold) continue;
+      }
       shown++;
     }
     this.filteredCount = { shown, total };
@@ -1350,6 +1379,9 @@ class DataState {
     const alpha = this.categoryTransparency || [];
     const outliers = this.outlierQuantilesArray || [];
     const threshold = this.getCurrentOutlierThreshold();
+    // Check if outlier filter is enabled for the active field
+    const activeField = this.getActiveField();
+    const outlierFilterEnabled = activeField?._outlierFilterEnabled !== false;
     const n = Math.min(this.pointCount, codes.length);
     const fields = this.obsData?.fields || [];
     const targetIndex = fields.indexOf(field);
@@ -1424,7 +1456,8 @@ class DataState {
           }
         }
       }
-      if (baseVisible) {
+      // Only apply outlier filter if enabled
+      if (baseVisible && outlierFilterEnabled) {
         const q = outliers[i] ?? -1;
         if (q >= 0 && q > threshold) {
           baseVisible = false;
@@ -1435,8 +1468,11 @@ class DataState {
       // Current visibility already encoded in alpha + outliers
       const isVisibleNow = (alpha[i] ?? 0) > 0.001;
       if (!isVisibleNow) continue;
-      const qNow = outliers[i] ?? -1;
-      if (qNow >= 0 && qNow > threshold) continue;
+      // Only apply outlier filter if enabled
+      if (outlierFilterEnabled) {
+        const qNow = outliers[i] ?? -1;
+        if (qNow >= 0 && qNow > threshold) continue;
+      }
       visible[code]++;
     }
     const visibleTotal = visible.reduce((sum, v) => sum + v, 0);
@@ -1457,6 +1493,9 @@ class DataState {
     const targetValues = field.values || [];
     const outliers = this.outlierQuantilesArray || [];
     const threshold = this.getCurrentOutlierThreshold();
+    // Check if outlier filter is enabled for the active field
+    const activeField = this.getActiveField();
+    const outlierFilterEnabled = activeField?._outlierFilterEnabled !== false;
     let available = 0;
     let visible = 0;
 
@@ -1519,9 +1558,11 @@ class DataState {
       }
       if (!passes) continue;
 
-      // Outliers always apply (they are a separate filter type)
-      const q = outliers[i] ?? -1;
-      if (q >= 0 && q > threshold) continue;
+      // Outliers only apply if the outlier filter is enabled
+      if (outlierFilterEnabled) {
+        const q = outliers[i] ?? -1;
+        if (q >= 0 && q > threshold) continue;
+      }
 
       available++;
 
@@ -2212,12 +2253,17 @@ class DataState {
           }
         }
       }
-      // Apply outlier filter based on active field's threshold
+      // Apply outlier filter based on active field's threshold (only if enabled)
       if (visible && this.outlierQuantilesArray && this.outlierQuantilesArray.length > i) {
-        const q = this.outlierQuantilesArray[i];
-        const outlierThreshold = this.getCurrentOutlierThreshold();
-        if (q >= 0 && q > outlierThreshold) {
-          visible = false;
+        // Check if any outlier filter is enabled for the active field
+        const activeField = this.getActiveField();
+        const outlierFilterEnabled = activeField?._outlierFilterEnabled !== false;
+        if (outlierFilterEnabled) {
+          const q = this.outlierQuantilesArray[i];
+          const outlierThreshold = this.getCurrentOutlierThreshold();
+          if (q >= 0 && q > outlierThreshold) {
+            visible = false;
+          }
         }
       }
       this.categoryTransparency[i] = visible ? 1.0 : 0.0;
@@ -2265,6 +2311,7 @@ class DataState {
           filter.max >= stats.max - 1e-6;
         if (!fullRange) {
           const enabled = field._filterEnabled !== false; // default true
+          const disabledSuffix = enabled ? '' : ' (disabled)';
           filters.push({
             id: `obs-continuous-${fi}`,
             type: 'continuous',
@@ -2272,7 +2319,7 @@ class DataState {
             fieldIndex: fi,
             fieldKey: key,
             enabled: enabled,
-            text: `${key}: ${filter.min.toFixed(2)} – ${filter.max.toFixed(2)}`
+            text: `${key}: ${filter.min.toFixed(2)} – ${filter.max.toFixed(2)}${disabledSuffix}`
           });
         }
       }
@@ -2291,6 +2338,7 @@ class DataState {
           const enabled = field._categoryFilterEnabled !== false; // default true
           const preview = hiddenNames.slice(0, 4).join(', ');
           const extra = hiddenNames.length > 4 ? ` +${hiddenNames.length - 4} more` : '';
+          const disabledSuffix = enabled ? '' : ' (disabled)';
           filters.push({
             id: `obs-category-${fi}`,
             type: 'category',
@@ -2299,7 +2347,7 @@ class DataState {
             fieldKey: key,
             enabled: enabled,
             hiddenCount: hiddenNames.length,
-            text: `${key}: hiding ${preview}${extra}`
+            text: `${key}: hiding ${preview}${extra}${disabledSuffix}`
           });
         }
         
@@ -2309,6 +2357,7 @@ class DataState {
           if (threshold < 0.9999) {
             const enabled = field._outlierFilterEnabled !== false; // default true
             const pct = Math.round(threshold * 100);
+            const disabledSuffix = enabled ? '' : ' (disabled)';
             filters.push({
               id: `obs-outlier-${fi}`,
               type: 'outlier',
@@ -2316,7 +2365,7 @@ class DataState {
               fieldIndex: fi,
               fieldKey: key,
               enabled: enabled,
-              text: `${key}: outlier ≤ ${pct}%`
+              text: `${key}: outlier ≤ ${pct}%${disabledSuffix}`
             });
           }
         }
@@ -2339,6 +2388,7 @@ class DataState {
           filter.max >= stats.max - 1e-6;
         if (!fullRange) {
           const enabled = field._filterEnabled !== false; // default true
+          const disabledSuffix = enabled ? '' : ' (disabled)';
           filters.push({
             id: `var-continuous-${this.activeVarFieldIndex}`,
             type: 'continuous',
@@ -2346,12 +2396,12 @@ class DataState {
             fieldIndex: this.activeVarFieldIndex,
             fieldKey: field.key,
             enabled: enabled,
-            text: `${field.key}: ${filter.min.toFixed(2)} – ${filter.max.toFixed(2)}`
+            text: `${field.key}: ${filter.min.toFixed(2)} – ${filter.max.toFixed(2)}${disabledSuffix}`
           });
         }
       }
     }
-    
+
     return filters;
   }
 
@@ -2826,6 +2876,10 @@ class DataState {
     this._ensureHighlightArray();
     this._invalidateHighlightCountCache(); // Invalidate cached counts
     this.highlightArray.fill(0);
+
+    // Collect all highlighted indices as we go (avoids O(n) scan in renderer)
+    const allHighlightedIndices = [];
+
     for (const group of this.highlightedGroups) {
       // Skip disabled groups
       if (group.enabled === false) continue;
@@ -2834,16 +2888,21 @@ class DataState {
       for (let i = 0; i < indices.length; i++) {
         const idx = indices[i];
         if (idx >= 0 && idx < this.pointCount) {
-          this.highlightArray[idx] = 255;
+          // Only add if not already highlighted (avoid duplicates)
+          if (this.highlightArray[idx] === 0) {
+            this.highlightArray[idx] = 255;
+            allHighlightedIndices.push(idx);
+          }
         }
       }
     }
-    this._pushHighlightToViewer();
+
+    this._pushHighlightToViewer(allHighlightedIndices);
   }
 
-  _pushHighlightToViewer() {
+  _pushHighlightToViewer(highlightedIndices = null) {
     if (this.viewer && typeof this.viewer.updateHighlight === 'function') {
-      this.viewer.updateHighlight(this.highlightArray);
+      this.viewer.updateHighlight(this.highlightArray, highlightedIndices);
     }
   }
 
@@ -2906,24 +2965,31 @@ class DataState {
     this._ensureHighlightArray();
     // Start with existing permanent highlights
     this.highlightArray.fill(0);
+
+    // Collect all highlighted indices (avoids O(n) scan in renderer)
+    const allHighlightedIndices = [];
+
     for (const group of this.highlightedGroups) {
+      if (group.enabled === false) continue;
       const indices = group.cellIndices;
       if (!indices) continue;
       for (let i = 0; i < indices.length; i++) {
         const idx = indices[i];
-        if (idx >= 0 && idx < this.pointCount) {
+        if (idx >= 0 && idx < this.pointCount && this.highlightArray[idx] === 0) {
           this.highlightArray[idx] = 255;
+          allHighlightedIndices.push(idx);
         }
       }
     }
     // Add preview highlights on top
     for (let i = 0; i < cellIndices.length; i++) {
       const idx = cellIndices[i];
-      if (idx >= 0 && idx < this.pointCount) {
+      if (idx >= 0 && idx < this.pointCount && this.highlightArray[idx] === 0) {
         this.highlightArray[idx] = 255;
+        allHighlightedIndices.push(idx);
       }
     }
-    this._pushHighlightToViewer();
+    this._pushHighlightToViewer(allHighlightedIndices);
   }
 
   // Clear preview highlight (restore to only permanent highlights)
@@ -2941,25 +3007,31 @@ class DataState {
     this._ensureHighlightArray();
     // Start with existing permanent highlights
     this.highlightArray.fill(0);
+
+    // Collect all highlighted indices (avoids O(n) scan in renderer)
+    const allHighlightedIndices = [];
+
     for (const group of this.highlightedGroups) {
       if (group.enabled === false) continue;
       const indices = group.cellIndices;
       if (!indices) continue;
       for (let i = 0; i < indices.length; i++) {
         const idx = indices[i];
-        if (idx >= 0 && idx < this.pointCount) {
+        if (idx >= 0 && idx < this.pointCount && this.highlightArray[idx] === 0) {
           this.highlightArray[idx] = 255;
+          allHighlightedIndices.push(idx);
         }
       }
     }
     // Add preview highlights on top
     for (let i = 0; i < cellIndices.length; i++) {
       const idx = cellIndices[i];
-      if (idx >= 0 && idx < this.pointCount) {
+      if (idx >= 0 && idx < this.pointCount && this.highlightArray[idx] === 0) {
         this.highlightArray[idx] = 255;
+        allHighlightedIndices.push(idx);
       }
     }
-    this._pushHighlightToViewer();
+    this._pushHighlightToViewer(allHighlightedIndices);
   }
 
   // Add a highlighted group from a categorical selection

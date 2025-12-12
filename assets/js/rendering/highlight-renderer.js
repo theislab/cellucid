@@ -37,10 +37,18 @@ export class HighlightRenderer {
       lightDir: gl.getUniformLocation(this.program, 'u_lightDir'),
     };
 
-    // GPU buffer + bookkeeping
-    this.highlightBuffer = null;
-    this.highlightPointCount = 0;
-    this.highlightBufferLodSignature = null;
+    // Per-view GPU buffers + bookkeeping (fixes multi-view race condition)
+    // Map<viewId, { buffer, pointCount, lodSignature, positionsFingerprint }>
+    this._viewBuffers = new Map();
+
+    // Track total highlighted count across all views (for UI feedback)
+    this._totalHighlightedCount = 0;
+
+    // Cache for highlighted cell indices - avoids scanning all cells on every rebuildBuffer
+    // This dramatically improves performance when only a small fraction of cells are highlighted
+    this._highlightedIndicesCache = null;  // Array of highlighted cell indices
+    this._highlightDataRef = null;         // Reference to last highlightData array
+    this._highlightDataVersion = 0;        // Incremented when cache is invalidated
 
     // Visual style state (defaults mirror previous viewer.js values)
     this.highlightColor = [0.4, 0.85, 1.0];
@@ -75,41 +83,160 @@ export class HighlightRenderer {
   }
 
   /**
-   * Returns true if the GPU buffer should be rebuilt for the given LOD signature.
+   * Compute a fingerprint for positions array (for cache invalidation)
+   * @private
    */
-  needsRefresh(lodSignature) {
-    return !this.highlightBuffer || this.highlightBufferLodSignature !== lodSignature;
+  _computePositionsFingerprint(positions) {
+    if (!positions || positions.length === 0) return 0;
+    const len = positions.length;
+    // Sample every ~300th triplet and sum for a quick fingerprint
+    const step = Math.max(3, Math.floor(len / 300)) * 3;
+    let sparseSum = 0;
+    for (let i = 0; i < len; i += step) {
+      sparseSum += positions[i] + (positions[i + 1] || 0) + (positions[i + 2] || 0);
+    }
+    return len * 31 + sparseSum;
+  }
+
+  /**
+   * Update or invalidate the highlighted indices cache.
+   * Call this when highlight data changes to enable fast iteration in rebuildBuffer.
+   * @param {Uint8Array} highlightData - Highlight intensity per cell
+   * @param {boolean} [forceRebuild=false] - Force full cache rebuild
+   */
+  updateHighlightCache(highlightData, forceRebuild = false) {
+    // Check if we need to rebuild the cache
+    const needsRebuild = forceRebuild ||
+      !this._highlightedIndicesCache ||
+      this._highlightDataRef !== highlightData;
+
+    if (!needsRebuild) return;
+
+    // Build new cache by scanning all cells (only done when highlight data reference changes)
+    if (!highlightData) {
+      this._highlightedIndicesCache = [];
+      this._highlightDataRef = null;
+      this._highlightDataVersion++;
+      return;
+    }
+
+    const indices = [];
+    const len = highlightData.length;
+    for (let i = 0; i < len; i++) {
+      if (highlightData[i] > 0) {
+        indices.push(i);
+      }
+    }
+
+    this._highlightedIndicesCache = indices;
+    this._highlightDataRef = highlightData;
+    this._highlightDataVersion++;
+  }
+
+  /**
+   * Invalidate the highlight cache (call when highlight array contents change in-place)
+   */
+  invalidateHighlightCache() {
+    this._highlightedIndicesCache = null;
+    this._highlightDataVersion++;
+  }
+
+  /**
+   * Directly set the highlighted indices cache (avoids O(n) full-array scan).
+   * Call this when you already know which indices are highlighted (e.g., from state.js groups).
+   * @param {number[]} indices - Array of highlighted cell indices
+   * @param {Uint8Array} highlightData - Reference to the highlight data array
+   */
+  setHighlightedIndicesCache(indices, highlightData) {
+    this._highlightedIndicesCache = indices;
+    this._highlightDataRef = highlightData;
+    this._highlightDataVersion++;
+  }
+
+  /**
+   * Returns true if the GPU buffer should be rebuilt for the given LOD signature and view.
+   * @param {number} lodSignature - LOD signature for cache validation
+   * @param {string} [viewId='default'] - View ID for per-view buffer lookup
+   * @param {Float32Array} [positions] - Optional positions to check for changes
+   */
+  needsRefresh(lodSignature, viewId = 'default', positions = null) {
+    const vid = String(viewId);
+    const viewBuffer = this._viewBuffers.get(vid);
+
+    if (!viewBuffer || !viewBuffer.buffer) return true;
+    if (viewBuffer.lodSignature !== lodSignature) return true;
+
+    // Check if positions changed (for multi-dimensional views)
+    if (positions) {
+      const currentFingerprint = this._computePositionsFingerprint(positions);
+      if (viewBuffer.positionsFingerprint !== currentFingerprint) return true;
+    }
+
+    return false;
   }
 
   /**
    * Rebuild the highlight buffer with positions of highlighted cells.
-   * Only includes cells that are both highlighted AND visible.
-   * This is a direct extraction of the previous rebuildHighlightBuffer logic.
+   * Only includes cells that are both highlighted AND visible (LOD + frustum).
+   *
+   * IMPORTANT: This does NOT check transparency/filtering. Highlights should display
+   * in ALL views regardless of each view's filters. Selection tools check filtering
+   * separately to prevent selecting filtered-out cells.
+   *
+   * Now supports per-view buffers for multi-view rendering.
+   * @param {Uint8Array} highlightData - Highlight intensity per cell
+   * @param {Float32Array} positions - Position data
+   * @param {Float32Array|null} visibility - Combined LOD+frustum visibility mask (1.0 = visible, 0.0 = hidden), or null for all visible
+   * @param {number} [visibilitySignature] - Signature for cache key (LOD level + frustum state)
+   * @param {string} [viewId='default'] - View ID for per-view buffer
    */
-  rebuildBuffer(highlightData, positions, transparency, lodVisibility = null, lodSignature = null) {
+  rebuildBuffer(highlightData, positions, visibility = null, visibilitySignature = null, viewId = 'default') {
     const gl = this.gl;
+    const vid = String(viewId);
 
-    const visibilitySignature = lodVisibility ? (lodSignature ?? -2) : -1;
+    const sigValue = visibility ? (visibilitySignature ?? -2) : -1;
+    const positionsFingerprint = this._computePositionsFingerprint(positions);
 
     if (!highlightData || !positions) {
-      this.highlightPointCount = 0;
-      this.highlightBufferLodSignature = visibilitySignature;
+      // Clear this view's buffer state
+      const viewBuffer = this._viewBuffers.get(vid);
+      if (viewBuffer) {
+        viewBuffer.pointCount = 0;
+        viewBuffer.lodSignature = sigValue;
+        viewBuffer.positionsFingerprint = positionsFingerprint;
+      }
       return;
     }
 
+    // Use cached highlighted indices for fast iteration (avoids scanning all 10M+ cells)
+    // Cache is rebuilt only when highlightData reference changes
+    this.updateHighlightCache(highlightData);
+    const highlightedIndices = this._highlightedIndicesCache;
+
+    // Count visible highlighted cells using cached indices (visibility = LOD + frustum, NOT filtering)
     let count = 0;
-    for (let i = 0; i < highlightData.length; i++) {
-      if (highlightData[i] > 0) {
-        const visibleByAlpha = !transparency || transparency[i] > 0;
-        const visibleByLod = !lodVisibility || lodVisibility[i] > 0;
-        const isVisible = visibleByAlpha && visibleByLod;
-        if (isVisible) count++;
+    if (!visibility) {
+      // No visibility filter - all highlighted cells are visible
+      count = highlightedIndices.length;
+    } else {
+      // Count only highlighted cells that pass visibility check
+      for (let j = 0; j < highlightedIndices.length; j++) {
+        const i = highlightedIndices[j];
+        if (visibility[i] > 0) count++;
       }
     }
 
+    // Get or create per-view buffer entry
+    let viewBuffer = this._viewBuffers.get(vid);
+    if (!viewBuffer) {
+      viewBuffer = { buffer: null, pointCount: 0, lodSignature: -999, positionsFingerprint: 0 };
+      this._viewBuffers.set(vid, viewBuffer);
+    }
+
     if (count === 0) {
-      this.highlightPointCount = 0;
-      this.highlightBufferLodSignature = visibilitySignature;
+      viewBuffer.pointCount = 0;
+      viewBuffer.lodSignature = sigValue;
+      viewBuffer.positionsFingerprint = positionsFingerprint;
       return;
     }
 
@@ -118,48 +245,88 @@ export class HighlightRenderer {
     const posView = new Float32Array(bufferData);
     const colorView = new Uint8Array(bufferData);
 
+    // Pack buffer using cached indices (fast - only iterates over highlighted cells)
     let outIdx = 0;
-    for (let i = 0; i < highlightData.length; i++) {
-      if (highlightData[i] > 0) {
-        const visibleByAlpha = !transparency || transparency[i] > 0;
-        const visibleByLod = !lodVisibility || lodVisibility[i] > 0;
-        const isVisible = visibleByAlpha && visibleByLod;
-        if (!isVisible) continue;
+    for (let j = 0; j < highlightedIndices.length; j++) {
+      const i = highlightedIndices[j];
+      // Only check LOD+frustum visibility for display
+      if (visibility && visibility[i] <= 0) continue;
 
-        const posOffset = outIdx * 4;
-        const colorOffset = outIdx * BYTES_PER_POINT + 12;
+      const posOffset = outIdx * 4;
+      const colorOffset = outIdx * BYTES_PER_POINT + 12;
 
-        posView[posOffset] = positions[i * 3];
-        posView[posOffset + 1] = positions[i * 3 + 1];
-        posView[posOffset + 2] = positions[i * 3 + 2];
+      posView[posOffset] = positions[i * 3];
+      posView[posOffset + 1] = positions[i * 3 + 1];
+      posView[posOffset + 2] = positions[i * 3 + 2];
 
-        colorView[colorOffset] = 255;
-        colorView[colorOffset + 1] = 255;
-        colorView[colorOffset + 2] = 255;
-        colorView[colorOffset + 3] = highlightData[i];
+      colorView[colorOffset] = 255;
+      colorView[colorOffset + 1] = 255;
+      colorView[colorOffset + 2] = 255;
+      colorView[colorOffset + 3] = highlightData[i];
 
-        outIdx++;
-      }
+      outIdx++;
     }
 
-    if (!this.highlightBuffer) {
-      this.highlightBuffer = gl.createBuffer();
+    // Create GPU buffer for this view if needed
+    if (!viewBuffer.buffer) {
+      viewBuffer.buffer = gl.createBuffer();
     }
 
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.highlightBuffer);
+    gl.bindBuffer(gl.ARRAY_BUFFER, viewBuffer.buffer);
     gl.bufferData(gl.ARRAY_BUFFER, bufferData, gl.DYNAMIC_DRAW);
 
-    this.highlightPointCount = count;
-    this.highlightBufferLodSignature = visibilitySignature;
-  }
+    viewBuffer.pointCount = count;
+    viewBuffer.lodSignature = sigValue;
+    viewBuffer.positionsFingerprint = positionsFingerprint;
 
-  getPointCount() {
-    return this.highlightPointCount;
+    // Update total count for UI feedback
+    this._totalHighlightedCount = count;
   }
 
   /**
-   * Draw highlight rings for the current buffer.
-   * This is a direct extraction of the previous drawHighlights logic.
+   * Get point count for a specific view, or total count if no viewId specified
+   * @param {string} [viewId] - View ID (optional, returns total count if not specified)
+   */
+  getPointCount(viewId) {
+    if (viewId) {
+      const viewBuffer = this._viewBuffers.get(String(viewId));
+      return viewBuffer ? viewBuffer.pointCount : 0;
+    }
+    // Return total highlighted count across all views for UI feedback
+    return this._totalHighlightedCount;
+  }
+
+  /**
+   * Clear buffer for a specific view (e.g., when view is removed)
+   * @param {string} viewId - View ID to clear
+   */
+  clearViewBuffer(viewId) {
+    const vid = String(viewId);
+    const viewBuffer = this._viewBuffers.get(vid);
+    if (viewBuffer && viewBuffer.buffer) {
+      this.gl.deleteBuffer(viewBuffer.buffer);
+    }
+    this._viewBuffers.delete(vid);
+  }
+
+  /**
+   * Dispose all GPU resources
+   */
+  dispose() {
+    const gl = this.gl;
+    for (const [, viewBuffer] of this._viewBuffers) {
+      if (viewBuffer.buffer) {
+        gl.deleteBuffer(viewBuffer.buffer);
+      }
+    }
+    this._viewBuffers.clear();
+    this._totalHighlightedCount = 0;
+  }
+
+  /**
+   * Draw highlight rings for the specified view's buffer.
+   * Uses per-view buffers for multi-view rendering with correct LOD sizes.
+   * @param {string} viewId - Required view ID for per-view buffer and LOD size lookup
    */
   draw({
     mvpMatrix,
@@ -173,10 +340,18 @@ export class HighlightRenderer {
     fogDensity,
     fogColor,
     lightingStrength,
-    lightDir
+    lightDir,
+    viewId  // Required for per-view buffer lookup and LOD size multiplier
   }) {
     const gl = this.gl;
-    if (this.highlightPointCount === 0 || !this.highlightBuffer) return;
+    const vid = String(viewId || 'default');
+
+    // Get the per-view buffer
+    const viewBuffer = this._viewBuffers.get(vid);
+    if (!viewBuffer || !viewBuffer.buffer || viewBuffer.pointCount === 0) return;
+
+    const buffer = viewBuffer.buffer;
+    const pointCount = viewBuffer.pointCount;
 
     const depthWasEnabled = gl.isEnabled(gl.DEPTH_TEST);
     const depthMaskWasEnabled = gl.getParameter(gl.DEPTH_WRITEMASK);
@@ -185,8 +360,9 @@ export class HighlightRenderer {
 
     gl.useProgram(this.program);
 
+    // Use per-view LOD size multiplier if viewId is provided
     const lodSizeMultiplier = this.hpRenderer && this.hpRenderer.getCurrentLODSizeMultiplier
-      ? this.hpRenderer.getCurrentLODSizeMultiplier()
+      ? this.hpRenderer.getCurrentLODSizeMultiplier(viewId)
       : 1.0;
     const highlightPointSize = basePointSize * lodSizeMultiplier;
 
@@ -230,7 +406,7 @@ export class HighlightRenderer {
     gl.uniform3fv(this.uniformLocations.lightDir, lightDir);
 
     const BYTES_PER_POINT = 16;
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.highlightBuffer);
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
     gl.enableVertexAttribArray(this.attribLocations.position);
     gl.vertexAttribPointer(this.attribLocations.position, 3, gl.FLOAT, false, BYTES_PER_POINT, 0);
     gl.enableVertexAttribArray(this.attribLocations.color);
@@ -238,7 +414,7 @@ export class HighlightRenderer {
 
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
-    gl.drawArrays(gl.POINTS, 0, this.highlightPointCount);
+    gl.drawArrays(gl.POINTS, 0, pointCount);
     gl.depthMask(depthMaskWasEnabled);
     if (!depthWasEnabled) gl.disable(gl.DEPTH_TEST);
   }
@@ -406,7 +582,7 @@ export function clearProximityOverlay({ canvas, lassoCtx }) {
   clearLassoOverlay({ canvas, lassoCtx });
 }
 
-export function findCellsInProximity({ hpRenderer, transparencyArray, centerPos, radius3D, viewPositions = null }) {
+export function findCellsInProximity({ hpRenderer, transparencyArray, centerPos, radius3D, viewPositions = null, highlightArray = null }) {
   if (!centerPos || radius3D <= 0) return [];
 
   // Use view-specific positions if provided, otherwise fall back to main positions
@@ -418,28 +594,13 @@ export function findCellsInProximity({ hpRenderer, transparencyArray, centerPos,
   const alphas = transparencyArray;
   const radiusSq = radius3D * radius3D;
 
-  // Only use octree if we're using main positions (octree is built from main positions)
-  // For view-specific positions (different dimension), use brute-force search
-  const useOctree = !viewPositions && hpRenderer.octree;
-
-  if (useOctree) {
-    if (!hpRenderer.octree) {
-      hpRenderer.ensureOctree?.();
-    }
-    if (hpRenderer.octree) {
-      const candidates = hpRenderer.octree.queryRadius(centerPos, radius3D, 100000);
-      for (const idx of candidates) {
-        if (alphas && alphas[idx] === 0) continue;
-        selectedIndices.push(idx);
-      }
-      return selectedIndices;
-    }
-  }
-
-  // Brute-force search for view-specific positions or when octree unavailable
+  // Brute-force search - fast enough for interactive brush selection
   const n = positions.length / 3;
   for (let i = 0; i < n; i++) {
-    if (alphas && alphas[i] === 0) continue;
+    // Cell is selectable if: visible (alpha > 0) OR already highlighted
+    const isVisible = !alphas || alphas[i] > 0;
+    const isHighlighted = highlightArray && highlightArray[i] > 0;
+    if (!isVisible && !isHighlighted) continue;
     const dx = positions[i * 3] - centerPos[0];
     const dy = positions[i * 3 + 1] - centerPos[1];
     const dz = positions[i * 3 + 2] - centerPos[2];
@@ -498,14 +659,17 @@ export class HighlightTools {
     this.annotationStepCount = 0;
     this.annotationLastMode = 'intersect';
 
+    // Unified candidate set shared across all selection tools (lasso, proximity, KNN)
+    // This allows users to start with one tool and refine with another
+    this._unifiedCandidateSet = null;
+    this._unifiedStepCount = 0;
+
     this.lassoEnabled = false;
     this.lassoPath = [];
     this.isLassoing = false;
     this.lassoViewContext = null;
     this.lassoCallback = null;
     this.lassoPreviewCallback = null;
-    this.lassoCandidateSet = null;
-    this.lassoStepCount = 0;
     this.lassoStepCallback = null;
     this.lassoMode = 'intersect';
 
@@ -516,8 +680,6 @@ export class HighlightTools {
     this.proximityCallback = null;
     this.proximityPreviewCallback = null;
     this.proximityStepCallback = null;
-    this.proximityCandidateSet = null;
-    this.proximityStepCount = 0;
 
     this.knnEnabled = false;
     this.isKnnDragging = false;
@@ -526,16 +688,94 @@ export class HighlightTools {
     this.knnCallback = null;
     this.knnPreviewCallback = null;
     this.knnStepCallback = null;
-    this.knnCandidateSet = null;
-    this.knnStepCount = 0;
     this.knnAdjacencyList = null;
     this.knnEdgesLoaded = false;
     this.knnEdgeLoadCallback = null;
 
     this.altKeyDown = false;
 
-    // Track last used positions for multiview dimension support
-    this._lastUsedPositions = null;
+    // Track last used positions per-view for multiview dimension support
+    // Each view may have different positions (e.g., 2D vs 3D), so we track separately
+    this._lastUsedPositionsMap = new Map();      // viewId -> positions reference
+    this._lastPositionFingerprintMap = new Map(); // viewId -> fingerprint string
+  }
+
+  // === Unified candidate set accessors ===
+  // All tools (lasso, proximity, KNN) share the same candidate set
+  // This allows switching tools mid-selection to refine with different methods
+
+  get lassoCandidateSet() { return this._unifiedCandidateSet; }
+  set lassoCandidateSet(value) { this._unifiedCandidateSet = value; }
+
+  get lassoStepCount() { return this._unifiedStepCount; }
+  set lassoStepCount(value) { this._unifiedStepCount = value; }
+
+  get proximityCandidateSet() { return this._unifiedCandidateSet; }
+  set proximityCandidateSet(value) { this._unifiedCandidateSet = value; }
+
+  get proximityStepCount() { return this._unifiedStepCount; }
+  set proximityStepCount(value) { this._unifiedStepCount = value; }
+
+  get knnCandidateSet() { return this._unifiedCandidateSet; }
+  set knnCandidateSet(value) { this._unifiedCandidateSet = value; }
+
+  get knnStepCount() { return this._unifiedStepCount; }
+  set knnStepCount(value) { this._unifiedStepCount = value; }
+
+  /**
+   * Get unified selection state across all tools.
+   * @returns {Object} State object with inProgress, stepCount, candidateCount, candidates
+   */
+  getUnifiedSelectionState() {
+    return {
+      inProgress: this._unifiedCandidateSet !== null,
+      stepCount: this._unifiedStepCount,
+      candidateCount: this._unifiedCandidateSet ? this._unifiedCandidateSet.size : 0,
+      candidates: this._unifiedCandidateSet ? [...this._unifiedCandidateSet] : []
+    };
+  }
+
+  /**
+   * Confirm unified selection and clear state.
+   * @param {Function} [callback] - Optional callback to receive final selection
+   * @returns {number[]} Array of selected cell indices
+   */
+  confirmUnifiedSelection(callback = null) {
+    const finalIndices = this._unifiedCandidateSet ? [...this._unifiedCandidateSet] : [];
+    if (callback && finalIndices.length > 0) {
+      callback({
+        type: 'unified',
+        cellIndices: finalIndices,
+        cellCount: finalIndices.length,
+        steps: this._unifiedStepCount
+      });
+    }
+    this._unifiedCandidateSet = null;
+    this._unifiedStepCount = 0;
+    return finalIndices;
+  }
+
+  /**
+   * Cancel unified selection and clear state.
+   */
+  cancelUnifiedSelection() {
+    this._unifiedCandidateSet = null;
+    this._unifiedStepCount = 0;
+  }
+
+  /**
+   * Restore unified selection state.
+   * @param {number[]} candidates - Array of cell indices
+   * @param {number} step - Step count
+   */
+  restoreUnifiedState(candidates, step) {
+    if (candidates && candidates.length > 0) {
+      this._unifiedCandidateSet = new Set(candidates);
+      this._unifiedStepCount = step;
+    } else {
+      this._unifiedCandidateSet = null;
+      this._unifiedStepCount = 0;
+    }
   }
 
   // === Highlight rendering ===
@@ -545,43 +785,149 @@ export class HighlightTools {
     }
   }
 
-  updateHighlight(highlightData) {
+  /**
+   * Update highlight data. In multi-view mode, the buffer will be rebuilt with
+   * view-specific positions during the next renderHighlights call.
+   *
+   * NOTE: Highlight display ignores filtering (transparency). Highlights show in ALL
+   * views regardless of per-view filters. This allows highlighting cells in one view
+   * and seeing them highlighted in all views, even if filtered out there.
+   *
+   * @param {Uint8Array} highlightData - Highlight intensity per point (0-255)
+   * @param {Float32Array} [viewPositions] - Optional view-specific positions. If not provided,
+   *   uses global positions as fallback (will be corrected during next renderHighlights call).
+   * @param {number[]} [highlightedIndices] - Optional pre-computed array of highlighted cell indices.
+   *   If provided, skips the expensive O(n) full-array scan. Pass this when you already know
+   *   which cells are highlighted (e.g., from state.js highlight groups).
+   * @param {string} [viewId='default'] - View ID for per-view LOD level in multi-view rendering
+   */
+  updateHighlight(highlightData, viewPositions = null, highlightedIndices = null, viewId = 'default') {
     this.highlightArray = highlightData;
     if (!this.highlightRenderer) return;
-    const ctx = this.getRenderContext?.() || {};
-    const positions = this.hpRenderer.getPositions ? this.hpRenderer.getPositions() : null;
-    const lodVisibility = this.hpRenderer.getLodVisibilityArray ? this.hpRenderer.getLodVisibilityArray() : null;
-    const lodLevel = this.hpRenderer.getCurrentLODLevel ? this.hpRenderer.getCurrentLODLevel() : -1;
-    const lodSignature = lodVisibility ? (lodLevel ?? -1) : -1;
-    this.highlightRenderer.rebuildBuffer(highlightData, positions, ctx.transparencyArray, lodVisibility, lodSignature);
+
+    // If pre-computed indices provided, set cache directly (avoids O(n) scan)
+    // Otherwise, invalidate cache to trigger scan on next rebuildBuffer
+    if (highlightedIndices) {
+      this.highlightRenderer.setHighlightedIndicesCache(highlightedIndices, highlightData);
+    } else {
+      this.highlightRenderer.invalidateHighlightCache();
+    }
+
+    // Use view-specific positions if provided, otherwise use global positions as initial fallback
+    // The buffer will be rebuilt with correct positions during renderHighlights
+    const positions = viewPositions || (this.hpRenderer.getPositions ? this.hpRenderer.getPositions() : null);
+    // Get combined LOD+frustum visibility (NOT filtering/transparency)
+    // This ensures highlights show regardless of per-view filters
+    const visibility = this.hpRenderer.getCombinedVisibilityForView
+      ? this.hpRenderer.getCombinedVisibilityForView(viewId)
+      : this.hpRenderer.getLodVisibilityArray?.(undefined, viewId) ?? null;
+    const lodLevel = this.hpRenderer.getCurrentLODLevel ? this.hpRenderer.getCurrentLODLevel(viewId) : -1;
+    const visibilitySignature = visibility ? (lodLevel ?? -1) : -1;
+    this.highlightRenderer.rebuildBuffer(highlightData, positions, visibility, visibilitySignature, viewId);
+    // Clear all position caches so next renderHighlights will rebuild with view-specific positions
+    this._lastUsedPositionsMap.clear();
+    this._lastPositionFingerprintMap.clear();
   }
 
-  handleTransparencyChange(transparencyArray) {
+  /**
+   * Handle transparency changes. This does NOT affect highlight display visibility.
+   *
+   * IMPORTANT: Highlight display ignores filtering. Highlights show in all views
+   * regardless of each view's filters. Selection tools check filtering separately.
+   *
+   * The buffer will be rebuilt with correct view-specific positions during the next
+   * renderHighlights call.
+   *
+   * @param {Float32Array} _transparencyArray - Transparency values per point (ignored for display)
+   * @param {Float32Array} [viewPositions] - Optional view-specific positions for multi-dimensional support.
+   *   If not provided, uses global positions (will be corrected during next renderHighlights call).
+   * @param {string} [viewId='default'] - View ID for per-view LOD level in multi-view rendering
+   */
+  handleTransparencyChange(_transparencyArray, viewPositions = null, viewId = 'default') {
     if (!this.highlightArray || !this.highlightRenderer) return;
-    const positions = this.hpRenderer.getPositions ? this.hpRenderer.getPositions() : null;
-    const lodVisibility = this.hpRenderer.getLodVisibilityArray ? this.hpRenderer.getLodVisibilityArray() : null;
-    const lodLevel = this.hpRenderer.getCurrentLODLevel ? this.hpRenderer.getCurrentLODLevel() : -1;
-    const lodSignature = lodVisibility ? (lodLevel ?? -1) : -1;
-    this.highlightRenderer.rebuildBuffer(this.highlightArray, positions, transparencyArray, lodVisibility, lodSignature);
+    // Note: We intentionally do NOT use transparencyArray for highlight display.
+    // Highlights should show in all views regardless of per-view filtering.
+    // Only LOD+frustum visibility affects highlight display.
+    const positions = viewPositions || (this.hpRenderer.getPositions ? this.hpRenderer.getPositions() : null);
+    // Get combined LOD+frustum visibility (NOT filtering/transparency)
+    const visibility = this.hpRenderer.getCombinedVisibilityForView
+      ? this.hpRenderer.getCombinedVisibilityForView(viewId)
+      : this.hpRenderer.getLodVisibilityArray?.(undefined, viewId) ?? null;
+    const lodLevel = this.hpRenderer.getCurrentLODLevel ? this.hpRenderer.getCurrentLODLevel(viewId) : -1;
+    const visibilitySignature = visibility ? (lodLevel ?? -1) : -1;
+    this.highlightRenderer.rebuildBuffer(this.highlightArray, positions, visibility, visibilitySignature, viewId);
+    // Clear all position caches so next renderHighlights will rebuild with view-specific positions
+    this._lastUsedPositionsMap.clear();
+    this._lastPositionFingerprintMap.clear();
   }
 
-  syncHighlightBufferForLod(viewPositions = null) {
+  /**
+   * Compute a quick fingerprint of positions array by sampling multiple positions.
+   * Samples at 5 positions (first, 25%, 50%, 75%, last) plus a sparse sum for better change detection.
+   * @param {Float32Array} positions - Positions array to fingerprint
+   * @returns {string|null} Fingerprint string or null if invalid
+   */
+  _computePositionFingerprint(positions) {
+    if (!positions || positions.length < 6) return null;
+    const len = positions.length;
+    const numPoints = len / 3;
+
+    // Sample at 5 positions: start, 25%, 50%, 75%, end (aligned to XYZ triplets)
+    const q1Idx = Math.floor(numPoints * 0.25) * 3;
+    const midIdx = Math.floor(numPoints * 0.5) * 3;
+    const q3Idx = Math.floor(numPoints * 0.75) * 3;
+    const lastIdx = len - 3;
+
+    // Compute a sparse sum for additional change detection (every 100th point's X value)
+    let sparseSum = 0;
+    const step = Math.max(3, Math.floor(len / 300)) * 3;  // ~100 samples, aligned to triplets
+    for (let i = 0; i < len; i += step) {
+      sparseSum += positions[i];
+    }
+
+    return `${positions[0]},${positions[1]},${positions[2]},` +
+           `${positions[q1Idx]},${positions[midIdx]},${positions[q3Idx]},` +
+           `${positions[lastIdx]},${positions[lastIdx+1]},${positions[lastIdx+2]},` +
+           `${sparseSum.toFixed(2)},${len}`;
+  }
+
+  /**
+   * Sync highlight buffer for LOD + frustum visibility.
+   *
+   * IMPORTANT: This uses combined LOD + frustum visibility, NOT filtering.
+   * Highlights show in all views regardless of per-view filters.
+   *
+   * @param {Float32Array} [viewPositions] - Optional view-specific positions for multi-dimensional support
+   * @param {string} [viewId] - Optional view ID for per-view LOD level in multi-view rendering
+   */
+  syncHighlightBufferForLod(viewPositions = null, viewId = undefined) {
     if (!this.highlightArray || !this.highlightRenderer) return;
-    const lodVisibility = this.hpRenderer.getLodVisibilityArray ? this.hpRenderer.getLodVisibilityArray() : null;
-    const lodLevel = this.hpRenderer.getCurrentLODLevel ? this.hpRenderer.getCurrentLODLevel() : -1;
-    const lodSignature = lodVisibility ? (lodLevel ?? -1) : -1;
+    // Normalize viewId to string for consistent map key
+    const vid = String(viewId || 'default');
 
-    // When view-specific positions are provided, always rebuild since we can't easily
-    // cache per-view buffers (positions change with dimension). In practice this is fast
-    // since highlight counts are typically small (<10k cells).
-    const positionsChanged = viewPositions && viewPositions !== this._lastUsedPositions;
+    // Use combined LOD + frustum visibility for this view (NOT filtering/transparency)
+    // This ensures highlights show regardless of per-view filters
+    const visibility = this.hpRenderer.getCombinedVisibilityForView
+      ? this.hpRenderer.getCombinedVisibilityForView(viewId)
+      : this.hpRenderer.getLodVisibilityArray?.(undefined, viewId) ?? null;
+    const lodLevel = this.hpRenderer.getCurrentLODLevel ? this.hpRenderer.getCurrentLODLevel(viewId) : -1;
+    const visibilitySignature = visibility ? (lodLevel ?? -1) : -1;
 
-    if (this.highlightRenderer.needsRefresh(lodSignature) || positionsChanged) {
-      const ctx = this.getRenderContext?.() || {};
-      // Use view-specific positions if provided, otherwise use global positions
-      const positions = viewPositions || (this.hpRenderer.getPositions ? this.hpRenderer.getPositions() : null);
-      this.highlightRenderer.rebuildBuffer(this.highlightArray, positions, ctx.transparencyArray, lodVisibility, lodSignature);
-      this._lastUsedPositions = positions;
+    // Check if positions changed using per-view fingerprint (handles in-place mutations)
+    // Reference check is fast path; fingerprint catches in-place array mutations
+    const positions = viewPositions || (this.hpRenderer.getPositions ? this.hpRenderer.getPositions() : null);
+    const currentFingerprint = positions ? this._computePositionFingerprint(positions) : null;
+    const lastUsedPositions = this._lastUsedPositionsMap.get(vid);
+    const lastFingerprint = this._lastPositionFingerprintMap.get(vid);
+    const positionsChanged = positions && (
+      positions !== lastUsedPositions ||
+      currentFingerprint !== lastFingerprint
+    );
+
+    if (this.highlightRenderer.needsRefresh(visibilitySignature, vid, positions) || positionsChanged) {
+      this.highlightRenderer.rebuildBuffer(this.highlightArray, positions, visibility, visibilitySignature, vid);
+      this._lastUsedPositionsMap.set(vid, positions);
+      this._lastPositionFingerprintMap.set(vid, currentFingerprint);
     }
   }
 
@@ -599,15 +945,20 @@ export class HighlightTools {
       fogDensity: drawParams.fogDensity,
       fogColor: drawParams.fogColor,
       lightingStrength: drawParams.lightingStrength,
-      lightDir: drawParams.lightDir
+      lightDir: drawParams.lightDir,
+      viewId: drawParams.viewId  // Pass viewId for per-view LOD size multiplier
     };
     this.highlightRenderer.draw(normalizedParams);
   }
 
-  // Sync LOD visibility and draw highlights in one call (used by viewer render loop)
-  // viewPositions: Optional per-view positions for multi-dimensional support
+  /**
+   * Sync LOD visibility and draw highlights in one call (used by viewer render loop)
+   * @param {Object} drawParams - Draw parameters (includes viewId for per-view LOD)
+   * @param {Float32Array} [viewPositions] - Optional per-view positions for multi-dimensional support
+   */
   renderHighlights(drawParams = {}, viewPositions = null) {
-    this.syncHighlightBufferForLod(viewPositions);
+    // Pass viewId for per-view LOD level lookup
+    this.syncHighlightBufferForLod(viewPositions, drawParams.viewId);
     this.drawHighlights(drawParams);
   }
 
@@ -1183,18 +1534,22 @@ export class HighlightTools {
         }
 
         const vpInfo = this.getViewportInfoAtScreen ? this.getViewportInfoAtScreen(e.clientX, e.clientY) : null;
+        const viewId = vpInfo?.viewId;
         this.knnSeedCell = {
           screenX: e.clientX,
           screenY: e.clientY,
           cellIndex: cellIdx,
           mode: knnMode,
-          viewport: vpInfo
+          viewport: vpInfo,
+          viewId: viewId  // Store viewId for multi-dimensional support
         };
         this.knnCurrentDegree = 0;
         resetKnnCache();
         this.isKnnDragging = true;
         this.canvas.style.cursor = 'ns-resize';
         this.canvas.classList.add('knn-dragging');
+        // Get view-specific positions for multi-dimensional support
+        const knnViewPositions = this.getViewPositions ? this.getViewPositions(viewId) : null;
         drawKnnIndicator({
           canvas: this.canvas,
           lassoCtx: this.lassoCtx,
@@ -1206,7 +1561,8 @@ export class HighlightTools {
           near: ctx.near,
           far: ctx.far,
           viewMatrix: ctx.viewMatrix,
-          modelMatrix: ctx.modelMatrix
+          modelMatrix: ctx.modelMatrix,
+          viewPositions: knnViewPositions
         });
         e.preventDefault();
         return true;
@@ -1279,7 +1635,8 @@ export class HighlightTools {
             snapshotViews: ctx.snapshotViews || [],
             viewLayoutMode: ctx.viewLayoutMode,
             transparencyArray: ctx.transparencyArray,
-            viewPositions
+            viewPositions,
+            highlightArray: this.highlightArray  // Allow selecting highlighted cells even if filtered
           });
           this.lassoPreviewCallback({
             type: 'lasso-preview',
@@ -1321,7 +1678,8 @@ export class HighlightTools {
           transparencyArray: ctx.transparencyArray,
           centerPos: this.proximityCenter.worldPos,
           radius3D: this.proximityCurrentRadius,
-          viewPositions
+          viewPositions,
+          highlightArray: this.highlightArray  // Allow selecting highlighted cells even if filtered
         });
         const mode = this.proximityCenter.mode || 'intersect';
 
@@ -1365,6 +1723,8 @@ export class HighlightTools {
       if (newDegree !== this.knnCurrentDegree) {
         this.knnCurrentDegree = newDegree;
 
+        // Get view-specific positions for multi-dimensional support
+        const knnViewPositions = this.getViewPositions ? this.getViewPositions(this.knnSeedCell?.viewId) : null;
         drawKnnIndicator({
           canvas: this.canvas,
           lassoCtx: this.lassoCtx,
@@ -1376,7 +1736,8 @@ export class HighlightTools {
           near: ctx.near,
           far: ctx.far,
           viewMatrix: ctx.viewMatrix,
-          modelMatrix: ctx.modelMatrix
+          modelMatrix: ctx.modelMatrix,
+          viewPositions: knnViewPositions
         });
 
         if (this.knnPreviewCallback) {
@@ -1384,7 +1745,8 @@ export class HighlightTools {
             this.knnSeedCell.cellIndex,
             this.knnCurrentDegree,
             this.knnAdjacencyList,
-            ctx.transparencyArray
+            ctx.transparencyArray,
+            this.highlightArray  // Allow selecting highlighted cells even if filtered
           );
           const newIndices = [...allCells];
           const mode = this.knnSeedCell.mode || 'intersect';
@@ -1465,7 +1827,8 @@ export class HighlightTools {
           snapshotViews: ctx.snapshotViews || [],
           viewLayoutMode: ctx.viewLayoutMode,
           transparencyArray: ctx.transparencyArray,
-          viewPositions
+          viewPositions,
+          highlightArray: this.highlightArray  // Allow selecting highlighted cells even if filtered
         });
         if (selectedIndices.length > 0 || this.lassoMode === 'subtract') {
           const newSet = new Set(selectedIndices);
@@ -1519,7 +1882,8 @@ export class HighlightTools {
           transparencyArray: ctx.transparencyArray,
           centerPos: this.proximityCenter.worldPos,
           radius3D: this.proximityCurrentRadius,
-          viewPositions
+          viewPositions,
+          highlightArray: this.highlightArray  // Allow selecting highlighted cells even if filtered
         });
         const mode = this.proximityCenter.mode || 'intersect';
         const newSet = new Set(newIndices);
@@ -1574,7 +1938,8 @@ export class HighlightTools {
           this.knnSeedCell.cellIndex,
           this.knnCurrentDegree,
           this.knnAdjacencyList,
-          ctx.transparencyArray
+          ctx.transparencyArray,
+          this.highlightArray  // Allow selecting highlighted cells even if filtered
         );
         const selectedIndices = [...allCells];
         const newSet = new Set(selectedIndices);
@@ -1696,14 +2061,48 @@ export function buildKnnAdjacencyList(sources, destinations) {
 
 let knnDegreesCache = null;
 let knnMaxCachedDegree = -1;
+let knnCachedAlphasRef = null;  // Track alphas reference to invalidate cache on filter change
+let knnCachedAlphasFingerprint = null;  // Track alphas fingerprint to detect in-place mutations
+
+/**
+ * Compute a quick fingerprint of alphas array by sampling values.
+ * Detects in-place mutations that reference checks would miss.
+ * Samples multiple positions and uses finer-grained zero counting for better detection.
+ * @param {Uint8Array|Float32Array} alphas - Alpha/transparency values
+ * @returns {string|null} Fingerprint string or null if invalid
+ */
+function computeAlphasFingerprint(alphas) {
+  if (!alphas || alphas.length < 3) return null;
+  const len = alphas.length;
+  // Sample at 5 positions: start, 25%, 50%, 75%, end (better coverage)
+  const q1 = Math.floor(len * 0.25);
+  const mid = Math.floor(len * 0.5);
+  const q3 = Math.floor(len * 0.75);
+
+  let zeroCount = 0;
+  let sumSample = 0;
+  // Sample every 100th element for better zero detection and value sum
+  // This catches more filter state changes while remaining fast
+  const step = Math.max(1, Math.floor(len / 500));  // ~500 samples max
+  for (let i = 0; i < len; i += step) {
+    if (alphas[i] === 0) zeroCount++;
+    sumSample += alphas[i];
+  }
+  return `${alphas[0]},${alphas[q1]},${alphas[mid]},${alphas[q3]},${alphas[len-1]},${zeroCount},${sumSample},${len}`;
+}
 
 export function resetKnnCache() {
   knnDegreesCache = null;
   knnMaxCachedDegree = -1;
+  knnCachedAlphasRef = null;
+  knnCachedAlphasFingerprint = null;
 }
 
-export function findKnnNeighborsUpToDegree(seedCell, maxDegree, adjacency, alphas) {
-  if (alphas && alphas[seedCell] === 0) {
+export function findKnnNeighborsUpToDegree(seedCell, maxDegree, adjacency, alphas, highlightArray = null) {
+  // Seed cell must be visible OR highlighted
+  const seedVisible = !alphas || alphas[seedCell] > 0;
+  const seedHighlighted = highlightArray && highlightArray[seedCell] > 0;
+  if (!seedVisible && !seedHighlighted) {
     return { allCells: new Set(), byDegree: new Map(), frontier: [] };
   }
 
@@ -1711,8 +2110,15 @@ export function findKnnNeighborsUpToDegree(seedCell, maxDegree, adjacency, alpha
     return { allCells: new Set([seedCell]), byDegree: new Map([[0, new Set([seedCell])]]), frontier: [seedCell] };
   }
 
+  // Check if cache is valid: same seed cell, same alphas (reference AND fingerprint), and can extend to requested degree
+  // Fingerprint check catches in-place mutations that reference checks would miss
+  // Note: We don't cache based on highlightArray since it changes frequently during selection
+  const currentFingerprint = computeAlphasFingerprint(alphas);
+  const alphasMatches = alphas === knnCachedAlphasRef && currentFingerprint === knnCachedAlphasFingerprint;
+
   if (knnDegreesCache &&
       knnDegreesCache.seedCell === seedCell &&
+      alphasMatches &&
       knnMaxCachedDegree >= 0 &&
       maxDegree >= knnMaxCachedDegree) {
 
@@ -1741,7 +2147,10 @@ export function findKnnNeighborsUpToDegree(seedCell, maxDegree, adjacency, alpha
         for (let j = 0; j < len; j++) {
           const neighbor = neighbors[j];
           if (visited.has(neighbor)) continue;
-          if (alphas && alphas[neighbor] === 0) continue;
+          // Neighbor is traversable if: visible (alpha > 0) OR highlighted
+          const neighborVisible = !alphas || alphas[neighbor] > 0;
+          const neighborHighlighted = highlightArray && highlightArray[neighbor] > 0;
+          if (!neighborVisible && !neighborHighlighted) continue;
 
           visited.add(neighbor);
           degreeCells.add(neighbor);
@@ -1774,6 +2183,8 @@ export function findKnnNeighborsUpToDegree(seedCell, maxDegree, adjacency, alpha
     frontier: [seedCell]
   };
   knnMaxCachedDegree = 0;
+  knnCachedAlphasRef = alphas;  // Track which alphas array was used for this cache
+  knnCachedAlphasFingerprint = currentFingerprint;  // Track fingerprint to detect in-place mutations
 
   if (maxDegree === 0) {
     return { allCells: visited, byDegree, frontier: [seedCell] };
@@ -1794,7 +2205,10 @@ export function findKnnNeighborsUpToDegree(seedCell, maxDegree, adjacency, alpha
       for (let j = 0; j < len; j++) {
         const neighbor = neighbors[j];
         if (visited.has(neighbor)) continue;
-        if (alphas && alphas[neighbor] === 0) continue;
+        // Neighbor is traversable if: visible (alpha > 0) OR highlighted
+        const neighborVisible = !alphas || alphas[neighbor] > 0;
+        const neighborHighlighted = highlightArray && highlightArray[neighbor] > 0;
+        if (!neighborVisible && !neighborHighlighted) continue;
 
         visited.add(neighbor);
         degreeCells.add(neighbor);
@@ -1831,7 +2245,8 @@ export function drawKnnIndicator({
   near,
   far,
   viewMatrix,
-  modelMatrix
+  modelMatrix,
+  viewPositions = null  // Optional: view-specific positions for multi-dimensional support
 }) {
   if (!knnSeedCell) return;
 
@@ -1841,7 +2256,8 @@ export function drawKnnIndicator({
   lassoCtx.scale(dpr, dpr);
   lassoCtx.clearRect(0, 0, rect.width, rect.height);
 
-  const positions = hpRenderer.getPositions();
+  // Use view-specific positions if provided, otherwise fall back to main positions
+  const positions = viewPositions || hpRenderer.getPositions();
   if (!positions) return;
 
   const vp = knnSeedCell.viewport;
@@ -1960,7 +2376,8 @@ export function findCellsInLasso({
   snapshotViews,
   viewLayoutMode,
   transparencyArray,
-  viewPositions = null  // Optional: view-specific positions for multi-dimensional support
+  viewPositions = null,  // Optional: view-specific positions for multi-dimensional support
+  highlightArray = null  // Optional: allow selecting highlighted cells even if filtered
 }) {
   if (!lassoPath || lassoPath.length < 3) return [];
 
@@ -2021,7 +2438,11 @@ export function findCellsInLasso({
   const alphas = transparencyArray;
 
   for (let i = 0; i < n; i++) {
-    if (alphas && alphas[i] === 0) continue;
+    // Cell is selectable if: visible (alpha > 0) OR already highlighted
+    // This allows interacting with highlighted cells even if filtered in current view
+    const isVisible = !alphas || alphas[i] > 0;
+    const isHighlighted = highlightArray && highlightArray[i] > 0;
+    if (!isVisible && !isHighlighted) continue;
 
     const px = positions[i * 3];
     const py = positions[i * 3 + 1];

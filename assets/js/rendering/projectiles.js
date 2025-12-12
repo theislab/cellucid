@@ -33,6 +33,8 @@ export function createProjectileSystem({
   // For grid collision
   getGridBounds,
   isGridVisible,
+  // For dimension-aware spatial index
+  getCurrentDimensionLevel = () => 3,
 }) {
   // Projectile buffers (small, dynamic)
   // Color buffers store RGBA as uint8 (alpha packed in)
@@ -161,18 +163,23 @@ export function createProjectileSystem({
   function queryNearbyPoints(center, radius, maxResults = 64) {
     const positionsArray = getPositionsArray();
     if (!positionsArray || positionsArray.length < 3) return [];
-    if (!hpRenderer?.octree) {
-      hpRenderer?.ensureOctree();
+
+    // Get the current dimension level and use the appropriate spatial index
+    const dimLevel = getCurrentDimensionLevel();
+    let spatialIndex = hpRenderer?.getSpatialIndex?.(dimLevel);
+    if (!spatialIndex) {
+      hpRenderer?.ensureSpatialIndex(dimLevel);
+      spatialIndex = hpRenderer?.getSpatialIndex?.(dimLevel);
     }
-    if (!hpRenderer?.octree) return [];
+    if (!spatialIndex) return [];
 
     // Use the currently displayed LOD level for collision detection
     const currentLOD = hpRenderer.stats?.lodLevel ?? -1;
-    const hasLOD = currentLOD >= 0 && hpRenderer.octree.lodLevels?.length > 0;
+    const hasLOD = currentLOD >= 0 && spatialIndex.lodLevels?.length > 0;
 
     if (hasLOD) {
       // Query at the displayed LOD level
-      const hits = hpRenderer.octree.queryRadiusAtLOD(center, radius, currentLOD, maxResults);
+      const hits = spatialIndex.queryRadiusAtLOD(center, radius, currentLOD, maxResults);
       return hits.map((hit) => ({
         index: hit.originalIndex,
         position: hit.position,
@@ -181,7 +188,7 @@ export function createProjectileSystem({
     }
 
     // Fallback to full resolution query
-    const indices = hpRenderer.octree.queryRadius(center, radius, maxResults);
+    const indices = spatialIndex.queryRadius(center, radius, maxResults);
     return indices.map((idx) => {
       const posBase = idx * 3;
       return {

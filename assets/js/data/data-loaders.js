@@ -403,7 +403,10 @@ export function expandObsManifest(manifest) {
         outlierQuantilesPath: catSchema.outlierPathPattern.replace('{key}', safeKey),
         outlierDtype: catSchema.outlierDtype,
         centroidsByDim: centroidsByDim,
-        // For backward compatibility, also provide centroids as the 3D version (or highest available)
+        // For backward compatibility, provide centroids as highest available dimension (3D -> 2D -> 1D).
+        // Higher dimensions are preferred because they can be projected down to lower dimensions.
+        // Note: state.js correctly looks up centroids by current dimension first via centroidsByDim,
+        // so this is only used as a last-resort fallback for legacy code paths.
         centroids: centroidsByDim['3'] || centroidsByDim['2'] || centroidsByDim['1'] || [],
       };
 

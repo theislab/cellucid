@@ -562,50 +562,53 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       });
     }
 
-    // Cancel any in-progress annotation selection when switching away from annotation mode
-    if (wasAnnotation && mode !== 'annotation') {
-      // Reset UI-managed annotation state
-      annotationCandidateSet = null;
-      annotationStepCount = 0;
+    // Selection tools (lasso, proximity, knn, annotation) share a unified candidate set
+    // NEVER cancel the selection when switching between selection tools
+    // Only cancel when the user explicitly clicks "Cancel"
+    const selectionModes = new Set(['lasso', 'proximity', 'knn', 'annotation']);
+    const wasSelectionMode = selectionModes.has(activeHighlightMode);
+    const isSelectionMode = selectionModes.has(mode);
+
+    // If switching from a selection tool to a non-selection mode (like 'none'), clear everything
+    if (wasSelectionMode && !isSelectionMode) {
+      lassoHistory = [];
+      lassoRedoStack = [];
+      proximityHistory = [];
+      proximityRedoStack = [];
+      knnHistory = [];
+      knnRedoStack = [];
       annotationHistory = [];
       annotationRedoStack = [];
+      annotationCandidateSet = null;
+      annotationStepCount = 0;
+      // Cancel the unified selection (clears shared candidate set)
+      viewer.cancelUnifiedSelection?.();
       viewer.cancelAnnotationSelection?.();
       if (state.clearPreviewHighlight) {
         state.clearPreviewHighlight();
       }
     }
-
-    // Cancel any in-progress lasso selection when switching away from lasso mode
-    if (wasLasso && mode !== 'lasso') {
-      lassoHistory = [];
-      lassoRedoStack = [];
-      viewer.cancelLassoSelection?.();
-      // Clear preview highlight
-      if (state.clearPreviewHighlight) {
-        state.clearPreviewHighlight();
+    // If switching between selection tools, preserve the selection
+    // Clear tool-specific UI history (undo/redo doesn't cross tools)
+    else if (wasSelectionMode && isSelectionMode && activeHighlightMode !== mode) {
+      if (wasLasso) {
+        lassoHistory = [];
+        lassoRedoStack = [];
       }
-    }
-
-    // Cancel any in-progress proximity selection when switching away from proximity mode
-    if (wasProximity && mode !== 'proximity') {
-      proximityHistory = [];
-      proximityRedoStack = [];
-      viewer.cancelProximitySelection?.();
-      // Clear preview highlight
-      if (state.clearPreviewHighlight) {
-        state.clearPreviewHighlight();
+      if (wasProximity) {
+        proximityHistory = [];
+        proximityRedoStack = [];
       }
-    }
-
-    // Cancel any in-progress KNN selection when switching away from KNN mode
-    if (wasKnn && mode !== 'knn') {
-      knnHistory = [];
-      knnRedoStack = [];
-      viewer.cancelKnnSelection?.();
-      // Clear preview highlight
-      if (state.clearPreviewHighlight) {
-        state.clearPreviewHighlight();
+      if (wasKnn) {
+        knnHistory = [];
+        knnRedoStack = [];
       }
+      if (wasAnnotation) {
+        annotationHistory = [];
+        annotationRedoStack = [];
+      }
+      // DON'T clear the unified candidate set or preview highlight
+      // The selection persists so user can refine with different tools
     }
 
     // Remove lasso/proximity/knn/annotation controls UI when switching modes
@@ -623,6 +626,46 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       const text = highlightModeCopy[mode] || '';
       highlightModeDescriptionEl.textContent = text;
       highlightModeDescriptionEl.style.display = text ? 'block' : 'none';
+    }
+
+    // Sync state between annotation (UI-managed) and viewer's unified state
+    // When switching FROM annotation, push annotation state to unified
+    if (wasAnnotation && annotationCandidateSet && annotationCandidateSet.size > 0) {
+      viewer.restoreUnifiedState?.([...annotationCandidateSet], annotationStepCount);
+    }
+    // When switching TO annotation, pull from unified state
+    if (mode === 'annotation') {
+      const unifiedState = viewer.getUnifiedSelectionState?.() || { inProgress: false };
+      if (unifiedState.inProgress && unifiedState.candidateCount > 0) {
+        annotationCandidateSet = new Set(unifiedState.candidates);
+        annotationStepCount = unifiedState.stepCount;
+      }
+    }
+
+    // If switching to a selection tool and there's an existing selection, show the step controls
+    // Use setTimeout to ensure this runs after the step handler functions are defined (hoisting)
+    if (isSelectionMode) {
+      setTimeout(() => {
+        const unifiedState = viewer.getUnifiedSelectionState?.() || { inProgress: false };
+        if (unifiedState.inProgress && unifiedState.candidateCount > 0) {
+          // Trigger the appropriate step callback to show controls for the new tool
+          const stepEvent = {
+            step: unifiedState.stepCount,
+            candidateCount: unifiedState.candidateCount,
+            candidates: unifiedState.candidates,
+            mode: 'intersect'
+          };
+          if (mode === 'lasso' && typeof handleLassoStep === 'function') {
+            handleLassoStep(stepEvent);
+          } else if (mode === 'proximity' && typeof handleProximityStep === 'function') {
+            handleProximityStep(stepEvent);
+          } else if (mode === 'knn' && typeof handleKnnStep === 'function') {
+            handleKnnStep({ ...stepEvent, edgesLoaded: viewer.isKnnEdgesLoaded?.() });
+          } else if (mode === 'annotation' && typeof handleAnnotationStep === 'function') {
+            handleAnnotationStep(stepEvent);
+          }
+        }
+      }, 0);
     }
 
     // Enable/disable lasso mode in viewer
@@ -1080,6 +1123,9 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     // Only count as a step if we have a valid candidate set (mirrors proximity behavior)
     if (annotationCandidateSet) {
       annotationStepCount++;
+
+      // Sync annotation state to viewer's unified state (for cross-tool persistence)
+      viewer.restoreUnifiedState?.([...annotationCandidateSet], annotationStepCount);
 
       // Update UI with step info
       updateAnnotationUI({
@@ -3896,14 +3942,14 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     projectilesEnabledCheckbox.addEventListener('change', () => {
       const enabled = projectilesEnabledCheckbox.checked;
 
-      if (enabled && !viewer.isProjectileOctreeReady?.()) {
-        // Show loading message while building collision octree
+      if (enabled && !viewer.isProjectileSpatialIndexReady?.()) {
+        // Show loading message while building collision spatial index
         if (projectileInfoEl) {
           projectileInfoEl.style.display = 'block';
           projectileInfoEl.innerHTML = '<em>Building collision tree...</em>';
         }
         viewer.setProjectilesEnabled(true, () => {
-          // Octree ready - hide loading message
+          // Spatial index ready - hide loading message
           if (projectileInfoEl) {
             projectileInfoEl.innerHTML = '<em style="color: #4a4;">Ready! Click to shoot, hold to charge.</em>';
             setTimeout(() => {

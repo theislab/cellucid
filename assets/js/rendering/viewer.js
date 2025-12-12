@@ -577,6 +577,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     // For grid collision
     getGridBounds: () => ({ min: -GRID_SIZE, max: GRID_SIZE }),
     isGridVisible: () => showGrid && gridOpacity > 0.1,
+    // For dimension-aware spatial index collision queries
+    getCurrentDimensionLevel: () => viewDimensionLevels.get(LIVE_VIEW_ID) ?? 3,
   });
 
   function getOrbitSigns() {
@@ -618,6 +620,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         }
         // Switch focus (always, regardless of camera lock state)
         focusedViewId = clickedViewId;
+        // Update active state on view title chips
+        updateViewTitleActiveState();
         // Load new view's camera (only when unlocked)
         if (!camerasLocked) {
           const newCam = getViewCameraState(focusedViewId);
@@ -862,16 +866,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     // Planar zoom-to-cursor: adjust target so cursor stays at same world position
     if (navigationMode === 'planar' && planarZoomToCursor) {
-      const rect = canvas.getBoundingClientRect();
-      const canvasX = e.clientX - rect.left;
-      const canvasY = e.clientY - rect.top;
-      const canvasWidth = rect.width;
-      const canvasHeight = rect.height;
-      // Normalized device coords (-1 to 1)
-      const ndcX = (canvasX / canvasWidth) * 2 - 1;
-      const ndcY = -((canvasY / canvasHeight) * 2 - 1);
+      // In multiview mode, use viewport-local coordinates for correct NDC calculation
+      const vpInfo = getViewportInfoAtScreen(e.clientX, e.clientY);
+      // Normalized device coords (-1 to 1) relative to the viewport
+      const ndcX = (vpInfo.vpLocalX / vpInfo.vpWidth) * 2 - 1;
+      const ndcY = -((vpInfo.vpLocalY / vpInfo.vpHeight) * 2 - 1);
       // In planar mode with perspective, calculate world offset at target plane
-      const aspect = canvasWidth / canvasHeight;
+      const aspect = vpInfo.vpAspect;
       const halfHeight = oldRadius * Math.tan(fov / 2);
       const halfWidth = halfHeight * aspect;
       // World position under cursor before zoom (X and Y plane)
@@ -1131,19 +1132,20 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   // Get camera position and axes for a specific view (multiview support)
   // Uses cached view matrix for non-focused views (more reliable than camera state)
   function getCameraForView(viewId) {
-    const isFocused = viewId === focusedViewId;
+    const vid = String(viewId);
+    const isFocused = vid === String(focusedViewId);
     // For the focused view, use global state (always up-to-date)
     if (isFocused || camerasLocked) {
       return { position: freeflyPosition, axes: getFreeflyAxes() };
     }
     // For non-focused views, try cached view matrix first (most reliable)
-    const cached = cachedViewMatrices.get(viewId);
+    const cached = cachedViewMatrices.get(vid);
     if (cached && cached.viewMatrix) {
       const fromMatrix = getCameraFromViewMatrix(cached.viewMatrix);
       if (fromMatrix) return fromMatrix;
     }
     // Fall back to camera state
-    const camState = getViewCameraState(viewId);
+    const camState = getViewCameraState(vid);
     return getCameraFromState(camState);
   }
 
@@ -1588,13 +1590,23 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   // === CENTROID SNAPSHOT BUFFER MANAGEMENT ===
   // Pre-upload centroid data to GPU once per snapshot (eliminates per-frame uploads)
 
-  function createCentroidSnapshotBuffer(viewId, positions, colors) {
+  /**
+   * Create or update a centroid snapshot buffer for a view.
+   * @param {string} viewId - View identifier
+   * @param {Float32Array} positions - Centroid positions
+   * @param {Uint8Array} colors - Centroid colors (RGBA)
+   * @param {number} [dimensionLevel] - Optional dimension level for tracking changes
+   */
+  function createCentroidSnapshotBuffer(viewId, positions, colors, dimensionLevel = undefined) {
     if (!positions || !colors) return false;
     const count = positions.length / 3;
     if (count === 0) return false;
 
+    // Normalize viewId to string for consistent Map keys
+    const vid = String(viewId);
+
     // Delete existing if updating
-    deleteCentroidSnapshotBuffer(viewId);
+    deleteCentroidSnapshotBuffer(vid);
 
     // Build interleaved buffer: 16 bytes per point (12 pos + 4 color)
     const STRIDE = 16;
@@ -1631,25 +1643,69 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     gl.vertexAttribPointer(centroidAttribLocations.color, 4, gl.UNSIGNED_BYTE, true, STRIDE, 12);
     gl.bindVertexArray(null);
 
-    centroidSnapshotBuffers.set(viewId, { vao, buffer: glBuffer, count });
+    // Store dimension level and position fingerprint to detect when buffer needs recreation
+    // Fingerprint is based on count and sampled position values
+    const posFingerprint = computeCentroidFingerprint(positions);
+    centroidSnapshotBuffers.set(vid, { vao, buffer: glBuffer, count, dimensionLevel, posFingerprint });
     return true;
   }
 
+  /**
+   * Compute a simple fingerprint of centroid positions to detect changes.
+   * @param {Float32Array} positions - Centroid positions array
+   * @returns {string} Fingerprint string
+   */
+  function computeCentroidFingerprint(positions) {
+    if (!positions || positions.length < 3) return '0';
+    const len = positions.length;
+    const mid = Math.floor(len / 2) - (Math.floor(len / 2) % 3);  // Align to xyz triplet
+    const last = len - 3;
+    // Sample first, middle, last positions and include total length
+    return `${len}:${positions[0].toFixed(4)},${positions[mid]?.toFixed(4) || 0},${positions[last]?.toFixed(4) || 0}`;
+  }
+
   function deleteCentroidSnapshotBuffer(viewId) {
-    const existing = centroidSnapshotBuffers.get(viewId);
+    const vid = String(viewId);
+    const existing = centroidSnapshotBuffers.get(vid);
     if (existing) {
       gl.deleteVertexArray(existing.vao);
       gl.deleteBuffer(existing.buffer);
-      centroidSnapshotBuffers.delete(viewId);
+      centroidSnapshotBuffers.delete(vid);
     }
   }
 
   function hasCentroidSnapshotBuffer(viewId) {
-    return centroidSnapshotBuffers.has(viewId);
+    return centroidSnapshotBuffers.has(String(viewId));
+  }
+
+  /**
+   * Check if centroid buffer needs recreation (dimension changed, positions changed, or doesn't exist)
+   * @param {string} viewId - View identifier
+   * @param {number} currentDimensionLevel - Current dimension level for the view
+   * @param {Float32Array} [positions] - Optional positions to check for changes
+   * @returns {boolean} True if buffer needs to be (re)created
+   */
+  function centroidBufferNeedsUpdate(viewId, currentDimensionLevel, positions = null) {
+    const vid = String(viewId);
+    const existing = centroidSnapshotBuffers.get(vid);
+    if (!existing) return true;  // Doesn't exist, need to create
+    // Check if dimension changed since buffer was created
+    // Also recreate if old buffer doesn't have dimensionLevel stored (legacy buffer)
+    if (existing.dimensionLevel === undefined || existing.dimensionLevel !== currentDimensionLevel) {
+      return true;  // Dimension unknown or changed, need to recreate
+    }
+    // Check if positions changed (detects data reload with same dimension)
+    if (positions && existing.posFingerprint) {
+      const currentFingerprint = computeCentroidFingerprint(positions);
+      if (currentFingerprint !== existing.posFingerprint) {
+        return true;  // Positions changed, need to recreate
+      }
+    }
+    return false;
   }
 
   function drawCentroidsWithSnapshot(viewId, viewportHeight) {
-    const snapshot = centroidSnapshotBuffers.get(viewId);
+    const snapshot = centroidSnapshotBuffers.get(String(viewId));
     if (!snapshot || snapshot.count === 0) return;
 
     gl.useProgram(centroidProgram);
@@ -1857,14 +1913,25 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     const ray = screenToRay(vpLocalX, vpLocalY, vpWidth, vpHeight, vpAspect, effectiveViewMatrix);
     if (!ray) return -1;
 
-    const positions = hpRenderer.getPositions();
-    if (!positions) return -1;
+    // Get view-specific positions for multi-dimensional support
+    // Different views may have different position data (e.g., 2D vs 3D embeddings)
+    const globalPositions = hpRenderer.getPositions();
+    if (!globalPositions) return -1;
+    const viewSpecificPositions = viewPositionsCache.get(String(clickedViewId));
+    const positions = viewSpecificPositions || globalPositions;
 
-    const octree = hpRenderer.octree;
+    // Get the dimension level for this view and use spatial index if available
+    // Don't force creation - use brute force fallback if no spatial index exists
+    const viewDimLevel = viewDimensionLevels.get(String(clickedViewId)) ?? viewDimensionLevels.get(LIVE_VIEW_ID) ?? 3;
+    const spatialIndex = hpRenderer.getSpatialIndex(viewDimLevel);
+
+    // Cache highlight array reference for faster access in tight loop
+    const highlightArray = highlightTools?.highlightArray;
 
     // Sample along the ray to find the nearest cell
-    const maxDistance = radius * 4; // Max ray distance
-    const sampleStep = 0.02; // Step size along ray
+    // Limit iterations to prevent lag (max 500 samples)
+    const maxDistance = Math.min(radius * 4, 10); // Cap max distance
+    const sampleStep = Math.max(0.02, maxDistance / 500); // Adaptive step size
     const searchRadius = 0.03; // Search radius around each sample point
 
     let nearestCell = -1;
@@ -1877,16 +1944,16 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         ray.origin[2] + ray.direction[2] * t
       ];
 
-      // Query cells near this point
+      // Query cells near this point - increase limit for better coverage
       let candidates;
-      if (octree) {
-        candidates = octree.queryRadius(samplePoint, searchRadius, 16);
+      if (spatialIndex) {
+        candidates = spatialIndex.queryRadius(samplePoint, searchRadius, 32);
       } else {
         // Fallback: brute force search (slow)
         candidates = [];
         const r2 = searchRadius * searchRadius;
         const n = positions.length / 3;
-        for (let i = 0; i < n && candidates.length < 16; i++) {
+        for (let i = 0; i < n && candidates.length < 32; i++) {
           const dx = positions[i * 3] - samplePoint[0];
           const dy = positions[i * 3 + 1] - samplePoint[1];
           const dz = positions[i * 3 + 2] - samplePoint[2];
@@ -1898,8 +1965,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
       // Find the cell closest to the ray (perpendicular distance)
       for (const idx of candidates) {
-        // Skip filtered-out cells (alpha = 0)
-        if (transparencyArray && transparencyArray[idx] === 0) continue;
+        // Cell is pickable if: visible (alpha > 0) OR already highlighted
+        // This allows interacting with highlighted cells even if filtered in current view
+        const isVisible = !transparencyArray || transparencyArray[idx] > 0;
+        const isHighlighted = highlightArray && highlightArray[idx] > 0;
+        if (!isVisible && !isHighlighted) continue;
 
         const px = positions[idx * 3];
         const py = positions[idx * 3 + 1];
@@ -2260,9 +2330,16 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
           if (view.colors) hpRenderer.updateColors(view.colors);
           if (view.transparency) hpRenderer.updateAlphas(view.transparency);
           currentLoadedViewId = view.id;
+        } else if (view.id === LIVE_VIEW_ID && currentLoadedViewId !== null) {
+          // Reset tracking when switching back to live view
+          currentLoadedViewId = null;
         }
         renderSingleView(width, height, { x: 0, y: 0, w: 1, h: 1 }, view.id, view.centroidCount);
       } else {
+        // Multi-view mode: reset tracking since we use snapshot buffers
+        if (currentLoadedViewId !== null) {
+          currentLoadedViewId = null;
+        }
         renderSingleView(width, height, { x: 0, y: 0, w: 1, h: 1 });
       }
       hideViewTitles(); // No titles in single/fullscreen mode
@@ -2365,13 +2442,16 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         // For snapshots without GPU buffers, lazily create one (uploaded once, not per-frame)
         // Skip live view - state.js handles updates via viewer.updateColors/updateTransparency
         if (view.id !== LIVE_VIEW_ID && !hasSnapshotBuffer && view.colors && view.transparency) {
-          hpRenderer.createSnapshotBuffer(view.id, view.colors, view.transparency);
+          // CRITICAL: Pass view-specific positions from cache, not global positions
+          const viewPositions = viewPositionsCache.get(String(view.id)) || positionsArray;
+          hpRenderer.createSnapshotBuffer(view.id, view.colors, view.transparency, viewPositions);
           hasSnapshotBuffer = true;
         }
 
-        // Lazily create centroid snapshot buffer if not exists (uploaded once, not per-frame)
-        if (view.centroidPositions && view.centroidColors && !hasCentroidSnapshotBuffer(view.id)) {
-          createCentroidSnapshotBuffer(view.id, view.centroidPositions, view.centroidColors);
+        // Create or recreate centroid snapshot buffer if needed (dimension change, position change, or doesn't exist)
+        const viewDimLevel = viewDimensionLevels.get(view.id) ?? 3;
+        if (view.centroidPositions && view.centroidColors && centroidBufferNeedsUpdate(view.id, viewDimLevel, view.centroidPositions)) {
+          createCentroidSnapshotBuffer(view.id, view.centroidPositions, view.centroidColors, viewDimLevel);
         }
 
         // Render this viewport - use snapshot buffer if available (no data upload!)
@@ -2403,6 +2483,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     const cameraPosition = [tempInvViewMatrix[12], tempInvViewMatrix[13], tempInvViewMatrix[14]];
 
     // Render params shared by both render paths
+    // Get dimension level for this view (used for LOD and frustum culling calculations)
+    const dimLevel = viewDimensionLevels.get(vid) ?? 3;
     const renderParams = {
       mvpMatrix,
       viewMatrix,
@@ -2419,7 +2501,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       lightDir,
       cameraPosition,
       cameraDistance: radius,
-      viewId: vid  // Per-view identifier for LOD and frustum culling state
+      viewId: vid,  // Per-view identifier for LOD and frustum culling state
+      dimensionLevel: dimLevel  // Current dimension level for correct 2D/3D LOD calculation
     };
 
     // Render scatter points - use snapshot buffer if available (no data upload!)
@@ -2983,14 +3066,15 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
   // Update cached view matrix for a specific view (call when camera changes)
   function updateCachedViewMatrix(viewId, camState) {
+    const vid = String(viewId);
     if (!camState) {
-      cachedViewMatrices.delete(viewId);
+      cachedViewMatrices.delete(vid);
       return;
     }
-    let cached = cachedViewMatrices.get(viewId);
+    let cached = cachedViewMatrices.get(vid);
     if (!cached) {
       cached = { viewMatrix: mat4.create(), radius: 0 };
-      cachedViewMatrices.set(viewId, cached);
+      cachedViewMatrices.set(vid, cached);
     }
     computeViewMatrixFromState(camState, cached.viewMatrix);
     cached.radius = camState.orbit?.radius ?? radius;
@@ -3027,15 +3111,20 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
   // === Public API ===
   return {
-    setData({ positions, colors, outlierQuantiles, transparency }) {
+    setData({ positions, colors, outlierQuantiles, transparency, dimensionLevel = 3 }) {
       pointCount = positions.length / 3;
       positionsArray = positions;
       colorsArray = colors;
       transparencyArray = transparency;
       computePointBoundsFromPositions(positions);
 
+      // Initialize dimension level for live view (default 3D if not specified)
+      viewDimensionLevels.set(LIVE_VIEW_ID, dimensionLevel);
+      viewPositionsCache.set(LIVE_VIEW_ID, positions);
+
       // Load data into HP renderer (alpha is packed in colors as RGBA uint8)
-      hpRenderer.loadData(positions, colors);
+      // Pass dimension level so the renderer can build the appropriate spatial index (BinaryTree/Quadtree/Octree)
+      hpRenderer.loadData(positions, colors, { dimensionLevel });
     },
 
     updateColors(colors) {
@@ -3050,6 +3139,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       currentLoadedViewId = LIVE_VIEW_ID; // Mark live view as loaded
       // Rebuild highlight buffer when visibility changes (filter applied/removed)
       highlightTools?.handleTransparencyChange?.(alphaArray);
+
+      // Propagate transparency changes to snapshot buffers that share transparency with live view
+      // This ensures filter changes affect all views in grid mode when sharesLiveTransparency is true
+      for (const snap of snapshotViews) {
+        if (snap.sharesLiveTransparency && hpRenderer.hasSnapshotBuffer(snap.id)) {
+          // Update snapshot buffer with new transparency from live view
+          const viewPositions = viewPositionsCache.get(String(snap.id)) || positionsArray;
+          hpRenderer.updateSnapshotBuffer(snap.id, snap.colors, alphaArray, viewPositions);
+          // Also update the snapshot's transparency reference so it stays in sync
+          snap.transparency = alphaArray;
+        }
+      }
     },
 
     updateOutlierQuantiles(outliers) {
@@ -3073,17 +3174,15 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       computePointBoundsFromPositions(positions);
 
       // Update HP renderer with new positions (keeps existing colors/transparency)
+      // Pass dimension level so the renderer can update for the correct dimension
+      const dimLevel = viewDimensionLevels.get(LIVE_VIEW_ID) ?? 3;
       if (hpRenderer && hpRenderer.updatePositions) {
-        hpRenderer.updatePositions(positions);
+        hpRenderer.updatePositions(positions, dimLevel);
       } else if (hpRenderer && hpRenderer.loadData) {
         // Fallback: full reload if incremental update not available
-        hpRenderer.loadData(positions, colorsArray);
+        hpRenderer.loadData(positions, colorsArray, { dimensionLevel: dimLevel });
       }
-
-      // Rebuild octree for picking/projectiles if needed
-      if (hpRenderer && hpRenderer.rebuildOctree) {
-        hpRenderer.rebuildOctree();
-      }
+      // Note: Spatial index is rebuilt lazily by updatePositions only if LOD/frustum culling is enabled
 
       currentLoadedViewId = LIVE_VIEW_ID;
     },
@@ -3111,6 +3210,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
      */
     setViewDimension(viewId, level) {
       const vid = String(viewId);
+      const oldLevel = viewDimensionLevels.get(vid);
       viewDimensionLevels.set(vid, level);
 
       // Also update the snapshot object if this is a snapshot view
@@ -3118,6 +3218,25 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       if (snap) {
         snap.dimensionLevel = level;
       }
+
+      // Invalidate per-view caches when dimension changes (LOD/frustum calculations differ)
+      if (oldLevel !== level && hpRenderer) {
+        hpRenderer.clearViewState(vid);
+        // If this view has a snapshot buffer with spatial index, it needs rebuild
+        const snapshot = hpRenderer.snapshotBuffers?.get(vid);
+        if (snapshot?.spatialIndex) {
+          snapshot.spatialIndex = null;
+        }
+
+        // For live view, also update the renderer's dimension level
+        // This switches the renderer to use the appropriate spatial index (BinaryTree/Quadtree/Octree)
+        if (vid === LIVE_VIEW_ID && hpRenderer.setDimensionLevel) {
+          hpRenderer.setDimensionLevel(level);
+        }
+      }
+
+      // Invalidate cached view matrix since camera behavior may differ per dimension
+      cachedViewMatrices.delete(vid);
     },
 
     /**
@@ -3143,8 +3262,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       if (vid === LIVE_VIEW_ID) {
         positionsArray = positions;
         computePointBoundsFromPositions(positions);
+        // Pass dimension level so the renderer can build the appropriate spatial index
+        const dimLevel = viewDimensionLevels.get(vid) ?? 3;
         if (hpRenderer && hpRenderer.updatePositions) {
-          hpRenderer.updatePositions(positions);
+          hpRenderer.updatePositions(positions, dimLevel);
         }
       } else {
         // For snapshot views, update the snapshot buffer positions
@@ -3177,8 +3298,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       viewPositionsCache.delete(vid);
     },
 
-    updateHighlight(highlightData) {
-      highlightTools?.updateHighlight?.(highlightData);
+    updateHighlight(highlightData, highlightedIndices = null) {
+      highlightTools?.updateHighlight?.(highlightData, null, highlightedIndices);
     },
 
     setHighlightStyle(options = {}) {
@@ -3366,6 +3487,24 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       highlightTools?.restoreKnnState?.(candidates, step);
     },
 
+    // Unified selection API (shared state across lasso, proximity, KNN)
+    // Allows switching tools mid-selection to refine with different methods
+    getUnifiedSelectionState() {
+      return highlightTools?.getUnifiedSelectionState?.() || { inProgress: false, stepCount: 0, candidateCount: 0, candidates: [] };
+    },
+
+    confirmUnifiedSelection(callback) {
+      return highlightTools?.confirmUnifiedSelection?.(callback) || [];
+    },
+
+    cancelUnifiedSelection() {
+      highlightTools?.cancelUnifiedSelection?.();
+    },
+
+    restoreUnifiedState(candidates, step) {
+      highlightTools?.restoreUnifiedState?.(candidates, step);
+    },
+
   setCentroids({ positions, colors, outlierQuantiles, transparency }) {
     centroidCount = positions ? positions.length / 3 : 0;
     gl.bindBuffer(gl.ARRAY_BUFFER, centroidPositionBuffer);
@@ -3517,10 +3656,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     setPointerLockChangeHandler(fn) { pointerLockChangeHandler = typeof fn === 'function' ? fn : null; },
     setProjectilesEnabled(enabled, onReady) {
       projectileSystem.setEnabled(enabled);
-      if (enabled && hpRenderer && !hpRenderer.octree) {
-        // Defer octree building so UI can update first (show loading message)
+      // Get the current dimension level for collision detection
+      const dimLevel = viewDimensionLevels.get(LIVE_VIEW_ID) ?? 3;
+      if (enabled && hpRenderer && !hpRenderer.hasSpatialIndex(dimLevel)) {
+        // Defer spatial index building so UI can update first (show loading message)
         setTimeout(() => {
-          hpRenderer.ensureOctree();
+          hpRenderer.ensureSpatialIndex(dimLevel);
           if (typeof onReady === 'function') onReady();
         }, 10);
       } else if (typeof onReady === 'function') {
@@ -3528,8 +3669,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         onReady();
       }
     },
-    isProjectileOctreeReady() {
-      return !!(hpRenderer && hpRenderer.octree);
+    isProjectileSpatialIndexReady() {
+      const dimLevel = viewDimensionLevels.get(LIVE_VIEW_ID) ?? 3;
+      return !!(hpRenderer && hpRenderer.hasSpatialIndex(dimLevel));
     },
 
     // Orbit anchor visibility control
@@ -3902,6 +4044,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       // Get initial dimension level from config or inherit from current live view
       const initialDimLevel = config.dimensionLevel ?? viewDimensionLevels.get(LIVE_VIEW_ID) ?? 3;
 
+      // Track if this snapshot should share transparency with the live view
+      // If sharesLiveTransparency is true, filter changes on live view propagate to this snapshot
+      const sharesLiveTransparency = config.sharesLiveTransparency ?? false;
+
       const snapshot = {
         id,
         label: config.label || `View ${snapshotViews.length + 2}`,
@@ -3916,7 +4062,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         outlierThreshold: config.outlierThreshold ?? 1.0,
         meta: config.meta || {},
         cameraState: inheritedCamera,  // Per-view camera state
-        dimensionLevel: initialDimLevel  // Per-view dimension level for multi-dimensional support
+        dimensionLevel: initialDimLevel,  // Per-view dimension level for multi-dimensional support
+        sharesLiveTransparency  // If true, filter changes on live view propagate to this snapshot
       };
       snapshotViews.push(snapshot);
 
@@ -3937,8 +4084,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       }
 
       // Create centroid GPU buffer for this snapshot (uploaded once)
+      // Pass dimension level so buffer can be recreated if dimension changes
       if (snapshot.centroidPositions && snapshot.centroidColors) {
-        createCentroidSnapshotBuffer(id, snapshot.centroidPositions, snapshot.centroidColors);
+        const dimLevel = viewDimensionLevels.get(id) ?? 3;
+        createCentroidSnapshotBuffer(id, snapshot.centroidPositions, snapshot.centroidColors, dimLevel);
       }
 
       // Pre-compute cached view matrix for this snapshot (if cameras unlocked)
@@ -3970,8 +4119,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       }
 
       // Re-upload centroid GPU buffer if changed
+      // Pass dimension level so buffer can be recreated if dimension changes
       if ((attrs.centroidPositions || attrs.centroidColors) && snap.centroidPositions && snap.centroidColors) {
-        createCentroidSnapshotBuffer(id, snap.centroidPositions, snap.centroidColors);
+        const dimLevel = viewDimensionLevels.get(id) ?? 3;
+        createCentroidSnapshotBuffer(id, snap.centroidPositions, snap.centroidColors, dimLevel);
       }
 
       // If this is the focused view in single mode, update HP renderer's main buffer too
@@ -4025,9 +4176,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
           orbitAnchorRenderer.deleteViewState(snap.id);
         }
       }
-      // Delete all centroid snapshot GPU buffers
+      // Delete all centroid snapshot GPU buffers (preserve live view)
       for (const id of centroidSnapshotBuffers.keys()) {
-        deleteCentroidSnapshotBuffer(id);
+        if (String(id) !== LIVE_VIEW_ID) {
+          deleteCentroidSnapshotBuffer(id);
+        }
       }
       // Clean up cached view matrices and dimension state for snapshots (preserve live view)
       for (const snap of snapshotViews) {
