@@ -182,10 +182,19 @@ export async function urlExists(url) {
   try {
     const response = await fetch(url, { method: 'HEAD' });
     if (response.ok) return true;
-    // Some servers don't support HEAD, try GET
+    // Some servers don't support HEAD, try GET with minimal data transfer
     if (response.status === 405 || response.status === 501) {
-      const getResponse = await fetch(url);
-      return getResponse.ok;
+      // Use Range header to request only 1 byte, and abort after headers received
+      // fetch() resolves once headers arrive, so we can check status then abort to skip body
+      const controller = new AbortController();
+      const getResponse = await fetch(url, {
+        headers: { 'Range': 'bytes=0-0' },
+        signal: controller.signal
+      });
+      const exists = getResponse.ok || getResponse.status === 206;
+      // Abort to prevent downloading body data (we only needed headers)
+      controller.abort();
+      return exists;
     }
     return false;
   } catch (_err) {
@@ -240,16 +249,36 @@ export async function validateDatasetStructure(baseUrl, _sourceType) {
   const missing = [];
   let pointsFile = null;
 
-  // Check for dimensional points files (3D preferred, then 2D, then 1D)
-  for (const candidate of DATA_CONFIG.POINTS_FILES) {
+  // Build all URL check promises in parallel
+  // For points files: check both .gz and non-.gz variants for each candidate
+  const pointsChecks = DATA_CONFIG.POINTS_FILES.map(candidate => {
     const pointsUrl = resolveUrl(baseUrl, candidate);
     const pointsGzUrl = pointsUrl + '.gz';
+    return Promise.all([
+      urlExists(pointsGzUrl).then(exists => ({ candidate, gz: true, exists })),
+      urlExists(pointsUrl).then(exists => ({ candidate, gz: false, exists }))
+    ]);
+  });
 
-    if (await urlExists(pointsGzUrl)) {
-      pointsFile = candidate + '.gz';
+  // Check required files in parallel
+  const requiredChecks = DATA_CONFIG.REQUIRED_FILES.map(file => {
+    const url = resolveUrl(baseUrl, file);
+    return urlExists(url).then(exists => ({ file, exists }));
+  });
+
+  // Wait for all checks to complete in parallel
+  const [pointsResults, requiredResults] = await Promise.all([
+    Promise.all(pointsChecks),
+    Promise.all(requiredChecks)
+  ]);
+
+  // Find the highest priority points file that exists (3D > 2D > 1D, prefer .gz)
+  for (const [gzResult, plainResult] of pointsResults) {
+    if (gzResult.exists) {
+      pointsFile = gzResult.candidate + '.gz';
       break;
-    } else if (await urlExists(pointsUrl)) {
-      pointsFile = candidate;
+    } else if (plainResult.exists) {
+      pointsFile = plainResult.candidate;
       break;
     }
   }
@@ -258,11 +287,10 @@ export async function validateDatasetStructure(baseUrl, _sourceType) {
     missing.push('points_Xd.bin (at least one of: ' + DATA_CONFIG.POINTS_FILES.join(', ') + ')');
   }
 
-  // Check required files
-  for (const file of DATA_CONFIG.REQUIRED_FILES) {
-    const url = resolveUrl(baseUrl, file);
-    if (!await urlExists(url)) {
-      missing.push(file);
+  // Collect missing required files
+  for (const result of requiredResults) {
+    if (!result.exists) {
+      missing.push(result.file);
     }
   }
 

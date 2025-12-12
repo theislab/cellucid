@@ -3,6 +3,7 @@ import { createViewer } from '../rendering/viewer.js';
 import { createDataState } from './state.js';
 import { initUI } from './ui.js';
 import { createStateSerializer } from './state-serializer.js';
+import { initDockableAccordions } from './dockable-accordions.js';
 import {
   loadObsJson,
   loadObsManifest,
@@ -49,6 +50,8 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
   const centroidLabelsCheckbox = document.getElementById('toggle-centroid-labels');
   const sidebar = document.getElementById('sidebar');
   const sidebarToggle = document.getElementById('sidebar-toggle');
+
+  initDockableAccordions({ sidebar });
   const displayOptionsContainer = document.getElementById('display-options-container');
   const outlierFilterContainer = document.getElementById('outlier-filter-container');
   const outlierFilterInput = document.getElementById('outlier-filter');
@@ -789,10 +792,33 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
        * An edge is visible only if BOTH endpoints pass filters AND are visible at current LOD.
        *
        * Performance: Reuses buffer, returns filterVis directly when LOD is disabled/full detail.
+       *
+       * @param {string} [viewId] - Optional view ID for per-view visibility (snapshots).
+       *   If not provided, uses global live view visibility.
+       * @param {number} [dimensionLevel] - Optional dimension level for LOD calculation.
+       * @returns {Float32Array|null} Combined visibility array
        */
-      function getCombinedVisibility() {
-        const filterVis = state.getVisibilityArray();
-        const lodVis = viewer.getLodVisibilityArray();
+      function getCombinedVisibility(viewId, dimensionLevel) {
+        // Get filter visibility:
+        // - For live view (no viewId): use state.getVisibilityArray()
+        // - For snapshots: use snapshot's transparency if it has its own filters
+        let filterVis;
+        if (viewId && viewId !== 'live') {
+          // Get snapshot's transparency as filter visibility
+          const snapshot = viewer.getSnapshotViews?.()?.find(s => s.id === viewId);
+          if (snapshot && !snapshot.sharesLiveTransparency && snapshot.transparency) {
+            // Convert transparency to binary visibility (transparency > 0.01 = visible)
+            filterVis = snapshot.transparency;
+          } else {
+            // Shares live transparency or no snapshot found
+            filterVis = state.getVisibilityArray();
+          }
+        } else {
+          filterVis = state.getVisibilityArray();
+        }
+
+        // Get LOD visibility for this specific view and dimension
+        const lodVis = viewer.getLodVisibilityArray(viewId, dimensionLevel);
 
         if (!filterVis) return null;
         if (!lodVis) return filterVis; // No LOD active, just use filter visibility (no copy needed)
@@ -805,8 +831,9 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         }
 
         // Combined visibility = filter AND LOD
+        // For transparency arrays, use threshold of 0.01 (nearly transparent = hidden)
         for (let i = 0; i < n; i++) {
-          combinedVisibilityBuffer[i] = (filterVis[i] > 0.5 && lodVis[i] > 0.5) ? 1.0 : 0.0;
+          combinedVisibilityBuffer[i] = (filterVis[i] > 0.01 && lodVis[i] > 0.5) ? 1.0 : 0.0;
         }
 
         return combinedVisibilityBuffer;
@@ -979,10 +1006,26 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
               viewer.setupEdgesV2(edgeData, state.positionsArray);
               edgesLoaded = true;
 
-              // Get combined visibility (filter + LOD) and count visible edges
+              // Set up edge textures for any existing snapshots (in case edges loaded after snapshots)
+              const existingSnapshots = viewer.getSnapshotViews?.() || [];
+              for (const snapshot of existingSnapshots) {
+                const positions = viewer.getViewPositions?.(snapshot.id) || state.positionsArray;
+                if (positions && viewer.setupEdgesV2ForView) {
+                  viewer.setupEdgesV2ForView(snapshot.id, positions, positions.length / 3);
+                }
+              }
+
+              // Get combined visibility (filter + LOD) and count visible edges for all views
               cachedCombinedVisibility = getCombinedVisibility();
               if (cachedCombinedVisibility) {
                 viewer.updateEdgeVisibilityV2(cachedCombinedVisibility);
+                // Also update existing snapshots
+                for (const snapshot of existingSnapshots) {
+                  const snapshotVis = getCombinedVisibility(snapshot.id, snapshot.dimensionLevel);
+                  if (snapshotVis && viewer.updateEdgeVisibilityV2ForView) {
+                    viewer.updateEdgeVisibilityV2ForView(snapshot.id, snapshotVis);
+                  }
+                }
                 const { visibleCount } = countVisibleEdges(cachedCombinedVisibility);
                 actualVisibleEdges = visibleCount;
               }
@@ -1008,11 +1051,8 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
               return;
             }
           } else if (show && edgesLoaded) {
-            // Already loaded - just update combined visibility
-            cachedCombinedVisibility = getCombinedVisibility();
-            if (cachedCombinedVisibility) {
-              viewer.updateEdgeVisibilityV2(cachedCombinedVisibility);
-            }
+            // Already loaded - just update combined visibility for all views
+            updateEdgeVisibilityCore();
           }
 
           viewer.setShowConnectivity(show);
@@ -1032,17 +1072,27 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       /**
        * Update edge visibility with combined filter + LOD visibility.
        * Called when filters change or LOD level changes.
+       * Updates all views (live + snapshots) for proper multi-view support.
        */
       function updateEdgeVisibilityCore() {
         if (!edgesLoaded) return;
 
-        // Get combined visibility (filter AND LOD)
+        // Update live view edges
         cachedCombinedVisibility = getCombinedVisibility();
         if (!cachedCombinedVisibility) return;
 
         viewer.updateEdgeVisibilityV2(cachedCombinedVisibility);
 
-        // Count actual visible edges (both endpoints visible)
+        // Update all snapshot views' edge visibility
+        const snapshots = viewer.getSnapshotViews?.() || [];
+        for (const snapshot of snapshots) {
+          const snapshotVis = getCombinedVisibility(snapshot.id, snapshot.dimensionLevel);
+          if (snapshotVis) {
+            viewer.updateEdgeVisibilityV2ForView(snapshot.id, snapshotVis);
+          }
+        }
+
+        // Count actual visible edges (both endpoints visible) - for live view
         const { visibleCount } = countVisibleEdges(cachedCombinedVisibility);
         actualVisibleEdges = visibleCount;
 

@@ -212,7 +212,7 @@ async function fetchBinary(url) {
 /**
  * Load points binary, trying .gz version first if the URL doesn't already end in .gz
  * This handles both compressed and uncompressed data transparently.
- * Supports local-user:// protocol for user directories.
+ * Supports all custom protocols (local-user://, remote://, jupyter://) via DataSourceManager.
  */
 export async function loadPointsBinary(url) {
   // If URL already ends with .gz, just fetch it directly
@@ -237,10 +237,13 @@ export async function loadPointsBinary(url) {
     }
   }
 
-  // For regular URLs, try .gz version first via HTTP
+  // For all other URLs (including custom protocols like remote://, jupyter://),
+  // resolve the protocol first, then try .gz version
   const gzUrl = url + '.gz';
   try {
-    const response = await fetch(gzUrl);
+    // Resolve custom protocol (if any) before fetching
+    const resolvedGzUrl = await resolveAnyUrl(gzUrl);
+    const response = await fetch(resolvedGzUrl);
     if (response.ok) {
       console.log('Found compressed points file:', gzUrl);
       // Gzip version exists, decompress it

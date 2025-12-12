@@ -48,6 +48,7 @@ export class HighlightRenderer {
     // This dramatically improves performance when only a small fraction of cells are highlighted
     this._highlightedIndicesCache = null;  // Array of highlighted cell indices
     this._highlightDataRef = null;         // Reference to last highlightData array
+    this._highlightDataFingerprint = 0;    // Content-based fingerprint for in-place modification detection
     this._highlightDataVersion = 0;        // Incremented when cache is invalidated
 
     // Visual style state (defaults mirror previous viewer.js values)
@@ -122,27 +123,59 @@ export class HighlightRenderer {
   }
 
   /**
+   * Compute a fingerprint for highlight data array (for content-based cache invalidation).
+   * Detects in-place modifications to the highlight array.
+   * @private
+   */
+  _computeHighlightDataFingerprint(highlightData) {
+    if (!highlightData || highlightData.length === 0) return 0;
+    const len = highlightData.length;
+    // Count highlighted cells with sparse sampling for quick detection
+    let highlightCount = 0;
+    let sumSample = 0;
+    const step = Math.max(1, Math.floor(len / 500));
+    for (let i = 0; i < len; i += step) {
+      if (highlightData[i] > 0) highlightCount++;
+      sumSample += highlightData[i];
+    }
+    // Combine length, highlight count estimate, and sum for fingerprint
+    return len * 31 + highlightCount * 17 + sumSample;
+  }
+
+  /**
    * Update or invalidate the highlighted indices cache.
    * Call this when highlight data changes to enable fast iteration in rebuildBuffer.
    * @param {Uint8Array} highlightData - Highlight intensity per cell
    * @param {boolean} [forceRebuild=false] - Force full cache rebuild
    */
   updateHighlightCache(highlightData, forceRebuild = false) {
-    // Check if we need to rebuild the cache
-    const needsRebuild = forceRebuild ||
-      !this._highlightedIndicesCache ||
-      this._highlightDataRef !== highlightData;
-
-    if (!needsRebuild) return;
-
-    // Build new cache by scanning all cells (only done when highlight data reference changes)
+    // Handle null/undefined highlight data
     if (!highlightData) {
-      this._highlightedIndicesCache = [];
-      this._highlightDataRef = null;
-      this._highlightDataVersion++;
+      if (this._highlightedIndicesCache !== null || this._highlightDataRef !== null) {
+        this._highlightedIndicesCache = [];
+        this._highlightDataRef = null;
+        this._highlightDataFingerprint = 0;
+        this._highlightDataVersion++;
+      }
       return;
     }
 
+    // Compute fingerprint for content-based invalidation (detects in-place modifications)
+    const newFingerprint = this._computeHighlightDataFingerprint(highlightData);
+
+    // Check if we need to rebuild the cache:
+    // 1. Force rebuild requested
+    // 2. Cache doesn't exist
+    // 3. Reference changed (different array)
+    // 4. Content changed (same array, but modified in-place - detected via fingerprint)
+    const needsRebuild = forceRebuild ||
+      !this._highlightedIndicesCache ||
+      this._highlightDataRef !== highlightData ||
+      this._highlightDataFingerprint !== newFingerprint;
+
+    if (!needsRebuild) return;
+
+    // Build new cache by scanning all cells
     const indices = [];
     const len = highlightData.length;
     for (let i = 0; i < len; i++) {
@@ -153,14 +186,18 @@ export class HighlightRenderer {
 
     this._highlightedIndicesCache = indices;
     this._highlightDataRef = highlightData;
+    this._highlightDataFingerprint = newFingerprint;
     this._highlightDataVersion++;
   }
 
   /**
    * Invalidate the highlight cache (call when highlight array contents change in-place)
+   * Note: With content-based fingerprinting, this is now rarely needed as in-place
+   * modifications are automatically detected. Still useful for forcing immediate invalidation.
    */
   invalidateHighlightCache() {
     this._highlightedIndicesCache = null;
+    this._highlightDataFingerprint = -1;  // Force mismatch on next update
     this._highlightDataVersion++;
   }
 
@@ -173,6 +210,7 @@ export class HighlightRenderer {
   setHighlightedIndicesCache(indices, highlightData) {
     this._highlightedIndicesCache = indices;
     this._highlightDataRef = highlightData;
+    this._highlightDataFingerprint = this._computeHighlightDataFingerprint(highlightData);
     this._highlightDataVersion++;
   }
 
@@ -304,8 +342,21 @@ export class HighlightRenderer {
     viewBuffer.lodSignature = sigValue;
     viewBuffer.positionsFingerprint = positionsFingerprint;
 
-    // Update total count for UI feedback
-    this._totalHighlightedCount = count;
+    // Recompute total count across all views for UI feedback
+    this._recomputeTotalHighlightedCount();
+  }
+
+  /**
+   * Recompute total highlighted count across all views.
+   * Called when a view's buffer is rebuilt.
+   * @private
+   */
+  _recomputeTotalHighlightedCount() {
+    let total = 0;
+    for (const viewBuffer of this._viewBuffers.values()) {
+      total += viewBuffer.pointCount || 0;
+    }
+    this._totalHighlightedCount = total;
   }
 
   /**
@@ -332,6 +383,8 @@ export class HighlightRenderer {
       this.gl.deleteBuffer(viewBuffer.buffer);
     }
     this._viewBuffers.delete(vid);
+    // Recompute total after removing a view
+    this._recomputeTotalHighlightedCount();
   }
 
   /**
@@ -366,7 +419,8 @@ export class HighlightRenderer {
     fogColor,
     lightingStrength,
     lightDir,
-    viewId  // Required for per-view buffer lookup and LOD size multiplier
+    viewId,  // Required for per-view buffer lookup and LOD size multiplier
+    dimensionLevel = 3  // Dimension level for LOD size multiplier calculation
   }) {
     const gl = this.gl;
     const vid = String(viewId || 'default');
@@ -378,16 +432,18 @@ export class HighlightRenderer {
     const buffer = viewBuffer.buffer;
     const pointCount = viewBuffer.pointCount;
 
-    const depthWasEnabled = gl.isEnabled(gl.DEPTH_TEST);
-    const depthMaskWasEnabled = gl.getParameter(gl.DEPTH_WRITEMASK);
-    if (!depthWasEnabled) gl.enable(gl.DEPTH_TEST);
-    gl.depthMask(false);
+    // Enable depth test and disable depth writes for highlight rendering
+    // Assumes caller (HighPerfRenderer) maintains DEPTH_TEST enabled and depthMask true as defaults
+    // This avoids expensive gl.isEnabled() and gl.getParameter() queries every frame
+    gl.enable(gl.DEPTH_TEST);  // Ensure enabled (usually already is from main renderer)
+    gl.depthMask(false);       // Disable writes so highlights render on top of existing geometry
 
     gl.useProgram(this.program);
 
     // Use per-view LOD size multiplier if viewId is provided
+    // Pass dimensionLevel to ensure correct LOD buffer lookup for multi-dimension views
     const lodSizeMultiplier = this.hpRenderer && this.hpRenderer.getCurrentLODSizeMultiplier
-      ? this.hpRenderer.getCurrentLODSizeMultiplier(viewId)
+      ? this.hpRenderer.getCurrentLODSizeMultiplier(viewId, dimensionLevel)
       : 1.0;
     const highlightPointSize = basePointSize * lodSizeMultiplier;
 
@@ -440,8 +496,9 @@ export class HighlightRenderer {
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
     gl.drawArrays(gl.POINTS, 0, pointCount);
-    gl.depthMask(depthMaskWasEnabled);
-    if (!depthWasEnabled) gl.disable(gl.DEPTH_TEST);
+
+    // Restore depth mask to default (true) - main renderer expects this state
+    gl.depthMask(true);
   }
 }
 
@@ -976,7 +1033,8 @@ export class HighlightTools {
       fogColor: drawParams.fogColor,
       lightingStrength: drawParams.lightingStrength,
       lightDir: drawParams.lightDir,
-      viewId: drawParams.viewId  // Pass viewId for per-view LOD size multiplier
+      viewId: drawParams.viewId,  // Pass viewId for per-view LOD size multiplier
+      dimensionLevel: drawParams.dimensionLevel  // Pass dimensionLevel for correct LOD buffer lookup
     };
     this.highlightRenderer.draw(normalizedParams);
   }

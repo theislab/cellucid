@@ -28,6 +28,23 @@ export function createStateSerializer({ state, viewer, sidebar }) {
   // v3: multiview restore, full filter capture, stronger post-restore syncing
   const VERSION = 3;
 
+  function getUiRoots() {
+    const roots = [];
+    if (sidebar) roots.push(sidebar);
+    const floatingRoot = document.getElementById('floating-panels-root');
+    if (floatingRoot) roots.push(floatingRoot);
+    return roots;
+  }
+
+  function queryAll(selector) {
+    const roots = getUiRoots();
+    const out = [];
+    for (const root of roots) {
+      out.push(...root.querySelectorAll(selector));
+    }
+    return out;
+  }
+
   /**
    * Determine if a categorical field has been modified from defaults
    */
@@ -97,7 +114,7 @@ export function createStateSerializer({ state, viewer, sidebar }) {
     const controls = {};
 
     // Collect all inputs
-    sidebar.querySelectorAll('input[id]').forEach(input => {
+    queryAll('input[id]').forEach(input => {
       const id = input.id;
       if (input.type === 'checkbox') {
         controls[id] = { type: 'checkbox', checked: input.checked };
@@ -111,12 +128,12 @@ export function createStateSerializer({ state, viewer, sidebar }) {
     });
 
     // Collect all selects
-    sidebar.querySelectorAll('select[id]').forEach(select => {
+    queryAll('select[id]').forEach(select => {
       controls[select.id] = { type: 'select', value: select.value };
     });
 
     // Collect accordion open/closed states
-    sidebar.querySelectorAll('details.accordion-section').forEach(details => {
+    queryAll('details.accordion-section').forEach(details => {
       const summary = details.querySelector('summary');
       const key = summary?.textContent?.trim() || details.id;
       if (key) {
@@ -151,7 +168,7 @@ export function createStateSerializer({ state, viewer, sidebar }) {
     Object.entries(controls).forEach(([id, data]) => {
       if (id.startsWith('accordion:')) {
         const key = id.replace('accordion:', '');
-        sidebar.querySelectorAll('details.accordion-section').forEach(details => {
+        queryAll('details.accordion-section').forEach(details => {
           const summary = details.querySelector('summary');
           const summaryText = summary?.textContent?.trim();
           if (summaryText === key || details.id === key) {

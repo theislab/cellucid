@@ -4,11 +4,13 @@
  * Supports 1D, 2D, 3D, and 4D embeddings with:
  * - Lazy loading of dimension-specific position data
  * - Automatic padding of 1D/2D data to work in 3D viewer
+ * - Normalization of positions to [-1,1] range for consistent rendering
  * - Per-view dimension state tracking
  * - Efficient index-based operations (no data duplication)
  */
 
 import { loadPointsBinary } from './data-loaders.js';
+import { normalizePositions } from '../rendering/gl-utils.js';
 
 // Dimension priority for default selection: 3D > 2D > 1D > 4D
 const DIMENSION_PRIORITY = [3, 2, 1, 4];
@@ -185,7 +187,7 @@ class DimensionManager {
       );
     }
 
-    // Check cache first
+    // Check cache first (cached positions are already normalized)
     if (this.paddedPositionCache.has(dim)) {
       return this.paddedPositionCache.get(dim);
     }
@@ -194,17 +196,14 @@ class DimensionManager {
     const rawPositions = await this.loadDimension(dim);
     const nCells = rawPositions.length / dim;
 
-    // For 3D, return as-is
+    let positions3D;
+
     if (dim === 3) {
-      this.paddedPositionCache.set(dim, rawPositions);
-      return rawPositions;
-    }
-
-    // For 1D and 2D, pad with zeros
-    const positions3D = new Float32Array(nCells * 3);
-
-    if (dim === 1) {
+      // For 3D, use the raw positions directly (will be normalized below)
+      positions3D = rawPositions;
+    } else if (dim === 1) {
       // 1D: X values only, Y and Z are zero
+      positions3D = new Float32Array(nCells * 3);
       for (let i = 0; i < nCells; i++) {
         positions3D[i * 3] = rawPositions[i];     // X
         positions3D[i * 3 + 1] = 0;                // Y = 0
@@ -212,6 +211,7 @@ class DimensionManager {
       }
     } else if (dim === 2) {
       // 2D: X and Y values, Z is zero
+      positions3D = new Float32Array(nCells * 3);
       for (let i = 0; i < nCells; i++) {
         positions3D[i * 3] = rawPositions[i * 2];     // X
         positions3D[i * 3 + 1] = rawPositions[i * 2 + 1]; // Y
@@ -219,8 +219,13 @@ class DimensionManager {
       }
     }
 
+    // Normalize positions to [-1,1] range for consistent rendering
+    // This ensures all dimensions render at the same scale regardless of original data range
+    // Note: For 1D/2D, only the used dimensions will affect normalization scale
+    const normTransform = normalizePositions(positions3D);
+    console.log(`[DimensionManager] Created normalized 3D positions for ${dim}D (scale: ${normTransform.scale.toFixed(4)})`);
+
     this.paddedPositionCache.set(dim, positions3D);
-    console.log(`[DimensionManager] Created 3D-padded positions for ${dim}D`);
     return positions3D;
   }
 

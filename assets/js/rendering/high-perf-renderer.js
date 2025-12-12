@@ -186,51 +186,61 @@ export class SpatialIndex {
       const ySplit = dimLevel >= 2 ? ((c & 2) !== 0) : false;
       const zSplit = dimLevel >= 3 ? ((c & 4) !== 0) : false;
 
+      // For dimensions being split: divide at mid point (upper/lower halves)
+      // For dimensions NOT being split: children inherit FULL parent range
+      // This is critical for correct frustum culling in lower dimensions
+      //
+      // When splitting a dimension (e.g., Y in 2D mode):
+      //   - split=true means upper half: [mid, max]
+      //   - split=false means lower half: [min, mid]
+      // When NOT splitting a dimension (e.g., Y in 1D mode):
+      //   - full range: [min, max]
       childBounds.push({
         minX: xSplit ? midX : bounds.minX,
         maxX: xSplit ? bounds.maxX : midX,
+        // Y bounds: split into halves if dimLevel >= 2, otherwise inherit full range
         minY: ySplit ? midY : bounds.minY,
-        maxY: ySplit ? bounds.maxY : midY,
-        // For dimensions not being split, children inherit full parent range
-        // This is critical for 2D/1D data where Z (and Y for 1D) should not subdivide
+        maxY: (dimLevel >= 2) ? (ySplit ? bounds.maxY : midY) : bounds.maxY,
+        // Z bounds: split into halves if dimLevel >= 3, otherwise inherit full range
         minZ: zSplit ? midZ : bounds.minZ,
-        maxZ: zSplit ? bounds.maxZ : bounds.maxZ  // Keep full Z range when not splitting Z
+        maxZ: (dimLevel >= 3) ? (zSplit ? bounds.maxZ : midZ) : bounds.maxZ
       });
     }
 
-    const childCounts = new Uint32Array(numChildren);
     const positions = this.positions;
+    const n = indices.length;
 
-    for (let i = 0; i < indices.length; i++) {
+    // Single-pass partitioning: compute child index for each point and store in temp array
+    // This avoids redundant position lookups and improves cache locality
+    const pointChildren = new Uint8Array(n);
+    const childCounts = new Uint32Array(numChildren);
+
+    for (let i = 0; i < n; i++) {
       const idx = indices[i];
-      const x = positions[idx * 3];
-      const y = positions[idx * 3 + 1];
-      const z = positions[idx * 3 + 2];
+      const base = idx * 3;
+      const x = positions[base];
+      const y = positions[base + 1];
+      const z = positions[base + 2];
 
-      // Compute child index based on dimension level
-      let childIdx = (x >= midX ? 1 : 0);
-      if (dimLevel >= 2) childIdx += (y >= midY ? 2 : 0);
-      if (dimLevel >= 3) childIdx += (z >= midZ ? 4 : 0);
+      // Compute child index based on dimension level (branchless for perf)
+      let childIdx = (x >= midX) | 0;
+      if (dimLevel >= 2) childIdx += ((y >= midY) | 0) << 1;
+      if (dimLevel >= 3) childIdx += ((z >= midZ) | 0) << 2;
 
+      pointChildren[i] = childIdx;
       childCounts[childIdx]++;
     }
 
+    // Pre-allocate child arrays based on counts
     const childIndices = childBounds.map((_, i) =>
       childCounts[i] > 0 ? new Uint32Array(childCounts[i]) : null
     );
     const childOffsets = new Uint32Array(numChildren);
 
-    for (let i = 0; i < indices.length; i++) {
-      const idx = indices[i];
-      const x = positions[idx * 3];
-      const y = positions[idx * 3 + 1];
-      const z = positions[idx * 3 + 2];
-
-      let childIdx = (x >= midX ? 1 : 0);
-      if (dimLevel >= 2) childIdx += (y >= midY ? 2 : 0);
-      if (dimLevel >= 3) childIdx += (z >= midZ ? 4 : 0);
-
-      childIndices[childIdx][childOffsets[childIdx]++] = idx;
+    // Second pass: distribute points using cached child indices (no position lookups)
+    for (let i = 0; i < n; i++) {
+      const childIdx = pointChildren[i];
+      childIndices[childIdx][childOffsets[childIdx]++] = indices[i];
     }
 
     node.children = childBounds.map((cb, i) =>
@@ -479,7 +489,8 @@ export class SpatialIndex {
     // Take the first targetCount points from the hierarchical order
     // This ensures coarser LODs are always subsets of finer LODs
     const count = Math.min(targetCount, order.length);
-    const sampledIndices = new Array(count);
+    // Return Uint32Array directly to avoid conversion allocations on LOD level changes
+    const sampledIndices = new Uint32Array(count);
     for (let i = 0; i < count; i++) {
       sampledIndices[i] = order[i];
     }
@@ -1237,21 +1248,39 @@ export class HighPerfRenderer {
 
     // Normalize colors to RGBA Uint8Array format
     // This ensures all downstream code can safely assume 4-component colors
+    // Handle both Uint8Array (0-255) and Float32Array (0-1) inputs
     const expectedRGBA = this.pointCount * 4;
     const expectedRGB = this.pointCount * 3;
     let normalizedColors = colors;
+
+    // Detect float colors (Float32Array or values in 0-1 range)
+    const isFloatArray = colors.BYTES_PER_ELEMENT === 4 && colors instanceof Float32Array;
+    const scale = isFloatArray ? 255 : 1;  // Scale 0-1 float to 0-255 uint8
+
+    if (isFloatArray && scale !== 1) {
+      console.log('[HighPerfRenderer] Detected float colors (0-1 range), converting to uint8 (0-255)');
+    }
 
     if (colors.length === expectedRGB) {
       // Convert RGB to RGBA (add alpha = 255)
       console.log('[HighPerfRenderer] Converting RGB colors to RGBA');
       normalizedColors = new Uint8Array(expectedRGBA);
       for (let i = 0; i < this.pointCount; i++) {
-        normalizedColors[i * 4]     = colors[i * 3];
-        normalizedColors[i * 4 + 1] = colors[i * 3 + 1];
-        normalizedColors[i * 4 + 2] = colors[i * 3 + 2];
+        normalizedColors[i * 4]     = Math.round(colors[i * 3] * scale);
+        normalizedColors[i * 4 + 1] = Math.round(colors[i * 3 + 1] * scale);
+        normalizedColors[i * 4 + 2] = Math.round(colors[i * 3 + 2] * scale);
         normalizedColors[i * 4 + 3] = 255; // Fully opaque
       }
-    } else if (colors.length !== expectedRGBA) {
+    } else if (colors.length === expectedRGBA) {
+      // RGBA - may need to convert from float to uint8
+      if (isFloatArray) {
+        normalizedColors = new Uint8Array(expectedRGBA);
+        for (let i = 0; i < expectedRGBA; i++) {
+          normalizedColors[i] = Math.round(colors[i] * scale);
+        }
+      }
+      // else: already Uint8Array RGBA, use as-is
+    } else {
       console.error(`[HighPerfRenderer] Invalid colors array length: ${colors.length}, expected ${expectedRGBA} (RGBA) or ${expectedRGB} (RGB)`);
     }
 
@@ -1347,7 +1376,7 @@ export class HighPerfRenderer {
     // Build new spatial index for this dimension
     console.log(`[HighPerfRenderer] Building ${dim}D spatial index...`);
     const startTime = performance.now();
-    const spatialIndex = new SpatialIndex(pos, col, dim, this.options.LOD_MAX_POINTS_PER_NODE);
+    const spatialIndex = new SpatialIndex(pos, col, dim, this.options.LOD_MAX_POINTS_PER_NODE, this.options.LOD_MAX_DEPTH);
     const elapsed = performance.now() - startTime;
     console.log(`[HighPerfRenderer] ${dim}D spatial index built in ${elapsed.toFixed(1)}ms`);
 
@@ -1667,9 +1696,20 @@ export class HighPerfRenderer {
 
     // Calculate texture dimensions (use power-of-2 width for better GPU compatibility)
     // Max texture size is typically 4096-16384, so we use a 2D layout
-    const maxWidth = Math.min(4096, gl.getParameter(gl.MAX_TEXTURE_SIZE));
+    const maxTexSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+    const maxWidth = Math.min(4096, maxTexSize);
     this._alphaTexWidth = Math.min(pointCount, maxWidth);
     this._alphaTexHeight = Math.ceil(pointCount / this._alphaTexWidth);
+
+    // Check if the required height exceeds GPU limits
+    // If so, disable alpha texture and fall back to buffer-based alpha
+    if (this._alphaTexHeight > maxTexSize) {
+      console.warn(`[HighPerfRenderer] Point count ${pointCount.toLocaleString()} exceeds alpha texture capacity (max ${maxTexSize}x${maxTexSize}). Falling back to buffer-based alpha.`);
+      this._useAlphaTexture = false;
+      this._alphaTexture = null;
+      this._alphaTexData = null;
+      return;
+    }
 
     // Allocate texture data buffer (reuse if same size)
     const requiredSize = this._alphaTexWidth * this._alphaTexHeight;
@@ -1770,6 +1810,14 @@ export class HighPerfRenderer {
       const pointCount = level.indices.length;
       const texWidth = Math.min(pointCount, maxWidth);
       const texHeight = Math.ceil(pointCount / texWidth);
+
+      // Check if texture height exceeds GPU limits
+      if (texHeight > maxWidth) {
+        console.warn(`[HighPerfRenderer] LOD level ${lvlIdx} index count ${pointCount.toLocaleString()} exceeds texture capacity. Skipping index texture.`);
+        lodIndexTextures.push({ texture: null, width: 0, height: 0 });
+        continue;
+      }
+
       const texSize = texWidth * texHeight;
 
       // Create Float32 texture to store indices (R32F format)
@@ -1852,7 +1900,9 @@ export class HighPerfRenderer {
 
     // Mark buffers as dirty - actual rebuild deferred to render() to avoid double rebuilds
     this._bufferDirty = true;
-    if (this._hasLodBuffers()) {
+    // Mark ALL dimensions' LOD buffers as dirty, not just current dimension
+    // This ensures switching dimensions or rendering multi-dimension views shows correct colors
+    if (this._hasAnyLodBuffers()) {
       this._lodBuffersDirty = true;
     }
   }
@@ -1866,6 +1916,18 @@ export class HighPerfRenderer {
     return lodBuffers && lodBuffers.length > 0;
   }
 
+  /**
+   * Check if any LOD buffers exist across ALL dimensions
+   * Used when marking buffers dirty during color/alpha updates
+   * @private
+   */
+  _hasAnyLodBuffers() {
+    for (const lodBuffers of this.lodBuffersByDimension.values()) {
+      if (lodBuffers && lodBuffers.length > 0) return true;
+    }
+    return false;
+  }
+
   updateAlphas(alphas) {
     // Note: Reference check removed - callers often modify arrays in-place,
     // so same reference doesn't mean same content.
@@ -1873,13 +1935,14 @@ export class HighPerfRenderer {
 
     this._currentAlphas = alphas; // Track current alphas reference
 
-    // NOTE: We intentionally do NOT call invalidateLodVisibilityCache() here.
-    // LOD visibility is purely spatial (which points exist at current LOD level).
-    // Alpha/filter visibility is data-driven and orthogonal to LOD.
-    // Consumers should use getCombinedVisibilityForView() which combines LOD + alpha.
-    // Calling invalidateLodVisibilityCache() here was wasteful - it forced O(n) cache
-    // rebuilds on every filter change, but the rebuilt values were identical since
-    // getLodVisibilityArray() doesn't incorporate alpha values.
+    // Invalidate combined visibility caches since alpha values changed.
+    // NOTE: This bumps _filterGeneration which is used by both getLodVisibilityArray()
+    // and getCombinedVisibilityForView(). While LOD visibility is purely spatial and
+    // doesn't actually depend on alpha values, the shared _filterGeneration counter
+    // is necessary for getCombinedVisibilityForView() cache validity. The minor
+    // overhead of LOD visibility cache rebuild (O(n) fill) is acceptable compared
+    // to the critical bug of returning stale combined visibility data.
+    this.invalidateLodVisibilityCache();
 
     // Use alpha texture for efficient updates (avoids full buffer rebuild)
     // This is ~16x faster: uploading N bytes vs N*16 bytes
@@ -1898,14 +1961,15 @@ export class HighPerfRenderer {
     }
 
     // Use alpha-only fast path if buffer already exists (skip position repacking)
+    // Mark ALL dimensions' LOD buffers as dirty (not just current) for consistent multi-view rendering
     if (this._interleavedArrayBuffer) {
       this._alphaOnlyDirty = true;
-      if (this._hasLodBuffers()) {
+      if (this._hasAnyLodBuffers()) {
         this._lodAlphaOnlyDirty = true;
       }
     } else {
       this._bufferDirty = true;
-      if (this._hasLodBuffers()) {
+      if (this._hasAnyLodBuffers()) {
         this._lodBuffersDirty = true;
       }
     }
@@ -2344,6 +2408,16 @@ export class HighPerfRenderer {
       overrideBounds = null  // Optional bounds override for view-specific positions (e.g., 2D views)
     } = params;
 
+    // Clamp dimension level to valid range [1, 3] - prevents invalid spatial index lookups
+    // and ensures depth test logic works correctly (dimensionLevel 0 would wrongly trigger 2D mode)
+    const clampedDimLevel = Math.max(1, Math.min(3, dimensionLevel));
+
+    // Create modified params for helper functions if dimension level was clamped
+    // This ensures _checkFrustumCacheValid and other helpers use the valid dimension for cache invalidation
+    const effectiveParams = (clampedDimLevel !== dimensionLevel)
+      ? { ...params, dimensionLevel: clampedDimLevel }
+      : params;
+
     // Get per-view state for frustum culling and LOD caching
     const viewState = this._getViewState(viewId);
 
@@ -2376,16 +2450,16 @@ export class HighPerfRenderer {
     // Get the correct spatial index for this view's dimension level
     // Each dimension (1D, 2D, 3D) needs its own spatial index for correct LOD/frustum culling
     const needsSpatialIndex = this.useAdaptiveLOD || this.useFrustumCulling;
-    const spatialIndex = needsSpatialIndex ? this.getSpatialIndexForDimension(dimensionLevel) : null;
-    const lodBuffersForDim = this.getLodBuffersForDimension(dimensionLevel);
+    const spatialIndex = needsSpatialIndex ? this.getSpatialIndexForDimension(clampedDimLevel) : null;
+    const lodBuffersForDim = this.getLodBuffersForDimension(clampedDimLevel);
 
     // Select LOD level first (determines whether to use frustum culling)
     // Priority: this.forceLODLevel > params.forceLOD > adaptive
     let lodLevel = this.forceLODLevel >= 0 ? this.forceLODLevel : forceLOD;
     if (lodLevel < 0 && this.useAdaptiveLOD && spatialIndex) {
       // Pass per-view lastLodLevel for hysteresis (prevents oscillation per-view)
-      // Also pass dimensionLevel and overrideBounds for correct 2D/3D diagonal calculation
-      lodLevel = spatialIndex.getLODLevel(cameraDistance, viewportHeight, viewState.lastLodLevel, dimensionLevel, overrideBounds);
+      // Also pass clampedDimLevel and overrideBounds for correct 2D/3D diagonal calculation
+      lodLevel = spatialIndex.getLODLevel(cameraDistance, viewportHeight, viewState.lastLodLevel, clampedDimLevel, overrideBounds);
     }
 
     // Safeguard: if LOD is disabled, ensure lodLevel stays -1
@@ -2395,6 +2469,8 @@ export class HighPerfRenderer {
 
     // Always update per-view LOD level for highlight rendering and other consumers
     // This must happen after all LOD selection logic (forced, adaptive, or disabled)
+    // NOTE: lastDimensionLevel is NOT set here - it's handled inside _checkFrustumCacheValid
+    // to properly detect dimension changes and invalidate the frustum cache
     viewState.lastLodLevel = lodLevel;
 
     const useFullDetail = lodLevel < 0 || !lodBuffersForDim.length ||
@@ -2420,25 +2496,25 @@ export class HighPerfRenderer {
       // Debug: log render path on first frame or when path changes
       const renderPath = useFullDetail ? 'frustum-only' : 'LOD+frustum';
       if (viewState._lastRenderPath !== renderPath) {
-        console.log(`[Render] View ${viewId}: ${renderPath} (lodLevel=${lodLevel}, useAdaptiveLOD=${this.useAdaptiveLOD}, lodBuffers=${lodBuffersForDim.length}, dim=${dimensionLevel})`);
+        console.log(`[Render] View ${viewId}: ${renderPath} (lodLevel=${lodLevel}, useAdaptiveLOD=${this.useAdaptiveLOD}, lodBuffers=${lodBuffersForDim.length}, dim=${clampedDimLevel})`);
         viewState._lastRenderPath = renderPath;
       }
 
-      // For 2D data (dimensionLevel <= DEPTH_TEST_DIMENSION_THRESHOLD), disable depth testing
+      // For 2D data (clampedDimLevel <= DEPTH_TEST_DIMENSION_THRESHOLD), disable depth testing
       // entirely to prevent draw-order artifacts. When all points have the same Z, depth testing
       // causes visual differences at quadtree boundaries because frustum culling changes the
       // draw order (spatially grouped vs original). Disabling depth writes alone is insufficient.
-      const disableDepth = dimensionLevel <= DEPTH_TEST_DIMENSION_THRESHOLD;
+      const disableDepth = clampedDimLevel <= DEPTH_TEST_DIMENSION_THRESHOLD;
       if (disableDepth) {
         gl.disable(gl.DEPTH_TEST);
       }
 
       if (useFullDetail) {
-        // Full detail: standard frustum culling
-        this._renderWithFrustumCulling(params, frustumPlanes, viewState, spatialIndex);
+        // Full detail: standard frustum culling (use effectiveParams for correct dimension in cache invalidation)
+        this._renderWithFrustumCulling(effectiveParams, frustumPlanes, viewState, spatialIndex);
       } else {
         // LOD active: combined LOD + frustum culling for maximum performance
-        this._renderLODWithFrustumCulling(lodLevel, params, frustumPlanes, viewState, spatialIndex, lodBuffersForDim);
+        this._renderLODWithFrustumCulling(lodLevel, effectiveParams, frustumPlanes, viewState, spatialIndex, lodBuffersForDim);
       }
 
       // Restore depth testing
@@ -2457,7 +2533,7 @@ export class HighPerfRenderer {
 
     // For 2D data, disable depth testing to prevent draw-order artifacts
     // (consistent with frustum culling path)
-    const disableDepth = dimensionLevel <= DEPTH_TEST_DIMENSION_THRESHOLD;
+    const disableDepth = clampedDimLevel <= DEPTH_TEST_DIMENSION_THRESHOLD;
     if (disableDepth) {
       gl.disable(gl.DEPTH_TEST);
     }
@@ -2473,6 +2549,10 @@ export class HighPerfRenderer {
       gl.enable(gl.DEPTH_TEST);
     }
 
+    // Update dimension level for non-frustum path (for getCombinedVisibilityForView and other consumers)
+    // This is done after rendering to ensure accurate per-view tracking without breaking cache invalidation
+    viewState.lastDimensionLevel = clampedDimLevel;
+
     this.stats.lastFrameTime = performance.now() - frameStart;
     this.stats.fps = Math.round(1000 / Math.max(this.stats.lastFrameTime, 1));
 
@@ -2486,7 +2566,7 @@ export class HighPerfRenderer {
       pointSize, sizeAttenuation, viewportHeight, fov,
       lightingStrength, fogDensity, fogColor, lightDir,
       viewId = 'default',
-      dimensionLevel = 3  // For cache invalidation on dimension change
+      dimensionLevel = 3  // For cache invalidation on dimension change (already clamped by caller)
     } = params;
 
     // One-time validation: ensure spatial index contains all points
@@ -2567,8 +2647,8 @@ export class HighPerfRenderer {
         viewState.lastVisibleCount = visibleCount;
       }
 
-      // Store visible indices in per-view state (for cache validation)
-      viewState.cachedVisibleIndices = new Uint32Array(visibleIndices);
+      // Store count for cache validation - no need to copy indices since they're uploaded to GPU
+      // The indices data is in viewState.indexBuffer (GPU) and visibleIndicesBuffer (pooled CPU buffer)
       viewState.cachedCulledCount = visibleIndices.length;
       viewState._noVisibleNodesWarned = false;  // Reset warning flag since we have visible nodes
 
@@ -2712,10 +2792,11 @@ export class HighPerfRenderer {
       sumSqDiff += diff * diff;
     }
 
-    // Very low threshold to catch even small camera movements
-    // In multi-view mode, each view has different frustum, so we need to be sensitive
-    // 0.0001 means even tiny changes (0.001 per element average) trigger update
-    const threshold = 0.0001;
+    // Threshold for detecting meaningful camera changes (sum of squared differences)
+    // 0.0005 balances sensitivity vs avoiding unnecessary recalculations from floating point noise
+    // Too low: wastes CPU recalculating when nothing visually changed
+    // Too high: frustum culling lags behind camera movement
+    const threshold = 0.0005;
 
     if (sumSqDiff > threshold) {
       for (let i = 0; i < 16; i++) {
@@ -2819,14 +2900,6 @@ export class HighPerfRenderer {
     const lastPercent = (lastCount / totalCount) * 100;
     const newPercent = (newCount / totalCount) * 100;
     return Math.abs(newPercent - lastPercent) > 10;
-  }
-
-  // Legacy method for backward compatibility
-  _updateCulledIndexBuffer(visibleIndices) {
-    const gl = this.gl;
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
-    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, visibleIndices, gl.DYNAMIC_DRAW);
-    this._culledPointCount = visibleIndices.length;
   }
 
   _renderFullDetail(params) {
@@ -3162,16 +3235,23 @@ export class HighPerfRenderer {
         if (nodeLodIndices) visibleCount += nodeLodIndices.length;
       }
 
-      // Pre-allocate typed array and bulk copy (avoids O(n) array.push resizes)
-      const visibleLodIndices = new Uint32Array(visibleCount);
+      // Reuse per-view pooled buffer for LOD indices (avoids GC pressure)
+      if (!viewState.visibleLodIndicesBuffer || viewState.visibleLodIndicesCapacity < visibleCount) {
+        viewState.visibleLodIndicesCapacity = Math.ceil(visibleCount * 1.5);
+        viewState.visibleLodIndicesBuffer = new Uint32Array(viewState.visibleLodIndicesCapacity);
+      }
+
+      // Fill pooled buffer with visible LOD indices
       let offset = 0;
       for (let i = 0; i < visibleNodes.length; i++) {
         const nodeLodIndices = visibleNodes[i].lodIndices?.[lodLevel];
         if (nodeLodIndices) {
-          visibleLodIndices.set(nodeLodIndices, offset);
+          viewState.visibleLodIndicesBuffer.set(nodeLodIndices, offset);
           offset += nodeLodIndices.length;
         }
       }
+      // Create view of used portion (no allocation, just a view)
+      const visibleLodIndices = viewState.visibleLodIndicesBuffer.subarray(0, visibleCount);
       const totalLodPoints = lod.pointCount;
       const visibleRatio = visibleCount / totalLodPoints;
       const cullPercent = ((1 - visibleRatio) * 100);
@@ -3302,11 +3382,26 @@ export class HighPerfRenderer {
         if (spatialIndex) {
           // Clear per-view caches since spatial index changed
           this.clearAllViewState();
-          // Invalidate all snapshot spatial indices (they reference stale positions)
+          // Rebuild snapshot spatial indices if they have custom positions
+          // This ensures LOD/frustum culling continues to work for snapshots
           for (const [id, snapshot] of this.snapshotBuffers) {
             if (snapshot.spatialIndex) {
-              snapshot.spatialIndex = null;
-              console.log(`[HighPerfRenderer] Invalidated spatial index for snapshot "${id}"`);
+              // If snapshot has custom positions, rebuild its spatial index
+              if (snapshot.positions && snapshot.positions !== this._positions) {
+                const snapshotDimLevel = snapshot.dimensionLevel || dimLevel;
+                console.log(`[HighPerfRenderer] Rebuilding spatial index for snapshot "${id}" (${snapshotDimLevel}D)...`);
+                snapshot.spatialIndex = new SpatialIndex(
+                  snapshot.positions,
+                  this._colors,
+                  snapshotDimLevel,
+                  this.options.LOD_MAX_POINTS_PER_NODE,
+                  this.options.LOD_MAX_DEPTH
+                );
+              } else {
+                // Snapshot uses main positions - invalidate its index (will use main index)
+                snapshot.spatialIndex = null;
+                console.log(`[HighPerfRenderer] Invalidated spatial index for snapshot "${id}" (uses main positions)`);
+              }
             }
           }
         }
@@ -3493,6 +3588,51 @@ export class HighPerfRenderer {
     }
   }
 
+  /**
+   * Get aggregated stats across all views (for multiview rendering).
+   * Returns sum/average of per-view stats plus a views array with individual stats.
+   * @returns {Object} Aggregated stats: { totalVisiblePoints, totalDrawCalls, avgCullPercent, viewCount, views: [...] }
+   */
+  getAggregatedStats() {
+    const views = [];
+    let totalVisiblePoints = 0;
+    let totalDrawCalls = 0;
+    let totalCullPercent = 0;
+    let culledViewCount = 0;
+
+    for (const [viewId, viewState] of this._perViewState) {
+      if (viewState.stats) {
+        const vs = viewState.stats;
+        views.push({
+          viewId,
+          visiblePoints: vs.visiblePoints,
+          lodLevel: vs.lodLevel,
+          drawCalls: vs.drawCalls,
+          frustumCulled: vs.frustumCulled,
+          cullPercent: vs.cullPercent
+        });
+        totalVisiblePoints += vs.visiblePoints || 0;
+        totalDrawCalls += vs.drawCalls || 0;
+        if (vs.frustumCulled) {
+          totalCullPercent += vs.cullPercent || 0;
+          culledViewCount++;
+        }
+      }
+    }
+
+    return {
+      totalVisiblePoints,
+      totalDrawCalls,
+      avgCullPercent: culledViewCount > 0 ? totalCullPercent / culledViewCount : 0,
+      viewCount: views.length,
+      views,
+      // Include last frame time and FPS from global stats
+      lastFrameTime: this.stats.lastFrameTime,
+      fps: this.stats.fps,
+      gpuMemoryMB: this.stats.gpuMemoryMB
+    };
+  }
+
   getPositions() {
     return this._positions;
   }
@@ -3565,14 +3705,26 @@ export class HighPerfRenderer {
     const n = this.pointCount;
     if (n === 0) return null;
 
-    // Use override if provided, otherwise fall back to global stats
-    const lodLevel = overrideLodLevel !== undefined ? overrideLodLevel : this.stats.lodLevel;
+    // Use override if provided, otherwise use per-view LOD level (if viewId provided), else global
+    // This ensures each view uses its own LOD level in multiview mode
+    let lodLevel;
+    if (overrideLodLevel !== undefined) {
+      lodLevel = overrideLodLevel;
+    } else if (viewId !== undefined) {
+      const viewState = this._getViewState(viewId);
+      lodLevel = viewState.lastLodLevel ?? this.stats.lodLevel;
+    } else {
+      lodLevel = this.stats.lodLevel;
+    }
 
     // Get spatial index for the dimension
     const spatialIndex = this.spatialIndices.get(dimensionLevel);
 
-    // If no spatial index or LOD disabled, all points visible - return null to signal "all visible"
-    if (!spatialIndex || !this.useAdaptiveLOD || lodLevel < 0) {
+    // If no spatial index or lodLevel is not set, all points visible - return null to signal "all visible"
+    // Note: We check lodLevel directly, NOT useAdaptiveLOD, because forced LOD (forceLODLevel >= 0)
+    // should work even when adaptive LOD is disabled. The lodLevel parameter already incorporates
+    // the decision from render() about whether LOD is active (adaptive or forced).
+    if (!spatialIndex || lodLevel < 0) {
       return null;
     }
 
@@ -3656,17 +3808,22 @@ export class HighPerfRenderer {
    *
    * @param {string|number} viewId - View ID for per-view LOD level lookup
    * @param {number} [alphaThreshold=0.01] - Minimum alpha to be considered visible
+   * @param {number} [dimensionLevel] - Dimension level for the view (1D/2D/3D). If not provided,
+   *   uses the view's cached dimension or falls back to currentDimensionLevel.
    * @returns {Float32Array|null} Visibility mask (1.0 = visible, 0.0 = hidden), or null if all visible
    */
-  getCombinedVisibilityForView(viewId, alphaThreshold = 0.01) {
+  getCombinedVisibilityForView(viewId, alphaThreshold = 0.01, dimensionLevel = undefined) {
     const vid = String(viewId);
     const viewState = this._perViewState.get(vid);
 
     // Get LOD level for this view
     const lodLevel = viewState?.lastLodLevel ?? this.stats.lodLevel ?? -1;
 
-    // Get LOD visibility (which points are in this LOD level)
-    const lodVis = this.getLodVisibilityArray(lodLevel, viewId);
+    // Get dimension level: explicit param > view state cache > current dimension
+    const dimLevel = dimensionLevel ?? viewState?.lastDimensionLevel ?? this.currentDimensionLevel;
+
+    // Get LOD visibility (which points are in this LOD level) for the correct dimension
+    const lodVis = this.getLodVisibilityArray(lodLevel, viewId, dimLevel);
     const alphas = this._currentAlphas;
     const n = this.pointCount;
 
@@ -3675,6 +3832,24 @@ export class HighPerfRenderer {
 
     // LOD only - no alpha filtering active
     if (!alphas) return lodVis;
+
+    // Check cache validity - skip rebuild if inputs haven't changed
+    // Track: LOD level, dimension, alpha threshold, filter generation (incremented on alpha changes)
+    const filterGen = this._filterGeneration || 0;
+    if (viewState) {
+      const cacheValid = viewState.cachedCombinedVisibility &&
+        viewState.cachedCombinedVisibility.length === n &&
+        viewState.cachedCombinedVisLod === lodLevel &&
+        viewState.cachedCombinedVisDim === dimLevel &&
+        viewState.cachedCombinedVisThreshold === alphaThreshold &&
+        viewState.cachedCombinedVisFilterGen === filterGen &&
+        viewState.cachedCombinedVisHasAlpha === !!alphas &&
+        viewState.cachedCombinedVisHasLod === !!lodVis;
+
+      if (cacheValid) {
+        return viewState.cachedCombinedVisibility;
+      }
+    }
 
     // Alpha only - no LOD filtering (full detail)
     if (!lodVis) {
@@ -3706,6 +3881,13 @@ export class HighPerfRenderer {
       for (let i = 0; i < n; i++) {
         viewState.cachedCombinedVisibility[i] = alphas[i] >= alphaThreshold ? 1.0 : 0.0;
       }
+      // Update cache keys
+      viewState.cachedCombinedVisLod = lodLevel;
+      viewState.cachedCombinedVisDim = dimLevel;
+      viewState.cachedCombinedVisThreshold = alphaThreshold;
+      viewState.cachedCombinedVisFilterGen = filterGen;
+      viewState.cachedCombinedVisHasAlpha = true;
+      viewState.cachedCombinedVisHasLod = false;
       return viewState.cachedCombinedVisibility;
     }
 
@@ -3718,6 +3900,13 @@ export class HighPerfRenderer {
     for (let i = 0; i < n; i++) {
       vs.cachedCombinedVisibility[i] = (lodVis[i] > 0 && alphas[i] >= alphaThreshold) ? 1.0 : 0.0;
     }
+    // Update cache keys
+    vs.cachedCombinedVisLod = lodLevel;
+    vs.cachedCombinedVisDim = dimLevel;
+    vs.cachedCombinedVisThreshold = alphaThreshold;
+    vs.cachedCombinedVisFilterGen = filterGen;
+    vs.cachedCombinedVisHasAlpha = true;
+    vs.cachedCombinedVisHasLod = true;
     return vs.cachedCombinedVisibility;
   }
 
@@ -3769,13 +3958,37 @@ export class HighPerfRenderer {
     // Use view-specific positions if provided, otherwise use global positions
     const positions = viewPositions || this._positions;
 
-    // Normalize colors to RGBA if needed
+    // Normalize colors to RGBA Uint8 if needed
     const expectedRGBA = n * 4;
     const expectedRGB = n * 3;
     let snapshotColors;
 
-    if (colors.length === expectedRGB) {
-      // Convert RGB to RGBA
+    // Detect Float32Array colors (normalized 0-1 range) and convert to Uint8 (0-255)
+    // Float32Array with values in 0-1 range needs conversion; direct Uint8Array copy would produce garbage
+    const isFloat32Colors = colors instanceof Float32Array ||
+      (colors.length > 0 && colors[0] !== undefined && colors[0] <= 1.0 && !(colors instanceof Uint8Array || colors instanceof Uint8ClampedArray));
+
+    if (isFloat32Colors) {
+      // Convert Float32 normalized colors (0-1) to Uint8 (0-255)
+      if (colors.length === expectedRGB) {
+        snapshotColors = new Uint8Array(expectedRGBA);
+        for (let i = 0; i < n; i++) {
+          snapshotColors[i * 4]     = Math.round(colors[i * 3] * 255);
+          snapshotColors[i * 4 + 1] = Math.round(colors[i * 3 + 1] * 255);
+          snapshotColors[i * 4 + 2] = Math.round(colors[i * 3 + 2] * 255);
+          snapshotColors[i * 4 + 3] = 255;
+        }
+      } else {
+        snapshotColors = new Uint8Array(expectedRGBA);
+        for (let i = 0; i < n; i++) {
+          snapshotColors[i * 4]     = Math.round(colors[i * 4] * 255);
+          snapshotColors[i * 4 + 1] = Math.round(colors[i * 4 + 1] * 255);
+          snapshotColors[i * 4 + 2] = Math.round(colors[i * 4 + 2] * 255);
+          snapshotColors[i * 4 + 3] = Math.round((colors[i * 4 + 3] ?? 1.0) * 255);
+        }
+      }
+    } else if (colors.length === expectedRGB) {
+      // Convert RGB to RGBA (Uint8 input)
       snapshotColors = new Uint8Array(expectedRGBA);
       for (let i = 0; i < n; i++) {
         snapshotColors[i * 4]     = colors[i * 3];
@@ -3784,7 +3997,7 @@ export class HighPerfRenderer {
         snapshotColors[i * 4 + 3] = 255;
       }
     } else {
-      // Create a copy of colors to avoid modifying the original
+      // Create a copy of colors to avoid modifying the original (Uint8 RGBA input)
       snapshotColors = new Uint8Array(colors);
     }
 
@@ -3849,11 +4062,12 @@ export class HighPerfRenderer {
     // Build spatial index for custom positions (enables fast frustum culling for 2D/1D views)
     // This replaces brute-force O(n) culling with O(log n) hierarchical culling
     let spatialIndex = null;
+    let snapshotDimensionLevel = null;
     if (hasCustomPositions && n > 10000) {
-      const dimensionLevel = HighPerfRenderer.detectDimensionLevel(customBounds);
-      console.log(`[HighPerfRenderer] Building ${dimensionLevel}D spatial index for snapshot "${id}"...`);
-      spatialIndex = new SpatialIndex(viewPositions, snapshotColors, dimensionLevel, this.options.LOD_MAX_POINTS_PER_NODE);
-      console.log(`[HighPerfRenderer] Built ${dimensionLevel}D spatial index with ${spatialIndex.lodLevels.length} LOD levels`);
+      snapshotDimensionLevel = HighPerfRenderer.detectDimensionLevel(customBounds);
+      console.log(`[HighPerfRenderer] Building ${snapshotDimensionLevel}D spatial index for snapshot "${id}"...`);
+      spatialIndex = new SpatialIndex(viewPositions, snapshotColors, snapshotDimensionLevel, this.options.LOD_MAX_POINTS_PER_NODE, this.options.LOD_MAX_DEPTH);
+      console.log(`[HighPerfRenderer] Built ${snapshotDimensionLevel}D spatial index with ${spatialIndex.lodLevels.length} LOD levels`);
     }
 
     this.snapshotBuffers.set(id, {
@@ -3868,7 +4082,9 @@ export class HighPerfRenderer {
       // Store bounds for custom positions (used for correct LOD diagonal calculation)
       bounds: customBounds,
       // Spatial index for fast frustum culling on custom positions (null if using main octree)
-      spatialIndex: spatialIndex
+      spatialIndex: spatialIndex,
+      // Store dimension level used to build the spatial index (for correct LOD/frustum calculations)
+      dimensionLevel: snapshotDimensionLevel
     });
 
     console.log(`[HighPerfRenderer] Created snapshot buffer "${id}" (${n.toLocaleString()} points, ${(n * 16 / 1024 / 1024).toFixed(1)} MB${spatialIndex ? ', with spatial index' : ''})`);
@@ -3896,13 +4112,36 @@ export class HighPerfRenderer {
     // Use view-specific positions if provided, otherwise use stored snapshot positions, or global positions
     const positions = viewPositions || snapshot.positions || this._positions;
 
-    // Normalize colors to RGBA if needed
+    // Normalize colors to RGBA Uint8 if needed
     const expectedRGBA = n * 4;
     const expectedRGB = n * 3;
     let snapshotColors;
 
-    if (colors.length === expectedRGB) {
-      // Convert RGB to RGBA
+    // Detect Float32Array colors (normalized 0-1 range) and convert to Uint8 (0-255)
+    const isFloat32Colors = colors instanceof Float32Array ||
+      (colors.length > 0 && colors[0] !== undefined && colors[0] <= 1.0 && !(colors instanceof Uint8Array || colors instanceof Uint8ClampedArray));
+
+    if (isFloat32Colors) {
+      // Convert Float32 normalized colors (0-1) to Uint8 (0-255)
+      if (colors.length === expectedRGB) {
+        snapshotColors = new Uint8Array(expectedRGBA);
+        for (let i = 0; i < n; i++) {
+          snapshotColors[i * 4]     = Math.round(colors[i * 3] * 255);
+          snapshotColors[i * 4 + 1] = Math.round(colors[i * 3 + 1] * 255);
+          snapshotColors[i * 4 + 2] = Math.round(colors[i * 3 + 2] * 255);
+          snapshotColors[i * 4 + 3] = 255;
+        }
+      } else {
+        snapshotColors = new Uint8Array(expectedRGBA);
+        for (let i = 0; i < n; i++) {
+          snapshotColors[i * 4]     = Math.round(colors[i * 4] * 255);
+          snapshotColors[i * 4 + 1] = Math.round(colors[i * 4 + 1] * 255);
+          snapshotColors[i * 4 + 2] = Math.round(colors[i * 4 + 2] * 255);
+          snapshotColors[i * 4 + 3] = Math.round((colors[i * 4 + 3] ?? 1.0) * 255);
+        }
+      }
+    } else if (colors.length === expectedRGB) {
+      // Convert RGB to RGBA (Uint8 input)
       snapshotColors = new Uint8Array(expectedRGBA);
       for (let i = 0; i < n; i++) {
         snapshotColors[i * 4]     = colors[i * 3];
@@ -3911,6 +4150,7 @@ export class HighPerfRenderer {
         snapshotColors[i * 4 + 3] = 255;
       }
     } else {
+      // Create a copy of colors to avoid modifying the original (Uint8 RGBA input)
       snapshotColors = new Uint8Array(colors);
     }
 
@@ -3961,7 +4201,7 @@ export class HighPerfRenderer {
         const customBounds = HighPerfRenderer.computeBoundsFromPositions(positions);
         const dimensionLevel = HighPerfRenderer.detectDimensionLevel(customBounds);
         snapshot.bounds = customBounds;
-        snapshot.spatialIndex = new SpatialIndex(positions, snapshotColors, dimensionLevel, this.options.LOD_MAX_POINTS_PER_NODE);
+        snapshot.spatialIndex = new SpatialIndex(positions, snapshotColors, dimensionLevel, this.options.LOD_MAX_POINTS_PER_NODE, this.options.LOD_MAX_DEPTH);
         console.log(`[HighPerfRenderer] Rebuilt ${dimensionLevel}D spatial index for snapshot "${id}"`);
       } else {
         snapshot.bounds = null;
@@ -4055,11 +4295,13 @@ export class HighPerfRenderer {
     // Rebuild spatial index for the new positions (enables fast frustum culling)
     const hasCustomPositions = viewPositions !== this._positions;
     if (hasCustomPositions && n > 10000 && snapshot.colors) {
-      const dimensionLevel = HighPerfRenderer.detectDimensionLevel(snapshot.bounds);
-      snapshot.spatialIndex = new SpatialIndex(viewPositions, snapshot.colors, dimensionLevel, this.options.LOD_MAX_POINTS_PER_NODE);
-      console.log(`[HighPerfRenderer] Rebuilt ${dimensionLevel}D spatial index for snapshot "${id}"`);
+      const detectedDimLevel = HighPerfRenderer.detectDimensionLevel(snapshot.bounds);
+      snapshot.spatialIndex = new SpatialIndex(viewPositions, snapshot.colors, detectedDimLevel, this.options.LOD_MAX_POINTS_PER_NODE, this.options.LOD_MAX_DEPTH);
+      snapshot.dimensionLevel = detectedDimLevel;  // Store for consistent LOD/frustum calculations
+      console.log(`[HighPerfRenderer] Rebuilt ${detectedDimLevel}D spatial index for snapshot "${id}"`);
     } else {
       snapshot.spatialIndex = null;
+      snapshot.dimensionLevel = null;  // Clear since using main spatial index
     }
 
     // IMPORTANT: Clear per-view cache for this snapshot to force frustum re-culling
@@ -4153,6 +4395,62 @@ export class HighPerfRenderer {
   }
 
   /**
+   * Get a snapshot's spatial index for picking/queries.
+   * Returns null if snapshot doesn't exist or uses the main spatial index.
+   * @param {string} id - Snapshot identifier
+   * @returns {SpatialIndex|null}
+   */
+  getSnapshotSpatialIndex(id) {
+    const snapshot = this.snapshotBuffers.get(id);
+    if (!snapshot) return null;
+    // Only return snapshot's own spatial index if it has custom positions
+    if (snapshot.positions && snapshot.positions !== this._positions && snapshot.spatialIndex) {
+      return snapshot.spatialIndex;
+    }
+    return null;
+  }
+
+  /**
+   * Rebuild a snapshot's spatial index for a new dimension level.
+   * Call this when changing a view's dimension to ensure LOD/frustum culling works correctly.
+   * @param {string} id - Snapshot identifier
+   * @param {number} dimensionLevel - New dimension level (1, 2, or 3)
+   * @returns {boolean} Success
+   */
+  rebuildSnapshotSpatialIndex(id, dimensionLevel) {
+    const snapshot = this.snapshotBuffers.get(id);
+    if (!snapshot) return false;
+
+    // Only rebuild if snapshot has custom positions (otherwise uses main spatial index)
+    if (!snapshot.positions || snapshot.positions === this._positions) {
+      // Clear any existing spatial index since it should use main index
+      snapshot.spatialIndex = null;
+      return true;
+    }
+
+    // Check if we have enough points to warrant a spatial index
+    const n = snapshot.positions.length / 3;
+    if (n <= 10000) {
+      snapshot.spatialIndex = null;
+      return true;
+    }
+
+    // Rebuild spatial index for the new dimension
+    const clampedDim = Math.max(1, Math.min(3, dimensionLevel));
+    console.log(`[HighPerfRenderer] Rebuilding ${clampedDim}D spatial index for snapshot "${id}"...`);
+    snapshot.spatialIndex = new SpatialIndex(
+      snapshot.positions,
+      snapshot.colors || this._colors,
+      clampedDim,
+      this.options.LOD_MAX_POINTS_PER_NODE,
+      this.options.LOD_MAX_DEPTH
+    );
+    snapshot.dimensionLevel = clampedDim;
+    console.log(`[HighPerfRenderer] Built ${clampedDim}D spatial index with ${snapshot.spatialIndex.lodLevels.length} LOD levels`);
+    return true;
+  }
+
+  /**
    * Render using a snapshot's pre-uploaded buffer. No data upload occurs.
    * Supports frustum culling and LOD for all views (not just the live view).
    * @param {string} id - Snapshot identifier
@@ -4184,12 +4482,28 @@ export class HighPerfRenderer {
 
     const frameStart = performance.now();
 
+    // Clamp dimension level to valid range [1, 3] - prevents invalid spatial index lookups
+    const clampedParamDimLevel = Math.max(1, Math.min(3, dimensionLevel));
+
     // Get per-view state for frustum culling and LOD caching
     const viewState = this._getViewState(viewId);
 
     // Check if snapshot has custom positions (different dimension)
     // The octree is built from main positions, so its bounds don't match custom positions
     const hasCustomPositions = snapshot.positions && snapshot.positions !== this._positions;
+
+    // Use snapshot's stored dimension level when it has custom positions with a spatial index
+    // This ensures consistency between the spatial index and the dimension used for LOD/frustum calculations
+    // Fall back to clamped params.dimensionLevel for snapshots using main positions (which use main spatial index)
+    const effectiveDimLevel = (hasCustomPositions && snapshot.dimensionLevel !== null)
+      ? snapshot.dimensionLevel  // Already clamped when stored
+      : clampedParamDimLevel;
+
+    // Create modified params for helper functions if dimension level differs from original params
+    // This ensures _checkFrustumCacheValid and other helpers use the correct dimension for cache invalidation
+    const effectiveParams = (effectiveDimLevel !== dimensionLevel)
+      ? { ...params, dimensionLevel: effectiveDimLevel }
+      : params;
 
     // Auto-compute fog range using snapshot bounds when available (for correct fog in custom dimension views)
     if (params.autoFog !== false) {
@@ -4204,23 +4518,25 @@ export class HighPerfRenderer {
     // Get the correct spatial index for this view's dimension level (for non-custom positions)
     // Custom positions use snapshot.spatialIndex instead
     const needsSpatialIndex = this.useAdaptiveLOD || this.useFrustumCulling;
-    const mainSpatialIndex = (!hasCustomPositions && needsSpatialIndex) ? this.getSpatialIndexForDimension(dimensionLevel) : null;
+    const mainSpatialIndex = (!hasCustomPositions && needsSpatialIndex) ? this.getSpatialIndexForDimension(effectiveDimLevel) : null;
 
     // For adaptive LOD, use snapshot's spatial index for custom positions (if available)
     // This enables LOD for 1D/2D views that have their own spatial index built from custom positions
     const lodSpatialIndex = hasCustomPositions ? snapshot.spatialIndex : mainSpatialIndex;
-    const lodBuffersForDim = this.getLodBuffersForDimension(dimensionLevel);
+    const lodBuffersForDim = this.getLodBuffersForDimension(effectiveDimLevel);
 
     // Select LOD level - priority: forceLODLevel > params.forceLOD > adaptive
     // Same logic as render() to ensure slider affects all views
     let lodLevel = this.forceLODLevel >= 0 ? this.forceLODLevel : (params.forceLOD ?? -1);
     if (lodLevel < 0 && this.useAdaptiveLOD && lodSpatialIndex) {
-      // Pass dimensionLevel for correct 2D/3D diagonal calculation
+      // Pass effectiveDimLevel for correct 2D/3D diagonal calculation (uses snapshot's stored dimension for custom positions)
       // Pass snapshot bounds when available (for custom positions that differ from octree)
-      lodLevel = lodSpatialIndex.getLODLevel(cameraDistance, viewportHeight, viewState.lastLodLevel, dimensionLevel, snapshot.bounds);
+      lodLevel = lodSpatialIndex.getLODLevel(cameraDistance, viewportHeight, viewState.lastLodLevel, effectiveDimLevel, snapshot.bounds);
     }
 
     // Always update per-view LOD level for highlight rendering and other consumers
+    // NOTE: lastDimensionLevel is NOT set here - it's handled inside _checkFrustumCacheValid
+    // to properly detect dimension changes and invalidate the frustum cache
     viewState.lastLodLevel = lodLevel;
 
     // Get size multiplier from LOD level for visual consistency
@@ -4236,14 +4552,21 @@ export class HighPerfRenderer {
     if (viewState.prevLodLevel !== lodLevel && lodSpatialIndex && (this.useAdaptiveLOD || this.forceLODLevel >= 0)) {
       const pointCount = lodSpatialIndex.lodLevels[lodLevel]?.pointCount || this.pointCount;
       const mode = this.forceLODLevel >= 0 ? 'forced' : 'auto';
-      console.log(`[LOD] Snapshot ${viewId}: level ${viewState.prevLodLevel ?? 'init'} → ${lodLevel} (${pointCount.toLocaleString()} pts, ${mode}, dim=${dimensionLevel})`);
+      console.log(`[LOD] Snapshot ${viewId}: level ${viewState.prevLodLevel ?? 'init'} → ${lodLevel} (${pointCount.toLocaleString()} pts, ${mode}, dim=${effectiveDimLevel})`);
       viewState.prevLodLevel = lodLevel;
     }
 
     // Determine if we should use full detail or LOD
-    const useFullDetail = lodLevel < 0 || !lodBuffersForDim.length ||
-      lodLevel >= lodBuffersForDim.length ||
-      (lodBuffersForDim[lodLevel] && lodBuffersForDim[lodLevel].isFullDetail);
+    // Check both global LOD buffers AND the spatial index's LOD levels
+    // This allows snapshots with custom positions (and their own spatial index) to use LOD
+    // even if no global LOD buffers exist for that dimension
+    const hasGlobalLodBuffer = lodBuffersForDim.length > 0 && lodLevel < lodBuffersForDim.length && lodBuffersForDim[lodLevel];
+    const hasLocalLodLevel = lodSpatialIndex?.lodLevels?.[lodLevel]?.indices?.length > 0;
+    const isGlobalFullDetail = hasGlobalLodBuffer && lodBuffersForDim[lodLevel].isFullDetail;
+
+    const useFullDetail = lodLevel < 0 ||
+      (!hasGlobalLodBuffer && !hasLocalLodLevel) ||
+      isGlobalFullDetail;
 
     // Frustum culling for snapshots:
     // - When positions match main buffer: use main octree for culling
@@ -4267,20 +4590,21 @@ export class HighPerfRenderer {
       }
 
       if (spatialIndex) {
-        // For 2D data (dimensionLevel <= 2), disable depth testing entirely to prevent draw-order artifacts.
+        // For 2D data (effectiveDimLevel <= 2), disable depth testing entirely to prevent draw-order artifacts.
         // When all points have the same Z, depth testing causes visual differences at quadtree
         // boundaries because frustum culling changes the draw order (spatially grouped vs original).
         // Disabling depth writes alone is insufficient - we must also disable depth testing.
-        const disableDepth = dimensionLevel <= 2;
+        const disableDepth = effectiveDimLevel <= 2;
         if (disableDepth) {
           gl.disable(gl.DEPTH_TEST);
         }
 
         // Use spatial index for hierarchical frustum culling (O(log n))
+        // Pass effectiveParams to ensure helper functions use correct dimensionLevel for cache invalidation
         if (useFullDetail) {
-          this._renderSnapshotWithFrustumCulling(snapshot, params, frustumPlanes, viewState, sizeMultiplier, useAlphaTexture, spatialIndex);
+          this._renderSnapshotWithFrustumCulling(snapshot, effectiveParams, frustumPlanes, viewState, sizeMultiplier, useAlphaTexture, spatialIndex);
         } else {
-          this._renderSnapshotLODWithFrustumCulling(snapshot, lodLevel, params, frustumPlanes, viewState, useAlphaTexture, spatialIndex, lodBuffersForDim);
+          this._renderSnapshotLODWithFrustumCulling(snapshot, lodLevel, effectiveParams, frustumPlanes, viewState, useAlphaTexture, spatialIndex, lodBuffersForDim);
         }
 
         // Restore depth testing
@@ -4300,11 +4624,25 @@ export class HighPerfRenderer {
       }
     }
 
+    // For 2D data (effectiveDimLevel <= 2), disable depth testing to prevent draw-order artifacts
+    // This is consistent with the frustum culling path and the main render() function
+    const disableDepth = effectiveDimLevel <= DEPTH_TEST_DIMENSION_THRESHOLD;
+    if (disableDepth) {
+      gl.disable(gl.DEPTH_TEST);
+    }
+
     // No frustum culling - check if we should use LOD
     if (!useFullDetail) {
       // Render with LOD using indexed drawing into snapshot buffer
       // Use lodSpatialIndex for custom positions (snapshot.spatialIndex) or main spatial index
-      this._renderSnapshotWithLOD(snapshot, lodLevel, params, viewState, useAlphaTexture, lodSpatialIndex, lodBuffersForDim);
+      // Pass effectiveParams to ensure correct dimensionLevel is used
+      this._renderSnapshotWithLOD(snapshot, lodLevel, effectiveParams, viewState, useAlphaTexture, lodSpatialIndex, lodBuffersForDim);
+
+      // Restore depth testing
+      if (disableDepth) {
+        gl.enable(gl.DEPTH_TEST);
+      }
+
       this.stats.lastFrameTime = performance.now() - frameStart;
       this.stats.fps = Math.round(1000 / Math.max(this.stats.lastFrameTime, 1));
       return this.stats;
@@ -4361,6 +4699,15 @@ export class HighPerfRenderer {
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, null);
     }
+
+    // Restore depth testing (matches the disable at line 4308)
+    if (disableDepth) {
+      gl.enable(gl.DEPTH_TEST);
+    }
+
+    // Update dimension level for non-frustum path (for getCombinedVisibilityForView and other consumers)
+    // This is done after rendering to ensure accurate per-view tracking without breaking cache invalidation
+    viewState.lastDimensionLevel = effectiveDimLevel;
 
     this.stats.visiblePoints = snapshot.pointCount;
     this.stats.lodLevel = lodLevel;
@@ -4458,7 +4805,8 @@ export class HighPerfRenderer {
         viewState.lastVisibleCount = visibleIndices.length;
       }
 
-      viewState.cachedVisibleIndices = new Uint32Array(visibleIndices);
+      // Store count for cache validation - no need to copy indices since they're uploaded to GPU
+      // The indices data is in viewState.indexBuffer (GPU) and visibleIndicesBuffer (pooled CPU buffer)
       viewState.cachedCulledCount = visibleIndices.length;
       viewState._noVisibleNodesWarned = false;  // Reset warning flag since we have visible nodes
 
@@ -4606,9 +4954,17 @@ export class HighPerfRenderer {
     const dimensionLevel = params.dimensionLevel || this.currentDimensionLevel;
     const lodBuffers = lodBuffersForDim || this.getLodBuffersForDimension(dimensionLevel);
     const tree = spatialIndex || this.spatialIndices.get(dimensionLevel);
-    const lod = lodBuffers[lodLevel];
 
-    if (!lod || lod.isFullDetail) {
+    // Get LOD buffer info (may be null for custom-position snapshots without global LOD buffers)
+    const lod = lodBuffers?.[lodLevel];
+
+    // Check if the tree has LOD levels we can use for indexed drawing
+    const hasTreeLodLevel = tree?.lodLevels?.[lodLevel]?.indices?.length > 0;
+
+    // Fall back to full detail if:
+    // - No LOD buffer AND no tree LOD level available
+    // - LOD buffer exists but is marked as full detail
+    if ((!lod && !hasTreeLodLevel) || (lod && lod.isFullDetail)) {
       this._renderSnapshotFullDetail(snapshot, params, lod?.sizeMultiplier || 1.0, useAlphaTexture);
       return;
     }
@@ -4624,11 +4980,11 @@ export class HighPerfRenderer {
 
     if (lodLevelChanged && tree && tree.lodLevels && tree.lodLevels[lodLevel]) {
       // Get the LOD level's original indices (which points to render)
+      // Note: indices are already Uint32Array from _stratifiedSample, no conversion needed
       const lodOriginalIndices = tree.lodLevels[lodLevel].indices;
 
-      // Upload LOD indices to per-view index buffer
-      const indicesArray = new Uint32Array(lodOriginalIndices);
-      this._uploadToViewIndexBuffer(viewState, indicesArray);
+      // Upload LOD indices to per-view index buffer (already typed array, no allocation)
+      this._uploadToViewIndexBuffer(viewState, lodOriginalIndices);
       viewState.cachedCulledCount = lodOriginalIndices.length;
       viewState.cachedLodLevel = lodLevel;
       viewState.cachedLodIsCulled = false;  // Mark as full LOD indices (not culled)
@@ -4638,7 +4994,23 @@ export class HighPerfRenderer {
       // We use prevLodLevel to avoid duplicate logging
     }
 
-    const adjustedPointSize = pointSize * (lod.sizeMultiplier || 1.0);
+    // Size multiplier from LOD buffer if available, otherwise estimate from tree's LOD level
+    // Note: When using tree LOD levels without global LOD buffers, we estimate the size multiplier
+    // based on the ratio of LOD point count to total point count
+    let sizeMultiplier = 1.0;
+    if (lod?.sizeMultiplier) {
+      sizeMultiplier = lod.sizeMultiplier;
+    } else if (tree?.lodLevels?.[lodLevel]) {
+      // Estimate size multiplier based on point density reduction
+      const lodPointCount = tree.lodLevels[lodLevel].pointCount || tree.lodLevels[lodLevel].indices?.length || 0;
+      const totalPoints = tree.pointCount || snapshot.pointCount;
+      if (lodPointCount > 0 && totalPoints > 0) {
+        const reduction = totalPoints / lodPointCount;
+        // Point size should scale roughly with sqrt of density reduction to maintain visual consistency
+        sizeMultiplier = Math.sqrt(reduction);
+      }
+    }
+    const adjustedPointSize = pointSize * sizeMultiplier;
 
     const program = this.activeProgram;
     const uniforms = this.uniformLocations.get(this.activeQuality);
@@ -4760,7 +5132,13 @@ export class HighPerfRenderer {
       viewState.cachedVisibleNodes = visibleNodes;
 
       // Build Set of visible original point indices
-      const visibleOriginalSet = new Set();
+      // Reuse existing Set if available to reduce GC pressure (clear instead of allocate)
+      let visibleOriginalSet = viewState.cachedVisibleOriginalSet;
+      if (visibleOriginalSet) {
+        visibleOriginalSet.clear();
+      } else {
+        visibleOriginalSet = new Set();
+      }
       for (let i = 0; i < visibleNodes.length; i++) {
         const nodeIndices = visibleNodes[i].indices;
         if (nodeIndices) {
@@ -4799,9 +5177,17 @@ export class HighPerfRenderer {
       const visibleOriginalSet = viewState.cachedVisibleOriginalSet;
 
       // Get LOD level's indices and filter by visibility
-      // Pre-allocate max size to avoid array resizing (significant perf improvement)
+      // Reuse pooled buffer in viewState to avoid GC pressure from repeated allocations
       const lodOriginalIndices = tree.lodLevels[lodLevel].indices;
-      const visibleLodIndices = new Uint32Array(lodOriginalIndices.length);
+      const requiredCapacity = lodOriginalIndices.length;
+
+      // Reuse or grow the pooled buffer (grow by 1.5x to reduce future reallocations)
+      if (!viewState.visibleLodIndicesBuffer || viewState.visibleLodIndicesCapacity < requiredCapacity) {
+        viewState.visibleLodIndicesCapacity = Math.ceil(requiredCapacity * 1.5);
+        viewState.visibleLodIndicesBuffer = new Uint32Array(viewState.visibleLodIndicesCapacity);
+      }
+
+      const visibleLodIndices = viewState.visibleLodIndicesBuffer;
       let visibleCount = 0;
       for (let i = 0; i < lodOriginalIndices.length; i++) {
         if (visibleOriginalSet.has(lodOriginalIndices[i])) {

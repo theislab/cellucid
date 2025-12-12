@@ -137,16 +137,23 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   ]), gl.STATIC_DRAW);
 
   // V2 edge textures (created on demand)
+  // Global edge topology texture (shared across all views - edges don't change)
   let edgeTextureV2 = null;
-  let positionTextureV2 = null;
-  let visibilityTextureV2 = null;
-  let visibilityScratchBuffer = null;  // Reusable buffer to avoid allocations
   let edgeTexDimsV2 = [0, 0];
-  let posTexDimsV2 = [0, 0];
   let nEdgesV2 = 0;
   let nCellsV2 = 0;
   let useInstancedEdges = false;  // Whether to use v2 instanced rendering
   let edgeLodLimit = 0;  // LOD limit for number of edges to render (0 = all)
+
+  // Per-view edge textures for multi-view/multi-dimension support
+  // Each view can have different positions (embeddings) and visibility (filters/LOD)
+  const edgePositionTexturesV2 = new Map();   // viewId -> { texture, dims: [w, h], format }
+  const edgeVisibilityTexturesV2 = new Map(); // viewId -> { texture, dims: [w, h], scratchBuffer, format }
+
+  // Debug flag for edge rendering (set to true to enable verbose logging)
+  let edgeDebugMode = false;
+  let edgeDebugFrameCount = 0;  // Limit debug output to first few frames
+
 
   // Centroid snapshot buffers - pre-uploaded GPU buffers for each snapshot view
   // Eliminates per-frame CPU→GPU uploads in multiview mode
@@ -251,6 +258,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   const sidebarEl = sidebar || null;
   let viewTitleEntries = [];
   let lastTitleKey = null;
+  // Cache for view title layout to avoid per-frame style updates
+  let lastTitleLayoutWidth = 0;
+  let lastTitleLayoutHeight = 0;
+  let lastTitleLayoutCols = 0;
+  let lastTitleLayoutRows = 0;
 
   const projectionMatrix = mat4.create();
   const viewMatrix = mat4.create();
@@ -269,6 +281,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   const tempVec3e = vec3.create();
   const tempVec3f = vec3.create();
   const lightDir = vec3.normalize(vec3.create(), [0.5, 0.7, 0.5]);
+  // Preallocated scratch vectors for getFreeflyAxes() to avoid per-frame allocations
+  const _freeflyForward = vec3.create();
+  const _freeflyRight = vec3.create();
+  const _freeflyUp = vec3.create();
+  const _freeflyWorldUp = vec3.fromValues(0, 1, 0);
+  // Preallocated scratch matrix for grid rendering to avoid per-frame mat4.clone()
+  const _activeViewMatrixScratch = mat4.create();
 
   let positionsArray = null;
   let colorsArray = null;
@@ -925,19 +944,19 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   }
 
   function getFreeflyAxes() {
-    const forward = vec3.fromValues(
+    // Reuse preallocated scratch vectors to avoid per-frame allocations
+    vec3.set(_freeflyForward,
       Math.cos(freeflyPitch) * Math.cos(freeflyYaw),
       Math.sin(freeflyPitch),
       Math.cos(freeflyPitch) * Math.sin(freeflyYaw)
     );
-    vec3.normalize(forward, forward);
-    const worldUp = vec3.fromValues(0, 1, 0);
-    const right = vec3.cross(vec3.create(), forward, worldUp);
-    if (vec3.length(right) < 1e-6) vec3.set(right, 1, 0, 0);
-    vec3.normalize(right, right);
-    const upVec = vec3.cross(vec3.create(), right, forward);
-    vec3.normalize(upVec, upVec);
-    return { forward, right, upVec };
+    vec3.normalize(_freeflyForward, _freeflyForward);
+    vec3.cross(_freeflyRight, _freeflyForward, _freeflyWorldUp);
+    if (vec3.length(_freeflyRight) < 1e-6) vec3.set(_freeflyRight, 1, 0, 0);
+    vec3.normalize(_freeflyRight, _freeflyRight);
+    vec3.cross(_freeflyUp, _freeflyRight, _freeflyForward);
+    vec3.normalize(_freeflyUp, _freeflyUp);
+    return { forward: _freeflyForward, right: _freeflyRight, upVec: _freeflyUp };
   }
 
   // Extract camera position and axes from a view matrix (for multiview projectile support)
@@ -1182,18 +1201,37 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     console.log(`[Viewer] Created edge texture V2: ${nEdges} edges, ${width}x${height} texture`);
   }
 
+  // ========================================================================
+  // PER-VIEW EDGE TEXTURE MANAGEMENT
+  // Enables multi-view edge rendering with different positions/visibility per view
+  // ========================================================================
+
   /**
-   * Create position texture from positions array
-   * @param {Float32Array} positions - Flat array of xyz positions
+   * Create or update position texture for a specific view.
+   * Each view can have different positions (e.g., XY embedding vs XZ embedding).
+   * @param {string} viewId - View identifier
+   * @param {Float32Array} positions - Flat array of xyz positions (nCells * 3)
    * @param {number} nCells - Number of cells
+   * @returns {boolean} True if texture was created successfully
    */
-  function createPositionTextureV2(positions, nCells) {
-    if (positionTextureV2) {
-      gl.deleteTexture(positionTextureV2);
+  function createPositionTextureV2ForView(viewId, positions, nCells) {
+    const vid = String(viewId);
+
+    // Validate inputs
+    if (!positions || positions.length < nCells * 3) {
+      console.warn(`[Viewer] Invalid positions for view ${vid}: positions=${positions?.length}, expected=${nCells * 3}`);
+      return false;
     }
 
-    posTexDimsV2 = calcTextureDims(nCells);
-    const [width, height] = posTexDimsV2;
+    const existing = edgePositionTexturesV2.get(vid);
+
+    // Delete existing texture if present
+    if (existing?.texture) {
+      gl.deleteTexture(existing.texture);
+    }
+
+    const dims = calcTextureDims(nCells);
+    const [width, height] = dims;
     const texelCount = width * height;
 
     // Pack positions into RGB32F texture
@@ -1204,8 +1242,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       data[i * 3 + 2] = positions[i * 3 + 2];
     }
 
-    positionTextureV2 = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, positionTextureV2);
+    const texture = gl.createTexture();
+    if (!texture) {
+      console.error(`[Viewer] Failed to create position texture for view ${vid}`);
+      return false;
+    }
+
+    gl.bindTexture(gl.TEXTURE_2D, texture);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB32F, width, height, 0, gl.RGB, gl.FLOAT, data);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
@@ -1213,53 +1256,305 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.bindTexture(gl.TEXTURE_2D, null);
 
-    nCellsV2 = nCells;
-    console.log(`[Viewer] Created position texture V2: ${nCells} cells, ${width}x${height} texture`);
+    // Store with format tag for validation
+    edgePositionTexturesV2.set(vid, { texture, dims, nCells, format: 'RGB32F' });
+    return true;
   }
 
   /**
-   * Create or update visibility texture
-   * @param {Float32Array|Uint8Array} visibility - Visibility values (0-1 per cell)
+   * Create or update visibility texture for a specific view.
+   * Each view can have different visibility (filters, LOD level).
+   * @param {string} viewId - View identifier
+   * @param {Float32Array} visibility - Per-cell visibility (0-1)
+   * @returns {boolean} True if texture was created/updated successfully
    */
-  function updateVisibilityTextureV2(visibility) {
+  function updateVisibilityTextureV2ForView(viewId, visibility) {
+    const vid = String(viewId);
+
+    // Validate inputs
+    if (!visibility || visibility.length === 0) {
+      console.warn(`[Viewer] Invalid visibility for view ${vid}: visibility is empty or null`);
+      return false;
+    }
+
     const nCells = visibility.length;
-    const [width, height] = posTexDimsV2;
+
+    // Get position texture dims for this view (visibility must match position count)
+    const posEntry = edgePositionTexturesV2.get(vid);
+    if (!posEntry) {
+      console.warn(`[Viewer] Cannot update visibility for view ${vid}: no position texture`);
+      return false;
+    }
+
+    const [width, height] = posEntry.dims;
     const texelCount = width * height;
 
-    // Reuse scratch buffer if size matches, otherwise reallocate
-    if (!visibilityScratchBuffer || visibilityScratchBuffer.length !== texelCount) {
-      visibilityScratchBuffer = new Float32Array(texelCount);
+    // Get or create visibility entry
+    let visEntry = edgeVisibilityTexturesV2.get(vid);
+
+    // Reuse or create scratch buffer
+    let scratchBuffer = visEntry?.scratchBuffer;
+    const hadPreviousBuffer = scratchBuffer && scratchBuffer.length === texelCount;
+    if (!hadPreviousBuffer) {
+      scratchBuffer = new Float32Array(texelCount);
     }
 
-    // Copy visibility data and zero-pad remainder
-    for (let i = 0; i < texelCount; i++) {
-      visibilityScratchBuffer[i] = i < nCells ? visibility[i] : 0;
+    // For subsequent updates, detect which rows changed to enable partial uploads
+    // This avoids full texture upload when only a few cells change (e.g., sparse filter updates)
+    let dirtyRowStart = 0;
+    let dirtyRowEnd = height;
+    let hasChanges = true;
+
+    if (hadPreviousBuffer && visEntry?.texture) {
+      // Compare with previous values to find dirty rows and detect if anything changed
+      hasChanges = false;
+      dirtyRowStart = height; // Will be updated to first dirty row
+      dirtyRowEnd = 0; // Will be updated to last dirty row + 1
+
+      for (let row = 0; row < height; row++) {
+        const rowStart = row * width;
+        const rowEnd = Math.min(rowStart + width, texelCount);
+        let rowDirty = false;
+
+        for (let i = rowStart; i < rowEnd; i++) {
+          const newVal = i < nCells ? visibility[i] : 0;
+          if (scratchBuffer[i] !== newVal) {
+            scratchBuffer[i] = newVal;
+            rowDirty = true;
+          }
+        }
+
+        if (rowDirty) {
+          hasChanges = true;
+          if (row < dirtyRowStart) dirtyRowStart = row;
+          dirtyRowEnd = row + 1;
+        }
+      }
+
+      // Early exit if nothing changed
+      if (!hasChanges) {
+        return true;
+      }
+    } else {
+      // First time or buffer size changed: copy all data
+      for (let i = 0; i < texelCount; i++) {
+        scratchBuffer[i] = i < nCells ? visibility[i] : 0;
+      }
     }
 
-    if (!visibilityTextureV2) {
-      // First time: create texture and upload with texImage2D
-      visibilityTextureV2 = gl.createTexture();
-      gl.bindTexture(gl.TEXTURE_2D, visibilityTextureV2);
+    if (!visEntry?.texture) {
+      // First time: create texture
+      const texture = gl.createTexture();
+      if (!texture) {
+        console.error(`[Viewer] Failed to create visibility texture for view ${vid}`);
+        return false;
+      }
+
+      gl.bindTexture(gl.TEXTURE_2D, texture);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, width, height, 0, gl.RED, gl.FLOAT, visibilityScratchBuffer);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, width, height, 0, gl.RED, gl.FLOAT, scratchBuffer);
+      gl.bindTexture(gl.TEXTURE_2D, null);
+
+      // Store with format tag for validation
+      edgeVisibilityTexturesV2.set(vid, { texture, dims: [width, height], scratchBuffer, format: 'R32F' });
     } else {
-      // Subsequent updates: use texSubImage2D (faster, no reallocation on GPU)
-      gl.bindTexture(gl.TEXTURE_2D, visibilityTextureV2);
-      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, width, height, gl.RED, gl.FLOAT, visibilityScratchBuffer);
+      // Subsequent updates: use row-based partial upload if fewer than 50% of rows changed
+      const dirtyRowCount = dirtyRowEnd - dirtyRowStart;
+      const usePartialUpload = dirtyRowCount < height * 0.5 && dirtyRowCount > 0;
+
+      gl.bindTexture(gl.TEXTURE_2D, visEntry.texture);
+
+      if (usePartialUpload) {
+        // Upload only the dirty rows using a subview of the scratch buffer
+        // texSubImage2D(target, level, xoffset, yoffset, width, height, format, type, srcData, srcOffset)
+        const srcOffset = dirtyRowStart * width;
+        gl.texSubImage2D(
+          gl.TEXTURE_2D, 0, 0, dirtyRowStart, width, dirtyRowCount,
+          gl.RED, gl.FLOAT, scratchBuffer, srcOffset
+        );
+      } else {
+        // Full texture upload
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, width, height, gl.RED, gl.FLOAT, scratchBuffer);
+      }
+
+      gl.bindTexture(gl.TEXTURE_2D, null);
+
+      // Update scratch buffer reference (it already holds the new values)
+      visEntry.scratchBuffer = scratchBuffer;
     }
 
-    gl.bindTexture(gl.TEXTURE_2D, null);
+    return true;
+  }
+
+  /**
+   * Delete edge textures for a specific view (cleanup on snapshot removal).
+   * @param {string} viewId - View identifier
+   */
+  function deleteEdgeTexturesForView(viewId) {
+    const vid = String(viewId);
+
+    const posEntry = edgePositionTexturesV2.get(vid);
+    if (posEntry?.texture) {
+      gl.deleteTexture(posEntry.texture);
+    }
+    edgePositionTexturesV2.delete(vid);
+
+    const visEntry = edgeVisibilityTexturesV2.get(vid);
+    if (visEntry?.texture) {
+      gl.deleteTexture(visEntry.texture);
+    }
+    edgeVisibilityTexturesV2.delete(vid);
+  }
+
+  /**
+   * Validate that a texture entry has the expected format for float samplers.
+   * @param {Object} entry - Texture entry with texture and format properties
+   * @param {string} expectedFormat - Expected format ('RGB32F' or 'R32F')
+   * @returns {boolean} True if valid
+   */
+  function isValidFloatTexture(entry, expectedFormat) {
+    if (!entry?.texture) return false;
+    // If format was tracked, verify it matches
+    if (entry.format && entry.format !== expectedFormat) {
+      console.error(`[Viewer] Texture format mismatch: expected ${expectedFormat}, got ${entry.format}`);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Get edge textures for a specific view.
+   * Handles multiple scenarios:
+   * 1. View has its own position and visibility textures → use both
+   * 2. View has position texture but shares live visibility → use own pos + live vis
+   * 3. View has no textures → fall back to live view's textures entirely
+   *
+   * IMPORTANT: Position and visibility textures must have matching dimensions.
+   * @param {string} viewId - View identifier
+   * @returns {{ posTexture, visTexture, dims } | null} Textures and dimensions, or null if unavailable
+   */
+  function getEdgeTexturesForView(viewId) {
+    const vid = String(viewId);
+
+    // Get live view textures first (needed for fallbacks)
+    const livePos = edgePositionTexturesV2.get(LIVE_VIEW_ID);
+    const liveVis = edgeVisibilityTexturesV2.get(LIVE_VIEW_ID);
+
+    // Helper to validate and return a texture set
+    const validateAndReturn = (posEntry, visEntry, source) => {
+      // Validate both textures exist and have correct formats
+      if (!isValidFloatTexture(posEntry, 'RGB32F')) {
+        console.warn(`[Viewer] Invalid position texture for ${source}`);
+        return null;
+      }
+      if (!isValidFloatTexture(visEntry, 'R32F')) {
+        console.warn(`[Viewer] Invalid visibility texture for ${source}`);
+        return null;
+      }
+      // Validate dimensions match
+      const posDims = posEntry.dims;
+      const visDims = visEntry.dims;
+      if (!posDims || !visDims || posDims[0] !== visDims[0] || posDims[1] !== visDims[1]) {
+        console.warn(`[Viewer] Dimension mismatch for ${source}: pos=${posDims}, vis=${visDims}`);
+        return null;
+      }
+      return {
+        posTexture: posEntry.texture,
+        visTexture: visEntry.texture,
+        dims: posDims
+      };
+    };
+
+    // For live view, just return its own textures
+    if (vid === LIVE_VIEW_ID) {
+      const result = validateAndReturn(livePos, liveVis, 'live');
+      if (result) return result;
+      // Fall through to legacy fallback
+    }
+
+    // For snapshots, check if they share live transparency
+    const snapshot = snapshotViews.find(s => s.id === vid);
+    const sharesLiveTransparency = snapshot?.sharesLiveTransparency ?? false;
+
+    // Get position texture for this view
+    const posEntry = edgePositionTexturesV2.get(vid);
+
+    // Determine which visibility texture to use
+    let visEntry;
+    if (sharesLiveTransparency) {
+      // Shares live's filters → use live's visibility texture
+      visEntry = liveVis;
+    } else {
+      // Has own filters → try own visibility, fall back to live's
+      visEntry = edgeVisibilityTexturesV2.get(vid) || liveVis;
+    }
+
+    // If snapshot has its own position texture, try to use it
+    if (posEntry?.texture) {
+      const result = validateAndReturn(posEntry, visEntry, `view ${vid}`);
+      if (result) return result;
+      // Validation failed - fall back to live textures
+    }
+
+    // Fall back to live's textures entirely
+    if (livePos?.texture && liveVis?.texture) {
+      const result = validateAndReturn(livePos, liveVis, 'live fallback');
+      if (result) return result;
+    }
+
+    // No valid textures available
+    return null;
+  }
+
+  /**
+   * Check if a view has per-view edge textures set up.
+   * @param {string} viewId - View identifier
+   * @returns {boolean}
+   */
+  function hasEdgeTexturesForView(viewId) {
+    const vid = String(viewId);
+    return edgePositionTexturesV2.has(vid) && edgeVisibilityTexturesV2.has(vid);
   }
 
   /**
    * Draw connectivity using instanced rendering (V2)
+   * Now supports per-view textures for multi-view rendering with different
+   * dimensional projections (e.g., XY vs XZ) and view-specific filtering.
+   *
+   * @param {number} widthPx - Viewport width in pixels
+   * @param {number} heightPx - Viewport height in pixels
+   * @param {string} [viewId] - Optional view ID for per-view texture lookup
    */
-  function drawConnectivityInstanced(widthPx, heightPx) {
-    if (!showConnectivity || nEdgesV2 === 0 || !edgeTextureV2 || !positionTextureV2 || !visibilityTextureV2) {
+  function drawConnectivityInstanced(widthPx, heightPx, viewId) {
+    if (!showConnectivity || nEdgesV2 === 0 || !edgeTextureV2) {
       return;
+    }
+
+    // Get textures for this view (per-view or fallback to global)
+    const textures = getEdgeTexturesForView(viewId);
+
+    // Need valid textures to render
+    if (!textures || !textures.posTexture || !textures.visTexture) {
+      if (edgeDebugMode && edgeDebugFrameCount < 5) {
+        console.warn(`[Viewer] No valid textures for view ${viewId}, skipping edge render`);
+      }
+      return;
+    }
+
+    const { posTexture, visTexture, dims } = textures;
+
+    // Validate dimensions are non-zero and valid
+    if (!dims || !Array.isArray(dims) || dims.length < 2 || !dims[0] || !dims[1]) {
+      console.warn(`[Viewer] Invalid edge texture dims for view ${viewId}:`, dims);
+      return;
+    }
+
+    // Debug logging for first few frames
+    if (edgeDebugMode && edgeDebugFrameCount < 5) {
+      console.log(`[Viewer] Edge render for ${viewId}: dims=${dims}, posTexture=${!!posTexture}, visTexture=${!!visTexture}`);
     }
 
     gl.useProgram(lineInstancedProgram);
@@ -1271,13 +1566,16 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     gl.uniform2f(lineInstancedUniformLocations.viewportSize, widthPx, heightPx);
     gl.uniform1f(lineInstancedUniformLocations.lineWidth, connectivityLineWidth);
 
-    // LOD: limit edges if set
+    // LOD: limit edges if set - this directly reduces the instance count for actual GPU savings
+    // Previously we passed maxEdges as a uniform and let the shader discard, which still wasted
+    // vertex shader invocations. Now we reduce the draw call itself.
     const maxEdges = edgeLodLimit > 0 ? Math.min(edgeLodLimit, nEdgesV2) : nEdgesV2;
+    // Keep uniform for shader-side early-out (defensive, in case instance count differs)
     gl.uniform1i(lineInstancedUniformLocations.maxEdges, maxEdges);
 
-    // Texture dimensions
+    // Texture dimensions (use per-view dims for position texture)
     gl.uniform2i(lineInstancedUniformLocations.edgeTexDims, edgeTexDimsV2[0], edgeTexDimsV2[1]);
-    gl.uniform2i(lineInstancedUniformLocations.posTexDims, posTexDimsV2[0], posTexDimsV2[1]);
+    gl.uniform2i(lineInstancedUniformLocations.posTexDims, dims[0], dims[1]);
 
     // Bind textures
     gl.activeTexture(gl.TEXTURE0);
@@ -1285,11 +1583,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     gl.uniform1i(lineInstancedUniformLocations.edgeTexture, 0);
 
     gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, positionTextureV2);
+    gl.bindTexture(gl.TEXTURE_2D, posTexture);  // Per-view position texture
     gl.uniform1i(lineInstancedUniformLocations.positionTexture, 1);
 
     gl.activeTexture(gl.TEXTURE2);
-    gl.bindTexture(gl.TEXTURE_2D, visibilityTextureV2);
+    gl.bindTexture(gl.TEXTURE_2D, visTexture);  // Per-view visibility texture
     gl.uniform1i(lineInstancedUniformLocations.visibilityTexture, 2);
 
     // Color and fog uniforms
@@ -1308,12 +1606,24 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     gl.enableVertexAttribArray(lineInstancedAttribLocations.quadPos);
     gl.vertexAttribPointer(lineInstancedAttribLocations.quadPos, 2, gl.FLOAT, false, 0, 0);
 
-    // Draw instanced
-    gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, nEdgesV2);
+    // Draw instanced - use maxEdges (not nEdgesV2) to actually reduce GPU work
+    // This is the critical fix: reducing the instance count saves vertex shader invocations,
+    // whereas the shader-side check just outputs degenerate triangles but still runs the VS
+    gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, maxEdges);
 
-    // Cleanup
+    // Cleanup - explicitly unbind textures to prevent state leakage
     gl.disableVertexAttribArray(lineInstancedAttribLocations.quadPos);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, null);
     gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+
+    // Increment debug frame counter
+    if (edgeDebugMode) {
+      edgeDebugFrameCount++;
+    }
   }
 
   function drawGrid() {
@@ -1397,8 +1707,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     return t * t * (3 - 2 * t);
   }
 
-  function drawConnectivityLines(widthPx, heightPx) {
-    drawConnectivityInstanced(widthPx, heightPx);
+  function drawConnectivityLines(widthPx, heightPx, viewId) {
+    drawConnectivityInstanced(widthPx, heightPx, viewId);
   }
 
   function drawCentroids(count, viewportHeight) {
@@ -1761,7 +2071,16 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     // Get the dimension level for this view and use spatial index if available
     // Don't force creation - use brute force fallback if no spatial index exists
     const viewDimLevel = viewDimensionLevels.get(String(clickedViewId)) ?? viewDimensionLevels.get(LIVE_VIEW_ID) ?? 3;
-    const spatialIndex = hpRenderer.getSpatialIndex(viewDimLevel);
+    // Use snapshot's own spatial index for custom-position snapshots, fall back to global
+    let spatialIndex = null;
+    if (clickedViewId !== LIVE_VIEW_ID) {
+      // Try to get snapshot's own spatial index first (for custom positions)
+      spatialIndex = hpRenderer.getSnapshotSpatialIndex(String(clickedViewId));
+    }
+    // Fall back to global spatial index if no snapshot-specific one exists
+    if (!spatialIndex) {
+      spatialIndex = hpRenderer.getSpatialIndex(viewDimLevel);
+    }
 
     // Get view-specific transparency array for filtering check
     // Each view may have different filters, so we need the clicked view's transparency
@@ -2010,6 +2329,20 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     const width = canvas.clientWidth;
     const height = canvas.clientHeight;
 
+    // Skip style updates if layout dimensions haven't changed
+    if (width === lastTitleLayoutWidth &&
+        height === lastTitleLayoutHeight &&
+        cols === lastTitleLayoutCols &&
+        rows === lastTitleLayoutRows) {
+      return;
+    }
+
+    // Cache current layout for next frame comparison
+    lastTitleLayoutWidth = width;
+    lastTitleLayoutHeight = height;
+    lastTitleLayoutCols = cols;
+    lastTitleLayoutRows = rows;
+
     viewTitleEntries.forEach((entry, i) => {
       if (!entry.el || i >= views.length) return;
       const col = i % cols;
@@ -2221,11 +2554,34 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         const snapshotId = hasSnapshotBuffer ? view.id : null;
         renderSingleView(width, height, { x: 0, y: 0, w: 1, h: 1 }, view.id, view.centroidCount, snapshotId);
       } else {
-        // Multi-view mode: reset tracking since we use snapshot buffers
+        // Single-layout mode with multiple views: render the focused view with its snapshot buffer
+        // Reset main buffer tracking since we use snapshot buffers for consistency with grid mode
         if (currentLoadedViewId !== null) {
           currentLoadedViewId = null;
         }
-        renderSingleView(width, height, { x: 0, y: 0, w: 1, h: 1 });
+
+        // Find the focused view (defaults to live view if not found)
+        const view = allViews.find(v => v.id === focusedViewId) || allViews[0];
+
+        // Check if this snapshot has a pre-uploaded GPU buffer (same logic as grid mode)
+        let hasSnapshotBuffer = view.id !== LIVE_VIEW_ID && hpRenderer.hasSnapshotBuffer(view.id);
+
+        // For snapshots without GPU buffers, lazily create one (uploaded once, not per-frame)
+        if (view.id !== LIVE_VIEW_ID && !hasSnapshotBuffer && view.colors && view.transparency) {
+          const viewPositions = viewPositionsCache.get(String(view.id)) || positionsArray;
+          hpRenderer.createSnapshotBuffer(view.id, view.colors, view.transparency, viewPositions);
+          hasSnapshotBuffer = true;
+        }
+
+        // Create or recreate centroid snapshot buffer if needed
+        const viewDimLevel = viewDimensionLevels.get(view.id) ?? 3;
+        if (view.centroidPositions && view.centroidColors && centroidBufferNeedsUpdate(view.id, viewDimLevel, view.centroidPositions)) {
+          createCentroidSnapshotBuffer(view.id, view.centroidPositions, view.centroidColors, viewDimLevel);
+        }
+
+        // Pass snapshot buffer ID if available (uses immutable snapshot, consistent with grid mode)
+        const snapshotId = hasSnapshotBuffer ? view.id : null;
+        renderSingleView(width, height, { x: 0, y: 0, w: 1, h: 1 }, view.id, view.centroidCount, snapshotId);
       }
       hideViewTitles(); // No titles in single/fullscreen mode
       return;
@@ -2259,7 +2615,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     }
 
     // Store active view's matrices (computed once in updateCamera before this loop)
-    const activeViewMatrix = mat4.clone(viewMatrix);
+    // Use preallocated scratch matrix to avoid per-frame allocation
+    mat4.copy(_activeViewMatrixScratch, viewMatrix);
     const activeRadius = radius;
 
     // Frustum culling and LOD work per-view: each renderSingleView call receives
@@ -2277,8 +2634,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         // OPTIMIZATION: Use cached view matrices instead of per-frame recalculation
         // No global state modification, no applyCameraStateTemporarily, no updateCamera
         if (isActiveView) {
-          // Active view: always use the freshly computed activeViewMatrix
-          mat4.copy(viewMatrix, activeViewMatrix);
+          // Active view: always use the freshly computed active view matrix
+          mat4.copy(viewMatrix, _activeViewMatrixScratch);
           radius = activeRadius;
         } else if (!camerasLocked) {
           const cached = cachedViewMatrices.get(view.id);
@@ -2300,13 +2657,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
               updateCachedViewMatrix(view.id, camState);
             } else {
               // Truly no camera state - use active view as last resort
-              mat4.copy(viewMatrix, activeViewMatrix);
+              mat4.copy(viewMatrix, _activeViewMatrixScratch);
               radius = activeRadius;
             }
           }
         } else {
           // Locked mode: non-active views use active view's matrix
-          mat4.copy(viewMatrix, activeViewMatrix);
+          mat4.copy(viewMatrix, _activeViewMatrixScratch);
           radius = activeRadius;
         }
 
@@ -2347,7 +2704,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       }
 
     // Restore active view's state after grid render
-    mat4.copy(viewMatrix, activeViewMatrix);
+    mat4.copy(viewMatrix, _activeViewMatrixScratch);
     radius = activeRadius;
 
     // Restore projection matrix for full canvas aspect
@@ -2374,6 +2731,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     // Render params shared by both render paths
     // Get dimension level for this view (used for LOD and frustum culling calculations)
     const dimLevel = viewDimensionLevels.get(vid) ?? 3;
+    // Camera distance calculation: in freefly mode, compute from position; otherwise use orbit radius
+    const camDist = navigationMode === 'free'
+      ? vec3.length(freeflyPosition)
+      : radius;
     const renderParams = {
       mvpMatrix,
       viewMatrix,
@@ -2389,7 +2750,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       fogColor,
       lightDir,
       cameraPosition,
-      cameraDistance: radius,
+      cameraDistance: camDist,
       viewId: vid,  // Per-view identifier for LOD and frustum culling state
       dimensionLevel: dimLevel,  // Current dimension level for correct 2D/3D LOD calculation
       useAlphaTexture  // For sharesLiveTransparency snapshots, sample alpha from live texture
@@ -2412,8 +2773,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       : transparencyArray;
     highlightTools?.renderHighlights?.(renderParams, viewPos, viewTransp);
 
-    // Draw connectivity lines
-    drawConnectivityLines(width, height);
+    // Draw connectivity lines (pass viewId for per-view position/visibility textures)
+    drawConnectivityLines(width, height, vid);
 
     // Draw centroids
     const flags = getViewFlags(vid);
@@ -2906,6 +3267,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     /**
      * Update positions for dimension switching (maintains same point count and indices)
+     * Also updates edge position texture if edge rendering is enabled.
      * @param {Float32Array} positions - New 3D positions array (n_points * 3)
      */
     updatePositions(positions) {
@@ -2929,6 +3291,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         hpRenderer.loadData(positions, colorsArray, { dimensionLevel: dimLevel });
       }
       // Note: Spatial index is rebuilt lazily by updatePositions only if LOD/frustum culling is enabled
+
+      // Update edge position texture for live view if edges are enabled
+      if (useInstancedEdges && nEdgesV2 > 0) {
+        createPositionTextureV2ForView(LIVE_VIEW_ID, positions, pointCount);
+      }
 
       currentLoadedViewId = LIVE_VIEW_ID;
     },
@@ -2968,10 +3335,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       // Invalidate per-view caches when dimension changes (LOD/frustum calculations differ)
       if (oldLevel !== level && hpRenderer) {
         hpRenderer.clearViewState(vid);
-        // If this view has a snapshot buffer with spatial index, it needs rebuild
-        const snapshot = hpRenderer.snapshotBuffers?.get(vid);
-        if (snapshot?.spatialIndex) {
-          snapshot.spatialIndex = null;
+        // If this view has a snapshot buffer, rebuild its spatial index for the new dimension
+        // This ensures LOD/frustum culling works correctly after dimension change
+        if (hpRenderer.hasSnapshotBuffer(vid)) {
+          hpRenderer.rebuildSnapshotSpatialIndex(vid, level);
         }
 
         // For live view, also update the renderer's dimension level
@@ -2997,6 +3364,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     /**
      * Set positions for a specific view (for multi-dimensional support in multiview)
      * Updates the snapshot buffer with new positions if the view has one.
+     * Also updates per-view edge position textures if edge rendering is enabled.
      * @param {string} viewId - View identifier
      * @param {Float32Array} positions - 3D positions array
      */
@@ -3013,10 +3381,20 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         if (hpRenderer && hpRenderer.updatePositions) {
           hpRenderer.updatePositions(positions, dimLevel);
         }
+        // Update edge position texture for live view if edges are enabled
+        if (useInstancedEdges && nEdgesV2 > 0) {
+          const nCells = positions.length / 3;
+          createPositionTextureV2ForView(vid, positions, nCells);
+        }
       } else {
         // For snapshot views, update the snapshot buffer positions
         if (hpRenderer && hpRenderer.updateSnapshotPositions) {
           hpRenderer.updateSnapshotPositions(vid, positions);
+        }
+        // Update edge position texture for this snapshot if edges are enabled
+        if (useInstancedEdges && nEdgesV2 > 0) {
+          const nCells = positions.length / 3;
+          createPositionTextureV2ForView(vid, positions, nCells);
         }
       }
     },
@@ -3488,14 +3866,14 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         return false;
       }
 
-      // Create textures
+      // Create edge topology texture (shared across all views)
       createEdgeTextureV2(sources, destinations, nEdges);
-      createPositionTextureV2(positions, nCells);
 
-      // Initialize visibility to all visible
+      // Create per-view textures for live view (primary view)
       const visibility = new Float32Array(nCells);
       visibility.fill(1.0);
-      updateVisibilityTextureV2(visibility);
+      createPositionTextureV2ForView(LIVE_VIEW_ID, positions, nCells);
+      updateVisibilityTextureV2ForView(LIVE_VIEW_ID, visibility);
 
       useInstancedEdges = true;
       edgeLodLimit = 0;  // No LOD limit by default
@@ -3505,14 +3883,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     },
 
     /**
-     * Update visibility texture for V2 edges
+     * Update visibility texture for V2 edges (live view).
+     * Also updates the per-view texture for the live view.
      * @param {Float32Array|Uint8Array} visibility - Per-cell visibility (0-1)
      */
     updateEdgeVisibilityV2(visibility) {
-      if (!useInstancedEdges || !visibilityTextureV2) {
+      if (!useInstancedEdges) {
         return false;
       }
-      updateVisibilityTextureV2(visibility);
+      // Update per-view texture for live view
+      if (edgePositionTexturesV2.has(LIVE_VIEW_ID)) {
+        updateVisibilityTextureV2ForView(LIVE_VIEW_ID, visibility);
+      }
       return true;
     },
 
@@ -3556,8 +3938,105 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
      * Enable V2 instanced edges (if set up)
      */
     enableEdgesV2() {
-      if (nEdgesV2 > 0 && edgeTextureV2 && positionTextureV2) {
+      if (nEdgesV2 > 0 && edgeTextureV2 && edgePositionTexturesV2.has(LIVE_VIEW_ID)) {
         useInstancedEdges = true;
+      }
+    },
+
+    // ========================================================================
+    // PER-VIEW EDGE API (Multi-view / Multi-dimension support)
+    // ========================================================================
+
+    /**
+     * Set up edge position texture for a specific view.
+     * Call this when a view has different positions than the global (e.g., XY vs XZ embedding).
+     * The edge topology texture is shared across all views.
+     * @param {string} viewId - View identifier
+     * @param {Float32Array} positions - Cell positions (flat xyz array, nCells * 3)
+     * @param {number} nCells - Number of cells
+     */
+    setupEdgesV2ForView(viewId, positions, nCells) {
+      if (!useInstancedEdges || nEdgesV2 === 0) {
+        console.warn('[Viewer] Cannot setup per-view edges: V2 edges not initialized');
+        return false;
+      }
+      createPositionTextureV2ForView(viewId, positions, nCells);
+      // Initialize visibility to all visible
+      const visibility = new Float32Array(nCells);
+      visibility.fill(1.0);
+      updateVisibilityTextureV2ForView(viewId, visibility);
+      return true;
+    },
+
+    /**
+     * Update edge visibility texture for a specific view.
+     * @param {string} viewId - View identifier
+     * @param {Float32Array} visibility - Per-cell visibility (0-1)
+     */
+    updateEdgeVisibilityV2ForView(viewId, visibility) {
+      if (!useInstancedEdges) {
+        return false;
+      }
+      const vid = String(viewId);
+      // If view doesn't have its own position texture, fall back to live view
+      if (!edgePositionTexturesV2.has(vid)) {
+        if (vid !== LIVE_VIEW_ID && edgePositionTexturesV2.has(LIVE_VIEW_ID)) {
+          // Update live view's visibility texture for views sharing with live
+          updateVisibilityTextureV2ForView(LIVE_VIEW_ID, visibility);
+          return true;
+        }
+        return false;
+      }
+      updateVisibilityTextureV2ForView(viewId, visibility);
+      return true;
+    },
+
+    /**
+     * Check if a view has per-view edge textures set up.
+     * @param {string} viewId - View identifier
+     * @returns {boolean}
+     */
+    hasEdgeTexturesForView(viewId) {
+      return hasEdgeTexturesForView(viewId);
+    },
+
+    /**
+     * Delete edge textures for a specific view (cleanup on snapshot removal).
+     * @param {string} viewId - View identifier
+     */
+    deleteEdgeTexturesForView(viewId) {
+      deleteEdgeTexturesForView(viewId);
+    },
+
+    /**
+     * Get the number of cells for edge rendering (for visibility array sizing).
+     * @returns {number}
+     */
+    getEdgeCellCount() {
+      // Return from first per-view entry (live view is always set up first)
+      for (const entry of edgePositionTexturesV2.values()) {
+        return entry.nCells;
+      }
+      return 0;
+    },
+
+    /**
+     * Enable/disable edge debug mode for troubleshooting.
+     * @param {boolean} enabled - Whether to enable debug logging
+     */
+    setEdgeDebugMode(enabled) {
+      edgeDebugMode = !!enabled;
+      edgeDebugFrameCount = 0;  // Reset frame counter
+      if (enabled) {
+        console.log('[Viewer] Edge debug mode enabled. Debug output will be logged for next 5 frames.');
+        console.log('[Viewer] Edge texture state:', {
+          edgeTextureV2: !!edgeTextureV2,
+          nEdgesV2,
+          nCellsV2,
+          useInstancedEdges,
+          positionTextures: Array.from(edgePositionTexturesV2.keys()),
+          visibilityTextures: Array.from(edgeVisibilityTexturesV2.keys())
+        });
       }
     },
 
@@ -3754,6 +4233,25 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         createCentroidSnapshotBuffer(id, snapshot.centroidPositions, snapshot.centroidColors, dimLevel);
       }
 
+      // Create per-view edge textures for this snapshot (if edges are enabled)
+      // This allows snapshots with different embeddings to show edges correctly
+      if (useInstancedEdges && nEdgesV2 > 0 && sourcePositions) {
+        const nCells = sourcePositions.length / 3;
+        createPositionTextureV2ForView(id, sourcePositions, nCells);
+        // Initialize visibility from snapshot's transparency data (filtered cells should not show edges)
+        // Uses same 0.01 threshold as getCombinedVisibility in main.js for consistency
+        const visibility = new Float32Array(nCells);
+        if (snapshot.transparency && snapshot.transparency.length >= nCells) {
+          for (let i = 0; i < nCells; i++) {
+            visibility[i] = snapshot.transparency[i] > 0.01 ? 1.0 : 0.0;
+          }
+        } else {
+          // No transparency data - default to all visible
+          visibility.fill(1.0);
+        }
+        updateVisibilityTextureV2ForView(id, visibility);
+      }
+
       // Pre-compute cached view matrix for this snapshot (if cameras unlocked)
       if (!camerasLocked) {
         updateCachedViewMatrix(id, inheritedCamera);
@@ -3807,6 +4305,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         }
         // Delete centroid GPU buffer for this snapshot
         deleteCentroidSnapshotBuffer(id);
+        // Delete per-view edge textures for this snapshot
+        deleteEdgeTexturesForView(id);
         // Clean up orbit anchor state for this view
         orbitAnchorRenderer.deleteViewState(id);
         // Clean up cached view matrix
@@ -3844,6 +4344,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       for (const id of centroidSnapshotBuffers.keys()) {
         if (String(id) !== LIVE_VIEW_ID) {
           deleteCentroidSnapshotBuffer(id);
+        }
+      }
+      // Delete all per-view edge textures (preserve live view)
+      for (const id of edgePositionTexturesV2.keys()) {
+        if (String(id) !== LIVE_VIEW_ID) {
+          deleteEdgeTexturesForView(id);
         }
       }
       // Clean up cached view matrices and dimension state for snapshots (preserve live view)

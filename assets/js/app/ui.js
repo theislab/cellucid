@@ -3809,16 +3809,30 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     updateHighlightMode();
   });
 
+  const syncSidebarToggleState = () => {
+    const isHidden = sidebar.classList.contains('hidden');
+    sidebarToggle.classList.toggle('sidebar-open', !isHidden);
+    sidebarToggle.textContent = isHidden ? '☰' : '✕';
+    sidebarToggle.setAttribute('aria-expanded', isHidden ? 'false' : 'true');
+    sidebarToggle.setAttribute('aria-label', isHidden ? 'Show sidebar' : 'Hide sidebar');
+    sidebarToggle.title = isHidden ? 'Show sidebar' : 'Hide sidebar';
+  };
+
+  // Ensure initial layout-dependent CSS vars match reality (prevents toggle drift).
+  sidebarToggle.type = 'button';
+  sidebarToggle.setAttribute('aria-controls', sidebar.id || 'sidebar');
+  document.documentElement.style.setProperty('--sidebar-width', `${Math.round(sidebar.getBoundingClientRect().width)}px`);
+  syncSidebarToggleState();
+
   sidebarToggle.addEventListener('click', () => {
     sidebar.classList.toggle('hidden');
-    sidebarToggle.classList.toggle('sidebar-open');
-    sidebarToggle.textContent = sidebar.classList.contains('hidden') ? '☰' : '✕';
+    syncSidebarToggleState();
   });
 
   // Sidebar resize functionality
   const sidebarResizeHandle = document.getElementById('sidebar-resize-handle');
-  const MIN_SIDEBAR_WIDTH = 260;
-  const MAX_SIDEBAR_WIDTH = 520; // 2x the minimum width
+  const MIN_SIDEBAR_WIDTH = 280;
+  const MAX_SIDEBAR_WIDTH = 560; // 2x the minimum width
 
   if (sidebarResizeHandle) {
     let isResizing = false;

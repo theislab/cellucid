@@ -30,20 +30,49 @@ export function createProgram(gl, vsSource, fsSource) {
 
 /**
  * Creates a ResizeObserver-based canvas size tracker to avoid per-frame layout reads.
+ * Also monitors DPR changes (e.g., moving window between monitors with different scales).
  * Returns an object with a getSize() method that returns cached dimensions.
  */
 export function createCanvasResizeObserver(canvas) {
-  const dpr = window.devicePixelRatio || 1;
-  let cachedWidth = Math.floor(canvas.clientWidth * dpr);
-  let cachedHeight = Math.floor(canvas.clientHeight * dpr);
+  let currentDpr = window.devicePixelRatio || 1;
+  let cachedWidth = Math.floor(canvas.clientWidth * currentDpr);
+  let cachedHeight = Math.floor(canvas.clientHeight * currentDpr);
+
+  // Function to recalculate dimensions with current DPR
+  const updateDimensions = () => {
+    currentDpr = window.devicePixelRatio || 1;
+    cachedWidth = Math.floor(canvas.clientWidth * currentDpr);
+    cachedHeight = Math.floor(canvas.clientHeight * currentDpr);
+  };
 
   const observer = new ResizeObserver(entries => {
     const entry = entries[0];
-    const currentDpr = window.devicePixelRatio || 1;
+    currentDpr = window.devicePixelRatio || 1;
     cachedWidth = Math.floor(entry.contentRect.width * currentDpr);
     cachedHeight = Math.floor(entry.contentRect.height * currentDpr);
   });
   observer.observe(canvas);
+
+  // Monitor DPR changes (e.g., dragging window between monitors with different scales)
+  // matchMedia with resolution query fires when DPR changes
+  let dprMediaQuery = null;
+  let dprChangeHandler = null;
+
+  const setupDprMonitor = () => {
+    // Clean up previous listener if any
+    if (dprMediaQuery && dprChangeHandler) {
+      dprMediaQuery.removeEventListener('change', dprChangeHandler);
+    }
+    // Create new media query for current DPR
+    dprMediaQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+    dprChangeHandler = () => {
+      updateDimensions();
+      // Re-setup for the new DPR value
+      setupDprMonitor();
+    };
+    dprMediaQuery.addEventListener('change', dprChangeHandler);
+  };
+  setupDprMonitor();
 
   return {
     /**
@@ -59,6 +88,9 @@ export function createCanvasResizeObserver(canvas) {
     },
     disconnect() {
       observer.disconnect();
+      if (dprMediaQuery && dprChangeHandler) {
+        dprMediaQuery.removeEventListener('change', dprChangeHandler);
+      }
     }
   };
 }
