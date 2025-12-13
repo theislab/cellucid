@@ -4,6 +4,7 @@ import { createDataState } from './state.js';
 import { initUI } from './ui.js';
 import { createStateSerializer } from './state-serializer.js';
 import { initDockableAccordions } from './dockable-accordions.js';
+import { getNotificationCenter } from './notification-center.js';
 import {
   loadObsJson,
   loadObsManifest,
@@ -83,7 +84,6 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
   const moveSpeedDisplay = document.getElementById('move-speed-display');
   const invertLookCheckbox = document.getElementById('invert-look');
   const projectilesEnabledCheckbox = document.getElementById('projectiles-enabled');
-  const projectileInfoEl = document.getElementById('projectile-info');
   const pointerLockCheckbox = document.getElementById('pointer-lock');
   const orbitReverseCheckbox = document.getElementById('orbit-reverse');
   const showOrbitAnchorCheckbox = document.getElementById('show-orbit-anchor');
@@ -124,7 +124,6 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
   const cloudResolutionDisplay = document.getElementById('cloud-resolution-display');
   const noiseResolutionInput = document.getElementById('noise-resolution');
   const noiseResolutionDisplay = document.getElementById('noise-resolution-display');
-  const smokeRebuildHint = document.getElementById('smoke-rebuild-hint');
 
   // Split-view controls (small multiples)
   const splitViewControls = document.getElementById('split-view-controls');
@@ -152,7 +151,6 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
   // Session save/load controls
   const saveStateBtn = document.getElementById('save-state-btn');
   const loadStateBtn = document.getElementById('load-state-btn');
-  const sessionStatus = document.getElementById('session-status');
 
   // Dataset selector controls
   const datasetSelect = document.getElementById('dataset-select');
@@ -169,14 +167,11 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
   const userDataPath = document.getElementById('user-data-path');
   const userDataBrowseBtn = document.getElementById('user-data-browse-btn');
   const userDataFileInput = document.getElementById('user-data-file-input');
-  const userDataStatus = document.getElementById('user-data-status');
   const userDataInfoBtn = document.getElementById('user-data-info-btn');
   const userDataInfoTooltip = document.getElementById('user-data-info-tooltip');
   // Remote server connection elements
   const remoteServerUrl = document.getElementById('remote-server-url');
   const remoteConnectBtn = document.getElementById('remote-connect-btn');
-  const remoteServerStatus = document.getElementById('remote-server-status');
-  const remoteStatusText = document.getElementById('remote-status-text');
   const remoteDisconnectBtn = document.getElementById('remote-disconnect-btn');
   const remoteInfoBtn = document.getElementById('remote-info-btn');
   const remoteInfoTooltip = document.getElementById('remote-info-tooltip');
@@ -186,12 +181,14 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     console.log('[Main] Creating viewer...');
     const viewer = createViewer({ canvas, labelLayer, viewTitleLayer, sidebar });
     console.log('[Main] Viewer created successfully');
-    
+
     const state = createDataState({ viewer, labelLayer });
     console.log('[Main] State created successfully');
     const benchmarkReporter = new BenchmarkReporter({ viewer, state, canvas });
-    
-    statsEl.textContent = 'Loading positions…';
+
+    // Initialize notification center early
+    const notifications = getNotificationCenter();
+    notifications.init();
 
     // Initialize DataSourceManager
     const dataSourceManager = getDataSourceManager();
@@ -326,13 +323,11 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     try {
       obs = await loadObsManifest(getObsManifestUrl());
       state.setFieldLoader((field) => loadObsFieldData(getObsManifestUrl(), field));
-      statsEl.textContent = 'Loaded obs manifest (lazy-loading fields)…';
     } catch (err) {
       if (err?.status === 404) {
         console.warn('obs_manifest.json not found, falling back to obs_values.json');
         try {
           obs = await loadObsJson(getLegacyObsUrl());
-          statsEl.textContent = 'Loaded legacy obs JSON (full payload).';
         } catch (err2) {
           console.warn('obs_values.json also not found, using empty obs');
           obs = { fields: [], count: 0 };
@@ -379,7 +374,6 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       }
 
       EXPORT_BASE_URL = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
-      statsEl.textContent = 'Loading positions…';
 
       // Indicate loading in dataset info block
       if (datasetInfo) {
@@ -442,13 +436,11 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         try {
           nextObs = await loadObsManifest(getObsManifestUrl());
           state.setFieldLoader((field) => loadObsFieldData(getObsManifestUrl(), field));
-          statsEl.textContent = 'Loaded obs manifest (lazy-loading fields)…';
         } catch (err) {
           if (err?.status === 404) {
             console.warn('obs_manifest.json not found, falling back to obs_values.json');
             try {
               nextObs = await loadObsJson(getLegacyObsUrl());
-              statsEl.textContent = 'Loaded legacy obs JSON (full payload).';
             } catch (err2) {
               console.warn('obs_values.json also not found, using empty obs');
               nextObs = { fields: [], count: 0 };
@@ -512,7 +504,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       } catch (err) {
         console.error('[Main] Failed to reload dataset in-place:', err);
         statsEl.textContent = 'Failed to load dataset';
-        ui?.showSessionStatus?.(err?.message || 'Failed to load dataset', true);
+        notifications.error(`Failed to load dataset: ${err?.message || 'Unknown error'}`, { category: 'data' });
         if (datasetInfo) datasetInfo.classList.add('error');
       } finally {
         if (connectivityCheckbox) {
@@ -591,7 +583,6 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         moveSpeedDisplay,
         invertLookCheckbox,
         projectilesEnabledCheckbox,
-        projectileInfoEl,
         pointerLockCheckbox,
         orbitReverseCheckbox,
         showOrbitAnchorCheckbox,
@@ -630,7 +621,6 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         cloudResolutionDisplay,
         noiseResolutionInput,
         noiseResolutionDisplay,
-        smokeRebuildHint,
         splitViewControls,
         splitKeepViewBtn,
         splitClearBtn,
@@ -642,10 +632,8 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         // Dimension controls
         dimensionControls: document.getElementById('dimension-controls'),
         dimensionSelect: document.getElementById('dimension-select'),
-        dimensionLoading: document.getElementById('dimension-loading'),
         saveStateBtn,
         loadStateBtn,
-        sessionStatus,
         // Dataset selector
         datasetSelect,
         datasetInfo,
@@ -661,14 +649,11 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         userDataPath,
         userDataBrowseBtn,
         userDataFileInput,
-        userDataStatus,
         userDataInfoBtn,
         userDataInfoTooltip,
         // Remote server
         remoteServerUrl,
         remoteConnectBtn,
-        remoteServerStatus,
-        remoteStatusText,
         remoteDisconnectBtn,
         remoteInfoBtn,
         remoteInfoTooltip
@@ -1004,12 +989,6 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         return Math.min(totalEdges, Math.round(totalEdges * ratio * 1.05));
       }
 
-      // Update the connectivity info display
-      function updateConnectivityInfo(visibleEdges, shownEdges) {
-        if (!connectivityInfo) return;
-        connectivityInfo.textContent = `${formatEdgeCount(totalEdges)} total · ${formatEdgeCount(visibleEdges)} visible · ${formatEdgeCount(shownEdges)} shown`;
-      }
-
       // Track current state - user's preference, NOT auto-adjusted by visibility changes
       let currentEdgeLimit = Math.min(250000, totalEdges);  // User's desired edge count (stable)
 
@@ -1037,6 +1016,15 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       }
 
       /**
+       * Update the connectivity info display with edge statistics.
+       * Shows total, visible (after filters), and shown (after LOD limit) edge counts.
+       */
+      function updateConnectivityInfo(visibleEdges, shownEdges) {
+        if (!connectivityInfo) return;
+        connectivityInfo.textContent = `${formatEdgeCount(totalEdges)} total · ${formatEdgeCount(visibleEdges)} visible · ${formatEdgeCount(shownEdges)} shown`;
+      }
+
+      /**
        * Apply the current edge limit to the viewer.
        * Uses accurate LOD calculation based on actual visible edges.
        *
@@ -1054,8 +1042,6 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         const targetVisible = Math.min(currentEdgeLimit, actualVisibleEdges);
         const lodLimit = findLodLimitFast(targetVisible, cachedCombinedVisibility);
         viewer.setEdgeLodLimit(lodLimit);
-
-        // The actual shown count is min of desired and available
         updateConnectivityInfo(actualVisibleEdges, targetVisible);
       }
 
@@ -1072,11 +1058,8 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
           // Load edge data on first toggle
           if (show && !edgesLoaded) {
+            const connNotifId = notifications.loading('Loading connectivity data', { category: 'connectivity' });
             try {
-              if (connectivityInfo) {
-                connectivityInfo.textContent = 'Loading connectivity data...';
-              }
-
               console.log('[Main] Loading GPU-optimized edges...');
               const edgeData = await loadEdges(getConnectivityManifestUrl(), connectivityManifest);
 
@@ -1129,11 +1112,11 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
                 viewer.loadKnnEdges(edgeData.sources, edgeData.destinations);
               }
 
+              notifications.complete(connNotifId, `Loaded ${edgeData.nEdges.toLocaleString()} edges`);
+
             } catch (err) {
               console.error('Failed to load connectivity data:', err);
-              if (connectivityInfo) {
-                connectivityInfo.textContent = 'Failed to load connectivity';
-              }
+              notifications.fail(connNotifId, 'Failed to load connectivity');
               connectivityCheckbox.checked = false;
               return;
             }
@@ -1302,6 +1285,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
           }
 
           // Otherwise, load edges first
+          const knnNotifId = notifications.loading('Loading neighbor graph for KNN mode', { category: 'connectivity' });
           try {
             console.log('[Main] Loading edges for KNN mode...');
             const edgeData = await loadEdges(getConnectivityManifestUrl(), connectivityManifest);
@@ -1321,8 +1305,10 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
             viewer.loadKnnEdges(edgeData.sources, edgeData.destinations);
 
             console.log(`[Main] KNN edges loaded: ${edgeData.nEdges} edges`);
+            notifications.complete(knnNotifId, `Neighbor graph ready (${edgeData.nEdges.toLocaleString()} edges)`);
           } catch (err) {
             console.error('[Main] Failed to load edges for KNN:', err);
+            notifications.fail(knnNotifId, 'Failed to load neighbor graph');
           }
         });
       }
@@ -1338,7 +1324,6 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     const benchPresets = document.querySelectorAll('.benchmark-preset');
     const benchmarkReportBtn = document.getElementById('benchmark-report-btn');
     const benchmarkReportOutput = document.getElementById('benchmark-report-output');
-    const benchmarkReportStatus = document.getElementById('benchmark-report-status');
     const benchmarkSection = document.getElementById('benchmark-section');
     const benchPointsEl = document.getElementById('bench-points');
     const benchFpsEl = document.getElementById('bench-fps');
@@ -1443,7 +1428,8 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
         if (benchFpsEl) {
           benchFpsEl.textContent = displayFps ?? '-';
-          benchFpsEl.style.color = displayFps > 55 ? '#22c55e' : displayFps > 30 ? '#f59e0b' : '#ef4444';
+          // Use ink color for newspaper-consistent design
+          benchFpsEl.style.color = 'var(--viewer-ink)';
         }
         if (benchFrametimeEl) {
           const frameText = displayFrameTime != null ? `${displayFrameTime} ms` : '-';
@@ -1582,8 +1568,10 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     async function runBenchmark(pointCount, pattern) {
       console.log(`Running benchmark: ${formatNumber(pointCount)} points (${pattern})`);
 
+      // Show notification for benchmark data generation
+      const benchNotifId = notifications.startDataGeneration(pattern, pointCount);
+
       ensureBenchmarkStatsVisible();
-      if (benchPointsEl) benchPointsEl.textContent = 'Loading...';
       if (benchFpsEl) benchFpsEl.textContent = '-';
       if (benchFrametimeEl) benchFrametimeEl.textContent = '-';
       if (benchTimingDetailsEl) benchTimingDetailsEl.style.display = 'none';
@@ -1613,8 +1601,8 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
             data = SyntheticDataGenerator.flatUMAP(pointCount);
             break;
           case 'glb':
-            // Async loading from GLB file
-            if (benchPointsEl) benchPointsEl.textContent = 'Loading GLB...';
+            // Async loading from GLB file - update notification
+            notifications.updateBenchmark(benchNotifId, 10, 'Loading GLB model...');
             data = await SyntheticDataGenerator.fromGLBUrl(pointCount);
             break;
           case 'clusters':
@@ -1626,10 +1614,11 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         const message = pattern === 'glb'
           ? `GLB load failed: ${err.message || err}`
           : `Error: ${err.message || err}`;
-        if (benchPointsEl) benchPointsEl.textContent = message;
+        notifications.fail(benchNotifId, `Benchmark failed: ${message}`);
         return;
       }
       const genTime = Math.round(performance.now() - genStart);
+      notifications.completeDataGeneration(benchNotifId, genTime);
 
       // Show generation time
       if (benchGenInfoEl && benchGenTimeEl) {
@@ -1681,6 +1670,10 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
     async function generateSituationReport() {
       if (!benchmarkReporter) return;
+
+      // Show notification for report generation
+      const reportNotifId = notifications.startReport();
+
       const datasetSnapshot = buildDatasetSnapshot();
       const rendererStats = viewer.getRendererStats();
       if (rendererStats) latestRendererStats = rendererStats;
@@ -1699,23 +1692,20 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         benchmarkReportOutput.value = yamlOutput;
         benchmarkReportOutput.style.display = 'block';
       }
-      if (benchmarkReportStatus) {
-        benchmarkReportStatus.textContent = `Report ready (${datasetSnapshot.mode} data)`;
-      }
 
+      let copiedToClipboard = false;
       if (navigator?.clipboard?.writeText) {
         try {
           await navigator.clipboard.writeText(yamlOutput);
-          if (benchmarkReportStatus) {
-            benchmarkReportStatus.textContent = 'Report copied to clipboard';
-          }
+          copiedToClipboard = true;
         } catch (err) {
           console.warn('Clipboard copy failed', err);
-          if (benchmarkReportStatus) {
-            benchmarkReportStatus.textContent = 'Copy failed — select the text manually.';
-          }
+          notifications.error('Copy failed — select the text manually.', { category: 'benchmark' });
         }
       }
+
+      // Complete notification
+      notifications.completeReport(reportNotifId, copiedToClipboard);
     }
 
     // Wire up run button
@@ -1729,9 +1719,6 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
     if (benchmarkReportBtn) {
       benchmarkReportBtn.addEventListener('click', () => {
-        if (benchmarkReportStatus) {
-          benchmarkReportStatus.textContent = 'Generating report...';
-        }
         generateSituationReport();
       });
     }
@@ -1752,5 +1739,9 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
   } catch (err) {
     console.error(err);
     statsEl.textContent = 'Error: ' + err.message;
+    // Show error in notification center if initialized
+    try {
+      getNotificationCenter().error(`Initialization error: ${err.message}`, { duration: 10000 });
+    } catch (_) { /* notification center may not be initialized */ }
   }
 })();

@@ -1,5 +1,6 @@
 // UI wiring: binds DOM controls to state/viewer, renders legends and filter summaries.
 import { formatCellCount as formatDataNumber } from '../data/data-source.js';
+import { getNotificationCenter } from './notification-center.js';
 
 export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadActiveDataset }) {
   console.log('[UI] initUI called with dataSourceManager:', !!dataSourceManager);
@@ -46,7 +47,6 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     moveSpeedDisplay,
     invertLookCheckbox,
     projectilesEnabledCheckbox,
-    projectileInfoEl,
     pointerLockCheckbox,
     orbitReverseCheckbox,
     showOrbitAnchorCheckbox,
@@ -86,7 +86,6 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     cloudResolutionDisplay,
     noiseResolutionInput,
     noiseResolutionDisplay,
-    smokeRebuildHint,
     // Split view HUD
     splitViewControls,
     splitKeepViewBtn,
@@ -99,11 +98,9 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     // Dimension controls
     dimensionControls,
     dimensionSelect,
-    dimensionLoading,
     // Session save/load
     saveStateBtn,
     loadStateBtn,
-    sessionStatus,
     // Dataset selector
     datasetSelect,
     datasetInfo,
@@ -119,14 +116,11 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     userDataPath,
     userDataBrowseBtn,
     userDataFileInput,
-    userDataStatus,
     userDataInfoBtn,
     userDataInfoTooltip,
     // Remote server
     remoteServerUrl,
     remoteConnectBtn,
-    remoteServerStatus,
-    remoteStatusText,
     remoteDisconnectBtn,
     remoteInfoBtn,
     remoteInfoTooltip
@@ -164,16 +158,17 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
   rangeLabel.style.cssText = `
     position: fixed;
     pointer-events: none;
-    background: rgba(0, 0, 0, 0.8);
-    color: #fff;
+    background: var(--viewer-ink);
+    color: var(--viewer-paper);
     padding: 4px 8px;
-    border-radius: 4px;
+    border-radius: 0;
     font-size: 12px;
-    font-family: monospace;
+    font-family: "Fira Code", monospace;
     white-space: nowrap;
     z-index: 10000;
     display: none;
     transform: translate(12px, -50%);
+    box-shadow: var(--viewer-shadow);
   `;
   document.body.appendChild(rangeLabel);
 
@@ -320,9 +315,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
   function scheduleAutoRebuild() {
     if (smokeRebuildTimeout) clearTimeout(smokeRebuildTimeout);
     smokeDirty = true;
-    if (smokeRebuildHint) {
-      smokeRebuildHint.textContent = 'Rebuilding smoke density...';
-    }
+    // Note: Smoke rebuild notification is shown by smoke-density.js via notification center
     smokeRebuildTimeout = setTimeout(() => {
       if (rebuildSmokeDensity && renderModeSelect?.value === 'smoke') {
         rebuildSmokeDensity(smokeGridSize);
@@ -336,17 +329,12 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     // Auto-rebuild when in smoke mode
     if (renderModeSelect?.value === 'smoke') {
       scheduleAutoRebuild();
-    } else if (smokeRebuildHint) {
-      smokeRebuildHint.textContent = 'Smoke density will rebuild when switching to smoke mode.';
     }
   }
 
   function markSmokeClean() {
     smokeDirty = false;
     smokeBuiltOnce = true;
-    if (smokeRebuildHint) {
-      smokeRebuildHint.textContent = 'Smoke density is up to date.';
-    }
   }
 
   // Log-scale point size mapping
@@ -693,13 +681,13 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       viewer.setKnnEnabled(mode === 'knn');
 
       // Pre-load edges when KNN mode is activated
+      // Note: Loading notifications are handled by the NotificationCenter in main.js
       if (mode === 'knn' && !viewer.isKnnEdgesLoaded?.()) {
-        // Show loading message
+        // Update description to show loading state
         if (highlightModeDescriptionEl) {
-          highlightModeDescriptionEl.innerHTML = '<em>Loading neighbor graph...</em>';
+          highlightModeDescriptionEl.innerHTML = highlightModeCopy.knn + '<br><small style="color: var(--viewer-ink-soft);">Loading neighbor graph... (see notifications)</small>';
         }
-        // Trigger async edge loading - the callback in main.js will handle it
-        // After loading completes, update the description
+        // Wait for edges to load, then update description
         let attempts = 0;
         const maxAttempts = 100; // 10 seconds max wait
         const checkLoaded = setInterval(() => {
@@ -712,7 +700,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
           } else if (attempts >= maxAttempts) {
             clearInterval(checkLoaded);
             if (highlightModeDescriptionEl && activeHighlightMode === 'knn') {
-              highlightModeDescriptionEl.innerHTML = '<em style="color: #666;">KNN requires connectivity data. Enable "Show edges" first or check if data is available.</em>';
+              highlightModeDescriptionEl.innerHTML = highlightModeCopy.knn + '<br><small style="color: var(--viewer-ink-soft);">Neighbor graph not available. Enable "Show edges" to load connectivity data.</small>';
             }
           }
         }, 100);
@@ -2541,8 +2529,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     try {
       forceDisableFieldSelects = true;
       updateFieldSelectDisabledStates();
-      statsEl.textContent = `Loading ${field.key}…`;
-      
+
       if (state.ensureVarFieldLoaded) {
         await state.ensureVarFieldLoaded(originalIdx);
       }
@@ -2555,7 +2542,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       markSmokeDirty(); // gene filters affect visibility
     } catch (err) {
       console.error(err);
-      statsEl.textContent = 'Error: ' + err.message;
+      getNotificationCenter().error(`Failed to load gene: ${err.message}`, { category: 'data' });
     } finally {
       forceDisableFieldSelects = false;
       updateFieldSelectDisabledStates();
@@ -3130,9 +3117,6 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       rebuildSmokeDensity(smokeGridSize);
       smokeBuiltOnce = true;
       smokeDirty = false;
-      if (smokeRebuildHint) {
-        smokeRebuildHint.textContent = 'Smoke density is up to date for current filters.';
-      }
     }
     updateSplitViewUI();
   }
@@ -3767,7 +3751,6 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     try {
       forceDisableFieldSelects = true;
       updateFieldSelectDisabledStates();
-      if (!alreadyLoaded) statsEl.textContent = `Loading ${field.key}…`;
       if (state.ensureFieldLoaded) {
         await state.ensureFieldLoaded(idx);
       }
@@ -3782,7 +3765,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       renderSplitViewBadges();
     } catch (err) {
       console.error(err);
-      statsEl.textContent = 'Error: ' + err.message;
+      getNotificationCenter().error(`Failed to load field: ${err.message}`, { category: 'data' });
     } finally {
       forceDisableFieldSelects = false;
       updateFieldSelectDisabledStates();
@@ -3984,25 +3967,17 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       const enabled = projectilesEnabledCheckbox.checked;
 
       if (enabled && !viewer.isProjectileSpatialIndexReady?.()) {
-        // Show loading message while building collision spatial index
-        if (projectileInfoEl) {
-          projectileInfoEl.style.display = 'block';
-          projectileInfoEl.innerHTML = '<em>Building collision tree...</em>';
-        }
+        // Building collision spatial index - notification center handles the status
+        // The spatial index build notification is shown by high-perf-renderer.js
+        const notifications = getNotificationCenter();
+        const readyNotifId = notifications.loading('Preparing projectile collision system...', { category: 'spatial' });
+
         viewer.setProjectilesEnabled(true, () => {
-          // Spatial index ready - hide loading message
-          if (projectileInfoEl) {
-            projectileInfoEl.innerHTML = '<em style="color: #4a4;">Ready! Click to shoot, hold to charge.</em>';
-            setTimeout(() => {
-              projectileInfoEl.style.display = 'none';
-            }, 2000);
-          }
+          // Spatial index ready
+          notifications.complete(readyNotifId, 'Projectiles ready! Click to shoot, hold to charge.');
         });
       } else {
         viewer.setProjectilesEnabled(enabled);
-        if (projectileInfoEl) {
-          projectileInfoEl.style.display = 'none';
-        }
       }
       projectilesEnabledCheckbox.blur();
     });
@@ -4779,7 +4754,8 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     if (newLevel === currentDim) return;
 
     dimensionChangeBusy = true;
-    if (dimensionLoading) dimensionLoading.style.display = '';
+    const notifications = getNotificationCenter();
+    const dimNotifId = notifications.loading(`Switching to ${newLevel}D embedding...`, { category: 'dimension' });
 
     // Immediately update dropdown value for responsive feel
     updateDimensionSelectValue(newLevel);
@@ -4788,14 +4764,14 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       await state.setDimensionLevel(newLevel, { viewId });
       // Update the dimension badges in the view badges after successful change
       renderSplitViewBadges();
+      notifications.complete(dimNotifId, `Switched to ${newLevel}D embedding`);
     } catch (err) {
       console.error('[UI] Failed to change dimension:', err);
       // Revert dropdown value
       updateDimensionSelectValue(currentDim);
-      showSessionStatus?.(err.message || 'Failed to change dimension', true);
+      notifications.fail(dimNotifId, err.message || 'Failed to change dimension');
     } finally {
       dimensionChangeBusy = false;
-      if (dimensionLoading) dimensionLoading.style.display = 'none';
     }
   }
 
@@ -4839,13 +4815,13 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
   }
 
   function showSessionStatus(message, isError = false) {
-    if (!sessionStatus) return;
-    sessionStatus.textContent = message;
-    sessionStatus.style.color = isError ? '#f44336' : 'var(--success-color, #4caf50)';
-    sessionStatus.style.display = 'block';
-    setTimeout(() => {
-      sessionStatus.style.display = 'none';
-    }, 3000);
+    // Show in notification center (centralized notification system)
+    const notifications = getNotificationCenter();
+    if (isError) {
+      notifications.error(message, { category: 'session' });
+    } else {
+      notifications.success(message, { category: 'session' });
+    }
   }
 
   if (saveStateBtn && stateSerializer) {
@@ -5240,23 +5216,16 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
         return;
       }
 
-      try {
-        if (userDataStatus) {
-          userDataStatus.textContent = 'Loading files...';
-          userDataStatus.className = 'legend-help loading';
-        }
+      const notifications = getNotificationCenter();
+      const loadNotifId = notifications.loading('Loading user data files...', { category: 'data' });
 
+      try {
         const metadata = await userSource.loadFromFileList(files);
 
         // Update UI with loaded data
         if (userDataPath) {
           userDataPath.value = userSource.getPath() || 'Selected';
           userDataPath.classList.add('active');
-        }
-
-        if (userDataStatus) {
-          userDataStatus.textContent = `Loaded: ${formatDataNumber(metadata.stats?.n_cells)} cells`;
-          userDataStatus.className = 'legend-help success';
         }
 
         updateDatasetInfo(metadata);
@@ -5273,10 +5242,10 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
             await reloadDataset(metadata);
           }
           populateDatasetDropdown();
-          showSessionStatus(`User data ready: ${formatDataNumber(metadata.stats?.n_cells)} cells.`, false);
+          notifications.complete(loadNotifId, `User data ready: ${formatDataNumber(metadata.stats?.n_cells)} cells`);
         } catch (switchErr) {
           console.warn('[UI] Could not auto-switch to user source:', switchErr);
-          showSessionStatus('User data validated. Select "Load" to apply.', false);
+          notifications.complete(loadNotifId, 'User data validated. Select "Load" to apply.');
         }
 
       } catch (err) {
@@ -5287,10 +5256,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
           userDataPath.classList.remove('active');
         }
 
-        if (userDataStatus) {
-          userDataStatus.textContent = err.getUserMessage?.() || err.message || 'Failed to load';
-          userDataStatus.className = 'legend-help error';
-        }
+        notifications.fail(loadNotifId, err.getUserMessage?.() || err.message || 'Failed to load');
       }
 
       // Reset the input so the same folder can be selected again
@@ -5340,9 +5306,15 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     const remoteSource = dataSourceManager.getSource('remote');
 
     const updateRemoteStatus = (message, isError = false) => {
-      if (remoteStatusText) {
-        remoteStatusText.textContent = message;
-        remoteStatusText.style.color = isError ? 'var(--error-color, #ff5555)' : 'var(--success-color, #4caf50)';
+      // Show in notification center (centralized notification system)
+      const notifications = getNotificationCenter();
+      if (isError) {
+        notifications.error(message, { category: 'connectivity' });
+      } else if (message.includes('Connecting')) {
+        // Show loading notification for connection attempts
+        return notifications.loading(message, { category: 'connectivity' });
+      } else {
+        notifications.success(message, { category: 'connectivity' });
       }
     };
 
@@ -5370,20 +5342,20 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
         return;
       }
 
-      updateRemoteStatus('Connecting...');
+      const notifications = getNotificationCenter();
+      const connectNotifId = notifications.loading(`Connecting to ${url}...`, { category: 'connectivity' });
       remoteConnectBtn.disabled = true;
 
       try {
         await remoteSource.connect({ url });
 
         if (remoteSource.isConnected()) {
-          updateRemoteStatus('Connected');
           updateRemoteUI(true);
 
           // List and load datasets
           const datasets = await remoteSource.listDatasets();
           if (datasets.length > 0) {
-            updateRemoteStatus(`Connected - ${datasets.length} dataset(s) found`);
+            notifications.complete(connectNotifId, `Connected - ${datasets.length} dataset(s) found`);
 
             // Switch to the first remote dataset
             await dataSourceManager.switchToDataset('remote', datasets[0].id);
@@ -5398,13 +5370,13 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
               await reloadDataset(datasets[0]);
             }
           } else {
-            updateRemoteStatus('Connected - no datasets found', true);
+            notifications.fail(connectNotifId, 'Connected - no datasets found');
           }
         } else {
-          updateRemoteStatus('Connection failed', true);
+          notifications.fail(connectNotifId, 'Connection failed');
         }
       } catch (err) {
-        updateRemoteStatus(`Error: ${err.message}`, true);
+        notifications.fail(connectNotifId, `Error: ${err.message}`);
         console.error('[UI] Remote connection error:', err);
       } finally {
         remoteConnectBtn.disabled = false;

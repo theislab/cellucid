@@ -213,16 +213,15 @@
             <div class="user-data-row">
               <input type="text" id="user-data-path" class="user-data-path"
                      placeholder="No directory selected" readonly />
-              <button id="user-data-browse-btn" class="reset-btn">Browse...</button>
+              <button id="user-data-browse-btn" class="reset-btn">Browse</button>
               <!-- Hidden file input for cross-browser directory selection -->
               <input type="file" id="user-data-file-input" webkitdirectory directory multiple
                      style="display:none;" />
             </div>
-            <div id="user-data-status" class="legend-help" style="margin-top:4px;"></div>
           </div>
 
           <!-- Remote server connection -->
-          <div class="control-block" id="remote-server-block" style="margin-top: -12px; position: relative;">
+          <div class="control-block" id="remote-server-block" style="margin-top: 2px; position: relative;">
             <label style="display: flex; align-items: center; gap: 4px;">
               Remote server:
               <span id="remote-info-btn" class="info-btn">i</span>
@@ -239,9 +238,8 @@
                      placeholder="http://localhost:8765" />
               <button id="remote-connect-btn" class="reset-btn">Connect</button>
             </div>
-            <div id="remote-server-status" class="legend-help" style="margin-top:4px;">
-              <span id="remote-status-text"></span>
-              <button id="remote-disconnect-btn" class="reset-btn" style="display:none; margin-left:8px; padding:2px 6px; font-size:11px;">Disconnect</button>
+            <div style="margin-top:4px;">
+              <button id="remote-disconnect-btn" class="reset-btn" style="display:none; padding:2px 6px; font-size:11px;">Disconnect</button>
             </div>
           </div>
 
@@ -255,7 +253,6 @@
               <button id="save-state-btn" class="reset-btn" style="flex: 1;">Save State</button>
               <button id="load-state-btn" class="reset-btn" style="flex: 1;">Load State</button>
             </div>
-            <div id="session-status" class="legend-help" style="margin-top: 6px; color: var(--success-color, #4caf50); display: none;"></div>
           </div>
         </div>
       </details>
@@ -454,9 +451,6 @@
               </div>
             </div>
 
-            <div id="smoke-rebuild-hint" class="legend-help" style="margin-top:8px;">
-              Smoke density rebuilds automatically when needed.
-            </div>
           </div>
 
           <!-- Point rendering controls (points mode only) -->
@@ -503,9 +497,9 @@
                     <span id="connectivity-limit-display" class="slider-value">250k</span>
                   </div>
                 </div>
-              </div>
 
-              <div id="connectivity-info" class="legend-help" style="margin-top:4px;"></div>
+                <div id="connectivity-info" class="legend-help" style="margin-top:8px; font-variant-numeric: tabular-nums;"></div>
+              </div>
             </div>
           </div>
 
@@ -577,7 +571,6 @@
               <select id="dimension-select" class="obs-select">
                 <!-- Options are dynamically generated based on available dimensions -->
               </select>
-              <span id="dimension-loading" class="dimension-loading" style="display:none;">Loading...</span>
             </div>
           </div>
 
@@ -641,7 +634,6 @@
                   <input type="checkbox" id="projectiles-enabled" />
                   Projectile shooting
                 </label>
-                <div id="projectile-info" class="legend-help" style="margin-top:4px; display:none;"></div>
               </div>
               <div class="control-block" style="margin-top:6px;">
                 <label class="checkbox-inline">
@@ -857,9 +849,6 @@
             <button id="benchmark-report-btn" class="btn-small" style="width:100%;padding:8px 10px;">
               Copy Situation Report
             </button>
-            <div id="benchmark-report-status" class="legend-help" style="margin-top:6px;">
-              Collects OS/Browser, renderer, and data details for support tickets.
-            </div>
             <textarea id="benchmark-report-output" readonly style="display:none;"></textarea>
           </div>
 

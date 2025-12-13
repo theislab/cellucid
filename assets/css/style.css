@@ -91,6 +91,7 @@ body.dock-resizing * {
   --highlight-accent-strong: #0ea5e9;
   --highlight-ink: #0b1326;
   --highlight-soft: #e0f7ff;
+
 }
 
 /* Sidebar container: fixed paper column */
@@ -2732,4 +2733,279 @@ body.dock-dragging .accordion-section:not(.accordion-floating) {
   font-size: 11px;
   color: var(--viewer-ink-muted);
   margin-left: 8px;
+}
+
+/* ========================================================================
+   Notification Center - Centralized status & progress system
+   ===================================================================== */
+
+.notification-center {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  z-index: 10000;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 8px;
+  pointer-events: none;
+  max-width: 360px;
+  max-height: calc(100vh - 32px);
+  overflow: hidden;
+  /* GPU acceleration for smooth animations */
+  transform: translateZ(0);
+  will-change: contents;
+}
+
+/* Individual notification - newspaper-inspired card */
+.notification {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  /* Paper-like background with subtle transparency */
+  background: rgba(255, 255, 255, 0.95);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: var(--viewer-border-strong);
+  border-radius: 0;
+  box-shadow: var(--viewer-shadow);
+  font-family: "Inter", system-ui, sans-serif;
+  font-size: 12px;
+  color: var(--viewer-ink);
+  pointer-events: auto;
+  min-width: 240px;
+  max-width: 360px;
+  /* GPU-accelerated animation properties */
+  transform: translateX(100%) translateZ(0);
+  opacity: 0;
+  transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+              opacity 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  will-change: transform, opacity;
+}
+
+.notification-enter {
+  transform: translateX(0) translateZ(0);
+  opacity: 1;
+}
+
+.notification-exit {
+  transform: translateX(100%) translateZ(0);
+  opacity: 0;
+}
+
+/* Notification icon */
+.notification-icon {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  color: var(--viewer-ink-soft);
+}
+
+/* Type-specific icon colors - all use ink colors for newspaper consistency */
+.notification-success .notification-icon,
+.notification-error .notification-icon,
+.notification-warning .notification-icon,
+.notification-loading .notification-icon,
+.notification-progress .notification-icon {
+  color: var(--viewer-ink);
+}
+
+/* Notification content */
+.notification-content {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.notification-title {
+  font-family: "Oswald", sans-serif;
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--viewer-ink-soft);
+}
+
+.notification-message {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--viewer-ink);
+  word-break: break-word;
+}
+
+/* Type-specific styles - newspaper-inspired visual distinction */
+/* Uses ink weight variations instead of colors */
+.notification-success {
+  border-left: 3px solid var(--viewer-ink); /* Bold ink - complete */
+}
+
+.notification-error {
+  border-left: 3px double var(--viewer-ink); /* Double line - attention needed */
+}
+
+.notification-warning {
+  border-left: 3px dashed var(--viewer-ink-soft); /* Dashed - caution */
+}
+
+.notification-loading,
+.notification-progress {
+  border-left: 3px solid var(--viewer-ink-muted); /* Muted - in progress */
+}
+
+/* Progress bar container */
+.notification-progress-container {
+  width: 100%;
+  height: 4px;
+  background: var(--viewer-accent-light);
+  border-radius: 2px;
+  overflow: hidden;
+  margin-top: 4px;
+}
+
+/* Progress bar fill */
+.notification-progress-bar {
+  height: 100%;
+  background: var(--viewer-ink);
+  border-radius: 2px;
+  transition: width 0.15s ease-out;
+  /* GPU acceleration */
+  transform: translateZ(0);
+  will-change: width;
+}
+
+/* Indeterminate animation */
+.notification-progress-bar.indeterminate {
+  width: 30% !important;
+  animation: progress-indeterminate 1.2s ease-in-out infinite;
+}
+
+@keyframes progress-indeterminate {
+  0% {
+    transform: translateX(-100%) translateZ(0);
+  }
+  50% {
+    transform: translateX(233%) translateZ(0);
+  }
+  100% {
+    transform: translateX(-100%) translateZ(0);
+  }
+}
+
+/* Progress text and speed */
+.notification-progress-text,
+.notification-speed {
+  font-family: "Fira Code", monospace;
+  font-size: 10px;
+  color: var(--viewer-ink-soft);
+  margin-top: 2px;
+}
+
+.notification-speed {
+  color: var(--viewer-ink-soft);
+}
+
+/* Dismiss button */
+.notification-dismiss {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  font-size: 16px;
+  color: var(--viewer-ink-muted);
+  cursor: pointer;
+  border-radius: 2px;
+  transition: color 0.15s ease, background-color 0.15s ease;
+  margin: -4px -4px -4px 0;
+  padding: 0;
+}
+
+.notification-dismiss:hover {
+  color: var(--viewer-ink);
+  background: rgba(0, 0, 0, 0.05);
+}
+
+.notification-dismiss:active {
+  background: rgba(0, 0, 0, 0.1);
+}
+
+/* Loading spinner animation for icon */
+.notification-loading .notification-icon {
+  animation: notification-spin 1s linear infinite;
+}
+
+@keyframes notification-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Responsive adjustments */
+@media (max-width: 480px) {
+  .notification-center {
+    left: 8px;
+    right: 8px;
+    bottom: 8px;
+    max-width: none;
+  }
+
+  .notification {
+    min-width: 0;
+    max-width: none;
+  }
+}
+
+/* Dark background mode adjustments */
+body.dark-mode .notification,
+.notification-center.dark-mode .notification {
+  background: rgba(31, 41, 55, 0.95);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  color: #f9fafb;
+  border-color: #374151;
+  box-shadow: 4px 4px 0 rgba(0, 0, 0, 0.3);
+}
+
+body.dark-mode .notification-title,
+body.dark-mode .notification-progress-text,
+body.dark-mode .notification-speed {
+  color: #9ca3af;
+}
+
+body.dark-mode .notification-progress-container {
+  background: #374151;
+}
+
+body.dark-mode .notification-dismiss:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+/* Dark mode type-specific border accents - lighter ink for visibility */
+body.dark-mode .notification-success {
+  border-left-color: #f9fafb; /* Light ink - complete */
+}
+
+body.dark-mode .notification-error {
+  border-left-color: #e5e7eb; /* Light ink - double style maintained */
+}
+
+body.dark-mode .notification-warning {
+  border-left-color: #9ca3af; /* Medium ink - dashed style maintained */
+}
+
+body.dark-mode .notification-loading,
+body.dark-mode .notification-progress {
+  border-left-color: #6b7280; /* Muted - in progress */
 }

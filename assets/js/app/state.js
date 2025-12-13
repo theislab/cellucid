@@ -12,6 +12,7 @@ import {
   getCssStopsForColormap,
   sampleContinuousColormap
 } from '../data/palettes.js';
+import { getNotificationCenter } from './notification-center.js';
 
 const NEUTRAL_GRAY_UINT8 = 211; // lightgray default when no field is selected (0-255)
 
@@ -1152,6 +1153,10 @@ class DataState {
       return field;
     }
 
+    // Show loading notification
+    const notifications = getNotificationCenter();
+    const notifId = notifications.loading(`Loading field: ${field.key}`, { category: 'data' });
+
     field._loadingPromise = this.fieldLoader(field)
       .then((loadedData) => {
         if (loadedData?.values) field.values = loadedData.values;
@@ -1173,10 +1178,12 @@ class DataState {
           codes: field.codes,
           outlierQuantiles: field.outlierQuantiles
         });
+        notifications.complete(notifId, `Loaded field: ${field.key}`);
         return field;
       })
       .catch((err) => {
         field._loadingPromise = null;
+        notifications.fail(notifId, `Failed to load field: ${field.key}`);
         throw err;
       });
 
@@ -1203,6 +1210,10 @@ class DataState {
       return field;
     }
 
+    // Show loading notification for gene expression
+    const notifications = getNotificationCenter();
+    const notifId = notifications.loading(`Loading gene: ${field.key}`, { category: 'data' });
+
     field._loadingPromise = this.varFieldLoader(field)
       .then((loadedData) => {
         if (loadedData?.values) field.values = loadedData.values;
@@ -1212,10 +1223,12 @@ class DataState {
         field.loaded = true;
         field._loadingPromise = null;
         this._varFieldDataCache.set(cacheKey, { values: field.values });
+        notifications.complete(notifId, `Loaded gene: ${field.key}`);
         return field;
       })
       .catch((err) => {
         field._loadingPromise = null;
+        notifications.fail(notifId, `Failed to load gene: ${field.key}`);
         throw err;
       });
 

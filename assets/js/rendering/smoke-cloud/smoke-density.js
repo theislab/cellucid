@@ -3,6 +3,7 @@
 // ============================================================================
 
 import { SPLAT_VS, SPLAT_FS, NORMALIZE_VS, NORMALIZE_FS } from '../shaders/density-shaders.js';
+import { getNotificationCenter } from '../../app/notification-center.js';
 
 // Cache for GPU splatting resources
 let gpuSplatCache = null;
@@ -104,13 +105,24 @@ export function buildDensityVolumeGPU(gl, positions, options = {}) {
   const pointCount = positions.length / 3;
   const halfExtent = 1.0;
 
+  // Show notification for smoke density computation
+  const notifications = getNotificationCenter();
+  const notifId = notifications.startCalculation(
+    `Building ${gridSize}³ smoke density volume`,
+    'render'
+  );
+  const startTime = performance.now();
+
   console.time('GPU density splat');
 
   const res = getOrCreateGPUSplatResources(gl);
   if (!res) {
     console.warn('GPU splat failed, falling back to CPU');
     console.timeEnd('GPU density splat');
-    return buildDensityVolume(positions, options);
+    const result = buildDensityVolume(positions, options);
+    const elapsed = performance.now() - startTime;
+    notifications.completeCalculation(notifId, 'Smoke density ready (CPU fallback)', elapsed);
+    return result;
   }
 
   // Calculate atlas dimensions (Z slices in a grid)
@@ -147,7 +159,10 @@ export function buildDensityVolumeGPU(gl, positions, options = {}) {
     gl.deleteTexture(atlasTexture);
     gl.deleteFramebuffer(fbo);
     console.timeEnd('GPU density splat');
-    return buildDensityVolume(positions, options);
+    const result = buildDensityVolume(positions, options);
+    const elapsed = performance.now() - startTime;
+    notifications.completeCalculation(notifId, 'Smoke density ready (CPU fallback)', elapsed);
+    return result;
   }
 
   // Clear to zero
@@ -269,6 +284,10 @@ export function buildDensityVolumeGPU(gl, positions, options = {}) {
 
   console.timeEnd('GPU density splat');
   console.log(`[GPU Splat] ${pointCount} points -> ${gridSize}³ volume, max=${maxVal.toFixed(2)}`);
+
+  // Complete notification
+  const elapsed = performance.now() - startTime;
+  notifications.completeCalculation(notifId, `Smoke density ready (${gridSize}³)`, elapsed);
 
   return {
     data: volume,

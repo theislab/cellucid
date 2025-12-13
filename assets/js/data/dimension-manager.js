@@ -120,9 +120,13 @@ class DimensionManager {
   /**
    * Load raw position data for a dimension (lazy load)
    * @param {number} dim - Dimension to load
+   * @param {Object} options - Loading options
+   * @param {boolean} options.showProgress - Show progress notification (default: true)
    * @returns {Promise<Float32Array>} Raw position data
    */
-  async loadDimension(dim) {
+  async loadDimension(dim, options = {}) {
+    const { showProgress = true } = options;
+
     // Check if dimension is available
     if (!this.hasDimension(dim)) {
       throw new Error(`Dimension ${dim}D is not available. Available: ${this.availableDimensions.join(', ')}D`);
@@ -144,7 +148,10 @@ class DimensionManager {
 
     console.log(`[DimensionManager] Loading ${dim}D positions from ${url}`);
 
-    const promise = loadPointsBinary(url)
+    const promise = loadPointsBinary(url, {
+      showProgress,
+      displayName: `${dim}D cell positions`
+    })
       .then(positions => {
         // Validate and cache
         const nCells = positions.length / dim;

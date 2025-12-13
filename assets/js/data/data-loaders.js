@@ -1,9 +1,11 @@
 // Fetch helpers for loading binary positions and obs payloads (manifest + per-field data).
 // Supports quantized data with transparent dequantization and gzip-compressed files.
 // Supports custom protocols (local-user://, remote://, jupyter://) via DataSourceManager.
+// Includes progress tracking with download speed for the notification center.
 
 import { getDataSourceManager } from './data-source-manager.js';
 import { isLocalUserUrl, resolveUrl } from './data-source.js';
+import { getNotificationCenter } from '../app/notification-center.js';
 // Note: remote:// and jupyter:// protocols are handled by DataSourceManager.resolveUrl()
 // via the registered protocol handlers - no explicit imports needed here.
 
@@ -168,77 +170,353 @@ async function fetchBinary(url) {
 }
 
 /**
- * Load points binary, trying .gz version first if the URL doesn't already end in .gz
- * This handles both compressed and uncompressed data transparently.
- * Supports all custom protocols (local-user://, remote://, jupyter://) via DataSourceManager.
+ * Fetch binary data with progress tracking for the notification center.
+ * Tracks download progress and speed, reporting to the UI.
+ *
+ * @param {string} url - URL to fetch
+ * @param {string} displayName - Human-readable name for the notification
+ * @param {boolean} showNotification - Whether to show notification (default: true)
+ * @returns {Promise<ArrayBuffer>} Decompressed binary data
  */
-export async function loadPointsBinary(url) {
-  // If URL already ends with .gz, just fetch it directly
-  if (url.endsWith('.gz')) {
-    const arrayBuffer = await fetchBinary(url);
-    return new Float32Array(arrayBuffer);
+async function fetchBinaryWithProgress(url, displayName = null, showNotification = true) {
+  const notifications = getNotificationCenter();
+  const name = displayName || url.split('/').pop().replace('.gz', '').replace('.bin', '');
+  let trackerId = null;
+
+  if (showNotification) {
+    trackerId = notifications.startDownload(name);
   }
 
-  const supportsGzip = HAS_DECOMPRESSION_STREAM || HAS_PAKO;
-
-  // For local-user:// URLs, check if .gz version exists in the file list
-  if (isLocalUserUrl(url)) {
-    if (!supportsGzip) {
-      console.log('Loading uncompressed points file:', url);
-      const arrayBuffer = await fetchLocalUserBinary(url);
-      return new Float32Array(arrayBuffer);
-    }
-
-    const gzUrl = url + '.gz';
-    try {
-      // Try to get the .gz file URL - this will throw if file doesn't exist
-      const arrayBuffer = await fetchLocalUserBinary(gzUrl);
-      console.log('Found compressed points file:', gzUrl);
-      return new Float32Array(arrayBuffer);
-    } catch (_e) {
-      // .gz version doesn't exist, try uncompressed
-      console.log('Loading uncompressed points file:', url);
-      const arrayBuffer = await fetchLocalUserBinary(url);
-      return new Float32Array(arrayBuffer);
-    }
-  }
-
-  // For all other URLs (including custom protocols like remote://, jupyter://),
-  // resolve the protocol first, then try .gz version
-  const gzUrl = url + '.gz';
   try {
-    if (!supportsGzip) {
-      throw new Error('Gzip decompression not supported');
+    const resolvedUrl = await resolveAnyUrl(url);
+    const response = await fetch(resolvedUrl);
+
+    if (!response.ok) {
+      const err = new Error('Failed to load ' + url + ': ' + response.statusText);
+      err.status = response.status;
+      throw err;
     }
-    // Resolve custom protocol (if any) before fetching
-    const resolvedGzUrl = await resolveAnyUrl(gzUrl);
-    const response = await fetch(resolvedGzUrl);
-    if (response.ok) {
-      console.log('Found compressed points file:', gzUrl);
-      // Gzip version exists, decompress it
-      if (HAS_DECOMPRESSION_STREAM) {
+
+    // Get content length for progress tracking
+    const contentLength = response.headers.get('content-length');
+    const totalBytes = contentLength ? parseInt(contentLength, 10) : null;
+
+    // Check if this is a gzipped file by URL extension
+    const isGzipped = url.endsWith('.gz');
+
+    // For streaming progress, we need to read the body manually
+    if (response.body && showNotification) {
+      const reader = response.body.getReader();
+      const chunks = [];
+      let loadedBytes = 0;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        chunks.push(value);
+        loadedBytes += value.length;
+
+        if (trackerId) {
+          notifications.updateDownload(trackerId, loadedBytes, totalBytes);
+        }
+      }
+
+      // Combine chunks into single ArrayBuffer
+      const allChunks = new Uint8Array(loadedBytes);
+      let position = 0;
+      for (const chunk of chunks) {
+        allChunks.set(chunk, position);
+        position += chunk.length;
+      }
+
+      // Handle decompression
+      let result;
+      if (isGzipped) {
+        if (typeof DecompressionStream !== 'undefined') {
+          const ds = new DecompressionStream('gzip');
+          const stream = new ReadableStream({
+            start(controller) {
+              controller.enqueue(allChunks);
+              controller.close();
+            }
+          });
+          const decompressedStream = stream.pipeThrough(ds);
+          const decompressedResponse = new Response(decompressedStream);
+          result = await decompressedResponse.arrayBuffer();
+        } else if (typeof pako !== 'undefined') {
+          const decompressed = pako.inflate(allChunks);
+          result = decompressed.buffer.slice(decompressed.byteOffset, decompressed.byteOffset + decompressed.byteLength);
+        } else {
+          throw new Error('Gzip decompression not supported');
+        }
+      } else {
+        result = allChunks.buffer;
+      }
+
+      if (trackerId) {
+        notifications.completeDownload(trackerId);
+      }
+      return result;
+    }
+
+    // Fallback for when streaming is not available or notifications disabled
+    if (isGzipped && typeof DecompressionStream !== 'undefined') {
+      try {
         const ds = new DecompressionStream('gzip');
         const decompressedStream = response.body.pipeThrough(ds);
         const decompressedResponse = new Response(decompressedStream);
-        const arrayBuffer = await decompressedResponse.arrayBuffer();
-        return new Float32Array(arrayBuffer);
-      } else if (HAS_PAKO) {
-        const compressedBuffer = await response.arrayBuffer();
+        const result = await decompressedResponse.arrayBuffer();
+        if (trackerId) notifications.completeDownload(trackerId);
+        return result;
+      } catch (e) {
+        if (trackerId) notifications.failDownload(trackerId, e.message);
+        throw e;
+      }
+    } else if (isGzipped) {
+      const compressedBuffer = await response.arrayBuffer();
+      if (typeof pako !== 'undefined') {
         const decompressed = pako.inflate(new Uint8Array(compressedBuffer));
-        // Safety: use byteOffset and byteLength in case pako returns a view into a larger buffer
-        return new Float32Array(decompressed.buffer, decompressed.byteOffset, decompressed.byteLength / 4);
+        if (trackerId) notifications.completeDownload(trackerId);
+        return decompressed.buffer.slice(decompressed.byteOffset, decompressed.byteOffset + decompressed.byteLength);
       } else {
-        console.warn('DecompressionStream not available and pako not loaded, trying uncompressed file');
+        const err = new Error('Gzip decompression not supported');
+        if (trackerId) notifications.failDownload(trackerId, err.message);
+        throw err;
       }
     }
-  } catch (e) {
-    console.log('Compressed file not available or failed:', e.message || e);
+
+    const result = await response.arrayBuffer();
+    if (trackerId) notifications.completeDownload(trackerId);
+    return result;
+
+  } catch (error) {
+    if (trackerId) {
+      notifications.failDownload(trackerId, error.message);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Load points binary, trying .gz version first if the URL doesn't already end in .gz
+ * This handles both compressed and uncompressed data transparently.
+ * Supports all custom protocols (local-user://, remote://, jupyter://) via DataSourceManager.
+ *
+ * @param {string} url - URL to fetch
+ * @param {Object} options - Optional settings
+ * @param {boolean} options.showProgress - Show progress notification (default: false)
+ * @param {string} options.displayName - Display name for notification
+ */
+export async function loadPointsBinary(url, options = {}) {
+  const { showProgress = false, displayName = null } = options;
+  const notifications = getNotificationCenter();
+  const name = displayName || 'Cell positions';
+  let trackerId = null;
+
+  if (showProgress) {
+    trackerId = notifications.startDownload(name);
   }
 
-  // Fall back to original URL (non-gzipped)
-  console.log('Loading uncompressed points file:', url);
-  const arrayBuffer = await fetchBinary(url);
-  return new Float32Array(arrayBuffer);
+  try {
+    // If URL already ends with .gz, just fetch it directly
+    if (url.endsWith('.gz')) {
+      const arrayBuffer = await fetchBinaryWithProgressInternal(url, trackerId, notifications);
+      if (trackerId) notifications.completeDownload(trackerId);
+      return new Float32Array(arrayBuffer);
+    }
+
+    const supportsGzip = HAS_DECOMPRESSION_STREAM || HAS_PAKO;
+
+    // For local-user:// URLs, check if .gz version exists in the file list
+    if (isLocalUserUrl(url)) {
+      if (!supportsGzip) {
+        console.log('Loading uncompressed points file:', url);
+        const arrayBuffer = await fetchBinaryWithProgressInternal(url, trackerId, notifications);
+        if (trackerId) notifications.completeDownload(trackerId);
+        return new Float32Array(arrayBuffer);
+      }
+
+      const gzUrl = url + '.gz';
+      try {
+        const arrayBuffer = await fetchBinaryWithProgressInternal(gzUrl, trackerId, notifications);
+        console.log('Found compressed points file:', gzUrl);
+        if (trackerId) notifications.completeDownload(trackerId);
+        return new Float32Array(arrayBuffer);
+      } catch (_e) {
+        console.log('Loading uncompressed points file:', url);
+        const arrayBuffer = await fetchBinaryWithProgressInternal(url, trackerId, notifications);
+        if (trackerId) notifications.completeDownload(trackerId);
+        return new Float32Array(arrayBuffer);
+      }
+    }
+
+    // For all other URLs (including custom protocols like remote://, jupyter://),
+    // resolve the protocol first, then try .gz version
+    const gzUrl = url + '.gz';
+    try {
+      if (!supportsGzip) {
+        throw new Error('Gzip decompression not supported');
+      }
+      const resolvedGzUrl = await resolveAnyUrl(gzUrl);
+      const response = await fetch(resolvedGzUrl);
+      if (response.ok) {
+        console.log('Found compressed points file:', gzUrl);
+
+        // Track progress if enabled
+        const contentLength = response.headers.get('content-length');
+        const totalBytes = contentLength ? parseInt(contentLength, 10) : null;
+
+        if (trackerId && response.body) {
+          const reader = response.body.getReader();
+          const chunks = [];
+          let loadedBytes = 0;
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(value);
+            loadedBytes += value.length;
+            notifications.updateDownload(trackerId, loadedBytes, totalBytes);
+          }
+
+          const allChunks = new Uint8Array(loadedBytes);
+          let position = 0;
+          for (const chunk of chunks) {
+            allChunks.set(chunk, position);
+            position += chunk.length;
+          }
+
+          // Decompress
+          if (HAS_DECOMPRESSION_STREAM) {
+            const ds = new DecompressionStream('gzip');
+            const stream = new ReadableStream({
+              start(controller) {
+                controller.enqueue(allChunks);
+                controller.close();
+              }
+            });
+            const decompressedStream = stream.pipeThrough(ds);
+            const decompressedResponse = new Response(decompressedStream);
+            const arrayBuffer = await decompressedResponse.arrayBuffer();
+            notifications.completeDownload(trackerId);
+            return new Float32Array(arrayBuffer);
+          } else if (HAS_PAKO) {
+            const decompressed = pako.inflate(allChunks);
+            notifications.completeDownload(trackerId);
+            return new Float32Array(decompressed.buffer, decompressed.byteOffset, decompressed.byteLength / 4);
+          }
+        }
+
+        // Fallback without progress tracking
+        if (HAS_DECOMPRESSION_STREAM) {
+          const ds = new DecompressionStream('gzip');
+          const decompressedStream = response.body.pipeThrough(ds);
+          const decompressedResponse = new Response(decompressedStream);
+          const arrayBuffer = await decompressedResponse.arrayBuffer();
+          if (trackerId) notifications.completeDownload(trackerId);
+          return new Float32Array(arrayBuffer);
+        } else if (HAS_PAKO) {
+          const compressedBuffer = await response.arrayBuffer();
+          const decompressed = pako.inflate(new Uint8Array(compressedBuffer));
+          if (trackerId) notifications.completeDownload(trackerId);
+          return new Float32Array(decompressed.buffer, decompressed.byteOffset, decompressed.byteLength / 4);
+        } else {
+          console.warn('DecompressionStream not available and pako not loaded, trying uncompressed file');
+        }
+      }
+    } catch (e) {
+      console.log('Compressed file not available or failed:', e.message || e);
+    }
+
+    // Fall back to original URL (non-gzipped)
+    console.log('Loading uncompressed points file:', url);
+    const arrayBuffer = await fetchBinaryWithProgressInternal(url, trackerId, notifications);
+    if (trackerId) notifications.completeDownload(trackerId);
+    return new Float32Array(arrayBuffer);
+
+  } catch (error) {
+    if (trackerId) {
+      notifications.failDownload(trackerId, error.message);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Internal helper for progress-tracked binary fetch
+ */
+async function fetchBinaryWithProgressInternal(url, trackerId, notifications) {
+  const resolvedUrl = await resolveAnyUrl(url);
+  const response = await fetch(resolvedUrl);
+
+  if (!response.ok) {
+    const err = new Error('Failed to load ' + url + ': ' + response.statusText);
+    err.status = response.status;
+    throw err;
+  }
+
+  const contentLength = response.headers.get('content-length');
+  const totalBytes = contentLength ? parseInt(contentLength, 10) : null;
+  const isGzipped = url.endsWith('.gz');
+
+  if (trackerId && response.body) {
+    const reader = response.body.getReader();
+    const chunks = [];
+    let loadedBytes = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      loadedBytes += value.length;
+      notifications.updateDownload(trackerId, loadedBytes, totalBytes);
+    }
+
+    const allChunks = new Uint8Array(loadedBytes);
+    let position = 0;
+    for (const chunk of chunks) {
+      allChunks.set(chunk, position);
+      position += chunk.length;
+    }
+
+    if (isGzipped) {
+      if (typeof DecompressionStream !== 'undefined') {
+        const ds = new DecompressionStream('gzip');
+        const stream = new ReadableStream({
+          start(controller) {
+            controller.enqueue(allChunks);
+            controller.close();
+          }
+        });
+        const decompressedStream = stream.pipeThrough(ds);
+        const decompressedResponse = new Response(decompressedStream);
+        return decompressedResponse.arrayBuffer();
+      } else if (typeof pako !== 'undefined') {
+        const decompressed = pako.inflate(allChunks);
+        return decompressed.buffer.slice(decompressed.byteOffset, decompressed.byteOffset + decompressed.byteLength);
+      }
+      throw new Error('Gzip decompression not supported');
+    }
+
+    return allChunks.buffer;
+  }
+
+  // Fallback without progress tracking
+  if (isGzipped && typeof DecompressionStream !== 'undefined') {
+    const ds = new DecompressionStream('gzip');
+    const decompressedStream = response.body.pipeThrough(ds);
+    const decompressedResponse = new Response(decompressedStream);
+    return decompressedResponse.arrayBuffer();
+  } else if (isGzipped && typeof pako !== 'undefined') {
+    const compressedBuffer = await response.arrayBuffer();
+    const decompressed = pako.inflate(new Uint8Array(compressedBuffer));
+    return decompressed.buffer.slice(decompressed.byteOffset, decompressed.byteOffset + decompressed.byteLength);
+  } else if (isGzipped) {
+    throw new Error('Gzip decompression not supported');
+  }
+
+  return response.arrayBuffer();
 }
 
 /**
@@ -427,17 +705,19 @@ export async function loadObsManifest(url) {
  */
 export async function loadObsFieldData(manifestUrl, field) {
   if (!field) throw new Error('No field metadata provided for obs field fetch.');
+
+  // Note: Notifications are handled by the caller (state.js) to avoid duplicates
   const outputs = { loaded: true };
-  
+
   // Load continuous values
   if (field.valuesPath) {
     const url = resolveUrl(manifestUrl, field.valuesPath);
     const buffer = await fetchBinary(url);
     const dtype = field.valuesDtype || 'float32';
     const raw = typedArrayFromBuffer(buffer, dtype, url);
-    
+
     // Check if quantized and needs dequantization
-    if (field.quantized && (dtype === 'uint8' || dtype === 'uint16') && 
+    if (field.quantized && (dtype === 'uint8' || dtype === 'uint16') &&
         field.minValue !== undefined && field.maxValue !== undefined) {
       const bits = field.quantizationBits || (dtype === 'uint8' ? 8 : 16);
       outputs.values = dequantize(raw, field.minValue, field.maxValue, bits);
@@ -446,14 +726,14 @@ export async function loadObsFieldData(manifestUrl, field) {
       outputs.values = raw;
     }
   }
-  
+
   // Load categorical codes
   if (field.codesPath) {
     const url = resolveUrl(manifestUrl, field.codesPath);
     const buffer = await fetchBinary(url);
     const dtype = field.codesDtype || 'uint16';
     const raw = typedArrayFromBuffer(buffer, dtype, url);
-    
+
     // If uint8 codes, convert to uint16 for consistency with rest of app
     if (dtype === 'uint8') {
       const u16 = new Uint16Array(raw.length);
@@ -467,14 +747,14 @@ export async function loadObsFieldData(manifestUrl, field) {
       outputs.codes = raw;
     }
   }
-  
+
   // Load outlier quantiles
   if (field.outlierQuantilesPath) {
     const url = resolveUrl(manifestUrl, field.outlierQuantilesPath);
     const buffer = await fetchBinary(url);
     const dtype = field.outlierDtype || 'float32';
     const raw = typedArrayFromBuffer(buffer, dtype, url);
-    
+
     // Check if quantized and needs dequantization
     if (field.outlierQuantized && (dtype === 'uint8' || dtype === 'uint16')) {
       const bits = dtype === 'uint8' ? 8 : 16;
@@ -488,7 +768,7 @@ export async function loadObsFieldData(manifestUrl, field) {
       outputs.outlierQuantiles = raw;
     }
   }
-  
+
   return outputs;
 }
 
@@ -515,14 +795,16 @@ export async function loadVarManifest(url) {
  */
 export async function loadVarFieldData(manifestUrl, field) {
   if (!field) throw new Error('No field metadata provided for var field fetch.');
+
+  // Note: Notifications are handled by the caller (state.js) to avoid duplicates
   const outputs = { loaded: true };
-  
+
   if (field.valuesPath) {
     const url = resolveUrl(manifestUrl, field.valuesPath);
     const buffer = await fetchBinary(url);
     const dtype = field.valuesDtype || 'float32';
     const raw = typedArrayFromBuffer(buffer, dtype, url);
-    
+
     // Check if quantized and needs dequantization
     if (field.quantized && (dtype === 'uint8' || dtype === 'uint16') &&
         field.minValue !== undefined && field.maxValue !== undefined) {
@@ -532,7 +814,7 @@ export async function loadVarFieldData(manifestUrl, field) {
       outputs.values = raw;
     }
   }
-  
+
   return outputs;
 }
 

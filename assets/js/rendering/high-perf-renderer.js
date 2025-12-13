@@ -15,6 +15,7 @@ import {
   HP_VS_FULL, HP_FS_FULL,
   HP_VS_LIGHT, HP_FS_LIGHT, HP_FS_ULTRALIGHT
 } from './shaders/high-perf-shaders.js';
+import { getNotificationCenter } from '../app/notification-center.js';
 
 // ============================================================================
 // CONSTANTS
@@ -122,17 +123,36 @@ export class SpatialIndex {
 
   ensureLODLevels() {
     if (this.lodLevels && this.lodLevels.length > 0) return;
+
+    const notifications = getNotificationCenter();
+    const notifId = notifications.startCalculation(
+      `Generating LOD levels for ${this.pointCount.toLocaleString()} cells`,
+      'calculation'
+    );
+    const startTime = performance.now();
+
     console.time('LOD generation');
     this.lodLevels = this._generateLODLevels();
     console.timeEnd('LOD generation');
     this._buildLOD = true;
+
+    const elapsed = performance.now() - startTime;
+    notifications.completeCalculation(notifId, `LOD ready (${this.lodLevels.length} levels)`, elapsed);
   }
 
   ensureLodNodeMappings() {
     if (this._lodNodeMappingsBuilt) return;
     this.ensureLODLevels();
+
+    const notifications = getNotificationCenter();
+    const notifId = notifications.startCalculation('Building LOD node mappings', 'calculation');
+    const startTime = performance.now();
+
     this._buildLODNodeMappings();
     this._lodNodeMappingsBuilt = true;
+
+    const elapsed = performance.now() - startTime;
+    notifications.completeCalculation(notifId, 'LOD node mappings ready', elapsed);
   }
 
   _createIndexArray(count) {
@@ -1504,6 +1524,14 @@ export class HighPerfRenderer {
 
     // Build new spatial index for this dimension
     console.log(`[HighPerfRenderer] Building ${dim}D spatial index...`);
+    const notifications = getNotificationCenter();
+    const treeNames = { 1: 'BinaryTree', 2: 'Quadtree', 3: 'Octree' };
+    const cellCount = pos.length / 3;
+    const notifId = notifications.startCalculation(
+      `Building ${dim}D ${treeNames[dim]} for live view (${cellCount.toLocaleString()} cells)`,
+      'spatial'
+    );
+
     const startTime = performance.now();
     const spatialIndex = new SpatialIndex(
       pos,
@@ -1519,6 +1547,7 @@ export class HighPerfRenderer {
     );
     const elapsed = performance.now() - startTime;
     console.log(`[HighPerfRenderer] ${dim}D spatial index built in ${elapsed.toFixed(1)}ms`);
+    notifications.completeCalculation(notifId, `${dim}D ${treeNames[dim]} ready (live view)`, elapsed);
 
     // Cache it
     this.spatialIndices.set(dim, spatialIndex);
@@ -4400,6 +4429,16 @@ export class HighPerfRenderer {
       // Clamp to valid range [1, 3] - consistent with render() and renderWithSnapshot()
       snapshotDimensionLevel = Math.max(1, Math.min(3, HighPerfRenderer.detectDimensionLevel(customBounds)));
       console.log(`[HighPerfRenderer] Building ${snapshotDimensionLevel}D spatial index for snapshot "${id}"...`);
+
+      const notifications = getNotificationCenter();
+      const treeNames = { 1: 'BinaryTree', 2: 'Quadtree', 3: 'Octree' };
+      const treeName = treeNames[snapshotDimensionLevel];
+      const notifId = notifications.startCalculation(
+        `Building ${snapshotDimensionLevel}D ${treeName} for view "${id}" (${n.toLocaleString()} cells)`,
+        'spatial'
+      );
+      const startTime = performance.now();
+
       const needsLOD = this._needsLodResources();
       spatialIndex = new SpatialIndex(
         viewPositions,
@@ -4413,6 +4452,8 @@ export class HighPerfRenderer {
           computeNodeStats: false
         }
       );
+      const elapsed = performance.now() - startTime;
+      notifications.completeCalculation(notifId, `${snapshotDimensionLevel}D ${treeName} ready (view "${id}")`, elapsed);
       console.log(`[HighPerfRenderer] Built ${snapshotDimensionLevel}D spatial index${needsLOD ? ` with ${spatialIndex.lodLevels.length} LOD levels` : ''}`);
     }
 
@@ -4557,6 +4598,15 @@ export class HighPerfRenderer {
         // Only build a spatial index when frustum culling or LOD is enabled; otherwise skip to
         // avoid expensive quadtree builds during 3D↔2D switching in multiview.
         if (needsSpatialIndex && n > 10000) {
+          const notifications = getNotificationCenter();
+          const treeNames = { 1: 'BinaryTree', 2: 'Quadtree', 3: 'Octree' };
+          const treeName = treeNames[dimensionLevel];
+          const notifId = notifications.startCalculation(
+            `Rebuilding ${dimensionLevel}D ${treeName} for view "${id}" (${n.toLocaleString()} cells)`,
+            'spatial'
+          );
+          const startTime = performance.now();
+
           const needsLOD = this._needsLodResources();
           snapshot.spatialIndex = new SpatialIndex(
             positions,
@@ -4571,6 +4621,8 @@ export class HighPerfRenderer {
             }
           );
           snapshot.dimensionLevel = dimensionLevel;
+          const elapsed = performance.now() - startTime;
+          notifications.completeCalculation(notifId, `${dimensionLevel}D ${treeName} ready (view "${id}")`, elapsed);
           console.log(`[HighPerfRenderer] Rebuilt ${dimensionLevel}D spatial index for snapshot "${id}"`);
         } else {
           snapshot.spatialIndex = null;
@@ -4672,6 +4724,16 @@ export class HighPerfRenderer {
     if (hasCustomPositions && needsSpatialIndex && n > 10000 && snapshot.colors) {
       // Clamp to valid range [1, 3] - consistent with render() and renderWithSnapshot()
       const detectedDimLevel = Math.max(1, Math.min(3, HighPerfRenderer.detectDimensionLevel(snapshot.bounds)));
+
+      const notifications = getNotificationCenter();
+      const treeNames = { 1: 'BinaryTree', 2: 'Quadtree', 3: 'Octree' };
+      const treeName = treeNames[detectedDimLevel];
+      const notifId = notifications.startCalculation(
+        `Rebuilding ${detectedDimLevel}D ${treeName} for view "${id}" (${n.toLocaleString()} cells)`,
+        'spatial'
+      );
+      const startTime = performance.now();
+
       const needsLOD = this._needsLodResources();
       snapshot.spatialIndex = new SpatialIndex(
         viewPositions,
@@ -4686,6 +4748,8 @@ export class HighPerfRenderer {
         }
       );
       snapshot.dimensionLevel = detectedDimLevel;  // Store for consistent LOD/frustum calculations
+      const elapsed = performance.now() - startTime;
+      notifications.completeCalculation(notifId, `${detectedDimLevel}D ${treeName} ready (view "${id}")`, elapsed);
       console.log(`[HighPerfRenderer] Rebuilt ${detectedDimLevel}D spatial index for snapshot "${id}"`);
     } else {
       snapshot.spatialIndex = null;
@@ -4851,6 +4915,17 @@ export class HighPerfRenderer {
     }
 
     console.log(`[HighPerfRenderer] Rebuilding ${clampedDim}D spatial index for snapshot "${id}"...`);
+
+    const notifications = getNotificationCenter();
+    const treeNames = { 1: 'BinaryTree', 2: 'Quadtree', 3: 'Octree' };
+    const treeName = treeNames[clampedDim];
+    const cellCount = snapshot.pointCount || this.pointCount;
+    const notifId = notifications.startCalculation(
+      `Rebuilding ${clampedDim}D ${treeName} for view "${id}" (${cellCount.toLocaleString()} cells)`,
+      'spatial'
+    );
+    const startTime = performance.now();
+
     const needsLOD = this._needsLodResources();
     snapshot.spatialIndex = new SpatialIndex(
       snapshot.positions,
@@ -4865,6 +4940,8 @@ export class HighPerfRenderer {
       }
     );
     snapshot.dimensionLevel = clampedDim;
+    const elapsed = performance.now() - startTime;
+    notifications.completeCalculation(notifId, `${clampedDim}D ${treeName} ready (view "${id}")`, elapsed);
     console.log(`[HighPerfRenderer] Built ${clampedDim}D spatial index${needsLOD ? ` with ${snapshot.spatialIndex.lodLevels.length} LOD levels` : ''}`);
     return true;
   }
@@ -4931,6 +5008,16 @@ export class HighPerfRenderer {
 
       if (indexStale) {
         console.log(`[HighPerfRenderer] Building ${snapshotDimLevel}D spatial index for snapshot "${id}"...`);
+
+        const notifications = getNotificationCenter();
+        const treeNames = { 1: 'BinaryTree', 2: 'Quadtree', 3: 'Octree' };
+        const treeName = treeNames[snapshotDimLevel];
+        const notifId = notifications.startCalculation(
+          `Building ${snapshotDimLevel}D ${treeName} for view "${id}" (${snapshot.pointCount.toLocaleString()} cells)`,
+          'spatial'
+        );
+        const startTime = performance.now();
+
         snapshot.spatialIndex = new SpatialIndex(
           snapshot.positions,
           snapshot.colors,
@@ -4944,6 +5031,8 @@ export class HighPerfRenderer {
           }
         );
         snapshot.dimensionLevel = snapshotDimLevel;
+        const elapsed = performance.now() - startTime;
+        notifications.completeCalculation(notifId, `${snapshotDimLevel}D ${treeName} ready (view "${id}")`, elapsed);
         console.log(`[HighPerfRenderer] Built ${snapshotDimLevel}D spatial index${needsLOD ? ` with ${snapshot.spatialIndex.lodLevels.length} LOD levels` : ''}`);
       } else if (needsLOD && (!snapshot.spatialIndex.lodLevels || snapshot.spatialIndex.lodLevels.length === 0)) {
         snapshot.spatialIndex.ensureLODLevels();
