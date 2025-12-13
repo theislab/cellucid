@@ -1,9 +1,11 @@
 // Fetch helpers for loading binary positions and obs payloads (manifest + per-field data).
 // Supports quantized data with transparent dequantization and gzip-compressed files.
-// Supports custom protocols (local-user://, future: remote://, jupyter://) via DataSourceManager.
+// Supports custom protocols (local-user://, remote://, jupyter://) via DataSourceManager.
 
 import { getDataSourceManager } from './data-source-manager.js';
 import { isLocalUserUrl, resolveUrl } from './data-source.js';
+// Note: remote:// and jupyter:// protocols are handled by DataSourceManager.resolveUrl()
+// via the registered protocol handlers - no explicit imports needed here.
 
 // ============================================================================
 // UNIFIED URL RESOLUTION (delegates to DataSourceManager)
@@ -18,11 +20,6 @@ import { isLocalUserUrl, resolveUrl } from './data-source.js';
 async function resolveAnyUrl(url) {
   return getDataSourceManager().resolveUrl(url);
 }
-
-// fetchBinaryWithProtocol is now an alias for fetchBinary (defined below)
-// Both handle custom protocols via resolveAnyUrl and gzip decompression
-// This avoids duplicate implementations that could diverge
-let fetchBinaryWithProtocol;
 
 /**
  * Fetch JSON with automatic custom protocol handling
@@ -41,8 +38,10 @@ async function fetchJsonWithProtocol(url) {
 }
 
 // Legacy compatibility aliases (used in existing code)
+// Note: These are functions that forward to the actual implementations
+// to avoid issues with variable hoisting
 const getLocalUserFileUrl = async (url) => resolveAnyUrl(url);
-const fetchLocalUserBinary = fetchBinaryWithProtocol;
+const fetchLocalUserBinary = async (url) => fetchBinary(url);
 const fetchLocalUserJson = fetchJsonWithProtocol;
 
 // ============================================================================
@@ -167,9 +166,6 @@ async function fetchBinary(url) {
   // Not gzipped, return as-is
   return response.arrayBuffer();
 }
-
-// Assign the alias now that fetchBinary is defined
-fetchBinaryWithProtocol = fetchBinary;
 
 /**
  * Load points binary, trying .gz version first if the URL doesn't already end in .gz

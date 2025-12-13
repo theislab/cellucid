@@ -13,9 +13,7 @@
 
 import {
   HP_VS_FULL, HP_FS_FULL,
-  HP_VS_LIGHT, HP_FS_LIGHT, HP_FS_ULTRALIGHT,
-  HP_VS_LOD,
-  getShaders
+  HP_VS_LIGHT, HP_FS_LIGHT, HP_FS_ULTRALIGHT
 } from './shaders/high-perf-shaders.js';
 
 // ============================================================================
@@ -901,8 +899,7 @@ export class HighPerfRenderer {
     this.programs = {
       full: null,
       light: null,
-      ultralight: null,
-      lod: null
+      ultralight: null
     };
 
     // Current active program
@@ -932,6 +929,10 @@ export class HighPerfRenderer {
     // Dimension-aware: Map<dimensionLevel, Array<{texture, width, height}>>
     this._lodIndexTexturesByDimension = new Map();
 
+    // Dummy 1x1 R32UI texture for when LOD index texture is not used
+    // Required because usampler2D uniforms must have a valid unsigned int texture bound
+    this._dummyLodIndexTexture = null;
+
     // LOD system - dimension-aware spatial indexing
     this.spatialIndices = new Map();  // Per-dimension spatial indices: Map<dimensionLevel, SpatialIndex>
     this.lodBuffersByDimension = new Map();  // Per-dimension LOD buffers: Map<dimensionLevel, lodBuffers[]>
@@ -939,7 +940,6 @@ export class HighPerfRenderer {
 
     // State
     this.pointCount = 0;
-    this.currentLOD = -1;
     this.forceLODLevel = -1; // -1 = auto, 0+ = forced level
     this.useAdaptiveLOD = this.options.USE_LOD;
     this.useFrustumCulling = this.options.USE_FRUSTUM_CULLING;
@@ -947,7 +947,6 @@ export class HighPerfRenderer {
 
     // VAO for WebGL2
     this.vao = null;
-    this.lodVaos = [];
 
     // Snapshot buffers for multi-view rendering (avoids re-uploading per frame)
     // Map<snapshotId, { vao, buffer, pointCount }>
@@ -1193,14 +1192,11 @@ export class HighPerfRenderer {
   }
 
   _createPrograms() {
-    const gl = this.gl;
-
     console.log('[HighPerfRenderer] Creating WebGL2 shader programs');
 
     this.programs.full = this._createProgram(HP_VS_FULL, HP_FS_FULL, 'full');
     this.programs.light = this._createProgram(HP_VS_LIGHT, HP_FS_LIGHT, 'light');
     this.programs.ultralight = this._createProgram(HP_VS_LIGHT, HP_FS_ULTRALIGHT, 'ultralight');
-    this.programs.lod = this._createProgram(HP_VS_LOD, HP_FS_FULL, 'lod');
 
     const createdPrograms = Object.entries(this.programs)
       .filter(([_, prog]) => prog !== null)
@@ -1216,6 +1212,44 @@ export class HighPerfRenderer {
         this._cacheUniformLocations(name, program);
       }
     }
+
+    // Create dummy 1x1 R32UI texture for usampler2D when LOD index texture is not used
+    // This prevents "Two textures of different types use the same sampler location" error
+    this._createDummyLodIndexTexture();
+  }
+
+  /**
+   * Create a dummy 1x1 R32UI texture to bind when LOD index texture is not in use.
+   * Required because usampler2D uniforms must have a valid unsigned integer texture bound,
+   * even when the shader doesn't use it (u_useLodIndexTex = false).
+   * @private
+   */
+  _createDummyLodIndexTexture() {
+    const gl = this.gl;
+
+    // Delete existing dummy texture if any
+    if (this._dummyLodIndexTexture) {
+      gl.deleteTexture(this._dummyLodIndexTexture);
+    }
+
+    this._dummyLodIndexTexture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, this._dummyLodIndexTexture);
+
+    // Create 1x1 R32UI texture with a dummy value
+    const dummyData = new Uint32Array([0]);
+    gl.texImage2D(
+      gl.TEXTURE_2D, 0, gl.R32UI,
+      1, 1, 0,
+      gl.RED_INTEGER, gl.UNSIGNED_INT, dummyData
+    );
+
+    // Set filtering to NEAREST (required for integer textures)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    gl.bindTexture(gl.TEXTURE_2D, null);
   }
 
   _createProgram(vsSource, fsSource, name = 'unknown') {
@@ -1305,7 +1339,7 @@ export class HighPerfRenderer {
 
     // Clear per-dimension spatial indices cache when loading new data
     this.spatialIndices.clear();
-    this.lodBuffersByDimension.clear();
+    this._clearLodBuffers();  // Properly delete GL buffers before clearing
     this._clearLodIndexTextures();  // Clear dimension-aware LOD index textures
     // Use provided dimensionLevel, or keep current if not specified
     if (dimensionLevel !== undefined) {
@@ -1335,9 +1369,13 @@ export class HighPerfRenderer {
       console.log('[HighPerfRenderer] Converting RGB colors to RGBA');
       normalizedColors = new Uint8Array(expectedRGBA);
       for (let i = 0; i < this.pointCount; i++) {
-        normalizedColors[i * 4]     = Math.round(colors[i * 3] * scale);
-        normalizedColors[i * 4 + 1] = Math.round(colors[i * 3 + 1] * scale);
-        normalizedColors[i * 4 + 2] = Math.round(colors[i * 3 + 2] * scale);
+        // Clamp to 0-255 to prevent wrap-around for out-of-range values
+        const r = Math.round(colors[i * 3] * scale);
+        const g = Math.round(colors[i * 3 + 1] * scale);
+        const b = Math.round(colors[i * 3 + 2] * scale);
+        normalizedColors[i * 4]     = r > 255 ? 255 : (r < 0 ? 0 : r);
+        normalizedColors[i * 4 + 1] = g > 255 ? 255 : (g < 0 ? 0 : g);
+        normalizedColors[i * 4 + 2] = b > 255 ? 255 : (b < 0 ? 0 : b);
         normalizedColors[i * 4 + 3] = 255; // Fully opaque
       }
     } else if (colors.length === expectedRGBA) {
@@ -1345,12 +1383,16 @@ export class HighPerfRenderer {
       if (isFloatArray) {
         normalizedColors = new Uint8Array(expectedRGBA);
         for (let i = 0; i < expectedRGBA; i++) {
-          normalizedColors[i] = Math.round(colors[i] * scale);
+          // Clamp to 0-255 to prevent wrap-around for out-of-range values
+          const val = Math.round(colors[i] * scale);
+          normalizedColors[i] = val > 255 ? 255 : (val < 0 ? 0 : val);
         }
       }
       // else: already Uint8Array RGBA, use as-is
     } else {
       console.error(`[HighPerfRenderer] Invalid colors array length: ${colors.length}, expected ${expectedRGBA} (RGBA) or ${expectedRGB} (RGB)`);
+      // Return early to prevent downstream errors from mismatched data
+      return this.stats;
     }
 
     // Store references to original data for frustum culling
@@ -1682,7 +1724,7 @@ export class HighPerfRenderer {
     // Clear spatial indices cache - positions changed, all cached indices are stale
     // We'll rebuild lazily when needed
     this.spatialIndices.clear();
-    this.lodBuffersByDimension.clear();
+    this._clearLodBuffers();  // Properly delete GL buffers before clearing
     this._clearLodIndexTextures();  // Clear dimension-aware LOD index textures
 
     // Update bounding sphere
@@ -1731,7 +1773,7 @@ export class HighPerfRenderer {
 
       // Clear spatial indices cache - will rebuild for current dimension
       this.spatialIndices.clear();
-      this.lodBuffersByDimension.clear();
+      this._clearLodBuffers();  // Properly delete GL buffers before clearing
       this._clearLodIndexTextures();  // Clear dimension-aware LOD index textures
 
       // Use dimension-aware spatial index
@@ -1760,13 +1802,27 @@ export class HighPerfRenderer {
   _createInterleavedBuffer(positions, colors) {
     const gl = this.gl;
     const pointCount = positions.length / 3;
+    const requiredSize = pointCount * 16; // 16 bytes per point
 
-    // Create interleaved buffer: [x,y,z (float32), r,g,b,a (uint8)] per point (16 bytes)
+    // Reuse pooled ArrayBuffer if size matches, otherwise allocate new one
+    // This reduces GC pressure during frequent dimension switching / reloads
+    let buffer, positionView, colorView;
+    if (this._interleavedArrayBuffer && this._interleavedArrayBuffer.byteLength === requiredSize) {
+      buffer = this._interleavedArrayBuffer;
+      positionView = this._interleavedPositionView;
+      colorView = this._interleavedColorView;
+    } else {
+      // Create interleaved buffer: [x,y,z (float32), r,g,b,a (uint8)] per point (16 bytes)
+      buffer = new ArrayBuffer(requiredSize);
+      positionView = new Float32Array(buffer);
+      colorView = new Uint8Array(buffer);
+      // Cache for reuse
+      this._interleavedArrayBuffer = buffer;
+      this._interleavedPositionView = positionView;
+      this._interleavedColorView = colorView;
+    }
+
     // colors is Uint8Array with RGBA packed (4 bytes per point) - alpha is in 4th byte
-    const buffer = new ArrayBuffer(pointCount * 16);
-    const positionView = new Float32Array(buffer);
-    const colorView = new Uint8Array(buffer);
-
     for (let i = 0; i < pointCount; i++) {
       const srcIdx = i * 3;
       const floatOffset = i * 4; // 16 bytes / 4 = 4 floats per point
@@ -1834,6 +1890,10 @@ export class HighPerfRenderer {
     // If so, disable alpha texture and fall back to buffer-based alpha
     if (this._alphaTexHeight > maxTexSize) {
       console.warn(`[HighPerfRenderer] Point count ${pointCount.toLocaleString()} exceeds alpha texture capacity (max ${maxTexSize}x${maxTexSize}). Falling back to buffer-based alpha.`);
+      // Delete existing texture to prevent VRAM leak (e.g., smaller dataset → larger dataset overflow)
+      if (this._alphaTexture) {
+        gl.deleteTexture(this._alphaTexture);
+      }
       this._useAlphaTexture = false;
       this._alphaTexture = null;
       this._alphaTexData = null;
@@ -1884,8 +1944,10 @@ export class HighPerfRenderer {
 
     // Convert float alphas to uint8 and store in texture data
     // Using bitwise OR for fast rounding (avoids Math.round() overhead on millions of points)
+    // Clamp to 0-255 to prevent wrap-around for out-of-range values (e.g., alpha > 1.0)
     for (let i = 0; i < n; i++) {
-      this._alphaTexData[i] = (alphas[i] * 255 + 0.5) | 0;
+      const val = (alphas[i] * 255 + 0.5) | 0;
+      this._alphaTexData[i] = val > 255 ? 255 : (val < 0 ? 0 : val);
     }
 
     // Upload to texture using texSubImage2D (faster than full texImage2D)
@@ -1924,7 +1986,8 @@ export class HighPerfRenderer {
       return;
     }
 
-    const maxWidth = Math.min(4096, gl.getParameter(gl.MAX_TEXTURE_SIZE));
+    const maxTexSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+    const maxWidth = Math.min(4096, maxTexSize);  // Clamp width to 4096 for better GPU compatibility
     const lodIndexTextures = [];
 
     for (let lvlIdx = 0; lvlIdx < spatialIndex.lodLevels.length; lvlIdx++) {
@@ -1940,18 +2003,19 @@ export class HighPerfRenderer {
       const texWidth = Math.min(pointCount, maxWidth);
       const texHeight = Math.ceil(pointCount / texWidth);
 
-      // Check if texture height exceeds GPU limits
-      if (texHeight > maxWidth) {
-        console.warn(`[HighPerfRenderer] LOD level ${lvlIdx} index count ${pointCount.toLocaleString()} exceeds texture capacity. Skipping index texture.`);
+      // Check if texture height exceeds GPU limits (use actual MAX_TEXTURE_SIZE, not clamped width)
+      if (texHeight > maxTexSize) {
+        console.warn(`[HighPerfRenderer] LOD level ${lvlIdx} index count ${pointCount.toLocaleString()} exceeds texture capacity (${maxTexSize}x${maxTexSize}). Skipping index texture.`);
         lodIndexTextures.push({ texture: null, width: 0, height: 0 });
         continue;
       }
 
       const texSize = texWidth * texHeight;
 
-      // Create Float32 texture to store indices (R32F format)
-      // Using float because indices can be large (> 65535)
-      const indexData = new Float32Array(texSize);
+      // Create Uint32 texture to store indices (R32UI format)
+      // Using unsigned integer for exact representation of indices up to 4 billion
+      // Float32 only has 24-bit mantissa, losing precision for indices > 16,777,216
+      const indexData = new Uint32Array(texSize);
       for (let i = 0; i < pointCount; i++) {
         indexData[i] = level.indices[i];
       }
@@ -1959,9 +2023,9 @@ export class HighPerfRenderer {
       const texture = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_2D, texture);
       gl.texImage2D(
-        gl.TEXTURE_2D, 0, gl.R32F,
+        gl.TEXTURE_2D, 0, gl.R32UI,
         texWidth, texHeight, 0,
-        gl.RED, gl.FLOAT, indexData
+        gl.RED_INTEGER, gl.UNSIGNED_INT, indexData
       );
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
@@ -1999,25 +2063,77 @@ export class HighPerfRenderer {
     this._lodIndexTexturesByDimension.clear();
   }
 
+  /**
+   * Clear all LOD buffers (all dimensions), properly deleting GL resources.
+   * Call this before clearing spatial indices or when data changes.
+   * @private
+   */
+  _clearLodBuffers() {
+    const gl = this.gl;
+    for (const lodBuffers of this.lodBuffersByDimension.values()) {
+      for (const lod of lodBuffers) {
+        // CRITICAL: Don't delete buffer for full-detail LOD entries!
+        // Full-detail LOD stores a reference to this.buffers.interleaved (the main VBO).
+        // Deleting it here would corrupt the main buffer, causing subsequent renders to fail.
+        if (lod.buffer && !lod.isFullDetail) {
+          gl.deleteBuffer(lod.buffer);
+        }
+        // Full-detail LOD also uses the main VAO (this.vao), so don't delete it either.
+        // Only delete VAOs created specifically for reduced LOD levels.
+        if (lod.vao && !lod.isFullDetail) {
+          gl.deleteVertexArray(lod.vao);
+        }
+        // Index buffers are always LOD-specific, safe to delete for all levels
+        if (lod.originalIndexBuffer) {
+          gl.deleteBuffer(lod.originalIndexBuffer);
+        }
+      }
+    }
+    this.lodBuffersByDimension.clear();
+  }
+
   updateColors(colors) {
     // Note: Reference check removed - callers often modify arrays in-place,
     // so same reference doesn't mean same content.
     if (!colors) return;
 
-    // Normalize colors to RGBA if needed (same logic as loadData)
+    // Normalize colors to RGBA Uint8Array format (same logic as loadData)
+    // Handle both Uint8Array (0-255) and Float32Array (0-1) inputs
     const expectedRGBA = this.pointCount * 4;
     const expectedRGB = this.pointCount * 3;
     let normalizedColors = colors;
+
+    // Detect float colors (Float32Array or values in 0-1 range)
+    const isFloatArray = colors.BYTES_PER_ELEMENT === 4 && colors instanceof Float32Array;
+    const scale = isFloatArray ? 255 : 1;  // Scale 0-1 float to 0-255 uint8
 
     if (colors.length === expectedRGB) {
       // Convert RGB to RGBA (add alpha = 255)
       normalizedColors = new Uint8Array(expectedRGBA);
       for (let i = 0; i < this.pointCount; i++) {
-        normalizedColors[i * 4]     = colors[i * 3];
-        normalizedColors[i * 4 + 1] = colors[i * 3 + 1];
-        normalizedColors[i * 4 + 2] = colors[i * 3 + 2];
+        // Clamp to 0-255 to prevent wrap-around for out-of-range values
+        const r = Math.round(colors[i * 3] * scale);
+        const g = Math.round(colors[i * 3 + 1] * scale);
+        const b = Math.round(colors[i * 3 + 2] * scale);
+        normalizedColors[i * 4]     = r > 255 ? 255 : (r < 0 ? 0 : r);
+        normalizedColors[i * 4 + 1] = g > 255 ? 255 : (g < 0 ? 0 : g);
+        normalizedColors[i * 4 + 2] = b > 255 ? 255 : (b < 0 ? 0 : b);
         normalizedColors[i * 4 + 3] = 255;
       }
+    } else if (colors.length === expectedRGBA) {
+      // RGBA - may need to convert from float to uint8
+      if (isFloatArray) {
+        normalizedColors = new Uint8Array(expectedRGBA);
+        for (let i = 0; i < expectedRGBA; i++) {
+          // Clamp to 0-255 to prevent wrap-around for out-of-range values
+          const val = Math.round(colors[i] * scale);
+          normalizedColors[i] = val > 255 ? 255 : (val < 0 ? 0 : val);
+        }
+      }
+      // else: already Uint8Array RGBA, use as-is
+    } else {
+      console.error(`[HighPerfRenderer] updateColors: Invalid array length: ${colors.length}, expected ${expectedRGBA} (RGBA) or ${expectedRGB} (RGB)`);
+      return;  // Early return on invalid input
     }
 
     this._colors = normalizedColors; // Uint8Array with RGBA packed
@@ -2086,7 +2202,9 @@ export class HighPerfRenderer {
 
     const n = Math.min(this.pointCount, alphas.length);
     for (let i = 0; i < n; i++) {
-      this._colors[i * 4 + 3] = Math.round(alphas[i] * 255);
+      // Clamp to 0-255 to prevent wrap-around for out-of-range values
+      const val = Math.round(alphas[i] * 255);
+      this._colors[i * 4 + 3] = val > 255 ? 255 : (val < 0 ? 0 : val);
     }
 
     // Use alpha-only fast path if buffer already exists (skip position repacking)
@@ -2582,18 +2700,21 @@ export class HighPerfRenderer {
     const spatialIndex = needsSpatialIndex ? this.getSpatialIndexForDimension(clampedDimLevel) : null;
     const lodBuffersForDim = this.getLodBuffersForDimension(clampedDimLevel);
 
-    // Select LOD level first (determines whether to use frustum culling)
-    // Priority: this.forceLODLevel > params.forceLOD > adaptive
-    let lodLevel = this.forceLODLevel >= 0 ? this.forceLODLevel : forceLOD;
-    if (lodLevel < 0 && this.useAdaptiveLOD && spatialIndex) {
-      // Pass per-view lastLodLevel for hysteresis (prevents oscillation per-view)
-      // Also pass clampedDimLevel and overrideBounds for correct 2D/3D diagonal calculation
-      lodLevel = spatialIndex.getLODLevel(cameraDistance, viewportHeight, viewState.lastLodLevel, clampedDimLevel, overrideBounds);
-    }
-
-    // Safeguard: if LOD is disabled, ensure lodLevel stays -1
-    if (!this.useAdaptiveLOD && this.forceLODLevel < 0 && forceLOD < 0) {
-      lodLevel = -1;
+    // Select LOD level based on whether LOD is enabled
+    // When LOD is disabled, forceLODLevel is ignored - only params.forceLOD is respected
+    // This ensures disabling LOD always returns to full detail (unless explicitly overridden per-render)
+    let lodLevel;
+    if (this.useAdaptiveLOD) {
+      // LOD enabled: Priority is this.forceLODLevel > params.forceLOD > adaptive
+      lodLevel = this.forceLODLevel >= 0 ? this.forceLODLevel : forceLOD;
+      if (lodLevel < 0 && spatialIndex) {
+        // Pass per-view lastLodLevel for hysteresis (prevents oscillation per-view)
+        // Also pass clampedDimLevel and overrideBounds for correct 2D/3D diagonal calculation
+        lodLevel = spatialIndex.getLODLevel(cameraDistance, viewportHeight, viewState.lastLodLevel, clampedDimLevel, overrideBounds);
+      }
+    } else {
+      // LOD disabled: only respect explicit per-render forceLOD, otherwise full detail
+      lodLevel = forceLOD >= 0 ? forceLOD : -1;
     }
 
     // Always update per-view LOD level for highlight rendering and other consumers
@@ -3166,7 +3287,15 @@ export class HighPerfRenderer {
           gl.uniform1i(uniforms.u_useLodIndexTex, 1); // true
         }
       } else {
-        // No LOD index texture needed
+        // No LOD index texture needed, but must bind dummy R32UI texture to satisfy usampler2D
+        // Without this, WebGL throws "Two textures of different types use the same sampler location"
+        if (this._dummyLodIndexTexture) {
+          gl.activeTexture(gl.TEXTURE1);
+          gl.bindTexture(gl.TEXTURE_2D, this._dummyLodIndexTexture);
+          if (uniforms.u_lodIndexTex !== null) {
+            gl.uniform1i(uniforms.u_lodIndexTex, 1); // Texture unit 1
+          }
+        }
         if (uniforms.u_useLodIndexTex !== null) {
           gl.uniform1i(uniforms.u_useLodIndexTex, 0); // false
         }
@@ -3175,6 +3304,14 @@ export class HighPerfRenderer {
       // Alpha texture not active - use vertex attribute alpha
       if (uniforms.u_useAlphaTex !== null) {
         gl.uniform1i(uniforms.u_useAlphaTex, 0); // false
+      }
+      // Still need to bind dummy R32UI texture to satisfy usampler2D uniform
+      if (this._dummyLodIndexTexture) {
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, this._dummyLodIndexTexture);
+        if (uniforms.u_lodIndexTex !== null) {
+          gl.uniform1i(uniforms.u_lodIndexTex, 1); // Texture unit 1
+        }
       }
       if (uniforms.u_useLodIndexTex !== null) {
         gl.uniform1i(uniforms.u_useLodIndexTex, 0); // false
@@ -3505,6 +3642,13 @@ export class HighPerfRenderer {
     this.useAdaptiveLOD = enabled;
     console.log(`[HighPerfRenderer] Adaptive LOD ${enabled ? 'enabled' : 'disabled'}`);
 
+    // When disabling LOD, reset forceLODLevel to -1 (auto/full detail)
+    // This ensures the scatterplot returns to full detail when LOD is turned off
+    if (!enabled && this.forceLODLevel >= 0) {
+      console.log('[HighPerfRenderer] Resetting forceLODLevel to -1 (LOD disabled)');
+      this.forceLODLevel = -1;
+    }
+
     if (enabled && this.pointCount > 0 && this._positions) {
       const dimLevel = this.currentDimensionLevel;
 
@@ -3517,7 +3661,7 @@ export class HighPerfRenderer {
           console.log(`[HighPerfRenderer] ${dimLevel}D spatial index stale (point count mismatch), rebuilding...`);
           // Clear all cached spatial indices
           this.spatialIndices.clear();
-          this.lodBuffersByDimension.clear();
+          this._clearLodBuffers();  // Properly delete GL buffers before clearing
           this._clearLodIndexTextures();  // Clear dimension-aware LOD index textures
         } else {
           console.log(`[HighPerfRenderer] Building ${dimLevel}D spatial index for LOD...`);
@@ -3629,7 +3773,7 @@ export class HighPerfRenderer {
         if (indexStale) {
           console.log(`[HighPerfRenderer] ${dimLevel}D spatial index stale, rebuilding for frustum culling...`);
           this.spatialIndices.clear();
-          this.lodBuffersByDimension.clear();
+          this._clearLodBuffers();  // Properly delete GL buffers before clearing
           this._clearLodIndexTextures();  // Clear dimension-aware LOD index textures
         } else {
           console.log(`[HighPerfRenderer] Building ${dimLevel}D spatial index for frustum culling...`);
@@ -3686,7 +3830,7 @@ export class HighPerfRenderer {
           console.log(`[HighPerfRenderer] ${dimLevel}D spatial index stale, rebuilding...`);
           this.clearAllViewState();
           this.spatialIndices.clear();
-          this.lodBuffersByDimension.clear();
+          this._clearLodBuffers();  // Properly delete GL buffers before clearing
           this._clearLodIndexTextures();  // Clear dimension-aware LOD index textures
         } else {
           console.log(`[HighPerfRenderer] Building ${dimLevel}D spatial index...`);
@@ -3900,17 +4044,32 @@ export class HighPerfRenderer {
       }
 
       // Reuse or create visibility array
-      if (!viewState.cachedLodVisibility || viewState.cachedLodVisibility.length !== n) {
+      const needsFullClear = !viewState.cachedLodVisibility || viewState.cachedLodVisibility.length !== n;
+      if (needsFullClear) {
         viewState.cachedLodVisibility = new Float32Array(n);
+        // New array is already zero-filled by Float32Array constructor
+      } else {
+        // SPARSE CLEAR OPTIMIZATION: Instead of .fill(0) which is O(N),
+        // only clear the previously marked indices. This is O(prev_LOD_points)
+        // which is much smaller than O(N) for large datasets.
+        const prevIndices = viewState.cachedLodVisibilityIndices;
+        if (prevIndices) {
+          const vis = viewState.cachedLodVisibility;
+          for (let i = 0, len = prevIndices.length; i < len; i++) {
+            vis[prevIndices[i]] = 0;
+          }
+        }
       }
 
-      // Clear and mark only the points in this LOD level as visible
-      viewState.cachedLodVisibility.fill(0);
+      // Mark only the points in this LOD level as visible
       const indices = level.indices;
+      const vis = viewState.cachedLodVisibility;
       for (let i = 0, len = indices.length; i < len; i++) {
-        viewState.cachedLodVisibility[indices[i]] = 1.0;
+        vis[indices[i]] = 1.0;
       }
 
+      // Store indices for next sparse clear
+      viewState.cachedLodVisibilityIndices = indices;
       viewState.cachedLodVisibilityLevel = lodLevel;
       viewState.cachedLodVisibilityFilterGen = currentFilterGen;
       return viewState.cachedLodVisibility;
@@ -3925,17 +4084,32 @@ export class HighPerfRenderer {
     }
 
     // Reuse or create visibility array
-    if (!this._cachedLodVisibility || this._cachedLodVisibility.length !== n) {
+    const needsFullClear = !this._cachedLodVisibility || this._cachedLodVisibility.length !== n;
+    if (needsFullClear) {
       this._cachedLodVisibility = new Float32Array(n);
+      // New array is already zero-filled by Float32Array constructor
+    } else {
+      // SPARSE CLEAR OPTIMIZATION: Instead of .fill(0) which is O(N),
+      // only clear the previously marked indices. This is O(prev_LOD_points)
+      // which is much smaller than O(N) for large datasets.
+      const prevIndices = this._cachedLodVisibilityIndices;
+      if (prevIndices) {
+        const vis = this._cachedLodVisibility;
+        for (let i = 0, len = prevIndices.length; i < len; i++) {
+          vis[prevIndices[i]] = 0;
+        }
+      }
     }
 
-    // Clear and mark only the points in this LOD level as visible
-    this._cachedLodVisibility.fill(0);
+    // Mark only the points in this LOD level as visible
     const indices = level.indices;
+    const vis = this._cachedLodVisibility;
     for (let i = 0, len = indices.length; i < len; i++) {
-      this._cachedLodVisibility[indices[i]] = 1.0;
+      vis[indices[i]] = 1.0;
     }
 
+    // Store indices for next sparse clear
+    this._cachedLodVisibilityIndices = indices;
     this._cachedLodVisibilityLevel = lodLevel;
     this._cachedLodVisibilityFilterGen = currentFilterGen;
     return this._cachedLodVisibility;
@@ -4117,18 +4291,27 @@ export class HighPerfRenderer {
       if (colors.length === expectedRGB) {
         snapshotColors = new Uint8Array(expectedRGBA);
         for (let i = 0; i < n; i++) {
-          snapshotColors[i * 4]     = Math.round(colors[i * 3] * 255);
-          snapshotColors[i * 4 + 1] = Math.round(colors[i * 3 + 1] * 255);
-          snapshotColors[i * 4 + 2] = Math.round(colors[i * 3 + 2] * 255);
+          // Clamp to 0-255 to prevent wrap-around for out-of-range values
+          const r = Math.round(colors[i * 3] * 255);
+          const g = Math.round(colors[i * 3 + 1] * 255);
+          const b = Math.round(colors[i * 3 + 2] * 255);
+          snapshotColors[i * 4]     = r > 255 ? 255 : (r < 0 ? 0 : r);
+          snapshotColors[i * 4 + 1] = g > 255 ? 255 : (g < 0 ? 0 : g);
+          snapshotColors[i * 4 + 2] = b > 255 ? 255 : (b < 0 ? 0 : b);
           snapshotColors[i * 4 + 3] = 255;
         }
       } else {
         snapshotColors = new Uint8Array(expectedRGBA);
         for (let i = 0; i < n; i++) {
-          snapshotColors[i * 4]     = Math.round(colors[i * 4] * 255);
-          snapshotColors[i * 4 + 1] = Math.round(colors[i * 4 + 1] * 255);
-          snapshotColors[i * 4 + 2] = Math.round(colors[i * 4 + 2] * 255);
-          snapshotColors[i * 4 + 3] = Math.round((colors[i * 4 + 3] ?? 1.0) * 255);
+          // Clamp to 0-255 to prevent wrap-around for out-of-range values
+          const r = Math.round(colors[i * 4] * 255);
+          const g = Math.round(colors[i * 4 + 1] * 255);
+          const b = Math.round(colors[i * 4 + 2] * 255);
+          const a = Math.round((colors[i * 4 + 3] ?? 1.0) * 255);
+          snapshotColors[i * 4]     = r > 255 ? 255 : (r < 0 ? 0 : r);
+          snapshotColors[i * 4 + 1] = g > 255 ? 255 : (g < 0 ? 0 : g);
+          snapshotColors[i * 4 + 2] = b > 255 ? 255 : (b < 0 ? 0 : b);
+          snapshotColors[i * 4 + 3] = a > 255 ? 255 : (a < 0 ? 0 : a);
         }
       }
     } else if (colors.length === expectedRGB) {
@@ -4149,7 +4332,9 @@ export class HighPerfRenderer {
     if (alphas) {
       const alphaCount = Math.min(n, alphas.length);
       for (let i = 0; i < alphaCount; i++) {
-        snapshotColors[i * 4 + 3] = Math.round(alphas[i] * 255);
+        // Clamp to 0-255 to prevent wrap-around for out-of-range values
+        const val = Math.round(alphas[i] * 255);
+        snapshotColors[i * 4 + 3] = val > 255 ? 255 : (val < 0 ? 0 : val);
       }
     }
 
@@ -4318,7 +4503,9 @@ export class HighPerfRenderer {
     if (alphas) {
       const alphaCount = Math.min(n, alphas.length);
       for (let i = 0; i < alphaCount; i++) {
-        snapshotColors[i * 4 + 3] = Math.round(alphas[i] * 255);
+        // Clamp to 0-255 to prevent wrap-around for out-of-range values
+        const val = Math.round(alphas[i] * 255);
+        snapshotColors[i * 4 + 3] = val > 255 ? 255 : (val < 0 ? 0 : val);
       }
     }
 
@@ -4795,18 +4982,21 @@ export class HighPerfRenderer {
     const lodSpatialIndex = hasCustomPositions ? snapshot.spatialIndex : mainSpatialIndex;
     const lodBuffersForDim = this.getLodBuffersForDimension(effectiveDimLevel);
 
-    // Select LOD level - priority: forceLODLevel > params.forceLOD > adaptive
-    // Same logic as render() to ensure slider affects all views
-    let lodLevel = this.forceLODLevel >= 0 ? this.forceLODLevel : forceLOD;
-    if (lodLevel < 0 && this.useAdaptiveLOD && lodSpatialIndex) {
-      // Pass effectiveDimLevel for correct 2D/3D diagonal calculation (uses snapshot's stored dimension for custom positions)
-      // Pass snapshot bounds when available (for custom positions that differ from octree)
-      lodLevel = lodSpatialIndex.getLODLevel(cameraDistance, viewportHeight, viewState.lastLodLevel, effectiveDimLevel, snapshot.bounds);
-    }
-
-    // Safeguard: if LOD is disabled, ensure lodLevel stays -1 (consistent with render())
-    if (!this.useAdaptiveLOD && this.forceLODLevel < 0 && forceLOD < 0) {
-      lodLevel = -1;
+    // Select LOD level based on whether LOD is enabled (consistent with render())
+    // When LOD is disabled, forceLODLevel is ignored - only params.forceLOD is respected
+    // This ensures disabling LOD always returns to full detail (unless explicitly overridden per-render)
+    let lodLevel;
+    if (this.useAdaptiveLOD) {
+      // LOD enabled: Priority is this.forceLODLevel > params.forceLOD > adaptive
+      lodLevel = this.forceLODLevel >= 0 ? this.forceLODLevel : forceLOD;
+      if (lodLevel < 0 && lodSpatialIndex) {
+        // Pass effectiveDimLevel for correct 2D/3D diagonal calculation (uses snapshot's stored dimension for custom positions)
+        // Pass snapshot bounds when available (for custom positions that differ from octree)
+        lodLevel = lodSpatialIndex.getLODLevel(cameraDistance, viewportHeight, viewState.lastLodLevel, effectiveDimLevel, snapshot.bounds);
+      }
+    } else {
+      // LOD disabled: only respect explicit per-render forceLOD, otherwise full detail
+      lodLevel = forceLOD >= 0 ? forceLOD : -1;
     }
 
     // Always update per-view LOD level for highlight rendering and other consumers
@@ -4957,6 +5147,12 @@ export class HighPerfRenderer {
       this._bindAlphaTexture(gl, uniforms, -1);  // -1 for full detail (no LOD index texture)
     } else {
       if (uniforms.u_useAlphaTex !== null) gl.uniform1i(uniforms.u_useAlphaTex, 0);
+      // Bind dummy R32UI texture to satisfy usampler2D uniform
+      if (this._dummyLodIndexTexture) {
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, this._dummyLodIndexTexture);
+        if (uniforms.u_lodIndexTex !== null) gl.uniform1i(uniforms.u_lodIndexTex, 1);
+      }
       if (uniforms.u_useLodIndexTex !== null) gl.uniform1i(uniforms.u_useLodIndexTex, 0);
     }
 
@@ -5127,6 +5323,12 @@ export class HighPerfRenderer {
       this._bindAlphaTexture(gl, uniforms, -1);  // -1 for full detail
     } else {
       if (uniforms.u_useAlphaTex !== null) gl.uniform1i(uniforms.u_useAlphaTex, 0);
+      // Bind dummy R32UI texture to satisfy usampler2D uniform
+      if (this._dummyLodIndexTexture) {
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, this._dummyLodIndexTexture);
+        if (uniforms.u_lodIndexTex !== null) gl.uniform1i(uniforms.u_lodIndexTex, 1);
+      }
       if (uniforms.u_useLodIndexTex !== null) gl.uniform1i(uniforms.u_useLodIndexTex, 0);
     }
 
@@ -5198,6 +5400,12 @@ export class HighPerfRenderer {
       this._bindAlphaTexture(gl, uniforms, -1);  // -1 for full detail
     } else {
       if (uniforms.u_useAlphaTex !== null) gl.uniform1i(uniforms.u_useAlphaTex, 0);
+      // Bind dummy R32UI texture to satisfy usampler2D uniform
+      if (this._dummyLodIndexTexture) {
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, this._dummyLodIndexTexture);
+        if (uniforms.u_lodIndexTex !== null) gl.uniform1i(uniforms.u_lodIndexTex, 1);
+      }
       if (uniforms.u_useLodIndexTex !== null) gl.uniform1i(uniforms.u_useLodIndexTex, 0);
     }
 
@@ -5340,6 +5548,12 @@ export class HighPerfRenderer {
       this._bindAlphaTexture(gl, uniforms, -1);  // -1 = no LOD index texture, gl_VertexID is already original
     } else {
       if (uniforms.u_useAlphaTex !== null) gl.uniform1i(uniforms.u_useAlphaTex, 0);
+      // Bind dummy R32UI texture to satisfy usampler2D uniform
+      if (this._dummyLodIndexTexture) {
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, this._dummyLodIndexTexture);
+        if (uniforms.u_lodIndexTex !== null) gl.uniform1i(uniforms.u_lodIndexTex, 1);
+      }
       if (uniforms.u_useLodIndexTex !== null) gl.uniform1i(uniforms.u_useLodIndexTex, 0);
     }
 
@@ -5582,6 +5796,12 @@ export class HighPerfRenderer {
       this._bindAlphaTexture(gl, uniforms, -1);  // -1 = no LOD index texture, gl_VertexID is already original
     } else {
       if (uniforms.u_useAlphaTex !== null) gl.uniform1i(uniforms.u_useAlphaTex, 0);
+      // Bind dummy R32UI texture to satisfy usampler2D uniform
+      if (this._dummyLodIndexTexture) {
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, this._dummyLodIndexTexture);
+        if (uniforms.u_lodIndexTex !== null) gl.uniform1i(uniforms.u_lodIndexTex, 1);
+      }
       if (uniforms.u_useLodIndexTex !== null) gl.uniform1i(uniforms.u_useLodIndexTex, 0);
     }
 
@@ -5618,24 +5838,29 @@ export class HighPerfRenderer {
     // Clean up per-view index buffers first
     this.clearAllViewState();
 
+    // Clean up main buffers (interleaved VBO, etc.)
     for (const buffer of Object.values(this.buffers)) {
       if (buffer) gl.deleteBuffer(buffer);
     }
 
-    // Clean up all per-dimension LOD buffers (including pre-cached index buffers)
+    // Clean up all per-dimension LOD buffers and VAOs
+    // CRITICAL: Skip full-detail entries - they reference main buffer/VAO which we already deleted above.
+    // Deleting them again would cause WebGL errors (double-delete).
     for (const lodBuffers of this.lodBuffersByDimension.values()) {
       for (const lod of lodBuffers) {
-        if (lod.buffer) gl.deleteBuffer(lod.buffer);
-        // Also clean up pre-cached index buffers for snapshot rendering
+        // Only delete buffers/VAOs for reduced LOD levels, not full-detail
+        if (!lod.isFullDetail) {
+          if (lod.buffer) gl.deleteBuffer(lod.buffer);
+          if (lod.vao) gl.deleteVertexArray(lod.vao);
+        }
+        // Index buffers are always LOD-specific (even full-detail has its own), safe to delete
         if (lod.originalIndexBuffer) gl.deleteBuffer(lod.originalIndexBuffer);
       }
     }
 
+    // Clean up main VAO and index buffer
     if (this.vao) gl.deleteVertexArray(this.vao);
     if (this.indexBuffer) gl.deleteBuffer(this.indexBuffer);
-    for (const vao of this.lodVaos) {
-      gl.deleteVertexArray(vao);
-    }
 
     // Clean up snapshot buffers
     this.deleteAllSnapshotBuffers();
@@ -5647,7 +5872,11 @@ export class HighPerfRenderer {
     this.buffers = {};
     this.lodBuffersByDimension.clear();
     this._clearLodIndexTextures();  // Clear dimension-aware LOD index textures
-    this.lodVaos = [];
+    // Clean up dummy LOD index texture
+    if (this._dummyLodIndexTexture) {
+      gl.deleteTexture(this._dummyLodIndexTexture);
+      this._dummyLodIndexTexture = null;
+    }
     this.programs = {};
     this.spatialIndices.clear();
 

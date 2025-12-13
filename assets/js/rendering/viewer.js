@@ -491,7 +491,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   const handleContextMenu = (e) => { e.preventDefault(); return false; };
   addEventListenerWithCleanup(canvas, 'contextmenu', handleContextMenu);
 
-  canvas.addEventListener('mousedown', (e) => {
+  addEventListenerWithCleanup(canvas, 'mousedown', (e) => {
     if (highlightTools && highlightTools.handleMouseDown(e)) {
       return;
     }
@@ -747,7 +747,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   };
   addEventListenerWithCleanup(window, 'mousemove', handleMouseMove);
 
-  canvas.addEventListener('wheel', (e) => {
+  addEventListenerWithCleanup(canvas, 'wheel', (e) => {
     e.preventDefault();
     if (navigationMode === 'free') {
       return;
@@ -888,8 +888,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   };
   addEventListenerWithCleanup(window, 'keyup', handleKeyUp);
 
-  // Touch events
-  canvas.addEventListener('touchstart', (e) => {
+  // Touch events (use cleanup registry to prevent handler stacking on recreate)
+  addEventListenerWithCleanup(canvas, 'touchstart', (e) => {
     if (navigationMode === 'free') return;
     velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
     lastDx = lastDy = 0;
@@ -909,7 +909,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     e.preventDefault();
   }, { passive: false });
 
-  canvas.addEventListener('touchmove', (e) => {
+  addEventListenerWithCleanup(canvas, 'touchmove', (e) => {
     if (navigationMode === 'free') return;
     e.preventDefault();
     if (e.touches.length === 1 && isDragging) {
@@ -949,7 +949,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     }
   }, { passive: false });
 
-  canvas.addEventListener('touchend', (e) => {
+  addEventListenerWithCleanup(canvas, 'touchend', (e) => {
     if (navigationMode === 'free') return;
     if (isDragging && e.touches.length === 0) {
       const timeDelta = performance.now() - lastMoveTime;
@@ -4618,6 +4618,24 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       if (highlightTools && typeof highlightTools.dispose === 'function') {
         highlightTools.dispose();
       }
+
+      // Clean up smoke renderer
+      if (smokeRenderer && typeof smokeRenderer.dispose === 'function') {
+        smokeRenderer.dispose();
+      }
+
+      // Clean up viewer's own shader programs
+      if (lineInstancedProgram) gl.deleteProgram(lineInstancedProgram);
+      if (gridProgram) gl.deleteProgram(gridProgram);
+      if (centroidProgram) gl.deleteProgram(centroidProgram);
+
+      // Clean up viewer's own buffers
+      if (centroidPositionBuffer) gl.deleteBuffer(centroidPositionBuffer);
+      if (centroidColorBuffer) gl.deleteBuffer(centroidColorBuffer);
+      if (edgeQuadBuffer) gl.deleteBuffer(edgeQuadBuffer);
+
+      // Clean up edge texture
+      if (edgeTextureV2) gl.deleteTexture(edgeTextureV2);
 
       // Clear caches
       cachedViewMatrices.clear();

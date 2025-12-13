@@ -119,7 +119,17 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     userDataPath,
     userDataBrowseBtn,
     userDataFileInput,
-    userDataStatus
+    userDataStatus,
+    userDataInfoBtn,
+    userDataInfoTooltip,
+    // Remote server
+    remoteServerUrl,
+    remoteConnectBtn,
+    remoteServerStatus,
+    remoteStatusText,
+    remoteDisconnectBtn,
+    remoteInfoBtn,
+    remoteInfoTooltip
   } = dom;
 
   const rebuildSmokeDensity = smoke?.rebuildSmokeDensity || null;
@@ -5293,6 +5303,167 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     userDataBrowseBtn.addEventListener('click', () => {
       userDataFileInput.click();
     });
+  }
+
+  // User data info tooltip toggle
+  if (userDataInfoBtn && userDataInfoTooltip) {
+    userDataInfoBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const isVisible = userDataInfoTooltip.style.display !== 'none';
+      userDataInfoTooltip.style.display = isVisible ? 'none' : 'block';
+    });
+  }
+
+  // Remote server info tooltip toggle
+  if (remoteInfoBtn && remoteInfoTooltip) {
+    remoteInfoBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const isVisible = remoteInfoTooltip.style.display !== 'none';
+      remoteInfoTooltip.style.display = isVisible ? 'none' : 'block';
+    });
+  }
+
+  // Close all info tooltips when clicking outside
+  document.addEventListener('click', (e) => {
+    if (userDataInfoBtn && userDataInfoTooltip &&
+        !userDataInfoBtn.contains(e.target) && !userDataInfoTooltip.contains(e.target)) {
+      userDataInfoTooltip.style.display = 'none';
+    }
+    if (remoteInfoBtn && remoteInfoTooltip &&
+        !remoteInfoBtn.contains(e.target) && !remoteInfoTooltip.contains(e.target)) {
+      remoteInfoTooltip.style.display = 'none';
+    }
+  });
+
+  // Remote server connection handling
+  if (remoteConnectBtn && remoteServerUrl && dataSourceManager) {
+    const remoteSource = dataSourceManager.getSource('remote');
+
+    const updateRemoteStatus = (message, isError = false) => {
+      if (remoteStatusText) {
+        remoteStatusText.textContent = message;
+        remoteStatusText.style.color = isError ? 'var(--error-color, #ff5555)' : 'var(--success-color, #4caf50)';
+      }
+    };
+
+    const updateRemoteUI = (connected) => {
+      if (remoteConnectBtn) {
+        remoteConnectBtn.textContent = connected ? 'Reconnect' : 'Connect';
+      }
+      if (remoteDisconnectBtn) {
+        remoteDisconnectBtn.style.display = connected ? 'inline-block' : 'none';
+      }
+      if (remoteServerUrl) {
+        remoteServerUrl.disabled = connected;
+      }
+    };
+
+    remoteConnectBtn.addEventListener('click', async () => {
+      const url = remoteServerUrl?.value?.trim();
+      if (!url) {
+        updateRemoteStatus('Please enter a server URL', true);
+        return;
+      }
+
+      if (!remoteSource) {
+        updateRemoteStatus('Remote source not available', true);
+        return;
+      }
+
+      updateRemoteStatus('Connecting...');
+      remoteConnectBtn.disabled = true;
+
+      try {
+        await remoteSource.connect({ url });
+
+        if (remoteSource.isConnected()) {
+          updateRemoteStatus('Connected');
+          updateRemoteUI(true);
+
+          // List and load datasets
+          const datasets = await remoteSource.listDatasets();
+          if (datasets.length > 0) {
+            updateRemoteStatus(`Connected - ${datasets.length} dataset(s) found`);
+
+            // Switch to the first remote dataset
+            await dataSourceManager.switchToDataset('remote', datasets[0].id);
+
+            // Refresh the dataset dropdown
+            if (typeof populateDatasetDropdown === 'function') {
+              populateDatasetDropdown();
+            }
+
+            // Reload the dataset in-place
+            if (reloadDataset) {
+              await reloadDataset(datasets[0]);
+            }
+          } else {
+            updateRemoteStatus('Connected - no datasets found', true);
+          }
+        } else {
+          updateRemoteStatus('Connection failed', true);
+        }
+      } catch (err) {
+        updateRemoteStatus(`Error: ${err.message}`, true);
+        console.error('[UI] Remote connection error:', err);
+      } finally {
+        remoteConnectBtn.disabled = false;
+      }
+    });
+
+    if (remoteDisconnectBtn) {
+      remoteDisconnectBtn.addEventListener('click', async () => {
+        if (remoteSource) {
+          remoteSource.disconnect();
+          updateRemoteStatus('Disconnected');
+          updateRemoteUI(false);
+
+          // If we were using remote source, switch back to local-demo
+          const currentSource = dataSourceManager.getCurrentSourceType();
+          if (currentSource === 'remote') {
+            try {
+              const demoSource = dataSourceManager.getSource('local-demo');
+              if (demoSource) {
+                const defaultId = await demoSource.getDefaultDatasetId?.();
+                if (defaultId) {
+                  await dataSourceManager.switchToDataset('local-demo', defaultId);
+                  if (typeof populateDatasetDropdown === 'function') {
+                    populateDatasetDropdown();
+                  }
+                  if (reloadDataset) {
+                    const metadata = dataSourceManager.getCurrentMetadata();
+                    await reloadDataset(metadata);
+                  }
+                }
+              }
+            } catch (err) {
+              console.warn('[UI] Failed to switch back to local-demo after disconnect:', err);
+            }
+          }
+        }
+      });
+    }
+
+    // Handle connection loss
+    if (remoteSource) {
+      remoteSource.onConnectionLost(() => {
+        updateRemoteStatus('Connection lost', true);
+        updateRemoteUI(false);
+      });
+    }
+
+    // Auto-fill URL from query params if present
+    const urlParams = new URLSearchParams(window.location.search);
+    const remoteParam = urlParams.get('remote');
+    if (remoteParam && remoteServerUrl) {
+      remoteServerUrl.value = remoteParam;
+    }
+
+    // Update UI if already connected (e.g., from URL param)
+    if (remoteSource?.isConnected()) {
+      updateRemoteStatus('Connected');
+      updateRemoteUI(true);
+    }
   }
 
   return { activateField, refreshUiAfterStateLoad, showSessionStatus, refreshDatasetUI };

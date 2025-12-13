@@ -900,6 +900,74 @@ body.dock-dragging .accordion-section:not(.accordion-floating) {
   transform: none;
 }
 
+/* Info button (small circular "i" icon) */
+.info-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 12px;
+  font-family: "Oswald", system-ui, sans-serif;
+  font-size: 8px;
+  font-weight: 500;
+  line-height: 1;
+  padding-left: 0.5px;
+  padding-bottom: 1px;
+  border-radius: 50%;
+  border: 1px solid var(--viewer-ink-muted);
+  background: transparent;
+  color: var(--viewer-ink-muted);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  flex-shrink: 0;
+  text-transform: lowercase;
+}
+
+.info-btn:hover {
+  border-color: var(--viewer-ink-soft);
+  color: var(--viewer-ink-soft);
+}
+
+/* Info tooltip popup */
+.info-tooltip {
+  position: absolute;
+  z-index: 100;
+  margin-top: 2px;
+  background: var(--viewer-paper);
+  border: var(--viewer-border-strong);
+  box-shadow: var(--viewer-shadow);
+  width: calc(100% - 2px);
+  box-sizing: border-box;
+}
+
+.info-tooltip-content {
+  padding: 8px 10px;
+  font-size: 10px;
+  line-height: 1.45;
+  color: var(--viewer-ink-soft);
+}
+
+.info-tooltip-content .info-step {
+  margin-bottom: 4px;
+}
+
+.info-tooltip-content .info-step:last-child {
+  margin-bottom: 0;
+}
+
+.info-tooltip-content .info-cmd {
+  color: var(--viewer-ink-muted);
+}
+
+.info-tooltip-content .info-link {
+  color: var(--viewer-ink-soft);
+  text-decoration: none;
+}
+
+.info-tooltip-content .info-link:hover {
+  text-decoration: underline;
+}
+
 /* Toggle switch pressed state */
 .toggle-switch {
   min-width: 60px;

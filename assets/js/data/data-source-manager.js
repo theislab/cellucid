@@ -99,11 +99,15 @@ export class DataSourceManager {
     const demoSource = createLocalDemoDataSource();
     this.registerSource('local-demo', demoSource);
 
-    // Check if demo source is available and load default dataset
-    if (await demoSource.isAvailable()) {
-      const defaultId = await demoSource.getDefaultDatasetId();
-      if (defaultId) {
-        await this.switchToDataset('local-demo', defaultId, { silent: true });
+    // Only load default dataset if no dataset is already active
+    // (e.g., from a remote connection or URL parameter)
+    if (!this.hasActiveDataset()) {
+      // Check if demo source is available and load default dataset
+      if (await demoSource.isAvailable()) {
+        const defaultId = await demoSource.getDefaultDatasetId();
+        if (defaultId) {
+          await this.switchToDataset('local-demo', defaultId, { silent: true });
+        }
       }
     }
 
@@ -428,6 +432,8 @@ export class DataSourceManager {
    */
   static DEFAULT_PROTOCOL_HANDLERS = {
     'local-user://': 'local-user',
+    'remote://': 'remote',
+    'jupyter://': 'jupyter',
   };
 
   /**

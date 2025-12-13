@@ -41,7 +41,9 @@ uniform int u_alphaTexWidth;
 uniform float u_invAlphaTexWidth;
 uniform bool u_useAlphaTex;
 // For LOD: maps LOD vertex index to original point index for alpha lookup
-uniform sampler2D u_lodIndexTex;
+// Using usampler2D (unsigned int) for exact index representation up to 4 billion points
+// (sampler2D/float32 loses precision for indices > 16,777,216)
+uniform highp usampler2D u_lodIndexTex;
 uniform int u_lodIndexTexWidth;
 uniform float u_invLodIndexTexWidth;
 uniform bool u_useLodIndexTex;
@@ -62,14 +64,16 @@ void main() {
   if (u_useAlphaTex && u_alphaTexWidth > 0) {
     int origIdx;
     if (u_useLodIndexTex && u_lodIndexTexWidth > 0) {
-      // LOD mode: lookup original index from index texture
-      int iy = int(float(gl_VertexID) * u_invLodIndexTexWidth);
+      // LOD mode: lookup original index from index texture (R32UI format)
+      // Use integer division for indices >16M (float32 loses precision beyond 2^24)
+      int iy = gl_VertexID / u_lodIndexTexWidth;
       int ix = gl_VertexID - iy * u_lodIndexTexWidth;
       origIdx = int(texelFetch(u_lodIndexTex, ivec2(ix, iy), 0).r);
     } else {
       origIdx = gl_VertexID;
     }
-    int y = int(float(origIdx) * u_invAlphaTexWidth);
+    // Use integer division for indices >16M (float32 loses precision beyond 2^24)
+    int y = origIdx / u_alphaTexWidth;
     int x = origIdx - y * u_alphaTexWidth;
     alpha = texelFetch(u_alphaTex, ivec2(x, y), 0).r;
   } else {
@@ -170,7 +174,8 @@ uniform int u_alphaTexWidth;
 uniform float u_invAlphaTexWidth;
 uniform bool u_useAlphaTex;
 // For LOD: maps LOD vertex index to original point index for alpha lookup
-uniform sampler2D u_lodIndexTex;
+// Using usampler2D (unsigned int) for exact index representation up to 4 billion points
+uniform highp usampler2D u_lodIndexTex;
 uniform int u_lodIndexTexWidth;
 uniform float u_invLodIndexTexWidth;
 uniform bool u_useLodIndexTex;
@@ -189,14 +194,16 @@ void main() {
   if (u_useAlphaTex && u_alphaTexWidth > 0) {
     int origIdx;
     if (u_useLodIndexTex && u_lodIndexTexWidth > 0) {
-      // LOD mode: lookup original index from index texture
-      int iy = int(float(gl_VertexID) * u_invLodIndexTexWidth);
+      // LOD mode: lookup original index from index texture (R32UI format)
+      // Use integer division for indices >16M (float32 loses precision beyond 2^24)
+      int iy = gl_VertexID / u_lodIndexTexWidth;
       int ix = gl_VertexID - iy * u_lodIndexTexWidth;
       origIdx = int(texelFetch(u_lodIndexTex, ivec2(ix, iy), 0).r);
     } else {
       origIdx = gl_VertexID;
     }
-    int y = int(float(origIdx) * u_invAlphaTexWidth);
+    // Use integer division for indices >16M (float32 loses precision beyond 2^24)
+    int y = origIdx / u_alphaTexWidth;
     int x = origIdx - y * u_alphaTexWidth;
     alpha = texelFetch(u_alphaTex, ivec2(x, y), 0).r;
   } else {
@@ -279,7 +286,8 @@ uniform int u_alphaTexWidth;
 uniform float u_invAlphaTexWidth;
 uniform bool u_useAlphaTex;
 // For LOD: maps LOD vertex index to original point index for alpha lookup
-uniform sampler2D u_lodIndexTex;
+// Using usampler2D (unsigned int) for exact index representation up to 4 billion points
+uniform highp usampler2D u_lodIndexTex;
 uniform int u_lodIndexTexWidth;
 uniform float u_invLodIndexTexWidth;
 uniform bool u_useLodIndexTex;
@@ -300,14 +308,16 @@ void main() {
   if (u_useAlphaTex && u_alphaTexWidth > 0) {
     int origIdx;
     if (u_useLodIndexTex && u_lodIndexTexWidth > 0) {
-      // LOD mode: lookup original index from index texture
-      int iy = int(float(gl_VertexID) * u_invLodIndexTexWidth);
+      // LOD mode: lookup original index from index texture (R32UI format)
+      // Use integer division for indices >16M (float32 loses precision beyond 2^24)
+      int iy = gl_VertexID / u_lodIndexTexWidth;
       int ix = gl_VertexID - iy * u_lodIndexTexWidth;
       origIdx = int(texelFetch(u_lodIndexTex, ivec2(ix, iy), 0).r);
     } else {
       origIdx = gl_VertexID;
     }
-    int y = int(float(origIdx) * u_invAlphaTexWidth);
+    // Use integer division for indices >16M (float32 loses precision beyond 2^24)
+    int y = origIdx / u_alphaTexWidth;
     int x = origIdx - y * u_alphaTexWidth;
     alpha = texelFetch(u_alphaTex, ivec2(x, y), 0).r;
   } else {
@@ -392,32 +402,36 @@ void main() {
 /**
  * Vertex shader that fetches position/color from textures
  * Enables massive datasets with texture-based storage
+ * NOTE: Uses gl_VertexID instead of float attribute for indices >16M precision
  */
 export const HP_VS_TEXTURE = `#version 300 es
 precision highp float;
 
+// a_pointIndex kept for backwards compatibility but prefer gl_VertexID for >16M points
 layout(location = 0) in float a_pointIndex;
 
 uniform sampler2D u_positionTex;
 uniform sampler2D u_colorTex; // Now stores RGBA
 uniform int u_texWidth;
-uniform float u_invTexWidth;
 uniform mat4 u_mvpMatrix;
 uniform float u_pointSize;
+uniform bool u_useVertexID; // If true, use gl_VertexID instead of a_pointIndex
 
 out vec3 v_color;
 out float v_alpha;
 
-vec4 fetchFromTexture(sampler2D tex, int idx, int width, float invWidth) {
-  int y = int(float(idx) * invWidth);
+vec4 fetchFromTexture(sampler2D tex, int idx, int width) {
+  // Use integer division for indices >16M (float32 loses precision beyond 2^24)
+  int y = idx / width;
   int x = idx - y * width;
   return texelFetch(tex, ivec2(x, y), 0);
 }
 
 void main() {
-  int idx = int(a_pointIndex);
-  vec4 pos = fetchFromTexture(u_positionTex, idx, u_texWidth, u_invTexWidth);
-  vec4 col = fetchFromTexture(u_colorTex, idx, u_texWidth, u_invTexWidth);
+  // Prefer gl_VertexID for large datasets (>16M points) to avoid float precision loss
+  int idx = u_useVertexID ? gl_VertexID : int(a_pointIndex);
+  vec4 pos = fetchFromTexture(u_positionTex, idx, u_texWidth);
+  vec4 col = fetchFromTexture(u_colorTex, idx, u_texWidth);
 
   gl_Position = u_mvpMatrix * vec4(pos.xyz, 1.0);
   gl_PointSize = u_pointSize;

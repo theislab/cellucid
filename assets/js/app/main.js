@@ -19,6 +19,8 @@ import {
 import { createDimensionManager } from '../data/dimension-manager.js';
 import { getDataSourceManager } from '../data/data-source-manager.js';
 import { createLocalUserDirDataSource } from '../data/local-user-source.js';
+import { createRemoteDataSource } from '../data/remote-source.js';
+import { createJupyterBridgeDataSource, isJupyterContext, getJupyterConfig } from '../data/jupyter-source.js';
 import { SyntheticDataGenerator, PerformanceTracker, BenchmarkReporter, formatNumber } from '../dev/benchmark.js';
 
 console.log('=== SCATTERPLOT APP STARTING ===');
@@ -168,6 +170,16 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
   const userDataBrowseBtn = document.getElementById('user-data-browse-btn');
   const userDataFileInput = document.getElementById('user-data-file-input');
   const userDataStatus = document.getElementById('user-data-status');
+  const userDataInfoBtn = document.getElementById('user-data-info-btn');
+  const userDataInfoTooltip = document.getElementById('user-data-info-tooltip');
+  // Remote server connection elements
+  const remoteServerUrl = document.getElementById('remote-server-url');
+  const remoteConnectBtn = document.getElementById('remote-connect-btn');
+  const remoteServerStatus = document.getElementById('remote-server-status');
+  const remoteStatusText = document.getElementById('remote-status-text');
+  const remoteDisconnectBtn = document.getElementById('remote-disconnect-btn');
+  const remoteInfoBtn = document.getElementById('remote-info-btn');
+  const remoteInfoTooltip = document.getElementById('remote-info-tooltip');
   let ui = null;
 
   try {
@@ -184,27 +196,92 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     // Initialize DataSourceManager
     const dataSourceManager = getDataSourceManager();
 
+    // Parse URL parameters early (needed for remote/jupyter detection)
+    const urlParams = new URLSearchParams(window.location.search);
+
     // Always register user directory source (works in all browsers via file input fallback)
     const userSource = createLocalUserDirDataSource();
     dataSourceManager.registerSource('local-user', userSource);
+
+    // Register remote server source
+    const remoteSource = createRemoteDataSource();
+    dataSourceManager.registerSource('remote', remoteSource);
+
+    // Check if running in Jupyter context
+    let jupyterSource = null;
+    if (isJupyterContext()) {
+      console.log('[Main] Detected Jupyter context, initializing bridge...');
+      jupyterSource = createJupyterBridgeDataSource();
+      dataSourceManager.registerSource('jupyter', jupyterSource);
+
+      // Try to initialize Jupyter connection
+      const jupyterInitialized = await jupyterSource.initialize();
+      if (jupyterInitialized) {
+        console.log('[Main] Jupyter bridge initialized successfully');
+
+        // Auto-load first Jupyter dataset
+        try {
+          const jupyterDatasets = await jupyterSource.listDatasets();
+          if (jupyterDatasets.length > 0) {
+            await dataSourceManager.switchToDataset('jupyter', jupyterDatasets[0].id);
+            console.log(`[Main] Switched to Jupyter dataset: ${jupyterDatasets[0].id}`);
+          }
+        } catch (err) {
+          console.warn('[Main] Failed to load Jupyter datasets:', err.message);
+        }
+      }
+    }
+
+    // Check for remote server URL in query parameters
+    const remoteUrlParam = urlParams.get('remote');
+    if (remoteUrlParam) {
+      console.log(`[Main] Remote server URL from param: ${remoteUrlParam}`);
+      try {
+        await remoteSource.connect({ url: remoteUrlParam });
+        console.log('[Main] Connected to remote server');
+
+        // If connected successfully, try to use remote source as primary
+        if (remoteSource.isConnected()) {
+          const datasets = await remoteSource.listDatasets();
+          if (datasets.length > 0) {
+            // Switch to the first remote dataset
+            await dataSourceManager.switchToDataset('remote', datasets[0].id);
+            console.log(`[Main] Switched to remote dataset: ${datasets[0].id}`);
+          }
+        }
+      } catch (err) {
+        console.warn('[Main] Failed to connect to remote server:', err.message);
+      }
+    }
 
     // Initialize with default sources
     await dataSourceManager.initialize();
 
     // Check URL parameters for dataset selection
-    const urlParams = new URLSearchParams(window.location.search);
+    // Only process if we haven't already connected via remote/jupyter
     const requestedDataset = urlParams.get('dataset');
     const requestedSource = urlParams.get('source') || 'local-demo';
+    const currentSourceType = dataSourceManager.getCurrentSourceType();
+    const skipUrlDataset = currentSourceType === 'remote' || currentSourceType === 'jupyter';
 
-    if (requestedDataset && requestedSource === 'local-demo') {
-      // Try to switch to the requested dataset
+    if (requestedDataset && !skipUrlDataset) {
+      // Try to switch to the requested dataset from the requested source
       try {
-        const demoSource = dataSourceManager.getSource('local-demo');
-        if (demoSource && await demoSource.hasDataset(requestedDataset)) {
-          await dataSourceManager.switchToDataset('local-demo', requestedDataset);
-          console.log(`[Main] Loaded dataset from URL param: ${requestedDataset}`);
+        const targetSource = dataSourceManager.getSource(requestedSource);
+        if (targetSource) {
+          // Check if dataset exists (hasDataset is optional, so handle if not available)
+          const hasDataset = typeof targetSource.hasDataset === 'function'
+            ? await targetSource.hasDataset(requestedDataset)
+            : true; // Assume exists if hasDataset not available
+
+          if (hasDataset) {
+            await dataSourceManager.switchToDataset(requestedSource, requestedDataset);
+            console.log(`[Main] Loaded dataset from URL param: ${requestedSource}/${requestedDataset}`);
+          } else {
+            console.warn(`[Main] Requested dataset '${requestedDataset}' not found in '${requestedSource}'`);
+          }
         } else {
-          console.warn(`[Main] Requested dataset '${requestedDataset}' not found, using default`);
+          console.warn(`[Main] Requested source '${requestedSource}' not registered`);
         }
       } catch (err) {
         console.warn(`[Main] Failed to load requested dataset '${requestedDataset}':`, err);
@@ -584,7 +661,17 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         userDataPath,
         userDataBrowseBtn,
         userDataFileInput,
-        userDataStatus
+        userDataStatus,
+        userDataInfoBtn,
+        userDataInfoTooltip,
+        // Remote server
+        remoteServerUrl,
+        remoteConnectBtn,
+        remoteServerStatus,
+        remoteStatusText,
+        remoteDisconnectBtn,
+        remoteInfoBtn,
+        remoteInfoTooltip
       },
       smoke: {
         rebuildSmokeDensity
@@ -1457,11 +1544,16 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         if (hpLodForceContainer) {
           hpLodForceContainer.style.display = hpLodEnabled.checked ? 'block' : 'none';
         }
-        // Reset force LOD to auto when enabling
-        if (hpLodEnabled.checked && hpLodForce) {
+        // Reset force LOD slider to auto when enabling OR disabling LOD
+        // When disabling: ensures UI stays in sync with renderer (which resets forceLODLevel to -1)
+        // When enabling: starts fresh in auto mode
+        if (hpLodForce) {
           hpLodForce.value = '-1';
           if (hpLodForceLabel) hpLodForceLabel.textContent = 'Auto';
-          viewer.setForceLOD(-1);
+          // Only call setForceLOD when enabling (renderer already resets when disabling)
+          if (hpLodEnabled.checked) {
+            viewer.setForceLOD(-1);
+          }
         }
       });
     }

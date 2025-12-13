@@ -353,6 +353,16 @@ export class LocalUserDirDataSource {
   }
 
   /**
+   * Check if a specific dataset exists
+   * @param {string} datasetId - Dataset identifier
+   * @returns {Promise<boolean>}
+   */
+  async hasDataset(datasetId) {
+    // Local user source only supports one dataset at a time
+    return this.datasetId !== null && this.datasetId === datasetId;
+  }
+
+  /**
    * Get an object URL for a file (for use with fetch)
    * @param {string} filename - Filename
    * @returns {Promise<string>}

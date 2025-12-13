@@ -205,10 +205,16 @@
           </div>
 
           <!-- User directory selector -->
-          <div class="control-block" id="user-data-block" style="margin-top: 4px;">
-            <label>Load your data:</label>
-            <div class="legend-help">
-              Load a prepared local directory.
+          <div class="control-block" id="user-data-block" style="margin-top: 4px; position: relative;">
+            <label style="display: flex; align-items: center; gap: 4px;">
+              Local data:
+              <span id="user-data-info-btn" class="info-btn">i</span>
+            </label>
+            <div id="user-data-info-tooltip" class="info-tooltip" style="display: none;">
+              <div class="info-tooltip-content">
+                <div class="info-step">Prepare data: <span class="info-cmd">pip install cellucid</span></div>
+                <div class="info-step">Docs: <a href="https://cellucid.readthedocs.io" target="_blank" class="info-cmd">cellucid.readthedocs.io</a></div>
+              </div>
             </div>
             <label class="sr-only" for="user-data-path">Selected data path</label>
             <div class="user-data-row">
@@ -222,8 +228,32 @@
             <div id="user-data-status" class="legend-help" style="margin-top:4px;"></div>
           </div>
 
+          <!-- Remote server connection -->
+          <div class="control-block" id="remote-server-block" style="margin-top: -12px; position: relative;">
+            <label style="display: flex; align-items: center; gap: 4px;">
+              Remote server:
+              <span id="remote-info-btn" class="info-btn">i</span>
+            </label>
+            <div id="remote-info-tooltip" class="info-tooltip" style="display: none;">
+              <div class="info-tooltip-content">
+                <div class="info-step">1. On server: <span class="info-cmd">cellucid serve /path/to/data</span></div>
+                <div class="info-step">2. Local: <span class="info-cmd">ssh -L 8765:localhost:8765 user@server</span></div>
+                <div class="info-step">3. Connect to <span class="info-cmd">http://localhost:8765</span></div>
+              </div>
+            </div>
+            <div class="user-data-row">
+              <input type="text" id="remote-server-url" class="user-data-path"
+                     placeholder="http://localhost:8765" />
+              <button id="remote-connect-btn" class="reset-btn">Connect</button>
+            </div>
+            <div id="remote-server-status" class="legend-help" style="margin-top:4px;">
+              <span id="remote-status-text"></span>
+              <button id="remote-disconnect-btn" class="reset-btn" style="display:none; margin-left:8px; padding:2px 6px; font-size:11px;">Disconnect</button>
+            </div>
+          </div>
+
           <!-- Session state save/load -->
-          <div class="control-block" id="session-state-controls" style="margin-top: -10px;">
+          <div class="control-block" id="session-state-controls" style="margin-top: 0px;">
             <label>Session state:</label>
             <div class="legend-help">
               Save or load the application state including camera, filters, highlights, and settings.
@@ -546,12 +576,11 @@
 
           <!-- Dimension Level Selector -->
           <div id="dimension-controls" class="control-block dimension-controls" style="display:none;">
-            <label>Embedding:</label>
+            <label for="dimension-select">Dimension:</label>
             <div class="legend-help">
               Switch between embeddings for the current view.
             </div>
             <div class="control-block" style="margin-top:6px;">
-              <label for="dimension-select">Dimension:</label>
               <select id="dimension-select" class="obs-select">
                 <!-- Options are dynamically generated based on available dimensions -->
               </select>
@@ -743,7 +772,7 @@
       <details class="accordion-section" id="benchmark-section">
         <summary>Performance Benchmark</summary>
         <div class="accordion-content">
-          <div class="legend-help" style="margin-bottom:10px;">
+          <div class="legend-help" style="margin-bottom:0px;">
             Test rendering limits with synthetic data
           </div>
 

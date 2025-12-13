@@ -142,22 +142,36 @@ export class HighPerfBenchmark {
     if (this.renderer) {
       this.renderer.dispose();
     }
-    
-    this.renderer = new HighPerfRenderer(this.canvas, {
-      gl: options.gl,  // Allow passing existing GL context
+
+    // HighPerfRenderer expects a WebGL2 context as first argument
+    // Get context from options or create from canvas
+    const gl = options.gl || this.canvas.getContext('webgl2', {
+      antialias: false,
+      alpha: false,
+      depth: true,
+      stencil: false,
+      powerPreference: 'high-performance'
+    });
+
+    if (!gl) {
+      throw new Error('[HighPerfBenchmark] Failed to get WebGL2 context');
+    }
+
+    this.gl = gl;  // Store for reference
+
+    this.renderer = new HighPerfRenderer(gl, {
       USE_LOD: this.config.useLOD,
       USE_FRUSTUM_CULLING: this.config.useFrustumCulling,
       USE_INTERLEAVED_BUFFERS: this.config.useInterleavedBuffers
     });
-    
+
     this.renderer.setQuality(this.config.shaderQuality);
     this.isActive = true;
-    
+
     console.log('[HighPerfBenchmark] Renderer initialized:', {
-      isWebGL2: this.renderer.isWebGL2,
       quality: this.config.shaderQuality
     });
-    
+
     return this.renderer;
   }
   
@@ -175,8 +189,9 @@ export class HighPerfBenchmark {
     const dimLevel = dimensionLevel ?? this.config.dimensionLevel;
 
     // Alpha is packed in colors as RGBA uint8 - no separate array needed
+    // Build spatial index if either LOD or frustum culling is enabled
     const stats = this.renderer.loadData(positions, colors, {
-      buildSpatialIndex: this.config.useLOD,
+      buildSpatialIndex: this.config.useLOD || this.config.useFrustumCulling,
       dimensionLevel: dimLevel
     });
 
@@ -222,20 +237,59 @@ export class HighPerfBenchmark {
   }
   
   /**
+   * Get default render parameters for benchmarking.
+   * Uses identity matrices and sensible defaults for GPU activity measurement.
+   * @private
+   */
+  _getDefaultRenderParams() {
+    // Identity matrices for benchmarking (render all points without culling/transformation)
+    const identityMatrix = new Float32Array([
+      1, 0, 0, 0,
+      0, 1, 0, 0,
+      0, 0, 1, 0,
+      0, 0, 0, 1
+    ]);
+    return {
+      mvpMatrix: identityMatrix,
+      viewMatrix: identityMatrix,
+      modelMatrix: identityMatrix,
+      projectionMatrix: identityMatrix,
+      pointSize: 4.0,
+      sizeAttenuation: 0.0,
+      viewportWidth: this.canvas.width || 800,
+      viewportHeight: this.canvas.height || 600,
+      fov: Math.PI / 4,
+      fogDensity: 0.0,
+      fogNear: 0.0,
+      fogFar: 100.0,
+      fogColor: new Float32Array([0, 0, 0]),
+      bgColor: new Float32Array([0, 0, 0]),
+      lightDir: new Float32Array([0, 0, 1]),
+      lightingStrength: 0.0,
+      cameraPosition: [0, 0, 5],
+      cameraDistance: 5.0,
+      forceLOD: this.config.forceLODLevel,
+      quality: this.config.shaderQuality,
+      dimensionLevel: this.config.dimensionLevel
+    };
+  }
+
+  /**
    * Render a frame using the high-performance renderer
    */
   render(params) {
     if (!this.renderer || !this.isActive) {
       return null;
     }
-    
-    // Add force LOD level to params
+
+    // Merge provided params with defaults, then add force LOD and quality
     const renderParams = {
+      ...this._getDefaultRenderParams(),
       ...params,
       forceLOD: this.config.forceLODLevel,
       quality: this.config.shaderQuality
     };
-    
+
     return this.renderer.render(renderParams);
   }
   
@@ -414,9 +468,7 @@ export class HighPerfBenchmark {
         if (warmupCount < warmupFrames) {
           warmupCount++;
           // Force a render during warmup to stabilize GPU state
-          if (this.renderer) {
-            this.renderer.render({});
-          }
+          this.render();  // Uses default render params
           requestAnimationFrame(measure);
           return;
         }
@@ -484,9 +536,7 @@ export class HighPerfBenchmark {
         }
 
         // Force a render to get accurate frame timing
-        if (this.renderer) {
-          this.renderer.render({});
-        }
+        this.render();  // Uses default render params
 
         totalFrameAttempts++;
 
@@ -1058,14 +1108,12 @@ export class HighPerfBenchmark {
         // Warmup phase
         if (warmupCount < warmupFrames) {
           warmupCount++;
-          if (this.renderer) {
-            if (this.gpuTimer) {
-              const query = this.gpuTimer.begin('warmup');
-              this.renderer.render({});
-              this.gpuTimer.end(query);
-            } else {
-              this.renderer.render({});
-            }
+          if (this.gpuTimer) {
+            const query = this.gpuTimer.begin('warmup');
+            this.render();  // Uses default render params
+            this.gpuTimer.end(query);
+          } else {
+            this.render();  // Uses default render params
           }
           requestAnimationFrame(measure);
           return;
@@ -1092,14 +1140,12 @@ export class HighPerfBenchmark {
         }
 
         // Render with GPU timing
-        if (this.renderer) {
-          if (this.gpuTimer) {
-            const query = this.gpuTimer.begin('frame');
-            this.renderer.render({});
-            this.gpuTimer.end(query);
-          } else {
-            this.renderer.render({});
-          }
+        if (this.gpuTimer) {
+          const query = this.gpuTimer.begin('frame');
+          this.render();  // Uses default render params
+          this.gpuTimer.end(query);
+        } else {
+          this.render();  // Uses default render params
         }
 
         totalFrameAttempts++;

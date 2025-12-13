@@ -275,6 +275,32 @@ export class LocalDemoDataSource {
   isLegacyMode() {
     return this._isLegacyMode;
   }
+
+  /**
+   * Whether this source requires manual reconnection.
+   * Demo source uses standard HTTP URLs and doesn't need reconnection.
+   * @returns {boolean}
+   */
+  requiresManualReconnect() {
+    return false;
+  }
+
+  /**
+   * Resolve a URL (no-op for demo source as it uses standard HTTP URLs)
+   * @param {string} url - URL to resolve
+   * @returns {Promise<string>}
+   */
+  async resolveUrl(url) {
+    return url;
+  }
+
+  /**
+   * Called when this source is deactivated
+   * No cleanup needed for demo source
+   */
+  onDeactivate() {
+    // No cleanup needed for demo source
+  }
 }
 
 /**
