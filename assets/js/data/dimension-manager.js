@@ -199,8 +199,9 @@ class DimensionManager {
     let positions3D;
 
     if (dim === 3) {
-      // For 3D, use the raw positions directly (will be normalized below)
-      positions3D = rawPositions;
+      // For 3D, copy the raw positions (normalization modifies in-place, so we must not
+      // corrupt the raw cache which loadDimension() returns on subsequent calls)
+      positions3D = new Float32Array(rawPositions);
     } else if (dim === 1) {
       // 1D: X values only, Y and Z are zero
       positions3D = new Float32Array(nCells * 3);

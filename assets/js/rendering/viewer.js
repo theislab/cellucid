@@ -277,9 +277,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   const tempVec3 = vec3.create();
   const tempVec3b = vec3.create();
   const tempVec3c = vec3.create();
-  const tempVec3d = vec3.create();
-  const tempVec3e = vec3.create();
-  const tempVec3f = vec3.create();
+  const tempVec3d = vec3.create();  // Scratch for pan forward vector
+  const tempVec3e = vec3.create();  // Scratch for pan camRight vector
+  const tempVec3f = vec3.create();  // Scratch for pan camUp vector
   const lightDir = vec3.normalize(vec3.create(), [0.5, 0.7, 0.5]);
   // Preallocated scratch vectors for getFreeflyAxes() to avoid per-frame allocations
   const _freeflyForward = vec3.create();
@@ -288,6 +288,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   const _freeflyWorldUp = vec3.fromValues(0, 1, 0);
   // Preallocated scratch matrix for grid rendering to avoid per-frame mat4.clone()
   const _activeViewMatrixScratch = mat4.create();
+  // Preallocated scratch vectors for updateFreefly() to avoid per-frame allocations
+  const _freeflyMove = vec3.create();
+  const _freeflyTargetVel = vec3.create();
+  // Preallocated array for render loop view list to avoid per-frame array allocation
+  const _renderAllViews = [];
 
   let positionsArray = null;
   let colorsArray = null;
@@ -475,8 +480,16 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     return target.isContentEditable || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
   }
 
+  // === Event Listener Registry (for cleanup/dispose) ===
+  const eventCleanupFns = [];
+  function addEventListenerWithCleanup(target, event, handler, options) {
+    target.addEventListener(event, handler, options);
+    eventCleanupFns.push(() => target.removeEventListener(event, handler, options));
+  }
+
   // === Event Listeners ===
-  canvas.addEventListener('contextmenu', (e) => { e.preventDefault(); return false; });
+  const handleContextMenu = (e) => { e.preventDefault(); return false; };
+  addEventListenerWithCleanup(canvas, 'contextmenu', handleContextMenu);
 
   canvas.addEventListener('mousedown', (e) => {
     if (highlightTools && highlightTools.handleMouseDown(e)) {
@@ -581,7 +594,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     canvas.classList.add('dragging');
   });
 
-  window.addEventListener('mouseup', (e) => {
+  const handleMouseUp = (e) => {
     if (highlightTools && highlightTools.handleMouseUp(e)) {
       return;
     }
@@ -640,16 +653,17 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
           velocityTheta = -lastDx * rotateSpeed * 0.5 * xSign;
           velocityPhi = -lastDy * rotateSpeed * 0.5 * ySign;
         } else if (dragMode === 'pan') {
-          const forward = vec3.sub(vec3.create(), target, eye);
-          vec3.normalize(forward, forward);
-          const camRight = vec3.cross(vec3.create(), forward, up);
-          vec3.normalize(camRight, camRight);
-          const camUp = vec3.cross(vec3.create(), camRight, forward);
-          vec3.normalize(camUp, camUp);
+          // Use scratch vectors to avoid per-event allocations
+          vec3.sub(tempVec3d, target, eye);  // forward
+          vec3.normalize(tempVec3d, tempVec3d);
+          vec3.cross(tempVec3e, tempVec3d, up);  // camRight
+          vec3.normalize(tempVec3e, tempVec3e);
+          vec3.cross(tempVec3f, tempVec3e, tempVec3d);  // camUp
+          vec3.normalize(tempVec3f, tempVec3f);
           const panSpeed = radius * 0.002 * 0.5;
-          velocityPanX = -lastDx * panSpeed * camRight[0] + lastDy * panSpeed * camUp[0];
-          velocityPanY = -lastDx * panSpeed * camRight[1] + lastDy * panSpeed * camUp[1];
-          velocityPanZ = -lastDx * panSpeed * camRight[2] + lastDy * panSpeed * camUp[2];
+          velocityPanX = -lastDx * panSpeed * tempVec3e[0] + lastDy * panSpeed * tempVec3f[0];
+          velocityPanY = -lastDx * panSpeed * tempVec3e[1] + lastDy * panSpeed * tempVec3f[1];
+          velocityPanZ = -lastDx * panSpeed * tempVec3e[2] + lastDy * panSpeed * tempVec3f[2];
         }
       }
     }
@@ -661,9 +675,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     if (!camerasLocked) {
       setViewCameraState(focusedViewId, getCurrentCameraStateInternal());
     }
-  });
+  };
+  addEventListenerWithCleanup(window, 'mouseup', handleMouseUp);
 
-  window.addEventListener('mousemove', (e) => {
+  const handleMouseMove = (e) => {
     // Always track cursor position for aiming (when not in pointer lock)
     if (!pointerLockActive) {
       cursorX = e.clientX;
@@ -716,19 +731,21 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         target[0] += dx * panSpeed * invertX;
         target[1] += dy * panSpeed * invertY;
       } else {
-        const forward = vec3.sub(vec3.create(), target, eye);
-        vec3.normalize(forward, forward);
-        const camRight = vec3.cross(vec3.create(), forward, up);
-        vec3.normalize(camRight, camRight);
-        const camUp = vec3.cross(vec3.create(), camRight, forward);
-        vec3.normalize(camUp, camUp);
-        vec3.scaleAndAdd(target, target, camRight, -dx * panSpeed);
-        vec3.scaleAndAdd(target, target, camUp, dy * panSpeed);
+        // Use scratch vectors to avoid per-event allocations
+        vec3.sub(tempVec3d, target, eye);  // forward
+        vec3.normalize(tempVec3d, tempVec3d);
+        vec3.cross(tempVec3e, tempVec3d, up);  // camRight
+        vec3.normalize(tempVec3e, tempVec3e);
+        vec3.cross(tempVec3f, tempVec3e, tempVec3d);  // camUp
+        vec3.normalize(tempVec3f, tempVec3f);
+        vec3.scaleAndAdd(target, target, tempVec3e, -dx * panSpeed);
+        vec3.scaleAndAdd(target, target, tempVec3f, dy * panSpeed);
       }
     }
     lastX = e.clientX;
     lastY = e.clientY;
-  });
+  };
+  addEventListenerWithCleanup(window, 'mousemove', handleMouseMove);
 
   canvas.addEventListener('wheel', (e) => {
     e.preventDefault();
@@ -780,22 +797,27 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     }
   }
 
-  window.addEventListener('keydown', (e) => {
+  const handleAltKeyDown = (e) => {
+    if (isTypingTarget(e.target)) return;
     if (e.key === 'Alt') {
       highlightTools?.handleAltKeyDown?.();
     }
-  });
+  };
+  addEventListenerWithCleanup(window, 'keydown', handleAltKeyDown);
 
-  window.addEventListener('keyup', (e) => {
+  const handleAltKeyUp = (e) => {
+    if (isTypingTarget(e.target)) return;
     if (e.key === 'Alt') {
       highlightTools?.handleAltKeyUp?.();
     }
-  });
+  };
+  addEventListenerWithCleanup(window, 'keyup', handleAltKeyUp);
 
   // Also update when window loses focus (Alt might be released while window unfocused)
-  window.addEventListener('blur', () => {
+  const handleWindowBlur = () => {
     highlightTools?.handleWindowBlur?.();
-  });
+  };
+  addEventListenerWithCleanup(window, 'blur', handleWindowBlur);
 
   function handlePointerLockChange() {
     pointerLockActive = document.pointerLockElement === canvas;
@@ -831,16 +853,17 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     }
   }
 
-  document.addEventListener('pointerlockchange', handlePointerLockChange);
-  document.addEventListener('pointerlockerror', () => {
+  addEventListenerWithCleanup(document, 'pointerlockchange', handlePointerLockChange);
+  const handlePointerLockError = () => {
     pointerLockActive = false;
     pointerLockEnabled = false;
     if (typeof pointerLockChangeHandler === 'function') {
       pointerLockChangeHandler(false);
     }
-  });
+  };
+  addEventListenerWithCleanup(document, 'pointerlockerror', handlePointerLockError);
 
-  window.addEventListener('keydown', (e) => {
+  const handleNavigationKeyDown = (e) => {
     if (isTypingTarget(e.target)) return;
     const code = e.code;
     if (pointerLockActive && code === 'Escape') {
@@ -857,11 +880,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       }
     }
     activeKeys.add(code);
-  });
+  };
+  addEventListenerWithCleanup(window, 'keydown', handleNavigationKeyDown);
 
-  window.addEventListener('keyup', (e) => {
+  const handleKeyUp = (e) => {
     activeKeys.delete(e.code);
-  });
+  };
+  addEventListenerWithCleanup(window, 'keyup', handleKeyUp);
 
   // Touch events
   canvas.addEventListener('touchstart', (e) => {
@@ -1031,22 +1056,23 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
   function updateFreefly(dt) {
     const { forward, right, upVec } = getFreeflyAxes();
-    const move = vec3.create();
-    if (activeKeys.has('KeyW')) vec3.add(move, move, forward);
-    if (activeKeys.has('KeyS')) vec3.sub(move, move, forward);
-    if (activeKeys.has('KeyD')) vec3.add(move, move, right);
-    if (activeKeys.has('KeyA')) vec3.sub(move, move, right);
-    if (activeKeys.has('KeyE')) vec3.add(move, move, upVec);
-    if (activeKeys.has('KeyQ')) vec3.sub(move, move, upVec);
+    // Use scratch vector to avoid per-frame allocation
+    vec3.set(_freeflyMove, 0, 0, 0);
+    if (activeKeys.has('KeyW')) vec3.add(_freeflyMove, _freeflyMove, forward);
+    if (activeKeys.has('KeyS')) vec3.sub(_freeflyMove, _freeflyMove, forward);
+    if (activeKeys.has('KeyD')) vec3.add(_freeflyMove, _freeflyMove, right);
+    if (activeKeys.has('KeyA')) vec3.sub(_freeflyMove, _freeflyMove, right);
+    if (activeKeys.has('KeyE')) vec3.add(_freeflyMove, _freeflyMove, upVec);
+    if (activeKeys.has('KeyQ')) vec3.sub(_freeflyMove, _freeflyMove, upVec);
 
-    const hasInput = vec3.length(move) > 0.0001;
+    const hasInput = vec3.length(_freeflyMove) > 0.0001;
     if (hasInput) {
-      vec3.normalize(move, move);
+      vec3.normalize(_freeflyMove, _freeflyMove);
       const sprint = (activeKeys.has('ShiftLeft') || activeKeys.has('ShiftRight')) ? sprintMultiplier : 1;
-      const targetVel = vec3.create();
-      vec3.scale(targetVel, move, moveSpeed * sprint);
+      // Use scratch vector for target velocity
+      vec3.scale(_freeflyTargetVel, _freeflyMove, moveSpeed * sprint);
       const lerpAlpha = Math.min(1, dt * 10);
-      vec3.lerp(freeflyVelocity, freeflyVelocity, targetVel, lerpAlpha);
+      vec3.lerp(freeflyVelocity, freeflyVelocity, _freeflyTargetVel, lerpAlpha);
     } else {
       vec3.scale(freeflyVelocity, freeflyVelocity, Math.pow(INERTIA_FRICTION, dt * PHYSICS_TICK_RATE));
       if (vec3.length(freeflyVelocity) < INERTIA_MIN_VELOCITY) {
@@ -1224,13 +1250,26 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     }
 
     const existing = edgePositionTexturesV2.get(vid);
+    const newDims = calcTextureDims(nCells);
 
     // Delete existing texture if present
     if (existing?.texture) {
       gl.deleteTexture(existing.texture);
+      // Also delete associated visibility texture if dimensions changed
+      // (visibility texture size depends on position texture size)
+      const dimsChanged = !existing.dims ||
+        existing.dims[0] !== newDims[0] ||
+        existing.dims[1] !== newDims[1];
+      if (dimsChanged) {
+        const visEntry = edgeVisibilityTexturesV2.get(vid);
+        if (visEntry?.texture) {
+          gl.deleteTexture(visEntry.texture);
+          edgeVisibilityTexturesV2.delete(vid);
+        }
+      }
     }
 
-    const dims = calcTextureDims(nCells);
+    const dims = newDims;
     const [width, height] = dims;
     const texelCount = width * height;
 
@@ -1258,6 +1297,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     // Store with format tag for validation
     edgePositionTexturesV2.set(vid, { texture, dims, nCells, format: 'RGB32F' });
+
+    // Track cell count for debugging (use live view's count as the canonical value)
+    if (vid === LIVE_VIEW_ID) {
+      nCellsV2 = nCells;
+    }
+
     return true;
   }
 
@@ -1291,6 +1336,17 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     // Get or create visibility entry
     let visEntry = edgeVisibilityTexturesV2.get(vid);
+
+    // Check if existing visibility texture has mismatched dimensions (safety check)
+    // This can happen if position texture was recreated without cleaning up visibility
+    if (visEntry?.texture && visEntry.dims) {
+      const dimsMismatch = visEntry.dims[0] !== width || visEntry.dims[1] !== height;
+      if (dimsMismatch) {
+        gl.deleteTexture(visEntry.texture);
+        edgeVisibilityTexturesV2.delete(vid);
+        visEntry = null;
+      }
+    }
 
     // Reuse or create scratch buffer
     let scratchBuffer = visEntry?.scratchBuffer;
@@ -2486,11 +2542,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     }
 
     // Determine views to render (include centroid data for each view)
-    const allViews = [];
+    // Reuse preallocated array to avoid per-frame allocation
+    _renderAllViews.length = 0;
 
     // Add live view only if not hidden
     if (!liveViewHidden) {
-      allViews.push({
+      _renderAllViews.push({
         id: LIVE_VIEW_ID,
         label: liveViewLabel,
         colors: colorsArray,
@@ -2504,7 +2561,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     }
 
     for (const snap of snapshotViews) {
-      allViews.push({
+      _renderAllViews.push({
         id: snap.id,
         label: snap.label,
         colors: snap.colors,
@@ -2518,13 +2575,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     }
 
     // In single mode or only one view, render full screen
-    if (viewLayoutMode === 'single' || allViews.length <= 1) {
+    if (viewLayoutMode === 'single' || _renderAllViews.length <= 1) {
       gl.viewport(0, 0, width, height);
       gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
       // If we have exactly one view (e.g., live hidden with 1 snapshot), load its data
-      if (allViews.length === 1) {
-        const view = allViews[0];
+      if (_renderAllViews.length === 1) {
+        const view = _renderAllViews[0];
 
         // Check if this snapshot has a pre-uploaded GPU buffer
         // Same logic as grid mode to avoid inconsistent render paths
@@ -2560,7 +2617,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         }
 
         // Find the focused view (defaults to live view if not found)
-        const view = allViews.find(v => v.id === focusedViewId) || allViews[0];
+        const view = _renderAllViews.find(v => v.id === focusedViewId) || _renderAllViews[0];
 
         // Check if this snapshot has a pre-uploaded GPU buffer (same logic as grid mode)
         let hasSnapshotBuffer = view.id !== LIVE_VIEW_ID && hpRenderer.hasSnapshotBuffer(view.id);
@@ -2590,13 +2647,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     gl.viewport(0, 0, width, height);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-    const viewCount = allViews.length;
+    const viewCount = _renderAllViews.length;
     // Layout: 1=1x1, 2=2x1, 3=3x1, 4=2x2, 5+=grid
     const cols = viewCount <= 3 ? viewCount : Math.ceil(Math.sqrt(viewCount));
     const rows = Math.ceil(viewCount / cols);
 
     // Update view title chips
-    updateViewTitles(allViews, cols, rows);
+    updateViewTitles(_renderAllViews, cols, rows);
     showViewTitles();
 
     // Pre-compute viewport dimensions (same for all cells in uniform grid)
@@ -2622,7 +2679,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     // the correct mvpMatrix and cameraDistance for that view's camera
 
     for (let i = 0; i < viewCount; i++) {
-        const view = allViews[i];
+        const view = _renderAllViews[i];
         const col = i % cols;
         const row = Math.floor(i / cols);
         const vx = col * vw;
@@ -2730,10 +2787,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     // Render params shared by both render paths
     // Get dimension level for this view (used for LOD and frustum culling calculations)
     const dimLevel = viewDimensionLevels.get(vid) ?? 3;
-    // Camera distance calculation: in freefly mode, compute from position; otherwise use orbit radius
-    const camDist = navigationMode === 'free'
-      ? vec3.length(freeflyPosition)
-      : radius;
+    // Camera distance calculation: use per-view cached distance when available (for multiview support)
+    // For focused view or locked cameras, global state is authoritative; otherwise use cached per-view value
+    let camDist;
+    const isActiveView = vid === focusedViewId;
+    if (isActiveView || camerasLocked) {
+      // Active view: use global state (most up-to-date during interaction)
+      camDist = navigationMode === 'free' ? vec3.length(freeflyPosition) : radius;
+    } else {
+      // Non-active view: use cached camera distance from view's camera state
+      const cached = cachedViewMatrices.get(vid);
+      camDist = cached?.cameraDistance ?? radius;
+    }
     const renderParams = {
       mvpMatrix,
       viewMatrix,
@@ -3181,11 +3246,20 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     }
     let cached = cachedViewMatrices.get(vid);
     if (!cached) {
-      cached = { viewMatrix: mat4.create(), radius: 0 };
+      cached = { viewMatrix: mat4.create(), radius: 0, cameraDistance: 0 };
       cachedViewMatrices.set(vid, cached);
     }
     computeViewMatrixFromState(camState, cached.viewMatrix);
     cached.radius = camState.orbit?.radius ?? radius;
+    // Cache camera distance based on view's navigation mode (for LOD/fog calculations)
+    if (camState.navigationMode === 'free' && camState.freefly?.position) {
+      // Freefly mode: distance is length of position vector
+      const pos = camState.freefly.position;
+      cached.cameraDistance = Math.sqrt(pos[0] * pos[0] + pos[1] * pos[1] + pos[2] * pos[2]);
+    } else {
+      // Orbit mode: distance is the orbit radius
+      cached.cameraDistance = cached.radius;
+    }
   }
 
   // Invalidate all cached matrices (call when switching lock modes)
@@ -4466,7 +4540,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         fogColor: new Float32Array(fogColor),
         bgColor: new Float32Array(bgColor),
         lightDir: new Float32Array(lightDir),
-        cameraPosition: [invView[12], invView[13], invView[14]],
+        cameraPosition: [tempInvViewMatrix[12], tempInvViewMatrix[13], tempInvViewMatrix[14]],
         cameraDistance
       };
     },
@@ -4502,6 +4576,53 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     start() {
       if (!animationHandle) animationHandle = requestAnimationFrame(render);
+    },
+
+    /**
+     * Clean up all resources (event listeners, observers, WebGL resources).
+     * Call this before recreating the viewer or when unmounting.
+     */
+    dispose() {
+      // Stop animation loop
+      if (animationHandle) {
+        cancelAnimationFrame(animationHandle);
+        animationHandle = null;
+      }
+
+      // Remove all registered event listeners
+      for (const cleanup of eventCleanupFns) {
+        cleanup();
+      }
+      eventCleanupFns.length = 0;
+
+      // Disconnect resize observer
+      canvasResizeObserver.disconnect();
+
+      // Clean up WebGL resources
+      for (const [, entry] of edgePositionTexturesV2) {
+        if (entry.texture) gl.deleteTexture(entry.texture);
+      }
+      edgePositionTexturesV2.clear();
+
+      for (const [, entry] of edgeVisibilityTexturesV2) {
+        if (entry.texture) gl.deleteTexture(entry.texture);
+      }
+      edgeVisibilityTexturesV2.clear();
+
+      // Clean up HP renderer
+      if (hpRenderer && typeof hpRenderer.dispose === 'function') {
+        hpRenderer.dispose();
+      }
+
+      // Clean up highlight tools
+      if (highlightTools && typeof highlightTools.dispose === 'function') {
+        highlightTools.dispose();
+      }
+
+      // Clear caches
+      cachedViewMatrices.clear();
+      viewDimensionLevels.clear();
+      viewPositionsCache.clear();
     }
   };
 }

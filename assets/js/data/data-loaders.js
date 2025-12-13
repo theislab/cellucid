@@ -19,36 +19,10 @@ async function resolveAnyUrl(url) {
   return getDataSourceManager().resolveUrl(url);
 }
 
-/**
- * Fetch binary data with automatic custom protocol handling and gzip decompression
- * @param {string} url - URL to fetch (may use custom protocol)
- * @returns {Promise<ArrayBuffer>}
- */
-async function fetchBinaryWithProtocol(url) {
-  const resolvedUrl = await resolveAnyUrl(url);
-  const response = await fetch(resolvedUrl);
-
-  if (!response.ok) {
-    throw new Error(`Failed to load: ${url}`);
-  }
-
-  const isGzipped = url.endsWith('.gz');
-
-  if (isGzipped && typeof DecompressionStream !== 'undefined') {
-    const ds = new DecompressionStream('gzip');
-    const decompressedStream = response.body.pipeThrough(ds);
-    const decompressedResponse = new Response(decompressedStream);
-    return decompressedResponse.arrayBuffer();
-  } else if (isGzipped && typeof pako !== 'undefined') {
-    const compressedBuffer = await response.arrayBuffer();
-    const decompressed = pako.inflate(new Uint8Array(compressedBuffer));
-    return decompressed.buffer;
-  } else if (isGzipped) {
-    throw new Error('Gzip decompression not supported. Use a modern browser or include pako library.');
-  }
-
-  return response.arrayBuffer();
-}
+// fetchBinaryWithProtocol is now an alias for fetchBinary (defined below)
+// Both handle custom protocols via resolveAnyUrl and gzip decompression
+// This avoids duplicate implementations that could diverge
+let fetchBinaryWithProtocol;
 
 /**
  * Fetch JSON with automatic custom protocol handling
@@ -181,7 +155,8 @@ async function fetchBinary(url) {
     const compressedBuffer = await response.arrayBuffer();
     if (typeof pako !== 'undefined') {
       const decompressed = pako.inflate(new Uint8Array(compressedBuffer));
-      return decompressed.buffer;
+      // Safety: slice the buffer in case pako returns a view with non-zero byteOffset
+      return decompressed.buffer.slice(decompressed.byteOffset, decompressed.byteOffset + decompressed.byteLength);
     } else {
       console.error('Gzip decompression not supported: DecompressionStream unavailable and pako not loaded');
       console.error('Either use a modern browser or include pako library, or regenerate data without compression');
@@ -192,6 +167,9 @@ async function fetchBinary(url) {
   // Not gzipped, return as-is
   return response.arrayBuffer();
 }
+
+// Assign the alias now that fetchBinary is defined
+fetchBinaryWithProtocol = fetchBinary;
 
 /**
  * Load points binary, trying .gz version first if the URL doesn't already end in .gz
@@ -251,7 +229,8 @@ export async function loadPointsBinary(url) {
       } else if (HAS_PAKO) {
         const compressedBuffer = await response.arrayBuffer();
         const decompressed = pako.inflate(new Uint8Array(compressedBuffer));
-        return new Float32Array(decompressed.buffer);
+        // Safety: use byteOffset and byteLength in case pako returns a view into a larger buffer
+        return new Float32Array(decompressed.buffer, decompressed.byteOffset, decompressed.byteLength / 4);
       } else {
         console.warn('DecompressionStream not available and pako not loaded, trying uncompressed file');
       }

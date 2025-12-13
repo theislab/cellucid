@@ -35,6 +35,13 @@ const DEPTH_TEST_DIMENSION_THRESHOLD = 2;
  */
 const LOD_PENDING_REUPLOAD = -999;
 
+/**
+ * Debug flag for LOD and frustum culling logs.
+ * Set to true to enable verbose console output during rendering.
+ * This should be false in production to avoid performance impact.
+ */
+let DEBUG_LOD_FRUSTUM = false;
+
 // ============================================================================
 // SPATIAL INDEX FOR LOD AND FRUSTUM CULLING (1D/2D/3D)
 // ============================================================================
@@ -2604,7 +2611,7 @@ export class HighPerfRenderer {
       const lodBuf = lodBuffersForDim[lodLevel];
       const pointCount = lodBuf ? lodBuf.pointCount : this.pointCount;
       const mode = this.forceLODLevel >= 0 ? 'forced' : 'auto';
-      console.log(`[LOD] View ${viewId}: level ${viewState.prevLodLevel ?? 'init'} → ${lodLevel} (${pointCount.toLocaleString()} pts, ${mode})`);
+      if (DEBUG_LOD_FRUSTUM) console.log(`[LOD] View ${viewId}: level ${viewState.prevLodLevel ?? 'init'} → ${lodLevel} (${pointCount.toLocaleString()} pts, ${mode})`);
       viewState.prevLodLevel = lodLevel;
     }
 
@@ -2766,7 +2773,7 @@ export class HighPerfRenderer {
       }
 
       // Log only on significant change (>10% of total points)
-      if (this._isSignificantChange(viewState.lastVisibleCount, visibleCount, this.pointCount)) {
+      if (DEBUG_LOD_FRUSTUM && this._isSignificantChange(viewState.lastVisibleCount, visibleCount, this.pointCount)) {
         console.log(`[FrustumCulling] View ${viewId}: ${visibleCount.toLocaleString()}/${this.pointCount.toLocaleString()} visible (${cullPercent.toFixed(1)}% culled)`);
         viewState.lastVisibleCount = visibleCount;
       }
@@ -3329,6 +3336,17 @@ export class HighPerfRenderer {
     }
 
     // Step 2: Rebuild LOD indices when frustum OR LOD level changes
+    // PERFORMANCE NOTE: This block is the main source of lag when zooming with LOD+Frustum enabled.
+    // Unlike LOD-only (which uses gl.drawArrays with pre-built VAOs) or Frustum-only (which only
+    // updates when camera moves), LOD+Frustum must rebuild index buffers on EVERY LOD level change.
+    // Pre-caching is NOT possible here because:
+    //   - Pre-cached originalIndexBuffer contains ALL LOD indices for a level
+    //   - Frustum culling requires only the SUBSET visible in current frustum
+    //   - This subset is view-dependent (each view has different frustum) and LOD-dependent
+    //   - When LOD changes during zoom, we must: iterate visible nodes → collect lodIndices[newLevel]
+    //     → upload via gl.bufferData() (synchronous GPU stall)
+    // With N views, this happens N times per LOD transition. The >98% visibility early-exit helps
+    // by falling back to gl.drawArrays when most points are visible.
     if (frustumChanged || lodLevelChanged) {
       const visibleNodes = viewState.cachedVisibleNodes;
 
@@ -3397,7 +3415,7 @@ export class HighPerfRenderer {
       const visibleLodIndices = viewState.visibleLodIndicesBuffer.subarray(0, visibleCount);
 
       // Log only on significant change (>10% of total points)
-      if (this._isSignificantChange(viewState.lastVisibleCount, visibleCount, totalLodPoints)) {
+      if (DEBUG_LOD_FRUSTUM && this._isSignificantChange(viewState.lastVisibleCount, visibleCount, totalLodPoints)) {
         console.log(`[LOD+Frustum] View ${viewId}: LOD ${lodLevel} - ${visibleCount.toLocaleString()}/${totalLodPoints.toLocaleString()} visible (${cullPercent.toFixed(1)}% culled)`);
         viewState.lastVisibleCount = visibleCount;
       }
@@ -4809,7 +4827,7 @@ export class HighPerfRenderer {
     if (viewState.prevLodLevel !== lodLevel && lodSpatialIndex && (this.useAdaptiveLOD || this.forceLODLevel >= 0)) {
       const pointCount = lodSpatialIndex.lodLevels[lodLevel]?.pointCount || this.pointCount;
       const mode = this.forceLODLevel >= 0 ? 'forced' : 'auto';
-      console.log(`[LOD] Snapshot ${viewId}: level ${viewState.prevLodLevel ?? 'init'} → ${lodLevel} (${pointCount.toLocaleString()} pts, ${mode}, dim=${effectiveDimLevel})`);
+      if (DEBUG_LOD_FRUSTUM) console.log(`[LOD] Snapshot ${viewId}: level ${viewState.prevLodLevel ?? 'init'} → ${lodLevel} (${pointCount.toLocaleString()} pts, ${mode}, dim=${effectiveDimLevel})`);
       viewState.prevLodLevel = lodLevel;
     }
 
@@ -5057,7 +5075,7 @@ export class HighPerfRenderer {
       }
 
       // Log only on significant change (>10% of total points)
-      if (this._isSignificantChange(viewState.lastVisibleCount, visibleIndices.length, snapshot.pointCount)) {
+      if (DEBUG_LOD_FRUSTUM && this._isSignificantChange(viewState.lastVisibleCount, visibleIndices.length, snapshot.pointCount)) {
         console.log(`[FrustumCulling] Snapshot ${viewId}: ${visibleIndices.length.toLocaleString()}/${snapshot.pointCount.toLocaleString()} visible (${cullPercent.toFixed(1)}% culled)`);
         viewState.lastVisibleCount = visibleIndices.length;
       }
@@ -5511,7 +5529,7 @@ export class HighPerfRenderer {
       const visibleLodIndicesView = visibleLodIndices.subarray(0, visibleCount);
 
       // Log only on significant change (>10% of total points)
-      if (this._isSignificantChange(viewState.lastVisibleCount, visibleCount, totalLodPoints)) {
+      if (DEBUG_LOD_FRUSTUM && this._isSignificantChange(viewState.lastVisibleCount, visibleCount, totalLodPoints)) {
         console.log(`[LOD+Frustum] Snapshot ${viewId}: LOD ${lodLevel} - ${visibleCount.toLocaleString()}/${totalLodPoints.toLocaleString()} visible (${cullPercent.toFixed(1)}% culled)`);
         viewState.lastVisibleCount = visibleCount;
       }
