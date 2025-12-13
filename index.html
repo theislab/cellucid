@@ -93,14 +93,7 @@
   <meta name="msapplication-TileColor" content="#111827" />
   <meta name="theme-color" content="#ffffff" />
 
-  <!-- Newspaper-style font stack (no behavior change, just design) -->
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link
-    href="https://fonts.googleapis.com/css2?family=Merriweather:wght@300;400;700&family=Oswald:wght@400;500;600&family=Inter:wght@400;500;600&family=Fira+Code:wght@400;500&display=swap"
-    rel="stylesheet"
-  >
-
+  <!-- Fonts are now self-hosted in assets/fonts/ for better performance -->
   <link rel="stylesheet" href="assets/css/style.css" />
 </head>
 <body>
@@ -891,8 +884,8 @@
   <!-- Titles for small multiple viewports -->
   <div id="view-title-layer"></div>
 
-  <!-- glMatrix for matrix math -->
-  <script src="https://cdn.jsdelivr.net/npm/gl-matrix@3.4.3/gl-matrix-min.js"></script>
+  <!-- glMatrix for matrix math (self-hosted) -->
+  <script src="assets/external/gl-matrix-min.js"></script>
   <script type="module" src="assets/js/app/main.js"></script>
 </body>
 </html>

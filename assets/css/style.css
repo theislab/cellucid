@@ -1,4 +1,35 @@
 /* ========================================================================
+   Self-hosted fonts (latin only, ~103 KB total)
+   ===================================================================== */
+
+/* Inter - Variable font for body text */
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('../fonts/inter-latin.woff2') format('woff2');
+}
+
+/* Oswald - Variable font for headlines/labels */
+@font-face {
+  font-family: 'Oswald';
+  font-style: normal;
+  font-weight: 200 700;
+  font-display: swap;
+  src: url('../fonts/oswald-latin.woff2') format('woff2');
+}
+
+/* Fira Code - Variable font for monospace/code */
+@font-face {
+  font-family: 'Fira Code';
+  font-style: normal;
+  font-weight: 300 700;
+  font-display: swap;
+  src: url('../fonts/firacode-latin.woff2') format('woff2');
+}
+
+/* ========================================================================
    Global layout & base styles
    ===================================================================== */
 
@@ -1256,7 +1287,7 @@ body.dock-dragging .accordion-section:not(.accordion-floating) {
 #filter-count,
 #highlight-count {
   font-size: 11px;
-  font-family: "Merriweather", Georgia, "Times New Roman", serif;
+  font-family: Georgia, "Times New Roman", serif;
   margin-bottom: 6px;
   color: #666666;
 }
