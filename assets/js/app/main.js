@@ -167,6 +167,10 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
   const userDataPath = document.getElementById('user-data-path');
   const userDataBrowseBtn = document.getElementById('user-data-browse-btn');
   const userDataFileInput = document.getElementById('user-data-file-input');
+  const userDataH5adBtn = document.getElementById('user-data-h5ad-btn');
+  const userDataH5adInput = document.getElementById('user-data-h5ad-input');
+  const userDataZarrBtn = document.getElementById('user-data-zarr-btn');
+  const userDataZarrInput = document.getElementById('user-data-zarr-input');
   const userDataInfoBtn = document.getElementById('user-data-info-btn');
   const userDataInfoTooltip = document.getElementById('user-data-info-tooltip');
   // Remote server connection elements
@@ -175,6 +179,12 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
   const remoteDisconnectBtn = document.getElementById('remote-disconnect-btn');
   const remoteInfoBtn = document.getElementById('remote-info-btn');
   const remoteInfoTooltip = document.getElementById('remote-info-tooltip');
+  // GitHub repository elements
+  const githubRepoUrl = document.getElementById('github-repo-url');
+  const githubConnectBtn = document.getElementById('github-connect-btn');
+  const githubDisconnectBtn = document.getElementById('github-disconnect-btn');
+  const githubInfoBtn = document.getElementById('github-info-btn');
+  const githubInfoTooltip = document.getElementById('github-info-tooltip');
   let ui = null;
 
   try {
@@ -231,11 +241,23 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
     // Check for remote server URL in query parameters
     const remoteUrlParam = urlParams.get('remote');
+    const isAnndataMode = urlParams.get('anndata') === 'true';
+
     if (remoteUrlParam) {
       console.log(`[Main] Remote server URL from param: ${remoteUrlParam}`);
       try {
         await remoteSource.connect({ url: remoteUrlParam });
         console.log('[Main] Connected to remote server');
+
+        // Show AnnData warning if loading directly from AnnData
+        if (isAnndataMode) {
+          console.log('[Main] AnnData mode detected - loading directly from AnnData');
+          notifications.warning(
+            'Loading data directly from AnnData. This may be slower than using pre-exported data. ' +
+            'For better performance, use prepare() to create optimized binary files.',
+            { duration: 12000 } // 12 seconds to give users time to read
+          );
+        }
 
         // If connected successfully, try to use remote source as primary
         if (remoteSource.isConnected()) {
@@ -649,6 +671,10 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         userDataPath,
         userDataBrowseBtn,
         userDataFileInput,
+        userDataH5adBtn,
+        userDataH5adInput,
+        userDataZarrBtn,
+        userDataZarrInput,
         userDataInfoBtn,
         userDataInfoTooltip,
         // Remote server
@@ -656,7 +682,13 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         remoteConnectBtn,
         remoteDisconnectBtn,
         remoteInfoBtn,
-        remoteInfoTooltip
+        remoteInfoTooltip,
+        // GitHub repository
+        githubRepoUrl,
+        githubConnectBtn,
+        githubDisconnectBtn,
+        githubInfoBtn,
+        githubInfoTooltip
       },
       smoke: {
         rebuildSmokeDensity

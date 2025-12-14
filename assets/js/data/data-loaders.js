@@ -6,8 +6,62 @@
 import { getDataSourceManager } from './data-source-manager.js';
 import { isLocalUserUrl, resolveUrl } from './data-source.js';
 import { getNotificationCenter } from '../app/notification-center.js';
+import {
+  isH5adActive,
+  isH5adUrl,
+  h5adLoadPoints,
+  h5adGetObsManifest,
+  h5adGetVarManifest,
+  h5adLoadObsField,
+  h5adLoadGeneExpression,
+  h5adLoadConnectivity,
+  h5adGetConnectivityManifest,
+  h5adGetDatasetIdentity,
+} from './h5ad-data-provider.js';
+import {
+  isZarrActive,
+  isZarrUrl,
+  zarrLoadPoints,
+  zarrGetObsManifest,
+  zarrGetVarManifest,
+  zarrLoadObsField,
+  zarrLoadGeneExpression,
+  zarrLoadConnectivity,
+  zarrGetConnectivityManifest,
+  zarrGetDatasetIdentity,
+} from './zarr-data-provider.js';
 // Note: remote:// and jupyter:// protocols are handled by DataSourceManager.resolveUrl()
 // via the registered protocol handlers - no explicit imports needed here.
+
+/**
+ * Check if we should use h5ad data loading for this URL.
+ * Returns true if the h5ad data source is active OR the URL uses h5ad:// protocol.
+ * @param {string} url - URL to check
+ * @returns {boolean}
+ */
+function shouldUseH5ad(url) {
+  // Check if h5ad source is active (either directly or via local-user)
+  if (isH5adActive()) {
+    return true;
+  }
+  // Also check if URL uses h5ad:// protocol
+  return isH5adUrl(url);
+}
+
+/**
+ * Check if we should use zarr data loading for this URL.
+ * Returns true if the zarr data source is active OR the URL uses zarr:// protocol.
+ * @param {string} url - URL to check
+ * @returns {boolean}
+ */
+function shouldUseZarr(url) {
+  // Check if zarr source is active (either directly or via local-user)
+  if (isZarrActive()) {
+    return true;
+  }
+  // Also check if URL uses zarr:// protocol
+  return isZarrUrl(url);
+}
 
 // ============================================================================
 // UNIFIED URL RESOLUTION (delegates to DataSourceManager)
@@ -309,10 +363,54 @@ async function fetchBinaryWithProgress(url, displayName = null, showNotification
  * @param {string} options.displayName - Display name for notification
  */
 export async function loadPointsBinary(url, options = {}) {
-  const { showProgress = false, displayName = null } = options;
+  const { showProgress = false, displayName = null, dimension = 3 } = options;
   const notifications = getNotificationCenter();
   const name = displayName || 'Cell positions';
   let trackerId = null;
+
+  // Check if h5ad source is active - use direct loading
+  if (shouldUseH5ad(url)) {
+    if (showProgress) {
+      trackerId = notifications.startDownload(name);
+    }
+    try {
+      // Extract dimension from URL if not provided (e.g., points_3d.bin -> 3)
+      let dim = dimension;
+      const dimMatch = url.match(/points_(\d)d\.bin/);
+      if (dimMatch) {
+        dim = parseInt(dimMatch[1], 10);
+      }
+
+      const result = await h5adLoadPoints(dim);
+      if (trackerId) notifications.completeDownload(trackerId);
+      return result;
+    } catch (err) {
+      if (trackerId) notifications.failDownload(trackerId, err.message);
+      throw err;
+    }
+  }
+
+  // Check if zarr source is active - use direct loading
+  if (shouldUseZarr(url)) {
+    if (showProgress) {
+      trackerId = notifications.startDownload(name);
+    }
+    try {
+      // Extract dimension from URL if not provided (e.g., points_3d.bin -> 3)
+      let dim = dimension;
+      const dimMatch = url.match(/points_(\d)d\.bin/);
+      if (dimMatch) {
+        dim = parseInt(dimMatch[1], 10);
+      }
+
+      const result = await zarrLoadPoints(dim);
+      if (trackerId) notifications.completeDownload(trackerId);
+      return result;
+    } catch (err) {
+      if (trackerId) notifications.failDownload(trackerId, err.message);
+      throw err;
+    }
+  }
 
   if (showProgress) {
     trackerId = notifications.startDownload(name);
@@ -683,6 +781,18 @@ export function expandObsManifest(manifest) {
 }
 
 export async function loadObsManifest(url) {
+  // Handle h5ad source
+  if (shouldUseH5ad(url)) {
+    const manifest = h5adGetObsManifest();
+    return expandObsManifest(manifest);
+  }
+
+  // Handle zarr source
+  if (shouldUseZarr(url)) {
+    const manifest = zarrGetObsManifest();
+    return expandObsManifest(manifest);
+  }
+
   // Handle local-user:// URLs
   if (isLocalUserUrl(url)) {
     const manifest = await fetchLocalUserJson(url);
@@ -705,6 +815,70 @@ export async function loadObsManifest(url) {
  */
 export async function loadObsFieldData(manifestUrl, field) {
   if (!field) throw new Error('No field metadata provided for obs field fetch.');
+
+  // Handle h5ad source
+  if (shouldUseH5ad(manifestUrl)) {
+    const h5adData = await h5adLoadObsField(field.key);
+    const outputs = { loaded: true };
+
+    if (h5adData.kind === 'continuous') {
+      outputs.values = new Float32Array(h5adData.data);
+    } else {
+      // Categorical
+      const dtype = h5adData.dtype === 'uint8' ? Uint8Array : Uint16Array;
+      const raw = new dtype(h5adData.data);
+
+      // Convert uint8 to uint16 for consistency
+      if (h5adData.dtype === 'uint8') {
+        const u16 = new Uint16Array(raw.length);
+        const missingU8 = 255;
+        const missingU16 = h5adData.missingValue || 65535;
+        for (let i = 0; i < raw.length; i++) {
+          u16[i] = raw[i] === missingU8 ? missingU16 : raw[i];
+        }
+        outputs.codes = u16;
+      } else {
+        outputs.codes = raw;
+      }
+
+      // No outlier quantiles from h5ad (would need latent space computation)
+      outputs.outlierQuantiles = new Float32Array(raw.length);
+    }
+
+    return outputs;
+  }
+
+  // Handle zarr source
+  if (shouldUseZarr(manifestUrl)) {
+    const zarrData = await zarrLoadObsField(field.key);
+    const outputs = { loaded: true };
+
+    if (zarrData.kind === 'continuous') {
+      outputs.values = new Float32Array(zarrData.data);
+    } else {
+      // Categorical
+      const dtype = zarrData.dtype === 'uint8' ? Uint8Array : Uint16Array;
+      const raw = new dtype(zarrData.data);
+
+      // Convert uint8 to uint16 for consistency
+      if (zarrData.dtype === 'uint8') {
+        const u16 = new Uint16Array(raw.length);
+        const missingU8 = 255;
+        const missingU16 = zarrData.missingValue || 65535;
+        for (let i = 0; i < raw.length; i++) {
+          u16[i] = raw[i] === missingU8 ? missingU16 : raw[i];
+        }
+        outputs.codes = u16;
+      } else {
+        outputs.codes = raw;
+      }
+
+      // No outlier quantiles from zarr (would need latent space computation)
+      outputs.outlierQuantiles = new Float32Array(raw.length);
+    }
+
+    return outputs;
+  }
 
   // Note: Notifications are handled by the caller (state.js) to avoid duplicates
   const outputs = { loaded: true };
@@ -774,6 +948,18 @@ export async function loadObsFieldData(manifestUrl, field) {
 
 // Var/gene expression manifest loader
 export async function loadVarManifest(url) {
+  // Handle h5ad source
+  if (shouldUseH5ad(url)) {
+    const manifest = h5adGetVarManifest();
+    return expandVarManifest(manifest);
+  }
+
+  // Handle zarr source
+  if (shouldUseZarr(url)) {
+    const manifest = zarrGetVarManifest();
+    return expandVarManifest(manifest);
+  }
+
   // Handle local-user:// URLs
   if (isLocalUserUrl(url)) {
     const manifest = await fetchLocalUserJson(url);
@@ -788,13 +974,25 @@ export async function loadVarManifest(url) {
 /**
  * Load gene expression field data with automatic dequantization.
  * Handles gzip-compressed files automatically.
- * 
+ *
  * @param {string} manifestUrl - Base URL for resolving paths
  * @param {object} field - Field metadata from manifest
  * @returns {object} Loaded data with values as Float32Array
  */
 export async function loadVarFieldData(manifestUrl, field) {
   if (!field) throw new Error('No field metadata provided for var field fetch.');
+
+  // Handle h5ad source
+  if (shouldUseH5ad(manifestUrl)) {
+    const values = await h5adLoadGeneExpression(field.key);
+    return { loaded: true, values };
+  }
+
+  // Handle zarr source
+  if (shouldUseZarr(manifestUrl)) {
+    const values = await zarrLoadGeneExpression(field.key);
+    return { loaded: true, values };
+  }
 
   // Note: Notifications are handled by the caller (state.js) to avoid duplicates
   const outputs = { loaded: true };
@@ -844,6 +1042,18 @@ export async function loadObsJson(url) {
  * @returns {Promise<Object>} Connectivity manifest
  */
 export async function loadConnectivityManifest(url) {
+  // Handle h5ad source
+  if (shouldUseH5ad(url)) {
+    const manifest = await h5adGetConnectivityManifest();
+    return manifest;
+  }
+
+  // Handle zarr source
+  if (shouldUseZarr(url)) {
+    const manifest = await zarrGetConnectivityManifest();
+    return manifest;
+  }
+
   // Handle local-user:// URLs
   if (isLocalUserUrl(url)) {
     return fetchLocalUserJson(url);
@@ -899,6 +1109,38 @@ export async function loadEdgeDestinations(manifestUrl, manifest) {
  * @returns {Promise<{sources: TypedArray, destinations: TypedArray, nEdges: number, nCells: number, maxNeighbors: number, indexDtype: string}>}
  */
 export async function loadEdges(manifestUrl, manifest) {
+  // Handle h5ad source
+  if (shouldUseH5ad(manifestUrl)) {
+    const edgeData = await h5adLoadConnectivity();
+    if (!edgeData) {
+      throw new Error('No connectivity data in h5ad file');
+    }
+    return {
+      sources: edgeData.sources,
+      destinations: edgeData.destinations,
+      nEdges: edgeData.nEdges,
+      nCells: manifest?.n_cells || edgeData.sources.length,
+      maxNeighbors: manifest?.max_neighbors || 0,
+      indexDtype: 'uint32'
+    };
+  }
+
+  // Handle zarr source
+  if (shouldUseZarr(manifestUrl)) {
+    const edgeData = await zarrLoadConnectivity();
+    if (!edgeData) {
+      throw new Error('No connectivity data in zarr directory');
+    }
+    return {
+      sources: edgeData.sources,
+      destinations: edgeData.destinations,
+      nEdges: edgeData.nEdges,
+      nCells: manifest?.n_cells || edgeData.sources.length,
+      maxNeighbors: manifest?.max_neighbors || 0,
+      indexDtype: 'uint32'
+    };
+  }
+
   if (!hasEdgeFormat(manifest)) {
     throw new Error('Invalid connectivity manifest: missing edge format.');
   }
@@ -926,6 +1168,16 @@ export async function loadEdges(manifestUrl, manifest) {
  * @returns {Promise<Object>} Dataset identity with embeddings metadata
  */
 export async function loadDatasetIdentity(url) {
+  // Handle h5ad source
+  if (shouldUseH5ad(url)) {
+    return h5adGetDatasetIdentity();
+  }
+
+  // Handle zarr source
+  if (shouldUseZarr(url)) {
+    return zarrGetDatasetIdentity();
+  }
+
   // Handle local-user:// URLs
   if (isLocalUserUrl(url)) {
     return fetchLocalUserJson(url);

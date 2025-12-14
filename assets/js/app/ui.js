@@ -116,6 +116,10 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     userDataPath,
     userDataBrowseBtn,
     userDataFileInput,
+    userDataH5adBtn,
+    userDataH5adInput,
+    userDataZarrBtn,
+    userDataZarrInput,
     userDataInfoBtn,
     userDataInfoTooltip,
     // Remote server
@@ -123,7 +127,13 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     remoteConnectBtn,
     remoteDisconnectBtn,
     remoteInfoBtn,
-    remoteInfoTooltip
+    remoteInfoTooltip,
+    // GitHub repository
+    githubRepoUrl,
+    githubConnectBtn,
+    githubDisconnectBtn,
+    githubInfoBtn,
+    githubInfoTooltip
   } = dom;
 
   const rebuildSmokeDensity = smoke?.rebuildSmokeDensity || null;
@@ -5264,10 +5274,144 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     });
   }
 
-  // Browse button triggers the hidden file input
+  // Browse button triggers the hidden directory input
   if (userDataBrowseBtn && userDataFileInput) {
     userDataBrowseBtn.addEventListener('click', () => {
       userDataFileInput.click();
+    });
+  }
+
+  // H5ad button triggers the hidden h5ad file input
+  if (userDataH5adBtn && userDataH5adInput) {
+    userDataH5adBtn.addEventListener('click', () => {
+      userDataH5adInput.click();
+    });
+  }
+
+  // Handle h5ad file input change
+  if (userDataH5adInput && dataSourceManager) {
+    userDataH5adInput.addEventListener('change', async (e) => {
+      const files = e.target.files;
+      if (!files || files.length === 0) return;
+
+      const userSource = dataSourceManager.getSource('local-user');
+      if (!userSource) {
+        showSessionStatus('User data source not available', true);
+        return;
+      }
+
+      const notifications = getNotificationCenter();
+      const loadNotifId = notifications.loading('Loading h5ad file...', { category: 'data' });
+
+      try {
+        const metadata = await userSource.loadFromFileList(files);
+
+        // Update UI with loaded data
+        if (userDataPath) {
+          userDataPath.value = userSource.getPath() || 'Selected';
+          userDataPath.classList.add('active');
+        }
+
+        updateDatasetInfo(metadata);
+
+        // Deselect demo dataset dropdown
+        if (datasetSelect) {
+          datasetSelect.value = NONE_DATASET_VALUE;
+        }
+
+        // Switch to the user data source
+        try {
+          await dataSourceManager.switchToDataset('local-user', userSource.datasetId);
+          if (typeof reloadDataset === 'function') {
+            await reloadDataset(metadata);
+          }
+          populateDatasetDropdown();
+          notifications.complete(loadNotifId, `User data ready: ${formatDataNumber(metadata.stats?.n_cells)} cells`);
+        } catch (switchErr) {
+          console.warn('[UI] Could not auto-switch to user source:', switchErr);
+          notifications.complete(loadNotifId, 'User data validated. Select "Load" to apply.');
+        }
+
+      } catch (err) {
+        console.error('[UI] Failed to load h5ad file:', err);
+
+        if (userDataPath) {
+          userDataPath.value = '';
+          userDataPath.classList.remove('active');
+        }
+
+        notifications.fail(loadNotifId, err.getUserMessage?.() || err.message || 'Failed to load');
+      }
+
+      // Reset the input so the same file can be selected again
+      userDataH5adInput.value = '';
+    });
+  }
+
+  // Zarr button triggers the hidden zarr directory input
+  if (userDataZarrBtn && userDataZarrInput) {
+    userDataZarrBtn.addEventListener('click', () => {
+      userDataZarrInput.click();
+    });
+  }
+
+  // Handle zarr directory input change
+  if (userDataZarrInput && dataSourceManager) {
+    userDataZarrInput.addEventListener('change', async (e) => {
+      const files = e.target.files;
+      if (!files || files.length === 0) return;
+
+      const userSource = dataSourceManager.getSource('local-user');
+      if (!userSource) {
+        showSessionStatus('User data source not available', true);
+        return;
+      }
+
+      const notifications = getNotificationCenter();
+      const loadNotifId = notifications.loading('Loading zarr directory...', { category: 'data' });
+
+      try {
+        const metadata = await userSource.loadFromFileList(files);
+
+        // Update UI with loaded data
+        if (userDataPath) {
+          userDataPath.value = userSource.getPath() || 'Selected';
+          userDataPath.classList.add('active');
+        }
+
+        updateDatasetInfo(metadata);
+
+        // Deselect demo dataset dropdown
+        if (datasetSelect) {
+          datasetSelect.value = NONE_DATASET_VALUE;
+        }
+
+        // Switch to the user data source
+        try {
+          await dataSourceManager.switchToDataset('local-user', userSource.datasetId);
+          if (typeof reloadDataset === 'function') {
+            await reloadDataset(metadata);
+          }
+          populateDatasetDropdown();
+          notifications.complete(loadNotifId, `User data ready: ${formatDataNumber(metadata.stats?.n_cells)} cells`);
+        } catch (switchErr) {
+          console.warn('[UI] Could not auto-switch to user source:', switchErr);
+          notifications.complete(loadNotifId, 'User data validated. Select "Load" to apply.');
+        }
+
+      } catch (err) {
+        console.error('[UI] Failed to load zarr directory:', err);
+
+        if (userDataPath) {
+          userDataPath.value = '';
+          userDataPath.classList.remove('active');
+        }
+
+        notifications.fail(loadNotifId, err.getUserMessage?.() || err.message || 'Failed to load');
+      }
+
+      // Reset the input so the same directory can be selected again
+      userDataZarrInput.value = '';
     });
   }
 
@@ -5289,6 +5433,15 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     });
   }
 
+  // GitHub repo info tooltip toggle
+  if (githubInfoBtn && githubInfoTooltip) {
+    githubInfoBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const isVisible = githubInfoTooltip.style.display !== 'none';
+      githubInfoTooltip.style.display = isVisible ? 'none' : 'block';
+    });
+  }
+
   // Close all info tooltips when clicking outside
   document.addEventListener('click', (e) => {
     if (userDataInfoBtn && userDataInfoTooltip &&
@@ -5298,6 +5451,10 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     if (remoteInfoBtn && remoteInfoTooltip &&
         !remoteInfoBtn.contains(e.target) && !remoteInfoTooltip.contains(e.target)) {
       remoteInfoTooltip.style.display = 'none';
+    }
+    if (githubInfoBtn && githubInfoTooltip &&
+        !githubInfoBtn.contains(e.target) && !githubInfoTooltip.contains(e.target)) {
+      githubInfoTooltip.style.display = 'none';
     }
   });
 
@@ -5435,6 +5592,118 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     if (remoteSource?.isConnected()) {
       updateRemoteStatus('Connected');
       updateRemoteUI(true);
+    }
+  }
+
+  // GitHub repository connection handling
+  if (githubConnectBtn && githubRepoUrl && dataSourceManager) {
+    const githubSource = dataSourceManager.getSource('github-repo');
+
+    const updateGithubUI = (connected) => {
+      if (githubConnectBtn) {
+        githubConnectBtn.textContent = connected ? 'Reconnect' : 'Connect';
+      }
+      if (githubDisconnectBtn) {
+        githubDisconnectBtn.style.display = connected ? 'inline-block' : 'none';
+      }
+      if (githubRepoUrl) {
+        githubRepoUrl.disabled = connected;
+      }
+    };
+
+    githubConnectBtn.addEventListener('click', async () => {
+      const repoPath = githubRepoUrl?.value?.trim();
+      if (!repoPath) {
+        const notifications = getNotificationCenter();
+        notifications.error('Please enter a GitHub repository path', { category: 'connectivity' });
+        return;
+      }
+
+      if (!githubSource) {
+        const notifications = getNotificationCenter();
+        notifications.error('GitHub source not available', { category: 'connectivity' });
+        return;
+      }
+
+      const notifications = getNotificationCenter();
+      const connectNotifId = notifications.loading(`Connecting to GitHub: ${repoPath}...`, { category: 'connectivity' });
+      githubConnectBtn.disabled = true;
+
+      try {
+        const { repoInfo, datasets } = await githubSource.connect(repoPath);
+        updateGithubUI(true);
+
+        if (datasets.length > 0) {
+          notifications.complete(connectNotifId, `Connected to ${repoInfo.owner}/${repoInfo.repo} - ${datasets.length} dataset(s)`);
+
+          // Switch to the first GitHub dataset
+          await dataSourceManager.switchToDataset('github-repo', datasets[0].id);
+
+          // Refresh the dataset dropdown
+          if (typeof populateDatasetDropdown === 'function') {
+            populateDatasetDropdown();
+          }
+
+          // Reload the dataset in-place
+          if (reloadDataset) {
+            await reloadDataset(datasets[0]);
+          }
+        } else {
+          notifications.fail(connectNotifId, 'Connected - no datasets found');
+        }
+      } catch (err) {
+        notifications.fail(connectNotifId, `Error: ${err.message}`);
+        console.error('[UI] GitHub connection error:', err);
+        updateGithubUI(false);
+      } finally {
+        githubConnectBtn.disabled = false;
+      }
+    });
+
+    if (githubDisconnectBtn) {
+      githubDisconnectBtn.addEventListener('click', async () => {
+        if (githubSource) {
+          githubSource.disconnect();
+          const notifications = getNotificationCenter();
+          notifications.success('Disconnected from GitHub', { category: 'connectivity' });
+          updateGithubUI(false);
+
+          // If we were using GitHub source, switch back to local-demo
+          const currentSource = dataSourceManager.getCurrentSourceType();
+          if (currentSource === 'github-repo') {
+            try {
+              const demoSource = dataSourceManager.getSource('local-demo');
+              if (demoSource) {
+                const defaultId = await demoSource.getDefaultDatasetId?.();
+                if (defaultId) {
+                  await dataSourceManager.switchToDataset('local-demo', defaultId);
+                  if (typeof populateDatasetDropdown === 'function') {
+                    populateDatasetDropdown();
+                  }
+                  if (reloadDataset) {
+                    const metadata = dataSourceManager.getCurrentMetadata();
+                    await reloadDataset(metadata);
+                  }
+                }
+              }
+            } catch (err) {
+              console.warn('[UI] Failed to switch back to local-demo after GitHub disconnect:', err);
+            }
+          }
+        }
+      });
+    }
+
+    // Auto-fill URL from query params if present
+    const urlParams = new URLSearchParams(window.location.search);
+    const githubParam = urlParams.get('github');
+    if (githubParam && githubRepoUrl) {
+      githubRepoUrl.value = githubParam;
+    }
+
+    // Update UI if already connected
+    if (githubSource?.getConnectionInfo?.().connected) {
+      updateGithubUI(true);
     }
   }
 

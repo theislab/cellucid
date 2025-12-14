@@ -14,6 +14,11 @@ import {
   validateSchemaVersion
 } from './data-source.js';
 import { expandObsManifest, expandVarManifest } from './data-loaders.js';
+import { isH5adFile, createH5adLoader } from './h5ad-loader.js';
+import { H5adDataSource, createH5adDataSource } from './h5ad-source.js';
+import { isZarrDirectory, createZarrLoader } from './zarr-loader.js';
+import { ZarrDataSource, createZarrDataSource } from './zarr-source.js';
+import { getNotificationCenter } from '../app/notification-center.js';
 
 /**
  * @typedef {import('./data-source.js').DatasetMetadata} DatasetMetadata
@@ -54,6 +59,15 @@ export class LocalUserDirDataSource {
     /** @type {Map<string, string>} */
     this._objectUrls = new Map();
 
+    /** @type {H5adDataSource|null} H5AD source for h5ad files */
+    this._h5adSource = null;
+
+    /** @type {ZarrDataSource|null} Zarr source for zarr directories */
+    this._zarrSource = null;
+
+    /** @type {'directory'|'h5ad'|'zarr'|null} */
+    this._sourceMode = null;
+
     this.type = 'local-user';
   }
 
@@ -70,6 +84,15 @@ export class LocalUserDirDataSource {
    * @returns {Promise<boolean>}
    */
   async isAvailable() {
+    // In h5ad mode, check if h5ad source is available
+    if (this._sourceMode === 'h5ad' && this._h5adSource) {
+      return this._h5adSource.isAvailable();
+    }
+    // In zarr mode, check if zarr source is available
+    if (this._sourceMode === 'zarr' && this._zarrSource) {
+      return this._zarrSource.isAvailable();
+    }
+    // In directory mode, check if files are loaded
     return this._files.size > 0;
   }
 
@@ -82,7 +105,8 @@ export class LocalUserDirDataSource {
   }
 
   /**
-   * Load files from a FileList (from <input type="file" webkitdirectory>)
+   * Load files from a FileList (from <input type="file" webkitdirectory> or single file input)
+   * Automatically detects if a single h5ad file or zarr directory is selected
    * @param {FileList} fileList - Files from file input
    * @returns {Promise<DatasetMetadata>}
    */
@@ -95,8 +119,102 @@ export class LocalUserDirDataSource {
       );
     }
 
+    // Check if this is a single h5ad file
+    const firstFile = fileList[0];
+    if (fileList.length === 1 && isH5adFile(firstFile)) {
+      return this.loadFromH5adFile(firstFile);
+    }
+
+    // Check if this is a zarr directory
+    if (isZarrDirectory(fileList)) {
+      return this.loadFromZarrDirectory(fileList);
+    }
+
+    // Check if any file in the list is an h5ad file (user might have selected h5ad from directory picker)
+    for (const file of fileList) {
+      if (isH5adFile(file)) {
+        // Found an h5ad file, load it directly
+        return this.loadFromH5adFile(file);
+      }
+    }
+
+    // Standard directory loading
+    return this._loadFromDirectory(fileList);
+  }
+
+  /**
+   * Load an h5ad file directly
+   * @param {File} file - h5ad file
+   * @returns {Promise<DatasetMetadata>}
+   */
+  async loadFromH5adFile(file) {
+    if (!isH5adFile(file)) {
+      throw new DataSourceError(
+        'Not an h5ad file. Expected .h5ad extension.',
+        DataSourceErrorCode.INVALID_FORMAT,
+        this.type
+      );
+    }
+
     // Clear previous state
     this._cleanup();
+
+    // Create and initialize h5ad source
+    this._h5adSource = createH5adDataSource();
+    await this._h5adSource.loadFromFile(file);
+
+    this._sourceMode = 'h5ad';
+    this.datasetId = this._h5adSource.datasetId;
+    this.directoryPath = file.name;
+    this._metadata = await this._h5adSource.getMetadata(this.datasetId);
+
+    console.log(`[LocalUserDirDataSource] Loaded h5ad file: ${file.name}`);
+
+    return this._metadata;
+  }
+
+  /**
+   * Load a zarr directory
+   * @param {FileList} fileList - FileList from directory input
+   * @returns {Promise<DatasetMetadata>}
+   */
+  async loadFromZarrDirectory(fileList) {
+    if (!isZarrDirectory(fileList)) {
+      throw new DataSourceError(
+        'Not a zarr directory. Expected .zarr extension or zarr structure files.',
+        DataSourceErrorCode.INVALID_FORMAT,
+        this.type
+      );
+    }
+
+    // Clear previous state
+    this._cleanup();
+
+    // Create and initialize zarr source
+    this._zarrSource = createZarrDataSource();
+    await this._zarrSource.loadFromFileList(fileList);
+
+    this._sourceMode = 'zarr';
+    this.datasetId = this._zarrSource.datasetId;
+    this.directoryPath = this._zarrSource.dirname;
+    this._metadata = await this._zarrSource.getMetadata(this.datasetId);
+
+    console.log(`[LocalUserDirDataSource] Loaded zarr directory: ${this.directoryPath}`);
+
+    return this._metadata;
+  }
+
+  /**
+   * Load from a directory (exported data format)
+   * @param {FileList} fileList - Files from directory input
+   * @returns {Promise<DatasetMetadata>}
+   * @private
+   */
+  async _loadFromDirectory(fileList) {
+    // Clear previous state
+    this._cleanup();
+
+    this._sourceMode = 'directory';
 
     // Extract directory name from the first file's path
     // webkitRelativePath format: "dirname/filename.ext" or "dirname/subdir/filename.ext"
@@ -387,6 +505,14 @@ export class LocalUserDirDataSource {
    * @returns {string}
    */
   getBaseUrl(_datasetId) {
+    // In h5ad mode, use h5ad:// protocol
+    if (this._sourceMode === 'h5ad' && this._h5adSource) {
+      return this._h5adSource.getBaseUrl(this.datasetId);
+    }
+    // In zarr mode, use zarr:// protocol
+    if (this._sourceMode === 'zarr' && this._zarrSource) {
+      return this._zarrSource.getBaseUrl(this.datasetId);
+    }
     // Return a special marker that data-loaders.js will recognize
     // The actual file loading will use getFileUrl()
     // Note: We use this.datasetId since local-user only supports one dataset at a time
@@ -434,10 +560,55 @@ export class LocalUserDirDataSource {
     }
     this._objectUrls.clear();
 
+    // Clean up h5ad source if present
+    if (this._h5adSource) {
+      this._h5adSource.clear();
+      this._h5adSource = null;
+    }
+
+    // Clean up zarr source if present
+    if (this._zarrSource) {
+      this._zarrSource.clear();
+      this._zarrSource = null;
+    }
+
     this._files.clear();
     this.datasetId = null;
     this.directoryPath = null;
     this._metadata = null;
+    this._sourceMode = null;
+  }
+
+  /**
+   * Check if data is loaded from h5ad file
+   * @returns {boolean}
+   */
+  isH5adMode() {
+    return this._sourceMode === 'h5ad';
+  }
+
+  /**
+   * Get the h5ad data source (if in h5ad mode)
+   * @returns {H5adDataSource|null}
+   */
+  getH5adSource() {
+    return this._h5adSource;
+  }
+
+  /**
+   * Check if data is loaded from zarr directory
+   * @returns {boolean}
+   */
+  isZarrMode() {
+    return this._sourceMode === 'zarr';
+  }
+
+  /**
+   * Get the zarr data source (if in zarr mode)
+   * @returns {ZarrDataSource|null}
+   */
+  getZarrSource() {
+    return this._zarrSource;
   }
 
   /**
@@ -449,7 +620,7 @@ export class LocalUserDirDataSource {
 
   /**
    * Called when this source is deactivated (switching to another source).
-   * Revokes Object URLs to prevent memory leaks.
+   * Revokes Object URLs and clears h5ad/zarr caches to prevent memory leaks.
    */
   onDeactivate() {
     // Only revoke Object URLs, keep the files in case user switches back
@@ -457,13 +628,38 @@ export class LocalUserDirDataSource {
       URL.revokeObjectURL(url);
     }
     this._objectUrls.clear();
-    console.log('[LocalUserDirDataSource] Deactivated - revoked Object URLs');
+
+    // MEMORY OPTIMIZATION: Clear h5ad caches when deactivating to free memory
+    // The h5ad file itself is retained, but computed caches (gene expressions, etc.) are freed
+    if (this._h5adSource) {
+      this._h5adSource.clearCaches?.();
+    }
+
+    // MEMORY OPTIMIZATION: Clear zarr caches when deactivating to free memory
+    if (this._zarrSource) {
+      this._zarrSource.clearCaches?.();
+    }
+
+    console.log('[LocalUserDirDataSource] Deactivated - revoked Object URLs and cleared caches');
   }
 
   /**
    * Refresh (re-validate and reload metadata)
    */
   async refresh() {
+    // In h5ad mode, metadata is immutable (from h5ad file)
+    // No refresh needed - reload would require re-reading the file
+    if (this._sourceMode === 'h5ad') {
+      console.log('[LocalUserDirDataSource] Refresh not applicable for h5ad mode');
+      return;
+    }
+    // In zarr mode, metadata is immutable (from zarr directory)
+    // No refresh needed - reload would require re-reading the files
+    if (this._sourceMode === 'zarr') {
+      console.log('[LocalUserDirDataSource] Refresh not applicable for zarr mode');
+      return;
+    }
+    // In directory mode, re-validate and reload metadata
     if (this._files.size > 0) {
       await this._validateAndLoadMetadata();
     }

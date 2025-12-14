@@ -10,6 +10,7 @@
 
 import { DataSourceError, DataSourceErrorCode } from './data-source.js';
 import { createLocalDemoDataSource } from './local-demo-source.js';
+import { createGitHubDataSource } from './github-data-source.js';
 
 /**
  * @typedef {import('./data-source.js').DatasetMetadata} DatasetMetadata
@@ -98,6 +99,11 @@ export class DataSourceManager {
     // Register default sources
     const demoSource = createLocalDemoDataSource();
     this.registerSource('local-demo', demoSource);
+
+    // Register GitHub data source
+    const githubSource = createGitHubDataSource();
+    this.registerSource('github-repo', githubSource);
+    this.registerProtocol('github-repo://', 'github-repo');
 
     // Only load default dataset if no dataset is already active
     // (e.g., from a remote connection or URL parameter)

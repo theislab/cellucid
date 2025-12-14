@@ -212,10 +212,18 @@
             <label class="sr-only" for="user-data-path">Selected data path</label>
             <div class="user-data-row">
               <input type="text" id="user-data-path" class="user-data-path"
-                     placeholder="No directory selected" readonly />
-              <button id="user-data-browse-btn" class="reset-btn">Browse</button>
+                     placeholder="No data selected" readonly />
+              <button id="user-data-browse-btn" class="reset-btn" title="Load exported directory">Folder</button>
+              <button id="user-data-h5ad-btn" class="reset-btn" title="Load .h5ad file directly">.h5ad</button>
+              <button id="user-data-zarr-btn" class="reset-btn" title="Load .zarr directory">.zarr</button>
               <!-- Hidden file input for cross-browser directory selection -->
               <input type="file" id="user-data-file-input" webkitdirectory directory multiple
+                     style="display:none;" />
+              <!-- Hidden file input for single h5ad file selection -->
+              <input type="file" id="user-data-h5ad-input" accept=".h5ad"
+                     style="display:none;" />
+              <!-- Hidden file input for zarr directory selection -->
+              <input type="file" id="user-data-zarr-input" webkitdirectory directory multiple
                      style="display:none;" />
             </div>
           </div>
@@ -240,6 +248,29 @@
             </div>
             <div style="margin-top:4px;">
               <button id="remote-disconnect-btn" class="reset-btn" style="display:none; padding:2px 6px; font-size:11px;">Disconnect</button>
+            </div>
+          </div>
+
+          <!-- GitHub repository data loading -->
+          <div class="control-block" id="github-repo-block" style="margin-top: 2px; position: relative;">
+            <label style="display: flex; align-items: center; gap: 4px;">
+              GitHub data:
+              <span id="github-info-btn" class="info-btn">i</span>
+            </label>
+            <div id="github-info-tooltip" class="info-tooltip" style="display: none;">
+              <div class="info-tooltip-content">
+                <div class="info-step">Load data from any public GitHub repo with exported data.</div>
+                <div class="info-step">Format: <span class="info-cmd">owner/repo/path</span></div>
+                <div class="info-step">Example: <span class="info-cmd">myuser/atlas/exports/dataset1</span></div>
+              </div>
+            </div>
+            <div class="user-data-row">
+              <input type="text" id="github-repo-url" class="user-data-path"
+                     placeholder="owner/repo/path/to/exports" />
+              <button id="github-connect-btn" class="reset-btn">Load</button>
+            </div>
+            <div style="margin-top:4px;">
+              <button id="github-disconnect-btn" class="reset-btn" style="display:none; padding:2px 6px; font-size:11px;">Disconnect</button>
             </div>
           </div>
 

@@ -1,20 +1,23 @@
 /**
  * JupyterBridgeDataSource - Data source for Jupyter notebook integration
  *
- * Provides bidirectional communication between the web viewer (in an iframe)
+ * Provides communication between the web viewer (in an iframe)
  * and a Jupyter notebook running the cellucid Python package.
  *
  * Communication flow:
  * 1. Jupyter cell embeds viewer in iframe with special URL params
  * 2. Viewer detects Jupyter mode and creates JupyterBridgeDataSource
- * 3. Source communicates with parent frame via postMessage
- * 4. Python side handles requests and sends data
+ * 3. Source communicates with parent frame via postMessage (Python → Frontend)
+ * 4. Source POSTs events to the data server (Frontend → Python)
  *
  * Features:
- * - Data loading from Jupyter server
- * - Live highlighting from Python
- * - Bidirectional selection sync
- * - Compute requests (filtering, recoloring)
+ * - Data loading from Jupyter server (works everywhere)
+ * - Live highlighting from Python (works everywhere)
+ * - Selection/hover/click notifications to Python (works everywhere via HTTP POST)
+ *
+ * Bidirectional communication works in ALL environments:
+ * - Python → Frontend: postMessage from notebook to iframe
+ * - Frontend → Python: HTTP POST to /_cellucid/events on the data server
  */
 
 import {
@@ -127,6 +130,9 @@ export class JupyterBridgeDataSource {
 
     /** @type {Set<Function>} */
     this._highlightCallbacks = new Set();
+
+    /** @type {number|null} Debounce timer for hover events */
+    this._hoverDebounceTimer = null;
 
     this.type = 'jupyter';
 
@@ -350,7 +356,7 @@ export class JupyterBridgeDataSource {
   }
 
   /**
-   * Post message to parent frame (Jupyter)
+   * Post message to parent frame (Jupyter) - for Python → Frontend responses
    * @param {Object} message
    * @private
    */
@@ -364,6 +370,33 @@ export class JupyterBridgeDataSource {
     // from various origins (localhost, jupyter hub, etc.). The message handler
     // validates incoming messages using origin checking to prevent unauthorized access.
     window.parent.postMessage(message, '*');
+  }
+
+  /**
+   * Post event to Python via HTTP POST to the data server.
+   * This enables Frontend → Python communication in ALL environments.
+   * @param {Object} event - Event data with 'type' and 'viewerId'
+   * @private
+   */
+  _postEventToPython(event) {
+    if (!this._config?.serverUrl) {
+      return;
+    }
+
+    // POST to the events endpoint on the data server
+    // Use fetch with keepalive to ensure delivery even on page unload
+    fetch(`${this._config.serverUrl}/_cellucid/events`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(event),
+      keepalive: true
+    }).catch(err => {
+      // Silently ignore errors - this is a fire-and-forget notification
+      // The server might not be running or the event might be for a stale viewer
+      console.debug('[JupyterBridge] Failed to POST event:', err.message);
+    });
   }
 
   /**
@@ -404,17 +437,107 @@ export class JupyterBridgeDataSource {
     });
   }
 
+  // =========================================================================
+  // PYTHON NOTIFICATION METHODS (Frontend → Python)
+  // =========================================================================
+  // These methods send events to Python via HTTP POST to the data server.
+  // This works in ALL environments (Jupyter, JupyterLab, Colab, VSCode).
+  // They are safe to call even when not connected - they will silently no-op.
+
   /**
    * Notify Python of cell selection change
    * @param {number[]} cellIndices - Selected cell indices
+   * @param {string} [source='unknown'] - Selection source ('lasso', 'click', 'range')
    */
-  notifySelection(cellIndices) {
-    this._postToParent({
+  notifySelection(cellIndices, source = 'unknown') {
+    if (!this._connected) return;
+    const event = {
       type: 'selection',
       cells: cellIndices,
+      source: source,
       viewerId: this._config?.viewerId
-    });
+    };
+    this._postEventToPython(event);
   }
+
+  /**
+   * Notify Python of cell hover (debounced internally)
+   * @param {number|null} cellIndex - Hovered cell index, or null if not hovering
+   * @param {{x: number, y: number, z: number}} [position] - World coordinates
+   */
+  notifyHover(cellIndex, position = null) {
+    if (!this._connected) return;
+
+    // Debounce hover events to avoid flooding Python
+    clearTimeout(this._hoverDebounceTimer);
+    this._hoverDebounceTimer = setTimeout(() => {
+      const event = {
+        type: 'hover',
+        cell: cellIndex,
+        position: position,
+        viewerId: this._config?.viewerId
+      };
+      this._postEventToPython(event);
+    }, 50); // 50ms debounce
+  }
+
+  /**
+   * Notify Python of cell click
+   * @param {number} cellIndex - Clicked cell index
+   * @param {Object} [options] - Click options
+   * @param {number} [options.button=0] - Mouse button (0=left, 1=middle, 2=right)
+   * @param {boolean} [options.shift=false] - Shift key held
+   * @param {boolean} [options.ctrl=false] - Ctrl/Cmd key held
+   */
+  notifyClick(cellIndex, options = {}) {
+    if (!this._connected) return;
+    const event = {
+      type: 'click',
+      cell: cellIndex,
+      button: options.button ?? 0,
+      shift: options.shift ?? false,
+      ctrl: options.ctrl ?? false,
+      viewerId: this._config?.viewerId
+    };
+    this._postEventToPython(event);
+  }
+
+  /**
+   * Notify Python that viewer is ready with dataset info
+   * @param {Object} [info] - Dataset info
+   * @param {number} [info.nCells] - Number of cells
+   * @param {number} [info.dimensions] - Embedding dimensions (2 or 3)
+   */
+  notifyReady(info = {}) {
+    if (!this._connected) return;
+    const event = {
+      type: 'ready',
+      n_cells: info.nCells ?? 0,
+      dimensions: info.dimensions ?? 3,
+      viewerId: this._config?.viewerId
+    };
+    this._postEventToPython(event);
+  }
+
+  /**
+   * Send a custom event to Python
+   * Use this for app-specific events not covered by the standard hooks.
+   * @param {string} eventType - Custom event type name
+   * @param {Object} data - Event data
+   */
+  notifyCustomEvent(eventType, data = {}) {
+    if (!this._connected) return;
+    const event = {
+      type: eventType,
+      ...data,
+      viewerId: this._config?.viewerId
+    };
+    this._postEventToPython(event);
+  }
+
+  // =========================================================================
+  // PYTHON EVENT CALLBACKS (Python → Frontend)
+  // =========================================================================
 
   /**
    * Register callback for highlight events from Python
@@ -637,6 +760,7 @@ export class JupyterBridgeDataSource {
    */
   disconnect() {
     window.removeEventListener('message', this._boundMessageHandler);
+    clearTimeout(this._hoverDebounceTimer);
     this._connected = false;
     this._config = null;
     this._datasetCache.clear();

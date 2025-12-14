@@ -2670,7 +2670,8 @@ body.dock-dragging .accordion-section:not(.accordion-floating) {
   color: var(--viewer-ink);
 }
 
-#user-data-browse-btn {
+#user-data-browse-btn,
+#user-data-h5ad-btn {
   flex-shrink: 0;
   white-space: nowrap;
 }
@@ -2702,7 +2703,8 @@ body.dock-dragging .accordion-section:not(.accordion-floating) {
   font-style: italic;
 }
 
-#user-data-block.unsupported #user-data-browse-btn {
+#user-data-block.unsupported #user-data-browse-btn,
+#user-data-block.unsupported #user-data-h5ad-btn {
   cursor: not-allowed;
   opacity: 0.6;
 }
