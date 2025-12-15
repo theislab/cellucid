@@ -53,10 +53,16 @@ const CategoryIcons = {
  * Format bytes to human-readable size
  */
 function formatBytes(bytes, decimals = 1) {
-  if (bytes === 0) return '0 B';
+  // Handle edge cases: zero, negative, or fractional bytes
+  if (!bytes || bytes <= 0) return '0 B';
+  if (bytes < 1) return bytes.toFixed(decimals) + ' B';
   const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+  // Clamp index to valid range to prevent undefined access
+  const i = Math.min(
+    sizes.length - 1,
+    Math.max(0, Math.floor(Math.log(bytes) / Math.log(k)))
+  );
   return parseFloat((bytes / Math.pow(k, i)).toFixed(decimals)) + ' ' + sizes[i];
 }
 
@@ -254,16 +260,29 @@ class NotificationCenter {
       if (titleEl) titleEl.textContent = options.title;
     }
 
-    // Update progress
+    // Update progress - only update bar when progress is a valid number
+    // When progress is null (unknown total size), keep the indeterminate state
     if (options.progress !== undefined) {
       const progressBar = element.querySelector('.notification-progress-bar');
       if (progressBar) {
-        progressBar.classList.remove('indeterminate');
-        progressBar.style.width = options.progress + '%';
+        if (options.progress !== null && typeof options.progress === 'number') {
+          // Known progress: show determinate bar with percentage width
+          progressBar.classList.remove('indeterminate');
+          progressBar.style.width = options.progress + '%';
+        } else {
+          // Unknown progress (null): ensure indeterminate mode
+          progressBar.classList.add('indeterminate');
+          progressBar.style.width = '100%';
+        }
       }
       const progressText = element.querySelector('.notification-progress-text');
       if (progressText) {
-        progressText.textContent = Math.round(options.progress) + '%';
+        if (options.progress !== null && typeof options.progress === 'number') {
+          progressText.textContent = Math.round(options.progress) + '%';
+        } else {
+          // Hide percentage text when progress is unknown
+          progressText.textContent = '';
+        }
       }
     }
 

@@ -94,7 +94,8 @@ export function createStateSerializer({ state, viewer, sidebar }) {
       const maxChanged = Math.abs(colorRange.max - stats.max) > 1e-6;
       if (minChanged || maxChanged) return true;
     }
-    if (field._useFilterColorRange) return true;
+    // Default is true, so only consider it modified if explicitly set to false
+    if (field._useFilterColorRange === false) return true;
     if (field._useLogScale) return true;
 
     const outlierEnabled = field._outlierFilterEnabled !== false;
@@ -326,8 +327,10 @@ export function createStateSerializer({ state, viewer, sidebar }) {
           filter: field._continuousFilter ? { ...field._continuousFilter } : null,
           colorRange: field._continuousColorRange ? { ...field._continuousColorRange } : null,
           useLogScale: field._useLogScale ?? false,
-          useFilterColorRange: field._useFilterColorRange ?? false,
-          outlierFilterEnabled: field._outlierFilterEnabled ?? false,
+          // Default is true to match state.js behavior
+          useFilterColorRange: field._useFilterColorRange ?? true,
+          // Default is true (enabled) to match state.js behavior
+          outlierFilterEnabled: field._outlierFilterEnabled ?? true,
           outlierThreshold: field._outlierThreshold ?? 1.0,
           colormapId: field._colormapId || null
         };
@@ -397,6 +400,8 @@ export function createStateSerializer({ state, viewer, sidebar }) {
         fieldKey: s.fieldKey,
         fieldKind: s.fieldKind,
         meta: s.meta,
+        // Capture dimension level for proper restoration (don't assume 3D)
+        dimensionLevel: s.dimensionLevel ?? ctx?.dimensionLevel ?? null,
         activeFields: {
           activeFieldKey,
           activeVarFieldKey,
@@ -435,6 +440,8 @@ export function createStateSerializer({ state, viewer, sidebar }) {
       timestamp: new Date().toISOString(),
       dataSource,
       camera: viewer.getCameraState?.() || null,
+      // Capture active dimension level for proper restoration (don't assume 3D)
+      activeDimensionLevel: state.activeDimensionLevel ?? null,
       uiControls: collectUIControls(),
       highlightPages: serializeHighlightPages(),
       activePageId,
@@ -620,8 +627,10 @@ export function createStateSerializer({ state, viewer, sidebar }) {
           }
           field._filterEnabled = data.filterEnabled !== false;
           field._useLogScale = data.useLogScale ?? false;
-          field._useFilterColorRange = data.useFilterColorRange ?? false;
-          field._outlierFilterEnabled = data.outlierFilterEnabled ?? false;
+          // Default is true to match state.js behavior
+          field._useFilterColorRange = data.useFilterColorRange ?? true;
+          // Default is true (enabled) to match state.js behavior
+          field._outlierFilterEnabled = data.outlierFilterEnabled ?? true;
           field._outlierThreshold = data.outlierThreshold ?? 1.0;
           // Restore colormap if specified
           if (data.colormapId) {
@@ -958,6 +967,8 @@ export function createStateSerializer({ state, viewer, sidebar }) {
       if (snap.centroidColors) config.centroidColors = new Uint8Array(snap.centroidColors);
       if (snap.centroidOutliers) config.centroidOutliers = new Float32Array(snap.centroidOutliers);
       if (typeof snap.outlierThreshold === 'number') config.outlierThreshold = snap.outlierThreshold;
+      // Restore dimension level for this snapshot (don't assume 3D)
+      if (snap.dimensionLevel != null) config.dimensionLevel = snap.dimensionLevel;
 
       const created = viewer.createSnapshotView ? viewer.createSnapshotView(config) : null;
       const newId = created?.id;
@@ -1034,6 +1045,17 @@ export function createStateSerializer({ state, viewer, sidebar }) {
     console.log('[StateSerializer] Restoring UI controls (count: ' + Object.keys(controls).length + ')');
     restoreUIControls(controls);
 
+    // 1b. Restore dimension level if saved (don't assume 3D)
+    if (snapshot.activeDimensionLevel != null && state.setDimensionLevel) {
+      console.log('[StateSerializer] Restoring dimension level:', snapshot.activeDimensionLevel);
+      await state.setDimensionLevel(snapshot.activeDimensionLevel);
+      // Update dimension selector UI
+      const dimensionSelect = document.getElementById('dimension-select');
+      if (dimensionSelect) {
+        dimensionSelect.value = String(snapshot.activeDimensionLevel);
+      }
+    }
+
     // 2. Restore filters (field-level filter settings)
     if (snapshot.filters) {
       const { restored, skippedNoop } = await restoreFilters(snapshot.filters);
@@ -1088,17 +1110,15 @@ export function createStateSerializer({ state, viewer, sidebar }) {
       const navSelect = document.getElementById('navigation-mode');
       if (navSelect && snapshot.camera.navigationMode) {
         navSelect.value = snapshot.camera.navigationMode;
-        // Show/hide the right control panels
+        // Show/hide the right control panels for all 3 modes: orbit, planar, free
         const freeflyControls = document.getElementById('freefly-controls');
         const orbitControls = document.getElementById('orbit-controls');
-        if (freeflyControls && orbitControls) {
-          if (snapshot.camera.navigationMode === 'free') {
-            freeflyControls.style.display = 'block';
-            orbitControls.style.display = 'none';
-          } else {
-            freeflyControls.style.display = 'none';
-            orbitControls.style.display = 'block';
-          }
+        const planarControls = document.getElementById('planar-controls');
+        if (freeflyControls && orbitControls && planarControls) {
+          const mode = snapshot.camera.navigationMode;
+          freeflyControls.style.display = mode === 'free' ? 'block' : 'none';
+          orbitControls.style.display = mode === 'orbit' ? 'block' : 'none';
+          planarControls.style.display = mode === 'planar' ? 'block' : 'none';
         }
       }
 
@@ -1175,6 +1195,7 @@ export function createStateSerializer({ state, viewer, sidebar }) {
       input.type = 'file';
       input.accept = '.json,application/json';
 
+      // Handle file selection
       input.onchange = async (e) => {
         const file = e.target.files?.[0];
         if (!file) {
@@ -1192,6 +1213,11 @@ export function createStateSerializer({ state, viewer, sidebar }) {
           console.error('Failed to load state:', err);
           reject(err);
         }
+      };
+
+      // Handle cancel: resolve without error when user cancels file picker
+      input.oncancel = () => {
+        resolve();
       };
 
       input.click();

@@ -14,10 +14,8 @@ import {
   validateSchemaVersion
 } from './data-source.js';
 import { expandObsManifest, expandVarManifest } from './data-loaders.js';
-import { isH5adFile, createH5adLoader } from './h5ad-loader.js';
-import { H5adDataSource, createH5adDataSource } from './h5ad-source.js';
-import { isZarrDirectory, createZarrLoader } from './zarr-loader.js';
-import { ZarrDataSource, createZarrDataSource } from './zarr-source.js';
+import { isH5adFile, createH5adLoader, H5adDataSource, createH5adDataSource } from './h5ad.js';
+import { isZarrDirectory, createZarrLoader, ZarrDataSource, createZarrDataSource } from './zarr.js';
 import { getNotificationCenter } from '../app/notification-center.js';
 
 /**

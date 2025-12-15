@@ -97,6 +97,7 @@ export class SmokeRenderer {
     this.noiseTextures = null;
     this.noiseResolution = 128;
     this.noiseGenerationInProgress = false;
+    this.noiseGenerationFailed = false;  // Prevents infinite retry loop on failure
 
     // Animation
     this.startTime = performance.now();
@@ -182,6 +183,8 @@ export class SmokeRenderer {
         if (this.noiseTextures.blueNoise) gl.deleteTexture(this.noiseTextures.blueNoise);
         this.noiseTextures = null;
       }
+      // Reset failure flag to allow retry with new resolution
+      this.noiseGenerationFailed = false;
       console.log(`[SmokeRenderer] Noise resolution changed to ${newSize}³, will regenerate`);
     }
   }
@@ -263,6 +266,29 @@ export class SmokeRenderer {
     this.framebuffer = gl.createFramebuffer();
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.framebuffer);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.colorTex, 0);
+
+    // Check framebuffer completeness to catch GPU/driver issues early
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    if (status !== gl.FRAMEBUFFER_COMPLETE) {
+      const statusNames = {
+        [gl.FRAMEBUFFER_INCOMPLETE_ATTACHMENT]: 'INCOMPLETE_ATTACHMENT',
+        [gl.FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT]: 'INCOMPLETE_MISSING_ATTACHMENT',
+        [gl.FRAMEBUFFER_INCOMPLETE_DIMENSIONS]: 'INCOMPLETE_DIMENSIONS',
+        [gl.FRAMEBUFFER_UNSUPPORTED]: 'UNSUPPORTED',
+      };
+      const statusName = statusNames[status] || `0x${status.toString(16)}`;
+      console.error(`[SmokeRenderer] Framebuffer incomplete: ${statusName} (${targetW}x${targetH})`);
+      // Clean up failed resources
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.deleteFramebuffer(this.framebuffer);
+      gl.deleteTexture(this.colorTex);
+      this.framebuffer = null;
+      this.colorTex = null;
+      this.targetWidth = 0;
+      this.targetHeight = 0;
+      return;
+    }
+
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
@@ -274,7 +300,8 @@ export class SmokeRenderer {
     if (!this.textureInfo) return;
 
     // Generate noise textures on first use (lazy initialization)
-    if (!this.noiseTextures && !this.noiseGenerationInProgress) {
+    // Check noiseGenerationFailed to prevent infinite retry loop on failure
+    if (!this.noiseTextures && !this.noiseGenerationInProgress && !this.noiseGenerationFailed) {
       this.noiseGenerationInProgress = true;
       console.log('[SmokeRenderer] Generating cloud noise textures...');
 
@@ -285,6 +312,7 @@ export class SmokeRenderer {
       }).catch(err => {
         console.error('[SmokeRenderer] Failed to generate noise textures:', err);
         this.noiseGenerationInProgress = false;
+        this.noiseGenerationFailed = true;  // Prevent retry on every frame
       });
 
       // Show loading state
@@ -294,7 +322,7 @@ export class SmokeRenderer {
       return;
     }
 
-    // Still generating - show loading state
+    // Still generating or failed - show loading/fallback state
     if (!this.noiseTextures) {
       gl.viewport(0, 0, width, height);
       gl.clearColor(bgColor[0], bgColor[1], bgColor[2], 1.0);

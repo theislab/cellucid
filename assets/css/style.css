@@ -1281,6 +1281,50 @@ body.dock-dragging .accordion-section:not(.accordion-floating) {
   cursor: not-allowed;
 }
 
+/* Scrollable legend items container for many categories */
+.legend-items-container {
+  position: relative;
+}
+
+.legend-items-scrollable {
+  max-height: 288px; /* ~16 items × 18px height */
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 4px;
+  /* Fade mask at bottom to indicate scrollability */
+  mask-image: linear-gradient(to bottom, black calc(100% - 24px), transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, black calc(100% - 24px), transparent 100%);
+  /* Native scrollbar styling */
+  scrollbar-width: thin;
+  scrollbar-color: rgba(0, 0, 0, 0.35) rgba(0, 0, 0, 0.08);
+}
+
+/* Remove fade mask when scrolled to bottom */
+.legend-items-scrollable.scrolled-to-bottom {
+  mask-image: none;
+  -webkit-mask-image: none;
+}
+
+/* WebKit scrollbar styling */
+.legend-items-scrollable::-webkit-scrollbar {
+  width: 6px;
+}
+
+.legend-items-scrollable::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.06);
+  border-radius: 3px;
+}
+
+.legend-items-scrollable::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: 3px;
+  min-height: 32px;
+}
+
+.legend-items-scrollable::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.45);
+}
+
 /* ========================================================================
    Active filter list – chips with consistent style
    ===================================================================== */
@@ -2641,6 +2685,12 @@ body.dock-dragging .accordion-section:not(.accordion-floating) {
   margin-top: 6px;
 }
 
+/* Equal-width data buttons that scale with sidebar */
+.user-data-row .data-btn {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
 .user-data-path {
   flex: 1;
   min-width: 0;
@@ -3010,4 +3060,335 @@ body.dark-mode .notification-warning {
 body.dark-mode .notification-loading,
 body.dark-mode .notification-progress {
   border-left-color: #6b7280; /* Muted - in progress */
+}
+
+/* =========================================================================
+   Welcome Modal - Newspaper-inspired onboarding
+   ========================================================================= */
+
+.welcome-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.welcome-modal.hidden {
+  display: none;
+}
+
+.welcome-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(17, 24, 39, 0.6);
+  backdrop-filter: blur(4px);
+}
+
+.welcome-content {
+  position: relative;
+  background: var(--viewer-paper);
+  border: 2px solid var(--viewer-ink);
+  box-shadow: 8px 8px 0 rgba(0, 0, 0, 0.15);
+  max-width: 420px;
+  width: 100%;
+  animation: welcomeSlideIn 0.3s ease-out;
+}
+
+@keyframes welcomeSlideIn {
+  from {
+    opacity: 0;
+    transform: translateY(-20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.welcome-header {
+  padding: 24px 24px 20px;
+  text-align: center;
+}
+
+.welcome-logo {
+  width: 200px;
+  height: auto;
+  margin-bottom: 8px;
+}
+
+.welcome-tagline {
+  font-family: "Oswald", system-ui, sans-serif;
+  font-size: 11px;
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: var(--viewer-ink-soft);
+  margin: 0;
+}
+
+.welcome-body {
+  padding: 16px 24px;
+}
+
+.welcome-body::before {
+  content: '';
+  display: block;
+  margin-bottom: 16px;
+  border-top: 1px solid #e5e7eb;
+}
+
+.welcome-intro {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--viewer-ink-soft);
+  margin: 0 0 20px;
+  text-align: center;
+}
+
+.welcome-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.welcome-btn {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  background: #f9fafb;
+  border: 1px solid var(--viewer-ink);
+  box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.12);
+  cursor: pointer;
+  text-decoration: none;
+  color: var(--viewer-ink);
+  transition: all 0.15s ease;
+}
+
+.welcome-btn:hover {
+  background: #e5e7eb;
+  transform: translate(-2px, -2px);
+  box-shadow: 5px 5px 0 rgba(0, 0, 0, 0.15);
+}
+
+.welcome-btn:active {
+  transform: translate(0, 0);
+  box-shadow: 1px 1px 0 rgba(0, 0, 0, 0.1);
+}
+
+.welcome-btn-primary {
+  background: var(--viewer-ink);
+  color: var(--viewer-paper);
+}
+
+.welcome-btn-primary:hover {
+  background: #1f2937;
+}
+
+.welcome-btn-icon {
+  font-size: 20px;
+  width: 28px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.welcome-btn-text {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+.welcome-btn-title {
+  font-family: "Oswald", system-ui, sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.welcome-btn-desc {
+  font-size: 11px;
+  color: inherit;
+  opacity: 0.7;
+}
+
+.welcome-btn-link {
+  background: transparent;
+  border-style: dashed;
+}
+
+.welcome-quote {
+  margin: 20px 0 0;
+  padding-top: 16px;
+  border-top: 1px solid #e5e7eb;
+  font-style: italic;
+  font-size: 12px;
+  color: var(--viewer-ink-soft);
+  text-align: center;
+  opacity: 0.8;
+}
+
+.welcome-quote-text {
+  display: block;
+}
+
+.welcome-quote-attr {
+  display: block;
+  font-style: normal;
+  font-size: 10px;
+  margin-top: 4px;
+  opacity: 0.7;
+}
+
+.welcome-quote-book {
+  font-style: italic;
+}
+
+/* =========================================================================
+   Error Recovery Modal
+   ========================================================================= */
+
+.error-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 10001;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.error-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(17, 24, 39, 0.7);
+}
+
+.error-content {
+  position: relative;
+  background: var(--viewer-paper);
+  border: 2px solid var(--viewer-ink);
+  box-shadow: 8px 8px 0 rgba(0, 0, 0, 0.15);
+  padding: 32px;
+  max-width: 400px;
+  width: 100%;
+  text-align: center;
+  animation: welcomeSlideIn 0.3s ease-out;
+}
+
+.error-icon {
+  font-size: 48px;
+  margin-bottom: 16px;
+  color: #dc2626;
+}
+
+.error-title {
+  font-family: "Oswald", system-ui, sans-serif;
+  font-size: 18px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin: 0 0 12px;
+  color: var(--viewer-ink);
+}
+
+.error-message {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--viewer-ink-soft);
+  margin: 0 0 24px;
+}
+
+.error-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.error-actions .btn-small {
+  min-width: 80px;
+}
+
+/* =========================================================================
+   Keyboard Shortcuts Section
+   ========================================================================= */
+
+.shortcuts-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.shortcut-group-title {
+  font-family: "Inter", system-ui, sans-serif;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--viewer-ink-soft);
+  margin-bottom: 2px;
+}
+
+.shortcut-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 0;
+  font-family: "Inter", system-ui, sans-serif;
+  font-size: 11px;
+  color: var(--viewer-ink-soft);
+}
+
+.shortcut-item kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  font-family: "Fira Code", monospace;
+  font-size: 10px;
+  font-weight: 500;
+  background: #f3f4f6;
+  border: 1px solid #d1d5db;
+  color: var(--viewer-ink);
+}
+
+.shortcut-item span {
+  flex: 1;
+  margin-left: 4px;
+}
+
+/* Mobile adjustments */
+@media (max-width: 480px) {
+  .welcome-content {
+    margin: 10px;
+  }
+
+  .welcome-header {
+    padding: 16px 16px 12px;
+  }
+
+  .welcome-logo {
+    width: 160px;
+  }
+
+  .welcome-body {
+    padding: 16px;
+  }
+
+  .error-content {
+    padding: 24px;
+  }
+
+  .error-actions {
+    flex-direction: column;
+  }
+
+  .error-actions .btn-small {
+    width: 100%;
+  }
 }

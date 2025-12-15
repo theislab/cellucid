@@ -26,6 +26,219 @@ import { SyntheticDataGenerator, PerformanceTracker, BenchmarkReporter, formatNu
 
 console.log('=== SCATTERPLOT APP STARTING ===');
 
+// ============================================================================
+// Onboarding & UX (Welcome Modal, Error Modal, Keyboard Shortcuts)
+// ============================================================================
+
+let welcomeModal = null;
+let welcomeCallbacks = { onExplore: null };
+let shortcutsCallbacks = {
+  onResetCamera: null,
+  onToggleFullscreen: null,
+  onToggleSidebar: null,
+  onSetDimension: null,
+  onShowHelp: null,
+  onClearHighlights: null,
+  onSetNavigationMode: null
+};
+
+// Quotes for the welcome modal
+const welcomeQuotes = [
+  {
+    text: "It's a dangerous business, Frodo, going out your door. You step onto the road, and if you don't keep your feet, there's no knowing where you might be swept off to.",
+    author: "J.R.R. Tolkien",
+    book: "The Fellowship of the Ring"
+  },
+  {
+    text: "There is nothing like looking, if you want to find something. You certainly usually find something, if you look, but it is not always quite the something you were after.",
+    author: "J.R.R. Tolkien",
+    book: "The Hobbit"
+  },
+  {
+    text: "The world is indeed full of peril, and in it there are many dark places; but still there is much that is fair, and though in all lands love is now mingled with grief, it grows perhaps the greater.",
+    author: "J.R.R. Tolkien",
+    book: "The Fellowship of the Ring"
+  },
+  {
+    text: "I wish it need not have happened in my time, said Frodo. So do I, said Gandalf, and so do all who live to see such times. But that is not for them to decide. All we have to decide is what to do with the time that is given us.",
+    author: "J.R.R. Tolkien",
+    book: "The Fellowship of the Ring"
+  },
+  {
+    text: "The Road goes ever on and on, down from the door where it began. Now far ahead the Road has gone, and I must follow, if I can.",
+    author: "J.R.R. Tolkien",
+    book: "The Fellowship of the Ring"
+  },
+  {
+    text: "Home is behind, the world ahead, and there are many paths to tread through shadows to the edge of night, until the stars are all alight.",
+    author: "J.R.R. Tolkien",
+    book: "The Fellowship of the Ring"
+  },
+  {
+    text: "Still round the corner there may wait, a new road or a secret gate; and though I oft have passed them by, a day will come at last when I shall take the hidden paths that run west of the Moon, east of the Sun.",
+    author: "J.R.R. Tolkien",
+    book: "The Return of the King"
+  }
+];
+
+function setRandomQuote() {
+  const quoteEl = welcomeModal?.querySelector('.welcome-quote-text');
+  const authorEl = welcomeModal?.querySelector('.welcome-quote-author');
+  const bookEl = welcomeModal?.querySelector('.welcome-quote-book');
+  if (!quoteEl) return;
+
+  // Avoid showing the same quote twice in a row
+  let lastIndex = -1;
+  try {
+    lastIndex = parseInt(localStorage.getItem('cellucid_last_quote_index') || '-1', 10);
+  } catch (_) { /* localStorage unavailable */ }
+
+  let newIndex;
+  do {
+    newIndex = Math.floor(Math.random() * welcomeQuotes.length);
+  } while (newIndex === lastIndex && welcomeQuotes.length > 1);
+
+  try {
+    localStorage.setItem('cellucid_last_quote_index', String(newIndex));
+  } catch (_) { /* localStorage unavailable */ }
+
+  const quote = welcomeQuotes[newIndex];
+  quoteEl.textContent = `"${quote.text}"`;
+  if (authorEl) authorEl.textContent = quote.author;
+  if (bookEl) bookEl.textContent = quote.book;
+}
+
+function initWelcomeModal(callbacks = {}) {
+  welcomeModal = document.getElementById('welcome-modal');
+  if (!welcomeModal) return;
+  welcomeCallbacks = { ...welcomeCallbacks, ...callbacks };
+  const exploreBtn = document.getElementById('welcome-demo-btn');
+  const backdrop = welcomeModal.querySelector('.welcome-backdrop');
+  if (exploreBtn) {
+    exploreBtn.addEventListener('click', () => {
+      hideWelcomeModal();
+      if (welcomeCallbacks.onExplore) welcomeCallbacks.onExplore();
+    });
+  }
+  if (backdrop) {
+    backdrop.addEventListener('click', () => hideWelcomeModal());
+  }
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && welcomeModal && !welcomeModal.classList.contains('hidden')) {
+      hideWelcomeModal();
+    }
+  });
+  setRandomQuote();
+}
+
+function showWelcomeModal() {
+  if (!welcomeModal) return false;
+  welcomeModal.classList.remove('hidden');
+  return true;
+}
+
+function hideWelcomeModal() {
+  if (welcomeModal) welcomeModal.classList.add('hidden');
+}
+
+function shouldShowWelcome() {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('remote') || params.get('github') || params.get('dataset') || params.get('jupyter')) {
+    return false;
+  }
+  return true;
+}
+
+function toggleFullscreen() {
+  if (!document.fullscreenElement) {
+    document.documentElement.requestFullscreen().catch(err => {
+      console.warn('Fullscreen request failed:', err);
+    });
+  } else {
+    document.exitFullscreen();
+  }
+}
+
+function showShortcutsHelp() {
+  const shortcutsSection = document.getElementById('shortcuts-section');
+  if (shortcutsSection) {
+    shortcutsSection.open = true;
+    shortcutsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+}
+
+function handleGlobalKeyDown(e) {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') {
+    return;
+  }
+  const welcomeVisible = welcomeModal && !welcomeModal.classList.contains('hidden');
+  if (welcomeVisible && e.key !== 'Escape') {
+    return;
+  }
+  const key = e.key.toLowerCase();
+  switch (key) {
+    case 'f':
+      e.preventDefault();
+      if (shortcutsCallbacks.onToggleFullscreen) {
+        shortcutsCallbacks.onToggleFullscreen();
+      } else {
+        toggleFullscreen();
+      }
+      break;
+    case 'h':
+      e.preventDefault();
+      if (shortcutsCallbacks.onToggleSidebar) shortcutsCallbacks.onToggleSidebar();
+      break;
+    case '1':
+      e.preventDefault();
+      if (shortcutsCallbacks.onSetDimension) shortcutsCallbacks.onSetDimension(1);
+      break;
+    case '2':
+      e.preventDefault();
+      if (shortcutsCallbacks.onSetDimension) shortcutsCallbacks.onSetDimension(2);
+      break;
+    case '3':
+      e.preventDefault();
+      if (shortcutsCallbacks.onSetDimension) shortcutsCallbacks.onSetDimension(3);
+      break;
+    case '?':
+      e.preventDefault();
+      if (shortcutsCallbacks.onShowHelp) {
+        shortcutsCallbacks.onShowHelp();
+      } else {
+        showShortcutsHelp();
+      }
+      break;
+    case 'x':
+      e.preventDefault();
+      if (shortcutsCallbacks.onClearHighlights) shortcutsCallbacks.onClearHighlights();
+      break;
+    case 'o':
+      e.preventDefault();
+      if (shortcutsCallbacks.onSetNavigationMode) shortcutsCallbacks.onSetNavigationMode('orbit');
+      break;
+    case 'p':
+      e.preventDefault();
+      if (shortcutsCallbacks.onSetNavigationMode) shortcutsCallbacks.onSetNavigationMode('planar');
+      break;
+    case 'g':
+      e.preventDefault();
+      if (shortcutsCallbacks.onSetNavigationMode) shortcutsCallbacks.onSetNavigationMode('free');
+      break;
+  }
+}
+
+function initKeyboardShortcuts(callbacks = {}) {
+  shortcutsCallbacks = { ...shortcutsCallbacks, ...callbacks };
+  document.addEventListener('keydown', handleGlobalKeyDown);
+}
+
+function initOnboarding(config = {}) {
+  const { welcomeCallbacks = {}, shortcutCallbacks = {} } = config;
+  initWelcomeModal(welcomeCallbacks);
+  initKeyboardShortcuts(shortcutCallbacks);
+}
+
 // Default export base URL (will be updated by DataSourceManager)
 let EXPORT_BASE_URL = 'assets/exports/';
 
@@ -55,6 +268,14 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
   const sidebarToggle = document.getElementById('sidebar-toggle');
 
   initDockableAccordions({ sidebar });
+
+  // Show welcome modal immediately for first-time visitors (before heavy initialization)
+  // This ensures the modal appears first, not after everything else loads
+  initWelcomeModal();
+  if (shouldShowWelcome()) {
+    showWelcomeModal();
+  }
+
   const displayOptionsContainer = document.getElementById('display-options-container');
   const outlierFilterContainer = document.getElementById('outlier-filter-container');
   const outlierFilterInput = document.getElementById('outlier-filter');
@@ -92,6 +313,11 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
   const planarControls = document.getElementById('planar-controls');
   const planarZoomToCursorCheckbox = document.getElementById('planar-zoom-to-cursor');
   const planarInvertAxesCheckbox = document.getElementById('planar-invert-axes');
+  // Keyboard navigation speed sliders
+  const orbitKeySpeedInput = document.getElementById('orbit-key-speed');
+  const orbitKeySpeedDisplay = document.getElementById('orbit-key-speed-display');
+  const planarPanSpeedInput = document.getElementById('planar-pan-speed');
+  const planarPanSpeedDisplay = document.getElementById('planar-pan-speed-display');
   const geneExpressionContainer = document.getElementById('gene-expression-container');
   const geneExpressionSearch = document.getElementById('gene-expression-search');
   const geneExpressionDropdown = document.getElementById('gene-expression-dropdown');
@@ -164,12 +390,13 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
   const datasetObsEl = document.getElementById('dataset-obs');
   const datasetConnectivityEl = document.getElementById('dataset-connectivity');
   const userDataBlock = document.getElementById('user-data-block');
-  const userDataPath = document.getElementById('user-data-path');
-  const userDataBrowseBtn = document.getElementById('user-data-browse-btn');
-  const userDataFileInput = document.getElementById('user-data-file-input');
+  // Three separate buttons for local data loading
   const userDataH5adBtn = document.getElementById('user-data-h5ad-btn');
-  const userDataH5adInput = document.getElementById('user-data-h5ad-input');
   const userDataZarrBtn = document.getElementById('user-data-zarr-btn');
+  const userDataBrowseBtn = document.getElementById('user-data-browse-btn');
+  // Hidden file inputs
+  const userDataFileInput = document.getElementById('user-data-file-input');
+  const userDataH5adInput = document.getElementById('user-data-h5ad-input');
   const userDataZarrInput = document.getElementById('user-data-zarr-input');
   const userDataInfoBtn = document.getElementById('user-data-info-btn');
   const userDataInfoTooltip = document.getElementById('user-data-info-tooltip');
@@ -177,12 +404,14 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
   const remoteServerUrl = document.getElementById('remote-server-url');
   const remoteConnectBtn = document.getElementById('remote-connect-btn');
   const remoteDisconnectBtn = document.getElementById('remote-disconnect-btn');
+  const remoteDisconnectContainer = document.getElementById('remote-disconnect-container');
   const remoteInfoBtn = document.getElementById('remote-info-btn');
   const remoteInfoTooltip = document.getElementById('remote-info-tooltip');
   // GitHub repository elements
   const githubRepoUrl = document.getElementById('github-repo-url');
   const githubConnectBtn = document.getElementById('github-connect-btn');
   const githubDisconnectBtn = document.getElementById('github-disconnect-btn');
+  const githubDisconnectContainer = document.getElementById('github-disconnect-container');
   const githubInfoBtn = document.getElementById('github-info-btn');
   const githubInfoTooltip = document.getElementById('github-info-tooltip');
   let ui = null;
@@ -202,6 +431,35 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
     // Initialize DataSourceManager
     const dataSourceManager = getDataSourceManager();
+
+    // Helper functions for onboarding callbacks (defined early, used later)
+    let toggleSidebarVisibility = null;
+    let setDimensionLevel = null;
+    let clearAllHighlights = null;
+    let setNavigationMode = null;
+
+    // Initialize keyboard shortcuts (welcome modal already shown at bootstrap start)
+    initKeyboardShortcuts({
+      onToggleSidebar: () => {
+        if (toggleSidebarVisibility) toggleSidebarVisibility();
+      },
+      onSetDimension: (dim) => {
+        if (setDimensionLevel) setDimensionLevel(dim);
+      },
+      onShowHelp: () => {
+        const shortcutsSection = document.getElementById('shortcuts-section');
+        if (shortcutsSection) {
+          shortcutsSection.open = true;
+          shortcutsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+      },
+      onClearHighlights: () => {
+        if (clearAllHighlights) clearAllHighlights();
+      },
+      onSetNavigationMode: (mode) => {
+        if (setNavigationMode) setNavigationMode(mode);
+      }
+    });
 
     // Parse URL parameters early (needed for remote/jupyter detection)
     const urlParams = new URLSearchParams(window.location.search);
@@ -273,15 +531,42 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       }
     }
 
-    // Initialize with default sources
+    // Initialize with default sources (registers local-demo and github-repo sources)
     await dataSourceManager.initialize();
 
+    // Check for GitHub repository path in query parameters
+    // Must be after initialize() since github-repo source is registered there
+    const githubPathParam = urlParams.get('github');
+    if (githubPathParam && !remoteUrlParam) {
+      console.log(`[Main] GitHub path from param: ${githubPathParam}`);
+      try {
+        const githubSource = dataSourceManager.getSource('github-repo');
+        if (githubSource) {
+          const { datasets } = await githubSource.connect(githubPathParam);
+          console.log('[Main] Connected to GitHub repository');
+
+          if (datasets && datasets.length > 0) {
+            await dataSourceManager.switchToDataset('github-repo', datasets[0].id);
+            console.log(`[Main] Switched to GitHub dataset: ${datasets[0].id}`);
+
+            // Fill in the input field for visual feedback
+            if (githubRepoUrl) {
+              githubRepoUrl.value = githubPathParam;
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('[Main] Failed to connect to GitHub:', err.message);
+        notifications.error(`Failed to load GitHub data: ${err.message}`, { category: 'connectivity' });
+      }
+    }
+
     // Check URL parameters for dataset selection
-    // Only process if we haven't already connected via remote/jupyter
+    // Only process if we haven't already connected via remote/jupyter/github
     const requestedDataset = urlParams.get('dataset');
     const requestedSource = urlParams.get('source') || 'local-demo';
     const currentSourceType = dataSourceManager.getCurrentSourceType();
-    const skipUrlDataset = currentSourceType === 'remote' || currentSourceType === 'jupyter';
+    const skipUrlDataset = currentSourceType === 'remote' || currentSourceType === 'jupyter' || currentSourceType === 'github-repo';
 
     if (requestedDataset && !skipUrlDataset) {
       // Try to switch to the requested dataset from the requested source
@@ -488,8 +773,35 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
           }
         }
 
-        // Skip connectivity reload in-place (would require fresh edge state); hide controls for now
-        connectivityManifest = null;
+        // Try to reload connectivity manifest for anndata sources
+        try {
+          const newConnManifest = await loadConnectivityManifest(getConnectivityManifestUrl());
+          if (newConnManifest && hasEdgeFormat(newConnManifest)) {
+            connectivityManifest = newConnManifest;
+            console.log(`[Main] Loaded connectivity manifest for reloaded dataset: ${newConnManifest.n_edges?.toLocaleString()} edges`);
+
+            // Show connectivity controls
+            if (connectivityControls) {
+              connectivityControls.style.display = 'block';
+            }
+            // Reset edge state so checkbox handler reloads edges
+            if (viewer.disableEdgesV2) viewer.disableEdgesV2();
+            if (typeof window.__resetConnectivityState === 'function') {
+              window.__resetConnectivityState();
+            }
+          } else {
+            connectivityManifest = null;
+            if (connectivityControls) {
+              connectivityControls.style.display = 'none';
+            }
+          }
+        } catch (err) {
+          console.log('[Main] Connectivity not available for reloaded dataset:', err?.message || err);
+          connectivityManifest = null;
+          if (connectivityControls) {
+            connectivityControls.style.display = 'none';
+          }
+        }
 
         const nextPositions = await positionsPromiseReload;
 
@@ -613,6 +925,10 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         planarControls,
         planarZoomToCursorCheckbox,
         planarInvertAxesCheckbox,
+        orbitKeySpeedInput,
+        orbitKeySpeedDisplay,
+        planarPanSpeedInput,
+        planarPanSpeedDisplay,
         geneExpressionContainer,
         geneExpressionSearch,
         geneExpressionDropdown,
@@ -668,12 +984,13 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         datasetObsEl,
         datasetConnectivityEl,
         userDataBlock,
-        userDataPath,
-        userDataBrowseBtn,
-        userDataFileInput,
+        // Three separate buttons for local data loading
         userDataH5adBtn,
-        userDataH5adInput,
         userDataZarrBtn,
+        userDataBrowseBtn,
+        // Hidden file inputs
+        userDataFileInput,
+        userDataH5adInput,
         userDataZarrInput,
         userDataInfoBtn,
         userDataInfoTooltip,
@@ -681,12 +998,14 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         remoteServerUrl,
         remoteConnectBtn,
         remoteDisconnectBtn,
+        remoteDisconnectContainer,
         remoteInfoBtn,
         remoteInfoTooltip,
         // GitHub repository
         githubRepoUrl,
         githubConnectBtn,
         githubDisconnectBtn,
+        githubDisconnectContainer,
         githubInfoBtn,
         githubInfoTooltip
       },
@@ -704,9 +1023,24 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     async function discoverLocalStateSnapshots(baseUrl) {
       const candidates = new Set();
       const stateRegex = /state[^/]*\.json$/i;
+
+      // Check if baseUrl uses a custom protocol (remote://, local-user://, etc.)
+      const isCustomProtocol = dataSourceManager.isCustomProtocolUrl(baseUrl);
+
+      // For custom protocols, resolve to fetchable URL; for standard URLs, use as-is
+      let fetchableBase = baseUrl;
+      if (isCustomProtocol) {
+        try {
+          fetchableBase = await dataSourceManager.resolveUrl(baseUrl);
+        } catch (err) {
+          console.warn('[Main] Could not resolve custom protocol URL:', baseUrl, err);
+          return []; // Can't discover state files without a fetchable URL
+        }
+      }
+
       let resolvedBase = null;
       try {
-        resolvedBase = new URL(baseUrl, window.location.href);
+        resolvedBase = new URL(fetchableBase, window.location.href);
       } catch (_err) {
         resolvedBase = null;
       }
@@ -761,7 +1095,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       }
 
       try {
-        const res = await fetch(baseUrl);
+        const res = await fetch(fetchableBase);
         if (res.ok) {
           const text = await res.text();
           const linkRegex = /href="([^"]+)"/gi;
@@ -831,14 +1165,17 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       viewer.setRenderMode(mode === 'smoke' ? 'smoke' : 'points');
     }
 
-    // Setup connectivity controls if data is available
-    if (connectivityManifest && hasEdgeFormat(connectivityManifest)) {
-      // Show connectivity controls
-      if (connectivityControls) {
+    // Setup connectivity controls
+    // NOTE: Handlers are ALWAYS set up so they work for datasets loaded dynamically (h5ad/zarr)
+    // The handlers check if connectivityManifest is available before doing anything
+    {
+      // Show connectivity controls if data is available at bootstrap
+      if (connectivityManifest && hasEdgeFormat(connectivityManifest) && connectivityControls) {
         connectivityControls.style.display = 'block';
       }
 
-      const totalEdges = connectivityManifest.n_edges;
+      // Use getter to always get current edge count (supports dynamic manifest updates)
+      const getTotalEdges = () => connectivityManifest?.n_edges || 0;
       const EDGE_UI_CAP = 100000000;  // 100M edges max in UI
 
       // Store edge arrays for accurate visible edge counting
@@ -848,7 +1185,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       // Cached visibility state for edge counting
       let cachedCombinedVisibility = null; // Combined: filter AND LOD visibility
       let lastLodLevel = -1;               // Track LOD level for change detection
-      let actualVisibleEdges = totalEdges;
+      let actualVisibleEdges = getTotalEdges();
 
       // Reusable buffer for combined visibility (avoids GC pressure)
       let combinedVisibilityBuffer = null;
@@ -961,7 +1298,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       function countVisibleEdges(visibility) {
         if (!edgeSources || !edgeDestinations || !visibility) {
           visibleEdgePrefixSum = null;
-          return { visibleCount: totalEdges };
+          return { visibleCount: getTotalEdges() };
         }
         const n = edgeSources.length;
 
@@ -994,7 +1331,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
           return targetVisible;
         }
         if (targetVisible >= actualVisibleEdges) {
-          return totalEdges;
+          return getTotalEdges();
         }
         if (actualVisibleEdges <= 0 || targetVisible <= 0) {
           return 0;
@@ -1018,11 +1355,11 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
         // Fallback: ratio-based approximation (should rarely happen)
         const ratio = targetVisible / actualVisibleEdges;
-        return Math.min(totalEdges, Math.round(totalEdges * ratio * 1.05));
+        return Math.min(getTotalEdges(), Math.round(getTotalEdges() * ratio * 1.05));
       }
 
       // Track current state - user's preference, NOT auto-adjusted by visibility changes
-      let currentEdgeLimit = Math.min(250000, totalEdges);  // User's desired edge count (stable)
+      let currentEdgeLimit = Math.min(250000, getTotalEdges());  // User's desired edge count (stable)
 
       /**
        * Update slider range based on visible edges.
@@ -1053,7 +1390,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
        */
       function updateConnectivityInfo(visibleEdges, shownEdges) {
         if (!connectivityInfo) return;
-        connectivityInfo.textContent = `${formatEdgeCount(totalEdges)} total · ${formatEdgeCount(visibleEdges)} visible · ${formatEdgeCount(shownEdges)} shown`;
+        connectivityInfo.textContent = `${formatEdgeCount(getTotalEdges())} total · ${formatEdgeCount(visibleEdges)} visible · ${formatEdgeCount(shownEdges)} shown`;
       }
 
       /**
@@ -1084,11 +1421,43 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       // Edge loading state
       let edgesLoaded = false;
 
+      // Function to reset edge state (called when switching datasets)
+      function resetEdgeState() {
+        edgesLoaded = false;
+        edgeSources = null;
+        edgeDestinations = null;
+        cachedCombinedVisibility = null;
+        visibleEdgePrefixSum = null;
+        combinedVisibilityBuffer = null;
+        actualVisibleEdges = getTotalEdges();
+        currentEdgeLimit = Math.min(250000, getTotalEdges());
+        lastLodLevel = -1;
+
+        if (connectivityCheckbox) {
+          connectivityCheckbox.checked = false;
+        }
+        if (connectivitySliders) {
+          connectivitySliders.style.display = 'none';
+        }
+        updateSliderRange(actualVisibleEdges);
+        updateConnectivityInfo(actualVisibleEdges, Math.min(currentEdgeLimit, actualVisibleEdges));
+      }
+
+      // Expose reset function for use by reloadActiveDatasetInPlace
+      window.__resetConnectivityState = resetEdgeState;
+
       if (connectivityCheckbox) {
         connectivityCheckbox.addEventListener('change', async () => {
           const show = connectivityCheckbox.checked;
 
-          // Load edge data on first toggle
+          // Check if connectivity manifest is available
+          if (!connectivityManifest || !hasEdgeFormat(connectivityManifest)) {
+            console.warn('[Main] Connectivity checkbox toggled but no manifest available');
+            connectivityCheckbox.checked = false;
+            return;
+          }
+
+          // Load edge data on first toggle (or after manifest was reloaded)
           if (show && !edgesLoaded) {
             const connNotifId = notifications.loading('Loading connectivity data', { category: 'connectivity' });
             try {
@@ -1308,6 +1677,13 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       // This loads edges on-demand when user first tries to use KNN drag
       if (viewer.setKnnEdgeLoadCallback) {
         viewer.setKnnEdgeLoadCallback(async () => {
+          // Check if connectivity manifest is available
+          if (!connectivityManifest || !hasEdgeFormat(connectivityManifest)) {
+            console.warn('[Main] KNN mode requested but no connectivity manifest available');
+            notifications.warn('No neighbor graph available for this dataset', { category: 'connectivity' });
+            return;
+          }
+
           // If edges are already loaded, just build the adjacency list
           if (edgesLoaded && edgeSources && edgeDestinations) {
             if (!viewer.isKnnEdgesLoaded()) {
@@ -1766,6 +2142,40 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     });
 
     await autoLoadLatestState();
+
+    // Define onboarding callback functions now that UI is ready
+    toggleSidebarVisibility = () => {
+      const sidebarToggleBtn = document.getElementById('sidebar-toggle');
+      if (sidebarToggleBtn) {
+        sidebarToggleBtn.click();
+      }
+    };
+
+    setDimensionLevel = (dim) => {
+      const dimensionSelect = document.getElementById('dimension-select');
+      if (dimensionSelect) {
+        // Check if the dimension is available
+        const option = dimensionSelect.querySelector(`option[value="${dim}"]`);
+        if (option && !option.disabled) {
+          dimensionSelect.value = String(dim);
+          dimensionSelect.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      }
+    };
+
+    clearAllHighlights = () => {
+      if (state.clearAllHighlights) {
+        state.clearAllHighlights();
+      }
+    };
+
+    setNavigationMode = (mode) => {
+      const navigationModeSelect = document.getElementById('navigation-mode');
+      if (navigationModeSelect) {
+        navigationModeSelect.value = mode;
+        navigationModeSelect.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    };
 
     viewer.start();
   } catch (err) {

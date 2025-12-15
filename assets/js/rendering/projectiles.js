@@ -986,6 +986,28 @@ export function createProjectileSystem({
       projectileBufferDirty = true;
       impactBufferDirty = true;
     },
+    /**
+     * Dispose of all WebGL resources to prevent GPU memory leaks.
+     * Call this when the projectile system is no longer needed.
+     */
+    dispose() {
+      // Delete all WebGL buffers
+      if (projectilePositionBuffer) gl.deleteBuffer(projectilePositionBuffer);
+      if (projectileColorBuffer) gl.deleteBuffer(projectileColorBuffer);
+      if (impactPositionBuffer) gl.deleteBuffer(impactPositionBuffer);
+      if (impactColorBuffer) gl.deleteBuffer(impactColorBuffer);
+
+      // Clear state
+      projectiles.length = 0;
+      impactFlashes.length = 0;
+      projectilePositions = new Float32Array();
+      projectileColors = new Uint8Array();
+      impactPositions = new Float32Array();
+      impactColors = new Uint8Array();
+      projectilePointCount = 0;
+
+      console.log('[Projectiles] WebGL resources disposed');
+    },
     // Charge system
     startCharging,
     cancelCharging,

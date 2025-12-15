@@ -2,8 +2,14 @@
  * RemoteDataSource - Data source for remote server connections
  *
  * Connects to a cellucid data server running on a remote machine
- * (or localhost via SSH tunnel). Supports both HTTP for data loading
- * and WebSocket for live updates.
+ * (or localhost via SSH tunnel). Supports both HTTP/HTTPS for data loading
+ * and WebSocket/WSS for live updates.
+ *
+ * Protocol handling:
+ * - remote://host:port  - Uses HTTP/WS (auto-upgrades to HTTPS/WSS if page is HTTPS)
+ * - remotes://host:port - Explicitly uses HTTPS/WSS (secure)
+ * - When the web app is served over HTTPS, all connections automatically use
+ *   secure protocols to avoid mixed-content blocking.
  *
  * Usage modes:
  * 1. Direct connection: Server running on accessible host:port
@@ -14,7 +20,7 @@
  * 1. User enters server URL (e.g., http://localhost:8765)
  * 2. RemoteDataSource.connect() validates connection
  * 3. On success, source is activated and datasets are listed
- * 4. Data is loaded via HTTP from server
+ * 4. Data is loaded via HTTP/HTTPS from server
  */
 
 import {
@@ -48,32 +54,65 @@ import { expandObsManifest, expandVarManifest } from './data-loaders.js';
  */
 
 /**
+ * Determine if secure protocols (HTTPS/WSS) should be used.
+ * Returns true if the current page is served over HTTPS.
+ * This prevents mixed-content blocking in browsers.
+ * @returns {boolean}
+ */
+function shouldUseSecureProtocol() {
+  // In browser context, check the current page's protocol
+  if (typeof window !== 'undefined' && window.location) {
+    return window.location.protocol === 'https:';
+  }
+  // Default to insecure for non-browser contexts (e.g., Node.js testing)
+  return false;
+}
+
+/**
  * Check if a URL uses the remote:// protocol
  * @param {string} url - URL to check
  * @returns {boolean}
  */
 export function isRemoteUrl(url) {
-  return url?.startsWith('remote://');
+  return url?.startsWith('remote://') || url?.startsWith('remotes://');
 }
 
 /**
- * Parse a remote:// URL into its components
+ * Check if a URL explicitly requests secure connection (remotes://)
+ * @param {string} url - URL to check
+ * @returns {boolean}
+ */
+export function isSecureRemoteUrl(url) {
+  return url?.startsWith('remotes://');
+}
+
+/**
+ * Parse a remote:// or remotes:// URL into its components.
+ * - remote:// uses HTTP/WS (but upgrades to HTTPS/WSS if page is HTTPS)
+ * - remotes:// explicitly requests HTTPS/WSS
  * @param {string} url - URL to parse
- * @returns {{serverUrl: string, path: string}|null}
+ * @returns {{serverUrl: string, path: string, secure: boolean}|null}
  */
 export function parseRemoteUrl(url) {
   if (!isRemoteUrl(url)) return null;
-  // remote://localhost:8765/path/to/file
-  // -> serverUrl: http://localhost:8765, path: path/to/file
-  const match = url.match(/^remote:\/\/([^/]+)(\/.*)?$/);
+
+  // Match both remote:// and remotes://
+  const match = url.match(/^remotes?:\/\/([^/]+)(\/.*)?$/);
   if (!match) return null;
 
   const hostPort = match[1];
   const path = (match[2] || '/').substring(1); // Remove leading /
 
+  // Use secure protocol if:
+  // 1. URL explicitly uses remotes:// OR
+  // 2. Current page is served over HTTPS (to avoid mixed-content blocking)
+  const secure = isSecureRemoteUrl(url) || shouldUseSecureProtocol();
+  const protocol = secure ? 'https' : 'http';
+
   return {
-    serverUrl: `http://${hostPort}`,
-    path
+    serverUrl: `${protocol}://${hostPort}`,
+    path,
+    secure
   };
 }
 
@@ -148,7 +187,10 @@ export class RemoteDataSource {
     // Normalize URL
     let serverUrl = url.trim();
     if (!serverUrl.startsWith('http://') && !serverUrl.startsWith('https://')) {
-      serverUrl = 'http://' + serverUrl;
+      // If no protocol specified, use https:// when page is served over HTTPS
+      // to avoid mixed-content blocking
+      const protocol = shouldUseSecureProtocol() ? 'https://' : 'http://';
+      serverUrl = protocol + serverUrl;
     }
     // Remove trailing slash
     serverUrl = serverUrl.replace(/\/+$/, '');
@@ -233,7 +275,10 @@ export class RemoteDataSource {
       return;
     }
 
-    const wsUrl = `ws://${new URL(this._serverUrl).hostname}:${this._serverInfo.ws_port}`;
+    // Use wss:// if the server URL is https:// (to avoid mixed-content blocking)
+    const serverUrlObj = new URL(this._serverUrl);
+    const wsProtocol = serverUrlObj.protocol === 'https:' ? 'wss' : 'ws';
+    const wsUrl = `${wsProtocol}://${serverUrlObj.hostname}:${this._serverInfo.ws_port}`;
 
     try {
       this._ws = new WebSocket(wsUrl);

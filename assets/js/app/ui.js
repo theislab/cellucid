@@ -1,6 +1,7 @@
 // UI wiring: binds DOM controls to state/viewer, renders legends and filter summaries.
 import { formatCellCount as formatDataNumber } from '../data/data-source.js';
 import { getNotificationCenter } from './notification-center.js';
+import { updateUrlForDataSource, clearUrlDataSource } from './url-state.js';
 
 export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadActiveDataset }) {
   console.log('[UI] initUI called with dataSourceManager:', !!dataSourceManager);
@@ -55,6 +56,11 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     planarControls,
     planarZoomToCursorCheckbox,
     planarInvertAxesCheckbox,
+    // Keyboard navigation speed sliders
+    orbitKeySpeedInput,
+    orbitKeySpeedDisplay,
+    planarPanSpeedInput,
+    planarPanSpeedDisplay,
     geneExpressionContainer,
     geneExpressionSearch,
     geneExpressionDropdown,
@@ -113,12 +119,13 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     datasetObsEl,
     datasetConnectivityEl,
     userDataBlock,
-    userDataPath,
-    userDataBrowseBtn,
-    userDataFileInput,
+    // Three separate buttons for local data loading
     userDataH5adBtn,
-    userDataH5adInput,
     userDataZarrBtn,
+    userDataBrowseBtn,
+    // Hidden file inputs
+    userDataFileInput,
+    userDataH5adInput,
     userDataZarrInput,
     userDataInfoBtn,
     userDataInfoTooltip,
@@ -126,12 +133,14 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     remoteServerUrl,
     remoteConnectBtn,
     remoteDisconnectBtn,
+    remoteDisconnectContainer,
     remoteInfoBtn,
     remoteInfoTooltip,
     // GitHub repository
     githubRepoUrl,
     githubConnectBtn,
     githubDisconnectBtn,
+    githubDisconnectContainer,
     githubInfoBtn,
     githubInfoTooltip
   } = dom;
@@ -557,10 +566,19 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
   let knnRedoStack = [];
 
   function setHighlightModeUI(mode) {
+    // Capture old state BEFORE updating activeHighlightMode
     const wasLasso = activeHighlightMode === 'lasso';
     const wasProximity = activeHighlightMode === 'proximity';
     const wasKnn = activeHighlightMode === 'knn';
     const wasAnnotation = activeHighlightMode === 'annotation';
+
+    // Selection tools (lasso, proximity, knn, annotation) share a unified candidate set
+    // Compute wasSelectionMode BEFORE updating activeHighlightMode
+    const selectionModes = new Set(['lasso', 'proximity', 'knn', 'annotation']);
+    const wasSelectionMode = selectionModes.has(activeHighlightMode);
+    const isSelectionMode = selectionModes.has(mode);
+
+    // Now update to the new mode
     activeHighlightMode = mode;
 
     if (highlightModeButtonsList && highlightModeButtonsList.length) {
@@ -570,12 +588,8 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       });
     }
 
-    // Selection tools (lasso, proximity, knn, annotation) share a unified candidate set
     // NEVER cancel the selection when switching between selection tools
     // Only cancel when the user explicitly clicks "Cancel"
-    const selectionModes = new Set(['lasso', 'proximity', 'knn', 'annotation']);
-    const wasSelectionMode = selectionModes.has(activeHighlightMode);
-    const isSelectionMode = selectionModes.has(mode);
 
     // If switching from a selection tool to a non-selection mode (like 'none'), clear everything
     if (wasSelectionMode && !isSelectionMode) {
@@ -598,7 +612,9 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     }
     // If switching between selection tools, preserve the selection
     // Clear tool-specific UI history (undo/redo doesn't cross tools)
-    else if (wasSelectionMode && isSelectionMode && activeHighlightMode !== mode) {
+    // Determine the old mode from the was* flags to check if we're actually switching
+    const oldMode = wasLasso ? 'lasso' : wasProximity ? 'proximity' : wasKnn ? 'knn' : wasAnnotation ? 'annotation' : null;
+    if (wasSelectionMode && isSelectionMode && oldMode !== mode) {
       if (wasLasso) {
         lassoHistory = [];
         lassoRedoStack = [];
@@ -3013,6 +3029,19 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
         .sort((a, b) => a.cat.localeCompare(b.cat, undefined, { numeric: true, sensitivity: 'base' }))
         .map(item => item.idx);
 
+      // Create scrollable container for legend items
+      const itemsContainer = document.createElement('div');
+      itemsContainer.className = 'legend-items-container';
+      const needsScroll = sortedIndices.length > 16;
+      if (needsScroll) {
+        itemsContainer.classList.add('legend-items-scrollable');
+        // Update fade mask based on scroll position
+        itemsContainer.addEventListener('scroll', () => {
+          const isAtBottom = itemsContainer.scrollHeight - itemsContainer.scrollTop - itemsContainer.clientHeight < 8;
+          itemsContainer.classList.toggle('scrolled-to-bottom', isAtBottom);
+        });
+      }
+
       sortedIndices.forEach(catIdx => {
         const cat = String(categories[catIdx]);
         const isVisible = field._categoryVisible?.[catIdx] !== false;
@@ -3074,8 +3103,9 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
         row.appendChild(swatch);
         row.appendChild(labelSpan);
         row.appendChild(countSpan);
-        catSection.appendChild(row);
+        itemsContainer.appendChild(row);
       });
+      catSection.appendChild(itemsContainer);
       legendEl.appendChild(catSection);
     }
   }
@@ -3929,10 +3959,8 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
         viewer.setPointerLockEnabled(false);
       }
       toggleNavigationPanels(mode);
-      // Blur the select so WASD keys work immediately in free-fly mode
-      if (mode === 'free') {
-        navigationModeSelect.blur();
-      }
+      // Blur the select so WASD keys work immediately
+      navigationModeSelect.blur();
     });
   }
 
@@ -3944,6 +3972,41 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
   if (moveSpeedInput) {
     updateMoveSpeed();
     moveSpeedInput.addEventListener('input', updateMoveSpeed);
+  }
+
+  // Keyboard navigation speed sliders for orbit and planar modes
+  function updateOrbitKeySpeed() {
+    if (!orbitKeySpeedInput) return;
+    const value = parseFloat(orbitKeySpeedInput.value) / 100;
+    if (orbitKeySpeedDisplay) {
+      orbitKeySpeedDisplay.textContent = value.toFixed(2) + 'x';
+    }
+    if (viewer.setOrbitKeySpeed) {
+      viewer.setOrbitKeySpeed(value);
+    }
+  }
+
+  function updatePlanarPanSpeed() {
+    if (!planarPanSpeedInput) return;
+    // Linear interpolation: slider 1 → 0.0010x, slider 100 → 0.0075x
+    const t = (parseFloat(planarPanSpeedInput.value) - 1) / 99;
+    const value = 0.001 + t * (0.0075 - 0.001);
+    if (planarPanSpeedDisplay) {
+      planarPanSpeedDisplay.textContent = value.toFixed(4) + 'x';
+    }
+    if (viewer.setPlanarPanSpeed) {
+      viewer.setPlanarPanSpeed(value);
+    }
+  }
+
+  if (orbitKeySpeedInput) {
+    updateOrbitKeySpeed();
+    orbitKeySpeedInput.addEventListener('input', updateOrbitKeySpeed);
+  }
+
+  if (planarPanSpeedInput) {
+    updatePlanarPanSpeed();
+    planarPanSpeedInput.addEventListener('input', updatePlanarPanSpeed);
   }
 
   if (invertLookCheckbox && viewer.setInvertLook) {
@@ -5095,18 +5158,13 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
         return;
       }
 
-      // Store the selected dataset in URL and reload for server-hosted sources
-      const url = new URL(window.location.href);
-      url.searchParams.set('dataset', datasetId);
-      if (sourceType !== 'local-demo') {
-        url.searchParams.set('source', sourceType);
-      } else {
-        url.searchParams.delete('source');
-      }
+      // Update URL and reload for server-hosted sources
+      // Use updateUrlForDataSource to ensure other params (remote, github) are cleared
+      updateUrlForDataSource('local-demo', { datasetId });
 
       // Small delay to show the status message before reload
       setTimeout(() => {
-        window.location.href = url.toString();
+        window.location.reload();
       }, 100);
 
     } catch (err) {
@@ -5160,7 +5218,8 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     dataSourceManager: !!dataSourceManager,
     datasetInfo: !!datasetInfo,
     userDataBlock: !!userDataBlock,
-    userDataPath: !!userDataPath,
+    userDataH5adBtn: !!userDataH5adBtn,
+    userDataZarrBtn: !!userDataZarrBtn,
     userDataBrowseBtn: !!userDataBrowseBtn
   });
 
@@ -5232,12 +5291,6 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       try {
         const metadata = await userSource.loadFromFileList(files);
 
-        // Update UI with loaded data
-        if (userDataPath) {
-          userDataPath.value = userSource.getPath() || 'Selected';
-          userDataPath.classList.add('active');
-        }
-
         updateDatasetInfo(metadata);
 
         // Deselect demo dataset dropdown
@@ -5253,18 +5306,15 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
           }
           populateDatasetDropdown();
           notifications.complete(loadNotifId, `User data ready: ${formatDataNumber(metadata.stats?.n_cells)} cells`);
+          clearUrlDataSource(); // Clear URL params - local files can't be restored from URL
         } catch (switchErr) {
           console.warn('[UI] Could not auto-switch to user source:', switchErr);
           notifications.complete(loadNotifId, 'User data validated. Select "Load" to apply.');
+          clearUrlDataSource(); // Clear URL params even on partial success
         }
 
       } catch (err) {
         console.error('[UI] Failed to load user directory:', err);
-
-        if (userDataPath) {
-          userDataPath.value = '';
-          userDataPath.classList.remove('active');
-        }
 
         notifications.fail(loadNotifId, err.getUserMessage?.() || err.message || 'Failed to load');
       }
@@ -5274,21 +5324,28 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     });
   }
 
-  // Browse button triggers the hidden directory input
-  if (userDataBrowseBtn && userDataFileInput) {
-    userDataBrowseBtn.addEventListener('click', () => {
-      userDataFileInput.click();
-    });
-  }
-
-  // H5ad button triggers the hidden h5ad file input
+  // H5AD button triggers the hidden h5ad file input
   if (userDataH5adBtn && userDataH5adInput) {
     userDataH5adBtn.addEventListener('click', () => {
       userDataH5adInput.click();
     });
   }
 
-  // Handle h5ad file input change
+  // Zarr button triggers the hidden zarr directory input
+  if (userDataZarrBtn && userDataZarrInput) {
+    userDataZarrBtn.addEventListener('click', () => {
+      userDataZarrInput.click();
+    });
+  }
+
+  // Exported button triggers the hidden directory input
+  if (userDataBrowseBtn && userDataFileInput) {
+    userDataBrowseBtn.addEventListener('click', () => {
+      userDataFileInput.click();
+    });
+  }
+
+  // Handle h5ad file input change (triggered by data picker dropdown)
   if (userDataH5adInput && dataSourceManager) {
     userDataH5adInput.addEventListener('change', async (e) => {
       const files = e.target.files;
@@ -5306,12 +5363,6 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       try {
         const metadata = await userSource.loadFromFileList(files);
 
-        // Update UI with loaded data
-        if (userDataPath) {
-          userDataPath.value = userSource.getPath() || 'Selected';
-          userDataPath.classList.add('active');
-        }
-
         updateDatasetInfo(metadata);
 
         // Deselect demo dataset dropdown
@@ -5327,18 +5378,15 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
           }
           populateDatasetDropdown();
           notifications.complete(loadNotifId, `User data ready: ${formatDataNumber(metadata.stats?.n_cells)} cells`);
+          clearUrlDataSource(); // Clear URL params - local files can't be restored from URL
         } catch (switchErr) {
           console.warn('[UI] Could not auto-switch to user source:', switchErr);
           notifications.complete(loadNotifId, 'User data validated. Select "Load" to apply.');
+          clearUrlDataSource(); // Clear URL params even on partial success
         }
 
       } catch (err) {
         console.error('[UI] Failed to load h5ad file:', err);
-
-        if (userDataPath) {
-          userDataPath.value = '';
-          userDataPath.classList.remove('active');
-        }
 
         notifications.fail(loadNotifId, err.getUserMessage?.() || err.message || 'Failed to load');
       }
@@ -5348,14 +5396,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     });
   }
 
-  // Zarr button triggers the hidden zarr directory input
-  if (userDataZarrBtn && userDataZarrInput) {
-    userDataZarrBtn.addEventListener('click', () => {
-      userDataZarrInput.click();
-    });
-  }
-
-  // Handle zarr directory input change
+  // Handle zarr directory input change (triggered by data picker dropdown)
   if (userDataZarrInput && dataSourceManager) {
     userDataZarrInput.addEventListener('change', async (e) => {
       const files = e.target.files;
@@ -5373,12 +5414,6 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       try {
         const metadata = await userSource.loadFromFileList(files);
 
-        // Update UI with loaded data
-        if (userDataPath) {
-          userDataPath.value = userSource.getPath() || 'Selected';
-          userDataPath.classList.add('active');
-        }
-
         updateDatasetInfo(metadata);
 
         // Deselect demo dataset dropdown
@@ -5394,18 +5429,15 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
           }
           populateDatasetDropdown();
           notifications.complete(loadNotifId, `User data ready: ${formatDataNumber(metadata.stats?.n_cells)} cells`);
+          clearUrlDataSource(); // Clear URL params - local files can't be restored from URL
         } catch (switchErr) {
           console.warn('[UI] Could not auto-switch to user source:', switchErr);
           notifications.complete(loadNotifId, 'User data validated. Select "Load" to apply.');
+          clearUrlDataSource(); // Clear URL params even on partial success
         }
 
       } catch (err) {
         console.error('[UI] Failed to load zarr directory:', err);
-
-        if (userDataPath) {
-          userDataPath.value = '';
-          userDataPath.classList.remove('active');
-        }
 
         notifications.fail(loadNotifId, err.getUserMessage?.() || err.message || 'Failed to load');
       }
@@ -5479,8 +5511,8 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       if (remoteConnectBtn) {
         remoteConnectBtn.textContent = connected ? 'Reconnect' : 'Connect';
       }
-      if (remoteDisconnectBtn) {
-        remoteDisconnectBtn.style.display = connected ? 'inline-block' : 'none';
+      if (remoteDisconnectContainer) {
+        remoteDisconnectContainer.style.display = connected ? 'flex' : 'none';
       }
       if (remoteServerUrl) {
         remoteServerUrl.disabled = connected;
@@ -5526,6 +5558,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
             if (reloadDataset) {
               await reloadDataset(datasets[0]);
             }
+            updateUrlForDataSource('remote', { serverUrl: url });
           } else {
             notifications.fail(connectNotifId, 'Connected - no datasets found');
           }
@@ -5546,6 +5579,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
           remoteSource.disconnect();
           updateRemoteStatus('Disconnected');
           updateRemoteUI(false);
+          clearUrlDataSource(); // Clear URL params on disconnect
 
           // If we were using remote source, switch back to local-demo
           const currentSource = dataSourceManager.getCurrentSourceType();
@@ -5603,8 +5637,8 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       if (githubConnectBtn) {
         githubConnectBtn.textContent = connected ? 'Reconnect' : 'Connect';
       }
-      if (githubDisconnectBtn) {
-        githubDisconnectBtn.style.display = connected ? 'inline-block' : 'none';
+      if (githubDisconnectContainer) {
+        githubDisconnectContainer.style.display = connected ? 'flex' : 'none';
       }
       if (githubRepoUrl) {
         githubRepoUrl.disabled = connected;
@@ -5648,6 +5682,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
           if (reloadDataset) {
             await reloadDataset(datasets[0]);
           }
+          updateUrlForDataSource('github-repo', { path: repoPath });
         } else {
           notifications.fail(connectNotifId, 'Connected - no datasets found');
         }
@@ -5667,6 +5702,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
           const notifications = getNotificationCenter();
           notifications.success('Disconnected from GitHub', { category: 'connectivity' });
           updateGithubUI(false);
+          clearUrlDataSource(); // Clear URL params on disconnect
 
           // If we were using GitHub source, switch back to local-demo
           const currentSource = dataSourceManager.getCurrentSourceType();

@@ -291,6 +291,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   // Preallocated scratch vectors for updateFreefly() to avoid per-frame allocations
   const _freeflyMove = vec3.create();
   const _freeflyTargetVel = vec3.create();
+  // Preallocated scratch vector for updateCamera() free-fly lookTarget to avoid per-frame allocation
+  const _cameraLookTarget = vec3.create();
   // Preallocated array for render loop view list to avoid per-frame array allocation
   const _renderAllViews = [];
 
@@ -409,6 +411,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   // Planar mode: invert pan axes
   let planarInvertAxes = false;
   let moveSpeed = 1.0; // units per second
+  // Keyboard navigation speeds (controlled by UI sliders)
+  let orbitKeySpeed = 0.4; // multiplier for orbit rotation and zoom speed
+  let planarPanSpeed = 0.0075; // multiplier for planar pan and zoom speed
   const sprintMultiplier = 2.2;
   const activeKeys = new Set();
   let freeflyPosition = vec3.fromValues(0, 0, 3.0);
@@ -872,12 +877,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       if (typeof pointerLockChangeHandler === 'function') pointerLockChangeHandler(false);
       return;
     }
-    if (navigationMode === 'free') {
-      if (code === 'KeyW' || code === 'KeyA' || code === 'KeyS' || code === 'KeyD' ||
-          code === 'KeyQ' || code === 'KeyE' ||
-          code === 'ShiftLeft' || code === 'ShiftRight') {
-        e.preventDefault();
-      }
+    // WASD navigation works in all modes (free, orbit, planar)
+    // Zoom keys: Equal (=) and Minus (-) for zoom in/out, also BracketRight (]) and BracketLeft ([)
+    const navKeys = ['KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyQ', 'KeyE', 'ShiftLeft', 'ShiftRight',
+                     'Equal', 'Minus', 'BracketLeft', 'BracketRight'];
+    if (navKeys.includes(code)) {
+      e.preventDefault();
     }
     activeKeys.add(code);
   };
@@ -1083,6 +1088,51 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     vec3.scaleAndAdd(freeflyPosition, freeflyPosition, freeflyVelocity, dt);
   }
 
+  // WASD navigation and zoom for orbit/planar modes
+  // Uses velocity system for smooth inertia (same as mouse drag)
+  function updateOrbitPlanarKeys(dt) {
+    const sprint = (activeKeys.has('ShiftLeft') || activeKeys.has('ShiftRight')) ? 3.0 : 1.0;
+
+    if (navigationMode === 'planar') {
+      // Planar mode: WASD pans the view using velocity for smooth inertia
+      // Respects "Invert axes" checkbox (same as mouse drag)
+      const panAccel = radius * 0.15 * planarPanSpeed * sprint;
+      const invertX = planarInvertAxes ? 1 : -1;
+      const invertY = planarInvertAxes ? -1 : 1;
+      if (activeKeys.has('KeyW')) velocityPanY += panAccel * invertY;
+      if (activeKeys.has('KeyS')) velocityPanY -= panAccel * invertY;
+      if (activeKeys.has('KeyA')) velocityPanX += panAccel * invertX;
+      if (activeKeys.has('KeyD')) velocityPanX -= panAccel * invertX;
+      // Zoom with = (plus) and - (minus), or ] and [ (brackets)
+      const zoomSpeed = radius * 1.5 * planarPanSpeed * dt;
+      if (activeKeys.has('Equal') || activeKeys.has('BracketRight')) {
+        targetRadius = Math.max(minOrbitRadius, targetRadius - zoomSpeed);
+      }
+      if (activeKeys.has('Minus') || activeKeys.has('BracketLeft')) {
+        targetRadius = Math.min(100.0, targetRadius + zoomSpeed);
+      }
+    } else if (navigationMode === 'orbit') {
+      // Orbit mode: WASD rotates around the anchor using velocity for smooth inertia
+      // Respects "Google Earth-style drag" checkbox (orbitInvertX) for A/D keys
+      const orbitAccel = 0.008 * orbitKeySpeed * sprint;
+      const xSign = orbitInvertX ? -1 : 1;
+      // A/D rotate horizontally (theta) - respects invert setting
+      if (activeKeys.has('KeyA')) velocityTheta -= orbitAccel * xSign;
+      if (activeKeys.has('KeyD')) velocityTheta += orbitAccel * xSign;
+      // W/S rotate vertically (phi)
+      if (activeKeys.has('KeyW')) velocityPhi -= orbitAccel;
+      if (activeKeys.has('KeyS')) velocityPhi += orbitAccel;
+      // Zoom with = (plus) and - (minus), or ] and [ (brackets)
+      const zoomSpeed = radius * 1.5 * orbitKeySpeed * dt;
+      if (activeKeys.has('Equal') || activeKeys.has('BracketRight')) {
+        targetRadius = Math.max(minOrbitRadius, targetRadius - zoomSpeed);
+      }
+      if (activeKeys.has('Minus') || activeKeys.has('BracketLeft')) {
+        targetRadius = Math.min(100.0, targetRadius + zoomSpeed);
+      }
+    }
+  }
+
   function syncFreeflyFromOrbit() {
     const forward = vec3.sub(vec3.create(), target, eye);
     vec3.normalize(forward, forward);
@@ -1146,8 +1196,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     if (navigationMode === 'free') {
       const { forward, upVec } = getFreeflyAxes();
       vec3.copy(eye, freeflyPosition);
-      const lookTarget = vec3.add(vec3.create(), freeflyPosition, forward);
-      mat4.lookAt(viewMatrix, eye, lookTarget, upVec);
+      // Use preallocated vector for lookTarget to avoid per-frame allocation
+      vec3.add(_cameraLookTarget, freeflyPosition, forward);
+      mat4.lookAt(viewMatrix, eye, _cameraLookTarget, upVec);
     } else if (navigationMode === 'planar') {
       // Planar mode: camera looks at the XY plane from the Z axis
       // Camera positioned in front of the target on Z axis
@@ -2484,6 +2535,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     if (navigationMode === 'free') {
       updateFreefly(dt);
     } else {
+      updateOrbitPlanarKeys(dt);
       updateSmoothZoom();
       updateInertia();
     }
@@ -3847,6 +3899,15 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     setOrbitInvertX(value) { orbitInvertX = !!value; },
     setPlanarZoomToCursor(value) { planarZoomToCursor = !!value; },
     setPlanarInvertAxes(value) { planarInvertAxes = !!value; },
+    // Keyboard navigation speed setters
+    setOrbitKeySpeed(value) {
+      if (!Number.isFinite(value)) return;
+      orbitKeySpeed = Math.max(0.01, Math.min(2, value));
+    },
+    setPlanarPanSpeed(value) {
+      if (!Number.isFinite(value)) return;
+      planarPanSpeed = Math.max(0.001, Math.min(0.0075, value));
+    },
     setPointerLockEnabled(enabled) {
       const desired = !!enabled && navigationMode === 'free';
       pointerLockEnabled = desired;

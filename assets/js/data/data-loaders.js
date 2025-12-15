@@ -6,61 +6,39 @@
 import { getDataSourceManager } from './data-source-manager.js';
 import { isLocalUserUrl, resolveUrl } from './data-source.js';
 import { getNotificationCenter } from '../app/notification-center.js';
+import { toUint32Array } from './sparse-utils.js';
+// Unified AnnData provider handles both h5ad and zarr sources
 import {
   isH5adActive,
-  isH5adUrl,
-  h5adLoadPoints,
-  h5adGetObsManifest,
-  h5adGetVarManifest,
-  h5adLoadObsField,
-  h5adLoadGeneExpression,
-  h5adLoadConnectivity,
-  h5adGetConnectivityManifest,
-  h5adGetDatasetIdentity,
-} from './h5ad-data-provider.js';
-import {
   isZarrActive,
+  isH5adUrl,
   isZarrUrl,
-  zarrLoadPoints,
-  zarrGetObsManifest,
-  zarrGetVarManifest,
-  zarrLoadObsField,
-  zarrLoadGeneExpression,
-  zarrLoadConnectivity,
-  zarrGetConnectivityManifest,
-  zarrGetDatasetIdentity,
-} from './zarr-data-provider.js';
+  isAnnDataActive,
+  anndataLoadPoints,
+  anndataGetObsManifest,
+  anndataGetVarManifest,
+  anndataLoadObsField,
+  anndataLoadGeneExpression,
+  anndataLoadConnectivity,
+  anndataGetConnectivityManifest,
+  anndataGetDatasetIdentity,
+} from './anndata-provider.js';
 // Note: remote:// and jupyter:// protocols are handled by DataSourceManager.resolveUrl()
 // via the registered protocol handlers - no explicit imports needed here.
 
 /**
- * Check if we should use h5ad data loading for this URL.
- * Returns true if the h5ad data source is active OR the URL uses h5ad:// protocol.
+ * Check if we should use AnnData data loading (h5ad or zarr) for this URL.
+ * Returns true if either h5ad/zarr source is active OR the URL uses h5ad:// or zarr:// protocol.
  * @param {string} url - URL to check
  * @returns {boolean}
  */
-function shouldUseH5ad(url) {
-  // Check if h5ad source is active (either directly or via local-user)
-  if (isH5adActive()) {
+function shouldUseAnnData(url) {
+  // Check if any AnnData source is active (h5ad or zarr)
+  if (isAnnDataActive()) {
     return true;
   }
-  // Also check if URL uses h5ad:// protocol
-  return isH5adUrl(url);
-}
-
-/**
- * Check if we should use zarr data loading for this URL.
- * Returns true if the zarr data source is active OR the URL uses zarr:// protocol.
- * @param {string} url - URL to check
- * @returns {boolean}
- */
-function shouldUseZarr(url) {
-  // Check if zarr source is active (either directly or via local-user)
-  if (isZarrActive()) {
-    return true;
-  }
-  // Also check if URL uses zarr:// protocol
-  return isZarrUrl(url);
+  // Also check if URL uses h5ad:// or zarr:// protocol
+  return isH5adUrl(url) || isZarrUrl(url);
 }
 
 // ============================================================================
@@ -93,11 +71,7 @@ async function fetchJsonWithProtocol(url) {
   return response.json();
 }
 
-// Legacy compatibility aliases (used in existing code)
-// Note: These are functions that forward to the actual implementations
-// to avoid issues with variable hoisting
-const getLocalUserFileUrl = async (url) => resolveAnyUrl(url);
-const fetchLocalUserBinary = async (url) => fetchBinary(url);
+// Internal alias for JSON fetching with protocol support
 const fetchLocalUserJson = fetchJsonWithProtocol;
 
 // ============================================================================
@@ -368,8 +342,8 @@ export async function loadPointsBinary(url, options = {}) {
   const name = displayName || 'Cell positions';
   let trackerId = null;
 
-  // Check if h5ad source is active - use direct loading
-  if (shouldUseH5ad(url)) {
+  // Check if AnnData source (h5ad or zarr) is active - use direct loading
+  if (shouldUseAnnData(url)) {
     if (showProgress) {
       trackerId = notifications.startDownload(name);
     }
@@ -381,29 +355,7 @@ export async function loadPointsBinary(url, options = {}) {
         dim = parseInt(dimMatch[1], 10);
       }
 
-      const result = await h5adLoadPoints(dim);
-      if (trackerId) notifications.completeDownload(trackerId);
-      return result;
-    } catch (err) {
-      if (trackerId) notifications.failDownload(trackerId, err.message);
-      throw err;
-    }
-  }
-
-  // Check if zarr source is active - use direct loading
-  if (shouldUseZarr(url)) {
-    if (showProgress) {
-      trackerId = notifications.startDownload(name);
-    }
-    try {
-      // Extract dimension from URL if not provided (e.g., points_3d.bin -> 3)
-      let dim = dimension;
-      const dimMatch = url.match(/points_(\d)d\.bin/);
-      if (dimMatch) {
-        dim = parseInt(dimMatch[1], 10);
-      }
-
-      const result = await zarrLoadPoints(dim);
+      const result = await anndataLoadPoints(dim);
       if (trackerId) notifications.completeDownload(trackerId);
       return result;
     } catch (err) {
@@ -502,7 +454,13 @@ export async function loadPointsBinary(url, options = {}) {
           } else if (HAS_PAKO) {
             const decompressed = pako.inflate(allChunks);
             notifications.completeDownload(trackerId);
-            return new Float32Array(decompressed.buffer, decompressed.byteOffset, decompressed.byteLength / 4);
+            // Use slice() to create a properly aligned copy - pako may return views with
+            // non-4-byte-aligned byteOffset which causes Float32Array constructor to throw
+            const alignedBuffer = decompressed.buffer.slice(
+              decompressed.byteOffset,
+              decompressed.byteOffset + decompressed.byteLength
+            );
+            return new Float32Array(alignedBuffer);
           }
         }
 
@@ -518,7 +476,13 @@ export async function loadPointsBinary(url, options = {}) {
           const compressedBuffer = await response.arrayBuffer();
           const decompressed = pako.inflate(new Uint8Array(compressedBuffer));
           if (trackerId) notifications.completeDownload(trackerId);
-          return new Float32Array(decompressed.buffer, decompressed.byteOffset, decompressed.byteLength / 4);
+          // Use slice() to create a properly aligned copy - pako may return views with
+          // non-4-byte-aligned byteOffset which causes Float32Array constructor to throw
+          const alignedBuffer = decompressed.buffer.slice(
+            decompressed.byteOffset,
+            decompressed.byteOffset + decompressed.byteLength
+          );
+          return new Float32Array(alignedBuffer);
         } else {
           console.warn('DecompressionStream not available and pako not loaded, trying uncompressed file');
         }
@@ -781,15 +745,9 @@ export function expandObsManifest(manifest) {
 }
 
 export async function loadObsManifest(url) {
-  // Handle h5ad source
-  if (shouldUseH5ad(url)) {
-    const manifest = h5adGetObsManifest();
-    return expandObsManifest(manifest);
-  }
-
-  // Handle zarr source
-  if (shouldUseZarr(url)) {
-    const manifest = zarrGetObsManifest();
+  // Handle AnnData source (h5ad or zarr) - unified handling
+  if (shouldUseAnnData(url)) {
+    const manifest = anndataGetObsManifest();
     return expandObsManifest(manifest);
   }
 
@@ -816,23 +774,23 @@ export async function loadObsManifest(url) {
 export async function loadObsFieldData(manifestUrl, field) {
   if (!field) throw new Error('No field metadata provided for obs field fetch.');
 
-  // Handle h5ad source
-  if (shouldUseH5ad(manifestUrl)) {
-    const h5adData = await h5adLoadObsField(field.key);
+  // Handle AnnData source (h5ad or zarr) - unified handling
+  if (shouldUseAnnData(manifestUrl)) {
+    const anndataData = await anndataLoadObsField(field.key);
     const outputs = { loaded: true };
 
-    if (h5adData.kind === 'continuous') {
-      outputs.values = new Float32Array(h5adData.data);
+    if (anndataData.kind === 'continuous') {
+      outputs.values = new Float32Array(anndataData.data);
     } else {
       // Categorical
-      const dtype = h5adData.dtype === 'uint8' ? Uint8Array : Uint16Array;
-      const raw = new dtype(h5adData.data);
+      const dtype = anndataData.dtype === 'uint8' ? Uint8Array : Uint16Array;
+      const raw = new dtype(anndataData.data);
 
       // Convert uint8 to uint16 for consistency
-      if (h5adData.dtype === 'uint8') {
+      if (anndataData.dtype === 'uint8') {
         const u16 = new Uint16Array(raw.length);
         const missingU8 = 255;
-        const missingU16 = h5adData.missingValue || 65535;
+        const missingU16 = anndataData.missingValue || 65535;
         for (let i = 0; i < raw.length; i++) {
           u16[i] = raw[i] === missingU8 ? missingU16 : raw[i];
         }
@@ -841,39 +799,7 @@ export async function loadObsFieldData(manifestUrl, field) {
         outputs.codes = raw;
       }
 
-      // No outlier quantiles from h5ad (would need latent space computation)
-      outputs.outlierQuantiles = new Float32Array(raw.length);
-    }
-
-    return outputs;
-  }
-
-  // Handle zarr source
-  if (shouldUseZarr(manifestUrl)) {
-    const zarrData = await zarrLoadObsField(field.key);
-    const outputs = { loaded: true };
-
-    if (zarrData.kind === 'continuous') {
-      outputs.values = new Float32Array(zarrData.data);
-    } else {
-      // Categorical
-      const dtype = zarrData.dtype === 'uint8' ? Uint8Array : Uint16Array;
-      const raw = new dtype(zarrData.data);
-
-      // Convert uint8 to uint16 for consistency
-      if (zarrData.dtype === 'uint8') {
-        const u16 = new Uint16Array(raw.length);
-        const missingU8 = 255;
-        const missingU16 = zarrData.missingValue || 65535;
-        for (let i = 0; i < raw.length; i++) {
-          u16[i] = raw[i] === missingU8 ? missingU16 : raw[i];
-        }
-        outputs.codes = u16;
-      } else {
-        outputs.codes = raw;
-      }
-
-      // No outlier quantiles from zarr (would need latent space computation)
+      // No outlier quantiles from AnnData (would need latent space computation)
       outputs.outlierQuantiles = new Float32Array(raw.length);
     }
 
@@ -948,15 +874,9 @@ export async function loadObsFieldData(manifestUrl, field) {
 
 // Var/gene expression manifest loader
 export async function loadVarManifest(url) {
-  // Handle h5ad source
-  if (shouldUseH5ad(url)) {
-    const manifest = h5adGetVarManifest();
-    return expandVarManifest(manifest);
-  }
-
-  // Handle zarr source
-  if (shouldUseZarr(url)) {
-    const manifest = zarrGetVarManifest();
+  // Handle AnnData source (h5ad or zarr) - unified handling
+  if (shouldUseAnnData(url)) {
+    const manifest = anndataGetVarManifest();
     return expandVarManifest(manifest);
   }
 
@@ -982,15 +902,9 @@ export async function loadVarManifest(url) {
 export async function loadVarFieldData(manifestUrl, field) {
   if (!field) throw new Error('No field metadata provided for var field fetch.');
 
-  // Handle h5ad source
-  if (shouldUseH5ad(manifestUrl)) {
-    const values = await h5adLoadGeneExpression(field.key);
-    return { loaded: true, values };
-  }
-
-  // Handle zarr source
-  if (shouldUseZarr(manifestUrl)) {
-    const values = await zarrLoadGeneExpression(field.key);
+  // Handle AnnData source (h5ad or zarr) - unified handling
+  if (shouldUseAnnData(manifestUrl)) {
+    const values = await anndataLoadGeneExpression(field.key);
     return { loaded: true, values };
   }
 
@@ -1042,15 +956,9 @@ export async function loadObsJson(url) {
  * @returns {Promise<Object>} Connectivity manifest
  */
 export async function loadConnectivityManifest(url) {
-  // Handle h5ad source
-  if (shouldUseH5ad(url)) {
-    const manifest = await h5adGetConnectivityManifest();
-    return manifest;
-  }
-
-  // Handle zarr source
-  if (shouldUseZarr(url)) {
-    const manifest = await zarrGetConnectivityManifest();
+  // Handle AnnData source (h5ad or zarr) - unified handling
+  if (shouldUseAnnData(url)) {
+    const manifest = await anndataGetConnectivityManifest();
     return manifest;
   }
 
@@ -1069,7 +977,14 @@ export async function loadConnectivityManifest(url) {
  * @returns {boolean} True if edge format is available
  */
 export function hasEdgeFormat(manifest) {
-  return manifest && manifest.format === 'edge_pairs' && manifest.sourcesPath && manifest.destinationsPath;
+  if (!manifest || manifest.format !== 'edge_pairs') {
+    return false;
+  }
+  // For file-based sources: need sourcesPath and destinationsPath
+  // For anndata sources: just need n_edges > 0 (edges loaded directly from adapter)
+  const hasFilePaths = manifest.sourcesPath && manifest.destinationsPath;
+  const hasAnndataEdges = manifest.n_edges > 0 && !manifest.sourcesPath;
+  return hasFilePaths || hasAnndataEdges;
 }
 
 /**
@@ -1109,27 +1024,11 @@ export async function loadEdgeDestinations(manifestUrl, manifest) {
  * @returns {Promise<{sources: TypedArray, destinations: TypedArray, nEdges: number, nCells: number, maxNeighbors: number, indexDtype: string}>}
  */
 export async function loadEdges(manifestUrl, manifest) {
-  // Handle h5ad source
-  if (shouldUseH5ad(manifestUrl)) {
-    const edgeData = await h5adLoadConnectivity();
+  // Handle AnnData source (h5ad or zarr) - unified handling
+  if (shouldUseAnnData(manifestUrl)) {
+    const edgeData = await anndataLoadConnectivity();
     if (!edgeData) {
-      throw new Error('No connectivity data in h5ad file');
-    }
-    return {
-      sources: edgeData.sources,
-      destinations: edgeData.destinations,
-      nEdges: edgeData.nEdges,
-      nCells: manifest?.n_cells || edgeData.sources.length,
-      maxNeighbors: manifest?.max_neighbors || 0,
-      indexDtype: 'uint32'
-    };
-  }
-
-  // Handle zarr source
-  if (shouldUseZarr(manifestUrl)) {
-    const edgeData = await zarrLoadConnectivity();
-    if (!edgeData) {
-      throw new Error('No connectivity data in zarr directory');
+      throw new Error('No connectivity data in AnnData file');
     }
     return {
       sources: edgeData.sources,
@@ -1144,17 +1043,24 @@ export async function loadEdges(manifestUrl, manifest) {
   if (!hasEdgeFormat(manifest)) {
     throw new Error('Invalid connectivity manifest: missing edge format.');
   }
-  const [sources, destinations] = await Promise.all([
+  const [rawSources, rawDestinations] = await Promise.all([
     loadEdgeSources(manifestUrl, manifest),
     loadEdgeDestinations(manifestUrl, manifest)
   ]);
+
+  // Convert to Uint32Array to handle uint64 dtypes (BigUint64Array cannot be
+  // assigned to regular typed arrays, and WebGL textures use uint32 anyway).
+  // This is safe because cell counts > 4 billion are unrealistic.
+  const sources = toUint32Array(rawSources);
+  const destinations = toUint32Array(rawDestinations);
+
   return {
     sources,
     destinations,
     nEdges: manifest.n_edges,
     nCells: manifest.n_cells,
     maxNeighbors: manifest.max_neighbors,
-    indexDtype: manifest.index_dtype
+    indexDtype: 'uint32' // Always uint32 after conversion
   };
 }
 
@@ -1168,14 +1074,9 @@ export async function loadEdges(manifestUrl, manifest) {
  * @returns {Promise<Object>} Dataset identity with embeddings metadata
  */
 export async function loadDatasetIdentity(url) {
-  // Handle h5ad source
-  if (shouldUseH5ad(url)) {
-    return h5adGetDatasetIdentity();
-  }
-
-  // Handle zarr source
-  if (shouldUseZarr(url)) {
-    return zarrGetDatasetIdentity();
+  // Handle AnnData source (h5ad or zarr) - unified handling
+  if (shouldUseAnnData(url)) {
+    return anndataGetDatasetIdentity();
   }
 
   // Handle local-user:// URLs

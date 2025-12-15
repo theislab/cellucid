@@ -135,6 +135,44 @@
     </div>
   </noscript>
 
+  <!-- Welcome Modal (shown on first visit, hidden by default) -->
+  <div id="welcome-modal" class="welcome-modal hidden" role="dialog" aria-modal="true" aria-labelledby="welcome-title">
+    <div class="welcome-backdrop"></div>
+    <div class="welcome-content">
+      <div class="welcome-header">
+        <img src="assets/img/cellucid-logo.svg" alt="cellucid" class="welcome-logo" />
+        <h2 id="welcome-title" class="welcome-tagline">Interactive Single-Cell Visualization</h2>
+      </div>
+
+      <div class="welcome-body">
+        <p class="welcome-intro">Every cell tells a story. Navigate through millions of them, uncover hidden patterns, and see your data come alive.</p>
+
+        <div class="welcome-actions">
+          <button type="button" class="welcome-btn welcome-btn-primary" id="welcome-demo-btn">
+            <span class="welcome-btn-icon">◈</span>
+            <span class="welcome-btn-text">
+              <span class="welcome-btn-title">Start Exploring</span>
+              <span class="welcome-btn-desc">Dive into the visualization</span>
+            </span>
+          </button>
+
+          <a href="https://cellucid.readthedocs.io" target="_blank" rel="noopener noreferrer" class="welcome-btn welcome-btn-link">
+            <span class="welcome-btn-icon">→</span>
+            <span class="welcome-btn-text">
+              <span class="welcome-btn-title">Learn More</span>
+              <span class="welcome-btn-desc">Guides and documentation</span>
+            </span>
+          </a>
+        </div>
+
+        <div class="welcome-quote">
+          <span class="welcome-quote-text">"Not all those who wander are lost."</span>
+          <span class="welcome-quote-attr">— <span class="welcome-quote-author">J.R.R. Tolkien</span>, <span class="welcome-quote-book">The Fellowship of the Ring</span></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <canvas id="glcanvas" tabindex="0"></canvas>
 
   <!-- Sidebar toggle button -->
@@ -153,14 +191,6 @@
       <details class="accordion-section" id="session-section" open>
         <summary>Session</summary>
         <div class="accordion-content">
-          <!-- Dataset Selector -->
-          <div class="control-block">
-            <label for="dataset-select">Sample datasets:</label>
-            <select id="dataset-select" class="obs-select">
-              <option value="" disabled selected>Loading...</option>
-            </select>
-          </div>
-
           <!-- Dataset info display -->
           <div id="dataset-info" class="dataset-info">
             <div class="dataset-info-row">
@@ -197,6 +227,14 @@
             </div>
           </div>
 
+          <!-- Dataset Selector -->
+          <div class="control-block">
+            <label for="dataset-select">Sample datasets:</label>
+            <select id="dataset-select" class="obs-select">
+              <option value="" disabled selected>Loading...</option>
+            </select>
+          </div>
+
           <!-- User directory selector -->
           <div class="control-block" id="user-data-block" style="margin-top: 4px; position: relative;">
             <label style="display: flex; align-items: center; gap: 4px;">
@@ -205,24 +243,21 @@
             </label>
             <div id="user-data-info-tooltip" class="info-tooltip" style="display: none;">
               <div class="info-tooltip-content">
-                <div class="info-step">Prepare data: <span class="info-cmd">pip install cellucid</span></div>
-                <div class="info-step">Docs: <a href="https://cellucid.readthedocs.io" target="_blank" class="info-cmd">cellucid.readthedocs.io</a></div>
+                <div class="info-step">H5AD: Load .h5ad files directly in browser</div>
+                <div class="info-step">Zarr: Load .zarr directories directly in browser</div>
+                <div class="info-step">Prepared: Load optimized data via <span class="info-cmd">cellucid prepare</span></div>
+                <div class="info-step">Docs: <a href="https://cellucid.readthedocs.io" target="_blank" rel="noopener noreferrer" class="info-cmd">cellucid.readthedocs.io</a></div>
               </div>
             </div>
-            <label class="sr-only" for="user-data-path">Selected data path</label>
             <div class="user-data-row">
-              <input type="text" id="user-data-path" class="user-data-path"
-                     placeholder="No data selected" readonly />
-              <button id="user-data-browse-btn" class="reset-btn" title="Load exported directory">Folder</button>
-              <button id="user-data-h5ad-btn" class="reset-btn" title="Load .h5ad file directly">.h5ad</button>
-              <button id="user-data-zarr-btn" class="reset-btn" title="Load .zarr directory">.zarr</button>
-              <!-- Hidden file input for cross-browser directory selection -->
+              <button id="user-data-h5ad-btn" class="reset-btn data-btn" title="Load single .h5ad file">H5AD</button>
+              <button id="user-data-zarr-btn" class="reset-btn data-btn" title="Load .zarr directory">Zarr</button>
+              <button id="user-data-browse-btn" class="reset-btn data-btn" title="Load prepared directory">Prepared</button>
+              <!-- Hidden file inputs -->
               <input type="file" id="user-data-file-input" webkitdirectory directory multiple
                      style="display:none;" />
-              <!-- Hidden file input for single h5ad file selection -->
               <input type="file" id="user-data-h5ad-input" accept=".h5ad"
                      style="display:none;" />
-              <!-- Hidden file input for zarr directory selection -->
               <input type="file" id="user-data-zarr-input" webkitdirectory directory multiple
                      style="display:none;" />
             </div>
@@ -236,9 +271,10 @@
             </label>
             <div id="remote-info-tooltip" class="info-tooltip" style="display: none;">
               <div class="info-tooltip-content">
-                <div class="info-step">1. On server: <span class="info-cmd">cellucid serve /path/to/data</span></div>
-                <div class="info-step">2. Local: <span class="info-cmd">ssh -L 8765:localhost:8765 user@server</span></div>
-                <div class="info-step">3. Connect to <span class="info-cmd">http://localhost:8765</span></div>
+                <div class="info-step">Stream data from a local or remote server.</div>
+                <div class="info-step">Local: <span class="info-cmd">cellucid serve /path/to/data</span></div>
+                <div class="info-step">AnnData: <span class="info-cmd">cellucid serve file.h5ad</span></div>
+                <div class="info-step">Remote: <span class="info-cmd">ssh -L 8765:localhost:8765 user@host</span></div>
               </div>
             </div>
             <div class="user-data-row">
@@ -246,8 +282,8 @@
                      placeholder="http://localhost:8765" />
               <button id="remote-connect-btn" class="reset-btn">Connect</button>
             </div>
-            <div style="margin-top:4px;">
-              <button id="remote-disconnect-btn" class="reset-btn" style="display:none; padding:2px 6px; font-size:11px;">Disconnect</button>
+            <div id="remote-disconnect-container" class="user-data-row" style="display:none; margin-top:4px;">
+              <button id="remote-disconnect-btn" class="reset-btn">Disconnect</button>
             </div>
           </div>
 
@@ -259,9 +295,8 @@
             </label>
             <div id="github-info-tooltip" class="info-tooltip" style="display: none;">
               <div class="info-tooltip-content">
-                <div class="info-step">Load data from any public GitHub repo with exported data.</div>
-                <div class="info-step">Format: <span class="info-cmd">owner/repo/path</span></div>
-                <div class="info-step">Example: <span class="info-cmd">myuser/atlas/exports/dataset1</span></div>
+                <div class="info-step">Load prepared data from a public GitHub repository.</div>
+                <div class="info-step">Format: <span class="info-cmd">owner/repo/path/to/data</span></div>
               </div>
             </div>
             <div class="user-data-row">
@@ -269,8 +304,8 @@
                      placeholder="owner/repo/path/to/exports" />
               <button id="github-connect-btn" class="reset-btn">Load</button>
             </div>
-            <div style="margin-top:4px;">
-              <button id="github-disconnect-btn" class="reset-btn" style="display:none; padding:2px 6px; font-size:11px;">Disconnect</button>
+            <div id="github-disconnect-container" class="user-data-row" style="display:none; margin-top:4px;">
+              <button id="github-disconnect-btn" class="reset-btn">Disconnect</button>
             </div>
           </div>
 
@@ -352,9 +387,9 @@
 
           <!-- Renderer Settings -->
           <div class="control-block" id="renderer-controls">
-            <label>Renderer settings:</label>
-            <div class="control-block" style="margin-top:6px;">
+            <div class="control-block" style="margin-bottom:8px; margin-top:0px;">
               <label for="hp-shader-quality">Shader quality:</label>
+              <div class="legend-help">Lower quality reduces GPU load for smoother interaction.</div>
               <select id="hp-shader-quality" class="obs-select">
                 <option value="full">Full (lighting + fog)</option>
                 <option value="light">Light (circular, no lighting)</option>
@@ -362,6 +397,10 @@
               </select>
             </div>
 
+            <label>Renderer settings:</label>
+            <div class="legend-help">
+              Improve performance on large datasets or limited hardware.
+            </div>
             <div class="control-block" style="margin-top:6px;">
               <label class="checkbox-inline">
                 <input type="checkbox" id="hp-lod-enabled" />
@@ -620,6 +659,13 @@
               </select>
             </div>
             <div id="orbit-controls" class="nav-mode-box">
+              <div class="control-block">
+                <label for="orbit-key-speed">Keyboard speed:</label>
+                <div class="slider-row">
+                  <input id="orbit-key-speed" type="range" min="1" max="100" step="1" value="40" />
+                  <span id="orbit-key-speed-display" class="slider-value">0.40x</span>
+                </div>
+              </div>
               <label class="checkbox-inline">
                 <input type="checkbox" id="orbit-reverse" checked />
                 Google Earth-style drag
@@ -630,13 +676,20 @@
               </label>
             </div>
             <div id="planar-controls" class="nav-mode-box" style="display:none;">
+              <div class="control-block">
+                <label for="planar-pan-speed">Keyboard speed:</label>
+                <div class="slider-row">
+                  <input id="planar-pan-speed" type="range" min="1" max="100" step="1" value="100" />
+                  <span id="planar-pan-speed-display" class="slider-value">0.0075x</span>
+                </div>
+              </div>
               <label class="checkbox-inline">
                 <input type="checkbox" id="planar-zoom-to-cursor" checked />
                 Zoom to cursor (pinch-style)
               </label>
               <label class="checkbox-inline">
                 <input type="checkbox" id="planar-invert-axes" />
-                Invert look axes
+                Invert axes
               </label>
             </div>
             <div id="freefly-controls" class="nav-mode-box" style="display:none;">
@@ -674,9 +727,6 @@
                 <div class="legend-help" style="margin-top:6px;">
                   Hides the cursor and lets you look without dragging. Press Esc to release.
                 </div>
-              </div>
-              <div class="legend-help" style="margin-top:6px;">
-                Free-fly: click+drag to look • WASD move • E up • Q down • Shift sprint.
               </div>
             </div>
           </div>
@@ -781,6 +831,39 @@
           </div>
           <div id="highlight-actions" class="highlight-actions" style="display: none;">
             <button type="button" class="btn-small" id="clear-all-highlights">Clear All</button>
+          </div>
+        </div>
+      </details>
+
+      <details class="accordion-section" id="shortcuts-section">
+        <summary>Keyboard Shortcuts</summary>
+        <div class="accordion-content">
+          <div class="shortcuts-list">
+            <div class="shortcut-item"><kbd>R</kbd><span>Reset camera</span></div>
+            <div class="shortcut-item"><kbd>F</kbd><span>Fullscreen</span></div>
+            <div class="shortcut-item"><kbd>H</kbd><span>Toggle sidebar</span></div>
+            <div class="shortcut-item"><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd><span>Switch dimension</span></div>
+            <div class="shortcut-item"><kbd>O</kbd><kbd>P</kbd><kbd>G</kbd><span>Orbit / Planar / Free-fly</span></div>
+            <div class="shortcut-item"><kbd>?</kbd><span>Show shortcuts</span></div>
+          </div>
+          <div class="shortcuts-list" style="margin-top:8px;">
+            <div class="shortcut-group-title">Navigation (Orbit / Planar / Free-fly)</div>
+            <div class="shortcut-item"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd><span>Orbit / pan</span></div>
+            <div class="shortcut-item"><kbd>=</kbd><kbd>]</kbd><span>Zoom in</span></div>
+            <div class="shortcut-item"><kbd>-</kbd><kbd>[</kbd><span>Zoom out</span></div>
+            <div class="shortcut-item"><kbd>Shift</kbd><span>Move faster</span></div>
+          </div>
+          <div class="shortcuts-list" style="margin-top:0px;">
+            <div class="shortcut-group-title">Free-fly specific</div>
+            <div class="shortcut-item"><kbd>Q</kbd><kbd>E</kbd><span>Up / down</span></div>
+            <div class="shortcut-item"><kbd>Esc</kbd><span>Exit pointer lock</span></div>
+          </div>
+          <div class="shortcuts-list" style="margin-top:8px;">
+            <div class="shortcut-group-title">Highlighting</div>
+            <div class="shortcut-item"><kbd>Alt</kbd>+click<span>Highlight group</span></div>
+            <div class="shortcut-item"><kbd>Alt</kbd>+drag<span>Area selection</span></div>
+            <div class="shortcut-item"><kbd>Shift</kbd>+click<span>Add to selection</span></div>
+            <div class="shortcut-item"><kbd>X</kbd><span>Clear highlights</span></div>
           </div>
         </div>
       </details>
