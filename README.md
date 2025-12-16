@@ -132,4 +132,4 @@ See [theislab/cellucid-python](https://github.com/theislab/cellucid-python) for 
 
 ## License
 
-BSD-3-Clause
+Proprietary - All rights reserved
