@@ -22,9 +22,11 @@ import { getDataSourceManager } from '../data/data-source-manager.js';
 import { createLocalUserDirDataSource } from '../data/local-user-source.js';
 import { createRemoteDataSource } from '../data/remote-source.js';
 import { createJupyterBridgeDataSource, isJupyterContext, getJupyterConfig } from '../data/jupyter-source.js';
-import { SyntheticDataGenerator, PerformanceTracker, BenchmarkReporter, formatNumber } from '../dev/benchmark.js';
+// formatNumber imported from data-source.js; benchmark module lazy-loaded when needed
+import { formatCellCount as formatNumber } from '../data/data-source.js';
+import { createComparisonModule } from './analysis/comparison-module.js';
 
-console.log('=== SCATTERPLOT APP STARTING ===');
+console.log('=== CELLUCID STARTING ===');
 
 // ============================================================================
 // Onboarding & UX (Welcome Modal, Error Modal, Keyboard Shortcuts)
@@ -285,7 +287,6 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
   // Highlight UI elements
   const highlightCountEl = document.getElementById('highlight-count');
   const highlightedGroupsEl = document.getElementById('highlighted-groups-list');
-  const highlightActionsEl = document.getElementById('highlight-actions');
   const clearAllHighlightsBtn = document.getElementById('clear-all-highlights');
   const highlightPagesTabsEl = document.getElementById('highlight-pages-tabs');
   const addHighlightPageBtn = document.getElementById('add-highlight-page');
@@ -423,7 +424,8 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
     const state = createDataState({ viewer, labelLayer });
     console.log('[Main] State created successfully');
-    const benchmarkReporter = new BenchmarkReporter({ viewer, state, canvas });
+    // benchmarkReporter will be created lazily when benchmark report is requested
+    let benchmarkReporter = null;
 
     // Initialize notification center early
     const notifications = getNotificationCenter();
@@ -598,77 +600,94 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     // Initialize dimension manager for multi-dimensional embeddings
     const dimensionManager = createDimensionManager({ baseUrl: EXPORT_BASE_URL });
 
-    // Try to load dataset identity for embeddings metadata
-    let datasetIdentity = null;
-    try {
-      datasetIdentity = await loadDatasetIdentity(getDatasetIdentityUrl());
-      const embeddingsMetadata = getEmbeddingsMetadata(datasetIdentity);
-      dimensionManager.initFromMetadata(embeddingsMetadata);
-      console.log(`[Main] Loaded dataset identity v${datasetIdentity.version || 1}`);
-    } catch (err) {
-      if (err?.status === 404) {
-        console.log('[Main] dataset_identity.json not found, using default 3D embeddings');
-        // Use default 3D-only embeddings (points_3d.bin is the standard filename)
-        dimensionManager.initFromMetadata({
-          available_dimensions: [3],
-          default_dimension: 3,
-          files: { '3d': 'points_3d.bin' }
-        });
-      } else {
-        console.warn('[Main] Error loading dataset identity:', err);
-      }
-    }
-
-    // Set dimension manager on state
-    state.setDimensionManager(dimensionManager);
-
-    // Load positions using dimension manager
-    const defaultDim = dimensionManager.getDefaultDimension();
-    const positionsPromise = dimensionManager.getPositions3D(defaultDim);
-
-    let obs = null;
-    try {
-      obs = await loadObsManifest(getObsManifestUrl());
-      state.setFieldLoader((field) => loadObsFieldData(getObsManifestUrl(), field));
-    } catch (err) {
-      if (err?.status === 404) {
-        console.warn('obs_manifest.json not found, falling back to obs_values.json');
-        try {
-          obs = await loadObsJson(getLegacyObsUrl());
-        } catch (err2) {
-          console.warn('obs_values.json also not found, using empty obs');
-          obs = { fields: [], count: 0 };
+    // Helper: load obs manifest with fallback to legacy format
+    async function loadObsManifestWithFallback() {
+      try {
+        const manifest = await loadObsManifest(getObsManifestUrl());
+        state.setFieldLoader((field) => loadObsFieldData(getObsManifestUrl(), field));
+        return manifest;
+      } catch (err) {
+        if (err?.status === 404) {
+          console.warn('obs_manifest.json not found, falling back to obs_values.json');
+          try {
+            return await loadObsJson(getLegacyObsUrl());
+          } catch (err2) {
+            console.warn('obs_values.json also not found, using empty obs');
+            return { fields: [], count: 0 };
+          }
         }
-      } else {
         throw err;
       }
     }
 
-    // Try to load var manifest for gene expression
-    try {
-      const varManifest = await loadVarManifest(getVarManifestUrl());
-      state.setVarFieldLoader((field) => loadVarFieldData(getVarManifestUrl(), field));
-      state.initVarData(varManifest);
-      console.log(`Loaded var manifest with ${varManifest?.fields?.length || 0} genes.`);
-    } catch (err) {
+    // Start ALL manifest loads in parallel for faster initialization
+    const identityPromise = loadDatasetIdentity(getDatasetIdentityUrl()).catch(err => {
+      if (err?.status === 404) {
+        console.log('[Main] dataset_identity.json not found, using default 3D embeddings');
+        return null;
+      }
+      console.warn('[Main] Error loading dataset identity:', err);
+      return null;
+    });
+
+    const obsPromise = loadObsManifestWithFallback();
+
+    const varPromise = loadVarManifest(getVarManifestUrl()).catch(err => {
       if (err?.status === 404) {
         console.log('var_manifest.json not found, gene expression not available.');
       } else {
         console.warn('Error loading var manifest:', err);
       }
-    }
+      return null;
+    });
 
-    // Try to load connectivity manifest for KNN edges
-    let connectivityManifest = null;
-    try {
-      connectivityManifest = await loadConnectivityManifest(getConnectivityManifestUrl());
-      console.log(`Loaded connectivity manifest with ${connectivityManifest?.n_edges?.toLocaleString() || 0} edges.`);
-    } catch (err) {
+    const connPromise = loadConnectivityManifest(getConnectivityManifestUrl()).catch(err => {
       if (err?.status === 404) {
         console.log('connectivity_manifest.json not found, connectivity not available.');
       } else {
         console.warn('Error loading connectivity manifest:', err);
       }
+      return null;
+    });
+
+    // Wait for identity first (needed to determine which positions file to load)
+    let datasetIdentity = await identityPromise;
+    if (datasetIdentity) {
+      const embeddingsMetadata = getEmbeddingsMetadata(datasetIdentity);
+      dimensionManager.initFromMetadata(embeddingsMetadata);
+      console.log(`[Main] Loaded dataset identity v${datasetIdentity.version || 1}`);
+    } else {
+      dimensionManager.initFromMetadata({
+        available_dimensions: [3],
+        default_dimension: 3,
+        files: { '3d': 'points_3d.bin' }
+      });
+    }
+
+    // Set dimension manager on state
+    state.setDimensionManager(dimensionManager);
+
+    // Start positions loading NOW (other manifests still loading in parallel)
+    const defaultDim = dimensionManager.getDefaultDimension();
+    const positionsPromise = dimensionManager.getPositions3D(defaultDim);
+
+    // Wait for remaining manifests (already loading in parallel)
+    // Note: connectivityManifest needs to be `let` because reloadActiveDatasetInPlace() reassigns it
+    const [obs, varManifest, connManifestResult] = await Promise.all([
+      obsPromise, varPromise, connPromise
+    ]);
+    let connectivityManifest = connManifestResult;
+
+    // Set up var data if loaded
+    if (varManifest) {
+      state.setVarFieldLoader((field) => loadVarFieldData(getVarManifestUrl(), field));
+      state.initVarData(varManifest);
+      console.log(`Loaded var manifest with ${varManifest?.fields?.length || 0} genes.`);
+    }
+
+    // Log connectivity if loaded
+    if (connectivityManifest) {
+      console.log(`Loaded connectivity manifest with ${connectivityManifest?.n_edges?.toLocaleString() || 0} edges.`);
     }
 
     // In-place dataset reload for sources that cannot survive a page refresh (e.g., local-user)
@@ -710,93 +729,80 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         dimensionManager.clearCache();
         dimensionManager.setBaseUrl(EXPORT_BASE_URL);
 
-        // Try to load new dataset_identity.json for embeddings metadata
-        try {
-          const newDatasetIdentity = await loadDatasetIdentity(getDatasetIdentityUrl());
-          const newEmbeddingsMetadata = getEmbeddingsMetadata(newDatasetIdentity);
-          dimensionManager.initFromMetadata(newEmbeddingsMetadata);
-          console.log(`[Main] Reloaded dataset identity v${newDatasetIdentity.version || 1}`);
-        } catch (err) {
+        // Start ALL manifest loads in parallel for faster reload
+        const reloadIdentityPromise = loadDatasetIdentity(getDatasetIdentityUrl()).catch(err => {
           if (err?.status === 404) {
             console.log('[Main] dataset_identity.json not found for reloaded dataset, using default 3D embeddings');
-            dimensionManager.initFromMetadata({
-              available_dimensions: [3],
-              default_dimension: 3,
-              files: { '3d': 'points_3d.bin' }
-            });
           } else {
             console.warn('[Main] Error loading dataset identity for reloaded dataset:', err);
-            // Fall back to 3D-only
-            dimensionManager.initFromMetadata({
-              available_dimensions: [3],
-              default_dimension: 3,
-              files: { '3d': 'points_3d.bin' }
-            });
           }
-        }
+          return null;
+        });
 
-        // Load positions through dimension manager for proper multi-dimensional support
-        const newDefaultDim = dimensionManager.getDefaultDimension();
-        const positionsPromiseReload = dimensionManager.getPositions3D(newDefaultDim);
+        const reloadObsPromise = loadObsManifestWithFallback();
 
-        let nextObs = null;
-        try {
-          nextObs = await loadObsManifest(getObsManifestUrl());
-          state.setFieldLoader((field) => loadObsFieldData(getObsManifestUrl(), field));
-        } catch (err) {
-          if (err?.status === 404) {
-            console.warn('obs_manifest.json not found, falling back to obs_values.json');
-            try {
-              nextObs = await loadObsJson(getLegacyObsUrl());
-            } catch (err2) {
-              console.warn('obs_values.json also not found, using empty obs');
-              nextObs = { fields: [], count: 0 };
-            }
-          } else {
-            throw err;
-          }
-        }
-
-        // Reload var manifest (optional)
-        try {
-          const nextVarManifest = await loadVarManifest(getVarManifestUrl());
-          state.setVarFieldLoader((field) => loadVarFieldData(getVarManifestUrl(), field));
-          state.initVarData(nextVarManifest);
-          console.log(`[Main] Reloaded var manifest with ${nextVarManifest?.fields?.length || 0} genes.`);
-        } catch (err) {
-          state.setVarFieldLoader?.(null);
-          state.varData = null;
+        const reloadVarPromise = loadVarManifest(getVarManifestUrl()).catch(err => {
           if (err?.status === 404) {
             console.log('[Main] var_manifest.json not found for reloaded dataset (gene expression disabled).');
           } else {
             console.warn('[Main] Error loading var manifest for reloaded dataset:', err);
           }
+          return null;
+        });
+
+        const reloadConnPromise = loadConnectivityManifest(getConnectivityManifestUrl()).catch(err => {
+          console.log('[Main] Connectivity not available for reloaded dataset:', err?.message || err);
+          return null;
+        });
+
+        // Wait for identity first (needed to determine positions file)
+        const newDatasetIdentity = await reloadIdentityPromise;
+        if (newDatasetIdentity) {
+          const newEmbeddingsMetadata = getEmbeddingsMetadata(newDatasetIdentity);
+          dimensionManager.initFromMetadata(newEmbeddingsMetadata);
+          console.log(`[Main] Reloaded dataset identity v${newDatasetIdentity.version || 1}`);
+        } else {
+          dimensionManager.initFromMetadata({
+            available_dimensions: [3],
+            default_dimension: 3,
+            files: { '3d': 'points_3d.bin' }
+          });
         }
 
-        // Try to reload connectivity manifest for anndata sources
-        try {
-          const newConnManifest = await loadConnectivityManifest(getConnectivityManifestUrl());
-          if (newConnManifest && hasEdgeFormat(newConnManifest)) {
-            connectivityManifest = newConnManifest;
-            console.log(`[Main] Loaded connectivity manifest for reloaded dataset: ${newConnManifest.n_edges?.toLocaleString()} edges`);
+        // Start positions loading NOW (other manifests still loading in parallel)
+        const newDefaultDim = dimensionManager.getDefaultDimension();
+        const positionsPromiseReload = dimensionManager.getPositions3D(newDefaultDim);
 
-            // Show connectivity controls
-            if (connectivityControls) {
-              connectivityControls.style.display = 'block';
-            }
-            // Reset edge state so checkbox handler reloads edges
-            if (viewer.disableEdgesV2) viewer.disableEdgesV2();
-            if (typeof window.__resetConnectivityState === 'function') {
-              window.__resetConnectivityState();
-            }
-          } else {
-            connectivityManifest = null;
-            if (connectivityControls) {
-              connectivityControls.style.display = 'none';
-            }
+        // Wait for remaining manifests (already loading in parallel)
+        const [nextObs, nextVarManifest, newConnManifest] = await Promise.all([
+          reloadObsPromise, reloadVarPromise, reloadConnPromise
+        ]);
+
+        // Set up var data if loaded
+        if (nextVarManifest) {
+          state.setVarFieldLoader((field) => loadVarFieldData(getVarManifestUrl(), field));
+          state.initVarData(nextVarManifest);
+          console.log(`[Main] Reloaded var manifest with ${nextVarManifest?.fields?.length || 0} genes.`);
+        } else {
+          state.setVarFieldLoader?.(null);
+          state.varData = null;
+        }
+
+        // Handle connectivity manifest
+        if (newConnManifest && hasEdgeFormat(newConnManifest)) {
+          connectivityManifest = newConnManifest;
+          console.log(`[Main] Loaded connectivity manifest for reloaded dataset: ${newConnManifest.n_edges?.toLocaleString()} edges`);
+
+          // Show connectivity controls
+          if (connectivityControls) {
+            connectivityControls.style.display = 'block';
           }
-        } catch (err) {
-          console.log('[Main] Connectivity not available for reloaded dataset:', err?.message || err);
+          // Reset edge state so checkbox handler reloads edges
+          if (viewer.disableEdgesV2) viewer.disableEdgesV2();
+          if (typeof window.__resetConnectivityState === 'function') {
+            window.__resetConnectivityState();
+          }
+        } else {
           connectivityManifest = null;
           if (connectivityControls) {
             connectivityControls.style.display = 'none';
@@ -805,7 +811,9 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
         const nextPositions = await positionsPromiseReload;
 
-        state.initScene(nextPositions, nextObs);
+        // Get the normalization transform from DimensionManager to apply to centroids
+        const reloadNormTransform = dimensionManager.getNormTransform(newDefaultDim);
+        state.initScene(nextPositions, nextObs, reloadNormTransform);
         if (state.clearActiveField) {
           state.clearActiveField();
         }
@@ -849,8 +857,10 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
     const positions = await positionsPromise;
 
-    // Normalize / init scatter state
-    state.initScene(positions, obs);
+    // Get the normalization transform from DimensionManager to apply to centroids
+    // Positions are already normalized by getPositions3D(), we just need the transform for centroids
+    const normTransform = dimensionManager.getNormTransform(defaultDim);
+    state.initScene(positions, obs, normTransform);
     // One-time helper to rebuild density from current visibility + grid
     function rebuildSmokeDensity(gridSizeOverride) {
       const gridSize = gridSizeOverride || 128;
@@ -897,7 +907,6 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         activeFiltersEl,
         highlightCountEl,
         highlightedGroupsEl,
-        highlightActionsEl,
         clearAllHighlightsBtn,
         highlightPagesTabsEl,
         addHighlightPageBtn,
@@ -1017,6 +1026,17 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       dataSourceManager: dataSourceManager
     });
 
+    // Initialize Page Analysis / Comparison Module
+    const pageAnalysisSection = document.getElementById('page-analysis-section');
+    if (pageAnalysisSection) {
+      const comparisonModule = createComparisonModule({
+        state,
+        container: pageAnalysisSection
+      });
+      // Store reference for potential external access
+      window._comparisonModule = comparisonModule;
+    }
+
     await ui.activateField(-1);
 
     // Discover state snapshots in the exports directory (for automatic restore)
@@ -1118,19 +1138,14 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
           const candidateUrl = resolveCandidate(name);
           if (candidates.has(candidateUrl)) continue;
           try {
-            const headResp = await fetch(candidateUrl, { method: 'HEAD' });
-            if (headResp.ok) {
+            // Use GET directly - state files are small JSON, so payload is minimal
+            // This avoids the HEAD+GET double request for servers that don't support HEAD
+            const resp = await fetch(candidateUrl);
+            if (resp.ok) {
               candidates.add(candidateUrl);
-              continue;
-            }
-            if (headResp.status === 405 || headResp.status === 501) {
-              const getResp = await fetch(candidateUrl);
-              if (getResp.ok) {
-                candidates.add(candidateUrl);
-              }
             }
           } catch (_err) {
-            // Ignore missing files or servers that disallow HEAD
+            // Ignore missing files or network errors
           }
         }
       }
@@ -1754,8 +1769,30 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     const hpLodForce = document.getElementById('hp-lod-force');
     const hpLodForceLabel = document.getElementById('hp-lod-force-label');
 
-    // Performance tracker for FPS monitoring
-    const perfTracker = new PerformanceTracker();
+    // Performance tracker for FPS monitoring (lazy-loaded with benchmark module)
+    let perfTracker = null;
+    let SyntheticDataGenerator = null;  // For synthetic data generation
+    let BenchmarkReporter = null;       // For report generation
+    let benchmarkModuleLoaded = false;
+
+    // Lazy-load benchmark module when first needed
+    async function ensureBenchmarkModule() {
+      if (benchmarkModuleLoaded) return true;
+      try {
+        const benchmarkModule = await import('../dev/benchmark.js');
+        SyntheticDataGenerator = benchmarkModule.SyntheticDataGenerator;
+        BenchmarkReporter = benchmarkModule.BenchmarkReporter;
+        const PerformanceTrackerClass = benchmarkModule.PerformanceTracker;
+        perfTracker = new PerformanceTrackerClass();
+        benchmarkModuleLoaded = true;
+        console.log('[Main] Benchmark module lazy-loaded');
+        return true;
+      } catch (err) {
+        console.error('[Main] Failed to load benchmark module:', err);
+        return false;
+      }
+    }
+
     let benchmarkActive = false;
     let activeDatasetMode = 'real';
     let syntheticDatasetInfo = null;
@@ -1869,6 +1906,12 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     };
 
     const startPerfMonitoring = ({ resetTracker = false } = {}) => {
+      // perfTracker is lazy-loaded; if not available yet, skip monitoring
+      if (!perfTracker) {
+        console.warn('[Main] Performance tracker not loaded yet');
+        return;
+      }
+
       ensureBenchmarkStatsVisible();
 
       if (resetTracker || !benchmarkActive) {
@@ -1900,7 +1943,9 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
     const stopPerfMonitoring = () => {
       benchmarkActive = false;
-      perfTracker.stop();
+      if (perfTracker) {
+        perfTracker.stop();
+      }
       if (perfLoopHandle) {
         cancelAnimationFrame(perfLoopHandle);
         perfLoopHandle = null;
@@ -1964,8 +2009,10 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     }
 
     if (benchmarkSection) {
-      benchmarkSection.addEventListener('toggle', () => {
+      benchmarkSection.addEventListener('toggle', async () => {
         if (benchmarkSection.open) {
+          // Lazy-load benchmark module when section is first opened
+          await ensureBenchmarkModule();
           activateBenchmarkingPanel({ resetTracker: true });
         } else {
           stopPerfMonitoring();
@@ -1974,6 +2021,14 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     }
 
     async function runBenchmark(pointCount, pattern) {
+      // Ensure benchmark module is loaded before running
+      const moduleLoaded = await ensureBenchmarkModule();
+      if (!moduleLoaded || !SyntheticDataGenerator) {
+        console.error('[Main] Cannot run benchmark: SyntheticDataGenerator not available');
+        notifications.error('Benchmark module failed to load', { category: 'benchmark' });
+        return;
+      }
+
       console.log(`Running benchmark: ${formatNumber(pointCount)} points (${pattern})`);
 
       // Show notification for benchmark data generation
@@ -2077,7 +2132,18 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     }
 
     async function generateSituationReport() {
-      if (!benchmarkReporter) return;
+      // Ensure benchmark module is loaded
+      const moduleLoaded = await ensureBenchmarkModule();
+      if (!moduleLoaded || !BenchmarkReporter) {
+        console.warn('[Main] Benchmark module not loaded, cannot generate report');
+        notifications.error('Benchmark module not available', { category: 'benchmark' });
+        return;
+      }
+
+      // Create benchmarkReporter lazily on first use
+      if (!benchmarkReporter) {
+        benchmarkReporter = new BenchmarkReporter({ viewer, state, canvas });
+      }
 
       // Show notification for report generation
       const reportNotifId = notifications.startReport();

@@ -1,6 +1,6 @@
 {
   "version": 3,
-  "timestamp": "2025-12-09T22:04:36.370Z",
+  "timestamp": "2025-12-16T04:45:52.172Z",
   "dataSource": {
     "sourceType": "local-demo",
     "datasetId": "suo",
@@ -29,8 +29,13 @@
       "pitch": 0
     }
   },
+  "activeDimensionLevel": 3,
   "uiControls": {
-    "user-data-path": {
+    "remote-server-url": {
+      "type": "text",
+      "value": ""
+    },
+    "github-repo-url": {
       "type": "text",
       "value": ""
     },
@@ -59,34 +64,6 @@
       "value": "-1"
     },
     "hp-frustum-culling": {
-      "type": "checkbox",
-      "checked": false
-    },
-    "orbit-reverse": {
-      "type": "checkbox",
-      "checked": true
-    },
-    "show-orbit-anchor": {
-      "type": "checkbox",
-      "checked": false
-    },
-    "look-sensitivity": {
-      "type": "range",
-      "value": "5"
-    },
-    "move-speed": {
-      "type": "range",
-      "value": "100"
-    },
-    "invert-look": {
-      "type": "checkbox",
-      "checked": false
-    },
-    "projectiles-enabled": {
-      "type": "checkbox",
-      "checked": false
-    },
-    "pointer-lock": {
       "type": "checkbox",
       "checked": false
     },
@@ -158,6 +135,50 @@
       "type": "range",
       "value": "250000"
     },
+    "orbit-key-speed": {
+      "type": "range",
+      "value": "40"
+    },
+    "orbit-reverse": {
+      "type": "checkbox",
+      "checked": true
+    },
+    "show-orbit-anchor": {
+      "type": "checkbox",
+      "checked": false
+    },
+    "planar-pan-speed": {
+      "type": "range",
+      "value": "100"
+    },
+    "planar-zoom-to-cursor": {
+      "type": "checkbox",
+      "checked": true
+    },
+    "planar-invert-axes": {
+      "type": "checkbox",
+      "checked": false
+    },
+    "look-sensitivity": {
+      "type": "range",
+      "value": "5"
+    },
+    "move-speed": {
+      "type": "range",
+      "value": "100"
+    },
+    "invert-look": {
+      "type": "checkbox",
+      "checked": false
+    },
+    "projectiles-enabled": {
+      "type": "checkbox",
+      "checked": false
+    },
+    "pointer-lock": {
+      "type": "checkbox",
+      "checked": false
+    },
     "gene-expression-search": {
       "type": "text",
       "value": ""
@@ -173,6 +194,10 @@
     "toggle-centroid-labels": {
       "type": "checkbox",
       "checked": false
+    },
+    "analysis-gene-search": {
+      "type": "text",
+      "value": ""
     },
     "benchmark-count": {
       "type": "number",
@@ -194,19 +219,31 @@
       "type": "select",
       "value": "full"
     },
-    "navigation-mode": {
-      "type": "select",
-      "value": "orbit"
-    },
     "view-layout-mode": {
       "type": "select",
       "value": "grid"
     },
+    "dimension-select": {
+      "type": "select",
+      "value": "3"
+    },
+    "navigation-mode": {
+      "type": "select",
+      "value": "orbit"
+    },
     "categorical-field": {
       "type": "select",
-      "value": "14"
+      "value": "12"
     },
     "continuous-field": {
+      "type": "select",
+      "value": "-1"
+    },
+    "analysis-categorical-field": {
+      "type": "select",
+      "value": "-1"
+    },
+    "analysis-continuous-field": {
       "type": "select",
       "value": "-1"
     },
@@ -233,6 +270,14 @@
     "accordion:Highlighted Cells": {
       "type": "details",
       "open": true
+    },
+    "accordion:Page Analysis": {
+      "type": "details",
+      "open": true
+    },
+    "accordion:Keyboard Shortcuts": {
+      "type": "details",
+      "open": false
     },
     "accordion:Performance Benchmark": {
       "type": "details",

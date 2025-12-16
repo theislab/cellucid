@@ -123,13 +123,15 @@ export class DataSourceManager {
 
   /**
    * Get all available datasets from all sources
+   * Uses parallel checks for better performance.
    * @returns {Promise<{sourceType: string, datasets: DatasetMetadata[]}[]>}
    */
   async getAllDatasets() {
     console.log('[DataSourceManager] getAllDatasets() called, sources:', [...this.sources.keys()]);
-    const results = [];
 
-    for (const [type, source] of this.sources) {
+    // Check all sources in parallel for better performance
+    const sourceEntries = [...this.sources.entries()];
+    const checkPromises = sourceEntries.map(async ([type, source]) => {
       try {
         console.log(`[DataSourceManager] Checking source '${type}'...`);
         const isAvailable = await source.isAvailable?.();
@@ -139,12 +141,22 @@ export class DataSourceManager {
           console.log(`[DataSourceManager] Listing datasets from '${type}'...`);
           const datasets = await source.listDatasets();
           console.log(`[DataSourceManager] Got ${datasets?.length || 0} datasets from '${type}'`);
-          results.push({ sourceType: type, datasets });
+          return { sourceType: type, datasets, success: true };
         }
+        return { sourceType: type, success: false };
       } catch (err) {
         console.error(`[DataSourceManager] Failed to list datasets from '${type}':`, err);
+        return { sourceType: type, success: false, error: err };
       }
-    }
+    });
+
+    // Wait for all checks to complete in parallel
+    const allResults = await Promise.all(checkPromises);
+
+    // Filter to only successful results with datasets
+    const results = allResults
+      .filter(r => r.success && r.datasets)
+      .map(({ sourceType, datasets }) => ({ sourceType, datasets }));
 
     console.log(`[DataSourceManager] getAllDatasets() returning ${results.length} source groups`);
     return results;

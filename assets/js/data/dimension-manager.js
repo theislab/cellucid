@@ -47,6 +47,10 @@ class DimensionManager {
     // Normalized/padded positions for 3D rendering: dimension -> Float32Array (n_cells * 3)
     this.paddedPositionCache = new Map();
 
+    // Normalization transforms per dimension: dimension -> { center: [x,y,z], scale: number }
+    // Used to apply the same transform to centroids in state.js
+    this.normTransformCache = new Map();
+
     // Number of cells (consistent across all dimensions)
     this.nCells = 0;
 
@@ -233,7 +237,11 @@ class DimensionManager {
     const normTransform = normalizePositions(positions3D);
     console.log(`[DimensionManager] Created normalized 3D positions for ${dim}D (scale: ${normTransform.scale.toFixed(4)})`);
 
+    // Store both the normalized positions and the transform used
+    // The transform is needed by state.js to normalize centroids consistently
     this.paddedPositionCache.set(dim, positions3D);
+    this.normTransformCache.set(dim, normTransform);
+
     return positions3D;
   }
 
@@ -293,6 +301,16 @@ class DimensionManager {
   }
 
   /**
+   * Get the normalization transform used for a dimension.
+   * This is needed to apply the same transform to centroids.
+   * @param {number} dim - Dimension (1, 2, or 3)
+   * @returns {Object|null} Transform object { center: [x,y,z], scale: number } or null if not loaded
+   */
+  getNormTransform(dim) {
+    return this.normTransformCache.get(dim) || null;
+  }
+
+  /**
    * Check if positions are loaded for a dimension
    * @param {number} dim - Dimension
    * @returns {boolean}
@@ -328,6 +346,7 @@ class DimensionManager {
   clearCache() {
     this.positionCache.clear();
     this.paddedPositionCache.clear();
+    this.normTransformCache.clear();
     this.loadingPromises.clear();
     this.nCells = 0;
   }

@@ -790,11 +790,13 @@ body.dock-dragging .accordion-section:not(.accordion-floating) {
 
 /* Sidebar footer link */
 #copyright {
-  font-size: 11px;
-  opacity: 0.85;
-  margin-top: 4px;
-  padding-top: 6px;
-  border-top: 1px solid rgba(0, 0, 0, 0.12);
+  font-size: 10px;
+  opacity: 0.6;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(0, 0, 0, 0.08);
+  text-align: center;
+  white-space: nowrap;
 }
 
 #copyright a {
@@ -803,6 +805,7 @@ body.dock-dragging .accordion-section:not(.accordion-floating) {
 }
 
 #copyright a:hover {
+  opacity: 1;
   text-decoration: underline;
 }
 
@@ -1572,10 +1575,33 @@ body.dock-dragging .accordion-section:not(.accordion-floating) {
   box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.25);
 }
 
-.highlight-actions {
-  margin-top: 8px;
-  padding-top: 8px;
-  border-top: var(--viewer-border-soft);
+/* Highlighted groups header with count and clear button */
+.highlighted-groups-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.highlight-clear-btn {
+  font-family: "Oswald", system-ui, sans-serif;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  padding: 2px 6px;
+  border: 1px solid #d1d5db;
+  background: #f9fafb;
+  color: #6b7280;
+  cursor: pointer;
+  border-radius: 2px;
+  transition: all 0.15s ease;
+}
+
+.highlight-clear-btn:hover {
+  background: #fee2e2;
+  border-color: #dc2626;
+  color: #dc2626;
 }
 
 /* Highlight pages tabs */
@@ -3249,6 +3275,130 @@ body.dark-mode .notification-progress {
 }
 
 /* =========================================================================
+   License Modal
+   ========================================================================= */
+
+.license-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 10002;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.license-modal.hidden {
+  display: none;
+}
+
+.license-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(17, 24, 39, 0.6);
+  backdrop-filter: blur(2px);
+}
+
+.license-content {
+  position: relative;
+  background: var(--viewer-paper);
+  border: 2px solid var(--viewer-ink);
+  box-shadow: 6px 6px 0 rgba(0, 0, 0, 0.15);
+  max-width: 600px;
+  width: 100%;
+  max-height: 80vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.license-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid #e5e7eb;
+  background: #f9fafb;
+}
+
+.license-header h2 {
+  margin: 0;
+  font-family: "Oswald", system-ui, sans-serif;
+  font-size: 18px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--viewer-ink);
+}
+
+.license-close {
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid transparent;
+  font-size: 24px;
+  line-height: 1;
+  color: #6b7280;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.license-close:hover {
+  background: #e5e7eb;
+  border-color: #d1d5db;
+  color: var(--viewer-ink);
+}
+
+.license-body {
+  padding: 20px;
+  overflow-y: auto;
+  font-family: "Inter", system-ui, sans-serif;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #374151;
+}
+
+.license-body p {
+  margin: 0 0 12px 0;
+}
+
+.license-body ol {
+  margin: 0 0 16px 0;
+  padding-left: 20px;
+}
+
+.license-body li {
+  margin-bottom: 10px;
+}
+
+.license-copyright {
+  font-weight: 600;
+  color: var(--viewer-ink);
+}
+
+.license-disclaimer {
+  font-size: 11px;
+  color: #6b7280;
+  padding: 12px;
+  background: #f3f4f6;
+  border: 1px solid #e5e7eb;
+  margin-top: 8px;
+}
+
+@media (max-width: 640px) {
+  .license-content {
+    max-height: 90vh;
+  }
+
+  .license-body {
+    font-size: 12px;
+  }
+}
+
+/* =========================================================================
    Error Recovery Modal
    ========================================================================= */
 
@@ -3392,3 +3542,1226 @@ body.dark-mode .notification-progress {
     width: 100%;
   }
 }
+
+/* =========================================================================
+   Page Analysis Module - Minimal design matching Filtering section
+   ========================================================================= */
+
+#page-analysis-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+/* Plot container */
+.analysis-plot-container {
+  min-height: 220px;
+  margin-top: 8px;
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  background: #ffffff;
+  position: relative;
+}
+
+.analysis-plot-container.empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #6b7280;
+  font-size: 11px;
+  text-align: center;
+  padding: 20px;
+}
+
+.analysis-plot-container.empty::before {
+  content: 'Select a variable and pages to generate plot';
+}
+
+.analysis-plot-container.loading::after {
+  content: 'Loading...';
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.9);
+  font-size: 11px;
+  color: #6b7280;
+  z-index: 10;
+}
+
+/* Export toolbar - compact */
+.analysis-export-toolbar {
+  display: flex;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.analysis-export-toolbar .btn-small {
+  flex: 1;
+  padding: 5px 8px;
+  font-size: 10px;
+}
+
+/* Page dropdown trigger - styled like obs-select */
+.analysis-page-trigger {
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.analysis-page-trigger::after {
+  content: '\25BC';
+  font-size: 8px;
+  margin-left: 8px;
+  opacity: 0.5;
+}
+
+.analysis-page-trigger.open::after {
+  content: '\25B2';
+}
+
+.analysis-page-trigger.placeholder {
+  color: #9ca3af;
+}
+
+/* Page dropdown menu */
+.analysis-page-menu {
+  max-height: 150px;
+  overflow-y: auto;
+}
+
+.analysis-page-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+}
+
+.analysis-page-menu-item input[type="checkbox"] {
+  width: 12px;
+  height: 12px;
+  margin: 0;
+  accent-color: #111827;
+  cursor: pointer;
+}
+
+.analysis-page-menu-item label {
+  font-size: 11px;
+  color: #111827;
+  text-transform: none;
+  letter-spacing: normal;
+  font-weight: 400;
+  cursor: pointer;
+  flex: 1;
+}
+
+.analysis-page-divider {
+  height: 1px;
+  background: rgba(0, 0, 0, 0.08);
+  margin: 4px 0;
+}
+
+/* Error display */
+.analysis-error {
+  padding: 16px;
+  color: #dc2626;
+  font-size: 11px;
+  text-align: center;
+}
+
+/* Plotly minimal styling - hide unnecessary elements */
+.analysis-plot-container .modebar {
+  top: 2px !important;
+  right: 2px !important;
+}
+
+.analysis-plot-container .modebar-btn {
+  font-size: 12px !important;
+}
+
+.analysis-plot-container .modebar-group {
+  padding: 0 !important;
+}
+
+/* Hide Plotly logo and some modebar buttons */
+.analysis-plot-container .modebar-btn[data-title="Produced with Plotly"] {
+  display: none !important;
+}
+
+/* =========================================================================
+   Analysis Page Selector - Matches Highlight Module Tabs Style
+   ========================================================================= */
+
+.analysis-page-selector {
+  margin-top: 8px;
+}
+
+.analysis-page-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.analysis-page-tab {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  font-size: 11px;
+  font-weight: 500;
+  color: #374151;
+  background: #e5e7eb;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  max-width: 120px;
+  min-width: 0;
+}
+
+.analysis-page-tab:hover {
+  background: #d1d5db;
+}
+
+/* Selected tabs are dark */
+.analysis-page-tab.selected {
+  background: #111827;
+  color: #ffffff;
+  border-color: #111827;
+  box-shadow: 1px 1px 0 rgba(0, 0, 0, 0.2);
+}
+
+/* Rectangular color swatch matching categorical obs legend style */
+.analysis-page-color {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  flex-shrink: 0;
+  border: 1px solid rgba(0, 0, 0, 0.25);
+  cursor: pointer;
+  position: relative;
+}
+
+.analysis-page-color:hover {
+  border-color: rgba(0, 0, 0, 0.4);
+}
+
+.analysis-page-tab.selected .analysis-page-color {
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+.analysis-page-tab.selected .analysis-page-color:hover {
+  border-color: rgba(255, 255, 255, 0.5);
+}
+
+/* Color input overlays the swatch like in categorical obs legend */
+.analysis-page-color-input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  min-width: 0;
+  min-height: 0;
+  border: none;
+  padding: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
+  cursor: pointer;
+  opacity: 0;
+}
+
+.analysis-page-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.analysis-page-count {
+  font-size: 9px;
+  opacity: 0.7;
+  flex-shrink: 0;
+  font-family: "Fira Code", monospace;
+}
+
+.analysis-page-actions {
+  display: flex;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.analysis-page-actions .btn-small {
+  font-size: 9px;
+  padding: 3px 8px;
+}
+
+/* =========================================================================
+   Analysis Preview Container
+   ========================================================================= */
+
+.analysis-preview-container {
+  margin-top: 10px;
+  min-height: 180px;
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  background: #ffffff;
+  position: relative;
+  border-radius: 0;
+}
+
+/* Hide preview container when empty - only show when there's a plot */
+.analysis-preview-container.empty {
+  display: none;
+}
+
+/* Show container when loading even if empty */
+.analysis-preview-container.loading {
+  display: block;
+  min-height: 180px;
+}
+
+.analysis-preview-container.loading::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.9);
+  z-index: 10;
+}
+
+.analysis-preview-container.loading::before {
+  content: 'Loading...';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 11px;
+  color: #6b7280;
+  z-index: 11;
+}
+
+.analysis-preview-plot {
+  width: 100%;
+  min-height: 180px;
+}
+
+/* =========================================================================
+   Analysis Actions Bar
+   ========================================================================= */
+
+.analysis-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+  align-items: center;
+}
+
+.analysis-expand-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* =========================================================================
+   Analysis Modal / Popup
+   ========================================================================= */
+
+.analysis-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+  pointer-events: none;
+}
+
+.analysis-modal.open {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.analysis-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+}
+
+.analysis-modal-content {
+  position: relative;
+  width: 70vw;
+  max-width: 900px;
+  min-width: 600px;
+  height: 70vh;
+  min-height: 500px;
+  background: #ffffff;
+  border: 1px solid #111827;
+  box-shadow: 6px 6px 0 rgba(0, 0, 0, 0.15);
+  /* Flexbox for main layout - more predictable than grid for resizing */
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  transform: scale(0.96);
+  transition: transform 0.15s ease, opacity 0.15s ease;
+  opacity: 0;
+}
+
+.analysis-modal.open .analysis-modal-content {
+  transform: scale(1);
+  opacity: 1;
+}
+
+.analysis-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  background: #fafafa;
+  border-bottom: 1px solid #e5e7eb;
+  cursor: move;
+}
+
+.analysis-modal-title {
+  margin: 0;
+  font-family: "Oswald", system-ui, sans-serif;
+  font-weight: 500;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: #111827;
+}
+
+.analysis-modal-close {
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid transparent;
+  font-size: 16px;
+  color: #6b7280;
+  cursor: pointer;
+  border-radius: 0;
+  transition: all 0.15s ease;
+}
+
+.analysis-modal-close:hover {
+  background: #e5e7eb;
+  border-color: #d1d5db;
+  color: #111827;
+}
+
+.analysis-modal-body {
+  /* Flex container for horizontal layout - plot | resizer | options */
+  display: flex;
+  flex-direction: row;
+  flex: 1;
+  min-height: 200px;
+  overflow: hidden;
+  background: #ffffff;
+  position: relative;
+}
+
+.analysis-modal-plot-section {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 250px;
+  padding: 16px 20px;
+  background: #ffffff;
+  overflow: hidden;
+}
+
+.analysis-modal-plot {
+  flex: 1;
+  min-height: 200px;
+  background: #ffffff;
+}
+
+.analysis-modal-export {
+  display: flex;
+  gap: 6px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #f3f4f6;
+}
+
+.analysis-modal-export .btn-small {
+  font-family: "Oswald", system-ui, sans-serif;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  border-radius: var(--viewer-radius-pill);
+  padding: 5px 10px;
+  border: 1px solid #111827;
+  background: #f9fafb;
+  color: #111827;
+  cursor: pointer;
+  box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.15);
+  transition: background 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+}
+
+.analysis-modal-export .btn-small:hover {
+  background: #e5e7eb;
+  transform: translate(-1px, -1px);
+  box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.2);
+}
+
+.analysis-modal-export .btn-small:active {
+  transform: translate(0, 0);
+  box-shadow: 1px 1px 0 rgba(0, 0, 0, 0.15);
+}
+
+/* =========================================================================
+   Analysis Options Panel (Right Side of Modal) - Matches Website Patterns
+   ========================================================================= */
+
+.analysis-modal-options {
+  width: 220px;
+  min-width: 200px;
+  max-width: 400px;
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  background: #fafafa;
+  overflow-y: auto;
+  overflow-x: hidden;
+  border-left: 1px solid #e5e7eb;
+}
+
+.analysis-options-title {
+  padding: 10px 12px;
+  font-family: "Oswald", system-ui, sans-serif;
+  font-weight: 500;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--viewer-ink-soft);
+  border-bottom: 1px solid #e5e7eb;
+  background: #f3f4f6;
+}
+
+.analysis-options-content {
+  flex: 1;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* Option rows - vertical layout for selects/sliders, horizontal for checkboxes */
+.analysis-option-row {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.analysis-option-label {
+  display: block;
+  font-family: "Oswald", system-ui, sans-serif;
+  font-weight: 500;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--viewer-ink-soft);
+  line-height: 1.2;
+}
+
+/* Select dropdowns - matches .obs-select */
+.analysis-option-select {
+  width: 100%;
+  padding: 6px 8px;
+  font-family: "Inter", system-ui, sans-serif;
+  font-size: 11px;
+  border-radius: 0;
+  border: 1px solid #111827;
+  background-color: #ffffff;
+  color: #111827;
+  cursor: pointer;
+  box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.12);
+  transition: box-shadow 0.15s ease;
+}
+
+.analysis-option-select:focus {
+  outline: 2px solid #111827;
+  outline-offset: 1px;
+  box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.15);
+}
+
+/* Checkbox styling */
+.analysis-option-checkbox {
+  width: 14px;
+  height: 14px;
+  accent-color: #111827;
+  cursor: pointer;
+  margin: 0;
+  flex-shrink: 0;
+}
+
+/* Checkbox rows - inline layout with checkbox first, then label */
+.analysis-option-row.checkbox-row {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+}
+
+.analysis-option-row.checkbox-row .analysis-option-label {
+  font-family: "Inter", system-ui, sans-serif;
+  font-weight: 400;
+  font-size: 11px;
+  text-transform: none;
+  letter-spacing: 0;
+  color: #374151;
+  cursor: pointer;
+  margin: 0;
+}
+
+/* Range/slider styling - matches .slider-row */
+.analysis-option-range {
+  flex: 1;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 3px;
+  border-radius: var(--viewer-radius-pill);
+  background: #e5e7eb;
+  outline: none;
+}
+
+.analysis-option-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #111827;
+  border: 1px solid #020617;
+  box-shadow: 1px 1px 0 rgba(0, 0, 0, 0.35);
+  margin-top: -5.5px;
+  cursor: pointer;
+}
+
+.analysis-option-range::-moz-range-track {
+  height: 3px;
+  border-radius: var(--viewer-radius-pill);
+  background: #e5e7eb;
+}
+
+.analysis-option-range::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #111827;
+  border: 1px solid #020617;
+  box-shadow: 1px 1px 0 rgba(0, 0, 0, 0.35);
+  cursor: pointer;
+}
+
+/* Slider value - matches .slider-value */
+.analysis-option-value {
+  font-family: "Fira Code", ui-monospace, monospace;
+  font-size: 11px;
+  opacity: 0.85;
+  min-width: 28px;
+  text-align: right;
+}
+
+.analysis-option-text {
+  width: 100%;
+  padding: 5px 8px;
+  font-size: 11px;
+  border-radius: 0;
+  border: 1px solid #111827;
+  background-color: #ffffff;
+  color: #111827;
+  box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.12);
+}
+
+.analysis-option-text:focus {
+  outline: 2px solid #111827;
+  outline-offset: 1px;
+  box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.15);
+}
+
+/* Section titles and dividers for option groups */
+.analysis-option-section-title {
+  font-family: "Oswald", system-ui, sans-serif;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #6b7280;
+  margin: 12px 0 8px 0;
+  padding: 0;
+}
+
+.analysis-option-section-title:first-child {
+  margin-top: 0;
+}
+
+.analysis-option-divider {
+  height: 1px;
+  background: #e5e7eb;
+  margin: 12px 0;
+  border: none;
+}
+
+/* =========================================================================
+   Analysis Summary Stats Table - Matches Website Patterns
+   ========================================================================= */
+
+.analysis-modal-footer {
+  padding: 0;
+  border-top: 1px solid #e5e7eb;
+  background: #fafafa;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.analysis-stats-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.analysis-stats-table th,
+.analysis-stats-table td {
+  padding: 6px 12px;
+  text-align: left;
+}
+
+.analysis-stats-table th {
+  font-family: "Oswald", system-ui, sans-serif;
+  font-weight: 500;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--viewer-ink-soft);
+  background: #f3f4f6;
+  border-bottom: 1px solid #e5e7eb;
+  position: sticky;
+  top: 0;
+}
+
+.analysis-stats-table td {
+  font-family: "Fira Code", ui-monospace, monospace;
+  font-size: 11px;
+  color: #374151;
+  border-bottom: 1px solid #f3f4f6;
+}
+
+.analysis-stats-table td:first-child {
+  font-family: "Inter", system-ui, sans-serif;
+  font-weight: 500;
+  font-size: 10px;
+  color: var(--viewer-ink-soft);
+}
+
+.analysis-stats-table tr:last-child td {
+  border-bottom: none;
+}
+
+/* =========================================================================
+   Plotly Minimal Styling for Analysis Module
+   ========================================================================= */
+
+/* Hide modebar by default, show when hovering near the modebar area */
+.analysis-preview-plot .modebar-container,
+.analysis-modal-plot .modebar-container {
+  background: transparent !important;
+  background-color: transparent !important;
+}
+
+.analysis-preview-plot .modebar,
+.analysis-modal-plot .modebar {
+  top: 6px !important;
+  right: 6px !important;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  background: transparent !important;
+  background-color: transparent !important;
+  box-shadow: none !important;
+  padding: 2px 4px !important;
+}
+
+.analysis-preview-plot .modebar-group,
+.analysis-modal-plot .modebar-group {
+  background: transparent !important;
+  background-color: transparent !important;
+}
+
+/* Expand hover detection area around the modebar */
+.analysis-preview-plot .modebar::before,
+.analysis-modal-plot .modebar::before {
+  content: '';
+  position: absolute;
+  top: -25px;
+  right: -25px;
+  bottom: -15px;
+  left: -25px;
+}
+
+.analysis-preview-plot .modebar:hover,
+.analysis-modal-plot .modebar:hover {
+  opacity: 1;
+}
+
+.analysis-preview-plot .modebar-btn,
+.analysis-modal-plot .modebar-btn {
+  font-size: 11px !important;
+  color: #9ca3af !important;
+}
+
+.analysis-preview-plot .modebar-btn path,
+.analysis-modal-plot .modebar-btn path {
+  fill: #9ca3af !important;
+}
+
+.analysis-preview-plot .modebar-btn:hover,
+.analysis-modal-plot .modebar-btn:hover {
+  color: #111827 !important;
+}
+
+.analysis-preview-plot .modebar-btn:hover path,
+.analysis-modal-plot .modebar-btn:hover path {
+  fill: #111827 !important;
+}
+
+.analysis-preview-plot .modebar-group,
+.analysis-modal-plot .modebar-group {
+  padding: 0 1px !important;
+}
+
+.analysis-preview-plot .modebar-btn[data-title="Produced with Plotly"],
+.analysis-modal-plot .modebar-btn[data-title="Produced with Plotly"] {
+  display: none !important;
+}
+
+/* Responsive adjustments for modal */
+@media (max-width: 768px) {
+  .analysis-modal-content {
+    width: 95vw;
+    min-width: unset;
+    height: 95vh;
+    min-height: unset;
+  }
+
+  /* Hide edge resize handles on mobile */
+  .analysis-modal-edge-resize {
+    display: none;
+  }
+
+  .analysis-modal-body {
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .analysis-modal-plot-section {
+    flex: 1;
+    min-width: unset;
+    min-height: 200px;
+    border-bottom: 1px solid #e5e7eb;
+  }
+
+  .analysis-modal-options {
+    width: 100%;
+    min-width: unset;
+    max-width: unset;
+    max-height: 200px;
+    border-left: none;
+    border-top: 1px solid #e5e7eb;
+  }
+
+  .analysis-modal-footer-area {
+    flex-direction: column;
+    height: auto;
+    min-height: unset;
+    max-height: unset;
+  }
+
+  .analysis-modal-stats-panel,
+  .analysis-modal-annotations-panel {
+    min-width: unset;
+    min-height: 100px;
+  }
+
+  .analysis-modal-annotations-panel {
+    border-left: none;
+    border-top: 1px solid #e5e7eb;
+  }
+
+  /* Hide internal resizers on mobile */
+  .analysis-modal-resizer,
+  .analysis-modal-resizer-intersection {
+    display: none;
+  }
+}
+
+/* Slider row for range inputs */
+.analysis-options-content .slider-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Modal edge resize handles */
+.analysis-modal-edge-resize {
+  position: absolute;
+  background: transparent;
+  z-index: 10;
+}
+
+.analysis-modal-edge-resize-right {
+  top: 0;
+  right: -4px;
+  width: 8px;
+  height: 100%;
+  cursor: ew-resize;
+}
+
+.analysis-modal-edge-resize-bottom {
+  bottom: -4px;
+  left: 0;
+  width: 100%;
+  height: 8px;
+  cursor: ns-resize;
+}
+
+/* =========================================================================
+   Analysis Modal - Resizable Grid Layout
+   ========================================================================= */
+
+/* Footer area with two panels */
+.analysis-modal-footer-area {
+  /* Flex container for horizontal layout - stats | resizer | annotations */
+  display: flex;
+  flex-direction: row;
+  height: 200px;
+  min-height: 200px;
+  max-height: 50%;
+  flex-shrink: 0;
+  border-top: 1px solid #e5e7eb;
+  background: #fafafa;
+  overflow: hidden;
+  position: relative;
+}
+
+/* Stats panel (left side of footer) */
+.analysis-modal-stats-panel {
+  flex: 1;
+  min-width: 200px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Annotations panel (right side of footer) */
+.analysis-modal-annotations-panel {
+  flex: 1;
+  min-width: 200px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-left: 1px solid #e5e7eb;
+}
+
+/* Panel titles */
+.analysis-panel-title {
+  padding: 8px 12px;
+  font-family: "Oswald", system-ui, sans-serif;
+  font-weight: 500;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--viewer-ink-soft);
+  background: #f3f4f6;
+  border-bottom: 1px solid #e5e7eb;
+  flex-shrink: 0;
+}
+
+/* Stats content area */
+.analysis-stats-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0;
+}
+
+/* Annotations content area */
+.analysis-annotations-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px 12px;
+}
+
+/* Internal panel resizer elements */
+.analysis-modal-resizer {
+  background: transparent;
+  flex-shrink: 0;
+  transition: background-color 0.1s ease;
+  position: relative;
+  z-index: 5;
+}
+
+.analysis-modal-resizer:hover {
+  background: rgba(59, 130, 246, 0.1);
+}
+
+.analysis-modal-resizer:active,
+.analysis-modal-resizer.resizing {
+  background: rgba(59, 130, 246, 0.2);
+}
+
+.analysis-modal-resizer-vertical {
+  width: 8px;
+  cursor: col-resize;
+}
+
+/* Vertical resizer grip dots */
+.analysis-modal-resizer-vertical::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 4px;
+  height: 24px;
+  background-image: radial-gradient(circle, #9ca3af 1px, transparent 1px);
+  background-size: 4px 4px;
+  background-position: center;
+  opacity: 0.6;
+}
+
+.analysis-modal-resizer-vertical:hover::before {
+  opacity: 1;
+  background-image: radial-gradient(circle, #6b7280 1px, transparent 1px);
+}
+
+/* Horizontal resizer - full width bar between body and footer */
+.analysis-modal-resizer-horizontal {
+  height: 8px;
+  cursor: row-resize;
+  flex-shrink: 0;
+  position: relative;
+  z-index: 5;
+}
+
+/* Horizontal resizer grip dots */
+.analysis-modal-resizer-horizontal::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 24px;
+  height: 4px;
+  background-image: radial-gradient(circle, #9ca3af 1px, transparent 1px);
+  background-size: 4px 4px;
+  background-position: center;
+  opacity: 0.6;
+}
+
+.analysis-modal-resizer-horizontal:hover::before {
+  opacity: 1;
+  background-image: radial-gradient(circle, #6b7280 1px, transparent 1px);
+}
+
+/* Intersection/corner resizer - at the crossing of horizontal and vertical resizers */
+.analysis-modal-resizer-intersection {
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  background: #f3f4f6;
+  border: 1px solid #e5e7eb;
+  cursor: nwse-resize;
+  z-index: 10;
+  transition: background-color 0.1s ease, border-color 0.1s ease;
+}
+
+.analysis-modal-resizer-intersection:hover {
+  background: rgba(59, 130, 246, 0.15);
+  border-color: rgba(59, 130, 246, 0.3);
+}
+
+.analysis-modal-resizer-intersection:active,
+.analysis-modal-resizer-intersection.resizing {
+  background: rgba(59, 130, 246, 0.25);
+  border-color: rgba(59, 130, 246, 0.4);
+}
+
+/* Intersection resizer grip pattern */
+.analysis-modal-resizer-intersection::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 8px;
+  height: 8px;
+  background-image: radial-gradient(circle, #9ca3af 1.5px, transparent 1.5px);
+  background-size: 4px 4px;
+  background-position: center;
+  opacity: 0.7;
+}
+
+.analysis-modal-resizer-intersection:hover::before {
+  opacity: 1;
+  background-image: radial-gradient(circle, #6b7280 1.5px, transparent 1.5px);
+}
+
+/* =========================================================================
+   Statistical Annotations Panel Styles
+   ========================================================================= */
+
+.analysis-annotations-help {
+  color: #9ca3af;
+  font-size: 11px;
+  text-align: center;
+  padding: 20px;
+  font-style: italic;
+}
+
+.analysis-annotations-results {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* Test result card */
+.analysis-test-card {
+  padding: 10px 12px;
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 4px;
+}
+
+.analysis-test-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.analysis-test-name {
+  font-family: "Oswald", system-ui, sans-serif;
+  font-weight: 500;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #111827;
+}
+
+.analysis-test-significance {
+  font-family: "Fira Code", monospace;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+
+.analysis-test-significance.significant {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.analysis-test-significance.not-significant {
+  background: #f3f4f6;
+  color: #6b7280;
+}
+
+/* Stats table within card */
+.analysis-test-stats {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 8px;
+  font-size: 10px;
+}
+
+.analysis-test-stats td {
+  padding: 3px 0;
+  border: none;
+}
+
+.analysis-test-stats td.stat-label {
+  color: #6b7280;
+  width: 70px;
+}
+
+.analysis-test-stats td.stat-value {
+  font-family: "Fira Code", monospace;
+  color: #374151;
+}
+
+.analysis-test-stats tr.highlight td.stat-value {
+  font-weight: 600;
+  color: #111827;
+}
+
+/* Interpretation text */
+.analysis-test-interpretation {
+  font-size: 10px;
+  color: #6b7280;
+  font-style: italic;
+  line-height: 1.4;
+  padding-top: 6px;
+  border-top: 1px solid #f3f4f6;
+}
+
+/* Significance legend */
+.analysis-annotations-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid #e5e7eb;
+  font-size: 9px;
+  color: #6b7280;
+}
+
+.analysis-annotations-legend .legend-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.analysis-annotations-legend .sig-marker {
+  font-family: "Fira Code", monospace;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 4px;
+  border-radius: 2px;
+}
+
+.analysis-annotations-legend .sig-ns {
+  background: #f3f4f6;
+  color: #6b7280;
+}
+
+.analysis-annotations-legend .sig-1 {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.analysis-annotations-legend .sig-2 {
+  background: #bbf7d0;
+  color: #166534;
+}
+
+.analysis-annotations-legend .sig-3 {
+  background: #86efac;
+  color: #166534;
+}
+
+/* Responsive adjustments for new footer layout - handled in main media query above */

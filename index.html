@@ -12,6 +12,9 @@
   <meta name="robots" content="index, follow" />
   <link rel="canonical" href="https://www.cellucid.com" />
 
+  <!-- Preconnect to external services for faster initial connection -->
+  <link rel="preconnect" href="https://www.googletagmanager.com">
+
   <!-- Open Graph / Social Media -->
   <meta property="og:title" content="cellucid - Interactive Single-Cell Data Visualization" />
   <meta property="og:description" content="Explore single-cell RNA sequencing data in 3D. Visualize millions of cells with UMAP embeddings, gene expression, and interactive filtering. Free and browser-based." />
@@ -93,6 +96,11 @@
   <meta name="msapplication-TileColor" content="#111827" />
   <meta name="theme-color" content="#ffffff" />
 
+  <!-- Preload critical fonts to avoid FOUT (Flash of Unstyled Text) -->
+  <link rel="preload" as="font" type="font/woff2" href="assets/fonts/inter-latin.woff2" crossorigin>
+  <link rel="preload" as="font" type="font/woff2" href="assets/fonts/oswald-latin.woff2" crossorigin>
+  <link rel="preload" as="font" type="font/woff2" href="assets/fonts/firacode-latin.woff2" crossorigin>
+
   <!-- Fonts are now self-hosted in assets/fonts/ for better performance -->
   <link rel="stylesheet" href="assets/css/style.css" />
 </head>
@@ -169,6 +177,27 @@
           <span class="welcome-quote-text">"Not all those who wander are lost."</span>
           <span class="welcome-quote-attr">— <span class="welcome-quote-author">J.R.R. Tolkien</span>, <span class="welcome-quote-book">The Fellowship of the Ring</span></span>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- License Modal -->
+  <div id="license-modal" class="license-modal hidden" role="dialog" aria-modal="true" aria-labelledby="license-title">
+    <div class="license-backdrop"></div>
+    <div class="license-content">
+      <div class="license-header">
+        <h2 id="license-title">BSD 3-Clause License</h2>
+        <button type="button" class="license-close" id="license-close-btn" aria-label="Close">&times;</button>
+      </div>
+      <div class="license-body">
+        <p class="license-copyright">Copyright &copy; 2025, Kemal Inecik</p>
+        <p>Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:</p>
+        <ol>
+          <li>Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.</li>
+          <li>Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.</li>
+          <li>Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.</li>
+        </ol>
+        <p class="license-disclaimer">THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.</p>
       </div>
     </div>
   </div>
@@ -824,14 +853,21 @@
             <button type="button" class="highlight-page-add-btn" id="add-highlight-page" title="Add new page">+</button>
           </div>
           <div id="highlighted-groups" class="highlighted-groups-box">
-            <div id="highlight-count" class="filter-info highlight-count-inline">No cells highlighted</div>
+            <div class="highlighted-groups-header">
+              <div id="highlight-count" class="filter-info highlight-count-inline">No cells highlighted</div>
+              <button type="button" class="highlight-clear-btn" id="clear-all-highlights" style="display: none;">Clear</button>
+            </div>
             <div id="highlighted-groups-list">
               <!-- Highlighted group items will be added here dynamically -->
             </div>
           </div>
-          <div id="highlight-actions" class="highlight-actions" style="display: none;">
-            <button type="button" class="btn-small" id="clear-all-highlights">Clear All</button>
-          </div>
+        </div>
+      </details>
+
+      <details class="accordion-section" id="page-analysis-section" open>
+        <summary>Page Analysis</summary>
+        <div class="accordion-content">
+          <!-- Analysis controls and plot will be rendered here by JavaScript -->
         </div>
       </details>
 
@@ -976,9 +1012,7 @@
 
     <div id="stats" class="sr-only">Loading data…</div>
 
-	    <div id="copyright">
-	      © Kemal Inecik · <a href="https://kemalinecik.com" target="_blank" rel="noopener noreferrer">kemalinecik.com</a>
-	    </div>
+      <div id="copyright">© Kemal Inecik · <a href="https://kemalinecik.com" target="_blank" rel="noopener noreferrer">kemalinecik.com</a> · <a href="#" id="license-link">BSD-3-Clause</a></div>
 		  </div>
 	  </div>
 
@@ -987,8 +1021,39 @@
   <!-- Titles for small multiple viewports -->
   <div id="view-title-layer"></div>
 
-  <!-- glMatrix for matrix math (self-hosted) -->
-  <script src="assets/external/gl-matrix-min.js"></script>
+  <!-- glMatrix for matrix math (self-hosted, defer ensures it loads before ES modules) -->
+  <script defer src="assets/external/gl-matrix-min.js"></script>
+  <!-- Plotly.js is lazy-loaded by the analysis module when needed -->
   <script type="module" src="assets/js/app/main.js"></script>
+
+  <!-- License modal handler -->
+  <script>
+    (function() {
+      const modal = document.getElementById('license-modal');
+      const link = document.getElementById('license-link');
+      const closeBtn = document.getElementById('license-close-btn');
+      const backdrop = modal.querySelector('.license-backdrop');
+
+      function openModal(e) {
+        e.preventDefault();
+        modal.classList.remove('hidden');
+        document.body.style.overflow = 'hidden';
+      }
+
+      function closeModal() {
+        modal.classList.add('hidden');
+        document.body.style.overflow = '';
+      }
+
+      link.addEventListener('click', openModal);
+      closeBtn.addEventListener('click', closeModal);
+      backdrop.addEventListener('click', closeModal);
+      document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape' && !modal.classList.contains('hidden')) {
+          closeModal();
+        }
+      });
+    })();
+  </script>
 </body>
 </html>

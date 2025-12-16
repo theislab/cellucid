@@ -1,8 +1,5 @@
 // Data/state manager: loads obs data, computes colors/filters, and feeds buffers to the viewer.
-import {
-  normalizePositions,
-  applyNormalizationToCentroids
-} from '../rendering/gl-utils.js';
+import { LRUCache } from '../data/sparse-utils.js';
 import {
   rgbToCss,
   COLOR_PICKER_PALETTE,
@@ -51,8 +48,11 @@ class DataState {
     this._activeCategoryCounts = null;
     this.activeViewId = 'live';
     this.viewContexts = new Map(); // viewId -> per-view context (arrays + field state)
-    this._fieldDataCache = new Map(); // field.key -> loaded arrays (shared across views)
-    this._varFieldDataCache = new Map(); // var.field.key -> loaded arrays
+    // LRU caches for field data to prevent unbounded memory growth
+    // Obs fields: max 50 (each ~10 bytes × pointCount)
+    // Var fields: max 20 (gene expressions, each ~4 bytes × pointCount, typically larger access pattern)
+    this._fieldDataCache = new LRUCache(50); // field.key -> loaded arrays (shared across views)
+    this._varFieldDataCache = new LRUCache(20); // var.field.key -> loaded arrays
 
     // Multi-dimensional embedding support
     this.dimensionManager = null; // Set via setDimensionManager()
@@ -874,20 +874,29 @@ class DataState {
     this.viewer.setCentroidLabels(this.centroidLabels, viewKey);
   }
 
-  initScene(positions, obs) {
+  /**
+   * Initialize the scene with positions and observation data.
+   * @param {Float32Array} positions - Already-normalized 3D positions from DimensionManager
+   * @param {Object} obs - Observation data with fields and centroids
+   * @param {Object} [normTransform] - (Deprecated) Previously used for centroid normalization.
+   *                                   Now handled lazily in buildCentroidsForField() to support
+   *                                   per-dimension centroid normalization when switching dimensions.
+   */
+  initScene(positions, obs, normTransform = null) {
     const normalizedFields = (obs?.fields || []).map((field) => ({
       ...field,
       loaded: Boolean(field?.values || field?.codes),
-      _loadingPromise: null
+      _loadingPromise: null,
+      _normalizedDims: null // Reset normalization tracking for new dataset
     }));
     this.obsData = { ...obs, fields: normalizedFields };
     this._fieldDataCache.clear();
     this._varFieldDataCache.clear();
 
-    // Normalize in place to [-1,1]^3 and remember the array
-    const norm = normalizePositions(positions);
+    // Positions are already normalized by DimensionManager.getPositions3D().
+    // Centroid normalization is now handled lazily in buildCentroidsForField() to ensure
+    // each dimension's centroids are normalized with their correct transform.
     this.positionsArray = positions;
-    applyNormalizationToCentroids(this.obsData, norm);
 
     this.pointCount = positions.length / 3;
 
@@ -1982,6 +1991,51 @@ class DataState {
       || centroidsByDim[currentDim]
       || field.centroids  // Legacy fallback
       || [];
+
+    // Lazy normalization: normalize centroids for this dimension if not already done.
+    // Each dimension has its own normalization transform, so we track per-dimension.
+    // This ensures centroids are correctly positioned regardless of which dimension
+    // was loaded first or when switching between dimensions.
+    //
+    // Important distinction:
+    // - centroidsByDim: per-dimension arrays, each normalized with its own transform
+    // - field.centroids (legacy): single 3D array, normalized once with its native dimension's transform
+    if (centroids.length > 0 && this.dimensionManager) {
+      // Initialize normalization tracking map if needed
+      if (!field._normalizedDims) {
+        field._normalizedDims = new Set();
+      }
+
+      // Determine if we're using per-dimension centroids or legacy shared centroids
+      const isPerDimCentroids = centroidsByDim[String(currentDim)] || centroidsByDim[currentDim];
+      const dimKey = isPerDimCentroids ? String(currentDim) : 'legacy';
+
+      // Check if this centroid array needs normalization
+      if (!field._normalizedDims.has(dimKey)) {
+        // For per-dimension centroids, use that dimension's transform
+        // For legacy centroids, use their native dimension (typically 3D)
+        const transformDim = isPerDimCentroids ? currentDim : (centroids[0]?.position?.length || 3);
+        const normTransform = this.dimensionManager.getNormTransform(transformDim);
+
+        if (normTransform) {
+          const { center, scale } = normTransform;
+          const [cx, cy, cz] = center;
+
+          // Normalize each centroid's position in-place
+          for (const c of centroids) {
+            const p = c.position;
+            if (!p) continue;
+            // Handle 1D, 2D, and 3D positions
+            if (p.length >= 1) p[0] = (p[0] - cx) * scale;
+            if (p.length >= 2) p[1] = (p[1] - cy) * scale;
+            if (p.length >= 3) p[2] = (p[2] - cz) * scale;
+          }
+
+          // Mark as normalized
+          field._normalizedDims.add(dimKey);
+        }
+      }
+    }
 
     // Determine the native dimension of these centroids (from position array length)
     let nativeDim = 3;

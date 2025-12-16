@@ -37,6 +37,8 @@ export class LocalDemoDataSource {
     this._manifest = null;
     this._datasets = null;
     this._isLegacyMode = null;
+    this._availabilityChecked = false;
+    this._isAvailable = false;
   }
 
   /**
@@ -49,28 +51,32 @@ export class LocalDemoDataSource {
 
   /**
    * Check if this data source is available
+   * Uses _loadManifest() to cache the manifest on first check, avoiding duplicate fetches.
    * @returns {Promise<boolean>}
    */
   async isAvailable() {
+    // Return cached result if already checked
+    if (this._availabilityChecked) {
+      return this._isAvailable;
+    }
+
     console.log(`[LocalDemoDataSource] isAvailable() checking manifest: ${this.manifestUrl}`);
 
-    // Check if manifest exists OR legacy mode is available
-    if (await urlExists(this.manifestUrl)) {
-      console.log('[LocalDemoDataSource] Manifest exists, available=true');
+    try {
+      // Try to load manifest - this caches it for later use by listDatasets() etc.
+      await this._loadManifest();
+      console.log('[LocalDemoDataSource] Manifest loaded and cached, available=true');
+      this._availabilityChecked = true;
+      this._isAvailable = true;
       return true;
+    } catch (err) {
+      // _loadManifest already checks legacy mode internally, so if it throws,
+      // neither manifest nor legacy mode is available
+      console.log('[LocalDemoDataSource] Not available:', err.message);
+      this._availabilityChecked = true;
+      this._isAvailable = false;
+      return false;
     }
-
-    // Check legacy mode (obs_manifest.json directly in exports/)
-    if (DATA_CONFIG.LEGACY_MODE_FALLBACK) {
-      const legacyManifest = resolveUrl(this.baseUrl, 'obs_manifest.json');
-      console.log(`[LocalDemoDataSource] Checking legacy mode: ${legacyManifest}`);
-      const legacyExists = await urlExists(legacyManifest);
-      console.log(`[LocalDemoDataSource] Legacy mode available: ${legacyExists}`);
-      return legacyExists;
-    }
-
-    console.log('[LocalDemoDataSource] Not available');
-    return false;
   }
 
   /**
@@ -266,6 +272,8 @@ export class LocalDemoDataSource {
     this._manifest = null;
     this._datasets = null;
     this._isLegacyMode = null;
+    this._availabilityChecked = false;
+    this._isAvailable = false;
   }
 
   /**

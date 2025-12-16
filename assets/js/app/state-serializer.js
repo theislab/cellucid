@@ -1121,11 +1121,8 @@ export function createStateSerializer({ state, viewer, sidebar }) {
           planarControls.style.display = mode === 'planar' ? 'block' : 'none';
         }
       }
-
-      // Re-apply camera after a frame to ensure it sticks (in case any async operations reset it)
-      requestAnimationFrame(() => {
-        viewer.setCameraState?.(snapshot.camera);
-      });
+      // Note: Previously had a duplicate setCameraState call in requestAnimationFrame as a workaround.
+      // Removed because camera state now persists correctly without re-application.
     }
 
     // Final: ensure state + viewer are in sync even if no active field

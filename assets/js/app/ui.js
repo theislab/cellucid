@@ -34,7 +34,6 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     activeFiltersEl,
     highlightCountEl,
     highlightedGroupsEl,
-    highlightActionsEl,
     clearAllHighlightsBtn,
     highlightPagesTabsEl,
     addHighlightPageBtn,
@@ -768,9 +767,9 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       highlightCountEl.textContent = `${visibleCount.toLocaleString()} of ${totalCount.toLocaleString()} highlighted cells visible`;
     }
 
-    // Show/hide actions
-    if (highlightActionsEl) {
-      highlightActionsEl.style.display = groups.length > 0 ? 'block' : 'none';
+    // Show/hide clear button
+    if (clearAllHighlightsBtn) {
+      clearAllHighlightsBtn.style.display = groups.length > 0 ? 'inline-block' : 'none';
     }
 
     // Render groups list
@@ -872,17 +871,46 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     setTimeout(() => document.addEventListener('mousedown', closeMenu), 0);
   }
 
+  // Track existing page IDs to detect structural changes
+  let lastPageIds = [];
+
   function renderHighlightPages() {
     if (!highlightPagesTabsEl) return;
 
     const pages = state.getHighlightPages();
     const activePageId = state.getActivePageId();
+    const currentPageIds = pages.map(p => p.id);
 
+    // Check if we need a full rebuild (pages added/removed/reordered)
+    const needsFullRebuild = lastPageIds.length !== currentPageIds.length ||
+      !lastPageIds.every((id, i) => id === currentPageIds[i]);
+
+    if (!needsFullRebuild) {
+      // Fast path: just update active states and counts
+      const existingTabs = highlightPagesTabsEl.querySelectorAll('.highlight-page-tab');
+      existingTabs.forEach((tab) => {
+        const pageId = tab.dataset.pageId;
+        const page = pages.find(p => p.id === pageId);
+        if (!page) return;
+
+        const isActive = pageId === activePageId;
+        tab.classList.toggle('active', isActive);
+
+        const nameSpan = tab.querySelector('.highlight-page-tab-name');
+        if (nameSpan && nameSpan.textContent !== page.name) {
+          nameSpan.textContent = page.name;
+          nameSpan.title = page.name;
+        }
+      });
+      return;
+    }
+
+    // Full rebuild needed
+    lastPageIds = currentPageIds.slice();
     highlightPagesTabsEl.innerHTML = '';
 
     pages.forEach((page) => {
       const isActive = page.id === activePageId;
-      const groupCount = page.highlightedGroups.length;
 
       const tab = document.createElement('div');
       tab.className = 'highlight-page-tab' + (isActive ? ' active' : '');
@@ -941,12 +969,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
         startPageRename(tab, page);
       });
 
-      const countSpan = document.createElement('span');
-      countSpan.className = 'highlight-page-tab-count';
-      countSpan.textContent = `(${groupCount})`;
-
       tab.appendChild(nameSpan);
-      tab.appendChild(countSpan);
 
       // Only show delete button if there's more than one page
       if (pages.length > 1) {
@@ -964,9 +987,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
 
       // Click to switch page
       tab.addEventListener('click', () => {
-        if (!isActive) {
-          state.switchToPage(page.id);
-        }
+        state.switchToPage(page.id);
       });
 
       highlightPagesTabsEl.appendChild(tab);

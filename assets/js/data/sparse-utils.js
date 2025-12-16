@@ -296,37 +296,35 @@ export function findMax(arr) {
 }
 
 /**
- * Simple LRU (Least Recently Used) cache using Map insertion order.
- * Provides O(1) get/set operations with automatic eviction.
+ * Simple LRU (Least Recently Used) Cache implementation.
+ * Used to limit memory usage for field data caches.
  *
- * Usage:
- *   const cache = new LRUCache(100);
- *   cache.set('key', value);
- *   const value = cache.get('key'); // Returns value and marks as recently used
+ * When the cache exceeds maxSize, the least recently accessed items are evicted.
+ * Access order is tracked: get() moves an item to most-recently-used position.
  */
 export class LRUCache {
   /**
-   * @param {number} maxSize - Maximum number of items to cache
+   * Create a new LRU cache.
+   * @param {number} maxSize - Maximum number of items to store (default: 50)
    */
-  constructor(maxSize = 100) {
-    if (maxSize < 1) {
-      throw new Error('LRUCache maxSize must be at least 1');
-    }
-    /** @type {Map<string, any>} */
+  constructor(maxSize = 50) {
+    this.maxSize = maxSize;
+    // Map maintains insertion order, which we use for LRU tracking
+    // Most recently used items are at the end (re-inserted on access)
     this._cache = new Map();
-    this._maxSize = maxSize;
   }
 
   /**
-   * Get a value from the cache and mark as recently used.
-   * @param {string} key
-   * @returns {any|undefined}
+   * Get an item from the cache.
+   * Moves the item to most-recently-used position.
+   * @param {string} key - Cache key
+   * @returns {*} Cached value or undefined if not found
    */
   get(key) {
     if (!this._cache.has(key)) {
       return undefined;
     }
-    // Move to end (most recently used)
+    // Move to end (most recently used) by re-inserting
     const value = this._cache.get(key);
     this._cache.delete(key);
     this._cache.set(key, value);
@@ -334,8 +332,32 @@ export class LRUCache {
   }
 
   /**
-   * Check if a key exists without affecting LRU order.
-   * @param {string} key
+   * Set an item in the cache.
+   * Evicts least-recently-used items if cache is full.
+   * @param {string} key - Cache key
+   * @param {*} value - Value to cache
+   */
+  set(key, value) {
+    // If key exists, delete first to update position
+    if (this._cache.has(key)) {
+      this._cache.delete(key);
+    }
+
+    // Add to end (most recently used)
+    this._cache.set(key, value);
+
+    // Evict oldest items if over capacity
+    while (this._cache.size > this.maxSize) {
+      // Map.keys().next() gives the first (oldest) key
+      const oldestKey = this._cache.keys().next().value;
+      this._cache.delete(oldestKey);
+    }
+  }
+
+  /**
+   * Check if a key exists in the cache.
+   * Does NOT update access order (use get() for that).
+   * @param {string} key - Cache key
    * @returns {boolean}
    */
   has(key) {
@@ -343,40 +365,23 @@ export class LRUCache {
   }
 
   /**
-   * Set a value in the cache, evicting oldest if at capacity.
-   * @param {string} key
-   * @param {any} value
-   */
-  set(key, value) {
-    // If key exists, delete first to move to end
-    if (this._cache.has(key)) {
-      this._cache.delete(key);
-    } else if (this._cache.size >= this._maxSize) {
-      // Evict oldest (first key in Map)
-      const oldestKey = this._cache.keys().next().value;
-      this._cache.delete(oldestKey);
-    }
-    this._cache.set(key, value);
-  }
-
-  /**
-   * Delete a specific key.
-   * @param {string} key
-   * @returns {boolean} True if key existed
+   * Delete an item from the cache.
+   * @param {string} key - Cache key
+   * @returns {boolean} True if item was deleted
    */
   delete(key) {
     return this._cache.delete(key);
   }
 
   /**
-   * Clear all cached items.
+   * Clear all items from the cache.
    */
   clear() {
     this._cache.clear();
   }
 
   /**
-   * Get current size of cache.
+   * Get the current number of items in the cache.
    * @returns {number}
    */
   get size() {
@@ -384,10 +389,27 @@ export class LRUCache {
   }
 
   /**
-   * Get maximum size of cache.
-   * @returns {number}
+   * Get all keys in the cache (oldest to newest).
+   * @returns {IterableIterator<string>}
    */
-  get maxSize() {
-    return this._maxSize;
+  keys() {
+    return this._cache.keys();
+  }
+
+  /**
+   * Get all values in the cache (oldest to newest).
+   * @returns {IterableIterator<*>}
+   */
+  values() {
+    return this._cache.values();
+  }
+
+  /**
+   * Get all entries in the cache (oldest to newest).
+   * @returns {IterableIterator<[string, *]>}
+   */
+  entries() {
+    return this._cache.entries();
   }
 }
+
