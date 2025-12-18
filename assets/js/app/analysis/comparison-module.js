@@ -11,37 +11,35 @@
  * - Plot is shown in a popup/modal with customization options
  */
 
-import { DataLayer, createDataLayer } from './data-layer.js';
-import { TransformPipeline, createTransformPipeline } from './transform-pipeline.js';
-import { PlotRegistry } from './plot-registry.js';
-import { LayoutEngine, createLayoutEngine } from './layout-engine.js';
-import {
-  createVariableSelector,
-  createGeneExpressionSelector,
-  createPageSelector,
-  createPlotTypeSelector,
-  createAnalysisModal,
-  openModal,
-  closeModal,
-  renderPlotOptions,
-  renderSummaryStats,
-  renderStatisticalAnnotations,
-  createExpandButton
-} from './ui-components.js';
-import { loadPlotly, purgePlot, downloadImage } from './plotly-loader.js';
+import { createDataLayer } from './data/data-layer.js';
+import { TransformPipeline, createTransformPipeline } from './data/transform-pipeline.js';
+import { createLayoutEngine } from './plots/layout-engine.js';
+import { createMultiVariableAnalysis } from './stats/multi-variable-analysis.js';
+import { runStatisticalTests as runStats } from './stats/statistical-tests.js';
+import { loadPlotly } from './plots/plotly-loader.js';
 import { getNotificationCenter } from '../notification-center.js';
+import { getMemoryMonitor } from './shared/memory-monitor.js';
+// Import PlotRegistry from centralized location
+import { PlotRegistry } from './shared/plot-registry-utils.js';
+
+// Import unified UI manager and analysis type factories
+import { createAnalysisUIManager } from './ui/analysis-ui-manager.js';
+import { createQuickInsights } from './ui/analysis-types/quick-insights-ui.js';
+import { createDetailedAnalysisUI } from './ui/analysis-types/detailed-analysis-ui.js';
+import { createCorrelationAnalysisUI } from './ui/analysis-types/correlation-analysis-ui.js';
+import { createDEAnalysisUI } from './ui/analysis-types/de-analysis-ui.js';
+import { createGeneSignatureUI } from './ui/analysis-types/gene-signature-ui.js';
 
 // Import plot types to register them
-import './plot-types/barplot.js';
-import './plot-types/boxplot.js';
-import './plot-types/violinplot.js';
-import './plot-types/histogram.js';
-import './plot-types/pieplot.js';
-import './plot-types/densityplot.js';
-import './plot-types/heatmap.js';
-
-const NONE_VALUE = '-1';
-const DEBOUNCE_DELAY = 300; // ms
+import './plots/types/barplot.js';
+import './plots/types/boxplot.js';
+import './plots/types/violinplot.js';
+import './plots/types/histogram.js';
+import './plots/types/pieplot.js';
+import './plots/types/densityplot.js';
+import './plots/types/heatmap.js';
+import './plots/types/volcanoplot.js';
+import './plots/types/scatterplot.js';
 
 /**
  * Comparison Module class
@@ -56,12 +54,33 @@ export class ComparisonModule {
     this.state = options.state;
     this.container = options.container;
 
-    // Initialize components
+    // Initialize components - DataLayer now includes all enhanced features by default
     this.dataLayer = createDataLayer(this.state);
     this.layoutEngine = null;
     this.transformPipeline = createTransformPipeline();
 
-    // Current state
+    // Advanced analysis modules (lazy initialized)
+    this._multiVariableAnalysis = null;
+
+    // Unified UI manager for all analysis types
+    this._uiManager = null;
+
+    // Current analysis mode (set during init)
+    this._analysisMode = null;
+
+    // Track last known highlight page IDs so we can preserve user selections
+    // when pages are added/removed/renamed.
+    this._lastKnownPageIds = [];
+
+    // Notification center
+    this._notifications = getNotificationCenter();
+
+    // Last statistical results (cached for UI reuse)
+    this._lastStatResults = [];
+    this._lastStatResultsTimestamp = null;
+    this._currentPageData = null;
+
+    // Current state (shared across analysis UIs)
     this.currentConfig = {
       dataSource: {
         type: '', // 'categorical_obs', 'continuous_obs', 'gene_expression'
@@ -75,52 +94,22 @@ export class ComparisonModule {
       syncAxes: true // Synchronize axes across multi-page plots
     };
 
-    // Custom page colors (pageId -> color hex)
-    this.customPageColors = new Map();
-
-    // Session-only plot options per plot type (plotTypeId -> options)
-    // Only stores options that differ from defaults; cleared on page refresh
-    this._savedPlotOptions = new Map();
-
-    // DOM references
-    this.controlsContainer = null;
-    this.previewContainer = null;
-    this.actionsContainer = null;
-
-    // UI component references
-    this.categoricalSelect = null;
-    this.continuousSelect = null;
-    this.geneExpressionContainer = null;
-    this.pageSelectContainer = null;
-    this.plotTypeContainer = null;
-
-    // Modal reference
-    this.modal = null;
-    this.modalPlotContainer = null;
-
-    // Current plot reference and data
-    this.currentPlot = null;
-    this.currentPageData = null;
-
-    // Debounce timer
-    this._updateTimer = null;
-
     // Event hooks
     this._hooks = {
       beforeRender: [],
       afterRender: []
     };
 
-    // Bind methods
-    this._handleCategoricalChange = this._handleCategoricalChange.bind(this);
-    this._handleContinuousChange = this._handleContinuousChange.bind(this);
-    this._handleGeneChange = this._handleGeneChange.bind(this);
-    this._handlePageChange = this._handlePageChange.bind(this);
-    this._handlePageColorChange = this._handlePageColorChange.bind(this);
-    this._handlePlotTypeChange = this._handlePlotTypeChange.bind(this);
-    this._handlePlotOptionChange = this._handlePlotOptionChange.bind(this);
-    this._scheduleUpdate = this._scheduleUpdate.bind(this);
-    this._openExpandedView = this._openExpandedView.bind(this);
+    // Register with memory monitor for automatic cleanup
+    this._memoryMonitor = getMemoryMonitor();
+    this._memoryMonitor.registerCleanupHandler('comparison-module', () => {
+      // Data layer cache cleanup
+      if (this.dataLayer && this.dataLayer.performCacheCleanup) {
+        this.dataLayer.performCacheCleanup();
+      }
+    });
+    // Start monitoring if not already active
+    this._memoryMonitor.start();
   }
 
   /**
@@ -138,26 +127,95 @@ export class ComparisonModule {
       return;
     }
 
-    // Create controls container
-    this.controlsContainer = document.createElement('div');
-    this.controlsContainer.id = 'page-analysis-controls';
-    accordionContent.appendChild(this.controlsContainer);
+    // Create analysis type accordion (minimalist design)
+    // Each item has header + content area for proper accordion behavior
+    // ARIA attributes provide accessibility for screen readers
+    this._modeToggleContainer = document.createElement('div');
+    this._modeToggleContainer.className = 'analysis-accordion';
+    this._modeToggleContainer.setAttribute('role', 'tablist');
+    this._modeToggleContainer.innerHTML = `
+      <div class="analysis-accordion-item" data-mode="simple">
+        <button type="button" class="analysis-accordion-header" aria-expanded="false" aria-controls="analysis-panel-simple">
+          <span class="analysis-accordion-title">Quick</span>
+          <span class="analysis-accordion-desc">Automatic insights</span>
+          <span class="analysis-accordion-chevron" aria-hidden="true"></span>
+        </button>
+        <div class="analysis-accordion-content" id="analysis-panel-simple" data-mode="simple" role="region" aria-labelledby="analysis-header-simple"></div>
+      </div>
+      <div class="analysis-accordion-item" data-mode="detailed">
+        <button type="button" class="analysis-accordion-header" aria-expanded="false" aria-controls="analysis-panel-detailed">
+          <span class="analysis-accordion-title">Detailed</span>
+          <span class="analysis-accordion-desc">Full control over options</span>
+          <span class="analysis-accordion-chevron" aria-hidden="true"></span>
+        </button>
+        <div class="analysis-accordion-content" id="analysis-panel-detailed" data-mode="detailed" role="region" aria-labelledby="analysis-header-detailed"></div>
+      </div>
+      <div class="analysis-accordion-item" data-mode="correlation">
+        <button type="button" class="analysis-accordion-header" aria-expanded="false" aria-controls="analysis-panel-correlation">
+          <span class="analysis-accordion-title">Correlation</span>
+          <span class="analysis-accordion-desc">Explore variable relationships</span>
+          <span class="analysis-accordion-chevron" aria-hidden="true"></span>
+        </button>
+        <div class="analysis-accordion-content" id="analysis-panel-correlation" data-mode="correlation" role="region" aria-labelledby="analysis-header-correlation"></div>
+      </div>
+      <div class="analysis-accordion-item" data-mode="differential">
+        <button type="button" class="analysis-accordion-header" aria-expanded="false" aria-controls="analysis-panel-differential">
+          <span class="analysis-accordion-title">Differential Expression</span>
+          <span class="analysis-accordion-desc">Find DE genes between groups</span>
+          <span class="analysis-accordion-chevron" aria-hidden="true"></span>
+        </button>
+        <div class="analysis-accordion-content" id="analysis-panel-differential" data-mode="differential" role="region" aria-labelledby="analysis-header-differential"></div>
+      </div>
+      <div class="analysis-accordion-item" data-mode="signature">
+        <button type="button" class="analysis-accordion-header" aria-expanded="false" aria-controls="analysis-panel-signature">
+          <span class="analysis-accordion-title">Gene Signature</span>
+          <span class="analysis-accordion-desc">Compute signature scores</span>
+          <span class="analysis-accordion-chevron" aria-hidden="true"></span>
+        </button>
+        <div class="analysis-accordion-content" id="analysis-panel-signature" data-mode="signature" role="region" aria-labelledby="analysis-header-signature"></div>
+      </div>
+    `;
+    accordionContent.appendChild(this._modeToggleContainer);
 
-    // Create preview container (small inline plot)
-    this.previewContainer = document.createElement('div');
-    this.previewContainer.id = 'page-analysis-preview';
-    this.previewContainer.className = 'analysis-preview-container empty';
-    accordionContent.appendChild(this.previewContainer);
+    // Accordion click event - select mode
+    this._modeToggleContainer.querySelectorAll('.analysis-accordion-header').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const item = btn.closest('.analysis-accordion-item');
+        this._setAnalysisMode(item.dataset.mode);
+      });
+    });
 
-    // Create actions container (expand button, export)
-    this.actionsContainer = document.createElement('div');
-    this.actionsContainer.id = 'page-analysis-actions';
-    this.actionsContainer.className = 'analysis-actions';
-    this.actionsContainer.style.display = 'none';
-    accordionContent.appendChild(this.actionsContainer);
+    // Build container map from accordion content areas
+    const containerMap = {};
+    this._modeToggleContainer.querySelectorAll('.analysis-accordion-content').forEach(content => {
+      containerMap[content.dataset.mode] = content;
+    });
 
-    // Render initial UI
-    this._renderControls();
+    // Create unified UI manager with accordion containers
+    this._uiManager = createAnalysisUIManager({
+      containerMap,
+      dataLayer: this.dataLayer,
+      comparisonModule: this
+    });
+
+    // Register all analysis types (unified - all treated equally)
+    this._registerAnalysisTypes();
+
+    // Initialize containers for all types
+    this._uiManager.initContainers();
+
+    // Update with current pages
+    const pages = this.dataLayer.getPages();
+    if (pages.length > 0) {
+      this.currentConfig.pages = pages.map(p => p.id);
+    }
+
+    // Seed shared page selection before first mode switch
+    this._uiManager.setCurrentPages(this.currentConfig.pages, { notifyActiveUI: false });
+    this._lastKnownPageIds = pages.map(p => p.id);
+
+    // Switch to default mode (simple/quick) via the unified setter
+    this._setAnalysisMode('simple');
 
     // Listen for page changes (add/remove/rename/switch)
     if (this.state.addHighlightPageChangeCallback) {
@@ -175,317 +233,143 @@ export class ComparisonModule {
   }
 
   /**
-   * Render the control panel - minimal design matching Filtering section
+   * Register all analysis types with the UI manager
+   * All types are treated equally - no special handling per type
+   * @private
    */
-  _renderControls() {
-    this.controlsContainer.innerHTML = '';
-
-    const pages = this.dataLayer.getPages();
-
-    // Auto-select all pages by default if none are selected
-    if (this.currentConfig.pages.length === 0 && pages.length > 0) {
-      this.currentConfig.pages = pages.map(p => p.id);
-    }
-
-    // If no pages, show message
-    if (pages.length === 0) {
-      const message = document.createElement('div');
-      message.className = 'legend-help';
-      message.textContent = 'Create highlight pages first using the Highlighted Cells section above.';
-      this.controlsContainer.appendChild(message);
-      this._hidePreview();
-      return;
-    }
-
-    // Variable selectors block - exactly like Filtering section
-    const variableBlock = document.createElement('div');
-    variableBlock.className = 'control-block';
-
-    // Categorical obs dropdown
-    const categoricalVars = this.dataLayer.getAvailableVariables('categorical_obs');
-    const categoricalSelector = createVariableSelector({
-      variables: categoricalVars,
-      selectedValue: this.currentConfig.dataSource.type === 'categorical_obs'
-        ? this.currentConfig.dataSource.variable : '',
-      label: 'Categorical obs:',
-      id: 'analysis-categorical-field',
-      onChange: this._handleCategoricalChange
+  _registerAnalysisTypes() {
+    // Quick Insights (simple mode)
+    this._uiManager.register({
+      id: 'simple',
+      name: 'Quick',
+      factory: createQuickInsights,
+      minPages: 1,
+      maxPages: null,
+      icon: 'bolt',
+      tooltip: 'Automatic insights for the active page'
     });
-    variableBlock.appendChild(categoricalSelector);
-    this.categoricalSelect = categoricalSelector.querySelector('select');
 
-    // Continuous obs dropdown
-    const continuousVars = this.dataLayer.getAvailableVariables('continuous_obs');
-    const continuousSelector = createVariableSelector({
-      variables: continuousVars,
-      selectedValue: this.currentConfig.dataSource.type === 'continuous_obs'
-        ? this.currentConfig.dataSource.variable : '',
-      label: 'Continuous obs:',
-      id: 'analysis-continuous-field',
-      onChange: this._handleContinuousChange
-    });
-    variableBlock.appendChild(continuousSelector);
-    this.continuousSelect = continuousSelector.querySelector('select');
-
-    // Gene expression dropdown (searchable) - only if genes available
-    const geneVars = this.dataLayer.getAvailableVariables('gene_expression');
-    if (geneVars.length > 0) {
-      const geneSelector = createGeneExpressionSelector({
-        genes: geneVars,
-        selectedValue: this.currentConfig.dataSource.type === 'gene_expression'
-          ? this.currentConfig.dataSource.variable : '',
-        label: 'Gene expression:',
-        id: 'analysis-gene',
-        onChange: this._handleGeneChange
-      });
-      variableBlock.appendChild(geneSelector);
-      this.geneExpressionContainer = geneSelector;
-    }
-
-    this.controlsContainer.appendChild(variableBlock);
-
-    // Page selector - now matching highlight module style with color picker
-    const pageSelect = createPageSelector({
-      pages: pages,
-      selectedIds: this.currentConfig.pages,
-      onChange: this._handlePageChange,
-      onColorChange: this._handlePageColorChange,
-      customColors: this.customPageColors
-    });
-    this.controlsContainer.appendChild(pageSelect);
-    this.pageSelectContainer = pageSelect;
-
-    // Plot type selector - only show if variable is selected
-    if (this.currentConfig.dataSource.variable) {
-      const dataKind = this.currentConfig.dataSource.type === 'categorical_obs'
-        ? 'categorical' : 'continuous';
-
-      // Auto-select first compatible plot type if none selected
-      if (!this.currentConfig.plotType) {
-        const compatiblePlots = PlotRegistry.getForDataType(dataKind);
-        if (compatiblePlots.length > 0) {
-          this.currentConfig.plotType = compatiblePlots[0].id;
+    // Detailed Analysis
+    this._uiManager.register({
+      id: 'detailed',
+      name: 'Detailed',
+      factory: createDetailedAnalysisUI,
+      factoryOptions: {
+        onConfigChange: (config) => {
+          const next = { ...this.currentConfig, ...config };
+          if (Array.isArray(config?.pages)) {
+            next.pages = [...config.pages];
+            this._uiManager?.setCurrentPages?.(next.pages, { notifyActiveUI: false });
+          }
+          this.currentConfig = next;
         }
-      }
+      },
+      minPages: 1,
+      maxPages: null,
+      icon: 'settings',
+      tooltip: 'Full control over analysis options'
+    });
 
-      const plotTypeSelector = createPlotTypeSelector({
-        dataType: dataKind,
-        selectedId: this.currentConfig.plotType,
-        onChange: this._handlePlotTypeChange
-      });
-      this.controlsContainer.appendChild(plotTypeSelector);
-      this.plotTypeContainer = plotTypeSelector;
-    }
+    // Correlation Analysis
+    this._uiManager.register({
+      id: 'correlation',
+      name: 'Correlation',
+      factory: createCorrelationAnalysisUI,
+      minPages: 1,
+      maxPages: null,
+      icon: 'scatter',
+      tooltip: 'Explore correlations between variables'
+    });
+
+    // Differential Expression
+    this._uiManager.register({
+      id: 'differential',
+      name: 'Differential Expression',
+      factory: createDEAnalysisUI,
+      minPages: 2,
+      maxPages: null, // User can select which 2 pages to compare from available pages
+      icon: 'bar-chart',
+      tooltip: 'Find differentially expressed genes'
+    });
+
+    // Gene Signature Score
+    this._uiManager.register({
+      id: 'signature',
+      name: 'Gene Signature',
+      factory: createGeneSignatureUI,
+      minPages: 1,
+      maxPages: null,
+      icon: 'list',
+      tooltip: 'Compute gene signature scores'
+    });
   }
 
   /**
-   * Render actions (expand button, exports)
+   * Set the analysis mode with proper accordion toggle behavior
+   *
+   * Accordion behavior:
+   * - Clicking a closed item opens it and closes all others
+   * - Clicking an already-open item closes it (toggle)
+   * - Zero or one item can be open at a time
+   *
+   * ARIA: Updates aria-expanded attributes for screen reader accessibility
+   *
+   * @param {'simple'|'detailed'|'correlation'|'differential'|'signature'} mode
    */
-  _renderActions() {
-    this.actionsContainer.innerHTML = '';
-    this.actionsContainer.style.display = 'flex';
-
-    // Expand button to open modal
-    const expandBtn = createExpandButton(this._openExpandedView);
-    this.actionsContainer.appendChild(expandBtn);
-  }
-
-  /**
-   * Hide preview and actions
-   */
-  _hidePreview() {
-    this.previewContainer.innerHTML = '';
-    this.previewContainer.classList.add('empty');
-    this.previewContainer.classList.remove('loading');
-    this.actionsContainer.style.display = 'none';
-  }
-
-  /**
-   * Check if analysis can be run
-   */
-  _canRunAnalysis() {
-    return (
-      this.currentConfig.dataSource.variable &&
-      this.currentConfig.pages.length > 0 &&
-      this.currentConfig.plotType
+  _setAnalysisMode(mode) {
+    const allItems = this._modeToggleContainer.querySelectorAll('.analysis-accordion-item');
+    const clickedItem = this._modeToggleContainer.querySelector(
+      `.analysis-accordion-item[data-mode="${mode}"]`
     );
-  }
 
-  /**
-   * Handle categorical field change - clears others
-   */
-  _handleCategoricalChange(variable) {
-    if (variable) {
-      this.currentConfig.dataSource.type = 'categorical_obs';
-      this.currentConfig.dataSource.variable = variable;
+    // IMPORTANT: Check if clicked item is ALREADY open BEFORE any DOM changes
+    const isAlreadyOpen = clickedItem?.classList.contains('open');
 
-      // Clear others
-      if (this.continuousSelect) this.continuousSelect.value = NONE_VALUE;
-      if (this.geneExpressionContainer?._clearSelection) {
-        this.geneExpressionContainer._clearSelection();
+    // Close ALL accordion items and update ARIA states
+    allItems.forEach(item => {
+      item.classList.remove('open');
+      const header = item.querySelector('.analysis-accordion-header');
+      if (header) {
+        header.setAttribute('aria-expanded', 'false');
+      }
+    });
+
+    // Toggle behavior: only open if it wasn't already open
+    if (!isAlreadyOpen && clickedItem) {
+      // Open the clicked item
+      clickedItem.classList.add('open');
+
+      // Update ARIA expanded state
+      const clickedHeader = clickedItem.querySelector('.analysis-accordion-header');
+      if (clickedHeader) {
+        clickedHeader.setAttribute('aria-expanded', 'true');
       }
 
-      // Update plot type for categorical data
-      this._updatePlotTypeForDataKind('categorical');
-    } else {
-      this._clearDataSource();
-    }
-    this._renderControls();
-    this._scheduleUpdate();
-  }
-
-  /**
-   * Handle continuous field change - clears others
-   */
-  _handleContinuousChange(variable) {
-    if (variable) {
-      this.currentConfig.dataSource.type = 'continuous_obs';
-      this.currentConfig.dataSource.variable = variable;
-
-      // Clear others
-      if (this.categoricalSelect) this.categoricalSelect.value = NONE_VALUE;
-      if (this.geneExpressionContainer?._clearSelection) {
-        this.geneExpressionContainer._clearSelection();
+      // Only switch UI manager when actually opening a new/different mode
+      if (mode !== this._analysisMode) {
+        this._analysisMode = mode;
+        this._uiManager.switchToMode(mode);
       }
-
-      // Update plot type for continuous data
-      this._updatePlotTypeForDataKind('continuous');
     } else {
-      this._clearDataSource();
-    }
-    this._renderControls();
-    this._scheduleUpdate();
-  }
-
-  /**
-   * Handle gene expression change - clears others
-   */
-  _handleGeneChange(variable) {
-    if (variable) {
-      this.currentConfig.dataSource.type = 'gene_expression';
-      this.currentConfig.dataSource.variable = variable;
-
-      // Clear others
-      if (this.categoricalSelect) this.categoricalSelect.value = NONE_VALUE;
-      if (this.continuousSelect) this.continuousSelect.value = NONE_VALUE;
-
-      // Update plot type for continuous data (gene expression is continuous)
-      this._updatePlotTypeForDataKind('continuous');
-    } else {
-      this._clearDataSource();
-    }
-    this._renderControls();
-    this._scheduleUpdate();
-  }
-
-  /**
-   * Clear data source selection
-   */
-  _clearDataSource() {
-    this.currentConfig.dataSource.type = '';
-    this.currentConfig.dataSource.variable = '';
-    this.currentConfig.plotType = '';
-    this.currentConfig.plotOptions = {};
-  }
-
-  /**
-   * Update plot type when data kind changes
-   */
-  _updatePlotTypeForDataKind(kind) {
-    const compatiblePlots = PlotRegistry.getForDataType(kind);
-    const currentPlotCompatible = compatiblePlots.find(p => p.id === this.currentConfig.plotType);
-
-    if (!currentPlotCompatible && compatiblePlots.length > 0) {
-      this.currentConfig.plotType = compatiblePlots[0].id;
-      this.currentConfig.plotOptions = {};
+      // Item was toggled closed - clear the active mode
+      this._analysisMode = null;
     }
   }
 
-  /**
-   * Handle page selection change
-   */
-  _handlePageChange(pageIds) {
-    this.currentConfig.pages = pageIds;
-    this._scheduleUpdate();
-  }
-
-  /**
-   * Handle page color change
-   */
-  _handlePageColorChange(pageId, color) {
-    this.customPageColors.set(pageId, color);
-    // Trigger re-render if we have a valid analysis
-    this._scheduleUpdate();
-  }
-
-  /**
-   * Handle plot type change
-   */
-  _handlePlotTypeChange(plotTypeId) {
-    this.currentConfig.plotType = plotTypeId;
-    // Load saved options for this plot type
-    this.currentConfig.plotOptions = this.getSavedOptionsForPlotType(plotTypeId);
-    this._scheduleUpdate();
-
-    // Update options panel if modal is open
-    if (this.modal && this.modal._optionsContent) {
-      renderPlotOptions(
-        this.modal._optionsContent,
-        plotTypeId,
-        this.currentConfig.plotOptions,
-        this._handlePlotOptionChange
-      );
-    }
-  }
-
-  /**
-   * Handle plot option change from modal
-   */
-  _handlePlotOptionChange(key, value) {
-    this.currentConfig.plotOptions[key] = value;
-    // Save options for persistence
-    this.saveOptionsForPlotType(this.currentConfig.plotType, this.currentConfig.plotOptions);
-    this._scheduleUpdate();
-  }
-
-  /**
-   * Schedule an update (debounced)
-   */
-  _scheduleUpdate() {
-    if (this._updateTimer) {
-      clearTimeout(this._updateTimer);
-    }
-    this._updateTimer = setTimeout(() => {
-      this._runAnalysisIfValid();
-    }, DEBOUNCE_DELAY);
-  }
-
-  /**
-   * Run analysis if configuration is valid
-   */
-  async _runAnalysisIfValid() {
-    if (!this._canRunAnalysis()) {
-      // Clear preview if configuration became invalid
-      this._hidePreview();
-      return;
-    }
-
-    try {
-      await this.runAnalysis(this.currentConfig);
-    } catch (err) {
-      console.error('[ComparisonModule] Analysis failed:', err);
-      this._showError('Analysis failed: ' + err.message);
-    }
-  }
+  // ===========================================================================
+  // Public API Methods
+  // ===========================================================================
 
   /**
    * Run analysis with given configuration
+   *
+   * This method is used by:
+   * - advanced-analysis-ui.js for correlation plots
+   *
+   * @param {Object} config - Analysis configuration
+   * @returns {Promise<Object[]>} Transformed page data
    */
   async runAnalysis(config) {
-    // Show loading state
-    this.previewContainer.classList.remove('empty');
-    this.previewContainer.classList.add('loading');
-
     try {
       // Ensure Plotly is loaded (lazy loading)
       await loadPlotly();
@@ -516,310 +400,96 @@ export class ComparisonModule {
         }));
       }
 
-      // Store current page data for modal
-      this.currentPageData = transformedData;
-
-      // Create layout engine with custom colors and sync options
+      // Create layout engine
       this.layoutEngine = createLayoutEngine({
         pageCount: transformedData.length,
         pageIds: transformedData.map(pd => pd.pageId),
         pageNames: transformedData.map(pd => pd.pageName),
         syncXAxis: config.syncAxes !== false,
-        syncYAxis: config.syncAxes !== false,
-        customColors: this.customPageColors
+        syncYAxis: config.syncAxes !== false
       });
-
-      // Get plot type
-      const plotType = PlotRegistry.get(config.plotType);
-      if (!plotType) {
-        throw new Error(`Unknown plot type: ${config.plotType}`);
-      }
-
-      // Merge options with defaults
-      const mergedOptions = PlotRegistry.mergeOptions(config.plotType, config.plotOptions);
-
-      // Render to preview container
-      this.previewContainer.classList.remove('loading');
-      this.previewContainer.innerHTML = '';
-
-      // Create a plot div for preview
-      const previewPlotDiv = document.createElement('div');
-      previewPlotDiv.className = 'analysis-preview-plot';
-      this.previewContainer.appendChild(previewPlotDiv);
-
-      this.currentPlot = await plotType.render(
-        transformedData,
-        mergedOptions,
-        previewPlotDiv,
-        this.layoutEngine
-      );
-
-      // Show actions
-      this._renderActions();
-
-      // If modal is open, update it too
-      if (this.modal && this.modal._plotContainer) {
-        purgePlot(this.modal._plotContainer);
-        await plotType.render(
-          transformedData,
-          mergedOptions,
-          this.modal._plotContainer,
-          this.layoutEngine
-        );
-
-        // Update summary stats
-        if (this.modal._footer) {
-          renderSummaryStats(
-            this.modal._footer,
-            transformedData,
-            config.dataSource.variable
-          );
-        }
-
-        // Update statistical annotations
-        if (this.modal._annotationsContent) {
-          renderStatisticalAnnotations(
-            this.modal._annotationsContent,
-            transformedData,
-            config.dataSource.type
-          );
-        }
-      }
 
       // Fire afterRender hooks
       for (const hook of this._hooks.afterRender) {
-        await hook(config, this.currentPlot);
+        await hook(config, transformedData);
       }
 
+      // Store for use by runStatisticalTests()
+      this._currentPageData = transformedData;
+
+      // Return transformed data for external use (analysis UIs, exports)
+      return transformedData;
+
     } catch (err) {
-      this.previewContainer.classList.remove('loading');
-      this.previewContainer.classList.add('empty');
+      console.error('[ComparisonModule] runAnalysis failed:', err);
       throw err;
     }
   }
 
-  /**
-   * Show error message
-   */
-  _showError(message) {
-    this.previewContainer.classList.remove('loading');
-    this.previewContainer.classList.add('empty');
-    this.previewContainer.innerHTML = `<div class="analysis-error">${message}</div>`;
-    this.actionsContainer.style.display = 'none';
-
-    // Also show in notification center
-    getNotificationCenter().error(message, { category: 'data', title: 'Analysis Error' });
-  }
-
-  /**
-   * Open expanded view in modal
-   */
-  async _openExpandedView() {
-    if (!this._canRunAnalysis()) return;
-
-    // Create modal
-    this.modal = createAnalysisModal({
-      onClose: () => {
-        this.modal = null;
-      },
-      onExportPNG: () => this.exportPNG(),
-      onExportSVG: () => this.exportSVG(),
-      onExportCSV: () => this.exportCSV()
-    });
-
-    // Set title
-    if (this.modal._title) {
-      this.modal._title.textContent = `Comparing: ${this.currentConfig.dataSource.variable}`;
-    }
-
-    // Render plot options
-    if (this.modal._optionsContent) {
-      renderPlotOptions(
-        this.modal._optionsContent,
-        this.currentConfig.plotType,
-        this.currentConfig.plotOptions,
-        this._handlePlotOptionChange
-      );
-    }
-
-    // Open modal
-    openModal(this.modal);
-
-    // Render plot in modal
-    if (this.currentPageData && this.modal._plotContainer) {
-      try {
-        await loadPlotly();
-
-        const plotType = PlotRegistry.get(this.currentConfig.plotType);
-        const mergedOptions = PlotRegistry.mergeOptions(
-          this.currentConfig.plotType,
-          this.currentConfig.plotOptions
-        );
-
-        await plotType.render(
-          this.currentPageData,
-          mergedOptions,
-          this.modal._plotContainer,
-          this.layoutEngine
-        );
-
-        // Render summary stats
-        if (this.modal._footer) {
-          renderSummaryStats(
-            this.modal._footer,
-            this.currentPageData,
-            this.currentConfig.dataSource.variable
-          );
-        }
-
-        // Render statistical annotations
-        if (this.modal._annotationsContent) {
-          renderStatisticalAnnotations(
-            this.modal._annotationsContent,
-            this.currentPageData,
-            this.currentConfig.dataSource.type
-          );
-        }
-      } catch (err) {
-        console.error('[ComparisonModule] Modal render failed:', err);
-        if (this.modal._plotContainer) {
-          this.modal._plotContainer.innerHTML = `<div class="analysis-error">Failed to render: ${err.message}</div>`;
-        }
-        getNotificationCenter().error('Plot render failed: ' + err.message, { category: 'data', title: 'Render Error' });
-      }
-    }
-  }
+  // ===========================================================================
+  // Event Handlers (Page/Highlight Changes)
+  // ===========================================================================
 
   /**
    * Handle pages changed event (pages added/removed/renamed/switched)
+   * Unified handling via UI manager
    */
   onPagesChanged() {
-    // Update page list in selector
     const pages = this.dataLayer.getPages();
-    const allPageIds = new Set(pages.map(p => p.id));
+    const currentPageIds = pages.map(p => p.id);
+    const currentPageIdSet = new Set(currentPageIds);
 
-    // Filter out any selected pages that no longer exist
-    this.currentConfig.pages = this.currentConfig.pages.filter(id => allPageIds.has(id));
+    const previousPageIds = Array.isArray(this._lastKnownPageIds) ? this._lastKnownPageIds : [];
+    const previousPageIdSet = new Set(previousPageIds);
 
-    // Auto-select any new pages that were added
-    const selectedSet = new Set(this.currentConfig.pages);
-    pages.forEach(p => {
-      if (!selectedSet.has(p.id)) {
-        this.currentConfig.pages.push(p.id);
+    const addedPageIds = currentPageIds.filter(id => !previousPageIdSet.has(id));
+
+    // Treat the manager's selection as canonical (it is the shared selection across modes).
+    const previousSelection = this._uiManager?.getCurrentPages?.() ?? this.currentConfig.pages ?? [];
+    const previousSelectionSet = new Set(previousSelection);
+
+    const hadAllPreviously =
+      previousPageIds.length > 0 &&
+      previousPageIds.every(id => previousSelectionSet.has(id));
+
+    const nextSelectionSet = new Set(
+      (previousSelection || []).filter(id => currentPageIdSet.has(id))
+    );
+
+    // Preserve "Select All" semantics: if the user previously had all pages selected,
+    // auto-include newly created pages so the selection remains "all".
+    if (hadAllPreviously) {
+      for (const id of addedPageIds) {
+        nextSelectionSet.add(id);
       }
-    });
+    }
 
-    // Re-render controls to update page list
-    this._renderControls();
-    this._scheduleUpdate();
+    // If selection is empty (e.g., deletions), default to selecting all current pages.
+    if (nextSelectionSet.size === 0) {
+      for (const id of currentPageIds) {
+        nextSelectionSet.add(id);
+      }
+    }
+
+    const nextSelection = currentPageIds.filter(id => nextSelectionSet.has(id));
+
+    this.currentConfig.pages = nextSelection;
+    this._uiManager.onPageSelectionChange(nextSelection);
+    this._lastKnownPageIds = currentPageIds;
   }
 
   /**
    * Handle highlight changed event (cells added/removed from pages)
+   * Unified handling via UI manager
    */
   onHighlightChanged() {
-    // Update page selector to show new cell counts
-    this._updatePageSelectorCounts();
-
-    // If we have selected pages, re-run the analysis with new data
-    if (this.currentConfig.pages.length > 0 && this.currentConfig.dataSource.variable) {
-      this._scheduleUpdate();
-    }
+    // Notify UI manager (it notifies only the active UI)
+    this._uiManager.onHighlightChanged();
   }
 
-  /**
-   * Update page selector tabs with current cell counts
-   */
-  _updatePageSelectorCounts() {
-    if (!this.controlsContainer) return;
-
-    const pageTabs = this.controlsContainer.querySelectorAll('.analysis-page-tab');
-
-    pageTabs.forEach(tab => {
-      const pageId = tab.dataset.pageId;
-      if (pageId) {
-        const countSpan = tab.querySelector('.analysis-page-count');
-        if (countSpan) {
-          const cellCount = this.dataLayer.getCellIndicesForPage(pageId).length;
-          countSpan.textContent = cellCount > 0 ? cellCount.toLocaleString() : '(0)';
-        }
-      }
-    });
-  }
-
-  /**
-   * Export plot as PNG
-   */
-  async exportPNG() {
-    const container = this.modal?._plotContainer || this.previewContainer?.querySelector('.analysis-preview-plot');
-    if (!container) return;
-
-    try {
-      await downloadImage(container, {
-        format: 'png',
-        width: 1200,
-        height: 800,
-        filename: 'page-analysis'
-      });
-      getNotificationCenter().success('Plot exported as PNG', { category: 'download' });
-    } catch (err) {
-      console.error('[ComparisonModule] PNG export failed:', err);
-      getNotificationCenter().error('PNG export failed: ' + err.message, { category: 'download' });
-    }
-  }
-
-  /**
-   * Export plot as SVG
-   */
-  async exportSVG() {
-    const container = this.modal?._plotContainer || this.previewContainer?.querySelector('.analysis-preview-plot');
-    if (!container) return;
-
-    try {
-      await downloadImage(container, {
-        format: 'svg',
-        width: 1200,
-        height: 800,
-        filename: 'page-analysis'
-      });
-      getNotificationCenter().success('Plot exported as SVG', { category: 'download' });
-    } catch (err) {
-      console.error('[ComparisonModule] SVG export failed:', err);
-      getNotificationCenter().error('SVG export failed: ' + err.message, { category: 'download' });
-    }
-  }
-
-  /**
-   * Export data as CSV
-   */
-  async exportCSV() {
-    if (!this.currentConfig.dataSource.variable || !this.currentPageData) return;
-
-    try {
-      // Build CSV
-      const rows = ['page,cell_index,value'];
-      for (const pd of this.currentPageData) {
-        for (let i = 0; i < pd.values.length; i++) {
-          rows.push(`"${pd.pageName}",${pd.cellIndices[i]},${pd.values[i]}`);
-        }
-      }
-
-      const csv = rows.join('\n');
-      const blob = new Blob([csv], { type: 'text/csv' });
-      const url = URL.createObjectURL(blob);
-
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = 'page-analysis-data.csv';
-      a.click();
-
-      URL.revokeObjectURL(url);
-      getNotificationCenter().success('Data exported as CSV', { category: 'download' });
-    } catch (err) {
-      console.error('[ComparisonModule] CSV export failed:', err);
-      getNotificationCenter().error('CSV export failed: ' + err.message, { category: 'download' });
-    }
-  }
+  // ===========================================================================
+  // Configuration & Hooks
+  // ===========================================================================
 
   /**
    * Get current configuration
@@ -833,8 +503,6 @@ export class ComparisonModule {
    */
   setConfig(config) {
     this.currentConfig = { ...this.currentConfig, ...config };
-    this._renderControls();
-    this._scheduleUpdate();
   }
 
   /**
@@ -858,44 +526,182 @@ export class ComparisonModule {
     }
   }
 
+  // ===========================================================================
+  // Lifecycle
+  // ===========================================================================
+
   /**
-   * Get saved options for a plot type, merged with defaults
-   * @param {string} plotTypeId
-   * @returns {Object}
+   * Perform periodic cleanup to prevent memory degradation
    */
-  getSavedOptionsForPlotType(plotTypeId) {
-    const saved = this._savedPlotOptions.get(plotTypeId) || {};
-    return PlotRegistry.mergeOptions(plotTypeId, saved);
+  performCleanup() {
+    if (this.dataLayer && this.dataLayer.performCacheCleanup) {
+      const result = this.dataLayer.performCacheCleanup();
+      console.debug('[ComparisonModule] Cleanup completed:', result);
+    }
+
+    // Clear stale stat results
+    if (this._lastStatResults && this._lastStatResults.length > 0) {
+      const now = Date.now();
+      if (this._lastStatResultsTimestamp && (now - this._lastStatResultsTimestamp) > 5 * 60 * 1000) {
+        this._lastStatResults = [];
+        this._lastStatResultsTimestamp = null;
+      }
+    }
   }
 
   /**
-   * Save options for current plot type (session-only, not persisted)
-   * @param {string} plotTypeId
-   * @param {Object} options
-   */
-  saveOptionsForPlotType(plotTypeId, options) {
-    this._savedPlotOptions.set(plotTypeId, { ...options });
-  }
-
-  /**
-   * Cleanup
+   * Cleanup and destroy the module
    */
   destroy() {
-    if (this._updateTimer) {
-      clearTimeout(this._updateTimer);
+    // Unregister from memory monitor
+    if (this._memoryMonitor) {
+      this._memoryMonitor.unregisterCleanupHandler('comparison-module');
+      this._memoryMonitor = null;
     }
-    if (this.previewContainer) {
-      const plotEl = this.previewContainer.querySelector('.analysis-preview-plot');
-      if (plotEl) purgePlot(plotEl);
+
+    // Destroy UI manager (handles all analysis UIs)
+    if (this._uiManager) {
+      this._uiManager.destroy();
+      this._uiManager = null;
     }
-    if (this.modal) {
-      closeModal(this.modal);
-      this.modal = null;
+
+    // Clear caches
+    if (this.dataLayer && this.dataLayer.clearAllCaches) {
+      this.dataLayer.clearAllCaches();
     }
+
+    // Clear hooks
     this._hooks = { beforeRender: [], afterRender: [] };
-    this.currentPlot = null;
-    this.currentPageData = null;
+
+    // Null out references to free memory
     this.layoutEngine = null;
+    this._multiVariableAnalysis = null;
+    this._lastStatResults = [];
+    this._lastStatResultsTimestamp = null;
+    this._currentPageData = null;
+    this.dataLayer = null;
+  }
+
+  // =========================================================================
+  // Advanced Analysis Features
+  // =========================================================================
+
+  /**
+   * Get multi-variable analysis module (lazy initialization)
+   * @returns {Object} MultiVariableAnalysis instance
+   */
+  get multiVariableAnalysis() {
+    if (!this._multiVariableAnalysis) {
+      this._multiVariableAnalysis = createMultiVariableAnalysis(this.dataLayer);
+    }
+    return this._multiVariableAnalysis;
+  }
+
+  /**
+   * Run statistical tests on current page data
+   * @returns {Promise<Object[]>} Statistical test results
+   */
+  async runStatisticalTests() {
+    if (!this._currentPageData || this._currentPageData.length < 2) {
+      return [];
+    }
+
+    const dataType = this.currentConfig.dataSource.type === 'categorical_obs'
+      ? 'categorical' : 'continuous';
+
+    this._lastStatResults = runStats(this._currentPageData, dataType);
+    this._lastStatResultsTimestamp = Date.now();
+    return this._lastStatResults;
+  }
+
+  /**
+   * Get the last statistical test results
+   * @returns {Object[]}
+   */
+  getLastStatResults() {
+    return this._lastStatResults;
+  }
+
+  /**
+   * Perform correlation analysis between two variables
+   * @param {Object} options - { varX, varY, pageIds, method }
+   * @returns {Promise<Object[]>}
+   */
+  async correlationAnalysis(options) {
+    return this.multiVariableAnalysis.correlationAnalysis(options);
+  }
+
+  /**
+   * Perform differential expression analysis
+   * @param {Object} options - { pageA, pageB, geneList, method }
+   * @returns {Promise<Object>}
+   */
+  async differentialExpression(options) {
+    return this.multiVariableAnalysis.differentialExpression(options);
+  }
+
+  /**
+   * Compute gene signature score
+   * @param {Object} options - { genes, pageIds, method }
+   * @returns {Promise<Object[]>}
+   */
+  async computeSignatureScore(options) {
+    return this.multiVariableAnalysis.computeSignatureScore(options);
+  }
+
+  /**
+   * Fetch bulk gene expression data with progress
+   * @param {Object} options - { pageIds, geneList, forceReload, onProgress }
+   * @returns {Promise<Object>}
+   */
+  async fetchBulkGeneExpression(options) {
+    return this.dataLayer.fetchBulkGeneExpression(options);
+  }
+
+  /**
+   * Get cache statistics from enhanced data layer
+   * @returns {Object}
+   */
+  getCacheStats() {
+    return this.dataLayer.getCacheStats();
+  }
+
+  /**
+   * Clear all caches
+   */
+  clearCaches() {
+    this.dataLayer.clearAllCaches();
+  }
+
+  /**
+   * Get individual analysis UIs via manager
+   * @returns {Object} Object with individual UI instances
+   */
+  getAnalysisUIs() {
+    return {
+      quick: this._uiManager?.getUI('simple'),
+      detailed: this._uiManager?.getUI('detailed'),
+      correlation: this._uiManager?.getUI('correlation'),
+      de: this._uiManager?.getUI('differential'),
+      signature: this._uiManager?.getUI('signature')
+    };
+  }
+
+  /**
+   * Get a specific analysis UI by mode ID
+   * @param {string} modeId - Mode ID (simple, detailed, correlation, differential, signature)
+   * @returns {Object|null} UI instance or null
+   */
+  getUI(modeId) {
+    return this._uiManager?.getUI(modeId) || null;
+  }
+
+  /**
+   * Get the UI manager instance
+   * @returns {AnalysisUIManager|null}
+   */
+  getUIManager() {
+    return this._uiManager;
   }
 
   // =========================================================================
@@ -943,4 +749,29 @@ export function createComparisonModule(options) {
   return module;
 }
 
-export { PlotRegistry, DataLayer, TransformPipeline, LayoutEngine };
+// Re-export for external use
+export { PlotRegistry };
+export { DataLayer, createDataLayer } from './data/data-layer.js';
+export { TransformPipeline, createTransformPipeline } from './data/transform-pipeline.js';
+export { LayoutEngine, createLayoutEngine } from './plots/layout-engine.js';
+export { MultiVariableAnalysis, createMultiVariableAnalysis } from './stats/multi-variable-analysis.js';
+
+// Re-export UI manager and analysis UIs (all treated equally)
+export { AnalysisUIManager, createAnalysisUIManager } from './ui/analysis-ui-manager.js';
+export { QuickInsights, createQuickInsights } from './ui/analysis-types/quick-insights-ui.js';
+export { DetailedAnalysisUI, createDetailedAnalysisUI } from './ui/analysis-types/detailed-analysis-ui.js';
+export { CorrelationAnalysisUI, createCorrelationAnalysisUI } from './ui/analysis-types/correlation-analysis-ui.js';
+export { DEAnalysisUI, createDEAnalysisUI } from './ui/analysis-types/de-analysis-ui.js';
+export { GeneSignatureUI, createGeneSignatureUI } from './ui/analysis-types/gene-signature-ui.js';
+
+// Re-export query builder
+export { QueryBuilder, createQueryBuilder, OPERATORS } from './data/query-builder.js';
+
+// Re-export statistical functions
+export {
+  benjaminiHochberg,
+  bonferroniCorrection,
+  applyMultipleTestingCorrection,
+  confidenceInterval,
+  computeFoldChange
+} from './stats/statistical-tests.js';

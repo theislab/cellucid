@@ -368,11 +368,13 @@ class DataState {
       this.viewer.updatePositions(positions3D);
     } else if (this.viewer.setData) {
       // Full data reload if no incremental update available
+      // Pass dimensionLevel to ensure correct spatial index is built
       this.viewer.setData({
         positions: positions3D,
         colors: this.colorsArray,
         outlierQuantiles: this.outlierQuantilesArray,
-        transparency: this.categoryTransparency
+        transparency: this.categoryTransparency,
+        dimensionLevel: this.activeDimensionLevel
       });
     }
   }
@@ -915,11 +917,15 @@ class DataState {
     this.categoryTransparency.fill(1.0);
     this.filteredCount = { shown: this.pointCount, total: this.pointCount };
 
+    // Pass dimensionLevel to ensure correct spatial index is built (BinaryTree/Quadtree/Octree)
+    // activeDimensionLevel is set by setDimensionManager() which is called before initScene()
+    // This fixes the bug where 1D/2D datasets were incorrectly treated as 3D
     this.viewer.setData({
       positions,
       colors: this.colorsArray,
       outlierQuantiles: this.outlierQuantilesArray,
-      transparency: this.categoryTransparency
+      transparency: this.categoryTransparency,
+      dimensionLevel: this.activeDimensionLevel
     });
 
     this.clearCentroids();
@@ -1136,7 +1142,15 @@ class DataState {
     this.varData = { ...varManifest, fields: normalizedFields };
   }
 
-  async ensureFieldLoaded(fieldIndex) {
+  /**
+   * Ensure a field is loaded before use.
+   * @param {number} fieldIndex - Index of the field in obsData.fields
+   * @param {Object} [options] - Options
+   * @param {boolean} [options.silent=false] - If true, suppress notifications (for batch operations)
+   * @returns {Promise<Object>} The loaded field object
+   */
+  async ensureFieldLoaded(fieldIndex, options = {}) {
+    const { silent = false } = options;
     const field = this.obsData?.fields?.[fieldIndex];
     if (!field) throw new Error(`Obs field ${fieldIndex} is not available.`);
     const cacheKey = field.key || String(fieldIndex);
@@ -1162,9 +1176,9 @@ class DataState {
       return field;
     }
 
-    // Show loading notification
+    // Show loading notification (unless silent mode for batch operations)
     const notifications = getNotificationCenter();
-    const notifId = notifications.loading(`Loading field: ${field.key}`, { category: 'data' });
+    const notifId = silent ? null : notifications.loading(`Loading field: ${field.key}`, { category: 'data' });
 
     field._loadingPromise = this.fieldLoader(field)
       .then((loadedData) => {
@@ -1187,19 +1201,27 @@ class DataState {
           codes: field.codes,
           outlierQuantiles: field.outlierQuantiles
         });
-        notifications.complete(notifId, `Loaded field: ${field.key}`);
+        if (notifId) notifications.complete(notifId, `Loaded field: ${field.key}`);
         return field;
       })
       .catch((err) => {
         field._loadingPromise = null;
-        notifications.fail(notifId, `Failed to load field: ${field.key}`);
+        if (notifId) notifications.fail(notifId, `Failed to load field: ${field.key}`);
         throw err;
       });
 
     return field._loadingPromise;
   }
 
-  async ensureVarFieldLoaded(fieldIndex) {
+  /**
+   * Ensure a var field (gene) is loaded before use.
+   * @param {number} fieldIndex - Index of the field in varData.fields
+   * @param {Object} [options] - Options
+   * @param {boolean} [options.silent=false] - If true, suppress notifications (for batch operations)
+   * @returns {Promise<Object>} The loaded field object
+   */
+  async ensureVarFieldLoaded(fieldIndex, options = {}) {
+    const { silent = false } = options;
     const field = this.varData?.fields?.[fieldIndex];
     if (!field) throw new Error(`Var field ${fieldIndex} is not available.`);
     const cacheKey = field.key || String(fieldIndex);
@@ -1219,9 +1241,9 @@ class DataState {
       return field;
     }
 
-    // Show loading notification for gene expression
+    // Show loading notification for gene expression (unless silent mode for batch operations)
     const notifications = getNotificationCenter();
-    const notifId = notifications.loading(`Loading gene: ${field.key}`, { category: 'data' });
+    const notifId = silent ? null : notifications.loading(`Loading gene: ${field.key}`, { category: 'data' });
 
     field._loadingPromise = this.varFieldLoader(field)
       .then((loadedData) => {
@@ -1232,12 +1254,12 @@ class DataState {
         field.loaded = true;
         field._loadingPromise = null;
         this._varFieldDataCache.set(cacheKey, { values: field.values });
-        notifications.complete(notifId, `Loaded gene: ${field.key}`);
+        if (notifId) notifications.complete(notifId, `Loaded gene: ${field.key}`);
         return field;
       })
       .catch((err) => {
         field._loadingPromise = null;
-        notifications.fail(notifId, `Failed to load gene: ${field.key}`);
+        if (notifId) notifications.fail(notifId, `Failed to load gene: ${field.key}`);
         throw err;
       });
 

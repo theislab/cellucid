@@ -2901,6 +2901,1892 @@ export class PerformanceTracker {
 }
 
 /**
+ * ====================================================================
+ * BOTTLENECK ANALYZER
+ * ====================================================================
+ *
+ * Comprehensive performance bottleneck analysis for large-scale rendering.
+ * Designed to identify WHY performance is slow when rendering 10-20M+ cells.
+ *
+ * Key bottleneck categories analyzed:
+ * 1. CPU vs GPU bound detection
+ * 2. CPU phase breakdown (LOD, frustum culling, buffer upload, draw calls)
+ * 3. GPU phase analysis (vertex vs fragment bound)
+ * 4. Memory bandwidth estimation
+ * 5. Fill rate analysis
+ * 6. Thermal throttling detection
+ *
+ * Usage:
+ *   const analyzer = new BottleneckAnalyzer(gl, renderer);
+ *   await analyzer.runAnalysis({ warmupFrames: 30, testFrames: 120 });
+ *   const report = analyzer.getReport();
+ *   console.log(analyzer.formatReport());
+ */
+export class BottleneckAnalyzer {
+  constructor(gl, renderer) {
+    this.gl = gl;
+    this.renderer = renderer;
+    this.gpuTimer = null;
+    this.results = null;
+
+    // Phase timing accumulators
+    this.phaseTimings = {
+      lodSelection: [],
+      frustumCulling: [],
+      bufferUpload: [],
+      uniformSetup: [],
+      drawCall: [],
+      total: []
+    };
+
+    // GPU timing results
+    this.gpuTimings = [];
+
+    // Frame metrics for analysis
+    this.frameMetrics = [];
+
+    // Configuration
+    this.config = {
+      warmupFrames: 30,
+      testFrames: 120,
+      cooldownMs: 100,
+      enableGPUTiming: true,
+      fillRateTestSizes: [0.25, 0.5, 1.0, 2.0], // viewport scale factors
+      vertexCountTests: [0.1, 0.25, 0.5, 1.0]   // LOD fractions
+    };
+
+    this._initGPUTimer();
+  }
+
+  _initGPUTimer() {
+    if (!this.gl || !this.config.enableGPUTiming) return;
+
+    this.gpuTimer = new GPUTimer(this.gl);
+    if (!this.gpuTimer.isAvailable()) {
+      console.warn('[BottleneckAnalyzer] GPU timing not available - will estimate from CPU times');
+      this.gpuTimer = null;
+    }
+  }
+
+  /**
+   * Run comprehensive bottleneck analysis
+   * @param {Object} options - Analysis options
+   * @returns {Promise<Object>} Analysis results
+   */
+  async runAnalysis(options = {}) {
+    const config = { ...this.config, ...options };
+
+    console.log('[BottleneckAnalyzer] Starting bottleneck analysis...');
+    console.log(`  - Warmup: ${config.warmupFrames} frames`);
+    console.log(`  - Test: ${config.testFrames} frames`);
+
+    // Reset state
+    this._reset();
+
+    const analysisStart = performance.now();
+
+    // Phase 1: Baseline measurement
+    console.log('[BottleneckAnalyzer] Phase 1: Baseline measurement...');
+    const baseline = await this._runBaselineMeasurement(config);
+
+    // Phase 2: CPU phase breakdown
+    console.log('[BottleneckAnalyzer] Phase 2: CPU phase analysis...');
+    const cpuPhases = await this._runCPUPhaseAnalysis(config);
+
+    // Phase 3: GPU timing (if available)
+    console.log('[BottleneckAnalyzer] Phase 3: GPU timing analysis...');
+    const gpuAnalysis = await this._runGPUAnalysis(config);
+
+    // Phase 4: Vertex vs Fragment bound test
+    console.log('[BottleneckAnalyzer] Phase 4: Vertex/Fragment bound analysis...');
+    const boundAnalysis = await this._runBoundAnalysis(config);
+
+    // Phase 5: Memory bandwidth estimation
+    console.log('[BottleneckAnalyzer] Phase 5: Memory analysis...');
+    const memoryAnalysis = this._analyzeMemory();
+
+    // Phase 6: Thermal throttling check
+    console.log('[BottleneckAnalyzer] Phase 6: Thermal analysis...');
+    const thermalAnalysis = this._analyzeThermal();
+
+    // Phase 7: Jank/stutter analysis
+    console.log('[BottleneckAnalyzer] Phase 7: Jank analysis...');
+    const jankAnalysis = this._analyzeJank(baseline.rawFrameTimes || []);
+
+    // Phase 8: JS/CPU pressure analysis
+    console.log('[BottleneckAnalyzer] Phase 8: JS/CPU analysis...');
+    const jsAnalysis = this._analyzeJSPressure();
+
+    const analysisTime = performance.now() - analysisStart;
+
+    // Compile results
+    this.results = {
+      timestamp: new Date().toISOString(),
+      analysisTimeMs: analysisTime,
+      config,
+
+      // Raw measurements
+      baseline,
+      cpuPhases,
+      gpuAnalysis,
+      boundAnalysis,
+      memoryAnalysis,
+      thermalAnalysis,
+      jankAnalysis,
+      jsAnalysis,
+
+      // Derived analysis
+      bottleneckType: this._determineBottleneckType(baseline, cpuPhases, gpuAnalysis, boundAnalysis, jankAnalysis, jsAnalysis),
+      recommendations: this._generateRecommendations(baseline, cpuPhases, gpuAnalysis, boundAnalysis, memoryAnalysis, jankAnalysis, jsAnalysis),
+
+      // Summary metrics
+      summary: this._generateSummary(baseline, cpuPhases, gpuAnalysis, boundAnalysis, memoryAnalysis, jankAnalysis, jsAnalysis)
+    };
+
+    console.log('[BottleneckAnalyzer] Analysis complete!');
+    return this.results;
+  }
+
+  _reset() {
+    this.phaseTimings = {
+      lodSelection: [],
+      frustumCulling: [],
+      bufferUpload: [],
+      uniformSetup: [],
+      drawCall: [],
+      total: []
+    };
+    this.gpuTimings = [];
+    this.frameMetrics = [];
+    this.results = null;
+
+    if (this.gpuTimer) {
+      this.gpuTimer.reset();
+    }
+  }
+
+  /**
+   * Phase 1: Baseline measurement - overall frame timing
+   */
+  async _runBaselineMeasurement(config) {
+    const frameTimes = [];
+    const rendererStats = [];
+
+    // Default render params
+    const renderParams = this._getDefaultRenderParams();
+
+    return new Promise((resolve) => {
+      let frameCount = 0;
+      let warmupCount = 0;
+      let lastTime = performance.now();
+
+      const measure = () => {
+        const now = performance.now();
+        const frameTime = now - lastTime;
+        lastTime = now;
+
+        // Warmup phase
+        if (warmupCount < config.warmupFrames) {
+          warmupCount++;
+          if (this.gpuTimer) {
+            const query = this.gpuTimer.begin('warmup');
+            this.renderer.render(renderParams);
+            this.gpuTimer.end(query);
+            this.gpuTimer.poll();
+          } else {
+            this.renderer.render(renderParams);
+          }
+          requestAnimationFrame(measure);
+          return;
+        }
+
+        // Measurement phase
+        if (frameCount < config.testFrames) {
+          // Start GPU timing
+          let gpuQuery = null;
+          if (this.gpuTimer) {
+            gpuQuery = this.gpuTimer.begin('baseline');
+          }
+
+          const renderStart = performance.now();
+          this.renderer.render(renderParams);
+          const renderTime = performance.now() - renderStart;
+
+          // End GPU timing
+          if (gpuQuery) {
+            this.gpuTimer.end(gpuQuery);
+          }
+
+          // Collect GPU results
+          if (this.gpuTimer) {
+            const completed = this.gpuTimer.poll();
+            this.gpuTimings.push(...completed);
+          }
+
+          // Skip first frame (may include setup)
+          if (frameCount > 0 && frameTime > 0.1 && frameTime < 1000) {
+            frameTimes.push(frameTime);
+            rendererStats.push({
+              ...this.renderer.getStats(),
+              cpuRenderTime: renderTime
+            });
+          }
+
+          frameCount++;
+          requestAnimationFrame(measure);
+          return;
+        }
+
+        // Analysis complete
+        const sorted = [...frameTimes].sort((a, b) => a - b);
+        const n = sorted.length;
+        const sum = sorted.reduce((a, b) => a + b, 0);
+        const avg = sum / n;
+
+        const stats = {
+          avgFrameTime: avg,
+          fps: 1000 / avg,
+          minFrameTime: sorted[0],
+          maxFrameTime: sorted[n - 1],
+          medianFrameTime: sorted[Math.floor(n * 0.5)],
+          p95FrameTime: sorted[Math.floor(n * 0.95)],
+          p99FrameTime: sorted[Math.floor(n * 0.99)],
+          stdDev: this._calcStdDev(sorted),
+          frameCount: n,
+          rendererStats: {
+            avgVisiblePoints: this._avg(rendererStats.map(s => s.visiblePoints)),
+            avgLodLevel: this._avg(rendererStats.map(s => s.lodLevel)),
+            avgDrawCalls: this._avg(rendererStats.map(s => s.drawCalls)),
+            avgCpuRenderTime: this._avg(rendererStats.map(s => s.cpuRenderTime)),
+            gpuMemoryMB: rendererStats[0]?.gpuMemoryMB || 0
+          },
+          rawFrameTimes: frameTimes
+        };
+
+        resolve(stats);
+      };
+
+      requestAnimationFrame(measure);
+    });
+  }
+
+  /**
+   * Phase 2: CPU phase breakdown with instrumented timing
+   */
+  async _runCPUPhaseAnalysis(config) {
+    // Measure each phase by toggling features
+    const phases = {};
+    const renderParams = this._getDefaultRenderParams();
+
+    // Store original config
+    const originalLOD = this.renderer.adaptiveLOD;
+    const originalFrustum = this.renderer.frustumCullingEnabled;
+
+    // Test 1: Measure with LOD disabled vs enabled
+    console.log('  - Testing LOD overhead...');
+    this.renderer.setAdaptiveLOD(false);
+    const noLODTimes = await this._measureFrameTimes(config.testFrames / 4, renderParams);
+
+    this.renderer.setAdaptiveLOD(true);
+    const withLODTimes = await this._measureFrameTimes(config.testFrames / 4, renderParams);
+
+    phases.lodOverhead = {
+      avgWithout: this._avg(noLODTimes),
+      avgWith: this._avg(withLODTimes),
+      overhead: this._avg(withLODTimes) - this._avg(noLODTimes),
+      percentOfFrame: ((this._avg(withLODTimes) - this._avg(noLODTimes)) / this._avg(withLODTimes)) * 100
+    };
+
+    // Test 2: Measure frustum culling overhead
+    console.log('  - Testing frustum culling overhead...');
+    this.renderer.setFrustumCulling(false);
+    const noFrustumTimes = await this._measureFrameTimes(config.testFrames / 4, renderParams);
+
+    this.renderer.setFrustumCulling(true);
+    const withFrustumTimes = await this._measureFrameTimes(config.testFrames / 4, renderParams);
+
+    phases.frustumCullingOverhead = {
+      avgWithout: this._avg(noFrustumTimes),
+      avgWith: this._avg(withFrustumTimes),
+      overhead: this._avg(withFrustumTimes) - this._avg(noFrustumTimes),
+      percentOfFrame: ((this._avg(withFrustumTimes) - this._avg(noFrustumTimes)) / this._avg(withFrustumTimes)) * 100
+    };
+
+    // Restore original settings
+    this.renderer.setAdaptiveLOD(originalLOD);
+    this.renderer.setFrustumCulling(originalFrustum);
+
+    // Test 3: Shader quality comparison
+    console.log('  - Testing shader complexity overhead...');
+    const shaderTests = {};
+    for (const quality of ['ultralight', 'light', 'full']) {
+      this.renderer.setQuality(quality);
+      const times = await this._measureFrameTimes(config.testFrames / 6, renderParams);
+      shaderTests[quality] = {
+        avg: this._avg(times),
+        min: Math.min(...times),
+        max: Math.max(...times)
+      };
+    }
+
+    phases.shaderComplexity = {
+      ultralight: shaderTests.ultralight,
+      light: shaderTests.light,
+      full: shaderTests.full,
+      lightVsUltralight: shaderTests.light.avg - shaderTests.ultralight.avg,
+      fullVsLight: shaderTests.full.avg - shaderTests.light.avg,
+      fullVsUltralight: shaderTests.full.avg - shaderTests.ultralight.avg
+    };
+
+    // Reset to full quality
+    this.renderer.setQuality('full');
+
+    return phases;
+  }
+
+  /**
+   * Phase 3: GPU timing analysis
+   */
+  async _runGPUAnalysis(config) {
+    if (!this.gpuTimer) {
+      return {
+        available: false,
+        message: 'GPU timing extension not available',
+        estimatedFromCPU: true
+      };
+    }
+
+    // Collect GPU timings already gathered during baseline
+    const gpuStats = this.gpuTimer.getStats();
+
+    // Additional GPU-specific measurements
+    const renderParams = this._getDefaultRenderParams();
+    this.gpuTimer.reset();
+
+    // Run focused GPU measurement
+    const gpuFrameTimes = [];
+    const cpuFrameTimes = [];
+
+    return new Promise((resolve) => {
+      let frameCount = 0;
+
+      const measure = () => {
+        if (frameCount < config.testFrames / 2) {
+          const cpuStart = performance.now();
+          const gpuQuery = this.gpuTimer.begin('gpu_analysis');
+
+          this.renderer.render(renderParams);
+
+          this.gpuTimer.end(gpuQuery);
+          const cpuEnd = performance.now();
+          cpuFrameTimes.push(cpuEnd - cpuStart);
+
+          // Poll for completed GPU queries
+          const completed = this.gpuTimer.poll();
+          for (const result of completed) {
+            gpuFrameTimes.push(result.gpuTimeMs);
+          }
+
+          frameCount++;
+          requestAnimationFrame(measure);
+          return;
+        }
+
+        // Final poll to get remaining queries
+        setTimeout(() => {
+          for (let i = 0; i < 10; i++) {
+            const completed = this.gpuTimer.poll();
+            for (const result of completed) {
+              gpuFrameTimes.push(result.gpuTimeMs);
+            }
+          }
+
+          const avgGPU = gpuFrameTimes.length > 0 ? this._avg(gpuFrameTimes) : 0;
+          const avgCPU = this._avg(cpuFrameTimes);
+
+          resolve({
+            available: true,
+            avgGpuTimeMs: avgGPU,
+            minGpuTimeMs: gpuFrameTimes.length > 0 ? Math.min(...gpuFrameTimes) : 0,
+            maxGpuTimeMs: gpuFrameTimes.length > 0 ? Math.max(...gpuFrameTimes) : 0,
+            avgCpuTimeMs: avgCPU,
+            gpuCpuRatio: avgCPU > 0 ? avgGPU / avgCPU : 0,
+            samples: gpuFrameTimes.length,
+            // Determine if GPU or CPU bound
+            boundBy: avgGPU > avgCPU * 0.8 ? 'GPU' : 'CPU',
+            gpuUtilization: avgCPU > 0 ? (avgGPU / avgCPU) * 100 : 0,
+            headroom: {
+              gpu: Math.max(0, 16.67 - avgGPU),
+              cpu: Math.max(0, 16.67 - avgCPU)
+            }
+          });
+        }, 200);
+      };
+
+      requestAnimationFrame(measure);
+    });
+  }
+
+  /**
+   * Phase 4: Vertex vs Fragment bound analysis
+   */
+  async _runBoundAnalysis(config) {
+    const renderParams = this._getDefaultRenderParams();
+
+    // Test 1: Vary point size (affects fill rate / fragment bound)
+    console.log('  - Testing point size scaling...');
+    const pointSizeTests = {};
+    for (const size of [1, 2, 4, 8, 16]) {
+      const params = { ...renderParams, pointSize: size };
+      const times = await this._measureFrameTimes(config.testFrames / 10, params);
+      pointSizeTests[size] = {
+        avg: this._avg(times),
+        min: Math.min(...times),
+        max: Math.max(...times)
+      };
+    }
+
+    // Test 2: Vary LOD level (affects vertex count)
+    console.log('  - Testing LOD level scaling...');
+    const lodTests = {};
+    const lodLevels = this.renderer.getLODLevelCount?.() || 10;
+    const testLevels = [0, Math.floor(lodLevels / 4), Math.floor(lodLevels / 2), lodLevels - 1];
+
+    for (const level of testLevels) {
+      const params = { ...renderParams, forceLOD: level };
+      const times = await this._measureFrameTimes(config.testFrames / 8, params);
+      const stats = this.renderer.getStats();
+      lodTests[level] = {
+        avg: this._avg(times),
+        min: Math.min(...times),
+        max: Math.max(...times),
+        visiblePoints: stats.visiblePoints
+      };
+    }
+
+    // Calculate scaling factors
+    const pointSizeScaling = this._calculateScaling(pointSizeTests);
+    const lodScaling = this._calculateLODScaling(lodTests);
+
+    // Determine if vertex or fragment bound
+    // If doubling point size doubles frame time -> fragment bound
+    // If halving vertices halves frame time -> vertex bound
+    const fragmentBoundScore = pointSizeScaling.scalingFactor;
+    const vertexBoundScore = lodScaling.scalingFactor;
+
+    let boundType = 'balanced';
+    if (fragmentBoundScore > 1.5 && fragmentBoundScore > vertexBoundScore) {
+      boundType = 'fragment';
+    } else if (vertexBoundScore > 1.5 && vertexBoundScore > fragmentBoundScore) {
+      boundType = 'vertex';
+    }
+
+    return {
+      pointSizeTests,
+      lodTests,
+      pointSizeScaling,
+      lodScaling,
+      boundType,
+      analysis: {
+        fragmentBoundScore,
+        vertexBoundScore,
+        explanation: this._explainBoundType(boundType, fragmentBoundScore, vertexBoundScore)
+      }
+    };
+  }
+
+  /**
+   * Phase 5: Memory analysis
+   */
+  _analyzeMemory() {
+    const stats = this.renderer.getStats();
+    const gl = this.gl;
+
+    // Estimate memory usage
+    const pointCount = this.renderer._positions?.length / 3 || 0;
+    const bytesPerPoint = 16; // interleaved: 12 bytes position + 4 bytes color
+    const geometryMemory = pointCount * bytesPerPoint;
+
+    // LOD buffers (approximately 1.5x main buffer due to multiple levels)
+    const lodMemoryEstimate = geometryMemory * 1.5;
+
+    // Alpha texture (1 byte per point)
+    const alphaTextureMemory = pointCount;
+
+    // Index buffer for frustum culling (4 bytes per point)
+    const indexBufferMemory = pointCount * 4;
+
+    const totalEstimatedMemory = geometryMemory + lodMemoryEstimate + alphaTextureMemory + indexBufferMemory;
+
+    // Get WebGL limits
+    const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+    const maxVertexAttribs = gl.getParameter(gl.MAX_VERTEX_ATTRIBS);
+    const maxUniformVectors = gl.getParameter(gl.MAX_VERTEX_UNIFORM_VECTORS);
+
+    // Check for memory pressure
+    const jsHeap = typeof performance !== 'undefined' && performance.memory
+      ? performance.memory.usedJSHeapSize / (1024 * 1024)
+      : null;
+    const jsHeapLimit = typeof performance !== 'undefined' && performance.memory
+      ? performance.memory.jsHeapSizeLimit / (1024 * 1024)
+      : null;
+
+    return {
+      pointCount,
+      bytesPerPoint,
+      breakdown: {
+        geometryMB: geometryMemory / (1024 * 1024),
+        lodBuffersMB: lodMemoryEstimate / (1024 * 1024),
+        alphaTextureMB: alphaTextureMemory / (1024 * 1024),
+        indexBufferMB: indexBufferMemory / (1024 * 1024)
+      },
+      totalEstimatedMB: totalEstimatedMemory / (1024 * 1024),
+      reportedGpuMemoryMB: stats.gpuMemoryMB,
+      jsHeap: {
+        usedMB: jsHeap,
+        limitMB: jsHeapLimit,
+        utilizationPercent: jsHeap && jsHeapLimit ? (jsHeap / jsHeapLimit) * 100 : null
+      },
+      webglLimits: {
+        maxTextureSize,
+        maxVertexAttribs,
+        maxUniformVectors
+      },
+      memoryPressure: this._assessMemoryPressure(totalEstimatedMemory, jsHeap, jsHeapLimit)
+    };
+  }
+
+  /**
+   * Phase 6: Thermal throttling analysis
+   */
+  _analyzeThermal() {
+    const frameTimes = this.frameMetrics.length > 0
+      ? this.frameMetrics
+      : (this.results?.baseline?.rawFrameTimes || []);
+
+    if (frameTimes.length < 20) {
+      return { detected: false, message: 'Insufficient data for thermal analysis' };
+    }
+
+    // Split into quarters and compare
+    const quarterSize = Math.floor(frameTimes.length / 4);
+    const quarters = [
+      frameTimes.slice(0, quarterSize),
+      frameTimes.slice(quarterSize, quarterSize * 2),
+      frameTimes.slice(quarterSize * 2, quarterSize * 3),
+      frameTimes.slice(quarterSize * 3)
+    ];
+
+    const quarterAvgs = quarters.map(q => this._avg(q));
+
+    // Check for progressive slowdown
+    const firstQuarterAvg = quarterAvgs[0];
+    const lastQuarterAvg = quarterAvgs[3];
+    const degradation = ((lastQuarterAvg - firstQuarterAvg) / firstQuarterAvg) * 100;
+
+    let severity = 'none';
+    let detected = false;
+
+    if (degradation > 20) {
+      severity = 'severe';
+      detected = true;
+    } else if (degradation > 10) {
+      severity = 'moderate';
+      detected = true;
+    } else if (degradation > 5) {
+      severity = 'mild';
+      detected = true;
+    }
+
+    return {
+      detected,
+      severity,
+      degradationPercent: degradation,
+      quarterAvgs: quarterAvgs.map(a => ({ avgMs: a, fps: 1000 / a })),
+      trend: degradation > 0 ? 'degrading' : 'stable',
+      recommendation: detected
+        ? 'Consider reducing workload or adding cooling. GPU may be thermal throttling.'
+        : null
+    };
+  }
+
+  /**
+   * Phase 7: Jank/stutter analysis - detect frame time spikes and inconsistency
+   */
+  _analyzeJank(frameTimes) {
+    if (!frameTimes || frameTimes.length < 10) {
+      return { hasJank: false, message: 'Insufficient data' };
+    }
+
+    const avg = this._avg(frameTimes);
+    const sorted = [...frameTimes].sort((a, b) => a - b);
+    const median = sorted[Math.floor(sorted.length / 2)];
+    const p99 = sorted[Math.floor(sorted.length * 0.99)];
+    const max = sorted[sorted.length - 1];
+
+    // Count frames that are significantly worse than average
+    const jankThreshold = avg * 1.5; // 50% worse than average
+    const severeJankThreshold = avg * 2.5; // 150% worse than average
+    const jankFrames = frameTimes.filter(t => t > jankThreshold).length;
+    const severeJankFrames = frameTimes.filter(t => t > severeJankThreshold).length;
+    const jankPercent = (jankFrames / frameTimes.length) * 100;
+    const severeJankPercent = (severeJankFrames / frameTimes.length) * 100;
+
+    // Count long frames (>50ms = potential long task)
+    const longFrames = frameTimes.filter(t => t > 50).length;
+    const longFramePercent = (longFrames / frameTimes.length) * 100;
+
+    // Calculate coefficient of variation (stddev / mean)
+    const stdDev = this._calcStdDev(frameTimes);
+    const coefficientOfVariation = (stdDev / avg) * 100;
+
+    // Determine jank severity
+    let severity = 'none';
+    let hasJank = false;
+
+    if (severeJankPercent > 5 || longFramePercent > 10) {
+      severity = 'severe';
+      hasJank = true;
+    } else if (jankPercent > 10 || coefficientOfVariation > 30) {
+      severity = 'moderate';
+      hasJank = true;
+    } else if (jankPercent > 5 || coefficientOfVariation > 20) {
+      severity = 'mild';
+      hasJank = true;
+    }
+
+    return {
+      hasJank,
+      severity,
+      avgFrameTime: avg,
+      medianFrameTime: median,
+      p99FrameTime: p99,
+      maxFrameTime: max,
+      jankFrames,
+      jankPercent,
+      severeJankFrames,
+      severeJankPercent,
+      longFrames,
+      longFramePercent,
+      coefficientOfVariation,
+      consistency: 100 - coefficientOfVariation,
+      diagnosis: this._diagnoseJank(severity, longFramePercent, coefficientOfVariation, avg)
+    };
+  }
+
+  _diagnoseJank(severity, longFramePercent, cv, avgFrameTime) {
+    if (severity === 'none') {
+      return 'Frame times are consistent with no significant stuttering.';
+    }
+
+    const issues = [];
+
+    if (longFramePercent > 5) {
+      issues.push(`${longFramePercent.toFixed(1)}% of frames take >50ms (long tasks blocking main thread)`);
+    }
+
+    if (cv > 30) {
+      issues.push(`High frame time variance (${cv.toFixed(0)}% CV) - inconsistent performance`);
+    }
+
+    if (avgFrameTime > 33) {
+      issues.push(`Average frame time ${avgFrameTime.toFixed(1)}ms is above 30 FPS target`);
+    }
+
+    return issues.length > 0 ? issues.join('; ') : 'Minor frame time inconsistencies detected.';
+  }
+
+  /**
+   * Phase 8: JS/CPU pressure analysis - detect main thread issues
+   */
+  _analyzeJSPressure() {
+    const result = {
+      gcPressure: 'unknown',
+      memoryTrend: 'unknown',
+      longTasksDetected: false,
+      mainThreadBlocked: false,
+      issues: []
+    };
+
+    // Check JS heap if available
+    if (typeof performance !== 'undefined' && performance.memory) {
+      const heap = performance.memory;
+      const usedMB = heap.usedJSHeapSize / (1024 * 1024);
+      const totalMB = heap.totalJSHeapSize / (1024 * 1024);
+      const limitMB = heap.jsHeapSizeLimit / (1024 * 1024);
+      const heapUtilization = (usedMB / limitMB) * 100;
+
+      result.heap = {
+        usedMB: usedMB.toFixed(1),
+        totalMB: totalMB.toFixed(1),
+        limitMB: limitMB.toFixed(1),
+        utilization: heapUtilization.toFixed(1)
+      };
+
+      // Estimate GC pressure
+      if (heapUtilization > 80) {
+        result.gcPressure = 'high';
+        result.issues.push(`High memory pressure (${heapUtilization.toFixed(0)}% heap used) - likely GC pauses`);
+      } else if (heapUtilization > 60) {
+        result.gcPressure = 'moderate';
+        result.issues.push(`Moderate memory usage (${heapUtilization.toFixed(0)}% heap) - possible GC impact`);
+      } else {
+        result.gcPressure = 'low';
+      }
+
+      // Check for large heap (>500MB used often means complex data structures)
+      if (usedMB > 500) {
+        result.issues.push(`Large JS heap (${usedMB.toFixed(0)}MB) - consider optimizing data structures`);
+      }
+    }
+
+    // Check for PerformanceObserver long task data (if we had collected it)
+    // For now, estimate from frame times
+    const avgFrameTime = this.results?.baseline?.avgFrameTime || 0;
+    if (avgFrameTime > 100) {
+      result.mainThreadBlocked = true;
+      result.issues.push('Main thread appears blocked - frames taking >100ms');
+    }
+
+    // Check navigator.hardwareConcurrency for CPU info
+    if (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) {
+      result.cpuCores = navigator.hardwareConcurrency;
+      if (navigator.hardwareConcurrency <= 2) {
+        result.issues.push(`Low CPU core count (${navigator.hardwareConcurrency}) - limited parallel processing`);
+      }
+    }
+
+    // Check for deviceMemory API
+    if (typeof navigator !== 'undefined' && navigator.deviceMemory) {
+      result.deviceMemoryGB = navigator.deviceMemory;
+      if (navigator.deviceMemory < 4) {
+        result.issues.push(`Low device memory (${navigator.deviceMemory}GB) - may limit performance`);
+      }
+    }
+
+    // Determine overall CPU/JS health
+    if (result.issues.length === 0) {
+      result.health = 'good';
+      result.summary = 'No significant CPU/JS bottlenecks detected.';
+    } else if (result.issues.length <= 2 && result.gcPressure !== 'high') {
+      result.health = 'fair';
+      result.summary = 'Minor CPU/JS issues detected.';
+    } else {
+      result.health = 'poor';
+      result.summary = 'Significant CPU/JS bottlenecks detected.';
+    }
+
+    return result;
+  }
+
+  /**
+   * Determine the primary bottleneck type
+   */
+  _determineBottleneckType(baseline, cpuPhases, gpuAnalysis, boundAnalysis, jankAnalysis = {}, jsAnalysis = {}) {
+    const bottlenecks = [];
+
+    // Check if CPU or GPU bound
+    if (gpuAnalysis.available) {
+      if (gpuAnalysis.boundBy === 'GPU') {
+        bottlenecks.push({
+          type: 'GPU',
+          severity: 'primary',
+          evidence: `GPU time (${gpuAnalysis.avgGpuTimeMs.toFixed(2)}ms) exceeds CPU time`
+        });
+      } else {
+        bottlenecks.push({
+          type: 'CPU',
+          severity: 'primary',
+          evidence: `CPU time (${gpuAnalysis.avgCpuTimeMs.toFixed(2)}ms) dominates frame time`
+        });
+      }
+    }
+
+    // Check vertex vs fragment bound
+    if (boundAnalysis.boundType === 'fragment') {
+      bottlenecks.push({
+        type: 'Fragment/Fill Rate',
+        severity: 'contributing',
+        evidence: `Point size scaling factor: ${boundAnalysis.analysis.fragmentBoundScore.toFixed(2)}`
+      });
+    } else if (boundAnalysis.boundType === 'vertex') {
+      bottlenecks.push({
+        type: 'Vertex Processing',
+        severity: 'contributing',
+        evidence: `LOD scaling factor: ${boundAnalysis.analysis.vertexBoundScore.toFixed(2)}`
+      });
+    }
+
+    // Check shader complexity
+    if (cpuPhases.shaderComplexity) {
+      const shaderOverhead = cpuPhases.shaderComplexity.fullVsUltralight;
+      if (shaderOverhead > 2) {
+        bottlenecks.push({
+          type: 'Shader Complexity',
+          severity: 'contributing',
+          evidence: `Full shader adds ${shaderOverhead.toFixed(2)}ms vs ultralight`
+        });
+      }
+    }
+
+    // Check LOD overhead
+    if (cpuPhases.lodOverhead && cpuPhases.lodOverhead.overhead > 1) {
+      bottlenecks.push({
+        type: 'LOD Selection',
+        severity: 'minor',
+        evidence: `LOD adds ${cpuPhases.lodOverhead.overhead.toFixed(2)}ms overhead`
+      });
+    }
+
+    // Check frustum culling overhead
+    if (cpuPhases.frustumCullingOverhead && cpuPhases.frustumCullingOverhead.overhead > 1) {
+      bottlenecks.push({
+        type: 'Frustum Culling',
+        severity: 'minor',
+        evidence: `Frustum culling adds ${cpuPhases.frustumCullingOverhead.overhead.toFixed(2)}ms overhead`
+      });
+    }
+
+    // Check for jank/stuttering
+    if (jankAnalysis.hasJank) {
+      const severity = jankAnalysis.severity === 'severe' ? 'primary' : 'contributing';
+      bottlenecks.push({
+        type: 'Frame Stuttering',
+        severity,
+        evidence: jankAnalysis.diagnosis || `${jankAnalysis.jankPercent?.toFixed(1)}% of frames are janky`
+      });
+    }
+
+    // Check for JS/CPU pressure issues
+    if (jsAnalysis.health === 'poor') {
+      bottlenecks.push({
+        type: 'JS/CPU Pressure',
+        severity: 'contributing',
+        evidence: jsAnalysis.issues?.[0] || 'High CPU/memory pressure detected'
+      });
+    } else if (jsAnalysis.gcPressure === 'high') {
+      bottlenecks.push({
+        type: 'Garbage Collection',
+        severity: 'contributing',
+        evidence: `High GC pressure (${jsAnalysis.heap?.utilization}% heap used)`
+      });
+    }
+
+    // Check for main thread blocking
+    if (jsAnalysis.mainThreadBlocked) {
+      bottlenecks.push({
+        type: 'Main Thread Blocked',
+        severity: 'primary',
+        evidence: 'Long tasks (>100ms) blocking the main thread'
+      });
+    }
+
+    return {
+      primary: bottlenecks.find(b => b.severity === 'primary') || { type: 'Unknown', severity: 'unknown' },
+      contributing: bottlenecks.filter(b => b.severity === 'contributing'),
+      minor: bottlenecks.filter(b => b.severity === 'minor'),
+      all: bottlenecks
+    };
+  }
+
+  /**
+   * Generate actionable recommendations
+   */
+  _generateRecommendations(baseline, cpuPhases, gpuAnalysis, boundAnalysis, memoryAnalysis, jankAnalysis = {}, jsAnalysis = {}) {
+    const recommendations = [];
+    const fps = baseline.fps;
+    const targetFps = 60;
+
+    // FPS-based urgency
+    const urgency = fps < 15 ? 'critical' : fps < 30 ? 'high' : fps < 45 ? 'medium' : 'low';
+
+    // GPU bound recommendations
+    if (gpuAnalysis.available && gpuAnalysis.boundBy === 'GPU') {
+      recommendations.push({
+        priority: 1,
+        category: 'GPU',
+        title: 'Reduce GPU workload',
+        actions: [
+          'Use "ultralight" shader quality for maximum GPU performance',
+          'Reduce point size to decrease fill rate requirements',
+          'Enable more aggressive LOD to reduce vertex count',
+          'Consider using WebGPU if available for better GPU utilization'
+        ]
+      });
+    }
+
+    // Fragment/fill rate bound
+    if (boundAnalysis.boundType === 'fragment') {
+      recommendations.push({
+        priority: 2,
+        category: 'Fill Rate',
+        title: 'Optimize fragment processing',
+        actions: [
+          'Reduce point size (current scaling shows fragment sensitivity)',
+          'Switch to ultralight shader (removes expensive lighting)',
+          'Consider rendering to smaller framebuffer and upscaling',
+          'Disable fog effects if not essential'
+        ]
+      });
+    }
+
+    // Vertex bound
+    if (boundAnalysis.boundType === 'vertex') {
+      recommendations.push({
+        priority: 2,
+        category: 'Vertex Processing',
+        title: 'Reduce vertex count',
+        actions: [
+          'Enable adaptive LOD for automatic detail reduction',
+          'Force a coarser LOD level for distant views',
+          'Consider spatial culling to reduce visible points',
+          'Use frustum culling to skip off-screen points'
+        ]
+      });
+    }
+
+    // Shader complexity
+    if (cpuPhases.shaderComplexity?.fullVsUltralight > 3) {
+      recommendations.push({
+        priority: 3,
+        category: 'Shader',
+        title: 'Reduce shader complexity',
+        actions: [
+          `Switch from "full" to "light" (saves ~${cpuPhases.shaderComplexity.fullVsLight.toFixed(1)}ms)`,
+          `Switch to "ultralight" for max perf (saves ~${cpuPhases.shaderComplexity.fullVsUltralight.toFixed(1)}ms)`,
+          'Disable fog if not needed',
+          'Consider baking lighting into vertex colors'
+        ]
+      });
+    }
+
+    // Memory pressure
+    if (memoryAnalysis.memoryPressure.level !== 'low') {
+      recommendations.push({
+        priority: memoryAnalysis.memoryPressure.level === 'critical' ? 1 : 3,
+        category: 'Memory',
+        title: 'Address memory pressure',
+        actions: [
+          `Current GPU memory: ~${memoryAnalysis.totalEstimatedMB.toFixed(0)}MB`,
+          'Consider reducing dataset size or using streaming',
+          'Clear unused buffers and textures',
+          'Use more aggressive LOD to reduce active memory'
+        ]
+      });
+    }
+
+    // CPU bound
+    if (!gpuAnalysis.available || gpuAnalysis.boundBy === 'CPU') {
+      recommendations.push({
+        priority: 2,
+        category: 'CPU',
+        title: 'Optimize CPU-side processing',
+        actions: [
+          'Ensure spatial index is built (amortizes culling cost)',
+          'Consider Web Workers for heavy computations',
+          'Reduce draw call count by batching',
+          'Minimize per-frame uniform updates'
+        ]
+      });
+    }
+
+    // Jank/stuttering issues
+    if (jankAnalysis.hasJank) {
+      recommendations.push({
+        priority: jankAnalysis.severity === 'severe' ? 1 : 2,
+        category: 'Stuttering',
+        title: 'Fix frame stuttering',
+        actions: [
+          `${jankAnalysis.jankPercent?.toFixed(1) || 0}% of frames are stuttering`,
+          'Avoid heavy computations during rendering',
+          'Use requestIdleCallback for non-critical work',
+          'Consider breaking up large data processing into chunks'
+        ]
+      });
+    }
+
+    // JS/CPU pressure
+    if (jsAnalysis.gcPressure === 'high') {
+      recommendations.push({
+        priority: 2,
+        category: 'Memory',
+        title: 'Reduce garbage collection pressure',
+        actions: [
+          `JS heap is ${jsAnalysis.heap?.utilization || 0}% full`,
+          'Reuse objects instead of creating new ones',
+          'Use typed arrays instead of regular arrays',
+          'Clear references to unused large objects'
+        ]
+      });
+    }
+
+    // Main thread blocking
+    if (jsAnalysis.mainThreadBlocked) {
+      recommendations.push({
+        priority: 1,
+        category: 'Main Thread',
+        title: 'Unblock main thread',
+        actions: [
+          'Move heavy computations to Web Workers',
+          'Break up long-running tasks into smaller chunks',
+          'Use async/await with setTimeout to yield to browser',
+          'Consider using OffscreenCanvas for rendering'
+        ]
+      });
+    }
+
+    // Low-end device warnings
+    if (jsAnalysis.cpuCores && jsAnalysis.cpuCores <= 2) {
+      recommendations.push({
+        priority: 3,
+        category: 'Hardware',
+        title: 'Low-end device detected',
+        actions: [
+          `Only ${jsAnalysis.cpuCores} CPU cores available`,
+          'Use simpler shader quality (ultralight)',
+          'Reduce data size or enable aggressive LOD',
+          'Consider showing fewer points on mobile'
+        ]
+      });
+    }
+
+    // Sort by priority
+    recommendations.sort((a, b) => a.priority - b.priority);
+
+    return {
+      urgency,
+      targetFps,
+      currentFps: fps,
+      gapToTarget: targetFps - fps,
+      recommendations
+    };
+  }
+
+  /**
+   * Generate summary metrics
+   */
+  _generateSummary(baseline, cpuPhases, gpuAnalysis, boundAnalysis, memoryAnalysis, jankAnalysis = {}, jsAnalysis = {}) {
+    return {
+      performance: {
+        fps: baseline.fps,
+        avgFrameTimeMs: baseline.avgFrameTime,
+        p95FrameTimeMs: baseline.p95FrameTime,
+        p99FrameTimeMs: baseline.p99FrameTime,
+        consistency: ((1 - baseline.stdDev / baseline.avgFrameTime) * 100).toFixed(1) + '%'
+      },
+      rendering: {
+        visiblePoints: baseline.rendererStats.avgVisiblePoints,
+        lodLevel: baseline.rendererStats.avgLodLevel,
+        drawCalls: baseline.rendererStats.avgDrawCalls,
+        gpuMemoryMB: memoryAnalysis.totalEstimatedMB.toFixed(1)
+      },
+      bottleneck: {
+        primary: gpuAnalysis.available ? gpuAnalysis.boundBy : 'Unknown (no GPU timing)',
+        gpuVsFragment: boundAnalysis.boundType,
+        gpuUtilization: gpuAnalysis.available ? gpuAnalysis.gpuUtilization.toFixed(1) + '%' : 'N/A'
+      },
+      overhead: {
+        lodMs: cpuPhases.lodOverhead?.overhead?.toFixed(2) || 'N/A',
+        frustumCullingMs: cpuPhases.frustumCullingOverhead?.overhead?.toFixed(2) || 'N/A',
+        shaderComplexityMs: cpuPhases.shaderComplexity?.fullVsUltralight?.toFixed(2) || 'N/A'
+      },
+      frameStability: {
+        hasJank: jankAnalysis.hasJank || false,
+        jankSeverity: jankAnalysis.severity || 'none',
+        jankPercent: jankAnalysis.jankPercent?.toFixed(1) + '%' || '0%',
+        longFramePercent: jankAnalysis.longFramePercent?.toFixed(1) + '%' || '0%',
+        diagnosis: jankAnalysis.diagnosis || 'Stable'
+      },
+      cpuHealth: {
+        health: jsAnalysis.health || 'unknown',
+        gcPressure: jsAnalysis.gcPressure || 'unknown',
+        mainThreadBlocked: jsAnalysis.mainThreadBlocked || false,
+        issues: jsAnalysis.issues || []
+      }
+    };
+  }
+
+  // ========================
+  // Helper methods
+  // ========================
+
+  async _measureFrameTimes(frames, renderParams) {
+    return new Promise((resolve) => {
+      const times = [];
+      let count = 0;
+      let lastTime = performance.now();
+
+      const measure = () => {
+        const now = performance.now();
+        const frameTime = now - lastTime;
+        lastTime = now;
+
+        this.renderer.render(renderParams);
+
+        if (count > 0 && frameTime > 0.1 && frameTime < 1000) {
+          times.push(frameTime);
+        }
+
+        count++;
+        if (count < frames + 1) {
+          requestAnimationFrame(measure);
+        } else {
+          resolve(times);
+        }
+      };
+
+      requestAnimationFrame(measure);
+    });
+  }
+
+  _getDefaultRenderParams() {
+    const identityMatrix = new Float32Array([
+      1, 0, 0, 0,
+      0, 1, 0, 0,
+      0, 0, 1, 0,
+      0, 0, 0, 1
+    ]);
+    return {
+      mvpMatrix: identityMatrix,
+      viewMatrix: identityMatrix,
+      modelMatrix: identityMatrix,
+      projectionMatrix: identityMatrix,
+      pointSize: 4.0,
+      sizeAttenuation: 0.0,
+      viewportWidth: this.gl.canvas.width || 800,
+      viewportHeight: this.gl.canvas.height || 600,
+      fov: Math.PI / 4,
+      fogDensity: 0.0,
+      fogNear: 0.0,
+      fogFar: 100.0,
+      fogColor: new Float32Array([0, 0, 0]),
+      bgColor: new Float32Array([0, 0, 0]),
+      lightDir: new Float32Array([0, 0, 1]),
+      lightingStrength: 0.0,
+      cameraPosition: [0, 0, 5],
+      cameraDistance: 5.0,
+      forceLOD: -1,
+      quality: 'full',
+      dimensionLevel: 3
+    };
+  }
+
+  _avg(arr) {
+    if (!arr || arr.length === 0) return 0;
+    return arr.reduce((a, b) => a + b, 0) / arr.length;
+  }
+
+  _calcStdDev(arr) {
+    if (!arr || arr.length === 0) return 0;
+    const avg = this._avg(arr);
+    const sumSquares = arr.reduce((sum, val) => sum + (val - avg) ** 2, 0);
+    return Math.sqrt(sumSquares / arr.length);
+  }
+
+  _calculateScaling(pointSizeTests) {
+    const sizes = Object.keys(pointSizeTests).map(Number).sort((a, b) => a - b);
+    if (sizes.length < 2) return { scalingFactor: 1, linear: false };
+
+    // Calculate how frame time scales with point size
+    const baseline = pointSizeTests[sizes[0]].avg;
+    const largest = pointSizeTests[sizes[sizes.length - 1]].avg;
+    const sizeRatio = sizes[sizes.length - 1] / sizes[0];
+    const timeRatio = largest / baseline;
+
+    // Perfect quadratic scaling would be sizeRatio^2 (area)
+    // Perfect linear would be sizeRatio
+    // Less than linear suggests vertex bound
+
+    return {
+      scalingFactor: timeRatio / sizeRatio,
+      baselineMs: baseline,
+      largestMs: largest,
+      sizeRatio,
+      timeRatio,
+      interpretation: timeRatio > sizeRatio * 1.5 ? 'fragment-heavy' : 'balanced'
+    };
+  }
+
+  _calculateLODScaling(lodTests) {
+    const levels = Object.keys(lodTests).map(Number).sort((a, b) => a - b);
+    if (levels.length < 2) return { scalingFactor: 1 };
+
+    const finest = lodTests[levels[0]];
+    const coarsest = lodTests[levels[levels.length - 1]];
+
+    const pointRatio = finest.visiblePoints / (coarsest.visiblePoints || 1);
+    const timeRatio = finest.avg / (coarsest.avg || 1);
+
+    return {
+      scalingFactor: timeRatio / pointRatio,
+      finestPoints: finest.visiblePoints,
+      coarsestPoints: coarsest.visiblePoints,
+      pointRatio,
+      timeRatio,
+      interpretation: timeRatio > pointRatio * 0.8 ? 'vertex-heavy' : 'balanced'
+    };
+  }
+
+  _explainBoundType(boundType, fragmentScore, vertexScore) {
+    switch (boundType) {
+      case 'fragment':
+        return `Frame time scales significantly with point size (${fragmentScore.toFixed(2)}x). ` +
+               `The GPU is spending most time filling pixels. Reduce point size or use simpler shaders.`;
+      case 'vertex':
+        return `Frame time scales significantly with vertex count (${vertexScore.toFixed(2)}x). ` +
+               `The GPU is bottlenecked on vertex processing. Use more aggressive LOD or frustum culling.`;
+      default:
+        return `Performance is relatively balanced between vertex and fragment processing. ` +
+               `Optimizations in either area will help.`;
+    }
+  }
+
+  _assessMemoryPressure(gpuBytes, jsHeapMB, jsHeapLimitMB) {
+    const gpuMB = gpuBytes / (1024 * 1024);
+
+    // GPU memory thresholds (in MB)
+    const gpuThresholds = { low: 256, medium: 512, high: 1024, critical: 2048 };
+
+    let gpuLevel = 'low';
+    if (gpuMB > gpuThresholds.critical) gpuLevel = 'critical';
+    else if (gpuMB > gpuThresholds.high) gpuLevel = 'high';
+    else if (gpuMB > gpuThresholds.medium) gpuLevel = 'medium';
+
+    // JS heap pressure
+    let jsLevel = 'low';
+    if (jsHeapMB && jsHeapLimitMB) {
+      const utilization = jsHeapMB / jsHeapLimitMB;
+      if (utilization > 0.9) jsLevel = 'critical';
+      else if (utilization > 0.7) jsLevel = 'high';
+      else if (utilization > 0.5) jsLevel = 'medium';
+    }
+
+    // Overall level is the worse of the two
+    const levels = ['low', 'medium', 'high', 'critical'];
+    const level = levels[Math.max(levels.indexOf(gpuLevel), levels.indexOf(jsLevel))];
+
+    return {
+      level,
+      gpuLevel,
+      jsLevel,
+      gpuMB,
+      jsHeapMB,
+      jsHeapLimitMB
+    };
+  }
+
+  /**
+   * Get the analysis results
+   */
+  getReport() {
+    return this.results;
+  }
+
+  /**
+   * Format report as human-readable string
+   */
+  formatReport() {
+    if (!this.results) {
+      return '[BottleneckAnalyzer] No analysis results available. Run runAnalysis() first.';
+    }
+
+    const r = this.results;
+    const s = r.summary;
+    const b = r.bottleneckType;
+
+    const lines = [
+      '╔══════════════════════════════════════════════════════════════════╗',
+      '║            BOTTLENECK ANALYSIS REPORT                            ║',
+      '╠══════════════════════════════════════════════════════════════════╣',
+      '',
+      '┌─────────────────────────────────────────────────────────────────┐',
+      '│ PERFORMANCE SUMMARY                                            │',
+      '├─────────────────────────────────────────────────────────────────┤',
+      `│ FPS:              ${s.performance.fps.toFixed(1).padStart(8)} │ P95 Frame Time: ${s.performance.p95FrameTimeMs.toFixed(2).padStart(8)}ms │`,
+      `│ Avg Frame Time:   ${s.performance.avgFrameTimeMs.toFixed(2).padStart(8)}ms │ Consistency:    ${s.performance.consistency.padStart(8)} │`,
+      '└─────────────────────────────────────────────────────────────────┘',
+      '',
+      '┌─────────────────────────────────────────────────────────────────┐',
+      '│ RENDERING STATS                                                │',
+      '├─────────────────────────────────────────────────────────────────┤',
+      `│ Visible Points: ${this._formatNumber(s.rendering.visiblePoints).padStart(12)} │ GPU Memory: ${s.rendering.gpuMemoryMB.padStart(8)}MB │`,
+      `│ LOD Level:      ${String(Math.round(s.rendering.lodLevel)).padStart(12)} │ Draw Calls: ${String(Math.round(s.rendering.drawCalls)).padStart(8)} │`,
+      '└─────────────────────────────────────────────────────────────────┘',
+      '',
+      '┌─────────────────────────────────────────────────────────────────┐',
+      '│ BOTTLENECK IDENTIFICATION                                      │',
+      '├─────────────────────────────────────────────────────────────────┤',
+      `│ Primary Bottleneck: ${b.primary.type.padEnd(44)} │`,
+      `│ Evidence: ${(b.primary.evidence || 'N/A').substring(0, 54).padEnd(54)} │`
+    ];
+
+    if (b.contributing.length > 0) {
+      lines.push('├─────────────────────────────────────────────────────────────────┤');
+      lines.push('│ Contributing Factors:                                         │');
+      for (const c of b.contributing) {
+        lines.push(`│   • ${c.type}: ${c.evidence.substring(0, 48).padEnd(48)} │`);
+      }
+    }
+
+    lines.push('└─────────────────────────────────────────────────────────────────┘');
+    lines.push('');
+
+    // Overhead breakdown
+    lines.push('┌─────────────────────────────────────────────────────────────────┐');
+    lines.push('│ OVERHEAD BREAKDOWN                                            │');
+    lines.push('├─────────────────────────────────────────────────────────────────┤');
+    lines.push(`│ LOD Selection:      ${String(s.overhead.lodMs).padStart(8)}ms                                 │`);
+    lines.push(`│ Frustum Culling:    ${String(s.overhead.frustumCullingMs).padStart(8)}ms                                 │`);
+    lines.push(`│ Shader Complexity:  ${String(s.overhead.shaderComplexityMs).padStart(8)}ms (full vs ultralight)          │`);
+    lines.push('└─────────────────────────────────────────────────────────────────┘');
+    lines.push('');
+
+    // Recommendations
+    const recs = r.recommendations;
+    lines.push('┌─────────────────────────────────────────────────────────────────┐');
+    lines.push(`│ RECOMMENDATIONS (Urgency: ${recs.urgency.toUpperCase()})                               │`);
+    lines.push(`│ Current: ${recs.currentFps.toFixed(1)} FPS → Target: ${recs.targetFps} FPS (gap: ${recs.gapToTarget.toFixed(1)} FPS)        │`);
+    lines.push('├─────────────────────────────────────────────────────────────────┤');
+
+    for (const rec of recs.recommendations.slice(0, 3)) {
+      lines.push(`│ [${rec.category}] ${rec.title.padEnd(50)} │`);
+      for (const action of rec.actions.slice(0, 2)) {
+        const truncated = action.length > 60 ? action.substring(0, 57) + '...' : action;
+        lines.push(`│   → ${truncated.padEnd(58)} │`);
+      }
+    }
+
+    lines.push('└─────────────────────────────────────────────────────────────────┘');
+    lines.push('');
+    lines.push('╚══════════════════════════════════════════════════════════════════╝');
+
+    return lines.join('\n');
+  }
+
+  /**
+   * Format large numbers with K/M suffix
+   */
+  _formatNumber(num) {
+    if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M';
+    if (num >= 1000) return (num / 1000).toFixed(1) + 'K';
+    return String(Math.round(num));
+  }
+
+  /**
+   * Export results to JSON
+   */
+  exportJSON() {
+    return JSON.stringify(this.results, null, 2);
+  }
+
+  // ========================
+  // VISUAL METRICS PANEL
+  // ========================
+
+  /**
+   * Show the metrics panel overlay in the browser
+   * @param {Object} options - Display options
+   * @returns {HTMLElement} The panel element
+   */
+  showMetricsPanel(options = {}) {
+    const {
+      position = 'top-right',  // 'top-left', 'top-right', 'bottom-left', 'bottom-right'
+      opacity = 0.95,
+      scale = 1.0
+    } = options;
+
+    // Remove existing panel if any
+    this.hideMetricsPanel();
+
+    if (!this.results) {
+      console.warn('[BottleneckAnalyzer] No results to display. Run runAnalysis() first.');
+      return null;
+    }
+
+    const panel = this._createMetricsPanel(position, opacity, scale);
+    document.body.appendChild(panel);
+    this._metricsPanel = panel;
+
+    return panel;
+  }
+
+  /**
+   * Hide/remove the metrics panel
+   */
+  hideMetricsPanel() {
+    if (this._metricsPanel && this._metricsPanel.parentNode) {
+      this._metricsPanel.parentNode.removeChild(this._metricsPanel);
+    }
+    this._metricsPanel = null;
+  }
+
+  /**
+   * Create the metrics panel HTML element
+   * @private
+   */
+  _createMetricsPanel(position, opacity, scale) {
+    const r = this.results;
+    const s = r.summary;
+    const b = r.bottleneckType;
+    const recs = r.recommendations;
+
+    // Position styles
+    const positionStyles = {
+      'top-left': 'top: 10px; left: 10px;',
+      'top-right': 'top: 10px; right: 10px;',
+      'bottom-left': 'bottom: 10px; left: 10px;',
+      'bottom-right': 'bottom: 10px; right: 10px;'
+    };
+
+    // Urgency colors
+    const urgencyColors = {
+      critical: '#ef4444',
+      high: '#f97316',
+      medium: '#eab308',
+      low: '#22c55e'
+    };
+
+    // FPS color based on performance
+    const fpsColor = s.performance.fps >= 60 ? '#22c55e' :
+                     s.performance.fps >= 45 ? '#84cc16' :
+                     s.performance.fps >= 30 ? '#eab308' :
+                     s.performance.fps >= 15 ? '#f97316' : '#ef4444';
+
+    // Create bar chart for overhead breakdown
+    const maxOverhead = Math.max(
+      parseFloat(s.overhead.lodMs) || 0,
+      parseFloat(s.overhead.frustumCullingMs) || 0,
+      parseFloat(s.overhead.shaderComplexityMs) || 0,
+      1 // minimum to avoid division by zero
+    );
+
+    const lodBarWidth = ((parseFloat(s.overhead.lodMs) || 0) / maxOverhead * 100);
+    const frustumBarWidth = ((parseFloat(s.overhead.frustumCullingMs) || 0) / maxOverhead * 100);
+    const shaderBarWidth = ((parseFloat(s.overhead.shaderComplexityMs) || 0) / maxOverhead * 100);
+
+    const panel = document.createElement('div');
+    panel.id = 'bottleneck-metrics-panel';
+    panel.style.cssText = `
+      position: fixed;
+      ${positionStyles[position] || positionStyles['top-right']}
+      z-index: 99999;
+      font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Fira Code', monospace;
+      font-size: ${12 * scale}px;
+      color: #e5e7eb;
+      background: rgba(17, 24, 39, ${opacity});
+      border: 1px solid rgba(75, 85, 99, 0.5);
+      border-radius: 8px;
+      padding: ${12 * scale}px;
+      min-width: ${320 * scale}px;
+      max-width: ${420 * scale}px;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+      backdrop-filter: blur(8px);
+      user-select: none;
+    `;
+
+    panel.innerHTML = `
+      <style>
+        #bottleneck-metrics-panel .section {
+          margin-bottom: ${10 * scale}px;
+          padding: ${8 * scale}px;
+          background: rgba(31, 41, 55, 0.5);
+          border-radius: 6px;
+        }
+        #bottleneck-metrics-panel .section-title {
+          font-size: ${10 * scale}px;
+          font-weight: 600;
+          text-transform: uppercase;
+          letter-spacing: 0.5px;
+          color: #9ca3af;
+          margin-bottom: ${6 * scale}px;
+          display: flex;
+          align-items: center;
+          gap: ${4 * scale}px;
+        }
+        #bottleneck-metrics-panel .metric-row {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          padding: ${2 * scale}px 0;
+        }
+        #bottleneck-metrics-panel .metric-label {
+          color: #9ca3af;
+        }
+        #bottleneck-metrics-panel .metric-value {
+          font-weight: 600;
+          color: #f3f4f6;
+        }
+        #bottleneck-metrics-panel .big-number {
+          font-size: ${28 * scale}px;
+          font-weight: 700;
+          line-height: 1;
+        }
+        #bottleneck-metrics-panel .bar-container {
+          height: ${6 * scale}px;
+          background: rgba(55, 65, 81, 0.5);
+          border-radius: 3px;
+          overflow: hidden;
+          margin-top: ${2 * scale}px;
+        }
+        #bottleneck-metrics-panel .bar {
+          height: 100%;
+          border-radius: 3px;
+          transition: width 0.3s ease;
+        }
+        #bottleneck-metrics-panel .badge {
+          display: inline-block;
+          padding: ${2 * scale}px ${6 * scale}px;
+          border-radius: 4px;
+          font-size: ${10 * scale}px;
+          font-weight: 600;
+          text-transform: uppercase;
+        }
+        #bottleneck-metrics-panel .recommendation {
+          padding: ${6 * scale}px;
+          background: rgba(55, 65, 81, 0.3);
+          border-radius: 4px;
+          margin-top: ${4 * scale}px;
+          border-left: 3px solid;
+        }
+        #bottleneck-metrics-panel .close-btn {
+          position: absolute;
+          top: ${8 * scale}px;
+          right: ${8 * scale}px;
+          width: ${20 * scale}px;
+          height: ${20 * scale}px;
+          border: none;
+          background: rgba(75, 85, 99, 0.5);
+          color: #9ca3af;
+          border-radius: 4px;
+          cursor: pointer;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-size: ${14 * scale}px;
+        }
+        #bottleneck-metrics-panel .close-btn:hover {
+          background: rgba(239, 68, 68, 0.5);
+          color: #fff;
+        }
+        #bottleneck-metrics-panel .header {
+          display: flex;
+          align-items: center;
+          gap: ${8 * scale}px;
+          margin-bottom: ${12 * scale}px;
+          padding-right: ${24 * scale}px;
+        }
+        #bottleneck-metrics-panel .header-title {
+          font-size: ${14 * scale}px;
+          font-weight: 700;
+          color: #f3f4f6;
+        }
+      </style>
+
+      <button class="close-btn" onclick="this.parentElement.remove()">×</button>
+
+      <div class="header">
+        <svg width="${16 * scale}" height="${16 * scale}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M12 20V10M18 20V4M6 20v-4"/>
+        </svg>
+        <span class="header-title">BOTTLENECK ANALYSIS</span>
+        <span class="badge" style="background: ${urgencyColors[recs.urgency]}20; color: ${urgencyColors[recs.urgency]};">
+          ${recs.urgency}
+        </span>
+      </div>
+
+      <!-- Performance Summary -->
+      <div class="section">
+        <div class="section-title">
+          <svg width="${12 * scale}" height="${12 * scale}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>
+          </svg>
+          Performance
+        </div>
+        <div style="display: flex; align-items: baseline; gap: ${8 * scale}px;">
+          <span class="big-number" style="color: ${fpsColor};">${s.performance.fps.toFixed(1)}</span>
+          <span style="color: #9ca3af;">FPS</span>
+          <span style="margin-left: auto; color: #6b7280;">
+            ${s.performance.avgFrameTimeMs.toFixed(1)}ms avg
+          </span>
+        </div>
+        <div class="bar-container" style="margin-top: ${8 * scale}px;">
+          <div class="bar" style="width: ${Math.min(s.performance.fps / 60 * 100, 100)}%; background: ${fpsColor};"></div>
+        </div>
+        <div class="metric-row" style="margin-top: ${6 * scale}px;">
+          <span class="metric-label">P95 Frame</span>
+          <span class="metric-value">${s.performance.p95FrameTimeMs.toFixed(1)}ms</span>
+        </div>
+        <div class="metric-row">
+          <span class="metric-label">Consistency</span>
+          <span class="metric-value">${s.performance.consistency}</span>
+        </div>
+      </div>
+
+      <!-- Bottleneck Identification -->
+      <div class="section">
+        <div class="section-title">
+          <svg width="${12 * scale}" height="${12 * scale}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
+            <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+          </svg>
+          Primary Bottleneck
+        </div>
+        <div style="display: flex; align-items: center; gap: ${8 * scale}px;">
+          <span class="badge" style="background: #ef444420; color: #ef4444; font-size: ${12 * scale}px;">
+            ${b.primary.type}
+          </span>
+          <span style="color: #9ca3af; font-size: ${10 * scale}px;">
+            ${b.primary.evidence ? b.primary.evidence.substring(0, 35) + '...' : ''}
+          </span>
+        </div>
+        ${b.contributing.length > 0 ? `
+          <div style="margin-top: ${8 * scale}px; padding-top: ${8 * scale}px; border-top: 1px solid rgba(75, 85, 99, 0.3);">
+            <div style="color: #6b7280; font-size: ${10 * scale}px; margin-bottom: ${4 * scale}px;">Contributing:</div>
+            ${b.contributing.map(c => `
+              <span class="badge" style="background: #f9731620; color: #f97316; margin-right: ${4 * scale}px;">
+                ${c.type}
+              </span>
+            `).join('')}
+          </div>
+        ` : ''}
+      </div>
+
+      <!-- Rendering Stats -->
+      <div class="section">
+        <div class="section-title">
+          <svg width="${12 * scale}" height="${12 * scale}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+          </svg>
+          Rendering
+        </div>
+        <div class="metric-row">
+          <span class="metric-label">Visible Points</span>
+          <span class="metric-value">${this._formatNumber(s.rendering.visiblePoints)}</span>
+        </div>
+        <div class="metric-row">
+          <span class="metric-label">LOD Level</span>
+          <span class="metric-value">${Math.round(s.rendering.lodLevel)}</span>
+        </div>
+        <div class="metric-row">
+          <span class="metric-label">GPU Memory</span>
+          <span class="metric-value">${s.rendering.gpuMemoryMB}MB</span>
+        </div>
+        <div class="metric-row">
+          <span class="metric-label">Draw Calls</span>
+          <span class="metric-value">${Math.round(s.rendering.drawCalls)}</span>
+        </div>
+      </div>
+
+      <!-- Overhead Breakdown -->
+      <div class="section">
+        <div class="section-title">
+          <svg width="${12 * scale}" height="${12 * scale}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/>
+          </svg>
+          Overhead Breakdown
+        </div>
+
+        <div class="metric-row">
+          <span class="metric-label">LOD Selection</span>
+          <span class="metric-value">${s.overhead.lodMs}ms</span>
+        </div>
+        <div class="bar-container">
+          <div class="bar" style="width: ${lodBarWidth}%; background: #3b82f6;"></div>
+        </div>
+
+        <div class="metric-row" style="margin-top: ${6 * scale}px;">
+          <span class="metric-label">Frustum Culling</span>
+          <span class="metric-value">${s.overhead.frustumCullingMs}ms</span>
+        </div>
+        <div class="bar-container">
+          <div class="bar" style="width: ${frustumBarWidth}%; background: #8b5cf6;"></div>
+        </div>
+
+        <div class="metric-row" style="margin-top: ${6 * scale}px;">
+          <span class="metric-label">Shader Complexity</span>
+          <span class="metric-value">${s.overhead.shaderComplexityMs}ms</span>
+        </div>
+        <div class="bar-container">
+          <div class="bar" style="width: ${shaderBarWidth}%; background: #ec4899;"></div>
+        </div>
+      </div>
+
+      <!-- Top Recommendation -->
+      ${recs.recommendations.length > 0 ? `
+        <div class="section" style="margin-bottom: 0;">
+          <div class="section-title">
+            <svg width="${12 * scale}" height="${12 * scale}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>
+            </svg>
+            Top Recommendation
+          </div>
+          <div class="recommendation" style="border-color: ${urgencyColors[recs.urgency]};">
+            <div style="font-weight: 600; color: #f3f4f6; margin-bottom: ${4 * scale}px;">
+              ${recs.recommendations[0].title}
+            </div>
+            <div style="color: #9ca3af; font-size: ${11 * scale}px;">
+              ${recs.recommendations[0].actions[0]}
+            </div>
+          </div>
+        </div>
+      ` : ''}
+
+      <div style="margin-top: ${10 * scale}px; text-align: center; color: #6b7280; font-size: ${9 * scale}px;">
+        Gap to 60 FPS: <span style="color: ${urgencyColors[recs.urgency]};">${recs.gapToTarget.toFixed(1)} FPS</span>
+        &nbsp;|&nbsp; Analysis time: ${(r.analysisTimeMs / 1000).toFixed(1)}s
+      </div>
+    `;
+
+    return panel;
+  }
+
+  /**
+   * Create a live stats monitor that updates continuously
+   * @param {Object} options - Monitor options
+   * @returns {Object} Controller with start/stop methods
+   */
+  createLiveMonitor(options = {}) {
+    const {
+      position = 'top-left',
+      updateInterval = 100,  // ms
+      showGraph = true,
+      graphWidth = 150,
+      graphHeight = 40
+    } = options;
+
+    let panel = null;
+    let intervalId = null;
+    let frameTimes = [];
+    const maxFrameTimes = graphWidth;
+
+    const controller = {
+      start: () => {
+        if (panel) return;
+
+        panel = document.createElement('div');
+        panel.id = 'live-stats-monitor';
+        panel.style.cssText = `
+          position: fixed;
+          ${position.includes('top') ? 'top: 10px;' : 'bottom: 10px;'}
+          ${position.includes('left') ? 'left: 10px;' : 'right: 10px;'}
+          z-index: 99999;
+          font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Fira Code', monospace;
+          font-size: 11px;
+          color: #e5e7eb;
+          background: rgba(17, 24, 39, 0.9);
+          border: 1px solid rgba(75, 85, 99, 0.5);
+          border-radius: 6px;
+          padding: 8px 12px;
+          min-width: 180px;
+          backdrop-filter: blur(8px);
+        `;
+
+        document.body.appendChild(panel);
+
+        let lastTime = performance.now();
+        const update = () => {
+          const now = performance.now();
+          const dt = now - lastTime;
+          lastTime = now;
+
+          if (dt > 0 && dt < 1000) {
+            frameTimes.push(dt);
+            if (frameTimes.length > maxFrameTimes) {
+              frameTimes.shift();
+            }
+          }
+
+          const stats = this.renderer?.getStats() || {};
+          const avgFrameTime = frameTimes.length > 0
+            ? frameTimes.reduce((a, b) => a + b) / frameTimes.length
+            : 0;
+          const fps = avgFrameTime > 0 ? 1000 / avgFrameTime : 0;
+          const fpsColor = fps >= 60 ? '#22c55e' : fps >= 30 ? '#eab308' : '#ef4444';
+
+          let graphHtml = '';
+          if (showGraph && frameTimes.length > 1) {
+            const maxTime = Math.max(...frameTimes, 33.33);
+            const points = frameTimes.map((t, i) => {
+              const x = (i / (maxFrameTimes - 1)) * graphWidth;
+              const y = graphHeight - (t / maxTime) * graphHeight;
+              return `${x},${y}`;
+            }).join(' ');
+
+            graphHtml = `
+              <svg width="${graphWidth}" height="${graphHeight}" style="display: block; margin-top: 6px;">
+                <rect width="100%" height="100%" fill="rgba(31, 41, 55, 0.5)" rx="3"/>
+                <line x1="0" y1="${graphHeight - (16.67 / maxTime) * graphHeight}" x2="${graphWidth}" y2="${graphHeight - (16.67 / maxTime) * graphHeight}" stroke="#22c55e" stroke-width="1" stroke-dasharray="2,2" opacity="0.5"/>
+                <polyline points="${points}" fill="none" stroke="${fpsColor}" stroke-width="1.5"/>
+              </svg>
+            `;
+          }
+
+          panel.innerHTML = `
+            <div style="display: flex; justify-content: space-between; align-items: baseline;">
+              <span style="font-size: 18px; font-weight: 700; color: ${fpsColor};">${fps.toFixed(1)}</span>
+              <span style="color: #6b7280;">FPS</span>
+              <span style="margin-left: auto; color: #9ca3af;">${avgFrameTime.toFixed(1)}ms</span>
+            </div>
+            ${graphHtml}
+            <div style="display: flex; justify-content: space-between; margin-top: 6px; color: #9ca3af; font-size: 10px;">
+              <span>Points: ${this._formatNumber(stats.visiblePoints || 0)}</span>
+              <span>LOD: ${stats.lodLevel ?? '-'}</span>
+              <span>DC: ${stats.drawCalls || 0}</span>
+            </div>
+            <div style="text-align: right; margin-top: 4px;">
+              <button onclick="window._liveMonitorController?.stop()" style="
+                border: none;
+                background: rgba(75, 85, 99, 0.5);
+                color: #9ca3af;
+                padding: 2px 6px;
+                border-radius: 3px;
+                font-size: 9px;
+                cursor: pointer;
+              ">Stop</button>
+            </div>
+          `;
+        };
+
+        intervalId = setInterval(update, updateInterval);
+        update();
+
+        // Store controller globally for stop button
+        window._liveMonitorController = controller;
+      },
+
+      stop: () => {
+        if (intervalId) {
+          clearInterval(intervalId);
+          intervalId = null;
+        }
+        if (panel && panel.parentNode) {
+          panel.parentNode.removeChild(panel);
+        }
+        panel = null;
+        frameTimes = [];
+        delete window._liveMonitorController;
+      },
+
+      isRunning: () => !!intervalId
+    };
+
+    return controller;
+  }
+
+  /**
+   * Dispose resources
+   */
+  dispose() {
+    this.hideMetricsPanel();
+    if (this.gpuTimer) {
+      this.gpuTimer.dispose();
+      this.gpuTimer = null;
+    }
+    this.results = null;
+  }
+}
+
+/**
  * Build a copy-ready situation report with environment + renderer state.
  * Designed to work for both real data and synthetic benchmarks.
  *
@@ -4578,4 +6464,136 @@ if (typeof window !== 'undefined') {
   window.BenchmarkReporter = BenchmarkReporter;
   window.GPUTimer = GPUTimer;
   window.BenchmarkExporter = BenchmarkExporter;
+  window.BottleneckAnalyzer = BottleneckAnalyzer;
+
+  // ============================================================
+  // EASY ACCESS HELPERS - Just type these in the browser console
+  // ============================================================
+
+  /**
+   * Start the live FPS monitor - just type: startLiveMonitor()
+   */
+  window.startLiveMonitor = function(options = {}) {
+    // Find canvas and get GL context
+    const canvas = document.querySelector('canvas');
+    if (!canvas) {
+      console.error('[Benchmark] No canvas found on page');
+      return null;
+    }
+
+    const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
+    if (!gl) {
+      console.error('[Benchmark] Could not get WebGL context');
+      return null;
+    }
+
+    // Try to find the hpRenderer from the viewer
+    // Look for it in common places
+    let renderer = null;
+
+    // Check if there's a global viewer or state object
+    if (window._cellucidViewer?.getHPRenderer) {
+      renderer = window._cellucidViewer.getHPRenderer();
+    } else if (window._cellucidState?.viewer?.getHPRenderer) {
+      renderer = window._cellucidState.viewer.getHPRenderer();
+    }
+
+    // Create analyzer (renderer can be null, monitor still works for FPS)
+    const analyzer = new BottleneckAnalyzer(gl, renderer);
+    const monitor = analyzer.createLiveMonitor({
+      position: options.position || 'top-left',
+      updateInterval: options.updateInterval || 100,
+      showGraph: options.showGraph !== false,
+      ...options
+    });
+
+    monitor.start();
+
+    // Store globally so user can stop it
+    window._liveMonitor = monitor;
+    window._bottleneckAnalyzer = analyzer;
+
+    console.log('[Benchmark] Live monitor started! Type stopLiveMonitor() to stop.');
+    return monitor;
+  };
+
+  /**
+   * Stop the live FPS monitor - just type: stopLiveMonitor()
+   */
+  window.stopLiveMonitor = function() {
+    if (window._liveMonitor) {
+      window._liveMonitor.stop();
+      console.log('[Benchmark] Live monitor stopped.');
+    } else {
+      console.log('[Benchmark] No live monitor running.');
+    }
+  };
+
+  /**
+   * Run full bottleneck analysis - just type: analyzeBottleneck()
+   */
+  window.analyzeBottleneck = async function(options = {}) {
+    const canvas = document.querySelector('canvas');
+    if (!canvas) {
+      console.error('[Benchmark] No canvas found on page');
+      return null;
+    }
+
+    const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
+    if (!gl) {
+      console.error('[Benchmark] Could not get WebGL context');
+      return null;
+    }
+
+    // Try to find the hpRenderer
+    let renderer = null;
+    if (window._cellucidViewer?.getHPRenderer) {
+      renderer = window._cellucidViewer.getHPRenderer();
+    } else if (window._cellucidState?.viewer?.getHPRenderer) {
+      renderer = window._cellucidState.viewer.getHPRenderer();
+    }
+
+    if (!renderer) {
+      console.error('[Benchmark] Could not find renderer. Make sure data is loaded.');
+      console.log('[Benchmark] Tip: The viewer needs to expose hpRenderer via window._cellucidViewer.getHPRenderer()');
+      return null;
+    }
+
+    console.log('[Benchmark] Starting bottleneck analysis... (takes ~10-20 seconds)');
+
+    const analyzer = new BottleneckAnalyzer(gl, renderer);
+    window._bottleneckAnalyzer = analyzer;
+
+    const results = await analyzer.runAnalysis({
+      warmupFrames: options.warmupFrames || 30,
+      testFrames: options.testFrames || 120,
+      ...options
+    });
+
+    // Show the visual panel
+    analyzer.showMetricsPanel({ position: options.position || 'top-right' });
+
+    // Also log to console
+    console.log(analyzer.formatReport());
+
+    return results;
+  };
+
+  /**
+   * Hide the metrics panel - just type: hideMetrics()
+   */
+  window.hideMetrics = function() {
+    if (window._bottleneckAnalyzer) {
+      window._bottleneckAnalyzer.hideMetricsPanel();
+    }
+    // Also remove by ID in case analyzer was lost
+    const panel = document.getElementById('bottleneck-metrics-panel');
+    if (panel) panel.remove();
+  };
+
+  console.log('[Benchmark] Helpers loaded! Available commands:');
+  console.log('  startLiveMonitor()  - Show live FPS monitor');
+  console.log('  stopLiveMonitor()   - Stop the monitor');
+  console.log('  analyzeBottleneck() - Run full analysis (needs data loaded)');
+  console.log('  hideMetrics()       - Hide the metrics panel');
 }

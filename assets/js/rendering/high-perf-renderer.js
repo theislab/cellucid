@@ -2820,9 +2820,13 @@ export class HighPerfRenderer {
     }
 
     if (useFullDetail) {
-      this._renderFullDetail(params);
+      // Use effectiveParams to ensure consistent dimensionLevel handling with frustum culling path
+      // This is critical for correct LOD alpha texture lookups when dimensionLevel was clamped
+      this._renderFullDetail(effectiveParams);
     } else {
-      this._renderLOD(lodLevel, params);
+      // Use effectiveParams to ensure _renderLOD gets the clamped dimensionLevel
+      // This prevents incorrect spatial index lookups when dimensionLevel > 3 or < 1
+      this._renderLOD(lodLevel, effectiveParams);
     }
 
     // Restore depth testing
@@ -4510,21 +4514,29 @@ export class HighPerfRenderer {
 
     if (isFloat32Colors) {
       // Convert Float32 normalized colors (0-1) to Uint8 (0-255)
+      // Clamp values to prevent wrap-around for out-of-range inputs (consistent with createSnapshotBuffer)
       if (colors.length === expectedRGB) {
         snapshotColors = new Uint8Array(expectedRGBA);
         for (let i = 0; i < n; i++) {
-          snapshotColors[i * 4]     = Math.round(colors[i * 3] * 255);
-          snapshotColors[i * 4 + 1] = Math.round(colors[i * 3 + 1] * 255);
-          snapshotColors[i * 4 + 2] = Math.round(colors[i * 3 + 2] * 255);
+          const r = Math.round(colors[i * 3] * 255);
+          const g = Math.round(colors[i * 3 + 1] * 255);
+          const b = Math.round(colors[i * 3 + 2] * 255);
+          snapshotColors[i * 4]     = r > 255 ? 255 : (r < 0 ? 0 : r);
+          snapshotColors[i * 4 + 1] = g > 255 ? 255 : (g < 0 ? 0 : g);
+          snapshotColors[i * 4 + 2] = b > 255 ? 255 : (b < 0 ? 0 : b);
           snapshotColors[i * 4 + 3] = 255;
         }
       } else {
         snapshotColors = new Uint8Array(expectedRGBA);
         for (let i = 0; i < n; i++) {
-          snapshotColors[i * 4]     = Math.round(colors[i * 4] * 255);
-          snapshotColors[i * 4 + 1] = Math.round(colors[i * 4 + 1] * 255);
-          snapshotColors[i * 4 + 2] = Math.round(colors[i * 4 + 2] * 255);
-          snapshotColors[i * 4 + 3] = Math.round((colors[i * 4 + 3] ?? 1.0) * 255);
+          const r = Math.round(colors[i * 4] * 255);
+          const g = Math.round(colors[i * 4 + 1] * 255);
+          const b = Math.round(colors[i * 4 + 2] * 255);
+          const a = Math.round((colors[i * 4 + 3] ?? 1.0) * 255);
+          snapshotColors[i * 4]     = r > 255 ? 255 : (r < 0 ? 0 : r);
+          snapshotColors[i * 4 + 1] = g > 255 ? 255 : (g < 0 ? 0 : g);
+          snapshotColors[i * 4 + 2] = b > 255 ? 255 : (b < 0 ? 0 : b);
+          snapshotColors[i * 4 + 3] = a > 255 ? 255 : (a < 0 ? 0 : a);
         }
       }
     } else if (colors.length === expectedRGB) {

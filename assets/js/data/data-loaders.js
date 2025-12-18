@@ -1111,3 +1111,432 @@ export function getEmbeddingsMetadata(identity) {
     }
   };
 }
+
+// ============================================================================
+// ANALYSIS-SPECIFIC BULK DATA LOADER
+// ============================================================================
+
+/**
+ * Load bulk analysis data: multiple gene expressions in parallel batches.
+ * Optimized for analysis workflows requiring many genes at once.
+ * Uses notification center for progress tracking.
+ *
+ * @param {Object} options
+ * @param {string} options.manifestUrl - Base URL for var manifest
+ * @param {Object} options.varManifest - Pre-loaded var manifest (fields array)
+ * @param {string[]} options.geneList - Genes to load
+ * @param {number} [options.batchSize=20] - Number of genes to load in parallel
+ * @param {Function} [options.onProgress] - Progress callback (0-100)
+ * @returns {Promise<Object>} { genes: { geneName: Float32Array }, loadedCount, failedCount }
+ */
+export async function loadAnalysisBulkData(options) {
+  const {
+    manifestUrl,
+    varManifest,
+    geneList,
+    batchSize = 20,
+    onProgress
+  } = options;
+
+  const notifications = getNotificationCenter();
+  const trackerId = notifications.show({
+    type: 'progress',
+    category: 'data',
+    title: 'Loading Gene Expression',
+    message: `Preparing ${geneList.length} genes...`,
+    progress: 0
+  });
+
+  const result = {
+    genes: {},
+    loadedCount: 0,
+    failedCount: 0,
+    failedGenes: []
+  };
+
+  try {
+    // Build gene field lookup
+    const fieldLookup = new Map();
+    if (varManifest && varManifest.fields) {
+      for (const field of varManifest.fields) {
+        fieldLookup.set(field.key, field);
+      }
+    }
+
+    // Filter to genes that exist in manifest
+    const validGenes = geneList.filter(gene => fieldLookup.has(gene));
+    const missingGenes = geneList.filter(gene => !fieldLookup.has(gene));
+
+    if (missingGenes.length > 0) {
+      result.failedGenes.push(...missingGenes);
+      result.failedCount += missingGenes.length;
+    }
+
+    if (validGenes.length === 0) {
+      notifications.complete(trackerId, 'No valid genes found');
+      return result;
+    }
+
+    // Load genes in parallel batches
+    let loadedCount = 0;
+    const totalGenes = validGenes.length;
+
+    for (let i = 0; i < validGenes.length; i += batchSize) {
+      const batch = validGenes.slice(i, i + batchSize);
+
+      // Load batch in parallel
+      const batchPromises = batch.map(async (geneName) => {
+        const field = fieldLookup.get(geneName);
+        try {
+          const data = await loadVarFieldData(manifestUrl, field);
+          return { geneName, values: data.values, success: true };
+        } catch (error) {
+          console.warn(`[loadAnalysisBulkData] Failed to load gene ${geneName}:`, error.message);
+          return { geneName, values: null, success: false, error: error.message };
+        }
+      });
+
+      const batchResults = await Promise.all(batchPromises);
+
+      // Process batch results
+      for (const res of batchResults) {
+        if (res.success && res.values) {
+          result.genes[res.geneName] = res.values;
+          result.loadedCount++;
+        } else {
+          result.failedGenes.push(res.geneName);
+          result.failedCount++;
+        }
+      }
+
+      // Update progress
+      loadedCount += batch.length;
+      const progress = Math.round((loadedCount / totalGenes) * 100);
+
+      notifications.updateProgress(trackerId, progress, {
+        message: `Loaded ${loadedCount} of ${totalGenes} genes...`
+      });
+
+      if (onProgress) {
+        onProgress(progress);
+      }
+    }
+
+    // Complete notification
+    const message = result.failedCount > 0
+      ? `Loaded ${result.loadedCount} genes (${result.failedCount} failed)`
+      : `Loaded ${result.loadedCount} genes`;
+
+    notifications.complete(trackerId, message);
+
+    return result;
+
+  } catch (error) {
+    notifications.fail(trackerId, `Failed: ${error.message}`);
+    throw error;
+  }
+}
+
+/**
+ * Load latent embeddings for analysis (e.g., for clustering, UMAP visualization).
+ * Supports multiple embedding types (PCA, UMAP, t-SNE, etc.)
+ *
+ * @param {Object} options
+ * @param {string} options.baseUrl - Base URL for data files
+ * @param {Object} options.identity - Dataset identity object
+ * @param {number} [options.dimension=2] - Dimension to load (1, 2, or 3)
+ * @returns {Promise<Object>} { points: Float32Array, dimension, cellCount }
+ */
+export async function loadLatentEmbeddings(options) {
+  const { baseUrl, identity, dimension = 2 } = options;
+
+  const notifications = getNotificationCenter();
+  const trackerId = notifications.startDownload(`${dimension}D Embeddings`);
+
+  try {
+    const embeddings = getEmbeddingsMetadata(identity);
+
+    if (!embeddings) {
+      throw new Error('No embeddings metadata available');
+    }
+
+    // Check if requested dimension is available
+    const available = embeddings.available_dimensions || [3];
+    if (!available.includes(dimension)) {
+      // Fall back to highest available dimension
+      const fallbackDim = Math.max(...available);
+      console.warn(`[loadLatentEmbeddings] Dimension ${dimension} not available, using ${fallbackDim}`);
+    }
+
+    // Determine file path
+    const dimKey = `${dimension}d`;
+    const filePath = embeddings.files?.[dimKey] || `points_${dimension}d.bin`;
+    const url = resolveUrl(baseUrl, filePath);
+
+    // Load the points
+    const points = await loadPointsBinary(url, {
+      dimension,
+      showProgress: false
+    });
+
+    const cellCount = Math.floor(points.length / dimension);
+
+    notifications.completeDownload(trackerId);
+
+    return {
+      points,
+      dimension,
+      cellCount
+    };
+
+  } catch (error) {
+    notifications.failDownload(trackerId, error.message);
+    throw error;
+  }
+}
+
+/**
+ * Load analysis data for specific cell indices only.
+ * More efficient when analyzing a subset of cells (e.g., highlighted pages).
+ *
+ * @param {Object} options
+ * @param {string} options.manifestUrl - Base URL for var manifest
+ * @param {Object} options.varManifest - Pre-loaded var manifest
+ * @param {string[]} options.geneList - Genes to load
+ * @param {number[]} options.cellIndices - Cell indices to extract
+ * @param {number} [options.batchSize=20] - Batch size for parallel loading
+ * @param {Function} [options.onProgress] - Progress callback
+ * @returns {Promise<Object>} { genes: { geneName: { values, indices } }, cellCount }
+ */
+export async function loadAnalysisSubset(options) {
+  const {
+    manifestUrl,
+    varManifest,
+    geneList,
+    cellIndices,
+    batchSize = 20,
+    onProgress
+  } = options;
+
+  const notifications = getNotificationCenter();
+  const trackerId = notifications.show({
+    type: 'progress',
+    category: 'data',
+    title: 'Loading Subset Data',
+    message: `Loading ${geneList.length} genes for ${cellIndices.length} cells...`,
+    progress: 0
+  });
+
+  try {
+    // First load all gene data
+    const bulkResult = await loadAnalysisBulkData({
+      manifestUrl,
+      varManifest,
+      geneList,
+      batchSize,
+      onProgress: (p) => {
+        notifications.updateProgress(trackerId, Math.round(p * 0.8), {
+          message: `Loading genes (${Math.round(p)}%)...`
+        });
+        if (onProgress) onProgress(Math.round(p * 0.8));
+      }
+    });
+
+    // Extract values for specified cell indices
+    notifications.updateProgress(trackerId, 85, {
+      message: 'Extracting cell values...'
+    });
+
+    const result = {
+      genes: {},
+      cellCount: cellIndices.length,
+      cellIndices
+    };
+
+    // Create index set for fast lookup
+    const indexSet = new Set(cellIndices);
+    const indexArray = Array.from(cellIndices);
+
+    for (const [geneName, fullValues] of Object.entries(bulkResult.genes)) {
+      const subsetValues = new Float32Array(cellIndices.length);
+
+      for (let i = 0; i < indexArray.length; i++) {
+        const cellIdx = indexArray[i];
+        if (cellIdx < fullValues.length) {
+          subsetValues[i] = fullValues[cellIdx];
+        } else {
+          subsetValues[i] = NaN;
+        }
+      }
+
+      result.genes[geneName] = {
+        values: subsetValues,
+        indices: indexArray
+      };
+    }
+
+    notifications.complete(trackerId,
+      `Loaded ${Object.keys(result.genes).length} genes for ${cellIndices.length} cells`
+    );
+
+    if (onProgress) onProgress(100);
+
+    return result;
+
+  } catch (error) {
+    notifications.fail(trackerId, `Failed: ${error.message}`);
+    throw error;
+  }
+}
+
+// ============================================================================
+// ANALYSIS-SPECIFIC BULK OBS LOADER
+// ============================================================================
+//
+// This function is integrated into EnhancedDataLayer.fetchMultiFieldData()
+// in enhanced-data-layer.js for multi-variable analysis workflows.
+// ============================================================================
+
+/**
+ * Load bulk observation field data: multiple obs fields in parallel.
+ * Optimized for analysis workflows requiring many obs fields at once.
+ * Uses notification center for progress tracking.
+ *
+ * Supports all data sources:
+ * - HTTP/HTTPS (standard web)
+ * - local-user:// (user's local filesystem)
+ * - remote:// (remote server sources)
+ * - jupyter:// (Jupyter notebook server)
+ * - h5ad files (via shouldUseAnnData check in loadObsFieldData)
+ * - zarr directories (via shouldUseAnnData check in loadObsFieldData)
+ *
+ * @param {Object} options
+ * @param {string} options.manifestUrl - Base URL for obs manifest
+ * @param {Object} options.obsManifest - Pre-loaded obs manifest (fields array)
+ * @param {string[]} options.fieldList - Field keys to load
+ * @param {number} [options.batchSize=10] - Number of fields to load in parallel (lower than genes due to larger data)
+ * @param {Function} [options.onProgress] - Progress callback (0-100)
+ * @returns {Promise<Object>} { fields: { fieldKey: { values?, codes?, categories?, kind } }, loadedCount, failedCount }
+ */
+export async function loadAnalysisBulkObsData(options) {
+  const {
+    manifestUrl,
+    obsManifest,
+    fieldList,
+    batchSize = 10, // Lower batch size than genes - obs fields can be larger
+    onProgress
+  } = options;
+
+  const notifications = getNotificationCenter();
+  const trackerId = notifications.show({
+    type: 'progress',
+    category: 'data',
+    title: 'Loading Observation Fields',
+    message: `Preparing ${fieldList.length} fields...`,
+    progress: 0
+  });
+
+  const result = {
+    fields: {},
+    loadedCount: 0,
+    failedCount: 0,
+    failedFields: []
+  };
+
+  try {
+    // Build field lookup from manifest
+    const fieldLookup = new Map();
+    if (obsManifest && obsManifest.fields) {
+      for (const field of obsManifest.fields) {
+        fieldLookup.set(field.key, field);
+      }
+    }
+
+    // Filter to fields that exist in manifest
+    const validFields = fieldList.filter(key => fieldLookup.has(key));
+    const missingFields = fieldList.filter(key => !fieldLookup.has(key));
+
+    if (missingFields.length > 0) {
+      result.failedFields.push(...missingFields);
+      result.failedCount += missingFields.length;
+      console.warn('[loadAnalysisBulkObsData] Fields not found in manifest:', missingFields);
+    }
+
+    if (validFields.length === 0) {
+      notifications.complete(trackerId, 'No valid fields found');
+      return result;
+    }
+
+    // Load fields in parallel batches
+    let loadedCount = 0;
+    const totalFields = validFields.length;
+
+    for (let i = 0; i < validFields.length; i += batchSize) {
+      const batch = validFields.slice(i, i + batchSize);
+
+      // Load batch in parallel
+      const batchPromises = batch.map(async (fieldKey) => {
+        const field = fieldLookup.get(fieldKey);
+        try {
+          const data = await loadObsFieldData(manifestUrl, field);
+
+          // Determine field kind and structure result
+          const fieldResult = {
+            kind: field.kind || (data.codes ? 'category' : 'continuous'),
+            categories: field.categories || null
+          };
+
+          if (data.values) {
+            fieldResult.values = data.values;
+          }
+          if (data.codes) {
+            fieldResult.codes = data.codes;
+          }
+
+          return { fieldKey, data: fieldResult, success: true };
+        } catch (error) {
+          console.warn(`[loadAnalysisBulkObsData] Failed to load field ${fieldKey}:`, error.message);
+          return { fieldKey, data: null, success: false, error: error.message };
+        }
+      });
+
+      const batchResults = await Promise.all(batchPromises);
+
+      // Process batch results
+      for (const res of batchResults) {
+        if (res.success && res.data) {
+          result.fields[res.fieldKey] = res.data;
+          result.loadedCount++;
+        } else {
+          result.failedFields.push(res.fieldKey);
+          result.failedCount++;
+        }
+      }
+
+      // Update progress
+      loadedCount += batch.length;
+      const progress = Math.round((loadedCount / totalFields) * 100);
+
+      notifications.updateProgress(trackerId, progress, {
+        message: `Loaded ${loadedCount} of ${totalFields} fields...`
+      });
+
+      if (onProgress) {
+        onProgress(progress);
+      }
+    }
+
+    // Complete notification
+    const message = result.failedCount > 0
+      ? `Loaded ${result.loadedCount} fields (${result.failedCount} failed)`
+      : `Loaded ${result.loadedCount} fields`;
+
+    notifications.complete(trackerId, message);
+
+    return result;
+
+  } catch (error) {
+    notifications.fail(trackerId, `Failed: ${error.message}`);
+    throw error;
+  }
+}

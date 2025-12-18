@@ -422,8 +422,14 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     const viewer = createViewer({ canvas, labelLayer, viewTitleLayer, sidebar });
     console.log('[Main] Viewer created successfully');
 
+    // Expose viewer globally for dev tools (benchmark, debugging)
+    window._cellucidViewer = viewer;
+
     const state = createDataState({ viewer, labelLayer });
     console.log('[Main] State created successfully');
+
+    // Expose state globally for dev tools
+    window._cellucidState = state;
     // benchmarkReporter will be created lazily when benchmark report is requested
     let benchmarkReporter = null;
 
@@ -2100,11 +2106,15 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       }
 
       // Load into viewer (HP renderer is always used)
+      // Pass dimensionLevel from synthetic data generator for correct spatial index construction
+      // (e.g., flatUMAP returns dimensionLevel: 2 for 2D data)
+      const syntheticDimLevel = data.dimensionLevel ?? 3;
       viewer.setData({
         positions: data.positions,
         colors: data.colors,
         outlierQuantiles,
-        transparency
+        transparency,
+        dimensionLevel: syntheticDimLevel
       });
 
       // Clear centroids
@@ -2120,7 +2130,8 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         pointCount,
         pattern,
         generationMs: genTime,
-        visiblePoints: pointCount
+        visiblePoints: pointCount,
+        dimensionLevel: syntheticDimLevel
       };
 
       const gpuMemMB = (pointCount * 28 / 1024 / 1024).toFixed(1);
@@ -2206,6 +2217,227 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         runBenchmark(count, pattern);
       });
     });
+
+    // ========================================
+    // BOTTLENECK ANALYSIS (Single Button)
+    // ========================================
+    const bottleneckAnalyzeBtn = document.getElementById('bottleneck-analyze-btn');
+    const bottleneckProgress = document.getElementById('bottleneck-progress');
+    const bottleneckProgressText = document.getElementById('bottleneck-progress-text');
+    const bottleneckResults = document.getElementById('bottleneck-results');
+
+    // Helper to format numbers with K/M suffix
+    const formatNumShort = (num) => {
+      if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M';
+      if (num >= 1000) return (num / 1000).toFixed(1) + 'K';
+      return String(Math.round(num));
+    };
+
+    if (bottleneckAnalyzeBtn) {
+      bottleneckAnalyzeBtn.addEventListener('click', async () => {
+        const hpRenderer = viewer.getHPRenderer();
+        if (!hpRenderer) {
+          alert('Load some data first before analyzing performance.');
+          return;
+        }
+
+        await ensureBenchmarkModule();
+        const benchmarkModule = await import('../dev/benchmark.js');
+        const BottleneckAnalyzer = benchmarkModule.BottleneckAnalyzer;
+
+        const canvas = document.querySelector('canvas');
+        const gl = canvas?.getContext('webgl2') || canvas?.getContext('webgl');
+
+        if (!gl) {
+          alert('WebGL not available');
+          return;
+        }
+
+        // Show progress
+        bottleneckAnalyzeBtn.disabled = true;
+        bottleneckAnalyzeBtn.textContent = 'Analyzing...';
+        if (bottleneckProgress) bottleneckProgress.style.display = 'block';
+        if (bottleneckResults) bottleneckResults.style.display = 'none';
+
+        try {
+          const analyzer = new BottleneckAnalyzer(gl, hpRenderer);
+
+          const results = await analyzer.runAnalysis({
+            warmupFrames: 30,
+            testFrames: 100
+          });
+
+          // Hide progress, show results
+          if (bottleneckProgress) bottleneckProgress.style.display = 'none';
+          if (bottleneckResults) bottleneckResults.style.display = 'block';
+
+          const s = results.summary;
+          const b = results.bottleneckType;
+          const recs = results.recommendations;
+          const fps = s.performance.fps;
+
+          // Build verdict
+          const verdictBox = document.getElementById('bn-verdict-box');
+          const verdictIcon = document.getElementById('bn-verdict-icon');
+          const verdictTitle = document.getElementById('bn-verdict-title');
+          const verdictDetail = document.getElementById('bn-verdict-detail');
+
+          let verdictText, detailText, icon, bgColor, borderColor, textColor;
+
+          if (fps >= 55) {
+            icon = '✅';
+            verdictText = 'Performance is good';
+            detailText = 'Running smoothly at ' + fps.toFixed(0) + ' FPS. No issues detected.';
+            bgColor = '#f0fdf4'; borderColor = '#bbf7d0'; textColor = '#166534';
+          } else if (fps >= 30) {
+            icon = '⚠️';
+            verdictText = 'Performance could be better';
+            detailText = b.primary.type + ' is the main bottleneck. ' + (b.primary.evidence || '');
+            bgColor = '#fefce8'; borderColor = '#fef08a'; textColor = '#854d0e';
+          } else {
+            icon = '🔴';
+            verdictText = 'Serious performance problem';
+            detailText = b.primary.type + ' is severely limiting performance. ' + (b.primary.evidence || '');
+            bgColor = '#fef2f2'; borderColor = '#fecaca'; textColor = '#991b1b';
+          }
+
+          if (verdictBox) {
+            verdictBox.style.background = bgColor;
+            verdictBox.style.borderColor = borderColor;
+          }
+          if (verdictIcon) verdictIcon.textContent = icon;
+          if (verdictTitle) {
+            verdictTitle.textContent = verdictText;
+            verdictTitle.style.color = textColor;
+          }
+          if (verdictDetail) {
+            verdictDetail.textContent = detailText;
+            verdictDetail.style.color = textColor;
+          }
+
+          // FPS display
+          const bnFps = document.getElementById('bn-fps');
+          if (bnFps) {
+            bnFps.textContent = fps.toFixed(0);
+            bnFps.style.color = fps >= 55 ? '#16a34a' : fps >= 30 ? '#ca8a04' : '#dc2626';
+          }
+
+          // Build problem list
+          const problemList = document.getElementById('bn-problem-list');
+          if (problemList) {
+            const problems = [];
+
+            // Add main bottleneck
+            if (fps < 55) {
+              problems.push(`<div style="padding:4px 0;border-bottom:1px solid #e5e7eb;">• <strong>${b.primary.type}</strong>: ${b.primary.evidence || 'Main limiting factor'}</div>`);
+            }
+
+            // Add contributing factors
+            for (const c of b.contributing) {
+              problems.push(`<div style="padding:4px 0;border-bottom:1px solid #e5e7eb;">• ${c.type}: ${c.evidence}</div>`);
+            }
+
+            // Add specific overhead issues
+            const lodMs = parseFloat(s.overhead.lodMs) || 0;
+            const frustumMs = parseFloat(s.overhead.frustumCullingMs) || 0;
+            const shaderMs = parseFloat(s.overhead.shaderComplexityMs) || 0;
+
+            if (shaderMs > 3) {
+              problems.push(`<div style="padding:4px 0;border-bottom:1px solid #e5e7eb;">• Shader complexity adds ${shaderMs.toFixed(1)}ms per frame</div>`);
+            }
+
+            // Add jank/stuttering issues
+            if (s.frameStability && s.frameStability.hasJank) {
+              const severity = s.frameStability.jankSeverity;
+              const icon = severity === 'severe' ? '🔴' : severity === 'moderate' ? '⚠️' : '';
+              problems.push(`<div style="padding:4px 0;border-bottom:1px solid #e5e7eb;">• ${icon} Frame stuttering: ${s.frameStability.diagnosis} (${s.frameStability.jankPercent} janky frames)</div>`);
+            }
+
+            // Add CPU/JS health issues
+            if (s.cpuHealth && s.cpuHealth.issues && s.cpuHealth.issues.length > 0) {
+              for (const issue of s.cpuHealth.issues.slice(0, 2)) {
+                problems.push(`<div style="padding:4px 0;border-bottom:1px solid #e5e7eb;">• ${issue}</div>`);
+              }
+            }
+
+            if (problems.length === 0) {
+              problems.push('<div style="padding:4px 0;color:#16a34a;">No significant problems found</div>');
+            }
+
+            problemList.innerHTML = problems.join('');
+          }
+
+          // Build fix list
+          const fixList = document.getElementById('bn-fix-list');
+          if (fixList && recs.recommendations.length > 0) {
+            const fixes = [];
+            for (const rec of recs.recommendations.slice(0, 3)) {
+              fixes.push(`<div style="padding:4px 0;border-bottom:1px solid #bbf7d0;">
+                <strong>${rec.title}</strong><br>
+                <span style="color:#15803d;">${rec.actions[0]}</span>
+              </div>`);
+            }
+            fixList.innerHTML = fixes.join('');
+          } else if (fixList) {
+            fixList.innerHTML = '<div style="color:#16a34a;">No changes needed - performance is good!</div>';
+          }
+
+          // Populate detailed stats
+          const bnVisiblePoints = document.getElementById('bn-visible-points');
+          const bnGpuMemory = document.getElementById('bn-gpu-memory');
+          const bnLodLevel = document.getElementById('bn-lod-level');
+          const bnDrawCalls = document.getElementById('bn-draw-calls');
+          const bnFrametime = document.getElementById('bn-frametime');
+          const bnP95 = document.getElementById('bn-p95');
+          const bnLodOverhead = document.getElementById('bn-lod-overhead');
+          const bnFrustumOverhead = document.getElementById('bn-frustum-overhead');
+          const bnShaderOverhead = document.getElementById('bn-shader-overhead');
+
+          if (bnVisiblePoints) bnVisiblePoints.textContent = formatNumShort(s.rendering.visiblePoints);
+          if (bnGpuMemory) bnGpuMemory.textContent = s.rendering.gpuMemoryMB + 'MB';
+          if (bnLodLevel) bnLodLevel.textContent = Math.round(s.rendering.lodLevel);
+          if (bnDrawCalls) bnDrawCalls.textContent = Math.round(s.rendering.drawCalls);
+          if (bnFrametime) bnFrametime.textContent = s.performance.avgFrameTimeMs.toFixed(1) + 'ms';
+          if (bnP95) bnP95.textContent = s.performance.p95FrameTimeMs.toFixed(1) + 'ms';
+          if (bnLodOverhead) bnLodOverhead.textContent = s.overhead.lodMs + 'ms';
+          if (bnFrustumOverhead) bnFrustumOverhead.textContent = s.overhead.frustumCullingMs + 'ms';
+          if (bnShaderOverhead) bnShaderOverhead.textContent = s.overhead.shaderComplexityMs + 'ms';
+
+          // Frame stability and CPU health stats
+          const bnFrameStability = document.getElementById('bn-frame-stability');
+          const bnJankPercent = document.getElementById('bn-jank-percent');
+          const bnCpuHealth = document.getElementById('bn-cpu-health');
+
+          if (s.frameStability) {
+            if (bnFrameStability) {
+              const stability = s.frameStability.hasJank ? s.frameStability.jankSeverity : 'stable';
+              const color = stability === 'stable' ? '#16a34a' : stability === 'mild' ? '#ca8a04' : '#dc2626';
+              bnFrameStability.textContent = stability;
+              bnFrameStability.style.color = color;
+            }
+            if (bnJankPercent) bnJankPercent.textContent = s.frameStability.jankPercent;
+          }
+
+          if (s.cpuHealth && bnCpuHealth) {
+            const health = s.cpuHealth.health || 'unknown';
+            const color = health === 'good' ? '#16a34a' : health === 'fair' ? '#ca8a04' : '#dc2626';
+            bnCpuHealth.textContent = health;
+            bnCpuHealth.style.color = color;
+          }
+
+          // Log to console too
+          console.log('[Bottleneck Analysis]', results);
+
+        } catch (err) {
+          console.error('[Bottleneck] Analysis failed:', err);
+          if (bottleneckProgress) bottleneckProgress.style.display = 'none';
+          alert('Analysis failed: ' + err.message);
+        } finally {
+          bottleneckAnalyzeBtn.disabled = false;
+          bottleneckAnalyzeBtn.textContent = 'Analyze Performance';
+        }
+      });
+    }
 
     await autoLoadLatestState();
 

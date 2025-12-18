@@ -4575,6 +4575,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     },
 
     getGLContext() { return gl; },
+    getHPRenderer() { return hpRenderer; },
     isWebGL2() { return true; },
 
     getRenderState() {
