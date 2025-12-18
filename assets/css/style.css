@@ -4311,6 +4311,58 @@ body.dark-mode .notification-progress {
 }
 
 /* =========================================================================
+   DE Analysis Performance Settings
+   ========================================================================= */
+
+.de-performance-settings {
+  margin-top: 12px;
+}
+
+.de-perf-header {
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 0;
+  border-top: 1px solid var(--viewer-border, #e5e7eb);
+  user-select: none;
+}
+
+.de-perf-title {
+  font-family: "Oswald", system-ui, sans-serif;
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--viewer-ink-soft, #6b7280);
+}
+
+.de-perf-toggle {
+  font-size: 10px;
+  color: var(--viewer-ink-soft, #9ca3af);
+  transition: transform 0.15s ease;
+}
+
+.de-perf-content {
+  padding-top: 8px;
+}
+
+.de-perf-info {
+  font-size: 11px;
+  color: var(--viewer-ink-soft, #6b7280);
+  padding: 8px;
+  background: var(--viewer-bg-subtle, #f9fafb);
+  border: 1px solid var(--viewer-border, #e5e7eb);
+  border-radius: 4px;
+  margin-top: 8px;
+  line-height: 1.5;
+}
+
+.de-perf-info strong {
+  color: var(--viewer-ink, #111827);
+}
+
+/* =========================================================================
    Plotly Minimal Styling for Analysis Module
    ========================================================================= */
 

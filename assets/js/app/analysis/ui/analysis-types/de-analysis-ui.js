@@ -24,6 +24,7 @@ import {
 // Note: renderStatsGrid and renderDEGenesTable are not used in sidebar
 // Modal rendering uses HTML templates directly for better control
 import { createPageComparisonSelector } from '../components/index.js';
+import { PerformanceConfig } from '../../shared/performance-config.js';
 
 /**
  * Differential Expression Analysis UI Component
@@ -133,16 +134,6 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     });
     wrapper.appendChild(pageSelector);
 
-    // Performance selector (parallelism)
-    const parallelismSelect = createFormSelect('parallelism', [
-      { value: 'auto', label: 'Auto (use worker pool)', selected: true },
-      { value: '1', label: '1× (lowest memory)' },
-      { value: '2', label: '2×' },
-      { value: '4', label: '4×' },
-      { value: '8', label: '8× (if available)' }
-    ]);
-    wrapper.appendChild(createFormRow('Speed (parallelism):', parallelismSelect));
-
     // Method selector
     const methodSelect = createFormSelect('method', [
       { value: 'wilcox', label: 'Wilcoxon (recommended)', selected: true },
@@ -166,6 +157,98 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       { value: '2', label: '|log2FC| > 2' }
     ]);
     wrapper.appendChild(createFormRow('Log2 fold change threshold:', fcSelect));
+
+    // === Performance Settings Section ===
+    this._renderPerformanceSettings(wrapper);
+  }
+
+  /**
+   * Render performance settings section
+   * @param {HTMLElement} wrapper - Form wrapper element
+   * @private
+   */
+  _renderPerformanceSettings(wrapper) {
+    // Get data characteristics for recommended settings
+    const pointCount = this.dataLayer?.state?.pointCount || 100000;
+    const geneCount = this.dataLayer?.getAvailableVariables?.('gene_expression')?.length || 20000;
+    const recommended = PerformanceConfig.getRecommendedSettings(pointCount, geneCount);
+
+    // Performance settings container
+    const perfSection = document.createElement('div');
+    perfSection.className = 'de-performance-settings';
+
+    // Section header with toggle
+    const header = document.createElement('div');
+    header.className = 'de-perf-header';
+    header.innerHTML = `
+      <span class="de-perf-title">Performance Settings</span>
+      <span class="de-perf-toggle">▼</span>
+    `;
+
+    const content = document.createElement('div');
+    content.className = 'de-perf-content';
+
+    // Batch size selector
+    const batchOptions = PerformanceConfig.getBatchSizeOptions(pointCount, geneCount);
+    const batchSelect = createFormSelect('batchSize', batchOptions.map(opt => ({
+      value: String(opt.value),
+      label: opt.label,
+      selected: opt.recommended
+    })));
+    content.appendChild(createFormRow('Batch size:', batchSelect));
+
+    // Memory budget selector
+    const memoryOptions = PerformanceConfig.getMemoryBudgetOptions();
+    const recommendedMemory = recommended.memoryBudgetMB;
+    const memorySelect = createFormSelect('memoryBudget', memoryOptions.map(opt => ({
+      value: String(opt.value),
+      label: opt.label,
+      selected: opt.value <= recommendedMemory && memoryOptions.find(o => o.value > recommendedMemory)?.value !== opt.value
+    })));
+    content.appendChild(createFormRow('Memory budget:', memorySelect));
+
+    // Network concurrency selector (actual parallel network requests)
+    const networkOptions = PerformanceConfig.getNetworkConcurrencyOptions(recommended.networkConcurrency);
+    const networkSelect = createFormSelect('networkConcurrency', networkOptions.map(opt => ({
+      value: String(opt.value),
+      label: opt.label,
+      selected: opt.recommended
+    })));
+    content.appendChild(createFormRow('Network parallelism:', networkSelect));
+
+    // Parallelism selector
+    const parallelismSelect = createFormSelect('parallelism', [
+      { value: 'auto', label: 'Auto (use worker pool)', selected: true },
+      { value: '1', label: '1× (lowest memory)' },
+      { value: '2', label: '2×' },
+      { value: '4', label: '4×' },
+      { value: '8', label: '8× (fastest)' }
+    ]);
+    content.appendChild(createFormRow('Compute parallelism:', parallelismSelect));
+
+    // Dataset info display
+    const infoDiv = document.createElement('div');
+    infoDiv.className = 'de-perf-info';
+    infoDiv.innerHTML = `
+      <strong>Dataset:</strong> ${(pointCount / 1000).toFixed(0)}K cells × ${geneCount.toLocaleString()} genes<br>
+      <strong>Est. data:</strong> ~${recommended.totalDataMB.toFixed(0)} MB total<br>
+      <strong>Est. time:</strong> ~${recommended.estimatedTimeFormatted}
+    `;
+    content.appendChild(infoDiv);
+
+    // Toggle functionality
+    let isExpanded = false;
+    content.style.display = 'none';
+
+    header.addEventListener('click', () => {
+      isExpanded = !isExpanded;
+      content.style.display = isExpanded ? 'block' : 'none';
+      header.querySelector('.de-perf-toggle').textContent = isExpanded ? '▲' : '▼';
+    });
+
+    perfSection.appendChild(header);
+    perfSection.appendChild(content);
+    wrapper.appendChild(perfSection);
   }
 
   /**
@@ -175,11 +258,21 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
   _getFormValues() {
     const form = this._formContainer.querySelector('.analysis-form');
     const parallelismRaw = form.querySelector('[name="parallelism"]')?.value || 'auto';
+    const batchSizeRaw = form.querySelector('[name="batchSize"]')?.value;
+    const memoryBudgetRaw = form.querySelector('[name="memoryBudget"]')?.value;
+    const networkConcurrencyRaw = form.querySelector('[name="networkConcurrency"]')?.value;
+
     return {
       parallelism: parallelismRaw === 'auto' ? 'auto' : parseInt(parallelismRaw, 10),
       method: form.querySelector('[name="method"]').value,
       pValueThreshold: parseFloat(form.querySelector('[name="pValueThreshold"]').value),
-      fcThreshold: parseFloat(form.querySelector('[name="fcThreshold"]').value)
+      fcThreshold: parseFloat(form.querySelector('[name="fcThreshold"]').value),
+      // Batch configuration for optimized loading
+      batchConfig: {
+        preloadCount: batchSizeRaw ? parseInt(batchSizeRaw, 10) : undefined,
+        memoryBudgetMB: memoryBudgetRaw ? parseInt(memoryBudgetRaw, 10) : undefined,
+        networkConcurrency: networkConcurrencyRaw ? parseInt(networkConcurrencyRaw, 10) : undefined
+      }
     };
   }
 
@@ -194,13 +287,14 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       ? this._comparisonPages
       : this._selectedPages.slice(0, 2);
 
-    // Run differential expression
+    // Run differential expression with optimized batch loading
     const deResults = await this.multiVariableAnalysis.differentialExpression({
       pageA,
       pageB,
       geneList: null, // Always test all genes; results are sorted so "top genes" naturally surface.
       method: formValues.method || 'wilcox',
-      parallelism: formValues.parallelism
+      parallelism: formValues.parallelism,
+      batchConfig: formValues.batchConfig || {}
     });
 
     const pValueThreshold = Number.isFinite(formValues.pValueThreshold)

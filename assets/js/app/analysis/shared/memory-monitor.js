@@ -10,6 +10,8 @@
  * - Provides manual cleanup API
  * - Logs memory statistics for debugging
  * - User notifications for cleanup events
+ * - Batch feasibility checking for large operations
+ * - Memory pressure event subscription
  *
  * @module shared/memory-monitor
  */
@@ -73,6 +75,12 @@ class MemoryMonitor {
 
     /** @type {boolean} Whether to show user notifications */
     this._showNotifications = true;
+
+    /** @type {Set<Function>} Memory pressure callbacks */
+    this._pressureCallbacks = new Set();
+
+    /** @type {string|null} Current pressure level */
+    this._currentPressureLevel = null;
   }
 
   /**
@@ -326,6 +334,255 @@ class MemoryMonitor {
       lastCleanup: null,
       peakMemoryMB: 0
     };
+  }
+
+  // ===========================================================================
+  // BATCH FEASIBILITY CHECKING
+  // ===========================================================================
+
+  /**
+   * Check if we have enough memory for a batch operation
+   *
+   * Analyzes current memory usage and estimates whether a batch operation
+   * of the given size can safely proceed without exceeding browser limits.
+   *
+   * @param {number} estimatedMB - Estimated memory needed for the operation (MB)
+   * @param {Object} [options] - Additional options
+   * @param {number} [options.safetyMargin=0.7] - Safety margin (0-1)
+   * @param {boolean} [options.includeCurrentUsage=true] - Factor in current usage
+   * @returns {BatchFeasibilityResult} Feasibility assessment
+   *
+   * @typedef {Object} BatchFeasibilityResult
+   * @property {boolean} canProceed - Whether operation can safely proceed
+   * @property {number|null} availableMB - Available memory (MB, null if unknown)
+   * @property {number|null} currentUsedMB - Currently used memory (MB)
+   * @property {number|null} limitMB - Heap limit (MB)
+   * @property {number} requestedMB - Requested memory for operation
+   * @property {string} recommendation - Human-readable recommendation
+   * @property {'ok'|'warning'|'critical'|'unknown'} level - Severity level
+   *
+   * @example
+   * const check = memoryMonitor.checkBatchFeasibility(256);
+   * if (!check.canProceed) {
+   *   console.warn(check.recommendation);
+   *   // Reduce batch size...
+   * }
+   */
+  checkBatchFeasibility(estimatedMB, options = {}) {
+    const { safetyMargin = 0.7, includeCurrentUsage = true } = options;
+    const usage = this.getMemoryUsage();
+
+    // Fallback when Performance.memory not available
+    if (!usage.available) {
+      // Be conservative - allow operations under 256MB without measurement
+      const canProceed = estimatedMB < 256;
+      return {
+        canProceed,
+        availableMB: null,
+        currentUsedMB: null,
+        limitMB: null,
+        requestedMB: estimatedMB,
+        recommendation: canProceed
+          ? 'Memory stats unavailable. Proceeding with conservative estimate.'
+          : 'Memory stats unavailable. Reduce batch size to under 256MB for safety.',
+        level: canProceed ? 'unknown' : 'warning'
+      };
+    }
+
+    const usedMB = parseFloat(usage.usedMB);
+    const limitMB = parseFloat(usage.limitMB);
+    const percentUsed = parseFloat(usage.percentUsed);
+
+    // Calculate available memory with safety margin
+    const theoreticalAvailable = limitMB - usedMB;
+    const safeAvailableMB = theoreticalAvailable * safetyMargin;
+
+    // Check if we're already under memory pressure
+    const alreadyUnderPressure = percentUsed >= THRESHOLDS.WARNING / (limitMB * 1024 * 1024) * 100;
+
+    // Determine if operation can proceed
+    const canProceed = estimatedMB <= safeAvailableMB && !alreadyUnderPressure;
+
+    // Generate recommendation
+    let recommendation;
+    let level;
+
+    if (canProceed) {
+      recommendation = `Memory available: ${Math.round(safeAvailableMB)}MB safe, requesting ${estimatedMB}MB.`;
+      level = 'ok';
+    } else if (alreadyUnderPressure) {
+      recommendation =
+        `Memory pressure detected (${percentUsed}% used). ` +
+        `Consider clearing cache before starting. ` +
+        `Requested: ${estimatedMB}MB, Available: ${Math.round(safeAvailableMB)}MB.`;
+      level = 'warning';
+    } else if (estimatedMB > theoreticalAvailable) {
+      recommendation =
+        `Insufficient memory. Requested: ${estimatedMB}MB, ` +
+        `Available: ${Math.round(theoreticalAvailable)}MB (${Math.round(safeAvailableMB)}MB safe). ` +
+        `Reduce batch size to ${Math.floor(safeAvailableMB * 0.8)}MB or less.`;
+      level = 'critical';
+    } else {
+      recommendation =
+        `Operation may cause memory pressure. ` +
+        `Requested: ${estimatedMB}MB, Safe available: ${Math.round(safeAvailableMB)}MB. ` +
+        `Consider reducing to ${Math.floor(safeAvailableMB * 0.8)}MB.`;
+      level = 'warning';
+    }
+
+    return {
+      canProceed,
+      availableMB: Math.round(safeAvailableMB),
+      currentUsedMB: Math.round(usedMB),
+      limitMB: Math.round(limitMB),
+      requestedMB: estimatedMB,
+      recommendation,
+      level
+    };
+  }
+
+  /**
+   * Suggest optimal batch size based on current memory state
+   *
+   * @param {number} bytesPerItem - Memory per item in bytes
+   * @param {number} overheadFactor - Memory overhead multiplier (e.g., 5 for Wilcoxon)
+   * @param {Object} [options] - Options
+   * @param {number} [options.targetUtilization=0.5] - Target memory utilization (0-1)
+   * @param {number} [options.minItems=10] - Minimum items per batch
+   * @param {number} [options.maxItems=500] - Maximum items per batch
+   * @returns {Object} Suggested batch configuration
+   */
+  suggestBatchSize(bytesPerItem, overheadFactor = 1, options = {}) {
+    const {
+      targetUtilization = 0.5,
+      minItems = 10,
+      maxItems = 500
+    } = options;
+
+    const usage = this.getMemoryUsage();
+
+    // Fallback when memory API unavailable
+    if (!usage.available) {
+      // Conservative default: 50MB budget
+      const defaultBudgetBytes = 50 * 1024 * 1024;
+      const memoryPerItem = bytesPerItem * overheadFactor;
+      const suggestedItems = Math.floor(defaultBudgetBytes / memoryPerItem);
+
+      return {
+        suggestedBatchSize: Math.max(minItems, Math.min(suggestedItems, maxItems)),
+        budgetMB: 50,
+        memoryPerItemMB: memoryPerItem / (1024 * 1024),
+        confidence: 'low',
+        note: 'Using conservative defaults (memory API unavailable)'
+      };
+    }
+
+    const limitMB = parseFloat(usage.limitMB);
+    const usedMB = parseFloat(usage.usedMB);
+    const availableMB = limitMB - usedMB;
+
+    // Target budget based on available memory and utilization
+    const budgetMB = availableMB * targetUtilization;
+    const budgetBytes = budgetMB * 1024 * 1024;
+
+    // Calculate items that fit in budget
+    const memoryPerItem = bytesPerItem * overheadFactor;
+    const suggestedItems = Math.floor(budgetBytes / memoryPerItem);
+
+    return {
+      suggestedBatchSize: Math.max(minItems, Math.min(suggestedItems, maxItems)),
+      budgetMB: Math.round(budgetMB),
+      memoryPerItemMB: Math.round((memoryPerItem / (1024 * 1024)) * 100) / 100,
+      availableMB: Math.round(availableMB),
+      confidence: 'high',
+      note: `Based on ${Math.round(targetUtilization * 100)}% of available ${Math.round(availableMB)}MB`
+    };
+  }
+
+  // ===========================================================================
+  // MEMORY PRESSURE EVENTS
+  // ===========================================================================
+
+  /**
+   * Subscribe to memory pressure events
+   *
+   * Callback is invoked when memory usage crosses threshold levels.
+   *
+   * @param {Function} callback - Function called on pressure change
+   * @returns {Function} Unsubscribe function
+   *
+   * @example
+   * const unsubscribe = memoryMonitor.onMemoryPressure((event) => {
+   *   if (event.level === 'critical') {
+   *     // Pause loading, reduce batch size, etc.
+   *   }
+   * });
+   */
+  onMemoryPressure(callback) {
+    if (typeof callback !== 'function') {
+      console.warn('[MemoryMonitor] onMemoryPressure requires a function callback');
+      return () => {};
+    }
+
+    this._pressureCallbacks.add(callback);
+
+    // Return unsubscribe function
+    return () => {
+      this._pressureCallbacks.delete(callback);
+    };
+  }
+
+  /**
+   * Notify subscribers of memory pressure change
+   * @param {string} level - Pressure level ('normal', 'warning', 'cleanup', 'critical')
+   * @param {Object} usage - Current memory usage
+   * @private
+   */
+  _notifyPressureChange(level, usage) {
+    if (level === this._currentPressureLevel) return;
+
+    this._currentPressureLevel = level;
+
+    const event = {
+      level,
+      previousLevel: this._currentPressureLevel,
+      timestamp: Date.now(),
+      usage
+    };
+
+    for (const callback of this._pressureCallbacks) {
+      try {
+        callback(event);
+      } catch (err) {
+        console.error('[MemoryMonitor] Pressure callback error:', err);
+      }
+    }
+  }
+
+  /**
+   * Get current memory pressure level
+   * @returns {'normal'|'warning'|'cleanup'|'critical'|'unknown'}
+   */
+  getPressureLevel() {
+    const usage = this.getMemoryUsage();
+
+    if (!usage.available) return 'unknown';
+
+    const usedBytes = usage.usedJSHeapSize;
+
+    if (usedBytes >= THRESHOLDS.CRITICAL) return 'critical';
+    if (usedBytes >= THRESHOLDS.CLEANUP) return 'cleanup';
+    if (usedBytes >= THRESHOLDS.WARNING) return 'warning';
+    return 'normal';
+  }
+
+  /**
+   * Check if memory is under pressure
+   * @returns {boolean}
+   */
+  isUnderPressure() {
+    const level = this.getPressureLevel();
+    return level === 'warning' || level === 'cleanup' || level === 'critical';
   }
 }
 

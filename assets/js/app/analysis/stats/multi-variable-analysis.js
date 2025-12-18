@@ -13,8 +13,10 @@
 import { getComputeManager } from '../compute/compute-manager.js';
 import { getNotificationCenter } from '../../notification-center.js';
 import { getBasePageIdFromRestOf, isRestOfPageId } from '../shared/page-derivation-utils.js';
-import { gatherComplementFloat32, gatherFloat32 } from '../shared/typed-array-utils.js';
 import { waitForAvailableSlot } from '../shared/concurrency-utils.js';
+import { StreamingGeneLoader } from '../data/streaming-gene-loader.js';
+import { PerformanceConfig } from '../shared/performance-config.js';
+import { ProgressTracker } from '../shared/progress-tracker.js';
 
 /**
  * Multi-Variable Analysis class
@@ -196,60 +198,75 @@ export class MultiVariableAnalysis {
       method = 'wilcox',
       minCells = 10,
       parallelism = 'auto',
-      maxInFlightBytes = 64 * 1024 * 1024,
-      onProgress
+      onProgress,
+      // Batch configuration options for optimized loading
+      batchConfig = {}
     } = options;
 
     if (!pageA || !pageB) {
       throw new Error('Two pages required for differential expression');
     }
 
-    // Show loading notification
-    const notificationId = this._notifications.show({
-      type: 'progress',
-      category: 'calculation',
-      title: 'Differential Expression',
-      message: 'Preparing differential expression...',
-      progress: 0
-    });
-
     const startTime = performance.now();
 
-    try {
-      // Get available genes
-      const allGenes = this.dataLayer.getAvailableVariables('gene_expression');
-      const genesToTest = geneList
-        ? (() => {
-          const keep = new Set(geneList);
-          return allGenes.filter(g => keep.has(g.key));
-        })()
-        : allGenes;
+    // Get data characteristics for recommended settings
+    const pointCount = Number.isFinite(this.dataLayer?.state?.pointCount)
+      ? this.dataLayer.state.pointCount
+      : 100000; // Conservative fallback
 
-      if (genesToTest.length === 0) {
-        throw new Error('No genes available for analysis');
+    // Get available genes
+    const allGenes = this.dataLayer.getAvailableVariables('gene_expression');
+    const genesToTest = geneList
+      ? (() => {
+        const keep = new Set(geneList);
+        return allGenes.filter(g => keep.has(g.key));
+      })()
+      : allGenes;
+
+    if (genesToTest.length === 0) {
+      throw new Error('No genes available for analysis');
+    }
+
+    // Get recommended settings based on data size
+    const recommended = PerformanceConfig.getRecommendedSettings(pointCount, genesToTest.length, { method });
+
+    // Merge user batch config with recommended settings
+    const effectiveBatchConfig = {
+      preloadCount: batchConfig.preloadCount || recommended.preloadCount,
+      memoryBudgetMB: batchConfig.memoryBudgetMB || recommended.memoryBudgetMB,
+      networkConcurrency: batchConfig.networkConcurrency || recommended.networkConcurrency
+    };
+
+    console.log('[DE] Effective config:', {
+      preloadCount: effectiveBatchConfig.preloadCount,
+      memoryBudgetMB: effectiveBatchConfig.memoryBudgetMB,
+      networkConcurrency: effectiveBatchConfig.networkConcurrency,
+      genes: genesToTest.length,
+      cells: pointCount
+    });
+
+    // Create progress tracker with ETA
+    const progressTracker = new ProgressTracker({
+      totalItems: genesToTest.length,
+      title: 'Differential Expression',
+      phases: ['Loading & Computing', 'Multiple Testing Correction'],
+      onUpdate: (stats) => {
+        if (onProgress) {
+          onProgress(stats.progress);
+        }
       }
+    });
 
+    progressTracker.start();
+
+    try {
       const pageAInfo = this.dataLayer.getPageInfo(pageA) || { id: pageA, name: pageA };
       const pageBInfo = this.dataLayer.getPageInfo(pageB) || { id: pageB, name: pageB };
 
       /**
-       * @typedef {{
-       *   kind: 'explicit',
-       *   pageId: string,
-       *   pageName: string,
-       *   cellIndices: number[]
-       * } | {
-       *   kind: 'rest_of',
-       *   pageId: string,
-       *   pageName: string,
-       *   baseId: string,
-       *   excludedCellIndices: number[]
-       * }} DEGroupSpec
-       */
-
-      /**
+       * Build group specification for a page
        * @param {string} pageId
-       * @returns {DEGroupSpec}
+       * @returns {Object} Group specification
        */
       const buildGroupSpec = (pageId) => {
         const pageInfo = this.dataLayer.getPageInfo(pageId);
@@ -258,22 +275,18 @@ export class MultiVariableAnalysis {
         if (isRestOfPageId(pageId)) {
           const baseId = getBasePageIdFromRestOf(pageId);
           if (!baseId) {
-            return { kind: 'explicit', pageId, pageName, cellIndices: [] };
+            return { kind: 'explicit', pageId, pageName, cellIndices: [], isRestOf: false };
           }
           const excludedCellIndices = this.dataLayer.getCellIndicesForPage(baseId);
-          return { kind: 'rest_of', pageId, pageName, baseId, excludedCellIndices };
+          return { kind: 'rest_of', pageId, pageName, baseId, excludedCellIndices, isRestOf: true };
         }
 
         const cellIndices = this.dataLayer.getCellIndicesForPage(pageId);
-        return { kind: 'explicit', pageId, pageName, cellIndices };
+        return { kind: 'explicit', pageId, pageName, cellIndices, isRestOf: false };
       };
 
       const groupA = buildGroupSpec(pageA);
       const groupB = buildGroupSpec(pageB);
-
-      const pointCount = Number.isFinite(this.dataLayer?.state?.pointCount)
-        ? this.dataLayer.state.pointCount
-        : null;
 
       const getGroupSize = (group, totalCells) => {
         if (group.kind === 'rest_of') {
@@ -285,10 +298,9 @@ export class MultiVariableAnalysis {
       const groupASize = getGroupSize(groupA, pointCount);
       const groupBSize = getGroupSize(groupB, pointCount);
 
-      this._notifications.updateProgress(notificationId, 5, {
-        message: `Preparing groups: ${pageAInfo.name} (${groupASize ?? '—'}) vs ${pageBInfo.name} (${groupBSize ?? '—'})`
-      });
-      if (onProgress) onProgress(5);
+      progressTracker.setMessage(
+        `${pageAInfo.name} (${groupASize?.toLocaleString() ?? '—'}) vs ${pageBInfo.name} (${groupBSize?.toLocaleString() ?? '—'})`
+      );
 
       // Compute differential expression for each gene
       const computeManager = await this._getComputeManager();
@@ -298,173 +310,104 @@ export class MultiVariableAnalysis {
         ? computeManager.isWorkerAvailable()
         : false;
 
+      // Calculate max in-flight computations based on memory and workers
       const groupTotalSize = Number.isFinite(groupASize) && Number.isFinite(groupBSize)
         ? groupASize + groupBSize
         : null;
 
-      // Adaptive in-flight parallelism:
-      // - saturate worker pool by default
-      // - clamp by a soft memory budget based on group sizes
       let maxInFlightGenes = 1;
       if (workersAvailable && workerPoolSize > 0) {
         const requested = parallelism === 'auto' ? workerPoolSize : Number(parallelism);
         maxInFlightGenes = Number.isFinite(requested) && requested > 0 ? Math.floor(requested) : 1;
 
         if (Number.isFinite(groupTotalSize) && groupTotalSize > 0) {
-          const baseBytes = groupTotalSize * 4; // Float32Array bytes
-          const overheadFactor = method === 'wilcox' ? 5 : 2; // filtering + test overhead (rough)
+          const baseBytes = groupTotalSize * 4;
+          const overheadFactor = method === 'wilcox' ? 5 : 2;
           const estimatedBytesPerGene = baseBytes * overheadFactor;
-          const budget = Number.isFinite(maxInFlightBytes) && maxInFlightBytes > 0
-            ? maxInFlightBytes
-            : 64 * 1024 * 1024;
+          const budget = effectiveBatchConfig.memoryBudgetMB * 1024 * 1024;
           const maxByMemory = Math.max(1, Math.floor(budget / Math.max(1, estimatedBytesPerGene)));
           maxInFlightGenes = Math.min(maxInFlightGenes, maxByMemory);
-        } else {
-          // If we can't estimate payload size, stay conservative.
-          maxInFlightGenes = 1;
         }
 
         maxInFlightGenes = Math.max(1, Math.min(maxInFlightGenes, workerPoolSize, 8));
       }
 
-      this._notifications.updateProgress(notificationId, 10, {
-        message: `Analyzing ${genesToTest.length} genes (parallelism: ${maxInFlightGenes}×)...`
+      // Create streaming gene loader with optimized prefetching
+      const geneLoader = new StreamingGeneLoader({
+        dataLayer: this.dataLayer,
+        config: effectiveBatchConfig
+        // Note: Progress is handled by progressTracker, not the loader
       });
-      if (onProgress) onProgress(10);
 
       /** @type {Array<Object|null>} */
       const resultsByIndex = new Array(genesToTest.length).fill(null);
       /** @type {Set<Promise<void>>} */
       const inFlight = new Set();
 
-      let completedGenes = 0;
-      let lastProgressBucket = -1;
+      // Stream genes with optimized prefetching
+      const geneKeys = genesToTest.map(g => g.key);
 
-      const updateProgressFromCompleted = () => {
-        const progress = 10 + ((completedGenes / genesToTest.length) * 85); // 10-95%
-        const bucket = Math.floor(progress);
-        if (bucket !== lastProgressBucket) {
-          lastProgressBucket = bucket;
-          this._notifications.updateProgress(notificationId, bucket, {
-            message: `Computing statistics (${completedGenes}/${genesToTest.length})...`
-          });
-          if (onProgress) onProgress(bucket);
-        }
-      };
+      for await (const { gene, valuesA, valuesB, index } of
+        geneLoader.streamGenes(geneKeys, groupA, groupB)) {
 
-      const markCompleted = () => {
-        completedGenes++;
-        updateProgressFromCompleted();
-      };
-
-      for (let i = 0; i < genesToTest.length; i++) {
-        // Keep a bounded number of in-flight worker computations to control memory.
+        // Keep a bounded number of in-flight worker computations
         await waitForAvailableSlot(inFlight, maxInFlightGenes);
 
-        const gene = genesToTest[i].key;
+        const nA = valuesA.length;
+        const nB = valuesB.length;
 
-        let wasLoaded = true;
-        let didUnload = false;
-        try {
-          const geneField = await this.dataLayer.ensureGeneExpressionLoaded(gene, { silent: true });
-          wasLoaded = geneField.wasLoaded;
-          let rawValues = geneField.values;
-
-          // Gather expression values for each group (creates new arrays safe for worker transfer)
-          const valuesA = groupA.kind === 'rest_of'
-            ? gatherComplementFloat32(rawValues, groupA.excludedCellIndices)
-            : gatherFloat32(rawValues, groupA.cellIndices);
-          const valuesB = groupB.kind === 'rest_of'
-            ? gatherComplementFloat32(rawValues, groupB.excludedCellIndices)
-            : gatherFloat32(rawValues, groupB.cellIndices);
-
-          // Free the raw per-cell array as early as possible when we loaded it just for this analysis.
-          // We keep only the per-group gathered arrays.
-          if (!wasLoaded) {
-            didUnload = true;
-            this.dataLayer.unloadGeneExpression(gene, { preserveActive: true });
-            this.dataLayer.invalidateVariable('gene_expression', gene);
-          }
-          rawValues = null;
-
-          const nA = valuesA.length;
-          const nB = valuesB.length;
-
-          if (nA < minCells || nB < minCells) {
-            resultsByIndex[i] = {
-              gene,
-              error: `Insufficient cells (A: ${nA}, B: ${nB})`,
-              meanA: nA > 0 ? mean(valuesA) : NaN,
-              meanB: nB > 0 ? mean(valuesB) : NaN,
-              log2FoldChange: NaN,
-              pValue: NaN,
-              nA,
-              nB
-            };
-            markCompleted();
-            continue;
-          }
-
-          // Fire-and-forget compute on worker; completion updates resultsByIndex.
-          let taskPromise;
-          taskPromise = computeManager.computeDifferential(valuesA, valuesB, method)
-            .then((deResult) => {
-              if ((deResult.nA ?? 0) < minCells || (deResult.nB ?? 0) < minCells) {
-                resultsByIndex[i] = {
-                  gene,
-                  error: `Insufficient valid cells (A: ${deResult.nA}, B: ${deResult.nB})`,
-                  meanA: deResult.meanA,
-                  meanB: deResult.meanB,
-                  log2FoldChange: NaN,
-                  pValue: NaN,
-                  statistic: NaN,
-                  nA: deResult.nA,
-                  nB: deResult.nB,
-                  method
-                };
-                return;
-              }
-              resultsByIndex[i] = { gene, ...deResult };
-            })
-            .catch((err) => {
-              resultsByIndex[i] = {
-                gene,
-                error: err?.message || String(err),
-                meanA: NaN,
-                meanB: NaN,
-                log2FoldChange: NaN,
-                pValue: NaN
-              };
-            })
-            .finally(() => {
-              inFlight.delete(taskPromise);
-              markCompleted();
-            });
-
-          inFlight.add(taskPromise);
-        } catch (err) {
-          resultsByIndex[i] = {
+        if (nA < minCells || nB < minCells) {
+          resultsByIndex[index] = {
             gene,
-            error: err?.message || String(err),
-            meanA: NaN,
-            meanB: NaN,
+            error: `Insufficient cells (A: ${nA}, B: ${nB})`,
+            meanA: nA > 0 ? mean(valuesA) : NaN,
+            meanB: nB > 0 ? mean(valuesB) : NaN,
             log2FoldChange: NaN,
-            pValue: NaN
+            pValue: NaN,
+            nA,
+            nB
           };
-          markCompleted();
-        } finally {
-          // Free the raw per-cell array when we loaded it just for this analysis.
-          // (We only keep the per-group gathered arrays, which are released per-gene.)
-          if (!wasLoaded && !didUnload) {
-            this.dataLayer.unloadGeneExpression(gene, { preserveActive: true });
-            this.dataLayer.invalidateVariable('gene_expression', gene);
-          }
+          progressTracker.itemComplete();
+          continue;
         }
 
-        // Yield periodically to keep UI responsive (CPU fallback / large groups)
-        if (i > 0 && i % 25 === 0) {
-          await new Promise(resolve => setTimeout(resolve, 0));
-        }
+        // Fire-and-forget compute on worker
+        let taskPromise;
+        taskPromise = computeManager.computeDifferential(valuesA, valuesB, method)
+          .then((deResult) => {
+            if ((deResult.nA ?? 0) < minCells || (deResult.nB ?? 0) < minCells) {
+              resultsByIndex[index] = {
+                gene,
+                error: `Insufficient valid cells (A: ${deResult.nA}, B: ${deResult.nB})`,
+                meanA: deResult.meanA,
+                meanB: deResult.meanB,
+                log2FoldChange: NaN,
+                pValue: NaN,
+                statistic: NaN,
+                nA: deResult.nA,
+                nB: deResult.nB,
+                method
+              };
+              return;
+            }
+            resultsByIndex[index] = { gene, ...deResult };
+          })
+          .catch((err) => {
+            resultsByIndex[index] = {
+              gene,
+              error: err?.message || String(err),
+              meanA: NaN,
+              meanB: NaN,
+              log2FoldChange: NaN,
+              pValue: NaN
+            };
+          })
+          .finally(() => {
+            inFlight.delete(taskPromise);
+            progressTracker.itemComplete();
+          });
+
+        inFlight.add(taskPromise);
       }
 
       // Wait for all pending worker computations
@@ -481,10 +424,8 @@ export class MultiVariableAnalysis {
         pValue: NaN
       }));
 
-      this._notifications.updateProgress(notificationId, 96, {
-        message: 'Applying multiple testing correction...'
-      });
-      if (onProgress) onProgress(96);
+      // Move to next phase
+      progressTracker.nextPhase('Applying multiple testing correction...');
 
       // Apply multiple testing correction (Benjamini-Hochberg)
       const correctedResults = this._benjaminiHochberg(results);
@@ -510,9 +451,8 @@ export class MultiVariableAnalysis {
       ).length;
 
       const duration = performance.now() - startTime;
-
-      this._notifications.complete(notificationId,
-        `DE analysis: ${significantCount} significant (${(duration / 1000).toFixed(1)}s)`
+      const stats = progressTracker.complete(
+        `${significantCount} significant genes found (${(duration / 1000).toFixed(1)}s)`
       );
 
       return {
@@ -525,16 +465,20 @@ export class MultiVariableAnalysis {
           method,
           pageA,
           pageB,
-          duration
+          duration,
+          // Include performance stats
+          throughput: stats.throughputPerSecond,
+          batchConfig: effectiveBatchConfig
         },
         metadata: {
           pageAName: pageAInfo.name || pageA,
-          pageBName: pageBInfo.name || pageB
+          pageBName: pageBInfo.name || pageB,
+          recommendedSettings: recommended
         }
       };
 
     } catch (error) {
-      this._notifications.fail(notificationId, `DE analysis failed: ${error.message}`);
+      progressTracker.fail(`DE analysis failed: ${error.message}`);
       throw error;
     }
   }
