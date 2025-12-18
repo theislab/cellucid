@@ -1266,6 +1266,78 @@ class DataState {
     return field._loadingPromise;
   }
 
+  /**
+   * Unload a var field (gene) to free memory.
+   *
+   * Note: Genes loaded for bulk analyses (e.g., differential expression) can otherwise
+   * accumulate in memory because loaded arrays are referenced from `varData.fields`.
+   *
+   * @param {number} fieldIndex - Index of the field in varData.fields
+   * @param {Object} [options]
+   * @param {boolean} [options.preserveActive=true] - If true, do not unload an active gene field
+   * @returns {boolean} True if unloaded
+   */
+  unloadVarField(fieldIndex, options = {}) {
+    const { preserveActive = true } = options;
+
+    if (!Number.isInteger(fieldIndex) || fieldIndex < 0) return false;
+
+    const isActiveInCurrent =
+      this.activeFieldSource === 'var' && this.activeVarFieldIndex === fieldIndex;
+
+    if (preserveActive && isActiveInCurrent) {
+      return false;
+    }
+
+    // If this field is active in any saved view context, optionally preserve it too.
+    if (preserveActive) {
+      for (const ctx of this.viewContexts.values()) {
+        if (!ctx) continue;
+        if (ctx.activeFieldSource === 'var' && ctx.activeVarFieldIndex === fieldIndex) {
+          return false;
+        }
+      }
+    }
+
+    const field = this.varData?.fields?.[fieldIndex];
+    if (!field) return false;
+
+    const cacheKey = field.key || String(fieldIndex);
+
+    // Clear LRU reference first so it doesn't keep the ArrayBuffer alive.
+    this._varFieldDataCache?.delete?.(cacheKey);
+
+    const clearFieldState = (f) => {
+      if (!f) return;
+      f.values = null;
+      f.loaded = false;
+      f._loadingPromise = null;
+    };
+
+    // Clear from current varData
+    clearFieldState(field);
+
+    // Clear from all stored view contexts (they clone field objects but may share values refs)
+    for (const ctx of this.viewContexts.values()) {
+      const ctxField = ctx?.varData?.fields?.[fieldIndex];
+      if (!ctxField) continue;
+      if ((ctxField.key || String(fieldIndex)) === cacheKey) {
+        clearFieldState(ctxField);
+      }
+    }
+
+    // If the gene was active and we were asked to unload anyway, reset active state.
+    if (isActiveInCurrent && !preserveActive && typeof this.clearActiveField === 'function') {
+      try {
+        this.clearActiveField();
+      } catch (err) {
+        console.warn('[DataState] Failed to clear active field after unload:', err);
+      }
+    }
+
+    return true;
+  }
+
   setActiveField(fieldIndex) {
     if (!this.obsData || !this.obsData.fields || !this.obsData.fields[fieldIndex]) return null;
     this.activeFieldIndex = fieldIndex;

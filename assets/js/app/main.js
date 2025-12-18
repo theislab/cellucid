@@ -8,9 +8,9 @@ import { getNotificationCenter } from './notification-center.js';
 import {
   loadObsJson,
   loadObsManifest,
-  loadObsFieldData,
+  createObsFieldLoader,
   loadVarManifest,
-  loadVarFieldData,
+  createVarFieldLoader,
   loadConnectivityManifest,
   hasEdgeFormat,
   loadEdges,
@@ -27,6 +27,8 @@ import { formatCellCount as formatNumber } from '../data/data-source.js';
 import { createComparisonModule } from './analysis/comparison-module.js';
 
 console.log('=== CELLUCID STARTING ===');
+
+const FAST_BINARY_FETCH_INIT = { cache: 'force-cache' };
 
 // ============================================================================
 // Onboarding & UX (Welcome Modal, Error Modal, Keyboard Shortcuts)
@@ -610,7 +612,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     async function loadObsManifestWithFallback() {
       try {
         const manifest = await loadObsManifest(getObsManifestUrl());
-        state.setFieldLoader((field) => loadObsFieldData(getObsManifestUrl(), field));
+        state.setFieldLoader(createObsFieldLoader(getObsManifestUrl(), { fetchInit: FAST_BINARY_FETCH_INIT }));
         return manifest;
       } catch (err) {
         if (err?.status === 404) {
@@ -686,7 +688,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
     // Set up var data if loaded
     if (varManifest) {
-      state.setVarFieldLoader((field) => loadVarFieldData(getVarManifestUrl(), field));
+      state.setVarFieldLoader(createVarFieldLoader(getVarManifestUrl(), { fetchInit: FAST_BINARY_FETCH_INIT }));
       state.initVarData(varManifest);
       console.log(`Loaded var manifest with ${varManifest?.fields?.length || 0} genes.`);
     }
@@ -786,7 +788,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
         // Set up var data if loaded
         if (nextVarManifest) {
-          state.setVarFieldLoader((field) => loadVarFieldData(getVarManifestUrl(), field));
+          state.setVarFieldLoader(createVarFieldLoader(getVarManifestUrl(), { fetchInit: FAST_BINARY_FETCH_INIT }));
           state.initVarData(nextVarManifest);
           console.log(`[Main] Reloaded var manifest with ${nextVarManifest?.fields?.length || 0} genes.`);
         } else {

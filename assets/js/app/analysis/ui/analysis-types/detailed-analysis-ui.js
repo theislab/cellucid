@@ -210,7 +210,9 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       selectedIds: this._selectedPages,
       onChange: this._handlePageChange,
       onColorChange: this._handlePageColorChange,
-      customColors: this._customPageColors
+      customColors: this._customPageColors,
+      includeDerivedPages: true,
+      getCellCountForPageId: (pageId) => this.dataLayer.getCellCountForPageId(pageId)
     });
     this._controlsContainer.appendChild(pageSelect);
     this._pageSelectContainer = pageSelect;

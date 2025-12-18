@@ -10,6 +10,8 @@
 
 import { getPageColor } from '../../core/plugin-contract.js';
 import { NONE_VALUE, formatCount, getCellCountForPage } from '../../shared/dom-utils.js';
+import { deriveRestOfColor } from '../../shared/color-utils.js';
+import { expandPagesWithDerived } from '../../shared/page-derivation-utils.js';
 
 // =============================================================================
 // PLOT REGISTRY - Imported from centralized location
@@ -266,7 +268,15 @@ export function createGeneExpressionSelector(options = {}) {
  * @returns {HTMLElement}
  */
 export function createPageSelector(options = {}) {
-  const { pages = [], selectedIds = [], onChange, onColorChange, customColors = new Map() } = options;
+  const {
+    pages = [],
+    selectedIds = [],
+    onChange,
+    onColorChange,
+    customColors = new Map(),
+    includeDerivedPages = false,
+    getCellCountForPageId = null
+  } = options;
 
   const container = document.createElement('div');
   container.className = 'control-block analysis-page-selector';
@@ -292,18 +302,41 @@ export function createPageSelector(options = {}) {
   const tabsContainer = document.createElement('div');
   tabsContainer.className = 'analysis-page-tabs';
 
+  const baseIndexById = new Map();
+  pages.forEach((p, idx) => {
+    if (p?.id) baseIndexById.set(p.id, idx);
+  });
+
+  const displayPages = includeDerivedPages
+    ? expandPagesWithDerived(pages, { includeRestOf: true })
+    : pages;
+
   let selected = new Set(selectedIds);
 
   const renderTabs = () => {
     tabsContainer.innerHTML = '';
 
-    pages.forEach((page, index) => {
+    displayPages.forEach((page, index) => {
       const isSelected = selected.has(page.id);
-      const cellCount = getCellCountForPage(page);
-      const currentColor = customColors.get(page.id) || getPageColor(index);
+      const derived = page?._derived || null;
+      const baseId = derived?.baseId || page.id;
+      const baseIndex = baseIndexById.get(baseId) ?? index;
+
+      const cellCount = typeof getCellCountForPageId === 'function'
+        ? getCellCountForPageId(page.id)
+        : getCellCountForPage(page);
+
+      const baseColor = customColors.get(baseId) || getPageColor(baseIndex);
+      const defaultColor = derived?.kind === 'rest_of'
+        ? deriveRestOfColor(baseColor)
+        : baseColor;
+
+      const currentColor = customColors.get(page.id) || defaultColor;
 
       const tab = document.createElement('div');
-      tab.className = 'analysis-page-tab' + (isSelected ? ' selected' : '');
+      tab.className = 'analysis-page-tab' +
+        (derived ? ' derived' : '') +
+        (isSelected ? ' selected' : '');
       tab.dataset.pageId = page.id;
 
       // Color swatch container (rectangular, matching categorical obs legend style)
@@ -348,6 +381,10 @@ export function createPageSelector(options = {}) {
         if (selected.has(page.id)) {
           selected.delete(page.id);
         } else {
+          // Ensure derived pages get a stable default color for plotting.
+          if (derived && !customColors.has(page.id)) {
+            customColors.set(page.id, currentColor);
+          }
           selected.add(page.id);
         }
         renderTabs();
@@ -365,13 +402,17 @@ export function createPageSelector(options = {}) {
       const selectAllBtn = document.createElement('button');
       selectAllBtn.type = 'button';
       selectAllBtn.className = 'btn-small';
-      selectAllBtn.textContent = selected.size === pages.length ? 'Deselect All' : 'Select All';
+      const baseIds = pages.map(p => p.id);
+      const allBaseSelected = baseIds.length > 0 && baseIds.every(id => selected.has(id));
+      selectAllBtn.textContent = (allBaseSelected && selected.size > 0) ? 'Deselect All' : 'Select All';
       selectAllBtn.addEventListener('click', (e) => {
         e.stopPropagation();
-        if (selected.size === pages.length) {
+        if (allBaseSelected) {
+          // Clear all (including derived selections) to match user expectations.
           selected.clear();
         } else {
-          selected = new Set(pages.map(p => p.id));
+          // Only select base pages to avoid accidentally selecting huge complements.
+          for (const id of baseIds) selected.add(id);
         }
         renderTabs();
         if (onChange) onChange(Array.from(selected));
@@ -422,22 +463,32 @@ export function createPageMultiSelect(options) {
  * @returns {HTMLElement}
  */
 export function createPageComparisonSelector(options = {}) {
-  const { pages = [], selectedIds = [], onChange, customColors = new Map() } = options;
+  const {
+    pages = [],
+    selectedIds = [],
+    onChange,
+    customColors = new Map(),
+    includeDerivedPages = true
+  } = options;
 
   const container = document.createElement('div');
   container.className = 'control-block page-comparison-selector';
 
-  // If fewer than 2 pages, show message
-  if (pages.length < 2) {
+  const selectablePages = includeDerivedPages
+    ? expandPagesWithDerived(pages, { includeRestOf: true })
+    : pages;
+
+  // If fewer than 2 selectable options, show message
+  if (selectablePages.length < 2) {
     const notice = document.createElement('div');
     notice.className = 'legend-help';
-    notice.textContent = 'Need at least 2 pages for comparison. Create highlight pages using the Highlighted Cells section above.';
+    notice.textContent = 'Need at least 1 page for comparison. Create a highlight page using the Highlighted Cells section above.';
     container.appendChild(notice);
     return container;
   }
 
-  // If exactly 2 pages, just show comparison display (no selection needed)
-  if (pages.length === 2) {
+  // If exactly 2 base pages and wildcards are disabled, just show comparison display (no selection needed)
+  if (!includeDerivedPages && pages.length === 2) {
     const comparisonDisplay = document.createElement('div');
     comparisonDisplay.className = 'de-page-info';
     const color0 = customColors.get(pages[0].id) || getPageColor(0);
@@ -463,12 +514,15 @@ export function createPageComparisonSelector(options = {}) {
   container.appendChild(label);
 
   // Initialize selection with first two if not already selected
-  let selectedA = selectedIds[0] || pages[0].id;
-  let selectedB = selectedIds[1] || (pages[1].id !== selectedA ? pages[1].id : pages[2]?.id || pages[0].id);
+  let selectedA = selectedIds[0] || pages[0]?.id || selectablePages[0]?.id;
+  let selectedB = selectedIds[1] ||
+    (pages.length > 1 && pages[1].id !== selectedA
+      ? pages[1].id
+      : selectablePages.find(p => p.id !== selectedA)?.id || selectedA);
 
   // Ensure selectedB is different from selectedA
   if (selectedB === selectedA) {
-    selectedB = pages.find(p => p.id !== selectedA)?.id || selectedA;
+    selectedB = selectablePages.find(p => p.id !== selectedA)?.id || selectedA;
   }
 
   const selectRow = document.createElement('div');
@@ -487,17 +541,31 @@ export function createPageComparisonSelector(options = {}) {
     const select = document.createElement('select');
     select.className = 'obs-select page-select';
 
-    pages.forEach((page) => {
+    const addOption = (page, parent) => {
       const option = document.createElement('option');
       option.value = page.id;
       option.textContent = page.name;
       option.selected = page.id === currentValue;
       // Disable the option if it's selected in the other dropdown
-      if (page.id === otherValue) {
-        option.disabled = true;
+      if (page.id === otherValue) option.disabled = true;
+      parent.appendChild(option);
+    };
+
+    const baseGroup = document.createElement('optgroup');
+    baseGroup.label = 'Pages';
+    pages.forEach((page) => addOption(page, baseGroup));
+    select.appendChild(baseGroup);
+
+    if (includeDerivedPages) {
+      const derivedGroup = document.createElement('optgroup');
+      derivedGroup.label = 'Wildcards';
+      selectablePages
+        .filter(p => p?._derived)
+        .forEach((page) => addOption(page, derivedGroup));
+      if (derivedGroup.children.length > 0) {
+        select.appendChild(derivedGroup);
       }
-      select.appendChild(option);
-    });
+    }
 
     select.addEventListener('change', () => {
       onSelect(select.value);

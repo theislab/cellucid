@@ -7,6 +7,7 @@ import { getDataSourceManager } from './data-source-manager.js';
 import { isLocalUserUrl, resolveUrl } from './data-source.js';
 import { getNotificationCenter } from '../app/notification-center.js';
 import { toUint32Array } from './sparse-utils.js';
+import { tryDequantizeToFloat32 } from './quantization-worker-pool.js';
 // Unified AnnData provider handles both h5ad and zarr sources
 import {
   isH5adActive,
@@ -142,10 +143,65 @@ function dequantize(quantized, minValue, maxValue, bits) {
   return result;
 }
 
+/**
+ * @typedef {'uint8'|'uint16'} QuantizedDType
+ */
 
-async function fetchOk(url) {
+const WORKER_DEQUANTIZE_MIN_BYTES = 256 * 1024;
+
+/**
+ * Dequantize quantized uint8/uint16 values into Float32Array, preferring worker decode.
+ * IMPORTANT: worker decode transfers the input ArrayBuffer; if worker decode fails, callers
+ * should provide refetchBuffer() so we can safely fall back to sync decode.
+ *
+ * @param {Object} options
+ * @param {ArrayBuffer} options.buffer
+ * @param {QuantizedDType} options.dtype
+ * @param {number} options.minValue
+ * @param {number} options.maxValue
+ * @param {8|16} options.bits
+ * @param {string} [options.urlForError]
+ * @param {(() => Promise<ArrayBuffer>)} [options.refetchBuffer]
+ * @returns {Promise<Float32Array>}
+ */
+async function dequantizeToFloat32(options) {
+  const { buffer, dtype, minValue, maxValue, bits, urlForError, refetchBuffer } = options || {};
+
+  if (!(buffer instanceof ArrayBuffer)) {
+    throw new Error('dequantizeToFloat32: missing ArrayBuffer');
+  }
+  if (dtype !== 'uint8' && dtype !== 'uint16') {
+    throw new Error(`dequantizeToFloat32: unsupported dtype "${String(dtype)}"`);
+  }
+
+  const shouldTryWorker = buffer.byteLength >= WORKER_DEQUANTIZE_MIN_BYTES;
+  if (shouldTryWorker) {
+    try {
+      const decoded = await tryDequantizeToFloat32({ buffer, dtype, minValue, maxValue, bits });
+      if (decoded) return decoded;
+    } catch (err) {
+      console.warn('[data-loaders] Worker dequantize failed:', urlForError || '(buffer)', err);
+      if (typeof refetchBuffer === 'function') {
+        const fresh = await refetchBuffer();
+        const raw = dtype === 'uint8' ? new Uint8Array(fresh) : new Uint16Array(fresh);
+        return dequantize(raw, minValue, maxValue, bits);
+      }
+      throw err;
+    }
+  }
+
+  const raw = dtype === 'uint8' ? new Uint8Array(buffer) : new Uint16Array(buffer);
+  return dequantize(raw, minValue, maxValue, bits);
+}
+
+
+/**
+ * @param {string} url
+ * @param {RequestInit} [init]
+ */
+async function fetchOk(url, init) {
   const resolvedUrl = await resolveAnyUrl(url);
-  const response = await fetch(resolvedUrl);
+  const response = await fetch(resolvedUrl, init);
   if (!response.ok) {
     const err = new Error('Failed to load ' + url + ': ' + response.statusText);
     err.status = response.status;
@@ -160,10 +216,11 @@ async function fetchOk(url) {
  * Supports local-user:// protocol for user directories.
  *
  * @param {string} url - URL to fetch
+ * @param {RequestInit} [init]
  * @returns {Promise<ArrayBuffer>} Decompressed binary data
  */
-async function fetchBinary(url) {
-  const response = await fetchOk(url);
+async function fetchBinary(url, init) {
+  const response = await fetchOk(url, init);
 
   // Check if this is a gzipped file by URL extension
   const isGzipped = url.endsWith('.gz');
@@ -204,9 +261,10 @@ async function fetchBinary(url) {
  * @param {string} url - URL to fetch
  * @param {string} displayName - Human-readable name for the notification
  * @param {boolean} showNotification - Whether to show notification (default: true)
+ * @param {RequestInit} [init]
  * @returns {Promise<ArrayBuffer>} Decompressed binary data
  */
-async function fetchBinaryWithProgress(url, displayName = null, showNotification = true) {
+async function fetchBinaryWithProgress(url, displayName = null, showNotification = true, init) {
   const notifications = getNotificationCenter();
   const name = displayName || url.split('/').pop().replace('.gz', '').replace('.bin', '');
   let trackerId = null;
@@ -217,7 +275,7 @@ async function fetchBinaryWithProgress(url, displayName = null, showNotification
 
   try {
     const resolvedUrl = await resolveAnyUrl(url);
-    const response = await fetch(resolvedUrl);
+    const response = await fetch(resolvedUrl, init);
 
     if (!response.ok) {
       const err = new Error('Failed to load ' + url + ': ' + response.statusText);
@@ -771,8 +829,10 @@ export async function loadObsManifest(url) {
  * @param {object} field - Field metadata from manifest
  * @returns {object} Loaded data with values/codes/outlierQuantiles
  */
-export async function loadObsFieldData(manifestUrl, field) {
+export async function loadObsFieldData(manifestUrl, field, options = {}) {
   if (!field) throw new Error('No field metadata provided for obs field fetch.');
+
+  const { fetchInit } = options || {};
 
   // Handle AnnData source (h5ad or zarr) - unified handling
   if (shouldUseAnnData(manifestUrl)) {
@@ -812,25 +872,32 @@ export async function loadObsFieldData(manifestUrl, field) {
   // Load continuous values
   if (field.valuesPath) {
     const url = resolveUrl(manifestUrl, field.valuesPath);
-    const buffer = await fetchBinary(url);
+    const buffer = await fetchBinary(url, fetchInit);
     const dtype = field.valuesDtype || 'float32';
-    const raw = typedArrayFromBuffer(buffer, dtype, url);
 
     // Check if quantized and needs dequantization
     if (field.quantized && (dtype === 'uint8' || dtype === 'uint16') &&
         field.minValue !== undefined && field.maxValue !== undefined) {
       const bits = field.quantizationBits || (dtype === 'uint8' ? 8 : 16);
-      outputs.values = dequantize(raw, field.minValue, field.maxValue, bits);
+      outputs.values = await dequantizeToFloat32({
+        buffer,
+        dtype,
+        minValue: field.minValue,
+        maxValue: field.maxValue,
+        bits,
+        urlForError: url,
+        refetchBuffer: () => fetchBinary(url, fetchInit)
+      });
     } else {
       // Non-quantized or already float32
-      outputs.values = raw;
+      outputs.values = typedArrayFromBuffer(buffer, dtype, url);
     }
   }
 
   // Load categorical codes
   if (field.codesPath) {
     const url = resolveUrl(manifestUrl, field.codesPath);
-    const buffer = await fetchBinary(url);
+    const buffer = await fetchBinary(url, fetchInit);
     const dtype = field.codesDtype || 'uint16';
     const raw = typedArrayFromBuffer(buffer, dtype, url);
 
@@ -851,21 +918,23 @@ export async function loadObsFieldData(manifestUrl, field) {
   // Load outlier quantiles
   if (field.outlierQuantilesPath) {
     const url = resolveUrl(manifestUrl, field.outlierQuantilesPath);
-    const buffer = await fetchBinary(url);
+    const buffer = await fetchBinary(url, fetchInit);
     const dtype = field.outlierDtype || 'float32';
-    const raw = typedArrayFromBuffer(buffer, dtype, url);
 
     // Check if quantized and needs dequantization
     if (field.outlierQuantized && (dtype === 'uint8' || dtype === 'uint16')) {
       const bits = dtype === 'uint8' ? 8 : 16;
-      outputs.outlierQuantiles = dequantize(
-        raw,
-        field.outlierMinValue !== undefined ? field.outlierMinValue : 0,
-        field.outlierMaxValue !== undefined ? field.outlierMaxValue : 1,
-        bits
-      );
+      outputs.outlierQuantiles = await dequantizeToFloat32({
+        buffer,
+        dtype,
+        minValue: field.outlierMinValue !== undefined ? field.outlierMinValue : 0,
+        maxValue: field.outlierMaxValue !== undefined ? field.outlierMaxValue : 1,
+        bits,
+        urlForError: url,
+        refetchBuffer: () => fetchBinary(url, fetchInit)
+      });
     } else {
-      outputs.outlierQuantiles = raw;
+      outputs.outlierQuantiles = typedArrayFromBuffer(buffer, dtype, url);
     }
   }
 
@@ -899,8 +968,10 @@ export async function loadVarManifest(url) {
  * @param {object} field - Field metadata from manifest
  * @returns {object} Loaded data with values as Float32Array
  */
-export async function loadVarFieldData(manifestUrl, field) {
+export async function loadVarFieldData(manifestUrl, field, options = {}) {
   if (!field) throw new Error('No field metadata provided for var field fetch.');
+
+  const { fetchInit } = options || {};
 
   // Handle AnnData source (h5ad or zarr) - unified handling
   if (shouldUseAnnData(manifestUrl)) {
@@ -913,21 +984,54 @@ export async function loadVarFieldData(manifestUrl, field) {
 
   if (field.valuesPath) {
     const url = resolveUrl(manifestUrl, field.valuesPath);
-    const buffer = await fetchBinary(url);
+    const buffer = await fetchBinary(url, fetchInit);
     const dtype = field.valuesDtype || 'float32';
-    const raw = typedArrayFromBuffer(buffer, dtype, url);
 
     // Check if quantized and needs dequantization
     if (field.quantized && (dtype === 'uint8' || dtype === 'uint16') &&
         field.minValue !== undefined && field.maxValue !== undefined) {
       const bits = field.quantizationBits || (dtype === 'uint8' ? 8 : 16);
-      outputs.values = dequantize(raw, field.minValue, field.maxValue, bits);
+      outputs.values = await dequantizeToFloat32({
+        buffer,
+        dtype,
+        minValue: field.minValue,
+        maxValue: field.maxValue,
+        bits,
+        urlForError: url,
+        refetchBuffer: () => fetchBinary(url, fetchInit)
+      });
     } else {
-      outputs.values = raw;
+      outputs.values = typedArrayFromBuffer(buffer, dtype, url);
     }
   }
 
   return outputs;
+}
+
+/**
+ * @typedef {{
+ *   fetchInit?: RequestInit
+ * }} FieldLoaderOptions
+ */
+
+/**
+ * Create a field loader closure with shared options (DRY).
+ * @param {string} manifestUrl
+ * @param {FieldLoaderOptions} [options]
+ * @returns {(field: any) => Promise<any>}
+ */
+export function createObsFieldLoader(manifestUrl, options = {}) {
+  return (field) => loadObsFieldData(manifestUrl, field, options);
+}
+
+/**
+ * Create a var field loader closure with shared options (DRY).
+ * @param {string} manifestUrl
+ * @param {FieldLoaderOptions} [options]
+ * @returns {(field: any) => Promise<any>}
+ */
+export function createVarFieldLoader(manifestUrl, options = {}) {
+  return (field) => loadVarFieldData(manifestUrl, field, options);
 }
 
 // Legacy loader kept for backward compatibility (single large JSON payload).

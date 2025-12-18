@@ -41,9 +41,9 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
    */
   static getRequirements() {
     return {
-      minPages: 2,
+      minPages: 1,
       maxPages: null, // Allow any number of pages; user selects which 2 to compare
-      description: 'Select at least 2 pages'
+      description: 'Select at least 1 page'
     };
   }
 
@@ -127,21 +127,21 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
 
     // Page comparison selector (handles 2+ pages elegantly)
     const pageSelector = createPageComparisonSelector({
-      pages: availablePages.length >= 2 ? availablePages : pages,
+      pages: availablePages.length > 0 ? availablePages : pages,
       selectedIds: this._comparisonPages.length === 2 ? this._comparisonPages : this._selectedPages.slice(0, 2),
       onChange: this._handleComparisonChange
     });
     wrapper.appendChild(pageSelector);
 
-    // Gene count selector
-    const geneCountSelect = createFormSelect('geneCount', [
-      { value: '50', label: 'Top 50 genes' },
-      { value: '100', label: 'Top 100 genes', selected: true },
-      { value: '250', label: 'Top 250 genes' },
-      { value: '500', label: 'Top 500 genes' },
-      { value: '-1', label: 'All genes (slow)' }
+    // Performance selector (parallelism)
+    const parallelismSelect = createFormSelect('parallelism', [
+      { value: 'auto', label: 'Auto (use worker pool)', selected: true },
+      { value: '1', label: '1× (lowest memory)' },
+      { value: '2', label: '2×' },
+      { value: '4', label: '4×' },
+      { value: '8', label: '8× (if available)' }
     ]);
-    wrapper.appendChild(createFormRow('Number of genes to test:', geneCountSelect));
+    wrapper.appendChild(createFormRow('Speed (parallelism):', parallelismSelect));
 
     // Method selector
     const methodSelect = createFormSelect('method', [
@@ -174,8 +174,9 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
    */
   _getFormValues() {
     const form = this._formContainer.querySelector('.analysis-form');
+    const parallelismRaw = form.querySelector('[name="parallelism"]')?.value || 'auto';
     return {
-      geneCount: parseInt(form.querySelector('[name="geneCount"]').value, 10),
+      parallelism: parallelismRaw === 'auto' ? 'auto' : parseInt(parallelismRaw, 10),
       method: form.querySelector('[name="method"]').value,
       pValueThreshold: parseFloat(form.querySelector('[name="pValueThreshold"]').value),
       fcThreshold: parseFloat(form.querySelector('[name="fcThreshold"]').value)
@@ -193,18 +194,13 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       ? this._comparisonPages
       : this._selectedPages.slice(0, 2);
 
-    // Get gene list
-    const allGenes = this.dataLayer.getAvailableVariables('gene_expression');
-    const geneList = formValues.geneCount === -1
-      ? null
-      : allGenes.slice(0, formValues.geneCount).map(g => g.key);
-
     // Run differential expression
     const deResults = await this.multiVariableAnalysis.differentialExpression({
       pageA,
       pageB,
-      geneList,
-      method: formValues.method || 'wilcox'
+      geneList: null, // Always test all genes; results are sorted so "top genes" naturally surface.
+      method: formValues.method || 'wilcox',
+      parallelism: formValues.parallelism
     });
 
     const pValueThreshold = Number.isFinite(formValues.pValueThreshold)

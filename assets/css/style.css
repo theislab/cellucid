@@ -3748,6 +3748,21 @@ body.dark-mode .notification-progress {
   border-color: #9ca3af;
 }
 
+/* Derived/wildcard pages (e.g., "Rest of Page 1") */
+.analysis-page-tab.derived {
+  background: #eef2ff;
+  border-color: #c7d2fe;
+}
+
+.analysis-page-tab.derived:hover {
+  background: #e0e7ff;
+  border-color: #a5b4fc;
+}
+
+.analysis-page-tab.derived .analysis-page-name {
+  font-style: italic;
+}
+
 /* Selected tabs are dark */
 .analysis-page-tab.selected {
   background: #111827;

@@ -23,6 +23,11 @@ import { getComputeManager } from '../compute/compute-manager.js';
 import { getNotificationCenter } from '../../notification-center.js';
 import { getMemoryMonitor } from '../shared/memory-monitor.js';
 import {
+  isRestOfPageId,
+  getBasePageIdFromRestOf,
+  getRestOfPageName
+} from '../shared/page-derivation-utils.js';
+import {
   loadAnalysisBulkData,
   loadLatentEmbeddings,
   loadAnalysisBulkObsData
@@ -66,6 +71,7 @@ import {
  * @property {DataType} type - Type of data to fetch
  * @property {string} variableKey - Variable key/name to fetch
  * @property {string[]} pageIds - Array of page IDs to include
+ * @property {boolean} [noCache=false] - If true, bypass DataLayer caches for this call
  */
 
 /**
@@ -397,6 +403,62 @@ export class DataLayer {
   }
 
   /**
+   * Get display information for a page ID (supports derived pages).
+   *
+   * @param {string} pageId
+   * @returns {{ id: string, name: string, derived?: { kind: string, baseId: string } } | null}
+   */
+  getPageInfo(pageId) {
+    if (!pageId) return null;
+
+    if (isRestOfPageId(pageId)) {
+      const baseId = getBasePageIdFromRestOf(pageId);
+      const basePage = baseId ? (this.getPages().find(p => p.id === baseId) || null) : null;
+      const baseName = basePage?.name || baseId || 'page';
+      return {
+        id: pageId,
+        name: getRestOfPageName(baseName),
+        derived: { kind: 'rest_of', baseId: baseId || '' }
+      };
+    }
+
+    const page = this.getPages().find(p => p.id === pageId) || null;
+    if (!page) return null;
+    return { id: pageId, name: page.name };
+  }
+
+  /**
+   * Get cell count for a page ID (supports derived pages).
+   * Useful for UI display without needing to build large derived index arrays.
+   *
+   * @param {string} pageId
+   * @returns {number}
+   */
+  getCellCountForPageId(pageId) {
+    if (!pageId) return 0;
+
+    if (isRestOfPageId(pageId)) {
+      const baseId = getBasePageIdFromRestOf(pageId);
+      const total = this.state?.pointCount || 0;
+      const baseCount = baseId ? this.getCellCountForPageId(baseId) : 0;
+      return Math.max(0, total - baseCount);
+    }
+
+    const page = this.getPages().find(p => p.id === pageId);
+    if (!page) return 0;
+
+    const indices = new Set();
+    for (const group of (page.highlightedGroups || [])) {
+      if (group.enabled === false) continue;
+      if (!group.cellIndices) continue;
+      for (const idx of group.cellIndices) {
+        indices.add(idx);
+      }
+    }
+    return indices.size;
+  }
+
+  /**
    * Get cell indices for a specific page
    *
    * @param {string} pageId - Page identifier
@@ -407,9 +469,46 @@ export class DataLayer {
    * console.log(`Page has ${cellIndices.length} cells`);
    */
   getCellIndicesForPage(pageId) {
-    const pages = this.state.getHighlightPages() || [];
-    const page = pages.find(p => p.id === pageId);
+    if (!pageId) return [];
 
+    // Derived "rest-of" page: complement of base page indices
+    if (isRestOfPageId(pageId)) {
+      const baseId = getBasePageIdFromRestOf(pageId);
+      if (!baseId) return [];
+
+      const total = this.state?.pointCount || 0;
+      if (!Number.isFinite(total) || total <= 0) {
+        console.warn(`[DataLayer] Cannot compute derived page indices without pointCount (pageId=${pageId})`);
+        return [];
+      }
+
+      const baseIndices = this.getCellIndicesForPage(baseId);
+      if (!baseIndices || baseIndices.length === 0) {
+        // Rest-of empty base page => all cells
+        const all = new Array(total);
+        for (let i = 0; i < total; i++) all[i] = i;
+        return all;
+      }
+
+      const complementCount = Math.max(0, total - baseIndices.length);
+      if (complementCount === 0) return [];
+
+      const complement = new Array(complementCount);
+      let write = 0;
+      let basePtr = 0;
+
+      for (let i = 0; i < total; i++) {
+        if (basePtr < baseIndices.length && baseIndices[basePtr] === i) {
+          basePtr++;
+          continue;
+        }
+        complement[write++] = i;
+      }
+
+      return complement;
+    }
+
+    const page = this.getPages().find(p => p.id === pageId);
     if (!page) {
       console.warn(`[DataLayer] Page not found: ${pageId}`);
       return [];
@@ -419,10 +518,9 @@ export class DataLayer {
     const cellIndices = new Set();
     for (const group of (page.highlightedGroups || [])) {
       if (group.enabled === false) continue;
-      if (group.cellIndices) {
-        for (const idx of group.cellIndices) {
-          cellIndices.add(idx);
-        }
+      if (!group.cellIndices) continue;
+      for (const idx of group.cellIndices) {
+        cellIndices.add(idx);
       }
     }
 
@@ -465,6 +563,78 @@ export class DataLayer {
     }
   }
 
+  // ===========================================================================
+  // GENE FIELD LIFECYCLE (MEMORY CONTROL)
+  // ===========================================================================
+
+  /**
+   * Ensure a gene expression field is loaded and return the raw per-cell values.
+   * This is useful for streaming/low-memory analyses that want to avoid building
+   * PageData objects and avoid repeated page-index computation.
+   *
+   * @param {string} geneKey
+   * @param {Object} [options]
+   * @param {boolean} [options.silent=true] - Suppress notifications
+   * @returns {Promise<{ fieldIndex: number, values: ArrayLike<number>, wasLoaded: boolean }>}
+   */
+  async ensureGeneExpressionLoaded(geneKey, options = {}) {
+    const { silent = true } = options;
+
+    const variableInfo = this.getVariableInfo('gene_expression', geneKey);
+    if (!variableInfo) {
+      throw new Error(`[DataLayer] Gene not found: ${geneKey}`);
+    }
+
+    const fields = this.state.varData?.fields;
+    if (!fields) {
+      throw new Error('[DataLayer] No var fields available (gene expression disabled)');
+    }
+
+    const fieldIndex = variableInfo._fieldIndex;
+    const field = fields[fieldIndex];
+    if (!field) {
+      throw new Error(`[DataLayer] Var field not found for gene: ${geneKey}`);
+    }
+
+    const wasLoaded = !!field.loaded;
+    await this._ensureFieldLoaded(field, fieldIndex, 'var', { silent });
+
+    return { fieldIndex, values: field.values, wasLoaded };
+  }
+
+  /**
+   * Unload a loaded gene expression field to free memory.
+   *
+   * @param {string} geneKey
+   * @param {Object} [options]
+   * @param {boolean} [options.preserveActive=true] - If true, do not unload an active gene field
+   * @returns {boolean} True if unloaded
+   */
+  unloadGeneExpression(geneKey, options = {}) {
+    const variableInfo = this.getVariableInfo('gene_expression', geneKey);
+    if (!variableInfo) return false;
+    const fieldIndex = variableInfo._fieldIndex;
+    if (typeof this.state.unloadVarField !== 'function') return false;
+    return this.state.unloadVarField(fieldIndex, options);
+  }
+
+  /**
+   * Invalidate cached PageData entries for a specific variable.
+   * Useful after unloading a field to ensure no large arrays remain referenced by caches.
+   *
+   * @param {DataType} type
+   * @param {string} variableKey
+   */
+  invalidateVariable(type, variableKey) {
+    if (!this._dataCache) return;
+    const prefix = `${type}:${variableKey}:`;
+    for (const key of this._dataCache.keys()) {
+      if (key.startsWith(prefix)) {
+        this._dataCache.delete(key);
+      }
+    }
+  }
+
   /**
    * Fetch data for a specific variable and page(s)
    *
@@ -487,7 +657,7 @@ export class DataLayer {
    * }
    */
   async getDataForPages(options) {
-    const { type, variableKey, pageIds, silent = false } = options;
+    const { type, variableKey, pageIds, silent = false, noCache = false } = options;
 
     if (!pageIds || pageIds.length === 0) {
       return [];
@@ -496,10 +666,11 @@ export class DataLayer {
     // Keep cache keys correct as highlight pages change.
     // Without refreshing page versions, cached results can become stale and plots lag behind
     // (e.g., a newly created page remains "empty" in analysis until another page change occurs).
-    this.refreshPageVersions(Array.from(new Set(pageIds)));
+    const uniquePageIds = Array.from(new Set(pageIds));
+    this.refreshPageVersions(uniquePageIds.filter(id => !isRestOfPageId(id)));
 
     // Check cache first (if enabled)
-    if (this._dataCache) {
+    if (this._dataCache && !noCache) {
       const cacheKey = this._getCacheKey(options);
 
       if (this._dataCache.has(cacheKey)) {
@@ -616,11 +787,10 @@ export class DataLayer {
 
     // Process each page
     const results = [];
-    const allPages = this.getPages();
 
     for (const pageId of pageIds) {
-      const page = allPages.find(p => p.id === pageId);
-      if (!page) {
+      const pageInfo = this.getPageInfo(pageId);
+      if (!pageInfo) {
         console.warn(`[DataLayer] Page not found: ${pageId}`);
         continue;
       }
@@ -630,7 +800,7 @@ export class DataLayer {
       if (cellIndices.length === 0) {
         results.push({
           pageId,
-          pageName: page.name,
+          pageName: pageInfo.name,
           variableInfo: { ...variableInfo },
           values: [],
           cellIndices: [],
@@ -664,7 +834,7 @@ export class DataLayer {
 
       results.push({
         pageId,
-        pageName: page.name,
+        pageName: pageInfo.name,
         variableInfo: {
           ...variableInfo,
           categories: field.kind === 'category' ? categories : undefined
@@ -925,6 +1095,16 @@ export class DataLayer {
     if (!this._pageVersions) {
       return `${pageId}:notrack`;
     }
+
+    // Derived pages are not stored in the version map; derive a stable version cheaply.
+    if (isRestOfPageId(pageId)) {
+      const baseId = getBasePageIdFromRestOf(pageId);
+      const total = this.state?.pointCount || 0;
+      const baseCount = baseId ? this.getCellCountForPageId(baseId) : 0;
+      const count = Math.max(0, total - baseCount);
+      return `${pageId}:${count}`;
+    }
+
     if (!this._pageVersions.has(pageId)) {
       return this._updatePageVersion(pageId);
     }
@@ -951,7 +1131,8 @@ export class DataLayer {
   refreshPageVersions(pageIds = null) {
     if (!this._pageVersions) return;
 
-    const idsToRefresh = pageIds || this.getPages().map(p => p.id);
+    const idsToRefresh = (pageIds || this.getPages().map(p => p.id))
+      .filter(id => !isRestOfPageId(id));
 
     for (const pageId of idsToRefresh) {
       const oldHash = this._pageVersions.get(pageId);
@@ -1210,7 +1391,7 @@ export class DataLayer {
 
     // Ensure bulk gene cache stays correct as highlight pages change.
     // (If versions are stale, bulk caches can return results for an old page membership.)
-    this.refreshPageVersions(Array.from(new Set(pageIds)));
+    this.refreshPageVersions(Array.from(new Set(pageIds)).filter(id => !isRestOfPageId(id)));
 
     const cacheKey = this._getBulkGeneCacheKey(pageIds);
 

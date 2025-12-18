@@ -286,7 +286,7 @@ export class ComparisonModule {
       id: 'differential',
       name: 'Differential Expression',
       factory: createDEAnalysisUI,
-      minPages: 2,
+      minPages: 1,
       maxPages: null, // User can select which 2 pages to compare from available pages
       icon: 'bar-chart',
       tooltip: 'Find differentially expressed genes'

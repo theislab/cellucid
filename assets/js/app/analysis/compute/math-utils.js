@@ -343,35 +343,29 @@ export function mannWhitneyU(group1, group2) {
     return { statistic: NaN, pValue: NaN };
   }
 
-  // Combine and rank
-  const combined = [
-    ...group1.map(v => ({ v, group: 1 })),
-    ...group2.map(v => ({ v, group: 2 }))
-  ];
+  // Combine and rank (TypedArray-safe; avoids `.map()` which behaves differently on TypedArrays).
+  // Sort an index array so we don't allocate per-element objects.
+  const n = n1 + n2;
+  const order = new Array(n);
+  for (let i = 0; i < n; i++) order[i] = i;
 
-  combined.sort((a, b) => a.v - b.v);
+  const valueAt = (idx) => (idx < n1 ? group1[idx] : group2[idx - n1]);
 
-  // Assign ranks with tie handling
-  const ranks = new Array(combined.length);
+  order.sort((a, b) => valueAt(a) - valueAt(b));
+
+  // Rank-sum for group 1 with tie handling (no separate ranks[] allocation).
+  let R1 = 0;
   let i = 0;
-  while (i < combined.length) {
-    let j = i;
-    while (j < combined.length && combined[j].v === combined[i].v) {
-      j++;
-    }
-    const avgRank = (i + j + 1) / 2;
+  while (i < n) {
+    let j = i + 1;
+    const v = valueAt(order[i]);
+    while (j < n && valueAt(order[j]) === v) j++;
+
+    const avgRank = (i + j + 1) / 2; // ranks are 1-based
     for (let k = i; k < j; k++) {
-      ranks[k] = avgRank;
+      if (order[k] < n1) R1 += avgRank;
     }
     i = j;
-  }
-
-  // Calculate rank sum for group 1
-  let R1 = 0;
-  for (let k = 0; k < combined.length; k++) {
-    if (combined[k].group === 1) {
-      R1 += ranks[k];
-    }
   }
 
   const U1 = R1 - (n1 * (n1 + 1)) / 2;

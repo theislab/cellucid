@@ -12,6 +12,9 @@
 
 import { getComputeManager } from '../compute/compute-manager.js';
 import { getNotificationCenter } from '../../notification-center.js';
+import { getBasePageIdFromRestOf, isRestOfPageId } from '../shared/page-derivation-utils.js';
+import { gatherComplementFloat32, gatherFloat32 } from '../shared/typed-array-utils.js';
+import { waitForAvailableSlot } from '../shared/concurrency-utils.js';
 
 /**
  * Multi-Variable Analysis class
@@ -180,6 +183,8 @@ export class MultiVariableAnalysis {
    * @param {string[]} [options.geneList] - Subset of genes to test (null = all)
    * @param {string} [options.method='wilcox'] - 'wilcox' or 'ttest'
    * @param {number} [options.minCells=10] - Minimum cells required per group
+   * @param {number|'auto'} [options.parallelism='auto'] - Max concurrent genes in-flight (worker-backed)
+   * @param {number} [options.maxInFlightBytes=67108864] - Soft memory budget for in-flight gene payloads
    * @param {Function} [options.onProgress] - Progress callback
    * @returns {Promise<Object>} Differential expression results
    */
@@ -190,6 +195,8 @@ export class MultiVariableAnalysis {
       geneList = null,
       method = 'wilcox',
       minCells = 10,
+      parallelism = 'auto',
+      maxInFlightBytes = 64 * 1024 * 1024,
       onProgress
     } = options;
 
@@ -202,7 +209,7 @@ export class MultiVariableAnalysis {
       type: 'progress',
       category: 'calculation',
       title: 'Differential Expression',
-      message: 'Loading gene expression data...',
+      message: 'Preparing differential expression...',
       progress: 0
     });
 
@@ -212,106 +219,272 @@ export class MultiVariableAnalysis {
       // Get available genes
       const allGenes = this.dataLayer.getAvailableVariables('gene_expression');
       const genesToTest = geneList
-        ? allGenes.filter(g => geneList.includes(g.key))
+        ? (() => {
+          const keep = new Set(geneList);
+          return allGenes.filter(g => keep.has(g.key));
+        })()
         : allGenes;
 
       if (genesToTest.length === 0) {
         throw new Error('No genes available for analysis');
       }
 
-      this._notifications.updateProgress(notificationId, 5, {
-        message: `Analyzing ${genesToTest.length} genes...`
-      });
+      const pageAInfo = this.dataLayer.getPageInfo(pageA) || { id: pageA, name: pageA };
+      const pageBInfo = this.dataLayer.getPageInfo(pageB) || { id: pageB, name: pageB };
 
-      // Fetch bulk gene expression data
-      const geneData = await this.dataLayer.fetchBulkGeneExpression({
-        pageIds: [pageA, pageB],
-        geneList: genesToTest.map(g => g.key),
-        onProgress: (p) => {
-          const adjustedProgress = 5 + (p * 0.5); // 5-55%
-          this._notifications.updateProgress(notificationId, adjustedProgress, {
-            message: `Loading gene data (${Math.round(p)}%)...`
-          });
-          if (onProgress) onProgress(adjustedProgress);
+      /**
+       * @typedef {{
+       *   kind: 'explicit',
+       *   pageId: string,
+       *   pageName: string,
+       *   cellIndices: number[]
+       * } | {
+       *   kind: 'rest_of',
+       *   pageId: string,
+       *   pageName: string,
+       *   baseId: string,
+       *   excludedCellIndices: number[]
+       * }} DEGroupSpec
+       */
+
+      /**
+       * @param {string} pageId
+       * @returns {DEGroupSpec}
+       */
+      const buildGroupSpec = (pageId) => {
+        const pageInfo = this.dataLayer.getPageInfo(pageId);
+        const pageName = pageInfo?.name || pageId;
+
+        if (isRestOfPageId(pageId)) {
+          const baseId = getBasePageIdFromRestOf(pageId);
+          if (!baseId) {
+            return { kind: 'explicit', pageId, pageName, cellIndices: [] };
+          }
+          const excludedCellIndices = this.dataLayer.getCellIndicesForPage(baseId);
+          return { kind: 'rest_of', pageId, pageName, baseId, excludedCellIndices };
         }
+
+        const cellIndices = this.dataLayer.getCellIndicesForPage(pageId);
+        return { kind: 'explicit', pageId, pageName, cellIndices };
+      };
+
+      const groupA = buildGroupSpec(pageA);
+      const groupB = buildGroupSpec(pageB);
+
+      const pointCount = Number.isFinite(this.dataLayer?.state?.pointCount)
+        ? this.dataLayer.state.pointCount
+        : null;
+
+      const getGroupSize = (group, totalCells) => {
+        if (group.kind === 'rest_of') {
+          return Number.isFinite(totalCells) ? Math.max(0, totalCells - group.excludedCellIndices.length) : null;
+        }
+        return group.cellIndices.length;
+      };
+
+      const groupASize = getGroupSize(groupA, pointCount);
+      const groupBSize = getGroupSize(groupB, pointCount);
+
+      this._notifications.updateProgress(notificationId, 5, {
+        message: `Preparing groups: ${pageAInfo.name} (${groupASize ?? '—'}) vs ${pageBInfo.name} (${groupBSize ?? '—'})`
       });
+      if (onProgress) onProgress(5);
 
       // Compute differential expression for each gene
-      const results = [];
       const computeManager = await this._getComputeManager();
-      const batchSize = 20;
 
-      for (let i = 0; i < genesToTest.length; i += batchSize) {
-        const batch = genesToTest.slice(i, i + batchSize);
-        const batchProgress = 55 + ((i / genesToTest.length) * 40); // 55-95%
+      const workerPoolSize = computeManager.getStatus?.().worker?.stats?.poolSize || 1;
+      const workersAvailable = typeof computeManager.isWorkerAvailable === 'function'
+        ? computeManager.isWorkerAvailable()
+        : false;
 
-        this._notifications.updateProgress(notificationId, batchProgress, {
-          message: `Computing statistics (${i + 1}/${genesToTest.length})...`
-        });
+      const groupTotalSize = Number.isFinite(groupASize) && Number.isFinite(groupBSize)
+        ? groupASize + groupBSize
+        : null;
 
-        if (onProgress) onProgress(batchProgress);
+      // Adaptive in-flight parallelism:
+      // - saturate worker pool by default
+      // - clamp by a soft memory budget based on group sizes
+      let maxInFlightGenes = 1;
+      if (workersAvailable && workerPoolSize > 0) {
+        const requested = parallelism === 'auto' ? workerPoolSize : Number(parallelism);
+        maxInFlightGenes = Number.isFinite(requested) && requested > 0 ? Math.floor(requested) : 1;
 
-        // Process batch in parallel
-        const batchResults = await Promise.all(batch.map(async (geneInfo) => {
-          const gene = geneInfo.key;
-          const genePageData = geneData[gene];
+        if (Number.isFinite(groupTotalSize) && groupTotalSize > 0) {
+          const baseBytes = groupTotalSize * 4; // Float32Array bytes
+          const overheadFactor = method === 'wilcox' ? 5 : 2; // filtering + test overhead (rough)
+          const estimatedBytesPerGene = baseBytes * overheadFactor;
+          const budget = Number.isFinite(maxInFlightBytes) && maxInFlightBytes > 0
+            ? maxInFlightBytes
+            : 64 * 1024 * 1024;
+          const maxByMemory = Math.max(1, Math.floor(budget / Math.max(1, estimatedBytesPerGene)));
+          maxInFlightGenes = Math.min(maxInFlightGenes, maxByMemory);
+        } else {
+          // If we can't estimate payload size, stay conservative.
+          maxInFlightGenes = 1;
+        }
 
-          if (!genePageData) {
-            return {
-              gene,
-              error: 'No data available',
-              meanA: NaN,
-              meanB: NaN,
-              log2FoldChange: NaN,
-              pValue: NaN
-            };
+        maxInFlightGenes = Math.max(1, Math.min(maxInFlightGenes, workerPoolSize, 8));
+      }
+
+      this._notifications.updateProgress(notificationId, 10, {
+        message: `Analyzing ${genesToTest.length} genes (parallelism: ${maxInFlightGenes}×)...`
+      });
+      if (onProgress) onProgress(10);
+
+      /** @type {Array<Object|null>} */
+      const resultsByIndex = new Array(genesToTest.length).fill(null);
+      /** @type {Set<Promise<void>>} */
+      const inFlight = new Set();
+
+      let completedGenes = 0;
+      let lastProgressBucket = -1;
+
+      const updateProgressFromCompleted = () => {
+        const progress = 10 + ((completedGenes / genesToTest.length) * 85); // 10-95%
+        const bucket = Math.floor(progress);
+        if (bucket !== lastProgressBucket) {
+          lastProgressBucket = bucket;
+          this._notifications.updateProgress(notificationId, bucket, {
+            message: `Computing statistics (${completedGenes}/${genesToTest.length})...`
+          });
+          if (onProgress) onProgress(bucket);
+        }
+      };
+
+      const markCompleted = () => {
+        completedGenes++;
+        updateProgressFromCompleted();
+      };
+
+      for (let i = 0; i < genesToTest.length; i++) {
+        // Keep a bounded number of in-flight worker computations to control memory.
+        await waitForAvailableSlot(inFlight, maxInFlightGenes);
+
+        const gene = genesToTest[i].key;
+
+        let wasLoaded = true;
+        let didUnload = false;
+        try {
+          const geneField = await this.dataLayer.ensureGeneExpressionLoaded(gene, { silent: true });
+          wasLoaded = geneField.wasLoaded;
+          let rawValues = geneField.values;
+
+          // Gather expression values for each group (creates new arrays safe for worker transfer)
+          const valuesA = groupA.kind === 'rest_of'
+            ? gatherComplementFloat32(rawValues, groupA.excludedCellIndices)
+            : gatherFloat32(rawValues, groupA.cellIndices);
+          const valuesB = groupB.kind === 'rest_of'
+            ? gatherComplementFloat32(rawValues, groupB.excludedCellIndices)
+            : gatherFloat32(rawValues, groupB.cellIndices);
+
+          // Free the raw per-cell array as early as possible when we loaded it just for this analysis.
+          // We keep only the per-group gathered arrays.
+          if (!wasLoaded) {
+            didUnload = true;
+            this.dataLayer.unloadGeneExpression(gene, { preserveActive: true });
+            this.dataLayer.invalidateVariable('gene_expression', gene);
           }
+          rawValues = null;
 
-          const dataA = genePageData[pageA];
-          const dataB = genePageData[pageB];
+          const nA = valuesA.length;
+          const nB = valuesB.length;
 
-          if (!dataA || !dataB) {
-            return {
+          if (nA < minCells || nB < minCells) {
+            resultsByIndex[i] = {
               gene,
-              error: 'Missing page data',
-              meanA: NaN,
-              meanB: NaN,
-              log2FoldChange: NaN,
-              pValue: NaN
-            };
-          }
-
-          // Filter to valid values
-          const valsA = dataA.values.filter(v => typeof v === 'number' && Number.isFinite(v));
-          const valsB = dataB.values.filter(v => typeof v === 'number' && Number.isFinite(v));
-
-          if (valsA.length < minCells || valsB.length < minCells) {
-            return {
-              gene,
-              error: `Insufficient cells (A: ${valsA.length}, B: ${valsB.length})`,
-              meanA: valsA.length > 0 ? mean(valsA) : NaN,
-              meanB: valsB.length > 0 ? mean(valsB) : NaN,
+              error: `Insufficient cells (A: ${nA}, B: ${nB})`,
+              meanA: nA > 0 ? mean(valuesA) : NaN,
+              meanB: nB > 0 ? mean(valuesB) : NaN,
               log2FoldChange: NaN,
               pValue: NaN,
-              nA: valsA.length,
-              nB: valsB.length
+              nA,
+              nB
             };
+            markCompleted();
+            continue;
           }
 
-          // Compute differential expression using worker
-          const deResult = await computeManager.computeDifferential(valsA, valsB, method);
+          // Fire-and-forget compute on worker; completion updates resultsByIndex.
+          let taskPromise;
+          taskPromise = computeManager.computeDifferential(valuesA, valuesB, method)
+            .then((deResult) => {
+              if ((deResult.nA ?? 0) < minCells || (deResult.nB ?? 0) < minCells) {
+                resultsByIndex[i] = {
+                  gene,
+                  error: `Insufficient valid cells (A: ${deResult.nA}, B: ${deResult.nB})`,
+                  meanA: deResult.meanA,
+                  meanB: deResult.meanB,
+                  log2FoldChange: NaN,
+                  pValue: NaN,
+                  statistic: NaN,
+                  nA: deResult.nA,
+                  nB: deResult.nB,
+                  method
+                };
+                return;
+              }
+              resultsByIndex[i] = { gene, ...deResult };
+            })
+            .catch((err) => {
+              resultsByIndex[i] = {
+                gene,
+                error: err?.message || String(err),
+                meanA: NaN,
+                meanB: NaN,
+                log2FoldChange: NaN,
+                pValue: NaN
+              };
+            })
+            .finally(() => {
+              inFlight.delete(taskPromise);
+              markCompleted();
+            });
 
-          return {
+          inFlight.add(taskPromise);
+        } catch (err) {
+          resultsByIndex[i] = {
             gene,
-            ...deResult
+            error: err?.message || String(err),
+            meanA: NaN,
+            meanB: NaN,
+            log2FoldChange: NaN,
+            pValue: NaN
           };
-        }));
+          markCompleted();
+        } finally {
+          // Free the raw per-cell array when we loaded it just for this analysis.
+          // (We only keep the per-group gathered arrays, which are released per-gene.)
+          if (!wasLoaded && !didUnload) {
+            this.dataLayer.unloadGeneExpression(gene, { preserveActive: true });
+            this.dataLayer.invalidateVariable('gene_expression', gene);
+          }
+        }
 
-        results.push(...batchResults);
-
-        // Yield to event loop
-        await new Promise(resolve => setTimeout(resolve, 0));
+        // Yield periodically to keep UI responsive (CPU fallback / large groups)
+        if (i > 0 && i % 25 === 0) {
+          await new Promise(resolve => setTimeout(resolve, 0));
+        }
       }
+
+      // Wait for all pending worker computations
+      if (inFlight.size > 0) {
+        await Promise.all(inFlight);
+      }
+
+      const results = resultsByIndex.map((r, idx) => r || ({
+        gene: genesToTest[idx]?.key || `gene_${idx}`,
+        error: 'No result',
+        meanA: NaN,
+        meanB: NaN,
+        log2FoldChange: NaN,
+        pValue: NaN
+      }));
+
+      this._notifications.updateProgress(notificationId, 96, {
+        message: 'Applying multiple testing correction...'
+      });
+      if (onProgress) onProgress(96);
 
       // Apply multiple testing correction (Benjamini-Hochberg)
       const correctedResults = this._benjaminiHochberg(results);
@@ -355,8 +528,8 @@ export class MultiVariableAnalysis {
           duration
         },
         metadata: {
-          pageAName: geneData[genesToTest[0]?.key]?.[pageA]?.pageName || pageA,
-          pageBName: geneData[genesToTest[0]?.key]?.[pageB]?.pageName || pageB
+          pageAName: pageAInfo.name || pageA,
+          pageBName: pageBInfo.name || pageB
         }
       };
 
