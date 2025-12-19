@@ -49,6 +49,9 @@ export class DataSourceManager {
     /** @type {boolean} */
     this._initialized = false;
 
+    /** @type {string|null} */
+    this.lastLoadMethod = null;
+
     /** @type {Object<string, string>} Protocol handlers (protocol → sourceType) */
     this._protocolHandlers = { ...DataSourceManager.DEFAULT_PROTOCOL_HANDLERS };
   }
@@ -112,7 +115,11 @@ export class DataSourceManager {
       if (await demoSource.isAvailable()) {
         const defaultId = await demoSource.getDefaultDatasetId();
         if (defaultId) {
-          await this.switchToDataset('local-demo', defaultId, { silent: true });
+          const hasListeners = this._onDatasetChangeCallbacks.size > 0;
+          await this.switchToDataset('local-demo', defaultId, {
+            silent: !hasListeners,
+            loadMethod: 'default-demo'
+          });
         }
       }
     }
@@ -186,10 +193,11 @@ export class DataSourceManager {
    * @param {string} datasetId - Dataset ID
    * @param {Object} [options]
    * @param {boolean} [options.silent=false] - Don't notify listeners
+   * @param {string} [options.loadMethod] - Analytics hint for how the dataset was chosen
    * @returns {Promise<{baseUrl: string, metadata: DatasetMetadata}>}
    */
   async switchToDataset(sourceType, datasetId, options = {}) {
-    const { silent = false } = options;
+    const { silent = false, loadMethod = null } = options;
 
     const source = this.sources.get(sourceType);
     if (!source) {
@@ -225,6 +233,7 @@ export class DataSourceManager {
     this.activeSource = source;
     this.activeDatasetId = datasetId;
     this.activeDatasetMetadata = metadata;
+    this.lastLoadMethod = loadMethod || 'unspecified';
 
     console.log(`[DataSourceManager] Switched to dataset '${datasetId}' from '${sourceType}' (baseUrl: ${baseUrl})`);
 
@@ -236,7 +245,8 @@ export class DataSourceManager {
         metadata,
         baseUrl,
         previousSourceType,
-        previousDatasetId
+        previousDatasetId,
+        loadMethod
       });
     }
 
@@ -249,7 +259,7 @@ export class DataSourceManager {
    * @param {boolean} [options.silent=false] - Don't notify listeners
    */
   clearActiveDataset(options = {}) {
-    const { silent = false } = options;
+    const { silent = false, loadMethod = null } = options;
 
     if (!this.activeSource && !this.activeDatasetId) {
       return;
@@ -270,6 +280,7 @@ export class DataSourceManager {
     this.activeSource = null;
     this.activeDatasetId = null;
     this.activeDatasetMetadata = null;
+    this.lastLoadMethod = null;
 
     if (!silent) {
       this._notifyDatasetChange({
@@ -278,7 +289,8 @@ export class DataSourceManager {
         metadata: null,
         baseUrl: null,
         previousSourceType,
-        previousDatasetId
+        previousDatasetId,
+        loadMethod
       });
     }
   }
@@ -314,6 +326,14 @@ export class DataSourceManager {
    */
   getCurrentDatasetId() {
     return this.activeDatasetId;
+  }
+
+  /**
+   * Get the last recorded load method (for analytics)
+   * @returns {string|null}
+   */
+  getLastLoadMethod() {
+    return this.lastLoadMethod;
   }
 
   /**

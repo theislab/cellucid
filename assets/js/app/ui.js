@@ -2,6 +2,7 @@
 import { formatCellCount as formatDataNumber } from '../data/data-source.js';
 import { getNotificationCenter } from './notification-center.js';
 import { updateUrlForDataSource, clearUrlDataSource } from './url-state.js';
+import { DATA_LOAD_METHODS } from '../analytics/tracker.js';
 
 export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadActiveDataset }) {
   console.log('[UI] initUI called with dataSourceManager:', !!dataSourceManager);
@@ -5168,7 +5169,9 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
 
       showSessionStatus('Switching dataset...', false);
 
-      await dataSourceManager.switchToDataset(sourceType, datasetId);
+      await dataSourceManager.switchToDataset(sourceType, datasetId, {
+        loadMethod: DATA_LOAD_METHODS.DATASET_DROPDOWN
+      });
 
       // Local-user datasets must be loaded in-place to keep file handles alive
       if (sourceType === 'local-user') {
@@ -5321,7 +5324,9 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
 
         // Switch to the user data source
         try {
-          await dataSourceManager.switchToDataset('local-user', userSource.datasetId);
+          await dataSourceManager.switchToDataset('local-user', userSource.datasetId, {
+            loadMethod: DATA_LOAD_METHODS.LOCAL_PREPARED
+          });
           if (typeof reloadDataset === 'function') {
             await reloadDataset(metadata);
           }
@@ -5393,7 +5398,9 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
 
         // Switch to the user data source
         try {
-          await dataSourceManager.switchToDataset('local-user', userSource.datasetId);
+          await dataSourceManager.switchToDataset('local-user', userSource.datasetId, {
+            loadMethod: DATA_LOAD_METHODS.LOCAL_H5AD
+          });
           if (typeof reloadDataset === 'function') {
             await reloadDataset(metadata);
           }
@@ -5444,7 +5451,9 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
 
         // Switch to the user data source
         try {
-          await dataSourceManager.switchToDataset('local-user', userSource.datasetId);
+          await dataSourceManager.switchToDataset('local-user', userSource.datasetId, {
+            loadMethod: DATA_LOAD_METHODS.LOCAL_ZARR
+          });
           if (typeof reloadDataset === 'function') {
             await reloadDataset(metadata);
           }
@@ -5568,7 +5577,9 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
             notifications.complete(connectNotifId, `Connected - ${datasets.length} dataset(s) found`);
 
             // Switch to the first remote dataset
-            await dataSourceManager.switchToDataset('remote', datasets[0].id);
+            await dataSourceManager.switchToDataset('remote', datasets[0].id, {
+              loadMethod: DATA_LOAD_METHODS.REMOTE_CONNECT
+            });
 
             // Refresh the dataset dropdown
             if (typeof populateDatasetDropdown === 'function') {
@@ -5606,14 +5617,16 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
           const currentSource = dataSourceManager.getCurrentSourceType();
           if (currentSource === 'remote') {
             try {
-              const demoSource = dataSourceManager.getSource('local-demo');
-              if (demoSource) {
-                const defaultId = await demoSource.getDefaultDatasetId?.();
-                if (defaultId) {
-                  await dataSourceManager.switchToDataset('local-demo', defaultId);
-                  if (typeof populateDatasetDropdown === 'function') {
-                    populateDatasetDropdown();
-                  }
+                const demoSource = dataSourceManager.getSource('local-demo');
+                if (demoSource) {
+                  const defaultId = await demoSource.getDefaultDatasetId?.();
+                  if (defaultId) {
+                    await dataSourceManager.switchToDataset('local-demo', defaultId, {
+                      loadMethod: DATA_LOAD_METHODS.REMOTE_DISCONNECT_FALLBACK
+                    });
+                    if (typeof populateDatasetDropdown === 'function') {
+                      populateDatasetDropdown();
+                    }
                   if (reloadDataset) {
                     const metadata = dataSourceManager.getCurrentMetadata();
                     await reloadDataset(metadata);
@@ -5692,7 +5705,9 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
           notifications.complete(connectNotifId, `Connected to ${repoInfo.owner}/${repoInfo.repo} - ${datasets.length} dataset(s)`);
 
           // Switch to the first GitHub dataset
-          await dataSourceManager.switchToDataset('github-repo', datasets[0].id);
+          await dataSourceManager.switchToDataset('github-repo', datasets[0].id, {
+            loadMethod: DATA_LOAD_METHODS.GITHUB_CONNECT
+          });
 
           // Refresh the dataset dropdown
           if (typeof populateDatasetDropdown === 'function') {
@@ -5729,14 +5744,16 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
           const currentSource = dataSourceManager.getCurrentSourceType();
           if (currentSource === 'github-repo') {
             try {
-              const demoSource = dataSourceManager.getSource('local-demo');
-              if (demoSource) {
-                const defaultId = await demoSource.getDefaultDatasetId?.();
-                if (defaultId) {
-                  await dataSourceManager.switchToDataset('local-demo', defaultId);
-                  if (typeof populateDatasetDropdown === 'function') {
-                    populateDatasetDropdown();
-                  }
+                const demoSource = dataSourceManager.getSource('local-demo');
+                if (demoSource) {
+                  const defaultId = await demoSource.getDefaultDatasetId?.();
+                  if (defaultId) {
+                    await dataSourceManager.switchToDataset('local-demo', defaultId, {
+                      loadMethod: DATA_LOAD_METHODS.GITHUB_DISCONNECT_FALLBACK
+                    });
+                    if (typeof populateDatasetDropdown === 'function') {
+                      populateDatasetDropdown();
+                    }
                   if (reloadDataset) {
                     const metadata = dataSourceManager.getCurrentMetadata();
                     await reloadDataset(metadata);

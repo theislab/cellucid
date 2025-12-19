@@ -25,6 +25,15 @@ import { createJupyterBridgeDataSource, isJupyterContext, getJupyterConfig } fro
 // formatNumber imported from data-source.js; benchmark module lazy-loaded when needed
 import { formatCellCount as formatNumber } from '../data/data-source.js';
 import { createComparisonModule } from './analysis/comparison-module.js';
+import {
+  initAnalytics,
+  trackDataLoadMethod,
+  beginDataLoad,
+  completeDataLoadSuccess,
+  completeDataLoadFailure,
+  DATA_LOAD_METHODS
+} from '../analytics/tracker.js';
+import { initPerformanceAnalytics } from '../analytics/performance.js';
 
 console.log('=== CELLUCID STARTING ===');
 
@@ -441,6 +450,45 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
     // Initialize DataSourceManager
     const dataSourceManager = getDataSourceManager();
+    initAnalytics({ dataSourceManager });
+
+    const buildDatasetAnalyticsContext = (overrides = {}) => {
+      const metadata = overrides.metadata ?? dataSourceManager.getCurrentMetadata?.();
+      const datasetId = overrides.datasetId ?? dataSourceManager.getCurrentDatasetId?.();
+      const datasetName = overrides.datasetName ?? metadata?.name;
+      const sourceType = overrides.sourceType ?? dataSourceManager.getCurrentSourceType?.();
+      return {
+        metadata,
+        datasetId,
+        datasetName,
+        sourceType,
+        previousDatasetId: overrides.previousDatasetId,
+        previousSource: overrides.previousSource,
+        reload: overrides.reload
+      };
+    };
+
+    const startDatasetLoad = (methodOverride = null, ctxOverrides = {}) => {
+      const method = methodOverride || dataSourceManager.getLastLoadMethod?.() || DATA_LOAD_METHODS.DEFAULT_DEMO;
+      return beginDataLoad(method, buildDatasetAnalyticsContext(ctxOverrides));
+    };
+
+    let currentDatasetLoadToken = null;
+
+    const startPerfAnalytics = () => {
+      initPerformanceAnalytics({
+        sampleRate: 1,
+        contextProvider: () => ({
+          datasetId: dataSourceManager.getCurrentDatasetId?.(),
+          sourceType: dataSourceManager.getCurrentSourceType?.()
+        })
+      });
+    };
+    if (typeof window.requestIdleCallback === 'function') {
+      window.requestIdleCallback(startPerfAnalytics, { timeout: 2000 });
+    } else {
+      setTimeout(startPerfAnalytics, 1200);
+    }
 
     // Helper functions for onboarding callbacks (defined early, used later)
     let toggleSidebarVisibility = null;
@@ -498,7 +546,9 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         try {
           const jupyterDatasets = await jupyterSource.listDatasets();
           if (jupyterDatasets.length > 0) {
-            await dataSourceManager.switchToDataset('jupyter', jupyterDatasets[0].id);
+            await dataSourceManager.switchToDataset('jupyter', jupyterDatasets[0].id, {
+              loadMethod: DATA_LOAD_METHODS.JUPYTER_AUTO
+            });
             console.log(`[Main] Switched to Jupyter dataset: ${jupyterDatasets[0].id}`);
           }
         } catch (err) {
@@ -532,7 +582,9 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
           const datasets = await remoteSource.listDatasets();
           if (datasets.length > 0) {
             // Switch to the first remote dataset
-            await dataSourceManager.switchToDataset('remote', datasets[0].id);
+            await dataSourceManager.switchToDataset('remote', datasets[0].id, {
+              loadMethod: DATA_LOAD_METHODS.REMOTE_URL_PARAM
+            });
             console.log(`[Main] Switched to remote dataset: ${datasets[0].id}`);
           }
         }
@@ -550,18 +602,20 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     if (githubPathParam && !remoteUrlParam) {
       console.log(`[Main] GitHub path from param: ${githubPathParam}`);
       try {
-        const githubSource = dataSourceManager.getSource('github-repo');
-        if (githubSource) {
-          const { datasets } = await githubSource.connect(githubPathParam);
-          console.log('[Main] Connected to GitHub repository');
+          const githubSource = dataSourceManager.getSource('github-repo');
+          if (githubSource) {
+            const { datasets } = await githubSource.connect(githubPathParam);
+            console.log('[Main] Connected to GitHub repository');
 
-          if (datasets && datasets.length > 0) {
-            await dataSourceManager.switchToDataset('github-repo', datasets[0].id);
-            console.log(`[Main] Switched to GitHub dataset: ${datasets[0].id}`);
+            if (datasets && datasets.length > 0) {
+              await dataSourceManager.switchToDataset('github-repo', datasets[0].id, {
+                loadMethod: DATA_LOAD_METHODS.GITHUB_URL_PARAM
+              });
+              console.log(`[Main] Switched to GitHub dataset: ${datasets[0].id}`);
 
-            // Fill in the input field for visual feedback
-            if (githubRepoUrl) {
-              githubRepoUrl.value = githubPathParam;
+              // Fill in the input field for visual feedback
+              if (githubRepoUrl) {
+                githubRepoUrl.value = githubPathParam;
             }
           }
         }
@@ -589,7 +643,9 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
             : true; // Assume exists if hasDataset not available
 
           if (hasDataset) {
-            await dataSourceManager.switchToDataset(requestedSource, requestedDataset);
+            await dataSourceManager.switchToDataset(requestedSource, requestedDataset, {
+              loadMethod: DATA_LOAD_METHODS.DATASET_URL_PARAM
+            });
             console.log(`[Main] Loaded dataset from URL param: ${requestedSource}/${requestedDataset}`);
           } else {
             console.warn(`[Main] Requested dataset '${requestedDataset}' not found in '${requestedSource}'`);
@@ -604,6 +660,10 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
     EXPORT_BASE_URL = dataSourceManager.getCurrentBaseUrl() || EXPORT_BASE_URL;
     console.log(`[Main] Using dataset base URL: ${EXPORT_BASE_URL}`);
+
+    if (!currentDatasetLoadToken && dataSourceManager.hasActiveDataset?.()) {
+      currentDatasetLoadToken = startDatasetLoad();
+    }
 
     // Initialize dimension manager for multi-dimensional embeddings
     const dimensionManager = createDimensionManager({ baseUrl: EXPORT_BASE_URL });
@@ -699,7 +759,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     }
 
     // In-place dataset reload for sources that cannot survive a page refresh (e.g., local-user)
-    async function reloadActiveDatasetInPlace(metadataOverride = null) {
+    async function reloadActiveDatasetInPlace(metadataOverride = null, loadMethodOverride = null) {
       const baseUrl = dataSourceManager.getCurrentBaseUrl();
       const activeMetadata = metadataOverride || dataSourceManager.getCurrentMetadata?.() || null;
       if (!baseUrl) {
@@ -731,6 +791,8 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       if (viewer.setShowConnectivity) viewer.setShowConnectivity(false);
       if (viewer.disableEdgesV2) viewer.disableEdgesV2();
       connectivityManifest = null;
+
+      const loadToken = startDatasetLoad(loadMethodOverride, { metadata: activeMetadata, reload: true });
 
       try {
         // Reinitialize dimension manager with new dataset's embeddings metadata
@@ -851,11 +913,26 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
           datasetInfo.classList.remove('loading', 'error');
         }
         ui?.showSessionStatus?.('Dataset loaded', false);
+        completeDataLoadSuccess(loadToken, buildDatasetAnalyticsContext({
+          metadata: activeMetadata,
+          datasetId: dataSourceManager.getCurrentDatasetId?.(),
+          datasetName: activeMetadata?.name,
+          reload: true
+        }));
       } catch (err) {
         console.error('[Main] Failed to reload dataset in-place:', err);
         statsEl.textContent = 'Failed to load dataset';
         notifications.error(`Failed to load dataset: ${err?.message || 'Unknown error'}`, { category: 'data' });
         if (datasetInfo) datasetInfo.classList.add('error');
+        completeDataLoadFailure(loadToken, {
+          ...buildDatasetAnalyticsContext({
+            metadata: activeMetadata,
+            datasetId: dataSourceManager.getCurrentDatasetId?.(),
+            datasetName: activeMetadata?.name,
+            reload: true
+          }),
+          error: err
+        });
       } finally {
         if (connectivityCheckbox) {
           connectivityCheckbox.disabled = false;
@@ -1046,6 +1123,10 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     }
 
     await ui.activateField(-1);
+    if (currentDatasetLoadToken) {
+      completeDataLoadSuccess(currentDatasetLoadToken, buildDatasetAnalyticsContext());
+      currentDatasetLoadToken = null;
+    }
 
     // Discover state snapshots in the exports directory (for automatic restore)
     async function discoverLocalStateSnapshots(baseUrl) {
@@ -1173,7 +1254,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       const target = stateFiles[stateFiles.length - 1];
       console.log('[Main] Auto-loading state snapshot from', target);
       try {
-        await stateSerializer.loadStateFromUrl(target);
+        await stateSerializer.loadStateFromUrl(target, DATA_LOAD_METHODS.STATE_RESTORE_AUTO);
         ui.refreshUiAfterStateLoad?.();
         ui.showSessionStatus?.('Loaded saved state from data directory');
       } catch (err) {
@@ -2136,6 +2217,17 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         dimensionLevel: syntheticDimLevel
       };
 
+      trackDataLoadMethod(DATA_LOAD_METHODS.BENCHMARK_SYNTHETIC, {
+        datasetId: `synthetic-${pattern}`,
+        datasetName: `Synthetic ${pattern}`,
+        sourceType: 'benchmark',
+        cellCount: pointCount,
+        obsFieldCount: 0,
+        edgeCount: 0,
+        durationMs: genTime,
+        success: 1
+      });
+
       const gpuMemMB = (pointCount * 28 / 1024 / 1024).toFixed(1);
 
       // Refresh stat panel immediately and start perf tracking loop
@@ -2481,6 +2573,13 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
   } catch (err) {
     console.error(err);
     statsEl.textContent = 'Error: ' + err.message;
+    if (currentDatasetLoadToken) {
+      completeDataLoadFailure(currentDatasetLoadToken, {
+        ...buildDatasetAnalyticsContext(),
+        error: err
+      });
+      currentDatasetLoadToken = null;
+    }
     // Show error in notification center if initialized
     try {
       getNotificationCenter().error(`Initialization error: ${err.message}`, { duration: 10000 });

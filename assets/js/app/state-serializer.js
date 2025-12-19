@@ -13,6 +13,12 @@
 
 import { getCategoryColor } from '../data/palettes.js';
 import { getDataSourceManager } from '../data/data-source-manager.js';
+import {
+  beginDataLoad,
+  completeDataLoadSuccess,
+  completeDataLoadFailure,
+  DATA_LOAD_METHODS
+} from '../analytics/tracker.js';
 
 /**
  * Compare two RGB colors for equality within a small epsilon
@@ -27,6 +33,13 @@ function colorsEqual(a, b, epsilon = 1e-4) {
 export function createStateSerializer({ state, viewer, sidebar }) {
   // v3: multiview restore, full filter capture, stronger post-restore syncing
   const VERSION = 3;
+  const dataSourceManager = getDataSourceManager();
+
+  const buildAnalyticsContext = () => ({
+    datasetId: dataSourceManager.getCurrentDatasetId?.(),
+    datasetName: dataSourceManager.getCurrentMetadata?.()?.name,
+    sourceType: dataSourceManager.getCurrentSourceType?.()
+  });
 
   function getUiRoots() {
     const roots = [];
@@ -1200,14 +1213,17 @@ export function createStateSerializer({ state, viewer, sidebar }) {
           return;
         }
 
+        const loadToken = beginDataLoad(DATA_LOAD_METHODS.STATE_RESTORE_FILE, buildAnalyticsContext());
         try {
           const text = await file.text();
           const snapshot = JSON.parse(text);
           validateSnapshotShape(snapshot, file.name || 'uploaded file');
           await deserialize(snapshot);
+          completeDataLoadSuccess(loadToken, buildAnalyticsContext());
           resolve();
         } catch (err) {
           console.error('Failed to load state:', err);
+          completeDataLoadFailure(loadToken, { ...buildAnalyticsContext(), error: err });
           reject(err);
         }
       };
@@ -1226,15 +1242,24 @@ export function createStateSerializer({ state, viewer, sidebar }) {
    * @param {string} url - Absolute or relative URL to a JSON snapshot
    * @returns {Promise<void>}
    */
-  async function loadStateFromUrl(url) {
+  async function loadStateFromUrl(url, method = DATA_LOAD_METHODS.STATE_RESTORE_URL) {
     if (!url) throw new Error('State URL is required');
-    const response = await fetch(url);
-    if (!response.ok) {
-      throw new Error(`Failed to fetch state from ${url} (${response.status} ${response.statusText})`);
+    const loadToken = beginDataLoad(method, buildAnalyticsContext());
+    try {
+      const response = await fetch(url);
+      if (!response.ok) {
+        const err = new Error(`Failed to fetch state from ${url} (${response.status} ${response.statusText})`);
+        err.status = response.status;
+        throw err;
+      }
+      const snapshot = await response.json();
+      validateSnapshotShape(snapshot, url);
+      await deserialize(snapshot);
+      completeDataLoadSuccess(loadToken, buildAnalyticsContext());
+    } catch (err) {
+      completeDataLoadFailure(loadToken, { ...buildAnalyticsContext(), error: err });
+      throw err;
     }
-    const snapshot = await response.json();
-    validateSnapshotShape(snapshot, url);
-    await deserialize(snapshot);
   }
 
   return {
