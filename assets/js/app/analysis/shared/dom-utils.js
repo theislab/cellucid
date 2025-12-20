@@ -243,16 +243,23 @@ export function createFormRow(labelText, inputEl, options = {}) {
 /**
  * Create a form select element with consistent styling
  * @param {string} name - Select name attribute
- * @param {Array<{value: string|number, label: string, selected?: boolean}>} options - Select options
+ * @param {Array<{value: string|number, label: string, description?: string, selected?: boolean}>} options - Select options
  * @param {Object} [config] - Additional configuration
  * @param {string} [config.className] - CSS class (default: 'obs-select')
  * @param {Function} [config.onChange] - Change handler
- * @returns {HTMLSelectElement}
+ * @param {boolean} [config.showDescription] - Show description below select (default: true if any option has description)
+ * @returns {HTMLElement} Select element or wrapper with description
  */
 export function createFormSelect(name, options, config = {}) {
+  const hasDescriptions = options.some(opt => opt.description);
+  const showDescription = config.showDescription ?? hasDescriptions;
+
   const select = document.createElement('select');
   select.className = config.className || 'obs-select';
   select.name = name;
+
+  // Build options map for description lookup
+  const optionsMap = new Map();
 
   for (const opt of options) {
     const option = document.createElement('option');
@@ -260,13 +267,41 @@ export function createFormSelect(name, options, config = {}) {
     option.textContent = opt.label;
     if (opt.selected) option.selected = true;
     select.appendChild(option);
+    optionsMap.set(String(opt.value), opt);
   }
 
-  if (config.onChange) {
-    select.addEventListener('change', (e) => config.onChange(e.target.value));
+  // If no descriptions, return simple select
+  if (!showDescription) {
+    if (config.onChange) {
+      select.addEventListener('change', (e) => config.onChange(e.target.value));
+    }
+    return select;
   }
 
-  return select;
+  // Create wrapper with description
+  const wrapper = document.createElement('div');
+  wrapper.className = 'form-select-with-description';
+  wrapper.appendChild(select);
+
+  const descEl = document.createElement('div');
+  descEl.className = 'form-select-description';
+  wrapper.appendChild(descEl);
+
+  // Update description based on selection
+  const updateDescription = () => {
+    const opt = optionsMap.get(select.value);
+    descEl.textContent = opt?.description || '';
+  };
+
+  select.addEventListener('change', () => {
+    updateDescription();
+    if (config.onChange) config.onChange(select.value);
+  });
+
+  // Set initial description
+  updateDescription();
+
+  return wrapper;
 }
 
 /**
@@ -366,6 +401,138 @@ export function createActionsBar(buttons) {
   }
 
   return bar;
+}
+
+// =============================================================================
+// STATS TABLE RENDERING
+// =============================================================================
+
+/**
+ * Render a generic statistics table from key-value data
+ *
+ * @param {Object} stats - Statistics object with key-value pairs
+ * @param {Object} [options] - Rendering options
+ * @param {Object} [options.labels] - Custom labels for keys (e.g., { std: 'Std Dev' })
+ * @param {Function} [options.formatValue] - Custom value formatter (default: 2 decimal places)
+ * @param {string} [options.className] - Additional CSS class
+ * @param {string[]} [options.order] - Order of keys to display (defaults to Object.keys order)
+ * @param {string[]} [options.highlight] - Keys to highlight
+ * @returns {HTMLTableElement}
+ *
+ * @example
+ * const stats = { count: 100, mean: 5.23, std: 1.45, pValue: 0.003 };
+ * const table = renderStatsTable(stats, {
+ *   labels: { std: 'Std Dev', pValue: 'p-value' },
+ *   highlight: ['pValue']
+ * });
+ * container.appendChild(table);
+ */
+export function renderStatsTable(stats, options = {}) {
+  const {
+    labels = {},
+    formatValue = (v) => typeof v === 'number' && !Number.isInteger(v) ? v.toFixed(2) : String(v),
+    className = '',
+    order = Object.keys(stats),
+    highlight = []
+  } = options;
+
+  const table = document.createElement('table');
+  table.className = `analysis-stats-table ${className}`.trim();
+
+  const tbody = document.createElement('tbody');
+
+  for (const key of order) {
+    if (!(key in stats)) continue;
+
+    const value = stats[key];
+    const label = labels[key] || key.charAt(0).toUpperCase() + key.slice(1).replace(/([A-Z])/g, ' $1');
+
+    const row = document.createElement('tr');
+    if (highlight.includes(key)) {
+      row.className = 'highlight';
+    }
+
+    const labelCell = document.createElement('td');
+    labelCell.className = 'stat-label';
+    labelCell.textContent = label;
+
+    const valueCell = document.createElement('td');
+    valueCell.className = 'stat-value';
+    valueCell.textContent = value === null || value === undefined ? '-' : formatValue(value);
+
+    row.appendChild(labelCell);
+    row.appendChild(valueCell);
+    tbody.appendChild(row);
+  }
+
+  table.appendChild(tbody);
+  return table;
+}
+
+/**
+ * Render a comparison stats table with multiple columns
+ *
+ * @param {Object[]} groups - Array of { name: string, stats: Object }
+ * @param {Object} [options] - Rendering options
+ * @param {Object} [options.labels] - Custom labels for stat keys
+ * @param {Function} [options.formatValue] - Custom value formatter
+ * @param {string[]} [options.statOrder] - Order of stats to display
+ * @param {string} [options.className] - Additional CSS class
+ * @returns {HTMLTableElement}
+ *
+ * @example
+ * const groups = [
+ *   { name: 'Group A', stats: { count: 50, mean: 5.2 } },
+ *   { name: 'Group B', stats: { count: 45, mean: 4.8 } }
+ * ];
+ * const table = renderComparisonStatsTable(groups, {
+ *   labels: { count: 'N' },
+ *   statOrder: ['count', 'mean']
+ * });
+ */
+export function renderComparisonStatsTable(groups, options = {}) {
+  const {
+    labels = {},
+    formatValue = (v) => typeof v === 'number' && !Number.isInteger(v) ? v.toFixed(2) : String(v),
+    statOrder,
+    className = ''
+  } = options;
+
+  // Determine stat keys from first group if not specified
+  const keys = statOrder || (groups[0]?.stats ? Object.keys(groups[0].stats) : []);
+
+  const table = document.createElement('table');
+  table.className = `analysis-stats-table ${className}`.trim();
+
+  // Header row
+  const thead = document.createElement('thead');
+  const headerRow = document.createElement('tr');
+  headerRow.innerHTML = '<th>Statistic</th>' + groups.map(g => `<th>${g.name}</th>`).join('');
+  thead.appendChild(headerRow);
+  table.appendChild(thead);
+
+  // Body rows
+  const tbody = document.createElement('tbody');
+  for (const key of keys) {
+    const label = labels[key] || key.charAt(0).toUpperCase() + key.slice(1).replace(/([A-Z])/g, ' $1');
+
+    const row = document.createElement('tr');
+    const labelCell = document.createElement('td');
+    labelCell.textContent = label;
+    row.appendChild(labelCell);
+
+    for (const group of groups) {
+      const valueCell = document.createElement('td');
+      const value = group.stats?.[key];
+      valueCell.textContent = value === null || value === undefined ? '-' : formatValue(value);
+      row.appendChild(valueCell);
+    }
+
+    tbody.appendChild(row);
+  }
+  table.appendChild(tbody);
+
+  return table;
 }
 
 // =============================================================================
@@ -504,6 +671,9 @@ export default {
   createNotice,
   createResultHeader,
   createActionsBar,
+  // Stats table rendering
+  renderStatsTable,
+  renderComparisonStatsTable,
   // DOM manipulation
   clearElement,
   addClass,

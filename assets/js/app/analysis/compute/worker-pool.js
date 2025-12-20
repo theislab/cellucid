@@ -16,6 +16,8 @@
  */
 
 import { executeFallback } from './fallback-operations.js';
+import { filterFiniteNumbers } from '../shared/number-utils.js';
+import { debug, debugWarn, debugError } from '../shared/debug-utils.js';
 
 // Singleton instance
 let poolInstance = null;
@@ -65,7 +67,7 @@ export class WorkerPool {
     if (this.initialized) return true;
 
     if (!this.workersAvailable) {
-      console.warn('[WorkerPool] Web Workers not available, using main thread fallback');
+      debugWarn('WorkerPool', 'Web Workers not available, using main thread fallback');
       return false;
     }
 
@@ -92,7 +94,7 @@ export class WorkerPool {
       }
 
       this.initialized = true;
-      console.log(`[WorkerPool] Initialized with ${this.poolSize} workers`);
+      debug('WorkerPool', `Initialized with ${this.poolSize} workers`);
 
       // Start health monitoring
       this._startHealthMonitoring();
@@ -100,7 +102,7 @@ export class WorkerPool {
       return true;
 
     } catch (error) {
-      console.error('[WorkerPool] Failed to initialize:', error);
+      debugError('WorkerPool', 'Failed to initialize:', error);
       this.workersAvailable = false;
       return false;
     }
@@ -154,7 +156,7 @@ export class WorkerPool {
    * Handle worker errors
    */
   _handleError(workerIndex, error) {
-    console.error(`[WorkerPool] Worker ${workerIndex} error:`, error);
+    debugError('WorkerPool', `Worker ${workerIndex} error:`, error);
 
     // Mark worker as idle (it crashed but we'll try to reuse)
     this.workerStates[workerIndex] = 'idle';
@@ -200,13 +202,13 @@ export class WorkerPool {
       this.workerStates[index] = 'idle';
       this._workerBusySince[index] = null;
 
-      console.log(`[WorkerPool] Worker ${index} restarted`);
+      debug('WorkerPool', `Worker ${index} restarted`);
 
       // Process any queued tasks
       this._processQueue(index);
 
     } catch (err) {
-      console.error(`[WorkerPool] Failed to restart worker ${index}:`, err);
+      debugError('WorkerPool', `Failed to restart worker ${index}:`, err);
     }
   }
 
@@ -250,7 +252,7 @@ export class WorkerPool {
         const busyDuration = now - this._workerBusySince[i];
 
         if (busyDuration > this._workerStuckThresholdMs) {
-          console.warn(`[WorkerPool] Worker ${i} appears stuck (busy for ${Math.round(busyDuration / 1000)}s), restarting...`);
+          debugWarn('WorkerPool', `Worker ${i} appears stuck (busy for ${Math.round(busyDuration / 1000)}s), restarting...`);
           healthIssues++;
 
           // Cancel pending requests for this worker
@@ -271,7 +273,7 @@ export class WorkerPool {
 
       // Check for accumulated queued tasks (indicates potential problem)
       if (this.taskQueues[i].length > 50) {
-        console.warn(`[WorkerPool] Worker ${i} has ${this.taskQueues[i].length} queued tasks`);
+        debugWarn('WorkerPool', `Worker ${i} has ${this.taskQueues[i].length} queued tasks`);
         healthIssues++;
       }
     }
@@ -296,11 +298,11 @@ export class WorkerPool {
     }
 
     if (orphanedRequests.length > 0) {
-      console.warn(`[WorkerPool] Cleaned up ${orphanedRequests.length} orphaned requests`);
+      debugWarn('WorkerPool', `Cleaned up ${orphanedRequests.length} orphaned requests`);
     }
 
     if (healthIssues > 0) {
-      console.warn(`[WorkerPool] Health check found ${healthIssues} issue(s)`);
+      debugWarn('WorkerPool', `Health check found ${healthIssues} issue(s)`);
     }
   }
 
@@ -551,7 +553,7 @@ export class WorkerPool {
     // Check for errors
     const errors = results.filter(r => r.error);
     if (errors.length > 0) {
-      console.warn(`[WorkerPool] ${errors.length}/${tasks.length} tasks failed`);
+      debugWarn('WorkerPool', `${errors.length}/${tasks.length} tasks failed`);
     }
 
     return results.map(r => {
@@ -672,7 +674,7 @@ export class WorkerPool {
    * Uses the shared fallback-operations module for all operation types.
    */
   _fallbackExecute(type, payload) {
-    console.warn('[WorkerPool] Executing on main thread (workers unavailable):', type);
+    debugWarn('WorkerPool', 'Executing on main thread (workers unavailable):', type);
 
     return new Promise((resolve, reject) => {
       try {
@@ -755,8 +757,8 @@ export class WorkerPool {
       return {
         type: 'COMPUTE_DIFFERENTIAL',
         payload: {
-          groupAValues: dataA.filter(v => typeof v === 'number' && Number.isFinite(v)),
-          groupBValues: dataB.filter(v => typeof v === 'number' && Number.isFinite(v)),
+          groupAValues: filterFiniteNumbers(dataA),
+          groupBValues: filterFiniteNumbers(dataB),
           method,
           gene
         }
@@ -783,6 +785,61 @@ export class WorkerPool {
   // =========================================================================
   // Lifecycle
   // =========================================================================
+
+  /**
+   * Restart idle workers to reclaim memory.
+   *
+   * Rationale:
+   * - Large analyses can temporarily grow worker heaps / ArrayBuffer usage.
+   * - Browsers may delay GC in workers; recycling is the most reliable way to
+   *   release memory back to the OS.
+   *
+   * This method is designed to be safe for MemoryMonitor-triggered cleanup:
+   * it only touches workers that are currently marked as idle.
+   *
+   * @param {Object} [options]
+   * @param {number} [options.keepAtLeast=0] - Leave this many idle workers untouched
+   * @param {number} [options.maxToRecycle=Infinity] - Upper bound on restarts
+   * @returns {{recycled: number, kept: number, considered: number}}
+   */
+  pruneIdleWorkers(options = {}) {
+    const {
+      keepAtLeast = 0,
+      maxToRecycle = Infinity
+    } = options;
+
+    if (!this.initialized || !this.workersAvailable || this.workers.length === 0) {
+      return { recycled: 0, kept: 0, considered: 0 };
+    }
+
+    const idleIndices = [];
+    for (let i = 0; i < this.poolSize; i++) {
+      if (this.workerStates[i] === 'idle') {
+        idleIndices.push(i);
+      }
+    }
+
+    const considered = idleIndices.length;
+    const keepCount = Math.max(0, Math.min(considered, Math.floor(keepAtLeast)));
+    const maxRecycle = Number.isFinite(maxToRecycle) ? Math.max(0, Math.floor(maxToRecycle)) : considered;
+    const toRecycle = Math.max(0, Math.min(considered - keepCount, maxRecycle));
+
+    for (let i = 0; i < toRecycle; i++) {
+      const idx = idleIndices[i];
+      // Fire-and-forget restart (async). Safe because worker is idle.
+      void this._restartWorker(idx);
+    }
+
+    if (toRecycle > 0) {
+      debug('WorkerPool', `Recycled ${toRecycle}/${considered} idle worker(s) to reclaim memory`);
+    }
+
+    return {
+      recycled: toRecycle,
+      kept: considered - toRecycle,
+      considered
+    };
+  }
 
   /**
    * Get pool statistics

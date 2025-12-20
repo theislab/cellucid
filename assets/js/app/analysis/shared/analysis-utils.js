@@ -11,6 +11,14 @@
  * @module shared/analysis-utils
  */
 
+import {
+  isFiniteNumber,
+  filterFiniteNumbers,
+  mean as computeMean,
+  std as computeStd,
+  median as computeMedian
+} from './number-utils.js';
+
 // =============================================================================
 // LOADING STATE MANAGEMENT
 // =============================================================================
@@ -227,6 +235,51 @@ export function toCSVCell(value) {
     return `"${str.replace(/"/g, '""')}"`;
   }
   return str;
+}
+
+/**
+ * Generic function to convert an array of objects to CSV format
+ *
+ * @param {Object[]} data - Array of objects to convert
+ * @param {Object} [options] - Options
+ * @param {string[]} [options.columns] - Column keys to include (default: all keys from first object)
+ * @param {Object} [options.headers] - Custom headers { key: 'Header Label' }
+ * @param {Function} [options.formatValue] - Custom value formatter (receives value, key, row)
+ * @returns {string} CSV content
+ *
+ * @example
+ * const data = [
+ *   { name: 'Gene A', pValue: 0.001, log2FC: 2.5 },
+ *   { name: 'Gene B', pValue: 0.05, log2FC: -1.2 }
+ * ];
+ * const csv = toCSV(data, {
+ *   columns: ['name', 'pValue', 'log2FC'],
+ *   headers: { name: 'Gene', pValue: 'P-value', log2FC: 'Log2 Fold Change' }
+ * });
+ */
+export function toCSV(data, options = {}) {
+  if (!data || data.length === 0) {
+    return '';
+  }
+
+  const {
+    columns = Object.keys(data[0]),
+    headers = {},
+    formatValue = (v) => v
+  } = options;
+
+  // Header row
+  const headerRow = columns.map(col => toCSVCell(headers[col] || col)).join(',');
+
+  // Data rows
+  const dataRows = data.map(row =>
+    columns.map(col => {
+      const value = formatValue(row[col], col, row);
+      return toCSVCell(value);
+    }).join(',')
+  );
+
+  return [headerRow, ...dataRows].join('\n');
 }
 
 /**
@@ -453,29 +506,21 @@ export function getTypedFormValues(formContainer, fieldConfig) {
  * @returns {Object} { count, mean, median, std, min, max, q1, q3 }
  */
 export function computeBasicStats(values) {
-  const valid = values.filter(v => typeof v === 'number' && Number.isFinite(v));
+  const valid = filterFiniteNumbers(values);
   const n = valid.length;
 
   if (n === 0) {
     return { count: 0, mean: null, median: null, std: null, min: null, max: null };
   }
 
-  // Sort for median/quartiles
+  // Sort once for quartiles and min/max
   const sorted = [...valid].sort((a, b) => a - b);
-
-  // Compute stats
-  const sum = valid.reduce((a, b) => a + b, 0);
-  const mean = sum / n;
-  const variance = valid.reduce((a, b) => a + (b - mean) ** 2, 0) / n;
-
-  const mid = Math.floor(n / 2);
-  const median = n % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
 
   return {
     count: n,
-    mean,
-    median,
-    std: Math.sqrt(variance),
+    mean: computeMean(valid),
+    median: computeMedian(valid),
+    std: computeStd(valid),
     min: sorted[0],
     max: sorted[n - 1],
     q1: sorted[Math.floor(n * 0.25)],
@@ -491,8 +536,8 @@ export function computeBasicStats(values) {
  * @returns {Object} { effectSize, interpretation, mean1, mean2, std1, std2, n1, n2 }
  */
 export function computeEffectSize(group1, group2) {
-  const valid1 = group1.filter(v => typeof v === 'number' && Number.isFinite(v));
-  const valid2 = group2.filter(v => typeof v === 'number' && Number.isFinite(v));
+  const valid1 = filterFiniteNumbers(group1);
+  const valid2 = filterFiniteNumbers(group2);
 
   const n1 = valid1.length;
   const n2 = valid2.length;
@@ -501,9 +546,10 @@ export function computeEffectSize(group1, group2) {
     return { effectSize: 0, interpretation: 'insufficient data' };
   }
 
-  const mean1 = valid1.reduce((a, b) => a + b, 0) / n1;
-  const mean2 = valid2.reduce((a, b) => a + b, 0) / n2;
+  const mean1 = computeMean(valid1);
+  const mean2 = computeMean(valid2);
 
+  // Sample variance uses (n-1) denominator (Bessel's correction) for unbiased estimate
   const var1 = valid1.reduce((a, b) => a + (b - mean1) ** 2, 0) / (n1 - 1);
   const var2 = valid2.reduce((a, b) => a + (b - mean2) ** 2, 0) / (n2 - 1);
 

@@ -77,6 +77,11 @@ import { getDataSourceManager } from './data-source-manager.js';
 // Maximum number of gene expression arrays to cache (LRU eviction beyond this)
 const MAX_GENE_CACHE_SIZE = 100;
 
+// Dense X cache guardrail:
+// Caching the full dense X matrix can be multi-GB (n_obs × n_vars × dtype_size).
+// Above this threshold we read only the needed chunk-column per gene to keep memory bounded.
+const MAX_DENSE_X_CACHE_BYTES = 256 * 1024 * 1024; // 256MB
+
 /**
  * Zarr dtype mapping to TypedArray
  */
@@ -893,18 +898,91 @@ export class ZarrLoader {
    * @private
    */
   async _getDenseColumn(colIdx) {
-    // For dense, we need to read the full matrix or specific chunks
-    // This is expensive, so we cache it
-    if (!this._denseX) {
-      const { data } = await this._readArray('X');
-      this._denseX = data instanceof Float32Array ? data : new Float32Array(data);
+    // For dense gene expression, avoid allocating the entire X matrix for large datasets.
+    // Instead, read only the chunk-column that contains `colIdx` for each chunk-row.
+
+    const metaCacheKey = 'meta:X';
+    /** @type {{shape: number[], dtype: string, chunks: number[], compressor: any, order?: string, fill_value?: any}|null} */
+    let meta = this._cache.get(metaCacheKey) || null;
+    if (!meta) {
+      meta = await this._readArrayMeta('X');
+      this._cache.set(metaCacheKey, meta);
     }
 
-    const result = new Float32Array(this._nObs);
-    for (let i = 0; i < this._nObs; i++) {
-      result[i] = this._denseX[i * this._nVars + colIdx];
+    const { shape, dtype, chunks, compressor, order, fill_value } = meta;
+    const TypedArrayClass = DTYPE_MAP[dtype];
+    if (!TypedArrayClass || TypedArrayClass === 'string' || TypedArrayClass === 'object') {
+      throw new Error(`Dense X has unsupported dtype: ${dtype}`);
     }
-    return result;
+
+    const [nRows, nCols] = shape;
+    const [chunkRows, chunkCols] = chunks;
+    const totalDenseBytes = nRows * nCols * bytesPerElement(dtype);
+    const canCacheDense = Number.isFinite(totalDenseBytes) && totalDenseBytes > 0 && totalDenseBytes <= MAX_DENSE_X_CACHE_BYTES;
+
+    if (canCacheDense) {
+      // Fast path for small datasets.
+      if (!this._denseX) {
+        const { data } = await this._readArray('X');
+        this._denseX = data instanceof Float32Array ? data : new Float32Array(data);
+      }
+
+      const out = new Float32Array(this._nObs);
+      for (let i = 0; i < this._nObs; i++) {
+        out[i] = this._denseX[i * this._nVars + colIdx];
+      }
+      return out;
+    }
+
+    const out = new Float32Array(nRows);
+    const fill = Number.isFinite(fill_value) ? Number(fill_value) : 0;
+    if (fill !== 0) out.fill(fill);
+
+    const colChunk = Math.floor(colIdx / chunkCols);
+    const colInChunk = colIdx - (colChunk * chunkCols);
+    const numChunkRows = Math.ceil(nRows / chunkRows);
+    const isFortran = order === 'F';
+
+    for (let cr = 0; cr < numChunkRows; cr++) {
+      const chunkPath = `X/${cr}.${colChunk}`;
+      const rowStart = cr * chunkRows;
+      const rowEnd = Math.min(rowStart + chunkRows, nRows);
+      const actualChunkRows = rowEnd - rowStart;
+
+      if (!this._exists(chunkPath)) {
+        continue;
+      }
+
+      const file = this._files.get(chunkPath);
+      if (!file) continue;
+
+      let buffer = await file.arrayBuffer();
+      buffer = await decompressChunk(buffer, compressor);
+
+      if (isBigEndian(dtype)) {
+        buffer = swapBytes(buffer, bytesPerElement(dtype));
+      }
+
+      const chunkData = new TypedArrayClass(buffer);
+
+      if (!isFortran) {
+        // C-order: contiguous rows; pick one value per row at colInChunk.
+        for (let r = rowStart; r < rowEnd; r++) {
+          const chunkR = r - rowStart;
+          const srcIdx = chunkR * chunkCols + colInChunk;
+          out[r] = chunkData[srcIdx];
+        }
+      } else {
+        // Fortran order: column-major within chunk.
+        for (let r = rowStart; r < rowEnd; r++) {
+          const chunkR = r - rowStart;
+          const srcIdx = colInChunk * actualChunkRows + chunkR;
+          out[r] = chunkData[srcIdx];
+        }
+      }
+    }
+
+    return out;
   }
 
   /**
@@ -1604,6 +1682,9 @@ export class ZarrDataSource {
       URL.revokeObjectURL(url);
     }
     this._blobUrls.clear();
+
+    // Best-effort cache release (keeps file references; frees large computed buffers).
+    this.clearCaches?.();
   }
 
   /**

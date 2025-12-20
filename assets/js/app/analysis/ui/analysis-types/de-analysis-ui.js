@@ -25,6 +25,8 @@ import {
 // Modal rendering uses HTML templates directly for better control
 import { createPageComparisonSelector } from '../components/index.js';
 import { PerformanceConfig } from '../../shared/performance-config.js';
+import { purgePlot } from '../../plots/plotly-loader.js';
+import { isFiniteNumber } from '../../shared/number-utils.js';
 
 /**
  * Differential Expression Analysis UI Component
@@ -136,27 +138,13 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
 
     // Method selector
     const methodSelect = createFormSelect('method', [
-      { value: 'wilcox', label: 'Wilcoxon (recommended)', selected: true },
-      { value: 'ttest', label: 't-test' }
+      { value: 'wilcox', label: 'Wilcoxon', description: 'Rank-based test, robust to outliers and non-normal distributions.', selected: true },
+      { value: 'ttest', label: 't-test', description: 'Parametric test, assumes normally distributed expression data.' }
     ]);
     wrapper.appendChild(createFormRow('Statistical method:', methodSelect));
 
-    // P-value threshold
-    const pValueSelect = createFormSelect('pValueThreshold', [
-      { value: '0.001', label: 'p < 0.001' },
-      { value: '0.01', label: 'p < 0.01' },
-      { value: '0.05', label: 'p < 0.05', selected: true }
-    ]);
-    wrapper.appendChild(createFormRow('Significance threshold:', pValueSelect));
-
-    // Fold change threshold
-    const fcSelect = createFormSelect('fcThreshold', [
-      { value: '0', label: 'No threshold' },
-      { value: '0.5', label: '|log2FC| > 0.5' },
-      { value: '1', label: '|log2FC| > 1', selected: true },
-      { value: '2', label: '|log2FC| > 2' }
-    ]);
-    wrapper.appendChild(createFormRow('Log2 fold change threshold:', fcSelect));
+    // Note: Significance and fold change thresholds are now in the results view
+    // where they can be adjusted dynamically after analysis
 
     // === Performance Settings Section ===
     this._renderPerformanceSettings(wrapper);
@@ -168,10 +156,10 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
    * @private
    */
   _renderPerformanceSettings(wrapper) {
-    // Get data characteristics for recommended settings
+    // Get data characteristics for dataset info display
     const pointCount = this.dataLayer?.state?.pointCount || 100000;
     const geneCount = this.dataLayer?.getAvailableVariables?.('gene_expression')?.length || 20000;
-    const recommended = PerformanceConfig.getRecommendedSettings(pointCount, geneCount);
+    const dataInfo = PerformanceConfig.getRecommendedSettings(pointCount, geneCount);
 
     // Performance settings container
     const perfSection = document.createElement('div');
@@ -193,36 +181,38 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     const batchSelect = createFormSelect('batchSize', batchOptions.map(opt => ({
       value: String(opt.value),
       label: opt.label,
-      selected: opt.recommended
+      description: opt.description,
+      selected: opt.selected
     })));
     content.appendChild(createFormRow('Batch size:', batchSelect));
 
     // Memory budget selector
     const memoryOptions = PerformanceConfig.getMemoryBudgetOptions();
-    const recommendedMemory = recommended.memoryBudgetMB;
     const memorySelect = createFormSelect('memoryBudget', memoryOptions.map(opt => ({
       value: String(opt.value),
       label: opt.label,
-      selected: opt.value <= recommendedMemory && memoryOptions.find(o => o.value > recommendedMemory)?.value !== opt.value
+      description: opt.description,
+      selected: opt.selected
     })));
     content.appendChild(createFormRow('Memory budget:', memorySelect));
 
     // Network concurrency selector (actual parallel network requests)
-    const networkOptions = PerformanceConfig.getNetworkConcurrencyOptions(recommended.networkConcurrency);
+    const networkOptions = PerformanceConfig.getNetworkConcurrencyOptions();
     const networkSelect = createFormSelect('networkConcurrency', networkOptions.map(opt => ({
       value: String(opt.value),
       label: opt.label,
-      selected: opt.recommended
+      description: opt.description,
+      selected: opt.selected
     })));
     content.appendChild(createFormRow('Network parallelism:', networkSelect));
 
     // Parallelism selector
     const parallelismSelect = createFormSelect('parallelism', [
-      { value: 'auto', label: 'Auto (use worker pool)', selected: true },
-      { value: '1', label: '1× (lowest memory)' },
-      { value: '2', label: '2×' },
-      { value: '4', label: '4×' },
-      { value: '8', label: '8× (fastest)' }
+      { value: 'auto', label: 'Auto', description: 'Automatically distributes work across available cores.' },
+      { value: '1', label: '1 core', description: 'Sequential processing with minimal resource usage.' },
+      { value: '2', label: '2 cores', description: 'Light parallel processing for moderate workloads.' },
+      { value: '4', label: '4 cores', description: 'Balanced parallel processing.' },
+      { value: '8', label: '8 cores', description: 'Full parallel processing for maximum throughput.', selected: true }
     ]);
     content.appendChild(createFormRow('Compute parallelism:', parallelismSelect));
 
@@ -231,8 +221,8 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     infoDiv.className = 'de-perf-info';
     infoDiv.innerHTML = `
       <strong>Dataset:</strong> ${(pointCount / 1000).toFixed(0)}K cells × ${geneCount.toLocaleString()} genes<br>
-      <strong>Est. data:</strong> ~${recommended.totalDataMB.toFixed(0)} MB total<br>
-      <strong>Est. time:</strong> ~${recommended.estimatedTimeFormatted}
+      <strong>Est. data:</strong> ~${dataInfo.totalDataMB.toFixed(0)} MB total<br>
+      <strong>Est. time:</strong> ~${dataInfo.estimatedTimeFormatted}
     `;
     content.appendChild(infoDiv);
 
@@ -265,8 +255,6 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     return {
       parallelism: parallelismRaw === 'auto' ? 'auto' : parseInt(parallelismRaw, 10),
       method: form.querySelector('[name="method"]').value,
-      pValueThreshold: parseFloat(form.querySelector('[name="pValueThreshold"]').value),
-      fcThreshold: parseFloat(form.querySelector('[name="fcThreshold"]').value),
       // Batch configuration for optimized loading
       batchConfig: {
         preloadCount: batchSizeRaw ? parseInt(batchSizeRaw, 10) : undefined,
@@ -297,20 +285,14 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       batchConfig: formValues.batchConfig || {}
     });
 
-    const pValueThreshold = Number.isFinite(formValues.pValueThreshold)
-      ? formValues.pValueThreshold
-      : 0.05;
-    const foldChangeThreshold = Number.isFinite(formValues.fcThreshold)
-      ? formValues.fcThreshold
-      : 1.0;
-
+    // Use default thresholds - these can be adjusted dynamically in the results view
     return {
       type: 'differential',
       plotType: 'volcanoplot',
       data: deResults,
       options: {
-        pValueThreshold,
-        foldChangeThreshold,
+        pValueThreshold: 0.05,
+        foldChangeThreshold: 1.0,
         useAdjustedPValue: true,
         labelTopN: 15
       },
@@ -331,6 +313,8 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
    */
   async _showResult(result) {
     this._resultContainer.classList.remove('hidden');
+    // Purge any existing plots to prevent WebGL memory leaks
+    purgePlot(this._resultContainer.querySelector('.analysis-preview-plot'));
     this._resultContainer.innerHTML = '';
 
     // Volcano plot container - directly under the run button, no header
@@ -376,46 +360,65 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
 
   /**
    * Render DE statistics in modal
+   * Statistics are dynamically calculated based on current threshold settings
    * @param {HTMLElement} container - Modal stats container
    */
   _renderModalStats(container) {
     const result = this._lastResult;
-    const summary = result?.data?.summary;
+    const results = result?.data?.results;
+    const options = PlotRegistry.mergeOptions('volcanoplot', result?.options || {});
 
-    if (!summary) {
+    if (!results || results.length === 0) {
       container.innerHTML = '<p class="modal-stats-placeholder">Statistics not available</p>';
       return;
     }
+
+    const {
+      pValueThreshold = 0.05,
+      foldChangeThreshold = 1.0,
+      useAdjustedPValue = true
+    } = options;
+
+    // Calculate dynamic statistics based on current thresholds
+    let upregulated = 0;
+    let downregulated = 0;
+
+    for (const row of results) {
+      const pVal = useAdjustedPValue ? (row.adjustedPValue ?? row.pValue) : row.pValue;
+      if (!isFiniteNumber(pVal) || !isFiniteNumber(row.log2FoldChange)) continue;
+
+      const isSignificant = pVal < pValueThreshold && Math.abs(row.log2FoldChange) >= foldChangeThreshold;
+      if (isSignificant) {
+        if (row.log2FoldChange > 0) {
+          upregulated++;
+        } else {
+          downregulated++;
+        }
+      }
+    }
+
+    const significantTotal = upregulated + downregulated;
+    const pLabel = useAdjustedPValue ? 'FDR' : 'p';
 
     container.innerHTML = `
       <h5>Summary Statistics</h5>
       <table class="analysis-stats-table de-modal-stats">
         <tr>
           <td>Genes Tested</td>
-          <td><strong>${summary.totalGenes?.toLocaleString() || 'N/A'}</strong></td>
+          <td><strong>${results.length.toLocaleString()}</strong></td>
         </tr>
         <tr>
-          <td>Significant Genes (FDR < 0.05)</td>
-          <td class="significant"><strong>${summary.significantGenes?.toLocaleString() || 'N/A'}</strong></td>
+          <td>Significant (${pLabel} < ${pValueThreshold}, |log₂FC| ≥ ${foldChangeThreshold})</td>
+          <td class="significant"><strong>${significantTotal.toLocaleString()}</strong></td>
         </tr>
         <tr>
           <td>Upregulated</td>
-          <td class="up"><strong>${summary.upregulated?.toLocaleString() || 'N/A'}</strong></td>
+          <td class="up"><strong>${upregulated.toLocaleString()}</strong></td>
         </tr>
         <tr>
           <td>Downregulated</td>
-          <td class="down"><strong>${summary.downregulated?.toLocaleString() || 'N/A'}</strong></td>
+          <td class="down"><strong>${downregulated.toLocaleString()}</strong></td>
         </tr>
-        ${summary.meanExpression !== undefined ? `
-        <tr>
-          <td>Mean Expression (A)</td>
-          <td><strong>${summary.meanExpressionA?.toFixed(3) || 'N/A'}</strong></td>
-        </tr>
-        <tr>
-          <td>Mean Expression (B)</td>
-          <td><strong>${summary.meanExpressionB?.toFixed(3) || 'N/A'}</strong></td>
-        </tr>
-        ` : ''}
       </table>
     `;
   }
@@ -443,7 +446,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     const getPValue = (row) => {
       if (!row) return null;
       const raw = useAdjustedPValue ? (row.adjustedPValue ?? row.pValue) : row.pValue;
-      return typeof raw === 'number' && Number.isFinite(raw) ? raw : null;
+      return isFiniteNumber(raw) ? raw : null;
     };
 
     const passesThresholds = (row) => {
@@ -452,7 +455,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       if (p >= pValueThreshold) return false;
 
       const fc = row?.log2FoldChange;
-      if (typeof fc !== 'number' || !Number.isFinite(fc)) return false;
+      if (!isFiniteNumber(fc)) return false;
       return Math.abs(fc) >= foldChangeThreshold;
     };
 

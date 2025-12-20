@@ -17,7 +17,8 @@ import {
   validateOptionsAgainstSchema,
   mergeOptions
 } from './analysis-types.js';
-import { filterFiniteNumbers, getFiniteMinMax } from '../shared/number-utils.js';
+import { filterFiniteNumbers, getFiniteMinMax, mean } from '../shared/number-utils.js';
+import { debug, debugWarn, debugError } from '../shared/debug-utils.js';
 
 // Re-export validation functions for index.js
 export { validatePluginContract, validateOptionsAgainstSchema, mergeOptions };
@@ -65,25 +66,25 @@ export class BasePluginRegistry {
     const validation = validatePluginContract(plugin, this._pluginType);
 
     if (!validation.valid) {
-      console.error(`[${this._name}] Failed to register '${plugin?.id}':`, validation.errors);
+      debugError(this._name, `Failed to register '${plugin?.id}':`, validation.errors);
       return false;
     }
 
     if (validation.warnings.length > 0) {
-      console.warn(`[${this._name}] Warnings for '${plugin.id}':`, validation.warnings);
+      debugWarn(this._name, `Warnings for '${plugin.id}':`, validation.warnings);
     }
 
     // Check required methods
     for (const method of this._requiredMethods) {
       if (typeof plugin[method] !== 'function') {
-        console.error(`[${this._name}] Plugin '${plugin.id}' missing required method: ${method}`);
+        debugError(this._name, `Plugin '${plugin.id}' missing required method: ${method}`);
         return false;
       }
     }
 
     // Check for duplicate
     if (this._plugins.has(plugin.id)) {
-      console.warn(`[${this._name}] Overwriting existing plugin: ${plugin.id}`);
+      debugWarn(this._name, `Overwriting existing plugin: ${plugin.id}`);
     }
 
     // Normalize plugin
@@ -251,7 +252,7 @@ export class BasePluginRegistry {
         try {
           handler(data);
         } catch (e) {
-          console.error(`[${this._name}] Event handler error:`, e);
+          debugError(this._name, 'Event handler error:', e);
         }
       }
     }
@@ -442,7 +443,7 @@ export class TransformPluginRegistry extends BasePluginRegistry {
     }
 
     this._initialized = true;
-    console.log(`[TransformRegistry] Initialized (GPU: ${this._gpuAvailable}, Worker: ${this._workerAvailable})`);
+    debug('TransformRegistry', `Initialized (GPU: ${this._gpuAvailable}, Worker: ${this._workerAvailable})`);
     this._emit('init');
   }
 
@@ -561,7 +562,7 @@ export class TransformPluginRegistry extends BasePluginRegistry {
     } catch (err) {
       // Fallback to CPU if accelerated backend fails
       if (backend !== 'cpu') {
-        console.warn(`[TransformRegistry] ${backend} execution failed, falling back to CPU:`, err.message);
+        debugWarn('TransformRegistry', `${backend} execution failed, falling back to CPU:`, err.message);
         result = await plugin.execute(data, mergedOptions, {
           ...context,
           backend: 'cpu',
@@ -676,7 +677,7 @@ class PluginManager {
     ]);
 
     this._initialized = true;
-    console.log('[PluginManager] All registries initialized');
+    debug('PluginManager', 'All registries initialized');
   }
 
   /**
@@ -831,9 +832,9 @@ export const PlotHelpers = {
 
     const min = sorted[0];
     const max = sorted[n - 1];
-    const mean = sorted.reduce((a, b) => a + b, 0) / n;
+    const meanVal = mean(sorted);
 
-    return { min, max, q1, median, q3, iqr, lowerFence, upperFence, mean, n };
+    return { min, max, q1, median, q3, iqr, lowerFence, upperFence, mean: meanVal, n };
   },
 
   /**

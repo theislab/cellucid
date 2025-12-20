@@ -105,3 +105,110 @@ export {
 // =============================================================================
 
 export { PlotRegistry } from './plot-registry-utils.js';
+
+// =============================================================================
+// NUMBER UTILITIES
+// =============================================================================
+
+export {
+  isFiniteNumber,
+  mean,
+  variance,
+  std,
+  median,
+  computeStats,
+  filterFiniteNumbers,
+  getFiniteMinMax
+} from './number-utils.js';
+
+// =============================================================================
+// ANALYSIS UTILITIES
+// =============================================================================
+
+export {
+  runAnalysisWithLoadingState,
+  createLoadingState,
+  validatePageRequirements,
+  getRequirementText,
+  toCSVCell,
+  downloadCSV,
+  pageDataToCSV,
+  deResultsToCSV,
+  signatureScoresToCSV,
+  correlationResultsToCSV,
+  getFormValues,
+  getTypedFormValues,
+  computeBasicStats,
+  computeEffectSize,
+  resolvePageNames,
+  getPageInfo
+} from './analysis-utils.js';
+
+// =============================================================================
+// DEBUG UTILITIES
+// =============================================================================
+
+export {
+  enableDebug,
+  disableDebug,
+  debug,
+  debugWarn,
+  debugError,
+  debugGroup,
+  debugTime,
+  debugMeasure,
+  debugOnly,
+  debugInspect
+} from './debug-utils.js';
+
+// =============================================================================
+// ERROR HANDLING
+// =============================================================================
+
+export {
+  AnalysisError,
+  DataError,
+  ComputeError,
+  CancelledError,
+  TimeoutError,
+  ERROR_MESSAGES,
+  getErrorMessage,
+  isCancellationError,
+  isTimeoutError,
+  formatErrorForUser,
+  handleError,
+  wrapAsync,
+  tryAsync,
+  withTimeout,
+  retry
+} from './error-utils.js';
+
+// =============================================================================
+// CANCELLABLE OPERATIONS
+// =============================================================================
+
+export {
+  OperationContext,
+  CancellableOperation,
+  OperationManager,
+  createOperationContext,
+  withCancellation,
+  createRequestIdTracker
+} from './cancellable-operation.js';
+
+// =============================================================================
+// RESULT RENDERING
+// =============================================================================
+
+export {
+  renderStatsGrid,
+  renderDESummaryStats,
+  renderSignatureSummaryStats,
+  renderDataTable,
+  renderDEGenesTable,
+  renderResultSection,
+  createPlotContainer,
+  renderGeneChips,
+  renderDEResults,
+  renderSignatureResults
+} from './result-renderer.js';

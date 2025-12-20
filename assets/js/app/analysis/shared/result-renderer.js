@@ -17,6 +17,12 @@ import {
   createActionsBar,
   createFormButton
 } from './dom-utils.js';
+import {
+  filterFiniteNumbers,
+  mean,
+  median,
+  std
+} from './number-utils.js';
 
 // =============================================================================
 // STATISTICS DISPLAY
@@ -119,7 +125,7 @@ export function renderSignatureSummaryStats(container, pageData) {
   const tbody = table.querySelector('tbody');
 
   for (const pd of pageData) {
-    const values = pd.values.filter(v => typeof v === 'number' && Number.isFinite(v));
+    const values = filterFiniteNumbers(pd.values);
     const n = values.length;
 
     if (n === 0) {
@@ -132,17 +138,16 @@ export function renderSignatureSummaryStats(container, pageData) {
       continue;
     }
 
-    const mean = values.reduce((a, b) => a + b, 0) / n;
-    const sorted = [...values].sort((a, b) => a - b);
-    const median = n % 2 === 0 ? (sorted[n/2-1] + sorted[n/2]) / 2 : sorted[Math.floor(n/2)];
-    const std = Math.sqrt(values.reduce((a, b) => a + (b - mean) ** 2, 0) / n);
+    const meanVal = mean(values);
+    const medianVal = median(values);
+    const stdVal = std(values);
 
     tbody.innerHTML += `
       <tr>
         <td>${pd.pageName}</td>
-        <td>${mean.toFixed(3)}</td>
-        <td>${median.toFixed(3)}</td>
-        <td>${std.toFixed(3)}</td>
+        <td>${meanVal.toFixed(3)}</td>
+        <td>${medianVal.toFixed(3)}</td>
+        <td>${stdVal.toFixed(3)}</td>
         <td>${n.toLocaleString()}</td>
       </tr>
     `;

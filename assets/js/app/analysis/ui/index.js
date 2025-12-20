@@ -66,13 +66,14 @@ export {
 
 // Selectors
 export {
-  PlotRegistry,
   createVariableSelector,
   createGeneExpressionSelector,
   createPageSelector,
   createPageMultiSelect,
   createPlotTypeSelector
 } from './components/selectors.js';
+
+// PlotRegistry should be imported from '../shared/plot-registry-utils.js'
 
 // Modal
 export {

@@ -18,6 +18,8 @@ import {
 } from '../../shared/dom-utils.js';
 import { correlationResultsToCSV, downloadCSV } from '../../shared/analysis-utils.js';
 import { createVariableSelectorComponent } from '../shared/variable-selector.js';
+import { purgePlot } from '../../plots/plotly-loader.js';
+import { isFiniteNumber } from '../../shared/number-utils.js';
 
 /**
  * @typedef {{ type: 'continuous_obs'|'gene_expression', key: string }} CorrelationVariable
@@ -112,9 +114,13 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
    * @private
    */
   _hideStaleResult() {
+    // Clear stale results aggressively to free large x/y arrays and Plotly buffers.
     if (this._resultContainer) {
+      purgePlot(this._resultContainer.querySelector('.analysis-preview-plot'));
+      this._resultContainer.innerHTML = '';
       this._resultContainer.classList.add('hidden');
     }
+    this._lastResult = null;
   }
 
   /**
@@ -193,6 +199,8 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
 
   async _showResult(result) {
     this._resultContainer.classList.remove('hidden');
+    // Purge any existing plots to prevent WebGL memory leaks
+    purgePlot(this._resultContainer.querySelector('.analysis-preview-plot'));
     this._resultContainer.innerHTML = '';
 
     const header = createResultHeader(result.title, result.subtitle);
@@ -244,9 +252,9 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
 
     const rows = results.map(r => {
       const hasError = !!r.error;
-      const rVal = typeof r.r === 'number' && Number.isFinite(r.r) ? r.r.toFixed(4) : 'N/A';
-      const r2Val = typeof r.rSquared === 'number' && Number.isFinite(r.rSquared) ? r.rSquared.toFixed(4) : 'N/A';
-      const pVal = typeof r.pValue === 'number' && Number.isFinite(r.pValue) ? r.pValue.toExponential(3) : 'N/A';
+      const rVal = isFiniteNumber(r.r) ? r.r.toFixed(4) : 'N/A';
+      const r2Val = isFiniteNumber(r.rSquared) ? r.rSquared.toFixed(4) : 'N/A';
+      const pVal = isFiniteNumber(r.pValue) ? r.pValue.toExponential(3) : 'N/A';
       const nVal = typeof r.n === 'number' ? r.n.toLocaleString() : (Array.isArray(r.xValues) ? r.xValues.length.toLocaleString() : 'N/A');
 
       return `
@@ -286,7 +294,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     }
 
     const rows = results
-      .filter(r => !r.error && typeof r.r === 'number' && Number.isFinite(r.r))
+      .filter(r => !r.error && isFiniteNumber(r.r))
       .map(r => {
         const absR = Math.abs(r.r);
         let strengthLabel, strengthClass;

@@ -32,6 +32,13 @@ import {
   loadLatentEmbeddings,
   loadAnalysisBulkObsData
 } from '../../../data/data-loaders.js';
+import {
+  filterFiniteNumbers,
+  mean as computeMean,
+  std as computeStd,
+  median as computeMedian
+} from '../shared/number-utils.js';
+import { debugWarn } from '../shared/debug-utils.js';
 
 // =============================================================================
 // TYPE DEFINITIONS
@@ -289,7 +296,7 @@ export class DataLayer {
       case 'gene_expression':
         return this._getGeneExpressionVariables();
       default:
-        console.warn(`[DataLayer] Unknown variable type: ${type}`);
+        debugWarn('DataLayer', `Unknown variable type: ${type}`);
         return [];
     }
   }
@@ -478,7 +485,7 @@ export class DataLayer {
 
       const total = this.state?.pointCount || 0;
       if (!Number.isFinite(total) || total <= 0) {
-        console.warn(`[DataLayer] Cannot compute derived page indices without pointCount (pageId=${pageId})`);
+        debugWarn('DataLayer', `Cannot compute derived page indices without pointCount (pageId=${pageId})`);
         return [];
       }
 
@@ -510,7 +517,7 @@ export class DataLayer {
 
     const page = this.getPages().find(p => p.id === pageId);
     if (!page) {
-      console.warn(`[DataLayer] Page not found: ${pageId}`);
+      debugWarn('DataLayer', `Page not found: ${pageId}`);
       return [];
     }
 
@@ -559,7 +566,7 @@ export class DataLayer {
         await this.state.ensureVarFieldLoaded(fieldIndex, { silent });
       }
     } catch (err) {
-      console.warn(`[DataLayer] Failed to load field at index ${fieldIndex}:`, err);
+      debugWarn('DataLayer', `Failed to load field at index ${fieldIndex}:`, err);
     }
   }
 
@@ -717,7 +724,7 @@ export class DataLayer {
     // Get the variable info and field
     const variableInfo = this.getVariableInfo(type, variableKey);
     if (!variableInfo) {
-      console.warn(`[DataLayer] Variable not found: ${variableKey} (type: ${type})`);
+      debugWarn('DataLayer', `Variable not found: ${variableKey} (type: ${type})`);
       return [];
     }
 
@@ -728,7 +735,7 @@ export class DataLayer {
       : this.state.obsData?.fields;
 
     if (!fields) {
-      console.warn(`[DataLayer] No ${source} fields available`);
+      debugWarn('DataLayer', `No ${source} fields available`);
       return [];
     }
 
@@ -736,7 +743,7 @@ export class DataLayer {
     const field = fields[fieldIndex];
 
     if (!field) {
-      console.warn(`[DataLayer] Field not found at index ${fieldIndex}`);
+      debugWarn('DataLayer', `Field not found at index ${fieldIndex}`);
       return [];
     }
 
@@ -778,7 +785,7 @@ export class DataLayer {
       : field.values;
 
     if (!rawValues || rawValues.length === 0) {
-      console.warn(`[DataLayer] No values for field: ${variableKey}`);
+      debugWarn('DataLayer', `No values for field: ${variableKey}`);
       return [];
     }
 
@@ -791,7 +798,7 @@ export class DataLayer {
     for (const pageId of pageIds) {
       const pageInfo = this.getPageInfo(pageId);
       if (!pageInfo) {
-        console.warn(`[DataLayer] Page not found: ${pageId}`);
+        debugWarn('DataLayer', `Page not found: ${pageId}`);
         continue;
       }
 
@@ -922,7 +929,7 @@ export class DataLayer {
     } else {
       // Aggregate continuous statistics
       const allValues = pageData.flatMap(pd => pd.values);
-      const validValues = allValues.filter(v => typeof v === 'number' && Number.isFinite(v));
+      const validValues = filterFiniteNumbers(allValues);
 
       if (validValues.length === 0) {
         return {
@@ -1203,6 +1210,15 @@ export class DataLayer {
   }
 
   /**
+   * Clear only the bulk gene cache (largest memory consumer).
+   * Useful after gene-heavy analyses that shouldn't keep multi-gene page caches alive.
+   */
+  clearBulkGeneCache() {
+    this._bulkGeneCache.clear();
+    this._bulkGeneCacheAccessOrder = [];
+  }
+
+  /**
    * Clear all caches including bulk gene cache
    */
   clearAllCaches() {
@@ -1210,8 +1226,7 @@ export class DataLayer {
     if (this._dataCache) {
       this._dataCache.clear();
     }
-    this._bulkGeneCache.clear();
-    this._bulkGeneCacheAccessOrder = [];
+    this.clearBulkGeneCache();
     this._prefetchQueue = [];
 
     if (this._prefetchTimeout) {
@@ -1666,7 +1681,7 @@ export class DataLayer {
             result.stats.genesLoaded++;
           }
         } catch (error) {
-          console.warn('[DataLayer] Bulk loader failed, falling back to sequential:', error.message);
+          debugWarn('DataLayer', 'Bulk loader failed, falling back to sequential:', error.message);
           await this._loadGenesSequentially(genes, pageIds, result);
         }
       } else {
@@ -1715,7 +1730,7 @@ export class DataLayer {
           if (onProgress) onProgress(100);
         }
       } catch (error) {
-        console.warn('[DataLayer] Failed to load latent embeddings:', error.message);
+        debugWarn('DataLayer', 'Failed to load latent embeddings:', error.message);
       }
     }
 
@@ -1759,7 +1774,7 @@ export class DataLayer {
         }
         result.stats.genesLoaded++;
       } catch (err) {
-        console.warn(`[DataLayer] Failed to load gene ${gene}:`, err.message);
+        debugWarn('DataLayer', `Failed to load gene ${gene}:`, err.message);
       }
     }
   }
@@ -1890,7 +1905,7 @@ export class DataLayer {
             result.stats.fieldsLoaded++;
           }
         } catch (error) {
-          console.warn('[DataLayer] Bulk obs loader failed, falling back to sequential:', error.message);
+          debugWarn('DataLayer', 'Bulk obs loader failed, falling back to sequential:', error.message);
           await this._loadObsFieldsSequentially(obsFields, pageIds, result, handleProgress);
         }
       } else {
@@ -1957,7 +1972,7 @@ export class DataLayer {
         }
         result.stats.fieldsLoaded++;
       } catch (err) {
-        console.warn(`[DataLayer] Failed to load obs field ${fieldKey}:`, err.message);
+        debugWarn('DataLayer', `Failed to load obs field ${fieldKey}:`, err.message);
       }
     }
   }
@@ -2081,7 +2096,7 @@ export class DataLayer {
           }
         }
       } catch (error) {
-        console.warn('[DataLayer] Failed to load latent embeddings:', error.message);
+        debugWarn('DataLayer', 'Failed to load latent embeddings:', error.message);
       }
       completedSteps++;
     }
@@ -2109,40 +2124,36 @@ export class DataLayer {
       const result = await computeManager.computeStats(pageData.values);
       return result;
     } catch (err) {
-      console.warn('[DataLayer] Compute stats failed, using local fallback:', err.message);
+      debugWarn('DataLayer', 'Compute stats failed, using local fallback:', err.message);
       return this._computeStatsLocal(pageData.values);
     }
   }
 
   /**
    * Local stats computation fallback
+   * Uses centralized statistics utilities from number-utils.js
    * @param {number[]} values - Values to compute stats for
    * @returns {BasicStats}
    * @private
    */
   _computeStatsLocal(values) {
-    const numericValues = values.filter(v => typeof v === 'number' && Number.isFinite(v));
+    const numericValues = filterFiniteNumbers(values);
 
     if (numericValues.length === 0) {
       return { count: 0, min: null, max: null, mean: null, median: null, std: null };
     }
 
+    // Sort once for quartiles and min/max
     const sorted = [...numericValues].sort((a, b) => a - b);
     const n = sorted.length;
-    const sum = numericValues.reduce((a, b) => a + b, 0);
-    const mean = sum / n;
-    const variance = numericValues.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / n;
-
-    const mid = Math.floor(n / 2);
-    const median = n % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
 
     return {
       count: n,
       min: sorted[0],
       max: sorted[n - 1],
-      mean,
-      median,
-      std: Math.sqrt(variance),
+      mean: computeMean(numericValues),
+      median: computeMedian(numericValues),
+      std: computeStd(numericValues),
       q1: sorted[Math.floor(n * 0.25)],
       q3: sorted[Math.floor(n * 0.75)]
     };
@@ -2162,7 +2173,7 @@ export class DataLayer {
       const result = await computeManager.aggregateCategories(pageData.values, normalize);
       return result;
     } catch (err) {
-      console.warn('[DataLayer] Compute aggregation failed, using local fallback:', err.message);
+      debugWarn('DataLayer', 'Compute aggregation failed, using local fallback:', err.message);
       return this._aggregateCategoriesLocal(pageData.values, normalize);
     }
   }
@@ -2231,8 +2242,8 @@ export class DataLayer {
       const dataB = analysisData.genes[gene]?.[pageB]?.values || [];
 
       // Filter valid numeric values
-      const valsA = Array.from(dataA).filter(v => typeof v === 'number' && Number.isFinite(v));
-      const valsB = Array.from(dataB).filter(v => typeof v === 'number' && Number.isFinite(v));
+      const valsA = filterFiniteNumbers(Array.from(dataA));
+      const valsB = filterFiniteNumbers(Array.from(dataB));
 
       try {
         const result = await computeManager.computeDifferential(valsA, valsB, method);

@@ -340,6 +340,9 @@ export class BaseAnalysisUI {
    */
   _hidePreview() {
     if (this._previewContainer) {
+      // Purge any existing plot to prevent WebGL memory leaks
+      const plotEl = this._previewContainer.querySelector('.analysis-preview-plot');
+      if (plotEl) purgePlot(plotEl);
       this._previewContainer.innerHTML = '';
       this._previewContainer.classList.add('empty');
       this._previewContainer.classList.remove('loading');

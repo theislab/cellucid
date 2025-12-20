@@ -456,73 +456,45 @@ class PerformanceConfigManager {
    * Get UI-friendly options for batch size selector
    * @param {number} cellCount - Cells in dataset
    * @param {number} geneCount - Genes in dataset
-   * @returns {Array<{value: number, label: string, recommended: boolean}>}
+   * @returns {Array<{value: number, label: string, description: string, selected?: boolean}>}
    */
   getBatchSizeOptions(cellCount, geneCount) {
-    const recommended = this.getRecommendedSettings(cellCount, geneCount);
-    const options = [
-      { value: 50, label: '50 genes (minimal memory)' },
-      { value: 100, label: '100 genes' },
-      { value: 200, label: '200 genes' },
-      { value: 500, label: '500 genes' },
-      { value: 1000, label: '1000 genes (max prefetch)' }
+    return [
+      { value: 50, label: '50 genes', description: 'Minimal memory usage, suitable for constrained environments.' },
+      { value: 100, label: '100 genes', description: 'Reduced memory footprint for standard workstations.' },
+      { value: 200, label: '200 genes', description: 'Moderate throughput with manageable memory consumption.' },
+      { value: 500, label: '500 genes', description: 'Balanced throughput and resource usage for most systems.', selected: true },
+      { value: 1000, label: '1000 genes', description: 'Maximum throughput, requires significant available memory.' }
     ];
-
-    // Mark recommended option
-    let bestMatch = options[2]; // default to 100
-    let bestDiff = Infinity;
-    for (const opt of options) {
-      const diff = Math.abs(opt.value - recommended.preloadCount);
-      if (diff < bestDiff) {
-        bestDiff = diff;
-        bestMatch = opt;
-      }
-    }
-    bestMatch.recommended = true;
-    bestMatch.label += ' (recommended)';
-
-    return options;
   }
 
   /**
    * Get UI-friendly options for memory budget selector
-   * @returns {Array<{value: number, label: string}>}
+   * @returns {Array<{value: number, label: string, description: string, selected?: boolean}>}
    */
   getMemoryBudgetOptions() {
     return [
-      { value: 256, label: '256 MB (conservative)' },
-      { value: 512, label: '512 MB (balanced)' },
-      { value: 1024, label: '1 GB' },
-      { value: 2048, label: '2 GB' },
-      { value: 4096, label: '4 GB (fast)' },
-      { value: 8192, label: '8 GB (maximum)' }
+      { value: 256, label: '256 MB', description: 'Minimal footprint for memory-constrained systems.' },
+      { value: 512, label: '512 MB', description: 'Standard allocation suitable for typical usage.' },
+      { value: 1024, label: '1 GB', description: 'Extended capacity for larger datasets.' },
+      { value: 2048, label: '2 GB', description: 'High capacity for complex multi-gene analyses.' },
+      { value: 4096, label: '4 GB', description: 'Premium allocation for intensive workloads.', selected: true },
+      { value: 8192, label: '8 GB', description: 'Maximum allocation for high-performance systems.' }
     ];
   }
 
   /**
    * Get UI-friendly options for network concurrency selector
-   * @param {number} [recommendedValue] - Recommended concurrency value
-   * @returns {Array<{value: number, label: string, recommended?: boolean}>}
+   * @returns {Array<{value: number, label: string, description: string, selected?: boolean}>}
    */
-  getNetworkConcurrencyOptions(recommendedValue = 6) {
-    const options = [
-      { value: 4, label: '4 parallel (conservative)' },
-      { value: 6, label: '6 parallel (balanced)' },
-      { value: 10, label: '10 parallel (fast)' },
-      { value: 20, label: '20 parallel (aggressive)' },
-      { value: 50, label: '50 parallel (maximum)' }
+  getNetworkConcurrencyOptions() {
+    return [
+      { value: 4, label: '4 parallel', description: 'Conservative setting for limited bandwidth connections.' },
+      { value: 6, label: '6 parallel', description: 'Moderate concurrency for standard network connections.' },
+      { value: 10, label: '10 parallel', description: 'Optimized for high-bandwidth networks.', selected: true },
+      { value: 20, label: '20 parallel', description: 'Aggressive concurrency for enterprise networks.' },
+      { value: 50, label: '50 parallel', description: 'Maximum concurrent requests, may saturate connections.' }
     ];
-
-    // Mark recommended option
-    for (const opt of options) {
-      if (opt.value === recommendedValue || (opt.value <= recommendedValue && options.find(o => o.value > recommendedValue)?.value !== opt.value)) {
-        opt.recommended = true;
-        opt.label += ' (recommended)';
-        break;
-      }
-    }
-
-    return options;
   }
 }
 

@@ -6,7 +6,7 @@
  * Refactored to use PlotFactory for reduced code duplication.
  */
 
-import { PlotFactory, PlotRegistry, BasePlot, COMMON_HOVER_STYLE } from '../plot-factory.js';
+import { PlotFactory, PlotRegistry, BasePlot, COMMON_HOVER_STYLE, createMinimalPlotly } from '../plot-factory.js';
 
 /**
  * Process categories for a page (count, sort, limit)
@@ -121,6 +121,12 @@ const pieplotDefinition = {
 
   async update(figure, pageData, options, layoutEngine) {
     // Pie charts need full re-render when domain layouts change
+    try {
+      const Plotly = await createMinimalPlotly();
+      Plotly.purge?.(figure);
+    } catch (_purgeErr) {
+      // Ignore purge failures
+    }
     return this.render(pageData, options, figure, layoutEngine);
   },
 

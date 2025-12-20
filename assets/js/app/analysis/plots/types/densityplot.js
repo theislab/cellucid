@@ -8,7 +8,7 @@
 
 import { PlotFactory, PlotRegistry, BasePlot, COMMON_HOVER_STYLE } from '../plot-factory.js';
 import { getScatterTraceType } from '../plotly-loader.js';
-import { filterFiniteNumbers, getFiniteMinMax } from '../../shared/number-utils.js';
+import { filterFiniteNumbers, getFiniteMinMax, mean, std } from '../../shared/number-utils.js';
 
 /**
  * Simple kernel density estimation using Gaussian kernel
@@ -32,10 +32,8 @@ function kernelDensity(data, bandwidth = 'auto', nPoints = 100) {
   // Calculate bandwidth using Silverman's rule of thumb if auto
   let h = bandwidth;
   if (bandwidth === 'auto') {
-    const mean = validData.reduce((a, b) => a + b, 0) / n;
-    const variance = validData.reduce((a, b) => a + (b - mean) ** 2, 0) / n;
-    const std = Math.sqrt(variance);
-    h = 1.06 * std * Math.pow(n, -0.2);
+    const stdVal = std(validData);
+    h = 1.06 * stdVal * Math.pow(n, -0.2);
     if (h <= 0 || !Number.isFinite(h)) h = range / 10;
   }
 
@@ -73,10 +71,8 @@ function getBandwidthMultiplier(bandwidth) {
 function calculateDensity(values, bandwidthMult) {
   let { x, y } = kernelDensity(values, 'auto');
   if (bandwidthMult !== 1 && values.length > 0) {
-    const mean = values.reduce((a, b) => a + b, 0) / values.length;
-    const variance = values.reduce((a, b) => a + (b - mean) ** 2, 0) / values.length;
-    const std = Math.sqrt(variance);
-    const h = 1.06 * std * Math.pow(values.length, -0.2) * bandwidthMult;
+    const stdVal = std(values);
+    const h = 1.06 * stdVal * Math.pow(values.length, -0.2) * bandwidthMult;
     const recalc = kernelDensity(values, h);
     x = recalc.x;
     y = recalc.y;
@@ -154,11 +150,11 @@ const densityplotDefinition = {
       pageData.forEach((pd, i) => {
         const values = BasePlot.filterNumeric(pd.values);
         if (values.length === 0) return;
-        const mean = values.reduce((a, b) => a + b, 0) / values.length;
+        const meanVal = mean(values);
         const color = BasePlot.getPageColor(layoutEngine, pd.pageId, i);
         layout.shapes.push({
           type: 'line',
-          x0: mean, x1: mean, y0: 0, y1: 1,
+          x0: meanVal, x1: meanVal, y0: 0, y1: 1,
           yref: 'paper',
           line: { color, width: 2, dash: 'dash' }
         });

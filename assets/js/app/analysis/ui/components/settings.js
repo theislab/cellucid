@@ -13,7 +13,7 @@
  * - Effect size display options
  */
 
-import { getFiniteMinMax } from '../../shared/number-utils.js';
+import { getFiniteMinMax, mean, std } from '../../shared/number-utils.js';
 
 // =============================================================================
 // ANALYSIS SETTINGS DEFINITIONS
@@ -428,17 +428,16 @@ export function applyAnalysisSettings(values, settings = {}) {
   const q1 = validValues[Math.floor(n * 0.25)];
   const q3 = validValues[Math.floor(n * 0.75)];
   const iqr = q3 - q1;
-  const mean = validValues.reduce((a, b) => a + b, 0) / n;
-  const variance = validValues.reduce((a, b) => a + (b - mean) ** 2, 0) / n;
-  const std = Math.sqrt(variance);
+  const meanVal = mean(validValues);
+  const stdVal = std(validValues);
 
   // MAD calculation
-  const median = validValues[Math.floor(n * 0.5)];
-  const deviations = validValues.map(v => Math.abs(v - median)).sort((a, b) => a - b);
+  const medianVal = validValues[Math.floor(n * 0.5)];
+  const deviations = validValues.map(v => Math.abs(v - medianVal)).sort((a, b) => a - b);
   const mad = deviations[Math.floor(n * 0.5)] * 1.4826; // Scale factor for consistency
 
-  stats.original.mean = mean;
-  stats.original.std = std;
+  stats.original.mean = meanVal;
+  stats.original.std = stdVal;
   stats.original.min = validValues[0];
   stats.original.max = validValues[n - 1];
 
@@ -478,8 +477,8 @@ export function applyAnalysisSettings(values, settings = {}) {
       break;
     }
     case 'mad': {
-      const madLower = median - 3 * mad;
-      const madUpper = median + 3 * mad;
+      const madLower = medianVal - 3 * mad;
+      const madUpper = medianVal + 3 * mad;
       for (let i = 0; i < data.length; i++) {
         if (Number.isFinite(data[i]) && (data[i] < madLower || data[i] > madUpper)) {
           data[i] = NaN;
@@ -501,10 +500,8 @@ export function applyAnalysisSettings(values, settings = {}) {
     return { values: data, stats, excluded };
   }
 
-  const newN = validValues.length;
-  const newMean = validValues.reduce((a, b) => a + b, 0) / newN;
-  const newVariance = validValues.reduce((a, b) => a + (b - newMean) ** 2, 0) / newN;
-  const newStd = Math.sqrt(newVariance);
+  const newMean = mean(validValues);
+  const newStd = std(validValues);
   const { min: newMin, max: newMax } = getFiniteMinMax(validValues);
 
   // Step 4: Apply normalization
@@ -561,7 +558,7 @@ export function applyAnalysisSettings(values, settings = {}) {
 
   if (validValues.length > 0) {
     stats.processed.count = validValues.length;
-    stats.processed.mean = validValues.reduce((a, b) => a + b, 0) / validValues.length;
+    stats.processed.mean = mean(validValues);
     const { min, max } = getFiniteMinMax(validValues);
     stats.processed.min = min;
     stats.processed.max = max;

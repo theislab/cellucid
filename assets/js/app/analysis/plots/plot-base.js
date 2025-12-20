@@ -14,6 +14,7 @@
 
 import { PlotHelpers, getPageColor, PAGE_COLORS } from '../core/plugin-contract.js';
 import { createMinimalPlotly, getPlotlyConfig } from './plotly-loader.js';
+import { isFiniteNumber } from '../shared/number-utils.js';
 
 /**
  * Common hover label style used by all plots
@@ -67,7 +68,7 @@ export class BasePlot {
    * @returns {number[]} Filtered numeric values
    */
   static filterNumeric(values) {
-    return values.filter(v => typeof v === 'number' && Number.isFinite(v));
+    return values.filter(v => isFiniteNumber(v));
   }
 
   /**
@@ -92,7 +93,7 @@ export class BasePlot {
 
     for (const pd of pageData) {
       for (const v of pd.values) {
-        if (typeof v === 'number' && Number.isFinite(v)) {
+        if (isFiniteNumber(v)) {
           if (v < globalMin) globalMin = v;
           if (v > globalMax) globalMax = v;
         }

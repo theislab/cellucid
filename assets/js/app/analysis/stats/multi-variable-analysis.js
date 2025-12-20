@@ -17,6 +17,9 @@ import { waitForAvailableSlot } from '../shared/concurrency-utils.js';
 import { StreamingGeneLoader } from '../data/streaming-gene-loader.js';
 import { PerformanceConfig } from '../shared/performance-config.js';
 import { ProgressTracker } from '../shared/progress-tracker.js';
+import { isFiniteNumber, mean } from '../shared/number-utils.js';
+import { startMemoryTracking } from '../shared/memory-tracker.js';
+import { bestEffortCleanupAnalysisResources } from '../shared/resource-cleanup.js';
 
 /**
  * Multi-Variable Analysis class
@@ -57,9 +60,11 @@ export class MultiVariableAnalysis {
    * @returns {Promise<Object[]>} Correlation results per page
    */
   async correlationAnalysis(options) {
+    const memScope = startMemoryTracking('Correlation', 'correlationAnalysis', { includeUserAgent: true });
     const { varX, varY, pageIds, method = 'pearson' } = options;
 
     if (!varX || !varY || !pageIds || pageIds.length === 0) {
+      memScope.end({ error: 'Invalid options' });
       throw new Error('Invalid correlation analysis options');
     }
 
@@ -85,6 +90,7 @@ export class MultiVariableAnalysis {
 
       const results = [];
       const computeManager = await this._getComputeManager();
+      const maxPlotPoints = 50000;
 
       // Compute correlation for each page
       for (let i = 0; i < pageIds.length; i++) {
@@ -101,9 +107,10 @@ export class MultiVariableAnalysis {
         }
 
         // Align values by cell index
-        const { xAligned, yAligned } = this._alignValuesByIndex(
+        const { xAligned, yAligned, xPlot, yPlot, sampled } = this._alignValuesByIndex(
           pageX.cellIndices, pageX.values,
-          pageY.cellIndices, pageY.values
+          pageY.cellIndices, pageY.values,
+          { maxPlotPoints }
         );
 
         if (xAligned.length < 3) {
@@ -116,17 +123,22 @@ export class MultiVariableAnalysis {
           continue;
         }
 
-        // Use worker for correlation computation
-        const correlation = await computeManager.computeCorrelation(xAligned, yAligned, method);
+        // Use worker for correlation computation.
+        // If we keep full arrays for plotting, avoid transferring them (so they are not detached).
+        // If we sampled for plotting, prefer transferring (frees memory on the calling side).
+        const correlation = await computeManager.computeCorrelation(xAligned, yAligned, method, {
+          transfer: sampled
+        });
 
         results.push({
           pageId: pageIds[i],
           pageName: pageX.pageName,
           ...correlation,
-          xValues: xAligned,
-          yValues: yAligned,
+          xValues: xPlot,
+          yValues: yPlot,
           xVariable: varX.key,
-          yVariable: varY.key
+          yVariable: varY.key,
+          sampled
         });
       }
 
@@ -134,42 +146,110 @@ export class MultiVariableAnalysis {
         `Correlation analysis complete (${method})`
       );
 
+      memScope.end({ pages: pageIds.length, method });
       return results;
 
     } catch (error) {
       this._notifications.fail(notificationId, `Correlation failed: ${error.message}`);
+      memScope.end({ method, error: error.message });
       throw error;
     }
   }
 
   /**
-   * Align two value arrays by matching cell indices
+   * Align two value arrays by matching cell indices.
+   *
+   * Returns paired finite values as Float32Arrays so they can be transferred to workers
+   * without pulling on DataLayer-owned buffers.
+   *
+   * For plotting, returns either full arrays (when small) or a downsampled copy.
+   *
+   * @param {ArrayLike<number>} indicesA
+   * @param {ArrayLike<number>} valuesA
+   * @param {ArrayLike<number>} indicesB
+   * @param {ArrayLike<number>} valuesB
+   * @param {{ maxPlotPoints?: number }} [options]
+   * @returns {{ xAligned: Float32Array, yAligned: Float32Array, xPlot: Float32Array, yPlot: Float32Array, sampled: boolean }}
+   * @private
    */
-  _alignValuesByIndex(indicesA, valuesA, indicesB, valuesB) {
-    const mapA = new Map();
-    for (let i = 0; i < indicesA.length; i++) {
-      mapA.set(indicesA[i], valuesA[i]);
-    }
+  _alignValuesByIndex(indicesA, valuesA, indicesB, valuesB, options = {}) {
+    const maxPlotPoints = Number.isFinite(options.maxPlotPoints)
+      ? Math.max(1, Math.floor(options.maxPlotPoints))
+      : 50000;
 
-    const xAligned = [];
-    const yAligned = [];
+    const lenA = indicesA?.length || 0;
+    const lenB = indicesB?.length || 0;
 
-    for (let i = 0; i < indicesB.length; i++) {
-      const idx = indicesB[i];
-      if (mapA.has(idx)) {
-        const xVal = mapA.get(idx);
-        const yVal = valuesB[i];
+    // First pass: count paired finite values (merge-join on sorted indices).
+    let i = 0;
+    let j = 0;
+    let count = 0;
 
-        // Only include valid numeric pairs
-        if (typeof xVal === 'number' && Number.isFinite(xVal) &&
-            typeof yVal === 'number' && Number.isFinite(yVal)) {
-          xAligned.push(xVal);
-          yAligned.push(yVal);
+    while (i < lenA && j < lenB) {
+      const idxA = indicesA[i];
+      const idxB = indicesB[j];
+
+      if (idxA === idxB) {
+        const x = valuesA[i];
+        const y = valuesB[j];
+        if (isFiniteNumber(x) && isFiniteNumber(y)) {
+          count++;
         }
+        i++;
+        j++;
+      } else if (idxA < idxB) {
+        i++;
+      } else {
+        j++;
       }
     }
 
-    return { xAligned, yAligned };
+    const xAligned = new Float32Array(count);
+    const yAligned = new Float32Array(count);
+
+    // Second pass: fill.
+    i = 0;
+    j = 0;
+    let k = 0;
+
+    while (i < lenA && j < lenB) {
+      const idxA = indicesA[i];
+      const idxB = indicesB[j];
+
+      if (idxA === idxB) {
+        const x = valuesA[i];
+        const y = valuesB[j];
+        if (isFiniteNumber(x) && isFiniteNumber(y)) {
+          xAligned[k] = x;
+          yAligned[k] = y;
+          k++;
+        }
+        i++;
+        j++;
+      } else if (idxA < idxB) {
+        i++;
+      } else {
+        j++;
+      }
+    }
+
+    const sampled = count > maxPlotPoints;
+    if (!sampled) {
+      return { xAligned, yAligned, xPlot: xAligned, yPlot: yAligned, sampled: false };
+    }
+
+    // Downsample for plotting (deterministic stride).
+    const step = Math.ceil(count / maxPlotPoints);
+    const plotCount = Math.min(maxPlotPoints, Math.ceil(count / step));
+    const xPlot = new Float32Array(plotCount);
+    const yPlot = new Float32Array(plotCount);
+
+    for (let out = 0, idx = 0; out < plotCount && idx < count; out++, idx += step) {
+      xPlot[out] = xAligned[idx];
+      yPlot[out] = yAligned[idx];
+    }
+
+    return { xAligned, yAligned, xPlot, yPlot, sampled: true };
   }
 
   // =========================================================================
@@ -186,11 +266,12 @@ export class MultiVariableAnalysis {
    * @param {string} [options.method='wilcox'] - 'wilcox' or 'ttest'
    * @param {number} [options.minCells=10] - Minimum cells required per group
    * @param {number|'auto'} [options.parallelism='auto'] - Max concurrent genes in-flight (worker-backed)
-   * @param {number} [options.maxInFlightBytes=67108864] - Soft memory budget for in-flight gene payloads
+   * @param {Object} [options.batchConfig] - Batch settings (preloadCount, memoryBudgetMB, networkConcurrency)
    * @param {Function} [options.onProgress] - Progress callback
    * @returns {Promise<Object>} Differential expression results
    */
   async differentialExpression(options) {
+    const memScope = startMemoryTracking('DE', 'differentialExpression', { includeUserAgent: true });
     const {
       pageA,
       pageB,
@@ -204,6 +285,7 @@ export class MultiVariableAnalysis {
     } = options;
 
     if (!pageA || !pageB) {
+      memScope.end({ error: 'Missing pages' });
       throw new Error('Two pages required for differential expression');
     }
 
@@ -224,6 +306,7 @@ export class MultiVariableAnalysis {
       : allGenes;
 
     if (genesToTest.length === 0) {
+      memScope.end({ error: 'No genes' });
       throw new Error('No genes available for analysis');
     }
 
@@ -258,6 +341,10 @@ export class MultiVariableAnalysis {
     });
 
     progressTracker.start();
+
+    /** @type {import('../compute/compute-manager.js').ComputeManager|null} */
+    let computeManager = null;
+    let didStartHeavyCompute = false;
 
     try {
       const pageAInfo = this.dataLayer.getPageInfo(pageA) || { id: pageA, name: pageA };
@@ -303,7 +390,8 @@ export class MultiVariableAnalysis {
       );
 
       // Compute differential expression for each gene
-      const computeManager = await this._getComputeManager();
+      computeManager = await this._getComputeManager();
+      didStartHeavyCompute = true;
 
       const workerPoolSize = computeManager.getStatus?.().worker?.stats?.poolSize || 1;
       const workersAvailable = typeof computeManager.isWorkerAvailable === 'function'
@@ -438,22 +526,31 @@ export class MultiVariableAnalysis {
       });
 
       // Calculate summary statistics
-      const significantCount = correctedResults.filter(r =>
-        r.adjustedPValue !== null && r.adjustedPValue < 0.05
-      ).length;
+      let significantCount = 0;
+      let upregulated = 0;
+      let downregulated = 0;
 
-      const upregulated = correctedResults.filter(r =>
-        r.adjustedPValue !== null && r.adjustedPValue < 0.05 && r.log2FoldChange > 0
-      ).length;
+      for (const r of correctedResults) {
+        const adj = r.adjustedPValue;
+        if (adj === null || !Number.isFinite(adj) || adj >= 0.05) continue;
 
-      const downregulated = correctedResults.filter(r =>
-        r.adjustedPValue !== null && r.adjustedPValue < 0.05 && r.log2FoldChange < 0
-      ).length;
+        significantCount++;
+        if (r.log2FoldChange > 0) upregulated++;
+        else if (r.log2FoldChange < 0) downregulated++;
+      }
 
       const duration = performance.now() - startTime;
       const stats = progressTracker.complete(
         `${significantCount} significant genes found (${(duration / 1000).toFixed(1)}s)`
       );
+
+      memScope.end({
+        genes: correctedResults.length,
+        method,
+        groupASize,
+        groupBSize,
+        durationMs: Math.round(duration)
+      });
 
       return {
         results: correctedResults,
@@ -479,7 +576,17 @@ export class MultiVariableAnalysis {
 
     } catch (error) {
       progressTracker.fail(`DE analysis failed: ${error.message}`);
+      memScope.end({ method, error: error.message });
       throw error;
+    } finally {
+      if (didStartHeavyCompute) {
+        bestEffortCleanupAnalysisResources({
+          computeManager,
+          dataLayer: this.dataLayer,
+          clearSourceCaches: true,
+          keepAtLeastIdleWorkers: 0
+        });
+      }
     }
   }
 
@@ -487,41 +594,39 @@ export class MultiVariableAnalysis {
    * Benjamini-Hochberg procedure for FDR correction
    */
   _benjaminiHochberg(results) {
-    // Get valid p-values with indices
-    const validResults = results
-      .map((r, idx) => ({ ...r, originalIndex: idx }))
-      .filter(r => Number.isFinite(r.pValue));
-
-    if (validResults.length === 0) {
-      return results.map(r => ({ ...r, adjustedPValue: null }));
+    // Initialize adjusted p-values (in-place to avoid duplicating large result arrays).
+    for (let i = 0; i < results.length; i++) {
+      results[i].adjustedPValue = null;
     }
 
-    // Sort by p-value
-    validResults.sort((a, b) => a.pValue - b.pValue);
+    // Collect valid p-values with indices.
+    const valid = [];
+    for (let i = 0; i < results.length; i++) {
+      const pValue = results[i]?.pValue;
+      if (Number.isFinite(pValue)) {
+        valid.push({ index: i, pValue });
+      }
+    }
 
-    // Calculate adjusted p-values
-    const m = validResults.length;
-    const adjustedPValues = new Array(m);
+    if (valid.length === 0) {
+      return results;
+    }
 
-    // BH procedure
-    adjustedPValues[m - 1] = validResults[m - 1].pValue;
+    // Sort by p-value.
+    valid.sort((a, b) => a.pValue - b.pValue);
+
+    // Benjamini-Hochberg procedure (in-place assignment).
+    const m = valid.length;
+    let nextAdj = valid[m - 1].pValue;
+    results[valid[m - 1].index].adjustedPValue = Math.min(nextAdj, 1);
+
     for (let i = m - 2; i >= 0; i--) {
-      const rawP = validResults[i].pValue * m / (i + 1);
-      adjustedPValues[i] = Math.min(rawP, adjustedPValues[i + 1]);
+      const rawP = valid[i].pValue * m / (i + 1);
+      nextAdj = Math.min(rawP, nextAdj);
+      results[valid[i].index].adjustedPValue = Math.min(nextAdj, 1);
     }
 
-    // Ensure adjusted p-values don't exceed 1
-    for (let i = 0; i < m; i++) {
-      adjustedPValues[i] = Math.min(adjustedPValues[i], 1);
-    }
-
-    // Map back to original results
-    const resultsCopy = results.map(r => ({ ...r, adjustedPValue: null }));
-    for (let i = 0; i < m; i++) {
-      resultsCopy[validResults[i].originalIndex].adjustedPValue = adjustedPValues[i];
-    }
-
-    return resultsCopy;
+    return results;
   }
 
   // =========================================================================
@@ -539,9 +644,11 @@ export class MultiVariableAnalysis {
    * @returns {Promise<Object[]>} Signature scores per page
    */
   async computeSignatureScore(options) {
+    const memScope = startMemoryTracking('Signature', 'computeSignatureScore', { includeUserAgent: true });
     const { genes, pageIds, method = 'mean', weights = null } = options;
 
     if (!genes || genes.length === 0) {
+      memScope.end({ error: 'No genes' });
       throw new Error('At least one gene required for signature');
     }
 
@@ -569,8 +676,8 @@ export class MultiVariableAnalysis {
         }
 
         const cellCount = firstGeneData.values.length;
-        const scores = new Array(cellCount).fill(0);
-        const validCounts = new Array(cellCount).fill(0);
+        const scores = new Float32Array(cellCount);
+        const validCounts = genes.length > 65535 ? new Uint32Array(cellCount) : new Uint16Array(cellCount);
 
         // Aggregate gene values
         for (const gene of genes) {
@@ -578,40 +685,36 @@ export class MultiVariableAnalysis {
           if (!genePageData) continue;
 
           const weight = weights?.[gene] ?? 1;
+          const useWeight = method === 'weighted' && weight !== 1;
 
           for (let i = 0; i < genePageData.values.length; i++) {
             const val = genePageData.values[i];
-            if (typeof val === 'number' && Number.isFinite(val)) {
-              if (method === 'weighted') {
-                scores[i] += val * weight;
-              } else {
-                scores[i] += val;
-              }
+            if (isFiniteNumber(val)) {
+              scores[i] += useWeight ? (val * weight) : val;
               validCounts[i]++;
             }
           }
         }
 
-        // Compute final scores based on method
-        const finalScores = [];
+        // Compute final scores in-place based on method (avoid duplicating huge arrays)
         for (let i = 0; i < cellCount; i++) {
-          if (validCounts[i] === 0) {
-            finalScores.push(NaN);
-          } else if (method === 'mean') {
-            finalScores.push(scores[i] / validCounts[i]);
-          } else {
-            finalScores.push(scores[i]);
+          const count = validCounts[i];
+          if (count === 0) {
+            scores[i] = NaN;
+            continue;
+          }
+          if (method === 'mean') {
+            scores[i] = scores[i] / count;
           }
         }
 
         // Compute statistics
-        const validScores = finalScores.filter(s => Number.isFinite(s));
-        const stats = this._computeBasicStats(validScores);
+        const stats = this._computeBasicStats(scores);
 
         results.push({
           pageId,
           pageName: firstGeneData.pageName,
-          scores: finalScores,
+          scores,
           cellIndices: firstGeneData.cellIndices,
           statistics: stats,
           genesUsed: genes.length,
@@ -621,38 +724,93 @@ export class MultiVariableAnalysis {
 
       this._notifications.complete(notificationId, 'Signature score computed');
 
+      memScope.end({ genes: genes.length, pages: pageIds.length, method });
       return results;
 
     } catch (error) {
       this._notifications.fail(notificationId, `Signature scoring failed: ${error.message}`);
+      memScope.end({ method, error: error.message });
       throw error;
+    } finally {
+      bestEffortCleanupAnalysisResources({
+        computeManager: this._computeManager,
+        dataLayer: this.dataLayer,
+        clearSourceCaches: true,
+        dataLayerCleanup: 'bulk',
+        keepAtLeastIdleWorkers: 0
+      });
     }
   }
 
   /**
    * Basic statistics helper
+   * Uses reservoir sampling for median to avoid sorting giant arrays.
+   * @param {ArrayLike<number>} values
+   * @param {{ maxSampleSize?: number }} [options]
    */
-  _computeBasicStats(values) {
-    if (values.length === 0) {
+  _computeBasicStats(values, options = {}) {
+    const maxSampleSize = Number.isFinite(options.maxSampleSize)
+      ? Math.max(10, Math.floor(options.maxSampleSize))
+      : 10000;
+
+    let count = 0;
+    let meanVal = 0;
+    let m2 = 0;
+    let min = Infinity;
+    let max = -Infinity;
+
+    /** @type {number[]} */
+    const reservoir = [];
+
+    for (let i = 0; i < (values?.length || 0); i++) {
+      const x = values[i];
+      if (!Number.isFinite(x)) continue;
+
+      count++;
+
+      // Welford online mean/variance
+      const delta = x - meanVal;
+      meanVal += delta / count;
+      const delta2 = x - meanVal;
+      m2 += delta * delta2;
+
+      if (x < min) min = x;
+      if (x > max) max = x;
+
+      // Reservoir sample for median approximation
+      if (reservoir.length < maxSampleSize) {
+        reservoir.push(x);
+      } else {
+        const j = Math.floor(Math.random() * count);
+        if (j < maxSampleSize) {
+          reservoir[j] = x;
+        }
+      }
+    }
+
+    if (count === 0) {
       return { count: 0, mean: NaN, median: NaN, min: NaN, max: NaN, std: NaN };
     }
 
-    const sorted = [...values].sort((a, b) => a - b);
-    const n = sorted.length;
-    const sum = values.reduce((a, b) => a + b, 0);
-    const meanVal = sum / n;
-    const variance = values.reduce((a, b) => a + Math.pow(b - meanVal, 2), 0) / n;
+    const variance = m2 / count;
+    const stdVal = Math.sqrt(Math.max(0, variance));
 
-    const mid = Math.floor(n / 2);
-    const median = n % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+    reservoir.sort((a, b) => a - b);
+    const sampleLen = reservoir.length;
+    const mid = Math.floor(sampleLen / 2);
+    const medianVal = sampleLen % 2 === 0
+      ? (reservoir[mid - 1] + reservoir[mid]) / 2
+      : reservoir[mid];
 
     return {
-      count: n,
+      count,
       mean: meanVal,
-      median,
-      min: sorted[0],
-      max: sorted[n - 1],
-      std: Math.sqrt(variance)
+      median: medianVal,
+      min,
+      max,
+      std: stdVal,
+      approximate: sampleLen < count,
+      sampleSize: sampleLen
     };
   }
 
@@ -670,9 +828,11 @@ export class MultiVariableAnalysis {
    * @returns {Promise<Object>} Co-expression matrix and clustering
    */
   async coexpressionAnalysis(options) {
+    const memScope = startMemoryTracking('Coexpression', 'coexpressionAnalysis', { includeUserAgent: true });
     const { genes, pageIds, method = 'pearson' } = options;
 
     if (!genes || genes.length < 2) {
+      memScope.end({ error: 'Insufficient genes' });
       throw new Error('At least 2 genes required for co-expression analysis');
     }
 
@@ -753,6 +913,7 @@ export class MultiVariableAnalysis {
         `Co-expression: ${genes.length} genes analyzed`
       );
 
+      memScope.end({ genes: genes.length, pages: pageIds.length, method });
       return {
         genes,
         correlationMatrix,
@@ -763,7 +924,16 @@ export class MultiVariableAnalysis {
 
     } catch (error) {
       this._notifications.fail(notificationId, `Co-expression failed: ${error.message}`);
+      memScope.end({ method, error: error.message });
       throw error;
+    } finally {
+      bestEffortCleanupAnalysisResources({
+        computeManager: this._computeManager,
+        dataLayer: this.dataLayer,
+        clearSourceCaches: true,
+        dataLayerCleanup: 'bulk',
+        keepAtLeastIdleWorkers: 0
+      });
     }
   }
 
@@ -809,8 +979,8 @@ export class MultiVariableAnalysis {
           const dataA = pageData[i];
           const dataB = pageData[j];
 
-          const valsA = dataA.values.filter(v => typeof v === 'number' && Number.isFinite(v));
-          const valsB = dataB.values.filter(v => typeof v === 'number' && Number.isFinite(v));
+          const valsA = dataA.values.filter(v => isFiniteNumber(v));
+          const valsB = dataB.values.filter(v => isFiniteNumber(v));
 
           const result = await computeManager.computeDifferential(valsA, valsB, method);
 
@@ -843,14 +1013,6 @@ export class MultiVariableAnalysis {
       throw error;
     }
   }
-}
-
-/**
- * Helper: compute mean
- */
-function mean(arr) {
-  if (!arr || arr.length === 0) return NaN;
-  return arr.reduce((a, b) => a + b, 0) / arr.length;
 }
 
 /**

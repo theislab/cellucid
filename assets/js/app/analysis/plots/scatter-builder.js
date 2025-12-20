@@ -17,6 +17,7 @@ import { getNotificationCenter } from '../../notification-center.js';
 import { createAnalysisModal, openModal, closeModal } from '../ui/components/modal.js';
 import { createMinimalPlotly, downloadImage, getScatterTraceType, purgePlot } from './plotly-loader.js';
 import { downloadCSV, toCSVCell } from '../shared/analysis-utils.js';
+import { isFiniteNumber, mean } from '../shared/number-utils.js';
 
 /**
  * Scatter Plot Builder class
@@ -518,9 +519,9 @@ export class ScatterBuilder {
       return { r: NaN, rSquared: NaN, pValue: NaN };
     }
 
-    // Compute means
-    const meanX = x.reduce((a, b) => a + b, 0) / n;
-    const meanY = y.reduce((a, b) => a + b, 0) / n;
+    // Compute means using centralized utility
+    const meanX = mean(x);
+    const meanY = mean(y);
 
     // Compute correlation
     let sumXY = 0, sumX2 = 0, sumY2 = 0;
@@ -690,7 +691,7 @@ export class ScatterBuilder {
         y: -0.2,
         font: { size: 9 }
       },
-      annotations: this.config.showTrendline && !isNaN(correlation.r) ? [{
+      annotations: this.config.showTrendline && isFiniteNumber(correlation.r) ? [{
         x: 0.02,
         y: 0.98,
         xref: 'paper',
@@ -1022,7 +1023,7 @@ export class ScatterBuilder {
         y: -0.15,
         font: { size: 10 }
       },
-      annotations: this.config.showTrendline && !isNaN(correlation.r) ? [{
+      annotations: this.config.showTrendline && isFiniteNumber(correlation.r) ? [{
         x: 0.02,
         y: 0.98,
         xref: 'paper',

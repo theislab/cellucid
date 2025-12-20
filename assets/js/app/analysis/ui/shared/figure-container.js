@@ -123,6 +123,8 @@ export class FigureContainer {
    * Show loading state
    */
   showLoading() {
+    // Purge any existing plot to prevent WebGL memory leaks
+    this._cleanup();
     this._previewContainer.innerHTML = '';
     this._previewContainer.classList.remove('empty');
     this._previewContainer.classList.add('loading');

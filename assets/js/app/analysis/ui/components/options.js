@@ -5,7 +5,8 @@
  * based on the current plot type's option schema.
  */
 
-import { PlotRegistry } from './selectors.js';
+import { PlotRegistry } from '../../shared/plot-registry-utils.js';
+import { debounce } from '../../shared/dom-utils.js';
 
 // =============================================================================
 // PLOT OPTIONS RENDERING
@@ -127,12 +128,15 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
         valueDisplay.className = 'analysis-option-value';
         valueDisplay.textContent = input.value;
 
+        // Debounce the change handler to prevent memory issues on large datasets
+        const debouncedChange = debounce(() => {
+          if (onChange) onChange(key, parseFloat(input.value));
+        }, 300);
+
         input.addEventListener('input', () => {
           valueDisplay.textContent = input.value;
         });
-        input.addEventListener('change', () => {
-          if (onChange) onChange(key, parseFloat(input.value));
-        });
+        input.addEventListener('change', debouncedChange);
 
         const rangeRow = document.createElement('div');
         rangeRow.className = 'slider-row';

@@ -276,23 +276,38 @@ export function computeSpearmanR(pairs) {
  * @returns {number[]} Array of ranks (1-based, fractional for ties)
  */
 export function computeRanks(values) {
-  const indexed = values.map((v, i) => ({ v, i }));
-  indexed.sort((a, b) => a.v - b.v);
+  const n = values.length;
+  if (n === 0) return [];
 
-  const ranks = new Array(values.length);
+  // Sort an index array so we don't allocate per-element objects.
+  const order = new Array(n);
+  for (let i = 0; i < n; i++) order[i] = i;
+
+  order.sort((a, b) => {
+    const va = values[a];
+    const vb = values[b];
+    if (va === vb) return 0;
+    return va < vb ? -1 : 1;
+  });
+
+  const ranks = new Array(n);
   let i = 0;
 
-  while (i < indexed.length) {
-    let j = i;
-    // Find ties (values that are equal)
-    while (j < indexed.length && indexed[j].v === indexed[i].v) {
+  while (i < n) {
+    let j = i + 1;
+    const v = values[order[i]];
+
+    // Find ties (values that are equal).
+    while (j < n && values[order[j]] === v) {
       j++;
     }
-    // Assign average rank to all tied values
+
+    // Assign average rank to all tied values (1-based ranks).
     const avgRank = (i + j + 1) / 2;
     for (let k = i; k < j; k++) {
-      ranks[indexed[k].i] = avgRank;
+      ranks[order[k]] = avgRank;
     }
+
     i = j;
   }
 
@@ -346,7 +361,7 @@ export function mannWhitneyU(group1, group2) {
   // Combine and rank (TypedArray-safe; avoids `.map()` which behaves differently on TypedArrays).
   // Sort an index array so we don't allocate per-element objects.
   const n = n1 + n2;
-  const order = new Array(n);
+  const order = new Uint32Array(n);
   for (let i = 0; i < n; i++) order[i] = i;
 
   const valueAt = (idx) => (idx < n1 ? group1[idx] : group2[idx - n1]);

@@ -17,13 +17,19 @@
  */
 
 import { getNotificationCenter } from '../../notification-center.js';
+import { debug, debugWarn, debugError } from './debug-utils.js';
+import { getHeapMemoryUsage, measureUserAgentSpecificMemory } from './memory-utils.js';
+import { PerformanceConfig } from './performance-config.js';
 
 // =============================================================================
 // CONSTANTS
 // =============================================================================
 
 /**
- * Memory thresholds in bytes
+ * Default heap thresholds in bytes (fallback when heap limits are unknown).
+ *
+ * NOTE: When `performance.memory.jsHeapSizeLimit` is available, we compute dynamic
+ * thresholds from `PerformanceConfig.memory.{warningThresholdPercent,cleanupThresholdPercent}`.
  */
 const THRESHOLDS = {
   WARNING: 100 * 1024 * 1024,  // 100 MB - log warning
@@ -81,6 +87,15 @@ class MemoryMonitor {
 
     /** @type {string|null} Current pressure level */
     this._currentPressureLevel = null;
+
+    /** @type {import('./memory-utils.js').UserAgentMemoryUsage|null} */
+    this._lastUserAgentMemory = null;
+
+    /** @type {Promise<void>|null} */
+    this._userAgentMemoryPromise = null;
+
+    /** @type {number} Minimum interval between UA memory samples */
+    this._userAgentMemoryIntervalMs = 120000; // 2 minutes (avoid overhead)
   }
 
   /**
@@ -131,7 +146,7 @@ class MemoryMonitor {
     }, cleanupInterval);
 
     this._active = true;
-    console.log('[MemoryMonitor] Started monitoring');
+    debug('MemoryMonitor', 'Started monitoring');
   }
 
   /**
@@ -151,13 +166,13 @@ class MemoryMonitor {
     }
 
     this._active = false;
-    console.log('[MemoryMonitor] Stopped monitoring');
+    debug('MemoryMonitor', 'Stopped monitoring');
   }
 
   /**
    * Register a cleanup handler for a component
    * @param {string} componentId - Unique component identifier
-   * @param {Function} cleanupFn - Cleanup function to call
+   * @param {(reason?: string) => void} cleanupFn - Cleanup function to call
    */
   registerCleanupHandler(componentId, cleanupFn) {
     this._cleanupHandlers.set(componentId, cleanupFn);
@@ -176,18 +191,24 @@ class MemoryMonitor {
    * @returns {Object} Memory usage info
    */
   getMemoryUsage() {
-    // Use Performance.memory if available (Chrome only)
-    if (performance?.memory) {
-      const memory = performance.memory;
+    const heap = getHeapMemoryUsage();
+    if (heap.available) {
       return {
-        usedJSHeapSize: memory.usedJSHeapSize,
-        totalJSHeapSize: memory.totalJSHeapSize,
-        jsHeapSizeLimit: memory.jsHeapSizeLimit,
-        usedMB: (memory.usedJSHeapSize / (1024 * 1024)).toFixed(2),
-        totalMB: (memory.totalJSHeapSize / (1024 * 1024)).toFixed(2),
-        limitMB: (memory.jsHeapSizeLimit / (1024 * 1024)).toFixed(2),
-        percentUsed: ((memory.usedJSHeapSize / memory.jsHeapSizeLimit) * 100).toFixed(1),
-        available: true
+        usedJSHeapSize: heap.usedBytes,
+        totalJSHeapSize: heap.totalBytes,
+        jsHeapSizeLimit: heap.limitBytes,
+        usedMB: heap.usedMB != null ? heap.usedMB.toFixed(2) : 'N/A',
+        totalMB: heap.totalMB != null ? heap.totalMB.toFixed(2) : 'N/A',
+        limitMB: heap.limitMB != null ? heap.limitMB.toFixed(2) : 'N/A',
+        percentUsed: heap.percentUsed != null ? heap.percentUsed.toFixed(1) : 'N/A',
+        available: true,
+        // Supplemental measurement (async; may be null if never sampled)
+        userAgentBytes: this._lastUserAgentMemory?.bytes ?? null,
+        userAgentMB: this._lastUserAgentMemory?.megabytes != null
+          ? this._lastUserAgentMemory.megabytes.toFixed(2)
+          : null,
+        userAgentTimestamp: this._lastUserAgentMemory?.timestamp ?? null,
+        userAgentError: this._lastUserAgentMemory?.error ?? null
       };
     }
 
@@ -201,8 +222,82 @@ class MemoryMonitor {
       limitMB: 'N/A',
       percentUsed: 'N/A',
       available: false,
-      note: 'Performance.memory not available (non-Chrome browser)'
+      note: 'Heap memory stats unavailable (non-Chrome browser)',
+      userAgentBytes: this._lastUserAgentMemory?.bytes ?? null,
+      userAgentMB: this._lastUserAgentMemory?.megabytes != null
+        ? this._lastUserAgentMemory.megabytes.toFixed(2)
+        : null,
+      userAgentTimestamp: this._lastUserAgentMemory?.timestamp ?? null,
+      userAgentError: this._lastUserAgentMemory?.error ?? null
     };
+  }
+
+  /**
+   * Compute heap thresholds based on heap limit when available.
+   * @param {ReturnType<MemoryMonitor['getMemoryUsage']>} usage
+   * @returns {{WARNING:number,CLEANUP:number,CRITICAL:number}}
+   * @private
+   */
+  _getHeapThresholds(usage) {
+    const clampPercent = (value, fallback) => {
+      const v = Number(value);
+      if (!Number.isFinite(v)) return fallback;
+      return Math.max(1, Math.min(v, 99));
+    };
+
+    const limitBytes = Number.isFinite(usage?.jsHeapSizeLimit) ? usage.jsHeapSizeLimit : null;
+    if (!Number.isFinite(limitBytes) || limitBytes <= 0) {
+      return THRESHOLDS;
+    }
+
+    const warningPct = clampPercent(PerformanceConfig.memory.warningThresholdPercent, 75) / 100;
+    const cleanupPct = clampPercent(PerformanceConfig.memory.cleanupThresholdPercent, 85) / 100;
+    const criticalPct = Math.min(0.98, Math.max(0.95, cleanupPct + 0.05));
+
+    return {
+      WARNING: limitBytes * warningPct,
+      CLEANUP: limitBytes * cleanupPct,
+      CRITICAL: limitBytes * criticalPct
+    };
+  }
+
+  /**
+   * Derive a pressure level from UA-specific memory measurements (when available).
+   *
+   * Rationale: `performance.memory` is JS-heap only; large analyses often allocate
+   * significant non-heap memory (ArrayBuffers, worker heaps, WebAssembly, WebGL).
+   *
+   * We intentionally use conservative ratio-based thresholds to avoid thrashing:
+   * only escalate when UA memory far exceeds the JS heap limit.
+   *
+   * @param {ReturnType<MemoryMonitor['getMemoryUsage']>} usage
+   * @returns {'normal'|'warning'|'cleanup'|'critical'}
+   * @private
+   */
+  _getUserAgentPressureLevel(usage) {
+    const uaBytes = Number.isFinite(usage?.userAgentBytes) ? usage.userAgentBytes : null;
+    const heapLimitBytes = Number.isFinite(usage?.jsHeapSizeLimit) ? usage.jsHeapSizeLimit : null;
+
+    if (!Number.isFinite(uaBytes) || uaBytes <= 0) return 'normal';
+    if (!Number.isFinite(heapLimitBytes) || heapLimitBytes <= 0) return 'normal';
+
+    const ratio = uaBytes / heapLimitBytes;
+    if (ratio >= 2.5) return 'critical';
+    if (ratio >= 2.0) return 'cleanup';
+    if (ratio >= 1.5) return 'warning';
+    return 'normal';
+  }
+
+  /**
+   * Choose the more severe of two pressure levels.
+   * @param {'normal'|'warning'|'cleanup'|'critical'} a
+   * @param {'normal'|'warning'|'cleanup'|'critical'} b
+   * @returns {'normal'|'warning'|'cleanup'|'critical'}
+   * @private
+   */
+  _maxPressureLevel(a, b) {
+    const rank = { normal: 0, warning: 1, cleanup: 2, critical: 3 };
+    return (rank[b] > rank[a]) ? b : a;
   }
 
   /**
@@ -210,16 +305,22 @@ class MemoryMonitor {
    * @private
    */
   _performCheck() {
+    // Best-effort background sample (does not block checks).
+    this._maybeSampleUserAgentMemory();
+
     const usage = this.getMemoryUsage();
     this._stats.checksPerformed++;
     this._stats.lastCheck = Date.now();
 
     if (!usage.available) {
+      // Still notify subscribers so they can degrade gracefully.
+      this._notifyPressureChange('unknown', usage);
       return;
     }
 
     const usedBytes = usage.usedJSHeapSize;
     const usedMB = parseFloat(usage.usedMB);
+    const thresholds = this._getHeapThresholds(usage);
 
     // Track peak
     if (usedMB > this._stats.peakMemoryMB) {
@@ -227,15 +328,61 @@ class MemoryMonitor {
     }
 
     // Check thresholds
-    if (usedBytes >= THRESHOLDS.CRITICAL) {
-      console.warn(`[MemoryMonitor] CRITICAL: Memory usage at ${usedMB}MB - triggering aggressive cleanup`);
+    const heapLevel = usedBytes >= thresholds.CRITICAL
+      ? 'critical'
+      : usedBytes >= thresholds.CLEANUP
+        ? 'cleanup'
+        : usedBytes >= thresholds.WARNING
+          ? 'warning'
+          : 'normal';
+
+    const uaLevel = this._getUserAgentPressureLevel(usage);
+    const level = this._maxPressureLevel(heapLevel, uaLevel);
+
+    if (level === 'critical') {
+      this._notifyPressureChange(level, usage);
+      debugWarn('MemoryMonitor', `CRITICAL: Memory usage at ${usedMB}MB - triggering aggressive cleanup`);
       this.performCleanup('critical');
-    } else if (usedBytes >= THRESHOLDS.CLEANUP) {
-      console.warn(`[MemoryMonitor] HIGH: Memory usage at ${usedMB}MB - triggering cleanup`);
+    } else if (level === 'cleanup') {
+      this._notifyPressureChange(level, usage);
+      debugWarn('MemoryMonitor', `HIGH: Memory usage at ${usedMB}MB - triggering cleanup`);
       this.performCleanup('threshold');
-    } else if (usedBytes >= THRESHOLDS.WARNING) {
-      console.debug(`[MemoryMonitor] Warning: Memory usage at ${usedMB}MB`);
+    } else if (level === 'warning') {
+      this._notifyPressureChange(level, usage);
+      debug('MemoryMonitor', `Warning: Memory usage at ${usedMB}MB`);
+    } else {
+      this._notifyPressureChange(level, usage);
     }
+  }
+
+  /**
+   * Best-effort async sampling of user-agent memory measurement.
+   * @private
+   */
+  _maybeSampleUserAgentMemory() {
+    if (this._userAgentMemoryPromise) return;
+
+    const lastTs = this._lastUserAgentMemory?.timestamp;
+    const now = Date.now();
+    if (lastTs && (now - lastTs) < this._userAgentMemoryIntervalMs) return;
+
+    this._userAgentMemoryPromise = measureUserAgentSpecificMemory()
+      .then((measurement) => {
+        // Keep the latest result (even when unavailable) to preserve error context.
+        this._lastUserAgentMemory = measurement;
+      })
+      .catch((err) => {
+        this._lastUserAgentMemory = {
+          available: false,
+          bytes: null,
+          megabytes: null,
+          error: err?.message || String(err),
+          timestamp: Date.now()
+        };
+      })
+      .finally(() => {
+        this._userAgentMemoryPromise = null;
+      });
   }
 
   /**
@@ -279,10 +426,10 @@ class MemoryMonitor {
     // Run all cleanup handlers
     for (const [componentId, cleanupFn] of this._cleanupHandlers) {
       try {
-        cleanupFn();
+        cleanupFn(reason);
         results.handlersRun++;
       } catch (error) {
-        console.error(`[MemoryMonitor] Cleanup error in ${componentId}:`, error);
+        debugError('MemoryMonitor', `Cleanup error in ${componentId}:`, error);
         results.errors.push({ component: componentId, error: error.message });
       }
     }
@@ -305,7 +452,7 @@ class MemoryMonitor {
       results.freedMB = freed.toFixed(2);
     }
 
-    console.log(`[MemoryMonitor] Cleanup complete: ${results.handlersRun} handlers, freed ~${results.freedMB}MB`);
+    debug('MemoryMonitor', `Cleanup complete: ${results.handlersRun} handlers, freed ~${results.freedMB}MB`);
 
     return results;
   }
@@ -389,16 +536,17 @@ class MemoryMonitor {
       };
     }
 
-    const usedMB = parseFloat(usage.usedMB);
+    const usedMB = includeCurrentUsage ? parseFloat(usage.usedMB) : 0;
     const limitMB = parseFloat(usage.limitMB);
-    const percentUsed = parseFloat(usage.percentUsed);
+    const percentUsed = includeCurrentUsage ? parseFloat(usage.percentUsed) : 0;
 
     // Calculate available memory with safety margin
     const theoreticalAvailable = limitMB - usedMB;
     const safeAvailableMB = theoreticalAvailable * safetyMargin;
 
-    // Check if we're already under memory pressure
-    const alreadyUnderPressure = percentUsed >= THRESHOLDS.WARNING / (limitMB * 1024 * 1024) * 100;
+    // Check if we're already under memory pressure (heap-based).
+    const thresholds = this._getHeapThresholds(usage);
+    const alreadyUnderPressure = includeCurrentUsage && usage.usedJSHeapSize >= thresholds.WARNING;
 
     // Determine if operation can proceed
     const canProceed = estimatedMB <= safeAvailableMB && !alreadyUnderPressure;
@@ -520,7 +668,7 @@ class MemoryMonitor {
    */
   onMemoryPressure(callback) {
     if (typeof callback !== 'function') {
-      console.warn('[MemoryMonitor] onMemoryPressure requires a function callback');
+      debugWarn('MemoryMonitor', 'onMemoryPressure requires a function callback');
       return () => {};
     }
 
@@ -541,11 +689,12 @@ class MemoryMonitor {
   _notifyPressureChange(level, usage) {
     if (level === this._currentPressureLevel) return;
 
+    const previousLevel = this._currentPressureLevel;
     this._currentPressureLevel = level;
 
     const event = {
       level,
-      previousLevel: this._currentPressureLevel,
+      previousLevel,
       timestamp: Date.now(),
       usage
     };
@@ -554,7 +703,7 @@ class MemoryMonitor {
       try {
         callback(event);
       } catch (err) {
-        console.error('[MemoryMonitor] Pressure callback error:', err);
+        debugError('MemoryMonitor', 'Pressure callback error:', err);
       }
     }
   }
@@ -569,11 +718,17 @@ class MemoryMonitor {
     if (!usage.available) return 'unknown';
 
     const usedBytes = usage.usedJSHeapSize;
+    const thresholds = this._getHeapThresholds(usage);
+    const heapLevel = usedBytes >= thresholds.CRITICAL
+      ? 'critical'
+      : usedBytes >= thresholds.CLEANUP
+        ? 'cleanup'
+        : usedBytes >= thresholds.WARNING
+          ? 'warning'
+          : 'normal';
 
-    if (usedBytes >= THRESHOLDS.CRITICAL) return 'critical';
-    if (usedBytes >= THRESHOLDS.CLEANUP) return 'cleanup';
-    if (usedBytes >= THRESHOLDS.WARNING) return 'warning';
-    return 'normal';
+    const uaLevel = this._getUserAgentPressureLevel(usage);
+    return this._maxPressureLevel(heapLevel, uaLevel);
   }
 
   /**

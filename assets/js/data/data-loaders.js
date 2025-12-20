@@ -582,44 +582,46 @@ async function fetchBinaryWithProgressInternal(url, trackerId, notifications) {
 
   if (trackerId && response.body) {
     const reader = response.body.getReader();
-    const chunks = [];
     let loadedBytes = 0;
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      loadedBytes += value.length;
-      notifications.updateDownload(trackerId, loadedBytes, totalBytes);
-    }
-
-    const allChunks = new Uint8Array(loadedBytes);
-    let position = 0;
-    for (const chunk of chunks) {
-      allChunks.set(chunk, position);
-      position += chunk.length;
-    }
+    // Stream into a new ReadableStream so we can:
+    // - track progress without buffering all chunks twice
+    // - support streaming gzip decompression when available
+    const monitoredStream = new ReadableStream({
+      async pull(controller) {
+        const { done, value } = await reader.read();
+        if (done) {
+          controller.close();
+          return;
+        }
+        loadedBytes += value?.byteLength ?? value?.length ?? 0;
+        notifications.updateDownload(trackerId, loadedBytes, totalBytes);
+        controller.enqueue(value);
+      },
+      cancel() {
+        try {
+          reader.cancel();
+        } catch (_err) {
+          // Ignore cancel errors
+        }
+      }
+    });
 
     if (isGzipped) {
       if (typeof DecompressionStream !== 'undefined') {
         const ds = new DecompressionStream('gzip');
-        const stream = new ReadableStream({
-          start(controller) {
-            controller.enqueue(allChunks);
-            controller.close();
-          }
-        });
-        const decompressedStream = stream.pipeThrough(ds);
+        const decompressedStream = monitoredStream.pipeThrough(ds);
         const decompressedResponse = new Response(decompressedStream);
         return decompressedResponse.arrayBuffer();
       } else if (typeof pako !== 'undefined') {
-        const decompressed = pako.inflate(allChunks);
+        const compressedBuffer = await new Response(monitoredStream).arrayBuffer();
+        const decompressed = pako.inflate(new Uint8Array(compressedBuffer));
         return decompressed.buffer.slice(decompressed.byteOffset, decompressed.byteOffset + decompressed.byteLength);
       }
       throw new Error('Gzip decompression not supported');
     }
 
-    return allChunks.buffer;
+    return new Response(monitoredStream).arrayBuffer();
   }
 
   // Fallback without progress tracking
@@ -1101,6 +1103,14 @@ export async function loadEdgeSources(manifestUrl, manifest) {
   if (!hasEdgeFormat(manifest)) {
     throw new Error('Invalid connectivity manifest: missing edge format.');
   }
+  // AnnData sources load edges directly from the adapter (no file paths).
+  if (shouldUseAnnData(manifestUrl)) {
+    const edgeData = await anndataLoadConnectivity();
+    if (!edgeData) {
+      throw new Error('No connectivity data in AnnData file');
+    }
+    return edgeData.sources;
+  }
   const url = resolveUrl(manifestUrl, manifest.sourcesPath);
   const buffer = await fetchBinary(url);
   return typedArrayFromBuffer(buffer, manifest.index_dtype, url);
@@ -1115,6 +1125,14 @@ export async function loadEdgeSources(manifestUrl, manifest) {
 export async function loadEdgeDestinations(manifestUrl, manifest) {
   if (!hasEdgeFormat(manifest)) {
     throw new Error('Invalid connectivity manifest: missing edge format.');
+  }
+  // AnnData sources load edges directly from the adapter (no file paths).
+  if (shouldUseAnnData(manifestUrl)) {
+    const edgeData = await anndataLoadConnectivity();
+    if (!edgeData) {
+      throw new Error('No connectivity data in AnnData file');
+    }
+    return edgeData.destinations;
   }
   const url = resolveUrl(manifestUrl, manifest.destinationsPath);
   const buffer = await fetchBinary(url);

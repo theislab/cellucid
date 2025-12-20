@@ -9,6 +9,8 @@
  * - Lifecycle management (open/close)
  */
 
+import { purgePlot } from '../../plots/plotly-loader.js';
+
 // =============================================================================
 // CONSTANTS
 // =============================================================================
@@ -47,6 +49,8 @@ export function createAnalysisModal(options = {}) {
   // Create modal backdrop
   const modal = document.createElement('div');
   modal.className = 'analysis-modal';
+  modal._cleanupFns = [];
+  modal._cleanupDone = false;
 
   const backdrop = document.createElement('div');
   backdrop.className = 'analysis-modal-backdrop';
@@ -209,13 +213,15 @@ export function createAnalysisModal(options = {}) {
   modal.appendChild(content);
 
   // Initialize modal edge resize
-  initializeModalResize(content, edgeRight, edgeBottom);
+  modal._cleanupFns.push(initializeModalResize(content, edgeRight, edgeBottom));
 
   // Initialize internal panel resizers
-  initializeResizers(content, body, footerArea, verticalResizer, horizontalResizer, footerResizer, intersectionResizer, optionsPanel);
+  modal._cleanupFns.push(
+    initializeResizers(content, body, footerArea, verticalResizer, horizontalResizer, footerResizer, intersectionResizer, optionsPanel)
+  );
 
   // Initialize modal dragging
-  initializeModalDrag(modal, content, header);
+  modal._cleanupFns.push(initializeModalDrag(modal, content, header));
 
   // Store references
   modal._plotContainer = plotContainer;
@@ -261,8 +267,11 @@ function initializeModalResize(content, edgeRight, edgeBottom) {
     e.stopPropagation();
   };
 
-  edgeRight.addEventListener('mousedown', (e) => startResize(e, 'right'));
-  edgeBottom.addEventListener('mousedown', (e) => startResize(e, 'bottom'));
+  const onMouseDownRight = (e) => startResize(e, 'right');
+  const onMouseDownBottom = (e) => startResize(e, 'bottom');
+
+  edgeRight.addEventListener('mousedown', onMouseDownRight);
+  edgeBottom.addEventListener('mousedown', onMouseDownBottom);
 
   const handleMouseMove = (e) => {
     if (!isResizing) return;
@@ -294,6 +303,13 @@ function initializeModalResize(content, edgeRight, edgeBottom) {
 
   document.addEventListener('mousemove', handleMouseMove);
   document.addEventListener('mouseup', handleMouseUp);
+
+  return () => {
+    edgeRight.removeEventListener('mousedown', onMouseDownRight);
+    edgeBottom.removeEventListener('mousedown', onMouseDownBottom);
+    document.removeEventListener('mousemove', handleMouseMove);
+    document.removeEventListener('mouseup', handleMouseUp);
+  };
 }
 
 // =============================================================================
@@ -464,19 +480,23 @@ function initializeResizers(content, body, footerArea, verticalResizer, horizont
   };
 
   // Attach pointer event handlers to resizers
-  verticalResizer.addEventListener('pointerdown', (e) => startResize(e, 'vertical'));
-  horizontalResizer.addEventListener('pointerdown', (e) => startResize(e, 'horizontal'));
-  footerResizer.addEventListener('pointerdown', (e) => startResize(e, 'footer'));
-  intersectionResizer.addEventListener('pointerdown', (e) => startResize(e, 'intersection'));
+  const onVerticalDown = (e) => startResize(e, 'vertical');
+  const onHorizontalDown = (e) => startResize(e, 'horizontal');
+  const onFooterDown = (e) => startResize(e, 'footer');
+  const onIntersectionDown = (e) => startResize(e, 'intersection');
+
+  verticalResizer.addEventListener('pointerdown', onVerticalDown);
+  horizontalResizer.addEventListener('pointerdown', onHorizontalDown);
+  footerResizer.addEventListener('pointerdown', onFooterDown);
+  intersectionResizer.addEventListener('pointerdown', onIntersectionDown);
 
   // Global pointer move/up handlers
   document.addEventListener('pointermove', handlePointerMove);
   document.addEventListener('pointerup', handlePointerUp);
 
   // Update intersection position on window resize
-  window.addEventListener('resize', () => {
-    requestAnimationFrame(updateIntersectionPosition);
-  });
+  const onWindowResize = () => requestAnimationFrame(updateIntersectionPosition);
+  window.addEventListener('resize', onWindowResize);
 
   // Create a ResizeObserver to update intersection position when content changes
   // This will also fire when the modal is first added to DOM and laid out
@@ -488,9 +508,28 @@ function initializeResizers(content, body, footerArea, verticalResizer, horizont
   resizeObserver.observe(footerArea);
 
   // Also update after modal open animation completes (200ms + buffer)
-  setTimeout(() => {
+  const intersectionTimeout = setTimeout(() => {
     updateIntersectionPosition();
   }, 250);
+
+  return () => {
+    verticalResizer.removeEventListener('pointerdown', onVerticalDown);
+    horizontalResizer.removeEventListener('pointerdown', onHorizontalDown);
+    footerResizer.removeEventListener('pointerdown', onFooterDown);
+    intersectionResizer.removeEventListener('pointerdown', onIntersectionDown);
+
+    document.removeEventListener('pointermove', handlePointerMove);
+    document.removeEventListener('pointerup', handlePointerUp);
+    window.removeEventListener('resize', onWindowResize);
+
+    try {
+      resizeObserver.disconnect();
+    } catch (_err) {
+      // Ignore
+    }
+
+    clearTimeout(intersectionTimeout);
+  };
 }
 
 // =============================================================================
@@ -510,7 +549,7 @@ function initializeModalDrag(modal, content, header) {
   let initialLeft = 0;
   let initialTop = 0;
 
-  header.addEventListener('mousedown', (e) => {
+  const onMouseDownHeader = (e) => {
     // Don't drag if clicking close button
     if (e.target.closest('.analysis-modal-close')) return;
 
@@ -526,7 +565,9 @@ function initializeModalDrag(modal, content, header) {
     document.body.style.cursor = 'move';
     document.body.style.userSelect = 'none';
     e.preventDefault();
-  });
+  };
+
+  header.addEventListener('mousedown', onMouseDownHeader);
 
   const handleMouseMove = (e) => {
     if (!isDragging) return;
@@ -558,6 +599,12 @@ function initializeModalDrag(modal, content, header) {
 
   document.addEventListener('mousemove', handleMouseMove);
   document.addEventListener('mouseup', handleMouseUp);
+
+  return () => {
+    header.removeEventListener('mousedown', onMouseDownHeader);
+    document.removeEventListener('mousemove', handleMouseMove);
+    document.removeEventListener('mouseup', handleMouseUp);
+  };
 }
 
 // =============================================================================
@@ -578,7 +625,7 @@ export function openModal(modal) {
   const content = modal.querySelector('.analysis-modal-content');
   if (content) {
     // Wait for open animation to complete
-    setTimeout(() => {
+    modal._openPositionTimeout = setTimeout(() => {
       const rect = content.getBoundingClientRect();
       const modalRect = modal.getBoundingClientRect();
 
@@ -600,9 +647,9 @@ export function openModal(modal) {
   const handleEscape = (e) => {
     if (e.key === 'Escape') {
       closeModal(modal);
-      document.removeEventListener('keydown', handleEscape);
     }
   };
+  modal._escapeHandler = handleEscape;
   document.addEventListener('keydown', handleEscape);
 }
 
@@ -611,6 +658,38 @@ export function openModal(modal) {
  * @param {HTMLElement} modal - Modal element to close
  */
 export function closeModal(modal) {
+  if (!modal || modal._cleanupDone) return;
+  modal._cleanupDone = true;
+
+  // Stop Escape handler (important: openModal doesn't always remove it).
+  if (modal._escapeHandler) {
+    document.removeEventListener('keydown', modal._escapeHandler);
+    modal._escapeHandler = null;
+  }
+
+  // Cancel deferred positioning if the modal is closed quickly.
+  if (modal._openPositionTimeout) {
+    clearTimeout(modal._openPositionTimeout);
+    modal._openPositionTimeout = null;
+  }
+
+  // Purge Plotly/WebGL resources before detaching from DOM.
+  if (modal._plotContainer) {
+    purgePlot(modal._plotContainer);
+  }
+
+  // Remove any global listeners/observers registered during initialization.
+  if (Array.isArray(modal._cleanupFns)) {
+    for (const cleanup of modal._cleanupFns) {
+      try {
+        if (typeof cleanup === 'function') cleanup();
+      } catch (_err) {
+        // Ignore teardown errors
+      }
+    }
+    modal._cleanupFns.length = 0;
+  }
+
   modal.classList.remove('open');
   setTimeout(() => {
     if (modal.parentNode) {

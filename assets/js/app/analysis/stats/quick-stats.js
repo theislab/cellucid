@@ -11,6 +11,14 @@
  */
 
 import { normalCDF } from '../compute/math-utils.js';
+import {
+  isFiniteNumber,
+  mean as computeMean,
+  std as computeStd,
+  variance as computeVar,
+  median as computeMedian,
+  filterFiniteNumbers
+} from '../shared/number-utils.js';
 
 // =============================================================================
 // STREAMING STATISTICS (for huge pages)
@@ -32,29 +40,24 @@ export function computeStreamingStats(values, maxSampleSize = 10000) {
 
   // For small arrays, compute exact stats
   if (n <= maxSampleSize) {
-    const valid = values.filter(v => typeof v === 'number' && Number.isFinite(v));
+    const valid = filterFiniteNumbers(values);
     if (valid.length === 0) {
       return { count: 0, min: null, max: null, mean: null, median: null, std: null, approximate: false };
     }
 
+    // Sort once for quartiles and min/max
     const sorted = [...valid].sort((a, b) => a - b);
-    const sum = valid.reduce((a, b) => a + b, 0);
-    const mean = sum / valid.length;
-    const variance = valid.reduce((a, b) => a + (b - mean) ** 2, 0) / valid.length;
-    const mid = Math.floor(valid.length / 2);
-    const median = valid.length % 2 === 0
-      ? (sorted[mid - 1] + sorted[mid]) / 2
-      : sorted[mid];
+    const len = valid.length;
 
     return {
-      count: valid.length,
+      count: len,
       min: sorted[0],
-      max: sorted[valid.length - 1],
-      mean,
-      median,
-      std: Math.sqrt(variance),
-      q1: sorted[Math.floor(valid.length * 0.25)],
-      q3: sorted[Math.floor(valid.length * 0.75)],
+      max: sorted[len - 1],
+      mean: computeMean(valid),
+      median: computeMedian(valid),
+      std: computeStd(valid),
+      q1: sorted[Math.floor(len * 0.25)],
+      q3: sorted[Math.floor(len * 0.75)],
       approximate: false
     };
   }
@@ -178,14 +181,15 @@ export function computeVarianceScore(values, sampleSize = 5000) {
     ? values
     : values.filter(() => Math.random() < sampleSize / values.length);
 
-  const valid = sampled.filter(v => typeof v === 'number' && Number.isFinite(v));
+  const valid = sampled.filter(v => isFiniteNumber(v));
   if (valid.length < 2) return { variance: 0, cv: 0 };
 
-  const mean = valid.reduce((a, b) => a + b, 0) / valid.length;
-  const variance = valid.reduce((a, b) => a + (b - mean) ** 2, 0) / valid.length;
-  const cv = mean !== 0 ? Math.sqrt(variance) / Math.abs(mean) : 0;
+  // Use centralized statistics utilities
+  const meanVal = computeMean(valid);
+  const varianceVal = computeVar(valid);
+  const cv = meanVal !== 0 ? Math.sqrt(varianceVal) / Math.abs(meanVal) : 0;
 
-  return { variance, cv };
+  return { variance: varianceVal, cv };
 }
 
 /**
@@ -199,7 +203,7 @@ export function computeMissingness(values) {
   let missing = 0;
   for (const v of values) {
     if (v === null || v === undefined || v === '' ||
-        (typeof v === 'number' && !Number.isFinite(v))) {
+        (typeof v === 'number' && !isFiniteNumber(v))) {
       missing++;
     }
   }
@@ -324,14 +328,14 @@ export function scoreFieldDifference(pageData) {
   } else {
     // For continuous: compare means using effect size
     const stats = pageData.map(pd => {
-      const valid = pd.values.filter(v => typeof v === 'number' && Number.isFinite(v));
+      const valid = filterFiniteNumbers(pd.values);
       if (valid.length === 0) return { mean: 0, std: 1, n: 0 };
 
-      const sum = valid.reduce((a, b) => a + b, 0);
-      const mean = sum / valid.length;
-      const variance = valid.reduce((a, b) => a + (b - mean) ** 2, 0) / valid.length;
-
-      return { mean, std: Math.sqrt(variance), n: valid.length };
+      return {
+        mean: computeMean(valid),
+        std: computeStd(valid),
+        n: valid.length
+      };
     });
 
     // Compute effect size (Cohen's d approximation)
@@ -361,8 +365,8 @@ export function scoreFieldDifference(pageData) {
  * @returns {Object} { effectSize, ci95Low, ci95High, interpretation }
  */
 export function computeEffectSizeWithCI(group1, group2) {
-  const valid1 = group1.filter(v => typeof v === 'number' && Number.isFinite(v));
-  const valid2 = group2.filter(v => typeof v === 'number' && Number.isFinite(v));
+  const valid1 = group1.filter(v => isFiniteNumber(v));
+  const valid2 = group2.filter(v => isFiniteNumber(v));
 
   const n1 = valid1.length;
   const n2 = valid2.length;
@@ -371,9 +375,10 @@ export function computeEffectSizeWithCI(group1, group2) {
     return { effectSize: 0, ci95Low: 0, ci95High: 0, interpretation: 'insufficient data' };
   }
 
-  const mean1 = valid1.reduce((a, b) => a + b, 0) / n1;
-  const mean2 = valid2.reduce((a, b) => a + b, 0) / n2;
+  const mean1 = computeMean(valid1);
+  const mean2 = computeMean(valid2);
 
+  // Sample variance uses (n-1) denominator (Bessel's correction) for unbiased estimate
   const var1 = valid1.reduce((a, b) => a + (b - mean1) ** 2, 0) / (n1 - 1);
   const var2 = valid2.reduce((a, b) => a + (b - mean2) ** 2, 0) / (n2 - 1);
 

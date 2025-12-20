@@ -21,6 +21,9 @@ import {
   computeStreamingStats
 } from '../../stats/quick-stats.js';
 
+// Import debug utilities for production-safe logging
+import { debug, debugWarn } from '../../shared/debug-utils.js';
+
 import { createMultiSelectDropdown } from '../components/multi-select-dropdown.js';
 
 /**
@@ -314,7 +317,7 @@ export class QuickInsights extends BaseAnalysisUI {
 
       // Check if this request is still current (prevents stale renders)
       if (requestId !== this._currentRequestId) {
-        console.debug('[QuickInsights] Discarding stale result for request', requestId);
+        debug('QuickInsights', 'Discarding stale result for request', requestId);
         return;
       }
 
@@ -328,7 +331,7 @@ export class QuickInsights extends BaseAnalysisUI {
 
       if (stillValidPages.length === 0 && filteredPageIds.length > 0) {
         // Pages were removed during computation
-        console.debug('[QuickInsights] Pages removed during computation, re-rendering empty');
+        debug('QuickInsights', 'Pages removed during computation, re-rendering empty');
         this._renderEmpty();
         return;
       }
@@ -422,13 +425,13 @@ export class QuickInsights extends BaseAnalysisUI {
     const allPages = this.dataLayer.getPages();
     const page = allPages.find(p => p.id === pageId);
     if (!page) {
-      console.debug(`[QuickInsights] Active page not found: ${pageId}`);
+      debug('QuickInsights', `Active page not found: ${pageId}`);
       return insights;
     }
 
     const cellIndices = this.dataLayer.getCellIndicesForPage(pageId);
     if (!cellIndices || cellIndices.length === 0) {
-      console.debug(`[QuickInsights] Active page is empty: ${pageId}`);
+      debug('QuickInsights', `Active page is empty: ${pageId}`);
       return insights;
     }
 
@@ -489,7 +492,7 @@ export class QuickInsights extends BaseAnalysisUI {
         obsFields
       });
     } catch (err) {
-      console.warn('[QuickInsights] Failed to fetch bulk obs fields:', err);
+      debugWarn('QuickInsights', 'Failed to fetch bulk obs fields:', err);
       return insights;
     }
 
@@ -499,7 +502,7 @@ export class QuickInsights extends BaseAnalysisUI {
     }
 
     if (!bulkData || !bulkData.fields || !bulkData.pageData) {
-      console.warn('[QuickInsights] Invalid bulk data structure');
+      debugWarn('QuickInsights', 'Invalid bulk data structure');
       return insights;
     }
 
@@ -641,7 +644,7 @@ export class QuickInsights extends BaseAnalysisUI {
 
     // Validate insights object
     if (!insights || !Array.isArray(insights.pages)) {
-      console.warn('[QuickInsights] Invalid insights object');
+      debugWarn('QuickInsights', 'Invalid insights object');
       this._renderEmpty();
       return;
     }
@@ -654,7 +657,7 @@ export class QuickInsights extends BaseAnalysisUI {
 
     // Final safety check - verify container still exists (could be destroyed during async)
     if (!this._container || !this._container.parentNode) {
-      console.debug('[QuickInsights] Container no longer in DOM, skipping render');
+      debug('QuickInsights', 'Container no longer in DOM, skipping render');
       return;
     }
 
@@ -674,7 +677,7 @@ export class QuickInsights extends BaseAnalysisUI {
       `;
       this._container.appendChild(header);
     } catch (err) {
-      console.warn('[QuickInsights] Error rendering header:', err);
+      debugWarn('QuickInsights', 'Error rendering header:', err);
     }
 
     try {
@@ -705,7 +708,7 @@ export class QuickInsights extends BaseAnalysisUI {
 
     // Safety check for insights object
     if (!insights || !insights.pages) {
-      console.warn('[QuickInsights] Invalid insights for standard render');
+      debugWarn('QuickInsights', 'Invalid insights for standard render');
       return;
     }
 

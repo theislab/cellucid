@@ -173,6 +173,12 @@ function readSparseMatrix(group) {
 // 100 genes = ~200MB max gene cache
 const MAX_GENE_CACHE_SIZE = 100;
 
+// Dense X cache guardrail:
+// Caching the full dense X matrix can be multi-GB (n_obs × n_vars × dtype_size).
+// That is a fast path for small datasets but a common OOM trigger for large ones.
+// Above this threshold we fetch gene columns via `Dataset.slice()` instead.
+const MAX_DENSE_X_CACHE_BYTES = 256 * 1024 * 1024; // 256MB
+
 /**
  * H5AD file loader for AnnData format
  */
@@ -239,14 +245,51 @@ export class H5adLoader {
     const trackerId = notifications.startDownload(`Loading ${file.name}`);
 
     try {
-      // Read file into ArrayBuffer
-      const buffer = await file.arrayBuffer();
-      notifications.updateDownload(trackerId, buffer.byteLength, buffer.byteLength);
-
       // Write to Emscripten virtual filesystem and open with h5wasm
       const FS = h5wasm.FS;
       const virtualPath = '/' + file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
-      FS.writeFile(virtualPath, new Uint8Array(buffer));
+
+      // MEMORY OPTIMIZATION:
+      // Avoid holding the entire file in a single ArrayBuffer for multi-GB h5ad files.
+      // Instead, stream/copy into MEMFS in chunks to reduce peak memory usage.
+      const totalBytes = Number.isFinite(file.size) ? file.size : 0;
+      const shouldChunkCopy = totalBytes > (256 * 1024 * 1024); // 256MB+
+
+      // Ensure we don't accidentally append to an existing stale file.
+      try {
+        FS.unlink(virtualPath);
+      } catch (_e) {
+        // ignore (file may not exist)
+      }
+
+      if (!shouldChunkCopy) {
+        const buffer = await file.arrayBuffer();
+        FS.writeFile(virtualPath, new Uint8Array(buffer));
+        notifications.updateDownload(trackerId, buffer.byteLength, buffer.byteLength);
+      } else {
+        const CHUNK_BYTES = 16 * 1024 * 1024; // 16MB
+        const fd = FS.open(virtualPath, 'w+');
+        let written = 0;
+
+        try {
+          while (written < totalBytes) {
+            const end = Math.min(totalBytes, written + CHUNK_BYTES);
+            const chunk = await file.slice(written, end).arrayBuffer();
+            const bytes = new Uint8Array(chunk);
+            FS.write(fd, bytes, 0, bytes.length, written);
+            written += bytes.length;
+            notifications.updateDownload(trackerId, written, totalBytes);
+
+            // Yield periodically so the UI stays responsive during large writes.
+            if (written > 0 && written % (CHUNK_BYTES * 4) === 0) {
+              await new Promise(resolve => setTimeout(resolve, 0));
+            }
+          }
+        } finally {
+          FS.close(fd);
+        }
+      }
+
       this._file = new h5wasm.File(virtualPath, 'r');
       this._filename = file.name;
       this._virtualPath = virtualPath;
@@ -551,16 +594,54 @@ export class H5adLoader {
         }
       }
     } else {
-      // Dense matrix - cache the entire matrix for efficient repeated column access
-      if (!this._denseX) {
-        const X = this._file.get('X');
-        // Cache the dense matrix data (creates typed array view into file buffer)
-        this._denseX = new Float32Array(X.value);
-      }
+      // Dense matrix:
+      // Prefer slice-based column access for large matrices to avoid caching multi-GB buffers.
+      const X = this._file.get('X');
+      const elementBytes = Number.isFinite(X?.metadata?.size) ? Number(X.metadata.size) : 4;
+      const totalDenseBytes = this._nObs * this._nVars * elementBytes;
+      const canCacheDense = Number.isFinite(totalDenseBytes) && totalDenseBytes > 0 && totalDenseBytes <= MAX_DENSE_X_CACHE_BYTES;
 
-      result = new Float32Array(this._nObs);
-      for (let i = 0; i < this._nObs; i++) {
-        result[i] = this._denseX[i * this._nVars + geneIdx];
+      if (canCacheDense) {
+        // Fast path: cache full matrix for repeated access (small datasets only).
+        if (!this._denseX) {
+          const raw = X.value;
+          this._denseX = raw instanceof Float32Array ? raw : new Float32Array(raw);
+        }
+
+        result = new Float32Array(this._nObs);
+        for (let i = 0; i < this._nObs; i++) {
+          result[i] = this._denseX[i * this._nVars + geneIdx];
+        }
+      } else if (typeof X.slice === 'function') {
+        // Memory-safe path: read only the requested column.
+        const sliced = X.slice([
+          [0, this._nObs],
+          [geneIdx, geneIdx + 1]
+        ]);
+
+        // `slice()` returns a flattened typed array of length n_obs * 1.
+        if (sliced instanceof Float32Array) {
+          result = sliced;
+        } else if (ArrayBuffer.isView(sliced)) {
+          result = new Float32Array(sliced);
+        } else {
+          // Extremely defensive fallback: coerce array-likes.
+          const out = new Float32Array(this._nObs);
+          for (let i = 0; i < this._nObs; i++) {
+            out[i] = Number(sliced?.[i] ?? 0);
+          }
+          result = out;
+        }
+      } else {
+        // Final fallback: load full matrix (may be expensive).
+        if (!this._denseX) {
+          const raw = X.value;
+          this._denseX = raw instanceof Float32Array ? raw : new Float32Array(raw);
+        }
+        result = new Float32Array(this._nObs);
+        for (let i = 0; i < this._nObs; i++) {
+          result[i] = this._denseX[i * this._nVars + geneIdx];
+        }
       }
     }
 
@@ -1214,6 +1295,9 @@ export class H5adDataSource {
       URL.revokeObjectURL(url);
     }
     this._blobUrls.clear();
+
+    // Best-effort cache release (keeps file reference; frees large computed buffers).
+    this.clearCaches?.();
   }
 
   /**

@@ -13,8 +13,8 @@
  */
 
 import { BaseAnalysisUI } from '../base-analysis-ui.js';
-// Import PlotRegistry from components directory
-import { PlotRegistry } from '../components/selectors.js';
+// Import PlotRegistry from canonical shared directory
+import { PlotRegistry } from '../../shared/plot-registry-utils.js';
 import {
   createPageSelector,
   createPlotTypeSelector,
@@ -393,6 +393,9 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
 
       // Render preview
       this._previewContainer.classList.remove('loading');
+      // Purge any existing plot to prevent WebGL memory leaks
+      const existingPlot = this._previewContainer.querySelector('.analysis-preview-plot');
+      if (existingPlot) purgePlot(existingPlot);
       this._previewContainer.innerHTML = '';
 
       const previewPlotDiv = document.createElement('div');

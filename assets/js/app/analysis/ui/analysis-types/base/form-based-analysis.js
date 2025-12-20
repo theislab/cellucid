@@ -51,8 +51,9 @@ import {
   createExpandButton,
   renderPlotOptions
 } from '../../components/index.js';
-import { loadPlotly, purgePlot, downloadImage } from '../../../plots/plotly-loader.js';
+import { loadPlotly, downloadImage } from '../../../plots/plotly-loader.js';
 import { PlotRegistry } from '../../../shared/plot-registry-utils.js';
+import { renderOrUpdatePlot } from '../../../shared/plot-lifecycle.js';
 
 /**
  * Abstract base class for form-based analysis UIs
@@ -84,6 +85,9 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     // Bind methods
     this._openExpandedView = this._openExpandedView.bind(this);
     this._handlePlotOptionChange = this._handlePlotOptionChange.bind(this);
+
+    // Prevent overlapping re-renders on rapid option changes
+    this._optionRenderRevision = 0;
 
     // Note: _selectedPages, _lastResult, and _isLoading are inherited from BaseAnalysisUI
   }
@@ -296,9 +300,15 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       return;
     }
 
-    purgePlot(container);
     const mergedOptions = PlotRegistry.mergeOptions(result.plotType, result.options || {});
-    await plotDef.render(result.data, mergedOptions, container, null);
+    await renderOrUpdatePlot({
+      plotDef,
+      data: result.data,
+      options: mergedOptions,
+      container,
+      layoutEngine: null,
+      preferUpdate: false
+    });
   }
 
   /**
@@ -347,14 +357,17 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       );
     }
 
-    void this._rerenderAfterOptionChange();
+    const revision = ++this._optionRenderRevision;
+    void this._rerenderAfterOptionChange(revision);
   }
 
   /**
    * Re-render plots and dependent panels after option changes.
    * @private
    */
-  async _rerenderAfterOptionChange() {
+  async _rerenderAfterOptionChange(revision) {
+    if (revision !== this._optionRenderRevision) return;
+
     const result = this._lastResult;
     if (!result?.plotType || !result?.data) return;
 
@@ -367,8 +380,15 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     if (this._modal?._plotContainer) {
       try {
         await loadPlotly();
-        purgePlot(this._modal._plotContainer);
-        await plotDef.render(result.data, mergedOptions, this._modal._plotContainer, null);
+        if (revision !== this._optionRenderRevision) return;
+        await renderOrUpdatePlot({
+          plotDef,
+          data: result.data,
+          options: mergedOptions,
+          container: this._modal._plotContainer,
+          layoutEngine: null,
+          preferUpdate: true
+        });
       } catch (err) {
         console.error(`[${this.constructor.name}] Modal plot re-render failed:`, err);
       }
@@ -389,8 +409,15 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     if (previewContainer) {
       try {
         await loadPlotly();
-        purgePlot(previewContainer);
-        await plotDef.render(result.data, mergedOptions, previewContainer, null);
+        if (revision !== this._optionRenderRevision) return;
+        await renderOrUpdatePlot({
+          plotDef,
+          data: result.data,
+          options: mergedOptions,
+          container: previewContainer,
+          layoutEngine: null,
+          preferUpdate: true
+        });
       } catch (err) {
         console.error(`[${this.constructor.name}] Preview plot re-render failed:`, err);
       }

@@ -12,6 +12,8 @@
  * beyond simple category selections.
  */
 
+import { isFiniteNumber, filterFiniteNumbers } from '../shared/number-utils.js';
+
 /**
  * Operator definitions with metadata
  */
@@ -359,8 +361,7 @@ export class QueryBuilder {
         const fieldValues = fieldsData[cond.field];
         if (!fieldValues) continue;
 
-        const validValues = Array.from(fieldValues)
-          .filter(v => typeof v === 'number' && Number.isFinite(v));
+        const validValues = filterFiniteNumbers(Array.from(fieldValues));
 
         if (validValues.length === 0) continue;
 
@@ -443,19 +444,19 @@ export class QueryBuilder {
         return value !== target;
 
       case 'greater_than':
-        return typeof value === 'number' && Number.isFinite(value) && value > target;
+        return isFiniteNumber(value) && value > target;
 
       case 'greater_equal':
-        return typeof value === 'number' && Number.isFinite(value) && value >= target;
+        return isFiniteNumber(value) && value >= target;
 
       case 'less_than':
-        return typeof value === 'number' && Number.isFinite(value) && value < target;
+        return isFiniteNumber(value) && value < target;
 
       case 'less_equal':
-        return typeof value === 'number' && Number.isFinite(value) && value <= target;
+        return isFiniteNumber(value) && value <= target;
 
       case 'between':
-        return typeof value === 'number' && Number.isFinite(value) &&
+        return isFiniteNumber(value) &&
                Array.isArray(target) && target.length === 2 &&
                value >= target[0] && value <= target[1];
 
@@ -476,19 +477,19 @@ export class QueryBuilder {
 
       case 'is_null':
         return value === null || value === undefined ||
-               (typeof value === 'number' && !Number.isFinite(value)) ||
+               (typeof value === 'number' && !isFiniteNumber(value)) ||
                value === '';
 
       case 'is_not_null':
         return value !== null && value !== undefined &&
-               !(typeof value === 'number' && !Number.isFinite(value)) &&
+               (typeof value !== 'number' || isFiniteNumber(value)) &&
                value !== '';
 
       case 'top_percent':
       case 'bottom_percent': {
         const threshold = thresholds.get(`${condition.id}_threshold`);
         if (!threshold) return false;
-        if (typeof value !== 'number' || !Number.isFinite(value)) return false;
+        if (!isFiniteNumber(value)) return false;
         return threshold.type === 'gte' ? value >= threshold.value : value <= threshold.value;
       }
 

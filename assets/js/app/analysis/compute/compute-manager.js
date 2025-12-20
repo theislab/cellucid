@@ -18,6 +18,7 @@
 // Import operation definitions from the single source of truth
 import { OperationType, GPU_CAPABLE_OPERATIONS } from './operations.js';
 import { getMemoryMonitor } from '../shared/memory-monitor.js';
+import { debug, debugWarn } from '../shared/debug-utils.js';
 
 // Re-export OperationType for backward compatibility
 export { OperationType };
@@ -76,8 +77,10 @@ export class ComputeManager {
     // Memory monitor integration for cleanup under memory pressure
     this._instanceId = `compute-manager-${Date.now()}`;
     this._memoryMonitor = getMemoryMonitor();
-    this._memoryMonitor.registerCleanupHandler(this._instanceId, () => {
-      this._handleMemoryCleanup();
+    this._memoryMonitor.registerCleanupHandler(this._instanceId, (reason) => {
+      // Avoid recycling all workers on periodic maintenance cleanups to reduce churn.
+      const keepAtLeastIdleWorkers = reason === 'periodic' ? 1 : 0;
+      this._handleMemoryCleanup({ keepAtLeastIdleWorkers });
     });
   }
 
@@ -86,7 +89,8 @@ export class ComputeManager {
    * Releases GPU resources and terminates idle workers
    * @private
    */
-  _handleMemoryCleanup() {
+  _handleMemoryCleanup(options = {}) {
+    const { keepAtLeastIdleWorkers = 0 } = options;
     console.debug('[ComputeManager] Memory cleanup triggered');
 
     // Release GPU shader cache if available
@@ -96,11 +100,24 @@ export class ComputeManager {
 
     // Terminate idle workers in the pool
     if (this._workerBackend && this._workerBackend.pruneIdleWorkers) {
-      this._workerBackend.pruneIdleWorkers();
+      this._workerBackend.pruneIdleWorkers({ keepAtLeast: keepAtLeastIdleWorkers });
     }
 
     // Reset metrics to free any accumulated data
     this.resetMetrics();
+  }
+
+  /**
+   * Best-effort cleanup for post-analysis memory recovery.
+   *
+   * Safe to call after large computations complete (when workers are typically idle).
+   * Uses the same hooks as MemoryMonitor cleanup but avoids global notifications.
+   *
+   * @param {Object} [options]
+   * @param {number} [options.keepAtLeastIdleWorkers=0] - Leave this many idle workers untouched
+   */
+  cleanupIdleResources(options = {}) {
+    this._handleMemoryCleanup(options);
   }
 
   /**
@@ -136,9 +153,7 @@ export class ComputeManager {
 
     this._initialized = true;
 
-    console.log(
-      `[ComputeManager] Initialized - GPU: ${this._gpuStatus}, Worker: ${this._workerStatus}`
-    );
+    debug('ComputeManager', `Initialized - GPU: ${this._gpuStatus}, Worker: ${this._workerStatus}`);
   }
 
   /**
@@ -159,12 +174,12 @@ export class ComputeManager {
         this._gpuStatus = BackendStatus.AVAILABLE;
 
         const info = gpu.getInfo();
-        console.log(`[ComputeManager] GPU available: ${info.renderer}`);
+        debug('ComputeManager', `GPU available: ${info.renderer}`);
       } else {
         this._gpuStatus = BackendStatus.UNAVAILABLE;
       }
     } catch (err) {
-      console.warn('[ComputeManager] GPU initialization failed:', err.message);
+      debugWarn('ComputeManager', 'GPU initialization failed:', err.message);
       this._gpuStatus = BackendStatus.UNAVAILABLE;
     }
   }
@@ -187,12 +202,12 @@ export class ComputeManager {
         this._workerStatus = BackendStatus.AVAILABLE;
 
         const stats = pool.getStats();
-        console.log(`[ComputeManager] Worker pool available: ${stats.poolSize} workers`);
+        debug('ComputeManager', `Worker pool available: ${stats.poolSize} workers`);
       } else {
         this._workerStatus = BackendStatus.UNAVAILABLE;
       }
     } catch (err) {
-      console.warn('[ComputeManager] Worker initialization failed:', err.message);
+      debugWarn('ComputeManager', 'Worker initialization failed:', err.message);
       this._workerStatus = BackendStatus.UNAVAILABLE;
     }
   }
@@ -223,7 +238,7 @@ export class ComputeManager {
 
       // If workers seem stuck (many pending, none processing), restart them
       if (stats.pendingRequests > 10 && stats.busyWorkers === 0) {
-        console.warn('[ComputeManager] Workers appear stuck, restarting...');
+        debugWarn('ComputeManager', 'Workers appear stuck, restarting...');
         this._workerBackend.terminate();
         this._initWorker();
       }
@@ -279,6 +294,7 @@ export class ComputeManager {
    * @param {string} [options.preferredBackend] - Force specific backend
    * @param {number} [options.timeout] - Timeout in ms
    * @param {AbortSignal} [options.signal] - AbortSignal for cancellation
+   * @param {boolean} [options.transfer] - Worker-only: whether to transfer ArrayBuffers (default true)
    * @returns {Promise<Object>} Operation result with metadata
    */
   async execute(operation, payload, options = {}) {
@@ -298,10 +314,7 @@ export class ComputeManager {
       result = await this._executeOnBackend(selectedBackend, operation, payload, options);
     } catch (primaryError) {
       // Attempt fallback
-      console.warn(
-        `[ComputeManager] ${selectedBackend} execution failed for ${operation}:`,
-        primaryError.message
-      );
+      debugWarn('ComputeManager', `${selectedBackend} execution failed for ${operation}:`, primaryError.message);
 
       if (selectedBackend === 'gpu') {
         // GPU failed -> try Worker
@@ -314,7 +327,7 @@ export class ComputeManager {
             fallbackUsed = true;
           } catch (workerError) {
             // Worker also failed -> CPU
-            console.warn('[ComputeManager] Worker fallback failed:', workerError.message);
+            debugWarn('ComputeManager', 'Worker fallback failed:', workerError.message);
             result = await this._executeOnBackend('cpu', operation, payload, options);
             actualBackend = 'cpu';
             fallbackUsed = true;
@@ -518,9 +531,9 @@ export class ComputeManager {
       throw new Error('Worker backend not available');
     }
 
-    const { timeout = 30000, signal = null } = options;
+    const { timeout = 30000, signal = null, transfer } = options;
 
-    return this._workerBackend.execute(operation, payload, { timeout, signal });
+    return this._workerBackend.execute(operation, payload, { timeout, signal, transfer });
   }
 
   /**
@@ -628,8 +641,8 @@ export class ComputeManager {
   /**
    * Compute correlation
    */
-  async computeCorrelation(xValues, yValues, method = 'pearson') {
-    return this.execute(OperationType.COMPUTE_CORRELATION, { xValues, yValues, method });
+  async computeCorrelation(xValues, yValues, method = 'pearson', options = {}) {
+    return this.execute(OperationType.COMPUTE_CORRELATION, { xValues, yValues, method }, options);
   }
 
   /**

@@ -26,7 +26,14 @@ import {
   renderSignatureSummaryStats,
   renderGeneChips
 } from '../../shared/result-renderer.js';
-import { getFiniteMinMax } from '../../shared/number-utils.js';
+import {
+  isFiniteNumber,
+  mean,
+  std,
+  median,
+  filterFiniteNumbers
+} from '../../shared/number-utils.js';
+import { purgePlot } from '../../plots/plotly-loader.js';
 
 /**
  * Gene Signature Score UI Component
@@ -198,19 +205,19 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
     });
 
     // Apply normalization if requested
-    let processedResults = signatureResults;
     if (formValues.normalize !== 'none') {
-      processedResults = this._normalizeResults(signatureResults, formValues.normalize);
+      this._normalizeResults(signatureResults, formValues.normalize);
     }
 
     // Format for visualization
     return {
       type: 'signature',
       plotType: formValues.plotType,
-      data: processedResults.map(sr => ({
+      data: signatureResults.map(sr => ({
         pageId: sr.pageId,
         pageName: sr.pageName,
-        values: sr.scores.filter(s => Number.isFinite(s)),
+        // Keep raw scores to avoid duplicating large arrays; plots/stats filter as needed.
+        values: sr.scores,
         variableInfo: { name: 'Signature Score', kind: 'continuous' }
       })),
       options: {
@@ -239,27 +246,66 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
    */
   _normalizeResults(results, method) {
     if (method === 'zscore') {
-      // Z-score normalization across all values
-      const allScores = results.flatMap(r => r.scores.filter(s => Number.isFinite(s)));
-      if (allScores.length === 0) return results;
-      const mean = allScores.reduce((a, b) => a + b, 0) / allScores.length;
-      const std = Math.sqrt(allScores.reduce((a, b) => a + (b - mean) ** 2, 0) / allScores.length);
+      // Z-score normalization across all values (streaming; avoids huge temporary arrays)
+      let count = 0;
+      let meanVal = 0;
+      let m2 = 0;
 
-      return results.map(r => ({
-        ...r,
-        scores: r.scores.map(s => Number.isFinite(s) ? (s - mean) / (std || 1) : NaN)
-      }));
+      for (const r of results) {
+        const scores = r?.scores || [];
+        for (let i = 0; i < scores.length; i++) {
+          const x = scores[i];
+          if (!isFiniteNumber(x)) continue;
+          count++;
+          const delta = x - meanVal;
+          meanVal += delta / count;
+          const delta2 = x - meanVal;
+          m2 += delta * delta2;
+        }
+      }
+
+      if (count === 0) return results;
+      const stdVal = Math.sqrt(m2 / count);
+      const denom = stdVal || 1;
+
+      for (const r of results) {
+        const scores = r?.scores || [];
+        for (let i = 0; i < scores.length; i++) {
+          const x = scores[i];
+          scores[i] = isFiniteNumber(x) ? (x - meanVal) / denom : NaN;
+        }
+      }
+
+      return results;
     } else if (method === 'minmax') {
       // Min-max normalization
-      const allScores = results.flatMap(r => r.scores.filter(s => Number.isFinite(s)));
-      const { min, max, count } = getFiniteMinMax(allScores);
-      if (count === 0) return results;
-      const range = max - min || 1;
+      let min = Infinity;
+      let max = -Infinity;
+      let count = 0;
 
-      return results.map(r => ({
-        ...r,
-        scores: r.scores.map(s => Number.isFinite(s) ? (s - min) / range : NaN)
-      }));
+      for (const r of results) {
+        const scores = r?.scores || [];
+        for (let i = 0; i < scores.length; i++) {
+          const x = scores[i];
+          if (!isFiniteNumber(x)) continue;
+          count++;
+          if (x < min) min = x;
+          if (x > max) max = x;
+        }
+      }
+
+      if (count === 0) return results;
+      const range = (max - min) || 1;
+
+      for (const r of results) {
+        const scores = r?.scores || [];
+        for (let i = 0; i < scores.length; i++) {
+          const x = scores[i];
+          scores[i] = isFiniteNumber(x) ? (x - min) / range : NaN;
+        }
+      }
+
+      return results;
     }
 
     return results;
@@ -275,6 +321,8 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
    */
   async _showResult(result) {
     this._resultContainer.classList.remove('hidden');
+    // Purge any existing plots to prevent WebGL memory leaks
+    purgePlot(this._resultContainer.querySelector('.analysis-preview-plot'));
     this._resultContainer.innerHTML = '';
 
     // Result header
@@ -342,23 +390,22 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
       return;
     }
 
-    // Compute stats for each page
+    // Compute stats for each page using centralized utilities
     const statsRows = pageData.map(pd => {
-      const values = pd.values.filter(v => typeof v === 'number' && Number.isFinite(v));
+      const values = filterFiniteNumbers(pd.values);
       const n = values.length;
       if (n === 0) return `<tr><td>${pd.pageName}</td><td colspan="4">No valid values</td></tr>`;
 
-      const mean = values.reduce((a, b) => a + b, 0) / n;
-      const sorted = [...values].sort((a, b) => a - b);
-      const median = n % 2 === 0 ? (sorted[n/2-1] + sorted[n/2]) / 2 : sorted[Math.floor(n/2)];
-      const std = Math.sqrt(values.reduce((a, b) => a + (b - mean) ** 2, 0) / n);
+      const meanVal = mean(values);
+      const medianVal = median(values);
+      const stdVal = std(values);
 
       return `
         <tr>
           <td>${pd.pageName}</td>
-          <td>${mean.toFixed(3)}</td>
-          <td>${median.toFixed(3)}</td>
-          <td>${std.toFixed(3)}</td>
+          <td>${meanVal.toFixed(3)}</td>
+          <td>${medianVal.toFixed(3)}</td>
+          <td>${stdVal.toFixed(3)}</td>
           <td>${n.toLocaleString()}</td>
         </tr>
       `;

@@ -11,7 +11,7 @@
  */
 
 import { getTransformRegistry as getUnifiedRegistry } from './plugin-contract.js';
-import { getFiniteMinMax } from '../shared/number-utils.js';
+import { getFiniteMinMax, isFiniteNumber, mean as computeMean, variance as computeVariance } from '../shared/number-utils.js';
 
 // =============================================================================
 // BUILT-IN TRANSFORM DEFINITIONS
@@ -49,7 +49,7 @@ const BUILTIN_TRANSFORMS = [
       const numericValues = [];
       for (let i = 0; i < values.length; i++) {
         const v = values[i];
-        if (typeof v === 'number' && Number.isFinite(v) && v >= 0) {
+        if (isFiniteNumber(v) && v >= 0) {
           numericIndices.push(i);
           numericValues.push(v);
         }
@@ -115,7 +115,7 @@ const BUILTIN_TRANSFORMS = [
       const numericIndices = [];
       for (let i = 0; i < values.length; i++) {
         const v = values[i];
-        if (typeof v === 'number' && Number.isFinite(v)) {
+        if (isFiniteNumber(v)) {
           numericIndices.push(i);
           numericValues.push(v);
         }
@@ -125,12 +125,12 @@ const BUILTIN_TRANSFORMS = [
         return { values: [...values], metadata: { transform: 'zscore', skipped: true } };
       }
 
-      const mean = numericValues.reduce((a, b) => a + b, 0) / numericValues.length;
-      const variance = numericValues.reduce((a, b) => a + (b - mean) ** 2, 0) / numericValues.length;
-      const std = Math.sqrt(variance);
+      // Use centralized statistics utilities
+      const mean = computeMean(numericValues);
+      const std = Math.sqrt(computeVariance(numericValues));
 
       if (std === 0) {
-        const result = values.map(v => typeof v === 'number' && Number.isFinite(v) ? 0 : v);
+        const result = values.map(v => isFiniteNumber(v) ? 0 : v);
         return { values: result, metadata: { transform: 'zscore', mean, std: 0 } };
       }
 
@@ -207,7 +207,7 @@ const BUILTIN_TRANSFORMS = [
       const numericIndices = [];
       for (let i = 0; i < values.length; i++) {
         const v = values[i];
-        if (typeof v === 'number' && Number.isFinite(v)) {
+        if (isFiniteNumber(v)) {
           numericIndices.push(i);
           numericValues.push(v);
         }
@@ -228,7 +228,7 @@ const BUILTIN_TRANSFORMS = [
 
       if (dataRange === 0) {
         const midpoint = (targetMin + targetMax) / 2;
-        const result = values.map(v => typeof v === 'number' && Number.isFinite(v) ? midpoint : v);
+        const result = values.map(v => isFiniteNumber(v) ? midpoint : v);
         return { values: result, metadata: { transform: 'minmax', dataMin, dataMax, dataRange: 0 } };
       }
 
@@ -309,7 +309,7 @@ const BUILTIN_TRANSFORMS = [
       const numericIndices = [];
       for (let i = 0; i < values.length; i++) {
         const v = values[i];
-        if (typeof v === 'number' && Number.isFinite(v)) {
+        if (isFiniteNumber(v)) {
           numericIndices.push(i);
           numericValues.push(v);
         }
@@ -390,7 +390,7 @@ const BUILTIN_TRANSFORMS = [
       const numericIndices = [];
       for (let i = 0; i < values.length; i++) {
         const v = values[i];
-        if (typeof v === 'number' && Number.isFinite(v)) {
+        if (isFiniteNumber(v)) {
           numericIndices.push(i);
           numericValues.push(v);
         }
@@ -480,7 +480,7 @@ const BUILTIN_TRANSFORMS = [
       const { method, binCount, customBreaks, labels: customLabels } = options;
       const values = data.values;
 
-      const numericValues = values.filter(v => typeof v === 'number' && Number.isFinite(v));
+      const numericValues = values.filter(v => isFiniteNumber(v));
 
       if (numericValues.length === 0) {
         return {
@@ -492,7 +492,7 @@ const BUILTIN_TRANSFORMS = [
       let breaks;
       if (method === 'custom' && customBreaks) {
         if (typeof customBreaks === 'string') {
-          breaks = customBreaks.split(',').map(s => parseFloat(s.trim())).filter(n => Number.isFinite(n));
+          breaks = customBreaks.split(',').map(s => parseFloat(s.trim())).filter(n => isFiniteNumber(n));
         } else {
           breaks = [...customBreaks];
         }
@@ -529,7 +529,7 @@ const BUILTIN_TRANSFORMS = [
       }
 
       const binnedValues = values.map(v => {
-        if (typeof v !== 'number' || !Number.isFinite(v)) {
+        if (!isFiniteNumber(v)) {
           return 'Missing';
         }
         for (let i = 0; i < breaks.length - 1; i++) {
@@ -593,7 +593,7 @@ const BUILTIN_TRANSFORMS = [
       const { relativeTo, customValue } = options;
       const values = data.values;
 
-      const numericValues = values.filter(v => typeof v === 'number' && Number.isFinite(v));
+      const numericValues = values.filter(v => isFiniteNumber(v));
 
       if (numericValues.length === 0) {
         return { values: [...values], metadata: { transform: 'percentage', skipped: true } };
@@ -605,7 +605,7 @@ const BUILTIN_TRANSFORMS = [
           divisor = numericValues.reduce((a, b) => a + b, 0);
           break;
         case 'value':
-          divisor = Number.isFinite(customValue) ? customValue : 1;
+          divisor = isFiniteNumber(customValue) ? customValue : 1;
           break;
         default:
           divisor = getFiniteMinMax(numericValues).max;
@@ -616,7 +616,7 @@ const BUILTIN_TRANSFORMS = [
       }
 
       const result = values.map(v => {
-        if (typeof v === 'number' && Number.isFinite(v)) {
+        if (isFiniteNumber(v)) {
           return (v / divisor) * 100;
         }
         return v;
@@ -692,7 +692,7 @@ const BUILTIN_TRANSFORMS = [
           break;
 
         case 'outliers': {
-          const numericVals = values.filter(v => typeof v === 'number' && Number.isFinite(v));
+          const numericVals = values.filter(v => isFiniteNumber(v));
           const sorted = [...numericVals].sort((a, b) => a - b);
           const q1 = sorted[Math.floor(sorted.length * 0.25)];
           const q3 = sorted[Math.floor(sorted.length * 0.75)];

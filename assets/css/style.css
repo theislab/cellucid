@@ -6198,6 +6198,20 @@ body.dark-mode .notification-progress {
   color: #374151;
 }
 
+/* Select with description - shows helper text below dropdown */
+.form-select-with-description {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.form-select-description {
+  font-size: 11px;
+  color: #6b7280;
+  line-height: 1.4;
+  min-height: 14px;
+}
+
 .analysis-requirement-notice {
   display: flex;
   align-items: flex-start;

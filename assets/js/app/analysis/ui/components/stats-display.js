@@ -7,7 +7,12 @@
  */
 
 import { runStatisticalTests, formatStatisticalResult } from '../../stats/statistical-tests.js';
-import { filterFiniteNumbers } from '../../shared/number-utils.js';
+import {
+  filterFiniteNumbers,
+  mean as computeMean,
+  std as computeStd,
+  median as computeMedian
+} from '../../shared/number-utils.js';
 
 // =============================================================================
 // SUMMARY STATISTICS
@@ -62,7 +67,7 @@ export function renderSummaryStats(container, pageData, variableName) {
     }
     table.appendChild(tbody);
   } else {
-    // Show continuous stats
+    // Show continuous stats using centralized utilities
     const statsByPage = pageData.map(pd => {
       const vals = filterFiniteNumbers(pd.values);
       const n = vals.length;
@@ -70,31 +75,16 @@ export function renderSummaryStats(container, pageData, variableName) {
         return { count: 0, mean: null, median: null, min: null, max: null, std: null };
       }
 
-      // Mean/std (Welford)
-      let mean = 0;
-      let m2 = 0;
-      for (let i = 0; i < n; i++) {
-        const x = vals[i];
-        const delta = x - mean;
-        mean += delta / (i + 1);
-        const delta2 = x - mean;
-        m2 += delta * delta2;
-      }
-      const variance = m2 / n;
-      const std = Math.sqrt(variance);
-
-      // Median/min/max (sorted copy)
+      // Sort once for min/max
       const sorted = [...vals].sort((a, b) => a - b);
-      const mid = Math.floor(n / 2);
-      const median = n % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
 
       return {
         count: n,
-        mean,
-        median,
+        mean: computeMean(vals),
+        median: computeMedian(vals),
         min: sorted[0],
         max: sorted[n - 1],
-        std
+        std: computeStd(vals)
       };
     });
 

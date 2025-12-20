@@ -16,9 +16,10 @@
  * @module data/streaming-gene-loader
  */
 
-import { PerformanceConfig, getPerformanceConfig } from '../shared/performance-config.js';
+import { getPerformanceConfig } from '../shared/performance-config.js';
 import { gatherFloat32, gatherComplementFloat32 } from '../shared/typed-array-utils.js';
 import { getMemoryMonitor } from '../shared/memory-monitor.js';
+import { debug, debugWarn } from '../shared/debug-utils.js';
 
 // =============================================================================
 // CONSTANTS
@@ -94,18 +95,31 @@ export class StreamingGeneLoader {
 
     // Configuration (merge with performance config)
     const perfConfig = getPerformanceConfig();
-    /** @type {number} Max buffer size */
-    this._maxBufferSize = config.preloadCount || perfConfig.batch.defaultPreloadCount || DEFAULTS.maxBufferSize;
     /** @type {number} Network concurrency */
     this._networkConcurrency = config.networkConcurrency || perfConfig.batch.networkConcurrency || DEFAULTS.networkConcurrency;
     /** @type {number} Memory budget in MB */
     this._memoryBudgetMB = config.memoryBudgetMB || perfConfig.memory.defaultBudgetMB;
+    /** @type {number} Configured preload count */
+    this._configuredPreloadCount = config.preloadCount || perfConfig.batch.defaultPreloadCount || DEFAULTS.maxBufferSize;
+    /** @type {number} Max buffer size (will be recalculated based on memory budget) */
+    this._maxBufferSize = this._configuredPreloadCount;
+    /** @type {number} Estimated bytes per gene (updated during loading) */
+    this._bytesPerGene = 0;
+    /** @type {number} Total cells in dataset (for memory estimation) */
+    this._totalCells = dataLayer?.state?.pointCount || 0;
 
     // Internal state
     /** @type {Map<string, Float32Array|null>} Loaded gene data buffer */
     this._buffer = new Map();
     /** @type {Set<string>} Currently loading genes */
     this._loadingGenes = new Set();
+    /**
+     * Genes that have been ensured-loaded in the DataLayer during this run.
+     * Used to guarantee best-effort unloading on abort/error to avoid leaking
+     * large var-field buffers across runs.
+     * @type {Set<string>}
+     */
+    this._loadedGenes = new Set();
     /** @type {string[]} Queue of genes to load */
     this._loadQueue = [];
     /** @type {boolean} Whether streaming has been aborted */
@@ -178,7 +192,13 @@ export class StreamingGeneLoader {
     this._aborted = false;
     this._buffer.clear();
     this._loadingGenes.clear();
+    // Defensive: previous runs should clean this, but ensure we don't leak in edge cases.
+    this._releaseAllLoadedGenes();
+    this._loadedGenes.clear();
     this._loadQueue = [...geneList];
+
+    // Calculate memory-aware buffer size
+    this._recalculateBufferSize();
     this._effectiveBufferSize = this._maxBufferSize;
 
     // Clear any waiting resolvers from previous runs
@@ -196,7 +216,7 @@ export class StreamingGeneLoader {
     // Subscribe to memory pressure
     this._pressureUnsubscribe = this._memoryMonitor.onMemoryPressure(this._handleMemoryPressure);
 
-    console.log(`[StreamingGeneLoader] Starting run ${currentRunId}: ${geneList.length} genes, buffer=${this._maxBufferSize}, network=${this._networkConcurrency}`);
+    debug('StreamingGeneLoader', `Starting run ${currentRunId}: ${geneList.length} genes, buffer=${this._maxBufferSize}, network=${this._networkConcurrency}`);
 
     // Set up abort listener
     if (this.signal) {
@@ -210,7 +230,7 @@ export class StreamingGeneLoader {
       // Process genes one by one
       for (let i = 0; i < geneList.length; i++) {
         if (this._aborted) {
-          console.log('[StreamingGeneLoader] Aborted, stopping iteration');
+          debug('StreamingGeneLoader', 'Aborted, stopping iteration');
           break;
         }
 
@@ -221,7 +241,7 @@ export class StreamingGeneLoader {
 
         if (values === null) {
           // Gene failed to load, skip it
-          console.warn(`[StreamingGeneLoader] Skipping failed gene: ${gene}`);
+          debugWarn('StreamingGeneLoader', `Skipping failed gene: ${gene}`);
           continue;
         }
 
@@ -243,9 +263,8 @@ export class StreamingGeneLoader {
         // Remove from buffer to free memory
         this._buffer.delete(gene);
 
-        // Unload gene from dataLayer to free memory
-        this.dataLayer.unloadGeneExpression?.(gene, { preserveActive: true });
-        this.dataLayer.invalidateVariable?.('gene_expression', gene);
+        // Unload gene from DataLayer to free memory (best-effort).
+        this._releaseGene(gene);
 
         // Report progress
         if (this.onProgress) {
@@ -269,6 +288,8 @@ export class StreamingGeneLoader {
         }
       }
     } finally {
+      // Mark the run as stopped so in-flight loads don't repopulate buffers after cleanup.
+      this._aborted = true;
       // Cleanup
       this._stats.endTime = performance.now();
 
@@ -287,10 +308,12 @@ export class StreamingGeneLoader {
       this._buffer.clear();
       this._loadQueue = [];
       this._loadingGenes.clear();
+      // Best-effort unload any genes that were loaded but not released (abort/errors/in-flight loads).
+      this._releaseAllLoadedGenes();
 
       const duration = (this._stats.endTime - this._stats.startTime) / 1000;
       const genesPerSec = this._stats.genesLoaded / duration;
-      console.log(`[StreamingGeneLoader] Run ${currentRunId} completed: ${this._stats.genesLoaded} loaded, ${this._stats.genesFailed} failed, ${duration.toFixed(1)}s (${genesPerSec.toFixed(1)} genes/s)`);
+      debug('StreamingGeneLoader', `Run ${currentRunId} completed: ${this._stats.genesLoaded} loaded, ${this._stats.genesFailed} failed, ${duration.toFixed(1)}s (${genesPerSec.toFixed(1)} genes/s)`);
     }
   }
 
@@ -326,6 +349,42 @@ export class StreamingGeneLoader {
   // ===========================================================================
 
   /**
+   * Recalculate buffer size based on memory budget
+   * @private
+   */
+  _recalculateBufferSize() {
+    // Estimate bytes per gene: 4 bytes per cell (Float32)
+    // Memory usage per gene includes:
+    // - Raw data in state.varData.fields: cellCount × 4 bytes
+    // - Buffer reference: cellCount × 4 bytes
+    // - Gathered valuesA: ~cellCount × 4 bytes (subset)
+    // - Gathered valuesB: ~cellCount × 4 bytes (subset)
+    // - Worker thread copies: potentially 2x more
+    // Conservative estimate: 6x base size
+    const cellCount = this._totalCells || this.dataLayer?.state?.pointCount || 100000;
+    const baseBytes = cellCount * 4;
+    const overheadMultiplier = 6; // Conservative: raw + buffer + 2 gathers + worker copies
+    const bytesPerGene = this._bytesPerGene > 0
+      ? this._bytesPerGene
+      : baseBytes * overheadMultiplier;
+
+    const budgetBytes = this._memoryBudgetMB * 1024 * 1024;
+
+    // Calculate max genes that fit in budget
+    // Reserve 30% of budget for buffered gene data (keep 70% for compute + other app allocations)
+    const bufferBudget = budgetBytes * 0.3;
+    const maxByMemory = Math.max(DEFAULTS.minBufferSize, Math.floor(bufferBudget / bytesPerGene));
+
+    // Use the smaller of configured preload count and memory-limited count
+    const oldBufferSize = this._maxBufferSize;
+    this._maxBufferSize = Math.min(this._configuredPreloadCount, maxByMemory);
+
+    if (this._maxBufferSize !== oldBufferSize) {
+      debug('StreamingGeneLoader', `Buffer size adjusted: ${oldBufferSize} -> ${this._maxBufferSize} (budget: ${this._memoryBudgetMB}MB, ~${(bytesPerGene / 1024 / 1024).toFixed(2)}MB/gene)`);
+    }
+  }
+
+  /**
    * Start prefetching genes up to buffer limit
    * @private
    */
@@ -355,7 +414,37 @@ export class StreamingGeneLoader {
     if (this._stats.genesLoaded > 0 && this._stats.genesLoaded % 100 === 0) {
       const elapsed = (performance.now() - this._stats.startTime) / 1000;
       const rate = this._stats.genesLoaded / elapsed;
-      console.log(`[StreamingGeneLoader] Progress: ${this._stats.genesLoaded} loaded (${rate.toFixed(1)}/s), loading=${this._loadingGenes.size}, buffered=${this._buffer.size}, queued=${this._loadQueue.length}`);
+      debug('StreamingGeneLoader', `Progress: ${this._stats.genesLoaded} loaded (${rate.toFixed(1)}/s), loading=${this._loadingGenes.size}, buffered=${this._buffer.size}, queued=${this._loadQueue.length}`);
+    }
+  }
+
+  /**
+   * Prune the prefetch buffer to the current effective size.
+   *
+   * Under memory pressure we drop buffered genes that haven't been consumed yet
+   * (except genes that callers are actively waiting on).
+   *
+   * @private
+   */
+  _pruneBufferToEffectiveSize() {
+    const targetSize = Math.max(DEFAULTS.minBufferSize, this._effectiveBufferSize);
+    if (this._buffer.size <= targetSize) return;
+
+    const protectedGenes = new Set(this._waitingFor.keys());
+
+    for (const gene of this._buffer.keys()) {
+      if (this._buffer.size <= targetSize) break;
+      if (protectedGenes.has(gene)) continue;
+
+      this._buffer.delete(gene);
+
+      // Release dataset-level cached buffers for this gene (best-effort).
+      try {
+        this.dataLayer.unloadGeneExpression?.(gene, { preserveActive: true });
+        this.dataLayer.invalidateVariable?.('gene_expression', gene);
+      } catch (_err) {
+        // Ignore pruning errors
+      }
     }
   }
 
@@ -371,9 +460,13 @@ export class StreamingGeneLoader {
 
     try {
       const { values } = await this.dataLayer.ensureGeneExpressionLoaded(gene, { silent: true });
+      // Track ownership of this loaded var-field so we can unload on abort/error.
+      this._loadedGenes.add(gene);
 
       if (this._aborted) {
-        // Still notify waiters so they don't hang
+        // If we were aborted while a load was in-flight, ensure we do not leak this field.
+        this._releaseGene(gene);
+        // Still notify waiters so they don't hang.
         this._notifyWaiters(gene, null);
         return;
       }
@@ -386,6 +479,23 @@ export class StreamingGeneLoader {
       this._stats.genesLoaded++;
       if (values?.byteLength) {
         this._stats.bytesLoaded += values.byteLength;
+
+        // Update bytes per gene estimate and recalculate buffer size
+        // Use running average for more accurate estimation
+        // Multiply by 6 to account for: raw + buffer + gathers + worker copies
+        const newBytesPerGene = values.byteLength * 6;
+        if (this._bytesPerGene === 0) {
+          this._bytesPerGene = newBytesPerGene;
+        } else {
+          // Weighted average: 80% current, 20% new (adapts to actual usage)
+          this._bytesPerGene = Math.round(this._bytesPerGene * 0.8 + newBytesPerGene * 0.2);
+        }
+
+        // Recalculate buffer size periodically (every 10 genes)
+        if (this._stats.genesLoaded % 10 === 0) {
+          this._recalculateBufferSize();
+          this._effectiveBufferSize = Math.min(this._effectiveBufferSize, this._maxBufferSize);
+        }
       }
 
       if (this.onGeneLoaded) {
@@ -395,7 +505,7 @@ export class StreamingGeneLoader {
       // Notify anyone waiting for this gene
       this._notifyWaiters(gene, values);
     } catch (err) {
-      console.warn(`[StreamingGeneLoader] Failed to load gene ${gene}:`, err.message);
+      debugWarn('StreamingGeneLoader', `Failed to load gene ${gene}:`, err.message);
       // Mark as failed (null) so waitForGene can skip it
       this._buffer.set(gene, null);
       this._stats.genesFailed++;
@@ -467,7 +577,9 @@ export class StreamingGeneLoader {
 
     // If still not in buffer, wait with promise-based notification
     if (!this._buffer.has(gene)) {
+      let resolver = null;
       const waitPromise = new Promise((resolve) => {
+        resolver = resolve;
         // Register this resolver
         if (!this._waitingFor.has(gene)) {
           this._waitingFor.set(gene, []);
@@ -476,9 +588,10 @@ export class StreamingGeneLoader {
       });
 
       // Race against timeout and abort
+      let timeoutId = null;
       const timeoutPromise = new Promise((resolve) => {
-        setTimeout(() => {
-          console.warn(`[StreamingGeneLoader] Timeout waiting for gene: ${gene}`);
+        timeoutId = setTimeout(() => {
+          debugWarn('StreamingGeneLoader', `Timeout waiting for gene: ${gene}`);
           resolve(null);
         }, timeoutMs);
       });
@@ -486,10 +599,14 @@ export class StreamingGeneLoader {
       // Wait for either gene to load, timeout, or abort
       const result = await Promise.race([waitPromise, timeoutPromise]);
 
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+
       // Clean up this resolver if it didn't get called
       const resolvers = this._waitingFor.get(gene);
       if (resolvers) {
-        const idx = resolvers.indexOf(waitPromise);
+        const idx = resolver ? resolvers.indexOf(resolver) : -1;
         if (idx >= 0) resolvers.splice(idx, 1);
         if (resolvers.length === 0) this._waitingFor.delete(gene);
       }
@@ -514,17 +631,17 @@ export class StreamingGeneLoader {
     if (level === 'critical') {
       // Aggressive reduction - cut buffer to minimum
       this._effectiveBufferSize = DEFAULTS.minBufferSize;
-      console.warn('[StreamingGeneLoader] Critical memory pressure - reducing buffer to minimum');
+      debugWarn('StreamingGeneLoader', 'Critical memory pressure - reducing buffer to minimum');
 
-      // Clear buffered genes that haven't been consumed yet
-      // (keep only genes currently being waited on)
-      // This is handled naturally as genes are consumed
+      // Proactively drop prefetched genes to free memory immediately.
+      this._pruneBufferToEffectiveSize();
     } else if (level === 'cleanup' || level === 'warning') {
       // Moderate reduction
       this._effectiveBufferSize = Math.max(
         DEFAULTS.minBufferSize,
         Math.floor(this._maxBufferSize * DEFAULTS.pressureBufferReduction)
       );
+      this._pruneBufferToEffectiveSize();
       console.debug(`[StreamingGeneLoader] Memory pressure (${level}) - reducing buffer to ${this._effectiveBufferSize}`);
     } else {
       // Normal - restore full buffer size
@@ -546,7 +663,49 @@ export class StreamingGeneLoader {
     }
     this._waitingFor.clear();
 
+    // Proactively release any prefetched genes that haven't been consumed yet.
+    // (Prevents large var-field arrays from remaining pinned in DataLayer/state after abort.)
+    for (const gene of this._buffer.keys()) {
+      this._releaseGene(gene);
+    }
+    this._buffer.clear();
+
+    // Also best-effort release anything we loaded during this run.
+    this._releaseAllLoadedGenes();
+
     console.debug('[StreamingGeneLoader] Aborted');
+  }
+
+  /**
+   * Best-effort release of a single gene's var-field buffers from DataLayer/state.
+   * @param {string} gene
+   * @private
+   */
+  _releaseGene(gene) {
+    if (!gene) return;
+
+    try {
+      const unloaded = this.dataLayer.unloadGeneExpression?.(gene, { preserveActive: true });
+      this.dataLayer.invalidateVariable?.('gene_expression', gene);
+      if (unloaded) {
+        this._loadedGenes.delete(gene);
+      }
+    } catch (_err) {
+      // Ignore release failures
+    }
+  }
+
+  /**
+   * Best-effort release of any genes ensured-loaded during this run.
+   * @private
+   */
+  _releaseAllLoadedGenes() {
+    if (!this._loadedGenes || this._loadedGenes.size === 0) return;
+
+    const genes = Array.from(this._loadedGenes);
+    for (const gene of genes) {
+      this._releaseGene(gene);
+    }
   }
 
   /**

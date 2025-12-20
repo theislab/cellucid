@@ -16,11 +16,14 @@ import { TransformPipeline, createTransformPipeline } from './data/transform-pip
 import { createLayoutEngine } from './plots/layout-engine.js';
 import { createMultiVariableAnalysis } from './stats/multi-variable-analysis.js';
 import { runStatisticalTests as runStats } from './stats/statistical-tests.js';
-import { loadPlotly } from './plots/plotly-loader.js';
+import { loadPlotly, purgePlot } from './plots/plotly-loader.js';
 import { getNotificationCenter } from '../notification-center.js';
 import { getMemoryMonitor } from './shared/memory-monitor.js';
+import { clearActiveSourceCaches } from './shared/resource-cleanup.js';
 // Import PlotRegistry from centralized location
 import { PlotRegistry } from './shared/plot-registry-utils.js';
+import { debugError } from './shared/debug-utils.js';
+import { closeModal } from './ui/components/modal.js';
 
 // Import unified UI manager and analysis type factories
 import { createAnalysisUIManager } from './ui/analysis-ui-manager.js';
@@ -102,14 +105,38 @@ export class ComparisonModule {
 
     // Register with memory monitor for automatic cleanup
     this._memoryMonitor = getMemoryMonitor();
-    this._memoryMonitor.registerCleanupHandler('comparison-module', () => {
-      // Data layer cache cleanup
+    this._memoryMonitor.registerCleanupHandler('comparison-module', (reason) => {
+      // Data layer cache cleanup (safe even for periodic maintenance)
       if (this.dataLayer && this.dataLayer.performCacheCleanup) {
         this.dataLayer.performCacheCleanup();
       }
+
+      // On memory-pressure cleanups, aggressively release UI/WebGL resources too.
+      if (reason !== 'threshold' && reason !== 'critical') return;
+
+      // Clear dataset-source caches too (h5ad/zarr) so large gene caches/sparse conversions can be released.
+      clearActiveSourceCaches();
+
+      // Close any open analysis modals (removes global listeners + purges plots).
+      try {
+        document.querySelectorAll?.('.analysis-modal')?.forEach?.((modal) => {
+          closeModal(modal);
+        });
+      } catch (_err) {
+        // Ignore
+      }
+
+      // Purge preview plots so GPU buffers can be reclaimed.
+      try {
+        document.querySelectorAll?.('.analysis-preview-plot')?.forEach?.((plotEl) => {
+          purgePlot(plotEl);
+        });
+      } catch (_err) {
+        // Ignore
+      }
     });
     // Start monitoring if not already active
-    this._memoryMonitor.start();
+    this._memoryMonitor.start({ checkInterval: 15000 });
   }
 
   /**
@@ -117,13 +144,13 @@ export class ComparisonModule {
    */
   init() {
     if (!this.container) {
-      console.error('[ComparisonModule] Container element not found');
+      debugError('ComparisonModule', 'Container element not found');
       return;
     }
 
     const accordionContent = this.container.querySelector('.accordion-content');
     if (!accordionContent) {
-      console.error('[ComparisonModule] Accordion content not found');
+      debugError('ComparisonModule', 'Accordion content not found');
       return;
     }
 
@@ -421,7 +448,7 @@ export class ComparisonModule {
       return transformedData;
 
     } catch (err) {
-      console.error('[ComparisonModule] runAnalysis failed:', err);
+      debugError('ComparisonModule', 'runAnalysis failed:', err);
       throw err;
     }
   }

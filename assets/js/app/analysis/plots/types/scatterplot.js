@@ -11,7 +11,7 @@
 
 import { PlotRegistry, BasePlot, COMMON_HOVER_STYLE, createMinimalPlotly, getPlotlyConfig } from '../plot-factory.js';
 import { getScatterTraceType } from '../plotly-loader.js';
-import { getFiniteMinMax } from '../../shared/number-utils.js';
+import { getFiniteMinMax, isFiniteNumber, mean } from '../../shared/number-utils.js';
 
 const scatterPlotDefinition = {
   id: 'scatterplot',
@@ -137,25 +137,23 @@ const scatterPlotDefinition = {
       const xVals = pageResult.xValues;
       const yVals = pageResult.yValues;
 
-      // Filter to valid pairs for display
-      const validPairs = [];
+      // Filter to valid pairs for display (avoid allocating per-point objects)
+      const xData = [];
+      const yData = [];
       for (let j = 0; j < Math.min(xVals.length, yVals.length); j++) {
         const x = xVals[j];
         const y = yVals[j];
-        if (typeof x === 'number' && Number.isFinite(x) &&
-            typeof y === 'number' && Number.isFinite(y)) {
+        if (isFiniteNumber(x) && isFiniteNumber(y)) {
           // Handle log scale - skip non-positive values
           if ((logScaleX && x <= 0) || (logScaleY && y <= 0)) continue;
-          validPairs.push({ x, y });
+          xData.push(x);
+          yData.push(y);
         }
       }
 
-      if (validPairs.length === 0) continue;
+      if (xData.length === 0) continue;
 
-      const xData = validPairs.map(p => p.x);
-      const yData = validPairs.map(p => p.y);
-
-      if (useDensity && validPairs.length > densityThreshold) {
+      if (useDensity && xData.length > densityThreshold) {
         // Use density plot for large datasets
         traces.push({
           type: 'histogram2dcontour',
@@ -172,11 +170,11 @@ const scatterPlotDefinition = {
         });
 
         // Add sparse scatter points on top (GPU-accelerated)
-        const sampleSize = Math.min(500, validPairs.length);
-        const step = Math.floor(validPairs.length / sampleSize);
+        const sampleSize = Math.min(500, xData.length);
+        const step = Math.max(1, Math.floor(xData.length / sampleSize));
         const sampledX = [];
         const sampledY = [];
-        for (let j = 0; j < validPairs.length; j += step) {
+        for (let j = 0; j < xData.length; j += step) {
           sampledX.push(xData[j]);
           sampledY.push(yData[j]);
         }
@@ -367,14 +365,16 @@ const scatterPlotDefinition = {
    * @returns {Promise<Object>} Updated Plotly figure
    */
   async update(figure, correlationData, _options, layoutEngine) {
-    // For scatter plots with complex trace manipulation, re-render is often cleaner
+    // For scatter plots with complex trace manipulation, a full re-render is often cleaner.
+    // Purge first to avoid leaking WebGL contexts / DOM on repeated updates.
     try {
-      const result = await this.render(correlationData, _options, figure, layoutEngine);
-      return result;
-    } catch (err) {
-      console.error('[ScatterPlot] Update error:', err);
-      return this.render(correlationData, _options, figure, layoutEngine);
+      const Plotly = await createMinimalPlotly();
+      Plotly.purge?.(figure);
+    } catch (_purgeErr) {
+      // Ignore purge failures
     }
+
+    return this.render(correlationData, _options, figure, layoutEngine);
   },
 
   /**
@@ -450,7 +450,7 @@ function computeConfidenceBand(xData, yData, slope, intercept, confidence = 0.95
     };
   }
 
-  const xMean = xData.reduce((a, b) => a + b, 0) / n;
+  const xMean = mean(xData);
   const ssX = xData.reduce((a, b) => a + Math.pow(b - xMean, 2), 0);
 
   // Residual standard error

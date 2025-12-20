@@ -18,6 +18,7 @@
 import { BasePlot, COMMON_HOVER_STYLE, createMinimalPlotly, getPlotlyConfig } from './plot-base.js';
 import { PlotHelpers, getPageColor, PAGE_COLORS } from '../core/plugin-contract.js';
 import { getScatterTraceType, getHeatmapTraceType, requireWebGL2 } from './plotly-loader.js';
+import { mean, std, median } from '../shared/number-utils.js';
 
 // =============================================================================
 // PLOT REGISTRY - Imported from centralized location
@@ -100,6 +101,13 @@ export class PlotFactory {
       return await Plotly.react(figure, traces, layout, getPlotlyConfig());
     } catch (err) {
       console.warn(`[${definition.id}] Update error, falling back to render:`, err);
+      // IMPORTANT: Purge before full re-render to avoid leaking WebGL contexts / DOM.
+      try {
+        const Plotly = await createMinimalPlotly();
+        Plotly.purge?.(figure);
+      } catch (_purgeErr) {
+        // Ignore purge failures
+      }
       return PlotFactory.render({ definition, pageData, options, container: figure, layoutEngine });
     }
   }
@@ -535,30 +543,28 @@ export class PlotFactory {
         continue;
       }
 
+      // Use centralized statistics utilities
       const sorted = [...values].sort((a, b) => a - b);
       const n = sorted.length;
-      const min = sorted[0];
-      const max = sorted[n - 1];
+      const minVal = sorted[0];
+      const maxVal = sorted[n - 1];
       const q1 = sorted[Math.floor(n * 0.25)];
       const q3 = sorted[Math.floor(n * 0.75)];
-      const median = n % 2 === 0
-        ? (sorted[n / 2 - 1] + sorted[n / 2]) / 2
-        : sorted[Math.floor(n / 2)];
-      const mean = values.reduce((a, b) => a + b, 0) / n;
-      const variance = values.reduce((a, b) => a + (b - mean) ** 2, 0) / n;
-      const std = Math.sqrt(variance);
+      const medianVal = median(values);
+      const meanVal = mean(values);
+      const stdVal = std(values);
       const iqr = q3 - q1;
 
       rows.push({
         page: pd.pageName,
         n,
-        min: min.toFixed(4),
+        min: minVal.toFixed(4),
         q1: q1.toFixed(4),
-        median: median.toFixed(4),
+        median: medianVal.toFixed(4),
         q3: q3.toFixed(4),
-        max: max.toFixed(4),
-        mean: mean.toFixed(4),
-        std: std.toFixed(4),
+        max: maxVal.toFixed(4),
+        mean: meanVal.toFixed(4),
+        std: stdVal.toFixed(4),
         iqr: iqr.toFixed(4)
       });
     }

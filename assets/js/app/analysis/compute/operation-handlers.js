@@ -14,11 +14,10 @@
 
 import { OperationType } from './operations.js';
 import {
+  mean,
   normalCDF,
   tCDF,
-  computePearsonR,
-  computeSpearmanR,
-  linearRegression,
+  computeRanks,
   mannWhitneyU,
   welchTTest,
   equalWidthBreaks,
@@ -38,6 +37,19 @@ function toFloat32Array(values) {
   if (values instanceof Float32Array) return values;
   if (ArrayBuffer.isView(values)) return new Float32Array(values);
   return new Float32Array(values || []);
+}
+
+function filterNumericIfNeeded(values) {
+  if (!values || values.length === 0) return values;
+
+  // Fast path: avoid allocating a copy when inputs are already finite.
+  for (let i = 0; i < values.length; i++) {
+    if (!Number.isFinite(values[i])) {
+      return filterNumeric(values);
+    }
+  }
+
+  return values;
 }
 
 function computeMeanAndStd(values) {
@@ -375,38 +387,109 @@ export function computeStats(payload) {
 export function computeCorrelation(payload) {
   const { xValues, yValues, method = 'pearson' } = payload;
 
-  // Filter to paired valid values
-  const pairs = [];
-  for (let i = 0; i < Math.min(xValues.length, yValues.length); i++) {
-    const x = xValues[i];
-    const y = yValues[i];
-    if (isValidNumber(x) && isValidNumber(y)) {
-      pairs.push({ x, y });
-    }
+  const len = Math.min(xValues?.length || 0, yValues?.length || 0);
+  if (len === 0) {
+    return { r: NaN, pValue: NaN, n: 0, method };
   }
 
-  if (pairs.length < 3) {
-    return { r: NaN, pValue: NaN, n: pairs.length, method };
+  // Single pass: compute sums on finite pairs (enables Pearson + linear regression without allocations).
+  let n = 0;
+  let sumX = 0;
+  let sumY = 0;
+  let sumXX = 0;
+  let sumYY = 0;
+  let sumXY = 0;
+
+  for (let i = 0; i < len; i++) {
+    const x = xValues[i];
+    const y = yValues[i];
+    if (!isValidNumber(x) || !isValidNumber(y)) continue;
+
+    n++;
+    sumX += x;
+    sumY += y;
+    sumXX += x * x;
+    sumYY += y * y;
+    sumXY += x * y;
   }
+
+  if (n < 3) {
+    return { r: NaN, pValue: NaN, n, method };
+  }
+
+  // Linear regression for trend line (y = slope*x + intercept).
+  const denomSlope = n * sumXX - sumX * sumX;
+  const slope = denomSlope === 0 ? 0 : (n * sumXY - sumX * sumY) / denomSlope;
+  const intercept = (sumY - slope * sumX) / n;
+
+  // Correlation coefficient.
+  const computePearsonFromArrays = (xs, ys) => {
+    const m = Math.min(xs.length, ys.length);
+    if (m < 2) return 0;
+
+    let sx = 0;
+    let sy = 0;
+    let sxx = 0;
+    let syy = 0;
+    let sxy = 0;
+
+    for (let i = 0; i < m; i++) {
+      const x = xs[i];
+      const y = ys[i];
+      sx += x;
+      sy += y;
+      sxx += x * x;
+      syy += y * y;
+      sxy += x * y;
+    }
+
+    const numerator = m * sxy - sx * sy;
+    const denom = Math.sqrt((m * sxx - sx * sx) * (m * syy - sy * sy));
+    return denom === 0 ? 0 : numerator / denom;
+  };
 
   let r;
   if (method === 'spearman') {
-    r = computeSpearmanR(pairs);
+    // For Spearman we need ranks; avoid allocating per-pair objects.
+    if (n === len) {
+      // Fast path: all pairs valid, rank inputs directly.
+      const xRanks = computeRanks(xValues);
+      const yRanks = computeRanks(yValues);
+      r = computePearsonFromArrays(xRanks, yRanks);
+    } else {
+      // Compact to valid-only arrays, then rank.
+      const xValid = new Float32Array(n);
+      const yValid = new Float32Array(n);
+      let k = 0;
+      for (let i = 0; i < len; i++) {
+        const x = xValues[i];
+        const y = yValues[i];
+        if (!isValidNumber(x) || !isValidNumber(y)) continue;
+        xValid[k] = x;
+        yValid[k] = y;
+        k++;
+      }
+      const xRanks = computeRanks(xValid);
+      const yRanks = computeRanks(yValid);
+      r = computePearsonFromArrays(xRanks, yRanks);
+    }
   } else {
-    r = computePearsonR(pairs);
+    const numerator = n * sumXY - sumX * sumY;
+    const denom = Math.sqrt((n * sumXX - sumX * sumX) * (n * sumYY - sumY * sumY));
+    r = denom === 0 ? 0 : numerator / denom;
   }
 
-  // Compute p-value using t-distribution approximation
-  const n = pairs.length;
-  const t = r * Math.sqrt((n - 2) / (1 - r * r));
-  const pValue = 2 * (1 - tCDF(Math.abs(t), n - 2));
-
-  // Linear regression for trend line
-  const { slope, intercept } = linearRegression(pairs);
+  // Compute p-value using t-distribution approximation.
+  const rSquared = r * r;
+  const denomT = 1 - rSquared;
+  const t = denomT <= 0 ? (r >= 0 ? Infinity : -Infinity) : r * Math.sqrt((n - 2) / denomT);
+  const pValue = Number.isFinite(t)
+    ? 2 * (1 - tCDF(Math.abs(t), n - 2))
+    : 0;
 
   return {
     r,
-    rSquared: r * r,
+    rSquared,
     pValue,
     n,
     method,
@@ -427,8 +510,8 @@ export function computeCorrelation(payload) {
 export function computeDifferential(payload) {
   const { groupAValues, groupBValues, method = 'wilcox' } = payload;
 
-  const valsA = filterNumeric(groupAValues);
-  const valsB = filterNumeric(groupBValues);
+  const valsA = filterNumericIfNeeded(groupAValues);
+  const valsB = filterNumericIfNeeded(groupBValues);
 
   if (valsA.length < 2 || valsB.length < 2) {
     return {
@@ -442,9 +525,9 @@ export function computeDifferential(payload) {
     };
   }
 
-  // Calculate means
-  const meanA = valsA.reduce((a, b) => a + b, 0) / valsA.length;
-  const meanB = valsB.reduce((a, b) => a + b, 0) / valsB.length;
+  // Calculate means using centralized utility
+  const meanA = mean(valsA);
+  const meanB = mean(valsB);
 
   // Log2 fold change (with pseudocount to avoid log(0))
   const pseudocount = 0.01;

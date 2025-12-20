@@ -17,10 +17,9 @@ import { expandPagesWithDerived } from '../../shared/page-derivation-utils.js';
 // PLOT REGISTRY - Imported from centralized location
 // =============================================================================
 
-// Import PlotRegistry for local use and re-export for backward compatibility
-// All new code should import directly from '../../shared/plot-registry-utils.js'
+// Import PlotRegistry for local use
+// All code should import directly from '../../shared/plot-registry-utils.js'
 import { PlotRegistry } from '../../shared/plot-registry-utils.js';
-export { PlotRegistry };
 
 // =============================================================================
 // VARIABLE SELECTOR

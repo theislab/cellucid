@@ -20,6 +20,7 @@ import {
   fDistributionPValue,
   computeRanks
 } from '../compute/math-utils.js';
+import { isFiniteNumber } from '../shared/number-utils.js';
 
 /**
  * @typedef {Object} StatisticalResult
@@ -541,7 +542,7 @@ export function runStatisticalTests(pageData, dataType) {
   } else {
     // Continuous data tests
     const groups = pageData.map(pd =>
-      pd.values.filter(v => typeof v === 'number' && Number.isFinite(v))
+      pd.values.filter(v => isFiniteNumber(v))
     );
 
     if (groups.length === 2) {
@@ -566,10 +567,10 @@ export function runStatisticalTests(pageData, dataType) {
 export function formatStatisticalResult(result) {
   return {
     test: result.testName,
-    statistic: isNaN(result.statistic) ? 'N/A' : result.statistic.toFixed(3),
-    pValue: isNaN(result.pValue) ? 'N/A' : formatPValue(result.pValue),
+    statistic: !isFiniteNumber(result.statistic) ? 'N/A' : result.statistic.toFixed(3),
+    pValue: !isFiniteNumber(result.pValue) ? 'N/A' : formatPValue(result.pValue),
     significance: result.significance,
-    effectSize: result.effectSize !== null && !isNaN(result.effectSize)
+    effectSize: result.effectSize !== null && isFiniteNumber(result.effectSize)
       ? `${result.effectSize.toFixed(3)} (${result.effectSizeType})`
       : 'N/A',
     interpretation: result.interpretation
@@ -599,7 +600,7 @@ export function benjaminiHochberg(pValues, alpha = 0.05) {
   const indexed = pValues.map((p, i) => ({
     pValue: p,
     originalIndex: i,
-    isValid: typeof p === 'number' && Number.isFinite(p)
+    isValid: isFiniteNumber(p)
   }));
 
   // Separate valid and invalid p-values
@@ -675,7 +676,7 @@ export function bonferroniCorrection(pValues, alpha = 0.05) {
 
   const n = pValues.length;
   const adjustedPValues = pValues.map(p => {
-    if (typeof p !== 'number' || !Number.isFinite(p)) return null;
+    if (!isFiniteNumber(p)) return null;
     return Math.min(p * n, 1);
   });
 
@@ -726,7 +727,7 @@ export function applyMultipleTestingCorrection(results, method = 'bh', alpha = 0
  * @returns {Object} { mean, lower, upper, se, n }
  */
 export function confidenceInterval(values, confidenceLevel = 0.95) {
-  const validValues = values.filter(v => typeof v === 'number' && Number.isFinite(v));
+  const validValues = values.filter(v => isFiniteNumber(v));
   const n = validValues.length;
 
   if (n < 2) {
