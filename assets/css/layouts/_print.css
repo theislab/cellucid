@@ -1,0 +1,43 @@
+/* layouts/_print.css
+   Print styles (fill as needed).
+*/
+
+@media print {
+  :root {
+    color-scheme: light;
+
+    /* Force high-contrast ink on paper. */
+    --color-surface-primary: var(--white);
+    --color-text-primary: var(--black);
+    --color-border-strong: var(--black);
+
+    /* Remove shadows for print. */
+    --shadow-sm: none;
+    --shadow-md: none;
+    --shadow-lg: none;
+    --shadow-xl: none;
+  }
+
+  html,
+  body {
+    overflow: visible;
+    height: auto;
+  }
+
+  /* Hide non-essential UI */
+  #glcanvas,
+  #label-layer,
+  #view-title-layer,
+  #sidebar,
+  #sidebar-toggle,
+  .no-print {
+    display: none !important;
+  }
+
+  /* Show link destinations when printing. */
+  a[href]::after {
+    content: " (" attr(href) ")";
+    font-size: 0.8em;
+    color: var(--color-text-secondary);
+  }
+}

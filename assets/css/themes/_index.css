@@ -1,0 +1,5 @@
+/* themes/_index.css - Aggregates all theme files. */
+
+@import '_base.css';
+@import '_light.css';
+@import '_dark.css';

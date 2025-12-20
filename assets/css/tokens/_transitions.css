@@ -1,0 +1,22 @@
+/* tokens/_transitions.css
+   Shared transition durations and easings.
+*/
+
+:root {
+  --duration-instant: 0ms;
+  --duration-fast: 150ms;
+  --duration-normal: 300ms;
+  --duration-slow: 450ms;
+
+  --easing-linear: linear;
+  --easing-standard: ease;
+  --easing-smooth: cubic-bezier(0.4, 0, 0.2, 1);
+  --easing-out: cubic-bezier(0.16, 1, 0.3, 1);
+
+  /* Common composites. */
+  --transition-all: all var(--duration-fast) var(--easing-standard);
+  --transition-colors: background-color var(--duration-fast) var(--easing-standard),
+    color var(--duration-fast) var(--easing-standard),
+    border-color var(--duration-fast) var(--easing-standard),
+    box-shadow var(--duration-fast) var(--easing-standard);
+}

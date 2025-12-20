@@ -19,6 +19,8 @@ import { BasePlot, COMMON_HOVER_STYLE, createMinimalPlotly, getPlotlyConfig } fr
 import { PlotHelpers, getPageColor, PAGE_COLORS } from '../core/plugin-contract.js';
 import { getScatterTraceType, getHeatmapTraceType, requireWebGL2 } from './plotly-loader.js';
 import { mean, std, median } from '../shared/number-utils.js';
+import { applyLegendPosition } from '../shared/legend-utils.js';
+import { getPlotTheme } from '../shared/plot-theme.js';
 
 // =============================================================================
 // PLOT REGISTRY - Imported from centralized location
@@ -71,6 +73,7 @@ export class PlotFactory {
   static async render({ definition, pageData, options, container, layoutEngine }) {
     const traces = definition.buildTraces(pageData, options, layoutEngine);
     const layout = definition.buildLayout(pageData, options, layoutEngine);
+    applyLegendPosition(layout, options?.legendPosition);
     const config = getPlotlyConfig();
 
     try {
@@ -97,6 +100,7 @@ export class PlotFactory {
     try {
       const traces = definition.buildTraces(pageData, options, layoutEngine);
       const layout = definition.buildLayout(pageData, options, layoutEngine);
+      applyLegendPosition(layout, options?.legendPosition);
       const Plotly = await createMinimalPlotly();
       return await Plotly.react(figure, traces, layout, getPlotlyConfig());
     } catch (err) {
@@ -408,7 +412,8 @@ export class PlotFactory {
     } = options;
 
     const variableName = valueAxisLabel || BasePlot.getVariableName(pageData, 'Value');
-    const gridColor = showGrid ? '#f3f4f6' : 'transparent';
+    const theme = getPlotTheme();
+    const gridColor = showGrid ? theme.grid : 'transparent';
     const isVertical = orientation === 'vertical';
 
     if (isVertical) {
@@ -764,6 +769,7 @@ export class PlotFactory {
    * @returns {Object} Layout with annotation
    */
   static createEmptyStateLayout(message) {
+    const theme = getPlotTheme();
     const layout = BasePlot.createLayout({ showLegend: false });
     layout.annotations = [{
       text: message,
@@ -772,7 +778,7 @@ export class PlotFactory {
       xref: 'paper',
       yref: 'paper',
       showarrow: false,
-      font: { size: 14, color: '#6b7280' }
+      font: { size: 14, color: theme.textMuted }
     }];
     return layout;
   }

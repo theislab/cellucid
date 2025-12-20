@@ -882,11 +882,46 @@ export class QuickInsights extends BaseAnalysisUI {
     this._cache.clear();
   }
 
+  exportSettings() {
+    const base = super.exportSettings();
+    return {
+      ...base,
+      selectedCategoricalObsKeys: [...this._selectedCategoricalObsKeys],
+      selectedContinuousObsKeys: [...this._selectedContinuousObsKeys],
+      hasUserSelectedCategoricalObsFields: !!this._hasUserSelectedCategoricalObsFields,
+      hasUserSelectedContinuousObsFields: !!this._hasUserSelectedContinuousObsFields
+    };
+  }
+
+  importSettings(settings) {
+    if (!settings) return;
+
+    const hasCat = !!settings.hasUserSelectedCategoricalObsFields;
+    const hasCont = !!settings.hasUserSelectedContinuousObsFields;
+
+    if (hasCat) {
+      this._applyCategoricalSelection(Array.isArray(settings.selectedCategoricalObsKeys) ? settings.selectedCategoricalObsKeys : []);
+    } else {
+      this._selectedCategoricalObsKeys = [];
+      this._hasUserSelectedCategoricalObsFields = false;
+    }
+
+    if (hasCont) {
+      this._applyContinuousSelection(Array.isArray(settings.selectedContinuousObsKeys) ? settings.selectedContinuousObsKeys : []);
+    } else {
+      this._selectedContinuousObsKeys = [];
+      this._hasUserSelectedContinuousObsFields = false;
+    }
+
+    super.importSettings(settings);
+  }
+
   /**
    * Destroy and cleanup
    * @override
    */
   destroy() {
+    this._isDestroyed = true;
     // Cancel any pending debounced update
     if (this._debounceTimer) {
       clearTimeout(this._debounceTimer);

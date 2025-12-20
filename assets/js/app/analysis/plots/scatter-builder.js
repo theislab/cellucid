@@ -15,9 +15,10 @@
 
 import { getNotificationCenter } from '../../notification-center.js';
 import { createAnalysisModal, openModal, closeModal } from '../ui/components/modal.js';
-import { createMinimalPlotly, downloadImage, getScatterTraceType, purgePlot } from './plotly-loader.js';
+import { createMinimalPlotly, downloadImage, getScatterTraceType, getPlotlyConfig, getPlotlyLayout, purgePlot } from './plotly-loader.js';
 import { downloadCSV, toCSVCell } from '../shared/analysis-utils.js';
 import { isFiniteNumber, mean } from '../shared/number-utils.js';
+import { getPlotTheme } from '../shared/plot-theme.js';
 
 /**
  * Scatter Plot Builder class
@@ -605,6 +606,8 @@ export class ScatterBuilder {
 
     // Prepare traces
     const traces = [];
+    const theme = getPlotTheme();
+    const theme = getPlotTheme();
 
     // If coloring by category, create separate traces
     if (this.config.colorBy && data.color.length > 0) {
@@ -636,7 +639,7 @@ export class ScatterBuilder {
         x: data.x,
         y: data.y,
         marker: {
-          color: '#111827',
+          color: theme.text,
           size: 5,
           opacity: 0.6
         },
@@ -660,7 +663,7 @@ export class ScatterBuilder {
         x: [xMin, xMax],
         y: [correlation.intercept + correlation.slope * xMin, correlation.intercept + correlation.slope * xMax],
         line: {
-          color: '#dc2626',
+          color: theme.danger,
           width: 2,
           dash: 'dash'
         },
@@ -668,28 +671,31 @@ export class ScatterBuilder {
       });
     }
 
-    const layout = {
-      xaxis: {
-        title: this.config.xVariable.key,
-        type: this.config.logScaleX ? 'log' : 'linear',
-        gridcolor: '#e5e7eb',
-        zerolinecolor: '#d1d5db'
-      },
-      yaxis: {
-        title: this.config.yVariable.key,
-        type: this.config.logScaleY ? 'log' : 'linear',
-        gridcolor: '#e5e7eb',
-        zerolinecolor: '#d1d5db'
-      },
-      font: { family: 'Inter, sans-serif', size: 11 },
-      paper_bgcolor: 'white',
-      plot_bgcolor: 'white',
+    const baseLayout = getPlotlyLayout({
       margin: { l: 60, r: 20, t: 30, b: 50 },
       showlegend: traces.length > 2,
       legend: {
         orientation: 'h',
         y: -0.2,
-        font: { size: 9 }
+        font: { size: theme.legendFontSize }
+      }
+    });
+
+    const layout = {
+      ...baseLayout,
+      xaxis: {
+        ...baseLayout.xaxis,
+        title: { ...(baseLayout.xaxis?.title || {}), text: this.config.xVariable.key },
+        type: this.config.logScaleX ? 'log' : 'linear',
+        zeroline: false,
+        zerolinecolor: theme.axisLine,
+      },
+      yaxis: {
+        ...baseLayout.yaxis,
+        title: { ...(baseLayout.yaxis?.title || {}), text: this.config.yVariable.key },
+        type: this.config.logScaleY ? 'log' : 'linear',
+        zeroline: false,
+        zerolinecolor: theme.axisLine,
       },
       annotations: this.config.showTrendline && isFiniteNumber(correlation.r) ? [{
         x: 0.02,
@@ -698,18 +704,13 @@ export class ScatterBuilder {
         yref: 'paper',
         text: `R = ${correlation.r.toFixed(3)}, R<sup>2</sup> = ${correlation.rSquared.toFixed(3)}`,
         showarrow: false,
-        font: { size: 10, color: '#374151' },
-        bgcolor: 'rgba(255,255,255,0.8)',
+        font: { size: theme.fontSize, color: theme.text },
+        bgcolor: theme.legend.bg,
         borderpad: 4
       }] : []
     };
 
-    const config = {
-      responsive: true,
-      displayModeBar: true,
-      modeBarButtonsToRemove: ['lasso2d', 'select2d', 'autoScale2d'],
-      displaylogo: false
-    };
+    const config = getPlotlyConfig();
 
     try {
       const Plotly = await createMinimalPlotly();
@@ -723,9 +724,16 @@ export class ScatterBuilder {
    * Generate distinct colors
    */
   _generateColors(n) {
+    const theme = getPlotTheme();
     const palette = [
-      '#111827', '#374151', '#6b7280', '#9ca3af', '#d1d5db',
-      '#1ed8ff', '#dc2626', '#059669', '#7c3aed', '#ea580c'
+      theme.text,
+      theme.textMuted,
+      theme.axisLine,
+      theme.accent,
+      theme.info,
+      theme.success,
+      theme.warning,
+      theme.danger,
     ];
     const colors = [];
     for (let i = 0; i < n; i++) {
@@ -968,7 +976,7 @@ export class ScatterBuilder {
         x: data.x,
         y: data.y,
         marker: {
-          color: '#111827',
+          color: theme.text,
           size: 6,
           opacity: 0.6
         },
@@ -992,7 +1000,7 @@ export class ScatterBuilder {
         x: [xMin, xMax],
         y: [correlation.intercept + correlation.slope * xMin, correlation.intercept + correlation.slope * xMax],
         line: {
-          color: '#dc2626',
+          color: theme.danger,
           width: 2,
           dash: 'dash'
         },
@@ -1000,28 +1008,31 @@ export class ScatterBuilder {
       });
     }
 
-    const layout = {
-      xaxis: {
-        title: { text: this.config.xVariable.key, font: { size: 12 } },
-        type: this.config.logScaleX ? 'log' : 'linear',
-        gridcolor: '#e5e7eb',
-        zerolinecolor: '#d1d5db'
-      },
-      yaxis: {
-        title: { text: this.config.yVariable.key, font: { size: 12 } },
-        type: this.config.logScaleY ? 'log' : 'linear',
-        gridcolor: '#e5e7eb',
-        zerolinecolor: '#d1d5db'
-      },
-      font: { family: 'Inter, sans-serif', size: 11 },
-      paper_bgcolor: 'white',
-      plot_bgcolor: 'white',
+    const baseLayout = getPlotlyLayout({
       margin: { l: 60, r: 30, t: 40, b: 60 },
       showlegend: traces.length > 2,
       legend: {
         orientation: 'h',
         y: -0.15,
-        font: { size: 10 }
+        font: { size: theme.legendFontSize }
+      }
+    });
+
+    const layout = {
+      ...baseLayout,
+      xaxis: {
+        ...baseLayout.xaxis,
+        title: { ...(baseLayout.xaxis?.title || {}), text: this.config.xVariable.key },
+        type: this.config.logScaleX ? 'log' : 'linear',
+        zeroline: false,
+        zerolinecolor: theme.axisLine,
+      },
+      yaxis: {
+        ...baseLayout.yaxis,
+        title: { ...(baseLayout.yaxis?.title || {}), text: this.config.yVariable.key },
+        type: this.config.logScaleY ? 'log' : 'linear',
+        zeroline: false,
+        zerolinecolor: theme.axisLine,
       },
       annotations: this.config.showTrendline && isFiniteNumber(correlation.r) ? [{
         x: 0.02,
@@ -1030,18 +1041,13 @@ export class ScatterBuilder {
         yref: 'paper',
         text: `R = ${correlation.r.toFixed(4)}, R<sup>2</sup> = ${correlation.rSquared.toFixed(4)}, p = ${correlation.pValue < 0.001 ? '<0.001' : correlation.pValue.toFixed(4)}`,
         showarrow: false,
-        font: { size: 11, color: '#374151' },
-        bgcolor: 'rgba(255,255,255,0.9)',
+        font: { size: theme.fontSize, color: theme.text },
+        bgcolor: theme.legend.bg,
         borderpad: 6
       }] : []
     };
 
-    const config = {
-      responsive: true,
-      displayModeBar: true,
-      modeBarButtonsToRemove: ['lasso2d', 'select2d'],
-      displaylogo: false
-    };
+    const config = getPlotlyConfig();
 
     try {
       const Plotly = await createMinimalPlotly();

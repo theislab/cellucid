@@ -12,6 +12,31 @@ import { debounce } from '../../shared/dom-utils.js';
 // PLOT OPTIONS RENDERING
 // =============================================================================
 
+let plotOptionsIdCounter = 0;
+
+/**
+ * Ensure a stable, unique ID prefix for plot option inputs within a container.
+ * This prevents duplicate IDs when multiple modals/windows are open.
+ * @param {HTMLElement} container
+ * @param {string|undefined|null} providedPrefix
+ * @returns {string}
+ */
+function getOrCreatePlotOptionsIdPrefix(container, providedPrefix) {
+  const trimmed = typeof providedPrefix === 'string' ? providedPrefix.trim() : '';
+  if (trimmed) {
+    container.dataset.plotOptionsIdPrefix = trimmed;
+    return trimmed;
+  }
+
+  const existing = container.dataset.plotOptionsIdPrefix;
+  if (existing) return existing;
+
+  plotOptionsIdCounter += 1;
+  const next = `plotopts-${plotOptionsIdCounter}`;
+  container.dataset.plotOptionsIdPrefix = next;
+  return next;
+}
+
 function coerceSelectValue(def, rawValue) {
   const schemaOptions = def?.options || [];
   if (schemaOptions.length === 0) return rawValue;
@@ -37,9 +62,11 @@ function coerceSelectValue(def, rawValue) {
  * @param {string} plotTypeId - Current plot type ID
  * @param {Object} currentOptions - Current option values
  * @param {Function} onChange - Callback when option changes
+ * @param {{ idPrefix?: string }} [renderOptions] - Optional render options
  */
-export function renderPlotOptions(container, plotTypeId, currentOptions = {}, onChange) {
+export function renderPlotOptions(container, plotTypeId, currentOptions = {}, onChange, renderOptions = {}) {
   container.innerHTML = '';
+  const idPrefix = getOrCreatePlotOptionsIdPrefix(container, renderOptions?.idPrefix);
 
   const plotType = PlotRegistry.get(plotTypeId);
   if (!plotType || !plotType.optionSchema) {
@@ -53,6 +80,7 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
   const visibleOptions = PlotRegistry.getVisibleOptions(plotTypeId, currentOptions);
 
   for (const [key, def] of Object.entries(visibleOptions)) {
+    const inputId = `${idPrefix}-analysis-opt-${key}`;
     const value = currentOptions[key] ?? plotType.defaultOptions[key];
 
     const optionRow = document.createElement('div');
@@ -65,12 +93,12 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
         const label = document.createElement('label');
         label.className = 'analysis-option-label';
         label.textContent = def.label;
-        label.htmlFor = `analysis-opt-${key}`;
+        label.htmlFor = inputId;
         optionRow.appendChild(label);
 
         input = document.createElement('select');
         input.className = 'obs-select analysis-option-select';
-        input.id = `analysis-opt-${key}`;
+        input.id = inputId;
         for (const opt of def.options || []) {
           const option = document.createElement('option');
           option.value = opt.value;
@@ -91,7 +119,7 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
         input = document.createElement('input');
         input.type = 'checkbox';
         input.className = 'analysis-option-checkbox';
-        input.id = `analysis-opt-${key}`;
+        input.id = inputId;
         input.checked = !!value;
         input.addEventListener('change', () => {
           if (onChange) onChange(key, input.checked);
@@ -112,13 +140,13 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
         const label = document.createElement('label');
         label.className = 'analysis-option-label';
         label.textContent = def.label;
-        label.htmlFor = `analysis-opt-${key}`;
+        label.htmlFor = inputId;
         optionRow.appendChild(label);
 
         input = document.createElement('input');
         input.type = 'range';
         input.className = 'analysis-option-range';
-        input.id = `analysis-opt-${key}`;
+        input.id = inputId;
         input.min = def.min ?? 0;
         input.max = def.max ?? 100;
         input.step = def.step ?? 1;
@@ -150,13 +178,13 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
         const label = document.createElement('label');
         label.className = 'analysis-option-label';
         label.textContent = def.label;
-        label.htmlFor = `analysis-opt-${key}`;
+        label.htmlFor = inputId;
         optionRow.appendChild(label);
 
         input = document.createElement('input');
         input.type = 'text';
         input.className = 'analysis-option-text';
-        input.id = `analysis-opt-${key}`;
+        input.id = inputId;
         input.value = value ?? '';
         input.placeholder = def.placeholder ?? '';
         input.addEventListener('change', () => {

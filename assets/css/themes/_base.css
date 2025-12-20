@@ -1,0 +1,21 @@
+/* themes/_base.css
+   Theme contract documentation.
+
+   Themes ONLY change semantic tokens. Components should reference semantic tokens
+   (e.g. var(--color-text-primary)), never raw hex values.
+
+   Current policy: ship only `light` (default) and `dark`.
+*/
+
+/* Enable smooth theme transitions only during theme changes. */
+html.theme-transition,
+html.theme-transition * {
+  transition: var(--transition-colors);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html.theme-transition,
+  html.theme-transition * {
+    transition: none;
+  }
+}

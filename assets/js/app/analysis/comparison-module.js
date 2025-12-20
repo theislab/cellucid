@@ -32,6 +32,7 @@ import { createDetailedAnalysisUI } from './ui/analysis-types/detailed-analysis-
 import { createCorrelationAnalysisUI } from './ui/analysis-types/correlation-analysis-ui.js';
 import { createDEAnalysisUI } from './ui/analysis-types/de-analysis-ui.js';
 import { createGeneSignatureUI } from './ui/analysis-types/gene-signature-ui.js';
+import { createAnalysisWindowManager } from './ui/analysis-window-manager.js';
 
 // Import plot types to register them
 import './plots/types/barplot.js';
@@ -67,6 +68,9 @@ export class ComparisonModule {
 
     // Unified UI manager for all analysis types
     this._uiManager = null;
+
+    // Floating windows created via "Copy" on analysis sub-accordions
+    this._analysisWindowManager = null;
 
     // Current analysis mode (set during init)
     this._analysisMode = null;
@@ -162,53 +166,101 @@ export class ComparisonModule {
     this._modeToggleContainer.setAttribute('role', 'tablist');
     this._modeToggleContainer.innerHTML = `
       <div class="analysis-accordion-item" data-mode="simple">
-        <button type="button" class="analysis-accordion-header" aria-expanded="false" aria-controls="analysis-panel-simple">
+        <div id="analysis-header-simple" class="analysis-accordion-header" role="button" tabindex="0" aria-expanded="false" aria-controls="analysis-panel-simple">
           <span class="analysis-accordion-title">Quick</span>
           <span class="analysis-accordion-desc">Automatic insights</span>
+          <button type="button" class="analysis-accordion-copy-btn accordion-copy-btn" aria-label="Copy analysis window" title="Copy"></button>
           <span class="analysis-accordion-chevron" aria-hidden="true"></span>
-        </button>
+        </div>
         <div class="analysis-accordion-content" id="analysis-panel-simple" data-mode="simple" role="region" aria-labelledby="analysis-header-simple"></div>
       </div>
       <div class="analysis-accordion-item" data-mode="detailed">
-        <button type="button" class="analysis-accordion-header" aria-expanded="false" aria-controls="analysis-panel-detailed">
+        <div id="analysis-header-detailed" class="analysis-accordion-header" role="button" tabindex="0" aria-expanded="false" aria-controls="analysis-panel-detailed">
           <span class="analysis-accordion-title">Detailed</span>
           <span class="analysis-accordion-desc">Full control over options</span>
+          <button type="button" class="analysis-accordion-copy-btn accordion-copy-btn" aria-label="Copy analysis window" title="Copy"></button>
           <span class="analysis-accordion-chevron" aria-hidden="true"></span>
-        </button>
+        </div>
         <div class="analysis-accordion-content" id="analysis-panel-detailed" data-mode="detailed" role="region" aria-labelledby="analysis-header-detailed"></div>
       </div>
       <div class="analysis-accordion-item" data-mode="correlation">
-        <button type="button" class="analysis-accordion-header" aria-expanded="false" aria-controls="analysis-panel-correlation">
+        <div id="analysis-header-correlation" class="analysis-accordion-header" role="button" tabindex="0" aria-expanded="false" aria-controls="analysis-panel-correlation">
           <span class="analysis-accordion-title">Correlation</span>
           <span class="analysis-accordion-desc">Explore variable relationships</span>
+          <button type="button" class="analysis-accordion-copy-btn accordion-copy-btn" aria-label="Copy analysis window" title="Copy"></button>
           <span class="analysis-accordion-chevron" aria-hidden="true"></span>
-        </button>
+        </div>
         <div class="analysis-accordion-content" id="analysis-panel-correlation" data-mode="correlation" role="region" aria-labelledby="analysis-header-correlation"></div>
       </div>
       <div class="analysis-accordion-item" data-mode="differential">
-        <button type="button" class="analysis-accordion-header" aria-expanded="false" aria-controls="analysis-panel-differential">
+        <div id="analysis-header-differential" class="analysis-accordion-header" role="button" tabindex="0" aria-expanded="false" aria-controls="analysis-panel-differential">
           <span class="analysis-accordion-title">Differential Expression</span>
           <span class="analysis-accordion-desc">Find DE genes between groups</span>
+          <button type="button" class="analysis-accordion-copy-btn accordion-copy-btn" aria-label="Copy analysis window" title="Copy"></button>
           <span class="analysis-accordion-chevron" aria-hidden="true"></span>
-        </button>
+        </div>
         <div class="analysis-accordion-content" id="analysis-panel-differential" data-mode="differential" role="region" aria-labelledby="analysis-header-differential"></div>
       </div>
       <div class="analysis-accordion-item" data-mode="signature">
-        <button type="button" class="analysis-accordion-header" aria-expanded="false" aria-controls="analysis-panel-signature">
+        <div id="analysis-header-signature" class="analysis-accordion-header" role="button" tabindex="0" aria-expanded="false" aria-controls="analysis-panel-signature">
           <span class="analysis-accordion-title">Gene Signature</span>
           <span class="analysis-accordion-desc">Compute signature scores</span>
+          <button type="button" class="analysis-accordion-copy-btn accordion-copy-btn" aria-label="Copy analysis window" title="Copy"></button>
           <span class="analysis-accordion-chevron" aria-hidden="true"></span>
-        </button>
+        </div>
         <div class="analysis-accordion-content" id="analysis-panel-signature" data-mode="signature" role="region" aria-labelledby="analysis-header-signature"></div>
       </div>
     `;
     accordionContent.appendChild(this._modeToggleContainer);
 
-    // Accordion click event - select mode
-    this._modeToggleContainer.querySelectorAll('.analysis-accordion-header').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const item = btn.closest('.analysis-accordion-item');
+    // Accordion click/keyboard event - select mode (ignore action button clicks)
+    this._modeToggleContainer.querySelectorAll('.analysis-accordion-header').forEach(header => {
+      const activate = () => {
+        const item = header.closest('.analysis-accordion-item');
+        if (!item) return;
         this._setAnalysisMode(item.dataset.mode);
+      };
+
+      header.addEventListener('click', (e) => {
+        if (e.target?.closest?.('.analysis-accordion-copy-btn')) return;
+        activate();
+      });
+
+      header.addEventListener('keydown', (e) => {
+        if (e.target?.closest?.('.analysis-accordion-copy-btn')) return;
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        e.preventDefault();
+        activate();
+      });
+    });
+
+    // Copy buttons (open floating window)
+    this._modeToggleContainer.querySelectorAll('.analysis-accordion-copy-btn').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+
+        const item = btn.closest('.analysis-accordion-item');
+        if (!item) return;
+
+        const mode = item.dataset.mode;
+        const header = item.querySelector('.analysis-accordion-header');
+        const sourceRect = header?.getBoundingClientRect?.() || item.getBoundingClientRect();
+        const sectionRect = btn.closest('details.accordion-section')?.getBoundingClientRect?.();
+        const itemRect = item.getBoundingClientRect();
+        const isExpanded = item.classList.contains('open');
+        const headerTitle = header?.querySelector?.('.analysis-accordion-title')?.textContent?.trim?.() || '';
+        const headerDesc = header?.querySelector?.('.analysis-accordion-desc')?.textContent?.trim?.() || '';
+
+        this._analysisWindowManager?.copyFromEmbedded?.(mode, {
+          sourceRect,
+          preferredSize: {
+            width: sectionRect?.width ?? itemRect.width,
+            height: isExpanded ? itemRect.height : undefined
+          },
+          headerTitle,
+          headerDesc
+        });
       });
     });
 
@@ -230,6 +282,13 @@ export class ComparisonModule {
 
     // Initialize containers for all types
     this._uiManager.initContainers();
+
+    // Floating analysis windows: allow copying sub-accordion items into detached panels
+    this._analysisWindowManager = createAnalysisWindowManager({
+      comparisonModule: this,
+      uiManager: this._uiManager,
+      sidebar: document.getElementById('sidebar')
+    });
 
     // Update with current pages
     const pages = this.dataLayer.getPages();
@@ -503,6 +562,9 @@ export class ComparisonModule {
     this.currentConfig.pages = nextSelection;
     this._uiManager.onPageSelectionChange(nextSelection);
     this._lastKnownPageIds = currentPageIds;
+
+    // Keep floating analysis windows in sync with page add/remove/rename changes.
+    this._analysisWindowManager?.onPagesChanged?.();
   }
 
   /**
@@ -512,6 +574,9 @@ export class ComparisonModule {
   onHighlightChanged() {
     // Notify UI manager (it notifies only the active UI)
     this._uiManager.onHighlightChanged();
+
+    // Notify floating analysis windows too
+    this._analysisWindowManager?.onHighlightChanged?.();
   }
 
   // ===========================================================================
@@ -584,6 +649,12 @@ export class ComparisonModule {
     if (this._memoryMonitor) {
       this._memoryMonitor.unregisterCleanupHandler('comparison-module');
       this._memoryMonitor = null;
+    }
+
+    // Close any floating analysis windows first (they may hold UI/WebGL resources).
+    if (this._analysisWindowManager) {
+      this._analysisWindowManager.closeAll();
+      this._analysisWindowManager = null;
     }
 
     // Destroy UI manager (handles all analysis UIs)

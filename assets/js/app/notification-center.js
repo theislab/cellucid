@@ -152,16 +152,17 @@ class NotificationCenter {
         ${message ? `<div class="notification-message">${message}</div>` : ''}
     `;
 
+    let progressBarWidth = '';
+
     // Progress bar for loading/progress types
     if (type === NotificationType.PROGRESS || type === NotificationType.LOADING) {
       const progressValue = progress !== null ? progress : 0;
       const isIndeterminate = type === NotificationType.LOADING || progress === null;
+      progressBarWidth = isIndeterminate ? '' : `${progressValue}%`;
 
       html += `
         <div class="notification-progress-container">
-          <div class="notification-progress-bar ${isIndeterminate ? 'indeterminate' : ''}"
-               style="width: ${isIndeterminate ? '100%' : progressValue + '%'}">
-          </div>
+          <div class="notification-progress-bar ${isIndeterminate ? 'indeterminate' : ''}"></div>
         </div>
       `;
 
@@ -181,6 +182,11 @@ class NotificationCenter {
     }
 
     el.innerHTML = html;
+
+    if (progressBarWidth) {
+      const progressBar = el.querySelector('.notification-progress-bar');
+      if (progressBar) progressBar.style.width = progressBarWidth;
+    }
 
     // Add dismiss handler
     const dismissBtn = el.querySelector('.notification-dismiss');

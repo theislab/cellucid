@@ -59,6 +59,17 @@ export function createStateSerializer({ state, viewer, sidebar }) {
   }
 
   /**
+   * Skip ephemeral UI subtrees from state snapshots (save/load).
+   * Used for floating, copy-only panels that should not be serialized.
+   * @param {Element|null} el
+   * @returns {boolean}
+   */
+  function isStateSerializerSkipped(el) {
+    if (!el) return false;
+    return !!el.closest?.('[data-state-serializer-skip]');
+  }
+
+  /**
    * Determine if a categorical field has been modified from defaults
    */
   function isCategoryFieldModified(field) {
@@ -129,6 +140,7 @@ export function createStateSerializer({ state, viewer, sidebar }) {
 
     // Collect all inputs
     queryAll('input[id]').forEach(input => {
+      if (isStateSerializerSkipped(input)) return;
       const id = input.id;
       if (input.type === 'checkbox') {
         controls[id] = { type: 'checkbox', checked: input.checked };
@@ -143,11 +155,13 @@ export function createStateSerializer({ state, viewer, sidebar }) {
 
     // Collect all selects
     queryAll('select[id]').forEach(select => {
+      if (isStateSerializerSkipped(select)) return;
       controls[select.id] = { type: 'select', value: select.value };
     });
 
     // Collect accordion open/closed states
     queryAll('details.accordion-section').forEach(details => {
+      if (isStateSerializerSkipped(details)) return;
       const summary = details.querySelector('summary');
       const key = summary?.textContent?.trim() || details.id;
       if (key) {
@@ -183,6 +197,7 @@ export function createStateSerializer({ state, viewer, sidebar }) {
       if (id.startsWith('accordion:')) {
         const key = id.replace('accordion:', '');
         queryAll('details.accordion-section').forEach(details => {
+          if (isStateSerializerSkipped(details)) return;
           const summary = details.querySelector('summary');
           const summaryText = summary?.textContent?.trim();
           if (summaryText === key || details.id === key) {
@@ -220,9 +235,12 @@ export function createStateSerializer({ state, viewer, sidebar }) {
     if (!data) return;
     const el = document.getElementById(id);
     if (!el) {
+      // Best-effort restore: ephemeral floating copy windows intentionally opt out of snapshots.
+      if (id.startsWith('analysiswin-')) return;
       console.warn(`[StateSerializer] Control not found: ${id}`);
       return;
     }
+    if (isStateSerializerSkipped(el)) return;
 
     try {
       if (data.type === 'checkbox' && el.type === 'checkbox') {

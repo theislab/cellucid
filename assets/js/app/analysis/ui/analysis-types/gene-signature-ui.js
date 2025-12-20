@@ -117,6 +117,7 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
     geneListRow.innerHTML = `<label>Signature Genes:</label>`;
 
     const geneListInput = createFormTextarea({
+      name: 'genes',
       className: 'gene-list-input',
       placeholder: 'Enter genes (comma-separated):\nCD3E, CD4, CD8A, FOXP3...',
       rows: 4
@@ -336,8 +337,9 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
 
     const plotContainer = document.createElement('div');
     plotContainer.className = 'analysis-preview-plot';
-    plotContainer.id = 'signature-analysis-plot';
-    this._plotContainerId = 'signature-analysis-plot';
+    const plotContainerId = this._instanceId ? `${this._instanceId}-signature-analysis-plot` : 'signature-analysis-plot';
+    plotContainer.id = plotContainerId;
+    this._plotContainerId = plotContainerId;
     previewContainer.appendChild(plotContainer);
 
     // Render plot
@@ -466,7 +468,7 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
    * Export plot as PNG
    */
   async _exportPlotPNG() {
-    const plotEl = document.getElementById('signature-analysis-plot');
+    const plotEl = this._plotContainerId ? document.getElementById(this._plotContainerId) : null;
     if (!plotEl) return;
 
     await this._exportPNG(plotEl, {

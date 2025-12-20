@@ -131,7 +131,7 @@ export class VariableSelectorComponent {
     } catch (err) {
       console.error('[VariableSelectorComponent] Failed to render:', err);
       this.container.innerHTML = `
-        <div class="legend-help" style="color: var(--danger-color, #dc3545)">
+        <div class="legend-help text-danger">
           Failed to load variables. Please try refreshing.
         </div>
       `;

@@ -1,6 +1,8 @@
 // Dockable accordions: drag a section header to tear it off into a floating window.
 // REDESIGN v2: Drag ghost pattern for zero-lag dragging.
 
+import { StyleManager } from '../utils/style-manager.js';
+
 const DRAG_THRESHOLD_PX = 6;
 const DETACH_DISTANCE_PX = 30;     // Distance from sidebar right edge to detach
 const DOCK_HIT_PADDING_PX = 20;
@@ -9,20 +11,16 @@ const FLOAT_MIN_HEIGHT_PX = 100;
 const FLOAT_MAX_HEIGHT_PX = 500;
 const FLOAT_MAX_SCALE = 2;
 
+function isFiniteNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
 function ensureFloatingRoot() {
   let root = document.getElementById('floating-panels-root');
   if (root) return root;
 
   root = document.createElement('div');
   root.id = 'floating-panels-root';
-  Object.assign(root.style, {
-    position: 'fixed',
-    inset: '0',
-    pointerEvents: 'none',
-    zIndex: '90',
-    transform: 'translateZ(0)',
-    contain: 'layout style',
-  });
   document.body.appendChild(root);
   return root;
 }
@@ -66,6 +64,9 @@ export function initDockableAccordions({ sidebar } = {}) {
       dockPlaceholder: null,
       dockParent: null,
       isFloating: false,
+      dockable: true,
+      registered: false,
+      widthConstraints: null,
       suppressNextClick: false,
       baseFloatSize: null,
       floatLeft: 0,
@@ -77,7 +78,7 @@ export function initDockableAccordions({ sidebar } = {}) {
 
   function bumpZIndex(details) {
     zIndexCounter += 1;
-    details.style.zIndex = String(zIndexCounter);
+    StyleManager.setLayer(details, zIndexCounter);
   }
 
   function setFloating(details, floating) {
@@ -90,8 +91,14 @@ export function initDockableAccordions({ sidebar } = {}) {
   // Dock button
   // ═══════════════════════════════════════════════════════════════════════════
 
-  function ensureDockButton(summary) {
-    if (summary.querySelector('.accordion-dock-btn')) return;
+  function syncDockButton(summary, details) {
+    const state = getState(details);
+    const existing = summary.querySelector('.accordion-dock-btn');
+    if (!state.dockable) {
+      existing?.remove();
+      return;
+    }
+    if (existing) return;
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'accordion-dock-btn';
@@ -99,8 +106,7 @@ export function initDockableAccordions({ sidebar } = {}) {
     btn.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
-      const details = summary.closest('details.accordion-section');
-      if (details) dock(details);
+      dock(details);
     });
     summary.appendChild(btn);
   }
@@ -109,7 +115,8 @@ export function initDockableAccordions({ sidebar } = {}) {
   // Undock - runs ONCE on drop, not during drag
   // ═══════════════════════════════════════════════════════════════════════════
 
-  function undock(details, targetLeft, targetTop) {
+  function applyFloatingLayout(details, targetLeft, targetTop, options = {}) {
+    const { createPlaceholder = true, preferredSize = null, constraints = null } = options;
     const state = getState(details);
     if (state.isFloating) return;
 
@@ -120,19 +127,32 @@ export function initDockableAccordions({ sidebar } = {}) {
     // Viewport constraints
     const viewportWidth = window.innerWidth;
     const viewportHeight = window.innerHeight;
-    const viewportMaxWidth = Math.max(FLOAT_MIN_WIDTH_PX, viewportWidth - 16);
-    const viewportMaxHeight = Math.max(FLOAT_MIN_HEIGHT_PX, viewportHeight - 16);
+    const minWidth = isFiniteNumber(constraints?.minWidth) ? constraints.minWidth : FLOAT_MIN_WIDTH_PX;
+    const maxWidth = isFiniteNumber(constraints?.maxWidth) ? constraints.maxWidth : Infinity;
+    const minHeight = isFiniteNumber(constraints?.minHeight) ? constraints.minHeight : FLOAT_MIN_HEIGHT_PX;
+    const maxHeight = isFiniteNumber(constraints?.maxHeight) ? constraints.maxHeight : FLOAT_MAX_HEIGHT_PX;
+
+    const viewportMaxWidth = Math.max(minWidth, viewportWidth - 16);
+    const viewportMaxHeight = Math.max(minHeight, viewportHeight - 16);
 
     // Measure dimensions
     const headerHeight = summary ? summary.offsetHeight : 40;
     const contentScrollHeight = content ? content.scrollHeight : 0;
 
-    // Calculate panel dimensions
-    const initialWidth = Math.min(Math.max(FLOAT_MIN_WIDTH_PX, rect.width), viewportMaxWidth);
+    const requestedWidth = isFiniteNumber(preferredSize?.width) ? preferredSize.width : rect.width;
     const naturalHeight = headerHeight + contentScrollHeight + 24;
-    const maxAllowedHeight = Math.min(FLOAT_MAX_HEIGHT_PX, viewportMaxHeight);
-    const initialHeight = Math.min(Math.max(FLOAT_MIN_HEIGHT_PX, naturalHeight), maxAllowedHeight);
-    const contentMaxHeight = initialHeight - headerHeight - 12;
+    const requestedHeight = isFiniteNumber(preferredSize?.height) ? preferredSize.height : naturalHeight;
+
+    // Calculate panel dimensions
+    const initialWidth = Math.min(
+      Math.max(minWidth, requestedWidth),
+      Math.min(maxWidth, viewportMaxWidth)
+    );
+    const initialHeight = Math.min(
+      Math.max(minHeight, requestedHeight),
+      Math.min(maxHeight, viewportMaxHeight)
+    );
+    const contentMaxHeight = Math.max(0, initialHeight - headerHeight - 12);
 
     // Clamp position
     const margin = 8;
@@ -145,38 +165,40 @@ export function initDockableAccordions({ sidebar } = {}) {
     state.floatLeft = clampedLeft;
     state.floatTop = clampedTop;
 
-    // Setup placeholder
-    if (!state.dockPlaceholder) {
-      state.dockPlaceholder = document.createElement('div');
-      state.dockPlaceholder.className = 'accordion-dock-placeholder';
-    }
-    state.dockPlaceholder.style.height = `${rect.height}px`;
-    state.dockPlaceholder.hidden = false;
+    // Setup placeholder (docked panels only)
+    if (createPlaceholder) {
+      if (!state.dockPlaceholder) {
+        state.dockPlaceholder = document.createElement('div');
+        state.dockPlaceholder.className = 'accordion-dock-placeholder';
+      }
+      state.dockPlaceholder.style.height = `${rect.height}px`;
+      state.dockPlaceholder.hidden = false;
 
-    const parent = details.parentElement;
-    if (parent) {
-      state.dockParent = parent;
-      parent.insertBefore(state.dockPlaceholder, details);
+      const parent = details.parentElement;
+      if (parent) {
+        state.dockParent = parent;
+        parent.insertBefore(state.dockPlaceholder, details);
+      }
+    } else {
+      state.dockPlaceholder?.remove();
+      state.dockPlaceholder = null;
+      state.dockParent = null;
     }
 
     // Apply floating styles
-    details.style.position = 'fixed';
-    details.style.width = `${Math.round(initialWidth)}px`;
-    details.style.height = `${Math.round(initialHeight)}px`;
-    details.style.left = `${clampedLeft}px`;
-    details.style.top = `${clampedTop}px`;
-    details.style.zIndex = String(++zIndexCounter);
-    details.style.contain = 'layout style';
-    details.style.transform = 'translateZ(0)';
-    details.style.backfaceVisibility = 'hidden';
-    details.style.setProperty('--floating-header-height', `${headerHeight}px`);
-    details.style.setProperty('--floating-content-max-height', `${contentMaxHeight}px`);
+    setFloating(details, true);
+    StyleManager.setPosition(details, {
+      x: clampedLeft,
+      y: clampedTop,
+      width: Math.round(initialWidth),
+      height: Math.round(initialHeight),
+    });
+    StyleManager.setLayer(details, ++zIndexCounter);
+    StyleManager.setVariable(details, '--floating-header-height', `${headerHeight}px`);
+    StyleManager.setVariable(details, '--floating-content-max-height', `${contentMaxHeight}px`);
 
     // Set content scroll containment
     if (content) {
-      content.style.maxHeight = `${contentMaxHeight}px`;
-      content.style.overflowY = 'auto';
-      content.style.overflowX = 'hidden';
       if (contentScrollHeight > contentMaxHeight) {
         content.classList.add('has-overflow');
       }
@@ -186,8 +208,12 @@ export function initDockableAccordions({ sidebar } = {}) {
     floatingRoot.appendChild(details);
     details.open = true;
 
-    setFloating(details, true);
     state.baseFloatSize = { width: initialWidth, height: initialHeight };
+    state.widthConstraints = {
+      min: minWidth,
+      max: isFiniteNumber(constraints?.maxWidth) ? constraints.maxWidth : (initialWidth * FLOAT_MAX_SCALE)
+    };
+    details.style.visibility = '';
 
     // Trigger lift animation
     details.classList.add('floating-enter');
@@ -195,13 +221,28 @@ export function initDockableAccordions({ sidebar } = {}) {
       details.classList.remove('floating-enter');
     }, { once: true });
 
-    // Hide placeholder after layout settles
-    requestAnimationFrame(() => {
-      if (state.dockPlaceholder) {
-        state.dockPlaceholder.hidden = true;
-        state.dockPlaceholder.style.height = '';
-      }
-    });
+    if (createPlaceholder) {
+      // Hide placeholder after layout settles
+      requestAnimationFrame(() => {
+        if (state.dockPlaceholder) {
+          state.dockPlaceholder.hidden = true;
+          state.dockPlaceholder.style.height = '';
+        }
+      });
+    }
+  }
+
+  function undock(details, targetLeft, targetTop) {
+    const state = getState(details);
+    if (state.isFloating) return;
+    if (!state.dockable) return;
+    applyFloatingLayout(details, targetLeft, targetTop, { createPlaceholder: true });
+  }
+
+  function floatPanel(details, targetLeft, targetTop, options = {}) {
+    const state = getState(details);
+    if (state.isFloating) return;
+    applyFloatingLayout(details, targetLeft, targetTop, { ...options, createPlaceholder: false });
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -211,6 +252,7 @@ export function initDockableAccordions({ sidebar } = {}) {
   function dock(details) {
     const state = getState(details);
     if (!state.isFloating) return;
+    if (!state.dockable) return;
 
     // Reset content styles
     const content = details.querySelector('.accordion-content');
@@ -238,7 +280,10 @@ export function initDockableAccordions({ sidebar } = {}) {
 
     setFloating(details, false);
     details.classList.remove('dragging');
-    details.style.cssText = '';
+    StyleManager.clearPosition(details);
+    StyleManager.removeVariable(details, '--z-layer');
+    StyleManager.removeVariable(details, '--floating-header-height');
+    StyleManager.removeVariable(details, '--floating-content-max-height');
 
     // Trigger settle animation
     details.classList.add('dock-settle');
@@ -276,14 +321,7 @@ export function initDockableAccordions({ sidebar } = {}) {
     const ghost = document.createElement('div');
     ghost.className = 'drag-ghost';
     ghost.textContent = title;
-    ghost.style.cssText = `
-      position: fixed;
-      left: 0;
-      top: 0;
-      width: ${width}px;
-      pointer-events: none;
-      z-index: 9999;
-    `;
+    StyleManager.setVariable(ghost, '--ghost-width', `${width}px`);
     document.body.appendChild(ghost);
     return ghost;
   }
@@ -348,8 +386,13 @@ export function initDockableAccordions({ sidebar } = {}) {
       const startX = e.clientX;
       const rect = details.getBoundingClientRect();
       const startWidth = rect.width;
+      const minWidth = state.widthConstraints?.min ?? FLOAT_MIN_WIDTH_PX;
+      const maxWidthConstraint = state.widthConstraints?.max;
       const baseWidth = state.baseFloatSize?.width ?? startWidth;
-      const maxWidthByScale = Math.max(FLOAT_MIN_WIDTH_PX, baseWidth * FLOAT_MAX_SCALE);
+      const maxWidthByScale = Math.max(minWidth, baseWidth * FLOAT_MAX_SCALE);
+      const maxWidth = isFiniteNumber(maxWidthConstraint)
+        ? Math.max(minWidth, maxWidthConstraint)
+        : maxWidthByScale;
       const viewportWidth = window.innerWidth;
       const startLeft = rect.left;
 
@@ -363,17 +406,17 @@ export function initDockableAccordions({ sidebar } = {}) {
       let pendingWidth = startWidth;
 
       function applyResize() {
-        details.style.width = `${Math.round(pendingWidth)}px`;
+        StyleManager.setPosition(details, { width: Math.round(pendingWidth) });
         rafId = null;
       }
 
       function onMove(ev) {
         ev.preventDefault();
         const dx = ev.clientX - startX;
-        const maxWidthByViewport = Math.max(FLOAT_MIN_WIDTH_PX, viewportWidth - startLeft - 8);
+        const maxWidthByViewport = Math.max(minWidth, viewportWidth - startLeft - 8);
         pendingWidth = Math.min(
-          Math.max(FLOAT_MIN_WIDTH_PX, startWidth + dx),
-          Math.min(maxWidthByScale, maxWidthByViewport)
+          Math.max(minWidth, startWidth + dx),
+          Math.min(maxWidth, maxWidthByViewport)
         );
         if (!rafId) rafId = requestAnimationFrame(applyResize);
       }
@@ -406,6 +449,7 @@ export function initDockableAccordions({ sidebar } = {}) {
 
       const state = getState(details);
       if (state.isFloating) return; // Use floating drag handler instead
+      if (!state.dockable) return;
 
       e.preventDefault();
 
@@ -495,6 +539,7 @@ export function initDockableAccordions({ sidebar } = {}) {
 
       const state = getState(details);
       if (!state.isFloating) return; // Use docked drag handler instead
+      const allowDock = !!state.dockable;
 
       e.preventDefault();
 
@@ -549,8 +594,7 @@ export function initDockableAccordions({ sidebar } = {}) {
       function commitPosition() {
         const clamped = clamp(currentX, currentY);
         details.style.transform = 'translateZ(0)';
-        details.style.left = `${clamped.x}px`;
-        details.style.top = `${clamped.y}px`;
+        StyleManager.setPosition(details, { x: clamped.x, y: clamped.y });
         state.floatLeft = clamped.x;
         state.floatTop = clamped.y;
         lastTransform = '';
@@ -572,7 +616,7 @@ export function initDockableAccordions({ sidebar } = {}) {
           cachedSidebarRect = sidebar.getBoundingClientRect();
 
           // Show dock indicator
-          setDockIndicator(true, false);
+          if (allowDock) setDockIndicator(true, false);
         }
 
         // Update position
@@ -581,11 +625,13 @@ export function initDockableAccordions({ sidebar } = {}) {
 
         if (!rafId) rafId = requestAnimationFrame(applyTransform);
 
-        // Check dock hover
-        const hovering = isInSidebarZone(ev.clientX, ev.clientY, cachedSidebarRect);
-        if (hovering !== isHoveringDock) {
-          isHoveringDock = hovering;
-          setDockIndicator(true, hovering);
+        if (allowDock) {
+          // Check dock hover
+          const hovering = isInSidebarZone(ev.clientX, ev.clientY, cachedSidebarRect);
+          if (hovering !== isHoveringDock) {
+            isHoveringDock = hovering;
+            setDockIndicator(true, hovering);
+          }
         }
       }
 
@@ -605,13 +651,15 @@ export function initDockableAccordions({ sidebar } = {}) {
         details.style.willChange = '';
         setGlobalDragState(false);
         details.classList.remove('dragging');
-        setDockIndicator(false, false);
+        if (allowDock) setDockIndicator(false, false);
         state.suppressNextClick = true;
 
         // If hovering sidebar: dock
-        const finalSidebarRect = sidebar.getBoundingClientRect();
-        if (isInSidebarZone(ev.clientX, ev.clientY, finalSidebarRect)) {
-          dock(details);
+        if (allowDock) {
+          const finalSidebarRect = sidebar.getBoundingClientRect();
+          if (isInSidebarZone(ev.clientX, ev.clientY, finalSidebarRect)) {
+            dock(details);
+          }
         }
       }
 
@@ -625,26 +673,33 @@ export function initDockableAccordions({ sidebar } = {}) {
   // Initialize
   // ═══════════════════════════════════════════════════════════════════════════
 
-  sidebar.querySelectorAll('details.accordion-section > summary').forEach((summary) => {
-    const details = summary.closest('details.accordion-section');
-    if (!details) return;
+  function register(details, options = {}) {
+    if (!(details instanceof HTMLElement)) return;
+    if (!details.matches?.('details.accordion-section')) return;
 
-    getState(details);
-    ensureDockButton(summary);
+    const summary = details.querySelector(':scope > summary');
+    if (!summary) return;
+
+    const state = getState(details);
+    state.dockable = options.dockable !== false;
+    syncDockButton(summary, details);
     ensureResizeHandles(details);
+
+    if (state.registered) return;
+    state.registered = true;
 
     // Z-index bump on any pointer interaction with floating panel
     details.addEventListener('pointerdown', () => {
-      const state = stateByDetails.get(details);
-      if (!state?.isFloating) return;
+      const s = stateByDetails.get(details);
+      if (!s?.isFloating) return;
       bumpZIndex(details);
     }, { capture: true });
 
     // Suppress click after drag
     summary.addEventListener('click', (e) => {
-      const state = stateByDetails.get(details);
-      if (!state?.suppressNextClick) return;
-      state.suppressNextClick = false;
+      const s = stateByDetails.get(details);
+      if (!s?.suppressNextClick) return;
+      s.suppressNextClick = false;
       e.preventDefault();
       e.stopImmediatePropagation();
     }, true);
@@ -652,10 +707,41 @@ export function initDockableAccordions({ sidebar } = {}) {
     // Drag handlers - both check state to determine which behavior to use
     setupDockedDrag(summary, details);
     setupFloatingDrag(summary, details);
+  }
+
+  function unregister(details) {
+    const state = stateByDetails.get(details);
+    if (!state) return;
+    try { state.dockPlaceholder?.remove(); } catch {}
+    stateByDetails.delete(details);
+  }
+
+  sidebar.querySelectorAll('details.accordion-section').forEach((details) => {
+    register(details, { dockable: true });
   });
 
-  return { dock, undock: (details) => {
-    const rect = details.getBoundingClientRect();
-    undock(details, rect.left, rect.top);
-  }, floatingRoot };
+  return {
+    dock,
+    undock: (details) => {
+      const rect = details.getBoundingClientRect();
+      undock(details, rect.left, rect.top);
+    },
+    float: (details, leftOrOptions, top, options = {}) => {
+      const rect = details.getBoundingClientRect();
+      if (isFiniteNumber(leftOrOptions)) {
+        floatPanel(details, leftOrOptions ?? rect.left, top ?? rect.top, options);
+        return;
+      }
+      const opts = leftOrOptions && typeof leftOrOptions === 'object' ? leftOrOptions : {};
+      floatPanel(
+        details,
+        isFiniteNumber(opts.left) ? opts.left : rect.left,
+        isFiniteNumber(opts.top) ? opts.top : rect.top,
+        opts
+      );
+    },
+    register,
+    unregister,
+    floatingRoot
+  };
 }

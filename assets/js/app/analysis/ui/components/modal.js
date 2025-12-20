@@ -10,6 +10,7 @@
  */
 
 import { purgePlot } from '../../plots/plotly-loader.js';
+import { createExportToolbar } from './export.js';
 
 // =============================================================================
 // CONSTANTS
@@ -96,28 +97,7 @@ export function createAnalysisModal(options = {}) {
 
   const plotContainer = document.createElement('div');
   plotContainer.className = 'analysis-modal-plot';
-  plotContainer.id = 'analysis-modal-plot-container';
   plotSection.appendChild(plotContainer);
-
-  // Export toolbar below plot
-  const exportToolbar = document.createElement('div');
-  exportToolbar.className = 'analysis-modal-export';
-
-  const createExportBtn = (label, title, onClick) => {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'btn-small';
-    btn.textContent = label;
-    btn.title = title;
-    btn.addEventListener('click', onClick);
-    return btn;
-  };
-
-  if (onExportPNG) exportToolbar.appendChild(createExportBtn('PNG', 'Download as PNG', onExportPNG));
-  if (onExportSVG) exportToolbar.appendChild(createExportBtn('SVG', 'Download as SVG', onExportSVG));
-  if (onExportCSV) exportToolbar.appendChild(createExportBtn('CSV', 'Download data', onExportCSV));
-
-  plotSection.appendChild(exportToolbar);
   body.appendChild(plotSection);
 
   // Vertical resizer between plot and options
@@ -129,16 +109,33 @@ export function createAnalysisModal(options = {}) {
   // Right side: Options panel
   const optionsPanel = document.createElement('div');
   optionsPanel.className = 'analysis-modal-options';
-  optionsPanel.id = 'analysis-modal-options';
 
   const optionsTitle = document.createElement('div');
   optionsTitle.className = 'analysis-options-title';
-  optionsTitle.textContent = 'Plot Options';
+  const exportToolbar = createExportToolbar({ onExportPNG, onExportSVG, onExportCSV });
+  if (exportToolbar.childElementCount > 0) {
+    exportToolbar.classList.add('analysis-options-export-toolbar');
+
+    const exportRow = document.createElement('div');
+    exportRow.className = 'analysis-options-export-row';
+
+    const exportLabel = document.createElement('span');
+    exportLabel.className = 'analysis-options-export-label';
+    exportLabel.textContent = 'Export:';
+
+    exportRow.appendChild(exportLabel);
+    exportRow.appendChild(exportToolbar);
+    optionsTitle.appendChild(exportRow);
+  }
+
+  const optionsTitleText = document.createElement('span');
+  optionsTitleText.className = 'analysis-options-title-text';
+  optionsTitleText.textContent = 'Plot Options';
+  optionsTitle.appendChild(optionsTitleText);
   optionsPanel.appendChild(optionsTitle);
 
   const optionsContent = document.createElement('div');
   optionsContent.className = 'analysis-options-content';
-  optionsContent.id = 'analysis-options-content';
   optionsPanel.appendChild(optionsContent);
 
   body.appendChild(optionsPanel);
@@ -163,7 +160,6 @@ export function createAnalysisModal(options = {}) {
   // Summary stats panel (left)
   const statsPanel = document.createElement('div');
   statsPanel.className = 'analysis-modal-stats-panel';
-  statsPanel.id = 'analysis-modal-stats';
 
   const statsTitle = document.createElement('div');
   statsTitle.className = 'analysis-panel-title';
@@ -172,7 +168,6 @@ export function createAnalysisModal(options = {}) {
 
   const statsContent = document.createElement('div');
   statsContent.className = 'analysis-stats-content';
-  statsContent.id = 'analysis-stats-content';
   statsPanel.appendChild(statsContent);
 
   footerArea.appendChild(statsPanel);
@@ -186,7 +181,6 @@ export function createAnalysisModal(options = {}) {
   // Statistical annotations panel (right)
   const annotationsPanel = document.createElement('div');
   annotationsPanel.className = 'analysis-modal-annotations-panel';
-  annotationsPanel.id = 'analysis-modal-annotations';
 
   const annotationsTitle = document.createElement('div');
   annotationsTitle.className = 'analysis-panel-title';
@@ -195,7 +189,6 @@ export function createAnalysisModal(options = {}) {
 
   const annotationsContent = document.createElement('div');
   annotationsContent.className = 'analysis-annotations-content';
-  annotationsContent.id = 'analysis-annotations-content';
   annotationsPanel.appendChild(annotationsContent);
 
   footerArea.appendChild(annotationsPanel);

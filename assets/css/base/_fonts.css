@@ -1,0 +1,31 @@
+/* ========================================================================
+   Self-hosted fonts (latin only, ~103 KB total)
+   ===================================================================== */
+
+/* Inter - Variable font for body text */
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('../../fonts/inter-latin.woff2') format('woff2');
+}
+
+/* Oswald - Variable font for headlines/labels */
+@font-face {
+  font-family: 'Oswald';
+  font-style: normal;
+  font-weight: 200 700;
+  font-display: swap;
+  src: url('../../fonts/oswald-latin.woff2') format('woff2');
+}
+
+/* Fira Code - Variable font for monospace/code */
+@font-face {
+  font-family: 'Fira Code';
+  font-style: normal;
+  font-weight: 300 700;
+  font-display: swap;
+  src: url('../../fonts/firacode-latin.woff2') format('woff2');
+}
+

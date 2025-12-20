@@ -19,6 +19,7 @@ import {
 } from './analysis-types.js';
 import { filterFiniteNumbers, getFiniteMinMax, mean } from '../shared/number-utils.js';
 import { debug, debugWarn, debugError } from '../shared/debug-utils.js';
+import { getPlotTheme } from '../shared/plot-theme.js';
 
 // Re-export validation functions for index.js
 export { validatePluginContract, validateOptionsAgainstSchema, mergeOptions };
@@ -873,15 +874,16 @@ export const PlotHelpers = {
    * @returns {Object}
    */
   createBaseLayout(options = {}) {
+    const theme = getPlotTheme();
     return {
       autosize: true,
       margin: { l: 55, r: 20, t: 40, b: 55 },
       paper_bgcolor: 'transparent',
-      plot_bgcolor: '#ffffff',
+      plot_bgcolor: theme.plotBg,
       font: {
-        family: 'Inter, system-ui, -apple-system, sans-serif',
-        size: 11,
-        color: '#374151'
+        family: theme.fontFamily,
+        size: theme.fontSize,
+        color: theme.text
       },
       showlegend: options.showLegend !== false,
       legend: {
@@ -890,35 +892,35 @@ export const PlotHelpers = {
         y: 1.02,
         xanchor: 'center',
         x: 0.5,
-        font: { size: 11, color: '#374151' },
+        font: { size: theme.legendFontSize, color: theme.text },
         bgcolor: 'transparent',
         borderwidth: 0,
         itemsizing: 'constant'
       },
       xaxis: {
-        gridcolor: '#f3f4f6',
+        gridcolor: theme.grid,
         gridwidth: 1,
-        linecolor: '#e5e7eb',
+        linecolor: theme.axisLine,
         linewidth: 1,
-        tickfont: { size: 11, color: '#6b7280' },
-        title: { font: { size: 12, color: '#374151' }, standoff: 12 },
+        tickfont: { size: theme.tickFontSize, color: theme.textMuted },
+        title: { font: { size: theme.titleFontSize, color: theme.text }, standoff: 12 },
         zeroline: false,
         automargin: true
       },
       yaxis: {
-        gridcolor: '#f3f4f6',
+        gridcolor: theme.grid,
         gridwidth: 1,
-        linecolor: '#e5e7eb',
+        linecolor: theme.axisLine,
         linewidth: 1,
-        tickfont: { size: 11, color: '#6b7280' },
-        title: { font: { size: 12, color: '#374151' }, standoff: 12 },
+        tickfont: { size: theme.tickFontSize, color: theme.textMuted },
+        title: { font: { size: theme.titleFontSize, color: theme.text }, standoff: 12 },
         zeroline: false,
         automargin: true
       },
       hoverlabel: {
-        bgcolor: '#111827',
-        bordercolor: '#111827',
-        font: { family: 'Inter, system-ui, sans-serif', size: 12, color: '#ffffff' }
+        bgcolor: theme.hover.bg,
+        bordercolor: theme.hover.border,
+        font: { family: theme.fontFamily, size: theme.titleFontSize, color: theme.hover.text }
       },
       ...options
     };

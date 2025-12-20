@@ -3,6 +3,8 @@ import { formatCellCount as formatDataNumber } from '../data/data-source.js';
 import { getNotificationCenter } from './notification-center.js';
 import { updateUrlForDataSource, clearUrlDataSource } from './url-state.js';
 import { DATA_LOAD_METHODS } from '../analytics/tracker.js';
+import { SIDEBAR_MIN_WIDTH_PX, clampSidebarWidthPx } from './sidebar-metrics.js';
+import { StyleManager } from '../utils/style-manager.js';
 
 export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadActiveDataset }) {
   console.log('[UI] initUI called with dataSourceManager:', !!dataSourceManager);
@@ -174,21 +176,6 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
   // Create floating range label for continuous selection
   const rangeLabel = document.createElement('div');
   rangeLabel.id = 'selection-range-label';
-  rangeLabel.style.cssText = `
-    position: fixed;
-    pointer-events: none;
-    background: var(--viewer-ink);
-    color: var(--viewer-paper);
-    padding: 4px 8px;
-    border-radius: 0;
-    font-size: 12px;
-    font-family: "Fira Code", monospace;
-    white-space: nowrap;
-    z-index: 10000;
-    display: none;
-    transform: translate(12px, -50%);
-    box-shadow: var(--viewer-shadow);
-  `;
   document.body.appendChild(rangeLabel);
 
   // Hide display options by default until a field is active
@@ -711,7 +698,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       if (mode === 'knn' && !viewer.isKnnEdgesLoaded?.()) {
         // Update description to show loading state
         if (highlightModeDescriptionEl) {
-          highlightModeDescriptionEl.innerHTML = highlightModeCopy.knn + '<br><small style="color: var(--viewer-ink-soft);">Loading neighbor graph... (see notifications)</small>';
+          highlightModeDescriptionEl.innerHTML = highlightModeCopy.knn + '<br><small class="highlight-mode-note">Loading neighbor graph... (see notifications)</small>';
         }
         // Wait for edges to load, then update description
         let attempts = 0;
@@ -723,13 +710,13 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
             if (highlightModeDescriptionEl && activeHighlightMode === 'knn') {
               highlightModeDescriptionEl.innerHTML = highlightModeCopy.knn;
             }
-          } else if (attempts >= maxAttempts) {
-            clearInterval(checkLoaded);
-            if (highlightModeDescriptionEl && activeHighlightMode === 'knn') {
-              highlightModeDescriptionEl.innerHTML = highlightModeCopy.knn + '<br><small style="color: var(--viewer-ink-soft);">Neighbor graph not available. Enable "Show edges" to load connectivity data.</small>';
+            } else if (attempts >= maxAttempts) {
+              clearInterval(checkLoaded);
+              if (highlightModeDescriptionEl && activeHighlightMode === 'knn') {
+              highlightModeDescriptionEl.innerHTML = highlightModeCopy.knn + '<br><small class="highlight-mode-note">Neighbor graph not available. Enable \"Show edges\" to load connectivity data.</small>';
+              }
             }
-          }
-        }, 100);
+          }, 100);
       }
     }
   }
@@ -2682,7 +2669,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       const gradientBar = document.createElement('button');
       gradientBar.type = 'button';
       gradientBar.className = 'colorbar-gradient';
-      gradientBar.style.backgroundImage = 'linear-gradient(to right, ' + model.colorStops.join(', ') + ')';
+      StyleManager.setVariable(gradientBar, '--colorbar-stops', model.colorStops.join(', '));
       gradientBar.title = 'Click to change color palette';
 
       const colormapMenu = document.createElement('div');
@@ -2697,7 +2684,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
           option.className = 'colormap-option' + (cm.id === activeId ? ' active' : '');
           const preview = document.createElement('div');
           preview.className = 'colormap-preview';
-          preview.style.backgroundImage = 'linear-gradient(to right, ' + cm.cssStops.join(', ') + ')';
+          StyleManager.setVariable(preview, '--colormap-stops', cm.cssStops.join(', '));
           const name = document.createElement('span');
           name.className = 'colormap-name';
           name.textContent = cm.label;
@@ -3076,7 +3063,6 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
         row.dataset.catIndex = String(catIdx);
         if (!hasCells) row.classList.add('legend-item-disabled');
         row.title = hasCells ? '' : 'No cells available in this category after other filters';
-        row.style.position = 'relative';
 
         const checkbox = document.createElement('input');
         checkbox.type = 'checkbox';
@@ -3099,7 +3085,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
 
         const updateColorUI = () => {
           const nextColor = state.getColorForCategory(field, catIdx);
-          swatch.style.backgroundColor = state.rgbToCss(nextColor);
+          StyleManager.setVariable(swatch, '--legend-swatch-color', state.rgbToCss(nextColor));
           colorInput.value = rgbToHex(nextColor);
         };
         updateColorUI();
@@ -3876,7 +3862,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
   // Ensure initial layout-dependent CSS vars match reality (prevents toggle drift).
   sidebarToggle.type = 'button';
   sidebarToggle.setAttribute('aria-controls', sidebar.id || 'sidebar');
-  document.documentElement.style.setProperty('--sidebar-width', `${Math.round(sidebar.getBoundingClientRect().width)}px`);
+  StyleManager.setVariable(document.documentElement, '--sidebar-width', `${Math.round(sidebar.getBoundingClientRect().width)}px`);
   syncSidebarToggleState();
 
   sidebarToggle.addEventListener('click', () => {
@@ -3886,8 +3872,6 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
 
   // Sidebar resize functionality
   const sidebarResizeHandle = document.getElementById('sidebar-resize-handle');
-  const MIN_SIDEBAR_WIDTH = 280;
-  const MAX_SIDEBAR_WIDTH = 560; // 2x the minimum width
 
   if (sidebarResizeHandle) {
     let isResizing = false;
@@ -3895,15 +3879,15 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     let startWidth = 0;
 
     const updateSidebarWidth = (width) => {
-      const clampedWidth = Math.max(MIN_SIDEBAR_WIDTH, Math.min(MAX_SIDEBAR_WIDTH, width));
-      sidebar.style.width = `${clampedWidth}px`;
-      document.documentElement.style.setProperty('--sidebar-width', `${clampedWidth}px`);
+      const clampedWidth = clampSidebarWidthPx(width);
+      StyleManager.setVariable(document.documentElement, '--sidebar-width', `${clampedWidth}px`);
     };
 
     sidebarResizeHandle.addEventListener('mousedown', (e) => {
       isResizing = true;
       startX = e.clientX;
       startWidth = sidebar.offsetWidth;
+      if (startWidth < SIDEBAR_MIN_WIDTH_PX) startWidth = SIDEBAR_MIN_WIDTH_PX;
       sidebar.classList.add('resizing');
       document.body.style.cursor = 'ew-resize';
       document.body.style.userSelect = 'none';
@@ -4779,7 +4763,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     const hasMultipleDimensions = availableDimensions.length > 1;
 
     // Show/hide dimension controls based on whether multiple dimensions are available
-    dimensionControls.style.display = hasMultipleDimensions ? '' : 'none';
+    dimensionControls.style.display = hasMultipleDimensions ? 'block' : 'none';
 
     if (!hasMultipleDimensions) return;
 
@@ -5481,7 +5465,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
   if (userDataInfoBtn && userDataInfoTooltip) {
     userDataInfoBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      const isVisible = userDataInfoTooltip.style.display !== 'none';
+      const isVisible = getComputedStyle(userDataInfoTooltip).display !== 'none';
       userDataInfoTooltip.style.display = isVisible ? 'none' : 'block';
     });
   }
@@ -5490,7 +5474,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
   if (remoteInfoBtn && remoteInfoTooltip) {
     remoteInfoBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      const isVisible = remoteInfoTooltip.style.display !== 'none';
+      const isVisible = getComputedStyle(remoteInfoTooltip).display !== 'none';
       remoteInfoTooltip.style.display = isVisible ? 'none' : 'block';
     });
   }
@@ -5499,7 +5483,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
   if (githubInfoBtn && githubInfoTooltip) {
     githubInfoBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      const isVisible = githubInfoTooltip.style.display !== 'none';
+      const isVisible = getComputedStyle(githubInfoTooltip).display !== 'none';
       githubInfoTooltip.style.display = isVisible ? 'none' : 'block';
     });
   }

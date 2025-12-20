@@ -64,6 +64,10 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
 
     this._xSelector = null;
     this._ySelector = null;
+
+    this._xIdPrefix = this._instanceId ? `${this._instanceId}-correlation-x` : 'correlation-x';
+    this._yIdPrefix = this._instanceId ? `${this._instanceId}-correlation-y` : 'correlation-y';
+    this._plotContainerIdBase = this._instanceId ? `${this._instanceId}-correlation-analysis-plot` : 'correlation-analysis-plot';
   }
 
   /**
@@ -81,7 +85,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
       dataLayer: this.dataLayer,
       container: xContainer,
       allowedTypes: ['continuous', 'gene'],
-      idPrefix: 'correlation-x',
+      idPrefix: this._xIdPrefix,
       typeLabel: 'X Axis Variable:',
       onVariableChange: () => this._hideStaleResult()
     });
@@ -96,7 +100,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
       dataLayer: this.dataLayer,
       container: yContainer,
       allowedTypes: ['continuous', 'gene'],
-      idPrefix: 'correlation-y',
+      idPrefix: this._yIdPrefix,
       typeLabel: 'Y Axis Variable:',
       onVariableChange: () => this._hideStaleResult()
     });
@@ -213,8 +217,8 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
 
     const plotContainer = document.createElement('div');
     plotContainer.className = 'analysis-preview-plot';
-    plotContainer.id = 'correlation-analysis-plot';
-    this._plotContainerId = 'correlation-analysis-plot';
+    plotContainer.id = this._plotContainerIdBase;
+    this._plotContainerId = this._plotContainerIdBase;
     previewContainer.appendChild(plotContainer);
 
     const plotDef = PlotRegistry.get(result.plotType);
@@ -360,7 +364,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
   // ===========================================================================
 
   async _exportPlotPNG() {
-    const plotEl = document.getElementById('correlation-analysis-plot');
+    const plotEl = this._plotContainerId ? document.getElementById(this._plotContainerId) : null;
     if (!plotEl) return;
 
     await this._exportPNG(plotEl, {
@@ -379,11 +383,36 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
   }
 
   destroy() {
+    this._isDestroyed = true;
     this._xSelector?.destroy?.();
     this._ySelector?.destroy?.();
     this._xSelector = null;
     this._ySelector = null;
     super.destroy();
+  }
+
+  exportSettings() {
+    const base = super.exportSettings();
+    return {
+      ...base,
+      variableX: this._xSelector?.getSelectedVariable?.() || null,
+      variableY: this._ySelector?.getSelectedVariable?.() || null
+    };
+  }
+
+  importSettings(settings) {
+    super.importSettings(settings);
+    if (!settings) return;
+
+    const variableX = settings.variableX;
+    const variableY = settings.variableY;
+
+    if (variableX?.type && variableX?.variable && this._xSelector?.setSelectedVariable) {
+      this._xSelector.setSelectedVariable(variableX.type, variableX.variable);
+    }
+    if (variableY?.type && variableY?.variable && this._ySelector?.setSelectedVariable) {
+      this._ySelector.setSelectedVariable(variableY.type, variableY.variable);
+    }
   }
 }
 

@@ -1,0 +1,11 @@
+/* tokens/_index.css - Aggregates all design token files. */
+
+@import '_colors.css';
+@import '_spacing.css';
+@import '_breakpoints.css';
+@import '_typography.css';
+@import '_shadows.css';
+@import '_borders.css';
+@import '_transitions.css';
+@import '_z-index.css';
+@import '_opacity.css';

@@ -13,6 +13,8 @@
 import { PlotRegistry, BasePlot, COMMON_HOVER_STYLE, createMinimalPlotly, getPlotlyConfig } from '../plot-factory.js';
 import { getScatterTraceType } from '../plotly-loader.js';
 import { getFiniteMinMax, isFiniteNumber } from '../../shared/number-utils.js';
+import { applyLegendPosition } from '../../shared/legend-utils.js';
+import { getPlotTheme } from '../../shared/plot-theme.js';
 
 /**
  * Precomputed, columnar volcano-plot data for a single DE result set.
@@ -170,6 +172,7 @@ function computeVolcanoCategoryCodes(pre, options) {
  */
 function buildVolcanoAnnotations(pre, codes, yValues, options) {
   const { labelTopN = 10, highlightGenes = [] } = options || {};
+  const theme = getPlotTheme();
   const highlightSet = new Set((highlightGenes || []).map(g => String(g).toLowerCase()));
   const wantTop = Number.isFinite(labelTopN) ? Math.max(0, Math.floor(labelTopN)) : 0;
 
@@ -229,15 +232,15 @@ function buildVolcanoAnnotations(pre, codes, yValues, options) {
       arrowhead: 0,
       arrowsize: 0.5,
       arrowwidth: 1,
-      arrowcolor: '#6b7280',
+      arrowcolor: theme.textMuted,
       ax: x > 0 ? 30 : -30,
       ay: -20,
       font: {
-        family: 'Inter, system-ui, sans-serif',
+        family: theme.fontFamily,
         size: 10,
-        color: '#374151'
+        color: theme.text
       },
-      bgcolor: 'rgba(255, 255, 255, 0.8)',
+      bgcolor: theme.legend.bg,
       borderpad: 2
     });
   }
@@ -268,6 +271,8 @@ function buildVolcanoFigure(deResults, options) {
   // Handle different input formats
   const results = normalizeDEResults(deResults);
 
+  const theme = getPlotTheme();
+
   // Base config
   const config = getPlotlyConfig();
   config.scrollZoom = true;
@@ -281,7 +286,7 @@ function buildVolcanoFigure(deResults, options) {
       xref: 'paper',
       yref: 'paper',
       showarrow: false,
-      font: { size: 14, color: '#6b7280' }
+      font: { size: 14, color: theme.textMuted }
     }];
     return { traces: [], layout, config };
   }
@@ -379,27 +384,27 @@ function buildVolcanoFigure(deResults, options) {
   layout.xaxis = {
     title: {
       text: 'log₂ Fold Change',
-      font: { family: 'Oswald, system-ui, sans-serif', size: 12, color: '#374151' }
+      font: { family: 'Oswald, system-ui, sans-serif', size: 12, color: theme.text }
     },
     zeroline: true,
-    zerolinecolor: '#e5e7eb',
+    zerolinecolor: theme.axisLine,
     zerolinewidth: 1,
     range: [-(xMax * 1.1), xMax * 1.1],
     showgrid: true,
-    gridcolor: '#f3f4f6',
-    tickfont: { size: 10, color: '#6b7280' }
+    gridcolor: theme.grid,
+    tickfont: { size: 10, color: theme.textMuted }
   };
 
   layout.yaxis = {
     title: {
       text: useAdjustedPValue ? '-log₁₀ (adjusted p-value)' : '-log₁₀ (p-value)',
-      font: { family: 'Oswald, system-ui, sans-serif', size: 12, color: '#374151' }
+      font: { family: 'Oswald, system-ui, sans-serif', size: 12, color: theme.text }
     },
     zeroline: false,
     range: [0, yMax * 1.1],
     showgrid: true,
-    gridcolor: '#f3f4f6',
-    tickfont: { size: 10, color: '#6b7280' }
+    gridcolor: theme.grid,
+    tickfont: { size: 10, color: theme.textMuted }
   };
 
   layout.annotations = buildVolcanoAnnotations(pre, codes, yValues, { labelTopN, highlightGenes });
@@ -416,7 +421,7 @@ function buildVolcanoFigure(deResults, options) {
         x1: xMax * 1.1,
         y0: pThresholdY,
         y1: pThresholdY,
-        line: { color: '#9ca3af', width: 1, dash: 'dash' }
+        line: { color: theme.textMuted, width: 1, dash: 'dash' }
       },
       // Vertical fold change thresholds
       {
@@ -425,7 +430,7 @@ function buildVolcanoFigure(deResults, options) {
         x1: -foldChangeThreshold,
         y0: 0,
         y1: yMax * 1.1,
-        line: { color: '#9ca3af', width: 1, dash: 'dash' }
+        line: { color: theme.textMuted, width: 1, dash: 'dash' }
       },
       {
         type: 'line',
@@ -433,7 +438,7 @@ function buildVolcanoFigure(deResults, options) {
         x1: foldChangeThreshold,
         y0: 0,
         y1: yMax * 1.1,
-        line: { color: '#9ca3af', width: 1, dash: 'dash' }
+        line: { color: theme.textMuted, width: 1, dash: 'dash' }
       }
     ];
   }
@@ -444,13 +449,14 @@ function buildVolcanoFigure(deResults, options) {
     y: 1,
     xanchor: 'right',
     yanchor: 'top',
-    bgcolor: 'rgba(255, 255, 255, 0.8)',
-    bordercolor: '#e5e7eb',
+    bgcolor: theme.legend.bg,
+    bordercolor: theme.legend.border,
     borderwidth: 1,
     font: { size: 10 }
   };
 
   layout.margin = { l: 60, r: 20, t: 30, b: 50 };
+  applyLegendPosition(layout, options.legendPosition);
 
   return { traces, layout, config };
 }
@@ -581,6 +587,9 @@ const volcanoPlotDefinition = {
         'yaxis.title.text': nextFigure.layout.yaxis?.title?.text,
         'xaxis.range': nextFigure.layout.xaxis?.range,
         'yaxis.range': nextFigure.layout.yaxis?.range,
+        showlegend: nextFigure.layout.showlegend,
+        legend: nextFigure.layout.legend,
+        margin: nextFigure.layout.margin,
         annotations: nextFigure.layout.annotations,
         shapes: nextFigure.layout.shapes || []
       });

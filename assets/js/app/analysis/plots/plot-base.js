@@ -15,19 +15,37 @@
 import { PlotHelpers, getPageColor, PAGE_COLORS } from '../core/plugin-contract.js';
 import { createMinimalPlotly, getPlotlyConfig } from './plotly-loader.js';
 import { isFiniteNumber } from '../shared/number-utils.js';
+import { getPlotTheme } from '../shared/plot-theme.js';
 
 /**
  * Common hover label style used by all plots
  */
 export const COMMON_HOVER_STYLE = {
-  bgcolor: '#111827',
-  bordercolor: '#111827',
+  bgcolor: '',
+  bordercolor: '',
   font: {
-    family: 'Inter, system-ui, sans-serif',
+    family: '',
     size: 12,
-    color: '#ffffff'
+    color: ''
   }
 };
+
+function syncCommonHoverStyle() {
+  const theme = getPlotTheme();
+  COMMON_HOVER_STYLE.bgcolor = theme.hover.bg;
+  COMMON_HOVER_STYLE.bordercolor = theme.hover.border;
+  COMMON_HOVER_STYLE.font.family = theme.fontFamily;
+  COMMON_HOVER_STYLE.font.size = theme.titleFontSize;
+  COMMON_HOVER_STYLE.font.color = theme.hover.text;
+}
+
+syncCommonHoverStyle();
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('cellucid:theme-change', () => {
+    syncCommonHoverStyle();
+  });
+}
 
 /**
  * Base class for plot type definitions

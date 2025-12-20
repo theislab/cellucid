@@ -1,0 +1,20 @@
+/* tokens/_z-index.css
+   Centralized stacking context layers.
+*/
+
+:root {
+  --z-below: -1;
+  --z-base: 0;
+  --z-raised: 1;
+  --z-dropdown: 100;
+  --z-sticky: 200;
+  --z-overlay: 300;
+  --z-sidebar: 400;
+  --z-floating: 500;
+  --z-modal: 600;
+  --z-popover: 700;
+  --z-tooltip: 800;
+  --z-notification: 900;
+  --z-max: 9999;
+}
+

@@ -12,6 +12,7 @@ import { getPageColor } from '../../core/plugin-contract.js';
 import { NONE_VALUE, formatCount, getCellCountForPage } from '../../shared/dom-utils.js';
 import { deriveRestOfColor } from '../../shared/color-utils.js';
 import { expandPagesWithDerived } from '../../shared/page-derivation-utils.js';
+import { StyleManager } from '../../../../utils/style-manager.js';
 
 // =============================================================================
 // PLOT REGISTRY - Imported from centralized location
@@ -157,7 +158,7 @@ export function createGeneExpressionSelector(options = {}) {
     const noneItem = document.createElement('div');
     noneItem.className = 'dropdown-item';
     noneItem.textContent = 'None';
-    noneItem.style.color = 'var(--viewer-ink-muted)';
+    noneItem.classList.add('text-tertiary');
     noneItem.addEventListener('mousedown', (e) => {
       e.preventDefault();
       currentSelectedGene = '';
@@ -179,7 +180,7 @@ export function createGeneExpressionSelector(options = {}) {
       const empty = document.createElement('div');
       empty.className = 'dropdown-item';
       empty.textContent = 'No matches';
-      empty.style.color = 'var(--viewer-ink-muted)';
+      empty.classList.add('text-tertiary');
       empty.style.fontStyle = 'italic';
       dropdown.appendChild(empty);
       return;
@@ -341,7 +342,7 @@ export function createPageSelector(options = {}) {
       // Color swatch container (rectangular, matching categorical obs legend style)
       const colorIndicator = document.createElement('span');
       colorIndicator.className = 'analysis-page-color';
-      colorIndicator.style.backgroundColor = currentColor;
+      StyleManager.setVariable(colorIndicator, '--analysis-page-color', currentColor);
       colorIndicator.title = 'Click to change color';
 
       // Color picker input (overlays the swatch)
@@ -353,7 +354,7 @@ export function createPageSelector(options = {}) {
       colorInput.addEventListener('input', (e) => {
         const newColor = e.target.value;
         customColors.set(page.id, newColor);
-        colorIndicator.style.backgroundColor = newColor;
+        StyleManager.setVariable(colorIndicator, '--analysis-page-color', newColor);
         if (onColorChange) onColorChange(page.id, newColor);
       });
       colorInput.addEventListener('click', (e) => {
@@ -438,13 +439,6 @@ export function createPageSelector(options = {}) {
   return container;
 }
 
-/**
- * Legacy function name for backwards compatibility
- */
-export function createPageMultiSelect(options) {
-  return createPageSelector(options);
-}
-
 // =============================================================================
 // PAGE COMPARISON SELECTOR (for two-page analyses like DE)
 // =============================================================================
@@ -492,12 +486,25 @@ export function createPageComparisonSelector(options = {}) {
     comparisonDisplay.className = 'de-page-info';
     const color0 = customColors.get(pages[0].id) || getPageColor(0);
     const color1 = customColors.get(pages[1].id) || getPageColor(1);
-    comparisonDisplay.innerHTML = `
-      <div class="de-comparison-label">Comparing:</div>
-      <div class="de-page-badge page-a" style="border-left-color: ${color0}">${pages[0].name}</div>
-      <span class="de-vs">vs</span>
-      <div class="de-page-badge page-b" style="border-left-color: ${color1}">${pages[1].name}</div>
-    `;
+    const labelEl = document.createElement('div');
+    labelEl.className = 'de-comparison-label';
+    labelEl.textContent = 'Comparing:';
+
+    const badgeA = document.createElement('div');
+    badgeA.className = 'de-page-badge page-a';
+    badgeA.textContent = pages[0].name;
+    StyleManager.setVariable(badgeA, '--de-page-color', color0);
+
+    const vsEl = document.createElement('span');
+    vsEl.className = 'de-vs';
+    vsEl.textContent = 'vs';
+
+    const badgeB = document.createElement('div');
+    badgeB.className = 'de-page-badge page-b';
+    badgeB.textContent = pages[1].name;
+    StyleManager.setVariable(badgeB, '--de-page-color', color1);
+
+    comparisonDisplay.append(labelEl, badgeA, vsEl, badgeB);
     container.appendChild(comparisonDisplay);
 
     // Ensure both pages are selected
@@ -642,18 +649,18 @@ export function createPageComparisonSelector(options = {}) {
  * @returns {HTMLElement}
  */
 export function createPlotTypeSelector(options = {}) {
-  const { dataType = 'categorical', selectedId = '', onChange } = options;
+  const { dataType = 'categorical', selectedId = '', onChange, id = 'analysis-plot-type' } = options;
 
   const container = document.createElement('div');
   container.className = 'field-select';
 
   const label = document.createElement('label');
-  label.htmlFor = 'analysis-plot-type';
+  label.htmlFor = id;
   label.textContent = 'Plot type:';
   container.appendChild(label);
 
   const select = document.createElement('select');
-  select.id = 'analysis-plot-type';
+  select.id = id;
   select.className = 'obs-select';
 
   // Get compatible plot types
@@ -695,7 +702,6 @@ export default {
   createVariableSelector,
   createGeneExpressionSelector,
   createPageSelector,
-  createPageMultiSelect,
   createPageComparisonSelector,
   createPlotTypeSelector
 };

@@ -2968,7 +2968,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         targetGridOpacity = 0.85;
         // Subtle warm gray tint instead of pure white
         gl.clearColor(0.965, 0.965, 0.970, 1);
-        document.body.style.backgroundColor = '#f6f6f7';
+        document.body.dataset.viewerBackground = 'grid';
         bgColor = [0.965, 0.965, 0.970];
         fogColor = [0.965, 0.965, 0.970];
         // Lighter grid lines - subtle but visible on light background
@@ -2986,7 +2986,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         showGrid = true;
         targetGridOpacity = 0.75;
         gl.clearColor(0.08, 0.09, 0.1, 1);
-        document.body.style.backgroundColor = '#14161a';
+        document.body.dataset.viewerBackground = 'grid-dark';
         bgColor = [0.08, 0.09, 0.1];
         fogColor = [0.08, 0.09, 0.1];
         gridColor = [0.38, 0.38, 0.42];   // Subtle gray lines
@@ -3001,7 +3001,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         break;
       case 'black':
         gl.clearColor(0, 0, 0, 1);
-        document.body.style.backgroundColor = '#000000';
+        document.body.dataset.viewerBackground = 'black';
         bgColor = [0, 0, 0];
         fogColor = [0.05, 0.05, 0.08];
         // Match grid bg to main bg for clean fade-out
@@ -3012,7 +3012,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       case 'white':
       default:
         gl.clearColor(1, 1, 1, 1);
-        document.body.style.backgroundColor = '#ffffff';
+        document.body.dataset.viewerBackground = 'white';
         bgColor = [1, 1, 1];
         fogColor = [1, 1, 1];
         // Match grid bg to main bg for clean fade-out

@@ -6,6 +6,7 @@
  */
 
 import { getPageColor, PAGE_COLORS } from '../core/plugin-contract.js';
+import { getPlotTheme } from '../shared/plot-theme.js';
 
 /**
  * Layout mode definitions
@@ -259,6 +260,7 @@ export class LayoutEngine {
 
       // Add annotations for subplot titles
       layout.annotations = layout.annotations || [];
+      const theme = getPlotTheme();
       for (let i = 0; i < this.pageCount; i++) {
         const row = Math.floor(i / grid.cols);
         const col = i % grid.cols;
@@ -274,7 +276,7 @@ export class LayoutEngine {
           xanchor: 'center',
           yanchor: 'bottom',
           showarrow: false,
-          font: { size: 12, color: '#374151', weight: 600 }
+          font: { size: theme.titleFontSize, color: theme.text, weight: 600 }
         });
       }
     }

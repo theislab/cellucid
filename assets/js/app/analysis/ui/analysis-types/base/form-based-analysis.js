@@ -51,7 +51,7 @@ import {
   createExpandButton,
   renderPlotOptions
 } from '../../components/index.js';
-import { loadPlotly, downloadImage } from '../../../plots/plotly-loader.js';
+import { loadPlotly, downloadImage, purgePlot } from '../../../plots/plotly-loader.js';
 import { PlotRegistry } from '../../../shared/plot-registry-utils.js';
 import { renderOrUpdatePlot } from '../../../shared/plot-lifecycle.js';
 
@@ -90,6 +90,96 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     this._optionRenderRevision = 0;
 
     // Note: _selectedPages, _lastResult, and _isLoading are inherited from BaseAnalysisUI
+  }
+
+  /**
+   * Snapshot current form control values by their `name` attribute.
+   * This intentionally captures settings only (not results).
+   * @returns {Record<string, { type: 'checkbox'|'value', value: string|boolean }>}
+   * @protected
+   */
+  _snapshotNamedFormControls() {
+    /** @type {Record<string, { type: 'checkbox'|'value', value: string|boolean }>} */
+    const out = {};
+    const form = this._formContainer?.querySelector?.('.analysis-form');
+    if (!form) return out;
+
+    form.querySelectorAll('input[name], select[name], textarea[name]').forEach((el) => {
+      const name = el.getAttribute('name');
+      if (!name) return;
+      if (el instanceof HTMLInputElement && el.type === 'checkbox') {
+        out[name] = { type: 'checkbox', value: el.checked };
+      } else if (el instanceof HTMLInputElement) {
+        out[name] = { type: 'value', value: el.value };
+      } else if (el instanceof HTMLSelectElement) {
+        out[name] = { type: 'value', value: el.value };
+      } else if (el instanceof HTMLTextAreaElement) {
+        out[name] = { type: 'value', value: el.value };
+      }
+    });
+
+    return out;
+  }
+
+  /**
+   * Apply a snapshot produced by _snapshotNamedFormControls().
+   * @param {Record<string, { type: 'checkbox'|'value', value: string|boolean }>|null|undefined} snapshot
+   * @protected
+   */
+  _applyNamedFormControls(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object') return;
+    const form = this._formContainer?.querySelector?.('.analysis-form');
+    if (!form) return;
+
+    for (const [name, data] of Object.entries(snapshot)) {
+      if (!data) continue;
+      const el = form.querySelector(`[name="${CSS.escape(name)}"]`);
+      if (!el) continue;
+
+      if (data.type === 'checkbox' && el instanceof HTMLInputElement && el.type === 'checkbox') {
+        el.checked = !!data.value;
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        continue;
+      }
+
+      if (data.type === 'value' && (el instanceof HTMLInputElement || el instanceof HTMLSelectElement)) {
+        el.value = String(data.value ?? '');
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        continue;
+      }
+
+      if (data.type === 'value' && el instanceof HTMLTextAreaElement) {
+        el.value = String(data.value ?? '');
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        continue;
+      }
+    }
+  }
+
+  /**
+   * Export a settings-only snapshot for cloning/copying.
+   * Results (plots/data) are intentionally excluded.
+   * @override
+   */
+  exportSettings() {
+    return {
+      selectedPages: [...this._selectedPages],
+      formControls: this._snapshotNamedFormControls()
+    };
+  }
+
+  /**
+   * Import a settings snapshot previously produced by exportSettings().
+   * @override
+   * @param {{ selectedPages?: string[], formControls?: Record<string, { type: 'checkbox'|'value', value: string|boolean }> }|null} settings
+   */
+  importSettings(settings) {
+    if (!settings) return;
+    const selectedPages = Array.isArray(settings.selectedPages) ? settings.selectedPages : null;
+    if (selectedPages) {
+      this.onPageSelectionChange([...selectedPages]);
+    }
+    this._applyNamedFormControls(settings.formControls);
   }
 
   // ===========================================================================
@@ -366,6 +456,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * @private
    */
   async _rerenderAfterOptionChange(revision) {
+    if (this._isDestroyed) return;
     if (revision !== this._optionRenderRevision) return;
 
     const result = this._lastResult;
@@ -380,6 +471,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     if (this._modal?._plotContainer) {
       try {
         await loadPlotly();
+        if (this._isDestroyed) return;
         if (revision !== this._optionRenderRevision) return;
         await renderOrUpdatePlot({
           plotDef,
@@ -409,6 +501,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     if (previewContainer) {
       try {
         await loadPlotly();
+        if (this._isDestroyed) return;
         if (revision !== this._optionRenderRevision) return;
         await renderOrUpdatePlot({
           plotDef,
@@ -590,6 +683,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * Run the analysis with loading state management
    */
   async _runAnalysis() {
+    if (this._isDestroyed) return;
     // Get form values
     const formValues = this._getFormValues();
 
@@ -613,6 +707,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       });
 
       if (result) {
+        if (this._isDestroyed) return;
         // Store result
         this._lastResult = result;
 
@@ -664,6 +759,17 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * @override
    */
   destroy() {
+    this._isDestroyed = true;
+    // Purge any preview plot to release Plotly/WebGL resources before DOM removal.
+    try {
+      const plotEl = this._plotContainerId
+        ? document.getElementById(this._plotContainerId)
+        : this._container?.querySelector?.('.analysis-preview-plot');
+      if (plotEl) purgePlot(plotEl);
+    } catch (_err) {
+      // Ignore purge errors during teardown
+    }
+
     // Close modal if open
     if (this._modal) {
       closeModal(this._modal);

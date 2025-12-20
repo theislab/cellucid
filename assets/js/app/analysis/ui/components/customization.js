@@ -10,6 +10,8 @@
  * - Combined customization panel
  */
 
+import { StyleManager } from '../../../../utils/style-manager.js';
+
 // =============================================================================
 // COLOR PALETTES
 // =============================================================================
@@ -176,7 +178,7 @@ export function createColorPaletteSelector(options = {}) {
     palette.colors.slice(0, 6).forEach(color => {
       const swatch = document.createElement('span');
       swatch.className = 'palette-swatch';
-      swatch.style.backgroundColor = color;
+      StyleManager.setVariable(swatch, '--palette-swatch-color', color);
       swatches.appendChild(swatch);
     });
     selectedDisplay.appendChild(swatches);
@@ -213,7 +215,7 @@ export function createColorPaletteSelector(options = {}) {
       palette.colors.slice(0, 8).forEach(color => {
         const swatch = document.createElement('span');
         swatch.className = 'palette-swatch';
-        swatch.style.backgroundColor = color;
+        StyleManager.setVariable(swatch, '--palette-swatch-color', color);
         swatches.appendChild(swatch);
       });
       item.appendChild(swatches);

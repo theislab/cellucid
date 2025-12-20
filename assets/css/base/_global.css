@@ -1,0 +1,84 @@
+/* ========================================================================
+   Global layout & base styles
+   ===================================================================== */
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--color-surface-primary);
+  font-family: var(--font-sans);
+  color: var(--color-text-primary);
+}
+
+/* Viewer background modes (controlled by JS via data attribute). */
+body[data-viewer-background="grid"] { background: var(--viewer-bg-grid); }
+body[data-viewer-background="grid-dark"] { background: var(--viewer-bg-grid-dark); }
+body[data-viewer-background="black"] { background: var(--black); }
+body[data-viewer-background="white"] { background: var(--white); }
+
+body.dock-dragging,
+body.dock-dragging * {
+  user-select: none !important;
+}
+
+body.dock-resizing,
+body.dock-resizing * {
+  user-select: none !important;
+}
+
+/* No-script fallback */
+.noscript-message {
+  padding: var(--space-10);
+  max-width: 800px;
+  margin: 0 auto;
+  font-family: var(--font-sans);
+  color: var(--color-text-primary);
+}
+
+/* Canvas (scene) */
+#glcanvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: grab;
+}
+
+#glcanvas.dragging {
+  cursor: grabbing;
+}
+
+#glcanvas.free-nav {
+  cursor: crosshair;
+}
+
+/* ========================================================================
+   Small global utilities
+   ===================================================================== */
+
+/* Filter base text (also used when no filters) */
+.filter-info {
+  font-size: var(--text-xs);
+  color: var(--color-text-secondary);
+  margin-top: var(--space-0-5);
+}
+
+/* Background renderer status text */
+#stats {
+  font-size: var(--text-sm);
+  opacity: var(--opacity-80);
+  margin-top: var(--space-1);
+  display: none;
+}
+
+/* Volumetric smoke rebuild button base (visual already overridden) */
+#smoke-rebuild-btn {
+  margin-top: var(--space-1);
+  font-size: var(--text-sm);
+}
+
+/* Default legend group spacing (already overridden higher) */
+.legend-group {
+  margin-top: var(--space-1);
+}

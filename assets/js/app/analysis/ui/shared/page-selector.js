@@ -27,6 +27,7 @@
 
 import { getPageColor } from '../../core/plugin-contract.js';
 import { formatCount } from '../../shared/dom-utils.js';
+import { StyleManager } from '../../../../utils/style-manager.js';
 
 /**
  * PageSelectorComponent Class
@@ -153,7 +154,7 @@ export class PageSelectorComponent {
     // Color swatch
     const colorIndicator = document.createElement('span');
     colorIndicator.className = 'analysis-page-color';
-    colorIndicator.style.backgroundColor = currentColor;
+    StyleManager.setVariable(colorIndicator, '--analysis-page-color', currentColor);
 
     if (this.showColorPicker) {
       colorIndicator.title = 'Click to change color';
@@ -168,7 +169,7 @@ export class PageSelectorComponent {
       colorInput.addEventListener('input', (e) => {
         const newColor = e.target.value;
         this._customColors.set(page.id, newColor);
-        colorIndicator.style.backgroundColor = newColor;
+        StyleManager.setVariable(colorIndicator, '--analysis-page-color', newColor);
         if (this.onColorChange) {
           this.onColorChange(page.id, newColor);
         }

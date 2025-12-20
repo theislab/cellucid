@@ -1,0 +1,62 @@
+/* themes/_light.css
+   Default theme: matches current UI appearance.
+*/
+
+:root,
+[data-theme="light"] {
+  color-scheme: light;
+
+  /* Surface colors (backgrounds). */
+  --color-surface-primary: var(--white);
+  --color-surface-secondary: var(--gray-50);
+  --color-surface-tertiary: var(--gray-100);
+  --color-surface-elevated: var(--white);
+  --color-surface-sunken: var(--gray-100);
+  --color-surface-overlay: rgba(var(--shadow-rgb), var(--opacity-50));
+  --color-surface-inverse: var(--gray-900);
+
+  /* Text colors. */
+  --color-text-primary: var(--gray-900);
+  --color-text-secondary: var(--gray-600);
+  --color-text-tertiary: var(--gray-400);
+  --color-text-inverse: var(--white);
+  --color-text-disabled: var(--gray-300);
+  --color-text-link: var(--cyan-600);
+  --color-text-link-hover: var(--cyan-700);
+
+  /* Border colors. */
+  --color-border-strong: var(--gray-900);
+  --color-border-default: var(--gray-300);
+  --color-border-light: var(--gray-200);
+  --color-border-focus: var(--cyan-500);
+  --color-border-error: var(--red-500);
+
+  /* Interactive colors. */
+  --color-interactive-primary: var(--gray-900);
+  --color-interactive-primary-hover: var(--gray-700);
+  --color-interactive-primary-active: var(--gray-800);
+  --color-interactive-secondary: var(--gray-100);
+  --color-interactive-secondary-hover: var(--gray-200);
+  --color-interactive-secondary-active: var(--gray-300);
+
+  /* Accent colors. */
+  --color-accent: var(--cyan-400);
+  --color-accent-strong: var(--cyan-500);
+  --color-accent-soft: var(--cyan-50);
+  --color-accent-text: var(--cyan-700);
+
+  /* Status colors. */
+  --color-success: var(--green-600);
+  --color-success-soft: var(--green-50);
+  --color-success-text: var(--green-700);
+  --color-warning: var(--yellow-500);
+  --color-warning-soft: var(--yellow-50);
+  --color-warning-text: var(--yellow-700);
+  --color-danger: var(--red-600);
+  --color-danger-soft: var(--red-50);
+  --color-danger-text: var(--red-700);
+  --color-danger-dark: var(--red-950);
+  --color-info: var(--blue-500);
+  --color-info-soft: var(--blue-50);
+  --color-info-text: var(--blue-700);
+}

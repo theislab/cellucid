@@ -69,7 +69,6 @@ export {
   createVariableSelector,
   createGeneExpressionSelector,
   createPageSelector,
-  createPageMultiSelect,
   createPlotTypeSelector
 } from './components/selectors.js';
 

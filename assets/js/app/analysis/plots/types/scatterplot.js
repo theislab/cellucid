@@ -12,6 +12,8 @@
 import { PlotRegistry, BasePlot, COMMON_HOVER_STYLE, createMinimalPlotly, getPlotlyConfig } from '../plot-factory.js';
 import { getScatterTraceType } from '../plotly-loader.js';
 import { getFiniteMinMax, isFiniteNumber, mean } from '../../shared/number-utils.js';
+import { applyLegendPosition } from '../../shared/legend-utils.js';
+import { getPlotTheme } from '../../shared/plot-theme.js';
 
 const scatterPlotDefinition = {
   id: 'scatterplot',
@@ -106,6 +108,7 @@ const scatterPlotDefinition = {
     const pageResults = Array.isArray(correlationData) ? correlationData : [correlationData];
 
     if (pageResults.length === 0 || !pageResults[0].xValues) {
+      const theme = getPlotTheme();
       // Show empty state
       const layout = BasePlot.createLayout({ showLegend: false });
       layout.annotations = [{
@@ -115,7 +118,7 @@ const scatterPlotDefinition = {
         xref: 'paper',
         yref: 'paper',
         showarrow: false,
-        font: { size: 14, color: '#6b7280' }
+        font: { size: 14, color: theme.textMuted }
       }];
       const Plotly = await createMinimalPlotly();
       return Plotly.newPlot(container, [], layout, getPlotlyConfig());
@@ -123,6 +126,7 @@ const scatterPlotDefinition = {
 
     const traces = [];
     const annotations = [];
+    const theme = getPlotTheme();
 
     // Determine if we should show density instead of points
     const totalPoints = pageResults.reduce((sum, pr) => sum + (pr.xValues?.length || 0), 0);
@@ -274,7 +278,7 @@ const scatterPlotDefinition = {
           text: `<b>${pageResult.pageName}</b><br>` +
                 `R² = ${rSquared.toFixed(3)}${significance}<br>` +
                 `r = ${pageResult.r.toFixed(3)}<br>` +
-                `n = ${validPairs.length}`,
+                `n = ${xData.length}`,
           x: 0.02,
           y: 0.98 - i * 0.15,
           xref: 'paper',
@@ -283,11 +287,11 @@ const scatterPlotDefinition = {
           yanchor: 'top',
           showarrow: false,
           font: {
-            family: 'Inter, system-ui, sans-serif',
+            family: theme.fontFamily,
             size: 10,
             color: color
           },
-          bgcolor: 'rgba(255, 255, 255, 0.9)',
+          bgcolor: theme.legend.bg,
           borderpad: 4,
           bordercolor: color,
           borderwidth: 1
@@ -307,25 +311,25 @@ const scatterPlotDefinition = {
     layout.xaxis = {
       title: {
         text: xVariable,
-        font: { family: 'Oswald, system-ui, sans-serif', size: 12, color: '#374151' }
+        font: { family: 'Oswald, system-ui, sans-serif', size: 12, color: theme.text }
       },
       type: logScaleX ? 'log' : 'linear',
       showgrid: showGrid,
-      gridcolor: '#f3f4f6',
+      gridcolor: theme.grid,
       zeroline: false,
-      tickfont: { size: 10, color: '#6b7280' }
+      tickfont: { size: 10, color: theme.textMuted }
     };
 
     layout.yaxis = {
       title: {
         text: yVariable,
-        font: { family: 'Oswald, system-ui, sans-serif', size: 12, color: '#374151' }
+        font: { family: 'Oswald, system-ui, sans-serif', size: 12, color: theme.text }
       },
       type: logScaleY ? 'log' : 'linear',
       showgrid: showGrid,
-      gridcolor: '#f3f4f6',
+      gridcolor: theme.grid,
       zeroline: false,
-      tickfont: { size: 10, color: '#6b7280' }
+      tickfont: { size: 10, color: theme.textMuted }
     };
 
     layout.annotations = annotations;
@@ -335,13 +339,14 @@ const scatterPlotDefinition = {
       y: 1,
       xanchor: 'right',
       yanchor: 'top',
-      bgcolor: 'rgba(255, 255, 255, 0.8)',
-      bordercolor: '#e5e7eb',
+      bgcolor: theme.legend.bg,
+      bordercolor: theme.legend.border,
       borderwidth: 1,
       font: { size: 10 }
     };
 
     layout.margin = { l: 60, r: 20, t: 30, b: 50 };
+    applyLegendPosition(layout, options.legendPosition);
 
     // Render with Plotly
     const config = getPlotlyConfig();

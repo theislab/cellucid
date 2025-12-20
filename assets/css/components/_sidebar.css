@@ -1,0 +1,473 @@
+/* ========================================================================
+   Sidebar – newspaper-inspired, but with pure white background
+   ===================================================================== */
+
+
+/* Sidebar container: fixed paper column */
+#sidebar {
+  position: fixed;
+  top: var(--space-2-5);
+  left: var(--space-2-5);
+  bottom: var(--space-2-5);
+  width: var(--sidebar-width);
+  box-sizing: border-box;
+  border: var(--border-strong);
+  border-radius: 0;
+  box-shadow: var(--shadow-md);
+  font-size: var(--text-lg);
+  z-index: var(--z-sidebar);
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - var(--space-5));
+  transition: transform var(--duration-normal) var(--easing-standard),
+    opacity var(--duration-normal) var(--easing-standard);
+  /* Isolate layout calculations for better drag performance */
+  contain: layout style;
+}
+
+.sidebar-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  background-color: var(--color-surface-elevated);
+  /* Subtle horizontal rules to suggest paper */
+  background-image: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--color-border-strong) 4%, transparent) 1px,
+    transparent 1px
+  );
+  background-size: 100% 26px;
+  padding: var(--space-3-5) var(--space-4) var(--space-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  overflow-x: hidden;
+  overflow-y: auto;
+  /* Contain layout for smooth accordion drag/undock */
+  contain: layout;
+}
+
+#sidebar.hidden {
+  transform: translateX(calc(-1 * (var(--sidebar-width) + var(--space-5))));
+  opacity: 0;
+  pointer-events: none;
+}
+
+#sidebar.hidden #sidebar-resize-handle {
+  display: none;
+}
+
+#sidebar.resizing {
+  transition: none;
+  user-select: none;
+}
+
+/* Sidebar toggle tab */
+#sidebar-toggle {
+  position: fixed;
+  top: var(--space-2-5);
+  left: var(--space-2-5);
+  width: 38px;
+  height: 34px;
+  background: var(--color-surface-elevated);
+  border: var(--border-strong);
+  border-radius: 0 var(--radius-full) var(--radius-full) 0;
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+  z-index: var(--z-sidebar);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  color: var(--color-text-primary);
+  transition: left var(--duration-normal) var(--easing-standard),
+    background-color var(--duration-fast) var(--easing-standard),
+    box-shadow var(--duration-fast) var(--easing-standard),
+    transform var(--duration-fast) var(--easing-standard);
+}
+
+#sidebar-toggle:hover {
+  background: var(--color-surface-tertiary);
+  transform: translateY(1px);
+  box-shadow: var(--shadow-xs);
+}
+
+#sidebar-toggle.sidebar-open {
+  left: calc(var(--space-2-5) + var(--sidebar-width));
+}
+
+/* Sidebar resize handle */
+#sidebar-resize-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: calc(-1 * var(--space-4));
+  width: var(--space-4);
+  cursor: ew-resize;
+  z-index: 40;
+  touch-action: none;
+}
+
+#sidebar-resize-handle::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: var(--space-1);
+  height: var(--space-10);
+  background: color-mix(in srgb, var(--color-border-strong) 15%, transparent);
+  border-radius: var(--radius-sm);
+  transition: background-color var(--duration-fast) var(--easing-standard);
+}
+
+#sidebar-resize-handle:hover::after,
+#sidebar.resizing #sidebar-resize-handle::after {
+  background: color-mix(in srgb, var(--color-border-strong) 35%, transparent);
+}
+
+/* Masthead style for the logo */
+.sidebar-brand {
+  margin: 0 0 6px;
+  border-bottom: var(--border-default);
+  background: var(--color-surface-elevated);
+}
+
+.sidebar-brand-link {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  padding: var(--space-1) var(--space-1-5) var(--space-2);
+  text-decoration: none;
+}
+
+.sidebar-brand-link:hover {
+  background: var(--color-surface-tertiary);
+}
+
+.sidebar-brand-link:active {
+  background: var(--color-border-light);
+}
+
+.sidebar-brand-link:focus-visible {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 2px;
+}
+
+.sidebar-logo {
+  width: 100%;
+  max-width: 220px;
+  height: auto;
+  display: block;
+}
+
+/* Typography inside sidebar */
+#sidebar h1 {
+  font-size: var(--text-2xl);
+  margin: 0 0 var(--space-1-5);
+  letter-spacing: 0.3px;
+}
+
+/* Labels = mini newspaper sub-headings */
+#sidebar label,
+.accordion-section.accordion-floating label {
+  display: inline-block;
+  font-family: var(--font-display);
+  font-weight: var(--font-weight-medium);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--color-text-secondary);
+}
+
+/* Inline checkbox label utility (for centroid / smoke) */
+.checkbox-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  margin-top: var(--space-1);
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
+}
+
+/* Simple field layout */
+.field-select {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1-5);
+}
+
+.field-select + .field-select {
+  margin-top: var(--space-1-5);
+}
+
+.field-select select,
+.field-select .searchable-dropdown,
+.field-select .obs-select {
+  margin-top: 0;
+}
+
+/* Selects – same paper box style everywhere */
+.obs-select,
+#background-select {
+  width: 100%;
+  margin-top: var(--space-1);
+  padding: calc(var(--space-1) + var(--space-px)) var(--space-2);
+  font-size: var(--text-sm);
+  border-radius: 0;
+  border: var(--border-strong);
+  background-color: var(--color-surface-elevated);
+  color: var(--color-text-primary);
+  box-shadow: var(--shadow-sm);
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%),
+                    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position: calc(100% - 14px) 9px, calc(100% - 10px) 9px;
+  background-size: 4px 4px, 4px 4px;
+  background-repeat: no-repeat;
+}
+
+.obs-select:focus,
+#background-select:focus {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 1px;
+  box-shadow: var(--shadow-md);
+}
+
+/* ========================================================================
+   Split-view HUD (small multiples) in sidebar
+   ===================================================================== */
+
+#split-view-controls {
+  margin-top: var(--space-2);
+}
+
+.split-view-badges-box {
+  margin-top: var(--space-2);
+  padding: var(--space-2) var(--space-2-5);
+  border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 18%, transparent);
+  background: var(--color-surface-secondary);
+  border-radius: 0;
+  box-shadow: var(--shadow-sm);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.split-view-intro {
+  margin: calc(-1 * var(--space-0-5)) 0 var(--space-2-5);
+}
+
+.split-view-section-title {
+  margin-bottom: var(--space-1-5);
+}
+
+.split-view-row {
+  display: flex;
+  gap: var(--space-2);
+  margin: var(--space-1-5) 0;
+}
+
+.camera-lock-btn {
+  text-align: center;
+  padding: var(--space-1) var(--space-3);
+}
+
+.split-view-badges {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  max-height: 200px;
+  overflow-y: auto;
+  padding: 0;
+  border: none;
+  background: transparent;
+  box-shadow: none;
+}
+
+.split-view-box-title {
+  margin: 8px 0 6px;
+}
+
+.split-view-actions {
+  justify-content: space-between;
+  align-items: center;
+  padding-top: 0;
+}
+
+.view-layout-select,
+#view-layout-mode {
+  width: 100px;
+}
+
+/* JS-controlled panels that should be hidden by default. */
+#lod-force-container,
+#dimension-controls,
+#connectivity-controls,
+#connectivity-sliders,
+#planar-controls,
+#freefly-controls {
+  display: none;
+}
+
+.split-badge {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: calc(var(--space-0-5) + var(--space-px)) var(--space-1-5);
+  border-radius: var(--radius-md);
+  font-size: var(--text-xs);
+  background: var(--color-border-light);
+  border: var(--border-width-1) solid var(--color-border-default);
+  cursor: pointer;
+  transition: var(--transition-colors);
+}
+
+.split-badge-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.split-badge-pill {
+  font-family: var(--font-display);
+  font-size: var(--text-2xs);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wider);
+  padding: var(--space-px) var(--space-1-5);
+  border-radius: var(--radius-full);
+  border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 50%, transparent);
+  background: var(--color-surface-secondary);
+}
+
+.split-badge-remove {
+  background: transparent;
+  border-radius: var(--radius-full);
+  border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 35%, transparent);
+  cursor: pointer;
+  font-size: var(--text-sm);
+  line-height: 1;
+  padding: 0 var(--space-1);
+  margin-left: var(--space-3);
+}
+
+.split-badge-remove:hover {
+  background: var(--color-danger-dark);
+  color: var(--color-text-inverse);
+  border-color: var(--color-danger-dark);
+}
+
+.split-badge.active {
+  background: var(--color-interactive-primary);
+  color: var(--color-text-inverse);
+  border-color: var(--color-interactive-primary);
+}
+
+.split-badge.active .split-badge-pill {
+  background: var(--color-interactive-primary);
+  color: var(--color-text-inverse);
+  border-color: var(--color-interactive-primary);
+}
+
+.split-badge.active .split-badge-remove {
+  border-color: color-mix(in srgb, var(--color-text-inverse) 60%, transparent);
+  color: var(--color-text-inverse);
+}
+
+.split-badge.active-camera {
+  box-shadow: 0 0 0 2px var(--color-border-focus);
+}
+
+/* Camera indicator - separate element outside the pill */
+.split-badge-camera {
+  font-size: var(--text-xs);
+  opacity: 0;
+  margin-left: calc(-1 * var(--space-0-5));
+}
+
+.split-badge.active-camera .split-badge-camera {
+  opacity: 1;
+}
+
+/* Dimension indicator on view badges */
+.split-badge-dim {
+  font-family: inherit;
+  font-size: var(--text-2xs);
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  padding: var(--space-px) 5px;
+  margin-left: 0;
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: color-mix(in srgb, var(--color-border-strong) 55%, transparent);
+  border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 25%, transparent);
+  cursor: pointer;
+  transition: var(--transition-colors);
+  flex-shrink: 0;
+}
+
+.split-badge-dim:hover {
+  background: color-mix(in srgb, var(--color-border-strong) 6%, transparent);
+  color: color-mix(in srgb, var(--color-border-strong) 75%, transparent);
+  border-color: color-mix(in srgb, var(--color-border-strong) 40%, transparent);
+}
+
+.split-badge-dim:active {
+  background: color-mix(in srgb, var(--color-border-strong) 10%, transparent);
+}
+
+.split-badge.active .split-badge-dim {
+  background: transparent;
+  color: color-mix(in srgb, var(--color-text-inverse) 60%, transparent);
+  border-color: color-mix(in srgb, var(--color-text-inverse) 35%, transparent);
+}
+
+.split-badge.active .split-badge-dim:hover {
+  background: color-mix(in srgb, var(--color-text-inverse) 8%, transparent);
+  color: color-mix(in srgb, var(--color-text-inverse) 85%, transparent);
+  border-color: color-mix(in srgb, var(--color-text-inverse) 50%, transparent);
+}
+
+/* Navigation mode indicator on view badges (only shown when cameras unlocked) */
+.split-badge-nav {
+  font-family: inherit;
+  font-size: var(--text-2xs);
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  padding: var(--space-px) 5px;
+  margin-left: 0;
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: color-mix(in srgb, var(--color-border-strong) 55%, transparent);
+  border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 25%, transparent);
+  cursor: pointer;
+  transition: var(--transition-colors);
+  flex-shrink: 0;
+}
+
+.split-badge-nav:hover {
+  background: color-mix(in srgb, var(--color-border-strong) 6%, transparent);
+  color: color-mix(in srgb, var(--color-border-strong) 75%, transparent);
+  border-color: color-mix(in srgb, var(--color-border-strong) 40%, transparent);
+}
+
+.split-badge-nav:active {
+  background: color-mix(in srgb, var(--color-border-strong) 10%, transparent);
+}
+
+.split-badge.active .split-badge-nav {
+  background: transparent;
+  color: color-mix(in srgb, var(--color-text-inverse) 60%, transparent);
+  border-color: color-mix(in srgb, var(--color-text-inverse) 35%, transparent);
+}
+
+.split-badge.active .split-badge-nav:hover {
+  background: color-mix(in srgb, var(--color-text-inverse) 8%, transparent);
+  color: color-mix(in srgb, var(--color-text-inverse) 85%, transparent);
+  border-color: color-mix(in srgb, var(--color-text-inverse) 50%, transparent);
+}

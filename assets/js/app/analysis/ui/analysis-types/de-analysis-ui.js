@@ -56,8 +56,24 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
   constructor(options) {
     super(options);
 
+    this._plotContainerIdBase = this._instanceId ? `${this._instanceId}-de-analysis-plot` : 'de-analysis-plot';
+
     // Track which two pages are selected for comparison
     this._comparisonPages = [];
+
+    /**
+     * Modal-only UI state: how many DE genes to show in the annotations table.
+     * @type {'top10'|'all'}
+     * @private
+     */
+    this._modalGeneListMode = 'top10';
+
+    /**
+     * Incremented per modal-annotations render to cancel async chunk rendering.
+     * @type {number}
+     * @private
+     */
+    this._modalAnnotationsRenderRevision = 0;
 
     // Bind handlers
     this._handleComparisonChange = this._handleComparisonChange.bind(this);
@@ -324,8 +340,8 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
 
     const plotContainer = document.createElement('div');
     plotContainer.className = 'analysis-preview-plot';
-    plotContainer.id = 'de-analysis-plot';
-    this._plotContainerId = 'de-analysis-plot';
+    plotContainer.id = this._plotContainerIdBase;
+    this._plotContainerId = this._plotContainerIdBase;
     previewContainer.appendChild(plotContainer);
 
     // Render volcano plot
@@ -437,11 +453,16 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       return;
     }
 
+    const renderRevision = ++this._modalAnnotationsRenderRevision;
+
     const {
       pValueThreshold = 0.05,
       foldChangeThreshold = 1.0,
       useAdjustedPValue = true
     } = options;
+
+    const geneListMode = this._modalGeneListMode || 'top10';
+    const maxRows = geneListMode === 'all' ? Infinity : 10;
 
     const getPValue = (row) => {
       if (!row) return null;
@@ -459,13 +480,18 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       return Math.abs(fc) >= foldChangeThreshold;
     };
 
-    // Get top 10 significant genes (based on active plot thresholds)
-    const topGenes = results
-      .filter(passesThresholds)
-      .sort((a, b) => Math.abs(b.log2FoldChange) - Math.abs(a.log2FoldChange))
-      .slice(0, 10);
+    /** @type {Array<any>} */
+    const significantGenes = [];
+    for (const row of results) {
+      if (passesThresholds(row)) {
+        significantGenes.push(row);
+      }
+    }
 
-    if (topGenes.length === 0) {
+    significantGenes.sort((a, b) => Math.abs(b.log2FoldChange) - Math.abs(a.log2FoldChange));
+    const genesToShow = Number.isFinite(maxRows) ? significantGenes.slice(0, maxRows) : significantGenes;
+
+    if (genesToShow.length === 0) {
       container.innerHTML = `
         <p class="modal-annotations-placeholder">
           No genes passed the current thresholds (p &lt; ${pValueThreshold}, |log2FC| ≥ ${foldChangeThreshold}).
@@ -474,32 +500,107 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       return;
     }
 
-    container.innerHTML = `
-      <h5>Top Differentially Expressed Genes</h5>
-      <table class="de-genes-table modal-de-genes">
-        <thead>
-          <tr>
-            <th>Gene</th>
-            <th>Log2 FC</th>
-            <th>${useAdjustedPValue ? 'Adj. P-value' : 'P-value'}</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${topGenes.map(g => `
-            <tr class="${g.log2FoldChange > 0 ? 'up' : 'down'}">
-              <td class="gene-name">${g.gene}</td>
-              <td>${g.log2FoldChange.toFixed(3)}</td>
-              <td>${(() => {
-                const p = getPValue(g);
-                if (p === null) return 'N/A';
-                if (p < 0.001) return '<0.001';
-                return p.toFixed(4);
-              })()}</td>
-            </tr>
-          `).join('')}
-        </tbody>
-      </table>
+    container.innerHTML = '';
+
+    const headerRow = document.createElement('div');
+    headerRow.className = 'de-modal-genes-header';
+
+    const title = document.createElement('h5');
+    title.textContent = 'Top Differentially Expressed Genes';
+    headerRow.appendChild(title);
+
+    const select = document.createElement('select');
+    select.className = 'obs-select';
+    select.innerHTML = `
+      <option value="top10">Top 10</option>
+      <option value="all">All</option>
     `;
+    select.value = geneListMode;
+    select.addEventListener('change', () => {
+      this._modalGeneListMode = select.value === 'all' ? 'all' : 'top10';
+      this._renderModalAnnotations(container);
+    });
+    headerRow.appendChild(select);
+
+    container.appendChild(headerRow);
+
+    const table = document.createElement('table');
+    table.className = 'de-genes-table modal-de-genes';
+
+    const thead = document.createElement('thead');
+    const headRow = document.createElement('tr');
+    const thGene = document.createElement('th');
+    thGene.textContent = 'Gene';
+    const thFc = document.createElement('th');
+    thFc.textContent = 'Log2 FC';
+    const thP = document.createElement('th');
+    thP.textContent = useAdjustedPValue ? 'Adj. P-value' : 'P-value';
+    headRow.appendChild(thGene);
+    headRow.appendChild(thFc);
+    headRow.appendChild(thP);
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+
+    const tbody = document.createElement('tbody');
+    table.appendChild(tbody);
+    container.appendChild(table);
+
+    const formatPValueCell = (p) => {
+      if (p === null) return 'N/A';
+      if (p < 0.001) return '<0.001';
+      return p.toFixed(4);
+    };
+
+    const createRowEl = (row) => {
+      const tr = document.createElement('tr');
+      tr.className = row?.log2FoldChange > 0 ? 'up' : 'down';
+
+      const tdGene = document.createElement('td');
+      tdGene.className = 'gene-name';
+      tdGene.textContent = String(row?.gene ?? '');
+      tr.appendChild(tdGene);
+
+      const tdFc = document.createElement('td');
+      tdFc.textContent = isFiniteNumber(row?.log2FoldChange) ? row.log2FoldChange.toFixed(3) : 'N/A';
+      tr.appendChild(tdFc);
+
+      const tdP = document.createElement('td');
+      tdP.textContent = formatPValueCell(getPValue(row));
+      tr.appendChild(tdP);
+
+      return tr;
+    };
+
+    const shouldChunkRender = geneListMode === 'all' && genesToShow.length > 500;
+    if (!shouldChunkRender) {
+      for (const row of genesToShow) {
+        tbody.appendChild(createRowEl(row));
+      }
+      return;
+    }
+
+    const CHUNK = 250;
+    let cursor = 0;
+
+    const renderChunk = () => {
+      if (renderRevision !== this._modalAnnotationsRenderRevision) return;
+
+      const end = Math.min(genesToShow.length, cursor + CHUNK);
+      const frag = document.createDocumentFragment();
+
+      for (let i = cursor; i < end; i++) {
+        frag.appendChild(createRowEl(genesToShow[i]));
+      }
+
+      tbody.appendChild(frag);
+      cursor = end;
+
+      if (cursor < genesToShow.length) {
+        setTimeout(renderChunk, 0);
+      }
+    };
+
+    renderChunk();
   }
 
   /**
@@ -517,7 +618,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
    * Export plot as PNG
    */
   async _exportPlotPNG() {
-    const plotEl = document.getElementById('de-analysis-plot');
+    const plotEl = this._plotContainerId ? document.getElementById(this._plotContainerId) : null;
     if (!plotEl) return;
 
     await this._exportPNG(plotEl, {
@@ -535,6 +636,26 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
 
     const csv = deResultsToCSV(this._lastResult.data.results);
     downloadCSV(csv, 'differential_expression', this._notifications);
+  }
+
+  exportSettings() {
+    const base = super.exportSettings();
+    return {
+      ...base,
+      comparisonPages: [...this._comparisonPages],
+      modalGeneListMode: this._modalGeneListMode
+    };
+  }
+
+  importSettings(settings) {
+    if (!settings) return;
+    if (Array.isArray(settings.comparisonPages)) {
+      this._comparisonPages = settings.comparisonPages.slice(0, 2);
+    }
+    if (settings.modalGeneListMode === 'all' || settings.modalGeneListMode === 'top10') {
+      this._modalGeneListMode = settings.modalGeneListMode;
+    }
+    super.importSettings(settings);
   }
 }
 

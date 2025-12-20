@@ -73,6 +73,15 @@
  */
 
 import { attachPlotlyHints, detachPlotlyHints, hidePlotlyNativeHints } from './plotly-hints.js';
+import { applyThemeToAllPlots, getPlotTheme, invalidatePlotThemeCache } from '../shared/plot-theme.js';
+
+// Keep Plotly charts in sync with the active CSS theme.
+if (typeof window !== 'undefined') {
+  window.addEventListener('cellucid:theme-change', () => {
+    invalidatePlotThemeCache();
+    void applyThemeToAllPlots();
+  });
+}
 
 let plotlyLoadPromise = null;
 let plotlyLoaded = false;
@@ -382,12 +391,13 @@ export async function downloadImage(container, options) {
  * @returns {Object}
  */
 export function getPlotlyConfig() {
+  const theme = getPlotTheme();
   return {
     displayModeBar: true, // CSS handles hover visibility
     displaylogo: false,
     responsive: true,
     modeBarBackgroundColor: 'transparent',
-    modeBarColor: '#9ca3af',
+    modeBarColor: theme.modeBarColor,
     modeBarButtonsToRemove: [
       'sendDataToCloud',
       'lasso2d',
@@ -414,15 +424,16 @@ export function getPlotlyConfig() {
  * @returns {Object}
  */
 export function getPlotlyLayout(options = {}) {
+  const theme = getPlotTheme();
   return {
     autosize: true,
     margin: { l: 50, r: 20, t: 30, b: 50 },
     paper_bgcolor: 'transparent',
-    plot_bgcolor: '#ffffff',
+    plot_bgcolor: theme.plotBg,
     font: {
-      family: 'Inter, system-ui, -apple-system, sans-serif',
-      size: 11,
-      color: '#374151'
+      family: theme.fontFamily,
+      size: theme.fontSize,
+      color: theme.text
     },
     showlegend: true,
     legend: {
@@ -431,32 +442,32 @@ export function getPlotlyLayout(options = {}) {
       y: 1.02,
       xanchor: 'center',
       x: 0.5,
-      font: { size: 10, color: '#374151' },
+      font: { size: theme.legendFontSize, color: theme.text },
       bgcolor: 'transparent',
       borderwidth: 0
     },
     xaxis: {
-      gridcolor: 'rgba(0,0,0,0.06)',
+      gridcolor: theme.grid,
       gridwidth: 1,
-      linecolor: '#e5e7eb',
+      linecolor: theme.axisLine,
       linewidth: 1,
-      tickfont: { size: 10, color: '#6b7280' },
-      title: { font: { size: 11, color: '#374151' } },
+      tickfont: { size: theme.tickFontSize, color: theme.textMuted },
+      title: { font: { size: theme.titleFontSize, color: theme.text } },
       zeroline: false
     },
     yaxis: {
-      gridcolor: 'rgba(0,0,0,0.06)',
+      gridcolor: theme.grid,
       gridwidth: 1,
-      linecolor: '#e5e7eb',
+      linecolor: theme.axisLine,
       linewidth: 1,
-      tickfont: { size: 10, color: '#6b7280' },
-      title: { font: { size: 11, color: '#374151' } },
+      tickfont: { size: theme.tickFontSize, color: theme.textMuted },
+      title: { font: { size: theme.titleFontSize, color: theme.text } },
       zeroline: false
     },
     hoverlabel: {
-      bgcolor: '#111827',
-      bordercolor: '#111827',
-      font: { family: 'Inter, system-ui, sans-serif', size: 11, color: '#ffffff' }
+      bgcolor: theme.hover.bg,
+      bordercolor: theme.hover.border,
+      font: { family: theme.fontFamily, size: theme.fontSize, color: theme.hover.text }
     },
     ...options
   };

@@ -1,0 +1,23 @@
+/* tokens/_shadows.css
+   Standardized elevation presets.
+*/
+
+:root {
+  /* Base RGB tuple used by shadow presets; themes may override. */
+  --shadow-rgb: 0, 0, 0;
+
+  /* Paper / offset shadows (signature look). */
+  --shadow-none: none;
+  --shadow-xs: 1px 1px 0 rgba(var(--shadow-rgb), var(--opacity-8));
+  --shadow-sm: 2px 2px 0 rgba(var(--shadow-rgb), var(--opacity-8));
+  --shadow-md: 4px 4px 0 rgba(var(--shadow-rgb), var(--opacity-8));
+  --shadow-lg: 6px 6px 0 rgba(var(--shadow-rgb), var(--opacity-12));
+  --shadow-xl: 8px 8px 0 rgba(var(--shadow-rgb), var(--opacity-15));
+
+  /* Soft elevation shadows (used for menus/popovers/tooltips). */
+  --shadow-soft-xs: 0 1px 2px rgba(var(--shadow-rgb), var(--opacity-5));
+  --shadow-soft-sm: 0 2px 4px rgba(var(--shadow-rgb), var(--opacity-6));
+  --shadow-soft-md: 0 4px 8px rgba(var(--shadow-rgb), var(--opacity-8));
+  --shadow-soft-lg: 0 8px 16px rgba(var(--shadow-rgb), var(--opacity-10));
+  --shadow-soft-xl: 0 16px 32px rgba(var(--shadow-rgb), var(--opacity-12));
+}

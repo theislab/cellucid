@@ -8,6 +8,7 @@
 
 import { PlotFactory, PlotRegistry, PlotHelpers, BasePlot, COMMON_HOVER_STYLE } from '../plot-factory.js';
 import { getHeatmapTraceType } from '../plotly-loader.js';
+import { getPlotTheme } from '../../shared/plot-theme.js';
 
 const heatmapDefinition = {
   id: 'heatmap',
@@ -15,6 +16,7 @@ const heatmapDefinition = {
   description: 'Matrix view of category distributions',
   supportedDataTypes: ['categorical'],
   supportedLayouts: ['single'],
+  supportsLegend: false,
 
   defaultOptions: { colorscale: 'Blues', showValues: true, normalize: 'row', sortRows: true },
 
@@ -40,6 +42,7 @@ const heatmapDefinition = {
 
   buildTraces(pageData, options) {
     const { colorscale = 'Blues', showValues = true, normalize = 'row', sortRows = true } = options;
+    const theme = getPlotTheme();
 
     // Collect all categories across all pages
     const globalCounts = new Map();
@@ -86,13 +89,13 @@ const heatmapDefinition = {
       type: getHeatmapTraceType(),
       z: matrix, x: pageNames, y: categories, text: textMatrix,
       texttemplate: showValues ? '%{text}' : '',
-      textfont: { family: 'Inter, system-ui, sans-serif', size: 10 },
+      textfont: { family: theme.fontFamily, size: 10 },
       colorscale,
       showscale: true,
       colorbar: {
         thickness: 12, len: 0.8,
-        tickfont: { family: 'Inter, system-ui, sans-serif', size: 9, color: '#6b7280' },
-        title: { text: normalize === 'none' ? 'Count' : '%', font: { family: 'Oswald, system-ui, sans-serif', size: 10, color: '#374151' } }
+        tickfont: { family: theme.fontFamily, size: 9, color: theme.textMuted },
+        title: { text: normalize === 'none' ? 'Count' : '%', font: { family: 'Oswald, system-ui, sans-serif', size: 10, color: theme.text } }
       },
       hovertemplate: '%{y}<br>%{x}: %{z:.1f}<extra></extra>',
       hoverlabel: COMMON_HOVER_STYLE
@@ -100,11 +103,12 @@ const heatmapDefinition = {
   },
 
   buildLayout(pageData, options) {
+    const theme = getPlotTheme();
     const layout = BasePlot.createLayout({ showLegend: false });
     const pageNames = pageData.map(pd => pd.pageName);
 
-    layout.xaxis = { title: '', tickangle: pageNames.length > 4 ? -45 : 0, automargin: true, tickfont: { size: 10, color: '#374151' } };
-    layout.yaxis = { title: '', automargin: true, tickfont: { size: 10, color: '#374151' }, autorange: 'reversed' };
+    layout.xaxis = { title: '', tickangle: pageNames.length > 4 ? -45 : 0, automargin: true, tickfont: { size: 10, color: theme.text } };
+    layout.yaxis = { title: '', automargin: true, tickfont: { size: 10, color: theme.text }, autorange: 'reversed' };
     layout.margin = { l: 100, r: 60, t: 30, b: 60 };
 
     return layout;

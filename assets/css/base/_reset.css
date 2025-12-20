@@ -1,0 +1,27 @@
+/* base/_reset.css
+   Minimal reset kept intentionally small to avoid regressions.
+*/
+
+/* Use consistent sizing math everywhere. */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+/* Make form controls inherit typography by default. */
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+[hidden] {
+  display: none !important;
+}

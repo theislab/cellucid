@@ -1,0 +1,17 @@
+/* main.css - Single entry point for all styles
+   Uses CSS Layers to keep the cascade predictable.
+*/
+
+@layer tokens, themes, base, utilities, components, layouts, overrides;
+
+/* Design system foundation. */
+@import 'tokens/_index.css' layer(tokens);
+@import 'themes/_index.css' layer(themes);
+@import 'base/_index.css' layer(base);
+
+/* Utility classes (composition). */
+@import 'utilities/_index.css' layer(utilities);
+
+/* Component modules. */
+@import 'components/_index.css' layer(components);
+@import 'layouts/_index.css' layer(layouts);

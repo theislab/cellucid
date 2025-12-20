@@ -56,6 +56,9 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
   constructor(options) {
     super(options);
 
+    this._idPrefix = this._instanceId ? `${this._instanceId}-detailed` : 'detailed';
+    this._plotTypeSelectId = this._instanceId ? `${this._instanceId}-analysis-plot-type` : 'analysis-plot-type';
+
     // UI element references (detailed-specific)
     this._variableSelector = null;
     this._pageSelectContainer = null;
@@ -181,7 +184,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
         dataLayer: this.dataLayer,
         container: selectorContainer,
         allowedTypes: ['categorical', 'continuous', 'gene'],
-        idPrefix: 'detailed',
+        idPrefix: this._idPrefix,
         typeLabel: 'Variable:',
         initialSelection: this._currentConfig.dataSource.type ? {
           type: this._currentConfig.dataSource.type,
@@ -192,7 +195,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     } catch (err) {
       console.error('[DetailedAnalysisUI] Failed to load variables:', err);
       variableBlock.innerHTML += `
-        <div class="legend-help" style="color: var(--danger-color, #dc3545)">
+        <div class="legend-help text-danger">
           Some variables could not be loaded.
         </div>
       `;
@@ -236,10 +239,33 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     const plotTypeSelector = createPlotTypeSelector({
       dataType: dataKind,
       selectedId: this._currentConfig.plotType,
-      onChange: this._handlePlotTypeChange
+      onChange: this._handlePlotTypeChange,
+      id: this._plotTypeSelectId
     });
     this._controlsContainer.appendChild(plotTypeSelector);
     this._plotTypeContainer = plotTypeSelector;
+  }
+
+  exportSettings() {
+    const base = super.exportSettings();
+    return {
+      ...base,
+      customPageColors: Array.from(this._customPageColors.entries()),
+      savedPlotOptions: Array.from(this._savedPlotOptions.entries())
+    };
+  }
+
+  importSettings(settings) {
+    if (!settings) return;
+
+    if (Array.isArray(settings.customPageColors)) {
+      this._customPageColors = new Map(settings.customPageColors);
+    }
+    if (Array.isArray(settings.savedPlotOptions)) {
+      this._savedPlotOptions = new Map(settings.savedPlotOptions);
+    }
+
+    super.importSettings(settings);
   }
 
   // ===========================================================================
@@ -349,13 +375,16 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
    * @override
    */
   async _runAnalysis() {
+    if (this._isDestroyed) return;
     this._cleanupPreviousAnalysis();
 
+    if (this._isDestroyed) return;
     this._previewContainer.classList.remove('empty');
     this._previewContainer.classList.add('loading');
 
     try {
       await loadPlotly();
+      if (this._isDestroyed) return;
 
       // Fetch data
       const pageData = await this.dataLayer.getDataForPages({
@@ -364,6 +393,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
         pageIds: this._selectedPages
       });
 
+      if (this._isDestroyed) return;
       if (pageData.length === 0) {
         throw new Error('No data available for selected pages');
       }
@@ -391,6 +421,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
         this._currentConfig.plotOptions
       );
 
+      if (this._isDestroyed) return;
       // Render preview
       this._previewContainer.classList.remove('loading');
       // Purge any existing plot to prevent WebGL memory leaks
@@ -403,6 +434,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       this._previewContainer.appendChild(previewPlotDiv);
 
       await plotType.render(pageData, mergedOptions, previewPlotDiv, this._layoutEngine);
+      if (this._isDestroyed) return;
 
       // Show actions
       this._renderActions();
@@ -420,16 +452,25 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
   }
 
   async _updateModal(plotType, options, pageData) {
-    purgePlot(this._modal._plotContainer);
-    await plotType.render(pageData, options, this._modal._plotContainer, this._layoutEngine);
+    if (this._isDestroyed) return;
+    const modal = this._modal;
+    const plotContainer = modal?._plotContainer;
+    if (!plotContainer) return;
 
-    if (this._modal._footer) {
-      renderSummaryStats(this._modal._footer, pageData, this._currentConfig.dataSource.variable);
+    purgePlot(plotContainer);
+    await plotType.render(pageData, options, plotContainer, this._layoutEngine);
+    if (this._isDestroyed) return;
+
+    const modalAfter = this._modal;
+    if (!modalAfter) return;
+
+    if (modalAfter._footer) {
+      renderSummaryStats(modalAfter._footer, pageData, this._currentConfig.dataSource.variable);
     }
 
-    if (this._modal._annotationsContent) {
+    if (modalAfter._annotationsContent) {
       renderStatisticalAnnotations(
-        this._modal._annotationsContent,
+        modalAfter._annotationsContent,
         pageData,
         this._currentConfig.dataSource.type
       );
@@ -599,6 +640,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
    * @override
    */
   destroy() {
+    this._isDestroyed = true;
     // Clean up variable selector
     this._variableSelector?.destroy?.();
     this._variableSelector = null;

@@ -1,0 +1,36 @@
+/* layouts/_responsive.css
+   Responsive adjustments (fill as needed).
+*/
+
+/* Reduce sidebar footprint on smaller screens. */
+@media (max-width: 900px) {
+  :root {
+    --sidebar-width: 260px;
+  }
+}
+
+/* Mobile layout: pin sidebar to the viewport edges for maximum usable space. */
+@media (max-width: 720px) {
+  :root {
+    --sidebar-width: 100vw;
+    --sidebar-min-width: 100vw;
+    --sidebar-max-width: 100vw;
+  }
+
+  #sidebar {
+    top: 0;
+    left: 0;
+    bottom: 0;
+    max-height: 100vh;
+    border-radius: 0;
+  }
+
+  #sidebar-toggle {
+    top: 0;
+    left: 0;
+  }
+
+  #sidebar-toggle.sidebar-open {
+    left: var(--sidebar-width);
+  }
+}

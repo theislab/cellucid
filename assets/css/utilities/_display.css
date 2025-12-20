@@ -1,0 +1,45 @@
+/* utilities/_display.css
+   Generic display-adjacent utilities (visibility, borders, radius, shadows).
+*/
+
+.visible { visibility: visible !important; }
+.invisible { visibility: hidden !important; }
+
+/* Opacity */
+.opacity-0 { opacity: var(--opacity-0) !important; }
+.opacity-50 { opacity: var(--opacity-50) !important; }
+.opacity-70 { opacity: var(--opacity-70) !important; }
+.opacity-100 { opacity: var(--opacity-100) !important; }
+
+/* Borders */
+.border { border: var(--border-default) !important; }
+.border-0 { border: 0 !important; }
+.border-t { border-top: var(--border-default) !important; }
+.border-r { border-right: var(--border-default) !important; }
+.border-b { border-bottom: var(--border-default) !important; }
+.border-l { border-left: var(--border-default) !important; }
+
+.border-strong { border: var(--border-strong) !important; }
+.border-light { border: var(--border-light) !important; }
+.border-dashed { border-style: dashed !important; }
+
+/* Border radius */
+.rounded-none { border-radius: var(--radius-none) !important; }
+.rounded-sm { border-radius: var(--radius-sm) !important; }
+.rounded-md { border-radius: var(--radius-md) !important; }
+.rounded-lg { border-radius: var(--radius-lg) !important; }
+.rounded-xl { border-radius: var(--radius-xl) !important; }
+.rounded-full { border-radius: var(--radius-full) !important; }
+
+/* Shadows */
+.shadow-none { box-shadow: none !important; }
+.shadow-xs { box-shadow: var(--shadow-xs) !important; }
+.shadow-sm { box-shadow: var(--shadow-sm) !important; }
+.shadow-md { box-shadow: var(--shadow-md) !important; }
+.shadow-lg { box-shadow: var(--shadow-lg) !important; }
+.shadow-xl { box-shadow: var(--shadow-xl) !important; }
+.shadow-soft-xs { box-shadow: var(--shadow-soft-xs) !important; }
+.shadow-soft-sm { box-shadow: var(--shadow-soft-sm) !important; }
+.shadow-soft-md { box-shadow: var(--shadow-soft-md) !important; }
+.shadow-soft-lg { box-shadow: var(--shadow-soft-lg) !important; }
+.shadow-soft-xl { box-shadow: var(--shadow-soft-xl) !important; }

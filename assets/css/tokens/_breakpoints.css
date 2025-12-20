@@ -1,0 +1,16 @@
+/* tokens/_breakpoints.css
+   Reference breakpoints for responsive layout.
+
+   Note: CSS custom properties cannot be used directly inside @media queries in
+   current browsers. These tokens are primarily for documentation and for JS
+   (e.g. reading computed values via getComputedStyle).
+*/
+
+:root {
+  --breakpoint-xs: 480px;
+  --breakpoint-sm: 640px;
+  --breakpoint-md: 768px;
+  --breakpoint-lg: 1024px;
+  --breakpoint-xl: 1280px;
+}
+

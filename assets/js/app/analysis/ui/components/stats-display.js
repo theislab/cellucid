@@ -62,7 +62,11 @@ export function renderSummaryStats(container, pageData, variableName) {
     }
     if (allCategories.size > 10) {
       const moreRow = document.createElement('tr');
-      moreRow.innerHTML = `<td colspan="${pageData.length + 1}" style="font-style: italic; color: var(--viewer-ink-muted);">... and ${allCategories.size - 10} more categories</td>`;
+      const moreCell = document.createElement('td');
+      moreCell.colSpan = pageData.length + 1;
+      moreCell.className = 'analysis-stats-more';
+      moreCell.textContent = `... and ${allCategories.size - 10} more categories`;
+      moreRow.appendChild(moreCell);
       tbody.appendChild(moreRow);
     }
     table.appendChild(tbody);

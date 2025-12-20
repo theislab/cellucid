@@ -1,0 +1,983 @@
+/* =========================================================================
+   Welcome Modal - Newspaper-inspired onboarding
+   ========================================================================= */
+
+.welcome-modal {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-5);
+}
+
+.welcome-modal.hidden {
+  display: none;
+}
+
+.welcome-backdrop {
+  position: absolute;
+  inset: 0;
+  background: var(--color-surface-overlay);
+  backdrop-filter: blur(4px);
+}
+
+.welcome-content {
+  position: relative;
+  background: var(--color-surface-elevated);
+  border: var(--border-width-2) solid var(--color-border-strong);
+  box-shadow: var(--shadow-lg);
+  max-width: 420px;
+  width: 100%;
+  animation: welcomeSlideIn 0.3s ease-out;
+}
+
+@keyframes welcomeSlideIn {
+  from {
+    opacity: 0;
+    transform: translateY(-20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.welcome-header {
+  padding: 24px 24px 20px;
+  text-align: center;
+}
+
+.welcome-logo {
+  width: 200px;
+  height: auto;
+  margin-bottom: 8px;
+}
+
+.welcome-tagline {
+  font-family: "Oswald", system-ui, sans-serif;
+  font-size: 11px;
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: var(--color-text-secondary);
+  margin: 0;
+}
+
+.welcome-body {
+  padding: 16px 24px;
+}
+
+.welcome-body::before {
+  content: '';
+  display: block;
+  margin-bottom: 16px;
+  border-top: var(--border-width-1) solid var(--color-border-light);
+}
+
+.welcome-intro {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-text-secondary);
+  margin: 0 0 20px;
+  text-align: center;
+}
+
+.welcome-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.welcome-btn {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  background: var(--color-surface-secondary);
+  border: 1px solid var(--color-text-primary);
+  box-shadow: var(--shadow-md);
+  cursor: pointer;
+  text-decoration: none;
+  color: var(--color-text-primary);
+  transition: var(--transition-all);
+}
+
+.welcome-btn:hover {
+  background: var(--color-border-light);
+  transform: translate(-2px, -2px);
+  box-shadow: var(--shadow-lg);
+}
+
+.welcome-btn:active {
+  transform: translate(0, 0);
+  box-shadow: var(--shadow-xs);
+}
+
+.welcome-btn-primary {
+  background: var(--color-text-primary);
+  color: var(--color-text-inverse);
+}
+
+.welcome-btn-primary:hover {
+  background: var(--color-interactive-primary-hover);
+}
+
+.welcome-btn-icon {
+  font-size: 20px;
+  width: 28px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.welcome-btn-text {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+.welcome-btn-title {
+  font-family: "Oswald", system-ui, sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.welcome-btn-desc {
+  font-size: 11px;
+  color: inherit;
+  opacity: var(--opacity-70);
+}
+
+.welcome-btn-link {
+  background: transparent;
+  border-style: dashed;
+}
+
+.welcome-quote {
+  margin: 20px 0 0;
+  padding-top: 16px;
+  border-top: var(--border-width-1) solid var(--color-border-light);
+  font-style: italic;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  text-align: center;
+  opacity: var(--opacity-80);
+}
+
+.welcome-quote-text {
+  display: block;
+}
+
+.welcome-quote-attr {
+  display: block;
+  font-style: normal;
+  font-size: 10px;
+  margin-top: 4px;
+  opacity: var(--opacity-70);
+}
+
+.welcome-quote-book {
+  font-style: italic;
+}
+
+/* =========================================================================
+   License Modal
+   ========================================================================= */
+
+.license-modal {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-5);
+}
+
+.license-modal.hidden {
+  display: none;
+}
+
+.license-backdrop {
+  position: absolute;
+  inset: 0;
+  background: var(--color-surface-overlay);
+  backdrop-filter: blur(2px);
+}
+
+.license-content {
+  position: relative;
+  background: var(--color-surface-elevated);
+  border: var(--border-width-2) solid var(--color-border-strong);
+  box-shadow: var(--shadow-lg);
+  max-width: 600px;
+  width: 100%;
+  max-height: 80vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.license-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: var(--border-width-1) solid var(--color-border-light);
+  background: var(--color-surface-secondary);
+}
+
+.license-header h2 {
+  margin: 0;
+  font-family: "Oswald", system-ui, sans-serif;
+  font-size: 18px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--color-text-primary);
+}
+
+.license-close {
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid transparent;
+  font-size: 24px;
+  line-height: 1;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition: var(--transition-all);
+}
+
+.license-close:hover {
+  background: var(--color-border-light);
+  border-color: var(--color-border-default);
+  color: var(--color-text-primary);
+}
+
+.license-body {
+  padding: 20px;
+  overflow-y: auto;
+  font-family: "Inter", system-ui, sans-serif;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--color-text-primary);
+}
+
+.license-body p {
+  margin: 0 0 12px 0;
+}
+
+.license-body ol {
+  margin: 0 0 16px 0;
+  padding-left: 20px;
+}
+
+.license-body li {
+  margin-bottom: 10px;
+}
+
+.license-copyright {
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+
+.license-disclaimer {
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  padding: 12px;
+  background: var(--color-surface-tertiary);
+  border: var(--border-width-1) solid var(--color-border-light);
+  margin-top: 8px;
+}
+
+@media (max-width: 640px) {
+  .license-content {
+    max-height: 90vh;
+  }
+
+  .license-body {
+    font-size: 12px;
+  }
+}
+
+/* =========================================================================
+   Error Recovery Modal
+   ========================================================================= */
+
+.error-modal {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-5);
+}
+
+.error-backdrop {
+  position: absolute;
+  inset: 0;
+  background: var(--color-surface-overlay);
+}
+
+.error-content {
+  position: relative;
+  background: var(--color-surface-elevated);
+  border: 2px solid var(--color-text-primary);
+  box-shadow: var(--shadow-xl);
+  padding: 32px;
+  max-width: 400px;
+  width: 100%;
+  text-align: center;
+  animation: welcomeSlideIn 0.3s ease-out;
+}
+
+.error-icon {
+  font-size: 48px;
+  margin-bottom: 16px;
+  color: var(--color-danger);
+}
+
+.error-title {
+  font-family: "Oswald", system-ui, sans-serif;
+  font-size: 18px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin: 0 0 12px;
+  color: var(--color-text-primary);
+}
+
+.error-message {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-text-secondary);
+  margin: 0 0 24px;
+}
+
+.error-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.error-actions .btn-small {
+  min-width: 80px;
+}
+
+/* =========================================================================
+   Keyboard Shortcuts Section
+   ========================================================================= */
+
+.shortcuts-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.shortcut-group-title {
+  font-family: "Inter", system-ui, sans-serif;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--color-text-secondary);
+  margin-bottom: 2px;
+}
+
+.shortcut-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 0;
+  font-family: "Inter", system-ui, sans-serif;
+  font-size: 11px;
+  color: var(--color-text-secondary);
+}
+
+.shortcut-item kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  font-family: "Fira Code", monospace;
+  font-size: 10px;
+  font-weight: 500;
+  background: var(--color-surface-tertiary);
+  border: var(--border-default);
+  color: var(--color-text-primary);
+}
+
+.shortcut-item span {
+  flex: 1;
+  margin-left: 4px;
+}
+
+/* Mobile adjustments */
+@media (max-width: 480px) {
+  .welcome-content {
+    margin: 10px;
+  }
+
+  .welcome-header {
+    padding: 16px 16px 12px;
+  }
+
+  .welcome-logo {
+    width: 160px;
+  }
+
+  .welcome-body {
+    padding: 16px;
+  }
+
+  .error-content {
+    padding: 24px;
+  }
+
+  .error-actions {
+    flex-direction: column;
+  }
+
+  .error-actions .btn-small {
+    width: 100%;
+  }
+}
+
+/* =========================================================================
+   Analysis Modal / Popup
+   ========================================================================= */
+
+.analysis-modal {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity var(--duration-fast) var(--easing-standard);
+  pointer-events: none;
+}
+
+.analysis-modal.open {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.analysis-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: var(--color-surface-overlay);
+}
+
+.analysis-modal-content {
+  position: relative;
+  width: 66vw;
+  max-width: 860px;
+  min-width: 600px;
+  height: 66vh;
+  min-height: 500px;
+  background: var(--color-surface-elevated);
+  border: var(--border-strong);
+  box-shadow: var(--shadow-lg);
+  /* Flexbox for main layout - more predictable than grid for resizing */
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  transform: scale(0.96);
+  transition: transform var(--duration-fast) var(--easing-standard),
+    opacity var(--duration-fast) var(--easing-standard);
+  opacity: 0;
+}
+
+.analysis-modal.open .analysis-modal-content {
+  transform: scale(1);
+  opacity: 1;
+}
+
+.analysis-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  background: var(--color-surface-secondary);
+  border-bottom: var(--border-width-1) solid var(--color-border-light);
+  cursor: move;
+}
+
+.analysis-modal-title {
+  margin: 0;
+  font-family: "Oswald", system-ui, sans-serif;
+  font-weight: 500;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--color-text-primary);
+}
+
+.analysis-modal-close {
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid transparent;
+  font-size: 16px;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  border-radius: 0;
+  transition: var(--transition-all);
+}
+
+.analysis-modal-close:hover {
+  background: var(--color-border-light);
+  border-color: var(--color-border-default);
+  color: var(--color-text-primary);
+}
+
+.analysis-modal-body {
+  /* Flex container for horizontal layout - plot | resizer | options */
+  display: flex;
+  flex-direction: row;
+  flex: 1;
+  min-height: 200px;
+  overflow: hidden;
+  background: var(--color-surface-elevated);
+  position: relative;
+}
+
+.analysis-modal-plot-section {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 250px;
+  padding: 16px 20px;
+  background: var(--color-surface-elevated);
+  overflow: hidden;
+}
+
+.analysis-modal-plot {
+  flex: 1;
+  min-height: 200px;
+  background: var(--color-surface-elevated);
+}
+
+/* =========================================================================
+   Analysis Options Panel (Right Side of Modal) - Matches Website Patterns
+   ========================================================================= */
+
+.analysis-modal-options {
+  width: 230px;
+  min-width: 200px;
+  max-width: 400px;
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  background: var(--color-surface-secondary);
+  overflow-y: auto;
+  overflow-x: hidden;
+  border-left: var(--border-width-1) solid var(--color-border-light);
+}
+
+.analysis-options-title {
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  font-family: "Oswald", system-ui, sans-serif;
+  font-weight: 500;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--color-text-secondary);
+  border-bottom: var(--border-width-1) solid var(--color-border-light);
+  background: var(--color-surface-tertiary);
+}
+
+.analysis-options-title-text {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.analysis-options-export-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.analysis-options-export-label {
+  flex: 0 0 auto;
+}
+
+.analysis-options-export-toolbar {
+  margin-top: 0;
+}
+
+.analysis-options-export-toolbar .btn-small {
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  font-size: 10px;
+}
+
+.analysis-options-content {
+  flex: 1;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* Option rows - vertical layout for selects/sliders, horizontal for checkboxes */
+.analysis-option-row {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.analysis-option-label {
+  display: block;
+  font-family: "Oswald", system-ui, sans-serif;
+  font-weight: 500;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--color-text-secondary);
+  line-height: 1.2;
+}
+
+/* Select dropdowns - matches .obs-select */
+.analysis-option-select {
+  width: 100%;
+  padding: 6px 8px;
+  font-family: "Inter", system-ui, sans-serif;
+  font-size: 11px;
+  border-radius: 0;
+  border: var(--border-strong);
+  background-color: var(--color-surface-elevated);
+  color: var(--color-text-primary);
+  cursor: pointer;
+  box-shadow: var(--shadow-sm);
+  transition: box-shadow var(--duration-fast) var(--easing-standard);
+}
+
+.analysis-option-select:focus {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 1px;
+  box-shadow: var(--shadow-md);
+}
+
+/* Checkbox styling */
+.analysis-option-checkbox {
+  width: 12px;
+  height: 12px;
+  accent-color: var(--color-interactive-primary);
+  cursor: pointer;
+  margin: 0;
+  flex-shrink: 0;
+}
+
+/* Checkbox rows - inline layout with checkbox first, then label */
+.analysis-option-row.checkbox-row {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+}
+
+.analysis-option-row.checkbox-row .analysis-option-label {
+  font-family: "Inter", system-ui, sans-serif;
+  font-weight: 400;
+  font-size: 11px;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  margin: 0;
+}
+
+/* Range/slider styling - matches .slider-row */
+.analysis-option-range {
+  flex: 1;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 3px;
+  border-radius: var(--radius-full);
+  background: var(--color-border-light);
+  outline: none;
+}
+
+.analysis-option-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--color-text-primary);
+  border: var(--border-width-1) solid var(--color-border-strong);
+  box-shadow: var(--shadow-xs);
+  margin-top: -5.5px;
+  cursor: pointer;
+}
+
+.analysis-option-range::-moz-range-track {
+  height: 3px;
+  border-radius: var(--radius-full);
+  background: var(--color-border-light);
+}
+
+.analysis-option-range::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--color-text-primary);
+  border: var(--border-width-1) solid var(--color-border-strong);
+  box-shadow: var(--shadow-xs);
+  cursor: pointer;
+}
+
+/* Slider value - matches .slider-value */
+.analysis-option-value {
+  font-family: "Fira Code", ui-monospace, monospace;
+  font-size: 11px;
+  opacity: var(--opacity-85);
+  min-width: 28px;
+  text-align: right;
+}
+
+.analysis-option-text {
+  width: 100%;
+  padding: 5px 8px;
+  font-size: 11px;
+  border-radius: 0;
+  border: var(--border-strong);
+  background-color: var(--color-surface-elevated);
+  color: var(--color-text-primary);
+  box-shadow: var(--shadow-sm);
+}
+
+.analysis-option-text:focus {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 1px;
+  box-shadow: var(--shadow-md);
+}
+
+/* Section titles and dividers for option groups */
+.analysis-option-section-title {
+  font-family: "Oswald", system-ui, sans-serif;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-text-secondary);
+  margin: 12px 0 8px 0;
+  padding: 0;
+}
+
+.analysis-option-section-title:first-child {
+  margin-top: 0;
+}
+
+.analysis-option-divider {
+  height: 1px;
+  background: var(--color-border-light);
+  margin: 12px 0;
+  border: none;
+}
+
+/* =========================================================================
+   Analysis Modal - Resizable Grid Layout
+   ========================================================================= */
+
+/* Footer area with two panels */
+.analysis-modal-footer-area {
+  /* Flex container for horizontal layout - stats | resizer | annotations */
+  display: flex;
+  flex-direction: row;
+  height: 200px;
+  min-height: 200px;
+  max-height: 50%;
+  flex-shrink: 0;
+  border-top: var(--border-width-1) solid var(--color-border-light);
+  background: var(--color-surface-secondary);
+  overflow: hidden;
+  position: relative;
+}
+
+/* Stats panel (left side of footer) */
+.analysis-modal-stats-panel {
+  flex: 1;
+  min-width: 200px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Annotations panel (right side of footer) */
+.analysis-modal-annotations-panel {
+  flex: 1;
+  min-width: 200px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-left: var(--border-width-1) solid var(--color-border-light);
+}
+
+/* Panel titles */
+.analysis-panel-title {
+  padding: 8px 12px;
+  font-family: "Oswald", system-ui, sans-serif;
+  font-weight: 500;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--color-text-secondary);
+  background: var(--color-surface-tertiary);
+  border-bottom: var(--border-width-1) solid var(--color-border-light);
+  flex-shrink: 0;
+}
+
+/* Stats content area */
+.analysis-stats-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0;
+}
+
+/* Annotations content area */
+.analysis-annotations-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px 12px;
+}
+
+/* Internal panel resizer elements */
+.analysis-modal-resizer {
+  background: transparent;
+  flex-shrink: 0;
+  transition: background-color var(--duration-fast) var(--easing-standard);
+  position: relative;
+  z-index: 5;
+}
+
+.analysis-modal-resizer:hover {
+  background: color-mix(in srgb, var(--color-info) 10%, transparent);
+}
+
+.analysis-modal-resizer:active,
+.analysis-modal-resizer.resizing {
+  background: color-mix(in srgb, var(--color-info) 20%, transparent);
+}
+
+.analysis-modal-resizer-vertical {
+  width: 8px;
+  cursor: col-resize;
+}
+
+/* Vertical resizer grip dots */
+.analysis-modal-resizer-vertical::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 4px;
+  height: 24px;
+  background-image: radial-gradient(circle, var(--color-text-tertiary) 1px, transparent 1px);
+  background-size: 4px 4px;
+  background-position: center;
+  opacity: var(--opacity-60);
+}
+
+.analysis-modal-resizer-vertical:hover::before {
+  opacity: 1;
+  background-image: radial-gradient(circle, var(--color-text-secondary) 1px, transparent 1px);
+}
+
+/* Horizontal resizer - full width bar between body and footer */
+.analysis-modal-resizer-horizontal {
+  height: 8px;
+  cursor: row-resize;
+  flex-shrink: 0;
+  position: relative;
+  z-index: 5;
+}
+
+/* Horizontal resizer grip dots */
+.analysis-modal-resizer-horizontal::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 24px;
+  height: 4px;
+  background-image: radial-gradient(circle, var(--color-text-tertiary) 1px, transparent 1px);
+  background-size: 4px 4px;
+  background-position: center;
+  opacity: var(--opacity-60);
+}
+
+.analysis-modal-resizer-horizontal:hover::before {
+  opacity: 1;
+  background-image: radial-gradient(circle, var(--color-text-secondary) 1px, transparent 1px);
+}
+
+/* Intersection/corner resizer - at the crossing of horizontal and vertical resizers */
+.analysis-modal-resizer-intersection {
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  background: var(--color-surface-tertiary);
+  border: var(--border-width-1) solid var(--color-border-light);
+  cursor: nwse-resize;
+  z-index: 10;
+  transition: background-color var(--duration-fast) var(--easing-standard),
+    border-color var(--duration-fast) var(--easing-standard);
+}
+
+.analysis-modal-resizer-intersection:hover {
+  background: color-mix(in srgb, var(--color-info) 15%, transparent);
+  border-color: color-mix(in srgb, var(--color-info) 30%, transparent);
+}
+
+.analysis-modal-resizer-intersection:active,
+.analysis-modal-resizer-intersection.resizing {
+  background: color-mix(in srgb, var(--color-info) 25%, transparent);
+  border-color: color-mix(in srgb, var(--color-info) 40%, transparent);
+}
+
+/* Intersection resizer grip pattern */
+.analysis-modal-resizer-intersection::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 8px;
+  height: 8px;
+  background-image: radial-gradient(circle, var(--color-text-tertiary) 1.5px, transparent 1.5px);
+  background-size: 4px 4px;
+  background-position: center;
+  opacity: var(--opacity-70);
+}
+
+.analysis-modal-resizer-intersection:hover::before {
+  opacity: 1;
+  background-image: radial-gradient(circle, var(--color-text-secondary) 1.5px, transparent 1.5px);
+}

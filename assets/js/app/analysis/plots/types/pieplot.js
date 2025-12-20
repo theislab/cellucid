@@ -7,6 +7,7 @@
  */
 
 import { PlotFactory, PlotRegistry, BasePlot, COMMON_HOVER_STYLE, createMinimalPlotly } from '../plot-factory.js';
+import { getPlotTheme } from '../../shared/plot-theme.js';
 
 /**
  * Process categories for a page (count, sort, limit)
@@ -45,6 +46,7 @@ const pieplotDefinition = {
   },
 
   buildTraces(pageData, options) {
+    const theme = getPlotTheme();
     const numPages = pageData.length;
     const cols = Math.min(numPages, 3);
     const rows = Math.ceil(numPages / cols);
@@ -71,8 +73,8 @@ const pieplotDefinition = {
           : options.showPercent ? 'percent' : options.showLabels ? 'label' : 'none',
         textposition: 'inside',
         insidetextorientation: 'radial',
-        textfont: { family: 'Inter, system-ui, sans-serif', size: 10, color: '#ffffff' },
-        marker: { line: { color: '#ffffff', width: 1 } },
+        textfont: { family: theme.fontFamily, size: 10, color: '#ffffff' },
+        marker: { line: { color: theme.plotBg, width: 1 } },
         hovertemplate: '%{label}: %{value} (%{percent})<extra>' + pd.pageName + '</extra>',
         hoverlabel: COMMON_HOVER_STYLE,
         showlegend: index === 0
@@ -83,12 +85,13 @@ const pieplotDefinition = {
   },
 
   buildLayout(pageData, options) {
+    const theme = getPlotTheme();
     const numPages = pageData.length;
     const cols = Math.min(numPages, 3);
     const rows = Math.ceil(numPages / cols);
 
     const layout = BasePlot.createLayout({ showLegend: true });
-    layout.legend = { orientation: 'h', x: 0.5, xanchor: 'center', y: -0.05, font: { family: 'Inter, system-ui, sans-serif', size: 10, color: '#374151' } };
+    layout.legend = { orientation: 'h', x: 0.5, xanchor: 'center', y: -0.05, font: { family: theme.fontFamily, size: theme.legendFontSize, color: theme.legend.text } };
     layout.margin = { l: 20, r: 20, t: 40, b: 40 };
     layout.height = rows * 200 + 60;
 
@@ -108,7 +111,7 @@ const pieplotDefinition = {
         y: yStart + ySize + 0.02,
         xref: 'paper', yref: 'paper',
         showarrow: false,
-        font: { family: 'Oswald, system-ui, sans-serif', size: 11, color: '#111827' }
+        font: { family: 'Oswald, system-ui, sans-serif', size: 11, color: theme.textStrong }
       };
     });
 

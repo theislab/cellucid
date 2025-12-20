@@ -1,0 +1,324 @@
+/* ========================================================================
+   Legend + colormap menu
+   ===================================================================== */
+
+.legend-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1-5);
+  padding: var(--space-2-5) var(--space-2-5) var(--space-3);
+  border: var(--border-strong);
+  border-radius: 0;
+  background: var(--color-surface-elevated);
+  box-shadow: var(--shadow-sm);
+}
+
+.legend-section-title {
+  font-family: var(--font-display);
+  font-size: var(--text-xs);
+  font-weight: var(--font-weight-medium);
+  letter-spacing: var(--tracking-wider);
+  text-transform: uppercase;
+  opacity: var(--opacity-85);
+}
+
+#legend {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.legend-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1-5);
+}
+
+.legend-section + .legend-section {
+  border-top: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 12%, transparent);
+  padding-top: var(--space-2);
+}
+
+.legend-subtitle {
+  font-size: var(--text-xs);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-text-primary);
+}
+
+.legend-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.legend-toggle-label {
+  font-size: var(--text-xs);
+  letter-spacing: 0.02em;
+  color: var(--color-text-secondary);
+}
+
+.legend-filter {
+  gap: var(--space-1);
+}
+
+.legend-help {
+  font-size: var(--text-xs);
+  opacity: var(--opacity-70);
+  margin-top: var(--space-0-5);
+}
+
+/* Colormap button */
+.colorbar-wrapper {
+  position: relative;
+}
+
+.colorbar-gradient {
+  width: 100%;
+  height: var(--space-4);
+  border-radius: var(--radius-full);
+  border: var(--border-width-1) solid var(--color-border-strong);
+  background: linear-gradient(to right,
+    var(--colorbar-stops, var(--color-border-light), var(--color-border-light)));
+  cursor: pointer;
+  padding: 0;
+  appearance: none;
+  box-shadow: var(--shadow-xs);
+}
+
+.colorbar-gradient:focus-visible {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 1px;
+}
+
+/* Colormap dropdown */
+.colormap-menu {
+  position: absolute;
+  top: calc(100% + var(--space-1-5));
+  left: 0;
+  right: 0;
+  background: var(--color-surface-elevated);
+  border: var(--border-strong);
+  border-radius: 0;
+  box-shadow: var(--shadow-md);
+  padding: var(--space-1-5);
+  display: none;
+  flex-direction: column;
+  gap: var(--space-1);
+  z-index: var(--z-popover);
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.colormap-menu.visible {
+  display: flex;
+}
+
+.colormap-option {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  border: 1px solid transparent;
+  border-radius: 0;
+  padding: var(--space-1-5) var(--space-2);
+  background: var(--color-surface-secondary);
+  cursor: pointer;
+  font-size: var(--text-xs);
+  text-align: left;
+}
+
+.colormap-option:hover {
+  border-color: var(--color-border-strong);
+  background: var(--color-border-light);
+}
+
+.colormap-option.active {
+  border-color: var(--color-interactive-primary);
+  background: var(--color-interactive-primary);
+  color: var(--color-text-inverse);
+}
+
+.colormap-preview {
+  flex: 1;
+  min-width: 90px;
+  height: var(--space-3);
+  border-radius: var(--radius-lg);
+  border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 15%, transparent);
+  background: linear-gradient(to right,
+    var(--colormap-stops, var(--color-border-light), var(--color-border-light)));
+}
+
+.colormap-name {
+  min-width: 72px;
+  font-weight: 700;
+  color: var(--color-text-primary);
+  letter-spacing: 0.2px;
+}
+
+/* Legend controls row */
+.legend-controls {
+  display: flex;
+  gap: var(--space-2);
+  margin-bottom: var(--space-1-5);
+  padding-bottom: 0;
+}
+
+.legend-controls button {
+  flex: 1;
+}
+
+/* Category legend line items */
+.legend-item {
+  display: flex;
+  align-items: center;
+  margin-bottom: 1px;
+  position: relative;
+}
+
+.legend-checkbox {
+  width: var(--space-3-5);
+  height: var(--space-3-5);
+  margin: 0 var(--space-1) 0 0;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+/* Color swatch & dropdown palette */
+.legend-swatch {
+  width: var(--space-3-5);
+  height: var(--space-3-5);
+  border-radius: 3px;
+  margin-right: var(--space-1-5);
+  border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 25%, transparent);
+  background-color: var(--legend-swatch-color, var(--color-border-light));
+  flex-shrink: 0;
+  cursor: pointer;
+  position: relative;
+}
+
+.legend-color-input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  min-width: 0;
+  min-height: 0;
+  border: none;
+  padding: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.legend-swatch:hover {
+  border-color: color-mix(in srgb, var(--color-border-strong) 60%, transparent);
+  box-shadow: var(--shadow-soft-xs);
+}
+
+.legend-label {
+  font-size: var(--text-xs);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.legend-count {
+  font-size: var(--text-xs);
+  opacity: var(--opacity-75);
+  margin-left: var(--space-2);
+  white-space: nowrap;
+}
+
+.legend-item.legend-item-disabled {
+  opacity: var(--opacity-55);
+}
+
+.legend-item.legend-item-disabled .legend-checkbox,
+.legend-item.legend-item-disabled .legend-color-input {
+  cursor: not-allowed;
+}
+
+/* Scrollable legend items container for many categories */
+.legend-items-container {
+  position: relative;
+}
+
+.legend-items-scrollable {
+  max-height: 288px; /* ~16 items × 18px height */
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: var(--space-1);
+  /* Fade mask at bottom to indicate scrollability */
+  mask-image: linear-gradient(to bottom, black calc(100% - 24px), transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, black calc(100% - 24px), transparent 100%);
+  /* Native scrollbar styling */
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--color-text-primary) 35%, transparent)
+    color-mix(in srgb, var(--color-text-primary) 8%, transparent);
+}
+
+/* Remove fade mask when scrolled to bottom */
+.legend-items-scrollable.scrolled-to-bottom {
+  mask-image: none;
+  -webkit-mask-image: none;
+}
+
+/* WebKit scrollbar styling */
+.legend-items-scrollable::-webkit-scrollbar {
+  width: 6px;
+}
+
+.legend-items-scrollable::-webkit-scrollbar-track {
+  background: color-mix(in srgb, var(--color-text-primary) 6%, transparent);
+  border-radius: 3px;
+}
+
+.legend-items-scrollable::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--color-text-primary) 30%, transparent);
+  border-radius: 3px;
+  min-height: 32px;
+}
+
+.legend-items-scrollable::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--color-text-primary) 45%, transparent);
+}
+
+/* ========================================================================
+   Legend for categorical items (reusing pieces above)
+   ===================================================================== */
+
+/* Already covered above; kept for layout clarity */
+
+.legend-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-1-5);
+  margin-top: var(--space-1);
+}
+
+.legend-actions.compact {
+  justify-content: flex-end;
+  gap: var(--space-1-5);
+}
+
+.legend-actions.compact button {
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--text-2xs);
+}
+
+.legend-actions button.primary {
+  background: var(--color-interactive-primary);
+  color: var(--color-text-inverse);
+  border-color: var(--color-interactive-primary);
+}
+
+.legend-actions button.primary:hover {
+  background: var(--color-interactive-primary-hover);
+  color: var(--color-text-inverse);
+}

@@ -1,0 +1,377 @@
+/* ========================================================================
+   Sliders – unified track and thumb
+   ===================================================================== */
+
+.slider-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+}
+
+.slider-row input[type="range"] {
+  flex: 1;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 3px;
+  border-radius: var(--radius-full);
+  background: var(--color-border-light);
+  outline: none;
+}
+
+/* WebKit */
+.slider-row input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: var(--space-3-5);
+  height: var(--space-3-5);
+  border-radius: 50%;
+  background: var(--color-text-primary);
+  border: var(--border-width-1) solid var(--color-border-strong);
+  box-shadow: var(--shadow-xs);
+  margin-top: -5.5px;
+}
+
+/* Firefox */
+.slider-row input[type="range"]::-moz-range-track {
+  height: 3px;
+  border-radius: var(--radius-full);
+  background: var(--color-border-light);
+}
+
+.slider-row input[type="range"]::-moz-range-thumb {
+  width: var(--space-3-5);
+  height: var(--space-3-5);
+  border-radius: 50%;
+  background: var(--color-text-primary);
+  border: var(--border-width-1) solid var(--color-border-strong);
+  box-shadow: var(--shadow-xs);
+}
+
+/* Slider value readout – monospaced for “instrument” feel */
+.slider-value {
+  font-size: var(--text-sm);
+  opacity: var(--opacity-85);
+  font-family: var(--font-mono);
+}
+
+/* ========================================================================
+   Color inputs (sidebar)
+   ===================================================================== */
+
+.connectivity-color-picker {
+  width: calc(var(--space-12) + var(--space-0-5));
+  height: var(--space-6);
+  padding: 0;
+  border: var(--border-strong);
+  border-radius: 0;
+  box-shadow: var(--shadow-sm);
+  background: transparent;
+  cursor: pointer;
+}
+
+/* ========================================================================
+   Searchable gene dropdown
+   ===================================================================== */
+
+#gene-expression-container {
+  display: none;
+}
+
+#gene-expression-container.visible {
+  display: block;
+}
+
+.searchable-dropdown {
+  position: relative;
+  width: 100%;
+}
+
+/* Gene search input styled like obs-select */
+.gene-search-input {
+  width: 100%;
+  box-sizing: border-box;
+  cursor: text;
+}
+
+.gene-search-input::placeholder {
+  color: var(--color-text-tertiary);
+}
+
+.search-input {
+  width: 100%;
+  padding: calc(var(--space-1) + var(--space-px)) var(--space-2);
+  font-size: var(--text-sm);
+  border: var(--border-strong);
+  border-radius: 0;
+  box-sizing: border-box;
+  background: var(--color-surface-elevated);
+  box-shadow: var(--shadow-sm);
+}
+
+.search-input:focus {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 1px;
+  box-shadow: var(--shadow-md);
+}
+
+/* Dropdown list of genes */
+.dropdown-list {
+  display: none;
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  max-height: 200px;
+  overflow-y: auto;
+  background: var(--color-surface-elevated);
+  border: var(--border-strong);
+  border-top: none;
+  border-radius: 0;
+  box-shadow: var(--shadow-md);
+  z-index: var(--z-popover);
+}
+
+.dropdown-list.visible {
+  display: block;
+}
+
+.dropdown-item {
+  padding: var(--space-1-5) var(--space-2-5);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  border-bottom: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 5%, transparent);
+}
+
+.dropdown-item:last-child {
+  border-bottom: none;
+}
+
+.dropdown-item:hover {
+  background: var(--color-border-light);
+}
+
+.dropdown-item.selected {
+  background: var(--color-interactive-primary);
+  color: var(--color-text-inverse);
+  font-weight: var(--font-weight-semibold);
+}
+
+.dropdown-no-results {
+  padding: var(--space-2) var(--space-2-5);
+  font-size: var(--text-sm);
+  color: var(--color-text-tertiary);
+  text-align: center;
+}
+
+/* Selected gene pill */
+.selected-gene {
+  display: none;
+  margin-top: var(--space-1);
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--text-sm);
+  background: var(--color-interactive-primary);
+  border-radius: var(--radius-full);
+  color: var(--color-text-inverse);
+}
+
+.selected-gene.visible {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.selected-gene .clear-btn {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--color-border-light);
+  padding: 0 var(--space-1);
+}
+
+.selected-gene .clear-btn:hover {
+  color: var(--color-text-inverse);
+}
+
+/* ========================================================================
+   Dataset & Session Styles
+   ===================================================================== */
+
+.dataset-info {
+  font-size: var(--text-sm);
+  color: var(--color-text-tertiary);
+  margin-top: var(--space-1-5);
+  padding: var(--space-2) var(--space-2-5);
+  background: var(--color-surface-secondary);
+  border: var(--border-width-1) dashed var(--color-border-strong);
+  border-radius: 0;
+  font-family: var(--font-mono);
+}
+
+.dataset-info.loading {
+  color: var(--color-text-secondary);
+  font-style: italic;
+}
+
+.dataset-info.error {
+  color: var(--color-danger);
+  background: var(--color-danger-soft);
+  border-color: var(--color-danger);
+}
+
+.dataset-info-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: calc(var(--space-0-5) + var(--space-px)) 0;
+  border-bottom: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 8%, transparent);
+}
+
+.dataset-info-row:last-child {
+  border-bottom: none;
+}
+
+.dataset-info-label {
+  flex: 0 0 82px;
+  text-transform: uppercase;
+  font-size: var(--text-xs);
+  color: var(--color-text-secondary);
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.dataset-info-value {
+  flex: 1 1 auto;
+  text-align: right;
+  color: var(--color-text-primary);
+  font-size: var(--text-xs);
+  letter-spacing: -0.01em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dataset-info-ellipsis {
+  max-width: 180px;
+}
+
+.user-data-row {
+  display: flex;
+  gap: var(--space-1-5);
+  align-items: stretch;
+  margin-top: var(--space-1-5);
+}
+
+/* Hidden inputs (triggered programmatically). */
+.file-input-hidden {
+  display: none;
+}
+
+/* Connection action rows start hidden; JS toggles display. */
+#remote-disconnect-container,
+#github-disconnect-container {
+  display: none;
+}
+
+/* Equal-width data buttons that scale with sidebar */
+.user-data-row .data-btn {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.user-data-path {
+  flex: 1;
+  min-width: 0;
+  padding: calc(var(--space-1) + var(--space-px)) var(--space-2);
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+  background: var(--color-surface-elevated);
+  border: var(--border-strong);
+  border-radius: 0;
+  color: var(--color-text-secondary);
+  cursor: default;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  box-shadow: var(--shadow-sm);
+}
+
+.user-data-path:focus {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 1px;
+  box-shadow: var(--shadow-md);
+}
+
+.user-data-path.active {
+  background: var(--color-surface-elevated);
+  border-color: var(--color-border-strong);
+  color: var(--color-text-primary);
+}
+
+#user-data-browse-btn,
+#user-data-h5ad-btn {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+#user-data-status {
+  font-size: var(--text-xs);
+  min-height: var(--space-3-5);
+}
+
+#user-data-status.error {
+  color: var(--color-danger);
+}
+
+#user-data-status.success {
+  color: var(--color-success);
+}
+
+#user-data-status.loading {
+  color: var(--color-text-secondary);
+  font-style: italic;
+}
+
+/* Style user data block if File System Access API is not supported */
+#user-data-block.unsupported {
+  opacity: var(--opacity-50);
+}
+
+#user-data-block.unsupported .user-data-path {
+  font-style: italic;
+}
+
+#user-data-block.unsupported #user-data-browse-btn,
+#user-data-block.unsupported #user-data-h5ad-btn {
+  cursor: not-allowed;
+  opacity: var(--opacity-60);
+}
+
+/* Dataset select dropdown enhancements */
+#dataset-select {
+  width: 100%;
+}
+
+#dataset-select option {
+  padding: var(--space-1) var(--space-2);
+}
+
+#dataset-select option:disabled {
+  color: var(--color-text-tertiary);
+  font-style: italic;
+}
+
+/* ========================================================================
+   Dimension Selector
+   ===================================================================== */
+
+.dimension-controls {
+  margin-top: var(--space-2-5);
+}
+
+.dimension-loading {
+  font-size: var(--text-sm);
+  color: var(--color-text-tertiary);
+  margin-left: var(--space-2);
+}

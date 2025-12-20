@@ -237,7 +237,6 @@ export {
   createVariableSelector,
   createGeneExpressionSelector,
   createPageSelector,
-  createPageMultiSelect,
   createPlotTypeSelector,
   createAnalysisModal,
   openModal,

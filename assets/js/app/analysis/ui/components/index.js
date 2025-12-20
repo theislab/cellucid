@@ -23,7 +23,6 @@ export {
   createVariableSelector,
   createGeneExpressionSelector,
   createPageSelector,
-  createPageMultiSelect,
   createPageComparisonSelector,
   createPlotTypeSelector
 } from './selectors.js';

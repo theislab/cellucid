@@ -25,6 +25,7 @@
  */
 
 import { getPlotRegistry } from '../core/plugin-contract.js';
+import { LEGEND_DEFAULT_OPTIONS, LEGEND_POSITION_SCHEMA } from './legend-utils.js';
 
 /**
  * PlotRegistry wrapper with user-friendly method names
@@ -134,14 +135,24 @@ export const PlotRegistry = {
       return false;
     }
 
+    const supportsLegend = plotType.supportsLegend !== false;
+
+    const defaultOptions = supportsLegend
+      ? { ...LEGEND_DEFAULT_OPTIONS, ...(plotType.defaultOptions || {}) }
+      : (plotType.defaultOptions || {});
+
+    const optionSchema = supportsLegend
+      ? { legendPosition: LEGEND_POSITION_SCHEMA, ...(plotType.optionSchema || {}) }
+      : (plotType.optionSchema || {});
+
     const plugin = {
       id: plotType.id,
       name: plotType.name || plotType.id,
       description: plotType.description || '',
       supportedTypes: plotType.supportedDataTypes || plotType.supportedTypes || ['categorical', 'continuous'],
       supportedLayouts: plotType.supportedLayouts || ['side-by-side', 'grouped'],
-      defaultOptions: plotType.defaultOptions || {},
-      optionSchema: plotType.optionSchema || {},
+      defaultOptions,
+      optionSchema,
       // Core render/update/export functions
       render: plotType.render,
       update: plotType.update,

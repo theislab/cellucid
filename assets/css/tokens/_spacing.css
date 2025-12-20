@@ -1,0 +1,36 @@
+/* tokens/_spacing.css
+   Spacing scale (px-based for consistency with existing UI).
+*/
+
+:root {
+  --space-0: 0px;
+  --space-px: 1px;
+  --space-0-5: 2px;
+  --space-1: 4px;
+  --space-1-5: 6px;
+  --space-2: 8px;
+  --space-2-5: 10px;
+  --space-3: 12px;
+  --space-3-5: 14px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-7: 28px;
+  --space-8: 32px;
+  --space-9: 36px;
+  --space-10: 40px;
+  --space-11: 44px;
+  --space-12: 48px;
+  --space-14: 56px;
+  --space-16: 64px;
+  --space-20: 80px;
+  --space-24: 96px;
+
+  /* Layout primitives. */
+  --sidebar-width: 280px;
+  --sidebar-min-width: 200px;
+  --sidebar-max-width: 450px;
+  --header-height: 36px;
+  --accordion-default-width: 320px;
+  --accordion-default-height: 400px;
+}

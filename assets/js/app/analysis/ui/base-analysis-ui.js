@@ -54,6 +54,21 @@ import { createPageSelectorComponent } from './shared/page-selector.js';
 import { createVariableSelectorComponent } from './shared/variable-selector.js';
 import { createFigureContainer } from './shared/figure-container.js';
 
+function cloneSettings(value) {
+  if (value == null) return value;
+  try {
+    // structuredClone is supported in all modern browsers we target.
+    return structuredClone(value);
+  } catch (_err) {
+    try {
+      return JSON.parse(JSON.stringify(value));
+    } catch (_err2) {
+      // Fall back to returning as-is (best effort); callers must avoid mutating.
+      return value;
+    }
+  }
+}
+
 /**
  * Abstract base class for all analysis UI components
  */
@@ -68,6 +83,7 @@ export class BaseAnalysisUI {
     this.comparisonModule = options.comparisonModule;
     this.dataLayer = options.dataLayer;
     this.onConfigChange = options.onConfigChange;
+    this._instanceId = options.instanceId || '';
 
     this._notifications = getNotificationCenter();
 
@@ -105,6 +121,9 @@ export class BaseAnalysisUI {
 
     // Debounce timer
     this._updateTimer = null;
+
+    // Lifecycle guard (prevents async work from updating after teardown)
+    this._isDestroyed = false;
   }
 
   // ===========================================================================
@@ -178,6 +197,7 @@ export class BaseAnalysisUI {
    * @param {HTMLElement} container - Container for the UI
    */
   init(container) {
+    this._isDestroyed = false;
     this._container = container;
     this._render();
 
@@ -205,6 +225,39 @@ export class BaseAnalysisUI {
     this._currentConfig = { ...this._currentConfig, ...config };
     this._renderControls();
     this._scheduleUpdate();
+  }
+
+  /**
+   * Export a settings-only snapshot for cloning/copying.
+   * Results (plots/data) are intentionally excluded.
+   * @returns {{ selectedPages: string[], config: Object }}
+   */
+  exportSettings() {
+    return {
+      selectedPages: [...this._selectedPages],
+      config: cloneSettings(this._currentConfig)
+    };
+  }
+
+  /**
+   * Import a settings snapshot previously produced by exportSettings().
+   * @param {{ selectedPages?: string[], config?: Object }|null} settings
+   */
+  importSettings(settings) {
+    if (!settings) return;
+    const selectedPages = Array.isArray(settings.selectedPages) ? settings.selectedPages : null;
+    const config = settings.config && typeof settings.config === 'object' ? settings.config : null;
+
+    // Apply page selection first so dependent controls (e.g., page selectors) render correctly.
+    if (selectedPages && typeof this.onPageSelectionChange === 'function') {
+      this.onPageSelectionChange([...selectedPages]);
+    }
+
+    if (config && typeof this.setConfig === 'function') {
+      // Preserve the explicitly imported page selection if provided.
+      const merged = selectedPages ? { ...config, pages: [...selectedPages] } : config;
+      this.setConfig(cloneSettings(merged));
+    }
   }
 
   // ===========================================================================
@@ -299,6 +352,7 @@ export class BaseAnalysisUI {
    * @param {number} delay - Debounce delay in ms (default 300)
    */
   _scheduleUpdate(delay = 300) {
+    if (this._isDestroyed) return;
     if (this._updateTimer) {
       clearTimeout(this._updateTimer);
     }
@@ -311,6 +365,7 @@ export class BaseAnalysisUI {
    * Run analysis if configuration is valid (override for custom logic)
    */
   async _runAnalysisIfValid() {
+    if (this._isDestroyed) return;
     if (!this._canRunAnalysis()) {
       this._hidePreview();
       return;
@@ -663,6 +718,7 @@ export class BaseAnalysisUI {
    * Destroy and cleanup the component
    */
   destroy() {
+    this._isDestroyed = true;
     if (this._updateTimer) {
       clearTimeout(this._updateTimer);
     }

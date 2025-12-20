@@ -1,0 +1,34 @@
+/* utilities/_colors.css
+   Semantic color utilities backed by theme tokens.
+*/
+
+/* Text colors */
+.text-primary { color: var(--color-text-primary) !important; }
+.text-secondary { color: var(--color-text-secondary) !important; }
+.text-tertiary { color: var(--color-text-tertiary) !important; }
+.text-inverse { color: var(--color-text-inverse) !important; }
+.text-link { color: var(--color-text-link) !important; }
+.text-accent { color: var(--color-accent-text) !important; }
+.text-success { color: var(--color-success-text) !important; }
+.text-warning { color: var(--color-warning-text) !important; }
+.text-danger { color: var(--color-danger-text) !important; }
+.text-info { color: var(--color-info-text) !important; }
+
+/* Background colors */
+.bg-surface-primary { background-color: var(--color-surface-primary) !important; }
+.bg-surface-secondary { background-color: var(--color-surface-secondary) !important; }
+.bg-surface-tertiary { background-color: var(--color-surface-tertiary) !important; }
+.bg-surface-elevated { background-color: var(--color-surface-elevated) !important; }
+.bg-surface-sunken { background-color: var(--color-surface-sunken) !important; }
+
+.bg-accent { background-color: var(--color-accent) !important; }
+.bg-accent-soft { background-color: var(--color-accent-soft) !important; }
+.bg-success { background-color: var(--color-success) !important; }
+.bg-success-soft { background-color: var(--color-success-soft) !important; }
+.bg-warning { background-color: var(--color-warning) !important; }
+.bg-warning-soft { background-color: var(--color-warning-soft) !important; }
+.bg-danger { background-color: var(--color-danger) !important; }
+.bg-danger-soft { background-color: var(--color-danger-soft) !important; }
+.bg-info { background-color: var(--color-info) !important; }
+.bg-info-soft { background-color: var(--color-info-soft) !important; }
+

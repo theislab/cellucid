@@ -112,12 +112,23 @@ prepare(adata, output_dir="./my_export", compress=True)
 cellucid/
 ├── index.html              # Single-page app
 ├── assets/
+│   ├── css/                 # CSS design system (tokens/themes/utilities/components)
 │   ├── js/
 │   │   ├── app/            # UI, state management
 │   │   ├── data/           # Data loaders (binary, h5ad)
 │   │   └── rendering/      # WebGL renderer
 │   └── exports/            # Sample datasets
+├── scripts/                 # Dev/validation scripts
+└── types/                   # Editor-only type defs (design tokens)
 ```
+
+## CSS Design System
+
+- Entry point: `assets/css/main.css` (layered: tokens → themes → base → utilities → components → layouts)
+- Documentation: `assets/css/README.md`
+- Validate token usage: `node scripts/validate-tokens.js`
+- Validate token types sync: `node scripts/validate-token-types.js`
+- Themes: `light` (default) and `dark` only (set via the Theme dropdown)
 
 ## Development
 
