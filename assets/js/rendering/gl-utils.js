@@ -153,21 +153,3 @@ export function normalizePositions(positions) {
     scale
   };
 }
-
-export function applyNormalizationToCentroids(obs, transform) {
-  if (!obs || !obs.fields || !transform) return;
-  const cx = transform.center[0];
-  const cy = transform.center[1];
-  const cz = transform.center[2];
-  const s = transform.scale;
-  for (const field of obs.fields) {
-    if (!field.centroids) continue;
-    for (const c of field.centroids) {
-      const p = c.position;
-      if (!p || p.length < 3) continue;
-      p[0] = (p[0] - cx) * s;
-      p[1] = (p[1] - cy) * s;
-      p[2] = (p[2] - cz) * s;
-    }
-  }
-}

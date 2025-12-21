@@ -410,6 +410,31 @@ export class DataLayer {
   }
 
   /**
+   * Get the current persistent color for a highlight page.
+   * @param {string} pageId
+   * @returns {string|null}
+   */
+  getPageColor(pageId) {
+    if (typeof this.state?.getHighlightPageColor === 'function') {
+      return this.state.getHighlightPageColor(pageId);
+    }
+    const pages = this.getPages();
+    const idx = pages.findIndex((p) => p.id === pageId);
+    return (idx >= 0 && pages[idx]?.color) ? pages[idx].color : null;
+  }
+
+  /**
+   * Set the persistent color for a highlight page.
+   * @param {string} pageId
+   * @param {string} color
+   * @returns {boolean}
+   */
+  setPageColor(pageId, color) {
+    if (typeof this.state?.setHighlightPageColor !== 'function') return false;
+    return this.state.setHighlightPageColor(pageId, color);
+  }
+
+  /**
    * Get display information for a page ID (supports derived pages).
    *
    * @param {string} pageId

@@ -86,6 +86,11 @@
   width: 100%;
 }
 
+#gene-expression-row .searchable-dropdown {
+  flex: 1;
+  min-width: 0;
+}
+
 /* Gene search input styled like obs-select */
 .gene-search-input {
   width: 100%;
@@ -161,36 +166,6 @@
   font-size: var(--text-sm);
   color: var(--color-text-tertiary);
   text-align: center;
-}
-
-/* Selected gene pill */
-.selected-gene {
-  display: none;
-  margin-top: var(--space-1);
-  padding: var(--space-1) var(--space-2);
-  font-size: var(--text-sm);
-  background: var(--color-interactive-primary);
-  border-radius: var(--radius-full);
-  color: var(--color-text-inverse);
-}
-
-.selected-gene.visible {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.selected-gene .clear-btn {
-  background: transparent;
-  border: none;
-  cursor: pointer;
-  font-size: 14px;
-  color: var(--color-border-light);
-  padding: 0 var(--space-1);
-}
-
-.selected-gene .clear-btn:hover {
-  color: var(--color-text-inverse);
 }
 
 /* ========================================================================

@@ -7,48 +7,11 @@
  *
  * This module provides:
  * - TransformPipeline class for chainable transforms
- * - Legacy TRANSFORMS object (for backward compatibility)
  * - Pipeline initialization and configuration
  */
 
 import { getTransformRegistry } from '../core/plugin-contract.js';
-import { initTransformRegistry, BUILTIN_TRANSFORMS } from '../core/transform-registry.js';
-
-// =============================================================================
-// LEGACY TRANSFORMS OBJECT (for backward compatibility)
-// =============================================================================
-
-/**
- * Legacy TRANSFORMS object
- * Maps transform IDs to their definitions for backward compatibility.
- * New code should use the registry directly via getTransformRegistry().
- */
-const TRANSFORMS = {};
-
-// Populate TRANSFORMS from built-in definitions
-for (const t of BUILTIN_TRANSFORMS) {
-  TRANSFORMS[t.id] = {
-    id: t.id,
-    name: t.name,
-    description: t.description,
-    applicableTo: t.supportedTypes,
-    defaultOptions: t.defaultOptions,
-
-    // Wrap execute as apply for legacy compatibility
-    apply(data, options = {}, cellIndices = null) {
-      const registry = getTransformRegistry();
-      const mergedOpts = { ...t.defaultOptions, ...options };
-
-      // Synchronous wrapper - transforms that need async should use registry.execute()
-      // For legacy sync API, we run the execute function directly with CPU backend
-      const context = { backend: 'cpu', registry };
-      const dataWithIndices = cellIndices ? { ...data, cellIndices } : data;
-
-      // Note: This is a sync shim. For async transforms, use the registry directly.
-      return t.execute(dataWithIndices, mergedOpts, context);
-    }
-  };
-}
+import { initTransformRegistry } from '../core/transform-registry.js';
 
 // =============================================================================
 // TRANSFORM PIPELINE CLASS
@@ -92,9 +55,6 @@ export class TransformPipeline {
       optionSchema: transform.optionSchema || {},
       execute: transform.execute || (async (data, opts) => transform.apply(data, opts))
     });
-
-    // Also add to legacy TRANSFORMS for compatibility
-    TRANSFORMS[id] = transform;
   }
 
   /**
@@ -118,9 +78,7 @@ export class TransformPipeline {
         }
       };
     }
-
-    // Fallback to legacy TRANSFORMS
-    return TRANSFORMS[id] || null;
+    return null;
   }
 
   /**
@@ -368,11 +326,5 @@ export function getBackendStatus() {
     workerAvailable: registry.isWorkerAvailable()
   };
 }
-
-// =============================================================================
-// EXPORTS
-// =============================================================================
-
-export { TRANSFORMS };
 
 export default TransformPipeline;

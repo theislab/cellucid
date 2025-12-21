@@ -25,7 +25,6 @@
  * pageSelector.destroy();
  */
 
-import { getPageColor } from '../../core/plugin-contract.js';
 import { formatCount } from '../../shared/dom-utils.js';
 import { StyleManager } from '../../../../utils/style-manager.js';
 
@@ -45,7 +44,6 @@ export class PageSelectorComponent {
    * @param {boolean} [options.showCellCounts=true] - Whether to show cell counts
    * @param {boolean} [options.showSelectAll=true] - Whether to show select all button
    * @param {string[]} [options.initialSelection] - Initial page IDs to select
-   * @param {Map} [options.customColors] - Initial custom colors map
    * @param {string} [options.emptyMessage] - Message when no pages available
    * @param {string} [options.label] - Label text for the selector
    */
@@ -64,7 +62,6 @@ export class PageSelectorComponent {
 
     // State
     this._selectedPages = new Set(options.initialSelection || []);
-    this._customColors = new Map(options.customColors || []);
 
     // DOM references
     this._tabsContainer = null;
@@ -145,7 +142,10 @@ export class PageSelectorComponent {
   _createPageTab(page, index) {
     const isSelected = this._selectedPages.has(page.id);
     const cellCount = this._getCellCount(page.id);
-    const currentColor = this._customColors.get(page.id) || getPageColor(index);
+    const currentColor =
+      (typeof this.dataLayer?.getPageColor === 'function' ? this.dataLayer.getPageColor(page.id) : null)
+      || page?.color
+      || '#888888';
 
     const tab = document.createElement('div');
     tab.className = 'analysis-page-tab' + (isSelected ? ' selected' : '');
@@ -168,11 +168,9 @@ export class PageSelectorComponent {
 
       colorInput.addEventListener('input', (e) => {
         const newColor = e.target.value;
-        this._customColors.set(page.id, newColor);
         StyleManager.setVariable(colorIndicator, '--analysis-page-color', newColor);
-        if (this.onColorChange) {
-          this.onColorChange(page.id, newColor);
-        }
+        if (this.onColorChange) this.onColorChange(page.id, newColor);
+        else this.dataLayer?.setPageColor?.(page.id, newColor);
       });
 
       colorInput.addEventListener('click', (e) => {
@@ -327,24 +325,6 @@ export class PageSelectorComponent {
   }
 
   /**
-   * Get custom colors map
-   * @returns {Map<string, string>}
-   */
-  getCustomColors() {
-    return new Map(this._customColors);
-  }
-
-  /**
-   * Set custom color for a page
-   * @param {string} pageId
-   * @param {string} color
-   */
-  setCustomColor(pageId, color) {
-    this._customColors.set(pageId, color);
-    this.render();
-  }
-
-  /**
    * Update cell counts display (call after highlights change)
    */
   updateCounts() {
@@ -396,7 +376,6 @@ export class PageSelectorComponent {
    */
   destroy() {
     this._selectedPages.clear();
-    this._customColors.clear();
     this.container.innerHTML = '';
   }
 }

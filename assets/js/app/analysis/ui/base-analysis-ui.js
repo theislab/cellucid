@@ -99,7 +99,7 @@ export class BaseAnalysisUI {
     // Selected pages - UNIFIED across all analysis types
     this._selectedPages = [];
 
-    // Current state (kept for backward compatibility, synced with _selectedPages)
+    // Current analysis configuration (pages mirrored from _selectedPages).
     this._currentConfig = {
       dataSource: {
         type: '',
@@ -118,6 +118,10 @@ export class BaseAnalysisUI {
 
     // Loading state
     this._isLoading = false;
+
+    // Persistent page colors (shared with Highlighted Cells UI via DataState).
+    // This Map instance is passed through to plotting so updates propagate without rebuilding objects.
+    this._pageColorMap = new Map();
 
     // Debounce timer
     this._updateTimer = null;
@@ -272,7 +276,7 @@ export class BaseAnalysisUI {
    */
   onPageSelectionChange(pageIds) {
     this._selectedPages = pageIds || [];
-    this._currentConfig.pages = this._selectedPages; // Keep in sync for backward compat
+    this._currentConfig.pages = this._selectedPages;
     this._renderControls();
     this._scheduleUpdate();
   }
@@ -591,6 +595,7 @@ export class BaseAnalysisUI {
    * @returns {Object} FigureContainer instance
    */
   _createFigureContainer(container, options = {}) {
+    this._syncPageColorMapFromState();
     return createFigureContainer({
       container,
       onExportPNG: () => this._exportPNG(),
@@ -600,7 +605,7 @@ export class BaseAnalysisUI {
         this._currentConfig.dataSource.variable
       ),
       onPlotOptionChange: (key, value) => this._onPlotOptionChange(key, value),
-      customColors: this._customPageColors || new Map(),
+      customColors: this._pageColorMap,
       ...options
     });
   }
@@ -616,6 +621,7 @@ export class BaseAnalysisUI {
   _onPageSelectionChange(pageIds) {
     this._selectedPages = pageIds;
     this._currentConfig.pages = this._selectedPages;
+    this._syncPageColorMapFromState();
     this._scheduleUpdate();
 
     if (this.onConfigChange) {
@@ -629,11 +635,19 @@ export class BaseAnalysisUI {
    * @param {string} color - New color
    */
   _onPageColorChange(pageId, color) {
-    if (!this._customPageColors) {
-      this._customPageColors = new Map();
-    }
-    this._customPageColors.set(pageId, color);
+    this.dataLayer?.setPageColor?.(pageId, color);
+    this._syncPageColorMapFromState();
     this._scheduleUpdate();
+  }
+
+  _syncPageColorMapFromState() {
+    this._pageColorMap.clear();
+    const pages = this.dataLayer?.getPages?.() || [];
+    for (const page of pages) {
+      if (!page?.id) continue;
+      const color = page.color || this.dataLayer?.getPageColor?.(page.id) || null;
+      if (color) this._pageColorMap.set(page.id, color);
+    }
   }
 
   /**

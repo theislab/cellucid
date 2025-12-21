@@ -6,6 +6,7 @@
  * - Camera position (orbit + freefly)
  * - Highlight pages and groups
  * - Field filter states
+ * - Field operation registries (renames, deletes, user-defined categoricals)
  * - Active field selections
  * - Multiview/snapshot configurations
  * - Data source and dataset information
@@ -31,8 +32,8 @@ function colorsEqual(a, b, epsilon = 1e-4) {
 }
 
 export function createStateSerializer({ state, viewer, sidebar }) {
-  // v3: multiview restore, full filter capture, stronger post-restore syncing
-  const VERSION = 3;
+  // v4: field operation registries (rename/delete/user-defined) + dev-phase strict versioning
+  const VERSION = 4;
   const dataSourceManager = getDataSourceManager();
 
   const buildAnalyticsContext = () => ({
@@ -292,6 +293,7 @@ export function createStateSerializer({ state, viewer, sidebar }) {
     return pages.map(page => ({
       id: page.id,
       name: page.name,
+      color: page.color || null,
       highlightedGroups: (page.highlightedGroups || []).map(group => ({
         id: group.id,
         type: group.type,
@@ -317,6 +319,7 @@ export function createStateSerializer({ state, viewer, sidebar }) {
     const filters = {};
     (fields || []).forEach((field) => {
       if (!field) return;
+      if (field._isDeleted === true) return;
 
       const modified =
         field.kind === 'category'
@@ -473,6 +476,10 @@ export function createStateSerializer({ state, viewer, sidebar }) {
       camera: viewer.getCameraState?.() || null,
       // Capture active dimension level for proper restoration (don't assume 3D)
       activeDimensionLevel: state.activeDimensionLevel ?? null,
+      // Field operation registries (TASK 1/2/3)
+      renames: state.getRenameRegistry?.()?.toJSON?.() || null,
+      deletedFields: state.getDeleteRegistry?.()?.toJSON?.() || [],
+      userDefinedFields: state.getUserDefinedFieldsRegistry?.()?.toJSON?.() || [],
       uiControls: collectUIControls(),
       highlightPages: serializeHighlightPages(),
       activePageId,
@@ -550,10 +557,10 @@ export function createStateSerializer({ state, viewer, sidebar }) {
     const varLookup = new Map();
 
     obsFields.forEach((field, idx) => {
-      if (field?.key) obsLookup.set(field.key, idx);
+      if (field?.key && field._isDeleted !== true) obsLookup.set(field.key, idx);
     });
     varFields.forEach((field, idx) => {
-      if (field?.key) varLookup.set(field.key, idx);
+      if (field?.key && field._isDeleted !== true) varLookup.set(field.key, idx);
     });
 
     const toRestore = [];
@@ -748,6 +755,10 @@ export function createStateSerializer({ state, viewer, sidebar }) {
         pageIdMap.set(page.id, targetPageId);
       }
 
+      if (page.color && typeof state.setHighlightPageColor === 'function') {
+        state.setHighlightPageColor(targetPageId, page.color);
+      }
+
       // Switch to this page to add groups
       const switched = state.switchToPage?.(targetPageId);
       if (!switched && switched !== undefined) {
@@ -779,15 +790,8 @@ export function createStateSerializer({ state, viewer, sidebar }) {
             console.warn(`[StateSerializer] Failed to restore highlight group: ${group.label}`);
           }
         } else {
-          // Fallback: try to recreate from field data (legacy support)
-          console.log(`[StateSerializer] Using legacy restore for group: ${group.label}`);
-          if (group.type === 'category' && group.fieldIndex != null && group.categoryIndex != null) {
-            state.addHighlightFromCategory?.(group.fieldIndex, group.categoryIndex, group.fieldSource || 'obs');
-            totalGroupsRestored++;
-          } else if (group.type === 'range' && group.fieldIndex != null) {
-            state.addHighlightFromRange?.(group.fieldIndex, group.rangeMin, group.rangeMax, group.fieldSource || 'obs');
-            totalGroupsRestored++;
-          }
+          // Development phase: no legacy/migration restore paths.
+          console.warn(`[StateSerializer] Skipping highlight group without cellIndices: ${group.label}`);
         }
       });
     });
@@ -824,7 +828,7 @@ export function createStateSerializer({ state, viewer, sidebar }) {
     // First, handle var field (gene expression) if present
     if (activeFields.activeVarFieldKey) {
       const varFields = state.getVarFields?.() || [];
-      const varIdx = varFields.findIndex(f => f?.key === activeFields.activeVarFieldKey);
+      const varIdx = varFields.findIndex(f => f?.key === activeFields.activeVarFieldKey && f?._isDeleted !== true);
       if (varIdx >= 0) {
         console.log(`[StateSerializer] Activating var field: ${activeFields.activeVarFieldKey} (index: ${varIdx})`);
         await state.ensureVarFieldLoaded?.(varIdx);
@@ -832,13 +836,8 @@ export function createStateSerializer({ state, viewer, sidebar }) {
 
         // Update gene expression search UI
         const geneSearch = document.getElementById('gene-expression-search');
-        const geneSelected = document.getElementById('gene-expression-selected');
         if (geneSearch) {
           geneSearch.value = activeFields.activeVarFieldKey;
-        }
-        if (geneSelected) {
-          geneSelected.textContent = activeFields.activeVarFieldKey;
-          geneSelected.style.display = 'block';
         }
       }
     }
@@ -846,7 +845,7 @@ export function createStateSerializer({ state, viewer, sidebar }) {
     // Then handle obs field
     if (activeFields.activeFieldKey && activeFields.activeFieldSource === 'obs') {
       const fields = state.getFields?.() || [];
-      const idx = fields.findIndex(f => f?.key === activeFields.activeFieldKey);
+      const idx = fields.findIndex(f => f?.key === activeFields.activeFieldKey && f?._isDeleted !== true);
 
       if (idx >= 0) {
         const field = fields[idx];
@@ -878,7 +877,7 @@ export function createStateSerializer({ state, viewer, sidebar }) {
     } else if (activeFields.activeFieldSource === 'var' && activeFields.activeFieldKey) {
       // Active field is a var field (gene) - handled above, but also activate it as primary
       const varFields = state.getVarFields?.() || [];
-      const varIdx = varFields.findIndex(f => f?.key === activeFields.activeFieldKey);
+      const varIdx = varFields.findIndex(f => f?.key === activeFields.activeFieldKey && f?._isDeleted !== true);
       if (varIdx >= 0) {
         console.log(`[StateSerializer] Activating var field as primary: ${activeFields.activeFieldKey}`);
         await state.ensureVarFieldLoaded?.(varIdx);
@@ -911,14 +910,12 @@ export function createStateSerializer({ state, viewer, sidebar }) {
     const categoricalSelect = document.getElementById('categorical-field');
     const continuousSelect = document.getElementById('continuous-field');
     const geneSearch = document.getElementById('gene-expression-search');
-    const geneSelected = document.getElementById('gene-expression-selected');
 
     if (!activeField) {
       // No active field - clear all selects
       if (categoricalSelect) categoricalSelect.value = '-1';
       if (continuousSelect) continuousSelect.value = '-1';
       if (geneSearch) geneSearch.value = '';
-      if (geneSelected) geneSelected.style.display = 'none';
       return;
     }
 
@@ -927,10 +924,6 @@ export function createStateSerializer({ state, viewer, sidebar }) {
       if (categoricalSelect) categoricalSelect.value = '-1';
       if (continuousSelect) continuousSelect.value = '-1';
       if (geneSearch) geneSearch.value = activeField.key || '';
-      if (geneSelected) {
-        geneSelected.textContent = activeField.key || '';
-        geneSelected.style.display = 'block';
-      }
     } else {
       // Obs field is active
       const fieldIndex = fields.findIndex(f => f?.key === activeField.key);
@@ -942,7 +935,6 @@ export function createStateSerializer({ state, viewer, sidebar }) {
         if (continuousSelect) continuousSelect.value = String(fieldIndex);
       }
       if (geneSearch) geneSearch.value = '';
-      if (geneSelected) geneSelected.style.display = 'none';
     }
   }
 
@@ -1044,9 +1036,9 @@ export function createStateSerializer({ state, viewer, sidebar }) {
 
     console.log('[StateSerializer] Restoring state from snapshot:', snapshot.timestamp);
 
-    // Version check
-    if (snapshot.version && snapshot.version > VERSION) {
-      console.warn(`State snapshot version ${snapshot.version} is newer than supported ${VERSION}`);
+    // Development phase: strict snapshot format (no migrations).
+    if (snapshot.version !== VERSION) {
+      throw new Error(`Unsupported state snapshot version: ${snapshot.version ?? 'missing'} (expected ${VERSION})`);
     }
 
     // Check data source compatibility
@@ -1067,6 +1059,31 @@ export function createStateSerializer({ state, viewer, sidebar }) {
           console.log(`[StateSerializer] Original user data path: ${snapshot.dataSource.userPath}`);
         }
       }
+    }
+
+    // 0. Restore field operation registries FIRST, then apply overlays to metadata.
+    // This ensures filters/active fields restore against the correct display names
+    // and deleted fields are excluded from restore paths.
+    const renameRegistry = state.getRenameRegistry?.();
+    const deleteRegistry = state.getDeleteRegistry?.();
+    const userDefinedRegistry = state.getUserDefinedFieldsRegistry?.();
+
+    renameRegistry?.clear?.();
+    deleteRegistry?.clear?.();
+    userDefinedRegistry?.clear?.();
+
+    if (snapshot.renames) {
+      renameRegistry?.fromJSON?.(snapshot.renames);
+    }
+    if (snapshot.deletedFields) {
+      deleteRegistry?.fromJSON?.(snapshot.deletedFields);
+    }
+
+    state.applyFieldOverlays?.();
+
+    if (snapshot.userDefinedFields) {
+      userDefinedRegistry?.fromJSON?.(snapshot.userDefinedFields, state);
+      state.applyFieldOverlays?.();
     }
 
     const controls = snapshot.uiControls || {};

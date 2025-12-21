@@ -10,6 +10,20 @@ import {
   sampleContinuousColormap
 } from '../data/palettes.js';
 import { getNotificationCenter } from './notification-center.js';
+import { RenameRegistry } from './registries/rename-registry.js';
+import { DeleteRegistry } from './registries/delete-registry.js';
+import { UserDefinedFieldsRegistry } from './registries/user-defined-fields.js';
+import { StateValidator } from './utils/state-validator.js';
+import { ChangeType, FieldKind, FieldSource } from './utils/field-constants.js';
+import { getFieldRegistry } from './utils/field-registry.js';
+import { makeUniqueLabel } from './utils/label-utils.js';
+import { getPageColor } from './utils/page-colors.js';
+import {
+  buildDeleteToUnassignedTransform,
+  buildMergeCategoriesTransform,
+  applyCategoryIndexMapping,
+  applyCategoryIndexMappingInPlace
+} from './utils/categorical-ops.js';
 
 const NEUTRAL_GRAY_UINT8 = 211; // lightgray default when no field is selected (0-255)
 
@@ -76,6 +90,18 @@ class DataState {
     this._batchMode = false;
     this._batchDepth = 0; // Track nested batch calls
     this._batchDirty = { visibility: false, colors: false, affectedFields: new Set() };
+
+    // -----------------------------------------------------------------------
+    // Field operations (rename / delete / user-defined categoricals)
+    // -----------------------------------------------------------------------
+
+    this._renameRegistry = new RenameRegistry();
+    this._deleteRegistry = new DeleteRegistry();
+    this._userDefinedFields = new UserDefinedFieldsRegistry();
+    this._fieldChangeCallbacks = new Set();
+
+    // Bind singleton registry for fast lookups.
+    getFieldRegistry().bind(this);
   }
 
   // --- Batch mode for bulk operations -----------------------------------------
@@ -232,6 +258,7 @@ class DataState {
             // Use getFieldForView to get live's field, NOT getActiveField which returns active view's field
             const liveField = this.getFieldForView('live');
             if (liveField && liveField.kind === 'category') {
+              this._ensureUserDefinedCentroidsForDim(liveField, level);
               this.buildCentroidsForField(liveField, { viewId: 'live' });
               // Push directly to live view's centroid buffers (don't use _pushCentroidsToViewer
               // which checks activeViewId and might push to wrong view)
@@ -284,6 +311,7 @@ class DataState {
             // Get the field for this snapshot view from its context
             const snapshotField = this.getFieldForView(targetViewId);
             if (snapshotField && snapshotField.kind === 'category') {
+              this._ensureUserDefinedCentroidsForDim(snapshotField, level);
               this.buildCentroidsForField(snapshotField, { viewId: targetViewId });
               // Update the snapshot's centroid data in viewer
               if (this.viewer.updateSnapshotAttributes) {
@@ -545,6 +573,14 @@ class DataState {
     this.centroidOutliers = ctx.centroidOutliers ? new Float32Array(ctx.centroidOutliers) : null;
     this.centroidLabels = ctx.centroidLabels ? ctx.centroidLabels.map((c) => (c ? { ...c } : c)) : [];
     this.filteredCount = ctx.filteredCount ? { ...ctx.filteredCount } : { shown: this.pointCount, total: this.pointCount };
+
+    // Ensure global overlays are applied after any context restore.
+    this._applyOverlaysToFields(this.obsData?.fields, FieldSource.OBS);
+    this._applyOverlaysToFields(this.varData?.fields, FieldSource.VAR);
+    this._injectUserDefinedFields();
+    this._ensureActiveSelectionNotDeleted();
+    getFieldRegistry().invalidate();
+
     if (preserveSnapshots) {
       this.activeViewId = 'live';
       this.viewContexts.set('live', this._buildContextFromCurrent('live', { cloneArrays: false }));
@@ -677,6 +713,14 @@ class DataState {
     this.centroidOutliers = ctx.centroidOutliers ? new Float32Array(ctx.centroidOutliers) : null;
     this.centroidLabels = ctx.centroidLabels ? ctx.centroidLabels.map(c => c ? { ...c } : c) : [];
     this.filteredCount = ctx.filteredCount ? { ...ctx.filteredCount } : { shown: this.pointCount, total: this.pointCount };
+
+    // Apply global overlays (rename/delete/user-defined) to the freshly-cloned field metadata.
+    // This keeps view switching stable without touching render buffers.
+    this._applyOverlaysToFields(this.obsData?.fields, FieldSource.OBS);
+    this._applyOverlaysToFields(this.varData?.fields, FieldSource.VAR);
+    this._injectUserDefinedFields();
+    this._ensureActiveSelectionNotDeleted();
+    getFieldRegistry().invalidate();
 
     // IMPORTANT: Sync dimension level from the view's context
     // This ensures the active dimension level matches the view being switched to
@@ -839,7 +883,6 @@ class DataState {
     const centroidsByDim = field.centroidsByDim || {};
     return centroidsByDim[String(currentDim)]
       || centroidsByDim[currentDim]
-      || field.centroids  // Legacy fallback
       || [];
   }
 
@@ -880,11 +923,8 @@ class DataState {
    * Initialize the scene with positions and observation data.
    * @param {Float32Array} positions - Already-normalized 3D positions from DimensionManager
    * @param {Object} obs - Observation data with fields and centroids
-   * @param {Object} [normTransform] - (Deprecated) Previously used for centroid normalization.
-   *                                   Now handled lazily in buildCentroidsForField() to support
-   *                                   per-dimension centroid normalization when switching dimensions.
    */
-  initScene(positions, obs, normTransform = null) {
+  initScene(positions, obs) {
     const normalizedFields = (obs?.fields || []).map((field) => ({
       ...field,
       loaded: Boolean(field?.values || field?.codes),
@@ -894,6 +934,13 @@ class DataState {
     this.obsData = { ...obs, fields: normalizedFields };
     this._fieldDataCache.clear();
     this._varFieldDataCache.clear();
+
+    // Development phase: a dataset load is a hard reset for all field-operation state.
+    // Saved sessions can be regenerated, so we do not carry registry state across datasets.
+    this._renameRegistry.clear();
+    this._deleteRegistry.clear();
+    this._userDefinedFields.clear();
+    getFieldRegistry().invalidate();
 
     // Positions are already normalized by DimensionManager.getPositions3D().
     // Centroid normalization is now handled lazily in buildCentroidsForField() to ensure
@@ -978,14 +1025,36 @@ class DataState {
     });
   }
 
+  // --- Field operation callbacks ---------------------------------------------
+
+  addFieldChangeCallback(callback) {
+    if (typeof callback === 'function') {
+      this._fieldChangeCallbacks.add(callback);
+    }
+  }
+
+  removeFieldChangeCallback(callback) {
+    this._fieldChangeCallbacks.delete(callback);
+  }
+
+  _notifyFieldChange(source, fieldIndex, changeType, detail = null) {
+    if (!this._fieldChangeCallbacks || this._fieldChangeCallbacks.size === 0) return;
+    const event = { source, fieldIndex, changeType, detail };
+    this._fieldChangeCallbacks.forEach((cb) => {
+      try { cb(event); }
+      catch (err) { console.error('Field change callback failed', err); }
+    });
+  }
+
   // Returns per-point visibility (0 = hidden, 1 = visible) including outlier filtering
   getVisibilityArray() {
     const total = this.pointCount || 0;
     if (!total) return new Float32Array();
 
     const alpha = this.categoryTransparency || new Float32Array(total).fill(1.0);
-    const outliers = this.outlierQuantilesArray || [];
-    const outlierThreshold = this.getCurrentOutlierThreshold();
+    const applyOutlierFilter = this.isOutlierFilterEnabledForActiveField?.();
+    const outliers = applyOutlierFilter ? (this.outlierQuantilesArray || []) : [];
+    const outlierThreshold = applyOutlierFilter ? this.getCurrentOutlierThreshold() : 1.0;
 
     if (!this._visibilityScratch || this._visibilityScratch.length !== total) {
       this._visibilityScratch = new Float32Array(total);
@@ -994,7 +1063,7 @@ class DataState {
     const mask = this._visibilityScratch;
     for (let i = 0; i < total; i++) {
       let visible = (alpha[i] ?? 0) > 0.001;
-      if (visible) {
+      if (visible && applyOutlierFilter) {
         const q = (i < outliers.length) ? outliers[i] : -1;
         if (q >= 0 && q > outlierThreshold) visible = false;
       }
@@ -1010,14 +1079,17 @@ class DataState {
     if (!positions || !this.pointCount) return new Float32Array();
 
     const alpha = this.categoryTransparency || new Float32Array(this.pointCount).fill(1.0);
-    const outliers = this.outlierQuantilesArray || [];
-    const outlierThreshold = this.getCurrentOutlierThreshold();
+    const applyOutlierFilter = this.isOutlierFilterEnabledForActiveField?.();
+    const outliers = applyOutlierFilter ? (this.outlierQuantilesArray || []) : [];
+    const outlierThreshold = applyOutlierFilter ? this.getCurrentOutlierThreshold() : 1.0;
 
     let visibleCount = 0;
     for (let i = 0; i < this.pointCount; i++) {
       if (alpha[i] <= 0.001) continue;
-      const q = (i < outliers.length) ? outliers[i] : -1;
-      if (q >= 0 && q > outlierThreshold) continue;
+      if (applyOutlierFilter) {
+        const q = (i < outliers.length) ? outliers[i] : -1;
+        if (q >= 0 && q > outlierThreshold) continue;
+      }
       visibleCount++;
     }
 
@@ -1025,8 +1097,10 @@ class DataState {
     let dst = 0;
     for (let i = 0; i < this.pointCount; i++) {
       if (alpha[i] <= 0.001) continue;
-      const q = (i < outliers.length) ? outliers[i] : -1;
-      if (q >= 0 && q > outlierThreshold) continue;
+      if (applyOutlierFilter) {
+        const q = (i < outliers.length) ? outliers[i] : -1;
+        if (q >= 0 && q > outlierThreshold) continue;
+      }
       const srcIdx = 3 * i;
       result[dst++] = positions[srcIdx];
       result[dst++] = positions[srcIdx + 1];
@@ -1050,6 +1124,1264 @@ class DataState {
       return this.getVarFields()[this.activeVarFieldIndex];
     }
     return this.getFields()[this.activeFieldIndex];
+  }
+
+  // --- Field operations (rename / delete / user-defined) ----------------------
+
+  getRenameRegistry() { return this._renameRegistry; }
+  getDeleteRegistry() { return this._deleteRegistry; }
+  getUserDefinedFieldsRegistry() { return this._userDefinedFields; }
+
+  /**
+   * Apply rename/delete overlays stored in registries to the currently loaded field metadata.
+   * This is safe to call during view switching because it does not touch render buffers.
+   */
+  applyFieldOverlays() {
+    this._applyOverlaysToFields(this.obsData?.fields, FieldSource.OBS);
+    this._applyOverlaysToFields(this.varData?.fields, FieldSource.VAR);
+    this._injectUserDefinedFields();
+
+    // Keep active selection pointing at a non-deleted field (buffers remain untouched).
+    this._ensureActiveSelectionNotDeleted();
+
+    getFieldRegistry().invalidate();
+    this._syncActiveContext();
+  }
+
+  getVisibleFields(source) {
+    return getFieldRegistry().getVisibleFields(source);
+  }
+
+  isFieldDeleted(source, fieldIndex) {
+    const fields = source === FieldSource.VAR ? this.varData?.fields : this.obsData?.fields;
+    return fields?.[fieldIndex]?._isDeleted === true;
+  }
+
+  renameField(source, fieldIndex, newKey) {
+    const src = source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
+    const fields = src === FieldSource.VAR ? this.varData?.fields : this.obsData?.fields;
+
+    try {
+      StateValidator.validateFieldIndex(fieldIndex, fields);
+      StateValidator.validateFieldKey(newKey);
+    } catch (e) {
+      console.error('[State] renameField validation failed:', e.message);
+      return false;
+    }
+
+    if (StateValidator.isDuplicateKey(newKey, fields, fieldIndex)) {
+      console.error('[State] renameField: duplicate key', newKey);
+      return false;
+    }
+
+    const field = fields[fieldIndex];
+    if (!field) return false;
+
+    const isUserDefined = field._isUserDefined === true && field._userDefinedId;
+
+    if (!field._originalKey) {
+      field._originalKey = field.key;
+    }
+
+    const originalKey = field._originalKey;
+    const previousKey = field.key;
+
+    if (newKey === originalKey) {
+      field.key = originalKey;
+      delete field._originalKey;
+      if (!isUserDefined) {
+        this._renameRegistry.revertFieldRename(src, originalKey);
+      }
+    } else {
+      field.key = newKey;
+      if (!isUserDefined) {
+        this._renameRegistry.setFieldRename(src, originalKey, newKey);
+      }
+    }
+
+    if (isUserDefined) {
+      this._userDefinedFields?.updateField?.(field._userDefinedId, { key: field.key });
+    }
+
+    this._refreshHighlightGroupsForField(src, fieldIndex);
+    getFieldRegistry().invalidate();
+    this.updateFilterSummary();
+    this._syncActiveContext();
+    this._notifyFieldChange(src, fieldIndex, ChangeType.RENAME, { originalKey, previousKey, newKey: field.key });
+    return true;
+  }
+
+  /**
+   * Revert a field rename back to its original key (if renamed).
+   * @param {string} source - 'obs' | 'var'
+   * @param {number} fieldIndex
+   * @returns {boolean}
+   */
+  revertFieldRename(source, fieldIndex) {
+    const src = source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
+    const fields = src === FieldSource.VAR ? this.varData?.fields : this.obsData?.fields;
+
+    try {
+      StateValidator.validateFieldIndex(fieldIndex, fields);
+    } catch (e) {
+      console.error('[State] revertFieldRename validation failed:', e.message);
+      return false;
+    }
+
+    const field = fields[fieldIndex];
+    if (!field) return false;
+    if (!field._originalKey) return true;
+    return this.renameField(src, fieldIndex, field._originalKey);
+  }
+
+  renameCategory(source, fieldIndex, categoryIndex, newLabel) {
+    const src = source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
+    const fields = src === FieldSource.VAR ? this.varData?.fields : this.obsData?.fields;
+
+    try {
+      StateValidator.validateFieldIndex(fieldIndex, fields);
+      const field = fields[fieldIndex];
+      StateValidator.validateCategoryIndex(categoryIndex, field);
+      StateValidator.validateCategoryLabel(newLabel);
+    } catch (e) {
+      console.error('[State] renameCategory validation failed:', e.message);
+      return false;
+    }
+
+    const field = fields[fieldIndex];
+    const isUserDefined = field._isUserDefined === true && field._userDefinedId;
+
+    if (!field._originalCategories) {
+      field._originalCategories = [...field.categories];
+    }
+
+    const originalFieldKey = field._originalKey || field.key;
+    const originalLabel = field._originalCategories?.[categoryIndex] ?? field.categories[categoryIndex];
+
+    if (newLabel === String(originalLabel)) {
+      // Revert this category label to its original.
+      field.categories[categoryIndex] = originalLabel;
+      if (!isUserDefined) {
+        this._renameRegistry.revertCategoryRename(src, originalFieldKey, categoryIndex);
+      }
+    } else {
+      field.categories[categoryIndex] = newLabel;
+      if (!isUserDefined) {
+        this._renameRegistry.setCategoryRename(src, originalFieldKey, categoryIndex, newLabel);
+      }
+    }
+
+    if (isUserDefined && Array.isArray(field._originalCategories)) {
+      const hasAnyRename = field.categories.some((label, idx) => String(label) !== String(field._originalCategories[idx]));
+      if (!hasAnyRename) {
+        delete field._originalCategories;
+      }
+    }
+
+    // Keep centroid labels consistent with the category list.
+    this._syncCentroidCategoryLabelAtIndex(field, categoryIndex);
+    this._refreshHighlightGroupsForField(src, fieldIndex);
+
+    // If this field is currently active, push centroid label updates.
+    if (src === FieldSource.OBS && this.activeFieldSource === FieldSource.OBS && this.activeFieldIndex === fieldIndex) {
+      this.buildCentroidsForField(field);
+      this._pushCentroidsToViewer();
+    }
+
+    this.updateFilterSummary();
+    this._syncActiveContext();
+    this._notifyFieldChange(src, fieldIndex, ChangeType.CATEGORY_RENAME, { categoryIndex, newLabel: field.categories[categoryIndex] });
+    return true;
+  }
+
+  /**
+   * Create a new categorical obs column where one category is merged into a
+   * single canonical `unassigned` bucket (accumulating deletions).
+   *
+   * This is a destructive edit of the category assignment:
+   * - For source fields, we create a user-defined derived field and soft-delete
+   *   the source field (restorable via Deleted Fields).
+   * - For already user-defined derived fields, we edit the field in place to
+   *   keep the workflow fast and avoid cluttering the field list. In this path
+   *   we remap per-cell codes in place when possible to avoid allocating an
+   *   additional full codes array on every edit.
+   *
+   * @param {number} fieldIndex
+   * @param {number} categoryIndex
+   * @param {object} [options]
+   * @param {string} [options.unassignedLabel='unassigned']
+   * @param {string} [options.newKey] - Optional explicit new field key
+   * @returns {{ newFieldIndex: number, newKey: string }|null}
+   */
+  deleteCategoryToUnassigned(fieldIndex, categoryIndex, options = {}) {
+    const fields = this.obsData?.fields;
+
+    try {
+      StateValidator.validateFieldIndex(fieldIndex, fields);
+      const field = fields[fieldIndex];
+      StateValidator.validateCategoryIndex(categoryIndex, field);
+    } catch (e) {
+      console.error('[State] deleteCategoryToUnassigned validation failed:', e.message);
+      return null;
+    }
+
+    const sourceField = fields[fieldIndex];
+    if (!sourceField || sourceField.kind !== FieldKind.CATEGORY) return null;
+    if (sourceField._isDeleted === true) return null;
+
+    const canEditInPlace = sourceField._isUserDefined === true && Boolean(sourceField._userDefinedId);
+    const editInPlace = options.editInPlace !== false && canEditInPlace;
+
+    const deletedLabel = String(sourceField.categories?.[categoryIndex] ?? '');
+    const unassignedLabel = String(options.unassignedLabel ?? 'unassigned').trim() || 'unassigned';
+
+    let transform;
+    try {
+      transform = buildDeleteToUnassignedTransform(sourceField.categories || [], categoryIndex, { unassignedLabel });
+    } catch (err) {
+      console.error('[State] deleteCategoryToUnassigned failed:', err.message);
+      return null;
+    }
+
+    const nextCategories = transform.categories;
+
+    // In-place edit for user-defined derived fields:
+    // avoids creating another full field copy on repeated destructive edits.
+    if (editInPlace) {
+      // Prefer in-place remapping to avoid allocating a full codes copy on every edit.
+      // Fallback to allocating when codes isn't a TypedArray (unexpected).
+      let nextCodes = sourceField.codes;
+      const didInPlace = applyCategoryIndexMappingInPlace(nextCodes, transform.mapping);
+      if (!didInPlace) {
+        nextCodes = applyCategoryIndexMapping(sourceField.codes, transform.mapping, nextCategories.length);
+      }
+
+      try {
+        this.ensureCategoryMetadata(sourceField);
+      } catch {}
+
+      const oldColors = sourceField._categoryColors || [];
+      const oldVisible = sourceField._categoryVisible || {};
+
+      const newColors = new Array(nextCategories.length);
+      const newVisible = {};
+      for (let i = 0; i < nextCategories.length; i++) newVisible[i] = true;
+
+      const merged = new Set(transform.mergedOldIndices || []);
+      const unassignedOld = transform.keptOldUnassignedIndex;
+      const unassignedNew = transform.unassignedNewIndex;
+
+      // Unassigned bucket: prefer the kept old unassigned color, otherwise palette default.
+      if (unassignedOld != null && oldColors[unassignedOld]) {
+        newColors[unassignedNew] = oldColors[unassignedOld];
+        newVisible[unassignedNew] = oldVisible[unassignedOld] !== false;
+      } else {
+        newColors[unassignedNew] = getCategoryColor(unassignedNew);
+        newVisible[unassignedNew] = true;
+      }
+
+      // Copy remaining categories (skip those merged into unassigned).
+      for (let oldIdx = 0; oldIdx < transform.mapping.length; oldIdx++) {
+        if (oldIdx === unassignedOld) continue;
+        if (merged.has(oldIdx)) continue;
+        const newIdx = transform.mapping[oldIdx];
+        const c = oldColors[oldIdx];
+        if (c) newColors[newIdx] = c;
+        newVisible[newIdx] = oldVisible[oldIdx] !== false;
+      }
+
+      sourceField.categories = nextCategories;
+      if (!didInPlace) sourceField.codes = nextCodes;
+      sourceField._categoryColors = newColors;
+      sourceField._categoryVisible = newVisible;
+
+      delete sourceField._originalCategories;
+      delete sourceField.outlierQuantiles;
+      delete sourceField._outlierThreshold;
+
+      try {
+        sourceField.centroidsByDim = this._userDefinedFields.computeCentroidsByDim(nextCodes, nextCategories, this);
+      } catch (err) {
+        console.warn('[State] deleteCategoryToUnassigned in-place centroid compute failed:', err);
+      }
+
+      sourceField._operation = {
+        type: 'delete-to-unassigned',
+        deletedCategoryIndex: categoryIndex,
+        deletedCategoryLabel: deletedLabel,
+        unassignedLabel: String(unassignedLabel)
+      };
+
+      // Keep serialized template in sync for persistence.
+      const template = this._userDefinedFields?.getField?.(sourceField._userDefinedId);
+      if (template) {
+        template.categories = nextCategories;
+        template.codes = sourceField.codes;
+        if (sourceField.centroidsByDim) template.centroidsByDim = sourceField.centroidsByDim;
+        template._operation = sourceField._operation;
+      }
+
+      // Remap any category-based highlight groups referencing this field.
+      for (const page of this.highlightPages || []) {
+        for (const group of (page.highlightedGroups || [])) {
+          if (!group || group.type !== 'category') continue;
+          if (group.fieldSource !== FieldSource.OBS) continue;
+          if (group.fieldIndex !== fieldIndex) continue;
+          const oldCat = group.categoryIndex;
+          if (!Number.isInteger(oldCat) || oldCat < 0 || oldCat >= transform.mapping.length) continue;
+          group.categoryIndex = transform.mapping[oldCat];
+        }
+      }
+
+      getFieldRegistry().invalidate();
+      this._syncActiveContext();
+
+      try {
+        this.setActiveField(fieldIndex);
+      } catch (err) {
+        console.warn('[State] Failed to re-activate edited field:', err);
+      }
+
+      this.updateFilterSummary();
+      this._refreshHighlightGroupsForField(FieldSource.OBS, fieldIndex);
+      this._notifyFieldChange(FieldSource.OBS, fieldIndex, ChangeType.UPDATE, {
+        operation: 'delete-to-unassigned',
+        unassignedLabel
+      });
+
+      // Note: restoration is still possible by restoring the original source column
+      // that this user-defined field was derived from.
+      return { newFieldIndex: fieldIndex, newKey: sourceField.key, updatedInPlace: true };
+    }
+
+    const nextCodes = applyCategoryIndexMapping(sourceField.codes, transform.mapping, nextCategories.length);
+
+    const rootKey = sourceField._sourceField?.sourceKey || sourceField._originalKey || sourceField.key;
+    const baseKey = String(options.newKey || `${rootKey} (edited)`).trim() || `${rootKey} (edited)`;
+    const existingKeys = (fields || []).filter((f) => f && f._isDeleted !== true).map((f) => f.key);
+    const newKey = makeUniqueLabel(baseKey, existingKeys);
+
+    let created;
+    try {
+      created = this._userDefinedFields.createFromCategoricalCodes(
+        {
+          key: newKey,
+          categories: nextCategories,
+          codes: nextCodes,
+          meta: {
+            _sourceField: {
+              kind: 'categorical-obs',
+              sourceKey: rootKey,
+              sourceIndex: fieldIndex
+            },
+            _operation: {
+              type: 'delete-to-unassigned',
+              deletedCategoryIndex: categoryIndex,
+              deletedCategoryLabel: String(sourceField.categories?.[categoryIndex] ?? ''),
+              unassignedLabel: String(unassignedLabel)
+            }
+          }
+        },
+        this
+      );
+    } catch (err) {
+      console.error('[State] deleteCategoryToUnassigned create failed:', err.message);
+      return null;
+    }
+
+    const derivedField = created.field;
+
+    // Carry forward category UI state (colors/visibility) as a convenience.
+    try {
+      this.ensureCategoryMetadata(sourceField);
+      const newColors = new Array(nextCategories.length);
+      const newVisible = {};
+      for (let i = 0; i < nextCategories.length; i++) newVisible[i] = true;
+
+      const oldColors = sourceField._categoryColors || [];
+      const oldVisible = sourceField._categoryVisible || {};
+
+      // Unassigned bucket: prefer the kept old unassigned color, otherwise palette default.
+      const unassignedOld = transform.keptOldUnassignedIndex;
+      const unassignedNew = transform.unassignedNewIndex;
+      if (unassignedOld != null && oldColors[unassignedOld]) {
+        newColors[unassignedNew] = oldColors[unassignedOld];
+        newVisible[unassignedNew] = oldVisible[unassignedOld] !== false;
+      } else {
+        newColors[unassignedNew] = getCategoryColor(unassignedNew);
+        newVisible[unassignedNew] = true;
+      }
+
+      // Copy remaining categories (skip those merged into unassigned).
+      const merged = new Set(transform.mergedOldIndices || []);
+      for (let oldIdx = 0; oldIdx < transform.mapping.length; oldIdx++) {
+        if (oldIdx === unassignedOld) continue;
+        if (merged.has(oldIdx)) continue;
+        const newIdx = transform.mapping[oldIdx];
+        const c = oldColors[oldIdx];
+        if (c) newColors[newIdx] = c;
+        newVisible[newIdx] = oldVisible[oldIdx] !== false;
+      }
+
+      derivedField._categoryColors = newColors;
+      derivedField._categoryVisible = newVisible;
+      derivedField._categoryFilterEnabled = sourceField._categoryFilterEnabled ?? true;
+      if (sourceField._colormapId) derivedField._colormapId = sourceField._colormapId;
+    } catch (err) {
+      console.warn('[State] Failed to carry category UI state to derived field:', err);
+    }
+
+    // Ensure this derived field does not carry latent outlier filtering state.
+    delete derivedField.outlierQuantiles;
+    delete derivedField._outlierThreshold;
+
+    fields.push(derivedField);
+    const newFieldIndex = fields.length - 1;
+
+    getFieldRegistry().invalidate();
+    this._syncActiveContext();
+    this._notifyFieldChange(FieldSource.OBS, newFieldIndex, ChangeType.CREATE, { userDefinedId: created.id });
+
+    // Activate new field before deleting the previous one (avoids a brief "no field" state).
+    try {
+      this.setActiveField(newFieldIndex);
+    } catch (err) {
+      console.warn('[State] Failed to activate derived field:', err);
+    }
+
+    // Soft-delete the source field for a clean UX; restoration is available in Deleted Fields.
+    this.deleteField(FieldSource.OBS, fieldIndex);
+
+    return { newFieldIndex, newKey };
+  }
+
+  /**
+   * Create a new categorical obs column where one category is merged into another.
+   *
+   * Implemented as:
+   * - For source fields, a derived user-defined field + soft-delete of the source field.
+   * - For user-defined derived fields, an in-place edit (with in-place code remapping
+   *   when possible) to support repeated drag-merge workflows without repeated large
+   *   allocations or a growing field list.
+   *
+   * @param {number} fieldIndex
+   * @param {number} fromCategoryIndex
+   * @param {number} toCategoryIndex
+   * @param {object} [options]
+   * @param {string} [options.newKey]
+   * @returns {{ newFieldIndex: number, newKey: string }|null}
+   */
+  mergeCategoriesToNewField(fieldIndex, fromCategoryIndex, toCategoryIndex, options = {}) {
+    const fields = this.obsData?.fields;
+
+    try {
+      StateValidator.validateFieldIndex(fieldIndex, fields);
+      const field = fields[fieldIndex];
+      StateValidator.validateCategoryIndex(fromCategoryIndex, field);
+      StateValidator.validateCategoryIndex(toCategoryIndex, field);
+    } catch (e) {
+      console.error('[State] mergeCategoriesToNewField validation failed:', e.message);
+      return null;
+    }
+
+    const sourceField = fields[fieldIndex];
+    if (!sourceField || sourceField.kind !== FieldKind.CATEGORY) return null;
+    if (sourceField._isDeleted === true) return null;
+
+    const canEditInPlace = sourceField._isUserDefined === true && Boolean(sourceField._userDefinedId);
+    const editInPlace = options.editInPlace !== false && canEditInPlace;
+
+    let transform;
+    try {
+      transform = buildMergeCategoriesTransform(sourceField.categories || [], fromCategoryIndex, toCategoryIndex);
+    } catch (err) {
+      console.error('[State] mergeCategoriesToNewField failed:', err.message);
+      return null;
+    }
+
+    const nextCategories = transform.categories;
+    const fromLabel = String(sourceField.categories?.[fromCategoryIndex] ?? '');
+    const toLabel = String(sourceField.categories?.[toCategoryIndex] ?? '');
+    const targetNewIndex = transform.targetNewIndex;
+
+    // Rename the merged bucket so the result is explicit to the user.
+    // The merged label is "dragged + target" so drag direction is visible.
+    const mergedBase = String(options.mergedLabel ?? `merged ${fromLabel} + ${toLabel}`).trim() || 'merged';
+    const mergedLabel = makeUniqueLabel(
+      mergedBase,
+      nextCategories.filter((_, idx) => idx !== targetNewIndex)
+    );
+    if (nextCategories[targetNewIndex] != null) {
+      nextCategories[targetNewIndex] = mergedLabel;
+    }
+
+    if (editInPlace) {
+      // Prefer in-place remapping to avoid allocating a full codes copy on every edit.
+      // Fallback to allocating when codes isn't a TypedArray (unexpected).
+      let nextCodes = sourceField.codes;
+      const didInPlace = applyCategoryIndexMappingInPlace(nextCodes, transform.mapping);
+      if (!didInPlace) {
+        nextCodes = applyCategoryIndexMapping(sourceField.codes, transform.mapping, nextCategories.length);
+      }
+
+      try {
+        this.ensureCategoryMetadata(sourceField);
+      } catch {}
+
+      const oldColors = sourceField._categoryColors || [];
+      const oldVisible = sourceField._categoryVisible || {};
+      const newColors = new Array(nextCategories.length);
+      const newVisible = {};
+      for (let i = 0; i < nextCategories.length; i++) newVisible[i] = true;
+
+      // Merged bucket color should come from the dragged category.
+      const draggedColor = oldColors[fromCategoryIndex] || getCategoryColor(fromCategoryIndex);
+      newColors[targetNewIndex] = draggedColor;
+      newVisible[targetNewIndex] = (oldVisible[fromCategoryIndex] !== false) || (oldVisible[toCategoryIndex] !== false);
+
+      for (let oldIdx = 0; oldIdx < transform.mapping.length; oldIdx++) {
+        if (oldIdx === fromCategoryIndex || oldIdx === toCategoryIndex) continue;
+        const newIdx = transform.mapping[oldIdx];
+        const c = oldColors[oldIdx];
+        if (c) newColors[newIdx] = c;
+        newVisible[newIdx] = oldVisible[oldIdx] !== false;
+      }
+
+      sourceField.categories = nextCategories;
+      if (!didInPlace) sourceField.codes = nextCodes;
+      sourceField._categoryColors = newColors;
+      sourceField._categoryVisible = newVisible;
+
+      delete sourceField._originalCategories;
+      delete sourceField.outlierQuantiles;
+      delete sourceField._outlierThreshold;
+
+      try {
+        sourceField.centroidsByDim = this._userDefinedFields.computeCentroidsByDim(nextCodes, nextCategories, this);
+      } catch (err) {
+        console.warn('[State] mergeCategoriesToNewField in-place centroid compute failed:', err);
+      }
+
+      sourceField._operation = {
+        type: 'merge-categories',
+        fromCategoryIndex,
+        toCategoryIndex,
+        fromCategoryLabel: fromLabel,
+        toCategoryLabel: toLabel,
+        mergedCategoryLabel: mergedLabel
+      };
+
+      // Keep serialized template in sync for persistence.
+      const template = this._userDefinedFields?.getField?.(sourceField._userDefinedId);
+      if (template) {
+        template.categories = nextCategories;
+        template.codes = sourceField.codes;
+        if (sourceField.centroidsByDim) template.centroidsByDim = sourceField.centroidsByDim;
+        template._operation = sourceField._operation;
+      }
+
+      // Remap any category-based highlight groups referencing this field.
+      for (const page of this.highlightPages || []) {
+        for (const group of (page.highlightedGroups || [])) {
+          if (!group || group.type !== 'category') continue;
+          if (group.fieldSource !== FieldSource.OBS) continue;
+          if (group.fieldIndex !== fieldIndex) continue;
+          const oldCat = group.categoryIndex;
+          if (!Number.isInteger(oldCat) || oldCat < 0 || oldCat >= transform.mapping.length) continue;
+          group.categoryIndex = transform.mapping[oldCat];
+        }
+      }
+
+      getFieldRegistry().invalidate();
+      this._syncActiveContext();
+
+      try {
+        this.setActiveField(fieldIndex);
+      } catch (err) {
+        console.warn('[State] Failed to re-activate merged field:', err);
+      }
+
+      this.updateFilterSummary();
+      this._refreshHighlightGroupsForField(FieldSource.OBS, fieldIndex);
+      this._notifyFieldChange(FieldSource.OBS, fieldIndex, ChangeType.UPDATE, {
+        operation: 'merge-categories',
+        mergedCategoryLabel: mergedLabel
+      });
+
+      return { newFieldIndex: fieldIndex, newKey: sourceField.key, updatedInPlace: true, mergedCategoryLabel: mergedLabel };
+    }
+
+    const nextCodes = applyCategoryIndexMapping(sourceField.codes, transform.mapping, nextCategories.length);
+
+    const rootKey = sourceField._sourceField?.sourceKey || sourceField._originalKey || sourceField.key;
+    const baseKey = String(options.newKey || `${rootKey} (merged)`).trim() || `${rootKey} (merged)`;
+    const existingKeys = (fields || []).filter((f) => f && f._isDeleted !== true).map((f) => f.key);
+    const newKey = makeUniqueLabel(baseKey, existingKeys);
+
+    let created;
+    try {
+      created = this._userDefinedFields.createFromCategoricalCodes(
+        {
+          key: newKey,
+          categories: nextCategories,
+          codes: nextCodes,
+          meta: {
+            _sourceField: {
+              kind: 'categorical-obs',
+              sourceKey: rootKey,
+              sourceIndex: fieldIndex
+            },
+            _operation: {
+              type: 'merge-categories',
+              fromCategoryIndex,
+              toCategoryIndex,
+              fromCategoryLabel: String(sourceField.categories?.[fromCategoryIndex] ?? ''),
+              toCategoryLabel: String(sourceField.categories?.[toCategoryIndex] ?? '')
+            }
+          }
+        },
+        this
+      );
+    } catch (err) {
+      console.error('[State] mergeCategoriesToNewField create failed:', err.message);
+      return null;
+    }
+
+    const derivedField = created.field;
+
+    // Carry forward category UI state (colors/visibility).
+    try {
+      this.ensureCategoryMetadata(sourceField);
+      const newColors = new Array(nextCategories.length);
+      const newVisible = {};
+      for (let i = 0; i < nextCategories.length; i++) newVisible[i] = true;
+
+      const oldColors = sourceField._categoryColors || [];
+      const oldVisible = sourceField._categoryVisible || {};
+
+      // Merged bucket color comes from the dragged category.
+      const draggedColor = oldColors[fromCategoryIndex] || getCategoryColor(fromCategoryIndex);
+      newColors[targetNewIndex] = draggedColor;
+      newVisible[targetNewIndex] = (oldVisible[fromCategoryIndex] !== false) || (oldVisible[toCategoryIndex] !== false);
+
+      // Copy remaining categories (skip merged source and avoid overwriting merged bucket).
+      for (let oldIdx = 0; oldIdx < transform.mapping.length; oldIdx++) {
+        if (oldIdx === fromCategoryIndex || oldIdx === toCategoryIndex) continue;
+        const newIdx = transform.mapping[oldIdx];
+        const c = oldColors[oldIdx];
+        if (c) newColors[newIdx] = c;
+        newVisible[newIdx] = oldVisible[oldIdx] !== false;
+      }
+
+      derivedField._categoryColors = newColors;
+      derivedField._categoryVisible = newVisible;
+      derivedField._categoryFilterEnabled = sourceField._categoryFilterEnabled ?? true;
+      if (sourceField._colormapId) derivedField._colormapId = sourceField._colormapId;
+    } catch (err) {
+      console.warn('[State] Failed to carry category UI state to merged field:', err);
+    }
+
+    delete derivedField.outlierQuantiles;
+    delete derivedField._outlierThreshold;
+
+    fields.push(derivedField);
+    const newFieldIndex = fields.length - 1;
+
+    getFieldRegistry().invalidate();
+    this._syncActiveContext();
+    this._notifyFieldChange(FieldSource.OBS, newFieldIndex, ChangeType.CREATE, { userDefinedId: created.id });
+
+    try {
+      this.setActiveField(newFieldIndex);
+    } catch (err) {
+      console.warn('[State] Failed to activate merged field:', err);
+    }
+
+    this.deleteField(FieldSource.OBS, fieldIndex);
+
+    return { newFieldIndex, newKey, mergedCategoryLabel: mergedLabel };
+  }
+
+  deleteField(source, fieldIndex) {
+    const src = source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
+    const fields = src === FieldSource.VAR ? this.varData?.fields : this.obsData?.fields;
+
+    try {
+      StateValidator.validateFieldIndex(fieldIndex, fields);
+    } catch (e) {
+      console.error('[State] deleteField validation failed:', e.message);
+      return false;
+    }
+
+    const field = fields[fieldIndex];
+    if (!field) return false;
+
+    if (field._isUserDefined && field._userDefinedId) {
+      return this.deleteUserDefinedField(field._userDefinedId, src);
+    }
+
+    const originalKey = field._originalKey || field.key;
+    this._deleteRegistry.markDeleted(src, originalKey);
+    field._isDeleted = true;
+
+    const wasActive =
+      (src === FieldSource.OBS && this.activeFieldSource === FieldSource.OBS && this.activeFieldIndex === fieldIndex) ||
+      (src === FieldSource.VAR && this.activeFieldSource === FieldSource.VAR && this.activeVarFieldIndex === fieldIndex);
+
+    if (wasActive) {
+      this.clearActiveField();
+    }
+
+    if (src === FieldSource.VAR) {
+      // Free memory when possible; preserveActive prevents unloading if any view still references it.
+      this.unloadVarField(fieldIndex, { preserveActive: true });
+    }
+
+    getFieldRegistry().invalidate();
+    if (!wasActive) this.computeGlobalVisibility();
+    this.updateFilterSummary();
+    this._notifyFieldChange(src, fieldIndex, ChangeType.DELETE, { originalKey });
+    return true;
+  }
+
+  /**
+   * Permanently confirm a deleted field so it is no longer restorable.
+   *
+   * This is intentionally destructive and should only be called from a user
+   * confirmation flow (e.g., the Deleted Fields "Confirm" button).
+   *
+   * @param {'obs'|'var'} source
+   * @param {number} fieldIndex
+   * @returns {boolean}
+   */
+  purgeDeletedField(source, fieldIndex) {
+    const src = source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
+    const fields = src === FieldSource.VAR ? this.varData?.fields : this.obsData?.fields;
+
+    try {
+      StateValidator.validateFieldIndex(fieldIndex, fields);
+    } catch (e) {
+      console.error('[State] purgeDeletedField validation failed:', e.message);
+      return false;
+    }
+
+    const field = fields?.[fieldIndex];
+    if (!field) return false;
+    if (field._isDeleted !== true) return false;
+    if (field._isPurged === true) return true;
+
+    const isUserDefined = field._isUserDefined === true && field._userDefinedId;
+
+    if (isUserDefined) {
+      field._isPurged = true;
+      const template = this._userDefinedFields?.getField?.(field._userDefinedId);
+      if (template) {
+        template._isDeleted = true;
+        template._isPurged = true;
+      }
+    } else {
+      const originalKey = field._originalKey || field.key;
+      this._deleteRegistry.markPurged(src, originalKey);
+      field._isDeleted = true;
+      field._isPurged = true;
+    }
+
+    getFieldRegistry().invalidate();
+    this.computeGlobalVisibility();
+    this.updateFilterSummary();
+    this._notifyFieldChange(src, fieldIndex, ChangeType.UPDATE, { purged: true, userDefinedId: field._userDefinedId || null });
+    return true;
+  }
+
+  /**
+   * Restore a soft-deleted field.
+   *
+   * Returns a structured result (instead of a boolean) so the UI can surface
+   * auto-rename details when restoring would create a duplicate visible key.
+   *
+   * @param {string} source - 'obs' | 'var'
+   * @param {number} fieldIndex
+   * @returns {{
+   *   ok: boolean,
+   *   originalKey?: string,
+   *   key?: string,
+   *   userDefinedId?: (string|null),
+   *   renamedFrom?: (string|null),
+   *   renamedTo?: (string|null)
+   * }}
+   */
+  restoreField(source, fieldIndex) {
+    const src = source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
+    const fields = src === FieldSource.VAR ? this.varData?.fields : this.obsData?.fields;
+    const field = fields?.[fieldIndex];
+    if (!field) return { ok: false };
+
+    if (field._isPurged === true) {
+      console.warn('[State] restoreField: cannot restore a confirmed deletion');
+      return { ok: false };
+    }
+
+    const isUserDefined = field._isUserDefined === true && field._userDefinedId;
+    const originalKey = field._originalKey || field.key;
+
+    if (isUserDefined) {
+      delete field._isDeleted;
+      const template = this._userDefinedFields?.getField?.(field._userDefinedId);
+      if (template) delete template._isDeleted;
+    } else {
+      this._deleteRegistry.markRestored(src, originalKey);
+      delete field._isDeleted;
+    }
+
+    // If restoring causes a key conflict, auto-rename the restored field to keep
+    // visible field keys unique (prevents selectors/filters from breaking).
+    let renamedFrom = null;
+    let renamedTo = null;
+    const existingKeys = (fields || [])
+      .map((f, idx) => ({ f, idx }))
+      .filter(({ f, idx }) => idx !== fieldIndex && f && f._isDeleted !== true)
+      .map(({ f }) => f.key);
+
+    if (existingKeys.includes(field.key)) {
+      renamedFrom = field.key;
+      renamedTo = makeUniqueLabel(`${field.key} (restored)`, existingKeys);
+
+      if (isUserDefined) {
+        field.key = renamedTo;
+        this._userDefinedFields?.updateField?.(field._userDefinedId, { key: renamedTo });
+      } else {
+        const okRename = this.renameField(src, fieldIndex, renamedTo);
+        if (!okRename) {
+          field.key = renamedTo;
+        }
+      }
+    }
+
+    getFieldRegistry().invalidate();
+    this.computeGlobalVisibility();
+    this.updateFilterSummary();
+    this._notifyFieldChange(src, fieldIndex, ChangeType.RESTORE, {
+      originalKey,
+      userDefinedId: isUserDefined ? field._userDefinedId : null,
+      renamedFrom,
+      renamedTo
+    });
+    return {
+      ok: true,
+      originalKey,
+      userDefinedId: isUserDefined ? field._userDefinedId : null,
+      renamedFrom,
+      renamedTo,
+      key: field.key
+    };
+  }
+
+  /**
+   * Duplicate a field as a new user-defined field.
+   *
+   * - Categorical obs: deep-copies codes + categories and computes centroids.
+   * - Continuous obs/var: creates a continuous alias that re-materializes values from
+   *   the referenced source field when loading state snapshots.
+   *
+   * This is a non-destructive operation (the source field remains intact).
+   *
+   * @param {'obs'|'var'} source
+   * @param {number} fieldIndex
+   * @param {object} [options]
+   * @param {string} [options.newKey]
+   * @returns {Promise<{ newFieldIndex: number, newKey: string }|null>}
+   */
+  async duplicateField(source, fieldIndex, options = {}) {
+    const src = source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
+    const fields = src === FieldSource.VAR ? this.varData?.fields : this.obsData?.fields;
+
+    try {
+      StateValidator.validateFieldIndex(fieldIndex, fields);
+    } catch (e) {
+      console.error('[State] duplicateField validation failed:', e.message);
+      return null;
+    }
+
+    const field = fields?.[fieldIndex];
+    if (!field || field._isDeleted === true) return null;
+
+    // Ensure the source field has its heavy data materialized first.
+    try {
+      if (src === FieldSource.VAR) {
+        await this.ensureVarFieldLoaded(fieldIndex);
+      } else {
+        await this.ensureFieldLoaded(fieldIndex);
+      }
+    } catch (err) {
+      console.error('[State] duplicateField load failed:', err);
+      return null;
+    }
+
+    const existingKeys = (fields || []).filter((f) => f && f._isDeleted !== true).map((f) => f.key);
+    const baseKey = String(options.newKey || `${field.key} (copy)`).trim() || `${field.key} (copy)`;
+    const newKey = makeUniqueLabel(baseKey, existingKeys);
+
+    // ---------------------------------------------------------------------
+    // Categorical obs: deep copy codes so subsequent merges don't affect the original.
+    // ---------------------------------------------------------------------
+    if (field.kind === FieldKind.CATEGORY) {
+      if (src !== FieldSource.OBS) {
+        console.warn('[State] duplicateField: categorical var fields are not supported');
+        return null;
+      }
+
+      const categories = Array.isArray(field.categories) ? [...field.categories] : [];
+      const codes = field.codes;
+      if (!codes || typeof codes.length !== 'number') return null;
+      const codesCopy = typeof codes.slice === 'function' ? codes.slice() : codes;
+
+      const sourceKey = field._sourceField?.sourceKey || field._originalKey || field.key;
+      const created = this._userDefinedFields.createFromCategoricalCodes(
+        {
+          key: newKey,
+          categories,
+          codes: codesCopy,
+          source: FieldSource.OBS,
+          meta: {
+            _sourceField: {
+              kind: 'categorical-obs',
+              sourceKey,
+              sourceIndex: fieldIndex
+            },
+            _operation: {
+              type: 'copy-field',
+              source: FieldSource.OBS,
+              sourceKey
+            }
+          }
+        },
+        this
+      );
+
+      // Carry forward category UI state (colors/visibility) as a convenience.
+      try {
+        this.ensureCategoryMetadata(field);
+        const colors = (field._categoryColors || []).map((c) => (Array.isArray(c) ? [...c] : c));
+        const visible = { ...(field._categoryVisible || {}) };
+        created.field._categoryColors = colors;
+        created.field._categoryVisible = visible;
+        created.field._categoryFilterEnabled = field._categoryFilterEnabled ?? true;
+        if (field._colormapId) created.field._colormapId = field._colormapId;
+      } catch (err) {
+        console.warn('[State] duplicateField: failed to carry categorical UI state:', err);
+      }
+
+      fields.push(created.field);
+      const newFieldIndex = fields.length - 1;
+
+      getFieldRegistry().invalidate();
+      this._syncActiveContext();
+      this._notifyFieldChange(FieldSource.OBS, newFieldIndex, ChangeType.CREATE, { userDefinedId: created.id });
+
+      return { newFieldIndex, newKey };
+    }
+
+    // ---------------------------------------------------------------------
+    // Continuous obs/var: create an alias that can be re-materialized on load.
+    // ---------------------------------------------------------------------
+    if (field.kind === FieldKind.CONTINUOUS) {
+      const sourceKey = field._originalKey || field.key;
+      const kind = src === FieldSource.VAR ? 'gene-expression' : 'continuous-obs';
+      const created = this._userDefinedFields.createContinuousAlias({
+        key: newKey,
+        source: src,
+        sourceField: { kind, sourceKey, sourceIndex: fieldIndex },
+        meta: {
+          _operation: { type: 'copy-field', source: src, sourceKey }
+        }
+      });
+
+      const aliasField = created.field;
+      const values = field.values;
+      if (values && typeof values.length === 'number') {
+        aliasField.values = typeof values.slice === 'function' ? values.slice() : values;
+        aliasField.loaded = true;
+      }
+      if (src === FieldSource.OBS && field.outlierQuantiles) {
+        aliasField.outlierQuantiles = field.outlierQuantiles;
+      }
+
+      // Carry forward continuous UI state.
+      if (field._continuousStats) aliasField._continuousStats = { ...field._continuousStats };
+      if (field._continuousFilter) aliasField._continuousFilter = { ...field._continuousFilter };
+      if (field._continuousColorRange) aliasField._continuousColorRange = { ...field._continuousColorRange };
+      if (field._positiveStats) aliasField._positiveStats = { ...field._positiveStats };
+      if (field._useLogScale != null) aliasField._useLogScale = field._useLogScale;
+      if (field._useFilterColorRange != null) aliasField._useFilterColorRange = field._useFilterColorRange;
+      if (field._filterEnabled != null) aliasField._filterEnabled = field._filterEnabled;
+      if (field._outlierFilterEnabled != null) aliasField._outlierFilterEnabled = field._outlierFilterEnabled;
+      if (field._outlierThreshold != null) aliasField._outlierThreshold = field._outlierThreshold;
+      if (field._colormapId) aliasField._colormapId = field._colormapId;
+
+      fields.push(aliasField);
+      const newFieldIndex = fields.length - 1;
+
+      getFieldRegistry().invalidate();
+      this._syncActiveContext();
+      this._notifyFieldChange(src, newFieldIndex, ChangeType.CREATE, { userDefinedId: created.id });
+
+      return { newFieldIndex, newKey };
+    }
+
+    console.warn('[State] duplicateField: unsupported field kind:', field.kind);
+    return null;
+  }
+
+  createCategoricalFromPages(options) {
+    const result = this._userDefinedFields.createFromPages(options, this);
+
+    if (result.field) {
+      if (!this.obsData) this.obsData = { fields: [] };
+      if (!this.obsData.fields) this.obsData.fields = [];
+
+      this.obsData.fields.push(result.field);
+      const newIndex = this.obsData.fields.length - 1;
+
+      getFieldRegistry().invalidate();
+      this._syncActiveContext();
+      this._notifyFieldChange(FieldSource.OBS, newIndex, ChangeType.CREATE, { userDefinedId: result.id });
+    }
+
+    return result;
+  }
+
+  deleteUserDefinedField(fieldId, source = FieldSource.OBS) {
+    const src = source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
+    const fields = src === FieldSource.VAR ? this.varData?.fields : this.obsData?.fields;
+    const field = fields?.find?.((f) => f && f._userDefinedId === fieldId);
+    if (!field) return false;
+
+    // User-defined fields are fully owned by Cellucid and serialized via
+    // UserDefinedFieldsRegistry. For dev-phase workflows we treat deletion as
+    // a soft-delete so the user can restore derived columns (e.g. after
+    // delete→unassigned or drag-merge operations).
+    field._isDeleted = true;
+    const template = this._userDefinedFields?.getField?.(fieldId);
+    if (template) template._isDeleted = true;
+
+    if (src === FieldSource.OBS && this.activeFieldSource === FieldSource.OBS && this.activeFieldIndex >= 0) {
+      const active = this.obsData?.fields?.[this.activeFieldIndex];
+      if (active && active._userDefinedId === fieldId) this.clearActiveField();
+    }
+    if (src === FieldSource.VAR && this.activeFieldSource === FieldSource.VAR && this.activeVarFieldIndex >= 0) {
+      const active = this.varData?.fields?.[this.activeVarFieldIndex];
+      if (active && active._userDefinedId === fieldId) this.clearActiveField();
+    }
+
+    getFieldRegistry().invalidate();
+    this.computeGlobalVisibility();
+    this.updateFilterSummary();
+    const fieldIndex = fields?.indexOf(field) ?? -1;
+    this._notifyFieldChange(src, fieldIndex, ChangeType.DELETE, { userDefinedId: fieldId, originalKey: field._originalKey || field.key });
+    return true;
+  }
+
+  isUserDefinedField(source, fieldIndex) {
+    if (source !== FieldSource.OBS) return false;
+    const field = this.obsData?.fields?.[fieldIndex];
+    return field?._isUserDefined === true;
+  }
+
+  _ensureActiveSelectionNotDeleted() {
+    if (this.activeFieldSource === FieldSource.OBS && this.activeFieldIndex >= 0) {
+      const field = this.obsData?.fields?.[this.activeFieldIndex];
+      if (field?._isDeleted === true) {
+        this.activeFieldIndex = -1;
+        this.activeFieldSource = null;
+      }
+    }
+    if (this.activeFieldSource === FieldSource.VAR && this.activeVarFieldIndex >= 0) {
+      const field = this.varData?.fields?.[this.activeVarFieldIndex];
+      if (field?._isDeleted === true) {
+        this.activeVarFieldIndex = -1;
+        this.activeFieldSource = null;
+      }
+    }
+  }
+
+  _applyOverlaysToFields(fields, source) {
+    if (!fields || fields.length === 0) return;
+
+    for (const field of fields) {
+      if (!field) continue;
+      if (field._isUserDefined === true && field._userDefinedId) {
+        // User-defined fields are serialized with their current metadata.
+        // Do not apply rename/delete/category overlays from registries.
+        continue;
+      }
+
+      const originalKey = field._originalKey || field.key;
+      if (!originalKey) continue;
+
+      // Field rename overlay
+      const displayKey = this._renameRegistry.getDisplayKey(source, originalKey);
+      if (displayKey !== originalKey) {
+        field._originalKey = originalKey;
+        field.key = displayKey;
+      } else if (field._originalKey) {
+        // Registry says "no rename" -> restore original.
+        field.key = originalKey;
+        delete field._originalKey;
+      }
+
+      // Delete overlay
+      if (this._deleteRegistry.isDeleted(source, originalKey)) {
+        field._isDeleted = true;
+      } else {
+        delete field._isDeleted;
+      }
+
+      // Confirmed deletion (non-restorable)
+      if (this._deleteRegistry.isPurged?.(source, originalKey)) {
+        field._isPurged = true;
+        field._isDeleted = true;
+      } else {
+        delete field._isPurged;
+      }
+
+      // Category rename overlay (only for categorical fields)
+      if (field.kind === FieldKind.CATEGORY && Array.isArray(field.categories)) {
+        // Reset categories back to originals if we have them.
+        if (Array.isArray(field._originalCategories) && field._originalCategories.length === field.categories.length) {
+          for (let i = 0; i < field.categories.length; i++) {
+            field.categories[i] = field._originalCategories[i];
+          }
+        }
+
+        // Apply registry renames.
+        let hasAnyRename = false;
+        for (let i = 0; i < field.categories.length; i++) {
+          const originalLabel = field.categories[i];
+          const displayLabel = this._renameRegistry.getDisplayCategory(source, originalKey, i, originalLabel);
+          if (displayLabel !== originalLabel) {
+            hasAnyRename = true;
+          }
+        }
+
+        if (hasAnyRename && !Array.isArray(field._originalCategories)) {
+          field._originalCategories = [...field.categories];
+        }
+
+        for (let i = 0; i < field.categories.length; i++) {
+          const originalLabel = field._originalCategories?.[i] ?? field.categories[i];
+          const displayLabel = this._renameRegistry.getDisplayCategory(source, originalKey, i, originalLabel);
+          field.categories[i] = displayLabel;
+          this._syncCentroidCategoryLabelAtIndex(field, i);
+        }
+
+        if (!hasAnyRename) {
+          delete field._originalCategories;
+        }
+      }
+    }
+  }
+
+  _injectUserDefinedFields() {
+    this._injectUserDefinedFieldsForSource(FieldSource.OBS);
+    this._injectUserDefinedFieldsForSource(FieldSource.VAR);
+  }
+
+  _injectUserDefinedFieldsForSource(source) {
+    const src = source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
+    const fields = src === FieldSource.VAR ? this.varData?.fields : this.obsData?.fields;
+    if (!fields) return;
+
+    const existingIds = new Set();
+    for (const field of fields) {
+      if (field && field._isUserDefined && field._userDefinedId) {
+        existingIds.add(field._userDefinedId);
+      }
+    }
+
+    const templates = this._userDefinedFields.getAllFieldsForSource
+      ? this._userDefinedFields.getAllFieldsForSource(src)
+      : this._userDefinedFields.getAllFields();
+
+    for (const template of templates) {
+      if (!template || !template._userDefinedId) continue;
+      if (existingIds.has(template._userDefinedId)) continue;
+
+      // Clone the definition but keep heavy arrays shared (codes/centroidsByDim).
+      const clone = { ...template };
+      // Reset per-view UI/filter state so each view can diverge safely.
+      delete clone._categoryColors;
+      delete clone._categoryVisible;
+      delete clone._continuousStats;
+      delete clone._continuousFilter;
+      delete clone._continuousColorRange;
+      delete clone._categoryCounts;
+      clone._loadingPromise = null;
+
+      fields.push(clone);
+    }
+  }
+
+  _syncCentroidCategoryLabelAtIndex(field, categoryIndex) {
+    const nextLabel = field.categories?.[categoryIndex];
+    if (!nextLabel) return;
+
+    const byDim = field.centroidsByDim || {};
+    for (const centroids of Object.values(byDim)) {
+      if (!Array.isArray(centroids)) continue;
+      const c = centroids[categoryIndex];
+      if (c && typeof c === 'object') c.category = nextLabel;
+    }
+  }
+
+  _refreshHighlightGroupsForField(source, fieldIndex) {
+    for (const page of this.highlightPages || []) {
+      for (const group of (page.highlightedGroups || [])) {
+        if (!group) continue;
+        if (group.fieldSource !== source) continue;
+        if (group.fieldIndex !== fieldIndex) continue;
+
+        const field = source === FieldSource.VAR
+          ? this.varData?.fields?.[fieldIndex]
+          : this.obsData?.fields?.[fieldIndex];
+        if (!field) continue;
+
+        group.fieldKey = field.key;
+
+        if (group.type === 'category') {
+          const label = field.categories?.[group.categoryIndex];
+          if (label != null) group.categoryName = label;
+          group.label = `${field.key}: ${group.categoryName}`;
+        } else if (group.type === 'range') {
+          const formatVal = (v) => {
+            const num = Number(v);
+            if (!Number.isFinite(num)) return String(v);
+            if (Math.abs(num) >= 1000 || (Math.abs(num) > 0 && Math.abs(num) < 0.01)) return num.toExponential(2);
+            return num.toFixed(2);
+          };
+          group.label = `${field.key}: ${formatVal(group.rangeMin)} – ${formatVal(group.rangeMax)}`;
+        }
+      }
+    }
+
+    this._notifyHighlightChange?.();
+  }
+
+  _ensureUserDefinedCentroidsForDim(field, dim) {
+    if (!field || field._isUserDefined !== true || !field._userDefinedId) return;
+
+    const dimKey = String(dim);
+    const centroidsByDim = field.centroidsByDim || {};
+    if (centroidsByDim[dimKey] || centroidsByDim[dim]) return;
+
+    const rawPositions = this.dimensionManager?.positionCache?.get?.(dim);
+    if (!rawPositions) return;
+
+    this._userDefinedFields.recomputeCentroidsForDimension(field._userDefinedId, dim, rawPositions);
+
+    // The new centroids are raw; make sure they are normalized exactly once when rendered.
+    if (field._normalizedDims instanceof Set) {
+      field._normalizedDims.delete(dimKey);
+    }
   }
 
   /**
@@ -1091,6 +2423,7 @@ class DataState {
     for (let fi = 0; fi < fields.length; fi++) {
       const field = fields[fi];
       if (!field) continue;
+      if (field._isDeleted === true) continue;
       const fieldKey = field.key || `Field ${fi + 1}`;
 
       // Check continuous filter
@@ -1153,7 +2486,36 @@ class DataState {
     const { silent = false } = options;
     const field = this.obsData?.fields?.[fieldIndex];
     if (!field) throw new Error(`Obs field ${fieldIndex} is not available.`);
-    const cacheKey = field.key || String(fieldIndex);
+    const cacheKey = field._originalKey || field.key || String(fieldIndex);
+
+    // User-defined continuous aliases are materialized by copying from their source field.
+    if (
+      field.loaded !== true &&
+      field._isUserDefined === true &&
+      field._userDefinedId &&
+      field.kind === FieldKind.CONTINUOUS &&
+      field._sourceField?.sourceKey
+    ) {
+      const sourceKey = String(field._sourceField.sourceKey || '').trim();
+      const sourceIndex = sourceKey ? getFieldRegistry().getIndexByKey(FieldSource.OBS, sourceKey) : -1;
+      if (sourceIndex < 0) {
+        throw new Error(`Source field not found for "${field.key}" (sourceKey="${sourceKey}")`);
+      }
+
+      const sourceField = await this.ensureFieldLoaded(sourceIndex, options);
+      const values = sourceField?.values;
+      if (!values || typeof values.length !== 'number') {
+        throw new Error(`Source field "${sourceKey}" has no values to copy`);
+      }
+
+      field.values = typeof values.slice === 'function' ? values.slice() : values;
+      if (sourceField?.outlierQuantiles) field.outlierQuantiles = sourceField.outlierQuantiles;
+      field.loaded = true;
+      field._loadingPromise = null;
+      this._fieldDataCache.set(cacheKey, { values: field.values, outlierQuantiles: field.outlierQuantiles });
+      return field;
+    }
+
     if (field.loaded) {
       if (!this._fieldDataCache.has(cacheKey)) {
         this._fieldDataCache.set(cacheKey, {
@@ -1180,7 +2542,10 @@ class DataState {
     const notifications = getNotificationCenter();
     const notifId = silent ? null : notifications.loading(`Loading field: ${field.key}`, { category: 'data' });
 
-    field._loadingPromise = this.fieldLoader(field)
+    // If the field has been renamed, keep network/data lookups stable by loading using the original key.
+    const loaderField = field._originalKey ? { ...field, key: field._originalKey } : field;
+
+    field._loadingPromise = this.fieldLoader(loaderField)
       .then((loadedData) => {
         if (loadedData?.values) field.values = loadedData.values;
         if (loadedData?.codes) field.codes = loadedData.codes;
@@ -1224,7 +2589,35 @@ class DataState {
     const { silent = false } = options;
     const field = this.varData?.fields?.[fieldIndex];
     if (!field) throw new Error(`Var field ${fieldIndex} is not available.`);
-    const cacheKey = field.key || String(fieldIndex);
+    const cacheKey = field._originalKey || field.key || String(fieldIndex);
+
+    // User-defined continuous aliases (gene copies) are materialized by copying from their source gene.
+    if (
+      field.loaded !== true &&
+      field._isUserDefined === true &&
+      field._userDefinedId &&
+      field.kind === FieldKind.CONTINUOUS &&
+      field._sourceField?.sourceKey
+    ) {
+      const sourceKey = String(field._sourceField.sourceKey || '').trim();
+      const sourceIndex = sourceKey ? getFieldRegistry().getIndexByKey(FieldSource.VAR, sourceKey) : -1;
+      if (sourceIndex < 0) {
+        throw new Error(`Source gene not found for "${field.key}" (sourceKey="${sourceKey}")`);
+      }
+
+      const sourceField = await this.ensureVarFieldLoaded(sourceIndex, options);
+      const values = sourceField?.values;
+      if (!values || typeof values.length !== 'number') {
+        throw new Error(`Source gene "${sourceKey}" has no values to copy`);
+      }
+
+      field.values = typeof values.slice === 'function' ? values.slice() : values;
+      field.loaded = true;
+      field._loadingPromise = null;
+      this._varFieldDataCache.set(cacheKey, { values: field.values });
+      return field;
+    }
+
     if (field.loaded) {
       if (!this._varFieldDataCache.has(cacheKey)) {
         this._varFieldDataCache.set(cacheKey, { values: field.values });
@@ -1245,7 +2638,10 @@ class DataState {
     const notifications = getNotificationCenter();
     const notifId = silent ? null : notifications.loading(`Loading gene: ${field.key}`, { category: 'data' });
 
-    field._loadingPromise = this.varFieldLoader(field)
+    // If the gene has been renamed, load using the original key for stable lookups.
+    const loaderField = field._originalKey ? { ...field, key: field._originalKey } : field;
+
+    field._loadingPromise = this.varFieldLoader(loaderField)
       .then((loadedData) => {
         if (loadedData?.values) field.values = loadedData.values;
         if (field.values && field.values.length !== this.pointCount) {
@@ -1302,7 +2698,7 @@ class DataState {
     const field = this.varData?.fields?.[fieldIndex];
     if (!field) return false;
 
-    const cacheKey = field.key || String(fieldIndex);
+    const cacheKey = field._originalKey || field.key || String(fieldIndex);
 
     // Clear LRU reference first so it doesn't keep the ArrayBuffer alive.
     this._varFieldDataCache?.delete?.(cacheKey);
@@ -1339,11 +2735,12 @@ class DataState {
   }
 
   setActiveField(fieldIndex) {
-    if (!this.obsData || !this.obsData.fields || !this.obsData.fields[fieldIndex]) return null;
+    const nextField = this.obsData?.fields?.[fieldIndex];
+    if (!nextField || nextField._isDeleted === true) return null;
     this.activeFieldIndex = fieldIndex;
     this.activeVarFieldIndex = -1;
     this.activeFieldSource = 'obs';
-    const field = this.obsData.fields[fieldIndex];
+    const field = nextField;
     if (!field.loaded) {
       throw new Error(`Field "${field.key}" not loaded yet.`);
     }
@@ -1380,11 +2777,12 @@ class DataState {
   }
 
   setActiveVarField(fieldIndex) {
-    if (!this.varData || !this.varData.fields || !this.varData.fields[fieldIndex]) return null;
+    const nextField = this.varData?.fields?.[fieldIndex];
+    if (!nextField || nextField._isDeleted === true) return null;
     this.activeVarFieldIndex = fieldIndex;
     this.activeFieldIndex = -1;
     this.activeFieldSource = 'var';
-    const field = this.varData.fields[fieldIndex];
+    const field = nextField;
     if (!field.loaded) {
       throw new Error(`Var field "${field.key}" not loaded yet.`);
     }
@@ -1431,6 +2829,7 @@ class DataState {
     const fields = this.obsData.fields;
     for (let f = 0; f < fields.length; f++) {
       const field = fields[f];
+      if (field?._isDeleted === true) continue;
       if (!field || !field.outlierQuantiles || !field.outlierQuantiles.length) continue;
       
       // Check if outlier filter is enabled
@@ -1467,18 +2866,16 @@ class DataState {
       return;
     }
     const total = this.pointCount;
-    const threshold = this.getCurrentOutlierThreshold();
-    const outliers = this.outlierQuantilesArray || [];
+    const applyOutlierFilter = this.isOutlierFilterEnabledForActiveField();
+    const threshold = applyOutlierFilter ? this.getCurrentOutlierThreshold() : 1.0;
+    const outliers = applyOutlierFilter ? (this.outlierQuantilesArray || []) : [];
     const alpha = this.categoryTransparency || [];
-    // Check if outlier filter is enabled for the active field
-    const activeField = this.getActiveField();
-    const outlierFilterEnabled = activeField?._outlierFilterEnabled !== false;
     let shown = 0;
     for (let i = 0; i < total; i++) {
       const visible = (alpha[i] ?? 0) > 0.001;
       if (!visible) continue;
-      // Only apply outlier filter if enabled
-      if (outlierFilterEnabled) {
+      // Only apply outlier filter when supported by the active field.
+      if (applyOutlierFilter) {
         const q = outliers[i] ?? -1;
         if (q >= 0 && q > threshold) continue;
       }
@@ -1499,11 +2896,9 @@ class DataState {
     const available = new Array(categories.length).fill(0); // respects other filters, ignores this field's category visibility
     const visible = new Array(categories.length).fill(0); // respects all filters including this field's category visibility
     const alpha = this.categoryTransparency || [];
-    const outliers = this.outlierQuantilesArray || [];
-    const threshold = this.getCurrentOutlierThreshold();
-    // Check if outlier filter is enabled for the active field
-    const activeField = this.getActiveField();
-    const outlierFilterEnabled = activeField?._outlierFilterEnabled !== false;
+    const applyOutlierFilter = this.isOutlierFilterEnabledForActiveField();
+    const outliers = applyOutlierFilter ? (this.outlierQuantilesArray || []) : [];
+    const threshold = applyOutlierFilter ? this.getCurrentOutlierThreshold() : 1.0;
     const n = Math.min(this.pointCount, codes.length);
     const fields = this.obsData?.fields || [];
     const targetIndex = fields.indexOf(field);
@@ -1578,8 +2973,8 @@ class DataState {
           }
         }
       }
-      // Only apply outlier filter if enabled
-      if (baseVisible && outlierFilterEnabled) {
+      // Only apply outlier filter when supported by the active field.
+      if (baseVisible && applyOutlierFilter) {
         const q = outliers[i] ?? -1;
         if (q >= 0 && q > threshold) {
           baseVisible = false;
@@ -1590,8 +2985,8 @@ class DataState {
       // Current visibility already encoded in alpha + outliers
       const isVisibleNow = (alpha[i] ?? 0) > 0.001;
       if (!isVisibleNow) continue;
-      // Only apply outlier filter if enabled
-      if (outlierFilterEnabled) {
+      // Only apply outlier filter when supported by the active field.
+      if (applyOutlierFilter) {
         const qNow = outliers[i] ?? -1;
         if (qNow >= 0 && qNow > threshold) continue;
       }
@@ -1613,11 +3008,9 @@ class DataState {
         : null;
     const activeVarValues = activeVarField?.values || [];
     const targetValues = field.values || [];
-    const outliers = this.outlierQuantilesArray || [];
-    const threshold = this.getCurrentOutlierThreshold();
-    // Check if outlier filter is enabled for the active field
-    const activeField = this.getActiveField();
-    const outlierFilterEnabled = activeField?._outlierFilterEnabled !== false;
+    const applyOutlierFilter = this.isOutlierFilterEnabledForActiveField();
+    const outliers = applyOutlierFilter ? (this.outlierQuantilesArray || []) : [];
+    const threshold = applyOutlierFilter ? this.getCurrentOutlierThreshold() : 1.0;
     let available = 0;
     let visible = 0;
 
@@ -1681,7 +3074,7 @@ class DataState {
       if (!passes) continue;
 
       // Outliers only apply if the outlier filter is enabled
-      if (outlierFilterEnabled) {
+      if (applyOutlierFilter) {
         const q = outliers[i] ?? -1;
         if (q >= 0 && q > threshold) continue;
       }
@@ -2080,10 +3473,9 @@ class DataState {
     const currentDim = this.activeDimensionLevel || 3;
     const centroidsByDim = field.centroidsByDim || {};
 
-    // Get centroids for current dimension, falling back through dimensions
+    // Get centroids for current dimension
     let centroids = centroidsByDim[String(currentDim)]
       || centroidsByDim[currentDim]
-      || field.centroids  // Legacy fallback
       || [];
 
     // Lazy normalization: normalize centroids for this dimension if not already done.
@@ -2091,25 +3483,18 @@ class DataState {
     // This ensures centroids are correctly positioned regardless of which dimension
     // was loaded first or when switching between dimensions.
     //
-    // Important distinction:
-    // - centroidsByDim: per-dimension arrays, each normalized with its own transform
-    // - field.centroids (legacy): single 3D array, normalized once with its native dimension's transform
+    // centroidsByDim: per-dimension arrays, each normalized with its own transform
     if (centroids.length > 0 && this.dimensionManager) {
       // Initialize normalization tracking map if needed
       if (!field._normalizedDims) {
         field._normalizedDims = new Set();
       }
 
-      // Determine if we're using per-dimension centroids or legacy shared centroids
-      const isPerDimCentroids = centroidsByDim[String(currentDim)] || centroidsByDim[currentDim];
-      const dimKey = isPerDimCentroids ? String(currentDim) : 'legacy';
+      const dimKey = String(currentDim);
 
       // Check if this centroid array needs normalization
       if (!field._normalizedDims.has(dimKey)) {
-        // For per-dimension centroids, use that dimension's transform
-        // For legacy centroids, use their native dimension (typically 3D)
-        const transformDim = isPerDimCentroids ? currentDim : (centroids[0]?.position?.length || 3);
-        const normTransform = this.dimensionManager.getNormTransform(transformDim);
+        const normTransform = this.dimensionManager.getNormTransform(currentDim);
 
         if (normTransform) {
           const { center, scale } = normTransform;
@@ -2341,6 +3726,22 @@ class DataState {
     this.computeGlobalVisibility();
   }
 
+  /**
+   * Outlier filtering is only applicable when the active field provides
+   * `outlierQuantiles` (latent-space outlier stats).
+   *
+   * User-defined categoricals never have these stats, so this prevents
+   * outlier filtering from being applied "silently" when the UI control is hidden.
+   * @returns {boolean}
+   */
+  isOutlierFilterEnabledForActiveField() {
+    const field = this.getActiveField?.();
+    if (!field || !field.outlierQuantiles || !field.outlierQuantiles.length) return false;
+    if (field._outlierFilterEnabled === false) return false;
+    const threshold = field._outlierThreshold != null ? field._outlierThreshold : 1.0;
+    return threshold < 0.9999;
+  }
+
   getCurrentOutlierThreshold() {
     const field = this.getActiveField();
     if (field && field._outlierThreshold != null) return field._outlierThreshold;
@@ -2350,19 +3751,25 @@ class DataState {
   computeGlobalVisibility() {
     if (!this.obsData || !this.obsData.fields || !this.pointCount) return;
     const fields = this.obsData.fields;
-    const activeVarField = (this.activeFieldSource === 'var' && this.activeVarFieldIndex >= 0)
+    const activeVarCandidate = (this.activeFieldSource === 'var' && this.activeVarFieldIndex >= 0)
       ? this.varData?.fields?.[this.activeVarFieldIndex]
       : null;
+    const activeVarField = activeVarCandidate && activeVarCandidate._isDeleted !== true ? activeVarCandidate : null;
     const activeVarValues = activeVarField?.values || [];
     if (!this.categoryTransparency || this.categoryTransparency.length !== this.pointCount) {
       this.categoryTransparency = new Float32Array(this.pointCount);
     }
+
+    const applyOutlierFilter = this.isOutlierFilterEnabledForActiveField();
+    const outlierThreshold = applyOutlierFilter ? this.getCurrentOutlierThreshold() : 1.0;
+    const outliers = applyOutlierFilter ? (this.outlierQuantilesArray || []) : [];
 
     for (let i = 0; i < this.pointCount; i++) {
       let visible = true;
       for (let f = 0; f < fields.length; f++) {
         const field = fields[f];
         if (!field) continue;
+        if (field._isDeleted === true) continue;
         if (field.kind === 'category' && field._categoryVisible) {
           // Check if category filter is enabled
           const categoryFilterEnabled = field._categoryFilterEnabled !== false;
@@ -2420,18 +3827,10 @@ class DataState {
           }
         }
       }
-      // Apply outlier filter based on active field's threshold (only if enabled)
-      if (visible && this.outlierQuantilesArray && this.outlierQuantilesArray.length > i) {
-        // Check if any outlier filter is enabled for the active field
-        const activeField = this.getActiveField();
-        const outlierFilterEnabled = activeField?._outlierFilterEnabled !== false;
-        if (outlierFilterEnabled) {
-          const q = this.outlierQuantilesArray[i];
-          const outlierThreshold = this.getCurrentOutlierThreshold();
-          if (q >= 0 && q > outlierThreshold) {
-            visible = false;
-          }
-        }
+      // Apply outlier filter for the active field (only when supported).
+      if (visible && applyOutlierFilter) {
+        const q = (i < outliers.length) ? outliers[i] : -1;
+        if (q >= 0 && q > outlierThreshold) visible = false;
       }
       this.categoryTransparency[i] = visible ? 1.0 : 0.0;
     }
@@ -2452,7 +3851,7 @@ class DataState {
   }
 
   getFilterSummaryLines() {
-    // Returns array of strings for backward compatibility
+    // Human-readable filter summaries (used for view labels + sidebar summary).
     const filters = this.getActiveFiltersStructured();
     if (filters.length === 0) return ['No filters active'];
     return filters.map(f => f.text);
@@ -2463,12 +3862,13 @@ class DataState {
     if (!this.obsData || !this.obsData.fields) return [];
     const fields = this.obsData.fields;
     const filters = [];
-    
+
     for (let fi = 0; fi < fields.length; fi++) {
       const field = fields[fi];
       if (!field) continue;
+      if (field._isDeleted === true) continue;
       const key = field.key || `Field ${fi + 1}`;
-      
+
       // Continuous field filter
       if (field.kind === 'continuous' && field._continuousStats && field._continuousFilter) {
         const stats = field._continuousStats;
@@ -2547,7 +3947,7 @@ class DataState {
       this.varData.fields
     ) {
       const field = this.varData.fields[this.activeVarFieldIndex];
-      if (field && field.kind === 'continuous' && field._continuousStats && field._continuousFilter) {
+      if (field && field._isDeleted !== true && field.kind === 'continuous' && field._continuousStats && field._continuousFilter) {
         const stats = field._continuousStats;
         const filter = field._continuousFilter;
         const fullRange =
@@ -2877,7 +4277,7 @@ class DataState {
     return this.highlightPages.find((p) => p.id === this.activePageId) || null;
   }
 
-  // Get highlighted groups for the active page (backwards compatible)
+  // Convenience alias: highlighted groups for the active page.
   get highlightedGroups() {
     const page = this._getActivePage();
     return page ? page.highlightedGroups : [];
@@ -2903,12 +4303,32 @@ class DataState {
     return this._getActivePage();
   }
 
+  /**
+   * Get the unique highlighted cell count for a page (enabled groups only).
+   * Used by both the Highlighted Cells UI and analysis selectors.
+   * @param {string} pageId
+   * @returns {number}
+   */
+  getHighlightedCellCountForPage(pageId) {
+    const page = this.highlightPages.find((p) => p.id === pageId);
+    if (!page) return 0;
+
+    const indices = new Set();
+    for (const group of (page.highlightedGroups || [])) {
+      if (!group || group.enabled === false) continue;
+      const cells = group.cellIndices || [];
+      for (let i = 0; i < cells.length; i++) indices.add(cells[i]);
+    }
+    return indices.size;
+  }
+
   createHighlightPage(name = null) {
     const id = `page_${++this._highlightPageIdCounter}`;
     const pageName = name || `Page ${this.highlightPages.length + 1}`;
     const page = {
       id,
       name: pageName,
+      color: getPageColor(this.highlightPages.length),
       highlightedGroups: []
     };
     this.highlightPages.push(page);
@@ -2961,6 +4381,41 @@ class DataState {
     page.name = newName;
     this._notifyHighlightPageChange();
     return true;
+  }
+
+  /**
+   * Set a persistent color for a highlight page.
+   * This is used across the app (Highlighted Cells tabs + analysis UI).
+   *
+   * @param {string} pageId
+   * @param {string} color - Hex color (#RRGGBB)
+   * @returns {boolean}
+   */
+  setHighlightPageColor(pageId, color) {
+    const page = this.highlightPages.find((p) => p.id === pageId);
+    if (!page) return false;
+
+    const next = String(color ?? '').trim();
+    if (!/^#[0-9a-fA-F]{6}$/.test(next)) {
+      console.warn('[State] Invalid page color:', color);
+      return false;
+    }
+
+    page.color = next;
+    this._notifyHighlightPageChange();
+    return true;
+  }
+
+  /**
+   * Get the current color for a page (falls back to the default palette).
+   * @param {string} pageId
+   * @returns {string}
+   */
+  getHighlightPageColor(pageId) {
+    const page = this.highlightPages.find((p) => p.id === pageId);
+    if (page?.color) return page.color;
+    const idx = this.highlightPages.findIndex((p) => p.id === pageId);
+    return getPageColor(idx >= 0 ? idx : 0);
   }
 
   /**

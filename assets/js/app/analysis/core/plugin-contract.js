@@ -20,6 +20,7 @@ import {
 import { filterFiniteNumbers, getFiniteMinMax, mean } from '../shared/number-utils.js';
 import { debug, debugWarn, debugError } from '../shared/debug-utils.js';
 import { getPlotTheme } from '../shared/plot-theme.js';
+import { getPageColor, PAGE_COLORS } from '../../utils/page-colors.js';
 
 // Re-export validation functions for index.js
 export { validatePluginContract, validateOptionsAgainstSchema, mergeOptions };
@@ -711,36 +712,8 @@ class PluginManager {
   }
 }
 
-// =============================================================================
-// PAGE COLORS
-// =============================================================================
-
-/**
- * Default page color palette
- */
-export const PAGE_COLORS = [
-  '#2563eb', // blue-600
-  '#dc2626', // red-600
-  '#16a34a', // green-600
-  '#9333ea', // purple-600
-  '#ea580c', // orange-600
-  '#0891b2', // cyan-600
-  '#c026d3', // fuchsia-600
-  '#65a30d', // lime-600
-  '#e11d48', // rose-600
-  '#0d9488', // teal-600
-  '#7c3aed', // violet-600
-  '#ca8a04'  // yellow-600
-];
-
-/**
- * Get color for a page by index
- * @param {number} pageIndex
- * @returns {string}
- */
-export function getPageColor(pageIndex) {
-  return PAGE_COLORS[pageIndex % PAGE_COLORS.length];
-}
+// Re-export the shared page color palette.
+export { getPageColor, PAGE_COLORS };
 
 // =============================================================================
 // PLOT HELPERS

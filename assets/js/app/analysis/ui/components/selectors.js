@@ -326,12 +326,13 @@ export function createPageSelector(options = {}) {
         ? getCellCountForPageId(page.id)
         : getCellCountForPage(page);
 
-      const baseColor = customColors.get(baseId) || getPageColor(baseIndex);
+      const basePage = pages.find((p) => p.id === baseId) || null;
+      const baseColor = basePage?.color || customColors.get(baseId) || getPageColor(baseIndex);
       const defaultColor = derived?.kind === 'rest_of'
         ? deriveRestOfColor(baseColor)
         : baseColor;
 
-      const currentColor = customColors.get(page.id) || defaultColor;
+      const currentColor = page?.color || customColors.get(page.id) || defaultColor;
 
       const tab = document.createElement('div');
       tab.className = 'analysis-page-tab' +

@@ -5,6 +5,13 @@ import { updateUrlForDataSource, clearUrlDataSource } from './url-state.js';
 import { DATA_LOAD_METHODS } from '../analytics/tracker.js';
 import { SIDEBAR_MIN_WIDTH_PX, clampSidebarWidthPx } from './sidebar-metrics.js';
 import { StyleManager } from '../utils/style-manager.js';
+import { InlineEditor } from './ui/components/inline-editor.js';
+import { showConfirmDialog } from './ui/components/confirm-dialog.js';
+import { CategoryBuilder } from './ui/category-builder.js';
+import { getFieldRegistry } from './utils/field-registry.js';
+import { FieldKind, FieldSource } from './utils/field-constants.js';
+import { StateValidator } from './utils/state-validator.js';
+import { makeUniqueLabel } from './utils/label-utils.js';
 
 export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadActiveDataset }) {
   console.log('[UI] initUI called with dataSourceManager:', !!dataSourceManager);
@@ -12,7 +19,15 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
   const {
     statsEl,
     categoricalFieldSelect,
+    categoricalFieldCopyBtn,
+    categoricalFieldRenameBtn,
+    categoricalFieldDeleteBtn,
+    categoricalFieldClearBtn,
     continuousFieldSelect,
+    continuousFieldCopyBtn,
+    continuousFieldRenameBtn,
+    continuousFieldDeleteBtn,
+    continuousFieldClearBtn,
     legendEl,
     displayOptionsContainer,
     pointSizeInput,
@@ -35,6 +50,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     outlierFilterDisplay,
     filterCountEl,
     activeFiltersEl,
+    deletedFieldsSection,
     highlightCountEl,
     highlightedGroupsEl,
     clearAllHighlightsBtn,
@@ -66,7 +82,11 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     geneExpressionContainer,
     geneExpressionSearch,
     geneExpressionDropdown,
-    geneExpressionSelected,
+    geneExpressionCopyBtn,
+    geneExpressionRenameBtn,
+    geneExpressionDeleteBtn,
+    geneExpressionClearBtn,
+    categoryBuilderContainer,
     // New smoke controls
     renderModeSelect,
     smokeControls,
@@ -157,7 +177,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
   let hasContinuousFields = false;
   let forceDisableFieldSelects = false;
   let hasGeneExpressionFields = false;
-  let selectedGeneIndex = -1;
+  let selectedGeneOriginalIdx = -1;
   let geneFieldList = [];
 
   // Volumetric smoke UI state
@@ -235,25 +255,24 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
         categoricalFieldSelect.value = NONE_FIELD_VALUE;
         continuousFieldSelect.value = NONE_FIELD_VALUE;
       }
-      selectedGeneIndex = -1;
-      updateSelectedGeneDisplay();
+      selectedGeneOriginalIdx = -1;
+      updateGeneActionButtons();
       if (geneExpressionSearch) {
         geneExpressionSearch.value = '';
       }
     } else if (source === 'var') {
       categoricalFieldSelect.value = NONE_FIELD_VALUE;
       continuousFieldSelect.value = NONE_FIELD_VALUE;
-      const geneIdx = geneFieldList.findIndex(({ idx }) => idx === varIdx);
-      selectedGeneIndex = geneIdx;
+      selectedGeneOriginalIdx = Number.isInteger(varIdx) && varIdx >= 0 ? varIdx : -1;
       if (geneExpressionSearch && activeField) {
         geneExpressionSearch.value = activeField.key || '';
       }
-      updateSelectedGeneDisplay();
+      updateGeneActionButtons();
     } else {
       categoricalFieldSelect.value = NONE_FIELD_VALUE;
       continuousFieldSelect.value = NONE_FIELD_VALUE;
-      selectedGeneIndex = -1;
-      updateSelectedGeneDisplay();
+      selectedGeneOriginalIdx = -1;
+      updateGeneActionButtons();
       if (geneExpressionSearch) {
         geneExpressionSearch.value = '';
       }
@@ -269,7 +288,6 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       const centroidsByDim = activeField.centroidsByDim || {};
       const dimCentroids = centroidsByDim[String(currentDim)]
         || centroidsByDim[currentDim]
-        || activeField.centroids  // Legacy fallback
         || [];
       centroidCount = dimCentroids.length;
     }
@@ -874,7 +892,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       !lastPageIds.every((id, i) => id === currentPageIds[i]);
 
     if (!needsFullRebuild) {
-      // Fast path: just update active states and counts
+      // Fast path: just update active states, names, counts, colors
       const existingTabs = highlightPagesTabsEl.querySelectorAll('.highlight-page-tab');
       existingTabs.forEach((tab) => {
         const pageId = tab.dataset.pageId;
@@ -889,6 +907,19 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
           nameSpan.textContent = page.name;
           nameSpan.title = page.name;
         }
+
+        const countSpan = tab.querySelector('.highlight-page-tab-count');
+        if (countSpan && typeof state.getHighlightedCellCountForPage === 'function') {
+          const count = state.getHighlightedCellCountForPage(pageId);
+          const next = count > 0 ? formatDataNumber(count) : '(0)';
+          if (countSpan.textContent !== next) countSpan.textContent = next;
+        }
+
+        const colorEl = tab.querySelector('.highlight-page-color');
+        const colorInput = tab.querySelector('.highlight-page-color-input');
+        const color = page.color || (typeof state.getHighlightPageColor === 'function' ? state.getHighlightPageColor(pageId) : null);
+        if (colorEl && color) StyleManager.setVariable(colorEl, '--highlight-page-color', color);
+        if (colorInput && color && colorInput.value !== color) colorInput.value = color;
       });
       return;
     }
@@ -911,6 +942,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
         draggedPageId = page.id;
         tab.classList.add('dragging');
         e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('application/x-highlight-page', page.id);
         e.dataTransfer.setData('text/plain', page.id);
       });
 
@@ -946,6 +978,32 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
         }
       });
 
+      const pageColor = page.color || (typeof state.getHighlightPageColor === 'function' ? state.getHighlightPageColor(page.id) : null);
+      if (pageColor) {
+        const colorIndicator = document.createElement('span');
+        colorIndicator.className = 'highlight-page-color';
+        StyleManager.setVariable(colorIndicator, '--highlight-page-color', pageColor);
+        colorIndicator.title = 'Click to change color';
+
+        const colorInput = document.createElement('input');
+        colorInput.type = 'color';
+        colorInput.className = 'highlight-page-color-input';
+        colorInput.value = pageColor;
+        colorInput.title = 'Click to change color';
+
+        colorInput.addEventListener('input', (e) => {
+          const newColor = e.target.value;
+          StyleManager.setVariable(colorIndicator, '--highlight-page-color', newColor);
+          state.setHighlightPageColor?.(page.id, newColor);
+        });
+        colorInput.addEventListener('click', (e) => {
+          e.stopPropagation();
+        });
+
+        colorIndicator.appendChild(colorInput);
+        tab.appendChild(colorIndicator);
+      }
+
       const nameSpan = document.createElement('span');
       nameSpan.className = 'highlight-page-tab-name';
       nameSpan.textContent = page.name;
@@ -958,6 +1016,14 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       });
 
       tab.appendChild(nameSpan);
+
+      const countSpan = document.createElement('span');
+      countSpan.className = 'highlight-page-tab-count';
+      const count = typeof state.getHighlightedCellCountForPage === 'function'
+        ? state.getHighlightedCellCountForPage(page.id)
+        : 0;
+      countSpan.textContent = count > 0 ? formatDataNumber(count) : '(0)';
+      tab.appendChild(countSpan);
 
       // Only show delete button if there's more than one page
       if (pages.length > 1) {
@@ -2397,29 +2463,58 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
   }
 
   function getFieldsByKind(kind) {
-    const fields = state.getFields();
-    const filtered = [];
-    for (let i = 0; i < fields.length; i++) {
-      const field = fields[i];
-      if (!field) continue;
-      const isContinuous = field.kind === 'continuous';
-      const isCategory = !isContinuous;
-      if (kind === 'continuous' ? isContinuous : isCategory) {
-        filtered.push({ field, idx: i });
-      }
-    }
-    return filtered;
+    const entries = state.getVisibleFields
+      ? state.getVisibleFields(FieldSource.OBS)
+      : (state.getFields?.() || [])
+          .map((field, index) => ({ field, index }))
+          .filter(({ field }) => field && field._isDeleted !== true);
+
+    return entries
+      .filter(({ field }) => field.kind === kind)
+      .map(({ field, index }) => ({ field, idx: index }));
   }
 
   function updateFieldSelectDisabledStates() {
     categoricalFieldSelect.disabled = forceDisableFieldSelects || !hasCategoricalFields;
     continuousFieldSelect.disabled = forceDisableFieldSelects || !hasContinuousFields;
+    updateFieldActionButtons();
+    updateGeneActionButtons();
+  }
+
+  function updateFieldActionButtons() {
+    const catIdx = parseInt(categoricalFieldSelect?.value || NONE_FIELD_VALUE, 10);
+    const contIdx = parseInt(continuousFieldSelect?.value || NONE_FIELD_VALUE, 10);
+
+    const catSelected = Number.isInteger(catIdx) && catIdx >= 0;
+    const contSelected = Number.isInteger(contIdx) && contIdx >= 0;
+
+    const catDisabled = Boolean(categoricalFieldSelect?.disabled) || !catSelected;
+    const contDisabled = Boolean(continuousFieldSelect?.disabled) || !contSelected;
+
+    if (categoricalFieldCopyBtn) categoricalFieldCopyBtn.disabled = catDisabled;
+    if (categoricalFieldRenameBtn) categoricalFieldRenameBtn.disabled = catDisabled;
+    if (categoricalFieldDeleteBtn) categoricalFieldDeleteBtn.disabled = catDisabled;
+    if (categoricalFieldClearBtn) categoricalFieldClearBtn.disabled = catDisabled;
+
+    if (continuousFieldCopyBtn) continuousFieldCopyBtn.disabled = contDisabled;
+    if (continuousFieldRenameBtn) continuousFieldRenameBtn.disabled = contDisabled;
+    if (continuousFieldDeleteBtn) continuousFieldDeleteBtn.disabled = contDisabled;
+    if (continuousFieldClearBtn) continuousFieldClearBtn.disabled = contDisabled;
+  }
+
+  function updateGeneActionButtons() {
+    const hasSelection = Number.isInteger(selectedGeneOriginalIdx) && selectedGeneOriginalIdx >= 0;
+    const disabled = forceDisableFieldSelects || !hasGeneExpressionFields || !hasSelection;
+    if (geneExpressionCopyBtn) geneExpressionCopyBtn.disabled = disabled;
+    if (geneExpressionRenameBtn) geneExpressionRenameBtn.disabled = disabled;
+    if (geneExpressionDeleteBtn) geneExpressionDeleteBtn.disabled = disabled;
+    if (geneExpressionClearBtn) geneExpressionClearBtn.disabled = forceDisableFieldSelects || !hasSelection;
   }
 
   function renderFieldSelects() {
     const fields = state.getFields();
-    const categoricalFields = getFieldsByKind('category');
-    const continuousFields = getFieldsByKind('continuous');
+    const categoricalFields = getFieldsByKind(FieldKind.CATEGORY);
+    const continuousFields = getFieldsByKind(FieldKind.CONTINUOUS);
     hasCategoricalFields = categoricalFields.length > 0;
     hasContinuousFields = continuousFields.length > 0;
 
@@ -2432,7 +2527,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       entries.forEach(({ field, idx }) => {
         const opt = document.createElement('option');
         opt.value = String(idx);
-        opt.textContent = field.key;
+        opt.textContent = field._originalKey ? `${field.key} *` : field.key;
         select.appendChild(opt);
       });
       select.value = NONE_FIELD_VALUE;
@@ -2446,20 +2541,192 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Field operations (rename / delete / restore)
+  // ---------------------------------------------------------------------------
+
+  function validateUniqueFieldName(nextValue, fields, fieldIndex) {
+    const value = String(nextValue ?? '').trim();
+    try {
+      StateValidator.validateFieldKey(value);
+    } catch (err) {
+      return err?.message || 'Invalid field name';
+    }
+    if (StateValidator.isDuplicateKey(value, fields, fieldIndex)) {
+      return 'A field with this name already exists';
+    }
+    return true;
+  }
+
+  function validateCategoryLabel(nextValue) {
+    const value = String(nextValue ?? '').trim();
+    if (!value) return 'Label cannot be empty';
+    try {
+      StateValidator.validateCategoryLabel(value);
+    } catch (err) {
+      return err?.message || 'Invalid category label';
+    }
+    return true;
+  }
+
+  function startFieldRename(source, fieldIndex, targetEl) {
+    const fields = source === FieldSource.VAR ? state.getVarFields?.() : state.getFields?.();
+    const field = fields?.[fieldIndex];
+    if (!field) return;
+
+    InlineEditor.create(targetEl, field.key, {
+      onSave: (newName) => {
+        const ok = state.renameField?.(source, fieldIndex, newName);
+        if (!ok) {
+          getNotificationCenter().error('Failed to rename field', { category: 'filter' });
+          return;
+        }
+        getNotificationCenter().success(`Renamed to "${newName}"`, { category: 'filter', duration: 2000 });
+      },
+      validate: (name) => validateUniqueFieldName(name, fields, fieldIndex)
+    });
+  }
+
+  function startFieldDelete(source, fieldIndex) {
+    const fields = source === FieldSource.VAR ? state.getVarFields?.() : state.getFields?.();
+    const field = fields?.[fieldIndex];
+    if (!field) return;
+
+    showConfirmDialog({
+      title: 'Delete field',
+      message: `Delete "${field.key}"? You can restore it from Deleted Fields.`,
+      confirmText: 'Delete',
+      onConfirm: () => {
+        const ok = state.deleteField?.(source, fieldIndex);
+        if (!ok) {
+          getNotificationCenter().error('Failed to delete field', { category: 'filter' });
+          return;
+        }
+        getNotificationCenter().success(`Deleted "${field.key}"`, { category: 'filter', duration: 2500 });
+      }
+    });
+  }
+
+  function renderDeletedFieldsSection() {
+    if (!deletedFieldsSection) return;
+
+    const deletedObs = getFieldRegistry().getDeletedFields(FieldSource.OBS);
+    const deletedVar = getFieldRegistry().getDeletedFields(FieldSource.VAR);
+    const total = deletedObs.length + deletedVar.length;
+
+    if (!total) {
+      deletedFieldsSection.hidden = true;
+      deletedFieldsSection.innerHTML = '';
+      return;
+    }
+
+    deletedFieldsSection.hidden = false;
+    deletedFieldsSection.innerHTML = '';
+
+    const open = deletedFieldsSection.dataset.open === 'true';
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'analysis-accordion deleted-fields-wrapper';
+    wrapper.innerHTML = `
+      <div class="analysis-accordion-item ${open ? 'open' : ''}" id="deleted-fields-accordion-item">
+        <button type="button" class="analysis-accordion-header" aria-expanded="${open ? 'true' : 'false'}">
+          <span class="analysis-accordion-title">Deleted Fields</span>
+          <span class="analysis-accordion-desc">${total} restorable item${total === 1 ? '' : 's'}</span>
+          <span class="analysis-accordion-chevron" aria-hidden="true"></span>
+        </button>
+
+        <div class="analysis-accordion-content">
+          <div class="deleted-fields-hint">
+            Restore soft-deleted fields, or confirm deletion to remove restore capability.
+          </div>
+          <div class="deleted-fields-list" id="deleted-fields-list"></div>
+        </div>
+      </div>
+    `;
+
+    deletedFieldsSection.appendChild(wrapper);
+
+    const item = wrapper.querySelector('#deleted-fields-accordion-item');
+    const toggle = wrapper.querySelector('.analysis-accordion-header');
+    const list = wrapper.querySelector('#deleted-fields-list');
+
+    toggle?.addEventListener('click', () => {
+      const next = !(deletedFieldsSection.dataset.open === 'true');
+      deletedFieldsSection.dataset.open = next ? 'true' : 'false';
+      toggle.setAttribute('aria-expanded', next ? 'true' : 'false');
+      item?.classList.toggle('open', next);
+    });
+
+    const addGroup = (title, entries, source) => {
+      if (!entries.length || !list) return;
+      const groupTitle = document.createElement('div');
+      groupTitle.className = 'deleted-fields-group-title';
+      groupTitle.textContent = title;
+      list.appendChild(groupTitle);
+
+      entries.forEach(({ field, index }) => {
+        const row = document.createElement('div');
+        row.className = 'deleted-field-row';
+
+        const name = document.createElement('span');
+        name.className = 'deleted-field-name';
+        name.textContent = field._originalKey ? `${field.key} *` : field.key;
+        if (field._originalKey) name.title = `Original: ${field._originalKey}`;
+
+        const buttons = document.createElement('div');
+        buttons.className = 'deleted-field-actions';
+
+        const restoreBtn = document.createElement('button');
+        restoreBtn.type = 'button';
+        restoreBtn.className = 'deleted-field-restore-btn';
+        restoreBtn.textContent = 'Restore';
+        restoreBtn.dataset.action = 'restore-field';
+        restoreBtn.dataset.source = source;
+        restoreBtn.dataset.index = String(index);
+
+        const confirmBtn = document.createElement('button');
+        confirmBtn.type = 'button';
+        confirmBtn.className = 'deleted-field-confirm-btn';
+        confirmBtn.textContent = 'Confirm';
+        confirmBtn.dataset.action = 'purge-field';
+        confirmBtn.dataset.source = source;
+        confirmBtn.dataset.index = String(index);
+        confirmBtn.title = 'Permanently confirm deletion (cannot be restored)';
+
+        buttons.appendChild(restoreBtn);
+        buttons.appendChild(confirmBtn);
+
+        row.appendChild(name);
+        row.appendChild(buttons);
+        list.appendChild(row);
+      });
+    };
+
+    addGroup('Obs', deletedObs, FieldSource.OBS);
+    addGroup('Genes', deletedVar, FieldSource.VAR);
+  }
+
   // Gene expression dropdown functions
   function initGeneExpressionDropdown() {
-    const varFields = state.getVarFields();
-    console.log('[UI] initGeneExpressionDropdown: varFields.length =', varFields.length, 'container =', !!geneExpressionContainer);
-    geneFieldList = varFields.map((field, idx) => ({ field, idx }));
+    const entries = state.getVisibleFields
+      ? state.getVisibleFields(FieldSource.VAR)
+      : (state.getVarFields?.() || [])
+          .map((field, index) => ({ field, index }))
+          .filter(({ field }) => field && field._isDeleted !== true);
+
+    geneFieldList = entries.map(({ field, index }) => ({ field, originalIdx: index }));
     hasGeneExpressionFields = geneFieldList.length > 0;
 
     if (hasGeneExpressionFields && geneExpressionContainer) {
       geneExpressionContainer.classList.add('visible');
-      console.log('[UI] Gene expression container shown');
     } else if (geneExpressionContainer) {
       geneExpressionContainer.classList.remove('visible');
-      console.log('[UI] Gene expression container hidden (no var fields)');
     }
+
+    if (!geneFieldList.some(({ originalIdx }) => originalIdx === selectedGeneOriginalIdx)) {
+      selectedGeneOriginalIdx = -1;
+    }
+    updateGeneActionButtons();
   }
 
   function renderGeneDropdownResults(query) {
@@ -2467,10 +2734,10 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     geneExpressionDropdown.innerHTML = '';
     
     const lowerQuery = (query || '').toLowerCase().trim();
-    let filtered = geneFieldList;
+    let filtered = geneFieldList.map((entry, listIndex) => ({ ...entry, listIndex }));
     
     if (lowerQuery) {
-      filtered = geneFieldList.filter(({ field }) => 
+      filtered = filtered.filter(({ field }) => 
         field.key.toLowerCase().includes(lowerQuery)
       );
     }
@@ -2486,15 +2753,16 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       return;
     }
     
-    toShow.forEach(({ field, idx }) => {
+    toShow.forEach(({ field, originalIdx }) => {
       const item = document.createElement('div');
       item.className = 'dropdown-item';
-      if (idx === selectedGeneIndex) {
+      if (originalIdx === selectedGeneOriginalIdx) {
         item.classList.add('selected');
       }
-      item.textContent = field.key;
-      item.dataset.index = idx;
-      item.addEventListener('click', () => selectGene(idx));
+      item.textContent = field._originalKey ? `${field.key} *` : field.key;
+      if (field._originalKey) item.title = `Original: ${field._originalKey}`;
+      item.dataset.originalIdx = String(originalIdx);
+      item.addEventListener('click', () => selectGene(originalIdx));
       geneExpressionDropdown.appendChild(item);
     });
     
@@ -2517,40 +2785,14 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     geneExpressionDropdown.classList.remove('visible');
   }
 
-  function updateSelectedGeneDisplay() {
-    if (!geneExpressionSelected) return;
-    
-    if (selectedGeneIndex >= 0) {
-      const field = geneFieldList[selectedGeneIndex]?.field;
-      if (field) {
-        geneExpressionSelected.innerHTML = '';
-        const nameSpan = document.createElement('span');
-        nameSpan.textContent = field.key;
-        const clearBtn = document.createElement('button');
-        clearBtn.className = 'clear-btn';
-        clearBtn.textContent = '✕';
-        clearBtn.title = 'Clear selection';
-        clearBtn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          clearGeneSelection();
-        });
-        geneExpressionSelected.appendChild(nameSpan);
-        geneExpressionSelected.appendChild(clearBtn);
-        geneExpressionSelected.classList.add('visible');
-      }
-    } else {
-      geneExpressionSelected.classList.remove('visible');
-    }
-  }
-
-  async function selectGene(idx) {
-    if (idx < 0 || idx >= geneFieldList.length) return;
-    
-    const field = geneFieldList[idx].field;
-    const originalIdx = geneFieldList[idx].idx;
+  async function selectGene(originalIdx) {
+    if (!Number.isInteger(originalIdx) || originalIdx < 0) return;
+    const entry = geneFieldList.find((e) => e.originalIdx === originalIdx);
+    const field = entry?.field;
+    if (!field) return;
 
     hideGeneDropdown();
-    selectedGeneIndex = idx;
+    selectedGeneOriginalIdx = originalIdx;
     
     categoricalFieldSelect.value = NONE_FIELD_VALUE;
     continuousFieldSelect.value = NONE_FIELD_VALUE;
@@ -2558,8 +2800,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     if (geneExpressionSearch) {
       geneExpressionSearch.value = field.key || '';
     }
-    
-    updateSelectedGeneDisplay();
+    updateGeneActionButtons();
     
     try {
       forceDisableFieldSelects = true;
@@ -2575,6 +2816,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       renderFilterSummary();
       updateStats(info);
       markSmokeDirty(); // gene filters affect visibility
+      updateHighlightMode();
     } catch (err) {
       console.error(err);
       getNotificationCenter().error(`Failed to load gene: ${err.message}`, { category: 'data' });
@@ -2585,8 +2827,8 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
   }
 
   function clearGeneSelection() {
-    selectedGeneIndex = -1;
-    updateSelectedGeneDisplay();
+    selectedGeneOriginalIdx = -1;
+    updateGeneActionButtons();
     if (geneExpressionSearch) {
       geneExpressionSearch.value = '';
     }
@@ -3038,6 +3280,8 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
         .sort((a, b) => a.cat.localeCompare(b.cat, undefined, { numeric: true, sensitivity: 'base' }))
         .map(item => item.idx);
 
+      const CATEGORY_DRAG_MIME = 'application/x-cellucid-category';
+
       // Create scrollable container for legend items
       const itemsContainer = document.createElement('div');
       itemsContainer.className = 'legend-items-container';
@@ -3057,6 +3301,8 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
         const visibleCount = visibleCounts[catIdx] || 0;
         const availableCount = availableCounts[catIdx] || 0;
         const hasCells = availableCount > 0;
+        const originalLabel = field._originalCategories?.[catIdx];
+        const isRenamed = originalLabel != null && String(originalLabel) !== cat;
 
         const row = document.createElement('div');
         row.className = 'legend-item';
@@ -3103,6 +3349,170 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
         const labelSpan = document.createElement('span');
         labelSpan.className = 'legend-label';
         labelSpan.textContent = cat;
+        if (isRenamed) {
+          labelSpan.classList.add('is-renamed');
+          labelSpan.title = `Original: ${originalLabel}`;
+        } else {
+          labelSpan.title = 'Double-click to rename • Drag onto another category to merge';
+        }
+
+        // Drag-to-merge: users can drop this category onto another to combine them.
+        labelSpan.draggable = true;
+        labelSpan.classList.add('legend-label-draggable');
+        labelSpan.addEventListener('dragstart', (e) => {
+          row.classList.add('legend-item-dragging');
+          if (!e.dataTransfer) return;
+          e.dataTransfer.effectAllowed = 'move';
+          e.dataTransfer.setData(CATEGORY_DRAG_MIME, JSON.stringify({ catIdx }));
+          e.dataTransfer.setData('text/plain', String(catIdx));
+        });
+        labelSpan.addEventListener('dragend', () => {
+          row.classList.remove('legend-item-dragging');
+          itemsContainer.querySelectorAll('.legend-item-drag-over').forEach((el) => el.classList.remove('legend-item-drag-over'));
+        });
+
+        const renameBtn = document.createElement('button');
+        renameBtn.type = 'button';
+        renameBtn.className = 'legend-rename-btn';
+        renameBtn.title = 'Rename category';
+        renameBtn.innerHTML = `
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+            <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+          </svg>
+        `;
+
+        const startRename = () => {
+          const fieldIndex = state.activeFieldSource === FieldSource.OBS ? state.activeFieldIndex : -1;
+          if (!Number.isInteger(fieldIndex) || fieldIndex < 0) return;
+          const currentField = state.getFields?.()?.[fieldIndex];
+          if (!currentField || currentField.kind !== FieldKind.CATEGORY) return;
+          const currentLabel = currentField.categories?.[catIdx] ?? '';
+
+          InlineEditor.create(labelSpan, currentLabel, {
+            onSave: (newLabel) => {
+              const ok = state.renameCategory?.(FieldSource.OBS, fieldIndex, catIdx, newLabel);
+              if (!ok) {
+                getNotificationCenter().error('Failed to rename category', { category: 'filter' });
+                return;
+              }
+              getNotificationCenter().success(`Category renamed to "${newLabel}"`, { category: 'filter', duration: 2000 });
+            },
+            validate: validateCategoryLabel
+          });
+        };
+
+        renameBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          startRename();
+        });
+        labelSpan.addEventListener('dblclick', (e) => {
+          e.stopPropagation();
+          startRename();
+        });
+
+        const deleteBtn = document.createElement('button');
+        deleteBtn.type = 'button';
+        deleteBtn.className = 'legend-delete-btn';
+        deleteBtn.title = 'Delete category (merge into unassigned)';
+        deleteBtn.innerHTML = `
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+          </svg>
+        `;
+        deleteBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+
+          const fieldIndex = state.activeFieldSource === FieldSource.OBS ? state.activeFieldIndex : -1;
+          if (!Number.isInteger(fieldIndex) || fieldIndex < 0) return;
+          const currentField = state.getFields?.()?.[fieldIndex];
+          if (!currentField || currentField.kind !== FieldKind.CATEGORY) return;
+
+          const currentLabel = String(currentField.categories?.[catIdx] ?? '');
+          const unassignedLabel = 'unassigned';
+          const inPlace = currentField._isUserDefined === true;
+
+          showConfirmDialog({
+            title: 'Delete category label',
+            message:
+              `Delete category "${currentLabel}"?\n\n` +
+              (inPlace
+                ? `This edits the current derived column in place, merging "${currentLabel}" into "${unassignedLabel}".\n` +
+                  `To undo, restore the original column from Deleted Fields.`
+                : `This creates a new categorical column where "${currentLabel}" is merged into "${unassignedLabel}".\n` +
+                  `The previous column is moved to Deleted Fields for restore.`),
+            confirmText: 'Delete category',
+            onConfirm: () => {
+              const result = state.deleteCategoryToUnassigned?.(fieldIndex, catIdx, { unassignedLabel, editInPlace: inPlace });
+              if (!result) {
+                getNotificationCenter().error('Failed to delete category', { category: 'filter' });
+                return;
+              }
+              const msg = result.updatedInPlace
+                ? `Merged into "${unassignedLabel}" (edited in place)`
+                : `Moved into "${unassignedLabel}"`;
+              getNotificationCenter().success(msg, { category: 'filter', duration: 2400 });
+            }
+          });
+        });
+
+        // Drop target: merge dragged category into this one.
+        row.addEventListener('dragover', (e) => {
+          if (!e.dataTransfer) return;
+          if (!e.dataTransfer.types?.includes?.(CATEGORY_DRAG_MIME)) return;
+          e.preventDefault();
+          e.dataTransfer.dropEffect = 'move';
+          row.classList.add('legend-item-drag-over');
+        });
+        row.addEventListener('dragleave', () => {
+          row.classList.remove('legend-item-drag-over');
+        });
+        row.addEventListener('drop', (e) => {
+          e.preventDefault();
+          row.classList.remove('legend-item-drag-over');
+
+          let payload = null;
+          try {
+            payload = JSON.parse(e.dataTransfer?.getData?.(CATEGORY_DRAG_MIME) || 'null');
+          } catch {}
+
+          const fromIdx =
+            Number.isInteger(payload?.catIdx)
+              ? payload.catIdx
+              : parseInt(e.dataTransfer?.getData?.('text/plain') || '', 10);
+          if (!Number.isInteger(fromIdx) || fromIdx < 0) return;
+          if (fromIdx === catIdx) return;
+
+          const fieldIndex = state.activeFieldSource === FieldSource.OBS ? state.activeFieldIndex : -1;
+          if (!Number.isInteger(fieldIndex) || fieldIndex < 0) return;
+          const currentField = state.getFields?.()?.[fieldIndex];
+          if (!currentField || currentField.kind !== FieldKind.CATEGORY) return;
+
+          const fromLabel = String(currentField.categories?.[fromIdx] ?? '');
+          const toLabel = String(currentField.categories?.[catIdx] ?? '');
+          const inPlace = currentField._isUserDefined === true;
+
+          showConfirmDialog({
+            title: 'Merge categories',
+            message:
+              `Merge category "${fromLabel}" into "${toLabel}"?\n\n` +
+              (inPlace
+                ? `This edits the current derived column in place.\n` +
+                  `To undo, restore the original column from Deleted Fields.`
+                : `This creates a new categorical column and moves the previous column to Deleted Fields for restore.`),
+            confirmText: 'Merge',
+            onConfirm: () => {
+              const result = state.mergeCategoriesToNewField?.(fieldIndex, fromIdx, catIdx, { editInPlace: inPlace });
+              if (!result) {
+                getNotificationCenter().error('Failed to merge categories', { category: 'filter' });
+                return;
+              }
+              const mergedLabel = result.mergedCategoryLabel ? ` → "${result.mergedCategoryLabel}"` : '';
+              const suffix = result.updatedInPlace ? ' (edited in place)' : '';
+              getNotificationCenter().success(`Merged "${fromLabel}" into "${toLabel}"${mergedLabel}${suffix}`, { category: 'filter', duration: 2400 });
+            }
+          });
+        });
         const countSpan = document.createElement('span');
         countSpan.className = 'legend-count';
         countSpan.textContent = formatCategoryCount(visibleCount, availableCount);
@@ -3111,6 +3521,8 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
         row.appendChild(swatch);
         row.appendChild(labelSpan);
         row.appendChild(countSpan);
+        row.appendChild(renameBtn);
+        row.appendChild(deleteBtn);
         itemsContainer.appendChild(row);
       });
       catSection.appendChild(itemsContainer);
@@ -3762,8 +4174,8 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     
     // Clear gene selection when activating an obs field
     if (idx >= 0) {
-      selectedGeneIndex = -1;
-      updateSelectedGeneDisplay();
+      selectedGeneOriginalIdx = -1;
+      updateGeneActionButtons();
       if (geneExpressionSearch) {
         geneExpressionSearch.value = '';
       }
@@ -3772,8 +4184,8 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     if (idx < 0) {
       const cleared = state.clearActiveField ? state.clearActiveField() : null;
       clearFieldSelections();
-      selectedGeneIndex = -1;
-      updateSelectedGeneDisplay();
+      selectedGeneOriginalIdx = -1;
+      updateGeneActionButtons();
       if (geneExpressionSearch) {
         geneExpressionSearch.value = '';
       }
@@ -3787,6 +4199,8 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
         const counts = state.getFilteredCount();
         updateStats({ field: null, pointCount: counts.total, centroidInfo: '' });
       }
+      updateFieldSelectDisabledStates();
+      updateHighlightMode();
       markSmokeDirty();
       return;
     }
@@ -3807,6 +4221,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       handleOutlierUI(state.getActiveField());
       renderFilterSummary();
       updateStats(info);
+      updateHighlightMode();
       markSmokeDirty();
       // Update view labels to reflect field change
       syncActiveViewSelectOptions();
@@ -3849,6 +4264,215 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
     }
     updateHighlightMode();
   });
+
+  if (categoricalFieldCopyBtn) {
+    categoricalFieldCopyBtn.addEventListener('click', async () => {
+      const idx = parseInt(categoricalFieldSelect.value, 10);
+      if (!Number.isInteger(idx) || idx < 0) return;
+      const field = state.getFields?.()?.[idx];
+      if (!field) return;
+
+      const notify = getNotificationCenter();
+      const notifId = notify.loading(`Duplicating "${field.key}"…`, { category: 'filter' });
+      try {
+        const result = await state.duplicateField?.(FieldSource.OBS, idx);
+        if (!result) {
+          notify.fail(notifId, 'Duplicate failed');
+          return;
+        }
+
+        // Switch selection to the new field for immediate editing/combining workflows.
+        categoricalFieldSelect.value = String(result.newFieldIndex);
+        continuousFieldSelect.value = NONE_FIELD_VALUE;
+        await activateField(result.newFieldIndex);
+        updateHighlightMode();
+
+        notify.complete(notifId, `Created "${result.newKey}"`);
+      } catch (err) {
+        console.error(err);
+        notify.fail(notifId, `Duplicate failed: ${err.message || err}`);
+      }
+    });
+  }
+
+  if (categoricalFieldRenameBtn) {
+    categoricalFieldRenameBtn.addEventListener('click', () => {
+      const idx = parseInt(categoricalFieldSelect.value, 10);
+      if (!Number.isInteger(idx) || idx < 0) return;
+      startFieldRename(FieldSource.OBS, idx, categoricalFieldSelect);
+    });
+  }
+
+  if (categoricalFieldDeleteBtn) {
+    categoricalFieldDeleteBtn.addEventListener('click', () => {
+      const idx = parseInt(categoricalFieldSelect.value, 10);
+      if (!Number.isInteger(idx) || idx < 0) return;
+      startFieldDelete(FieldSource.OBS, idx);
+    });
+  }
+
+  if (categoricalFieldClearBtn) {
+    categoricalFieldClearBtn.addEventListener('click', () => {
+      activateField(-1);
+    });
+  }
+
+  if (continuousFieldCopyBtn) {
+    continuousFieldCopyBtn.addEventListener('click', async () => {
+      const idx = parseInt(continuousFieldSelect.value, 10);
+      if (!Number.isInteger(idx) || idx < 0) return;
+      const field = state.getFields?.()?.[idx];
+      if (!field) return;
+
+      const notify = getNotificationCenter();
+      const notifId = notify.loading(`Duplicating "${field.key}"…`, { category: 'filter' });
+      try {
+        const result = await state.duplicateField?.(FieldSource.OBS, idx);
+        if (!result) {
+          notify.fail(notifId, 'Duplicate failed');
+          return;
+        }
+
+        continuousFieldSelect.value = String(result.newFieldIndex);
+        categoricalFieldSelect.value = NONE_FIELD_VALUE;
+        await activateField(result.newFieldIndex);
+        updateHighlightMode();
+
+        notify.complete(notifId, `Created "${result.newKey}"`);
+      } catch (err) {
+        console.error(err);
+        notify.fail(notifId, `Duplicate failed: ${err.message || err}`);
+      }
+    });
+  }
+
+  if (continuousFieldRenameBtn) {
+    continuousFieldRenameBtn.addEventListener('click', () => {
+      const idx = parseInt(continuousFieldSelect.value, 10);
+      if (!Number.isInteger(idx) || idx < 0) return;
+      startFieldRename(FieldSource.OBS, idx, continuousFieldSelect);
+    });
+  }
+
+  if (continuousFieldDeleteBtn) {
+    continuousFieldDeleteBtn.addEventListener('click', () => {
+      const idx = parseInt(continuousFieldSelect.value, 10);
+      if (!Number.isInteger(idx) || idx < 0) return;
+      startFieldDelete(FieldSource.OBS, idx);
+    });
+  }
+
+  if (continuousFieldClearBtn) {
+    continuousFieldClearBtn.addEventListener('click', () => {
+      activateField(-1);
+    });
+  }
+
+  if (geneExpressionCopyBtn) {
+    geneExpressionCopyBtn.addEventListener('click', async () => {
+      if (!Number.isInteger(selectedGeneOriginalIdx) || selectedGeneOriginalIdx < 0) return;
+
+      const field = state.getVarFields?.()?.[selectedGeneOriginalIdx];
+      if (!field) return;
+
+      const notify = getNotificationCenter();
+      const notifId = notify.loading(`Duplicating "${field.key}"…`, { category: 'filter' });
+      try {
+        const result = await state.duplicateField?.(FieldSource.VAR, selectedGeneOriginalIdx);
+        if (!result) {
+          notify.fail(notifId, 'Duplicate failed');
+          return;
+        }
+
+        // Refresh gene list and select the new copy.
+        initGeneExpressionDropdown();
+        await selectGene(result.newFieldIndex);
+        notify.complete(notifId, `Created "${result.newKey}"`);
+      } catch (err) {
+        console.error(err);
+        notify.fail(notifId, `Duplicate failed: ${err.message || err}`);
+      }
+    });
+  }
+
+  if (geneExpressionRenameBtn) {
+    geneExpressionRenameBtn.addEventListener('click', () => {
+      if (!Number.isInteger(selectedGeneOriginalIdx) || selectedGeneOriginalIdx < 0) return;
+      if (!geneExpressionSearch) return;
+      startFieldRename(FieldSource.VAR, selectedGeneOriginalIdx, geneExpressionSearch);
+    });
+  }
+
+  if (geneExpressionDeleteBtn) {
+    geneExpressionDeleteBtn.addEventListener('click', () => {
+      if (!Number.isInteger(selectedGeneOriginalIdx) || selectedGeneOriginalIdx < 0) return;
+      startFieldDelete(FieldSource.VAR, selectedGeneOriginalIdx);
+    });
+  }
+
+  if (geneExpressionClearBtn) {
+    geneExpressionClearBtn.addEventListener('click', () => {
+      clearGeneSelection();
+    });
+  }
+
+  if (deletedFieldsSection) {
+    deletedFieldsSection.addEventListener('click', (e) => {
+      const purgeBtn = e.target.closest('button[data-action="purge-field"]');
+      if (purgeBtn) {
+        const source = purgeBtn.dataset.source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
+        const fieldIndex = parseInt(purgeBtn.dataset.index, 10);
+        if (!Number.isInteger(fieldIndex) || fieldIndex < 0) return;
+
+        const fields = source === FieldSource.VAR ? state.getVarFields?.() : state.getFields?.();
+        const field = fields?.[fieldIndex];
+        const label = field?.key || 'field';
+
+        showConfirmDialog({
+          title: 'Confirm deletion',
+          message:
+            `Permanently confirm deletion of "${label}"?\n\n` +
+            `This removes restore capability for this field in the current session and in saved states.`,
+          confirmText: 'Confirm delete',
+          onConfirm: () => {
+            const ok = state.purgeDeletedField?.(source, fieldIndex);
+            if (!ok) {
+              getNotificationCenter().error('Failed to confirm deletion', { category: 'filter' });
+              return;
+            }
+            getNotificationCenter().success(`Confirmed deletion of "${label}"`, { category: 'filter', duration: 2500 });
+          }
+        });
+        return;
+      }
+
+      const restoreBtn = e.target.closest('button[data-action="restore-field"]');
+      if (!restoreBtn) return;
+
+      const source = restoreBtn.dataset.source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
+      const fieldIndex = parseInt(restoreBtn.dataset.index, 10);
+      if (!Number.isInteger(fieldIndex) || fieldIndex < 0) return;
+
+      const fields = source === FieldSource.VAR ? state.getVarFields?.() : state.getFields?.();
+      const field = fields?.[fieldIndex];
+      const label = field?.key || 'field';
+
+      const result = state.restoreField?.(source, fieldIndex);
+      if (!result || result.ok !== true) {
+        getNotificationCenter().error('Failed to restore field', { category: 'filter' });
+        return;
+      }
+
+      if (result.renamedTo) {
+        getNotificationCenter().success(
+          `Restored "${label}" as "${result.key}"`,
+          { category: 'filter', duration: 2800 }
+        );
+      } else {
+        getNotificationCenter().success(`Restored "${result.key || label}"`, { category: 'filter', duration: 2500 });
+      }
+    });
+  }
 
   const syncSidebarToggleState = () => {
     const isHidden = sidebar.classList.contains('hidden');
@@ -4418,15 +5042,13 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
   // Gene expression search and dropdown event listeners
   if (geneExpressionSearch) {
     geneExpressionSearch.addEventListener('focus', () => {
-      if (selectedGeneIndex >= 0) {
-        geneExpressionSearch.value = '';
-      }
+      geneExpressionSearch.select?.();
       showGeneDropdown();
     });
 
     geneExpressionSearch.addEventListener('input', () => {
       renderGeneDropdownResults(geneExpressionSearch.value);
-      if (!geneExpressionDropdown.classList.contains('visible')) {
+      if (geneExpressionDropdown && !geneExpressionDropdown.classList.contains('visible')) {
         showGeneDropdown();
       }
     });
@@ -4438,18 +5060,16 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       } else if (e.key === 'Enter') {
         const firstItem = geneExpressionDropdown.querySelector('.dropdown-item');
         if (firstItem) {
-          const idx = parseInt(firstItem.dataset.index, 10);
-          selectGene(idx);
+          const originalIdx = parseInt(firstItem.dataset.originalIdx, 10);
+          selectGene(originalIdx);
         }
       }
     });
 
     geneExpressionSearch.addEventListener('blur', () => {
-      if (selectedGeneIndex >= 0 && !geneExpressionSearch.value) {
-        const field = geneFieldList[selectedGeneIndex]?.field;
-        if (field) {
-          geneExpressionSearch.value = field.key || '';
-        }
+      if (selectedGeneOriginalIdx >= 0 && !geneExpressionSearch.value) {
+        const field = geneFieldList.find(({ originalIdx }) => originalIdx === selectedGeneOriginalIdx)?.field;
+        if (field) geneExpressionSearch.value = field.key || '';
       }
     });
   }
@@ -4692,8 +5312,26 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
   };
 
   renderFieldSelects();
+  renderDeletedFieldsSection();
   updateHighlightMode();
   initGeneExpressionDropdown();
+
+  if (categoryBuilderContainer && !categoryBuilderContainer.dataset.catBuilderInitialized) {
+    categoryBuilderContainer.dataset.catBuilderInitialized = 'true';
+    new CategoryBuilder(state, categoryBuilderContainer).init();
+  }
+
+  if (state.addFieldChangeCallback) {
+    state.addFieldChangeCallback(() => {
+      renderFieldSelects();
+      initGeneExpressionDropdown();
+      renderDeletedFieldsSection();
+      refreshUIForActiveView();
+      updateHighlightMode();
+      syncActiveViewSelectOptions();
+      renderSplitViewBadges();
+    });
+  }
   const startingNavMode = navigationModeSelect?.value || 'orbit';
   toggleNavigationPanels(startingNavMode);
 
@@ -4876,19 +5514,12 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
       liveViewHidden = viewer.getLiveViewHidden();
     }
 
+    renderFieldSelects();
+    renderDeletedFieldsSection();
+    initGeneExpressionDropdown();
+    refreshUIForActiveView();
     renderHighlightPages();
     renderHighlightSummary();
-    renderFilterSummary();
-    state.updateFilteredCount();
-    renderLegend(state.getActiveField());
-    handleOutlierUI(state.getActiveField());
-    const counts = state.getFilteredCount();
-    const activeField = state.getActiveField();
-    updateStats({
-      field: activeField,
-      pointCount: counts?.total || 0,
-      centroidInfo: ''
-    });
     renderSplitViewBadges();
     updateSplitViewUI();
   }
@@ -5006,6 +5637,7 @@ export function initUI({ state, viewer, dom, smoke, dataSourceManager, reloadAct
    */
   function refreshDatasetUI(metadata) {
     renderFieldSelects();
+    renderDeletedFieldsSection();
     initGeneExpressionDropdown();
     clearGeneSelection();
     refreshUIForActiveView();

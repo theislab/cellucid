@@ -283,6 +283,46 @@
   box-shadow: var(--shadow-xs);
 }
 
+.highlight-page-color {
+  width: 10px;
+  height: 10px;
+  border-radius: 0;
+  flex-shrink: 0;
+  border: var(--border-width-1) solid var(--color-border-default);
+  background-color: var(--highlight-page-color, var(--color-border-default));
+  cursor: pointer;
+  position: relative;
+}
+
+.highlight-page-color:hover {
+  border-color: var(--color-border-strong);
+}
+
+.highlight-page-tab.active .highlight-page-color {
+  border-color: color-mix(in srgb, var(--color-text-inverse) 30%, transparent);
+}
+
+.highlight-page-tab.active .highlight-page-color:hover {
+  border-color: color-mix(in srgb, var(--color-text-inverse) 50%, transparent);
+}
+
+.highlight-page-color-input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  min-width: 0;
+  min-height: 0;
+  border: none;
+  padding: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
+  cursor: pointer;
+  opacity: 0;
+}
+
 .highlight-page-tab-name {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -292,7 +332,7 @@
 }
 
 .highlight-page-tab-count {
-  font-size: 8px;
+  font-size: var(--text-2xs);
   opacity: var(--opacity-65);
   flex-shrink: 0;
   font-family: var(--font-mono);

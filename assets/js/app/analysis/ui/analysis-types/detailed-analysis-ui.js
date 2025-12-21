@@ -64,7 +64,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     this._pageSelectContainer = null;
     this._plotTypeContainer = null;
 
-    // Custom page colors
+    // Derived page color overrides (base page colors come from DataState.page.color)
     this._customPageColors = new Map();
 
     // Session-only saved options per plot type
@@ -208,6 +208,13 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
    * Render page selector
    */
   _renderPageSelector(pages) {
+    // Keep base page colors in sync with global highlight page colors.
+    (pages || []).forEach((p) => {
+      if (!p?.id) return;
+      const color = this.dataLayer?.getPageColor?.(p.id) || p.color || null;
+      if (color) this._customPageColors.set(p.id, color);
+    });
+
     const pageSelect = createPageSelector({
       pages: pages,
       selectedIds: this._selectedPages,
@@ -250,7 +257,6 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     const base = super.exportSettings();
     return {
       ...base,
-      customPageColors: Array.from(this._customPageColors.entries()),
       savedPlotOptions: Array.from(this._savedPlotOptions.entries())
     };
   }
@@ -258,9 +264,6 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
   importSettings(settings) {
     if (!settings) return;
 
-    if (Array.isArray(settings.customPageColors)) {
-      this._customPageColors = new Map(settings.customPageColors);
-    }
     if (Array.isArray(settings.savedPlotOptions)) {
       this._savedPlotOptions = new Map(settings.savedPlotOptions);
     }
@@ -311,7 +314,12 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
   }
 
   _handlePageColorChange(pageId, color) {
-    this._customPageColors.set(pageId, color);
+    // Base highlight pages: persist to DataState so the entire app stays in sync.
+    const applied = this.dataLayer?.setPageColor?.(pageId, color);
+    // Derived pages (e.g., rest-of) don't exist in DataState, but we still allow local overrides.
+    if (applied || applied === false) {
+      this._customPageColors.set(pageId, color);
+    }
     this._scheduleUpdate();
   }
 

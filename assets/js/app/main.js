@@ -7,7 +7,6 @@ import { initDockableAccordions } from './dockable-accordions.js';
 import { setDockableAccordions } from './dockable-accordions-registry.js';
 import { getNotificationCenter } from './notification-center.js';
 import {
-  loadObsJson,
   loadObsManifest,
   createObsFieldLoader,
   loadVarManifest,
@@ -263,7 +262,6 @@ let EXPORT_BASE_URL = 'assets/exports/';
 function getObsManifestUrl() { return `${EXPORT_BASE_URL}obs_manifest.json`; }
 function getVarManifestUrl() { return `${EXPORT_BASE_URL}var_manifest.json`; }
 function getConnectivityManifestUrl() { return `${EXPORT_BASE_URL}connectivity_manifest.json`; }
-function getLegacyObsUrl() { return `${EXPORT_BASE_URL}obs_values.json`; }
 function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.json`; }
 
 (async function bootstrap() {
@@ -272,7 +270,15 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
   const viewTitleLayer = document.getElementById('view-title-layer');
   const statsEl = document.getElementById('stats');
   const categoricalFieldSelect = document.getElementById('categorical-field');
+  const categoricalFieldCopyBtn = document.getElementById('copy-categorical-field');
+  const categoricalFieldRenameBtn = document.getElementById('rename-categorical-field');
+  const categoricalFieldDeleteBtn = document.getElementById('delete-categorical-field');
+  const categoricalFieldClearBtn = document.getElementById('clear-categorical-field');
   const continuousFieldSelect = document.getElementById('continuous-field');
+  const continuousFieldCopyBtn = document.getElementById('copy-continuous-field');
+  const continuousFieldRenameBtn = document.getElementById('rename-continuous-field');
+  const continuousFieldDeleteBtn = document.getElementById('delete-continuous-field');
+  const continuousFieldClearBtn = document.getElementById('clear-continuous-field');
   const legendEl = document.getElementById('legend');
   const pointSizeInput = document.getElementById('point-size');
   const pointSizeDisplay = document.getElementById('point-size-display');
@@ -307,6 +313,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
   const outlierFilterDisplay = document.getElementById('outlier-filter-display');
   const filterCountEl = document.getElementById('filter-count');
   const activeFiltersEl = document.getElementById('active-filters');
+  const deletedFieldsSection = document.getElementById('deleted-fields-section');
   // Highlight UI elements
   const highlightCountEl = document.getElementById('highlight-count');
   const highlightedGroupsEl = document.getElementById('highlighted-groups-list');
@@ -345,7 +352,11 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
   const geneExpressionContainer = document.getElementById('gene-expression-container');
   const geneExpressionSearch = document.getElementById('gene-expression-search');
   const geneExpressionDropdown = document.getElementById('gene-expression-dropdown');
-  const geneExpressionSelected = document.getElementById('gene-expression-selected');
+  const geneExpressionCopyBtn = document.getElementById('copy-gene-expression');
+  const geneExpressionRenameBtn = document.getElementById('rename-gene-expression');
+  const geneExpressionDeleteBtn = document.getElementById('delete-gene-expression');
+  const geneExpressionClearBtn = document.getElementById('clear-gene-expression');
+  const categoryBuilderContainer = document.getElementById('category-builder-container');
 
   // New smoke controls
   const renderModeSelect = document.getElementById('render-mode');
@@ -680,21 +691,16 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     // Initialize dimension manager for multi-dimensional embeddings
     const dimensionManager = createDimensionManager({ baseUrl: EXPORT_BASE_URL });
 
-    // Helper: load obs manifest with fallback to legacy format
-    async function loadObsManifestWithFallback() {
+    // Development phase: require obs_manifest.json (no legacy obs_values.json fallback).
+    async function loadObsManifestStrict() {
       try {
         const manifest = await loadObsManifest(getObsManifestUrl());
         state.setFieldLoader(createObsFieldLoader(getObsManifestUrl(), { fetchInit: FAST_BINARY_FETCH_INIT }));
         return manifest;
       } catch (err) {
         if (err?.status === 404) {
-          console.warn('obs_manifest.json not found, falling back to obs_values.json');
-          try {
-            return await loadObsJson(getLegacyObsUrl());
-          } catch (err2) {
-            console.warn('obs_values.json also not found, using empty obs');
-            return { fields: [], count: 0 };
-          }
+          console.warn('obs_manifest.json not found, using empty obs');
+          return { fields: [], count: 0 };
         }
         throw err;
       }
@@ -710,7 +716,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       return null;
     });
 
-    const obsPromise = loadObsManifestWithFallback();
+    const obsPromise = loadObsManifestStrict();
 
     const varPromise = loadVarManifest(getVarManifestUrl()).catch(err => {
       if (err?.status === 404) {
@@ -821,7 +827,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
           return null;
         });
 
-        const reloadObsPromise = loadObsManifestWithFallback();
+        const reloadObsPromise = loadObsManifestStrict();
 
         const reloadVarPromise = loadVarManifest(getVarManifestUrl()).catch(err => {
           if (err?.status === 404) {
@@ -893,9 +899,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
         const nextPositions = await positionsPromiseReload;
 
-        // Get the normalization transform from DimensionManager to apply to centroids
-        const reloadNormTransform = dimensionManager.getNormTransform(newDefaultDim);
-        state.initScene(nextPositions, nextObs, reloadNormTransform);
+        state.initScene(nextPositions, nextObs);
         if (state.clearActiveField) {
           state.clearActiveField();
         }
@@ -954,10 +958,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
     const positions = await positionsPromise;
 
-    // Get the normalization transform from DimensionManager to apply to centroids
-    // Positions are already normalized by getPositions3D(), we just need the transform for centroids
-    const normTransform = dimensionManager.getNormTransform(defaultDim);
-    state.initScene(positions, obs, normTransform);
+    state.initScene(positions, obs);
     // One-time helper to rebuild density from current visibility + grid
     function rebuildSmokeDensity(gridSizeOverride) {
       const gridSize = gridSizeOverride || 128;
@@ -985,7 +986,15 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       dom: {
         statsEl,
         categoricalFieldSelect,
+        categoricalFieldCopyBtn,
+        categoricalFieldRenameBtn,
+        categoricalFieldDeleteBtn,
+        categoricalFieldClearBtn,
         continuousFieldSelect,
+        continuousFieldCopyBtn,
+        continuousFieldRenameBtn,
+        continuousFieldDeleteBtn,
+        continuousFieldClearBtn,
         legendEl,
         displayOptionsContainer,
         pointSizeInput,
@@ -1002,6 +1011,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         outlierFilterDisplay,
         filterCountEl,
         activeFiltersEl,
+        deletedFieldsSection,
         highlightCountEl,
         highlightedGroupsEl,
         clearAllHighlightsBtn,
@@ -1038,7 +1048,11 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         geneExpressionContainer,
         geneExpressionSearch,
         geneExpressionDropdown,
-        geneExpressionSelected,
+        geneExpressionCopyBtn,
+        geneExpressionRenameBtn,
+        geneExpressionDeleteBtn,
+        geneExpressionClearBtn,
+        categoryBuilderContainer,
         renderModeSelect,
         smokeControls,
         smokeGridInput,
