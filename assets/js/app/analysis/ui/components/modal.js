@@ -219,7 +219,6 @@ export function createAnalysisModal(options = {}) {
   // Store references
   modal._plotContainer = plotContainer;
   modal._optionsContent = optionsContent;
-  modal._footer = statsContent; // For backwards compatibility
   modal._statsContent = statsContent;
   modal._annotationsContent = annotationsContent;
   modal._title = title;

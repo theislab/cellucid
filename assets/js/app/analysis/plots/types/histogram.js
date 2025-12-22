@@ -11,7 +11,7 @@ const histogramDefinition = {
   id: 'histogram',
   name: 'Histogram',
   description: 'Compare binned value distributions across pages',
-  supportedDataTypes: ['continuous'],
+  supportedTypes: ['continuous'],
   supportedLayouts: ['side-by-side', 'overlay', 'stacked'],
 
   defaultOptions: {

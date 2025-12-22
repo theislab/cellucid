@@ -5,6 +5,9 @@
  * It handles positioning of the plot area, legend, title, and axes while ensuring
  * the plot content maintains its intended size.
  *
+ * NOTE: Legend size is computed dynamically from the legend model so exports
+ * can show all legend entries (no “+N more” truncation).
+ *
  * KEY DESIGN DECISION:
  * The user-specified dimensions (width x height) represent the desired PLOT content size.
  * Legend, axes, and title are added as ADDITIONAL space around the plot, expanding
@@ -33,6 +36,18 @@ const LEGEND_WIDTH_RIGHT = 240;
 /** Height of legend panel when positioned at the bottom (px) */
 const LEGEND_HEIGHT_BOTTOM = 140;
 
+/** Legend layout padding (px) */
+const LEGEND_PADDING = 8;
+
+/** Legend swatch size (px) */
+const LEGEND_SWATCH = 10;
+
+/** Gap between swatch and text (px) */
+const LEGEND_SWATCH_GAP = 6;
+
+/** Approximate average character width in pixels (multiplier × fontSize) */
+const LEGEND_CHAR_WIDTH = 0.62;
+
 /** Space reserved for Y-axis labels and ticks (px) */
 const AXIS_LEFT_SPACE = 62;
 
@@ -47,6 +62,46 @@ const AXIS_RIGHT_SPACE = 10;
 
 /** Minimal padding when axes are disabled (px) */
 const NO_AXIS_PADDING = 10;
+
+function estimateLegendWidthRight({ model, fontSizePx, plotHeight }) {
+  if (!model) return LEGEND_WIDTH_RIGHT;
+  if (model.kind !== 'category') return LEGEND_WIDTH_RIGHT;
+  const categories = model.categories || [];
+  if (!categories.length) return LEGEND_WIDTH_RIGHT;
+
+  const lineH = Math.max(14, Math.round(fontSizePx * 1.2));
+  const headerSpace = LEGEND_PADDING + fontSizePx + 8;
+  const availH = Math.max(1, plotHeight - headerSpace - LEGEND_PADDING);
+  const rowsPerCol = Math.max(1, Math.floor(availH / lineH));
+  const cols = Math.max(1, Math.ceil(categories.length / rowsPerCol));
+
+  let maxLen = 0;
+  for (const c of categories) maxLen = Math.max(maxLen, String(c ?? '').length);
+  const textW = maxLen * fontSizePx * LEGEND_CHAR_WIDTH;
+  const colW = LEGEND_SWATCH + LEGEND_SWATCH_GAP + textW;
+  const width = Math.ceil(LEGEND_PADDING * 2 + cols * colW);
+  return Math.max(LEGEND_WIDTH_RIGHT, width);
+}
+
+function estimateLegendHeightBottom({ model, fontSizePx, plotWidth }) {
+  if (!model) return LEGEND_HEIGHT_BOTTOM;
+  if (model.kind !== 'category') return LEGEND_HEIGHT_BOTTOM;
+  const categories = model.categories || [];
+  if (!categories.length) return LEGEND_HEIGHT_BOTTOM;
+
+  let maxLen = 0;
+  for (const c of categories) maxLen = Math.max(maxLen, String(c ?? '').length);
+  const textW = maxLen * fontSizePx * LEGEND_CHAR_WIDTH;
+  const colW = LEGEND_SWATCH + LEGEND_SWATCH_GAP + textW;
+
+  const lineH = Math.max(14, Math.round(fontSizePx * 1.2));
+  const headerSpace = LEGEND_PADDING + fontSizePx + 8;
+  const availW = Math.max(1, plotWidth - LEGEND_PADDING * 2);
+  const cols = Math.max(1, Math.floor(availW / Math.max(1, colW)));
+  const rows = Math.max(1, Math.ceil(categories.length / cols));
+  const height = Math.ceil(headerSpace + rows * lineH + LEGEND_PADDING);
+  return Math.max(LEGEND_HEIGHT_BOTTOM, height);
+}
 
 // ============================================================================
 // Type Definitions
@@ -103,6 +158,8 @@ const NO_AXIS_PADDING = 10;
  * @param {boolean} [options.includeAxes=true] - Whether axes will be rendered
  * @param {boolean} [options.includeLegend=true] - Whether legend will be rendered
  * @param {LegendPosition} [options.legendPosition='right'] - Legend position
+ * @param {any} [options.legendModel=null] - Legend model (for sizing)
+ * @param {number} [options.legendFontSizePx=12] - Legend font size (px, for sizing)
  * @returns {LayoutDimensions}
  */
 export function computeExpandedDimensions({
@@ -111,10 +168,13 @@ export function computeExpandedDimensions({
   hasTitle = false,
   includeAxes = true,
   includeLegend = true,
-  legendPosition = 'right'
+  legendPosition = 'right',
+  legendModel = null,
+  legendFontSizePx = 12
 }) {
   const plotWidth = Math.max(1, Math.round(desiredPlotWidth));
   const plotHeight = Math.max(1, Math.round(desiredPlotHeight));
+  const legendFontPx = Math.max(6, Math.round(Number(legendFontSizePx) || 12));
 
   // Axis space allocation
   const axisLeft = includeAxes ? AXIS_LEFT_SPACE : NO_AXIS_PADDING;
@@ -123,8 +183,12 @@ export function computeExpandedDimensions({
   const axisBottom = includeAxes ? AXIS_BOTTOM_SPACE : NO_AXIS_PADDING;
 
   // Legend space allocation (added OUTSIDE the plot, not subtracted from it)
-  const legendWidth = includeLegend && legendPosition === 'right' ? LEGEND_WIDTH_RIGHT : 0;
-  const legendHeight = includeLegend && legendPosition === 'bottom' ? LEGEND_HEIGHT_BOTTOM : 0;
+  const legendWidth = includeLegend && legendPosition === 'right'
+    ? estimateLegendWidthRight({ model: legendModel, fontSizePx: legendFontPx, plotHeight })
+    : 0;
+  const legendHeight = includeLegend && legendPosition === 'bottom'
+    ? estimateLegendHeightBottom({ model: legendModel, fontSizePx: legendFontPx, plotWidth })
+    : 0;
   const legendGapH = legendWidth > 0 ? LEGEND_GAP : 0;
   const legendGapV = legendHeight > 0 ? LEGEND_GAP : 0;
 
@@ -152,9 +216,6 @@ export function computeExpandedDimensions({
  * PLOT CONTENT size, not the total output size. The total output will be
  * LARGER to accommodate legend, axes, and title.
  *
- * For backwards compatibility, if you need the plot to fit WITHIN specified
- * total dimensions, use computeSingleViewLayoutConstrained instead.
- *
  * @param {object} options
  * @param {number} options.width              - Desired plot content width (px)
  * @param {number} options.height             - Desired plot content height (px)
@@ -162,6 +223,8 @@ export function computeExpandedDimensions({
  * @param {boolean} [options.includeAxes=true] - Whether to include axes
  * @param {boolean} [options.includeLegend=true] - Whether to include legend
  * @param {LegendPosition} [options.legendPosition='right'] - Legend position
+ * @param {any} [options.legendModel=null] - Legend model (for sizing)
+ * @param {number} [options.legendFontSizePx=12] - Legend font size (px, for sizing)
  * @returns {SingleViewLayout}
  */
 export function computeSingleViewLayout({
@@ -170,7 +233,9 @@ export function computeSingleViewLayout({
   title = '',
   includeAxes = true,
   includeLegend = true,
-  legendPosition = 'right'
+  legendPosition = 'right',
+  legendModel = null,
+  legendFontSizePx = 12
 }) {
   const hasTitle = Boolean(String(title || '').trim());
   const plotWidth = Math.max(1, Math.round(width));
@@ -183,7 +248,9 @@ export function computeSingleViewLayout({
     hasTitle,
     includeAxes,
     includeLegend,
-    legendPosition
+    legendPosition,
+    legendModel,
+    legendFontSizePx
   });
 
   // Axis margins
@@ -228,92 +295,6 @@ export function computeSingleViewLayout({
     outerPadding: OUTER_PADDING,
     totalWidth: dims.totalWidth,
     totalHeight: dims.totalHeight,
-    titleRect,
-    plotRect,
-    legendRect
-  };
-}
-
-/**
- * Compute layout with the plot constrained to fit WITHIN specified total dimensions.
- *
- * This is the legacy behavior where the plot area shrinks to accommodate
- * legend and other elements within the user-specified total dimensions.
- *
- * USE CASE: When you need exact output dimensions (e.g., for journal requirements)
- * and are willing to have a smaller plot area.
- *
- * @param {object} options
- * @param {number} options.totalWidth         - Total output width (px)
- * @param {number} options.totalHeight        - Total output height (px)
- * @param {string} [options.title='']         - Figure title
- * @param {boolean} [options.includeAxes=true] - Whether to include axes
- * @param {boolean} [options.includeLegend=true] - Whether to include legend
- * @param {LegendPosition} [options.legendPosition='right'] - Legend position
- * @returns {SingleViewLayout}
- */
-export function computeSingleViewLayoutConstrained({
-  totalWidth,
-  totalHeight,
-  title = '',
-  includeAxes = true,
-  includeLegend = true,
-  legendPosition = 'right'
-}) {
-  const outerPadding = OUTER_PADDING;
-  const hasTitle = Boolean(String(title || '').trim());
-  const titleHeight = hasTitle ? TITLE_HEIGHT : 0;
-
-  // Axis space
-  const axisLeft = includeAxes ? AXIS_LEFT_SPACE : NO_AXIS_PADDING;
-  const axisBottom = includeAxes ? AXIS_BOTTOM_SPACE : NO_AXIS_PADDING;
-  const axisTop = includeAxes ? AXIS_TOP_SPACE : NO_AXIS_PADDING;
-  const axisRight = includeAxes ? AXIS_RIGHT_SPACE : NO_AXIS_PADDING;
-
-  // Legend space (subtracts from content area)
-  const legendW = includeLegend && legendPosition === 'right' ? LEGEND_WIDTH_RIGHT : 0;
-  const legendH = includeLegend && legendPosition === 'bottom' ? LEGEND_HEIGHT_BOTTOM : 0;
-
-  const contentX = outerPadding;
-  const contentY = outerPadding + titleHeight;
-  const contentW = Math.max(1, totalWidth - outerPadding * 2);
-  const contentH = Math.max(1, totalHeight - outerPadding * 2 - titleHeight);
-
-  // Plot area (shrinks to fit within constraints)
-  const plotW = Math.max(1, contentW - axisLeft - axisRight - (legendW ? (LEGEND_GAP + legendW) : 0));
-  const plotH = Math.max(1, contentH - axisTop - axisBottom - (legendH ? (LEGEND_GAP + legendH) : 0));
-
-  const plotRect = {
-    x: contentX + axisLeft,
-    y: contentY + axisTop,
-    width: plotW,
-    height: plotH
-  };
-
-  const legendRect = includeLegend
-    ? (legendPosition === 'right'
-      ? {
-        x: plotRect.x + plotRect.width + LEGEND_GAP,
-        y: plotRect.y,
-        width: legendW,
-        height: plotRect.height
-      }
-      : {
-        x: plotRect.x,
-        y: plotRect.y + plotRect.height + LEGEND_GAP,
-        width: plotRect.width,
-        height: legendH
-      })
-    : null;
-
-  const titleRect = hasTitle
-    ? { x: outerPadding, y: outerPadding, width: contentW, height: titleHeight }
-    : null;
-
-  return {
-    outerPadding,
-    totalWidth,
-    totalHeight,
     titleRect,
     plotRect,
     legendRect

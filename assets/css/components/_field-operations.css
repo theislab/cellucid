@@ -14,7 +14,7 @@
 
 .field-selector-row {
   display: flex;
-  align-items: stretch;
+  align-items: center;
   gap: var(--space-1);
 }
 
@@ -26,9 +26,8 @@
 .field-actions {
   display: inline-flex;
   gap: var(--space-0-5);
-  align-items: stretch;
+  align-items: center;
   flex-shrink: 0;
-  margin-top: var(--space-0-5);
 }
 
 .field-action-btn {
@@ -38,45 +37,47 @@
   width: var(--space-4);
   height: var(--space-4);
   padding: 0;
-  border: var(--border-strong);
+  border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 18%, transparent);
   border-radius: 0;
-  background: var(--color-surface-secondary);
-  color: var(--color-text-primary);
-  box-shadow: var(--shadow-sm);
+  background: transparent;
+  color: var(--color-text-tertiary);
+  box-shadow: none;
   cursor: pointer;
-  transition: var(--transition-colors), transform var(--duration-fast) var(--easing-standard);
+  transition: var(--transition-colors);
 }
 
 .field-action-btn svg {
   pointer-events: none;
+  width: 12px;
+  height: 12px;
 }
 
 .field-action-btn:hover {
-  background-color: var(--color-border-light);
-  transform: translate(-1px, -1px);
-  box-shadow: var(--shadow-md);
+  background: var(--color-border-light);
+  color: var(--color-text-primary);
 }
 
 .field-action-btn:active {
-  transform: translate(0, 0);
-  box-shadow: var(--shadow-xs);
-  background-color: var(--color-border-default);
+  background: var(--color-border-default);
 }
 
 .field-action-btn:disabled {
   opacity: var(--opacity-50);
   cursor: not-allowed;
-  background-color: var(--color-surface-tertiary);
-  box-shadow: none;
-  transform: none;
+}
+
+.field-action-btn:focus-visible {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 1px;
 }
 
 .field-action-btn.field-delete-btn {
-  color: var(--color-danger);
+  color: var(--color-text-tertiary);
 }
 
 .field-action-btn.field-delete-btn:hover {
-  background: var(--color-danger-soft);
+  background: var(--color-border-light);
+  color: var(--color-danger);
 }
 
 /* ------------------------------------------------------------------------
@@ -116,7 +117,7 @@
    --------------------------------------------------------------------- */
 
 .deleted-fields-section {
-  margin-top: var(--space-2);
+  margin-top: var(--space-1);
   padding: 0;
   border: none;
   background: transparent;
@@ -124,46 +125,44 @@
 }
 
 .deleted-fields-wrapper {
-  margin-top: var(--space-2);
+  margin-top: var(--space-1);
 }
 
 .deleted-fields-hint {
-  margin: 0 0 var(--space-1-5);
-  font-size: var(--text-xs);
-  color: var(--color-text-secondary);
-  opacity: var(--opacity-85);
+  margin: 0 0 var(--space-0-5);
+  font-size: var(--text-2xs);
+  color: var(--color-text-tertiary);
 }
 
 .deleted-fields-list {
   display: flex;
   flex-direction: column;
-  gap: var(--space-0-5);
+  gap: 0;
 }
 
 .deleted-fields-group-title {
-  margin-top: var(--space-1);
-  font-size: var(--text-xs);
+  margin-top: var(--space-0-5);
+  font-size: var(--text-2xs);
   color: var(--color-text-tertiary);
   text-transform: uppercase;
   letter-spacing: 0.02em;
+}
+
+.deleted-fields-group-title:first-child {
+  margin-top: 0;
 }
 
 .deleted-field-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: var(--space-2);
-  padding: var(--space-px) 0;
-  border-bottom: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 8%, transparent);
-}
-
-.deleted-field-row:last-child {
-  border-bottom: none;
+  gap: var(--space-1);
+  padding: var(--space-0-5) 0;
 }
 
 .deleted-field-name {
-  font-size: var(--text-sm);
-  color: var(--color-text-primary);
+  font-size: var(--text-xs);
+  color: var(--color-text-secondary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -178,58 +177,39 @@
   flex-shrink: 0;
 }
 
-.deleted-field-restore-btn {
-  font-family: var(--font-display);
-  font-size: var(--text-2xs);
-  text-transform: uppercase;
-  letter-spacing: var(--tracking-wider);
-  border-radius: var(--radius-full);
-  padding: var(--space-px) var(--space-1);
-  border: var(--border-strong);
-  background: var(--color-surface-elevated);
-  color: var(--color-text-primary);
-  cursor: pointer;
-  box-shadow: var(--shadow-xs);
-  transition: var(--transition-colors), transform var(--duration-fast) var(--easing-standard);
-  flex-shrink: 0;
-}
-
-.deleted-field-restore-btn:hover {
-  background-color: var(--color-border-light);
-  transform: translate(-1px, -1px);
-  box-shadow: var(--shadow-sm);
-}
-
-.deleted-field-restore-btn:active {
-  transform: translate(0, 0);
-  box-shadow: var(--shadow-xs);
-}
-
+.deleted-field-restore-btn,
 .deleted-field-confirm-btn {
   font-family: var(--font-display);
   font-size: var(--text-2xs);
   text-transform: uppercase;
-  letter-spacing: var(--tracking-wider);
-  border-radius: var(--radius-full);
-  padding: var(--space-px) var(--space-1);
-  border: var(--border-strong);
-  background: var(--color-danger-soft);
-  color: var(--color-danger);
+  letter-spacing: 0.02em;
+  padding: var(--space-0-5) var(--space-1);
+  border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 18%, transparent);
+  border-radius: 0;
+  background: transparent;
+  color: var(--color-text-tertiary);
   cursor: pointer;
-  box-shadow: var(--shadow-xs);
-  transition: var(--transition-colors), transform var(--duration-fast) var(--easing-standard);
+  box-shadow: none;
+  transition: var(--transition-colors);
   flex-shrink: 0;
 }
 
+.deleted-field-restore-btn:hover {
+  background: var(--color-border-light);
+  color: var(--color-text-primary);
+}
+
+.deleted-field-restore-btn:active {
+  background: var(--color-border-default);
+}
+
 .deleted-field-confirm-btn:hover {
-  background: color-mix(in srgb, var(--color-danger-soft) 80%, var(--color-border-light));
-  transform: translate(-1px, -1px);
-  box-shadow: var(--shadow-sm);
+  background: var(--color-border-light);
+  color: var(--color-danger);
 }
 
 .deleted-field-confirm-btn:active {
-  transform: translate(0, 0);
-  box-shadow: var(--shadow-xs);
+  background: var(--color-border-default);
 }
 
 /* ------------------------------------------------------------------------

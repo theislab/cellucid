@@ -17,12 +17,6 @@
 export {
   // Constants
   NONE_VALUE,
-  // Formatting
-  formatCount,
-  formatNumber,
-  formatPValue,
-  getSignificanceMarker,
-  getSignificanceClass,
   // Page utilities
   getCellCountForPage,
   // Element factories
@@ -50,6 +44,14 @@ export {
   debounce,
   throttle
 } from '../shared/dom-utils.js';
+
+export {
+  formatNumber,
+  formatCount,
+  formatPValue,
+  getSignificanceMarker,
+  getSignificanceClass
+} from '../shared/formatting.js';
 
 // =============================================================================
 // COMPONENTS (from components/ directory)
@@ -173,7 +175,7 @@ export {
 // =============================================================================
 
 // Default export for convenient destructuring
-import domUtils from '../shared/dom-utils.js';
+import * as domUtils from '../shared/dom-utils.js';
 import componentsModule from './components/index.js';
 
 export default {

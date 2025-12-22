@@ -37,8 +37,6 @@ import { isFiniteNumber } from '../shared/number-utils.js';
 // Helper Functions
 // ============================================================================
 
-// Alias for backward compatibility with internal code
-const rankData = computeRanks;
 
 /**
  * Get significance stars from p-value
@@ -260,7 +258,7 @@ export function mannWhitneyU(group1, group2) {
     ...group2.map(v => ({ v, group: 2 }))
   ];
   const values = combined.map(x => x.v);
-  const ranks = rankData(values);
+  const ranks = computeRanks(values);
 
   // Calculate rank sum for each group
   let R1 = 0, R2 = 0;
@@ -460,7 +458,7 @@ export function kruskalWallis(groups) {
 
   const N = combined.length;
   const values = combined.map(x => x.v);
-  const ranks = rankData(values);
+  const ranks = computeRanks(values);
 
   // Calculate rank sums for each group
   const rankSums = new Array(validGroups.length).fill(0);

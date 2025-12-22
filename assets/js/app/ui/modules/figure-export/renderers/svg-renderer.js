@@ -55,26 +55,16 @@ import { computeSingleViewLayout, computeGridDims } from '../utils/layout.js';
 import { renderSvgAxes } from '../components/axes-builder.js';
 import { renderSvgLegend } from '../components/legend-builder.js';
 import { renderSvgOrientationIndicator } from '../components/orientation-indicator.js';
+import { renderSvgCentroidOverlay } from '../components/centroid-overlay.js';
 import { computeVisibleRealBounds } from '../utils/coordinate-mapper.js';
+import { cropRect01ToPx, normalizeCropRect01 } from '../utils/crop.js';
 import { reducePointsByDensity } from '../utils/density-reducer.js';
 import { blobToDataUrl } from '../utils/export-helpers.js';
 import { hashStringToSeed } from '../utils/hash.js';
 import { rasterizePointsWebgl } from '../utils/webgl-point-rasterizer.js';
+import { getEffectivePointDiameterPx, getLodVisibilityMask } from '../utils/point-size.js';
 import { clamp, parseNumberOr } from '../../../../utils/number-utils.js';
-
-/**
- * Get point radius from render state for WYSIWYG export.
- * The viewer's pointSize is a diameter; we return radius (diameter / 2).
- * @param {object|null} renderState
- * @returns {number} radius in logical pixels
- */
-function getPointRadiusFromRenderState(renderState) {
-  const pointSize = renderState?.pointSize;
-  if (typeof pointSize === 'number' && Number.isFinite(pointSize) && pointSize > 0) {
-    return pointSize / 2; // Convert diameter to radius
-  }
-  return 2.5; // Fallback: 5px diameter → 2.5px radius
-}
+import { computeLetterboxedRect } from '../utils/letterbox.js';
 
 function buildSvgMetadata(meta) {
   const dataset = meta?.datasetName || meta?.datasetId || '';
@@ -112,6 +102,7 @@ async function rasterizePointsToDataUrl({
   positions,
   colors,
   transparency,
+  visibilityMask = null,
   renderState,
   plotRect,
   radiusPx,
@@ -120,7 +111,11 @@ async function rasterizePointsToDataUrl({
   emphasizeSelection = false,
   selectionMutedOpacity = 0.15,
   sortByDepth = false,
-  maxSortedPoints = 200000
+  maxSortedPoints = 200000,
+  crop = null,
+  overlayPositions = null,
+  overlayColors = null,
+  overlayPointDiameterViewportPx = null
 }) {
   // Early validation - cannot rasterize without basic data
   if (!positions || !colors || !renderState?.mvpMatrix) {
@@ -135,27 +130,70 @@ async function rasterizePointsToDataUrl({
   const rasterScale = 2;
   const pxW = Math.max(1, Math.round(plotRect.width * rasterScale));
   const pxH = Math.max(1, Math.round(plotRect.height * rasterScale));
+  const crop01 = normalizeCropRect01(crop);
+
+  const srcViewportW = Math.max(1, Math.round(renderState?.viewportWidth || 1));
+  const srcViewportH = Math.max(1, Math.round(renderState?.viewportHeight || 1));
+  const viewportScale = computeLetterboxedRect({ srcWidth: srcViewportW, srcHeight: srcViewportH, dstWidth: pxW, dstHeight: pxH }).scale;
+  const pointDiameterViewportPx = Math.max(1, Number(radiusPx || 1.5) * 2);
 
   const webglCanvas = rasterizePointsWebgl({
     positions,
     colors,
     transparency,
+    visibilityMask,
     renderState,
     outputWidthPx: pxW,
     outputHeightPx: pxH,
-    pointSizePx: Math.max(1, Number(radiusPx || 1.5) * 2 * rasterScale),
+    pointSizePx: Math.max(1, pointDiameterViewportPx * viewportScale),
+    overlayPoints: (overlayPositions && overlayColors && Number.isFinite(overlayPointDiameterViewportPx))
+      ? {
+        positions: overlayPositions,
+        colors: overlayColors,
+        pointSizePx: Math.max(1, Number(overlayPointDiameterViewportPx) * viewportScale)
+      }
+      : null,
     highlightArray,
     emphasizeSelection,
     selectionMutedOpacity
   });
 
   if (webglCanvas) {
-    // WebGL rasterizer succeeded - 3D shading preserved
-    console.debug('[FigureExport] SVG hybrid: WebGL rasterization succeeded (3D shading preserved)');
-    const blob = typeof webglCanvas.convertToBlob === 'function'
-      ? await webglCanvas.convertToBlob({ type: 'image/png' })
+    if (!crop01) {
+      const blob = typeof webglCanvas.convertToBlob === 'function'
+        ? await webglCanvas.convertToBlob({ type: 'image/png' })
+        : await new Promise((resolve, reject) => {
+          /** @type {HTMLCanvasElement} */ (webglCanvas).toBlob(
+            (b) => (b ? resolve(b) : reject(new Error('PNG encode failed'))),
+            'image/png'
+          );
+        });
+      return blobToDataUrl(blob);
+    }
+
+    /** @type {OffscreenCanvas|HTMLCanvasElement} */
+    const out = typeof OffscreenCanvas !== 'undefined'
+      ? new OffscreenCanvas(pxW, pxH)
+      : (() => {
+        const c = document.createElement('canvas');
+        c.width = pxW;
+        c.height = pxH;
+        return c;
+      })();
+    const outCtx = /** @type {CanvasRenderingContext2D|null} */ (out.getContext('2d', { alpha: true }));
+    if (!outCtx) return null;
+
+    const vp = computeLetterboxedRect({ srcWidth: srcViewportW, srcHeight: srcViewportH, dstWidth: pxW, dstHeight: pxH });
+    const sx = vp.x + crop01.x * vp.width;
+    const sy = vp.y + crop01.y * vp.height;
+    const sw = crop01.width * vp.width;
+    const sh = crop01.height * vp.height;
+    outCtx.drawImage(webglCanvas, sx, sy, sw, sh, 0, 0, pxW, pxH);
+
+    const blob = typeof out.convertToBlob === 'function'
+      ? await out.convertToBlob({ type: 'image/png' })
       : await new Promise((resolve, reject) => {
-        /** @type {HTMLCanvasElement} */ (webglCanvas).toBlob(
+        /** @type {HTMLCanvasElement} */ (out).toBlob(
           (b) => (b ? resolve(b) : reject(new Error('PNG encode failed'))),
           'image/png'
         );
@@ -165,7 +203,7 @@ async function rasterizePointsToDataUrl({
 
   // WebGL rasterizer returned null - fall back to Canvas2D flat circles
   // This happens when viewMatrix/projectionMatrix/modelMatrix are missing
-  console.debug('[FigureExport] SVG hybrid: using Canvas2D fallback (flat circles, not 3D spheres)');
+  // (Canvas2D fallback produces flat circles instead of 3D spheres.)
 
   /** @type {OffscreenCanvas|HTMLCanvasElement} */
   const canvas = typeof OffscreenCanvas !== 'undefined'
@@ -188,14 +226,20 @@ async function rasterizePointsToDataUrl({
   const mutedAlpha = clamp(parseNumberOr(selectionMutedOpacity, 0.15), 0, 1);
 
   const localPlot = { x: 0, y: 0, width: plotRect.width, height: plotRect.height };
+  const cropPx = cropRect01ToPx(crop01, srcViewportW, srcViewportH);
+  const cropW = cropPx ? cropPx.width : srcViewportW;
+  const cropH = cropPx ? cropPx.height : srcViewportH;
+  const radiusPlot = (Number(radiusPx || 1.5)) * computeLetterboxedRect({ srcWidth: cropW, srcHeight: cropH, dstWidth: plotRect.width, dstHeight: plotRect.height }).scale;
 
   forEachProjectedPoint({
     positions,
     colors,
     transparency,
+    visibilityMask,
     renderState,
     plotRect: localPlot,
-    radiusPx,
+    radiusPx: radiusPlot,
+    crop,
     sortByDepth,
     maxSortedPoints,
     onPoint: (x, y, r, g, b, a, radius, index) => {
@@ -266,10 +310,16 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
   const strategy = opts.strategy || 'full-vector';
   const showOrientation = opts.showOrientation !== false;
   const depthSort3d = opts.depthSort3d !== false;
+  const crop = opts.crop || null;
 
   const fontFamily = String(opts.fontFamily || 'Arial, Helvetica, sans-serif');
-  const fontSize = Math.max(6, Math.round(opts.fontSizePx || 12));
-  // Point size comes from the viewer's render state (WYSIWYG) - see getPointRadiusFromRenderState
+  const baseFontSize = Math.max(6, Math.round(parseNumberOr(opts.fontSizePx, 12)));
+  const legendFontSize = Math.max(6, Math.round(parseNumberOr(opts.legendFontSizePx, baseFontSize)));
+  const tickFontSize = Math.max(6, Math.round(parseNumberOr(opts.tickFontSizePx, baseFontSize)));
+  const axisLabelFontSize = Math.max(6, Math.round(parseNumberOr(opts.axisLabelFontSizePx, baseFontSize)));
+  const titleFontSize = Math.max(10, Math.round(parseNumberOr(opts.titleFontSizePx, Math.max(14, baseFontSize * 1.25))));
+  const centroidLabelFontSize = Math.max(6, Math.round(parseNumberOr(opts.centroidLabelFontSizePx, baseFontSize)));
+  // Point size comes from the interactive viewer (WYSIWYG).
   const selectionMutedOpacity = clamp(parseNumberOr(opts.selectionMutedOpacity, 0.15), 0, 1);
   const totalHighlighted = typeof state?.getTotalHighlightedCellCount === 'function'
     ? state.getTotalHighlightedCellCount()
@@ -286,32 +336,49 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
     : '#ffffff';
 
   const singleView = views.length === 1;
+  const singleViewId = singleView ? String(views[0]?.id || 'live') : null;
+
+  const singleLegendField = singleView && includeLegend && typeof state.getFieldForView === 'function'
+    ? state.getFieldForView(singleViewId)
+    : (singleView && includeLegend && typeof state.getActiveField === 'function' ? state.getActiveField() : null);
+  const singleLegendModel = singleView && singleLegendField && typeof state.getLegendModel === 'function'
+    ? state.getLegendModel(singleLegendField)
+    : null;
 
   // For single view, compute layout first to get the expanded total dimensions
   let svgWidth, svgHeight;
+  /** @type {ReturnType<typeof computeSingleViewLayout> | null} */
+  let singleLayout = null;
+  let singleAxesEligible = false;
+  let singleDim = 3;
+  let singleNavMode = 'orbit';
+  let singleCameraState = null;
 
   if (singleView) {
     const view = views[0];
-    const viewId = String(view?.id || 'live');
-    const cameraState = view?.cameraState || viewer?.getViewCameraState?.(viewId) || viewer?.getCameraState?.() || null;
-    const navMode = cameraState?.navigationMode || 'orbit';
-    const dim = typeof state?.getViewDimensionLevel === 'function'
-      ? state.getViewDimensionLevel(viewId)
+    singleCameraState = view?.cameraState || viewer?.getViewCameraState?.(singleViewId) || viewer?.getCameraState?.() || null;
+    singleNavMode = singleCameraState?.navigationMode || 'orbit';
+    singleDim = typeof state?.getViewDimensionLevel === 'function'
+      ? state.getViewDimensionLevel(singleViewId)
       : (state?.getDimensionLevel?.() ?? 3);
-    const axesEligible = includeAxes && dim <= 2 && navMode === 'planar';
+    // Allow axes when the camera is locked to a 2D planar navigation mode, even if the
+    // underlying embedding is stored as 3D (e.g., z=0 but rendered with 3D shading).
+    singleAxesEligible = includeAxes && (singleDim <= 2 || singleNavMode === 'planar');
 
-    const layout = computeSingleViewLayout({
+    singleLayout = computeSingleViewLayout({
       width: desiredPlotWidth,
       height: desiredPlotHeight,
       title,
-      includeAxes: axesEligible,
+      includeAxes: singleAxesEligible,
       includeLegend,
-      legendPosition
+      legendPosition,
+      legendModel: singleLegendModel,
+      legendFontSizePx: legendFontSize
     });
 
     // Use expanded dimensions for SVG
-    svgWidth = layout.totalWidth;
-    svgHeight = layout.totalHeight;
+    svgWidth = singleLayout.totalWidth;
+    svgHeight = singleLayout.totalHeight;
   } else {
     // For multi-view, use the original dimensions (grid layout handles internally)
     svgWidth = desiredPlotWidth;
@@ -320,7 +387,7 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
 
   const parts = [];
   parts.push(
-    `<svg xmlns="http://www.w3.org/2000/svg" width="${svgWidth}" height="${svgHeight}" viewBox="0 0 ${svgWidth} ${svgHeight}">`
+    `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="${svgWidth}" height="${svgHeight}" viewBox="0 0 ${svgWidth} ${svgHeight}">`
   );
   parts.push(buildSvgMetadata(meta));
 
@@ -330,41 +397,38 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
 
   if (singleView) {
     const view = views[0];
-    const viewId = String(view?.id || 'live');
+    const viewId = singleViewId || String(view?.id || 'live');
     const data = view?.data || {};
     const positions = data.positions || null;
     const colors = data.colors || null;
     const transparency = data.transparency || null;
 
-    const renderState = view?.renderState || (
-      typeof viewer.getViewRenderState === 'function'
-        ? viewer.getViewRenderState(viewId)
-        : (typeof viewer.getRenderState === 'function' ? viewer.getRenderState() : null)
-    );
+    const renderState = view?.renderState || null;
+    if (!renderState?.mvpMatrix) throw new Error('Figure export renderState missing for SVG render');
 
-    const dim = typeof state.getViewDimensionLevel === 'function'
-      ? state.getViewDimensionLevel(viewId)
-      : (state.getDimensionLevel?.() ?? 3);
-    const cameraState = view?.cameraState || viewer.getViewCameraState?.(viewId) || viewer.getCameraState?.() || null;
-    const navMode = cameraState?.navigationMode || 'orbit';
-    const axesEligible = includeAxes && dim <= 2 && navMode === 'planar';
+    const dim = singleDim;
+    const cameraState = singleCameraState || view?.cameraState || null;
+    const navMode = singleNavMode;
+    const axesEligible = singleAxesEligible;
     const shouldDepthSort = depthSort3d && dim > 2 && navMode !== 'planar';
 
-    // WYSIWYG: Get point size from viewer's render state
-    const pointRadiusPx = getPointRadiusFromRenderState(renderState);
+    const visibilityMask = getLodVisibilityMask({ viewer, viewId, dimensionLevel: dim });
+    const pointDiameterViewportPx = getEffectivePointDiameterPx({ viewer, renderState, viewId, dimensionLevel: dim });
+    const pointRadiusViewportPx = pointDiameterViewportPx / 2;
 
-    // Compute layout with desired plot dimensions (returns expanded total dimensions)
-    const layout = computeSingleViewLayout({
+    const layout = singleLayout || computeSingleViewLayout({
       width: desiredPlotWidth,
       height: desiredPlotHeight,
       title,
       includeAxes: axesEligible,
       includeLegend,
-      legendPosition
+      legendPosition,
+      legendModel: singleLegendModel,
+      legendFontSizePx: legendFontSize
     });
 
     if (title) {
-      const titleSize = Math.max(14, Math.round(fontSize * 1.25));
+      const titleSize = Math.max(14, titleFontSize);
       parts.push(
         `<text x="${layout.titleRect?.x ?? layout.outerPadding}" y="${(layout.titleRect?.y ?? layout.outerPadding) + titleSize}" font-family="${escapeHtml(fontFamily)}" font-size="${titleSize}" fill="#111">${escapeHtml(title)}</text>`
       );
@@ -376,16 +440,12 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
 
     // Legend (may contribute defs for gradients).
     if (includeLegend && layout.legendRect) {
-      const field = typeof state.getFieldForView === 'function'
-        ? state.getFieldForView(viewId)
-        : (typeof state.getActiveField === 'function' ? state.getActiveField() : null);
-      const model = field && typeof state.getLegendModel === 'function' ? state.getLegendModel(field) : null;
       const legend = renderSvgLegend({
         legendRect: layout.legendRect,
-        fieldKey: field?.key || null,
-        model,
+        fieldKey: singleLegendField?.key || null,
+        model: singleLegendModel,
         fontFamily,
-        fontSize,
+        fontSize: legendFontSize,
         idPrefix: `legend_${hashStringToSeed(meta?.datasetId || meta?.datasetName || 'cellucid')}`,
         backgroundFill: background === 'transparent' ? 'transparent' : backgroundColor
       });
@@ -403,30 +463,55 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
         viewMatrix: renderState.viewMatrix,
         cameraState,
         fontFamily,
-        fontSize: Math.max(10, Math.round(fontSize * 0.92))
+        fontSize: Math.max(10, Math.round(baseFontSize * 0.92))
       }));
     }
 
     if (emphasizeSelection && highlightCount > 0) {
       const label = `n = ${highlightCount.toLocaleString()} selected`;
       const boxPad = 6;
-      const boxH = Math.max(16, Math.round(fontSize * 1.35));
+      const boxH = Math.max(16, Math.round(baseFontSize * 1.35));
       const boxW = Math.min(
         Math.max(1, plotRect.width - 16),
-        Math.max(90, Math.round(label.length * (fontSize * 0.62) + boxPad * 2))
+        Math.max(90, Math.round(label.length * (baseFontSize * 0.62) + boxPad * 2))
       );
       const boxX = plotRect.x + 8;
       const boxY = plotRect.y + 8;
       parts.push(
-        `<g font-family="${escapeHtml(fontFamily)}" font-size="${fontSize}" fill="#111">` +
+        `<g font-family="${escapeHtml(fontFamily)}" font-size="${baseFontSize}" fill="#111">` +
         `<rect x="${boxX}" y="${boxY}" width="${boxW}" height="${boxH}" rx="4" fill="#ffffff" fill-opacity="0.85" stroke="#e5e7eb" stroke-width="1"/>` +
         `<text x="${boxX + boxPad}" y="${boxY + boxH - boxPad}" stroke="none">${escapeHtml(label)}</text>` +
         `</g>`
       );
     }
 
-    // Points.
+    // Points + centroid overlay (WYSIWYG).
     parts.push(`<g clip-path="url(#${clipId})">`);
+
+    const centroidPositions = data?.centroidPositions || null;
+    const centroidColors = data?.centroidColors || null;
+    const centroidLabelTexts = Array.isArray(data?.centroidLabelTexts) ? data.centroidLabelTexts : null;
+    const centroidFlags = data?.centroidFlags || null;
+    const includeCentroidPoints = typeof opts.includeCentroidPoints === 'boolean'
+      ? opts.includeCentroidPoints
+      : Boolean(centroidFlags?.points);
+    const includeCentroidLabels = typeof opts.includeCentroidLabels === 'boolean'
+      ? opts.includeCentroidLabels
+      : Boolean(centroidFlags?.labels);
+
+    const crop01 = normalizeCropRect01(crop);
+    const srcViewportW = Math.max(1, renderState?.viewportWidth || 1);
+    const srcViewportH = Math.max(1, renderState?.viewportHeight || 1);
+    const cropPx = cropRect01ToPx(crop01, srcViewportW, srcViewportH);
+    const cropW = cropPx ? cropPx.width : srcViewportW;
+    const cropH = cropPx ? cropPx.height : srcViewportH;
+    const plotScale = computeLetterboxedRect({ srcWidth: cropW, srcHeight: cropH, dstWidth: plotRect.width, dstHeight: plotRect.height }).scale;
+
+    // Viewer draws centroids at ~4× base point size (without LOD multipliers).
+    const centroidDiameterViewportPx = Math.max(1, (Number(renderState?.pointSize || 5) * 4.0));
+    const centroidRadiusPlotPx = Math.max(0.5, (centroidDiameterViewportPx / 2) * plotScale);
+
+    let centroidPointsRasterized = false;
 
     if (strategy === 'hybrid') {
       const seed = hashStringToSeed(meta?.datasetId || meta?.datasetName || viewId);
@@ -434,17 +519,58 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
         positions,
         colors,
         transparency,
+        visibilityMask,
         renderState,
         plotRect,
-        radiusPx: pointRadiusPx,
+        radiusPx: pointRadiusViewportPx,
         seed,
         highlightArray,
         emphasizeSelection,
         selectionMutedOpacity,
-        sortByDepth: shouldDepthSort
+        sortByDepth: shouldDepthSort,
+        crop,
+        overlayPositions: includeCentroidPoints ? centroidPositions : null,
+        overlayColors: includeCentroidPoints ? centroidColors : null,
+        overlayPointDiameterViewportPx: includeCentroidPoints ? centroidDiameterViewportPx : null,
       });
       if (dataUrl) {
-        parts.push(`<image x="${plotRect.x}" y="${plotRect.y}" width="${plotRect.width}" height="${plotRect.height}" href="${dataUrl}" preserveAspectRatio="none"/>`);
+        centroidPointsRasterized = includeCentroidPoints && Boolean(centroidPositions) && Boolean(centroidColors);
+        // Add both href and xlink:href for better compatibility across SVG consumers.
+        parts.push(
+          `<image x="${plotRect.x}" y="${plotRect.y}" width="${plotRect.width}" height="${plotRect.height}" href="${dataUrl}" xlink:href="${dataUrl}" preserveAspectRatio="none"/>`
+        );
+      } else {
+        // Fallback: rasterization unavailable (e.g., WebGL2 blocked) -> draw vector circles.
+        const radiusPlot = pointRadiusViewportPx * plotScale;
+        forEachProjectedPoint({
+          positions,
+          colors,
+          transparency,
+          visibilityMask,
+          renderState,
+          plotRect,
+          radiusPx: radiusPlot,
+          crop,
+          sortByDepth: shouldDepthSort,
+          onPoint: (x, y, r, g, b, a, radius, index) => {
+            let rr = r;
+            let gg = g;
+            let bb = b;
+            let aa = a;
+            if (emphasizeSelection && highlightArray && (highlightArray[index] ?? 0) <= 0) {
+              rr = 160;
+              gg = 160;
+              bb = 160;
+              aa = aa * selectionMutedOpacity;
+            }
+            if (aa < 0.01) return;
+            if (aa >= 0.999) {
+              parts.push(`<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${radius.toFixed(2)}" fill="rgb(${rr},${gg},${bb})"/>`);
+            } else {
+              parts.push(`<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${radius.toFixed(2)}" fill="rgb(${rr},${gg},${bb})" fill-opacity="${aa.toFixed(3)}"/>`);
+            }
+          }
+        });
       }
     } else if (strategy === 'optimized-vector' && renderState) {
       const seed = hashStringToSeed(meta?.datasetId || meta?.datasetName || viewId);
@@ -452,9 +578,11 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
         positions,
         colors,
         transparency,
+        visibilityMask,
         renderState,
         targetCount: Math.max(1000, Math.floor(opts.optimizedTargetCount || 100000)),
-        seed
+        seed,
+        crop
       });
 
       const viewportW = reduced.viewportWidth;
@@ -462,6 +590,7 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
       const scale = Math.min(plotRect.width / viewportW, plotRect.height / viewportH);
       const offsetX = plotRect.x + (plotRect.width - viewportW * scale) / 2;
       const offsetY = plotRect.y + (plotRect.height - viewportH * scale) / 2;
+      const pointRadiusPx = pointRadiusViewportPx * scale;
 
       const outN = reduced.x.length;
       for (let i = 0; i < outN; i++) {
@@ -487,13 +616,16 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
         }
       }
     } else {
+      const radiusPlot = pointRadiusViewportPx * plotScale;
       forEachProjectedPoint({
         positions,
         colors,
         transparency,
+        visibilityMask,
         renderState,
         plotRect,
-        radiusPx: pointRadiusPx,
+        radiusPx: radiusPlot,
+        crop,
         sortByDepth: shouldDepthSort,
         onPoint: (x, y, r, g, b, a, radius, index) => {
           let rr = r;
@@ -516,15 +648,38 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
       });
     }
 
+    const centroidSvg = renderSvgCentroidOverlay({
+      positions: centroidPositions,
+      colors: centroidColors,
+      labelTexts: centroidLabelTexts,
+      flags: {
+        points: includeCentroidPoints && !centroidPointsRasterized,
+        labels: includeCentroidLabels,
+      },
+      renderState,
+      plotRect,
+      pointRadiusPx: centroidRadiusPlotPx,
+      crop,
+      fontFamily,
+      labelFontSizePx: centroidLabelFontSize,
+      labelColor: '#111',
+      haloColor: background === 'transparent' ? '#ffffff' : backgroundColor,
+    });
+    if (centroidSvg) parts.push(centroidSvg);
+
     parts.push(`</g>`);
 
-    // Axes (2D planar exports only, to avoid misleading axes in 3D projections).
+    // Axes (2D exports only; avoid misleading axes in 3D projections).
     if (axesEligible && renderState && state?.dimensionManager?.getNormTransform) {
         const norm = state.dimensionManager.getNormTransform(dim);
         const bounds = computeVisibleRealBounds({
           positions,
           transparency,
+          visibilityMask,
           mvpMatrix: renderState.mvpMatrix,
+          viewportWidth: renderState.viewportWidth,
+          viewportHeight: renderState.viewportHeight,
+          crop,
           normTransform: norm
         });
         if (bounds) {
@@ -534,7 +689,8 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
             xLabel: String(opts.xLabel || 'X'),
             yLabel: String(opts.yLabel || 'Y'),
             fontFamily,
-            fontSize,
+            tickFontSize,
+            labelFontSize: axisLabelFontSize,
             color: '#111'
           }));
         }
@@ -551,7 +707,7 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
     const cellPadding = 10;
 
     if (title) {
-      const titleSize = Math.max(14, Math.round(fontSize * 1.25));
+      const titleSize = Math.max(14, titleFontSize);
       parts.push(
         `<text x="${outerPadding}" y="${outerPadding + titleSize}" font-family="${escapeHtml(fontFamily)}" font-size="${titleSize}" fill="#111">${escapeHtml(title)}</text>`
       );
@@ -622,12 +778,23 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
       parts.push(`<rect x="${plotRect.x}" y="${plotRect.y}" width="${plotRect.width}" height="${plotRect.height}" fill="${cellFill}" stroke="#e5e7eb" stroke-width="1"/>`);
       parts.push(`<g clip-path="url(#${clipId})">`);
 
-      const renderState = typeof viewer.getViewRenderState === 'function'
-        ? (view?.renderState || viewer.getViewRenderState(viewId))
-        : (typeof viewer.getRenderState === 'function' ? viewer.getRenderState() : null);
+      const renderState = view?.renderState || null;
+      if (!renderState?.mvpMatrix) throw new Error('Figure export renderState missing for SVG multiview render');
 
-      // WYSIWYG: Get point size from viewer's render state
-      const pointRadiusPx = getPointRadiusFromRenderState(renderState);
+      const dim = typeof state.getViewDimensionLevel === 'function'
+        ? state.getViewDimensionLevel(viewId)
+        : (state.getDimensionLevel?.() ?? 3);
+      const navMode = view?.cameraState?.navigationMode || 'orbit';
+      const visibilityMask = getLodVisibilityMask({ viewer, viewId, dimensionLevel: dim });
+      const pointRadiusViewportPx = getEffectivePointDiameterPx({ viewer, renderState, viewId, dimensionLevel: dim }) / 2;
+
+      const crop01 = normalizeCropRect01(crop);
+      const srcViewportW = Math.max(1, renderState?.viewportWidth || 1);
+      const srcViewportH = Math.max(1, renderState?.viewportHeight || 1);
+      const cropPx = cropRect01ToPx(crop01, srcViewportW, srcViewportH);
+      const cropW = cropPx ? cropPx.width : srcViewportW;
+      const cropH = cropPx ? cropPx.height : srcViewportH;
+      const radiusPlot = pointRadiusViewportPx * computeLetterboxedRect({ srcWidth: cropW, srcHeight: cropH, dstWidth: plotRect.width, dstHeight: plotRect.height }).scale;
 
       forEachProjectedPoint({
         positions,
@@ -635,11 +802,10 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
         transparency,
         renderState,
         plotRect,
-        radiusPx: pointRadiusPx,
-        sortByDepth: depthSort3d && (typeof state.getViewDimensionLevel === 'function'
-          ? state.getViewDimensionLevel(viewId)
-          : (state.getDimensionLevel?.() ?? 3)) > 2 &&
-          ((view?.cameraState || viewer.getViewCameraState?.(viewId) || viewer.getCameraState?.())?.navigationMode || 'orbit') !== 'planar',
+        radiusPx: radiusPlot,
+        visibilityMask,
+        crop,
+        sortByDepth: depthSort3d && dim > 2 && navMode !== 'planar',
         onPoint: (x, y, r, g, b, a, radius, index) => {
           let rr = r;
           let gg = g;
@@ -660,10 +826,39 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
         }
       });
 
+      const centroidPositions = data?.centroidPositions || null;
+      const centroidColors = data?.centroidColors || null;
+      const centroidLabelTexts = Array.isArray(data?.centroidLabelTexts) ? data.centroidLabelTexts : null;
+      const centroidFlags = data?.centroidFlags || null;
+      const includeCentroidPoints = typeof opts.includeCentroidPoints === 'boolean'
+        ? opts.includeCentroidPoints
+        : Boolean(centroidFlags?.points);
+      const includeCentroidLabels = typeof opts.includeCentroidLabels === 'boolean'
+        ? opts.includeCentroidLabels
+        : Boolean(centroidFlags?.labels);
+      const centroidDiameterViewportPx = Math.max(1, (Number(renderState?.pointSize || 5) * 4.0));
+      const centroidRadiusPlotPx = Math.max(0.5, (centroidDiameterViewportPx / 2) * computeLetterboxedRect({ srcWidth: cropW, srcHeight: cropH, dstWidth: plotRect.width, dstHeight: plotRect.height }).scale);
+
+      const centroidSvg = renderSvgCentroidOverlay({
+        positions: centroidPositions,
+        colors: centroidColors,
+        labelTexts: centroidLabelTexts,
+        flags: { points: includeCentroidPoints, labels: includeCentroidLabels },
+        renderState,
+        plotRect,
+        pointRadiusPx: centroidRadiusPlotPx,
+        crop,
+        fontFamily,
+        labelFontSizePx: centroidLabelFontSize,
+        labelColor: '#111',
+        haloColor: background === 'transparent' ? '#ffffff' : backgroundColor,
+      });
+      if (centroidSvg) parts.push(centroidSvg);
+
       parts.push(`</g>`);
 
       parts.push(
-        `<text x="${plotRect.x}" y="${plotRect.y - 4}" font-family="${escapeHtml(fontFamily)}" font-size="12" fill="#111">${escapeHtml(String.fromCharCode(65 + idx))}. ${escapeHtml(viewLabel)}</text>`
+        `<text x="${plotRect.x}" y="${plotRect.y - 4}" font-family="${escapeHtml(fontFamily)}" font-size="${baseFontSize}" fill="#111">${escapeHtml(String.fromCharCode(65 + idx))}. ${escapeHtml(viewLabel)}</text>`
       );
     }
 
@@ -674,7 +869,7 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
         fieldKey: sharedFieldKey,
         model,
         fontFamily,
-        fontSize,
+        fontSize: legendFontSize,
         idPrefix: `legend_${hashStringToSeed(meta?.datasetId || meta?.datasetName || 'cellucid')}`,
         backgroundFill: background === 'transparent' ? 'transparent' : backgroundColor
       });

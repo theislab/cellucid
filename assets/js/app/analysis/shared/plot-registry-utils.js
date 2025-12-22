@@ -42,8 +42,7 @@ export const PlotRegistry = {
   get: (id) => {
     const plugin = getPlotRegistry().get(id);
     if (!plugin) return null;
-    // Add supportedDataTypes alias for backwards compatibility
-    return { ...plugin, supportedDataTypes: plugin.supportedTypes };
+    return plugin;
   },
 
   /**
@@ -51,10 +50,7 @@ export const PlotRegistry = {
    * @returns {Object[]} Array of all plot type definitions
    */
   getAll: () => {
-    return getPlotRegistry().getAll().map(p => ({
-      ...p,
-      supportedDataTypes: p.supportedTypes
-    }));
+    return getPlotRegistry().getAll();
   },
 
   /**
@@ -72,7 +68,7 @@ export const PlotRegistry = {
         pt.supportedTypes?.includes(dataType) ||
         pt.supportedTypes?.includes('any')
       )
-      .map(p => ({ ...p, supportedDataTypes: p.supportedTypes }));
+      ;
   },
 
   /**
@@ -145,11 +141,16 @@ export const PlotRegistry = {
       ? { legendPosition: LEGEND_POSITION_SCHEMA, ...(plotType.optionSchema || {}) }
       : (plotType.optionSchema || {});
 
+    if (!Array.isArray(plotType.supportedTypes) || plotType.supportedTypes.length === 0) {
+      console.error(`[PlotRegistry] Plot type '${plotType.id}' must declare supportedTypes`);
+      return false;
+    }
+
     const plugin = {
       id: plotType.id,
       name: plotType.name || plotType.id,
       description: plotType.description || '',
-      supportedTypes: plotType.supportedDataTypes || plotType.supportedTypes || ['categorical', 'continuous'],
+      supportedTypes: plotType.supportedTypes,
       supportedLayouts: plotType.supportedLayouts || ['side-by-side', 'grouped'],
       defaultOptions,
       optionSchema,

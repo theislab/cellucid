@@ -46,7 +46,7 @@ import {
   pageDataToCSV,
   downloadCSV
 } from '../shared/analysis-utils.js';
-import { formatCount } from '../shared/dom-utils.js';
+import { formatCount } from '../shared/formatting.js';
 import { createAnalysisModal, openModal, closeModal } from './components/modal.js';
 import { loadPlotly, purgePlot, downloadImage } from '../plots/plotly-loader.js';
 import { PlotRegistry } from '../shared/plot-registry-utils.js';

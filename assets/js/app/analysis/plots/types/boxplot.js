@@ -11,7 +11,7 @@ const boxplotDefinition = {
   id: 'boxplot',
   name: 'Box Plot',
   description: 'Compare continuous value distributions across pages',
-  supportedDataTypes: ['continuous'],
+  supportedTypes: ['continuous'],
   supportedLayouts: ['side-by-side', 'grouped', 'overlay'],
 
   defaultOptions: {

@@ -28,12 +28,11 @@ export const OperationCategory = {
 };
 
 // ============================================================================
-// Operation Type Enum (Backward Compatible)
+// Operation Type Enum
 // ============================================================================
 
 /**
  * Supported operation types - use these constants instead of strings.
- * Exported for backward compatibility with existing code.
  */
 export const OperationType = {
   // Transforms (GPU-accelerated)

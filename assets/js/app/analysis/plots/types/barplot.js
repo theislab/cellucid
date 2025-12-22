@@ -11,7 +11,7 @@ const barplotDefinition = {
   id: 'barplot',
   name: 'Bar Plot',
   description: 'Compare categorical distributions across pages',
-  supportedDataTypes: ['categorical'],
+  supportedTypes: ['categorical'],
   supportedLayouts: ['side-by-side', 'grouped', 'stacked', 'overlay'],
 
   defaultOptions: {

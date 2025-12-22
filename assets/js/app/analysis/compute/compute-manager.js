@@ -20,9 +20,6 @@ import { OperationType, GPU_CAPABLE_OPERATIONS } from './operations.js';
 import { getMemoryMonitor } from '../shared/memory-monitor.js';
 import { debug, debugWarn } from '../shared/debug-utils.js';
 
-// Re-export OperationType for backward compatibility
-export { OperationType };
-
 // Lazy imports to avoid circular dependencies
 let gpuComputeModule = null;
 let workerPoolModule = null;
@@ -40,9 +37,6 @@ export const BackendStatus = {
   UNAVAILABLE: 'unavailable',
   FAILED: 'failed'
 };
-
-// Use GPU_CAPABLE_OPERATIONS from operations.js (aliased for backward compat)
-const GPU_OPERATIONS = GPU_CAPABLE_OPERATIONS;
 
 /**
  * ComputeManager class
@@ -269,7 +263,7 @@ export class ComputeManager {
     }
 
     // Check if operation can use GPU
-    const gpuCapable = GPU_OPERATIONS.has(operation);
+    const gpuCapable = GPU_CAPABLE_OPERATIONS.has(operation);
 
     // GPU first if available and operation supports it
     if (gpuCapable && this._gpuStatus === BackendStatus.AVAILABLE) {
@@ -474,9 +468,8 @@ export class ComputeManager {
       case OperationType.COMPUTE_HISTOGRAM: {
         const stats = gpu.computeStatistics(inputArray);
 
-        // Prefer canonical payload field `range`, but support legacy `min`/`max`.
-        let min = Array.isArray(payload.range) && payload.range.length === 2 ? payload.range[0] : payload.min;
-        let max = Array.isArray(payload.range) && payload.range.length === 2 ? payload.range[1] : payload.max;
+        let min = Array.isArray(payload.range) && payload.range.length === 2 ? payload.range[0] : undefined;
+        let max = Array.isArray(payload.range) && payload.range.length === 2 ? payload.range[1] : undefined;
 
         if (!Number.isFinite(min)) min = stats.min;
         if (!Number.isFinite(max)) max = stats.max;

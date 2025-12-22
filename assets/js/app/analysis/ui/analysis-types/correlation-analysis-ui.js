@@ -14,10 +14,12 @@ import { PlotRegistry } from '../../shared/plot-registry-utils.js';
 import {
   createFormRow,
   createFormSelect,
-  createResultHeader
+  createResultHeader,
+  NONE_VALUE
 } from '../../shared/dom-utils.js';
 import { correlationResultsToCSV, downloadCSV } from '../../shared/analysis-utils.js';
 import { createVariableSelectorComponent } from '../shared/variable-selector.js';
+import { PageSelectorComponent } from '../shared/page-selector.js';
 import { purgePlot } from '../../plots/plotly-loader.js';
 import { isFiniteNumber } from '../../shared/number-utils.js';
 
@@ -68,6 +70,44 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     this._xIdPrefix = this._instanceId ? `${this._instanceId}-correlation-x` : 'correlation-x';
     this._yIdPrefix = this._instanceId ? `${this._instanceId}-correlation-y` : 'correlation-y';
     this._plotContainerIdBase = this._instanceId ? `${this._instanceId}-correlation-analysis-plot` : 'correlation-analysis-plot';
+
+    // Page selector component
+    this._pageSelector = null;
+    this._pageSelectContainer = null;
+
+    // Color by categorical variable
+    this._colorByVariable = null;
+
+  }
+
+  // ===========================================================================
+  // Page Selection Handlers
+  // ===========================================================================
+
+  _handlePageChange = (pageIds) => {
+    this._selectedPages = pageIds || [];
+    this._currentConfig.pages = this._selectedPages;
+    this._hideStaleResult();
+  };
+
+  _handlePageColorChange = (pageId, color) => {
+    this.dataLayer?.setPageColor?.(pageId, color);
+    // Re-render if we have results
+    if (this._lastResult) {
+      this._hideStaleResult();
+    }
+  };
+
+  // ===========================================================================
+  // Page Change Notification Overrides
+  // ===========================================================================
+
+  /**
+   * Override to use PageSelectorComponent's updateCounts method
+   * @override
+   */
+  _updatePageSelectorCounts() {
+    this._pageSelector?.updateCounts();
   }
 
   /**
@@ -105,12 +145,94 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
       onVariableChange: () => this._hideStaleResult()
     });
 
+    // Page selector (matching DetailedAnalysisUI)
+    this._renderPageSelector(wrapper);
+
+    // Color by categorical variable selector
+    this._renderColorBySelector(wrapper);
+
     // Correlation method selector
     const methodSelect = createFormSelect('method', [
       { value: 'pearson', label: 'Pearson (linear)', selected: true },
       { value: 'spearman', label: 'Spearman (rank)' }
     ]);
     wrapper.appendChild(createFormRow('Correlation method:', methodSelect));
+  }
+
+  /**
+   * Render page selector using shared PageSelectorComponent
+   * @param {HTMLElement} wrapper
+   */
+  _renderPageSelector(wrapper) {
+    let pages;
+    try {
+      pages = this.dataLayer.getPages();
+    } catch (err) {
+      console.error('[CorrelationAnalysisUI] Failed to get pages:', err);
+      return;
+    }
+
+    if (pages.length === 0) return;
+
+    // Auto-select all pages by default if none selected
+    if (this._selectedPages.length === 0 && pages.length > 0) {
+      this._selectedPages = pages.map(p => p.id);
+      this._currentConfig.pages = this._selectedPages;
+    }
+
+    // Create container for the component
+    this._pageSelectContainer = document.createElement('div');
+    wrapper.appendChild(this._pageSelectContainer);
+
+    // Destroy previous instance if exists
+    this._pageSelector?.destroy();
+
+    // Create PageSelectorComponent
+    this._pageSelector = new PageSelectorComponent({
+      dataLayer: this.dataLayer,
+      container: this._pageSelectContainer,
+      onSelectionChange: this._handlePageChange,
+      onColorChange: this._handlePageColorChange,
+      showColorPicker: true,
+      showCellCounts: true,
+      showSelectAll: true,
+      initialSelection: this._selectedPages,
+      includeDerivedPages: true,
+      getCellCountForPageId: (pageId) => this.dataLayer.getCellCountForPageId(pageId),
+      label: 'Compare pages:'
+    });
+  }
+
+  /**
+   * Render color by categorical variable selector
+   * @param {HTMLElement} wrapper
+   */
+  _renderColorBySelector(wrapper) {
+    let categoricalVars = [];
+    try {
+      categoricalVars = this.dataLayer.getAvailableVariables('categorical_obs') || [];
+    } catch (err) {
+      console.error('[CorrelationAnalysisUI] Failed to get categorical variables:', err);
+    }
+
+    if (categoricalVars.length === 0) return;
+
+    const colorBySelect = createFormSelect('colorBy', [
+      { value: NONE_VALUE, label: 'None (color by page)', selected: !this._colorByVariable },
+      ...categoricalVars.map(v => ({
+        value: v.key,
+        label: v.key,
+        selected: this._colorByVariable === v.key
+      }))
+    ]);
+
+    colorBySelect.addEventListener('change', () => {
+      const value = colorBySelect.value;
+      this._colorByVariable = (value && value !== NONE_VALUE) ? value : null;
+      this._hideStaleResult();
+    });
+
+    wrapper.appendChild(createFormRow('Color by:', colorBySelect));
   }
 
   /**
@@ -144,7 +266,8 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     return {
       variableX,
       variableY,
-      method
+      method,
+      colorBy: this._colorByVariable
     };
   }
 
@@ -175,8 +298,19 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
       varX: formValues.variableX,
       varY: formValues.variableY,
       pageIds: this._selectedPages,
-      method: formValues.method || 'pearson'
+      method: formValues.method || 'pearson',
+      colorBy: formValues.colorBy ? { type: 'categorical_obs', key: formValues.colorBy } : null
     });
+
+    // Pass custom page colors to results for proper coloring
+    const customColors = this._pageSelector?.getCustomColors() || new Map();
+    if (customColors.size > 0) {
+      for (const result of correlationResults) {
+        if (result.pageId && customColors.has(result.pageId)) {
+          result.pageColor = customColors.get(result.pageId);
+        }
+      }
+    }
 
     return {
       type: 'correlation',
@@ -185,14 +319,16 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
       options: {
         showTrendline: true,
         showR2: true,
-        showConfidenceInterval: true
+        showConfidenceInterval: true,
+        colorBy: formValues.colorBy ? { type: 'categorical_obs', key: formValues.colorBy } : null
       },
       title: 'Correlation',
       subtitle: `${formValues.variableX.key} vs ${formValues.variableY.key}`,
       metadata: {
         method: formValues.method || 'pearson',
         variableX: formValues.variableX,
-        variableY: formValues.variableY
+        variableY: formValues.variableY,
+        colorBy: formValues.colorBy
       }
     };
   }
@@ -386,17 +522,24 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     this._isDestroyed = true;
     this._xSelector?.destroy?.();
     this._ySelector?.destroy?.();
+    this._pageSelector?.destroy();
     this._xSelector = null;
     this._ySelector = null;
+    this._pageSelector = null;
+    this._pageSelectContainer = null;
+    this._colorByVariable = null;
     super.destroy();
   }
 
   exportSettings() {
     const base = super.exportSettings();
+    const customColors = this._pageSelector?.getCustomColors() || new Map();
     return {
       ...base,
       variableX: this._xSelector?.getSelectedVariable?.() || null,
-      variableY: this._ySelector?.getSelectedVariable?.() || null
+      variableY: this._ySelector?.getSelectedVariable?.() || null,
+      colorBy: this._colorByVariable,
+      customPageColors: Array.from(customColors.entries())
     };
   }
 
@@ -412,6 +555,19 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     }
     if (variableY?.type && variableY?.variable && this._ySelector?.setSelectedVariable) {
       this._ySelector.setSelectedVariable(variableY.type, variableY.variable);
+    }
+
+    // Restore colorBy
+    if (settings.colorBy) {
+      this._colorByVariable = settings.colorBy;
+    }
+
+    // Restore custom page colors to component
+    if (Array.isArray(settings.customPageColors) && this._pageSelector) {
+      settings.customPageColors.forEach(([pageId, color]) => {
+        this._pageSelector.customColors.set(pageId, color);
+      });
+      this._pageSelector.render();
     }
   }
 }

@@ -22,6 +22,7 @@ import { getMemoryMonitor } from './shared/memory-monitor.js';
 import { clearActiveSourceCaches } from './shared/resource-cleanup.js';
 // Import PlotRegistry from centralized location
 import { PlotRegistry } from './shared/plot-registry-utils.js';
+import { getTransformRegistry } from './core/plugin-contract.js';
 import { debugError } from './shared/debug-utils.js';
 import { closeModal } from './ui/components/modal.js';
 
@@ -32,6 +33,7 @@ import { createDetailedAnalysisUI } from './ui/analysis-types/detailed-analysis-
 import { createCorrelationAnalysisUI } from './ui/analysis-types/correlation-analysis-ui.js';
 import { createDEAnalysisUI } from './ui/analysis-types/de-analysis-ui.js';
 import { createGeneSignatureUI } from './ui/analysis-types/gene-signature-ui.js';
+import { createGenesPanelUI } from './ui/analysis-types/genes-panel-ui.js';
 import { createAnalysisWindowManager } from './ui/analysis-window-manager.js';
 
 // Import plot types to register them
@@ -44,6 +46,7 @@ import './plots/types/densityplot.js';
 import './plots/types/heatmap.js';
 import './plots/types/volcanoplot.js';
 import './plots/types/scatterplot.js';
+import './plots/types/gene-heatmap.js';
 
 /**
  * Comparison Module class
@@ -209,6 +212,15 @@ export class ComparisonModule {
           <span class="analysis-accordion-chevron" aria-hidden="true"></span>
         </div>
         <div class="analysis-accordion-content" id="analysis-panel-signature" data-mode="signature" role="region" aria-labelledby="analysis-header-signature"></div>
+      </div>
+      <div class="analysis-accordion-item" data-mode="genesPanel">
+        <div id="analysis-header-genesPanel" class="analysis-accordion-header" role="button" tabindex="0" aria-expanded="false" aria-controls="analysis-panel-genesPanel">
+          <span class="analysis-accordion-title">Marker Genes</span>
+          <span class="analysis-accordion-desc">Discover markers across groups</span>
+          <button type="button" class="analysis-accordion-copy-btn accordion-copy-btn" aria-label="Copy analysis window" title="Copy"></button>
+          <span class="analysis-accordion-chevron" aria-hidden="true"></span>
+        </div>
+        <div class="analysis-accordion-content" id="analysis-panel-genesPanel" data-mode="genesPanel" role="region" aria-labelledby="analysis-header-genesPanel"></div>
       </div>
     `;
     accordionContent.appendChild(this._modeToggleContainer);
@@ -384,6 +396,17 @@ export class ComparisonModule {
       icon: 'list',
       tooltip: 'Compute gene signature scores'
     });
+
+    // Marker Genes Panel
+    this._uiManager.register({
+      id: 'genesPanel',
+      name: 'Marker Genes',
+      factory: createGenesPanelUI,
+      minPages: 1,
+      maxPages: null,
+      icon: 'grid',
+      tooltip: 'Discover and visualize marker genes across cell groups'
+    });
   }
 
   /**
@@ -396,7 +419,7 @@ export class ComparisonModule {
    *
    * ARIA: Updates aria-expanded attributes for screen reader accessibility
    *
-   * @param {'simple'|'detailed'|'correlation'|'differential'|'signature'} mode
+   * @param {'simple'|'detailed'|'correlation'|'differential'|'signature'|'genesPanel'} mode
    */
   _setAnalysisMode(mode) {
     const allItems = this._modeToggleContainer.querySelectorAll('.analysis-accordion-item');
@@ -777,13 +800,14 @@ export class ComparisonModule {
       detailed: this._uiManager?.getUI('detailed'),
       correlation: this._uiManager?.getUI('correlation'),
       de: this._uiManager?.getUI('differential'),
-      signature: this._uiManager?.getUI('signature')
+      signature: this._uiManager?.getUI('signature'),
+      genesPanel: this._uiManager?.getUI('genesPanel')
     };
   }
 
   /**
    * Get a specific analysis UI by mode ID
-   * @param {string} modeId - Mode ID (simple, detailed, correlation, differential, signature)
+   * @param {string} modeId - Mode ID (simple, detailed, correlation, differential, signature, genesPanel)
    * @returns {Object|null} UI instance or null
    */
   getUI(modeId) {
@@ -807,7 +831,19 @@ export class ComparisonModule {
   }
 
   static registerTransform(id, transform) {
-    TransformPipeline.registerTransform(id, transform);
+    const registry = getTransformRegistry();
+    registry.register({
+      id,
+      name: transform.name || id,
+      description: transform.description || '',
+      supportedTypes: transform.supportedTypes || transform.applicableTo || ['any'],
+      defaultOptions: transform.defaultOptions || {},
+      optionSchema: transform.optionSchema || {},
+      execute: transform.execute || (async (data, opts, ctx) => {
+        if (typeof transform.apply === 'function') return transform.apply(data, opts, ctx);
+        throw new Error(`Transform '${id}' must provide an execute() or apply() function`);
+      })
+    });
   }
 
   static getPlotType(id) {
@@ -819,7 +855,7 @@ export class ComparisonModule {
   }
 
   static getTransforms() {
-    return TransformPipeline.getAllTransforms();
+    return getTransformRegistry().getAll();
   }
 }
 
@@ -857,6 +893,7 @@ export { DetailedAnalysisUI, createDetailedAnalysisUI } from './ui/analysis-type
 export { CorrelationAnalysisUI, createCorrelationAnalysisUI } from './ui/analysis-types/correlation-analysis-ui.js';
 export { DEAnalysisUI, createDEAnalysisUI } from './ui/analysis-types/de-analysis-ui.js';
 export { GeneSignatureUI, createGeneSignatureUI } from './ui/analysis-types/gene-signature-ui.js';
+export { GenesPanelUI, createGenesPanelUI } from './ui/analysis-types/genes-panel-ui.js';
 
 // Re-export query builder
 export { QueryBuilder, createQueryBuilder, OPERATORS } from './data/query-builder.js';

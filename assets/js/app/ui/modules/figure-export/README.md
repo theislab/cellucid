@@ -13,6 +13,8 @@ This folder implements **publication-grade SVG/PNG export** for Cellucid without
 - `index.js`: module entry point (wires UI + engine).
 - `figure-export-ui.js`: sidebar panel (collects user inputs + triggers export/preview).
 - `figure-export-engine.js`: snapshots current view buffers + orchestrates rendering/download/notifications.
+  - Includes optional **framing crop** (photography-style overlay) so users can export a chosen sub-region of the current view without changing the camera.
+  - Framing is locked to the selected plot size aspect; resizing the frame changes the exported region (zoom) without changing the camera.
 
 ### Renderers
 
@@ -25,9 +27,10 @@ This folder implements **publication-grade SVG/PNG export** for Cellucid without
 
 ### Components (shared building blocks)
 
-- `components/axes-builder.js`: nice ticks + axis labels (only for 2D planar views).
+- `components/axes-builder.js`: nice ticks + axis labels (for 1D/2D, and for planar camera mode).
 - `components/legend-builder.js`: categorical + continuous legends (sourced from `DataState.getLegendModel()` for color consistency).
 - `components/orientation-indicator.js`: 3D orientation widget (axis triad + angles).
+- `components/centroid-overlay.js`: centroid points + centroid text overlay (WYSIWYG with viewer state).
 - `components/large-dataset-dialog.js`: forces explicit user choice for large SVG exports.
 - `components/citation-modal.js`: post-export citation helper.
 

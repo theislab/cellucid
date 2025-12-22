@@ -90,6 +90,15 @@ export {
 } from './gene-signature-ui.js';
 
 // =============================================================================
+// MARKER GENES PANEL
+// =============================================================================
+
+export {
+  GenesPanelUI,
+  createGenesPanelUI
+} from './genes-panel-ui.js';
+
+// =============================================================================
 // ANALYSIS TYPE REGISTRY
 // =============================================================================
 
@@ -141,6 +150,15 @@ export const ANALYSIS_TYPES = {
     minPages: 1,
     maxPages: null,
     component: 'GeneSignatureUI'
+  },
+  genesPanel: {
+    id: 'genesPanel',
+    name: 'Marker Genes',
+    description: 'Discover and visualize marker genes across cell groups',
+    icon: 'grid',
+    minPages: 1,
+    maxPages: null,
+    component: 'GenesPanelUI'
   }
 };
 
@@ -184,6 +202,7 @@ export default {
   CorrelationAnalysisUI: () => import('./correlation-analysis-ui.js'),
   DEAnalysisUI: () => import('./de-analysis-ui.js'),
   GeneSignatureUI: () => import('./gene-signature-ui.js'),
+  GenesPanelUI: () => import('./genes-panel-ui.js'),
   // Registry
   ANALYSIS_TYPES
 };

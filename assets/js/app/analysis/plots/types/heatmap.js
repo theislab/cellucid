@@ -14,7 +14,7 @@ const heatmapDefinition = {
   id: 'heatmap',
   name: 'Heatmap',
   description: 'Matrix view of category distributions',
-  supportedDataTypes: ['categorical'],
+  supportedTypes: ['categorical'],
   supportedLayouts: ['single'],
   supportsLegend: false,
 
@@ -84,9 +84,12 @@ const heatmapDefinition = {
       textMatrix.push(textRow);
     }
 
-    // GPU-accelerated heatmap
+    // Prefer WebGL for large matrices, but use standard heatmap when value
+    // annotations are enabled (heatmapgl does not reliably support them).
+    const traceType = showValues ? 'heatmap' : getHeatmapTraceType();
+
     return [{
-      type: getHeatmapTraceType(),
+      type: traceType,
       z: matrix, x: pageNames, y: categories, text: textMatrix,
       texttemplate: showValues ? '%{text}' : '',
       textfont: { family: theme.fontFamily, size: 10 },

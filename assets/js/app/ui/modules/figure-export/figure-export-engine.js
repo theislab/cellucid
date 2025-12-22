@@ -47,11 +47,18 @@ const LIVE_VIEW_ID = 'live';
  * @property {string} [backgroundColor]
  * @property {string} [fontFamily]
  * @property {number} [fontSizePx]
- * @property {number} [pointRadiusPx] - DEPRECATED: Export now uses viewer's point size (WYSIWYG)
+ * @property {number} [legendFontSizePx]
+ * @property {number} [tickFontSizePx]
+ * @property {number} [axisLabelFontSizePx]
+ * @property {number} [titleFontSizePx]
+ * @property {number} [centroidLabelFontSizePx]
  * @property {boolean} [showOrientation]
  * @property {boolean} [depthSort3d]
+ * @property {boolean} [includeCentroidPoints]
+ * @property {boolean} [includeCentroidLabels]
  * @property {boolean} [emphasizeSelection]
  * @property {number} [selectionMutedOpacity]
+ * @property {{ enabled?: boolean; x?: number; y?: number; width?: number; height?: number } | null} [crop]
  * @property {'ask'|'full-vector'|'optimized-vector'|'hybrid'|'raster'} [strategy]
  * @property {number} [optimizedTargetCount]
  * @property {FigureExportJob[]} [jobs]
@@ -78,13 +85,9 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
     const viewerCount = typeof viewer.getPointCount === 'function' ? viewer.getPointCount() : null;
     const stateCount = state?.pointCount ?? null;
     if (viewerCount != null && stateCount != null && viewerCount !== stateCount) {
-      const patternSelect = typeof document !== 'undefined'
-        ? /** @type {HTMLSelectElement|null} */ (document.getElementById('benchmark-pattern'))
-        : null;
-      const pattern = patternSelect?.value || null;
       return {
-        datasetName: pattern ? `Synthetic_${pattern}` : 'Synthetic',
-        datasetId: pattern ? `synthetic-${pattern}` : 'synthetic',
+        datasetName: 'Synthetic',
+        datasetId: 'synthetic',
         sourceType: 'benchmark'
       };
     }
@@ -95,43 +98,51 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
   /**
    * Snapshot view data needed for export.
    *
-   * Prefer viewer-owned arrays (positions/transparency) for accuracy across
-   * all dataset load paths; fall back to state arrays when needed.
-   *
    * @param {string} viewId
    */
   function getViewData(viewId) {
     const vid = String(viewId || LIVE_VIEW_ID);
-    const positions = typeof viewer.getViewPositions === 'function'
-      ? viewer.getViewPositions(vid)
-      : state.positionsArray;
+    const ctx = state?.viewContexts?.get?.(vid) || null;
 
-    const transparency = typeof viewer.getViewTransparency === 'function'
-      ? viewer.getViewTransparency(vid)
-      : state.categoryTransparency;
-
-    const colors = typeof viewer.getViewColors === 'function'
-      ? viewer.getViewColors(vid)
-      : (vid === LIVE_VIEW_ID ? state.colorsArray : (state.viewContexts?.get?.(vid)?.colorsArray || state.colorsArray));
-
-    const pointCount = typeof viewer.getPointCount === 'function'
-      ? viewer.getPointCount()
-      : (state.pointCount || (positions ? positions.length / 3 : 0));
-
-    // Debug logging for export data verification
-    if (typeof console !== 'undefined' && console.debug) {
-      console.debug('[FigureExport] getViewData:', {
-        viewId: vid,
-        hasPositions: !!positions,
-        positionsLength: positions?.length || 0,
-        hasColors: !!colors,
-        colorsLength: colors?.length || 0,
-        hasTransparency: !!transparency,
-        pointCount
-      });
+    if (
+      typeof viewer.getViewPositions !== 'function' ||
+      typeof viewer.getViewColors !== 'function' ||
+      typeof viewer.getViewTransparency !== 'function' ||
+      typeof viewer.getPointCount !== 'function'
+    ) {
+      throw new Error('Figure export requires viewer.getViewPositions/getViewColors/getViewTransparency/getPointCount');
     }
 
-    return { positions, colors, transparency, pointCount };
+    const positions = viewer.getViewPositions(vid);
+    const colors = viewer.getViewColors(vid);
+    const transparency = viewer.getViewTransparency(vid);
+    const pointCount = viewer.getPointCount();
+
+    const centroidPositions = ctx?.centroidPositions
+      || (vid === LIVE_VIEW_ID ? (state.centroidPositions || null) : null);
+    const centroidColors = ctx?.centroidColors
+      || (vid === LIVE_VIEW_ID ? (state.centroidColors || null) : null);
+    const centroidLabelTexts = Array.isArray(ctx?.centroidLabels)
+      ? ctx.centroidLabels.map((entry) => {
+        const elText = entry?.el?.textContent;
+        const rawText = entry?.text;
+        return String(elText ?? rawText ?? '');
+      })
+      : (Array.isArray(state?.centroidLabels) && vid === LIVE_VIEW_ID
+        ? state.centroidLabels.map((entry) => String(entry?.el?.textContent ?? entry?.text ?? ''))
+        : []);
+    const centroidFlags = viewer.getCentroidFlags?.(vid) || null;
+
+    return {
+      positions,
+      colors,
+      transparency,
+      pointCount,
+      centroidPositions,
+      centroidColors,
+      centroidLabelTexts,
+      centroidFlags,
+    };
   }
 
   /**
@@ -203,10 +214,13 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
 
     // Snapshot per-view render state so exports match the exact on-screen projection,
     // especially in split-view grid mode where each pane has its own viewport aspect.
-    const canGetViewRenderState = typeof viewer.getViewRenderState === 'function';
-    const baseRenderState = canGetViewRenderState
-      ? viewer.getViewRenderState(viewId)
-      : (typeof viewer.getRenderState === 'function' ? viewer.getRenderState() : null);
+    if (typeof viewer.getViewRenderState !== 'function') {
+      throw new Error('Figure export requires viewer.getViewRenderState');
+    }
+    if (typeof viewer.getViewCameraState !== 'function') {
+      throw new Error('Figure export requires viewer.getViewCameraState');
+    }
+    const baseRenderState = viewer.getViewRenderState(viewId);
 
     const gridViewport = wantsGrid && baseRenderState?.viewportWidth && baseRenderState?.viewportHeight
       ? (() => {
@@ -218,30 +232,12 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
       : null;
 
     function getViewRenderStateSnapshot(vid) {
-      if (!canGetViewRenderState) return baseRenderState;
-      const rs = gridViewport
-        ? viewer.getViewRenderState(String(vid || LIVE_VIEW_ID), gridViewport)
-        : viewer.getViewRenderState(String(vid || LIVE_VIEW_ID));
-
-      // Debug logging for render state verification
-      if (typeof console !== 'undefined' && console.debug) {
-        console.debug('[FigureExport] getViewRenderStateSnapshot:', {
-          viewId: vid,
-          hasMvpMatrix: !!rs?.mvpMatrix,
-          hasViewMatrix: !!rs?.viewMatrix,
-          hasModelMatrix: !!rs?.modelMatrix,
-          hasProjectionMatrix: !!rs?.projectionMatrix,
-          viewportWidth: rs?.viewportWidth,
-          viewportHeight: rs?.viewportHeight,
-          shaderQuality: rs?.shaderQuality
-        });
-      }
-
-      return rs;
+      const key = String(vid || LIVE_VIEW_ID);
+      return gridViewport ? viewer.getViewRenderState(key, gridViewport) : viewer.getViewRenderState(key);
     }
 
     function getViewCameraStateSnapshot(vid) {
-      return viewer.getViewCameraState?.(String(vid || LIVE_VIEW_ID)) || viewer.getCameraState?.() || null;
+      return viewer.getViewCameraState(String(vid || LIVE_VIEW_ID));
     }
 
     const payloadBase = {
@@ -258,7 +254,14 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
         backgroundColor: options?.backgroundColor || '#ffffff',
         fontFamily: options?.fontFamily || 'Arial, Helvetica, sans-serif',
         fontSizePx: Number.isFinite(options?.fontSizePx) ? options.fontSizePx : 12,
-        // pointRadiusPx is deprecated - renderers now use viewer's pointSize directly (WYSIWYG)
+        legendFontSizePx: Number.isFinite(options?.legendFontSizePx) ? options.legendFontSizePx : (Number.isFinite(options?.fontSizePx) ? options.fontSizePx : 12),
+        tickFontSizePx: Number.isFinite(options?.tickFontSizePx) ? options.tickFontSizePx : (Number.isFinite(options?.fontSizePx) ? options.fontSizePx : 12),
+        axisLabelFontSizePx: Number.isFinite(options?.axisLabelFontSizePx) ? options.axisLabelFontSizePx : null,
+        titleFontSizePx: Number.isFinite(options?.titleFontSizePx) ? options.titleFontSizePx : null,
+        centroidLabelFontSizePx: Number.isFinite(options?.centroidLabelFontSizePx) ? options.centroidLabelFontSizePx : null,
+        includeCentroidPoints: options?.includeCentroidPoints,
+        includeCentroidLabels: options?.includeCentroidLabels,
+        crop: options?.crop || null,
         showOrientation: options?.showOrientation !== false,
         depthSort3d: options?.depthSort3d !== false,
         emphasizeSelection: options?.emphasizeSelection === true,

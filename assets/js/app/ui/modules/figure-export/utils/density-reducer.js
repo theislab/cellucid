@@ -28,6 +28,7 @@
 
 import { clamp } from '../../../../utils/number-utils.js';
 import { createMulberry32 } from '../../../../utils/random-utils.js';
+import { cropRect01ToPx, normalizeCropRect01 } from './crop.js';
 
 /**
  * @typedef {object} ReducedViewportPoints
@@ -51,9 +52,12 @@ function clampInt(value, lo, hi) {
  * @param {Float32Array|null} options.positions - n*3
  * @param {Uint8Array|null} options.colors - n*4
  * @param {Float32Array|null} [options.transparency] - n (0..1)
+ * @param {Float32Array|null} [options.visibilityMask] - n (0..1), e.g. LOD visibility
  * @param {{ mvpMatrix: Float32Array; viewportWidth: number; viewportHeight: number }} options.renderState
  * @param {number} options.targetCount
+ * @param {{ enabled?: boolean; x?: number; y?: number; width?: number; height?: number } | null} [options.crop]
  * @param {number} [options.gridSize=160]
+ * @param {number|null} [options.maxScanPoints=null] - Optional cap for preview-mode sampling (skips points by stride)
  * @param {number} [options.seed=1337]
  * @returns {ReducedViewportPoints}
  */
@@ -61,9 +65,12 @@ export function reducePointsByDensity({
   positions,
   colors,
   transparency = null,
+  visibilityMask = null,
   renderState,
   targetCount,
+  crop = null,
   gridSize = 160,
+  maxScanPoints = null,
   seed = 1337
 }) {
   if (!positions || !colors || !renderState?.mvpMatrix) {
@@ -79,9 +86,21 @@ export function reducePointsByDensity({
   }
 
   const n = Math.min(Math.floor(positions.length / 3), Math.floor(colors.length / 4));
+  const stride = maxScanPoints && maxScanPoints > 0 && maxScanPoints < n
+    ? Math.max(1, Math.ceil(n / maxScanPoints))
+    : 1;
   const viewportW = Math.max(1, renderState.viewportWidth || 1);
   const viewportH = Math.max(1, renderState.viewportHeight || 1);
   const mvp = renderState.mvpMatrix;
+
+  const crop01 = normalizeCropRect01(crop);
+  const cropPx = cropRect01ToPx(crop01, viewportW, viewportH);
+  const hasCrop = Boolean(
+    cropPx &&
+    (cropPx.width < viewportW - 0.5 || cropPx.height < viewportH - 0.5 || cropPx.x > 0.5 || cropPx.y > 0.5)
+  );
+  const effW = hasCrop ? cropPx.width : viewportW;
+  const effH = hasCrop ? cropPx.height : viewportH;
 
   const cols = clampInt(gridSize, 32, 512);
   const rows = clampInt(gridSize, 32, 512);
@@ -91,8 +110,12 @@ export function reducePointsByDensity({
   let visibleTotal = 0;
 
   // Pass 1: count points per cell (only visible + within clip).
-  for (let i = 0; i < n; i++) {
-    const a = transparency ? (transparency[i] ?? 1.0) : (colors[i * 4 + 3] / 255);
+  for (let i = 0; i < n; i += stride) {
+    if (visibilityMask && (visibilityMask[i] ?? 0) <= 0) continue;
+    const rawAlpha = transparency ? (transparency[i] ?? 1.0) : (colors[i * 4 + 3] / 255);
+    let a = Number.isFinite(rawAlpha) ? rawAlpha : 1.0;
+    if (a < 0) a = 0;
+    else if (a > 1) a = 1;
     if (a < 0.01) continue;
 
     const ix = i * 3;
@@ -109,10 +132,16 @@ export function reducePointsByDensity({
     const ndcY = clipY / clipW;
     if (ndcX < -1 || ndcX > 1 || ndcY < -1 || ndcY > 1) continue;
 
-    const vx = (ndcX * 0.5 + 0.5) * viewportW;
-    const vy = (-ndcY * 0.5 + 0.5) * viewportH;
-    const cx = clampInt((vx / viewportW) * cols, 0, cols - 1);
-    const cy = clampInt((vy / viewportH) * rows, 0, rows - 1);
+    let vx = (ndcX * 0.5 + 0.5) * viewportW;
+    let vy = (-ndcY * 0.5 + 0.5) * viewportH;
+    if (hasCrop && cropPx) {
+      if (vx < cropPx.x || vx > cropPx.x + cropPx.width || vy < cropPx.y || vy > cropPx.y + cropPx.height) continue;
+      vx -= cropPx.x;
+      vy -= cropPx.y;
+    }
+
+    const cx = clampInt((vx / effW) * cols, 0, cols - 1);
+    const cy = clampInt((vy / effH) * rows, 0, rows - 1);
     counts[cy * cols + cx]++;
     visibleTotal++;
   }
@@ -174,8 +203,12 @@ export function reducePointsByDensity({
   const rnd = createMulberry32(seed);
 
   // Pass 2: per-cell reservoir sampling.
-  for (let i = 0; i < n; i++) {
-    const a = transparency ? (transparency[i] ?? 1.0) : (colors[i * 4 + 3] / 255);
+  for (let i = 0; i < n; i += stride) {
+    if (visibilityMask && (visibilityMask[i] ?? 0) <= 0) continue;
+    const rawAlpha = transparency ? (transparency[i] ?? 1.0) : (colors[i * 4 + 3] / 255);
+    let a = Number.isFinite(rawAlpha) ? rawAlpha : 1.0;
+    if (a < 0) a = 0;
+    else if (a > 1) a = 1;
     if (a < 0.01) continue;
 
     const ix = i * 3;
@@ -192,11 +225,16 @@ export function reducePointsByDensity({
     const ndcY = clipY / clipW;
     if (ndcX < -1 || ndcX > 1 || ndcY < -1 || ndcY > 1) continue;
 
-    const vx = (ndcX * 0.5 + 0.5) * viewportW;
-    const vy = (-ndcY * 0.5 + 0.5) * viewportH;
+    let vx = (ndcX * 0.5 + 0.5) * viewportW;
+    let vy = (-ndcY * 0.5 + 0.5) * viewportH;
+    if (hasCrop && cropPx) {
+      if (vx < cropPx.x || vx > cropPx.x + cropPx.width || vy < cropPx.y || vy > cropPx.y + cropPx.height) continue;
+      vx -= cropPx.x;
+      vy -= cropPx.y;
+    }
 
-    const cx = clampInt((vx / viewportW) * cols, 0, cols - 1);
-    const cy = clampInt((vy / viewportH) * rows, 0, rows - 1);
+    const cx = clampInt((vx / effW) * cols, 0, cols - 1);
+    const cy = clampInt((vy / effH) * rows, 0, rows - 1);
     const cell = cy * cols + cx;
     const want = desired[cell];
     if (!want) continue;
@@ -229,7 +267,7 @@ export function reducePointsByDensity({
     rgba: outRGBA,
     alpha: outA,
     index: outIndex,
-    viewportWidth: viewportW,
-    viewportHeight: viewportH
+    viewportWidth: effW,
+    viewportHeight: effH
   };
 }

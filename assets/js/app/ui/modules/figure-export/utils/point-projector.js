@@ -30,6 +30,8 @@
  * @module ui/modules/figure-export/utils/point-projector
  */
 
+import { cropRect01ToPx, normalizeCropRect01 } from './crop.js';
+
 /**
  * @typedef {object} RenderStateLike
  * @property {Float32Array} mvpMatrix
@@ -57,6 +59,7 @@
  * @param {PlotRect} options.plotRect
  * @param {number} [options.radiusPx]
  * @param {Float32Array|null} [options.visibilityMask] - optional per-point mask (0..1), e.g. LOD visibility
+ * @param {{ enabled?: boolean; x?: number; y?: number; width?: number; height?: number } | null} [options.crop] - optional framing crop in normalized viewport coords
  * @param {boolean} [options.sortByDepth] - if true, draw back-to-front using binned depth ordering
  * @param {number} [options.depthBins]
  * @param {number} [options.maxSortedPoints]
@@ -71,6 +74,7 @@ export function forEachProjectedPoint({
   plotRect,
   radiusPx = 1.5,
   visibilityMask = null,
+  crop = null,
   sortByDepth = false,
   depthBins = 256,
   maxSortedPoints = 200000,
@@ -85,10 +89,23 @@ export function forEachProjectedPoint({
   const viewportW = Math.max(1, renderState.viewportWidth || 1);
   const viewportH = Math.max(1, renderState.viewportHeight || 1);
 
-  // Fit current viewport into plotRect without distortion (letterbox/pillarbox).
-  const scale = Math.min(plotRect.width / viewportW, plotRect.height / viewportH);
-  const offsetX = plotRect.x + (plotRect.width - viewportW * scale) / 2;
-  const offsetY = plotRect.y + (plotRect.height - viewportH * scale) / 2;
+  const crop01 = normalizeCropRect01(crop);
+  const cropPx = cropRect01ToPx(crop01, viewportW, viewportH);
+  const hasCrop = Boolean(
+    cropPx &&
+    (cropPx.width < viewportW - 0.5 || cropPx.height < viewportH - 0.5 || cropPx.x > 0.5 || cropPx.y > 0.5)
+  );
+
+  // Fit the chosen source viewport (full viewport OR crop rect) into plotRect
+  // without distortion (letterbox/pillarbox).
+  const srcX0 = hasCrop && cropPx ? cropPx.x : 0;
+  const srcY0 = hasCrop && cropPx ? cropPx.y : 0;
+  const srcW = hasCrop && cropPx ? cropPx.width : viewportW;
+  const srcH = hasCrop && cropPx ? cropPx.height : viewportH;
+
+  const scale = Math.min(plotRect.width / srcW, plotRect.height / srcH);
+  const offsetX = plotRect.x + (plotRect.width - srcW * scale) / 2;
+  const offsetY = plotRect.y + (plotRect.height - srcH * scale) / 2;
 
   let drawn = 0;
   let skipped = 0;
@@ -104,7 +121,10 @@ export function forEachProjectedPoint({
 
     // Pass 1: count visible points per depth bin.
     for (let i = 0; i < n; i++) {
-      const alpha = transparency ? (transparency[i] ?? 1.0) : (colors[i * 4 + 3] / 255);
+      const rawAlpha = transparency ? (transparency[i] ?? 1.0) : (colors[i * 4 + 3] / 255);
+      let alpha = Number.isFinite(rawAlpha) ? rawAlpha : 1.0;
+      if (alpha < 0) alpha = 0;
+      else if (alpha > 1) alpha = 1;
       if (alpha < 0.01) continue;
       if (visibilityMask && (visibilityMask[i] ?? 0) <= 0) continue;
 
@@ -123,6 +143,12 @@ export function forEachProjectedPoint({
       const ndcY = clipY / clipW;
       const ndcZ = clipZ / clipW;
       if (ndcX < -1 || ndcX > 1 || ndcY < -1 || ndcY > 1 || ndcZ < -1 || ndcZ > 1) continue;
+
+      const viewportX = (ndcX * 0.5 + 0.5) * viewportW;
+      const viewportY = (-ndcY * 0.5 + 0.5) * viewportH;
+      if (hasCrop) {
+        if (viewportX < srcX0 || viewportX > srcX0 + srcW || viewportY < srcY0 || viewportY > srcY0 + srcH) continue;
+      }
       let bin = (((ndcZ + 1) * 0.5) * bins) | 0;
       if (bin < 0) bin = 0;
       else if (bin >= bins) bin = bins - 1;
@@ -149,7 +175,10 @@ export function forEachProjectedPoint({
 
     // Pass 2: fill packed arrays in bin order.
     for (let i = 0; i < n; i++) {
-      const alpha = transparency ? (transparency[i] ?? 1.0) : (colors[i * 4 + 3] / 255);
+      const rawAlpha = transparency ? (transparency[i] ?? 1.0) : (colors[i * 4 + 3] / 255);
+      let alpha = Number.isFinite(rawAlpha) ? rawAlpha : 1.0;
+      if (alpha < 0) alpha = 0;
+      else if (alpha > 1) alpha = 1;
       if (alpha < 0.01) continue;
       if (visibilityMask && (visibilityMask[i] ?? 0) <= 0) continue;
 
@@ -175,8 +204,16 @@ export function forEachProjectedPoint({
 
       const viewportX = (ndcX * 0.5 + 0.5) * viewportW;
       const viewportY = (-ndcY * 0.5 + 0.5) * viewportH;
-      outX[slot] = offsetX + viewportX * scale;
-      outY[slot] = offsetY + viewportY * scale;
+      if (hasCrop && (viewportX < srcX0 || viewportX > srcX0 + srcW || viewportY < srcY0 || viewportY > srcY0 + srcH)) {
+        // We counted without crop in bin offsets; keep the slot but mark alpha 0.
+        outA[slot] = 0;
+        continue;
+      }
+
+      const localX = viewportX - srcX0;
+      const localY = viewportY - srcY0;
+      outX[slot] = offsetX + localX * scale;
+      outY[slot] = offsetY + localY * scale;
 
       const cj = i * 4;
       const oj = slot * 4;
@@ -210,7 +247,10 @@ export function forEachProjectedPoint({
       skipped++;
       continue;
     }
-    const alpha = transparency ? (transparency[i] ?? 1.0) : (colors[i * 4 + 3] / 255);
+    const rawAlpha = transparency ? (transparency[i] ?? 1.0) : (colors[i * 4 + 3] / 255);
+    let alpha = Number.isFinite(rawAlpha) ? rawAlpha : 1.0;
+    if (alpha < 0) alpha = 0;
+    else if (alpha > 1) alpha = 1;
     if (alpha < 0.01) {
       skipped++;
       continue;
@@ -245,8 +285,13 @@ export function forEachProjectedPoint({
     const viewportX = (ndcX * 0.5 + 0.5) * viewportW;
     const viewportY = (-ndcY * 0.5 + 0.5) * viewportH;
 
-    const px = offsetX + viewportX * scale;
-    const py = offsetY + viewportY * scale;
+    if (hasCrop && (viewportX < srcX0 || viewportX > srcX0 + srcW || viewportY < srcY0 || viewportY > srcY0 + srcH)) {
+      skipped++;
+      continue;
+    }
+
+    const px = offsetX + (viewportX - srcX0) * scale;
+    const py = offsetY + (viewportY - srcY0) * scale;
 
     const j = i * 4;
     onPoint(px, py, colors[j], colors[j + 1], colors[j + 2], alpha, radiusPx, i);

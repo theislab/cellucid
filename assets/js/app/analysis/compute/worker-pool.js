@@ -209,6 +209,9 @@ export class WorkerPool {
 
     } catch (err) {
       debugError('WorkerPool', `Failed to restart worker ${index}:`, err);
+      // Avoid leaving the pool in a permanent "restarting" state.
+      this.workerStates[index] = 'idle';
+      this._workerBusySince[index] = null;
     }
   }
 
@@ -352,11 +355,15 @@ export class WorkerPool {
    * Dispatch task to a specific worker
    */
   _dispatchToWorker(workerIndex, task) {
-    const { type, payload, requestId, resolve, reject, timeout, signal, transfer } = task;
+    const { type, payload, requestId, resolve, reject, timeout, signal, transfer, restartWorkerOnAbort } = task;
 
     // Check if already aborted
     if (signal?.aborted) {
       reject(new DOMException('Request aborted', 'AbortError'));
+      // Important: tasks can become aborted while waiting in a queue. If we don't
+      // continue draining the queue, the first aborted task can permanently block
+      // later tasks for this worker.
+      Promise.resolve().then(() => this._processQueue(workerIndex));
       return;
     }
 
@@ -379,6 +386,18 @@ export class WorkerPool {
         if (this.pendingRequests.has(requestId)) {
           clearTimeout(timeoutId);
           this.pendingRequests.delete(requestId);
+
+          // Workers cannot be preempted; a long-running compute continues even if
+          // we reject the promise. For specific heavy tasks, callers can opt-in
+          // to restarting the worker on abort to keep the pool responsive.
+          if (restartWorkerOnAbort) {
+            this.workerStates[workerIndex] = 'restarting';
+            this._workerBusySince[workerIndex] = null;
+            reject(new DOMException('Request aborted', 'AbortError'));
+            void this._restartWorker(workerIndex);
+            return;
+          }
+
           this.workerStates[workerIndex] = 'idle';
           this._workerBusySince[workerIndex] = null;
           reject(new DOMException('Request aborted', 'AbortError'));
@@ -477,19 +496,16 @@ export class WorkerPool {
    * @param {number} [options.timeout] - Timeout in ms
    * @param {AbortSignal} [options.signal] - AbortSignal for cancellation
    * @param {boolean} [options.transfer=true] - Use transferables for ArrayBuffers
+   * @param {boolean} [options.restartWorkerOnAbort=false] - Restart worker on abort (for long-running tasks)
    * @returns {Promise<any>}
    */
   async execute(type, payload, options = {}) {
-    // Handle legacy signature: execute(type, payload, timeout)
-    const opts = typeof options === 'number'
-      ? { timeout: options }
-      : options;
-
     const {
       timeout = this.defaultTimeout,
       signal = null,
-      transfer = true
-    } = opts;
+      transfer = true,
+      restartWorkerOnAbort = false
+    } = options;
 
     // Initialize if needed
     if (!this.initialized) {
@@ -509,7 +525,7 @@ export class WorkerPool {
     const requestId = this._generateRequestId();
 
     return new Promise((resolve, reject) => {
-      const task = { type, payload, requestId, resolve, reject, timeout, signal, transfer };
+      const task = { type, payload, requestId, resolve, reject, timeout, signal, transfer, restartWorkerOnAbort };
 
       // Try to find an idle worker first
       const idleIndex = this._findIdleWorker();
@@ -523,6 +539,95 @@ export class WorkerPool {
         this.taskQueues[targetIndex].push(task);
       }
     });
+  }
+
+  /**
+   * Execute a task on a specific worker index.
+   * Useful for "broadcast" style initialization where each worker must receive
+   * a distinct transferable payload (e.g., per-worker ArrayBuffer copies).
+   *
+   * @param {number} workerIndex
+   * @param {string} type
+   * @param {Object} payload
+   * @param {Object|number} [options]
+   * @param {number} [options.timeout] - Timeout in ms
+   * @param {AbortSignal} [options.signal] - AbortSignal for cancellation
+   * @param {boolean} [options.transfer=true] - Use transferables for ArrayBuffers
+   * @param {boolean} [options.restartWorkerOnAbort=false] - Restart worker on abort (rare; usually false for init/broadcast)
+   * @returns {Promise<any>}
+   */
+  async executeOnWorker(workerIndex, type, payload, options = {}) {
+    const opts = typeof options === 'number'
+      ? { timeout: options }
+      : options;
+
+    const {
+      timeout = this.defaultTimeout,
+      signal = null,
+      transfer = true,
+      restartWorkerOnAbort = false
+    } = opts;
+
+    if (!this.initialized) {
+      await this.init();
+    }
+
+    if (!this.workersAvailable || this.workers.length === 0) {
+      return this._fallbackExecute(type, payload);
+    }
+
+    if (!Number.isFinite(workerIndex) || workerIndex < 0 || workerIndex >= this.workers.length) {
+      throw new Error(`Invalid workerIndex: ${workerIndex}`);
+    }
+
+    if (signal?.aborted) {
+      return Promise.reject(new DOMException('Request aborted', 'AbortError'));
+    }
+
+    const requestId = this._generateRequestId();
+
+    return new Promise((resolve, reject) => {
+      const task = { type, payload, requestId, resolve, reject, timeout, signal, transfer, restartWorkerOnAbort };
+      if (this.workerStates[workerIndex] === 'idle') {
+        this._dispatchToWorker(workerIndex, task);
+        return;
+      }
+      this.taskQueues[workerIndex].push(task);
+    });
+  }
+
+  /**
+   * Broadcast a task to all workers.
+   *
+   * NOTE: If `payloads` contains TypedArrays/ArrayBuffers, each entry should
+   * own its own backing buffer (since payload transfer detaches buffers).
+   *
+   * @param {string} type
+   * @param {Object[]|((workerIndex: number) => Object)} payloads
+   * @param {Object|number} [options]
+   * @returns {Promise<any[]>} Results ordered by worker index
+   */
+  async broadcast(type, payloads, options = {}) {
+    if (!this.initialized) {
+      await this.init();
+    }
+
+    const makePayload = typeof payloads === 'function'
+      ? payloads
+      : (i) => payloads?.[i];
+
+    const tasks = [];
+    for (let i = 0; i < this.workers.length; i++) {
+      const payload = makePayload(i);
+      if (!payload) continue;
+      tasks.push(
+        this.executeOnWorker(i, type, payload, options).then((result) => ({ i, result }))
+      );
+    }
+
+    const results = await Promise.all(tasks);
+    results.sort((a, b) => a.i - b.i);
+    return results.map(r => r.result);
   }
 
   /**
@@ -540,7 +645,7 @@ export class WorkerPool {
 
     // Execute all tasks in parallel
     const promises = tasks.map((task, index) =>
-      this.execute(task.type, task.payload, timeout)
+      this.execute(task.type, task.payload, { timeout })
         .then(result => ({ index, result, error: null }))
         .catch(error => ({ index, result: null, error }))
     );
@@ -845,7 +950,7 @@ export class WorkerPool {
    * Get pool statistics
    */
   getStats() {
-    const busy = this.workerStates.filter(s => s === 'busy').length;
+    const busy = this.workerStates.filter(s => s !== 'idle').length;
     const queuedTasks = this.taskQueues.reduce((sum, q) => sum + q.length, 0);
 
     return {

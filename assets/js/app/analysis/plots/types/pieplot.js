@@ -32,7 +32,7 @@ const pieplotDefinition = {
   id: 'pieplot',
   name: 'Pie / Donut',
   description: 'Proportions within pages',
-  supportedDataTypes: ['categorical'],
+  supportedTypes: ['categorical'],
   supportedLayouts: ['side-by-side', 'grid'],
 
   defaultOptions: { donut: true, showPercent: true, showLabels: true, maxCategories: 10, sortByValue: true },

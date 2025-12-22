@@ -6,23 +6,10 @@
  * DRY principles and consistent behavior.
  *
  * NOTE: Formatting functions (formatNumber, formatPValue, formatCount, etc.)
- * are centralized in shared/formatting.js. This file re-exports them
- * for backward compatibility.
+ * are centralized in shared/formatting.js.
  *
  * @module shared/dom-utils
  */
-
-// =============================================================================
-// FORMATTING - Re-exported from shared/formatting.js for backward compatibility
-// =============================================================================
-
-export {
-  formatNumber,
-  formatCount,
-  formatPValue,
-  getSignificanceMarker,
-  getSignificanceClass
-} from './formatting.js';
 
 // =============================================================================
 // CONSTANTS
@@ -242,15 +229,27 @@ export function createFormRow(labelText, inputEl, options = {}) {
 
 /**
  * Create a form select element with consistent styling
- * @param {string} name - Select name attribute
- * @param {Array<{value: string|number, label: string, description?: string, selected?: boolean}>} options - Select options
- * @param {Object} [config] - Additional configuration
+ *
+ * Supports two API patterns:
+ * 1. Object-based (with label): createFormSelect({ label, name, options, helpText })
+ * 2. Positional (select only): createFormSelect(name, options, config)
+ *
+ * @param {string|Object} nameOrConfig - Select name attribute or full config object
+ * @param {Array<{value: string|number, label: string, description?: string, selected?: boolean}>} [options] - Select options (positional API)
+ * @param {Object} [config] - Additional configuration (positional API)
  * @param {string} [config.className] - CSS class (default: 'obs-select')
  * @param {Function} [config.onChange] - Change handler
- * @param {boolean} [config.showDescription] - Show description below select (default: true if any option has description)
- * @returns {HTMLElement} Select element or wrapper with description
+ * @param {boolean} [config.showDescription] - Show description below select
+ * @returns {HTMLElement} Select element or wrapper with label/description
  */
-export function createFormSelect(name, options, config = {}) {
+export function createFormSelect(nameOrConfig, options, config = {}) {
+  // Detect object-based API (has label property)
+  if (typeof nameOrConfig === 'object' && nameOrConfig !== null && 'label' in nameOrConfig) {
+    return _createFormSelectWithLabel(nameOrConfig);
+  }
+
+  // Original positional API
+  const name = nameOrConfig;
   const hasDescriptions = options.some(opt => opt.description);
   const showDescription = config.showDescription ?? hasDescriptions;
 
@@ -300,6 +299,60 @@ export function createFormSelect(name, options, config = {}) {
 
   // Set initial description
   updateDescription();
+
+  return wrapper;
+}
+
+/**
+ * Create a form select with label wrapper (object-based API)
+ * @private
+ * @param {Object} config
+ * @param {string} config.label - Label text
+ * @param {string} config.name - Select name attribute
+ * @param {Array<{value: string|number, label: string, selected?: boolean}>} config.options - Select options
+ * @param {string} [config.helpText] - Help text shown below
+ * @param {string} [config.className] - Additional CSS class
+ * @param {Function} [config.onChange] - Change handler
+ * @returns {HTMLElement} Wrapper containing label and select
+ */
+function _createFormSelectWithLabel({ label, name, options, helpText, className, onChange }) {
+  const wrapper = document.createElement('div');
+  wrapper.className = `form-select-row ${className || ''}`.trim();
+
+  // Create label
+  const labelEl = document.createElement('label');
+  labelEl.className = 'form-select-label';
+  labelEl.textContent = label;
+  labelEl.htmlFor = `form-select-${name}`;
+  wrapper.appendChild(labelEl);
+
+  // Create select
+  const select = document.createElement('select');
+  select.className = 'obs-select';
+  select.name = name;
+  select.id = `form-select-${name}`;
+
+  for (const opt of options) {
+    const option = document.createElement('option');
+    option.value = opt.value;
+    option.textContent = opt.label;
+    if (opt.selected) option.selected = true;
+    select.appendChild(option);
+  }
+
+  if (onChange) {
+    select.addEventListener('change', (e) => onChange(e.target.value));
+  }
+
+  wrapper.appendChild(select);
+
+  // Add help text if provided
+  if (helpText) {
+    const helpEl = document.createElement('div');
+    helpEl.className = 'form-select-help';
+    helpEl.textContent = helpText;
+    wrapper.appendChild(helpEl);
+  }
 
   return wrapper;
 }
@@ -369,6 +422,71 @@ export function createNotice(message, options = {}) {
 }
 
 /**
+ * Create a form group container with label
+ *
+ * @param {Object} options
+ * @param {string} options.label - Group label text
+ * @param {string} [options.name] - Name for the group (used as class)
+ * @param {string} [options.className] - Additional CSS class
+ * @returns {HTMLDivElement}
+ */
+export function createFormGroup({ label, name, className }) {
+  const group = document.createElement('div');
+  group.className = `form-group ${name ? `form-group-${name}` : ''} ${className || ''}`.trim();
+
+  if (label) {
+    const labelEl = document.createElement('label');
+    labelEl.className = 'form-group-label';
+    labelEl.textContent = label;
+    group.appendChild(labelEl);
+  }
+
+  return group;
+}
+
+/**
+ * Create a form checkbox with label and name attribute
+ *
+ * @param {Object} options
+ * @param {string} options.label - Checkbox label text
+ * @param {string} options.name - Checkbox name attribute (for form snapshot)
+ * @param {boolean} [options.checked=false] - Initial checked state
+ * @param {string} [options.helpText] - Help text shown below
+ * @param {Function} [options.onChange] - Change handler
+ * @returns {HTMLDivElement} Container with checkbox and label
+ */
+export function createFormCheckbox({ label, name, checked = false, helpText, onChange }) {
+  const container = document.createElement('div');
+  container.className = 'form-checkbox-row';
+
+  const checkbox = document.createElement('input');
+  checkbox.type = 'checkbox';
+  checkbox.name = name;
+  checkbox.id = `form-checkbox-${name}`;
+  checkbox.checked = checked;
+
+  const labelEl = document.createElement('label');
+  labelEl.htmlFor = checkbox.id;
+  labelEl.textContent = label;
+
+  container.appendChild(checkbox);
+  container.appendChild(labelEl);
+
+  if (helpText) {
+    const help = document.createElement('span');
+    help.className = 'form-checkbox-help';
+    help.textContent = helpText;
+    container.appendChild(help);
+  }
+
+  if (onChange) {
+    checkbox.addEventListener('change', (e) => onChange(e.target.checked));
+  }
+
+  return container;
+}
+
+/**
  * Create an analysis result header
  * @param {string} title - Title text
  * @param {string} [subtitle] - Optional subtitle
@@ -401,6 +519,141 @@ export function createActionsBar(buttons) {
   }
 
   return bar;
+}
+
+/**
+ * Create a collapsible performance settings section
+ *
+ * Shared UI component for DE Analysis, Genes Panel, and other analysis types.
+ * Uses PerformanceConfig for options and recommendations.
+ *
+ * @param {Object} options
+ * @param {Object} options.dataLayer - Data layer for accessing dataset info
+ * @param {string} [options.className='analysis-performance-settings'] - CSS class prefix
+ * @param {boolean} [options.collapsed=true] - Start collapsed
+ * @returns {HTMLDivElement} Performance settings section element
+ */
+export function createPerformanceSettings(options) {
+  const { dataLayer, className = 'analysis-performance-settings', collapsed = true } = options;
+
+  // Lazy import to avoid circular dependencies
+  const getPerformanceConfig = async () => {
+    const mod = await import('./performance-config.js');
+    return mod.PerformanceConfig;
+  };
+
+  // Get data characteristics
+  const pointCount = dataLayer?.state?.pointCount || 100000;
+  const geneCount = dataLayer?.getAvailableVariables?.('gene_expression')?.length || 20000;
+
+  // Create container
+  const container = document.createElement('div');
+  container.className = className;
+
+  // Create header
+  const header = document.createElement('div');
+  header.className = `${className.replace('settings', 'header')} analysis-perf-header`;
+  header.innerHTML = `
+    <span class="analysis-perf-title">Performance Settings</span>
+    <span class="analysis-perf-toggle">${collapsed ? '▼' : '▲'}</span>
+  `;
+
+  // Create content
+  const content = document.createElement('div');
+  content.className = `${className.replace('settings', 'content')} analysis-perf-content`;
+  content.style.display = collapsed ? 'none' : 'block';
+
+  // Populate content asynchronously
+  getPerformanceConfig().then(PerformanceConfig => {
+    const dataInfo = PerformanceConfig.getRecommendedSettings(pointCount, geneCount);
+
+    // Batch size selector
+    const batchOptions = PerformanceConfig.getBatchSizeOptions(pointCount, geneCount);
+    const batchSelect = createFormSelect('batchSize', batchOptions.map(opt => ({
+      value: String(opt.value),
+      label: opt.label,
+      description: opt.description,
+      selected: opt.selected
+    })));
+    content.appendChild(createFormRow('Batch size:', batchSelect));
+
+    // Memory budget selector
+    const memoryOptions = PerformanceConfig.getMemoryBudgetOptions();
+    const memorySelect = createFormSelect('memoryBudget', memoryOptions.map(opt => ({
+      value: String(opt.value),
+      label: opt.label,
+      description: opt.description,
+      selected: opt.selected
+    })));
+    content.appendChild(createFormRow('Memory budget:', memorySelect));
+
+    // Network concurrency selector
+    const networkOptions = PerformanceConfig.getNetworkConcurrencyOptions();
+    const networkSelect = createFormSelect('networkConcurrency', networkOptions.map(opt => ({
+      value: String(opt.value),
+      label: opt.label,
+      description: opt.description,
+      selected: opt.selected
+    })));
+    content.appendChild(createFormRow('Network parallelism:', networkSelect));
+
+    // Parallelism selector
+    const parallelismSelect = createFormSelect('parallelism', [
+      { value: 'auto', label: 'Auto', description: 'Automatically distributes work across available cores.' },
+      { value: '1', label: '1 core', description: 'Sequential processing with minimal resource usage.' },
+      { value: '2', label: '2 cores', description: 'Light parallel processing for moderate workloads.' },
+      { value: '4', label: '4 cores', description: 'Balanced parallel processing.' },
+      { value: '8', label: '8 cores', description: 'Full parallel processing for maximum throughput.', selected: true }
+    ]);
+    content.appendChild(createFormRow('Compute parallelism:', parallelismSelect));
+
+    // Dataset info display
+    const infoDiv = document.createElement('div');
+    infoDiv.className = 'analysis-perf-info';
+    infoDiv.innerHTML = `
+      <strong>Dataset:</strong> ${(pointCount / 1000).toFixed(0)}K cells × ${geneCount.toLocaleString()} genes<br>
+      <strong>Est. data:</strong> ~${dataInfo.totalDataMB.toFixed(0)} MB total<br>
+      <strong>Est. time:</strong> ~${dataInfo.estimatedTimeFormatted}
+    `;
+    content.appendChild(infoDiv);
+  });
+
+  // Toggle functionality
+  let isExpanded = !collapsed;
+  header.addEventListener('click', () => {
+    isExpanded = !isExpanded;
+    content.style.display = isExpanded ? 'block' : 'none';
+    header.querySelector('.analysis-perf-toggle').textContent = isExpanded ? '▲' : '▼';
+  });
+
+  container.appendChild(header);
+  container.appendChild(content);
+
+  return container;
+}
+
+/**
+ * Extract performance settings from a form container
+ *
+ * @param {HTMLElement} formContainer - Form container element
+ * @returns {Object} Performance settings object
+ */
+export function getPerformanceFormValues(formContainer) {
+  const getValue = (name) => formContainer.querySelector(`[name="${name}"]`)?.value;
+
+  const parallelismRaw = getValue('parallelism') || 'auto';
+  const batchSizeRaw = getValue('batchSize');
+  const memoryBudgetRaw = getValue('memoryBudget');
+  const networkConcurrencyRaw = getValue('networkConcurrency');
+
+  return {
+    parallelism: parallelismRaw === 'auto' ? 'auto' : parseInt(parallelismRaw, 10),
+    batchConfig: {
+      preloadCount: batchSizeRaw ? parseInt(batchSizeRaw, 10) : undefined,
+      memoryBudgetMB: memoryBudgetRaw ? parseInt(memoryBudgetRaw, 10) : undefined,
+      networkConcurrency: networkConcurrencyRaw ? parseInt(networkConcurrencyRaw, 10) : undefined
+    }
+  };
 }
 
 // =============================================================================
@@ -632,56 +885,3 @@ export function throttle(fn, limit) {
     }
   };
 }
-
-// =============================================================================
-// DEFAULT EXPORT (for backward compatibility)
-// =============================================================================
-
-// Import formatting functions for use in default export
-import {
-  formatNumber as _formatNumber,
-  formatCount as _formatCount,
-  formatPValue as _formatPValue,
-  getSignificanceMarker as _getSignificanceMarker,
-  getSignificanceClass as _getSignificanceClass
-} from './formatting.js';
-
-export default {
-  // Constants
-  NONE_VALUE,
-  // Formatting (from shared/formatting.js)
-  formatCount: _formatCount,
-  formatNumber: _formatNumber,
-  formatPValue: _formatPValue,
-  getSignificanceMarker: _getSignificanceMarker,
-  getSignificanceClass: _getSignificanceClass,
-  // Page utilities
-  getCellCountForPage,
-  // Element factories
-  createLabeledContainer,
-  createSelect,
-  createButton,
-  createCheckbox,
-  createRangeSlider,
-  // Form utilities (for Analysis UIs)
-  createFormRow,
-  createFormSelect,
-  createFormTextarea,
-  createFormButton,
-  createNotice,
-  createResultHeader,
-  createActionsBar,
-  // Stats table rendering
-  renderStatsTable,
-  renderComparisonStatsTable,
-  // DOM manipulation
-  clearElement,
-  addClass,
-  removeClass,
-  toggleClass,
-  setStyles,
-  // Events
-  addListener,
-  debounce,
-  throttle
-};

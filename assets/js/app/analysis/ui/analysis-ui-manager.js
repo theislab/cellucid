@@ -39,7 +39,6 @@
 export class AnalysisUIManager {
   /**
    * @param {Object} options
-   * @param {HTMLElement} [options.container] - Parent container for all UI containers (legacy)
    * @param {Object} [options.containerMap] - Map of mode ID to pre-created container elements
    * @param {Object} options.dataLayer - Enhanced data layer instance
    * @param {Object} options.comparisonModule - Reference to ComparisonModule
@@ -47,8 +46,11 @@ export class AnalysisUIManager {
   constructor(options) {
     this.dataLayer = options.dataLayer;
     this.comparisonModule = options.comparisonModule;
-    this._parentContainer = options.container || null;
     this._containerMap = options.containerMap || null;
+
+    if (!this._containerMap) {
+      throw new Error('[AnalysisUIManager] containerMap is required');
+    }
 
     // Registry of all analysis types (id -> config)
     this._registry = new Map();
@@ -127,13 +129,6 @@ export class AnalysisUIManager {
         container = this._containerMap[id];
         container.id = `${id}-analysis-container`;
         container.classList.add(`${id}-analysis-panel`, 'analysis-panel');
-      } else if (this._parentContainer) {
-        // Legacy: create container in parent
-        container = document.createElement('div');
-        container.id = `${id}-analysis-container`;
-        container.className = `${id}-analysis-panel analysis-panel`;
-        container.style.display = 'none';
-        this._parentContainer.appendChild(container);
       } else {
         console.warn(`[AnalysisUIManager] No container available for mode: ${id}`);
         continue;
@@ -182,17 +177,6 @@ export class AnalysisUIManager {
     if (!entry) {
       console.warn(`[AnalysisUIManager] Unknown mode: ${modeId}`);
       return false;
-    }
-
-    // When using containerMap (accordion), visibility is controlled by CSS
-    // Only use display:none/block for legacy parent container mode
-    if (!this._containerMap) {
-      // Hide all containers
-      for (const uiEntry of this._uis.values()) {
-        uiEntry.container.style.display = 'none';
-      }
-      // Show target container
-      entry.container.style.display = 'block';
     }
 
     // Lazy initialize if needed

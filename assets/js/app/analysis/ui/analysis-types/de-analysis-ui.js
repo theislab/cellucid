@@ -15,7 +15,9 @@ import { FormBasedAnalysisUI } from './base/form-based-analysis.js';
 import { PlotRegistry } from '../../shared/plot-registry-utils.js';
 import {
   createFormRow,
-  createFormSelect
+  createFormSelect,
+  createPerformanceSettings,
+  getPerformanceFormValues
 } from '../../shared/dom-utils.js';
 import {
   deResultsToCSV,
@@ -24,7 +26,6 @@ import {
 // Note: renderStatsGrid and renderDEGenesTable are not used in sidebar
 // Modal rendering uses HTML templates directly for better control
 import { createPageComparisonSelector } from '../components/index.js';
-import { PerformanceConfig } from '../../shared/performance-config.js';
 import { purgePlot } from '../../plots/plotly-loader.js';
 import { isFiniteNumber } from '../../shared/number-utils.js';
 
@@ -162,99 +163,13 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     // Note: Significance and fold change thresholds are now in the results view
     // where they can be adjusted dynamically after analysis
 
-    // === Performance Settings Section ===
-    this._renderPerformanceSettings(wrapper);
-  }
-
-  /**
-   * Render performance settings section
-   * @param {HTMLElement} wrapper - Form wrapper element
-   * @private
-   */
-  _renderPerformanceSettings(wrapper) {
-    // Get data characteristics for dataset info display
-    const pointCount = this.dataLayer?.state?.pointCount || 100000;
-    const geneCount = this.dataLayer?.getAvailableVariables?.('gene_expression')?.length || 20000;
-    const dataInfo = PerformanceConfig.getRecommendedSettings(pointCount, geneCount);
-
-    // Performance settings container
-    const perfSection = document.createElement('div');
-    perfSection.className = 'de-performance-settings';
-
-    // Section header with toggle
-    const header = document.createElement('div');
-    header.className = 'de-perf-header';
-    header.innerHTML = `
-      <span class="de-perf-title">Performance Settings</span>
-      <span class="de-perf-toggle">▼</span>
-    `;
-
-    const content = document.createElement('div');
-    content.className = 'de-perf-content';
-
-    // Batch size selector
-    const batchOptions = PerformanceConfig.getBatchSizeOptions(pointCount, geneCount);
-    const batchSelect = createFormSelect('batchSize', batchOptions.map(opt => ({
-      value: String(opt.value),
-      label: opt.label,
-      description: opt.description,
-      selected: opt.selected
-    })));
-    content.appendChild(createFormRow('Batch size:', batchSelect));
-
-    // Memory budget selector
-    const memoryOptions = PerformanceConfig.getMemoryBudgetOptions();
-    const memorySelect = createFormSelect('memoryBudget', memoryOptions.map(opt => ({
-      value: String(opt.value),
-      label: opt.label,
-      description: opt.description,
-      selected: opt.selected
-    })));
-    content.appendChild(createFormRow('Memory budget:', memorySelect));
-
-    // Network concurrency selector (actual parallel network requests)
-    const networkOptions = PerformanceConfig.getNetworkConcurrencyOptions();
-    const networkSelect = createFormSelect('networkConcurrency', networkOptions.map(opt => ({
-      value: String(opt.value),
-      label: opt.label,
-      description: opt.description,
-      selected: opt.selected
-    })));
-    content.appendChild(createFormRow('Network parallelism:', networkSelect));
-
-    // Parallelism selector
-    const parallelismSelect = createFormSelect('parallelism', [
-      { value: 'auto', label: 'Auto', description: 'Automatically distributes work across available cores.' },
-      { value: '1', label: '1 core', description: 'Sequential processing with minimal resource usage.' },
-      { value: '2', label: '2 cores', description: 'Light parallel processing for moderate workloads.' },
-      { value: '4', label: '4 cores', description: 'Balanced parallel processing.' },
-      { value: '8', label: '8 cores', description: 'Full parallel processing for maximum throughput.', selected: true }
-    ]);
-    content.appendChild(createFormRow('Compute parallelism:', parallelismSelect));
-
-    // Dataset info display
-    const infoDiv = document.createElement('div');
-    infoDiv.className = 'de-perf-info';
-    infoDiv.innerHTML = `
-      <strong>Dataset:</strong> ${(pointCount / 1000).toFixed(0)}K cells × ${geneCount.toLocaleString()} genes<br>
-      <strong>Est. data:</strong> ~${dataInfo.totalDataMB.toFixed(0)} MB total<br>
-      <strong>Est. time:</strong> ~${dataInfo.estimatedTimeFormatted}
-    `;
-    content.appendChild(infoDiv);
-
-    // Toggle functionality
-    let isExpanded = false;
-    content.style.display = 'none';
-
-    header.addEventListener('click', () => {
-      isExpanded = !isExpanded;
-      content.style.display = isExpanded ? 'block' : 'none';
-      header.querySelector('.de-perf-toggle').textContent = isExpanded ? '▲' : '▼';
+    // === Performance Settings Section (shared with Genes Panel) ===
+    const perfSettings = createPerformanceSettings({
+      dataLayer: this.dataLayer,
+      className: 'de-performance-settings',
+      collapsed: true
     });
-
-    perfSection.appendChild(header);
-    perfSection.appendChild(content);
-    wrapper.appendChild(perfSection);
+    wrapper.appendChild(perfSettings);
   }
 
   /**
@@ -263,20 +178,11 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
    */
   _getFormValues() {
     const form = this._formContainer.querySelector('.analysis-form');
-    const parallelismRaw = form.querySelector('[name="parallelism"]')?.value || 'auto';
-    const batchSizeRaw = form.querySelector('[name="batchSize"]')?.value;
-    const memoryBudgetRaw = form.querySelector('[name="memoryBudget"]')?.value;
-    const networkConcurrencyRaw = form.querySelector('[name="networkConcurrency"]')?.value;
+    const perfValues = getPerformanceFormValues(form);
 
     return {
-      parallelism: parallelismRaw === 'auto' ? 'auto' : parseInt(parallelismRaw, 10),
-      method: form.querySelector('[name="method"]').value,
-      // Batch configuration for optimized loading
-      batchConfig: {
-        preloadCount: batchSizeRaw ? parseInt(batchSizeRaw, 10) : undefined,
-        memoryBudgetMB: memoryBudgetRaw ? parseInt(memoryBudgetRaw, 10) : undefined,
-        networkConcurrency: networkConcurrencyRaw ? parseInt(networkConcurrencyRaw, 10) : undefined
-      }
+      ...perfValues,
+      method: form.querySelector('[name="method"]').value
     };
   }
 

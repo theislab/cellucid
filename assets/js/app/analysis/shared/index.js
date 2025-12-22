@@ -76,10 +76,6 @@ export {
   throttle
 } from './dom-utils.js';
 
-// Default export for convenience
-import domUtils from './dom-utils.js';
-export { domUtils };
-
 // =============================================================================
 // MEMORY MONITORING
 // =============================================================================
@@ -212,3 +208,21 @@ export {
   renderDEResults,
   renderSignatureResults
 } from './result-renderer.js';
+
+// =============================================================================
+// MATRIX UTILITIES
+// =============================================================================
+
+export {
+  zscoreRowwise,
+  log1pTransform,
+  computeDistanceMatrix,
+  correlationMatrix,
+  euclideanDistanceMatrix,
+  cosineDistanceMatrix,
+  reorderRows,
+  reorderCols,
+  transposeMatrix,
+  TRANSFORM_TYPES,
+  DISTANCE_TYPES
+} from './matrix-utils.js';

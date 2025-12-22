@@ -8,7 +8,7 @@
  * - Select All/Deselect All actions
  * - Reactive state management
  *
- * Used by: DetailedAnalysisUI, DEAnalysisUI, etc.
+ * Used by: DetailedAnalysisUI, CorrelationAnalysisUI, etc.
  *
  * @example
  * const pageSelector = createPageSelectorComponent({
@@ -25,8 +25,11 @@
  * pageSelector.destroy();
  */
 
-import { formatCount } from '../../shared/dom-utils.js';
+import { formatCount } from '../../shared/formatting.js';
 import { StyleManager } from '../../../../utils/style-manager.js';
+import { expandPagesWithDerived } from '../../shared/page-derivation-utils.js';
+import { deriveRestOfColor } from '../../shared/color-utils.js';
+import { getPageColor } from '../../core/plugin-contract.js';
 
 /**
  * PageSelectorComponent Class
@@ -46,6 +49,9 @@ export class PageSelectorComponent {
    * @param {string[]} [options.initialSelection] - Initial page IDs to select
    * @param {string} [options.emptyMessage] - Message when no pages available
    * @param {string} [options.label] - Label text for the selector
+   * @param {boolean} [options.includeDerivedPages=false] - Whether to show derived pages (e.g., "Rest of X")
+   * @param {Map} [options.customColors] - Map of pageId -> custom color
+   * @param {Function} [options.getCellCountForPageId] - Custom cell count function (pageId) => number
    */
   constructor(options) {
     this.dataLayer = options.dataLayer;
@@ -59,9 +65,13 @@ export class PageSelectorComponent {
     this.showSelectAll = options.showSelectAll ?? true;
     this.emptyMessage = options.emptyMessage || 'Create highlight pages first using the Highlighted Cells section above.';
     this.label = options.label ?? 'Compare pages:';
+    this.includeDerivedPages = options.includeDerivedPages ?? false;
+    this.customColors = options.customColors || new Map();
+    this.getCellCountForPageId = options.getCellCountForPageId || null;
 
     // State
     this._selectedPages = new Set(options.initialSelection || []);
+    this._basePages = []; // Store base pages for Select All logic
 
     // DOM references
     this._tabsContainer = null;
@@ -142,13 +152,29 @@ export class PageSelectorComponent {
   _createPageTab(page, index) {
     const isSelected = this._selectedPages.has(page.id);
     const cellCount = this._getCellCount(page.id);
-    const currentColor =
-      (typeof this.dataLayer?.getPageColor === 'function' ? this.dataLayer.getPageColor(page.id) : null)
-      || page?.color
-      || '#888888';
+    const derived = page?._derived || null;
+    const baseId = derived?.baseId || page.id;
+
+    // Find base page index for default color
+    const baseIndex = this._basePages.findIndex(p => p.id === baseId);
+    const effectiveIndex = baseIndex >= 0 ? baseIndex : index;
+
+    // Determine color: custom > dataLayer > page.color > default palette
+    const basePage = this._basePages.find(p => p.id === baseId) || null;
+    const baseColor = this.customColors.get(baseId)
+      || (typeof this.dataLayer?.getPageColor === 'function' ? this.dataLayer.getPageColor(baseId) : null)
+      || basePage?.color
+      || getPageColor(effectiveIndex);
+
+    // For derived "rest of" pages, derive a lighter color
+    const currentColor = derived?.kind === 'rest_of'
+      ? (this.customColors.get(page.id) || deriveRestOfColor(baseColor))
+      : (this.customColors.get(page.id) || baseColor);
 
     const tab = document.createElement('div');
-    tab.className = 'analysis-page-tab' + (isSelected ? ' selected' : '');
+    tab.className = 'analysis-page-tab' +
+      (derived ? ' derived' : '') +
+      (isSelected ? ' selected' : '');
     tab.dataset.pageId = page.id;
 
     // Color swatch
@@ -168,6 +194,7 @@ export class PageSelectorComponent {
 
       colorInput.addEventListener('input', (e) => {
         const newColor = e.target.value;
+        this.customColors.set(page.id, newColor);
         StyleManager.setVariable(colorIndicator, '--analysis-page-color', newColor);
         if (this.onColorChange) this.onColorChange(page.id, newColor);
         else this.dataLayer?.setPageColor?.(page.id, newColor);
@@ -199,7 +226,7 @@ export class PageSelectorComponent {
 
     // Click to toggle selection
     tab.addEventListener('click', () => {
-      this._togglePageSelection(page.id);
+      this._togglePageSelection(page.id, page);
     });
 
     return tab;
@@ -207,25 +234,30 @@ export class PageSelectorComponent {
 
   /**
    * Render select all/deselect all button
+   * Only toggles base pages (not derived) to match expected behavior
    */
   _renderSelectAllButton(pages) {
     const actionsRow = document.createElement('div');
     actionsRow.className = 'analysis-page-actions';
 
-    const allSelected = this._selectedPages.size === pages.length;
+    // Only consider base pages for "all selected" check
+    const basePageIds = this._basePages.map(p => p.id);
+    const allBaseSelected = basePageIds.every(id => this._selectedPages.has(id));
 
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'btn-small';
-    btn.textContent = allSelected ? 'Deselect All' : 'Select All';
+    btn.textContent = allBaseSelected ? 'Deselect All' : 'Select All';
 
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
 
-      if (allSelected) {
+      if (allBaseSelected) {
+        // Deselect all (including any derived)
         this._selectedPages.clear();
       } else {
-        pages.forEach(p => this._selectedPages.add(p.id));
+        // Select only base pages
+        basePageIds.forEach(id => this._selectedPages.add(id));
       }
 
       this._renderTabs(pages);
@@ -239,10 +271,24 @@ export class PageSelectorComponent {
   /**
    * Toggle page selection
    */
-  _togglePageSelection(pageId) {
+  _togglePageSelection(pageId, page) {
     if (this._selectedPages.has(pageId)) {
       this._selectedPages.delete(pageId);
     } else {
+      // Ensure derived pages get a stable default color for plotting
+      if (page?._derived && !this.customColors.has(pageId)) {
+        const baseId = page._derived.baseId;
+        const baseIndex = this._basePages.findIndex(p => p.id === baseId);
+        const basePage = this._basePages.find(p => p.id === baseId);
+        const baseColor = this.customColors.get(baseId)
+          || this.dataLayer?.getPageColor?.(baseId)
+          || basePage?.color
+          || getPageColor(baseIndex >= 0 ? baseIndex : 0);
+        const derivedColor = page._derived.kind === 'rest_of'
+          ? deriveRestOfColor(baseColor)
+          : baseColor;
+        this.customColors.set(pageId, derivedColor);
+      }
       this._selectedPages.add(pageId);
     }
 
@@ -262,11 +308,17 @@ export class PageSelectorComponent {
   }
 
   /**
-   * Get pages from data layer
+   * Get pages from data layer (optionally with derived pages)
    */
   _getPages() {
     try {
-      return this.dataLayer.getPages() || [];
+      const basePages = this.dataLayer.getPages() || [];
+      this._basePages = basePages; // Store for Select All logic
+
+      if (this.includeDerivedPages) {
+        return expandPagesWithDerived(basePages, { includeRestOf: true });
+      }
+      return basePages;
     } catch (err) {
       console.error('[PageSelectorComponent] Failed to get pages:', err);
       return [];
@@ -278,6 +330,10 @@ export class PageSelectorComponent {
    */
   _getCellCount(pageId) {
     try {
+      // Use custom callback if provided
+      if (typeof this.getCellCountForPageId === 'function') {
+        return this.getCellCountForPageId(pageId) || 0;
+      }
       return this.dataLayer.getCellIndicesForPage(pageId)?.length || 0;
     } catch (err) {
       return 0;
@@ -306,11 +362,11 @@ export class PageSelectorComponent {
   }
 
   /**
-   * Select all pages
+   * Select all base pages (not derived, matching button behavior)
    */
   selectAll() {
-    const pages = this._getPages();
-    this._selectedPages = new Set(pages.map(p => p.id));
+    this._getPages(); // Ensure _basePages is populated
+    this._selectedPages = new Set(this._basePages.map(p => p.id));
     this.render();
     this._notifySelectionChange();
   }
@@ -369,6 +425,14 @@ export class PageSelectorComponent {
     if (this._labelEl) {
       this._labelEl.textContent = label;
     }
+  }
+
+  /**
+   * Get custom colors map (for passing to plots)
+   * @returns {Map<string, string>}
+   */
+  getCustomColors() {
+    return this.customColors;
   }
 
   /**

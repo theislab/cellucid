@@ -54,6 +54,13 @@ import './volcanoplot.js';
 import './scatterplot.js';
 
 // =============================================================================
+// MARKER GENES PANEL PLOT TYPES
+// =============================================================================
+
+// Gene heatmap - Shows marker gene expression across cell groups
+import './gene-heatmap.js';
+
+// =============================================================================
 // PLOT TYPE SUMMARY
 // =============================================================================
 
@@ -86,7 +93,8 @@ export const PLOT_TYPE_IDS = [
   'densityplot',
   'heatmap',
   'volcanoplot',
-  'scatterplot'
+  'scatterplot',
+  'gene-heatmap'
 ];
 
 // Categorical plot types
@@ -96,4 +104,4 @@ export const CATEGORICAL_PLOT_IDS = ['barplot', 'pieplot'];
 export const CONTINUOUS_PLOT_IDS = ['boxplot', 'violinplot', 'histogram', 'densityplot'];
 
 // Advanced plot types (require specific data configurations)
-export const ADVANCED_PLOT_IDS = ['heatmap', 'volcanoplot', 'scatterplot'];
+export const ADVANCED_PLOT_IDS = ['heatmap', 'volcanoplot', 'scatterplot', 'gene-heatmap'];

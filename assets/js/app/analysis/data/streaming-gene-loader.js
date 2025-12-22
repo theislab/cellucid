@@ -318,6 +318,308 @@ export class StreamingGeneLoader {
   }
 
   /**
+   * Stream raw per-cell gene values (no group extraction).
+   *
+   * This is the lowest-level streaming primitive and is ideal when downstream
+   * computation wants to operate on the full per-cell vector (e.g., multi-group
+   * marker discovery in a worker) without allocating per-group extracted arrays.
+   *
+   * IMPORTANT:
+   * - The yielded `values` array is backed by DataLayer's internal var-field buffer.
+   * - Do NOT transfer its ArrayBuffer to a Worker (it would detach and break DataLayer).
+   * - If you need to compute in a Worker, make a copy first: `new Float32Array(values)`.
+   *
+   * @param {string[]} geneList
+   * @yields {{ gene: string, values: Float32Array, index: number }}
+   */
+  async *streamGenesRaw(geneList) {
+    if (!geneList || geneList.length === 0) {
+      return;
+    }
+
+    // Increment run ID to invalidate any stale callbacks from previous runs
+    this._runId++;
+    const currentRunId = this._runId;
+
+    // Initialize - full state reset
+    this._stats.startTime = performance.now();
+    this._stats.genesLoaded = 0;
+    this._stats.genesFailed = 0;
+    this._stats.bytesLoaded = 0;
+    this._stats.endTime = null;
+    this._aborted = false;
+    this._buffer.clear();
+    this._loadingGenes.clear();
+    this._releaseAllLoadedGenes();
+    this._loadedGenes.clear();
+    this._loadQueue = [...geneList];
+
+    // Calculate memory-aware buffer size
+    this._recalculateBufferSize();
+    this._effectiveBufferSize = this._maxBufferSize;
+
+    // Clear any waiting resolvers from previous runs
+    for (const resolvers of this._waitingFor.values()) {
+      resolvers.forEach(resolve => resolve(null));
+    }
+    this._waitingFor.clear();
+
+    // Unsubscribe from previous run's memory pressure listener if exists
+    if (this._pressureUnsubscribe) {
+      this._pressureUnsubscribe();
+      this._pressureUnsubscribe = null;
+    }
+
+    // Subscribe to memory pressure
+    this._pressureUnsubscribe = this._memoryMonitor.onMemoryPressure(this._handleMemoryPressure);
+
+    debug('StreamingGeneLoader', `Starting raw run ${currentRunId}: ${geneList.length} genes, buffer=${this._maxBufferSize}, network=${this._networkConcurrency}`);
+
+    // Set up abort listener
+    if (this.signal) {
+      this.signal.addEventListener('abort', () => this._abort(), { once: true });
+    }
+
+    try {
+      // Start initial prefetch
+      this._startPrefetch();
+
+      for (let i = 0; i < geneList.length; i++) {
+        if (this._aborted) {
+          debug('StreamingGeneLoader', 'Aborted, stopping raw iteration');
+          break;
+        }
+
+        const gene = geneList[i];
+        const values = await this._waitForGene(gene);
+
+        if (values === null) {
+          debugWarn('StreamingGeneLoader', `Skipping failed gene: ${gene}`);
+          continue;
+        }
+
+        // Remove from buffer to free memory
+        this._buffer.delete(gene);
+
+        // Unload gene from DataLayer to free memory (best-effort)
+        this._releaseGene(gene);
+
+        if (this.onProgress) {
+          this.onProgress({
+            loaded: i + 1,
+            total: geneList.length,
+            buffered: this._buffer.size,
+            loading: this._loadingGenes.size,
+            queued: this._loadQueue.length
+          });
+        }
+
+        yield { gene, values, index: i };
+
+        // Continue prefetching
+        this._startPrefetch();
+
+        // Yield to event loop periodically
+        if (i > 0 && i % 25 === 0) {
+          await new Promise(resolve => setTimeout(resolve, 0));
+        }
+      }
+    } finally {
+      this._aborted = true;
+      this._stats.endTime = performance.now();
+
+      if (this._pressureUnsubscribe) {
+        this._pressureUnsubscribe();
+        this._pressureUnsubscribe = null;
+      }
+
+      for (const resolvers of this._waitingFor.values()) {
+        resolvers.forEach(resolve => resolve(null));
+      }
+      this._waitingFor.clear();
+
+      this._buffer.clear();
+      this._loadQueue = [];
+      this._loadingGenes.clear();
+      this._releaseAllLoadedGenes();
+
+      const duration = (this._stats.endTime - this._stats.startTime) / 1000;
+      const genesPerSec = duration > 0 ? (this._stats.genesLoaded / duration) : 0;
+      debug('StreamingGeneLoader', `Raw run ${currentRunId} completed: ${this._stats.genesLoaded} loaded, ${this._stats.genesFailed} failed, ${duration.toFixed(1)}s (${genesPerSec.toFixed(1)} genes/s)`);
+    }
+  }
+
+  /**
+   * Stream genes for multiple groups simultaneously
+   *
+   * Key optimization for marker discovery: download each gene ONCE,
+   * extract values for ALL groups in a single pass. This is much more
+   * efficient than calling streamGenes() multiple times.
+   *
+   * @param {string[]} geneList - List of gene names to process
+   * @param {Object[]} groups - Array of group specifications
+   * @param {string} groups[].groupId - Unique group identifier
+   * @param {string} [groups[].groupName] - Display name for the group
+   * @param {number[]|Uint32Array} [groups[].cellIndices] - Cell indices for explicit group
+   * @param {number[]|Uint32Array} [groups[].excludedCellIndices] - Excluded indices for rest-of group
+   * @param {boolean} [groups[].isRestOf=false] - Whether this is a rest-of group
+   * @yields {{ gene: string, groupValues: Map<string, Float32Array>, index: number }}
+   *
+   * @example
+   * const groups = [
+   *   { groupId: 'cluster_0', cellIndices: [0, 1, 2, ...] },
+   *   { groupId: 'cluster_1', cellIndices: [100, 101, ...] },
+   *   { groupId: 'rest', excludedCellIndices: [0, 1, 2, 100, 101, ...], isRestOf: true }
+   * ];
+   *
+   * for await (const { gene, groupValues, index } of loader.streamGenesMultiGroup(genes, groups)) {
+   *   const cluster0Values = groupValues.get('cluster_0');
+   *   const cluster1Values = groupValues.get('cluster_1');
+   *   // Process all groups for this gene
+   * }
+   */
+  async *streamGenesMultiGroup(geneList, groups) {
+    if (!geneList || geneList.length === 0 || !groups || groups.length === 0) {
+      return;
+    }
+
+    // Increment run ID to invalidate any stale callbacks from previous runs
+    this._runId++;
+    const currentRunId = this._runId;
+
+    // Initialize - full state reset
+    this._stats.startTime = performance.now();
+    this._stats.genesLoaded = 0;
+    this._stats.genesFailed = 0;
+    this._stats.bytesLoaded = 0;
+    this._stats.endTime = null;
+    this._aborted = false;
+    this._buffer.clear();
+    this._loadingGenes.clear();
+    this._releaseAllLoadedGenes();
+    this._loadedGenes.clear();
+    this._loadQueue = [...geneList];
+
+    // Calculate memory-aware buffer size
+    this._recalculateBufferSize();
+    this._effectiveBufferSize = this._maxBufferSize;
+
+    // Clear any waiting resolvers from previous runs
+    for (const resolvers of this._waitingFor.values()) {
+      resolvers.forEach(resolve => resolve(null));
+    }
+    this._waitingFor.clear();
+
+    // Unsubscribe from previous run's memory pressure listener if exists
+    if (this._pressureUnsubscribe) {
+      this._pressureUnsubscribe();
+      this._pressureUnsubscribe = null;
+    }
+
+    // Subscribe to memory pressure
+    this._pressureUnsubscribe = this._memoryMonitor.onMemoryPressure(this._handleMemoryPressure);
+
+    debug('StreamingGeneLoader', `Starting multi-group run ${currentRunId}: ${geneList.length} genes, ${groups.length} groups, buffer=${this._maxBufferSize}`);
+
+    // Set up abort listener
+    if (this.signal) {
+      this.signal.addEventListener('abort', () => this._abort(), { once: true });
+    }
+
+    try {
+      // Start initial prefetch
+      this._startPrefetch();
+
+      // Process genes one by one
+      for (let i = 0; i < geneList.length; i++) {
+        if (this._aborted) {
+          debug('StreamingGeneLoader', 'Aborted, stopping multi-group iteration');
+          break;
+        }
+
+        const gene = geneList[i];
+
+        // Wait for this gene to be loaded
+        const values = await this._waitForGene(gene);
+
+        if (values === null) {
+          // Gene failed to load, skip it
+          debugWarn('StreamingGeneLoader', `Skipping failed gene: ${gene}`);
+          continue;
+        }
+
+        // Gather values for ALL groups from the same gene data
+        const groupValues = new Map();
+
+        for (const group of groups) {
+          let groupData;
+
+          if (group.isRestOf || group.excludedCellIndices) {
+            groupData = gatherComplementFloat32(values, group.excludedCellIndices || []);
+          } else {
+            groupData = gatherFloat32(values, group.cellIndices || []);
+          }
+
+          groupValues.set(group.groupId, groupData);
+        }
+
+        // Remove from buffer to free memory
+        this._buffer.delete(gene);
+
+        // Unload gene from DataLayer to free memory (best-effort)
+        this._releaseGene(gene);
+
+        // Report progress
+        if (this.onProgress) {
+          this.onProgress({
+            loaded: i + 1,
+            total: geneList.length,
+            buffered: this._buffer.size,
+            loading: this._loadingGenes.size,
+            queued: this._loadQueue.length,
+            groupCount: groups.length
+          });
+        }
+
+        yield { gene, groupValues, index: i };
+
+        // Continue prefetching
+        this._startPrefetch();
+
+        // Yield to event loop periodically
+        if (i > 0 && i % 25 === 0) {
+          await new Promise(resolve => setTimeout(resolve, 0));
+        }
+      }
+    } finally {
+      // Mark the run as stopped
+      this._aborted = true;
+      this._stats.endTime = performance.now();
+
+      if (this._pressureUnsubscribe) {
+        this._pressureUnsubscribe();
+        this._pressureUnsubscribe = null;
+      }
+
+      // Notify any remaining waiters
+      for (const resolvers of this._waitingFor.values()) {
+        resolvers.forEach(resolve => resolve(null));
+      }
+      this._waitingFor.clear();
+
+      // Clear any remaining buffered data
+      this._buffer.clear();
+      this._loadQueue = [];
+      this._loadingGenes.clear();
+      this._releaseAllLoadedGenes();
+
+      const duration = (this._stats.endTime - this._stats.startTime) / 1000;
+      const genesPerSec = this._stats.genesLoaded / duration;
+      debug('StreamingGeneLoader', `Multi-group run ${currentRunId} completed: ${this._stats.genesLoaded} loaded, ${this._stats.genesFailed} failed, ${duration.toFixed(1)}s (${genesPerSec.toFixed(1)} genes/s)`);
+    }
+  }
+
+  /**
    * Get loading statistics
    * @returns {Object} Statistics object
    */

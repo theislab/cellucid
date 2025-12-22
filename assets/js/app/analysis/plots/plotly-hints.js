@@ -191,10 +191,6 @@ export function setPlotlyHintsEnabled(value) {
   enabled = !!value;
 }
 
-/**
- * Backwards-compatible export name.
- */
-export const setPlotlyNotificationsEnabled = setPlotlyHintsEnabled;
 
 /**
  * Destroy and restore native behavior (stop forwarding + show native toasts again).

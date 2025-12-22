@@ -14,12 +14,13 @@ import { getScatterTraceType } from '../plotly-loader.js';
 import { getFiniteMinMax, isFiniteNumber, mean } from '../../shared/number-utils.js';
 import { applyLegendPosition } from '../../shared/legend-utils.js';
 import { getPlotTheme } from '../../shared/plot-theme.js';
+import { generateCategoryColors } from '../../shared/color-utils.js';
 
 const scatterPlotDefinition = {
   id: 'scatterplot',
   name: 'Scatter Plot',
   description: 'Correlation between two continuous variables',
-  supportedDataTypes: ['correlation', 'continuous_pair'],
+  supportedTypes: ['correlation', 'continuous_pair'],
   supportedLayouts: ['overlay', 'side-by-side'],
 
   defaultOptions: {
@@ -157,8 +158,25 @@ const scatterPlotDefinition = {
 
       if (xData.length === 0) continue;
 
-      if (useDensity && xData.length > densityThreshold) {
-        // Use density plot for large datasets
+      // Check if we have colorBy data
+      const hasColorBy = pageResult.colorValues && pageResult.colorValues.length > 0 && pageResult.colorVariable;
+      // Get aligned color data (must match xData/yData after filtering)
+      let colorData = null;
+      if (hasColorBy) {
+        const colorVals = pageResult.colorValues;
+        colorData = [];
+        for (let j = 0; j < Math.min(xVals.length, yVals.length); j++) {
+          const x = xVals[j];
+          const y = yVals[j];
+          if (isFiniteNumber(x) && isFiniteNumber(y)) {
+            if ((logScaleX && x <= 0) || (logScaleY && y <= 0)) continue;
+            colorData.push(colorVals[j] ?? 'Unknown');
+          }
+        }
+      }
+
+      if (useDensity && xData.length > densityThreshold && !hasColorBy) {
+        // Use density plot for large datasets (only when not coloring by category)
         traces.push({
           type: 'histogram2dcontour',
           name: pageResult.pageName,
@@ -198,6 +216,42 @@ const scatterPlotDefinition = {
           },
           hoverinfo: 'x+y'
         });
+      } else if (hasColorBy && colorData) {
+        // Color by categorical variable - create separate trace per category
+        const categories = [...new Set(colorData)].filter(c => c != null).sort();
+        const categoryColors = generateCategoryColors(categories, theme);
+
+        for (const cat of categories) {
+          const catX = [];
+          const catY = [];
+          for (let j = 0; j < xData.length; j++) {
+            if (colorData[j] === cat) {
+              catX.push(xData[j]);
+              catY.push(yData[j]);
+            }
+          }
+
+          if (catX.length === 0) continue;
+
+          traces.push({
+            type: getScatterTraceType(),
+            mode: 'markers',
+            name: cat,
+            legendgroup: cat,
+            x: catX,
+            y: catY,
+            marker: {
+              color: categoryColors.get(cat) || color,
+              size: pointSize,
+              opacity: pointOpacity,
+              line: { width: 0 }
+            },
+            hovertemplate: `${pageResult.xVariable || 'X'}: %{x:.2f}<br>` +
+              `${pageResult.yVariable || 'Y'}: %{y:.2f}<br>` +
+              `${pageResult.colorVariable}: ${cat}<extra></extra>`,
+            hoverlabel: COMMON_HOVER_STYLE
+          });
+        }
       } else {
         // Regular scatter plot (GPU-accelerated)
         traces.push({

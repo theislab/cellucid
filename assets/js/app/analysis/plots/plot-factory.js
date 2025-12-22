@@ -23,11 +23,9 @@ import { applyLegendPosition } from '../shared/legend-utils.js';
 import { getPlotTheme } from '../shared/plot-theme.js';
 
 // =============================================================================
-// PLOT REGISTRY - Imported from centralized location
+// PLOT REGISTRY
 // =============================================================================
 
-// Re-export PlotRegistry from centralized location for backward compatibility
-// All new code should import directly from '../shared/plot-registry-utils.js'
 export { PlotRegistry } from '../shared/plot-registry-utils.js';
 
 // =============================================================================
@@ -102,7 +100,37 @@ export class PlotFactory {
       const layout = definition.buildLayout(pageData, options, layoutEngine);
       applyLegendPosition(layout, options?.legendPosition);
       const Plotly = await createMinimalPlotly();
-      return await Plotly.react(figure, traces, layout, getPlotlyConfig());
+      const config = getPlotlyConfig();
+
+      // Plotly.react can silently fail or render blank when switching trace types
+      // (notably between WebGL and non-WebGL heatmaps). Detect type changes and
+      // force a clean re-render to keep plots stable across browsers/devices.
+      const existingTraces = Array.isArray(figure?.data) ? figure.data : null;
+      const nextTraces = Array.isArray(traces) ? traces : null;
+
+      let mustFullRender = false;
+      if (existingTraces && nextTraces) {
+        const n = Math.min(existingTraces.length, nextTraces.length);
+        for (let i = 0; i < n; i++) {
+          const prevType = existingTraces[i]?.type;
+          const nextType = nextTraces[i]?.type;
+          if (prevType && nextType && prevType !== nextType) {
+            mustFullRender = true;
+            break;
+          }
+        }
+      }
+
+      if (mustFullRender) {
+        try {
+          Plotly.purge?.(figure);
+        } catch (_purgeErr) {
+          // Ignore purge failures
+        }
+        return await Plotly.newPlot(figure, traces, layout, config);
+      }
+
+      return await Plotly.react(figure, traces, layout, config);
     } catch (err) {
       console.warn(`[${definition.id}] Update error, falling back to render:`, err);
       // IMPORTANT: Purge before full re-render to avoid leaking WebGL contexts / DOM.
@@ -248,8 +276,7 @@ export class PlotFactory {
   // ===========================================================================
 
   /**
-   * Create a GPU-accelerated scatter trace
-   * ALWAYS uses scattergl (WebGL2) - no fallbacks
+   * Create a scatter trace (prefers WebGL when available).
    *
    * @param {Object} config - Trace configuration
    * @param {string} config.name - Trace name
@@ -279,8 +306,6 @@ export class PlotFactory {
     line,
     text
   }) {
-    requireWebGL2();
-
     const trace = {
       type: getScatterTraceType(),
       mode,
@@ -325,8 +350,11 @@ export class PlotFactory {
   }
 
   /**
-   * Create a GPU-accelerated heatmap trace
-   * ALWAYS uses heatmapgl (WebGL2) - no fallbacks
+   * Create a heatmap trace (prefers WebGL when available).
+   *
+   * Note: `heatmapgl` does not support some annotation features across
+   * Plotly builds, so when `texttemplate` is provided we force the
+   * non-WebGL `heatmap` trace for correctness.
    *
    * @param {Object} config - Trace configuration
    * @param {number[][]} config.z - Matrix data
@@ -351,10 +379,10 @@ export class PlotFactory {
     texttemplate,
     textfont
   }) {
-    requireWebGL2();
+    const wantsTextAnnotations = !!texttemplate;
 
     const trace = {
-      type: getHeatmapTraceType(),
+      type: wantsTextAnnotations ? 'heatmap' : getHeatmapTraceType(),
       z,
       colorscale,
       showscale,
@@ -823,7 +851,7 @@ export function createDistributionPlotDefinition(config) {
     id,
     name,
     description,
-    supportedDataTypes: ['continuous'],
+    supportedTypes: ['continuous'],
     supportedLayouts: ['side-by-side', 'grouped', 'overlay'],
     defaultOptions,
     optionSchema,
@@ -910,7 +938,7 @@ export function createCategoricalPlotDefinition(config) {
     id,
     name,
     description,
-    supportedDataTypes: ['categorical'],
+    supportedTypes: ['categorical'],
     supportedLayouts: ['side-by-side', 'grouped', 'stacked', 'overlay'],
     defaultOptions,
     optionSchema,

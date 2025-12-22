@@ -15,6 +15,21 @@
  * - Worker integration for heavy computations
  * - Notification center integration for user feedback
  *
+ * Data loading coverage (large dataset support):
+ * This layer delegates all actual I/O to the core dataset loaders in
+ * `cellucid/assets/js/data/data-loaders.js`, which cover:
+ * - Points: `loadPointsBinary`
+ * - Manifests: `loadObsManifest`, `loadVarManifest`, `loadConnectivityManifest`
+ * - Fields: `loadObsFieldData`, `loadVarFieldData`
+ * - Graph edges: `loadEdgeSources`, `loadEdgeDestinations`, `loadEdges`
+ * - Dataset identity: `loadDatasetIdentity` (+ embeddings metadata helpers)
+ * - Analysis payloads: `loadAnalysisBulkData`, `loadAnalysisBulkObsData`, `loadAnalysisSubset`
+ * - Latents: `loadLatentEmbeddings`
+ *
+ * The Genes Panel feature relies specifically on:
+ * - `ensureObsFieldLoaded()` → categorical obs codes/categories (grouping)
+ * - `ensureGeneExpressionLoaded()` → per-gene per-cell Float32 arrays (streamed)
+ *
  * @module data/data-layer
  */
 
@@ -188,6 +203,14 @@ export class DataLayer {
     // Simple variable cache (for variable info lookups)
     this._variableCache = new Map();
 
+    // Fast key->fieldIndex lookups (critical for streaming loaders).
+    // Built lazily and treated as immutable for the lifetime of this DataLayer
+    // instance (a new DataLayer is created per dataset/state).
+    /** @type {Map<string, number>|null} */
+    this._geneFieldIndexByKey = null;
+    /** @type {Map<string, number>|null} */
+    this._obsFieldIndexByKey = null;
+
     // LRU cache for page data (if enabled)
     this._dataCache = enableCache
       ? new LRUCache({ maxSize: cacheSize, maxAge: cacheMaxAge })
@@ -226,6 +249,46 @@ export class DataLayer {
     if (enableVersionTracking) {
       this._initPageVersionTracking();
     }
+  }
+
+  // ===========================================================================
+  // FAST FIELD INDEX LOOKUPS (PERFORMANCE-CRITICAL)
+  // ===========================================================================
+
+  /**
+   * Build (or reuse) a geneKey -> var fieldIndex map.
+   * @private
+   */
+  _getGeneFieldIndexMap() {
+    if (this._geneFieldIndexByKey) return this._geneFieldIndexByKey;
+    const fields = this.state?.varData?.fields || [];
+    const map = new Map();
+    for (let i = 0; i < fields.length; i++) {
+      const key = fields[i]?.key;
+      if (typeof key === 'string' && key.length > 0) {
+        map.set(key, i);
+      }
+    }
+    this._geneFieldIndexByKey = map;
+    return map;
+  }
+
+  /**
+   * Build (or reuse) an obsKey -> obs fieldIndex map.
+   * @private
+   */
+  _getObsFieldIndexMap() {
+    if (this._obsFieldIndexByKey) return this._obsFieldIndexByKey;
+    const fields = this.state?.obsData?.fields || [];
+    const map = new Map();
+    for (let i = 0; i < fields.length; i++) {
+      const key = fields[i]?.key;
+      if (typeof key === 'string' && key.length > 0) {
+        map.set(key, i);
+      }
+    }
+    this._obsFieldIndexByKey = map;
+    return map;
   }
 
   /**
@@ -612,17 +675,16 @@ export class DataLayer {
   async ensureGeneExpressionLoaded(geneKey, options = {}) {
     const { silent = true } = options;
 
-    const variableInfo = this.getVariableInfo('gene_expression', geneKey);
-    if (!variableInfo) {
-      throw new Error(`[DataLayer] Gene not found: ${geneKey}`);
-    }
-
     const fields = this.state.varData?.fields;
     if (!fields) {
       throw new Error('[DataLayer] No var fields available (gene expression disabled)');
     }
 
-    const fieldIndex = variableInfo._fieldIndex;
+    const fieldIndex = this._getGeneFieldIndexMap().get(geneKey);
+    if (typeof fieldIndex !== 'number') {
+      throw new Error(`[DataLayer] Gene not found: ${geneKey}`);
+    }
+
     const field = fields[fieldIndex];
     if (!field) {
       throw new Error(`[DataLayer] Var field not found for gene: ${geneKey}`);
@@ -643,11 +705,53 @@ export class DataLayer {
    * @returns {boolean} True if unloaded
    */
   unloadGeneExpression(geneKey, options = {}) {
-    const variableInfo = this.getVariableInfo('gene_expression', geneKey);
-    if (!variableInfo) return false;
-    const fieldIndex = variableInfo._fieldIndex;
+    const fieldIndex = this._getGeneFieldIndexMap().get(geneKey);
+    if (typeof fieldIndex !== 'number') return false;
     if (typeof this.state.unloadVarField !== 'function') return false;
     return this.state.unloadVarField(fieldIndex, options);
+  }
+
+  /**
+   * Ensure an observation field is loaded and return its data.
+   * For categorical fields, returns codes and categories arrays.
+   * For continuous fields, returns values array.
+   *
+   * @param {string} obsKey - Observation field key (e.g., 'cell_type')
+   * @param {Object} [options]
+   * @param {boolean} [options.silent=true] - Suppress notifications
+   * @returns {Promise<{ fieldIndex: number, kind: string, codes?: Uint16Array, categories?: string[], values?: Float32Array, colors?: Object }>}
+   */
+  async ensureObsFieldLoaded(obsKey, options = {}) {
+    const { silent = true } = options;
+
+    const obsData = this.state.obsData;
+    if (!obsData || !obsData.fields) {
+      throw new Error(`[DataLayer] No observation data available`);
+    }
+
+    const fieldIndex = this._getObsFieldIndexMap().get(obsKey);
+    if (typeof fieldIndex !== 'number') {
+      throw new Error(`[DataLayer] Observation field not found: ${obsKey}`);
+    }
+
+    const field = obsData.fields[fieldIndex];
+    await this._ensureFieldLoaded(field, fieldIndex, 'obs', { silent });
+
+    if (field.kind === 'category') {
+      return {
+        fieldIndex,
+        kind: 'category',
+        codes: field.codes,
+        categories: field.categories || [],
+        colors: field.colors || {}
+      };
+    } else {
+      return {
+        fieldIndex,
+        kind: 'continuous',
+        values: field.values
+      };
+    }
   }
 
   /**
@@ -1631,16 +1735,13 @@ export class DataLayer {
       genes,
       includeLatent = false,
       latentDimension = 2,
-      usePoolMode = true, // kept for backward compatibility, ComputeManager handles this automatically
       onProgress
     } = options;
 
     const startTime = performance.now();
 
     // Initialize compute manager (handles GPU -> Worker -> CPU fallback automatically)
-    if (usePoolMode) {
-      await this._getComputeManager();
-    }
+    await this._getComputeManager();
 
     const result = {
       genes: {},

@@ -16,7 +16,6 @@ import { BaseAnalysisUI } from '../base-analysis-ui.js';
 // Import PlotRegistry from canonical shared directory
 import { PlotRegistry } from '../../shared/plot-registry-utils.js';
 import {
-  createPageSelector,
   createPlotTypeSelector,
   createAnalysisModal,
   openModal,
@@ -26,6 +25,7 @@ import {
   createExpandButton
 } from '../components/index.js';
 import { createVariableSelectorComponent } from '../shared/variable-selector.js';
+import { PageSelectorComponent } from '../shared/page-selector.js';
 import { loadPlotly, purgePlot } from '../../plots/plotly-loader.js';
 import { createLayoutEngine } from '../../plots/layout-engine.js';
 
@@ -61,11 +61,9 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
 
     // UI element references (detailed-specific)
     this._variableSelector = null;
+    this._pageSelector = null;
     this._pageSelectContainer = null;
     this._plotTypeContainer = null;
-
-    // Derived page color overrides (base page colors come from DataState.page.color)
-    this._customPageColors = new Map();
 
     // Session-only saved options per plot type
     this._savedPlotOptions = new Map();
@@ -75,8 +73,6 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
 
     // Bind methods
     this._handleVariableChange = this._handleVariableChange.bind(this);
-    this._handlePageChange = this._handlePageChange.bind(this);
-    this._handlePageColorChange = this._handlePageColorChange.bind(this);
     this._handlePlotTypeChange = this._handlePlotTypeChange.bind(this);
     this._handlePlotOptionChange = this._handlePlotOptionChange.bind(this);
     this._openExpandedView = this._openExpandedView.bind(this);
@@ -205,27 +201,30 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
   }
 
   /**
-   * Render page selector
+   * Render page selector using shared PageSelectorComponent
    */
   _renderPageSelector(pages) {
-    // Keep base page colors in sync with global highlight page colors.
-    (pages || []).forEach((p) => {
-      if (!p?.id) return;
-      const color = this.dataLayer?.getPageColor?.(p.id) || p.color || null;
-      if (color) this._customPageColors.set(p.id, color);
-    });
+    // Create container for the component
+    this._pageSelectContainer = document.createElement('div');
+    this._controlsContainer.appendChild(this._pageSelectContainer);
 
-    const pageSelect = createPageSelector({
-      pages: pages,
-      selectedIds: this._selectedPages,
-      onChange: this._handlePageChange,
+    // Destroy previous instance if exists
+    this._pageSelector?.destroy();
+
+    // Create PageSelectorComponent
+    this._pageSelector = new PageSelectorComponent({
+      dataLayer: this.dataLayer,
+      container: this._pageSelectContainer,
+      onSelectionChange: this._handlePageChange,
       onColorChange: this._handlePageColorChange,
-      customColors: this._customPageColors,
+      showColorPicker: true,
+      showCellCounts: true,
+      showSelectAll: true,
+      initialSelection: this._selectedPages,
       includeDerivedPages: true,
-      getCellCountForPageId: (pageId) => this.dataLayer.getCellCountForPageId(pageId)
+      getCellCountForPageId: (pageId) => this.dataLayer.getCellCountForPageId(pageId),
+      label: 'Compare pages:'
     });
-    this._controlsContainer.appendChild(pageSelect);
-    this._pageSelectContainer = pageSelect;
   }
 
   /**
@@ -303,7 +302,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     // don't re-render - let the selector handle its own state
   }
 
-  _handlePageChange(pageIds) {
+  _handlePageChange = (pageIds) => {
     this._selectedPages = pageIds || [];
     this._currentConfig.pages = this._selectedPages;
     this._scheduleUpdate();
@@ -311,17 +310,13 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     if (this.onConfigChange) {
       this.onConfigChange(this._currentConfig);
     }
-  }
+  };
 
-  _handlePageColorChange(pageId, color) {
-    // Base highlight pages: persist to DataState so the entire app stays in sync.
-    const applied = this.dataLayer?.setPageColor?.(pageId, color);
-    // Derived pages (e.g., rest-of) don't exist in DataState, but we still allow local overrides.
-    if (applied || applied === false) {
-      this._customPageColors.set(pageId, color);
-    }
+  _handlePageColorChange = (pageId, color) => {
+    // Persist color to DataState for base pages; component handles derived colors internally
+    this.dataLayer?.setPageColor?.(pageId, color);
     this._scheduleUpdate();
-  }
+  };
 
   _handlePlotTypeChange(plotTypeId) {
     this._currentConfig.plotType = plotTypeId;
@@ -408,14 +403,15 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
 
       this._currentPageData = pageData;
 
-      // Create layout engine
+      // Create layout engine with custom colors from page selector
+      const customColors = this._pageSelector?.getCustomColors() || new Map();
       this._layoutEngine = createLayoutEngine({
         pageCount: pageData.length,
         pageIds: pageData.map(pd => pd.pageId),
         pageNames: pageData.map(pd => pd.pageName),
         syncXAxis: true,
         syncYAxis: true,
-        customColors: this._customPageColors
+        customColors
       });
 
       // Get plot type
@@ -472,8 +468,8 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     const modalAfter = this._modal;
     if (!modalAfter) return;
 
-    if (modalAfter._footer) {
-      renderSummaryStats(modalAfter._footer, pageData, this._currentConfig.dataSource.variable);
+    if (modalAfter._statsContent) {
+      renderSummaryStats(modalAfter._statsContent, pageData, this._currentConfig.dataSource.variable);
     }
 
     if (modalAfter._annotationsContent) {
@@ -548,9 +544,9 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
           this._layoutEngine
         );
 
-        if (this._modal._footer) {
+        if (this._modal._statsContent) {
           renderSummaryStats(
-            this._modal._footer,
+            this._modal._statsContent,
             this._currentPageData,
             this._currentConfig.dataSource.variable
           );
@@ -641,7 +637,15 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
   // ===========================================================================
 
   // _cleanupPreviousAnalysis(), onPagesChanged(), onHighlightChanged(),
-  // _updatePageSelectorCounts(), getConfig(), setConfig() - inherited from BaseAnalysisUI
+  // getConfig(), setConfig() - inherited from BaseAnalysisUI
+
+  /**
+   * Override to use PageSelectorComponent's updateCounts method
+   * @override
+   */
+  _updatePageSelectorCounts() {
+    this._pageSelector?.updateCounts();
+  }
 
   /**
    * Destroy and cleanup
@@ -653,9 +657,13 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     this._variableSelector?.destroy?.();
     this._variableSelector = null;
 
+    // Clean up page selector
+    this._pageSelector?.destroy();
+    this._pageSelector = null;
+    this._pageSelectContainer = null;
+
     // Clean up detailed-specific state
     this._savedPlotOptions.clear();
-    this._customPageColors.clear();
     this._layoutEngine = null;
 
     // Call parent destroy

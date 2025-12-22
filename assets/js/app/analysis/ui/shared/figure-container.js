@@ -296,9 +296,9 @@ export class FigureContainer {
     await this._renderModalPlot();
 
     // Render statistics
-    if (this.showStats && this._modal._footer) {
+    if (this.showStats && this._modal._statsContent) {
       renderSummaryStats(
-        this._modal._footer,
+        this._modal._statsContent,
         this._currentPageData,
         this._currentPageData[0]?.variableInfo?.name || 'Variable'
       );
@@ -354,9 +354,9 @@ export class FigureContainer {
     purgePlot(this._modal._plotContainer);
     await plotType.render(pageData, options, this._modal._plotContainer, this._layoutEngine);
 
-    if (this._modal._footer) {
+    if (this._modal._statsContent) {
       renderSummaryStats(
-        this._modal._footer,
+        this._modal._statsContent,
         pageData,
         pageData[0]?.variableInfo?.name || 'Variable'
       );

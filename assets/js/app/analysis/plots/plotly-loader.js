@@ -5,10 +5,9 @@
  * The library is only loaded when the Page Analysis module is first used.
  *
  * GPU RENDERING POLICY:
- * - WebGL2 is REQUIRED for all figure rendering
- * - NO FALLBACKS - users must have WebGL2 support
- * - All scatter plots use 'scattergl' (GPU-accelerated)
- * - All heatmaps use 'heatmapgl' (GPU-accelerated)
+ * - Prefer WebGL2 when available (scattergl/heatmapgl) for performance
+ * - Fall back to non-WebGL traces (scatter/heatmap) when WebGL2 is unavailable
+ * - Rendering must remain functional across browsers/devices
  *
  * Also provides hint management integration - see plotly-hints.js
  */
@@ -18,13 +17,13 @@
 // =============================================================================
 
 /**
- * @typedef {'scattergl'|'scatter3d'|'heatmapgl'|'histogram'|'box'|'violin'|'bar'|'pie'} GPUTraceType
- * GPU-accelerated Plotly trace types
+ * @typedef {'scattergl'|'scatter'|'scatter3d'|'heatmapgl'|'heatmap'|'histogram'|'box'|'violin'|'bar'|'pie'} TraceType
+ * Plotly trace types used by the analysis module.
  */
 
 /**
  * @typedef {Object} PlotlyTrace
- * @property {GPUTraceType} type - Trace type (always GPU-accelerated)
+ * @property {TraceType} type - Trace type
  * @property {string} [name] - Trace name for legend
  * @property {number[]} [x] - X values
  * @property {number[]} [y] - Y values
@@ -121,17 +120,25 @@ export const GPU_TRACE_TYPES = {
 };
 
 /**
- * Verify WebGL2 support - throws error if not available
- * WebGL2 is REQUIRED, there are NO FALLBACKS
+ * Verify WebGL2 support.
+ *
+ * Note: Plot rendering has non-WebGL fallbacks, but some compute backends
+ * (GPUCompute) may still require WebGL2. This helper is kept for those cases.
+ *
  * @throws {Error} If WebGL2 is not supported
  */
 export function requireWebGL2() {
-  if (_webgl2Verified) {
-    if (!_webgl2Available) {
-      throw new Error('WebGL2 is required for figure rendering. Please use a browser with WebGL2 support.');
-    }
-    return;
+  if (!isWebGL2Available()) {
+    throw new Error('WebGL2 is required for GPU acceleration.');
   }
+}
+
+/**
+ * Check if WebGL2 is available (does not throw)
+ * @returns {boolean}
+ */
+export function isWebGL2Available() {
+  if (_webgl2Verified) return _webgl2Available;
 
   _webgl2Verified = true;
 
@@ -141,7 +148,7 @@ export function requireWebGL2() {
 
     if (!gl) {
       _webgl2Available = false;
-      throw new Error('WebGL2 is required for figure rendering. Please use a browser with WebGL2 support.');
+      return false;
     }
 
     _webgl2Available = true;
@@ -149,56 +156,42 @@ export function requireWebGL2() {
     // Clean up context
     const ext = gl.getExtension('WEBGL_lose_context');
     if (ext) ext.loseContext();
-
-    console.log('[PlotlyLoader] WebGL2 verified - GPU acceleration enabled');
-  } catch (e) {
+  } catch (_err) {
     _webgl2Available = false;
-    throw new Error('WebGL2 is required for figure rendering. Please use a browser with WebGL2 support.');
   }
-}
 
-/**
- * Check if WebGL2 is available (does not throw)
- * @returns {boolean}
- */
-export function isWebGL2Available() {
-  if (!_webgl2Verified) {
-    try {
-      requireWebGL2();
-    } catch (e) {
-      return false;
-    }
-  }
   return _webgl2Available;
 }
 
 /**
- * Get the GPU-accelerated scatter trace type
- * ALWAYS returns 'scattergl' - no fallbacks
- * @returns {'scattergl'}
+ * Get the preferred scatter trace type.
+ * @returns {'scattergl'|'scatter'}
  */
 export function getScatterTraceType() {
-  requireWebGL2();
-  return 'scattergl';
+  return isWebGL2Available() ? 'scattergl' : 'scatter';
 }
 
 /**
- * Get the GPU-accelerated heatmap trace type
- * ALWAYS returns 'heatmapgl' - no fallbacks
- * @returns {'heatmapgl'}
+ * Get the preferred heatmap trace type.
+ * @returns {'heatmapgl'|'heatmap'}
  */
 export function getHeatmapTraceType() {
-  requireWebGL2();
-  return 'heatmapgl';
+  return isWebGL2Available() ? 'heatmapgl' : 'heatmap';
 }
 
 /**
- * Get the GPU-accelerated trace type for any base type
+ * Get the preferred trace type for any base type.
  * @param {string} baseType - Base trace type (scatter, heatmap, etc.)
  * @returns {string} GPU-accelerated trace type
  */
 export function getGPUTraceType(baseType) {
-  requireWebGL2();
+  if (baseType === 'scatter') return getScatterTraceType();
+  if (baseType === 'heatmap') return getHeatmapTraceType();
+
+  if ((baseType === 'scattergl' || baseType === 'heatmapgl') && !isWebGL2Available()) {
+    return baseType === 'scattergl' ? 'scatter' : 'heatmap';
+  }
+
   return GPU_TRACE_TYPES[baseType] || baseType;
 }
 
@@ -499,7 +492,7 @@ export default {
   attachPlotlyHints,
   detachPlotlyHints,
   hidePlotlyNativeHints,
-  // WebGL2 / GPU acceleration (REQUIRED - no fallbacks)
+  // WebGL2 / GPU acceleration helpers
   requireWebGL2,
   isWebGL2Available,
   getScatterTraceType,

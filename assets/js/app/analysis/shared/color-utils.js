@@ -68,10 +68,42 @@ export function deriveRestOfColor(baseHex, options = {}) {
   return mixHex(baseHex, '#ffffff', mix);
 }
 
+/**
+ * Default qualitative color palette for categorical data.
+ * Based on D3's category10/category20 for good visual distinction.
+ */
+export const CATEGORY_PALETTE = [
+  '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+  '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
+  '#aec7e8', '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5'
+];
+
+/**
+ * Generate a color map for categorical values.
+ * Assigns consistent colors from a qualitative palette.
+ *
+ * @param {string[]} categories - Array of category names
+ * @param {Object} [options]
+ * @param {string[]} [options.palette] - Custom color palette (defaults to CATEGORY_PALETTE)
+ * @returns {Map<string, string>} Map of category name to hex color
+ */
+export function generateCategoryColors(categories, options = {}) {
+  const { palette = CATEGORY_PALETTE } = options;
+  const colorMap = new Map();
+
+  categories.forEach((cat, idx) => {
+    colorMap.set(cat, palette[idx % palette.length]);
+  });
+
+  return colorMap;
+}
+
 export default {
   parseHexColor,
   rgbToHex,
   mixHex,
-  deriveRestOfColor
+  deriveRestOfColor,
+  CATEGORY_PALETTE,
+  generateCategoryColors
 };
 

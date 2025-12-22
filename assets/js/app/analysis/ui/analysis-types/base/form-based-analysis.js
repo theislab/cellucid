@@ -362,8 +362,8 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     }
 
     // Render summary stats (bottom left)
-    if (this._modal._footer) {
-      this._renderModalStats(this._modal._footer);
+    if (this._modal._statsContent) {
+      this._renderModalStats(this._modal._statsContent);
     }
 
     // Render statistical annotations (bottom right)
@@ -485,8 +485,8 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
         console.error(`[${this.constructor.name}] Modal plot re-render failed:`, err);
       }
 
-      if (this._modal?._footer) {
-        this._renderModalStats(this._modal._footer);
+      if (this._modal?._statsContent) {
+        this._renderModalStats(this._modal._statsContent);
       }
       if (this._modal?._annotationsContent) {
         this._renderModalAnnotations(this._modal._annotationsContent);

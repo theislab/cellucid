@@ -52,7 +52,8 @@ export function buildAxesModel(bounds, targetTicks = 5) {
  * @param {string} [options.xLabel]
  * @param {string} [options.yLabel]
  * @param {string} [options.fontFamily]
- * @param {number} [options.fontSize]
+ * @param {number} [options.tickFontSize]
+ * @param {number} [options.labelFontSize]
  * @param {string} [options.color]
  */
 export function renderSvgAxes({
@@ -61,13 +62,16 @@ export function renderSvgAxes({
   xLabel = 'X',
   yLabel = 'Y',
   fontFamily = 'Arial, Helvetica, sans-serif',
-  fontSize = 12,
+  tickFontSize = null,
+  labelFontSize = null,
   color = '#111'
 }) {
+  const tickSize = Math.max(6, Math.round(Number(tickFontSize) || 12));
+  const labelSize = Number.isFinite(labelFontSize) ? Math.max(6, Math.round(labelFontSize)) : tickSize;
   const model = buildAxesModel(bounds, 5);
   const axisColor = color;
   const tickLen = 5;
-  const labelOffset = 12;
+  const labelOffset = Math.max(12, Math.round(labelSize * 1.15));
   const tickTextOffset = 8;
 
   const x0 = plotRect.x;
@@ -76,7 +80,7 @@ export function renderSvgAxes({
   const y1 = plotRect.y + plotRect.height;
 
   const parts = [];
-  parts.push(`<g font-family="${fontFamily}" font-size="${fontSize}" fill="${axisColor}" stroke="${axisColor}" stroke-width="1">`);
+  parts.push(`<g font-family="${fontFamily}" font-size="${tickSize}" fill="${axisColor}" stroke="${axisColor}" stroke-width="1">`);
 
   // Axis lines (bottom + left).
   parts.push(`<line x1="${x0}" y1="${y1}" x2="${x1}" y2="${y1}"/>`);
@@ -104,10 +108,10 @@ export function renderSvgAxes({
 
   // Axis labels.
   parts.push(
-    `<text x="${(x0 + x1) / 2}" y="${y1 + tickLen + tickTextOffset + labelOffset}" text-anchor="middle" stroke="none">${escapeHtml(String(xLabel || ''))}</text>`
+    `<text x="${(x0 + x1) / 2}" y="${y1 + tickLen + tickTextOffset + labelOffset}" text-anchor="middle" stroke="none" font-size="${labelSize}">${escapeHtml(String(xLabel || ''))}</text>`
   );
   parts.push(
-    `<text x="${x0 - tickLen - tickTextOffset - labelOffset}" y="${(y0 + y1) / 2}" text-anchor="middle" stroke="none" transform="rotate(-90 ${x0 - tickLen - tickTextOffset - labelOffset} ${(y0 + y1) / 2})">${escapeHtml(String(yLabel || ''))}</text>`
+    `<text x="${x0 - tickLen - tickTextOffset - labelOffset}" y="${(y0 + y1) / 2}" text-anchor="middle" stroke="none" font-size="${labelSize}" transform="rotate(-90 ${x0 - tickLen - tickTextOffset - labelOffset} ${(y0 + y1) / 2})">${escapeHtml(String(yLabel || ''))}</text>`
   );
 
   parts.push(`</g>`);
@@ -124,7 +128,8 @@ export function renderSvgAxes({
  * @param {string} [options.xLabel]
  * @param {string} [options.yLabel]
  * @param {string} [options.fontFamily]
- * @param {number} [options.fontSize]
+ * @param {number} [options.tickFontSize]
+ * @param {number} [options.labelFontSize]
  * @param {string} [options.color]
  */
 export function drawCanvasAxes({
@@ -134,12 +139,15 @@ export function drawCanvasAxes({
   xLabel = 'X',
   yLabel = 'Y',
   fontFamily = 'Arial, Helvetica, sans-serif',
-  fontSize = 12,
+  tickFontSize = null,
+  labelFontSize = null,
   color = '#111'
 }) {
+  const tickSize = Math.max(6, Math.round(Number(tickFontSize) || 12));
+  const labelSize = Number.isFinite(labelFontSize) ? Math.max(6, Math.round(labelFontSize)) : tickSize;
   const model = buildAxesModel(bounds, 5);
   const tickLen = 5;
-  const labelOffset = 12;
+  const labelOffset = Math.max(12, Math.round(labelSize * 1.15));
   const tickTextOffset = 8;
 
   const x0 = plotRect.x;
@@ -151,7 +159,7 @@ export function drawCanvasAxes({
   ctx.strokeStyle = color;
   ctx.fillStyle = color;
   ctx.lineWidth = 1;
-  ctx.font = `${fontSize}px ${fontFamily}`;
+  ctx.font = `${tickSize}px ${fontFamily}`;
   ctx.textBaseline = 'alphabetic';
 
   // Axis lines.
@@ -189,6 +197,7 @@ export function drawCanvasAxes({
   }
 
   // Axis labels.
+  ctx.font = `${labelSize}px ${fontFamily}`;
   ctx.textAlign = 'center';
   ctx.fillText(xLabel, (x0 + x1) / 2, y1 + tickLen + tickTextOffset + labelOffset);
 

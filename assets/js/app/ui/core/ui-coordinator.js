@@ -68,7 +68,7 @@ export function initUI({
     }
   });
 
-  const legend = initLegendRenderer({ state, dom: dom.display });
+  const legend = initLegendRenderer({ state, viewer, dom: dom.display });
   const filterControls = initFilterControls({
     state,
     viewer,
@@ -143,7 +143,7 @@ export function initUI({
     const info = fieldInfo || buildStatsInfoFromState();
     statsDisplay.updateStats?.(info);
     legend.render?.(info.field);
-    legend.handleOutlierUI?.();
+    legend.handleOutlierUI?.(info.field);
     highlightControls.updateHighlightMode?.();
   }
 
@@ -164,7 +164,7 @@ export function initUI({
       onActiveViewChanged: (viewId) => {
         fieldSelector.syncFromState?.();
         legend.render?.(state.getActiveField());
-        legend.handleOutlierUI?.();
+        legend.handleOutlierUI?.(state.getActiveField());
         highlightControls.updateHighlightMode?.();
         filterControls.render?.();
         highlightControls.renderHighlightSummary?.();
@@ -187,7 +187,7 @@ export function initUI({
     fieldSelector.syncFromState?.();
 
     legend.render?.(state.getActiveField());
-    legend.handleOutlierUI?.();
+    legend.handleOutlierUI?.(state.getActiveField());
     filterControls.render?.();
     highlightControls.renderHighlightPages?.();
     highlightControls.renderHighlightSummary?.();
@@ -218,7 +218,7 @@ export function initUI({
       refreshUIForActiveView: () => {
         fieldSelector.syncFromState?.();
         legend.render?.(state.getActiveField());
-        legend.handleOutlierUI?.();
+        legend.handleOutlierUI?.(state.getActiveField());
         highlightControls.updateHighlightMode?.();
         filterControls.render?.();
         highlightControls.renderHighlightSummary?.();
@@ -256,7 +256,7 @@ export function initUI({
     fieldSelector.initGeneExpressionDropdown?.();
     fieldSelector.syncFromState?.();
     legend.render?.(state.getActiveField());
-    legend.handleOutlierUI?.();
+    legend.handleOutlierUI?.(state.getActiveField());
     highlightControls.updateHighlightMode?.();
     handleVisibilityChange();
   });

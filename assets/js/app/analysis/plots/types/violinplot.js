@@ -12,7 +12,7 @@ const violinplotDefinition = {
   id: 'violinplot',
   name: 'Violin Plot',
   description: 'Compare value distributions with density visualization',
-  supportedDataTypes: ['continuous'],
+  supportedTypes: ['continuous'],
   supportedLayouts: ['side-by-side', 'grouped', 'overlay'],
 
   defaultOptions: {

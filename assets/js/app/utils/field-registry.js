@@ -81,9 +81,26 @@ class FieldRegistry {
 
   getDeletedFields(source) {
     const fields = source === FieldSource.VAR ? this._state?.varData?.fields : this._state?.obsData?.fields;
-    return (fields || [])
+    const result = (fields || [])
       .map((field, index) => ({ field, index }))
       .filter(({ field }) => field && field._isDeleted === true && field._isPurged !== true);
+
+    // Also check user-defined registry for deleted templates not yet in fields array
+    const userDefinedRegistry = this._state?._userDefinedFields;
+    if (userDefinedRegistry?.getAllFieldsForSource) {
+      const existingIds = new Set(result.map(({ field }) => field._userDefinedId).filter(Boolean));
+      const templates = userDefinedRegistry.getAllFieldsForSource(source);
+      for (const template of templates) {
+        if (!template || !template._userDefinedId) continue;
+        if (existingIds.has(template._userDefinedId)) continue;
+        if (template._isDeleted === true && template._isPurged !== true) {
+          // Add template as a "virtual" deleted field with index -1
+          result.push({ field: template, index: -1 });
+        }
+      }
+    }
+
+    return result;
   }
 
   getCategoricalFields(source) {

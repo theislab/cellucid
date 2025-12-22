@@ -152,6 +152,7 @@ function boundsToSphere(bounds) {
  * @param {Float32Array} options.positions
  * @param {Uint8Array} options.colors
  * @param {Float32Array|null} options.transparency
+ * @param {Float32Array|Uint8Array|null} [options.visibilityMask]
  * @param {Uint8Array|Float32Array|null} options.highlightArray
  * @param {boolean} options.emphasizeSelection
  * @param {number} options.selectionMutedOpacity
@@ -162,6 +163,7 @@ function packBuffers({
   positions,
   colors,
   transparency,
+  visibilityMask,
   highlightArray,
   emphasizeSelection,
   selectionMutedOpacity,
@@ -195,6 +197,10 @@ function packBuffers({
     const baseAlpha = transparency ? (transparency[i] ?? 1.0) : (colors[ci + 3] / 255);
     let a = Math.max(0, Math.min(1, baseAlpha));
 
+    if (visibilityMask && (visibilityMask[i] ?? 0) <= 0) {
+      a = 0;
+    }
+
     if (emphasizeSelection && highlightArray && (highlightArray[i] ?? 0) <= 0) {
       r = 160;
       g = 160;
@@ -226,10 +232,12 @@ function packBuffers({
  * @param {Float32Array|null} options.positions
  * @param {Uint8Array|null} options.colors
  * @param {Float32Array|null} [options.transparency]
+ * @param {Float32Array|Uint8Array|null} [options.visibilityMask]
  * @param {RenderStateForWebgl|null} options.renderState
  * @param {number} options.outputWidthPx - target canvas width (pixels)
  * @param {number} options.outputHeightPx - target canvas height (pixels)
  * @param {number} options.pointSizePx - diameter in output pixels
+ * @param {{ positions: Float32Array|null; colors: Uint8Array|null; transparency?: Float32Array|null; visibilityMask?: Float32Array|Uint8Array|null; pointSizePx: number; alphaThreshold?: number } | null} [options.overlayPoints]
  * @param {Uint8Array|Float32Array|null} [options.highlightArray]
  * @param {boolean} [options.emphasizeSelection=false]
  * @param {number} [options.selectionMutedOpacity=0.15]
@@ -240,10 +248,12 @@ export function rasterizePointsWebgl({
   positions,
   colors,
   transparency = null,
+  visibilityMask = null,
   renderState,
   outputWidthPx,
   outputHeightPx,
   pointSizePx,
+  overlayPoints = null,
   highlightArray = null,
   emphasizeSelection = false,
   selectionMutedOpacity = 0.15,
@@ -286,6 +296,7 @@ export function rasterizePointsWebgl({
     positions,
     colors,
     transparency,
+    visibilityMask,
     highlightArray,
     emphasizeSelection,
     selectionMutedOpacity,
@@ -299,7 +310,6 @@ export function rasterizePointsWebgl({
   /** @type {OffscreenCanvas|HTMLCanvasElement|null} */
   let canvas = createRasterCanvas(outW, outH);
   if (!canvas) {
-    console.debug('[FigureExport] WebGL rasterizer: failed to create canvas');
     return null;
   }
 
@@ -321,7 +331,6 @@ export function rasterizePointsWebgl({
     }
   }
   if (!gl) {
-    console.debug('[FigureExport] WebGL rasterizer: failed to get WebGL2 context');
     return null;
   }
 
@@ -333,6 +342,10 @@ export function rasterizePointsWebgl({
   let positionBuffer = null;
   /** @type {WebGLBuffer|null} */
   let colorBuffer = null;
+  /** @type {WebGLBuffer|null} */
+  let overlayPosBuffer = null;
+  /** @type {WebGLBuffer|null} */
+  let overlayColorBuffer = null;
   /** @type {WebGLTexture|null} */
   let dummyAlphaTex = null;
   /** @type {WebGLTexture|null} */
@@ -400,7 +413,13 @@ export function rasterizePointsWebgl({
 
     setF1(u('u_pointSize'), pointSize);
     setF1(u('u_sizeAttenuation'), sizeAttenuation);
-    setF1(u('u_viewportHeight'), vpH);
+    // IMPORTANT: Keep u_viewportHeight in the SOURCE viewport pixel units.
+    //
+    // We letterbox the source viewport into a differently-sized export canvas by
+    // changing gl.viewport(). To produce a *scaled copy* of what the user sees
+    // (WYSIWYG), we scale u_pointSize at the callsite and keep u_viewportHeight
+    // consistent with the interactive viewer's original projection factor.
+    setF1(u('u_viewportHeight'), srcViewportH);
     setF1(u('u_fov'), fov);
 
     // Disable alpha texture paths for export; alpha is baked into vertex colors.
@@ -415,20 +434,31 @@ export function rasterizePointsWebgl({
     setI1(u('u_lodIndexTexWidth'), 0);
     setF1(u('u_invLodIndexTexWidth'), 0);
 
-    // Create and bind dummy textures to separate texture units to prevent type conflicts
-    // Unit 0: dummy float texture for u_alphaTex (sampler2D)
+    // Create and bind dummy textures to separate texture units to prevent type conflicts.
+    // IMPORTANT: Configure filters/wraps so textures are "complete" (no mipmaps required),
+    // otherwise some browsers will fail the draw even if the texture path is disabled.
+    //
+    // Unit 0: dummy normalized texture for u_alphaTex (sampler2D)
     dummyAlphaTex = gl.createTexture();
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, dummyAlphaTex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, 1, 1, 0, gl.RED, gl.FLOAT, new Float32Array([1.0]));
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([255, 255, 255, 255]));
     const alphaTexLoc = u('u_alphaTex');
     if (alphaTexLoc) gl.uniform1i(alphaTexLoc, 0);
 
-    // Unit 1: dummy uint texture for u_lodIndexTex (usampler2D)
+    // Unit 1: dummy integer texture for u_lodIndexTex (usampler2D)
     dummyLodIndexTex = gl.createTexture();
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, dummyLodIndexTex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32UI, 1, 1, 0, gl.RED_INTEGER, gl.UNSIGNED_INT, new Uint32Array([0]));
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8UI, 1, 1, 0, gl.RED_INTEGER, gl.UNSIGNED_BYTE, new Uint8Array([0]));
     const lodIndexTexLoc = u('u_lodIndexTex');
     if (lodIndexTexLoc) gl.uniform1i(lodIndexTexLoc, 1);
 
@@ -451,6 +481,43 @@ export function rasterizePointsWebgl({
     }
 
     gl.drawArrays(gl.POINTS, 0, packed.count);
+
+    // Optional overlay pass (e.g., centroid points rendered larger on top).
+    if (overlayPoints?.positions && overlayPoints?.colors) {
+      const overlayPacked = packBuffers({
+        positions: overlayPoints.positions,
+        colors: overlayPoints.colors,
+        transparency: overlayPoints.transparency ?? null,
+        visibilityMask: overlayPoints.visibilityMask ?? null,
+        highlightArray: null,
+        emphasizeSelection: false,
+        selectionMutedOpacity: 1.0,
+        alphaThreshold: overlayPoints.alphaThreshold ?? DEFAULT_ALPHA_THRESHOLD,
+      });
+      if (overlayPacked.count > 0) {
+        overlayPosBuffer = gl.createBuffer();
+        overlayColorBuffer = gl.createBuffer();
+        if (overlayPosBuffer && overlayColorBuffer) {
+          const overlayPositions = overlayPacked.positions.subarray(0, overlayPacked.count * 3);
+          gl.bindBuffer(gl.ARRAY_BUFFER, overlayPosBuffer);
+          gl.bufferData(gl.ARRAY_BUFFER, overlayPositions, gl.STATIC_DRAW);
+          gl.enableVertexAttribArray(0);
+          gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+
+          gl.bindBuffer(gl.ARRAY_BUFFER, overlayColorBuffer);
+          gl.bufferData(gl.ARRAY_BUFFER, overlayPacked.colors, gl.STATIC_DRAW);
+          gl.enableVertexAttribArray(1);
+          gl.vertexAttribPointer(1, 4, gl.UNSIGNED_BYTE, true, 0, 0);
+
+          const overlaySize = isFiniteNumber(overlayPoints.pointSizePx)
+            ? overlayPoints.pointSizePx
+            : pointSize;
+          setF1(u('u_pointSize'), overlaySize);
+          gl.drawArrays(gl.POINTS, 0, overlayPacked.count);
+        }
+      }
+    }
+
     gl.flush();
     return canvas;
   } catch (err) {
@@ -464,6 +531,12 @@ export function rasterizePointsWebgl({
     }
     if (colorBuffer) {
       try { gl.deleteBuffer(colorBuffer); } catch {}
+    }
+    if (overlayPosBuffer) {
+      try { gl.deleteBuffer(overlayPosBuffer); } catch {}
+    }
+    if (overlayColorBuffer) {
+      try { gl.deleteBuffer(overlayColorBuffer); } catch {}
     }
     if (dummyAlphaTex) {
       try { gl.deleteTexture(dummyAlphaTex); } catch {}

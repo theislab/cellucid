@@ -465,7 +465,7 @@ const volcanoPlotDefinition = {
   id: 'volcanoplot',
   name: 'Volcano Plot',
   description: 'Differential expression visualization showing fold change vs significance',
-  supportedDataTypes: ['differential'],
+  supportedTypes: ['differential'],
   supportedLayouts: ['single'],
 
   defaultOptions: {

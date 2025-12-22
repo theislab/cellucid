@@ -319,6 +319,8 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
   const connectivityLimitDisplay = document.getElementById('connectivity-limit-display');
   const connectivityInfo = document.getElementById('connectivity-info');
   let ui = null;
+  let currentDatasetLoadToken = null;
+  let buildDatasetAnalyticsContext = () => ({});
 
   try {
     debug.log('[Main] Creating viewer...');
@@ -344,7 +346,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     const dataSourceManager = getDataSourceManager();
     initAnalytics({ dataSourceManager });
 
-    const buildDatasetAnalyticsContext = (overrides = {}) => {
+    buildDatasetAnalyticsContext = (overrides = {}) => {
       const metadata = overrides.metadata ?? dataSourceManager.getCurrentMetadata?.();
       const datasetId = overrides.datasetId ?? dataSourceManager.getCurrentDatasetId?.();
       const datasetName = overrides.datasetName ?? metadata?.name;
@@ -364,8 +366,6 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       const method = methodOverride || dataSourceManager.getLastLoadMethod?.() || DATA_LOAD_METHODS.DEFAULT_DEMO;
       return beginDataLoad(method, buildDatasetAnalyticsContext(ctxOverrides));
     };
-
-    let currentDatasetLoadToken = null;
 
     const startPerfAnalytics = () => {
       initPerformanceAnalytics({
@@ -2305,7 +2305,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     viewer.start();
   } catch (err) {
     console.error(err);
-    statsEl.textContent = 'Error: ' + err.message;
+    if (statsEl) statsEl.textContent = 'Error: ' + err.message;
     if (currentDatasetLoadToken) {
       completeDataLoadFailure(currentDatasetLoadToken, {
         ...buildDatasetAnalyticsContext(),

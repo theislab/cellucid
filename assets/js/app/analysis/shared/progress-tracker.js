@@ -211,6 +211,43 @@ export class ProgressTracker {
   }
 
   /**
+   * Set the absolute completed item count.
+   * This is useful when progress is reported externally as (loaded/total).
+   *
+   * If the new value is lower than the current value, ETA is reset because the
+   * rolling window no longer reflects monotonic progress.
+   *
+   * @param {number} completed
+   * @returns {ProgressTracker} this
+   */
+  setCompletedItems(completed) {
+    if (this._completed || this._cancelled) return this;
+
+    const target = Math.max(0, Math.min(this.totalItems || 0, Math.floor(Number(completed) || 0)));
+    const delta = target - this._completedItems;
+
+    if (delta > 0) {
+      return this.itemComplete(delta);
+    }
+
+    if (delta < 0) {
+      this._completedItems = target;
+      this._completionTimes = [];
+      this._reportUpdate();
+    }
+
+    return this;
+  }
+
+  /**
+   * Get the raw completed item count.
+   * @returns {number}
+   */
+  getCompletedItems() {
+    return this._completedItems;
+  }
+
+  /**
    * Advance to the next phase
    * @param {string} [customMessage] - Optional message override for this phase
    * @returns {ProgressTracker} this (for chaining)
@@ -241,6 +278,46 @@ export class ProgressTracker {
   setMessage(message) {
     if (this._completed || this._cancelled) return this;
     this._reportUpdate(message);
+    return this;
+  }
+
+  /**
+   * Set the current phase by name.
+   *
+   * This is useful when progress is reported externally with explicit phase names
+   * (e.g., controller emits { phase: 'Clustering', ... }) instead of calling
+   * nextPhase() sequentially.
+   *
+   * If the provided phase name does not exist in `this.phases`, it is appended.
+   *
+   * @param {string} phaseName
+   * @param {string} [customMessage]
+   * @returns {ProgressTracker} this
+   */
+  setPhase(phaseName, customMessage) {
+    if (this._completed || this._cancelled) return this;
+    if (typeof phaseName !== 'string' || phaseName.trim().length === 0) return this;
+
+    const name = phaseName.trim();
+    let idx = this.phases.indexOf(name);
+    if (idx < 0) {
+      this.phases.push(name);
+      idx = this.phases.length - 1;
+    }
+
+    if (idx !== this._phaseIndex) {
+      this._phaseIndex = idx;
+      if (this.onPhaseChange) {
+        this.onPhaseChange({
+          phase: this.phases[this._phaseIndex] || 'Unknown',
+          phaseIndex: this._phaseIndex,
+          totalPhases: this.phases.length,
+          customMessage
+        });
+      }
+    }
+
+    this._reportUpdate(customMessage);
     return this;
   }
 
@@ -518,8 +595,7 @@ export function createSimpleProgress(options) {
     start: () => tracker.start(),
     increment: (count = 1) => tracker.itemComplete(count),
     setProgress: (completed) => {
-      const delta = completed - tracker._completedItems;
-      if (delta > 0) tracker.itemComplete(delta);
+      tracker.setCompletedItems(completed);
     },
     done: (message) => tracker.complete(message),
     fail: (error) => tracker.fail(error),

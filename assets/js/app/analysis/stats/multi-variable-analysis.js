@@ -61,7 +61,7 @@ export class MultiVariableAnalysis {
    */
   async correlationAnalysis(options) {
     const memScope = startMemoryTracking('Correlation', 'correlationAnalysis', { includeUserAgent: true });
-    const { varX, varY, pageIds, method = 'pearson' } = options;
+    const { varX, varY, pageIds, method = 'pearson', colorBy = null } = options;
 
     if (!varX || !varY || !pageIds || pageIds.length === 0) {
       memScope.end({ error: 'Invalid options' });
@@ -74,8 +74,8 @@ export class MultiVariableAnalysis {
     );
 
     try {
-      // Fetch data for both variables in parallel
-      const [dataX, dataY] = await Promise.all([
+      // Fetch data for variables in parallel (including colorBy if specified)
+      const fetchPromises = [
         this.dataLayer.getDataForPages({
           type: varX.type,
           variableKey: varX.key,
@@ -86,7 +86,20 @@ export class MultiVariableAnalysis {
           variableKey: varY.key,
           pageIds
         })
-      ]);
+      ];
+
+      // Fetch color variable if specified
+      if (colorBy?.key) {
+        fetchPromises.push(
+          this.dataLayer.getDataForPages({
+            type: colorBy.type || 'categorical_obs',
+            variableKey: colorBy.key,
+            pageIds
+          })
+        );
+      }
+
+      const [dataX, dataY, dataColor] = await Promise.all(fetchPromises);
 
       const results = [];
       const computeManager = await this._getComputeManager();
@@ -96,6 +109,7 @@ export class MultiVariableAnalysis {
       for (let i = 0; i < pageIds.length; i++) {
         const pageX = dataX.find(d => d.pageId === pageIds[i]);
         const pageY = dataY.find(d => d.pageId === pageIds[i]);
+        const pageColor = dataColor?.find(d => d.pageId === pageIds[i]);
 
         if (!pageX || !pageY) {
           results.push({
@@ -106,11 +120,11 @@ export class MultiVariableAnalysis {
           continue;
         }
 
-        // Align values by cell index
-        const { xAligned, yAligned, xPlot, yPlot, sampled } = this._alignValuesByIndex(
+        // Align values by cell index (including color if available)
+        const { xAligned, yAligned, colorAligned, xPlot, yPlot, colorPlot, sampled } = this._alignValuesByIndex(
           pageX.cellIndices, pageX.values,
           pageY.cellIndices, pageY.values,
-          { maxPlotPoints }
+          { maxPlotPoints, colorIndices: pageColor?.cellIndices, colorValues: pageColor?.values }
         );
 
         if (xAligned.length < 3) {
@@ -130,7 +144,7 @@ export class MultiVariableAnalysis {
           transfer: sampled
         });
 
-        results.push({
+        const result = {
           pageId: pageIds[i],
           pageName: pageX.pageName,
           ...correlation,
@@ -139,7 +153,15 @@ export class MultiVariableAnalysis {
           xVariable: varX.key,
           yVariable: varY.key,
           sampled
-        });
+        };
+
+        // Include color data if available
+        if (colorBy?.key && colorPlot) {
+          result.colorValues = colorPlot;
+          result.colorVariable = colorBy.key;
+        }
+
+        results.push(result);
       }
 
       this._notifications.complete(notificationId,
@@ -168,14 +190,25 @@ export class MultiVariableAnalysis {
    * @param {ArrayLike<number>} valuesA
    * @param {ArrayLike<number>} indicesB
    * @param {ArrayLike<number>} valuesB
-   * @param {{ maxPlotPoints?: number }} [options]
-   * @returns {{ xAligned: Float32Array, yAligned: Float32Array, xPlot: Float32Array, yPlot: Float32Array, sampled: boolean }}
+   * @param {{ maxPlotPoints?: number, colorIndices?: ArrayLike<number>, colorValues?: ArrayLike<string> }} [options]
+   * @returns {{ xAligned: Float32Array, yAligned: Float32Array, colorAligned?: string[], xPlot: Float32Array, yPlot: Float32Array, colorPlot?: string[], sampled: boolean }}
    * @private
    */
   _alignValuesByIndex(indicesA, valuesA, indicesB, valuesB, options = {}) {
     const maxPlotPoints = Number.isFinite(options.maxPlotPoints)
       ? Math.max(1, Math.floor(options.maxPlotPoints))
       : 50000;
+
+    const { colorIndices, colorValues } = options;
+    const hasColor = colorIndices && colorValues && colorIndices.length > 0;
+
+    // Build color lookup map if colorBy is provided
+    const colorMap = new Map();
+    if (hasColor) {
+      for (let c = 0; c < colorIndices.length; c++) {
+        colorMap.set(colorIndices[c], colorValues[c]);
+      }
+    }
 
     const lenA = indicesA?.length || 0;
     const lenB = indicesB?.length || 0;
@@ -206,6 +239,7 @@ export class MultiVariableAnalysis {
 
     const xAligned = new Float32Array(count);
     const yAligned = new Float32Array(count);
+    const colorAligned = hasColor ? new Array(count) : null;
 
     // Second pass: fill.
     i = 0;
@@ -222,6 +256,9 @@ export class MultiVariableAnalysis {
         if (isFiniteNumber(x) && isFiniteNumber(y)) {
           xAligned[k] = x;
           yAligned[k] = y;
+          if (hasColor) {
+            colorAligned[k] = colorMap.get(idxA) ?? null;
+          }
           k++;
         }
         i++;
@@ -235,7 +272,15 @@ export class MultiVariableAnalysis {
 
     const sampled = count > maxPlotPoints;
     if (!sampled) {
-      return { xAligned, yAligned, xPlot: xAligned, yPlot: yAligned, sampled: false };
+      return {
+        xAligned,
+        yAligned,
+        colorAligned,
+        xPlot: xAligned,
+        yPlot: yAligned,
+        colorPlot: colorAligned,
+        sampled: false
+      };
     }
 
     // Downsample for plotting (deterministic stride).
@@ -243,13 +288,17 @@ export class MultiVariableAnalysis {
     const plotCount = Math.min(maxPlotPoints, Math.ceil(count / step));
     const xPlot = new Float32Array(plotCount);
     const yPlot = new Float32Array(plotCount);
+    const colorPlot = hasColor ? new Array(plotCount) : null;
 
     for (let out = 0, idx = 0; out < plotCount && idx < count; out++, idx += step) {
       xPlot[out] = xAligned[idx];
       yPlot[out] = yAligned[idx];
+      if (hasColor) {
+        colorPlot[out] = colorAligned[idx];
+      }
     }
 
-    return { xAligned, yAligned, xPlot, yPlot, sampled: true };
+    return { xAligned, yAligned, colorAligned, xPlot, yPlot, colorPlot, sampled: true };
   }
 
   // =========================================================================

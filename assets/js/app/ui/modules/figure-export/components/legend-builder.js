@@ -4,6 +4,9 @@
  * The legend model is sourced from DataState.getLegendModel(field) to ensure
  * DRY, color-consistent behavior across the app.
  *
+ * Category legends are laid out in multiple columns as needed to show all
+ * entries (never “+N more” truncation).
+ *
  * @module ui/modules/figure-export/components/legend-builder
  */
 
@@ -37,6 +40,40 @@ function parseCssStop(stop) {
   return { color, offset };
 }
 
+function estimateTextWidthPxApprox(text, fontSizePx) {
+  // SVG has no cheap/portable text measurement; use a conservative average width.
+  return String(text ?? '').length * fontSizePx * 0.62;
+}
+
+function truncateTextApprox(text, maxWidthPx, fontSizePx) {
+  const s = String(text ?? '');
+  if (maxWidthPx <= 0) return '';
+  if (estimateTextWidthPxApprox(s, fontSizePx) <= maxWidthPx) return s;
+  const ell = '…';
+  const charW = Math.max(0.0001, fontSizePx * 0.62);
+  const maxChars = Math.max(0, Math.floor(maxWidthPx / charW) - 1);
+  if (maxChars <= 0) return ell;
+  return s.slice(0, maxChars) + ell;
+}
+
+function truncateCanvasTextToWidth(ctx, text, maxWidthPx) {
+  const s = String(text ?? '');
+  if (maxWidthPx <= 0) return '';
+  if (ctx.measureText(s).width <= maxWidthPx) return s;
+  const ell = '…';
+  if (ctx.measureText(ell).width > maxWidthPx) return '';
+
+  let lo = 0;
+  let hi = s.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    const cand = s.slice(0, mid) + ell;
+    if (ctx.measureText(cand).width <= maxWidthPx) lo = mid;
+    else hi = mid - 1;
+  }
+  return s.slice(0, lo) + ell;
+}
+
 /**
  * Render an SVG legend. Returns `{ svg, defs }` where defs may include gradients.
  *
@@ -46,7 +83,6 @@ function parseCssStop(stop) {
  * @param {any} options.model - legend model from DataState.getLegendModel
  * @param {string} [options.fontFamily]
  * @param {number} [options.fontSize]
- * @param {number} [options.maxItems]
  * @param {string} [options.idPrefix]
  */
 export function renderSvgLegend({
@@ -55,7 +91,6 @@ export function renderSvgLegend({
   model,
   fontFamily = 'Arial, Helvetica, sans-serif',
   fontSize = 12,
-  maxItems = 20,
   idPrefix = 'legend',
   backgroundFill = '#ffffff'
 }) {
@@ -84,21 +119,28 @@ export function renderSvgLegend({
   if (model.kind === 'category') {
     const categories = model.categories || [];
     const colors = model.colors || [];
-    const shown = Math.min(categories.length, maxItems);
     const swatch = 10;
+    const listTop = cursorY;
+    const listBottom = y + h - padding;
+    const availH = Math.max(1, listBottom - listTop);
+    const rowsPerCol = Math.max(1, Math.floor(availH / lineH));
+    const cols = Math.max(1, Math.ceil(categories.length / rowsPerCol));
+    const colW = Math.max(1, (w - padding * 2) / cols);
 
-    for (let i = 0; i < shown; i++) {
-      const label = String(categories[i] ?? '');
+    for (let i = 0; i < categories.length; i++) {
+      const col = Math.floor(i / rowsPerCol);
+      const row = i % rowsPerCol;
+      const itemX = x + padding + col * colW;
+      const itemY = listTop + row * lineH;
+
+      const labelX = itemX + swatch + 6;
+      const colRight = x + padding + (col + 1) * colW;
+      const maxLabelW = Math.max(0, colRight - labelX - 2);
+
+      const label = truncateTextApprox(String(categories[i] ?? ''), maxLabelW, fontSize);
       const colorCss = rgb01ToCss(colors[i]);
-      parts.push(`<rect x="${x + padding}" y="${cursorY}" width="${swatch}" height="${swatch}" fill="${colorCss}" stroke="#111" stroke-width="0.25"/>`);
-      parts.push(`<text x="${x + padding + swatch + 6}" y="${cursorY + swatch}" dominant-baseline="ideographic">${escapeHtml(label)}</text>`);
-      cursorY += lineH;
-      if (cursorY > y + h - padding) break;
-    }
-
-    const remaining = categories.length - shown;
-    if (remaining > 0 && cursorY <= y + h - padding) {
-      parts.push(`<text x="${x + padding}" y="${cursorY + swatch}" fill="#555" dominant-baseline="ideographic">…and ${remaining} more</text>`);
+      parts.push(`<rect x="${itemX}" y="${itemY}" width="${swatch}" height="${swatch}" fill="${colorCss}" stroke="#111" stroke-width="0.25"/>`);
+      parts.push(`<text x="${labelX}" y="${itemY + swatch}" dominant-baseline="ideographic">${escapeHtml(label)}</text>`);
     }
   } else if (model.kind === 'continuous') {
     const gradId = `${idPrefix}_grad`;
@@ -137,7 +179,6 @@ export function renderSvgLegend({
  * @param {any} options.model
  * @param {string} [options.fontFamily]
  * @param {number} [options.fontSize]
- * @param {number} [options.maxItems]
  */
 export function drawCanvasLegend({
   ctx,
@@ -146,7 +187,6 @@ export function drawCanvasLegend({
   model,
   fontFamily = 'Arial, Helvetica, sans-serif',
   fontSize = 12,
-  maxItems = 20,
   backgroundFill = '#ffffff'
 }) {
   if (!ctx || !legendRect || !model) return;
@@ -181,27 +221,40 @@ export function drawCanvasLegend({
   if (model.kind === 'category') {
     const categories = model.categories || [];
     const colors = model.colors || [];
-    const shown = Math.min(categories.length, maxItems);
     const swatch = 10;
 
-    for (let i = 0; i < shown; i++) {
-      const label = String(categories[i] ?? '');
+    const listTop = cursorY;
+    const listBottom = y + h - padding;
+    const availH = Math.max(1, listBottom - listTop);
+    const rowsPerCol = Math.max(1, Math.floor(availH / lineH));
+    const cols = Math.max(1, Math.ceil(categories.length / rowsPerCol));
+    const colW = Math.max(1, (w - padding * 2) / cols);
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x, y, w, h);
+    ctx.clip();
+
+    for (let i = 0; i < categories.length; i++) {
+      const col = Math.floor(i / rowsPerCol);
+      const row = i % rowsPerCol;
+      const itemX = x + padding + col * colW;
+      const itemY = listTop + row * lineH;
+      const labelX = itemX + swatch + 6;
+      const colRight = x + padding + (col + 1) * colW;
+      const maxLabelW = Math.max(0, colRight - labelX - 2);
+
       ctx.fillStyle = rgb01ToCss(colors[i]);
-      ctx.fillRect(x + padding, cursorY, swatch, swatch);
+      ctx.fillRect(itemX, itemY, swatch, swatch);
       ctx.strokeStyle = '#111';
       ctx.lineWidth = 0.5;
-      ctx.strokeRect(x + padding, cursorY, swatch, swatch);
-      ctx.fillStyle = '#111';
-      ctx.fillText(label, x + padding + swatch + 6, cursorY + swatch);
-      cursorY += lineH;
-      if (cursorY > y + h - padding) break;
-    }
+      ctx.strokeRect(itemX, itemY, swatch, swatch);
 
-    const remaining = categories.length - shown;
-    if (remaining > 0 && cursorY <= y + h - padding) {
-      ctx.fillStyle = '#555';
-      ctx.fillText(`…and ${remaining} more`, x + padding, cursorY + swatch);
+      ctx.fillStyle = '#111';
+      const label = truncateCanvasTextToWidth(ctx, String(categories[i] ?? ''), maxLabelW);
+      ctx.fillText(label, labelX, itemY + swatch);
     }
+    ctx.restore();
   } else if (model.kind === 'continuous') {
     const barH = 12;
     const barW = Math.max(40, w - padding * 2);

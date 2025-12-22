@@ -8,6 +8,8 @@
  * @module ui/modules/figure-export/utils/coordinate-mapper
  */
 
+import { cropRect01ToPx, normalizeCropRect01 } from './crop.js';
+
 /**
  * @typedef {object} NormTransform
  * @property {[number, number, number]} center
@@ -39,20 +41,36 @@ export function denormalizeXY(x, y, transform) {
  * @param {object} options
  * @param {Float32Array|null} options.positions - normalized positions (n*3)
  * @param {Float32Array|null} [options.transparency] - per-point alpha (0..1)
+ * @param {Float32Array|null} [options.visibilityMask] - optional LOD visibility mask (1 = visible)
  * @param {Float32Array} options.mvpMatrix
+ * @param {number} [options.viewportWidth]
+ * @param {number} [options.viewportHeight]
+ * @param {{ enabled?: boolean; x?: number; y?: number; width?: number; height?: number } | null} [options.crop]
  * @param {NormTransform|null} options.normTransform
  * @returns {{ minX: number, maxX: number, minY: number, maxY: number } | null}
  */
 export function computeVisibleRealBounds({
   positions,
   transparency = null,
+  visibilityMask = null,
   mvpMatrix,
+  viewportWidth = 1,
+  viewportHeight = 1,
+  crop = null,
   normTransform
 }) {
   if (!positions || !mvpMatrix || !normTransform) return null;
 
   const n = Math.floor(positions.length / 3);
   const m = mvpMatrix;
+  const vw = Math.max(1, Number(viewportWidth) || 1);
+  const vh = Math.max(1, Number(viewportHeight) || 1);
+  const crop01 = normalizeCropRect01(crop);
+  const cropPx = cropRect01ToPx(crop01, vw, vh);
+  const hasCrop = Boolean(
+    cropPx &&
+    (cropPx.width < vw - 0.5 || cropPx.height < vh - 0.5 || cropPx.x > 0.5 || cropPx.y > 0.5)
+  );
 
   let minX = Infinity;
   let maxX = -Infinity;
@@ -61,7 +79,11 @@ export function computeVisibleRealBounds({
   let any = false;
 
   for (let i = 0; i < n; i++) {
-    const alpha = transparency ? (transparency[i] ?? 1.0) : 1.0;
+    if (visibilityMask && (visibilityMask[i] ?? 0) <= 0) continue;
+    const rawAlpha = transparency ? (transparency[i] ?? 1.0) : 1.0;
+    let alpha = Number.isFinite(rawAlpha) ? rawAlpha : 1.0;
+    if (alpha < 0) alpha = 0;
+    else if (alpha > 1) alpha = 1;
     if (alpha < 0.01) continue;
 
     const ix = i * 3;
@@ -78,6 +100,12 @@ export function computeVisibleRealBounds({
     const ndcY = clipY / clipW;
     if (ndcX < -1 || ndcX > 1 || ndcY < -1 || ndcY > 1) continue;
 
+    if (hasCrop && cropPx) {
+      const vx = (ndcX * 0.5 + 0.5) * vw;
+      const vy = (-ndcY * 0.5 + 0.5) * vh;
+      if (vx < cropPx.x || vx > cropPx.x + cropPx.width || vy < cropPx.y || vy > cropPx.y + cropPx.height) continue;
+    }
+
     const real = denormalizeXY(x, y, normTransform);
     if (!Number.isFinite(real.x) || !Number.isFinite(real.y)) continue;
     if (real.x < minX) minX = real.x;
@@ -90,4 +118,3 @@ export function computeVisibleRealBounds({
   if (!any) return null;
   return { minX, maxX, minY, maxY };
 }
-

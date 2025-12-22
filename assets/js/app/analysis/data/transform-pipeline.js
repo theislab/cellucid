@@ -39,61 +39,6 @@ export class TransformPipeline {
   }
 
   /**
-   * Register a custom transform
-   * @param {string} id - Transform identifier
-   * @param {Object} transform - Transform definition
-   * @deprecated Use getTransformRegistry().register() instead
-   */
-  static registerTransform(id, transform) {
-    const registry = getTransformRegistry();
-    registry.register({
-      id,
-      name: transform.name || id,
-      description: transform.description || '',
-      supportedTypes: transform.applicableTo || transform.supportedTypes || ['any'],
-      defaultOptions: transform.defaultOptions || {},
-      optionSchema: transform.optionSchema || {},
-      execute: transform.execute || (async (data, opts) => transform.apply(data, opts))
-    });
-  }
-
-  /**
-   * Get a transform by ID
-   * @param {string} id - Transform identifier
-   * @returns {Object|null}
-   */
-  static getTransform(id) {
-    // First check registry
-    const registry = getTransformRegistry();
-    const plugin = registry.get(id);
-    if (plugin) {
-      return {
-        ...plugin,
-        applicableTo: plugin.supportedTypes,
-        apply(data, options = {}, cellIndices = null) {
-          const mergedOpts = { ...plugin.defaultOptions, ...options };
-          const context = { backend: 'cpu', registry };
-          const dataWithIndices = cellIndices ? { ...data, cellIndices } : data;
-          return plugin.execute(dataWithIndices, mergedOpts, context);
-        }
-      };
-    }
-    return null;
-  }
-
-  /**
-   * Get all available transforms
-   * @returns {Object[]}
-   */
-  static getAllTransforms() {
-    const registry = getTransformRegistry();
-    return registry.getAll().map(plugin => ({
-      ...plugin,
-      applicableTo: plugin.supportedTypes
-    }));
-  }
-
-  /**
    * Add a transform step to the pipeline
    * @param {string} type - Transform type identifier
    * @param {Object} options - Transform options

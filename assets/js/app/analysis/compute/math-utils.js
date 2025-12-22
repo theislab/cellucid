@@ -577,13 +577,11 @@ export function evaluateCondition(value, condition, thresholds = null) {
 }
 
 // ============================================================================
-// Formatting Functions (re-exported from shared/formatting.js)
+// Formatting Functions - Import from shared/formatting.js
 // ============================================================================
 
-// NOTE: These are re-exported from the centralized formatting module for
-// backward compatibility. New code should import from '../shared/formatting.js'
-import { formatNumber, formatPValue } from '../shared/formatting.js';
-export { formatNumber, formatPValue };
+// Import directly from shared/formatting.js for number and p-value formatting
+// This module focuses on mathematical computations only
 
 // ============================================================================
 // Value Filtering Utilities
@@ -617,6 +615,33 @@ export function isValidNumber(value) {
  */
 export function isMissing(value) {
   return value === null || value === undefined || (typeof value === 'number' && !Number.isFinite(value));
+}
+
+// ============================================================================
+// Formatting Utilities (worker-safe)
+// ============================================================================
+
+/**
+ * Format a number for UI-facing labels (e.g., bin range labels).
+ * Worker-safe (no Intl / locale dependencies).
+ *
+ * @param {number} value
+ * @returns {string}
+ */
+export function formatNumber(value) {
+  if (!Number.isFinite(value)) return 'N/A';
+  const abs = Math.abs(value);
+
+  // Scientific for very small / very large magnitudes.
+  if ((abs > 0 && abs < 0.001) || abs >= 10000) {
+    return value.toExponential(2);
+  }
+
+  if (abs >= 100) return String(Math.round(value));
+  if (abs >= 10) return value.toFixed(1).replace(/\.0$/, '');
+
+  // Keep a couple decimals for small values; trim trailing zeros.
+  return value.toFixed(3).replace(/\.?0+$/, '');
 }
 
 // ============================================================================
@@ -656,12 +681,9 @@ export default {
   FilterOperator,
   evaluateCondition,
 
-  // Formatting
-  formatNumber,
-  formatPValue,
-
   // Value utilities
   filterNumeric,
   isValidNumber,
-  isMissing
+  isMissing,
+  formatNumber
 };

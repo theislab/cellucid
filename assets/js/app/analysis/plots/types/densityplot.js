@@ -84,7 +84,7 @@ const densityplotDefinition = {
   id: 'densityplot',
   name: 'Density Plot',
   description: 'Smoothed distribution curve',
-  supportedDataTypes: ['continuous'],
+  supportedTypes: ['continuous'],
   supportedLayouts: ['overlay', 'side-by-side'],
 
   defaultOptions: {

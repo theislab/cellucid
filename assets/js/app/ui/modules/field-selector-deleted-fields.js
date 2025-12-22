@@ -99,6 +99,7 @@ export function initDeletedFieldsPanel({ state, deletedFieldsSection }) {
         restoreBtn.dataset.action = 'restore-field';
         restoreBtn.dataset.source = source;
         restoreBtn.dataset.index = String(index);
+        if (field._userDefinedId) restoreBtn.dataset.userDefinedId = field._userDefinedId;
 
         const confirmBtn = document.createElement('button');
         confirmBtn.type = 'button';
@@ -108,6 +109,7 @@ export function initDeletedFieldsPanel({ state, deletedFieldsSection }) {
         confirmBtn.dataset.source = source;
         confirmBtn.dataset.index = String(index);
         confirmBtn.title = 'Permanently confirm deletion (cannot be restored)';
+        if (field._userDefinedId) confirmBtn.dataset.userDefinedId = field._userDefinedId;
 
         buttons.appendChild(restoreBtn);
         buttons.appendChild(confirmBtn);
@@ -130,11 +132,19 @@ export function initDeletedFieldsPanel({ state, deletedFieldsSection }) {
       if (purgeBtn) {
         const source = purgeBtn.dataset.source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
         const fieldIndex = parseInt(purgeBtn.dataset.index || '-1', 10);
-        if (!Number.isInteger(fieldIndex) || fieldIndex < 0) return;
+        const userDefinedId = purgeBtn.dataset.userDefinedId || null;
 
-        const fields = source === FieldSource.VAR ? state.getVarFields?.() : state.getFields?.();
-        const field = fields?.[fieldIndex];
-        const label = field?.key || 'field';
+        let label = 'field';
+        if (fieldIndex >= 0) {
+          const fields = source === FieldSource.VAR ? state.getVarFields?.() : state.getFields?.();
+          const field = fields?.[fieldIndex];
+          label = field?.key || 'field';
+        } else if (userDefinedId) {
+          const template = state.getUserDefinedFieldsRegistry?.()?.getField?.(userDefinedId);
+          label = template?.key || 'field';
+        } else {
+          return;
+        }
 
         showConfirmDialog({
           title: 'Confirm deletion',
@@ -143,7 +153,12 @@ export function initDeletedFieldsPanel({ state, deletedFieldsSection }) {
             `This removes restore capability for this field in the current session and in saved states.`,
           confirmText: 'Confirm delete',
           onConfirm: () => {
-            const ok = state.purgeDeletedField?.(source, fieldIndex);
+            let ok;
+            if (fieldIndex >= 0) {
+              ok = state.purgeDeletedField?.(source, fieldIndex);
+            } else if (userDefinedId) {
+              ok = state.purgeUserDefinedField?.(userDefinedId, source);
+            }
             if (!ok) {
               getNotificationCenter().error('Failed to confirm deletion', { category: 'filter' });
               return;
@@ -159,13 +174,25 @@ export function initDeletedFieldsPanel({ state, deletedFieldsSection }) {
 
       const source = restoreBtn.dataset.source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
       const fieldIndex = parseInt(restoreBtn.dataset.index || '-1', 10);
-      if (!Number.isInteger(fieldIndex) || fieldIndex < 0) return;
+      const userDefinedId = restoreBtn.dataset.userDefinedId || null;
 
-      const fields = source === FieldSource.VAR ? state.getVarFields?.() : state.getFields?.();
-      const field = fields?.[fieldIndex];
-      const label = field?.key || 'field';
+      let result;
+      let label = 'field';
 
-      const result = state.restoreField?.(source, fieldIndex);
+      if (fieldIndex >= 0) {
+        // Restore by index (field exists in array)
+        const fields = source === FieldSource.VAR ? state.getVarFields?.() : state.getFields?.();
+        const field = fields?.[fieldIndex];
+        label = field?.key || 'field';
+        result = state.restoreField?.(source, fieldIndex);
+      } else if (userDefinedId) {
+        // Restore by userDefinedId (field only in registry)
+        result = state.restoreUserDefinedField?.(userDefinedId, source);
+        label = result?.key || 'field';
+      } else {
+        return;
+      }
+
       if (!result || result.ok !== true) {
         getNotificationCenter().error('Failed to restore field', { category: 'filter' });
         return;

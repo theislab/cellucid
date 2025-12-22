@@ -15,14 +15,17 @@
 import { StyleManager } from '../../../utils/style-manager.js';
 import { clamp } from '../../utils/number-utils.js';
 import { initCategoricalLegend } from './legend/categorical-legend.js';
+import { throttle } from '../../analysis/shared/dom-utils.js';
 
-export function initLegendRenderer({ state, dom }) {
+export function initLegendRenderer({ state, viewer, dom }) {
   const displayOptionsContainer = dom?.optionsContainer || null;
   const legendEl = dom?.legendEl || null;
   const outlierFilterContainer = dom?.outlierFilterContainer || null;
   const outlierFilterInput = dom?.outlierFilterInput || null;
   const outlierFilterDisplay = dom?.outlierFilterDisplay || null;
   const centroidControls = dom?.centroidControls || null;
+  const centroidPointsCheckbox = dom?.centroidPointsCheckbox || null;
+  const centroidLabelsCheckbox = dom?.centroidLabelsCheckbox || null;
 
   const { refreshCategoryCounts, renderCategoricalLegend } = initCategoricalLegend({ state, legendEl });
 
@@ -409,15 +412,58 @@ export function initLegendRenderer({ state, dom }) {
     if (centroidControls) {
       const isCategorical = Boolean(field && field.kind === 'category');
       centroidControls.classList.toggle('visible', isCategorical);
+
+      // Sync checkbox state with viewer when centroid controls become visible
+      if (isCategorical && viewer) {
+        const activeViewId = state.getActiveViewId?.() || 'live';
+        const flags = viewer.getCentroidFlags?.(activeViewId) || { points: false, labels: false };
+        if (centroidPointsCheckbox) {
+          centroidPointsCheckbox.checked = flags.points;
+        }
+        if (centroidLabelsCheckbox) {
+          centroidLabelsCheckbox.checked = flags.labels;
+        }
+      }
     }
   }
 
   if (outlierFilterInput) {
+    // Throttle the expensive state update (visibility recomputation) while keeping display update immediate
+    const throttledStateUpdate = throttle((threshold) => {
+      state.setOutlierThresholdForActive(threshold);
+    }, 50); // ~20 updates/sec max
+
     outlierFilterInput.addEventListener('input', () => {
       const sliderValue = parseFloat(outlierFilterInput.value);
       const threshold = sliderValue / 100.0;
-      state.setOutlierThresholdForActive(threshold);
+      // Update display immediately for smooth visual feedback
       if (outlierFilterDisplay) outlierFilterDisplay.textContent = Math.round(threshold * 100) + '%';
+      // Throttle the expensive state update
+      throttledStateUpdate(threshold);
+    });
+
+    // Ensure final value is applied when user releases slider
+    outlierFilterInput.addEventListener('change', () => {
+      const sliderValue = parseFloat(outlierFilterInput.value);
+      const threshold = sliderValue / 100.0;
+      state.setOutlierThresholdForActive(threshold);
+    });
+  }
+
+  // Centroid visibility toggles
+  if (centroidPointsCheckbox && viewer) {
+    centroidPointsCheckbox.addEventListener('change', () => {
+      const show = centroidPointsCheckbox.checked;
+      const activeViewId = state.getActiveViewId?.() || 'live';
+      viewer.setShowCentroidPoints?.(show, activeViewId);
+    });
+  }
+
+  if (centroidLabelsCheckbox && viewer) {
+    centroidLabelsCheckbox.addEventListener('change', () => {
+      const show = centroidLabelsCheckbox.checked;
+      const activeViewId = state.getActiveViewId?.() || 'live';
+      viewer.setShowCentroidLabels?.(show, activeViewId);
     });
   }
 

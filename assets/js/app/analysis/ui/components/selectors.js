@@ -9,7 +9,8 @@
  */
 
 import { getPageColor } from '../../core/plugin-contract.js';
-import { NONE_VALUE, formatCount, getCellCountForPage } from '../../shared/dom-utils.js';
+import { NONE_VALUE, getCellCountForPage } from '../../shared/dom-utils.js';
+import { formatCount } from '../../shared/formatting.js';
 import { deriveRestOfColor } from '../../shared/color-utils.js';
 import { expandPagesWithDerived } from '../../shared/page-derivation-utils.js';
 import { StyleManager } from '../../../../utils/style-manager.js';

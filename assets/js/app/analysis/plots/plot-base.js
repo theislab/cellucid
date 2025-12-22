@@ -61,7 +61,7 @@ export class BasePlot {
    * @param {string} definition.id - Unique plot type ID
    * @param {string} definition.name - Display name
    * @param {string} [definition.description] - Description
-   * @param {string[]} [definition.supportedDataTypes] - Supported data types
+   * @param {string[]} [definition.supportedTypes] - Supported data types
    * @param {string[]} [definition.supportedLayouts] - Supported layout modes
    * @param {Object} [definition.defaultOptions] - Default option values
    * @param {Object} [definition.optionSchema] - Option schema for UI generation
@@ -70,7 +70,7 @@ export class BasePlot {
     this.id = definition.id;
     this.name = definition.name;
     this.description = definition.description || '';
-    this.supportedDataTypes = definition.supportedDataTypes || ['continuous', 'categorical'];
+    this.supportedTypes = definition.supportedTypes || ['continuous', 'categorical'];
     this.supportedLayouts = definition.supportedLayouts || ['side-by-side'];
     this.defaultOptions = definition.defaultOptions || {};
     this.optionSchema = definition.optionSchema || {};
@@ -318,7 +318,7 @@ export class BasePlot {
       id: this.id,
       name: this.name,
       description: this.description,
-      supportedDataTypes: this.supportedDataTypes,
+      supportedTypes: this.supportedTypes,
       supportedLayouts: this.supportedLayouts,
       defaultOptions: this.defaultOptions,
       optionSchema: this.optionSchema,
@@ -344,7 +344,7 @@ export class BasePlot {
  */
 export function createPlotDefinition(definition) {
   const base = {
-    supportedDataTypes: ['continuous'],
+    supportedTypes: ['continuous'],
     supportedLayouts: ['side-by-side'],
     defaultOptions: {},
     optionSchema: {}

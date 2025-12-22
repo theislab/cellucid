@@ -811,8 +811,8 @@ export class ScatterBuilder {
       }
 
       // Render stats in modal footer (matching Detailed Analysis pattern)
-      if (this._modal._footer) {
-        this._renderExpandedStats(this._modal._footer);
+      if (this._modal._statsContent) {
+        this._renderExpandedStats(this._modal._statsContent);
       }
 
       // Render annotations (matching Detailed Analysis pattern)

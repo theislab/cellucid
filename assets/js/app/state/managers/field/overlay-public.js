@@ -374,6 +374,108 @@ export class FieldOverlayPublicMethods {
   }
 
   /**
+   * Restore a deleted user-defined field by its userDefinedId.
+   *
+   * This handles the case where the field exists only in the UserDefinedFieldsRegistry
+   * (not yet injected into the fields array).
+   *
+   * @param {string} userDefinedId
+   * @param {'obs'|'var'} source
+   * @returns {{ ok: boolean, key?: string, renamedTo?: string|null }}
+   */
+  restoreUserDefinedField(userDefinedId, source = FieldSource.OBS) {
+    const src = source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
+    const template = this._userDefinedFields?.getField?.(userDefinedId);
+    if (!template) return { ok: false };
+    if (template._isPurged === true) {
+      console.warn('[State] restoreUserDefinedField: cannot restore a confirmed deletion');
+      return { ok: false };
+    }
+
+    // Mark template as not deleted
+    delete template._isDeleted;
+
+    // Check if field already exists in array
+    const fields = src === FieldSource.VAR ? this.varData?.fields : this.obsData?.fields;
+    let field = fields?.find?.((f) => f && f._userDefinedId === userDefinedId);
+
+    if (field) {
+      // Field exists in array, just un-delete it
+      delete field._isDeleted;
+    } else {
+      // Field not in array, inject it
+      const clone = { ...template };
+      delete clone._categoryColors;
+      delete clone._categoryVisible;
+      delete clone._continuousStats;
+      delete clone._continuousFilter;
+      delete clone._continuousColorRange;
+      delete clone._categoryCounts;
+      clone._loadingPromise = null;
+      fields.push(clone);
+      field = clone;
+    }
+
+    // Handle potential key conflicts
+    let renamedTo = null;
+    const existingKeys = (fields || [])
+      .filter((f) => f && f._userDefinedId !== userDefinedId && f._isDeleted !== true)
+      .map((f) => f.key);
+
+    if (existingKeys.includes(field.key)) {
+      renamedTo = makeUniqueLabel(`${field.key} (restored)`, existingKeys);
+      field.key = renamedTo;
+      template.key = renamedTo;
+    }
+
+    getFieldRegistry().invalidate();
+    this.computeGlobalVisibility();
+    this.updateFilterSummary();
+    this._notifyFieldChange(src, fields.indexOf(field), ChangeType.RESTORE, {
+      userDefinedId,
+      renamedTo
+    });
+
+    return { ok: true, key: field.key, renamedTo };
+  }
+
+  /**
+   * Permanently confirm deletion of a user-defined field by its userDefinedId.
+   *
+   * This handles the case where the field exists only in the UserDefinedFieldsRegistry
+   * (not yet injected into the fields array).
+   *
+   * @param {string} userDefinedId
+   * @param {'obs'|'var'} source
+   * @returns {boolean}
+   */
+  purgeUserDefinedField(userDefinedId, source = FieldSource.OBS) {
+    const src = source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
+    const template = this._userDefinedFields?.getField?.(userDefinedId);
+    if (!template) return false;
+    if (template._isPurged === true) return true;
+
+    // Mark template as deleted and purged
+    template._isDeleted = true;
+    template._isPurged = true;
+
+    // If field exists in array, mark it there too
+    const fields = src === FieldSource.VAR ? this.varData?.fields : this.obsData?.fields;
+    const field = fields?.find?.((f) => f && f._userDefinedId === userDefinedId);
+    if (field) {
+      field._isDeleted = true;
+      field._isPurged = true;
+    }
+
+    getFieldRegistry().invalidate();
+    this.computeGlobalVisibility();
+    this.updateFilterSummary();
+    const fieldIndex = field ? fields.indexOf(field) : -1;
+    this._notifyFieldChange(src, fieldIndex, ChangeType.UPDATE, { purged: true, userDefinedId });
+    return true;
+  }
+
+  /**
    * Duplicate a field as a new user-defined field.
    *
    * - Categorical obs: deep-copies codes + categories and computes centroids.
@@ -533,15 +635,25 @@ export class FieldOverlayPublicMethods {
     const src = source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
     const fields = src === FieldSource.VAR ? this.varData?.fields : this.obsData?.fields;
     const field = fields?.find?.((f) => f && f._userDefinedId === fieldId);
-    if (!field) return false;
+
+    // Mark the template as deleted first (ensures restore works even if field isn't in array)
+    const template = this._userDefinedFields?.getField?.(fieldId);
+    if (template) template._isDeleted = true;
+
+    if (!field) {
+      // Field not in array but template exists - still counts as successful deletion
+      if (template) {
+        getFieldRegistry().invalidate();
+        return true;
+      }
+      return false;
+    }
 
     // User-defined fields are fully owned by Cellucid and serialized via
     // UserDefinedFieldsRegistry. For dev-phase workflows we treat deletion as
     // a soft-delete so the user can restore derived columns (e.g. after
     // delete→unassigned or drag-merge operations).
     field._isDeleted = true;
-    const template = this._userDefinedFields?.getField?.(fieldId);
-    if (template) template._isDeleted = true;
 
     if (src === FieldSource.OBS && this.activeFieldSource === FieldSource.OBS && this.activeFieldIndex >= 0) {
       const active = this.obsData?.fields?.[this.activeFieldIndex];
