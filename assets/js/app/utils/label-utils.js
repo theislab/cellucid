@@ -7,7 +7,12 @@
  * This module is intentionally dependency-free.
  */
 
-function normalizeForCompare(value) {
+/**
+ * Normalize a value for case-insensitive comparisons.
+ * @param {*} value
+ * @returns {string}
+ */
+export function normalizeForCompare(value) {
   return String(value ?? '').trim().toLocaleLowerCase();
 }
 
@@ -45,4 +50,3 @@ export function makeUniqueLabel(baseLabel, existingLabels, options = {}) {
   }
   return `${base}${separator}${suffix}`;
 }
-

@@ -11,6 +11,7 @@
 import { DataSourceError, DataSourceErrorCode } from './data-source.js';
 import { createLocalDemoDataSource } from './local-demo-source.js';
 import { createGitHubDataSource } from './github-data-source.js';
+import { debug } from '../utils/debug.js';
 
 /**
  * @typedef {import('./data-source.js').DatasetMetadata} DatasetMetadata
@@ -94,10 +95,14 @@ export class DataSourceManager {
 
   /**
    * Initialize with default sources and load initial dataset
+   * @param {Object} [options]
+   * @param {boolean} [options.autoLoadDefault=true] - Auto-load demo dataset when no dataset is active
+   * @param {string} [options.defaultLoadMethod='default-demo'] - Analytics hint for the default demo load
    * @returns {Promise<void>}
    */
-  async initialize() {
+  async initialize(options = {}) {
     if (this._initialized) return;
+    const { autoLoadDefault = true, defaultLoadMethod = 'default-demo' } = options || {};
 
     // Register default sources
     const demoSource = createLocalDemoDataSource();
@@ -110,7 +115,7 @@ export class DataSourceManager {
 
     // Only load default dataset if no dataset is already active
     // (e.g., from a remote connection or URL parameter)
-    if (!this.hasActiveDataset()) {
+    if (autoLoadDefault && !this.hasActiveDataset()) {
       // Check if demo source is available and load default dataset
       if (await demoSource.isAvailable()) {
         const defaultId = await demoSource.getDefaultDatasetId();
@@ -118,14 +123,14 @@ export class DataSourceManager {
           const hasListeners = this._onDatasetChangeCallbacks.size > 0;
           await this.switchToDataset('local-demo', defaultId, {
             silent: !hasListeners,
-            loadMethod: 'default-demo'
+            loadMethod: defaultLoadMethod
           });
         }
       }
     }
 
     this._initialized = true;
-    console.log('[DataSourceManager] Initialized');
+    debug.log('[DataSourceManager] Initialized');
   }
 
   /**
@@ -134,25 +139,21 @@ export class DataSourceManager {
    * @returns {Promise<{sourceType: string, datasets: DatasetMetadata[]}[]>}
    */
   async getAllDatasets() {
-    console.log('[DataSourceManager] getAllDatasets() called, sources:', [...this.sources.keys()]);
+    debug.log('[DataSourceManager] getAllDatasets', { sources: [...this.sources.keys()] });
 
     // Check all sources in parallel for better performance
     const sourceEntries = [...this.sources.entries()];
     const checkPromises = sourceEntries.map(async ([type, source]) => {
       try {
-        console.log(`[DataSourceManager] Checking source '${type}'...`);
         const isAvailable = await source.isAvailable?.();
-        console.log(`[DataSourceManager] Source '${type}' available: ${isAvailable}`);
 
         if (isAvailable) {
-          console.log(`[DataSourceManager] Listing datasets from '${type}'...`);
           const datasets = await source.listDatasets();
-          console.log(`[DataSourceManager] Got ${datasets?.length || 0} datasets from '${type}'`);
           return { sourceType: type, datasets, success: true };
         }
         return { sourceType: type, success: false };
       } catch (err) {
-        console.error(`[DataSourceManager] Failed to list datasets from '${type}':`, err);
+        debug.error(`[DataSourceManager] Failed to list datasets from '${type}':`, err);
         return { sourceType: type, success: false, error: err };
       }
     });
@@ -165,7 +166,7 @@ export class DataSourceManager {
       .filter(r => r.success && r.datasets)
       .map(({ sourceType, datasets }) => ({ sourceType, datasets }));
 
-    console.log(`[DataSourceManager] getAllDatasets() returning ${results.length} source groups`);
+    debug.log('[DataSourceManager] getAllDatasets complete', { sourceGroups: results.length });
     return results;
   }
 
@@ -224,7 +225,7 @@ export class DataSourceManager {
         try {
           previousSource.onDeactivate();
         } catch (err) {
-          console.warn('[DataSourceManager] Error in source onDeactivate:', err);
+          debug.warn('[DataSourceManager] Error in source onDeactivate:', err);
         }
       }
     }
@@ -235,7 +236,7 @@ export class DataSourceManager {
     this.activeDatasetMetadata = metadata;
     this.lastLoadMethod = loadMethod || 'unspecified';
 
-    console.log(`[DataSourceManager] Switched to dataset '${datasetId}' from '${sourceType}' (baseUrl: ${baseUrl})`);
+    debug.log('[DataSourceManager] Switched dataset', { sourceType, datasetId, baseUrl, loadMethod });
 
     // Notify listeners
     if (!silent) {
@@ -273,7 +274,7 @@ export class DataSourceManager {
       try {
         previousSource.onDeactivate();
       } catch (err) {
-        console.warn('[DataSourceManager] Error in source onDeactivate during clear:', err);
+        debug.warn('[DataSourceManager] Error in source onDeactivate during clear:', err);
       }
     }
 
@@ -372,13 +373,13 @@ export class DataSourceManager {
 
     const source = this.sources.get(state.sourceType);
     if (!source) {
-      console.warn(`[DataSourceManager] Cannot restore: source '${state.sourceType}' not registered`);
+      debug.warn(`[DataSourceManager] Cannot restore: source '${state.sourceType}' not registered`);
       return false;
     }
 
     // Check if this source requires manual reconnection (e.g., user directories, remote servers)
     if (typeof source.requiresManualReconnect === 'function' && source.requiresManualReconnect()) {
-      console.log(`[DataSourceManager] Cannot auto-restore '${state.sourceType}' (requires manual reconnection)`);
+      debug.warn(`[DataSourceManager] Cannot auto-restore '${state.sourceType}' (requires manual reconnection)`);
       return false;
     }
 
@@ -386,7 +387,7 @@ export class DataSourceManager {
       await this.switchToDataset(state.sourceType, state.datasetId, options);
       return true;
     } catch (err) {
-      console.warn(`[DataSourceManager] Failed to restore dataset '${state.datasetId}':`, err);
+      debug.warn(`[DataSourceManager] Failed to restore dataset '${state.datasetId}':`, err);
       return false;
     }
   }
@@ -433,7 +434,7 @@ export class DataSourceManager {
       try {
         callback(event);
       } catch (err) {
-        console.error('[DataSourceManager] Error in dataset change callback:', err);
+        debug.error('[DataSourceManager] Error in dataset change callback:', err);
       }
     }
   }
@@ -447,7 +448,7 @@ export class DataSourceManager {
       try {
         callback();
       } catch (err) {
-        console.error('[DataSourceManager] Error in sources change callback:', err);
+        debug.error('[DataSourceManager] Error in sources change callback:', err);
       }
     }
   }
@@ -485,10 +486,10 @@ export class DataSourceManager {
    */
   registerProtocol(protocol, sourceType) {
     if (!protocol.endsWith('://')) {
-      console.warn(`[DataSourceManager] Protocol should end with '://': ${protocol}`);
+      debug.warn(`[DataSourceManager] Protocol should end with '://': ${protocol}`);
     }
     this._protocolHandlers[protocol] = sourceType;
-    console.log(`[DataSourceManager] Registered protocol '${protocol}' → '${sourceType}'`);
+    debug.log('[DataSourceManager] Registered protocol', { protocol, sourceType });
   }
 
   /**
@@ -550,7 +551,7 @@ export class DataSourceManager {
 
     const source = this.sources.get(sourceType);
     if (!source) {
-      console.warn(`[DataSourceManager] No source registered for protocol in URL: ${url}`);
+      debug.warn(`[DataSourceManager] No source registered for protocol in URL: ${url}`);
       return url;
     }
 
@@ -570,7 +571,7 @@ export class DataSourceManager {
       }
     }
 
-    console.warn(`[DataSourceManager] Source '${sourceType}' cannot resolve URL: ${url}`);
+    debug.warn(`[DataSourceManager] Source '${sourceType}' cannot resolve URL: ${url}`);
     return url;
   }
 

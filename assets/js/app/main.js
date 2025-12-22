@@ -1,7 +1,20 @@
-// App entrypoint: loads data, initializes the viewer/state, and wires the UI.
+/**
+ * @fileoverview Application entry point.
+ *
+ * Orchestrates:
+ * - Dataset + data source selection (URL params, local prepared exports, remote/GitHub/Jupyter sources)
+ * - Data loading (points, manifests, connectivity)
+ * - Initialization wiring (Viewer, DataState, UI coordinator, state serializer, analysis module)
+ *
+ * Performance note:
+ * Keep per-frame and per-point work inside the viewer and state managers.
+ * `main.js` should stay orchestration-only (no hot-path allocations).
+ *
+ * @module main
+ */
 import { createViewer } from '../rendering/viewer.js';
-import { createDataState } from './state.js';
-import { initUI } from './ui.js';
+import { createDataState } from './state/index.js';
+import { initUI } from './ui/core/ui-coordinator.js';
 import { createStateSerializer } from './state-serializer.js';
 import { initDockableAccordions } from './dockable-accordions.js';
 import { setDockableAccordions } from './dockable-accordions-registry.js';
@@ -26,6 +39,9 @@ import { createJupyterBridgeDataSource, isJupyterContext, getJupyterConfig } fro
 import { formatCellCount as formatNumber } from '../data/data-source.js';
 import { createComparisonModule } from './analysis/comparison-module.js';
 import { ThemeManager } from '../utils/theme-manager.js';
+import { debug } from './utils/debug.js';
+import { clamp } from './utils/number-utils.js';
+import { createMulberry32 } from './utils/random-utils.js';
 import {
   initAnalytics,
   trackDataLoadMethod,
@@ -36,7 +52,7 @@ import {
 } from '../analytics/tracker.js';
 import { initPerformanceAnalytics } from '../analytics/performance.js';
 
-console.log('=== CELLUCID STARTING ===');
+debug.log('Starting…');
 
 ThemeManager.init();
 
@@ -269,27 +285,9 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
   const labelLayer = document.getElementById('label-layer');
   const viewTitleLayer = document.getElementById('view-title-layer');
   const statsEl = document.getElementById('stats');
-  const categoricalFieldSelect = document.getElementById('categorical-field');
-  const categoricalFieldCopyBtn = document.getElementById('copy-categorical-field');
-  const categoricalFieldRenameBtn = document.getElementById('rename-categorical-field');
-  const categoricalFieldDeleteBtn = document.getElementById('delete-categorical-field');
-  const categoricalFieldClearBtn = document.getElementById('clear-categorical-field');
-  const continuousFieldSelect = document.getElementById('continuous-field');
-  const continuousFieldCopyBtn = document.getElementById('copy-continuous-field');
-  const continuousFieldRenameBtn = document.getElementById('rename-continuous-field');
-  const continuousFieldDeleteBtn = document.getElementById('delete-continuous-field');
-  const continuousFieldClearBtn = document.getElementById('clear-continuous-field');
-  const legendEl = document.getElementById('legend');
-  const pointSizeInput = document.getElementById('point-size');
-  const pointSizeDisplay = document.getElementById('point-size-display');
   const themeSelect = document.getElementById('theme-select');
-  const backgroundSelect = document.getElementById('background-select');
-  const pointsControls = document.getElementById('points-controls');
-  const centroidControls = document.getElementById('centroid-controls');
-  const centroidPointsCheckbox = document.getElementById('toggle-centroid-points');
-  const centroidLabelsCheckbox = document.getElementById('toggle-centroid-labels');
   const sidebar = document.getElementById('sidebar');
-  const sidebarToggle = document.getElementById('sidebar-toggle');
+  const renderModeSelect = document.getElementById('render-mode');
 
   setDockableAccordions(initDockableAccordions({ sidebar }));
 
@@ -303,98 +301,10 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
   // Show welcome modal immediately for first-time visitors (before heavy initialization)
   // This ensures the modal appears first, not after everything else loads
   initWelcomeModal();
-  if (shouldShowWelcome()) {
+  const welcomeVisible = shouldShowWelcome();
+  if (welcomeVisible) {
     showWelcomeModal();
   }
-
-  const displayOptionsContainer = document.getElementById('display-options-container');
-  const outlierFilterContainer = document.getElementById('outlier-filter-container');
-  const outlierFilterInput = document.getElementById('outlier-filter');
-  const outlierFilterDisplay = document.getElementById('outlier-filter-display');
-  const filterCountEl = document.getElementById('filter-count');
-  const activeFiltersEl = document.getElementById('active-filters');
-  const deletedFieldsSection = document.getElementById('deleted-fields-section');
-  // Highlight UI elements
-  const highlightCountEl = document.getElementById('highlight-count');
-  const highlightedGroupsEl = document.getElementById('highlighted-groups-list');
-  const clearAllHighlightsBtn = document.getElementById('clear-all-highlights');
-  const highlightPagesTabsEl = document.getElementById('highlight-pages-tabs');
-  const addHighlightPageBtn = document.getElementById('add-highlight-page');
-  const highlightModeButtons = Array.from(document.querySelectorAll('.highlight-mode-btn'));
-  const highlightModeDescription = document.getElementById('highlight-mode-description');
-  const lightingStrengthInput = document.getElementById('lighting-strength');
-  const lightingStrengthDisplay = document.getElementById('lighting-strength-display');
-  const fogDensityInput = document.getElementById('fog-density');
-  const fogDensityDisplay = document.getElementById('fog-density-display');
-  const sizeAttenuationInput = document.getElementById('size-attenuation');
-  const sizeAttenuationDisplay = document.getElementById('size-attenuation-display');
-  const resetCameraBtn = document.getElementById('reset-camera-btn');
-  const navigationModeSelect = document.getElementById('navigation-mode');
-  const lookSensitivityInput = document.getElementById('look-sensitivity');
-  const lookSensitivityDisplay = document.getElementById('look-sensitivity-display');
-  const moveSpeedInput = document.getElementById('move-speed');
-  const moveSpeedDisplay = document.getElementById('move-speed-display');
-  const invertLookCheckbox = document.getElementById('invert-look');
-  const projectilesEnabledCheckbox = document.getElementById('projectiles-enabled');
-  const pointerLockCheckbox = document.getElementById('pointer-lock');
-  const orbitReverseCheckbox = document.getElementById('orbit-reverse');
-  const showOrbitAnchorCheckbox = document.getElementById('show-orbit-anchor');
-  const freeflyControls = document.getElementById('freefly-controls');
-  const orbitControls = document.getElementById('orbit-controls');
-  const planarControls = document.getElementById('planar-controls');
-  const planarZoomToCursorCheckbox = document.getElementById('planar-zoom-to-cursor');
-  const planarInvertAxesCheckbox = document.getElementById('planar-invert-axes');
-  // Keyboard navigation speed sliders
-  const orbitKeySpeedInput = document.getElementById('orbit-key-speed');
-  const orbitKeySpeedDisplay = document.getElementById('orbit-key-speed-display');
-  const planarPanSpeedInput = document.getElementById('planar-pan-speed');
-  const planarPanSpeedDisplay = document.getElementById('planar-pan-speed-display');
-  const geneExpressionContainer = document.getElementById('gene-expression-container');
-  const geneExpressionSearch = document.getElementById('gene-expression-search');
-  const geneExpressionDropdown = document.getElementById('gene-expression-dropdown');
-  const geneExpressionCopyBtn = document.getElementById('copy-gene-expression');
-  const geneExpressionRenameBtn = document.getElementById('rename-gene-expression');
-  const geneExpressionDeleteBtn = document.getElementById('delete-gene-expression');
-  const geneExpressionClearBtn = document.getElementById('clear-gene-expression');
-  const categoryBuilderContainer = document.getElementById('category-builder-container');
-
-  // New smoke controls
-  const renderModeSelect = document.getElementById('render-mode');
-  const smokeControls = document.getElementById('smoke-controls');
-  const smokeGridInput = document.getElementById('smoke-grid');
-  const smokeGridDisplay = document.getElementById('smoke-grid-display');
-  const smokeStepsInput = document.getElementById('smoke-steps');
-  const smokeStepsDisplay = document.getElementById('smoke-steps-display');
-  const smokeDensityInput = document.getElementById('smoke-density');
-  const smokeDensityDisplay = document.getElementById('smoke-density-display');
-  const smokeSpeedInput = document.getElementById('smoke-speed');
-  const smokeSpeedDisplay = document.getElementById('smoke-speed-display');
-  const smokeDetailInput = document.getElementById('smoke-detail');
-  const smokeDetailDisplay = document.getElementById('smoke-detail-display');
-  const smokeWarpInput = document.getElementById('smoke-warp');
-  const smokeWarpDisplay = document.getElementById('smoke-warp-display');
-  const smokeAbsorptionInput = document.getElementById('smoke-absorption');
-  const smokeAbsorptionDisplay = document.getElementById('smoke-absorption-display');
-  const smokeScatterInput = document.getElementById('smoke-scatter');
-  const smokeScatterDisplay = document.getElementById('smoke-scatter-display');
-  const smokeEdgeInput = document.getElementById('smoke-edge');
-  const smokeEdgeDisplay = document.getElementById('smoke-edge-display');
-  const smokeDirectLightInput = document.getElementById('smoke-direct-light');
-  const smokeDirectLightDisplay = document.getElementById('smoke-direct-light-display');
-  const cloudResolutionInput = document.getElementById('cloud-resolution');
-  const cloudResolutionDisplay = document.getElementById('cloud-resolution-display');
-  const noiseResolutionInput = document.getElementById('noise-resolution');
-  const noiseResolutionDisplay = document.getElementById('noise-resolution-display');
-
-  // Split-view controls (small multiples)
-  const splitViewControls = document.getElementById('split-view-controls');
-  const splitKeepViewBtn = document.getElementById('split-keep-view-btn');
-  const splitClearBtn = document.getElementById('split-clear-btn');
-  const cameraLockBtn = document.getElementById('camera-lock-btn');
-  const viewLayoutModeSelect = document.getElementById('view-layout-mode');
-  const splitViewBadgesBox = document.getElementById('split-view-badges-box');
-  const splitViewBadges = document.getElementById('split-view-badges-list');
-  const splitViewBoxTitle = document.querySelector('.split-view-box-title');
 
   // Connectivity controls
   const connectivityControls = document.getElementById('connectivity-controls');
@@ -408,59 +318,18 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
   const connectivityLimitInput = document.getElementById('connectivity-limit');
   const connectivityLimitDisplay = document.getElementById('connectivity-limit-display');
   const connectivityInfo = document.getElementById('connectivity-info');
-
-  // Session save/load controls
-  const saveStateBtn = document.getElementById('save-state-btn');
-  const loadStateBtn = document.getElementById('load-state-btn');
-
-  // Dataset selector controls
-  const datasetSelect = document.getElementById('dataset-select');
-  const datasetInfo = document.getElementById('dataset-info');
-  const datasetNameEl = document.getElementById('dataset-name');
-  const datasetSourceEl = document.getElementById('dataset-source');
-  const datasetDescriptionEl = document.getElementById('dataset-description');
-  const datasetUrlEl = document.getElementById('dataset-url');
-  const datasetCellsEl = document.getElementById('dataset-cells');
-  const datasetGenesEl = document.getElementById('dataset-genes');
-  const datasetObsEl = document.getElementById('dataset-obs');
-  const datasetConnectivityEl = document.getElementById('dataset-connectivity');
-  const userDataBlock = document.getElementById('user-data-block');
-  // Three separate buttons for local data loading
-  const userDataH5adBtn = document.getElementById('user-data-h5ad-btn');
-  const userDataZarrBtn = document.getElementById('user-data-zarr-btn');
-  const userDataBrowseBtn = document.getElementById('user-data-browse-btn');
-  // Hidden file inputs
-  const userDataFileInput = document.getElementById('user-data-file-input');
-  const userDataH5adInput = document.getElementById('user-data-h5ad-input');
-  const userDataZarrInput = document.getElementById('user-data-zarr-input');
-  const userDataInfoBtn = document.getElementById('user-data-info-btn');
-  const userDataInfoTooltip = document.getElementById('user-data-info-tooltip');
-  // Remote server connection elements
-  const remoteServerUrl = document.getElementById('remote-server-url');
-  const remoteConnectBtn = document.getElementById('remote-connect-btn');
-  const remoteDisconnectBtn = document.getElementById('remote-disconnect-btn');
-  const remoteDisconnectContainer = document.getElementById('remote-disconnect-container');
-  const remoteInfoBtn = document.getElementById('remote-info-btn');
-  const remoteInfoTooltip = document.getElementById('remote-info-tooltip');
-  // GitHub repository elements
-  const githubRepoUrl = document.getElementById('github-repo-url');
-  const githubConnectBtn = document.getElementById('github-connect-btn');
-  const githubDisconnectBtn = document.getElementById('github-disconnect-btn');
-  const githubDisconnectContainer = document.getElementById('github-disconnect-container');
-  const githubInfoBtn = document.getElementById('github-info-btn');
-  const githubInfoTooltip = document.getElementById('github-info-tooltip');
   let ui = null;
 
   try {
-    console.log('[Main] Creating viewer...');
+    debug.log('[Main] Creating viewer...');
     const viewer = createViewer({ canvas, labelLayer, viewTitleLayer, sidebar });
-    console.log('[Main] Viewer created successfully');
+    debug.log('[Main] Viewer created successfully');
 
     // Expose viewer globally for dev tools (benchmark, debugging)
     window._cellucidViewer = viewer;
 
     const state = createDataState({ viewer, labelLayer });
-    console.log('[Main] State created successfully');
+    debug.log('[Main] State created successfully');
 
     // Expose state globally for dev tools
     window._cellucidState = state;
@@ -556,14 +425,14 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     // Check if running in Jupyter context
     let jupyterSource = null;
     if (isJupyterContext()) {
-      console.log('[Main] Detected Jupyter context, initializing bridge...');
+      debug.log('[Main] Detected Jupyter context, initializing bridge...');
       jupyterSource = createJupyterBridgeDataSource();
       dataSourceManager.registerSource('jupyter', jupyterSource);
 
       // Try to initialize Jupyter connection
       const jupyterInitialized = await jupyterSource.initialize();
       if (jupyterInitialized) {
-        console.log('[Main] Jupyter bridge initialized successfully');
+        debug.log('[Main] Jupyter bridge initialized successfully');
 
         // Auto-load first Jupyter dataset
         try {
@@ -572,7 +441,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
             await dataSourceManager.switchToDataset('jupyter', jupyterDatasets[0].id, {
               loadMethod: DATA_LOAD_METHODS.JUPYTER_AUTO
             });
-            console.log(`[Main] Switched to Jupyter dataset: ${jupyterDatasets[0].id}`);
+            debug.log(`[Main] Switched to Jupyter dataset: ${jupyterDatasets[0].id}`);
           }
         } catch (err) {
           console.warn('[Main] Failed to load Jupyter datasets:', err.message);
@@ -585,14 +454,14 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     const isAnndataMode = urlParams.get('anndata') === 'true';
 
     if (remoteUrlParam) {
-      console.log(`[Main] Remote server URL from param: ${remoteUrlParam}`);
+      debug.log(`[Main] Remote server URL from param: ${remoteUrlParam}`);
       try {
         await remoteSource.connect({ url: remoteUrlParam });
-        console.log('[Main] Connected to remote server');
+        debug.log('[Main] Connected to remote server');
 
         // Show AnnData warning if loading directly from AnnData
         if (isAnndataMode) {
-          console.log('[Main] AnnData mode detected - loading directly from AnnData');
+          debug.log('[Main] AnnData mode detected - loading directly from AnnData');
           notifications.warning(
             'Loading data directly from AnnData. This may be slower than using pre-exported data. ' +
             'For better performance, use prepare() to create optimized binary files.',
@@ -608,7 +477,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
             await dataSourceManager.switchToDataset('remote', datasets[0].id, {
               loadMethod: DATA_LOAD_METHODS.REMOTE_URL_PARAM
             });
-            console.log(`[Main] Switched to remote dataset: ${datasets[0].id}`);
+            debug.log(`[Main] Switched to remote dataset: ${datasets[0].id}`);
           }
         }
       } catch (err) {
@@ -616,30 +485,31 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       }
     }
 
-    // Initialize with default sources (registers local-demo and github-repo sources)
-    await dataSourceManager.initialize();
+    // Initialize with default sources (registers local-demo and github-repo sources).
+    // When the welcome modal is shown, classify the default demo load as an explicit "sample demo".
+    await dataSourceManager.initialize({
+      defaultLoadMethod: welcomeVisible ? DATA_LOAD_METHODS.SAMPLE_DEMO : DATA_LOAD_METHODS.DEFAULT_DEMO
+    });
 
     // Check for GitHub repository path in query parameters
     // Must be after initialize() since github-repo source is registered there
     const githubPathParam = urlParams.get('github');
     if (githubPathParam && !remoteUrlParam) {
-      console.log(`[Main] GitHub path from param: ${githubPathParam}`);
+      debug.log(`[Main] GitHub path from param: ${githubPathParam}`);
       try {
-          const githubSource = dataSourceManager.getSource('github-repo');
-          if (githubSource) {
-            const { datasets } = await githubSource.connect(githubPathParam);
-            console.log('[Main] Connected to GitHub repository');
+        const githubSource = dataSourceManager.getSource('github-repo');
+        if (githubSource) {
+          const { datasets } = await githubSource.connect(githubPathParam);
+          debug.log('[Main] Connected to GitHub repository');
 
-            if (datasets && datasets.length > 0) {
-              await dataSourceManager.switchToDataset('github-repo', datasets[0].id, {
-                loadMethod: DATA_LOAD_METHODS.GITHUB_URL_PARAM
-              });
-              console.log(`[Main] Switched to GitHub dataset: ${datasets[0].id}`);
+          if (datasets && datasets.length > 0) {
+            await dataSourceManager.switchToDataset('github-repo', datasets[0].id, {
+              loadMethod: DATA_LOAD_METHODS.GITHUB_URL_PARAM
+            });
+            debug.log(`[Main] Switched to GitHub dataset: ${datasets[0].id}`);
 
-              // Fill in the input field for visual feedback
-              if (githubRepoUrl) {
-                githubRepoUrl.value = githubPathParam;
-            }
+            const githubRepoInput = document.getElementById('github-repo-url');
+            if (githubRepoInput) githubRepoInput.value = githubPathParam;
           }
         }
       } catch (err) {
@@ -669,7 +539,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
             await dataSourceManager.switchToDataset(requestedSource, requestedDataset, {
               loadMethod: DATA_LOAD_METHODS.DATASET_URL_PARAM
             });
-            console.log(`[Main] Loaded dataset from URL param: ${requestedSource}/${requestedDataset}`);
+            debug.log(`[Main] Loaded dataset from URL param: ${requestedSource}/${requestedDataset}`);
           } else {
             console.warn(`[Main] Requested dataset '${requestedDataset}' not found in '${requestedSource}'`);
           }
@@ -682,7 +552,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     }
 
     EXPORT_BASE_URL = dataSourceManager.getCurrentBaseUrl() || EXPORT_BASE_URL;
-    console.log(`[Main] Using dataset base URL: ${EXPORT_BASE_URL}`);
+    debug.log(`[Main] Using dataset base URL: ${EXPORT_BASE_URL}`);
 
     if (!currentDatasetLoadToken && dataSourceManager.hasActiveDataset?.()) {
       currentDatasetLoadToken = startDatasetLoad();
@@ -709,7 +579,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     // Start ALL manifest loads in parallel for faster initialization
     const identityPromise = loadDatasetIdentity(getDatasetIdentityUrl()).catch(err => {
       if (err?.status === 404) {
-        console.log('[Main] dataset_identity.json not found, using default 3D embeddings');
+        debug.log('[Main] dataset_identity.json not found, using default 3D embeddings');
         return null;
       }
       console.warn('[Main] Error loading dataset identity:', err);
@@ -720,7 +590,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
     const varPromise = loadVarManifest(getVarManifestUrl()).catch(err => {
       if (err?.status === 404) {
-        console.log('var_manifest.json not found, gene expression not available.');
+        debug.log('var_manifest.json not found, gene expression not available.');
       } else {
         console.warn('Error loading var manifest:', err);
       }
@@ -729,7 +599,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
     const connPromise = loadConnectivityManifest(getConnectivityManifestUrl()).catch(err => {
       if (err?.status === 404) {
-        console.log('connectivity_manifest.json not found, connectivity not available.');
+        debug.log('connectivity_manifest.json not found, connectivity not available.');
       } else {
         console.warn('Error loading connectivity manifest:', err);
       }
@@ -741,7 +611,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     if (datasetIdentity) {
       const embeddingsMetadata = getEmbeddingsMetadata(datasetIdentity);
       dimensionManager.initFromMetadata(embeddingsMetadata);
-      console.log(`[Main] Loaded dataset identity v${datasetIdentity.version || 1}`);
+      debug.log(`[Main] Loaded dataset identity v${datasetIdentity.version || 1}`);
     } else {
       dimensionManager.initFromMetadata({
         available_dimensions: [3],
@@ -768,12 +638,12 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     if (varManifest) {
       state.setVarFieldLoader(createVarFieldLoader(getVarManifestUrl(), { fetchInit: FAST_BINARY_FETCH_INIT }));
       state.initVarData(varManifest);
-      console.log(`Loaded var manifest with ${varManifest?.fields?.length || 0} genes.`);
+      debug.log(`Loaded var manifest with ${varManifest?.fields?.length || 0} genes.`);
     }
 
     // Log connectivity if loaded
     if (connectivityManifest) {
-      console.log(`Loaded connectivity manifest with ${connectivityManifest?.n_edges?.toLocaleString() || 0} edges.`);
+      debug.log(`Loaded connectivity manifest with ${connectivityManifest?.n_edges?.toLocaleString() || 0} edges.`);
     }
 
     // In-place dataset reload for sources that cannot survive a page refresh (e.g., local-user)
@@ -786,14 +656,6 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       }
 
       EXPORT_BASE_URL = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
-
-      // Indicate loading in dataset info block
-      if (datasetInfo) {
-        datasetInfo.classList.remove('error');
-        datasetInfo.classList.add('loading');
-      }
-      if (datasetCellsEl) datasetCellsEl.textContent = '...';
-      if (datasetGenesEl) datasetGenesEl.textContent = '...';
 
       // Disable connectivity visuals when switching datasets without reload
       if (connectivityCheckbox) {
@@ -820,7 +682,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         // Start ALL manifest loads in parallel for faster reload
         const reloadIdentityPromise = loadDatasetIdentity(getDatasetIdentityUrl()).catch(err => {
           if (err?.status === 404) {
-            console.log('[Main] dataset_identity.json not found for reloaded dataset, using default 3D embeddings');
+            debug.log('[Main] dataset_identity.json not found for reloaded dataset, using default 3D embeddings');
           } else {
             console.warn('[Main] Error loading dataset identity for reloaded dataset:', err);
           }
@@ -831,7 +693,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
         const reloadVarPromise = loadVarManifest(getVarManifestUrl()).catch(err => {
           if (err?.status === 404) {
-            console.log('[Main] var_manifest.json not found for reloaded dataset (gene expression disabled).');
+            debug.log('[Main] var_manifest.json not found for reloaded dataset (gene expression disabled).');
           } else {
             console.warn('[Main] Error loading var manifest for reloaded dataset:', err);
           }
@@ -839,7 +701,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         });
 
         const reloadConnPromise = loadConnectivityManifest(getConnectivityManifestUrl()).catch(err => {
-          console.log('[Main] Connectivity not available for reloaded dataset:', err?.message || err);
+          debug.log('[Main] Connectivity not available for reloaded dataset:', err?.message || err);
           return null;
         });
 
@@ -848,7 +710,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         if (newDatasetIdentity) {
           const newEmbeddingsMetadata = getEmbeddingsMetadata(newDatasetIdentity);
           dimensionManager.initFromMetadata(newEmbeddingsMetadata);
-          console.log(`[Main] Reloaded dataset identity v${newDatasetIdentity.version || 1}`);
+          debug.log(`[Main] Reloaded dataset identity v${newDatasetIdentity.version || 1}`);
         } else {
           dimensionManager.initFromMetadata({
             available_dimensions: [3],
@@ -870,7 +732,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         if (nextVarManifest) {
           state.setVarFieldLoader(createVarFieldLoader(getVarManifestUrl(), { fetchInit: FAST_BINARY_FETCH_INIT }));
           state.initVarData(nextVarManifest);
-          console.log(`[Main] Reloaded var manifest with ${nextVarManifest?.fields?.length || 0} genes.`);
+          debug.log(`[Main] Reloaded var manifest with ${nextVarManifest?.fields?.length || 0} genes.`);
         } else {
           state.setVarFieldLoader?.(null);
           state.varData = null;
@@ -879,7 +741,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         // Handle connectivity manifest
         if (newConnManifest && hasEdgeFormat(newConnManifest)) {
           connectivityManifest = newConnManifest;
-          console.log(`[Main] Loaded connectivity manifest for reloaded dataset: ${newConnManifest.n_edges?.toLocaleString()} edges`);
+          debug.log(`[Main] Loaded connectivity manifest for reloaded dataset: ${newConnManifest.n_edges?.toLocaleString()} edges`);
 
           // Show connectivity controls
           if (connectivityControls) {
@@ -916,18 +778,6 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         // Refresh dataset-aware UI controls (field dropdowns, gene search, stats, dimension slider)
         ui?.refreshDatasetUI?.(activeMetadata || null);
         await ui?.activateField?.(-1);
-
-        if (activeMetadata?.stats) {
-          if (datasetCellsEl && activeMetadata.stats.n_cells != null) {
-            datasetCellsEl.textContent = formatNumber(activeMetadata.stats.n_cells);
-          }
-          if (datasetGenesEl && activeMetadata.stats.n_genes != null) {
-            datasetGenesEl.textContent = formatNumber(activeMetadata.stats.n_genes);
-          }
-        }
-        if (datasetInfo) {
-          datasetInfo.classList.remove('loading', 'error');
-        }
         ui?.showSessionStatus?.('Dataset loaded', false);
         completeDataLoadSuccess(loadToken, buildDatasetAnalyticsContext({
           metadata: activeMetadata,
@@ -939,7 +789,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         console.error('[Main] Failed to reload dataset in-place:', err);
         statsEl.textContent = 'Failed to load dataset';
         notifications.error(`Failed to load dataset: ${err?.message || 'Unknown error'}`, { category: 'data' });
-        if (datasetInfo) datasetInfo.classList.add('error');
+        ui?.showSessionStatus?.(err?.message || 'Failed to load dataset', true);
         completeDataLoadFailure(loadToken, {
           ...buildDatasetAnalyticsContext({
             metadata: activeMetadata,
@@ -967,7 +817,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         ? state.getVisiblePositionsForSmoke()
         : positions;
 
-      console.log(`Building smoke volume at ${gridSize}^3 from ${visiblePositions.length / 3} visible points (GPU)…`);
+      debug.log(`Building smoke volume at ${gridSize}^3 from ${visiblePositions.length / 3} visible points (GPU)…`);
       // Use GPU-accelerated splatting for dramatic speedup
       viewer.buildSmokeVolumeGPU(visiblePositions, {
         gridSize,
@@ -983,158 +833,12 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     ui = initUI({
       state,
       viewer,
-      dom: {
-        statsEl,
-        categoricalFieldSelect,
-        categoricalFieldCopyBtn,
-        categoricalFieldRenameBtn,
-        categoricalFieldDeleteBtn,
-        categoricalFieldClearBtn,
-        continuousFieldSelect,
-        continuousFieldCopyBtn,
-        continuousFieldRenameBtn,
-        continuousFieldDeleteBtn,
-        continuousFieldClearBtn,
-        legendEl,
-        displayOptionsContainer,
-        pointSizeInput,
-        pointSizeDisplay,
-        backgroundSelect,
-        pointsControls,
-        centroidControls,
-        centroidPointsCheckbox,
-        centroidLabelsCheckbox,
-        sidebar,
-        sidebarToggle,
-        outlierFilterContainer,
-        outlierFilterInput,
-        outlierFilterDisplay,
-        filterCountEl,
-        activeFiltersEl,
-        deletedFieldsSection,
-        highlightCountEl,
-        highlightedGroupsEl,
-        clearAllHighlightsBtn,
-        highlightPagesTabsEl,
-        addHighlightPageBtn,
-        highlightModeButtons,
-        highlightModeDescription,
-        lightingStrengthInput,
-        lightingStrengthDisplay,
-        fogDensityInput,
-        fogDensityDisplay,
-        sizeAttenuationInput,
-        sizeAttenuationDisplay,
-        resetCameraBtn,
-        navigationModeSelect,
-        lookSensitivityInput,
-        lookSensitivityDisplay,
-        moveSpeedInput,
-        moveSpeedDisplay,
-        invertLookCheckbox,
-        projectilesEnabledCheckbox,
-        pointerLockCheckbox,
-        orbitReverseCheckbox,
-        showOrbitAnchorCheckbox,
-        freeflyControls,
-        orbitControls,
-        planarControls,
-        planarZoomToCursorCheckbox,
-        planarInvertAxesCheckbox,
-        orbitKeySpeedInput,
-        orbitKeySpeedDisplay,
-        planarPanSpeedInput,
-        planarPanSpeedDisplay,
-        geneExpressionContainer,
-        geneExpressionSearch,
-        geneExpressionDropdown,
-        geneExpressionCopyBtn,
-        geneExpressionRenameBtn,
-        geneExpressionDeleteBtn,
-        geneExpressionClearBtn,
-        categoryBuilderContainer,
-        renderModeSelect,
-        smokeControls,
-        smokeGridInput,
-        smokeGridDisplay,
-        smokeStepsInput,
-        smokeStepsDisplay,
-        smokeDensityInput,
-        smokeDensityDisplay,
-        smokeSpeedInput,
-        smokeSpeedDisplay,
-        smokeDetailInput,
-        smokeDetailDisplay,
-        smokeWarpInput,
-        smokeWarpDisplay,
-        smokeAbsorptionInput,
-        smokeAbsorptionDisplay,
-        smokeScatterInput,
-        smokeScatterDisplay,
-        smokeEdgeInput,
-        smokeEdgeDisplay,
-        smokeDirectLightInput,
-        smokeDirectLightDisplay,
-        cloudResolutionInput,
-        cloudResolutionDisplay,
-        noiseResolutionInput,
-        noiseResolutionDisplay,
-        splitViewControls,
-        splitKeepViewBtn,
-        splitClearBtn,
-        cameraLockBtn,
-        viewLayoutModeSelect,
-        splitViewBadgesBox,
-        splitViewBadges,
-        splitViewBoxTitle,
-        // Dimension controls
-        dimensionControls: document.getElementById('dimension-controls'),
-        dimensionSelect: document.getElementById('dimension-select'),
-        saveStateBtn,
-        loadStateBtn,
-        // Dataset selector
-        datasetSelect,
-        datasetInfo,
-        datasetNameEl,
-        datasetSourceEl,
-        datasetDescriptionEl,
-        datasetUrlEl,
-        datasetCellsEl,
-        datasetGenesEl,
-        datasetObsEl,
-        datasetConnectivityEl,
-        userDataBlock,
-        // Three separate buttons for local data loading
-        userDataH5adBtn,
-        userDataZarrBtn,
-        userDataBrowseBtn,
-        // Hidden file inputs
-        userDataFileInput,
-        userDataH5adInput,
-        userDataZarrInput,
-        userDataInfoBtn,
-        userDataInfoTooltip,
-        // Remote server
-        remoteServerUrl,
-        remoteConnectBtn,
-        remoteDisconnectBtn,
-        remoteDisconnectContainer,
-        remoteInfoBtn,
-        remoteInfoTooltip,
-        // GitHub repository
-        githubRepoUrl,
-        githubConnectBtn,
-        githubDisconnectBtn,
-        githubDisconnectContainer,
-        githubInfoBtn,
-        githubInfoTooltip
-      },
       smoke: {
         rebuildSmokeDensity
       },
       reloadActiveDataset: reloadActiveDatasetInPlace,
-      stateSerializer: stateSerializer,
-      dataSourceManager: dataSourceManager
+      stateSerializer,
+      dataSourceManager
     });
 
     // Initialize Page Analysis / Comparison Module
@@ -1278,7 +982,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       const stateFiles = await discoverLocalStateSnapshots(EXPORT_BASE_URL);
       if (!stateFiles.length) return;
       const target = stateFiles[stateFiles.length - 1];
-      console.log('[Main] Auto-loading state snapshot from', target);
+      debug.log('[Main] Auto-loading state snapshot from', target);
       try {
         await stateSerializer.loadStateFromUrl(target, DATA_LOAD_METHODS.STATE_RESTORE_AUTO);
         ui.refreshUiAfterStateLoad?.();
@@ -1287,12 +991,6 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         console.warn('[Main] Failed to auto-load state:', err);
         ui.showSessionStatus?.(err?.message || 'Failed to auto-load state', true);
       }
-    }
-
-    // Initial smoke mode setup
-    if (renderModeSelect) {
-      const mode = renderModeSelect.value || 'points';
-      viewer.setRenderMode(mode === 'smoke' ? 'smoke' : 'points');
     }
 
     // Setup connectivity controls
@@ -1324,26 +1022,13 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       let visibleEdgePrefixSum = null;
 
       /**
-       * Seeded random number generator (Mulberry32) for reproducible shuffles.
-       * Using a fixed seed ensures the same shuffle every time for consistency.
-       */
-      function mulberry32(seed) {
-        return function() {
-          let t = seed += 0x6D2B79F5;
-          t = Math.imul(t ^ t >>> 15, t | 1);
-          t ^= t + Math.imul(t ^ t >>> 7, t | 61);
-          return ((t ^ t >>> 14) >>> 0) / 4294967296;
-        };
-      }
-
-      /**
        * Fisher-Yates shuffle for edge arrays (in-place, synchronized).
        * Uses seeded RNG for reproducibility across sessions.
        * This ensures "first N edges" is a truly random sample.
        */
       function shuffleEdges(sources, destinations) {
         const n = sources.length;
-        const rng = mulberry32(42); // Fixed seed for reproducibility
+        const rng = createMulberry32(42); // Fixed seed for reproducibility
 
         for (let i = n - 1; i > 0; i--) {
           const j = Math.floor(rng() * (i + 1));
@@ -1500,7 +1185,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       function updateSliderRange(visibleEdges) {
         if (!connectivityLimitInput) return;
         const cappedMax = Math.min(visibleEdges, EDGE_UI_CAP);
-        const minVal = Math.max(100, Math.min(1000, Math.round(cappedMax * 0.01)));
+        const minVal = clamp(Math.round(cappedMax * 0.01), 100, 1000);
 
         connectivityLimitInput.max = cappedMax;
         connectivityLimitInput.min = minVal;
@@ -1591,12 +1276,12 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
           if (show && !edgesLoaded) {
             const connNotifId = notifications.loading('Loading connectivity data', { category: 'connectivity' });
             try {
-              console.log('[Main] Loading GPU-optimized edges...');
+              debug.log('[Main] Loading GPU-optimized edges...');
               const edgeData = await loadEdges(getConnectivityManifestUrl(), connectivityManifest);
 
               // Shuffle edges for truly random sampling when using MAX EDGES slider
               // This ensures "first N edges" gives a representative random sample
-              console.log('[Main] Shuffling edges for random sampling...');
+              debug.log('[Main] Shuffling edges for random sampling...');
               shuffleEdges(edgeData.sources, edgeData.destinations);
 
               // Store edge arrays for accurate visibility counting
@@ -1636,7 +1321,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
               updateSliderRange(actualVisibleEdges);
               applyEdgeLodLimit();
 
-              console.log(`[Main] Edges loaded: ${edgeData.nEdges} edges, ${edgeData.nCells} cells, visible: ${actualVisibleEdges}`);
+              debug.log(`[Main] Edges loaded: ${edgeData.nEdges} edges, ${edgeData.nCells} cells, visible: ${actualVisibleEdges}`);
 
               // Also load edges into KNN adjacency list for KNN drag mode
               if (viewer.loadKnnEdges) {
@@ -1740,7 +1425,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
           const currentLod = viewer.getCurrentLODLevel();
           if (currentLod !== lastLodLevel) {
-            console.log(`[Edges] LOD changed: ${lastLodLevel} → ${currentLod}`);
+            debug.log(`[Edges] LOD changed: ${lastLodLevel} → ${currentLod}`);
             lastLodLevel = currentLod;
             updateEdgeVisibility();
           }
@@ -1753,11 +1438,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
           lodCheckInterval = null;
         }
       }
-      if (state.addVisibilityChangeCallback) {
-        state.addVisibilityChangeCallback(onVisibilityChange);
-      } else {
-        state.setVisibilityChangeCallback(onVisibilityChange);
-      }
+      state.on('visibility:changed', onVisibilityChange);
 
       // Wire up color picker
       if (connectivityColorInput) {
@@ -1794,7 +1475,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
           const max = parseInt(connectivityLimitInput.max || EDGE_UI_CAP, 10);
           const min = parseInt(connectivityLimitInput.min || '1000', 10);
           const requested = parseInt(connectivityLimitInput.value, 10);
-          currentEdgeLimit = Math.max(min, Math.min(max, Number.isFinite(requested) ? requested : 0));
+          currentEdgeLimit = clamp(Number.isFinite(requested) ? requested : 0, min, max);
           connectivityLimitInput.value = currentEdgeLimit;
           connectivityLimitDisplay.textContent = formatEdgeCount(currentEdgeLimit);
 
@@ -1825,7 +1506,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
           // Otherwise, load edges first
           const knnNotifId = notifications.loading('Loading neighbor graph for KNN mode', { category: 'connectivity' });
           try {
-            console.log('[Main] Loading edges for KNN mode...');
+            debug.log('[Main] Loading edges for KNN mode...');
             const edgeData = await loadEdges(getConnectivityManifestUrl(), connectivityManifest);
 
             // Shuffle for random sampling (if not already done)
@@ -1842,7 +1523,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
             // Build KNN adjacency list
             viewer.loadKnnEdges(edgeData.sources, edgeData.destinations);
 
-            console.log(`[Main] KNN edges loaded: ${edgeData.nEdges} edges`);
+            debug.log(`[Main] KNN edges loaded: ${edgeData.nEdges} edges`);
             notifications.complete(knnNotifId, `Neighbor graph ready (${edgeData.nEdges.toLocaleString()} edges)`);
           } catch (err) {
             console.error('[Main] Failed to load edges for KNN:', err);
@@ -1900,7 +1581,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         const PerformanceTrackerClass = benchmarkModule.PerformanceTracker;
         perfTracker = new PerformanceTrackerClass();
         benchmarkModuleLoaded = true;
-        console.log('[Main] Benchmark module lazy-loaded');
+        debug.log('[Main] Benchmark module lazy-loaded');
         return true;
       } catch (err) {
         console.error('[Main] Failed to load benchmark module:', err);
@@ -2142,7 +1823,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         return;
       }
 
-      console.log(`Running benchmark: ${formatNumber(pointCount)} points (${pattern})`);
+      debug.log(`Running benchmark: ${formatNumber(pointCount)} points (${pattern})`);
 
       // Show notification for benchmark data generation
       const benchNotifId = notifications.startDataGeneration(pattern, pointCount);
@@ -2257,7 +1938,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       // Refresh stat panel immediately and start perf tracking loop
       activateBenchmarkingPanel({ resetTracker: true });
 
-      console.log(`Benchmark loaded: ${formatNumber(pointCount)} points, ~${gpuMemMB}MB GPU memory (gen: ${genTime}ms)`);
+      debug.log(`Benchmark loaded: ${formatNumber(pointCount)} points, ~${gpuMemMB}MB GPU memory (gen: ${genTime}ms)`);
     }
 
     async function generateSituationReport() {
@@ -2572,7 +2253,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
           }
 
           // Log to console too
-          console.log('[Bottleneck Analysis]', results);
+          debug.log('[Bottleneck Analysis]', results);
 
         } catch (err) {
           console.error('[Bottleneck] Analysis failed:', err);

@@ -20,6 +20,7 @@ venv/
 
 # Data artifacts (keep placeholders)
 data/raw/**
+/markdown/*
 !data/raw/.gitkeep
 data/experiments/**
 !data/experiments/.gitkeep

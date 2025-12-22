@@ -6,9 +6,11 @@
  */
 
 import { makeFieldId } from '../utils/field-constants.js';
+import { BaseRegistry } from './base-registry.js';
 
-export class DeleteRegistry {
+export class DeleteRegistry extends BaseRegistry {
   constructor() {
+    super();
     this._deletedFields = new Set(); // 'source:originalKey'
     this._purgedFields = new Set(); // 'source:originalKey' (confirmed, non-restorable)
   }
@@ -57,20 +59,14 @@ export class DeleteRegistry {
 
   toJSON() {
     return {
-      deleted: [...this._deletedFields],
-      purged: [...this._purgedFields]
+      deleted: BaseRegistry.setToArray(this._deletedFields),
+      purged: BaseRegistry.setToArray(this._purgedFields)
     };
   }
 
   fromJSON(data) {
-    // Dev-phase: accept either the new object format or the previous array-only format.
-    if (Array.isArray(data)) {
-      this._deletedFields = new Set(data || []);
-      this._purgedFields = new Set();
-      return;
-    }
-    this._deletedFields = new Set(data?.deleted || []);
-    this._purgedFields = new Set(data?.purged || []);
+    this._deletedFields = BaseRegistry.arrayToSet(data?.deleted);
+    this._purgedFields = BaseRegistry.arrayToSet(data?.purged);
   }
 
   clear() {

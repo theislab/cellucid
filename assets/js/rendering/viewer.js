@@ -3436,6 +3436,14 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     },
 
     /**
+     * Get current packed RGBA colors for the live view.
+     * @returns {Uint8Array|null}
+     */
+    getColors() {
+      return colorsArray;
+    },
+
+    /**
      * Get point count
      * @returns {number}
      */
@@ -3537,6 +3545,20 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         return positionsArray;
       }
       return viewPositionsCache.get(vid) || positionsArray;
+    },
+
+    /**
+     * Get packed RGBA colors for a specific view.
+     * Snapshot views may have independent colors for split-view comparisons.
+     *
+     * @param {string} viewId - View identifier
+     * @returns {Uint8Array|null}
+     */
+    getViewColors(viewId) {
+      const vid = String(viewId || LIVE_VIEW_ID);
+      if (vid === LIVE_VIEW_ID) return colorsArray;
+      const snapshot = snapshotViews.find(s => s.id === vid);
+      return snapshot?.colors || colorsArray;
     },
 
     /**
@@ -4597,13 +4619,85 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         viewportHeight: height,
         viewportWidth: width,
         fov,
+        near,
+        far,
         lightingStrength,
         fogDensity,
         fogColor: new Float32Array(fogColor),
         bgColor: new Float32Array(bgColor),
         lightDir: new Float32Array(lightDir),
         cameraPosition: [tempInvViewMatrix[12], tempInvViewMatrix[13], tempInvViewMatrix[14]],
-        cameraDistance
+        cameraDistance,
+        shaderQuality: currentShaderQuality
+      };
+    },
+
+    /**
+     * Camera parameters used for projection computations.
+     * @returns {{ fov: number; near: number; far: number }}
+     */
+    getCameraParams() {
+      return { fov, near, far };
+    },
+
+    /**
+     * Compute a render-state snapshot for a specific view without mutating
+     * the active camera or render loop state.
+     *
+     * Used by figure export to reproduce the exact projection for split views.
+     *
+     * @param {string} viewId
+     * @param {{ viewportWidth?: number; viewportHeight?: number }} [options]
+     */
+    getViewRenderState(viewId, options = {}) {
+      const [canvasW, canvasH] = canvasResizeObserver.getSize();
+      const viewportWidth = Math.max(1, Math.round(options.viewportWidth ?? canvasW));
+      const viewportHeight = Math.max(1, Math.round(options.viewportHeight ?? canvasH));
+
+      const camState = getViewCameraState(String(viewId || LIVE_VIEW_ID));
+      const viewMtx = mat4.create();
+      computeViewMatrixFromState(camState, viewMtx);
+
+      const projMtx = mat4.create();
+      mat4.perspective(projMtx, fov, viewportWidth / viewportHeight, near, far);
+
+      const mvpMtx = mat4.create();
+      mat4.multiply(mvpMtx, projMtx, viewMtx);
+      mat4.multiply(mvpMtx, mvpMtx, modelMatrix);
+
+      // Derive camera position by inverting the view matrix.
+      const invView = mat4.create();
+      mat4.invert(invView, viewMtx);
+
+      const navMode = camState?.navigationMode || 'orbit';
+      const cameraDistance = navMode === 'free' && camState?.freefly?.position
+        ? Math.sqrt(
+          camState.freefly.position[0] ** 2 +
+          camState.freefly.position[1] ** 2 +
+          camState.freefly.position[2] ** 2
+        )
+        : (camState?.orbit?.radius ?? radius);
+
+      return {
+        mvpMatrix: new Float32Array(mvpMtx),
+        viewMatrix: new Float32Array(viewMtx),
+        modelMatrix: new Float32Array(modelMatrix),
+        projectionMatrix: new Float32Array(projMtx),
+        pointSize: basePointSize,
+        sizeAttenuation,
+        viewportHeight,
+        viewportWidth,
+        fov,
+        near,
+        far,
+        lightingStrength,
+        fogDensity,
+        fogColor: new Float32Array(fogColor),
+        bgColor: new Float32Array(bgColor),
+        lightDir: new Float32Array(lightDir),
+        cameraPosition: [invView[12], invView[13], invView[14]],
+        cameraDistance,
+        shaderQuality: currentShaderQuality
       };
     },
 

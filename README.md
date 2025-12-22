@@ -16,6 +16,7 @@ WebGL-based 3D visualization for single-cell data. Explore UMAP embeddings with 
 - Interactive filtering and cell selection
 - KNN connectivity edge visualization
 - Multi-dimensional support (1D timelines, 2D, 3D)
+- Publication export: SVG (vector) + PNG (high-DPI)
 - Works in browser without Python (file picker) or with Python (Jupyter, CLI)
 
 ## Quick Start
@@ -47,6 +48,14 @@ cellucid serve ./my_export
 from cellucid import show_anndata
 show_anndata(adata)  # In-memory or file path
 ```
+
+## Figure Export (SVG/PNG)
+
+Use the **Figure Export** accordion in the sidebar to export the current view:
+
+- **SVG**: best for Illustrator/Inkscape editing; for large datasets you’ll be prompted to choose Full Vector, Optimized Vector (density-preserving), or Hybrid (points raster + vector annotations).
+- **PNG**: best compatibility; choose DPI (150/300/600).
+- **Axes**: only rendered for **2D planar views** (switch navigation to Planar) to avoid misleading axes on 3D projections.
 
 ## All 14 Loading Options
 

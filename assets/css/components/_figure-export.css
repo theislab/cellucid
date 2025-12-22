@@ -1,0 +1,269 @@
+/* =========================================================================
+   Figure Export (UI + modals)
+   ========================================================================= */
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Text/number inputs (no dropdown arrow)
+   ───────────────────────────────────────────────────────────────────────── */
+.figure-input {
+  width: 100%;
+  margin-top: var(--space-1);
+  padding: calc(var(--space-1) + var(--space-px)) var(--space-2);
+  font-size: var(--text-sm);
+  border-radius: 0;
+  border: var(--border-strong);
+  background-color: var(--color-surface-elevated);
+  color: var(--color-text-primary);
+  box-shadow: var(--shadow-sm);
+  box-sizing: border-box;
+}
+
+.figure-input:focus {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 1px;
+  box-shadow: var(--shadow-md);
+}
+
+.figure-input::placeholder {
+  color: var(--color-text-tertiary);
+}
+
+/* Compact number inputs */
+.figure-input-sm {
+  width: 64px;
+  padding: calc(var(--space-0-5) + var(--space-px)) var(--space-1-5);
+  text-align: center;
+  margin-top: 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Layout
+   ───────────────────────────────────────────────────────────────────────── */
+.figure-export-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1-5);
+  align-items: center;
+}
+
+.figure-export-row > label:first-child {
+  flex: 0 0 100%;
+}
+
+.figure-export-row .obs-select {
+  flex: 1;
+  min-width: 0;
+  margin-top: 0;
+}
+
+/* Inline labeled input groups */
+.figure-export-inline {
+  display: inline-flex;
+  gap: var(--space-1);
+  align-items: center;
+}
+
+.figure-export-inline .figure-input-sm {
+  flex: 0 0 auto;
+}
+
+.figure-export-label {
+  font-size: var(--text-xs);
+  color: var(--color-text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* Size row: preset + W/H inputs */
+.figure-export-size-row {
+  display: flex;
+  gap: var(--space-1-5);
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.figure-export-size-row .obs-select {
+  flex: 1 1 120px;
+  min-width: 100px;
+  margin-top: 0;
+}
+
+.figure-export-size-row .figure-export-inline {
+  flex: 0 0 auto;
+}
+
+/* Checkbox rows */
+.figure-export-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-3);
+  align-items: center;
+}
+
+.figure-export-checks .checkbox-inline {
+  margin-top: 0;
+}
+
+/* Actions */
+.figure-export-actions {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  padding-top: var(--space-1);
+  border-top: var(--border-width-1) solid var(--color-border-light);
+  margin-top: var(--space-1);
+}
+
+.figure-export-actions .btn-small {
+  flex: 1;
+}
+
+/* Modal (shared) */
+.figure-export-modal {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-5);
+}
+
+.figure-export-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: var(--color-surface-overlay);
+  backdrop-filter: blur(2px);
+}
+
+.figure-export-modal-content {
+  position: relative;
+  background: var(--color-surface-elevated);
+  border: var(--border-width-2) solid var(--color-border-strong);
+  box-shadow: var(--shadow-lg);
+  width: min(680px, 100%);
+  max-height: 80vh;
+  overflow: auto;
+  padding: var(--space-4);
+}
+
+.figure-export-modal-title {
+  font-family: var(--font-display);
+  font-size: 14px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin: 0 0 var(--space-3);
+}
+
+.figure-export-modal-actions {
+  display: flex;
+  gap: var(--space-2);
+  justify-content: flex-end;
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: var(--border-width-1) solid var(--color-border-light);
+}
+
+.figure-export-codeblock {
+  background: var(--color-surface-secondary);
+  border: var(--border-width-1) solid var(--color-border-light);
+  padding: var(--space-3);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow: auto;
+}
+
+/* Preview */
+.figure-export-preview-box {
+  display: grid;
+  gap: var(--space-1);
+  margin-top: var(--space-1);
+}
+
+.figure-export-preview {
+  width: 100%;
+  height: auto;
+  max-height: 180px;
+  object-fit: contain;
+  border: var(--border-width-1) solid var(--color-border-light);
+  background: var(--color-surface-secondary);
+}
+
+.figure-export-preview-status {
+  font-size: var(--text-xs);
+  color: var(--color-text-tertiary);
+  margin: 0;
+}
+
+/* Preview controls row */
+.figure-export-preview-controls {
+  display: flex;
+  gap: var(--space-1-5);
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.figure-export-preview-controls .checkbox-inline {
+  margin-top: 0;
+}
+
+.figure-export-preview-controls .obs-select {
+  flex: 1;
+  min-width: 100px;
+  margin-top: 0;
+}
+
+.figure-export-preview-controls .btn-small {
+  flex: 0 0 auto;
+  padding: var(--space-1) var(--space-2);
+}
+
+/* Style grid (background, font, etc) */
+.figure-export-style-grid {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1-5);
+}
+
+.figure-export-style-row {
+  display: flex;
+  gap: var(--space-1-5);
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.figure-export-style-row .obs-select {
+  flex: 1;
+  min-width: 80px;
+  margin-top: 0;
+}
+
+.figure-export-style-row .figure-input-sm {
+  flex: 0 0 auto;
+}
+
+/* Color picker */
+.figure-color-picker {
+  width: 28px;
+  height: 24px;
+  padding: 0;
+  border: var(--border-strong);
+  border-radius: 0;
+  box-shadow: var(--shadow-xs);
+  background: transparent;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.figure-color-picker:focus {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 1px;
+}
+
+/* Section dividers */
+.figure-export-section {
+  border-top: var(--border-width-1) solid var(--color-border-light);
+  padding-top: var(--space-1-5);
+  margin-top: var(--space-1);
+}

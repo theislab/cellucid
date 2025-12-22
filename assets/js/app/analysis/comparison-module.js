@@ -304,18 +304,14 @@ export class ComparisonModule {
     this._setAnalysisMode('simple');
 
     // Listen for page changes (add/remove/rename/switch)
-    if (this.state.addHighlightPageChangeCallback) {
-      this.state.addHighlightPageChangeCallback(() => {
-        this.onPagesChanged();
-      });
-    }
+    this.state.on?.('page:changed', () => {
+      this.onPagesChanged();
+    });
 
     // Listen for highlight changes (cells added/removed from pages)
-    if (this.state.addHighlightChangeCallback) {
-      this.state.addHighlightChangeCallback(() => {
-        this.onHighlightChanged();
-      });
-    }
+    this.state.on?.('highlight:changed', () => {
+      this.onHighlightChanged();
+    });
   }
 
   /**

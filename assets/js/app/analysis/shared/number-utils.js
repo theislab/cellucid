@@ -24,29 +24,16 @@ import {
   variance as mathVariance,
   std as mathStd
 } from '../compute/math-utils.js';
+import { isFiniteNumber } from '../../utils/number-utils.js';
+
+export { isFiniteNumber };
 
 // =============================================================================
 // NUMBER VALIDATION
 // =============================================================================
 
-/**
- * Check whether a value is a finite number (excludes NaN and ±Infinity).
- * This is THE canonical validation function - use it everywhere.
- *
- * @param {*} value - Value to check
- * @returns {boolean} True if value is a finite number
- *
- * @example
- * isFiniteNumber(42)        // true
- * isFiniteNumber(3.14)      // true
- * isFiniteNumber(NaN)       // false
- * isFiniteNumber(Infinity)  // false
- * isFiniteNumber('42')      // false
- * isFiniteNumber(null)      // false
- */
-export function isFiniteNumber(value) {
-  return typeof value === 'number' && Number.isFinite(value);
-}
+// Note: `isFiniteNumber` is imported from `app/utils/number-utils.js` to keep a
+// single source of truth shared across the app and analysis layers.
 
 // =============================================================================
 // BASIC STATISTICS
@@ -205,4 +192,3 @@ export function getFiniteMinMax(values) {
   if (count === 0) return { min: NaN, max: NaN, count: 0 };
   return { min, max, count };
 }
-

@@ -1,6 +1,6 @@
 {
-  "version": 3,
-  "timestamp": "2025-12-16T04:45:52.172Z",
+  "version": 4,
+  "timestamp": "2025-12-22T09:15:41.017Z",
   "dataSource": {
     "sourceType": "local-demo",
     "datasetId": "suo",
@@ -9,10 +9,10 @@
   "camera": {
     "navigationMode": "orbit",
     "orbit": {
-      "radius": 0.9623287024071686,
-      "targetRadius": 0.9623287024071686,
-      "theta": 3.5145652889642682,
-      "phi": 1.7789671468440647,
+      "radius": 0.9457784752440714,
+      "targetRadius": 0.9457784752440714,
+      "theta": 3.417051732943996,
+      "phi": 1.686184663921145,
       "target": [
         0,
         0,
@@ -30,6 +30,15 @@
     }
   },
   "activeDimensionLevel": 3,
+  "renames": {
+    "fields": {},
+    "categories": {}
+  },
+  "deletedFields": {
+    "deleted": [],
+    "purged": []
+  },
+  "userDefinedFields": [],
   "uiControls": {
     "remote-server-url": {
       "type": "text",
@@ -121,7 +130,7 @@
     },
     "connectivity-color": {
       "type": "color",
-      "value": "#4a4a4a"
+      "value": "#000000"
     },
     "connectivity-alpha": {
       "type": "range",
@@ -145,7 +154,7 @@
     },
     "show-orbit-anchor": {
       "type": "checkbox",
-      "checked": false
+      "checked": true
     },
     "planar-pan-speed": {
       "type": "range",
@@ -195,9 +204,41 @@
       "type": "checkbox",
       "checked": false
     },
-    "analysis-gene-search": {
+    "figure-export-title": {
       "type": "text",
       "value": ""
+    },
+    "figure-export-axes": {
+      "type": "checkbox",
+      "checked": true
+    },
+    "figure-export-legend": {
+      "type": "checkbox",
+      "checked": true
+    },
+    "figure-export-citation": {
+      "type": "checkbox",
+      "checked": true
+    },
+    "figure-export-orientation": {
+      "type": "checkbox",
+      "checked": true
+    },
+    "figure-export-depthsort": {
+      "type": "checkbox",
+      "checked": true
+    },
+    "figure-export-selection-emphasis": {
+      "type": "checkbox",
+      "checked": false
+    },
+    "figure-export-preview-enabled": {
+      "type": "checkbox",
+      "checked": false
+    },
+    "figure-export-all-views": {
+      "type": "checkbox",
+      "checked": false
     },
     "benchmark-count": {
       "type": "number",
@@ -206,6 +247,10 @@
     "dataset-select": {
       "type": "select",
       "value": "suo"
+    },
+    "theme-select": {
+      "type": "select",
+      "value": "light"
     },
     "background-select": {
       "type": "select",
@@ -239,14 +284,6 @@
       "type": "select",
       "value": "-1"
     },
-    "analysis-categorical-field": {
-      "type": "select",
-      "value": "-1"
-    },
-    "analysis-continuous-field": {
-      "type": "select",
-      "value": "-1"
-    },
     "benchmark-pattern": {
       "type": "select",
       "value": "glb"
@@ -275,6 +312,10 @@
       "type": "details",
       "open": true
     },
+    "accordion:Figure Export": {
+      "type": "details",
+      "open": false
+    },
     "accordion:Keyboard Shortcuts": {
       "type": "details",
       "open": false
@@ -288,6 +329,7 @@
     {
       "id": "page_1",
       "name": "Page 1",
+      "color": "#2563eb",
       "highlightedGroups": []
     }
   ],

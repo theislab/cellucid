@@ -420,7 +420,7 @@ export class TransformPluginRegistry extends BasePluginRegistry {
 
     // Check GPU availability
     try {
-      const { getGPUCompute } = await import('./gpu-compute.js');
+      const { getGPUCompute } = await import('../compute/gpu-compute.js');
       const gpu = getGPUCompute();
       await gpu.init();
       this._gpuAvailable = gpu._initialized;

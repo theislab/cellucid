@@ -14,66 +14,14 @@
  * - Auto-dismissing with configurable duration
  */
 
+import { debug } from './utils/debug.js';
+import { NotificationType, CategoryIcons } from './notification-center/constants.js';
+import { formatBytes, formatDuration } from './notification-center/formatters.js';
+import { downloadTrackingMethods } from './notification-center/download-tracking.js';
+import { benchmarkNotificationMethods } from './notification-center/benchmark-notifications.js';
+
 // Singleton instance
 let instance = null;
-
-// Notification types
-const NotificationType = {
-  INFO: 'info',
-  SUCCESS: 'success',
-  ERROR: 'error',
-  WARNING: 'warning',
-  LOADING: 'loading',
-  PROGRESS: 'progress'
-};
-
-// Category icons (using unicode for simplicity, no external dependencies)
-// Use registerCategory() to add new categories dynamically
-const CategoryIcons = {
-  download: '↓',
-  upload: '↑',
-  calculation: '◐',
-  spatial: '⊞',
-  render: '◉',
-  session: '⚙',
-  data: '◈',
-  connectivity: '⤲',
-  filter: '⧩',
-  highlight: '★',
-  selection: '◇',
-  lasso: '⌒',
-  benchmark: '⏱',
-  knn: '⋈',
-  view: '◫',
-  dimension: '⊡',
-  default: '●'
-};
-
-/**
- * Format bytes to human-readable size
- */
-function formatBytes(bytes, decimals = 1) {
-  // Handle edge cases: zero, negative, or fractional bytes
-  if (!bytes || bytes <= 0) return '0 B';
-  if (bytes < 1) return bytes.toFixed(decimals) + ' B';
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-  // Clamp index to valid range to prevent undefined access
-  const i = Math.min(
-    sizes.length - 1,
-    Math.max(0, Math.floor(Math.log(bytes) / Math.log(k)))
-  );
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(decimals)) + ' ' + sizes[i];
-}
-
-/**
- * Format duration in ms to human-readable
- */
-function formatDuration(ms) {
-  if (ms < 1000) return `${Math.round(ms)}ms`;
-  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
-  return `${Math.floor(ms / 60000)}m ${Math.round((ms % 60000) / 1000)}s`;
-}
 
 class NotificationCenter {
   constructor() {
@@ -111,7 +59,7 @@ class NotificationCenter {
     document.body.appendChild(this.container);
     this.initialized = true;
 
-    console.log('[NotificationCenter] Initialized');
+    debug.log('[NotificationCenter] Initialized');
   }
 
   /**
@@ -475,110 +423,6 @@ class NotificationCenter {
   }
 
   // =========================================================================
-  // Download tracking with speed calculation
-  // =========================================================================
-
-  /**
-   * Start tracking a download
-   * @param {string} name - Download name for display
-   * @param {number} totalBytes - Total size in bytes (optional)
-   * @returns {string} Tracker ID
-   */
-  startDownload(name, totalBytes = null) {
-    const id = this._generateId();
-
-    const tracker = {
-      name,
-      totalBytes,
-      loadedBytes: 0,
-      startTime: performance.now(),
-      lastTime: performance.now(),
-      lastBytes: 0,
-      speed: 0,
-      notificationId: null
-    };
-
-    this.downloadTrackers.set(id, tracker);
-
-    // Create notification
-    tracker.notificationId = this.show({
-      id: `download-${id}`,
-      type: totalBytes ? NotificationType.PROGRESS : NotificationType.LOADING,
-      category: 'download',
-      title: 'Downloading',
-      message: name,
-      progress: 0,
-      speed: 0
-    });
-
-    return id;
-  }
-
-  /**
-   * Update download progress
-   * @param {string} id - Tracker ID
-   * @param {number} loadedBytes - Bytes loaded so far
-   * @param {number} totalBytes - Total bytes (optional, for when size becomes known)
-   */
-  updateDownload(id, loadedBytes, totalBytes = null) {
-    const tracker = this.downloadTrackers.get(id);
-    if (!tracker) return;
-
-    const now = performance.now();
-    const timeDelta = now - tracker.lastTime;
-    const bytesDelta = loadedBytes - tracker.lastBytes;
-
-    // Calculate speed (smoothed)
-    if (timeDelta > 100) { // Update speed every 100ms
-      const instantSpeed = (bytesDelta / timeDelta) * 1000;
-      tracker.speed = tracker.speed * 0.7 + instantSpeed * 0.3; // Exponential smoothing
-      tracker.lastTime = now;
-      tracker.lastBytes = loadedBytes;
-    }
-
-    tracker.loadedBytes = loadedBytes;
-    if (totalBytes !== null) tracker.totalBytes = totalBytes;
-
-    // Calculate progress
-    const progress = tracker.totalBytes ? (loadedBytes / tracker.totalBytes) * 100 : null;
-
-    // Update notification
-    this._updateNotification(`download-${id}`, {
-      type: progress !== null ? NotificationType.PROGRESS : NotificationType.LOADING,
-      progress,
-      speed: tracker.speed,
-      message: tracker.totalBytes
-        ? `${tracker.name} (${formatBytes(loadedBytes)} / ${formatBytes(tracker.totalBytes)})`
-        : `${tracker.name} (${formatBytes(loadedBytes)})`
-    });
-  }
-
-  /**
-   * Complete a download
-   */
-  completeDownload(id, message = null) {
-    const tracker = this.downloadTrackers.get(id);
-    if (!tracker) return;
-
-    const duration = performance.now() - tracker.startTime;
-    const finalMessage = message || `${tracker.name} (${formatBytes(tracker.loadedBytes)} in ${formatDuration(duration)})`;
-
-    this.complete(`download-${id}`, finalMessage);
-    this.downloadTrackers.delete(id);
-  }
-
-  /**
-   * Fail a download
-   */
-  failDownload(id, errorMessage) {
-    const tracker = this.downloadTrackers.get(id);
-    if (!tracker) return;
-
-    this.fail(`download-${id}`, `${tracker.name}: ${errorMessage}`);
-    this.downloadTrackers.delete(id);
-  }
-
-  // =========================================================================
   // Calculation tracking
   // =========================================================================
 
@@ -675,124 +519,9 @@ class NotificationCenter {
 
     return results;
   }
-
-  // =========================================================================
-  // Benchmark-specific notifications
-  // =========================================================================
-
-  /**
-   * Start a benchmark run notification
-   * @param {string} name - Benchmark name (e.g., "1M points (clusters)")
-   * @param {Object} options - Additional options
-   * @returns {string} Notification ID
-   */
-  startBenchmark(name, options = {}) {
-    return this.show({
-      type: NotificationType.LOADING,
-      category: 'benchmark',
-      title: 'Benchmark',
-      message: name,
-      ...options
-    });
-  }
-
-  /**
-   * Update benchmark progress
-   * @param {string} id - Notification ID
-   * @param {number} progress - Progress percentage (0-100)
-   * @param {string} stage - Current stage description
-   */
-  updateBenchmark(id, progress, stage = null) {
-    this._updateNotification(id, {
-      type: NotificationType.PROGRESS,
-      progress,
-      message: stage
-    });
-  }
-
-  /**
-   * Complete a benchmark with results
-   * @param {string} id - Notification ID
-   * @param {Object} results - Benchmark results
-   * @param {number} results.fps - Average FPS
-   * @param {number} results.points - Number of points
-   * @param {number} results.duration - Total duration in ms
-   */
-  completeBenchmark(id, results) {
-    const { fps, points, duration } = results;
-    let message = '';
-    if (fps !== undefined) {
-      message = `${fps.toFixed(1)} FPS`;
-      if (points) message += ` (${formatNumber(points)} pts)`;
-      if (duration) message += ` in ${formatDuration(duration)}`;
-    } else if (duration) {
-      message = `Complete (${formatDuration(duration)})`;
-    } else {
-      message = 'Benchmark complete';
-    }
-    this.complete(id, message);
-  }
-
-  /**
-   * Start data generation notification
-   * @param {string} pattern - Generation pattern (e.g., "clusters", "octopus")
-   * @param {number} pointCount - Number of points
-   * @returns {string} Notification ID
-   */
-  startDataGeneration(pattern, pointCount) {
-    const formattedCount = typeof formatNumber === 'function'
-      ? formatNumber(pointCount)
-      : pointCount.toLocaleString();
-    return this.show({
-      type: NotificationType.LOADING,
-      category: 'benchmark',
-      title: 'Generating Data',
-      message: `${formattedCount} points (${pattern})`
-    });
-  }
-
-  /**
-   * Complete data generation
-   * @param {string} id - Notification ID
-   * @param {number} duration - Generation time in ms
-   */
-  completeDataGeneration(id, duration) {
-    this.complete(id, `Data ready (${formatDuration(duration)})`);
-  }
-
-  /**
-   * Start report generation notification
-   * @returns {string} Notification ID
-   */
-  startReport() {
-    return this.show({
-      type: NotificationType.LOADING,
-      category: 'benchmark',
-      title: 'Generating Report',
-      message: 'Collecting system information...'
-    });
-  }
-
-  /**
-   * Complete report generation
-   * @param {string} id - Notification ID
-   * @param {boolean} copiedToClipboard - Whether copied to clipboard
-   */
-  completeReport(id, copiedToClipboard = false) {
-    const message = copiedToClipboard
-      ? 'Report copied to clipboard'
-      : 'Report ready';
-    this.complete(id, message);
-  }
 }
 
-// Helper for formatting numbers (if not available from imports)
-function formatNumber(n) {
-  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
-  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
-  return n.toString();
-}
+Object.assign(NotificationCenter.prototype, downloadTrackingMethods, benchmarkNotificationMethods);
 
 // =========================================================================
 // Singleton accessor

@@ -1031,17 +1031,6 @@ export function createVarFieldLoader(manifestUrl, options = {}) {
   return (field) => loadVarFieldData(manifestUrl, field, options);
 }
 
-// Legacy loader kept for backward compatibility (single large JSON payload).
-export async function loadObsJson(url) {
-  // Handle local-user:// URLs
-  if (isLocalUserUrl(url)) {
-    return fetchLocalUserJson(url);
-  }
-
-  const response = await fetchOk(url);
-  return response.json();
-}
-
 // ============================================================================
 // CONNECTIVITY / EDGE DATA LOADERS
 // ============================================================================

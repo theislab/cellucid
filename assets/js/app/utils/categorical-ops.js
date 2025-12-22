@@ -11,9 +11,7 @@
  * @module categorical-ops
  */
 
-function normalizeLabel(value) {
-  return String(value ?? '').trim().toLocaleLowerCase();
-}
+import { normalizeForCompare } from './label-utils.js';
 
 function escapeRegExp(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -26,7 +24,7 @@ function escapeRegExp(s) {
  * @returns {boolean}
  */
 function isUnassignedVariant(label, baseLabelLower) {
-  const norm = normalizeLabel(label);
+  const norm = normalizeForCompare(label);
   if (!norm) return false;
   const re = new RegExp(`^${escapeRegExp(baseLabelLower)}(\\s+\\d+)?$`, 'i');
   return re.test(norm);
@@ -55,7 +53,7 @@ export function buildDeleteToUnassignedTransform(categories, deleteIndex, option
   const labels = Array.isArray(categories) ? categories : [];
   const oldCount = labels.length;
   const unassignedLabel = String(options.unassignedLabel ?? 'unassigned').trim() || 'unassigned';
-  const baseLower = normalizeLabel(unassignedLabel) || 'unassigned';
+  const baseLower = normalizeForCompare(unassignedLabel) || 'unassigned';
   const canonicalLabel = baseLower; // keep a consistent canonical representation
 
   const unassignedIndices = [];
@@ -65,7 +63,7 @@ export function buildDeleteToUnassignedTransform(categories, deleteIndex, option
     const label = labels[i];
     if (!isUnassignedVariant(label, baseLower)) continue;
     unassignedIndices.push(i);
-    if (baseUnassignedOldIndex == null && normalizeLabel(label) === baseLower) {
+    if (baseUnassignedOldIndex == null && normalizeForCompare(label) === baseLower) {
       baseUnassignedOldIndex = i;
     }
   }

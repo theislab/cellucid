@@ -6,11 +6,15 @@
  */
 
 import { makeFieldId } from '../utils/field-constants.js';
+import { BaseRegistry } from './base-registry.js';
 
-export class RenameRegistry {
+export class RenameRegistry extends BaseRegistry {
   constructor() {
+    super();
     this._fieldRenames = new Map(); // 'source:originalKey' -> displayKey
     this._categoryRenames = new Map(); // 'source:originalFieldKey:catIdx' -> label
+    // Alias the canonical map so common BaseRegistry helpers apply.
+    this._data = this._fieldRenames;
   }
 
   // ---------------------------------------------------------------------------
@@ -66,14 +70,15 @@ export class RenameRegistry {
 
   toJSON() {
     return {
-      fields: Object.fromEntries(this._fieldRenames),
-      categories: Object.fromEntries(this._categoryRenames)
+      fields: BaseRegistry.mapToObject(this._fieldRenames),
+      categories: BaseRegistry.mapToObject(this._categoryRenames)
     };
   }
 
   fromJSON(data) {
-    this._fieldRenames = new Map(Object.entries(data?.fields || {}));
-    this._categoryRenames = new Map(Object.entries(data?.categories || {}));
+    this._fieldRenames = BaseRegistry.objectToMap(data?.fields);
+    this._categoryRenames = BaseRegistry.objectToMap(data?.categories);
+    this._data = this._fieldRenames;
   }
 
   clear() {
@@ -85,4 +90,3 @@ export class RenameRegistry {
     return { fields: this._fieldRenames.size, categories: this._categoryRenames.size };
   }
 }
-

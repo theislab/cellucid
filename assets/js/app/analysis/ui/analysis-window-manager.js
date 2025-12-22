@@ -14,6 +14,7 @@
 import { getNotificationCenter } from '../../notification-center.js';
 import { getDockableAccordions } from '../../dockable-accordions-registry.js';
 import { SIDEBAR_MAX_WIDTH_PX, SIDEBAR_MIN_WIDTH_PX } from '../../sidebar-metrics.js';
+import { isFiniteNumber } from '../shared/number-utils.js';
 import { StyleManager } from '../../../utils/style-manager.js';
 
 const MAX_ANALYSIS_WINDOWS = 20;
@@ -39,10 +40,6 @@ function getHeaderTitleForMode(typeInfo, modeId) {
 
 function isDomRectLike(rect) {
   return rect && typeof rect.left === 'number' && typeof rect.top === 'number';
-}
-
-function isFiniteNumber(value) {
-  return typeof value === 'number' && Number.isFinite(value);
 }
 
 export class AnalysisWindowManager {
