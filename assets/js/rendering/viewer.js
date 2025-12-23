@@ -13,6 +13,9 @@ import { HighPerfRenderer } from './high-perf-renderer.js';
 import { HighlightTools } from './highlight-renderer.js';
 import { OrbitAnchorRenderer } from './orbit-anchor.js';
 import { createProjectileSystem } from './projectiles.js';
+import { OverlayManager } from './overlays/overlay-manager.js';
+import { buildOverlayContext } from './overlays/overlay-context.js';
+import { VelocityOverlay } from './overlays/velocity/velocity-overlay.js';
 
 export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onViewFocus }) {
   // WebGL2 ONLY - no fallback
@@ -117,6 +120,24 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   // Highlight toolset (renderer + interactive tools)
   let highlightTools = null;
   let currentShaderQuality = 'full';
+
+  // === OVERLAYS (opt-in render passes, e.g. vector field particles) ===
+  let overlayManager = null;
+  let vectorFieldOverlay = null;
+
+  function ensureOverlayManager() {
+    if (overlayManager) return overlayManager;
+    overlayManager = new OverlayManager(gl);
+    return overlayManager;
+  }
+
+  function ensureVectorFieldOverlay() {
+    if (vectorFieldOverlay) return vectorFieldOverlay;
+    vectorFieldOverlay = new VelocityOverlay(gl);
+    vectorFieldOverlay.init();
+    ensureOverlayManager().register(vectorFieldOverlay);
+    return vectorFieldOverlay;
+  }
 
   // === BUFFERS ===
   // Centroid buffers (small count, separate from main points)
@@ -253,6 +274,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   // Per-view dimension tracking for multi-dimensional support
   const viewDimensionLevels = new Map();  // viewId -> dimension level (1, 2, 3, or 4)
   const viewPositionsCache = new Map();   // viewId -> Float32Array positions
+
+  function getFallbackDimensionLevel() {
+    const liveDim = viewDimensionLevels.get(LIVE_VIEW_ID);
+    return liveDim !== undefined ? liveDim : 3;
+  }
+
+  function getEffectiveDimensionLevel(viewId) {
+    const vid = String(viewId);
+    const cached = viewDimensionLevels.get(vid);
+    if (cached !== undefined) return cached;
+    return getFallbackDimensionLevel();
+  }
 
   const viewTitleLayerEl = viewTitleLayer || null;
   const sidebarEl = sidebar || null;
@@ -468,7 +501,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     getGridBounds: () => ({ min: -GRID_SIZE, max: GRID_SIZE }),
     isGridVisible: () => showGrid && gridOpacity > 0.1,
     // For dimension-aware spatial index collision queries
-    getCurrentDimensionLevel: () => viewDimensionLevels.get(LIVE_VIEW_ID) ?? 3,
+    getCurrentDimensionLevel: () => getFallbackDimensionLevel(),
   });
 
   function getOrbitSigns() {
@@ -492,9 +525,102 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     eventCleanupFns.push(() => target.removeEventListener(event, handler, options));
   }
 
+  // === WebGL context loss handling (WebGL2-only policy) ===
+  let webglContextLost = false;
+  let webglContextOverlay = null;
+  let webglContextOverlayMessage = null;
+
+  function ensureWebglContextOverlay() {
+    if (webglContextOverlay) return webglContextOverlay;
+
+    const overlay = document.createElement('div');
+    overlay.id = 'cellucid-webgl-context-overlay';
+    overlay.style.cssText = `
+      position: fixed;
+      inset: 0;
+      z-index: 2147483647;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0, 0, 0, 0.65);
+      color: #fff;
+      font-family: var(--font-sans, system-ui, sans-serif);
+      padding: 24px;
+      text-align: center;
+    `;
+
+    const panel = document.createElement('div');
+    panel.style.cssText = `
+      max-width: 520px;
+      width: 100%;
+      background: rgba(20, 20, 20, 0.9);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: 10px;
+      padding: 18px 20px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+    `;
+
+    const title = document.createElement('div');
+    title.style.cssText = 'font-size: 16px; font-weight: 700; margin-bottom: 10px;';
+    title.textContent = 'WebGL Context Lost';
+
+    const message = document.createElement('div');
+    message.style.cssText = 'font-size: 13px; line-height: 1.5; opacity: 0.95; margin-bottom: 14px;';
+    message.textContent = 'WebGL context lost. Reload required.';
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn-small';
+    btn.textContent = 'Reload';
+    btn.style.cssText = 'cursor: pointer;';
+    btn.addEventListener('click', () => window.location.reload());
+
+    panel.appendChild(title);
+    panel.appendChild(message);
+    panel.appendChild(btn);
+    overlay.appendChild(panel);
+
+    document.body.appendChild(overlay);
+    webglContextOverlay = overlay;
+    webglContextOverlayMessage = message;
+    return overlay;
+  }
+
+  function showWebglContextOverlay(message) {
+    const overlay = ensureWebglContextOverlay();
+    if (webglContextOverlayMessage) {
+      webglContextOverlayMessage.textContent = message;
+    }
+    overlay.style.display = 'flex';
+  }
+
   // === Event Listeners ===
   const handleContextMenu = (e) => { e.preventDefault(); return false; };
   addEventListenerWithCleanup(canvas, 'contextmenu', handleContextMenu);
+
+  addEventListenerWithCleanup(canvas, 'webglcontextlost', (e) => {
+    // Prevent default so the browser is allowed to attempt restoration; we still require reload.
+    e.preventDefault();
+    if (webglContextLost) return;
+    webglContextLost = true;
+
+    // Stop animation loop immediately to avoid GL calls on a lost context.
+    if (animationHandle) {
+      cancelAnimationFrame(animationHandle);
+      animationHandle = null;
+    }
+
+    // Hide DOM overlays that assume a working render loop.
+    if (labelLayer) labelLayer.style.display = 'none';
+    if (viewTitleLayerEl) viewTitleLayerEl.style.display = 'none';
+
+    showWebglContextOverlay('WebGL context lost. Reload required to continue.');
+  });
+
+  addEventListenerWithCleanup(canvas, 'webglcontextrestored', () => {
+    // Resource re-init is complex and high-risk; require a full reload.
+    showWebglContextOverlay('WebGL context restored, but Cellucid requires a reload to reinitialize GPU resources.');
+  });
 
   addEventListenerWithCleanup(canvas, 'mousedown', (e) => {
     if (highlightTools && highlightTools.handleMouseDown(e)) {
@@ -2177,7 +2303,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     // Get the dimension level for this view and use spatial index if available
     // Don't force creation - use brute force fallback if no spatial index exists
-    const viewDimLevel = viewDimensionLevels.get(String(clickedViewId)) ?? viewDimensionLevels.get(LIVE_VIEW_ID) ?? 3;
+    const viewDimLevel = getEffectiveDimensionLevel(clickedViewId);
     // Use snapshot's own spatial index for custom-position snapshots, fall back to global
     let spatialIndex = null;
     if (clickedViewId !== LIVE_VIEW_ID) {
@@ -2527,8 +2653,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   }
 
   function render() {
+    if (webglContextLost) return;
     animationHandle = requestAnimationFrame(render);
     const now = performance.now();
+    const timeSeconds = now / 1000;
     const dt = Math.min(0.05, Math.max(0.001, (now - lastFrameTime) / 1000));
     lastFrameTime = now;
 
@@ -2660,7 +2788,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
         // Pass snapshot buffer ID if available (uses immutable snapshot, consistent with grid mode)
         const snapshotId = hasSnapshotBuffer ? view.id : null;
-        renderSingleView(width, height, { x: 0, y: 0, w: 1, h: 1 }, view.id, view.centroidCount, snapshotId);
+        renderSingleView(width, height, { x: 0, y: 0, w: 1, h: 1 }, view.id, view.centroidCount, snapshotId, dt, timeSeconds);
       } else {
         // Single-layout mode with multiple views: render the focused view with its snapshot buffer
         // Reset main buffer tracking since we use snapshot buffers for consistency with grid mode
@@ -2682,14 +2810,14 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         }
 
         // Create or recreate centroid snapshot buffer if needed
-        const viewDimLevel = viewDimensionLevels.get(view.id) ?? 3;
+        const viewDimLevel = getEffectiveDimensionLevel(view.id);
         if (view.centroidPositions && view.centroidColors && centroidBufferNeedsUpdate(view.id, viewDimLevel, view.centroidPositions)) {
           createCentroidSnapshotBuffer(view.id, view.centroidPositions, view.centroidColors, viewDimLevel);
         }
 
         // Pass snapshot buffer ID if available (uses immutable snapshot, consistent with grid mode)
         const snapshotId = hasSnapshotBuffer ? view.id : null;
-        renderSingleView(width, height, { x: 0, y: 0, w: 1, h: 1 }, view.id, view.centroidCount, snapshotId);
+        renderSingleView(width, height, { x: 0, y: 0, w: 1, h: 1 }, view.id, view.centroidCount, snapshotId, dt, timeSeconds);
       }
       hideViewTitles(); // No titles in single/fullscreen mode
       return;
@@ -2799,14 +2927,14 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         }
 
         // Create or recreate centroid snapshot buffer if needed (dimension change, position change, or doesn't exist)
-        const viewDimLevel = viewDimensionLevels.get(view.id) ?? 3;
+        const viewDimLevel = getEffectiveDimensionLevel(view.id);
         if (view.centroidPositions && view.centroidColors && centroidBufferNeedsUpdate(view.id, viewDimLevel, view.centroidPositions)) {
           createCentroidSnapshotBuffer(view.id, view.centroidPositions, view.centroidColors, viewDimLevel);
         }
 
         // Render this viewport - use snapshot buffer if available (no data upload!)
         const snapshotId = hasSnapshotBuffer ? view.id : null;
-        renderSingleView(vw, vh, { x: col / cols, y: row / rows, w: 1 / cols, h: 1 / rows }, view.id, view.centroidCount, snapshotId);
+        renderSingleView(vw, vh, { x: col / cols, y: row / rows, w: 1 / cols, h: 1 / rows }, view.id, view.centroidCount, snapshotId, dt, timeSeconds);
 
         gl.disable(gl.SCISSOR_TEST);
       }
@@ -2821,7 +2949,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     mat4.multiply(mvpMatrix, mvpMatrix, modelMatrix);
   }
 
-  function renderSingleView(width, height, viewport, viewId, overrideCentroidCount, snapshotBufferId = null) {
+  function renderSingleView(width, height, viewport, viewId, overrideCentroidCount, snapshotBufferId = null, dtSeconds = 0.016, timeSeconds = 0) {
     const vid = viewId || focusedViewId || LIVE_VIEW_ID;
     const numCentroids = overrideCentroidCount !== undefined ? overrideCentroidCount : centroidCount;
 
@@ -2838,7 +2966,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     // Render params shared by both render paths
     // Get dimension level for this view (used for LOD and frustum culling calculations)
-    const dimLevel = viewDimensionLevels.get(vid) ?? 3;
+    const dimLevel = getEffectiveDimensionLevel(vid);
     // Camera distance calculation: use per-view cached distance when available (for multiview support)
     // For focused view or locked cameras, global state is authoritative; otherwise use cached per-view value
     let camDist;
@@ -2877,6 +3005,30 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       hpRenderer.renderWithSnapshot(snapshotBufferId, renderParams);
     } else {
       hpRenderer.render(renderParams);
+    }
+
+    // Render overlays (after main points, before selection highlights).
+    if (overlayManager?.hasEnabledOverlays?.()) {
+      const overlayCtx = buildOverlayContext({
+        gl,
+        viewId: vid,
+        renderParams,
+        timeSeconds,
+        deltaTimeSeconds: dtSeconds,
+        isSnapshot: Boolean(snapshotBufferId),
+        dimensionLevel: dimLevel,
+        hpRenderer,
+        getViewPositions: () => viewPositionsCache.get(String(vid)) || positionsArray,
+        getViewTransparency: () => {
+          if (!vid || vid === LIVE_VIEW_ID) return transparencyArray;
+          if (snapshot && !snapshot.sharesLiveTransparency && snapshot.transparency) {
+            return snapshot.transparency;
+          }
+          return transparencyArray;
+        }
+      });
+      overlayManager.update(dtSeconds, overlayCtx);
+      overlayManager.render(overlayCtx);
     }
 
     // Draw highlights (selection rings) on top of scatter points
@@ -3374,6 +3526,14 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       // Rebuild highlight buffer when visibility changes (filter applied/removed)
       highlightTools?.handleTransparencyChange?.(alphaArray);
 
+      // Let overlays (e.g., vector field particles) rebuild spawn sources lazily when visibility changes.
+      if (vectorFieldOverlay?.enabled) {
+        vectorFieldOverlay.markVisibilityDirty(LIVE_VIEW_ID);
+        for (const snap of snapshotViews) {
+          vectorFieldOverlay.markVisibilityDirty(snap.id);
+        }
+      }
+
       // Propagate transparency reference to snapshots that share transparency with live view
       // NOTE: We do NOT rebuild snapshot GPU buffers here - that was ~16x slower than necessary.
       // Instead, renderWithSnapshot() uses useAlphaTexture=true for these snapshots, which
@@ -3410,7 +3570,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
       // Update HP renderer with new positions (keeps existing colors/transparency)
       // Pass dimension level so the renderer can update for the correct dimension
-      const dimLevel = viewDimensionLevels.get(LIVE_VIEW_ID) ?? 3;
+      const dimLevel = getFallbackDimensionLevel();
       if (hpRenderer && hpRenderer.updatePositions) {
         hpRenderer.updatePositions(positions, dimLevel);
       } else if (hpRenderer && hpRenderer.loadData) {
@@ -3493,7 +3653,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
      * @returns {number} Dimension level (defaults to 3)
      */
     getViewDimension(viewId) {
-      return viewDimensionLevels.get(String(viewId)) ?? 3;
+      return getEffectiveDimensionLevel(viewId);
     },
 
     /**
@@ -3512,7 +3672,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         positionsArray = positions;
         computePointBoundsFromPositions(positions);
         // Pass dimension level so the renderer can build the appropriate spatial index
-        const dimLevel = viewDimensionLevels.get(vid) ?? 3;
+        const dimLevel = getEffectiveDimensionLevel(vid);
         if (hpRenderer && hpRenderer.updatePositions) {
           hpRenderer.updatePositions(positions, dimLevel);
         }
@@ -3957,7 +4117,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     setProjectilesEnabled(enabled, onReady) {
       projectileSystem.setEnabled(enabled);
       // Get the current dimension level for collision detection
-      const dimLevel = viewDimensionLevels.get(LIVE_VIEW_ID) ?? 3;
+      const dimLevel = getFallbackDimensionLevel();
       if (enabled && hpRenderer && !hpRenderer.hasSpatialIndex(dimLevel)) {
         // Defer spatial index building so UI can update first (show loading message)
         setTimeout(() => {
@@ -3970,7 +4130,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       }
     },
     isProjectileSpatialIndexReady() {
-      const dimLevel = viewDimensionLevels.get(LIVE_VIEW_ID) ?? 3;
+      const dimLevel = getFallbackDimensionLevel();
       return !!(hpRenderer && hpRenderer.hasSpatialIndex(dimLevel));
     },
 
@@ -4343,7 +4503,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
           JSON.parse(JSON.stringify(liveCameraState || getCurrentCameraStateInternal())));
 
       // Get initial dimension level from config or inherit from current live view
-      const initialDimLevel = config.dimensionLevel ?? viewDimensionLevels.get(LIVE_VIEW_ID) ?? 3;
+      const initialDimLevel = config.dimensionLevel ?? getFallbackDimensionLevel();
 
       // Track if this snapshot should share transparency with the live view
       // If sharesLiveTransparency is true, filter changes on live view propagate to this snapshot
@@ -4387,7 +4547,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       // Create centroid GPU buffer for this snapshot (uploaded once)
       // Pass dimension level so buffer can be recreated if dimension changes
       if (snapshot.centroidPositions && snapshot.centroidColors) {
-        const dimLevel = viewDimensionLevels.get(id) ?? 3;
+        const dimLevel = getEffectiveDimensionLevel(id);
         createCentroidSnapshotBuffer(id, snapshot.centroidPositions, snapshot.centroidColors, dimLevel);
       }
 
@@ -4441,7 +4601,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       // Re-upload centroid GPU buffer if changed
       // Pass dimension level so buffer can be recreated if dimension changes
       if ((attrs.centroidPositions || attrs.centroidColors) && snap.centroidPositions && snap.centroidColors) {
-        const dimLevel = viewDimensionLevels.get(id) ?? 3;
+        const dimLevel = getEffectiveDimensionLevel(id);
         createCentroidSnapshotBuffer(id, snap.centroidPositions, snap.centroidColors, dimLevel);
       }
 
@@ -4449,6 +4609,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       if (viewLayoutMode === 'single' && focusedViewId === id) {
         if (snap.colors) hpRenderer.updateColors(snap.colors);
         if (snap.transparency) hpRenderer.updateAlphas(snap.transparency);
+      }
+
+      if (transparencyChanged && vectorFieldOverlay?.enabled) {
+        vectorFieldOverlay.markVisibilityDirty(id);
       }
       return true;
     },
@@ -4472,6 +4636,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         // Clean up per-view dimension state
         viewDimensionLevels.delete(id);
         viewPositionsCache.delete(id);
+        vectorFieldOverlay?.disposeView?.(id);
         snapshotViews.splice(idx, 1);
         const key = String(id);
         if (key !== LIVE_VIEW_ID) {
@@ -4515,6 +4680,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         cachedViewMatrices.delete(snap.id);
         viewDimensionLevels.delete(snap.id);
         viewPositionsCache.delete(snap.id);
+        vectorFieldOverlay?.disposeView?.(snap.id);
       }
       snapshotViews.length = 0;
       focusedViewId = LIVE_VIEW_ID;
@@ -4599,6 +4765,49 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     getGLContext() { return gl; },
     getHPRenderer() { return hpRenderer; },
     isWebGL2() { return true; },
+
+    // ---------------------------------------------------------------------
+    // Vector field overlay (GPU particle flow)
+    // ---------------------------------------------------------------------
+
+    setVectorFieldOverlayEnabled(enabled) {
+      const on = Boolean(enabled);
+      if (!on && !vectorFieldOverlay) return;
+      const overlay = ensureVectorFieldOverlay();
+      overlay.enabled = on;
+      if (on) {
+        overlay.markVisibilityDirty(LIVE_VIEW_ID);
+        for (const snap of snapshotViews) {
+          overlay.markVisibilityDirty(snap.id);
+        }
+      }
+    },
+
+    setVectorFieldConfig(key, value) {
+      if (!key) return;
+      const overlay = vectorFieldOverlay || ensureVectorFieldOverlay();
+      overlay.setConfig?.(key, value);
+    },
+
+    setActiveVectorField(fieldId) {
+      const overlay = vectorFieldOverlay || ensureVectorFieldOverlay();
+      overlay.setActiveField?.(fieldId);
+    },
+
+    setVectorFieldData(fieldId, dimensionLevel, fieldData) {
+      const overlay = vectorFieldOverlay || ensureVectorFieldOverlay();
+      overlay.setVectorFieldData?.(fieldId, dimensionLevel, fieldData);
+    },
+
+    hasVectorFieldForDimension(fieldId, dimensionLevel) {
+      return vectorFieldOverlay?.hasFieldForDimension?.(fieldId, dimensionLevel) ?? false;
+    },
+
+    resetVectorFieldOverlay() {
+      if (!vectorFieldOverlay) return;
+      overlayManager?.unregister?.(vectorFieldOverlay.id);
+      vectorFieldOverlay = null;
+    },
 
     getRenderState() {
       const [width, height] = canvasResizeObserver.getSize();
@@ -4701,10 +4910,6 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       };
     },
 
-    // HP renderer is always used now, these are no-ops
-    setExternalRenderer(renderer) {},
-    clearExternalRenderer() {},
-
     // HP renderer controls
     setShaderQuality(quality) {
       currentShaderQuality = quality || 'full';
@@ -4731,6 +4936,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     },
 
     start() {
+      if (webglContextLost) {
+        showWebglContextOverlay('WebGL context lost. Reload required to continue.');
+        return;
+      }
       if (!animationHandle) animationHandle = requestAnimationFrame(render);
     },
 
@@ -4753,6 +4962,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
       // Disconnect resize observer
       canvasResizeObserver.disconnect();
+
+      if (webglContextOverlay?.parentNode) {
+        webglContextOverlay.parentNode.removeChild(webglContextOverlay);
+      }
+      webglContextOverlay = null;
+      webglContextOverlayMessage = null;
 
       // Clean up WebGL resources
       for (const [, entry] of edgePositionTexturesV2) {

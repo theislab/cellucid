@@ -139,7 +139,11 @@ export class FigureContainer {
     this._cleanup();
     this._previewContainer.classList.remove('loading');
     this._previewContainer.classList.add('empty');
-    this._previewContainer.innerHTML = `<div class="analysis-error">${message}</div>`;
+    this._previewContainer.innerHTML = '';
+    const errorEl = document.createElement('div');
+    errorEl.className = 'analysis-error';
+    errorEl.textContent = String(message);
+    this._previewContainer.appendChild(errorEl);
     this._actionsContainer.style.display = 'none';
 
     this._notifications.error(message, { category: 'data', title: 'Analysis Error' });
@@ -154,10 +158,12 @@ export class FigureContainer {
     this._previewContainer.classList.remove('loading');
     this._previewContainer.classList.add('empty');
 
+    this._previewContainer.innerHTML = '';
     if (message) {
-      this._previewContainer.innerHTML = `<div class="analysis-empty-message">${message}</div>`;
-    } else {
-      this._previewContainer.innerHTML = '';
+      const emptyEl = document.createElement('div');
+      emptyEl.className = 'analysis-empty-message';
+      emptyEl.textContent = String(message);
+      this._previewContainer.appendChild(emptyEl);
     }
 
     this._actionsContainer.style.display = 'none';
@@ -342,7 +348,11 @@ export class FigureContainer {
     } catch (err) {
       console.error('[FigureContainer] Modal plot render failed:', err);
       if (this._modal._plotContainer) {
-        this._modal._plotContainer.innerHTML = `<div class="analysis-error">Failed to render: ${err.message}</div>`;
+        this._modal._plotContainer.innerHTML = '';
+        const errorEl = document.createElement('div');
+        errorEl.className = 'analysis-error';
+        errorEl.textContent = `Failed to render: ${err?.message || err}`;
+        this._modal._plotContainer.appendChild(errorEl);
       }
     }
   }

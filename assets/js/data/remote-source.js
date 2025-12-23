@@ -40,7 +40,6 @@ import { expandObsManifest, expandVarManifest } from './data-loaders.js';
 /**
  * @typedef {Object} RemoteServerInfo
  * @property {string} version - Server version
- * @property {string} data_dir - Data directory on server
  * @property {string} host - Server host
  * @property {number} port - Server port
  * @property {string} mode - Server mode ('standalone', 'async', 'jupyter')
@@ -129,6 +128,9 @@ export class RemoteDataSource {
 
     /** @type {boolean} */
     this._connected = false;
+
+    /** @type {Map<string, string>} Dataset ID -> base path (from /_cellucid/datasets) */
+    this._datasetPaths = new Map();
 
     /** @type {Map<string, DatasetMetadata>} */
     this._datasetCache = new Map();
@@ -231,12 +233,23 @@ export class RemoteDataSource {
 
       // Get server info
       const infoResponse = await fetch(`${serverUrl}/_cellucid/info`);
+      if (!infoResponse.ok) {
+        throw new DataSourceError(
+          `Server info request failed: ${infoResponse.status} ${infoResponse.statusText}`,
+          DataSourceErrorCode.NETWORK_ERROR,
+          this.type,
+          { url: serverUrl, status: infoResponse.status }
+        );
+      }
       this._serverInfo = await infoResponse.json();
 
       this._connected = true;
       this._reconnectAttempts = 0;
 
       console.log(`[RemoteDataSource] Connected to ${serverUrl}`, this._serverInfo);
+
+      // Cache dataset paths to correctly handle single-dataset root mode.
+      await this._refreshDatasetPaths();
 
       // Try to connect WebSocket for live updates (optional)
       this._connectWebSocket();
@@ -492,12 +505,20 @@ export class RemoteDataSource {
       }
 
       const data = await response.json();
-      const datasetList = data.datasets || [];
+      const datasetList = (data.datasets || []).filter(ds => ds?.id);
+      this._datasetPaths.clear();
+      for (const ds of datasetList) {
+        let dsPath = typeof ds.path === 'string' ? ds.path : `/${ds.id}/`;
+        if (!dsPath.startsWith('/')) dsPath = `/${dsPath}`;
+        if (!dsPath.endsWith('/')) dsPath = `${dsPath}/`;
+        this._datasetPaths.set(ds.id, dsPath);
+      }
 
       // Load metadata for all datasets in parallel
       const metadataPromises = datasetList.map(async (ds) => {
         try {
-          const baseUrl = `${this._serverUrl}${ds.path}`;
+          const dsPath = this._datasetPaths.get(ds.id) || `/${ds.id}/`;
+          const baseUrl = `${this._serverUrl}${dsPath}`;
           const metadata = await loadDatasetMetadata(baseUrl, ds.id, this.type);
           this._datasetCache.set(ds.id, metadata);
           return metadata;
@@ -590,10 +611,8 @@ export class RemoteDataSource {
         this.type
       );
     }
-    // If single dataset mode (data_dir is the dataset), use root
-    if (this._serverInfo?.data_dir?.endsWith(datasetId)) {
-      return `${this._serverUrl}/`;
-    }
+    const dsPath = this._datasetPaths.get(datasetId);
+    if (dsPath) return `${this._serverUrl}${dsPath}`;
     return `${this._serverUrl}/${datasetId}/`;
   }
 
@@ -618,11 +637,39 @@ export class RemoteDataSource {
     // This will be resolved by resolveUrl() to actual HTTP URL
     const urlHost = new URL(this._serverUrl).host;
 
-    // If single dataset mode, use root path
-    if (this._serverInfo?.data_dir?.endsWith(datasetId)) {
-      return `remote://${urlHost}/`;
-    }
+    const dsPath = this._datasetPaths.get(datasetId);
+    if (dsPath) return `remote://${urlHost}${dsPath}`;
     return `remote://${urlHost}/${datasetId}/`;
+  }
+
+  /**
+   * Refresh dataset base-path mappings from the server.
+   * Ensures correct behavior when the server is hosting a single dataset at `/`.
+   * @private
+   */
+  async _refreshDatasetPaths() {
+    if (!this._serverUrl) return;
+
+    try {
+      const response = await fetch(`${this._serverUrl}/_cellucid/datasets`);
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const data = await response.json();
+      const datasetList = data.datasets || [];
+
+      this._datasetPaths.clear();
+      for (const ds of datasetList) {
+        if (!ds?.id) continue;
+        let dsPath = typeof ds.path === 'string' ? ds.path : `/${ds.id}/`;
+        if (!dsPath.startsWith('/')) dsPath = `/${dsPath}`;
+        if (!dsPath.endsWith('/')) dsPath = `${dsPath}/`;
+        this._datasetPaths.set(ds.id, dsPath);
+      }
+    } catch (err) {
+      console.warn('[RemoteDataSource] Failed to fetch /_cellucid/datasets:', err);
+      this._datasetPaths.clear();
+    }
   }
 
   /**

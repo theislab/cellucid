@@ -6,6 +6,8 @@
 
 import { escapeHtml } from '../utils.js';
 
+let activeKeydownHandler = null;
+
 export function showConfirmDialog({
   title,
   message,
@@ -13,6 +15,11 @@ export function showConfirmDialog({
   onConfirm,
   onCancel
 }) {
+  if (activeKeydownHandler) {
+    document.removeEventListener('keydown', activeKeydownHandler);
+    activeKeydownHandler = null;
+  }
+
   const existing = document.querySelector('.confirm-dialog-overlay');
   if (existing) existing.remove();
 
@@ -34,7 +41,16 @@ export function showConfirmDialog({
     </div>
   `;
 
-  const close = () => overlay.remove();
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    if (activeKeydownHandler) {
+      document.removeEventListener('keydown', activeKeydownHandler);
+      activeKeydownHandler = null;
+    }
+    overlay.remove();
+  };
 
   const cancelBtn = overlay.querySelector('.confirm-dialog-cancel');
   const confirmBtn = overlay.querySelector('.confirm-dialog-confirm');
@@ -59,11 +75,10 @@ export function showConfirmDialog({
     if (e.key !== 'Escape') return;
     close();
     onCancel?.();
-    document.removeEventListener('keydown', onKeyDown);
   };
+  activeKeydownHandler = onKeyDown;
   document.addEventListener('keydown', onKeyDown);
 
   document.body.appendChild(overlay);
   confirmBtn?.focus?.();
 }
-

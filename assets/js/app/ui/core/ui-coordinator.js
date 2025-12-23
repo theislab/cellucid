@@ -14,6 +14,7 @@ import { collectDOMReferences } from './dom-cache.js';
 import { initSidebarControls } from '../modules/sidebar-controls.js';
 import { initStatsDisplay } from '../modules/stats-display.js';
 import { initRenderControls } from '../modules/render-controls.js';
+import { initVelocityOverlayControls } from '../modules/velocity-overlay-controls.js';
 import { initCameraControls } from '../modules/camera-controls.js';
 import { initLegendRenderer } from '../modules/legend-renderer.js';
 import { initFilterControls } from '../modules/filter-controls.js';
@@ -25,7 +26,7 @@ import { initDatasetControls } from '../modules/dataset-controls.js';
 import { initSessionControls } from '../modules/session-controls.js';
 import { initVisualizationReset } from '../modules/visualization-reset.js';
 import { initFigureExport } from '../modules/figure-export/index.js';
-import { debug } from '../../utils/debug.js';
+import { debug } from '../../../utils/debug.js';
 
 const LIVE_VIEW_ID = 'live';
 
@@ -60,6 +61,7 @@ export function initUI({
     dom: dom.render,
     smoke
   });
+  initVelocityOverlayControls({ state, viewer, dom: dom.render });
   const cameraControls = initCameraControls({
     viewer,
     dom: dom.camera,

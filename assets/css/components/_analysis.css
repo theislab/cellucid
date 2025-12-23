@@ -2172,6 +2172,101 @@ details.form-section[open] > summary.section-title::after {
   color: var(--color-text-secondary);
 }
 
+/* Collapsible Page Selector Section */
+.insights-page-selector-section {
+  margin-top: 8px;
+  border-top: var(--border-width-1) solid var(--color-border-light);
+  padding-top: 6px;
+}
+
+.insights-collapsible-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 0;
+  cursor: pointer;
+  user-select: none;
+  transition: color var(--duration-fast) var(--easing-standard);
+}
+
+.insights-collapsible-header:hover {
+  color: var(--color-text-primary);
+}
+
+.insights-collapsible-header:focus-visible {
+  outline: none;
+  color: var(--color-interactive-primary);
+}
+
+.insights-collapsible-toggle {
+  font-size: 8px;
+  color: var(--color-text-tertiary);
+  width: 10px;
+  text-align: center;
+}
+
+.insights-collapsible-title {
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--color-text-secondary);
+}
+
+.insights-page-mode-indicator {
+  font-size: 9px;
+  color: var(--color-text-tertiary);
+  margin-left: auto;
+}
+
+.insights-collapsible-content {
+  padding: 6px 0 2px;
+}
+
+.insights-page-selector-container {
+  margin-top: 2px;
+}
+
+/* Page tabs within quick insights */
+.insights-page-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+}
+
+.insights-page-tabs .analysis-page-tab {
+  padding: 3px 6px;
+  font-size: 10px;
+  min-height: unset;
+}
+
+.insights-page-tabs .analysis-page-color {
+  width: 8px;
+  height: 8px;
+}
+
+/* Dynamic tab styling */
+.insights-dynamic-tab {
+  border-style: dashed;
+}
+
+.insights-dynamic-icon {
+  font-size: 10px;
+  margin-right: 2px;
+  opacity: 0.7;
+}
+
+.insights-dynamic-tab.selected .insights-dynamic-icon {
+  opacity: 1;
+}
+
+/* Separator between dynamic and page tabs */
+.insights-page-separator {
+  width: 1px;
+  height: 16px;
+  background: var(--color-border-light);
+  margin: 0 4px;
+}
+
 /* ========================================================================= */
 /* Color Palette Selector                                                     */
 /* ========================================================================= */

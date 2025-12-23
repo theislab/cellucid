@@ -16,6 +16,7 @@ WebGL-based 3D visualization for single-cell data. Explore UMAP embeddings with 
 - Interactive filtering and cell selection
 - KNN connectivity edge visualization
 - Multi-dimensional support (1D timelines, 2D, 3D)
+- Animated vector field overlay (velocity / drift) with GPU particle flow
 - Publication export: SVG (vector) + PNG (high-DPI)
 - Works in browser without Python (file picker) or with Python (Jupyter, CLI)
 
@@ -98,6 +99,15 @@ Cellucid supports 6 deployment modes, each with support for pre-exported binary 
 
 - **Required:** `obsm['X_umap']` or `obsm['X_umap_3d']` (shape: n_cells × 2 or 3)
 - **Optional:** `obs` (cell metadata), `X` (expression matrix), `obsp['connectivities']` (KNN graph)
+
+## Vector Field Overlay (Velocity / Drift)
+
+Cellucid can render an animated particle-flow overlay from **per-cell displacement vectors** (e.g. scVelo velocity, CellRank drift).
+
+- **AnnData**: store vectors in `adata.obsm` using keys like `velocity_umap_2d`, `velocity_umap_3d`, `T_fwd_umap_2d`, etc. (shape: n_cells × dim).
+- **Prepared exports**: include binary vector files under `vectors/` and a `vector_fields` block in `dataset_identity.json`.
+
+Naming/import details: [VECTOR_FIELD_OVERLAY_CONVENTIONS.md](markdown/VECTOR_FIELD_OVERLAY_CONVENTIONS.md)
 
 ### Saving as zarr
 

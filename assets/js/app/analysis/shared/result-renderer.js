@@ -60,11 +60,16 @@ export function renderStatsGrid(container, stats, options = {}) {
 
     // Format value if formatter provided
     const displayValue = stat.format ? stat.format(stat.value) : stat.value;
+    const valueEl = document.createElement('span');
+    valueEl.className = 'stat-value';
+    valueEl.textContent = displayValue ?? '';
 
-    item.innerHTML = `
-      <span class="stat-value">${displayValue}</span>
-      <span class="stat-label">${stat.label}</span>
-    `;
+    const labelEl = document.createElement('span');
+    labelEl.className = 'stat-label';
+    labelEl.textContent = stat.label ?? '';
+
+    item.appendChild(valueEl);
+    item.appendChild(labelEl);
 
     if (stat.title) {
       item.title = stat.title;
@@ -108,51 +113,66 @@ export function renderSignatureSummaryStats(container, pageData) {
   const table = document.createElement('table');
   table.className = 'signature-stats-table';
 
-  // Header
-  table.innerHTML = `
-    <thead>
-      <tr>
-        <th>Page</th>
-        <th>Mean</th>
-        <th>Median</th>
-        <th>Std</th>
-        <th>Cells</th>
-      </tr>
-    </thead>
-    <tbody></tbody>
-  `;
+  const thead = document.createElement('thead');
+  const headerRow = document.createElement('tr');
+  for (const col of ['Page', 'Mean', 'Median', 'Std', 'Cells']) {
+    const th = document.createElement('th');
+    th.textContent = col;
+    headerRow.appendChild(th);
+  }
+  thead.appendChild(headerRow);
+  table.appendChild(thead);
 
-  const tbody = table.querySelector('tbody');
+  const tbody = document.createElement('tbody');
 
   for (const pd of pageData) {
     const values = filterFiniteNumbers(pd.values);
     const n = values.length;
 
     if (n === 0) {
-      tbody.innerHTML += `
-        <tr>
-          <td>${pd.pageName}</td>
-          <td colspan="4">No valid values</td>
-        </tr>
-      `;
+      const row = document.createElement('tr');
+      const pageCell = document.createElement('td');
+      pageCell.textContent = pd.pageName ?? '';
+      row.appendChild(pageCell);
+
+      const emptyCell = document.createElement('td');
+      emptyCell.colSpan = 4;
+      emptyCell.textContent = 'No valid values';
+      row.appendChild(emptyCell);
+
+      tbody.appendChild(row);
       continue;
     }
 
     const meanVal = mean(values);
     const medianVal = median(values);
     const stdVal = std(values);
+    const row = document.createElement('tr');
 
-    tbody.innerHTML += `
-      <tr>
-        <td>${pd.pageName}</td>
-        <td>${meanVal.toFixed(3)}</td>
-        <td>${medianVal.toFixed(3)}</td>
-        <td>${stdVal.toFixed(3)}</td>
-        <td>${n.toLocaleString()}</td>
-      </tr>
-    `;
+    const pageCell = document.createElement('td');
+    pageCell.textContent = pd.pageName ?? '';
+    row.appendChild(pageCell);
+
+    const meanCell = document.createElement('td');
+    meanCell.textContent = meanVal.toFixed(3);
+    row.appendChild(meanCell);
+
+    const medianCell = document.createElement('td');
+    medianCell.textContent = medianVal.toFixed(3);
+    row.appendChild(medianCell);
+
+    const stdCell = document.createElement('td');
+    stdCell.textContent = stdVal.toFixed(3);
+    row.appendChild(stdCell);
+
+    const countCell = document.createElement('td');
+    countCell.textContent = n.toLocaleString();
+    row.appendChild(countCell);
+
+    tbody.appendChild(row);
   }
 
+  table.appendChild(tbody);
   section.appendChild(table);
   container.appendChild(section);
   return section;
@@ -181,7 +201,9 @@ export function renderDataTable(container, options) {
   wrapper.className = `result-table-container ${className || ''}`.trim();
 
   if (title) {
-    wrapper.innerHTML = `<h5>${title}</h5>`;
+    const heading = document.createElement('h5');
+    heading.textContent = title;
+    wrapper.appendChild(heading);
   }
 
   const table = document.createElement('table');
@@ -258,26 +280,45 @@ export function renderDEGenesTable(container, results, options = {}) {
 
   const table = document.createElement('table');
   table.className = 'de-genes-table';
-  table.innerHTML = `
-    <thead>
-      <tr>
-        <th>Gene</th>
-        <th>Log2 FC</th>
-        <th>Adj. p-value</th>
-        <th>Direction</th>
-      </tr>
-    </thead>
-    <tbody>
-      ${topGenes.map(g => `
-        <tr class="${g.log2FoldChange > 0 ? 'up' : 'down'}">
-          <td class="gene-name">${g.gene}</td>
-          <td class="log2fc">${g.log2FoldChange.toFixed(3)}</td>
-          <td class="pvalue">${g.adjustedPValue.toExponential(2)}</td>
-          <td class="direction">${g.log2FoldChange > 0 ? '\u2191' : '\u2193'}</td>
-        </tr>
-      `).join('')}
-    </tbody>
-  `;
+
+  const thead = document.createElement('thead');
+  const headerRow = document.createElement('tr');
+  for (const col of ['Gene', 'Log2 FC', 'Adj. p-value', 'Direction']) {
+    const th = document.createElement('th');
+    th.textContent = col;
+    headerRow.appendChild(th);
+  }
+  thead.appendChild(headerRow);
+  table.appendChild(thead);
+
+  const tbody = document.createElement('tbody');
+  for (const g of topGenes) {
+    const row = document.createElement('tr');
+    row.className = g.log2FoldChange > 0 ? 'up' : 'down';
+
+    const geneCell = document.createElement('td');
+    geneCell.className = 'gene-name';
+    geneCell.textContent = g.gene ?? '';
+    row.appendChild(geneCell);
+
+    const fcCell = document.createElement('td');
+    fcCell.className = 'log2fc';
+    fcCell.textContent = Number.isFinite(g.log2FoldChange) ? g.log2FoldChange.toFixed(3) : 'N/A';
+    row.appendChild(fcCell);
+
+    const pCell = document.createElement('td');
+    pCell.className = 'pvalue';
+    pCell.textContent = Number.isFinite(g.adjustedPValue) ? g.adjustedPValue.toExponential(2) : 'N/A';
+    row.appendChild(pCell);
+
+    const dirCell = document.createElement('td');
+    dirCell.className = 'direction';
+    dirCell.textContent = g.log2FoldChange > 0 ? '↑' : '↓';
+    row.appendChild(dirCell);
+
+    tbody.appendChild(row);
+  }
+  table.appendChild(tbody);
 
   wrapper.appendChild(table);
   container.appendChild(wrapper);
@@ -351,15 +392,29 @@ export function createPlotContainer(container, options = {}) {
     element: plotDiv,
 
     showLoading() {
-      plotDiv.innerHTML = '<div class="plot-loading"><div class="spinner"></div></div>';
+      plotDiv.textContent = '';
+      const loading = document.createElement('div');
+      loading.className = 'plot-loading';
+      const spinner = document.createElement('div');
+      spinner.className = 'spinner';
+      loading.appendChild(spinner);
+      plotDiv.appendChild(loading);
     },
 
     showError(message) {
-      plotDiv.innerHTML = `<div class="plot-error">Failed to render plot: ${message}</div>`;
+      plotDiv.textContent = '';
+      const el = document.createElement('div');
+      el.className = 'plot-error';
+      el.textContent = `Failed to render plot: ${message ?? ''}`;
+      plotDiv.appendChild(el);
     },
 
     showEmpty(message = 'No data to display') {
-      plotDiv.innerHTML = `<div class="plot-empty">${message}</div>`;
+      plotDiv.textContent = '';
+      const el = document.createElement('div');
+      el.className = 'plot-empty';
+      el.textContent = message ?? '';
+      plotDiv.appendChild(el);
     },
 
     async render(plotType, data, plotOptions, layoutEngine) {
@@ -397,12 +452,19 @@ export function renderGeneChips(container, genes, options = {}) {
   section.className = 'gene-chips-section';
 
   if (options.title) {
-    section.innerHTML = `<h5>${options.title} (${genes.length})</h5>`;
+    const heading = document.createElement('h5');
+    heading.textContent = `${options.title} (${genes.length})`;
+    section.appendChild(heading);
   }
 
   const chipsDiv = document.createElement('div');
   chipsDiv.className = 'gene-chips';
-  chipsDiv.innerHTML = genes.map(g => `<span class="gene-chip">${g}</span>`).join('');
+  for (const gene of genes) {
+    const chip = document.createElement('span');
+    chip.className = 'gene-chip';
+    chip.textContent = gene ?? '';
+    chipsDiv.appendChild(chip);
+  }
 
   section.appendChild(chipsDiv);
   container.appendChild(section);

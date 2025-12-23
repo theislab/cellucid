@@ -862,29 +862,71 @@ export class H5adLoader {
     this._ensureOpen();
 
     // Detect available UMAP dimensions using shape metadata only (no full array loading)
-    const availableDimensions = [];
-    let defaultDimension = 3;
+    const availableDimensions = new Set();
+    const explicitDims = new Set();
+    let umapResolution = null;
 
-    for (const key of this._obsmKeys) {
-      if (key === 'X_umap_3d' || (key === 'X_umap' && !this._obsmKeys.includes('X_umap_3d'))) {
-        // Use getEmbeddingShape() to avoid loading full array just for dimension detection
-        const { nDims } = this.getEmbeddingShape(key);
-        if (nDims === 3) availableDimensions.push(3);
-        else if (nDims === 2) availableDimensions.push(2);
-        else if (nDims === 1) availableDimensions.push(1);
+    for (const dim of [1, 2, 3]) {
+      const key = `X_umap_${dim}d`;
+      if (!this._obsmKeys.includes(key)) continue;
+      try {
+        const { shape, nDims } = this.getEmbeddingShape(key);
+        if (shape?.length !== 2) {
+          console.warn(`[H5adLoader] Ignoring '${key}': expected 2D array, got shape ${shape}`);
+          continue;
+        }
+        if (shape[0] !== this._nObs) {
+          console.warn(`[H5adLoader] Ignoring '${key}': ${shape[0]} rows but expected ${this._nObs}`);
+          continue;
+        }
+        if (nDims !== dim) {
+          console.warn(`[H5adLoader] Ignoring '${key}': ${nDims} columns but expected ${dim}`);
+          continue;
+        }
+        availableDimensions.add(dim);
+        explicitDims.add(dim);
+      } catch (e) {
+        console.warn(`[H5adLoader] Failed to read embedding shape for '${key}':`, e);
       }
-      if (key === 'X_umap_2d') availableDimensions.push(2);
-      if (key === 'X_umap_1d') availableDimensions.push(1);
     }
 
-    // Fallback: check X_umap
-    if (availableDimensions.length === 0 && this._obsmKeys.includes('X_umap')) {
-      const { nDims } = this.getEmbeddingShape('X_umap');
-      availableDimensions.push(nDims);
+    if (this._obsmKeys.includes('X_umap')) {
+      try {
+        const { shape, nDims } = this.getEmbeddingShape('X_umap');
+        if (shape?.length !== 2) {
+          umapResolution = { source_key: 'X_umap', action: 'ignored', reason: 'invalid_shape', shape };
+        } else if (shape[0] !== this._nObs) {
+          umapResolution = {
+            source_key: 'X_umap',
+            action: 'ignored',
+            reason: 'row_count_mismatch',
+            shape,
+            expected_rows: this._nObs,
+          };
+        } else if (nDims < 1 || nDims > 3) {
+          umapResolution = { source_key: 'X_umap', action: 'ignored', reason: 'unsupported_dim', n_dims: nDims };
+        } else {
+          const aliasKey = `X_umap_${nDims}d`;
+          if (explicitDims.has(nDims)) {
+            umapResolution = {
+              source_key: 'X_umap',
+              action: 'ignored',
+              reason: 'explicit_key_present',
+              dim: nDims,
+              alias_key: aliasKey,
+            };
+          } else {
+            availableDimensions.add(nDims);
+            umapResolution = { source_key: 'X_umap', action: 'used_as', dim: nDims, alias_key: aliasKey };
+          }
+        }
+      } catch (e) {
+        console.warn("[H5adLoader] Failed to read embedding shape for 'X_umap':", e);
+      }
     }
 
     // If still no embeddings found, check for any obsm array that could be an embedding
-    if (availableDimensions.length === 0) {
+    if (availableDimensions.size === 0) {
       // Look for common embedding key patterns
       const embeddingPatterns = ['X_pca', 'X_tsne', 'X_phate', 'X_draw_graph', 'X_diffmap'];
       for (const pattern of embeddingPatterns) {
@@ -893,7 +935,7 @@ export class H5adLoader {
           try {
             const { nDims } = this.getEmbeddingShape(matchingKey);
             if (nDims >= 1 && nDims <= 3) {
-              availableDimensions.push(nDims);
+              availableDimensions.add(nDims);
               console.warn(`[H5adLoader] No UMAP found, using ${matchingKey} as fallback embedding`);
               break;
             }
@@ -905,7 +947,8 @@ export class H5adLoader {
     }
 
     // If absolutely no embeddings found, throw a helpful error
-    if (availableDimensions.length === 0) {
+    const availableDimensionsList = Array.from(availableDimensions);
+    if (availableDimensionsList.length === 0) {
       throw new Error(
         `No suitable embeddings found in obsm. Expected X_umap, X_umap_3d, X_umap_2d, or similar. ` +
         `Available obsm keys: ${this._obsmKeys.join(', ') || '(none)'}. ` +
@@ -913,8 +956,8 @@ export class H5adLoader {
       );
     }
 
-    availableDimensions.sort((a, b) => b - a); // Prefer higher dimensions
-    defaultDimension = availableDimensions[0];
+    availableDimensionsList.sort((a, b) => b - a); // Prefer higher dimensions
+    const defaultDimension = availableDimensionsList[0];
 
     // Count obs field types using getObsFieldInfo() for performance
     // This only loads metadata (dtype, categories) without loading all values/codes
@@ -951,8 +994,9 @@ export class H5adLoader {
         has_connectivity: hasConnectivity,
       },
       embeddings: {
-        available_dimensions: availableDimensions,
+        available_dimensions: availableDimensionsList,
         default_dimension: defaultDimension,
+        ...(umapResolution ? { umap_resolution: umapResolution } : {}),
       },
       obs_fields: this._obsKeys.map(key => ({ key, kind: 'unknown' })),
       source: {

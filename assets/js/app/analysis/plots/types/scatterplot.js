@@ -15,6 +15,7 @@ import { getFiniteMinMax, isFiniteNumber, mean } from '../../shared/number-utils
 import { applyLegendPosition } from '../../shared/legend-utils.js';
 import { getPlotTheme } from '../../shared/plot-theme.js';
 import { generateCategoryColors } from '../../shared/color-utils.js';
+import { escapeHtml } from '../../../utils/dom-utils.js';
 
 const scatterPlotDefinition = {
   id: 'scatterplot',
@@ -177,7 +178,7 @@ const scatterPlotDefinition = {
 
       if (useDensity && xData.length > densityThreshold && !hasColorBy) {
         // Use density plot for large datasets (only when not coloring by category)
-        traces.push({
+            traces.push({
           type: 'histogram2dcontour',
           name: pageResult.pageName,
           x: xData,
@@ -240,15 +241,15 @@ const scatterPlotDefinition = {
             legendgroup: cat,
             x: catX,
             y: catY,
-            marker: {
-              color: categoryColors.get(cat) || color,
-              size: pointSize,
-              opacity: pointOpacity,
-              line: { width: 0 }
-            },
-            hovertemplate: `${pageResult.xVariable || 'X'}: %{x:.2f}<br>` +
-              `${pageResult.yVariable || 'Y'}: %{y:.2f}<br>` +
-              `${pageResult.colorVariable}: ${cat}<extra></extra>`,
+              marker: {
+                color: categoryColors.get(cat) || color,
+                size: pointSize,
+                opacity: pointOpacity,
+                line: { width: 0 }
+              },
+            hovertemplate: `${escapeHtml(pageResult.xVariable || 'X')}: %{x:.2f}<br>` +
+              `${escapeHtml(pageResult.yVariable || 'Y')}: %{y:.2f}<br>` +
+              `${escapeHtml(pageResult.colorVariable)}: ${escapeHtml(cat)}<extra></extra>`,
             hoverlabel: COMMON_HOVER_STYLE
           });
         }
@@ -266,9 +267,9 @@ const scatterPlotDefinition = {
             opacity: pointOpacity,
             line: { width: 0 }
           },
-          hovertemplate: `${pageResult.pageName}<br>` +
-            `${pageResult.xVariable || 'X'}: %{x:.2f}<br>` +
-            `${pageResult.yVariable || 'Y'}: %{y:.2f}<extra></extra>`,
+          hovertemplate: `${escapeHtml(pageResult.pageName)}<br>` +
+            `${escapeHtml(pageResult.xVariable || 'X')}: %{x:.2f}<br>` +
+            `${escapeHtml(pageResult.yVariable || 'Y')}: %{y:.2f}<extra></extra>`,
           hoverlabel: COMMON_HOVER_STYLE
         });
       }
@@ -329,7 +330,7 @@ const scatterPlotDefinition = {
         const significance = pValue < 0.001 ? '***' : pValue < 0.01 ? '**' : pValue < 0.05 ? '*' : '';
 
         annotations.push({
-          text: `<b>${pageResult.pageName}</b><br>` +
+          text: `<b>${escapeHtml(pageResult.pageName ?? '')}</b><br>` +
                 `R² = ${rSquared.toFixed(3)}${significance}<br>` +
                 `r = ${pageResult.r.toFixed(3)}<br>` +
                 `n = ${xData.length}`,

@@ -2104,12 +2104,12 @@ export class HighPerfRenderer {
         // CRITICAL: Don't delete buffer for full-detail LOD entries!
         // Full-detail LOD stores a reference to this.buffers.interleaved (the main VBO).
         // Deleting it here would corrupt the main buffer, causing subsequent renders to fail.
-        if (lod.buffer && !lod.isFullDetail) {
+        if (lod.buffer && lod.isFullDetail !== true) {
           gl.deleteBuffer(lod.buffer);
         }
         // Full-detail LOD also uses the main VAO (this.vao), so don't delete it either.
         // Only delete VAOs created specifically for reduced LOD levels.
-        if (lod.vao && !lod.isFullDetail) {
+        if (lod.vao && lod.isFullDetail !== true) {
           gl.deleteVertexArray(lod.vao);
         }
         // Index buffers are always LOD-specific, safe to delete for all levels
@@ -3956,6 +3956,55 @@ export class HighPerfRenderer {
 
   getPositions() {
     return this._positions;
+  }
+
+  /**
+   * Read-only fog range accessors for overlays and export utilities.
+   * @returns {number}
+   */
+  getFogNear() { return this.fogNear; }
+
+  /**
+   * @returns {number}
+   */
+  getFogFar() { return this.fogFar; }
+
+  /**
+   * Read-only alpha texture accessors for overlays.
+   * The alpha texture is the canonical visibility mask for filters/outliers.
+   *
+   * @returns {WebGLTexture|null}
+   */
+  getAlphaTexture() { return this._alphaTexture; }
+
+  /**
+   * @returns {number}
+   */
+  getAlphaTextureWidth() { return this._alphaTexWidth; }
+
+  /**
+   * @returns {boolean}
+   */
+  isAlphaTextureActive() { return Boolean(this._useAlphaTexture && this._alphaTexture && this._alphaTexWidth > 0); }
+
+  /**
+   * Get the original point indices included in the current LOD level for a view.
+   * Returns null when LOD is inactive (lodLevel < 0) or unavailable.
+   *
+   * Useful for overlays that want to downsample spawn sources without scanning
+   * the full `pointCount` array on the CPU.
+   *
+   * @param {string|number} viewId
+   * @param {number} [dimensionLevel]
+   * @returns {Uint32Array|null}
+   */
+  getCurrentLodIndices(viewId, dimensionLevel = this.currentDimensionLevel) {
+    const lodLevel = this.getCurrentLODLevel(viewId);
+    if (lodLevel == null || lodLevel < 0) return null;
+    const dim = Math.max(1, Math.min(3, Math.floor(dimensionLevel || this.currentDimensionLevel || 3)));
+    const spatialIndex = this.spatialIndices.get(dim);
+    const level = spatialIndex?.lodLevels?.[lodLevel];
+    return (level && level.indices instanceof Uint32Array) ? level.indices : null;
   }
 
   /**

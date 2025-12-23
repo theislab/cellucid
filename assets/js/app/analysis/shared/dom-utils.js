@@ -414,10 +414,15 @@ export function createFormButton(text, onClick, options = {}) {
 export function createNotice(message, options = {}) {
   const notice = document.createElement('div');
   notice.className = options.className || 'analysis-requirement-notice';
-  notice.innerHTML = `
-    <span class="notice-icon">${options.icon || '⚠'}</span>
-    <span>${message}</span>
-  `;
+  const icon = document.createElement('span');
+  icon.className = 'notice-icon';
+  icon.textContent = options.icon || '⚠';
+
+  const text = document.createElement('span');
+  text.textContent = message ?? '';
+
+  notice.appendChild(icon);
+  notice.appendChild(text);
   return notice;
 }
 
@@ -495,10 +500,16 @@ export function createFormCheckbox({ label, name, checked = false, helpText, onC
 export function createResultHeader(title, subtitle) {
   const header = document.createElement('div');
   header.className = 'result-header';
-  header.innerHTML = `
-    <h3>${title}</h3>
-    ${subtitle ? `<p class="result-subtitle">${subtitle}</p>` : ''}
-  `;
+  const heading = document.createElement('h3');
+  heading.textContent = title ?? '';
+  header.appendChild(heading);
+
+  if (subtitle) {
+    const subtitleEl = document.createElement('p');
+    subtitleEl.className = 'result-subtitle';
+    subtitleEl.textContent = subtitle;
+    header.appendChild(subtitleEl);
+  }
   return header;
 }
 
@@ -553,10 +564,16 @@ export function createPerformanceSettings(options) {
   // Create header
   const header = document.createElement('div');
   header.className = `${className.replace('settings', 'header')} analysis-perf-header`;
-  header.innerHTML = `
-    <span class="analysis-perf-title">Performance Settings</span>
-    <span class="analysis-perf-toggle">${collapsed ? '▼' : '▲'}</span>
-  `;
+  const titleEl = document.createElement('span');
+  titleEl.className = 'analysis-perf-title';
+  titleEl.textContent = 'Performance Settings';
+
+  const toggleEl = document.createElement('span');
+  toggleEl.className = 'analysis-perf-toggle';
+  toggleEl.textContent = collapsed ? '▼' : '▲';
+
+  header.appendChild(titleEl);
+  header.appendChild(toggleEl);
 
   // Create content
   const content = document.createElement('div');
@@ -610,11 +627,22 @@ export function createPerformanceSettings(options) {
     // Dataset info display
     const infoDiv = document.createElement('div');
     infoDiv.className = 'analysis-perf-info';
-    infoDiv.innerHTML = `
-      <strong>Dataset:</strong> ${(pointCount / 1000).toFixed(0)}K cells × ${geneCount.toLocaleString()} genes<br>
-      <strong>Est. data:</strong> ~${dataInfo.totalDataMB.toFixed(0)} MB total<br>
-      <strong>Est. time:</strong> ~${dataInfo.estimatedTimeFormatted}
-    `;
+    const datasetStrong = document.createElement('strong');
+    datasetStrong.textContent = 'Dataset:';
+    infoDiv.appendChild(datasetStrong);
+    infoDiv.appendChild(document.createTextNode(` ${(pointCount / 1000).toFixed(0)}K cells × ${geneCount.toLocaleString()} genes`));
+    infoDiv.appendChild(document.createElement('br'));
+
+    const dataStrong = document.createElement('strong');
+    dataStrong.textContent = 'Est. data:';
+    infoDiv.appendChild(dataStrong);
+    infoDiv.appendChild(document.createTextNode(` ~${dataInfo.totalDataMB.toFixed(0)} MB total`));
+    infoDiv.appendChild(document.createElement('br'));
+
+    const timeStrong = document.createElement('strong');
+    timeStrong.textContent = 'Est. time:';
+    infoDiv.appendChild(timeStrong);
+    infoDiv.appendChild(document.createTextNode(` ~${dataInfo.estimatedTimeFormatted}`));
     content.appendChild(infoDiv);
   });
 
@@ -760,7 +788,15 @@ export function renderComparisonStatsTable(groups, options = {}) {
   // Header row
   const thead = document.createElement('thead');
   const headerRow = document.createElement('tr');
-  headerRow.innerHTML = '<th>Statistic</th>' + groups.map(g => `<th>${g.name}</th>`).join('');
+  const firstHeader = document.createElement('th');
+  firstHeader.textContent = 'Statistic';
+  headerRow.appendChild(firstHeader);
+
+  for (const group of groups) {
+    const th = document.createElement('th');
+    th.textContent = group?.name ?? '';
+    headerRow.appendChild(th);
+  }
   thead.appendChild(headerRow);
   table.appendChild(thead);
 

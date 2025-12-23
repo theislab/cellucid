@@ -6,6 +6,7 @@
  */
 
 import { PlotFactory, PlotRegistry, PlotHelpers, COMMON_HOVER_STYLE } from '../plot-factory.js';
+import { escapeHtml } from '../../../utils/dom-utils.js';
 
 const barplotDefinition = {
   id: 'barplot',
@@ -67,14 +68,15 @@ const barplotDefinition = {
         const total = pd.cellCount || pd.values.length;
         const values = sortedCategories.map(cat => pageCounts.get(cat) || 0);
         const displayValues = normalize ? values.map(v => total > 0 ? (v / total) * 100 : 0) : values;
+        const safePageName = escapeHtml(String(pd.pageName || ''));
 
         const trace = {
           name: pd.pageName,
           type: 'bar',
           marker: { color, line: { color: 'rgba(0,0,0,0.1)', width: 0.5 } },
           hovertemplate: normalize
-            ? `${pd.pageName}<br>%{${orientation === 'vertical' ? 'x' : 'y'}}: %{${orientation === 'vertical' ? 'y' : 'x'}:.1f}%<extra></extra>`
-            : `${pd.pageName}<br>%{${orientation === 'vertical' ? 'x' : 'y'}}: %{${orientation === 'vertical' ? 'y' : 'x'}:,}<extra></extra>`,
+            ? `${safePageName}<br>%{${orientation === 'vertical' ? 'x' : 'y'}}: %{${orientation === 'vertical' ? 'y' : 'x'}:.1f}%<extra></extra>`
+            : `${safePageName}<br>%{${orientation === 'vertical' ? 'x' : 'y'}}: %{${orientation === 'vertical' ? 'y' : 'x'}:,}<extra></extra>`,
           hoverlabel: COMMON_HOVER_STYLE
         };
 

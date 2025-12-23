@@ -1,9 +1,7 @@
 /**
  * LocalDemoDataSource - Data source for demo datasets in the exports/ directory
  *
- * Supports two modes:
- * 1. Multi-dataset mode: reads datasets.json manifest listing available datasets
- * 2. Legacy mode: treats exports/ as a single dataset (backwards compatible)
+ * Reads datasets.json manifest listing available datasets.
  */
 
 import {
@@ -13,7 +11,6 @@ import {
   fetchJson,
   loadDatasetMetadata,
   resolveUrl,
-  urlExists,
   validateSchemaVersion
 } from './data-source.js';
 
@@ -36,7 +33,6 @@ export class LocalDemoDataSource {
     // Cache
     this._manifest = null;
     this._datasets = null;
-    this._isLegacyMode = null;
     this._availabilityChecked = false;
     this._isAvailable = false;
   }
@@ -70,8 +66,7 @@ export class LocalDemoDataSource {
       this._isAvailable = true;
       return true;
     } catch (err) {
-      // _loadManifest already checks legacy mode internally, so if it throws,
-      // neither manifest nor legacy mode is available
+      // If manifest load fails, the demo source is not available.
       console.log('[LocalDemoDataSource] Not available:', err.message);
       this._availabilityChecked = true;
       this._isAvailable = false;
@@ -80,46 +75,25 @@ export class LocalDemoDataSource {
   }
 
   /**
-   * Load the datasets manifest (or detect legacy mode)
-   * @returns {Promise<{isLegacy: boolean, manifest?: Object}>}
+   * Load the datasets manifest
+   * @returns {Promise<Object>}
    * @private
    */
   async _loadManifest() {
-    if (this._manifest !== null || this._isLegacyMode !== null) {
-      return { isLegacy: this._isLegacyMode, manifest: this._manifest };
+    if (this._manifest !== null) {
+      return this._manifest;
     }
 
-    try {
-      this._manifest = await fetchJson(this.manifestUrl, this.type);
+    this._manifest = await fetchJson(this.manifestUrl, this.type);
 
-      // Validate manifest version
-      validateSchemaVersion(
-        this._manifest.version,
-        DATA_CONFIG.SUPPORTED_MANIFEST_VERSIONS,
-        'datasets.json'
-      );
+    validateSchemaVersion(
+      this._manifest.version,
+      DATA_CONFIG.SUPPORTED_MANIFEST_VERSIONS,
+      'datasets.json'
+    );
 
-      this._isLegacyMode = false;
-      console.log(`[LocalDemoDataSource] Loaded datasets manifest with ${this._manifest.datasets?.length || 0} datasets`);
-      return { isLegacy: false, manifest: this._manifest };
-    } catch (err) {
-      // Check for legacy mode
-      if (DATA_CONFIG.LEGACY_MODE_FALLBACK) {
-        const legacyManifest = resolveUrl(this.baseUrl, 'obs_manifest.json');
-        if (await urlExists(legacyManifest)) {
-          console.log('[LocalDemoDataSource] No datasets.json found, using legacy single-dataset mode');
-          this._isLegacyMode = true;
-          return { isLegacy: true };
-        }
-      }
-
-      throw new DataSourceError(
-        'No datasets available',
-        DataSourceErrorCode.NOT_FOUND,
-        this.type,
-        { baseUrl: this.baseUrl }
-      );
-    }
+    console.log(`[LocalDemoDataSource] Loaded datasets manifest with ${this._manifest.datasets?.length || 0} datasets`);
+    return this._manifest;
   }
 
   /**
@@ -131,18 +105,7 @@ export class LocalDemoDataSource {
       return this._datasets;
     }
 
-    const { isLegacy, manifest } = await this._loadManifest();
-
-    if (isLegacy) {
-      // Legacy mode: single dataset at baseUrl
-      const metadata = await loadDatasetMetadata(this.baseUrl, DATA_CONFIG.LEGACY_DATASET_ID, this.type);
-      // Use a more descriptive name for legacy mode
-      if (metadata.name === DATA_CONFIG.LEGACY_DATASET_ID) {
-        metadata.name = 'Default Dataset';
-      }
-      this._datasets = [metadata];
-      return this._datasets;
-    }
+    const manifest = await this._loadManifest();
 
     // Multi-dataset mode: load metadata for each dataset in manifest
     const datasets = [];
@@ -167,17 +130,16 @@ export class LocalDemoDataSource {
         datasets.push(metadata);
       } catch (err) {
         console.warn(`[LocalDemoDataSource] Failed to load metadata for dataset '${entry.id}':`, err);
-        // Still include the dataset with minimal info from manifest
-        datasets.push({
-          id: entry.id,
-          name: entry.name || entry.id,
-          description: entry.description || '',
-          stats: {
-            n_cells: entry.n_cells || 0,
-            n_genes: entry.n_genes || 0
-          }
-        });
       }
+    }
+
+    if (datasets.length === 0) {
+      throw new DataSourceError(
+        'No valid datasets found in demo exports (dataset_identity.json required)',
+        DataSourceErrorCode.INVALID_FORMAT,
+        this.type,
+        { baseUrl: this.baseUrl }
+      );
     }
 
     this._datasets = datasets;
@@ -189,11 +151,7 @@ export class LocalDemoDataSource {
    * @returns {Promise<string|null>}
    */
   async getDefaultDatasetId() {
-    const { isLegacy, manifest } = await this._loadManifest();
-
-    if (isLegacy) {
-      return DATA_CONFIG.LEGACY_DATASET_ID;
-    }
+    const manifest = await this._loadManifest();
 
     // Check manifest for explicit default
     if (manifest.default) {
@@ -235,10 +193,6 @@ export class LocalDemoDataSource {
    * @returns {string}
    */
   getBaseUrl(datasetId) {
-    if (this._isLegacyMode || datasetId === DATA_CONFIG.LEGACY_DATASET_ID) {
-      return this.baseUrl;
-    }
-
     // Find dataset path in manifest
     if (this._manifest?.datasets) {
       const entry = this._manifest.datasets.find(d => d.id === datasetId);
@@ -271,17 +225,8 @@ export class LocalDemoDataSource {
   refresh() {
     this._manifest = null;
     this._datasets = null;
-    this._isLegacyMode = null;
     this._availabilityChecked = false;
     this._isAvailable = false;
-  }
-
-  /**
-   * Check if currently in legacy mode
-   * @returns {boolean|null} - null if not yet determined
-   */
-  isLegacyMode() {
-    return this._isLegacyMode;
   }
 
   /**

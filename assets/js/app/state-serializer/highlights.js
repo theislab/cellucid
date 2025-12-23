@@ -4,7 +4,7 @@
  * @module state-serializer/highlights
  */
 
-import { debug } from '../utils/debug.js';
+import { debug } from '../../utils/debug.js';
 
 export function serializeHighlightPages(state) {
   const pages = state.getHighlightPages?.() || [];
@@ -161,4 +161,3 @@ export function restoreHighlightPages(state, pages, activePageInfo) {
     state.switchToPage?.(targetActiveId);
   }
 }
-

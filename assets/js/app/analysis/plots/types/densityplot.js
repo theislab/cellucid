@@ -9,6 +9,7 @@
 import { PlotFactory, PlotRegistry, BasePlot, COMMON_HOVER_STYLE } from '../plot-factory.js';
 import { getScatterTraceType } from '../plotly-loader.js';
 import { filterFiniteNumbers, getFiniteMinMax, mean, std } from '../../shared/number-utils.js';
+import { escapeHtml } from '../../../utils/dom-utils.js';
 
 /**
  * Simple kernel density estimation using Gaussian kernel
@@ -130,7 +131,7 @@ const densityplotDefinition = {
           line: { color, width: 2, shape: 'spline' },
           fill: 'tozeroy',
           fillcolor: PlotFactory.hexToRgba(color, fillOpacity),
-          hovertemplate: `${pd.pageName}<br>Value: %{x:.2f}<br>Density: %{y:.4f}<extra></extra>`,
+          hovertemplate: `${escapeHtml(pd.pageName)}<br>Value: %{x:.2f}<br>Density: %{y:.4f}<extra></extra>`,
           hoverlabel: COMMON_HOVER_STYLE
         };
       }

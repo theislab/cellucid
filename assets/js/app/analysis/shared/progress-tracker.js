@@ -144,6 +144,9 @@ export class ProgressTracker {
     /** @type {boolean} Whether tracking was cancelled */
     this._cancelled = false;
 
+    /** @type {Function|null} Abort handler reference for cleanup */
+    this._abortHandler = null;
+
     // Configuration
     /** @type {number} Rolling window size for ETA */
     this._rollingWindowSize = DEFAULTS.rollingWindowSize;
@@ -174,7 +177,8 @@ export class ProgressTracker {
 
     // Set up abort signal listener
     if (this.signal) {
-      this.signal.addEventListener('abort', () => this._handleAbort(), { once: true });
+      this._abortHandler = () => this._handleAbort();
+      this.signal.addEventListener('abort', this._abortHandler, { once: true });
     }
 
     // Show initial notification
@@ -341,6 +345,7 @@ export class ProgressTracker {
     if (this._completed) return this.getStats();
 
     this._completed = true;
+    this._cleanupAbortListener();
 
     const stats = this.getStats();
 
@@ -366,6 +371,7 @@ export class ProgressTracker {
    */
   fail(errorMessage) {
     this._completed = true;
+    this._cleanupAbortListener();
 
     const stats = this.getStats();
     stats.error = errorMessage;
@@ -385,6 +391,7 @@ export class ProgressTracker {
     if (this._completed || this._cancelled) return this.getStats();
 
     this._cancelled = true;
+    this._cleanupAbortListener();
 
     if (this._notificationId && this._notifications) {
       this._notifications.dismiss(this._notificationId);
@@ -532,9 +539,17 @@ export class ProgressTracker {
     if (this._completed || this._cancelled) return;
 
     this._cancelled = true;
+    this._cleanupAbortListener();
 
     if (this._notificationId && this._notifications) {
       this._notifications.fail(this._notificationId, 'Operation cancelled');
+    }
+  }
+
+  _cleanupAbortListener() {
+    if (this.signal && this._abortHandler) {
+      this.signal.removeEventListener('abort', this._abortHandler);
+      this._abortHandler = null;
     }
   }
 

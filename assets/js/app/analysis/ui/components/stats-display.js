@@ -46,18 +46,32 @@ export function renderSummaryStats(container, pageData, variableName) {
 
     const thead = document.createElement('thead');
     const headerRow = document.createElement('tr');
-    headerRow.innerHTML = `<th>${variableName}</th>` + pageData.map(pd => `<th>${pd.pageName}</th>`).join('');
+    const variableHeader = document.createElement('th');
+    variableHeader.textContent = variableName ?? '';
+    headerRow.appendChild(variableHeader);
+
+    for (const pd of pageData) {
+      const th = document.createElement('th');
+      th.textContent = pd.pageName ?? '';
+      headerRow.appendChild(th);
+    }
     thead.appendChild(headerRow);
     table.appendChild(thead);
 
     const tbody = document.createElement('tbody');
     for (const cat of categories) {
       const row = document.createElement('tr');
-      row.innerHTML = `<td>${cat}</td>` + pageData.map(pd => {
+      const labelCell = document.createElement('td');
+      labelCell.textContent = cat ?? '';
+      row.appendChild(labelCell);
+
+      for (const pd of pageData) {
         const count = pd.values.filter(v => v === cat).length;
         const pct = pd.cellCount > 0 ? ((count / pd.cellCount) * 100).toFixed(1) : '0';
-        return `<td>${count} (${pct}%)</td>`;
-      }).join('');
+        const td = document.createElement('td');
+        td.textContent = `${count} (${pct}%)`;
+        row.appendChild(td);
+      }
       tbody.appendChild(row);
     }
     if (allCategories.size > 10) {
@@ -94,7 +108,15 @@ export function renderSummaryStats(container, pageData, variableName) {
 
     const thead = document.createElement('thead');
     const headerRow = document.createElement('tr');
-    headerRow.innerHTML = '<th>Statistic</th>' + pageData.map(pd => `<th>${pd.pageName}</th>`).join('');
+    const firstHeader = document.createElement('th');
+    firstHeader.textContent = 'Statistic';
+    headerRow.appendChild(firstHeader);
+
+    for (const pd of pageData) {
+      const th = document.createElement('th');
+      th.textContent = pd.pageName ?? '';
+      headerRow.appendChild(th);
+    }
     thead.appendChild(headerRow);
     table.appendChild(thead);
 
@@ -104,14 +126,20 @@ export function renderSummaryStats(container, pageData, variableName) {
 
     for (const stat of stats) {
       const row = document.createElement('tr');
-      row.innerHTML = `<td>${statLabels[stat]}</td>` + statsByPage.map(pageStats => {
-        let value = '-';
+      const labelCell = document.createElement('td');
+      labelCell.textContent = statLabels[stat] ?? stat;
+      row.appendChild(labelCell);
+
+      for (const pageStats of statsByPage) {
+        const cell = document.createElement('td');
         if (pageStats?.count > 0) {
           const raw = pageStats[stat];
-          value = stat === 'count' ? raw : raw.toFixed(2);
+          cell.textContent = stat === 'count' ? String(raw) : raw.toFixed(2);
+        } else {
+          cell.textContent = '-';
         }
-        return `<td>${value}</td>`;
-      }).join('');
+        row.appendChild(cell);
+      }
       tbody.appendChild(row);
     }
     table.appendChild(tbody);
@@ -183,7 +211,16 @@ export function renderStatisticalAnnotations(container, pageData, dataType) {
     const addRow = (label, value, highlight = false) => {
       const row = document.createElement('tr');
       if (highlight) row.className = 'highlight';
-      row.innerHTML = `<td class="stat-label">${label}</td><td class="stat-value">${value}</td>`;
+      const labelCell = document.createElement('td');
+      labelCell.className = 'stat-label';
+      labelCell.textContent = label ?? '';
+
+      const valueCell = document.createElement('td');
+      valueCell.className = 'stat-value';
+      valueCell.textContent = value ?? '';
+
+      row.appendChild(labelCell);
+      row.appendChild(valueCell);
       statsTable.appendChild(row);
     };
 

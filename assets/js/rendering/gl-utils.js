@@ -29,6 +29,47 @@ export function createProgram(gl, vsSource, fsSource) {
 }
 
 /**
+ * Create a WebGL2 program configured for transform feedback.
+ *
+ * WebGL2 requires `transformFeedbackVaryings()` to be set before linking the
+ * program. This helper keeps the boilerplate centralized so transform-feedback
+ * users (GPU particle systems, etc.) stay DRY.
+ *
+ * @param {WebGL2RenderingContext} gl
+ * @param {string} vsSource
+ * @param {string} fsSource
+ * @param {string[]} varyings - Vertex shader outputs to capture
+ * @param {number} [bufferMode] - gl.INTERLEAVED_ATTRIBS or gl.SEPARATE_ATTRIBS
+ * @returns {WebGLProgram}
+ */
+export function createTransformFeedbackProgram(
+  gl,
+  vsSource,
+  fsSource,
+  varyings,
+  bufferMode = undefined
+) {
+  const vs = createShader(gl, gl.VERTEX_SHADER, vsSource);
+  const fs = createShader(gl, gl.FRAGMENT_SHADER, fsSource);
+  const program = gl.createProgram();
+  gl.attachShader(program, vs);
+  gl.attachShader(program, fs);
+
+  const mode = bufferMode ?? gl.INTERLEAVED_ATTRIBS;
+  gl.transformFeedbackVaryings(program, varyings, mode);
+  gl.linkProgram(program);
+
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    const info = gl.getProgramInfoLog(program);
+    gl.deleteProgram(program);
+    throw new Error('Could not link transform feedback program:\n' + info);
+  }
+  gl.deleteShader(vs);
+  gl.deleteShader(fs);
+  return program;
+}
+
+/**
  * Creates a ResizeObserver-based canvas size tracker to avoid per-frame layout reads.
  * Also monitors DPR changes (e.g., moving window between monitors with different scales).
  * Returns an object with a getSize() method that returns cached dimensions.
@@ -93,18 +134,6 @@ export function createCanvasResizeObserver(canvas) {
       }
     }
   };
-}
-
-/** @deprecated Use createCanvasResizeObserver instead to avoid per-frame layout reads */
-export function resizeCanvasToDisplaySize(canvas) {
-  const dpr = window.devicePixelRatio || 1;
-  const displayWidth = Math.floor(canvas.clientWidth * dpr);
-  const displayHeight = Math.floor(canvas.clientHeight * dpr);
-  if (canvas.width !== displayWidth || canvas.height !== displayHeight) {
-    canvas.width = displayWidth;
-    canvas.height = displayHeight;
-  }
-  return [displayWidth, displayHeight];
 }
 
 export function normalizePositions(positions) {

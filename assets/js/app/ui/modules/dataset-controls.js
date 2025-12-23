@@ -17,7 +17,7 @@ import { formatCellCount as formatDataNumber } from '../../../data/data-source.j
 import { getNotificationCenter } from '../../notification-center.js';
 import { updateUrlForDataSource } from '../../url-state.js';
 import { DATA_LOAD_METHODS } from '../../../analytics/tracker.js';
-import { debug } from '../../utils/debug.js';
+import { debug } from '../../../utils/debug.js';
 import { initDatasetConnections } from './dataset-connections.js';
 
 export function initDatasetControls({

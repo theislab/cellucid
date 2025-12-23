@@ -219,8 +219,10 @@ export class StreamingGeneLoader {
     debug('StreamingGeneLoader', `Starting run ${currentRunId}: ${geneList.length} genes, buffer=${this._maxBufferSize}, network=${this._networkConcurrency}`);
 
     // Set up abort listener
-    if (this.signal) {
-      this.signal.addEventListener('abort', () => this._abort(), { once: true });
+    const abortSignal = this.signal;
+    const abortHandler = abortSignal ? () => this._abort() : null;
+    if (abortSignal && abortHandler) {
+      abortSignal.addEventListener('abort', abortHandler, { once: true });
     }
 
     try {
@@ -288,6 +290,10 @@ export class StreamingGeneLoader {
         }
       }
     } finally {
+      if (abortSignal && abortHandler) {
+        abortSignal.removeEventListener('abort', abortHandler);
+      }
+
       // Mark the run as stopped so in-flight loads don't repopulate buffers after cleanup.
       this._aborted = true;
       // Cleanup
@@ -376,8 +382,10 @@ export class StreamingGeneLoader {
     debug('StreamingGeneLoader', `Starting raw run ${currentRunId}: ${geneList.length} genes, buffer=${this._maxBufferSize}, network=${this._networkConcurrency}`);
 
     // Set up abort listener
-    if (this.signal) {
-      this.signal.addEventListener('abort', () => this._abort(), { once: true });
+    const abortSignal = this.signal;
+    const abortHandler = abortSignal ? () => this._abort() : null;
+    if (abortSignal && abortHandler) {
+      abortSignal.addEventListener('abort', abortHandler, { once: true });
     }
 
     try {
@@ -425,6 +433,10 @@ export class StreamingGeneLoader {
         }
       }
     } finally {
+      if (abortSignal && abortHandler) {
+        abortSignal.removeEventListener('abort', abortHandler);
+      }
+
       this._aborted = true;
       this._stats.endTime = performance.now();
 
@@ -522,8 +534,10 @@ export class StreamingGeneLoader {
     debug('StreamingGeneLoader', `Starting multi-group run ${currentRunId}: ${geneList.length} genes, ${groups.length} groups, buffer=${this._maxBufferSize}`);
 
     // Set up abort listener
-    if (this.signal) {
-      this.signal.addEventListener('abort', () => this._abort(), { once: true });
+    const abortSignal = this.signal;
+    const abortHandler = abortSignal ? () => this._abort() : null;
+    if (abortSignal && abortHandler) {
+      abortSignal.addEventListener('abort', abortHandler, { once: true });
     }
 
     try {
@@ -592,6 +606,10 @@ export class StreamingGeneLoader {
         }
       }
     } finally {
+      if (abortSignal && abortHandler) {
+        abortSignal.removeEventListener('abort', abortHandler);
+      }
+
       // Mark the run as stopped
       this._aborted = true;
       this._stats.endTime = performance.now();
@@ -1080,15 +1098,14 @@ export async function loadGenesBatch(options) {
   let loaded = 0;
   const total = geneList.length;
 
-  for (let i = 0; i < geneList.length; i += batchSize) {
-    if (signal?.aborted) break;
+	  for (let i = 0; i < geneList.length; i += batchSize) {
+	    if (signal?.aborted) break;
 
-    const batch = geneList.slice(i, i + batchSize);
+	    const batch = geneList.slice(i, i + batchSize);
 
-    // Load batch with concurrency limit
-    const loadPromises = [];
-    for (let j = 0; j < batch.length; j += concurrency) {
-      const concurrent = batch.slice(j, j + concurrency);
+	    // Load batch with concurrency limit
+	    for (let j = 0; j < batch.length; j += concurrency) {
+	      const concurrent = batch.slice(j, j + concurrency);
 
       const concurrentResults = await Promise.all(
         concurrent.map(async (gene) => {

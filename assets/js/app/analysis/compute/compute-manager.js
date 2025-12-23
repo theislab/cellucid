@@ -67,6 +67,7 @@ export class ComputeManager {
 
     // Health check interval
     this._healthCheckInterval = null;
+    this._workerRestartPromise = null;
 
     // Memory monitor integration for cleanup under memory pressure
     this._instanceId = `compute-manager-${Date.now()}`;
@@ -217,7 +218,9 @@ export class ComputeManager {
 
     // Check health every 30 seconds
     this._healthCheckInterval = setInterval(() => {
-      this._performHealthCheck();
+      void this._performHealthCheck().catch((err) => {
+        debugWarn('ComputeManager', 'Health check failed:', err?.message || err);
+      });
     }, 30000);
   }
 
@@ -225,7 +228,9 @@ export class ComputeManager {
    * Perform health check on all backends
    * @private
    */
-  _performHealthCheck() {
+  async _performHealthCheck() {
+    if (this._workerRestartPromise) return;
+
     // Check worker health
     if (this._workerBackend) {
       const stats = this._workerBackend.getStats();
@@ -233,8 +238,20 @@ export class ComputeManager {
       // If workers seem stuck (many pending, none processing), restart them
       if (stats.pendingRequests > 10 && stats.busyWorkers === 0) {
         debugWarn('ComputeManager', 'Workers appear stuck, restarting...');
-        this._workerBackend.terminate();
-        this._initWorker();
+        try {
+          this._workerBackend.terminate();
+        } catch (err) {
+          debugWarn('ComputeManager', 'Worker termination failed:', err?.message || err);
+        }
+
+        // Prevent new tasks from selecting the worker backend during restart.
+        this._workerBackend = null;
+        this._workerStatus = BackendStatus.UNAVAILABLE;
+
+        this._workerRestartPromise = this._initWorker().finally(() => {
+          this._workerRestartPromise = null;
+        });
+        await this._workerRestartPromise;
       }
     }
 

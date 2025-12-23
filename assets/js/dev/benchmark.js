@@ -4810,7 +4810,7 @@ export class BenchmarkReporter {
       return this.viewer.getGLContext();
     }
     if (this.canvas && typeof this.canvas.getContext === 'function') {
-      return this.canvas.getContext('webgl2') || this.canvas.getContext('webgl');
+      return this.canvas.getContext('webgl2');
     }
     return null;
   }
@@ -5041,7 +5041,8 @@ export class BenchmarkReporter {
   _checkWebGLSupport() {
     try {
       const canvas = document.createElement('canvas');
-      return !!(canvas.getContext('webgl') || canvas.getContext('experimental-webgl'));
+      // Cellucid requires WebGL2; do not treat WebGL1 as supported.
+      return !!canvas.getContext('webgl2');
     } catch {
       return false;
     }
@@ -6481,9 +6482,9 @@ if (typeof window !== 'undefined') {
       return null;
     }
 
-    const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
+    const gl = canvas.getContext('webgl2');
     if (!gl) {
-      console.error('[Benchmark] Could not get WebGL context');
+      console.error('[Benchmark] Could not get WebGL2 context');
       return null;
     }
 
@@ -6539,9 +6540,9 @@ if (typeof window !== 'undefined') {
       return null;
     }
 
-    const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
+    const gl = canvas.getContext('webgl2');
     if (!gl) {
-      console.error('[Benchmark] Could not get WebGL context');
+      console.error('[Benchmark] Could not get WebGL2 context');
       return null;
     }
 

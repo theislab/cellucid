@@ -577,7 +577,11 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
 
     const plotDef = PlotRegistry.get(result.plotType);
     if (!plotDef) {
-      plotContainer.innerHTML = `<div class="plot-error">Unknown plot type: ${result.plotType}</div>`;
+      plotContainer.innerHTML = '';
+      const errorEl = document.createElement('div');
+      errorEl.className = 'plot-error';
+      errorEl.textContent = `Unknown plot type: ${result.plotType}`;
+      plotContainer.appendChild(errorEl);
       return;
     }
 
@@ -593,7 +597,11 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       });
     } catch (err) {
       console.error('[GenesPanelUI] Plot render error:', err);
-      plotContainer.innerHTML = `<div class="plot-error">Failed to render heatmap: ${err.message || err}</div>`;
+      plotContainer.innerHTML = '';
+      const errorEl = document.createElement('div');
+      errorEl.className = 'plot-error';
+      errorEl.textContent = `Failed to render heatmap: ${err?.message || err}`;
+      plotContainer.appendChild(errorEl);
       return;
     }
 
@@ -632,7 +640,11 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     await import('../../plots/types/gene-heatmap.js');
     const plotDef = PlotRegistry.get(result.plotType);
     if (!plotDef) {
-      plotContainer.innerHTML = `<div class="plot-error">Unknown plot type: ${result.plotType}</div>`;
+      plotContainer.innerHTML = '';
+      const errorEl = document.createElement('div');
+      errorEl.className = 'plot-error';
+      errorEl.textContent = `Unknown plot type: ${result.plotType}`;
+      plotContainer.appendChild(errorEl);
       return;
     }
 
@@ -648,7 +660,11 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       });
     } catch (err) {
       console.error('[GenesPanelUI] Modal plot render error:', err);
-      plotContainer.innerHTML = `<div class="plot-error">Failed to render heatmap: ${err.message || err}</div>`;
+      plotContainer.innerHTML = '';
+      const errorEl = document.createElement('div');
+      errorEl.className = 'plot-error';
+      errorEl.textContent = `Failed to render heatmap: ${err?.message || err}`;
+      plotContainer.appendChild(errorEl);
       return;
     }
 
@@ -800,40 +816,46 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     if (!this._lastResult?.metadata) return;
 
     const { metadata } = this._lastResult;
+    container.innerHTML = '';
 
-    const statsHtml = `
-      <div class="modal-stats-section">
-        <h4>Analysis Summary</h4>
-        <div class="stats-grid">
-          <div class="stat-item">
-            <span class="stat-label">Category:</span>
-            <span class="stat-value">${metadata.obsCategory || 'N/A'}</span>
-          </div>
-          <div class="stat-item">
-            <span class="stat-label">Mode:</span>
-            <span class="stat-value">${metadata.mode}</span>
-          </div>
-          <div class="stat-item">
-            <span class="stat-label">Method:</span>
-            <span class="stat-value">${metadata.method}</span>
-          </div>
-          <div class="stat-item">
-            <span class="stat-label">Groups:</span>
-            <span class="stat-value">${metadata.groupCount}</span>
-          </div>
-          <div class="stat-item">
-            <span class="stat-label">Genes:</span>
-            <span class="stat-value">${metadata.geneCount}</span>
-          </div>
-          <div class="stat-item">
-            <span class="stat-label">Duration:</span>
-            <span class="stat-value">${(metadata.duration / 1000).toFixed(1)}s</span>
-          </div>
-        </div>
-      </div>
-    `;
+    const section = document.createElement('div');
+    section.className = 'modal-stats-section';
 
-    container.innerHTML = statsHtml;
+    const title = document.createElement('h4');
+    title.textContent = 'Analysis Summary';
+    section.appendChild(title);
+
+    const grid = document.createElement('div');
+    grid.className = 'stats-grid';
+
+    const addStat = (label, value) => {
+      const item = document.createElement('div');
+      item.className = 'stat-item';
+
+      const labelEl = document.createElement('span');
+      labelEl.className = 'stat-label';
+      labelEl.textContent = label;
+
+      const valueEl = document.createElement('span');
+      valueEl.className = 'stat-value';
+      valueEl.textContent = value;
+
+      item.appendChild(labelEl);
+      item.appendChild(valueEl);
+      grid.appendChild(item);
+    };
+
+    addStat('Category:', String(metadata.obsCategory || 'N/A'));
+    addStat('Mode:', String(metadata.mode || 'N/A'));
+    addStat('Method:', String(metadata.method || 'N/A'));
+    addStat('Groups:', Number.isFinite(metadata.groupCount) ? String(metadata.groupCount) : String(metadata.groupCount || 'N/A'));
+    addStat('Genes:', Number.isFinite(metadata.geneCount) ? String(metadata.geneCount) : String(metadata.geneCount || 'N/A'));
+
+    const durationSec = Number.isFinite(metadata.duration) ? (metadata.duration / 1000).toFixed(1) : null;
+    addStat('Duration:', durationSec ? `${durationSec}s` : 'N/A');
+
+    section.appendChild(grid);
+    container.appendChild(section);
   }
 
   /**
@@ -1041,10 +1063,15 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
 
     const header = document.createElement('div');
     header.className = 'analysis-perf-header';
-    header.innerHTML = `
-      <span class="analysis-perf-title">${title}</span>
-      <span class="analysis-perf-toggle">${expanded ? '▲' : '▼'}</span>
-    `;
+    const titleEl = document.createElement('span');
+    titleEl.className = 'analysis-perf-title';
+    titleEl.textContent = String(title ?? '');
+    header.appendChild(titleEl);
+
+    const toggleEl = document.createElement('span');
+    toggleEl.className = 'analysis-perf-toggle';
+    toggleEl.textContent = expanded ? '▲' : '▼';
+    header.appendChild(toggleEl);
 
     const content = document.createElement('div');
     content.className = 'analysis-perf-content';
@@ -1054,7 +1081,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     header.addEventListener('click', () => {
       isExpanded = !isExpanded;
       content.style.display = isExpanded ? 'block' : 'none';
-      header.querySelector('.analysis-perf-toggle').textContent = isExpanded ? '▲' : '▼';
+      toggleEl.textContent = isExpanded ? '▲' : '▼';
     });
 
     container.appendChild(header);

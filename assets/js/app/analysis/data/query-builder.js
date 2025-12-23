@@ -630,7 +630,7 @@ export class QueryBuilder {
     if (onExecute) {
       const execBtn = document.createElement('button');
       execBtn.type = 'button';
-      execBtn.className = 'btn-primary query-execute-btn';
+      execBtn.className = 'btn-small query-execute-btn';
       execBtn.textContent = 'Apply Filter';
       execBtn.disabled = !this.isValid();
       execBtn.addEventListener('click', () => onExecute(this));

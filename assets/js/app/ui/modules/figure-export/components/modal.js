@@ -9,6 +9,8 @@
 
 import { createElement } from '../../../../utils/dom-utils.js';
 
+let activeKeydownHandler = null;
+
 /**
  * @param {object} options
  * @param {string} options.title
@@ -17,6 +19,11 @@ import { createElement } from '../../../../utils/dom-utils.js';
  * @returns {{ close: () => void }}
  */
 export function showFigureExportModal({ title, content, onClose }) {
+  if (activeKeydownHandler) {
+    document.removeEventListener('keydown', activeKeydownHandler);
+    activeKeydownHandler = null;
+  }
+
   const existing = document.querySelector('.figure-export-modal');
   if (existing) existing.remove();
 
@@ -36,18 +43,28 @@ export function showFigureExportModal({ title, content, onClose }) {
   modal.appendChild(backdrop);
   modal.appendChild(contentEl);
 
+  let closed = false;
+
+  const onKeyDown = (e) => {
+    if (e.key !== 'Escape') return;
+    close();
+  };
+
   const close = () => {
+    if (closed) return;
+    closed = true;
+
     document.removeEventListener('keydown', onKeyDown);
+    if (activeKeydownHandler === onKeyDown) {
+      activeKeydownHandler = null;
+    }
     modal.remove();
     onClose?.();
   };
 
   backdrop.addEventListener('click', close);
 
-  const onKeyDown = (e) => {
-    if (e.key !== 'Escape') return;
-    close();
-  };
+  activeKeydownHandler = onKeyDown;
   document.addEventListener('keydown', onKeyDown);
 
   document.body.appendChild(modal);

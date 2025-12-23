@@ -10,8 +10,7 @@
  *
  * Features:
  * - Lazy loading: Files fetched on-demand, identical to local-demo behavior
- * - Multi-dataset support: Reads datasets.json if present
- * - Legacy mode: Single dataset if datasets.json not found
+ * - Multi-dataset support: Reads datasets.json
  * - Branch selection: Default 'main', can specify 'master' or other branches
  */
 
@@ -137,20 +136,6 @@ async function fetchJson(url) {
 }
 
 /**
- * Check if a URL exists (returns 2xx status)
- * @param {string} url
- * @returns {Promise<boolean>}
- */
-async function urlExists(url) {
-  try {
-    const response = await fetch(url, { method: 'HEAD' });
-    return response.ok;
-  } catch {
-    return false;
-  }
-}
-
-/**
  * Data source for datasets hosted in GitHub repositories
  */
 export class GitHubDataSource {
@@ -169,9 +154,6 @@ export class GitHubDataSource {
 
     /** @type {DatasetMetadata[]|null} */
     this._datasets = null;
-
-    /** @type {boolean|null} */
-    this._isLegacyMode = null;
 
     /** @type {string|null} Active dataset ID */
     this._activeDatasetId = null;
@@ -228,53 +210,21 @@ export class GitHubDataSource {
 
       try {
         this._manifest = await fetchJson(manifestUrl);
-        validateSchemaVersion(
-          this._manifest.version,
-          DATA_CONFIG.SUPPORTED_MANIFEST_VERSIONS,
-          'datasets.json'
-        );
-        this._isLegacyMode = false;
-        console.log(`[GitHubDataSource] Found datasets manifest with ${this._manifest.datasets?.length || 0} datasets`);
       } catch (err) {
-        // Try legacy mode
-        const legacyManifestUrl = resolveUrl(this._baseUrl, 'obs_manifest.json');
-        if (await urlExists(legacyManifestUrl)) {
-          console.log('[GitHubDataSource] Using legacy single-dataset mode');
-          this._isLegacyMode = true;
-          this._manifest = null;
-        } else {
-          // Try alternate branches
-          const alternativeBranches = ['master', 'main'];
-          let found = false;
-
-          for (const branch of alternativeBranches) {
-            if (branch === this._parsedPath.branch) continue;
-
-            const altParsed = { ...this._parsedPath, branch };
-            const altBaseUrl = buildRawUrl(altParsed);
-            const altManifestUrl = resolveUrl(altBaseUrl, 'obs_manifest.json');
-
-            if (await urlExists(altManifestUrl)) {
-              console.log(`[GitHubDataSource] Found data on branch '${branch}'`);
-              this._parsedPath = altParsed;
-              this._baseUrl = altBaseUrl;
-              this._isLegacyMode = true;
-              this._manifest = null;
-              found = true;
-              break;
-            }
-          }
-
-          if (!found) {
-            throw new DataSourceError(
-              'No Cellucid dataset found at this GitHub path. Ensure the repository contains exported data (obs_manifest.json).',
-              DataSourceErrorCode.NOT_FOUND,
-              this.type,
-              { url: this._baseUrl }
-            );
-          }
-        }
+        throw new DataSourceError(
+          'datasets.json not found at this GitHub path. Exported datasets must include datasets.json (no legacy mode).',
+          DataSourceErrorCode.NOT_FOUND,
+          this.type,
+          { url: this._baseUrl, manifestUrl, originalError: err?.message || String(err) }
+        );
       }
+
+      validateSchemaVersion(
+        this._manifest.version,
+        DATA_CONFIG.SUPPORTED_MANIFEST_VERSIONS,
+        'datasets.json'
+      );
+      console.log(`[GitHubDataSource] Found datasets manifest with ${this._manifest.datasets?.length || 0} datasets`);
 
       // Load datasets
       this._datasets = await this._loadDatasets();
@@ -286,7 +236,6 @@ export class GitHubDataSource {
         branch: this._parsedPath.branch,
         path: this._parsedPath.path,
         baseUrl: this._baseUrl,
-        isLegacyMode: this._isLegacyMode,
       };
 
       notifications.complete(trackerId, `Connected to ${this._parsedPath.owner}/${this._parsedPath.repo}`);
@@ -311,22 +260,23 @@ export class GitHubDataSource {
   }
 
   /**
-   * Load datasets from manifest or legacy mode
+   * Load datasets from manifest
    * @returns {Promise<DatasetMetadata[]>}
    * @private
    */
   async _loadDatasets() {
-    if (this._isLegacyMode) {
-      // Legacy mode: single dataset at baseUrl
-      const metadata = await loadDatasetMetadata(this._baseUrl, DATA_CONFIG.LEGACY_DATASET_ID, this.type);
-      if (metadata.name === DATA_CONFIG.LEGACY_DATASET_ID) {
-        metadata.name = `${this._parsedPath.owner}/${this._parsedPath.repo}`;
-      }
-      return [metadata];
+    if (!this._manifest) {
+      throw new DataSourceError(
+        'datasets.json manifest not loaded',
+        DataSourceErrorCode.INVALID_FORMAT,
+        this.type,
+        { url: this._baseUrl }
+      );
     }
 
     // Multi-dataset mode
     const datasets = [];
+    const failures = [];
     for (const entry of (this._manifest?.datasets || [])) {
       try {
         const datasetBaseUrl = resolveUrl(this._baseUrl, entry.path);
@@ -342,7 +292,23 @@ export class GitHubDataSource {
         datasets.push(metadata);
       } catch (err) {
         console.warn(`[GitHubDataSource] Failed to load dataset '${entry.id}':`, err);
+        failures.push({
+          id: entry.id,
+          message: err?.message || String(err)
+        });
       }
+    }
+
+    if (datasets.length === 0) {
+      const hint = failures.length
+        ? ` (first error: ${failures[0].message})`
+        : '';
+      throw new DataSourceError(
+        `No valid datasets found at this GitHub path${hint}`,
+        DataSourceErrorCode.INVALID_FORMAT,
+        this.type,
+        { url: this._baseUrl, failures }
+      );
     }
 
     return datasets;
@@ -366,7 +332,6 @@ export class GitHubDataSource {
     this._parsedPath = null;
     this._manifest = null;
     this._datasets = null;
-    this._isLegacyMode = null;
     this._activeDatasetId = null;
     this._connected = false;
   }
@@ -438,11 +403,6 @@ export class GitHubDataSource {
 
     this._activeDatasetId = datasetId;
 
-    // For legacy mode, use base URL directly
-    if (this._isLegacyMode) {
-      return this._baseUrl;
-    }
-
     // For multi-dataset, find the dataset's path
     const entry = this._manifest?.datasets?.find(d => d.id === datasetId);
     if (entry?.path) {
@@ -462,7 +422,6 @@ export class GitHubDataSource {
       inputPath: this._inputPath,
       parsedPath: this._parsedPath,
       baseUrl: this._baseUrl,
-      isLegacyMode: this._isLegacyMode,
       datasetsCount: this._datasets?.length || 0,
     };
   }
@@ -483,8 +442,17 @@ export class GitHubDataSource {
       return;
     }
 
-    // Re-load datasets
-    this._datasets = null;
+    // Re-load manifest + datasets
+    if (!this._baseUrl) return;
+
+    const manifestUrl = resolveUrl(this._baseUrl, DATA_CONFIG.DATASETS_MANIFEST);
+    this._manifest = await fetchJson(manifestUrl);
+    validateSchemaVersion(
+      this._manifest.version,
+      DATA_CONFIG.SUPPORTED_MANIFEST_VERSIONS,
+      'datasets.json'
+    );
+
     this._datasets = await this._loadDatasets();
   }
 

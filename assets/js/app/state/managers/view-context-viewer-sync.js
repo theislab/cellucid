@@ -114,6 +114,10 @@ export const viewContextViewerSyncMethods = {
   },
 
   initScene(positions, obs) {
+    // Dataset swap: ensure GPU overlay resources referencing the previous dataset
+    // are released before we upload new buffers.
+    this.viewer.resetVectorFieldOverlay?.();
+
     const normalizedFields = (obs?.fields || []).map((field) => ({
       ...field,
       loaded: Boolean(field?.values || field?.codes),

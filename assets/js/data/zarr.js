@@ -1256,25 +1256,70 @@ export class ZarrLoader {
     this._ensureOpen();
 
     // Detect available UMAP dimensions using shape metadata only (no full array loading)
-    const availableDimensions = [];
-    let defaultDimension = 3;
+    const availableDimensions = new Set();
+    const explicitDims = new Set();
+    let umapResolution = null;
 
-    for (const key of this._obsmKeys) {
-      if (key === 'X_umap_3d' || (key === 'X_umap' && !this._obsmKeys.includes('X_umap_3d'))) {
-        // Use getEmbeddingShape() to avoid loading full array just for dimension detection
-        const { nDims } = await this.getEmbeddingShape(key);
-        if (nDims >= 1 && nDims <= 3) availableDimensions.push(nDims);
+    for (const dim of [1, 2, 3]) {
+      const key = `X_umap_${dim}d`;
+      if (!this._obsmKeys.includes(key)) continue;
+      try {
+        const { shape, nDims } = await this.getEmbeddingShape(key);
+        if (shape?.length !== 2) {
+          console.warn(`[ZarrLoader] Ignoring '${key}': expected 2D array, got shape ${shape}`);
+          continue;
+        }
+        if (shape[0] !== this._nObs) {
+          console.warn(`[ZarrLoader] Ignoring '${key}': ${shape[0]} rows but expected ${this._nObs}`);
+          continue;
+        }
+        if (nDims !== dim) {
+          console.warn(`[ZarrLoader] Ignoring '${key}': ${nDims} columns but expected ${dim}`);
+          continue;
+        }
+        availableDimensions.add(dim);
+        explicitDims.add(dim);
+      } catch (e) {
+        console.warn(`[ZarrLoader] Failed to read embedding shape for '${key}':`, e);
       }
-      if (key === 'X_umap_2d') availableDimensions.push(2);
-      if (key === 'X_umap_1d') availableDimensions.push(1);
     }
 
-    if (availableDimensions.length === 0 && this._obsmKeys.includes('X_umap')) {
-      const { nDims } = await this.getEmbeddingShape('X_umap');
-      availableDimensions.push(nDims);
+    if (this._obsmKeys.includes('X_umap')) {
+      try {
+        const { shape, nDims } = await this.getEmbeddingShape('X_umap');
+        if (shape?.length !== 2) {
+          umapResolution = { source_key: 'X_umap', action: 'ignored', reason: 'invalid_shape', shape };
+        } else if (shape[0] !== this._nObs) {
+          umapResolution = {
+            source_key: 'X_umap',
+            action: 'ignored',
+            reason: 'row_count_mismatch',
+            shape,
+            expected_rows: this._nObs,
+          };
+        } else if (nDims < 1 || nDims > 3) {
+          umapResolution = { source_key: 'X_umap', action: 'ignored', reason: 'unsupported_dim', n_dims: nDims };
+        } else {
+          const aliasKey = `X_umap_${nDims}d`;
+          if (explicitDims.has(nDims)) {
+            umapResolution = {
+              source_key: 'X_umap',
+              action: 'ignored',
+              reason: 'explicit_key_present',
+              dim: nDims,
+              alias_key: aliasKey,
+            };
+          } else {
+            availableDimensions.add(nDims);
+            umapResolution = { source_key: 'X_umap', action: 'used_as', dim: nDims, alias_key: aliasKey };
+          }
+        }
+      } catch (e) {
+        console.warn("[ZarrLoader] Failed to read embedding shape for 'X_umap':", e);
+      }
     }
 
-    if (availableDimensions.length === 0) {
+    if (availableDimensions.size === 0) {
       const fallbacks = ['X_pca', 'X_tsne', 'X_phate'];
       for (const pattern of fallbacks) {
         const key = this._obsmKeys.find(k => k.startsWith(pattern));
@@ -1282,7 +1327,7 @@ export class ZarrLoader {
           try {
             const { nDims } = await this.getEmbeddingShape(key);
             if (nDims >= 1 && nDims <= 3) {
-              availableDimensions.push(nDims);
+              availableDimensions.add(nDims);
               console.warn(`[ZarrLoader] No UMAP found, using ${key} as fallback`);
               break;
             }
@@ -1291,12 +1336,13 @@ export class ZarrLoader {
       }
     }
 
-    if (availableDimensions.length === 0) {
+    const availableDimensionsList = Array.from(availableDimensions);
+    if (availableDimensionsList.length === 0) {
       throw new Error('No suitable embeddings found in obsm');
     }
 
-    availableDimensions.sort((a, b) => b - a);
-    defaultDimension = availableDimensions[0];
+    availableDimensionsList.sort((a, b) => b - a);
+    const defaultDimension = availableDimensionsList[0];
 
     // Count field types
     let nCategorical = 0;
@@ -1328,8 +1374,9 @@ export class ZarrLoader {
         has_connectivity: hasConnectivity,
       },
       embeddings: {
-        available_dimensions: availableDimensions,
+        available_dimensions: availableDimensionsList,
         default_dimension: defaultDimension,
+        ...(umapResolution ? { umap_resolution: umapResolution } : {}),
       },
       obs_fields: this._obsKeys.map(key => ({ key, kind: 'unknown' })),
       source: {

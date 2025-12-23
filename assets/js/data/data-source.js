@@ -70,15 +70,9 @@ export const DATA_CONFIG = {
   // Metadata file name
   DATASET_IDENTITY_FILE: 'dataset_identity.json',
 
-  // Legacy support - if no datasets.json, treat exports/ as single dataset
-  LEGACY_MODE_FALLBACK: true,
-
-  // Default dataset ID for legacy mode
-  LEGACY_DATASET_ID: '__legacy__',
-
   // Supported schema versions
   SUPPORTED_MANIFEST_VERSIONS: [1],
-  SUPPORTED_IDENTITY_VERSIONS: [1, 2]
+  SUPPORTED_IDENTITY_VERSIONS: [2]
 };
 
 /**
@@ -90,9 +84,12 @@ export const DATA_CONFIG = {
  */
 export function validateSchemaVersion(version, supportedVersions, context) {
   if (version === undefined) {
-    // Allow missing version for backward compatibility, but warn
-    console.warn(`[DataSource] No version field in ${context}, assuming version 1`);
-    return;
+    throw new DataSourceError(
+      `Missing required version field in ${context}`,
+      DataSourceErrorCode.INVALID_FORMAT,
+      null,
+      { version, supportedVersions, context }
+    );
   }
 
   if (!supportedVersions.includes(version)) {
@@ -334,71 +331,15 @@ export async function loadDatasetMetadata(baseUrl, datasetId, sourceType) {
       source: identity.source || {}
     };
   } catch (err) {
-    // Fallback: construct minimal metadata from obs_manifest.json
-    console.log(`[DataSource] No dataset_identity.json found, constructing from manifests...`);
-
-    try {
-      const obsManifestUrl = resolveUrl(baseUrl, 'obs_manifest.json');
-      const obsManifest = await fetchJson(obsManifestUrl, sourceType);
-
-      // Try to get gene count from var_manifest
-      let n_genes = 0;
-      try {
-        const varManifestUrl = resolveUrl(baseUrl, 'var_manifest.json');
-        const varManifest = await fetchJson(varManifestUrl, sourceType);
-        n_genes = varManifest.fields?.length || 0;
-      } catch (_) {
-        // No var manifest
-      }
-
-      // Check for connectivity
-      let has_connectivity = false;
-      let n_edges = 0;
-      try {
-        const connManifestUrl = resolveUrl(baseUrl, 'connectivity_manifest.json');
-        const connManifest = await fetchJson(connManifestUrl, sourceType);
-        has_connectivity = true;
-        n_edges = connManifest.n_edges || 0;
-      } catch (_) {
-        // No connectivity
-      }
-
-      // Count field types from expanded manifest
-      const fields = obsManifest.fields || [];
-      const categoricalCount = fields.filter(f => f.kind === 'category').length;
-      const continuousCount = fields.filter(f => f.kind === 'continuous').length;
-
-      return {
-        id: datasetId,
-        name: datasetId,
-        description: '',
-        stats: {
-          n_cells: obsManifest.n_points || 0,
-          n_genes,
-          n_obs_fields: fields.length,
-          n_categorical_fields: categoricalCount,
-          n_continuous_fields: continuousCount,
-          has_connectivity,
-          n_edges
-        },
-        obs_fields: fields.map(f => ({
-          key: f.key,
-          kind: f.kind,
-          n_categories: f.categories?.length
-        })),
-        export_settings: {
-          compression: obsManifest.compression,
-          obs_continuous_quantization: obsManifest._obsSchemas?.continuous?.quantizationBits || null
-        }
-      };
-    } catch (manifestErr) {
+    if (err instanceof DataSourceError && err.code === DataSourceErrorCode.NOT_FOUND) {
       throw new DataSourceError(
-        `Could not load dataset metadata: ${manifestErr.message}`,
+        'Missing required dataset_identity.json',
         DataSourceErrorCode.INVALID_FORMAT,
         sourceType,
-        { datasetId, baseUrl }
+        { datasetId, baseUrl, identityUrl }
       );
     }
+    throw err;
   }
 }
 

@@ -12,93 +12,149 @@ import { rgbToCss, COLOR_PICKER_PALETTE, getCategoryColor } from '../../../data/
 import { NEUTRAL_GRAY_UINT8 } from '../core/constants.js';
 import { BaseManager } from '../core/base-manager.js';
 
+const FULL_RANGE_EPSILON_FLOOR = 1e-9;
+const FULL_RANGE_EPSILON_SCALE = 1e-6;
+
+function getFullRangeEpsilon(stats) {
+  const range = (stats?.max ?? 0) - (stats?.min ?? 0);
+  if (!Number.isFinite(range) || range <= 0) return FULL_RANGE_EPSILON_FLOOR;
+  const scaled = range * FULL_RANGE_EPSILON_SCALE;
+  return scaled > FULL_RANGE_EPSILON_FLOOR ? scaled : FULL_RANGE_EPSILON_FLOOR;
+}
+
+function isContinuousFilterFullRange(filter, stats) {
+  const epsilon = getFullRangeEpsilon(stats);
+  return (
+    filter.min <= stats.min + epsilon &&
+    filter.max >= stats.max - epsilon
+  );
+}
+
 export class DataStateFilterMethods {
   computeGlobalVisibility() {
     if (!this.obsData || !this.obsData.fields || !this.pointCount) return;
     const fields = this.obsData.fields;
+    const pointCount = this.pointCount;
     const activeVarCandidate = (this.activeFieldSource === 'var' && this.activeVarFieldIndex >= 0)
       ? this.varData?.fields?.[this.activeVarFieldIndex]
       : null;
     const activeVarField = activeVarCandidate && activeVarCandidate._isDeleted !== true ? activeVarCandidate : null;
     const activeVarValues = activeVarField?.values || [];
-    if (!this.categoryTransparency || this.categoryTransparency.length !== this.pointCount) {
-      this.categoryTransparency = new Float32Array(this.pointCount);
+    if (!this.categoryTransparency || this.categoryTransparency.length !== pointCount) {
+      this.categoryTransparency = new Float32Array(pointCount);
     }
 
     const applyOutlierFilter = this.isOutlierFilterEnabledForActiveField();
     const outlierThreshold = applyOutlierFilter ? this.getCurrentOutlierThreshold() : 1.0;
     const outliers = applyOutlierFilter ? (this.outlierQuantilesArray || []) : [];
 
-    for (let i = 0; i < this.pointCount; i++) {
-      let visible = true;
-      for (let f = 0; f < fields.length; f++) {
-        const field = fields[f];
-        if (!field) continue;
-        if (field._isDeleted === true) continue;
-        if (field.kind === 'category' && field._categoryVisible) {
-          // Check if category filter is enabled
-          const categoryFilterEnabled = field._categoryFilterEnabled !== false;
-          if (categoryFilterEnabled) {
-            const codes = field.codes || [];
-            const categories = field.categories || [];
-            const numCats = categories.length;
-            const code = codes[i];
-            if (code == null || code < 0 || code >= numCats) {
-            } else {
-              const isVisible = field._categoryVisible[code] !== false;
-              if (!isVisible) { visible = false; break; }
+    const categoryFilters = [];
+    const continuousFilters = [];
+
+    for (let f = 0; f < fields.length; f++) {
+      const field = fields[f];
+      if (!field) continue;
+      if (field._isDeleted === true) continue;
+
+      if (field.kind === 'category' && field._categoryVisible && field._categoryFilterEnabled !== false) {
+        const categories = field.categories || [];
+        const numCats = categories.length;
+        if (numCats > 0) {
+          const visibleMap = field._categoryVisible;
+          let hasHidden = false;
+          for (let c = 0; c < numCats; c++) {
+            if (visibleMap[c] === false) {
+              hasHidden = true;
+              break;
             }
           }
-        } else if (field.kind === 'continuous' && field._continuousStats && field._continuousFilter) {
-          // Check if continuous filter is enabled
-          const filterEnabled = field._filterEnabled !== false;
-          if (filterEnabled) {
-            const stats = field._continuousStats;
-            const filter = field._continuousFilter;
-            const values = field.values || [];
-            const fullRange =
-              filter.min <= stats.min + 1e-6 &&
-              filter.max >= stats.max - 1e-6;
-            if (!fullRange) {
-              const v = values[i];
-              if (v === null || Number.isNaN(v) || v < filter.min || v > filter.max) {
-                visible = false;
-                break;
-              }
-            }
+          if (hasHidden) {
+            categoryFilters.push({ codes: field.codes || [], visibleMap, numCats });
           }
         }
-      }
-      if (
-        visible &&
-        activeVarField &&
-        activeVarField.kind === 'continuous' &&
-        activeVarField._continuousStats &&
-        activeVarField._continuousFilter
+      } else if (
+        field.kind === 'continuous' &&
+        field._continuousStats &&
+        field._continuousFilter &&
+        field._filterEnabled !== false
       ) {
-        // Check if var field filter is enabled
-        const filterEnabled = activeVarField._filterEnabled !== false;
-        if (filterEnabled) {
-          const stats = activeVarField._continuousStats;
-          const filter = activeVarField._continuousFilter;
-          const fullRange =
-            filter.min <= stats.min + 1e-6 &&
-            filter.max >= stats.max - 1e-6;
-          if (!fullRange) {
-            const v = activeVarValues[i];
+        const stats = field._continuousStats;
+        const filter = field._continuousFilter;
+        if (!isContinuousFilterFullRange(filter, stats)) {
+          continuousFilters.push({ values: field.values || [], min: filter.min, max: filter.max });
+        }
+      }
+    }
+
+    let activeVarFilterMin = null;
+    let activeVarFilterMax = null;
+    let activeVarFilterEnabled = false;
+    if (
+      activeVarField &&
+      activeVarField.kind === 'continuous' &&
+      activeVarField._continuousStats &&
+      activeVarField._continuousFilter &&
+      activeVarField._filterEnabled !== false
+    ) {
+      const stats = activeVarField._continuousStats;
+      const filter = activeVarField._continuousFilter;
+      if (!isContinuousFilterFullRange(filter, stats)) {
+        activeVarFilterEnabled = true;
+        activeVarFilterMin = filter.min;
+        activeVarFilterMax = filter.max;
+      }
+    }
+
+    const hasAnyFilter =
+      categoryFilters.length > 0 ||
+      continuousFilters.length > 0 ||
+      activeVarFilterEnabled ||
+      applyOutlierFilter;
+
+    if (!hasAnyFilter) {
+      this.categoryTransparency.fill(1.0, 0, pointCount);
+    } else {
+      for (let i = 0; i < pointCount; i++) {
+        let visible = true;
+
+        for (let cf = 0; cf < categoryFilters.length; cf++) {
+          const filter = categoryFilters[cf];
+          const code = filter.codes[i];
+          if (code == null || code < 0 || code >= filter.numCats) continue;
+          if (filter.visibleMap[code] === false) {
+            visible = false;
+            break;
+          }
+        }
+
+        if (visible) {
+          for (let cf = 0; cf < continuousFilters.length; cf++) {
+            const filter = continuousFilters[cf];
+            const v = filter.values[i];
             if (v === null || Number.isNaN(v) || v < filter.min || v > filter.max) {
               visible = false;
+              break;
             }
           }
         }
+
+        if (visible && activeVarFilterEnabled) {
+          const v = activeVarValues[i];
+          if (v === null || Number.isNaN(v) || v < activeVarFilterMin || v > activeVarFilterMax) {
+            visible = false;
+          }
+        }
+
+        // Apply outlier filter for the active field (only when supported).
+        if (visible && applyOutlierFilter) {
+          const q = (i < outliers.length) ? outliers[i] : -1;
+          if (q >= 0 && q > outlierThreshold) visible = false;
+        }
+
+        this.categoryTransparency[i] = visible ? 1.0 : 0.0;
       }
-      // Apply outlier filter for the active field (only when supported).
-      if (visible && applyOutlierFilter) {
-        const q = (i < outliers.length) ? outliers[i] : -1;
-        if (q >= 0 && q > outlierThreshold) visible = false;
-      }
-      this.categoryTransparency[i] = visible ? 1.0 : 0.0;
     }
+
     this._syncColorsAlpha();
     const centroidsChanged = this._updateActiveCategoryCounts();
     this._pushTransparencyToViewer();
@@ -138,9 +194,7 @@ export class DataStateFilterMethods {
       if (field.kind === 'continuous' && field._continuousStats && field._continuousFilter) {
         const stats = field._continuousStats;
         const filter = field._continuousFilter;
-        const fullRange =
-          filter.min <= stats.min + 1e-6 &&
-          filter.max >= stats.max - 1e-6;
+        const fullRange = isContinuousFilterFullRange(filter, stats);
         if (!fullRange) {
           const enabled = field._filterEnabled !== false; // default true
           const disabledSuffix = enabled ? '' : ' (disabled)';
@@ -215,9 +269,7 @@ export class DataStateFilterMethods {
       if (field && field._isDeleted !== true && field.kind === 'continuous' && field._continuousStats && field._continuousFilter) {
         const stats = field._continuousStats;
         const filter = field._continuousFilter;
-        const fullRange =
-          filter.min <= stats.min + 1e-6 &&
-          filter.max >= stats.max - 1e-6;
+        const fullRange = isContinuousFilterFullRange(filter, stats);
         if (!fullRange) {
           const enabled = field._filterEnabled !== false; // default true
           const disabledSuffix = enabled ? '' : ' (disabled)';
@@ -371,6 +423,10 @@ export class DataStateFilterMethods {
 
   getColorForCategory(field, idx) {
     this.ensureCategoryMetadata(field);
+    const numCats = field.categories?.length ?? 0;
+    if (!Number.isFinite(idx) || idx < 0 || idx >= numCats) {
+      return getCategoryColor(idx);
+    }
     const color = field._categoryColors[idx];
     if (color && color.length === 3) return color;
     const fallback = getCategoryColor(idx);

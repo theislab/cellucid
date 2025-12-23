@@ -351,15 +351,19 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     openModal(this._modal);
 
     // Render plot in modal
-    if (this._modal._plotContainer) {
-      try {
-        await loadPlotly();
-        await this._renderModalPlot(this._modal._plotContainer);
-      } catch (err) {
-        console.error(`[${this.constructor.name}] Modal plot render failed:`, err);
-        this._modal._plotContainer.innerHTML = `<div class="analysis-error">Failed to render: ${err.message}</div>`;
+      if (this._modal._plotContainer) {
+        try {
+          await loadPlotly();
+          await this._renderModalPlot(this._modal._plotContainer);
+        } catch (err) {
+          console.error(`[${this.constructor.name}] Modal plot render failed:`, err);
+          this._modal._plotContainer.innerHTML = '';
+          const errorEl = document.createElement('div');
+          errorEl.className = 'analysis-error';
+          errorEl.textContent = `Failed to render: ${err?.message || err}`;
+          this._modal._plotContainer.appendChild(errorEl);
+        }
       }
-    }
 
     // Render summary stats (bottom left)
     if (this._modal._statsContent) {
@@ -386,7 +390,11 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
 
     const plotDef = PlotRegistry.get(result.plotType);
     if (!plotDef) {
-      container.innerHTML = `<div class="analysis-error">Unknown plot type: ${result.plotType}</div>`;
+      container.innerHTML = '';
+      const errorEl = document.createElement('div');
+      errorEl.className = 'analysis-error';
+      errorEl.textContent = `Unknown plot type: ${result.plotType}`;
+      container.appendChild(errorEl);
       return;
     }
 
@@ -622,10 +630,13 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     // Intro section
     const intro = document.createElement('div');
     intro.className = 'analysis-intro';
-    intro.innerHTML = `
-      <h3>${this._getTitle()}</h3>
-      <p>${this._getDescription()}</p>
-    `;
+    const title = document.createElement('h3');
+    title.textContent = this._getTitle();
+    intro.appendChild(title);
+
+    const description = document.createElement('p');
+    description.textContent = this._getDescription();
+    intro.appendChild(description);
     this._container.appendChild(intro);
 
     // Form container
@@ -672,7 +683,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     const runBtn = createFormButton(
       this._getRunButtonText(),
       () => this._runAnalysis(),
-      { className: 'btn-primary analysis-run-btn' }
+      { className: 'btn-small analysis-run-btn' }
     );
     wrapper.appendChild(runBtn);
 

@@ -8,6 +8,7 @@
 
 import { PlotFactory, PlotRegistry, BasePlot, COMMON_HOVER_STYLE, createMinimalPlotly } from '../plot-factory.js';
 import { getPlotTheme } from '../../shared/plot-theme.js';
+import { escapeHtml } from '../../../utils/dom-utils.js';
 
 /**
  * Process categories for a page (count, sort, limit)
@@ -75,7 +76,7 @@ const pieplotDefinition = {
         insidetextorientation: 'radial',
         textfont: { family: theme.fontFamily, size: 10, color: '#ffffff' },
         marker: { line: { color: theme.plotBg, width: 1 } },
-        hovertemplate: '%{label}: %{value} (%{percent})<extra>' + pd.pageName + '</extra>',
+        hovertemplate: '%{label}: %{value} (%{percent})<extra>' + escapeHtml(pd.pageName) + '</extra>',
         hoverlabel: COMMON_HOVER_STYLE,
         showlegend: index === 0
       });
@@ -106,7 +107,7 @@ const pieplotDefinition = {
       const yStart = 1 - (row + 1) * (ySize + yGap) + yGap;
 
       return {
-        text: `<b>${pd.pageName}</b>`,
+        text: `<b>${escapeHtml(pd.pageName ?? '')}</b>`,
         x: xStart + xSize / 2,
         y: yStart + ySize + 0.02,
         xref: 'paper', yref: 'paper',

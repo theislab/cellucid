@@ -14,7 +14,6 @@ import { PlotRegistry } from '../../shared/plot-registry-utils.js';
 import {
   createFormRow,
   createFormSelect,
-  createResultHeader,
   NONE_VALUE
 } from '../../shared/dom-utils.js';
 import { correlationResultsToCSV, downloadCSV } from '../../shared/analysis-utils.js';
@@ -57,10 +56,6 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     return 'Correlation analysis complete';
   }
 
-  _getRunButtonText() {
-    return 'Compute Correlation';
-  }
-
   constructor(options) {
     super(options);
 
@@ -87,20 +82,114 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
   _handlePageChange = (pageIds) => {
     this._selectedPages = pageIds || [];
     this._currentConfig.pages = this._selectedPages;
-    this._hideStaleResult();
+    // Trigger auto-update (like detailed mode)
+    this._scheduleUpdate();
   };
 
   _handlePageColorChange = (pageId, color) => {
     this.dataLayer?.setPageColor?.(pageId, color);
-    // Re-render if we have results
-    if (this._lastResult) {
-      this._hideStaleResult();
-    }
+    // Trigger auto-update to reflect color changes
+    this._scheduleUpdate();
   };
+
+  // ===========================================================================
+  // Auto-calculation Logic (like Detailed mode)
+  // ===========================================================================
+
+  /**
+   * Override _canRunAnalysis to check for X and Y variables
+   * @override
+   */
+  _canRunAnalysis() {
+    const xSel = this._xSelector?.getSelectedVariable?.() || { type: '', variable: '' };
+    const ySel = this._ySelector?.getSelectedVariable?.() || { type: '', variable: '' };
+    return (
+      xSel.type && xSel.variable &&
+      ySel.type && ySel.variable &&
+      this._selectedPages.length > 0
+    );
+  }
+
+  /**
+   * Override to run analysis automatically when inputs are valid
+   * @override
+   */
+  async _runAnalysisIfValid() {
+    if (this._isDestroyed) return;
+    if (!this._canRunAnalysis()) {
+      this._hideResult();
+      return;
+    }
+
+    // Validate that X and Y are different
+    const formValues = this._getFormValues();
+    if (formValues.variableX?.key === formValues.variableY?.key &&
+        formValues.variableX?.type === formValues.variableY?.type) {
+      this._hideResult();
+      return;
+    }
+
+    try {
+      this._isLoading = true;
+      const result = await this._runAnalysisImpl(formValues);
+
+      if (this._isDestroyed) return;
+      if (result) {
+        this._lastResult = result;
+        this._currentPageData = result.data || result;
+        await this._showResult(result);
+      }
+    } catch (err) {
+      console.error('[CorrelationAnalysisUI] Analysis failed:', err);
+      this._showError('Analysis failed: ' + err.message);
+    } finally {
+      this._isLoading = false;
+    }
+  }
+
+  /**
+   * Hide result container
+   */
+  _hideResult() {
+    if (this._resultContainer) {
+      purgePlot(this._resultContainer.querySelector('.analysis-preview-plot'));
+      this._resultContainer.innerHTML = '';
+      this._resultContainer.classList.add('hidden');
+    }
+    this._lastResult = null;
+  }
+
+  /**
+   * Show error message
+   */
+  _showError(message) {
+    if (this._resultContainer) {
+      this._resultContainer.classList.remove('hidden');
+      this._resultContainer.innerHTML = '';
+      const errorEl = document.createElement('div');
+      errorEl.className = 'analysis-error';
+      errorEl.textContent = message;
+      this._resultContainer.appendChild(errorEl);
+    }
+    this._notifications?.error?.(message, { category: 'analysis' });
+  }
 
   // ===========================================================================
   // Page Change Notification Overrides
   // ===========================================================================
+
+  /**
+   * Update when highlights change (cells added/removed from pages)
+   * Override base class to check for X/Y variables instead of dataSource.variable
+   * @override
+   */
+  onHighlightChanged() {
+    this._updatePageSelectorCounts();
+
+    if (this._canRunAnalysis()) {
+      this._scheduleUpdate();
+    }
+  }
 
   /**
    * Override to use PageSelectorComponent's updateCounts method
@@ -108,6 +197,37 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
    */
   _updatePageSelectorCounts() {
     this._pageSelector?.updateCounts();
+  }
+
+  /**
+   * Override _renderControls to not render a button (auto-calculate like detailed mode)
+   * @override
+   */
+  _renderControls() {
+    this._formContainer.innerHTML = '';
+
+    // Validate page requirements
+    const validation = this.validatePages(this._selectedPages);
+
+    if (!validation.valid) {
+      const notice = document.createElement('div');
+      notice.className = 'analysis-notice';
+      notice.textContent = validation.error || this.getRequirementText();
+      this._formContainer.appendChild(notice);
+      return;
+    }
+
+    // Create form wrapper (no button - auto-calculates)
+    const wrapper = document.createElement('div');
+    wrapper.className = 'analysis-form';
+
+    // Render form controls
+    this._renderFormControls(wrapper);
+
+    this._formContainer.appendChild(wrapper);
+
+    // Trigger initial calculation if inputs are valid
+    this._scheduleUpdate();
   }
 
   /**
@@ -127,7 +247,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
       allowedTypes: ['continuous', 'gene'],
       idPrefix: this._xIdPrefix,
       typeLabel: 'X Axis Variable:',
-      onVariableChange: () => this._hideStaleResult()
+      onVariableChange: () => this._scheduleUpdate()
     });
 
     // Y axis variable selector
@@ -142,7 +262,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
       allowedTypes: ['continuous', 'gene'],
       idPrefix: this._yIdPrefix,
       typeLabel: 'Y Axis Variable:',
-      onVariableChange: () => this._hideStaleResult()
+      onVariableChange: () => this._scheduleUpdate()
     });
 
     // Page selector (matching DetailedAnalysisUI)
@@ -156,6 +276,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
       { value: 'pearson', label: 'Pearson (linear)', selected: true },
       { value: 'spearman', label: 'Spearman (rank)' }
     ]);
+    methodSelect.addEventListener('change', () => this._scheduleUpdate());
     wrapper.appendChild(createFormRow('Correlation method:', methodSelect));
   }
 
@@ -229,24 +350,10 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     colorBySelect.addEventListener('change', () => {
       const value = colorBySelect.value;
       this._colorByVariable = (value && value !== NONE_VALUE) ? value : null;
-      this._hideStaleResult();
+      this._scheduleUpdate();
     });
 
     wrapper.appendChild(createFormRow('Color by:', colorBySelect));
-  }
-
-  /**
-   * Hide results when inputs change (prevents stale plot/stat interpretation).
-   * @private
-   */
-  _hideStaleResult() {
-    // Clear stale results aggressively to free large x/y arrays and Plotly buffers.
-    if (this._resultContainer) {
-      purgePlot(this._resultContainer.querySelector('.analysis-preview-plot'));
-      this._resultContainer.innerHTML = '';
-      this._resultContainer.classList.add('hidden');
-    }
-    this._lastResult = null;
   }
 
   /**
@@ -343,12 +450,12 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     purgePlot(this._resultContainer.querySelector('.analysis-preview-plot'));
     this._resultContainer.innerHTML = '';
 
-    const header = createResultHeader(result.title, result.subtitle);
-    this._resultContainer.appendChild(header);
-
-    // Plot container (use the same base styling as the Detailed preview)
+    // Plot container only - clickable to open modal (like detailed mode)
     const previewContainer = document.createElement('div');
     previewContainer.className = 'analysis-preview-container';
+    previewContainer.style.cursor = 'pointer';
+    previewContainer.title = 'Click to open in full view with statistics and export options';
+    previewContainer.addEventListener('click', () => this._openFigureModal?.());
     this._resultContainer.appendChild(previewContainer);
 
     const plotContainer = document.createElement('div');
@@ -364,19 +471,13 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
         await plotDef.render(result.data, mergedOptions, plotContainer, null);
       } catch (err) {
         console.error('[CorrelationAnalysisUI] Plot render error:', err);
-        plotContainer.innerHTML = `<div class="plot-error">Failed to render plot: ${err.message}</div>`;
+        plotContainer.innerHTML = '';
+        const errorEl = document.createElement('div');
+        errorEl.className = 'plot-error';
+        errorEl.textContent = `Failed to render plot: ${err?.message || err}`;
+        plotContainer.appendChild(errorEl);
       }
     }
-
-    // Expand (modal) action - lower right
-    const actionsContainer = document.createElement('div');
-    actionsContainer.className = 'analysis-actions';
-    actionsContainer.style.display = 'flex';
-
-    const expandBtn = this._createExpandButton();
-    expandBtn.title = 'Open in full view with statistics and export options';
-    actionsContainer.appendChild(expandBtn);
-    this._resultContainer.appendChild(actionsContainer);
   }
 
   // ===========================================================================
@@ -390,40 +491,58 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
       return;
     }
 
-    const rows = results.map(r => {
-      const hasError = !!r.error;
-      const rVal = isFiniteNumber(r.r) ? r.r.toFixed(4) : 'N/A';
-      const r2Val = isFiniteNumber(r.rSquared) ? r.rSquared.toFixed(4) : 'N/A';
-      const pVal = isFiniteNumber(r.pValue) ? r.pValue.toExponential(3) : 'N/A';
-      const nVal = typeof r.n === 'number' ? r.n.toLocaleString() : (Array.isArray(r.xValues) ? r.xValues.length.toLocaleString() : 'N/A');
+    container.innerHTML = '';
 
-      return `
-        <tr>
-          <td>${r.pageName || 'Page'}</td>
-          <td>${hasError ? '—' : rVal}</td>
-          <td>${hasError ? '—' : r2Val}</td>
-          <td class="${!hasError && r.pValue < 0.05 ? 'significant' : ''}">${hasError ? '—' : pVal}</td>
-          <td>${hasError ? '—' : nVal}</td>
-        </tr>
-      `;
-    }).join('');
+    const table = document.createElement('table');
+    table.className = 'analysis-stats-table';
 
-    container.innerHTML = `
-      <table class="analysis-stats-table">
-        <thead>
-          <tr>
-            <th>Page</th>
-            <th>r</th>
-            <th>r²</th>
-            <th>p</th>
-            <th>n</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${rows}
-        </tbody>
-      </table>
-    `;
+    const thead = document.createElement('thead');
+    const headRow = document.createElement('tr');
+    for (const label of ['Page', 'r', 'r²', 'p', 'n']) {
+      const th = document.createElement('th');
+      th.textContent = label;
+      headRow.appendChild(th);
+    }
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+
+    const tbody = document.createElement('tbody');
+    for (const r of results) {
+      const hasError = !!r?.error;
+      const rVal = isFiniteNumber(r?.r) ? r.r.toFixed(4) : 'N/A';
+      const r2Val = isFiniteNumber(r?.rSquared) ? r.rSquared.toFixed(4) : 'N/A';
+      const pVal = isFiniteNumber(r?.pValue) ? r.pValue.toExponential(3) : 'N/A';
+      const nVal = typeof r?.n === 'number'
+        ? r.n.toLocaleString()
+        : (Array.isArray(r?.xValues) ? r.xValues.length.toLocaleString() : 'N/A');
+
+      const tr = document.createElement('tr');
+
+      const tdPage = document.createElement('td');
+      tdPage.textContent = String(r?.pageName || 'Page');
+      tr.appendChild(tdPage);
+
+      const tdR = document.createElement('td');
+      tdR.textContent = hasError ? '—' : rVal;
+      tr.appendChild(tdR);
+
+      const tdR2 = document.createElement('td');
+      tdR2.textContent = hasError ? '—' : r2Val;
+      tr.appendChild(tdR2);
+
+      const tdP = document.createElement('td');
+      tdP.textContent = hasError ? '—' : pVal;
+      if (!hasError && isFiniteNumber(r?.pValue) && r.pValue < 0.05) tdP.classList.add('significant');
+      tr.appendChild(tdP);
+
+      const tdN = document.createElement('td');
+      tdN.textContent = hasError ? '—' : nVal;
+      tr.appendChild(tdN);
+
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    container.appendChild(table);
   }
 
   _renderModalAnnotations(container) {
@@ -433,11 +552,38 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
       return;
     }
 
-    const rows = results
-      .filter(r => !r.error && isFiniteNumber(r.r))
-      .map(r => {
+    const method = this._lastResult?.metadata?.method || 'pearson';
+
+    container.innerHTML = '';
+
+    const table = document.createElement('table');
+    table.className = 'analysis-stats-table correlation-interpretation';
+
+    const thead = document.createElement('thead');
+    const headRow = document.createElement('tr');
+    for (const label of ['Page', 'Direction', 'Strength', 'r']) {
+      const th = document.createElement('th');
+      th.textContent = label;
+      headRow.appendChild(th);
+    }
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+
+    const tbody = document.createElement('tbody');
+
+    const valid = results.filter(r => !r?.error && isFiniteNumber(r?.r));
+    if (valid.length === 0) {
+      const tr = document.createElement('tr');
+      const td = document.createElement('td');
+      td.colSpan = 4;
+      td.textContent = 'No valid correlation values';
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+    } else {
+      for (const r of valid) {
         const absR = Math.abs(r.r);
-        let strengthLabel, strengthClass;
+        let strengthLabel;
+        let strengthClass;
         if (absR >= 0.8) {
           strengthLabel = 'Very Strong';
           strengthClass = 'very-strong';
@@ -458,37 +604,43 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
         const direction = r.r > 0 ? 'Positive' : r.r < 0 ? 'Negative' : 'None';
         const directionClass = r.r > 0 ? 'up' : r.r < 0 ? 'down' : '';
 
-        return `
-          <tr>
-            <td>${r.pageName || 'Page'}</td>
-            <td><strong class="${directionClass}">${direction}</strong></td>
-            <td><strong class="correlation-${strengthClass}">${strengthLabel}</strong></td>
-            <td><strong>${r.r.toFixed(3)}</strong></td>
-          </tr>
-        `;
-      })
-      .join('');
+        const tr = document.createElement('tr');
 
-    const method = this._lastResult?.metadata?.method || 'pearson';
+        const tdPage = document.createElement('td');
+        tdPage.textContent = String(r.pageName || 'Page');
+        tr.appendChild(tdPage);
 
-    container.innerHTML = `
-      <table class="analysis-stats-table correlation-interpretation">
-        <thead>
-          <tr>
-            <th>Page</th>
-            <th>Direction</th>
-            <th>Strength</th>
-            <th>r</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${rows || `<tr><td colspan="4">No valid correlation values</td></tr>`}
-        </tbody>
-      </table>
-      <p class="interpretation-note">
-        Interpreting ${method} correlation: |r| ≥ 0.8 (very strong), ≥ 0.6 (strong), ≥ 0.4 (moderate), ≥ 0.2 (weak).
-      </p>
-    `;
+        const tdDir = document.createElement('td');
+        const strongDir = document.createElement('strong');
+        if (directionClass) strongDir.className = directionClass;
+        strongDir.textContent = direction;
+        tdDir.appendChild(strongDir);
+        tr.appendChild(tdDir);
+
+        const tdStrength = document.createElement('td');
+        const strongStrength = document.createElement('strong');
+        strongStrength.className = `correlation-${strengthClass}`;
+        strongStrength.textContent = strengthLabel;
+        tdStrength.appendChild(strongStrength);
+        tr.appendChild(tdStrength);
+
+        const tdR = document.createElement('td');
+        const strongR = document.createElement('strong');
+        strongR.textContent = r.r.toFixed(3);
+        tdR.appendChild(strongR);
+        tr.appendChild(tdR);
+
+        tbody.appendChild(tr);
+      }
+    }
+
+    table.appendChild(tbody);
+    container.appendChild(table);
+
+    const note = document.createElement('p');
+    note.className = 'interpretation-note';
+    note.textContent = `Interpreting ${method} correlation: |r| ≥ 0.8 (very strong), ≥ 0.6 (strong), ≥ 0.4 (moderate), ≥ 0.2 (weak).`;
+    container.appendChild(note);
   }
 
   _exportModalCSV() {

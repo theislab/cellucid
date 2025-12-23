@@ -31,6 +31,7 @@ import {
   getEmbeddingsMetadata
 } from '../data/data-loaders.js';
 import { createDimensionManager } from '../data/dimension-manager.js';
+import { createVectorFieldManager } from '../data/vector-field-manager.js';
 import { getDataSourceManager } from '../data/data-source-manager.js';
 import { createLocalUserDirDataSource } from '../data/local-user-source.js';
 import { createRemoteDataSource } from '../data/remote-source.js';
@@ -39,7 +40,7 @@ import { createJupyterBridgeDataSource, isJupyterContext, getJupyterConfig } fro
 import { formatCellCount as formatNumber } from '../data/data-source.js';
 import { createComparisonModule } from './analysis/comparison-module.js';
 import { ThemeManager } from '../utils/theme-manager.js';
-import { debug } from './utils/debug.js';
+import { debug } from '../utils/debug.js';
 import { clamp } from './utils/number-utils.js';
 import { createMulberry32 } from './utils/random-utils.js';
 import {
@@ -561,6 +562,37 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     // Initialize dimension manager for multi-dimensional embeddings
     const dimensionManager = createDimensionManager({ baseUrl: EXPORT_BASE_URL });
 
+    function notifyUmapResolution(embeddingsMetadata) {
+      const resolution = embeddingsMetadata?.umap_resolution;
+      if (!resolution || resolution.source_key !== 'X_umap') return;
+
+      const dim = resolution.dim;
+      const aliasKey = resolution.alias_key || (typeof dim === 'number' ? `X_umap_${dim}d` : null);
+
+      if (resolution.action === 'used_as' && typeof dim === 'number') {
+        notifications.info(
+          `Detected obsm['X_umap'] (${dim}D); using it as '${aliasKey}'.`,
+          { category: 'dimension', title: 'AnnData embedding' }
+        );
+        return;
+      }
+
+      if (resolution.action === 'ignored' && resolution.reason === 'explicit_key_present' && typeof dim === 'number') {
+        notifications.info(
+          `Detected obsm['X_umap'] (${dim}D) but '${aliasKey}' is present; ignoring X_umap.`,
+          { category: 'dimension', title: 'AnnData embedding' }
+        );
+        return;
+      }
+
+      if (resolution.action === 'ignored' && resolution.reason === 'unsupported_dim' && typeof resolution.n_dims === 'number') {
+        notifications.warning(
+          `Ignoring obsm['X_umap'] (${resolution.n_dims}D); only 1D/2D/3D embeddings are supported.`,
+          { category: 'dimension', title: 'AnnData embedding' }
+        );
+      }
+    }
+
     // Development phase: require obs_manifest.json (no legacy obs_values.json fallback).
     async function loadObsManifestStrict() {
       try {
@@ -577,14 +609,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     }
 
     // Start ALL manifest loads in parallel for faster initialization
-    const identityPromise = loadDatasetIdentity(getDatasetIdentityUrl()).catch(err => {
-      if (err?.status === 404) {
-        debug.log('[Main] dataset_identity.json not found, using default 3D embeddings');
-        return null;
-      }
-      console.warn('[Main] Error loading dataset identity:', err);
-      return null;
-    });
+    const identityPromise = loadDatasetIdentity(getDatasetIdentityUrl());
 
     const obsPromise = loadObsManifestStrict();
 
@@ -607,21 +632,22 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     });
 
     // Wait for identity first (needed to determine which positions file to load)
-    let datasetIdentity = await identityPromise;
-    if (datasetIdentity) {
-      const embeddingsMetadata = getEmbeddingsMetadata(datasetIdentity);
-      dimensionManager.initFromMetadata(embeddingsMetadata);
-      debug.log(`[Main] Loaded dataset identity v${datasetIdentity.version || 1}`);
-    } else {
-      dimensionManager.initFromMetadata({
-        available_dimensions: [3],
-        default_dimension: 3,
-        files: { '3d': 'points_3d.bin' }
-      });
-    }
+    const datasetIdentity = await identityPromise;
+    const embeddingsMetadata = getEmbeddingsMetadata(datasetIdentity);
+    dimensionManager.initFromMetadata(embeddingsMetadata);
+    notifyUmapResolution(embeddingsMetadata);
+    debug.log(`[Main] Loaded dataset identity v${datasetIdentity.version}`);
 
     // Set dimension manager on state
     state.setDimensionManager(dimensionManager);
+
+    // Optional vector fields (dimension-specific) used by the animated overlay.
+    // Only datasets that provide `vector_fields` metadata will surface the UI.
+    state.setVectorFieldManager(createVectorFieldManager({
+      baseUrl: EXPORT_BASE_URL,
+      vectorFieldsMetadata: datasetIdentity?.vector_fields || null,
+      dimensionManager
+    }));
 
     // Start positions loading NOW (other manifests still loading in parallel)
     const defaultDim = dimensionManager.getDefaultDimension();
@@ -680,14 +706,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         dimensionManager.setBaseUrl(EXPORT_BASE_URL);
 
         // Start ALL manifest loads in parallel for faster reload
-        const reloadIdentityPromise = loadDatasetIdentity(getDatasetIdentityUrl()).catch(err => {
-          if (err?.status === 404) {
-            debug.log('[Main] dataset_identity.json not found for reloaded dataset, using default 3D embeddings');
-          } else {
-            console.warn('[Main] Error loading dataset identity for reloaded dataset:', err);
-          }
-          return null;
-        });
+        const reloadIdentityPromise = loadDatasetIdentity(getDatasetIdentityUrl());
 
         const reloadObsPromise = loadObsManifestStrict();
 
@@ -707,17 +726,16 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
         // Wait for identity first (needed to determine positions file)
         const newDatasetIdentity = await reloadIdentityPromise;
-        if (newDatasetIdentity) {
-          const newEmbeddingsMetadata = getEmbeddingsMetadata(newDatasetIdentity);
-          dimensionManager.initFromMetadata(newEmbeddingsMetadata);
-          debug.log(`[Main] Reloaded dataset identity v${newDatasetIdentity.version || 1}`);
-        } else {
-          dimensionManager.initFromMetadata({
-            available_dimensions: [3],
-            default_dimension: 3,
-            files: { '3d': 'points_3d.bin' }
-          });
-        }
+        const newEmbeddingsMetadata = getEmbeddingsMetadata(newDatasetIdentity);
+        dimensionManager.initFromMetadata(newEmbeddingsMetadata);
+        notifyUmapResolution(newEmbeddingsMetadata);
+        debug.log(`[Main] Reloaded dataset identity v${newDatasetIdentity.version}`);
+
+        state.setVectorFieldManager(createVectorFieldManager({
+          baseUrl: EXPORT_BASE_URL,
+          vectorFieldsMetadata: newDatasetIdentity?.vector_fields || null,
+          dimensionManager
+        }));
 
         // Start positions loading NOW (other manifests still loading in parallel)
         const newDefaultDim = dimensionManager.getDefaultDimension();
@@ -2045,10 +2063,10 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         const BottleneckAnalyzer = benchmarkModule.BottleneckAnalyzer;
 
         const canvas = document.querySelector('canvas');
-        const gl = canvas?.getContext('webgl2') || canvas?.getContext('webgl');
+        const gl = canvas?.getContext('webgl2');
 
         if (!gl) {
-          alert('WebGL not available');
+          alert('WebGL2 not available. Cellucid requires WebGL2.');
           return;
         }
 

@@ -258,7 +258,11 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
         await plotDef.render(result.data, mergedOptions, plotContainer, null);
       } catch (err) {
         console.error('[DEAnalysisUI] Volcano plot render error:', err);
-        plotContainer.innerHTML = `<div class="plot-error">Failed to render plot: ${err.message}</div>`;
+        plotContainer.innerHTML = '';
+        const errorEl = document.createElement('div');
+        errorEl.className = 'plot-error';
+        errorEl.textContent = `Failed to render plot: ${err?.message || err}`;
+        plotContainer.appendChild(errorEl);
       }
     }
 

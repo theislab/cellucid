@@ -107,11 +107,21 @@ export class JupyterBridgeDataSource {
     /** @type {JupyterConfig|null} */
     this._config = null;
 
+    /**
+     * Captured parent origin for outgoing postMessage.
+     * Learned from the first inbound message that passes origin validation.
+     * @type {string|null}
+     */
+    this._parentOrigin = null;
+
     /** @type {boolean} */
     this._connected = false;
 
     /** @type {Map<string, DatasetMetadata>} */
     this._datasetCache = new Map();
+
+    /** @type {Map<string, string>} Dataset ID -> base path (from /_cellucid/datasets) */
+    this._datasetPaths = new Map();
 
     /** @type {string|null} */
     this._activeDatasetId = null;
@@ -199,23 +209,31 @@ export class JupyterBridgeDataSource {
    * @private
    */
   _handleMessage(event) {
-    // Verify origin (should be Jupyter server or localhost)
-    const allowedOrigins = [
-      'http://localhost',
-      'http://127.0.0.1',
-      window.location.origin
-    ];
-
-    // Allow any localhost port
-    const isLocalhost = event.origin.startsWith('http://localhost:') ||
-                        event.origin.startsWith('http://127.0.0.1:');
-
-    if (!isLocalhost && !allowedOrigins.includes(event.origin)) {
-      return;
+    // Verify origin (should be Jupyter server or localhost/loopback).
+    // IMPORTANT: Don't rely on string prefix checks; parse origin and allow http/https.
+    const origin = event.origin;
+    let originUrl = null;
+    try {
+      originUrl = new URL(origin);
+    } catch {
+      originUrl = null;
     }
+
+    const isSameOrigin = origin === window.location.origin;
+    const isLoopbackHttp =
+      originUrl &&
+      (originUrl.protocol === 'http:' || originUrl.protocol === 'https:') &&
+      (originUrl.hostname === 'localhost' || originUrl.hostname === '127.0.0.1');
+
+    if (!isSameOrigin && !isLoopbackHttp) return;
 
     const data = event.data;
     if (!data || typeof data !== 'object') return;
+
+    // Capture parent origin after validation so outgoing messages can target it.
+    if (!this._parentOrigin) {
+      this._parentOrigin = origin;
+    }
 
     // Check viewer ID if present
     if (data.viewerId && this._config && data.viewerId !== this._config.viewerId) {
@@ -366,10 +384,10 @@ export class JupyterBridgeDataSource {
       return;
     }
 
-    // Note: Using '*' as targetOrigin because Jupyter notebooks can be served
-    // from various origins (localhost, jupyter hub, etc.). The message handler
-    // validates incoming messages using origin checking to prevent unauthorized access.
-    window.parent.postMessage(message, '*');
+    // Prefer a specific targetOrigin once we have a validated parent origin.
+    // Fall back to '*' only until the parent origin is learned.
+    const targetOrigin = this._parentOrigin || '*';
+    window.parent.postMessage(message, targetOrigin);
   }
 
   /**
@@ -587,12 +605,21 @@ export class JupyterBridgeDataSource {
       }
 
       const data = await response.json();
-      const datasetList = data.datasets || [];
+      const datasetList = (data.datasets || []).filter(ds => ds?.id);
+
+      this._datasetPaths.clear();
+      for (const ds of datasetList) {
+        let dsPath = typeof ds.path === 'string' ? ds.path : `/${ds.id}/`;
+        if (!dsPath.startsWith('/')) dsPath = `/${dsPath}`;
+        if (!dsPath.endsWith('/')) dsPath = `${dsPath}/`;
+        this._datasetPaths.set(ds.id, dsPath);
+      }
 
       // Load metadata for all datasets in parallel
       const metadataPromises = datasetList.map(async (ds) => {
         try {
-          const baseUrl = `${this._config.serverUrl}${ds.path}`;
+          const dsPath = this._datasetPaths.get(ds.id) || `/${ds.id}/`;
+          const baseUrl = `${this._config.serverUrl}${dsPath}`;
           const metadata = await loadDatasetMetadata(baseUrl, ds.id, this.type);
           this._datasetCache.set(ds.id, metadata);
           return metadata;
@@ -611,6 +638,31 @@ export class JupyterBridgeDataSource {
     } catch (err) {
       console.error('[JupyterBridge] Failed to list datasets:', err);
       return [];
+    }
+  }
+
+  async _refreshDatasetPaths() {
+    if (!this._config?.serverUrl) return;
+
+    try {
+      const response = await fetch(`${this._config.serverUrl}/_cellucid/datasets`);
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const data = await response.json();
+      const datasetList = (data.datasets || []).filter(ds => ds?.id);
+
+      this._datasetPaths.clear();
+      for (const ds of datasetList) {
+        let dsPath = typeof ds.path === 'string' ? ds.path : `/${ds.id}/`;
+        if (!dsPath.startsWith('/')) dsPath = `/${dsPath}`;
+        if (!dsPath.endsWith('/')) dsPath = `${dsPath}/`;
+        this._datasetPaths.set(ds.id, dsPath);
+      }
+    } catch (err) {
+      console.warn('[JupyterBridge] Failed to fetch /_cellucid/datasets:', err);
+      this._datasetPaths.clear();
     }
   }
 
@@ -649,10 +701,21 @@ export class JupyterBridgeDataSource {
     }
 
     if (this._datasetCache.has(datasetId)) {
+      if (!this._datasetPaths.has(datasetId)) {
+        await this._refreshDatasetPaths();
+      }
       return this._datasetCache.get(datasetId);
     }
 
-    const baseUrl = `${this._config.serverUrl}/${datasetId}/`;
+    let dsPath = this._datasetPaths.get(datasetId);
+    if (!dsPath) {
+      await this._refreshDatasetPaths();
+      dsPath = this._datasetPaths.get(datasetId);
+    }
+
+    const baseUrl = dsPath
+      ? `${this._config.serverUrl}${dsPath}`
+      : `${this._config.serverUrl}/${datasetId}/`;
     const metadata = await loadDatasetMetadata(baseUrl, datasetId, this.type);
     this._datasetCache.set(datasetId, metadata);
     return metadata;
@@ -675,6 +738,13 @@ export class JupyterBridgeDataSource {
     this._activeDatasetId = datasetId;
 
     // Use jupyter:// protocol for consistent handling
+    const dsPath = this._datasetPaths.get(datasetId);
+    if (dsPath === '/') {
+      return `jupyter://${this._config.viewerId}/`;
+    }
+    if (dsPath) {
+      return `jupyter://${this._config.viewerId}${dsPath}`;
+    }
     return `jupyter://${this._config.viewerId}/${datasetId}/`;
   }
 
@@ -763,7 +833,9 @@ export class JupyterBridgeDataSource {
     clearTimeout(this._hoverDebounceTimer);
     this._connected = false;
     this._config = null;
+    this._parentOrigin = null;
     this._datasetCache.clear();
+    this._datasetPaths.clear();
     this._pendingRequests.clear();
     this._messageCallbacks.clear();
     this._highlightCallbacks.clear();

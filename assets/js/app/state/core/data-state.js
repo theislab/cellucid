@@ -61,6 +61,11 @@ export class DataState extends EventEmitter {
     // Multi-dimensional embedding support
     this.dimensionManager = null; // Set via setDimensionManager()
     this.activeDimensionLevel = 3; // Current dimension level for live view (1, 2, 3, or 4)
+    this._dimensionChangeLock = null; // Serializes async dimension changes to prevent cross-await state corruption
+
+    // Optional per-cell vector fields (e.g., velocity, CellRank drift) tied to embedding dimensions.
+    // Set via views.setVectorFieldManager() from the app bootstrap when available.
+    this.vectorFieldManager = null;
 
     // Cell highlighting/selection state - multi-page system
     // Each page contains its own independent set of highlight groups

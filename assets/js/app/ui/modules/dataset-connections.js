@@ -18,7 +18,7 @@ import { formatCellCount as formatDataNumber } from '../../../data/data-source.j
 import { getNotificationCenter } from '../../notification-center.js';
 import { updateUrlForDataSource, clearUrlDataSource } from '../../url-state.js';
 import { DATA_LOAD_METHODS } from '../../../analytics/tracker.js';
-import { debug } from '../../utils/debug.js';
+import { debug } from '../../../utils/debug.js';
 
 /**
  * @param {object} options
@@ -425,4 +425,3 @@ export function initDatasetConnections({
     if (connected) updateGithubUI(true);
   }
 }
-

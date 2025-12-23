@@ -7,7 +7,13 @@
  * @module utils/dom-utils
  */
 
-let _escapeDiv = null;
+const HTML_ESCAPE_MAP = {
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  "'": '&#39;'
+};
 
 /**
  * Escape HTML entities by using the browser's DOM serializer.
@@ -15,9 +21,8 @@ let _escapeDiv = null;
  * @returns {string}
  */
 export function escapeHtml(value) {
-  if (!_escapeDiv) _escapeDiv = document.createElement('div');
-  _escapeDiv.textContent = value ?? '';
-  return _escapeDiv.innerHTML;
+  const str = value == null ? '' : String(value);
+  return str.replace(/[&<>"']/g, (ch) => HTML_ESCAPE_MAP[ch]);
 }
 
 /**
@@ -108,4 +113,3 @@ export function addListener(target, event, handler, options) {
   target.addEventListener(event, handler, options);
   return () => target.removeEventListener(event, handler, options);
 }
-

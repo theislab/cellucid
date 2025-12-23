@@ -4,7 +4,7 @@
  * @module state-serializer/multiview
  */
 
-import { debug } from '../utils/debug.js';
+import { debug } from '../../utils/debug.js';
 
 export function serializeMultiview({ state, viewer, serializeFiltersForFields }) {
   const viewLayout = viewer.getViewLayout?.() || { mode: 'single', activeId: 'live' };
@@ -157,4 +157,3 @@ export async function restoreMultiview({
     state.setActiveView?.(resolvedActiveId);
   }
 }
-

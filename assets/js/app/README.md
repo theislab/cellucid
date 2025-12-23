@@ -81,7 +81,7 @@ Cross-cutting helpers live in one place:
 - `utils/number-utils.js`: finite-safe number helpers (canonical `isFiniteNumber` implementation)
 - `utils/random-utils.js`: deterministic PRNG helpers (reproducible sampling/shuffles)
 - `utils/dom-utils.js`: small DOM helpers (escape, create, listener cleanup)
-- `utils/debug.js`: app-layer re-export of `assets/js/utils/debug.js`
+- `../utils/debug.js`: shared debug logger (import directly; no app-layer shim)
 - `analysis/shared/number-utils.js`: re-exports `isFiniteNumber` from `utils/number-utils.js` to keep one definition
 
 ## Debugging

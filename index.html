@@ -612,6 +612,253 @@
                 <div id="connectivity-info" class="legend-help mt-2 tabular-nums"></div>
               </div>
             </div>
+
+            <!-- Velocity overlay (GPU particle flow) -->
+            <div class="control-block mt-1" id="velocity-overlay-controls" style="display: none;">
+              <label>Vector Field Overlay:</label>
+
+              <div class="legend-help mb-1-5">
+                Animated particle flow from per-cell vector fields (velocity / drift), dimension-specific.
+              </div>
+
+              <label class="checkbox-inline">
+                <input type="checkbox" id="velocity-overlay-enabled" />
+                Show overlay
+              </label>
+
+              <div id="velocity-overlay-settings" class="nav-mode-box" style="display: none;">
+                <div class="control-block">
+                  <label for="velocity-field">Vector field:</label>
+                  <select id="velocity-field" class="obs-select"></select>
+                </div>
+
+                <div class="control-block">
+                  <label for="velocity-density">Particle density:</label>
+                  <div class="slider-row">
+                    <input id="velocity-density" type="range" min="1" max="500" step="1" value="15" />
+                    <span id="velocity-density-display" class="slider-value">15K</span>
+                  </div>
+                </div>
+
+                <div class="control-block">
+                  <label for="velocity-speed">Flow speed:</label>
+                  <div class="slider-row">
+                    <input id="velocity-speed" type="range" min="5" max="500" step="1" value="300" />
+                    <span id="velocity-speed-display" class="slider-value">3.0×</span>
+                  </div>
+                </div>
+
+                <div class="control-block">
+                  <label for="velocity-lifetime">Trail length:</label>
+                  <div class="slider-row">
+                    <input id="velocity-lifetime" type="range" min="10" max="1500" step="10" value="800" />
+                    <span id="velocity-lifetime-display" class="slider-value">8.0s</span>
+                  </div>
+                </div>
+
+                <div class="control-block">
+                  <label for="velocity-size">Particle size:</label>
+                  <div class="slider-row">
+                    <input id="velocity-size" type="range" min="0.5" max="30" step="0.5" value="1" />
+                    <span id="velocity-size-display" class="slider-value">1</span>
+                  </div>
+                </div>
+
+                <div class="control-block">
+                  <label for="velocity-opacity">Opacity:</label>
+                  <div class="slider-row">
+                    <input id="velocity-opacity" type="range" min="0" max="100" step="1" value="60" />
+                    <span id="velocity-opacity-display" class="slider-value">60%</span>
+                  </div>
+                </div>
+
+                <div class="control-block">
+                  <label for="velocity-colormap">Color scheme:</label>
+                  <select id="velocity-colormap" class="obs-select">
+                    <option value="viridis" selected>Viridis</option>
+                    <option value="plasma">Plasma</option>
+                    <option value="turbo">Turbo</option>
+                    <option value="cividis">Cividis</option>
+                    <option value="magma">Magma</option>
+                    <option value="coolwarm">Coolwarm</option>
+                  </select>
+                </div>
+
+                <label class="checkbox-inline">
+                  <input type="checkbox" id="velocity-sync-lod" checked />
+                  Sync with LOD
+                </label>
+
+                <!-- Advanced Visual Settings (collapsible) -->
+                <details class="mt-2">
+                  <summary class="cursor-pointer">Advanced Visual Settings</summary>
+                  <div class="mt-1">
+
+                    <!-- Particle Rendering -->
+                    <div class="legend-help mb-1" style="font-weight: 500; opacity: 0.7;">Particle Rendering</div>
+
+                    <div class="control-block">
+                      <label for="velocity-intensity">Intensity:</label>
+                      <div class="slider-row">
+                        <input id="velocity-intensity" type="range" min="0.05" max="1.5" step="0.05" value="0.25" />
+                        <span id="velocity-intensity-display" class="slider-value">0.25</span>
+                      </div>
+                    </div>
+
+                    <div class="control-block">
+                      <label for="velocity-glow">Glow amount:</label>
+                      <div class="slider-row">
+                        <input id="velocity-glow" type="range" min="0" max="1" step="0.05" value="0.3" />
+                        <span id="velocity-glow-display" class="slider-value">0.3</span>
+                      </div>
+                    </div>
+
+                    <div class="control-block">
+                      <label for="velocity-comet-stretch">Comet stretch:</label>
+                      <div class="slider-row">
+                        <input id="velocity-comet-stretch" type="range" min="0" max="2" step="0.05" value="0.6" />
+                        <span id="velocity-comet-stretch-display" class="slider-value">0.6</span>
+                      </div>
+                    </div>
+
+                    <div class="control-block">
+                      <label for="velocity-core-sharpness">Core sharpness:</label>
+                      <div class="slider-row">
+                        <input id="velocity-core-sharpness" type="range" min="0" max="1" step="0.05" value="0.7" />
+                        <span id="velocity-core-sharpness-display" class="slider-value">0.7</span>
+                      </div>
+                    </div>
+
+                    <!-- Trail Settings -->
+                    <div class="legend-help mb-1 mt-2" style="font-weight: 500; opacity: 0.7;">Trail Settings</div>
+
+                    <div class="control-block">
+                      <label for="velocity-trail-fade">Trail persistence:</label>
+                      <div class="slider-row">
+                        <input id="velocity-trail-fade" type="range" min="0.9" max="0.995" step="0.005" value="0.925" />
+                        <span id="velocity-trail-fade-display" class="slider-value">0.925</span>
+                      </div>
+                    </div>
+
+                    <div class="control-block">
+                      <label for="velocity-chromatic-fade">Chromatic fade:</label>
+                      <div class="slider-row">
+                        <input id="velocity-chromatic-fade" type="range" min="0" max="1" step="0.05" value="0" />
+                        <span id="velocity-chromatic-fade-display" class="slider-value">0</span>
+                      </div>
+                    </div>
+
+                    <div class="control-block">
+                      <label for="velocity-turbulence">Turbulence:</label>
+                      <div class="slider-row">
+                        <input id="velocity-turbulence" type="range" min="0" max="1" step="0.05" value="0.3" />
+                        <span id="velocity-turbulence-display" class="slider-value">0.3</span>
+                      </div>
+                    </div>
+
+                    <!-- HDR & Bloom -->
+                    <div class="legend-help mb-1 mt-2" style="font-weight: 500; opacity: 0.7;">HDR & Bloom</div>
+
+                    <div class="control-block">
+                      <label for="velocity-exposure">Exposure:</label>
+                      <div class="slider-row">
+                        <input id="velocity-exposure" type="range" min="0.1" max="2" step="0.05" value="0.5" />
+                        <span id="velocity-exposure-display" class="slider-value">0.5</span>
+                      </div>
+                    </div>
+
+                    <div class="control-block">
+                      <label for="velocity-bloom-strength">Bloom strength:</label>
+                      <div class="slider-row">
+                        <input id="velocity-bloom-strength" type="range" min="0" max="0.5" step="0.01" value="0.08" />
+                        <span id="velocity-bloom-strength-display" class="slider-value">0.08</span>
+                      </div>
+                    </div>
+
+                    <div class="control-block">
+                      <label for="velocity-bloom-threshold">Bloom threshold:</label>
+                      <div class="slider-row">
+                        <input id="velocity-bloom-threshold" type="range" min="0.1" max="1" step="0.05" value="0.75" />
+                        <span id="velocity-bloom-threshold-display" class="slider-value">0.75</span>
+                      </div>
+                    </div>
+
+                    <div class="control-block">
+                      <label for="velocity-anamorphic">Anamorphic ratio:</label>
+                      <div class="slider-row">
+                        <input id="velocity-anamorphic" type="range" min="1" max="3" step="0.1" value="1.2" />
+                        <span id="velocity-anamorphic-display" class="slider-value">1.2</span>
+                      </div>
+                    </div>
+
+                    <!-- Color Grading -->
+                    <div class="legend-help mb-1 mt-2" style="font-weight: 500; opacity: 0.7;">Color Grading</div>
+
+                    <div class="control-block">
+                      <label for="velocity-saturation">Saturation:</label>
+                      <div class="slider-row">
+                        <input id="velocity-saturation" type="range" min="0.5" max="2" step="0.05" value="1.15" />
+                        <span id="velocity-saturation-display" class="slider-value">1.15</span>
+                      </div>
+                    </div>
+
+                    <div class="control-block">
+                      <label for="velocity-contrast">Contrast:</label>
+                      <div class="slider-row">
+                        <input id="velocity-contrast" type="range" min="0.5" max="2" step="0.05" value="1.05" />
+                        <span id="velocity-contrast-display" class="slider-value">1.05</span>
+                      </div>
+                    </div>
+
+                    <div class="control-block">
+                      <label for="velocity-highlights">Highlights:</label>
+                      <div class="slider-row">
+                        <input id="velocity-highlights" type="range" min="0.5" max="1.5" step="0.05" value="0.85" />
+                        <span id="velocity-highlights-display" class="slider-value">0.85</span>
+                      </div>
+                    </div>
+
+                    <div class="control-block">
+                      <label for="velocity-shadows">Shadows:</label>
+                      <div class="slider-row">
+                        <input id="velocity-shadows" type="range" min="0.5" max="1.5" step="0.05" value="1.05" />
+                        <span id="velocity-shadows-display" class="slider-value">1.05</span>
+                      </div>
+                    </div>
+
+                    <!-- Cinematic Effects -->
+                    <div class="legend-help mb-1 mt-2" style="font-weight: 500; opacity: 0.7;">Cinematic Effects</div>
+
+                    <div class="control-block">
+                      <label for="velocity-vignette">Vignette:</label>
+                      <div class="slider-row">
+                        <input id="velocity-vignette" type="range" min="0" max="1" step="0.05" value="0" />
+                        <span id="velocity-vignette-display" class="slider-value">0</span>
+                      </div>
+                    </div>
+
+                    <div class="control-block">
+                      <label for="velocity-film-grain">Film grain:</label>
+                      <div class="slider-row">
+                        <input id="velocity-film-grain" type="range" min="0" max="0.1" step="0.002" value="0" />
+                        <span id="velocity-film-grain-display" class="slider-value">0</span>
+                      </div>
+                    </div>
+
+                    <div class="control-block">
+                      <label for="velocity-chromatic-aberration">Chromatic aberr.:</label>
+                      <div class="slider-row">
+                        <input id="velocity-chromatic-aberration" type="range" min="0" max="1" step="0.05" value="0" />
+                        <span id="velocity-chromatic-aberration-display" class="slider-value">0</span>
+                      </div>
+                    </div>
+
+                  </div>
+                </details>
+
+                <div id="velocity-overlay-info" class="legend-help mt-2 tabular-nums"></div>
+              </div>
+            </div>
           </div>
 
           <!-- Reset Camera -->

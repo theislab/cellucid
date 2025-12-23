@@ -562,7 +562,11 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       } catch (err) {
         console.error('[DetailedAnalysisUI] Modal render failed:', err);
         if (this._modal._plotContainer) {
-          this._modal._plotContainer.innerHTML = `<div class="analysis-error">Failed to render: ${err.message}</div>`;
+          this._modal._plotContainer.innerHTML = '';
+          const errorEl = document.createElement('div');
+          errorEl.className = 'analysis-error';
+          errorEl.textContent = `Failed to render: ${err?.message || err}`;
+          this._modal._plotContainer.appendChild(errorEl);
         }
       }
     }

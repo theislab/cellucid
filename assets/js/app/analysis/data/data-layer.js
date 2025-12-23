@@ -473,6 +473,20 @@ export class DataLayer {
   }
 
   /**
+   * Get the currently active highlight page ID.
+   * Used by Quick Insights for "Dynamic" mode that follows the active page.
+   * @returns {string|null}
+   */
+  getActiveHighlightPageId() {
+    if (typeof this.state?.getActivePageId === 'function') {
+      return this.state.getActivePageId();
+    }
+    // Fallback: return first page ID if state method unavailable
+    const pages = this.getPages();
+    return pages.length > 0 ? pages[0].id : null;
+  }
+
+  /**
    * Get the current persistent color for a highlight page.
    * @param {string} pageId
    * @returns {string|null}
@@ -1915,7 +1929,13 @@ export class DataLayer {
    * @returns {Promise<Object>} { fields, pageData, stats }
    */
   async fetchBulkObsFields(options) {
-    const { pageIds, obsFields, onProgress } = options;
+    const {
+      pageIds,
+      obsFields,
+      onProgress,
+      subsetPages = true,
+      includeCategoricalValues = true
+    } = options || {};
 
     const startTime = performance.now();
 
@@ -1979,7 +1999,9 @@ export class DataLayer {
             obsManifest,
             fieldList: obsFields,
             batchSize: 10,
-            onProgress: handleProgress
+            onProgress: handleProgress,
+            // DataLayer already owns the progress notification for bulk loading.
+            suppressNotifications: true
           });
 
           for (const [fieldKey, fieldData] of Object.entries(bulkData.fields)) {
@@ -1987,6 +2009,16 @@ export class DataLayer {
               kind: fieldData.kind,
               categories: fieldData.categories
             };
+
+            if (!subsetPages) {
+              // Expose raw arrays for callers that want to compute without per-page copies.
+              // Keeping these references when `subsetPages` is true would retain the full
+              // dataset arrays in memory unnecessarily.
+              result.fields[fieldKey].values = fieldData.values;
+              result.fields[fieldKey].codes = fieldData.codes;
+              result.stats.fieldsLoaded++;
+              continue;
+            }
 
             for (const pageId of pageIds) {
               const cellIndices = result.pageData[pageId].cellIndices;
@@ -2011,20 +2043,25 @@ export class DataLayer {
                     ? fieldData.codes[cellIdx]
                     : 65535;
                 }
-                const pageValues = [];
-                for (let i = 0; i < pageCodes.length; i++) {
-                  const code = pageCodes[i];
-                  if (code === 65535 || !fieldData.categories) {
-                    pageValues.push(null);
-                  } else {
-                    pageValues.push(fieldData.categories[code] || `Unknown (${code})`);
-                  }
-                }
-                result.fields[fieldKey][pageId] = {
-                  values: pageValues,
+                const pageEntry = {
                   codes: pageCodes,
                   cellCount: cellIndices.length
                 };
+
+                if (includeCategoricalValues) {
+                  const pageValues = [];
+                  for (let i = 0; i < pageCodes.length; i++) {
+                    const code = pageCodes[i];
+                    if (code === 65535 || !fieldData.categories) {
+                      pageValues.push(null);
+                    } else {
+                      pageValues.push(fieldData.categories[code] || `Unknown (${code})`);
+                    }
+                  }
+                  pageEntry.values = pageValues;
+                }
+
+                result.fields[fieldKey][pageId] = pageEntry;
               }
             }
 

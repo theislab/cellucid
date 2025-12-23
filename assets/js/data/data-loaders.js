@@ -743,7 +743,6 @@ export function expandObsManifest(manifest) {
     for (const fieldTuple of (manifest._categoricalFields || [])) {
       // [key, categories, codesDtype, codesMissingValue, centroidsByDim, outlierMin?, outlierMax?]
       // centroidsByDim is a dict: {"1": [...], "2": [...], "3": [...]} for per-dimension centroids
-      // OR legacy format: [{category, position, n_points}, ...] for single dimension (3D)
       const key = fieldTuple[0];
       const safeKey = safeFilenameComponent(key);
       const categories = fieldTuple[1];
@@ -754,17 +753,17 @@ export function expandObsManifest(manifest) {
       // Determine codes extension from dtype
       const codesExt = codesDtype === 'uint8' ? 'u8' : 'u16';
 
-      // Handle both legacy (array) and new (dict by dimension) centroid formats
-      let centroidsByDim;
+      // Centroids must be provided as a dict keyed by dimension ("1", "2", "3", ...).
+      // Development phase policy: legacy centroid formats are not supported.
       if (Array.isArray(centroidsData)) {
-        // Legacy format: single array of centroids (assume 3D)
-        centroidsByDim = { '3': centroidsData };
-      } else if (centroidsData && typeof centroidsData === 'object') {
-        // New format: dict keyed by dimension
-        centroidsByDim = centroidsData;
-      } else {
-        centroidsByDim = {};
+        throw new Error(
+          `Unsupported legacy centroid format for categorical field "${key}". ` +
+          'Expected centroidsByDim object keyed by dimension.'
+        );
       }
+      const centroidsByDim = (centroidsData && typeof centroidsData === 'object')
+        ? centroidsData
+        : {};
 
       const field = {
         key: key,
@@ -1200,22 +1199,10 @@ export async function loadDatasetIdentity(url) {
  * @returns {Object|null} Embeddings metadata or null if not present
  */
 export function getEmbeddingsMetadata(identity) {
-  if (!identity) return null;
-
-  // Version 2+ has explicit embeddings field
-  if (identity.embeddings) {
-    return identity.embeddings;
+  if (!identity?.embeddings) {
+    throw new Error('dataset_identity.json is missing required embeddings metadata');
   }
-
-  // Version 1 (legacy): assume only 3D is available
-  // Note: points.bin is deprecated, use points_3d.bin for new exports
-  return {
-    available_dimensions: [3],
-    default_dimension: 3,
-    files: {
-      '3d': 'points_3d.bin'
-    }
-  };
+  return identity.embeddings;
 }
 
 // ============================================================================
@@ -1530,17 +1517,18 @@ export async function loadAnalysisBulkObsData(options) {
     obsManifest,
     fieldList,
     batchSize = 10, // Lower batch size than genes - obs fields can be larger
-    onProgress
+    onProgress,
+    suppressNotifications = false
   } = options;
 
-  const notifications = getNotificationCenter();
-  const trackerId = notifications.show({
+  const notifications = suppressNotifications ? null : getNotificationCenter();
+  const trackerId = notifications ? notifications.show({
     type: 'progress',
     category: 'data',
     title: 'Loading Observation Fields',
     message: `Preparing ${fieldList.length} fields...`,
     progress: 0
-  });
+  }) : null;
 
   const result = {
     fields: {},
@@ -1569,7 +1557,9 @@ export async function loadAnalysisBulkObsData(options) {
     }
 
     if (validFields.length === 0) {
-      notifications.complete(trackerId, 'No valid fields found');
+      if (notifications && trackerId) {
+        notifications.complete(trackerId, 'No valid fields found');
+      }
       return result;
     }
 
@@ -1623,9 +1613,11 @@ export async function loadAnalysisBulkObsData(options) {
       loadedCount += batch.length;
       const progress = Math.round((loadedCount / totalFields) * 100);
 
-      notifications.updateProgress(trackerId, progress, {
-        message: `Loaded ${loadedCount} of ${totalFields} fields...`
-      });
+      if (notifications && trackerId) {
+        notifications.updateProgress(trackerId, progress, {
+          message: `Loaded ${loadedCount} of ${totalFields} fields...`
+        });
+      }
 
       if (onProgress) {
         onProgress(progress);
@@ -1637,12 +1629,16 @@ export async function loadAnalysisBulkObsData(options) {
       ? `Loaded ${result.loadedCount} fields (${result.failedCount} failed)`
       : `Loaded ${result.loadedCount} fields`;
 
-    notifications.complete(trackerId, message);
+    if (notifications && trackerId) {
+      notifications.complete(trackerId, message);
+    }
 
     return result;
 
   } catch (error) {
-    notifications.fail(trackerId, `Failed: ${error.message}`);
+    if (notifications && trackerId) {
+      notifications.fail(trackerId, `Failed: ${error.message}`);
+    }
     throw error;
   }
 }

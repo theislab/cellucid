@@ -4,7 +4,7 @@
  * @module state-serializer/active-fields
  */
 
-import { debug } from '../utils/debug.js';
+import { debug } from '../../utils/debug.js';
 
 export function serializeActiveFields(state) {
   const activeField = state.getActiveField?.();
@@ -122,4 +122,3 @@ export function syncFieldSelectsToActiveField(state) {
   }
   if (geneSearch) geneSearch.value = '';
 }
-

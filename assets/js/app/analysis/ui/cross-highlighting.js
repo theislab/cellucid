@@ -73,37 +73,46 @@ export class CrossHighlightManager {
   registerPlot(plotId, plotInstance, options) {
     const { type, pageData, plotOptions } = options;
 
+    const element = plotInstance._container || plotInstance;
+
     // Store plot info
-    this._registeredPlots.set(plotId, {
+    const plotInfo = {
       instance: plotInstance,
       type,
       pageData,
       plotOptions,
-      element: plotInstance._container || plotInstance
-    });
+      element,
+      plotlyClickHandler: null,
+      plotlyHoverHandler: null,
+      plotlyUnhoverHandler: null,
+      domClickHandler: null
+    };
+    this._registeredPlots.set(plotId, plotInfo);
 
     // Attach Plotly click handler
-    const element = plotInstance._container || plotInstance;
-
     if (element && typeof element.on === 'function') {
-      element.on('plotly_click', (data) => {
+      plotInfo.plotlyClickHandler = (data) => {
         this._handlePlotClick(plotId, data);
-      });
+      };
+      element.on('plotly_click', plotInfo.plotlyClickHandler);
 
-      element.on('plotly_hover', (data) => {
+      plotInfo.plotlyHoverHandler = (data) => {
         this._handlePlotHover(plotId, data);
-      });
+      };
+      element.on('plotly_hover', plotInfo.plotlyHoverHandler);
 
-      element.on('plotly_unhover', () => {
+      plotInfo.plotlyUnhoverHandler = () => {
         this._clearHover();
-      });
+      };
+      element.on('plotly_unhover', plotInfo.plotlyUnhoverHandler);
     } else if (element instanceof HTMLElement) {
       // For DOM elements, attach via event delegation
-      element.addEventListener('plotly_click', (event) => {
+      plotInfo.domClickHandler = (event) => {
         if (event.detail) {
           this._handlePlotClick(plotId, event.detail);
         }
-      });
+      };
+      element.addEventListener('plotly_click', plotInfo.domClickHandler);
     }
 
     console.debug(`[CrossHighlight] Registered plot: ${plotId} (${type})`);
@@ -118,10 +127,22 @@ export class CrossHighlightManager {
     if (plotInfo) {
       // Remove event listeners if possible
       const element = plotInfo.element;
-      if (element && typeof element.removeAllListeners === 'function') {
+
+      // Plotly elements
+      if (element && typeof element.removeListener === 'function') {
+        if (plotInfo.plotlyClickHandler) element.removeListener('plotly_click', plotInfo.plotlyClickHandler);
+        if (plotInfo.plotlyHoverHandler) element.removeListener('plotly_hover', plotInfo.plotlyHoverHandler);
+        if (plotInfo.plotlyUnhoverHandler) element.removeListener('plotly_unhover', plotInfo.plotlyUnhoverHandler);
+      } else if (element && typeof element.removeAllListeners === 'function') {
+        // Fallback: remove all listeners for these events if targeted removal isn't available.
         element.removeAllListeners('plotly_click');
         element.removeAllListeners('plotly_hover');
         element.removeAllListeners('plotly_unhover');
+      }
+
+      // DOM elements
+      if (element instanceof HTMLElement && plotInfo.domClickHandler) {
+        element.removeEventListener('plotly_click', plotInfo.domClickHandler);
       }
     }
 

@@ -15,6 +15,7 @@ import { getScatterTraceType } from '../plotly-loader.js';
 import { getFiniteMinMax, isFiniteNumber } from '../../shared/number-utils.js';
 import { applyLegendPosition } from '../../shared/legend-utils.js';
 import { getPlotTheme } from '../../shared/plot-theme.js';
+import { escapeHtml } from '../../../utils/dom-utils.js';
 
 /**
  * Precomputed, columnar volcano-plot data for a single DE result set.
@@ -227,7 +228,7 @@ function buildVolcanoAnnotations(pre, codes, yValues, options) {
     annotations.push({
       x,
       y,
-      text: gene,
+      text: escapeHtml(gene),
       showarrow: true,
       arrowhead: 0,
       arrowsize: 0.5,
@@ -293,6 +294,8 @@ function buildVolcanoFigure(deResults, options) {
 
   const colors = getVolcanoColors(colorScheme);
   const pre = getVolcanoPrecomputed(results);
+  const genesNeedEscaping = pre.genes.some((gene) => /[&<>"']/.test(String(gene ?? '')));
+  const safeGenes = genesNeedEscaping ? pre.genes.map((gene) => escapeHtml(gene)) : pre.genes;
   const yValues = useAdjustedPValue ? pre.negLog10PAdjustedOrRaw : pre.negLog10PRaw;
   const { codes, up, down, ns } = computeVolcanoCategoryCodes(pre, {
     pValueThreshold,
@@ -310,7 +313,7 @@ function buildVolcanoFigure(deResults, options) {
     name: 'Genes',
     x: pre.log2FoldChange,
     y: yValues,
-    text: pre.genes,
+    text: safeGenes,
     meta: { cellucid: 'volcano', version: 2 },
     marker: {
       // Encode categories as numeric codes to avoid allocating large color-string arrays.

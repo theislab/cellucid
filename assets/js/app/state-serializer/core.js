@@ -8,7 +8,7 @@
  */
 
 import { getDataSourceManager } from '../../data/data-source-manager.js';
-import { debug } from '../utils/debug.js';
+import { debug } from '../../utils/debug.js';
 import { createUiControlSerializer } from './ui-controls.js';
 import { createFilterSerializer } from './filters.js';
 import { serializeHighlightPages, restoreHighlightPages } from './highlights.js';
@@ -279,4 +279,3 @@ export function createStateSerializer({ state, viewer, sidebar }) {
     restoreUIControls: ui.restoreUIControls
   };
 }
-

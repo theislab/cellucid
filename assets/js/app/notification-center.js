@@ -14,11 +14,12 @@
  * - Auto-dismissing with configurable duration
  */
 
-import { debug } from './utils/debug.js';
+import { debug } from '../utils/debug.js';
 import { NotificationType, CategoryIcons } from './notification-center/constants.js';
 import { formatBytes, formatDuration } from './notification-center/formatters.js';
 import { downloadTrackingMethods } from './notification-center/download-tracking.js';
 import { benchmarkNotificationMethods } from './notification-center/benchmark-notifications.js';
+import { escapeHtml } from './utils/dom-utils.js';
 
 // Singleton instance
 let instance = null;
@@ -92,12 +93,15 @@ class NotificationCenter {
     // Icon
     const icon = CategoryIcons[category] || CategoryIcons.default;
 
+    const safeTitle = title ? escapeHtml(String(title)) : '';
+    const safeMessage = message ? escapeHtml(String(message)) : '';
+
     // Build content
     let html = `
       <div class="notification-icon">${icon}</div>
       <div class="notification-content">
-        ${title ? `<div class="notification-title">${title}</div>` : ''}
-        ${message ? `<div class="notification-message">${message}</div>` : ''}
+        ${safeTitle ? `<div class="notification-title">${safeTitle}</div>` : ''}
+        ${safeMessage ? `<div class="notification-message">${safeMessage}</div>` : ''}
     `;
 
     let progressBarWidth = '';
@@ -175,7 +179,7 @@ class NotificationCenter {
     // Store reference
     this.notifications.set(id, {
       element: el,
-      options,
+      options: { ...options },
       startTime: performance.now()
     });
 
@@ -283,7 +287,7 @@ class NotificationCenter {
     }
 
     // Update stored options
-    Object.assign(notif.options, options);
+    notif.options = { ...notif.options, ...options };
   }
 
   /**

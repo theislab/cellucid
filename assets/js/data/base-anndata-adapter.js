@@ -36,6 +36,9 @@ export class BaseAnnDataAdapter {
     /** @type {Map<number, Float32Array>} Cached embeddings per dimension */
     this._embeddingCache = new Map();
 
+    /** @type {Map<string, Map<number, Float32Array>>} Cached vector fields per fieldId + dimension */
+    this._vectorFieldCache = new Map();
+
     /** @type {Array|null} Obs field metadata (kind, categories, etc.) */
     this._obsFieldsMetadata = null;
 
@@ -56,6 +59,125 @@ export class BaseAnnDataAdapter {
   async initialize() {
     this._metadata = await this._loader.getDatasetMetadata();
     await this._computeObsFieldsMetadata();
+    await this._computeVectorFieldsMetadata();
+  }
+
+  /**
+   * Detect available vector fields in `obsm` and attach a compact metadata
+   * summary onto the dataset identity.
+   *
+   * This keeps the UI fast: we can show/hide the vector field overlay controls
+   * without loading the full vector arrays upfront.
+   *
+   * Naming convention (UMAP basis):
+   * - Explicit per-dimension keys: `<field>_umap_<dim>d` (preferred)
+   *   - Examples: `velocity_umap_2d`, `T_fwd_umap_3d`
+   * - Implicit key: `<field>_umap` with shape `(n_cells, 1|2|3)`
+   *   - Accepted ONLY if the explicit `<field>_umap_<dim>d` is not present (clash-safe)
+   *
+   * Notes:
+   * - Keys starting with `X_` are reserved for embeddings and are ignored here.
+   * - This does not compute or validate semantics; it only validates shapes.
+   *
+   * @protected
+   */
+  async _computeVectorFieldsMetadata() {
+    const obsmKeys = Array.isArray(this._loader?.obsmKeys) ? this._loader.obsmKeys : [];
+    if (!this._metadata || obsmKeys.length === 0) return;
+
+    const getShapeDims = async (key) => {
+      if (typeof this._loader.getEmbeddingShape !== 'function') return null;
+      try {
+        const shapeMaybe = this._loader.getEmbeddingShape(key);
+        const shapeInfo = typeof shapeMaybe?.then === 'function' ? await shapeMaybe : shapeMaybe;
+        const nDims = shapeInfo?.nDims;
+        return Number.isInteger(nDims) ? nDims : null;
+      } catch (_err) {
+        return null;
+      }
+    };
+
+    const isEmbeddingKey = (key) => String(key || '').startsWith('X_');
+    const isUmapKey = (key) => String(key || '').endsWith('_umap');
+
+    const fields = new Map(); // fieldId -> { dims: Set<number>, explicit: Set<number>, keysByDim: Record<string, string> }
+    const ensureField = (id) => {
+      const key = String(id || '');
+      if (!fields.has(key)) {
+        fields.set(key, { dims: new Set(), explicit: new Set(), keysByDim: {} });
+      }
+      return fields.get(key);
+    };
+
+    // 1) Explicit per-dimension keys: <field>_umap_<dim>d
+    for (const key of obsmKeys) {
+      const match = String(key).match(/^(.*)_([123])d$/);
+      if (!match) continue;
+      const baseId = match[1];
+      const dim = Number.parseInt(match[2], 10);
+      if (!Number.isInteger(dim) || dim < 1 || dim > 3) continue;
+      if (!isUmapKey(baseId) || isEmbeddingKey(baseId)) continue;
+
+      const nDims = await getShapeDims(key);
+      if (nDims !== null && nDims !== dim) continue;
+
+      const entry = ensureField(baseId);
+      entry.keysByDim[`${dim}d`] = key;
+      entry.dims.add(dim);
+      entry.explicit.add(dim);
+    }
+
+    // 2) Implicit key: <field>_umap (shape-derived), only if explicit is missing.
+    for (const key of obsmKeys) {
+      const baseId = String(key);
+      if (!isUmapKey(baseId) || isEmbeddingKey(baseId)) continue;
+      // Skip explicit keys already handled above.
+      if (baseId.match(/_([123])d$/)) continue;
+
+      const nDims = await getShapeDims(baseId);
+      if (!Number.isInteger(nDims) || nDims < 1 || nDims > 3) continue;
+
+      const entry = ensureField(baseId);
+      if (entry.explicit.has(nDims)) continue; // clash-safe
+
+      const slot = `${nDims}d`;
+      if (!entry.keysByDim[slot]) {
+        entry.keysByDim[slot] = baseId;
+        entry.dims.add(nDims);
+      }
+    }
+
+    const buildLabel = (fieldId) => {
+      const id = String(fieldId || '');
+      if (!id) return '';
+      const base = id.endsWith('_umap') ? id.slice(0, -5) : id;
+      const pretty = base.replace(/_/g, ' ').trim();
+      const titled = pretty ? (pretty[0].toUpperCase() + pretty.slice(1)) : id;
+      return id.endsWith('_umap') ? `${titled} (UMAP)` : titled;
+    };
+
+    const fieldsObj = {};
+    for (const [id, entry] of fields.entries()) {
+      const dims = Array.from(entry.dims).sort((a, b) => a - b);
+      if (!dims.length) continue;
+      fieldsObj[id] = {
+        label: buildLabel(id),
+        basis: 'umap',
+        available_dimensions: dims,
+        default_dimension: Math.max(...dims),
+        obsm_keys: entry.keysByDim,
+      };
+    }
+
+    const ids = Object.keys(fieldsObj);
+    if (!ids.length) return;
+
+    const defaultField = fieldsObj.velocity_umap ? 'velocity_umap' : ids[0];
+
+    this._metadata.vector_fields = {
+      default_field: defaultField,
+      fields: fieldsObj,
+    };
   }
 
   /**
@@ -208,6 +330,17 @@ export class BaseAnnDataAdapter {
     if (!this._loader.obsmKeys.includes(embKey)) {
       // Fall back to X_umap if it has the right dimension
       if (this._loader.obsmKeys.includes('X_umap')) {
+        // Prefer checking shape metadata (cheap) to avoid loading full arrays when mismatched.
+        if (typeof this._loader.getEmbeddingShape === 'function') {
+          const shapeMaybePromise = this._loader.getEmbeddingShape('X_umap');
+          const shapeInfo = typeof shapeMaybePromise?.then === 'function'
+            ? await shapeMaybePromise
+            : shapeMaybePromise;
+          const nDims = shapeInfo?.nDims;
+          if (typeof nDims === 'number' && nDims !== dim) {
+            throw new Error(`No ${dim}D embedding found (X_umap is ${nDims}D)`);
+          }
+        }
         embKey = 'X_umap';
       } else {
         throw new Error(`No ${dim}D embedding found`);
@@ -216,8 +349,8 @@ export class BaseAnnDataAdapter {
 
     const emb = await this._loader.getEmbedding(embKey);
 
-    // Verify dimension (allow X_umap to have any dimension)
-    if (emb.nDims !== dim && embKey !== 'X_umap') {
+    // Verify dimension (X_umap must match the requested dimension)
+    if (emb.nDims !== dim) {
       throw new Error(`Embedding '${embKey}' has ${emb.nDims} dimensions, expected ${dim}`);
     }
 
@@ -226,6 +359,87 @@ export class BaseAnnDataAdapter {
 
     this._embeddingCache.set(dim, normalized);
     return normalized;
+  }
+
+  /**
+   * Get per-cell displacement vectors for a vector field in `obsm`.
+   *
+   * Returns a flat Float32Array with `dim` components per cell, scaled by the
+   * same normalization scale as the embedding (so vectors live in the same
+   * normalized coordinate space as positions).
+   *
+   * The fieldId should match a `vector_fields.fields` key in dataset identity
+   * (e.g. `velocity_umap`, `T_fwd_umap`).
+   *
+   * @param {string} fieldId
+   * @param {number} dim
+   * @returns {Promise<Float32Array>}
+   */
+  async getVectorField(fieldId, dim) {
+    const id = String(fieldId || '');
+    const d = Math.max(1, Math.min(3, Math.floor(dim || 3)));
+    if (!id) {
+      throw new Error('BaseAnnDataAdapter.getVectorField: fieldId is required');
+    }
+
+    let perField = this._vectorFieldCache.get(id);
+    if (!perField) {
+      perField = new Map();
+      this._vectorFieldCache.set(id, perField);
+    }
+    if (perField.has(d)) return perField.get(d);
+
+    // Ensure we have the embedding scale for this dimension.
+    if (!this._normInfo.has(d)) {
+      await this.getEmbedding(d);
+    }
+    const scale = Number(this._normInfo.get(d)?.scale) || 1;
+
+    const obsmKeys = Array.isArray(this._loader?.obsmKeys) ? this._loader.obsmKeys : [];
+
+    const metaEntry = this._metadata?.vector_fields?.fields?.[id] || null;
+    const keyFromMeta = metaEntry?.obsm_keys?.[`${d}d`] || metaEntry?.obsm_keys?.[String(d)] || null;
+
+    const resolveKey = async () => {
+      if (keyFromMeta && obsmKeys.includes(keyFromMeta)) return keyFromMeta;
+
+      // Explicit: <field>_<dim>d
+      const explicit = `${id}_${d}d`;
+      if (obsmKeys.includes(explicit)) return explicit;
+
+      // Implicit: <field> (shape-derived)
+      if (!obsmKeys.includes(id)) return null;
+      if (typeof this._loader.getEmbeddingShape === 'function') {
+        const shapeMaybe = this._loader.getEmbeddingShape(id);
+        const shapeInfo = typeof shapeMaybe?.then === 'function' ? await shapeMaybe : shapeMaybe;
+        const nDims = shapeInfo?.nDims;
+        if (Number.isInteger(nDims) && nDims === d) return id;
+        return null;
+      }
+      // Without shape metadata, load and validate.
+      return id;
+    };
+
+    const key = await resolveKey();
+    if (!key) {
+      throw new Error(`No ${d}D vector field found for "${id}" in obsm`);
+    }
+
+    const vel = await this._loader.getEmbedding(key);
+    if (vel?.nDims !== d) {
+      throw new Error(`Vector field '${key}' has ${vel?.nDims} dimensions, expected ${d}`);
+    }
+
+    const raw = vel?.data;
+    const data = raw instanceof Float32Array ? raw : new Float32Array(raw);
+    const len = data.length;
+    for (let i = 0; i < len; i++) {
+      const v = data[i];
+      data[i] = Number.isFinite(v) ? v * scale : 0;
+    }
+
+    perField.set(d, data);
+    return data;
   }
 
   /**
@@ -563,6 +777,7 @@ export class BaseAnnDataAdapter {
   close() {
     this._loader.close();
     this._embeddingCache.clear();
+    this._vectorFieldCache.clear();
     this._obsFieldsMetadata = null;
     this._obsFieldDataCache.clear();
     this._connectivityCache = undefined;

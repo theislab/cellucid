@@ -14,6 +14,7 @@
  */
 
 import { getNotificationCenter } from '../../notification-center.js';
+import { escapeHtml } from '../../utils/dom-utils.js';
 import { createAnalysisModal, openModal, closeModal } from '../ui/components/modal.js';
 import { createMinimalPlotly, downloadImage, getScatterTraceType, getPlotlyConfig, getPlotlyLayout, purgePlot } from './plotly-loader.js';
 import { downloadCSV, toCSVCell } from '../shared/analysis-utils.js';
@@ -449,7 +450,11 @@ export class ScatterBuilder {
     } catch (error) {
       console.error('[ScatterBuilder] Failed to update plot:', error);
       this._plotContainer.className = 'scatter-plot-container error';
-      this._plotContainer.innerHTML = `<p class="scatter-placeholder">Error: ${error.message}</p>`;
+      this._plotContainer.innerHTML = '';
+      const p = document.createElement('p');
+      p.className = 'scatter-placeholder';
+      p.textContent = `Error: ${error?.message || error}`;
+      this._plotContainer.appendChild(p);
     } finally {
       this._isLoading = false;
     }
@@ -607,14 +612,17 @@ export class ScatterBuilder {
     // Prepare traces
     const traces = [];
     const theme = getPlotTheme();
-    const theme = getPlotTheme();
+    const safeXKey = escapeHtml(String(this.config.xVariable?.key ?? ''));
+    const safeYKey = escapeHtml(String(this.config.yVariable?.key ?? ''));
 
     // If coloring by category, create separate traces
     if (this.config.colorBy && data.color.length > 0) {
+      const safeColorKey = escapeHtml(String(this.config.colorBy?.key ?? ''));
       const categories = [...new Set(data.color)];
       const colors = this._generateColors(categories.length);
 
       categories.forEach((cat, idx) => {
+        const safeCat = escapeHtml(String(cat));
         const indices = data.color.map((c, i) => c === cat ? i : -1).filter(i => i >= 0);
         traces.push({
           type: getScatterTraceType(),
@@ -627,7 +635,7 @@ export class ScatterBuilder {
             size: 5,
             opacity: 0.7
           },
-          hovertemplate: `${this.config.xVariable.key}: %{x:.3f}<br>${this.config.yVariable.key}: %{y:.3f}<br>${this.config.colorBy.key}: ${cat}<extra></extra>`
+          hovertemplate: `${safeXKey}: %{x:.3f}<br>${safeYKey}: %{y:.3f}<br>${safeColorKey}: ${safeCat}<extra></extra>`
         });
       });
     } else {
@@ -643,7 +651,7 @@ export class ScatterBuilder {
           size: 5,
           opacity: 0.6
         },
-        hovertemplate: `${this.config.xVariable.key}: %{x:.3f}<br>${this.config.yVariable.key}: %{y:.3f}<extra></extra>`
+        hovertemplate: `${safeXKey}: %{x:.3f}<br>${safeYKey}: %{y:.3f}<extra></extra>`
       });
     }
 
@@ -716,7 +724,11 @@ export class ScatterBuilder {
       const Plotly = await createMinimalPlotly();
       await Plotly.newPlot(plotDiv, traces, layout, config);
     } catch (err) {
-      plotDiv.innerHTML = `<p class="scatter-placeholder">Plot error: ${err.message}</p>`;
+      plotDiv.innerHTML = '';
+      const p = document.createElement('p');
+      p.className = 'scatter-placeholder';
+      p.textContent = `Plot error: ${err?.message || err}`;
+      plotDiv.appendChild(p);
     }
   }
 
@@ -751,6 +763,7 @@ export class ScatterBuilder {
                          correlation.pValue < 0.05 ? 'p < 0.05' : 'not significant';
 
     const sigClass = correlation.pValue < 0.05 ? 'significant' : 'not-significant';
+    const safeSignificance = escapeHtml(String(significance));
 
     this._statsContainer.innerHTML = `
       <div class="scatter-stat-row">
@@ -763,7 +776,7 @@ export class ScatterBuilder {
       </div>
       <div class="scatter-stat-row">
         <span class="stat-name">Significance:</span>
-        <span class="stat-value ${sigClass}">${significance}</span>
+        <span class="stat-value ${sigClass}">${safeSignificance}</span>
       </div>
       <div class="scatter-stat-row">
         <span class="stat-name">N:</span>
@@ -830,13 +843,16 @@ export class ScatterBuilder {
    * @param {HTMLElement} container - Options container
    */
   _renderModalOptions(container) {
+    const safeXKey = escapeHtml(String(this.config.xVariable?.key || 'N/A'));
+    const safeYKey = escapeHtml(String(this.config.yVariable?.key || 'N/A'));
+    const safeColorKey = this.config.colorBy ? escapeHtml(String(this.config.colorBy.key)) : '';
     container.innerHTML = `
       <div class="modal-analysis-info correlation-modal-options">
         <h5>Analysis Settings</h5>
         <table class="analysis-params-table">
           <tr>
             <td>X Variable</td>
-            <td><strong>${this.config.xVariable?.key || 'N/A'}</strong></td>
+            <td><strong>${safeXKey}</strong></td>
           </tr>
           <tr>
             <td>X Type</td>
@@ -844,7 +860,7 @@ export class ScatterBuilder {
           </tr>
           <tr>
             <td>Y Variable</td>
-            <td><strong>${this.config.yVariable?.key || 'N/A'}</strong></td>
+            <td><strong>${safeYKey}</strong></td>
           </tr>
           <tr>
             <td>Y Type</td>
@@ -865,7 +881,7 @@ export class ScatterBuilder {
           ${this.config.colorBy ? `
           <tr>
             <td>Color By</td>
-            <td><strong>${this.config.colorBy.key}</strong></td>
+            <td><strong>${safeColorKey}</strong></td>
           </tr>
           ` : ''}
         </table>
@@ -902,6 +918,8 @@ export class ScatterBuilder {
     }
 
     const direction = r > 0 ? 'Positive' : r < 0 ? 'Negative' : 'None';
+    const safeXKey = escapeHtml(String(this.config.xVariable?.key || 'X'));
+    const safeYKey = escapeHtml(String(this.config.yVariable?.key || 'Y'));
 
     container.innerHTML = `
       <h5>Correlation Interpretation</h5>
@@ -921,8 +939,8 @@ export class ScatterBuilder {
       </table>
       <p class="interpretation-note">
         ${absR >= 0.4
-          ? `The ${direction.toLowerCase()} correlation suggests that as ${this.config.xVariable?.key} increases, ${this.config.yVariable?.key} ${r > 0 ? 'tends to increase' : 'tends to decrease'}.`
-          : `The correlation is weak, suggesting little linear relationship between ${this.config.xVariable?.key} and ${this.config.yVariable?.key}.`
+          ? `The ${direction.toLowerCase()} correlation suggests that as ${safeXKey} increases, ${safeYKey} ${r > 0 ? 'tends to increase' : 'tends to decrease'}.`
+          : `The correlation is weak, suggesting little linear relationship between ${safeXKey} and ${safeYKey}.`
         }
       </p>
     `;
@@ -944,15 +962,20 @@ export class ScatterBuilder {
 
     const data = this._lastPlotData;
     const correlation = this._lastCorrelation;
+    const theme = getPlotTheme();
+    const safeXKey = escapeHtml(String(this.config.xVariable?.key ?? ''));
+    const safeYKey = escapeHtml(String(this.config.yVariable?.key ?? ''));
 
     // Prepare traces (same as inline but larger)
     const traces = [];
 
     if (this.config.colorBy && data.color.length > 0) {
+      const safeColorKey = escapeHtml(String(this.config.colorBy?.key ?? ''));
       const categories = [...new Set(data.color)];
       const colors = this._generateColors(categories.length);
 
       categories.forEach((cat, idx) => {
+        const safeCat = escapeHtml(String(cat));
         const indices = data.color.map((c, i) => c === cat ? i : -1).filter(i => i >= 0);
         traces.push({
           type: getScatterTraceType(),
@@ -965,7 +988,7 @@ export class ScatterBuilder {
             size: 6,
             opacity: 0.7
           },
-          hovertemplate: `${this.config.xVariable.key}: %{x:.3f}<br>${this.config.yVariable.key}: %{y:.3f}<br>${this.config.colorBy.key}: ${cat}<extra></extra>`
+          hovertemplate: `${safeXKey}: %{x:.3f}<br>${safeYKey}: %{y:.3f}<br>${safeColorKey}: ${safeCat}<extra></extra>`
         });
       });
     } else {
@@ -980,7 +1003,7 @@ export class ScatterBuilder {
           size: 6,
           opacity: 0.6
         },
-        hovertemplate: `${this.config.xVariable.key}: %{x:.3f}<br>${this.config.yVariable.key}: %{y:.3f}<extra></extra>`
+        hovertemplate: `${safeXKey}: %{x:.3f}<br>${safeYKey}: %{y:.3f}<extra></extra>`
       });
     }
 
@@ -1039,7 +1062,7 @@ export class ScatterBuilder {
         y: 0.98,
         xref: 'paper',
         yref: 'paper',
-        text: `R = ${correlation.r.toFixed(4)}, R<sup>2</sup> = ${correlation.rSquared.toFixed(4)}, p = ${correlation.pValue < 0.001 ? '<0.001' : correlation.pValue.toFixed(4)}`,
+        text: `R = ${correlation.r.toFixed(4)}, R<sup>2</sup> = ${correlation.rSquared.toFixed(4)}, p = ${Number.isFinite(correlation.pValue) ? (correlation.pValue < 0.001 ? '&lt;0.001' : correlation.pValue.toFixed(4)) : 'N/A'}`,
         showarrow: false,
         font: { size: theme.fontSize, color: theme.text },
         bgcolor: theme.legend.bg,
@@ -1053,7 +1076,11 @@ export class ScatterBuilder {
       const Plotly = await createMinimalPlotly();
       await Plotly.newPlot(plotDiv, traces, layout, config);
     } catch (err) {
-      plotDiv.innerHTML = `<p class="scatter-placeholder">Plot error: ${err.message}</p>`;
+      plotDiv.innerHTML = '';
+      const p = document.createElement('p');
+      p.className = 'scatter-placeholder';
+      p.textContent = `Plot error: ${err?.message || err}`;
+      plotDiv.appendChild(p);
     }
   }
 
@@ -1069,17 +1096,22 @@ export class ScatterBuilder {
                          correlation.pValue < 0.05 ? 'p < 0.05 (significant)' : 'Not significant (p >= 0.05)';
 
     const sigClass = correlation.pValue < 0.05 ? 'significant' : 'not-significant';
+    const safeXKey = escapeHtml(String(this.config.xVariable?.key || 'N/A'));
+    const safeYKey = escapeHtml(String(this.config.yVariable?.key || 'N/A'));
+    const pValueRaw = isNaN(correlation.pValue) ? 'N/A' : (correlation.pValue < 0.001 ? '<0.001' : correlation.pValue.toFixed(4));
+    const safePValue = escapeHtml(String(pValueRaw));
+    const safeSignificance = escapeHtml(String(significance));
 
     container.innerHTML = `
       <h4>Correlation Statistics</h4>
       <table class="analysis-stats-table">
         <tr>
           <td>X Variable</td>
-          <td><strong>${this.config.xVariable?.key || 'N/A'}</strong></td>
+          <td><strong>${safeXKey}</strong></td>
         </tr>
         <tr>
           <td>Y Variable</td>
-          <td><strong>${this.config.yVariable?.key || 'N/A'}</strong></td>
+          <td><strong>${safeYKey}</strong></td>
         </tr>
         <tr>
           <td>Pearson R</td>
@@ -1091,11 +1123,11 @@ export class ScatterBuilder {
         </tr>
         <tr>
           <td>P-value</td>
-          <td><strong>${isNaN(correlation.pValue) ? 'N/A' : (correlation.pValue < 0.001 ? '<0.001' : correlation.pValue.toFixed(4))}</strong></td>
+          <td><strong>${safePValue}</strong></td>
         </tr>
         <tr>
           <td>Significance</td>
-          <td class="${sigClass}"><strong>${significance}</strong></td>
+          <td class="${sigClass}"><strong>${safeSignificance}</strong></td>
         </tr>
         <tr>
           <td>Sample Size</td>

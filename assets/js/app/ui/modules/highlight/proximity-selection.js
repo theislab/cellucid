@@ -7,7 +7,7 @@
  * @module ui/modules/highlight/proximity-selection
  */
 
-import { debug } from '../../../utils/debug.js';
+import { debug } from '../../../../utils/debug.js';
 import { HIGHLIGHT_MODE_COPY } from './mode-copy.js';
 import { MAX_HISTORY_STEPS } from './selection-state.js';
 
@@ -253,4 +253,3 @@ export function initProximitySelection({ state, viewer, selectionState, ui }) {
 
   return { handleProximityStep };
 }
-

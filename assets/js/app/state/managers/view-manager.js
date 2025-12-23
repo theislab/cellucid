@@ -9,6 +9,8 @@
 import { BaseManager } from '../core/base-manager.js';
 import { viewContextCoreMethods } from './view-context-core.js';
 import { viewContextViewerSyncMethods } from './view-context-viewer-sync.js';
+import { getNotificationCenter } from '../../notification-center.js';
+import { isAnnDataActive } from '../../../data/anndata-provider.js';
 
 export class DataStateViewMethods {
 
@@ -65,6 +67,86 @@ export class DataStateViewMethods {
   }
 
   /**
+   * Attach a vector field manager for dimension-specific per-cell displacement vectors
+   * (e.g. scVelo velocity, CellRank drift vectors).
+   *
+   * The manager is optional: most datasets do not provide vector fields.
+   *
+   * @param {import('../../../data/vector-field-manager.js').VectorFieldManager | null} manager
+   */
+  setVectorFieldManager(manager) {
+    this.vectorFieldManager = manager || null;
+    this.emit?.('vectorFields:changed', this.getAvailableVectorFields?.() || []);
+  }
+
+  getVectorFieldManager() {
+    return this.vectorFieldManager || null;
+  }
+
+  hasAnyVectorFields() {
+    return Boolean(this.vectorFieldManager?.hasAny?.());
+  }
+
+  /**
+   * @returns {{ id: string, label: string, availableDimensions: number[], defaultDimension: number }[]}
+   */
+  getAvailableVectorFields() {
+    return this.vectorFieldManager?.getAvailableFields?.() || [];
+  }
+
+  /**
+   * @returns {string|null}
+   */
+  getDefaultVectorFieldId() {
+    return this.vectorFieldManager?.getDefaultFieldId?.() || null;
+  }
+
+  hasVectorField(fieldId) {
+    const id = String(fieldId || '');
+    if (!id) return false;
+    return Boolean(this.vectorFieldManager?.hasField?.(id));
+  }
+
+  hasVectorFieldForDimension(fieldId, level) {
+    const id = String(fieldId || '');
+    if (!id) return false;
+    return Boolean(this.vectorFieldManager?.hasFieldDimension?.(id, level));
+  }
+
+  /**
+   * Ensure vector field data is loaded and uploaded to the viewer for a dimension.
+   *
+   * @param {string} fieldId
+   * @param {number} level
+   * @param {{ silent?: boolean }} [options]
+   * @returns {Promise<boolean>}
+   */
+  async ensureVectorField(fieldId, level, options = {}) {
+    const id = String(fieldId || '');
+    const dim = Math.max(1, Math.min(3, Math.floor(level || 3)));
+    if (!id) return false;
+    if (!this.vectorFieldManager || !this.vectorFieldManager.hasFieldDimension?.(id, dim)) return false;
+    if (!this.viewer?.setVectorFieldData) return false;
+    if (this.viewer.hasVectorFieldForDimension?.(id, dim)) return true;
+
+    const silent = options?.silent === true;
+    const needsLocalNotif = typeof isAnnDataActive === 'function' ? isAnnDataActive() : false;
+    const notifications = (!silent && needsLocalNotif) ? getNotificationCenter() : null;
+    const label = this.vectorFieldManager.getAvailableFields().find((f) => f.id === id)?.label || id;
+    const notifId = notifications?.loading?.(`Loading ${dim}D ${label}…`, { category: 'data' }) || null;
+
+    try {
+      const fieldData = await this.vectorFieldManager.loadField(id, dim, { showProgress: !silent && !needsLocalNotif });
+      this.viewer.setVectorFieldData(id, dim, fieldData);
+      notifications?.complete?.(notifId, `Loaded ${dim}D ${label}`);
+      return true;
+    } catch (err) {
+      notifications?.fail?.(notifId, err?.message || `Failed to load ${dim}D ${label}`);
+      throw err;
+    }
+  }
+
+  /**
    * Get dimension manager
    * @returns {DimensionManager|null}
    */
@@ -117,165 +199,182 @@ export class DataStateViewMethods {
       throw new Error('4D visualization is not yet implemented');
     }
 
-    // Determine which view to update
-    const targetViewId = viewId ?? this.activeViewId;
-    const isActiveView = String(targetViewId) === String(this.activeViewId);
-
-    // Get the view context
-    const ctx = this.viewContexts.get(String(targetViewId));
-    const previousLevel = isActiveView ? this.activeDimensionLevel : (ctx?.dimensionLevel ?? this.activeDimensionLevel);
-
-    // Skip if no change
-    if (previousLevel === level) {
-      return;
+    // Serialize async dimension switches so concurrent callers can’t overlap across `await`.
+    while (this._dimensionChangeLock) {
+      await this._dimensionChangeLock;
     }
 
-    // Update the view context's dimension level
-    if (ctx) {
-      ctx.dimensionLevel = level;
-    }
+    let unlockDimensionChange = null;
+    this._dimensionChangeLock = new Promise((resolve) => {
+      unlockDimensionChange = resolve;
+    });
 
-    // Update dimension manager's per-view tracking
-    this.dimensionManager.setViewDimension(targetViewId, level);
+    try {
+      // Determine which view to update
+      const targetViewId = viewId ?? this.activeViewId;
+      const isActiveView = String(targetViewId) === String(this.activeViewId);
 
-    // If this is the active view, also update activeDimensionLevel
-    if (isActiveView) {
-      this.activeDimensionLevel = level;
-    }
+      // Get the view context
+      const ctx = this.viewContexts.get(String(targetViewId));
+      const previousLevel = isActiveView ? this.activeDimensionLevel : (ctx?.dimensionLevel ?? this.activeDimensionLevel);
 
-    // Load positions for the new dimension
-    if (updateViewer && this.viewer) {
-      try {
-        const positions3D = await this.dimensionManager.getPositions3D(level);
+      // Skip if no change
+      if (previousLevel === level) {
+        return;
+      }
 
-        // IMPORTANT: Use 'live' check, NOT isActiveView, to determine which buffer to update.
-        // Snapshot views should ALWAYS update their snapshot buffers, even if "active" in UI.
-        // Only the live view should update main positions.
-        const isLiveView = String(targetViewId) === 'live';
+      // Update the view context's dimension level
+      if (ctx) {
+        ctx.dimensionLevel = level;
+      }
 
-        if (isLiveView) {
-          // Live view: update main positions
-          this._updateViewerPositions(positions3D);
+      // Update dimension manager's per-view tracking
+      this.dimensionManager.setViewDimension(targetViewId, level);
 
-          // Rebuild centroids for the new dimension
-          // IMPORTANT: Temporarily set activeDimensionLevel so buildCentroidsForField uses correct dimension
-          // Use try/finally to guarantee restoration even if an exception occurs
-          const savedDimLevel = this.activeDimensionLevel;
-          this.activeDimensionLevel = level;
-          try {
-            // Use getFieldForView to get live's field, NOT getActiveField which returns active view's field
-            const liveField = this.getFieldForView('live');
-            if (liveField && liveField.kind === 'category') {
-              this._ensureUserDefinedCentroidsForDim(liveField, level);
-              this.buildCentroidsForField(liveField, { viewId: 'live' });
-              // Push directly to live view's centroid buffers (don't use _pushCentroidsToViewer
-              // which checks activeViewId and might push to wrong view)
-              if (this.viewer) {
-                this.viewer.setCentroids({
-                  positions: this.centroidPositions || new Float32Array(),
-                  colors: this.centroidColors || new Uint8Array(),
-                  outlierQuantiles: this.centroidOutliers || new Float32Array()
-                });
-                if (this.viewer.setCentroidLabels) {
-                  this.viewer.setCentroidLabels(this.centroidLabels, 'live');
+      // If this is the active view, also update activeDimensionLevel
+      if (isActiveView) {
+        this.activeDimensionLevel = level;
+      }
+
+      // Load positions for the new dimension
+      if (updateViewer && this.viewer) {
+        try {
+          const positions3D = await this.dimensionManager.getPositions3D(level);
+
+          // IMPORTANT: Use 'live' check, NOT isActiveView, to determine which buffer to update.
+          // Snapshot views should ALWAYS update their snapshot buffers, even if "active" in UI.
+          // Only the live view should update main positions.
+          const isLiveView = String(targetViewId) === 'live';
+
+          if (isLiveView) {
+            // Live view: update main positions
+            this._updateViewerPositions(positions3D);
+
+            // Rebuild centroids for the new dimension
+            // IMPORTANT: Temporarily set activeDimensionLevel so buildCentroidsForField uses correct dimension
+            // Use try/finally to guarantee restoration even if an exception occurs
+            const savedDimLevel = this.activeDimensionLevel;
+            this.activeDimensionLevel = level;
+            try {
+              // Use getFieldForView to get live's field, NOT getActiveField which returns active view's field
+              const liveField = this.getFieldForView('live');
+              if (liveField && liveField.kind === 'category') {
+                this._ensureUserDefinedCentroidsForDim(liveField, level);
+                this.buildCentroidsForField(liveField, { viewId: 'live' });
+                // Push directly to live view's centroid buffers (don't use _pushCentroidsToViewer
+                // which checks activeViewId and might push to wrong view)
+                if (this.viewer) {
+                  this.viewer.setCentroids({
+                    positions: this.centroidPositions || new Float32Array(),
+                    colors: this.centroidColors || new Uint8Array(),
+                    outlierQuantiles: this.centroidOutliers || new Float32Array()
+                  });
+                  if (this.viewer.setCentroidLabels) {
+                    this.viewer.setCentroidLabels(this.centroidLabels, 'live');
+                  }
+                }
+                // Save centroids to live view's context (consistent with snapshot handling)
+                if (ctx) {
+                  ctx.centroidPositions = this.centroidPositions ? new Float32Array(this.centroidPositions) : null;
+                  ctx.centroidColors = this.centroidColors ? new Uint8Array(this.centroidColors) : null;
+                  ctx.centroidOutliers = this.centroidOutliers ? new Float32Array(this.centroidOutliers) : null;
+                  ctx.centroidLabels = this.centroidLabels ? this.centroidLabels.map(c => c ? { ...c } : c) : [];
                 }
               }
-              // Save centroids to live view's context (consistent with snapshot handling)
-              if (ctx) {
-                ctx.centroidPositions = this.centroidPositions ? new Float32Array(this.centroidPositions) : null;
-                ctx.centroidColors = this.centroidColors ? new Uint8Array(this.centroidColors) : null;
-                ctx.centroidOutliers = this.centroidOutliers ? new Float32Array(this.centroidOutliers) : null;
-                ctx.centroidLabels = this.centroidLabels ? this.centroidLabels.map(c => c ? { ...c } : c) : [];
+            } finally {
+              // Restore if live wasn't active (but keep if it was, which was already set above)
+              if (!isActiveView) {
+                this.activeDimensionLevel = savedDimLevel;
+                // IMPORTANT: Restore active view's centroid state since buildCentroidsForField
+                // overwrote it with live's data
+                const activeCtx = this.viewContexts.get(String(this.activeViewId));
+                if (activeCtx) {
+                  this.centroidPositions = activeCtx.centroidPositions ? new Float32Array(activeCtx.centroidPositions) : null;
+                  this.centroidColors = activeCtx.centroidColors ? new Uint8Array(activeCtx.centroidColors) : null;
+                  this.centroidOutliers = activeCtx.centroidOutliers ? new Float32Array(activeCtx.centroidOutliers) : null;
+                  this.centroidLabels = activeCtx.centroidLabels || [];
+                }
               }
             }
-          } finally {
-            // Restore if live wasn't active (but keep if it was, which was already set above)
-            if (!isActiveView) {
+          } else {
+            // Snapshot view: update viewer's per-view position cache
+            // The viewer will use this to update the snapshot buffer
+            if (this.viewer.setViewPositions) {
+              this.viewer.setViewPositions(targetViewId, positions3D);
+            }
+
+            // Rebuild centroids for this snapshot view using its new dimension
+            // We need to temporarily set activeDimensionLevel for buildCentroidsForField
+            // Use try/finally to guarantee restoration even if an exception occurs
+            const savedDimLevel = this.activeDimensionLevel;
+            this.activeDimensionLevel = level;
+            try {
+              // Get the field for this snapshot view from its context
+              const snapshotField = this.getFieldForView(targetViewId);
+              if (snapshotField && snapshotField.kind === 'category') {
+                this._ensureUserDefinedCentroidsForDim(snapshotField, level);
+                this.buildCentroidsForField(snapshotField, { viewId: targetViewId });
+                // Update the snapshot's centroid data in viewer
+                if (this.viewer.updateSnapshotAttributes) {
+                  this.viewer.updateSnapshotAttributes(targetViewId, {
+                    centroidPositions: this.centroidPositions || new Float32Array(),
+                    centroidColors: this.centroidColors || new Uint8Array(),
+                    centroidOutliers: this.centroidOutliers || new Float32Array()
+                  });
+                }
+                // Update centroid labels for this view
+                if (this.viewer.setCentroidLabels) {
+                  this.viewer.setCentroidLabels(this.centroidLabels, targetViewId);
+                }
+                // Also save centroids to the view's context
+                if (ctx) {
+                  ctx.centroidPositions = this.centroidPositions ? new Float32Array(this.centroidPositions) : null;
+                  ctx.centroidColors = this.centroidColors ? new Uint8Array(this.centroidColors) : null;
+                  ctx.centroidOutliers = this.centroidOutliers ? new Float32Array(this.centroidOutliers) : null;
+                  ctx.centroidLabels = this.centroidLabels ? this.centroidLabels.map(c => c ? { ...c } : c) : [];
+                }
+              }
+            } finally {
+              // Restore activeDimensionLevel
               this.activeDimensionLevel = savedDimLevel;
-              // IMPORTANT: Restore active view's centroid state since buildCentroidsForField
-              // overwrote it with live's data
-              const activeCtx = this.viewContexts.get(String(this.activeViewId));
-              if (activeCtx) {
-                this.centroidPositions = activeCtx.centroidPositions ? new Float32Array(activeCtx.centroidPositions) : null;
-                this.centroidColors = activeCtx.centroidColors ? new Uint8Array(activeCtx.centroidColors) : null;
-                this.centroidOutliers = activeCtx.centroidOutliers ? new Float32Array(activeCtx.centroidOutliers) : null;
-                this.centroidLabels = activeCtx.centroidLabels || [];
-              }
-            }
-          }
-        } else {
-          // Snapshot view: update viewer's per-view position cache
-          // The viewer will use this to update the snapshot buffer
-          if (this.viewer.setViewPositions) {
-            this.viewer.setViewPositions(targetViewId, positions3D);
-          }
 
-          // Rebuild centroids for this snapshot view using its new dimension
-          // We need to temporarily set activeDimensionLevel for buildCentroidsForField
-          // Use try/finally to guarantee restoration even if an exception occurs
-          const savedDimLevel = this.activeDimensionLevel;
-          this.activeDimensionLevel = level;
-          try {
-            // Get the field for this snapshot view from its context
-            const snapshotField = this.getFieldForView(targetViewId);
-            if (snapshotField && snapshotField.kind === 'category') {
-              this._ensureUserDefinedCentroidsForDim(snapshotField, level);
-              this.buildCentroidsForField(snapshotField, { viewId: targetViewId });
-              // Update the snapshot's centroid data in viewer
-              if (this.viewer.updateSnapshotAttributes) {
-                this.viewer.updateSnapshotAttributes(targetViewId, {
-                  centroidPositions: this.centroidPositions || new Float32Array(),
-                  centroidColors: this.centroidColors || new Uint8Array(),
-                  centroidOutliers: this.centroidOutliers || new Float32Array()
-                });
-              }
-              // Update centroid labels for this view
-              if (this.viewer.setCentroidLabels) {
-                this.viewer.setCentroidLabels(this.centroidLabels, targetViewId);
-              }
-              // Also save centroids to the view's context
-              if (ctx) {
-                ctx.centroidPositions = this.centroidPositions ? new Float32Array(this.centroidPositions) : null;
-                ctx.centroidColors = this.centroidColors ? new Uint8Array(this.centroidColors) : null;
-                ctx.centroidOutliers = this.centroidOutliers ? new Float32Array(this.centroidOutliers) : null;
-                ctx.centroidLabels = this.centroidLabels ? this.centroidLabels.map(c => c ? { ...c } : c) : [];
-              }
-            }
-          } finally {
-            // Restore activeDimensionLevel
-            this.activeDimensionLevel = savedDimLevel;
-
-            // IMPORTANT: If this snapshot is not the active view, restore active view's centroid state
-            // since buildCentroidsForField overwrote it with snapshot's data
-            if (!isActiveView) {
-              const activeCtx = this.viewContexts.get(String(this.activeViewId));
-              if (activeCtx) {
-                this.centroidPositions = activeCtx.centroidPositions ? new Float32Array(activeCtx.centroidPositions) : null;
-                this.centroidColors = activeCtx.centroidColors ? new Uint8Array(activeCtx.centroidColors) : null;
-                this.centroidOutliers = activeCtx.centroidOutliers ? new Float32Array(activeCtx.centroidOutliers) : null;
-                this.centroidLabels = activeCtx.centroidLabels || [];
+              // IMPORTANT: If this snapshot is not the active view, restore active view's centroid state
+              // since buildCentroidsForField overwrote it with snapshot's data
+              if (!isActiveView) {
+                const activeCtx = this.viewContexts.get(String(this.activeViewId));
+                if (activeCtx) {
+                  this.centroidPositions = activeCtx.centroidPositions ? new Float32Array(activeCtx.centroidPositions) : null;
+                  this.centroidColors = activeCtx.centroidColors ? new Uint8Array(activeCtx.centroidColors) : null;
+                  this.centroidOutliers = activeCtx.centroidOutliers ? new Float32Array(activeCtx.centroidOutliers) : null;
+                  this.centroidLabels = activeCtx.centroidLabels || [];
+                }
               }
             }
           }
+        } catch (err) {
+          console.error(`[State] Failed to load ${level}D positions:`, err);
+          // Revert to previous level
+          if (ctx) ctx.dimensionLevel = previousLevel;
+          if (isActiveView) this.activeDimensionLevel = previousLevel;
+          this.dimensionManager.setViewDimension(targetViewId, previousLevel);
+          throw err;
         }
-      } catch (err) {
-        console.error(`[State] Failed to load ${level}D positions:`, err);
-        // Revert to previous level
-        if (ctx) ctx.dimensionLevel = previousLevel;
-        if (isActiveView) this.activeDimensionLevel = previousLevel;
-        this.dimensionManager.setViewDimension(targetViewId, previousLevel);
-        throw err;
       }
-    }
 
-    // Update viewer's per-view dimension tracking for multiview rendering
-    if (this.viewer && this.viewer.setViewDimension) {
-      this.viewer.setViewDimension(targetViewId, level);
-    }
+      // Update viewer's per-view dimension tracking for multiview rendering
+      if (this.viewer && this.viewer.setViewDimension) {
+        this.viewer.setViewDimension(targetViewId, level);
+      }
 
-    // Notify callbacks (only if active view changed, or always for UI sync)
-    if (isActiveView) {
-      this._notifyDimensionChange();
+      // Notify callbacks (only if active view changed, or always for UI sync)
+      if (isActiveView) {
+        this._notifyDimensionChange();
+      }
+    } finally {
+      if (typeof unlockDimensionChange === 'function') {
+        unlockDimensionChange();
+      }
+      this._dimensionChangeLock = null;
     }
   }
 

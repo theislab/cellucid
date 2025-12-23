@@ -429,7 +429,11 @@ export class BaseAnalysisUI {
     if (this._previewContainer) {
       this._previewContainer.classList.remove('loading');
       this._previewContainer.classList.add('empty');
-      this._previewContainer.innerHTML = `<div class="analysis-error">${message}</div>`;
+      this._previewContainer.textContent = '';
+      const errorEl = document.createElement('div');
+      errorEl.className = 'analysis-error';
+      errorEl.textContent = message ?? '';
+      this._previewContainer.appendChild(errorEl);
     }
     if (this._actionsContainer) {
       this._actionsContainer.style.display = 'none';

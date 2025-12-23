@@ -6,6 +6,7 @@
  */
 
 import { PlotFactory, PlotRegistry, BasePlot, COMMON_HOVER_STYLE } from '../plot-factory.js';
+import { escapeHtml } from '../../../utils/dom-utils.js';
 
 const histogramDefinition = {
   id: 'histogram',
@@ -61,6 +62,7 @@ const histogramDefinition = {
       filterNumeric: true,
       minValues: 1,
       traceBuilder: (pd, color, i, opts) => {
+        const safePageName = escapeHtml(String(pd.pageName || ''));
         const trace = {
           type: 'histogram',
           name: pd.pageName,
@@ -71,8 +73,8 @@ const histogramDefinition = {
           marker: { color, line: { color: 'rgba(0,0,0,0.1)', width: 0.5 } },
           opacity: barmode === 'overlay' ? opacity : 1,
           hovertemplate: histnorm === 'percent' || histnorm === 'probability'
-            ? `${pd.pageName}<br>%{x}: %{y:.1f}%<extra></extra>`
-            : `${pd.pageName}<br>%{x}: %{y}<extra></extra>`,
+            ? `${safePageName}<br>%{x}: %{y:.1f}%<extra></extra>`
+            : `${safePageName}<br>%{x}: %{y}<extra></extra>`,
           hoverlabel: COMMON_HOVER_STYLE
         };
 
