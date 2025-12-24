@@ -8,6 +8,7 @@
  * - ?dataset=suo                    → Demo dataset
  * - ?remote=http://localhost:8765   → Remote server
  * - ?github=owner/repo/path         → GitHub repository
+ * - ?annotations=owner/repo[@branch]→ Community annotation repo (votes/suggestions)
  * - (no params)                     → Local file or empty state
  */
 
@@ -72,4 +73,28 @@ export function parseUrlDataSource() {
  */
 export function clearUrlDataSource() {
   updateUrlForDataSource(null, {});
+}
+
+/**
+ * Set or clear the community annotation repo param.
+ * Token is never stored in the URL.
+ *
+ * @param {string|null} ownerRepo - "owner/repo" or "owner/repo@branch" or null to clear
+ */
+export function setUrlAnnotationRepo(ownerRepo) {
+  const url = new URL(window.location.href);
+  const value = String(ownerRepo ?? '').trim();
+  if (value) url.searchParams.set('annotations', value);
+  else url.searchParams.delete('annotations');
+  history.replaceState(null, '', url.toString());
+}
+
+export function getUrlAnnotationRepo() {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const value = params.get('annotations');
+    return value ? String(value).trim() : null;
+  } catch {
+    return null;
+  }
 }

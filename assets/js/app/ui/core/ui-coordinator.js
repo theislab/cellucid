@@ -24,6 +24,7 @@ import { initViewControls } from '../modules/view-controls.js';
 import { initDimensionControls } from '../modules/dimension-controls.js';
 import { initDatasetControls } from '../modules/dataset-controls.js';
 import { initSessionControls } from '../modules/session-controls.js';
+import { initCommunityAnnotationControls } from '../modules/community-annotation-controls.js';
 import { initVisualizationReset } from '../modules/visualization-reset.js';
 import { initFigureExport } from '../modules/figure-export/index.js';
 import { debug } from '../../../utils/debug.js';
@@ -80,6 +81,11 @@ export function initUI({
     }
   });
   const highlightControls = initHighlightControls({ state, viewer, dom: dom.highlight });
+  const communityAnnotationControls = initCommunityAnnotationControls({
+    state,
+    dom: dom.communityAnnotation,
+    dataSourceManager
+  });
 
   let viewControls = null;
 
@@ -147,6 +153,7 @@ export function initUI({
     legend.render?.(info.field);
     legend.handleOutlierUI?.(info.field);
     highlightControls.updateHighlightMode?.();
+    communityAnnotationControls.render?.();
   }
 
   const fieldSelector = initFieldSelector({
@@ -193,6 +200,7 @@ export function initUI({
     filterControls.render?.();
     highlightControls.renderHighlightPages?.();
     highlightControls.renderHighlightSummary?.();
+    communityAnnotationControls.render?.();
     dimensionControls.updateDimensionSelectUI?.();
     viewControls?.renderSplitViewBadges?.();
     viewControls?.updateSplitViewUI?.();
@@ -260,6 +268,7 @@ export function initUI({
     legend.render?.(state.getActiveField());
     legend.handleOutlierUI?.(state.getActiveField());
     highlightControls.updateHighlightMode?.();
+    communityAnnotationControls.render?.();
     handleVisibilityChange();
   });
   state.on('dimension:changed', () => {
@@ -275,6 +284,7 @@ export function initUI({
   filterControls.render?.();
   highlightControls.renderHighlightPages?.();
   highlightControls.renderHighlightSummary?.();
+  communityAnnotationControls.render?.();
   viewControls?.renderSplitViewBadges?.();
   viewControls?.updateSplitViewUI?.();
   handleActiveFieldChanged(buildStatsInfoFromState());

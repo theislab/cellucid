@@ -677,4 +677,107 @@ export class FieldOverlayPublicMethods {
     const field = this.obsData?.fields?.[fieldIndex];
     return field?._isUserDefined === true;
   }
+
+  /**
+   * Create or update a user-defined categorical obs field by key.
+   *
+   * Designed for "computed columns" like community annotation consensus outputs,
+   * where the field should be overwritten on each sync without touching the
+   * source column.
+   *
+   * If a non-user-defined field already exists with the requested key, a unique
+   * key is generated and returned.
+   *
+   * @param {object} options
+   * @param {string} options.key
+   * @param {string[]} options.categories
+   * @param {Uint8Array|Uint16Array} options.codes
+   * @param {object} [options.meta]
+   * @returns {{ fieldIndex: number, key: string, updatedInPlace: boolean }|null}
+   */
+  upsertUserDefinedCategoricalField(options = {}) {
+    const fields = this.obsData?.fields;
+    const key = String(options.key ?? '').trim();
+    const categories = Array.isArray(options.categories) ? options.categories : null;
+    const codes = options.codes;
+    const meta = options.meta && typeof options.meta === 'object' ? options.meta : null;
+
+    try {
+      StateValidator.validateFieldKey(key);
+    } catch (e) {
+      console.error('[State] upsertUserDefinedCategoricalField invalid key:', e.message);
+      return null;
+    }
+    if (!categories || categories.length === 0) {
+      console.error('[State] upsertUserDefinedCategoricalField: categories required');
+      return null;
+    }
+    if (!codes || typeof codes.length !== 'number') {
+      console.error('[State] upsertUserDefinedCategoricalField: codes required');
+      return null;
+    }
+
+    const existingIndex = (fields || []).findIndex((f) => f && f._isDeleted !== true && f.key === key);
+    if (existingIndex >= 0) {
+      const existing = fields[existingIndex];
+      const canUpdate =
+        existing &&
+        existing.kind === FieldKind.CATEGORY &&
+        existing._isUserDefined === true &&
+        Boolean(existing._userDefinedId);
+
+      if (canUpdate) {
+        const centroidsByDim = this._userDefinedFields.computeCentroidsByDim(codes, categories, this);
+        existing.categories = [...categories];
+        existing.codes = codes;
+        existing.centroidsByDim = centroidsByDim;
+        existing.loaded = true;
+
+        if (meta?._sourceField) existing._sourceField = meta._sourceField;
+        if (meta?._operation) existing._operation = meta._operation;
+
+        // Keep serialized template in sync.
+        this._userDefinedFields.updateField(existing._userDefinedId, {
+          categories: existing.categories,
+          codes: existing.codes,
+          centroidsByDim: existing.centroidsByDim,
+          sourceField: meta?._sourceField || undefined,
+          operation: meta?._operation || undefined
+        });
+
+        getFieldRegistry().invalidate();
+        this._syncActiveContext();
+        this._notifyFieldChange(FieldSource.OBS, existingIndex, ChangeType.UPDATE, { operation: 'upsert-user-defined' });
+        return { fieldIndex: existingIndex, key, updatedInPlace: true };
+      }
+    }
+
+    // Create new user-defined field (avoid clobbering source fields).
+    const existingKeys = (fields || []).filter((f) => f && f._isDeleted !== true).map((f) => f.key);
+    const newKey = existingIndex >= 0 ? makeUniqueLabel(key, existingKeys) : key;
+
+    let created;
+    try {
+      created = this._userDefinedFields.createFromCategoricalCodes(
+        {
+          key: newKey,
+          categories,
+          codes,
+          source: FieldSource.OBS,
+          meta: meta || undefined
+        },
+        this
+      );
+    } catch (err) {
+      console.error('[State] upsertUserDefinedCategoricalField create failed:', err.message);
+      return null;
+    }
+
+    fields.push(created.field);
+    const newFieldIndex = fields.length - 1;
+    getFieldRegistry().invalidate();
+    this._syncActiveContext();
+    this._notifyFieldChange(FieldSource.OBS, newFieldIndex, ChangeType.CREATE, { userDefinedId: created.id });
+    return { fieldIndex: newFieldIndex, key: newKey, updatedInPlace: false };
+  }
 }

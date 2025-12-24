@@ -142,6 +142,11 @@ export function collectDOMReferences(root) {
       modeDescription: byId('highlight-mode-description'),
     },
 
+    communityAnnotation: {
+      section: byId('community-annotation-section'),
+      container: byId('community-annotation-controls'),
+    },
+
     render: {
       backgroundSelect: byId('background-select'),
       renderModeSelect: byId('render-mode'),

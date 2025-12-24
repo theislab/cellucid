@@ -14,6 +14,7 @@ import { showConfirmDialog } from '../../components/confirm-dialog.js';
 import { FieldKind, FieldSource } from '../../../utils/field-constants.js';
 import { StateValidator } from '../../../utils/state-validator.js';
 import { clamp } from '../../../utils/number-utils.js';
+import { getCommunityAnnotationSession } from '../../../community-annotations/session.js';
 
 function rgbToHex(color) {
   const toChannel = (v) => clamp(Math.round(v * 255), 0, 255);
@@ -54,6 +55,229 @@ function formatCategoryCount(visibleCount, availableCount) {
 }
 
 export function initCategoricalLegend({ state, legendEl }) {
+  const annotationSession = getCommunityAnnotationSession();
+
+  let votingHoverTimer = null;
+  let votingCloseTimer = null;
+  let openVoting = null; // { row, fieldKey, catIdx, catLabel, panel }
+  let unsubscribeVoting = null;
+
+  function clearVotingTimers() {
+    if (votingHoverTimer) {
+      clearTimeout(votingHoverTimer);
+      votingHoverTimer = null;
+    }
+    if (votingCloseTimer) {
+      clearTimeout(votingCloseTimer);
+      votingCloseTimer = null;
+    }
+  }
+
+  function closeVotingPanel() {
+    clearVotingTimers();
+    if (openVoting?.panel?.parentNode) openVoting.panel.remove();
+    openVoting = null;
+  }
+
+  function renderVotingPanelContent(panel, { fieldKey, catIdx, catLabel }) {
+    panel.innerHTML = '';
+    panel.appendChild(Object.assign(document.createElement('div'), {
+      className: 'community-annotation-panel-title',
+      textContent: `🗳️ ${catLabel}`
+    }));
+
+    const profile = annotationSession.getProfile();
+    panel.appendChild(Object.assign(document.createElement('div'), {
+      className: 'community-annotation-panel-subtitle',
+      textContent: `You: @${profile.username}`
+    }));
+
+    const consensus = annotationSession.computeConsensus(fieldKey, catIdx);
+    const consensusLine = document.createElement('div');
+    consensusLine.className = `community-annotation-consensus status-${consensus.status}`;
+    const label = consensus.label ? `"${consensus.label}"` : '—';
+    consensusLine.textContent =
+      consensus.status === 'consensus'
+        ? `Consensus: ${label} (${Math.round(consensus.confidence * 100)}% • voters ${consensus.voters})`
+        : consensus.status === 'disputed'
+          ? `Disputed: top ${label} (${Math.round(consensus.confidence * 100)}% • voters ${consensus.voters})`
+          : `Pending: voters ${consensus.voters}`;
+    panel.appendChild(consensusLine);
+
+    const suggestions = annotationSession
+      .getSuggestions(fieldKey, catIdx)
+      .slice()
+      .sort((a, b) => ((b.upvotes?.length || 0) - (b.downvotes?.length || 0)) - ((a.upvotes?.length || 0) - (a.downvotes?.length || 0)));
+
+    const list = document.createElement('div');
+    list.className = 'community-annotation-suggestions';
+
+    if (!suggestions.length) {
+      const empty = document.createElement('div');
+      empty.className = 'legend-help';
+      empty.textContent = 'No suggestions yet.';
+      list.appendChild(empty);
+    } else {
+      for (const s of suggestions.slice(0, 8)) {
+        const up = s.upvotes?.length || 0;
+        const down = s.downvotes?.length || 0;
+        const net = up - down;
+
+        const card = document.createElement('div');
+        card.className = 'community-annotation-suggestion-card';
+
+        const top = document.createElement('div');
+        top.className = 'community-annotation-suggestion-top';
+
+        const labelEl = document.createElement('div');
+        labelEl.className = 'community-annotation-suggestion-label';
+        labelEl.textContent = s.label;
+        top.appendChild(labelEl);
+
+        const netEl = document.createElement('div');
+        netEl.className = 'community-annotation-suggestion-net';
+        netEl.textContent = `net ${net}`;
+        top.appendChild(netEl);
+
+        card.appendChild(top);
+
+        if (s.ontologyId) {
+          const ont = document.createElement('div');
+          ont.className = 'community-annotation-suggestion-ontology';
+          ont.textContent = s.ontologyId;
+          card.appendChild(ont);
+        }
+        if (s.evidence) {
+          const ev = document.createElement('div');
+          ev.className = 'community-annotation-suggestion-evidence';
+          ev.textContent = s.evidence;
+          card.appendChild(ev);
+        }
+
+        const actions = document.createElement('div');
+        actions.className = 'community-annotation-suggestion-actions';
+
+        const upBtn = document.createElement('button');
+        upBtn.type = 'button';
+        upBtn.className = 'btn-small';
+        upBtn.textContent = `▲ ${up}`;
+        upBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          annotationSession.vote(fieldKey, catIdx, s.id, 'up');
+        });
+
+        const downBtn = document.createElement('button');
+        downBtn.type = 'button';
+        downBtn.className = 'btn-small';
+        downBtn.textContent = `▼ ${down}`;
+        downBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          annotationSession.vote(fieldKey, catIdx, s.id, 'down');
+        });
+
+        actions.appendChild(upBtn);
+        actions.appendChild(downBtn);
+        card.appendChild(actions);
+
+        const by = document.createElement('div');
+        by.className = 'legend-help';
+        by.textContent = `@${s.proposedBy}`;
+        card.appendChild(by);
+
+        list.appendChild(card);
+      }
+    }
+
+    panel.appendChild(list);
+
+    const form = document.createElement('div');
+    form.className = 'community-annotation-new';
+
+    const labelInput = document.createElement('input');
+    labelInput.type = 'text';
+    labelInput.className = 'obs-select community-annotation-input';
+    labelInput.placeholder = 'New label…';
+
+    const submit = document.createElement('button');
+    submit.type = 'button';
+    submit.className = 'btn-small';
+    submit.textContent = 'Add';
+    submit.addEventListener('click', (e) => {
+      e.stopPropagation();
+      try {
+        annotationSession.addSuggestion(fieldKey, catIdx, { label: labelInput.value });
+        labelInput.value = '';
+      } catch (err) {
+        getNotificationCenter().error(err?.message || 'Failed to add suggestion', { category: 'annotation' });
+      }
+    });
+
+    form.appendChild(labelInput);
+    form.appendChild(submit);
+    panel.appendChild(form);
+  }
+
+  function openVotingPanel(row, { fieldKey, catIdx, catLabel }) {
+    if (!legendEl) return;
+    if (!fieldKey) return;
+
+    if (openVoting && openVoting.fieldKey === fieldKey && openVoting.catIdx === catIdx) return;
+    closeVotingPanel();
+
+    const panel = document.createElement('div');
+    panel.className = 'community-annotation-panel';
+    panel.dataset.fieldKey = fieldKey;
+    panel.dataset.catIndex = String(catIdx);
+
+    panel.addEventListener('mouseenter', () => {
+      if (votingCloseTimer) {
+        clearTimeout(votingCloseTimer);
+        votingCloseTimer = null;
+      }
+    });
+    panel.addEventListener('mouseleave', () => {
+      scheduleCloseVotingPanel();
+    });
+
+    renderVotingPanelContent(panel, { fieldKey, catIdx, catLabel });
+    row.insertAdjacentElement('afterend', panel);
+
+    openVoting = { row, fieldKey, catIdx, catLabel, panel };
+  }
+
+  function scheduleOpenVotingPanel(row, options) {
+    if (!options?.fieldKey) return;
+    if (votingCloseTimer) {
+      clearTimeout(votingCloseTimer);
+      votingCloseTimer = null;
+    }
+    if (votingHoverTimer) clearTimeout(votingHoverTimer);
+    votingHoverTimer = setTimeout(() => {
+      votingHoverTimer = null;
+      if (!row.isConnected) return;
+      if (row.classList.contains('legend-item-dragging')) return;
+      openVotingPanel(row, options);
+    }, 200);
+  }
+
+  function scheduleCloseVotingPanel() {
+    if (votingHoverTimer) {
+      clearTimeout(votingHoverTimer);
+      votingHoverTimer = null;
+    }
+    if (votingCloseTimer) clearTimeout(votingCloseTimer);
+    votingCloseTimer = setTimeout(() => {
+      votingCloseTimer = null;
+      closeVotingPanel();
+    }, 250);
+  }
+
+  // Keep an open panel in sync with vote changes.
+  unsubscribeVoting = annotationSession.on('changed', () => {
+    if (!openVoting?.panel || !openVoting.panel.isConnected) return;
+    renderVotingPanelContent(openVoting.panel, openVoting);
+  });
+
   function refreshCategoryCounts() {
     const activeField = state.getActiveField ? state.getActiveField() : null;
     if (!activeField || activeField.kind !== 'category') return;
@@ -82,6 +306,7 @@ export function initCategoricalLegend({ state, legendEl }) {
 
   function renderCategoricalLegend(field, model) {
     if (!legendEl) return;
+    closeVotingPanel();
 
     const catSection = document.createElement('div');
     catSection.className = 'legend-section';
@@ -124,6 +349,9 @@ export function initCategoricalLegend({ state, legendEl }) {
       .map((item) => item.idx);
 
     const CATEGORY_DRAG_MIME = 'application/x-cellucid-category';
+
+    const fieldKey = field?.key || '';
+    const annotating = Boolean(fieldKey && annotationSession.isFieldAnnotated(fieldKey));
 
     const itemsContainer = document.createElement('div');
     itemsContainer.className = 'legend-items-container';
@@ -363,6 +591,21 @@ export function initCategoricalLegend({ state, legendEl }) {
       row.appendChild(swatch);
       row.appendChild(labelSpan);
       row.appendChild(countSpan);
+      if (annotating && hasCells) {
+        const voteBtn = document.createElement('button');
+        voteBtn.type = 'button';
+        voteBtn.className = 'legend-vote-btn';
+        voteBtn.title = 'Vote on annotations';
+        voteBtn.textContent = 'Vote';
+        voteBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          openVotingPanel(row, { fieldKey, catIdx, catLabel: cat });
+        });
+        row.addEventListener('mouseenter', () => scheduleOpenVotingPanel(row, { fieldKey, catIdx, catLabel: cat }));
+        row.addEventListener('mouseleave', () => scheduleCloseVotingPanel());
+        row.appendChild(voteBtn);
+      }
+
       row.appendChild(renameBtn);
       row.appendChild(deleteBtn);
       itemsContainer.appendChild(row);
@@ -377,4 +620,3 @@ export function initCategoricalLegend({ state, legendEl }) {
     renderCategoricalLegend
   };
 }
-

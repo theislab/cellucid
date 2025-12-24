@@ -23,6 +23,7 @@ import { FieldKind, FieldSource } from '../../utils/field-constants.js';
 import { StateValidator } from '../../utils/state-validator.js';
 import { initDeletedFieldsPanel } from './field-selector-deleted-fields.js';
 import { initGeneExpressionSelector } from './field-selector-gene-expression.js';
+import { getCommunityAnnotationSession } from '../../community-annotations/session.js';
 
 /**
  * @typedef {object} FieldSelectorCallbacks
@@ -61,6 +62,8 @@ export function initFieldSelector({ state, dom, callbacks = /** @type {FieldSele
   let hasCategoricalFields = false;
   let hasContinuousFields = false;
   let geneSelector = null;
+
+  const annotationSession = getCommunityAnnotationSession();
 
   const { renderDeletedFieldsSection } = initDeletedFieldsPanel({ state, deletedFieldsSection });
 
@@ -150,7 +153,9 @@ export function initFieldSelector({ state, dom, callbacks = /** @type {FieldSele
       entries.forEach(({ field, idx }) => {
         const opt = document.createElement('option');
         opt.value = String(idx);
-        opt.textContent = field._originalKey ? `${field.key} *` : field.key;
+        const baseLabel = field._originalKey ? `${field.key} *` : field.key;
+        const annotateBadge = (select === categoricalSelect && annotationSession.isFieldAnnotated(field.key)) ? ' 🗳️' : '';
+        opt.textContent = baseLabel + annotateBadge;
         select.appendChild(opt);
       });
       select.value = NONE_FIELD_VALUE;
@@ -167,6 +172,40 @@ export function initFieldSelector({ state, dom, callbacks = /** @type {FieldSele
       callbacks.onActiveFieldChanged?.({ field: null, pointCount: 0, centroidInfo: '' });
     }
   }
+
+  // Right-click the categorical field selector to toggle annotation mode for the selected field.
+  if (categoricalSelect) {
+    categoricalSelect.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      const idx = parseInt(categoricalSelect.value || NONE_FIELD_VALUE, 10);
+      if (!Number.isInteger(idx) || idx < 0) return;
+      const field = state.getFields?.()?.[idx] || null;
+      if (!field || field.kind !== FieldKind.CATEGORY || !field.key) return;
+
+      const enabled = annotationSession.isFieldAnnotated(field.key);
+      showConfirmDialog({
+        title: enabled ? 'Disable community annotation' : 'Enable community annotation',
+        message: enabled
+          ? `Disable annotation voting for "${field.key}"? (Votes remain in local storage.)`
+          : `Enable annotation voting for "${field.key}"? Legend items will show voting on hover.`,
+        confirmText: enabled ? 'Disable' : 'Enable',
+        onConfirm: () => {
+          annotationSession.setFieldAnnotated(field.key, !enabled);
+          const notifications = getNotificationCenter();
+          notifications.success(
+            `${enabled ? 'Disabled' : 'Enabled'} community annotation for "${field.key}"`,
+            { category: 'annotation', duration: 2400 }
+          );
+          renderFieldSelects();
+        }
+      });
+    });
+  }
+
+  // Keep 🗳️ badges in sync if annotation session changes elsewhere (accordion, legend, etc.).
+  const unsubscribeAnnotation = annotationSession.on('changed', () => {
+    renderFieldSelects();
+  });
 
   function validateUniqueFieldName(nextValue, fields, fieldIndex) {
     const value = String(nextValue ?? '').trim();
@@ -264,6 +303,12 @@ export function initFieldSelector({ state, dom, callbacks = /** @type {FieldSele
     updateFieldActionButtons();
     geneSelector?.syncFromState?.();
     geneSelector?.updateGeneActionButtons?.(forceDisableFieldSelects);
+  }
+
+  // Best-effort cleanup for embedders/tests.
+  // (Most UI modules in the app do not currently expose a destroy lifecycle.)
+  if (typeof window !== 'undefined') {
+    window.addEventListener?.('beforeunload', () => unsubscribeAnnotation?.(), { once: true });
   }
 
   async function activateField(idx) {

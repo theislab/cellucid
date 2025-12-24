@@ -14,6 +14,7 @@ WebGL-based 3D visualization for single-cell data. Explore UMAP embeddings with 
 - Gene expression overlays with efficient sparse matrix handling
 - Categorical and continuous cell metadata coloring
 - Interactive filtering and cell selection
+- Community annotation voting (🗳️) with optional GitHub sync (fine-grained PAT)
 - KNN connectivity edge visualization
 - Multi-dimensional support (1D timelines, 2D, 3D)
 - Animated vector field overlay (velocity / drift) with GPU particle flow
@@ -57,6 +58,12 @@ Use the **Figure Export** accordion in the sidebar to export the current view:
 - **SVG**: best for Illustrator/Inkscape editing; for large datasets you’ll be prompted to choose Full Vector, Optimized Vector (density-preserving), or Hybrid (points raster + vector annotations).
 - **PNG**: best compatibility; choose DPI (150/300/600).
 - **Axes**: only rendered for **2D planar views** (switch navigation to Planar) to avoid misleading axes on 3D projections.
+
+## Community Annotation (GitHub Sync)
+
+- Enable per-field voting: right-click the categorical field dropdown → “Enable community annotation”.
+- Open **Community Annotation** accordion to connect a repo and `Pull`/`Push` votes/suggestions (private repos require a fine-grained PAT).
+- Annotation repo template: `cellucid-annotation/README.md`.
 
 ## All 14 Loading Options
 
