@@ -30,9 +30,11 @@ import { isFiniteNumber } from '../../shared/number-utils.js';
 export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
   static getRequirements() {
     return {
-      minPages: 1,
+      // Correlation has its own internal page selector; don't block rendering
+      // when the global page selection is empty.
+      minPages: 0,
       maxPages: null,
-      description: 'Select at least 1 page'
+      description: 'Select pages to analyze'
     };
   }
 

@@ -60,10 +60,11 @@ export const DEFAULTS = {
  */
 export const TOP_N_OPTIONS = [
   { value: 5, label: '5 genes', description: 'Quick overview' },
-  { value: 10, label: '10 genes', description: 'Standard analysis', selected: true },
+  { value: 10, label: '10 genes', description: 'Standard analysis' },
   { value: 20, label: '20 genes', description: 'Detailed analysis' },
   { value: 50, label: '50 genes', description: 'Comprehensive' },
-  { value: 100, label: '100 genes', description: 'Full panel' }
+  { value: 100, label: '100 genes', description: 'Full panel' },
+  { value: 'all', label: 'All genes', description: 'Return all genes (slower, larger tables)', selected: true }
 ];
 
 /**

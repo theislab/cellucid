@@ -435,6 +435,7 @@ export class ProgressTracker {
       totalPhases: this.phases.length,
       progress,
       completed: this._completedItems,
+      completedItems: this._completedItems,
       total: this.totalItems,
       remaining: this.totalItems - this._completedItems,
 
@@ -452,7 +453,7 @@ export class ProgressTracker {
 
       // Status
       started: this._started,
-      completed: this._completed,
+      isComplete: this._completed,
       cancelled: this._cancelled,
       percentComplete: progress
     };

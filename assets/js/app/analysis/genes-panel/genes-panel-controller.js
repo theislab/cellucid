@@ -270,43 +270,14 @@ export class GenesPanelController {
         }));
       }
 
-      // Ranked mode only needs marker lists (fast path; no matrix/clustering).
-      if (mode === 'ranked') {
-        const duration = performance.now() - startTime;
-        if (onProgress) {
-          onProgress({
-            phase: ANALYSIS_PHASES.RENDER,
-            progress: 100,
-            message: 'Markers ready'
-          });
-        }
+      // Build expression matrix.
+      // For interactive thresholding + browsing, we only need a small panel by default.
+      // The figure modal can request larger sets (Top 10/20/100/All) and rebuild the matrix.
+      const DEFAULT_HEATMAP_TOP_N = 5;
+      const genesForMatrix = this._extractTopNGenes(markers, DEFAULT_HEATMAP_TOP_N);
 
-        return {
-          markers,
-          matrix: null,
-          clustering: null,
-          metadata: {
-            obsCategory,
-            mode,
-            method,
-            transform,
-            distance,
-            linkage,
-            topNPerGroup,
-            pValueThreshold,
-            foldChangeThreshold,
-            useAdjustedPValue,
-            geneCount: allGenes.length,
-            groupCount: groups.length,
-            duration,
-            cached: !!(useCache && cacheHit)
-          }
-        };
-      }
-
-      // Build expression matrix
       const matrix = await this._matrixBuilder.buildMatrix({
-        genes: allGenes,
+        genes: genesForMatrix.length > 0 ? genesForMatrix : allGenes,
         groups,
         transform,
         batchConfig,
@@ -370,7 +341,10 @@ export class GenesPanelController {
           pValueThreshold,
           foldChangeThreshold,
           useAdjustedPValue,
+          parallelism,
+          batchConfig,
           geneCount: allGenes.length,
+          matrixGeneCount: genesForMatrix.length > 0 ? genesForMatrix.length : allGenes.length,
           groupCount: groups.length,
           duration,
           cached: !!(useCache && cacheHit)
@@ -388,6 +362,40 @@ export class GenesPanelController {
         this._currentAbortController = null;
       }
     }
+  }
+
+  /**
+   * Public helper: get groups + obsCodes for a category (for post-run re-filtering).
+   *
+   * @param {string} obsCategory
+   * @param {{ onProgress?: Function, signal?: AbortSignal }} [options]
+   * @returns {Promise<{ groups: any[], obsCodes: Uint16Array }>}
+   */
+  async getGroupsAndCodes(obsCategory, options = {}) {
+    await this.init();
+    return this._getGroupsFromCategory(obsCategory, options);
+  }
+
+  /**
+   * Public helper: build an expression matrix for a given gene list.
+   * This lets the UI rebuild the heatmap after post-run threshold changes
+   * without re-running marker discovery.
+   *
+   * @param {Object} options
+   * @param {string[]} options.genes
+   * @param {any[]} options.groups
+   * @param {'none'|'zscore'|'log1p'} [options.transform]
+   * @param {Object} [options.batchConfig]
+   * @param {Function} [options.onProgress]
+   * @param {AbortSignal} [options.signal]
+   * @returns {Promise<any>}
+   */
+  async buildMatrixForGenes(options) {
+    await this.init();
+    if (!this._matrixBuilder) {
+      throw new Error('[GenesPanelController] Matrix builder not initialized');
+    }
+    return this._matrixBuilder.buildMatrix(options);
   }
 
   /**
@@ -507,6 +515,22 @@ export class GenesPanelController {
   _getDatasetId() {
     const state = this.dataLayer.state;
     return state?.datasetId || state?.pointCount?.toString() || 'unknown';
+  }
+
+  _extractTopNGenes(markers, topNPerGroup) {
+    const groups = markers?.groups || {};
+    const n = Number.isFinite(topNPerGroup) ? Math.max(1, Math.floor(topNPerGroup)) : 5;
+    const wanted = new Set();
+
+    for (const group of Object.values(groups)) {
+      const list = group?.markers || [];
+      const limit = Math.min(list.length, n);
+      for (let i = 0; i < limit; i++) {
+        if (list[i]?.gene) wanted.add(list[i].gene);
+      }
+    }
+
+    return Array.from(wanted);
   }
 
   /**

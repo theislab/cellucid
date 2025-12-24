@@ -1819,7 +1819,7 @@ details.form-section[open] > summary.section-title::after {
 /* ========================================================================= */
 
 .quick-insights-panel {
-  padding: 0;
+  /* Padding is provided by the surrounding accordion content. */
 }
 
 .quick-insights-empty,
@@ -2532,7 +2532,7 @@ details.form-section[open] > summary.section-title::after {
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  padding: var(--space-2) var(--space-2-5);
+  padding: var(--space-2) var(--space-3);
   background: transparent;
   border: none;
   cursor: pointer;
@@ -2655,7 +2655,7 @@ details.form-section[open] > summary.section-title::after {
 /* ========================================================================= */
 
 .analysis-window-panel > summary {
-  padding: var(--space-2) var(--space-2-5);
+  padding: var(--space-2) var(--space-3);
   font-family: inherit;
   font-weight: 400;
   font-size: var(--text-md);
@@ -3025,7 +3025,7 @@ details.form-section[open] > summary.section-title::after {
 /* ========================================================================= */
 
 .de-analysis-panel {
-  padding: var(--space-1) 0;
+  /* Padding is provided by the surrounding accordion content. */
 }
 
 .de-page-info {
@@ -3088,6 +3088,13 @@ details.form-section[open] > summary.section-title::after {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+/* Allow using `.page-comparison-row` without `.page-comparison-dropdown` wrapper
+   (e.g., Marker Genes mode + method selectors). */
+.page-comparison-row > .page-select {
+  flex: 1;
+  min-width: 120px;
 }
 
 .page-comparison-dropdown {
@@ -3182,7 +3189,7 @@ details.form-section[open] > summary.section-title::after {
 /* ========================================================================= */
 
 .gene-signature-panel {
-  padding: var(--space-1) 0;
+  /* Padding is provided by the surrounding accordion content. */
 }
 
 .gene-list-row {
@@ -3233,7 +3240,7 @@ details.form-section[open] > summary.section-title::after {
 /* ========================================================================= */
 
 .correlation-analysis-panel {
-  padding: 4px 0;
+  /* Padding is provided by the surrounding accordion content. */
 }
 
 /* Correlation Modal Options */

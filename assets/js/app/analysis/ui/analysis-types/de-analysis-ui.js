@@ -28,6 +28,7 @@ import {
 import { createPageComparisonSelector } from '../components/index.js';
 import { purgePlot } from '../../plots/plotly-loader.js';
 import { isFiniteNumber } from '../../shared/number-utils.js';
+import { ProgressTracker } from '../../shared/progress-tracker.js';
 
 /**
  * Differential Expression Analysis UI Component
@@ -45,9 +46,11 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
    */
   static getRequirements() {
     return {
-      minPages: 1,
+      // DE has its own internal page comparison selector; don't block rendering
+      // when the global page selection is empty.
+      minPages: 0,
       maxPages: null, // Allow any number of pages; user selects which 2 to compare
-      description: 'Select at least 1 page'
+      description: 'Select pages to compare'
     };
   }
 
@@ -64,10 +67,10 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
 
     /**
      * Modal-only UI state: how many DE genes to show in the annotations table.
-     * @type {'top10'|'all'}
+     * @type {'top5'|'top10'|'top20'|'top100'|'all'}
      * @private
      */
-    this._modalGeneListMode = 'top10';
+    this._modalGeneListMode = 'top5';
 
     /**
      * Incremented per modal-annotations render to cancel async chunk rendering.
@@ -78,6 +81,9 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
 
     // Bind handlers
     this._handleComparisonChange = this._handleComparisonChange.bind(this);
+
+    /** @type {ProgressTracker|null} */
+    this._progressTracker = null;
   }
 
   /**
@@ -204,7 +210,8 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       geneList: null, // Always test all genes; results are sorted so "top genes" naturally surface.
       method: formValues.method || 'wilcox',
       parallelism: formValues.parallelism,
-      batchConfig: formValues.batchConfig || {}
+      batchConfig: formValues.batchConfig || {},
+      onProgress: (progress) => this._updateProgress(progress)
     });
 
     // Use default thresholds - these can be adjusted dynamically in the results view
@@ -221,6 +228,108 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       title: 'Differential Expression',
       subtitle: `${deResults.metadata.pageAName} vs ${deResults.metadata.pageBName}`
     };
+  }
+
+  /**
+   * Override _runAnalysis to use the same progress bar UX as Marker Analysis.
+   * @override
+   */
+  async _runAnalysis() {
+    if (this._isDestroyed) return;
+
+    const formValues = this._getFormValues();
+    const validation = this._validateForm(formValues);
+    if (!validation.valid) {
+      this._notifications.error(validation.error || 'Invalid form values');
+      return;
+    }
+
+    if (this._isLoading) return;
+
+    const runBtn = this._formContainer?.querySelector('.analysis-run-btn');
+    const originalText = runBtn?.textContent;
+    if (runBtn) {
+      runBtn.disabled = true;
+      runBtn.textContent = 'Running...';
+    }
+    this._isLoading = true;
+
+    this._progressTracker = new ProgressTracker({
+      totalItems: 1,
+      phases: ['Loading & Computing', 'Multiple Testing Correction'],
+      title: 'Differential Expression',
+      category: 'calculation',
+      showNotification: true
+    });
+    this._progressTracker.start();
+
+    try {
+      const result = await this._runAnalysisImpl(formValues);
+      if (!result || this._isDestroyed) return;
+
+      this._progressTracker.complete('Differential expression complete');
+
+      this._lastResult = result;
+      this._currentPageData = result.data || result;
+      await this._showResult(result);
+
+      if (this.onResultChange) this.onResultChange(result);
+    } catch (error) {
+      console.error('[DEAnalysisUI] Analysis error:', error);
+      this._progressTracker?.fail(`Analysis failed: ${error.message}`);
+    } finally {
+      this._isLoading = false;
+      this._progressTracker = null;
+      if (runBtn) {
+        runBtn.disabled = false;
+        runBtn.textContent = originalText;
+      }
+    }
+  }
+
+  /**
+   * Keep the DE ProgressTracker in sync with MultiVariableAnalysis progress emissions.
+   * @private
+   * @param {{ phase?: string, progress?: number, loaded?: number, total?: number, message?: string }|number} progress
+   */
+  _updateProgress(progress) {
+    if (!this._progressTracker) return;
+
+    // Back-compat: older callers may pass a numeric percent.
+    if (Number.isFinite(progress)) {
+      this._progressTracker.setPhase('Loading & Computing');
+      this._progressTracker.setTotalItems(100);
+      this._progressTracker.setCompletedItems(Math.floor(progress));
+      return;
+    }
+
+    const { phase, progress: percent, loaded, total, message } = progress || {};
+
+    if (typeof phase === 'string' && phase.length > 0) {
+      const prevPhase = this._progressTracker.getStats()?.phase;
+      if (prevPhase !== phase) {
+        this._progressTracker.setPhase(phase);
+        this._progressTracker.setTotalItems(100);
+        this._progressTracker.setCompletedItems(0);
+      } else {
+        this._progressTracker.setPhase(phase);
+      }
+    }
+
+    if (Number.isFinite(total) && total > 0) {
+      this._progressTracker.setTotalItems(total);
+    }
+
+    if (Number.isFinite(loaded)) {
+      this._progressTracker.setCompletedItems(loaded);
+    } else if (Number.isFinite(percent)) {
+      if (!Number.isFinite(total) || total <= 0) this._progressTracker.setTotalItems(100);
+      this._progressTracker.setCompletedItems(Math.floor(percent));
+    }
+
+    if (message) {
+      this._progressTracker.setMessage(message);
+    }
   }
 
   // ===========================================================================
@@ -327,7 +436,6 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     const pLabel = useAdjustedPValue ? 'FDR' : 'p';
 
     container.innerHTML = `
-      <h5>Summary Statistics</h5>
       <table class="analysis-stats-table de-modal-stats">
         <tr>
           <td>Genes Tested</td>
@@ -371,8 +479,13 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       useAdjustedPValue = true
     } = options;
 
-    const geneListMode = this._modalGeneListMode || 'top10';
-    const maxRows = geneListMode === 'all' ? Infinity : 10;
+    const geneListMode = this._modalGeneListMode || 'top5';
+    const maxRows = geneListMode === 'all'
+      ? Infinity
+      : (geneListMode === 'top100' ? 100
+        : geneListMode === 'top20' ? 20
+          : geneListMode === 'top10' ? 10
+            : 5);
 
     const getPValue = (row) => {
       if (!row) return null;
@@ -422,12 +535,18 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     const select = document.createElement('select');
     select.className = 'obs-select';
     select.innerHTML = `
+      <option value="top5">Top 5</option>
       <option value="top10">Top 10</option>
+      <option value="top20">Top 20</option>
+      <option value="top100">Top 100</option>
       <option value="all">All</option>
     `;
     select.value = geneListMode;
     select.addEventListener('change', () => {
-      this._modalGeneListMode = select.value === 'all' ? 'all' : 'top10';
+      const value = select.value;
+      this._modalGeneListMode = (value === 'all' || value === 'top5' || value === 'top10' || value === 'top20' || value === 'top100')
+        ? value
+        : 'top5';
       this._renderModalAnnotations(container);
     });
     headerRow.appendChild(select);
@@ -562,7 +681,11 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     if (Array.isArray(settings.comparisonPages)) {
       this._comparisonPages = settings.comparisonPages.slice(0, 2);
     }
-    if (settings.modalGeneListMode === 'all' || settings.modalGeneListMode === 'top10') {
+    if (settings.modalGeneListMode === 'all' ||
+      settings.modalGeneListMode === 'top5' ||
+      settings.modalGeneListMode === 'top10' ||
+      settings.modalGeneListMode === 'top20' ||
+      settings.modalGeneListMode === 'top100') {
       this._modalGeneListMode = settings.modalGeneListMode;
     }
     super.importSettings(settings);

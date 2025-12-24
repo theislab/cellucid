@@ -275,7 +275,8 @@ export class MarkerDiscoveryEngine {
         (/* workerIndex */) => ({
           codes: new Uint16Array(obsCodes),
           codeToGroupIndex: new Int16Array(codeToGroupIndex),
-          groupCount
+          groupCount,
+          histBins: batchConfig?.wilcoxBins
         }),
         { timeout: 30000, signal }
       );
@@ -288,6 +289,17 @@ export class MarkerDiscoveryEngine {
       return arr;
     });
 
+    // Store full per-gene stats so UI can re-threshold without recomputing.
+    const log2FCByGroup = Array.from({ length: groupCount }, () => {
+      const arr = new Float32Array(geneCount);
+      arr.fill(NaN);
+      return arr;
+    });
+
+    const effectiveTopNPerGroup = topNPerGroup === 'all'
+      ? geneCount
+      : clampInt(Number(topNPerGroup), 1, geneCount);
+
     // Per-group Top-N heaps for progressive results.
     const heaps = Array.from({ length: groupCount }, () => {
       // "Worst" = higher p-value; tie-break: smaller |log2FC| is worse.
@@ -299,13 +311,14 @@ export class MarkerDiscoveryEngine {
         const fb = Math.abs(b.log2FoldChange || 0);
         return fa < fb;
       };
-      return new TopNHeap(topNPerGroup, isWorse);
+      return new TopNHeap(effectiveTopNPerGroup, isWorse);
     });
 
     const effectiveBatchConfig = {
       preloadCount: batchConfig.preloadCount ?? this._config.batchSize,
       networkConcurrency: batchConfig.networkConcurrency ?? this._config.networkConcurrency,
-      memoryBudgetMB: batchConfig.memoryBudgetMB ?? this._config.memoryBudgetMB
+      memoryBudgetMB: batchConfig.memoryBudgetMB ?? this._config.memoryBudgetMB,
+      wilcoxBins: batchConfig.wilcoxBins
     };
 
     // Choose bounded concurrency for worker compute.
@@ -403,6 +416,7 @@ export class MarkerDiscoveryEngine {
               geneIndex,
               groups,
               pValuesByGroup,
+              log2FCByGroup,
               heaps,
               result: res
             });
@@ -419,6 +433,7 @@ export class MarkerDiscoveryEngine {
               geneIndex,
               groups,
               pValuesByGroup,
+              log2FCByGroup,
               heaps,
               result: res
             });
@@ -479,7 +494,14 @@ export class MarkerDiscoveryEngine {
       computedAt: Date.now(),
       computeDuration: duration,
       geneCount,
-      groups: finalGroups
+      groups: finalGroups,
+      stats: {
+        genes: allGenes,
+        groupIds: groups.map(g => g.groupId),
+        pValuesByGroup,
+        adjustedPValuesByGroup: adjustedByGroup,
+        log2FoldChangeByGroup: log2FCByGroup
+      }
     };
   }
 
@@ -510,7 +532,7 @@ export class MarkerDiscoveryEngine {
     }
   }
 
-  _ingestGeneResult({ gene, geneIndex, groups, pValuesByGroup, heaps, result }) {
+  _ingestGeneResult({ gene, geneIndex, groups, pValuesByGroup, log2FCByGroup, heaps, result }) {
     const { pValues, log2FoldChange, meanInGroup, meanOutGroup, percentInGroup, percentOutGroup, nIn, nOut } = result || {};
     if (!pValues || !log2FoldChange) return;
 
@@ -523,6 +545,9 @@ export class MarkerDiscoveryEngine {
       if (!Number.isFinite(p)) continue;
       const fc = log2FoldChange[g];
       if (!Number.isFinite(fc)) continue;
+      if (log2FCByGroup && Number.isFinite(geneIndex) && geneIndex >= 0 && geneIndex < log2FCByGroup[g].length) {
+        log2FCByGroup[g][geneIndex] = fc;
+      }
 
       heaps[g].push({
         gene,

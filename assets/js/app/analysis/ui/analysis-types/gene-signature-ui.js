@@ -166,9 +166,11 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
    */
   static getRequirements() {
     return {
-      minPages: 1,
+      // Gene Signature has its own internal page selector; don't block rendering
+      // when the global page selection is empty.
+      minPages: 0,
       maxPages: null, // No limit
-      description: 'Select at least 1 page'
+      description: 'Select pages to analyze'
     };
   }
 
@@ -553,6 +555,16 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
         plotContainer.appendChild(errorEl);
       }
     }
+
+    // Expand (modal) action - consistent with DE mode
+    const actionsContainer = document.createElement('div');
+    actionsContainer.className = 'analysis-actions';
+    actionsContainer.style.display = 'flex';
+
+    const expandBtn = this._createExpandButton();
+    expandBtn.title = 'Open in full view with statistics and export options';
+    actionsContainer.appendChild(expandBtn);
+    this._resultContainer.appendChild(actionsContainer);
   }
 
   // ===========================================================================

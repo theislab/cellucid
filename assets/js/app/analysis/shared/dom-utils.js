@@ -624,26 +624,15 @@ export function createPerformanceSettings(options) {
     ]);
     content.appendChild(createFormRow('Compute parallelism:', parallelismSelect));
 
-    // Dataset info display
-    const infoDiv = document.createElement('div');
-    infoDiv.className = 'analysis-perf-info';
-    const datasetStrong = document.createElement('strong');
-    datasetStrong.textContent = 'Dataset:';
-    infoDiv.appendChild(datasetStrong);
-    infoDiv.appendChild(document.createTextNode(` ${(pointCount / 1000).toFixed(0)}K cells × ${geneCount.toLocaleString()} genes`));
-    infoDiv.appendChild(document.createElement('br'));
+    const wilcoxBinsSelect = createFormSelect('wilcoxBins', [
+      { value: '64', label: '64 bins', description: 'Lower memory, coarser Wilcoxon approximation.' },
+      { value: '128', label: '128 bins', description: 'Default balance of accuracy and speed.', selected: true },
+      { value: '256', label: '256 bins', description: 'More accurate, slightly more memory.' },
+      { value: '512', label: '512 bins', description: 'Most accurate approximation, more memory.' }
+    ]);
+    content.appendChild(createFormRow('Wilcoxon bins:', wilcoxBinsSelect));
 
-    const dataStrong = document.createElement('strong');
-    dataStrong.textContent = 'Est. data:';
-    infoDiv.appendChild(dataStrong);
-    infoDiv.appendChild(document.createTextNode(` ~${dataInfo.totalDataMB.toFixed(0)} MB total`));
-    infoDiv.appendChild(document.createElement('br'));
-
-    const timeStrong = document.createElement('strong');
-    timeStrong.textContent = 'Est. time:';
-    infoDiv.appendChild(timeStrong);
-    infoDiv.appendChild(document.createTextNode(` ~${dataInfo.estimatedTimeFormatted}`));
-    content.appendChild(infoDiv);
+    // Dataset info display intentionally omitted (too verbose for the UI).
   });
 
   // Toggle functionality
@@ -673,13 +662,15 @@ export function getPerformanceFormValues(formContainer) {
   const batchSizeRaw = getValue('batchSize');
   const memoryBudgetRaw = getValue('memoryBudget');
   const networkConcurrencyRaw = getValue('networkConcurrency');
+  const wilcoxBinsRaw = getValue('wilcoxBins');
 
   return {
     parallelism: parallelismRaw === 'auto' ? 'auto' : parseInt(parallelismRaw, 10),
     batchConfig: {
       preloadCount: batchSizeRaw ? parseInt(batchSizeRaw, 10) : undefined,
       memoryBudgetMB: memoryBudgetRaw ? parseInt(memoryBudgetRaw, 10) : undefined,
-      networkConcurrency: networkConcurrencyRaw ? parseInt(networkConcurrencyRaw, 10) : undefined
+      networkConcurrency: networkConcurrencyRaw ? parseInt(networkConcurrencyRaw, 10) : undefined,
+      wilcoxBins: wilcoxBinsRaw ? parseInt(wilcoxBinsRaw, 10) : undefined
     }
   };
 }

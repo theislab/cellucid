@@ -33,15 +33,9 @@ import { purgePlot } from '../../plots/plotly-loader.js';
 import { downloadCSV } from '../../shared/analysis-utils.js';
 import {
   DEFAULTS,
-  TOP_N_OPTIONS,
-  METHOD_OPTIONS,
-  TRANSFORM_OPTIONS,
-  COLORSCALE_OPTIONS,
   DISTANCE_OPTIONS,
   LINKAGE_OPTIONS,
   MODE_OPTIONS,
-  P_VALUE_THRESHOLDS,
-  FOLD_CHANGE_THRESHOLDS,
   ANALYSIS_PHASES
 } from '../../genes-panel/constants.js';
 
@@ -61,7 +55,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
    */
   static getRequirements() {
     return {
-      minPages: 1,
+      minPages: 0,
       maxPages: null,
       description: 'Discover and visualize marker genes across cell groups'
     };
@@ -96,10 +90,10 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
 
     /**
      * Modal-only UI state: how many markers to show in the table.
-     * @type {'top10'|'top20'|'all'}
+     * @type {'top5'|'top10'|'top20'|'top100'|'all'}
      * @private
      */
-    this._modalGeneListMode = 'top10';
+    this._modalGeneListMode = 'top5';
 
     /**
      * Incremented per modal-annotations render to cancel async chunk rendering.
@@ -107,6 +101,9 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
      * @private
      */
     this._modalAnnotationsRenderRevision = 0;
+
+    /** @type {any|null} Full (unsliced) heatmap matrix from last run */
+    this._fullMatrix = null;
 
     // Bind methods
     this._handleModeChange = this._handleModeChange.bind(this);
@@ -169,9 +166,17 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     // Category selection
     const categorySelectEl = createFormSelect('obsCategory', categoryOptions);
     const categoryRow = createFormRow('Group By:', categorySelectEl, {
-      description: 'Select a categorical observation field'
+      description: ''
     });
     form.appendChild(categoryRow);
+
+    // Use cache (placed next to Group By as it affects data loading)
+    const useCacheCheckbox = createFormCheckbox({
+      label: 'Use cached results',
+      name: 'useCache',
+      checked: true
+    });
+    form.appendChild(useCacheCheckbox);
 
     // Mode selection - using positional API with onChange for reliability
     const modeSelectEl = createFormSelect('mode', MODE_OPTIONS.map(o => ({
@@ -180,9 +185,20 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       description: o.description,
       selected: o.value === 'clustered'
     })), { onChange: this._handleModeChange });
-    const modeRow = createFormRow('Mode:', modeSelectEl, {
-      description: 'How to select and display genes'
-    });
+    // Statistical method selector (placed next to Mode; thresholds are adjusted in the figure modal)
+    const methodSelectEl = createFormSelect('method', [
+      { value: 'wilcox', label: 'Wilcoxon', description: 'Rank-based test, robust to outliers and non-normal distributions.', selected: true },
+      { value: 'ttest', label: 't-test', description: 'Parametric test, assumes normally distributed expression data.' }
+    ]);
+
+    const modeAndMethod = document.createElement('div');
+    modeAndMethod.className = 'page-comparison-row';
+    modeSelectEl.classList.add('page-select');
+    methodSelectEl.classList.add('page-select');
+    modeAndMethod.appendChild(modeSelectEl);
+    modeAndMethod.appendChild(methodSelectEl);
+
+    const modeRow = createFormRow('Mode:', modeAndMethod, { description: '' });
     form.appendChild(modeRow);
 
     // Custom genes input (hidden by default)
@@ -201,94 +217,6 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     customGenesGroup.appendChild(customGenesTextarea);
     this._customGenesInput = customGenesTextarea;
     form.appendChild(customGenesGroup);
-
-    // Discovery parameters section (collapsible, open by default)
-    const { container: discoverySection, content: discoveryContent } = this._createCollapsibleSection({
-      title: 'Discovery Parameters',
-      className: 'discovery-params',
-      expanded: true
-    });
-
-    // Top N genes
-    const topNSelectEl = createFormSelect('topNPerGroup', TOP_N_OPTIONS.map(o => ({
-      value: o.value,
-      label: o.label,
-      description: o.description,
-      selected: o.selected
-    })));
-    discoveryContent.appendChild(createFormRow('Top Genes per Group:', topNSelectEl));
-
-    // Statistical method
-    const methodSelectEl = createFormSelect('method', METHOD_OPTIONS.map(o => ({
-      value: o.value,
-      label: o.label,
-      description: o.description,
-      selected: o.selected
-    })));
-    discoveryContent.appendChild(createFormRow('Statistical Method:', methodSelectEl));
-
-    // P-value threshold
-    const pValueSelectEl = createFormSelect('pValueThreshold', P_VALUE_THRESHOLDS.map(o => ({
-      value: o.value,
-      label: o.label,
-      description: o.description,
-      selected: o.selected
-    })));
-    discoveryContent.appendChild(createFormRow('P-value Threshold:', pValueSelectEl));
-
-    // Fold change threshold
-    const fcSelectEl = createFormSelect('foldChangeThreshold', FOLD_CHANGE_THRESHOLDS.map(o => ({
-      value: o.value,
-      label: o.label,
-      description: o.description,
-      selected: o.selected
-    })));
-    discoveryContent.appendChild(createFormRow('Log2 FC Threshold:', fcSelectEl));
-
-    // Use adjusted p-value
-    const useAdjustedCheckbox = createFormCheckbox({
-      label: 'Use FDR-corrected p-values',
-      name: 'useAdjustedPValue',
-      checked: DEFAULTS.useAdjustedPValue
-    });
-    discoveryContent.appendChild(useAdjustedCheckbox);
-
-    // Use cache
-    const useCacheCheckbox = createFormCheckbox({
-      label: 'Use cached results',
-      name: 'useCache',
-      checked: true
-    });
-    discoveryContent.appendChild(useCacheCheckbox);
-
-    form.appendChild(discoverySection);
-
-    // Visualization section (collapsible, closed by default as detailed settings)
-    const { container: vizSection, content: vizContent } = this._createCollapsibleSection({
-      title: 'Visualization',
-      className: 'viz-params',
-      expanded: false
-    });
-
-    // Transform
-    const transformSelectEl = createFormSelect('transform', TRANSFORM_OPTIONS.map(o => ({
-      value: o.value,
-      label: o.label,
-      description: o.description,
-      selected: o.selected
-    })));
-    vizContent.appendChild(createFormRow('Transform:', transformSelectEl));
-
-    // Colorscale
-    const colorscaleSelectEl = createFormSelect('colorscale', COLORSCALE_OPTIONS.map(o => ({
-      value: o.value,
-      label: o.label,
-      description: o.description,
-      selected: o.selected
-    })));
-    vizContent.appendChild(createFormRow('Color Scale:', colorscaleSelectEl));
-
-    form.appendChild(vizSection);
 
     // Clustering section (collapsible, closed by default as detailed settings, hidden when mode='ranked')
     const { container: clusterSection, content: clusterContent } = this._createCollapsibleSection({
@@ -363,17 +291,18 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     const values = {
       obsCategory: getValue('obsCategory'),
       mode: getValue('mode'),
-      topNPerGroup: parseInt(getValue('topNPerGroup'), 10) || DEFAULTS.topNPerGroup,
+      topNPerGroup: 'all',
       method: getValue('method') || DEFAULTS.method,
-      pValueThreshold: parseFloat(getValue('pValueThreshold')) || DEFAULTS.pValueThreshold,
-      foldChangeThreshold: parseFloat(getValue('foldChangeThreshold')) || DEFAULTS.foldChangeThreshold,
-      transform: getValue('transform') || DEFAULTS.transform,
-      colorscale: getValue('colorscale') || DEFAULTS.colorscale,
+      // Thresholds are adjusted dynamically in the figure modal; keep defaults for initial run.
+      pValueThreshold: DEFAULTS.pValueThreshold,
+      foldChangeThreshold: DEFAULTS.foldChangeThreshold,
+      transform: DEFAULTS.transform,
+      colorscale: DEFAULTS.colorscale,
       distance: getValue('distance') || DEFAULTS.distance,
       linkage: getValue('linkage') || DEFAULTS.linkage,
       clusterRows: getValue('clusterRows'),
       clusterCols: getValue('clusterCols'),
-      useAdjustedPValue: getValue('useAdjustedPValue'),
+      useAdjustedPValue: DEFAULTS.useAdjustedPValue,
       useCache: getValue('useCache'),
       // Performance settings (shared with DE analysis)
       ...getPerformanceFormValues(form)
@@ -495,27 +424,25 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       }
     });
 
-    // Ranked mode is markers-only (no heatmap)
-    if (formValues.mode === 'ranked') {
-      return {
-        type: 'genes_panel',
-        plotType: null,
-        data: null,
-        options: {},
-        title: 'Marker Genes',
-        subtitle: formValues.obsCategory,
-        markers: panelResult.markers,
-        clustering: panelResult.clustering,
-        metadata: panelResult.metadata
-      };
-    }
+    // Cache the full matrix so we can re-slice it when the modal "Top N" changes.
+    this._fullMatrix = panelResult.matrix || null;
+
+    const displayMatrix = this._buildHeatmapMatrixForMode({
+      matrix: panelResult.matrix,
+      markers: panelResult.markers,
+      mode: this._modalGeneListMode
+    });
 
     // Clustered/custom mode: render heatmap
     return {
       type: 'genes_panel',
       plotType: 'gene-heatmap',
-      data: { matrix: panelResult.matrix },
+      data: { matrix: displayMatrix, clustering: panelResult.clustering },
       options: {
+        pValueThreshold: formValues.pValueThreshold,
+        foldChangeThreshold: formValues.foldChangeThreshold,
+        useAdjustedPValue: formValues.useAdjustedPValue,
+        hasClustering: !!panelResult.clustering,
         colorscale: formValues.colorscale,
         showValues: false,
         reverseColorscale: true
@@ -525,6 +452,29 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       markers: panelResult.markers,
       clustering: panelResult.clustering,
       metadata: panelResult.metadata
+    };
+  }
+
+  _handlePlotOptionChange(key, value) {
+    super._handlePlotOptionChange(key, value);
+
+    if (key === 'pValueThreshold' || key === 'foldChangeThreshold' || key === 'useAdjustedPValue') {
+      const revision = this._optionRenderRevision;
+      void this._refreshMarkersAndHeatmapFromThresholds(revision);
+    }
+
+    if (key === 'transform') {
+      const revision = this._optionRenderRevision;
+      void this._refreshHeatmapTransform(revision, value);
+    }
+  }
+
+  _getMarkerThresholdOptions() {
+    const opts = this._lastResult?.options || {};
+    return {
+      pValueThreshold: Number.isFinite(opts.pValueThreshold) ? opts.pValueThreshold : DEFAULTS.pValueThreshold,
+      foldChangeThreshold: Number.isFinite(opts.foldChangeThreshold) ? opts.foldChangeThreshold : DEFAULTS.foldChangeThreshold,
+      useAdjustedPValue: opts.useAdjustedPValue !== false
     };
   }
 
@@ -818,44 +768,33 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     const { metadata } = this._lastResult;
     container.innerHTML = '';
 
-    const section = document.createElement('div');
-    section.className = 'modal-stats-section';
+    const table = document.createElement('table');
+    table.className = 'analysis-stats-table';
 
-    const title = document.createElement('h4');
-    title.textContent = 'Analysis Summary';
-    section.appendChild(title);
+    const tbody = document.createElement('tbody');
+    table.appendChild(tbody);
 
-    const grid = document.createElement('div');
-    grid.className = 'stats-grid';
-
-    const addStat = (label, value) => {
-      const item = document.createElement('div');
-      item.className = 'stat-item';
-
-      const labelEl = document.createElement('span');
-      labelEl.className = 'stat-label';
-      labelEl.textContent = label;
-
-      const valueEl = document.createElement('span');
-      valueEl.className = 'stat-value';
-      valueEl.textContent = value;
-
-      item.appendChild(labelEl);
-      item.appendChild(valueEl);
-      grid.appendChild(item);
+    const addRow = (label, value) => {
+      const tr = document.createElement('tr');
+      const tdLabel = document.createElement('td');
+      tdLabel.textContent = label;
+      const tdValue = document.createElement('td');
+      tdValue.innerHTML = `<strong>${value}</strong>`;
+      tr.appendChild(tdLabel);
+      tr.appendChild(tdValue);
+      tbody.appendChild(tr);
     };
 
-    addStat('Category:', String(metadata.obsCategory || 'N/A'));
-    addStat('Mode:', String(metadata.mode || 'N/A'));
-    addStat('Method:', String(metadata.method || 'N/A'));
-    addStat('Groups:', Number.isFinite(metadata.groupCount) ? String(metadata.groupCount) : String(metadata.groupCount || 'N/A'));
-    addStat('Genes:', Number.isFinite(metadata.geneCount) ? String(metadata.geneCount) : String(metadata.geneCount || 'N/A'));
+    addRow('Category', String(metadata.obsCategory || 'N/A'));
+    addRow('Mode', String(metadata.mode || 'N/A'));
+    addRow('Method', String(metadata.method || 'N/A'));
+    addRow('Groups', Number.isFinite(metadata.groupCount) ? String(metadata.groupCount) : String(metadata.groupCount || 'N/A'));
+    addRow('Genes', Number.isFinite(metadata.geneCount) ? String(metadata.geneCount) : String(metadata.geneCount || 'N/A'));
 
     const durationSec = Number.isFinite(metadata.duration) ? (metadata.duration / 1000).toFixed(1) : null;
-    addStat('Duration:', durationSec ? `${durationSec}s` : 'N/A');
+    addRow('Duration', durationSec ? `${durationSec}s` : 'N/A');
 
-    section.appendChild(grid);
-    container.appendChild(section);
+    container.appendChild(table);
   }
 
   /**
@@ -921,15 +860,20 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     const topSelect = document.createElement('select');
     topSelect.className = 'obs-select';
     topSelect.innerHTML = `
+      <option value="top5">Top 5</option>
       <option value="top10">Top 10</option>
       <option value="top20">Top 20</option>
+      <option value="top100">Top 100</option>
       <option value="all">All</option>
     `;
     topSelect.value = this._modalGeneListMode;
     topSelect.addEventListener('change', () => {
       const v = topSelect.value;
-      this._modalGeneListMode = (v === 'all' || v === 'top20') ? v : 'top10';
+      this._modalGeneListMode = (v === 'all' || v === 'top5' || v === 'top10' || v === 'top20' || v === 'top100')
+        ? v
+        : 'top5';
       this._renderModalAnnotations(container);
+      this._rerenderHeatmapForModalSelection();
     });
     headerRow.appendChild(topSelect);
 
@@ -958,7 +902,10 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
 
     const maxRows = this._modalGeneListMode === 'all'
       ? Infinity
-      : (this._modalGeneListMode === 'top20' ? 20 : 10);
+      : (this._modalGeneListMode === 'top100' ? 100
+        : this._modalGeneListMode === 'top20' ? 20
+          : this._modalGeneListMode === 'top10' ? 10
+            : 5);
 
     const genesToShow = Number.isFinite(maxRows) ? markers.slice(0, maxRows) : markers;
 
@@ -1025,6 +972,264 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     };
 
     renderChunk();
+  }
+
+  _getTopNFromMode(mode) {
+    if (mode === 'all') return Infinity;
+    if (mode === 'top100') return 100;
+    if (mode === 'top20') return 20;
+    if (mode === 'top10') return 10;
+    return 5;
+  }
+
+  _computeTopMarkersForGroupIndex({
+    groupId,
+    geneKeys,
+    pValuesEffective,
+    pValuesRaw,
+    adjPValues,
+    log2FC,
+    topN,
+    pValueThreshold,
+    foldChangeThreshold
+  }) {
+    const out = [];
+    const n = geneKeys.length;
+    if (!pValuesEffective || !log2FC) return out;
+
+    for (let i = 0; i < n; i++) {
+      const p = pValuesEffective[i];
+      const fc = log2FC[i];
+      if (!Number.isFinite(p) || p >= pValueThreshold) continue;
+      if (!Number.isFinite(fc) || Math.abs(fc) < foldChangeThreshold) continue;
+
+      out.push({
+        gene: geneKeys[i],
+        geneIndex: i,
+        groupId,
+        pValue: Number.isFinite(pValuesRaw?.[i]) ? pValuesRaw[i] : p,
+        adjustedPValue: Number.isFinite(adjPValues?.[i]) ? adjPValues[i] : null,
+        log2FoldChange: fc
+      });
+    }
+
+    out.sort((a, b) => {
+      const pa = Number.isFinite(a.adjustedPValue) ? a.adjustedPValue : (Number.isFinite(a.pValue) ? a.pValue : 1);
+      const pb = Number.isFinite(b.adjustedPValue) ? b.adjustedPValue : (Number.isFinite(b.pValue) ? b.pValue : 1);
+      if (pa !== pb) return pa - pb;
+      return Math.abs(b.log2FoldChange) - Math.abs(a.log2FoldChange);
+    });
+
+    return out.slice(0, Math.min(out.length, topN));
+  }
+
+  _rebuildMarkerGroupsFromStats({ markers, topN }) {
+    const stats = markers?.stats;
+    if (!stats?.genes || !stats.groupIds || !stats.pValuesByGroup || !stats.log2FoldChangeByGroup) return null;
+
+    const { pValueThreshold, foldChangeThreshold, useAdjustedPValue } = this._getMarkerThresholdOptions();
+
+    /** @type {Record<string, any>} */
+    const nextGroups = {};
+    for (let g = 0; g < stats.groupIds.length; g++) {
+      const groupId = stats.groupIds[g];
+      const pEff = useAdjustedPValue ? stats.adjustedPValuesByGroup?.[g] : stats.pValuesByGroup[g];
+      const picked = this._computeTopMarkersForGroupIndex({
+        groupId,
+        geneKeys: stats.genes,
+        pValuesEffective: pEff,
+        pValuesRaw: stats.pValuesByGroup[g],
+        adjPValues: stats.adjustedPValuesByGroup?.[g],
+        log2FC: stats.log2FoldChangeByGroup[g],
+        topN: Number.isFinite(topN) ? topN : stats.genes.length,
+        pValueThreshold,
+        foldChangeThreshold
+      });
+
+      nextGroups[groupId] = {
+        ...(markers.groups?.[groupId] || {}),
+        groupId,
+        markers: picked.map((m, i) => ({ ...m, rank: i + 1 }))
+      };
+    }
+
+    return nextGroups;
+  }
+
+  _computeHeatmapGeneSet({ markers, topN }) {
+    const nextGroups = this._rebuildMarkerGroupsFromStats({ markers, topN });
+    const groups = nextGroups || markers?.groups || {};
+
+    const wanted = new Set();
+    for (const group of Object.values(groups)) {
+      const list = group?.markers || [];
+      const limit = Math.min(list.length, topN);
+      for (let i = 0; i < limit; i++) {
+        if (list[i]?.gene) wanted.add(list[i].gene);
+      }
+    }
+    return wanted;
+  }
+
+  _buildHeatmapMatrixForMode({ matrix, markers, mode }) {
+    if (!matrix || !markers) return matrix;
+
+    const topN = this._getTopNFromMode(mode);
+    if (!Number.isFinite(topN)) return matrix;
+
+    const wanted = this._computeHeatmapGeneSet({ markers, topN });
+
+    if (wanted.size === 0) return matrix;
+
+    const genes = matrix.genes || [];
+    const keepRows = [];
+    for (let i = 0; i < genes.length; i++) {
+      if (wanted.has(genes[i])) keepRows.push(i);
+    }
+
+    if (keepRows.length === 0 || keepRows.length === genes.length) return matrix;
+
+    const nCols = matrix.nCols || (matrix.groupIds?.length || 0);
+    const nRows = keepRows.length;
+    const outValues = new Float32Array(nRows * nCols);
+    outValues.fill(NaN);
+    const outRaw = matrix.rawValues ? new Float32Array(nRows * nCols) : null;
+
+    for (let r = 0; r < nRows; r++) {
+      const srcRow = keepRows[r];
+      const srcOffset = srcRow * nCols;
+      const dstOffset = r * nCols;
+      for (let c = 0; c < nCols; c++) {
+        outValues[dstOffset + c] = matrix.values[srcOffset + c];
+        if (outRaw && matrix.rawValues) {
+          outRaw[dstOffset + c] = matrix.rawValues[srcOffset + c];
+        }
+      }
+    }
+
+    const out = {
+      ...matrix,
+      genes: keepRows.map(i => genes[i]),
+      values: outValues,
+      rawValues: outRaw,
+      nRows
+    };
+
+    return out;
+  }
+
+  async _rerenderHeatmapForModalSelection() {
+    if (!this._lastResult?.plotType || this._lastResult.plotType !== 'gene-heatmap') return;
+    if (!this._fullMatrix || !this._lastResult.markers) return;
+
+    // Update marker lists to match current threshold options.
+    const topN = this._getTopNFromMode(this._modalGeneListMode);
+    const rebuilt = this._rebuildMarkerGroupsFromStats({ markers: this._lastResult.markers, topN });
+    if (rebuilt) {
+      this._lastResult.markers.groups = rebuilt;
+    }
+
+    const nextMatrix = this._buildHeatmapMatrixForMode({
+      matrix: this._fullMatrix,
+      markers: this._lastResult.markers,
+      mode: this._modalGeneListMode
+    });
+
+    // Update the cached result and re-render preview plot.
+    const clustering = this._lastResult.data?.clustering || this._lastResult.clustering || null;
+    this._lastResult.data = { matrix: nextMatrix, clustering };
+    if (this._lastResult.options) this._lastResult.options.hasClustering = !!clustering;
+    const revision = ++this._optionRenderRevision;
+    void this._rerenderAfterOptionChange(revision);
+  }
+
+  async _refreshMarkersAndHeatmapFromThresholds(revision) {
+    if (this._isDestroyed) return;
+    if (revision !== this._optionRenderRevision) return;
+    if (!this._lastResult?.markers) return;
+
+    const topN = this._getTopNFromMode(this._modalGeneListMode);
+    const rebuilt = this._rebuildMarkerGroupsFromStats({ markers: this._lastResult.markers, topN });
+    if (rebuilt) {
+      this._lastResult.markers.groups = rebuilt;
+    }
+
+    // Compute desired gene set for heatmap.
+    const wanted = Array.from(this._computeHeatmapGeneSet({ markers: this._lastResult.markers, topN }))
+      .filter(Boolean);
+
+    if (wanted.length === 0) {
+      return;
+    }
+
+    // If the gene set is fully covered by the current matrix, slice locally.
+    const current = this._fullMatrix;
+    const geneSet = new Set(current?.genes || []);
+    const canSlice = current && current.values && wanted.every(g => geneSet.has(g));
+
+    let nextMatrix;
+    if (canSlice) {
+      nextMatrix = this._buildHeatmapMatrixForMode({
+        matrix: current,
+        markers: this._lastResult.markers,
+        mode: this._modalGeneListMode
+      });
+    } else {
+      // Rebuild matrix for the new gene set (no re-run of marker discovery).
+      const obsCategory = this._lastResult.metadata?.obsCategory;
+      if (!obsCategory || !this._controller) return;
+
+      const { groups } = await this._controller.getGroupsAndCodes(obsCategory, {});
+      if (this._isDestroyed) return;
+      if (revision !== this._optionRenderRevision) return;
+
+      nextMatrix = await this._controller.buildMatrixForGenes({
+        genes: wanted,
+        groups,
+        transform: this._lastResult.metadata?.transform || DEFAULTS.transform,
+        batchConfig: this._lastResult.metadata?.batchConfig || {},
+        onProgress: null
+      });
+      this._fullMatrix = nextMatrix;
+    }
+
+    const clustering = this._lastResult.data?.clustering || this._lastResult.clustering || null;
+    this._lastResult.data = { matrix: nextMatrix, clustering };
+    if (this._lastResult.options) this._lastResult.options.hasClustering = !!clustering;
+    const nextRevision = ++this._optionRenderRevision;
+    void this._rerenderAfterOptionChange(nextRevision);
+  }
+
+  async _refreshHeatmapTransform(revision, transform) {
+    if (this._isDestroyed) return;
+    if (revision !== this._optionRenderRevision) return;
+    if (!this._controller || !this._fullMatrix) return;
+
+    // Re-transform the full matrix (preserves rawValues so repeated toggles work).
+    const wrapper = { matrix: this._fullMatrix };
+    const transformed = this._controller.retransform(wrapper, transform)?.matrix || null;
+    if (!transformed) return;
+
+    this._fullMatrix = transformed;
+    if (this._lastResult?.metadata) {
+      this._lastResult.metadata.transform = transform;
+    }
+
+    const nextMatrix = this._buildHeatmapMatrixForMode({
+      matrix: this._fullMatrix,
+      markers: this._lastResult?.markers,
+      mode: this._modalGeneListMode
+    });
+
+    const clustering = this._lastResult?.data?.clustering || this._lastResult?.clustering || null;
+    if (this._lastResult) {
+      if (!this._lastResult.options) this._lastResult.options = {};
+      this._lastResult.options.transform = transform;
+      this._lastResult.data = { matrix: nextMatrix, clustering };
+    }
+
+    const nextRevision = ++this._optionRenderRevision;
+    void this._rerenderAfterOptionChange(nextRevision);
   }
 
   // ===========================================================================

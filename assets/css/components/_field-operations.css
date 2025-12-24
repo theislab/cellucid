@@ -679,6 +679,8 @@
   font-size: var(--text-xs);
   text-transform: uppercase;
   letter-spacing: var(--tracking-wider);
+  line-height: 1;
+  white-space: nowrap;
   border-radius: var(--radius-full);
   padding: var(--space-1-5) var(--space-2-5);
   border: var(--border-strong);

@@ -20,6 +20,8 @@ import { ProgressTracker } from '../shared/progress-tracker.js';
 import { isFiniteNumber, mean } from '../shared/number-utils.js';
 import { startMemoryTracking } from '../shared/memory-tracker.js';
 import { bestEffortCleanupAnalysisResources } from '../shared/resource-cleanup.js';
+import { getWorkerPool } from '../compute/worker-pool.js';
+import { buildDEObsCodes } from './de-adapter.js';
 
 /**
  * Multi-Variable Analysis class
@@ -377,14 +379,25 @@ export class MultiVariableAnalysis {
       cells: pointCount
     });
 
-    // Create progress tracker with ETA
+    // Create progress tracker with ETA.
+    // UI layers (e.g., DEAnalysisUI) may create their own ProgressTracker to
+    // unify progress UX across analysis types, so keep this tracker silent.
     const progressTracker = new ProgressTracker({
       totalItems: genesToTest.length,
       title: 'Differential Expression',
       phases: ['Loading & Computing', 'Multiple Testing Correction'],
+      showNotification: false,
       onUpdate: (stats) => {
         if (onProgress) {
-          onProgress(stats.progress);
+          onProgress({
+            phase: stats.phase,
+            progress: stats.progress,
+            loaded: stats.completed,
+            total: stats.total,
+            message: stats.phaseIndex === 0
+              ? `Analyzing genes (${stats.completed.toLocaleString()}/${stats.total.toLocaleString()})`
+              : 'Applying multiple testing correction...'
+          });
         }
       }
     });
@@ -438,36 +451,26 @@ export class MultiVariableAnalysis {
         `${pageAInfo.name} (${groupASize?.toLocaleString() ?? '—'}) vs ${pageBInfo.name} (${groupBSize?.toLocaleString() ?? '—'})`
       );
 
-      // Compute differential expression for each gene
-      computeManager = await this._getComputeManager();
-      didStartHeavyCompute = true;
+      // Prefer marker-style worker backend when workers are available:
+      // - Stream raw gene vectors once
+      // - Broadcast group membership context once per run
+      // - Compute DE per gene inside workers (no main-thread gather/gatherComplement)
+      const pool = getWorkerPool();
+      await pool.init();
+      const markerStyleAvailable = pool.isReady?.() === true;
 
-      const workerPoolSize = computeManager.getStatus?.().worker?.stats?.poolSize || 1;
-      const workersAvailable = typeof computeManager.isWorkerAvailable === 'function'
-        ? computeManager.isWorkerAvailable()
-        : false;
+      // Calculate max in-flight computations based on memory and worker pool size.
+      // This is intentionally aligned with marker discovery semantics: we copy a full
+      // per-cell gene vector per in-flight task.
+      const poolSize = pool.getStats?.()?.poolSize || 1;
+      const requested = parallelism === 'auto' ? poolSize : Number(parallelism);
+      let maxInFlightGenes = Number.isFinite(requested) && requested > 0 ? Math.floor(requested) : 1;
 
-      // Calculate max in-flight computations based on memory and workers
-      const groupTotalSize = Number.isFinite(groupASize) && Number.isFinite(groupBSize)
-        ? groupASize + groupBSize
-        : null;
+      const bytesPerGene = pointCount * 4 * (method === 'wilcox' ? 2 : 1);
+      const budget = effectiveBatchConfig.memoryBudgetMB * 1024 * 1024;
+      const maxByMemory = Math.max(1, Math.floor(budget / Math.max(1, bytesPerGene)));
 
-      let maxInFlightGenes = 1;
-      if (workersAvailable && workerPoolSize > 0) {
-        const requested = parallelism === 'auto' ? workerPoolSize : Number(parallelism);
-        maxInFlightGenes = Number.isFinite(requested) && requested > 0 ? Math.floor(requested) : 1;
-
-        if (Number.isFinite(groupTotalSize) && groupTotalSize > 0) {
-          const baseBytes = groupTotalSize * 4;
-          const overheadFactor = method === 'wilcox' ? 5 : 2;
-          const estimatedBytesPerGene = baseBytes * overheadFactor;
-          const budget = effectiveBatchConfig.memoryBudgetMB * 1024 * 1024;
-          const maxByMemory = Math.max(1, Math.floor(budget / Math.max(1, estimatedBytesPerGene)));
-          maxInFlightGenes = Math.min(maxInFlightGenes, maxByMemory);
-        }
-
-        maxInFlightGenes = Math.max(1, Math.min(maxInFlightGenes, workerPoolSize, 8));
-      }
+      maxInFlightGenes = Math.max(1, Math.min(maxInFlightGenes, maxByMemory, poolSize, 8));
 
       // Create streaming gene loader with optimized prefetching
       const geneLoader = new StreamingGeneLoader({
@@ -484,67 +487,158 @@ export class MultiVariableAnalysis {
       // Stream genes with optimized prefetching
       const geneKeys = genesToTest.map(g => g.key);
 
-      for await (const { gene, valuesA, valuesB, index } of
-        geneLoader.streamGenes(geneKeys, groupA, groupB)) {
+      if (markerStyleAvailable) {
+        didStartHeavyCompute = true;
+        const { obsCodes } = buildDEObsCodes({ groupA, groupB, totalCells: pointCount });
+        const codeToGroupIndex = new Int16Array(2);
+        codeToGroupIndex[0] = 0;
+        codeToGroupIndex[1] = 1;
 
-        // Keep a bounded number of in-flight worker computations
-        await waitForAvailableSlot(inFlight, maxInFlightGenes);
+        // Broadcast marker context to workers (once per run). Each worker needs its own buffers.
+        await pool.broadcast(
+          'MARKERS_SET_CONTEXT',
+          () => ({
+            codes: new Uint16Array(obsCodes),
+            codeToGroupIndex: new Int16Array(codeToGroupIndex),
+            groupCount: 2,
+            histBins: effectiveBatchConfig.wilcoxBins
+          }),
+          { timeout: 30000 }
+        );
 
-        const nA = valuesA.length;
-        const nB = valuesB.length;
+        for await (const { gene, values, index } of geneLoader.streamGenesRaw(geneKeys)) {
+          await waitForAvailableSlot(inFlight, maxInFlightGenes);
 
-        if (nA < minCells || nB < minCells) {
-          resultsByIndex[index] = {
-            gene,
-            error: `Insufficient cells (A: ${nA}, B: ${nB})`,
-            meanA: nA > 0 ? mean(valuesA) : NaN,
-            meanB: nB > 0 ? mean(valuesB) : NaN,
-            log2FoldChange: NaN,
-            pValue: NaN,
-            nA,
-            nB
-          };
-          progressTracker.itemComplete();
-          continue;
-        }
+          // Copy per-cell gene vector for worker transfer (never transfer DataLayer-owned buffers).
+          const valuesCopyForWorker = new Float32Array(values);
 
-        // Fire-and-forget compute on worker
-        let taskPromise;
-        taskPromise = computeManager.computeDifferential(valuesA, valuesB, method)
-          .then((deResult) => {
-            if ((deResult.nA ?? 0) < minCells || (deResult.nB ?? 0) < minCells) {
+          let taskPromise;
+          taskPromise = pool.execute(
+            'MARKERS_COMPUTE_GENE',
+            { values: valuesCopyForWorker, method, minCells },
+            { timeout: 120000, transfer: true }
+          )
+            .then((res) => {
+              const nA = res?.nIn?.[0] ?? 0;
+              const nB = res?.nOut?.[0] ?? 0;
+              const meanA = res?.meanInGroup?.[0];
+              const meanB = res?.meanOutGroup?.[0];
+              const log2FoldChange = res?.log2FoldChange?.[0];
+              const pValue = res?.pValues?.[0];
+              const statistic = res?.statistics?.[0];
+
+              if (nA < minCells || nB < minCells) {
+                resultsByIndex[index] = {
+                  gene,
+                  error: `Insufficient valid cells (A: ${nA}, B: ${nB})`,
+                  meanA: Number.isFinite(meanA) ? meanA : NaN,
+                  meanB: Number.isFinite(meanB) ? meanB : NaN,
+                  log2FoldChange: NaN,
+                  pValue: NaN,
+                  statistic: NaN,
+                  nA,
+                  nB,
+                  method
+                };
+                return;
+              }
+
               resultsByIndex[index] = {
                 gene,
-                error: `Insufficient valid cells (A: ${deResult.nA}, B: ${deResult.nB})`,
-                meanA: deResult.meanA,
-                meanB: deResult.meanB,
-                log2FoldChange: NaN,
-                pValue: NaN,
-                statistic: NaN,
-                nA: deResult.nA,
-                nB: deResult.nB,
+                meanA: Number.isFinite(meanA) ? meanA : NaN,
+                meanB: Number.isFinite(meanB) ? meanB : NaN,
+                log2FoldChange: Number.isFinite(log2FoldChange) ? log2FoldChange : NaN,
+                pValue: Number.isFinite(pValue) ? pValue : NaN,
+                statistic: Number.isFinite(statistic) ? statistic : NaN,
+                nA,
+                nB,
                 method
               };
-              return;
-            }
-            resultsByIndex[index] = { gene, ...deResult };
-          })
-          .catch((err) => {
+            })
+            .catch((err) => {
+              resultsByIndex[index] = {
+                gene,
+                error: err?.message || String(err),
+                meanA: NaN,
+                meanB: NaN,
+                log2FoldChange: NaN,
+                pValue: NaN
+              };
+            })
+            .finally(() => {
+              inFlight.delete(taskPromise);
+              progressTracker.itemComplete();
+            });
+
+          inFlight.add(taskPromise);
+        }
+      } else {
+        // Fallback to legacy DE backend if workers are unavailable.
+        computeManager = await this._getComputeManager();
+        didStartHeavyCompute = true;
+
+        for await (const { gene, valuesA, valuesB, index } of
+          geneLoader.streamGenes(geneKeys, groupA, groupB)) {
+
+          // Keep a bounded number of in-flight worker computations
+          await waitForAvailableSlot(inFlight, maxInFlightGenes);
+
+          const nA = valuesA.length;
+          const nB = valuesB.length;
+
+          if (nA < minCells || nB < minCells) {
             resultsByIndex[index] = {
               gene,
-              error: err?.message || String(err),
-              meanA: NaN,
-              meanB: NaN,
+              error: `Insufficient cells (A: ${nA}, B: ${nB})`,
+              meanA: nA > 0 ? mean(valuesA) : NaN,
+              meanB: nB > 0 ? mean(valuesB) : NaN,
               log2FoldChange: NaN,
-              pValue: NaN
+              pValue: NaN,
+              nA,
+              nB
             };
-          })
-          .finally(() => {
-            inFlight.delete(taskPromise);
             progressTracker.itemComplete();
-          });
+            continue;
+          }
 
-        inFlight.add(taskPromise);
+          // Fire-and-forget compute on worker
+          let taskPromise;
+          taskPromise = computeManager.computeDifferential(valuesA, valuesB, method)
+            .then((deResult) => {
+              if ((deResult.nA ?? 0) < minCells || (deResult.nB ?? 0) < minCells) {
+                resultsByIndex[index] = {
+                  gene,
+                  error: `Insufficient valid cells (A: ${deResult.nA}, B: ${deResult.nB})`,
+                  meanA: deResult.meanA,
+                  meanB: deResult.meanB,
+                  log2FoldChange: NaN,
+                  pValue: NaN,
+                  statistic: NaN,
+                  nA: deResult.nA,
+                  nB: deResult.nB,
+                  method
+                };
+                return;
+              }
+              resultsByIndex[index] = { gene, ...deResult };
+            })
+            .catch((err) => {
+              resultsByIndex[index] = {
+                gene,
+                error: err?.message || String(err),
+                meanA: NaN,
+                meanB: NaN,
+                log2FoldChange: NaN,
+                pValue: NaN
+              };
+            })
+            .finally(() => {
+              inFlight.delete(taskPromise);
+              progressTracker.itemComplete();
+            });
+
+          inFlight.add(taskPromise);
+        }
       }
 
       // Wait for all pending worker computations

@@ -312,8 +312,10 @@ export class ComparisonModule {
     this._uiManager.setCurrentPages(this.currentConfig.pages, { notifyActiveUI: false });
     this._lastKnownPageIds = pages.map(p => p.id);
 
-    // Switch to default mode (simple/quick) via the unified setter
-    this._setAnalysisMode('simple');
+    // Set default active mode (simple/quick) without auto-opening the accordion item.
+    // Users can open the desired section explicitly.
+    this._analysisMode = 'simple';
+    this._uiManager.switchToMode('simple');
 
     // Listen for page changes (add/remove/rename/switch)
     this.state.on?.('page:changed', () => {

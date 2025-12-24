@@ -14,7 +14,6 @@
  */
 
 import { PlotFactory, PlotRegistry, BasePlot, COMMON_HOVER_STYLE } from '../plot-factory.js';
-import { getHeatmapTraceType } from '../plotly-loader.js';
 import { getPlotTheme } from '../../shared/plot-theme.js';
 import { getMatrixMinMax } from '../../shared/matrix-utils.js';
 
@@ -69,14 +68,58 @@ const geneHeatmapDefinition = {
 
   defaultOptions: {
     colorscale: 'RdBu',
+    transform: 'zscore',
     showValues: false,
     reverseColorscale: true,
     rangeMode: 'auto',
     zmin: -3,
-    zmax: 3
+    zmax: 3,
+    // Marker selection controls (used by GenesPanelUI to rebuild markers/heatmap)
+    pValueThreshold: 0.05,
+    foldChangeThreshold: 1.0,
+    useAdjustedPValue: true,
+    // Internal flag for modal option visibility; set by UI depending on whether
+    // clustering/dendrogram data is available for this figure.
+    hasClustering: false,
+    showRowDendrogram: true,
+    showColDendrogram: true
   },
 
   optionSchema: {
+    pValueThreshold: {
+      type: 'range',
+      label: 'P-value threshold',
+      min: 0,
+      max: 0.2,
+      step: 0.001
+    },
+    foldChangeThreshold: {
+      type: 'range',
+      label: '|log2FC| threshold',
+      min: 0,
+      max: 5,
+      step: 0.1
+    },
+    useAdjustedPValue: { type: 'checkbox', label: 'Use FDR-corrected p-values' },
+    transform: {
+      type: 'select',
+      label: 'Transform',
+      options: [
+        { value: 'zscore', label: 'Z-score' },
+        { value: 'log1p', label: 'Log(1+x)' },
+        { value: 'none', label: 'None' }
+      ]
+    },
+    showRowDendrogram: {
+      type: 'checkbox',
+      label: 'Show gene dendrogram',
+      showWhen: (opts) => opts?.hasClustering === true
+    },
+    showColDendrogram: {
+      type: 'checkbox',
+      label: 'Show group dendrogram',
+      showWhen: (opts) => opts?.hasClustering === true
+    },
     colorscale: {
       type: 'select',
       label: 'Colors',
@@ -138,6 +181,9 @@ const geneHeatmapDefinition = {
 
     const { values, genes, groupNames, nRows, nCols } = data.matrix;
     const transform = data.matrix.transform || 'none';
+    const clustering = data?.clustering || null;
+    const showRowDendrogram = options?.showRowDendrogram !== false;
+    const showColDendrogram = options?.showColDendrogram !== false;
 
     // Convert Float32Array to 2D array for Plotly.
     // Display is transposed: groups (rows) x genes (cols).
@@ -168,17 +214,19 @@ const geneHeatmapDefinition = {
 
     const traces = [];
 
-    // Prefer WebGL for large matrices, but force standard heatmap when value
-    // annotations are enabled (heatmapgl does not reliably support them).
-    const traceType = showValues ? 'heatmap' : getHeatmapTraceType();
+    // NOTE: We intentionally use the standard `heatmap` trace.
+    // In some environments Plotly's `heatmapgl` can render blank (especially when
+    // toggling "Show values"), so prioritize correctness over GPU acceleration.
+    const traceType = 'heatmap';
 
     // Color range strategy:
-    // - Z-score: default to a symmetric fixed range so colors are comparable across runs.
-    // - Other transforms: default to autoscale (raw units vary by dataset).
+    // - 'auto' always uses Plotly autoscale (even for z-score), so the user can truly revert.
+    // - 'zscore' uses a symmetric fixed range so colors are comparable across runs.
+    // - 'fixed' uses user-specified zmin/zmax (or falls back to data min/max).
     const mode = (rangeMode === 'fixed' || rangeMode === 'zscore' || rangeMode === 'auto')
       ? rangeMode
       : 'auto';
-    const effectiveMode = (mode === 'auto' && transform === 'zscore') ? 'zscore' : mode;
+    const effectiveMode = mode;
     const wantsFixed = effectiveMode !== 'auto';
 
     let traceZmin;
@@ -252,6 +300,92 @@ const geneHeatmapDefinition = {
 
     traces.push(trace);
 
+    const pushDendrogramTraces = (dendrogram, order, axisName) => {
+      if (!dendrogram || !Array.isArray(order) || order.length === 0) return;
+
+      const leafPos = new Map();
+      for (let i = 0; i < order.length; i++) {
+        leafPos.set(order[i], i);
+      }
+
+      let maxHeight = 0;
+      const stack = [dendrogram];
+      while (stack.length) {
+        const node = stack.pop();
+        if (!node) continue;
+        if (Number.isFinite(node.height)) maxHeight = Math.max(maxHeight, node.height);
+        if (!node.isLeaf) {
+          if (node.left) stack.push(node.left);
+          if (node.right) stack.push(node.right);
+        }
+      }
+      maxHeight = maxHeight > 0 ? maxHeight : 1;
+
+      const xs = [];
+      const ys = [];
+
+      const walk = (node) => {
+        if (!node) return { x: 0, y: 0 };
+        if (node.isLeaf) {
+          const x = leafPos.get(node.id) ?? 0;
+          return { x, y: 0 };
+        }
+
+        const left = walk(node.left);
+        const right = walk(node.right);
+        const x = (left.x + right.x) / 2;
+        const y = Number.isFinite(node.height) ? node.height : 0;
+
+        // vertical left
+        xs.push(left.x, left.x, null);
+        ys.push(left.y, y, null);
+        // vertical right
+        xs.push(right.x, right.x, null);
+        ys.push(right.y, y, null);
+        // horizontal
+        xs.push(left.x, right.x, null);
+        ys.push(y, y, null);
+
+        return { x, y };
+      };
+
+      walk(dendrogram);
+
+      if (axisName === 'row') {
+        traces.push({
+          type: 'scatter',
+          mode: 'lines',
+          x: xs,
+          y: ys,
+          xaxis: 'x2',
+          yaxis: 'y2',
+          line: { color: theme.border || '#999', width: 1 },
+          hoverinfo: 'skip',
+          showlegend: false
+        });
+      } else {
+        // col dendrogram: swap axes (distance on x, order position on y)
+        traces.push({
+          type: 'scatter',
+          mode: 'lines',
+          x: ys,
+          y: xs,
+          xaxis: 'x3',
+          yaxis: 'y3',
+          line: { color: theme.border || '#999', width: 1 },
+          hoverinfo: 'skip',
+          showlegend: false
+        });
+      }
+    };
+
+    if (showRowDendrogram && clustering?.rowDendrogram && clustering?.rowOrder) {
+      pushDendrogramTraces(clustering.rowDendrogram, clustering.rowOrder, 'row');
+    }
+    if (showColDendrogram && clustering?.colDendrogram && clustering?.colOrder) {
+      pushDendrogramTraces(clustering.colDendrogram, clustering.colOrder, 'col');
+    }
+
     return traces;
   },
 
@@ -277,6 +411,16 @@ const geneHeatmapDefinition = {
     const xTickFontSize = Math.min(10, Math.max(6, Math.floor(220 / Math.max(10, nGenes))));
     const yTickFontSize = Math.min(10, Math.max(7, Math.floor(160 / Math.max(4, nGroups))));
 
+    const clustering = data?.clustering || null;
+    const showRowDendrogram = options?.showRowDendrogram !== false && !!(clustering?.rowDendrogram && clustering?.rowOrder);
+    const showColDendrogram = options?.showColDendrogram !== false && !!(clustering?.colDendrogram && clustering?.colOrder);
+
+    const dendroFrac = 0.18;
+    // Row dendrogram is drawn above the heatmap (aligned to x).
+    const topFrac = showRowDendrogram ? dendroFrac : 0;
+    // Column dendrogram is drawn to the RIGHT of the heatmap (aligned to y).
+    const rightFrac = showColDendrogram ? dendroFrac : 0;
+
     layout.xaxis = {
       title: '',
       tickangle: tickAngle,
@@ -288,6 +432,7 @@ const geneHeatmapDefinition = {
       },
       side: 'bottom',
       fixedrange: false,
+      domain: [0, 1 - rightFrac],
       ...buildSparseTicks(genes, 40, 14)
     };
 
@@ -300,8 +445,40 @@ const geneHeatmapDefinition = {
         color: theme.text
       },
       autorange: 'reversed', // First group at top
-      fixedrange: false
+      fixedrange: false,
+      domain: [0, 1 - topFrac]
     };
+
+    if (showRowDendrogram) {
+      layout.xaxis2 = {
+        domain: [0, 1 - rightFrac],
+        showticklabels: false,
+        showgrid: false,
+        zeroline: false
+      };
+      layout.yaxis2 = {
+        domain: [1 - topFrac, 1],
+        showticklabels: false,
+        showgrid: false,
+        zeroline: false
+      };
+    }
+
+    if (showColDendrogram) {
+      layout.xaxis3 = {
+        domain: [1 - rightFrac, 1],
+        showticklabels: false,
+        showgrid: false,
+        zeroline: false
+      };
+      layout.yaxis3 = {
+        domain: [0, 1 - topFrac],
+        showticklabels: false,
+        showgrid: false,
+        zeroline: false,
+        autorange: 'reversed'
+      };
+    }
 
     // Adjust margins based on content
     const groupLabelWidth = Math.max(

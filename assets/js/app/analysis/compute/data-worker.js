@@ -49,7 +49,7 @@ let poolSize = 1;
 let markerContext = null;
 
 function setMarkerContext(payload) {
-  const { codes, codeToGroupIndex, groupCount } = payload || {};
+  const { codes, codeToGroupIndex, groupCount, histBins } = payload || {};
 
   if (!codes || !codeToGroupIndex || !Number.isFinite(groupCount) || groupCount <= 0) {
     throw new Error('MARKERS_SET_CONTEXT: invalid payload');
@@ -69,13 +69,17 @@ function setMarkerContext(payload) {
     }
   }
 
+  const bins = Number.isFinite(histBins)
+    ? Math.max(16, Math.min(1024, Math.floor(histBins)))
+    : 128;
+
   markerContext = {
     groupCount,
     cellGroupIndex,
     orderScratch: new Uint32Array(nCells),
-    histBins: 128,
-    histTotal: new Uint32Array(128),
-    histByGroup: new Uint32Array(groupCount * 128)
+    histBins: bins,
+    histTotal: new Uint32Array(bins),
+    histByGroup: new Uint32Array(groupCount * bins)
   };
 
   return { ok: true, cells: nCells, groups: groupCount };

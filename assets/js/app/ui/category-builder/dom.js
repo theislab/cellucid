@@ -72,7 +72,7 @@ const TEMPLATE = `
 
         <div class="cat-builder-actions">
           <button type="button" class="cat-builder-btn secondary" id="cat-builder-cancel">Cancel</button>
-          <button type="button" class="cat-builder-btn primary" id="cat-builder-confirm" disabled>Create Categorical</button>
+          <button type="button" class="cat-builder-btn secondary" id="cat-builder-confirm" disabled>Create</button>
         </div>
       </div>
     </div>
@@ -121,4 +121,3 @@ export function renderCategoryBuilderDom(containerEl) {
     cancelBtn: wrapper.querySelector('#cat-builder-cancel')
   };
 }
-
