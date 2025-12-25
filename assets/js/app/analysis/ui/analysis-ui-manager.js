@@ -210,6 +210,13 @@ export class AnalysisUIManager {
     return this._activeMode === modeId;
   }
 
+  /**
+   * Clear active mode (when accordion closes)
+   */
+  clearActiveMode() {
+    this._activeMode = null;
+  }
+
   // ===========================================================================
   // Page Change Notifications
   // ===========================================================================
@@ -256,6 +263,15 @@ export class AnalysisUIManager {
     if (entry?.ui?.onHighlightChanged) {
       entry.ui.onHighlightChanged();
     }
+  }
+
+  /**
+   * Notify active UI that visibility changed (accordion opened/closed)
+   * @param {boolean} isVisible
+   */
+  onVisibilityChanged(isVisible) {
+    const entry = this._uis.get(this._activeMode);
+    entry?.ui?.onVisibilityChanged?.(isVisible);
   }
 
   /**

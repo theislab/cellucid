@@ -84,15 +84,15 @@
   color: var(--color-text-secondary);
 }
 
-/* Info tooltip popup */
+/* Info tooltip popup - uses fixed positioning to escape accordion overflow.
+   JS sets top/left dynamically based on button position. */
 .info-tooltip {
-  position: absolute;
-  z-index: var(--z-dropdown);
-  margin-top: var(--space-0-5);
+  position: fixed;
+  z-index: var(--z-tooltip);
   background: var(--color-surface-elevated);
   border: var(--border-strong);
   box-shadow: var(--shadow-md);
-  width: calc(100% - var(--space-0-5));
+  width: 240px;
   box-sizing: border-box;
   display: none;
 }

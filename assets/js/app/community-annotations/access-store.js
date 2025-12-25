@@ -8,6 +8,9 @@
  */
 
 import { EventEmitter } from '../utils/event-emitter.js';
+import { getAnnotationRepoForDataset } from './repo-store.js';
+import { dispatchAnnotationConnectionChanged } from './connection-events.js';
+import { getGitHubAuthSession, toGitHubUserKey } from './github-auth.js';
 
 function toCleanString(value) {
   return String(value ?? '').trim();
@@ -52,6 +55,21 @@ export function isSimulateRepoConnectedEnabled() {
   }
 }
 
+export function isAnnotationRepoConnected(datasetId, username = 'local') {
+  if (isSimulateRepoConnectedEnabled()) return true;
+  try {
+    const auth = getGitHubAuthSession();
+    if (!auth?.isAuthenticated?.()) return false;
+    const key = toGitHubUserKey(auth.getUser?.());
+    if (!key) return false;
+    const u = toCleanString(username || '').replace(/^@+/, '').toLowerCase();
+    if (u && u !== key) return false;
+  } catch {
+    return false;
+  }
+  return Boolean(getAnnotationRepoForDataset(datasetId, username));
+}
+
 function readDevOverrideRole() {
   if (!isLocalDevHost()) return null;
   try {
@@ -89,12 +107,20 @@ export class CommunityAnnotationAccessStore extends EventEmitter {
     return this.getEffectiveRole() === 'author';
   }
 
+  isRoleKnown() {
+    return this.getRole() !== 'unknown';
+  }
+
   setRole(nextRole) {
     const r = toCleanString(nextRole) || 'unknown';
     const normalized = r === 'author' || r === 'annotator' ? r : 'unknown';
     if (normalized === this._role) return;
     this._role = normalized;
     this.emit('changed', { role: this._role });
+  }
+
+  clearRole() {
+    this.setRole('unknown');
   }
 
   setRoleFromRepoInfo(repoInfo) {
@@ -110,9 +136,9 @@ export class CommunityAnnotationAccessStore extends EventEmitter {
       const w = /** @type {any} */ (window);
       const self = this;
       let _cellucidDev = w.__CELLUCID_DEV__ === true;
-      let _authorMode = false;
-      let _annotatorMode = false;
-      let _simulateRepoConnected = false;
+      let _authorMode = w._author_mode === true;
+      let _annotatorMode = !_authorMode && w._annotator_mode === true;
+      let _simulateRepoConnected = w._simulate_repo_connected === true;
 
       // __CELLUCID_DEV__ must also trigger re-render since isLocalDevHost() depends on it
       Object.defineProperty(w, '__CELLUCID_DEV__', {
@@ -122,6 +148,7 @@ export class CommunityAnnotationAccessStore extends EventEmitter {
           if (next === _cellucidDev) return;
           _cellucidDev = next;
           self.emit('changed', { role: self.getEffectiveRole() });
+          dispatchAnnotationConnectionChanged({ reason: '__CELLUCID_DEV__' });
         },
         configurable: true,
         enumerable: true
@@ -160,6 +187,7 @@ export class CommunityAnnotationAccessStore extends EventEmitter {
           if (next === _simulateRepoConnected) return;
           _simulateRepoConnected = next;
           self.emit('changed', { role: self.getEffectiveRole() });
+          dispatchAnnotationConnectionChanged({ reason: '_simulate_repo_connected' });
         },
         configurable: true,
         enumerable: true

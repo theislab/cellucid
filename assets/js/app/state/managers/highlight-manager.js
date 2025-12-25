@@ -519,6 +519,23 @@ export const highlightStateMethods = {
     return this.highlightedGroups;
   },
 
+  /**
+   * Find a highlight group that was created from a specific category.
+   * @param {number} fieldIndex - The field index
+   * @param {number} categoryIndex - The category index within the field
+   * @param {string} [source='obs'] - The field source ('obs' or 'var')
+   * @returns {object|null} The matching highlight group, or null if not found
+   */
+  findHighlightGroupByCategory(fieldIndex, categoryIndex, source = 'obs') {
+    return this.highlightedGroups.find(
+      (g) =>
+        g.type === 'category' &&
+        g.fieldIndex === fieldIndex &&
+        g.categoryIndex === categoryIndex &&
+        g.fieldSource === source
+    ) || null;
+  },
+
   getHighlightedCellCount() {
     // Returns count of highlighted cells that are currently visible (cached)
     if (!this.highlightArray) return 0;

@@ -101,6 +101,9 @@ export class QuickInsights extends BaseAnalysisUI {
     // Collapsible state (closed by default)
     this._pageSelectorExpanded = false;
 
+    // Pending update flag (for when accordion is closed during highlight changes)
+    this._pendingUpdateWhenVisible = false;
+
     // Content container (for insights, separate from page selector)
     this._contentContainer = null;
 
@@ -237,10 +240,38 @@ export class QuickInsights extends BaseAnalysisUI {
   }
 
   /**
+   * Check if this UI is currently visible (accordion open or floating window expanded)
+   * @private
+   */
+  _isVisible() {
+    // Check sidebar accordion item
+    const accordionItem = this._container?.closest('.analysis-accordion-item');
+    if (accordionItem) {
+      return accordionItem.classList.contains('open');
+    }
+
+    // Check floating window (uses <details> element)
+    const floatingDetails = this._container?.closest('details.analysis-window-panel');
+    if (floatingDetails) {
+      return floatingDetails.open;
+    }
+
+    // Unknown container type - assume visible
+    return true;
+  }
+
+  /**
    * Trigger debounced update
    * @private
    */
   _triggerUpdate() {
+    // Skip fetch if not visible - will refresh when accordion opens
+    if (!this._isVisible()) {
+      this._pendingUpdateWhenVisible = true;
+      return;
+    }
+    this._pendingUpdateWhenVisible = false;
+
     // Cancel any pending computation
     if (this._abortController) {
       this._abortController.abort();
@@ -329,6 +360,24 @@ export class QuickInsights extends BaseAnalysisUI {
       this._container = container;
     }
     this._render();
+    this._setupVisibilityListener();
+  }
+
+  /**
+   * Setup listener for floating window toggle events
+   * @private
+   */
+  _setupVisibilityListener() {
+    // Listen for floating window expand/collapse
+    const floatingDetails = this._container?.closest('details.analysis-window-panel');
+    if (floatingDetails && !this._detailsToggleListener) {
+      this._detailsToggleListener = () => {
+        if (floatingDetails.open) {
+          this.onVisibilityChanged(true);
+        }
+      };
+      floatingDetails.addEventListener('toggle', this._detailsToggleListener);
+    }
   }
 
   /**
@@ -375,6 +424,18 @@ export class QuickInsights extends BaseAnalysisUI {
 
     // Trigger update
     this._triggerUpdate();
+  }
+
+  /**
+   * Handle visibility change (accordion opened/closed)
+   * Triggers pending updates when becoming visible
+   * @param {boolean} isVisible
+   */
+  onVisibilityChanged(isVisible) {
+    if (isVisible && this._pendingUpdateWhenVisible) {
+      this._pendingUpdateWhenVisible = false;
+      this._triggerUpdate();
+    }
   }
 
   /**
@@ -1502,6 +1563,13 @@ export class QuickInsights extends BaseAnalysisUI {
 
     this._destroyFieldPickers();
     this._destroyPageSelector();
+
+    // Remove floating window toggle listener
+    if (this._detailsToggleListener) {
+      const floatingDetails = this._container?.closest('details.analysis-window-panel');
+      floatingDetails?.removeEventListener('toggle', this._detailsToggleListener);
+      this._detailsToggleListener = null;
+    }
 
     // Clear container
     if (this._container) {

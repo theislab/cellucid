@@ -178,15 +178,56 @@ export function initDatasetConnections({
   }
 
   // ---------------------------------------------------------------------------
-  // Tooltips (user data / remote / github)
+  // Tooltips (user data / remote / github) - uses fixed positioning to escape overflow
   // ---------------------------------------------------------------------------
+
+  function positionTooltip(button, tooltip) {
+    if (!button || !tooltip) return;
+    const rect = button.getBoundingClientRect();
+    const tooltipHeight = tooltip.offsetHeight || 120;
+    const spaceBelow = window.innerHeight - rect.bottom;
+    const spaceAbove = rect.top;
+    const gap = 4;
+
+    // Position below button if space, otherwise above
+    if (spaceBelow >= tooltipHeight + gap || spaceBelow >= spaceAbove) {
+      tooltip.style.top = `${rect.bottom + gap}px`;
+      tooltip.style.bottom = 'auto';
+    } else {
+      tooltip.style.bottom = `${window.innerHeight - rect.top + gap}px`;
+      tooltip.style.top = 'auto';
+    }
+
+    // Align left with button, constrain to viewport (240px width + 8px margin)
+    const left = Math.max(8, Math.min(rect.left, window.innerWidth - 248));
+    tooltip.style.left = `${left}px`;
+  }
 
   function attachTooltipToggle(button, tooltip) {
     if (!button || !tooltip) return;
+    // Store original parent for cleanup
+    const originalParent = tooltip.parentElement;
+
     button.addEventListener('click', (e) => {
       e.stopPropagation();
       const isVisible = getComputedStyle(tooltip).display !== 'none';
-      tooltip.style.display = isVisible ? 'none' : 'block';
+      if (isVisible) {
+        tooltip.style.display = 'none';
+        // Return tooltip to original location
+        if (originalParent && tooltip.parentElement === document.body) {
+          originalParent.appendChild(tooltip);
+        }
+      } else {
+        // Portal to body to escape transform containment
+        if (tooltip.parentElement !== document.body) {
+          document.body.appendChild(tooltip);
+        }
+        // Position and show
+        positionTooltip(button, tooltip);
+        tooltip.style.display = 'block';
+        // Refine position after layout is computed
+        requestAnimationFrame(() => positionTooltip(button, tooltip));
+      }
     });
   }
 
@@ -205,6 +246,13 @@ export function initDatasetConnections({
     closeIfOutside(remoteInfoBtn, remoteInfoTooltip);
     closeIfOutside(githubInfoBtn, githubInfoTooltip);
   });
+
+  // Close tooltips on scroll for cleaner UX
+  window.addEventListener('scroll', () => {
+    [userDataInfoTooltip, remoteInfoTooltip, githubInfoTooltip].forEach((tip) => {
+      if (tip) tip.style.display = 'none';
+    });
+  }, { passive: true, capture: true });
 
   // ---------------------------------------------------------------------------
   // Remote server connection

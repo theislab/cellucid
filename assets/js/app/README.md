@@ -98,11 +98,3 @@ Disable:
 ```js
 localStorage.removeItem('CELLUCID_DEBUG');
 ```
-
-## Verification
-
-From the `cellucid/` repo root, run:
-
-```bash
-./scripts/verify-refactor.sh
-```

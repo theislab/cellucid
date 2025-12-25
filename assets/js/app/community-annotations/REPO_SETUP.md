@@ -79,7 +79,7 @@ You can share a link that pre-selects the annotation repo:
 ### Write access (Publish)
 
 - If you have **push** access to the repo, Cellucid writes directly to:
-  - `annotations/users/{your-username}.json`
+  - `annotations/users/ghid_<your-github-user-id>.json`
 - If you do **not** have push access, Cellucid uses a **fork + Pull Request** flow.
 
 Fork + PR notes:
@@ -88,13 +88,13 @@ Fork + PR notes:
 
 ## Author vs Annotator
 
-- **Annotator**: can Pull and submit their own `annotations/users/{username}.json` (direct push if allowed; otherwise fork + PR).
+- **Annotator**: can Pull and submit their own `annotations/users/ghid_<id>.json` (direct push if allowed; otherwise fork + PR).
 - **Author** (**maintain/admin** access to repo): additionally can:
   - Control which categorical obs columns are annotatable (stored in `annotations/config.json`)
   - Merge suggestions (stored in `annotations/moderation/merges.json`; votes are summed; history notes recorded)
 
 In the Cellucid UI, **Publish** (for authors) pushes:
-- Your user file (`annotations/users/{you}.json`)
+- Your user file (`annotations/users/ghid_<id>.json`)
 - The current annotatable-column selection (`annotations/config.json`)
 - Any recorded merges (`annotations/moderation/merges.json`)
 

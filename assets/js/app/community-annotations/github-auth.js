@@ -15,6 +15,7 @@ const DEFAULT_WORKER_ORIGIN = 'https://cellucid-github-auth.benkemalim.workers.d
 
 const TOKEN_KEY = 'cellucid:github-app-auth:token:v1';
 const USER_KEY = 'cellucid:github-app-auth:user:v1';
+const LAST_GITHUB_USER_KEY = 'cellucid:community-annotations:last-github-user-key';
 
 function toCleanString(value) {
   return String(value ?? '').trim();
@@ -36,10 +37,28 @@ function safeJsonStringify(obj) {
   }
 }
 
+function isDevOverrideAllowed() {
+  try {
+    if (typeof window === 'undefined' || typeof window.location === 'undefined') return false;
+    try {
+      const w = /** @type {any} */ (window);
+      if (w?.__CELLUCID_DEV__ === true) return true;
+    } catch {
+      // ignore
+    }
+    const host = String(window.location.hostname || '').toLowerCase();
+    const proto = String(window.location.protocol || '').toLowerCase();
+    if (proto === 'file:') return true;
+    return host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '0.0.0.0' || host.endsWith('.local');
+  } catch {
+    return false;
+  }
+}
+
 export function getGitHubWorkerOrigin() {
   if (typeof window === 'undefined') return DEFAULT_WORKER_ORIGIN;
   const override = toCleanString(window.__CELLUCID_GITHUB_WORKER_ORIGIN__ || '');
-  if (!override) return DEFAULT_WORKER_ORIGIN;
+  if (!override || !isDevOverrideAllowed()) return DEFAULT_WORKER_ORIGIN;
   try {
     return new URL(override).origin;
   } catch {
@@ -73,6 +92,23 @@ function removeSessionItem(key) {
   }
 }
 
+function readLocalItem(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeLocalItem(key, value) {
+  try {
+    localStorage.setItem(key, value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function fetchJson(url, { method = 'GET', headers = null, body = null } = {}) {
   const res = await fetch(url, {
     method,
@@ -95,6 +131,23 @@ async function fetchJson(url, { method = 'GET', headers = null, body = null } = 
 export function getGitHubLoginUrl(workerOrigin = null) {
   const origin = toCleanString(workerOrigin || getGitHubWorkerOrigin()).replace(/\/+$/, '');
   return `${origin}/auth/login`;
+}
+
+export function toGitHubUserKey(user) {
+  const id = Number(user?.id);
+  if (!Number.isFinite(id)) return null;
+  const safe = Math.max(0, Math.floor(id));
+  return safe ? `ghid_${safe}` : null;
+}
+
+export function getLastGitHubUserKey() {
+  const raw = toCleanString(readLocalItem(LAST_GITHUB_USER_KEY) || '').replace(/^@+/, '').toLowerCase();
+  const m = raw.match(/^ghid_(\d+)$/);
+  if (!m) return null;
+  const id = Number(m[1]);
+  if (!Number.isFinite(id)) return null;
+  const safe = Math.max(0, Math.floor(id));
+  return safe ? `ghid_${safe}` : null;
 }
 
 function openAuthWindow(workerOrigin, mode) {
@@ -141,6 +194,7 @@ async function waitForAuthMessage({ workerOrigin, popup, timeoutMs = 120_000 } =
 
     const onMessage = (event) => {
       if (event.origin !== expectedOrigin) return;
+      if (popup && event.source !== popup) return;
       const data = event.data || null;
       if (!data || data.type !== 'cellucid-github-auth') return;
       const token = toCleanString(data.token || '');
@@ -225,6 +279,8 @@ export class GitHubAuthSession extends EventEmitter {
     if (user && typeof user === 'object') {
       this._user = user;
       this._persist();
+      const key = toGitHubUserKey(this._user);
+      if (key) writeLocalItem(LAST_GITHUB_USER_KEY, key);
       this.emit('changed', { token: this._token, user: this._user });
     }
     return this._user;

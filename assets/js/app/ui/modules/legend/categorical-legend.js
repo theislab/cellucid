@@ -15,8 +15,15 @@ import { FieldKind, FieldSource } from '../../../utils/field-constants.js';
 import { StateValidator } from '../../../utils/state-validator.js';
 import { clamp } from '../../../utils/number-utils.js';
 import { getCommunityAnnotationSession } from '../../../community-annotations/session.js';
-import { getAnnotationRepoForDataset } from '../../../community-annotations/repo-store.js';
+import { getAnnotationRepoForDataset, getLastAnnotationRepoForDataset } from '../../../community-annotations/repo-store.js';
+import {
+  getCommunityAnnotationAccessStore,
+  isAnnotationRepoConnected,
+  isSimulateRepoConnectedEnabled
+} from '../../../community-annotations/access-store.js';
+import { ANNOTATION_CONNECTION_CHANGED_EVENT } from '../../../community-annotations/connection-events.js';
 import { openCommunityAnnotationVotingModal } from '../community-annotation-voting-modal.js';
+import { getGitHubAuthSession, getLastGitHubUserKey, toGitHubUserKey } from '../../../community-annotations/github-auth.js';
 
 function toCleanString(value) {
   return String(value ?? '').trim();
@@ -97,12 +104,34 @@ function formatCategoryCount(visibleCount, availableCount) {
   return `${visible.toLocaleString()} cells`;
 }
 
-export function initCategoricalLegend({ state, legendEl, dataSourceManager = null }) {
+  export function initCategoricalLegend({ state, legendEl, dataSourceManager = null }) {
   const annotationSession = getCommunityAnnotationSession();
+  const access = getCommunityAnnotationAccessStore();
+  const lifecycle = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const isCommunityAnnotationUiEnabled = () => {
+    try {
+      const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
+      const auth = getGitHubAuthSession();
+      const authedKey = auth.isAuthenticated?.() ? toGitHubUserKey(auth.getUser?.()) : null;
+      const username = authedKey
+        ? String(authedKey)
+        : (isSimulateRepoConnectedEnabled() ? (getLastGitHubUserKey() || (annotationSession.getProfile?.()?.username || 'local')) : (annotationSession.getProfile?.()?.username || 'local'));
+      return isAnnotationRepoConnected(datasetId, username);
+    } catch {
+      return false;
+    }
+  };
   try {
     const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
-    const username = annotationSession.getProfile?.()?.username || 'local';
-    const repoRef = getAnnotationRepoForDataset(datasetId, username) || null;
+    const auth = getGitHubAuthSession();
+    const authedKey = auth.isAuthenticated?.() ? toGitHubUserKey(auth.getUser?.()) : null;
+    const username = authedKey
+      ? String(authedKey)
+      : (isSimulateRepoConnectedEnabled() ? (getLastGitHubUserKey() || (annotationSession.getProfile?.()?.username || 'local')) : (annotationSession.getProfile?.()?.username || 'local'));
+    let repoRef = getAnnotationRepoForDataset(datasetId, username) || null;
+    if (!repoRef && isSimulateRepoConnectedEnabled()) {
+      repoRef = getLastAnnotationRepoForDataset(datasetId, username) || null;
+    }
     annotationSession.setCacheContext?.({ datasetId, repoRef, username });
   } catch {
     // ignore
@@ -110,6 +139,16 @@ export function initCategoricalLegend({ state, legendEl, dataSourceManager = nul
 
   // Guard to prevent re-entry during render
   let isRendering = false;
+
+  const rerenderIfActiveCategory = () => {
+    if (isRendering) return;
+    const field = state.getActiveField?.() || null;
+    if (!field || field.kind !== 'category') return;
+    if (!legendEl) return;
+    const model = state.getLegendModel(field);
+    if (!model) return;
+    renderCategoricalLegend(field, model);
+  };
 
   // Keep legend UI in sync when voting mode is toggled or votes change.
   annotationSession.on('changed', () => {
@@ -122,11 +161,39 @@ export function initCategoricalLegend({ state, legendEl, dataSourceManager = nul
     renderCategoricalLegend(field, model);
   });
 
+  // Re-render when repo connect/disconnect or dev overrides change.
+  const unsubscribeAccess = access.on?.('changed', () => rerenderIfActiveCategory()) || null;
+  try {
+    if (typeof window !== 'undefined' && lifecycle?.signal) {
+      window.addEventListener(ANNOTATION_CONNECTION_CHANGED_EVENT, rerenderIfActiveCategory, { signal: lifecycle.signal });
+    }
+  } catch {
+    // ignore
+  }
+
+  if (typeof window !== 'undefined') {
+    window.addEventListener?.(
+      'beforeunload',
+      () => {
+        unsubscribeAccess?.();
+        lifecycle?.abort?.();
+      },
+      { once: true }
+    );
+  }
+
   function refreshCategoryCounts() {
     try {
       const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
-      const username = annotationSession.getProfile?.()?.username || 'local';
-      const repoRef = getAnnotationRepoForDataset(datasetId, username) || null;
+      const auth = getGitHubAuthSession();
+      const authedKey = auth.isAuthenticated?.() ? toGitHubUserKey(auth.getUser?.()) : null;
+      const username = authedKey
+        ? String(authedKey)
+        : (isSimulateRepoConnectedEnabled() ? (getLastGitHubUserKey() || (annotationSession.getProfile?.()?.username || 'local')) : (annotationSession.getProfile?.()?.username || 'local'));
+      let repoRef = getAnnotationRepoForDataset(datasetId, username) || null;
+      if (!repoRef && isSimulateRepoConnectedEnabled()) {
+        repoRef = getLastAnnotationRepoForDataset(datasetId, username) || null;
+      }
       annotationSession.setCacheContext?.({ datasetId, repoRef, username });
     } catch {
       // ignore
@@ -214,7 +281,7 @@ export function initCategoricalLegend({ state, legendEl, dataSourceManager = nul
     const CATEGORY_DRAG_MIME = 'application/x-cellucid-category';
 
     const fieldKey = field?.key || '';
-    const annotating = Boolean(fieldKey && annotationSession.isFieldAnnotated(fieldKey));
+    const annotating = Boolean(isCommunityAnnotationUiEnabled() && fieldKey && annotationSession.isFieldAnnotated(fieldKey));
 
     const itemsContainer = document.createElement('div');
     itemsContainer.className = 'legend-items-container';
@@ -295,11 +362,44 @@ export function initCategoricalLegend({ state, legendEl, dataSourceManager = nul
         const left = document.createElement('span');
         left.className = 'legend-consensus-names';
         left.textContent = consensusNames || '—';
+
+        const highlightBtn = document.createElement('button');
+        highlightBtn.type = 'button';
+        highlightBtn.className = 'legend-highlight-btn';
+        highlightBtn.textContent = '◉';
+
+        const syncHighlightBtn = () => {
+          const fIdx = state.activeFieldSource === FieldSource.OBS ? state.activeFieldIndex : -1;
+          if (!Number.isInteger(fIdx) || fIdx < 0) return;
+          const group = state.findHighlightGroupByCategory?.(fIdx, catIdx, 'obs');
+          const active = Boolean(group);
+          highlightBtn.classList.toggle('legend-highlight-btn--active', active);
+          highlightBtn.title = active ? 'Remove highlight from this category' : 'Highlight all cells in this category';
+        };
+        syncHighlightBtn();
+
+        highlightBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const fIdx = state.activeFieldSource === FieldSource.OBS ? state.activeFieldIndex : -1;
+          if (!Number.isInteger(fIdx) || fIdx < 0) return;
+
+          const group = state.findHighlightGroupByCategory?.(fIdx, catIdx, 'obs');
+          if (group) {
+            // Already highlighted - remove it
+            state.removeHighlightGroup?.(group.id);
+          } else {
+            // Not highlighted - add it
+            state.addHighlightFromCategory?.(fIdx, catIdx, 'obs');
+          }
+          syncHighlightBtn();
+        });
+
         const right = document.createElement('span');
         right.className = 'legend-consensus-counts';
         right.textContent = `▲${consensusUp} ▼${consensusDown}`;
         sub.appendChild(left);
         sub.appendChild(right);
+        sub.appendChild(highlightBtn);
         labelSpan.appendChild(sub);
       }
       if (isRenamed) {
@@ -330,6 +430,7 @@ export function initCategoricalLegend({ state, legendEl, dataSourceManager = nul
       } else if (hasCells) {
         labelSpan.addEventListener('click', (e) => {
           e.stopPropagation();
+          if (!isCommunityAnnotationUiEnabled()) return;
           openCommunityAnnotationVotingModal({ state, defaultFieldKey: fieldKey, defaultCatIdx: catIdx });
         });
       }

@@ -44,16 +44,17 @@
 
 .community-annotation-panel-title {
   font-family: var(--font-display);
-  font-size: var(--text-xs);
+  font-size: var(--text-base);
   font-weight: var(--font-weight-semibold);
-  text-transform: uppercase;
-  letter-spacing: var(--tracking-wider);
+  letter-spacing: var(--tracking-tight);
+  margin-bottom: var(--space-1);
 }
 
 .community-annotation-panel-subtitle {
   font-size: var(--text-2xs);
-  color: var(--color-text-secondary);
+  color: var(--color-text-tertiary);
   line-height: var(--leading-relaxed);
+  margin-bottom: var(--space-2);
 }
 
 /* Consensus status badge */
@@ -114,6 +115,18 @@
   box-shadow: var(--shadow-md);
 }
 
+.community-annotation-suggestion-card.is-duplicate-label {
+  border-color: var(--color-warning);
+  background: var(--color-warning-soft);
+}
+
+.community-annotation-dup-note {
+  margin-top: var(--space-1);
+  font-size: var(--text-2xs);
+  color: var(--color-text-secondary);
+  line-height: var(--leading-relaxed);
+}
+
 .community-annotation-suggestion-top {
   display: flex;
   justify-content: space-between;
@@ -145,8 +158,22 @@
   color: var(--color-text-secondary);
 }
 
-.community-annotation-suggestion-evidence {
+.community-annotation-suggestion-meta {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-0-5);
   margin-top: var(--space-1);
+}
+
+.community-annotation-suggestion-meta .legend-help {
+  margin: 0;
+}
+
+.community-annotation-suggestion-meta .community-annotation-suggestion-ontology {
+  margin-top: 0;
+}
+
+.community-annotation-suggestion-evidence {
   font-size: var(--text-2xs);
   color: var(--color-text-secondary);
   line-height: var(--leading-relaxed);
@@ -208,6 +235,52 @@
   transform: translate(-1px, -1px);
 }
 
+.community-annotation-vote-btn.is-delegated {
+  border-style: dashed;
+}
+
+.community-annotation-vote-btn.is-mine.is-delegated.vote-up {
+  background: color-mix(in srgb, var(--color-success-soft) 60%, var(--color-surface-secondary));
+}
+
+.community-annotation-vote-btn.is-mine.is-delegated.vote-down {
+  background: color-mix(in srgb, var(--color-danger-soft) 60%, var(--color-surface-secondary));
+}
+
+.community-annotation-delegated-vote {
+  margin-top: var(--space-1);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-0-5) var(--space-1-5);
+  font-family: var(--font-display);
+  font-size: var(--text-2xs);
+  letter-spacing: var(--tracking-wider);
+  text-transform: uppercase;
+  border: var(--border-width-1) dashed var(--color-border-strong);
+  background: var(--color-surface-secondary);
+  box-shadow: var(--shadow-xs);
+  width: fit-content;
+}
+
+.community-annotation-delegated-vote.delegated-up {
+  border-color: var(--color-success);
+  background: color-mix(in srgb, var(--color-success-soft) 70%, var(--color-surface-secondary));
+  color: var(--color-success-text);
+}
+
+.community-annotation-delegated-vote.delegated-down {
+  border-color: var(--color-danger);
+  background: color-mix(in srgb, var(--color-danger-soft) 70%, var(--color-surface-secondary));
+  color: var(--color-danger-text);
+}
+
+.community-annotation-delegated-vote.delegated-tie {
+  border-color: var(--color-border-default);
+  background: var(--color-surface-tertiary);
+  color: var(--color-text-secondary);
+}
+
 /* Sync actions grid */
 .community-annotation-sync-actions {
   display: grid;
@@ -256,8 +329,9 @@
 
 /* Help text */
 .community-annotation-inline-help {
-  font-size: var(--text-xs);
-  color: var(--color-text-secondary);
+  font-size: var(--text-sm);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-primary);
   line-height: var(--leading-relaxed);
 }
 
@@ -278,11 +352,16 @@
   width: 100%;
   padding: var(--space-1-5) var(--space-2);
   font-size: var(--text-sm);
+  font-family: inherit;
   border: var(--border-strong);
   border-radius: 0;
   box-sizing: border-box;
-  background: var(--color-surface-elevated);
+  background-color: var(--color-surface-elevated);
+  color: var(--color-text-primary);
   box-shadow: var(--shadow-sm);
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
   transition: var(--transition-all);
 }
 
@@ -294,6 +373,7 @@
 
 .community-annotation-text-input::placeholder {
   color: var(--color-text-tertiary);
+  opacity: 1;
 }
 
 .community-annotation-voting-detail {
@@ -310,6 +390,81 @@
   box-shadow: var(--shadow-xs);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
+}
+
+.community-annotation-merge-history-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-bottom: var(--space-1);
+}
+
+.community-annotation-merge-history-count {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--color-text-tertiary);
+}
+
+.community-annotation-merge-group-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.community-annotation-merge-group-title {
+  font-family: var(--font-display);
+  font-size: var(--text-xs);
+  font-weight: var(--font-weight-medium);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--color-text-secondary);
+}
+
+.community-annotation-merge-row {
+  margin-top: var(--space-1);
+  padding: var(--space-1-5) var(--space-2);
+  background: var(--color-surface-elevated);
+  border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 22%, transparent);
+  box-shadow: var(--shadow-xs);
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-rows: auto auto;
+  grid-template-areas:
+    "desc actions"
+    "meta actions";
+  column-gap: var(--space-2);
+  row-gap: var(--space-0-5);
+  align-items: start;
+}
+
+.community-annotation-merge-desc {
+  grid-area: desc;
+  min-width: 0;
+  font-size: var(--text-sm);
+  color: var(--color-text-primary);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.community-annotation-merge-meta {
+  grid-area: meta;
+  min-width: 0;
+  font-size: var(--text-2xs);
+  color: var(--color-text-tertiary);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.community-annotation-merge-actions {
+  grid-area: actions;
+  display: flex;
+  justify-content: flex-end;
+  align-self: start;
 }
 
 .community-annotation-input {
@@ -431,6 +586,17 @@
   padding: 20px;
 }
 
+.community-annotation-secondary-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  z-index: calc(var(--z-modal) + 2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
 .community-annotation-modal {
   width: min(520px, 96vw);
   min-width: min(360px, 96vw);
@@ -445,6 +611,18 @@
   font-size: var(--text-sm);
 }
 
+.community-annotation-modal--narrow {
+  width: min(420px, 96vw);
+  min-width: min(320px, 96vw);
+  resize: none;
+}
+
+.community-annotation-secondary-modal {
+  width: min(700px, 96vw);
+  min-width: min(420px, 96vw);
+  max-height: min(86vh, 960px);
+}
+
 .community-annotation-modal-header {
   display: flex;
   justify-content: space-between;
@@ -455,7 +633,7 @@
 
 .community-annotation-modal-title {
   font-family: var(--font-display);
-  font-size: var(--text-sm);
+  font-size: var(--text-lg);
   font-weight: var(--font-weight-semibold);
 }
 
@@ -465,6 +643,56 @@
   overflow-x: hidden;
   display: flex;
   flex-direction: column;
+  gap: var(--space-2);
+}
+
+.community-annotation-inline-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-1-5);
+}
+
+.community-annotation-suggest {
+  display: none;
+  width: 100%;
+  max-height: 180px;
+  overflow-y: auto;
+  padding: var(--space-1);
+  background: var(--color-surface-secondary);
+  border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 22%, transparent);
+  box-shadow: var(--shadow-sm);
+  position: relative;
+  z-index: 5;
+}
+
+.community-annotation-suggest--popup {
+  position: fixed;
+  width: auto;
+  max-width: min(520px, calc(100vw - 40px));
+  z-index: calc(var(--z-modal) + 5);
+}
+
+.community-annotation-suggest-item {
+  padding: var(--space-1) var(--space-1-5);
+  font-size: var(--text-sm);
+  color: var(--color-text-primary);
+  cursor: pointer;
+  user-select: none;
+}
+
+.community-annotation-suggest-item:hover {
+  background: var(--color-border-light);
+}
+
+.community-annotation-suggest-item.muted {
+  cursor: default;
+  color: var(--color-text-secondary);
+}
+
+.community-annotation-bundle-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
   gap: var(--space-2);
 }
 
@@ -631,6 +859,128 @@
   gap: var(--space-1-5);
 }
 
+.community-annotation-comments-inline {
+  margin-top: var(--space-1);
+  padding: var(--space-1) var(--space-1-5);
+  background: color-mix(in srgb, var(--color-surface-tertiary) 70%, transparent);
+  border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 14%, transparent);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.community-annotation-comment-bar-wrap {
+  position: relative;
+}
+
+.community-annotation-comment-bar {
+  width: 100%;
+  padding: var(--space-0-5) var(--space-1);
+  padding-right: 6em;
+  font-size: var(--text-xs);
+  line-height: 1.2;
+  border: var(--border-strong);
+  border-radius: 0;
+  background: var(--color-surface-elevated);
+  color: var(--color-text-primary);
+  box-shadow: var(--shadow-xs);
+  resize: none;
+  min-height: 1.8em;
+  max-height: 9em;
+  overflow-y: hidden;
+}
+
+.community-annotation-char-counter--overlay {
+  position: absolute;
+  right: var(--space-1);
+  top: var(--space-0-5);
+  transform: none;
+  pointer-events: none;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--color-text-tertiary);
+  background: color-mix(in srgb, var(--color-surface-elevated) 85%, transparent);
+  padding: 0 var(--space-0-5);
+}
+
+.community-annotation-comment-bar:focus-visible {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 1px;
+}
+
+.community-annotation-comment-bar:disabled {
+  opacity: var(--opacity-75);
+}
+
+.community-annotation-comments-scroll {
+  --community-annotation-comment-box-lines: 10;
+  font-size: var(--text-2xs);
+  line-height: 1.4;
+  max-height: calc(var(--community-annotation-comment-box-lines) * 1.4em);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-0-5);
+  padding-right: var(--space-0-5);
+  position: relative;
+}
+
+.community-annotation-comments-scroll::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 14px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity var(--duration-fast) var(--easing-standard);
+  background: linear-gradient(
+    to bottom,
+    transparent,
+    color-mix(in srgb, var(--color-surface-tertiary) 92%, var(--color-surface-elevated))
+  );
+}
+
+.community-annotation-comments-scroll.is-scrollable::after {
+  opacity: 1;
+}
+
+.community-annotation-comments-scroll.is-at-bottom::after {
+  opacity: 0;
+}
+
+.community-annotation-comment-preview-item {
+  display: flex;
+  gap: var(--space-1);
+  align-items: flex-start;
+  min-width: 0;
+}
+
+.community-annotation-comment-preview-meta {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--color-text-tertiary);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.community-annotation-comment-preview-text {
+  font-size: var(--text-2xs);
+  color: var(--color-text-secondary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  flex: 1;
+  min-width: 0;
+}
+
+.community-annotation-comment-preview-more {
+  font-size: var(--text-2xs);
+  color: var(--color-text-tertiary);
+  text-align: right;
+}
+
 .community-annotation-comment {
   padding: var(--space-1-5) var(--space-2);
   background: var(--color-surface-secondary);
@@ -689,6 +1039,22 @@
 
 .community-annotation-comment-action-btn:hover {
   color: var(--color-text-secondary);
+}
+
+.community-annotation-merged-comment-btn {
+  padding: 0;
+  font-size: var(--text-2xs);
+  color: var(--color-text-tertiary);
+  background: none;
+  border: none;
+  cursor: pointer;
+  opacity: var(--opacity-75);
+  transition: var(--transition-colors);
+}
+
+.community-annotation-merged-comment-btn:hover {
+  color: var(--color-text-secondary);
+  opacity: 1;
 }
 
 .community-annotation-comment-overflow {
@@ -754,4 +1120,118 @@
   display: flex;
   gap: var(--space-1);
   justify-content: flex-end;
+}
+
+/* ========================================================================
+   CAP (Cell Annotation Platform) Integration
+   ===================================================================== */
+
+/* CAP button styling */
+.cap-btn {
+  font-size: var(--text-2xs);
+  padding: var(--space-0-5) var(--space-1-5);
+  background: var(--color-surface-tertiary);
+  border: var(--border-width-1) solid var(--color-border-default);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition: var(--transition-all);
+}
+
+.cap-btn:hover:not(:disabled) {
+  background: var(--color-surface-secondary);
+  border-color: var(--color-border-strong);
+  color: var(--color-text-primary);
+}
+
+.cap-btn:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+/* Label row with search button */
+.community-annotation-label-row {
+  display: flex;
+  gap: var(--space-1);
+  align-items: stretch;
+}
+
+.community-annotation-label-row .community-annotation-text-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.community-annotation-label-row .cap-btn {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* CAP search results dropdown */
+.cap-search-results {
+  margin-top: var(--space-1-5);
+  padding: var(--space-1-5);
+  background: var(--color-surface-elevated);
+  border: var(--border-strong);
+  box-shadow: var(--shadow-md);
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.cap-search-item {
+  padding: var(--space-1-5) var(--space-2);
+  cursor: pointer;
+  border: var(--border-width-1) solid transparent;
+  transition: var(--transition-all);
+  margin-bottom: var(--space-1);
+}
+
+.cap-search-item:hover {
+  background: var(--color-surface-secondary);
+  border-color: var(--color-border-default);
+}
+
+.cap-search-item:last-of-type {
+  margin-bottom: var(--space-1-5);
+}
+
+.cap-search-item-name {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-1-5);
+  font-weight: var(--font-weight-medium);
+  font-size: var(--text-sm);
+}
+
+.cap-search-item-synonyms,
+.cap-search-item-markers {
+  font-size: var(--text-2xs);
+  color: var(--color-text-tertiary);
+  margin-top: var(--space-0-5);
+  line-height: var(--leading-relaxed);
+}
+
+.cap-search-item-markers {
+  font-family: var(--font-mono);
+}
+
+.cap-search-empty {
+  font-size: var(--text-sm);
+  color: var(--color-text-tertiary);
+  text-align: center;
+  padding: var(--space-2);
+}
+
+.cap-search-close {
+  width: 100%;
+  margin-top: var(--space-1);
+}
+
+/* CAP ontology ID badge */
+.cap-ontology-id {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  padding: var(--space-0-5) var(--space-1);
+  background: var(--color-surface-tertiary);
+  border: var(--border-width-1) solid var(--color-border-default);
+  color: var(--color-text-secondary);
+  white-space: nowrap;
 }

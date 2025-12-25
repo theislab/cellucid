@@ -246,10 +246,10 @@
 }
 
 .legend-label-sub {
+  width: 100%;
   font-size: var(--text-2xs);
   opacity: var(--opacity-75);
-  overflow: hidden;
-  text-overflow: ellipsis;
+  overflow: visible;
   white-space: nowrap;
   display: flex;
   align-items: center;
@@ -266,12 +266,51 @@
 
 .legend-consensus-counts {
   position: absolute;
-  right: 0;
+  right: var(--space-5);
+  bottom: 0;
   font-size: var(--text-2xs);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
   text-align: right;
   opacity: var(--opacity-75);
+}
+
+.legend-highlight-btn {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  padding: 0 var(--space-1);
+  font-size: var(--text-2xs);
+  line-height: 1;
+  border-radius: var(--radius-full);
+  border: var(--border-default);
+  background: var(--color-surface-secondary);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  opacity: var(--opacity-75);
+  transition: var(--transition-colors);
+}
+
+.legend-highlight-btn:hover {
+  background: var(--color-surface-tertiary);
+  color: var(--color-text-primary);
+  opacity: 1;
+}
+
+.legend-highlight-btn:active {
+  background: var(--color-border-light);
+}
+
+.legend-highlight-btn--active {
+  background: var(--color-accent-primary, #3b82f6);
+  color: var(--color-text-on-accent, #fff);
+  border-color: var(--color-accent-primary, #3b82f6);
+  opacity: 1;
+}
+
+.legend-highlight-btn--active:hover {
+  background: var(--color-accent-hover, #2563eb);
+  border-color: var(--color-accent-hover, #2563eb);
 }
 
 .legend-count {

@@ -9,8 +9,11 @@
 
 import { getNotificationCenter } from '../../notification-center.js';
 import { getCommunityAnnotationSession } from '../../community-annotations/session.js';
-import { getCommunityAnnotationAccessStore } from '../../community-annotations/access-store.js';
+import { getCommunityAnnotationAccessStore, isAnnotationRepoConnected, isSimulateRepoConnectedEnabled } from '../../community-annotations/access-store.js';
 import { showConfirmDialog } from '../components/confirm-dialog.js';
+import * as capApi from '../../community-annotations/cap-api.js';
+import { ANNOTATION_CONNECTION_CHANGED_EVENT } from '../../community-annotations/connection-events.js';
+import { getGitHubAuthSession, getLastGitHubUserKey, toGitHubUserKey } from '../../community-annotations/github-auth.js';
 
 function el(tag, props = {}, children = []) {
   const node = document.createElement(tag);
@@ -34,6 +37,83 @@ function toCleanString(value) {
   return String(value ?? '').trim();
 }
 
+function bucketKey(fieldKey, catIdx) {
+  const f = toCleanString(fieldKey);
+  const idx = Number.isFinite(catIdx) ? Math.max(0, Math.floor(catIdx)) : 0;
+  return `${f}:${idx}`;
+}
+
+function resolveMergeTarget(fromId, fromToMap) {
+  const start = toCleanString(fromId);
+  if (!start) return null;
+  let cur = start;
+  const seen = new Set([cur]);
+  while (fromToMap.has(cur)) {
+    const next = toCleanString(fromToMap.get(cur));
+    if (!next) break;
+    if (seen.has(next)) return null;
+    seen.add(next);
+    cur = next;
+  }
+  return cur;
+}
+
+function normalizeLabelForCompare(value) {
+  return toCleanString(value).toLowerCase().replace(/\s+/g, ' ');
+}
+
+function parseMarkerGenesInput(text) {
+  const raw = toCleanString(text);
+  if (!raw) return null;
+  const parts = raw.split(',').map((s) => toCleanString(s)).filter(Boolean);
+  if (!parts.length) return null;
+  const seen = new Set();
+  const out = [];
+  for (const p of parts) {
+    const gene = p.replace(/\s+/g, '');
+    if (!gene) continue;
+    const cleaned = gene.slice(0, 40);
+    const key = cleaned.toUpperCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(cleaned);
+    if (out.length >= 50) break;
+  }
+  return out.length ? out : null;
+}
+
+function markersToGeneList(markers) {
+  const list = Array.isArray(markers) ? markers : [];
+  const out = [];
+  const seen = new Set();
+  for (const m of list.slice(0, 200)) {
+    let gene = '';
+    if (typeof m === 'string') gene = toCleanString(m);
+    else if (m && typeof m === 'object') gene = toCleanString(m.gene);
+    gene = gene.replace(/\s+/g, '');
+    if (!gene) continue;
+    const key = gene.toUpperCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(gene);
+    if (out.length >= 50) break;
+  }
+  return out;
+}
+
+function markersToDisplayText(markers) {
+  const genes = markersToGeneList(markers);
+  if (!genes.length) return '';
+  const shown = genes.slice(0, 8);
+  const suffix = genes.length > shown.length ? ` +${genes.length - shown.length}` : '';
+  return `Markers: ${shown.join(', ')}${suffix}`;
+}
+
+function markersToInputText(markers) {
+  const genes = markersToGeneList(markers);
+  return genes.length ? genes.slice(0, 20).join(', ') : '';
+}
+
 function formatRelativeTime(isoString) {
   if (!isoString) return '';
   try {
@@ -54,7 +134,76 @@ function formatRelativeTime(isoString) {
   }
 }
 
-function renderComment({ session, fieldKey, catIdx, suggestionId, comment, onUpdate }) {
+// =============================================================================
+// CAP Integration UI Components
+// =============================================================================
+
+/**
+ * Render CAP search results dropdown
+ */
+function renderCapSearchResults({ results, onSelect, onClose }) {
+  const container = el('div', { className: 'cap-search-results' });
+
+  if (!results?.length) {
+    container.appendChild(el('div', { className: 'cap-search-empty', text: 'No results found in CAP database' }));
+  } else {
+    for (const result of results.slice(0, 8)) {
+      const item = el('div', { className: 'cap-search-item' });
+
+      const nameRow = el('div', { className: 'cap-search-item-name' });
+      nameRow.appendChild(el('span', { text: result.name }));
+      if (result.ontologyTermId) {
+        nameRow.appendChild(el('span', { className: 'cap-ontology-id', text: result.ontologyTermId }));
+      }
+      item.appendChild(nameRow);
+
+      if (result.synonyms?.length) {
+        item.appendChild(el('div', { className: 'cap-search-item-synonyms', text: `Synonyms: ${result.synonyms.slice(0, 3).join(', ')}${result.synonyms.length > 3 ? '...' : ''}` }));
+      }
+
+      if (result.markerGenes?.length) {
+        item.appendChild(el('div', { className: 'cap-search-item-markers', text: `Markers: ${result.markerGenes.slice(0, 5).join(', ')}${result.markerGenes.length > 5 ? '...' : ''}` }));
+      }
+
+      item.addEventListener('click', () => {
+        onSelect?.(result);
+        onClose?.();
+      });
+
+      container.appendChild(item);
+    }
+  }
+
+  const closeBtn = el('button', { type: 'button', className: 'btn-small cap-search-close', text: 'Close' });
+  closeBtn.addEventListener('click', () => onClose?.());
+  container.appendChild(closeBtn);
+
+  return container;
+}
+
+function truncateText(text, maxLen) {
+  const s = toCleanString(text);
+  if (!s) return '';
+  const max = Number.isFinite(maxLen) ? Math.max(0, Math.floor(maxLen)) : 160;
+  if (s.length <= max) return s;
+  return `${s.slice(0, max).trim()}…`;
+}
+
+function autoSizeTextarea(textarea, { minHeightPx = null, maxHeightPx = null } = {}) {
+  const el = textarea || null;
+  if (!el) return;
+  try {
+    el.style.height = 'auto';
+    const next = Math.max(minHeightPx ?? 0, el.scrollHeight || 0);
+    const capped = maxHeightPx != null ? Math.min(next, maxHeightPx) : next;
+    el.style.height = `${capped}px`;
+    el.style.overflowY = maxHeightPx != null && next > maxHeightPx ? 'auto' : 'hidden';
+  } catch {
+    // ignore
+  }
+}
+
+function renderComment({ session, fieldKey, catIdx, suggestionId, comment, canInteract = true, onUpdate }) {
   const isOwn = session.isMyComment(comment?.authorUsername);
   const commentEl = el('div', { className: `community-annotation-comment${isOwn ? ' is-own' : ''}` });
 
@@ -70,7 +219,7 @@ function renderComment({ session, fieldKey, catIdx, suggestionId, comment, onUpd
   const textEl = el('div', { className: 'community-annotation-comment-text', text: comment?.text || '' });
   commentEl.appendChild(textEl);
 
-  if (isOwn) {
+  if (isOwn && canInteract) {
     const actions = el('div', { className: 'community-annotation-comment-actions' });
     const editBtn = el('button', { type: 'button', className: 'community-annotation-comment-action-btn', text: 'Edit' });
     const deleteBtn = el('button', { type: 'button', className: 'community-annotation-comment-action-btn', text: 'Delete' });
@@ -80,13 +229,13 @@ function renderComment({ session, fieldKey, catIdx, suggestionId, comment, onUpd
       const input = el('textarea', {
         className: 'community-annotation-comment-input',
         placeholder: 'Edit comment...',
-        maxlength: '500'
+        maxlength: '256'
       });
       input.value = comment?.text || '';
 
-      const charCounter = el('div', { className: 'community-annotation-char-counter', text: `${input.value.length}/500` });
+      const charCounter = el('div', { className: 'community-annotation-char-counter', text: `${input.value.length}/256` });
       input.addEventListener('input', () => {
-        charCounter.textContent = `${input.value.length}/500`;
+        charCounter.textContent = `${input.value.length}/256`;
       });
 
       const formActions = el('div', { className: 'community-annotation-comment-form-actions' });
@@ -179,128 +328,630 @@ function showModal({ title, buildContent }) {
   return { close, overlay, modal, content };
 }
 
-function renderSuggestionCard({ session, fieldKey, catIdx, suggestion }) {
+/** @type {{close?: Function} | null} */
+let activeSecondaryModal = null;
+
+/** @type {null | {fieldKey:string, catIdx:number, suggestionId:string}} */
+let activeSuggestionMergeDrag = null;
+
+function renderMergeRow({ session, fieldKey, catIdx, merge, idToLabel, canDetach }) {
+  const fromId = toCleanString(merge?.fromSuggestionId);
+  const intoId = toCleanString(merge?.intoSuggestionId);
+  const fromLabel = idToLabel?.get(fromId) || fromId || '—';
+  const intoLabel = idToLabel?.get(intoId) || intoId || '—';
+  const meta = [
+    toCleanString(merge?.by) ? `@${toCleanString(merge.by)}` : null,
+    toCleanString(merge?.at) ? toCleanString(merge.at) : null,
+    toCleanString(merge?.note) ? `“${toCleanString(merge.note)}”` : null
+  ].filter(Boolean).join(' • ');
+
+  const row = el('div', { className: 'community-annotation-merge-row' });
+  row.appendChild(el('div', { className: 'community-annotation-merge-desc', text: `${fromLabel} → ${intoLabel}` }));
+  if (meta) row.appendChild(el('div', { className: 'community-annotation-merge-meta', text: meta }));
+
+  if (canDetach && fromId) {
+    const actions = el('div', { className: 'community-annotation-merge-actions' });
+    const detachBtn = el('button', { type: 'button', className: 'btn-small', text: 'Detach' });
+    detachBtn.addEventListener('click', () => {
+      showConfirmDialog({
+        title: 'Detach merge?',
+        message: `Detach "${fromLabel}" from its merged bundle?`,
+        confirmText: 'Detach',
+        onConfirm: () => {
+          const ok = session.detachModerationMerge?.({ fieldKey, catIdx, fromSuggestionId: fromId });
+          if (ok) getNotificationCenter().success('Detached (local moderation)', { category: 'annotation', duration: 2200 });
+          else getNotificationCenter().error('Unable to detach', { category: 'annotation' });
+        }
+      });
+    });
+    actions.appendChild(detachBtn);
+    row.appendChild(actions);
+  }
+
+  return row;
+}
+
+function showSecondaryModal({ title, buildContent, session = null }) {
+  try {
+    activeSecondaryModal?.close?.();
+  } catch {
+    // ignore
+  }
+  activeSecondaryModal = null;
+
+  const overlay = el('div', { className: 'community-annotation-secondary-overlay', role: 'dialog', 'aria-modal': 'true' });
+  const modal = el('div', { className: 'community-annotation-modal community-annotation-secondary-modal', role: 'document' });
+
+  const header = el('div', { className: 'community-annotation-modal-header' });
+  header.appendChild(el('div', { className: 'community-annotation-modal-title', text: title || 'Details' }));
+  const closeBtn = el('button', { type: 'button', className: 'btn-small community-annotation-modal-close', text: 'Close' });
+  header.appendChild(closeBtn);
+
+  const content = el('div', { className: 'community-annotation-modal-body' });
+
+  modal.appendChild(header);
+  modal.appendChild(content);
+  overlay.appendChild(modal);
+
+  let unsubscribe = null;
+  let ownerObserver = null;
+  const ownerOverlay = document.querySelector('.community-annotation-modal-overlay');
+
+  const render = () => {
+    content.innerHTML = '';
+    try {
+      buildContent?.(content, { close });
+    } catch {
+      // ignore
+    }
+  };
+
+  const close = () => {
+    try {
+      unsubscribe?.();
+    } catch {
+      // ignore
+    }
+    try {
+      ownerObserver?.disconnect?.();
+    } catch {
+      // ignore
+    }
+    try {
+      document.removeEventListener('keydown', onKeyDown, true);
+    } catch {
+      // ignore
+    }
+    overlay.remove();
+    if (activeSecondaryModal?.close === close) activeSecondaryModal = null;
+  };
+
+  closeBtn.addEventListener('click', close);
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) close();
+  });
+  const onKeyDown = (e) => {
+    if (e.key !== 'Escape') return;
+    try {
+      e.preventDefault?.();
+      e.stopPropagation?.();
+      e.stopImmediatePropagation?.();
+    } catch {
+      // ignore
+    }
+    close();
+  };
+  document.addEventListener('keydown', onKeyDown, true);
+
+  document.body.appendChild(overlay);
+  closeBtn.focus?.();
+
+  if (session && typeof session.on === 'function') {
+    unsubscribe = session.on('changed', () => render());
+  }
+
+  try {
+    if (ownerOverlay && typeof MutationObserver !== 'undefined') {
+      ownerObserver = new MutationObserver(() => {
+        if (!document.body.contains(ownerOverlay)) close();
+      });
+      ownerObserver.observe(document.body, { childList: true, subtree: true });
+    }
+  } catch {
+    // ignore
+  }
+
+  render();
+
+  activeSecondaryModal = { close };
+  return { close, overlay, modal, content };
+}
+
+function openMergedSuggestionsModal({ session, fieldKey, catIdx, targetSuggestionId }) {
+  const access = getCommunityAnnotationAccessStore();
+  const isClosed = session.isFieldClosed?.(fieldKey) === true;
+  const canInteract = !isClosed || access.isAuthor();
+
+  showSecondaryModal({
+    title: 'Merged suggestions',
+    session,
+    buildContent: (content) => {
+      const bucket = bucketKey(fieldKey, catIdx);
+      const mergesAll = session.getModerationMerges?.() || [];
+      const merges = Array.isArray(mergesAll) ? mergesAll.filter((m) => toCleanString(m?.bucket) === bucket) : [];
+
+      const all = session.getSuggestions?.(fieldKey, catIdx) || [];
+      const target = (Array.isArray(all) ? all : []).find((s) => toCleanString(s?.id) === toCleanString(targetSuggestionId)) || null;
+      const mergedFrom = Array.isArray(target?.mergedFrom) ? target.mergedFrom : [];
+
+      if (!target || !mergedFrom.length) {
+        content.appendChild(el('div', { className: 'legend-help', text: 'No merged suggestions for this bundle.' }));
+        return;
+      }
+
+      const canDetach = access.isAuthor();
+
+      const idToLabel = new Map();
+      try {
+        const tid = toCleanString(target?.id);
+        if (tid) idToLabel.set(tid, toCleanString(target?.label) || tid);
+        for (const s of mergedFrom) {
+          const id = toCleanString(s?.id);
+          if (!id) continue;
+          idToLabel.set(id, toCleanString(s?.label) || id);
+        }
+      } catch {
+        // ignore
+      }
+      try {
+        const snap = session.getStateSnapshot?.() || null;
+        const raw = snap?.suggestions?.[bucket] || [];
+        for (const s of (Array.isArray(raw) ? raw : []).slice(0, 5000)) {
+          const id = toCleanString(s?.id);
+          if (!id || idToLabel.has(id)) continue;
+          idToLabel.set(id, toCleanString(s?.label) || id);
+        }
+      } catch {
+        // ignore
+      }
+
+      const targetId = toCleanString(target?.id);
+      content.appendChild(el('div', { className: 'community-annotation-inline-help', text: `Bundle: ${toCleanString(target?.label) || '—'}` }));
+      content.appendChild(el('div', {
+        className: 'legend-help',
+        text:
+          `Bundle total (de-duplicated per user): ▲${target.upvotes?.length || 0} ▼${target.downvotes?.length || 0}. ` +
+          'Cards below keep their own comments; merge rows show the chain and optional notes.'
+      }));
+      content.appendChild(el('div', {
+        className: 'legend-help',
+        text: 'If you have no direct vote on the bundle main card, your bundle vote is delegated from member votes (majority; ties = none) and shown with a dashed badge.'
+      }));
+
+      // Effective mapping (one active merge per from id).
+      const fromTo = new Map();
+      const mergeByFrom = new Map();
+      for (const m of merges) {
+        const from = toCleanString(m?.fromSuggestionId);
+        const into = toCleanString(m?.intoSuggestionId);
+        if (!from || !into || from === into) continue;
+        fromTo.set(from, into);
+        mergeByFrom.set(from, m);
+      }
+
+      // Which "from" ids resolve into this bundle target?
+      const includedFromIds = [];
+      for (const fromId of fromTo.keys()) {
+        const resolved = resolveMergeTarget(fromId, fromTo) || fromId;
+        if (resolved === targetId) includedFromIds.push(fromId);
+      }
+      const includedFromSet = new Set(includedFromIds);
+
+      // Roots: merged suggestions that aren't the "into" of another included merge.
+      const intoSet = new Set();
+      for (const fromId of includedFromIds) {
+        const into = toCleanString(fromTo.get(fromId));
+        if (into) intoSet.add(into);
+      }
+      const roots = includedFromIds.filter((fromId) => !intoSet.has(fromId));
+      roots.sort((a, b) => String(idToLabel.get(a) || a).localeCompare(String(idToLabel.get(b) || b)));
+
+      const suggestionById = new Map();
+      if (targetId) suggestionById.set(targetId, target);
+      for (const s of mergedFrom) {
+        const id = toCleanString(s?.id);
+        if (!id) continue;
+        suggestionById.set(id, s);
+      }
+
+      const list = el('div', { className: 'community-annotation-suggestions' });
+      const renderedCards = new Set();
+      const renderedMergeFrom = new Set();
+
+      const renderCard = (id) => {
+        const sid = toCleanString(id);
+        if (!sid || renderedCards.has(sid)) return;
+        const s = suggestionById.get(sid) || null;
+        if (!s) return;
+        renderedCards.add(sid);
+        list.appendChild(renderSuggestionCard({
+          session,
+          fieldKey,
+          catIdx,
+          suggestion: s,
+          canInteract,
+          duplicateLabelKeys: null,
+          variant: 'full',
+          showMergedBundleRow: false,
+          allowModerationDrag: false,
+          voteDisplayMode: sid === targetId ? 'bundle' : 'direct'
+        }));
+      };
+
+      const renderChainFrom = (rootId) => {
+        let cur = toCleanString(rootId);
+        const seen = new Set();
+        while (cur && !seen.has(cur) && cur !== targetId && includedFromSet.has(cur)) {
+          seen.add(cur);
+          renderCard(cur);
+
+          const merge = mergeByFrom.get(cur) || null;
+          if (merge) {
+            renderedMergeFrom.add(cur);
+            list.appendChild(renderMergeRow({ session, fieldKey, catIdx, merge, idToLabel, canDetach }));
+          }
+
+          cur = toCleanString(fromTo.get(cur));
+        }
+        if (cur && cur !== targetId) renderCard(cur);
+      };
+
+      for (const root of roots) renderChainFrom(root);
+
+      // Fallback: any included merges not reached by roots (cycles/odd graphs).
+      for (const fromId of includedFromIds) {
+        const from = toCleanString(fromId);
+        if (from) renderCard(from);
+        const merge = mergeByFrom.get(fromId) || null;
+        if (merge && !renderedMergeFrom.has(fromId)) {
+          list.appendChild(renderMergeRow({ session, fieldKey, catIdx, merge, idToLabel, canDetach }));
+          renderedMergeFrom.add(fromId);
+        }
+        const into = toCleanString(fromTo.get(fromId));
+        if (into && into !== targetId) renderCard(into);
+      }
+
+      // Always render the target card last for context.
+      renderCard(targetId);
+
+      content.appendChild(list);
+    }
+  });
+}
+
+function renderSuggestionCard({
+  session,
+  fieldKey,
+  catIdx,
+  suggestion,
+  canInteract = true,
+  duplicateLabelKeys = null,
+  variant = 'full',
+  showMergedBundleRow = true,
+  allowModerationDrag = true,
+  voteDisplayMode = 'bundle'
+}) {
+  const isCompact = variant === 'compact';
   const up = suggestion?.upvotes?.length || 0;
   const down = suggestion?.downvotes?.length || 0;
   const net = up - down;
-  const myVote = session.getMyVote(fieldKey, catIdx, suggestion?.id);
+  const directVote = session.getMyVoteDirect?.(fieldKey, catIdx, suggestion?.id) ?? session.getMyVote?.(fieldKey, catIdx, suggestion?.id) ?? null;
+  const bundleInfo = voteDisplayMode === 'bundle' && session.getMyBundleVoteInfo
+    ? session.getMyBundleVoteInfo(fieldKey, catIdx, suggestion?.id)
+    : { vote: directVote, source: directVote ? 'direct' : 'none', delegatedUp: 0, delegatedDown: 0 };
+  const myVote = bundleInfo?.vote || null;
+  const isDelegated = bundleInfo?.source === 'delegated';
+  const delegatedUp = Number(bundleInfo?.delegatedUp || 0);
+  const delegatedDown = Number(bundleInfo?.delegatedDown || 0);
+  const isDelegationTie = bundleInfo?.source === 'none' && !myVote && (delegatedUp + delegatedDown) > 0;
   const access = getCommunityAnnotationAccessStore();
   const canModerate = access.isAuthor();
+  const myUser = toCleanString(session.getProfile?.()?.username || '').replace(/^@+/, '').toLowerCase();
+  const proposer = toCleanString(suggestion?.proposedBy || '').replace(/^@+/, '').toLowerCase();
+  const isMine = Boolean(myUser && proposer && myUser === proposer);
 
   const card = el('div', { className: 'community-annotation-suggestion-card' });
+  const labelKey = normalizeLabelForCompare(suggestion?.label || '');
+  const isDuplicate = Boolean(labelKey && duplicateLabelKeys && duplicateLabelKeys.has(labelKey));
+  if (isDuplicate) card.classList.add('is-duplicate-label');
   const top = el('div', { className: 'community-annotation-suggestion-top' });
   top.appendChild(el('div', { className: 'community-annotation-suggestion-label', text: suggestion?.label || '' }));
   top.appendChild(el('div', { className: 'community-annotation-suggestion-net', text: `net ${net}` }));
   card.appendChild(top);
 
-  if (suggestion?.ontologyId) card.appendChild(el('div', { className: 'community-annotation-suggestion-ontology', text: suggestion.ontologyId }));
-  if (suggestion?.evidence) card.appendChild(el('div', { className: 'community-annotation-suggestion-evidence', text: suggestion.evidence }));
-  const mergeNotes = Array.isArray(suggestion?.mergeNotes) ? suggestion.mergeNotes : [];
-  if (mergeNotes.length) {
-    for (const note of mergeNotes.slice(0, 3)) {
-      card.appendChild(el('div', { className: 'community-annotation-suggestion-evidence', text: note }));
-    }
+  if ((isDelegated && (myVote === 'up' || myVote === 'down')) || isDelegationTie) {
+    const icon = isDelegationTie ? '±' : (myVote === 'up' ? '▲' : '▼');
+    const label = isDelegationTie ? 'Delegation tie' : (myVote === 'up' ? 'Delegated upvote' : 'Delegated downvote');
+    const detail = (delegatedUp || delegatedDown) ? ` (${delegatedUp}▲ / ${delegatedDown}▼)` : '';
+    card.appendChild(el('div', {
+      className: `community-annotation-delegated-vote ${isDelegationTie ? 'delegated-tie' : `delegated-${myVote}`}`,
+      text: `${icon} ${label}${detail}`
+    }));
   }
 
+  if (isDuplicate) {
+    card.appendChild(el('div', {
+      className: 'community-annotation-dup-note',
+      text: canModerate ? 'Duplicate label (drag to merge if needed).' : 'Duplicate label (votes may be split).'
+    }));
+  }
+
+  const meta = el('div', { className: 'community-annotation-suggestion-meta' });
+  const ontologyId = toCleanString(suggestion?.ontologyId || '');
+  meta.appendChild(el('div', { className: 'community-annotation-suggestion-ontology', text: `Ontology: ${ontologyId || '—'}` }));
+
+  const markers = markersToGeneList(suggestion?.markers);
+  const markerSummary = markers.length ? `${markers.slice(0, 10).join(', ')}${markers.length > 10 ? ` +${markers.length - 10}` : ''}` : '—';
+  meta.appendChild(el('div', { className: 'legend-help', text: `Markers: ${markerSummary}` }));
+
+  const evidence = toCleanString(suggestion?.evidence || '');
+  const evidenceShort = evidence ? truncateText(evidence, 220) : '';
+  const evidenceText = evidenceShort || '—';
+  const evidenceRow = el('div', { className: 'community-annotation-suggestion-evidence', text: `Evidence: ${evidenceText}` });
+  meta.appendChild(evidenceRow);
+  if (evidence && evidenceShort !== evidence) {
+    const moreBtn = el('button', { type: 'button', className: 'community-annotation-merged-comment-btn', text: 'View full evidence' });
+    moreBtn.addEventListener('click', () => {
+      showSecondaryModal({
+        title: 'Evidence',
+        session: null,
+        buildContent: (content) => {
+          content.appendChild(el('div', { className: 'community-annotation-inline-help', text: toCleanString(suggestion?.label) || 'Suggestion' }));
+          content.appendChild(el('div', { className: 'community-annotation-dashed-box', text: evidence }));
+        }
+      });
+    });
+    meta.appendChild(moreBtn);
+  }
+
+  card.appendChild(meta);
+
   const actions = el('div', { className: 'community-annotation-suggestion-actions' });
-  const upBtn = el('button', { type: 'button', className: 'btn-small community-annotation-vote-btn vote-up', text: `▲ ${up}` });
-  const downBtn = el('button', { type: 'button', className: 'btn-small community-annotation-vote-btn vote-down', text: `▼ ${down}` });
+  const upBtn = el('button', { type: 'button', className: 'btn-small community-annotation-vote-btn vote-up', text: `▲ ${up}`, disabled: !canInteract });
+  const downBtn = el('button', { type: 'button', className: 'btn-small community-annotation-vote-btn vote-down', text: `▼ ${down}`, disabled: !canInteract });
   if (myVote === 'up') upBtn.classList.add('is-mine');
   if (myVote === 'down') downBtn.classList.add('is-mine');
-  upBtn.addEventListener('click', () => session.vote(fieldKey, catIdx, suggestion.id, 'up'));
-  downBtn.addEventListener('click', () => session.vote(fieldKey, catIdx, suggestion.id, 'down'));
+  if (isDelegated) {
+    if (myVote === 'up') upBtn.classList.add('is-delegated');
+    if (myVote === 'down') downBtn.classList.add('is-delegated');
+  }
+
+  if (canInteract) {
+    upBtn.addEventListener('click', () => {
+      session.vote(fieldKey, catIdx, suggestion.id, 'up');
+    });
+    downBtn.addEventListener('click', () => {
+      session.vote(fieldKey, catIdx, suggestion.id, 'down');
+    });
+  }
   actions.appendChild(upBtn);
   actions.appendChild(downBtn);
+
+  let editBox = null;
+  if (!isCompact && isMine && canInteract) {
+    const editBtn = el('button', { type: 'button', className: 'btn-small', text: 'Edit' });
+
+    editBox = el('div', { className: 'community-annotation-dashed-box', style: 'display: none; margin-top: 8px;' });
+    editBox.appendChild(el('div', { className: 'community-annotation-new-title', text: 'Edit suggestion' }));
+
+    const editForm = el('div', { className: 'community-annotation-new community-annotation-new-vertical' });
+    const labelInput = el('input', { type: 'text', className: 'community-annotation-text-input', placeholder: 'Label (required)' });
+    const ontInput = el('input', { type: 'text', className: 'community-annotation-text-input', placeholder: 'Ontology id (optional, e.g. CL:0000625)' });
+    const markerGenesInput = el('input', { type: 'text', className: 'community-annotation-text-input', placeholder: 'Marker genes (optional, comma-separated)' });
+    const evidenceInput = el('textarea', { className: 'community-annotation-text-input community-annotation-textarea', placeholder: 'Evidence (optional)' });
+
+    const populateFromSuggestion = () => {
+      labelInput.value = suggestion?.label || '';
+      ontInput.value = suggestion?.ontologyId || '';
+      markerGenesInput.value = markersToInputText(suggestion?.markers);
+      evidenceInput.value = suggestion?.evidence || '';
+    };
+
+    const editActions = el('div', { className: 'community-annotation-suggestion-actions' });
+    const saveBtn = el('button', { type: 'button', className: 'btn-small', text: 'Save' });
+    const cancelBtn = el('button', { type: 'button', className: 'btn-small', text: 'Cancel' });
+    editActions.appendChild(saveBtn);
+    editActions.appendChild(cancelBtn);
+
+    saveBtn.addEventListener('click', () => {
+      try {
+        const markers = parseMarkerGenesInput(markerGenesInput.value);
+        session.editMySuggestion?.(fieldKey, catIdx, suggestion?.id, {
+          label: labelInput.value,
+          ontologyId: ontInput.value,
+          evidence: evidenceInput.value,
+          markers
+        });
+        getNotificationCenter().success('Suggestion updated', { category: 'annotation', duration: 1500 });
+        editBox.style.display = 'none';
+        editBtn.textContent = 'Edit';
+      } catch (err) {
+        getNotificationCenter().error(err?.message || 'Failed to update suggestion', { category: 'annotation' });
+      }
+    });
+
+    cancelBtn.addEventListener('click', () => {
+      editBox.style.display = 'none';
+      editBtn.textContent = 'Edit';
+      populateFromSuggestion();
+    });
+
+    editBtn.addEventListener('click', () => {
+      const open = editBox.style.display === 'none';
+      if (open) populateFromSuggestion();
+      editBox.style.display = open ? '' : 'none';
+      editBtn.textContent = open ? 'Hide edit' : 'Edit';
+      if (open) labelInput.focus?.();
+    });
+
+    editForm.appendChild(labelInput);
+    editForm.appendChild(ontInput);
+    editForm.appendChild(markerGenesInput);
+    editForm.appendChild(evidenceInput);
+    editForm.appendChild(editActions);
+    editBox.appendChild(editForm);
+
+    actions.appendChild(editBtn);
+
+    const delBtn = el('button', { type: 'button', className: 'btn-small', text: 'Delete' });
+    delBtn.addEventListener('click', () => {
+      showConfirmDialog({
+        title: 'Delete your suggestion?',
+        message:
+          `This will remove your suggestion "${toCleanString(suggestion?.label) || ''}" from the community list once you Publish.\n\n` +
+          `Your local vote/comment data for this suggestion will also be removed.`,
+        confirmText: 'Delete',
+        onConfirm: () => {
+          const ok = session.deleteMySuggestion?.(fieldKey, catIdx, suggestion?.id);
+          if (ok) {
+            getNotificationCenter().success('Suggestion deleted (local)', { category: 'annotation', duration: 1800 });
+          } else {
+            getNotificationCenter().error('Unable to delete this suggestion', { category: 'annotation' });
+          }
+        }
+      });
+    });
+    actions.appendChild(delBtn);
+  }
+
   card.appendChild(actions);
+  if (editBox) card.appendChild(editBox);
 
   const by = el('div', { className: 'legend-help', text: session.formatUserAttribution(suggestion?.proposedBy || '') });
   card.appendChild(by);
 
-  // Comments section
-  const commentsSection = el('div', { className: 'community-annotation-comments-section' });
-  const commentsList = el('div', { className: 'community-annotation-comments-list' });
+  const mergedFrom = Array.isArray(suggestion?.mergedFrom) ? suggestion.mergedFrom : [];
+  if (!isCompact && showMergedBundleRow && mergedFrom.length && suggestion?.id) {
+    const bundleRow = el('div', { className: 'community-annotation-bundle-row' });
+    bundleRow.appendChild(el('div', {
+      className: 'legend-help',
+      text: `Merged bundle (${mergedFrom.length + 1} suggestions) • votes de-duplicated`
+    }));
+    const mergedBtn = el('button', {
+      type: 'button',
+      className: 'community-annotation-merged-comment-btn',
+      text: `View merged (${mergedFrom.length})`,
+      title: 'View original votes and comments for merged suggestions'
+    });
+    mergedBtn.addEventListener('click', () => {
+      openMergedSuggestionsModal({ session, fieldKey, catIdx, targetSuggestionId: suggestion.id });
+    });
+    bundleRow.appendChild(mergedBtn);
+    card.appendChild(bundleRow);
+  }
 
-  const renderCommentsList = () => {
-    commentsList.innerHTML = '';
-    const comments = session.getComments(fieldKey, catIdx, suggestion?.id);
-    for (const c of comments.slice(0, 10)) {
-      commentsList.appendChild(
-        renderComment({
-          session,
-          fieldKey,
-          catIdx,
-          suggestionId: suggestion?.id,
-          comment: c,
-          onUpdate: renderCommentsList
-        })
-      );
+  const comments = (() => {
+    try {
+      const list = session.getComments?.(fieldKey, catIdx, suggestion?.id) || [];
+      return Array.isArray(list) ? list : [];
+    } catch {
+      return [];
     }
-    if (comments.length > 10) {
-      commentsList.appendChild(el('div', { className: 'community-annotation-comment-overflow', text: `+${comments.length - 10} more comments` }));
+  })();
+  if (!isCompact && suggestion?.id) {
+    const commentsBox = el('div', { className: 'community-annotation-comments-inline' });
+
+    const input = el('textarea', {
+      className: 'community-annotation-comment-bar',
+      placeholder: canInteract ? 'Write a comment and press Enter…' : 'Comments are read-only (closed by author).',
+      maxlength: '256',
+      rows: '1',
+      disabled: !canInteract
+    });
+    const charCounter = el('div', {
+      className: 'community-annotation-char-counter community-annotation-char-counter--overlay',
+      text: `${input.value.length}/256`
+    });
+    const resizeInput = () => {
+      const cs = getComputedStyle(input);
+      const minHeight = Number.parseFloat(cs.minHeight || '') || null;
+      const maxHeight = Number.parseFloat(cs.maxHeight || '') || null;
+      autoSizeTextarea(input, { minHeightPx: minHeight, maxHeightPx: maxHeight });
+    };
+    input.addEventListener('input', () => {
+      charCounter.textContent = `${input.value.length}/256`;
+      resizeInput();
+    });
+    input.addEventListener('keydown', (e) => {
+      if (!canInteract) return;
+      if (e.key !== 'Enter' || e.shiftKey) return;
+      e.preventDefault();
+      const text = toCleanString(input.value);
+      if (!text) return;
+      const id = session.addComment?.(fieldKey, catIdx, suggestion.id, text);
+      if (id) {
+        input.value = '';
+        charCounter.textContent = '0/256';
+        resizeInput();
+        getNotificationCenter().success('Comment added', { category: 'annotation', duration: 1200 });
+      } else {
+        getNotificationCenter().error('Failed to add comment', { category: 'annotation' });
+      }
+    });
+    const inputWrap = el('div', { className: 'community-annotation-comment-bar-wrap' });
+    inputWrap.appendChild(input);
+    inputWrap.appendChild(charCounter);
+    commentsBox.appendChild(inputWrap);
+    try {
+      if (typeof requestAnimationFrame === 'function') requestAnimationFrame(resizeInput);
+      else setTimeout(resizeInput, 0);
+    } catch {
+      // ignore
     }
-  };
-  renderCommentsList();
 
-  commentsSection.appendChild(commentsList);
+    const sorted = comments
+      .slice()
+      .sort((a, b) => toCleanString(b?.createdAt || '').localeCompare(toCleanString(a?.createdAt || '')));
 
-  // Add comment form (collapsible)
-  const addCommentBtn = el('button', { type: 'button', className: 'community-annotation-add-comment-btn', text: 'Add comment' });
-  const commentFormContainer = el('div', { className: 'community-annotation-comment-form', style: 'display: none;' });
-
-  const commentInput = el('textarea', {
-    className: 'community-annotation-comment-input',
-    placeholder: 'Write a comment...',
-    maxlength: '500'
-  });
-  const charCounter = el('div', { className: 'community-annotation-char-counter', text: '0/500' });
-  commentInput.addEventListener('input', () => {
-    charCounter.textContent = `${commentInput.value.length}/500`;
-  });
-
-  const formActions = el('div', { className: 'community-annotation-comment-form-actions' });
-  const submitBtn = el('button', { type: 'button', className: 'btn-small', text: 'Post' });
-  const cancelBtn = el('button', { type: 'button', className: 'btn-small', text: 'Cancel' });
-
-  submitBtn.addEventListener('click', () => {
-    const text = commentInput.value.trim();
-    if (!text) return;
-    const id = session.addComment(fieldKey, catIdx, suggestion?.id, text);
-    if (id) {
-      commentInput.value = '';
-      charCounter.textContent = '0/500';
-      commentFormContainer.style.display = 'none';
-      addCommentBtn.style.display = '';
-      renderCommentsList();
-      getNotificationCenter().success('Comment added', { category: 'annotation', duration: 1500 });
-    } else {
-      getNotificationCenter().error('Failed to add comment', { category: 'annotation' });
+    const scroll = el('div', { className: 'community-annotation-comments-scroll' });
+    for (const c of sorted.slice(0, 1000)) {
+      const author = toCleanString(c?.authorUsername || '') || 'local';
+      const time = toCleanString(c?.editedAt || c?.createdAt || '');
+      const metaText = `@${author}${time ? ` • ${formatRelativeTime(time)}` : ''}`;
+      const item = el('div', { className: 'community-annotation-comment-preview-item' });
+      item.appendChild(el('span', { className: 'community-annotation-comment-preview-meta', text: metaText }));
+      const fullText = toCleanString(c?.text || '');
+      const textEl = el('span', { className: 'community-annotation-comment-preview-text', text: fullText });
+      item.appendChild(textEl);
+      scroll.appendChild(item);
     }
-  });
+    const updateScrollFade = () => {
+      try {
+        const scrollable = scroll.scrollHeight > scroll.clientHeight + 1;
+        scroll.classList.toggle('is-scrollable', scrollable);
+        if (!scrollable) {
+          scroll.classList.remove('is-at-bottom');
+          return;
+        }
+        const atBottom = scroll.scrollTop + scroll.clientHeight >= scroll.scrollHeight - 1;
+        scroll.classList.toggle('is-at-bottom', atBottom);
+      } catch {
+        // ignore
+      }
+    };
+    scroll.addEventListener('scroll', updateScrollFade, { passive: true });
+    try {
+      if (typeof requestAnimationFrame === 'function') requestAnimationFrame(updateScrollFade);
+      else setTimeout(updateScrollFade, 0);
+      setTimeout(updateScrollFade, 60);
+    } catch {
+      // ignore
+    }
+    commentsBox.appendChild(scroll);
+    card.appendChild(commentsBox);
+  }
 
-  cancelBtn.addEventListener('click', () => {
-    commentInput.value = '';
-    charCounter.textContent = '0/500';
-    commentFormContainer.style.display = 'none';
-    addCommentBtn.style.display = '';
-  });
-
-  formActions.appendChild(submitBtn);
-  formActions.appendChild(cancelBtn);
-  commentFormContainer.appendChild(commentInput);
-  commentFormContainer.appendChild(charCounter);
-  commentFormContainer.appendChild(formActions);
-
-  addCommentBtn.addEventListener('click', () => {
-    addCommentBtn.style.display = 'none';
-    commentFormContainer.style.display = '';
-    commentInput.focus();
-  });
-
-  commentsSection.appendChild(addCommentBtn);
-  commentsSection.appendChild(commentFormContainer);
-  card.appendChild(commentsSection);
-
-  if (canModerate && suggestion?.id) {
+  if (!isCompact && allowModerationDrag && canModerate && suggestion?.id) {
     card.draggable = true;
     card.classList.add('community-annotation-moderation-draggable');
     card.title = 'Drag this suggestion onto another suggestion to merge (author-only).';
@@ -311,9 +962,13 @@ function renderSuggestionCard({ session, fieldKey, catIdx, suggestion }) {
           'application/x-cellucid-suggestion-merge',
           JSON.stringify({ fieldKey, catIdx, suggestionId: suggestion.id, label: suggestion?.label || '' })
         );
+        activeSuggestionMergeDrag = { fieldKey: toCleanString(fieldKey), catIdx: Number(catIdx), suggestionId: String(suggestion.id) };
       } catch {
         // ignore
       }
+    });
+    card.addEventListener('dragend', () => {
+      activeSuggestionMergeDrag = null;
     });
     card.addEventListener('dragover', (e) => {
       e.preventDefault();
@@ -345,16 +1000,19 @@ function renderSuggestionCard({ session, fieldKey, catIdx, suggestion }) {
         title: 'Merge suggestions?',
         message:
           `Merge "${fromLabel || fromId}" into "${intoLabel || intoId}"?\n\n` +
-          `This sums votes and adds a history note (author-only).`,
+          `Votes will be combined (1 per user). Comments stay separate and can be reviewed via “View merged”.`,
+        inputLabel: 'Optional merge note',
+        inputPlaceholder: 'Why are these equivalent? (optional)',
+        inputMaxLength: 512,
         confirmText: 'Merge',
-        onConfirm: () => {
-          const note = `Merged "${fromLabel || fromId}" into "${intoLabel || intoId}" by @${session.getProfile?.()?.username || 'local'}`;
+        onConfirm: (note) => {
+          const mergeNote = toCleanString(note || '');
           const ok = session.addModerationMerge({
             fieldKey,
             catIdx,
             fromSuggestionId: fromId,
             intoSuggestionId: intoId,
-            note
+            note: mergeNote || null
           });
           if (ok) {
             getNotificationCenter().success('Merged suggestions (local moderation)', { category: 'annotation', duration: 2400 });
@@ -369,20 +1027,26 @@ function renderSuggestionCard({ session, fieldKey, catIdx, suggestion }) {
   return card;
 }
 
-function buildVotingDetail({ session, fieldKey, catIdx, catLabel }) {
+function buildVotingDetail({ session, fieldKey, catIdx }) {
   const panel = el('div', { className: 'community-annotation-voting-detail' });
-  panel.appendChild(el('div', { className: 'community-annotation-panel-title', text: catLabel || '(category)' }));
-  panel.appendChild(el('div', { className: 'community-annotation-panel-subtitle', text: 'Votes are saved locally until you Publish via GitHub sync.' }));
 
-  const consensus = session.computeConsensus(fieldKey, catIdx);
+  const access = getCommunityAnnotationAccessStore();
+  const isClosed = session.isFieldClosed?.(fieldKey) === true;
+  const canInteract = !isClosed || access.isAuthor();
+  if (isClosed && !access.isAuthor()) {
+    panel.appendChild(el('div', { className: 'legend-help', text: 'Closed by the author (read-only).' }));
+  }
+
+  const consensusSettings = session.getAnnotatableConsensusSettings?.(fieldKey) || null;
+  const consensus = session.computeConsensus(fieldKey, catIdx, consensusSettings || undefined);
   const consensusLine = el('div', { className: `community-annotation-consensus status-${consensus.status}` });
   const label = consensus.label ? `"${consensus.label}"` : '—';
   consensusLine.textContent =
     consensus.status === 'consensus'
-      ? `Consensus: ${label} (${Math.round(consensus.confidence * 100)}% • voters ${consensus.voters})`
+      ? `Consensus: ${label} (${Math.round(consensus.confidence * 100)}% • ${consensus.voters} voters)`
       : consensus.status === 'disputed'
-        ? `Disputed: top ${label} (${Math.round(consensus.confidence * 100)}% • voters ${consensus.voters})`
-        : `Pending: voters ${consensus.voters}`;
+        ? `Disputed: ${label} (${Math.round(consensus.confidence * 100)}% • ${consensus.voters} voters)`
+        : `Pending (${consensus.voters} voters)`;
   panel.appendChild(consensusLine);
 
   const suggestions = session
@@ -393,47 +1057,243 @@ function buildVotingDetail({ session, fieldKey, catIdx, catLabel }) {
         ((b.upvotes?.length || 0) - (b.downvotes?.length || 0)) - ((a.upvotes?.length || 0) - (a.downvotes?.length || 0))
     );
 
+  // Detect duplicate labels (multi-user/offline): votes/comments can be split across duplicate suggestions.
+  const labelCounts = new Map();
+  for (const s of suggestions) {
+    const key = normalizeLabelForCompare(s?.label || '');
+    if (!key) continue;
+    labelCounts.set(key, (labelCounts.get(key) || 0) + 1);
+  }
+  const duplicateLabelKeys = new Set();
+  for (const [k, count] of labelCounts.entries()) {
+    if (count > 1) duplicateLabelKeys.add(k);
+  }
+  if (duplicateLabelKeys.size) {
+    const dupSuggestionCount = suggestions.filter((s) => duplicateLabelKeys.has(normalizeLabelForCompare(s?.label || ''))).length;
+    panel.appendChild(el('div', {
+      className: 'legend-help',
+      text:
+        `Duplicate labels detected (${dupSuggestionCount} suggestions). ` +
+        (access.isAuthor()
+          ? 'Drag one duplicate onto the other to merge.'
+          : 'Ask the dataset author to merge duplicates so votes combine.')
+    }));
+  }
+
   const list = el('div', { className: 'community-annotation-suggestions' });
   if (!suggestions.length) {
     list.appendChild(el('div', { className: 'legend-help', text: 'No suggestions yet.' }));
   } else {
-    for (const s of suggestions.slice(0, 25)) list.appendChild(renderSuggestionCard({ session, fieldKey, catIdx, suggestion: s }));
+    for (const s of suggestions.slice(0, 25)) {
+      list.appendChild(renderSuggestionCard({ session, fieldKey, catIdx, suggestion: s, canInteract, duplicateLabelKeys }));
+    }
   }
   panel.appendChild(list);
 
   const formBox = el('div', { className: 'community-annotation-dashed-box' });
   formBox.appendChild(el('div', { className: 'community-annotation-new-title', text: 'New suggestion' }));
+  if (!canInteract) {
+    formBox.appendChild(el('div', { className: 'legend-help', text: 'New suggestions are disabled while closed by the author.' }));
+  }
 
   const form = el('div', { className: 'community-annotation-new community-annotation-new-vertical' });
 
-  const labelInput = el('input', { type: 'text', className: 'community-annotation-text-input', placeholder: 'Label (required)' });
-  const ontInput = el('input', { type: 'text', className: 'community-annotation-text-input', placeholder: 'Ontology id (optional, e.g. CL:0000625)' });
-  const evidenceInput = el('textarea', { className: 'community-annotation-text-input community-annotation-textarea', placeholder: 'Evidence (optional)' });
+  // Label input with CAP search
+  const labelRow = el('div', { className: 'community-annotation-label-row' });
+  const labelInput = el('input', { type: 'text', className: 'community-annotation-text-input', placeholder: 'Label (required)', disabled: !canInteract });
+  const searchCapBtn = el('button', { type: 'button', className: 'btn-small cap-btn', text: 'Search CAP', title: 'Search Cell Annotation Platform for cell types', disabled: !canInteract });
+
+  let capSearchPanel = null;
+  const closeCapSearch = () => {
+    if (capSearchPanel) {
+      capSearchPanel.remove();
+      capSearchPanel = null;
+    }
+  };
+
+  searchCapBtn.addEventListener('click', async () => {
+    const searchTerm = labelInput.value.trim();
+    if (!searchTerm) {
+      getNotificationCenter().info('Enter a cell type name to search', { category: 'annotation', duration: 2000 });
+      labelInput.focus();
+      return;
+    }
+
+    closeCapSearch();
+    searchCapBtn.disabled = true;
+    searchCapBtn.textContent = 'Searching...';
+
+    try {
+      const results = await capApi.searchCellTypes(searchTerm, 8);
+      capSearchPanel = renderCapSearchResults({
+        results,
+        onSelect: (result) => {
+          labelInput.value = result.name || '';
+          ontInput.value = result.ontologyTermId || '';
+          if (result.markerGenes?.length) {
+            markerGenesInput.value = result.markerGenes.slice(0, 10).join(', ');
+          }
+        },
+        onClose: closeCapSearch
+      });
+      formBox.appendChild(capSearchPanel);
+    } catch (err) {
+      getNotificationCenter().error(`CAP search failed: ${err.message}`, { category: 'annotation' });
+    } finally {
+      searchCapBtn.disabled = false;
+      searchCapBtn.textContent = 'Search CAP';
+    }
+  });
+
+  labelRow.appendChild(labelInput);
+  labelRow.appendChild(searchCapBtn);
+
+  // Ontology input with search button
+  const ontRow = el('div', { className: 'community-annotation-label-row' });
+  const ontInput = el('input', { type: 'text', className: 'community-annotation-text-input', placeholder: 'Ontology id (optional, e.g. CL:0000625)', disabled: !canInteract });
+  const searchOntBtn = el('button', { type: 'button', className: 'btn-small cap-btn', text: 'Search Ontology', title: 'Search CAP by ontology ID', disabled: !canInteract });
+
+  let ontSearchPanel = null;
+  const closeOntSearch = () => {
+    if (ontSearchPanel) {
+      ontSearchPanel.remove();
+      ontSearchPanel = null;
+    }
+  };
+
+  searchOntBtn.addEventListener('click', async () => {
+    const searchTerm = ontInput.value.trim();
+    if (!searchTerm) {
+      getNotificationCenter().info('Enter an ontology ID to search', { category: 'annotation', duration: 2000 });
+      ontInput.focus();
+      return;
+    }
+
+    closeOntSearch();
+    closeCapSearch();
+    searchOntBtn.disabled = true;
+    searchOntBtn.textContent = 'Searching...';
+
+    try {
+      const result = await capApi.lookupByOntologyId(searchTerm);
+      if (result) {
+        ontSearchPanel = renderCapSearchResults({
+          results: [result],
+          onSelect: (r) => {
+            labelInput.value = r.name || '';
+            ontInput.value = r.ontologyTermId || '';
+            if (r.markerGenes?.length) {
+              markerGenesInput.value = r.markerGenes.slice(0, 10).join(', ');
+            }
+          },
+          onClose: closeOntSearch
+        });
+      } else {
+        ontSearchPanel = renderCapSearchResults({
+          results: [],
+          onSelect: () => {},
+          onClose: closeOntSearch
+        });
+      }
+      formBox.appendChild(ontSearchPanel);
+    } catch (err) {
+      getNotificationCenter().error(`CAP ontology search failed: ${err.message}`, { category: 'annotation' });
+    } finally {
+      searchOntBtn.disabled = false;
+      searchOntBtn.textContent = 'Search Ontology';
+    }
+  });
+
+  ontRow.appendChild(ontInput);
+  ontRow.appendChild(searchOntBtn);
+
+  // Marker genes input with search button
+  const markerGenesRow = el('div', { className: 'community-annotation-label-row' });
+  const markerGenesInput = el('input', { type: 'text', className: 'community-annotation-text-input', placeholder: 'Marker genes (optional, comma-separated)', disabled: !canInteract });
+  const searchMarkersBtn = el('button', { type: 'button', className: 'btn-small cap-btn', text: 'Search Markers', title: 'Search CAP by marker genes', disabled: !canInteract });
+
+  let markersSearchPanel = null;
+  const closeMarkersSearch = () => {
+    if (markersSearchPanel) {
+      markersSearchPanel.remove();
+      markersSearchPanel = null;
+    }
+  };
+
+  searchMarkersBtn.addEventListener('click', async () => {
+    const searchTerm = markerGenesInput.value.trim();
+    if (!searchTerm) {
+      getNotificationCenter().info('Enter marker gene(s) to search', { category: 'annotation', duration: 2000 });
+      markerGenesInput.focus();
+      return;
+    }
+
+    closeMarkersSearch();
+    closeCapSearch();
+    closeOntSearch();
+    searchMarkersBtn.disabled = true;
+    searchMarkersBtn.textContent = 'Searching...';
+
+    try {
+      // Search using first marker gene or the whole input
+      const firstMarker = searchTerm.split(',')[0].trim();
+      const results = await capApi.searchCellTypes(firstMarker, 8);
+      markersSearchPanel = renderCapSearchResults({
+        results,
+        onSelect: (r) => {
+          labelInput.value = r.name || '';
+          ontInput.value = r.ontologyTermId || '';
+          if (r.markerGenes?.length) {
+            markerGenesInput.value = r.markerGenes.slice(0, 10).join(', ');
+          }
+        },
+        onClose: closeMarkersSearch
+      });
+      formBox.appendChild(markersSearchPanel);
+    } catch (err) {
+      getNotificationCenter().error(`CAP marker search failed: ${err.message}`, { category: 'annotation' });
+    } finally {
+      searchMarkersBtn.disabled = false;
+      searchMarkersBtn.textContent = 'Search Markers';
+    }
+  });
+
+  markerGenesRow.appendChild(markerGenesInput);
+  markerGenesRow.appendChild(searchMarkersBtn);
+
+  const evidenceInput = el('textarea', { className: 'community-annotation-text-input community-annotation-textarea', placeholder: 'Evidence (optional)', disabled: !canInteract });
 
   const actions = el('div', { className: 'community-annotation-suggestion-actions' });
-  const addBtn = el('button', { type: 'button', className: 'btn-small', text: 'Add' });
-  const clearBtn = el('button', { type: 'button', className: 'btn-small', text: 'Clear' });
+  const addBtn = el('button', { type: 'button', className: 'btn-small', text: 'Add', disabled: !canInteract });
+  const clearBtn = el('button', { type: 'button', className: 'btn-small', text: 'Clear', disabled: !canInteract });
   actions.appendChild(addBtn);
   actions.appendChild(clearBtn);
 
-  addBtn.addEventListener('click', () => {
-    try {
-      session.addSuggestion(fieldKey, catIdx, { label: labelInput.value, ontologyId: ontInput.value, evidence: evidenceInput.value });
-      labelInput.value = '';
-      ontInput.value = '';
-      evidenceInput.value = '';
-    } catch (err) {
-      getNotificationCenter().error(err?.message || 'Failed to add suggestion', { category: 'annotation' });
-    }
-  });
+  if (canInteract) {
+    addBtn.addEventListener('click', () => {
+      try {
+        const markers = parseMarkerGenesInput(markerGenesInput.value);
+        session.addSuggestion(fieldKey, catIdx, { label: labelInput.value, ontologyId: ontInput.value, evidence: evidenceInput.value, markers });
+        labelInput.value = '';
+        ontInput.value = '';
+        markerGenesInput.value = '';
+        evidenceInput.value = '';
+      } catch (err) {
+        getNotificationCenter().error(err?.message || 'Failed to add suggestion', { category: 'annotation' });
+      }
+    });
+  }
   clearBtn.addEventListener('click', () => {
+    if (!canInteract) return;
     labelInput.value = '';
     ontInput.value = '';
+    markerGenesInput.value = '';
     evidenceInput.value = '';
   });
 
-  form.appendChild(labelInput);
-  form.appendChild(ontInput);
+  form.appendChild(labelRow);
+  form.appendChild(ontRow);
+  form.appendChild(markerGenesRow);
   form.appendChild(evidenceInput);
   form.appendChild(actions);
   formBox.appendChild(form);
@@ -458,29 +1318,108 @@ export function openCommunityAnnotationVotingModal({
   }
 
   const session = getCommunityAnnotationSession();
+  try {
+    const datasetId = session.getDatasetId?.() || null;
+    const auth = getGitHubAuthSession();
+    const authedKey = auth.isAuthenticated?.() ? toGitHubUserKey(auth.getUser?.()) : null;
+    const username = authedKey
+      ? String(authedKey)
+      : (isSimulateRepoConnectedEnabled() ? (getLastGitHubUserKey() || (session.getProfile?.()?.username || 'local')) : (session.getProfile?.()?.username || 'local'));
+    // Hide the entire voting UX unless a repo is connected (or dev simulate is enabled).
+    if (!isAnnotationRepoConnected(datasetId, username)) return null;
+  } catch {
+    return null;
+  }
 
-  const ref = showModal({
+  /** @type {{close?: Function, overlay?: HTMLElement, modal?: HTMLElement, content?: HTMLElement} | null} */
+  let ref = null;
+  ref = showModal({
     title: 'Community voting',
     buildContent: (content) => {
       const status = el('div', { className: 'legend-help', text: '' });
       content.appendChild(status);
 
+      const lifecycle = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const autoScrollMargin = 48;
+      const autoScrollMaxPx = 28;
+      const autoScrollMinPx = 6;
+      const dragAutoScroll = (clientY) => {
+        try {
+          if (!activeSuggestionMergeDrag) return;
+          if (!getCommunityAnnotationAccessStore().isAuthor()) return;
+          if (!Number.isFinite(clientY)) return;
+          if (content.scrollHeight <= content.clientHeight) return;
+          const rect = content.getBoundingClientRect();
+          if (!rect || !Number.isFinite(rect.top) || !Number.isFinite(rect.bottom)) return;
+          const topZone = rect.top + autoScrollMargin;
+          const bottomZone = rect.bottom - autoScrollMargin;
+          let delta = 0;
+          if (clientY < topZone) {
+            const t = Math.min(1, Math.max(0, (topZone - clientY) / autoScrollMargin));
+            delta = -Math.ceil(autoScrollMinPx + t * (autoScrollMaxPx - autoScrollMinPx));
+          } else if (clientY > bottomZone) {
+            const t = Math.min(1, Math.max(0, (clientY - bottomZone) / autoScrollMargin));
+            delta = Math.ceil(autoScrollMinPx + t * (autoScrollMaxPx - autoScrollMinPx));
+          }
+          if (delta) content.scrollTop += delta;
+        } catch {
+          // ignore
+        }
+      };
+      try {
+        if (lifecycle?.signal) {
+          let latestY = null;
+          let rafPending = false;
+          const onDragOver = (e) => {
+            latestY = e?.clientY;
+            if (rafPending) return;
+            rafPending = true;
+            if (typeof requestAnimationFrame === 'function') {
+              requestAnimationFrame(() => {
+                rafPending = false;
+                dragAutoScroll(latestY);
+              });
+              return;
+            }
+            rafPending = false;
+            dragAutoScroll(latestY);
+          };
+          const onDropOrLeave = () => {
+            latestY = null;
+          };
+          content.addEventListener('dragover', onDragOver, { signal: lifecycle.signal });
+          content.addEventListener('drop', onDropOrLeave, { signal: lifecycle.signal });
+          content.addEventListener('dragleave', onDropOrLeave, { signal: lifecycle.signal });
+        }
+      } catch {
+        // ignore
+      }
+
       let renderVersion = 0;
+      let isFirstRender = true;
       const renderFocused = async () => {
         const myVersion = ++renderVersion;
-        content.innerHTML = '';
-        content.appendChild(status);
-        status.textContent = 'Loading…';
+
+        // Only show loading state on first render - subsequent renders keep old content visible
+        if (isFirstRender) {
+          content.innerHTML = '';
+          content.appendChild(status);
+          status.textContent = 'Loading…';
+        }
 
         const fields = state.getFields?.() || [];
         const fieldIndex = fields.findIndex((f) => f && f._isDeleted !== true && f.kind === 'category' && toCleanString(f.key) === focusField);
         if (fieldIndex < 0) {
+          content.innerHTML = '';
+          content.appendChild(status);
           status.textContent = 'Field not found in current dataset.';
           return;
         }
         try {
           await state.ensureFieldLoaded?.(fieldIndex, { silent: true });
         } catch (err) {
+          content.innerHTML = '';
+          content.appendChild(status);
           status.textContent = err?.message || 'Failed to load field';
           return;
         }
@@ -488,13 +1427,19 @@ export function openCommunityAnnotationVotingModal({
         // Bail if a newer render started while we were loading
         if (myVersion !== renderVersion) return;
 
+        isFirstRender = false;
+
         const field = state.getFields?.()?.[fieldIndex] || null;
         const categories = Array.isArray(field?.categories) ? field.categories : [];
         const catLabel = categories[focusCatIdx] != null ? String(categories[focusCatIdx]) : `Category ${focusCatIdx}`;
 
-        status.textContent = '';
-        content.appendChild(el('div', { className: 'community-annotation-inline-help', text: `${focusField} • ${catLabel}` }));
-        content.appendChild(buildVotingDetail({ session, fieldKey: focusField, catIdx: focusCatIdx, catLabel }));
+        // Build new content then swap atomically to avoid flashing
+        const newContent = document.createDocumentFragment();
+        newContent.appendChild(el('div', { className: 'community-annotation-inline-help', text: `${focusField} • ${catLabel}` }));
+        newContent.appendChild(buildVotingDetail({ session, fieldKey: focusField, catIdx: focusCatIdx }));
+
+        content.innerHTML = '';
+        content.appendChild(newContent);
       };
 
       const unsubscribe = session.on('changed', () => {
@@ -506,10 +1451,33 @@ export function openCommunityAnnotationVotingModal({
       const observer = new MutationObserver(() => {
         if (!document.body.contains(content)) {
           unsubscribe?.();
+          lifecycle?.abort?.();
           observer.disconnect();
         }
       });
       observer.observe(document.body, { childList: true, subtree: true });
+
+      // If repo is disconnected (or dev simulate toggles turn off), close this modal.
+      const closeIfDisconnected = () => {
+        try {
+          const datasetId = session.getDatasetId?.() || null;
+          const auth = getGitHubAuthSession();
+          const authedKey = auth.isAuthenticated?.() ? toGitHubUserKey(auth.getUser?.()) : null;
+          const username = authedKey
+            ? String(authedKey)
+            : (isSimulateRepoConnectedEnabled() ? (getLastGitHubUserKey() || (session.getProfile?.()?.username || 'local')) : (session.getProfile?.()?.username || 'local'));
+          if (!isAnnotationRepoConnected(datasetId, username)) ref?.close?.();
+        } catch {
+          ref?.close?.();
+        }
+      };
+      try {
+        if (typeof window !== 'undefined' && lifecycle?.signal) {
+          window.addEventListener(ANNOTATION_CONNECTION_CHANGED_EVENT, closeIfDisconnected, { signal: lifecycle.signal });
+        }
+      } catch {
+        // ignore
+      }
     }
   });
 

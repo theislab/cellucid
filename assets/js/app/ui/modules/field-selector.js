@@ -24,8 +24,14 @@ import { StateValidator } from '../../utils/state-validator.js';
 import { initDeletedFieldsPanel } from './field-selector-deleted-fields.js';
 import { initGeneExpressionSelector } from './field-selector-gene-expression.js';
 import { getCommunityAnnotationSession } from '../../community-annotations/session.js';
-import { getCommunityAnnotationAccessStore, isSimulateRepoConnectedEnabled } from '../../community-annotations/access-store.js';
-import { getAnnotationRepoForDataset } from '../../community-annotations/repo-store.js';
+import {
+  getCommunityAnnotationAccessStore,
+  isAnnotationRepoConnected,
+  isSimulateRepoConnectedEnabled
+} from '../../community-annotations/access-store.js';
+import { getAnnotationRepoForDataset, getLastAnnotationRepoForDataset } from '../../community-annotations/repo-store.js';
+import { ANNOTATION_CONNECTION_CHANGED_EVENT } from '../../community-annotations/connection-events.js';
+import { getGitHubAuthSession, getLastGitHubUserKey, toGitHubUserKey } from '../../community-annotations/github-auth.js';
 
 /**
  * @typedef {object} FieldSelectorCallbacks
@@ -67,11 +73,26 @@ export function initFieldSelector({ state, dom, dataSourceManager = null, callba
 
   const annotationSession = getCommunityAnnotationSession();
   const access = getCommunityAnnotationAccessStore();
+  const lifecycle = typeof AbortController !== 'undefined' ? new AbortController() : null;
   try {
     const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
     annotationSession.setDatasetId?.(datasetId);
   } catch {
     // ignore
+  }
+
+  function isCommunityAnnotationUiEnabled() {
+    try {
+      const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
+      const auth = getGitHubAuthSession();
+      const authedKey = auth.isAuthenticated?.() ? toGitHubUserKey(auth.getUser?.()) : null;
+      const username = authedKey
+        ? String(authedKey)
+        : (isSimulateRepoConnectedEnabled() ? (getLastGitHubUserKey() || (annotationSession.getProfile?.()?.username || 'local')) : (annotationSession.getProfile?.()?.username || 'local'));
+      return isAnnotationRepoConnected(datasetId, username);
+    } catch {
+      return false;
+    }
   }
 
   const { renderDeletedFieldsSection } = initDeletedFieldsPanel({ state, deletedFieldsSection });
@@ -99,7 +120,11 @@ export function initFieldSelector({ state, dom, dataSourceManager = null, callba
     const contDisabled = Boolean(continuousSelect?.disabled) || !contSelected;
 
     const catField = catSelected ? state.getFields?.()?.[catIdx] : null;
-    const catVotingLocked = Boolean(catField?.kind === FieldKind.CATEGORY && annotationSession.isFieldAnnotated(catField?.key));
+    const catVotingLocked = Boolean(
+      isCommunityAnnotationUiEnabled() &&
+      catField?.kind === FieldKind.CATEGORY &&
+      annotationSession.isFieldAnnotated(catField?.key)
+    );
 
     if (categoricalCopyBtn) categoricalCopyBtn.disabled = catDisabled;
     if (categoricalRenameBtn) categoricalRenameBtn.disabled = catDisabled || catVotingLocked;
@@ -150,11 +175,20 @@ export function initFieldSelector({ state, dom, dataSourceManager = null, callba
   function renderFieldSelects() {
     if (!categoricalSelect || !continuousSelect) return;
 
+    let annotationUiEnabled = false;
     try {
       const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
-      const username = annotationSession.getProfile?.()?.username || 'local';
-      const repoRef = getAnnotationRepoForDataset(datasetId, username) || null;
+      const auth = getGitHubAuthSession();
+      const authedKey = auth.isAuthenticated?.() ? toGitHubUserKey(auth.getUser?.()) : null;
+      const username = authedKey
+        ? String(authedKey)
+        : (isSimulateRepoConnectedEnabled() ? (getLastGitHubUserKey() || (annotationSession.getProfile?.()?.username || 'local')) : (annotationSession.getProfile?.()?.username || 'local'));
+      let repoRef = getAnnotationRepoForDataset(datasetId, username) || null;
+      if (!repoRef && isSimulateRepoConnectedEnabled()) {
+        repoRef = getLastAnnotationRepoForDataset(datasetId, username) || null;
+      }
       annotationSession.setCacheContext?.({ datasetId, repoRef, username });
+      annotationUiEnabled = isAnnotationRepoConnected(datasetId, username);
     } catch {
       // ignore
     }
@@ -175,7 +209,11 @@ export function initFieldSelector({ state, dom, dataSourceManager = null, callba
         const opt = document.createElement('option');
         opt.value = String(idx);
         const baseLabel = field._originalKey ? `${field.key} *` : field.key;
-        const annotateBadge = (select === categoricalSelect && annotationSession.isFieldAnnotated(field.key)) ? '🗳️ ' : '';
+        let annotateBadge = '';
+        if (annotationUiEnabled && select === categoricalSelect && annotationSession.isFieldAnnotated(field.key)) {
+          const closed = annotationSession.isFieldClosed?.(field.key) === true;
+          annotateBadge = closed ? '🗳️🏁 ' : '🗳️ ';
+        }
         opt.textContent = annotateBadge + baseLabel;
         select.appendChild(opt);
       });
@@ -198,15 +236,9 @@ export function initFieldSelector({ state, dom, dataSourceManager = null, callba
   if (categoricalSelect) {
     categoricalSelect.addEventListener('contextmenu', (e) => {
       e.preventDefault();
-      let repoConnected = false;
-      try {
-        const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
-        const username = annotationSession.getProfile?.()?.username || 'local';
-        repoConnected = Boolean(getAnnotationRepoForDataset(datasetId, username)) || isSimulateRepoConnectedEnabled();
-      } catch {
-        repoConnected = false;
-      }
-      if (repoConnected && !access.isAuthor()) {
+      const repoConnected = isCommunityAnnotationUiEnabled();
+      if (!repoConnected) return;
+      if (!access.isAuthor()) {
         getNotificationCenter().error('Only repo authors can change which columns are annotatable', { category: 'annotation' });
         return;
       }
@@ -240,6 +272,32 @@ export function initFieldSelector({ state, dom, dataSourceManager = null, callba
     renderFieldSelects();
   });
 
+  // Keep UI in sync when repo connect/disconnect or dev simulate toggles change.
+  const rerenderForConnectionChange = () => {
+    try {
+      const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
+      annotationSession.setDatasetId?.(datasetId);
+    } catch {
+      // ignore
+    }
+    renderFieldSelects();
+  };
+
+  const unsubscribeAccess = access.on?.('changed', () => rerenderForConnectionChange()) || null;
+  try {
+    if (typeof window !== 'undefined' && lifecycle?.signal) {
+      window.addEventListener(ANNOTATION_CONNECTION_CHANGED_EVENT, rerenderForConnectionChange, { signal: lifecycle.signal });
+    }
+  } catch {
+    // ignore
+  }
+
+  if (dataSourceManager?.onDatasetChange) {
+    dataSourceManager.onDatasetChange(() => {
+      rerenderForConnectionChange();
+    });
+  }
+
   function validateUniqueFieldName(nextValue, fields, fieldIndex) {
     const value = String(nextValue ?? '').trim();
     try {
@@ -257,7 +315,7 @@ export function initFieldSelector({ state, dom, dataSourceManager = null, callba
     const fields = source === FieldSource.VAR ? state.getVarFields?.() : state.getFields?.();
     const field = fields?.[fieldIndex];
     if (!field) return;
-    if (source === FieldSource.OBS && field.kind === FieldKind.CATEGORY && annotationSession.isFieldAnnotated(field.key)) {
+    if (isCommunityAnnotationUiEnabled() && source === FieldSource.OBS && field.kind === FieldKind.CATEGORY && annotationSession.isFieldAnnotated(field.key)) {
       getNotificationCenter().error('Rename is disabled while voting is enabled for this field', { category: 'annotation' });
       return;
     }
@@ -279,7 +337,7 @@ export function initFieldSelector({ state, dom, dataSourceManager = null, callba
     const fields = source === FieldSource.VAR ? state.getVarFields?.() : state.getFields?.();
     const field = fields?.[fieldIndex];
     if (!field) return;
-    if (source === FieldSource.OBS && field.kind === FieldKind.CATEGORY && annotationSession.isFieldAnnotated(field.key)) {
+    if (isCommunityAnnotationUiEnabled() && source === FieldSource.OBS && field.kind === FieldKind.CATEGORY && annotationSession.isFieldAnnotated(field.key)) {
       getNotificationCenter().error('Delete is disabled while voting is enabled for this field', { category: 'annotation' });
       return;
     }
@@ -349,7 +407,15 @@ export function initFieldSelector({ state, dom, dataSourceManager = null, callba
   // Best-effort cleanup for embedders/tests.
   // (Most UI modules in the app do not currently expose a destroy lifecycle.)
   if (typeof window !== 'undefined') {
-    window.addEventListener?.('beforeunload', () => unsubscribeAnnotation?.(), { once: true });
+    window.addEventListener?.(
+      'beforeunload',
+      () => {
+        unsubscribeAnnotation?.();
+        unsubscribeAccess?.();
+        lifecycle?.abort?.();
+      },
+      { once: true }
+    );
   }
 
   async function activateField(idx) {
@@ -553,6 +619,11 @@ export function initFieldSelector({ state, dom, dataSourceManager = null, callba
   }
 
   return {
+    destroy: () => {
+      unsubscribeAnnotation?.();
+      unsubscribeAccess?.();
+      lifecycle?.abort?.();
+    },
     activateField,
     selectGene,
     syncFromState,

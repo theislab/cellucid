@@ -3,8 +3,8 @@
  *
  * Static-site friendly GitHub sync using the REST API "contents" endpoints,
  * proxied through a Cloudflare Worker to avoid exposing client secrets.
- * - Pull: list & fetch `annotations/users/*.json`, merge into local session
- * - Push: write only `annotations/users/{username}.json`
+ * - Pull: list & fetch `annotations/users/ghid_*.json`, merge into local session
+ * - Push: write only `annotations/users/ghid_<id>.json`
  *
  * Security:
  * - Never logs tokens.
@@ -25,6 +25,47 @@ function safeJsonParse(text) {
     return JSON.parse(text);
   } catch {
     return null;
+  }
+}
+
+function nowIso() {
+  try {
+    return new Date().toISOString();
+  } catch {
+    return String(Date.now());
+  }
+}
+
+function uniqueStrings(values) {
+  const out = [];
+  const seen = new Set();
+  for (const v of Array.isArray(values) ? values : []) {
+    const s = toCleanString(v);
+    if (!s || seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
+function stableStringifyJson(value) {
+  const seen = new WeakSet();
+  const walk = (v) => {
+    if (v == null) return null;
+    if (typeof v !== 'object') return v;
+    if (Array.isArray(v)) return v.map(walk);
+    if (seen.has(v)) return null;
+    seen.add(v);
+    const out = {};
+    for (const k of Object.keys(v).sort()) {
+      out[k] = walk(v[k]);
+    }
+    return out;
+  };
+  try {
+    return JSON.stringify(walk(value));
+  } catch {
+    return '';
   }
 }
 
@@ -110,15 +151,31 @@ export function parseOwnerRepo(input) {
   return { owner, repo, ownerRepo, ref, ownerRepoRef };
 }
 
-function sanitizeUsernameForPath(username) {
-  const raw = toCleanString(username);
-  if (!raw) return 'local';
+function sanitizeUserKeyForPath(userKey) {
+  const raw = toCleanString(userKey).replace(/^@+/, '').toLowerCase();
+  const m = raw.match(/^ghid_(\d+)$/);
+  if (!m) return null;
+  const id = Number(m[1]);
+  if (!Number.isFinite(id)) return null;
+  const safe = Math.max(0, Math.floor(id));
+  return safe ? `ghid_${safe}` : null;
+}
+
+function sanitizeBranchPart(value, { maxLen = 40 } = {}) {
+  const raw = toCleanString(value).toLowerCase();
   const cleaned = raw
-    .toLowerCase()
-    .replace(/[^a-z0-9-]+/g, '_')
-    .replace(/^_+|_+$/g, '')
-    .slice(0, 64);
-  return cleaned || 'local';
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^[.-]+|[.-]+$/g, '')
+    .slice(0, Math.max(8, Math.floor(Number(maxLen) || 40)));
+  return cleaned || 'default';
+}
+
+function toDeterministicPrBranch({ datasetId, baseBranch, fileUser }) {
+  const did = sanitizeBranchPart(datasetId || 'default', { maxLen: 32 });
+  const base = sanitizeBranchPart(baseBranch || 'main', { maxLen: 32 });
+  const user = sanitizeBranchPart(fileUser || 'local', { maxLen: 48 });
+  return `cellucid-annotations/${did}/${base}/${user}`;
 }
 
 function toWorkerApiUrl(workerOrigin, githubPath) {
@@ -230,6 +287,19 @@ async function putContent({ workerOrigin, owner, repo, token, path, branch, mess
   );
 }
 
+async function putContentWithSingleRetry({ workerOrigin, owner, repo, token, path, branch, message, contentBase64, sha = null, refForRefresh = null }) {
+  try {
+    return await putContent({ workerOrigin, owner, repo, token, path, branch, message, contentBase64, sha });
+  } catch (err) {
+    // Resolve rare sha mismatch races (concurrent writes).
+    if (err?.status !== 409) throw err;
+    const ref = toCleanString(refForRefresh) || toCleanString(branch) || null;
+    const existing = await getContent({ workerOrigin, owner, repo, token, path, ref });
+    const nextSha = existing?.type === 'file' ? toCleanString(existing?.sha || '') || null : null;
+    return putContent({ workerOrigin, owner, repo, token, path, branch, message, contentBase64, sha: nextSha });
+  }
+}
+
 async function readJsonFile({ workerOrigin, owner, repo, token = null, path, ref = null }) {
   const content = await getContent({ workerOrigin, owner, repo, token, path, ref });
   if (!content || content.type !== 'file') {
@@ -245,12 +315,127 @@ function isNotFoundError(err) {
   return err?.status === 404;
 }
 
+async function readJsonFileOrNull({ workerOrigin, owner, repo, token, path, ref }) {
+  try {
+    return await readJsonFile({ workerOrigin, owner, repo, token, path, ref });
+  } catch (err) {
+    if (isNotFoundError(err)) return { json: null, sha: null };
+    throw err;
+  }
+}
+
+function normalizeModerationMergesDoc(doc) {
+  const input = (doc && typeof doc === 'object') ? doc : {};
+  const merges = Array.isArray(input?.merges) ? input.merges : [];
+
+  const clamp = (value, maxLen) => {
+    const s = toCleanString(value);
+    if (!s) return '';
+    return s.length > maxLen ? s.slice(0, maxLen) : s;
+  };
+
+  const isNewer = (prev, next) => {
+    const ax = toCleanString(prev?.at || '');
+    const ay = toCleanString(next?.at || '');
+    if (ax && ay && ay > ax) return true;
+    if (ax && ay && ax > ay) return false;
+    if (!ax && ay) return true;
+    if (ax && !ay) return false;
+    const score = (m) => (toCleanString(m?.by || '') ? 1 : 0) + (toCleanString(m?.note || '') ? 1 : 0);
+    return score(next) > score(prev);
+  };
+
+  // Moderation merges are an author-maintained "current mapping", not an append-only event log.
+  // Keep at most one active merge per (bucket, fromSuggestionId).
+  const newestByKey = new Map();
+  for (const raw of merges.slice(0, 10000)) {
+    const bucket = toCleanString(raw?.bucket);
+    const fromSuggestionId = toCleanString(raw?.fromSuggestionId);
+    const intoSuggestionId = toCleanString(raw?.intoSuggestionId);
+    if (!bucket || !fromSuggestionId || !intoSuggestionId) continue;
+    if (fromSuggestionId === intoSuggestionId) continue;
+
+    const entry = {
+      bucket,
+      fromSuggestionId,
+      intoSuggestionId,
+      ...(toCleanString(raw?.by || '') ? { by: clamp(raw?.by, 64) } : {}),
+      ...(toCleanString(raw?.at || '') ? { at: clamp(raw?.at, 64) } : {}),
+      ...(toCleanString(raw?.note || '') ? { note: clamp(raw?.note, 500) } : {})
+    };
+    const key = `${bucket}::${fromSuggestionId}`;
+    const prev = newestByKey.get(key) || null;
+    if (!prev || isNewer(prev, entry)) newestByKey.set(key, entry);
+  }
+
+  const mergedList = Array.from(newestByKey.entries())
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([, v]) => v)
+    .slice(0, 5000);
+
+  return {
+    version: 1,
+    updatedAt: nowIso(),
+    merges: mergedList
+  };
+}
+
 async function listDir({ workerOrigin, owner, repo, token = null, path, ref = null }) {
   const content = await getContent({ workerOrigin, owner, repo, token, path, ref });
   if (!Array.isArray(content)) {
     throw new Error(`Expected directory listing at ${path}`);
   }
   return content;
+}
+
+async function ensureForkRepo({ workerOrigin, upstreamOwner, upstreamRepo, token, forkOwner }) {
+  // Best effort: ask GitHub to create a fork; if it already exists, that's fine.
+  /** @type {string|null} */
+  let forkRepoName = null;
+  try {
+    const created = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/forks`, {
+      token,
+      method: 'POST'
+    });
+    forkRepoName = toCleanString(created?.name || '') || null;
+  } catch (err) {
+    // "already_exists" / "fork exists" should not block PR flow.
+    if (err?.status !== 422) throw err;
+  }
+
+  // If we got a name from the fork-creation response, prefer it.
+  if (forkRepoName) return forkRepoName;
+
+  // Common case: fork repo has the same name as upstream.
+  try {
+    const maybe = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(forkOwner)}/${encodeURIComponent(upstreamRepo)}`, { token });
+    const parent = toCleanString(maybe?.parent?.full_name || '') || null;
+    if (parent && parent.toLowerCase() === `${upstreamOwner}/${upstreamRepo}`.toLowerCase()) return upstreamRepo;
+  } catch (err) {
+    if (err?.status !== 404) throw err;
+  }
+
+  // Edge case: fork was renamed (or upstream repo name collides). Find the user's fork via the upstream forks listing.
+  for (let page = 1; page <= 5; page++) {
+    const forks = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/forks`, {
+      token,
+      query: { per_page: 100, page }
+    });
+    const list = Array.isArray(forks) ? forks : [];
+    for (const f of list) {
+      const full = toCleanString(f?.full_name || '');
+      if (!full) continue;
+      const [o, r] = full.split('/');
+      if (!o || !r) continue;
+      if (o.toLowerCase() === String(forkOwner).toLowerCase()) return r;
+    }
+    if (list.length < 100) break;
+  }
+
+  throw new Error(
+    `Unable to locate your fork for ${upstreamOwner}/${upstreamRepo}. ` +
+    `If you renamed your fork or cannot fork into your account, create a fork manually and ensure it's visible to the GitHub App, then try again.`
+  );
 }
 
 export class CommunityAnnotationGitHubSync {
@@ -324,25 +509,17 @@ export class CommunityAnnotationGitHubSync {
     });
   }
 
-  async updateDatasetFieldsToAnnotate({ datasetId, fieldsToAnnotate, commitMessage = null } = {}) {
+  async updateDatasetFieldsToAnnotate({ datasetId, fieldsToAnnotate, annotatableSettings = null, closedFields = null, commitMessage = null } = {}) {
     const token = this.token;
     if (!token) throw new Error('GitHub sign-in required');
 
-    const { repoInfo, branch, config } = await this.validateAndLoadConfig({ datasetId });
+    const { repoInfo, branch } = await this.validateAndLoadConfig({ datasetId });
     const perms = repoInfo?.permissions || null;
     const canManage = perms ? Boolean(perms.maintain || perms.admin) : false;
     if (!canManage) throw new Error('Maintain/admin access required to update annotations/config.json');
 
     const did = toCleanString(datasetId ?? this.datasetId ?? '') || null;
     if (!did) throw new Error('datasetId required');
-
-    const existing = await this.readRepoConfigJson();
-    const sha = existing?.sha || null;
-
-    const nextConfig = config && typeof config === 'object'
-      ? { ...config }
-      : { version: 1, supportedDatasets: [] };
-    if (!Array.isArray(nextConfig.supportedDatasets)) nextConfig.supportedDatasets = [];
 
     const cleanedFields = Array.isArray(fieldsToAnnotate)
       ? fieldsToAnnotate
@@ -351,35 +528,144 @@ export class CommunityAnnotationGitHubSync {
           .slice(0, 200)
       : [];
 
-    let found = false;
-    nextConfig.supportedDatasets = nextConfig.supportedDatasets.map((d) => {
-      if (!d || typeof d !== 'object') return d;
-      const dId = toCleanString(d.datasetId);
-      if (dId !== did) return d;
-      found = true;
-      return { ...d, fieldsToAnnotate: cleanedFields };
-    });
+      const cleanSettings = (settings) => {
+        const input = (settings && typeof settings === 'object') ? settings : {};
+        const out = {};
+        for (const [fieldKey, raw] of Object.entries(input)) {
+          const k = toCleanString(fieldKey);
+          if (!k) continue;
+          const minAnnotators = Number.isFinite(Number(raw?.minAnnotators)) ? Math.max(0, Math.min(50, Math.floor(Number(raw.minAnnotators)))) : 1;
+          const thresholdRaw = Number(raw?.threshold);
+          const threshold = Number.isFinite(thresholdRaw) ? Math.max(-1, Math.min(1, thresholdRaw)) : 0.5;
+          out[k] = { minAnnotators, threshold };
+        }
+        return out;
+      };
 
-    if (!found) {
-      nextConfig.supportedDatasets = nextConfig.supportedDatasets.concat([
-        { datasetId: did, name: did, fieldsToAnnotate: cleanedFields }
-      ]);
+    const cleanClosed = (values) => {
+      const input = Array.isArray(values) ? values : [];
+      const out = [];
+      const seen = new Set();
+      for (const v of input.slice(0, 500)) {
+        const k = toCleanString(v);
+        if (!k || seen.has(k)) continue;
+        seen.add(k);
+        out.push(k);
+      }
+      return out;
+    };
+
+    // Only persist settings for fields that are currently annotatable.
+    const settingsMap = cleanSettings(annotatableSettings);
+
+    const msg = toCleanString(commitMessage) || `Update annotatable fields for ${did}`;
+
+    // Concurrency-safe: rebase onto the latest config on 409, preserving other authors' edits.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const { json: current, sha } = await readJsonFileOrNull({
+        workerOrigin: this.workerOrigin,
+        owner: this.owner,
+        repo: this.repo,
+        token,
+        path: 'annotations/config.json',
+        ref: branch
+      });
+
+      const nextConfig = (current && typeof current === 'object')
+        ? { ...current }
+        : { version: 1, supportedDatasets: [] };
+      if (!Array.isArray(nextConfig.supportedDatasets)) nextConfig.supportedDatasets = [];
+
+      let found = false;
+      nextConfig.supportedDatasets = nextConfig.supportedDatasets.map((d) => {
+        if (!d || typeof d !== 'object') return d;
+        const dId = toCleanString(d.datasetId);
+        if (dId !== did) return d;
+        found = true;
+        const next = { ...d, fieldsToAnnotate: cleanedFields };
+        if (annotatableSettings != null) {
+          const merged = { ...cleanSettings(d.annotatableSettings), ...settingsMap };
+          const pruned = {};
+          for (const k of cleanedFields) {
+            if (merged[k]) pruned[k] = merged[k];
+          }
+          next.annotatableSettings = pruned;
+        }
+        if (closedFields != null) {
+          const merged = uniqueStrings(cleanClosed(d.closedFields).concat(cleanClosed(closedFields)));
+          next.closedFields = merged.filter((k) => cleanedFields.includes(k)).slice(0, 500);
+        }
+        return next;
+      });
+
+      if (!found) {
+        const pruned = {};
+        for (const k of cleanedFields) {
+          if (settingsMap[k]) pruned[k] = settingsMap[k];
+        }
+        const prunedClosed = closedFields != null
+          ? cleanClosed(closedFields).filter((k) => cleanedFields.includes(k)).slice(0, 500)
+          : undefined;
+        nextConfig.supportedDatasets = nextConfig.supportedDatasets.concat([
+          {
+            datasetId: did,
+            name: did,
+            fieldsToAnnotate: cleanedFields,
+            ...(annotatableSettings != null ? { annotatableSettings: pruned } : {}),
+            ...(closedFields != null ? { closedFields: prunedClosed } : {})
+          }
+        ]);
+      }
+
+      // Avoid no-op commits: compare semantic JSON ignoring key order.
+      if (current && typeof current === 'object') {
+        const changed = stableStringifyJson(current) !== stableStringifyJson(nextConfig);
+        if (!changed) {
+          const retSettings = {};
+          for (const k of cleanedFields) {
+            if (settingsMap[k]) retSettings[k] = settingsMap[k];
+          }
+          const retClosed = closedFields != null
+            ? cleanClosed(closedFields).filter((k) => cleanedFields.includes(k)).slice(0, 500)
+            : [];
+          return {
+            branch,
+            datasetId: did,
+            fieldsToAnnotate: cleanedFields,
+            annotatableSettings: retSettings,
+            closedFields: retClosed,
+            changed: false
+          };
+        }
+      }
+
+      const contentBase64 = encodeBase64Utf8(JSON.stringify(nextConfig, null, 2) + '\n');
+      try {
+        await putContent({
+          workerOrigin: this.workerOrigin,
+          owner: this.owner,
+          repo: this.repo,
+          token,
+          path: 'annotations/config.json',
+          branch,
+          message: msg,
+          contentBase64,
+          sha
+        });
+        break;
+      } catch (err) {
+        if (err?.status !== 409 || attempt === 2) throw err;
+      }
     }
 
-    const content = encodeBase64Utf8(JSON.stringify(nextConfig, null, 2) + '\n');
-    const msg = toCleanString(commitMessage) || `Update annotatable fields for ${did}`;
-    await putContent({
-      workerOrigin: this.workerOrigin,
-      owner: this.owner,
-      repo: this.repo,
-      token,
-      path: 'annotations/config.json',
-      branch,
-      message: msg,
-      contentBase64: content,
-      sha
-    });
-    return { branch, datasetId: did, fieldsToAnnotate: cleanedFields };
+    const retSettings = {};
+    for (const k of cleanedFields) {
+      if (settingsMap[k]) retSettings[k] = settingsMap[k];
+    }
+    const retClosed = closedFields != null
+      ? cleanClosed(closedFields).filter((k) => cleanedFields.includes(k)).slice(0, 500)
+      : [];
+    return { branch, datasetId: did, fieldsToAnnotate: cleanedFields, annotatableSettings: retSettings, closedFields: retClosed, changed: true };
   }
 
   async pullModerationMerges({ knownShas = null } = {}) {
@@ -434,9 +720,12 @@ export class CommunityAnnotationGitHubSync {
     const branch = this.branch || repoInfo?.default_branch || 'main';
     this.branch = branch;
 
-    let sha = null;
-    try {
-      const existing = await getContent({
+    const msg = toCleanString(commitMessage) || 'Update annotation moderation merges';
+    const incoming = normalizeModerationMergesDoc(mergesDoc && typeof mergesDoc === 'object' ? mergesDoc : {});
+
+    // Concurrency-safe: retry with latest sha on 409.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const { json: current, sha } = await readJsonFileOrNull({
         workerOrigin: this.workerOrigin,
         owner: this.owner,
         repo: this.repo,
@@ -444,30 +733,37 @@ export class CommunityAnnotationGitHubSync {
         path: 'annotations/moderation/merges.json',
         ref: branch
       });
-      if (existing?.type === 'file' && existing?.sha) sha = existing.sha;
-    } catch (err) {
-      if (!isNotFoundError(err)) throw err;
+
+      const currentNorm = (current && typeof current === 'object') ? normalizeModerationMergesDoc(current) : null;
+      const currentComparable = currentNorm ? { version: 1, merges: Array.isArray(currentNorm?.merges) ? currentNorm.merges : [] } : null;
+      const nextComparable = { version: 1, merges: Array.isArray(incoming?.merges) ? incoming.merges : [] };
+      const changed = stableStringifyJson(currentComparable) !== stableStringifyJson(nextComparable);
+      if (!changed) {
+        return { branch, path: 'annotations/moderation/merges.json', sha: sha || null, changed: false };
+      }
+
+      const docToWrite = { version: 1, updatedAt: nowIso(), merges: nextComparable.merges };
+      const contentBase64 = encodeBase64Utf8(JSON.stringify(docToWrite, null, 2) + '\n');
+      try {
+        const res = await putContent({
+          workerOrigin: this.workerOrigin,
+          owner: this.owner,
+          repo: this.repo,
+          token,
+          path: 'annotations/moderation/merges.json',
+          branch,
+          message: msg,
+          contentBase64,
+          sha
+        });
+        const newSha = toCleanString(res?.content?.sha || res?.sha || '') || null;
+        return { branch, path: 'annotations/moderation/merges.json', sha: newSha, changed: true };
+      } catch (err) {
+        if (err?.status !== 409 || attempt === 2) throw err;
+      }
     }
 
-    const doc = mergesDoc && typeof mergesDoc === 'object'
-      ? mergesDoc
-      : { version: 1, updatedAt: new Date().toISOString(), merges: [] };
-    const content = encodeBase64Utf8(JSON.stringify(doc, null, 2) + '\n');
-    const msg = toCleanString(commitMessage) || 'Update annotation moderation merges';
-    const res = await putContent({
-      workerOrigin: this.workerOrigin,
-      owner: this.owner,
-      repo: this.repo,
-      token,
-      path: 'annotations/moderation/merges.json',
-      branch,
-      message: msg,
-      contentBase64: content,
-      sha
-    });
-
-    const newSha = toCleanString(res?.content?.sha || res?.sha || '') || null;
-    return { branch, path: 'annotations/moderation/merges.json', sha: newSha };
+    throw new Error('Unable to publish moderation merges (retry limit)');
   }
 
   async getAuthenticatedUser() {
@@ -496,7 +792,7 @@ export class CommunityAnnotationGitHubSync {
     });
 
     const jsonFiles = entries
-      .filter((e) => e?.type === 'file' && typeof e?.name === 'string' && e.name.endsWith('.json'))
+      .filter((e) => e?.type === 'file' && typeof e?.name === 'string' && /^ghid_\d+\.json$/i.test(e.name))
       .slice(0, 2000);
 
     /** @type {Record<string, string>} */
@@ -533,7 +829,11 @@ export class CommunityAnnotationGitHubSync {
           path,
           ref: branch
         });
-        out.push(json);
+        const fileUser = toCleanString(name.replace(/\.json$/i, '')) || null;
+        const doc = (json && typeof json === 'object')
+          ? { ...json, __path: path, __fileUser: fileUser, __sha: sha || null }
+          : { __invalid: true, __path: name, __error: 'Invalid JSON shape (expected object)' };
+        out.push(doc);
         fetchedCount++;
       } catch (err) {
         // Skip invalid files; surface in UI via aggregate error if needed.
@@ -551,18 +851,17 @@ export class CommunityAnnotationGitHubSync {
     };
   }
 
-  async pullUserFile({ username } = {}) {
+  async pullUserFile({ userKey = null } = {}) {
     const token = this.token;
     if (!token) throw new Error('GitHub sign-in required');
     const branch = this.branch || 'main';
     const workerOrigin = this.workerOrigin;
 
-    const u = toCleanString(username).replace(/^@+/, '');
-    if (!u) throw new Error('username required');
-    const fileUser = sanitizeUsernameForPath(u);
-    const path = `annotations/users/${fileUser}.json`;
+    const key = sanitizeUserKeyForPath(userKey);
+    if (!key) throw new Error('userKey required');
 
     try {
+      const path = `annotations/users/${key}.json`;
       const { json, sha } = await readJsonFile({
         workerOrigin,
         owner: this.owner,
@@ -571,7 +870,10 @@ export class CommunityAnnotationGitHubSync {
         path,
         ref: branch
       });
-      return { doc: json, sha: sha || null, path };
+      const doc = (json && typeof json === 'object')
+        ? { ...json, __path: path, __fileUser: key, __sha: sha || null }
+        : null;
+      return doc ? { doc, sha: sha || null, path } : null;
     } catch (err) {
       if (err?.status === 404) return null;
       throw err;
@@ -584,9 +886,10 @@ export class CommunityAnnotationGitHubSync {
     const branch = this.branch || 'main';
     const workerOrigin = this.workerOrigin;
 
-    const username = toCleanString(userDoc?.username);
-    if (!username) throw new Error('User doc missing username');
-    const fileUser = sanitizeUsernameForPath(username);
+    const idRaw = userDoc?.githubUserId;
+    const id = Number.isFinite(Number(idRaw)) ? Math.max(0, Math.floor(Number(idRaw))) : 0;
+    if (!id) throw new Error('User doc missing githubUserId');
+    const fileUser = `ghid_${id}`;
     const path = `annotations/users/${fileUser}.json`;
 
     let sha = null;
@@ -622,14 +925,18 @@ export class CommunityAnnotationGitHubSync {
     this._repoInfo = repoInfo || null;
     const perms = repoInfo?.permissions || null;
     const canPushDirect = perms ? Boolean(perms?.push || perms?.maintain || perms?.admin) : null;
+    const isPrivateRepo = Boolean(repoInfo?.private);
+    const allowForking = repoInfo?.allow_forking !== false;
 
-    const content = encodeBase64Utf8(JSON.stringify(userDoc, null, 2) + '\n');
-    const msg = toCleanString(commitMessage) || `Update annotations for @${fileUser}`;
+    const docToWrite = { ...(userDoc && typeof userDoc === 'object' ? userDoc : {}), username: fileUser, githubUserId: id };
+    const content = encodeBase64Utf8(JSON.stringify(docToWrite, null, 2) + '\n');
+    const login = toCleanString(userDoc?.login || '') || null;
+    const msg = toCleanString(commitMessage) || `Update annotations for @${login || fileUser}`;
 
     // Prefer direct push when permitted; if permissions are unknown, try direct push first and fall back to PR.
     if (canPushDirect !== false) {
       try {
-        const res = await putContent({
+        const res = await putContentWithSingleRetry({
           workerOrigin,
           owner: this.owner,
           repo: this.repo,
@@ -638,7 +945,8 @@ export class CommunityAnnotationGitHubSync {
           branch,
           message: msg,
           contentBase64: content,
-          sha
+          sha,
+          refForRefresh: branch
         });
         const newSha = toCleanString(res?.content?.sha || res?.sha || '') || null;
         return { mode: 'push', path, remoteUpdatedAt, sha: newSha };
@@ -646,8 +954,21 @@ export class CommunityAnnotationGitHubSync {
         const status = err?.status;
         const isDenied = status === 401 || status === 403;
         if (canPushDirect === true || !isDenied) throw err;
+        if (!allowForking) {
+          throw new Error(
+            'This repository does not allow forking, so you cannot publish via Pull Request. ' +
+            'Ask the repo admins to enable forking or grant you GitHub role "Write" (or higher).'
+          );
+        }
         // Permissions were missing/unknown and the push was denied; fall back to fork + PR.
       }
+    }
+
+    if (!allowForking) {
+      throw new Error(
+        'This repository does not allow forking, so you cannot publish via Pull Request. ' +
+        'Ask the repo admins to enable forking or grant you GitHub role "Write" (or higher).'
+      );
     }
 
     // No direct write access: fork + PR flow.
@@ -663,11 +984,39 @@ export class CommunityAnnotationGitHubSync {
       });
     } catch (err) {
       // "already_exists" / "fork exists" should not block PR flow.
-      if (err?.status !== 422) throw err;
+      if (err?.status !== 422) {
+        const status = err?.status;
+        if (status === 401 || status === 403) {
+          throw new Error(
+            'Unable to create or access a fork for Pull Request publishing. ' +
+            'Make sure the GitHub App is installed for your account, and that you have permission to fork this repository.'
+          );
+        }
+        throw err;
+      }
     }
 
     const forkOwner = meLogin;
-    const forkRepo = this.repo;
+    let forkRepo = null;
+    try {
+      forkRepo = await ensureForkRepo({
+        workerOrigin,
+        upstreamOwner: this.owner,
+        upstreamRepo: this.repo,
+        token,
+        forkOwner
+      });
+    } catch (err) {
+      const msg = isPrivateRepo
+        ? (
+          `Unable to locate your fork for this private repository. ` +
+          `Install the Cellucid GitHub App on your personal account (ideally "All repositories"), ` +
+          `then retry Publish.`
+        )
+        : null;
+      if (msg) throw new Error(msg);
+      throw err;
+    }
 
     // Wait for fork to become available.
     let forkInfo = null;
@@ -686,25 +1035,56 @@ export class CommunityAnnotationGitHubSync {
       );
     }
 
-    const forkBase = toCleanString(forkInfo?.default_branch || '') || 'main';
+    // Deterministic branch per (datasetId, baseBranch, user) so repeated Publish updates a single PR.
+    const prBranch = toDeterministicPrBranch({ datasetId: this.datasetId, baseBranch: branch, fileUser });
 
-    // Create a branch in the fork.
-    const baseRef = await githubRequest(
-      workerOrigin,
-      `/repos/${encodeURIComponent(forkOwner)}/${encodeURIComponent(forkRepo)}/git/ref/heads/${encodeURIComponent(forkBase)}`,
-      { token }
-    );
-    const baseSha = toCleanString(baseRef?.object?.sha || '');
-    if (!baseSha) throw new Error('Unable to read fork base branch SHA');
+    // Create the branch if missing (base on the upstream branch tip for cleaner PR diffs).
+    let upstreamBaseSha = null;
+    try {
+      const upstreamRef = await githubRequest(
+        workerOrigin,
+        `/repos/${encodeURIComponent(this.owner)}/${encodeURIComponent(this.repo)}/git/ref/heads/${encodeURIComponent(branch)}`,
+        { token }
+      );
+      upstreamBaseSha = toCleanString(upstreamRef?.object?.sha || '') || null;
+    } catch {
+      upstreamBaseSha = null;
+    }
+    if (!upstreamBaseSha) {
+      const forkBase = toCleanString(forkInfo?.default_branch || '') || 'main';
+      const baseRef = await githubRequest(
+        workerOrigin,
+        `/repos/${encodeURIComponent(forkOwner)}/${encodeURIComponent(forkRepo)}/git/ref/heads/${encodeURIComponent(forkBase)}`,
+        { token }
+      );
+      upstreamBaseSha = toCleanString(baseRef?.object?.sha || '') || null;
+    }
+    if (!upstreamBaseSha) throw new Error('Unable to determine base SHA for PR branch');
 
-    const branchSuffix = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
-    const prBranch = `cellucid-annotations/${fileUser}/${branchSuffix}`;
-
-    await githubRequest(workerOrigin, `/repos/${encodeURIComponent(forkOwner)}/${encodeURIComponent(forkRepo)}/git/refs`, {
-      token,
-      method: 'POST',
-      body: { ref: `refs/heads/${prBranch}`, sha: baseSha }
-    });
+    let branchExists = false;
+    try {
+      await githubRequest(
+        workerOrigin,
+        `/repos/${encodeURIComponent(forkOwner)}/${encodeURIComponent(forkRepo)}/git/ref/heads/${encodeURIComponent(prBranch)}`,
+        { token }
+      );
+      branchExists = true;
+    } catch (err) {
+      if (err?.status !== 404) throw err;
+      branchExists = false;
+    }
+    if (!branchExists) {
+      try {
+        await githubRequest(workerOrigin, `/repos/${encodeURIComponent(forkOwner)}/${encodeURIComponent(forkRepo)}/git/refs`, {
+          token,
+          method: 'POST',
+          body: { ref: `refs/heads/${prBranch}`, sha: upstreamBaseSha }
+        });
+      } catch (err) {
+        // If another publish created it concurrently, proceed.
+        if (err?.status !== 422) throw err;
+      }
+    }
 
     // Upsert file in the fork branch.
     let forkSha = null;
@@ -715,7 +1095,7 @@ export class CommunityAnnotationGitHubSync {
       if (err?.status !== 404) throw err;
     }
 
-    await putContent({
+    await putContentWithSingleRetry({
       workerOrigin,
       owner: forkOwner,
       repo: forkRepo,
@@ -724,8 +1104,30 @@ export class CommunityAnnotationGitHubSync {
       branch: prBranch,
       message: msg,
       contentBase64: content,
-      sha: forkSha
+      sha: forkSha,
+      refForRefresh: prBranch
     });
+
+    // If an open PR already exists for this head/base, reuse it (avoids PR spam).
+    try {
+      const existing = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(this.owner)}/${encodeURIComponent(this.repo)}/pulls`, {
+        token,
+        query: { state: 'open', head: `${forkOwner}:${prBranch}`, base: branch, per_page: 5 }
+      });
+      const pr0 = Array.isArray(existing) ? existing[0] : null;
+      if (pr0) {
+        return {
+          mode: 'pr',
+          path,
+          remoteUpdatedAt,
+          prUrl: toCleanString(pr0?.html_url || '') || null,
+          prNumber: pr0?.number ?? null,
+          reused: true
+        };
+      }
+    } catch {
+      // ignore and fall through to creating a PR
+    }
 
     const prBody = [
       'Automated community annotation update from Cellucid.',
@@ -734,24 +1136,98 @@ export class CommunityAnnotationGitHubSync {
       `File: \`${path}\``
     ].join('\n');
 
-    const pr = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(this.owner)}/${encodeURIComponent(this.repo)}/pulls`, {
-      token,
-      method: 'POST',
-      body: {
-        title: msg,
-        head: `${forkOwner}:${prBranch}`,
-        base: branch,
-        body: prBody,
-        maintainer_can_modify: true
+    let pr = null;
+    let reused = false;
+    try {
+      pr = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(this.owner)}/${encodeURIComponent(this.repo)}/pulls`, {
+        token,
+        method: 'POST',
+        body: {
+          title: msg,
+          head: `${forkOwner}:${prBranch}`,
+          base: branch,
+          body: prBody,
+          maintainer_can_modify: true
+        }
+      });
+    } catch (err) {
+      // GitHub returns 422 if a PR already exists for this head/base (sometimes even if closed).
+      if (err?.status !== 422) throw err;
+      try {
+        const prs = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(this.owner)}/${encodeURIComponent(this.repo)}/pulls`, {
+          token,
+          query: { state: 'all', head: `${forkOwner}:${prBranch}`, base: branch, per_page: 10 }
+        });
+        const list = Array.isArray(prs) ? prs : [];
+        const existing = list.find((p) => p && p.number) || null;
+        if (!existing) throw err;
+        reused = true;
+        // If the previous PR was merged, you cannot reopen it; create a fresh PR from a new branch
+        // that points to the current fork branch head (avoids PR spam during review, but supports
+        // a new review cycle after merge).
+        const mergedAt = toCleanString(existing?.merged_at || '');
+        if (existing?.state === 'closed' && mergedAt) {
+          reused = false;
+          const ref = await githubRequest(
+            workerOrigin,
+            `/repos/${encodeURIComponent(forkOwner)}/${encodeURIComponent(forkRepo)}/git/ref/heads/${encodeURIComponent(prBranch)}`,
+            { token }
+          );
+          const headSha = toCleanString(ref?.object?.sha || '') || null;
+          if (!headSha) throw err;
+          let alt = null;
+          for (let attempt = 0; attempt < 5; attempt++) {
+            const suffix = `${Date.now().toString(36)}${attempt ? `_${attempt}` : ''}`;
+            alt = `${prBranch}-${suffix}`;
+            try {
+              await githubRequest(workerOrigin, `/repos/${encodeURIComponent(forkOwner)}/${encodeURIComponent(forkRepo)}/git/refs`, {
+                token,
+                method: 'POST',
+                body: { ref: `refs/heads/${alt}`, sha: headSha }
+              });
+              break;
+            } catch (createErr) {
+              if (createErr?.status !== 422 || attempt === 4) throw createErr;
+            }
+          }
+          pr = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(this.owner)}/${encodeURIComponent(this.repo)}/pulls`, {
+            token,
+            method: 'POST',
+            body: {
+              title: msg,
+              head: `${forkOwner}:${alt}`,
+              base: branch,
+              body: prBody,
+              maintainer_can_modify: true
+            }
+          });
+        } else if (existing?.state === 'closed') {
+          try {
+            pr = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(this.owner)}/${encodeURIComponent(this.repo)}/pulls/${encodeURIComponent(existing.number)}`, {
+              token,
+              method: 'PATCH',
+              body: { state: 'open' }
+            });
+          } catch {
+            // If reopen fails (permissions), still return the existing PR link so the user can act.
+            pr = existing;
+          }
+        } else {
+          pr = existing;
+        }
+      } catch (fallbackErr) {
+        // If we can't recover, surface the original error.
+        throw fallbackErr || err;
       }
-    });
+    }
 
     return {
       mode: 'pr',
       path,
       remoteUpdatedAt,
       prUrl: toCleanString(pr?.html_url || '') || null,
-      prNumber: pr?.number ?? null
+      prNumber: pr?.number ?? null,
+      reused
     };
   }
 }
@@ -775,5 +1251,26 @@ export function getGitHubSyncForDataset({ datasetId, username = 'local', tokenOv
 export function setDatasetAnnotationRepoFromUrlParam({ datasetId, urlParamValue, username = 'local' }) {
   const parsed = parseOwnerRepo(urlParamValue);
   if (!parsed) return false;
+  return setAnnotationRepoForDataset(datasetId, parsed.ownerRepoRef, username);
+}
+
+export async function setDatasetAnnotationRepoFromUrlParamAsync({ datasetId, urlParamValue, username = 'local', tokenOverride = null } = {}) {
+  const parsed = parseOwnerRepo(urlParamValue);
+  if (!parsed) return false;
+
+  // If no branch is specified, resolve the repo's default branch ("HEAD") and persist owner/repo@branch.
+  if (!parsed.ref) {
+    const token = tokenOverride || getGitHubAuthSession().getToken() || null;
+    if (!token) return false;
+    const repoInfo = await getRepoInfo({
+      workerOrigin: getGitHubWorkerOrigin(),
+      owner: parsed.owner,
+      repo: parsed.repo,
+      token
+    });
+    const head = toCleanString(repoInfo?.default_branch || '') || 'main';
+    return setAnnotationRepoForDataset(datasetId, `${parsed.ownerRepo}@${head}`, username);
+  }
+
   return setAnnotationRepoForDataset(datasetId, parsed.ownerRepoRef, username);
 }

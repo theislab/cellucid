@@ -457,9 +457,12 @@ export class ComparisonModule {
         this._analysisMode = mode;
         this._uiManager.switchToMode(mode);
       }
+      // Notify UI that it's now visible (triggers pending updates)
+      this._uiManager.onVisibilityChanged(true);
     } else {
       // Item was toggled closed - clear the active mode
       this._analysisMode = null;
+      this._uiManager.clearActiveMode();
     }
   }
 

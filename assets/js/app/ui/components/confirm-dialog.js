@@ -12,6 +12,10 @@ export function showConfirmDialog({
   title,
   message,
   confirmText = 'Delete',
+  inputLabel = null,
+  inputPlaceholder = null,
+  inputDefaultValue = '',
+  inputMaxLength = 512,
   onConfirm,
   onCancel
 }) {
@@ -28,12 +32,33 @@ export function showConfirmDialog({
   overlay.setAttribute('role', 'dialog');
   overlay.setAttribute('aria-modal', 'true');
 
+  const wantsInput = Boolean(inputLabel || inputPlaceholder);
+  const inputBlock = wantsInput
+    ? `
+      <div class="confirm-dialog-input">
+        ${inputLabel ? `<div class="confirm-dialog-input-label">${escapeHtml(inputLabel)}</div>` : ''}
+        <div class="confirm-dialog-textarea-wrap">
+          <textarea
+            class="confirm-dialog-textarea"
+            rows="3"
+            maxlength="${escapeHtml(String(inputMaxLength))}"
+            placeholder="${escapeHtml(inputPlaceholder || '')}"
+          >${escapeHtml(inputDefaultValue || '')}</textarea>
+          <div class="confirm-dialog-char-counter confirm-dialog-char-counter--overlay"></div>
+        </div>
+      </div>
+    `
+    : '';
+
   overlay.innerHTML = `
     <div class="confirm-dialog" role="document">
       <div class="confirm-dialog-header">
         <span class="confirm-dialog-title">${escapeHtml(title || 'Confirm')}</span>
       </div>
-      <div class="confirm-dialog-body">${escapeHtml(message || '')}</div>
+      <div class="confirm-dialog-body">
+        ${escapeHtml(message || '')}
+        ${inputBlock}
+      </div>
       <div class="confirm-dialog-actions">
         <button type="button" class="confirm-dialog-btn confirm-dialog-cancel">Cancel</button>
         <button type="button" class="confirm-dialog-btn confirm-dialog-confirm">${escapeHtml(confirmText)}</button>
@@ -54,14 +79,28 @@ export function showConfirmDialog({
 
   const cancelBtn = overlay.querySelector('.confirm-dialog-cancel');
   const confirmBtn = overlay.querySelector('.confirm-dialog-confirm');
+  const textarea = overlay.querySelector('.confirm-dialog-textarea');
+  const charCounter = overlay.querySelector('.confirm-dialog-char-counter');
+
+  if (wantsInput && textarea && charCounter) {
+    const maxLen = Number.parseInt(textarea.getAttribute('maxlength') || '', 10);
+    const maxLabel = Number.isFinite(maxLen) && maxLen > 0 ? maxLen : null;
+    const updateCounter = () => {
+      const cur = String(textarea.value || '').length;
+      charCounter.textContent = `${cur}/${maxLabel ?? '—'}`;
+    };
+    textarea.addEventListener('input', updateCounter, { passive: true });
+    updateCounter();
+  }
 
   cancelBtn?.addEventListener('click', () => {
     close();
     onCancel?.();
   });
   confirmBtn?.addEventListener('click', () => {
+    const note = wantsInput ? String(textarea?.value || '') : null;
     close();
-    onConfirm?.();
+    onConfirm?.(note);
   });
 
   overlay.addEventListener('click', (e) => {
@@ -80,5 +119,6 @@ export function showConfirmDialog({
   document.addEventListener('keydown', onKeyDown);
 
   document.body.appendChild(overlay);
-  confirmBtn?.focus?.();
+  if (wantsInput) textarea?.focus?.();
+  else confirmBtn?.focus?.();
 }
