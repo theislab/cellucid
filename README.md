@@ -14,7 +14,7 @@ WebGL-based 3D visualization for single-cell data. Explore UMAP embeddings with 
 - Gene expression overlays with efficient sparse matrix handling
 - Categorical and continuous cell metadata coloring
 - Interactive filtering and cell selection
-- Community annotation voting (🗳️) with optional GitHub sync (fine-grained PAT)
+- Community annotation voting (🗳️) with optional GitHub sync (GitHub App)
 - KNN connectivity edge visualization
 - Multi-dimensional support (1D timelines, 2D, 3D)
 - Animated vector field overlay (velocity / drift) with GPU particle flow
@@ -34,13 +34,9 @@ WebGL-based 3D visualization for single-cell data. Explore UMAP embeddings with 
 ```bash
 pip install cellucid
 
-# Serve h5ad directly
-cellucid-anndata /path/to/data.h5ad
-
-# Serve zarr directly
-cellucid-anndata /path/to/data.zarr
-
-# Or serve pre-exported data
+# Serve any data (format auto-detected)
+cellucid serve /path/to/data.h5ad
+cellucid serve /path/to/data.zarr
 cellucid serve ./my_export
 ```
 
@@ -62,8 +58,9 @@ Use the **Figure Export** accordion in the sidebar to export the current view:
 ## Community Annotation (GitHub Sync)
 
 - Enable per-field voting: right-click the categorical field dropdown → “Enable community annotation”.
-- Open **Community Annotation** accordion to connect a repo and `Pull`/`Push` votes/suggestions (private repos require a fine-grained PAT).
+- Open **Community Annotation** accordion to sign in with GitHub, select an installed repo, and `Pull`/`Publish` votes/suggestions.
 - Annotation repo template: `cellucid-annotation/README.md`.
+- Detailed repo + auth setup: `cellucid/assets/js/app/community-annotations/REPO_SETUP.md`.
 
 ## All 14 Loading Options
 

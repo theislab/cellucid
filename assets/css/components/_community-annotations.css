@@ -2,24 +2,38 @@
    Community annotations (offline-first)
    ===================================================================== */
 
+/* Vote button in legend row – pill style matching btn-small */
 .legend-vote-btn {
   margin-left: var(--space-1-5);
   padding: var(--space-0-5) var(--space-1-5);
+  font-family: var(--font-display);
   font-size: var(--text-2xs);
-  border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 35%, transparent);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wider);
+  border-radius: var(--radius-full);
+  border: var(--border-strong);
   background: var(--color-surface-secondary);
   color: var(--color-text-primary);
   cursor: pointer;
+  box-shadow: var(--shadow-xs);
+  transition: var(--transition-colors), transform var(--duration-fast) var(--easing-standard);
 }
 
 .legend-vote-btn:hover {
   background: var(--color-border-light);
-  border-color: var(--color-border-strong);
+  transform: translate(-1px, -1px);
+  box-shadow: var(--shadow-sm);
 }
 
+.legend-vote-btn:active {
+  transform: translate(0, 0);
+  box-shadow: none;
+}
+
+/* Inline panel – paper card style */
 .community-annotation-panel {
-  margin: 6px 0 10px 24px; /* align under label */
-  padding: var(--space-2);
+  margin: var(--space-1-5) 0 var(--space-2-5) var(--space-6);
+  padding: var(--space-2) var(--space-2-5);
   border: var(--border-strong);
   background: var(--color-surface-secondary);
   box-shadow: var(--shadow-sm);
@@ -32,42 +46,72 @@
   font-family: var(--font-display);
   font-size: var(--text-xs);
   font-weight: var(--font-weight-semibold);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wider);
 }
 
 .community-annotation-panel-subtitle {
   font-size: var(--text-2xs);
-  opacity: var(--opacity-75);
+  color: var(--color-text-secondary);
+  line-height: var(--leading-relaxed);
 }
 
+/* Consensus status badge */
 .community-annotation-consensus {
   font-size: var(--text-2xs);
-  padding: 4px 6px;
-  border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 20%, transparent);
+  padding: var(--space-1) var(--space-1-5);
+  border: var(--border-strong);
   background: var(--color-surface-elevated);
+  box-shadow: var(--shadow-xs);
 }
 
 .community-annotation-consensus.status-consensus {
-  border-color: color-mix(in srgb, var(--color-success) 45%, transparent);
+  border-color: var(--color-success);
+  background: var(--color-success-soft);
 }
 
 .community-annotation-consensus.status-disputed {
-  border-color: color-mix(in srgb, var(--color-warning) 45%, transparent);
+  border-color: var(--color-warning);
+  background: var(--color-warning-soft);
 }
 
 .community-annotation-consensus.status-pending {
-  border-color: color-mix(in srgb, var(--color-border-strong) 20%, transparent);
+  border-color: var(--color-border-default);
+  background: var(--color-surface-tertiary);
 }
 
+/* Suggestions list */
 .community-annotation-suggestions {
   display: flex;
   flex-direction: column;
-  gap: var(--space-1);
+  gap: var(--space-1-5);
 }
 
+/* Suggestion card – elevated paper style */
 .community-annotation-suggestion-card {
-  padding: var(--space-1-5);
+  padding: var(--space-2);
   background: var(--color-surface-elevated);
-  border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 12%, transparent);
+  border: var(--border-strong);
+  box-shadow: var(--shadow-xs);
+  transition: var(--transition-all);
+}
+
+.community-annotation-suggestion-card:hover {
+  box-shadow: var(--shadow-sm);
+}
+
+.community-annotation-suggestion-card.community-annotation-moderation-draggable {
+  cursor: grab;
+}
+
+.community-annotation-suggestion-card.community-annotation-moderation-draggable:active {
+  cursor: grabbing;
+}
+
+.community-annotation-suggestion-card.is-merge-target {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 2px;
+  box-shadow: var(--shadow-md);
 }
 
 .community-annotation-suggestion-top {
@@ -78,7 +122,8 @@
 }
 
 .community-annotation-suggestion-label {
-  font-size: var(--text-xs);
+  font-family: var(--font-display);
+  font-size: var(--text-sm);
   font-weight: var(--font-weight-semibold);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -86,56 +131,185 @@
 }
 
 .community-annotation-suggestion-net {
+  font-family: var(--font-mono);
   font-size: var(--text-2xs);
-  opacity: var(--opacity-70);
+  color: var(--color-text-secondary);
   white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 
 .community-annotation-suggestion-ontology {
-  margin-top: 2px;
+  margin-top: var(--space-0-5);
   font-size: var(--text-2xs);
-  font-family: "Fira Code", monospace;
-  opacity: var(--opacity-75);
+  font-family: var(--font-mono);
+  color: var(--color-text-secondary);
 }
 
 .community-annotation-suggestion-evidence {
-  margin-top: 4px;
+  margin-top: var(--space-1);
   font-size: var(--text-2xs);
-  opacity: var(--opacity-75);
-  line-height: 1.35;
+  color: var(--color-text-secondary);
+  line-height: var(--leading-relaxed);
   white-space: pre-wrap;
 }
 
 .community-annotation-suggestion-actions {
   display: flex;
-  gap: var(--space-1);
-  margin-top: var(--space-1);
+  gap: var(--space-1-5);
+  margin-top: var(--space-1-5);
 }
 
+/* Vote buttons – pill style with state colors */
+.community-annotation-vote-btn {
+  padding: var(--space-1) var(--space-2);
+  font-family: var(--font-display);
+  font-size: var(--text-2xs);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wider);
+  border-radius: var(--radius-full);
+  border: var(--border-strong);
+  background: var(--color-surface-secondary);
+  color: var(--color-text-primary);
+  cursor: pointer;
+  box-shadow: var(--shadow-xs);
+  transition: var(--transition-colors), transform var(--duration-fast) var(--easing-standard);
+}
+
+.community-annotation-vote-btn:hover {
+  background: var(--color-border-light);
+  transform: translate(-1px, -1px);
+  box-shadow: var(--shadow-sm);
+}
+
+.community-annotation-vote-btn:active {
+  transform: translate(0, 0);
+  box-shadow: none;
+}
+
+.community-annotation-vote-btn.is-mine.vote-up {
+  background: var(--color-success-soft);
+  border-color: var(--color-success);
+  color: var(--color-success-text);
+}
+
+.community-annotation-vote-btn.is-mine.vote-up:hover {
+  filter: brightness(0.98);
+  transform: translate(-1px, -1px);
+}
+
+.community-annotation-vote-btn.is-mine.vote-down {
+  background: var(--color-danger-soft);
+  border-color: var(--color-danger);
+  color: var(--color-danger-text);
+}
+
+.community-annotation-vote-btn.is-mine.vote-down:hover {
+  filter: brightness(0.98);
+  transform: translate(-1px, -1px);
+}
+
+/* Sync actions grid */
 .community-annotation-sync-actions {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
   grid-auto-rows: 1fr;
-  gap: var(--space-2) var(--space-1-5);
-  margin-top: var(--space-1-5);
+  gap: var(--space-1-5);
+  margin-top: var(--space-2);
 }
 
 .community-annotation-sync-actions .btn-small {
   width: 100%;
   text-align: center;
-  padding: var(--space-1-5) var(--space-2-5);
 }
 
+/* GitHub user display */
+.community-annotation-github-user {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  margin-top: var(--space-1-5);
+  padding: var(--space-1-5) var(--space-2);
+  background: var(--color-surface-tertiary);
+  border: var(--border-width-1) solid var(--color-border-default);
+}
+
+.community-annotation-github-avatar {
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-full);
+  border: var(--border-width-1) solid var(--color-border-strong);
+  background: var(--color-surface-elevated);
+  flex-shrink: 0;
+}
+
+.community-annotation-github-username {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--color-text-primary);
+}
+
+.community-annotation-identity-actions {
+  display: flex;
+  gap: var(--space-1-5);
+  margin-top: var(--space-1-5);
+}
+
+/* Help text */
 .community-annotation-inline-help {
-  font-size: var(--text-2xs);
-  opacity: var(--opacity-75);
-  line-height: 1.35;
+  font-size: var(--text-xs);
+  color: var(--color-text-secondary);
+  line-height: var(--leading-relaxed);
 }
 
+/* New annotation input row */
 .community-annotation-new {
   display: flex;
-  gap: var(--space-1);
+  gap: var(--space-1-5);
   align-items: center;
+}
+
+.community-annotation-new.community-annotation-new-vertical {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+/* Text inputs – matching search-input style */
+.community-annotation-text-input {
+  width: 100%;
+  padding: var(--space-1-5) var(--space-2);
+  font-size: var(--text-sm);
+  border: var(--border-strong);
+  border-radius: 0;
+  box-sizing: border-box;
+  background: var(--color-surface-elevated);
+  box-shadow: var(--shadow-sm);
+  transition: var(--transition-all);
+}
+
+.community-annotation-text-input:focus {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 1px;
+  box-shadow: var(--shadow-md);
+}
+
+.community-annotation-text-input::placeholder {
+  color: var(--color-text-tertiary);
+}
+
+.community-annotation-voting-detail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+/* Dashed info box – matching dataset-info style */
+.community-annotation-dashed-box {
+  padding: var(--space-2) var(--space-2-5);
+  background: var(--color-surface-secondary);
+  border: var(--border-width-1) dashed var(--color-border-strong);
+  box-shadow: var(--shadow-xs);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
 }
 
 .community-annotation-input {
@@ -145,68 +319,104 @@
 .community-annotation-textarea {
   width: 100%;
   min-height: 72px;
+  padding: var(--space-1-5) var(--space-2);
+  font-size: var(--text-sm);
+  font-family: inherit;
+  border: var(--border-strong);
+  border-radius: 0;
+  background: var(--color-surface-elevated);
+  box-shadow: var(--shadow-sm);
   resize: vertical;
+  transition: var(--transition-all);
 }
 
-/* Sidebar section */
+.community-annotation-textarea:focus {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 1px;
+  box-shadow: var(--shadow-md);
+}
+
+.community-annotation-consensus-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: var(--space-2);
+}
+
+/* Progress section */
 .community-annotation-progress {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  margin-top: var(--space-1-5);
+  gap: var(--space-1-5);
+  margin-top: var(--space-2);
 }
 
 .community-annotation-progress-label {
+  font-family: var(--font-display);
   font-size: var(--text-xs);
-  opacity: var(--opacity-80);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wide);
+  color: var(--color-text-secondary);
 }
 
 .community-annotation-progress-bar {
   height: 8px;
   background: var(--color-surface-tertiary);
-  border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 12%, transparent);
+  border: var(--border-strong);
+  box-shadow: inset 0 1px 2px color-mix(in srgb, var(--color-shadow-rgb) 8%, transparent);
 }
 
 .community-annotation-progress-fill {
   height: 100%;
-  background: color-mix(in srgb, var(--color-success) 55%, var(--color-success-soft) 45%);
+  background: var(--color-success);
   width: 0%;
+  transition: width var(--duration-normal) var(--easing-smooth);
 }
 
+/* Cluster list */
 .community-annotation-cluster-list {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--space-1-5);
   margin-top: var(--space-2);
 }
 
 .community-annotation-cluster-row {
   display: grid;
   grid-template-columns: 1fr auto auto auto;
-  gap: var(--space-1-5);
+  gap: var(--space-2);
   align-items: center;
-  padding: 6px;
+  padding: var(--space-1-5) var(--space-2);
   background: var(--color-surface-secondary);
-  border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 10%, transparent);
+  border: var(--border-strong);
+  box-shadow: var(--shadow-xs);
+  transition: var(--transition-all);
+}
+
+.community-annotation-cluster-row:hover {
+  box-shadow: var(--shadow-sm);
 }
 
 .community-annotation-cluster-name {
   font-size: var(--text-xs);
+  font-weight: var(--font-weight-medium);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .community-annotation-cluster-status {
+  font-family: var(--font-mono);
   font-size: var(--text-2xs);
-  opacity: var(--opacity-85);
+  color: var(--color-text-secondary);
   white-space: nowrap;
 }
 
 .community-annotation-cluster-meta {
+  font-family: var(--font-mono);
   font-size: var(--text-2xs);
-  opacity: var(--opacity-65);
+  color: var(--color-text-tertiary);
   white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 
 /* Modal */
@@ -222,7 +432,8 @@
 }
 
 .community-annotation-modal {
-  width: min(720px, 96vw);
+  width: min(520px, 96vw);
+  min-width: min(360px, 96vw);
   max-height: min(84vh, 900px);
   overflow: hidden;
   background: var(--color-surface-elevated);
@@ -230,6 +441,8 @@
   box-shadow: var(--shadow-lg);
   display: flex;
   flex-direction: column;
+  resize: both;
+  font-size: var(--text-sm);
 }
 
 .community-annotation-modal-header {
@@ -248,14 +461,297 @@
 
 .community-annotation-modal-body {
   padding: var(--space-2-5);
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
 }
 
+.community-annotation-modal-body .legend-help,
+.community-annotation-modal-body .community-annotation-inline-help,
+.community-annotation-modal-body .community-annotation-panel-subtitle,
+.community-annotation-modal-body .community-annotation-consensus,
+.community-annotation-modal-body .community-annotation-suggestion-net,
+.community-annotation-modal-body .community-annotation-suggestion-ontology,
+.community-annotation-modal-body .community-annotation-suggestion-evidence {
+  font-size: var(--text-sm);
+}
+
+.community-annotation-modal-body .community-annotation-panel-title,
+.community-annotation-modal-body .community-annotation-suggestion-label {
+  font-size: var(--text-lg);
+}
+
+.community-annotation-modal-body .community-annotation-new-title {
+  font-size: var(--text-sm);
+}
+
+/* New annotation section title */
 .community-annotation-new-title {
+  font-family: var(--font-display);
   font-size: var(--text-xs);
   font-weight: var(--font-weight-semibold);
-  margin-bottom: var(--space-1);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wider);
+  margin-bottom: var(--space-1-5);
+}
+
+/* Scrollbar styling for modal */
+.community-annotation-modal-body::-webkit-scrollbar {
+  width: 6px;
+}
+
+.community-annotation-modal-body::-webkit-scrollbar-track {
+  background: color-mix(in srgb, var(--color-text-primary) 6%, transparent);
+}
+
+.community-annotation-modal-body::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--color-text-primary) 30%, transparent);
+  border-radius: 3px;
+}
+
+.community-annotation-modal-body::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--color-text-primary) 45%, transparent);
+}
+
+/* Field selector in modal */
+.community-annotation-field-select {
+  width: 100%;
+  padding: var(--space-1-5) var(--space-2);
+  font-size: var(--text-sm);
+  border: var(--border-strong);
+  border-radius: 0;
+  background: var(--color-surface-elevated);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+  transition: var(--transition-all);
+}
+
+.community-annotation-field-select:focus {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 1px;
+  box-shadow: var(--shadow-md);
+}
+
+/* Category list in modal */
+.community-annotation-category-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  max-height: 240px;
+  overflow-y: auto;
+  padding-right: var(--space-1);
+}
+
+.community-annotation-category-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1-5) var(--space-2);
+  background: var(--color-surface-secondary);
+  border: var(--border-width-1) solid var(--color-border-default);
+  cursor: pointer;
+  transition: var(--transition-all);
+}
+
+.community-annotation-category-item:hover {
+  border-color: var(--color-border-strong);
+  background: var(--color-border-light);
+}
+
+.community-annotation-category-item.selected {
+  border-color: var(--color-border-strong);
+  background: var(--color-text-primary);
+  color: var(--color-text-inverse);
+}
+
+.community-annotation-category-swatch {
+  width: var(--space-3);
+  height: var(--space-3);
+  border-radius: 2px;
+  border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 40%, transparent);
+  flex-shrink: 0;
+}
+
+.community-annotation-category-name {
+  flex: 1;
+  font-size: var(--text-sm);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.community-annotation-category-status {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--color-text-tertiary);
+  white-space: nowrap;
+}
+
+.community-annotation-category-item.selected .community-annotation-category-status {
+  color: color-mix(in srgb, var(--color-text-inverse) 70%, transparent);
+}
+
+/* Empty state */
+.community-annotation-empty {
+  padding: var(--space-4) var(--space-3);
+  text-align: center;
+  color: var(--color-text-tertiary);
+  font-size: var(--text-sm);
+  background: var(--color-surface-tertiary);
+  border: var(--border-width-1) dashed var(--color-border-default);
+}
+
+/* Loading state */
+.community-annotation-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  color: var(--color-text-secondary);
+  font-size: var(--text-sm);
+  font-style: italic;
+}
+
+/* ========================================================================
+   Comments
+   ===================================================================== */
+
+.community-annotation-comments-section {
+  margin-top: var(--space-2);
+  padding-top: var(--space-2);
+  border-top: var(--border-width-1) solid color-mix(in srgb, var(--color-border-default) 50%, transparent);
+}
+
+.community-annotation-comments-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1-5);
+}
+
+.community-annotation-comment {
+  padding: var(--space-1-5) var(--space-2);
+  background: var(--color-surface-secondary);
+  border: var(--border-width-1) solid var(--color-border-default);
+  font-size: var(--text-xs);
+}
+
+.community-annotation-comment.is-own {
+  background: color-mix(in srgb, var(--color-interactive-primary) 8%, var(--color-surface-secondary));
+  border-color: color-mix(in srgb, var(--color-interactive-primary) 30%, var(--color-border-default));
+}
+
+.community-annotation-comment-header {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-1-5);
+  margin-bottom: var(--space-0-5);
+}
+
+.community-annotation-comment-author {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-secondary);
+}
+
+.community-annotation-comment-time {
+  font-size: var(--text-2xs);
+  color: var(--color-text-tertiary);
+}
+
+.community-annotation-comment-text {
+  font-size: var(--text-sm);
+  line-height: var(--leading-relaxed);
+  color: var(--color-text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.community-annotation-comment-actions {
+  display: flex;
+  gap: var(--space-1-5);
+  margin-top: var(--space-1);
+}
+
+.community-annotation-comment-action-btn {
+  padding: 0;
+  font-size: var(--text-2xs);
+  color: var(--color-text-tertiary);
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-decoration: underline;
+  transition: var(--transition-colors);
+}
+
+.community-annotation-comment-action-btn:hover {
+  color: var(--color-text-secondary);
+}
+
+.community-annotation-comment-overflow {
+  font-size: var(--text-2xs);
+  color: var(--color-text-tertiary);
+  text-align: center;
+  padding: var(--space-1);
+}
+
+.community-annotation-add-comment-btn {
+  display: inline-block;
+  margin-top: var(--space-1-5);
+  padding: var(--space-0-5) var(--space-1-5);
+  font-size: var(--text-2xs);
+  color: var(--color-text-secondary);
+  background: none;
+  border: var(--border-width-1) dashed var(--color-border-default);
+  cursor: pointer;
+  transition: var(--transition-all);
+}
+
+.community-annotation-add-comment-btn:hover {
+  border-color: var(--color-border-strong);
+  color: var(--color-text-primary);
+  background: var(--color-surface-secondary);
+}
+
+.community-annotation-comment-form {
+  margin-top: var(--space-1-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.community-annotation-comment-input {
+  width: 100%;
+  min-height: 60px;
+  padding: var(--space-1-5) var(--space-2);
+  font-size: var(--text-sm);
+  font-family: inherit;
+  border: var(--border-strong);
+  border-radius: 0;
+  background: var(--color-surface-elevated);
+  box-shadow: var(--shadow-sm);
+  resize: vertical;
+  transition: var(--transition-all);
+}
+
+.community-annotation-comment-input:focus {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 1px;
+  box-shadow: var(--shadow-md);
+}
+
+.community-annotation-char-counter {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--color-text-tertiary);
+  text-align: right;
+}
+
+.community-annotation-comment-form-actions {
+  display: flex;
+  gap: var(--space-1);
+  justify-content: flex-end;
 }

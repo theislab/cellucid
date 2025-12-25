@@ -74,7 +74,34 @@ export function buildOverlayContext(options) {
     getViewTransparency
   } = options || {};
 
-  const devicePixelRatio = (typeof window !== 'undefined' && window.devicePixelRatio) ? window.devicePixelRatio : 1;
+  // Backwards-compatible: allow callers to pass an existing context object to reuse
+  // allocations (critical for per-frame render loops).
+  const out = options?.reuse || null;
+  const ctx = out || {};
+
+  ctx.gl = gl;
+  ctx.viewId = String(viewId);
+  ctx.time = Number(timeSeconds) || 0;
+  ctx.deltaTime = Number(deltaTimeSeconds) || 0;
+  ctx.isSnapshot = Boolean(isSnapshot);
+  ctx.dimensionLevel = Number(dimensionLevel) || 3;
+  ctx.devicePixelRatio = (typeof window !== 'undefined' && window.devicePixelRatio) ? window.devicePixelRatio : 1;
+
+  ctx.mvpMatrix = renderParams.mvpMatrix;
+  ctx.viewMatrix = renderParams.viewMatrix;
+  ctx.modelMatrix = renderParams.modelMatrix;
+  ctx.projectionMatrix = renderParams.projectionMatrix;
+
+  ctx.viewportWidth = renderParams.viewportWidth;
+  ctx.viewportHeight = renderParams.viewportHeight;
+  ctx.fov = renderParams.fov;
+  ctx.sizeAttenuation = renderParams.sizeAttenuation;
+
+  ctx.fogDensity = renderParams.fogDensity;
+  ctx.fogColor = renderParams.fogColor;
+
+  ctx.cameraPosition = renderParams.cameraPosition;
+  ctx.cameraDistance = renderParams.cameraDistance;
 
   const alphaTexture = typeof hpRenderer?.getAlphaTexture === 'function'
     ? hpRenderer.getAlphaTexture()
@@ -89,50 +116,30 @@ export function buildOverlayContext(options) {
   // Snapshots may render with their own transparency buffers; only use the alpha
   // texture when the view explicitly opts-in (e.g., sharesLiveTransparency).
   const viewWantsAlphaTex = Boolean(renderParams?.useAlphaTexture);
-  const useAlphaTexture = Boolean(alphaActive && (!isSnapshot || viewWantsAlphaTex));
+  ctx.useAlphaTexture = Boolean(alphaActive && (!isSnapshot || viewWantsAlphaTex));
+  ctx.alphaTexture = alphaTexture;
+  ctx.alphaTexWidth = alphaTexWidth;
 
-  const fogNear = typeof hpRenderer?.getFogNear === 'function' ? hpRenderer.getFogNear() : (hpRenderer?.fogNear ?? 0);
-  const fogFar = typeof hpRenderer?.getFogFar === 'function' ? hpRenderer.getFogFar() : (hpRenderer?.fogFar ?? 10);
+  ctx.fogNear = typeof hpRenderer?.getFogNear === 'function' ? hpRenderer.getFogNear() : (hpRenderer?.fogNear ?? 0);
+  ctx.fogFar = typeof hpRenderer?.getFogFar === 'function' ? hpRenderer.getFogFar() : (hpRenderer?.fogFar ?? 10);
 
-  const getLodLevel = () => (typeof hpRenderer?.getCurrentLODLevel === 'function' ? hpRenderer.getCurrentLODLevel(viewId) : -1);
-  const getLodIndices = () => (typeof hpRenderer?.getCurrentLodIndices === 'function'
-    ? (hpRenderer.getCurrentLodIndices(viewId, dimensionLevel) || null)
-    : null);
+  if (typeof getViewPositions === 'function') ctx.getViewPositions = getViewPositions;
+  if (typeof getViewTransparency === 'function') ctx.getViewTransparency = getViewTransparency;
 
-  return {
-    gl,
-    viewId: String(viewId),
-    time: Number(timeSeconds) || 0,
-    deltaTime: Number(deltaTimeSeconds) || 0,
-    isSnapshot: Boolean(isSnapshot),
-    dimensionLevel: Number(dimensionLevel) || 3,
-    devicePixelRatio,
+  // Stable LOD helpers (avoid allocating new closures per frame).
+  ctx._hpRenderer = hpRenderer || null;
+  if (typeof ctx.getLodLevel !== 'function') {
+    ctx.getLodLevel = () => (
+      typeof ctx._hpRenderer?.getCurrentLODLevel === 'function' ? ctx._hpRenderer.getCurrentLODLevel(ctx.viewId) : -1
+    );
+  }
+  if (typeof ctx.getLodIndices !== 'function') {
+    ctx.getLodIndices = () => (
+      typeof ctx._hpRenderer?.getCurrentLodIndices === 'function'
+        ? (ctx._hpRenderer.getCurrentLodIndices(ctx.viewId, ctx.dimensionLevel) || null)
+        : null
+    );
+  }
 
-    mvpMatrix: renderParams.mvpMatrix,
-    viewMatrix: renderParams.viewMatrix,
-    modelMatrix: renderParams.modelMatrix,
-    projectionMatrix: renderParams.projectionMatrix,
-
-    viewportWidth: renderParams.viewportWidth,
-    viewportHeight: renderParams.viewportHeight,
-    fov: renderParams.fov,
-    sizeAttenuation: renderParams.sizeAttenuation,
-
-    fogDensity: renderParams.fogDensity,
-    fogColor: renderParams.fogColor,
-    fogNear,
-    fogFar,
-
-    cameraPosition: renderParams.cameraPosition,
-    cameraDistance: renderParams.cameraDistance,
-
-    alphaTexture,
-    alphaTexWidth,
-    useAlphaTexture,
-
-    getViewPositions,
-    getViewTransparency,
-    getLodLevel,
-    getLodIndices
-  };
+  return ctx;
 }

@@ -24,13 +24,15 @@ import { StateValidator } from '../../utils/state-validator.js';
 import { initDeletedFieldsPanel } from './field-selector-deleted-fields.js';
 import { initGeneExpressionSelector } from './field-selector-gene-expression.js';
 import { getCommunityAnnotationSession } from '../../community-annotations/session.js';
+import { getCommunityAnnotationAccessStore, isSimulateRepoConnectedEnabled } from '../../community-annotations/access-store.js';
+import { getAnnotationRepoForDataset } from '../../community-annotations/repo-store.js';
 
 /**
  * @typedef {object} FieldSelectorCallbacks
  * @property {(fieldInfo: any) => void} [onActiveFieldChanged]
  */
 
-export function initFieldSelector({ state, dom, callbacks = /** @type {FieldSelectorCallbacks} */ ({}) }) {
+export function initFieldSelector({ state, dom, dataSourceManager = null, callbacks = /** @type {FieldSelectorCallbacks} */ ({}) }) {
   const {
     categoricalSelect,
     categoricalCopyBtn,
@@ -64,6 +66,13 @@ export function initFieldSelector({ state, dom, callbacks = /** @type {FieldSele
   let geneSelector = null;
 
   const annotationSession = getCommunityAnnotationSession();
+  const access = getCommunityAnnotationAccessStore();
+  try {
+    const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
+    annotationSession.setDatasetId?.(datasetId);
+  } catch {
+    // ignore
+  }
 
   const { renderDeletedFieldsSection } = initDeletedFieldsPanel({ state, deletedFieldsSection });
 
@@ -89,9 +98,12 @@ export function initFieldSelector({ state, dom, callbacks = /** @type {FieldSele
     const catDisabled = Boolean(categoricalSelect?.disabled) || !catSelected;
     const contDisabled = Boolean(continuousSelect?.disabled) || !contSelected;
 
+    const catField = catSelected ? state.getFields?.()?.[catIdx] : null;
+    const catVotingLocked = Boolean(catField?.kind === FieldKind.CATEGORY && annotationSession.isFieldAnnotated(catField?.key));
+
     if (categoricalCopyBtn) categoricalCopyBtn.disabled = catDisabled;
-    if (categoricalRenameBtn) categoricalRenameBtn.disabled = catDisabled;
-    if (categoricalDeleteBtn) categoricalDeleteBtn.disabled = catDisabled;
+    if (categoricalRenameBtn) categoricalRenameBtn.disabled = catDisabled || catVotingLocked;
+    if (categoricalDeleteBtn) categoricalDeleteBtn.disabled = catDisabled || catVotingLocked;
     if (categoricalClearBtn) categoricalClearBtn.disabled = catDisabled;
 
     if (continuousCopyBtn) continuousCopyBtn.disabled = contDisabled;
@@ -138,6 +150,15 @@ export function initFieldSelector({ state, dom, callbacks = /** @type {FieldSele
   function renderFieldSelects() {
     if (!categoricalSelect || !continuousSelect) return;
 
+    try {
+      const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
+      const username = annotationSession.getProfile?.()?.username || 'local';
+      const repoRef = getAnnotationRepoForDataset(datasetId, username) || null;
+      annotationSession.setCacheContext?.({ datasetId, repoRef, username });
+    } catch {
+      // ignore
+    }
+
     const fields = state.getFields?.() || [];
     const categoricalFields = getFieldsByKind(FieldKind.CATEGORY);
     const continuousFields = getFieldsByKind(FieldKind.CONTINUOUS);
@@ -154,8 +175,8 @@ export function initFieldSelector({ state, dom, callbacks = /** @type {FieldSele
         const opt = document.createElement('option');
         opt.value = String(idx);
         const baseLabel = field._originalKey ? `${field.key} *` : field.key;
-        const annotateBadge = (select === categoricalSelect && annotationSession.isFieldAnnotated(field.key)) ? ' 🗳️' : '';
-        opt.textContent = baseLabel + annotateBadge;
+        const annotateBadge = (select === categoricalSelect && annotationSession.isFieldAnnotated(field.key)) ? '🗳️ ' : '';
+        opt.textContent = annotateBadge + baseLabel;
         select.appendChild(opt);
       });
       select.value = NONE_FIELD_VALUE;
@@ -177,6 +198,18 @@ export function initFieldSelector({ state, dom, callbacks = /** @type {FieldSele
   if (categoricalSelect) {
     categoricalSelect.addEventListener('contextmenu', (e) => {
       e.preventDefault();
+      let repoConnected = false;
+      try {
+        const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
+        const username = annotationSession.getProfile?.()?.username || 'local';
+        repoConnected = Boolean(getAnnotationRepoForDataset(datasetId, username)) || isSimulateRepoConnectedEnabled();
+      } catch {
+        repoConnected = false;
+      }
+      if (repoConnected && !access.isAuthor()) {
+        getNotificationCenter().error('Only repo authors can change which columns are annotatable', { category: 'annotation' });
+        return;
+      }
       const idx = parseInt(categoricalSelect.value || NONE_FIELD_VALUE, 10);
       if (!Number.isInteger(idx) || idx < 0) return;
       const field = state.getFields?.()?.[idx] || null;
@@ -187,7 +220,7 @@ export function initFieldSelector({ state, dom, callbacks = /** @type {FieldSele
         title: enabled ? 'Disable community annotation' : 'Enable community annotation',
         message: enabled
           ? `Disable annotation voting for "${field.key}"? (Votes remain in local storage.)`
-          : `Enable annotation voting for "${field.key}"? Legend items will show voting on hover.`,
+          : `Enable annotation voting for "${field.key}"? You will see 🗳️ next to the field name and can click category labels to vote in a popup.`,
         confirmText: enabled ? 'Disable' : 'Enable',
         onConfirm: () => {
           annotationSession.setFieldAnnotated(field.key, !enabled);
@@ -224,6 +257,10 @@ export function initFieldSelector({ state, dom, callbacks = /** @type {FieldSele
     const fields = source === FieldSource.VAR ? state.getVarFields?.() : state.getFields?.();
     const field = fields?.[fieldIndex];
     if (!field) return;
+    if (source === FieldSource.OBS && field.kind === FieldKind.CATEGORY && annotationSession.isFieldAnnotated(field.key)) {
+      getNotificationCenter().error('Rename is disabled while voting is enabled for this field', { category: 'annotation' });
+      return;
+    }
 
     InlineEditor.create(targetEl, field.key, {
       onSave: (newName) => {
@@ -242,6 +279,10 @@ export function initFieldSelector({ state, dom, callbacks = /** @type {FieldSele
     const fields = source === FieldSource.VAR ? state.getVarFields?.() : state.getFields?.();
     const field = fields?.[fieldIndex];
     if (!field) return;
+    if (source === FieldSource.OBS && field.kind === FieldKind.CATEGORY && annotationSession.isFieldAnnotated(field.key)) {
+      getNotificationCenter().error('Delete is disabled while voting is enabled for this field', { category: 'annotation' });
+      return;
+    }
 
     showConfirmDialog({
       title: 'Delete field',
@@ -313,6 +354,12 @@ export function initFieldSelector({ state, dom, callbacks = /** @type {FieldSele
 
   async function activateField(idx) {
     if (Number.isNaN(idx)) return;
+    try {
+      const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
+      annotationSession.setDatasetId?.(datasetId);
+    } catch {
+      // ignore
+    }
 
     // Activating an obs field clears any gene selection.
     if (idx >= 0) {
@@ -413,6 +460,12 @@ export function initFieldSelector({ state, dom, callbacks = /** @type {FieldSele
         if (categoricalSelect) categoricalSelect.value = String(result.newFieldIndex);
         if (continuousSelect) continuousSelect.value = NONE_FIELD_VALUE;
         await activateField(result.newFieldIndex);
+        // Ensure the duplicated field is not implicitly treated as "voting-enabled".
+        try {
+          annotationSession.setFieldAnnotated(result.newKey, false);
+        } catch {
+          // ignore
+        }
 
         notify.complete(notifId, `Created "${result.newKey}"`);
       } catch (err) {

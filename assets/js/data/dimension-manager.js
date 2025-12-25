@@ -1,7 +1,7 @@
 /**
  * Dimension Manager - Handles multi-dimensional embeddings for cellucid viewer
  *
- * Supports 1D, 2D, 3D, and 4D embeddings with:
+ * Supports 1D, 2D, and 3D embeddings with:
  * - Lazy loading of dimension-specific position data
  * - Automatic padding of 1D/2D data to work in 3D viewer
  * - Normalization of positions to [-1,1] range for consistent rendering
@@ -12,8 +12,17 @@
 import { loadPointsBinary } from './data-loaders.js';
 import { normalizePositions } from '../rendering/gl-utils.js';
 
-// Dimension priority for default selection: 3D > 2D > 1D > 4D
-const DIMENSION_PRIORITY = [3, 2, 1, 4];
+const SUPPORTED_DIMENSIONS = new Set([1, 2, 3]);
+// Dimension priority for default selection: 3D > 2D > 1D
+const DIMENSION_PRIORITY = [3, 2, 1];
+
+function toSupportedDimension(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  const dim = Math.floor(n);
+  if (!SUPPORTED_DIMENSIONS.has(dim)) return null;
+  return dim;
+}
 
 /**
  * Create a dimension manager instance
@@ -27,8 +36,9 @@ export function createDimensionManager(options = {}) {
 }
 
 class DimensionManager {
-  constructor({ baseUrl = '', embeddingsMetadata = null } = {}) {
+  constructor({ baseUrl = '', embeddingsMetadata = null, keepRawPositions = false } = {}) {
     this.baseUrl = baseUrl;
+    this.keepRawPositions = Boolean(keepRawPositions);
 
     // Available dimensions from metadata
     this.availableDimensions = [];
@@ -67,8 +77,25 @@ class DimensionManager {
   initFromMetadata(meta) {
     if (!meta) return;
 
-    this.availableDimensions = meta.available_dimensions || [3];
-    this.defaultDimension = meta.default_dimension || this._selectDefaultDimension();
+    const rawAvailable = Array.isArray(meta.available_dimensions) ? meta.available_dimensions : [3];
+    const availableSet = new Set();
+    for (const value of rawAvailable) {
+      const dim = toSupportedDimension(value);
+      if (dim != null) availableSet.add(dim);
+    }
+
+    if (availableSet.size === 0) {
+      throw new Error('No supported embeddings available (supported: 1D/2D/3D).');
+    }
+
+    this.availableDimensions = Array.from(availableSet).sort((a, b) => a - b);
+
+    const requestedDefault = toSupportedDimension(meta.default_dimension);
+    if (requestedDefault != null && availableSet.has(requestedDefault)) {
+      this.defaultDimension = requestedDefault;
+    } else {
+      this.defaultDimension = this._selectDefaultDimension(availableSet);
+    }
     this.dimensionFiles = meta.files || {};
 
     console.log(`[DimensionManager] Available dimensions: ${this.availableDimensions.join(', ')}D`);
@@ -77,11 +104,13 @@ class DimensionManager {
 
   /**
    * Select default dimension based on priority
-   * @returns {number} Default dimension (1, 2, 3, or 4)
+   * @param {Set<number>|null} [availableSet=null]
+   * @returns {number} Default dimension (1, 2, or 3)
    */
-  _selectDefaultDimension() {
+  _selectDefaultDimension(availableSet = null) {
+    const dims = availableSet || new Set(this.availableDimensions);
     for (const dim of DIMENSION_PRIORITY) {
-      if (this.availableDimensions.includes(dim)) {
+      if (dims.has(dim)) {
         return dim;
       }
     }
@@ -98,11 +127,13 @@ class DimensionManager {
 
   /**
    * Check if a dimension is available
-   * @param {number} dim - Dimension (1, 2, 3, or 4)
+   * @param {number} dim - Dimension (1, 2, or 3)
    * @returns {boolean}
    */
   hasDimension(dim) {
-    return this.availableDimensions.includes(dim);
+    const supported = toSupportedDimension(dim);
+    if (supported == null) return false;
+    return this.availableDimensions.includes(supported);
   }
 
   /**
@@ -130,6 +161,11 @@ class DimensionManager {
    */
   async loadDimension(dim, options = {}) {
     const { showProgress = true } = options;
+    const supportedDim = toSupportedDimension(dim);
+    if (supportedDim == null) {
+      throw new Error(`Dimension ${dim}D is not supported (supported: 1D/2D/3D).`);
+    }
+    dim = supportedDim;
 
     // Check if dimension is available
     if (!this.hasDimension(dim)) {
@@ -158,7 +194,17 @@ class DimensionManager {
     })
       .then(positions => {
         // Validate and cache
+        if (positions.length % dim !== 0) {
+          throw new Error(
+            `Invalid positions length for ${dim}D: ${positions.length} values not divisible by ${dim}.`
+          );
+        }
         const nCells = positions.length / dim;
+        if (!Number.isInteger(nCells)) {
+          throw new Error(
+            `Invalid positions length for ${dim}D: ${positions.length} produced non-integer cell count (${nCells}).`
+          );
+        }
         if (this.nCells === 0) {
           this.nCells = nCells;
         } else if (nCells !== this.nCells) {
@@ -190,13 +236,11 @@ class DimensionManager {
    * @returns {Promise<Float32Array>} 3D positions (n_cells * 3)
    */
   async getPositions3D(dim) {
-    // Handle 4D - raise error as it's not yet implemented
-    if (dim === 4) {
-      throw new Error(
-        '4D visualization is not yet implemented. ' +
-        'The infrastructure is in place, but rendering 4D data requires additional work.'
-      );
+    const supportedDim = toSupportedDimension(dim);
+    if (supportedDim == null) {
+      throw new Error(`Unsupported dimension ${dim}D (supported: 1D/2D/3D).`);
     }
+    dim = supportedDim;
 
     // Check cache first (cached positions are already normalized)
     if (this.paddedPositionCache.has(dim)) {
@@ -210,9 +254,8 @@ class DimensionManager {
     let positions3D;
 
     if (dim === 3) {
-      // For 3D, copy the raw positions (normalization modifies in-place, so we must not
-      // corrupt the raw cache which loadDimension() returns on subsequent calls)
-      positions3D = new Float32Array(rawPositions);
+      // For 3D, normalize in-place unless the caller explicitly requests keeping raw positions.
+      positions3D = this.keepRawPositions ? new Float32Array(rawPositions) : rawPositions;
     } else if (dim === 1) {
       // 1D: X values only, Y and Z are zero
       positions3D = new Float32Array(nCells * 3);
@@ -241,6 +284,11 @@ class DimensionManager {
     // The transform is needed by state.js to normalize centroids consistently
     this.paddedPositionCache.set(dim, positions3D);
     this.normTransformCache.set(dim, normTransform);
+
+    // Policy: keep raw positions only if explicitly requested.
+    if (!this.keepRawPositions) {
+      this.positionCache.delete(dim);
+    }
 
     return positions3D;
   }
@@ -311,33 +359,11 @@ class DimensionManager {
   }
 
   /**
-   * Check if positions are loaded for a dimension
-   * @param {number} dim - Dimension
-   * @returns {boolean}
-   */
-  isLoaded(dim) {
-    return this.positionCache.has(dim);
-  }
-
-  /**
    * Check if any dimension is currently loading
    * @returns {boolean}
    */
   isLoading() {
     return this.loadingPromises.size > 0;
-  }
-
-  /**
-   * Preload all available dimensions
-   * @returns {Promise<void>}
-   */
-  async preloadAll() {
-    const promises = this.availableDimensions
-      .filter(dim => dim !== 4) // Skip 4D as it's not implemented
-      .map(dim => this.loadDimension(dim).catch(e => {
-        console.warn(`[DimensionManager] Failed to preload ${dim}D:`, e);
-      }));
-    await Promise.all(promises);
   }
 
   /**
@@ -351,24 +377,6 @@ class DimensionManager {
     this.nCells = 0;
   }
 
-  /**
-   * Get dimension info for UI display
-   * @returns {Object[]} Array of {dim, label, available, loaded, isDefault, notImplemented}
-   */
-  getDimensionInfo() {
-    return [1, 2, 3, 4].map(dim => {
-      const notImplemented = dim === 4;
-      return {
-        dim,
-        label: `${dim}D`,
-        // 4D is not available until implemented, even if data exists
-        available: notImplemented ? false : this.hasDimension(dim),
-        loaded: this.isLoaded(dim),
-        isDefault: dim === this.defaultDimension,
-        notImplemented
-      };
-    });
-  }
 }
 
 export { DimensionManager };

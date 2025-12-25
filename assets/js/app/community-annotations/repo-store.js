@@ -1,23 +1,14 @@
 /**
- * Community Annotation - Repo/token storage helpers.
+ * Community Annotation - Repo storage helpers.
  *
  * Stores:
  * - datasetId -> connected annotation repo (owner/repo)
- * - repo -> GitHub fine-grained PAT (optional; required for private repos and pushes)
- *   - Stored in-memory for this session by default
- *   - Stored in localStorage only if the user opts in via UI
  *
  * Security:
- * - Tokens are never logged.
- * - Tokens are stored in localStorage only if the user opts in via UI.
+ * - No tokens are stored here.
  */
 
-const REPO_MAP_KEY = 'cellucid:community-annotations:repo-map:v1';
-const TOKEN_PREFIX = 'cellucid:community-annotations:pat:v1:';
-
-// In-memory token store for the current page session only.
-// This supports private repo access without persisting PATs to localStorage unless the user opts in.
-const sessionTokensByRepo = new Map();
+const REPO_MAP_KEY = 'cellucid:community-annotations:repo-map';
 
 function toCleanString(value) {
   return String(value ?? '').trim();
@@ -44,26 +35,34 @@ function normalizeDatasetId(datasetId) {
   return id || 'default';
 }
 
-export function getAnnotationRepoForDataset(datasetId) {
+function normalizeUsername(username) {
+  return toCleanString(username).replace(/^@+/, '').toLowerCase() || 'local';
+}
+
+function mapKey(datasetId, username) {
+  return `${normalizeDatasetId(datasetId)}::${normalizeUsername(username)}`;
+}
+
+export function getAnnotationRepoForDataset(datasetId, username = 'local') {
   const id = normalizeDatasetId(datasetId);
   try {
     const raw = localStorage.getItem(REPO_MAP_KEY);
     const parsed = raw ? safeJsonParse(raw) : null;
-    const repo = toCleanString(parsed?.[id] || '');
+    const repo = toCleanString(parsed?.[mapKey(id, username)] || '');
     return repo || null;
   } catch {
     return null;
   }
 }
 
-export function setAnnotationRepoForDataset(datasetId, ownerRepo) {
+export function setAnnotationRepoForDataset(datasetId, ownerRepo, username = 'local') {
   const id = normalizeDatasetId(datasetId);
   const repo = toCleanString(ownerRepo);
   if (!repo || repo.length > 256) return false;
   try {
     const raw = localStorage.getItem(REPO_MAP_KEY);
     const parsed = (raw ? safeJsonParse(raw) : null) || {};
-    parsed[id] = repo;
+    parsed[mapKey(id, username)] = repo;
     const payload = safeJsonStringify(parsed);
     if (!payload) return false;
     localStorage.setItem(REPO_MAP_KEY, payload);
@@ -73,96 +72,19 @@ export function setAnnotationRepoForDataset(datasetId, ownerRepo) {
   }
 }
 
-export function clearAnnotationRepoForDataset(datasetId) {
+export function clearAnnotationRepoForDataset(datasetId, username = 'local') {
   const id = normalizeDatasetId(datasetId);
   try {
     const raw = localStorage.getItem(REPO_MAP_KEY);
     const parsed = raw ? safeJsonParse(raw) : null;
     if (!parsed || typeof parsed !== 'object') return true;
-    delete parsed[id];
+    delete parsed[mapKey(id, username)];
     const payload = safeJsonStringify(parsed);
     if (!payload) {
       localStorage.removeItem(REPO_MAP_KEY);
       return true;
     }
     localStorage.setItem(REPO_MAP_KEY, payload);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function tokenKey(ownerRepo) {
-  // Repo string is validated elsewhere; treat as opaque key suffix.
-  return `${TOKEN_PREFIX}${toCleanString(ownerRepo)}`;
-}
-
-export function getSessionPatForRepo(ownerRepo) {
-  const repo = toCleanString(ownerRepo);
-  if (!repo) return null;
-  const token = toCleanString(sessionTokensByRepo.get(repo) || '');
-  return token || null;
-}
-
-export function setSessionPatForRepo(ownerRepo, token) {
-  const repo = toCleanString(ownerRepo);
-  const pat = toCleanString(token);
-  if (!repo || !pat || pat.length > 1000) return false;
-  sessionTokensByRepo.set(repo, pat);
-  // Prevent unbounded growth if many repos are connected in one session.
-  if (sessionTokensByRepo.size > 25) {
-    const oldest = sessionTokensByRepo.keys().next().value;
-    sessionTokensByRepo.delete(oldest);
-  }
-  return true;
-}
-
-export function clearSessionPatForRepo(ownerRepo) {
-  const repo = toCleanString(ownerRepo);
-  if (!repo) return true;
-  sessionTokensByRepo.delete(repo);
-  return true;
-}
-
-/**
- * Returns the best available token for a repo:
- * - session (in-memory) token first
- * - then persisted localStorage token (if previously saved by the user)
- */
-export function getEffectivePatForRepo(ownerRepo) {
-  const sessionPat = getSessionPatForRepo(ownerRepo);
-  if (sessionPat) return sessionPat;
-  return getPatForRepo(ownerRepo);
-}
-
-export function getPatForRepo(ownerRepo) {
-  const repo = toCleanString(ownerRepo);
-  if (!repo) return null;
-  try {
-    const token = toCleanString(localStorage.getItem(tokenKey(repo)) || '');
-    return token || null;
-  } catch {
-    return null;
-  }
-}
-
-export function setPatForRepo(ownerRepo, token) {
-  const repo = toCleanString(ownerRepo);
-  const pat = toCleanString(token);
-  if (!repo || !pat || pat.length > 1000) return false;
-  try {
-    localStorage.setItem(tokenKey(repo), pat);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-export function clearPatForRepo(ownerRepo) {
-  const repo = toCleanString(ownerRepo);
-  if (!repo) return true;
-  try {
-    localStorage.removeItem(tokenKey(repo));
     return true;
   } catch {
     return false;

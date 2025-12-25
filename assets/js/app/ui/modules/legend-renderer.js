@@ -17,7 +17,7 @@ import { clamp } from '../../utils/number-utils.js';
 import { initCategoricalLegend } from './legend/categorical-legend.js';
 import { throttle } from '../../analysis/shared/dom-utils.js';
 
-export function initLegendRenderer({ state, viewer, dom }) {
+export function initLegendRenderer({ state, viewer, dom, dataSourceManager = null }) {
   const displayOptionsContainer = dom?.optionsContainer || null;
   const legendEl = dom?.legendEl || null;
   const outlierFilterContainer = dom?.outlierFilterContainer || null;
@@ -27,7 +27,7 @@ export function initLegendRenderer({ state, viewer, dom }) {
   const centroidPointsCheckbox = dom?.centroidPointsCheckbox || null;
   const centroidLabelsCheckbox = dom?.centroidLabelsCheckbox || null;
 
-  const { refreshCategoryCounts, renderCategoricalLegend } = initCategoricalLegend({ state, legendEl });
+  const { refreshCategoryCounts, renderCategoricalLegend } = initCategoricalLegend({ state, legendEl, dataSourceManager });
 
   function setDisplayOptionsVisibility(field) {
     if (!displayOptionsContainer) return;
@@ -475,4 +475,3 @@ export function initLegendRenderer({ state, viewer, dom }) {
     handleOutlierUI,
   };
 }
-

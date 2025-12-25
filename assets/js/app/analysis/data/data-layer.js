@@ -2367,66 +2367,6 @@ export class DataLayer {
     };
   }
 
-  /**
-   * Compute differential expression using GPU/Worker/CPU backends
-   *
-   * @param {Object} options - Options
-   * @param {string} options.pageA - Reference page ID
-   * @param {string} options.pageB - Test page ID
-   * @param {string[]} options.genes - Genes to test
-   * @param {string} [options.method='wilcox'] - Statistical test
-   * @param {Function} [options.onProgress] - Progress callback
-   * @returns {Promise<Object[]>} DE results
-   */
-  async computeDifferentialExpressionParallel(options) {
-    const { pageA, pageB, genes, method = 'wilcox', onProgress } = options;
-
-    const analysisData = await this.fetchAnalysisData({
-      pageIds: [pageA, pageB],
-      genes,
-      usePoolMode: true,
-      onProgress: (p) => {
-        if (onProgress) onProgress(Math.round(p * 0.5));
-      }
-    });
-
-    const computeManager = await this._getComputeManager();
-
-    if (onProgress) onProgress(55);
-
-    // Process genes sequentially with ComputeManager's automatic backend selection
-    const deResults = [];
-    const geneNames = Object.keys(analysisData.genes);
-    const totalGenes = geneNames.length;
-
-    for (let i = 0; i < totalGenes; i++) {
-      const gene = geneNames[i];
-      const dataA = analysisData.genes[gene]?.[pageA]?.values || [];
-      const dataB = analysisData.genes[gene]?.[pageB]?.values || [];
-
-      // Filter valid numeric values
-      const valsA = filterFiniteNumbers(Array.from(dataA));
-      const valsB = filterFiniteNumbers(Array.from(dataB));
-
-      try {
-        const result = await computeManager.computeDifferential(valsA, valsB, method);
-        deResults.push({ gene, ...result });
-      } catch (error) {
-        deResults.push({ gene, error: error.message, pValue: NaN, log2FoldChange: NaN });
-      }
-
-      // Update progress
-      if (onProgress && i % 10 === 0) {
-        const progressPercent = 55 + Math.round((i / totalGenes) * 45);
-        onProgress(progressPercent);
-      }
-    }
-
-    if (onProgress) onProgress(100);
-
-    return deResults;
-  }
-
   // ===========================================================================
   // UTILITY METHODS
   // ===========================================================================

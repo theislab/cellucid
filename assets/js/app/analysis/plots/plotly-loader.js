@@ -5,9 +5,9 @@
  * The library is only loaded when the Page Analysis module is first used.
  *
  * GPU RENDERING POLICY:
- * - Prefer WebGL2 when available (scattergl/heatmapgl) for performance
- * - Fall back to non-WebGL traces (scatter/heatmap) when WebGL2 is unavailable
- * - Rendering must remain functional across browsers/devices
+ * - WebGL2 is required (no non-WebGL trace fallbacks)
+ * - Use GPU-accelerated traces (scattergl/heatmapgl) for performance
+ * - Rendering must remain functional across WebGL2-capable browsers/devices
  *
  * Also provides hint management integration - see plotly-hints.js
  */
@@ -168,7 +168,8 @@ export function isWebGL2Available() {
  * @returns {'scattergl'|'scatter'}
  */
 export function getScatterTraceType() {
-  return isWebGL2Available() ? 'scattergl' : 'scatter';
+  requireWebGL2();
+  return 'scattergl';
 }
 
 /**
@@ -176,7 +177,8 @@ export function getScatterTraceType() {
  * @returns {'heatmapgl'|'heatmap'}
  */
 export function getHeatmapTraceType() {
-  return isWebGL2Available() ? 'heatmapgl' : 'heatmap';
+  requireWebGL2();
+  return 'heatmapgl';
 }
 
 /**
@@ -189,7 +191,7 @@ export function getGPUTraceType(baseType) {
   if (baseType === 'heatmap') return getHeatmapTraceType();
 
   if ((baseType === 'scattergl' || baseType === 'heatmapgl') && !isWebGL2Available()) {
-    return baseType === 'scattergl' ? 'scatter' : 'heatmap';
+    requireWebGL2();
   }
 
   return GPU_TRACE_TYPES[baseType] || baseType;

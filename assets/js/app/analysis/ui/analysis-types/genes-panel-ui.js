@@ -774,16 +774,18 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     const tbody = document.createElement('tbody');
     table.appendChild(tbody);
 
-    const addRow = (label, value) => {
-      const tr = document.createElement('tr');
-      const tdLabel = document.createElement('td');
-      tdLabel.textContent = label;
-      const tdValue = document.createElement('td');
-      tdValue.innerHTML = `<strong>${value}</strong>`;
-      tr.appendChild(tdLabel);
-      tr.appendChild(tdValue);
-      tbody.appendChild(tr);
-    };
+	    const addRow = (label, value) => {
+	      const tr = document.createElement('tr');
+	      const tdLabel = document.createElement('td');
+	      tdLabel.textContent = label;
+	      const tdValue = document.createElement('td');
+	      const strong = document.createElement('strong');
+	      strong.textContent = String(value);
+	      tdValue.replaceChildren(strong);
+	      tr.appendChild(tdLabel);
+	      tr.appendChild(tdValue);
+	      tbody.appendChild(tr);
+	    };
 
     addRow('Category', String(metadata.obsCategory || 'N/A'));
     addRow('Mode', String(metadata.mode || 'N/A'));

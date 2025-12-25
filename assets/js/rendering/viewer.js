@@ -271,21 +271,55 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   const cachedViewMatrices = new Map();  // viewId -> { viewMatrix: Float32Array, radius: number, dirty: boolean }
   let cachedGridProjection = null;       // { aspect: number, matrix: Float32Array } - shared by all grid cells
 
-  // Per-view dimension tracking for multi-dimensional support
-  const viewDimensionLevels = new Map();  // viewId -> dimension level (1, 2, 3, or 4)
-  const viewPositionsCache = new Map();   // viewId -> Float32Array positions
+	  // Per-view dimension tracking for multi-dimensional support
+	  const viewDimensionLevels = new Map();  // viewId -> dimension level (1, 2, 3, or 4)
+	  const viewPositionsCache = new Map();   // viewId -> Float32Array positions
+	  // Per-view render params (avoid per-frame allocations in multiview render loop)
+	  const renderParamsByView = new Map();   // viewId -> mutable params object passed to HighPerfRenderer
+	  // Per-view overlay contexts + stable builder options (avoid per-frame allocations/closures)
+	  const overlayCtxByView = new Map();     // viewId -> OverlayContext
+	  const overlayCtxOptionsByView = new Map(); // viewId -> stable buildOverlayContext options object
 
   function getFallbackDimensionLevel() {
     const liveDim = viewDimensionLevels.get(LIVE_VIEW_ID);
     return liveDim !== undefined ? liveDim : 3;
   }
 
-  function getEffectiveDimensionLevel(viewId) {
-    const vid = String(viewId);
-    const cached = viewDimensionLevels.get(vid);
-    if (cached !== undefined) return cached;
-    return getFallbackDimensionLevel();
-  }
+	  function getEffectiveDimensionLevel(viewId) {
+	    const vid = String(viewId);
+	    const cached = viewDimensionLevels.get(vid);
+	    if (cached !== undefined) return cached;
+	    return getFallbackDimensionLevel();
+	  }
+
+	  function getOrCreateRenderParams(viewId) {
+	    const vid = String(viewId || LIVE_VIEW_ID);
+	    let renderParams = renderParamsByView.get(vid);
+	    if (!renderParams) {
+	      renderParams = {
+	        mvpMatrix,
+	        viewMatrix,
+	        modelMatrix,
+	        projectionMatrix,
+	        pointSize: 5.0,
+	        sizeAttenuation: 0,
+	        viewportHeight: 0,
+	        viewportWidth: 0,
+	        fov: 0,
+	        lightingStrength: 0,
+	        fogDensity: 0,
+	        fogColor: [1, 1, 1],
+	        lightDir,
+	        cameraPosition: vec3.create(),
+	        cameraDistance: 0,
+	        viewId: vid,
+	        dimensionLevel: 3,
+	        useAlphaTexture: false
+	      };
+	      renderParamsByView.set(vid, renderParams);
+	    }
+	    return renderParams;
+	  }
 
   const viewTitleLayerEl = viewTitleLayer || null;
   const sidebarEl = sidebar || null;
@@ -324,10 +358,38 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   // Preallocated scratch vectors for updateFreefly() to avoid per-frame allocations
   const _freeflyMove = vec3.create();
   const _freeflyTargetVel = vec3.create();
-  // Preallocated scratch vector for updateCamera() free-fly lookTarget to avoid per-frame allocation
-  const _cameraLookTarget = vec3.create();
-  // Preallocated array for render loop view list to avoid per-frame array allocation
-  const _renderAllViews = [];
+	  // Preallocated scratch vector for updateCamera() free-fly lookTarget to avoid per-frame allocation
+	  const _cameraLookTarget = vec3.create();
+	  // Preallocated array for render loop view list to avoid per-frame array allocation
+	  const _renderAllViews = [];
+	  // Reused per-frame parameter objects (avoid per-view per-frame allocations in multiview mode)
+	  const _projectileDrawParams = {
+	    viewportHeight: 0,
+	    mvpMatrix,
+	    viewMatrix,
+	    modelMatrix,
+	    basePointSize: 0,
+	    sizeAttenuation: 0,
+	    fov: 0,
+	  };
+	  const _orbitAnchorDrawParams = {
+	    viewId: LIVE_VIEW_ID,
+	    viewTheta: 0,
+	    viewPhi: 0,
+	    viewTarget: null,
+	    viewRadius: 0,
+	    pointBoundsRadius: 0,
+	    bgColor: null,
+	    use3D: false,
+	    mvpMatrix,
+	    viewMatrix,
+	    modelMatrix,
+	    fogDensity: 0,
+	    fogColor: null,
+	    lightingStrength: 0,
+	    lightDir,
+	    navigationMode: 'orbit'
+	  };
 
   let positionsArray = null;
   let colorsArray = null;
@@ -430,9 +492,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   let lastY = 0;
   let cursorX = 0;  // Current cursor position for aiming (client coords)
   let cursorY = 0;
-  let targetRadius = radius;
-  let lastTouchDist = 0;
-  let animationHandle = null;
+	  let targetRadius = radius;
+	  let lastTouchDist = 0;
+	  let animationHandle = null;
+	  let disposed = false;
 
   // Navigation (orbit + free-fly + planar)
   let navigationMode = 'orbit';
@@ -2815,13 +2878,14 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
           createCentroidSnapshotBuffer(view.id, view.centroidPositions, view.centroidColors, viewDimLevel);
         }
 
-        // Pass snapshot buffer ID if available (uses immutable snapshot, consistent with grid mode)
-        const snapshotId = hasSnapshotBuffer ? view.id : null;
-        renderSingleView(width, height, { x: 0, y: 0, w: 1, h: 1 }, view.id, view.centroidCount, snapshotId, dt, timeSeconds);
-      }
-      hideViewTitles(); // No titles in single/fullscreen mode
-      return;
-    }
+	        // Pass snapshot buffer ID if available (uses immutable snapshot, consistent with grid mode)
+	        const snapshotId = hasSnapshotBuffer ? view.id : null;
+	        renderSingleView(width, height, { x: 0, y: 0, w: 1, h: 1 }, view.id, view.centroidCount, snapshotId, dt, timeSeconds);
+	      }
+	      hideViewTitles(); // No titles in single/fullscreen mode
+	      updateLabelLayerVisibility();
+	      return;
+	    }
 
     // Grid mode: render multiple viewports
     gl.viewport(0, 0, width, height);
@@ -2943,93 +3007,122 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     mat4.copy(viewMatrix, _activeViewMatrixScratch);
     radius = activeRadius;
 
-    // Restore projection matrix for full canvas aspect
-    mat4.perspective(projectionMatrix, fov, width / height, near, far);
-    mat4.multiply(mvpMatrix, projectionMatrix, viewMatrix);
-    mat4.multiply(mvpMatrix, mvpMatrix, modelMatrix);
-  }
+	    // Restore projection matrix for full canvas aspect
+	    mat4.perspective(projectionMatrix, fov, width / height, near, far);
+	    mat4.multiply(mvpMatrix, projectionMatrix, viewMatrix);
+	    mat4.multiply(mvpMatrix, mvpMatrix, modelMatrix);
 
-  function renderSingleView(width, height, viewport, viewId, overrideCentroidCount, snapshotBufferId = null, dtSeconds = 0.016, timeSeconds = 0) {
-    const vid = viewId || focusedViewId || LIVE_VIEW_ID;
-    const numCentroids = overrideCentroidCount !== undefined ? overrideCentroidCount : centroidCount;
+	    // Aggregate label layer visibility once per frame (after all views render).
+	    updateLabelLayerVisibility();
+	  }
 
-    // Draw grid first
-    drawGrid();
+	  function renderSingleView(width, height, viewport, viewId, overrideCentroidCount, snapshotBufferId = null, dtSeconds = 0.016, timeSeconds = 0) {
+	    const vid = viewId || focusedViewId || LIVE_VIEW_ID;
+	    const numCentroids = overrideCentroidCount !== undefined ? overrideCentroidCount : centroidCount;
 
-    // Get camera position for HP renderer
-    mat4.invert(tempInvViewMatrix, viewMatrix);
-    const cameraPosition = [tempInvViewMatrix[12], tempInvViewMatrix[13], tempInvViewMatrix[14]];
+	    // Draw grid first
+	    drawGrid();
 
-    // Check if this snapshot shares live transparency (uses alpha texture for efficient updates)
-    const snapshot = snapshotViews.find(s => s.id === vid);
-    const useAlphaTexture = snapshot?.sharesLiveTransparency ?? false;
+	    // Check if this snapshot shares live transparency (uses alpha texture for efficient updates)
+	    const snapshot = snapshotViews.find(s => s.id === vid);
+	    const useAlphaTexture = snapshot?.sharesLiveTransparency ?? false;
 
-    // Render params shared by both render paths
-    // Get dimension level for this view (used for LOD and frustum culling calculations)
-    const dimLevel = getEffectiveDimensionLevel(vid);
-    // Camera distance calculation: use per-view cached distance when available (for multiview support)
-    // For focused view or locked cameras, global state is authoritative; otherwise use cached per-view value
-    let camDist;
-    const isActiveView = vid === focusedViewId;
-    if (isActiveView || camerasLocked) {
-      // Active view: use global state (most up-to-date during interaction)
-      camDist = navigationMode === 'free' ? vec3.length(freeflyPosition) : radius;
-    } else {
-      // Non-active view: use cached camera distance from view's camera state
-      const cached = cachedViewMatrices.get(vid);
-      camDist = cached?.cameraDistance ?? radius;
-    }
-    const renderParams = {
-      mvpMatrix,
-      viewMatrix,
-      modelMatrix,
-      projectionMatrix,
-      pointSize: basePointSize,
-      sizeAttenuation,
-      viewportHeight: height,
-      viewportWidth: width,
-      fov,
-      lightingStrength,
-      fogDensity,
-      fogColor,
-      lightDir,
-      cameraPosition,
-      cameraDistance: camDist,
-      viewId: vid,  // Per-view identifier for LOD and frustum culling state
-      dimensionLevel: dimLevel,  // Current dimension level for correct 2D/3D LOD calculation
-      useAlphaTexture  // For sharesLiveTransparency snapshots, sample alpha from live texture
-    };
+	    // Render params shared by both render paths
+	    // Get dimension level for this view (used for LOD and frustum culling calculations)
+	    const dimLevel = getEffectiveDimensionLevel(vid);
+	    // Camera distance calculation: use per-view cached distance when available (for multiview support)
+	    // For focused view or locked cameras, global state is authoritative; otherwise use cached per-view value
+	    let camDist;
+	    const isActiveView = vid === focusedViewId;
+	    if (isActiveView || camerasLocked) {
+	      // Active view: use global state (most up-to-date during interaction)
+	      camDist = navigationMode === 'free' ? vec3.length(freeflyPosition) : radius;
+	    } else {
+	      // Non-active view: use cached camera distance from view's camera state
+	      const cached = cachedViewMatrices.get(vid);
+	      camDist = cached?.cameraDistance ?? radius;
+	    }
+	    const renderParams = getOrCreateRenderParams(vid);
+	    renderParams.pointSize = basePointSize;
+	    renderParams.sizeAttenuation = sizeAttenuation;
+	    renderParams.viewportHeight = height;
+	    renderParams.viewportWidth = width;
+	    renderParams.fov = fov;
+	    renderParams.lightingStrength = lightingStrength;
+	    renderParams.fogDensity = fogDensity;
+	    renderParams.fogColor = fogColor;
+	    renderParams.cameraDistance = camDist;
+	    renderParams.dimensionLevel = dimLevel;
+	    renderParams.useAlphaTexture = useAlphaTexture;
 
-    // Render scatter points - use snapshot buffer if available (no data upload!)
-    if (snapshotBufferId) {
-      hpRenderer.renderWithSnapshot(snapshotBufferId, renderParams);
-    } else {
+	    // Camera position is used for fog/lighting; avoid per-view mat4.invert in the render loop.
+	    const cameraPosition = renderParams.cameraPosition;
+	    if (isActiveView || camerasLocked) {
+	      cameraPosition[0] = eye[0];
+	      cameraPosition[1] = eye[1];
+	      cameraPosition[2] = eye[2];
+	    } else {
+	      const cached = cachedViewMatrices.get(vid);
+	      if (cached?.cameraPosition) {
+	        cameraPosition[0] = cached.cameraPosition[0];
+	        cameraPosition[1] = cached.cameraPosition[1];
+	        cameraPosition[2] = cached.cameraPosition[2];
+	      } else {
+	        mat4.invert(tempInvViewMatrix, viewMatrix);
+	        cameraPosition[0] = tempInvViewMatrix[12];
+	        cameraPosition[1] = tempInvViewMatrix[13];
+	        cameraPosition[2] = tempInvViewMatrix[14];
+	      }
+	    }
+
+	    // Render scatter points - use snapshot buffer if available (no data upload!)
+	    if (snapshotBufferId) {
+	      hpRenderer.renderWithSnapshot(snapshotBufferId, renderParams);
+	    } else {
       hpRenderer.render(renderParams);
     }
 
-    // Render overlays (after main points, before selection highlights).
-    if (overlayManager?.hasEnabledOverlays?.()) {
-      const overlayCtx = buildOverlayContext({
-        gl,
-        viewId: vid,
-        renderParams,
-        timeSeconds,
-        deltaTimeSeconds: dtSeconds,
-        isSnapshot: Boolean(snapshotBufferId),
-        dimensionLevel: dimLevel,
-        hpRenderer,
-        getViewPositions: () => viewPositionsCache.get(String(vid)) || positionsArray,
-        getViewTransparency: () => {
-          if (!vid || vid === LIVE_VIEW_ID) return transparencyArray;
-          if (snapshot && !snapshot.sharesLiveTransparency && snapshot.transparency) {
-            return snapshot.transparency;
-          }
-          return transparencyArray;
-        }
-      });
-      overlayManager.update(dtSeconds, overlayCtx);
-      overlayManager.render(overlayCtx);
-    }
+	    // Render overlays (after main points, before selection highlights).
+	    if (overlayManager?.hasEnabledOverlays?.()) {
+	      let overlayCtx = overlayCtxByView.get(vid) || null;
+	      let overlayOpts = overlayCtxOptionsByView.get(vid) || null;
+	      if (!overlayOpts) {
+	        const getViewPositions = () => viewPositionsCache.get(String(vid)) || positionsArray;
+	        const getViewTransparency = () => {
+	          if (!vid || vid === LIVE_VIEW_ID) return transparencyArray;
+	          const snap = snapshotViews.find(s => s.id === vid);
+	          if (snap && !snap.sharesLiveTransparency && snap.transparency) {
+	            return snap.transparency;
+	          }
+	          return transparencyArray;
+	        };
+	        overlayOpts = {
+	          gl,
+	          viewId: vid,
+	          renderParams,
+	          timeSeconds,
+	          deltaTimeSeconds: dtSeconds,
+	          isSnapshot: Boolean(snapshotBufferId),
+	          dimensionLevel: dimLevel,
+	          hpRenderer,
+	          getViewPositions,
+	          getViewTransparency,
+	          reuse: overlayCtx
+	        };
+	        overlayCtxOptionsByView.set(vid, overlayOpts);
+	      } else {
+	        overlayOpts.renderParams = renderParams;
+	        overlayOpts.timeSeconds = timeSeconds;
+	        overlayOpts.deltaTimeSeconds = dtSeconds;
+	        overlayOpts.isSnapshot = Boolean(snapshotBufferId);
+	        overlayOpts.dimensionLevel = dimLevel;
+	        overlayOpts.reuse = overlayCtx;
+	      }
+	      overlayCtx = buildOverlayContext(overlayOpts);
+	      overlayCtxByView.set(vid, overlayCtx);
+	      overlayManager.update(dtSeconds, overlayCtx);
+	      overlayManager.render(overlayCtx);
+	    }
 
     // Draw highlights (selection rings) on top of scatter points
     // Use view-specific positions and transparency for multi-view support
@@ -3046,23 +3139,19 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     // Draw centroids
     const flags = getViewFlags(vid);
-    if (flags.points && numCentroids > 0) {
-      // Use snapshot buffer if available (no per-frame upload), otherwise use live buffer
-      if (hasCentroidSnapshotBuffer(vid)) {
-        drawCentroidsWithSnapshot(vid, height);
-      } else {
-        drawCentroids(numCentroids, height);
-      }
-    }
-    projectileSystem.draw({
-      viewportHeight: height,
-      mvpMatrix,
-      viewMatrix,
-      modelMatrix,
-      basePointSize,
-      sizeAttenuation,
-      fov,
-    });
+	    if (flags.points && numCentroids > 0) {
+	      // Use snapshot buffer if available (no per-frame upload), otherwise use live buffer
+	      if (hasCentroidSnapshotBuffer(vid)) {
+	        drawCentroidsWithSnapshot(vid, height);
+	      } else {
+	        drawCentroids(numCentroids, height);
+	      }
+	    }
+	    _projectileDrawParams.viewportHeight = height;
+	    _projectileDrawParams.basePointSize = basePointSize;
+	    _projectileDrawParams.sizeAttenuation = sizeAttenuation;
+	    _projectileDrawParams.fov = fov;
+	    projectileSystem.draw(_projectileDrawParams);
 
     // Draw orbit anchor compass visualization (only in orbit navigation mode)
     if (navigationMode === 'orbit') {
@@ -3080,35 +3169,29 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
           viewRadius = camState.orbit.radius ?? radius;
         }
       }
-      orbitAnchorRenderer.draw({
-        viewId: vid,
-        viewTheta,
-        viewPhi,
-        viewTarget,
-        viewRadius,
-        pointBoundsRadius: projectileSystem.getPointBoundsRadius(),
-        bgColor,
-        use3D: currentShaderQuality === 'full',
-        mvpMatrix,
-        viewMatrix,
-        modelMatrix,
-        fogDensity,
-        fogColor,
-        lightingStrength,
-        lightDir,
-        navigationMode
-      });
-    }
+	      _orbitAnchorDrawParams.viewId = vid;
+	      _orbitAnchorDrawParams.viewTheta = viewTheta;
+	      _orbitAnchorDrawParams.viewPhi = viewPhi;
+	      _orbitAnchorDrawParams.viewTarget = viewTarget;
+	      _orbitAnchorDrawParams.viewRadius = viewRadius;
+	      _orbitAnchorDrawParams.pointBoundsRadius = projectileSystem.getPointBoundsRadius();
+	      _orbitAnchorDrawParams.bgColor = bgColor;
+	      _orbitAnchorDrawParams.use3D = currentShaderQuality === 'full';
+	      _orbitAnchorDrawParams.fogDensity = fogDensity;
+	      _orbitAnchorDrawParams.fogColor = fogColor;
+	      _orbitAnchorDrawParams.lightingStrength = lightingStrength;
+	      _orbitAnchorDrawParams.navigationMode = navigationMode;
+	      orbitAnchorRenderer.draw(_orbitAnchorDrawParams);
+	    }
 
     // Update labels
-    if (flags.labels) {
-      const labels = getLabelsForView(vid);
-      if (labels.length) updateCentroidLabelPositions(labels, viewport);
-    } else {
-      hideLabelsForView(vid);
-    }
-    updateLabelLayerVisibility();
-  }
+	    if (flags.labels) {
+	      const labels = getLabelsForView(vid);
+	      if (labels.length) updateCentroidLabelPositions(labels, viewport);
+	    } else {
+	      hideLabelsForView(vid);
+	    }
+	  }
 
   function setBackground(mode) {
     showGrid = false;
@@ -3442,29 +3525,56 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   }
 
   // Update cached view matrix for a specific view (call when camera changes)
-  function updateCachedViewMatrix(viewId, camState) {
-    const vid = String(viewId);
-    if (!camState) {
-      cachedViewMatrices.delete(vid);
-      return;
-    }
-    let cached = cachedViewMatrices.get(vid);
-    if (!cached) {
-      cached = { viewMatrix: mat4.create(), radius: 0, cameraDistance: 0 };
-      cachedViewMatrices.set(vid, cached);
-    }
-    computeViewMatrixFromState(camState, cached.viewMatrix);
-    cached.radius = camState.orbit?.radius ?? radius;
-    // Cache camera distance based on view's navigation mode (for LOD/fog calculations)
-    if (camState.navigationMode === 'free' && camState.freefly?.position) {
-      // Freefly mode: distance is length of position vector
-      const pos = camState.freefly.position;
-      cached.cameraDistance = Math.sqrt(pos[0] * pos[0] + pos[1] * pos[1] + pos[2] * pos[2]);
-    } else {
-      // Orbit mode: distance is the orbit radius
-      cached.cameraDistance = cached.radius;
-    }
-  }
+	  function updateCachedViewMatrix(viewId, camState) {
+	    const vid = String(viewId);
+	    if (!camState) {
+	      cachedViewMatrices.delete(vid);
+	      return;
+	    }
+	    let cached = cachedViewMatrices.get(vid);
+	    if (!cached) {
+	      cached = { viewMatrix: mat4.create(), radius: 0, cameraDistance: 0, cameraPosition: vec3.create() };
+	      cachedViewMatrices.set(vid, cached);
+	    }
+	    computeViewMatrixFromState(camState, cached.viewMatrix);
+	    cached.radius = camState.orbit?.radius ?? radius;
+	    // Cache camera distance based on view's navigation mode (for LOD/fog calculations)
+	    if (camState.navigationMode === 'free' && camState.freefly?.position) {
+	      // Freefly mode: distance is length of position vector
+	      const pos = camState.freefly.position;
+	      cached.cameraDistance = Math.sqrt(pos[0] * pos[0] + pos[1] * pos[1] + pos[2] * pos[2]);
+	    } else {
+	      // Orbit mode: distance is the orbit radius
+	      cached.cameraDistance = cached.radius;
+	    }
+
+	    // Cache camera position for this view (avoid per-frame mat4.invert in render loop).
+	    const outPos = cached.cameraPosition;
+	    if (camState.navigationMode === 'free' && camState.freefly?.position) {
+	      const pos = camState.freefly.position;
+	      outPos[0] = pos[0] ?? 0;
+	      outPos[1] = pos[1] ?? 0;
+	      outPos[2] = pos[2] ?? 0;
+	    } else if (camState.navigationMode === 'planar' && camState.orbit) {
+	      const r = camState.orbit.radius ?? 5;
+	      const tgt = camState.orbit.target || [0, 0, 0];
+	      outPos[0] = tgt[0] ?? 0;
+	      outPos[1] = tgt[1] ?? 0;
+	      outPos[2] = (tgt[2] ?? 0) + r;
+	    } else if (camState.orbit) {
+	      const r = camState.orbit.radius ?? 5;
+	      const t = camState.orbit.theta ?? 0;
+	      const p = camState.orbit.phi ?? Math.PI / 2;
+	      const tgt = camState.orbit.target || [0, 0, 0];
+	      outPos[0] = (tgt[0] ?? 0) + r * Math.sin(p) * Math.cos(t);
+	      outPos[1] = (tgt[1] ?? 0) + r * Math.cos(p);
+	      outPos[2] = (tgt[2] ?? 0) + r * Math.sin(p) * Math.sin(t);
+	    } else {
+	      outPos[0] = eye[0];
+	      outPos[1] = eye[1];
+	      outPos[2] = eye[2];
+	    }
+	  }
 
   // Invalidate all cached matrices (call when switching lock modes)
   function invalidateAllCachedMatrices() {
@@ -4629,14 +4739,17 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         deleteCentroidSnapshotBuffer(id);
         // Delete per-view edge textures for this snapshot
         deleteEdgeTexturesForView(id);
-        // Clean up orbit anchor state for this view
-        orbitAnchorRenderer.deleteViewState(id);
-        // Clean up cached view matrix
-        cachedViewMatrices.delete(id);
-        // Clean up per-view dimension state
-        viewDimensionLevels.delete(id);
-        viewPositionsCache.delete(id);
-        vectorFieldOverlay?.disposeView?.(id);
+	        // Clean up orbit anchor state for this view
+	        orbitAnchorRenderer.deleteViewState(id);
+	        // Clean up cached view matrix
+	        cachedViewMatrices.delete(id);
+	        renderParamsByView.delete(id);
+	        overlayCtxByView.delete(id);
+	        overlayCtxOptionsByView.delete(id);
+	        // Clean up per-view dimension state
+	        viewDimensionLevels.delete(id);
+	        viewPositionsCache.delete(id);
+	        vectorFieldOverlay?.disposeView?.(id);
         snapshotViews.splice(idx, 1);
         const key = String(id);
         if (key !== LIVE_VIEW_ID) {
@@ -4675,13 +4788,16 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
           deleteEdgeTexturesForView(id);
         }
       }
-      // Clean up cached view matrices and dimension state for snapshots (preserve live view)
-      for (const snap of snapshotViews) {
-        cachedViewMatrices.delete(snap.id);
-        viewDimensionLevels.delete(snap.id);
-        viewPositionsCache.delete(snap.id);
-        vectorFieldOverlay?.disposeView?.(snap.id);
-      }
+	      // Clean up cached view matrices and dimension state for snapshots (preserve live view)
+	      for (const snap of snapshotViews) {
+	        cachedViewMatrices.delete(snap.id);
+	        renderParamsByView.delete(snap.id);
+	        overlayCtxByView.delete(snap.id);
+	        overlayCtxOptionsByView.delete(snap.id);
+	        viewDimensionLevels.delete(snap.id);
+	        viewPositionsCache.delete(snap.id);
+	        vectorFieldOverlay?.disposeView?.(snap.id);
+	      }
       snapshotViews.length = 0;
       focusedViewId = LIVE_VIEW_ID;
       liveViewHidden = false; // Restore live view visibility
@@ -4947,12 +5063,15 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
      * Clean up all resources (event listeners, observers, WebGL resources).
      * Call this before recreating the viewer or when unmounting.
      */
-    dispose() {
-      // Stop animation loop
-      if (animationHandle) {
-        cancelAnimationFrame(animationHandle);
-        animationHandle = null;
-      }
+	    dispose() {
+	      if (disposed) return;
+	      disposed = true;
+
+	      // Stop animation loop
+	      if (animationHandle) {
+	        cancelAnimationFrame(animationHandle);
+	        animationHandle = null;
+	      }
 
       // Remove all registered event listeners
       for (const cleanup of eventCleanupFns) {
@@ -4968,6 +5087,35 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       }
       webglContextOverlay = null;
       webglContextOverlayMessage = null;
+
+      // Clean up overlays (they can own significant GPU resources)
+      if (overlayManager?.dispose) {
+        overlayManager.dispose();
+      }
+      overlayManager = null;
+      vectorFieldOverlay = null;
+
+      // Clean up projectiles (GPU buffers)
+      if (projectileSystem?.dispose) {
+        projectileSystem.dispose();
+      }
+
+      // Clean up orbit anchor (programs + per-view buffers)
+      if (orbitAnchorRenderer?.dispose) {
+        orbitAnchorRenderer.dispose();
+      }
+
+      // Clean up centroid snapshot buffers (includes live + snapshots)
+      for (const vid of Array.from(centroidSnapshotBuffers.keys())) {
+        deleteCentroidSnapshotBuffer(vid);
+      }
+
+      // Clean up grid plane buffers
+      for (const key of Object.keys(gridPlaneBuffers)) {
+        const buf = gridPlaneBuffers[key];
+        if (buf) gl.deleteBuffer(buf);
+        gridPlaneBuffers[key] = null;
+      }
 
       // Clean up WebGL resources
       for (const [, entry] of edgePositionTexturesV2) {
@@ -5005,11 +5153,15 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       if (centroidColorBuffer) gl.deleteBuffer(centroidColorBuffer);
       if (edgeQuadBuffer) gl.deleteBuffer(edgeQuadBuffer);
 
-      // Clean up edge texture
+	      // Clean up edge texture
       if (edgeTextureV2) gl.deleteTexture(edgeTextureV2);
+      edgeTextureV2 = null;
 
       // Clear caches
       cachedViewMatrices.clear();
+      renderParamsByView.clear();
+      overlayCtxByView.clear();
+      overlayCtxOptionsByView.clear();
       viewDimensionLevels.clear();
       viewPositionsCache.clear();
     }

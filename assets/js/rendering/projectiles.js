@@ -47,6 +47,7 @@ export function createProjectileSystem({
   const projectiles = [];
   const impactFlashes = [];
   let projectilesEnabled = false;
+  let disposed = false;
   let projectileBufferDirty = true;
   let impactBufferDirty = true;
   let projectilePositions = new Float32Array();
@@ -948,35 +949,11 @@ export function createProjectileSystem({
       updateImpactFlashes(dt);
       if (projectileBufferDirty) rebuildProjectileBuffers();
       if (impactBufferDirty) rebuildImpactBuffers();
-    },
-    draw({
-      viewportHeight,
-      mvpMatrix,
-      viewMatrix,
-      modelMatrix,
-      basePointSize,
-      sizeAttenuation,
-      fov,
-    }) {
-      drawProjectiles({
-        viewportHeight,
-        mvpMatrix,
-        viewMatrix,
-        modelMatrix,
-        basePointSize,
-        sizeAttenuation,
-        fov,
-      });
-      drawImpactFlashes({
-        viewportHeight,
-        mvpMatrix,
-        viewMatrix,
-        modelMatrix,
-        basePointSize,
-        sizeAttenuation,
-        fov,
-      });
-    },
+	    },
+	    draw(params) {
+	      drawProjectiles(params);
+	      drawImpactFlashes(params);
+	    },
     setEnabled(enabled) {
       projectilesEnabled = !!enabled;
     },
@@ -990,16 +967,19 @@ export function createProjectileSystem({
      * Dispose of all WebGL resources to prevent GPU memory leaks.
      * Call this when the projectile system is no longer needed.
      */
-    dispose() {
-      // Delete all WebGL buffers
-      if (projectilePositionBuffer) gl.deleteBuffer(projectilePositionBuffer);
-      if (projectileColorBuffer) gl.deleteBuffer(projectileColorBuffer);
-      if (impactPositionBuffer) gl.deleteBuffer(impactPositionBuffer);
-      if (impactColorBuffer) gl.deleteBuffer(impactColorBuffer);
+	    dispose() {
+	      if (disposed) return;
+	      disposed = true;
 
-      // Clear state
-      projectiles.length = 0;
-      impactFlashes.length = 0;
+	      // Delete all WebGL buffers
+	      if (projectilePositionBuffer) gl.deleteBuffer(projectilePositionBuffer);
+	      if (projectileColorBuffer) gl.deleteBuffer(projectileColorBuffer);
+	      if (impactPositionBuffer) gl.deleteBuffer(impactPositionBuffer);
+	      if (impactColorBuffer) gl.deleteBuffer(impactColorBuffer);
+
+	      // Clear state
+	      projectiles.length = 0;
+	      impactFlashes.length = 0;
       projectilePositions = new Float32Array();
       projectileColors = new Uint8Array();
       impactPositions = new Float32Array();
@@ -1016,4 +996,3 @@ export function createProjectileSystem({
     isCharging() { return isCharging; },
   };
 }
-

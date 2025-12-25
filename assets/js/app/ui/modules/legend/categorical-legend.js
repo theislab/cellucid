@@ -15,6 +15,49 @@ import { FieldKind, FieldSource } from '../../../utils/field-constants.js';
 import { StateValidator } from '../../../utils/state-validator.js';
 import { clamp } from '../../../utils/number-utils.js';
 import { getCommunityAnnotationSession } from '../../../community-annotations/session.js';
+import { getAnnotationRepoForDataset } from '../../../community-annotations/repo-store.js';
+import { openCommunityAnnotationVotingModal } from '../community-annotation-voting-modal.js';
+
+function toCleanString(value) {
+  return String(value ?? '').trim();
+}
+
+function computeTopConsensusSummary(session, fieldKey, catIdx) {
+  const suggestions = session.getSuggestions(fieldKey, catIdx) || [];
+  if (!suggestions.length) return null;
+  let bestNet = null;
+  for (const s of suggestions) {
+    const up = s?.upvotes?.length || 0;
+    const down = s?.downvotes?.length || 0;
+    const net = up - down;
+    if (bestNet == null || net > bestNet) bestNet = net;
+  }
+  if (bestNet == null) return null;
+  const labels = [];
+  const seen = new Set();
+  const upSet = new Set();
+  const downSet = new Set();
+  for (const s of suggestions) {
+    const up = s?.upvotes?.length || 0;
+    const down = s?.downvotes?.length || 0;
+    const net = up - down;
+    if (net !== bestNet) continue;
+    for (const u of Array.isArray(s?.upvotes) ? s.upvotes : []) {
+      const uu = toCleanString(u);
+      if (uu) upSet.add(uu);
+    }
+    for (const u of Array.isArray(s?.downvotes) ? s.downvotes : []) {
+      const uu = toCleanString(u);
+      if (uu) downSet.add(uu);
+    }
+    const label = toCleanString(s?.label || '');
+    if (!label || seen.has(label)) continue;
+    seen.add(label);
+    labels.push(label);
+  }
+  const names = labels.length ? labels.join(', ') : null;
+  return { names, up: upSet.size, down: downSet.size };
+}
 
 function rgbToHex(color) {
   const toChannel = (v) => clamp(Math.round(v * 255), 0, 255);
@@ -54,231 +97,41 @@ function formatCategoryCount(visibleCount, availableCount) {
   return `${visible.toLocaleString()} cells`;
 }
 
-export function initCategoricalLegend({ state, legendEl }) {
+export function initCategoricalLegend({ state, legendEl, dataSourceManager = null }) {
   const annotationSession = getCommunityAnnotationSession();
-
-  let votingHoverTimer = null;
-  let votingCloseTimer = null;
-  let openVoting = null; // { row, fieldKey, catIdx, catLabel, panel }
-  let unsubscribeVoting = null;
-
-  function clearVotingTimers() {
-    if (votingHoverTimer) {
-      clearTimeout(votingHoverTimer);
-      votingHoverTimer = null;
-    }
-    if (votingCloseTimer) {
-      clearTimeout(votingCloseTimer);
-      votingCloseTimer = null;
-    }
+  try {
+    const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
+    const username = annotationSession.getProfile?.()?.username || 'local';
+    const repoRef = getAnnotationRepoForDataset(datasetId, username) || null;
+    annotationSession.setCacheContext?.({ datasetId, repoRef, username });
+  } catch {
+    // ignore
   }
 
-  function closeVotingPanel() {
-    clearVotingTimers();
-    if (openVoting?.panel?.parentNode) openVoting.panel.remove();
-    openVoting = null;
-  }
+  // Guard to prevent re-entry during render
+  let isRendering = false;
 
-  function renderVotingPanelContent(panel, { fieldKey, catIdx, catLabel }) {
-    panel.innerHTML = '';
-    panel.appendChild(Object.assign(document.createElement('div'), {
-      className: 'community-annotation-panel-title',
-      textContent: `🗳️ ${catLabel}`
-    }));
-
-    const profile = annotationSession.getProfile();
-    panel.appendChild(Object.assign(document.createElement('div'), {
-      className: 'community-annotation-panel-subtitle',
-      textContent: `You: @${profile.username}`
-    }));
-
-    const consensus = annotationSession.computeConsensus(fieldKey, catIdx);
-    const consensusLine = document.createElement('div');
-    consensusLine.className = `community-annotation-consensus status-${consensus.status}`;
-    const label = consensus.label ? `"${consensus.label}"` : '—';
-    consensusLine.textContent =
-      consensus.status === 'consensus'
-        ? `Consensus: ${label} (${Math.round(consensus.confidence * 100)}% • voters ${consensus.voters})`
-        : consensus.status === 'disputed'
-          ? `Disputed: top ${label} (${Math.round(consensus.confidence * 100)}% • voters ${consensus.voters})`
-          : `Pending: voters ${consensus.voters}`;
-    panel.appendChild(consensusLine);
-
-    const suggestions = annotationSession
-      .getSuggestions(fieldKey, catIdx)
-      .slice()
-      .sort((a, b) => ((b.upvotes?.length || 0) - (b.downvotes?.length || 0)) - ((a.upvotes?.length || 0) - (a.downvotes?.length || 0)));
-
-    const list = document.createElement('div');
-    list.className = 'community-annotation-suggestions';
-
-    if (!suggestions.length) {
-      const empty = document.createElement('div');
-      empty.className = 'legend-help';
-      empty.textContent = 'No suggestions yet.';
-      list.appendChild(empty);
-    } else {
-      for (const s of suggestions.slice(0, 8)) {
-        const up = s.upvotes?.length || 0;
-        const down = s.downvotes?.length || 0;
-        const net = up - down;
-
-        const card = document.createElement('div');
-        card.className = 'community-annotation-suggestion-card';
-
-        const top = document.createElement('div');
-        top.className = 'community-annotation-suggestion-top';
-
-        const labelEl = document.createElement('div');
-        labelEl.className = 'community-annotation-suggestion-label';
-        labelEl.textContent = s.label;
-        top.appendChild(labelEl);
-
-        const netEl = document.createElement('div');
-        netEl.className = 'community-annotation-suggestion-net';
-        netEl.textContent = `net ${net}`;
-        top.appendChild(netEl);
-
-        card.appendChild(top);
-
-        if (s.ontologyId) {
-          const ont = document.createElement('div');
-          ont.className = 'community-annotation-suggestion-ontology';
-          ont.textContent = s.ontologyId;
-          card.appendChild(ont);
-        }
-        if (s.evidence) {
-          const ev = document.createElement('div');
-          ev.className = 'community-annotation-suggestion-evidence';
-          ev.textContent = s.evidence;
-          card.appendChild(ev);
-        }
-
-        const actions = document.createElement('div');
-        actions.className = 'community-annotation-suggestion-actions';
-
-        const upBtn = document.createElement('button');
-        upBtn.type = 'button';
-        upBtn.className = 'btn-small';
-        upBtn.textContent = `▲ ${up}`;
-        upBtn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          annotationSession.vote(fieldKey, catIdx, s.id, 'up');
-        });
-
-        const downBtn = document.createElement('button');
-        downBtn.type = 'button';
-        downBtn.className = 'btn-small';
-        downBtn.textContent = `▼ ${down}`;
-        downBtn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          annotationSession.vote(fieldKey, catIdx, s.id, 'down');
-        });
-
-        actions.appendChild(upBtn);
-        actions.appendChild(downBtn);
-        card.appendChild(actions);
-
-        const by = document.createElement('div');
-        by.className = 'legend-help';
-        by.textContent = `@${s.proposedBy}`;
-        card.appendChild(by);
-
-        list.appendChild(card);
-      }
-    }
-
-    panel.appendChild(list);
-
-    const form = document.createElement('div');
-    form.className = 'community-annotation-new';
-
-    const labelInput = document.createElement('input');
-    labelInput.type = 'text';
-    labelInput.className = 'obs-select community-annotation-input';
-    labelInput.placeholder = 'New label…';
-
-    const submit = document.createElement('button');
-    submit.type = 'button';
-    submit.className = 'btn-small';
-    submit.textContent = 'Add';
-    submit.addEventListener('click', (e) => {
-      e.stopPropagation();
-      try {
-        annotationSession.addSuggestion(fieldKey, catIdx, { label: labelInput.value });
-        labelInput.value = '';
-      } catch (err) {
-        getNotificationCenter().error(err?.message || 'Failed to add suggestion', { category: 'annotation' });
-      }
-    });
-
-    form.appendChild(labelInput);
-    form.appendChild(submit);
-    panel.appendChild(form);
-  }
-
-  function openVotingPanel(row, { fieldKey, catIdx, catLabel }) {
+  // Keep legend UI in sync when voting mode is toggled or votes change.
+  annotationSession.on('changed', () => {
+    if (isRendering) return;
+    const field = state.getActiveField?.() || null;
+    if (!field || field.kind !== 'category') return;
     if (!legendEl) return;
-    if (!fieldKey) return;
-
-    if (openVoting && openVoting.fieldKey === fieldKey && openVoting.catIdx === catIdx) return;
-    closeVotingPanel();
-
-    const panel = document.createElement('div');
-    panel.className = 'community-annotation-panel';
-    panel.dataset.fieldKey = fieldKey;
-    panel.dataset.catIndex = String(catIdx);
-
-    panel.addEventListener('mouseenter', () => {
-      if (votingCloseTimer) {
-        clearTimeout(votingCloseTimer);
-        votingCloseTimer = null;
-      }
-    });
-    panel.addEventListener('mouseleave', () => {
-      scheduleCloseVotingPanel();
-    });
-
-    renderVotingPanelContent(panel, { fieldKey, catIdx, catLabel });
-    row.insertAdjacentElement('afterend', panel);
-
-    openVoting = { row, fieldKey, catIdx, catLabel, panel };
-  }
-
-  function scheduleOpenVotingPanel(row, options) {
-    if (!options?.fieldKey) return;
-    if (votingCloseTimer) {
-      clearTimeout(votingCloseTimer);
-      votingCloseTimer = null;
-    }
-    if (votingHoverTimer) clearTimeout(votingHoverTimer);
-    votingHoverTimer = setTimeout(() => {
-      votingHoverTimer = null;
-      if (!row.isConnected) return;
-      if (row.classList.contains('legend-item-dragging')) return;
-      openVotingPanel(row, options);
-    }, 200);
-  }
-
-  function scheduleCloseVotingPanel() {
-    if (votingHoverTimer) {
-      clearTimeout(votingHoverTimer);
-      votingHoverTimer = null;
-    }
-    if (votingCloseTimer) clearTimeout(votingCloseTimer);
-    votingCloseTimer = setTimeout(() => {
-      votingCloseTimer = null;
-      closeVotingPanel();
-    }, 250);
-  }
-
-  // Keep an open panel in sync with vote changes.
-  unsubscribeVoting = annotationSession.on('changed', () => {
-    if (!openVoting?.panel || !openVoting.panel.isConnected) return;
-    renderVotingPanelContent(openVoting.panel, openVoting);
+    const model = state.getLegendModel(field);
+    if (!model) return;
+    renderCategoricalLegend(field, model);
   });
 
   function refreshCategoryCounts() {
+    try {
+      const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
+      const username = annotationSession.getProfile?.()?.username || 'local';
+      const repoRef = getAnnotationRepoForDataset(datasetId, username) || null;
+      annotationSession.setCacheContext?.({ datasetId, repoRef, username });
+    } catch {
+      // ignore
+    }
+
     const activeField = state.getActiveField ? state.getActiveField() : null;
     if (!activeField || activeField.kind !== 'category') return;
     const model = state.getLegendModel(activeField);
@@ -306,8 +159,18 @@ export function initCategoricalLegend({ state, legendEl }) {
 
   function renderCategoricalLegend(field, model) {
     if (!legendEl) return;
-    closeVotingPanel();
 
+    isRendering = true;
+    try {
+      // Always clear before rendering to prevent duplicates
+      legendEl.innerHTML = '';
+      _doRenderCategoricalLegend(field, model);
+    } finally {
+      isRendering = false;
+    }
+  }
+
+  function _doRenderCategoricalLegend(field, model) {
     const catSection = document.createElement('div');
     catSection.className = 'legend-section';
     const title = document.createElement('div');
@@ -376,6 +239,7 @@ export function initCategoricalLegend({ state, legendEl }) {
 
       const row = document.createElement('div');
       row.className = 'legend-item';
+      if (annotating) row.classList.add('legend-item-annotating');
       row.dataset.catIndex = String(catIdx);
       if (!hasCells) row.classList.add('legend-item-disabled');
       row.title = hasCells ? '' : 'No cells available in this category after other filters';
@@ -413,31 +277,62 @@ export function initCategoricalLegend({ state, legendEl }) {
 
       swatch.appendChild(colorInput);
 
-      const labelSpan = document.createElement('span');
+      const labelSpan = document.createElement('div');
       labelSpan.className = 'legend-label';
-      labelSpan.textContent = cat;
+      const labelMain = document.createElement('div');
+      labelMain.className = 'legend-label-main';
+      labelMain.textContent = cat;
+      labelSpan.appendChild(labelMain);
+      if (annotating) {
+        labelSpan.classList.add('legend-label-multiline');
+        const consensus = computeTopConsensusSummary(annotationSession, fieldKey, catIdx);
+        const sub = document.createElement('div');
+        sub.className = 'legend-label-sub';
+        const consensusNames = consensus?.names || null;
+        const consensusUp = consensus?.up || 0;
+        const consensusDown = consensus?.down || 0;
+
+        const left = document.createElement('span');
+        left.className = 'legend-consensus-names';
+        left.textContent = consensusNames || '—';
+        const right = document.createElement('span');
+        right.className = 'legend-consensus-counts';
+        right.textContent = `▲${consensusUp} ▼${consensusDown}`;
+        sub.appendChild(left);
+        sub.appendChild(right);
+        labelSpan.appendChild(sub);
+      }
       if (isRenamed) {
         labelSpan.classList.add('is-renamed');
         labelSpan.title = `Original: ${originalLabel}`;
       } else {
-        labelSpan.title = 'Double-click to rename • Drag onto another category to merge';
+        labelSpan.title = annotating
+          ? 'Voting mode enabled: click to vote (labels are locked).'
+          : 'Double-click to rename • Drag onto another category to merge';
       }
 
-      labelSpan.draggable = true;
+      labelSpan.draggable = !annotating;
       labelSpan.classList.add('legend-label-draggable');
-      labelSpan.addEventListener('dragstart', (e) => {
-        row.classList.add('legend-item-dragging');
-        if (!e.dataTransfer) return;
-        e.dataTransfer.effectAllowed = 'move';
-        e.dataTransfer.setData(CATEGORY_DRAG_MIME, JSON.stringify({ catIdx }));
-        e.dataTransfer.setData('text/plain', String(catIdx));
-      });
-      labelSpan.addEventListener('dragend', () => {
-        row.classList.remove('legend-item-dragging');
-        itemsContainer
-          .querySelectorAll('.legend-item-drag-over')
-          .forEach((el) => el.classList.remove('legend-item-drag-over'));
-      });
+      if (!annotating) {
+        labelSpan.addEventListener('dragstart', (e) => {
+          row.classList.add('legend-item-dragging');
+          if (!e.dataTransfer) return;
+          e.dataTransfer.effectAllowed = 'move';
+          e.dataTransfer.setData(CATEGORY_DRAG_MIME, JSON.stringify({ catIdx }));
+          e.dataTransfer.setData('text/plain', String(catIdx));
+        });
+        labelSpan.addEventListener('dragend', () => {
+          row.classList.remove('legend-item-dragging');
+          itemsContainer
+            .querySelectorAll('.legend-item-drag-over')
+            .forEach((el) => el.classList.remove('legend-item-drag-over'));
+        });
+      } else if (hasCells) {
+        labelSpan.addEventListener('click', (e) => {
+          e.stopPropagation();
+          openCommunityAnnotationVotingModal({ state, defaultFieldKey: fieldKey, defaultCatIdx: catIdx });
+        });
+      }
 
       const renameBtn = document.createElement('button');
       renameBtn.type = 'button';
@@ -451,6 +346,7 @@ export function initCategoricalLegend({ state, legendEl }) {
       `;
 
       const startRename = () => {
+        if (annotating) return;
         const fieldIndex = state.activeFieldSource === FieldSource.OBS ? state.activeFieldIndex : -1;
         if (!Number.isInteger(fieldIndex) || fieldIndex < 0) return;
         const currentField = state.getFields?.()?.[fieldIndex];
@@ -472,17 +368,19 @@ export function initCategoricalLegend({ state, legendEl }) {
 
       renameBtn.addEventListener('click', (e) => {
         e.stopPropagation();
+        if (annotating) return;
         startRename();
       });
       labelSpan.addEventListener('dblclick', (e) => {
         e.stopPropagation();
+        if (annotating) return;
         startRename();
       });
 
       const deleteBtn = document.createElement('button');
       deleteBtn.type = 'button';
       deleteBtn.className = 'legend-delete-btn';
-      deleteBtn.title = 'Delete category (merge into unassigned)';
+      deleteBtn.title = annotating ? 'Disabled while voting is enabled' : 'Delete category (merge into unassigned)';
       deleteBtn.innerHTML = `
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
           <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
@@ -490,6 +388,7 @@ export function initCategoricalLegend({ state, legendEl }) {
       `;
       deleteBtn.addEventListener('click', (e) => {
         e.stopPropagation();
+        if (annotating) return;
 
         const fieldIndex = state.activeFieldSource === FieldSource.OBS ? state.activeFieldIndex : -1;
         if (!Number.isInteger(fieldIndex) || fieldIndex < 0) return;
@@ -525,6 +424,7 @@ export function initCategoricalLegend({ state, legendEl }) {
       });
 
       row.addEventListener('dragover', (e) => {
+        if (annotating) return;
         if (!e.dataTransfer) return;
         if (!e.dataTransfer.types?.includes?.(CATEGORY_DRAG_MIME)) return;
         e.preventDefault();
@@ -535,6 +435,7 @@ export function initCategoricalLegend({ state, legendEl }) {
         row.classList.remove('legend-item-drag-over');
       });
       row.addEventListener('drop', (e) => {
+        if (annotating) return;
         e.preventDefault();
         row.classList.remove('legend-item-drag-over');
 
@@ -591,23 +492,10 @@ export function initCategoricalLegend({ state, legendEl }) {
       row.appendChild(swatch);
       row.appendChild(labelSpan);
       row.appendChild(countSpan);
-      if (annotating && hasCells) {
-        const voteBtn = document.createElement('button');
-        voteBtn.type = 'button';
-        voteBtn.className = 'legend-vote-btn';
-        voteBtn.title = 'Vote on annotations';
-        voteBtn.textContent = 'Vote';
-        voteBtn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          openVotingPanel(row, { fieldKey, catIdx, catLabel: cat });
-        });
-        row.addEventListener('mouseenter', () => scheduleOpenVotingPanel(row, { fieldKey, catIdx, catLabel: cat }));
-        row.addEventListener('mouseleave', () => scheduleCloseVotingPanel());
-        row.appendChild(voteBtn);
+      if (!annotating) {
+        row.appendChild(renameBtn);
+        row.appendChild(deleteBtn);
       }
-
-      row.appendChild(renameBtn);
-      row.appendChild(deleteBtn);
       itemsContainer.appendChild(row);
     });
 

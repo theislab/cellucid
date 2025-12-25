@@ -184,6 +184,19 @@ class MemoryMonitor {
    */
   unregisterCleanupHandler(componentId) {
     this._cleanupHandlers.delete(componentId);
+    // If no components remain registered, stop background polling to avoid
+    // unnecessary CPU/battery usage.
+    if (this._cleanupHandlers.size === 0) {
+      this.stop();
+    }
+  }
+
+  /**
+   * Return the number of registered cleanup handlers.
+   * @returns {number}
+   */
+  getCleanupHandlerCount() {
+    return this._cleanupHandlers.size;
   }
 
   /**

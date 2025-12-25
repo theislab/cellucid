@@ -34,6 +34,20 @@ export class OrbitAnchorRenderer {
     this._setupLocations();
   }
 
+  dispose() {
+    const gl = this.gl;
+
+    for (const viewId of Array.from(this.viewStates.keys())) {
+      this.deleteViewState(viewId);
+    }
+    this.viewStates.clear();
+
+    if (this.program3D) gl.deleteProgram(this.program3D);
+    if (this.program2D) gl.deleteProgram(this.program2D);
+    this.program3D = null;
+    this.program2D = null;
+  }
+
   _createShader(type, source) {
     const gl = this.gl;
     const shader = gl.createShader(type);

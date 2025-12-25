@@ -598,13 +598,16 @@ export class SpatialIndex {
     if (validDimLevel === 1) {
       // 1D: use the largest extent (data could be along X, Y, or Z)
       dataSize = Math.max(dx, dy, dz) || 1;
-    } else if (validDimLevel === 2) {
-      // 2D: use the two largest extents (handles XY, XZ, or YZ planes)
-      const extents = [dx, dy, dz].sort((a, b) => b - a);
-      dataSize = Math.sqrt(extents[0] * extents[0] + extents[1] * extents[1]) || 1;
-    } else {
-      dataSize = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;  // 3D+: full diagonal
-    }
+	    } else if (validDimLevel === 2) {
+	      // 2D: use the two largest extents (handles XY, XZ, or YZ planes)
+	      // Avoid allocation/sort in a hot helper (used when adaptive LOD is enabled).
+	      const maxExtent = Math.max(dx, dy, dz);
+	      const minExtent = Math.min(dx, dy, dz);
+	      const midExtent = dx + dy + dz - maxExtent - minExtent;
+	      dataSize = Math.sqrt(maxExtent * maxExtent + midExtent * midExtent) || 1;
+	    } else {
+	      dataSize = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;  // 3D+: full diagonal
+	    }
 
     // Normalize distance relative to data size
     const distanceRatio = distance / dataSize;

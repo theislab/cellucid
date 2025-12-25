@@ -255,136 +255,6 @@ async function fetchBinary(url, init) {
 }
 
 /**
- * Fetch binary data with progress tracking for the notification center.
- * Tracks download progress and speed, reporting to the UI.
- *
- * @param {string} url - URL to fetch
- * @param {string} displayName - Human-readable name for the notification
- * @param {boolean} showNotification - Whether to show notification (default: true)
- * @param {RequestInit} [init]
- * @returns {Promise<ArrayBuffer>} Decompressed binary data
- */
-async function fetchBinaryWithProgress(url, displayName = null, showNotification = true, init) {
-  const notifications = getNotificationCenter();
-  const name = displayName || url.split('/').pop().replace('.gz', '').replace('.bin', '');
-  let trackerId = null;
-
-  if (showNotification) {
-    trackerId = notifications.startDownload(name);
-  }
-
-  try {
-    const resolvedUrl = await resolveAnyUrl(url);
-    const response = await fetch(resolvedUrl, init);
-
-    if (!response.ok) {
-      const err = new Error('Failed to load ' + url + ': ' + response.statusText);
-      err.status = response.status;
-      throw err;
-    }
-
-    // Get content length for progress tracking
-    const contentLength = response.headers.get('content-length');
-    const totalBytes = contentLength ? parseInt(contentLength, 10) : null;
-
-    // Check if this is a gzipped file by URL extension
-    const isGzipped = url.endsWith('.gz');
-
-    // For streaming progress, we need to read the body manually
-    if (response.body && showNotification) {
-      const reader = response.body.getReader();
-      const chunks = [];
-      let loadedBytes = 0;
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        chunks.push(value);
-        loadedBytes += value.length;
-
-        if (trackerId) {
-          notifications.updateDownload(trackerId, loadedBytes, totalBytes);
-        }
-      }
-
-      // Combine chunks into single ArrayBuffer
-      const allChunks = new Uint8Array(loadedBytes);
-      let position = 0;
-      for (const chunk of chunks) {
-        allChunks.set(chunk, position);
-        position += chunk.length;
-      }
-
-      // Handle decompression
-      let result;
-      if (isGzipped) {
-        if (typeof DecompressionStream !== 'undefined') {
-          const ds = new DecompressionStream('gzip');
-          const stream = new ReadableStream({
-            start(controller) {
-              controller.enqueue(allChunks);
-              controller.close();
-            }
-          });
-          const decompressedStream = stream.pipeThrough(ds);
-          const decompressedResponse = new Response(decompressedStream);
-          result = await decompressedResponse.arrayBuffer();
-        } else if (typeof pako !== 'undefined') {
-          const decompressed = pako.inflate(allChunks);
-          result = decompressed.buffer.slice(decompressed.byteOffset, decompressed.byteOffset + decompressed.byteLength);
-        } else {
-          throw new Error('Gzip decompression not supported');
-        }
-      } else {
-        result = allChunks.buffer;
-      }
-
-      if (trackerId) {
-        notifications.completeDownload(trackerId);
-      }
-      return result;
-    }
-
-    // Fallback for when streaming is not available or notifications disabled
-    if (isGzipped && typeof DecompressionStream !== 'undefined') {
-      try {
-        const ds = new DecompressionStream('gzip');
-        const decompressedStream = response.body.pipeThrough(ds);
-        const decompressedResponse = new Response(decompressedStream);
-        const result = await decompressedResponse.arrayBuffer();
-        if (trackerId) notifications.completeDownload(trackerId);
-        return result;
-      } catch (e) {
-        if (trackerId) notifications.failDownload(trackerId, e.message);
-        throw e;
-      }
-    } else if (isGzipped) {
-      const compressedBuffer = await response.arrayBuffer();
-      if (typeof pako !== 'undefined') {
-        const decompressed = pako.inflate(new Uint8Array(compressedBuffer));
-        if (trackerId) notifications.completeDownload(trackerId);
-        return decompressed.buffer.slice(decompressed.byteOffset, decompressed.byteOffset + decompressed.byteLength);
-      } else {
-        const err = new Error('Gzip decompression not supported');
-        if (trackerId) notifications.failDownload(trackerId, err.message);
-        throw err;
-      }
-    }
-
-    const result = await response.arrayBuffer();
-    if (trackerId) notifications.completeDownload(trackerId);
-    return result;
-
-  } catch (error) {
-    if (trackerId) {
-      notifications.failDownload(trackerId, error.message);
-    }
-    throw error;
-  }
-}
-
-/**
  * Load points binary, trying .gz version first if the URL doesn't already end in .gz
  * This handles both compressed and uncompressed data transparently.
  * Supports all custom protocols (local-user://, remote://, jupyter://) via DataSourceManager.
@@ -457,101 +327,25 @@ export async function loadPointsBinary(url, options = {}) {
         if (trackerId) notifications.completeDownload(trackerId);
         return new Float32Array(arrayBuffer);
       }
-    }
+	    }
 
-    // For all other URLs (including custom protocols like remote://, jupyter://),
-    // resolve the protocol first, then try .gz version
-    const gzUrl = url + '.gz';
-    try {
-      if (!supportsGzip) {
-        throw new Error('Gzip decompression not supported');
-      }
-      const resolvedGzUrl = await resolveAnyUrl(gzUrl);
-      const response = await fetch(resolvedGzUrl);
-      if (response.ok) {
-        console.log('Found compressed points file:', gzUrl);
+	    // For all other URLs (including custom protocols like remote://, jupyter://),
+	    // try .gz version first, then fall back to uncompressed
+	    const gzUrl = url + '.gz';
+	    if (supportsGzip) {
+	      try {
+	        const arrayBuffer = await fetchBinaryWithProgressInternal(gzUrl, trackerId, notifications);
+	        console.log('Found compressed points file:', gzUrl);
+	        if (trackerId) notifications.completeDownload(trackerId);
+	        return new Float32Array(arrayBuffer);
+	      } catch (e) {
+	        console.log('Compressed file not available or failed:', e.message || e);
+	      }
+	    }
 
-        // Track progress if enabled
-        const contentLength = response.headers.get('content-length');
-        const totalBytes = contentLength ? parseInt(contentLength, 10) : null;
-
-        if (trackerId && response.body) {
-          const reader = response.body.getReader();
-          const chunks = [];
-          let loadedBytes = 0;
-
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            chunks.push(value);
-            loadedBytes += value.length;
-            notifications.updateDownload(trackerId, loadedBytes, totalBytes);
-          }
-
-          const allChunks = new Uint8Array(loadedBytes);
-          let position = 0;
-          for (const chunk of chunks) {
-            allChunks.set(chunk, position);
-            position += chunk.length;
-          }
-
-          // Decompress
-          if (HAS_DECOMPRESSION_STREAM) {
-            const ds = new DecompressionStream('gzip');
-            const stream = new ReadableStream({
-              start(controller) {
-                controller.enqueue(allChunks);
-                controller.close();
-              }
-            });
-            const decompressedStream = stream.pipeThrough(ds);
-            const decompressedResponse = new Response(decompressedStream);
-            const arrayBuffer = await decompressedResponse.arrayBuffer();
-            notifications.completeDownload(trackerId);
-            return new Float32Array(arrayBuffer);
-          } else if (HAS_PAKO) {
-            const decompressed = pako.inflate(allChunks);
-            notifications.completeDownload(trackerId);
-            // Use slice() to create a properly aligned copy - pako may return views with
-            // non-4-byte-aligned byteOffset which causes Float32Array constructor to throw
-            const alignedBuffer = decompressed.buffer.slice(
-              decompressed.byteOffset,
-              decompressed.byteOffset + decompressed.byteLength
-            );
-            return new Float32Array(alignedBuffer);
-          }
-        }
-
-        // Fallback without progress tracking
-        if (HAS_DECOMPRESSION_STREAM) {
-          const ds = new DecompressionStream('gzip');
-          const decompressedStream = response.body.pipeThrough(ds);
-          const decompressedResponse = new Response(decompressedStream);
-          const arrayBuffer = await decompressedResponse.arrayBuffer();
-          if (trackerId) notifications.completeDownload(trackerId);
-          return new Float32Array(arrayBuffer);
-        } else if (HAS_PAKO) {
-          const compressedBuffer = await response.arrayBuffer();
-          const decompressed = pako.inflate(new Uint8Array(compressedBuffer));
-          if (trackerId) notifications.completeDownload(trackerId);
-          // Use slice() to create a properly aligned copy - pako may return views with
-          // non-4-byte-aligned byteOffset which causes Float32Array constructor to throw
-          const alignedBuffer = decompressed.buffer.slice(
-            decompressed.byteOffset,
-            decompressed.byteOffset + decompressed.byteLength
-          );
-          return new Float32Array(alignedBuffer);
-        } else {
-          console.warn('DecompressionStream not available and pako not loaded, trying uncompressed file');
-        }
-      }
-    } catch (e) {
-      console.log('Compressed file not available or failed:', e.message || e);
-    }
-
-    // Fall back to original URL (non-gzipped)
-    console.log('Loading uncompressed points file:', url);
-    const arrayBuffer = await fetchBinaryWithProgressInternal(url, trackerId, notifications);
+	    // Fall back to original URL (non-gzipped)
+	    console.log('Loading uncompressed points file:', url);
+	    const arrayBuffer = await fetchBinaryWithProgressInternal(url, trackerId, notifications);
     if (trackerId) notifications.completeDownload(trackerId);
     return new Float32Array(arrayBuffer);
 

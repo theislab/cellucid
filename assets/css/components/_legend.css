@@ -177,6 +177,10 @@
   position: relative;
 }
 
+.legend-item.legend-item-annotating {
+  align-items: flex-start;
+}
+
 .legend-checkbox {
   width: var(--space-3-5);
   height: var(--space-3-5);
@@ -226,6 +230,48 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.legend-label.legend-label-multiline {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  white-space: normal;
+}
+
+.legend-label-main {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.legend-label-sub {
+  font-size: var(--text-2xs);
+  opacity: var(--opacity-75);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+}
+
+.legend-consensus-names {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.legend-consensus-counts {
+  position: absolute;
+  right: 0;
+  font-size: var(--text-2xs);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  text-align: right;
+  opacity: var(--opacity-75);
 }
 
 .legend-count {

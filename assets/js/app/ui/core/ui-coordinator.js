@@ -71,7 +71,7 @@ export function initUI({
     }
   });
 
-  const legend = initLegendRenderer({ state, viewer, dom: dom.display });
+  const legend = initLegendRenderer({ state, viewer, dom: dom.display, dataSourceManager });
   const filterControls = initFilterControls({
     state,
     viewer,
@@ -159,6 +159,7 @@ export function initUI({
   const fieldSelector = initFieldSelector({
     state,
     dom: dom.fieldSelector,
+    dataSourceManager,
     callbacks: {
       onActiveFieldChanged: handleActiveFieldChanged
     }

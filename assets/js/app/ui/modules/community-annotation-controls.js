@@ -5,8 +5,8 @@
  * - Local session (localStorage) for annotated fields, suggestions, votes
  * - Lightweight UI to manage profile + per-cluster voting/suggestions
  *
- * GitHub sync (fine-grained PAT) is implemented here as a lightweight UI wrapper
- * around the GitHub sync module.
+ * GitHub App auth + sync is implemented here as a lightweight UI wrapper around
+ * the GitHub sync module.
  *
  * @module ui/modules/community-annotation-controls
  */
@@ -15,15 +15,12 @@ import { getNotificationCenter } from '../../notification-center.js';
 import { getCommunityAnnotationSession } from '../../community-annotations/session.js';
 import { showConfirmDialog } from '../components/confirm-dialog.js';
 import { getUrlAnnotationRepo, setUrlAnnotationRepo } from '../../url-state.js';
+import { getGitHubAuthSession, getGitHubLoginUrl } from '../../community-annotations/github-auth.js';
+import { getCommunityAnnotationAccessStore, isSimulateRepoConnectedEnabled } from '../../community-annotations/access-store.js';
 import {
   clearAnnotationRepoForDataset,
-  clearPatForRepo,
-  clearSessionPatForRepo,
-  getEffectivePatForRepo,
   getAnnotationRepoForDataset,
-  setAnnotationRepoForDataset,
-  setSessionPatForRepo,
-  setPatForRepo
+  setAnnotationRepoForDataset
 } from '../../community-annotations/repo-store.js';
 import {
   CommunityAnnotationGitHubSync,
@@ -38,7 +35,11 @@ function el(tag, props = {}, children = []) {
     if (k === 'className') node.className = String(v);
     else if (k === 'text') node.textContent = String(v);
     else if (k.startsWith('on') && typeof v === 'function') node.addEventListener(k.slice(2).toLowerCase(), v);
-    else if (v != null) node.setAttribute(k, String(v));
+    else if (k === 'disabled' || k === 'checked' || k === 'readonly') {
+      // Boolean HTML attributes: presence = true, absence = false
+      if (v) node.setAttribute(k, '');
+      // Don't set attribute if false (absence means not disabled/checked/readonly)
+    } else if (v != null && v !== false) node.setAttribute(k, String(v));
   }
   for (const c of children) {
     if (c == null) continue;
@@ -146,25 +147,289 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
   if (!container) return {};
 
   const session = getCommunityAnnotationSession();
+  const access = getCommunityAnnotationAccessStore();
 
   const notifications = getNotificationCenter();
+  const githubAuth = getGitHubAuthSession();
 
   let selectedFieldKey = null;
   let consensusThreshold = 0.7;
   let minAnnotators = 3;
   let consensusColumnKey = 'community_cell_type';
+  let consensusSourceFieldKey = null;
+  let consensusAccordionOpen = false;
 
   let syncBusy = false;
   let syncError = null;
+  let lastRepoInfo = null;
+
+  const tooltipAbort = new AbortController();
+  document.addEventListener('click', (e) => {
+    const target = e?.target || null;
+    try {
+      if (target && container.contains(target)) {
+        const insideTooltip = typeof target.closest === 'function' && (
+          target.closest('.info-tooltip') || target.closest('.info-btn')
+        );
+        if (insideTooltip) return;
+      }
+    } catch {
+      // ignore
+    }
+    try {
+      container.querySelectorAll('.info-tooltip').forEach((node) => {
+        node.style.display = 'none';
+      });
+    } catch {
+      // ignore
+    }
+  }, { signal: tooltipAbort.signal });
+
+  function createInfoTooltip(steps) {
+    const btn = el('button', { type: 'button', className: 'info-btn', text: 'i', 'aria-label': 'Info' });
+    const tooltip = el('div', { className: 'info-tooltip' });
+    const content = el('div', { className: 'info-tooltip-content' });
+    const list = Array.isArray(steps) ? steps : [];
+    for (const step of list) {
+      content.appendChild(el('div', { className: 'info-step', text: String(step) }));
+    }
+    tooltip.appendChild(content);
+
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const isVisible = getComputedStyle(tooltip).display !== 'none';
+      container.querySelectorAll('.info-tooltip').forEach((node) => {
+        node.style.display = 'none';
+      });
+      tooltip.style.display = isVisible ? 'none' : 'block';
+    });
+
+    return { btn, tooltip };
+  }
+
+  function getGitHubLogin() {
+    const u = githubAuth.getUser?.() || null;
+    return normalizeGitHubUsername(u?.login || '');
+  }
+
+  function getCacheUsername() {
+    const login = getGitHubLogin();
+    if (login) return login;
+    const profile = session.getProfile?.() || null;
+    return normalizeGitHubUsername(profile?.username || '') || 'local';
+  }
+
+  function applySessionCacheContext({ datasetId = null } = {}) {
+    const did = datasetId ?? dataSourceManager?.getCurrentDatasetId?.() ?? null;
+    const username = getCacheUsername();
+    const repoRef = getAnnotationRepoForDataset(did, username) || null;
+    session.setCacheContext?.({ datasetId: did, repoRef, username });
+  }
+
+  function ensureRepoRefHasBranch(repoRef, branch) {
+    const parsed = parseOwnerRepo(repoRef);
+    if (!parsed) return toCleanString(repoRef) || null;
+    const b = toCleanString(branch);
+    if (!b || parsed.ref) return parsed.ownerRepoRef;
+    return `${parsed.ownerRepo}@${b}`;
+  }
+
+  async function syncIdentityFromAuth({ promptIfMissing = false } = {}) {
+    if (!githubAuth.isAuthenticated?.()) return false;
+    if (!githubAuth.getUser?.()) {
+      try {
+        await githubAuth.fetchUser?.();
+      } catch {
+        return false;
+      }
+    }
+    const login = getGitHubLogin();
+    if (!login) return false;
+    await ensureIdentityForUsername({ username: login, promptIfMissing });
+    return true;
+  }
+
+  async function loadMyProfileFromGitHub({ datasetId } = {}) {
+    const did = datasetId ?? dataSourceManager?.getCurrentDatasetId?.() ?? null;
+    const login = getGitHubLogin();
+    const repo = getAnnotationRepoForDataset(did, login || 'local');
+    if (!repo) return false;
+    if (!githubAuth.isAuthenticated?.()) return false;
+    if (!login) return false;
+    try {
+      const sync = getGitHubSyncForDataset({ datasetId: did, username: login });
+      if (!sync) return false;
+      await sync.validateAndLoadConfig({ datasetId: did });
+      const resolvedRepoRef = ensureRepoRefHasBranch(repo, sync.branch);
+      if (resolvedRepoRef && resolvedRepoRef !== repo) {
+        setAnnotationRepoForDataset(did, resolvedRepoRef, login);
+        setUrlAnnotationRepo(resolvedRepoRef);
+        session.setCacheContext?.({ datasetId: did, repoRef: resolvedRepoRef, username: login });
+      }
+      const mine = await sync.pullUserFile({ username: login });
+      if (!mine?.doc) return false;
+      session.mergeFromUserFiles([mine.doc], { preferLocalVotes: true });
+      if (mine?.path && mine?.sha) session.setRemoteFileSha?.(mine.path, mine.sha);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function normalizeGitHubUsername(value) {
+    return String(value ?? '').trim().replace(/^@+/, '');
+  }
+
+  async function editIdentityFlow({
+    suggestedUsername = null,
+    reason = null
+  } = {}) {
+    const current = session.getProfile();
+    const suggested = normalizeGitHubUsername(suggestedUsername || current?.username || '');
+    const remoteFields = suggested ? session.getKnownUserProfile?.(suggested) : null;
+
+    return new Promise((resolve) => {
+      let resolved = false;
+      const resolveOnce = (value) => {
+        if (resolved) return;
+        resolved = true;
+        resolve(value);
+      };
+
+      const modalRef = showClusterModal({
+        title: 'Your identity (optional)',
+        buildContent: (content) => {
+          content.appendChild(el('div', {
+            className: 'legend-help',
+            text:
+              'Used for attribution in annotations. Saved locally (like votes) until you Publish; Publish writes it into your GitHub user file. Pull reloads it from GitHub.'
+          }));
+
+          if (reason) content.appendChild(el('div', { className: 'legend-help', text: `⚠ ${String(reason)}` }));
+
+          const status = el('div', { className: 'legend-help', text: '' });
+          content.appendChild(status);
+
+          if (suggested) {
+            content.appendChild(el('div', { className: 'legend-help', text: `GitHub: @${suggested}` }));
+            content.appendChild(el('div', {
+              className: 'community-annotation-inline-help',
+              text: 'GitHub username comes from your GitHub sign-in and cannot be edited here. Sign out to switch accounts.'
+            }));
+          } else {
+            content.appendChild(el('div', {
+              className: 'legend-help',
+              text: 'GitHub account not available. Sign in to set identity.'
+            }));
+          }
+
+          content.appendChild(el('label', { className: 'legend-help', text: 'Name (optional):' }));
+          const nameInput = el('input', {
+            type: 'text',
+            className: 'obs-select community-annotation-input',
+            placeholder: 'e.g. Alice Smith',
+            value: current?.displayName || remoteFields?.displayName || ''
+          });
+          content.appendChild(nameInput);
+
+          content.appendChild(el('label', { className: 'legend-help', text: 'Affiliation / role (optional):' }));
+          const titleInput = el('input', {
+            type: 'text',
+            className: 'obs-select community-annotation-input',
+            placeholder: 'e.g. Theis Lab, Postdoc',
+            value: current?.title || remoteFields?.title || ''
+          });
+          content.appendChild(titleInput);
+
+          content.appendChild(el('label', { className: 'legend-help', text: 'ORCID (optional):' }));
+          const orcidInput = el('input', {
+            type: 'text',
+            className: 'obs-select community-annotation-input',
+            placeholder: '0000-0000-0000-0000',
+            value: current?.orcid || remoteFields?.orcid || ''
+          });
+          content.appendChild(orcidInput);
+
+          const actions = el('div', { className: 'community-annotation-suggestion-actions' });
+          const saveBtn = el('button', { type: 'button', className: 'btn-small', text: 'Save' });
+          const skipBtn = el('button', { type: 'button', className: 'btn-small', text: 'Skip' });
+          actions.appendChild(saveBtn);
+          actions.appendChild(skipBtn);
+          content.appendChild(actions);
+
+          saveBtn.addEventListener('click', () => {
+            const username = suggested;
+            if (!username) {
+              status.textContent = 'Sign in with GitHub first.';
+              return;
+            }
+            const nextProfile = {
+              ...current,
+              username,
+              displayName: String(nameInput.value || '').trim(),
+              title: String(titleInput.value || '').trim(),
+              orcid: String(orcidInput.value || '').trim()
+            };
+            session.setProfile(nextProfile);
+            content.closest('.community-annotation-modal-overlay')?.remove?.();
+            resolveOnce({ username, dismissed: false });
+          });
+
+          skipBtn.addEventListener('click', () => {
+            const username = suggested;
+            if (username) {
+              session.setProfile({ ...current, username, displayName: '', title: '', orcid: '' });
+            }
+            content.closest('.community-annotation-modal-overlay')?.remove?.();
+            resolveOnce({ username: username || null, dismissed: true });
+          });
+        }
+      });
+
+      const overlay = modalRef?.overlay || null;
+      if (!overlay) return;
+      const observer = new MutationObserver(() => {
+        if (resolved) {
+          observer.disconnect();
+          return;
+        }
+        if (!document.body.contains(overlay)) {
+          observer.disconnect();
+          resolveOnce(null);
+        }
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+    });
+  }
+
+  async function ensureIdentityForUsername({ username, promptIfMissing = false } = {}) {
+    const u = normalizeGitHubUsername(username);
+    if (!u) return false;
+    const current = session.getProfile();
+    session.setProfile({ ...current, username: u });
+    if (promptIfMissing) {
+      const after = session.getProfile();
+      const hasAny = Boolean(after.displayName || after.title || after.orcid);
+      if (!hasAny) await editIdentityFlow({ suggestedUsername: u });
+    }
+    return true;
+  }
+
+  async function ensureIdentityForPush({ sync } = {}) {
+    // Identity is authoritative from GitHub sign-in.
+    return syncIdentityFromAuth({ promptIfMissing: true });
+  }
 
   const setDatasetContextFromManager = () => {
     const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
-    session.setDatasetId(datasetId);
+    applySessionCacheContext({ datasetId });
 
     const paramRepo = getUrlAnnotationRepo();
     if (paramRepo) {
       try {
-        setDatasetAnnotationRepoFromUrlParam({ datasetId, urlParamValue: paramRepo });
+        const username = getCacheUsername();
+        setDatasetAnnotationRepoFromUrlParam({ datasetId, urlParamValue: paramRepo, username });
+        applySessionCacheContext({ datasetId });
       } catch {
         // ignore
       }
@@ -183,15 +448,43 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
     render();
   });
 
+  const unsubscribeAuth = githubAuth.on?.('changed', () => {
+    // Clear auth-related errors and update identity UI quickly.
+    syncError = null;
+    if (!githubAuth.isAuthenticated?.()) {
+      const current = session.getProfile();
+      session.setProfile({ ...current, username: 'local', displayName: '', title: '', orcid: '' });
+      applySessionCacheContext({});
+      render();
+      return;
+    }
+    syncIdentityFromAuth({ promptIfMissing: false })
+      .then(() => loadMyProfileFromGitHub({}))
+      .finally(() => {
+        applySessionCacheContext({});
+        render();
+      });
+  }) || null;
+  const unsubscribeAccess = access.on?.('changed', () => render()) || null;
+
   function destroy() {
     unsubscribe?.();
+    unsubscribeAuth?.();
+    unsubscribeAccess?.();
+    tooltipAbort.abort();
   }
 
   async function applyConsensusColumn() {
-    if (!selectedFieldKey) return;
+    const sourceFieldKey = consensusSourceFieldKey || selectedFieldKey || null;
+    if (!sourceFieldKey) return;
+    const targetKey = String(consensusColumnKey || '').trim();
+    if (!targetKey) {
+      notifications.error('Consensus column key is required', { category: 'annotation', duration: 2600 });
+      return;
+    }
 
     const fields = state.getFields?.() || [];
-    const fieldIndex = fields.findIndex((f) => f?.kind === 'category' && f?.key === selectedFieldKey && f?._isDeleted !== true);
+    const fieldIndex = fields.findIndex((f) => f?.kind === 'category' && f?.key === sourceFieldKey && f?._isDeleted !== true);
     if (fieldIndex < 0) return;
 
     try {
@@ -220,7 +513,7 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
 
     const oldToNew = new Array(categories.length);
     for (let i = 0; i < categories.length; i++) {
-      const c = session.computeConsensus(selectedFieldKey, i, { minAnnotators, threshold: consensusThreshold });
+      const c = session.computeConsensus(sourceFieldKey, i, { minAnnotators, threshold: consensusThreshold });
       const label =
         c.status === 'consensus' && c.label
           ? c.label
@@ -240,18 +533,18 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
     }
 
     const result = state.upsertUserDefinedCategoricalField?.({
-      key: consensusColumnKey,
+      key: targetKey,
       categories: outCategories,
       codes: outCodes,
       meta: {
         _sourceField: {
           kind: 'community-annotation',
-          sourceKey: selectedFieldKey,
+          sourceKey: sourceFieldKey,
           sourceIndex: fieldIndex
         },
         _operation: {
           type: 'community-consensus',
-          fieldKey: selectedFieldKey,
+          fieldKey: sourceFieldKey,
           builtAt: Date.now()
         }
       }
@@ -263,15 +556,207 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
     }
   }
 
-  async function connectRepoFlow({
-    requireToken = false,
-    reason = null,
-    initialOwnerRepo = null,
-    defaultPullNow = null
-  } = {}) {
+  function openExternal(url) {
+    const href = String(url || '').trim();
+    if (!href) return false;
+    try {
+      window.open(href, '_blank', 'noopener,noreferrer');
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function manageGitHubAccessFlow() {
+    if (!githubAuth.isAuthenticated?.()) {
+      await ensureSignedInFlow({ reason: 'Sign in to manage GitHub App access.' });
+    }
+
+    const appInstallUrl = 'https://github.com/apps/cellucid-community-annotations/installations/new';
+    const settingsUrl = 'https://github.com/settings/installations';
+
+    return new Promise((resolve) => {
+      const modalRef = showClusterModal({
+        title: 'GitHub App access',
+        buildContent: (content) => {
+          content.appendChild(el('div', {
+            className: 'legend-help',
+            text: 'Manage which repositories the Cellucid GitHub App can access.'
+          }));
+
+          const status = el('div', { className: 'legend-help', text: '' });
+          content.appendChild(status);
+
+          const actions = el('div', { className: 'community-annotation-suggestion-actions' });
+          const openInstall = el('button', { type: 'button', className: 'btn-small', text: 'Install / add repos…' });
+          const openSettings = el('button', { type: 'button', className: 'btn-small', text: 'GitHub settings…' });
+          actions.appendChild(openInstall);
+          actions.appendChild(openSettings);
+          content.appendChild(actions);
+
+          openInstall.addEventListener('click', () => openExternal(appInstallUrl));
+          openSettings.addEventListener('click', () => openExternal(settingsUrl));
+
+          const list = el('div', { className: 'legend-help', text: '' });
+          content.appendChild(list);
+
+          const load = async () => {
+            list.textContent = '';
+            if (!githubAuth.isAuthenticated?.()) {
+              status.textContent = 'Sign in to view your installations.';
+              return;
+            }
+            status.textContent = 'Loading installations…';
+            try {
+              const data = await githubAuth.listInstallations?.();
+              const installs = Array.isArray(data?.installations) ? data.installations : [];
+              status.textContent = installs.length ? `Installations: ${installs.length}` : 'No installations found.';
+              if (!installs.length) {
+                list.appendChild(el('div', { className: 'legend-help', text: 'Install the app on an account and select repos, then return and refresh.' }));
+                return;
+              }
+              for (const inst of installs.slice(0, 50)) {
+                const account = inst?.account?.login || inst?.account?.name || 'unknown';
+                const row = el('div', { className: 'community-annotation-inline-help', text: `• ${account}` });
+                const url = inst?.html_url || null;
+                if (url) {
+                  const btn = el('button', { type: 'button', className: 'btn-small', text: 'Open' });
+                  btn.addEventListener('click', () => openExternal(url));
+                  row.appendChild(document.createTextNode(' '));
+                  row.appendChild(btn);
+                }
+                list.appendChild(row);
+              }
+            } catch (err) {
+              status.textContent = err?.message || 'Failed to load installations';
+            }
+          };
+
+          load();
+        }
+      });
+
+      const overlay = modalRef?.overlay || null;
+      if (!overlay) return;
+      const observer = new MutationObserver(() => {
+        if (!document.body.contains(overlay)) {
+          observer.disconnect();
+          resolve(null);
+        }
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+    });
+  }
+
+  async function ensureSignedInFlow({ reason = null } = {}) {
+    if (githubAuth.isAuthenticated?.()) return true;
+    return new Promise((resolve) => {
+      let resolved = false;
+      const resolveOnce = (value) => {
+        if (resolved) return;
+        resolved = true;
+        resolve(value);
+      };
+
+      const modalRef = showClusterModal({
+        title: 'Sign in with GitHub',
+        buildContent: (content) => {
+          content.appendChild(el('div', {
+            className: 'legend-help',
+            text:
+              'Cellucid uses a GitHub App sign-in (opens a GitHub window). ' +
+              'Your access token is stored only in sessionStorage (cleared on tab close).'
+          }));
+          if (reason) content.appendChild(el('div', { className: 'legend-help', text: `⚠ ${String(reason)}` }));
+
+          const status = el('div', { className: 'legend-help', text: '' });
+          content.appendChild(status);
+
+          const actions = el('div', { className: 'community-annotation-suggestion-actions' });
+          const signInBtn = el('button', { type: 'button', className: 'btn-small', text: 'Sign in with GitHub' });
+          const cancelBtn = el('button', { type: 'button', className: 'btn-small', text: 'Cancel' });
+          actions.appendChild(signInBtn);
+          actions.appendChild(cancelBtn);
+          content.appendChild(actions);
+
+          const fallback = el('div', { className: 'community-annotation-inline-help', text: '' });
+          content.appendChild(fallback);
+
+          cancelBtn.addEventListener('click', () => {
+            content.closest('.community-annotation-modal-overlay')?.remove?.();
+            resolveOnce(false);
+          });
+
+          signInBtn.addEventListener('click', async () => {
+            signInBtn.disabled = true;
+            cancelBtn.disabled = true;
+            fallback.textContent = '';
+            status.textContent = 'Opening GitHub sign-in…';
+            try {
+              await githubAuth.signIn?.({ mode: 'auto' });
+              await syncIdentityFromAuth({ promptIfMissing: false });
+              await loadMyProfileFromGitHub({});
+              content.closest('.community-annotation-modal-overlay')?.remove?.();
+              resolveOnce(true);
+            } catch (err) {
+              signInBtn.disabled = false;
+              cancelBtn.disabled = false;
+              const msg = err?.message || 'Sign-in failed';
+              status.textContent = msg;
+              if (err?.code === 'POPUP_BLOCKED') {
+                const link = getGitHubLoginUrl(githubAuth.getWorkerOrigin?.());
+                fallback.textContent = '';
+                fallback.appendChild(el('div', { className: 'legend-help', text: 'If your browser blocks popups/new tabs, allow them for Cellucid and try again.' }));
+                fallback.appendChild(el('div', { className: 'legend-help', text: 'Alternative: click this link (starts sign-in in a new tab):' }));
+                const manualLink = el('a', { href: link, target: '_blank', text: 'Open GitHub sign-in' });
+                manualLink.addEventListener('click', () => {
+                  status.textContent = 'Waiting for GitHub sign-in…';
+                  fallback.textContent = '';
+                  signInBtn.disabled = true;
+                  cancelBtn.disabled = true;
+                  githubAuth.completeSignInFromMessage?.()
+                    .then(() => syncIdentityFromAuth({ promptIfMissing: false }))
+                    .then(() => loadMyProfileFromGitHub({}))
+                    .then(() => {
+                      content.closest('.community-annotation-modal-overlay')?.remove?.();
+                      resolveOnce(true);
+                    })
+                    .catch((listenErr) => {
+                      signInBtn.disabled = false;
+                      cancelBtn.disabled = false;
+                      status.textContent = listenErr?.message || 'Sign-in failed';
+                    });
+                });
+                fallback.appendChild(manualLink);
+              }
+            }
+          });
+        }
+      });
+
+      const overlay = modalRef?.overlay || null;
+      if (!overlay) return;
+      const observer = new MutationObserver(() => {
+        if (resolved) {
+          observer.disconnect();
+          return;
+        }
+        if (!document.body.contains(overlay)) {
+          observer.disconnect();
+          resolveOnce(false);
+        }
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+    });
+  }
+
+  async function connectRepoFlow({ reason = null, defaultPullNow = true } = {}) {
     const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
-    const existingRepo = initialOwnerRepo || getAnnotationRepoForDataset(datasetId) || null;
-    const existingToken = existingRepo ? getEffectivePatForRepo(existingRepo) : null;
+    const okAuth = await ensureSignedInFlow({ reason: reason || 'Sign in to choose an annotation repository.' });
+    if (!okAuth) return null;
+
+    const login = getGitHubLogin();
+    const currentRepo = getAnnotationRepoForDataset(datasetId, login || 'local') || getUrlAnnotationRepo() || null;
 
     return new Promise((resolve) => {
       let resolved = false;
@@ -282,101 +767,140 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
       };
 
       const modalRef = showClusterModal({
-        title: 'Connect annotation repository',
+        title: 'Choose annotation repository',
         buildContent: (content) => {
-          const intro = el('div', {
+          content.appendChild(el('div', {
             className: 'legend-help',
-            text:
-              'Connect a GitHub repo that contains annotations/ (config + users). For private repos, paste a fine-grained PAT (Contents: read/write).'
-          });
-          content.appendChild(intro);
-
-          if (reason) {
-            content.appendChild(el('div', { className: 'legend-help', text: `⚠ ${String(reason)}` }));
-          }
+            text: 'Select a repo where the Cellucid GitHub App is installed (annotations/ config + users).'
+          }));
+          if (reason) content.appendChild(el('div', { className: 'legend-help', text: `⚠ ${String(reason)}` }));
 
           const status = el('div', { className: 'legend-help', text: '' });
           content.appendChild(status);
 
-          const repoInput = el('input', {
+          const searchInput = el('input', {
             type: 'text',
             className: 'obs-select community-annotation-input',
-            placeholder: 'owner/repo (or owner/repo@branch)',
-            value: existingRepo || getUrlAnnotationRepo() || ''
-          });
-          content.appendChild(repoInput);
-
-          const tokenInput = el('input', {
-            type: 'password',
-            className: 'obs-select community-annotation-input',
-            placeholder: requireToken ? 'GitHub token required' : 'GitHub token (optional for public pull)',
+            placeholder: 'Search repos…',
             value: ''
           });
-          content.appendChild(tokenInput);
+          content.appendChild(searchInput);
 
-          const rememberRow = el('label', { className: 'legend-help' });
-          const remember = el('input', { type: 'checkbox' });
-          remember.checked = false;
-          rememberRow.appendChild(remember);
-          rememberRow.appendChild(document.createTextNode(' Remember token in this browser (localStorage)'));
-          content.appendChild(rememberRow);
+          const repoSelect = el('select', { className: 'obs-select' });
+          repoSelect.appendChild(el('option', { value: '', text: '(loading…)'}));
+          content.appendChild(repoSelect);
 
           const pullRow = el('label', { className: 'legend-help' });
           const pullNow = el('input', { type: 'checkbox' });
-          pullNow.checked = defaultPullNow == null ? !requireToken : Boolean(defaultPullNow);
+          pullNow.checked = Boolean(defaultPullNow);
           pullRow.appendChild(pullNow);
           pullRow.appendChild(document.createTextNode(' Pull now after connecting'));
           content.appendChild(pullRow);
 
-          if (existingToken && !requireToken) {
-            const hint = el('div', { className: 'legend-help', text: 'A token exists for this repo (not shown).' });
-            content.appendChild(hint);
-          }
-
           const actions = el('div', { className: 'community-annotation-suggestion-actions' });
+          const refreshBtn = el('button', { type: 'button', className: 'btn-small', text: 'Refresh list' });
+          const manageBtn = el('button', { type: 'button', className: 'btn-small', text: 'Manage access…' });
           const connectBtn = el('button', { type: 'button', className: 'btn-small', text: 'Connect' });
-          const clearTokenBtn = el('button', { type: 'button', className: 'btn-small', text: 'Clear saved token' });
+          actions.appendChild(refreshBtn);
+          actions.appendChild(manageBtn);
           actions.appendChild(connectBtn);
-          actions.appendChild(clearTokenBtn);
           content.appendChild(actions);
 
-          clearTokenBtn.addEventListener('click', () => {
-            const parsed = parseOwnerRepo(repoInput.value);
-            if (!parsed) {
-              status.textContent = 'Enter a valid owner/repo to clear token.';
-              return;
+          /** @type {{full_name:string, private?:boolean, html_url?:string}[]} */
+          let allRepos = [];
+
+          const renderOptions = () => {
+            const q = String(searchInput.value || '').trim().toLowerCase();
+            repoSelect.innerHTML = '';
+            const filtered = q
+              ? allRepos.filter((r) => String(r.full_name || '').toLowerCase().includes(q))
+              : allRepos;
+            repoSelect.appendChild(el('option', { value: '', text: filtered.length ? '(select a repo)' : '(no repos found)' }));
+            for (const r of filtered.slice(0, 400)) {
+              const name = String(r.full_name || '').trim();
+              if (!name) continue;
+              const label = r.private ? `${name} (private)` : name;
+              repoSelect.appendChild(el('option', { value: name, text: label }));
             }
-            clearSessionPatForRepo(parsed.ownerRepoRef);
-            clearPatForRepo(parsed.ownerRepoRef);
-            status.textContent = 'Saved token cleared for this repo.';
-          });
+            if (currentRepo) repoSelect.value = currentRepo;
+          };
+
+          const loadRepos = async () => {
+            status.textContent = 'Loading installations…';
+            refreshBtn.disabled = true;
+            connectBtn.disabled = true;
+            repoSelect.disabled = true;
+            try {
+              const instData = await githubAuth.listInstallations?.();
+              const installations = Array.isArray(instData?.installations) ? instData.installations : [];
+              if (!installations.length) {
+                allRepos = [];
+                renderOptions();
+                status.textContent = 'No installations found. Install the app on an account, then refresh.';
+                return;
+              }
+
+              const repos = [];
+              for (const inst of installations.slice(0, 50)) {
+                status.textContent = `Loading repos… (${repos.length})`;
+                const id = inst?.id;
+                if (!id) continue;
+                try {
+                  const repoData = await githubAuth.listInstallationRepos?.(id);
+                  const list = Array.isArray(repoData?.repositories) ? repoData.repositories : [];
+                  for (const r of list) {
+                    const full = String(r?.full_name || '').trim();
+                    if (!full) continue;
+                    repos.push({ full_name: full, private: Boolean(r?.private), html_url: r?.html_url || null });
+                  }
+                } catch (err) {
+                  // Skip installations that error; user can manage access and retry.
+                  status.textContent = err?.message || 'Failed to load some installations';
+                }
+              }
+
+              const unique = new Map();
+              for (const r of repos) unique.set(r.full_name, r);
+              allRepos = Array.from(unique.values()).sort((a, b) => a.full_name.localeCompare(b.full_name));
+              status.textContent = allRepos.length ? `Repos available: ${allRepos.length}` : 'No repos available via the app.';
+              renderOptions();
+            } finally {
+              refreshBtn.disabled = false;
+              connectBtn.disabled = false;
+              repoSelect.disabled = false;
+            }
+          };
+
+          searchInput.addEventListener('input', () => renderOptions());
+          refreshBtn.addEventListener('click', () => loadRepos());
+          manageBtn.addEventListener('click', () => manageGitHubAccessFlow());
 
           connectBtn.addEventListener('click', async () => {
-            const parsed = parseOwnerRepo(repoInput.value);
-            if (!parsed) {
-              status.textContent = 'Invalid repo. Use: owner/repo';
+            const selected = String(repoSelect.value || '').trim();
+            if (!selected) {
+              status.textContent = 'Select a repo first.';
+              return;
+            }
+            const parts = selected.split('/');
+            if (parts.length !== 2) {
+              status.textContent = 'Invalid repo selection.';
               return;
             }
 
-            const savedForRepo = getEffectivePatForRepo(parsed.ownerRepoRef);
-            const token = String(tokenInput.value || '').trim() || (savedForRepo || null);
-            if (requireToken && !token) {
-              status.textContent = 'Token required.';
-              return;
-            }
-
-            status.textContent = 'Validating repository...';
+            status.textContent = 'Validating repository…';
             try {
+              const token = githubAuth.getToken?.() || null;
               const sync = new CommunityAnnotationGitHubSync({
                 datasetId,
-                owner: parsed.owner,
-                repo: parsed.repo,
+                owner: parts[0],
+                repo: parts[1],
                 token,
-                branch: parsed.ref || null
+                branch: null,
+                workerOrigin: githubAuth.getWorkerOrigin?.() || null
               });
-
-              const { config, datasetConfig, datasetId: did } = await sync.validateAndLoadConfig({ datasetId });
-
+              const { repoInfo, config, datasetConfig, datasetId: did } = await sync.validateAndLoadConfig({ datasetId });
+              lastRepoInfo = repoInfo || null;
+              access.setRoleFromRepoInfo(lastRepoInfo);
               if (did && Array.isArray(config?.supportedDatasets) && config.supportedDatasets.length && !datasetConfig) {
                 const ok = await confirmAsync({
                   title: 'Dataset mismatch',
@@ -390,42 +914,34 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
                 }
               }
 
-              setAnnotationRepoForDataset(datasetId, parsed.ownerRepoRef);
-              setUrlAnnotationRepo(parsed.ownerRepoRef);
+              const resolvedRepoRef = ensureRepoRefHasBranch(selected, sync.branch);
+              setAnnotationRepoForDataset(datasetId, resolvedRepoRef, login || 'local');
+              session.setCacheContext?.({ datasetId, repoRef: resolvedRepoRef, username: login || 'local' });
+              setUrlAnnotationRepo(resolvedRepoRef);
+              await syncIdentityFromAuth({ promptIfMissing: true });
+              await loadMyProfileFromGitHub({ datasetId });
 
-              if (token) setSessionPatForRepo(parsed.ownerRepoRef, token);
-              if (remember.checked && token) setPatForRepo(parsed.ownerRepoRef, token);
-
-              if (token) {
-                const me = await sync.getAuthenticatedUser();
-                const login = String(me?.login || '').trim();
-                const profile = session.getProfile();
-                if (login && (!profile?.username || profile.username === 'local')) {
-                  session.setProfile({ ...profile, username: login });
-                }
+              // Apply configured fields for this dataset on connect (author-controlled).
+              const configured = new Set(Array.isArray(datasetConfig?.fieldsToAnnotate) ? datasetConfig.fieldsToAnnotate : []);
+              const catFields = (state.getFields?.() || []).filter((f) => f?.kind === 'category' && f?._isDeleted !== true);
+              const allKeys = catFields.map((f) => f.key).filter(Boolean);
+              for (const key of allKeys) {
+                session.setFieldAnnotated(key, configured.has(key));
               }
 
-              status.textContent = `Connected to ${parsed.ownerRepoRef}`;
-              resolveOnce({ ownerRepo: parsed.ownerRepoRef, token, remembered: remember.checked });
-
+              resolveOnce({ ownerRepo: selected, pullNow: pullNow.checked });
+              content.closest('.community-annotation-modal-overlay')?.remove?.();
               if (pullNow.checked) {
-                content.closest('.community-annotation-modal-overlay')?.remove?.();
-                await pullFromGitHub({ tokenOverride: token, repoOverride: parsed.ownerRepoRef, allowReauth: false });
+                await pullFromGitHub({ repoOverride: selected });
               } else {
-                content.closest('.community-annotation-modal-overlay')?.remove?.();
                 render();
               }
             } catch (err) {
-              const msg = err?.message || 'Failed to connect';
-              if (isAuthError(err)) {
-                status.textContent = token
-                  ? `Access denied (token may be missing repo permissions): ${msg}`
-                  : `Repo not found or access denied. If this is a private repo, paste a fine-grained PAT. (${msg})`;
-              } else {
-                status.textContent = msg;
-              }
+              status.textContent = err?.message || 'Failed to connect';
             }
           });
+
+          loadRepos();
         }
       });
 
@@ -445,43 +961,76 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
     });
   }
 
-  async function pullFromGitHub({ tokenOverride = null, repoOverride = null, allowReauth = true } = {}) {
+  async function pullFromGitHub({ repoOverride = null } = {}) {
     if (syncBusy) return;
     syncBusy = true;
     syncError = null;
     render();
 
     const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
-    const repo = repoOverride || getAnnotationRepoForDataset(datasetId);
+    const login = getGitHubLogin();
+    const cacheUser = login || getCacheUsername();
+    const repo = repoOverride || getAnnotationRepoForDataset(datasetId, cacheUser);
     if (!repo) {
       syncBusy = false;
       syncError = 'No annotation repo connected.';
       render();
+      await connectRepoFlow({ reason: 'Choose a repo to Pull from.', defaultPullNow: true });
       return;
     }
 
     if (repoOverride) {
       // Keep stored mapping consistent with the repo we're about to pull from.
-      setAnnotationRepoForDataset(datasetId, repoOverride);
+      setAnnotationRepoForDataset(datasetId, repoOverride, cacheUser);
+    }
+    session.setCacheContext?.({ datasetId, repoRef: repo, username: cacheUser });
+
+    const okAuth = await ensureSignedInFlow({ reason: 'Sign in required to Pull annotations.' });
+    if (!okAuth) {
+      syncBusy = false;
+      render();
+      return;
     }
 
     const trackerId = notifications.loading(`Pulling annotations from ${repo}...`, { category: 'annotation' });
 
     try {
-      if (tokenOverride) setSessionPatForRepo(repo, tokenOverride);
-      const sync = getGitHubSyncForDataset({ datasetId, tokenOverride });
+      const sync = getGitHubSyncForDataset({ datasetId, username: cacheUser });
       if (!sync) throw new Error('Invalid annotation repo');
 
-      const { datasetConfig } = await sync.validateAndLoadConfig({ datasetId });
-      const docs = await sync.pullAllUsers();
+      const { repoInfo, datasetConfig } = await sync.validateAndLoadConfig({ datasetId });
+      lastRepoInfo = repoInfo || null;
+      access.setRoleFromRepoInfo(lastRepoInfo);
+      const resolvedRepoRef = ensureRepoRefHasBranch(repo, sync.branch);
+      if (resolvedRepoRef && resolvedRepoRef !== repo) {
+        setAnnotationRepoForDataset(datasetId, resolvedRepoRef, cacheUser);
+        setUrlAnnotationRepo(resolvedRepoRef);
+        session.setCacheContext?.({ datasetId, repoRef: resolvedRepoRef, username: cacheUser });
+      }
+      const knownShas = session.getRemoteFileShas?.() || null;
+      const pullResult = await sync.pullAllUsers({ knownShas });
+      const docs = pullResult?.docs || [];
+      if (pullResult?.shas) session.setRemoteFileShas?.(pullResult.shas);
       const invalidCount = docs.filter((d) => d && d.__invalid).length;
       const usable = docs.filter((d) => d && !d.__invalid);
       session.mergeFromUserFiles(usable, { preferLocalVotes: true });
 
-      // Optional: auto-enable configured fields for this dataset.
-      const fieldsToAnnotate = Array.isArray(datasetConfig?.fieldsToAnnotate) ? datasetConfig.fieldsToAnnotate : [];
-      for (const fieldKey of fieldsToAnnotate.slice(0, 50)) {
-        session.setFieldAnnotated(fieldKey, true);
+      // Optional: moderation merges (author-maintained) - incremental via sha cache.
+      try {
+        const known = session.getRemoteFileShas?.() || null;
+        const res = await sync.pullModerationMerges({ knownShas: known });
+        if (res?.sha) session.setRemoteFileSha?.(res.path || 'annotations/moderation/merges.json', res.sha);
+        if (res?.doc) session.setModerationMergesFromDoc(res.doc);
+      } catch {
+        // ignore
+      }
+
+      // Apply configured fields for this dataset (author-controlled).
+      const configured = new Set(Array.isArray(datasetConfig?.fieldsToAnnotate) ? datasetConfig.fieldsToAnnotate : []);
+      const catFields = (state.getFields?.() || []).filter((f) => f?.kind === 'category' && f?._isDeleted !== true);
+      const allKeys = catFields.map((f) => f.key).filter(Boolean);
+      for (const key of allKeys) {
+        session.setFieldAnnotated(key, configured.has(key));
       }
 
       await applyConsensusColumn();
@@ -493,20 +1042,12 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
       }
     } catch (err) {
       const msg = err?.message || 'Pull failed';
-      if (allowReauth && isAuthError(err)) {
+      if (isAuthError(err)) {
+        githubAuth.signOut?.();
+        syncError = `${msg} (sign in again)`;
+      } else {
         syncError = msg;
-        notifications.fail(trackerId, msg);
-        syncBusy = false;
-        render();
-        await connectRepoFlow({
-          requireToken: true,
-          reason: msg,
-          initialOwnerRepo: repo,
-          defaultPullNow: true
-        });
-        return;
       }
-      syncError = msg;
       notifications.fail(trackerId, msg);
     } finally {
       syncBusy = false;
@@ -516,10 +1057,14 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
 
   async function pushToGitHub() {
     const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
-    const repo = getAnnotationRepoForDataset(datasetId);
+    const login = getGitHubLogin();
+    const cacheUser = login || getCacheUsername();
+    const repo = getAnnotationRepoForDataset(datasetId, cacheUser);
+    const repoConnectedForGating = Boolean(repo) || isSimulateRepoConnectedEnabled();
     if (!repo) {
       syncError = 'No annotation repo connected.';
       render();
+      await connectRepoFlow({ reason: 'Choose a repo to Publish to.', defaultPullNow: false });
       return;
     }
 
@@ -528,50 +1073,84 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
     syncError = null;
     render();
 
-    let token = getEffectivePatForRepo(repo);
-    if (!token) {
+    const okAuth = await ensureSignedInFlow({ reason: 'Sign in required to Publish your annotations.' });
+    if (!okAuth) {
       syncBusy = false;
-      syncError = 'Token required to push.';
       render();
-      const result = await connectRepoFlow({
-        requireToken: true,
-        reason: 'A fine-grained PAT is required to push your file.',
-        initialOwnerRepo: repo,
-        defaultPullNow: false
-      });
-      token = result?.token || getEffectivePatForRepo(repo);
-      if (!token) return;
-
-      // Resume after successful token entry.
-      syncBusy = true;
-      syncError = null;
-      render();
+      return;
     }
 
-    const trackerId = notifications.loading(`Pushing your annotations to ${repo}...`, { category: 'annotation' });
+    const trackerId = notifications.loading(`Publishing your annotations to ${repo}...`, { category: 'annotation' });
 
     try {
-      const sync = getGitHubSyncForDataset({ datasetId, tokenOverride: token });
+      session.setCacheContext?.({ datasetId, repoRef: repo, username: cacheUser });
+      const sync = getGitHubSyncForDataset({ datasetId, username: cacheUser });
       if (!sync) throw new Error('Invalid annotation repo');
       // Ensure branch/config resolves early with auth.
-      await sync.validateAndLoadConfig({ datasetId });
-
-      const profile = session.getProfile();
-      if (!profile?.username || profile.username === 'local') {
-        const me = await sync.getAuthenticatedUser();
-        const login = String(me?.login || '').trim();
-        if (login) session.setProfile({ ...profile, username: login });
+      const { repoInfo } = await sync.validateAndLoadConfig({ datasetId });
+      lastRepoInfo = repoInfo || null;
+      access.setRoleFromRepoInfo(lastRepoInfo);
+      const resolvedRepoRef = ensureRepoRefHasBranch(repo, sync.branch);
+      if (resolvedRepoRef && resolvedRepoRef !== repo) {
+        setAnnotationRepoForDataset(datasetId, resolvedRepoRef, cacheUser);
+        setUrlAnnotationRepo(resolvedRepoRef);
+        session.setCacheContext?.({ datasetId, repoRef: resolvedRepoRef, username: cacheUser });
       }
 
-      const updatedProfile = session.getProfile();
-      if (!updatedProfile?.username || updatedProfile.username === 'local') {
-        throw new Error('Set your handle (GitHub username) before pushing.');
+      const okIdentity = await ensureIdentityForPush({ sync });
+      if (!okIdentity) {
+        throw new Error('Unable to determine your GitHub username.');
       }
+
+      const publishAuthorExtras = async () => {
+        if (!access.isAuthor()) return { configUpdated: false, mergesPublished: false, errors: [] };
+        /** @type {string[]} */
+        const errors = [];
+        let configUpdated = false;
+        let mergesPublished = false;
+
+        try {
+          const fieldsToAnnotate = session.getAnnotatedFields?.() || [];
+          await sync.updateDatasetFieldsToAnnotate({ datasetId, fieldsToAnnotate });
+          configUpdated = true;
+        } catch (err) {
+          errors.push(err?.message || 'Failed to publish annotatable columns');
+        }
+
+        try {
+          const merges = session.getModerationMerges?.() || [];
+          if (Array.isArray(merges) && merges.length) {
+            const res = await sync.pushModerationMerges({ mergesDoc: session.buildModerationMergesDocument() });
+            if (res?.path && res?.sha) session.setRemoteFileSha?.(res.path, res.sha);
+            mergesPublished = true;
+          }
+        } catch (err) {
+          errors.push(err?.message || 'Failed to publish merges');
+        }
+
+        return { configUpdated, mergesPublished, errors };
+      };
 
       const doc = session.buildUserFileDocument();
       const lastSyncAt = session.getStateSnapshot()?.lastSyncAt || null;
       try {
-        await sync.pushMyUserFile({ userDoc: doc, conflictIfRemoteNewerThan: lastSyncAt });
+        const result = await sync.pushMyUserFile({ userDoc: doc, conflictIfRemoteNewerThan: lastSyncAt });
+        session.markSyncedNow();
+        if (result?.mode === 'push' && result?.path && result?.sha) session.setRemoteFileSha?.(result.path, result.sha);
+        if (result?.mode === 'pr') {
+          const prUrl = String(result?.prUrl || '').trim();
+          notifications.complete(trackerId, prUrl ? `Opened Pull Request: ${prUrl}` : 'Opened Pull Request');
+        } else {
+          const extras = await publishAuthorExtras();
+          const bits = ['Published your votes/suggestions'];
+          if (extras.configUpdated) bits.push('updated annotatable columns');
+          if (extras.mergesPublished) bits.push('published merges');
+          notifications.complete(trackerId, bits.join(' • '));
+          if (extras.errors.length) {
+            notifications.error(`Author publish extras: ${extras.errors.join(' • ')}`, { category: 'annotation', duration: 6000 });
+          }
+        }
+        return;
       } catch (err) {
         if (err?.code === 'COMMUNITY_ANNOTATION_CONFLICT') {
           const ok = await confirmAsync({
@@ -582,30 +1161,36 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
               `Recommendation: Pull first to merge changes. Overwrite anyway?`,
             confirmText: 'Overwrite remote'
           });
-          if (!ok) throw new Error('Push cancelled.');
-          await sync.pushMyUserFile({ userDoc: doc, force: true });
+          if (!ok) throw new Error('Publish cancelled.');
+          const result = await sync.pushMyUserFile({ userDoc: doc, force: true });
+          session.markSyncedNow();
+          if (result?.mode === 'push' && result?.path && result?.sha) session.setRemoteFileSha?.(result.path, result.sha);
+          if (result?.mode === 'pr') {
+            const prUrl = String(result?.prUrl || '').trim();
+            notifications.complete(trackerId, prUrl ? `Opened Pull Request: ${prUrl}` : 'Opened Pull Request');
+          } else {
+            const extras = await publishAuthorExtras();
+            const bits = ['Published your votes/suggestions'];
+            if (extras.configUpdated) bits.push('updated annotatable columns');
+            if (extras.mergesPublished) bits.push('published merges');
+            notifications.complete(trackerId, bits.join(' • '));
+            if (extras.errors.length) {
+              notifications.error(`Author publish extras: ${extras.errors.join(' • ')}`, { category: 'annotation', duration: 6000 });
+            }
+          }
+          return;
         } else {
           throw err;
         }
       }
-      session.markSyncedNow();
-      notifications.complete(trackerId, 'Pushed your votes/suggestions');
     } catch (err) {
-      const msg = err?.message || 'Push failed';
+      const msg = err?.message || 'Publish failed';
       if (isAuthError(err)) {
+        githubAuth.signOut?.();
+        syncError = `${msg} (sign in again)`;
+      } else {
         syncError = msg;
-        notifications.fail(trackerId, msg);
-        syncBusy = false;
-        render();
-        await connectRepoFlow({
-          requireToken: true,
-          reason: msg,
-          initialOwnerRepo: repo,
-          defaultPullNow: false
-        });
-        return;
       }
-      syncError = msg;
       notifications.fail(trackerId, msg);
     } finally {
       syncBusy = false;
@@ -616,18 +1201,40 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
   function render() {
     container.innerHTML = '';
 
-    const hint = el('div', {
-      className: 'legend-help',
-      text: 'Offline-first voting. Right-click the categorical dropdown to enable/disable fields.'
-    });
-    container.appendChild(hint);
+    const introBlock = el('div', { className: 'control-block relative' });
+    const introInfo = createInfoTooltip([
+      'Offline-first: votes/suggestions are saved locally first.',
+      'Annotatable columns are chosen by repo authors (maintain/admin) via the annotation repo config.',
+      'GitHub sync is optional: sign in to Pull/Publish.'
+    ]);
+    introBlock.appendChild(el('label', { className: 'd-flex items-center gap-1' }, [
+      'Community voting',
+      introInfo.btn
+    ]));
+    introBlock.appendChild(introInfo.tooltip);
+    introBlock.appendChild(el('div', { className: 'legend-help', text: 'Votes and suggestions are saved locally; GitHub sync is optional.' }));
+    container.appendChild(introBlock);
 
     // GitHub sync
     const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
-    const repo = getAnnotationRepoForDataset(datasetId);
+    const cacheUsername = getCacheUsername();
+    const repo = getAnnotationRepoForDataset(datasetId, cacheUsername);
+    const repoConnectedForGating = Boolean(repo) || isSimulateRepoConnectedEnabled();
     const online = typeof navigator !== 'undefined' ? navigator.onLine !== false : true;
-    const syncBlock = el('div', { className: 'control-block' });
-    syncBlock.appendChild(el('label', { text: 'GitHub sync (PAT):' }));
+    const isAuthed = Boolean(githubAuth.isAuthenticated?.());
+    const authedUser = githubAuth.getUser?.() || null;
+    const login = normalizeGitHubUsername(authedUser?.login || '');
+    const syncBlock = el('div', { className: 'control-block relative' });
+    const syncInfo = createInfoTooltip([
+      'Sign in: authenticate via GitHub App (token stored in sessionStorage; cleared on tab close).',
+      'Manage access: install the app on more repos, or revoke it in GitHub settings.',
+      'Choose repo: pick from repos where the app is installed for you (no manual entry).',
+      'Pull: fetch latest `annotations/users/*.json` from GitHub and merge locally.',
+      'Publish: push your `annotations/users/{you}.json` (direct push if allowed, otherwise a fork + PR).',
+      'Author tools require maintain/admin (not just write).'
+    ]);
+    syncBlock.appendChild(el('label', { className: 'd-flex items-center gap-1' }, ['GitHub sync', syncInfo.btn]));
+    syncBlock.appendChild(syncInfo.tooltip);
 
     const repoLine = el('div', {
       className: 'legend-help',
@@ -635,14 +1242,19 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
     });
     syncBlock.appendChild(repoLine);
 
-    const syncHelp = el('div', {
-      className: 'community-annotation-inline-help',
-      text:
-        'Connect an annotation repo (annotations/config.json + annotations/users/). ' +
-        'For private repos and Push, use a fine-grained PAT (Contents: read/write). ' +
-        'Tokens are kept in-memory unless you explicitly choose to save them in this browser.'
-    });
-    syncBlock.appendChild(syncHelp);
+    const userRow = el('div', { className: 'community-annotation-github-user' });
+    if (isAuthed && authedUser?.avatar_url) {
+      userRow.appendChild(el('img', {
+        className: 'community-annotation-github-avatar',
+        src: String(authedUser.avatar_url),
+        alt: login ? `@${login}` : 'GitHub user'
+      }));
+    }
+    userRow.appendChild(el('div', {
+      className: 'legend-help',
+      text: isAuthed ? (login ? `Signed in as @${login}` : 'Signed in') : 'Not signed in'
+    }));
+    syncBlock.appendChild(userRow);
 
     if (!online) {
       syncBlock.appendChild(el('div', { className: 'legend-help', text: 'Offline: GitHub actions are disabled.' }));
@@ -651,121 +1263,169 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
     const lastSync = session.getStateSnapshot()?.lastSyncAt || null;
     syncBlock.appendChild(el('div', { className: 'legend-help', text: `Last sync: ${formatTimeLabel(lastSync)}` }));
 
+    const role = access.getEffectiveRole();
+    const roleLabel =
+      role === 'author'
+        ? 'Access: Author (maintain/admin)'
+        : role === 'annotator'
+          ? 'Access: Annotator (contributors)'
+          : 'Access: Unknown (Pull to detect permissions)';
+    syncBlock.appendChild(el('div', { className: 'legend-help', text: roleLabel }));
+
+    const perms = lastRepoInfo?.permissions || null;
+    const canDirectPush = perms ? Boolean(perms.push || perms.maintain || perms.admin) : null;
+    if (canDirectPush != null) {
+      syncBlock.appendChild(el('div', { className: 'legend-help', text: `Publish mode: ${canDirectPush ? 'Direct push' : 'Fork + Pull Request'}` }));
+    }
+
     if (syncError) {
       syncBlock.appendChild(el('div', { className: 'legend-help', text: `⚠ ${syncError}` }));
     }
 
     const syncActions = el('div', { className: 'community-annotation-sync-actions' });
-    const connectBtn = el('button', { type: 'button', className: 'btn-small', text: repo ? 'Change repo' : 'Connect repo' });
+    const signInOutBtn = el('button', { type: 'button', className: 'btn-small', text: isAuthed ? 'Sign out' : 'Sign in' });
+    const manageBtn = el('button', { type: 'button', className: 'btn-small', text: 'Manage access' });
+    const connectBtn = el('button', { type: 'button', className: 'btn-small', text: repo ? 'Change repo' : 'Choose repo' });
     const disconnectBtn = el('button', { type: 'button', className: 'btn-small', text: 'Disconnect' });
     const pullBtn = el('button', { type: 'button', className: 'btn-small', text: syncBusy ? 'Working...' : 'Pull' });
-    const pushBtn = el('button', { type: 'button', className: 'btn-small', text: syncBusy ? 'Working...' : 'Push' });
+    const publishBtn = el('button', { type: 'button', className: 'btn-small', text: syncBusy ? 'Working...' : 'Publish' });
+
+    syncActions.appendChild(signInOutBtn);
+    syncActions.appendChild(manageBtn);
     syncActions.appendChild(connectBtn);
     syncActions.appendChild(disconnectBtn);
     syncActions.appendChild(pullBtn);
-    syncActions.appendChild(pushBtn);
+    syncActions.appendChild(publishBtn);
 
+    // In dev mode with _simulate_repo_connected, allow buttons without actual repo/auth
+    const devBypassAuth = repoConnectedForGating && !repo;
+
+    signInOutBtn.disabled = syncBusy || !online;
+    manageBtn.disabled = syncBusy || !online;
+    connectBtn.disabled = syncBusy || !online;
     disconnectBtn.disabled = !repo || syncBusy;
-    pullBtn.disabled = !repo || syncBusy || !online;
-    pushBtn.disabled = !repo || syncBusy || !online;
+    pullBtn.disabled = !repoConnectedForGating || (!isAuthed && !devBypassAuth) || syncBusy || !online;
+    publishBtn.disabled = !repoConnectedForGating || (!isAuthed && !devBypassAuth) || syncBusy || !online;
 
-    connectBtn.title = 'Connect an annotation repo (owner/repo or owner/repo@branch).';
-    disconnectBtn.title = repo ? 'Disconnect this dataset from the annotation repo.' : 'Connect a repo first.';
-    pullBtn.title = !repo ? 'Connect a repo first.' : (!online ? 'Offline.' : 'Fetch latest user files from GitHub and merge into your session.');
-    pushBtn.title = !repo ? 'Connect a repo first.' : (!online ? 'Offline.' : 'Upload your user file to GitHub (requires PAT + write access).');
+    signInOutBtn.title = isAuthed ? 'Clear session token and sign out.' : 'Sign in with GitHub App authentication.';
+    manageBtn.title = 'Install the app on more repos, or revoke access.';
+    connectBtn.title = 'Choose a repo where the app is installed.';
+    disconnectBtn.title = repo ? 'Disconnect this dataset from the annotation repo.' : 'Choose a repo first.';
+    pullBtn.title = devBypassAuth
+      ? 'Dev mode: simulated repo connected.'
+      : (!repoConnectedForGating ? 'Choose a repo first.' : (!online ? 'Offline.' : (!isAuthed ? 'Sign in first.' : 'Fetch latest user files from GitHub and merge into your session.')));
+    publishBtn.title = devBypassAuth
+      ? 'Dev mode: simulated repo connected.'
+      : (!repoConnectedForGating
+        ? 'Choose a repo first.'
+        : (!online
+          ? 'Offline.'
+          : (!isAuthed
+            ? 'Sign in first.'
+            : 'Publish pushes directly if you have write access; otherwise it creates a Pull Request from your fork.')));
 
-    connectBtn.addEventListener('click', () => connectRepoFlow({ requireToken: false }));
+    signInOutBtn.addEventListener('click', async () => {
+      if (isAuthed) {
+        const ok = await confirmAsync({
+          title: 'Sign out?',
+          message: 'This clears your session token (you can sign in again anytime).',
+          confirmText: 'Sign out'
+        });
+        if (!ok) return;
+        githubAuth.signOut?.();
+        render();
+        return;
+      }
+      await ensureSignedInFlow({ reason: null });
+      render();
+    });
+
+    manageBtn.addEventListener('click', () => manageGitHubAccessFlow());
+    connectBtn.addEventListener('click', () => connectRepoFlow({ reason: null, defaultPullNow: false }));
     disconnectBtn.addEventListener('click', () => {
-      clearAnnotationRepoForDataset(datasetId);
-      if (repo) clearSessionPatForRepo(repo);
+      clearAnnotationRepoForDataset(datasetId, cacheUsername);
       if (repo) setUrlAnnotationRepo(null);
       syncError = null;
+      session.setCacheContext?.({ datasetId, repoRef: null, username: cacheUsername });
       render();
     });
     pullBtn.addEventListener('click', () => pullFromGitHub());
-    pushBtn.addEventListener('click', () => pushToGitHub());
-
+    publishBtn.addEventListener('click', () => pushToGitHub());
     syncBlock.appendChild(syncActions);
 
-    const consensusBlock = el('div', { className: 'control-block' });
-    consensusBlock.appendChild(el('label', { text: 'Consensus column key:' }));
-    const consensusKeyInput = el('input', { type: 'text', className: 'obs-select community-annotation-input', value: consensusColumnKey });
-    consensusKeyInput.addEventListener('change', () => {
-      consensusColumnKey = String(consensusKeyInput.value || '').trim() || 'community_cell_type';
-      consensusKeyInput.value = consensusColumnKey;
-    });
-    consensusBlock.appendChild(consensusKeyInput);
-    const applyBtn = el('button', { type: 'button', className: 'btn-small', text: 'Apply consensus to dataset' });
-    applyBtn.disabled = syncBusy;
-    applyBtn.addEventListener('click', () => applyConsensusColumn());
-    consensusBlock.appendChild(applyBtn);
-    consensusBlock.appendChild(el('div', {
-      className: 'community-annotation-inline-help',
-      text: 'Creates/updates a derived categorical obs column based on current consensus status (Consensus/Disputed/Pending).'
-    }));
+    const consensusBlock = el('div', { className: 'control-block relative' });
 
-    container.appendChild(syncBlock);
-    container.appendChild(consensusBlock);
-
-    // Profile
-    const profile = session.getProfile();
-    const profileBlock = el('div', { className: 'control-block' });
-    profileBlock.appendChild(el('label', { text: 'Your handle:' }));
-    const usernameInput = el('input', {
-      type: 'text',
-      className: 'obs-select community-annotation-input',
-      value: profile.username || 'local',
-      placeholder: 'local'
-    });
-    usernameInput.addEventListener('change', () => {
-      const next = String(usernameInput.value || '').trim() || 'local';
-      session.setProfile({ ...profile, username: next });
-      notifications.success(`Using @${next}`, { category: 'annotation', duration: 2000 });
-    });
-    profileBlock.appendChild(usernameInput);
-    container.appendChild(profileBlock);
-
-    // Controls: annotated field selector
-    const annotated = session.getAnnotatedFields();
-    const fields = (state.getFields?.() || []).filter((f) => f?.kind === 'category');
-    const availableKeys = new Set(fields.map((f) => f.key));
-    const eligible = annotated.filter((k) => availableKeys.has(k));
-
-    const fieldBlock = el('div', { className: 'control-block' });
-    fieldBlock.appendChild(el('label', { text: 'Annotating field:' }));
-    const select = el('select', { className: 'obs-select' });
-    select.appendChild(el('option', { value: '', text: eligible.length ? '(select)' : '(none enabled)' }));
-    for (const key of eligible) {
-      select.appendChild(el('option', { value: key, text: key }));
+    const catFieldsForConsensus = (state.getFields?.() || []).filter((f) => f?.kind === 'category' && f?._isDeleted !== true);
+    const allKeysForConsensus = catFieldsForConsensus.map((f) => f.key).filter(Boolean);
+    const annotatableKeysForConsensus = session.getAnnotatedFields().filter((k) => allKeysForConsensus.includes(k));
+    if (!consensusSourceFieldKey || !annotatableKeysForConsensus.includes(consensusSourceFieldKey)) {
+      consensusSourceFieldKey = annotatableKeysForConsensus[0] || null;
     }
-    if (selectedFieldKey && eligible.includes(selectedFieldKey)) select.value = selectedFieldKey;
-    else if (eligible.length === 1) select.value = eligible[0];
 
-    select.addEventListener('change', () => {
-      selectedFieldKey = select.value || null;
-      render();
-    });
-    fieldBlock.appendChild(select);
+    const accordion = el('div', { className: 'analysis-accordion' });
+    const item = el('div', { className: `analysis-accordion-item${consensusAccordionOpen ? ' open' : ''}` });
+    const header = el('div', {
+      className: 'analysis-accordion-header',
+      role: 'button',
+      tabIndex: '0',
+      'aria-expanded': String(consensusAccordionOpen)
+    }, [
+      el('span', { className: 'analysis-accordion-title', text: 'CONSENSUS COLUMN KEY' }),
+      el('span', { className: 'analysis-accordion-desc', text: 'Threshold, min annotators, and source column' }),
+      el('span', { className: 'analysis-accordion-chevron', 'aria-hidden': 'true' })
+    ]);
+    const content = el('div', { className: 'analysis-accordion-content' });
 
-    const active = state.getActiveField?.() || null;
-    const enableBtn = el('button', {
-      type: 'button',
-      className: 'btn-small',
-      text: active?.kind === 'category' ? 'Enable for active categorical field' : 'Select a categorical field first',
+    const toggleOpen = () => {
+      consensusAccordionOpen = !consensusAccordionOpen;
+      item.classList.toggle('open', consensusAccordionOpen);
+      header.setAttribute('aria-expanded', String(consensusAccordionOpen));
+    };
+    header.addEventListener('click', () => toggleOpen());
+    header.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        toggleOpen();
+      }
     });
-    enableBtn.disabled = !(active?.kind === 'category' && active?.key);
-    enableBtn.addEventListener('click', () => {
-      if (!(active?.kind === 'category' && active?.key)) return;
-      session.setFieldAnnotated(active.key, true);
-      selectedFieldKey = active.key;
-      notifications.success(`Enabled annotation for "${active.key}"`, { category: 'annotation', duration: 2500 });
-    });
-    fieldBlock.appendChild(enableBtn);
-    container.appendChild(fieldBlock);
 
-    // Consensus settings
-    const settings = el('div', { className: 'control-block community-annotation-settings' });
-    settings.appendChild(el('label', { text: 'Consensus threshold:' }));
+    // Source annotatable column selector
+    const srcWrap = el('div', { className: 'field-select' });
+    const consensusInfo = createInfoTooltip([
+      'Builds a derived categorical obs column based on current community consensus.',
+      'Choose which annotatable column to summarize; then apply to create/update a new obs column.',
+      'Each cluster becomes: a consensus label, Disputed, or Pending.'
+    ]);
+    srcWrap.appendChild(el('label', { className: 'd-flex items-center gap-1' }, ['Annotatable column:', consensusInfo.btn]));
+    srcWrap.appendChild(consensusInfo.tooltip);
+    const srcSelect = el('select', { className: 'obs-select' });
+    if (!annotatableKeysForConsensus.length) {
+      srcSelect.appendChild(el('option', { value: '', text: '(no annotatable columns)' }));
+      srcSelect.disabled = true;
+    } else {
+      for (const k of annotatableKeysForConsensus) srcSelect.appendChild(el('option', { value: k, text: k }));
+      srcSelect.value = consensusSourceFieldKey || annotatableKeysForConsensus[0];
+      srcSelect.addEventListener('change', () => {
+        consensusSourceFieldKey = toCleanString(srcSelect.value) || null;
+        render();
+      });
+    }
+    srcWrap.appendChild(srcSelect);
+    content.appendChild(srcWrap);
+
+    // Consensus column key
+    const consensusKeyWrap = el('div', { className: 'field-select' });
+    consensusKeyWrap.appendChild(el('label', { text: 'Consensus column key:' }));
+    const consensusKeyInput = el('input', { type: 'text', className: 'community-annotation-text-input community-annotation-input', placeholder: 'community_cell_type' });
+    consensusKeyInput.addEventListener('change', () => {
+      consensusColumnKey = String(consensusKeyInput.value || '').trim();
+    });
+    consensusKeyWrap.appendChild(consensusKeyInput);
+    content.appendChild(consensusKeyWrap);
+
+    // Consensus threshold + min annotators
+    const consensusSettings = el('div', { className: 'control-block community-annotation-settings' });
+    const thresholdLabel = el('label', { text: 'Consensus threshold:' });
     const thresholdInput = el('input', {
       type: 'range',
       min: '0.5',
@@ -777,177 +1437,217 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
     thresholdInput.addEventListener('input', () => {
       consensusThreshold = Number(thresholdInput.value);
       thresholdDisplay.textContent = formatPct01(consensusThreshold);
-      render();
     });
     const thresholdRow = el('div', { className: 'slider-row' }, [thresholdInput, thresholdDisplay]);
-    settings.appendChild(thresholdRow);
+    consensusSettings.appendChild(thresholdLabel);
+    consensusSettings.appendChild(thresholdRow);
 
-    settings.appendChild(el('label', { text: 'Min annotators:' }));
-    const minInput = el('input', { type: 'number', className: 'obs-select', value: String(minAnnotators), min: '1', max: '50', step: '1' });
+    const minLabel = el('label', { text: 'Min annotators:' });
+    const minInput = el('input', {
+      type: 'number',
+      className: 'obs-select',
+      value: String(minAnnotators),
+      min: '1',
+      max: '50',
+      step: '1'
+    });
     minInput.addEventListener('change', () => {
       minAnnotators = clampInt(Number(minInput.value), 1, 50);
       minInput.value = String(minAnnotators);
+    });
+    consensusSettings.appendChild(minLabel);
+    consensusSettings.appendChild(minInput);
+    content.appendChild(consensusSettings);
+
+    const applyActions = el('div', { className: 'community-annotation-consensus-actions' });
+    const applyBtn = el('button', { type: 'button', className: 'btn-small', text: 'Apply' });
+    applyBtn.disabled = syncBusy || !consensusSourceFieldKey;
+    applyBtn.addEventListener('click', () => applyConsensusColumn());
+    applyActions.appendChild(applyBtn);
+    content.appendChild(applyActions);
+
+    item.appendChild(header);
+    item.appendChild(content);
+    accordion.appendChild(item);
+    consensusBlock.appendChild(accordion);
+
+    container.appendChild(syncBlock);
+
+    // Profile (asked once per GitHub username; editable)
+    const profile = session.getProfile();
+    const identityBlock = el('div', { className: 'control-block relative' });
+    const identityInfo = createInfoTooltip([
+      'Profile fields are optional and saved locally (like votes) until you Publish.',
+      'Publish writes them into your GitHub user file; Pull reloads them from GitHub.',
+      'Your GitHub username comes from sign-in and cannot be edited here.'
+    ]);
+    identityBlock.appendChild(el('label', { className: 'd-flex items-center gap-1' }, ['Profile (optional)', identityInfo.btn]));
+    identityBlock.appendChild(identityInfo.tooltip);
+
+    const authedLogin = getGitHubLogin();
+    const canEdit = Boolean(githubAuth.isAuthenticated?.() && authedLogin);
+    const identityText = canEdit
+      ? session.formatUserAttribution(authedLogin)
+      : 'Sign in with GitHub to set your identity and publish.';
+    identityBlock.appendChild(el('div', { className: 'legend-help', text: identityText }));
+
+    const identityActions = el('div', { className: 'community-annotation-identity-actions' });
+    const editBtn = el('button', { type: 'button', className: 'btn-small', text: 'Edit' });
+    const clearBtn = el('button', { type: 'button', className: 'btn-small', text: 'Clear' });
+    identityActions.appendChild(editBtn);
+    identityActions.appendChild(clearBtn);
+    identityBlock.appendChild(identityActions);
+
+    editBtn.disabled = !canEdit || syncBusy;
+    clearBtn.disabled = !canEdit || syncBusy;
+    editBtn.title = editBtn.disabled ? 'Sign in first.' : 'Edit your attribution info (published in your GitHub user file).';
+    clearBtn.title = clearBtn.disabled ? 'Sign in first.' : 'Clear your profile fields (Publish to update GitHub).';
+
+    editBtn.addEventListener('click', async () => {
+      if (!canEdit) return;
+      await ensureIdentityForUsername({ username: authedLogin, promptIfMissing: false });
+      await editIdentityFlow({ suggestedUsername: authedLogin });
       render();
     });
-    settings.appendChild(minInput);
-    container.appendChild(settings);
 
-    if (!selectedFieldKey) {
-      const empty = el('div', { className: 'legend-help', text: 'Enable at least one categorical field to begin.' });
-      container.appendChild(empty);
-      return;
-    }
-
-    const field = findCategoricalFieldByKey(state, selectedFieldKey);
-    if (!field) {
-      container.appendChild(el('div', { className: 'legend-help', text: 'Selected field not available in this dataset.' }));
-      return;
-    }
-
-    const categories = field.categories || [];
-    const progress = computeProgress(session, selectedFieldKey, categories);
-
-    const progressRow = el('div', { className: 'community-annotation-progress' });
-    progressRow.appendChild(el('div', { className: 'community-annotation-progress-label', text: `Progress: ${progress.done}/${progress.total}` }));
-    const bar = el('div', { className: 'community-annotation-progress-bar' });
-    const fill = el('div', { className: 'community-annotation-progress-fill' });
-    const pct = progress.total > 0 ? progress.done / progress.total : 0;
-    fill.style.width = `${Math.round(pct * 100)}%`;
-    bar.appendChild(fill);
-    progressRow.appendChild(bar);
-    container.appendChild(progressRow);
-
-    // Cluster list
-    const list = el('div', { className: 'community-annotation-cluster-list' });
-    for (let catIdx = 0; catIdx < categories.length; catIdx++) {
-      const catLabel = String(categories[catIdx] ?? `cluster_${catIdx}`);
-      const consensus = session.computeConsensus(selectedFieldKey, catIdx, { minAnnotators, threshold: consensusThreshold });
-
-      const row = el('div', { className: 'community-annotation-cluster-row' });
-      row.appendChild(el('div', { className: 'community-annotation-cluster-name', text: catLabel }));
-
-      const statusText =
-        consensus.status === 'consensus'
-          ? `${consensus.label || 'Consensus'} ✓`
-          : consensus.status === 'disputed'
-            ? 'Disputed ⚠'
-            : 'Pending';
-      row.appendChild(el('div', { className: `community-annotation-cluster-status status-${consensus.status}`, text: statusText }));
-
-      const meta = el('div', {
-        className: 'community-annotation-cluster-meta',
-        text: `net ${consensus.netVotes} • voters ${consensus.voters}`
+    clearBtn.addEventListener('click', async () => {
+      if (!canEdit) return;
+      const ok = await confirmAsync({
+        title: 'Clear profile?',
+        message: `Clear your profile fields for @${authedLogin} in this session?\n\nPublish to update your GitHub user file.`,
+        confirmText: 'Clear'
       });
-      row.appendChild(meta);
+      if (!ok) return;
+      session.setProfile({ ...profile, username: authedLogin, displayName: '', title: '', orcid: '' });
+      render();
+    });
 
-      const manageBtn = el('button', { type: 'button', className: 'btn-small', text: 'Vote' });
-      manageBtn.addEventListener('click', () => {
-        const title = `${selectedFieldKey} • ${catLabel}`;
-        showClusterModal({
-          title,
-          buildContent: (content) => {
-            const header = el('div', { className: 'legend-help', text: 'Add suggestions and vote. All changes are local-only.' });
-            content.appendChild(header);
+    container.appendChild(identityBlock);
+    container.appendChild(consensusBlock);
 
-            const suggestionsContainer = el('div', { className: 'community-annotation-suggestions' });
-
-            const renderSuggestions = () => {
-              suggestionsContainer.innerHTML = '';
-              const suggestions = session.getSuggestions(selectedFieldKey, catIdx);
-              if (!suggestions.length) {
-                suggestionsContainer.appendChild(el('div', { className: 'legend-help', text: 'No suggestions yet.' }));
-                return;
-              }
-
-              suggestions
-                .slice()
-                .sort((a, b) => ((b.upvotes?.length || 0) - (b.downvotes?.length || 0)) - ((a.upvotes?.length || 0) - (a.downvotes?.length || 0)))
-                .forEach((s) => {
-                  const up = s.upvotes?.length || 0;
-                  const down = s.downvotes?.length || 0;
-                  const net = up - down;
-
-                  const card = el('div', { className: 'community-annotation-suggestion-card' });
-                  const top = el('div', { className: 'community-annotation-suggestion-top' });
-                  top.appendChild(el('div', { className: 'community-annotation-suggestion-label', text: s.label }));
-                  top.appendChild(el('div', { className: 'community-annotation-suggestion-net', text: `net ${net}` }));
-                  card.appendChild(top);
-
-                  if (s.ontologyId) {
-                    card.appendChild(el('div', { className: 'community-annotation-suggestion-ontology', text: s.ontologyId }));
-                  }
-                  if (s.evidence) {
-                    card.appendChild(el('div', { className: 'community-annotation-suggestion-evidence', text: s.evidence }));
-                  }
-
-                  const actions = el('div', { className: 'community-annotation-suggestion-actions' });
-                  const upBtn = el('button', { type: 'button', className: 'btn-small', text: `▲ ${up}` });
-                  const downBtn = el('button', { type: 'button', className: 'btn-small', text: `▼ ${down}` });
-                  upBtn.addEventListener('click', () => session.vote(selectedFieldKey, catIdx, s.id, 'up'));
-                  downBtn.addEventListener('click', () => session.vote(selectedFieldKey, catIdx, s.id, 'down'));
-                  actions.appendChild(upBtn);
-                  actions.appendChild(downBtn);
-                  card.appendChild(actions);
-
-                  const by = el('div', { className: 'legend-help', text: `Proposed by @${s.proposedBy}` });
-                  card.appendChild(by);
-
-                  suggestionsContainer.appendChild(card);
-                });
-            };
-
-            const unsubscribeLocal = session.on('changed', renderSuggestions);
-            renderSuggestions();
-
-            content.appendChild(suggestionsContainer);
-
-            const form = el('div', { className: 'community-annotation-new' });
-            form.appendChild(el('div', { className: 'community-annotation-new-title', text: 'New suggestion' }));
-
-            const labelInput = el('input', { type: 'text', className: 'obs-select community-annotation-input', placeholder: 'Cell type label (required)' });
-            const ontInput = el('input', { type: 'text', className: 'obs-select community-annotation-input', placeholder: 'Ontology id (optional, e.g. CL:0000625)' });
-            const evidenceInput = el('textarea', { className: 'obs-select community-annotation-textarea', placeholder: 'Evidence / reasoning (optional)' });
-            const submitBtn = el('button', { type: 'button', className: 'btn-small', text: 'Submit suggestion' });
-
-            submitBtn.addEventListener('click', () => {
-              try {
-                session.addSuggestion(selectedFieldKey, catIdx, {
-                  label: labelInput.value,
-                  ontologyId: ontInput.value,
-                  evidence: evidenceInput.value
-                });
-                labelInput.value = '';
-                ontInput.value = '';
-                evidenceInput.value = '';
-                notifications.success('Suggestion added', { category: 'annotation', duration: 2000 });
-              } catch (err) {
-                notifications.error(err?.message || 'Failed to add suggestion', { category: 'annotation' });
-              }
-            });
-
-            form.appendChild(labelInput);
-            form.appendChild(ontInput);
-            form.appendChild(evidenceInput);
-            form.appendChild(submitBtn);
-
-            content.appendChild(form);
-
-            // Ensure cleanup if modal removed (best-effort).
-            const observer = new MutationObserver(() => {
-              if (!document.body.contains(content)) {
-                unsubscribeLocal?.();
-                observer.disconnect();
-              }
-            });
-            observer.observe(document.body, { childList: true, subtree: true });
-          }
-        });
-      });
-      row.appendChild(manageBtn);
-
-      list.appendChild(row);
+    // ─────────────────────────────────────────────────────────────────────────
+    // MANAGE ANNOTATION - author-only when connected to a repo
+    // ─────────────────────────────────────────────────────────────────────────
+    const annotated = session.getAnnotatedFields();
+    const catFields = (state.getFields?.() || []).filter((f) => f?.kind === 'category' && f?._isDeleted !== true);
+    const allKeys = catFields.map((f) => f.key).filter(Boolean);
+    if (!selectedFieldKey || !allKeys.includes(selectedFieldKey)) {
+      const active = state.getActiveField?.() || null;
+      selectedFieldKey = active?.kind === 'category' && active?.key ? active.key : (allKeys[0] || null);
     }
-    container.appendChild(list);
+
+    const hasSelection = Boolean(selectedFieldKey);
+    const canManageAnnotatable = hasSelection && (!repoConnectedForGating || access.isAuthor());
+    const showManageSection = !repoConnectedForGating || access.isAuthor();
+
+    if (showManageSection) {
+      const manageBlock = el('div', { className: 'control-block relative' });
+
+      const manageAccordion = el('div', { className: 'analysis-accordion' });
+      const manageItem = el('div', { className: 'analysis-accordion-item' });
+      const manageHeaderBtn = el('div', {
+        className: 'analysis-accordion-header',
+        role: 'button',
+        tabIndex: '0',
+        'aria-expanded': 'false'
+      }, [
+        el('span', { className: 'analysis-accordion-title', text: 'MANAGE ANNOTATION' }),
+        el('span', { className: 'analysis-accordion-desc', text: 'Add/remove columns from annotation (author)' }),
+        el('span', { className: 'analysis-accordion-chevron', 'aria-hidden': 'true' })
+      ]);
+      const manageContent = el('div', { className: 'analysis-accordion-content' });
+
+      const toggleManageOpen = () => {
+        const isOpen = manageItem.classList.toggle('open');
+        manageHeaderBtn.setAttribute('aria-expanded', String(isOpen));
+      };
+      manageHeaderBtn.addEventListener('click', () => toggleManageOpen());
+      manageHeaderBtn.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          toggleManageOpen();
+        }
+      });
+
+      manageContent.appendChild(el('div', {
+        className: 'legend-help',
+        text: 'Add or remove categorical columns from the annotation list. When connected to a repo, only authors can change this.'
+      }));
+
+      // Field selector dropdown
+      const fieldSelectWrap = el('div', { className: 'field-select' });
+      fieldSelectWrap.appendChild(el('label', { text: 'Categorical obs:' }));
+      const fieldSelect = el('select', { className: 'obs-select' });
+      fieldSelect.appendChild(el('option', { value: '', text: allKeys.length ? 'None' : '(no categorical obs fields)' }));
+      for (const key of allKeys) {
+        const enabled = annotated.includes(key);
+        fieldSelect.appendChild(el('option', { value: key, text: enabled ? `🗳️ ${key}` : key }));
+      }
+      if (selectedFieldKey) fieldSelect.value = selectedFieldKey;
+      fieldSelect.addEventListener('change', () => {
+        selectedFieldKey = fieldSelect.value || null;
+        render();
+      });
+      fieldSelectWrap.appendChild(fieldSelect);
+      manageContent.appendChild(fieldSelectWrap);
+
+      const manageActions = el('div', { className: 'community-annotation-consensus-actions', 'aria-label': 'Manage annotation actions' });
+
+      const lockedReason = !hasSelection
+        ? 'Select a categorical obs field first.'
+        : (repoConnectedForGating && !access.isAuthor() ? 'Author (maintain/admin) required.' : '');
+      const addBtn = el('button', { type: 'button', className: 'btn-small', text: 'Add to annotation', title: lockedReason || 'Mark this column as annotatable', disabled: !canManageAnnotatable });
+      const removeBtn = el('button', { type: 'button', className: 'btn-small', text: 'Remove from annotation', title: lockedReason || 'Remove this column from annotation', disabled: !canManageAnnotatable });
+
+      addBtn.addEventListener('click', () => {
+        if (!selectedFieldKey) return;
+        if (repoConnectedForGating && !access.isAuthor()) return;
+        session.setFieldAnnotated(selectedFieldKey, true);
+        notifications.success(`Added "${selectedFieldKey}" as annotation`, { category: 'annotation', duration: 2200 });
+        render();
+      });
+
+      removeBtn.addEventListener('click', () => {
+        if (!selectedFieldKey) return;
+        if (repoConnectedForGating && !access.isAuthor()) return;
+        session.setFieldAnnotated(selectedFieldKey, false);
+        notifications.success(`Removed "${selectedFieldKey}" from annotation`, { category: 'annotation', duration: 2200 });
+        render();
+      });
+
+      manageActions.appendChild(addBtn);
+      manageActions.appendChild(removeBtn);
+      manageContent.appendChild(manageActions);
+
+      manageItem.appendChild(manageHeaderBtn);
+      manageItem.appendChild(manageContent);
+      manageAccordion.appendChild(manageItem);
+      manageBlock.appendChild(manageAccordion);
+      container.appendChild(manageBlock);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Cache management
+    // ─────────────────────────────────────────────────────────────────────────
+    const cacheBlock = el('div', { className: 'control-block' });
+    const cacheRow = el('div', { className: 'community-annotation-consensus-actions', 'aria-label': 'Annotation cache actions' });
+    const clearCacheBtn = el('button', { type: 'button', className: 'btn-small', text: 'Remove local cache' });
+    clearCacheBtn.addEventListener('click', async () => {
+      const ok = await confirmAsync({
+        title: 'Remove local annotation cache?',
+        message: 'This clears local community-annotation data only for the current dataset + repo + branch + user in this browser (votes, suggestions, voting-enabled fields).',
+        confirmText: 'Remove local cache'
+      });
+      if (!ok) return;
+      session.clearLocalCache?.({ keepVotingMode: false });
+      notifications.success('Local annotation cache cleared', { category: 'annotation', duration: 2200 });
+      render();
+    });
+    cacheRow.appendChild(clearCacheBtn);
+    cacheBlock.appendChild(cacheRow);
+    container.appendChild(cacheBlock);
+
+    // Popup handles per-category voting/suggestions; keep the sidebar compact.
   }
 
   render();
