@@ -8,41 +8,13 @@
  */
 
 import { EventEmitter } from '../utils/event-emitter.js';
+import { isLocalDevHost } from '../utils/local-dev.js';
 import { getAnnotationRepoForDataset } from './repo-store.js';
 import { dispatchAnnotationConnectionChanged } from './connection-events.js';
 import { getGitHubAuthSession, toGitHubUserKey } from './github-auth.js';
 
 function toCleanString(value) {
   return String(value ?? '').trim();
-}
-
-function isLocalDevHost() {
-  try {
-    if (typeof window === 'undefined' || typeof window.location === 'undefined') return false;
-    // Explicit dev override (must be set manually in local/dev builds).
-    // This keeps console-only toggles from working in production unless the page opts in.
-    try {
-      const w = /** @type {any} */ (window);
-      if (w?.__CELLUCID_DEV__ === true) return true;
-    } catch {
-      // ignore
-    }
-    const host = String(window.location.hostname || '').toLowerCase();
-    const proto = String(window.location.protocol || '').toLowerCase();
-    if (proto === 'file:') return true;
-    if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '0.0.0.0') return true;
-    if (host.endsWith('.local')) return true;
-    if (/^10\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.test(host)) return true;
-    if (/^192\.168\.(\d{1,3})\.(\d{1,3})$/.test(host)) return true;
-    const m = host.match(/^172\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-    if (m) {
-      const second = Number(m[1]);
-      if (Number.isFinite(second) && second >= 16 && second <= 31) return true;
-    }
-    return false;
-  } catch {
-    return false;
-  }
 }
 
 export function isSimulateRepoConnectedEnabled() {
@@ -135,24 +107,9 @@ export class CommunityAnnotationAccessStore extends EventEmitter {
       if (typeof window === 'undefined') return false;
       const w = /** @type {any} */ (window);
       const self = this;
-      let _cellucidDev = w.__CELLUCID_DEV__ === true;
       let _authorMode = w._author_mode === true;
       let _annotatorMode = !_authorMode && w._annotator_mode === true;
       let _simulateRepoConnected = w._simulate_repo_connected === true;
-
-      // __CELLUCID_DEV__ must also trigger re-render since isLocalDevHost() depends on it
-      Object.defineProperty(w, '__CELLUCID_DEV__', {
-        get() { return _cellucidDev; },
-        set(val) {
-          const next = val === true;
-          if (next === _cellucidDev) return;
-          _cellucidDev = next;
-          self.emit('changed', { role: self.getEffectiveRole() });
-          dispatchAnnotationConnectionChanged({ reason: '__CELLUCID_DEV__' });
-        },
-        configurable: true,
-        enumerable: true
-      });
 
       Object.defineProperty(w, '_author_mode', {
         get() { return _authorMode; },

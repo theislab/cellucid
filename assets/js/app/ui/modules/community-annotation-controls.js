@@ -1096,89 +1096,31 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
     }
   }
 
-  async function manageGitHubAccessFlow() {
-    if (!githubAuth.isAuthenticated?.()) {
-      await ensureSignedInFlow({ reason: 'Sign in to manage GitHub App access.' });
-    }
+  function describeGitHubAuthReachabilityError(err) {
+    const msg = String(err?.message || '').trim();
+    const origin = (() => {
+      try { return String(window.location.origin || '').trim(); } catch { return ''; }
+    })();
+    const looksLikeCors =
+      err instanceof TypeError ||
+      /failed to fetch|load failed/i.test(msg);
+    if (!looksLikeCors) return msg || 'Request failed';
+    return `Couldn’t reach the GitHub sign-in server from ${origin || 'this site'}. If you recently changed domains, update your Cloudflare Worker allowlist (ALLOWED_ORIGINS) to include ${origin || 'this origin'}, then reload.`;
+  }
 
+  async function openGitHubConnectionFlow({
+    mode = 'repo',
+    focus = 'overview',
+    reason = null,
+    datasetId = null,
+    cacheUser = null,
+    login = null,
+    currentRepo = null,
+    defaultPullNow = true
+  } = {}) {
     const appInstallUrl = 'https://github.com/apps/cellucid-community-annotations/installations/new';
     const settingsUrl = 'https://github.com/settings/installations';
 
-    return new Promise((resolve) => {
-      const modalRef = showClusterModal({
-        title: 'GitHub App access',
-        buildContent: (content) => {
-          content.appendChild(el('div', {
-            className: 'legend-help',
-            text: 'Manage which repositories the Cellucid GitHub App can access.'
-          }));
-
-          const status = el('div', { className: 'legend-help', text: '' });
-          content.appendChild(status);
-
-          const actions = el('div', { className: 'community-annotation-suggestion-actions' });
-          const openInstall = el('button', { type: 'button', className: 'btn-small', text: 'Install / add repos…' });
-          const openSettings = el('button', { type: 'button', className: 'btn-small', text: 'GitHub settings…' });
-          actions.appendChild(openInstall);
-          actions.appendChild(openSettings);
-          content.appendChild(actions);
-
-          openInstall.addEventListener('click', () => openExternal(appInstallUrl));
-          openSettings.addEventListener('click', () => openExternal(settingsUrl));
-
-          const list = el('div', { className: 'legend-help', text: '' });
-          content.appendChild(list);
-
-          const load = async () => {
-            list.textContent = '';
-            if (!githubAuth.isAuthenticated?.()) {
-              status.textContent = 'Sign in to view your installations.';
-              return;
-            }
-            status.textContent = 'Loading installations…';
-            try {
-              const data = await githubAuth.listInstallations?.();
-              const installs = Array.isArray(data?.installations) ? data.installations : [];
-              status.textContent = installs.length ? `Installations: ${installs.length}` : 'No installations found.';
-              if (!installs.length) {
-                list.appendChild(el('div', { className: 'legend-help', text: 'Install the app on an account and select repos, then return and refresh.' }));
-                return;
-              }
-              for (const inst of installs.slice(0, 50)) {
-                const account = inst?.account?.login || inst?.account?.name || 'unknown';
-                const row = el('div', { className: 'community-annotation-inline-help', text: `• ${account}` });
-                const url = inst?.html_url || null;
-                if (url) {
-                  const btn = el('button', { type: 'button', className: 'btn-small', text: 'Open' });
-                  btn.addEventListener('click', () => openExternal(url));
-                  row.appendChild(document.createTextNode(' '));
-                  row.appendChild(btn);
-                }
-                list.appendChild(row);
-              }
-            } catch (err) {
-              status.textContent = err?.message || 'Failed to load installations';
-            }
-          };
-
-          load();
-        }
-      });
-
-      const overlay = modalRef?.overlay || null;
-      if (!overlay) return;
-      const observer = new MutationObserver(() => {
-        if (!document.body.contains(overlay)) {
-          observer.disconnect();
-          resolve(null);
-        }
-      });
-      observer.observe(document.body, { childList: true, subtree: true });
-    });
-  }
-
-  async function ensureSignedInFlow({ reason = null } = {}) {
-    if (githubAuth.isAuthenticated?.()) return true;
     return new Promise((resolve) => {
       let resolved = false;
       const resolveOnce = (value) => {
@@ -1188,91 +1130,841 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
       };
 
       const modalRef = showClusterModal({
-        title: 'Sign in with GitHub',
+        title: 'GitHub sync',
         buildContent: (content) => {
-          content.appendChild(el('div', {
-            className: 'legend-help',
-            text:
-              'Cellucid uses a GitHub App sign-in (opens a GitHub window). ' +
-              'Your access token is stored only in sessionStorage (cleared on tab close).'
-          }));
-          if (reason) content.appendChild(el('div', { className: 'legend-help', text: `⚠ ${String(reason)}` }));
+          const modalAbort = new AbortController();
+          try {
+            // Allow outer scope to stop listeners when modal closes.
+            content.__cellucidCleanup = () => modalAbort.abort();
+          } catch {
+            // ignore
+          }
 
-          const status = el('div', { className: 'legend-help', text: '' });
-          content.appendChild(status);
+          const did = datasetId || dataSourceManager?.getCurrentDatasetId?.() || null;
+          const initialUserKey = cacheUser || getCacheUserKey();
+          const getEffectiveUserKey = () => {
+            const key = toGitHubUserKey(githubAuth.getUser?.());
+            return key || initialUserKey || 'local';
+          };
+          const initialRepoRef =
+            currentRepo ||
+            (did ? getAnnotationRepoForDataset(did, getEffectiveUserKey()) : null) ||
+            getUrlAnnotationRepo() ||
+            null;
 
-          const actions = el('div', { className: 'community-annotation-suggestion-actions' });
-          const signInBtn = el('button', { type: 'button', className: 'btn-small', text: 'Sign in with GitHub' });
-          const cancelBtn = el('button', { type: 'button', className: 'btn-small', text: 'Cancel' });
-          actions.appendChild(signInBtn);
-          actions.appendChild(cancelBtn);
-          content.appendChild(actions);
+          let connectedRepoRef = initialRepoRef;
+          let repoListLoaded = false;
+          let installationsLoaded = false;
+          let isReloadingRepos = false;
+          /** @type {{full_name:string, private?:boolean}[]} */
+          let allRepos = [];
+          /** @type {{id?:number|string, html_url?:string, account?:{login?:string,name?:string}}[]} */
+          let installations = [];
+          /** @type {string} */
+          let selectedRepoFullName = '';
 
-          const fallback = el('div', { className: 'community-annotation-inline-help', text: '' });
-          content.appendChild(fallback);
+          const badges = el('div', { className: 'community-annotation-badges' });
+          const datasetBadge = el('div', { className: 'community-annotation-badge', text: '' });
+          const authBadge = el('div', { className: 'community-annotation-badge', text: '' });
+          const repoBadge = el('div', { className: 'community-annotation-badge', text: '' });
+          badges.appendChild(datasetBadge);
+          badges.appendChild(authBadge);
+          badges.appendChild(repoBadge);
+          const badgeActions = el('div', { className: 'community-annotation-badge-actions' });
+          const settingsBtn = el('button', { type: 'button', className: 'btn-small', text: 'GitHub settings' });
+          const disconnectRepoBtn = el('button', { type: 'button', className: 'btn-small', text: 'Disconnect repo' });
+          const disconnectBtn = el('button', { type: 'button', className: 'btn-small', text: 'Disconnect GitHub' });
+          badgeActions.appendChild(settingsBtn);
+          badgeActions.appendChild(disconnectRepoBtn);
+          badgeActions.appendChild(disconnectBtn);
 
-          cancelBtn.addEventListener('click', () => {
-            content.closest('.community-annotation-modal-overlay')?.remove?.();
-            resolveOnce(false);
+          const badgeBar = el('div', { className: 'community-annotation-badgebar' });
+          badgeBar.appendChild(badges);
+          badgeBar.appendChild(badgeActions);
+          content.appendChild(badgeBar);
+
+          const step1Desc = [
+            'This opens a GitHub window to sign you in. ',
+            el('strong', { text: 'Cellucid does not get access to your repositories by default.' }),
+            ' You decide later whether to install the GitHub App and which repositories to enable.'
+          ];
+
+          const stepDefs = [
+            {
+              title: 'Sign in with GitHub',
+              descParts: step1Desc
+            },
+            {
+              title: 'Install the GitHub App (choose repos)',
+              descParts: [
+                'Install the GitHub App on your account/org and select which repositories it can access. ',
+                'Use “Add repo” to open GitHub, then come back and click “Reload”.'
+              ]
+            },
+            {
+              title: 'Select an annotation repository',
+              descParts: [
+                'Pick a repository where the app is installed. ',
+                'This connection is saved locally per dataset (',
+                el('code', { text: String(did || 'default') }),
+                ') and per GitHub account. ',
+                'Cellucid will validate the repo, connect it to this dataset, and pull the latest annotations.'
+              ]
+            },
+            {
+              title: 'Sync (pull / publish)',
+              descParts: [
+                'Use Pull to fetch updates from GitHub. ',
+                'Use Publish to upload your changes (direct push if permitted; otherwise it opens a Pull Request).'
+              ]
+            }
+          ];
+
+          const stepEls = stepDefs.map((s, i) => {
+            const n = i + 1;
+            const node = el('div', { className: 'community-annotation-step', role: 'button', tabIndex: '0', 'data-step': String(n) }, [
+              el('div', { className: 'community-annotation-step-num', text: String(n) }),
+              el('div', { className: 'community-annotation-step-title', text: s.title })
+            ]);
+            return node;
           });
 
-          signInBtn.addEventListener('click', async () => {
-            signInBtn.disabled = true;
-            cancelBtn.disabled = true;
-            fallback.textContent = '';
+          const stepper = el('div', { className: 'community-annotation-stepper' }, stepEls);
+          content.appendChild(stepper);
+
+          const stepIntro = el('div', { className: 'community-annotation-step-intro' });
+          const stepIntroTitle = el('div', { className: 'community-annotation-step-intro-title', text: '' });
+          const stepIntroDesc = el('div', { className: 'community-annotation-step-intro-desc' });
+          stepIntro.appendChild(stepIntroTitle);
+          stepIntro.appendChild(stepIntroDesc);
+          content.appendChild(stepIntro);
+
+          const step1Panel = el('div', { className: 'community-annotation-step-panel' });
+          const step1Help = el('div', { className: 'legend-help', text: '' });
+          step1Panel.appendChild(step1Help);
+          content.appendChild(step1Panel);
+
+          // Step 2: add/refresh repos (no selection).
+          const step2Panel = el('div', { className: 'community-annotation-step-panel' });
+          const step2Actions = el('div', { className: 'community-annotation-suggestion-actions' });
+          const addRepoBtn = el('button', { type: 'button', className: 'btn-small', text: 'Add repo' });
+          const reloadReposBtn = el('button', { type: 'button', className: 'btn-small community-annotation-reload-btn', text: 'Reload' });
+          step2Actions.appendChild(addRepoBtn);
+          step2Actions.appendChild(reloadReposBtn);
+          step2Panel.appendChild(step2Actions);
+
+          const step2Help = el('div', { className: 'legend-help', text: '' });
+          step2Panel.appendChild(step2Help);
+          const repoGridStep2 = el('div', { className: 'community-annotation-repo-grid' });
+          step2Panel.appendChild(repoGridStep2);
+          content.appendChild(step2Panel);
+
+          // Step 3: pick repo (selection + connect).
+          const step3Panel = el('div', { className: 'community-annotation-step-panel' });
+          const step3Help = el('div', { className: 'legend-help', text: 'Select an annotation repository to connect.' });
+          step3Panel.appendChild(step3Help);
+
+          const filterRow = el('div', { className: 'legend-help', text: '' });
+          const filterInput = el('input', {
+            type: 'text',
+            className: 'community-annotation-text-input',
+            autocomplete: 'off',
+            placeholder: 'Filter repositories…',
+            value: ''
+          });
+          filterRow.appendChild(filterInput);
+          step3Panel.appendChild(filterRow);
+
+          const repoGridStep3 = el('div', { className: 'community-annotation-repo-grid' });
+          step3Panel.appendChild(repoGridStep3);
+
+          const step3Selection = el('div', { className: 'legend-help', text: '' });
+          step3Panel.appendChild(step3Selection);
+          content.appendChild(step3Panel);
+
+          const syncBlock = el('div', {});
+          syncBlock.appendChild(el('div', { className: 'legend-help', text: 'Sync' }));
+          const syncActions = el('div', { className: 'community-annotation-suggestion-actions' });
+          const pullBtn = el('button', { type: 'button', className: 'btn-small', text: 'Pull latest' });
+          const publishBtn = el('button', { type: 'button', className: 'btn-small', text: 'Publish' });
+          syncActions.appendChild(pullBtn);
+          syncActions.appendChild(publishBtn);
+          syncBlock.appendChild(syncActions);
+          content.appendChild(syncBlock);
+
+          const status = el('div', {
+            className: 'community-annotation-wizard-status',
+            role: 'status',
+            'aria-live': 'polite',
+            text: String(reason || '')
+          });
+          content.appendChild(status);
+
+          const wizardNav = el('div', { className: 'community-annotation-wizard-nav' });
+          const prevBtn = el('button', { type: 'button', className: 'btn-small community-annotation-wizard-prev', text: 'Back' });
+          const stepCount = el('div', { className: 'community-annotation-wizard-stepcount', text: '' });
+          const nextBtn = el('button', { type: 'button', className: 'btn-small community-annotation-wizard-next', text: 'Next' });
+          wizardNav.appendChild(prevBtn);
+          wizardNav.appendChild(stepCount);
+          wizardNav.appendChild(nextBtn);
+          content.appendChild(wizardNav);
+
+          let isSigningIn = false;
+          let isConnectingRepo = false;
+
+          const toRepoFullName = (repoRef) => String(repoRef || '').split('@')[0].trim();
+
+          const isStepLocked = (step, { authed, connectedName }) => {
+            if (step === 1) return false;
+            if (!authed) return true;
+            if (step === 4) return !connectedName;
+            return false; // steps 2 & 3 unlocked once authed
+          };
+
+          const computeRecommendedStep = ({ authed, connectedName }) => {
+            if (!authed) return 1;
+            if (connectedName) return 4;
+            if (!repoListLoaded || allRepos.length === 0) return 2;
+            return 3;
+          };
+
+          /** @type {number|null} */
+          let uiStep = null;
+          /** @type {number|null} */
+          let lastUiStep = null;
+          let canGoNext = false;
+
+          const setActiveStep = (n) => {
+            const active = Math.max(1, Math.min(4, Number(n) || 1));
+            for (let i = 0; i < stepEls.length; i++) {
+              const elStep = stepEls[i];
+              const isActive = i === active - 1;
+              elStep.classList.toggle('community-annotation-step--active', isActive);
+              if (isActive) elStep.setAttribute('aria-current', 'step');
+              else elStep.removeAttribute('aria-current');
+            }
+          };
+
+          const setStepStates = ({ authed, hasRepos, connectedName }) => {
+            const done = (step) => {
+              if (step === 1) return authed;
+              if (step === 2) return authed && hasRepos;
+              if (step === 3) return Boolean(connectedName);
+              return false;
+            };
+            for (let i = 0; i < stepEls.length; i++) {
+              const step = i + 1;
+              const elStep = stepEls[i];
+              const isLocked = isStepLocked(step, { authed, connectedName });
+              const isDone = done(step);
+              elStep.classList.toggle('community-annotation-step--locked', isLocked);
+              elStep.classList.toggle('community-annotation-step--done', isDone);
+              elStep.setAttribute('aria-disabled', isLocked ? 'true' : 'false');
+              elStep.tabIndex = isLocked ? -1 : 0;
+              const num = elStep.querySelector?.('.community-annotation-step-num') || null;
+              if (num) {
+                const isActive = elStep.classList.contains('community-annotation-step--active');
+                num.textContent = isDone && !isActive ? '✓' : String(step);
+              }
+            }
+          };
+
+          const isTokenAuthFailure = (err) => {
+            if (!err) return false;
+            const statusCode = Number(err?.status);
+            if (statusCode === 401 || statusCode === 403) return true;
+            const msg = String(err?.message || '').toLowerCase();
+            return (
+              msg.includes('bad credentials') ||
+              msg.includes('invalid token') ||
+              msg.includes('requires authentication') ||
+              msg.includes('unauthorized')
+            );
+          };
+
+          const disconnectGitHubSession = ({ message, notify = 'error' } = {}) => {
+            const msg = String(message || 'GitHub disconnected.').trim() || 'GitHub disconnected.';
+            try {
+              githubAuth.signOut?.();
+            } catch {
+              // ignore
+            }
+            repoListLoaded = false;
+            installationsLoaded = false;
+            installations = [];
+            allRepos = [];
+            selectedRepoFullName = '';
+            try { repoGridStep2.innerHTML = ''; } catch { /* ignore */ }
+            try { repoGridStep3.innerHTML = ''; } catch { /* ignore */ }
+            status.textContent = msg;
+            if (notify === 'success') {
+              notifications.success(msg, { category: 'annotation', duration: 2600 });
+            } else {
+              notifications.error(msg, { category: 'annotation', duration: 6000 });
+            }
+            try {
+              render();
+            } catch {
+              // ignore
+            }
+            updateUi();
+          };
+
+          const renderRepoCards = () => {
+            const base = Array.isArray(allRepos) ? allRepos : [];
+            const q = String(filterInput.value || '').trim().toLowerCase();
+            const reposStep2 = base;
+            const reposStep3 = q ? base.filter((r) => String(r.full_name || '').toLowerCase().includes(q)) : base;
+            const connected = toRepoFullName(connectedRepoRef);
+
+            const renderGrid = (grid, { selectable }) => {
+              grid.innerHTML = '';
+              const source = selectable ? reposStep3 : reposStep2;
+              const items = source.slice(0, 300);
+              if (!items.length) {
+                grid.appendChild(el('div', { className: 'legend-help', text: '(no repos found)' }));
+                return;
+              }
+              for (const r of items) {
+                const full = String(r.full_name || '').trim();
+                if (!full) continue;
+                const isConnected = connected && full === connected;
+                const isSelected = selectable && selectedRepoFullName && full === selectedRepoFullName;
+                const cls = [
+                  'community-annotation-repo-card',
+                  isSelected ? 'community-annotation-repo-card--selected' : '',
+                  isConnected ? 'community-annotation-repo-card--connected' : ''
+                ].filter(Boolean).join(' ');
+
+                const card = el('div', { className: cls, role: selectable ? 'button' : undefined, tabIndex: selectable ? '0' : undefined });
+                const title = el('div', { className: 'community-annotation-repo-title', text: full });
+                const metaParts = [r.private ? 'Private' : 'Public'];
+                if (isConnected) metaParts.push('Connected');
+                if (isSelected) metaParts.push('Selected');
+                const meta = el('div', { className: 'community-annotation-repo-meta', text: metaParts.join(' • ') });
+                card.appendChild(title);
+                card.appendChild(meta);
+
+                if (selectable) {
+                  const select = () => {
+                    selectedRepoFullName = full;
+                    updateUi();
+                  };
+                  card.addEventListener('click', select);
+                  card.addEventListener('keydown', (e) => {
+                    if (e.key !== 'Enter' && e.key !== ' ') return;
+                    e.preventDefault();
+                    select();
+                  });
+                } else {
+                  // Convenience: clicking a repo in step 2 jumps to step 3 and preselects it.
+                  card.addEventListener('click', () => {
+                    const authed = Boolean(githubAuth.isAuthenticated?.());
+                    if (!authed) return;
+                    if ((Number(uiStep) || 1) !== 2) return;
+                    if (!canGoNext) return;
+                    selectedRepoFullName = full;
+                    uiStep = 3;
+                    updateUi();
+                  });
+                }
+
+                grid.appendChild(card);
+              }
+            };
+
+            renderGrid(repoGridStep2, { selectable: false });
+            renderGrid(repoGridStep3, { selectable: true });
+          };
+
+          const updateUi = () => {
+            const authed = Boolean(githubAuth.isAuthenticated?.());
+            const user = githubAuth.getUser?.() || null;
+            const who = String(user?.login || '').trim();
+            const effectiveUserKey = getEffectiveUserKey();
+            const repoRef = (did ? getAnnotationRepoForDataset(did, effectiveUserKey) : null) || connectedRepoRef || null;
+            connectedRepoRef = repoRef;
+            const connectedName = toRepoFullName(repoRef);
+
+            if (selectedRepoFullName) {
+              const stillExists = (Array.isArray(allRepos) ? allRepos : []).some((r) => String(r?.full_name || '').trim() === selectedRepoFullName);
+              if (!stillExists) selectedRepoFullName = '';
+            }
+
+            const recommended = computeRecommendedStep({ authed, connectedName });
+            if (uiStep == null) uiStep = recommended;
+            uiStep = Math.max(1, Math.min(4, uiStep));
+            if (isStepLocked(uiStep, { authed, connectedName })) uiStep = recommended;
+            setActiveStep(uiStep);
+            setStepStates({ authed, hasRepos: repoListLoaded && allRepos.length > 0, connectedName });
+
+            if (uiStep !== lastUiStep) {
+              lastUiStep = uiStep;
+              if (authed && uiStep === 2 && !isReloadingRepos) {
+                // Step 2 auto-refreshes repository list.
+                loadRepoList();
+              }
+              if (authed && uiStep === 3 && !repoListLoaded && !isReloadingRepos) {
+                // Step 3 triggers a refresh only if step 2 was skipped.
+                loadRepoList();
+              }
+            }
+
+            datasetBadge.className = 'community-annotation-badge';
+            datasetBadge.textContent = did ? `Dataset: ${did}` : 'Dataset: —';
+
+            authBadge.className = `community-annotation-badge${authed ? ' community-annotation-badge--ok' : ' community-annotation-badge--warn'}`;
+            authBadge.textContent = authed ? (who ? `Signed in as @${who}` : 'Signed in') : 'Not signed in';
+
+            repoBadge.className = `community-annotation-badge${connectedName ? ' community-annotation-badge--ok' : ' community-annotation-badge--warn'}`;
+            repoBadge.textContent = connectedName ? `Repo: ${connectedName}` : 'Repo: not connected';
+
+            const showFilter = repoListLoaded && allRepos.length > 20;
+            filterRow.style.display = authed && uiStep === 3 && showFilter ? '' : 'none';
+
+            addRepoBtn.disabled = !authed;
+            reloadReposBtn.disabled = !authed || isReloadingRepos;
+            reloadReposBtn.setAttribute('data-loading', isReloadingRepos ? 'true' : 'false');
+            reloadReposBtn.textContent = isReloadingRepos ? 'Reloading…' : 'Reload';
+
+            const canSync = Boolean(authed && connectedName && !syncBusy);
+            pullBtn.disabled = !canSync;
+            publishBtn.disabled = !canSync;
+
+            step1Panel.style.display = uiStep === 1 ? '' : 'none';
+            step2Panel.style.display = authed && uiStep === 2 ? '' : 'none';
+            step3Panel.style.display = authed && uiStep === 3 ? '' : 'none';
+            syncBlock.style.display = authed && uiStep === 4 ? '' : 'none';
+            badgeActions.style.display = authed ? '' : 'none';
+            disconnectRepoBtn.style.display = authed && connectedName ? '' : 'none';
+
+            if (uiStep === 1) {
+              step1Help.textContent = authed
+                ? 'You’re already signed in. Click Next to continue.'
+                : 'Click “Continue with GitHub”. If the sign-in window is blocked, allow popups/new tabs for this site and try again.';
+            }
+
+            if (authed && uiStep === 2) {
+              const n = allRepos.length;
+              step2Help.textContent = n
+                ? `${n} repos available. Click a repo to continue, or Add repo to enable more.`
+                : 'No repos available yet. Click Add repo, choose repos in GitHub, then come back (or click Reload).';
+            }
+
+            if (authed && uiStep === 3) {
+              if (isReloadingRepos) {
+                step3Help.textContent = 'Loading repositories…';
+              } else if (repoListLoaded && allRepos.length === 0) {
+                step3Help.textContent = 'No repositories available yet. Go back to step 2 to add repos, then reload.';
+              } else {
+                step3Help.textContent = 'Select an annotation repository to connect.';
+              }
+            }
+
+            if (authed && uiStep === 3) {
+              const selected = String(selectedRepoFullName || '').trim();
+              if (connectedName && selected && selected !== connectedName) {
+                step3Selection.textContent = `Connected: ${connectedName} • Selected: ${selected}`;
+              } else if (connectedName) {
+                step3Selection.textContent = `Connected: ${connectedName}`;
+              }
+              else if (selected) step3Selection.textContent = `Selected: ${selected}`;
+              else step3Selection.textContent = 'Select a repo to continue.';
+            }
+
+            // Step intro content.
+            const def = stepDefs[Math.max(0, Math.min(stepDefs.length - 1, uiStep - 1))] || null;
+            stepIntroTitle.textContent = def?.title || '';
+            stepIntroDesc.innerHTML = '';
+            const parts = Array.isArray(def?.descParts) ? def.descParts : [];
+            for (const part of parts) {
+              if (part == null) continue;
+              stepIntroDesc.appendChild(typeof part === 'string' ? document.createTextNode(part) : part);
+            }
+
+            // Wizard nav.
+            stepCount.textContent = `Step ${uiStep} of ${stepDefs.length}`;
+            const busy = Boolean(isSigningIn || isConnectingRepo || isReloadingRepos || syncBusy);
+            prevBtn.disabled = busy || uiStep <= 1;
+
+            let nextText = 'Next';
+            let nextEnabled = !busy;
+            if (uiStep === 1) {
+              nextText = authed ? 'Next' : (isSigningIn ? 'Opening GitHub…' : 'Continue with GitHub');
+            } else if (uiStep === 2) {
+              nextText = 'Next';
+              nextEnabled = nextEnabled && (Boolean(connectedName) || (repoListLoaded && allRepos.length > 0));
+            } else if (uiStep === 3) {
+              const selected = String(selectedRepoFullName || '').trim();
+              const wantsSwitch = Boolean(connectedName && selected && selected !== connectedName);
+              const needsConnect = Boolean(!connectedName);
+              if (wantsSwitch || needsConnect) {
+                nextText = isConnectingRepo ? (wantsSwitch ? 'Switching…' : 'Connecting…') : (wantsSwitch ? 'Switch repo' : 'Connect');
+                nextEnabled = nextEnabled && Boolean(selected) && (!connectedName || selected !== connectedName);
+              } else {
+                nextText = 'Next';
+              }
+            } else if (uiStep === 4) {
+              nextText = 'Done';
+            }
+
+            nextBtn.textContent = nextText;
+            nextBtn.disabled = !nextEnabled;
+            canGoNext = Boolean(nextEnabled);
+
+            renderRepoCards();
+          };
+
+          const loadRepoList = async () => {
+            if (!githubAuth.isAuthenticated?.()) {
+              repoListLoaded = false;
+              installationsLoaded = false;
+              installations = [];
+              allRepos = [];
+              selectedRepoFullName = '';
+              repoGridStep2.innerHTML = '';
+              repoGridStep3.innerHTML = '';
+              updateUi();
+              return;
+            }
+            isReloadingRepos = true;
+            updateUi();
+            status.textContent = 'Loading repositories…';
+            try {
+              const instData = await githubAuth.listInstallations?.();
+              installations = Array.isArray(instData?.installations) ? instData.installations : [];
+              installationsLoaded = true;
+              if (!installations.length) {
+                repoListLoaded = true;
+                allRepos = [];
+                status.textContent = 'No installations found. Install the app, choose repos, then reload.';
+                return;
+              }
+
+              const repos = [];
+              for (const inst of installations.slice(0, 50)) {
+                const id = inst?.id;
+                if (!id) continue;
+                const repoData = await githubAuth.listInstallationRepos?.(id);
+                const list = Array.isArray(repoData?.repositories) ? repoData.repositories : [];
+                for (const r of list) {
+                  const full = String(r?.full_name || '').trim();
+                  if (!full) continue;
+                  repos.push({ full_name: full, private: Boolean(r?.private) });
+                }
+              }
+
+              const unique = new Map();
+              for (const r of repos) unique.set(r.full_name, r);
+              allRepos = Array.from(unique.values()).sort((a, b) => a.full_name.localeCompare(b.full_name));
+              repoListLoaded = true;
+              status.textContent = allRepos.length ? '' : 'No repositories available yet. Install the app and select repos, then reload.';
+            } catch (err) {
+              repoListLoaded = true;
+              installationsLoaded = true;
+              allRepos = [];
+              if (isTokenAuthFailure(err)) {
+                disconnectGitHubSession({ message: 'GitHub session expired or was revoked. Please connect again.', notify: 'error' });
+                return;
+              }
+              status.textContent = describeGitHubAuthReachabilityError(err);
+            } finally {
+              isReloadingRepos = false;
+              updateUi();
+            }
+          };
+
+          const connectSelectedRepo = async () => {
+            if (!githubAuth.isAuthenticated?.()) {
+              status.textContent = 'Sign in first.';
+              updateUi();
+              return;
+            }
+            if (!did) {
+              status.textContent = 'Missing dataset context.';
+              updateUi();
+              return;
+            }
+            const authedUserKey = toGitHubUserKey(githubAuth.getUser?.());
+            if (!authedUserKey) {
+              status.textContent = 'Missing GitHub user info. Disconnect GitHub and sign in again.';
+              updateUi();
+              return;
+            }
+            const selected = String(selectedRepoFullName || '').trim();
+            const parts = selected.split('/');
+            if (!selected || parts.length !== 2) {
+              status.textContent = 'Select a valid repository.';
+              updateUi();
+              return;
+            }
+
+            status.textContent = 'Validating repository…';
+            isConnectingRepo = true;
+            updateUi();
+            try {
+              const token = githubAuth.getToken?.() || null;
+              const sync = new CommunityAnnotationGitHubSync({
+                datasetId: did,
+                owner: parts[0],
+                repo: parts[1],
+                token,
+                branch: null,
+                workerOrigin: githubAuth.getWorkerOrigin?.() || null
+              });
+              const { repoInfo, config, datasetConfig, datasetId: didResolved } = await sync.validateAndLoadConfig({ datasetId: did });
+              lastRepoInfo = repoInfo || null;
+              access.setRoleFromRepoInfo(lastRepoInfo);
+
+              if (didResolved && Array.isArray(config?.supportedDatasets) && config.supportedDatasets.length && !datasetConfig) {
+                const ok = await confirmAsync({
+                  title: 'Dataset mismatch',
+                  message:
+                    `This repo does not list the current dataset id "${didResolved}" in annotations/config.json.\n\nConnect anyway?`,
+                  confirmText: 'Connect anyway'
+                });
+                if (!ok) {
+                  status.textContent = 'Cancelled.';
+                  updateUi();
+                  return;
+                }
+              }
+
+              const resolvedRepoRef = ensureRepoRefHasBranch(selected, sync.branch);
+              setAnnotationRepoForDataset(did, resolvedRepoRef, authedUserKey);
+              session.setCacheContext?.({ datasetId: did, repoRef: resolvedRepoRef, username: authedUserKey });
+              setUrlAnnotationRepo(resolvedRepoRef);
+              connectedRepoRef = resolvedRepoRef;
+
+              const authedLogin = login || getGitHubLogin() || '';
+              await ensureIdentityForUserKey({ userKey: authedUserKey, login: authedLogin, githubUserId: githubAuth.getUser?.()?.id ?? null, promptIfMissing: true });
+              await loadMyProfileFromGitHub({ datasetId: did });
+
+              // Apply configured fields for this dataset on connect (author-controlled).
+              const configured = new Set(Array.isArray(datasetConfig?.fieldsToAnnotate) ? datasetConfig.fieldsToAnnotate : []);
+              const configSettings = (datasetConfig?.annotatableSettings && typeof datasetConfig.annotatableSettings === 'object')
+                ? datasetConfig.annotatableSettings
+                : null;
+              const configClosed = Array.isArray(datasetConfig?.closedFields) ? datasetConfig.closedFields : [];
+              const catFields = (state.getFields?.() || []).filter((f) => f?.kind === 'category' && f?._isDeleted !== true);
+              const allKeys = catFields.map((f) => f.key).filter(Boolean);
+              for (const key of allKeys) {
+                session.setFieldAnnotated(key, configured.has(key));
+              }
+              if (configSettings && session.setAnnotatableConsensusSettingsMap) {
+                session.setAnnotatableConsensusSettingsMap(configSettings);
+              }
+              session.setClosedAnnotatableFields?.(configClosed);
+
+              render();
+
+              status.textContent = 'Connected. Pulling latest annotations…';
+              await pullFromGitHub({ repoOverride: selected });
+              status.textContent = syncError ? `⚠ ${syncError}` : 'Connected and up to date.';
+              uiStep = 4;
+            } catch (err) {
+              if (isTokenAuthFailure(err)) {
+                disconnectGitHubSession({ message: 'GitHub session expired or was revoked. Please connect again.', notify: 'error' });
+                return;
+              }
+              status.textContent = String(err?.message || 'Failed to connect');
+            } finally {
+              isConnectingRepo = false;
+              updateUi();
+            }
+          };
+
+          const signIn = async () => {
+            if (isSigningIn) return;
+            isSigningIn = true;
             status.textContent = 'Opening GitHub sign-in…';
+            updateUi();
             try {
               await githubAuth.signIn?.({ mode: 'auto' });
               await syncIdentityFromAuth({ promptIfMissing: false });
-              await loadMyProfileFromGitHub({});
-              content.closest('.community-annotation-modal-overlay')?.remove?.();
-              resolveOnce(true);
-            } catch (err) {
-              signInBtn.disabled = false;
-              cancelBtn.disabled = false;
-              const msg = err?.message || 'Sign-in failed';
-              status.textContent = msg;
-              if (err?.code === 'POPUP_BLOCKED') {
-                const link = getGitHubLoginUrl(githubAuth.getWorkerOrigin?.());
-                fallback.textContent = '';
-                fallback.appendChild(el('div', { className: 'legend-help', text: 'If your browser blocks popups/new tabs, allow them for Cellucid and try again.' }));
-                fallback.appendChild(el('div', { className: 'legend-help', text: 'Alternative: click this link (starts sign-in in a new tab):' }));
-                const manualLink = el('a', { href: link, target: '_blank', text: 'Open GitHub sign-in' });
-                manualLink.addEventListener('click', () => {
-                  status.textContent = 'Waiting for GitHub sign-in…';
-                  fallback.textContent = '';
-                  signInBtn.disabled = true;
-                  cancelBtn.disabled = true;
-                  githubAuth.completeSignInFromMessage?.()
-                    .then(() => syncIdentityFromAuth({ promptIfMissing: false }))
-                    .then(() => loadMyProfileFromGitHub({}))
-                    .then(() => {
-                      content.closest('.community-annotation-modal-overlay')?.remove?.();
-                      resolveOnce(true);
-                    })
-                    .catch((listenErr) => {
-                      signInBtn.disabled = false;
-                      cancelBtn.disabled = false;
-                      status.textContent = listenErr?.message || 'Sign-in failed';
-                    });
-                });
-                fallback.appendChild(manualLink);
+              await loadMyProfileFromGitHub(did ? { datasetId: did } : {});
+              status.textContent = '';
+              if (mode === 'auth') {
+                content.closest('.community-annotation-modal-overlay')?.remove?.();
+                resolveOnce(true);
+                return;
               }
+              uiStep = 2;
+            } catch (err) {
+              if (isTokenAuthFailure(err)) {
+                disconnectGitHubSession({ message: 'GitHub session expired or was revoked. Please connect again.', notify: 'error' });
+                return;
+              }
+              status.textContent = String(err?.message || 'Sign-in failed');
+            } finally {
+              isSigningIn = false;
+              updateUi();
+            }
+          };
+
+          const closeModal = () => content.closest('.community-annotation-modal-overlay')?.remove?.();
+
+          prevBtn.addEventListener('click', () => {
+            uiStep = Math.max(1, (Number(uiStep) || 1) - 1);
+            updateUi();
+          });
+
+          nextBtn.addEventListener('click', async () => {
+            const step = Number(uiStep) || 1;
+            const authed = Boolean(githubAuth.isAuthenticated?.());
+            const repoRef = (did ? getAnnotationRepoForDataset(did, getEffectiveUserKey()) : null) || connectedRepoRef || null;
+            const connectedName = toRepoFullName(repoRef);
+
+            if (step === 1) {
+              if (!authed) {
+                await signIn();
+                return;
+              }
+              uiStep = 2;
+              updateUi();
+              return;
+            }
+
+            if (step === 2) {
+              uiStep = 3;
+              updateUi();
+              return;
+            }
+
+            if (step === 3) {
+              const selected = String(selectedRepoFullName || '').trim();
+              if (connectedName && (!selected || selected === connectedName)) {
+                uiStep = 4;
+                updateUi();
+                return;
+              }
+              await connectSelectedRepo();
+              return;
+            }
+
+            closeModal();
+          });
+
+          addRepoBtn.addEventListener('click', () => {
+            if (!installationsLoaded) {
+              openExternal(appInstallUrl);
+              return;
+            }
+            const whoLogin = String(githubAuth.getUser?.()?.login || '').trim().toLowerCase();
+            const preferred = installations.find((inst) => String(inst?.account?.login || '').trim().toLowerCase() === whoLogin) || null;
+            const fallback = installations[0] || null;
+            const url = String((preferred || fallback)?.html_url || '').trim();
+            openExternal(url || appInstallUrl);
+          });
+          reloadReposBtn.addEventListener('click', () => loadRepoList());
+          filterInput.addEventListener('input', () => renderRepoCards());
+
+          pullBtn.addEventListener('click', async () => {
+            pullBtn.disabled = true;
+            status.textContent = 'Pulling latest annotations…';
+            try {
+              const promise = pullFromGitHub({});
+              updateUi();
+              await promise;
+              status.textContent = syncError ? `⚠ ${syncError}` : 'Pulled latest annotations.';
+            } finally {
+              pullBtn.disabled = false;
+              updateUi();
             }
           });
+          publishBtn.addEventListener('click', async () => {
+            publishBtn.disabled = true;
+            status.textContent = 'Publishing…';
+            try {
+              const promise = pushToGitHub();
+              updateUi();
+              await promise;
+              status.textContent = syncError ? `⚠ ${syncError}` : 'Publish complete.';
+            } finally {
+              publishBtn.disabled = false;
+              updateUi();
+            }
+          });
+
+          settingsBtn.addEventListener('click', () => openExternal(settingsUrl));
+          disconnectRepoBtn.addEventListener('click', () => {
+            const authedUserKey = toGitHubUserKey(githubAuth.getUser?.());
+            if (!did || !authedUserKey) return;
+            const repoRef = getAnnotationRepoForDataset(did, authedUserKey);
+            const connectedName = toRepoFullName(repoRef);
+            if (!connectedName) return;
+            clearAnnotationRepoForDataset(did, authedUserKey);
+            setUrlAnnotationRepo(null);
+            connectedRepoRef = null;
+            selectedRepoFullName = '';
+            lastRepoInfo = null;
+            access.clearRole?.();
+            session.setCacheContext?.({ datasetId: did, repoRef: null, username: authedUserKey });
+            status.textContent = 'Repository disconnected.';
+            notifications.success('Disconnected annotation repository.', { category: 'annotation', duration: 2600 });
+            uiStep = 3;
+            render();
+            updateUi();
+          });
+          disconnectBtn.addEventListener('click', () => {
+            disconnectGitHubSession({ message: 'GitHub disconnected.', notify: 'success' });
+          });
+
+          // Step navigation: allow going back, or going forward by one step when permitted.
+          const goToStep = (nextStep) => {
+            const authed = Boolean(githubAuth.isAuthenticated?.());
+            const repoRef = (did ? getAnnotationRepoForDataset(did, getEffectiveUserKey()) : null) || connectedRepoRef || null;
+            const connectedName = toRepoFullName(repoRef);
+            const target = Math.max(1, Math.min(4, Number(nextStep) || 1));
+            if (isStepLocked(target, { authed, connectedName })) return;
+            const current = Number(uiStep) || 1;
+            if (target <= current) {
+              uiStep = target;
+              updateUi();
+              return;
+            }
+          };
+          for (const stepEl of stepEls) {
+            stepEl.addEventListener('click', () => goToStep(stepEl.getAttribute('data-step')));
+            stepEl.addEventListener('keydown', (e) => {
+              if (e.key !== 'Enter' && e.key !== ' ') return;
+              e.preventDefault();
+              goToStep(stepEl.getAttribute('data-step'));
+            });
+          }
+
+          // Initial state.
+          updateUi();
+
+          // Convenience: after returning from GitHub (Add repo), refresh list automatically.
+          try {
+            window.addEventListener('focus', () => {
+              if (!githubAuth.isAuthenticated?.()) return;
+              if (uiStep !== 2) return;
+              if (isReloadingRepos) return;
+              loadRepoList();
+            }, { signal: modalAbort.signal });
+          } catch {
+            // ignore
+          }
         }
       });
 
       const overlay = modalRef?.overlay || null;
       if (!overlay) return;
+      const cleanup = () => {
+        try { modalRef?.content?.__cellucidCleanup?.(); } catch { /* ignore */ }
+      };
       const observer = new MutationObserver(() => {
         if (resolved) {
           observer.disconnect();
+          cleanup();
           return;
         }
         if (!document.body.contains(overlay)) {
           observer.disconnect();
-          resolveOnce(false);
+          cleanup();
+          resolveOnce(mode === 'auth' ? Boolean(githubAuth.isAuthenticated?.()) : null);
         }
       });
       observer.observe(document.body, { childList: true, subtree: true });
@@ -1281,222 +1973,18 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
 
   async function connectRepoFlow({ reason = null, defaultPullNow = true } = {}) {
     const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
-    const okAuth = await ensureSignedInFlow({ reason: reason || 'Sign in to choose an annotation repository.' });
-    if (!okAuth) return null;
-
     const login = getGitHubLogin();
     const cacheUser = getCacheUserKey();
     const currentRepo = getAnnotationRepoForDataset(datasetId, cacheUser) || getUrlAnnotationRepo() || null;
-
-    return new Promise((resolve) => {
-      let resolved = false;
-      const resolveOnce = (value) => {
-        if (resolved) return;
-        resolved = true;
-        resolve(value);
-      };
-
-      const modalRef = showClusterModal({
-        title: 'Choose annotation repository',
-        buildContent: (content) => {
-          content.appendChild(el('div', {
-            className: 'legend-help',
-            text: 'Select a repo where the Cellucid GitHub App is installed (annotations/ config + users).'
-          }));
-          if (reason) content.appendChild(el('div', { className: 'legend-help', text: `⚠ ${String(reason)}` }));
-
-          const status = el('div', { className: 'legend-help', text: '' });
-          content.appendChild(status);
-
-          const searchInput = el('input', {
-            type: 'text',
-            className: 'community-annotation-text-input',
-            autocomplete: 'off',
-            placeholder: 'Search repos…',
-            value: ''
-          });
-          content.appendChild(searchInput);
-
-          const repoSelect = el('select', { className: 'obs-select' });
-          repoSelect.appendChild(el('option', { value: '', text: '(loading…)'}));
-          content.appendChild(repoSelect);
-
-          const pullRow = el('label', { className: 'legend-help' });
-          const pullNow = el('input', { type: 'checkbox' });
-          pullNow.checked = Boolean(defaultPullNow);
-          pullRow.appendChild(pullNow);
-          pullRow.appendChild(document.createTextNode(' Pull now after connecting'));
-          content.appendChild(pullRow);
-
-          const actions = el('div', { className: 'community-annotation-suggestion-actions' });
-          const refreshBtn = el('button', { type: 'button', className: 'btn-small', text: 'Refresh list' });
-          const manageBtn = el('button', { type: 'button', className: 'btn-small', text: 'Manage access…' });
-          const connectBtn = el('button', { type: 'button', className: 'btn-small', text: 'Connect' });
-          actions.appendChild(refreshBtn);
-          actions.appendChild(manageBtn);
-          actions.appendChild(connectBtn);
-          content.appendChild(actions);
-
-          /** @type {{full_name:string, private?:boolean, html_url?:string}[]} */
-          let allRepos = [];
-
-          const renderOptions = () => {
-            const q = String(searchInput.value || '').trim().toLowerCase();
-            repoSelect.innerHTML = '';
-            const filtered = q
-              ? allRepos.filter((r) => String(r.full_name || '').toLowerCase().includes(q))
-              : allRepos;
-            repoSelect.appendChild(el('option', { value: '', text: filtered.length ? '(select a repo)' : '(no repos found)' }));
-            for (const r of filtered.slice(0, 400)) {
-              const name = String(r.full_name || '').trim();
-              if (!name) continue;
-              const label = r.private ? `${name} (private)` : name;
-              repoSelect.appendChild(el('option', { value: name, text: label }));
-            }
-            if (currentRepo) repoSelect.value = currentRepo;
-          };
-
-          const loadRepos = async () => {
-            status.textContent = 'Loading installations…';
-            refreshBtn.disabled = true;
-            connectBtn.disabled = true;
-            repoSelect.disabled = true;
-            try {
-              const instData = await githubAuth.listInstallations?.();
-              const installations = Array.isArray(instData?.installations) ? instData.installations : [];
-              if (!installations.length) {
-                allRepos = [];
-                renderOptions();
-                status.textContent = 'No installations found. Install the app on an account, then refresh.';
-                return;
-              }
-
-              const repos = [];
-              for (const inst of installations.slice(0, 50)) {
-                status.textContent = `Loading repos… (${repos.length})`;
-                const id = inst?.id;
-                if (!id) continue;
-                try {
-                  const repoData = await githubAuth.listInstallationRepos?.(id);
-                  const list = Array.isArray(repoData?.repositories) ? repoData.repositories : [];
-                  for (const r of list) {
-                    const full = String(r?.full_name || '').trim();
-                    if (!full) continue;
-                    repos.push({ full_name: full, private: Boolean(r?.private), html_url: r?.html_url || null });
-                  }
-                } catch (err) {
-                  // Skip installations that error; user can manage access and retry.
-                  status.textContent = err?.message || 'Failed to load some installations';
-                }
-              }
-
-              const unique = new Map();
-              for (const r of repos) unique.set(r.full_name, r);
-              allRepos = Array.from(unique.values()).sort((a, b) => a.full_name.localeCompare(b.full_name));
-              status.textContent = allRepos.length ? `Repos available: ${allRepos.length}` : 'No repos available via the app.';
-              renderOptions();
-            } finally {
-              refreshBtn.disabled = false;
-              connectBtn.disabled = false;
-              repoSelect.disabled = false;
-            }
-          };
-
-          searchInput.addEventListener('input', () => renderOptions());
-          refreshBtn.addEventListener('click', () => loadRepos());
-          manageBtn.addEventListener('click', () => manageGitHubAccessFlow());
-
-          connectBtn.addEventListener('click', async () => {
-            const selected = String(repoSelect.value || '').trim();
-            if (!selected) {
-              status.textContent = 'Select a repo first.';
-              return;
-            }
-            const parts = selected.split('/');
-            if (parts.length !== 2) {
-              status.textContent = 'Invalid repo selection.';
-              return;
-            }
-
-            status.textContent = 'Validating repository…';
-            try {
-              const token = githubAuth.getToken?.() || null;
-              const sync = new CommunityAnnotationGitHubSync({
-                datasetId,
-                owner: parts[0],
-                repo: parts[1],
-                token,
-                branch: null,
-                workerOrigin: githubAuth.getWorkerOrigin?.() || null
-              });
-              const { repoInfo, config, datasetConfig, datasetId: did } = await sync.validateAndLoadConfig({ datasetId });
-              lastRepoInfo = repoInfo || null;
-              access.setRoleFromRepoInfo(lastRepoInfo);
-              if (did && Array.isArray(config?.supportedDatasets) && config.supportedDatasets.length && !datasetConfig) {
-                const ok = await confirmAsync({
-                  title: 'Dataset mismatch',
-                  message:
-                    `This repo does not list the current dataset id "${did}" in annotations/config.json.\n\nConnect anyway?`,
-                  confirmText: 'Connect anyway'
-                });
-                if (!ok) {
-                  status.textContent = 'Cancelled.';
-                  return;
-                }
-              }
-
-              const resolvedRepoRef = ensureRepoRefHasBranch(selected, sync.branch);
-              setAnnotationRepoForDataset(datasetId, resolvedRepoRef, cacheUser);
-              session.setCacheContext?.({ datasetId, repoRef: resolvedRepoRef, username: cacheUser });
-              setUrlAnnotationRepo(resolvedRepoRef);
-              await ensureIdentityForUserKey({ userKey: cacheUser, login, githubUserId: githubAuth.getUser?.()?.id ?? null, promptIfMissing: true });
-              await loadMyProfileFromGitHub({ datasetId });
-
-      // Apply configured fields for this dataset on connect (author-controlled).
-      const configured = new Set(Array.isArray(datasetConfig?.fieldsToAnnotate) ? datasetConfig.fieldsToAnnotate : []);
-      const configSettings = (datasetConfig?.annotatableSettings && typeof datasetConfig.annotatableSettings === 'object')
-        ? datasetConfig.annotatableSettings
-        : null;
-      const configClosed = Array.isArray(datasetConfig?.closedFields) ? datasetConfig.closedFields : [];
-      const catFields = (state.getFields?.() || []).filter((f) => f?.kind === 'category' && f?._isDeleted !== true);
-      const allKeys = catFields.map((f) => f.key).filter(Boolean);
-      for (const key of allKeys) {
-        session.setFieldAnnotated(key, configured.has(key));
-      }
-      if (configSettings && session.setAnnotatableConsensusSettingsMap) {
-        session.setAnnotatableConsensusSettingsMap(configSettings);
-      }
-      session.setClosedAnnotatableFields?.(configClosed);
-
-              resolveOnce({ ownerRepo: selected, pullNow: pullNow.checked });
-              content.closest('.community-annotation-modal-overlay')?.remove?.();
-              if (pullNow.checked) {
-                await pullFromGitHub({ repoOverride: selected });
-              } else {
-                render();
-              }
-            } catch (err) {
-              status.textContent = err?.message || 'Failed to connect';
-            }
-          });
-
-          loadRepos();
-        }
-      });
-
-      const overlay = modalRef?.overlay || null;
-      if (!overlay) return;
-      const observer = new MutationObserver(() => {
-        if (resolved) {
-          observer.disconnect();
-          return;
-        }
-        if (!document.body.contains(overlay)) {
-          observer.disconnect();
-          resolveOnce(null);
-        }
-      });
-      observer.observe(document.body, { childList: true, subtree: true });
+    return openGitHubConnectionFlow({
+      mode: 'repo',
+      focus: 'repo',
+      reason,
+      datasetId,
+      cacheUser,
+      login,
+      currentRepo,
+      defaultPullNow
     });
   }
 
@@ -1513,13 +2001,12 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
       syncBusy = false;
       syncError = 'No annotation repo connected.';
       render();
-      await connectRepoFlow({ reason: 'Choose a repo to Pull from.', defaultPullNow: true });
       return;
     }
 
-    const okAuth = await ensureSignedInFlow({ reason: 'Sign in required to Pull annotations.' });
-    if (!okAuth) {
+    if (!githubAuth.isAuthenticated?.()) {
       syncBusy = false;
+      syncError = 'Sign in required.';
       render();
       return;
     }
@@ -1603,14 +2090,19 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
     }
   }
 
-	  async function pushToGitHub() {
-	    const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
-	    const cacheUser = getCacheUserKey();
-	    const repo = getAnnotationRepoForDataset(datasetId, cacheUser);
-	    if (!repo) {
-	      syncError = 'No annotation repo connected.';
-	      render();
-	      await connectRepoFlow({ reason: 'Choose a repo to Publish to.', defaultPullNow: false });
+  async function pushToGitHub() {
+    const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
+    const cacheUser = getCacheUserKey();
+    const repo = getAnnotationRepoForDataset(datasetId, cacheUser);
+    if (!repo) {
+      syncError = 'No annotation repo connected.';
+      render();
+      return;
+    }
+
+    if (!githubAuth.isAuthenticated?.()) {
+      syncError = 'Sign in required.';
+      render();
       return;
     }
 
@@ -1618,13 +2110,6 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
     syncBusy = true;
     syncError = null;
     render();
-
-    const okAuth = await ensureSignedInFlow({ reason: 'Sign in required to Publish your annotations.' });
-    if (!okAuth) {
-      syncBusy = false;
-      render();
-      return;
-    }
 
     const trackerId = notifications.loading(`Publishing your annotations to ${repo}...`, { category: 'annotation' });
 
@@ -1799,21 +2284,12 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
     const login = normalizeGitHubUsername(authedUser?.login || '');
     const syncBlock = el('div', { className: 'control-block relative' });
     const syncInfo = createInfoTooltip([
-      'Sign in: authenticate via GitHub App (token stored in sessionStorage; cleared on tab close).',
-      'Manage access: install the app on more repos, or revoke it in GitHub settings.',
-      'Choose repo: pick from repos where the app is installed for you (no manual entry).',
-      'Pull: fetch latest `annotations/users/ghid_*.json` from GitHub and merge locally.',
-      'Publish: push your `annotations/users/ghid_<id>.json` (direct push if allowed, otherwise a fork + PR).',
-      'Author tools require maintain/admin (not just write).'
+      'Open GitHub sync to sign in, install the app, pick a repo, and pull/publish.',
+      'Your sign-in token is stored only in sessionStorage (clears on tab close).',
+      'The GitHub App has no repo access by default; you choose which repos to enable.'
     ]);
     syncBlock.appendChild(el('label', { className: 'd-flex items-center gap-1' }, ['GitHub sync', syncInfo.btn]));
     syncBlock.appendChild(syncInfo.tooltip);
-
-    const repoLine = el('div', {
-      className: 'legend-help',
-      text: repo ? `Repo: ${repo}` : 'No annotation repo connected.'
-    });
-    syncBlock.appendChild(repoLine);
 
     const userRow = el('div', { className: 'community-annotation-github-user' });
     if (isAuthed && authedUser?.avatar_url) {
@@ -1823,32 +2299,20 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
         alt: login ? `@${login}` : 'GitHub user'
       }));
     }
-    userRow.appendChild(el('div', {
-      className: 'legend-help',
+    const badgeRow = el('div', { className: 'community-annotation-badges' });
+    badgeRow.appendChild(el('div', {
+      className: `community-annotation-badge${isAuthed ? ' community-annotation-badge--ok' : ' community-annotation-badge--warn'}`,
       text: isAuthed ? (login ? `Signed in as @${login}` : 'Signed in') : 'Not signed in'
     }));
+    badgeRow.appendChild(el('div', {
+      className: `community-annotation-badge${repo ? ' community-annotation-badge--ok' : ' community-annotation-badge--warn'}`,
+      text: repo ? `Repo: ${String(repo).split('@')[0]}` : 'Repo: not connected'
+    }));
+    userRow.appendChild(badgeRow);
     syncBlock.appendChild(userRow);
 
     if (!online) {
       syncBlock.appendChild(el('div', { className: 'legend-help', text: 'Offline: GitHub actions are disabled.' }));
-    }
-
-    const lastSync = session.getStateSnapshot()?.lastSyncAt || null;
-    syncBlock.appendChild(el('div', { className: 'legend-help', text: `Last sync: ${formatTimeLabel(lastSync)}` }));
-
-    const role = access.getEffectiveRole();
-    const roleLabel =
-      role === 'author'
-        ? 'Access: Author (maintain/admin)'
-      : role === 'annotator'
-          ? 'Access: Annotator (non-admin)'
-          : 'Access: Unknown (Pull to detect permissions)';
-    syncBlock.appendChild(el('div', { className: 'legend-help', text: roleLabel }));
-
-    const perms = lastRepoInfo?.permissions || null;
-    const canDirectPush = perms ? Boolean(perms.push || perms.maintain || perms.admin) : null;
-    if (canDirectPush != null) {
-      syncBlock.appendChild(el('div', { className: 'legend-help', text: `Publish mode: ${canDirectPush ? 'Direct push' : 'Fork + Pull Request'}` }));
     }
 
     if (syncError) {
@@ -1856,69 +2320,22 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
     }
 
     const syncActions = el('div', { className: 'community-annotation-sync-actions' });
-    const signInOutBtn = el('button', { type: 'button', className: 'btn-small', text: isAuthed ? 'Sign out' : 'Sign in' });
-    const manageBtn = el('button', { type: 'button', className: 'btn-small', text: 'Manage access' });
-    const connectBtn = el('button', { type: 'button', className: 'btn-small', text: repo ? 'Change repo' : 'Choose repo' });
-    const disconnectBtn = el('button', { type: 'button', className: 'btn-small', text: 'Disconnect' });
-    const pullBtn = el('button', { type: 'button', className: 'btn-small', text: syncBusy ? 'Working...' : 'Pull' });
-    const publishBtn = el('button', { type: 'button', className: 'btn-small', text: syncBusy ? 'Working...' : 'Publish' });
-
-    syncActions.appendChild(signInOutBtn);
-    syncActions.appendChild(manageBtn);
-    syncActions.appendChild(connectBtn);
-    syncActions.appendChild(disconnectBtn);
-    syncActions.appendChild(pullBtn);
-    syncActions.appendChild(publishBtn);
-
-    signInOutBtn.disabled = syncBusy || !online;
-    manageBtn.disabled = syncBusy || !online;
-    connectBtn.disabled = syncBusy || !online;
-    disconnectBtn.disabled = !repo || syncBusy;
-    pullBtn.disabled = !repo || !isAuthed || syncBusy || !online;
-    publishBtn.disabled = !repo || !isAuthed || syncBusy || !online;
-
-    signInOutBtn.title = isAuthed ? 'Clear session token and sign out.' : 'Sign in with GitHub App authentication.';
-    manageBtn.title = 'Install the app on more repos, or revoke access.';
-    connectBtn.title = 'Choose a repo where the app is installed.';
-    disconnectBtn.title = repo ? 'Disconnect this dataset from the annotation repo.' : 'Choose a repo first.';
-    pullBtn.title = !repo
-      ? 'Choose a repo first.'
-      : (!online ? 'Offline.' : (!isAuthed ? 'Sign in first.' : 'Fetch latest user files from GitHub and merge into your session.'));
-    publishBtn.title = !repo
-      ? 'Choose a repo first.'
-      : (!online ? 'Offline.' : (!isAuthed
-        ? 'Sign in first.'
-        : 'Publish pushes directly if you have write access; otherwise it creates a Pull Request from your fork.'));
-
-    signInOutBtn.addEventListener('click', async () => {
-      if (isAuthed) {
-        const ok = await confirmAsync({
-          title: 'Sign out?',
-          message: 'This clears your session token (you can sign in again anytime).',
-          confirmText: 'Sign out'
-        });
-        if (!ok) return;
-        githubAuth.signOut?.();
-        render();
-        return;
-      }
-      await ensureSignedInFlow({ reason: null });
-      render();
+    const openBtnText = !isAuthed ? 'Connect GitHub…' : (!repo ? 'Choose repo…' : 'GitHub sync…');
+    const openSyncBtn = el('button', { type: 'button', className: 'btn-small', text: openBtnText });
+    openSyncBtn.disabled = syncBusy || !online;
+    openSyncBtn.addEventListener('click', () => {
+      openGitHubConnectionFlow({
+        mode: 'repo',
+        focus: 'overview',
+        reason: null,
+        datasetId,
+        cacheUser: cacheUsername,
+        login,
+        currentRepo: repo,
+        defaultPullNow: true
+      });
     });
-
-    manageBtn.addEventListener('click', () => manageGitHubAccessFlow());
-    connectBtn.addEventListener('click', () => connectRepoFlow({ reason: null, defaultPullNow: false }));
-    disconnectBtn.addEventListener('click', () => {
-      clearAnnotationRepoForDataset(datasetId, cacheUsername);
-      if (repo) setUrlAnnotationRepo(null);
-      syncError = null;
-      session.setCacheContext?.({ datasetId, repoRef: null, username: cacheUsername });
-      lastRepoInfo = null;
-      access.clearRole?.();
-      render();
-    });
-    pullBtn.addEventListener('click', () => pullFromGitHub());
-    publishBtn.addEventListener('click', () => pushToGitHub());
+    syncActions.appendChild(openSyncBtn);
     syncBlock.appendChild(syncActions);
 
     // Keep the panel minimal unless a repo is connected (or dev-simulated).

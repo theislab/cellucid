@@ -14,8 +14,6 @@
 import { getGitHubAuthSession, getGitHubWorkerOrigin } from './github-auth.js';
 import { getAnnotationRepoForDataset, setAnnotationRepoForDataset } from './repo-store.js';
 
-const API_VERSION = '2022-11-28';
-
 function toCleanString(value) {
   return String(value ?? '').trim();
 }
@@ -203,7 +201,6 @@ async function githubRequest(workerOrigin, path, { token = null, method = 'GET',
 
   const headers = {
     Accept: 'application/vnd.github+json',
-    'X-GitHub-Api-Version': API_VERSION,
   };
   if (token) headers.Authorization = `Bearer ${token}`;
   if (body != null) headers['Content-Type'] = 'application/json';

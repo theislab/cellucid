@@ -158,4 +158,8 @@ Then configure Cellucid to point at your worker origin (build/deploy-time inject
 
 - `window.__CELLUCID_GITHUB_WORKER_ORIGIN__ = 'https://your-worker.example.workers.dev'`
 
+Notes:
+
+- On non-local hosts, this value is treated as deploy-time config and is read once when the app loads (setting it later in the console won’t change the active worker origin).
+
 This lets you keep the same repo template and UI while controlling the auth infrastructure.

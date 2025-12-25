@@ -10,6 +10,7 @@
  */
 
 import { EventEmitter } from '../utils/event-emitter.js';
+import { isLocalDevHost } from '../utils/local-dev.js';
 
 const DEFAULT_WORKER_ORIGIN = 'https://cellucid-github-auth.benkemalim.workers.dev';
 
@@ -20,6 +21,25 @@ const LAST_GITHUB_USER_KEY = 'cellucid:community-annotations:last-github-user-ke
 function toCleanString(value) {
   return String(value ?? '').trim();
 }
+
+function normalizeOriginOrDefault(rawOrigin) {
+  try {
+    return new URL(rawOrigin).origin;
+  } catch {
+    return DEFAULT_WORKER_ORIGIN;
+  }
+}
+
+const _initialWorkerOriginOverride = (() => {
+  if (typeof window === 'undefined') return '';
+  return toCleanString(window.__CELLUCID_GITHUB_WORKER_ORIGIN__ || '');
+})();
+
+const _cachedNonLocalWorkerOrigin = (() => {
+  if (typeof window === 'undefined') return DEFAULT_WORKER_ORIGIN;
+  if (!_initialWorkerOriginOverride) return DEFAULT_WORKER_ORIGIN;
+  return normalizeOriginOrDefault(_initialWorkerOriginOverride);
+})();
 
 function safeJsonParse(text) {
   try {
@@ -37,33 +57,17 @@ function safeJsonStringify(obj) {
   }
 }
 
-function isDevOverrideAllowed() {
-  try {
-    if (typeof window === 'undefined' || typeof window.location === 'undefined') return false;
-    try {
-      const w = /** @type {any} */ (window);
-      if (w?.__CELLUCID_DEV__ === true) return true;
-    } catch {
-      // ignore
-    }
-    const host = String(window.location.hostname || '').toLowerCase();
-    const proto = String(window.location.protocol || '').toLowerCase();
-    if (proto === 'file:') return true;
-    return host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '0.0.0.0' || host.endsWith('.local');
-  } catch {
-    return false;
-  }
-}
-
 export function getGitHubWorkerOrigin() {
   if (typeof window === 'undefined') return DEFAULT_WORKER_ORIGIN;
-  const override = toCleanString(window.__CELLUCID_GITHUB_WORKER_ORIGIN__ || '');
-  if (!override || !isDevOverrideAllowed()) return DEFAULT_WORKER_ORIGIN;
-  try {
-    return new URL(override).origin;
-  } catch {
-    return DEFAULT_WORKER_ORIGIN;
+  // Local dev: allow changing the override without a reload.
+  if (isLocalDevHost()) {
+    const override = toCleanString(window.__CELLUCID_GITHUB_WORKER_ORIGIN__ || '');
+    if (!override) return DEFAULT_WORKER_ORIGIN;
+    return normalizeOriginOrDefault(override);
   }
+
+  // Non-local: treat overrides as deploy-time config only (read once at module init).
+  return _cachedNonLocalWorkerOrigin;
 }
 
 function readSessionItem(key) {
