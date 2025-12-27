@@ -77,6 +77,25 @@ export class MarkerCache {
   }
 
   /**
+   * Update the dataset identifier used in cache keys.
+   *
+   * Important for correctness when the active dataset changes while the same
+   * MarkerCache instance is reused (prevents cross-dataset cache hits).
+   *
+   * @param {string|null|undefined} datasetId
+   * @returns {boolean} true if changed
+   */
+  setDatasetId(datasetId) {
+    const next = String(datasetId ?? '').trim() || 'default';
+    if (next === this._datasetId) return false;
+    this._datasetId = next;
+    // Hot cache entries are keyed by datasetId-prefixed keys; clearing keeps the
+    // in-memory LRU bounded and avoids wasting space on another dataset.
+    this._hotCache.clear();
+    return true;
+  }
+
+  /**
    * Initialize the cache (opens IndexedDB connection)
    * @returns {Promise<void>}
    */

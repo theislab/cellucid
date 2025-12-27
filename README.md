@@ -2,11 +2,13 @@
   <img src="https://raw.githubusercontent.com/theislab/cellucid-python/main/cellucid-logo.svg" alt="Cellucid logo" width="360">
 </p>
 
-# Cellucid Web Viewer
+# Cellucid
 
-WebGL-based 3D visualization for single-cell data. Explore UMAP embeddings with interactive coloring, filtering, gene expression overlays, and KNN connectivity graphs.
+See every cell. Query any gene. Fly through millions. Zero friction. 
 
-**Live demo:** [cellucid.com](https://www.cellucid.com)
+GPU-powered atlas viewer with real-time filtering, velocity overlays, and collaborative community annotation.
+
+**Live:** [cellucid.com](https://www.cellucid.com)
 
 ## Features
 

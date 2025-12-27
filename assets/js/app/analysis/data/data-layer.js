@@ -1378,6 +1378,42 @@ export class DataLayer {
     }
   }
 
+  /**
+   * Reset internal state for an in-place dataset reload.
+   *
+   * Some flows (notably `local-user`) reload a new dataset into the same `DataState`
+   * instance without a full page refresh. In those cases, any cached field-index
+   * lookups and cached page data must be cleared to avoid cross-dataset cache hits.
+   *
+   * Safe to call at any time; it never throws.
+   */
+  resetForDatasetReload() {
+    try {
+      this.clearAllCaches();
+    } catch {
+      // ignore
+    }
+
+    try {
+      this._pendingRequests?.clear?.();
+    } catch {
+      // ignore
+    }
+
+    try {
+      this._geneFieldIndexByKey = null;
+      this._obsFieldIndexByKey = null;
+    } catch {
+      // ignore
+    }
+
+    try {
+      this._pageVersions?.clear?.();
+    } catch {
+      // ignore
+    }
+  }
+
   // ===========================================================================
   // PREFETCHING
   // ===========================================================================

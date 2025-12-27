@@ -7,36 +7,239 @@
  * - Community feedback scores
  * - Synonym detection
  *
+ * Privacy: search terms are sent to https://celltype.info/graphql.
+ *
  * @module community-annotations/cap-api
  * @see https://celltype.info/docs/python-client-for-cap-api
  */
 
 const CAP_GRAPHQL_URL = 'https://celltype.info/graphql';
+const CAP_DEFAULT_TIMEOUT_MS = 12_000;
+
+function toCleanString(value) {
+  return String(value ?? '').trim();
+}
+
+function normalizeForSearch(value) {
+  const s = toCleanString(value);
+  if (!s) return '';
+  try {
+    return s
+      .normalize('NFKD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  } catch {
+    return s
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+}
+
+function tokenizeSearch(value) {
+  const norm = normalizeForSearch(value);
+  if (!norm) return [];
+  const parts = norm.split(' ').filter(Boolean);
+  const isMulti = parts.length > 1;
+  const out = [];
+  const seen = new Set();
+  for (const p of parts) {
+    if (isMulti && p.length < 2) continue;
+    if (seen.has(p)) continue;
+    seen.add(p);
+    out.push(p);
+  }
+  return out;
+}
+
+function isAbortError(err) {
+  return err?.name === 'AbortError';
+}
+
+function isNetworkError(err) {
+  // Browser fetch() commonly throws TypeError on network failure / CORS / DNS.
+  if (err instanceof TypeError) return true;
+  const msg = toCleanString(err?.message || '');
+  return /failed to fetch|load failed|networkerror|fetch failed/i.test(msg);
+}
 
 /**
  * Execute a GraphQL query against CAP API.
  * @param {string} query - GraphQL query string
  * @param {Object} [variables={}] - Query variables
+ * @param {Object} [options={}]
+ * @param {number} [options.timeoutMs=12000] - Request timeout.
  * @returns {Promise<Object>} - Response data
  */
-async function executeQuery(query, variables = {}) {
-  const response = await fetch(CAP_GRAPHQL_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query, variables })
-  });
+async function executeQuery(query, variables = {}, options = {}) {
+  const timeoutMs = Number.isFinite(Number(options?.timeoutMs)) ? Math.max(0, Number(options.timeoutMs)) : CAP_DEFAULT_TIMEOUT_MS;
 
-  if (!response.ok) {
-    throw new Error(`CAP API error: ${response.status} ${response.statusText}`);
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const signal = controller?.signal;
+
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let timeout = null;
+  if (controller && timeoutMs > 0) {
+    timeout = setTimeout(() => {
+      try { controller.abort(); } catch { /* ignore */ }
+    }, timeoutMs);
   }
 
-  const result = await response.json();
+  try {
+    const response = await fetch(CAP_GRAPHQL_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, variables }),
+      signal: signal || undefined
+    });
 
-  if (result.errors?.length) {
-    throw new Error(`CAP GraphQL error: ${result.errors[0].message}`);
+    const text = await response.text();
+    let result = null;
+    try {
+      result = text ? JSON.parse(text) : null;
+    } catch {
+      result = null;
+    }
+
+    if (!response.ok) {
+      const msg =
+        toCleanString(result?.errors?.[0]?.message) ||
+        toCleanString(result?.message) ||
+        toCleanString(text) ||
+        `HTTP ${response.status}`;
+      throw new Error(`CAP API error: ${response.status} ${msg}`);
+    }
+
+    if (!result || typeof result !== 'object') {
+      throw new Error('CAP API returned invalid JSON');
+    }
+
+    if (result.errors?.length) {
+      throw new Error(`CAP GraphQL error: ${result.errors[0].message}`);
+    }
+
+    return result.data;
+  } catch (err) {
+    if (isAbortError(err)) {
+      throw new Error(`CAP request timed out after ${Math.round(timeoutMs / 1000)}s`);
+    }
+    if (isNetworkError(err)) {
+      throw new Error('CAP unreachable (network error)');
+    }
+    throw err;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+function computeStringMatchScore(value, ctx) {
+  const raw = toCleanString(value);
+  if (!raw) return 0;
+
+  const rawLower = raw.toLowerCase();
+  const norm = normalizeForSearch(raw);
+
+  const searchLower = ctx?.searchLower || '';
+  const searchNorm = ctx?.searchNorm || '';
+  const tokens = Array.isArray(ctx?.tokens) ? ctx.tokens : [];
+
+  let best = 0;
+
+  if (searchLower && rawLower === searchLower) best = Math.max(best, 1000);
+  if (searchNorm && norm === searchNorm) best = Math.max(best, 950);
+
+  if (searchLower && rawLower.startsWith(searchLower)) {
+    best = Math.max(best, 900 - Math.min(250, rawLower.length - searchLower.length));
+  }
+  if (searchNorm && norm.startsWith(searchNorm)) {
+    best = Math.max(best, 850 - Math.min(250, norm.length - searchNorm.length));
   }
 
-  return result.data;
+  if (searchLower) {
+    const idx = rawLower.indexOf(searchLower);
+    if (idx >= 0) best = Math.max(best, 700 - idx);
+  }
+  if (searchNorm) {
+    const idx = norm.indexOf(searchNorm);
+    if (idx >= 0) best = Math.max(best, 650 - idx);
+  }
+
+  if (tokens.length) {
+    let matchCount = 0;
+    for (const t of tokens) {
+      if (!t) continue;
+      if (norm.includes(t)) matchCount += 1;
+    }
+    if (matchCount === tokens.length) best = Math.max(best, 600);
+    else if (matchCount > 0) best = Math.max(best, 420 + Math.round((matchCount / tokens.length) * 120));
+  }
+
+  return best;
+}
+
+function getMarkerGeneMatchCount(result, markerGenes) {
+  const genes = Array.isArray(markerGenes) ? markerGenes : [];
+  if (!genes.length) return 0;
+
+  const wanted = new Set();
+  for (const g of genes.slice(0, 50)) {
+    const key = toCleanString(g).replace(/\s+/g, '').toUpperCase();
+    if (key) wanted.add(key);
+  }
+  if (!wanted.size) return 0;
+
+  const all = [];
+  if (Array.isArray(result?.markerGenes)) all.push(...result.markerGenes);
+  if (Array.isArray(result?.canonicalMarkerGenes)) all.push(...result.canonicalMarkerGenes);
+
+  const matched = new Set();
+  for (const g of all.slice(0, 200)) {
+    const key = toCleanString(g).replace(/\s+/g, '').toUpperCase();
+    if (!key) continue;
+    if (wanted.has(key)) matched.add(key);
+  }
+  return matched.size;
+}
+
+function computeCellTypeRelevance(result, ctx, { markerGenes = null } = {}) {
+  if (!result || typeof result !== 'object') return { score: 0, markerMatchCount: 0 };
+
+  const markerMatchCount = getMarkerGeneMatchCount(result, markerGenes);
+  let score = 0;
+
+  score = Math.max(score, computeStringMatchScore(result?.ontologyTermId, ctx) * 1.25);
+  score = Math.max(score, computeStringMatchScore(result?.ontologyTerm, ctx) * 1.05);
+  score = Math.max(score, computeStringMatchScore(result?.fullName, ctx) * 1.0);
+  score = Math.max(score, computeStringMatchScore(result?.name, ctx) * 1.0);
+
+  if (Array.isArray(result?.synonyms)) {
+    for (const syn of result.synonyms.slice(0, 50)) {
+      score = Math.max(score, computeStringMatchScore(syn, ctx) * 0.85);
+    }
+  }
+
+  if (Array.isArray(result?.markerGenes)) {
+    for (const g of result.markerGenes.slice(0, 80)) {
+      score = Math.max(score, computeStringMatchScore(g, ctx) * 0.8);
+    }
+  }
+
+  if (Array.isArray(result?.canonicalMarkerGenes)) {
+    for (const g of result.canonicalMarkerGenes.slice(0, 80)) {
+      score = Math.max(score, computeStringMatchScore(g, ctx) * 0.75);
+    }
+  }
+
+  if (markerMatchCount > 0) {
+    score += 140 * markerMatchCount;
+    if (Array.isArray(markerGenes) && markerMatchCount >= markerGenes.length) score += 180;
+  }
+
+  return { score, markerMatchCount };
 }
 
 /**
@@ -45,6 +248,8 @@ async function executeQuery(query, variables = {}) {
  *
  * @param {string} searchTerm - Search term (e.g., "macrophage", "T cell")
  * @param {number} [limit=10] - Maximum results to return
+ * @param {Object} [options={}]
+ * @param {string[]|null} [options.markerGenes=null] - Optional marker gene list (improves marker searches).
  * @returns {Promise<Array<{
  *   name: string,
  *   fullName: string,
@@ -55,10 +260,15 @@ async function executeQuery(query, variables = {}) {
  *   synonyms: string[]
  * }>>}
  */
-export async function searchCellTypes(searchTerm, limit = 10) {
+export async function searchCellTypes(searchTerm, limit = 10, options = {}) {
   if (!searchTerm?.trim()) return [];
 
-  const normalizedSearch = searchTerm.trim().toLowerCase();
+  const trimmed = searchTerm.trim();
+  const searchLower = trimmed.toLowerCase();
+  const searchNorm = normalizeForSearch(trimmed);
+  const tokens = tokenizeSearch(trimmed);
+  const ctx = { searchLower, searchNorm, tokens };
+  const markerGenes = Array.isArray(options?.markerGenes) ? options.markerGenes : null;
 
   const query = `
     query SearchCells($limit: Int!, $name: String!) {
@@ -75,21 +285,39 @@ export async function searchCellTypes(searchTerm, limit = 10) {
     }
   `;
 
-  // Request more results to filter client-side (CAP's search can return poor matches)
-  const data = await executeQuery(query, { limit: Math.max(limit * 5, 50), name: searchTerm.trim() });
+  const maxClient = Number.isFinite(Number(limit)) ? Math.max(1, Math.floor(Number(limit))) : 10;
+  // Request more results to re-rank client-side (CAP search ordering can be noisy).
+  const expandedLimit = Math.min(200, Math.max(maxClient * 10, 80));
+  const data = await executeQuery(query, { limit: expandedLimit, name: trimmed });
   const results = data?.lookupCells || [];
 
-  // Filter to results where search term appears anywhere in name/fullName/synonyms/markerGenes (case-insensitive)
-  const filtered = results.filter((r) => {
-    if ((r.name || '').toLowerCase().includes(normalizedSearch)) return true;
-    if ((r.fullName || '').toLowerCase().includes(normalizedSearch)) return true;
-    if (r.synonyms?.some((s) => (s || '').toLowerCase().includes(normalizedSearch))) return true;
-    if (r.markerGenes?.some((g) => (g || '').toLowerCase().includes(normalizedSearch))) return true;
-    if (r.canonicalMarkerGenes?.some((g) => (g || '').toLowerCase().includes(normalizedSearch))) return true;
-    return false;
+  const scored = [];
+  const seen = new Set();
+  for (const r of results) {
+    const idKey = toCleanString(r?.ontologyTermId).toLowerCase();
+    const nameKey = normalizeForSearch(r?.fullName || r?.name || '');
+    const key = idKey ? `id:${idKey}` : (nameKey ? `name:${nameKey}` : '');
+    if (key && seen.has(key)) continue;
+    if (key) seen.add(key);
+
+    const { score, markerMatchCount } = computeCellTypeRelevance(r, ctx, { markerGenes });
+    if (!score) continue;
+    if (markerGenes?.length && markerMatchCount <= 0) continue;
+    scored.push({ r, score });
+  }
+
+  scored.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    const aName = toCleanString(a.r?.fullName || a.r?.name).toLowerCase();
+    const bName = toCleanString(b.r?.fullName || b.r?.name).toLowerCase();
+    if (aName && bName && aName !== bName) return aName.localeCompare(bName);
+    const aId = toCleanString(a.r?.ontologyTermId).toLowerCase();
+    const bId = toCleanString(b.r?.ontologyTermId).toLowerCase();
+    if (aId && bId && aId !== bId) return aId.localeCompare(bId);
+    return 0;
   });
 
-  return filtered.slice(0, limit);
+  return scored.slice(0, maxClient).map((s) => s.r);
 }
 
 /**

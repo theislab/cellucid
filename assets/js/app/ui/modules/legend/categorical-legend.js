@@ -15,15 +15,13 @@ import { FieldKind, FieldSource } from '../../../utils/field-constants.js';
 import { StateValidator } from '../../../utils/state-validator.js';
 import { clamp } from '../../../utils/number-utils.js';
 import { getCommunityAnnotationSession } from '../../../community-annotations/session.js';
-import { getAnnotationRepoForDataset, getLastAnnotationRepoForDataset } from '../../../community-annotations/repo-store.js';
+import { syncCommunityAnnotationCacheContext } from '../../../community-annotations/runtime-context.js';
 import {
   getCommunityAnnotationAccessStore,
-  isAnnotationRepoConnected,
-  isSimulateRepoConnectedEnabled
+  isAnnotationRepoConnected
 } from '../../../community-annotations/access-store.js';
 import { ANNOTATION_CONNECTION_CHANGED_EVENT } from '../../../community-annotations/connection-events.js';
 import { openCommunityAnnotationVotingModal } from '../community-annotation-voting-modal.js';
-import { getGitHubAuthSession, getLastGitHubUserKey, toGitHubUserKey } from '../../../community-annotations/github-auth.js';
 
 function toCleanString(value) {
   return String(value ?? '').trim();
@@ -110,29 +108,14 @@ function formatCategoryCount(visibleCount, availableCount) {
   const lifecycle = typeof AbortController !== 'undefined' ? new AbortController() : null;
   const isCommunityAnnotationUiEnabled = () => {
     try {
-      const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
-      const auth = getGitHubAuthSession();
-      const authedKey = auth.isAuthenticated?.() ? toGitHubUserKey(auth.getUser?.()) : null;
-      const username = authedKey
-        ? String(authedKey)
-        : (isSimulateRepoConnectedEnabled() ? (getLastGitHubUserKey() || (annotationSession.getProfile?.()?.username || 'local')) : (annotationSession.getProfile?.()?.username || 'local'));
-      return isAnnotationRepoConnected(datasetId, username);
+      const ctx = syncCommunityAnnotationCacheContext({ dataSourceManager });
+      return isAnnotationRepoConnected(ctx.datasetId, ctx.userKey);
     } catch {
       return false;
     }
   };
   try {
-    const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
-    const auth = getGitHubAuthSession();
-    const authedKey = auth.isAuthenticated?.() ? toGitHubUserKey(auth.getUser?.()) : null;
-    const username = authedKey
-      ? String(authedKey)
-      : (isSimulateRepoConnectedEnabled() ? (getLastGitHubUserKey() || (annotationSession.getProfile?.()?.username || 'local')) : (annotationSession.getProfile?.()?.username || 'local'));
-    let repoRef = getAnnotationRepoForDataset(datasetId, username) || null;
-    if (!repoRef && isSimulateRepoConnectedEnabled()) {
-      repoRef = getLastAnnotationRepoForDataset(datasetId, username) || null;
-    }
-    annotationSession.setCacheContext?.({ datasetId, repoRef, username });
+    syncCommunityAnnotationCacheContext({ dataSourceManager });
   } catch {
     // ignore
   }
@@ -182,22 +165,12 @@ function formatCategoryCount(visibleCount, availableCount) {
     );
   }
 
-  function refreshCategoryCounts() {
-    try {
-      const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
-      const auth = getGitHubAuthSession();
-      const authedKey = auth.isAuthenticated?.() ? toGitHubUserKey(auth.getUser?.()) : null;
-      const username = authedKey
-        ? String(authedKey)
-        : (isSimulateRepoConnectedEnabled() ? (getLastGitHubUserKey() || (annotationSession.getProfile?.()?.username || 'local')) : (annotationSession.getProfile?.()?.username || 'local'));
-      let repoRef = getAnnotationRepoForDataset(datasetId, username) || null;
-      if (!repoRef && isSimulateRepoConnectedEnabled()) {
-        repoRef = getLastAnnotationRepoForDataset(datasetId, username) || null;
-      }
-      annotationSession.setCacheContext?.({ datasetId, repoRef, username });
-    } catch {
-      // ignore
-    }
+		  function refreshCategoryCounts() {
+		    try {
+		      syncCommunityAnnotationCacheContext({ dataSourceManager });
+		    } catch {
+		      // ignore
+		    }
 
     const activeField = state.getActiveField ? state.getActiveField() : null;
     if (!activeField || activeField.kind !== 'category') return;
@@ -281,6 +254,13 @@ function formatCategoryCount(visibleCount, availableCount) {
     const CATEGORY_DRAG_MIME = 'application/x-cellucid-category';
 
     const fieldKey = field?.key || '';
+    try {
+      if (fieldKey && Array.isArray(categories)) {
+        annotationSession.setFieldCategories?.(fieldKey, categories);
+      }
+    } catch {
+      // ignore
+    }
     const annotating = Boolean(isCommunityAnnotationUiEnabled() && fieldKey && annotationSession.isFieldAnnotated(fieldKey));
 
     const itemsContainer = document.createElement('div');

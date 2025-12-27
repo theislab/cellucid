@@ -1,7 +1,12 @@
 /**
  * Community Annotation & Voting - Local Session Store
  *
- * Offline-first session state persisted to localStorage, keyed by datasetId.
+ * Offline-first session state persisted to localStorage, scoped by:
+ * - datasetId
+ * - repo@branch
+ * - GitHub user.id (numeric id; not login/username)
+ *
+ * This keeps the app multi-user + multi-project safe within the same browser profile.
  * GitHub sync is intentionally out of scope for this store; it tracks user
  * intent and votes/suggestions in a merge-friendly shape.
  *
@@ -10,10 +15,9 @@
  */
 
 import { EventEmitter } from '../utils/event-emitter.js';
+import { toSessionStorageKey } from './cache-scope.js';
 
 const STORAGE_VERSION = 1;
-const STORAGE_PREFIX = 'cellucid:community-annotations:session:';
-const DEFAULT_DATASET_KEY = 'default';
 
 const MAX_LABEL_LEN = 120;
 const MAX_ONTOLOGY_LEN = 64;
@@ -25,6 +29,12 @@ const MAX_MERGE_NOTE_LEN = 512;
 
 const DEFAULT_MIN_ANNOTATORS = 1;
 const DEFAULT_CONSENSUS_THRESHOLD = 0.5;
+const MAX_TRACKED_DATASETS = 200;
+
+// Bucket and vote keys use ":" as a delimiter. Field keys can contain ":" in other
+// parts of the app, so we escape fieldKey only when needed to keep keys unambiguous
+// without changing the common case.
+const FIELDKEY_ESCAPE_PREFIX = 'fk~';
 
 function safeJsonParse(text) {
   try {
@@ -50,6 +60,22 @@ function nowIso() {
   }
 }
 
+function normalizeGitHubUserIdOrNull(userId) {
+  const n = Number(userId);
+  if (!Number.isFinite(n)) return null;
+  const safe = Math.max(0, Math.floor(n));
+  return safe ? safe : null;
+}
+
+function toFileUserKeyFromId(userId) {
+  const id = normalizeGitHubUserIdOrNull(userId);
+  return id ? `ghid_${id}` : null;
+}
+
+function isGitHubUserKey(value) {
+  return /^ghid_\d+$/i.test(toCleanString(value));
+}
+
 function createId() {
   try {
     if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -61,27 +87,35 @@ function createId() {
   return `s_${Math.random().toString(36).slice(2)}_${Date.now().toString(36)}`;
 }
 
-function normalizeRepoRef(repoRef) {
-  const raw = toCleanString(repoRef);
-  if (!raw) return { repo: 'local/local', branch: 'local' };
-  const at = raw.lastIndexOf('@');
-  const repo = toCleanString(at >= 0 ? raw.slice(0, at) : raw) || 'local/local';
-  const branch = toCleanString(at >= 0 ? raw.slice(at + 1) : '') || 'main';
-  return { repo, branch };
-}
-
-function toStorageKey({ datasetId, repoRef, username }) {
-  const did = toCleanString(datasetId) || DEFAULT_DATASET_KEY;
-  const { repo, branch } = normalizeRepoRef(repoRef);
-  const user = clampLen(String(username || '').replace(/^@+/, ''), 64).toLowerCase() || 'local';
-  const enc = (s) => encodeURIComponent(String(s || '').trim());
-  return `${STORAGE_PREFIX}${enc(did)}|${enc(repo)}|${enc(branch)}|${enc(user)}`;
-}
-
 function clampLen(text, maxLen) {
   const s = toCleanString(text);
   if (s.length <= maxLen) return s;
   return s.slice(0, maxLen);
+}
+
+function encodeFieldKeyForKey(fieldKey) {
+  const f = toCleanString(fieldKey);
+  if (!f) return '';
+  if (!f.includes(':')) return f;
+  try {
+    return `${FIELDKEY_ESCAPE_PREFIX}${encodeURIComponent(f)}`;
+  } catch {
+    // Fallback for rare invalid surrogate inputs.
+    return `${FIELDKEY_ESCAPE_PREFIX}${f.replace(/%/g, '%25').replace(/:/g, '%3A')}`;
+  }
+}
+
+function decodeFieldKeyFromKey(fieldKeyPart) {
+  const raw = toCleanString(fieldKeyPart);
+  if (!raw.startsWith(FIELDKEY_ESCAPE_PREFIX)) return raw;
+  const encoded = raw.slice(FIELDKEY_ESCAPE_PREFIX.length);
+  // Only treat as our encoding when a ":" was present (encodeURIComponent produces "%3A").
+  if (!/%3a/i.test(encoded)) return raw;
+  try {
+    return decodeURIComponent(encoded);
+  } catch {
+    return raw;
+  }
 }
 
 function ensureStringArray(value) {
@@ -103,6 +137,79 @@ function uniqueStrings(values) {
     out.push(v);
   }
   return out;
+}
+
+function parseDateMsOrNull(value) {
+  const s = toCleanString(value);
+  if (!s) return null;
+  const ms = Date.parse(s);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function normalizeDatasetAccessEntry(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+  const fieldsToAnnotate = uniqueStrings(ensureStringArray(entry.fieldsToAnnotate)).slice(0, 200);
+  const lastAccessedAt = clampLen(entry.lastAccessedAt, 64) || null;
+  return { fieldsToAnnotate, lastAccessedAt };
+}
+
+function normalizeDatasetAccessMap(map) {
+  const input = (map && typeof map === 'object' && !Array.isArray(map)) ? map : null;
+  /** @type {Record<string, {fieldsToAnnotate:string[], lastAccessedAt:string|null}>} */
+  const out = {};
+  if (!input) return out;
+  for (const [datasetIdRaw, entry] of Object.entries(input)) {
+    const datasetId = toCleanString(datasetIdRaw);
+    if (!datasetId) continue;
+    const normalized = normalizeDatasetAccessEntry(entry);
+    if (!normalized) continue;
+    out[datasetId] = normalized;
+  }
+  return out;
+}
+
+function mergeDatasetAccessMaps(left, right) {
+  const a = normalizeDatasetAccessMap(left);
+  const b = normalizeDatasetAccessMap(right);
+  const out = { ...a };
+  for (const [datasetId, entry] of Object.entries(b)) {
+    const prev = out[datasetId] || null;
+    if (!prev) {
+      out[datasetId] = entry;
+      continue;
+    }
+    const prevMs = parseDateMsOrNull(prev.lastAccessedAt);
+    const nextMs = parseDateMsOrNull(entry.lastAccessedAt);
+    if (prevMs != null && nextMs != null) {
+      out[datasetId] = nextMs >= prevMs ? entry : prev;
+      continue;
+    }
+    if (prevMs == null && nextMs != null) {
+      out[datasetId] = entry;
+      continue;
+    }
+    if (prevMs != null && nextMs == null) {
+      out[datasetId] = prev;
+      continue;
+    }
+    // Both missing/invalid timestamps: prefer the entry with a larger field list.
+    out[datasetId] = (entry.fieldsToAnnotate.length >= prev.fieldsToAnnotate.length) ? entry : prev;
+  }
+
+  const ids = Object.keys(out);
+  if (ids.length <= MAX_TRACKED_DATASETS) return out;
+
+  // Prune to most-recently-accessed datasets to cap file growth.
+  ids.sort((x, y) => {
+    const ax = parseDateMsOrNull(out[x]?.lastAccessedAt) ?? -1;
+    const ay = parseDateMsOrNull(out[y]?.lastAccessedAt) ?? -1;
+    if (ay !== ax) return ay - ax;
+    return x.localeCompare(y);
+  });
+  const keep = ids.slice(0, MAX_TRACKED_DATASETS);
+  const pruned = {};
+  for (const id of keep) pruned[id] = out[id];
+  return pruned;
 }
 
 function sanitizeProfile(profile) {
@@ -181,6 +288,7 @@ function normalizeSuggestion(input, { proposedBy } = {}) {
 
   const ontologyId = clampLen(input?.ontologyId, MAX_ONTOLOGY_LEN);
   const evidence = clampLen(input?.evidence, MAX_EVIDENCE_LEN);
+  const editedAt = clampLen(input?.editedAt, 64) || null;
 
   const upvotes = uniqueStrings(ensureStringArray(input?.upvotes).map((u) => normalizeUsername(u)).filter(Boolean));
   const upSet = new Set(upvotes);
@@ -197,6 +305,7 @@ function normalizeSuggestion(input, { proposedBy } = {}) {
     evidence: evidence || null,
     proposedBy: normalizeUsername(proposedBy || input?.proposedBy || 'local') || 'local',
     proposedAt: nowIso(),
+    editedAt,
     upvotes,
     downvotes,
     markers: normalizeMarkers(input?.markers),
@@ -230,12 +339,27 @@ function normalizeCommentArray(comments) {
   return out.slice(0, MAX_COMMENTS_PER_SUGGESTION);
 }
 
-function suggestionKey(fieldKey, catIdx, suggestionId) {
-  return `${fieldKey}:${catIdx}:${suggestionId}`;
+function suggestionKey(fieldKey, catKey, suggestionId) {
+  return `${encodeFieldKeyForKey(fieldKey)}:${catKey}:${suggestionId}`;
 }
 
-function bucketKey(fieldKey, catIdx) {
-  return `${fieldKey}:${catIdx}`;
+function bucketKey(fieldKey, catKey) {
+  return `${encodeFieldKeyForKey(fieldKey)}:${catKey}`;
+}
+
+function parseBucketKey(bucket) {
+  const b = toCleanString(bucket);
+  if (!b) return null;
+  const first = b.indexOf(':');
+  if (first < 0) return null;
+  const fieldKey = decodeFieldKeyFromKey(b.slice(0, first));
+  const catKey = b.slice(first + 1);
+  if (!fieldKey || !catKey) return null;
+  return { fieldKey, catKey };
+}
+
+function isNonNegativeIntegerString(value) {
+  return /^\d+$/.test(toCleanString(value));
 }
 
 function normalizeModerationMerge(entry) {
@@ -244,16 +368,19 @@ function normalizeModerationMerge(entry) {
   const intoSuggestionId = toCleanString(entry?.intoSuggestionId);
   if (!bucket || !fromSuggestionId || !intoSuggestionId) return null;
   if (fromSuggestionId === intoSuggestionId) return null;
-  const by = normalizeUsername(entry?.by || '') || null;
-  const at = toCleanString(entry?.at) || null;
+  const by = normalizeUsername(entry?.by || '');
+  const at = toCleanString(entry?.at);
+  if (!by || !at) return null;
+  const editedAt = clampLen(entry?.editedAt, 64) || null;
   const note = clampLen(entry?.note, MAX_MERGE_NOTE_LEN) || null;
 
   return {
     bucket,
     fromSuggestionId,
     intoSuggestionId,
-    ...(by ? { by } : {}),
-    ...(at ? { at } : {}),
+    by,
+    at,
+    ...(editedAt ? { editedAt } : {}),
     ...(note ? { note } : {}),
   };
 }
@@ -284,8 +411,9 @@ function compactModerationMerges(merges) {
     if (!bucket || !from || !into) continue;
     const k = `${bucket}::${from}`;
     const prev = newestByKey.get(k) || null;
-    if (!prev || isNewer(prev, m?.at, i)) {
-      newestByKey.set(k, { at: toCleanString(m?.at || ''), index: i, entry: m });
+    const time = toCleanString(m?.editedAt || m?.at || '');
+    if (!prev || isNewer(prev, time, i)) {
+      newestByKey.set(k, { at: time, index: i, entry: m });
     }
   }
 
@@ -342,8 +470,9 @@ function buildEffectiveModerationMergeMapForBucket(merges, bucket) {
     const into = toCleanString(m.intoSuggestionId);
     if (!from || !into) continue;
     const prev = newestByFrom.get(from) || null;
-    if (!prev || isNewer(prev, m.at, i)) {
-      newestByFrom.set(from, { at: toCleanString(m.at || ''), index: i, into });
+    const time = toCleanString(m.editedAt || m.at || '');
+    if (!prev || isNewer(prev, time, i)) {
+      newestByFrom.set(from, { at: time, index: i, into });
       fromTo.set(from, into);
     }
   }
@@ -381,8 +510,9 @@ function buildEffectiveModerationMergeMapByBucket(merges) {
     if (!newest.has(bucket)) newest.set(bucket, new Map());
     const bucketNewest = newest.get(bucket);
     const prev = bucketNewest.get(from) || null;
-    if (!prev || isNewer(prev, m.at, i)) {
-      bucketNewest.set(from, { at: toCleanString(m.at || ''), index: i, into });
+    const time = toCleanString(m.editedAt || m.at || '');
+    if (!prev || isNewer(prev, time, i)) {
+      bucketNewest.set(from, { at: time, index: i, into });
     }
   }
 
@@ -399,29 +529,47 @@ function buildEffectiveModerationMergeMapByBucket(merges) {
 function parseVoteKey(key) {
   const raw = toCleanString(key);
   if (!raw) return null;
-  const parts = raw.split(':');
-  if (parts.length < 3) return null;
-  const suggestionId = parts.pop();
-  const catIdxRaw = parts.pop();
-  const fieldKey = parts.join(':');
-  const catIdx = Number.isFinite(Number(catIdxRaw)) ? Math.max(0, Math.floor(Number(catIdxRaw))) : 0;
-  if (!fieldKey || !suggestionId) return null;
-  return { fieldKey, catIdx, suggestionId };
+  const last = raw.lastIndexOf(':');
+  if (last < 0) return null;
+  const suggestionId = raw.slice(last + 1);
+  const prefix = raw.slice(0, last);
+  const first = prefix.indexOf(':');
+  if (first < 0) return null;
+  const fieldKey = decodeFieldKeyFromKey(prefix.slice(0, first));
+  const catKey = prefix.slice(first + 1);
+  if (!fieldKey || !catKey || !suggestionId) return null;
+  return { fieldKey, catKey, suggestionId };
 }
 
-function mergeSuggestionMeta(a, b) {
-  if (!a && !b) return null;
-  const left = a || {};
-  const right = b || {};
-  return {
-    id: clampLen(left.id || right.id || '', 128) || createId(),
-    label: clampLen(left.label || right.label || '', MAX_LABEL_LEN),
-    ontologyId: clampLen(left.ontologyId || right.ontologyId || '', MAX_ONTOLOGY_LEN) || null,
-    evidence: clampLen(left.evidence || right.evidence || '', MAX_EVIDENCE_LEN) || null,
-    proposedBy: clampLen(left.proposedBy || right.proposedBy || 'local', 64) || 'local',
-    proposedAt: clampLen(left.proposedAt || right.proposedAt || nowIso(), 64) || nowIso(),
-    markers: Array.isArray(left.markers) ? left.markers.slice(0, 50) : (Array.isArray(right.markers) ? right.markers.slice(0, 50) : null),
-  };
+function mergeSuggestionMeta(existing, incoming, { preferIncoming = false } = {}) {
+  if (!existing && !incoming) return null;
+  if (!existing) return incoming || null;
+  if (!incoming) return existing || null;
+
+  const left = existing || {};
+  const right = incoming || {};
+
+  const time = (s) => toCleanString(s?.editedAt || s?.proposedAt || '');
+  const leftTime = time(left);
+  const rightTime = time(right);
+
+  let takeIncoming = false;
+  if (leftTime && rightTime) {
+    if (rightTime > leftTime) takeIncoming = true;
+    else if (rightTime < leftTime) takeIncoming = false;
+    else takeIncoming = Boolean(preferIncoming);
+  } else if (!leftTime && rightTime) {
+    takeIncoming = true;
+  } else if (leftTime && !rightTime) {
+    takeIncoming = false;
+  } else {
+    takeIncoming = Boolean(preferIncoming);
+  }
+
+  // Use "prefer right" merge so explicit nulls (e.g. clearing evidence) are preserved.
+  return takeIncoming
+    ? mergeSuggestionMetaPreferRight(left, right)
+    : mergeSuggestionMetaPreferRight(right, left);
 }
 
 function mergeSuggestionMetaPreferRight(a, b) {
@@ -459,6 +607,7 @@ function mergeSuggestionMetaPreferRight(a, b) {
     evidence: pickNullableString('evidence', MAX_EVIDENCE_LEN),
     proposedBy: clampLen(right.proposedBy || left.proposedBy || 'local', 64) || 'local',
     proposedAt: clampLen(right.proposedAt || left.proposedAt || nowIso(), 64) || nowIso(),
+    editedAt: pickNullableString('editedAt', 64),
     markers: pickMarkers(),
   };
 }
@@ -470,16 +619,16 @@ function defaultState() {
     annotationFields: [],
     annotatableSettings: {}, // { [fieldKey]: { minAnnotators:number, threshold:number } }
     closedAnnotatableFields: {}, // { [fieldKey]: true }
+    datasets: {}, // { [datasetId]: { fieldsToAnnotate:string[], lastAccessedAt:string } } (informational)
     // Persisted locally so profile edits survive refresh until Publish.
     profile: sanitizeProfile({}),
-    suggestions: {}, // { [fieldKey:catIdx]: Suggestion[] }
-    deletedSuggestions: {}, // { [fieldKey:catIdx]: string[] } (only the proposer can delete)
-    myVotes: {}, // { [fieldKey:catIdx:suggestionId]: 'up'|'down' }
+    suggestions: {}, // { [fieldKey:categoryLabel]: Suggestion[] }
+    deletedSuggestions: {}, // { [fieldKey:categoryLabel]: string[] } (only the proposer can delete)
+    myVotes: {}, // { [fieldKey:categoryLabel:suggestionId]: 'up'|'down' }
     myComments: {}, // { [suggestionId]: Comment[] }
     moderationMerges: [], // { bucket, fromSuggestionId, intoSuggestionId, by, at, note }[]
     // Used to enable incremental GitHub pulls (only fetch files whose sha changed).
     remoteFileShas: {}, // { [path]: sha }
-    pendingSync: [],
     lastSyncAt: null
   };
 }
@@ -489,28 +638,151 @@ export class CommunityAnnotationSession extends EventEmitter {
     super();
     this._datasetId = null;
     this._repoRef = null;
-    this._cacheUsername = 'local';
+    this._cacheUserId = null;
     this._state = defaultState();
     this._profile = sanitizeProfile({});
     // Public profile metadata from GitHub user files (in-memory only).
     this._knownProfiles = {}; // { [usernameLower]: { displayName?, title?, orcid? } }
+    // In-memory category label lookup for stable bucket keys (fieldKey + categoryLabel).
+    this._categoriesByFieldKey = {}; // { [fieldKey]: string[] }
     this._saveTimer = null;
     this._loadedForKey = null;
     this._ensureLoaded();
   }
 
-  setCacheContext({ datasetId, repoRef, username } = {}) {
+  _getEffectiveUserKey() {
+    const fromScope = toFileUserKeyFromId(this._cacheUserId);
+    if (fromScope) return fromScope;
+    const fromProfileId = toFileUserKeyFromId(this._profile?.githubUserId);
+    if (fromProfileId) return fromProfileId;
+    const fromProfile = normalizeUsername(this._profile?.username);
+    return fromProfile || 'local';
+  }
+
+  _migrateAttribution({ fromUserKeys = [], toUserKey } = {}) {
+    const to = normalizeUsername(toUserKey);
+    if (!to) return false;
+
+    const fromSet = new Set(
+      (Array.isArray(fromUserKeys) ? fromUserKeys : [fromUserKeys])
+        .map((u) => normalizeUsername(u))
+        .filter((u) => u && u !== to)
+    );
+    if (!fromSet.size) return false;
+
+    const arraysEqual = (a, b) => {
+      if (a === b) return true;
+      if (!Array.isArray(a) || !Array.isArray(b)) return false;
+      if (a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) return false;
+      }
+      return true;
+    };
+
+    const shouldSwapUser = (u) => {
+      const key = normalizeUsername(u);
+      return key ? fromSet.has(key) : false;
+    };
+
+    let didChange = false;
+
+    const migrateVoteArrays = (suggestion) => {
+      const up = Array.isArray(suggestion?.upvotes) ? suggestion.upvotes : null;
+      const down = Array.isArray(suggestion?.downvotes) ? suggestion.downvotes : null;
+      if (!up && !down) return;
+
+      const oldUp = Array.isArray(up) ? up : [];
+      const oldDown = Array.isArray(down) ? down : [];
+
+      const nextUp = uniqueStrings(
+        oldUp.map((u) => (shouldSwapUser(u) ? to : normalizeUsername(u))).filter(Boolean)
+      );
+      const upSet = new Set(nextUp);
+      const nextDown = uniqueStrings(
+        oldDown
+          .map((u) => (shouldSwapUser(u) ? to : normalizeUsername(u)))
+          .filter((u) => u && !upSet.has(u))
+      );
+
+      if (!arraysEqual(oldUp, nextUp)) {
+        suggestion.upvotes = nextUp;
+        didChange = true;
+      }
+      if (!arraysEqual(oldDown, nextDown)) {
+        suggestion.downvotes = nextDown;
+        didChange = true;
+      }
+    };
+
+    const migrateCommentList = (commentList) => {
+      if (!Array.isArray(commentList) || !commentList.length) return;
+      for (const c of commentList) {
+        if (!c || typeof c !== 'object') continue;
+        if (!shouldSwapUser(c.authorUsername)) continue;
+        c.authorUsername = to;
+        didChange = true;
+      }
+    };
+
+    // Suggestions: proposedBy + attached vote/comment usernames.
+    const suggestions = this._state.suggestions && typeof this._state.suggestions === 'object' ? this._state.suggestions : {};
+    for (const list of Object.values(suggestions)) {
+      if (!Array.isArray(list)) continue;
+      for (const s of list) {
+        if (!s || typeof s !== 'object') continue;
+        if (shouldSwapUser(s.proposedBy)) {
+          s.proposedBy = to;
+          didChange = true;
+        }
+        migrateVoteArrays(s);
+        if (Array.isArray(s.comments)) migrateCommentList(s.comments);
+      }
+    }
+
+    // Local comment cache (authorUsername).
+    if (this._state.myComments && typeof this._state.myComments === 'object') {
+      for (const list of Object.values(this._state.myComments)) {
+        migrateCommentList(list);
+      }
+    }
+
+    // Moderation merges: by username.
+    if (Array.isArray(this._state.moderationMerges)) {
+      for (const m of this._state.moderationMerges) {
+        if (!m || typeof m !== 'object') continue;
+        if (!shouldSwapUser(m.by)) continue;
+        m.by = to;
+        didChange = true;
+      }
+    }
+
+    // Known profiles cache keys.
+    if (this._knownProfiles && typeof this._knownProfiles === 'object') {
+      for (const from of fromSet) {
+        const existing = this._knownProfiles[from];
+        if (!existing || typeof existing !== 'object') continue;
+        if (!this._knownProfiles[to]) {
+          this._knownProfiles[to] = existing;
+          didChange = true;
+        }
+        delete this._knownProfiles[from];
+        didChange = true;
+      }
+    }
+
+    return didChange;
+  }
+
+  setCacheContext({ datasetId, repoRef, userId } = {}) {
     const nextDatasetId = datasetId === undefined ? this._datasetId : (toCleanString(datasetId) || null);
     const nextRepoRef = repoRef === undefined ? this._repoRef : (toCleanString(repoRef) || null);
-    const nextUser =
-      username === undefined
-        ? this._cacheUsername
-        : (clampLen(String(username || '').replace(/^@+/, ''), 64).toLowerCase() || 'local');
+    const nextUserId = userId === undefined ? this._cacheUserId : (normalizeGitHubUserIdOrNull(userId) || null);
 
     if (
       nextDatasetId === this._datasetId &&
       nextRepoRef === this._repoRef &&
-      nextUser === this._cacheUsername
+      nextUserId === this._cacheUserId
     ) {
       return;
     }
@@ -521,11 +793,17 @@ export class CommunityAnnotationSession extends EventEmitter {
       // ignore
     }
 
+    // Category label maps are dataset-specific; clear on dataset changes to avoid
+    // transient incorrect bucket canonicalization when datasets share field keys.
+    if (nextDatasetId !== this._datasetId) {
+      this._categoriesByFieldKey = {};
+    }
+
     this._datasetId = nextDatasetId;
     this._repoRef = nextRepoRef;
-    this._cacheUsername = nextUser;
+    this._cacheUserId = nextUserId;
     this._ensureLoaded();
-    this.emit('context:changed', { datasetId: this._datasetId, repoRef: this._repoRef, username: this._cacheUsername });
+    this.emit('context:changed', { datasetId: this._datasetId, repoRef: this._repoRef, userId: this._cacheUserId });
   }
 
   setDatasetId(datasetId) {
@@ -535,8 +813,8 @@ export class CommunityAnnotationSession extends EventEmitter {
   clearLocalCache({ keepVotingMode = true } = {}) {
     try {
       if (typeof localStorage !== 'undefined') {
-        const key = toStorageKey({ datasetId: this._datasetId, repoRef: this._repoRef, username: this._cacheUsername });
-        localStorage.removeItem(key);
+        const key = toSessionStorageKey({ datasetId: this._datasetId, repoRef: this._repoRef, userId: this._cacheUserId });
+        if (key) localStorage.removeItem(key);
       }
     } catch {
       // ignore
@@ -555,6 +833,27 @@ export class CommunityAnnotationSession extends EventEmitter {
 
   getDatasetId() {
     return this._datasetId;
+  }
+
+  getDatasetAccessMap() {
+    return normalizeDatasetAccessMap(this._state?.datasets);
+  }
+
+  recordDatasetAccess({ datasetId, fieldsToAnnotate = [] } = {}) {
+    const did = toCleanString(datasetId);
+    if (!did) return false;
+    if (!this._state.datasets || typeof this._state.datasets !== 'object' || Array.isArray(this._state.datasets)) {
+      this._state.datasets = {};
+    }
+    this._state.datasets[did] = {
+      fieldsToAnnotate: uniqueStrings(ensureStringArray(fieldsToAnnotate)).slice(0, 200),
+      lastAccessedAt: nowIso()
+    };
+    if (Object.keys(this._state.datasets).length > MAX_TRACKED_DATASETS) {
+      this._state.datasets = mergeDatasetAccessMaps(this._state.datasets, {});
+    }
+    this._touch();
+    return true;
   }
 
   getProfile() {
@@ -576,7 +875,9 @@ export class CommunityAnnotationSession extends EventEmitter {
     if (!u) return '@local';
     const prof = this.getKnownUserProfile(u);
     const parts = [];
-    const handle = prof?.login ? normalizeUsername(prof.login) : u;
+    let handle = prof?.login ? normalizeUsername(prof.login) : u;
+    // Never display GitHub numeric ids (ghid_123...) in the UI.
+    if (!prof?.login && /^ghid_\d+$/i.test(handle)) handle = 'unknown';
     if (prof?.displayName) parts.push(prof.displayName);
     if (prof?.title) parts.push(prof.title);
     if (parts.length) return `@${handle} (${parts.join(', ')})`;
@@ -608,8 +909,24 @@ export class CommunityAnnotationSession extends EventEmitter {
       prev.email === next.email
     ) return;
 
-    if (normalizeUsername(prev.username) !== normalizeUsername(next.username)) {
-      this.setCacheContext({ username: next.username });
+    try {
+      const prevKey =
+        toFileUserKeyFromId(this._cacheUserId) ||
+        toFileUserKeyFromId(prev?.githubUserId) ||
+        normalizeUsername(prev?.username) ||
+        'local';
+      const nextKey =
+        toFileUserKeyFromId(this._cacheUserId) ||
+        toFileUserKeyFromId(next?.githubUserId) ||
+        normalizeUsername(next?.username) ||
+        'local';
+      if (prevKey !== nextKey && isGitHubUserKey(nextKey)) {
+        const fromKeys = [prevKey];
+        if (!isGitHubUserKey(prevKey)) fromKeys.push('local');
+        this._migrateAttribution({ fromUserKeys: fromKeys, toUserKey: nextKey });
+      }
+    } catch {
+      // ignore
     }
 
     this._upsertKnownUserProfile(next.username, next);
@@ -746,13 +1063,207 @@ export class CommunityAnnotationSession extends EventEmitter {
     return true;
   }
 
+  _resolveCategoryKey(fieldKey, catIdxOrKey) {
+    const f = toCleanString(fieldKey);
+    if (!f) return null;
+
+    if (typeof catIdxOrKey === 'number' && Number.isFinite(catIdxOrKey)) {
+      const idx = Math.max(0, Math.floor(catIdxOrKey));
+      const categories = this._categoriesByFieldKey?.[f];
+      const label = Array.isArray(categories) && categories[idx] != null ? toCleanString(categories[idx]) : '';
+      return label || String(idx);
+    }
+
+    const catKey = toCleanString(catIdxOrKey);
+    return catKey || null;
+  }
+
+  toBucketKey(fieldKey, catIdxOrKey) {
+    const f = toCleanString(fieldKey);
+    const catKey = this._resolveCategoryKey(f, catIdxOrKey);
+    if (!f || !catKey) return null;
+    return bucketKey(f, catKey);
+  }
+
+  _canonicalizeBucketKey(bucket) {
+    const parts = parseBucketKey(bucket);
+    if (!parts) return null;
+    const f = toCleanString(parts.fieldKey);
+    const catKeyRaw = toCleanString(parts.catKey);
+    if (!f || !catKeyRaw) return null;
+
+    // Upgrade legacy "fieldKey:<catIdx>" buckets to "fieldKey:<categoryLabel>" when possible.
+    if (isNonNegativeIntegerString(catKeyRaw)) {
+      const categories = this._categoriesByFieldKey?.[f];
+      const idx = Math.max(0, Math.floor(Number(catKeyRaw)));
+      if (Array.isArray(categories) && idx < categories.length) {
+        const label = toCleanString(categories[idx]);
+        if (label) return bucketKey(f, label);
+      }
+    }
+
+    return bucketKey(f, catKeyRaw);
+  }
+
+  _migrateLegacyCategoryKeysForField(fieldKey) {
+    const f = toCleanString(fieldKey);
+    if (!f) return false;
+    const categories = this._categoriesByFieldKey?.[f];
+    if (!Array.isArray(categories) || !categories.length) return false;
+    let didChange = false;
+    const fieldPrefix = `${encodeFieldKeyForKey(f)}:`;
+
+    // Suggestions buckets
+    if (this._state.suggestions && typeof this._state.suggestions === 'object') {
+      const keys = Object.keys(this._state.suggestions);
+      for (const bucket of keys) {
+        if (!bucket.startsWith(fieldPrefix)) continue;
+        const parts = parseBucketKey(bucket);
+        if (!parts || toCleanString(parts.fieldKey) !== f) continue;
+        const catIdxRaw = toCleanString(parts.catKey);
+        if (!isNonNegativeIntegerString(catIdxRaw)) continue;
+        const idx = Math.max(0, Math.floor(Number(catIdxRaw)));
+        if (!Number.isInteger(idx) || idx >= categories.length) continue;
+        const label = toCleanString(categories[idx]);
+        if (!label) continue;
+        const nextBucket = bucketKey(f, label);
+        if (nextBucket === bucket) continue;
+
+        const incoming = Array.isArray(this._state.suggestions[bucket]) ? this._state.suggestions[bucket] : [];
+        const existing = Array.isArray(this._state.suggestions[nextBucket]) ? this._state.suggestions[nextBucket] : [];
+        const merged = existing.concat(incoming);
+        const seen = new Set();
+        const out = [];
+        for (const s of merged) {
+          const sid = toCleanString(s?.id);
+          if (sid) {
+            if (seen.has(sid)) continue;
+            seen.add(sid);
+          }
+          out.push(s);
+          if (out.length >= MAX_SUGGESTIONS_PER_CLUSTER) break;
+        }
+        this._state.suggestions[nextBucket] = out;
+        delete this._state.suggestions[bucket];
+        didChange = true;
+      }
+    }
+
+    // Deleted suggestion markers
+    if (this._state.deletedSuggestions && typeof this._state.deletedSuggestions === 'object') {
+      const keys = Object.keys(this._state.deletedSuggestions);
+      for (const bucket of keys) {
+        if (!bucket.startsWith(fieldPrefix)) continue;
+        const parts = parseBucketKey(bucket);
+        if (!parts || toCleanString(parts.fieldKey) !== f) continue;
+        const catIdxRaw = toCleanString(parts.catKey);
+        if (!isNonNegativeIntegerString(catIdxRaw)) continue;
+        const idx = Math.max(0, Math.floor(Number(catIdxRaw)));
+        if (!Number.isInteger(idx) || idx >= categories.length) continue;
+        const label = toCleanString(categories[idx]);
+        if (!label) continue;
+        const nextBucket = bucketKey(f, label);
+        if (nextBucket === bucket) continue;
+
+        const incoming = Array.isArray(this._state.deletedSuggestions[bucket]) ? this._state.deletedSuggestions[bucket] : [];
+        const existing = Array.isArray(this._state.deletedSuggestions[nextBucket]) ? this._state.deletedSuggestions[nextBucket] : [];
+        const merged = uniqueStrings(existing.concat(incoming).map((x) => toCleanString(x)).filter(Boolean)).slice(0, 5000);
+        if (merged.length) this._state.deletedSuggestions[nextBucket] = merged;
+        else delete this._state.deletedSuggestions[nextBucket];
+        delete this._state.deletedSuggestions[bucket];
+        didChange = true;
+      }
+    }
+
+    // Local vote keys
+    if (this._state.myVotes && typeof this._state.myVotes === 'object') {
+      const keys = Object.keys(this._state.myVotes);
+      for (const k of keys) {
+        const parsed = parseVoteKey(k);
+        if (!parsed || toCleanString(parsed.fieldKey) !== f) continue;
+        const catIdxRaw = toCleanString(parsed.catKey);
+        if (!isNonNegativeIntegerString(catIdxRaw)) continue;
+        const idx = Math.max(0, Math.floor(Number(catIdxRaw)));
+        if (!Number.isInteger(idx) || idx >= categories.length) continue;
+        const label = toCleanString(categories[idx]);
+        if (!label) continue;
+        const nextKey = suggestionKey(f, label, parsed.suggestionId);
+        if (nextKey === k) continue;
+        if (this._state.myVotes[nextKey] !== 'up' && this._state.myVotes[nextKey] !== 'down') {
+          this._state.myVotes[nextKey] = this._state.myVotes[k];
+        }
+        delete this._state.myVotes[k];
+        didChange = true;
+      }
+    }
+
+    // Moderation merges buckets
+    if (Array.isArray(this._state.moderationMerges)) {
+      let didChangeMerges = false;
+      const cleaned = [];
+      for (const m of this._state.moderationMerges.slice(0, 5000)) {
+        const normalized = normalizeModerationMerge(m);
+        if (!normalized) continue;
+        const parts = parseBucketKey(normalized.bucket);
+        if (parts && toCleanString(parts.fieldKey) === f) {
+          const catIdxRaw = toCleanString(parts.catKey);
+          if (isNonNegativeIntegerString(catIdxRaw)) {
+            const idx = Math.max(0, Math.floor(Number(catIdxRaw)));
+            if (Number.isInteger(idx) && idx < categories.length) {
+              const label = toCleanString(categories[idx]);
+              if (label) {
+                const nextBucket = bucketKey(f, label);
+                if (nextBucket !== normalized.bucket) {
+                  normalized.bucket = nextBucket;
+                  didChangeMerges = true;
+                }
+              }
+            }
+          }
+        }
+        cleaned.push(normalized);
+      }
+      if (didChangeMerges) {
+        this._state.moderationMerges = compactModerationMerges(cleaned);
+        didChange = true;
+      }
+    }
+
+    return didChange;
+  }
+
+  setFieldCategories(fieldKey, categories) {
+    const f = toCleanString(fieldKey);
+    const list = Array.isArray(categories) ? categories : null;
+    if (!f || !list) return false;
+
+    const cleaned = [];
+    for (let i = 0; i < list.length; i++) {
+      const label = toCleanString(list[i]);
+      cleaned.push(label || `Category ${i}`);
+      if (cleaned.length >= 200000) break;
+    }
+
+    const prev = this._categoriesByFieldKey?.[f];
+    const same =
+      Array.isArray(prev) &&
+      prev.length === cleaned.length &&
+      prev.every((v, i) => v === cleaned[i]);
+    if (!same) this._categoriesByFieldKey[f] = cleaned;
+
+    const migrated = this._migrateLegacyCategoryKeysForField(f);
+    if (migrated) this._touch();
+    return true;
+  }
+
   /**
    * @returns {any[]} suggestions (cloned)
    */
   getSuggestions(fieldKey, catIdx) {
     const f = toCleanString(fieldKey);
-    const idx = Number.isFinite(catIdx) ? Math.max(0, Math.floor(catIdx)) : 0;
-    const key = bucketKey(f, idx);
+    const catKey = this._resolveCategoryKey(f, catIdx);
+    if (!f || !catKey) return [];
+    const key = bucketKey(f, catKey);
     const list = this._state.suggestions[key] || [];
     const merged = this._applyModerationMergesForBucket(key, list);
     return merged.map((s) => {
@@ -897,10 +1408,12 @@ export class CommunityAnnotationSession extends EventEmitter {
 
   addSuggestion(fieldKey, catIdx, { label, ontologyId = null, evidence = null, markers = null } = {}) {
     const f = toCleanString(fieldKey);
-    const idx = Number.isFinite(catIdx) ? Math.max(0, Math.floor(catIdx)) : 0;
     if (!f) throw new Error('[CommunityAnnotationSession] fieldKey required');
 
-    const key = bucketKey(f, idx);
+    const catKey = this._resolveCategoryKey(f, catIdx);
+    if (!catKey) throw new Error('[CommunityAnnotationSession] category required');
+
+    const key = bucketKey(f, catKey);
     const labelNormalized = normalizeLabelForCompare(label);
     if (labelNormalized) {
       const existing = this._state.suggestions?.[key] || [];
@@ -915,7 +1428,7 @@ export class CommunityAnnotationSession extends EventEmitter {
 
     const suggestion = normalizeSuggestion(
       { label, ontologyId, evidence, markers },
-      { proposedBy: this._profile.username }
+      { proposedBy: this._getEffectiveUserKey() }
     );
     if (!suggestion) throw new Error('[CommunityAnnotationSession] label required');
 
@@ -925,9 +1438,10 @@ export class CommunityAnnotationSession extends EventEmitter {
     }
 
     // Auto-upvote by proposer
-    suggestion.upvotes = uniqueStrings([this._profile.username, ...suggestion.upvotes]);
-    suggestion.downvotes = suggestion.downvotes.filter((u) => u !== this._profile.username);
-    this._state.myVotes[suggestionKey(f, idx, suggestion.id)] = 'up';
+    const myUserKey = this._getEffectiveUserKey();
+    suggestion.upvotes = uniqueStrings([myUserKey, ...suggestion.upvotes]);
+    suggestion.downvotes = suggestion.downvotes.filter((u) => normalizeUsername(u) !== normalizeUsername(myUserKey));
+    this._state.myVotes[suggestionKey(f, catKey, suggestion.id)] = 'up';
 
     this._state.suggestions[key].push(suggestion);
     this._touch();
@@ -936,20 +1450,24 @@ export class CommunityAnnotationSession extends EventEmitter {
 
   editMySuggestion(fieldKey, catIdx, suggestionId, { label, ontologyId, evidence, markers } = {}) {
     const f = toCleanString(fieldKey);
-    const idx = Number.isFinite(catIdx) ? Math.max(0, Math.floor(catIdx)) : 0;
     const id = toCleanString(suggestionId);
-    const my = normalizeUsername(this._profile?.username || '');
+    const my = normalizeUsername(this._getEffectiveUserKey());
     if (!f) throw new Error('[CommunityAnnotationSession] fieldKey required');
     if (!id) throw new Error('[CommunityAnnotationSession] suggestionId required');
     if (!my) throw new Error('[CommunityAnnotationSession] username required');
 
-    const bucket = bucketKey(f, idx);
+    const catKey = this._resolveCategoryKey(f, catIdx);
+    if (!catKey) throw new Error('[CommunityAnnotationSession] category required');
+
+    const bucket = bucketKey(f, catKey);
     const list = this._state.suggestions?.[bucket] || [];
     const suggestion = list.find((x) => x && toCleanString(x.id) === id) || null;
     if (!suggestion) throw new Error('[CommunityAnnotationSession] suggestion not found');
     if (normalizeUsername(suggestion.proposedBy) !== my) {
       throw new Error('[CommunityAnnotationSession] cannot edit a suggestion you did not propose');
     }
+
+    let didUpdate = false;
 
     if (label !== undefined) {
       const nextLabel = clampLen(label, MAX_LABEL_LEN);
@@ -966,35 +1484,60 @@ export class CommunityAnnotationSession extends EventEmitter {
           }
         }
       }
-      suggestion.label = nextLabel;
+      if (suggestion.label !== nextLabel) {
+        suggestion.label = nextLabel;
+        didUpdate = true;
+      }
     }
 
     if (ontologyId !== undefined) {
       const next = clampLen(ontologyId, MAX_ONTOLOGY_LEN);
-      suggestion.ontologyId = next ? next : null;
+      const nextValue = next ? next : null;
+      if ((suggestion.ontologyId ?? null) !== nextValue) {
+        suggestion.ontologyId = nextValue;
+        didUpdate = true;
+      }
     }
 
     if (evidence !== undefined) {
       const next = clampLen(evidence, MAX_EVIDENCE_LEN);
-      suggestion.evidence = next ? next : null;
+      const nextValue = next ? next : null;
+      if ((suggestion.evidence ?? null) !== nextValue) {
+        suggestion.evidence = nextValue;
+        didUpdate = true;
+      }
     }
 
     if (markers !== undefined) {
-      suggestion.markers = normalizeMarkers(markers);
+      const nextMarkers = normalizeMarkers(markers);
+      const currentSerialized = (() => {
+        try { return JSON.stringify(suggestion.markers ?? null); } catch { return null; }
+      })();
+      const nextSerialized = (() => {
+        try { return JSON.stringify(nextMarkers ?? null); } catch { return null; }
+      })();
+      if (currentSerialized !== nextSerialized) {
+        suggestion.markers = nextMarkers;
+        didUpdate = true;
+      }
     }
 
+    if (!didUpdate) return true;
+
+    suggestion.editedAt = nowIso();
     this._touch();
     return true;
   }
 
   deleteMySuggestion(fieldKey, catIdx, suggestionId) {
     const f = toCleanString(fieldKey);
-    const idx = Number.isFinite(catIdx) ? Math.max(0, Math.floor(catIdx)) : 0;
     const id = toCleanString(suggestionId);
-    const my = normalizeUsername(this._profile?.username || '');
+    const my = normalizeUsername(this._getEffectiveUserKey());
     if (!f || !id || !my) return false;
+    const catKey = this._resolveCategoryKey(f, catIdx);
+    if (!catKey) return false;
 
-    const bucket = bucketKey(f, idx);
+    const bucket = bucketKey(f, catKey);
     const list = this._state.suggestions?.[bucket] || [];
     const s = list.find((x) => x && toCleanString(x.id) === id) || null;
     const proposer = normalizeUsername(s?.proposedBy || '');
@@ -1025,7 +1568,7 @@ export class CommunityAnnotationSession extends EventEmitter {
     this._state.suggestions[bucket] = list.filter((x) => toCleanString(x?.id) !== id);
 
     // Remove my local vote + comments for this suggestion.
-    const voteKey = suggestionKey(f, idx, id);
+    const voteKey = suggestionKey(f, catKey, id);
     if (this._state.myVotes?.[voteKey]) delete this._state.myVotes[voteKey];
     if (this._state.myComments?.[id]) delete this._state.myComments[id];
 
@@ -1035,20 +1578,21 @@ export class CommunityAnnotationSession extends EventEmitter {
 
   vote(fieldKey, catIdx, suggestionId, direction) {
     const f = toCleanString(fieldKey);
-    const idx = Number.isFinite(catIdx) ? Math.max(0, Math.floor(catIdx)) : 0;
     const id = toCleanString(suggestionId);
     const dir = direction === 'down' ? 'down' : 'up';
-    const username = normalizeUsername(this._profile.username);
+    const username = normalizeUsername(this._getEffectiveUserKey());
     if (!f || !id || !username) return false;
+    const catKey = this._resolveCategoryKey(f, catIdx);
+    if (!catKey) return false;
 
-    const key = bucketKey(f, idx);
+    const key = bucketKey(f, catKey);
     const list = this._state.suggestions[key] || [];
     const suggestion = list.find((s) => s?.id === id) || null;
     if (!suggestion) return false;
 
     // Per-suggestion voting: allow users to vote independently on merged bundle members.
     // The merged bundle totals are de-duplicated at read/render time.
-    const directKey = suggestionKey(f, idx, id);
+    const directKey = suggestionKey(f, catKey, id);
     const current = this._state.myVotes?.[directKey] || null;
     const next = current === dir ? null : dir;
 
@@ -1067,10 +1611,11 @@ export class CommunityAnnotationSession extends EventEmitter {
 
   getMyVoteDirect(fieldKey, catIdx, suggestionId) {
     const f = toCleanString(fieldKey);
-    const idx = Number.isFinite(catIdx) ? Math.max(0, Math.floor(catIdx)) : 0;
     const sid = toCleanString(suggestionId);
     if (!f || !sid) return null;
-    const directKey = suggestionKey(f, idx, sid);
+    const catKey = this._resolveCategoryKey(f, catIdx);
+    if (!catKey) return null;
+    const directKey = suggestionKey(f, catKey, sid);
     const direct = this._state.myVotes?.[directKey] || null;
     if (direct === 'up' || direct === 'down') return direct;
     return null;
@@ -1085,14 +1630,15 @@ export class CommunityAnnotationSession extends EventEmitter {
    */
   getMyBundleVoteInfo(fieldKey, catIdx, suggestionId) {
     const f = toCleanString(fieldKey);
-    const idx = Number.isFinite(catIdx) ? Math.max(0, Math.floor(catIdx)) : 0;
     const sid = toCleanString(suggestionId);
     if (!f || !sid) return { vote: null, source: 'none', delegatedUp: 0, delegatedDown: 0 };
+    const catKey = this._resolveCategoryKey(f, catIdx);
+    if (!catKey) return { vote: null, source: 'none', delegatedUp: 0, delegatedDown: 0 };
 
-    const direct = this.getMyVoteDirect(f, idx, sid);
+    const direct = this.getMyVoteDirect(f, catKey, sid);
     if (direct) return { vote: direct, source: 'direct', delegatedUp: 0, delegatedDown: 0 };
 
-    const bucket = bucketKey(f, idx);
+    const bucket = bucketKey(f, catKey);
     const list = this._state.suggestions?.[bucket] || [];
     const merges = Array.isArray(this._state.moderationMerges) ? this._state.moderationMerges : [];
     const map = buildEffectiveModerationMergeMapForBucket(merges, bucket);
@@ -1114,7 +1660,7 @@ export class CommunityAnnotationSession extends EventEmitter {
     let delegatedUp = 0;
     let delegatedDown = 0;
     for (const oid of uniqueStrings(familyOtherIds)) {
-      const k = suggestionKey(f, idx, oid);
+      const k = suggestionKey(f, catKey, oid);
       const v = this._state.myVotes?.[k] || null;
       if (v === 'up') delegatedUp++;
       else if (v === 'down') delegatedDown++;
@@ -1130,12 +1676,13 @@ export class CommunityAnnotationSession extends EventEmitter {
 
   addComment(fieldKey, catIdx, suggestionId, text) {
     const f = toCleanString(fieldKey);
-    const idx = Number.isFinite(catIdx) ? Math.max(0, Math.floor(catIdx)) : 0;
     const sid = toCleanString(suggestionId);
     const trimmedText = toCleanString(text);
     if (!f || !sid || !trimmedText) return null;
+    const catKey = this._resolveCategoryKey(f, catIdx);
+    if (!catKey) return null;
 
-    const key = bucketKey(f, idx);
+    const key = bucketKey(f, catKey);
     const list = this._state.suggestions[key] || [];
     let suggestion = list.find((s) => s?.id === sid) || null;
     let storeSid = sid;
@@ -1153,7 +1700,7 @@ export class CommunityAnnotationSession extends EventEmitter {
     if (!Array.isArray(suggestion.comments)) suggestion.comments = [];
     if (suggestion.comments.length >= MAX_COMMENTS_PER_SUGGESTION) return null;
 
-    const comment = normalizeComment({ text: trimmedText }, { authorUsername: this._profile.username });
+    const comment = normalizeComment({ text: trimmedText }, { authorUsername: this._getEffectiveUserKey() });
     if (!comment) return null;
 
     suggestion.comments.push(comment);
@@ -1168,13 +1715,14 @@ export class CommunityAnnotationSession extends EventEmitter {
 
   editComment(fieldKey, catIdx, suggestionId, commentId, newText) {
     const f = toCleanString(fieldKey);
-    const idx = Number.isFinite(catIdx) ? Math.max(0, Math.floor(catIdx)) : 0;
     const sid = toCleanString(suggestionId);
     const cid = toCleanString(commentId);
     const trimmedText = toCleanString(newText);
     if (!f || !sid || !cid || !trimmedText) return false;
+    const catKey = this._resolveCategoryKey(f, catIdx);
+    if (!catKey) return false;
 
-    const key = bucketKey(f, idx);
+    const key = bucketKey(f, catKey);
     const list = this._state.suggestions[key] || [];
     const merges = Array.isArray(this._state.moderationMerges) ? this._state.moderationMerges : [];
     const map = buildEffectiveModerationMergeMapForBucket(merges, key);
@@ -1214,12 +1762,13 @@ export class CommunityAnnotationSession extends EventEmitter {
 
   deleteComment(fieldKey, catIdx, suggestionId, commentId) {
     const f = toCleanString(fieldKey);
-    const idx = Number.isFinite(catIdx) ? Math.max(0, Math.floor(catIdx)) : 0;
     const sid = toCleanString(suggestionId);
     const cid = toCleanString(commentId);
     if (!f || !sid || !cid) return false;
+    const catKey = this._resolveCategoryKey(f, catIdx);
+    if (!catKey) return false;
 
-    const key = bucketKey(f, idx);
+    const key = bucketKey(f, catKey);
     const list = this._state.suggestions[key] || [];
     const merges = Array.isArray(this._state.moderationMerges) ? this._state.moderationMerges : [];
     const map = buildEffectiveModerationMergeMapForBucket(merges, key);
@@ -1258,11 +1807,12 @@ export class CommunityAnnotationSession extends EventEmitter {
 
   getComments(fieldKey, catIdx, suggestionId) {
     const f = toCleanString(fieldKey);
-    const idx = Number.isFinite(catIdx) ? Math.max(0, Math.floor(catIdx)) : 0;
     const sid = toCleanString(suggestionId);
     if (!f || !sid) return [];
+    const catKey = this._resolveCategoryKey(f, catIdx);
+    if (!catKey) return [];
 
-    const key = bucketKey(f, idx);
+    const key = bucketKey(f, catKey);
     const list = this._state.suggestions[key] || [];
     const suggestion = list.find((s) => toCleanString(s?.id) === sid) || null;
     if (!suggestion || !Array.isArray(suggestion.comments)) return [];
@@ -1270,7 +1820,7 @@ export class CommunityAnnotationSession extends EventEmitter {
   }
 
   isMyComment(authorUsername) {
-    const myUsername = normalizeUsername(this._profile?.username);
+    const myUsername = normalizeUsername(this._getEffectiveUserKey());
     const author = normalizeUsername(authorUsername);
     return myUsername && author && myUsername === author;
   }
@@ -1281,6 +1831,8 @@ export class CommunityAnnotationSession extends EventEmitter {
     for (const m of merges.slice(0, 5000)) {
       const normalized = normalizeModerationMerge(m);
       if (!normalized) continue;
+      const canonicalBucket = this._canonicalizeBucketKey(normalized.bucket);
+      if (canonicalBucket) normalized.bucket = canonicalBucket;
       cleaned.push(normalized);
     }
     this._state.moderationMerges = compactModerationMerges(cleaned);
@@ -1295,13 +1847,13 @@ export class CommunityAnnotationSession extends EventEmitter {
 
   addModerationMerge({ fieldKey, catIdx, fromSuggestionId, intoSuggestionId, note = null } = {}) {
     const f = toCleanString(fieldKey);
-    const idx = Number.isFinite(catIdx) ? Math.max(0, Math.floor(catIdx)) : 0;
-    const bucket = bucketKey(f, idx);
+    const catKey = this._resolveCategoryKey(f, catIdx);
+    const bucket = catKey ? bucketKey(f, catKey) : '';
     const entry = normalizeModerationMerge({
       bucket,
       fromSuggestionId,
       intoSuggestionId,
-      by: this._profile?.username || 'local',
+      by: this._getEffectiveUserKey(),
       at: nowIso(),
       note
     });
@@ -1322,10 +1874,52 @@ export class CommunityAnnotationSession extends EventEmitter {
     return true;
   }
 
+  editModerationMergeNote({ fieldKey, catIdx, fromSuggestionId, note = null } = {}) {
+    const f = toCleanString(fieldKey);
+    const catKey = this._resolveCategoryKey(f, catIdx);
+    const bucket = catKey ? bucketKey(f, catKey) : '';
+    const from = toCleanString(fromSuggestionId);
+    if (!bucket || !from) return false;
+
+    const merges = Array.isArray(this._state.moderationMerges) ? this._state.moderationMerges : [];
+    if (!merges.length) return false;
+
+    const nextNote = clampLen(note, MAX_MERGE_NOTE_LEN) || null;
+
+    const cleaned = [];
+    let didUpdate = false;
+    for (const mRaw of merges) {
+      const m = normalizeModerationMerge(mRaw);
+      if (!m) continue;
+      if (m.bucket !== bucket || m.fromSuggestionId !== from) {
+        cleaned.push(m);
+        continue;
+      }
+      if (!this.isMyComment(m.by)) {
+        cleaned.push(m);
+        continue;
+      }
+
+      const prevNote = clampLen(m?.note, MAX_MERGE_NOTE_LEN) || null;
+      if (toCleanString(prevNote || '') === toCleanString(nextNote || '')) {
+        cleaned.push(m);
+        continue;
+      }
+
+      const updated = normalizeModerationMerge({ ...m, note: nextNote, editedAt: nowIso() });
+      cleaned.push(updated || m);
+      didUpdate = true;
+    }
+    if (!didUpdate) return false;
+    this._state.moderationMerges = compactModerationMerges(cleaned);
+    this._touch();
+    return true;
+  }
+
   detachModerationMerge({ fieldKey, catIdx, fromSuggestionId } = {}) {
     const f = toCleanString(fieldKey);
-    const idx = Number.isFinite(catIdx) ? Math.max(0, Math.floor(catIdx)) : 0;
-    const bucket = bucketKey(f, idx);
+    const catKey = this._resolveCategoryKey(f, catIdx);
+    const bucket = catKey ? bucketKey(f, catKey) : '';
     const from = toCleanString(fromSuggestionId);
     if (!bucket || !from) return false;
     const merges = Array.isArray(this._state.moderationMerges) ? this._state.moderationMerges : [];
@@ -1346,8 +1940,8 @@ export class CommunityAnnotationSession extends EventEmitter {
 
   detachLastModerationMerge({ fieldKey, catIdx, intoSuggestionId = null } = {}) {
     const f = toCleanString(fieldKey);
-    const idx = Number.isFinite(catIdx) ? Math.max(0, Math.floor(catIdx)) : 0;
-    const bucket = bucketKey(f, idx);
+    const catKey = this._resolveCategoryKey(f, catIdx);
+    const bucket = catKey ? bucketKey(f, catKey) : '';
     if (!bucket) return false;
     const merges = Array.isArray(this._state.moderationMerges) ? this._state.moderationMerges : [];
     if (!merges.length) return false;
@@ -1378,7 +1972,7 @@ export class CommunityAnnotationSession extends EventEmitter {
       }
     }
     if (!best?.fromId) return false;
-    return this.detachModerationMerge({ fieldKey: f, catIdx: idx, fromSuggestionId: best.fromId });
+    return this.detachModerationMerge({ fieldKey: f, catIdx: catKey, fromSuggestionId: best.fromId });
   }
 
   buildModerationMergesDocument() {
@@ -1398,8 +1992,11 @@ export class CommunityAnnotationSession extends EventEmitter {
    */
   computeConsensus(fieldKey, catIdx, { minAnnotators = DEFAULT_MIN_ANNOTATORS, threshold = DEFAULT_CONSENSUS_THRESHOLD } = {}) {
     const f = toCleanString(fieldKey);
-    const idx = Number.isFinite(catIdx) ? Math.max(0, Math.floor(catIdx)) : 0;
-    const key = bucketKey(f, idx);
+    const catKey = this._resolveCategoryKey(f, catIdx);
+    if (!f || !catKey) {
+      return { status: 'pending', label: null, confidence: 0, voters: 0, netVotes: 0, suggestionId: null };
+    }
+    const key = bucketKey(f, catKey);
     const list = this._applyModerationMergesForBucket(key, this._state.suggestions[key] || []);
     if (!list.length) {
       return { status: 'pending', label: null, confidence: 0, voters: 0, netVotes: 0, suggestionId: null };
@@ -1472,6 +2069,75 @@ export class CommunityAnnotationSession extends EventEmitter {
     };
   }
 
+  /**
+   * Build a derived consensus export document (not persisted).
+   *
+   * This is the in-browser equivalent of a "compiled" consensus artifact:
+   * it merges moderation merges into the visible suggestion list, and computes a
+   * per-bucket consensus summary using the current annotatable consensus settings.
+   *
+   * @param {object} [options]
+   * @param {boolean} [options.includeComments=false] - Include suggestion `comments` arrays (can be large).
+   * @param {boolean} [options.includeMergedFrom=false] - Include `mergedFrom` bundles for moderated merges.
+   * @returns {{version:1, builtAt:string, suggestions:Record<string, any[]>, consensus:Record<string, any>}}
+   */
+  buildConsensusDocument({ includeComments = false, includeMergedFrom = false } = {}) {
+    const now = nowIso();
+
+    /** @type {Record<string, any[]>} */
+    const outSuggestions = {};
+    /** @type {Record<string, any>} */
+    const outConsensus = {};
+
+    const parseBucket = (bucket) => {
+      const canonical = this._canonicalizeBucketKey(bucket) || toCleanString(bucket);
+      const parts = parseBucketKey(canonical);
+      if (!parts) return null;
+      const fieldKey = toCleanString(parts.fieldKey);
+      const catKey = toCleanString(parts.catKey);
+      if (!fieldKey || !catKey) return null;
+      return { fieldKey, catKey, bucket: bucketKey(fieldKey, catKey) };
+    };
+
+    const buckets = Object.keys(this._state.suggestions || {}).sort((a, b) => a.localeCompare(b));
+    for (const rawBucket of buckets) {
+      const parts = parseBucket(rawBucket);
+      if (!parts) continue;
+      const { fieldKey, catKey, bucket } = parts;
+
+      const suggestions = this.getSuggestions(fieldKey, catKey);
+      outSuggestions[bucket] = suggestions.map((s) => {
+        const out = {
+          id: toCleanString(s?.id) || null,
+          label: toCleanString(s?.label) || null,
+          ontologyId: s?.ontologyId ?? null,
+          evidence: s?.evidence ?? null,
+          markers: s?.markers ?? null,
+          proposedBy: toCleanString(s?.proposedBy) || null,
+          proposedAt: toCleanString(s?.proposedAt) || null,
+          upvotes: Array.isArray(s?.upvotes) ? s.upvotes.slice() : [],
+          downvotes: Array.isArray(s?.downvotes) ? s.downvotes.slice() : [],
+          ...(includeComments ? { comments: Array.isArray(s?.comments) ? s.comments.map((c) => ({ ...(c || {}) })) : [] } : {}),
+          ...(includeMergedFrom ? { mergedFrom: Array.isArray(s?.mergedFrom) ? s.mergedFrom.map((m) => ({ ...(m || {}) })) : [] } : {}),
+        };
+        // Remove null id/label if malformed to reduce downstream surprises.
+        if (!out.id) delete out.id;
+        if (!out.label) delete out.label;
+        return out;
+      });
+
+      const settings = this.getAnnotatableConsensusSettings(fieldKey);
+      outConsensus[bucket] = this.computeConsensus(fieldKey, catKey, settings);
+    }
+
+    return {
+      version: 1,
+      builtAt: now,
+      suggestions: outSuggestions,
+      consensus: outConsensus
+    };
+  }
+
   getStateSnapshot() {
     return {
       datasetId: this._datasetId,
@@ -1518,9 +2184,12 @@ export class CommunityAnnotationSession extends EventEmitter {
    */
   buildUserFileDocument() {
     const profile = this._profile || sanitizeProfile({});
-    const username = clampLen(profile.username || 'local', 64) || 'local';
+    const username = clampLen(this._getEffectiveUserKey(), 64) || 'local';
     const login = clampLen(profile.login || '', 64) || undefined;
-    const githubUserId = profile.githubUserId && Number.isFinite(profile.githubUserId) ? profile.githubUserId : undefined;
+    const githubUserId =
+      normalizeGitHubUserIdOrNull(profile.githubUserId) ||
+      normalizeGitHubUserIdOrNull(this._cacheUserId) ||
+      undefined;
     const linkedin = clampLen(profile.linkedin || '', 120) || undefined;
     const email = clampLen(profile.email || '', 254) || undefined;
 
@@ -1542,7 +2211,23 @@ export class CommunityAnnotationSession extends EventEmitter {
         mine.push(normalized);
         if (mine.length >= MAX_SUGGESTIONS_PER_CLUSTER) break;
       }
-      if (mine.length) suggestionsOut[bucket] = mine;
+      if (mine.length) {
+        const outBucket = this._canonicalizeBucketKey(bucket) || bucket;
+        const existing = Array.isArray(suggestionsOut[outBucket]) ? suggestionsOut[outBucket] : [];
+        const merged = existing.concat(mine);
+        const seen = new Set();
+        const out = [];
+        for (const s of merged) {
+          const sid = toCleanString(s?.id);
+          if (sid) {
+            if (seen.has(sid)) continue;
+            seen.add(sid);
+          }
+          out.push(s);
+          if (out.length >= MAX_SUGGESTIONS_PER_CLUSTER) break;
+        }
+        suggestionsOut[outBucket] = out;
+      }
     }
 
     const votesOut = {};
@@ -1567,7 +2252,22 @@ export class CommunityAnnotationSession extends EventEmitter {
       if (!bucket) continue;
       if (!Array.isArray(ids)) continue;
       const cleaned = uniqueStrings(ids.map((x) => toCleanString(x)).filter(Boolean)).slice(0, 2000);
-      if (cleaned.length) deletedOut[bucket] = cleaned;
+      if (cleaned.length) {
+        const outBucket = this._canonicalizeBucketKey(bucket) || bucket;
+        const existing = Array.isArray(deletedOut[outBucket]) ? deletedOut[outBucket] : [];
+        deletedOut[outBucket] = uniqueStrings(existing.concat(cleaned)).slice(0, 5000);
+      }
+    }
+
+    const datasetsOut = {};
+    const datasets = normalizeDatasetAccessMap(this._state.datasets);
+    for (const datasetId of Object.keys(datasets).sort((a, b) => a.localeCompare(b))) {
+      const entry = datasets[datasetId] || null;
+      const lastAccessedAt = clampLen(entry?.lastAccessedAt, 64);
+      datasetsOut[datasetId] = {
+        fieldsToAnnotate: uniqueStrings(ensureStringArray(entry?.fieldsToAnnotate)).slice(0, 200),
+        lastAccessedAt: lastAccessedAt || nowIso()
+      };
     }
 
     return {
@@ -1581,11 +2281,43 @@ export class CommunityAnnotationSession extends EventEmitter {
       linkedin,
       email,
       updatedAt: nowIso(),
+      ...(Object.keys(datasetsOut).length ? { datasets: datasetsOut } : {}),
       suggestions: suggestionsOut,
       votes: votesOut,
       comments: commentsOut,
       deletedSuggestions: deletedOut
     };
+  }
+
+  /**
+   * Rebuild the merged suggestions view from a complete set of raw GitHub user files.
+   *
+   * Why this exists:
+   * - The UI "Pull" action should be able to deterministically rebuild the merged view
+   *   from cached raw files, without depending on any previously-compiled merged output.
+   * - Local (unsynced) intent still lives in this session (myVotes/myComments/my suggestions),
+   *   so we append a locally-built user doc as a final input.
+   *
+   * This method:
+   * 1) builds the local user's file doc from the current session state,
+   * 2) clears the compiled/merged suggestion view,
+   * 3) runs `mergeFromUserFiles()` against the complete inputs.
+   *
+   * @param {object[]} remoteUserDocs - parsed docs from `annotations/users/*.json`
+   * @param {object} [options]
+   * @param {boolean} [options.preferLocalVotes=true]
+   */
+  rebuildMergedViewFromUserFiles(remoteUserDocs, options = {}) {
+    const preferLocalVotes = options.preferLocalVotes !== false;
+
+    // Capture local intent before clearing the merged view.
+    const localDoc = this.buildUserFileDocument();
+
+    // Clear the previously-compiled merged output (but keep local intent: myVotes/myComments/etc).
+    this._state.suggestions = {};
+
+    const docs = Array.isArray(remoteUserDocs) ? remoteUserDocs : [];
+    this.mergeFromUserFiles(docs.concat([localDoc]), { preferLocalVotes });
   }
 
   markSyncedNow() {
@@ -1609,7 +2341,7 @@ export class CommunityAnnotationSession extends EventEmitter {
    */
   mergeFromUserFiles(userDocs, options = {}) {
     const preferLocalVotes = options.preferLocalVotes !== false;
-    const myUsername = this._profile?.username || 'local';
+    const myUsername = this._getEffectiveUserKey();
     const myUserLower = normalizeUsername(myUsername);
     const knownProfiles = this._knownProfiles && typeof this._knownProfiles === 'object' ? this._knownProfiles : {};
 
@@ -1679,7 +2411,7 @@ export class CommunityAnnotationSession extends EventEmitter {
     // to suggestions where `proposedBy` normalizes to U.
     const deletedByBucketById = new Map(); // bucket -> Map(suggestionId -> Set(usernameLower))
     const addDeleted = (bucket, suggestionId, username) => {
-      const b = toCleanString(bucket);
+      const b = this._canonicalizeBucketKey(bucket) || toCleanString(bucket);
       const sid = toCleanString(suggestionId);
       const u = normalizeUsername(username);
       if (!b || !sid || !u) return;
@@ -1697,7 +2429,7 @@ export class CommunityAnnotationSession extends EventEmitter {
     }
 
     const addSuggestion = (bucket, suggestion, { sourceUser = null } = {}) => {
-      const b = toCleanString(bucket);
+      const b = this._canonicalizeBucketKey(bucket) || toCleanString(bucket);
       if (!b) return;
       const normalized = normalizeSuggestion(suggestion || {}, { proposedBy: sourceUser || suggestion?.proposedBy || 'local' });
       if (!normalized) return;
@@ -1717,7 +2449,7 @@ export class CommunityAnnotationSession extends EventEmitter {
       const existing = m.get(id) || null;
       const sourceLower = sourceUser ? normalizeUsername(sourceUser) : '';
       const preferRemoteMeta = Boolean(sourceLower && myUserLower && sourceLower !== myUserLower);
-      m.set(id, preferRemoteMeta ? mergeSuggestionMetaPreferRight(existing, normalized) : mergeSuggestionMeta(existing, normalized));
+      m.set(id, mergeSuggestionMeta(existing, normalized, { preferIncoming: preferRemoteMeta }));
     };
 
     for (const [bucket, list] of Object.entries(this._state.suggestions || {})) {
@@ -1798,6 +2530,11 @@ export class CommunityAnnotationSession extends EventEmitter {
     // Only fill gaps: if local state has a vote/comment/deletion, it remains authoritative.
     try {
       if (myRemoteDoc && myUserLower) {
+        // 0) Dataset access metadata (informational): union per-user map.
+        if (myRemoteDoc.datasets != null) {
+          this._state.datasets = mergeDatasetAccessMaps(this._state.datasets, myRemoteDoc.datasets);
+        }
+
         // 1) Deleted suggestions (per-bucket)
         const remoteDeleted = myRemoteDoc.deletedSuggestions && typeof myRemoteDoc.deletedSuggestions === 'object'
           ? myRemoteDoc.deletedSuggestions
@@ -1829,7 +2566,8 @@ export class CommunityAnnotationSession extends EventEmitter {
             const parsed = parseVoteKey(voteKey);
             if (!parsed) continue;
             if (v !== 'up' && v !== 'down') continue;
-            const bucket = bucketKey(parsed.fieldKey, parsed.catIdx);
+            const bucket = idToBucket.get(toCleanString(parsed.suggestionId));
+            if (!bucket) continue;
             const target = toCleanString(resolveTargetForBucket(bucket, parsed.suggestionId));
             if (!target) continue;
             if (!localTargetsByBucket.has(bucket)) localTargetsByBucket.set(bucket, new Set());
@@ -1837,14 +2575,7 @@ export class CommunityAnnotationSession extends EventEmitter {
           }
 
           const parseBucketToParts = (bucket) => {
-            const b = toCleanString(bucket);
-            const last = b.lastIndexOf(':');
-            if (last < 0) return null;
-            const fieldKey = b.slice(0, last);
-            const catIdxRaw = b.slice(last + 1);
-            const catIdx = Number.isFinite(Number(catIdxRaw)) ? Math.max(0, Math.floor(Number(catIdxRaw))) : 0;
-            if (!fieldKey) return null;
-            return { fieldKey, catIdx };
+            return parseBucketKey(bucket);
           };
 
           for (const [sidRaw, dir] of Object.entries(remoteVotes)) {
@@ -1858,7 +2589,7 @@ export class CommunityAnnotationSession extends EventEmitter {
             if (target && localTargets && localTargets.has(target)) continue;
             const parts = parseBucketToParts(bucket);
             if (!parts) continue;
-            const k = suggestionKey(parts.fieldKey, parts.catIdx, sid);
+            const k = suggestionKey(parts.fieldKey, parts.catKey, sid);
             if (!this._state.myVotes) this._state.myVotes = {};
             if (this._state.myVotes[k] !== 'up' && this._state.myVotes[k] !== 'down') {
               this._state.myVotes[k] = d;
@@ -2021,11 +2752,11 @@ export class CommunityAnnotationSession extends EventEmitter {
   // -------------------------------------------------------------------------
 
   _ensureLoaded() {
-    const key = toStorageKey({ datasetId: this._datasetId, repoRef: this._repoRef, username: this._cacheUsername });
+    const key = toSessionStorageKey({ datasetId: this._datasetId, repoRef: this._repoRef, userId: this._cacheUserId });
     if (this._loadedForKey === key) return;
     this._loadedForKey = key;
 
-    const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(key) : null;
+    const raw = (key && typeof localStorage !== 'undefined') ? localStorage.getItem(key) : null;
     const parsed = raw ? safeJsonParse(raw) : null;
     const next = defaultState();
 
@@ -2056,7 +2787,6 @@ export class CommunityAnnotationSession extends EventEmitter {
         if (n.length > 256 || s.length > 128) continue;
         next.remoteFileShas[n] = s;
       }
-      next.pendingSync = Array.isArray(parsed.pendingSync) ? parsed.pendingSync.slice(0, 2000) : [];
       next.lastSyncAt = parsed.lastSyncAt || null;
 
       next.annotatableSettings = {};
@@ -2068,16 +2798,10 @@ export class CommunityAnnotationSession extends EventEmitter {
       }
 
       next.closedAnnotatableFields = {};
-      const closed = parsed.closedAnnotatableFields && typeof parsed.closedAnnotatableFields === 'object'
+      const closed = parsed.closedAnnotatableFields && typeof parsed.closedAnnotatableFields === 'object' && !Array.isArray(parsed.closedAnnotatableFields)
         ? parsed.closedAnnotatableFields
-        : (Array.isArray(parsed.closedAnnotatableFields) ? parsed.closedAnnotatableFields : null);
-      if (Array.isArray(closed)) {
-        for (const k of closed.slice(0, 500)) {
-          const key = toCleanString(k);
-          if (!key) continue;
-          next.closedAnnotatableFields[key] = true;
-        }
-      } else if (closed && typeof closed === 'object') {
+        : null;
+      if (closed) {
         for (const [k, v] of Object.entries(closed)) {
           const key = toCleanString(k);
           if (!key) continue;
@@ -2110,20 +2834,41 @@ export class CommunityAnnotationSession extends EventEmitter {
         const cleaned = uniqueStrings(ids.map((x) => toCleanString(x)).filter(Boolean)).slice(0, 5000);
         if (cleaned.length) next.deletedSuggestions[bucket] = cleaned;
       }
+
+      next.datasets = normalizeDatasetAccessMap(parsed.datasets);
     }
 
     this._state = next;
     this._profile = sanitizeProfile(next.profile || {});
-    // The cache key includes the "user" dimension; ensure the persisted profile username
-    // matches the active cache username so attribution/vote ownership stays consistent.
+
+    // The cache key includes the GitHub numeric user id dimension; ensure the persisted
+    // identity matches the active scope so attribution/vote ownership stays consistent.
     try {
-      const desiredUser = clampLen(String(this._cacheUsername || '').replace(/^@+/, ''), 64).toLowerCase() || 'local';
-      const currentUser = normalizeUsername(this._profile?.username || '') || 'local';
-      if (desiredUser && currentUser !== desiredUser) {
-        const fixedProfile = sanitizeProfile({ ...this._profile, username: desiredUser });
-        this._profile = fixedProfile;
-        this._state.profile = sanitizeProfile(fixedProfile);
-        this._scheduleSave();
+      const desiredId = normalizeGitHubUserIdOrNull(this._cacheUserId);
+      const desiredUserKey = desiredId ? toFileUserKeyFromId(desiredId) : null;
+      if (desiredId && desiredUserKey) {
+        const prevUserKey = normalizeUsername(this._profile?.username);
+        const fixedProfile = sanitizeProfile({ ...this._profile, username: desiredUserKey, githubUserId: desiredId });
+        const changed = (
+          normalizeGitHubUserIdOrNull(fixedProfile.githubUserId) !== normalizeGitHubUserIdOrNull(this._profile.githubUserId) ||
+          normalizeUsername(fixedProfile.username) !== normalizeUsername(this._profile.username)
+        );
+        if (changed) {
+          this._profile = fixedProfile;
+          this._state.profile = sanitizeProfile(fixedProfile);
+        }
+
+        // Repair any stale "local"/legacy attribution so suggestions and moderation actions remain
+        // editable + publishable under the correct file identity.
+        const fromKeys = [];
+        const desiredLower = normalizeUsername(desiredUserKey);
+        if (prevUserKey && desiredLower && prevUserKey !== desiredLower) fromKeys.push(prevUserKey);
+        fromKeys.push('local');
+        const didMigrate = this._migrateAttribution({ fromUserKeys: fromKeys, toUserKey: desiredUserKey });
+        if (changed || didMigrate) {
+          this._state.updatedAt = nowIso();
+          this._scheduleSave();
+        }
       }
     } catch {
       // ignore
@@ -2149,7 +2894,8 @@ export class CommunityAnnotationSession extends EventEmitter {
   }
 
   _saveNow() {
-    const key = toStorageKey({ datasetId: this._datasetId, repoRef: this._repoRef, username: this._cacheUsername });
+    const key = toSessionStorageKey({ datasetId: this._datasetId, repoRef: this._repoRef, userId: this._cacheUserId });
+    if (!key) return;
     const payload = JSON.stringify(this._state);
     try {
       localStorage.setItem(key, payload);

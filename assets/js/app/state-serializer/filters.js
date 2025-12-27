@@ -8,6 +8,7 @@
  */
 
 import { getCategoryColor } from '../../data/palettes.js';
+import { makeFieldId, parseFieldId } from '../utils/field-constants.js';
 
 /**
  * Compare two RGB colors for equality within a small epsilon.
@@ -88,7 +89,7 @@ export function serializeFiltersForFields(fields, source) {
         : isContinuousFieldModified(field);
     if (!modified) return;
 
-    const key = `${source}:${field.key}`;
+    const key = makeFieldId(source, field.key);
     if (field.kind === 'category') {
       const visibility = {};
       if (field._categoryVisible) {
@@ -193,8 +194,10 @@ export function createFilterSerializer({ state }) {
     const toRestore = [];
 
     for (const [key, data] of entries) {
-      const [source, fieldKey] = key.split(':');
-      if (!fieldKey) {
+      const parsed = parseFieldId(key);
+      const source = parsed?.source;
+      const fieldKey = parsed?.fieldKey;
+      if (!source || !fieldKey) {
         skippedNoop += 1;
         continue;
       }
@@ -306,4 +309,3 @@ export function createFilterSerializer({ state }) {
 
   return { serializeFiltersForFields, serializeFilters, restoreFilters };
 }
-

@@ -796,6 +796,87 @@ export class ComparisonModule {
   }
 
   /**
+   * Reset analysis UI + caches after an in-place dataset reload.
+   *
+   * In-place reload keeps the JS context alive (notably `local-user` datasets),
+   * so analysis UIs and caches that assume dataset-stable identities must be
+   * cleared to avoid cross-dataset state bleed.
+   *
+   * Safe to call even if the module is partially initialized.
+   *
+   * @param {object} [options]
+   * @param {string} [options.reason]
+   */
+  resetForDatasetReload({ reason = 'dataset-reload' } = {}) {
+    // Close any floating analysis windows first (they can hold WebGL/DOM resources).
+    try {
+      this._analysisWindowManager?.closeAll?.();
+    } catch {
+      // ignore
+    }
+
+    // Close embedded accordion panels (avoid showing stale results in-place).
+    try {
+      const items = this._modeToggleContainer?.querySelectorAll?.('.analysis-accordion-item') || [];
+      items.forEach((item) => {
+        item.classList.remove('open');
+        const header = item.querySelector?.('.analysis-accordion-header');
+        header?.setAttribute?.('aria-expanded', 'false');
+      });
+    } catch {
+      // ignore
+    }
+    try {
+      this._analysisMode = null;
+      this._uiManager?.clearActiveMode?.();
+    } catch {
+      // ignore
+    }
+
+    // Destroy and reset analysis UIs (clears per-UI caches/results).
+    try {
+      this._uiManager?.reset?.();
+    } catch {
+      // ignore
+    }
+
+    // Clear analysis-layer caches (DataLayer).
+    try {
+      this.dataLayer?.resetForDatasetReload?.();
+    } catch {
+      try {
+        this.dataLayer?.clearAllCaches?.();
+      } catch {
+        // ignore
+      }
+    }
+
+    // Drop cached analysis helpers/results that may retain dataset-specific state.
+    this._multiVariableAnalysis = null;
+    this._lastStatResults = [];
+    this._lastStatResultsTimestamp = null;
+    this._currentPageData = null;
+
+    // Re-seed page selection for the new dataset (best effort).
+    try {
+      this.onPagesChanged?.();
+    } catch {
+      // ignore
+    }
+
+    // Dev-only introspection hook (no user data, no tokens).
+    try {
+      this._datasetReloadResetCount = (Number(this._datasetReloadResetCount) || 0) + 1;
+      this._lastDatasetReloadReset = {
+        at: Date.now(),
+        reason: String(reason || '').trim() || 'dataset-reload'
+      };
+    } catch {
+      // ignore
+    }
+  }
+
+  /**
    * Get individual analysis UIs via manager
    * @returns {Object} Object with individual UI instances
    */

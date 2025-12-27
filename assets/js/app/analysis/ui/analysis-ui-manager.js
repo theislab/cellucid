@@ -438,6 +438,7 @@ export class AnalysisUIManager {
       entry.initialized = false;
     }
     this._activeMode = null;
+    this._currentPages = [];
   }
 }
 

@@ -1,8 +1,8 @@
 /**
  * GitHub App OAuth session (via Cloudflare Worker).
  *
- * - Starts OAuth via popup to `${WORKER_ORIGIN}/auth/login`
- * - Receives access token via `postMessage` from the popup
+ * - Starts OAuth via full-page redirect to `${WORKER_ORIGIN}/auth/login`
+ * - Worker redirects back to the app with token in URL fragment
  * - Stores token in `sessionStorage` (never `localStorage`)
  * - Fetches user identity from `${WORKER_ORIGIN}/auth/user`
  *
@@ -18,8 +18,24 @@ const TOKEN_KEY = 'cellucid:github-app-auth:token:v1';
 const USER_KEY = 'cellucid:github-app-auth:user:v1';
 const LAST_GITHUB_USER_KEY = 'cellucid:community-annotations:last-github-user-key';
 
+const AUTH_FLAG_PARAM = 'cellucid_github_auth';
+const AUTH_TOKEN_PARAM = 'cellucid_github_token';
+const AUTH_ERROR_PARAM = 'cellucid_github_error';
+
+const DEFAULT_FETCH_TIMEOUT_MS = 20_000;
+
 function toCleanString(value) {
   return String(value ?? '').trim();
+}
+
+function normalizeTimeoutMs(rawTimeoutMs, fallbackMs) {
+  const n = Number(rawTimeoutMs);
+  if (!Number.isFinite(n)) return fallbackMs;
+  return Math.max(0, Math.floor(n));
+}
+
+function isAbortError(err) {
+  return err?.name === 'AbortError';
 }
 
 function normalizeOriginOrDefault(rawOrigin) {
@@ -113,23 +129,49 @@ function writeLocalItem(key, value) {
   }
 }
 
-async function fetchJson(url, { method = 'GET', headers = null, body = null } = {}) {
-  const res = await fetch(url, {
-    method,
-    headers: headers || undefined,
-    body: body != null ? JSON.stringify(body) : undefined
-  });
+async function fetchJson(url, { method = 'GET', headers = null, body = null, timeoutMs = DEFAULT_FETCH_TIMEOUT_MS } = {}) {
+  const ms = normalizeTimeoutMs(timeoutMs, DEFAULT_FETCH_TIMEOUT_MS);
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const signal = controller?.signal;
 
-  const text = await res.text();
-  const asJson = text ? safeJsonParse(text) : null;
-  if (!res.ok) {
-    const msg = toCleanString(asJson?.error || asJson?.message || text) || `HTTP ${res.status}`;
-    const err = new Error(msg);
-    err.status = res.status;
-    err.url = url;
-    throw err;
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let timeout = null;
+  if (controller && ms > 0) {
+    timeout = setTimeout(() => {
+      try { controller.abort(); } catch { /* ignore */ }
+    }, ms);
   }
-  return asJson != null ? asJson : (text || null);
+
+  try {
+    const res = await fetch(url, {
+      method,
+      headers: headers || undefined,
+      body: body != null ? JSON.stringify(body) : undefined,
+      signal: signal || undefined
+    });
+
+    const text = await res.text();
+    const asJson = text ? safeJsonParse(text) : null;
+    if (!res.ok) {
+      const msg = toCleanString(asJson?.error || asJson?.message || text) || `HTTP ${res.status}`;
+      const err = new Error(msg);
+      err.status = res.status;
+      err.url = url;
+      throw err;
+    }
+    return asJson != null ? asJson : (text || null);
+  } catch (err) {
+    if (isAbortError(err)) {
+      const msg = ms > 0 ? `Request timed out after ${Math.max(1, Math.round(ms / 1000))}s` : 'Request aborted';
+      const e = new Error(msg);
+      e.code = 'TIMEOUT';
+      e.url = url;
+      throw e;
+    }
+    throw err;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
 }
 
 export function getGitHubLoginUrl(workerOrigin = null) {
@@ -154,78 +196,37 @@ export function getLastGitHubUserKey() {
   return safe ? `ghid_${safe}` : null;
 }
 
-function openAuthWindow(workerOrigin, mode) {
-  const url = getGitHubLoginUrl(workerOrigin);
-  const m = toCleanString(mode || 'popup');
-  if (m === 'tab') {
-    return window.open(url, 'cellucid-github-auth');
+function readAuthResultFromUrl(urlString) {
+  if (typeof window === 'undefined') return null;
+  const href = toCleanString(urlString || window.location?.href || '');
+  if (!href) return null;
+
+  /** @type {URL|null} */
+  let url = null;
+  try {
+    url = new URL(href);
+  } catch {
+    return null;
   }
-  const features = [
-    'popup=yes',
-    'width=600',
-    'height=700',
-    'menubar=no',
-    'toolbar=no',
-    'location=no',
-    'status=no',
-    'resizable=yes',
-    'scrollbars=yes'
-  ].join(',');
-  return window.open(url, 'cellucid-github-auth', features);
-}
 
-async function waitForAuthMessage({ workerOrigin, popup, timeoutMs = 120_000 } = {}) {
-  const expectedOrigin = new URL(workerOrigin).origin;
-  const startedAt = Date.now();
+  const hash = String(url.hash || '').replace(/^#/, '');
+  if (!hash) return null;
 
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    /** @type {number|null} */
-    let timer = null;
-    /** @type {number|null} */
-    let timeout = null;
-    const cleanup = () => {
-      window.removeEventListener('message', onMessage);
-      if (timer != null) clearInterval(timer);
-      if (timeout != null) clearTimeout(timeout);
-    };
-    const settleOnce = (fn, value) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      fn(value);
-    };
+  const params = new URLSearchParams(hash);
+  const flag = toCleanString(params.get(AUTH_FLAG_PARAM) || '');
+  if (!flag) return null;
 
-    const onMessage = (event) => {
-      if (event.origin !== expectedOrigin) return;
-      if (popup && event.source !== popup) return;
-      const data = event.data || null;
-      if (!data || data.type !== 'cellucid-github-auth') return;
-      const token = toCleanString(data.token || '');
-      const error = toCleanString(data.error || data.message || '');
-      if (token) settleOnce(resolve, token);
-      else settleOnce(reject, new Error(error || 'GitHub login failed'));
-    };
+  const token = toCleanString(params.get(AUTH_TOKEN_PARAM) || '') || null;
+  const error = toCleanString(params.get(AUTH_ERROR_PARAM) || '') || null;
 
-    window.addEventListener('message', onMessage);
+  params.delete(AUTH_FLAG_PARAM);
+  params.delete(AUTH_TOKEN_PARAM);
+  params.delete(AUTH_ERROR_PARAM);
 
-    timer = setInterval(() => {
-      if (settled) return;
-      const elapsed = Date.now() - startedAt;
-      if (elapsed > timeoutMs) {
-        settleOnce(reject, new Error('GitHub login timed out'));
-        return;
-      }
-      if (popup && popup.closed) {
-        settleOnce(reject, new Error('GitHub login was cancelled'));
-      }
-    }, 350);
+  const cleanedHash = params.toString();
+  const cleanedUrl = `${url.origin}${url.pathname}${url.search}${cleanedHash ? `#${cleanedHash}` : ''}`;
 
-    timeout = setTimeout(() => {
-      if (settled) return;
-      settleOnce(reject, new Error('GitHub login timed out'));
-    }, timeoutMs + 1000);
-  });
+  return { token, error, cleanedUrl };
 }
 
 export class GitHubAuthSession extends EventEmitter {
@@ -307,34 +308,50 @@ export class GitHubAuthSession extends EventEmitter {
     return { token: this._token, user: this._user };
   }
 
-  async completeSignInFromMessage({ timeoutMs = 120_000 } = {}) {
+  async completeSignInFromRedirect({ url = null } = {}) {
     if (typeof window === 'undefined') throw new Error('GitHub login requires a browser context');
-    const workerOrigin = this.getWorkerOrigin();
-    const token = await waitForAuthMessage({ workerOrigin, popup: null, timeoutMs });
-    return this._acceptToken(token);
-  }
+    const result = readAuthResultFromUrl(url || window.location?.href || '');
+    if (!result) return null;
 
-  async signIn({ mode = 'auto' } = {}) {
-    if (typeof window === 'undefined') throw new Error('GitHub login requires a browser context');
-    const workerOrigin = this.getWorkerOrigin();
-    /** @type {Window|null} */
-    let authWindow = null;
-
-    if (mode === 'auto') {
-      // "Tab" mode avoids popup blockers in some browsers.
-      authWindow = openAuthWindow(workerOrigin, 'tab') || openAuthWindow(workerOrigin, 'popup');
-    } else {
-      authWindow = openAuthWindow(workerOrigin, mode);
+    if (result.cleanedUrl) {
+      try {
+        window.history?.replaceState?.(null, '', result.cleanedUrl);
+      } catch {
+        // ignore
+      }
     }
 
-    if (!authWindow) {
-      const err = new Error('Sign-in window blocked: allow popups/new tabs for Cellucid to sign in with GitHub');
-      err.code = 'POPUP_BLOCKED';
+    if (result.error) {
+      const err = new Error(result.error);
+      err.code = 'GITHUB_AUTH_ERROR';
       throw err;
     }
 
-    const token = await waitForAuthMessage({ workerOrigin, popup: authWindow });
-    return this._acceptToken(token);
+    if (!result.token) {
+      const err = new Error('Missing GitHub token');
+      err.code = 'GITHUB_AUTH_MISSING_TOKEN';
+      throw err;
+    }
+
+    return this._acceptToken(result.token);
+  }
+
+  signIn({ returnTo = null } = {}) {
+    if (typeof window === 'undefined') throw new Error('GitHub login requires a browser context');
+    const workerOrigin = this.getWorkerOrigin();
+    const rt = (() => {
+      const raw = toCleanString(returnTo || '');
+      if (raw) return raw;
+      try {
+        const { origin, pathname, search } = window.location;
+        return `${origin}${pathname}${search || ''}`;
+      } catch {
+        return toCleanString(window.location?.href || '');
+      }
+    })();
+    const url = new URL(getGitHubLoginUrl(workerOrigin));
+    if (rt) url.searchParams.set('return_to', rt);
+    window.location.assign(url.toString());
   }
 
   signOut() {

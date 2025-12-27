@@ -16,17 +16,13 @@ annotations/
   schema.json
   users/
     (one JSON file per contributor)
-  consensus/
-    merged.json   (optional; written by GitHub Actions)
   moderation/
     merges.json   (optional; written by authors via Cellucid)
 .github/
   workflows/
     validate.yml        (recommended)
-    build-consensus.yml (recommended)
 scripts/
   validate_user_files.py
-  build_consensus.py
 ```
 
 The folder `cellucid-annotation/` in this workspace is a ready-to-use template you can copy into a new GitHub repo.
@@ -39,8 +35,10 @@ Option A (recommended):
 1. Create a new GitHub repository (public or private).
 2. Copy the contents of `cellucid-annotation/` into the root of that repo.
 3. Update `annotations/config.json`:
-   - Set your dataset id in `supportedDatasets[].datasetId`
-   - Optionally set `fieldsToAnnotate`
+   - Add one entry per dataset id in `supportedDatasets[].datasetId`
+   - Optionally set `fieldsToAnnotate` (categorical obs columns that are votable)
+   - Optionally set `annotatableSettings` per field (`minAnnotators`, `threshold`)
+   - Optionally set `closedFields` (temporarily lock voting on selected fields)
 4. Commit and push.
 
 Option B:
@@ -62,6 +60,15 @@ Install the Cellucid GitHub App and grant it access to the annotation repo.
 4. Click **Choose repo** and select the repo (only installed repos appear).
 5. Click **Pull** to fetch latest annotations.
 6. Make local changes, then **Publish**.
+
+### Dataset mismatch behavior
+
+If the dataset currently loaded in Cellucid is not listed in `annotations/config.json` for the connected repo:
+
+- **Annotators** are blocked (no Pull / no viewing or downloading annotations).
+- **Authors** can connect anyway (with a confirmation) to update settings, then **Publish**.
+  - Publish automatically adds/updates the `supportedDatasets[]` entry for the current dataset id in `annotations/config.json` (no manual editing required).
+  - Annotators are unblocked after this is published.
 
 ### Shareable links
 
@@ -91,12 +98,27 @@ Fork + PR notes:
 - **Annotator**: can Pull and submit their own `annotations/users/ghid_<id>.json` (direct push if allowed; otherwise fork + PR).
 - **Author** (**maintain/admin** access to repo): additionally can:
   - Control which categorical obs columns are annotatable (stored in `annotations/config.json`)
-  - Merge suggestions (stored in `annotations/moderation/merges.json`; votes are summed; history notes recorded)
+  - Set per-field consensus settings (`minAnnotators`, `threshold`) and optionally close fields (`closedFields`)
+  - Merge suggestions (stored in `annotations/moderation/merges.json`; votes are summed; merge notes are recorded and editable)
 
 In the Cellucid UI, **Publish** (for authors) pushes:
 - Your user file (`annotations/users/ghid_<id>.json`)
-- The current annotatable-column selection (`annotations/config.json`)
+- The current annotatable settings (`annotations/config.json`)
 - Any recorded merges (`annotations/moderation/merges.json`)
+
+## Timestamps and edits
+
+- Suggestions in `annotations/users/ghid_<id>.json` always have `proposedAt`, and may have `editedAt` if you edit the suggestion later.
+- Comments always have `createdAt`, and may have `editedAt` if you edit the comment later.
+- Moderation merges in `annotations/moderation/merges.json` always have `at`, and may have `editedAt` if you edit the merge note later; `by` is stored as `ghid_<githubUserId>`.
+
+## Bucket keys (Developer note)
+
+In `annotations/users/ghid_<id>.json`, the `suggestions` and `deletedSuggestions` maps are keyed by a **bucket key**:
+
+- Format: `<fieldKey>:<categoryLabel>`
+- If `fieldKey` contains `:`, Cellucid encodes it as `fk~<urlencoded>` to keep the delimiter unambiguous.
+  - Example: `fieldKey="celltype:coarse"` → bucket key starts with `fk~celltype%3Acoarse:...`
 
 ## Token Storage (Security)
 
@@ -108,9 +130,20 @@ In the Cellucid UI, **Publish** (for authors) pushes:
 The template includes:
 
 - `validate.yml`: validates `annotations/config.json` and all `annotations/users/*.json`
-- `build-consensus.yml`: builds `annotations/consensus/merged.json` on each push
 
-These workflows run entirely in GitHub and keep the repo consistent for all collaborators.
+This workflow runs entirely in GitHub and keeps the repo consistent for all collaborators.
+
+### About consensus compilation
+
+This template does **not** commit a pre-merged consensus artifact (like `merged.json`) to the repo.
+
+Instead, on **Pull** Cellucid:
+
+- Lists `annotations/users/*.json` and the optional `annotations/moderation/merges.json`
+- Downloads only files whose GitHub `sha` changed since your last Pull (cached locally per `datasetId + owner/repo@branch + user.id`)
+- Compiles the merged suggestions + consensus view in the browser
+
+From the sidebar you can download a locally-built `consensus.json` snapshot for downstream usage.
 
 ---
 

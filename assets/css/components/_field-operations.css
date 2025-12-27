@@ -329,6 +329,7 @@
   font-size: var(--text-sm);
   line-height: 1.45;
   color: var(--color-text-secondary);
+  white-space: pre-line;
 }
 
 .confirm-dialog-input {

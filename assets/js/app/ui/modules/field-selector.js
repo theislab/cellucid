@@ -26,12 +26,10 @@ import { initGeneExpressionSelector } from './field-selector-gene-expression.js'
 import { getCommunityAnnotationSession } from '../../community-annotations/session.js';
 import {
   getCommunityAnnotationAccessStore,
-  isAnnotationRepoConnected,
-  isSimulateRepoConnectedEnabled
+  isAnnotationRepoConnected
 } from '../../community-annotations/access-store.js';
-import { getAnnotationRepoForDataset, getLastAnnotationRepoForDataset } from '../../community-annotations/repo-store.js';
+import { syncCommunityAnnotationCacheContext } from '../../community-annotations/runtime-context.js';
 import { ANNOTATION_CONNECTION_CHANGED_EVENT } from '../../community-annotations/connection-events.js';
-import { getGitHubAuthSession, getLastGitHubUserKey, toGitHubUserKey } from '../../community-annotations/github-auth.js';
 
 /**
  * @typedef {object} FieldSelectorCallbacks
@@ -75,21 +73,15 @@ export function initFieldSelector({ state, dom, dataSourceManager = null, callba
   const access = getCommunityAnnotationAccessStore();
   const lifecycle = typeof AbortController !== 'undefined' ? new AbortController() : null;
   try {
-    const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
-    annotationSession.setDatasetId?.(datasetId);
+    syncCommunityAnnotationCacheContext({ dataSourceManager });
   } catch {
     // ignore
   }
 
   function isCommunityAnnotationUiEnabled() {
     try {
-      const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
-      const auth = getGitHubAuthSession();
-      const authedKey = auth.isAuthenticated?.() ? toGitHubUserKey(auth.getUser?.()) : null;
-      const username = authedKey
-        ? String(authedKey)
-        : (isSimulateRepoConnectedEnabled() ? (getLastGitHubUserKey() || (annotationSession.getProfile?.()?.username || 'local')) : (annotationSession.getProfile?.()?.username || 'local'));
-      return isAnnotationRepoConnected(datasetId, username);
+      const ctx = syncCommunityAnnotationCacheContext({ dataSourceManager });
+      return isAnnotationRepoConnected(ctx.datasetId, ctx.userKey);
     } catch {
       return false;
     }
@@ -172,26 +164,16 @@ export function initFieldSelector({ state, dom, dataSourceManager = null, callba
     }
   });
 
-  function renderFieldSelects() {
-    if (!categoricalSelect || !continuousSelect) return;
+	  function renderFieldSelects() {
+	    if (!categoricalSelect || !continuousSelect) return;
 
-    let annotationUiEnabled = false;
-    try {
-      const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
-      const auth = getGitHubAuthSession();
-      const authedKey = auth.isAuthenticated?.() ? toGitHubUserKey(auth.getUser?.()) : null;
-      const username = authedKey
-        ? String(authedKey)
-        : (isSimulateRepoConnectedEnabled() ? (getLastGitHubUserKey() || (annotationSession.getProfile?.()?.username || 'local')) : (annotationSession.getProfile?.()?.username || 'local'));
-      let repoRef = getAnnotationRepoForDataset(datasetId, username) || null;
-      if (!repoRef && isSimulateRepoConnectedEnabled()) {
-        repoRef = getLastAnnotationRepoForDataset(datasetId, username) || null;
-      }
-      annotationSession.setCacheContext?.({ datasetId, repoRef, username });
-      annotationUiEnabled = isAnnotationRepoConnected(datasetId, username);
-    } catch {
-      // ignore
-    }
+	    let annotationUiEnabled = false;
+	    try {
+	      const ctx = syncCommunityAnnotationCacheContext({ dataSourceManager });
+	      annotationUiEnabled = isAnnotationRepoConnected(ctx.datasetId, ctx.userKey);
+	    } catch {
+	      // ignore
+	    }
 
     const fields = state.getFields?.() || [];
     const categoricalFields = getFieldsByKind(FieldKind.CATEGORY);

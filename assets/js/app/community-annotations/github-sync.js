@@ -12,10 +12,29 @@
  */
 
 import { getGitHubAuthSession, getGitHubWorkerOrigin } from './github-auth.js';
-import { getAnnotationRepoForDataset, setAnnotationRepoForDataset } from './repo-store.js';
+import {
+  getAnnotationRepoForDataset,
+  getAnnotationRepoMetaForDataset,
+  setAnnotationRepoForDataset,
+  setAnnotationRepoMetaForDataset
+} from './repo-store.js';
+
+const GITHUB_DEFAULT_TIMEOUT_MS = 20_000;
+const DEFAULT_USER_PULL_CONCURRENCY = 8;
+const MAX_USER_FILES_PER_PULL = 2000;
 
 function toCleanString(value) {
   return String(value ?? '').trim();
+}
+
+function normalizeTimeoutMs(rawTimeoutMs, fallbackMs) {
+  const n = Number(rawTimeoutMs);
+  if (!Number.isFinite(n)) return fallbackMs;
+  return Math.max(0, Math.floor(n));
+}
+
+function isAbortError(err) {
+  return err?.name === 'AbortError';
 }
 
 function safeJsonParse(text) {
@@ -42,6 +61,56 @@ function uniqueStrings(values) {
     if (!s || seen.has(s)) continue;
     seen.add(s);
     out.push(s);
+  }
+  return out;
+}
+
+function parseDateMsOrNull(value) {
+  const s = toCleanString(value);
+  if (!s) return null;
+  const ms = Date.parse(s);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function normalizeDatasetAccessMap(map) {
+  const input = (map && typeof map === 'object' && !Array.isArray(map)) ? map : null;
+  const out = {};
+  if (!input) return out;
+  for (const [datasetIdRaw, entry] of Object.entries(input)) {
+    const datasetId = toCleanString(datasetIdRaw);
+    if (!datasetId || !entry || typeof entry !== 'object') continue;
+    const fields = uniqueStrings(Array.isArray(entry.fieldsToAnnotate) ? entry.fieldsToAnnotate : []).slice(0, 200);
+    const lastAccessedAt = toCleanString(entry.lastAccessedAt) || null;
+    out[datasetId] = { fieldsToAnnotate: fields, lastAccessedAt };
+  }
+  return out;
+}
+
+function mergeDatasetAccessMaps(left, right) {
+  const a = normalizeDatasetAccessMap(left);
+  const b = normalizeDatasetAccessMap(right);
+  const out = { ...a };
+  for (const [datasetId, entry] of Object.entries(b)) {
+    const prev = out[datasetId] || null;
+    if (!prev) {
+      out[datasetId] = entry;
+      continue;
+    }
+    const prevMs = parseDateMsOrNull(prev.lastAccessedAt);
+    const nextMs = parseDateMsOrNull(entry.lastAccessedAt);
+    if (prevMs != null && nextMs != null) {
+      out[datasetId] = nextMs >= prevMs ? entry : prev;
+      continue;
+    }
+    if (prevMs == null && nextMs != null) {
+      out[datasetId] = entry;
+      continue;
+    }
+    if (prevMs != null && nextMs == null) {
+      out[datasetId] = prev;
+      continue;
+    }
+    out[datasetId] = entry.fieldsToAnnotate.length >= prev.fieldsToAnnotate.length ? entry : prev;
   }
   return out;
 }
@@ -90,6 +159,25 @@ function decodeBase64Utf8(b64) {
 function sleep(ms) {
   const t = Math.max(0, Math.floor(Number(ms) || 0));
   return new Promise((resolve) => setTimeout(resolve, t));
+}
+
+async function mapWithConcurrency(items, concurrency, fn) {
+  const list = Array.isArray(items) ? items : [];
+  const limit = Math.max(1, Math.floor(Number(concurrency) || 1));
+  const results = new Array(list.length);
+  if (!list.length) return results;
+
+  let nextIndex = 0;
+  const workers = new Array(Math.min(limit, list.length)).fill(null).map(async () => {
+    while (true) {
+      const idx = nextIndex;
+      nextIndex += 1;
+      if (idx >= list.length) return;
+      results[idx] = await fn(list[idx], idx);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 export function parseOwnerRepo(input) {
@@ -190,7 +278,7 @@ function toWorkerAuthUrl(workerOrigin, workerPath) {
   return new URL(`${origin}${p}`);
 }
 
-async function githubRequest(workerOrigin, path, { token = null, method = 'GET', query = null, body = null } = {}) {
+async function githubRequest(workerOrigin, path, { token = null, method = 'GET', query = null, body = null, timeoutMs = GITHUB_DEFAULT_TIMEOUT_MS } = {}) {
   const url = toWorkerApiUrl(workerOrigin, path);
   if (query && typeof query === 'object') {
     for (const [k, v] of Object.entries(query)) {
@@ -205,52 +293,114 @@ async function githubRequest(workerOrigin, path, { token = null, method = 'GET',
   if (token) headers.Authorization = `Bearer ${token}`;
   if (body != null) headers['Content-Type'] = 'application/json';
 
-  const res = await fetch(url.toString(), {
-    method,
-    headers,
-    body: body != null ? JSON.stringify(body) : undefined
-  });
+  const ms = normalizeTimeoutMs(timeoutMs, GITHUB_DEFAULT_TIMEOUT_MS);
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const signal = controller?.signal;
 
-  const text = await res.text();
-  const asJson = text ? safeJsonParse(text) : null;
-
-  if (!res.ok) {
-    const msg =
-      toCleanString(asJson?.message) ||
-      toCleanString(text) ||
-      `GitHub HTTP ${res.status}`;
-    const err = new Error(msg);
-    // attach minimal context (no token)
-    err.status = res.status;
-    err.github = { path, method };
-    throw err;
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let timeout = null;
+  if (controller && ms > 0) {
+    timeout = setTimeout(() => {
+      try { controller.abort(); } catch { /* ignore */ }
+    }, ms);
   }
 
-  return asJson != null ? asJson : (text || null);
+  try {
+    const res = await fetch(url.toString(), {
+      method,
+      headers,
+      body: body != null ? JSON.stringify(body) : undefined,
+      signal: signal || undefined
+    });
+
+    const text = await res.text();
+    const asJson = text ? safeJsonParse(text) : null;
+
+    if (!res.ok) {
+      const msg =
+        toCleanString(asJson?.message) ||
+        toCleanString(text) ||
+        `GitHub HTTP ${res.status}`;
+      const err = new Error(msg);
+      // attach minimal context (no token)
+      err.status = res.status;
+      err.github = { path, method };
+      throw err;
+    }
+
+    return asJson != null ? asJson : (text || null);
+  } catch (err) {
+    if (isAbortError(err)) {
+      const msg = ms > 0 ? `GitHub request timed out after ${Math.max(1, Math.round(ms / 1000))}s` : 'GitHub request aborted';
+      const e = new Error(msg);
+      e.code = 'TIMEOUT';
+      e.github = { path, method };
+      throw e;
+    }
+    try {
+      if (err && typeof err === 'object' && !err.github) err.github = { path, method };
+    } catch {
+      // ignore
+    }
+    throw err;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
 }
 
-async function workerAuthRequest(workerOrigin, path, { token = null, method = 'GET', body = null } = {}) {
+async function workerAuthRequest(workerOrigin, path, { token = null, method = 'GET', body = null, timeoutMs = GITHUB_DEFAULT_TIMEOUT_MS } = {}) {
   const url = toWorkerAuthUrl(workerOrigin, path);
   const headers = {};
   if (token) headers.Authorization = `Bearer ${token}`;
   if (body != null) headers['Content-Type'] = 'application/json';
 
-  const res = await fetch(url.toString(), {
-    method,
-    headers,
-    body: body != null ? JSON.stringify(body) : undefined
-  });
+  const ms = normalizeTimeoutMs(timeoutMs, GITHUB_DEFAULT_TIMEOUT_MS);
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const signal = controller?.signal;
 
-  const text = await res.text();
-  const asJson = text ? safeJsonParse(text) : null;
-  if (!res.ok) {
-    const msg = toCleanString(asJson?.error || asJson?.message || text) || `HTTP ${res.status}`;
-    const err = new Error(msg);
-    err.status = res.status;
-    err.worker = { path, method };
-    throw err;
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let timeout = null;
+  if (controller && ms > 0) {
+    timeout = setTimeout(() => {
+      try { controller.abort(); } catch { /* ignore */ }
+    }, ms);
   }
-  return asJson != null ? asJson : (text || null);
+
+  try {
+    const res = await fetch(url.toString(), {
+      method,
+      headers,
+      body: body != null ? JSON.stringify(body) : undefined,
+      signal: signal || undefined
+    });
+
+    const text = await res.text();
+    const asJson = text ? safeJsonParse(text) : null;
+    if (!res.ok) {
+      const msg = toCleanString(asJson?.error || asJson?.message || text) || `HTTP ${res.status}`;
+      const err = new Error(msg);
+      err.status = res.status;
+      err.worker = { path, method };
+      throw err;
+    }
+    return asJson != null ? asJson : (text || null);
+  } catch (err) {
+    if (isAbortError(err)) {
+      const msg = ms > 0 ? `Auth request timed out after ${Math.max(1, Math.round(ms / 1000))}s` : 'Auth request aborted';
+      const e = new Error(msg);
+      e.code = 'TIMEOUT';
+      e.worker = { path, method };
+      throw e;
+    }
+    try {
+      if (err && typeof err === 'object' && !err.worker) err.worker = { path, method };
+    } catch {
+      // ignore
+    }
+    throw err;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
 }
 
 async function getRepoInfo({ workerOrigin, owner, repo, token = null }) {
@@ -284,17 +434,35 @@ async function putContent({ workerOrigin, owner, repo, token, path, branch, mess
   );
 }
 
-async function putContentWithSingleRetry({ workerOrigin, owner, repo, token, path, branch, message, contentBase64, sha = null, refForRefresh = null }) {
-  try {
-    return await putContent({ workerOrigin, owner, repo, token, path, branch, message, contentBase64, sha });
-  } catch (err) {
-    // Resolve rare sha mismatch races (concurrent writes).
-    if (err?.status !== 409) throw err;
-    const ref = toCleanString(refForRefresh) || toCleanString(branch) || null;
-    const existing = await getContent({ workerOrigin, owner, repo, token, path, ref });
-    const nextSha = existing?.type === 'file' ? toCleanString(existing?.sha || '') || null : null;
-    return putContent({ workerOrigin, owner, repo, token, path, branch, message, contentBase64, sha: nextSha });
+async function putContentWithRetry({
+  workerOrigin,
+  owner,
+  repo,
+  token,
+  path,
+  branch,
+  message,
+  contentBase64,
+  sha = null,
+  refForRefresh = null,
+  maxAttempts = 3
+}) {
+  const max = Math.max(1, Math.floor(Number(maxAttempts) || 3));
+  let nextSha = sha;
+  for (let attempt = 0; attempt < max; attempt++) {
+    try {
+      return await putContent({ workerOrigin, owner, repo, token, path, branch, message, contentBase64, sha: nextSha });
+    } catch (err) {
+      // Resolve rare sha mismatch races (concurrent writes).
+      if (err?.status !== 409 || attempt === max - 1) throw err;
+      const ref = toCleanString(refForRefresh) || toCleanString(branch) || null;
+      const existing = await getContent({ workerOrigin, owner, repo, token, path, ref });
+      nextSha = existing?.type === 'file' ? toCleanString(existing?.sha || '') || null : null;
+      // Small backoff helps when multiple publishes race in different tabs.
+      await sleep(120 * Math.pow(2, attempt));
+    }
   }
+  throw new Error('Unable to publish file (retry limit)');
 }
 
 async function readJsonFile({ workerOrigin, owner, repo, token = null, path, ref = null }) {
@@ -332,8 +500,8 @@ function normalizeModerationMergesDoc(doc) {
   };
 
   const isNewer = (prev, next) => {
-    const ax = toCleanString(prev?.at || '');
-    const ay = toCleanString(next?.at || '');
+    const ax = toCleanString(prev?.editedAt || prev?.at || '');
+    const ay = toCleanString(next?.editedAt || next?.at || '');
     if (ax && ay && ay > ax) return true;
     if (ax && ay && ax > ay) return false;
     if (!ax && ay) return true;
@@ -352,13 +520,20 @@ function normalizeModerationMergesDoc(doc) {
     if (!bucket || !fromSuggestionId || !intoSuggestionId) continue;
     if (fromSuggestionId === intoSuggestionId) continue;
 
+    const byRaw = toCleanString(raw?.by || '').replace(/^@+/, '').toLowerCase();
+    const atRaw = toCleanString(raw?.at || '');
+    const by = clamp(byRaw, 64);
+    const at = clamp(atRaw, 64);
+    if (!by || !at) continue;
+
     const entry = {
       bucket,
       fromSuggestionId,
       intoSuggestionId,
-      ...(toCleanString(raw?.by || '') ? { by: clamp(raw?.by, 64) } : {}),
-      ...(toCleanString(raw?.at || '') ? { at: clamp(raw?.at, 64) } : {}),
-      ...(toCleanString(raw?.note || '') ? { note: clamp(raw?.note, 500) } : {})
+      by,
+      at,
+      ...(toCleanString(raw?.editedAt || '') ? { editedAt: clamp(raw?.editedAt, 64) } : {}),
+      ...(toCleanString(raw?.note || '') ? { note: clamp(raw?.note, 512) } : {})
     };
     const key = `${bucket}::${fromSuggestionId}`;
     const prev = newestByKey.get(key) || null;
@@ -689,15 +864,24 @@ export class CommunityAnnotationGitHubSync {
       const prev = known ? toCleanString(known[path] || '') : '';
       if (sha && prev && sha === prev) return { doc: null, sha, path, fetched: false };
 
-      const { json } = await readJsonFile({
-        workerOrigin,
-        owner: this.owner,
-        repo: this.repo,
-        token,
-        path,
-        ref: branch
-      });
-      return { doc: json, sha, path, fetched: true };
+      try {
+        const { json } = await readJsonFile({
+          workerOrigin,
+          owner: this.owner,
+          repo: this.repo,
+          token,
+          path,
+          ref: branch
+        });
+        return { doc: json, sha, path, fetched: true };
+      } catch (err) {
+        // Treat invalid JSON as a recoverable case so callers can cache the SHA and surface UX.
+        const msg = err?.message || String(err);
+        if (/invalid json/i.test(String(msg))) {
+          return { doc: { __invalid: true, __error: msg }, sha, path, fetched: true };
+        }
+        throw err;
+      }
     } catch (err) {
       if (isNotFoundError(err)) return { doc: null, sha: null, path, fetched: false };
       throw err;
@@ -788,9 +972,10 @@ export class CommunityAnnotationGitHubSync {
       ref: branch
     });
 
-    const jsonFiles = entries
-      .filter((e) => e?.type === 'file' && typeof e?.name === 'string' && /^ghid_\d+\.json$/i.test(e.name))
-      .slice(0, 2000);
+    const allJsonFiles = entries
+      .filter((e) => e?.type === 'file' && typeof e?.name === 'string' && /^ghid_\d+\.json$/i.test(e.name));
+    const jsonFiles = allJsonFiles.slice(0, MAX_USER_FILES_PER_PULL);
+    const truncatedCount = Math.max(0, allJsonFiles.length - jsonFiles.length);
 
     /** @type {Record<string, string>} */
     const nextShas = {};
@@ -809,14 +994,19 @@ export class CommunityAnnotationGitHubSync {
       return !prev || prev !== sha;
     };
 
-    const out = [];
-    let fetchedCount = 0;
+    const toFetch = [];
     for (const f of jsonFiles) {
       const name = toCleanString(f?.name);
-      const sha = toCleanString(f?.sha);
       if (!name) continue;
+      const sha = toCleanString(f?.sha) || null;
       const path = `annotations/users/${name}`;
       if (sha && !needsFetch(path, sha)) continue;
+      toFetch.push({ name, sha, path });
+    }
+
+    const concurrency = DEFAULT_USER_PULL_CONCURRENCY;
+    const out = (await mapWithConcurrency(toFetch, concurrency, async ({ name, sha, path }) => {
+      const fileUser = toCleanString(name.replace(/\.json$/i, '')) || null;
       try {
         const { json } = await readJsonFile({
           workerOrigin,
@@ -826,25 +1016,24 @@ export class CommunityAnnotationGitHubSync {
           path,
           ref: branch
         });
-        const fileUser = toCleanString(name.replace(/\.json$/i, '')) || null;
-        const doc = (json && typeof json === 'object')
+        return (json && typeof json === 'object')
           ? { ...json, __path: path, __fileUser: fileUser, __sha: sha || null }
-          : { __invalid: true, __path: name, __error: 'Invalid JSON shape (expected object)' };
-        out.push(doc);
-        fetchedCount++;
+          : { __invalid: true, __path: path, __fileUser: fileUser, __sha: sha || null, __error: 'Invalid JSON shape (expected object)' };
       } catch (err) {
         // Skip invalid files; surface in UI via aggregate error if needed.
         // (No token in error message.)
-        out.push({ __invalid: true, __path: name, __error: err?.message || String(err) });
-        fetchedCount++;
+        return { __invalid: true, __path: path, __fileUser: fileUser, __sha: sha || null, __error: err?.message || String(err) };
       }
-    }
+    })).filter(Boolean);
 
     return {
       docs: out,
       shas: nextShas,
-      fetchedCount,
-      totalCount: jsonFiles.length
+      fetchedCount: toFetch.length,
+      totalCount: jsonFiles.length,
+      availableCount: allJsonFiles.length,
+      truncatedCount,
+      concurrency
     };
   }
 
@@ -891,13 +1080,15 @@ export class CommunityAnnotationGitHubSync {
 
     let sha = null;
     let remoteUpdatedAt = null;
+    let remoteDoc = null;
     try {
       const existing = await getContent({ workerOrigin, owner: this.owner, repo: this.repo, token, path, ref: branch });
       if (existing?.type === 'file' && existing?.sha) {
         sha = existing.sha;
         const decoded = decodeBase64Utf8(existing?.content || '');
         const parsed = decoded ? safeJsonParse(decoded) : null;
-        remoteUpdatedAt = toCleanString(parsed?.updatedAt) || null;
+        remoteDoc = (parsed && typeof parsed === 'object') ? parsed : null;
+        remoteUpdatedAt = toCleanString(remoteDoc?.updatedAt) || null;
       }
     } catch (err) {
       // If not found, we'll create it. Otherwise bubble up.
@@ -926,6 +1117,12 @@ export class CommunityAnnotationGitHubSync {
     const allowForking = repoInfo?.allow_forking !== false;
 
     const docToWrite = { ...(userDoc && typeof userDoc === 'object' ? userDoc : {}), username: fileUser, githubUserId: id };
+    // Preserve per-user dataset access metadata across publishes (informational; does not affect annotations).
+    if (remoteDoc?.datasets != null || docToWrite.datasets != null) {
+      const merged = mergeDatasetAccessMaps(remoteDoc?.datasets, docToWrite.datasets);
+      if (Object.keys(merged).length) docToWrite.datasets = merged;
+      else delete docToWrite.datasets;
+    }
     const content = encodeBase64Utf8(JSON.stringify(docToWrite, null, 2) + '\n');
     const login = toCleanString(userDoc?.login || '') || null;
     const msg = toCleanString(commitMessage) || `Update annotations for @${login || fileUser}`;
@@ -933,7 +1130,7 @@ export class CommunityAnnotationGitHubSync {
     // Prefer direct push when permitted; if permissions are unknown, try direct push first and fall back to PR.
     if (canPushDirect !== false) {
       try {
-        const res = await putContentWithSingleRetry({
+        const res = await putContentWithRetry({
           workerOrigin,
           owner: this.owner,
           repo: this.repo,
@@ -1092,7 +1289,7 @@ export class CommunityAnnotationGitHubSync {
       if (err?.status !== 404) throw err;
     }
 
-    await putContentWithSingleRetry({
+    await putContentWithRetry({
       workerOrigin,
       owner: forkOwner,
       repo: forkRepo,
@@ -1234,13 +1431,15 @@ export function getGitHubSyncForDataset({ datasetId, username = 'local', tokenOv
   if (!repo) return null;
   const parsed = parseOwnerRepo(repo);
   if (!parsed) return null;
+  const meta = getAnnotationRepoMetaForDataset(datasetId, username);
+  const branchMode = meta?.branchMode === 'explicit' ? 'explicit' : 'default';
   const token = tokenOverride || getGitHubAuthSession().getToken() || null;
   return new CommunityAnnotationGitHubSync({
     datasetId,
     owner: parsed.owner,
     repo: parsed.repo,
     token,
-    branch: parsed.ref || null,
+    branch: branchMode === 'explicit' ? (parsed.ref || null) : null,
     workerOrigin: getGitHubWorkerOrigin()
   });
 }
@@ -1248,7 +1447,10 @@ export function getGitHubSyncForDataset({ datasetId, username = 'local', tokenOv
 export function setDatasetAnnotationRepoFromUrlParam({ datasetId, urlParamValue, username = 'local' }) {
   const parsed = parseOwnerRepo(urlParamValue);
   if (!parsed) return false;
-  return setAnnotationRepoForDataset(datasetId, parsed.ownerRepoRef, username);
+  const ok = setAnnotationRepoForDataset(datasetId, parsed.ownerRepoRef, username);
+  if (!ok) return false;
+  setAnnotationRepoMetaForDataset(datasetId, username, { branchMode: parsed.ref ? 'explicit' : 'default' });
+  return true;
 }
 
 export async function setDatasetAnnotationRepoFromUrlParamAsync({ datasetId, urlParamValue, username = 'local', tokenOverride = null } = {}) {
@@ -1266,8 +1468,14 @@ export async function setDatasetAnnotationRepoFromUrlParamAsync({ datasetId, url
       token
     });
     const head = toCleanString(repoInfo?.default_branch || '') || 'main';
-    return setAnnotationRepoForDataset(datasetId, `${parsed.ownerRepo}@${head}`, username);
+    const ok = setAnnotationRepoForDataset(datasetId, `${parsed.ownerRepo}@${head}`, username);
+    if (!ok) return false;
+    setAnnotationRepoMetaForDataset(datasetId, username, { branchMode: 'default' });
+    return true;
   }
 
-  return setAnnotationRepoForDataset(datasetId, parsed.ownerRepoRef, username);
+  const ok = setAnnotationRepoForDataset(datasetId, parsed.ownerRepoRef, username);
+  if (!ok) return false;
+  setAnnotationRepoMetaForDataset(datasetId, username, { branchMode: 'explicit' });
+  return true;
 }

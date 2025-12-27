@@ -9,11 +9,11 @@
 
 import { getNotificationCenter } from '../../notification-center.js';
 import { getCommunityAnnotationSession } from '../../community-annotations/session.js';
-import { getCommunityAnnotationAccessStore, isAnnotationRepoConnected, isSimulateRepoConnectedEnabled } from '../../community-annotations/access-store.js';
+import { getCommunityAnnotationAccessStore, isAnnotationRepoConnected } from '../../community-annotations/access-store.js';
 import { showConfirmDialog } from '../components/confirm-dialog.js';
 import * as capApi from '../../community-annotations/cap-api.js';
 import { ANNOTATION_CONNECTION_CHANGED_EVENT } from '../../community-annotations/connection-events.js';
-import { getGitHubAuthSession, getLastGitHubUserKey, toGitHubUserKey } from '../../community-annotations/github-auth.js';
+import { syncCommunityAnnotationCacheContext } from '../../community-annotations/runtime-context.js';
 
 function el(tag, props = {}, children = []) {
   const node = document.createElement(tag);
@@ -37,7 +37,43 @@ function toCleanString(value) {
   return String(value ?? '').trim();
 }
 
-function bucketKey(fieldKey, catIdx) {
+function describeErrorMessage(err) {
+  const msg = toCleanString(err?.message || '');
+  if (msg) return msg;
+  const fallback = toCleanString(err);
+  if (fallback && fallback !== '[object Object]') return fallback;
+  return 'Request failed';
+}
+
+function truncateForUi(value, maxLen) {
+  const s = toCleanString(value);
+  const max = Number.isFinite(maxLen) ? Math.max(1, Math.floor(maxLen)) : 12;
+  if (s.length <= max) return s;
+  return `${s.slice(0, Math.max(0, max - 1))}…`;
+}
+
+function formatCommentAuthorHandle(session, username, { maxLen = 12 } = {}) {
+  const raw = toCleanString(username).replace(/^@+/, '');
+  let handle = raw || 'local';
+  try {
+    const prof = session?.getKnownUserProfile?.(raw);
+    const login = toCleanString(prof?.login);
+    if (login) handle = login;
+  } catch {
+    // ignore
+  }
+  handle = toCleanString(handle).replace(/^@+/, '') || 'local';
+  if (/^ghid_\d+$/i.test(handle)) handle = 'unknown';
+  return `@${truncateForUi(handle, maxLen)}`;
+}
+
+function bucketKey(session, fieldKey, catIdx) {
+  try {
+    const key = session?.toBucketKey?.(fieldKey, catIdx);
+    if (key) return key;
+  } catch {
+    // ignore
+  }
   const f = toCleanString(fieldKey);
   const idx = Number.isFinite(catIdx) ? Math.max(0, Math.floor(catIdx)) : 0;
   return `${f}:${idx}`;
@@ -143,15 +179,17 @@ function formatRelativeTime(isoString) {
  */
 function renderCapSearchResults({ results, onSelect, onClose }) {
   const container = el('div', { className: 'cap-search-results' });
+  const maxRender = 25;
 
   if (!results?.length) {
     container.appendChild(el('div', { className: 'cap-search-empty', text: 'No results found in CAP database' }));
   } else {
-    for (const result of results.slice(0, 8)) {
+    for (const result of results.slice(0, maxRender)) {
       const item = el('div', { className: 'cap-search-item' });
 
+      const displayName = toCleanString(result.fullName) || toCleanString(result.ontologyTerm) || toCleanString(result.name);
       const nameRow = el('div', { className: 'cap-search-item-name' });
-      nameRow.appendChild(el('span', { text: result.name }));
+      nameRow.appendChild(el('span', { text: displayName || '—' }));
       if (result.ontologyTermId) {
         nameRow.appendChild(el('span', { className: 'cap-ontology-id', text: result.ontologyTermId }));
       }
@@ -208,7 +246,7 @@ function renderComment({ session, fieldKey, catIdx, suggestionId, comment, canIn
   const commentEl = el('div', { className: `community-annotation-comment${isOwn ? ' is-own' : ''}` });
 
   const header = el('div', { className: 'community-annotation-comment-header' });
-  const author = el('span', { className: 'community-annotation-comment-author', text: `@${comment?.authorUsername || 'unknown'}` });
+  const author = el('span', { className: 'community-annotation-comment-author', text: formatCommentAuthorHandle(session, comment?.authorUsername || '') });
   const time = el('span', { className: 'community-annotation-comment-time' });
   const edited = comment?.editedAt ? ' (edited)' : '';
   time.textContent = formatRelativeTime(comment?.editedAt || comment?.createdAt) + edited;
@@ -229,13 +267,13 @@ function renderComment({ session, fieldKey, catIdx, suggestionId, comment, canIn
       const input = el('textarea', {
         className: 'community-annotation-comment-input',
         placeholder: 'Edit comment...',
-        maxlength: '256'
+        maxlength: '500'
       });
       input.value = comment?.text || '';
 
-      const charCounter = el('div', { className: 'community-annotation-char-counter', text: `${input.value.length}/256` });
+      const charCounter = el('div', { className: 'community-annotation-char-counter', text: `${input.value.length}/500` });
       input.addEventListener('input', () => {
-        charCounter.textContent = `${input.value.length}/256`;
+        charCounter.textContent = `${input.value.length}/500`;
       });
 
       const formActions = el('div', { className: 'community-annotation-comment-form-actions' });
@@ -339,18 +377,148 @@ function renderMergeRow({ session, fieldKey, catIdx, merge, idToLabel, canDetach
   const intoId = toCleanString(merge?.intoSuggestionId);
   const fromLabel = idToLabel?.get(fromId) || fromId || '—';
   const intoLabel = idToLabel?.get(intoId) || intoId || '—';
-  const meta = [
-    toCleanString(merge?.by) ? `@${toCleanString(merge.by)}` : null,
-    toCleanString(merge?.at) ? toCleanString(merge.at) : null,
-    toCleanString(merge?.note) ? `“${toCleanString(merge.note)}”` : null
+  const byKey = toCleanString(merge?.by);
+  const at = toCleanString(merge?.at);
+  const editedAt = toCleanString(merge?.editedAt);
+  const noteText = toCleanString(merge?.note);
+  const isOwn = byKey ? session.isMyComment(byKey) : false;
+  let currentNote = noteText;
+  const buildMeta = () => [
+    byKey ? session.formatUserAttribution(byKey) : null,
+    (() => {
+      const t = editedAt || at;
+      if (!t) return null;
+      const rel = formatRelativeTime(t) || t;
+      return `${rel}${editedAt ? ' (edited)' : ''}`;
+    })(),
+    currentNote ? `“${currentNote}”` : null
   ].filter(Boolean).join(' • ');
 
   const row = el('div', { className: 'community-annotation-merge-row' });
   row.appendChild(el('div', { className: 'community-annotation-merge-desc', text: `${fromLabel} → ${intoLabel}` }));
-  if (meta) row.appendChild(el('div', { className: 'community-annotation-merge-meta', text: meta }));
+  const metaEl = buildMeta() || (canDetach && isOwn)
+    ? el('div', { className: 'community-annotation-merge-meta', text: buildMeta() || '' })
+    : null;
+  if (metaEl) row.appendChild(metaEl);
 
   if (canDetach && fromId) {
     const actions = el('div', { className: 'community-annotation-merge-actions' });
+
+    const renderMetaDisplay = () => {
+      if (!metaEl) return;
+      metaEl.innerHTML = '';
+      metaEl.textContent = buildMeta() || '';
+      metaEl.dataset.mode = 'display';
+
+      if (isOwn) {
+        const editBtn = el('button', { type: 'button', className: 'community-annotation-comment-action-btn', text: 'Edit' });
+        editBtn.addEventListener('click', () => enterNoteEdit());
+        const deleteBtn = el('button', { type: 'button', className: 'community-annotation-comment-action-btn', text: 'Delete' });
+        deleteBtn.style.display = currentNote ? '' : 'none';
+        deleteBtn.addEventListener('click', () => {
+          showConfirmDialog({
+            title: 'Delete merge note?',
+            message: 'This will remove the note text, but keep the merge.',
+            confirmText: 'Delete',
+            onConfirm: () => {
+              const ok = session.editModerationMergeNote?.({ fieldKey, catIdx, fromSuggestionId: fromId, note: null });
+              if (ok) {
+                currentNote = '';
+                getNotificationCenter().success('Merge note deleted (local moderation)', { category: 'annotation', duration: 1800 });
+                renderMetaDisplay();
+              } else {
+                getNotificationCenter().error('Unable to delete merge note', { category: 'annotation' });
+              }
+            }
+          });
+        });
+        const links = el('span', { className: 'community-annotation-inline-action-links' }, [editBtn, deleteBtn]);
+        metaEl.appendChild(links);
+      }
+    };
+
+    const enterNoteEdit = () => {
+      if (!metaEl) return;
+      if (metaEl.dataset.mode === 'edit') {
+        renderMetaDisplay();
+        return;
+      }
+
+      metaEl.dataset.mode = 'edit';
+      metaEl.innerHTML = '';
+      const inputWrap = el('div', { className: 'community-annotation-comment-bar-wrap community-annotation-comment-bar-wrap--edit' });
+      const input = el('textarea', {
+        className: 'community-annotation-comment-bar community-annotation-comment-bar--edit',
+        maxlength: '512',
+        rows: '1',
+        placeholder: 'Merge note (optional)…',
+        'data-esc-cancel': 'true',
+        title: 'Enter to save • Esc to cancel'
+      });
+      input.value = currentNote;
+
+      const charCounter = el('div', {
+        className: 'community-annotation-char-counter community-annotation-char-counter--overlay',
+        text: `${input.value.length}/512`
+      });
+
+      const resize = () => {
+        const cs = getComputedStyle(input);
+        const minHeight = Number.parseFloat(cs.minHeight || '') || null;
+        const maxHeight = Number.parseFloat(cs.maxHeight || '') || null;
+        autoSizeTextarea(input, { minHeightPx: minHeight, maxHeightPx: maxHeight });
+      };
+
+      const save = () => {
+        const nextNote = toCleanString(input.value) || null;
+        const ok = session.editModerationMergeNote?.({ fieldKey, catIdx, fromSuggestionId: fromId, note: nextNote });
+        if (ok) {
+          currentNote = toCleanString(nextNote || '');
+          getNotificationCenter().success('Merge note updated (local moderation)', { category: 'annotation', duration: 1800 });
+          renderMetaDisplay();
+        } else {
+          getNotificationCenter().error('Unable to update merge note', { category: 'annotation' });
+        }
+      };
+
+      input.addEventListener('input', () => {
+        charCounter.textContent = `${input.value.length}/512`;
+        resize();
+      });
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+          try {
+            e.preventDefault?.();
+            e.stopPropagation?.();
+          } catch {
+            // ignore
+          }
+          renderMetaDisplay();
+          return;
+        }
+        if (e.key === 'Enter' && !e.shiftKey) {
+          try {
+            e.preventDefault?.();
+            e.stopPropagation?.();
+          } catch {
+            // ignore
+          }
+          save();
+        }
+      });
+
+      inputWrap.appendChild(input);
+      inputWrap.appendChild(charCounter);
+      metaEl.appendChild(inputWrap);
+      try {
+        if (typeof requestAnimationFrame === 'function') requestAnimationFrame(resize);
+        else setTimeout(resize, 0);
+      } catch {
+        // ignore
+      }
+      input.focus?.();
+    };
+
     const detachBtn = el('button', { type: 'button', className: 'btn-small', text: 'Detach' });
     detachBtn.addEventListener('click', () => {
       showConfirmDialog({
@@ -366,6 +534,8 @@ function renderMergeRow({ session, fieldKey, catIdx, merge, idToLabel, canDetach
     });
     actions.appendChild(detachBtn);
     row.appendChild(actions);
+
+    renderMetaDisplay();
   }
 
   return row;
@@ -433,6 +603,12 @@ function showSecondaryModal({ title, buildContent, session = null }) {
   const onKeyDown = (e) => {
     if (e.key !== 'Escape') return;
     try {
+      const target = e?.target || null;
+      if (target && typeof target.closest === 'function' && target.closest('[data-esc-cancel="true"]')) return;
+    } catch {
+      // ignore
+    }
+    try {
       e.preventDefault?.();
       e.stopPropagation?.();
       e.stopImmediatePropagation?.();
@@ -476,7 +652,7 @@ function openMergedSuggestionsModal({ session, fieldKey, catIdx, targetSuggestio
     title: 'Merged suggestions',
     session,
     buildContent: (content) => {
-      const bucket = bucketKey(fieldKey, catIdx);
+      const bucket = bucketKey(session, fieldKey, catIdx);
       const mergesAll = session.getModerationMerges?.() || [];
       const merges = Array.isArray(mergesAll) ? mergesAll.filter((m) => toCleanString(m?.bucket) === bucket) : [];
 
@@ -745,10 +921,10 @@ function renderSuggestionCard({
     editBox.appendChild(el('div', { className: 'community-annotation-new-title', text: 'Edit suggestion' }));
 
     const editForm = el('div', { className: 'community-annotation-new community-annotation-new-vertical' });
-    const labelInput = el('input', { type: 'text', className: 'community-annotation-text-input', placeholder: 'Label (required)' });
-    const ontInput = el('input', { type: 'text', className: 'community-annotation-text-input', placeholder: 'Ontology id (optional, e.g. CL:0000625)' });
+    const labelInput = el('input', { type: 'text', className: 'community-annotation-text-input', placeholder: 'Label (required)', maxlength: '120' });
+    const ontInput = el('input', { type: 'text', className: 'community-annotation-text-input', placeholder: 'Ontology id (optional, e.g. CL:0000625)', maxlength: '64' });
     const markerGenesInput = el('input', { type: 'text', className: 'community-annotation-text-input', placeholder: 'Marker genes (optional, comma-separated)' });
-    const evidenceInput = el('textarea', { className: 'community-annotation-text-input community-annotation-textarea', placeholder: 'Evidence (optional)' });
+    const evidenceInput = el('textarea', { className: 'community-annotation-text-input community-annotation-textarea', placeholder: 'Evidence (optional)', maxlength: '2000' });
 
     const populateFromSuggestion = () => {
       labelInput.value = suggestion?.label || '';
@@ -864,13 +1040,13 @@ function renderSuggestionCard({
     const input = el('textarea', {
       className: 'community-annotation-comment-bar',
       placeholder: canInteract ? 'Write a comment and press Enter…' : 'Comments are read-only (closed by author).',
-      maxlength: '256',
+      maxlength: '500',
       rows: '1',
       disabled: !canInteract
     });
     const charCounter = el('div', {
       className: 'community-annotation-char-counter community-annotation-char-counter--overlay',
-      text: `${input.value.length}/256`
+      text: `${input.value.length}/500`
     });
     const resizeInput = () => {
       const cs = getComputedStyle(input);
@@ -879,7 +1055,7 @@ function renderSuggestionCard({
       autoSizeTextarea(input, { minHeightPx: minHeight, maxHeightPx: maxHeight });
     };
     input.addEventListener('input', () => {
-      charCounter.textContent = `${input.value.length}/256`;
+      charCounter.textContent = `${input.value.length}/500`;
       resizeInput();
     });
     input.addEventListener('keydown', (e) => {
@@ -891,7 +1067,7 @@ function renderSuggestionCard({
       const id = session.addComment?.(fieldKey, catIdx, suggestion.id, text);
       if (id) {
         input.value = '';
-        charCounter.textContent = '0/256';
+        charCounter.textContent = '0/500';
         resizeInput();
         getNotificationCenter().success('Comment added', { category: 'annotation', duration: 1200 });
       } else {
@@ -917,12 +1093,134 @@ function renderSuggestionCard({
     for (const c of sorted.slice(0, 1000)) {
       const author = toCleanString(c?.authorUsername || '') || 'local';
       const time = toCleanString(c?.editedAt || c?.createdAt || '');
-      const metaText = `@${author}${time ? ` • ${formatRelativeTime(time)}` : ''}`;
+      const metaText = `${formatCommentAuthorHandle(session, author)}${time ? ` • ${formatRelativeTime(time)}` : ''}`;
+      const isOwn = session.isMyComment(author);
+
       const item = el('div', { className: 'community-annotation-comment-preview-item' });
       item.appendChild(el('span', { className: 'community-annotation-comment-preview-meta', text: metaText }));
-      const fullText = toCleanString(c?.text || '');
-      const textEl = el('span', { className: 'community-annotation-comment-preview-text', text: fullText });
-      item.appendChild(textEl);
+
+      const body = el('div', { style: 'flex: 1; min-width: 0;' });
+      let currentText = toCleanString(c?.text || '');
+      let isEditing = false;
+
+      const editBtn = el('button', { type: 'button', className: 'community-annotation-comment-action-btn', text: 'Edit' });
+      const deleteBtn = el('button', { type: 'button', className: 'community-annotation-comment-action-btn', text: 'Delete' });
+      const inlineActions = el('span', { className: 'community-annotation-inline-action-links' }, [
+        editBtn,
+        deleteBtn
+      ]);
+
+      const renderPreview = () => {
+        isEditing = false;
+        body.innerHTML = '';
+        const textWrap = el('span', { className: 'community-annotation-comment-preview-text' }, [currentText]);
+        if (isOwn && canInteract) textWrap.appendChild(inlineActions);
+        body.appendChild(textWrap);
+      };
+
+      const renderEdit = () => {
+        isEditing = true;
+        body.innerHTML = '';
+
+        const inputWrap = el('div', { className: 'community-annotation-comment-bar-wrap community-annotation-comment-bar-wrap--edit' });
+        const input = el('textarea', {
+          className: 'community-annotation-comment-bar community-annotation-comment-bar--edit',
+          placeholder: 'Edit comment…',
+          maxlength: '500',
+          rows: '1',
+          'data-esc-cancel': 'true',
+          title: 'Enter to save • Esc to cancel'
+        });
+        input.value = currentText;
+        const counter = el('div', {
+          className: 'community-annotation-char-counter community-annotation-char-counter--overlay',
+          text: `${input.value.length}/500`
+        });
+
+        const resize = () => {
+          const cs = getComputedStyle(input);
+          const minHeight = Number.parseFloat(cs.minHeight || '') || null;
+          const maxHeight = Number.parseFloat(cs.maxHeight || '') || null;
+          autoSizeTextarea(input, { minHeightPx: minHeight, maxHeightPx: maxHeight });
+        };
+
+        const save = () => {
+          const nextText = toCleanString(input.value);
+          if (!nextText) return;
+          const ok = session.editComment?.(fieldKey, catIdx, suggestion.id, c?.id, nextText);
+          if (ok) {
+            currentText = nextText;
+            getNotificationCenter().success('Comment updated', { category: 'annotation', duration: 1500 });
+            renderPreview();
+          } else {
+            getNotificationCenter().error('Failed to update comment', { category: 'annotation' });
+          }
+        };
+
+        input.addEventListener('input', () => {
+          counter.textContent = `${input.value.length}/500`;
+          resize();
+        });
+        input.addEventListener('keydown', (e) => {
+          if (e.key === 'Escape') {
+            try {
+              e.preventDefault?.();
+              e.stopPropagation?.();
+            } catch {
+              // ignore
+            }
+            renderPreview();
+            return;
+          }
+          if (e.key === 'Enter' && !e.shiftKey) {
+            try {
+              e.preventDefault?.();
+              e.stopPropagation?.();
+            } catch {
+              // ignore
+            }
+            save();
+          }
+        });
+
+        inputWrap.appendChild(input);
+        inputWrap.appendChild(counter);
+        body.appendChild(inputWrap);
+        try {
+          if (typeof requestAnimationFrame === 'function') requestAnimationFrame(resize);
+          else setTimeout(resize, 0);
+        } catch {
+          // ignore
+        }
+        input.focus?.();
+      };
+
+      if (isOwn && canInteract) {
+        editBtn.addEventListener('click', () => {
+          if (isEditing) return;
+          renderEdit();
+        });
+
+        deleteBtn.addEventListener('click', () => {
+          if (isEditing) return;
+          showConfirmDialog({
+            title: 'Delete comment?',
+            message: 'This will remove your comment. This action cannot be undone.',
+            confirmText: 'Delete',
+            onConfirm: () => {
+              const ok = session.deleteComment?.(fieldKey, catIdx, suggestion.id, c?.id);
+              if (ok) {
+                getNotificationCenter().success('Comment deleted', { category: 'annotation', duration: 1500 });
+              } else {
+                getNotificationCenter().error('Failed to delete comment', { category: 'annotation' });
+              }
+            }
+          });
+        });
+      }
+
+      renderPreview();
+      item.appendChild(body);
       scroll.appendChild(item);
     }
     const updateScrollFade = () => {
@@ -1100,7 +1398,7 @@ function buildVotingDetail({ session, fieldKey, catIdx }) {
 
   // Label input with CAP search
   const labelRow = el('div', { className: 'community-annotation-label-row' });
-  const labelInput = el('input', { type: 'text', className: 'community-annotation-text-input', placeholder: 'Label (required)', disabled: !canInteract });
+  const labelInput = el('input', { type: 'text', className: 'community-annotation-text-input', placeholder: 'Label (required)', maxlength: '120', disabled: !canInteract });
   const searchCapBtn = el('button', { type: 'button', className: 'btn-small cap-btn', text: 'Search CAP', title: 'Search Cell Annotation Platform for cell types', disabled: !canInteract });
 
   let capSearchPanel = null;
@@ -1119,16 +1417,18 @@ function buildVotingDetail({ session, fieldKey, catIdx }) {
       return;
     }
 
-    closeCapSearch();
-    searchCapBtn.disabled = true;
-    searchCapBtn.textContent = 'Searching...';
+	    closeCapSearch();
+	    closeOntSearch();
+	    closeMarkersSearch();
+	    searchCapBtn.disabled = true;
+	    searchCapBtn.textContent = 'Searching...';
 
     try {
-      const results = await capApi.searchCellTypes(searchTerm, 8);
+      const results = await capApi.searchCellTypes(searchTerm, 20);
       capSearchPanel = renderCapSearchResults({
         results,
         onSelect: (result) => {
-          labelInput.value = result.name || '';
+          labelInput.value = result.fullName || result.ontologyTerm || result.name || '';
           ontInput.value = result.ontologyTermId || '';
           if (result.markerGenes?.length) {
             markerGenesInput.value = result.markerGenes.slice(0, 10).join(', ');
@@ -1137,20 +1437,20 @@ function buildVotingDetail({ session, fieldKey, catIdx }) {
         onClose: closeCapSearch
       });
       formBox.appendChild(capSearchPanel);
-    } catch (err) {
-      getNotificationCenter().error(`CAP search failed: ${err.message}`, { category: 'annotation' });
-    } finally {
-      searchCapBtn.disabled = false;
-      searchCapBtn.textContent = 'Search CAP';
-    }
-  });
+	    } catch (err) {
+	      getNotificationCenter().error(`CAP search failed: ${describeErrorMessage(err)}`, { category: 'annotation' });
+	    } finally {
+	      searchCapBtn.disabled = false;
+	      searchCapBtn.textContent = 'Search CAP';
+	    }
+	  });
 
   labelRow.appendChild(labelInput);
   labelRow.appendChild(searchCapBtn);
 
   // Ontology input with search button
   const ontRow = el('div', { className: 'community-annotation-label-row' });
-  const ontInput = el('input', { type: 'text', className: 'community-annotation-text-input', placeholder: 'Ontology id (optional, e.g. CL:0000625)', disabled: !canInteract });
+  const ontInput = el('input', { type: 'text', className: 'community-annotation-text-input', placeholder: 'Ontology id (optional, e.g. CL:0000625)', maxlength: '64', disabled: !canInteract });
   const searchOntBtn = el('button', { type: 'button', className: 'btn-small cap-btn', text: 'Search Ontology', title: 'Search CAP by ontology ID', disabled: !canInteract });
 
   let ontSearchPanel = null;
@@ -1175,34 +1475,34 @@ function buildVotingDetail({ session, fieldKey, catIdx }) {
     searchOntBtn.textContent = 'Searching...';
 
     try {
-      const result = await capApi.lookupByOntologyId(searchTerm);
-      if (result) {
-        ontSearchPanel = renderCapSearchResults({
-          results: [result],
-          onSelect: (r) => {
-            labelInput.value = r.name || '';
-            ontInput.value = r.ontologyTermId || '';
-            if (r.markerGenes?.length) {
-              markerGenesInput.value = r.markerGenes.slice(0, 10).join(', ');
-            }
-          },
-          onClose: closeOntSearch
-        });
-      } else {
-        ontSearchPanel = renderCapSearchResults({
-          results: [],
-          onSelect: () => {},
+	      const result = await capApi.lookupByOntologyId(searchTerm);
+	      if (result) {
+	        ontSearchPanel = renderCapSearchResults({
+	          results: [result],
+	          onSelect: (r) => {
+	            labelInput.value = r.fullName || r.ontologyTerm || r.name || '';
+	            ontInput.value = r.ontologyTermId || '';
+	            if (r.markerGenes?.length) {
+	              markerGenesInput.value = r.markerGenes.slice(0, 10).join(', ');
+	            }
+	          },
+	          onClose: closeOntSearch
+	        });
+	      } else {
+	        ontSearchPanel = renderCapSearchResults({
+	          results: [],
+	          onSelect: () => {},
           onClose: closeOntSearch
         });
       }
       formBox.appendChild(ontSearchPanel);
-    } catch (err) {
-      getNotificationCenter().error(`CAP ontology search failed: ${err.message}`, { category: 'annotation' });
-    } finally {
-      searchOntBtn.disabled = false;
-      searchOntBtn.textContent = 'Search Ontology';
-    }
-  });
+	    } catch (err) {
+	      getNotificationCenter().error(`CAP ontology search failed: ${describeErrorMessage(err)}`, { category: 'annotation' });
+	    } finally {
+	      searchOntBtn.disabled = false;
+	      searchOntBtn.textContent = 'Search Ontology';
+	    }
+	  });
 
   ontRow.appendChild(ontInput);
   ontRow.appendChild(searchOntBtn);
@@ -1221,8 +1521,8 @@ function buildVotingDetail({ session, fieldKey, catIdx }) {
   };
 
   searchMarkersBtn.addEventListener('click', async () => {
-    const searchTerm = markerGenesInput.value.trim();
-    if (!searchTerm) {
+    const markers = parseMarkerGenesInput(markerGenesInput.value);
+    if (!markers?.length) {
       getNotificationCenter().info('Enter marker gene(s) to search', { category: 'annotation', duration: 2000 });
       markerGenesInput.focus();
       return;
@@ -1235,13 +1535,13 @@ function buildVotingDetail({ session, fieldKey, catIdx }) {
     searchMarkersBtn.textContent = 'Searching...';
 
     try {
-      // Search using first marker gene or the whole input
-      const firstMarker = searchTerm.split(',')[0].trim();
-      const results = await capApi.searchCellTypes(firstMarker, 8);
+      // Use the first marker gene as the primary CAP query, but re-rank/filter results using all entered markers.
+      const firstMarker = markers[0];
+      const results = await capApi.searchCellTypes(firstMarker, 20, { markerGenes: markers });
       markersSearchPanel = renderCapSearchResults({
         results,
         onSelect: (r) => {
-          labelInput.value = r.name || '';
+          labelInput.value = r.fullName || r.ontologyTerm || r.name || '';
           ontInput.value = r.ontologyTermId || '';
           if (r.markerGenes?.length) {
             markerGenesInput.value = r.markerGenes.slice(0, 10).join(', ');
@@ -1250,18 +1550,18 @@ function buildVotingDetail({ session, fieldKey, catIdx }) {
         onClose: closeMarkersSearch
       });
       formBox.appendChild(markersSearchPanel);
-    } catch (err) {
-      getNotificationCenter().error(`CAP marker search failed: ${err.message}`, { category: 'annotation' });
-    } finally {
-      searchMarkersBtn.disabled = false;
-      searchMarkersBtn.textContent = 'Search Markers';
-    }
-  });
+	    } catch (err) {
+	      getNotificationCenter().error(`CAP marker search failed: ${describeErrorMessage(err)}`, { category: 'annotation' });
+	    } finally {
+	      searchMarkersBtn.disabled = false;
+	      searchMarkersBtn.textContent = 'Search Markers';
+	    }
+	  });
 
   markerGenesRow.appendChild(markerGenesInput);
   markerGenesRow.appendChild(searchMarkersBtn);
 
-  const evidenceInput = el('textarea', { className: 'community-annotation-text-input community-annotation-textarea', placeholder: 'Evidence (optional)', disabled: !canInteract });
+  const evidenceInput = el('textarea', { className: 'community-annotation-text-input community-annotation-textarea', placeholder: 'Evidence (optional)', maxlength: '2000', disabled: !canInteract });
 
   const actions = el('div', { className: 'community-annotation-suggestion-actions' });
   const addBtn = el('button', { type: 'button', className: 'btn-small', text: 'Add', disabled: !canInteract });
@@ -1320,13 +1620,9 @@ export function openCommunityAnnotationVotingModal({
   const session = getCommunityAnnotationSession();
   try {
     const datasetId = session.getDatasetId?.() || null;
-    const auth = getGitHubAuthSession();
-    const authedKey = auth.isAuthenticated?.() ? toGitHubUserKey(auth.getUser?.()) : null;
-    const username = authedKey
-      ? String(authedKey)
-      : (isSimulateRepoConnectedEnabled() ? (getLastGitHubUserKey() || (session.getProfile?.()?.username || 'local')) : (session.getProfile?.()?.username || 'local'));
+    const ctx = syncCommunityAnnotationCacheContext({ datasetId });
     // Hide the entire voting UX unless a repo is connected (or dev simulate is enabled).
-    if (!isAnnotationRepoConnected(datasetId, username)) return null;
+    if (!isAnnotationRepoConnected(ctx.datasetId, ctx.userKey)) return null;
   } catch {
     return null;
   }
@@ -1431,6 +1727,11 @@ export function openCommunityAnnotationVotingModal({
 
         const field = state.getFields?.()?.[fieldIndex] || null;
         const categories = Array.isArray(field?.categories) ? field.categories : [];
+        try {
+          session.setFieldCategories?.(focusField, categories);
+        } catch {
+          // ignore
+        }
         const catLabel = categories[focusCatIdx] != null ? String(categories[focusCatIdx]) : `Category ${focusCatIdx}`;
 
         // Build new content then swap atomically to avoid flashing
@@ -1461,12 +1762,8 @@ export function openCommunityAnnotationVotingModal({
       const closeIfDisconnected = () => {
         try {
           const datasetId = session.getDatasetId?.() || null;
-          const auth = getGitHubAuthSession();
-          const authedKey = auth.isAuthenticated?.() ? toGitHubUserKey(auth.getUser?.()) : null;
-          const username = authedKey
-            ? String(authedKey)
-            : (isSimulateRepoConnectedEnabled() ? (getLastGitHubUserKey() || (session.getProfile?.()?.username || 'local')) : (session.getProfile?.()?.username || 'local'));
-          if (!isAnnotationRepoConnected(datasetId, username)) ref?.close?.();
+          const ctx = syncCommunityAnnotationCacheContext({ datasetId });
+          if (!isAnnotationRepoConnected(ctx.datasetId, ctx.userKey)) ref?.close?.();
         } catch {
           ref?.close?.();
         }

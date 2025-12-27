@@ -43,6 +43,7 @@ import { ThemeManager } from '../utils/theme-manager.js';
 import { debug } from '../utils/debug.js';
 import { clamp } from './utils/number-utils.js';
 import { createMulberry32 } from './utils/random-utils.js';
+import { getGitHubAuthSession } from './community-annotations/github-auth.js';
 import {
   initAnalytics,
   trackDataLoadMethod,
@@ -56,6 +57,42 @@ import { initPerformanceAnalytics } from '../analytics/performance.js';
 debug.log('Starting…');
 
 ThemeManager.init();
+
+getGitHubAuthSession()
+  .completeSignInFromRedirect()
+  .then((result) => {
+    if (!result) return;
+    const who = String(result.user?.login || '').trim();
+    const message = who ? `Signed in with GitHub as @${who}.` : 'Signed in with GitHub.';
+    const notify = () => {
+      try {
+        getNotificationCenter().success(message, { category: 'annotation', duration: 2800 });
+      } catch {
+        // ignore
+      }
+    };
+    if (document?.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', notify, { once: true });
+    } else {
+      notify();
+    }
+  })
+  .catch((err) => {
+    debug.log('[GitHubAuth] Redirect completion failed:', err);
+    const msg = String(err?.message || '').trim() || 'GitHub sign-in failed.';
+    const notify = () => {
+      try {
+        getNotificationCenter().error(msg, { category: 'annotation', duration: 8000 });
+      } catch {
+        // ignore
+      }
+    };
+    if (document?.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', notify, { once: true });
+    } else {
+      notify();
+    }
+  });
 
 const FAST_BINARY_FETCH_INIT = { cache: 'force-cache' };
 
@@ -785,6 +822,17 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         }
         if (state.clearAllHighlights) {
           state.clearAllHighlights();
+        }
+        try {
+          // In-place reload keeps the same ComparisonModule/DataLayer instance alive; reset
+          // analysis-layer caches and per-UI state that assume dataset identities are stable.
+          if (window._comparisonModule?.resetForDatasetReload) {
+            window._comparisonModule.resetForDatasetReload({ reason: 'local-user-inplace-reload' });
+          } else {
+            window._comparisonModule?.dataLayer?.resetForDatasetReload?.();
+          }
+        } catch {
+          // ignore
         }
 
         // Reset dimension level to the new dataset's default

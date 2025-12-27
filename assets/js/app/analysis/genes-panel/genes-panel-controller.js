@@ -25,6 +25,7 @@ import { ExpressionMatrixBuilder } from './expression-matrix-builder.js';
 import { ClusteringEngine } from './clustering-engine.js';
 import { MarkerCache } from './marker-cache.js';
 import { DEFAULTS, ANALYSIS_PHASES, ERROR_MESSAGES, formatError } from './constants.js';
+import { getDataSourceManager } from '../../../data/data-source-manager.js';
 
 // =============================================================================
 // GENES PANEL CONTROLLER
@@ -143,6 +144,7 @@ export class GenesPanelController {
    */
   async runAnalysis(options) {
     await this.init();
+    this._syncCacheDatasetId();
 
     const {
       obsCategory,
@@ -513,8 +515,31 @@ export class GenesPanelController {
    * @private
    */
   _getDatasetId() {
-    const state = this.dataLayer.state;
-    return state?.datasetId || state?.pointCount?.toString() || 'unknown';
+    const state = this.dataLayer?.state || null;
+    const fromDataLayer = String(state?.datasetId || '').trim();
+    if (fromDataLayer) return fromDataLayer;
+
+    try {
+      const manager = getDataSourceManager?.();
+      const fromManager = String(manager?.getCurrentDatasetId?.() || '').trim();
+      if (fromManager) return fromManager;
+    } catch {
+      // ignore
+    }
+
+    // Fallback: include point count to reduce collision risk when datasetId is missing.
+    const count = state?.pointCount;
+    const countPart = Number.isFinite(Number(count)) ? String(Math.max(0, Math.floor(Number(count)))) : '';
+    return countPart ? `unknown_${countPart}` : 'unknown';
+  }
+
+  _syncCacheDatasetId() {
+    const id = this._getDatasetId();
+    try {
+      this._cache?.setDatasetId?.(id);
+    } catch {
+      // ignore
+    }
   }
 
   _extractTopNGenes(markers, topNPerGroup) {

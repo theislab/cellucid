@@ -353,6 +353,72 @@ function handleNoneDatasetSelection() {
   showSessionStatus('No dataset selected', false);
 }
 
+// =========================================================================
+// Dev-only self-test (local-user in-place switching)
+// =========================================================================
+
+const isDevSelfTestEnabled = Boolean(debug?.isEnabled);
+
+async function runLocalUserInPlaceSwitchSelfTest({ switchBack = true } = {}) {
+  if (!isDevSelfTestEnabled) {
+    throw new Error('Dev self-test requires CELLUCID_DEBUG=true (see docs).');
+  }
+
+  const sourceType = dataSourceManager?.getCurrentSourceType?.() || null;
+  if (sourceType !== 'local-user') {
+    throw new Error(`Dev self-test requires active sourceType "local-user" (got "${sourceType || 'none'}").`);
+  }
+
+  const fromDatasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
+  if (!fromDatasetId) {
+    throw new Error('Dev self-test requires an active dataset.');
+  }
+
+  const datasets = await dataSourceManager.getDatasets('local-user');
+  const toDatasetId =
+    (Array.isArray(datasets) ? datasets : [])
+      .map((d) => d?.id)
+      .find((id) => id && id !== fromDatasetId) || null;
+
+  if (!toDatasetId) {
+    throw new Error('Dev self-test requires at least 2 local-user datasets.');
+  }
+
+  const cm = (typeof window !== 'undefined') ? window._comparisonModule : null;
+  if (!cm) {
+    throw new Error('Dev self-test requires Page Analysis to be initialized (missing window._comparisonModule).');
+  }
+  const beforeResets = Number(cm?._datasetReloadResetCount) || 0;
+
+  await handleDatasetChange(toDatasetId, 'local-user');
+
+  const afterResets = Number(cm?._datasetReloadResetCount) || 0;
+  const resetOk = afterResets > beforeResets;
+  const cacheStats = cm?.dataLayer?.getCacheStats?.() || null;
+  const cachesOk = cacheStats
+    ? (
+        (cacheStats.dataCache?.size || 0) === 0 &&
+        (cacheStats.bulkGeneCache?.size || 0) === 0 &&
+        (cacheStats.pendingRequests || 0) === 0 &&
+        (cacheStats.prefetchQueue || 0) === 0
+      )
+    : null;
+
+  if (switchBack) {
+    await handleDatasetChange(fromDatasetId, 'local-user');
+  }
+
+  return {
+    fromDatasetId,
+    toDatasetId,
+    switchBack: switchBack !== false,
+    resetOk,
+    cachesOk,
+    cacheStats,
+    datasetResetCount: afterResets
+  };
+}
+
 // Initialize dataset selector
 debug.log('[UI] Dataset selector initialization:', {
   datasetSelect: !!datasetSelect,
@@ -365,6 +431,68 @@ debug.log('[UI] Dataset selector initialization:', {
 
 
 if (datasetSelect && dataSourceManager) {
+  // Dev-only: in-place switching self-test helper.
+  let devSelfTestBlock = null;
+  let devSelfTestBtn = null;
+  let devSelfTestStatus = null;
+
+  const syncDevSelfTestVisibility = () => {
+    if (!devSelfTestBlock) return;
+    const src = dataSourceManager?.getCurrentSourceType?.() || null;
+    devSelfTestBlock.style.display = (src === 'local-user') ? 'block' : 'none';
+  };
+
+  if (isDevSelfTestEnabled && typeof window !== 'undefined') {
+    try {
+      const parentBlock = datasetSelect.closest?.('.control-block') || null;
+      devSelfTestBlock = document.createElement('div');
+      devSelfTestBlock.className = 'control-block mt-0-5';
+      devSelfTestBlock.style.display = 'none';
+
+      devSelfTestBtn = document.createElement('button');
+      devSelfTestBtn.type = 'button';
+      devSelfTestBtn.className = 'reset-btn';
+      devSelfTestBtn.textContent = 'Dev: local-user switch self-test';
+      devSelfTestBtn.title = 'Switch between two local-user datasets in-place and sanity-check analysis caches';
+
+      devSelfTestStatus = document.createElement('div');
+      devSelfTestStatus.className = 'legend-help';
+      devSelfTestStatus.style.marginTop = '6px';
+      devSelfTestStatus.textContent = '';
+
+      devSelfTestBtn.addEventListener('click', async () => {
+        if (!devSelfTestBtn) return;
+        devSelfTestBtn.disabled = true;
+        devSelfTestStatus.textContent = 'Running self-test…';
+        try {
+          const result = await runLocalUserInPlaceSwitchSelfTest({ switchBack: true });
+          const ok = result.resetOk && (result.cachesOk !== false);
+          devSelfTestStatus.textContent = ok
+            ? `OK (switched ${result.fromDatasetId} → ${result.toDatasetId} → back)`
+            : `WARN (resetOk=${result.resetOk ? 'true' : 'false'}, cachesOk=${result.cachesOk === null ? 'unknown' : String(result.cachesOk)})`;
+        } catch (err) {
+          devSelfTestStatus.textContent = `FAILED: ${err?.message || String(err)}`;
+        } finally {
+          devSelfTestBtn.disabled = false;
+        }
+      });
+
+      devSelfTestBlock.appendChild(devSelfTestBtn);
+      devSelfTestBlock.appendChild(devSelfTestStatus);
+
+      if (parentBlock?.parentNode) {
+        parentBlock.insertAdjacentElement('afterend', devSelfTestBlock);
+      } else if (datasetSelect.parentNode) {
+        datasetSelect.parentNode.appendChild(devSelfTestBlock);
+      }
+
+      window.__CELLUCID_DEV__ = window.__CELLUCID_DEV__ || {};
+      window.__CELLUCID_DEV__.runLocalUserInPlaceSwitchSelfTest = runLocalUserInPlaceSwitchSelfTest;
+    } catch {
+      devSelfTestBlock = null;
+    }
+  }
+
   // Populate dropdown
   populateDatasetDropdown();
 
@@ -372,6 +500,7 @@ if (datasetSelect && dataSourceManager) {
   if (typeof dataSourceManager.onSourcesChange === 'function') {
     dataSourceManager.onSourcesChange(() => {
       populateDatasetDropdown();
+      syncDevSelfTestVisibility();
     });
   }
   if (typeof dataSourceManager.onDatasetChange === 'function') {
@@ -388,6 +517,7 @@ if (datasetSelect && dataSourceManager) {
         /* ignore */
       }
       updateDatasetInfo(event?.metadata || null, event?.sourceType || null);
+      syncDevSelfTestVisibility();
     });
   }
 
@@ -402,6 +532,8 @@ if (datasetSelect && dataSourceManager) {
     const sourceType = selectedOption?.dataset?.sourceType || 'local-demo';
     handleDatasetChange(selectedValue, sourceType);
   });
+
+  syncDevSelfTestVisibility();
 } else {
   debug.warn('[UI] Dataset selector not initialized - missing elements:', {
     datasetSelect: datasetSelect,
