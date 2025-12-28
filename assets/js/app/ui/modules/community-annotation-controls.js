@@ -146,34 +146,117 @@ function downloadJsonAsFile(filename, json) {
     const cls = String(modalClassName || '').trim();
     const modal = el('div', { className: `community-annotation-modal${cls ? ` ${cls}` : ''}`, role: 'document' });
 
-  const header = el('div', { className: 'community-annotation-modal-header' });
-  header.appendChild(el('div', { className: 'community-annotation-modal-title', text: title || 'Community annotation' }));
-  const closeBtn = el('button', { type: 'button', className: 'btn-small community-annotation-modal-close', text: 'Close' });
-  header.appendChild(closeBtn);
+    const header = el('div', { className: 'community-annotation-modal-header' });
+    const titleEl = el('div', { className: 'community-annotation-modal-title', text: title || 'Community annotation' });
+    titleEl.id = `community-annotation-modal-title-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    overlay.setAttribute('aria-labelledby', titleEl.id);
+    header.appendChild(titleEl);
+    const closeBtn = el('button', { type: 'button', className: 'btn-small community-annotation-modal-close', text: 'Close' });
+    header.appendChild(closeBtn);
 
-  const content = el('div', { className: 'community-annotation-modal-body' });
-  buildContent?.(content);
+    const content = el('div', { className: 'community-annotation-modal-body' });
+    buildContent?.(content);
 
-  modal.appendChild(header);
-  modal.appendChild(content);
-  overlay.appendChild(modal);
+    modal.appendChild(header);
+    modal.appendChild(content);
+    overlay.appendChild(modal);
 
-  const close = () => overlay.remove();
-  closeBtn.addEventListener('click', close);
-  overlay.addEventListener('click', (e) => {
-    if (e.target === overlay) close();
-  });
-  const onKeyDown = (e) => {
-    if (e.key !== 'Escape') return;
-    close();
-  };
-  document.addEventListener('keydown', onKeyDown, { once: true });
+    const prevFocus = document.activeElement;
+    let closed = false;
+    const listFocusable = () => {
+      const selectors = [
+        'a[href]',
+        'area[href]',
+        'button:not([disabled])',
+        'input:not([disabled]):not([type="hidden"])',
+        'select:not([disabled])',
+        'textarea:not([disabled])',
+        '[contenteditable="true"]',
+        '[tabindex]:not([tabindex="-1"])'
+      ].join(',');
+      const nodes = Array.from(modal.querySelectorAll(selectors));
+      return nodes.filter((node) => {
+        if (!(node instanceof HTMLElement)) return false;
+        try {
+          const style = window.getComputedStyle?.(node);
+          if (style?.display === 'none' || style?.visibility === 'hidden') return false;
+          return node.getClientRects().length > 0;
+        } catch {
+          return true;
+        }
+      });
+    };
 
-  document.body.appendChild(overlay);
-  closeBtn.focus?.();
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      try {
+        overlay.removeEventListener('keydown', onKeyDown, true);
+      } catch {
+        // ignore
+      }
+      overlay.remove();
+      try {
+        prevFocus?.focus?.();
+      } catch {
+        // ignore
+      }
+    };
 
-  return { close, overlay, modal, content };
-}
+    const onKeyDown = (e) => {
+      if (!e) return;
+      if (e.key === 'Escape') {
+        try {
+          e.preventDefault?.();
+          e.stopPropagation?.();
+        } catch {
+          // ignore
+        }
+        close();
+        return;
+      }
+      if (e.key !== 'Tab') return;
+      const focusables = listFocusable();
+      if (!focusables.length) {
+        try { e.preventDefault?.(); } catch { /* ignore */ }
+        return;
+      }
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      const active = document.activeElement;
+      const containsActive = active && modal.contains(active);
+      if (e.shiftKey) {
+        if (!containsActive || active === first) {
+          try {
+            e.preventDefault?.();
+            last.focus?.();
+          } catch {
+            // ignore
+          }
+        }
+        return;
+      }
+      if (!containsActive || active === last) {
+        try {
+          e.preventDefault?.();
+          first.focus?.();
+        } catch {
+          // ignore
+        }
+      }
+    };
+
+    closeBtn.addEventListener('click', close);
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) close();
+    });
+    overlay.addEventListener('keydown', onKeyDown, true);
+
+    document.body.appendChild(overlay);
+    closeBtn.focus?.();
+
+    return { close, overlay, modal, content };
+  }
 
 function confirmAsync({ title, message, confirmText }) {
   return new Promise((resolve) => {
@@ -249,6 +332,11 @@ function isRateLimitError(err) {
   return msg.includes('rate limit') || msg.includes('secondary rate limit') || msg.includes('abuse detection');
 }
 
+function isWorkerOriginSecurityError(err) {
+  const code = String(err?.code || '').trim();
+  return code === 'GITHUB_WORKER_ORIGIN_INVALID' || code === 'GITHUB_WORKER_ORIGIN_UNTRUSTED';
+}
+
 function isNetworkFetchFailure(err) {
   const msg = String(err?.message || '').trim();
   if (err instanceof TypeError) return true;
@@ -281,6 +369,21 @@ function isAnnotationRepoStructureError(err) {
   return false;
 }
 
+function getPublishCapability(repoInfo) {
+  const perms = repoInfo?.permissions || null;
+  const canDirectPush = perms ? Boolean(perms.push || perms.maintain || perms.admin) : false;
+  const allowForking = repoInfo?.allow_forking !== false;
+  return { canDirectPush, allowForking, canPublish: canDirectPush || allowForking };
+}
+
+function describeCannotPublishMessage(repoLabel) {
+  return (
+    `You do not have permission to publish annotations to ${repoLabel}.\n\n` +
+    'GitHub reports you cannot push, and this repo disables forking, so Pull Request publishing is not possible.\n\n' +
+    'Ask an author to grant you Write access (or higher), or enable forking for this repo.'
+  );
+}
+
 export function initCommunityAnnotationControls({ state, dom, dataSourceManager }) {
   const container = dom?.container || null;
   if (!container) return {};
@@ -305,6 +408,45 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
   let syncBusy = false;
   let syncError = null;
   let lastRepoInfo = null;
+  /** @type {AbortController|null} */
+  let activeSyncAbort = null;
+  let activeSyncAbortReason = null;
+  let activeSyncFatalMessage = null;
+
+  function beginActiveSyncAbortScope() {
+    activeSyncFatalMessage = null;
+    activeSyncAbortReason = null;
+    try { activeSyncAbort?.abort?.(); } catch { /* ignore */ }
+    activeSyncAbort = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    return activeSyncAbort;
+  }
+
+  function endActiveSyncAbortScope(controller) {
+    if (activeSyncAbort !== controller) return;
+    activeSyncAbort = null;
+    activeSyncAbortReason = null;
+    activeSyncFatalMessage = null;
+  }
+
+  function abortActiveSync(reason) {
+    const msg = toCleanString(reason) || 'Annotation sync aborted.';
+    activeSyncFatalMessage = msg;
+    activeSyncAbortReason = msg;
+    try { activeSyncAbort?.abort?.(); } catch { /* ignore */ }
+  }
+
+  function throwIfActiveSyncAborted(controller) {
+    if (activeSyncFatalMessage) {
+      const err = new Error(activeSyncFatalMessage);
+      err.code = 'ANNOTATION_SYNC_ABORTED';
+      throw err;
+    }
+    if (controller?.signal?.aborted) {
+      const err = new Error(activeSyncAbortReason || 'Annotation sync aborted.');
+      err.code = 'ANNOTATION_SYNC_ABORTED';
+      throw err;
+    }
+  }
   /** @type {Record<string, {minAnnotators:number, threshold:number}>} */
   const annotatableSettingsDraft = {};
   const annotatableSettingsDirty = new Set();
@@ -577,7 +719,7 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
       const meta = getAnnotationRepoMetaForDataset(did, userKey);
       const branchMode = meta?.branchMode === 'explicit' ? 'explicit' : 'default';
 
-      const { repoInfo } = await sync.validateAndLoadConfig({ datasetId: did });
+      const { repoInfo, configSha } = await sync.validateAndLoadConfig({ datasetId: did });
       lastRepoInfo = repoInfo || null;
       access.setRoleFromRepoInfo(lastRepoInfo);
 
@@ -596,6 +738,16 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
         return false;
       }
 
+      if (!getPublishCapability(repoInfo).canPublish) {
+        disconnectAnnotationRepo({
+          datasetId: did,
+          userKey,
+          message: `${describeCannotPublishMessage(repoLabel)}\nDisconnected annotation repo.`,
+          notify: 'error'
+        });
+        return false;
+      }
+
       // Keep repoRef canonicalized to the resolved branch so cache keys remain stable.
       const branch = toCleanString(sync.branch || '') || toCleanString(repoInfo?.default_branch || '') || 'main';
       const canonicalRepoRef = `${repoLabel}@${branch}`;
@@ -605,6 +757,7 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
         setUrlAnnotationRepo(canonicalRepoRef);
       }
       session.setCacheContext?.({ datasetId: did, repoRef: canonicalRepoRef || repo, userId });
+      if (configSha) session.setRemoteFileSha?.('annotations/config.json', configSha);
       setAnnotationRepoMetaForDataset(did, userKey, { branchMode });
 
       return true;
@@ -630,7 +783,8 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
     datasetId = null,
     userKey = null,
     message = null,
-    notify = 'error'
+    notify = 'error',
+    preserveSession = true
   } = {}) {
     const did = datasetId ?? dataSourceManager?.getCurrentDatasetId?.() ?? null;
     const key =
@@ -640,13 +794,17 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
       getCacheUserKey();
     if (!did || !key) return false;
 
+    abortActiveSync(toCleanString(message) || 'Annotation repo disconnected.');
+
     clearAnnotationRepoForDataset(did, key);
     setUrlAnnotationRepo(null);
 
     lastRepoInfo = null;
     access.clearRole?.();
     try {
-      session.setCacheContext?.({ datasetId: did, repoRef: null, userId: getCacheUserId() });
+      if (!preserveSession) {
+        session.setCacheContext?.({ datasetId: did, repoRef: null, userId: getCacheUserId() });
+      }
     } catch {
       // ignore
     }
@@ -722,7 +880,7 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
 	      if (!sync) return false;
 	      const meta = getAnnotationRepoMetaForDataset(did, cacheUser);
 	      const branchMode = meta?.branchMode === 'explicit' ? 'explicit' : 'default';
-	      const { repoInfo, datasetConfig, config, datasetId: didResolved } = await sync.validateAndLoadConfig({ datasetId: did });
+	      const { repoInfo, datasetConfig, config, configSha, datasetId: didResolved } = await sync.validateAndLoadConfig({ datasetId: did });
 	      const parsed = parseOwnerRepo(repo);
 	      lastRepoInfo = repoInfo || null;
 	      access.setRoleFromRepoInfo(lastRepoInfo);
@@ -737,6 +895,18 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
           notify: 'error'
 	        });
 	        return false;
+	      }
+	      {
+	        const repoLabel = toCleanString(repoInfo?.full_name || '') || parsed?.ownerRepo || String(repo || '').split('@')[0].trim() || 'repo';
+	        if (!getPublishCapability(repoInfo).canPublish) {
+	          disconnectAnnotationRepo({
+	            datasetId: did,
+	            userKey: cacheUser,
+	            message: `${describeCannotPublishMessage(repoLabel)}\nDisconnected annotation repo.`,
+	            notify: 'error'
+	          });
+	          return false;
+	        }
 	      }
 	      const isDatasetMismatch =
 	        didResolved &&
@@ -768,6 +938,7 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
       }
       if (canonicalRepoRef) {
         session.setCacheContext?.({ datasetId: did, repoRef: canonicalRepoRef, userId });
+        if (configSha) session.setRemoteFileSha?.('annotations/config.json', configSha);
         setAnnotationRepoMetaForDataset(did, cacheUser, { branchMode });
       }
       const mine = await sync.pullUserFile({ userKey: cacheUser });
@@ -782,20 +953,6 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
 
   function normalizeGitHubUsername(value) {
     return String(value ?? '').trim().replace(/^@+/, '');
-  }
-
-  function normalizeEmail(value) {
-    return String(value ?? '').trim();
-  }
-
-  function isValidEmailAddress(value) {
-    const email = normalizeEmail(value);
-    if (!email) return true;
-    if (email.length > 254) return false;
-    // Pragmatic validation (good UX, avoids false negatives).
-    if (/\s/.test(email)) return false;
-    const re = /^[^@]+@[^@]+\.[^@]+$/;
-    return re.test(email);
   }
 
 	  async function editIdentityFlow({
@@ -907,21 +1064,6 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
             value: current?.title || remoteFields?.title || ''
           });
           content.appendChild(titleInput);
-
-          content.appendChild(el('label', { className: 'legend-help', text: 'Email:' }));
-          const emailInput = el('input', {
-            type: 'email',
-            className: 'community-annotation-text-input',
-            name: 'email',
-            autocomplete: 'email',
-            autocorrect: 'off',
-            autocapitalize: 'off',
-            spellcheck: 'false',
-            inputmode: 'email',
-            placeholder: 'name@domain.com',
-            value: current?.email || remoteFields?.email || ''
-          });
-          content.appendChild(emailInput);
 
           function normalizeLinkedInHandle(value) {
             const raw = String(value ?? '').trim();
@@ -1235,12 +1377,6 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
               status.textContent = 'Sign in with GitHub first.';
               return;
             }
-            const email = normalizeEmail(emailInput.value || '');
-            if (email && !isValidEmailAddress(email)) {
-              status.textContent = 'Email looks invalid.';
-              try { emailInput.focus(); } catch { /* ignore */ }
-              return;
-            }
             const normalizedOrcid = normalizeOrcidId(orcidInput.value || '') || String(orcidInput.value || '').trim();
             const normalizedLinkedin = normalizeLinkedInHandle(linkedinInput.value || '');
             if (linkedinInput.value && !normalizedLinkedin) {
@@ -1255,8 +1391,7 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
               displayName: String(nameInput.value || '').trim(),
               title: String(titleInput.value || '').trim(),
               orcid: normalizedOrcid,
-              linkedin: normalizedLinkedin,
-              email
+              linkedin: normalizedLinkedin
             };
             session.setProfile(nextProfile);
             content.closest('.community-annotation-modal-overlay')?.remove?.();
@@ -1302,7 +1437,7 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
     session.setProfile({ ...current, username: u, login: l, githubUserId });
     if (promptIfMissing) {
       const after = session.getProfile();
-      const hasAny = Boolean(after.displayName || after.title || after.orcid || after.linkedin || after.email);
+      const hasAny = Boolean(after.displayName || after.title || after.orcid || after.linkedin);
       if (!hasAny) await editIdentityFlow({ suggestedUsername: l });
     }
     return true;
@@ -1322,7 +1457,8 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
       const username = getCacheUserKey();
       const parsed = parseOwnerRepo(paramRepo);
       // If no @branch is provided, resolve "HEAD" (default branch) using GitHub API before persisting.
-      if (parsed && !parsed.ref) {
+      // Also resolve GitHub tree URLs where the branch may contain slashes.
+      if (parsed && (!parsed.ref || parsed.treeRefPath)) {
         (async () => {
           try {
             const ok = await setDatasetAnnotationRepoFromUrlParamAsync({ datasetId, urlParamValue: paramRepo, username });
@@ -1356,13 +1492,61 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
     render();
   });
 
+  const unsubscribeSessionLockLost = session.on?.('lock:lost', (evt) => {
+    const msg = toCleanString(evt?.message || '') || 'Lost cross-tab lock. Disconnected annotation repo.';
+    abortActiveSync(msg);
+    disconnectAnnotationRepo({
+      datasetId: evt?.datasetId ?? dataSourceManager?.getCurrentDatasetId?.() ?? null,
+      userKey: getCacheUserKey(),
+      message: msg,
+      notify: 'error',
+      preserveSession: true
+    });
+  }) || null;
+
+  const unsubscribeSessionLockError = session.on?.('lock:error', (evt) => {
+    const msg = toCleanString(evt?.message || '') || 'Unable to acquire cross-tab lock. Disconnected annotation repo.';
+    abortActiveSync(msg);
+    disconnectAnnotationRepo({
+      datasetId: evt?.datasetId ?? dataSourceManager?.getCurrentDatasetId?.() ?? null,
+      userKey: getCacheUserKey(),
+      message: msg,
+      notify: 'error',
+      preserveSession: true
+    });
+  }) || null;
+
+  const unsubscribeSessionPersistenceError = session.on?.('persistence:error', (evt) => {
+    const msg = toCleanString(evt?.message || '') || 'Local persistence failed. Disconnected annotation repo.';
+    abortActiveSync(msg);
+    disconnectAnnotationRepo({
+      datasetId: evt?.datasetId ?? dataSourceManager?.getCurrentDatasetId?.() ?? null,
+      userKey: getCacheUserKey(),
+      message: msg,
+      notify: 'error',
+      preserveSession: true
+    });
+  }) || null;
+
+  const unsubscribeSessionIntegrityError = session.on?.('integrity:error', (evt) => {
+    const msg = toCleanString(evt?.message || '') || 'Annotation data integrity error. Disconnected annotation repo.';
+    abortActiveSync(msg);
+    disconnectAnnotationRepo({
+      datasetId: evt?.datasetId ?? dataSourceManager?.getCurrentDatasetId?.() ?? null,
+      userKey: getCacheUserKey(),
+      message: msg,
+      notify: 'error',
+      preserveSession: true
+    });
+  }) || null;
+
   const unsubscribeAuth = githubAuth.on?.('changed', () => {
     // Clear auth-related errors and update identity UI quickly.
     syncError = null;
     if (!githubAuth.isAuthenticated?.()) {
       const current = session.getProfile();
       const fallbackUserKey = isSimulateRepoConnectedEnabled() ? (getLastGitHubUserKey() || 'local') : 'local';
-      session.setProfile({ ...current, username: fallbackUserKey, login: '', githubUserId: null, displayName: '', title: '', orcid: '', linkedin: '', email: '' });
+      session.setProfile({ ...current, username: fallbackUserKey, login: '', githubUserId: null, displayName: '', title: '', orcid: '', linkedin: '' });
       lastRepoInfo = null;
       access.clearRole?.();
       applySessionCacheContext({});
@@ -1380,6 +1564,10 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
 
   function destroy() {
     unsubscribe?.();
+    unsubscribeSessionLockLost?.();
+    unsubscribeSessionLockError?.();
+    unsubscribeSessionPersistenceError?.();
+    unsubscribeSessionIntegrityError?.();
     unsubscribeAuth?.();
     unsubscribeAccess?.();
     tooltipAbort.abort();
@@ -1479,6 +1667,26 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
       const parsed = new URL(href, window.location.href);
       if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
       window.open(parsed.toString(), '_blank', 'noopener,noreferrer');
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function copyTextToClipboard(text) {
+    const value = String(text ?? '').trim();
+    if (!value) return false;
+    try {
+      if (typeof navigator !== 'undefined' && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        await navigator.clipboard.writeText(value);
+        return true;
+      }
+    } catch {
+      // ignore and fall back
+    }
+    try {
+      // Fallback: allow manual copy without relying on deprecated execCommand.
+      window.prompt('Copy to clipboard:', value);
       return true;
     } catch {
       return false;
@@ -2236,6 +2444,10 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
               repoListLoaded = true;
               installationsLoaded = true;
               allRepos = [];
+              if (isWorkerOriginSecurityError(err)) {
+                disconnectGitHubSession({ message: err?.message || 'Invalid GitHub worker origin.', notify: 'error' });
+                return;
+              }
               if (isTokenAuthFailure(err)) {
                 disconnectGitHubSession({ message: 'GitHub session expired or was revoked. Please connect again.', notify: 'error' });
                 return;
@@ -2520,19 +2732,21 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
     });
   }
 
-	  async function pullFromGitHub({ repoOverride = null, quiet = false, confirmDatasetMismatch = false } = {}) {
-	    if (syncBusy) return { ok: false, skipped: true };
-	    syncBusy = true;
-	    syncError = null;
-	    render();
+		  async function pullFromGitHub({ repoOverride = null, quiet = false, confirmDatasetMismatch = false } = {}) {
+		    if (syncBusy) return { ok: false, skipped: true };
+		    syncBusy = true;
+		    syncError = null;
+		    const opAbort = beginActiveSyncAbortScope();
+		    render();
 
-	    const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
-	    if (!datasetId) {
-	      syncBusy = false;
-	      syncError = 'Missing dataset context.';
-	      render();
-	      return { ok: false, error: syncError };
-	    }
+		    const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
+		    if (!datasetId) {
+		      syncBusy = false;
+		      syncError = 'Missing dataset context.';
+		      endActiveSyncAbortScope(opAbort);
+		      render();
+		      return { ok: false, error: syncError };
+		    }
 
 	    const prevRepoInfo = lastRepoInfo;
 	    const prevRole = access.getRole?.() || 'unknown';
@@ -2540,20 +2754,22 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
 
 	    const cacheUser = getCacheUserKey();
 	    const storedRepoRef = getAnnotationRepoForDataset(datasetId, cacheUser) || null;
-	    const repoInput = repoOverride || storedRepoRef;
-	    if (!repoInput) {
-	      syncBusy = false;
-      syncError = 'No annotation repo connected.';
-      render();
-      return { ok: false, error: syncError };
-    }
+		    const repoInput = repoOverride || storedRepoRef;
+		    if (!repoInput) {
+		      syncBusy = false;
+	      syncError = 'No annotation repo connected.';
+	      endActiveSyncAbortScope(opAbort);
+	      render();
+	      return { ok: false, error: syncError };
+	    }
 
-    if (!githubAuth.isAuthenticated?.()) {
-      syncBusy = false;
-      syncError = 'Sign in required.';
-      render();
-      return { ok: false, error: syncError };
-    }
+	    if (!githubAuth.isAuthenticated?.()) {
+	      syncBusy = false;
+	      syncError = 'Sign in required.';
+	      endActiveSyncAbortScope(opAbort);
+	      render();
+	      return { ok: false, error: syncError };
+	    }
 
     const trackerId = quiet ? null : notifications.progress(`Pulling annotations from ${repoInput}...`, 0, { category: 'annotation' });
     const updateProgress = (pct, opts) => {
@@ -2589,8 +2805,9 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
           // ignore
         }
       }
-      const userId = getCacheUserId();
-      if (!userId) throw new Error('Missing GitHub numeric user id. Disconnect GitHub and sign in again.');
+	      const userId = getCacheUserId();
+	      if (!userId) throw new Error('Missing GitHub numeric user id. Disconnect GitHub and sign in again.');
+	      throwIfActiveSyncAborted(opAbort);
 
       const parsed = parseOwnerRepo(repoInput);
       if (!parsed) throw new Error('Invalid annotation repo');
@@ -2606,12 +2823,15 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
 	        else if (overrideParsed?.ownerRepo) overrideForDifferentRepo = storedParsed.ownerRepo.toLowerCase() !== overrideParsed.ownerRepo.toLowerCase();
 	      }
 	      preserveExisting = Boolean(overrideForDifferentRepo && storedRepoRef);
-	      if (overrideForDifferentRepo) {
-	        const ref = overrideParsed?.ref || parsed.ref || null;
-	        branchMode = ref ? 'explicit' : 'default';
-	      } else {
-	        branchMode = meta?.branchMode === 'explicit' ? 'explicit' : 'default';
+      if (overrideForDifferentRepo) {
+        const ref = overrideParsed?.ref || parsed.ref || null;
+        branchMode = ref ? 'explicit' : 'default';
+      } else {
+        branchMode = meta?.branchMode === 'explicit' ? 'explicit' : 'default';
       }
+
+      const treeRefPath = toCleanString(parsed?.treeRefPath || '') || null;
+      if (treeRefPath) branchMode = 'explicit';
 
       const token = githubAuth.getToken?.() || null;
       if (!token) throw new Error('GitHub sign-in required');
@@ -2625,10 +2845,18 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
         workerOrigin: githubAuth.getWorkerOrigin?.() || null
       });
 
-	      updateProgress(5, { message: `Validating repo: ${parsed.ownerRepo}...` });
-	      const { repoInfo, datasetConfig, config, datasetId: didResolved } = await sync.validateAndLoadConfig({ datasetId });
+      if (treeRefPath) {
+        updateProgress(4, { message: 'Resolving branch from GitHub URL…' });
+        const resolved = await sync.resolveBranchFromTreeRefPath(treeRefPath).catch(() => null);
+        if (!resolved) throw new Error('Unable to resolve branch from GitHub URL. Use owner/repo@branch format instead.');
+        sync.branch = resolved;
+      }
 
-	      lastRepoInfo = repoInfo || null;
+      updateProgress(5, { message: `Validating repo: ${parsed.ownerRepo}...` });
+      const { repoInfo, datasetConfig, config, configSha, datasetId: didResolved } = await sync.validateAndLoadConfig({ datasetId });
+      throwIfActiveSyncAborted(opAbort);
+
+		      lastRepoInfo = repoInfo || null;
 	      access.setRoleFromRepoInfo(lastRepoInfo);
 	      if ((access.getRole?.() || 'unknown') === 'unknown') {
 	        const repoLabel = toCleanString(repoInfo?.full_name || '') || parsed.ownerRepo;
@@ -2654,6 +2882,32 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
 	        fail(base);
 	        return { ok: false, error: base };
 	      }
+
+      // Enforce: connected users must be able to publish (direct push OR fork+PR).
+      // If a user cannot publish at all, treat as a fatal configuration/permission issue.
+      {
+        const repoLabel = toCleanString(repoInfo?.full_name || '') || parsed.ownerRepo;
+        if (!getPublishCapability(repoInfo).canPublish) {
+          const base = describeCannotPublishMessage(repoLabel);
+          if (preserveExisting) {
+            lastRepoInfo = prevRepoInfo;
+            try { access.setRole?.(prevRole); } catch { /* ignore */ }
+            lastRoleContext = prevRoleContext;
+            syncError = `${base}\nExisting repo connection preserved.`;
+            notifications.error(syncError, { category: 'annotation', duration: 10000 });
+            fail(base);
+            return { ok: false, error: base, blocked: true, preservedExisting: true };
+          }
+          disconnectAnnotationRepo({
+            datasetId,
+            userKey: cacheUser,
+            message: `${base}\nDisconnected annotation repo.`,
+            notify: 'error'
+          });
+          fail(base);
+          return { ok: false, error: base, blocked: true };
+        }
+      }
 
       const isDatasetMismatch =
         didResolved &&
@@ -2721,37 +2975,33 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
       const branch = toCleanString(sync.branch || '') || toCleanString(repoInfo?.default_branch || '') || 'main';
       canonicalRepoRef = `${ownerRepo}@${branch}`;
 
-	      // Ensure local cache key uses (datasetId, repo, branch, user) with the resolved branch.
-	      session.setCacheContext?.({ datasetId, repoRef: canonicalRepoRef, userId });
+		      // Ensure local cache key uses (datasetId, repo, branch, user) with the resolved branch.
+		      session.setCacheContext?.({ datasetId, repoRef: canonicalRepoRef, userId });
+		      throwIfActiveSyncAborted(opAbort);
 
-	      await fileCache.init?.();
-	      const cacheMode = String(fileCache.getCacheMode?.() || '');
-	      if (cacheMode === 'memory' && !didWarnMemoryCache) {
-	        didWarnMemoryCache = true;
-	        notifications.warning(
-	          'Browser storage is restricted (IndexedDB unavailable). Downloads will be cached in-memory for this tab only; Pull may re-download after a reload.',
-	          { category: 'annotation', duration: 10000 }
-	        );
-	      }
+		      await fileCache.init?.();
+		      throwIfActiveSyncAborted(opAbort);
+		      const cacheMode = String(fileCache.getCacheMode?.() || '');
+		      if (cacheMode === 'memory' && !didWarnMemoryCache) {
+		        didWarnMemoryCache = true;
+		        notifications.warning(
+		          'Browser storage is restricted (IndexedDB unavailable). Downloads will be cached in-memory for this tab only; Pull may re-download after a reload.',
+		          { category: 'annotation', duration: 10000 }
+		        );
+		      }
 
 	      // -------------------------------------------------------------------
 	      // 1) Pull + cache raw user + moderation files (download only changed via SHA)
 	      // -------------------------------------------------------------------
-	      const knownUserShas = fileCache.getKnownShas?.({ datasetId, repoRef: canonicalRepoRef, userId }, { prefixes: ['annotations/users/'] }) || null;
-	      updateProgress(15, { message: 'Checking `annotations/users/` (SHA)…' });
-	      const pullResult = await sync.pullAllUsers({ knownShas: knownUserShas });
-	      if ((pullResult?.truncatedCount || 0) > 0) {
-	        const total = Number(pullResult?.availableCount) || (Number(pullResult?.totalCount) || 0) + Number(pullResult?.truncatedCount || 0);
-	        const used = Number(pullResult?.totalCount) || 0;
-	        notifications.warning(
-	          `Repo has ${total} user files; Cellucid currently loads the first ${used}. ${pullResult.truncatedCount} user file(s) were skipped.`,
-	          { category: 'annotation', duration: 10000 }
-	        );
-	      }
+		      const knownUserShas = fileCache.getKnownShas?.({ datasetId, repoRef: canonicalRepoRef, userId }, { prefixes: ['annotations/users/'] }) || null;
+		      updateProgress(15, { message: 'Checking `annotations/users/` (SHA)…' });
+		      const pullResult = await sync.pullAllUsers({ knownShas: knownUserShas });
+		      throwIfActiveSyncAborted(opAbort);
 
 	      const fetchedUserDocs = pullResult?.docs || [];
 	      const remoteUserShas = pullResult?.shas || null;
 	      if (remoteUserShas) session.setRemoteFileShas?.(remoteUserShas);
+	      if (configSha) session.setRemoteFileSha?.('annotations/config.json', configSha);
 
       const userPaths = remoteUserShas ? Object.keys(remoteUserShas) : [];
       updateProgress(55, {
@@ -2762,16 +3012,17 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
 
       // Persist fetched user docs to the local raw-file cache. Invalid files are cached as a
       // sentinel so we don't keep re-downloading them until their SHA changes.
-      for (const d of fetchedUserDocs) {
-        const p = toCleanString(d?.__path || '');
-        const sha = toCleanString(d?.__sha || '') || (remoteUserShas ? toCleanString(remoteUserShas[p] || '') : '');
-        if (!p || !sha) continue;
-        const raw = (d && typeof d === 'object') ? { ...d } : { __invalid: true, __error: 'Invalid JSON shape (expected object)' };
-        delete raw.__path;
-        delete raw.__sha;
-        delete raw.__fileUser;
-        await fileCache.setJson?.({ datasetId, repoRef: canonicalRepoRef, userId, path: p, sha, json: raw });
-      }
+	      for (const d of fetchedUserDocs) {
+	        const p = toCleanString(d?.__path || '');
+	        const sha = toCleanString(d?.__sha || '') || (remoteUserShas ? toCleanString(remoteUserShas[p] || '') : '');
+	        if (!p || !sha) continue;
+	        const raw = (d && typeof d === 'object') ? { ...d } : { __invalid: true, __error: 'Invalid JSON shape (expected object)' };
+	        delete raw.__path;
+	        delete raw.__sha;
+	        delete raw.__fileUser;
+	        await fileCache.setJson?.({ datasetId, repoRef: canonicalRepoRef, userId, path: p, sha, json: raw });
+	      }
+	      throwIfActiveSyncAborted(opAbort);
 
       // Moderation merges (author-maintained, optional).
       const keepPaths = new Set(userPaths);
@@ -2785,19 +3036,60 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
           const raw = (res.doc && typeof res.doc === 'object') ? res.doc : { __invalid: true, __error: 'Invalid JSON shape (expected object)' };
           await fileCache.setJson?.({ datasetId, repoRef: canonicalRepoRef, userId, path: res.path, sha: res.sha, json: raw });
         }
-      } catch {
-        // ignore (optional)
-      }
+	      } catch {
+	        // ignore (optional)
+	      }
+	      throwIfActiveSyncAborted(opAbort);
 
-      // Prune cached files that no longer exist remotely.
-      await fileCache.pruneToPaths?.({ datasetId, repoRef: canonicalRepoRef, userId, keepPaths });
+	      // Prune cached files that no longer exist remotely.
+	      await fileCache.pruneToPaths?.({ datasetId, repoRef: canonicalRepoRef, userId, keepPaths });
+	      throwIfActiveSyncAborted(opAbort);
 
       // -------------------------------------------------------------------
-      // 2) Compile merged view from cached raw files (no cached compiled output)
-      // -------------------------------------------------------------------
-      updateProgress(75, { message: 'Compiling merged view from cached raw files…' });
+	      // 2) Compile merged view from cached raw files (no cached compiled output)
+	      // -------------------------------------------------------------------
+	      updateProgress(75, { message: 'Compiling merged view from cached raw files…' });
 
-      const cached = await fileCache.getAllJsonForRepo?.({ datasetId, repoRef: canonicalRepoRef, userId, prefixes: ['annotations/users/', 'annotations/moderation/'] }) || {};
+	      let cached = await fileCache.getAllJsonForRepo?.({ datasetId, repoRef: canonicalRepoRef, userId, prefixes: ['annotations/users/', 'annotations/moderation/'] }) || {};
+	      throwIfActiveSyncAborted(opAbort);
+
+	      // Self-heal: if the SHA index says a file exists but the IndexedDB record is missing/corrupt,
+	      // rebuild would silently drop those user docs. Re-download missing cached paths once.
+	      const missingCachedUserPaths = userPaths.filter((p) => !cached?.[p]?.json);
+	      if (missingCachedUserPaths.length) {
+	        updateProgress(78, { message: `Local cache missing ${missingCachedUserPaths.length} user file(s); re-downloading…` });
+	        const knownAfter = fileCache.getKnownShas?.({ datasetId, repoRef: canonicalRepoRef, userId }, { prefixes: ['annotations/users/'] }) || null;
+	        const forcedKnown = (knownAfter && typeof knownAfter === 'object') ? { ...knownAfter } : {};
+	        for (const p of missingCachedUserPaths.slice(0, 50_000)) delete forcedKnown[p];
+	        const repair = await sync.pullAllUsers({ knownShas: forcedKnown });
+	        throwIfActiveSyncAborted(opAbort);
+
+	        const repairDocs = repair?.docs || [];
+	        for (const d of repairDocs) {
+	          const p = toCleanString(d?.__path || '');
+	          const sha = toCleanString(d?.__sha || '') || (repair?.shas ? toCleanString(repair.shas?.[p] || '') : '');
+	          if (!p || !sha) continue;
+	          const raw = (d && typeof d === 'object') ? { ...d } : { __invalid: true, __error: 'Invalid JSON shape (expected object)' };
+	          delete raw.__path;
+	          delete raw.__sha;
+	          delete raw.__fileUser;
+	          await fileCache.setJson?.({ datasetId, repoRef: canonicalRepoRef, userId, path: p, sha, json: raw });
+	        }
+
+	        cached = await fileCache.getAllJsonForRepo?.({ datasetId, repoRef: canonicalRepoRef, userId, prefixes: ['annotations/users/', 'annotations/moderation/'] }) || {};
+	        throwIfActiveSyncAborted(opAbort);
+
+	        const stillMissing = userPaths.filter((p) => !cached?.[p]?.json);
+	        if (stillMissing.length) {
+	          const err = new Error(
+	            `Local cache is corrupted (missing ${stillMissing.length} user file(s)).\n\n` +
+	            'To prevent incorrect consensus/merges, disconnecting.\n\n' +
+	            'Fix: clear site data for this origin and Pull again.'
+	          );
+	          err.code = 'LOCAL_RAW_CACHE_CORRUPT';
+	          throw err;
+	        }
+	      }
 
       // Apply cached moderation merges first (if present and valid).
       //
@@ -2841,8 +3133,9 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
       const allUserDocsForSession = userPaths.map((p) => toUserDocForSession(p));
       const invalidTotal = allUserDocsForSession.filter((d) => d && d.__invalid).length;
 
-      // Rebuild deterministically from the complete raw-file set.
-      session.rebuildMergedViewFromUserFiles?.(allUserDocsForSession, { preferLocalVotes: true });
+	      // Rebuild deterministically from the complete raw-file set.
+	      session.rebuildMergedViewFromUserFiles?.(allUserDocsForSession, { preferLocalVotes: true });
+	      throwIfActiveSyncAborted(opAbort);
 
       // Apply configured fields for this dataset (author-controlled).
       const configuredList = Array.isArray(datasetConfig?.fieldsToAnnotate) ? datasetConfig.fieldsToAnnotate : [];
@@ -2917,7 +3210,8 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
         // ignore
       }
 
-      updateProgress(100, { message: 'Pull complete' });
+	      updateProgress(100, { message: 'Pull complete' });
+	      throwIfActiveSyncAborted(opAbort);
 
 	      // Commit the repo connection only after a successful Pull.
 	      if (canonicalRepoRef) {
@@ -2960,11 +3254,35 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
         const p = parseOwnerRepo(repoInput);
         return p?.ownerRepo || String(repoInput || '').split('@')[0].trim() || 'repo';
       })();
-      const branchLabel = toCleanString(sync?.branch || '') || null;
-      const apiSuffix = apiPath ? ` (${apiPath})` : '';
-	      preserveExisting = Boolean(overrideForDifferentRepo && storedRepoRef);
+	      const branchLabel = toCleanString(sync?.branch || '') || null;
+	      const apiSuffix = apiPath ? ` (${apiPath})` : '';
+		      preserveExisting = Boolean(overrideForDifferentRepo && storedRepoRef);
 
-      if (isTokenAuthFailure(err)) {
+	      if (err?.code === 'ANNOTATION_SYNC_ABORTED') {
+	        syncError = msg;
+	        fail(msg);
+	        return { ok: false, error: msg, aborted: true };
+	      }
+
+	      if (err?.code === 'LOCAL_RAW_CACHE_CORRUPT') {
+	        disconnectAnnotationRepo({
+	          datasetId,
+	          userKey: cacheUser,
+	          message: msg,
+	          notify: 'error',
+	          preserveSession: true
+	        });
+	        fail(msg);
+	        return { ok: false, error: msg, corruptedCache: true };
+	      }
+
+	      if (isWorkerOriginSecurityError(err)) {
+	        disconnectGitHubAndAnnotationRepo({
+	          datasetId,
+	          message: err?.message || `Invalid GitHub worker origin.${apiSuffix}`,
+          notify: 'error'
+        });
+      } else if (isTokenAuthFailure(err)) {
         disconnectGitHubAndAnnotationRepo({
           datasetId,
           message: `GitHub session expired or was revoked. Signed out and disconnected. Please connect again.${apiSuffix}`,
@@ -3068,11 +3386,12 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
 
 	      fail(msg);
 	      return { ok: false, error: msg };
-	    } finally {
-	      syncBusy = false;
-	      render();
-    }
-  }
+		    } finally {
+		      endActiveSyncAbortScope(opAbort);
+		      syncBusy = false;
+		      render();
+	    }
+	  }
 
   async function pushToGitHub() {
     const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
@@ -3098,6 +3417,7 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
     if (syncBusy) return;
     syncBusy = true;
     syncError = null;
+    const opAbort = beginActiveSyncAbortScope();
     render();
 
     const trackerId = notifications.loading(`Publishing your annotations to ${repo}...`, { category: 'annotation' });
@@ -3108,6 +3428,8 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
 
       const meta = getAnnotationRepoMetaForDataset(datasetId, cacheUser);
       const branchMode = meta?.branchMode === 'explicit' ? 'explicit' : 'default';
+      const treeRefPath = toCleanString(parsed?.treeRefPath || '') || null;
+      const effectiveBranchMode = treeRefPath ? 'explicit' : branchMode;
 
       const token = githubAuth.getToken?.() || null;
       if (!token) throw new Error('GitHub sign-in required');
@@ -3117,13 +3439,20 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
         owner: parsed.owner,
         repo: parsed.repo,
         token,
-        branch: branchMode === 'explicit' ? (parsed.ref || null) : null,
+        branch: effectiveBranchMode === 'explicit' ? (parsed.ref || null) : null,
         workerOrigin: githubAuth.getWorkerOrigin?.() || null
       });
 
-	      // Ensure branch/config resolves early with auth.
-	      const { repoInfo } = await sync.validateAndLoadConfig({ datasetId });
-	      lastRepoInfo = repoInfo || null;
+      if (treeRefPath) {
+        const resolved = await sync.resolveBranchFromTreeRefPath(treeRefPath).catch(() => null);
+        if (!resolved) throw new Error('Unable to resolve branch from GitHub URL. Use owner/repo@branch format instead.');
+        sync.branch = resolved;
+      }
+
+		      // Ensure branch/config resolves early with auth.
+		      const { repoInfo, configSha } = await sync.validateAndLoadConfig({ datasetId });
+		      throwIfActiveSyncAborted(opAbort);
+		      lastRepoInfo = repoInfo || null;
 	      access.setRoleFromRepoInfo(lastRepoInfo);
 	      if ((access.getRole?.() || 'unknown') === 'unknown') {
 	        const repoLabel = toCleanString(repoInfo?.full_name || '') || parsed.ownerRepo;
@@ -3143,6 +3472,22 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
 	        }
 	        return;
 	      }
+
+      // Enforce: connected users must be able to publish (direct push OR fork+PR).
+      {
+        const repoLabel = toCleanString(repoInfo?.full_name || '') || parsed.ownerRepo;
+        if (!getPublishCapability(repoInfo).canPublish) {
+          const msg = describeCannotPublishMessage(repoLabel);
+          disconnectAnnotationRepo({
+            datasetId,
+            userKey: cacheUser,
+            message: `${msg}\nDisconnected annotation repo.`,
+            notify: 'none'
+          });
+          try { notifications.fail(trackerId, msg); } catch { /* ignore */ }
+          return;
+        }
+      }
 	      const ownerRepo = toCleanString(repoInfo?.full_name || '') || parsed.ownerRepo;
 	      const branch = toCleanString(sync.branch || '') || toCleanString(repoInfo?.default_branch || '') || 'main';
 	      const canonicalRepoRef = `${ownerRepo}@${branch}`;
@@ -3155,7 +3500,7 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
           if (prev?.ownerRepo && next?.ownerRepo && prev.ownerRepo.toLowerCase() !== next.ownerRepo.toLowerCase()) {
             bits.push(`Repo moved: ${prev.ownerRepo} → ${next.ownerRepo}`);
           }
-          if (prev?.ref && next?.ref && prev.ref !== next.ref && branchMode === 'default') {
+          if (prev?.ref && next?.ref && prev.ref !== next.ref && effectiveBranchMode === 'default') {
             bits.push(`Default branch updated: ${prev.ref} → ${next.ref}`);
           }
 	          if (bits.length) {
@@ -3166,7 +3511,7 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
 	          lastRoleContext = `${String(cacheUser || 'local').toLowerCase()}::${String(canonicalRepoRef || '')}`;
 	          setAnnotationRepoForDataset(datasetId, canonicalRepoRef, cacheUser);
 	        }
-	        setAnnotationRepoMetaForDataset(datasetId, cacheUser, { branchMode });
+	        setAnnotationRepoMetaForDataset(datasetId, cacheUser, { branchMode: effectiveBranchMode });
 	        setUrlAnnotationRepo(canonicalRepoRef);
 	      };
       // Ensure local cache key uses (datasetId, repo, branch, user) with the resolved default branch.
@@ -3177,107 +3522,189 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
           // ignore
         }
       }
-      const userId = getCacheUserId();
-      if (!userId) throw new Error('Missing GitHub numeric user id. Disconnect GitHub and sign in again.');
-      session.setCacheContext?.({ datasetId, repoRef: canonicalRepoRef, userId });
+	      const userId = getCacheUserId();
+	      if (!userId) throw new Error('Missing GitHub numeric user id. Disconnect GitHub and sign in again.');
+	      throwIfActiveSyncAborted(opAbort);
+	      session.setCacheContext?.({ datasetId, repoRef: canonicalRepoRef, userId });
+	      throwIfActiveSyncAborted(opAbort);
+	      if (configSha) session.setRemoteFileSha?.('annotations/config.json', configSha);
 
-      const okIdentity = await ensureIdentityForPush({ sync });
-      if (!okIdentity) {
-        throw new Error('Unable to determine your GitHub username.');
-      }
+	      const okIdentity = await ensureIdentityForPush({ sync });
+	      throwIfActiveSyncAborted(opAbort);
+	      if (!okIdentity) {
+	        throw new Error('Unable to determine your GitHub username.');
+	      }
 
       const publishAuthorExtras = async () => {
-        if (!access.isAuthor()) return { configUpdated: false, mergesPublished: false, errors: [] };
+        const empty = () => ({ changed: false, mode: 'noop', prUrl: null, reused: false });
+        if (!access.isAuthor()) return { config: empty(), merges: empty(), errors: [] };
+
         /** @type {string[]} */
         const errors = [];
-        let configUpdated = false;
-        let mergesPublished = false;
+        const config = empty();
+        const merges = empty();
+
+        const remoteShas = (() => {
+          try {
+            return session.getRemoteFileShas?.() || {};
+          } catch {
+            return {};
+          }
+        })();
+        const expectedConfigSha = toCleanString(remoteShas?.['annotations/config.json'] || '') || null;
+        const expectedMergesSha = toCleanString(remoteShas?.['annotations/moderation/merges.json'] || '') || null;
 
         try {
           const fieldsToAnnotate = session.getAnnotatedFields?.() || [];
           const annotatableSettings = session.getAnnotatableConsensusSettingsMap?.() || {};
           const closedFields = session.getClosedAnnotatableFields?.() || [];
-          const res = await sync.updateDatasetFieldsToAnnotate({ datasetId, fieldsToAnnotate, annotatableSettings, closedFields });
-          configUpdated = Boolean(res?.changed);
+          const res = await sync.updateDatasetFieldsToAnnotate({
+            datasetId,
+            fieldsToAnnotate,
+            annotatableSettings,
+            closedFields,
+            conflictIfRemoteShaNotEqual: expectedConfigSha
+          });
+          config.changed = Boolean(res?.changed);
+          if (res?.mode === 'pr') {
+            config.mode = 'pr';
+            config.prUrl = String(res?.prUrl || '').trim() || null;
+            config.reused = Boolean(res?.reused);
+          } else if (res?.mode === 'push') {
+            config.mode = 'push';
+            if (res?.path && res?.sha) session.setRemoteFileSha?.(res.path, res.sha);
+          } else {
+            config.mode = 'noop';
+          }
         } catch (err) {
-          errors.push(err?.message || 'Failed to publish annotatable columns');
+          const msg = err?.message || 'Failed to publish annotatable columns';
+          errors.push(msg);
         }
 
         try {
-          const merges = session.getModerationMerges?.() || [];
-          if (Array.isArray(merges)) {
-            const res = await sync.pushModerationMerges({ mergesDoc: session.buildModerationMergesDocument() });
-            if (res?.path && res?.sha) session.setRemoteFileSha?.(res.path, res.sha);
-            mergesPublished = Boolean(res?.changed);
+          const list = session.getModerationMerges?.() || [];
+          if (Array.isArray(list)) {
+            const res = await sync.pushModerationMerges({
+              mergesDoc: session.buildModerationMergesDocument(),
+              conflictIfRemoteShaNotEqual: expectedMergesSha
+            });
+            merges.changed = Boolean(res?.changed);
+            if (res?.mode === 'pr') {
+              merges.mode = 'pr';
+              merges.prUrl = String(res?.prUrl || '').trim() || null;
+              merges.reused = Boolean(res?.reused);
+            } else if (res?.mode === 'push') {
+              merges.mode = 'push';
+              if (res?.path && res?.sha) session.setRemoteFileSha?.(res.path, res.sha);
+            } else {
+              merges.mode = 'noop';
+            }
           }
         } catch (err) {
-          errors.push(err?.message || 'Failed to publish merges');
+          const msg = err?.message || 'Failed to publish merges';
+          errors.push(msg);
         }
 
-        return { configUpdated, mergesPublished, errors };
+        return { config, merges, errors };
       };
 
-      const doc = session.buildUserFileDocument();
-      const lastSyncAt = session.getStateSnapshot()?.lastSyncAt || null;
-      try {
-        const result = await sync.pushMyUserFile({ userDoc: doc, conflictIfRemoteNewerThan: lastSyncAt });
+      const handlePublishResult = async (result) => {
+        throwIfActiveSyncAborted(opAbort);
         session.markSyncedNow();
         if (result?.mode === 'push' && result?.path && result?.sha) session.setRemoteFileSha?.(result.path, result.sha);
+
+        const extras = await publishAuthorExtras();
+        throwIfActiveSyncAborted(opAbort);
+
+        const configPrLabel = extras?.config?.mode === 'pr' && extras.config.changed
+          ? (extras.config.prUrl ? `Config PR: ${extras.config.prUrl}` : 'Config PR opened')
+          : null;
+        const mergesPrLabel = extras?.merges?.mode === 'pr' && extras.merges.changed
+          ? (extras.merges.prUrl ? `Merges PR: ${extras.merges.prUrl}` : 'Merges PR opened')
+          : null;
+
         if (result?.mode === 'pr') {
           const prUrl = String(result?.prUrl || '').trim();
           const label = result?.reused ? 'Updated Pull Request' : 'Opened Pull Request';
-          notifications.complete(trackerId, prUrl ? `${label}: ${prUrl}` : label);
-        } else {
-          const extras = await publishAuthorExtras();
-          const bits = ['Published your votes/suggestions'];
-          if (extras.configUpdated) bits.push('updated annotatable columns');
-          if (extras.mergesPublished) bits.push('published merges');
-          notifications.complete(trackerId, bits.join(' • '));
+          const parts = [prUrl ? `${label}: ${prUrl}` : label];
+          if (configPrLabel) parts.push(configPrLabel);
+          else if (extras?.config?.mode === 'push' && extras.config.changed) parts.push('updated annotatable columns');
+          if (mergesPrLabel) parts.push(mergesPrLabel);
+          else if (extras?.merges?.mode === 'push' && extras.merges.changed) parts.push('published merges');
+          notifications.complete(trackerId, parts.join(' • '));
           if (extras.errors.length) {
             notifications.error(`Author publish extras: ${extras.errors.join(' • ')}`, { category: 'annotation', duration: 6000 });
           }
+          throwIfActiveSyncAborted(opAbort);
+          commitRepoRefIfChanged();
+          return;
         }
+
+        const bits = ['Published your votes/suggestions'];
+        if (configPrLabel) bits.push(configPrLabel);
+        else if (extras?.config?.mode === 'push' && extras.config.changed) bits.push('updated annotatable columns');
+        if (mergesPrLabel) bits.push(mergesPrLabel);
+        else if (extras?.merges?.mode === 'push' && extras.merges.changed) bits.push('published merges');
+        notifications.complete(trackerId, bits.join(' • '));
+        if (extras.errors.length) {
+          notifications.error(`Author publish extras: ${extras.errors.join(' • ')}`, { category: 'annotation', duration: 6000 });
+        }
+        throwIfActiveSyncAborted(opAbort);
         commitRepoRefIfChanged();
-        return;
-      } catch (err) {
-        if (err?.code === 'COMMUNITY_ANNOTATION_CONFLICT') {
-          const ok = await confirmAsync({
-            title: 'Possible conflict',
+      };
+
+	      const doc = session.buildUserFileDocument();
+	      const lastSyncAt = session.getStateSnapshot()?.lastSyncAt || null;
+	      const expectedRemoteUserSha = (() => {
+	        const gidRaw = doc?.githubUserId;
+	        const gid = Number.isFinite(Number(gidRaw)) ? Math.max(0, Math.floor(Number(gidRaw))) : 0;
+	        if (!gid) return null;
+	        const path = `annotations/users/ghid_${gid}.json`;
+	        try {
+	          const map = session.getRemoteFileShas?.() || {};
+	          return toCleanString(map?.[path] || '') || null;
+	        } catch {
+	          return null;
+	        }
+	      })();
+		      try {
+		        const result = await sync.pushMyUserFile({
+		          userDoc: doc,
+		          conflictIfRemoteNewerThan: lastSyncAt,
+		          conflictIfRemoteShaNotEqual: expectedRemoteUserSha
+		        });
+		        await handlePublishResult(result);
+		        return;
+		      } catch (err) {
+		        if (err?.code === 'COMMUNITY_ANNOTATION_CONFLICT') {
+		          const ok = await confirmAsync({
+	            title: 'Possible conflict',
             message:
               `Your remote user file appears to have been updated since your last sync.\n\n` +
               `Remote updatedAt: ${String(err?.remoteUpdatedAt || 'unknown')}\n\n` +
               `Recommendation: Pull first to merge changes. Overwrite anyway?`,
-            confirmText: 'Overwrite remote'
-          });
-          if (!ok) throw new Error('Publish cancelled.');
-          const result = await sync.pushMyUserFile({ userDoc: doc, force: true });
-          session.markSyncedNow();
-          if (result?.mode === 'push' && result?.path && result?.sha) session.setRemoteFileSha?.(result.path, result.sha);
-          if (result?.mode === 'pr') {
-            const prUrl = String(result?.prUrl || '').trim();
-            const label = result?.reused ? 'Updated Pull Request' : 'Opened Pull Request';
-            notifications.complete(trackerId, prUrl ? `${label}: ${prUrl}` : label);
-          } else {
-            const extras = await publishAuthorExtras();
-            const bits = ['Published your votes/suggestions'];
-            if (extras.configUpdated) bits.push('updated annotatable columns');
-            if (extras.mergesPublished) bits.push('published merges');
-            notifications.complete(trackerId, bits.join(' • '));
-            if (extras.errors.length) {
-              notifications.error(`Author publish extras: ${extras.errors.join(' • ')}`, { category: 'annotation', duration: 6000 });
-            }
-          }
-          commitRepoRefIfChanged();
-          return;
-        } else {
-          throw err;
-        }
+	            confirmText: 'Overwrite remote'
+	          });
+		          throwIfActiveSyncAborted(opAbort);
+		          if (!ok) throw new Error('Publish cancelled.');
+		          const result = await sync.pushMyUserFile({ userDoc: doc, force: true });
+		          await handlePublishResult(result);
+		          return;
+		        } else {
+		          throw err;
+	        }
       }
-	    } catch (err) {
-	      const statusCode = httpStatusOrNull(err);
-	      const apiPath = gitHubApiPath(err) || workerPath(err);
-	      let msg = String(err?.message || 'Publish failed').trim() || 'Publish failed';
-	      const apiSuffix = apiPath ? ` (${apiPath})` : '';
+    } catch (err) {
+      const statusCode = httpStatusOrNull(err);
+      const apiPath = gitHubApiPath(err) || workerPath(err);
+      let msg = String(err?.message || 'Publish failed').trim() || 'Publish failed';
+      const apiSuffix = apiPath ? ` (${apiPath})` : '';
+
+      if (err?.code === 'ANNOTATION_SYNC_ABORTED') {
+        syncError = msg;
+        notifications.fail(trackerId, msg);
+        return;
+      }
 
       if (msg.toLowerCase().includes('cancelled')) {
         syncError = 'Cancelled.';
@@ -3294,7 +3721,13 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
         return p?.ownerRepo || String(repo || '').split('@')[0].trim() || 'repo';
       })();
 
-      if (isTokenAuthFailure(err)) {
+      if (isWorkerOriginSecurityError(err)) {
+        disconnectGitHubAndAnnotationRepo({
+          datasetId,
+          message: err?.message || `Invalid GitHub worker origin.${apiSuffix}`,
+          notify: 'error'
+        });
+      } else if (isTokenAuthFailure(err)) {
         disconnectGitHubAndAnnotationRepo({
           datasetId,
           message: `GitHub session expired or was revoked. Signed out and disconnected. Please connect again.${apiSuffix}`,
@@ -3359,10 +3792,11 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
 	        }
 	      }
 
-	      notifications.fail(trackerId, msg);
-	    } finally {
-	      syncBusy = false;
-	      render();
+      notifications.fail(trackerId, msg);
+    } finally {
+      endActiveSyncAbortScope(opAbort);
+      syncBusy = false;
+      render();
     }
   }
 
@@ -3444,6 +3878,7 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
     const datasetIcon = icon('M4 6c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3zm0 6c0 1.7 3.6 3 8 3s8-1.3 8-3m-16 6c0 1.7 3.6 3 8 3s8-1.3 8-3');
     const githubIcon = icon('M12 12a4 4 0 1 0-4-4 4 4 0 0 0 4 4zm-8 9a8 8 0 0 1 16 0');
     const repoIcon = icon('M4 7a3 3 0 0 1 3-3h10a3 3 0 0 1 3 3v10a3 3 0 0 1-3 3H7a3 3 0 0 1-3-3zM8 8h8M8 12h8M8 16h6');
+    const copyIcon = icon('M8 8h12v12H8zM4 4h12v12H4z');
 
     const toneClass = (tone) => {
       if (tone === 'ok') return 'community-annotation-status-chip community-annotation-status-chip--ok';
@@ -3466,6 +3901,29 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
     const storedRepoName = repo ? String(repo).split('@')[0] : '';
     const connectedName = isAuthed ? storedRepoName : '';
 
+    const copyShareLinkBtn = (() => {
+      if (!repo) return null;
+      const btn = el('button', {
+        type: 'button',
+        className: 'community-annotation-status-action',
+        title: 'Copy share link (includes @branch)',
+        'aria-label': 'Copy share link'
+      }, [copyIcon]);
+      btn.disabled = syncBusy;
+      btn.addEventListener('click', async () => {
+        try {
+          const url = new URL(window.location.href);
+          url.searchParams.set('annotations', String(repo).trim());
+          const ok = await copyTextToClipboard(url.toString());
+          if (ok) notifications.success('Share link copied.', { category: 'annotation', duration: 2200 });
+          else notifications.error('Unable to copy share link.', { category: 'annotation', duration: 3500 });
+        } catch {
+          notifications.error('Unable to copy share link.', { category: 'annotation', duration: 3500 });
+        }
+      });
+      return btn;
+    })();
+
     const statusList = el('div', { className: 'community-annotation-status-list community-annotation-status-panel community-annotation-dashed-box community-annotation-dashed-box--prose' });
     statusList.appendChild(makeStatusRow({
       iconEl: datasetIcon,
@@ -3486,7 +3944,7 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
       tone: connectedName ? 'ok' : 'warn',
       key: 'Repo',
       value: connectedName ? ` ${connectedName}` : (storedRepoName && !isAuthed ? ` ${storedRepoName} (sign in)` : ' not connected'),
-      actions: []
+      actions: copyShareLinkBtn ? [copyShareLinkBtn] : []
     }));
 
     syncBlock.appendChild(statusList);
@@ -3694,7 +4152,6 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
     if (profile?.title) addProfileRow('Title', profile.title);
     if (profile?.orcid) addProfileRow('ORCID', profile.orcid);
     if (profile?.linkedin) addProfileRow('LinkedIn', profile.linkedin);
-    if (profile?.email) addProfileRow('Email', profile.email);
     identityBlock.appendChild(profileBox);
 
     const identityActions = el('div', { className: 'community-annotation-identity-actions' });
@@ -3726,7 +4183,7 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
         confirmText: 'Clear'
       });
       if (!ok) return;
-      session.setProfile({ ...profile, login: loginOrLocal, displayName: '', title: '', orcid: '', linkedin: '', email: '' });
+      session.setProfile({ ...profile, login: loginOrLocal, displayName: '', title: '', orcid: '', linkedin: '' });
       render();
 	    });
 
@@ -3821,7 +4278,7 @@ export function initCommunityAnnotationControls({ state, dom, dataSourceManager 
           type: 'button',
           className: 'btn-small',
           text: isClosed ? 'Reopen' : 'Close',
-          title: isClosed ? 'Reopen this annotatable column for community voting.' : 'Close this annotatable column (read-only for annotators).',
+          title: isClosed ? 'Reopen this annotatable column for community voting.' : 'Close this annotatable column (voting disabled for annotators).',
           disabled: repoConnectedForGating && !access.isAuthor()
         })
         : null;

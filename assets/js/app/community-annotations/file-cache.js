@@ -229,10 +229,32 @@ export class CommunityAnnotationFileCache {
         const req = store.get(key);
         req.onsuccess = () => {
           const rec = req.result || null;
-          if (!rec || typeof rec !== 'object') return resolve(null);
+          if (!rec || typeof rec !== 'object') {
+            try {
+              const idx = readShaIndex(scope);
+              if (idx[p]) {
+                delete idx[p];
+                writeShaIndex(scope, idx);
+              }
+            } catch {
+              // ignore
+            }
+            return resolve(null);
+          }
           const sha = toCleanString(rec.sha);
           const json = rec.json ?? null;
-          if (!sha || !json || typeof json !== 'object') return resolve(null);
+          if (!sha || !json || typeof json !== 'object') {
+            try {
+              const idx = readShaIndex(scope);
+              if (idx[p]) {
+                delete idx[p];
+                writeShaIndex(scope, idx);
+              }
+            } catch {
+              // ignore
+            }
+            return resolve(null);
+          }
           resolve({ sha, json });
         };
         req.onerror = () => resolve(null);
@@ -428,6 +450,24 @@ export class CommunityAnnotationFileCache {
       });
     } catch {
       return {};
+    }
+
+    // Repair: if the localStorage-backed SHA index contains paths that are missing from IndexedDB,
+    // future pulls may incorrectly skip re-downloading those files. Drop any missing entries so
+    // the next pull self-heals.
+    try {
+      const idx = readShaIndex(scope);
+      let changed = false;
+      for (const path of Object.keys(idx)) {
+        const okPrefix = !pfxList || pfxList.some((pfx) => path.startsWith(pfx));
+        if (!okPrefix) continue;
+        if (out[path]) continue;
+        delete idx[path];
+        changed = true;
+      }
+      if (changed) writeShaIndex(scope, idx);
+    } catch {
+      // ignore
     }
 
     return out;

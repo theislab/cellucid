@@ -58,9 +58,11 @@
 
 /* Inline labeled input groups */
 .figure-export-inline {
-  display: inline-flex;
+  display: flex;
   gap: var(--space-1);
   align-items: center;
+  flex-wrap: wrap;
+  min-width: 0;
 }
 
 .figure-export-inline .figure-input-sm {
@@ -77,19 +79,30 @@
 /* Size row: preset + W/H inputs */
 .figure-export-size-row {
   display: flex;
+  flex-direction: column;
   gap: var(--space-1-5);
-  align-items: center;
-  flex-wrap: wrap;
 }
 
 .figure-export-size-row .obs-select {
-  flex: 1 1 120px;
-  min-width: 100px;
+  width: 100%;
   margin-top: 0;
 }
 
-.figure-export-size-row .figure-export-inline {
-  flex: 0 0 auto;
+.figure-export-dimensions {
+  display: flex;
+  gap: var(--space-1-5);
+}
+
+.figure-export-dim-field {
+  flex: 1 1 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.figure-export-dim-field .figure-input-sm {
+  flex: 1;
+  min-width: 0;
 }
 
 /* Plot size + framing (stacked; keeps close to preview) */
@@ -108,6 +121,25 @@
 
 .figure-export-framing-controls .checkbox-inline {
   margin-top: 0;
+}
+
+.figure-export-framing-buttons {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: var(--space-1);
+}
+
+.figure-export-framing-buttons .btn-small {
+  flex: 1 1 0;
+  min-width: 0;
+  padding-left: var(--space-1);
+  padding-right: var(--space-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: center;
+  justify-content: center;
 }
 
 /* Checkbox rows */
@@ -219,7 +251,8 @@
 .figure-export-crop-aspect {
   font-size: var(--text-xs);
   color: var(--color-text-tertiary);
-  white-space: nowrap;
+  white-space: normal;
+  flex: 1 1 100%;
 }
 
 .figure-export-crop-hint {
@@ -239,18 +272,21 @@
 /* Preview controls row */
 .figure-export-preview-controls {
   display: flex;
-  gap: var(--space-1-5);
+  gap: var(--space-1);
   align-items: center;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
 }
 
 .figure-export-preview-controls .checkbox-inline {
+  flex: 0 0 auto;
   margin-top: 0;
+  white-space: nowrap;
 }
 
-.figure-export-preview-controls .obs-select {
-  flex: 1;
-  min-width: 100px;
+.figure-export-colorblind-select {
+  flex: 1 1 auto;
+  min-width: 60px;
+  max-width: 110px;
   margin-top: 0;
 }
 
@@ -264,6 +300,24 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-1-5);
+}
+
+.figure-export-sizes-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: var(--space-1-5);
+  align-items: center;
+}
+
+.figure-export-size-item {
+  display: flex;
+  gap: var(--space-1);
+  align-items: center;
+  min-width: 0;
+}
+
+.figure-export-size-item .figure-input-sm {
+  margin-left: auto;
 }
 
 .figure-export-style-row {
@@ -312,4 +366,18 @@
   border-bottom: var(--border-width-1) solid var(--color-border-light);
   padding-bottom: var(--space-2);
   margin-bottom: var(--space-1);
+}
+
+.figure-export-accordion {
+  margin-top: var(--space-2);
+}
+
+.figure-export-dashed-box {
+  padding: var(--space-2) var(--space-2-5);
+  background: var(--color-surface-secondary);
+  border: var(--border-width-1) dashed var(--color-border-strong);
+  box-shadow: var(--shadow-xs);
+  font-size: var(--text-xs);
+  color: var(--color-text-secondary);
+  line-height: 1.35;
 }

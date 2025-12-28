@@ -8,6 +8,18 @@ import { escapeHtml } from '../utils.js';
 
 let activeKeydownHandler = null;
 
+function createDomId(prefix = 'id') {
+  const p = String(prefix || 'id').trim() || 'id';
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return `${p}-${crypto.randomUUID()}`;
+    }
+  } catch {
+    // ignore
+  }
+  return `${p}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 export function showConfirmDialog({
   title,
   message,
@@ -31,6 +43,9 @@ export function showConfirmDialog({
   overlay.className = 'confirm-dialog-overlay';
   overlay.setAttribute('role', 'dialog');
   overlay.setAttribute('aria-modal', 'true');
+  const prevFocus = document.activeElement;
+  const titleId = createDomId('confirm-dialog-title');
+  overlay.setAttribute('aria-labelledby', titleId);
 
   const wantsInput = Boolean(inputLabel || inputPlaceholder);
   const inputBlock = wantsInput
@@ -53,7 +68,7 @@ export function showConfirmDialog({
   overlay.innerHTML = `
     <div class="confirm-dialog" role="document">
       <div class="confirm-dialog-header">
-        <span class="confirm-dialog-title">${escapeHtml(title || 'Confirm')}</span>
+        <span class="confirm-dialog-title" id="${escapeHtml(titleId)}">${escapeHtml(title || 'Confirm')}</span>
       </div>
       <div class="confirm-dialog-body">
         ${escapeHtml(message || '')}
@@ -67,6 +82,68 @@ export function showConfirmDialog({
   `;
 
   let closed = false;
+  const listFocusable = () => {
+    const root = overlay.querySelector('.confirm-dialog');
+    if (!root) return [];
+    const selectors = [
+      'a[href]',
+      'area[href]',
+      'button:not([disabled])',
+      'input:not([disabled]):not([type="hidden"])',
+      'select:not([disabled])',
+      'textarea:not([disabled])',
+      '[contenteditable="true"]',
+      '[tabindex]:not([tabindex="-1"])'
+    ].join(',');
+    return Array.from(root.querySelectorAll(selectors)).filter((node) => {
+      if (!(node instanceof HTMLElement)) return false;
+      try {
+        const style = window.getComputedStyle?.(node);
+        if (style?.display === 'none' || style?.visibility === 'hidden') return false;
+        return node.getClientRects().length > 0;
+      } catch {
+        return true;
+      }
+    });
+  };
+
+  const onTrapKeyDown = (e) => {
+    if (e.key !== 'Tab') return;
+    const focusables = listFocusable();
+    if (!focusables.length) {
+      try { e.preventDefault?.(); } catch { /* ignore */ }
+      return;
+    }
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    const active = document.activeElement;
+    const root = overlay.querySelector('.confirm-dialog');
+    const containsActive = active && root && root.contains(active);
+
+    if (e.shiftKey) {
+      if (!containsActive || active === first) {
+        try {
+          e.preventDefault?.();
+          last.focus?.();
+        } catch {
+          // ignore
+        }
+      }
+      return;
+    }
+
+    if (!containsActive || active === last) {
+      try {
+        e.preventDefault?.();
+        first.focus?.();
+      } catch {
+        // ignore
+      }
+    }
+  };
+
+  overlay.addEventListener('keydown', onTrapKeyDown, true);
+
   const close = () => {
     if (closed) return;
     closed = true;
@@ -74,7 +151,17 @@ export function showConfirmDialog({
       document.removeEventListener('keydown', activeKeydownHandler);
       activeKeydownHandler = null;
     }
+    try {
+      overlay.removeEventListener('keydown', onTrapKeyDown, true);
+    } catch {
+      // ignore
+    }
     overlay.remove();
+    try {
+      prevFocus?.focus?.();
+    } catch {
+      // ignore
+    }
   };
 
   const cancelBtn = overlay.querySelector('.confirm-dialog-cancel');

@@ -153,8 +153,8 @@ export function reducePointsByDensity({
       rgba: new Uint8Array(0),
       alpha: new Float32Array(0),
       index: new Uint32Array(0),
-      viewportWidth: viewportW,
-      viewportHeight: viewportH
+      viewportWidth: effW,
+      viewportHeight: effH
     };
   }
 

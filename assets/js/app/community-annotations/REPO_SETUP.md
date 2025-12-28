@@ -193,6 +193,7 @@ Then configure Cellucid to point at your worker origin (build/deploy-time inject
 
 Notes:
 
-- On non-local hosts, this value is treated as deploy-time config and is read once when the app loads (setting it later in the console won’t change the active worker origin).
+- For security, **non-local builds refuse untrusted worker origins**. In production, set your worker by changing `DEFAULT_WORKER_ORIGIN` in `cellucid/assets/js/app/community-annotations/github-auth.js` and rebuilding.
+- Local dev hosts may use `window.__CELLUCID_GITHUB_WORKER_ORIGIN__` for testing.
 
 This lets you keep the same repo template and UI while controlling the auth infrastructure.

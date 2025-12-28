@@ -51,43 +51,203 @@
 
 import { escapeHtml } from '../../../../utils/dom-utils.js';
 import { forEachProjectedPoint } from '../utils/point-projector.js';
-import { computeSingleViewLayout, computeGridDims } from '../utils/layout.js';
-import { renderSvgAxes } from '../components/axes-builder.js';
-import { renderSvgLegend } from '../components/legend-builder.js';
-import { renderSvgOrientationIndicator } from '../components/orientation-indicator.js';
-import { renderSvgCentroidOverlay } from '../components/centroid-overlay.js';
-import { computeVisibleRealBounds } from '../utils/coordinate-mapper.js';
-import { cropRect01ToPx, normalizeCropRect01 } from '../utils/crop.js';
-import { reducePointsByDensity } from '../utils/density-reducer.js';
-import { blobToDataUrl } from '../utils/export-helpers.js';
-import { hashStringToSeed } from '../utils/hash.js';
+	import { computeSingleViewLayout, computeGridDims } from '../utils/layout.js';
+	import { renderSvgAxes } from '../components/axes-builder.js';
+	import { renderSvgLegend } from '../components/legend-builder.js';
+	import { renderSvgOrientationIndicator } from '../components/orientation-indicator.js';
+	import { renderSvgCentroidOverlay } from '../components/centroid-overlay.js';
+	import { computeVisibleRealBounds } from '../utils/coordinate-mapper.js';
+	import { cropRect01ToPx, normalizeCropRect01 } from '../utils/crop.js';
+	import { reducePointsByDensity } from '../utils/density-reducer.js';
+	import { applyAuto3dAxisLabels } from '../utils/orientation-labels.js';
+	import { blobToDataUrl } from '../utils/export-helpers.js';
+	import { hashStringToSeed } from '../utils/hash.js';
 import { rasterizePointsWebgl } from '../utils/webgl-point-rasterizer.js';
 import { getEffectivePointDiameterPx, getLodVisibilityMask } from '../utils/point-size.js';
-import { clamp, parseNumberOr } from '../../../../utils/number-utils.js';
-import { computeLetterboxedRect } from '../utils/letterbox.js';
+import { hexToRgb01, rgb01ToHex } from '../utils/color-utils.js';
+	import { clamp, parseNumberOr } from '../../../../utils/number-utils.js';
+	import { computeLetterboxedRect } from '../utils/letterbox.js';
 
-function buildSvgMetadata(meta) {
-  const dataset = meta?.datasetName || meta?.datasetId || '';
-  const descriptionParts = [];
-  if (meta?.fieldKey) descriptionParts.push(`Field: ${meta.fieldKey}`);
-  if (Array.isArray(meta?.filters) && meta.filters.length) {
-    const lines = meta.filters.filter((l) => l && !/No filters active/i.test(String(l)));
-    if (lines.length) descriptionParts.push(`Filters: ${lines.join('; ')}`);
-  }
-  const description = descriptionParts.join(' • ');
+function applyExportBackgroundToRenderState(renderState, background, backgroundColor) {
+  if (!renderState) return renderState;
+  if (background === 'viewer' || background === 'transparent') return renderState;
 
-  return `<metadata>
+  const rgb = hexToRgb01(backgroundColor);
+  if (!rgb) return renderState;
+
+  return {
+    ...renderState,
+    fogColor: new Float32Array(rgb),
+    bgColor: new Float32Array(rgb),
+  };
+}
+
+const DEFAULT_HIGHLIGHT_RGB = { r: 102, g: 217, b: 255 }; // ~[0.4, 0.85, 1.0]
+const DEFAULT_HIGHLIGHT_SCALE = 1.75;
+
+function highlightValueToAlpha01(value) {
+  const v = Number(value);
+  if (!Number.isFinite(v) || v <= 0) return 0;
+  if (v <= 1.0) return Math.max(0, Math.min(1, v));
+  return Math.max(0, Math.min(1, v / 255));
+}
+
+	function computeVisibleCameraBounds({
+	  positions,
+	  transparency = null,
+	  visibilityMask = null,
+	  mvpMatrix,
+	  viewMatrix,
+	  viewportWidth = 1,
+	  viewportHeight = 1,
+	  crop = null,
+	}) {
+	  if (!positions || !mvpMatrix || !viewMatrix) return null;
+
+	  const n = Math.floor(positions.length / 3);
+	  const m = mvpMatrix;
+	  const v = viewMatrix;
+	  const vw = Math.max(1, Number(viewportWidth) || 1);
+	  const vh = Math.max(1, Number(viewportHeight) || 1);
+	  const crop01 = normalizeCropRect01(crop);
+	  const cropPx = cropRect01ToPx(crop01, vw, vh);
+	  const hasCrop = Boolean(
+	    cropPx &&
+	      (cropPx.width < vw - 0.5 || cropPx.height < vh - 0.5 || cropPx.x > 0.5 || cropPx.y > 0.5)
+	  );
+
+	  let minX = Infinity;
+	  let maxX = -Infinity;
+	  let minY = Infinity;
+	  let maxY = -Infinity;
+	  let any = false;
+
+	  for (let i = 0; i < n; i++) {
+	    if (visibilityMask && (visibilityMask[i] ?? 0) <= 0) continue;
+	    const rawAlpha = transparency ? (transparency[i] ?? 1.0) : 1.0;
+	    let alpha = Number.isFinite(rawAlpha) ? rawAlpha : 1.0;
+	    if (alpha < 0) alpha = 0;
+	    else if (alpha > 1) alpha = 1;
+	    if (alpha < 0.01) continue;
+
+	    const ix = i * 3;
+	    const x = positions[ix];
+	    const y = positions[ix + 1];
+	    const z = positions[ix + 2];
+
+	    const clipX = m[0] * x + m[4] * y + m[8] * z + m[12];
+	    const clipY = m[1] * x + m[5] * y + m[9] * z + m[13];
+	    const clipW = m[3] * x + m[7] * y + m[11] * z + m[15];
+	    if (!Number.isFinite(clipW) || clipW <= 0) continue;
+
+	    const ndcX = clipX / clipW;
+	    const ndcY = clipY / clipW;
+	    if (ndcX < -1 || ndcX > 1 || ndcY < -1 || ndcY > 1) continue;
+
+	    if (hasCrop && cropPx) {
+	      const vx = (ndcX * 0.5 + 0.5) * vw;
+	      const vy = (-ndcY * 0.5 + 0.5) * vh;
+	      if (vx < cropPx.x || vx > cropPx.x + cropPx.width || vy < cropPx.y || vy > cropPx.y + cropPx.height) continue;
+	    }
+
+	    const camX = v[0] * x + v[4] * y + v[8] * z + v[12];
+	    const camY = v[1] * x + v[5] * y + v[9] * z + v[13];
+	    if (!Number.isFinite(camX) || !Number.isFinite(camY)) continue;
+	    if (camX < minX) minX = camX;
+	    if (camX > maxX) maxX = camX;
+	    if (camY < minY) minY = camY;
+	    if (camY > maxY) maxY = camY;
+	    any = true;
+	  }
+
+	  if (!any) return null;
+	  return { minX, maxX, minY, maxY };
+	}
+
+	function buildSvgMetadata(meta, payload) {
+	  const dataset = meta?.datasetName || meta?.datasetId || '';
+	  const exportedAt = String(meta?.exportedAt || new Date().toISOString());
+	  const website = 'https://cellucid.com';
+	  const sourceFile = (
+	    meta?.datasetUserPath ||
+	    meta?.datasetSourceUrl ||
+	    meta?.datasetBaseUrl ||
+	    null
+	  );
+
+	  const descriptionParts = [];
+	  if (meta?.fieldKey) descriptionParts.push(`Field: ${meta.fieldKey}`);
+	  if (meta?.viewLabel) descriptionParts.push(`View: ${meta.viewLabel}`);
+	  if (sourceFile) descriptionParts.push(`Source: ${sourceFile}`);
+	  if (Array.isArray(meta?.filters) && meta.filters.length) {
+	    const lines = meta.filters.filter((l) => l && !/No filters active/i.test(String(l)));
+	    if (lines.length) descriptionParts.push(`Filters: ${lines.join('; ')}`);
+	  }
+	  const description = descriptionParts.join(' • ');
+
+	  const json = JSON.stringify(
+	    {
+	      generator: website,
+	      exporter: meta?.exporter || { name: 'Cellucid', website },
+	      exportedAt,
+	      dataset: {
+	        name: meta?.datasetName || null,
+	        id: meta?.datasetId || null,
+	        sourceType: meta?.sourceType || null,
+	        baseUrl: meta?.datasetBaseUrl || null,
+	        userPath: meta?.datasetUserPath || null,
+	        source: {
+	          name: meta?.datasetSourceName || null,
+	          url: meta?.datasetSourceUrl || null,
+	          citation: meta?.datasetSourceCitation || null,
+	        },
+	      },
+	      view: {
+	        id: meta?.viewId || null,
+	        label: meta?.viewLabel || null,
+	      },
+	      field: {
+	        key: meta?.fieldKey || null,
+	        kind: meta?.fieldKind || null,
+	      },
+	      filters: Array.isArray(meta?.filters) ? meta.filters : [],
+	      export: {
+	        format: 'svg',
+	        width: Number.isFinite(payload?.width) ? payload.width : null,
+	        height: Number.isFinite(payload?.height) ? payload.height : null,
+	        dpi: Number.isFinite(payload?.dpi) ? payload.dpi : null,
+	        strategy: payload?.options?.strategy || null,
+	        includeAxes: payload?.options?.includeAxes ?? null,
+	        includeLegend: payload?.options?.includeLegend ?? null,
+	        legendPosition: payload?.options?.legendPosition ?? null,
+	        background: payload?.options?.background ?? null,
+	        backgroundColor: payload?.options?.backgroundColor ?? null,
+	        crop: payload?.options?.crop ?? null,
+	      }
+	    },
+	    null,
+	    0
+	  );
+
+	  return `<metadata>
   <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
-           xmlns:dc="http://purl.org/dc/elements/1.1/">
+           xmlns:dc="http://purl.org/dc/elements/1.1/"
+           xmlns:cellucid="https://cellucid.com/ns#">
     <rdf:Description rdf:about="">
       <dc:creator>Cellucid</dc:creator>
-      <dc:date>${escapeHtml(meta?.exportedAt || new Date().toISOString())}</dc:date>
+      <dc:publisher>cellucid.com</dc:publisher>
+      <dc:relation>${escapeHtml(website)}</dc:relation>
+      <dc:date>${escapeHtml(exportedAt)}</dc:date>
       ${dataset ? `<dc:source>${escapeHtml(dataset)}</dc:source>` : ''}
+      ${meta?.datasetId ? `<dc:identifier>${escapeHtml(String(meta.datasetId))}</dc:identifier>` : ''}
       ${description ? `<dc:description>${escapeHtml(description)}</dc:description>` : ''}
+      ${meta?.fieldKey ? `<cellucid:colorField>${escapeHtml(String(meta.fieldKey))}</cellucid:colorField>` : ''}
+      ${sourceFile ? `<cellucid:sourceFile>${escapeHtml(String(sourceFile))}</cellucid:sourceFile>` : ''}
+      <cellucid:json>${escapeHtml(json)}</cellucid:json>
     </rdf:Description>
   </rdf:RDF>
 </metadata>`;
-}
+	}
 
 /**
  * Rasterize points to a data URL for embedding in SVG (hybrid mode).
@@ -328,12 +488,13 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
   const highlightCount = emphasizeSelection && typeof state?.getHighlightedCellCount === 'function'
     ? state.getHighlightedCellCount()
     : totalHighlighted;
-  const highlightArray = emphasizeSelection ? (state?.highlightArray || null) : null;
+  const highlightArray = totalHighlighted > 0 ? (state?.highlightArray || null) : null;
 
+  const viewerBgHex = rgb01ToHex(views[0]?.renderState?.bgColor) || '#ffffff';
   const background = opts.background || 'white';
   const backgroundColor = background === 'custom'
     ? String(opts.backgroundColor || '#ffffff')
-    : '#ffffff';
+    : (background === 'viewer' ? viewerBgHex : '#ffffff');
 
   const singleView = views.length === 1;
   const singleViewId = singleView ? String(views[0]?.id || 'live') : null;
@@ -361,9 +522,7 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
     singleDim = typeof state?.getViewDimensionLevel === 'function'
       ? state.getViewDimensionLevel(singleViewId)
       : (state?.getDimensionLevel?.() ?? 3);
-    // Allow axes when the camera is locked to a 2D planar navigation mode, even if the
-    // underlying embedding is stored as 3D (e.g., z=0 but rendered with 3D shading).
-    singleAxesEligible = includeAxes && (singleDim <= 2 || singleNavMode === 'planar');
+    singleAxesEligible = includeAxes;
 
     singleLayout = computeSingleViewLayout({
       width: desiredPlotWidth,
@@ -389,7 +548,7 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
   parts.push(
     `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="${svgWidth}" height="${svgHeight}" viewBox="0 0 ${svgWidth} ${svgHeight}">`
   );
-  parts.push(buildSvgMetadata(meta));
+  parts.push(buildSvgMetadata(meta, payload));
 
   if (background !== 'transparent') {
     parts.push(`<rect x="0" y="0" width="${svgWidth}" height="${svgHeight}" fill="${escapeHtml(backgroundColor)}"/>`);
@@ -429,8 +588,9 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
 
     if (title) {
       const titleSize = Math.max(14, titleFontSize);
+      const tx = layout.titleRect ? (layout.titleRect.x + layout.titleRect.width / 2) : (layout.outerPadding + (layout.totalWidth - layout.outerPadding * 2) / 2);
       parts.push(
-        `<text x="${layout.titleRect?.x ?? layout.outerPadding}" y="${(layout.titleRect?.y ?? layout.outerPadding) + titleSize}" font-family="${escapeHtml(fontFamily)}" font-size="${titleSize}" fill="#111">${escapeHtml(title)}</text>`
+        `<text x="${tx}" y="${(layout.titleRect?.y ?? layout.outerPadding) + titleSize}" text-anchor="middle" font-family="${escapeHtml(fontFamily)}" font-size="${titleSize}" fill="#111">${escapeHtml(title)}</text>`
       );
     }
 
@@ -458,12 +618,13 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
     parts.push(`<rect x="${plotRect.x}" y="${plotRect.y}" width="${plotRect.width}" height="${plotRect.height}" fill="${plotFill}" stroke="#e5e7eb" stroke-width="1"/>`);
 
     if (showOrientation && renderState?.viewMatrix && dim > 2 && navMode !== 'planar') {
+      const orientationFontSize = clamp(Math.round(baseFontSize * 0.9), 11, 22);
       parts.push(renderSvgOrientationIndicator({
         plotRect,
         viewMatrix: renderState.viewMatrix,
         cameraState,
         fontFamily,
-        fontSize: Math.max(10, Math.round(baseFontSize * 0.92))
+        fontSize: orientationFontSize
       }));
     }
 
@@ -515,12 +676,13 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
 
     if (strategy === 'hybrid') {
       const seed = hashStringToSeed(meta?.datasetId || meta?.datasetName || viewId);
+      const renderStateForPoints = applyExportBackgroundToRenderState(renderState, background, backgroundColor);
       const dataUrl = await rasterizePointsToDataUrl({
         positions,
         colors,
         transparency,
         visibilityMask,
-        renderState,
+        renderState: renderStateForPoints,
         plotRect,
         radiusPx: pointRadiusViewportPx,
         seed,
@@ -569,6 +731,18 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
             } else {
               parts.push(`<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${radius.toFixed(2)}" fill="rgb(${rr},${gg},${bb})" fill-opacity="${aa.toFixed(3)}"/>`);
             }
+
+            const h = highlightArray ? highlightValueToAlpha01(highlightArray[index] ?? 0) : 0;
+            if (h > 0) {
+              const ringR = radius * DEFAULT_HIGHLIGHT_SCALE;
+              const sw = Math.max(0.75, radius * 0.45);
+              const op = Math.max(0.25, 0.85 * h);
+              parts.push(
+                `<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${ringR.toFixed(2)}" ` +
+                `fill="none" stroke="rgb(${DEFAULT_HIGHLIGHT_RGB.r},${DEFAULT_HIGHLIGHT_RGB.g},${DEFAULT_HIGHLIGHT_RGB.b})" ` +
+                `stroke-width="${sw.toFixed(2)}" stroke-opacity="${op.toFixed(3)}"/>`
+              );
+            }
           }
         });
       }
@@ -614,6 +788,18 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
         } else {
           parts.push(`<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${pointRadiusPx.toFixed(2)}" fill="rgb(${r},${g},${b})" fill-opacity="${a.toFixed(3)}"/>`);
         }
+
+        const h = highlightArray ? highlightValueToAlpha01(highlightArray[srcIndex] ?? 0) : 0;
+        if (h > 0) {
+          const ringR = pointRadiusPx * DEFAULT_HIGHLIGHT_SCALE;
+          const sw = Math.max(0.75, pointRadiusPx * 0.45);
+          const op = Math.max(0.25, 0.85 * h);
+          parts.push(
+            `<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${ringR.toFixed(2)}" ` +
+            `fill="none" stroke="rgb(${DEFAULT_HIGHLIGHT_RGB.r},${DEFAULT_HIGHLIGHT_RGB.g},${DEFAULT_HIGHLIGHT_RGB.b})" ` +
+            `stroke-width="${sw.toFixed(2)}" stroke-opacity="${op.toFixed(3)}"/>`
+          );
+        }
       }
     } else {
       const radiusPlot = pointRadiusViewportPx * plotScale;
@@ -644,6 +830,18 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
           } else {
             parts.push(`<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${radius.toFixed(2)}" fill="rgb(${rr},${gg},${bb})" fill-opacity="${aa.toFixed(3)}"/>`);
           }
+
+          const h = highlightArray ? highlightValueToAlpha01(highlightArray[index] ?? 0) : 0;
+          if (h > 0) {
+            const ringR = radius * DEFAULT_HIGHLIGHT_SCALE;
+            const sw = Math.max(0.75, radius * 0.45);
+            const op = Math.max(0.25, 0.85 * h);
+            parts.push(
+              `<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${ringR.toFixed(2)}" ` +
+              `fill="none" stroke="rgb(${DEFAULT_HIGHLIGHT_RGB.r},${DEFAULT_HIGHLIGHT_RGB.g},${DEFAULT_HIGHLIGHT_RGB.b})" ` +
+              `stroke-width="${sw.toFixed(2)}" stroke-opacity="${op.toFixed(3)}"/>`
+            );
+          }
         }
       });
     }
@@ -669,31 +867,54 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
 
     parts.push(`</g>`);
 
-    // Axes (2D exports only; avoid misleading axes in 3D projections).
-    if (axesEligible && renderState && state?.dimensionManager?.getNormTransform) {
-        const norm = state.dimensionManager.getNormTransform(dim);
-        const bounds = computeVisibleRealBounds({
-          positions,
-          transparency,
-          visibilityMask,
-          mvpMatrix: renderState.mvpMatrix,
-          viewportWidth: renderState.viewportWidth,
-          viewportHeight: renderState.viewportHeight,
-          crop,
-          normTransform: norm
+    // Axes (2D uses embedding coordinates; 3D uses camera-space coordinates + orientation labels).
+    if (axesEligible && renderState) {
+      const norm = typeof state?.dimensionManager?.getNormTransform === 'function'
+        ? state.dimensionManager.getNormTransform(dim)
+        : null;
+      const useCameraAxes = dim > 2 && navMode !== 'planar' && renderState?.viewMatrix;
+      const bounds = (
+        useCameraAxes
+          ? computeVisibleCameraBounds({
+            positions,
+            transparency,
+            visibilityMask,
+            mvpMatrix: renderState.mvpMatrix,
+            viewMatrix: renderState.viewMatrix,
+            viewportWidth: renderState.viewportWidth,
+            viewportHeight: renderState.viewportHeight,
+            crop,
+          })
+          : computeVisibleRealBounds({
+            positions,
+            transparency,
+            visibilityMask,
+            mvpMatrix: renderState.mvpMatrix,
+            viewportWidth: renderState.viewportWidth,
+            viewportHeight: renderState.viewportHeight,
+            crop,
+            normTransform: norm
+          })
+      ) || { minX: -1, maxX: 1, minY: -1, maxY: 1 };
+      if (bounds) {
+        const axisLabels = applyAuto3dAxisLabels({
+          xLabel: String(opts.xLabel || 'X'),
+          yLabel: String(opts.yLabel || 'Y'),
+          cameraState,
+          dim,
+          navMode
         });
-        if (bounds) {
-          parts.push(renderSvgAxes({
-            plotRect,
-            bounds,
-            xLabel: String(opts.xLabel || 'X'),
-            yLabel: String(opts.yLabel || 'Y'),
-            fontFamily,
-            tickFontSize,
-            labelFontSize: axisLabelFontSize,
-            color: '#111'
-          }));
-        }
+        parts.push(renderSvgAxes({
+          plotRect,
+          bounds,
+          xLabel: axisLabels.xLabel,
+          yLabel: axisLabels.yLabel,
+          fontFamily,
+          tickFontSize,
+          labelFontSize: axisLabelFontSize,
+          color: '#111'
+        }));
+      }
     }
   } else {
     const outerPadding = 20;
@@ -708,8 +929,9 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
 
     if (title) {
       const titleSize = Math.max(14, titleFontSize);
+      const tx = outerPadding + contentW / 2;
       parts.push(
-        `<text x="${outerPadding}" y="${outerPadding + titleSize}" font-family="${escapeHtml(fontFamily)}" font-size="${titleSize}" fill="#111">${escapeHtml(title)}</text>`
+        `<text x="${tx}" y="${outerPadding + titleSize}" text-anchor="middle" font-family="${escapeHtml(fontFamily)}" font-size="${titleSize}" fill="#111">${escapeHtml(title)}</text>`
       );
     }
 

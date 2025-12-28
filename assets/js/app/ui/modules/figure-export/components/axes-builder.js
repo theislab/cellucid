@@ -54,6 +54,7 @@ export function buildAxesModel(bounds, targetTicks = 5) {
  * @param {string} [options.fontFamily]
  * @param {number} [options.tickFontSize]
  * @param {number} [options.labelFontSize]
+ * @param {number} [options.axisGapPx] - Gap between plot frame and axes (px)
  * @param {string} [options.color]
  */
 export function renderSvgAxes({
@@ -64,12 +65,14 @@ export function renderSvgAxes({
   fontFamily = 'Arial, Helvetica, sans-serif',
   tickFontSize = null,
   labelFontSize = null,
+  axisGapPx = 6,
   color = '#111'
 }) {
   const tickSize = Math.max(6, Math.round(Number(tickFontSize) || 12));
   const labelSize = Number.isFinite(labelFontSize) ? Math.max(6, Math.round(labelFontSize)) : tickSize;
   const model = buildAxesModel(bounds, 5);
   const axisColor = color;
+  const axisGap = Math.max(0, Math.round(Number(axisGapPx) || 0));
   const tickLen = 5;
   const labelOffset = Math.max(12, Math.round(labelSize * 1.15));
   const tickTextOffset = 8;
@@ -78,21 +81,23 @@ export function renderSvgAxes({
   const x1 = plotRect.x + plotRect.width;
   const y0 = plotRect.y;
   const y1 = plotRect.y + plotRect.height;
+  const axisX = x0 - axisGap;
+  const axisY = y1 + axisGap;
 
   const parts = [];
   parts.push(`<g font-family="${fontFamily}" font-size="${tickSize}" fill="${axisColor}" stroke="${axisColor}" stroke-width="1">`);
 
   // Axis lines (bottom + left).
-  parts.push(`<line x1="${x0}" y1="${y1}" x2="${x1}" y2="${y1}"/>`);
-  parts.push(`<line x1="${x0}" y1="${y0}" x2="${x0}" y2="${y1}"/>`);
+  parts.push(`<line x1="${x0}" y1="${axisY}" x2="${x1}" y2="${axisY}"/>`);
+  parts.push(`<line x1="${axisX}" y1="${y0}" x2="${axisX}" y2="${y1}"/>`);
 
   const spanX = model.xNice.max - model.xNice.min || 1;
   for (const t of model.xTicks) {
     const frac = (t - model.xNice.min) / spanX;
     const x = x0 + frac * plotRect.width;
-    parts.push(`<line x1="${x}" y1="${y1}" x2="${x}" y2="${y1 + tickLen}"/>`);
+    parts.push(`<line x1="${x}" y1="${axisY}" x2="${x}" y2="${axisY + tickLen}"/>`);
     parts.push(
-      `<text x="${x}" y="${y1 + tickLen + tickTextOffset}" text-anchor="middle" stroke="none">${formatTick(t)}</text>`
+      `<text x="${x}" y="${axisY + tickLen + tickTextOffset}" text-anchor="middle" stroke="none">${formatTick(t)}</text>`
     );
   }
 
@@ -100,18 +105,18 @@ export function renderSvgAxes({
   for (const t of model.yTicks) {
     const frac = (t - model.yNice.min) / spanY;
     const y = y1 - frac * plotRect.height;
-    parts.push(`<line x1="${x0}" y1="${y}" x2="${x0 - tickLen}" y2="${y}"/>`);
+    parts.push(`<line x1="${axisX}" y1="${y}" x2="${axisX - tickLen}" y2="${y}"/>`);
     parts.push(
-      `<text x="${x0 - tickLen - tickTextOffset}" y="${y + 4}" text-anchor="end" stroke="none">${formatTick(t)}</text>`
+      `<text x="${axisX - tickLen - tickTextOffset}" y="${y + 4}" text-anchor="end" stroke="none">${formatTick(t)}</text>`
     );
   }
 
   // Axis labels.
   parts.push(
-    `<text x="${(x0 + x1) / 2}" y="${y1 + tickLen + tickTextOffset + labelOffset}" text-anchor="middle" stroke="none" font-size="${labelSize}">${escapeHtml(String(xLabel || ''))}</text>`
+    `<text x="${(x0 + x1) / 2}" y="${axisY + tickLen + tickTextOffset + labelOffset}" text-anchor="middle" stroke="none" font-size="${labelSize}">${escapeHtml(String(xLabel || ''))}</text>`
   );
   parts.push(
-    `<text x="${x0 - tickLen - tickTextOffset - labelOffset}" y="${(y0 + y1) / 2}" text-anchor="middle" stroke="none" font-size="${labelSize}" transform="rotate(-90 ${x0 - tickLen - tickTextOffset - labelOffset} ${(y0 + y1) / 2})">${escapeHtml(String(yLabel || ''))}</text>`
+    `<text x="${axisX - tickLen - tickTextOffset - labelOffset}" y="${(y0 + y1) / 2}" text-anchor="middle" stroke="none" font-size="${labelSize}" transform="rotate(-90 ${axisX - tickLen - tickTextOffset - labelOffset} ${(y0 + y1) / 2})">${escapeHtml(String(yLabel || ''))}</text>`
   );
 
   parts.push(`</g>`);
@@ -130,6 +135,7 @@ export function renderSvgAxes({
  * @param {string} [options.fontFamily]
  * @param {number} [options.tickFontSize]
  * @param {number} [options.labelFontSize]
+ * @param {number} [options.axisGapPx] - Gap between plot frame and axes (px)
  * @param {string} [options.color]
  */
 export function drawCanvasAxes({
@@ -141,11 +147,13 @@ export function drawCanvasAxes({
   fontFamily = 'Arial, Helvetica, sans-serif',
   tickFontSize = null,
   labelFontSize = null,
+  axisGapPx = 6,
   color = '#111'
 }) {
   const tickSize = Math.max(6, Math.round(Number(tickFontSize) || 12));
   const labelSize = Number.isFinite(labelFontSize) ? Math.max(6, Math.round(labelFontSize)) : tickSize;
   const model = buildAxesModel(bounds, 5);
+  const axisGap = Math.max(0, Math.round(Number(axisGapPx) || 0));
   const tickLen = 5;
   const labelOffset = Math.max(12, Math.round(labelSize * 1.15));
   const tickTextOffset = 8;
@@ -154,6 +162,8 @@ export function drawCanvasAxes({
   const x1 = plotRect.x + plotRect.width;
   const y0 = plotRect.y;
   const y1 = plotRect.y + plotRect.height;
+  const axisX = x0 - axisGap;
+  const axisY = y1 + axisGap;
 
   ctx.save();
   ctx.strokeStyle = color;
@@ -164,10 +174,10 @@ export function drawCanvasAxes({
 
   // Axis lines.
   ctx.beginPath();
-  ctx.moveTo(x0, y1);
-  ctx.lineTo(x1, y1);
-  ctx.moveTo(x0, y0);
-  ctx.lineTo(x0, y1);
+  ctx.moveTo(x0, axisY);
+  ctx.lineTo(x1, axisY);
+  ctx.moveTo(axisX, y0);
+  ctx.lineTo(axisX, y1);
   ctx.stroke();
 
   const spanX = model.xNice.max - model.xNice.min || 1;
@@ -175,12 +185,12 @@ export function drawCanvasAxes({
     const frac = (t - model.xNice.min) / spanX;
     const x = x0 + frac * plotRect.width;
     ctx.beginPath();
-    ctx.moveTo(x, y1);
-    ctx.lineTo(x, y1 + tickLen);
+    ctx.moveTo(x, axisY);
+    ctx.lineTo(x, axisY + tickLen);
     ctx.stroke();
     const label = formatTick(t);
     ctx.textAlign = 'center';
-    ctx.fillText(label, x, y1 + tickLen + tickTextOffset);
+    ctx.fillText(label, x, axisY + tickLen + tickTextOffset);
   }
 
   const spanY = model.yNice.max - model.yNice.min || 1;
@@ -188,21 +198,21 @@ export function drawCanvasAxes({
     const frac = (t - model.yNice.min) / spanY;
     const y = y1 - frac * plotRect.height;
     ctx.beginPath();
-    ctx.moveTo(x0, y);
-    ctx.lineTo(x0 - tickLen, y);
+    ctx.moveTo(axisX, y);
+    ctx.lineTo(axisX - tickLen, y);
     ctx.stroke();
     const label = formatTick(t);
     ctx.textAlign = 'right';
-    ctx.fillText(label, x0 - tickLen - 2, y + 4);
+    ctx.fillText(label, axisX - tickLen - 2, y + 4);
   }
 
   // Axis labels.
   ctx.font = `${labelSize}px ${fontFamily}`;
   ctx.textAlign = 'center';
-  ctx.fillText(xLabel, (x0 + x1) / 2, y1 + tickLen + tickTextOffset + labelOffset);
+  ctx.fillText(xLabel, (x0 + x1) / 2, axisY + tickLen + tickTextOffset + labelOffset);
 
   ctx.save();
-  ctx.translate(x0 - tickLen - tickTextOffset - labelOffset, (y0 + y1) / 2);
+  ctx.translate(axisX - tickLen - tickTextOffset - labelOffset, (y0 + y1) / 2);
   ctx.rotate(-Math.PI / 2);
   ctx.textAlign = 'center';
   ctx.fillText(yLabel, 0, 0);

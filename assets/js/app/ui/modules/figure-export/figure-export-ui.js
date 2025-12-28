@@ -12,6 +12,7 @@ import { clamp, parseNumberOr } from '../../../utils/number-utils.js';
 import { getNotificationCenter } from '../../../notification-center.js';
 import { maybeShowCitationModal } from './components/citation-modal.js';
 import { promptLargeDatasetStrategy } from './components/large-dataset-dialog.js';
+import { confirmExportFidelityWarnings } from './components/fidelity-warning-dialog.js';
 import { computeSingleViewLayout, computeGridDims } from './utils/layout.js';
 import { reducePointsByDensity } from './utils/density-reducer.js';
 import { getEffectivePointDiameterPx, getLodVisibilityMask } from './utils/point-size.js';
@@ -22,8 +23,10 @@ import { denormalizeXY } from './utils/coordinate-mapper.js';
 import { drawCanvasOrientationIndicator } from './components/orientation-indicator.js';
 import { applyColorblindSimulationToImageData } from './utils/colorblindness.js';
 import { normalizeCropRect01 } from './utils/crop.js';
+import { applyAuto3dAxisLabels } from './utils/orientation-labels.js';
+import { rgb01ToHex } from './utils/color-utils.js';
 
-const DEFAULT_SIZE = { width: 1200, height: 900 };
+const DEFAULT_SIZE = { width: 1600, height: 1200 };
 const LARGE_DATASET_THRESHOLD = 50000;
 
 /**
@@ -51,7 +54,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   // Plot size + framing
   // ─────────────────────────────────────────────────────────────────────────
   const sizeRow = createElement('div', { className: 'control-block' });
-  sizeRow.appendChild(createElement('label', {}, ['Plot size']));
+  sizeRow.appendChild(createElement('label', {}, ['Plot size:']));
 
   const presetSelect = createElement('select', { className: 'obs-select', 'aria-label': 'Export size preset' });
   presets.forEach((p) => {
@@ -81,55 +84,65 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
 
   const sizeGrid = createElement('div', { className: 'figure-export-size-row' }, [
     presetSelect,
-    createElement('div', { className: 'figure-export-inline' }, [
-      createElement('span', { className: 'figure-export-label' }, ['W']),
-      widthInput,
-      createElement('span', { className: 'figure-export-label' }, ['H']),
-      heightInput,
+    createElement('div', { className: 'figure-export-dimensions' }, [
+      createElement('div', { className: 'figure-export-dim-field' }, [
+        createElement('span', { className: 'figure-export-label' }, ['W']),
+        widthInput,
+      ]),
+      createElement('div', { className: 'figure-export-dim-field' }, [
+        createElement('span', { className: 'figure-export-label' }, ['H']),
+        heightInput,
+      ]),
     ])
   ]);
   sizeRow.appendChild(sizeGrid);
-  sizeRow.appendChild(createElement('div', { className: 'figure-export-hint' }, [
-    'Plot size sets the exported plot resolution; axes/legend/title add extra space around it. Framing chooses which region fills the plot.'
-  ]));
-
-  const framingSection = createElement('div', { className: 'control-block' });
-  framingSection.appendChild(createElement('label', {}, ['Framing']));
 
   const cropEnabledCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-crop-enabled' });
+  const cropLockCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-crop-lock' });
   const cropResetBtn = createElement('button', { type: 'button', className: 'btn-small' }, ['Reset']);
+  const cropConfirmBtn = createElement('button', { type: 'button', className: 'btn-small' }, ['Confirm']);
+  const cropFitPlotBtn = createElement('button', { type: 'button', className: 'btn-small' }, ['Fit plot']);
   const cropAspectHint = createElement('span', { className: 'figure-export-crop-aspect' }, ['Aspect: —']);
 
+  const cropLockLabel = createElement('label', { className: 'checkbox-inline', htmlFor: cropLockCheckbox.id }, [
+    cropLockCheckbox,
+    ' Lock aspect'
+  ]);
   const framingControls = createElement('div', { className: 'figure-export-framing-controls' }, [
     createElement('label', { className: 'checkbox-inline', htmlFor: cropEnabledCheckbox.id }, [
       cropEnabledCheckbox,
       ' Frame export'
     ]),
-    cropResetBtn,
+    cropLockLabel,
+    createElement('div', { className: 'figure-export-framing-buttons' }, [
+      cropResetBtn,
+      cropConfirmBtn,
+      cropFitPlotBtn,
+    ]),
     cropAspectHint
   ]);
-  const framingHint = createElement('div', { className: 'figure-export-crop-hint' }, [
-    'Frame matches Plot size. Turn on Preview to move/resize the frame.'
-  ]);
-  framingSection.appendChild(framingControls);
-  framingSection.appendChild(framingHint);
 
   const plotAndFrameRow = createElement('div', { className: 'figure-export-plot-frame' }, [
-    sizeRow,
-    framingSection
+    sizeRow
   ]);
 
   // ─────────────────────────────────────────────────────────────────────────
   // Style section
   // ─────────────────────────────────────────────────────────────────────────
-  const styleSection = createElement('div', { className: 'control-block figure-export-section' });
-  styleSection.appendChild(createElement('label', {}, ['Style']));
+  const styleSection = createElement('div', { className: 'control-block' });
+  styleSection.appendChild(createElement('label', {}, ['Style:']));
+  styleSection.appendChild(createElement('div', { className: 'figure-export-hint' }, [
+    'Background color and font settings.'
+  ]));
 
   const backgroundSelect = createElement('select', { className: 'obs-select', 'aria-label': 'Background' });
+  backgroundSelect.appendChild(createElement('option', { value: 'viewer' }, ['Match viewer']));
   backgroundSelect.appendChild(createElement('option', { value: 'white' }, ['White BG']));
   backgroundSelect.appendChild(createElement('option', { value: 'transparent' }, ['Transparent']));
   backgroundSelect.appendChild(createElement('option', { value: 'custom' }, ['Custom…']));
-  const backgroundColorInput = createElement('input', { type: 'color', className: 'figure-color-picker', value: '#ffffff', 'aria-label': 'Custom background color' });
+  const initialViewerBg = typeof viewer?.getRenderState === 'function' ? rgb01ToHex(viewer.getRenderState()?.bgColor) : null;
+  const backgroundColorInput = createElement('input', { type: 'color', className: 'figure-color-picker', value: initialViewerBg || '#ffffff', 'aria-label': 'Custom background color' });
+  backgroundSelect.value = 'viewer';
 
   const fontSelect = createElement('select', { className: 'obs-select', 'aria-label': 'Font family' });
   [
@@ -219,19 +232,25 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
         autoTextSizingCheckbox,
         ' Auto text'
       ]),
-      createElement('div', { className: 'figure-export-inline' }, [
+    ]),
+    createElement('div', { className: 'figure-export-sizes-grid' }, [
+      createElement('div', { className: 'figure-export-size-item' }, [
         createElement('span', { className: 'figure-export-label' }, ['Legend']),
         legendFontSizeInput,
+      ]),
+      createElement('div', { className: 'figure-export-size-item' }, [
         createElement('span', { className: 'figure-export-label' }, ['Ticks']),
         tickFontSizeInput,
       ]),
-    ]),
-    createElement('div', { className: 'figure-export-style-row' }, [
-      createElement('div', { className: 'figure-export-inline' }, [
+      createElement('div', { className: 'figure-export-size-item' }, [
         createElement('span', { className: 'figure-export-label' }, ['Axis']),
         axisLabelFontSizeInput,
+      ]),
+      createElement('div', { className: 'figure-export-size-item' }, [
         createElement('span', { className: 'figure-export-label' }, ['Title']),
         titleFontSizeInput,
+      ]),
+      createElement('div', { className: 'figure-export-size-item' }, [
         createElement('span', { className: 'figure-export-label' }, ['Centroids']),
         centroidLabelFontSizeInput,
       ]),
@@ -240,7 +259,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   styleSection.appendChild(styleGrid);
 
   const titleRow = createElement('div', { className: 'control-block' });
-  titleRow.appendChild(createElement('label', { htmlFor: 'figure-export-title' }, ['Title']));
+  titleRow.appendChild(createElement('label', { htmlFor: 'figure-export-title' }, ['Title:']));
   const titleInput = createElement('input', {
     id: 'figure-export-title',
     type: 'text',
@@ -251,7 +270,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   titleRow.appendChild(titleInput);
 
   const xLabelRow = createElement('div', { className: 'control-block' });
-  xLabelRow.appendChild(createElement('label', { htmlFor: 'figure-export-xlabel' }, ['X axis label']));
+  xLabelRow.appendChild(createElement('label', { htmlFor: 'figure-export-xlabel' }, ['X axis label:']));
   const xLabelInput = createElement('input', {
     id: 'figure-export-xlabel',
     type: 'text',
@@ -263,7 +282,10 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   xLabelRow.appendChild(xLabelInput);
 
   const yLabelRow = createElement('div', { className: 'control-block' });
-  yLabelRow.appendChild(createElement('label', { htmlFor: 'figure-export-ylabel' }, ['Y axis label']));
+  yLabelRow.appendChild(createElement('label', { htmlFor: 'figure-export-ylabel' }, ['Y axis label:']));
+  yLabelRow.appendChild(createElement('div', { className: 'figure-export-hint' }, [
+    '3D axes auto-annotate with camera orientation.'
+  ]));
   const yLabelInput = createElement('input', {
     id: 'figure-export-ylabel',
     type: 'text',
@@ -277,12 +299,13 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   // ─────────────────────────────────────────────────────────────────────────
   // Annotations section
   // ─────────────────────────────────────────────────────────────────────────
-  const annotationSection = createElement('div', { className: 'control-block figure-export-section' });
-  annotationSection.appendChild(createElement('label', {}, ['Include']));
+  const annotationSection = createElement('div', { className: 'control-block' });
+  annotationSection.appendChild(createElement('label', {}, ['Annotations:']));
+  annotationSection.appendChild(createElement('div', { className: 'figure-export-hint' }, [
+    'Extra elements to include in the export.'
+  ]));
   const includeAxesCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-axes', checked: true });
   const includeLegendCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-legend', checked: true });
-  const includeCentroidPointsCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-centroid-points', checked: true });
-  const includeCentroidLabelsCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-centroid-labels', checked: true });
   const showCitationCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-citation', checked: true });
   const showOrientationCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-orientation', checked: true });
   const depthSortCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-depthsort', checked: true });
@@ -290,11 +313,9 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   const annotationChecks = createElement('div', { className: 'figure-export-checks' }, [
     createElement('label', { className: 'checkbox-inline', htmlFor: includeAxesCheckbox.id }, [includeAxesCheckbox, ' Axes']),
     createElement('label', { className: 'checkbox-inline', htmlFor: includeLegendCheckbox.id }, [includeLegendCheckbox, ' Legend']),
-    createElement('label', { className: 'checkbox-inline', htmlFor: includeCentroidPointsCheckbox.id }, [includeCentroidPointsCheckbox, ' Centroid pts']),
-    createElement('label', { className: 'checkbox-inline', htmlFor: includeCentroidLabelsCheckbox.id }, [includeCentroidLabelsCheckbox, ' Centroid text']),
-    createElement('label', { className: 'checkbox-inline', htmlFor: showCitationCheckbox.id }, [showCitationCheckbox, ' Cite']),
-    createElement('label', { className: 'checkbox-inline', htmlFor: showOrientationCheckbox.id }, [showOrientationCheckbox, ' 3D orient']),
-    createElement('label', { className: 'checkbox-inline', htmlFor: depthSortCheckbox.id }, [depthSortCheckbox, ' Depth']),
+    createElement('label', { className: 'checkbox-inline', htmlFor: showCitationCheckbox.id }, [showCitationCheckbox, ' Citation']),
+    createElement('label', { className: 'checkbox-inline', htmlFor: showOrientationCheckbox.id }, [showOrientationCheckbox, ' 3D orientation']),
+    createElement('label', { className: 'checkbox-inline', htmlFor: depthSortCheckbox.id }, [depthSortCheckbox, ' Depth sort']),
   ]);
   annotationSection.appendChild(annotationChecks);
 
@@ -332,10 +353,10 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   ]));
 
   const previewRow = createElement('div', { className: 'control-block' });
-  previewRow.appendChild(createElement('label', {}, ['Preview']));
+  previewRow.appendChild(createElement('label', {}, ['Preview:']));
   const previewEnabledCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-preview-enabled' });
   const previewRefreshBtn = createElement('button', { type: 'button', className: 'btn-small' }, ['Refresh']);
-  const previewModeSelect = createElement('select', { className: 'obs-select', 'aria-label': 'Colorblind preview' });
+  const previewModeSelect = createElement('select', { className: 'obs-select figure-export-colorblind-select', 'aria-label': 'Colorblind preview' });
   previewModeSelect.appendChild(createElement('option', { value: 'none' }, ['Normal']));
   previewModeSelect.appendChild(createElement('option', { value: 'deuteranopia' }, ['Deuteranopia']));
   previewModeSelect.appendChild(createElement('option', { value: 'protanopia' }, ['Protanopia']));
@@ -363,14 +384,17 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   });
   const previewBox = createElement('div', { className: 'figure-export-preview-box' }, [
     previewCanvas,
-    previewStatus
+    previewStatus,
   ]);
 
   // ─────────────────────────────────────────────────────────────────────────
   // Advanced & Export section
   // ─────────────────────────────────────────────────────────────────────────
-  const advancedSection = createElement('div', { className: 'control-block figure-export-section' });
-  advancedSection.appendChild(createElement('label', {}, ['Download']));
+  const advancedSection = createElement('div', { className: 'control-block' });
+  advancedSection.appendChild(createElement('label', {}, ['Download:']));
+  advancedSection.appendChild(createElement('div', { className: 'figure-export-hint' }, [
+    'Format and resolution for the exported file.'
+  ]));
 
   const downloadSelect = createElement('select', { className: 'obs-select', 'aria-label': 'Download format' });
   downloadSelect.appendChild(createElement('option', { value: 'svg' }, ['SVG']));
@@ -378,6 +402,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   downloadSelect.appendChild(createElement('option', { value: 'svg+png' }, ['SVG + PNG']));
   downloadSelect.appendChild(createElement('option', { value: 'png-multi' }, ['PNG (150/300/600)']));
   downloadSelect.appendChild(createElement('option', { value: 'all' }, ['All']));
+  downloadSelect.value = 'png';
 
   const dpiSelect = createElement('select', { className: 'obs-select', 'aria-label': 'PNG DPI' });
   [150, 300, 600].forEach((dpi) => {
@@ -425,7 +450,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     targetGroup,
   ]);
   const densityHint = createElement('div', { className: 'figure-export-hint' }, [
-    'Optimized vector reduces point count while preserving density. Hybrid rasterizes points with the WebGL shader for WYSIWYG 3D exports.'
+    'Optimized reduces points preserving density; Hybrid rasterizes for 3D.'
   ]);
 
   const advancedGrid = createElement('div', { className: 'figure-export-style-row' }, [
@@ -467,8 +492,8 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
 
     const previewOn = previewEnabledCheckbox.checked;
     previewBox.style.display = previewOn ? 'grid' : 'none';
-    previewModeSelect.disabled = !previewOn;
-    previewRefreshBtn.disabled = !previewOn;
+    previewModeSelect.style.display = previewOn ? '' : 'none';
+    previewRefreshBtn.style.display = previewOn ? 'inline-flex' : 'none';
     if (!previewOn) {
       previewStatus.textContent = 'Preview is off.';
     }
@@ -480,21 +505,23 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   dpiSelect.addEventListener('change', syncFormatDependentUi);
   strategySelect.addEventListener('change', syncFormatDependentUi);
   previewEnabledCheckbox.addEventListener('change', async () => {
+    if (!previewEnabledCheckbox.checked) previewFramingMode = 'edit';
     syncFormatDependentUi();
     syncCropUi();
     if (!previewEnabledCheckbox.checked) {
       clearPreview();
       return;
     }
-    if (!previewSample) {
-      await buildPreviewSample();
-    }
+    const needsCropPreview = cropEnabled && previewFramingMode === 'applied';
+    const sample = needsCropPreview ? previewSampleCrop : previewSampleFull;
+    if (!sample) await buildPreviewSample({ mode: needsCropPreview ? 'crop' : 'full' });
     drawPreview();
   });
 
   previewRefreshBtn.addEventListener('click', async () => {
     if (!previewEnabledCheckbox.checked) return;
-    await buildPreviewSample({ force: true });
+    const needsCropPreview = cropEnabled && previewFramingMode === 'applied';
+    await buildPreviewSample({ force: true, mode: needsCropPreview ? 'crop' : 'full' });
     drawPreview();
   });
 
@@ -509,8 +536,6 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     yLabelInput,
     includeAxesCheckbox,
     includeLegendCheckbox,
-    includeCentroidPointsCheckbox,
-    includeCentroidLabelsCheckbox,
     legendPosSelect,
     backgroundSelect,
     backgroundColorInput,
@@ -535,6 +560,8 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   cropEnabledCheckbox.addEventListener('change', () => {
     if (cropEnabledCheckbox.checked) {
       cropEnabled = true;
+      previewFramingMode = 'edit';
+      previewSampleCrop = null;
       if (!previewEnabledCheckbox.checked) {
         previewEnabledCheckbox.checked = true;
         previewEnabledCheckbox.dispatchEvent(new Event('change', { bubbles: true }));
@@ -542,6 +569,8 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       resetCropToDefault();
     } else {
       cropEnabled = false;
+      previewFramingMode = 'edit';
+      previewSampleCrop = null;
     }
     syncCropUi();
     schedulePreviewDraw();
@@ -550,9 +579,60 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   cropResetBtn.addEventListener('click', () => {
     cropEnabled = true;
     cropEnabledCheckbox.checked = true;
+    previewFramingMode = 'edit';
+    previewSampleCrop = null;
     resetCropToDefault();
     syncCropUi();
     schedulePreviewDraw();
+  });
+
+  cropLockCheckbox.addEventListener('change', () => {
+    if (!cropEnabled) return;
+    previewFramingMode = 'edit';
+    previewSampleCrop = null;
+    enforceCropAspect();
+    syncCropUi();
+    schedulePreviewDraw();
+  });
+
+  cropConfirmBtn.addEventListener('click', async () => {
+    if (!cropEnabled) return;
+    if (previewFramingMode === 'applied') {
+      previewFramingMode = 'edit';
+      if (previewEnabledCheckbox.checked && !previewSampleFull) {
+        await buildPreviewSample({ mode: 'full' });
+      }
+      syncCropUi();
+      drawPreview();
+      return;
+    }
+    if (!previewEnabledCheckbox.checked) {
+      previewEnabledCheckbox.checked = true;
+      syncFormatDependentUi();
+    }
+    if (!previewSampleFull) await buildPreviewSample({ mode: 'full' });
+    previewFramingMode = 'applied';
+    syncCropUi();
+    if (!previewSampleCrop) await buildPreviewSample({ mode: 'crop' });
+    drawPreview();
+  });
+
+  cropFitPlotBtn.addEventListener('click', () => {
+    if (!cropEnabled) return;
+    const viewId = getActiveViewIdForPreview();
+    const rs = getPreviewRenderStateForView(viewId);
+    const vw = Math.max(1, Number(rs?.viewportWidth) || 1);
+    const vh = Math.max(1, Number(rs?.viewportHeight) || 1);
+    const c = normalizeCropRect01({ enabled: true, ...cropRect01 });
+    if (!c || !Number.isFinite(c.width) || !Number.isFinite(c.height) || c.width <= 0 || c.height <= 0) return;
+
+    const cropAspect = (c.width * vw) / Math.max(1e-6, c.height * vh);
+    if (!Number.isFinite(cropAspect) || cropAspect <= 0) return;
+
+    const w = Math.max(100, parseInt(widthInput.value, 10) || DEFAULT_SIZE.width);
+    const nextH = clamp(Math.round(w / cropAspect), 100, 20000);
+    heightInput.value = String(nextH);
+    onPlotSizeAspectChange();
   });
 
   // ---------------------------------------------------------------------------
@@ -568,9 +648,9 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   function computeAutoTextSizes() {
     const { w, h } = getPlotSizePx();
     const area = Math.sqrt(w * h);
-    const base = clamp(Math.round(area / 85), 10, 18);
-    const title = Math.max(14, Math.round(base * 1.25));
-    const axis = Math.max(10, Math.round(base * 1.05));
+    const base = clamp(Math.round(area / 70), 14, 30);
+    const title = Math.max(18, Math.round(base * 1.35));
+    const axis = Math.max(14, Math.round(base * 1.15));
     const ticks = base;
     const legend = base;
     return { base, title, axis, ticks, legend };
@@ -690,7 +770,11 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   const PREVIEW_MAX_SCAN_POINTS = 250000;
 
   /** @type {{ viewId: string; positions: Float32Array|null; colors: Uint8Array|null; transparency: Float32Array|null; renderState: any; reduced: any; dim: number; cameraState: any; navMode: string } | null} */
-  let previewSample = null;
+  let previewSampleFull = null;
+  /** @type {{ viewId: string; positions: Float32Array|null; colors: Uint8Array|null; transparency: Float32Array|null; renderState: any; reduced: any; dim: number; cameraState: any; navMode: string; crop: any } | null} */
+  let previewSampleCrop = null;
+  /** @type {'edit'|'applied'} */
+  let previewFramingMode = 'edit';
   let previewDrawTimer = /** @type {ReturnType<typeof setTimeout> | null} */ (null);
   let previewBuildToken = 0;
 
@@ -711,10 +795,6 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   }
 
   function getViewportAspect() {
-    const reduced = previewSample?.reduced || null;
-    if (reduced?.viewportWidth && reduced?.viewportHeight) {
-      return Math.max(0.0001, reduced.viewportWidth) / Math.max(0.0001, reduced.viewportHeight);
-    }
     const viewId = getActiveViewIdForPreview();
     const rs = getPreviewRenderStateForView(viewId);
     if (rs?.viewportWidth && rs?.viewportHeight) {
@@ -733,30 +813,59 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
 
   function syncCropUi() {
     cropResetBtn.disabled = !cropEnabled;
-    const exportAspect = getExportAspect();
-    const aspectLabel = formatAspectLabel(exportAspect);
+    cropLockCheckbox.disabled = !cropEnabled;
+    cropConfirmBtn.disabled = !cropEnabled;
+    cropFitPlotBtn.disabled = !cropEnabled;
 
+    cropResetBtn.style.display = cropEnabled ? 'inline-flex' : 'none';
+    cropLockLabel.style.display = cropEnabled ? '' : 'none';
+    cropConfirmBtn.style.display = cropEnabled ? 'inline-flex' : 'none';
+    cropFitPlotBtn.style.display = cropEnabled ? 'inline-flex' : 'none';
+
+    cropConfirmBtn.textContent = previewFramingMode === 'applied' ? 'Edit' : 'Confirm';
+
+    const exportAspect = getExportAspect();
+    const plotLabel = formatAspectLabel(exportAspect);
+
+    const viewId = getActiveViewIdForPreview();
+    const rs = getPreviewRenderStateForView(viewId);
+    const vw = Math.max(1, Number(rs?.viewportWidth) || 1);
+    const vh = Math.max(1, Number(rs?.viewportHeight) || 1);
+
+    let frameLabel = '—';
     let zoomLabel = '';
     if (cropEnabled) {
-      const viewportAspect = getViewportAspect();
-      const eff = exportAspect / Math.max(0.0001, viewportAspect);
-      const maxW = eff >= 1 ? 1 : clamp(eff, 0.0001, 1);
       const c = normalizeCropRect01({ enabled: true, ...cropRect01 }) || cropRect01;
-      const zoom = Number.isFinite(c?.width) && c.width > 0 ? (maxW / c.width) : 1;
-      if (Number.isFinite(zoom) && zoom >= 1) zoomLabel = ` • Zoom: ${zoom.toFixed(2)}×`;
+      if (Number.isFinite(c?.width) && Number.isFinite(c?.height) && c.width > 0 && c.height > 0) {
+        const frameAspect = (c.width * vw) / Math.max(1e-6, c.height * vh);
+        frameLabel = formatAspectLabel(frameAspect);
+
+        const exportW = Math.max(100, parseInt(widthInput.value, 10) || DEFAULT_SIZE.width);
+        const exportH = Math.max(100, parseInt(heightInput.value, 10) || DEFAULT_SIZE.height);
+        const fullScale = Math.min(exportW / vw, exportH / vh);
+        const cropW = Math.max(1e-6, c.width * vw);
+        const cropH = Math.max(1e-6, c.height * vh);
+        const cropScale = Math.min(exportW / cropW, exportH / cropH);
+        const zoom = cropScale / Math.max(1e-6, fullScale);
+        if (Number.isFinite(zoom) && zoom > 1.01) zoomLabel = ` • Zoom ${zoom.toFixed(2)}×`;
+      }
     }
 
-    cropAspectHint.textContent = `Aspect: ${aspectLabel}${zoomLabel}`;
-    if (!cropEnabled) {
-      framingHint.textContent = 'Frame matches Plot size. Enable “Frame export” to select a region.';
-    } else if (!previewEnabledCheckbox.checked) {
-      framingHint.textContent = 'Frame matches Plot size. Turn on Preview to move/resize the frame.';
-    } else {
-      framingHint.textContent = 'Drag inside to move; drag corners to zoom; double-click to reset.';
+    const lock = cropEnabled && cropLockCheckbox.checked ? ' • locked' : '';
+    cropAspectHint.textContent = cropEnabled
+      ? `Plot: ${plotLabel} • Frame: ${frameLabel}${lock}${zoomLabel}`
+      : `Plot: ${plotLabel}`;
+
+    if (!cropEnabled || previewFramingMode !== 'edit') {
+      previewCanvas.style.cursor = 'default';
     }
   }
 
   function resetCropToDefault() {
+    if (!cropEnabled || !cropLockCheckbox.checked) {
+      cropRect01 = { x: 0, y: 0, width: 1, height: 1 };
+      return;
+    }
     const exportAspect = getExportAspect();
     const viewportAspect = getViewportAspect();
     const eff = exportAspect / Math.max(0.0001, viewportAspect);
@@ -778,7 +887,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   }
 
   function enforceCropAspect() {
-    if (!cropEnabled) return;
+    if (!cropEnabled || !cropLockCheckbox.checked) return;
     const exportAspect = getExportAspect();
     const viewportAspect = getViewportAspect();
     const eff = exportAspect / Math.max(0.0001, viewportAspect);
@@ -847,20 +956,48 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     return usesSphereShader || is3dProjection;
   }
 
+  let cachedWebgl2ExportSupport = /** @type {boolean|null} */ (null);
+  function canCreateWebgl2Context() {
+    if (cachedWebgl2ExportSupport != null) return cachedWebgl2ExportSupport;
+
+    // Try OffscreenCanvas first (fast path), then fallback to HTMLCanvasElement.
+    try {
+      if (typeof OffscreenCanvas !== 'undefined') {
+        const c = new OffscreenCanvas(2, 2);
+        const gl = c.getContext('webgl2', { alpha: true, antialias: true, premultipliedAlpha: false, preserveDrawingBuffer: true });
+        if (gl) {
+          cachedWebgl2ExportSupport = true;
+          return true;
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    try {
+      if (typeof document !== 'undefined' && document?.createElement) {
+        const c = document.createElement('canvas');
+        c.width = 2;
+        c.height = 2;
+        const gl = c.getContext('webgl2', { alpha: true, antialias: true, premultipliedAlpha: false, preserveDrawingBuffer: true });
+        if (gl) {
+          cachedWebgl2ExportSupport = true;
+          return true;
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    cachedWebgl2ExportSupport = false;
+    return false;
+  }
+
   // Shader-accurate views cannot be represented faithfully with pure SVG circles.
   // Default to the Hybrid strategy so SVG exports stay WYSIWYG.
   const activeViewIdForDefaults = getActiveViewIdForPreview();
   if (requiresShaderAccuratePoints(activeViewIdForDefaults) && strategySelect.value !== 'hybrid' && strategySelect.value !== 'raster') {
     strategySelect.value = 'hybrid';
-  }
-
-  // Default centroid inclusion to the current viewer state (WYSIWYG).
-  const centroidDefaults = typeof viewer.getCentroidFlags === 'function'
-    ? (viewer.getCentroidFlags(activeViewIdForDefaults) || viewer.getCentroidFlags('live'))
-    : null;
-  if (centroidDefaults) {
-    includeCentroidPointsCheckbox.checked = centroidDefaults.points !== false;
-    includeCentroidLabelsCheckbox.checked = centroidDefaults.labels !== false;
   }
 
   // Seed centroid label font size from the on-screen overlay CSS when available.
@@ -884,15 +1021,23 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
    * Build or refresh the preview sample (downsampled point cloud in viewport space).
    * This intentionally avoids any work in the main render loop.
    */
-  async function buildPreviewSample({ force = false } = {}) {
+  async function buildPreviewSample({ force = false, mode = 'full' } = {}) {
+    const wantsCrop = mode === 'crop';
+    if (!force && (wantsCrop ? previewSampleCrop : previewSampleFull)) return;
+
     const visibleCount = inferVisiblePointCount();
     const fastSample = !force && visibleCount >= PREVIEW_AUTOBUILD_THRESHOLD;
     const maxScanPoints = fastSample ? PREVIEW_MAX_SCAN_POINTS : null;
+    const crop = wantsCrop ? getCropOptionForExport() : null;
 
     const token = ++previewBuildToken;
-    previewStatus.textContent = fastSample
-      ? `Building fast preview… (${Math.min(visibleCount, PREVIEW_MAX_SCAN_POINTS).toLocaleString()} scan)`
-      : 'Building preview…';
+    previewStatus.textContent = (() => {
+      if (fastSample) {
+        const scan = Math.min(visibleCount, PREVIEW_MAX_SCAN_POINTS).toLocaleString();
+        return wantsCrop ? `Building framed preview… (${scan} scan)` : `Building fast preview… (${scan} scan)`;
+      }
+      return wantsCrop ? 'Building framed preview…' : 'Building preview…';
+    })();
     await new Promise((r) => requestAnimationFrame(r));
     if (token !== previewBuildToken) return;
 
@@ -903,7 +1048,8 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     const renderState = getPreviewRenderStateForView(viewId);
 
     if (!positions || !colors || !renderState?.mvpMatrix) {
-      previewSample = null;
+      if (wantsCrop) previewSampleCrop = null;
+      else previewSampleFull = null;
       previewStatus.textContent = 'Preview unavailable (missing view buffers).';
       return;
     }
@@ -925,19 +1071,22 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       renderState,
       targetCount,
       maxScanPoints,
-      seed: 1337
+      seed: 1337,
+      crop
     });
 
     if (token !== previewBuildToken) return;
 
-    previewSample = { viewId, positions, colors, transparency, renderState, reduced, dim, cameraState, navMode };
-    if (cropEnabled) {
-      enforceCropAspect();
-      syncCropUi();
-    }
+    if (wantsCrop) previewSampleCrop = { viewId, positions, colors, transparency, renderState, reduced, dim, cameraState, navMode, crop };
+    else previewSampleFull = { viewId, positions, colors, transparency, renderState, reduced, dim, cameraState, navMode };
+
+    if (cropEnabled && cropLockCheckbox.checked) enforceCropAspect();
+    if (cropEnabled) syncCropUi();
+
     const note = requiresShaderAccuratePoints(viewId) ? ' • shader-accurate points' : '';
     const sampleNote = fastSample ? ' • fast sample' : '';
-    previewStatus.textContent = `Preview sample: ${reduced?.x?.length?.toLocaleString?.() || 0} points${sampleNote}${note}`;
+    const label = wantsCrop ? 'Framed preview' : 'Preview sample';
+    previewStatus.textContent = `${label}: ${reduced?.x?.length?.toLocaleString?.() || 0} points${sampleNote}${note}`;
   }
 
   function schedulePreviewDraw() {
@@ -949,14 +1098,20 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     }, 80);
   }
 
-  function computeApproxBoundsFromSample({ reduced, positions, normTransform }) {
-    if (!reduced?.index || !positions || !normTransform) return null;
+  function computeApproxBoundsFromSample({ reduced, positions, normTransform, cropPx = null }) {
+    if (!reduced?.index || !positions) return null;
     let minX = Infinity;
     let maxX = -Infinity;
     let minY = Infinity;
     let maxY = -Infinity;
     const outN = reduced.index.length;
     for (let i = 0; i < outN; i++) {
+      if (cropPx && reduced?.x && reduced?.y) {
+        const vx = reduced.x[i];
+        const vy = reduced.y[i];
+        if (vx < cropPx.x || vx > cropPx.x + cropPx.width) continue;
+        if (vy < cropPx.y || vy > cropPx.y + cropPx.height) continue;
+      }
       const idx = reduced.index[i];
       const base = idx * 3;
       if (base + 1 >= positions.length) continue;
@@ -966,6 +1121,38 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       if (real.x > maxX) maxX = real.x;
       if (real.y < minY) minY = real.y;
       if (real.y > maxY) maxY = real.y;
+    }
+    if (!Number.isFinite(minX) || !Number.isFinite(maxX) || !Number.isFinite(minY) || !Number.isFinite(maxY)) return null;
+    return { minX, maxX, minY, maxY };
+  }
+
+  function computeApproxCameraBoundsFromSample({ reduced, positions, viewMatrix, cropPx = null }) {
+    if (!reduced?.index || !positions || !viewMatrix) return null;
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    const outN = reduced.index.length;
+    for (let i = 0; i < outN; i++) {
+      if (cropPx && reduced?.x && reduced?.y) {
+        const vx = reduced.x[i];
+        const vy = reduced.y[i];
+        if (vx < cropPx.x || vx > cropPx.x + cropPx.width) continue;
+        if (vy < cropPx.y || vy > cropPx.y + cropPx.height) continue;
+      }
+      const idx = reduced.index[i];
+      const base = idx * 3;
+      if (base + 2 >= positions.length) continue;
+      const x = positions[base];
+      const y = positions[base + 1];
+      const z = positions[base + 2];
+      const cx = viewMatrix[0] * x + viewMatrix[4] * y + viewMatrix[8] * z + viewMatrix[12];
+      const cy = viewMatrix[1] * x + viewMatrix[5] * y + viewMatrix[9] * z + viewMatrix[13];
+      if (!Number.isFinite(cx) || !Number.isFinite(cy)) continue;
+      if (cx < minX) minX = cx;
+      if (cx > maxX) maxX = cx;
+      if (cy < minY) minY = cy;
+      if (cy > maxY) maxY = cy;
     }
     if (!Number.isFinite(minX) || !Number.isFinite(maxX) || !Number.isFinite(minY) || !Number.isFinite(maxY)) return null;
     return { minX, maxX, minY, maxY };
@@ -985,7 +1172,9 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, canvasW, canvasH);
 
-    const sample = previewSample;
+    const sample = previewFramingMode === 'applied'
+      ? (previewSampleCrop || previewSampleFull)
+      : previewSampleFull;
     const titleText = String(titleInput.value || '').trim();
     const fontFamily = String(fontSelect.value || 'Arial, Helvetica, sans-serif');
     const baseFontSizePx = Math.max(6, parseInt(fontSizeInput.value, 10) || 12);
@@ -998,8 +1187,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     const includeLegend = includeLegendCheckbox.checked;
     const legendPosition = legendPosSelect.value === 'bottom' ? 'bottom' : 'right';
     const includeAxes = includeAxesCheckbox.checked;
-    const navMode = sample?.navMode || sample?.cameraState?.navigationMode || 'orbit';
-    const axesEligible = includeAxes && (sample?.dim <= 2 || navMode === 'planar');
+    const axesEligible = includeAxes;
 
     const legendViewId = sample?.viewId || getActiveViewIdForPreview();
     const legendField = includeLegend && typeof state.getFieldForView === 'function'
@@ -1027,9 +1215,10 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     ctx.setTransform(s, 0, 0, s, ox, oy);
 
     const background = backgroundSelect.value || 'white';
+    const viewerBgHex = rgb01ToHex(getPreviewRenderStateForView(legendViewId)?.bgColor) || '#ffffff';
     const backgroundColor = background === 'custom'
       ? String(backgroundColorInput.value || '#ffffff')
-      : '#ffffff';
+      : (background === 'viewer' ? viewerBgHex : '#ffffff');
     if (background !== 'transparent') {
       ctx.fillStyle = backgroundColor;
       ctx.fillRect(0, 0, totalW, totalH);
@@ -1037,10 +1226,14 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
 
     if (titleText) {
       const titleSize = Math.max(14, titleFontSizePx);
+      const rect = layout.titleRect || { x: layout.outerPadding, y: layout.outerPadding, width: totalW - layout.outerPadding * 2, height: 0 };
+      ctx.save();
       ctx.fillStyle = '#111';
       ctx.font = `${titleSize}px ${fontFamily}`;
+      ctx.textAlign = 'center';
       ctx.textBaseline = 'alphabetic';
-      ctx.fillText(titleText, layout.titleRect?.x ?? layout.outerPadding, (layout.titleRect?.y ?? layout.outerPadding) + titleSize);
+      ctx.fillText(titleText, rect.x + rect.width / 2, rect.y + titleSize);
+      ctx.restore();
     }
 
     const plotRect = layout.plotRect;
@@ -1048,17 +1241,17 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     ctx.lineWidth = 1;
     ctx.strokeRect(plotRect.x, plotRect.y, plotRect.width, plotRect.height);
 
-    // Compute the on-screen viewport rectangle inside plotRect (letterboxed).
+    // Compute the on-screen (full) viewport rectangle inside plotRect (letterboxed).
     const reduced = sample?.reduced || null;
-    const rs = getPreviewRenderStateForView(getActiveViewIdForPreview());
-    const viewportW = Math.max(1, (reduced?.viewportWidth || rs?.viewportWidth || 1));
-    const viewportH = Math.max(1, (reduced?.viewportHeight || rs?.viewportHeight || 1));
-    const vpScale = Math.min(plotRect.width / viewportW, plotRect.height / viewportH);
+    const rs = sample?.renderState || getPreviewRenderStateForView(getActiveViewIdForPreview());
+    const fullViewportW = Math.max(1, (rs?.viewportWidth || 1));
+    const fullViewportH = Math.max(1, (rs?.viewportHeight || 1));
+    const vpScale = Math.min(plotRect.width / fullViewportW, plotRect.height / fullViewportH);
     const viewportRect = {
-      x: plotRect.x + (plotRect.width - viewportW * vpScale) / 2,
-      y: plotRect.y + (plotRect.height - viewportH * vpScale) / 2,
-      width: viewportW * vpScale,
-      height: viewportH * vpScale
+      x: plotRect.x + (plotRect.width - fullViewportW * vpScale) / 2,
+      y: plotRect.y + (plotRect.height - fullViewportH * vpScale) / 2,
+      width: fullViewportW * vpScale,
+      height: fullViewportH * vpScale
     };
     previewGeom = { scale: s, ox, oy, viewportRect };
 
@@ -1077,13 +1270,44 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       return;
     }
 
+    const appliedFraming = cropEnabled && previewFramingMode === 'applied';
+    const usingCropSample = appliedFraming && Boolean(previewSampleCrop) && sample === previewSampleCrop && Boolean(previewSampleCrop?.crop);
+
+    // Plot-space mapping for viewport coords (full viewport or crop viewport).
+    let srcX0 = 0;
+    let srcY0 = 0;
+    let srcW = fullViewportW;
+    let srcH = fullViewportH;
+    let cropPxForBounds = null;
+
+    if (appliedFraming) {
+      if (usingCropSample) {
+        srcW = Math.max(1, Number(reduced.viewportWidth) || 1);
+        srcH = Math.max(1, Number(reduced.viewportHeight) || 1);
+      } else {
+        const norm = normalizeCropRect01({ enabled: true, ...cropRect01 });
+        if (norm) cropRect01 = norm;
+        if (norm) {
+          srcX0 = norm.x * fullViewportW;
+          srcY0 = norm.y * fullViewportH;
+          srcW = Math.max(1, norm.width * fullViewportW);
+          srcH = Math.max(1, norm.height * fullViewportH);
+          cropPxForBounds = { x: srcX0, y: srcY0, width: srcW, height: srcH };
+        }
+      }
+    }
+
+    const plotScale = Math.min(plotRect.width / srcW, plotRect.height / srcH);
+    const plotOffsetX = plotRect.x + (plotRect.width - srcW * plotScale) / 2;
+    const plotOffsetY = plotRect.y + (plotRect.height - srcH * plotScale) / 2;
+
     const pointRadiusViewportPx = getEffectivePointDiameterPx({
       viewer,
-      renderState: sample?.renderState,
+      renderState: rs,
       viewId: sample?.viewId,
       dimensionLevel: sample?.dim
     }) / 2;
-    const rawPointRadiusPx = pointRadiusViewportPx * vpScale;
+    const rawPointRadiusPx = pointRadiusViewportPx * plotScale;
     // Preview is heavily downscaled; enforce a minimum dot size in *screen pixels*
     // so points remain visible even when the exported figure is large.
     const minPreviewRadiusPx = (1.2 / Math.max(0.0001, s)) / 2; // 1.2px diameter on screen
@@ -1094,10 +1318,6 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     ctx.beginPath();
     ctx.rect(plotRect.x, plotRect.y, plotRect.width, plotRect.height);
     ctx.clip();
-
-    const scale = vpScale;
-    const offsetX = viewportRect.x;
-    const offsetY = viewportRect.y;
 
     const totalHighlighted = typeof state?.getTotalHighlightedCellCount === 'function'
       ? state.getTotalHighlightedCellCount()
@@ -1126,8 +1346,16 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       }
       if (a < 0.01) continue;
 
-      const x = offsetX + reduced.x[i] * scale;
-      const y = offsetY + reduced.y[i] * scale;
+      const vx = reduced.x[i];
+      const vy = reduced.y[i];
+      if (appliedFraming && !usingCropSample && cropPxForBounds) {
+        if (vx < cropPxForBounds.x || vx > cropPxForBounds.x + cropPxForBounds.width) continue;
+        if (vy < cropPxForBounds.y || vy > cropPxForBounds.y + cropPxForBounds.height) continue;
+      }
+      const localX = appliedFraming && !usingCropSample && cropPxForBounds ? (vx - cropPxForBounds.x) : vx;
+      const localY = appliedFraming && !usingCropSample && cropPxForBounds ? (vy - cropPxForBounds.y) : vy;
+      const x = plotOffsetX + localX * plotScale;
+      const y = plotOffsetY + localY * plotScale;
       ctx.fillStyle = `rgba(${r},${g},${b},${a})`;
       if (pointRadiusPx <= 1) {
         const sz = pointRadiusPx * 2;
@@ -1141,26 +1369,32 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
 
     ctx.restore();
 
-    // Centroid points + labels (matches the viewer overlay).
-    if (sample?.renderState?.mvpMatrix && (includeCentroidPointsCheckbox.checked || includeCentroidLabelsCheckbox.checked)) {
+    // Centroid points + labels (matches the viewer overlay; no separate export toggles).
+    const centroidFlags = typeof viewer.getCentroidFlags === 'function'
+      ? (viewer.getCentroidFlags(String(sample?.viewId || 'live')) || viewer.getCentroidFlags('live'))
+      : { points: false, labels: false };
+    const showCentroidPoints = Boolean(centroidFlags?.points);
+    const showCentroidLabels = Boolean(centroidFlags?.labels);
+
+    if (sample?.renderState?.mvpMatrix && (showCentroidPoints || showCentroidLabels)) {
       const vctx = state?.viewContexts?.get?.(String(sample.viewId || 'live')) || state?.viewContexts?.get?.('live') || null;
       const centroidPositions = vctx?.centroidPositions || null;
       const centroidColors = vctx?.centroidColors || null;
       const centroidLabelTexts = Array.isArray(vctx?.centroidLabels)
         ? vctx.centroidLabels.map((entry) => String(entry?.el?.textContent ?? entry?.text ?? ''))
         : null;
-      const centroidRadiusPx = Math.max(0.5, (Number(sample.renderState.pointSize || 5) * 4.0) * 0.5 * vpScale);
+      const centroidRadiusPx = Math.max(0.5, (Number(sample.renderState.pointSize || 5) * 4.0) * 0.5 * plotScale);
 
       drawCanvasCentroidOverlay({
         ctx,
         positions: centroidPositions,
         colors: centroidColors,
         labelTexts: centroidLabelTexts,
-        flags: { points: includeCentroidPointsCheckbox.checked, labels: includeCentroidLabelsCheckbox.checked },
+        flags: { points: showCentroidPoints, labels: showCentroidLabels },
         renderState: sample.renderState,
         plotRect,
         pointRadiusPx: centroidRadiusPx,
-        crop: null,
+        crop: appliedFraming ? getCropOptionForExport() : null,
         fontFamily,
         labelFontSizePx: centroidLabelFontSizePx,
         labelColor: '#111',
@@ -1169,13 +1403,14 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     }
 
     if (showOrientationCheckbox.checked && sample.renderState?.viewMatrix && sample.dim > 2 && sample.navMode !== 'planar') {
+      const orientationFontSize = clamp(Math.round(baseFontSizePx * 0.9), 11, 22);
       drawCanvasOrientationIndicator({
         ctx,
         plotRect,
         viewMatrix: sample.renderState.viewMatrix,
         cameraState: sample.cameraState,
         fontFamily,
-        fontSize: Math.max(10, Math.round(baseFontSizePx * 0.92))
+        fontSize: orientationFontSize
       });
     }
 
@@ -1222,20 +1457,41 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     }
 
     // Axes (approximate bounds from preview sample).
-    if (axesEligible && sample.positions && state?.dimensionManager?.getNormTransform) {
-      const norm = state.dimensionManager.getNormTransform(sample.dim);
-      const bounds = computeApproxBoundsFromSample({
-        reduced: sample.reduced,
-        positions: sample.positions,
-        normTransform: norm
-      });
+    if (axesEligible && sample.positions) {
+      const navMode = sample?.navMode || sample?.cameraState?.navigationMode || 'orbit';
+      const norm = typeof state?.dimensionManager?.getNormTransform === 'function'
+        ? state.dimensionManager.getNormTransform(sample.dim)
+        : null;
+      const useCameraAxes = sample?.dim > 2 && navMode !== 'planar' && sample?.renderState?.viewMatrix;
+      const bounds = (
+        useCameraAxes
+          ? computeApproxCameraBoundsFromSample({
+            reduced: sample.reduced,
+            positions: sample.positions,
+            viewMatrix: sample.renderState.viewMatrix,
+            cropPx: appliedFraming && !usingCropSample ? cropPxForBounds : null
+          })
+          : computeApproxBoundsFromSample({
+            reduced: sample.reduced,
+            positions: sample.positions,
+            normTransform: norm,
+            cropPx: appliedFraming && !usingCropSample ? cropPxForBounds : null
+          })
+      ) || { minX: -1, maxX: 1, minY: -1, maxY: 1 };
       if (bounds) {
+        const axisLabels = applyAuto3dAxisLabels({
+          xLabel: String(xLabelInput.value || 'X'),
+          yLabel: String(yLabelInput.value || 'Y'),
+          cameraState: sample?.cameraState || null,
+          dim: sample?.dim ?? 3,
+          navMode
+        });
         drawCanvasAxes({
           ctx,
           plotRect,
           bounds,
-          xLabel: String(xLabelInput.value || 'X'),
-          yLabel: String(yLabelInput.value || 'Y'),
+          xLabel: axisLabels.xLabel,
+          yLabel: axisLabels.yLabel,
           fontFamily,
           tickFontSize: tickFontSizePx,
           labelFontSize: axisLabelFontSizePx,
@@ -1245,7 +1501,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     }
 
     // Framing overlay (photography-style crop guide).
-    if (cropEnabled && viewportRect?.width > 1 && viewportRect?.height > 1) {
+    if (cropEnabled && previewFramingMode === 'edit' && viewportRect?.width > 1 && viewportRect?.height > 1) {
       const normalized = normalizeCropRect01({ enabled: true, ...cropRect01 });
       if (normalized) cropRect01 = normalized;
       const c = normalized || cropRect01;
@@ -1394,6 +1650,19 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     const maxW = left ? ax : (1 - ax);
     const maxH = top ? ay : (1 - ay);
 
+    if (!cropLockCheckbox.checked) {
+      const width = clamp(Math.min(dx, maxW), minSize, 1);
+      const height = clamp(Math.min(dy, maxH), minSize, 1);
+      const x = left ? ax - width : ax;
+      const y = top ? ay - height : ay;
+      return {
+        x: clamp(x, 0, 1 - width),
+        y: clamp(y, 0, 1 - height),
+        width,
+        height
+      };
+    }
+
     let width;
     let height;
     const viewportAspect = getViewportAspect();
@@ -1443,8 +1712,9 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
 
   previewCanvas.addEventListener('pointerdown', (evt) => {
     if (!previewEnabledCheckbox.checked || !cropEnabled) return;
+    if (previewFramingMode !== 'edit') return;
     if (!previewGeom?.viewportRect) return;
-    if (!previewSample?.reduced) return; // require a preview sample for meaningful framing
+    if (!previewSampleFull?.reduced) return; // require a preview sample for meaningful framing
 
     const p = getCanvasXYFromPointerEvent(evt);
     const logical = canvasXYToLogical(p.x, p.y);
@@ -1464,8 +1734,9 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
 
   previewCanvas.addEventListener('pointermove', (evt) => {
     if (!previewEnabledCheckbox.checked || !cropEnabled) return;
+    if (previewFramingMode !== 'edit') return;
     if (!previewGeom?.viewportRect) return;
-    if (!previewSample?.reduced) return;
+    if (!previewSampleFull?.reduced) return;
 
     const p = getCanvasXYFromPointerEvent(evt);
     const logical = canvasXYToLogical(p.x, p.y);
@@ -1492,6 +1763,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     } else {
       cropRect01 = applyResize(cropDrag.mode, norm, start);
     }
+    previewSampleCrop = null;
     syncCropUi();
     schedulePreviewDraw();
     evt.preventDefault();
@@ -1506,6 +1778,8 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   previewCanvas.addEventListener('pointercancel', endCropDrag);
   previewCanvas.addEventListener('dblclick', () => {
     if (!cropEnabled) return;
+    previewFramingMode = 'edit';
+    previewSampleCrop = null;
     resetCropToDefault();
     syncCropUi();
     schedulePreviewDraw();
@@ -1520,34 +1794,85 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       return;
     }
 
+    const visibleCount = inferVisiblePointCount();
+    const mode = downloadSelect.value || 'svg';
+    const needsSvg = mode === 'svg' || mode === 'svg+png' || mode === 'all';
+    const needsPng = mode === 'png' || mode === 'svg+png' || mode === 'png-multi' || mode === 'all';
+    const multiPng = mode === 'png-multi' || mode === 'all';
+
+    let strategy = strategySelect.value || 'ask';
+    const largeThreshold = clamp(parseInt(largeDatasetThresholdInput.value, 10) || LARGE_DATASET_THRESHOLD, 1000, 5000000);
+    const optimizedTargetCount = clamp(parseInt(optimizedTargetCountInput.value, 10) || 100000, 1000, 5000000);
+
+    if (needsSvg && strategy === 'ask' && visibleCount >= largeThreshold) {
+      const chosen = await promptLargeDatasetStrategy({
+        pointCount: visibleCount,
+        threshold: largeThreshold
+      });
+      if (!chosen) return;
+      strategy = chosen;
+      strategySelect.value = chosen;
+    }
+
+    const activeViewId = getActiveViewIdForPreview();
+    const shaderAccurate = requiresShaderAccuratePoints(activeViewId);
+
+    /** @type {{ title: string; detail: string }[]} */
+    const warnings = [];
+
+    // Shader-accurate point rendering cannot be expressed as pure SVG circles.
+    // Force Hybrid for SVG exports so points match the on-screen appearance.
+    if (needsSvg && shaderAccurate && strategy !== 'hybrid' && strategy !== 'raster') {
+      warnings.push({
+        title: 'SVG strategy adjusted for WYSIWYG',
+        detail: 'This view uses 3D/shader-accurate point rendering that cannot be represented as pure SVG circles. Export will use Hybrid SVG (rasterized points, vector annotations).'
+      });
+      strategy = 'hybrid';
+      strategySelect.value = 'hybrid';
+    }
+
+    const needsShaderAccurateRasterization = shaderAccurate && (needsPng || (needsSvg && strategy === 'hybrid'));
+    if (needsShaderAccurateRasterization) {
+      const rs = getPreviewRenderStateForView(activeViewId);
+      const missing = [];
+      if (!canCreateWebgl2Context()) missing.push('WebGL2');
+      if (!rs?.viewMatrix || !rs?.projectionMatrix || !rs?.modelMatrix) missing.push('camera matrices');
+      if (missing.length) {
+        warnings.push({
+          title: 'Shader-accurate export may degrade',
+          detail: `Shader-accurate export requires ${missing.join(' and ')}, but it is not available. Export may fall back to flat circles (not pixel-identical to the current view).`
+        });
+      }
+    }
+
+    if (needsSvg && strategy === 'optimized-vector') {
+      warnings.push({
+        title: 'Point reduction enabled',
+        detail: `Optimized vector keeps ~${optimizedTargetCount.toLocaleString()} points to preserve density. This may not be a pixel-for-pixel match to the current view. Use Hybrid or PNG for exact point appearance.`
+      });
+    }
+
+    if (needsSvg && strategy === 'raster') {
+      warnings.push({
+        title: 'SVG will be rasterized',
+        detail: 'Raster strategy outputs PNG (no editable SVG points).'
+      });
+    }
+
+    const showConnectivity = typeof viewer?.getShowConnectivity === 'function' ? viewer.getShowConnectivity() : false;
+    const hasConnectivity = typeof viewer?.hasConnectivityData === 'function' ? viewer.hasConnectivityData() : false;
+    if (showConnectivity && hasConnectivity) {
+      warnings.push({
+        title: 'Connectivity overlay not exported',
+        detail: 'Connectivity lines are enabled in the viewer, but figure export currently exports the point layer only (no edges).'
+      });
+    }
+
+    const proceed = await confirmExportFidelityWarnings({ warnings });
+    if (!proceed) return;
+
     setBusy(true);
     try {
-      const visibleCount = inferVisiblePointCount();
-      const mode = downloadSelect.value || 'svg';
-      const needsSvg = mode === 'svg' || mode === 'svg+png' || mode === 'all';
-      const needsPng = mode === 'png' || mode === 'svg+png' || mode === 'png-multi' || mode === 'all';
-      const multiPng = mode === 'png-multi' || mode === 'all';
-
-      let strategy = strategySelect.value || 'ask';
-      const largeThreshold = clamp(parseInt(largeDatasetThresholdInput.value, 10) || LARGE_DATASET_THRESHOLD, 1000, 5000000);
-      const optimizedTargetCount = clamp(parseInt(optimizedTargetCountInput.value, 10) || 100000, 1000, 5000000);
-
-      if (needsSvg && strategy === 'ask' && visibleCount >= largeThreshold) {
-        const chosen = await promptLargeDatasetStrategy({
-          pointCount: visibleCount,
-          threshold: largeThreshold
-        });
-        if (!chosen) return;
-        strategy = chosen;
-      }
-
-      // Shader-accurate point rendering cannot be expressed as pure SVG circles.
-      // Force Hybrid for SVG exports so points match the on-screen appearance.
-      const activeViewId = getActiveViewIdForPreview();
-      if (needsSvg && requiresShaderAccuratePoints(activeViewId) && strategy !== 'hybrid' && strategy !== 'raster') {
-        strategy = 'hybrid';
-        getNotificationCenter().info('Shader-accurate view detected — using Hybrid SVG for WYSIWYG point rendering.', { category: 'render' });
-      }
 
       const baseFontSizePx = parseInt(fontSizeInput.value, 10) || 12;
       const legendFontSizePx = parseInt(legendFontSizeInput.value, 10) || baseFontSizePx;
@@ -1563,8 +1888,6 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
         title: String(titleInput.value || ''),
         includeAxes: includeAxesCheckbox.checked,
         includeLegend: includeLegendCheckbox.checked,
-        includeCentroidPoints: includeCentroidPointsCheckbox.checked,
-        includeCentroidLabels: includeCentroidLabelsCheckbox.checked,
         legendPosition: legendPosSelect.value === 'bottom' ? 'bottom' : 'right',
         xLabel: String(xLabelInput.value || 'X'),
         yLabel: String(yLabelInput.value || 'Y'),
@@ -1627,22 +1950,79 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     }
   });
 
-  // Keep plot size/framing close to preview, and visually separated from the rest.
-  const sizePreviewSection = createElement('div', { className: 'control-block figure-export-section figure-export-section-box' }, [
-    plotAndFrameRow,
-    previewRow,
-    previewBox,
-  ]);
+  function buildSubAccordionItem({ title, desc, open = false, content = [] }) {
+    const safeTitle = String(title || '').trim() || 'Section';
+    const safeDesc = String(desc || '').trim();
+    const item = createElement('div', { className: `analysis-accordion-item${open ? ' open' : ''}` });
+    const contentId = `figure-export-${safeTitle.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-panel`;
+    const toggle = createElement(
+      'button',
+      {
+        type: 'button',
+        className: 'analysis-accordion-header',
+        ariaExpanded: open ? 'true' : 'false',
+        ariaControls: contentId
+      },
+      [
+        createElement('span', { className: 'analysis-accordion-title' }, [safeTitle]),
+        createElement('span', { className: 'analysis-accordion-desc' }, [safeDesc]),
+        createElement('span', { className: 'analysis-accordion-chevron', ariaHidden: 'true' })
+      ]
+    );
+    const panel = createElement('div', { className: 'analysis-accordion-content', id: contentId }, content);
+    toggle.addEventListener('click', () => {
+      const next = !item.classList.contains('open');
+      if (next) {
+        const parent = item.parentElement;
+        const siblings = parent ? Array.from(parent.children) : [];
+        for (const sibling of siblings) {
+          if (!(sibling instanceof HTMLElement)) continue;
+          if (sibling === item) continue;
+          if (!sibling.classList.contains('analysis-accordion-item')) continue;
+          if (!sibling.classList.contains('open')) continue;
+          sibling.classList.remove('open');
+          const siblingToggle = sibling.firstElementChild;
+          if (siblingToggle && siblingToggle.classList.contains('analysis-accordion-header')) {
+            siblingToggle.setAttribute('aria-expanded', 'false');
+          }
+        }
+      }
+      item.classList.toggle('open', next);
+      toggle.setAttribute('aria-expanded', next ? 'true' : 'false');
+    });
+    item.appendChild(toggle);
+    item.appendChild(panel);
+    return { item, toggle, panel };
+  }
+
+  const subAccordion = createElement('div', { className: 'analysis-accordion figure-export-accordion' });
+  subAccordion.appendChild(buildSubAccordionItem({
+    title: 'Framing',
+    desc: 'Plot size, frame export, preview',
+    open: false,
+    content: [plotAndFrameRow, previewRow, framingControls, previewBox]
+  }).item);
+  subAccordion.appendChild(buildSubAccordionItem({
+    title: 'Labels & Annotations',
+    desc: 'Title, axes, legend, selection, 3D orientation',
+    open: false,
+    content: [titleRow, xLabelRow, yLabelRow, annotationSection, selectionRow]
+  }).item);
+  subAccordion.appendChild(buildSubAccordionItem({
+    title: 'Style',
+    desc: 'Background and typography',
+    open: false,
+    content: [styleSection]
+  }).item);
+  subAccordion.appendChild(buildSubAccordionItem({
+    title: 'Download',
+    desc: 'Format, DPI, large-data strategy',
+    open: false,
+    content: [advancedSection]
+  }).item);
 
   container.appendChild(header);
-  container.appendChild(titleRow);
-  container.appendChild(xLabelRow);
-  container.appendChild(yLabelRow);
-  container.appendChild(annotationSection);
-  container.appendChild(selectionRow);
-  container.appendChild(styleSection);
-  container.appendChild(sizePreviewSection);
-  container.appendChild(advancedSection);
+  container.appendChild(subAccordion);
   container.appendChild(actionsRow);
 
   syncFormatDependentUi();

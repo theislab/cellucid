@@ -15,7 +15,8 @@
  */
 
 import { EventEmitter } from '../utils/event-emitter.js';
-import { toSessionStorageKey } from './cache-scope.js';
+import { toCacheScopeKey, toSessionStorageKey } from './cache-scope.js';
+import { getCommunityAnnotationScopeLock } from './scope-lock.js';
 
 const STORAGE_VERSION = 1;
 
@@ -221,8 +222,7 @@ function sanitizeProfile(profile) {
   const title = clampLen(profile?.title || '', 120);
   const orcid = clampLen(profile?.orcid || '', 64);
   const linkedin = clampLen(profile?.linkedin || '', 120);
-  const email = clampLen(profile?.email || '', 254);
-  return { username, login, githubUserId, displayName, title, orcid, linkedin, email };
+  return { username, login, githubUserId, displayName, title, orcid, linkedin };
 }
 
 function sanitizeKnownUserProfile(input) {
@@ -231,9 +231,8 @@ function sanitizeKnownUserProfile(input) {
   const title = clampLen(input?.title || '', 120);
   const orcid = clampLen(input?.orcid || '', 64);
   const linkedin = clampLen(input?.linkedin || '', 120);
-  const email = clampLen(input?.email || '', 254);
-  if (!login && !displayName && !title && !orcid && !linkedin && !email) return null;
-  return { login, displayName, title, orcid, linkedin, email };
+  if (!login && !displayName && !title && !orcid && !linkedin) return null;
+  return { login, displayName, title, orcid, linkedin };
 }
 
 function normalizeUsername(username) {
@@ -639,6 +638,11 @@ export class CommunityAnnotationSession extends EventEmitter {
     this._datasetId = null;
     this._repoRef = null;
     this._cacheUserId = null;
+    this._scopeLock = getCommunityAnnotationScopeLock();
+    this._lockScopeKey = null;
+    this._persistenceOk = true;
+    this._persistenceErrorEmittedForKey = null;
+    this._integrityErrorEmittedForScopeKey = null;
     this._state = defaultState();
     this._profile = sanitizeProfile({});
     // Public profile metadata from GitHub user files (in-memory only).
@@ -647,6 +651,23 @@ export class CommunityAnnotationSession extends EventEmitter {
     this._categoriesByFieldKey = {}; // { [fieldKey]: string[] }
     this._saveTimer = null;
     this._loadedForKey = null;
+    this._scopeLock.on('lost', (evt) => {
+      try {
+        const scopeKey = toCleanString(evt?.scopeKey);
+        if (!scopeKey || !this._lockScopeKey) return;
+        if (scopeKey !== this._lockScopeKey) return;
+        this._lockScopeKey = null;
+        this._persistenceOk = false;
+        this.emit('lock:lost', {
+          ...(evt || {}),
+          datasetId: this._datasetId,
+          repoRef: this._repoRef,
+          userId: this._cacheUserId
+        });
+      } catch {
+        // ignore
+      }
+    });
     this._ensureLoaded();
   }
 
@@ -775,17 +796,26 @@ export class CommunityAnnotationSession extends EventEmitter {
   }
 
   setCacheContext({ datasetId, repoRef, userId } = {}) {
+    const prevDatasetId = this._datasetId;
+    const prevRepoRef = this._repoRef;
+    const prevUserId = this._cacheUserId;
+    const prevScopeKey = toCacheScopeKey({ datasetId: prevDatasetId, repoRef: prevRepoRef, userId: prevUserId });
+
     const nextDatasetId = datasetId === undefined ? this._datasetId : (toCleanString(datasetId) || null);
     const nextRepoRef = repoRef === undefined ? this._repoRef : (toCleanString(repoRef) || null);
     const nextUserId = userId === undefined ? this._cacheUserId : (normalizeGitHubUserIdOrNull(userId) || null);
 
-    if (
-      nextDatasetId === this._datasetId &&
-      nextRepoRef === this._repoRef &&
-      nextUserId === this._cacheUserId
-    ) {
-      return;
-    }
+    const nextScopeKey = toCacheScopeKey({ datasetId: nextDatasetId, repoRef: nextRepoRef, userId: nextUserId });
+    const sameContext =
+      nextDatasetId === prevDatasetId &&
+      nextRepoRef === prevRepoRef &&
+      nextUserId === prevUserId;
+    const needsLockReacquire = Boolean(
+      nextScopeKey &&
+      (!this._lockScopeKey || this._lockScopeKey !== nextScopeKey || !this._scopeLock.isHolding(nextScopeKey))
+    );
+    const needsPersistenceRetry = this._persistenceOk === false;
+    if (sameContext && !needsLockReacquire && !needsPersistenceRetry) return;
 
     try {
       this._saveNow?.();
@@ -793,15 +823,48 @@ export class CommunityAnnotationSession extends EventEmitter {
       // ignore
     }
 
+    // Acquire a strict cross-tab lock for the fully-scoped key (dataset + repo@branch + numeric user id).
+    // If we cannot acquire it, fail closed (do not change scope) to prevent silent overwrites across tabs.
+    const lockRes = this._scopeLock.setScopeKey(nextScopeKey);
+    if (!lockRes?.ok) {
+      // Best-effort: restore the previous lock if we were attempting a scope switch.
+      let restored = false;
+      if (prevScopeKey && nextScopeKey && prevScopeKey !== nextScopeKey) {
+        try {
+          const res = this._scopeLock.setScopeKey(prevScopeKey);
+          restored = Boolean(res?.ok);
+        } catch {
+          restored = false;
+        }
+      }
+
+      if (restored) {
+        this._lockScopeKey = prevScopeKey;
+        this._persistenceOk = true;
+      } else {
+        this._lockScopeKey = null;
+        this._persistenceOk = false;
+      }
+      this.emit('lock:error', {
+        ...(lockRes || {}),
+        datasetId: nextDatasetId,
+        repoRef: nextRepoRef,
+        userId: nextUserId
+      });
+      return;
+    }
+
     // Category label maps are dataset-specific; clear on dataset changes to avoid
     // transient incorrect bucket canonicalization when datasets share field keys.
-    if (nextDatasetId !== this._datasetId) {
+    if (nextDatasetId !== prevDatasetId) {
       this._categoriesByFieldKey = {};
     }
 
     this._datasetId = nextDatasetId;
     this._repoRef = nextRepoRef;
     this._cacheUserId = nextUserId;
+    this._lockScopeKey = nextScopeKey || null;
+    this._persistenceOk = true;
     this._ensureLoaded();
     this.emit('context:changed', { datasetId: this._datasetId, repoRef: this._repoRef, userId: this._cacheUserId });
   }
@@ -833,6 +896,14 @@ export class CommunityAnnotationSession extends EventEmitter {
 
   getDatasetId() {
     return this._datasetId;
+  }
+
+  getRepoRef() {
+    return this._repoRef;
+  }
+
+  getCacheUserId() {
+    return this._cacheUserId;
   }
 
   getDatasetAccessMap() {
@@ -905,8 +976,7 @@ export class CommunityAnnotationSession extends EventEmitter {
       prev.displayName === next.displayName &&
       prev.title === next.title &&
       prev.orcid === next.orcid &&
-      prev.linkedin === next.linkedin &&
-      prev.email === next.email
+      prev.linkedin === next.linkedin
     ) return;
 
     try {
@@ -2032,6 +2102,7 @@ export class CommunityAnnotationSession extends EventEmitter {
       if (labelParts.length >= 6) break;
     }
     const bestLabel = labelParts.length ? labelParts.join(', ') : (best?.suggestion?.label || null);
+    const isTie = bestSuggestions.length > 1;
 
     const votersSet = new Set();
     for (const s of list) {
@@ -2048,7 +2119,7 @@ export class CommunityAnnotationSession extends EventEmitter {
         confidence: 0,
         voters,
         netVotes: best?.netVotes || 0,
-        suggestionId: best?.suggestion?.id || null
+        suggestionId: isTie ? null : (best?.suggestion?.id || null)
       };
     }
 
@@ -2058,14 +2129,15 @@ export class CommunityAnnotationSession extends EventEmitter {
     const rawConfidence = (best?.netVotes || 0) / denom;
     const confidence = Number.isFinite(rawConfidence) ? Math.max(-1, Math.min(1, rawConfidence)) : 0;
     const th = normalizeConsensusThreshold(Number(threshold));
-    const status = confidence >= th ? 'consensus' : 'disputed';
+    // Ties are always disputed (no single winning label), even if the top net-vote share crosses threshold.
+    const status = (!isTie && confidence >= th) ? 'consensus' : 'disputed';
     return {
       status,
       label: bestLabel,
       confidence,
       voters,
       netVotes: best?.netVotes || 0,
-      suggestionId: best?.suggestion?.id || null
+      suggestionId: isTie ? null : (best?.suggestion?.id || null)
     };
   }
 
@@ -2191,7 +2263,6 @@ export class CommunityAnnotationSession extends EventEmitter {
       normalizeGitHubUserIdOrNull(this._cacheUserId) ||
       undefined;
     const linkedin = clampLen(profile.linkedin || '', 120) || undefined;
-    const email = clampLen(profile.email || '', 254) || undefined;
 
     const suggestionsOut = {};
     for (const [bucket, list] of Object.entries(this._state.suggestions || {})) {
@@ -2279,7 +2350,6 @@ export class CommunityAnnotationSession extends EventEmitter {
       title: profile.title || undefined,
       orcid: profile.orcid || undefined,
       linkedin,
-      email,
       updatedAt: nowIso(),
       ...(Object.keys(datasetsOut).length ? { datasets: datasetsOut } : {}),
       suggestions: suggestionsOut,
@@ -2344,6 +2414,7 @@ export class CommunityAnnotationSession extends EventEmitter {
     const myUsername = this._getEffectiveUserKey();
     const myUserLower = normalizeUsername(myUsername);
     const knownProfiles = this._knownProfiles && typeof this._knownProfiles === 'object' ? this._knownProfiles : {};
+    const scopeKey = toCacheScopeKey({ datasetId: this._datasetId, repoRef: this._repoRef, userId: this._cacheUserId });
 
     const getDocUser = (doc) => {
       const id = Number(doc?.githubUserId);
@@ -2363,16 +2434,35 @@ export class CommunityAnnotationSession extends EventEmitter {
       return fromMeta || fromPath || normalizeUsername(fromDoc);
     };
 
+    const docUserCache = (typeof WeakMap !== 'undefined') ? new WeakMap() : null;
+    const getCachedDocUser = (doc) => {
+      if (!doc || typeof doc !== 'object') return null;
+      if (!docUserCache) return getDocUser(doc);
+      if (docUserCache.has(doc)) return docUserCache.get(doc);
+      const u = getDocUser(doc) || null;
+      docUserCache.set(doc, u);
+      return u;
+    };
+
     // 0) Capture optional public profile info from user docs (displayName/title/orcid/linkedin).
     // This is local-only UI metadata (not pushed anywhere by the app).
     // Limit growth to avoid unbounded localStorage usage.
     const KNOWN_PROFILE_LIMIT = 500;
-    for (const doc of (Array.isArray(userDocs) ? userDocs : []).slice(0, 2000)) {
-      const u = getDocUser(doc);
+    const docsList = Array.isArray(userDocs) ? userDocs : [];
+    let knownProfileCount = 0;
+    try {
+      knownProfileCount = Object.keys(knownProfiles).length;
+    } catch {
+      knownProfileCount = 0;
+    }
+    for (const doc of docsList) {
+      const u = getCachedDocUser(doc);
       if (!u) continue;
-      if (Object.keys(knownProfiles).length >= KNOWN_PROFILE_LIMIT && !knownProfiles[u]) continue;
+      const already = Boolean(knownProfiles[u]);
+      if (knownProfileCount >= KNOWN_PROFILE_LIMIT && !already) continue;
       const cleaned = sanitizeKnownUserProfile(doc || {});
       if (!cleaned) continue;
+      if (!already) knownProfileCount++;
       knownProfiles[u] = cleaned;
     }
     this._knownProfiles = knownProfiles;
@@ -2380,10 +2470,10 @@ export class CommunityAnnotationSession extends EventEmitter {
     // Hydrate my profile fields from my GitHub user file if we don't have them yet.
     try {
       const mine = this._profile || sanitizeProfile({});
-      const hasAny = Boolean(mine.displayName || mine.title || mine.orcid || mine.linkedin || mine.email);
+      const hasAny = Boolean(mine.displayName || mine.title || mine.orcid || mine.linkedin);
       if (!hasAny) {
-        for (const doc of (Array.isArray(userDocs) ? userDocs : []).slice(0, 2000)) {
-          const docUser = getDocUser(doc);
+        for (const doc of docsList) {
+          const docUser = getCachedDocUser(doc);
           if (!docUser) continue;
           if (docUser !== myUserLower) continue;
           this._profile = sanitizeProfile({
@@ -2391,8 +2481,7 @@ export class CommunityAnnotationSession extends EventEmitter {
             displayName: doc?.displayName || '',
             title: doc?.title || '',
             orcid: doc?.orcid || '',
-            linkedin: doc?.linkedin || '',
-            email: doc?.email || ''
+            linkedin: doc?.linkedin || ''
           });
           this._state.profile = sanitizeProfile(this._profile);
           break;
@@ -2405,6 +2494,19 @@ export class CommunityAnnotationSession extends EventEmitter {
     // 1) Union suggestion metadata from local + remote.
     const byBucketById = new Map(); // bucket -> Map(id -> suggestionMeta)
     const idToBucket = new Map();
+    const duplicateSuggestionIds = [];
+    const recordDuplicateSuggestionId = ({ id, firstBucket, secondBucket, sourceUser }) => {
+      const sid = toCleanString(id);
+      const a = toCleanString(firstBucket);
+      const b = toCleanString(secondBucket);
+      if (!sid || !a || !b || a === b) return;
+      duplicateSuggestionIds.push({
+        id: sid,
+        firstBucket: a,
+        secondBucket: b,
+        sourceUser: normalizeUsername(sourceUser || '') || null
+      });
+    };
 
     // 1a) Collect deletion markers from remote docs + local session.
     // Only the proposer may delete: a deletion marker from username U only applies
@@ -2439,7 +2541,14 @@ export class CommunityAnnotationSession extends EventEmitter {
       const id = toCleanString(normalized.id);
       if (!id) return;
       if (idToBucket.has(id) && idToBucket.get(id) !== b) {
-        // Ambiguous id reused across buckets; ignore later duplicates.
+        // Duplicate suggestion id across buckets is a correctness/safety violation:
+        // votes are keyed by suggestionId (bucketless), so collisions can cause silent mis-attribution.
+        recordDuplicateSuggestionId({
+          id,
+          firstBucket: idToBucket.get(id),
+          secondBucket: b,
+          sourceUser
+        });
         return;
       }
       idToBucket.set(id, b);
@@ -2464,7 +2573,7 @@ export class CommunityAnnotationSession extends EventEmitter {
     let myRemoteDoc = null;
     for (const doc of remoteDocs) {
       if (!doc || typeof doc !== 'object' || doc.__invalid) continue;
-      const docUser = getDocUser(doc);
+      const docUser = getCachedDocUser(doc);
       if (!docUser) continue;
       if (docUser === myUserLower) {
         myRemoteDoc = doc;
@@ -2473,9 +2582,9 @@ export class CommunityAnnotationSession extends EventEmitter {
     }
 
     // remote deletion markers
-    for (const doc of remoteDocs.slice(0, 2000)) {
+    for (const doc of remoteDocs) {
       if (!doc || typeof doc !== 'object' || doc.__invalid) continue;
-      const docUser = getDocUser(doc);
+      const docUser = getCachedDocUser(doc);
       if (!docUser) continue;
       const deleted = doc.deletedSuggestions && typeof doc.deletedSuggestions === 'object' ? doc.deletedSuggestions : {};
       for (const [bucket, ids] of Object.entries(deleted)) {
@@ -2484,15 +2593,43 @@ export class CommunityAnnotationSession extends EventEmitter {
       }
     }
 
-    for (const doc of remoteDocs.slice(0, 1000)) {
+    for (const doc of remoteDocs) {
       if (!doc || typeof doc !== 'object' || doc.__invalid) continue;
-      const docUser = getDocUser(doc);
+      const docUser = getCachedDocUser(doc);
       if (!docUser) continue;
       const suggestions = doc.suggestions && typeof doc.suggestions === 'object' ? doc.suggestions : {};
       for (const [bucket, list] of Object.entries(suggestions)) {
         if (!Array.isArray(list)) continue;
         for (const s of list.slice(0, MAX_SUGGESTIONS_PER_CLUSTER)) addSuggestion(bucket, s, { sourceUser: docUser });
       }
+    }
+
+    if (duplicateSuggestionIds.length) {
+      // Treat as fatal: continuing would produce a misleading consensus view.
+      const preview = duplicateSuggestionIds
+        .slice(0, 8)
+        .map((d) => `- ${d.id}: ${d.firstBucket} ↔ ${d.secondBucket}`)
+        .join('\n');
+      if (scopeKey && this._integrityErrorEmittedForScopeKey !== scopeKey) {
+        this._integrityErrorEmittedForScopeKey = scopeKey;
+        this.emit('integrity:error', {
+          datasetId: this._datasetId,
+          repoRef: this._repoRef,
+          userId: this._cacheUserId,
+          scopeKey,
+          duplicates: duplicateSuggestionIds.slice(0, 50),
+          message:
+            'Annotation data integrity error: duplicate suggestion ids were found across buckets.\n' +
+            'This can corrupt votes and consensus because votes are keyed only by suggestionId.\n\n' +
+            'Examples:\n' +
+            `${preview || '- (none)'}\n\n` +
+            'Fix: remove/repair the offending user files in `annotations/users/`, then Pull again.\n' +
+            'Disconnected annotation repo to prevent incorrect merges.'
+        });
+      }
+      // Stop persistence and avoid further local writes for this scope.
+      this._persistenceOk = false;
+      return;
     }
 
     // Apply deletion markers now that we have suggestion metadata (including proposedBy).
@@ -2653,9 +2790,9 @@ export class CommunityAnnotationSession extends EventEmitter {
       if (direction === 'down') downvotesById.get(sid).add(u);
     };
 
-    for (const doc of remoteDocs.slice(0, 1000)) {
+    for (const doc of remoteDocs) {
       if (!doc || typeof doc !== 'object' || doc.__invalid) continue;
-      const docUser = getDocUser(doc);
+      const docUser = getCachedDocUser(doc);
       if (!docUser) continue;
       if (preferLocalVotes && docUser === myUserLower) continue;
 
@@ -2697,9 +2834,9 @@ export class CommunityAnnotationSession extends EventEmitter {
     };
 
     // Collect comments from remote user docs
-    for (const doc of remoteDocs.slice(0, 1000)) {
+    for (const doc of remoteDocs) {
       if (!doc || typeof doc !== 'object' || doc.__invalid) continue;
-      const docUsername = getDocUser(doc);
+      const docUsername = getCachedDocUser(doc);
       // Skip local user's remote comments (prefer local state)
       if (docUsername === myUserLower) continue;
 
@@ -2878,11 +3015,12 @@ export class CommunityAnnotationSession extends EventEmitter {
 
   _touch() {
     this._state.updatedAt = nowIso();
-    this._scheduleSave();
+    if (this._persistenceOk) this._scheduleSave();
     this.emit('changed', { reason: 'update' });
   }
 
   _scheduleSave() {
+    if (!this._persistenceOk) return;
     if (this._saveTimer) return;
     const schedule = typeof requestIdleCallback === 'function'
       ? (fn) => requestIdleCallback(fn, { timeout: 800 })
@@ -2896,11 +3034,45 @@ export class CommunityAnnotationSession extends EventEmitter {
   _saveNow() {
     const key = toSessionStorageKey({ datasetId: this._datasetId, repoRef: this._repoRef, userId: this._cacheUserId });
     if (!key) return;
-    const payload = JSON.stringify(this._state);
+    const scopeKey = toCacheScopeKey({ datasetId: this._datasetId, repoRef: this._repoRef, userId: this._cacheUserId });
+    if (scopeKey && !this._scopeLock.isHolding(scopeKey)) return;
+    // Persist only *local intent* (my suggestions/votes/comments/settings), not the
+    // fully-merged remote view (which can be rebuilt from cached raw GitHub files).
+    const localDoc = this.buildUserFileDocument?.() || {};
+    const persisted = {
+      version: STORAGE_VERSION,
+      updatedAt: this._state.updatedAt,
+      annotationFields: this._state.annotationFields,
+      annotatableSettings: this._state.annotatableSettings,
+      closedAnnotatableFields: this._state.closedAnnotatableFields,
+      datasets: this._state.datasets,
+      profile: this._state.profile,
+      myVotes: this._state.myVotes,
+      myComments: this._state.myComments,
+      moderationMerges: this._state.moderationMerges,
+      remoteFileShas: this._state.remoteFileShas,
+      lastSyncAt: this._state.lastSyncAt,
+      suggestions: (localDoc && typeof localDoc === 'object') ? (localDoc.suggestions || {}) : {},
+      deletedSuggestions: (localDoc && typeof localDoc === 'object') ? (localDoc.deletedSuggestions || {}) : {}
+    };
+    const payload = JSON.stringify(persisted);
     try {
       localStorage.setItem(key, payload);
+      this._persistenceErrorEmittedForKey = null;
     } catch {
-      // ignore storage quota errors; session remains in memory
+      this._persistenceOk = false;
+      if (this._persistenceErrorEmittedForKey !== key) {
+        this._persistenceErrorEmittedForKey = key;
+        this.emit('persistence:error', {
+          datasetId: this._datasetId,
+          repoRef: this._repoRef,
+          userId: this._cacheUserId,
+          message:
+            'Local persistence failed (browser storage write error).\n' +
+            'To prevent silent data loss, the annotation repo must be disconnected.\n\n' +
+            'Fix: free up browser storage (clear site data) and reconnect, then Pull again.'
+        });
+      }
     }
   }
 }

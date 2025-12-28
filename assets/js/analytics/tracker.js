@@ -51,6 +51,13 @@ let buttonTrackingAttached = false;
 let flushAttempts = 0;
 const loadSessions = new Map();
 
+const clampString = (value, maxLen = 120) => {
+  if (value === undefined || value === null) return undefined;
+  const s = String(value).replace(/\s+/g, ' ').trim();
+  if (!s) return undefined;
+  return s.length > maxLen ? s.slice(0, maxLen) : s;
+};
+
 const scheduleIdle = (fn, timeout = 500) => {
   if (typeof requestIdleCallback === 'function') {
     return requestIdleCallback(() => fn(), { timeout });
@@ -145,42 +152,24 @@ function getClickType(event) {
 export function trackButtonClick(controlId, meta = {}) {
   if (!controlId) return;
   sendEvent('ui_button_click', {
-    control_id: controlId,
-    control_type: meta.controlType,
-    click_type: meta.clickType,
-    pointer_type: meta.pointerType,
-    dataset_id: meta.datasetId,
-    modifiers: meta.modifiers
+    control_id: clampString(controlId, ANALYTICS_ID_MAX),
+    control_type: clampString(meta.controlType, 32),
+    click_type: clampString(meta.clickType, 16),
+    pointer_type: clampString(meta.pointerType, 16),
+    dataset_id: clampString(meta.datasetId, 120),
+    modifiers: clampString(meta.modifiers, 40)
   });
 }
 
 export function trackDataLoadMethod(method, context = {}) {
   if (!method) return;
-
-  const stats = context.metadata?.stats || {};
-  const cellCount = safeNumber(stats.n_cells ?? context.cellCount);
-  const geneCount = safeNumber(stats.n_genes ?? context.geneCount);
-  const obsCount = safeNumber(stats.n_obs_fields ?? context.obsFieldCount);
-  const edgeCount = safeNumber(stats.n_edges ?? context.edgeCount);
-
   const payload = {
-    load_method: method,
-    source_type: context.sourceType,
-    dataset_id: context.datasetId || context.metadata?.id,
-    dataset_name: context.datasetName || context.metadata?.name,
-    cell_count: cellCount,
-    gene_count: geneCount,
-    obs_field_count: obsCount,
-    edge_count: edgeCount,
+    load_method: clampString(method, 64),
+    ...buildDatasetStatsPayload(context),
     duration_ms: safeNumber(context.durationMs),
-    has_connectivity: stats.has_connectivity != null ? Number(!!stats.has_connectivity) : undefined,
-    previous_source: context.previousSource,
-    previous_dataset_id: context.previousDatasetId,
-    reload: context.reload ? 1 : 0,
-    sample_dataset: context.sourceType === 'local-demo' ? 1 : undefined,
-    error_code: context.errorCode,
+    error_code: clampString(context.errorCode, 80),
     http_status: safeNumber(context.httpStatus),
-    failure_reason: context.failureReason
+    failure_reason: clampString(context.failureReason, 160)
   };
 
   if (context.success !== undefined && context.success !== null) {
@@ -211,6 +200,29 @@ function sanitizeError(err) {
   const errorCode = err.code || err.name || err.type;
   const failureReason = (err.message || '').slice(0, 160) || undefined;
   return { errorCode, httpStatus, failureReason };
+}
+
+function buildDatasetStatsPayload(context = {}) {
+  const stats = context.metadata?.stats || {};
+  const cellCount = safeNumber(stats.n_cells ?? context.cellCount);
+  const geneCount = safeNumber(stats.n_genes ?? context.geneCount);
+  const obsCount = safeNumber(stats.n_obs_fields ?? context.obsFieldCount);
+  const edgeCount = safeNumber(stats.n_edges ?? context.edgeCount);
+
+  return {
+    source_type: clampString(context.sourceType, 64),
+    dataset_id: clampString(context.datasetId || context.metadata?.id, 120),
+    dataset_name: clampString(context.datasetName || context.metadata?.name, 120),
+    cell_count: cellCount,
+    gene_count: geneCount,
+    obs_field_count: obsCount,
+    edge_count: edgeCount,
+    has_connectivity: stats.has_connectivity != null ? Number(!!stats.has_connectivity) : undefined,
+    previous_source: clampString(context.previousSource, 64),
+    previous_dataset_id: clampString(context.previousDatasetId, 120),
+    reload: context.reload ? 1 : 0,
+    sample_dataset: context.sourceType === 'local-demo' ? 1 : undefined
+  };
 }
 
 export function completeDataLoadSuccess(token, context = {}) {
@@ -257,6 +269,14 @@ export function trackPerformanceMetric(metricName, value, context = {}) {
   });
 }
 
+export function trackDatasetSelected(method, context = {}) {
+  if (!method) return;
+  sendEvent('dataset_selected', {
+    load_method: clampString(method, 64),
+    ...buildDatasetStatsPayload(context)
+  });
+}
+
 function attachDatasetChangeAnalytics(dataSourceManager) {
   if (!dataSourceManager?.onDatasetChange) return;
 
@@ -264,7 +284,7 @@ function attachDatasetChangeAnalytics(dataSourceManager) {
     if (!event?.metadata) return;
     const meta = event.metadata;
     const method = event.loadMethod || dataSourceManager.getLastLoadMethod?.() || 'unspecified';
-    trackDataLoadMethod(method, {
+    trackDatasetSelected(method, {
       metadata: meta,
       sourceType: event.sourceType,
       datasetId: event.datasetId,
@@ -320,7 +340,7 @@ export function initAnalytics({ dataSourceManager } = {}) {
   if (dataSourceManager?.hasActiveDataset?.()) {
     const metadata = dataSourceManager.getCurrentMetadata?.();
     if (metadata) {
-      trackDataLoadMethod(dataSourceManager.getLastLoadMethod?.() || DATA_LOAD_METHODS.DEFAULT_DEMO, {
+      trackDatasetSelected(dataSourceManager.getLastLoadMethod?.() || DATA_LOAD_METHODS.DEFAULT_DEMO, {
         metadata,
         sourceType: dataSourceManager.getCurrentSourceType?.(),
         datasetId: dataSourceManager.getCurrentDatasetId?.()

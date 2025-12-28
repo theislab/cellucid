@@ -72,13 +72,27 @@ const LIVE_VIEW_ID = 'live';
  */
 export function createFigureExportEngine({ state, viewer, dataSourceManager = null }) {
   /**
-   * @returns {{ datasetName: string|null, datasetId: string|null, sourceType: string|null }}
+   * @returns {{
+   *   datasetName: string|null,
+   *   datasetId: string|null,
+   *   sourceType: string|null,
+   *   datasetBaseUrl: string|null,
+   *   datasetSourceName: string|null,
+   *   datasetSourceUrl: string|null,
+   *   datasetSourceCitation: string|null,
+   *   datasetUserPath: string|null
+   * }}
    */
   function getDatasetIdentity() {
     const meta = dataSourceManager?.getCurrentMetadata?.() || null;
     const datasetId = dataSourceManager?.getCurrentDatasetId?.() || meta?.id || null;
     const datasetName = meta?.name || meta?.id || null;
     const sourceType = dataSourceManager?.getCurrentSourceType?.() || null;
+    const datasetBaseUrl = dataSourceManager?.getCurrentBaseUrl?.() || null;
+    const datasetSourceName = meta?.source?.name || null;
+    const datasetSourceUrl = meta?.source?.url || null;
+    const datasetSourceCitation = meta?.source?.citation || null;
+    const datasetUserPath = dataSourceManager?.getStateSnapshot?.()?.userPath || null;
 
     // If the viewer/state point counts disagree (e.g., benchmark synthetic mode),
     // avoid reusing stale DataSourceManager labels.
@@ -88,11 +102,25 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
       return {
         datasetName: 'Synthetic',
         datasetId: 'synthetic',
-        sourceType: 'benchmark'
+        sourceType: 'benchmark',
+        datasetBaseUrl: null,
+        datasetSourceName: null,
+        datasetSourceUrl: null,
+        datasetSourceCitation: null,
+        datasetUserPath: null,
       };
     }
 
-    return { datasetName, datasetId, sourceType };
+    return {
+      datasetName,
+      datasetId,
+      sourceType,
+      datasetBaseUrl,
+      datasetSourceName,
+      datasetSourceUrl,
+      datasetSourceCitation,
+      datasetUserPath,
+    };
   }
 
   /**
@@ -187,7 +215,16 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
       jobs.push({ requested, format, dpi });
     }
 
-    const { datasetName, datasetId, sourceType } = getDatasetIdentity();
+    const {
+      datasetName,
+      datasetId,
+      sourceType,
+      datasetBaseUrl,
+      datasetSourceName,
+      datasetSourceUrl,
+      datasetSourceCitation,
+      datasetUserPath,
+    } = getDatasetIdentity();
     const activeViewId = typeof state.getActiveViewId === 'function'
       ? state.getActiveViewId()
       : (typeof viewer.getFocusedViewId === 'function' ? viewer.getFocusedViewId() : LIVE_VIEW_ID);
@@ -271,9 +308,18 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
       },
       meta: {
         exportedAt: new Date().toISOString(),
+        exporter: {
+          name: 'Cellucid',
+          website: 'https://cellucid.com'
+        },
         datasetName,
         datasetId,
         sourceType,
+        datasetBaseUrl,
+        datasetSourceName,
+        datasetSourceUrl,
+        datasetSourceCitation,
+        datasetUserPath,
         fieldKey,
         fieldKind,
         viewId,

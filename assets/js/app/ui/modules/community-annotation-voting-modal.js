@@ -170,6 +170,119 @@ function formatRelativeTime(isoString) {
   }
 }
 
+function createDomId(prefix = 'id') {
+  const p = toCleanString(prefix) || 'id';
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return `${p}-${crypto.randomUUID()}`;
+    }
+  } catch {
+    // ignore
+  }
+  return `${p}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function listFocusableElements(root) {
+  const container = root || null;
+  if (!container || typeof container.querySelectorAll !== 'function') return [];
+  const selectors = [
+    'a[href]',
+    'area[href]',
+    'button:not([disabled])',
+    'input:not([disabled]):not([type="hidden"])',
+    'select:not([disabled])',
+    'textarea:not([disabled])',
+    '[contenteditable="true"]',
+    '[tabindex]:not([tabindex="-1"])'
+  ].join(',');
+  const nodes = Array.from(container.querySelectorAll(selectors));
+  return nodes.filter((node) => {
+    if (!(node instanceof HTMLElement)) return false;
+    try {
+      const style = window.getComputedStyle?.(node);
+      if (style?.display === 'none' || style?.visibility === 'hidden') return false;
+      return node.getClientRects().length > 0;
+    } catch {
+      return true;
+    }
+  });
+}
+
+function trapModalFocus({ overlay, modal, close, escCancelSelector = null } = {}) {
+  const o = overlay || null;
+  const m = modal || null;
+  if (!o || !m || typeof o.addEventListener !== 'function') return () => {};
+
+  const onKeyDown = (e) => {
+    if (!e) return;
+    if (e.key === 'Escape') {
+      try {
+        if (escCancelSelector) {
+          const target = e?.target || null;
+          if (target && typeof target.closest === 'function' && target.closest(escCancelSelector)) return;
+        }
+      } catch {
+        // ignore
+      }
+      try {
+        e.preventDefault?.();
+        e.stopPropagation?.();
+      } catch {
+        // ignore
+      }
+      close?.();
+      return;
+    }
+
+    if (e.key !== 'Tab') return;
+
+    const focusables = listFocusableElements(m);
+    if (!focusables.length) {
+      try {
+        e.preventDefault?.();
+      } catch {
+        // ignore
+      }
+      return;
+    }
+
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    const active = document.activeElement;
+    const containsActive = active && m.contains(active);
+
+    if (e.shiftKey) {
+      if (!containsActive || active === first) {
+        try {
+          e.preventDefault?.();
+          last.focus?.();
+        } catch {
+          // ignore
+        }
+      }
+      return;
+    }
+
+    if (!containsActive || active === last) {
+      try {
+        e.preventDefault?.();
+        first.focus?.();
+      } catch {
+        // ignore
+      }
+    }
+  };
+
+  o.addEventListener('keydown', onKeyDown, true);
+  return () => {
+    try {
+      o.removeEventListener('keydown', onKeyDown, true);
+    } catch {
+      // ignore
+    }
+  };
+}
+
 // =============================================================================
 // CAP Integration UI Components
 // =============================================================================
@@ -338,7 +451,11 @@ function showModal({ title, buildContent }) {
   const modal = el('div', { className: 'community-annotation-modal', role: 'document' });
 
   const header = el('div', { className: 'community-annotation-modal-header' });
-  header.appendChild(el('div', { className: 'community-annotation-modal-title', text: title || 'Community voting' }));
+  const titleEl = el('div', { className: 'community-annotation-modal-title', text: title || 'Community voting' });
+  const titleId = createDomId('community-annotation-voting-title');
+  titleEl.id = titleId;
+  overlay.setAttribute('aria-labelledby', titleId);
+  header.appendChild(titleEl);
   const closeBtn = el('button', { type: 'button', className: 'btn-small community-annotation-modal-close', text: 'Close' });
   header.appendChild(closeBtn);
 
@@ -349,18 +466,31 @@ function showModal({ title, buildContent }) {
   modal.appendChild(content);
   overlay.appendChild(modal);
 
-  const close = () => overlay.remove();
+  const prevFocus = document.activeElement;
+  let closed = false;
+  let cleanupTrap = null;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    try {
+      cleanupTrap?.();
+    } catch {
+      // ignore
+    }
+    overlay.remove();
+    try {
+      prevFocus?.focus?.();
+    } catch {
+      // ignore
+    }
+  };
   closeBtn.addEventListener('click', close);
   overlay.addEventListener('click', (e) => {
     if (e.target === overlay) close();
   });
-  const onKeyDown = (e) => {
-    if (e.key !== 'Escape') return;
-    close();
-  };
-  document.addEventListener('keydown', onKeyDown, { once: true });
 
   document.body.appendChild(overlay);
+  cleanupTrap = trapModalFocus({ overlay, modal, close });
   closeBtn.focus?.();
 
   return { close, overlay, modal, content };
@@ -553,7 +683,11 @@ function showSecondaryModal({ title, buildContent, session = null }) {
   const modal = el('div', { className: 'community-annotation-modal community-annotation-secondary-modal', role: 'document' });
 
   const header = el('div', { className: 'community-annotation-modal-header' });
-  header.appendChild(el('div', { className: 'community-annotation-modal-title', text: title || 'Details' }));
+  const titleEl = el('div', { className: 'community-annotation-modal-title', text: title || 'Details' });
+  const titleId = createDomId('community-annotation-secondary-title');
+  titleEl.id = titleId;
+  overlay.setAttribute('aria-labelledby', titleId);
+  header.appendChild(titleEl);
   const closeBtn = el('button', { type: 'button', className: 'btn-small community-annotation-modal-close', text: 'Close' });
   header.appendChild(closeBtn);
 
@@ -587,37 +721,18 @@ function showSecondaryModal({ title, buildContent, session = null }) {
     } catch {
       // ignore
     }
-    try {
-      document.removeEventListener('keydown', onKeyDown, true);
-    } catch {
-      // ignore
-    }
+    try { cleanupTrap?.(); } catch { /* ignore */ }
     overlay.remove();
     if (activeSecondaryModal?.close === close) activeSecondaryModal = null;
+    try { prevFocus?.focus?.(); } catch { /* ignore */ }
   };
 
   closeBtn.addEventListener('click', close);
   overlay.addEventListener('click', (e) => {
     if (e.target === overlay) close();
   });
-  const onKeyDown = (e) => {
-    if (e.key !== 'Escape') return;
-    try {
-      const target = e?.target || null;
-      if (target && typeof target.closest === 'function' && target.closest('[data-esc-cancel="true"]')) return;
-    } catch {
-      // ignore
-    }
-    try {
-      e.preventDefault?.();
-      e.stopPropagation?.();
-      e.stopImmediatePropagation?.();
-    } catch {
-      // ignore
-    }
-    close();
-  };
-  document.addEventListener('keydown', onKeyDown, true);
+  const prevFocus = document.activeElement;
+  const cleanupTrap = trapModalFocus({ overlay, modal, close, escCancelSelector: '[data-esc-cancel="true"]' });
 
   document.body.appendChild(overlay);
   closeBtn.focus?.();
@@ -1039,7 +1154,7 @@ function renderSuggestionCard({
 
     const input = el('textarea', {
       className: 'community-annotation-comment-bar',
-      placeholder: canInteract ? 'Write a comment and press Enter…' : 'Comments are read-only (closed by author).',
+      placeholder: canInteract ? 'Write a comment and press Enter…' : 'Comments are disabled (closed by author).',
       maxlength: '500',
       rows: '1',
       disabled: !canInteract
@@ -1332,7 +1447,7 @@ function buildVotingDetail({ session, fieldKey, catIdx }) {
   const isClosed = session.isFieldClosed?.(fieldKey) === true;
   const canInteract = !isClosed || access.isAuthor();
   if (isClosed && !access.isAuthor()) {
-    panel.appendChild(el('div', { className: 'legend-help', text: 'Closed by the author (read-only).' }));
+    panel.appendChild(el('div', { className: 'legend-help', text: 'Closed by the author (voting disabled).' }));
   }
 
   const consensusSettings = session.getAnnotatableConsensusSettings?.(fieldKey) || null;

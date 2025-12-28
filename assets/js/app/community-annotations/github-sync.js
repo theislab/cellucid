@@ -21,7 +21,7 @@ import {
 
 const GITHUB_DEFAULT_TIMEOUT_MS = 20_000;
 const DEFAULT_USER_PULL_CONCURRENCY = 8;
-const MAX_USER_FILES_PER_PULL = 2000;
+const MAX_TREE_ITEMS = 250_000;
 
 function toCleanString(value) {
   return String(value ?? '').trim();
@@ -136,6 +136,28 @@ function stableStringifyJson(value) {
   }
 }
 
+function assertSupportedUserFileSchema(schema, { path = 'annotations/schema.json' } = {}) {
+  const doc = (schema && typeof schema === 'object') ? schema : null;
+  if (!doc) throw new Error(`Invalid JSON schema at ${path}`);
+
+  const versionConst = doc?.properties?.version?.const;
+  const version = Number.isFinite(Number(versionConst)) ? Number(versionConst) : null;
+  if (version !== 1) {
+    throw new Error(
+      `Unsupported annotation user-file schema version in ${path}.\n` +
+      `Expected version=1 but got ${versionConst == null ? 'missing' : String(versionConst)}.`
+    );
+  }
+
+  const required = Array.isArray(doc?.required) ? doc.required.map((v) => toCleanString(v)).filter(Boolean) : [];
+  const req = new Set(required);
+  for (const key of ['version', 'username', 'githubUserId', 'updatedAt', 'suggestions', 'votes']) {
+    if (!req.has(key)) {
+      throw new Error(`Unsupported annotation user-file schema at ${path} (missing required field: ${key}).`);
+    }
+  }
+}
+
 function encodeBase64Utf8(text) {
   const s = toCleanString(text);
   const bytes = typeof TextEncoder !== 'undefined' ? new TextEncoder().encode(s) : null;
@@ -154,6 +176,37 @@ function decodeBase64Utf8(b64) {
     return new TextDecoder().decode(bytes);
   }
   return decodeURIComponent(escape(bin));
+}
+
+async function getGitTreeRecursive({ workerOrigin, owner, repo, token = null, ref }) {
+  const treeish = toCleanString(ref);
+  if (!treeish) throw new Error('Ref required');
+  const res = await githubRequest(
+    workerOrigin,
+    `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/trees/${encodeURIComponent(treeish)}`,
+    { token, query: { recursive: 1 } }
+  );
+  const list = Array.isArray(res?.tree) ? res.tree : null;
+  if (!list) throw new Error('Expected git tree listing');
+  // Hard cap to avoid pathological repos freezing the browser.
+  return list.slice(0, MAX_TREE_ITEMS);
+}
+
+async function getGitBlobJson({ workerOrigin, owner, repo, token = null, sha }) {
+  const s = toCleanString(sha);
+  if (!s) throw new Error('Blob sha required');
+  const res = await githubRequest(
+    workerOrigin,
+    `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/blobs/${encodeURIComponent(s)}`,
+    { token }
+  );
+  const encoding = toCleanString(res?.encoding || '');
+  const content = toCleanString(res?.content || '');
+  if (!content) throw new Error('Empty blob content');
+  const decoded = encoding.toLowerCase() === 'base64' ? decodeBase64Utf8(content) : content;
+  const parsed = safeJsonParse(decoded);
+  if (!parsed) throw new Error('Invalid JSON');
+  return parsed;
 }
 
 function sleep(ms) {
@@ -186,6 +239,8 @@ export function parseOwnerRepo(input) {
 
   /** @type {string|null} */
   let ref = null;
+  /** @type {string|null} */
+  let treeRefPath = null;
 
   let cleaned = raw
     .replace(/^https?:\/\/github\.com\//i, '')
@@ -193,14 +248,22 @@ export function parseOwnerRepo(input) {
     .replace(/^git@github\.com:/i, '')
     .replace(/^\/+|\/+$/g, '');
 
+  // Drop query params for URL pastes (e.g. "...?tab=readme").
+  const qIdx = cleaned.indexOf('?');
+  if (qIdx >= 0) cleaned = cleaned.slice(0, qIdx);
+
   // Support ".../owner/repo.git"
   cleaned = cleaned.replace(/\.git$/i, '');
 
   // Support ".../owner/repo/tree/branch[/...]" links.
-  const treeMatch = cleaned.match(/^([^/]+\/[^/]+)\/tree\/([^/]+)(?:\/.*)?$/i);
+  // Note: branch names can include slashes, so we capture the entire tail after `/tree/`.
+  const treeMatch = cleaned.match(/^([^/]+\/[^/]+)\/tree\/(.+)$/i);
   if (treeMatch) {
     cleaned = treeMatch[1];
-    ref = toCleanString(treeMatch[2]) || null;
+    treeRefPath = toCleanString(treeMatch[2]) || null;
+    // Keep the full tree ref+path tail (may include path segments). We resolve it to a real branch
+    // during connect by probing for the required template files (schema/config).
+    ref = treeRefPath;
   }
 
   // Support "owner/repo@branch" and "owner/repo#branch"
@@ -228,13 +291,13 @@ export function parseOwnerRepo(input) {
 
   if (ref) {
     // Branch names can include slashes; keep validation permissive while preventing obviously invalid input.
-    const refOk = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/.test(ref);
+    const refOk = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,1023}$/.test(ref);
     if (!refOk) ref = null;
   }
 
   const ownerRepo = `${owner}/${repo}`;
   const ownerRepoRef = ref ? `${ownerRepo}@${ref}` : ownerRepo;
-  return { owner, repo, ownerRepo, ref, ownerRepoRef };
+  return { owner, repo, ownerRepo, ref, ownerRepoRef, treeRefPath };
 }
 
 function sanitizeUserKeyForPath(userKey) {
@@ -257,11 +320,34 @@ function sanitizeBranchPart(value, { maxLen = 40 } = {}) {
   return cleaned || 'default';
 }
 
+function fnv1aHash32(input) {
+  const str = String(input ?? '');
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    hash ^= str.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+function encodeGitRefPath(ref) {
+  const raw = toCleanString(ref);
+  if (!raw) return '';
+  return raw.split('/').map((p) => encodeURIComponent(p)).join('/');
+}
+
 function toDeterministicPrBranch({ datasetId, baseBranch, fileUser }) {
-  const did = sanitizeBranchPart(datasetId || 'default', { maxLen: 32 });
-  const base = sanitizeBranchPart(baseBranch || 'main', { maxLen: 32 });
-  const user = sanitizeBranchPart(fileUser || 'local', { maxLen: 48 });
-  return `cellucid-annotations/${did}/${base}/${user}`;
+  const didRaw = toCleanString(datasetId || 'default') || 'default';
+  const baseRaw = toCleanString(baseBranch || 'main') || 'main';
+  const userRaw = toCleanString(fileUser || 'local') || 'local';
+
+  const did = sanitizeBranchPart(didRaw, { maxLen: 32 });
+  const base = sanitizeBranchPart(baseRaw, { maxLen: 32 });
+  const user = sanitizeBranchPart(userRaw, { maxLen: 48 });
+
+  // Avoid collisions from truncation/normalization by suffixing a stable hash.
+  const fingerprint = fnv1aHash32(`${didRaw}::${baseRaw}::${userRaw}`).toString(36);
+  return `cellucid-annotations/${did}/${base}/${user}-${fingerprint}`;
 }
 
 function toWorkerApiUrl(workerOrigin, githubPath) {
@@ -434,6 +520,40 @@ async function putContent({ workerOrigin, owner, repo, token, path, branch, mess
   );
 }
 
+function isWriteDeniedError(err) {
+  const status = err?.status;
+  return status === 401 || status === 403;
+}
+
+function isProtectedBranchError(err) {
+  const msg = toCleanString(err?.message || '').toLowerCase();
+  if (!msg) return false;
+  return (
+    msg.includes('protected branch') ||
+    msg.includes('branch protection') ||
+    msg.includes('protected branch hook declined') ||
+    msg.includes('pushes to this branch are restricted') ||
+    msg.includes('required pull request') ||
+    msg.includes('required status checks') ||
+    msg.includes('required reviews')
+  );
+}
+
+function isShaMismatchError(err) {
+  const status = err?.status;
+  const msg = toCleanString(err?.message || '').toLowerCase();
+  if (status === 422) {
+    // GitHub often reports sha mismatches / missing sha as 422 with message containing "sha".
+    // Avoid treating protected-branch failures as sha mismatches.
+    if (isProtectedBranchError(err)) return false;
+    return msg.includes('sha');
+  }
+  if (status !== 409) return false;
+  // 409 can be used for non-sha errors (e.g., protected branch update failures).
+  if (isProtectedBranchError(err)) return false;
+  return msg.includes('sha') || msg.includes('does not match') || msg.includes('was not supplied') || msg.includes("wasn't supplied");
+}
+
 async function putContentWithRetry({
   workerOrigin,
   owner,
@@ -454,7 +574,8 @@ async function putContentWithRetry({
       return await putContent({ workerOrigin, owner, repo, token, path, branch, message, contentBase64, sha: nextSha });
     } catch (err) {
       // Resolve rare sha mismatch races (concurrent writes).
-      if (err?.status !== 409 || attempt === max - 1) throw err;
+      const isShaMismatch = isShaMismatchError(err);
+      if (!isShaMismatch || attempt === max - 1) throw err;
       const ref = toCleanString(refForRefresh) || toCleanString(branch) || null;
       const existing = await getContent({ workerOrigin, owner, repo, token, path, ref });
       nextSha = existing?.type === 'file' ? toCleanString(existing?.sha || '') || null : null;
@@ -610,6 +731,258 @@ async function ensureForkRepo({ workerOrigin, upstreamOwner, upstreamRepo, token
   );
 }
 
+async function getBranchTipShaOrNull({ workerOrigin, owner, repo, token, branch }) {
+  const b = toCleanString(branch);
+  if (!b) return null;
+  try {
+    const ref = await githubRequest(
+      workerOrigin,
+      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/ref/heads/${encodeGitRefPath(b)}`,
+      { token }
+    );
+    return toCleanString(ref?.object?.sha || '') || null;
+  } catch (err) {
+    if (err?.status === 404) return null;
+    throw err;
+  }
+}
+
+async function ensureBranchExists({ workerOrigin, owner, repo, token, branch, baseSha }) {
+  const b = toCleanString(branch);
+  if (!b) throw new Error('PR branch required');
+  const sha = toCleanString(baseSha);
+  if (!sha) throw new Error('Unable to determine base SHA for PR branch');
+  try {
+    await githubRequest(
+      workerOrigin,
+      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/ref/heads/${encodeGitRefPath(b)}`,
+      { token }
+    );
+    return;
+  } catch (err) {
+    if (err?.status !== 404) throw err;
+  }
+  try {
+    await githubRequest(workerOrigin, `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/refs`, {
+      token,
+      method: 'POST',
+      body: { ref: `refs/heads/${b}`, sha }
+    });
+  } catch (err) {
+    // If another publish created it concurrently, proceed.
+    if (err?.status !== 422) throw err;
+  }
+}
+
+async function upsertFileOnBranch({ workerOrigin, owner, repo, token, branch, path, message, contentBase64 }) {
+  const b = toCleanString(branch);
+  if (!b) throw new Error('branch required');
+  const p = toCleanString(path).replace(/^\/+/, '');
+  if (!p) throw new Error('path required');
+
+  let sha = null;
+  try {
+    const existing = await getContent({ workerOrigin, owner, repo, token, path: p, ref: b });
+    if (existing?.type === 'file') sha = toCleanString(existing?.sha || '') || null;
+  } catch (err) {
+    if (err?.status !== 404) throw err;
+  }
+
+  await putContentWithRetry({
+    workerOrigin,
+    owner,
+    repo,
+    token,
+    path: p,
+    branch: b,
+    message,
+    contentBase64,
+    sha,
+    refForRefresh: b
+  });
+}
+
+function formatPullRequestHeadForCreate({ upstreamOwner, headOwner, headBranch }) {
+  const u = toCleanString(upstreamOwner).toLowerCase();
+  const h = toCleanString(headOwner).toLowerCase();
+  const b = toCleanString(headBranch);
+  if (!b) throw new Error('headBranch required');
+  return u && h && u === h ? b : `${toCleanString(headOwner)}:${b}`;
+}
+
+async function openOrReusePullRequest({
+  workerOrigin,
+  token,
+  upstreamOwner,
+  upstreamRepo,
+  baseBranch,
+  headOwner,
+  headRepo,
+  headBranch,
+  title,
+  body
+}) {
+  const headQuery = `${toCleanString(headOwner)}:${toCleanString(headBranch)}`;
+
+  // If an open PR already exists for this head/base, reuse it (avoids PR spam).
+  try {
+    const existing = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/pulls`, {
+      token,
+      query: { state: 'open', head: headQuery, base: baseBranch, per_page: 5 }
+    });
+    const pr0 = Array.isArray(existing) ? existing[0] : null;
+    if (pr0) return { pr: pr0, reused: true };
+  } catch {
+    // ignore and fall through to creating a PR
+  }
+
+  const prBody = toCleanString(body);
+  const headCreate = formatPullRequestHeadForCreate({ upstreamOwner, headOwner, headBranch });
+
+  let pr = null;
+  let reused = false;
+  try {
+    pr = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/pulls`, {
+      token,
+      method: 'POST',
+      body: {
+        title: toCleanString(title) || 'Update annotations',
+        head: headCreate,
+        base: baseBranch,
+        body: prBody || undefined,
+        maintainer_can_modify: true
+      }
+    });
+  } catch (err) {
+    // GitHub returns 422 if a PR already exists for this head/base (sometimes even if closed).
+    if (err?.status !== 422) throw err;
+    try {
+      const prs = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/pulls`, {
+        token,
+        query: { state: 'all', head: headQuery, base: baseBranch, per_page: 10 }
+      });
+      const list = Array.isArray(prs) ? prs : [];
+      const existing = list.find((p) => p && p.number) || null;
+      if (!existing) throw err;
+      reused = true;
+
+      const mergedAt = toCleanString(existing?.merged_at || '');
+      if (existing?.state === 'closed' && mergedAt) {
+        reused = false;
+        const ref = await githubRequest(
+          workerOrigin,
+          `/repos/${encodeURIComponent(headOwner)}/${encodeURIComponent(headRepo)}/git/ref/heads/${encodeGitRefPath(headBranch)}`,
+          { token }
+        );
+        const headSha = toCleanString(ref?.object?.sha || '') || null;
+        if (!headSha) throw err;
+
+        let alt = null;
+        for (let attempt = 0; attempt < 5; attempt++) {
+          const suffix = `${Date.now().toString(36)}${attempt ? `_${attempt}` : ''}`;
+          alt = `${toCleanString(headBranch)}-${suffix}`;
+          try {
+            await githubRequest(workerOrigin, `/repos/${encodeURIComponent(headOwner)}/${encodeURIComponent(headRepo)}/git/refs`, {
+              token,
+              method: 'POST',
+              body: { ref: `refs/heads/${alt}`, sha: headSha }
+            });
+            break;
+          } catch (createErr) {
+            if (createErr?.status !== 422 || attempt === 4) throw createErr;
+          }
+        }
+
+        const headAlt = formatPullRequestHeadForCreate({ upstreamOwner, headOwner, headBranch: alt });
+        pr = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/pulls`, {
+          token,
+          method: 'POST',
+          body: {
+            title: toCleanString(title) || 'Update annotations',
+            head: headAlt,
+            base: baseBranch,
+            body: prBody || undefined,
+            maintainer_can_modify: true
+          }
+        });
+      } else if (existing?.state === 'closed') {
+        try {
+          pr = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/pulls/${encodeURIComponent(existing.number)}`, {
+            token,
+            method: 'PATCH',
+            body: { state: 'open' }
+          });
+        } catch {
+          // If reopen fails (permissions), still return the existing PR link so the user can act.
+          pr = existing;
+        }
+      } else {
+        pr = existing;
+      }
+    } catch (fallbackErr) {
+      throw fallbackErr || err;
+    }
+  }
+
+  return { pr, reused };
+}
+
+async function publishFileViaPullRequest({
+  workerOrigin,
+  token,
+  upstreamOwner,
+  upstreamRepo,
+  baseBranch,
+  headOwner,
+  headRepo,
+  headBranch,
+  path,
+  title,
+  body,
+  contentBase64
+}) {
+  const upstreamSha = await getBranchTipShaOrNull({ workerOrigin, owner: upstreamOwner, repo: upstreamRepo, token, branch: baseBranch });
+
+  let baseSha = upstreamSha;
+  if (!baseSha) {
+    const headInfo = await getRepoInfo({ workerOrigin, owner: headOwner, repo: headRepo, token });
+    const fallback = toCleanString(headInfo?.default_branch || '') || 'main';
+    baseSha = await getBranchTipShaOrNull({ workerOrigin, owner: headOwner, repo: headRepo, token, branch: fallback });
+  }
+  if (!baseSha) throw new Error('Unable to determine base SHA for PR branch');
+
+  await ensureBranchExists({ workerOrigin, owner: headOwner, repo: headRepo, token, branch: headBranch, baseSha });
+  await upsertFileOnBranch({
+    workerOrigin,
+    owner: headOwner,
+    repo: headRepo,
+    token,
+    branch: headBranch,
+    path,
+    message: title,
+    contentBase64
+  });
+
+  const { pr, reused } = await openOrReusePullRequest({
+    workerOrigin,
+    token,
+    upstreamOwner,
+    upstreamRepo,
+    baseBranch,
+    headOwner,
+    headRepo,
+    headBranch,
+    title,
+    body
+  });
+
+  return {
+    prUrl: toCleanString(pr?.html_url || '') || null,
+    prNumber: pr?.number ?? null,
+    reused
+  };
+}
+
 export class CommunityAnnotationGitHubSync {
   constructor({ datasetId, owner, repo, token = null, branch = null, workerOrigin = null } = {}) {
     this.datasetId = toCleanString(datasetId) || null;
@@ -619,8 +992,6 @@ export class CommunityAnnotationGitHubSync {
     this.branch = branch;
     this.workerOrigin = toCleanString(workerOrigin) || getGitHubWorkerOrigin();
 
-    this._usersDirEntries = null;
-    this._usersDirRef = null;
     this._schemaCheckedRef = null;
     this._repoInfo = null;
   }
@@ -635,21 +1006,38 @@ export class CommunityAnnotationGitHubSync {
     const workerOrigin = this.workerOrigin;
     const repoInfo = await getRepoInfo({ workerOrigin, owner: this.owner, repo: this.repo, token });
     this._repoInfo = repoInfo || null;
-    const branch = this.branch || repoInfo?.default_branch || 'main';
+    let branch = this.branch || repoInfo?.default_branch || 'main';
+
+    // If the branch came from a GitHub "/tree/<ref>/path" paste, it may include extra path segments
+    // (and ref names can include slashes). Resolve the actual branch by probing git refs.
+    if (branch && branch.includes('/')) {
+      try {
+        const resolved = await this.resolveBranchFromTreeRefPath(branch);
+        if (resolved) branch = resolved;
+      } catch {
+        // ignore and fall through to normal validation (which will surface a clear error)
+      }
+    }
+
     this.branch = branch;
 
     // Basic structural checks expected by the template.
-    // (Public repos may be rate-limited without a token; errors are surfaced to the caller.)
-    if (!this._usersDirEntries || this._usersDirRef !== branch) {
-      this._usersDirEntries = await listDir({ workerOrigin, owner: this.owner, repo: this.repo, token, path: 'annotations/users', ref: branch });
-      this._usersDirRef = branch;
-    }
+    // Note: we intentionally avoid listing `annotations/users/` via the Contents API because
+    // large directories can fail or be truncated; `pullAllUsers()` uses the git tree API.
     if (this._schemaCheckedRef !== branch) {
-      await readJsonFile({ workerOrigin, owner: this.owner, repo: this.repo, token, path: 'annotations/schema.json', ref: branch });
+      const { json: schema } = await readJsonFile({
+        workerOrigin,
+        owner: this.owner,
+        repo: this.repo,
+        token,
+        path: 'annotations/schema.json',
+        ref: branch
+      });
+      assertSupportedUserFileSchema(schema, { path: 'annotations/schema.json' });
       this._schemaCheckedRef = branch;
     }
 
-    const { json: config } = await readJsonFile({
+    const { json: config, sha: configSha } = await readJsonFile({
       workerOrigin,
       owner: this.owner,
       repo: this.repo,
@@ -664,7 +1052,38 @@ export class CommunityAnnotationGitHubSync {
       ? supported.find((d) => toCleanString(d?.datasetId) === targetDatasetId) || null
       : null;
 
-    return { repoInfo, branch, config, datasetId: targetDatasetId, datasetConfig: match };
+    return { repoInfo, branch, config, configSha: configSha || null, datasetId: targetDatasetId, datasetConfig: match };
+  }
+
+  async resolveBranchFromTreeRefPath(treeRefPath, { maxSegments = 40 } = {}) {
+    const token = this.token;
+    if (!token) throw new Error('GitHub sign-in required');
+
+    const raw = toCleanString(treeRefPath);
+    if (!raw) return null;
+
+    const parts = raw.split('/').map((s) => toCleanString(s)).filter(Boolean);
+    if (!parts.length) return null;
+
+    const cap = Math.max(1, Math.min(parts.length, Math.floor(Number(maxSegments) || 12)));
+    const workerOrigin = this.workerOrigin;
+
+    for (let n = cap; n >= 1; n--) {
+      const candidate = parts.slice(0, n).join('/');
+      try {
+        await githubRequest(
+          workerOrigin,
+          `/repos/${encodeURIComponent(this.owner)}/${encodeURIComponent(this.repo)}/git/ref/${encodeGitRefPath(`heads/${candidate}`)}`,
+          { token }
+        );
+        return candidate;
+      } catch (err) {
+        if (err?.status === 404) continue;
+        throw err;
+      }
+    }
+
+    return null;
   }
 
   async readRepoConfigJson() {
@@ -681,7 +1100,15 @@ export class CommunityAnnotationGitHubSync {
     });
   }
 
-  async updateDatasetFieldsToAnnotate({ datasetId, fieldsToAnnotate, annotatableSettings = null, closedFields = null, commitMessage = null } = {}) {
+  async updateDatasetFieldsToAnnotate({
+    datasetId,
+    fieldsToAnnotate,
+    annotatableSettings = null,
+    closedFields = null,
+    commitMessage = null,
+    conflictIfRemoteShaNotEqual = null,
+    force = false
+  } = {}) {
     const token = this.token;
     if (!token) throw new Error('GitHub sign-in required');
 
@@ -700,19 +1127,21 @@ export class CommunityAnnotationGitHubSync {
           .slice(0, 200)
       : [];
 
-      const cleanSettings = (settings) => {
-        const input = (settings && typeof settings === 'object') ? settings : {};
-        const out = {};
-        for (const [fieldKey, raw] of Object.entries(input)) {
-          const k = toCleanString(fieldKey);
-          if (!k) continue;
-          const minAnnotators = Number.isFinite(Number(raw?.minAnnotators)) ? Math.max(0, Math.min(50, Math.floor(Number(raw.minAnnotators)))) : 1;
-          const thresholdRaw = Number(raw?.threshold);
-          const threshold = Number.isFinite(thresholdRaw) ? Math.max(-1, Math.min(1, thresholdRaw)) : 0.5;
-          out[k] = { minAnnotators, threshold };
-        }
-        return out;
-      };
+    const cleanSettings = (settings) => {
+      const input = (settings && typeof settings === 'object') ? settings : {};
+      const out = {};
+      for (const [fieldKey, raw] of Object.entries(input)) {
+        const k = toCleanString(fieldKey);
+        if (!k) continue;
+        const minAnnotators = Number.isFinite(Number(raw?.minAnnotators))
+          ? Math.max(0, Math.min(50, Math.floor(Number(raw.minAnnotators))))
+          : 1;
+        const thresholdRaw = Number(raw?.threshold);
+        const threshold = Number.isFinite(thresholdRaw) ? Math.max(-1, Math.min(1, thresholdRaw)) : 0.5;
+        out[k] = { minAnnotators, threshold };
+      }
+      return out;
+    };
 
     const cleanClosed = (values) => {
       const input = Array.isArray(values) ? values : [];
@@ -732,112 +1161,203 @@ export class CommunityAnnotationGitHubSync {
 
     const msg = toCleanString(commitMessage) || `Update annotatable fields for ${did}`;
 
-    // Concurrency-safe: rebase onto the latest config on 409, preserving other authors' edits.
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const { json: current, sha } = await readJsonFileOrNull({
+    const expectedSha = toCleanString(conflictIfRemoteShaNotEqual) || null;
+
+    const { json: current, sha } = await readJsonFileOrNull({
+      workerOrigin: this.workerOrigin,
+      owner: this.owner,
+      repo: this.repo,
+      token,
+      path: 'annotations/config.json',
+      ref: branch
+    });
+
+    if (!force) {
+      if (!expectedSha) {
+        const err = new Error(
+          'Missing baseline version for annotations/config.json.\n' +
+          'Pull first to load the latest config, then Publish again.'
+        );
+        err.code = 'COMMUNITY_ANNOTATION_CONFLICT';
+        err.path = 'annotations/config.json';
+        err.remoteSha = sha || null;
+        err.expectedSha = null;
+        throw err;
+      }
+      if (sha !== expectedSha) {
+        const err = new Error(
+          'annotations/config.json changed since your last Pull.\n' +
+          'Pull first to review/merge the latest settings, then Publish again.'
+        );
+        err.code = 'COMMUNITY_ANNOTATION_CONFLICT';
+        err.path = 'annotations/config.json';
+        err.remoteSha = sha || null;
+        err.expectedSha = expectedSha;
+        throw err;
+      }
+    }
+
+    const nextConfig = (current && typeof current === 'object')
+      ? { ...current }
+      : { version: 1, supportedDatasets: [] };
+    if (!Array.isArray(nextConfig.supportedDatasets)) nextConfig.supportedDatasets = [];
+
+    let found = false;
+    nextConfig.supportedDatasets = nextConfig.supportedDatasets.map((d) => {
+      if (!d || typeof d !== 'object') return d;
+      const dId = toCleanString(d.datasetId);
+      if (dId !== did) return d;
+      found = true;
+      const next = { ...d, fieldsToAnnotate: cleanedFields };
+      if (annotatableSettings != null) {
+        const merged = { ...cleanSettings(d.annotatableSettings), ...settingsMap };
+        const pruned = {};
+        for (const k of cleanedFields) {
+          if (merged[k]) pruned[k] = merged[k];
+        }
+        next.annotatableSettings = pruned;
+      }
+      if (closedFields != null) {
+        const merged = uniqueStrings(cleanClosed(d.closedFields).concat(cleanClosed(closedFields)));
+        next.closedFields = merged.filter((k) => cleanedFields.includes(k)).slice(0, 500);
+      }
+      return next;
+    });
+
+    if (!found) {
+      const pruned = {};
+      for (const k of cleanedFields) {
+        if (settingsMap[k]) pruned[k] = settingsMap[k];
+      }
+      const prunedClosed = closedFields != null
+        ? cleanClosed(closedFields).filter((k) => cleanedFields.includes(k)).slice(0, 500)
+        : undefined;
+      nextConfig.supportedDatasets = nextConfig.supportedDatasets.concat([
+        {
+          datasetId: did,
+          name: did,
+          fieldsToAnnotate: cleanedFields,
+          ...(annotatableSettings != null ? { annotatableSettings: pruned } : {}),
+          ...(closedFields != null ? { closedFields: prunedClosed } : {})
+        }
+      ]);
+    }
+
+    // Avoid no-op commits: compare semantic JSON ignoring key order.
+    if (current && typeof current === 'object') {
+      const changed = stableStringifyJson(current) !== stableStringifyJson(nextConfig);
+      if (!changed) {
+        const retSettings = {};
+        for (const k of cleanedFields) {
+          if (settingsMap[k]) retSettings[k] = settingsMap[k];
+        }
+        const retClosed = closedFields != null
+          ? cleanClosed(closedFields).filter((k) => cleanedFields.includes(k)).slice(0, 500)
+          : [];
+        return {
+          branch,
+          path: 'annotations/config.json',
+          sha: sha || null,
+          datasetId: did,
+          fieldsToAnnotate: cleanedFields,
+          annotatableSettings: retSettings,
+          closedFields: retClosed,
+          changed: false
+        };
+      }
+    }
+
+    const contentBase64 = encodeBase64Utf8(JSON.stringify(nextConfig, null, 2) + '\n');
+    try {
+      const res = await putContent({
         workerOrigin: this.workerOrigin,
         owner: this.owner,
         repo: this.repo,
         token,
         path: 'annotations/config.json',
-        ref: branch
+        branch,
+        message: msg,
+        contentBase64,
+        sha
+      });
+      const newSha = toCleanString(res?.content?.sha || res?.sha || '') || null;
+      const retSettings = {};
+      for (const k of cleanedFields) {
+        if (settingsMap[k]) retSettings[k] = settingsMap[k];
+      }
+      return {
+        mode: 'push',
+        branch,
+        path: 'annotations/config.json',
+        sha: newSha,
+        datasetId: did,
+        fieldsToAnnotate: cleanedFields,
+        annotatableSettings: retSettings,
+        closedFields: closedFields != null ? cleanClosed(closedFields).filter((k) => cleanedFields.includes(k)).slice(0, 500) : [],
+        changed: true
+      };
+    } catch (err) {
+      if (!force && isShaMismatchError(err)) {
+        const conflict = new Error(
+          'annotations/config.json changed while publishing.\n' +
+          'Pull first to review/merge the latest settings, then Publish again.'
+        );
+        conflict.code = 'COMMUNITY_ANNOTATION_CONFLICT';
+        conflict.path = 'annotations/config.json';
+        throw conflict;
+      }
+
+      if (!(isWriteDeniedError(err) || isProtectedBranchError(err))) throw err;
+
+      const me = await workerAuthRequest(this.workerOrigin, '/auth/user', { token });
+      const meLogin = toCleanString(me?.login || '');
+      if (!meLogin) throw err;
+
+      const prBranch = toDeterministicPrBranch({ datasetId: did, baseBranch: branch, fileUser: `${meLogin}-config` });
+      const prBody = [
+        'Automated community annotation config update from Cellucid.',
+        '',
+        `User: @${meLogin}`,
+        'File: `annotations/config.json`'
+      ].join('\n');
+
+      const prRes = await publishFileViaPullRequest({
+        workerOrigin: this.workerOrigin,
+        token,
+        upstreamOwner: this.owner,
+        upstreamRepo: this.repo,
+        baseBranch: branch,
+        headOwner: this.owner,
+        headRepo: this.repo,
+        headBranch: prBranch,
+        path: 'annotations/config.json',
+        title: msg,
+        body: prBody,
+        contentBase64
       });
 
-      const nextConfig = (current && typeof current === 'object')
-        ? { ...current }
-        : { version: 1, supportedDatasets: [] };
-      if (!Array.isArray(nextConfig.supportedDatasets)) nextConfig.supportedDatasets = [];
-
-      let found = false;
-      nextConfig.supportedDatasets = nextConfig.supportedDatasets.map((d) => {
-        if (!d || typeof d !== 'object') return d;
-        const dId = toCleanString(d.datasetId);
-        if (dId !== did) return d;
-        found = true;
-        const next = { ...d, fieldsToAnnotate: cleanedFields };
-        if (annotatableSettings != null) {
-          const merged = { ...cleanSettings(d.annotatableSettings), ...settingsMap };
-          const pruned = {};
-          for (const k of cleanedFields) {
-            if (merged[k]) pruned[k] = merged[k];
-          }
-          next.annotatableSettings = pruned;
-        }
-        if (closedFields != null) {
-          const merged = uniqueStrings(cleanClosed(d.closedFields).concat(cleanClosed(closedFields)));
-          next.closedFields = merged.filter((k) => cleanedFields.includes(k)).slice(0, 500);
-        }
-        return next;
-      });
-
-      if (!found) {
-        const pruned = {};
-        for (const k of cleanedFields) {
-          if (settingsMap[k]) pruned[k] = settingsMap[k];
-        }
-        const prunedClosed = closedFields != null
-          ? cleanClosed(closedFields).filter((k) => cleanedFields.includes(k)).slice(0, 500)
-          : undefined;
-        nextConfig.supportedDatasets = nextConfig.supportedDatasets.concat([
-          {
-            datasetId: did,
-            name: did,
-            fieldsToAnnotate: cleanedFields,
-            ...(annotatableSettings != null ? { annotatableSettings: pruned } : {}),
-            ...(closedFields != null ? { closedFields: prunedClosed } : {})
-          }
-        ]);
+      const retSettings = {};
+      for (const k of cleanedFields) {
+        if (settingsMap[k]) retSettings[k] = settingsMap[k];
       }
 
-      // Avoid no-op commits: compare semantic JSON ignoring key order.
-      if (current && typeof current === 'object') {
-        const changed = stableStringifyJson(current) !== stableStringifyJson(nextConfig);
-        if (!changed) {
-          const retSettings = {};
-          for (const k of cleanedFields) {
-            if (settingsMap[k]) retSettings[k] = settingsMap[k];
-          }
-          const retClosed = closedFields != null
-            ? cleanClosed(closedFields).filter((k) => cleanedFields.includes(k)).slice(0, 500)
-            : [];
-          return {
-            branch,
-            datasetId: did,
-            fieldsToAnnotate: cleanedFields,
-            annotatableSettings: retSettings,
-            closedFields: retClosed,
-            changed: false
-          };
-        }
-      }
-
-      const contentBase64 = encodeBase64Utf8(JSON.stringify(nextConfig, null, 2) + '\n');
-      try {
-        await putContent({
-          workerOrigin: this.workerOrigin,
-          owner: this.owner,
-          repo: this.repo,
-          token,
-          path: 'annotations/config.json',
-          branch,
-          message: msg,
-          contentBase64,
-          sha
-        });
-        break;
-      } catch (err) {
-        if (err?.status !== 409 || attempt === 2) throw err;
-      }
+      return {
+        mode: 'pr',
+        branch,
+        path: 'annotations/config.json',
+        sha: sha || null,
+        datasetId: did,
+        fieldsToAnnotate: cleanedFields,
+        annotatableSettings: retSettings,
+        closedFields: closedFields != null ? cleanClosed(closedFields).filter((k) => cleanedFields.includes(k)).slice(0, 500) : [],
+        changed: true,
+        prUrl: prRes?.prUrl || null,
+        prNumber: prRes?.prNumber ?? null,
+        reused: Boolean(prRes?.reused)
+      };
     }
 
-    const retSettings = {};
-    for (const k of cleanedFields) {
-      if (settingsMap[k]) retSettings[k] = settingsMap[k];
-    }
-    const retClosed = closedFields != null
-      ? cleanClosed(closedFields).filter((k) => cleanedFields.includes(k)).slice(0, 500)
-      : [];
-    return { branch, datasetId: did, fieldsToAnnotate: cleanedFields, annotatableSettings: retSettings, closedFields: retClosed, changed: true };
+    // Unreachable (returns above).
   }
 
   async pullModerationMerges({ knownShas = null } = {}) {
@@ -888,7 +1408,7 @@ export class CommunityAnnotationGitHubSync {
     }
   }
 
-  async pushModerationMerges({ mergesDoc, commitMessage = null } = {}) {
+  async pushModerationMerges({ mergesDoc, commitMessage = null, conflictIfRemoteShaNotEqual = null, force = false } = {}) {
     const token = this.token;
     if (!token) throw new Error('GitHub sign-in required');
 
@@ -904,47 +1424,122 @@ export class CommunityAnnotationGitHubSync {
     const msg = toCleanString(commitMessage) || 'Update annotation moderation merges';
     const incoming = normalizeModerationMergesDoc(mergesDoc && typeof mergesDoc === 'object' ? mergesDoc : {});
 
-    // Concurrency-safe: retry with latest sha on 409.
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const { json: current, sha } = await readJsonFileOrNull({
+    const expectedSha = toCleanString(conflictIfRemoteShaNotEqual) || null;
+
+    const { json: current, sha } = await readJsonFileOrNull({
+      workerOrigin: this.workerOrigin,
+      owner: this.owner,
+      repo: this.repo,
+      token,
+      path: 'annotations/moderation/merges.json',
+      ref: branch
+    });
+
+    if (!force) {
+      // If the remote file exists, require a baseline SHA from the last Pull to avoid overwrites.
+      if (!expectedSha && sha) {
+        const err = new Error(
+          'Missing baseline version for annotations/moderation/merges.json.\n' +
+          'Pull first to load the latest merges, then Publish again.'
+        );
+        err.code = 'COMMUNITY_ANNOTATION_CONFLICT';
+        err.path = 'annotations/moderation/merges.json';
+        err.remoteSha = sha || null;
+        err.expectedSha = null;
+        throw err;
+      }
+      if (expectedSha && sha !== expectedSha) {
+        const err = new Error(
+          'annotations/moderation/merges.json changed since your last Pull.\n' +
+          'Pull first to review the latest merges, then Publish again.'
+        );
+        err.code = 'COMMUNITY_ANNOTATION_CONFLICT';
+        err.path = 'annotations/moderation/merges.json';
+        err.remoteSha = sha || null;
+        err.expectedSha = expectedSha;
+        throw err;
+      }
+    }
+
+    const currentNorm = (current && typeof current === 'object') ? normalizeModerationMergesDoc(current) : null;
+    const currentComparable = currentNorm ? { version: 1, merges: Array.isArray(currentNorm?.merges) ? currentNorm.merges : [] } : null;
+    const nextComparable = { version: 1, merges: Array.isArray(incoming?.merges) ? incoming.merges : [] };
+    const changed = stableStringifyJson(currentComparable) !== stableStringifyJson(nextComparable);
+    if (!changed) {
+      return { branch, path: 'annotations/moderation/merges.json', sha: sha || null, changed: false };
+    }
+
+    const docToWrite = { version: 1, updatedAt: nowIso(), merges: nextComparable.merges };
+    const contentBase64 = encodeBase64Utf8(JSON.stringify(docToWrite, null, 2) + '\n');
+    try {
+      const res = await putContent({
         workerOrigin: this.workerOrigin,
         owner: this.owner,
         repo: this.repo,
         token,
         path: 'annotations/moderation/merges.json',
-        ref: branch
+        branch,
+        message: msg,
+        contentBase64,
+        sha
+      });
+      const newSha = toCleanString(res?.content?.sha || res?.sha || '') || null;
+      return { mode: 'push', branch, path: 'annotations/moderation/merges.json', sha: newSha, changed: true };
+    } catch (err) {
+      if (!force && isShaMismatchError(err)) {
+        const conflict = new Error(
+          'annotations/moderation/merges.json changed while publishing.\n' +
+          'Pull first to review the latest merges, then Publish again.'
+        );
+        conflict.code = 'COMMUNITY_ANNOTATION_CONFLICT';
+        conflict.path = 'annotations/moderation/merges.json';
+        throw conflict;
+      }
+
+      if (!(isWriteDeniedError(err) || isProtectedBranchError(err))) throw err;
+
+      const me = await workerAuthRequest(this.workerOrigin, '/auth/user', { token });
+      const meLogin = toCleanString(me?.login || '');
+      if (!meLogin) throw err;
+
+      const prBranch = toDeterministicPrBranch({
+        datasetId: this.datasetId || 'default',
+        baseBranch: branch,
+        fileUser: `${meLogin}-merges`
+      });
+      const prBody = [
+        'Automated community annotation moderation merges update from Cellucid.',
+        '',
+        `User: @${meLogin}`,
+        'File: `annotations/moderation/merges.json`'
+      ].join('\n');
+
+      const prRes = await publishFileViaPullRequest({
+        workerOrigin: this.workerOrigin,
+        token,
+        upstreamOwner: this.owner,
+        upstreamRepo: this.repo,
+        baseBranch: branch,
+        headOwner: this.owner,
+        headRepo: this.repo,
+        headBranch: prBranch,
+        path: 'annotations/moderation/merges.json',
+        title: msg,
+        body: prBody,
+        contentBase64
       });
 
-      const currentNorm = (current && typeof current === 'object') ? normalizeModerationMergesDoc(current) : null;
-      const currentComparable = currentNorm ? { version: 1, merges: Array.isArray(currentNorm?.merges) ? currentNorm.merges : [] } : null;
-      const nextComparable = { version: 1, merges: Array.isArray(incoming?.merges) ? incoming.merges : [] };
-      const changed = stableStringifyJson(currentComparable) !== stableStringifyJson(nextComparable);
-      if (!changed) {
-        return { branch, path: 'annotations/moderation/merges.json', sha: sha || null, changed: false };
-      }
-
-      const docToWrite = { version: 1, updatedAt: nowIso(), merges: nextComparable.merges };
-      const contentBase64 = encodeBase64Utf8(JSON.stringify(docToWrite, null, 2) + '\n');
-      try {
-        const res = await putContent({
-          workerOrigin: this.workerOrigin,
-          owner: this.owner,
-          repo: this.repo,
-          token,
-          path: 'annotations/moderation/merges.json',
-          branch,
-          message: msg,
-          contentBase64,
-          sha
-        });
-        const newSha = toCleanString(res?.content?.sha || res?.sha || '') || null;
-        return { branch, path: 'annotations/moderation/merges.json', sha: newSha, changed: true };
-      } catch (err) {
-        if (err?.status !== 409 || attempt === 2) throw err;
-      }
+      return {
+        mode: 'pr',
+        branch,
+        path: 'annotations/moderation/merges.json',
+        sha: sha || null,
+        changed: true,
+        prUrl: prRes?.prUrl || null,
+        prNumber: prRes?.prNumber ?? null,
+        reused: Boolean(prRes?.reused)
+      };
     }
-
-    throw new Error('Unable to publish moderation merges (retry limit)');
   }
 
   async getAuthenticatedUser() {
@@ -963,66 +1558,44 @@ export class CommunityAnnotationGitHubSync {
     const branch = this.branch || 'main';
     const workerOrigin = this.workerOrigin;
 
-    const entries = await listDir({
-      workerOrigin,
-      owner: this.owner,
-      repo: this.repo,
-      token,
-      path: 'annotations/users',
-      ref: branch
+    const tree = await getGitTreeRecursive({ workerOrigin, owner: this.owner, repo: this.repo, token, ref: branch });
+    const userBlobs = tree.filter((e) => {
+      const path = toCleanString(e?.path || '');
+      if (!path) return false;
+      return e?.type === 'blob' && /^annotations\/users\/ghid_\d+\.json$/i.test(path);
     });
-
-    const allJsonFiles = entries
-      .filter((e) => e?.type === 'file' && typeof e?.name === 'string' && /^ghid_\d+\.json$/i.test(e.name));
-    const jsonFiles = allJsonFiles.slice(0, MAX_USER_FILES_PER_PULL);
-    const truncatedCount = Math.max(0, allJsonFiles.length - jsonFiles.length);
 
     /** @type {Record<string, string>} */
     const nextShas = {};
-    for (const f of jsonFiles) {
-      const name = toCleanString(f?.name);
-      const sha = toCleanString(f?.sha);
-      if (!name || !sha) continue;
-      nextShas[`annotations/users/${name}`] = sha;
+    for (const f of userBlobs) {
+      const path = toCleanString(f?.path || '');
+      const sha = toCleanString(f?.sha || '');
+      if (!path || !sha) continue;
+      nextShas[path] = sha;
     }
 
     const known = (knownShas && typeof knownShas === 'object') ? knownShas : null;
-
-    const needsFetch = (name, sha) => {
+    const needsFetch = (path, sha) => {
       if (!known) return true;
-      const prev = toCleanString(known[name] || '');
+      const prev = toCleanString(known[path] || '');
       return !prev || prev !== sha;
     };
 
-    const toFetch = [];
-    for (const f of jsonFiles) {
-      const name = toCleanString(f?.name);
-      if (!name) continue;
-      const sha = toCleanString(f?.sha) || null;
-      const path = `annotations/users/${name}`;
-      if (sha && !needsFetch(path, sha)) continue;
-      toFetch.push({ name, sha, path });
-    }
+    const allPaths = Object.keys(nextShas).sort((a, b) => a.localeCompare(b));
+    const toFetch = allPaths.filter((path) => needsFetch(path, nextShas[path]));
 
     const concurrency = DEFAULT_USER_PULL_CONCURRENCY;
-    const out = (await mapWithConcurrency(toFetch, concurrency, async ({ name, sha, path }) => {
-      const fileUser = toCleanString(name.replace(/\.json$/i, '')) || null;
+    const out = (await mapWithConcurrency(toFetch, concurrency, async (path) => {
+      const sha = nextShas[path] || null;
+      const fileUser = toCleanString(path.split('/').pop() || '').replace(/\.json$/i, '') || null;
       try {
-        const { json } = await readJsonFile({
-          workerOrigin,
-          owner: this.owner,
-          repo: this.repo,
-          token,
-          path,
-          ref: branch
-        });
+        const json = await getGitBlobJson({ workerOrigin, owner: this.owner, repo: this.repo, token, sha });
         return (json && typeof json === 'object')
           ? { ...json, __path: path, __fileUser: fileUser, __sha: sha || null }
           : { __invalid: true, __path: path, __fileUser: fileUser, __sha: sha || null, __error: 'Invalid JSON shape (expected object)' };
       } catch (err) {
-        // Skip invalid files; surface in UI via aggregate error if needed.
-        // (No token in error message.)
-        return { __invalid: true, __path: path, __fileUser: fileUser, __sha: sha || null, __error: err?.message || String(err) };
+        const msg = err?.message || String(err);
+        return { __invalid: true, __path: path, __fileUser: fileUser, __sha: sha || null, __error: msg || 'Failed to load blob' };
       }
     })).filter(Boolean);
 
@@ -1030,9 +1603,7 @@ export class CommunityAnnotationGitHubSync {
       docs: out,
       shas: nextShas,
       fetchedCount: toFetch.length,
-      totalCount: jsonFiles.length,
-      availableCount: allJsonFiles.length,
-      truncatedCount,
+      totalCount: allPaths.length,
       concurrency
     };
   }
@@ -1066,7 +1637,13 @@ export class CommunityAnnotationGitHubSync {
     }
   }
 
-  async pushMyUserFile({ userDoc, commitMessage = null, conflictIfRemoteNewerThan = null, force = false } = {}) {
+  async pushMyUserFile({
+    userDoc,
+    commitMessage = null,
+    conflictIfRemoteNewerThan = null,
+    conflictIfRemoteShaNotEqual = null,
+    force = false
+  } = {}) {
     const token = this.token;
     if (!token) throw new Error('GitHub token required to push');
     const branch = this.branch || 'main';
@@ -1093,6 +1670,38 @@ export class CommunityAnnotationGitHubSync {
     } catch (err) {
       // If not found, we'll create it. Otherwise bubble up.
       if (err?.status !== 404) throw err;
+    }
+
+    // Strong conflict detection: GitHub blob sha is the real source-of-truth version.
+    // This avoids clock-skew issues with `updatedAt` when the same user publishes from multiple devices.
+    const expectedSha = toCleanString(conflictIfRemoteShaNotEqual) || null;
+    if (!force) {
+      // If the remote file exists, require a baseline SHA from the last Pull to avoid overwrites.
+      if (!expectedSha && sha) {
+        const err = new Error(
+          'Missing baseline version for your remote user file.\n' +
+          'Pull first to merge any existing votes/suggestions, then Publish again.'
+        );
+        err.code = 'COMMUNITY_ANNOTATION_CONFLICT';
+        err.remoteUpdatedAt = remoteUpdatedAt;
+        err.remoteSha = sha;
+        err.expectedSha = null;
+        err.path = path;
+        throw err;
+      }
+
+      if (expectedSha && sha !== expectedSha) {
+        const err = new Error(
+          'Remote user file changed since your last Pull.\n' +
+          'Pull first to merge changes, or force overwrite to publish anyway.'
+        );
+        err.code = 'COMMUNITY_ANNOTATION_CONFLICT';
+        err.remoteUpdatedAt = remoteUpdatedAt;
+        err.remoteSha = sha;
+        err.expectedSha = expectedSha;
+        err.path = path;
+        throw err;
+      }
     }
 
     if (!force && remoteUpdatedAt && conflictIfRemoteNewerThan) {
@@ -1127,69 +1736,107 @@ export class CommunityAnnotationGitHubSync {
     const login = toCleanString(userDoc?.login || '') || null;
     const msg = toCleanString(commitMessage) || `Update annotations for @${login || fileUser}`;
 
-    // Prefer direct push when permitted; if permissions are unknown, try direct push first and fall back to PR.
+    let lastDirectPushError = null;
     if (canPushDirect !== false) {
       try {
-        const res = await putContentWithRetry({
-          workerOrigin,
-          owner: this.owner,
-          repo: this.repo,
-          token,
-          path,
-          branch,
-          message: msg,
-          contentBase64: content,
-          sha,
-          refForRefresh: branch
-        });
+        const res = force
+          ? await putContentWithRetry({
+            workerOrigin,
+            owner: this.owner,
+            repo: this.repo,
+            token,
+            path,
+            branch,
+            message: msg,
+            contentBase64: content,
+            sha,
+            refForRefresh: branch
+          })
+          : await putContent({
+            workerOrigin,
+            owner: this.owner,
+            repo: this.repo,
+            token,
+            path,
+            branch,
+            message: msg,
+            contentBase64: content,
+            sha
+          });
         const newSha = toCleanString(res?.content?.sha || res?.sha || '') || null;
         return { mode: 'push', path, remoteUpdatedAt, sha: newSha };
       } catch (err) {
-        const status = err?.status;
-        const isDenied = status === 401 || status === 403;
-        if (canPushDirect === true || !isDenied) throw err;
-        if (!allowForking) {
-          throw new Error(
-            'This repository does not allow forking, so you cannot publish via Pull Request. ' +
-            'Ask the repo admins to enable forking or grant you GitHub role "Write" (or higher).'
+        if (!force && isShaMismatchError(err)) {
+          const conflict = new Error(
+            'Remote user file changed while publishing.\n' +
+            'Pull first to merge changes, or force overwrite to publish anyway.'
           );
+          conflict.code = 'COMMUNITY_ANNOTATION_CONFLICT';
+          conflict.remoteUpdatedAt = remoteUpdatedAt;
+          conflict.path = path;
+          throw conflict;
         }
-        // Permissions were missing/unknown and the push was denied; fall back to fork + PR.
+        if (!(isWriteDeniedError(err) || isProtectedBranchError(err))) throw err;
+        lastDirectPushError = err;
       }
     }
 
-    if (!allowForking) {
+    // At this point, direct publishing was either not allowed or was blocked (e.g. protected branch).
+    if (canPushDirect !== true && !allowForking) {
       throw new Error(
-        'This repository does not allow forking, so you cannot publish via Pull Request. ' +
-        'Ask the repo admins to enable forking or grant you GitHub role "Write" (or higher).'
+        'You do not have permission to publish annotations.\n\n' +
+        'GitHub reports you cannot push, and this repo disables forking, so Pull Request publishing is not possible.'
       );
     }
 
-    // No direct write access: fork + PR flow.
     const me = await workerAuthRequest(workerOrigin, '/auth/user', { token });
     const meLogin = toCleanString(me?.login || '');
     if (!meLogin) throw new Error('Unable to determine GitHub user (GET /auth/user)');
 
-    // Ensure a fork exists (or create one).
-    try {
-      await githubRequest(workerOrigin, `/repos/${encodeURIComponent(this.owner)}/${encodeURIComponent(this.repo)}/forks`, {
-        token,
-        method: 'POST'
-      });
-    } catch (err) {
-      // "already_exists" / "fork exists" should not block PR flow.
-      if (err?.status !== 422) {
-        const status = err?.status;
-        if (status === 401 || status === 403) {
-          throw new Error(
-            'Unable to create or access a fork for Pull Request publishing. ' +
-            'Make sure the GitHub App is installed for your account, and that you have permission to fork this repository.'
-          );
-        }
-        throw err;
+    const prBranch = toDeterministicPrBranch({ datasetId: this.datasetId, baseBranch: branch, fileUser });
+    const prBody = [
+      'Automated community annotation update from Cellucid.',
+      '',
+      `User: @${meLogin}`,
+      `File: \`${path}\``
+    ].join('\n');
+
+    // Prefer same-repo PR branches when possible (works even when forking is disabled).
+    const shouldTryUpstreamPrFirst =
+      canPushDirect === true ||
+      !allowForking ||
+      isProtectedBranchError(lastDirectPushError);
+
+    if (shouldTryUpstreamPrFirst) {
+      try {
+        const prRes = await publishFileViaPullRequest({
+          workerOrigin,
+          token,
+          upstreamOwner: this.owner,
+          upstreamRepo: this.repo,
+          baseBranch: branch,
+          headOwner: this.owner,
+          headRepo: this.repo,
+          headBranch: prBranch,
+          path,
+          title: msg,
+          body: prBody,
+          contentBase64: content
+        });
+        return {
+          mode: 'pr',
+          path,
+          remoteUpdatedAt,
+          prUrl: prRes?.prUrl || null,
+          prNumber: prRes?.prNumber ?? null,
+          reused: Boolean(prRes?.reused)
+        };
+      } catch (err) {
+        if (!allowForking) throw err;
       }
     }
 
+    // Fork + PR flow (no direct write access, or upstream branch PR failed).
     const forkOwner = meLogin;
     let forkRepo = null;
     try {
@@ -1201,6 +1848,13 @@ export class CommunityAnnotationGitHubSync {
         forkOwner
       });
     } catch (err) {
+      const status = err?.status;
+      if (status === 401 || status === 403) {
+        throw new Error(
+          'Unable to create or access a fork for Pull Request publishing. ' +
+          'Make sure the GitHub App is installed for your account, and that you have permission to fork this repository.'
+        );
+      }
       const msg = isPrivateRepo
         ? (
           `Unable to locate your fork for this private repository. ` +
@@ -1225,203 +1879,32 @@ export class CommunityAnnotationGitHubSync {
     }
     if (!forkInfo) {
       throw new Error(
-        `Fork not ready. Install the GitHub App on your personal account (ideally "All repositories"), then try again.`
+        'Fork not ready. Install the GitHub App on your personal account (ideally "All repositories"), then try again.'
       );
     }
 
-    // Deterministic branch per (datasetId, baseBranch, user) so repeated Publish updates a single PR.
-    const prBranch = toDeterministicPrBranch({ datasetId: this.datasetId, baseBranch: branch, fileUser });
-
-    // Create the branch if missing (base on the upstream branch tip for cleaner PR diffs).
-    let upstreamBaseSha = null;
-    try {
-      const upstreamRef = await githubRequest(
-        workerOrigin,
-        `/repos/${encodeURIComponent(this.owner)}/${encodeURIComponent(this.repo)}/git/ref/heads/${encodeURIComponent(branch)}`,
-        { token }
-      );
-      upstreamBaseSha = toCleanString(upstreamRef?.object?.sha || '') || null;
-    } catch {
-      upstreamBaseSha = null;
-    }
-    if (!upstreamBaseSha) {
-      const forkBase = toCleanString(forkInfo?.default_branch || '') || 'main';
-      const baseRef = await githubRequest(
-        workerOrigin,
-        `/repos/${encodeURIComponent(forkOwner)}/${encodeURIComponent(forkRepo)}/git/ref/heads/${encodeURIComponent(forkBase)}`,
-        { token }
-      );
-      upstreamBaseSha = toCleanString(baseRef?.object?.sha || '') || null;
-    }
-    if (!upstreamBaseSha) throw new Error('Unable to determine base SHA for PR branch');
-
-    let branchExists = false;
-    try {
-      await githubRequest(
-        workerOrigin,
-        `/repos/${encodeURIComponent(forkOwner)}/${encodeURIComponent(forkRepo)}/git/ref/heads/${encodeURIComponent(prBranch)}`,
-        { token }
-      );
-      branchExists = true;
-    } catch (err) {
-      if (err?.status !== 404) throw err;
-      branchExists = false;
-    }
-    if (!branchExists) {
-      try {
-        await githubRequest(workerOrigin, `/repos/${encodeURIComponent(forkOwner)}/${encodeURIComponent(forkRepo)}/git/refs`, {
-          token,
-          method: 'POST',
-          body: { ref: `refs/heads/${prBranch}`, sha: upstreamBaseSha }
-        });
-      } catch (err) {
-        // If another publish created it concurrently, proceed.
-        if (err?.status !== 422) throw err;
-      }
-    }
-
-    // Upsert file in the fork branch.
-    let forkSha = null;
-    try {
-      const existingFork = await getContent({ workerOrigin, owner: forkOwner, repo: forkRepo, token, path, ref: prBranch });
-      if (existingFork?.type === 'file' && existingFork?.sha) forkSha = existingFork.sha;
-    } catch (err) {
-      if (err?.status !== 404) throw err;
-    }
-
-    await putContentWithRetry({
+    const prRes = await publishFileViaPullRequest({
       workerOrigin,
-      owner: forkOwner,
-      repo: forkRepo,
       token,
+      upstreamOwner: this.owner,
+      upstreamRepo: this.repo,
+      baseBranch: branch,
+      headOwner: forkOwner,
+      headRepo: forkRepo,
+      headBranch: prBranch,
       path,
-      branch: prBranch,
-      message: msg,
-      contentBase64: content,
-      sha: forkSha,
-      refForRefresh: prBranch
+      title: msg,
+      body: prBody,
+      contentBase64: content
     });
-
-    // If an open PR already exists for this head/base, reuse it (avoids PR spam).
-    try {
-      const existing = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(this.owner)}/${encodeURIComponent(this.repo)}/pulls`, {
-        token,
-        query: { state: 'open', head: `${forkOwner}:${prBranch}`, base: branch, per_page: 5 }
-      });
-      const pr0 = Array.isArray(existing) ? existing[0] : null;
-      if (pr0) {
-        return {
-          mode: 'pr',
-          path,
-          remoteUpdatedAt,
-          prUrl: toCleanString(pr0?.html_url || '') || null,
-          prNumber: pr0?.number ?? null,
-          reused: true
-        };
-      }
-    } catch {
-      // ignore and fall through to creating a PR
-    }
-
-    const prBody = [
-      'Automated community annotation update from Cellucid.',
-      '',
-      `User: @${meLogin}`,
-      `File: \`${path}\``
-    ].join('\n');
-
-    let pr = null;
-    let reused = false;
-    try {
-      pr = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(this.owner)}/${encodeURIComponent(this.repo)}/pulls`, {
-        token,
-        method: 'POST',
-        body: {
-          title: msg,
-          head: `${forkOwner}:${prBranch}`,
-          base: branch,
-          body: prBody,
-          maintainer_can_modify: true
-        }
-      });
-    } catch (err) {
-      // GitHub returns 422 if a PR already exists for this head/base (sometimes even if closed).
-      if (err?.status !== 422) throw err;
-      try {
-        const prs = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(this.owner)}/${encodeURIComponent(this.repo)}/pulls`, {
-          token,
-          query: { state: 'all', head: `${forkOwner}:${prBranch}`, base: branch, per_page: 10 }
-        });
-        const list = Array.isArray(prs) ? prs : [];
-        const existing = list.find((p) => p && p.number) || null;
-        if (!existing) throw err;
-        reused = true;
-        // If the previous PR was merged, you cannot reopen it; create a fresh PR from a new branch
-        // that points to the current fork branch head (avoids PR spam during review, but supports
-        // a new review cycle after merge).
-        const mergedAt = toCleanString(existing?.merged_at || '');
-        if (existing?.state === 'closed' && mergedAt) {
-          reused = false;
-          const ref = await githubRequest(
-            workerOrigin,
-            `/repos/${encodeURIComponent(forkOwner)}/${encodeURIComponent(forkRepo)}/git/ref/heads/${encodeURIComponent(prBranch)}`,
-            { token }
-          );
-          const headSha = toCleanString(ref?.object?.sha || '') || null;
-          if (!headSha) throw err;
-          let alt = null;
-          for (let attempt = 0; attempt < 5; attempt++) {
-            const suffix = `${Date.now().toString(36)}${attempt ? `_${attempt}` : ''}`;
-            alt = `${prBranch}-${suffix}`;
-            try {
-              await githubRequest(workerOrigin, `/repos/${encodeURIComponent(forkOwner)}/${encodeURIComponent(forkRepo)}/git/refs`, {
-                token,
-                method: 'POST',
-                body: { ref: `refs/heads/${alt}`, sha: headSha }
-              });
-              break;
-            } catch (createErr) {
-              if (createErr?.status !== 422 || attempt === 4) throw createErr;
-            }
-          }
-          pr = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(this.owner)}/${encodeURIComponent(this.repo)}/pulls`, {
-            token,
-            method: 'POST',
-            body: {
-              title: msg,
-              head: `${forkOwner}:${alt}`,
-              base: branch,
-              body: prBody,
-              maintainer_can_modify: true
-            }
-          });
-        } else if (existing?.state === 'closed') {
-          try {
-            pr = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(this.owner)}/${encodeURIComponent(this.repo)}/pulls/${encodeURIComponent(existing.number)}`, {
-              token,
-              method: 'PATCH',
-              body: { state: 'open' }
-            });
-          } catch {
-            // If reopen fails (permissions), still return the existing PR link so the user can act.
-            pr = existing;
-          }
-        } else {
-          pr = existing;
-        }
-      } catch (fallbackErr) {
-        // If we can't recover, surface the original error.
-        throw fallbackErr || err;
-      }
-    }
 
     return {
       mode: 'pr',
       path,
       remoteUpdatedAt,
-      prUrl: toCleanString(pr?.html_url || '') || null,
-      prNumber: pr?.number ?? null,
-      reused
+      prUrl: prRes?.prUrl || null,
+      prNumber: prRes?.prNumber ?? null,
+      reused: Boolean(prRes?.reused)
     };
   }
 }
@@ -1456,6 +1939,27 @@ export function setDatasetAnnotationRepoFromUrlParam({ datasetId, urlParamValue,
 export async function setDatasetAnnotationRepoFromUrlParamAsync({ datasetId, urlParamValue, username = 'local', tokenOverride = null } = {}) {
   const parsed = parseOwnerRepo(urlParamValue);
   if (!parsed) return false;
+
+  // Support GitHub tree URLs where the branch may contain slashes by resolving the
+  // longest matching `refs/heads/...` prefix via the API.
+  if (parsed.treeRefPath) {
+    const token = tokenOverride || getGitHubAuthSession().getToken() || null;
+    if (!token) return false;
+    const sync = new CommunityAnnotationGitHubSync({
+      datasetId,
+      owner: parsed.owner,
+      repo: parsed.repo,
+      token,
+      branch: null,
+      workerOrigin: getGitHubWorkerOrigin()
+    });
+    const resolved = await sync.resolveBranchFromTreeRefPath(parsed.treeRefPath).catch(() => null);
+    if (!resolved) return false;
+    const ok = setAnnotationRepoForDataset(datasetId, `${parsed.ownerRepo}@${resolved}`, username);
+    if (!ok) return false;
+    setAnnotationRepoMetaForDataset(datasetId, username, { branchMode: 'explicit' });
+    return true;
+  }
 
   // If no branch is specified, resolve the repo's default branch ("HEAD") and persist owner/repo@branch.
   if (!parsed.ref) {

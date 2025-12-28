@@ -5,6 +5,28 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>cellucid - Interactive Single-Cell Data Visualization</title>
 
+	  <!-- Security (dev-phase strict CSP; no inline scripts) -->
+	  <!--
+	    Note: `connect-src https: wss:` is dev-friendly (allows any HTTPS/WSS). It’s fine for now.
+	    If we want this truly strict, we must allowlist the exact endpoints we use (GitHub/GA/worker/etc).
+	    The `sha256-...` in `script-src` allowlists the inline JSON-LD `<script type="application/ld+json">`
+	    block below (SEO structured data) without enabling `'unsafe-inline'`. If you change that JSON, the
+	    hash must be regenerated or the browser will block the block and report a CSP violation.
+	    TODO (prod): move CSP to an HTTP response header + generate per-environment.
+	  -->
+	  <meta http-equiv="Content-Security-Policy" content="
+	    default-src 'self';
+	    base-uri 'none';
+	    object-src 'none';
+	    script-src 'self' https://www.googletagmanager.com 'sha256-MXYWlpoSQ1twXf6ffR439dY146Pre5/CiJuwrxfL1Ho=';
+	    style-src 'self' 'unsafe-inline';
+	    img-src 'self' data: https:;
+	    font-src 'self' data:;
+	    connect-src 'self' https: wss: blob: http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*;
+	    worker-src 'self' blob:;
+	    manifest-src 'self';
+	  " />
+
   <!-- SEO Meta Tags -->
   <meta name="description" content="Every cell tells a story. Navigate through millions of them, uncover hidden patterns, and see your data come alive." />
   <meta name="keywords" content="single-cell, scRNA-seq, UMAP, visualization, WebGL, bioinformatics, gene expression, 3D visualization, cell atlas" />
@@ -13,7 +35,7 @@
   <link rel="canonical" href="https://www.cellucid.com" />
 
   <!-- Preconnect to external services for faster initial connection -->
-  <link rel="preconnect" href="https://www.googletagmanager.com">
+  <link rel="preconnect" href="https://www.googletagmanager.com" />
 
   <!-- Open Graph / Social Media -->
   <meta property="og:title" content="cellucid - Interactive Single-Cell Data Visualization" />
@@ -30,50 +52,46 @@
   <meta name="twitter:description" content="Every cell tells a story. Navigate through millions of them, uncover hidden patterns, and see your data come alive." />
   <meta name="twitter:image" content="https://www.cellucid.com/assets/img/og-preview.jpg" />
 
-  <!-- Structured Data for Search Engines -->
-  <script type="application/ld+json">
-  {
-    "@context": "https://schema.org",
-    "@type": "WebApplication",
-    "name": "cellucid",
-    "description": "Every cell tells a story. Navigate through millions of them, uncover hidden patterns, and see your data come alive.",
-    "url": "https://www.cellucid.com",
-    "image": "https://www.cellucid.com/assets/img/og-preview.jpg",
-    "logo": "https://www.cellucid.com/assets/img/android-chrome-512x512.png",
-    "applicationCategory": "Scientific Software",
-    "operatingSystem": "Any (Web Browser)",
-    "offers": {
-      "@type": "Offer",
-      "price": "0",
-      "priceCurrency": "USD"
-    },
-    "author": {
-      "@type": "Person",
-      "name": "Kemal Inecik",
-      "url": "https://kemalinecik.com"
-    },
-    "featureList": [
-      "3D UMAP visualization",
-      "Gene expression overlay",
-      "Categorical and continuous obs filtering",
-      "WebGL2 high-performance rendering",
-      "Support for millions of cells",
-      "Volumetric smoke cloud rendering",
-      "KNN connectivity visualization",
-      "Multiple view comparison"
-    ]
-  }
-  </script>
+	  <!-- Structured Data for Search Engines -->
+	  <script type="application/ld+json">
+	  {
+	    "@context": "https://schema.org",
+	    "@type": "WebApplication",
+	    "name": "cellucid",
+	    "description": "GPU-powered single-cell atlas viewer with real-time filtering, gene expression overlays, vector field animation, and collaborative community annotation.",
+	    "url": "https://www.cellucid.com",
+	    "image": "https://www.cellucid.com/assets/img/og-preview.jpg",
+	    "logo": "https://www.cellucid.com/assets/img/android-chrome-512x512.png",
+	    "applicationCategory": "Scientific Software",
+	    "operatingSystem": "Any (Web Browser)",
+	    "browserRequirements": "Requires WebGL2",
+	    "isAccessibleForFree": true,
+	    "offers": {
+	      "@type": "Offer",
+	      "price": "0",
+	      "priceCurrency": "USD"
+	    },
+	    "author": {
+	      "@type": "Person",
+	      "name": "Kemal Inecik",
+	      "url": "https://kemalinecik.com"
+	    },
+	    "featureList": [
+	      "Real-time rendering of millions of cells with adaptive level of detail (LOD)",
+	      "Gene expression overlays with efficient sparse matrix handling",
+	      "Categorical and continuous cell metadata coloring, filtering, and selection",
+	      "Multi-dimensional support (1D timelines, 2D, 3D embeddings)",
+	      "Animated vector field overlays (velocity / drift) with GPU particle flow",
+	      "KNN connectivity edge visualization",
+	      "Publication export: SVG (vector) + PNG (high-DPI)",
+	      "Collaborative community annotation voting with optional GitHub sync"
+	    ]
+	  }
+	  </script>
 
   <!-- Google tag (gtag.js) -->
   <script async src="https://www.googletagmanager.com/gtag/js?id=G-K4774ZWGEQ"></script>
-  <script>
-    window.dataLayer = window.dataLayer || [];
-    function gtag(){dataLayer.push(arguments);}
-    gtag('js', new Date());
-
-    gtag('config', 'G-K4774ZWGEQ');
-  </script>
+  <script src="assets/js/app/ui/core/ga-init.js"></script>
 
   <!-- Favicons -->
   <link rel="icon" type="image/png" sizes="256x256" href="assets/img/favicon-256x256.png" />
@@ -102,56 +120,53 @@
   <link rel="preload" as="font" type="font/woff2" href="assets/fonts/firacode-latin.woff2" crossorigin>
 
   <!-- Apply persisted theme early to avoid a flash when loading CSS -->
-  <script>
-    (function() {
-      try {
-        const stored = localStorage.getItem('cellucid_theme');
-        document.documentElement.dataset.theme = stored === 'dark' ? 'dark' : 'light';
-      } catch (_) { /* localStorage unavailable */ }
-    })();
-  </script>
+  <script src="assets/js/app/ui/core/theme-init.js"></script>
 
   <!-- Fonts are now self-hosted in assets/fonts/ for better performance -->
   <link rel="stylesheet" href="assets/css/main.css" />
 </head>
 <body>
-  <!-- SEO: Semantic content for search engines and screen readers (hidden visually) -->
-  <main class="sr-only" aria-label="About cellucid">
-    <h1>cellucid - Interactive Single-Cell Data Visualization</h1>
-    <p>Every cell tells a story. Navigate through millions of them, uncover hidden patterns, and see your data come alive.</p>
-    <h2>Key Features</h2>
-    <ul>
-      <li>3D UMAP and embedding visualization</li>
-      <li>Gene expression overlay with searchable gene list</li>
-      <li>Categorical and continuous observation filtering</li>
-      <li>Support for millions of cells with GPU-accelerated rendering</li>
-      <li>Volumetric smoke cloud visualization mode</li>
-      <li>KNN connectivity graph visualization</li>
-      <li>Multiple view comparison for UMAP parameter exploration</li>
-      <li>Outlier filtering in latent space</li>
-    </ul>
-    <h2>Use Cases</h2>
-    <p>Ideal for researchers working with scRNA-seq data, cell atlases, and dimensional reduction visualizations. Compatible with AnnData exports and standard single-cell analysis pipelines.</p>
-  </main>
+	  <!-- SEO: Semantic content for search engines and screen readers (hidden visually) -->
+	  <main class="sr-only" aria-label="About cellucid">
+	    <h1>cellucid - Interactive Single-Cell Data Visualization</h1>
+	    <p>GPU-powered atlas viewer for single-cell data with fast rendering, real-time filtering, and collaborative annotation.</p>
+	    <h2>Key Features</h2>
+	    <ul>
+	      <li>Real-time rendering of millions of cells with adaptive level of detail (LOD)</li>
+	      <li>Gene expression overlays with efficient sparse matrix handling</li>
+	      <li>Categorical and continuous cell metadata coloring, filtering, and selection</li>
+	      <li>Multi-dimensional support (1D timelines, 2D, 3D embeddings)</li>
+	      <li>Animated vector field overlay (velocity / drift) with GPU particle flow</li>
+	      <li>Community annotation voting with optional GitHub sync</li>
+	      <li>Connectivity edge visualization (KNN graph)</li>
+	      <li>Publication export: SVG (vector) + PNG (high-DPI)</li>
+	    </ul>
+	    <h2>Data Sources</h2>
+	    <p>Load prepared exports, AnnData <code>.h5ad</code> files, or <code>.zarr</code> stores directly in the browser, from a Python server, or from a Jupyter notebook.</p>
+	    <h2>Use Cases</h2>
+	    <p>Explore scRNA-seq atlases, query marker genes, compare embeddings, visualize trajectories, and build consensus community annotations.</p>
+	  </main>
 
-  <noscript>
-    <div class="noscript-message">
-      <h1>cellucid - Interactive Single-Cell Data Visualization</h1>
-      <p>Cellucid requires JavaScript and WebGL2 to run. Please enable JavaScript in your browser to use this application.</p>
-      <h2>About cellucid</h2>
-      <p>Every cell tells a story. Navigate through millions of them, uncover hidden patterns, and see your data come alive.</p>
-      <h3>Features</h3>
-      <ul>
-        <li>3D UMAP visualization with GPU-accelerated rendering</li>
-        <li>Gene expression overlay</li>
-        <li>Categorical and continuous obs filtering</li>
-        <li>Support for millions of cells</li>
-        <li>Volumetric smoke cloud rendering</li>
-        <li>KNN connectivity visualization</li>
-      </ul>
-      <p>Created by <a href="https://kemalinecik.com">Kemal Inecik</a></p>
-    </div>
-  </noscript>
+	  <noscript>
+	    <div class="noscript-message">
+	      <h1>cellucid - Interactive Single-Cell Data Visualization</h1>
+	      <p>Cellucid requires JavaScript and WebGL2 to run. Please enable JavaScript in your browser to use this application.</p>
+	      <h2>About cellucid</h2>
+	      <p>GPU-powered atlas viewer for single-cell data with fast rendering, real-time filtering, and collaborative annotation.</p>
+	      <h3>Features</h3>
+	      <ul>
+	        <li>Real-time rendering of millions of cells with adaptive level of detail (LOD)</li>
+	        <li>Gene expression overlays</li>
+	        <li>Categorical and continuous cell metadata coloring, filtering, and selection</li>
+	        <li>Multi-dimensional support (1D timelines, 2D, 3D embeddings)</li>
+	        <li>Animated vector field overlays (velocity / drift)</li>
+	        <li>Community annotation voting with optional GitHub sync</li>
+	        <li>Connectivity edge visualization (KNN graph)</li>
+	        <li>Publication export: SVG (vector) + PNG (high-DPI)</li>
+	      </ul>
+	      <p>Created by <a href="https://kemalinecik.com">Kemal Inecik</a></p>
+	    </div>
+	  </noscript>
 
   <!-- Welcome Modal (shown on first visit, hidden by default) -->
   <div id="welcome-modal" class="welcome-modal hidden" role="dialog" aria-modal="true" aria-labelledby="welcome-title">
@@ -1462,33 +1477,6 @@
   <script type="module" src="assets/js/app/main.js"></script>
 
   <!-- License modal handler -->
-  <script>
-    (function() {
-      const modal = document.getElementById('license-modal');
-      const link = document.getElementById('license-link');
-      const closeBtn = document.getElementById('license-close-btn');
-      const backdrop = modal.querySelector('.license-backdrop');
-
-      function openModal(e) {
-        e.preventDefault();
-        modal.classList.remove('hidden');
-        document.body.style.overflow = 'hidden';
-      }
-
-      function closeModal() {
-        modal.classList.add('hidden');
-        document.body.style.overflow = '';
-      }
-
-      link.addEventListener('click', openModal);
-      closeBtn.addEventListener('click', closeModal);
-      backdrop.addEventListener('click', closeModal);
-      document.addEventListener('keydown', function(e) {
-        if (e.key === 'Escape' && !modal.classList.contains('hidden')) {
-          closeModal();
-        }
-      });
-    })();
-  </script>
+  <script defer src="assets/js/app/ui/core/license-modal.js"></script>
 </body>
 </html>

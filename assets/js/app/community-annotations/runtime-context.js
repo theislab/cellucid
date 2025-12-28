@@ -46,6 +46,13 @@ function parseGitHubUserIdFromKey(userKey) {
   return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : null;
 }
 
+function normalizeGitHubUserIdOrNull(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  const safe = Math.max(0, Math.floor(n));
+  return safe ? safe : null;
+}
+
 /**
  * Compute the active community-annotation cache context.
  *
@@ -104,7 +111,27 @@ export function getCommunityAnnotationCacheContext({ dataSourceManager = null, d
 export function syncCommunityAnnotationCacheContext({ dataSourceManager = null, datasetId = null } = {}) {
   const session = getCommunityAnnotationSession();
   const ctx = getCommunityAnnotationCacheContext({ dataSourceManager, datasetId });
-  session.setCacheContext?.({ datasetId: ctx.datasetId, repoRef: ctx.repoRef, userId: ctx.userId });
+  // Safety: if another module cleared the connected repo mapping (disconnect) while this tab
+  // still holds a fully-scoped session (dataset+repo@branch+userId), avoid wiping in-memory
+  // local intent by resetting the session to an "unscoped" state.
+  //
+  // We only preserve the existing repoRef when the computed context matches the current
+  // dataset + GitHub numeric user id (so we don't leak across scopes).
+  let repoRefForSession = ctx.repoRef;
+  if (!repoRefForSession) {
+    try {
+      const currentDatasetId = toCleanString(session.getDatasetId?.() || '') || null;
+      const currentRepoRef = toCleanString(session.getRepoRef?.() || '') || null;
+      const currentUserId = normalizeGitHubUserIdOrNull(session.getCacheUserId?.());
+      const nextUserId = normalizeGitHubUserIdOrNull(ctx.userId);
+      if (currentRepoRef && currentDatasetId && currentDatasetId === ctx.datasetId && currentUserId && nextUserId && currentUserId === nextUserId) {
+        repoRefForSession = currentRepoRef;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  session.setCacheContext?.({ datasetId: ctx.datasetId, repoRef: repoRefForSession, userId: ctx.userId });
   return ctx;
 }
-

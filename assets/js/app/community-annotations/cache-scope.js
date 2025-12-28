@@ -27,9 +27,23 @@ function toCleanString(value) {
   return String(value ?? '').trim();
 }
 
+function fnv1aHex(input) {
+  const s = toCleanString(input);
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, '0');
+}
+
 function normalizeDatasetIdOrNull(datasetId) {
   const did = toCleanString(datasetId);
-  return did ? did : null;
+  if (!did) return null;
+  // Keep cache keys bounded even if dataset ids are long (paths/URLs).
+  if (did.length <= 128) return did;
+  const hash = fnv1aHex(did);
+  return `${did.slice(0, 96)}~${hash}`;
 }
 
 function normalizeGitHubUserIdOrNull(userId) {

@@ -42,10 +42,91 @@ import {
   HP_VS_LIGHT,
   HP_FS_LIGHT,
   HP_FS_ULTRALIGHT,
+  HP_VS_HIGHLIGHT,
+  HP_FS_HIGHLIGHT,
 } from '../../../../../rendering/shaders/high-perf-shaders.js';
 import { isFiniteNumber } from '../../../../utils/number-utils.js';
 
 const DEFAULT_ALPHA_THRESHOLD = 0.01;
+const DEFAULT_HIGHLIGHT_COLOR = [0.4, 0.85, 1.0];
+
+const HIGHLIGHT_STYLE_BY_QUALITY = {
+  full: { scale: 1.75, ringWidth: 0.42, haloStrength: 0.65, haloShape: 0.0, ringStyle: 0.0 },
+  light: { scale: 1.70, ringWidth: 0.44, haloStrength: 0.60, haloShape: 0.0, ringStyle: 1.0 },
+  ultralight: { scale: 1.65, ringWidth: 0.46, haloStrength: 0.55, haloShape: 0.35, ringStyle: 2.0 }
+};
+
+function clamp01(v) {
+  if (!Number.isFinite(v)) return 0;
+  if (v < 0) return 0;
+  if (v > 1) return 1;
+  return v;
+}
+
+function highlightValueToAlphaByte(value) {
+  const v = Number(value);
+  if (!Number.isFinite(v) || v <= 0) return 0;
+  // Support both 0..1 and 0..255 highlight arrays.
+  const a01 = v <= 1.0 ? v : (v >= 255 ? 1.0 : (v / 255));
+  return Math.max(0, Math.min(255, Math.round(clamp01(a01) * 255)));
+}
+
+function buildHighlightOverlayBuffers({
+  positions,
+  highlightArray,
+  transparency,
+  visibilityMask,
+  alphaThreshold = DEFAULT_ALPHA_THRESHOLD
+}) {
+  if (!positions || !highlightArray) return null;
+
+  const n = Math.min(
+    Math.floor(positions.length / 3),
+    highlightArray.length,
+    transparency ? transparency.length : Infinity,
+    visibilityMask ? visibilityMask.length : Infinity
+  );
+  if (!Number.isFinite(n) || n <= 0) return null;
+
+  let count = 0;
+  for (let i = 0; i < n; i++) {
+    const aByte = highlightValueToAlphaByte(highlightArray[i]);
+    if (aByte <= 0) continue;
+    if (visibilityMask && (visibilityMask[i] ?? 0) <= 0) continue;
+    const baseAlpha = transparency ? (transparency[i] ?? 1.0) : 1.0;
+    if (!Number.isFinite(baseAlpha) || baseAlpha < alphaThreshold) continue;
+    count++;
+  }
+  if (count <= 0) return null;
+
+  const outPos = new Float32Array(count * 3);
+  const outCol = new Uint8Array(count * 4);
+
+  let cursor = 0;
+  for (let i = 0; i < n; i++) {
+    const aByte = highlightValueToAlphaByte(highlightArray[i]);
+    if (aByte <= 0) continue;
+    if (visibilityMask && (visibilityMask[i] ?? 0) <= 0) continue;
+    const baseAlpha = transparency ? (transparency[i] ?? 1.0) : 1.0;
+    if (!Number.isFinite(baseAlpha) || baseAlpha < alphaThreshold) continue;
+
+    const pi = i * 3;
+    const oi = cursor * 3;
+    outPos[oi] = positions[pi];
+    outPos[oi + 1] = positions[pi + 1];
+    outPos[oi + 2] = positions[pi + 2];
+
+    const cj = cursor * 4;
+    outCol[cj] = 255;
+    outCol[cj + 1] = 255;
+    outCol[cj + 2] = 255;
+    outCol[cj + 3] = aByte;
+
+    cursor++;
+  }
+
+  return { positions: outPos, colors: outCol, count };
+}
 
 /**
  * @typedef {object} RenderStateForWebgl
@@ -338,10 +419,16 @@ export function rasterizePointsWebgl({
 
   /** @type {WebGLProgram|null} */
   let program = null;
+  /** @type {WebGLProgram|null} */
+  let highlightProgram = null;
   /** @type {WebGLBuffer|null} */
   let positionBuffer = null;
   /** @type {WebGLBuffer|null} */
   let colorBuffer = null;
+  /** @type {WebGLBuffer|null} */
+  let highlightPosBuffer = null;
+  /** @type {WebGLBuffer|null} */
+  let highlightColorBuffer = null;
   /** @type {WebGLBuffer|null} */
   let overlayPosBuffer = null;
   /** @type {WebGLBuffer|null} */
@@ -462,22 +549,26 @@ export function rasterizePointsWebgl({
     const lodIndexTexLoc = u('u_lodIndexTex');
     if (lodIndexTexLoc) gl.uniform1i(lodIndexTexLoc, 1);
 
-    if (quality === 'full') {
-      const cameraPosition = Array.isArray(renderState.cameraPosition) ? renderState.cameraPosition : [0, 0, 3];
-      const sphere = boundsToSphere(packed.bounds);
-      const dx = (cameraPosition[0] || 0) - sphere.center[0];
-      const dy = (cameraPosition[1] || 0) - sphere.center[1];
-      const dz = (cameraPosition[2] || 0) - sphere.center[2];
-      const distToCenter = Math.sqrt(dx * dx + dy * dy + dz * dz);
-      const fogNear = Math.max(0, distToCenter - sphere.radius);
-      const fogFar = distToCenter + sphere.radius;
+    const cameraPosition = Array.isArray(renderState.cameraPosition) ? renderState.cameraPosition : [0, 0, 3];
+    const sphere = boundsToSphere(packed.bounds);
+    const dx = (cameraPosition[0] || 0) - sphere.center[0];
+    const dy = (cameraPosition[1] || 0) - sphere.center[1];
+    const dz = (cameraPosition[2] || 0) - sphere.center[2];
+    const distToCenter = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    const fogNear = Math.max(0, distToCenter - sphere.radius);
+    const fogFar = distToCenter + sphere.radius;
+    const fogDensity = isFiniteNumber(renderState.fogDensity) ? renderState.fogDensity : 0.5;
+    const fogColor = renderState.fogColor || [1, 1, 1];
+    const lightingStrength = isFiniteNumber(renderState.lightingStrength) ? renderState.lightingStrength : 0.6;
+    const lightDir = renderState.lightDir || [0.5, 0.7, 0.5];
 
-      setF1(u('u_lightingStrength'), isFiniteNumber(renderState.lightingStrength) ? renderState.lightingStrength : 0.6);
-      setF1(u('u_fogDensity'), isFiniteNumber(renderState.fogDensity) ? renderState.fogDensity : 0.5);
+    if (quality === 'full') {
+      setF1(u('u_lightingStrength'), lightingStrength);
+      setF1(u('u_fogDensity'), fogDensity);
       setF1(u('u_fogNear'), fogNear);
       setF1(u('u_fogFar'), fogFar);
-      setV3(u('u_fogColor'), renderState.fogColor || [1, 1, 1]);
-      setV3(u('u_lightDir'), renderState.lightDir || [0.5, 0.7, 0.5]);
+      setV3(u('u_fogColor'), fogColor);
+      setV3(u('u_lightDir'), lightDir);
     }
 
     gl.drawArrays(gl.POINTS, 0, packed.count);
@@ -518,6 +609,71 @@ export function rasterizePointsWebgl({
       }
     }
 
+    // Optional highlight overlay (selection rings / continuous highlights).
+    // Matches viewer behavior: depth test ON, but depth writes OFF so highlights appear on top.
+    const highlightOverlay = buildHighlightOverlayBuffers({
+      positions,
+      highlightArray,
+      transparency,
+      visibilityMask,
+      alphaThreshold
+    });
+    if (highlightOverlay?.count) {
+      highlightProgram = createProgram(gl, HP_VS_HIGHLIGHT, HP_FS_HIGHLIGHT);
+      gl.useProgram(highlightProgram);
+
+      highlightPosBuffer = gl.createBuffer();
+      highlightColorBuffer = gl.createBuffer();
+      if (!highlightPosBuffer || !highlightColorBuffer) return canvas;
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, highlightPosBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, highlightOverlay.positions, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, highlightColorBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, highlightOverlay.colors, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(1);
+      gl.vertexAttribPointer(1, 4, gl.UNSIGNED_BYTE, true, 0, 0);
+
+      const hu = (name) => gl.getUniformLocation(highlightProgram, name);
+      const setHMat4 = (loc, mat) => { if (loc) gl.uniformMatrix4fv(loc, false, mat); };
+      const setHF1 = (loc, v) => { if (loc) gl.uniform1f(loc, v); };
+      const setHV3 = (loc, v) => { if (loc && v) gl.uniform3fv(loc, v); };
+
+      setHMat4(hu('u_mvpMatrix'), renderState.mvpMatrix);
+      setHMat4(hu('u_viewMatrix'), renderState.viewMatrix);
+      setHMat4(hu('u_modelMatrix'), renderState.modelMatrix);
+      setHMat4(hu('u_projectionMatrix'), renderState.projectionMatrix);
+
+      setHF1(hu('u_pointSize'), pointSize);
+      setHF1(hu('u_sizeAttenuation'), sizeAttenuation);
+      setHF1(hu('u_viewportHeight'), srcViewportH);
+      setHF1(hu('u_fov'), fov);
+
+      const style = HIGHLIGHT_STYLE_BY_QUALITY[quality] || HIGHLIGHT_STYLE_BY_QUALITY.full;
+      setHF1(hu('u_highlightScale'), style.scale);
+      setHV3(hu('u_highlightColor'), DEFAULT_HIGHLIGHT_COLOR);
+      setHF1(hu('u_ringWidth'), style.ringWidth);
+      setHF1(hu('u_haloStrength'), style.haloStrength);
+      setHF1(hu('u_haloShape'), style.haloShape);
+      setHF1(hu('u_ringStyle'), style.ringStyle);
+      setHF1(hu('u_time'), 0.0);
+
+      setHF1(hu('u_fogDensity'), fogDensity);
+      setHF1(hu('u_fogNear'), fogNear);
+      setHF1(hu('u_fogFar'), fogFar);
+      setHV3(hu('u_fogColor'), fogColor);
+      setHF1(hu('u_lightingStrength'), lightingStrength);
+      setHV3(hu('u_lightDir'), lightDir);
+
+      gl.enable(gl.DEPTH_TEST);
+      gl.depthMask(false);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      gl.drawArrays(gl.POINTS, 0, highlightOverlay.count);
+      gl.depthMask(true);
+    }
+
     gl.flush();
     return canvas;
   } catch (err) {
@@ -538,11 +694,21 @@ export function rasterizePointsWebgl({
     if (overlayColorBuffer) {
       try { gl.deleteBuffer(overlayColorBuffer); } catch {}
     }
+    if (highlightPosBuffer) {
+      try { gl.deleteBuffer(highlightPosBuffer); } catch {}
+    }
+    if (highlightColorBuffer) {
+      try { gl.deleteBuffer(highlightColorBuffer); } catch {}
+    }
     if (dummyAlphaTex) {
       try { gl.deleteTexture(dummyAlphaTex); } catch {}
     }
     if (dummyLodIndexTex) {
       try { gl.deleteTexture(dummyLodIndexTex); } catch {}
+    }
+    if (highlightProgram) {
+      try { gl.useProgram(null); } catch {}
+      try { gl.deleteProgram(highlightProgram); } catch {}
     }
     if (program) {
       try { gl.useProgram(null); } catch {}

@@ -38,24 +38,17 @@ function isAbortError(err) {
   return err?.name === 'AbortError';
 }
 
-function normalizeOriginOrDefault(rawOrigin) {
+function normalizeOriginOrNull(rawOrigin) {
+  const raw = toCleanString(rawOrigin);
+  if (!raw) return null;
   try {
-    return new URL(rawOrigin).origin;
+    const url = new URL(raw);
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return null;
+    return url.origin;
   } catch {
-    return DEFAULT_WORKER_ORIGIN;
+    return null;
   }
 }
-
-const _initialWorkerOriginOverride = (() => {
-  if (typeof window === 'undefined') return '';
-  return toCleanString(window.__CELLUCID_GITHUB_WORKER_ORIGIN__ || '');
-})();
-
-const _cachedNonLocalWorkerOrigin = (() => {
-  if (typeof window === 'undefined') return DEFAULT_WORKER_ORIGIN;
-  if (!_initialWorkerOriginOverride) return DEFAULT_WORKER_ORIGIN;
-  return normalizeOriginOrDefault(_initialWorkerOriginOverride);
-})();
 
 function safeJsonParse(text) {
   try {
@@ -75,15 +68,31 @@ function safeJsonStringify(obj) {
 
 export function getGitHubWorkerOrigin() {
   if (typeof window === 'undefined') return DEFAULT_WORKER_ORIGIN;
-  // Local dev: allow changing the override without a reload.
-  if (isLocalDevHost()) {
-    const override = toCleanString(window.__CELLUCID_GITHUB_WORKER_ORIGIN__ || '');
-    if (!override) return DEFAULT_WORKER_ORIGIN;
-    return normalizeOriginOrDefault(override);
+  const overrideRaw = toCleanString(window.__CELLUCID_GITHUB_WORKER_ORIGIN__ || '');
+  if (!overrideRaw) return DEFAULT_WORKER_ORIGIN;
+
+  const overrideOrigin = normalizeOriginOrNull(overrideRaw);
+  if (!overrideOrigin) {
+    const err = new Error('Invalid GitHub worker origin override. Refusing to continue.');
+    err.code = 'GITHUB_WORKER_ORIGIN_INVALID';
+    throw err;
   }
 
-  // Non-local: treat overrides as deploy-time config only (read once at module init).
-  return _cachedNonLocalWorkerOrigin;
+  // Dev safety rule:
+  // - Local dev may point at any worker origin (for testing).
+  // - Non-local builds must use the compiled-in DEFAULT_WORKER_ORIGIN (prevents token exfiltration via misconfig).
+  if (!isLocalDevHost() && overrideOrigin !== DEFAULT_WORKER_ORIGIN) {
+    const err = new Error(
+      `Untrusted GitHub worker origin override: ${overrideOrigin}\n` +
+      `Expected: ${DEFAULT_WORKER_ORIGIN}\n\n` +
+      'Refusing to use an untrusted auth proxy to prevent token exfiltration.'
+    );
+    err.code = 'GITHUB_WORKER_ORIGIN_UNTRUSTED';
+    err.origin = overrideOrigin;
+    throw err;
+  }
+
+  return overrideOrigin;
 }
 
 function readSessionItem(key) {
