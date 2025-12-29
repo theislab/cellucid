@@ -76,6 +76,8 @@ export function renderSvgAxes({
   const tickLen = 5;
   const labelOffset = Math.max(12, Math.round(labelSize * 1.15));
   const tickTextOffset = 8;
+  const xLabelText = String(xLabel ?? '').trim();
+  const yLabelText = String(yLabel ?? '').trim();
 
   const x0 = plotRect.x;
   const x1 = plotRect.x + plotRect.width;
@@ -112,12 +114,18 @@ export function renderSvgAxes({
   }
 
   // Axis labels.
-  parts.push(
-    `<text x="${(x0 + x1) / 2}" y="${axisY + tickLen + tickTextOffset + labelOffset}" text-anchor="middle" stroke="none" font-size="${labelSize}">${escapeHtml(String(xLabel || ''))}</text>`
-  );
-  parts.push(
-    `<text x="${axisX - tickLen - tickTextOffset - labelOffset}" y="${(y0 + y1) / 2}" text-anchor="middle" stroke="none" font-size="${labelSize}" transform="rotate(-90 ${axisX - tickLen - tickTextOffset - labelOffset} ${(y0 + y1) / 2})">${escapeHtml(String(yLabel || ''))}</text>`
-  );
+  if (xLabelText) {
+    parts.push(
+      `<text x="${(x0 + x1) / 2}" y="${axisY + tickLen + tickTextOffset + labelOffset}" text-anchor="middle" stroke="none" font-size="${labelSize}">${escapeHtml(xLabelText)}</text>`
+    );
+  }
+  if (yLabelText) {
+    const lx = axisX - tickLen - tickTextOffset - labelOffset;
+    const ly = (y0 + y1) / 2;
+    parts.push(
+      `<text x="${lx}" y="${ly}" text-anchor="middle" stroke="none" font-size="${labelSize}" transform="rotate(-90 ${lx} ${ly})">${escapeHtml(yLabelText)}</text>`
+    );
+  }
 
   parts.push(`</g>`);
   return parts.join('');
@@ -157,6 +165,8 @@ export function drawCanvasAxes({
   const tickLen = 5;
   const labelOffset = Math.max(12, Math.round(labelSize * 1.15));
   const tickTextOffset = 8;
+  const xLabelText = String(xLabel ?? '').trim();
+  const yLabelText = String(yLabel ?? '').trim();
 
   const x0 = plotRect.x;
   const x1 = plotRect.x + plotRect.width;
@@ -207,16 +217,21 @@ export function drawCanvasAxes({
   }
 
   // Axis labels.
-  ctx.font = `${labelSize}px ${fontFamily}`;
-  ctx.textAlign = 'center';
-  ctx.fillText(xLabel, (x0 + x1) / 2, axisY + tickLen + tickTextOffset + labelOffset);
-
-  ctx.save();
-  ctx.translate(axisX - tickLen - tickTextOffset - labelOffset, (y0 + y1) / 2);
-  ctx.rotate(-Math.PI / 2);
-  ctx.textAlign = 'center';
-  ctx.fillText(yLabel, 0, 0);
-  ctx.restore();
+  if (xLabelText || yLabelText) {
+    ctx.font = `${labelSize}px ${fontFamily}`;
+    ctx.textAlign = 'center';
+  }
+  if (xLabelText) {
+    ctx.fillText(xLabelText, (x0 + x1) / 2, axisY + tickLen + tickTextOffset + labelOffset);
+  }
+  if (yLabelText) {
+    ctx.save();
+    ctx.translate(axisX - tickLen - tickTextOffset - labelOffset, (y0 + y1) / 2);
+    ctx.rotate(-Math.PI / 2);
+    ctx.textAlign = 'center';
+    ctx.fillText(yLabelText, 0, 0);
+    ctx.restore();
+  }
 
   ctx.restore();
 }

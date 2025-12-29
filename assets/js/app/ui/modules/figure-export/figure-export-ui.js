@@ -10,7 +10,6 @@
 import { createElement, clearElement } from '../../../utils/dom-utils.js';
 import { clamp, parseNumberOr } from '../../../utils/number-utils.js';
 import { getNotificationCenter } from '../../../notification-center.js';
-import { maybeShowCitationModal } from './components/citation-modal.js';
 import { promptLargeDatasetStrategy } from './components/large-dataset-dialog.js';
 import { confirmExportFidelityWarnings } from './components/fidelity-warning-dialog.js';
 import { computeSingleViewLayout, computeGridDims } from './utils/layout.js';
@@ -23,7 +22,6 @@ import { denormalizeXY } from './utils/coordinate-mapper.js';
 import { drawCanvasOrientationIndicator } from './components/orientation-indicator.js';
 import { applyColorblindSimulationToImageData } from './utils/colorblindness.js';
 import { normalizeCropRect01 } from './utils/crop.js';
-import { applyAuto3dAxisLabels } from './utils/orientation-labels.js';
 import { rgb01ToHex } from './utils/color-utils.js';
 
 const DEFAULT_SIZE = { width: 1600, height: 1200 };
@@ -37,9 +35,18 @@ const LARGE_DATASET_THRESHOLD = 50000;
  * @param {{ exportFigure: (opts: any) => Promise<any> }} options.engine
  */
 export function initFigureExportUI({ state, viewer, container, engine }) {
+  try { container?.__cellucidCleanup?.(); } catch { /* ignore */ }
   clearElement(container);
+  /** @type {Array<() => void>} */
+  const cleanupFns = [];
+  container.__cellucidCleanup = () => {
+    for (const fn of cleanupFns) {
+      try { fn(); } catch { /* ignore */ }
+    }
+  };
 
   const presets = [
+    { label: 'Screen (half)', value: 'screen-half' },
     { label: 'Screen (current)', value: 'screen' },
     { label: '1200 × 900', value: '1200x900' },
     { label: '1600 × 1200', value: '1600x1200' },
@@ -60,6 +67,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   presets.forEach((p) => {
     presetSelect.appendChild(createElement('option', { value: p.value }, [p.label]));
   });
+  presetSelect.value = 'screen-half';
 
   const widthInput = createElement('input', {
     type: 'number',
@@ -99,27 +107,25 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
 
   const cropEnabledCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-crop-enabled' });
   const cropLockCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-crop-lock' });
-  const cropResetBtn = createElement('button', { type: 'button', className: 'btn-small' }, ['Reset']);
-  const cropConfirmBtn = createElement('button', { type: 'button', className: 'btn-small' }, ['Confirm']);
-  const cropFitPlotBtn = createElement('button', { type: 'button', className: 'btn-small' }, ['Fit plot']);
+  const cropResetBtn = createElement('button', { type: 'button', className: 'toggle-switch figure-export-framing-btn' }, ['Reset']);
+  const cropConfirmBtn = createElement('button', { type: 'button', className: 'toggle-switch figure-export-framing-btn', 'aria-pressed': 'false' }, ['Confirm']);
+  const cropFitPlotBtn = createElement('button', { type: 'button', className: 'toggle-switch figure-export-framing-btn' }, ['Fit plot']);
   const cropAspectHint = createElement('span', { className: 'figure-export-crop-aspect' }, ['Aspect: —']);
 
-  const cropLockLabel = createElement('label', { className: 'checkbox-inline', htmlFor: cropLockCheckbox.id }, [
-    cropLockCheckbox,
-    ' Lock aspect'
+  const frameExportToggleLabel = createElement('label', { className: 'checkbox-inline', htmlFor: cropEnabledCheckbox.id }, [
+    cropEnabledCheckbox,
+    ' Frame export'
   ]);
-  const framingControls = createElement('div', { className: 'figure-export-framing-controls' }, [
-    createElement('label', { className: 'checkbox-inline', htmlFor: cropEnabledCheckbox.id }, [
-      cropEnabledCheckbox,
-      ' Frame export'
-    ]),
-    cropLockLabel,
-    createElement('div', { className: 'figure-export-framing-buttons' }, [
-      cropResetBtn,
-      cropConfirmBtn,
-      cropFitPlotBtn,
-    ]),
-    cropAspectHint
+  const lockAspectBtn = createElement('button', {
+    type: 'button',
+    className: 'toggle-switch figure-export-framing-btn',
+    'aria-pressed': 'false',
+  }, ['Lock aspect']);
+  const framingActionGrid = createElement('div', { className: 'figure-export-framing-grid' }, [
+    cropResetBtn,
+    cropConfirmBtn,
+    cropFitPlotBtn,
+    lockAspectBtn,
   ]);
 
   const plotAndFrameRow = createElement('div', { className: 'figure-export-plot-frame' }, [
@@ -217,23 +223,19 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
 
   // Point radius removed - export now uses viewer's pointSize directly (WYSIWYG)
 
-  const styleGrid = createElement('div', { className: 'figure-export-style-grid' }, [
-    createElement('div', { className: 'figure-export-style-row' }, [
-      backgroundSelect,
-      backgroundColorInput,
+  const autoTextToggleRow = createElement('div', { className: 'figure-export-style-row figure-export-auto-text-toggle' }, [
+    createElement('label', { className: 'checkbox-inline', htmlFor: autoTextSizingCheckbox.id }, [
+      autoTextSizingCheckbox,
+      ' Auto text'
     ]),
-    createElement('div', { className: 'figure-export-style-row' }, [
-      fontSelect,
-      createElement('span', { className: 'figure-export-label' }, ['pt']),
-      fontSizeInput,
-    ]),
-    createElement('div', { className: 'figure-export-style-row' }, [
-      createElement('label', { className: 'checkbox-inline', htmlFor: autoTextSizingCheckbox.id }, [
-        autoTextSizingCheckbox,
-        ' Auto text'
-      ]),
-    ]),
+  ]);
+
+  const autoTextBox = createElement('div', { className: 'figure-export-dashed-box figure-export-auto-text-box' }, [
     createElement('div', { className: 'figure-export-sizes-grid' }, [
+      createElement('div', { className: 'figure-export-size-item' }, [
+        createElement('span', { className: 'figure-export-label' }, ['Base']),
+        fontSizeInput,
+      ]),
       createElement('div', { className: 'figure-export-size-item' }, [
         createElement('span', { className: 'figure-export-label' }, ['Legend']),
         legendFontSizeInput,
@@ -256,7 +258,22 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       ]),
     ]),
   ]);
-  styleSection.appendChild(styleGrid);
+
+  const styleBox = createElement('div', { className: 'figure-export-style-box' }, [
+    createElement('div', { className: 'section-title' }, ['Background']),
+    createElement('div', { className: 'figure-export-style-row' }, [
+      backgroundSelect,
+      backgroundColorInput,
+    ]),
+    createElement('div', { className: 'section-title' }, ['Font']),
+    createElement('div', { className: 'figure-export-style-row' }, [
+      fontSelect,
+    ]),
+    createElement('div', { className: 'section-title' }, ['Text sizes']),
+    autoTextToggleRow,
+    autoTextBox,
+  ]);
+  styleSection.appendChild(styleBox);
 
   const titleRow = createElement('div', { className: 'control-block' });
   titleRow.appendChild(createElement('label', { htmlFor: 'figure-export-title' }, ['Title:']));
@@ -269,32 +286,23 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   });
   titleRow.appendChild(titleInput);
 
-  const xLabelRow = createElement('div', { className: 'control-block' });
-  xLabelRow.appendChild(createElement('label', { htmlFor: 'figure-export-xlabel' }, ['X axis label:']));
   const xLabelInput = createElement('input', {
     id: 'figure-export-xlabel',
     type: 'text',
-    className: 'figure-input',
+    className: 'figure-input figure-export-axis-input',
     value: 'X',
     placeholder: 'e.g., UMAP_1',
     'aria-label': 'X axis label'
   });
-  xLabelRow.appendChild(xLabelInput);
 
-  const yLabelRow = createElement('div', { className: 'control-block' });
-  yLabelRow.appendChild(createElement('label', { htmlFor: 'figure-export-ylabel' }, ['Y axis label:']));
-  yLabelRow.appendChild(createElement('div', { className: 'figure-export-hint' }, [
-    '3D axes auto-annotate with camera orientation.'
-  ]));
   const yLabelInput = createElement('input', {
     id: 'figure-export-ylabel',
     type: 'text',
-    className: 'figure-input',
+    className: 'figure-input figure-export-axis-input',
     value: 'Y',
     placeholder: 'e.g., UMAP_2',
     'aria-label': 'Y axis label'
   });
-  yLabelRow.appendChild(yLabelInput);
 
   // ─────────────────────────────────────────────────────────────────────────
   // Annotations section
@@ -306,27 +314,54 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   ]));
   const includeAxesCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-axes', checked: true });
   const includeLegendCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-legend', checked: true });
-  const showCitationCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-citation', checked: true });
   const showOrientationCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-orientation', checked: true });
   const depthSortCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-depthsort', checked: true });
 
   const annotationChecks = createElement('div', { className: 'figure-export-checks' }, [
     createElement('label', { className: 'checkbox-inline', htmlFor: includeAxesCheckbox.id }, [includeAxesCheckbox, ' Axes']),
     createElement('label', { className: 'checkbox-inline', htmlFor: includeLegendCheckbox.id }, [includeLegendCheckbox, ' Legend']),
-    createElement('label', { className: 'checkbox-inline', htmlFor: showCitationCheckbox.id }, [showCitationCheckbox, ' Citation']),
     createElement('label', { className: 'checkbox-inline', htmlFor: showOrientationCheckbox.id }, [showOrientationCheckbox, ' 3D orientation']),
     createElement('label', { className: 'checkbox-inline', htmlFor: depthSortCheckbox.id }, [depthSortCheckbox, ' Depth sort']),
   ]);
-  annotationSection.appendChild(annotationChecks);
+  const axisLabelGrid = createElement('div', { className: 'figure-export-axis-label-grid' }, [
+    createElement('div', { className: 'figure-export-axis-label-field' }, [
+      createElement('span', { className: 'figure-export-label' }, ['X']),
+      xLabelInput,
+    ]),
+    createElement('div', { className: 'figure-export-axis-label-field' }, [
+      createElement('span', { className: 'figure-export-label' }, ['Y']),
+      yLabelInput,
+    ]),
+  ]);
+  const axisLabelSettings = createElement('div', { className: 'figure-export-axes-settings' }, [
+    createElement('label', {}, ['Axis labels:']),
+    axisLabelGrid,
+    createElement('div', { className: 'figure-export-hint figure-export-hint--tight' }, [
+      'Clear X/Y to hide axis labels.'
+    ]),
+  ]);
 
   const legendPosSelect = createElement('select', { className: 'obs-select', 'aria-label': 'Legend position' });
   legendPosSelect.appendChild(createElement('option', { value: 'right' }, ['Legend: Right']));
   legendPosSelect.appendChild(createElement('option', { value: 'bottom' }, ['Legend: Bottom']));
 
-  const annotationOpts = createElement('div', { className: 'figure-export-style-row' }, [
+  const legendSettingsRow = createElement('div', { className: 'figure-export-style-row figure-export-legend-settings' }, [
     legendPosSelect,
   ]);
-  annotationSection.appendChild(annotationOpts);
+  const annotationBox = createElement('div', { className: 'figure-export-dashed-box figure-export-annotations-box' }, [
+    annotationChecks,
+    axisLabelSettings,
+    legendSettingsRow,
+  ]);
+  annotationSection.appendChild(annotationBox);
+
+  function syncAnnotationUi() {
+    axisLabelSettings.style.display = includeAxesCheckbox.checked ? 'grid' : 'none';
+    legendSettingsRow.style.display = includeLegendCheckbox.checked ? 'flex' : 'none';
+  }
+  includeAxesCheckbox.addEventListener('change', syncAnnotationUi);
+  includeLegendCheckbox.addEventListener('change', syncAnnotationUi);
+  syncAnnotationUi();
 
   // ─────────────────────────────────────────────────────────────────────────
   // Selection & Preview section
@@ -355,7 +390,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   const previewRow = createElement('div', { className: 'control-block' });
   previewRow.appendChild(createElement('label', {}, ['Preview:']));
   const previewEnabledCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-preview-enabled' });
-  const previewRefreshBtn = createElement('button', { type: 'button', className: 'btn-small' }, ['Refresh']);
+  const previewRefreshBtn = createElement('button', { type: 'button', className: 'toggle-switch figure-export-framing-btn' }, ['Refresh']);
   const previewModeSelect = createElement('select', { className: 'obs-select figure-export-colorblind-select', 'aria-label': 'Colorblind preview' });
   previewModeSelect.appendChild(createElement('option', { value: 'none' }, ['Normal']));
   previewModeSelect.appendChild(createElement('option', { value: 'deuteranopia' }, ['Deuteranopia']));
@@ -365,12 +400,13 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   const previewControls = createElement('div', { className: 'figure-export-preview-controls' }, [
     createElement('label', { className: 'checkbox-inline', htmlFor: previewEnabledCheckbox.id }, [
       previewEnabledCheckbox,
-      ' Show'
-    ]),
-    previewModeSelect,
-    previewRefreshBtn
+      ' Show preview'
+    ])
   ]);
   previewRow.appendChild(previewControls);
+  previewRow.appendChild(createElement('div', { className: 'figure-export-hint figure-export-hint--tight' }, [
+    'Shows an export-style preview (required for framing).'
+  ]));
 
   const previewStatus = createElement('div', { className: 'figure-export-preview-status' }, [
     'Preview is off.'
@@ -386,6 +422,23 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     previewCanvas,
     previewStatus,
   ]);
+
+  const previewSettingsBox = createElement('div', { className: 'figure-export-dashed-box figure-export-preview-settings' }, [
+    createElement('div', { className: 'figure-export-preview-settings-top' }, [
+      previewModeSelect,
+      previewRefreshBtn,
+    ]),
+    createElement('div', { className: 'figure-export-preview-settings-row figure-export-preview-settings-row--toggles' }, [
+      frameExportToggleLabel,
+    ]),
+    createElement('div', { className: 'figure-export-hint figure-export-hint--tight' }, [
+      'Crop the export by dragging the frame in the preview.'
+    ]),
+    framingActionGrid,
+    cropAspectHint,
+    previewBox,
+  ]);
+  previewRow.appendChild(previewSettingsBox);
 
   // ─────────────────────────────────────────────────────────────────────────
   // Advanced & Export section
@@ -492,8 +545,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
 
     const previewOn = previewEnabledCheckbox.checked;
     previewBox.style.display = previewOn ? 'grid' : 'none';
-    previewModeSelect.style.display = previewOn ? '' : 'none';
-    previewRefreshBtn.style.display = previewOn ? 'inline-flex' : 'none';
+    previewSettingsBox.style.display = previewOn ? 'grid' : 'none';
     if (!previewOn) {
       previewStatus.textContent = 'Preview is off.';
     }
@@ -505,7 +557,16 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   dpiSelect.addEventListener('change', syncFormatDependentUi);
   strategySelect.addEventListener('change', syncFormatDependentUi);
   previewEnabledCheckbox.addEventListener('change', async () => {
-    if (!previewEnabledCheckbox.checked) previewFramingMode = 'edit';
+    if (!previewEnabledCheckbox.checked) {
+      previewFramingMode = 'edit';
+      if (cropEnabledCheckbox.checked) {
+        cropEnabled = false;
+        cropEnabledCheckbox.checked = false;
+        previewSampleCrop = null;
+        syncCropUi();
+        schedulePreviewDraw();
+      }
+    }
     syncFormatDependentUi();
     syncCropUi();
     if (!previewEnabledCheckbox.checked) {
@@ -586,8 +647,10 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     schedulePreviewDraw();
   });
 
-  cropLockCheckbox.addEventListener('change', () => {
+  lockAspectBtn.addEventListener('click', () => {
     if (!cropEnabled) return;
+    cropLockCheckbox.checked = !cropLockCheckbox.checked;
+    lockAspectBtn.setAttribute('aria-pressed', cropLockCheckbox.checked ? 'true' : 'false');
     previewFramingMode = 'edit';
     previewSampleCrop = null;
     enforceCropAspect();
@@ -717,17 +780,21 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   }
 
   function readSizePreset() {
-    if (presetSelect.value !== 'screen') return;
+    const preset = presetSelect.value;
+    if (preset !== 'screen' && preset !== 'screen-half') return;
     if (typeof viewer.getRenderState !== 'function') return;
     const rs = viewer.getRenderState();
     if (!rs) return;
-    widthInput.value = String(Math.round(rs.viewportWidth || DEFAULT_SIZE.width));
-    heightInput.value = String(Math.round(rs.viewportHeight || DEFAULT_SIZE.height));
+    const scale = preset === 'screen-half' ? 0.5 : 1;
+    const nextW = Math.max(100, Math.round((rs.viewportWidth || DEFAULT_SIZE.width) * scale));
+    const nextH = Math.max(100, Math.round((rs.viewportHeight || DEFAULT_SIZE.height) * scale));
+    widthInput.value = String(nextW);
+    heightInput.value = String(nextH);
   }
 
   presetSelect.addEventListener('change', () => {
     const value = presetSelect.value;
-    if (value === 'screen') {
+    if (value === 'screen' || value === 'screen-half') {
       readSizePreset();
       onPlotSizeAspectChange();
       return;
@@ -739,9 +806,110 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     onPlotSizeAspectChange();
   });
 
-  // Seed "screen" preset once after init.
+  // Seed the screen preset once after init.
   readSizePreset();
   syncTextSizingUi();
+
+  // Dynamic title: keep in sync with dataset + shown categories until the user edits.
+  let titleAutofillEnabled = true;
+  let lastAutoTitle = '';
+  let settingAutoTitle = false;
+
+  function buildAutoTitle() {
+    const sidebarNameEl = typeof document !== 'undefined' ? document.getElementById('dataset-name') : null;
+    const datasetName = String(sidebarNameEl?.textContent || '').trim();
+    const safeDataset = datasetName && datasetName !== '–' && datasetName !== '—' ? datasetName : '';
+
+    const viewId = getActiveViewIdForPreview();
+    const legendField = typeof state?.getFieldForView === 'function'
+      ? state.getFieldForView(viewId)
+      : (typeof state?.getActiveField === 'function' ? state.getActiveField() : null);
+    const fieldLabel = String(legendField?.label || legendField?.name || legendField?.key || '').trim();
+
+    const legendModel = legendField && typeof state?.getLegendModel === 'function' ? state.getLegendModel(legendField) : null;
+    let categorySummary = '';
+    if (legendModel?.kind === 'category' && Array.isArray(legendModel.categories) && legendModel.categories.length) {
+      const visibleMap = legendModel.visible || {};
+      const visibleCounts = Array.isArray(legendModel?.counts?.visible) ? legendModel.counts.visible : null;
+      const shown = legendModel.categories
+        .map((name, i) => {
+          if (visibleMap[i] === false) return null;
+          if (visibleCounts && (Number(visibleCounts[i]) || 0) <= 0) return null;
+          const s = String(name ?? '').trim();
+          return s ? s : null;
+        })
+        .filter((name) => Boolean(name));
+
+      if (shown.length === 1) {
+        categorySummary = shown[0];
+      } else if (shown.length === 2 || shown.length === 3) {
+        categorySummary = shown.join(', ');
+      } else if (shown.length > 3) {
+        categorySummary = `${shown.slice(0, 2).join(', ')} +${shown.length - 2}`;
+      }
+    }
+
+    if (safeDataset && fieldLabel && categorySummary) return `${safeDataset} • ${fieldLabel}: ${categorySummary}`;
+    if (safeDataset && fieldLabel) return `${safeDataset} • ${fieldLabel}`;
+    if (safeDataset && categorySummary) return `${safeDataset} • ${categorySummary}`;
+    if (fieldLabel && categorySummary) return `${fieldLabel}: ${categorySummary}`;
+    return safeDataset || fieldLabel || categorySummary || '';
+  }
+
+  function syncAutoTitle() {
+    if (!titleAutofillEnabled) return;
+    const next = buildAutoTitle();
+    if (!next) {
+      if (!String(titleInput.value || '').trim()) {
+        settingAutoTitle = true;
+        titleInput.value = 'Figure';
+        settingAutoTitle = false;
+        lastAutoTitle = 'Figure';
+      }
+      return;
+    }
+    if (next === lastAutoTitle && String(titleInput.value || '') === next) return;
+    settingAutoTitle = true;
+    titleInput.value = next;
+    settingAutoTitle = false;
+    lastAutoTitle = next;
+    schedulePreviewDraw();
+  }
+
+  titleInput.addEventListener('input', (evt) => {
+    if (settingAutoTitle) return;
+    const isTrusted = evt?.isTrusted === true;
+    const value = String(titleInput.value || '').trim();
+    if (isTrusted) {
+      titleAutofillEnabled = false;
+      return;
+    }
+    if (!value) {
+      titleAutofillEnabled = true;
+      setTimeout(syncAutoTitle, 0);
+      return;
+    }
+    const auto = buildAutoTitle();
+    titleAutofillEnabled = value === lastAutoTitle || (auto && value === auto);
+  });
+
+  if (typeof state?.on === 'function') {
+    cleanupFns.push(state.on('field:changed', syncAutoTitle));
+    cleanupFns.push(state.on('visibility:changed', syncAutoTitle));
+  }
+  try {
+    const nameEl = typeof document !== 'undefined' ? document.getElementById('dataset-name') : null;
+    if (nameEl && typeof MutationObserver !== 'undefined') {
+      const observer = new MutationObserver(syncAutoTitle);
+      observer.observe(nameEl, { childList: true, characterData: true, subtree: true });
+      cleanupFns.push(() => observer.disconnect());
+    }
+  } catch {
+    // ignore
+  }
+
+  // Seed title once after init (before any state updates arrive).
+  syncAutoTitle();
 
   // Point radius is now taken directly from viewer's renderState (WYSIWYG)
 
@@ -816,13 +984,15 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     cropLockCheckbox.disabled = !cropEnabled;
     cropConfirmBtn.disabled = !cropEnabled;
     cropFitPlotBtn.disabled = !cropEnabled;
+    lockAspectBtn.disabled = !cropEnabled;
+    lockAspectBtn.setAttribute('aria-pressed', cropLockCheckbox.checked ? 'true' : 'false');
 
-    cropResetBtn.style.display = cropEnabled ? 'inline-flex' : 'none';
-    cropLockLabel.style.display = cropEnabled ? '' : 'none';
-    cropConfirmBtn.style.display = cropEnabled ? 'inline-flex' : 'none';
-    cropFitPlotBtn.style.display = cropEnabled ? 'inline-flex' : 'none';
+    framingActionGrid.style.display = cropEnabled ? 'grid' : 'none';
+    cropAspectHint.style.display = cropEnabled ? '' : 'none';
 
-    cropConfirmBtn.textContent = previewFramingMode === 'applied' ? 'Edit' : 'Confirm';
+    const isApplied = previewFramingMode === 'applied';
+    cropConfirmBtn.textContent = isApplied ? 'Edit' : 'Confirm';
+    cropConfirmBtn.setAttribute('aria-pressed', isApplied ? 'false' : 'true');
 
     const exportAspect = getExportAspect();
     const plotLabel = formatAspectLabel(exportAspect);
@@ -1479,19 +1649,14 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
           })
       ) || { minX: -1, maxX: 1, minY: -1, maxY: 1 };
       if (bounds) {
-        const axisLabels = applyAuto3dAxisLabels({
-          xLabel: String(xLabelInput.value || 'X'),
-          yLabel: String(yLabelInput.value || 'Y'),
-          cameraState: sample?.cameraState || null,
-          dim: sample?.dim ?? 3,
-          navMode
-        });
+        const axisXLabel = String(xLabelInput.value || '').trim();
+        const axisYLabel = String(yLabelInput.value || '').trim();
         drawCanvasAxes({
           ctx,
           plotRect,
           bounds,
-          xLabel: axisLabels.xLabel,
-          yLabel: axisLabels.yLabel,
+          xLabel: axisXLabel,
+          yLabel: axisYLabel,
           fontFamily,
           tickFontSize: tickFontSizePx,
           labelFontSize: axisLabelFontSizePx,
@@ -1889,8 +2054,8 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
         includeAxes: includeAxesCheckbox.checked,
         includeLegend: includeLegendCheckbox.checked,
         legendPosition: legendPosSelect.value === 'bottom' ? 'bottom' : 'right',
-        xLabel: String(xLabelInput.value || 'X'),
-        yLabel: String(yLabelInput.value || 'Y'),
+        xLabel: String(xLabelInput.value || ''),
+        yLabel: String(yLabelInput.value || ''),
         background: backgroundSelect.value || 'white',
         backgroundColor: String(backgroundColorInput.value || '#ffffff'),
         fontFamily: String(fontSelect.value || 'Arial, Helvetica, sans-serif'),
@@ -1937,14 +2102,6 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
         result = Array.isArray(results) ? results[0] : results;
       }
 
-      if (showCitationCheckbox.checked) {
-        maybeShowCitationModal({
-          datasetName: result?.metadata?.datasetName || null,
-          fieldKey: result?.metadata?.fieldKey || null,
-          viewLabel: result?.metadata?.viewLabel || null,
-          filename: result?.filename || null
-        });
-      }
     } finally {
       setBusy(false);
     }
@@ -2000,13 +2157,13 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     title: 'Framing',
     desc: 'Plot size, frame export, preview',
     open: false,
-    content: [plotAndFrameRow, previewRow, framingControls, previewBox]
+    content: [plotAndFrameRow, previewRow]
   }).item);
   subAccordion.appendChild(buildSubAccordionItem({
     title: 'Labels & Annotations',
     desc: 'Title, axes, legend, selection, 3D orientation',
     open: false,
-    content: [titleRow, xLabelRow, yLabelRow, annotationSection, selectionRow]
+    content: [titleRow, annotationSection, selectionRow]
   }).item);
   subAccordion.appendChild(buildSubAccordionItem({
     title: 'Style',

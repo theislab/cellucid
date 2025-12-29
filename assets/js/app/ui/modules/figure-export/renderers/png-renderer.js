@@ -47,7 +47,6 @@ import { forEachProjectedPoint } from '../utils/point-projector.js';
 	import { computeVisibleRealBounds } from '../utils/coordinate-mapper.js';
 	import { cropRect01ToPx, normalizeCropRect01 } from '../utils/crop.js';
 	import { reducePointsByDensity } from '../utils/density-reducer.js';
-	import { applyAuto3dAxisLabels } from '../utils/orientation-labels.js';
 	import { embedPngTextChunks } from '../utils/png-metadata.js';
 	import { hashStringToSeed } from '../utils/hash.js';
 import { rasterizePointsWebgl } from '../utils/webgl-point-rasterizer.js';
@@ -674,7 +673,7 @@ export async function renderFigureToPngBlob({ state, viewer, payload }) {
       });
     }
 
-    // Axes (2D uses embedding coordinates; 3D uses camera-space coordinates + orientation labels).
+    // Axes (2D uses embedding coordinates; 3D uses camera-space coordinates).
     if (axesEligible && renderState) {
       const norm = typeof state?.dimensionManager?.getNormTransform === 'function'
         ? state.dimensionManager.getNormTransform(dim)
@@ -704,19 +703,14 @@ export async function renderFigureToPngBlob({ state, viewer, payload }) {
           })
       ) || { minX: -1, maxX: 1, minY: -1, maxY: 1 };
       if (bounds) {
-        const axisLabels = applyAuto3dAxisLabels({
-          xLabel: String(opts.xLabel || 'X'),
-          yLabel: String(opts.yLabel || 'Y'),
-          cameraState,
-          dim,
-          navMode
-        });
+        const axisXLabel = opts?.xLabel == null ? 'X' : String(opts.xLabel);
+        const axisYLabel = opts?.yLabel == null ? 'Y' : String(opts.yLabel);
         drawCanvasAxes({
           ctx,
           plotRect,
           bounds,
-          xLabel: axisLabels.xLabel,
-          yLabel: axisLabels.yLabel,
+          xLabel: axisXLabel,
+          yLabel: axisYLabel,
           fontFamily,
           tickFontSize,
           labelFontSize: axisLabelFontSize,

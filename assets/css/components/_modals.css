@@ -30,7 +30,6 @@
   box-shadow: var(--shadow-lg);
   max-width: 420px;
   width: 100%;
-  animation: welcomeSlideIn 0.3s ease-out;
 }
 
 @keyframes welcomeSlideIn {
@@ -45,12 +44,16 @@
 }
 
 .welcome-header {
-  padding: 24px 24px 20px;
+  margin: 16px 16px 0;
+  padding: 12px 16px 10px;
   text-align: center;
+  background: var(--color-surface-secondary);
+  border: 1px solid var(--color-text-primary);
+  box-shadow: var(--shadow-md);
 }
 
 .welcome-logo {
-  width: 200px;
+  width: 260px;
   height: auto;
   margin-bottom: 8px;
 }
@@ -66,15 +69,9 @@
 }
 
 .welcome-body {
-  padding: 16px 24px;
+  padding: 16px;
 }
 
-.welcome-body::before {
-  content: '';
-  display: block;
-  margin-bottom: 16px;
-  border-top: var(--border-width-1) solid var(--color-border-light);
-}
 
 .welcome-intro {
   font-size: 13px;
@@ -101,17 +98,14 @@
   cursor: pointer;
   text-decoration: none;
   color: var(--color-text-primary);
-  transition: var(--transition-all);
 }
 
 .welcome-btn:hover {
   background: var(--color-border-light);
-  transform: translate(-2px, -2px);
   box-shadow: var(--shadow-lg);
 }
 
 .welcome-btn:active {
-  transform: translate(0, 0);
   box-shadow: var(--shadow-xs);
 }
 
@@ -165,11 +159,23 @@
   font-size: 12px;
   color: var(--color-text-secondary);
   text-align: center;
-  opacity: var(--opacity-80);
+}
+
+.welcome-quote-explanation {
+  display: block;
+  font-style: normal;
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--color-text-secondary);
+  margin-bottom: 6px;
+  opacity: var(--opacity-60);
 }
 
 .welcome-quote-text {
   display: block;
+  opacity: var(--opacity-80);
 }
 
 .welcome-quote-attr {
@@ -177,7 +183,7 @@
   font-style: normal;
   font-size: 10px;
   margin-top: 4px;
-  opacity: var(--opacity-70);
+  opacity: var(--opacity-60);
 }
 
 .welcome-quote-book {
@@ -206,18 +212,25 @@
   position: absolute;
   inset: 0;
   background: var(--color-surface-overlay);
-  backdrop-filter: blur(2px);
+  backdrop-filter: blur(10px) saturate(1.15);
 }
 
 .license-content {
   position: relative;
-  background: var(--color-surface-elevated);
-  border: var(--border-width-2) solid var(--color-border-strong);
-  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+  border-radius: var(--radius-2xl);
+  background:
+    radial-gradient(140% 120% at 20% 0%, rgba(255, 255, 255, 0.10), transparent 60%),
+    radial-gradient(140% 140% at 80% 100%, rgba(0, 0, 0, 0.14), transparent 55%),
+    var(--color-surface-elevated);
+  border: 1px solid color-mix(in srgb, var(--color-border-default) 65%, transparent);
+  box-shadow:
+    0 24px 80px rgba(var(--shadow-rgb), var(--opacity-25)),
+    0 8px 22px rgba(var(--shadow-rgb), var(--opacity-12)),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
   max-width: 600px;
   width: 100%;
   max-height: 80vh;
-  overflow: hidden;
   display: flex;
   flex-direction: column;
 }
@@ -326,13 +339,21 @@
   position: absolute;
   inset: 0;
   background: var(--color-surface-overlay);
+  backdrop-filter: blur(10px) saturate(1.15);
 }
 
 .error-content {
   position: relative;
-  background: var(--color-surface-elevated);
-  border: 2px solid var(--color-text-primary);
-  box-shadow: var(--shadow-xl);
+  overflow: hidden;
+  border-radius: var(--radius-2xl);
+  background:
+    radial-gradient(140% 120% at 20% 0%, rgba(255, 255, 255, 0.12), transparent 58%),
+    radial-gradient(140% 140% at 80% 100%, rgba(0, 0, 0, 0.16), transparent 55%),
+    var(--color-surface-elevated);
+  border: 1px solid color-mix(in srgb, var(--color-border-default) 70%, transparent);
+  box-shadow:
+    0 28px 90px rgba(var(--shadow-rgb), var(--opacity-30)),
+    0 10px 26px rgba(var(--shadow-rgb), var(--opacity-12));
   padding: 32px;
   max-width: 400px;
   width: 100%;
@@ -429,6 +450,7 @@
   }
 
   .welcome-header {
+    margin: 12px 12px 0;
     padding: 16px 16px 12px;
   }
 
@@ -437,7 +459,7 @@
   }
 
   .welcome-body {
-    padding: 16px;
+    padding: 12px;
   }
 
   .error-content {
@@ -478,6 +500,7 @@
   position: absolute;
   inset: 0;
   background: var(--color-surface-overlay);
+  backdrop-filter: blur(10px) saturate(1.15);
 }
 
 .analysis-modal-content {
@@ -487,9 +510,15 @@
   min-width: 600px;
   height: 66vh;
   min-height: 500px;
-  background: var(--color-surface-elevated);
-  border: var(--border-strong);
-  box-shadow: var(--shadow-lg);
+  border-radius: var(--radius-2xl);
+  background:
+    radial-gradient(140% 120% at 22% 0%, rgba(255, 255, 255, 0.08), transparent 62%),
+    radial-gradient(140% 140% at 78% 100%, rgba(0, 0, 0, 0.18), transparent 55%),
+    var(--color-surface-elevated);
+  border: 1px solid color-mix(in srgb, var(--color-border-default) 70%, transparent);
+  box-shadow:
+    0 26px 88px rgba(var(--shadow-rgb), var(--opacity-28)),
+    0 10px 26px rgba(var(--shadow-rgb), var(--opacity-12));
   /* Flexbox for main layout - more predictable than grid for resizing */
   display: flex;
   flex-direction: column;

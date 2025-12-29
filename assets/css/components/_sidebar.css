@@ -28,14 +28,16 @@
 .sidebar-scroll {
   flex: 1 1 auto;
   min-height: 0;
-  background-color: var(--color-surface-elevated);
+  background-color: color-mix(in srgb, var(--color-surface-sunken) 94%, black);
   /* Subtle horizontal rules to suggest paper */
   background-image: linear-gradient(
     to bottom,
-    color-mix(in srgb, var(--color-border-strong) 4%, transparent) 1px,
+    color-mix(in srgb, var(--color-border-strong) 8%, transparent) 1px,
     transparent 1px
   );
   background-size: 100% 26px;
+  /* Subtle inset shadow for depth */
+  box-shadow: inset 0 1px 3px color-mix(in srgb, var(--color-text-primary) 6%, transparent);
   padding: var(--space-3-5) var(--space-4) var(--space-3);
   display: flex;
   flex-direction: column;
@@ -127,9 +129,10 @@
 
 /* Masthead style for the logo */
 .sidebar-brand {
-  margin: 0 0 6px;
-  border-bottom: var(--border-default);
+  margin: 0 0 var(--space-1);
+  border: var(--border-strong);
   background: var(--color-surface-elevated);
+  box-shadow: var(--shadow-md);
 }
 
 .sidebar-brand-link {
@@ -137,7 +140,7 @@
   align-items: center;
   justify-content: center;
   width: 100%;
-  padding: var(--space-1) var(--space-1-5) var(--space-2);
+  padding: var(--space-2) var(--space-1-5) var(--space-2);
   text-decoration: none;
 }
 

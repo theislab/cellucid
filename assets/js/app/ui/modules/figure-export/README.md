@@ -32,7 +32,6 @@ This folder implements **publication-grade SVG/PNG export** for Cellucid without
 - `components/orientation-indicator.js`: 3D orientation widget (axis triad + angles).
 - `components/centroid-overlay.js`: centroid points + centroid text overlay (WYSIWYG with viewer state).
 - `components/large-dataset-dialog.js`: forces explicit user choice for large SVG exports.
-- `components/citation-modal.js`: post-export citation helper.
 
 ### Utilities
 
