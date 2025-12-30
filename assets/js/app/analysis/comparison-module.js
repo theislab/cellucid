@@ -608,6 +608,18 @@ export class ComparisonModule {
   // ===========================================================================
 
   /**
+   * Get the AnalysisWindowManager instance (if initialized).
+   *
+   * Session bundle restore uses this to reopen floating analysis windows from
+   * descriptors without reaching into private fields.
+   *
+   * @returns {any|null}
+   */
+  getAnalysisWindowManager() {
+    return this._analysisWindowManager || null;
+  }
+
+  /**
    * Get current configuration
    */
   getConfig() {

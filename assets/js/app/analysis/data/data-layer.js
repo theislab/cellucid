@@ -1557,6 +1557,139 @@ export class DataLayer {
     return `bulk_genes:${sortedUnique.join(',')}`;
   }
 
+  // ===========================================================================
+  // SESSION CACHE EXPORT/IMPORT (for session bundles)
+  // ===========================================================================
+
+  /**
+   * Export portable analysis caches for inclusion in a session bundle.
+   *
+   * IMPORTANT:
+   * - This API intentionally avoids exposing private cache internals directly.
+   * - Callers (session contributors) are responsible for chunking/encoding.
+   * - Dev-phase: we currently export the bulk gene cache only (the largest, most
+   *   expensive-to-recompute analysis cache in typical workflows).
+   *
+   * @returns {Array<{ kind: 'bulk-gene', cacheKey: string, gene: string, pageId: string, pageName: string, cellCount: number, timestamp: number, geneCount: number, values: Float32Array, cellIndices: Uint32Array }>}
+   */
+  exportSessionCache() {
+    /** @type {Array<{ kind: 'bulk-gene', cacheKey: string, gene: string, pageId: string, pageName: string, cellCount: number, timestamp: number, geneCount: number, values: Float32Array, cellIndices: Uint32Array }>} */
+    const artifacts = [];
+
+    for (const [cacheKey, entry] of this._bulkGeneCache.entries()) {
+      const ts = Number(entry?.timestamp ?? 0) || 0;
+      const geneCount = Number(entry?.geneCount ?? 0) || 0;
+      const data = entry?.data || null;
+      if (!data || typeof data !== 'object') continue;
+
+      for (const [gene, genePages] of Object.entries(data)) {
+        if (!genePages || typeof genePages !== 'object') continue;
+
+        for (const [pageId, pd] of Object.entries(genePages)) {
+          const valuesIn = pd?.values;
+          const indicesIn = pd?.cellIndices;
+          if (!valuesIn || !indicesIn) continue;
+
+          const cellCount = Number(pd?.cellCount ?? (Array.isArray(indicesIn) ? indicesIn.length : indicesIn.length)) || 0;
+          const pageName = String(pd?.pageName || pageId);
+
+          // Convert values to Float32Array (portable, compact, renderer-friendly).
+          let values = valuesIn instanceof Float32Array ? valuesIn : null;
+          if (!values) {
+            const n = valuesIn.length >>> 0;
+            values = new Float32Array(n);
+            for (let i = 0; i < n; i++) values[i] = Number(valuesIn[i] ?? NaN);
+          }
+
+          // Convert indices to Uint32Array.
+          let cellIndices = indicesIn instanceof Uint32Array ? indicesIn : null;
+          if (!cellIndices) {
+            const n = indicesIn.length >>> 0;
+            cellIndices = new Uint32Array(n);
+            for (let i = 0; i < n; i++) cellIndices[i] = Number(indicesIn[i] ?? 0) >>> 0;
+          }
+
+          artifacts.push({
+            kind: 'bulk-gene',
+            cacheKey,
+            gene,
+            pageId,
+            pageName,
+            cellCount,
+            timestamp: ts,
+            geneCount,
+            values,
+            cellIndices
+          });
+        }
+      }
+    }
+
+    return artifacts;
+  }
+
+  /**
+   * Import a session cache artifact (or array of artifacts) into this DataLayer.
+   *
+   * This is used by the session-bundle lazy restore path to incrementally
+   * populate caches without reaching into private fields from session code.
+   *
+   * @param {any} artifactOrArtifacts
+   * @returns {number} Number of artifacts applied
+   */
+  importSessionCache(artifactOrArtifacts) {
+    const artifacts = Array.isArray(artifactOrArtifacts) ? artifactOrArtifacts : [artifactOrArtifacts];
+    let applied = 0;
+
+    for (const artifact of artifacts) {
+      if (!artifact || artifact.kind !== 'bulk-gene') continue;
+
+      const cacheKey = String(artifact.cacheKey || '').trim();
+      const gene = String(artifact.gene || '').trim();
+      const pageId = String(artifact.pageId || '').trim();
+      if (!cacheKey || !gene || !pageId) continue;
+
+      const values = artifact.values instanceof Float32Array ? artifact.values : null;
+      const cellIndices = artifact.cellIndices instanceof Uint32Array ? artifact.cellIndices : null;
+      if (!values || !cellIndices) continue;
+
+      const pageName = String(artifact.pageName || pageId);
+      const cellCount = Number(artifact.cellCount ?? cellIndices.length) || cellIndices.length;
+      const timestamp = Number(artifact.timestamp ?? Date.now()) || Date.now();
+      const geneCount = Number(artifact.geneCount ?? 0) || 0;
+
+      // Merge into the existing cache entry (or create one).
+      const existing = this._bulkGeneCache.get(cacheKey);
+      const entry = existing && typeof existing === 'object'
+        ? existing
+        : { data: {}, timestamp, geneCount };
+
+      if (!entry.data || typeof entry.data !== 'object') entry.data = {};
+      if (!entry.data[gene] || typeof entry.data[gene] !== 'object') entry.data[gene] = {};
+
+      entry.data[gene][pageId] = {
+        values,
+        cellIndices,
+        pageName,
+        cellCount
+      };
+
+      // Preserve the newest timestamp/geneCount seen for the entry.
+      entry.timestamp = Math.max(Number(entry.timestamp ?? 0) || 0, timestamp);
+      entry.geneCount = Math.max(
+        Number(entry.geneCount ?? 0) || 0,
+        geneCount,
+        Object.keys(entry.data || {}).length
+      );
+
+      // Use the canonical setter so eviction/access order are maintained.
+      this._setBulkGeneCache(cacheKey, entry);
+      applied += 1;
+    }
+
+    return applied;
+  }
+
   /**
    * Fetch all gene expression data for given pages
    *

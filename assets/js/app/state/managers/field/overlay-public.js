@@ -480,7 +480,7 @@ export class FieldOverlayPublicMethods {
    *
    * - Categorical obs: deep-copies codes + categories and computes centroids.
    * - Continuous obs/var: creates a continuous alias that re-materializes values from
-   *   the referenced source field when loading state snapshots.
+   *   the referenced source field when restoring a session bundle.
    *
    * This is a non-destructive operation (the source field remains intact).
    *

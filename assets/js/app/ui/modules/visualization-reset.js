@@ -59,10 +59,10 @@ export function initVisualizationReset({ viewer, renderDom, cameraDom, renderCon
     initialUIState = {
       background: backgroundSelect?.value || 'white',
       renderMode: renderModeSelect?.value || 'points',
-      pointSize: pointSizeInput?.value || String(renderControls.pointSizeToSlider?.(1.0) ?? 0),
+      pointSize: pointSizeInput?.value || String(renderControls.pointSizeToSlider?.(0.75) ?? 0),
       lighting: lightingStrengthInput?.value || '60',
       fog: fogDensityInput?.value || '50',
-      sizeAttenuation: sizeAttenuationInput?.value || '65',
+      sizeAttenuation: sizeAttenuationInput?.value || '80',
 
       smokeGrid: smokeGridInput?.value || '60',
       smokeSteps: smokeStepsInput?.value || '75',
@@ -246,4 +246,3 @@ export function initVisualizationReset({ viewer, renderDom, cameraDom, renderCon
 
   return { resetVisualizationToDefaults, captureInitialState };
 }
-

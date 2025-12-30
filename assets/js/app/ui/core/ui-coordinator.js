@@ -40,7 +40,7 @@ const LIVE_VIEW_ID = 'live';
  * @param {{ rebuildSmokeDensity?: (gridSize?: number) => void } | null} [options.smoke]
  * @param {import('../../../data/data-source-manager.js').DataSourceManager | null} [options.dataSourceManager]
  * @param {(metadata: any) => Promise<void> | void} [options.reloadActiveDataset]
- * @param {object|null} [options.stateSerializer]
+ * @param {object|null} [options.sessionSerializer]
  */
 export function initUI({
   state,
@@ -48,7 +48,7 @@ export function initUI({
   smoke = null,
   dataSourceManager = null,
   reloadActiveDataset = null,
-  stateSerializer = null
+  sessionSerializer = null
 }) {
   debug.log('[UI] initUI');
 
@@ -211,7 +211,7 @@ export function initUI({
 
   const { showSessionStatus } = initSessionControls({
     dom: dom.session,
-    stateSerializer,
+    sessionSerializer,
     onAfterLoad: refreshUiAfterStateLoad
   });
 

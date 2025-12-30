@@ -101,6 +101,23 @@ export function initRenderControls({ viewer, dom, smoke, callbacks = {} }) {
   const noiseResolutionInput = dom?.noiseResolutionInput || null;
   const noiseResolutionDisplay = dom?.noiseResolutionDisplay || null;
 
+  const VIEWER_BACKGROUND_STORAGE_KEY = 'cellucid_viewer_background';
+
+  function safeGetStoredViewerBackground() {
+    try {
+      const value = localStorage.getItem(VIEWER_BACKGROUND_STORAGE_KEY);
+      return typeof value === 'string' ? value : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function normalizeViewerBackground(value) {
+    return value === 'grid' || value === 'grid-dark' || value === 'white' || value === 'black'
+      ? value
+      : 'grid';
+  }
+
   // Volumetric smoke UI state
   let smokeDirty = false;
   let smokeBuiltOnce = false;
@@ -135,7 +152,7 @@ export function initRenderControls({ viewer, dom, smoke, callbacks = {} }) {
   // Log-scale point size mapping
   const MIN_POINT_SIZE = 0.25;
   const MAX_POINT_SIZE = 200.0;
-  const DEFAULT_POINT_SIZE = 1.0;
+  const DEFAULT_POINT_SIZE = 0.75;
   const POINT_SIZE_SCALE = MAX_POINT_SIZE / MIN_POINT_SIZE;
 
   function sliderToPointSize(sliderValue) {
@@ -160,6 +177,27 @@ export function initRenderControls({ viewer, dom, smoke, callbacks = {} }) {
     const size = sliderToPointSize(pointSizeInput.value);
     viewer.setPointSize?.(size);
     if (pointSizeDisplay) pointSizeDisplay.textContent = formatPointSize(size);
+  }
+
+  function snapRangeValueToStep(value, input) {
+    if (!input) return value;
+
+    const minAttr = parseFloat(input.min);
+    const maxAttr = parseFloat(input.max);
+    const min = Number.isFinite(minAttr) ? minAttr : 0;
+    const max = Number.isFinite(maxAttr) ? maxAttr : 100;
+
+    const clamped = clamp(value, min, max);
+
+    const stepAttr = input.step;
+    if (!stepAttr || stepAttr === 'any') return clamped;
+    const step = parseFloat(stepAttr);
+    if (!Number.isFinite(step) || step <= 0) return clamped;
+
+    const decimals = stepAttr.includes('.') ? stepAttr.split('.')[1].length : 0;
+    const snapped = Math.round((clamped - min) / step) * step + min;
+    const rounded = decimals > 0 ? Number(snapped.toFixed(decimals)) : snapped;
+    return clamp(rounded, min, max);
   }
 
   function applyRenderMode(mode) {
@@ -416,9 +454,14 @@ export function initRenderControls({ viewer, dom, smoke, callbacks = {} }) {
   }
 
   if (backgroundSelect) {
-    viewer.setBackground?.(backgroundSelect.value);
+    const stored = safeGetStoredViewerBackground();
+    const initial = normalizeViewerBackground(stored || backgroundSelect.value || 'grid');
+    backgroundSelect.value = initial;
+    viewer.setBackground?.(initial);
     backgroundSelect.addEventListener('change', () => {
-      viewer.setBackground?.(backgroundSelect.value);
+      const next = normalizeViewerBackground(backgroundSelect.value);
+      if (backgroundSelect.value !== next) backgroundSelect.value = next;
+      viewer.setBackground?.(next);
     });
   }
 
@@ -471,7 +514,7 @@ export function initRenderControls({ viewer, dom, smoke, callbacks = {} }) {
     const normalizedSliderValue = Number.isFinite(initialSliderValue)
       ? clamp(initialSliderValue, 0, 100)
       : pointSizeToSlider(DEFAULT_POINT_SIZE);
-    pointSizeInput.value = String(Math.round(normalizedSliderValue));
+    pointSizeInput.value = String(snapRangeValueToStep(normalizedSliderValue, pointSizeInput));
     applyPointSizeFromSlider();
   }
 
@@ -481,7 +524,7 @@ export function initRenderControls({ viewer, dom, smoke, callbacks = {} }) {
   }
   if (sizeAttenuationInput) {
     const initialSizeAttenuation = parseFloat(sizeAttenuationInput.value);
-    viewer.setSizeAttenuation?.(Number.isFinite(initialSizeAttenuation) ? initialSizeAttenuation / 100.0 : 0.65);
+    viewer.setSizeAttenuation?.(Number.isFinite(initialSizeAttenuation) ? initialSizeAttenuation / 100.0 : 0.8);
   }
   if (lightingStrengthDisplay && lightingStrengthInput) lightingStrengthDisplay.textContent = lightingStrengthInput.value;
   if (fogDensityDisplay && fogDensityInput) fogDensityDisplay.textContent = fogDensityInput.value;

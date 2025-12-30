@@ -15,10 +15,12 @@ export const downloadTrackingMethods = {
    * Start tracking a download.
    * @param {string} name - Download name for display.
    * @param {number|null} [totalBytes=null] - Total size in bytes (optional).
+   * @param {{ onCancel?: (() => void) | null }} [options]
    * @returns {string} Tracker ID
    */
-  startDownload(name, totalBytes = null) {
+  startDownload(name, totalBytes = null, options = {}) {
     const id = this._generateId();
+    const onCancel = typeof options?.onCancel === 'function' ? options.onCancel : null;
 
     const now = performance.now();
     const tracker = {
@@ -28,20 +30,20 @@ export const downloadTrackingMethods = {
       startTime: now,
       lastTime: now,
       lastBytes: 0,
-      speed: 0,
-      notificationId: null
+      speed: 0
     };
 
     this.downloadTrackers.set(id, tracker);
 
-    tracker.notificationId = this.show({
+    this.show({
       id: `download-${id}`,
       type: totalBytes ? NotificationType.PROGRESS : NotificationType.LOADING,
       category: 'download',
       title: 'Downloading',
       message: name,
       progress: 0,
-      speed: 0
+      speed: 0,
+      onCancel
     });
 
     return id;
@@ -113,4 +115,3 @@ export const downloadTrackingMethods = {
     this.downloadTrackers.delete(id);
   }
 };
-

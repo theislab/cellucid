@@ -4,11 +4,13 @@
  * Responsibilities:
  * - Create a categorical codes array from highlight pages (with overlap strategy)
  * - Compute per-dimension centroids (raw space) with NO outlier filtering
- * - Serialize/deserialize large codes arrays efficiently (RLE)
  * - Persist soft-deletes so derived columns are restorable
+ *
+ * Session bundles persist:
+ * - field *definitions* eagerly via `toSessionMeta()/fromSessionMeta()`
+ * - large categorical codes arrays separately as binary chunks
  */
 
-import { rleEncode, rleDecode } from '../utils/rle-codec.js';
 import { StateValidator } from '../utils/state-validator.js';
 import { FieldKind, FieldSource, Limits, OverlapStrategy, generateId } from '../utils/field-constants.js';
 import { makeUniqueLabel } from '../utils/label-utils.js';
@@ -48,7 +50,7 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
    * Used for destructive categorical edits (merge categories, delete→unassigned)
    * where we want to:
    * - Keep the original field intact (restorable via Deleted Fields)
-   * - Persist the derived field through state snapshots (RLE)
+   * - Persist the derived field through session bundles (compact binary codes)
    *
    * @param {object} options
    * @param {string} options.key
@@ -102,7 +104,7 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
    * Register a user-defined continuous field that is sourced from an existing
    * obs/var continuous field (e.g. "copy continuous obs" or "copy gene expression").
    *
-   * We intentionally do NOT persist the raw values array in snapshots.
+   * We intentionally do NOT persist the raw values array in session bundles.
    * DataState re-materializes values by copying from the referenced source field.
    *
    * @param {object} options
@@ -432,61 +434,82 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
   // Serialization
   // ---------------------------------------------------------------------------
 
-  toJSON() {
+  /**
+   * Session-bundle metadata export (NO heavy codes payloads).
+   *
+   * The session bundle stores user-defined field definitions in an eager JSON
+   * chunk (key/categories/source refs), while the large categorical `codes`
+   * arrays are stored separately as binary chunks and loaded lazily.
+   *
+   * @returns {any[]}
+   */
+  toSessionMeta() {
     const result = [];
     for (const [id, field] of this._fields) {
       const source = field?._fieldSource === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
       const kind = field?.kind === FieldKind.CONTINUOUS ? FieldKind.CONTINUOUS : FieldKind.CATEGORY;
 
-      if (kind === FieldKind.CATEGORY) {
-        const codesRLE = rleEncode(field.codes);
+      if (kind === FieldKind.CONTINUOUS) {
+        // Continuous aliases: metadata-only, values are materialized by copying from source fields.
         result.push({
           id,
           source,
           kind,
           key: field.key,
-          categories: [...(field.categories || [])],
           isDeleted: field._isDeleted === true,
           isPurged: field._isPurged === true,
-          codesRLE,
-          codesLength: field.codes?.length || 0,
-          codesType: field.codes?.constructor?.name || 'Uint8Array',
-          centroidsByDim: field.centroidsByDim || {},
-          normalizedDims: field._normalizedDims ? [...field._normalizedDims] : [],
           sourceField: field._sourceField || null,
           operation: field._operation || null,
-          sourcePages: field._sourcePages || [],
-          overlapStrategy: field._overlapStrategy || 'first',
-          overlapLabel: field._overlapLabel || null,
-          intersectionLabels: field._intersectionLabels || null,
-          uncoveredLabel: field._uncoveredLabel || null,
           createdAt: field._createdAt || null
         });
         continue;
       }
 
-      // Continuous aliases: persist only metadata + stable source reference.
+      // Categorical user-defined fields: store definition (no codes array).
+      const codesType = field.codes?.constructor?.name || field._codesTypeHint || 'Uint8Array';
+      const codesLength = typeof field.codes?.length === 'number' ? field.codes.length : (field._codesLengthHint || 0);
+
       result.push({
         id,
         source,
         kind,
         key: field.key,
+        categories: [...(field.categories || [])],
         isDeleted: field._isDeleted === true,
         isPurged: field._isPurged === true,
+        codesLength,
+        codesType,
+        centroidsByDim: field.centroidsByDim || {},
+        normalizedDims: field._normalizedDims ? [...field._normalizedDims] : [],
         sourceField: field._sourceField || null,
         operation: field._operation || null,
+        sourcePages: field._sourcePages || [],
+        overlapStrategy: field._overlapStrategy || 'first',
+        overlapLabel: field._overlapLabel || null,
+        intersectionLabels: field._intersectionLabels || null,
+        uncoveredLabel: field._uncoveredLabel || null,
         createdAt: field._createdAt || null
       });
     }
     return result;
   }
 
-  fromJSON(data, state) {
+  /**
+   * Restore user-defined field definitions from session-bundle metadata.
+   *
+   * Note: categorical `codes` arrays are intentionally NOT restored here.
+   * They are attached later by the session-bundle lazy `user-defined/codes/*` chunks.
+   *
+   * @param {any[]} data
+   */
+  fromSessionMeta(data) {
     this._fields.clear();
 
     for (const item of (data || [])) {
       const kind = item?.kind === FieldKind.CONTINUOUS ? FieldKind.CONTINUOUS : FieldKind.CATEGORY;
       const source = item?.source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
+
+      if (!item?.id || !item?.key) continue;
 
       if (kind === FieldKind.CONTINUOUS) {
         const field = {
@@ -510,20 +533,17 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
         continue;
       }
 
+      // Categorical user-defined field placeholder: mark as "loaded" with an empty
+      // codes array so filters/UI can restore without triggering dataset loaders.
       const ArrayType = item.codesType === 'Uint16Array' ? Uint16Array : Uint8Array;
-      const codes = rleDecode(item.codesRLE, item.codesLength, ArrayType);
-
-      let centroidsByDim = item.centroidsByDim || {};
-      if (!centroidsByDim || Object.keys(centroidsByDim).length === 0) {
-        centroidsByDim = computeAllDimensionCentroids(codes, item.categories || [], state);
-      }
+      const codes = new ArrayType(0);
 
       const field = {
         key: item.key,
         kind: FieldKind.CATEGORY,
         categories: item.categories || [],
         codes,
-        centroidsByDim,
+        centroidsByDim: item.centroidsByDim || {},
         loaded: true,
 
         _isUserDefined: true,
@@ -539,7 +559,11 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
         _intersectionLabels: item.intersectionLabels || null,
         _uncoveredLabel: item.uncoveredLabel || null,
         _createdAt: item.createdAt || null,
-        _normalizedDims: Array.isArray(item.normalizedDims) ? new Set(item.normalizedDims) : null
+        _normalizedDims: Array.isArray(item.normalizedDims) ? new Set(item.normalizedDims) : null,
+
+        // Hints used by session restore to validate incoming code payloads.
+        _codesLengthHint: item.codesLength || 0,
+        _codesTypeHint: item.codesType || 'Uint8Array'
       };
 
       this._fields.set(item.id, field);

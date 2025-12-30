@@ -415,6 +415,9 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks = /*
             : 'Cameras independent (click to link)')
         : 'Add a kept view to link cameras';
     }
+    // Keep the button label/aria state in sync in case camera lock is toggled
+    // programmatically (e.g., session restore).
+    updateCameraLockUI();
 
     if (viewLayoutModeSelect) {
       if (!modeIsPoints) {

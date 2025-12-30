@@ -459,11 +459,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   // Grid state - grid is default background (matches 'grid' light mode)
   let showGrid = true;
   // Match original neutral grid contrast, but on pure white instead of off-white.
-  let gridColor = [0.45, 0.45, 0.48];   // Medium gray - visible on light bg
-  let gridBgColor = [1.0, 1.0, 1.0];    // Must match bgColor exactly in light grid mode
-  let gridSpacing = 0.2;
-  let gridLineWidth = 0.008;
-  let gridOpacity = 0.75;
+		  let gridColor = [0.45, 0.45, 0.48];   // Medium gray - visible on light bg
+		  let gridBgColor = [1.0, 1.0, 1.0];    // Must match bgColor exactly in light grid mode
+		  let gridSpacing = 0.2;
+		  let gridLineWidth = 0.008;
+		  let gridOpacity = 0.75;
   // Target values for smooth grid transitions
   let targetGridOpacity = 0.75;
   let gridTransitionSpeed = 3.0;  // Opacity change per second
@@ -1922,22 +1922,22 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     }
   }
 
-  function drawGrid() {
-    // Allow fade-out transition to complete before stopping render
-    if (gridOpacity <= 0) return;
-    gl.useProgram(gridProgram);
-    gl.uniformMatrix4fv(gridUniformLocations.mvpMatrix, false, mvpMatrix);
-    gl.uniformMatrix4fv(gridUniformLocations.viewMatrix, false, viewMatrix);
-    gl.uniformMatrix4fv(gridUniformLocations.modelMatrix, false, modelMatrix);
-    gl.uniform3fv(gridUniformLocations.gridColor, gridColor);
-    gl.uniform3fv(gridUniformLocations.bgColor, gridBgColor);
-    gl.uniform1f(gridUniformLocations.gridSpacing, gridSpacing);
-    gl.uniform1f(gridUniformLocations.gridLineWidth, gridLineWidth);
-    gl.uniform1f(gridUniformLocations.gridOpacity, gridOpacity);
-    gl.uniform1f(gridUniformLocations.fogDensity, fogDensity * gridFogDensityMultiplier);
-    gl.uniform1f(gridUniformLocations.fogNearMean, fogNearMean);
-    gl.uniform1f(gridUniformLocations.fogFarMean, fogFarMean);
-    gl.uniform1f(gridUniformLocations.gridSize, GRID_SIZE);
+		  function drawGrid() {
+		    // Allow fade-out transition to complete before stopping render
+		    if (gridOpacity <= 0) return;
+		    gl.useProgram(gridProgram);
+		    gl.uniformMatrix4fv(gridUniformLocations.mvpMatrix, false, mvpMatrix);
+		    gl.uniformMatrix4fv(gridUniformLocations.viewMatrix, false, viewMatrix);
+		    gl.uniformMatrix4fv(gridUniformLocations.modelMatrix, false, modelMatrix);
+		    gl.uniform3fv(gridUniformLocations.gridColor, gridColor);
+		    gl.uniform3fv(gridUniformLocations.bgColor, gridBgColor);
+		    gl.uniform1f(gridUniformLocations.gridSpacing, gridSpacing);
+		    gl.uniform1f(gridUniformLocations.gridLineWidth, gridLineWidth);
+		    gl.uniform1f(gridUniformLocations.gridOpacity, gridOpacity);
+		    gl.uniform1f(gridUniformLocations.fogDensity, fogDensity * gridFogDensityMultiplier);
+		    gl.uniform1f(gridUniformLocations.fogNearMean, fogNearMean);
+		    gl.uniform1f(gridUniformLocations.fogFarMean, fogFarMean);
+		    gl.uniform1f(gridUniformLocations.gridSize, GRID_SIZE);
 
     // Scientific axis colors (RGB for XYZ)
     gl.uniform3fv(gridUniformLocations.axisXColor, axisXColor);
@@ -2762,13 +2762,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     mat4.multiply(mvpMatrix, projectionMatrix, viewMatrix);
     mat4.multiply(mvpMatrix, mvpMatrix, modelMatrix);
 
-    if (renderMode === 'smoke') {
-      gl.viewport(0, 0, width, height);
-      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-      // Draw grid first as background reference (render during fade-out too)
-      if (gridOpacity > 0) {
-        drawGrid();
-      }
+		    if (renderMode === 'smoke') {
+		      gl.viewport(0, 0, width, height);
+		      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+		      // Draw grid first as background reference (render during fade-out too)
+		      if (gridOpacity > 0) {
+		        drawGrid();
+		      }
       // Compute inverse view-projection matrix for smoke ray marching
       mat4.multiply(viewProjMatrix, projectionMatrix, viewMatrix);
       mat4.invert(invViewProjMatrix, viewProjMatrix);
@@ -3016,12 +3016,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 	    updateLabelLayerVisibility();
 	  }
 
-	  function renderSingleView(width, height, viewport, viewId, overrideCentroidCount, snapshotBufferId = null, dtSeconds = 0.016, timeSeconds = 0) {
-	    const vid = viewId || focusedViewId || LIVE_VIEW_ID;
-	    const numCentroids = overrideCentroidCount !== undefined ? overrideCentroidCount : centroidCount;
+		  function renderSingleView(width, height, viewport, viewId, overrideCentroidCount, snapshotBufferId = null, dtSeconds = 0.016, timeSeconds = 0) {
+		    const vid = viewId || focusedViewId || LIVE_VIEW_ID;
+		    const numCentroids = overrideCentroidCount !== undefined ? overrideCentroidCount : centroidCount;
 
-	    // Draw grid first
-	    drawGrid();
+			    // Draw grid first
+			    drawGrid();
 
 	    // Check if this snapshot shares live transparency (uses alpha texture for efficient updates)
 	    const snapshot = snapshotViews.find(s => s.id === vid);
@@ -3194,49 +3194,64 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 	  }
 
   function setBackground(mode) {
+    const VIEWER_BACKGROUND_STORAGE_KEY = 'cellucid_viewer_background';
+
+    function applyViewerBackgroundMode(value) {
+      const root = document.documentElement;
+      if (root) root.dataset.viewerBackground = value;
+      if (document.body) document.body.dataset.viewerBackground = value;
+      try {
+        if (typeof localStorage !== 'undefined') {
+          localStorage.setItem(VIEWER_BACKGROUND_STORAGE_KEY, value);
+        }
+      } catch (_) {
+        // Ignore storage failures (e.g., privacy mode).
+      }
+    }
+
     showGrid = false;
     switch (mode) {
-      case 'grid':
-        showGrid = true;
+	      case 'grid':
+	        showGrid = true;
         // Light grid with subtle gray tint - reduces eye strain and improves
         // line contrast on LCD/OLED screens. Mirrors dark grid design principles.
         targetGridOpacity = 0.85;
         // Subtle warm gray tint instead of pure white
         gl.clearColor(0.965, 0.965, 0.970, 1);
-        document.body.dataset.viewerBackground = 'grid';
+        applyViewerBackgroundMode('grid');
         bgColor = [0.965, 0.965, 0.970];
         fogColor = [0.965, 0.965, 0.970];
-        // Lighter grid lines - subtle but visible on light background
-        gridColor = [0.60, 0.60, 0.60];
-        gridBgColor = [0.965, 0.965, 0.970];  // Must match bgColor exactly
-        gridSpacing = 0.2;
-        gridLineWidth = 0.010;                // Slightly thicker for screen legibility
-        // Lighter axis colors
-        axisXColor = [0.45, 0.45, 0.45];
-        axisYColor = [0.45, 0.45, 0.45];
-        axisZColor = [0.45, 0.45, 0.45];
-        gridFogDensityMultiplier = 1.0;
-        break;
-      case 'grid-dark':
-        showGrid = true;
+	        // Light grid lines - subtle but visible on light background
+	        gridColor = [0.56, 0.56, 0.57];
+	        gridBgColor = [0.965, 0.965, 0.970];  // Must match bgColor exactly
+		        gridSpacing = 0.2;
+		        gridLineWidth = 0.010;                // Slightly thicker for screen legibility
+		        // Subtle per-axis tint (kept near-neutral)
+		        axisXColor = [0.48, 0.46, 0.46];
+		        axisYColor = [0.46, 0.48, 0.46];
+		        axisZColor = [0.46, 0.46, 0.48];
+	        gridFogDensityMultiplier = 1.0;
+	        break;
+	      case 'grid-dark':
+	        showGrid = true;
         targetGridOpacity = 0.75;
         gl.clearColor(0.08, 0.09, 0.1, 1);
-        document.body.dataset.viewerBackground = 'grid-dark';
+        applyViewerBackgroundMode('grid-dark');
         bgColor = [0.08, 0.09, 0.1];
         fogColor = [0.08, 0.09, 0.1];
-        gridColor = [0.38, 0.38, 0.42];   // Subtle gray lines
-        gridBgColor = [0.08, 0.09, 0.1];
-        gridSpacing = 0.2;
-        gridLineWidth = 0.008;
-        // Grayscale axis colors for scientific look
-        axisXColor = [0.5, 0.5, 0.5];
-        axisYColor = [0.5, 0.5, 0.5];
-        axisZColor = [0.5, 0.5, 0.5];
-        gridFogDensityMultiplier = 1.0;
-        break;
+	        gridColor = [0.38, 0.38, 0.42];   // Subtle gray lines
+		        gridBgColor = [0.08, 0.09, 0.1];
+		        gridSpacing = 0.2;
+		        gridLineWidth = 0.008;
+		        // Subtle per-axis tint (kept near-neutral)
+		        axisXColor = [0.62, 0.58, 0.58];
+		        axisYColor = [0.58, 0.62, 0.58];
+		        axisZColor = [0.58, 0.58, 0.62];
+	        gridFogDensityMultiplier = 1.0;
+	        break;
       case 'black':
         gl.clearColor(0, 0, 0, 1);
-        document.body.dataset.viewerBackground = 'black';
+        applyViewerBackgroundMode('black');
         bgColor = [0, 0, 0];
         fogColor = [0.05, 0.05, 0.08];
         // Match grid bg to main bg for clean fade-out
@@ -3247,7 +3262,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       case 'white':
       default:
         gl.clearColor(1, 1, 1, 1);
-        document.body.dataset.viewerBackground = 'white';
+        applyViewerBackgroundMode('white');
         bgColor = [1, 1, 1];
         fogColor = [1, 1, 1];
         // Match grid bg to main bg for clean fade-out

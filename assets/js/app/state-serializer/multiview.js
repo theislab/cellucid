@@ -1,67 +1,13 @@
 /**
- * @fileoverview Multiview (snapshot) serialization helpers.
+ * @fileoverview Multiview (snapshot views) restoration helpers.
+ *
+ * Used by the session bundle eager restore path to rebuild snapshot view
+ * structure by replaying filters/active-fields per view.
  *
  * @module state-serializer/multiview
  */
 
 import { debug } from '../../utils/debug.js';
-
-export function serializeMultiview({ state, viewer, serializeFiltersForFields }) {
-  const viewLayout = viewer.getViewLayout?.() || { mode: 'single', activeId: 'live' };
-  const snapshots = viewer.getSnapshotViews?.() || [];
-  const viewContexts = state.viewContexts instanceof Map ? state.viewContexts : null;
-
-  const serializedSnapshots = snapshots.map((s) => {
-    const ctx = viewContexts?.get?.(String(s.id)) || null;
-    const activeFieldKey =
-      ctx?.activeFieldIndex >= 0 ? ctx?.obsData?.fields?.[ctx.activeFieldIndex]?.key : null;
-    const activeVarFieldKey =
-      ctx?.activeVarFieldIndex >= 0 ? ctx?.varData?.fields?.[ctx.activeVarFieldIndex]?.key : null;
-    const activeFieldSource = ctx?.activeFieldSource || (activeVarFieldKey ? 'var' : activeFieldKey ? 'obs' : null);
-
-    const ctxFilters = ctx
-      ? {
-          ...serializeFiltersForFields(ctx?.obsData?.fields, 'obs'),
-          ...serializeFiltersForFields(ctx?.varData?.fields, 'var')
-        }
-      : null;
-
-    let ctxOutlierThreshold = null;
-    if (activeFieldSource === 'var' && ctx?.varData?.fields?.[ctx.activeVarFieldIndex]) {
-      ctxOutlierThreshold = ctx.varData.fields[ctx.activeVarFieldIndex]._outlierThreshold ?? null;
-    } else if (activeFieldSource === 'obs' && ctx?.obsData?.fields?.[ctx.activeFieldIndex]) {
-      ctxOutlierThreshold = ctx.obsData.fields[ctx.activeFieldIndex]._outlierThreshold ?? null;
-    }
-
-    return {
-      id: s.id,
-      label: s.label,
-      fieldKey: s.fieldKey,
-      fieldKind: s.fieldKind,
-      meta: s.meta,
-      // Capture dimension level for proper restoration (don't assume 3D)
-      dimensionLevel: s.dimensionLevel ?? ctx?.dimensionLevel ?? null,
-      activeFields: {
-        activeFieldKey,
-        activeVarFieldKey,
-        activeFieldSource
-      },
-      filters: ctxFilters,
-      colors: ctx?.colorsArray ? Array.from(ctx.colorsArray) : null,
-      transparency: ctx?.categoryTransparency ? Array.from(ctx.categoryTransparency) : null,
-      outlierQuantiles: ctx?.outlierQuantilesArray ? Array.from(ctx.outlierQuantilesArray) : null,
-      centroidPositions: ctx?.centroidPositions ? Array.from(ctx.centroidPositions) : null,
-      centroidColors: ctx?.centroidColors ? Array.from(ctx.centroidColors) : null,
-      centroidOutliers: ctx?.centroidOutliers ? Array.from(ctx.centroidOutliers) : null,
-      outlierThreshold: ctxOutlierThreshold
-    };
-  });
-
-  return {
-    layout: viewLayout,
-    snapshots: serializedSnapshots
-  };
-}
 
 /**
  * Restore multiview snapshots and layout.
@@ -80,6 +26,16 @@ export async function restoreMultiview({
   if (viewer.clearSnapshotViews) viewer.clearSnapshotViews();
   if (state.clearSnapshotViews) state.clearSnapshotViews();
 
+  // Restore camera lock state and per-view camera states *before* creating snapshots.
+  // NOTE: viewer.setCamerasLocked(false) overwrites existing snapshot cameraState objects,
+  // so this must happen before snapshot creation.
+  if (typeof multiview.camerasLocked === 'boolean' && typeof viewer.setCamerasLocked === 'function') {
+    viewer.setCamerasLocked(multiview.camerasLocked);
+  }
+  if (multiview.camerasLocked === false && multiview.liveCameraState && typeof viewer.setViewCameraState === 'function') {
+    viewer.setViewCameraState('live', multiview.liveCameraState);
+  }
+
   // Ensure current live state is fully synced before cloning it
   pushViewerState();
 
@@ -96,7 +52,7 @@ export async function restoreMultiview({
     if (snap.filters) {
       const { restored } = await restoreFilters(snap.filters);
       if (restored > 0) {
-        debug.log(`[StateSerializer] Restored ${restored} filter${restored === 1 ? '' : 's'} for snapshot ${snap.label || snap.id}`);
+        debug.log(`[SessionSerializer] Restored ${restored} filter${restored === 1 ? '' : 's'} for view ${snap.label || snap.id}`);
       }
     }
     if (snap.activeFields) {
@@ -105,7 +61,7 @@ export async function restoreMultiview({
 
     pushViewerState();
 
-    // Build snapshot payload (allow overriding with saved arrays for exact match)
+    // Build snapshot payload from the current state, then apply descriptor overrides.
     const payload = state.getSnapshotPayload ? state.getSnapshotPayload() : {};
     const config = {
       ...payload,
@@ -114,15 +70,11 @@ export async function restoreMultiview({
       fieldKind: snap.fieldKind ?? payload.fieldKind,
       meta: snap.meta || payload.meta
     };
-    if (snap.colors) config.colors = new Uint8Array(snap.colors);
-    if (snap.transparency) config.transparency = new Float32Array(snap.transparency);
-    if (snap.outlierQuantiles) config.outlierQuantiles = new Float32Array(snap.outlierQuantiles);
-    if (snap.centroidPositions) config.centroidPositions = new Float32Array(snap.centroidPositions);
-    if (snap.centroidColors) config.centroidColors = new Uint8Array(snap.centroidColors);
-    if (snap.centroidOutliers) config.centroidOutliers = new Float32Array(snap.centroidOutliers);
     if (typeof snap.outlierThreshold === 'number') config.outlierThreshold = snap.outlierThreshold;
     // Restore dimension level for this snapshot (don't assume 3D)
     if (snap.dimensionLevel != null) config.dimensionLevel = snap.dimensionLevel;
+    // Restore per-view camera state when cameras are unlocked.
+    if (snap.cameraState) config.cameraState = snap.cameraState;
 
     const created = viewer.createSnapshotView ? viewer.createSnapshotView(config) : null;
     const newId = created?.id;
@@ -131,6 +83,16 @@ export async function restoreMultiview({
     }
     if (newId) {
       idMap.set(String(snap.id), String(newId));
+    }
+
+    // Restore per-snapshot dimension positions/centroids in DataState + Viewer.
+    // This is required so each view renders the correct embedding after session restore.
+    if (newId && snap.dimensionLevel != null && typeof state.setDimensionLevel === 'function') {
+      try {
+        await state.setDimensionLevel(snap.dimensionLevel, { viewId: newId, updateViewer: true });
+      } catch (err) {
+        console.warn(`[SessionSerializer] Failed to restore dimension ${snap.dimensionLevel} for view ${newId}:`, err);
+      }
     }
   }
 
@@ -155,5 +117,14 @@ export async function restoreMultiview({
   }
   if (resolvedActiveId) {
     state.setActiveView?.(resolvedActiveId);
+  }
+
+  // When cameras are unlocked, `setViewLayout()` only applies a camera change if the
+  // focused view id changes. If the active view is already focused (common after a
+  // fresh clear), force-apply the active view camera to the global camera state.
+  const camerasLocked = typeof viewer.getCamerasLocked === 'function' ? viewer.getCamerasLocked() : true;
+  if (!camerasLocked && typeof viewer.getViewCameraState === 'function' && typeof viewer.setCameraState === 'function') {
+    const cam = viewer.getViewCameraState(resolvedActiveId || 'live');
+    if (cam) viewer.setCameraState(cam);
   }
 }

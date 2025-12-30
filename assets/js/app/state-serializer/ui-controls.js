@@ -1,9 +1,9 @@
 /**
- * @fileoverview UI control save/restore helpers for state snapshots.
+ * @fileoverview UI control save/restore helpers for session bundles.
  *
  * This module is intentionally DOM-focused and does not depend on DataState
- * internals. It is used by the StateSerializer to snapshot sidebar + floating
- * panel UI inputs in a generic way.
+ * internals. It is used by the SessionSerializer eager stage to capture/restore
+ * lightweight sidebar + floating panel UI inputs in a generic way.
  *
  * @module state-serializer/ui-controls
  */
@@ -26,7 +26,7 @@ function queryAll(sidebar, selector) {
 }
 
 /**
- * Skip ephemeral UI subtrees from state snapshots (save/load).
+ * Skip ephemeral UI subtrees from session bundle capture/restore.
  * Used for floating, copy-only panels that should not be serialized.
  * @param {Element|null} el
  * @returns {boolean}
@@ -36,22 +36,30 @@ function isStateSerializerSkipped(el) {
   return !!el.closest?.('[data-state-serializer-skip]');
 }
 
-// IDs that should be skipped during general restoration (handled specially)
+// IDs that should be skipped during general restoration (handled specially or
+// intentionally excluded from session bundles).
 const SPECIAL_IDS = new Set([
   'navigation-mode', // Camera-related, handled separately
   'categorical-field', // Dynamically populated, handled via activeFields
   'continuous-field', // Dynamically populated, handled via activeFields
   'outlier-filter', // Per-field state, restored after active field is set
   'gene-expression-search', // Restored via activeFields
+  'dimension-select', // Restored explicitly by core-state (avoid async handler races)
+  'dataset-select', // Not part of session state (dataset assumed already loaded)
+  'remote-server-url', // Connection UI only; not session state
+  'github-repo-url', // Connection UI only; not session state
 ]);
 
-function restoreSingleControl(id, data) {
+function restoreSingleControl(id, data, options = {}) {
+  // NOTE: We keep this helper resilient to dynamic UIs. Some selects are
+  // populated asynchronously (e.g., after dataset metadata arrives). The
+  // restore logic retries setting select values for a short period to avoid
+  // noisy warnings and to improve fidelity.
   if (!data) return;
+  const abortSignal = options.abortSignal || null;
   const el = document.getElementById(id);
   if (!el) {
-    // Best-effort restore: ephemeral floating copy windows intentionally opt out of snapshots.
-    if (id.startsWith('analysiswin-')) return;
-    console.warn(`[StateSerializer] Control not found: ${id}`);
+    console.warn(`[SessionSerializer] Control not found: ${id}`);
     return;
   }
   if (isStateSerializerSkipped(el)) return;
@@ -64,15 +72,60 @@ function restoreSingleControl(id, data) {
         el.dispatchEvent(new Event('change', { bubbles: true }));
       }
     } else if (data.type === 'select' && el.tagName === 'SELECT') {
-      const optionExists = Array.from(el.options).some(opt => opt.value === data.value);
-      if (optionExists) {
-        if (el.value !== data.value) {
-          el.value = data.value;
+      const nextValue = data.value ?? '';
+      const stringValue = String(nextValue);
+
+      // Empty string is commonly used by placeholder options (or by selects that
+      // haven't been populated yet). Treat it as "no-op" unless the option
+      // actually exists.
+      if (stringValue === '') {
+        const hasEmptyOption = Array.from(el.options).some(opt => opt.value === '');
+        if (hasEmptyOption && el.value !== '') {
+          el.value = '';
           el.dispatchEvent(new Event('change', { bubbles: true }));
         }
-      } else {
-        console.warn(`[StateSerializer] Option '${data.value}' not found in select '${id}'`);
+        return;
       }
+
+      const optionExists = Array.from(el.options).some(opt => opt.value === stringValue);
+      if (optionExists) {
+        if (el.value !== stringValue) {
+          el.value = stringValue;
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        return;
+      }
+
+      // If the option isn't present yet, the select may be dynamically
+      // populated. Defer a few retries instead of warning immediately.
+      const maxAttempts = 30;
+      const delayMs = 100;
+      let attempt = 0;
+
+      const retry = () => {
+        if (abortSignal?.aborted) return;
+        attempt += 1;
+        const current = document.getElementById(id);
+        if (!current || current.tagName !== 'SELECT') return;
+
+        const exists = Array.from(current.options).some(opt => opt.value === stringValue);
+        if (exists) {
+          if (current.value !== stringValue) {
+            current.value = stringValue;
+            current.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+          return;
+        }
+
+        if (attempt >= maxAttempts) {
+          console.warn(`[SessionSerializer] Option '${stringValue}' not found in select '${id}'`);
+          return;
+        }
+
+        setTimeout(retry, delayMs);
+      };
+
+      if (!abortSignal?.aborted) setTimeout(retry, 0);
     } else if ((data.type === 'range' || data.type === 'number') && el.type === data.type) {
       const nextValue = String(data.value);
       if (el.value !== nextValue) {
@@ -92,7 +145,7 @@ function restoreSingleControl(id, data) {
       }
     }
   } catch (err) {
-    console.error(`[StateSerializer] Error restoring control '${id}':`, err);
+    console.error(`[SessionSerializer] Error restoring control '${id}':`, err);
   }
 }
 
@@ -138,11 +191,13 @@ export function createUiControlSerializer({ sidebar }) {
   /**
    * Restore UI controls from saved state.
    * @param {Object} controls - Saved control values
-   * @param {Set<string>} [skipIds] - Additional IDs to skip (for deferred restoration)
+   * @param {{ skipIds?: Set<string>, abortSignal?: AbortSignal | null }} [options]
    */
-  function restoreUIControls(controls, skipIds = new Set()) {
+  function restoreUIControls(controls, options = {}) {
     if (!controls) return;
 
+    const skipIds = options.skipIds instanceof Set ? options.skipIds : new Set();
+    const abortSignal = options.abortSignal || null;
     const allSkipIds = new Set([...SPECIAL_IDS, ...skipIds]);
 
     // First pass: restore accordions
@@ -174,10 +229,9 @@ export function createUiControlSerializer({ sidebar }) {
     });
 
     [...checkboxes, ...selects, ...ranges, ...others].forEach(([id, data]) => {
-      restoreSingleControl(id, data);
+      restoreSingleControl(id, data, { abortSignal });
     });
   }
 
   return { collectUIControls, restoreUIControls };
 }
-

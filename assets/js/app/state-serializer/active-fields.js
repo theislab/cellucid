@@ -33,7 +33,7 @@ export async function restoreActiveFields(state, activeFields) {
     const varFields = state.getVarFields?.() || [];
     const varIdx = varFields.findIndex(f => f?.key === activeFields.activeVarFieldKey && f?._isDeleted !== true);
     if (varIdx >= 0) {
-      debug.log(`[StateSerializer] Activating var field: ${activeFields.activeVarFieldKey} (index: ${varIdx})`);
+      debug.log(`[SessionSerializer] Activating var field: ${activeFields.activeVarFieldKey} (index: ${varIdx})`);
       await state.ensureVarFieldLoaded?.(varIdx);
       state.setActiveVarField?.(varIdx);
 
@@ -51,7 +51,7 @@ export async function restoreActiveFields(state, activeFields) {
 
     if (idx >= 0) {
       const field = fields[idx];
-      debug.log(`[StateSerializer] Activating obs field: ${field?.key} (index: ${idx})`);
+      debug.log(`[SessionSerializer] Activating obs field: ${field?.key} (index: ${idx})`);
 
       await state.ensureFieldLoaded?.(idx);
       state.setActiveField?.(idx);
@@ -70,14 +70,14 @@ export async function restoreActiveFields(state, activeFields) {
         }
       }
     } else {
-      console.warn(`[StateSerializer] Obs field not found: ${activeFields.activeFieldKey}`);
+      console.warn(`[SessionSerializer] Obs field not found: ${activeFields.activeFieldKey}`);
     }
   } else if (activeFields.activeFieldSource === 'var' && activeFields.activeFieldKey) {
     // Active field is a var field (gene) - handled above, but also activate it as primary
     const varFields = state.getVarFields?.() || [];
     const varIdx = varFields.findIndex(f => f?.key === activeFields.activeFieldKey && f?._isDeleted !== true);
     if (varIdx >= 0) {
-      debug.log(`[StateSerializer] Activating var field as primary: ${activeFields.activeFieldKey}`);
+      debug.log(`[SessionSerializer] Activating var field as primary: ${activeFields.activeFieldKey}`);
       await state.ensureVarFieldLoaded?.(varIdx);
       state.setActiveVarField?.(varIdx);
     }

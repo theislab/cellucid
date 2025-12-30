@@ -81,8 +81,8 @@ class NotificationCenter {
       message,
       progress = null,
       speed = null,
-      duration = null,
-      dismissible = true
+      dismissible = true,
+      onCancel = null
     } = options;
 
     const el = document.createElement('div');
@@ -128,9 +128,15 @@ class NotificationCenter {
 
     html += '</div>'; // Close notification-content
 
-    // Dismiss button
-    if (dismissible && type !== NotificationType.LOADING && type !== NotificationType.PROGRESS) {
-      html += '<button class="notification-dismiss" aria-label="Dismiss">×</button>';
+    const cancelable =
+      typeof onCancel === 'function' &&
+      (type === NotificationType.LOADING || type === NotificationType.PROGRESS);
+
+    // Cancel (for progress/loading only) or dismiss (for others).
+    if (cancelable) {
+      html += '<button class="notification-dismiss" data-role="cancel" aria-label="Cancel" title="Cancel">×</button>';
+    } else if (dismissible && type !== NotificationType.LOADING && type !== NotificationType.PROGRESS) {
+      html += '<button class="notification-dismiss" data-role="dismiss" aria-label="Dismiss">×</button>';
     }
 
     el.innerHTML = html;
@@ -140,8 +146,20 @@ class NotificationCenter {
       if (progressBar) progressBar.style.width = progressBarWidth;
     }
 
-    // Add dismiss handler
-    const dismissBtn = el.querySelector('.notification-dismiss');
+    const cancelBtn = el.querySelector('.notification-dismiss[data-role="cancel"]');
+    if (cancelBtn && typeof onCancel === 'function') {
+      cancelBtn.addEventListener('click', () => {
+        try {
+          cancelBtn.disabled = true;
+          cancelBtn.setAttribute('aria-disabled', 'true');
+        } catch { /* ignore */ }
+        try { onCancel(); } catch (err) {
+          console.warn('[NotificationCenter] Cancel handler failed:', err);
+        }
+      });
+    }
+
+    const dismissBtn = el.querySelector('.notification-dismiss[data-role="dismiss"]');
     if (dismissBtn) {
       dismissBtn.addEventListener('click', () => this.dismiss(id));
     }
@@ -270,10 +288,17 @@ class NotificationCenter {
         const progressText = element.querySelector('.notification-progress-text');
         if (progressText) progressText.remove();
 
-        // Add dismiss button if not present
+        // Replace "cancel" with a standard dismiss button.
+        const existingBtn = element.querySelector('.notification-dismiss');
+        if (existingBtn?.dataset?.role === 'cancel') {
+          try { existingBtn.remove(); } catch { /* ignore */ }
+        }
+
+        // Add dismiss button if not present (completion/failure is always dismissible).
         if (!element.querySelector('.notification-dismiss')) {
           const dismissBtn = document.createElement('button');
           dismissBtn.className = 'notification-dismiss';
+          dismissBtn.dataset.role = 'dismiss';
           dismissBtn.setAttribute('aria-label', 'Dismiss');
           dismissBtn.textContent = '×';
           dismissBtn.addEventListener('click', () => this.dismiss(id));

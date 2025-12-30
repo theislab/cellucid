@@ -13,10 +13,10 @@ html, body {
 }
 
 /* Viewer background modes (controlled by JS via data attribute). */
-body[data-viewer-background="grid"] { background: var(--viewer-bg-grid); }
-body[data-viewer-background="grid-dark"] { background: var(--viewer-bg-grid-dark); }
-body[data-viewer-background="black"] { background: var(--black); }
-body[data-viewer-background="white"] { background: var(--white); }
+:root[data-viewer-background="grid"] body { background: var(--viewer-bg-grid); }
+:root[data-viewer-background="grid-dark"] body { background: var(--viewer-bg-grid-dark); }
+:root[data-viewer-background="black"] body { background: var(--black); }
+:root[data-viewer-background="white"] body { background: var(--white); }
 
 body.dock-dragging,
 body.dock-dragging * {

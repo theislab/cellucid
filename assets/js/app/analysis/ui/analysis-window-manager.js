@@ -66,6 +66,87 @@ export class AnalysisWindowManager {
   }
 
   /**
+   * Export all floating analysis windows as session restore descriptors.
+   *
+   * The session bundle stores analysis windows as eager JSON so the UI can be
+   * reconstructed quickly. Results are intentionally excluded; only settings
+   * and geometry are persisted.
+   *
+   * @returns {Array<{ modeId: string, rect: { left: number, top: number, width: number, height: number }, settings: any, headerTitle: string, headerDesc: string, constraints: any }>}
+   */
+  exportSessionWindows() {
+    /** @type {Array<{ modeId: string, rect: { left: number, top: number, width: number, height: number }, settings: any, headerTitle: string, headerDesc: string, constraints: any }>} */
+    const out = [];
+
+    for (const entry of this._windows.values()) {
+      if (!entry?.details) continue;
+
+      // Prefer the persisted StyleManager geometry; fall back to DOMRect.
+      const leftVar = StyleManager.getVariable(entry.details, '--pos-x');
+      const topVar = StyleManager.getVariable(entry.details, '--pos-y');
+      const widthVar = StyleManager.getVariable(entry.details, '--pos-width');
+      const heightVar = StyleManager.getVariable(entry.details, '--pos-height');
+
+      const rectFallback = entry.details.getBoundingClientRect();
+      const left = isFiniteNumber(parseFloat(leftVar)) ? parseFloat(leftVar) : rectFallback.left;
+      const top = isFiniteNumber(parseFloat(topVar)) ? parseFloat(topVar) : rectFallback.top;
+      const width = isFiniteNumber(parseFloat(widthVar)) ? parseFloat(widthVar) : rectFallback.width;
+      const height = isFiniteNumber(parseFloat(heightVar)) ? parseFloat(heightVar) : rectFallback.height;
+
+      const settings = typeof entry.ui?.exportSettings === 'function'
+        ? entry.ui.exportSettings()
+        : {
+          selectedPages: entry.ui?.getSelectedPages?.() ?? [],
+          config: entry.ui?.getConfig?.() ?? {}
+        };
+
+      out.push({
+        modeId: entry.modeId,
+        rect: { left, top, width, height },
+        settings,
+        headerTitle: entry.headerTitle || '',
+        headerDesc: entry.headerDesc || '',
+        constraints: entry.floatConstraints || null
+      });
+    }
+
+    return out;
+  }
+
+  /**
+   * Create a floating analysis window from a session restore descriptor.
+   *
+   * @param {{ modeId?: string, rect?: any, settings?: any, headerTitle?: string, headerDesc?: string, constraints?: any }} descriptor
+   * @returns {string|null} windowId
+   */
+  createFromSessionDescriptor(descriptor) {
+    const modeId = String(descriptor?.modeId || '').trim();
+    if (!modeId) return null;
+
+    const rect = descriptor?.rect || {};
+    const left = isFiniteNumber(rect.left) ? rect.left : undefined;
+    const top = isFiniteNumber(rect.top) ? rect.top : undefined;
+    const preferredSize = {
+      width: isFiniteNumber(rect.width) ? rect.width : undefined,
+      height: isFiniteNumber(rect.height) ? rect.height : undefined
+    };
+
+    // Use a tiny origin shim so we can reuse the existing creation path.
+    const originUi = {
+      exportSettings: () => descriptor?.settings || null
+    };
+
+    return this._createWindowFromOrigin(modeId, originUi, {
+      left,
+      top,
+      preferredSize,
+      constraints: descriptor?.constraints || null,
+      headerTitle: descriptor?.headerTitle || '',
+      headerDesc: descriptor?.headerDesc || ''
+    });
+  }
+
+  /**
    * Create a floating copy from the embedded (sidebar) analysis mode instance.
    * @param {string} modeId
    * @param {{ sourceRect?: DOMRect, preferredSize?: { width?: number, height?: number }, constraints?: any, headerTitle?: string, headerDesc?: string }} [options]
@@ -204,7 +285,8 @@ export class AnalysisWindowManager {
     details.open = true;
     details.dataset.analysisWindowId = windowId;
     details.dataset.analysisMode = modeId;
-    // Floating analysis window copies are ephemeral; opt out of state snapshots (save/load).
+    // Floating analysis windows are reconstructed from session bundles; exclude them from
+    // generic UI control capture/restore.
     details.setAttribute('data-state-serializer-skip', 'true');
 
     const summary = document.createElement('summary');
@@ -313,7 +395,9 @@ export class AnalysisWindowManager {
       return null;
     }
 
-    const { left, top } = this._computeInitialPosition(options.sourceRect);
+    const computed = this._computeInitialPosition(options.sourceRect);
+    const left = isFiniteNumber(options.left) ? options.left : computed.left;
+    const top = isFiniteNumber(options.top) ? options.top : computed.top;
     const preferredSize = this._resolvePreferredSize(options);
     const floatConstraints = this._windows.get(windowId)?.floatConstraints;
 

@@ -18,7 +18,7 @@
 	    default-src 'self';
 	    base-uri 'none';
 	    object-src 'none';
-	    script-src 'self' https://www.googletagmanager.com 'sha256-MXYWlpoSQ1twXf6ffR439dY146Pre5/CiJuwrxfL1Ho=';
+	    script-src 'self' https://www.googletagmanager.com 'sha256-+9zlP/wQVfV23S04wl/L4pHtJlWnuGrS2YNU0z7yjJQ=';
 	    style-src 'self' 'unsafe-inline';
 	    img-src 'self' data: https:;
 	    font-src 'self' data:;
@@ -53,8 +53,7 @@
   <meta name="twitter:image" content="https://www.cellucid.com/assets/img/og-preview.jpg" />
 
 	  <!-- Structured Data for Search Engines -->
-	  <script type="application/ld+json">
-	  {
+	  <script type="application/ld+json">{
 	    "@context": "https://schema.org",
 	    "@type": "WebApplication",
 	    "name": "cellucid",
@@ -86,8 +85,7 @@
 	      "Publication export: SVG (vector) + PNG (high-DPI)",
 	      "Collaborative community annotation voting with optional GitHub sync"
 	    ]
-	  }
-	  </script>
+	  }</script>
 
   <!-- Google tag (gtag.js) -->
   <script async src="https://www.googletagmanager.com/gtag/js?id=G-K4774ZWGEQ"></script>
@@ -279,15 +277,15 @@
           </div>
 
           <!-- Dataset Selector -->
-          <div class="control-block">
-            <label for="dataset-select">Sample datasets:</label>
-            <select id="dataset-select" class="obs-select">
-              <option value="" disabled selected>Loading...</option>
-            </select>
-          </div>
+	          <div class="control-block" data-state-serializer-skip="true">
+	            <label for="dataset-select">Sample datasets:</label>
+	            <select id="dataset-select" class="obs-select">
+	              <option value="" disabled selected>Loading...</option>
+	            </select>
+	          </div>
 
           <!-- User directory selector -->
-          <div class="control-block mt-1 relative" id="user-data-block">
+	          <div class="control-block mt-1 relative" id="user-data-block" data-state-serializer-skip="true">
             <label class="d-flex items-center gap-1">
               Local data:
               <span id="user-data-info-btn" class="info-btn">i</span>
@@ -312,7 +310,7 @@
           </div>
 
           <!-- Remote server connection -->
-          <div class="control-block mt-0-5 relative" id="remote-server-block">
+	          <div class="control-block mt-0-5 relative" id="remote-server-block" data-state-serializer-skip="true">
             <label class="d-flex items-center gap-1">
               Remote server:
               <span id="remote-info-btn" class="info-btn">i</span>
@@ -336,7 +334,7 @@
           </div>
 
           <!-- GitHub repository data loading -->
-          <div class="control-block mt-0-5 relative" id="github-repo-block">
+	          <div class="control-block mt-0-5 relative" id="github-repo-block" data-state-serializer-skip="true">
             <label class="d-flex items-center gap-1">
               GitHub data:
               <span id="github-info-btn" class="info-btn">i</span>
@@ -412,8 +410,8 @@
             <div class="control-block">
               <label for="point-size">Point size (log):</label>
               <div class="slider-row">
-                <input id="point-size" type="range" min="0" max="100" step="1" value="0" />
-                <span id="point-size-display" class="slider-value">1.00</span>
+                <input id="point-size" type="range" min="0" max="100" step="0.5" value="0" />
+                <span id="point-size-display" class="slider-value">0.75</span>
               </div>
             </div>
 
@@ -436,8 +434,8 @@
             <div class="control-block">
               <label for="size-attenuation">Perspective size scaling:</label>
               <div class="slider-row">
-                <input id="size-attenuation" type="range" min="0" max="100" step="1" value="65" />
-                <span id="size-attenuation-display" class="slider-value">65</span>
+                <input id="size-attenuation" type="range" min="0" max="100" step="1" value="80" />
+                <span id="size-attenuation-display" class="slider-value">80</span>
               </div>
             </div>
           </div>
@@ -1185,7 +1183,8 @@
         </div>
       </details>
 
-      <details class="accordion-section" open id="community-annotation-section">
+      <!-- Community Annotation is network/auth-driven and intentionally excluded from session bundles. -->
+      <details class="accordion-section" open id="community-annotation-section" data-state-serializer-skip="true">
         <summary>Community Annotation</summary>
         <div class="accordion-content">
           <div id="community-annotation-controls"></div>
@@ -1236,7 +1235,7 @@
         </div>
       </details>
 
-      <details class="accordion-section" id="figure-export-section">
+      <details class="accordion-section" id="figure-export-section" data-state-serializer-skip="true">
         <summary>Figure Export</summary>
         <div class="accordion-content">
           <div id="figure-export-controls"></div>
@@ -1276,7 +1275,7 @@
         </div>
       </details>
 
-      <details class="accordion-section" id="benchmark-section">
+      <details class="accordion-section" id="benchmark-section" data-state-serializer-skip="true">
         <summary>Performance Benchmark</summary>
         <div class="accordion-content">
           <div class="legend-help mb-0">

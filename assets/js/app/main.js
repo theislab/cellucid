@@ -15,7 +15,7 @@
 import { createViewer } from '../rendering/viewer.js';
 import { createDataState } from './state/index.js';
 import { initUI } from './ui/core/ui-coordinator.js';
-import { createStateSerializer } from './state-serializer.js';
+import { createSessionSerializer } from './session/index.js';
 import { initDockableAccordions } from './dockable-accordions.js';
 import { setDockableAccordions } from './dockable-accordions-registry.js';
 import { getNotificationCenter } from './notification-center.js';
@@ -682,7 +682,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     // Smoke volume is built lazily when switching to smoke mode
     // (no initial build to save startup time)
 
-    const stateSerializer = createStateSerializer({ state, viewer, sidebar });
+    const sessionSerializer = createSessionSerializer({ state, viewer, sidebar, dataSourceManager });
 
     ui = initUI({
       state,
@@ -691,7 +691,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         rebuildSmokeDensity
       },
       reloadActiveDataset: reloadActiveDatasetInPlace,
-      stateSerializer,
+      sessionSerializer,
       dataSourceManager
     });
 
@@ -704,147 +704,21 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       });
       // Store reference for potential external access
       window._comparisonModule = comparisonModule;
+      // Allow session restore to reopen analysis windows once the module exists.
+      try {
+        sessionSerializer.setAnalysisRefs?.({
+          comparisonModule,
+          analysisWindowManager: comparisonModule.getAnalysisWindowManager?.()
+        });
+      } catch (err) {
+        console.warn('[Main] Failed to wire analysis refs for session restore:', err);
+      }
     }
 
     await ui.activateField(-1);
     if (currentDatasetLoadToken) {
       completeDataLoadSuccess(currentDatasetLoadToken, buildDatasetAnalyticsContext());
       currentDatasetLoadToken = null;
-    }
-
-    // Discover state snapshots in the exports directory (for automatic restore)
-    async function discoverLocalStateSnapshots(baseUrl) {
-      const candidates = new Set();
-      const stateRegex = /state[^/]*\.json$/i;
-
-      // Check if baseUrl uses a custom protocol (remote://, local-user://, etc.)
-      const isCustomProtocol = dataSourceManager.isCustomProtocolUrl(baseUrl);
-
-      // For custom protocols, resolve to fetchable URL; for standard URLs, use as-is
-      let fetchableBase = baseUrl;
-      if (isCustomProtocol) {
-        try {
-          fetchableBase = await dataSourceManager.resolveUrl(baseUrl);
-        } catch (err) {
-          console.warn('[Main] Could not resolve custom protocol URL:', baseUrl, err);
-          return []; // Can't discover state files without a fetchable URL
-        }
-      }
-
-      let resolvedBase = null;
-      try {
-        resolvedBase = new URL(fetchableBase, window.location.href);
-      } catch (_err) {
-        resolvedBase = null;
-      }
-
-      const resolveCandidate = (path, overrideBase = null) => {
-        try {
-          const base = overrideBase || resolvedBase || window.location.href;
-          return new URL(path, base).toString();
-        } catch (_err) {
-          return path;
-        }
-      };
-
-      // Prefer an explicit manifest so we don't depend on directory listings (which are disabled on GitHub Pages)
-      // Try the explicit manifest we ship with data; avoid probing non-existent alternates to keep consoles clean
-      const manifestNames = ['state-snapshots.json'];
-      let manifestFound = false;
-      for (const manifestName of manifestNames) {
-        const manifestUrl = resolveCandidate(manifestName);
-        try {
-          const res = await fetch(manifestUrl);
-          if (!res.ok) continue;
-          const payload = await res.json();
-          const entries = Array.isArray(payload)
-            ? payload
-            : payload?.states || payload?.files || payload?.snapshots || [];
-          if (!Array.isArray(entries)) continue;
-          manifestFound = true;
-
-          entries.forEach((entry) => {
-            const entryPath = typeof entry === 'string'
-              ? entry
-              : entry?.url || entry?.path || entry?.href || entry?.name;
-            if (!entryPath) return;
-            const filename = entryPath.split('/').pop() || '';
-            if (!stateRegex.test(filename)) return;
-            candidates.add(resolveCandidate(entryPath, res.url));
-          });
-        } catch (err) {
-          console.warn('[Main] Could not load state manifest:', manifestUrl, err);
-        }
-      }
-
-      // If manifest provided entries, return them without probing missing defaults
-      if (manifestFound && candidates.size > 0) {
-        const sorted = Array.from(candidates).sort();
-        const filtered = sorted.filter((url) => {
-          const name = url.split('/').pop() || '';
-          return !/state[-_]?snapshots\.json$/i.test(name) && !/state[-_]?manifest\.json$/i.test(name);
-        });
-        return filtered.length ? filtered : sorted;
-      }
-
-      try {
-        const res = await fetch(fetchableBase);
-        if (res.ok) {
-          const text = await res.text();
-          const linkRegex = /href="([^"]+)"/gi;
-          let match;
-          while ((match = linkRegex.exec(text)) !== null) {
-            const rawHref = match[1];
-            const cleanHref = rawHref.split('#')[0].split('?')[0];
-            const filename = cleanHref.split('/').pop() || '';
-            if (!stateRegex.test(filename)) continue;
-            candidates.add(resolveCandidate(cleanHref, res.url));
-          }
-        }
-      } catch (err) {
-        console.warn('[Main] Could not inspect exports directory for state files:', err);
-      }
-
-      const fallbackNames = ['cellucid-state.json', 'state.json'];
-      if (candidates.size === 0) {
-        for (const name of fallbackNames) {
-          const candidateUrl = resolveCandidate(name);
-          if (candidates.has(candidateUrl)) continue;
-          try {
-            // Use GET directly - state files are small JSON, so payload is minimal
-            // This avoids the HEAD+GET double request for servers that don't support HEAD
-            const resp = await fetch(candidateUrl);
-            if (resp.ok) {
-              candidates.add(candidateUrl);
-            }
-          } catch (_err) {
-            // Ignore missing files or network errors
-          }
-        }
-      }
-
-      // Prefer real snapshot files over manifest/metadata files when multiple matches exist
-      const sorted = Array.from(candidates).sort();
-      const filtered = sorted.filter((url) => {
-        const name = url.split('/').pop() || '';
-        return !/state[-_]?snapshots\.json$/i.test(name) && !/state[-_]?manifest\.json$/i.test(name);
-      });
-      return filtered.length ? filtered : sorted;
-    }
-
-    async function autoLoadLatestState() {
-      const stateFiles = await discoverLocalStateSnapshots(EXPORT_BASE_URL);
-      if (!stateFiles.length) return;
-      const target = stateFiles[stateFiles.length - 1];
-      debug.log('[Main] Auto-loading state snapshot from', target);
-      try {
-        await stateSerializer.loadStateFromUrl(target, DATA_LOAD_METHODS.STATE_RESTORE_AUTO);
-        ui.refreshUiAfterStateLoad?.();
-        ui.showSessionStatus?.('Loaded saved state from data directory');
-      } catch (err) {
-        console.warn('[Main] Failed to auto-load state:', err);
-        ui.showSessionStatus?.(err?.message || 'Failed to auto-load state', true);
-      }
     }
 
     // Setup connectivity controls
@@ -2120,7 +1994,20 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       });
     }
 
-    await autoLoadLatestState();
+	    // Auto-restore the latest session bundle listed in the dataset exports
+	    // directory (`state-snapshots.json`) to preserve the legacy "auto-load" workflow.
+	    try {
+	      const restored = await sessionSerializer.restoreLatestFromDatasetExports?.();
+	      if (restored) {
+	        ui?.refreshUiAfterStateLoad?.();
+	        ui?.showSessionStatus?.('Loaded saved session from data directory');
+	      } else {
+	        console.info('[Main] No session bundle auto-loaded (state-snapshots.json missing/empty or no .cellucid-session entries).');
+	      }
+	    } catch (err) {
+	      console.warn('[Main] Failed to auto-load session bundle:', err);
+	      ui?.showSessionStatus?.(err?.message || 'Failed to auto-load session', true);
+	    }
 
     // Define onboarding callback functions now that UI is ready
     toggleSidebarVisibility = () => {

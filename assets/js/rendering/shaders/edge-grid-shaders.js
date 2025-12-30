@@ -206,82 +206,98 @@ float gridLine(float coord, float spacing, float lineWidth) {
   return 1.0 - smoothstep(lineHalf - derivative, lineHalf + derivative, f);
 }
 
-// Axis line detection - thicker lines at edges where planes meet
-float axisLine(float coord, float gridSize, float lineWidth) {
+float edgeLine(float coord, float gridSize, float lineWidth) {
   float edgeDist = min(abs(coord + gridSize), abs(coord - gridSize));
   float derivative = fwidth(coord);
-  float axisWidth = lineWidth * 2.5;
-  return 1.0 - smoothstep(axisWidth - derivative, axisWidth + derivative, edgeDist);
+  float edgeWidth = lineWidth * 1.4;
+  return 1.0 - smoothstep(edgeWidth - derivative, edgeWidth + derivative, edgeDist);
+}
+
+float originLine(float coord, float lineWidth) {
+  float d = abs(coord);
+  float derivative = fwidth(coord);
+  // Keep origin axes slightly emphasized, but avoid thick "shaded" bands.
+  float w = lineWidth * 1.55;
+  return 1.0 - smoothstep(w - derivative, w + derivative, d);
 }
 
 void main() {
-  float line = 0.0;
-  float axisLine1 = 0.0, axisLine2 = 0.0;
+  float minor = 0.0;
+  float major = 0.0;
+  float frame = 0.0;
+  float xAxis = 0.0;
+  float yAxis = 0.0;
+  float zAxis = 0.0;
 
-  // Grid line width for main grid
   float mainLineWidth = u_gridLineWidth;
+  float majorSpacing = u_gridSpacing * 5.0; // e.g. 0.2 -> 1.0
+  float majorLineWidth = mainLineWidth * 1.20;
 
-  // Select coordinates based on plane type
+  vec2 planeUv = vec2(0.0);
+
   if (u_planeType == 0) {
-    // XY plane (front/back wall) - grid on X and Y
-    line = max(gridLine(v_worldPos.x, u_gridSpacing, mainLineWidth),
-               gridLine(v_worldPos.y, u_gridSpacing, mainLineWidth));
-    // Edge lines at boundaries
-    axisLine1 = axisLine(v_worldPos.y, u_gridSize, mainLineWidth);
-    axisLine2 = axisLine(v_worldPos.x, u_gridSize, mainLineWidth);
+    // XY plane
+    planeUv = v_localPos.xy;
+    minor = max(gridLine(v_worldPos.x, u_gridSpacing, mainLineWidth),
+                gridLine(v_worldPos.y, u_gridSpacing, mainLineWidth));
+    major = max(gridLine(v_worldPos.x, majorSpacing, majorLineWidth),
+                gridLine(v_worldPos.y, majorSpacing, majorLineWidth));
+    frame = max(edgeLine(v_worldPos.x, u_gridSize, mainLineWidth),
+                edgeLine(v_worldPos.y, u_gridSize, mainLineWidth));
+    xAxis = originLine(v_worldPos.y, mainLineWidth);
+    yAxis = originLine(v_worldPos.x, mainLineWidth);
   } else if (u_planeType == 1) {
-    // XZ plane (floor/ceiling) - grid on X and Z
-    line = max(gridLine(v_worldPos.x, u_gridSpacing, mainLineWidth),
-               gridLine(v_worldPos.z, u_gridSpacing, mainLineWidth));
-    // Edge lines at boundaries
-    axisLine1 = axisLine(v_worldPos.z, u_gridSize, mainLineWidth);
-    axisLine2 = axisLine(v_worldPos.x, u_gridSize, mainLineWidth);
+    // XZ plane
+    planeUv = v_localPos.xz;
+    minor = max(gridLine(v_worldPos.x, u_gridSpacing, mainLineWidth),
+                gridLine(v_worldPos.z, u_gridSpacing, mainLineWidth));
+    major = max(gridLine(v_worldPos.x, majorSpacing, majorLineWidth),
+                gridLine(v_worldPos.z, majorSpacing, majorLineWidth));
+    frame = max(edgeLine(v_worldPos.x, u_gridSize, mainLineWidth),
+                edgeLine(v_worldPos.z, u_gridSize, mainLineWidth));
+    xAxis = originLine(v_worldPos.z, mainLineWidth);
+    zAxis = originLine(v_worldPos.x, mainLineWidth);
   } else {
-    // YZ plane (side wall) - grid on Y and Z
-    line = max(gridLine(v_worldPos.y, u_gridSpacing, mainLineWidth),
-               gridLine(v_worldPos.z, u_gridSpacing, mainLineWidth));
-    // Edge lines at boundaries
-    axisLine1 = axisLine(v_worldPos.z, u_gridSize, mainLineWidth);
-    axisLine2 = axisLine(v_worldPos.y, u_gridSize, mainLineWidth);
+    // YZ plane
+    planeUv = v_localPos.yz;
+    minor = max(gridLine(v_worldPos.y, u_gridSpacing, mainLineWidth),
+                gridLine(v_worldPos.z, u_gridSpacing, mainLineWidth));
+    major = max(gridLine(v_worldPos.y, majorSpacing, majorLineWidth),
+                gridLine(v_worldPos.z, majorSpacing, majorLineWidth));
+    frame = max(edgeLine(v_worldPos.y, u_gridSize, mainLineWidth),
+                edgeLine(v_worldPos.z, u_gridSize, mainLineWidth));
+    yAxis = originLine(v_worldPos.z, mainLineWidth);
+    zAxis = originLine(v_worldPos.y, mainLineWidth);
   }
 
-  // Combine axis lines uniformly (max instead of additive blend)
-  float combinedAxis = max(axisLine1, axisLine2);
-
-  // === Perceptual Synchronization for Grid Lines and Surfaces ===
-  // Problem: Thin grid lines become imperceptible before thick axis lines
-  // due to line thinness reducing perceptual contrast at low alpha values.
-  // Solution: Decouple color intensity from alpha fading using perceptual curves.
-
-  // Base effective opacity for all grid elements
   float effectiveOpacity = u_gridOpacity * u_planeAlpha;
 
-  // Perceptual compensation curves:
-  // - Thin lines need boosted color to remain visible at low opacity
-  // - Thick axis lines need less boost (their thickness provides visibility)
-  // - Use power curves: lower exponent = more boost at low values
+  // Subtle surface shading (vignette) to avoid a flat "sheet" look.
+  float r = clamp(length(planeUv), 0.0, 1.41421356);
+  float vignette = smoothstep(1.35, 0.15, r);
+  float bgLuma = dot(u_bgColor, vec3(0.2126, 0.7152, 0.0722));
+  float isDarkBg = 1.0 - step(0.55, bgLuma);
+  float isLightBg = 1.0 - isDarkBg;
+  float shadeAmount = mix(0.012, 0.020, isDarkBg);
+  vec3 surfaceColor = clamp(u_bgColor + vec3((vignette - 0.5) * shadeAmount), 0.0, 1.0);
 
-  // Grid line color curve: aggressive boost for thin lines
-  // pow(x, 0.55) keeps lines visible longer as opacity drops
-  float lineColorStrength = pow(effectiveOpacity, 0.55);
+  // Perceptual curves: keep thin lines readable while staying subtle overall.
+  float minorStrength = (0.35 + 0.16 * isLightBg) * pow(effectiveOpacity, 0.60);
+  float majorStrength = 0.58 * pow(effectiveOpacity, 0.50);
+  float frameStrength = 0.18 * pow(effectiveOpacity, 0.65);
 
-  // Axis line color curve: moderate boost to sync with grid lines
-  // pow(x, 0.7) provides less boost since axis lines are 2.5x thicker
-  float axisColorStrength = pow(effectiveOpacity, 0.7);
+  float gridMix = clamp(minor * minorStrength + major * majorStrength + frame * frameStrength, 0.0, 1.0);
 
-  // Grid line color mixing - uses boosted color strength
-  vec3 finalColor = mix(u_bgColor, u_gridColor, line * lineColorStrength);
+  vec3 finalColor = mix(surfaceColor, u_gridColor, gridMix);
 
-  // Axis lines use unified opacity base with perceptual curve
-  // (Previously used u_planeAlpha alone, causing desync with grid lines)
-  float axisIntensity = 0.6 * axisColorStrength;
-  finalColor = mix(finalColor, u_axisXColor, combinedAxis * axisIntensity);
+  float axisStrength = (0.32 + 0.03 * isLightBg) * pow(effectiveOpacity, 0.55);
+  finalColor = mix(finalColor, u_axisXColor, xAxis * axisStrength);
+  finalColor = mix(finalColor, u_axisYColor, yAxis * axisStrength);
+  finalColor = mix(finalColor, u_axisZColor, zAxis * axisStrength);
 
-  // === Surface Alpha for Smooth Background Blending ===
-  // Surface alpha uses linear effectiveOpacity for smooth fade to background
-  // Line/axis presence adds slight alpha boost for edge definition
-  float linePresence = max(line, combinedAxis * 0.7);
-  float alpha = effectiveOpacity * (0.85 + 0.15 * linePresence);
+  // Alpha emphasizes lines while keeping surfaces airy (no fog dependence).
+  float lineMask = max(max(minor, major), max(frame, max(xAxis, max(yAxis, zAxis))));
+  float alpha = effectiveOpacity * (0.55 + 0.45 * lineMask);
 
   // Discard nearly invisible fragments
   if (alpha < 0.01) discard;

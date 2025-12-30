@@ -35,6 +35,10 @@ const LARGE_DATASET_THRESHOLD = 50000;
  * @param {{ exportFigure: (opts: any) => Promise<any> }} options.engine
  */
 export function initFigureExportUI({ state, viewer, container, engine }) {
+  // Session bundles must NOT persist Figure Export UI state. Mark the entire
+  // subtree as opt-out so generic UI control snapshotting ignores it.
+  container?.setAttribute?.('data-state-serializer-skip', 'true');
+
   try { container?.__cellucidCleanup?.(); } catch { /* ignore */ }
   clearElement(container);
   /** @type {Array<() => void>} */

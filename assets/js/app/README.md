@@ -40,7 +40,7 @@ app/
 │
 ├── registries/              # Field registries (rename/delete/user-defined)
 ├── main.js                  # Application entry point
-├── state-serializer.js      # Session persistence (save/load)
+├── session/                 # Session bundle persistence (.cellucid-session)
 ├── notification-center.js   # User-facing notifications
 ├── dockable-accordions.js   # Floating panels
 ├── sidebar-metrics.js

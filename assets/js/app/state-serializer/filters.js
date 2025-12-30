@@ -1,7 +1,7 @@
 /**
  * @fileoverview Field filter serialization/restoration helpers.
  *
- * This module snapshots only modified filter state to minimize snapshot size
+ * This module records only modified filter state to keep session bundles small
  * and avoid forcing unnecessary data loads when restoring.
  *
  * @module state-serializer/filters
