@@ -36,6 +36,15 @@ export const MAX_MANIFEST_BYTES = 16 * 1024 * 1024;
 export const DEFAULT_MAX_UNCOMPRESSED_CHUNK_BYTES = 512 * 1024 * 1024;
 
 /**
+ * Hard cap for stored chunk size (after codec, before decompression/JSON parse).
+ *
+ * This is primarily a guard for streamed inputs where total file size may be
+ * unknown or unreliable (e.g., `Content-Encoding` makes `Content-Length` a hint).
+ * Without this, a corrupt file could request multi‑GB allocations.
+ */
+export const MAX_STORED_CHUNK_BYTES = 512 * 1024 * 1024;
+
+/**
  * Encode a number as u32 little-endian.
  * @param {number} value
  * @returns {Uint8Array}
@@ -59,4 +68,3 @@ export function bytesToU32LE(bytes) {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   return view.getUint32(0, true);
 }
-

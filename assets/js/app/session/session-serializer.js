@@ -367,21 +367,39 @@ export class SessionSerializer {
         throw new Error('restoreFromUrl: fetch response has no readable body stream.');
       }
 
+      // NOTE:
+      // `Content-Length` is not always reliable for streamed responses in browsers.
+      // In particular, when servers apply `Content-Encoding` (gzip/br), browsers
+      // transparently decode the body stream but `Content-Length` still reflects
+      // the encoded byte length. Using it for strict EOF/bounds checks can cause
+      // false "truncated" errors (e.g., "Invalid chunk length ... > remaining ...").
+      //
+      // We treat it as a progress hint only, and rely on actual stream EOF to
+      // detect truncation/corruption.
+      const contentEncoding = String(res.headers?.get?.('Content-Encoding') || '').trim().toLowerCase();
       const lenHeader = res.headers?.get?.('Content-Length') || null;
-      const totalBytes = lenHeader != null ? Number(lenHeader) : null;
-      if (Number.isFinite(totalBytes) && totalBytes > 0) {
-        try { notifications.updateDownload(downloadId, 0, totalBytes); } catch { /* ignore */ }
+      const totalBytesHint = lenHeader != null ? Number(lenHeader) : null;
+      const hasReliableContentLength = !contentEncoding || contentEncoding === 'identity';
+
+      const totalBytesForUi = (hasReliableContentLength && Number.isFinite(totalBytesHint) && totalBytesHint > 0)
+        ? totalBytesHint
+        : null;
+
+      if (totalBytesForUi != null) {
+        try { notifications.updateDownload(downloadId, 0, totalBytesForUi); } catch { /* ignore */ }
       }
 
       // Present a Blob-like interface to the bundle reader so it can enforce
-      // file-length bounds even for streamed sources.
+      // file-length bounds when the stream length is reliable.
       const source = {
-        size: (Number.isFinite(totalBytes) && totalBytes > 0) ? totalBytes : undefined,
+        // Only provide a trusted size when the response is not content-encoded.
+        // For encoded responses, providing a size can break bundle parsing.
+        size: totalBytesForUi != null ? totalBytesForUi : undefined,
         stream: () => res.body
       };
 
       await this._restoreFromBundleSource(source, {
-        totalBytes: (Number.isFinite(totalBytes) && totalBytes > 0) ? totalBytes : null,
+        totalBytes: totalBytesForUi,
         notificationsOverride: notifications,
         downloadIdOverride: downloadId,
         abortControllerOverride: abortController
@@ -756,7 +774,29 @@ export class SessionSerializer {
    * Open a file picker for `.cellucid-session` files.
    * @returns {Promise<File|null>}
    */
-  _pickSessionFile() {
+  async _pickSessionFile() {
+    // Prefer the File System Access API when available because it provides a
+    // reliable cancellation signal (rejects with AbortError).
+    if (typeof window !== 'undefined' && typeof window.showOpenFilePicker === 'function') {
+      try {
+        const handles = await window.showOpenFilePicker({
+          multiple: false,
+          types: [
+            {
+              description: 'Cellucid session bundle',
+              accept: { 'application/octet-stream': ['.cellucid-session'] }
+            }
+          ]
+        });
+        const handle = Array.isArray(handles) ? handles[0] : null;
+        if (!handle?.getFile) return null;
+        return await handle.getFile();
+      } catch (err) {
+        if (err?.name === 'AbortError') return null;
+        throw err;
+      }
+    }
+
     return new Promise((resolve) => {
       const input = document.createElement('input');
       input.type = 'file';
@@ -792,19 +832,28 @@ export class SessionSerializer {
       // Best-effort cancellation: when the picker closes without a selection,
       // `change` doesn't fire. When focus returns, settle with null.
       window.addEventListener('focus', () => {
-        // Delay the null settle slightly to avoid racing `change` in browsers
-        // that dispatch focus before the input updates its FileList.
-        setTimeout(() => {
+        // Some browsers update `input.files` after focus returns, but before
+        // dispatching `change`. Poll briefly to avoid settling null too early.
+        const maxChecks = 25;
+        const intervalMs = 80;
+        let checks = 0;
+
+        const poll = () => {
+          if (settled) return;
           const file = input.files?.[0] || null;
           if (file) {
             settle(file);
             return;
           }
-          setTimeout(() => {
-            const file2 = input.files?.[0] || null;
-            settle(file2);
-          }, 200);
-        }, 0);
+          checks += 1;
+          if (checks >= maxChecks) {
+            settle(null);
+            return;
+          }
+          setTimeout(poll, intervalMs);
+        };
+
+        setTimeout(poll, 0);
       }, { once: true });
 
       input.click();

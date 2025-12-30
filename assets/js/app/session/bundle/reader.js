@@ -15,6 +15,7 @@
 import {
   SESSION_BUNDLE_MAGIC_BYTES,
   MAX_MANIFEST_BYTES,
+  MAX_STORED_CHUNK_BYTES,
   U32_BYTES,
   bytesToU32LE
 } from './format.js';
@@ -200,6 +201,13 @@ export async function readBundle(source, options = {}) {
       const meta = manifest.chunks[i];
       const chunkByteLength = await byteReader.readU32LE();
 
+      // Absolute size guard to avoid pathological allocations on corrupt input.
+      if (chunkByteLength > MAX_STORED_CHUNK_BYTES) {
+        throw new Error(
+          `Invalid chunk length for ${meta?.id || `#${i}`}: ${chunkByteLength} exceeds limit (${MAX_STORED_CHUNK_BYTES} bytes).`
+        );
+      }
+
       // Validate storedBytes when present (redundant but useful for sanity).
       const storedBytes = meta?.storedBytes;
       if (typeof storedBytes === 'number' && storedBytes !== chunkByteLength) {
@@ -210,7 +218,9 @@ export async function readBundle(source, options = {}) {
       if (byteReader.totalBytes != null) {
         const remaining = byteReader.totalBytes - byteReader.position;
         if (chunkByteLength > remaining) {
-          throw new Error(`Invalid chunk length for ${meta?.id || `#${i}`}: ${chunkByteLength} > remaining ${remaining}`);
+          throw new Error(
+            `Invalid chunk length for ${meta?.id || `#${i}`}: ${chunkByteLength} > remaining ${remaining} (session file truncated?)`
+          );
         }
       }
 
@@ -221,4 +231,3 @@ export async function readBundle(source, options = {}) {
 
   return { manifest, totalBytes, chunkStream: chunkStream() };
 }
-

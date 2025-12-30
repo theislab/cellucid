@@ -49,9 +49,11 @@ If nothing happens and you see no notifications:
 - Open DevTools → Console:
   - The loader logs when `state-snapshots.json` can’t be fetched/parsed or contains no `.cellucid-session` entries.
   - If you see `[Main] No session bundle auto-loaded…`, the manifest was missing/empty or had no matching `.cellucid-session` entries.
+  - If you see `Invalid chunk length … (session file truncated?)`, the `.cellucid-session` response was incomplete or corrupted.
 - Open DevTools → Network:
   - Verify `.../state-snapshots.json` returns **real JSON** (not an HTML SPA fallback page).
   - Verify the resolved `.cellucid-session` URL returns `200` and the response body is not empty.
+  - Check response headers for `Content-Encoding`: if your host compresses `.cellucid-session`, `Content-Length` can be unreliable for bounds checks in browsers (fixed in recent builds by treating it as a hint only).
 
 ---
 
