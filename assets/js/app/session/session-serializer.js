@@ -370,16 +370,34 @@ export class SessionSerializer {
       // NOTE:
       // `Content-Length` is not always reliable for streamed responses in browsers.
       // In particular, when servers apply `Content-Encoding` (gzip/br), browsers
-      // transparently decode the body stream but `Content-Length` still reflects
-      // the encoded byte length. Using it for strict EOF/bounds checks can cause
-      // false "truncated" errors (e.g., "Invalid chunk length ... > remaining ...").
+      // transparently decode the body stream but `Content-Length` can reflect the
+      // encoded byte length. Using it for strict EOF/bounds checks can cause false
+      // "truncated" errors (e.g., "Invalid chunk length ... > remaining ...").
       //
-      // We treat it as a progress hint only, and rely on actual stream EOF to
-      // detect truncation/corruption.
-      const contentEncoding = String(res.headers?.get?.('Content-Encoding') || '').trim().toLowerCase();
+      // There's an additional CORS pitfall: `Content-Encoding` is not a safelisted
+      // response header, so it may be *present* but not visible to JS unless the
+      // server exposes it. In that case, we must assume encoding is unknown and
+      // avoid treating `Content-Length` as authoritative for parsing.
+      //
+      // We treat `Content-Length` as a progress hint only unless we're confident
+      // the body stream byte length matches it.
+      const responseType = String(res.type || '').trim().toLowerCase();
+      const contentEncodingHeader = res.headers?.get?.('Content-Encoding');
+      const contentEncoding = String(contentEncodingHeader || '').trim().toLowerCase();
+
       const lenHeader = res.headers?.get?.('Content-Length') || null;
       const totalBytesHint = lenHeader != null ? Number(lenHeader) : null;
-      const hasReliableContentLength = !contentEncoding || contentEncoding === 'identity';
+
+      const isCorsResponse = responseType === 'cors';
+      const canObserveContentEncoding = contentEncodingHeader != null;
+      const isIdentityEncoding = !contentEncoding || contentEncoding === 'identity';
+
+      // Only treat Content-Length as reliable when:
+      // - it's same-origin (Response.type !== 'cors') and there's no Content-Encoding header, OR
+      // - Content-Encoding is explicitly visible and identity.
+      const hasReliableContentLength = canObserveContentEncoding
+        ? isIdentityEncoding
+        : !isCorsResponse;
 
       const totalBytesForUi = (hasReliableContentLength && Number.isFinite(totalBytesHint) && totalBytesHint > 0)
         ? totalBytesHint
