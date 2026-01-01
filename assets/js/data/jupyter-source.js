@@ -34,6 +34,7 @@ import {
  * @typedef {Object} JupyterConfig
  * @property {string} serverUrl - URL of the cellucid data server (from Python side)
  * @property {string} viewerId - Unique viewer ID for message routing
+ * @property {string|null} viewerToken - Per-viewer token for postMessage auth (recommended)
  * @property {string} [kernelId] - Jupyter kernel ID (optional)
  */
 
@@ -58,17 +59,19 @@ export function getJupyterConfig() {
     return null;
   }
 
-  const remote = params.get('remote');
+  // In the recommended "local viewer" mode, the web app is served by the Python
+  // server itself, so the server URL is the current location base.
+  //
+  // Important: some notebook environments proxy ports behind a path prefix, so
+  // `window.location.origin` is not sufficient (it would drop the prefix).
+  const defaultBase = new URL('.', window.location.href).toString().replace(/\/$/, '');
+  const remote = params.get('remote') || defaultBase;
   const viewerId = params.get('viewerId');
-
-  if (!remote) {
-    console.warn('[JupyterBridge] Missing remote parameter');
-    return null;
-  }
 
   return {
     serverUrl: remote,
     viewerId: viewerId || 'default',
+    viewerToken: params.get('viewerToken') || null,
     kernelId: params.get('kernelId') || null
   };
 }
@@ -209,30 +212,18 @@ export class JupyterBridgeDataSource {
    * @private
    */
   _handleMessage(event) {
-    // Verify origin (should be Jupyter server or localhost/loopback).
-    // IMPORTANT: Don't rely on string prefix checks; parse origin and allow http/https.
-    const origin = event.origin;
-    let originUrl = null;
-    try {
-      originUrl = new URL(origin);
-    } catch {
-      originUrl = null;
-    }
-
-    const isSameOrigin = origin === window.location.origin;
-    const isLoopbackHttp =
-      originUrl &&
-      (originUrl.protocol === 'http:' || originUrl.protocol === 'https:') &&
-      (originUrl.hostname === 'localhost' || originUrl.hostname === '127.0.0.1');
-
-    if (!isSameOrigin && !isLoopbackHttp) return;
-
     const data = event.data;
     if (!data || typeof data !== 'object') return;
 
+    // Dev-phase strictness: require per-viewer token authentication.
+    // Notebook frontends can be hosted on non-loopback origins (Colab, VSCode webviews),
+    // so we do not attempt origin allowlisting here.
+    if (!this._config?.viewerToken) return;
+    if (data.viewerToken !== this._config.viewerToken) return;
+
     // Capture parent origin after validation so outgoing messages can target it.
     if (!this._parentOrigin) {
-      this._parentOrigin = origin;
+      this._parentOrigin = event.origin;
     }
 
     // Check viewer ID if present
@@ -243,6 +234,34 @@ export class JupyterBridgeDataSource {
     console.log('[JupyterBridge] Received message:', data.type);
 
     switch (data.type) {
+      case 'ping':
+        // Lightweight round-trip used by `viewer.debug_connection()` on Python side.
+        this._postEventToPython({
+          type: 'pong',
+          requestId: data.requestId || null,
+          t: Date.now(),
+          viewerId: this._config?.viewerId
+        });
+        break;
+
+      case 'debug_snapshot':
+        // One-shot diagnostic payload for `viewer.debug_connection()`.
+        // Important: this is sent via the same HTTP event channel as hooks, so it works
+        // across notebook frontends (Jupyter/JupyterLab/Colab/VSCode).
+        this._postEventToPython({
+          type: 'debug_snapshot',
+          requestId: data.requestId || null,
+          ts: new Date().toISOString(),
+          locationHref: window.location.href,
+          origin: window.location.origin,
+          serverUrl: this._config?.serverUrl || null,
+          connected: !!this._connected,
+          parentOrigin: this._parentOrigin,
+          userAgent: (typeof navigator !== 'undefined' && navigator.userAgent) ? navigator.userAgent : null,
+          viewerId: this._config?.viewerId
+        });
+        break;
+
       case 'response':
         this._handleResponse(data);
         break;

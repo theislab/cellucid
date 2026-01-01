@@ -4,7 +4,7 @@
 // Includes progress tracking with download speed for the notification center.
 
 import { getDataSourceManager } from './data-source-manager.js';
-import { isLocalUserUrl, resolveUrl } from './data-source.js';
+import { fetchWithExportsBridge, isLocalUserUrl, resolveUrl } from './data-source.js';
 import { getNotificationCenter } from '../app/notification-center.js';
 import { toUint32Array } from './sparse-utils.js';
 import { tryDequantizeToFloat32 } from './quantization-worker-pool.js';
@@ -63,7 +63,7 @@ async function resolveAnyUrl(url) {
  */
 async function fetchJsonWithProtocol(url) {
   const resolvedUrl = await resolveAnyUrl(url);
-  const response = await fetch(resolvedUrl);
+  const response = await fetchWithExportsBridge(resolvedUrl);
 
   if (!response.ok) {
     throw new Error(`Failed to load: ${url}`);
@@ -201,7 +201,7 @@ async function dequantizeToFloat32(options) {
  */
 async function fetchOk(url, init) {
   const resolvedUrl = await resolveAnyUrl(url);
-  const response = await fetch(resolvedUrl, init);
+  const response = await fetchWithExportsBridge(resolvedUrl, init);
   if (!response.ok) {
     const err = new Error('Failed to load ' + url + ': ' + response.statusText);
     err.status = response.status;

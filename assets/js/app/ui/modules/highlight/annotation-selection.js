@@ -16,13 +16,14 @@ import { MAX_HISTORY_STEPS } from './selection-state.js';
  * @param {object} options
  * @param {import('../../../state/core/data-state.js').DataState} options.state
  * @param {object} options.viewer
+ * @param {any|null} [options.jupyterSource]
  * @param {ReturnType<import('./selection-state.js').createHighlightSelectionState>} options.selectionState
  * @param {object} options.ui
  * @param {HTMLElement|null} options.ui.modeDescriptionEl
  * @param {() => void} options.ui.hideRangeLabel
  * @returns {{ handleAnnotationStep: (stepEvent: any) => void }}
  */
-export function initAnnotationSelection({ state, viewer, selectionState, ui }) {
+export function initAnnotationSelection({ state, viewer, jupyterSource = null, selectionState, ui }) {
   const highlightModeDescriptionEl = ui?.modeDescriptionEl || null;
   const hideRangeLabel = ui?.hideRangeLabel || (() => {});
 
@@ -187,6 +188,10 @@ export function initAnnotationSelection({ state, viewer, selectionState, ui }) {
       label: `Annotation${stepsLabel} (${cellIndices.length.toLocaleString()} cells)`,
       cellIndices
     });
+
+    try {
+      jupyterSource?.notifySelection?.(cellIndices, 'annotation');
+    } catch {}
 
     debug.log(`[UI] Annotation selected ${cellIndices.length} cells from ${selectionState.annotationStepCount} step(s)`);
 

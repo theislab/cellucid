@@ -25,8 +25,8 @@ data/raw/**
 data/experiments/**
 !data/experiments/.gitkeep
 
-# Viewer exports now live under assets
-# assets/exports/**
+# Viewer exports live in a separate repo (cellucid-datasets).
+assets/exports/**
 !assets/exports/.gitkeep
 # exports/_**
 # python/exports/**

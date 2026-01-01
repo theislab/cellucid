@@ -21,6 +21,7 @@ import { initContinuousSelectionPreview } from './continuous-selection-preview.j
  * @param {object} options
  * @param {import('../../../state/core/data-state.js').DataState} options.state
  * @param {object} options.viewer
+ * @param {any|null} [options.jupyterSource]
  * @param {object} [options.dom]
  * @param {HTMLElement|HTMLElement[]|null} [options.dom.modeButtons]
  * @param {HTMLElement|null} [options.dom.modeDescription]
@@ -30,6 +31,7 @@ import { initContinuousSelectionPreview } from './continuous-selection-preview.j
 export function initHighlightSelectionTools({
   state,
   viewer,
+  jupyterSource = null,
   dom,
   renderHighlightSummary,
   renderHighlightPages
@@ -47,6 +49,7 @@ export function initHighlightSelectionTools({
   const annotation = initAnnotationSelection({
     state,
     viewer,
+    jupyterSource,
     selectionState,
     ui: {
       modeDescriptionEl: ui.modeDescriptionEl,
@@ -57,6 +60,7 @@ export function initHighlightSelectionTools({
   const lasso = initLassoSelection({
     state,
     viewer,
+    jupyterSource,
     selectionState,
     ui: { modeDescriptionEl: ui.modeDescriptionEl }
   });
@@ -64,6 +68,7 @@ export function initHighlightSelectionTools({
   const proximity = initProximitySelection({
     state,
     viewer,
+    jupyterSource,
     selectionState,
     ui: { modeDescriptionEl: ui.modeDescriptionEl }
   });
@@ -71,6 +76,7 @@ export function initHighlightSelectionTools({
   const knn = initKnnSelection({
     state,
     viewer,
+    jupyterSource,
     selectionState,
     ui: { modeDescriptionEl: ui.modeDescriptionEl }
   });
@@ -113,4 +119,3 @@ export function initHighlightSelectionTools({
     }
   };
 }
-

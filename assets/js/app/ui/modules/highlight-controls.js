@@ -11,7 +11,7 @@ import { initHighlightPagesUI } from './highlight/highlight-pages-ui.js';
 import { initHighlightSelectionTools } from './highlight/highlight-selection-tools.js';
 import { initHighlightSummaryUI } from './highlight/highlight-summary-ui.js';
 
-export function initHighlightControls({ state, viewer, dom }) {
+export function initHighlightControls({ state, viewer, dom, jupyterSource = null }) {
   const {
     countEl: highlightCountEl,
     groupsEl: highlightedGroupsEl,
@@ -42,6 +42,7 @@ export function initHighlightControls({ state, viewer, dom }) {
   initHighlightSelectionTools({
     state,
     viewer,
+    jupyterSource,
     dom: {
       modeButtons: highlightModeButtons,
       modeDescription: highlightModeDescription
@@ -70,4 +71,3 @@ export function initHighlightControls({ state, viewer, dom }) {
 
   return { renderHighlightSummary, renderHighlightPages, updateHighlightMode };
 }
-

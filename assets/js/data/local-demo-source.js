@@ -1,5 +1,5 @@
 /**
- * LocalDemoDataSource - Data source for demo datasets in the exports/ directory
+ * LocalDemoDataSource - Data source for demo datasets at an exports base URL
  *
  * Reads datasets.json manifest listing available datasets.
  */
@@ -19,15 +19,20 @@ import {
  */
 
 /**
- * Data source for demo datasets stored in the exports/ directory
+ * Data source for demo datasets stored in an exports directory.
+ *
+ * Note: in production, exports are typically hosted outside the web app repo
+ * (e.g. a separate `cellucid-datasets` repo/site). The base URL is configured
+ * via `DATA_CONFIG.EXPORTS_BASE_URL` (index.html meta tag or query param).
  */
 export class LocalDemoDataSource {
   /**
-   * @param {string} [baseUrl='assets/exports/'] - Base URL for the exports directory
+   * @param {string|null} [baseUrl] - Base URL for the exports directory (must end with `/` or will be normalized)
    */
   constructor(baseUrl = DATA_CONFIG.EXPORTS_BASE_URL) {
-    this.baseUrl = baseUrl.endsWith('/') ? baseUrl : baseUrl + '/';
-    this.manifestUrl = resolveUrl(this.baseUrl, DATA_CONFIG.DATASETS_MANIFEST);
+    const normalized = typeof baseUrl === 'string' ? baseUrl.trim() : '';
+    this.baseUrl = normalized ? (normalized.endsWith('/') ? normalized : normalized + '/') : null;
+    this.manifestUrl = this.baseUrl ? resolveUrl(this.baseUrl, DATA_CONFIG.DATASETS_MANIFEST) : null;
     this.type = 'local-demo';
 
     // Cache
@@ -51,6 +56,12 @@ export class LocalDemoDataSource {
    * @returns {Promise<boolean>}
    */
   async isAvailable() {
+    if (!this.manifestUrl) {
+      this._availabilityChecked = true;
+      this._isAvailable = false;
+      return false;
+    }
+
     // Return cached result if already checked
     if (this._availabilityChecked) {
       return this._isAvailable;
@@ -80,6 +91,15 @@ export class LocalDemoDataSource {
    * @private
    */
   async _loadManifest() {
+    if (!this.manifestUrl) {
+      throw new DataSourceError(
+        'Demo datasets are not configured. Set ?exportsBaseUrl=... (or ?exports=...) or add <meta name="cellucid-exports-base-url" ...> in index.html.',
+        DataSourceErrorCode.INVALID_FORMAT,
+        this.type,
+        { hint: 'configure cellucid-exports-base-url' }
+      );
+    }
+
     if (this._manifest !== null) {
       return this._manifest;
     }

@@ -15,12 +15,13 @@ import { MAX_HISTORY_STEPS } from './selection-state.js';
  * @param {object} options
  * @param {import('../../../state/core/data-state.js').DataState} options.state
  * @param {object} options.viewer
+ * @param {any|null} [options.jupyterSource]
  * @param {ReturnType<import('./selection-state.js').createHighlightSelectionState>} options.selectionState
  * @param {object} options.ui
  * @param {HTMLElement|null} options.ui.modeDescriptionEl
  * @returns {{ handleKnnStep: (stepEvent: any) => void }}
  */
-export function initKnnSelection({ state, viewer, selectionState, ui }) {
+export function initKnnSelection({ state, viewer, jupyterSource = null, selectionState, ui }) {
   const highlightModeDescriptionEl = ui?.modeDescriptionEl || null;
 
   function handleKnnSelection(knnEvent) {
@@ -45,6 +46,9 @@ export function initKnnSelection({ state, viewer, selectionState, ui }) {
     if (group) {
       debug.log(`[UI] KNN selected ${knnEvent.cellCount} cells from ${knnEvent.steps} selection(s)`);
     }
+    try {
+      jupyterSource?.notifySelection?.(knnEvent.cellIndices, 'knn');
+    } catch {}
 
     selectionState.knnHistory = [];
     selectionState.knnRedoStack = [];

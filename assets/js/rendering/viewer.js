@@ -495,6 +495,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 	  let targetRadius = radius;
 	  let lastTouchDist = 0;
 	  let animationHandle = null;
+	  let renderPaused = false;
 	  let disposed = false;
 
   // Navigation (orbit + free-fly + planar)
@@ -2716,7 +2717,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   }
 
   function render() {
-    if (webglContextLost) return;
+    if (webglContextLost || renderPaused) return;
     animationHandle = requestAnimationFrame(render);
     const now = performance.now();
     const timeSeconds = now / 1000;
@@ -5071,7 +5072,39 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         showWebglContextOverlay('WebGL context lost. Reload required to continue.');
         return;
       }
+      if (renderPaused) return;
       if (!animationHandle) animationHandle = requestAnimationFrame(render);
+    },
+
+    /**
+     * Pause the render loop without disposing GPU resources.
+     *
+     * This is used for the Jupyter "freeze" UX: the view stays exactly as-is,
+     * but interactions/network-driven updates are expected to stop.
+     */
+    pause() {
+      renderPaused = true;
+      if (animationHandle) {
+        cancelAnimationFrame(animationHandle);
+        animationHandle = null;
+      }
+    },
+
+    /**
+     * Resume after `pause()`.
+     */
+    resume() {
+      if (disposed) return;
+      renderPaused = false;
+      if (webglContextLost) {
+        showWebglContextOverlay('WebGL context lost. Reload required to continue.');
+        return;
+      }
+      if (!animationHandle) animationHandle = requestAnimationFrame(render);
+    },
+
+    isPaused() {
+      return renderPaused;
     },
 
     /**

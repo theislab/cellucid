@@ -98,7 +98,7 @@ getGitHubAuthSession()
 const FAST_BINARY_FETCH_INIT = { cache: 'force-cache' };
 
 // Default export base URL (will be updated by DataSourceManager)
-let EXPORT_BASE_URL = 'assets/exports/';
+let EXPORT_BASE_URL = '';
 
 // Helper to get URLs based on current dataset
 function getObsManifestUrl() { return `${EXPORT_BASE_URL}obs_manifest.json`; }
@@ -248,9 +248,11 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     const remoteSource = createRemoteDataSource();
     dataSourceManager.registerSource('remote', remoteSource);
 
+    const inJupyter = isJupyterContext();
+
     // Check if running in Jupyter context
     let jupyterSource = null;
-    if (isJupyterContext()) {
+    if (inJupyter) {
       debug.log('[Main] Detected Jupyter context, initializing bridge...');
       jupyterSource = createJupyterBridgeDataSource();
       dataSourceManager.registerSource('jupyter', jupyterSource);
@@ -259,6 +261,171 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       const jupyterInitialized = await jupyterSource.initialize();
       if (jupyterInitialized) {
         debug.log('[Main] Jupyter bridge initialized successfully');
+
+        const jupyterConfig = getJupyterConfig();
+        const jupyterServerUrl =
+          jupyterConfig?.serverUrl || new URL('.', window.location.href).toString().replace(/\/$/, '');
+
+        // Freeze support: keep the view exactly as-is when the kernel/server stops.
+        let jupyterFrozen = false;
+        const freezeJupyterView = () => {
+          if (jupyterFrozen) return;
+          jupyterFrozen = true;
+          try { viewer.pause?.(); } catch {}
+          try {
+            let overlay = document.getElementById('cellucid-jupyter-freeze-overlay');
+            if (!overlay) {
+              overlay = document.createElement('div');
+              overlay.id = 'cellucid-jupyter-freeze-overlay';
+              overlay.style.position = 'fixed';
+              overlay.style.inset = '0';
+              overlay.style.zIndex = '999999';
+              overlay.style.pointerEvents = 'all';
+              overlay.style.background = 'transparent';
+              overlay.setAttribute('aria-hidden', 'true');
+              document.body.appendChild(overlay);
+            }
+            overlay.style.display = 'block';
+          } catch {}
+        };
+
+        // Freeze command from Python (viewer.stop()).
+        try {
+          jupyterSource.onMessage?.((msg) => {
+            if (msg?.type === 'freeze') {
+              freezeJupyterView();
+            }
+          });
+        } catch (err) {
+          console.warn('[Main] Failed to wire Jupyter freeze handler:', err);
+        }
+
+        // Auto-freeze on server disconnect (kernel stopped / viewer stopped).
+        try {
+          const interval = setInterval(async () => {
+            if (jupyterFrozen) {
+              clearInterval(interval);
+              return;
+            }
+            try {
+              const res = await fetch(`${jupyterServerUrl}/_cellucid/health`, { cache: 'no-store' });
+              if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            } catch (err) {
+              console.warn('[Main] Jupyter server unreachable; freezing view:', err?.message || err);
+              freezeJupyterView();
+              clearInterval(interval);
+            }
+          }, 3000);
+        } catch (err) {
+          console.warn('[Main] Failed to start Jupyter health checker:', err);
+        }
+
+        // Forward frontend warnings/errors to Python (for `viewer.debug_connection()`).
+        try {
+          const stringifyArg = (a) => {
+            if (typeof a === 'string') return a;
+            if (a instanceof Error) return a.stack || a.message || String(a);
+            try { return JSON.stringify(a); } catch { return String(a); }
+          };
+          const sendConsoleEvent = (level, args, extra = {}) => {
+            try {
+              const parts = (args || []).map(stringifyArg);
+              const message = parts.join(' ').slice(0, 4000);
+              jupyterSource?.notifyCustomEvent?.('console', {
+                level,
+                message,
+                ts: new Date().toISOString(),
+                ...extra
+              });
+            } catch {}
+          };
+
+          const origWarn = console.warn.bind(console);
+          const origError = console.error.bind(console);
+          console.warn = (...args) => {
+            origWarn(...args);
+            sendConsoleEvent('warn', args);
+          };
+          console.error = (...args) => {
+            origError(...args);
+            sendConsoleEvent('error', args);
+          };
+
+          window.addEventListener('error', (e) => {
+            sendConsoleEvent('error', [e?.message || 'Window error'], {
+              filename: e?.filename || null,
+              lineno: e?.lineno || null,
+              colno: e?.colno || null
+            });
+          });
+          window.addEventListener('unhandledrejection', (e) => {
+            sendConsoleEvent('error', ['UnhandledRejection', e?.reason], {});
+          });
+        } catch (err) {
+          console.warn('[Main] Failed to wire console forwarding to Python:', err);
+        }
+
+        // Forward hover/click events to Python for notebook hooks.
+        // Kept intentionally lightweight (throttled picking).
+        try {
+          let lastHoverCell = null;
+          let lastHoverAt = 0;
+          const HOVER_THROTTLE_MS = 50;
+
+          canvas?.addEventListener?.('mousemove', (e) => {
+            const now = performance.now();
+            if (now - lastHoverAt < HOVER_THROTTLE_MS) return;
+            lastHoverAt = now;
+
+            const cellIdx = typeof viewer.pickCellAtScreen === 'function'
+              ? viewer.pickCellAtScreen(e.clientX, e.clientY)
+              : -1;
+
+            if (cellIdx < 0) {
+              if (lastHoverCell !== null) {
+                lastHoverCell = null;
+                jupyterSource?.notifyHover?.(null, null);
+              }
+              return;
+            }
+
+            if (cellIdx === lastHoverCell) return;
+            lastHoverCell = cellIdx;
+
+            let position = null;
+            const positions = typeof viewer.getPositions === 'function' ? viewer.getPositions() : null;
+            if (positions && positions.length >= cellIdx * 3 + 3) {
+              position = {
+                x: positions[cellIdx * 3],
+                y: positions[cellIdx * 3 + 1],
+                z: positions[cellIdx * 3 + 2]
+              };
+            }
+
+            jupyterSource?.notifyHover?.(cellIdx, position);
+          });
+
+          canvas?.addEventListener?.('mouseleave', () => {
+            if (lastHoverCell !== null) {
+              lastHoverCell = null;
+              jupyterSource?.notifyHover?.(null, null);
+            }
+          });
+
+          canvas?.addEventListener?.('click', (e) => {
+            const cellIdx = typeof viewer.pickCellAtScreen === 'function'
+              ? viewer.pickCellAtScreen(e.clientX, e.clientY)
+              : -1;
+            if (cellIdx < 0) return;
+            jupyterSource?.notifyClick?.(cellIdx, {
+              button: e.button ?? 0,
+              shift: !!e.shiftKey,
+              ctrl: !!(e.ctrlKey || e.metaKey)
+            });
+          });
+        } catch (err) {
+          console.warn('[Main] Failed to wire Jupyter hover/click hooks:', err);
+        }
 
         // Auto-load first Jupyter dataset
         try {
@@ -272,6 +439,13 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         } catch (err) {
           console.warn('[Main] Failed to load Jupyter datasets:', err.message);
         }
+      } else {
+        notifications.error(
+          'Cellucid Jupyter initialization failed: could not reach the Python-side server. ' +
+          'This usually means the viewer is blocked from reaching the server URL (mixed-content / proxy / port forwarding). ' +
+          'In Python, run `viewer.debug_connection()` for a detailed report.',
+          { category: 'connectivity', title: 'Jupyter connection' }
+        );
       }
     }
 
@@ -314,6 +488,9 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     // Initialize with default sources (registers local-demo and github-repo sources).
     // When the welcome modal is shown, classify the default demo load as an explicit "sample demo".
     await dataSourceManager.initialize({
+      // In Jupyter mode, never auto-load the demo dataset as a fallback. If the bridge/server
+      // is unreachable, we want a loud failure instead of silently showing sample data.
+      autoLoadDefault: !inJupyter,
       defaultLoadMethod: welcomeVisible ? DATA_LOAD_METHODS.SAMPLE_DEMO : DATA_LOAD_METHODS.DEFAULT_DEMO
     });
 
@@ -660,12 +837,12 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       }
     }
 
-    const positions = await positionsPromise;
+	    const positions = await positionsPromise;
 
-    state.initScene(positions, obs);
-    // One-time helper to rebuild density from current visibility + grid
-    function rebuildSmokeDensity(gridSizeOverride) {
-      const gridSize = gridSizeOverride || 128;
+	    state.initScene(positions, obs);
+	    // One-time helper to rebuild density from current visibility + grid
+	    function rebuildSmokeDensity(gridSizeOverride) {
+	      const gridSize = gridSizeOverride || 128;
 
       const visiblePositions = state.getVisiblePositionsForSmoke
         ? state.getVisiblePositionsForSmoke()
@@ -684,16 +861,75 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
     const sessionSerializer = createSessionSerializer({ state, viewer, sidebar, dataSourceManager });
 
-    ui = initUI({
-      state,
-      viewer,
-      smoke: {
-        rebuildSmokeDensity
-      },
-      reloadActiveDataset: reloadActiveDatasetInPlace,
-      sessionSerializer,
-      dataSourceManager
-    });
+    // -----------------------------------------------------------------------
+    // Jupyter "no-download" session bundle capture (viewer → Python)
+    // -----------------------------------------------------------------------
+    if (jupyterSource) {
+      const jupyterConfig = getJupyterConfig();
+      const serverUrl =
+        jupyterConfig?.serverUrl || new URL('.', window.location.href).toString().replace(/\/$/, '');
+      const viewerId = jupyterConfig?.viewerId || null;
+
+      try {
+        jupyterSource.onMessage(async (msg) => {
+          if (!msg || typeof msg !== 'object') return;
+          if (msg.type !== 'requestSessionBundle') return;
+
+          const requestId = String(msg.requestId || '').trim();
+          if (!requestId) return;
+          if (!viewerId) return;
+
+          try {
+            const blob = await sessionSerializer.createSessionBundle();
+            const uploadUrl =
+              `${serverUrl}/_cellucid/session_bundle?viewerId=${encodeURIComponent(viewerId)}&requestId=${encodeURIComponent(requestId)}`;
+
+            const res = await fetch(uploadUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/octet-stream' },
+              body: blob
+            });
+
+            if (!res.ok) {
+              const text = await res.text().catch(() => '');
+              throw new Error(text || `Upload failed (${res.status})`);
+            }
+          } catch (err) {
+            console.warn('[Main] requestSessionBundle failed:', err);
+            try {
+              jupyterSource.notifyCustomEvent('session_bundle', {
+                requestId,
+                status: 'error',
+                error: err?.message || String(err)
+              });
+            } catch {}
+          }
+        });
+      } catch (err) {
+        console.warn('[Main] Failed to wire requestSessionBundle handler:', err);
+      }
+    }
+
+	    ui = initUI({
+	      state,
+	      viewer,
+	      smoke: {
+	        rebuildSmokeDensity
+	      },
+	      reloadActiveDataset: reloadActiveDatasetInPlace,
+	      sessionSerializer,
+	      dataSourceManager,
+	      jupyterSource
+	    });
+
+	    // Jupyter: notify Python only after the UI + notebook hooks are fully wired.
+	    // This powers `viewer.on_ready` and `viewer.wait_for_ready()`.
+	    try {
+	      jupyterSource?.notifyReady?.({
+	        nCells: state.pointCount || Math.floor((positions?.length || 0) / 3),
+	        dimensions: state.activeDimensionLevel || 3
+	      });
+	    } catch {}
 
     // Initialize Page Analysis / Comparison Module
     const pageAnalysisSection = document.getElementById('page-analysis-section');

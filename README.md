@@ -142,9 +142,17 @@ cellucid/
 │   │   ├── app/            # UI, state management
 │   │   ├── data/           # Data loaders (binary, h5ad)
 │   │   └── rendering/      # WebGL renderer
-│   └── exports/            # Sample datasets
 ├── scripts/                 # Dev/validation scripts
 └── types/                   # Editor-only type defs (design tokens)
+```
+
+Sample datasets (prepared exports) live in a separate repo/site:
+
+```
+cellucid-datasets/
+├── exports/                 # Static exports (datasets.json + dataset folders)
+├── bridge.html              # CORS-free fetch bridge (GitHub Pages)
+└── bridge.js
 ```
 
 ## CSS Design System

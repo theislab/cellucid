@@ -25,9 +25,7 @@ The intent is:
 
 ---
 
-## Auto-Load on Startup (Exports Directory)
-
-Cellucid preserves the legacy “auto-load saved state from the dataset exports folder” workflow.
+## Auto-Load on Startup (Dataset Base URL)
 
 How it works:
 - On startup, `cellucid/assets/js/app/main.js` calls `sessionSerializer.restoreLatestFromDatasetExports()`.
@@ -35,9 +33,9 @@ How it works:
 - It filters for entries whose **filename ends with** `.cellucid-session` (case-insensitive, query/hash ignored) and loads the **last** entry.
 - It resolves bundle URLs relative to the fetched manifest URL (`Response.url`) so redirects and absolute/relative entries work the same.
 
-Expected files (example for the `suo` demo dataset):
-- `cellucid/assets/exports/suo/state-snapshots.json`
-- `cellucid/assets/exports/suo/cellucid-session-YYYY-MM-DDTHH-MM-SS.cellucid-session`
+Expected files (example for the `suo` demo dataset, assuming an exports base like `https://theislab.github.io/cellucid-datasets/exports/`):
+- `https://theislab.github.io/cellucid-datasets/exports/suo/state-snapshots.json`
+- `https://theislab.github.io/cellucid-datasets/exports/suo/cellucid-session-YYYY-MM-DDTHH-MM-SS.cellucid-session`
 
 Supported `state-snapshots.json` shapes (dev-phase):
 - `{ "states": ["file.cellucid-session", ...] }` (recommended)

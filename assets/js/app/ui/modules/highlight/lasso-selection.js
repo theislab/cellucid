@@ -15,12 +15,13 @@ import { MAX_HISTORY_STEPS } from './selection-state.js';
  * @param {object} options
  * @param {import('../../../state/core/data-state.js').DataState} options.state
  * @param {object} options.viewer
+ * @param {any|null} [options.jupyterSource]
  * @param {ReturnType<import('./selection-state.js').createHighlightSelectionState>} options.selectionState
  * @param {object} options.ui
  * @param {HTMLElement|null} options.ui.modeDescriptionEl
  * @returns {{ handleLassoStep: (stepEvent: any) => void }}
  */
-export function initLassoSelection({ state, viewer, selectionState, ui }) {
+export function initLassoSelection({ state, viewer, jupyterSource = null, selectionState, ui }) {
   const highlightModeDescriptionEl = ui?.modeDescriptionEl || null;
 
   function handleLassoSelection(lassoEvent) {
@@ -45,6 +46,9 @@ export function initLassoSelection({ state, viewer, selectionState, ui }) {
     if (group) {
       debug.log(`[UI] Lasso selected ${lassoEvent.cellCount} cells from ${lassoEvent.steps} view(s)`);
     }
+    try {
+      jupyterSource?.notifySelection?.(lassoEvent.cellIndices, 'lasso');
+    } catch {}
 
     selectionState.lassoHistory = [];
     selectionState.lassoRedoStack = [];

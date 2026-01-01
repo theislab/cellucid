@@ -15,12 +15,13 @@ import { MAX_HISTORY_STEPS } from './selection-state.js';
  * @param {object} options
  * @param {import('../../../state/core/data-state.js').DataState} options.state
  * @param {object} options.viewer
+ * @param {any|null} [options.jupyterSource]
  * @param {ReturnType<import('./selection-state.js').createHighlightSelectionState>} options.selectionState
  * @param {object} options.ui
  * @param {HTMLElement|null} options.ui.modeDescriptionEl
  * @returns {{ handleProximityStep: (stepEvent: any) => void }}
  */
-export function initProximitySelection({ state, viewer, selectionState, ui }) {
+export function initProximitySelection({ state, viewer, jupyterSource = null, selectionState, ui }) {
   const highlightModeDescriptionEl = ui?.modeDescriptionEl || null;
 
   function handleProximitySelection(proximityEvent) {
@@ -45,6 +46,9 @@ export function initProximitySelection({ state, viewer, selectionState, ui }) {
     if (group) {
       debug.log(`[UI] Proximity selected ${proximityEvent.cellCount} cells from ${proximityEvent.steps} drag(s)`);
     }
+    try {
+      jupyterSource?.notifySelection?.(proximityEvent.cellIndices, 'proximity');
+    } catch {}
 
     selectionState.proximityHistory = [];
     selectionState.proximityRedoStack = [];

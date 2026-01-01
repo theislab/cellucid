@@ -468,26 +468,8 @@ export class SessionSerializer {
       manifestUrl = `${baseWithSlash}state-snapshots.json`;
     }
 
-    const datasetIdRaw = dsm?.getCurrentDatasetId?.() || null;
-    const datasetId = typeof datasetIdRaw === 'string' ? datasetIdRaw.trim() : null;
-
-    /** @type {string|null} */
-    let fallbackManifestUrl = null;
-    if (datasetId) {
-      try {
-        const exportsBase = new URL(
-          'assets/exports/',
-          typeof window !== 'undefined' ? window.location?.href : undefined
-        );
-        fallbackManifestUrl = new URL(`${datasetId.replace(/\/+$/, '')}/state-snapshots.json`, exportsBase).toString();
-      } catch {
-        fallbackManifestUrl = null;
-      }
-    }
-
     /** @type {string[]} */
     const candidates = [manifestUrl];
-    if (fallbackManifestUrl && fallbackManifestUrl !== manifestUrl) candidates.push(fallbackManifestUrl);
 
     let res = null;
     let payload = null;

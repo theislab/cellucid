@@ -5,27 +5,59 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>cellucid - Interactive Single-Cell Data Visualization</title>
 
+  <!--
+    CELLUCID_WEB_BUILD_ID
+    --------------------
+    This stamp is used by `cellucid-python`'s hosted-asset proxy cache to decide
+    whether it should re-download `index.html` and invalidate its cached
+    `/assets/*` files.
+
+    TODO(dev): Update this value whenever you deploy changes to the website.
+    Recommended: use an ISO timestamp or a git commit hash.
+  -->
+  <meta name="cellucid-web-build-id" content="2025-12-31T23:59:59Z-theislab-datasets" />
+
+  <!--
+    CELLUCID_EXPORTS_BASE_URL
+    ------------------------
+    The web app's built-in sample datasets (the "local-demo" source) are now
+    hosted outside the web app repo, typically in a separate `cellucid-datasets`
+    repo/site. This URL must point at an exports root that contains:
+      - datasets.json
+      - <dataset-id>/dataset_identity.json
+      - <dataset-id>/obs_manifest.json
+      - ...
+
+    If you host datasets on GitHub Pages (or any host where you can't set CORS),
+    Cellucid will automatically fall back to the `cellucid-datasets/bridge.html`
+    iframe bridge (expected at `../bridge.html` relative to this base URL).
+
+    TODO(dev): Set this to your datasets hosting URL (GitHub Pages or custom domain).
+  -->
+  <meta name="cellucid-exports-base-url" content="https://theislab.github.io/cellucid-datasets/exports/" />
+
 	  <!-- Security (dev-phase strict CSP; no inline scripts) -->
 	  <!--
 	    Note: `connect-src https: wss:` is dev-friendly (allows any HTTPS/WSS). It’s fine for now.
 	    If we want this truly strict, we must allowlist the exact endpoints we use (GitHub/GA/worker/etc).
-	    The `sha256-...` in `script-src` allowlists the inline JSON-LD `<script type="application/ld+json">`
-	    block below (SEO structured data) without enabling `'unsafe-inline'`. If you change that JSON, the
-	    hash must be regenerated or the browser will block the block and report a CSP violation.
-	    TODO (prod): move CSP to an HTTP response header + generate per-environment.
-	  -->
-	  <meta http-equiv="Content-Security-Policy" content="
-	    default-src 'self';
-	    base-uri 'none';
-	    object-src 'none';
-	    script-src 'self' https://www.googletagmanager.com 'sha256-+9zlP/wQVfV23S04wl/L4pHtJlWnuGrS2YNU0z7yjJQ=';
-	    style-src 'self' 'unsafe-inline';
-	    img-src 'self' data: https:;
-	    font-src 'self' data:;
-	    connect-src 'self' https: wss: blob: http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*;
-	    worker-src 'self' blob:;
-	    manifest-src 'self';
-	  " />
+    The `sha256-...` in `script-src` allowlists the inline JSON-LD `<script type="application/ld+json">`
+    block below (SEO structured data) without enabling `'unsafe-inline'`. If you change that JSON, the
+    hash must be regenerated or the browser will block the block and report a CSP violation.
+    TODO (prod): move CSP to an HTTP response header + generate per-environment.
+  -->
+  <meta http-equiv="Content-Security-Policy" content="
+    default-src 'self';
+    base-uri 'none';
+    object-src 'none';
+    script-src 'self' https://www.googletagmanager.com 'sha256-+9zlP/wQVfV23S04wl/L4pHtJlWnuGrS2YNU0z7yjJQ=';
+    style-src 'self' 'unsafe-inline';
+    img-src 'self' data: https:;
+    font-src 'self' data:;
+    connect-src 'self' https: wss: blob: http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*;
+    frame-src 'self' https:;
+    worker-src 'self' blob:;
+    manifest-src 'self';
+  " />
 
   <!-- SEO Meta Tags -->
   <meta name="description" content="Every cell tells a story. Navigate through millions of them, uncover hidden patterns, and see your data come alive." />
@@ -36,6 +68,7 @@
 
   <!-- Preconnect to external services for faster initial connection -->
   <link rel="preconnect" href="https://www.googletagmanager.com" />
+  <link rel="preconnect" href="https://theislab.github.io" crossorigin />
 
   <!-- Open Graph / Social Media -->
   <meta property="og:title" content="cellucid - Interactive Single-Cell Data Visualization" />

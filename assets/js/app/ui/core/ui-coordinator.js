@@ -41,6 +41,7 @@ const LIVE_VIEW_ID = 'live';
  * @param {import('../../../data/data-source-manager.js').DataSourceManager | null} [options.dataSourceManager]
  * @param {(metadata: any) => Promise<void> | void} [options.reloadActiveDataset]
  * @param {object|null} [options.sessionSerializer]
+ * @param {any|null} [options.jupyterSource]
  */
 export function initUI({
   state,
@@ -48,7 +49,8 @@ export function initUI({
   smoke = null,
   dataSourceManager = null,
   reloadActiveDataset = null,
-  sessionSerializer = null
+  sessionSerializer = null,
+  jupyterSource = null
 }) {
   debug.log('[UI] initUI');
 
@@ -80,7 +82,7 @@ export function initUI({
       onViewBadgesMaybeChanged: () => viewControls?.renderSplitViewBadges?.()
     }
   });
-  const highlightControls = initHighlightControls({ state, viewer, dom: dom.highlight });
+  const highlightControls = initHighlightControls({ state, viewer, dom: dom.highlight, jupyterSource });
   const communityAnnotationControls = initCommunityAnnotationControls({
     state,
     dom: dom.communityAnnotation,

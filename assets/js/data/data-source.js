@@ -5,6 +5,8 @@
  * to work with different data backends (local demo, user directory, remote server, Jupyter).
  */
 
+import { ExportsBridgeClient } from './exports-bridge-client.js';
+
 /**
  * @typedef {Object} DatasetStats
  * @property {number} n_cells - Number of cells/points
@@ -54,9 +56,35 @@
 /**
  * Configuration constants for data loading
  */
+function getExportsBaseUrl() {
+  // Allow quick overrides without rebuilding (useful for testing new dataset hosts).
+  try {
+    const search = (typeof window !== 'undefined' && window.location && window.location.search) ? window.location.search : '';
+    const params = new URLSearchParams(search);
+    const fromQuery = (params.get('exportsBaseUrl') || params.get('exports') || '').trim();
+    if (fromQuery) return fromQuery.endsWith('/') ? fromQuery : fromQuery + '/';
+  } catch {
+    // ignore
+  }
+
+  // Read from <meta name="cellucid-exports-base-url" content="..."> in index.html.
+  try {
+    if (typeof document === 'undefined') throw new Error('no document');
+    const meta = document.querySelector('meta[name="cellucid-exports-base-url"]');
+    const content = (meta?.getAttribute('content') || '').trim();
+    if (content) return content.endsWith('/') ? content : content + '/';
+  } catch {
+    // ignore
+  }
+
+  // No fallback: demo exports live outside the app repo (see `cellucid-datasets`).
+  // If this is null, `local-demo` is treated as unavailable.
+  return null;
+}
+
 export const DATA_CONFIG = {
   // Base paths
-  EXPORTS_BASE_URL: 'assets/exports/',
+  EXPORTS_BASE_URL: getExportsBaseUrl(),
   DATASETS_MANIFEST: 'datasets.json',
 
   // Required files for a valid dataset
@@ -74,6 +102,236 @@ export const DATA_CONFIG = {
   SUPPORTED_MANIFEST_VERSIONS: [1],
   SUPPORTED_IDENTITY_VERSIONS: [2]
 };
+
+// ============================================================================
+// EXPORTS (cellucid-datasets) CORS-FREE FETCH BRIDGE
+// ============================================================================
+
+/**
+ * GitHub Pages typically cannot be configured with CORS headers.
+ * To keep the Cellucid web app (`https://www.cellucid.com`) able to load public
+ * demo exports from a separate origin (e.g. `https://<user>.github.io/...`),
+ * we use a tiny iframe bridge page hosted alongside `exports/` that performs
+ * same-origin fetches and returns bytes via postMessage.
+ *
+ * The bridge lives at `../bridge.html` relative to `EXPORTS_BASE_URL`.
+ * See `cellucid-datasets/bridge.html`.
+ */
+
+const EXPORTS_FETCH_MODE = {
+  AUTO: 'auto',
+  DIRECT: 'direct',
+  BRIDGE: 'bridge',
+};
+
+let _exportsFetchMode = EXPORTS_FETCH_MODE.AUTO;
+let _exportsBridgeClient = null;
+
+function getAbsoluteUrl(url) {
+  try {
+    return new URL(String(url), window.location.href).toString();
+  } catch {
+    return String(url);
+  }
+}
+
+function getAbsoluteExportsBaseUrl() {
+  const base = DATA_CONFIG.EXPORTS_BASE_URL;
+  if (!base) return null;
+  return getAbsoluteUrl(base);
+}
+
+function getExportsBridgeUrl() {
+  const exportsBase = getAbsoluteExportsBaseUrl();
+  if (!exportsBase) return null;
+  try {
+    return new URL('../bridge.html', exportsBase).toString();
+  } catch {
+    return null;
+  }
+}
+
+function exportsHostLikelyNoCors() {
+  const exportsBase = getAbsoluteExportsBaseUrl();
+  if (!exportsBase) return false;
+  try {
+    const host = new URL(exportsBase).hostname || '';
+    // GitHub Pages does not allow configuring CORS headers, so direct fetches
+    // from `https://www.cellucid.com` will fail. Use the bridge immediately.
+    return /\.github\.io$/i.test(host);
+  } catch {
+    return false;
+  }
+}
+
+function isExportsUrl(url) {
+  const exportsBase = getAbsoluteExportsBaseUrl();
+  if (!exportsBase) return false;
+  const abs = getAbsoluteUrl(url);
+  return abs.startsWith(exportsBase);
+}
+
+function isCrossOrigin(url) {
+  try {
+    return new URL(url, window.location.href).origin !== window.location.origin;
+  } catch {
+    return false;
+  }
+}
+
+function normalizeBridgeInit(init) {
+  const normalized = {};
+  if (!init || typeof init !== 'object') return normalized;
+
+  if (typeof init.method === 'string') normalized.method = init.method;
+  if (typeof init.cache === 'string') normalized.cache = init.cache;
+
+  // Normalize headers into a plain object of string->string.
+  try {
+    const headersOut = {};
+    const headersIn = init.headers;
+
+    if (headersIn && typeof Headers !== 'undefined' && headersIn instanceof Headers) {
+      for (const [k, v] of headersIn.entries()) {
+        if (typeof k === 'string' && typeof v === 'string') headersOut[k] = v;
+      }
+    } else if (Array.isArray(headersIn)) {
+      for (const pair of headersIn) {
+        if (!Array.isArray(pair) || pair.length !== 2) continue;
+        const [k, v] = pair;
+        if (typeof k === 'string' && typeof v === 'string') headersOut[k] = v;
+      }
+    } else if (headersIn && typeof headersIn === 'object') {
+      for (const [k, v] of Object.entries(headersIn)) {
+        if (typeof k === 'string' && typeof v === 'string') headersOut[k] = v;
+      }
+    }
+
+    if (Object.keys(headersOut).length) normalized.headers = headersOut;
+  } catch {
+    // ignore
+  }
+
+  return normalized;
+}
+
+function getExportsBridgeClient() {
+  if (_exportsBridgeClient) return _exportsBridgeClient;
+
+  const bridgeUrl = getExportsBridgeUrl();
+  if (!bridgeUrl) return null;
+
+  _exportsBridgeClient = new ExportsBridgeClient({ bridgeUrl });
+  return _exportsBridgeClient;
+}
+
+function prewarmExportsBridgeIfNeeded() {
+  try {
+    // For GitHub Pages demo exports (no CORS), warming the bridge early reduces the
+    // perceived "first demo load" latency (bridge.html + bridge.js need to load once).
+    if (!exportsHostLikelyNoCors()) return;
+    const exportsBase = getAbsoluteExportsBaseUrl();
+    if (!exportsBase) return;
+    if (!isCrossOrigin(exportsBase)) return;
+
+    const client = getExportsBridgeClient();
+    if (!client) return;
+    client.ensureReady().catch(() => {});
+  } catch {
+    // ignore
+  }
+}
+
+try {
+  setTimeout(prewarmExportsBridgeIfNeeded, 0);
+} catch {
+  // ignore
+}
+
+function responseFromBridgeMessage(msg, urlForError) {
+  if (!msg || typeof msg !== 'object') {
+    throw new Error(`Datasets bridge error: invalid response (${urlForError || 'request'})`);
+  }
+  if (msg.status === 0 && !msg.ok) {
+    throw new Error(`Datasets bridge network error: ${msg.error || 'unknown error'} (${urlForError || 'request'})`);
+  }
+
+  const headers = new Headers();
+  if (typeof msg.contentType === 'string' && msg.contentType) headers.set('content-type', msg.contentType);
+  if (typeof msg.contentLength === 'string' && msg.contentLength) headers.set('content-length', msg.contentLength);
+
+  const body = msg.body instanceof ArrayBuffer ? msg.body : new ArrayBuffer(0);
+  return new Response(body, {
+    status: typeof msg.status === 'number' ? msg.status : 200,
+    statusText: typeof msg.statusText === 'string' ? msg.statusText : '',
+    headers,
+  });
+}
+
+/**
+ * Fetch a URL, using the datasets bridge automatically for cross-origin demo exports.
+ *
+ * For non-exports URLs, this is a thin wrapper around `fetch()`.
+ *
+ * @param {string} url
+ * @param {RequestInit} [init]
+ * @returns {Promise<Response>}
+ */
+export async function fetchWithExportsBridge(url, init) {
+  const absUrl = getAbsoluteUrl(url);
+
+  // Not a demo-exports URL: normal fetch.
+  if (!isExportsUrl(absUrl)) {
+    return fetch(absUrl, init);
+  }
+
+  // Same-origin exports (e.g., if you deploy exports under www.cellucid.com): normal fetch.
+  if (!isCrossOrigin(absUrl)) {
+    _exportsFetchMode = EXPORTS_FETCH_MODE.DIRECT;
+    return fetch(absUrl, init);
+  }
+
+  // Cross-origin exports: prefer direct fetch if CORS works, else fall back to the bridge.
+  if (_exportsFetchMode === EXPORTS_FETCH_MODE.AUTO && exportsHostLikelyNoCors()) {
+    _exportsFetchMode = EXPORTS_FETCH_MODE.BRIDGE;
+  }
+
+  if (_exportsFetchMode === EXPORTS_FETCH_MODE.DIRECT) {
+    return fetch(absUrl, init);
+  }
+
+  if (_exportsFetchMode === EXPORTS_FETCH_MODE.BRIDGE) {
+    const client = getExportsBridgeClient();
+    if (!client) {
+      throw new Error('Demo exports are cross-origin but the datasets bridge URL could not be constructed.');
+    }
+    const msg = await client.fetch(absUrl, normalizeBridgeInit(init), 'arrayBuffer');
+    return responseFromBridgeMessage(msg, absUrl);
+  }
+
+  // AUTO
+  try {
+    const response = await fetch(absUrl, init);
+    _exportsFetchMode = EXPORTS_FETCH_MODE.DIRECT;
+    return response;
+  } catch (directErr) {
+    const client = getExportsBridgeClient();
+    if (!client) throw directErr;
+
+    try {
+      const msg = await client.fetch(absUrl, normalizeBridgeInit(init), 'arrayBuffer');
+      _exportsFetchMode = EXPORTS_FETCH_MODE.BRIDGE;
+      return responseFromBridgeMessage(msg, absUrl);
+    } catch (bridgeErr) {
+      const hint =
+        `Failed to fetch demo exports from a different origin. ` +
+        `If you are using GitHub Pages, ensure the datasets repo is published and includes \`bridge.html\` + \`bridge.js\`.`;
+      const err = new Error(`${hint}\nDirect fetch error: ${directErr?.message || directErr}\nBridge error: ${bridgeErr?.message || bridgeErr}`);
+      err.cause = bridgeErr;
+      throw err;
+    }
+  }
+}
 
 /**
  * Validate that a manifest/identity version is supported
@@ -177,14 +435,14 @@ export function resolveUrl(base, relative) {
  */
 export async function urlExists(url) {
   try {
-    const response = await fetch(url, { method: 'HEAD' });
+    const response = await fetchWithExportsBridge(url, { method: 'HEAD' });
     if (response.ok) return true;
     // Some servers don't support HEAD, try GET with minimal data transfer
     if (response.status === 405 || response.status === 501) {
       // Use Range header to request only 1 byte, and abort after headers received
       // fetch() resolves once headers arrive, so we can check status then abort to skip body
       const controller = new AbortController();
-      const getResponse = await fetch(url, {
+      const getResponse = await fetchWithExportsBridge(url, {
         headers: { 'Range': 'bytes=0-0' },
         signal: controller.signal
       });
@@ -207,7 +465,7 @@ export async function urlExists(url) {
  */
 export async function fetchJson(url, sourceType) {
   try {
-    const response = await fetch(url);
+    const response = await fetchWithExportsBridge(url);
     if (!response.ok) {
       if (response.status === 404) {
         throw new DataSourceError(
