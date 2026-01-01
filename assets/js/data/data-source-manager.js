@@ -472,6 +472,7 @@ export class DataSourceManager {
   static DEFAULT_PROTOCOL_HANDLERS = {
     'local-user://': 'local-user',
     'remote://': 'remote',
+    'remotes://': 'remote',
     'jupyter://': 'jupyter',
   };
 

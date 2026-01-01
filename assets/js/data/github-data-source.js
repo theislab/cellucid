@@ -31,48 +31,85 @@ import { getNotificationCenter } from '../app/notification-center.js';
 /**
  * Parse a GitHub repository URL/path into components
  * @param {string} input - Input like "owner/repo/path" or "owner/repo/branch/path"
- * @returns {{owner: string, repo: string, branch: string, path: string}|null}
+ * @returns {{owner: string, repo: string, branch: string|null, pathSegments: string[], path: string, branchExplicit: boolean}|null}
  */
 export function parseGitHubPath(input) {
   if (!input || typeof input !== 'string') return null;
 
-  // Clean up input
   let cleaned = input.trim();
+  let host = null;
+  let path = cleaned;
 
-  // Remove https://github.com/ prefix if present
-  cleaned = cleaned.replace(/^https?:\/\/github\.com\//i, '');
-  // Remove https://raw.githubusercontent.com/ prefix if present
-  cleaned = cleaned.replace(/^https?:\/\/raw\.githubusercontent\.com\//i, '');
-  // Remove leading/trailing slashes
-  cleaned = cleaned.replace(/^\/+|\/+$/g, '');
+  // Accept full URLs (github.com + raw.githubusercontent.com).
+  try {
+    const url = new URL(cleaned);
+    host = (url.hostname || '').toLowerCase();
+    path = url.pathname || '';
+  } catch {
+    // Not a URL; accept github.com/... and raw.githubusercontent.com/... without protocol.
+    cleaned = cleaned.replace(/^https?:\/\//i, '');
+    const lower = cleaned.toLowerCase();
+    if (lower.startsWith('github.com/')) {
+      host = 'github.com';
+      cleaned = cleaned.slice('github.com/'.length);
+    } else if (lower.startsWith('raw.githubusercontent.com/')) {
+      host = 'raw.githubusercontent.com';
+      cleaned = cleaned.slice('raw.githubusercontent.com/'.length);
+    }
+    path = cleaned;
+  }
 
-  const parts = cleaned.split('/');
+  // Normalize path: strip leading/trailing slashes and remove query/hash suffixes.
+  path = (path || '').split('?')[0].split('#')[0];
+  path = path.replace(/^\/+|\/+$/g, '');
+
+  // If the user pasted a direct datasets.json URL, treat its parent as the exports root.
+  if (path.toLowerCase().endsWith('/datasets.json')) {
+    path = path.slice(0, -'/datasets.json'.length);
+  }
+
+  const parts = path.split('/').filter(Boolean);
   if (parts.length < 2) {
     return null;
   }
 
   const owner = parts[0];
-  const repo = parts[1];
+  let repo = parts[1];
+  let branch = null;
+  let branchExplicit = false;
 
-  // Common branch names
-  const commonBranches = ['main', 'master', 'develop', 'dev', 'gh-pages'];
-
-  // Check if third part looks like a branch name
-  let branch = 'main';
-  let pathStart = 2;
-
-  if (parts.length > 2) {
-    // If third part is a common branch name, use it
-    if (commonBranches.includes(parts[2])) {
-      branch = parts[2];
-      pathStart = 3;
-    }
-    // Otherwise, keep default 'main' and treat rest as path
+  // Allow explicit branch via owner/repo@branch/path or owner/repo#branch/path
+  const repoBranchMatch = repo.match(/^([^@#]+)[@#]([^@#]+)$/);
+  if (repoBranchMatch) {
+    repo = repoBranchMatch[1];
+    branch = repoBranchMatch[2];
+    branchExplicit = true;
   }
 
-  const path = parts.slice(pathStart).join('/');
+  let rest = parts.slice(2);
 
-  return { owner, repo, branch, path };
+  // Parse GitHub "tree/blob" URLs: /owner/repo/tree/<branch>/...
+  if ((host === 'github.com' || host === null) && rest.length >= 2 && (rest[0] === 'tree' || rest[0] === 'blob')) {
+    branch = rest[1];
+    branchExplicit = true;
+    rest = rest.slice(2);
+  }
+
+  // Parse raw URLs: /owner/repo/<branch>/...
+  if (host === 'raw.githubusercontent.com' && rest.length >= 1) {
+    branch = rest[0];
+    branchExplicit = true;
+    rest = rest.slice(1);
+  }
+
+  return {
+    owner,
+    repo,
+    branch,
+    pathSegments: rest,
+    path: rest.join('/'),
+    branchExplicit
+  };
 }
 
 /**
@@ -195,35 +232,94 @@ export class GitHubDataSource {
 
       if (!this._parsedPath) {
         throw new DataSourceError(
-          'Invalid GitHub path. Use format: owner/repo/path or owner/repo/branch/path',
+          'Invalid GitHub path. Use format: owner/repo/exports (or owner/repo@branch/exports), or paste a GitHub URL.',
           DataSourceErrorCode.INVALID_FORMAT,
           this.type,
           { input: inputPath }
         );
       }
 
-      this._baseUrl = buildRawUrl(this._parsedPath);
-      console.log(`[GitHubDataSource] Connecting to: ${this._baseUrl}`);
+      const commonBranches = ['main', 'master', 'gh-pages', 'develop', 'dev'];
 
-      // Try to load datasets manifest
-      const manifestUrl = resolveUrl(this._baseUrl, DATA_CONFIG.DATASETS_MANIFEST);
+      const attempts = [];
+      const tried = new Set();
 
-      try {
-        this._manifest = await fetchJson(manifestUrl);
-      } catch (err) {
+      const tryManifest = async ({ owner, repo, branch, path }) => {
+        const baseUrl = buildRawUrl({ owner, repo, branch, path });
+        const manifestUrl = resolveUrl(baseUrl, DATA_CONFIG.DATASETS_MANIFEST);
+        if (tried.has(manifestUrl)) return null;
+        tried.add(manifestUrl);
+
+        try {
+          const manifest = await fetchJson(manifestUrl);
+          validateSchemaVersion(
+            manifest.version,
+            DATA_CONFIG.SUPPORTED_MANIFEST_VERSIONS,
+            'datasets.json'
+          );
+          return { baseUrl, manifestUrl, manifest, branch, path };
+        } catch (err) {
+          attempts.push({
+            baseUrl,
+            manifestUrl,
+            error: err?.message || String(err)
+          });
+          return null;
+        }
+      };
+
+      const owner = this._parsedPath.owner;
+      const repo = this._parsedPath.repo;
+
+      let chosen = null;
+      if (this._parsedPath.branch) {
+        chosen = await tryManifest({
+          owner,
+          repo,
+          branch: this._parsedPath.branch,
+          path: this._parsedPath.path
+        });
+      } else {
+        // First: default branches + the full path (most common: owner/repo/exports).
+        for (const b of commonBranches) {
+          chosen = await tryManifest({ owner, repo, branch: b, path: this._parsedPath.path });
+          if (chosen) break;
+        }
+
+        // Next: treat the first path segment as a branch name (owner/repo/<branch>/<exportsPath>).
+        if (!chosen && this._parsedPath.pathSegments.length >= 2) {
+          const b = this._parsedPath.pathSegments[0];
+          const p = this._parsedPath.pathSegments.slice(1).join('/');
+          chosen = await tryManifest({ owner, repo, branch: b, path: p });
+        }
+
+        // Last resort: treat a single segment as a branch (owner/repo/<branch>).
+        if (!chosen && this._parsedPath.pathSegments.length === 1) {
+          const b = this._parsedPath.pathSegments[0];
+          chosen = await tryManifest({ owner, repo, branch: b, path: '' });
+        }
+      }
+
+      if (!chosen) {
+        const hint = attempts[0]?.manifestUrl
+          ? ` (example tried: ${attempts[0].manifestUrl})`
+          : '';
         throw new DataSourceError(
-          'datasets.json not found at this GitHub path. Exported datasets must include datasets.json (no legacy mode).',
+          `datasets.json not found at this GitHub path${hint}. ` +
+          `Make sure you point at an exports root folder that contains datasets.json.`,
           DataSourceErrorCode.NOT_FOUND,
           this.type,
-          { url: this._baseUrl, manifestUrl, originalError: err?.message || String(err) }
+          { input: inputPath, parsed: this._parsedPath, attempts }
         );
       }
 
-      validateSchemaVersion(
-        this._manifest.version,
-        DATA_CONFIG.SUPPORTED_MANIFEST_VERSIONS,
-        'datasets.json'
-      );
+      this._baseUrl = chosen.baseUrl;
+      this._manifest = chosen.manifest;
+      this._parsedPath.branch = chosen.branch;
+      this._parsedPath.path = chosen.path;
+      this._parsedPath.pathSegments = (chosen.path || '').split('/').filter(Boolean);
+      console.log(`[GitHubDataSource] Connecting to: ${this._baseUrl}`);
+
       console.log(`[GitHubDataSource] Found datasets manifest with ${this._manifest.datasets?.length || 0} datasets`);
 
       // Load datasets
@@ -231,10 +327,10 @@ export class GitHubDataSource {
       this._connected = true;
 
       const repoInfo = {
-        owner: this._parsedPath.owner,
-        repo: this._parsedPath.repo,
-        branch: this._parsedPath.branch,
-        path: this._parsedPath.path,
+        owner,
+        repo,
+        branch: chosen.branch,
+        path: chosen.path,
         baseUrl: this._baseUrl,
       };
 

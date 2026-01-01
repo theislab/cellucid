@@ -8,6 +8,7 @@ const BUTTON_SELECTOR = 'button, [role="button"], a, input[type="button"], input
 
 export const DATA_LOAD_METHODS = {
   DEFAULT_DEMO: 'default-demo',
+  SERVER_AUTO: 'server-auto',
   DATASET_DROPDOWN: 'dataset-dropdown',
   DATASET_URL_PARAM: 'dataset-url-param',
   SAMPLE_DEMO: 'sample-demo',

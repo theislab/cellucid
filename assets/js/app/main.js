@@ -485,12 +485,73 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       }
     }
 
+    let sameOriginServerDetected = false;
+
+    // Auto-connect to a same-origin Cellucid server when the web app is being
+    // served by the Python package itself (CLI/Python server mode).
+    //
+    // Without this, the app may auto-load the demo dataset and ignore the
+    // server-hosted dataset, especially when demo exports are configured.
+    if (!inJupyter && !remoteUrlParam) {
+      const sourceParam = urlParams.get('source');
+      // Allow explicit overrides (e.g. ?source=local-demo) to skip server auto-connect.
+      const shouldAutoConnectServer = !sourceParam || sourceParam === 'remote';
+
+      if (shouldAutoConnectServer) {
+        try {
+          const protocol = window?.location?.protocol || '';
+          if (protocol === 'http:' || protocol === 'https:') {
+            const selfBase = new URL('.', window.location.href).toString().replace(/\/$/, '');
+            const healthRes = await fetch(`${selfBase}/_cellucid/health`, { cache: 'no-store' });
+            if (healthRes.ok) {
+              const health = await healthRes.json().catch(() => null);
+              if (health?.status === 'ok') {
+                sameOriginServerDetected = true;
+                debug.log(`[Main] Detected Cellucid server at current origin (${health.type || 'unknown'}); auto-connecting...`);
+                try {
+                  await remoteSource.connect({ url: selfBase });
+                  if (remoteSource.isConnected?.()) {
+                    const datasets = await remoteSource.listDatasets();
+                    if (datasets.length > 0) {
+                      const requestedDataset = urlParams.get('dataset');
+                      const chosenId =
+                        requestedDataset && datasets.some((d) => d?.id === requestedDataset)
+                          ? requestedDataset
+                          : datasets[0].id;
+
+                      // Mirror the AnnData warning used for explicit remote connections.
+                      if (isAnndataMode) {
+                        notifications.warning(
+                          'Loading data directly from AnnData. This may be slower than using pre-exported data. ' +
+                          'For better performance, use prepare() to create optimized binary files.',
+                          { duration: 12000 }
+                        );
+                      }
+
+                      await dataSourceManager.switchToDataset('remote', chosenId, {
+                        loadMethod: DATA_LOAD_METHODS.SERVER_AUTO
+                      });
+                      debug.log(`[Main] Auto-connected to server dataset: ${chosenId}`);
+                    }
+                  }
+                } catch (err) {
+                  console.warn('[Main] Same-origin server detected but auto-connect failed:', err?.message || err);
+                }
+              }
+            }
+          }
+        } catch (err) {
+          // Not a server context; proceed normally (demo/local-user/etc).
+        }
+      }
+    }
+
     // Initialize with default sources (registers local-demo and github-repo sources).
     // When the welcome modal is shown, classify the default demo load as an explicit "sample demo".
     await dataSourceManager.initialize({
       // In Jupyter mode, never auto-load the demo dataset as a fallback. If the bridge/server
       // is unreachable, we want a loud failure instead of silently showing sample data.
-      autoLoadDefault: !inJupyter,
+      autoLoadDefault: !inJupyter && !sameOriginServerDetected,
       defaultLoadMethod: welcomeVisible ? DATA_LOAD_METHODS.SAMPLE_DEMO : DATA_LOAD_METHODS.DEFAULT_DEMO
     });
 
@@ -837,12 +898,12 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       }
     }
 
-	    const positions = await positionsPromise;
+    const positions = await positionsPromise;
 
-	    state.initScene(positions, obs);
-	    // One-time helper to rebuild density from current visibility + grid
-	    function rebuildSmokeDensity(gridSizeOverride) {
-	      const gridSize = gridSizeOverride || 128;
+    state.initScene(positions, obs);
+    // One-time helper to rebuild density from current visibility + grid
+    function rebuildSmokeDensity(gridSizeOverride) {
+      const gridSize = gridSizeOverride || 128;
 
       const visiblePositions = state.getVisiblePositionsForSmoke
         ? state.getVisiblePositionsForSmoke()
@@ -910,26 +971,26 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       }
     }
 
-	    ui = initUI({
-	      state,
-	      viewer,
-	      smoke: {
-	        rebuildSmokeDensity
-	      },
-	      reloadActiveDataset: reloadActiveDatasetInPlace,
-	      sessionSerializer,
-	      dataSourceManager,
-	      jupyterSource
-	    });
+    ui = initUI({
+      state,
+      viewer,
+      smoke: {
+        rebuildSmokeDensity
+      },
+      reloadActiveDataset: reloadActiveDatasetInPlace,
+      sessionSerializer,
+      dataSourceManager,
+      jupyterSource
+    });
 
-	    // Jupyter: notify Python only after the UI + notebook hooks are fully wired.
-	    // This powers `viewer.on_ready` and `viewer.wait_for_ready()`.
-	    try {
-	      jupyterSource?.notifyReady?.({
-	        nCells: state.pointCount || Math.floor((positions?.length || 0) / 3),
-	        dimensions: state.activeDimensionLevel || 3
-	      });
-	    } catch {}
+    // Jupyter: notify Python only after the UI + notebook hooks are fully wired.
+    // This powers `viewer.on_ready` and `viewer.wait_for_ready()`.
+    try {
+      jupyterSource?.notifyReady?.({
+        nCells: state.pointCount || Math.floor((positions?.length || 0) / 3),
+        dimensions: state.activeDimensionLevel || 3
+      });
+    } catch {}
 
     // Initialize Page Analysis / Comparison Module
     const pageAnalysisSection = document.getElementById('page-analysis-section');
@@ -2230,20 +2291,20 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       });
     }
 
-	    // Auto-restore the latest session bundle listed in the dataset exports
-	    // directory (`state-snapshots.json`) to preserve the legacy "auto-load" workflow.
-	    try {
-	      const restored = await sessionSerializer.restoreLatestFromDatasetExports?.();
-	      if (restored) {
-	        ui?.refreshUiAfterStateLoad?.();
-	        ui?.showSessionStatus?.('Loaded saved session from data directory');
-	      } else {
-	        console.info('[Main] No session bundle auto-loaded (state-snapshots.json missing/empty or no .cellucid-session entries).');
-	      }
-	    } catch (err) {
-	      console.warn('[Main] Failed to auto-load session bundle:', err);
-	      ui?.showSessionStatus?.(err?.message || 'Failed to auto-load session', true);
-	    }
+    // Auto-restore the latest session bundle listed in the dataset exports
+    // directory (`state-snapshots.json`) to preserve the legacy "auto-load" workflow.
+    try {
+      const restored = await sessionSerializer.restoreLatestFromDatasetExports?.();
+      if (restored) {
+        ui?.refreshUiAfterStateLoad?.();
+        ui?.showSessionStatus?.('Loaded saved session from data directory');
+      } else {
+        console.info('[Main] No session bundle auto-loaded (state-snapshots.json missing/empty or no .cellucid-session entries).');
+      }
+    } catch (err) {
+      console.warn('[Main] Failed to auto-load session bundle:', err);
+      ui?.showSessionStatus?.(err?.message || 'Failed to auto-load session', true);
+    }
 
     // Define onboarding callback functions now that UI is ready
     toggleSidebarVisibility = () => {

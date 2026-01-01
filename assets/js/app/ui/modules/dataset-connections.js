@@ -365,6 +365,19 @@ export function initDatasetConnections({
     }
 
     if (remoteSource?.isConnected?.()) {
+      // If the connection was established programmatically (e.g. when served by the
+      // Python server itself), the URL param may be absent; still show the connected URL.
+      try {
+        if (!remoteServerUrl.value) {
+          const info = remoteSource.getConnectionInfo?.();
+          const connectedUrl = info?.url;
+          if (connectedUrl) {
+            remoteServerUrl.value = connectedUrl;
+          }
+        }
+      } catch {
+        // ignore
+      }
       updateRemoteUI(true);
     }
   }

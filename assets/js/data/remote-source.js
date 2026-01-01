@@ -633,13 +633,29 @@ export class RemoteDataSource {
 
     this._activeDatasetId = datasetId;
 
-    // Return remote:// protocol URL
-    // This will be resolved by resolveUrl() to actual HTTP URL
-    const urlHost = new URL(this._serverUrl).host;
+    // Return remote:// (or remotes://) protocol URL.
+    //
+    // Important: preserve any path prefix in the server URL (e.g. reverse proxies,
+    // Jupyter Server Proxy paths like /user/.../proxy/<port>/). The remote:// URL
+    // encodes that prefix into the path segment so resolveUrl() can reconstruct
+    // a correct fetchable HTTP(S) URL.
+    const serverUrlObj = new URL(this._serverUrl);
+    const urlHost = serverUrlObj.host;
+    const prefix = (serverUrlObj.pathname || '').replace(/\/+$/, '');
+    const scheme = serverUrlObj.protocol === 'https:' ? 'remotes' : 'remote';
 
-    const dsPath = this._datasetPaths.get(datasetId);
-    if (dsPath) return `remote://${urlHost}${dsPath}`;
-    return `remote://${urlHost}/${datasetId}/`;
+    let dsPath = this._datasetPaths.get(datasetId) || `/${datasetId}/`;
+    if (!dsPath.startsWith('/')) dsPath = `/${dsPath}`;
+    if (!dsPath.endsWith('/')) dsPath = `${dsPath}/`;
+
+    let fullPath = dsPath;
+    if (prefix && prefix !== '/') {
+      fullPath = `${prefix}${dsPath}`;
+    }
+    if (!fullPath.startsWith('/')) fullPath = `/${fullPath}`;
+    if (!fullPath.endsWith('/')) fullPath = `${fullPath}/`;
+
+    return `${scheme}://${urlHost}${fullPath}`;
   }
 
   /**
