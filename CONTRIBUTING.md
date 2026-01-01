@@ -4,6 +4,12 @@ Contributions are welcome — code, docs, bug reports, performance investigation
 
 This file focuses on the **Cellucid web app** (the browser UI + state layer + WebGL renderer) in the `cellucid/` repo.
 
+By participating, you agree to follow the project’s Code of Conduct:
+- `CODE_OF_CONDUCT.md`
+
+If you’re reporting a security issue, please follow:
+- `SECURITY.md`
+
 ---
 
 ## Which repo should I contribute to?
@@ -174,4 +180,3 @@ More detailed checklist:
   - how to verify (exact steps, dataset if possible)
 - If you changed a user-visible workflow, update docs in `cellucid-python/docs/`.
 - Do not attach private datasets or tokens to PRs/issues.
-

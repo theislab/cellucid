@@ -174,6 +174,14 @@ open http://localhost:8000
 
 See [theislab/cellucid-python](https://github.com/theislab/cellucid-python) for the companion Python package.
 
+## Community
+
+- Contributing: [CONTRIBUTING.md](CONTRIBUTING.md)
+- Code of Conduct: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
+- Security: [SECURITY.md](SECURITY.md)
+- Support: [SUPPORT.md](SUPPORT.md)
+- Citation: [CITATION.cff](CITATION.cff)
+
 ## License
 
-Proprietary - All rights reserved
+BSD 3-Clause License - see [LICENSE](LICENSE) for details.
