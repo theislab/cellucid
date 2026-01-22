@@ -1,0 +1,5 @@
+{
+  "status": "static",
+  "type": "web",
+  "message": "Cellucid web viewer (no same-origin Python server)"
+}
