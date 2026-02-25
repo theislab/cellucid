@@ -296,5 +296,47 @@ export function collectDOMReferences(root) {
       projectilesEnabledCheckbox: byId('projectiles-enabled'),
       pointerLockCheckbox: byId('pointer-lock'),
     },
+
+    cinematicCamera: {
+      section: byId('cinematic-camera-section'),
+
+      // Navigation controls (mirrors Compare Views)
+      navModeSelect: byId('cinematic-nav-mode'),
+      orbitControls: byId('cinematic-orbit-controls'),
+      planarControls: byId('cinematic-planar-controls'),
+      freeflyControls: byId('cinematic-freefly-controls'),
+      orbitKeySpeedInput: byId('cinematic-orbit-key-speed'),
+      orbitKeySpeedDisplay: byId('cinematic-orbit-key-speed-display'),
+      orbitReverseCheckbox: byId('cinematic-orbit-reverse'),
+      showOrbitAnchorCheckbox: byId('cinematic-show-orbit-anchor'),
+      planarPanSpeedInput: byId('cinematic-planar-pan-speed'),
+      planarPanSpeedDisplay: byId('cinematic-planar-pan-speed-display'),
+      planarZoomToCursorCheckbox: byId('cinematic-planar-zoom-to-cursor'),
+      planarInvertAxesCheckbox: byId('cinematic-planar-invert-axes'),
+      lookSensitivityInput: byId('cinematic-look-sensitivity'),
+      lookSensitivityDisplay: byId('cinematic-look-sensitivity-display'),
+      moveSpeedInput: byId('cinematic-move-speed'),
+      moveSpeedDisplay: byId('cinematic-move-speed-display'),
+      invertLookCheckbox: byId('cinematic-invert-look'),
+      pointerLockCheckbox: byId('cinematic-pointer-lock'),
+
+      // Keyframe controls
+      saveBtn: byId('cinematic-save-btn'),
+      loopBackBtn: byId('cinematic-loop-back-btn'),
+      keyframeList: byId('cinematic-keyframe-list'),
+      clearBtn: byId('cinematic-clear-btn'),
+      timingActions: byId('cinematic-timing-actions'),
+      setAllDuration: byId('cinematic-set-all-duration'),
+      setAllBtn: byId('cinematic-set-all-btn'),
+
+      // Settings
+      defaultSpeedInput: byId('cinematic-default-speed'),
+      defaultSpeedDisplay: byId('cinematic-default-speed-display'),
+      positionInterp: byId('cinematic-position-interp'),
+      rotationInterp: byId('cinematic-rotation-interp'),
+      easingSelect: byId('cinematic-easing'),
+      loopCheckbox: byId('cinematic-loop'),
+      interpolationSettings: byId('cinematic-interpolation-settings'),
+    },
   };
 }

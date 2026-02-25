@@ -1,0 +1,465 @@
+/* ========================================================================
+   Camera Path accordion + transport bar overlay
+   ===================================================================== */
+
+/* ------------------------------------------------------------------------
+   Keyframe list – scrollable container with fade edges
+   --------------------------------------------------------------------- */
+
+.cinematic-keyframe-list {
+  position: relative;
+  max-height: 220px;
+  overflow-y: auto;
+  border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 18%, transparent);
+  background: var(--color-surface-secondary);
+  border-radius: 0;
+  box-shadow: var(--shadow-sm);
+  scrollbar-width: thin;
+  scrollbar-color:
+    color-mix(in srgb, var(--color-text-primary) 30%, transparent)
+    color-mix(in srgb, var(--color-text-primary) 8%, transparent);
+}
+
+/* Fade edges only when the list actually overflows */
+.cinematic-keyframe-list.is-scrollable {
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0px,
+    black 6px,
+    black calc(100% - 16px),
+    transparent 100%
+  );
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0px,
+    black 6px,
+    black calc(100% - 16px),
+    transparent 100%
+  );
+}
+
+.cinematic-keyframe-list::-webkit-scrollbar {
+  width: 5px;
+}
+
+.cinematic-keyframe-list::-webkit-scrollbar-track {
+  background: color-mix(in srgb, var(--color-text-primary) 8%, transparent);
+}
+
+.cinematic-keyframe-list::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--color-text-primary) 30%, transparent);
+}
+
+.cinematic-empty-state {
+  padding: var(--space-3) var(--space-2-5);
+  font-size: var(--text-xs);
+  color: var(--color-text-tertiary);
+  text-align: center;
+}
+
+/* ------------------------------------------------------------------------
+   Keyframe item
+   --------------------------------------------------------------------- */
+
+.cinematic-keyframe-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--text-xs);
+  transition: background-color var(--duration-fast) var(--easing-standard);
+}
+
+.cinematic-keyframe-item:hover {
+  background: var(--color-border-light);
+}
+
+.cinematic-keyframe-index {
+  flex: 0 0 20px;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--color-text-tertiary);
+  text-align: center;
+}
+
+.cinematic-keyframe-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+  color: var(--color-text-primary);
+}
+
+.cinematic-keyframe-label:hover {
+  text-decoration: underline;
+}
+
+.cinematic-keyframe-label-static,
+.cinematic-keyframe-label-static:hover {
+  cursor: default;
+  text-decoration: none;
+}
+
+/* Inline rename input for keyframe label */
+.cinematic-keyframe-rename {
+  flex: 1;
+  min-width: 0;
+  padding: var(--space-0-5) var(--space-1);
+  font-size: var(--text-xs);
+  border: var(--border-strong);
+  border-radius: 0;
+  background: var(--color-surface-elevated);
+  color: var(--color-text-primary);
+  box-shadow: var(--shadow-sm);
+  box-sizing: border-box;
+}
+
+.cinematic-keyframe-rename:focus {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 1px;
+}
+
+.cinematic-keyframe-actions {
+  display: flex;
+  gap: var(--space-0-5);
+  flex-shrink: 0;
+}
+
+/* Small icon buttons inside keyframe rows – mirrors .field-action-btn */
+.cinematic-kf-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--space-4);
+  height: var(--space-4);
+  padding: 0;
+  border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 18%, transparent);
+  border-radius: 0;
+  background: transparent;
+  color: var(--color-text-tertiary);
+  cursor: pointer;
+  box-shadow: none;
+  transition: var(--transition-colors);
+}
+
+.cinematic-kf-btn svg {
+  pointer-events: none;
+  width: 12px;
+  height: 12px;
+}
+
+.cinematic-kf-btn:hover {
+  background: var(--color-border-light);
+  color: var(--color-text-primary);
+}
+
+.cinematic-kf-btn:active {
+  background: var(--color-border-default);
+}
+
+.cinematic-kf-btn:focus-visible {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 1px;
+}
+
+.cinematic-kf-btn:disabled {
+  opacity: var(--opacity-50);
+  cursor: not-allowed;
+}
+
+.cinematic-kf-btn.cinematic-kf-delete:hover {
+  background: var(--color-border-light);
+  color: var(--color-danger);
+}
+
+/* ------------------------------------------------------------------------
+   Timing rows (interleaved between keyframe items in the same list)
+   --------------------------------------------------------------------- */
+
+.cinematic-timing-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  padding: var(--space-0-5) var(--space-2) var(--space-0-5) var(--space-6);
+  border-bottom: var(--border-width-1) solid
+    color-mix(in srgb, var(--color-border-strong) 5%, transparent);
+  font-size: var(--text-2xs);
+  background: color-mix(in srgb, var(--color-surface-tertiary) 30%, transparent);
+}
+
+.cinematic-timing-label {
+  flex: 1;
+  color: var(--color-text-tertiary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cinematic-duration-input {
+  width: 50px;
+  padding: var(--space-0-5) var(--space-1);
+  font-size: var(--text-2xs);
+  font-family: var(--font-mono);
+  border: var(--border-strong);
+  border-radius: 0;
+  background: var(--color-surface-elevated);
+  color: var(--color-text-primary);
+  box-shadow: var(--shadow-sm);
+  text-align: right;
+  box-sizing: border-box;
+}
+
+.cinematic-duration-input:focus {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 1px;
+}
+
+.cinematic-duration-input::placeholder {
+  color: var(--color-text-tertiary);
+  font-style: italic;
+}
+
+.cinematic-timing-unit {
+  color: var(--color-text-tertiary);
+  font-size: var(--text-2xs);
+  flex-shrink: 0;
+}
+
+/* "Set all" actions row (below the list) */
+.cinematic-timing-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  margin-top: var(--space-1-5);
+  font-size: var(--text-xs);
+}
+
+.cinematic-timing-actions label {
+  margin-top: 0;
+}
+
+.cinematic-loopback-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-1-5);
+  padding: var(--space-0-5) var(--space-2);
+  border-top: var(--border-width-1) solid
+    color-mix(in srgb, var(--color-border-strong) 10%, transparent);
+  background: color-mix(in srgb, var(--color-surface-tertiary) 35%, transparent);
+}
+
+.cinematic-loopback-row-label {
+  font-size: var(--text-2xs);
+  color: var(--color-text-secondary);
+}
+
+.cinematic-loopback-list-toggle {
+  width: 12px;
+  height: 12px;
+  margin: 0;
+  accent-color: var(--color-text-primary);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+/* ------------------------------------------------------------------------
+   Interpolation settings (dashed box)
+   --------------------------------------------------------------------- */
+
+.cinematic-settings-box {
+  margin-top: var(--space-2);
+  padding: var(--space-2) var(--space-2-5);
+  border: var(--border-width-1) dashed var(--color-border-strong);
+  background: var(--color-surface-secondary);
+}
+
+.cinematic-settings-box .control-block {
+  margin-top: var(--space-1-5);
+}
+
+.cinematic-settings-box .control-block:first-child {
+  margin-top: 0;
+}
+
+/* ------------------------------------------------------------------------
+   Transport bar – overlays 3D viewport (compact variant)
+   --------------------------------------------------------------------- */
+
+.cinematic-transport-bar {
+  position: fixed;
+  top: var(--space-2-5);
+  left: calc(var(--sidebar-width, 280px) + var(--space-2-5) + var(--space-8));
+  right: var(--space-8);
+  z-index: var(--z-overlay);
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(-6px);
+  transition:
+    opacity var(--duration-normal) var(--easing-smooth),
+    transform var(--duration-normal) var(--easing-smooth);
+}
+
+.cinematic-transport-bar.visible {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+.cinematic-transport-bar.sidebar-hidden {
+  left: var(--space-8);
+}
+
+.cinematic-transport-inner {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-2-5);
+  width: min(92%, 1160px);
+  margin: 0 auto;
+  background: color-mix(in srgb, var(--color-surface-elevated) 92%, transparent);
+  border: var(--border-strong);
+  box-shadow: var(--shadow-md);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+/* Transport buttons – compact squares */
+.cinematic-transport-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: var(--border-strong);
+  border-radius: 0;
+  background: var(--color-surface-secondary);
+  color: var(--color-text-primary);
+  cursor: pointer;
+  box-shadow: var(--shadow-sm);
+  transition:
+    var(--transition-colors),
+    transform var(--duration-fast) var(--easing-standard);
+  flex-shrink: 0;
+}
+
+.cinematic-transport-btn:hover {
+  background: var(--color-border-light);
+  transform: translate(-1px, -1px);
+  box-shadow: var(--shadow-md);
+}
+
+.cinematic-transport-btn:active {
+  transform: translate(0, 0);
+  box-shadow: var(--shadow-xs);
+}
+
+.cinematic-transport-btn svg {
+  pointer-events: none;
+  width: 15px;
+  height: 15px;
+}
+
+/* Timeline track */
+.cinematic-timeline-container {
+  flex: 1 1 auto;
+  position: relative;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.cinematic-timeline-track {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 5px;
+  background: var(--color-border-light);
+  border-radius: var(--radius-full);
+  overflow: visible;
+}
+
+.cinematic-timeline-progress {
+  height: 100%;
+  width: 0%;
+  background: var(--color-text-primary);
+  border-radius: var(--radius-full);
+  transition: width 60ms linear;
+  pointer-events: none;
+}
+
+/* Invisible range input that captures scrubbing */
+.cinematic-timeline-scrubber {
+  position: absolute;
+  left: 0;
+  right: 0;
+  width: 100%;
+  height: 32px;
+  opacity: 0;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+  margin: 0;
+  padding: 0;
+  background: transparent;
+}
+
+/* Keyframe markers on the timeline */
+.cinematic-timeline-marker {
+  position: absolute;
+  top: -5px;
+  width: 3px;
+  height: 15px;
+  background: var(--color-text-secondary);
+  transform: translateX(-50%);
+  pointer-events: none;
+  opacity: var(--opacity-70);
+}
+
+/* Time readout */
+.cinematic-time-readout {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+  min-width: 78px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+/* ------------------------------------------------------------------------
+   Accordion-level tweaks
+   --------------------------------------------------------------------- */
+
+.cinematic-keyframes-header {
+  justify-content: space-between;
+  gap: var(--space-1-5);
+}
+
+/* Clear all button (inline with label) */
+.cinematic-clear-btn {
+  font-family: var(--font-display);
+  font-size: var(--text-2xs);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  padding: var(--space-0-5) var(--space-1);
+  border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 18%, transparent);
+  border-radius: 0;
+  background: transparent;
+  color: var(--color-text-tertiary);
+  cursor: pointer;
+  box-shadow: none;
+  transition: var(--transition-colors);
+}
+
+.cinematic-clear-btn:hover {
+  background: var(--color-border-light);
+  color: var(--color-danger);
+}
+
+.cinematic-clear-btn:active {
+  background: var(--color-border-default);
+}

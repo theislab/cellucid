@@ -1272,6 +1272,158 @@
         </div>
       </details>
 
+      <details class="accordion-section" id="cinematic-camera-section" data-state-serializer-skip="true" open>
+        <summary>Camera Path</summary>
+        <div class="accordion-content">
+
+          <!-- Navigation controls (mirrors Compare Views block) -->
+          <div class="control-block" id="cinematic-navigation-controls">
+            <label>Navigation:</label>
+            <div class="legend-help">
+              Set up your camera before saving keyframes.
+            </div>
+            <div class="control-block">
+              <label for="cinematic-nav-mode">Mode:</label>
+              <select id="cinematic-nav-mode" class="obs-select">
+                <option value="orbit">Orbit</option>
+                <option value="planar">Planar</option>
+                <option value="free">Free-fly</option>
+              </select>
+            </div>
+            <div id="cinematic-orbit-controls" class="nav-mode-box">
+              <div class="control-block">
+                <label for="cinematic-orbit-key-speed">Keyboard speed:</label>
+                <div class="slider-row">
+                  <input id="cinematic-orbit-key-speed" type="range" min="1" max="100" step="1" value="40" />
+                  <span id="cinematic-orbit-key-speed-display" class="slider-value">0.40x</span>
+                </div>
+              </div>
+              <label class="checkbox-inline">
+                <input type="checkbox" id="cinematic-orbit-reverse" checked />
+                Google Earth-style drag
+              </label>
+              <label class="checkbox-inline">
+                <input type="checkbox" id="cinematic-show-orbit-anchor" checked />
+                Show orbit anchor
+              </label>
+            </div>
+            <div id="cinematic-planar-controls" class="nav-mode-box">
+              <div class="control-block">
+                <label for="cinematic-planar-pan-speed">Keyboard speed:</label>
+                <div class="slider-row">
+                  <input id="cinematic-planar-pan-speed" type="range" min="1" max="100" step="1" value="100" />
+                  <span id="cinematic-planar-pan-speed-display" class="slider-value">0.0075x</span>
+                </div>
+              </div>
+              <label class="checkbox-inline">
+                <input type="checkbox" id="cinematic-planar-zoom-to-cursor" checked />
+                Zoom to cursor
+              </label>
+              <label class="checkbox-inline">
+                <input type="checkbox" id="cinematic-planar-invert-axes" />
+                Invert axes
+              </label>
+            </div>
+            <div id="cinematic-freefly-controls" class="nav-mode-box">
+              <div class="control-block">
+                <label for="cinematic-look-sensitivity">Look sensitivity:</label>
+                <div class="slider-row">
+                  <input id="cinematic-look-sensitivity" type="range" min="1" max="30" step="1" value="5" />
+                  <span id="cinematic-look-sensitivity-display" class="slider-value">0.05x</span>
+                </div>
+              </div>
+              <div class="control-block">
+                <label for="cinematic-move-speed">Move speed:</label>
+                <div class="slider-row">
+                  <input id="cinematic-move-speed" type="range" min="1" max="500" step="1" value="100" />
+                  <span id="cinematic-move-speed-display" class="slider-value">1.00 u/s</span>
+                </div>
+              </div>
+              <label class="checkbox-inline">
+                <input type="checkbox" id="cinematic-invert-look" />
+                Invert look axes
+              </label>
+              <label class="checkbox-inline">
+                <input type="checkbox" id="cinematic-pointer-lock" />
+                Capture pointer
+              </label>
+            </div>
+          </div>
+
+          <!-- Save position button -->
+          <div class="control-block">
+            <label style="margin-top:0;">Save Keyframe</label>
+            <button id="cinematic-save-btn" class="reset-btn" type="button" style="width:100%;">
+              Save Position
+            </button>
+          </div>
+
+          <!-- Keyframe list + transition timing (unified scrollable box) -->
+          <div class="control-block">
+            <div class="d-flex items-center cinematic-keyframes-header">
+              <label style="margin:0;">Keyframes</label>
+              <button id="cinematic-clear-btn" class="cinematic-clear-btn" type="button">Clear All</button>
+            </div>
+            <div id="cinematic-keyframe-list" class="cinematic-keyframe-list">
+              <div class="cinematic-empty-state">No keyframes saved yet.</div>
+            </div>
+            <div id="cinematic-timing-actions" class="cinematic-timing-actions" style="display:none;">
+              <label for="cinematic-set-all-duration" style="margin:0;">Set all:</label>
+              <input id="cinematic-set-all-duration" type="number" class="cinematic-duration-input"
+                     min="0.1" max="60" step="0.1" placeholder="auto" />
+              <span class="cinematic-timing-unit">s</span>
+              <button id="cinematic-set-all-btn" class="btn-small" type="button">Apply</button>
+            </div>
+          </div>
+
+          <!-- Interpolation / playback settings (dashed box) -->
+          <div id="cinematic-interpolation-settings" class="cinematic-settings-box">
+            <label>Settings</label>
+            <div class="control-block">
+              <label for="cinematic-default-speed">Default speed:</label>
+              <div class="legend-help">
+                Controls how fast the camera moves between keyframes when timing is set to auto.
+              </div>
+              <div class="slider-row">
+                <input id="cinematic-default-speed" type="range" min="1" max="100" step="1" value="30" />
+                <span id="cinematic-default-speed-display" class="slider-value">Slow</span>
+              </div>
+            </div>
+            <div class="control-block">
+              <label for="cinematic-position-interp">Position interpolation:</label>
+              <select id="cinematic-position-interp" class="obs-select">
+                <option value="catmull-rom" selected>Catmull-Rom Spline</option>
+                <option value="linear">Linear</option>
+                <option value="bezier">Bezier</option>
+              </select>
+            </div>
+            <div class="control-block">
+              <label for="cinematic-rotation-interp">Rotation interpolation:</label>
+              <select id="cinematic-rotation-interp" class="obs-select">
+                <option value="slerp" selected>SLERP (Smooth)</option>
+                <option value="linear">Linear (Euler)</option>
+              </select>
+            </div>
+            <div class="control-block">
+              <label for="cinematic-easing">Easing:</label>
+              <select id="cinematic-easing" class="obs-select">
+                <option value="linear" selected>Linear</option>
+                <option value="ease-in-out">Ease In-Out</option>
+                <option value="ease-in">Ease In</option>
+                <option value="ease-out">Ease Out</option>
+              </select>
+            </div>
+            <div class="control-block">
+              <label style="margin-top:0;display:flex;align-items:center;gap:var(--space-1-5);">
+                <input type="checkbox" id="cinematic-loop" />
+                Loop playback
+              </label>
+            </div>
+          </div>
+
+        </div>
+      </details>
+
       <details class="accordion-section" id="figure-export-section" data-state-serializer-skip="true">
         <summary>Figure Export</summary>
         <div class="accordion-content">
@@ -1495,6 +1647,7 @@
           </div>
         </div>
       </details>
+
     </div>
 
     <div id="stats" class="sr-only">Loading data…</div>

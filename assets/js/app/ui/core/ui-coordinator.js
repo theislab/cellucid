@@ -27,6 +27,7 @@ import { initSessionControls } from '../modules/session-controls.js';
 import { initCommunityAnnotationControls } from '../modules/community-annotation-controls.js';
 import { initVisualizationReset } from '../modules/visualization-reset.js';
 import { initFigureExport } from '../modules/figure-export/index.js';
+import { initCinematicCamera } from '../modules/cinematic-camera/index.js';
 import { debug } from '../../../utils/debug.js';
 
 const LIVE_VIEW_ID = 'live';
@@ -251,6 +252,11 @@ export function initUI({
     viewer,
     dom: dom.figureExport,
     dataSourceManager
+  });
+
+  initCinematicCamera({
+    viewer,
+    dom: dom.cinematicCamera,
   });
 
   initVisualizationReset({
