@@ -547,9 +547,77 @@ export function initCinematicCamera({ viewer, dom }) {
   syncLoopBackState();
   renderKeyframeList();
 
+  // =========================================================================
+  // Session export / restore
+  // =========================================================================
+
+  /**
+   * Export all cinematic camera state for session serialization.
+   * @returns {object}
+   */
+  function exportSessionState() {
+    return {
+      ...keyframeStore.exportAll(),
+      loopBackKeyframeId,
+      // Interpolation & playback settings
+      loopPlayback: dom.loopCheckbox?.checked || false,
+      positionMethod: dom.positionInterp?.value || 'catmull-rom',
+      rotationMethod: dom.rotationInterp?.value || 'slerp',
+      easing: dom.easingSelect?.value || 'linear',
+      defaultSpeed: dom.defaultSpeedInput?.value ?? '30',
+      // Navigation mode
+      navigationMode: dom.navModeSelect?.value || 'orbit'
+    };
+  }
+
+  /**
+   * Restore cinematic camera state from a session snapshot.
+   * @param {object} data
+   */
+  function restoreSessionState(data) {
+    if (!data) return;
+    playbackController.stop();
+
+    // Restore interpolation & playback settings before importing keyframes
+    // so that duration computation uses the correct speed / methods.
+    if (dom.positionInterp && data.positionMethod) {
+      dom.positionInterp.value = data.positionMethod;
+    }
+    if (dom.rotationInterp && data.rotationMethod) {
+      dom.rotationInterp.value = data.rotationMethod;
+    }
+    if (dom.easingSelect && data.easing) {
+      dom.easingSelect.value = data.easing;
+    }
+    if (dom.defaultSpeedInput && data.defaultSpeed != null) {
+      dom.defaultSpeedInput.value = data.defaultSpeed;
+      dom.defaultSpeedInput.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    if (dom.loopCheckbox && typeof data.loopPlayback === 'boolean') {
+      dom.loopCheckbox.checked = data.loopPlayback;
+    }
+    if (dom.navModeSelect && data.navigationMode) {
+      dom.navModeSelect.value = data.navigationMode;
+      viewer.setNavigationMode?.(data.navigationMode);
+      toggleNavigationPanels(data.navigationMode);
+    }
+
+    keyframeStore.importAll(data);
+    loopBackKeyframeId = data.loopBackKeyframeId || null;
+    syncLoopBackState();
+    renderKeyframeList();
+    transportBar.updateVisibility();
+    // Auto-play the path once the DOM has settled.
+    if (keyframeStore.getCount() >= 2) {
+      requestAnimationFrame(() => playbackController.play());
+    }
+  }
+
   return {
     getKeyframeStore: () => keyframeStore,
-    getPlaybackController: () => playbackController
+    getPlaybackController: () => playbackController,
+    exportSessionState,
+    restoreSessionState
   };
 }
 

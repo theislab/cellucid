@@ -254,7 +254,7 @@ export function initUI({
     dataSourceManager
   });
 
-  initCinematicCamera({
+  const cinematicCamera = initCinematicCamera({
     viewer,
     dom: dom.cinematicCamera,
   });
@@ -303,6 +303,7 @@ export function initUI({
     activateField: fieldSelector.activateField,
     refreshUiAfterStateLoad,
     showSessionStatus,
-    refreshDatasetUI
+    refreshDatasetUI,
+    cinematicCamera
   };
 }

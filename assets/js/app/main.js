@@ -983,6 +983,13 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       jupyterSource
     });
 
+    // Allow session serializer to capture/restore cinematic camera state.
+    try {
+      sessionSerializer.setCinematicCameraRef?.(ui.cinematicCamera);
+    } catch (err) {
+      console.warn('[Main] Failed to wire cinematic camera ref for session restore:', err);
+    }
+
     // Jupyter: notify Python only after the UI + notebook hooks are fully wired.
     // This powers `viewer.on_ready` and `viewer.wait_for_ready()`.
     try {

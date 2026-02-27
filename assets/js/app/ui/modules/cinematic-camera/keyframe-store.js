@@ -167,6 +167,35 @@ export function createKeyframeStore() {
     emit();
   }
 
+  /**
+   * Export all keyframes and the next-index counter for session serialization.
+   * @returns {{ keyframes: Keyframe[], nextIndex: number }}
+   */
+  function exportAll() {
+    return {
+      keyframes: keyframes.map((kf) => ({ ...kf })),
+      nextIndex
+    };
+  }
+
+  /**
+   * Bulk-import keyframes from a session snapshot (replaces current state).
+   * @param {{ keyframes: Keyframe[], nextIndex?: number }} data
+   */
+  function importAll(data) {
+    if (!data || !Array.isArray(data.keyframes)) return;
+    keyframes = data.keyframes.slice(0, MAX_KEYFRAMES).map((kf) => ({
+      id: kf.id,
+      label: kf.label || 'KF',
+      navigationMode: kf.navigationMode,
+      orbit: kf.orbit || null,
+      freefly: kf.freefly || null,
+      transitionDuration: kf.transitionDuration ?? null
+    }));
+    nextIndex = typeof data.nextIndex === 'number' ? data.nextIndex : keyframes.length + 1;
+    emit();
+  }
+
   return {
     add,
     remove,
@@ -178,6 +207,8 @@ export function createKeyframeStore() {
     getCount,
     getById,
     clear,
+    exportAll,
+    importAll,
     on,
     off,
     MAX_KEYFRAMES

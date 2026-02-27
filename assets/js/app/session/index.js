@@ -15,6 +15,7 @@ import * as analysisWindows from './contributors/analysis-windows.js';
 import * as highlightsMeta from './contributors/highlights-meta.js';
 import * as highlightsCells from './contributors/highlights-cells.js';
 import * as analysisArtifacts from './contributors/analysis-artifacts.js';
+import * as cinematicCamera from './contributors/cinematic-camera.js';
 
 /**
  * Create the SessionSerializer.
@@ -39,7 +40,8 @@ export function createSessionSerializer(options) {
     analysisWindows,
     highlightsMeta,
     highlightsCells,
-    analysisArtifacts
+    analysisArtifacts,
+    cinematicCamera
   ];
   return new SessionSerializer({ ...options, contributors });
 }

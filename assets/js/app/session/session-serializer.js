@@ -162,7 +162,8 @@ export class SessionSerializer {
       sidebar: options.sidebar || null,
       dataSourceManager: options.dataSourceManager || null,
       comparisonModule: options.comparisonModule || null,
-      analysisWindowManager: options.analysisWindowManager || null
+      analysisWindowManager: options.analysisWindowManager || null,
+      cinematicCamera: options.cinematicCamera || null
     };
 
     /** @type {SessionContributor[]} */
@@ -189,6 +190,14 @@ export class SessionSerializer {
   setAnalysisRefs(refs = {}) {
     if (refs.comparisonModule) this._base.comparisonModule = refs.comparisonModule;
     if (refs.analysisWindowManager) this._base.analysisWindowManager = refs.analysisWindowManager;
+  }
+
+  /**
+   * Set the cinematic camera reference once the UI is initialized.
+   * @param {object|null} cinematicCamera
+   */
+  setCinematicCameraRef(cinematicCamera) {
+    if (cinematicCamera) this._base.cinematicCamera = cinematicCamera;
   }
 
   /**

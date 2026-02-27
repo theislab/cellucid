@@ -18,6 +18,7 @@ import { getDockableAccordions } from '../dockable-accordions-registry.js';
  * @property {import('../../data/data-source-manager.js').DataSourceManager|null} dataSourceManager
  * @property {any|null} comparisonModule
  * @property {any|null} analysisWindowManager
+ * @property {any|null} cinematicCamera
  */
 
 /**
@@ -36,6 +37,7 @@ export function buildSessionContext(base, options = {}) {
     dockableAccordions: getDockableAccordions(),
     comparisonModule: base.comparisonModule || null,
     analysisWindowManager: base.analysisWindowManager || null,
+    cinematicCamera: base.cinematicCamera || null,
     notifications: getNotificationCenter(),
     abortSignal: options.abortSignal ?? null
   };

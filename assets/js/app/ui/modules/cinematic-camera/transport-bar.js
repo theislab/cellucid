@@ -202,8 +202,8 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
     const keyframes = keyframeStore.getAll();
     if (keyframes.length < 2) return;
 
-    const speed = getInterpolationOptions ? getInterpolationOptions().autoPaceSpeed : undefined;
-    const durations = resolveSegmentDurations(keyframes, speed);
+    const opts = getInterpolationOptions ? getInterpolationOptions() : {};
+    const durations = resolveSegmentDurations(keyframes, opts.autoPaceSpeed);
     const total = durations.reduce((s, d) => s + d, 0);
     if (total <= 0) return;
 
