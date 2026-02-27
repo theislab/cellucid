@@ -420,7 +420,8 @@ export class SessionSerializer {
         totalBytes: totalBytesForUi,
         notificationsOverride: notifications,
         downloadIdOverride: downloadId,
-        abortControllerOverride: abortController
+        abortControllerOverride: abortController,
+        trustDatasetMatch: !!options.trustDatasetMatch
       });
     } catch (err) {
       if (err?.name === 'AbortError') {
@@ -447,7 +448,10 @@ export class SessionSerializer {
     const urls = await this.listDatasetSessionBundles(options);
     if (!urls.length) return false;
     const target = urls[urls.length - 1];
-    await this.restoreFromUrl(target, options);
+    // Sessions bundled in the dataset exports directory are authoritative for
+    // that dataset regardless of the sourceType/datasetId they were originally
+    // saved from (e.g. saved from local-user but deployed for local-demo).
+    await this.restoreFromUrl(target, { ...options, trustDatasetMatch: true });
     return true;
   }
 
@@ -592,7 +596,7 @@ export class SessionSerializer {
    * Blob-like `{ size, stream() }` object).
    *
    * @param {any} source
-   * @param {{ totalBytes?: number|null, notificationsOverride?: any, downloadIdOverride?: string|null, abortControllerOverride?: AbortController|null }} [options]
+   * @param {{ totalBytes?: number|null, notificationsOverride?: any, downloadIdOverride?: string|null, abortControllerOverride?: AbortController|null, trustDatasetMatch?: boolean }} [options]
    * @returns {Promise<void>}
    */
   async _restoreFromBundleSource(source, options = {}) {
@@ -632,7 +636,7 @@ export class SessionSerializer {
 
       const currentFp = getDatasetFingerprint(ctx);
       const fileFp = manifest.datasetFingerprint;
-      const datasetMatches = datasetFingerprintMatches(fileFp, currentFp);
+      const datasetMatches = options.trustDatasetMatch || datasetFingerprintMatches(fileFp, currentFp);
 
       if (!datasetMatches) {
         const saved = `${fileFp?.sourceType || 'unknown'}:${fileFp?.datasetId || 'unknown'}`;
