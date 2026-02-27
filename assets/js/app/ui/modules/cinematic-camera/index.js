@@ -292,6 +292,18 @@ export function initCinematicCamera({ viewer, dom }) {
   });
   transportBar.create();
 
+  // Keep the nav mode UI in sync when playback changes modes (cross-mode paths)
+  // or when playback stops (which jumps to the first keyframe's mode).
+  playbackController.on('stateChange', (newState) => {
+    if (newState === 'STOPPED' && dom.navModeSelect) {
+      const mode = viewer.getNavigationMode?.();
+      if (mode) {
+        dom.navModeSelect.value = mode;
+        toggleNavigationPanels(mode);
+      }
+    }
+  });
+
   // =========================================================================
   // Save Position
   // =========================================================================
@@ -441,6 +453,12 @@ export function initCinematicCamera({ viewer, dom }) {
             orbit: kf.orbit,
             freefly: kf.freefly
           });
+          // Keep the navigation dropdown and sub-panels in sync with the
+          // keyframe's mode so the user sees the correct controls after goto.
+          if (dom.navModeSelect && kf.navigationMode) {
+            dom.navModeSelect.value = kf.navigationMode;
+            toggleNavigationPanels(kf.navigationMode);
+          }
         }
       } else if (action === 'rename') {
         if (isLoopBack) return;

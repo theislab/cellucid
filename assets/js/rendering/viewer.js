@@ -3409,8 +3409,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   }
 
   function getCurrentCameraStateInternal() {
-    // Sync the inactive mode from the active mode before saving
+    // Sync the inactive mode from the active mode before saving.
     // This ensures both orbit and freefly params are current/equivalent
+    // so that keyframes, session state, and view snapshots always carry
+    // a consistent "where I look" for every camera mode.
     if (navigationMode === 'free') {
       // Sync orbit from freefly so orbit params are up-to-date
       const offset = vec3.sub(vec3.create(), freeflyPosition, target);
@@ -3434,12 +3436,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
           pitch: freeflyPitch
         }
       };
-    } else {
-      // In orbit mode, sync freefly from orbit so freefly params are up-to-date
-      const forward = vec3.sub(vec3.create(), target, eye);
-      vec3.normalize(forward, forward);
-      const syncedYaw = Math.atan2(forward[2], forward[0]);
-      const syncedPitch = Math.asin(Math.min(1, Math.max(-1, forward[1])));
+    } else if (navigationMode === 'planar') {
+      // Planar: camera is on the +Z axis looking at the XY plane.
+      // Compute eye and look direction directly from orbit params.
+      const eyeX = target[0];
+      const eyeY = target[1];
+      const eyeZ = target[2] + radius;
+      const fwdX = target[0] - eyeX;  // 0
+      const fwdY = target[1] - eyeY;  // 0
+      const fwdZ = target[2] - eyeZ;  // -radius
+      const len = Math.sqrt(fwdX * fwdX + fwdY * fwdY + fwdZ * fwdZ) || 1;
+      const syncedYaw = Math.atan2(fwdZ / len, fwdX / len);
+      const syncedPitch = Math.asin(Math.min(1, Math.max(-1, fwdY / len)));
       return {
         navigationMode,
         orbit: {
@@ -3450,7 +3458,37 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
           target: [target[0], target[1], target[2]]
         },
         freefly: {
-          position: [eye[0], eye[1], eye[2]],
+          position: [eyeX, eyeY, eyeZ],
+          yaw: syncedYaw,
+          pitch: syncedPitch
+        }
+      };
+    } else {
+      // Orbit mode: compute eye position from orbit params directly
+      // (avoids relying on the cached `eye` which could be one frame stale).
+      const sinPhi = Math.sin(phi);
+      const cosPhi = Math.cos(phi);
+      const eyeX = target[0] + radius * sinPhi * Math.cos(theta);
+      const eyeY = target[1] + radius * cosPhi;
+      const eyeZ = target[2] + radius * sinPhi * Math.sin(theta);
+      // Forward = direction from eye to target
+      const fwdX = target[0] - eyeX;
+      const fwdY = target[1] - eyeY;
+      const fwdZ = target[2] - eyeZ;
+      const len = Math.sqrt(fwdX * fwdX + fwdY * fwdY + fwdZ * fwdZ) || 1;
+      const syncedYaw = Math.atan2(fwdZ / len, fwdX / len);
+      const syncedPitch = Math.asin(Math.min(1, Math.max(-1, fwdY / len)));
+      return {
+        navigationMode,
+        orbit: {
+          radius,
+          targetRadius,
+          theta,
+          phi,
+          target: [target[0], target[1], target[2]]
+        },
+        freefly: {
+          position: [eyeX, eyeY, eyeZ],
           yaw: syncedYaw,
           pitch: syncedPitch
         }
@@ -4502,32 +4540,19 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     },
 
     getCameraState() {
-      return {
-        navigationMode,
-        orbit: {
-          radius,
-          targetRadius,
-          theta,
-          phi,
-          target: [target[0], target[1], target[2]]
-        },
-        freefly: {
-          position: [freeflyPosition[0], freeflyPosition[1], freeflyPosition[2]],
-          yaw: freeflyYaw,
-          pitch: freeflyPitch
-        }
-      };
+      return getCurrentCameraStateInternal();
     },
 
     setCameraState(camState) {
       if (!camState) return;
-      console.log('[Viewer] setCameraState called:', camState.navigationMode, 'orbit:', camState.orbit?.radius?.toFixed(2), 'theta:', camState.orbit?.theta?.toFixed(2));
 
-      // Stop any inertia
+      // Stop any inertia so the camera holds the exact position we set
       velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
       vec3.set(freeflyVelocity, 0, 0, 0);
 
-      // Set navigation mode directly without triggering sync functions
+      // Set navigation mode directly without triggering sync functions —
+      // the caller (interpolation engine / goto) already provides fully-synced
+      // orbit + freefly data so no re-sync is needed.
       if (camState.navigationMode) {
         const next = camState.navigationMode === 'free' ? 'free' : (camState.navigationMode === 'planar' ? 'planar' : 'orbit');
         navigationMode = next;
@@ -4539,6 +4564,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         }
       }
 
+      // Apply both representations unconditionally so all internal variables
+      // stay in sync regardless of which mode is active.
       if (camState.orbit) {
         radius = camState.orbit.radius ?? radius;
         targetRadius = camState.orbit.targetRadius ?? targetRadius;
@@ -4555,7 +4582,6 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         freeflyYaw = camState.freefly.yaw ?? freeflyYaw;
         freeflyPitch = camState.freefly.pitch ?? freeflyPitch;
       }
-      console.log('[Viewer] Camera state applied. radius:', radius.toFixed(2), 'theta:', theta.toFixed(2), 'phi:', phi.toFixed(2));
     },
 
     stopInertia() {

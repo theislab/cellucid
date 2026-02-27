@@ -163,20 +163,38 @@ function vec3Dist(a, b) {
   return Math.sqrt(dx * dx + dy * dy + dz * dz);
 }
 
-/** Approximate distance between two keyframes in their respective spaces. */
+/**
+ * Approximate distance between two keyframes for auto-pacing.
+ *
+ * Uses the freefly (eye-position) representation for cross-mode segments since
+ * it is the universal space shared by all modes.  Same-mode orbit/planar
+ * segments use the orbit target + radius metric which better reflects the
+ * user's perceived motion.
+ */
 function keyframeDistance(kfA, kfB) {
-  const mode = kfA.navigationMode;
-  if (mode === 'free') {
+  const modeA = kfA.navigationMode;
+  const modeB = kfB.navigationMode;
+
+  // Cross-mode or freefly: measure world-space eye-position distance
+  if (modeA !== modeB || modeA === 'free') {
     const posA = kfA.freefly?.position || [0, 0, 0];
     const posB = kfB.freefly?.position || [0, 0, 0];
     return vec3Dist(posA, posB) + 0.5; // +0.5 baseline so identical positions still move
   }
-  // orbit / planar
+
+  // Same-mode orbit / planar: target movement + radius change + arc travel
   const tA = kfA.orbit?.target || [0, 0, 0];
   const tB = kfB.orbit?.target || [0, 0, 0];
   const rA = kfA.orbit?.radius ?? 3;
   const rB = kfB.orbit?.radius ?? 3;
-  return vec3Dist(tA, tB) + Math.abs(rA - rB) + 0.5;
+  // Account for angular travel (theta, phi) so large orbits around the same
+  // target don't collapse to zero distance and whip the camera around.
+  let dTheta = (kfB.orbit?.theta ?? 0) - (kfA.orbit?.theta ?? 0);
+  dTheta -= Math.round(dTheta / (2 * Math.PI)) * 2 * Math.PI; // wrap to [-π, π]
+  const dPhi = (kfB.orbit?.phi ?? Math.PI / 4) - (kfA.orbit?.phi ?? Math.PI / 4);
+  const avgR = (rA + rB) / 2;
+  const arcLength = avgR * Math.sqrt(dTheta * dTheta + dPhi * dPhi);
+  return vec3Dist(tA, tB) + Math.abs(rA - rB) + arcLength + 0.5;
 }
 
 const DEFAULT_AUTO_PACE_SPEED = 1.5; // scene units per second
@@ -233,9 +251,13 @@ export function interpolateCameraState(keyframes, globalT, options) {
   const totalDuration = durations.reduce((s, d) => s + d, 0);
   if (totalDuration <= 0) return buildCameraState(keyframes[0]);
 
-  // Clamp
+  // Apply easing to GLOBAL progress so the overall path eases in/out smoothly.
+  // Per-segment easing would cause visible stuttering at every keyframe boundary
+  // (each segment independently decelerates then re-accelerates).
   const clamped = Math.max(0, Math.min(1, globalT));
-  const absTime = clamped * totalDuration;
+  const easingFn = EASING[options.easing] || easeLinear;
+  const easedT = easingFn(clamped);
+  const absTime = easedT * totalDuration;
 
   // Find segment
   let cumulative = 0;
@@ -253,18 +275,26 @@ export function interpolateCameraState(keyframes, globalT, options) {
     : 0;
   localT = Math.max(0, Math.min(1, localT));
 
-  // Apply easing
-  const easingFn = EASING[options.easing] || easeInOut;
-  localT = easingFn(localT);
-
-  const mode = keyframes[0].navigationMode;
   const posMethod = options.positionMethod || 'catmull-rom';
   const rotMethod = options.rotationMethod || 'slerp';
 
-  if (mode === 'free') {
+  const modeA = keyframes[segIndex].navigationMode;
+  const modeB = keyframes[Math.min(segIndex + 1, n - 1)].navigationMode;
+  const isCrossMode = modeA !== modeB;
+
+  // Cross-mode segments always use freefly (world-space) interpolation because
+  // both representations are synced at capture time, giving every keyframe valid
+  // eye-position + yaw/pitch data.  This avoids the discontinuity that would
+  // happen from switching between orbit's spherical math and freefly's linear
+  // math at a mode boundary.
+  //
+  // Same-mode segments use their native interpolation:
+  //   orbit/planar → spherical (theta, phi, target, radius)
+  //   freefly      → world-space (position, yaw, pitch)
+  if (isCrossMode || modeA === 'free') {
     return interpolateFreefly(keyframes, segIndex, localT, posMethod, rotMethod);
   }
-  return interpolateOrbit(keyframes, segIndex, localT, posMethod, rotMethod, mode);
+  return interpolateOrbit(keyframes, segIndex, localT, posMethod, rotMethod, modeA);
 }
 
 // ---------------------------------------------------------------------------
@@ -328,8 +358,9 @@ function interpolateOrbit(keyframes, segIndex, t, posMethod, rotMethod, mode) {
     theta = a.orbit?.theta ?? 0;
     phi = a.orbit?.phi ?? 0;
   } else if (rotMethod === 'slerp') {
-    if (posMethod === 'catmull-rom' && n >= 4) {
-      // Use Catmull-Rom on angles for consistency with position spline
+    if (posMethod === 'catmull-rom' && n >= 2) {
+      // Use Catmull-Rom on angles for consistency with position spline.
+      // Boundary-mirrored accessors handle n=2 (degrades to linear) and n=3 correctly.
       theta = catmullRomAngle(
         getOrbitScalar(kf, i - 1, 'theta'),
         getOrbitScalar(kf, i, 'theta'),
@@ -358,20 +389,24 @@ function interpolateOrbit(keyframes, segIndex, t, posMethod, rotMethod, mode) {
     phi = lerp(a.orbit?.phi ?? 0, b.orbit?.phi ?? 0, t);
   }
 
+  // Sync freefly from interpolated orbit params so both representations are consistent.
+  // This ensures setCameraState applies correct values when modes are mixed.
+  const sinP = Math.sin(phi);
+  const cosP = Math.cos(phi);
+  const eyeX = target[0] + radius * sinP * Math.cos(theta);
+  const eyeY = target[1] + radius * cosP;
+  const eyeZ = target[2] + radius * sinP * Math.sin(theta);
+  const fwdX = target[0] - eyeX;
+  const fwdY = target[1] - eyeY;
+  const fwdZ = target[2] - eyeZ;
+  const fLen = Math.sqrt(fwdX * fwdX + fwdY * fwdY + fwdZ * fwdZ) || 1;
+  const syncYaw = Math.atan2(fwdZ / fLen, fwdX / fLen);
+  const syncPitch = Math.asin(Math.max(-1, Math.min(1, fwdY / fLen)));
+
   return {
     navigationMode: mode,
     orbit: { radius, targetRadius, theta, phi, target },
-    freefly: a.freefly
-      ? {
-          position: [
-            a.freefly.position[0],
-            a.freefly.position[1],
-            a.freefly.position[2]
-          ],
-          yaw: a.freefly.yaw,
-          pitch: a.freefly.pitch
-        }
-      : { position: [0, 0, 3], yaw: 0, pitch: 0 }
+    freefly: { position: [eyeX, eyeY, eyeZ], yaw: syncYaw, pitch: syncPitch }
   };
 }
 
@@ -409,7 +444,7 @@ function interpolateFreefly(keyframes, segIndex, t, posMethod, rotMethod) {
   // --- Rotation (yaw, pitch) ---
   let yaw, pitch;
   if (rotMethod === 'slerp') {
-    if (posMethod === 'catmull-rom' && n >= 4) {
+    if (posMethod === 'catmull-rom' && n >= 2) {
       yaw = catmullRomAngle(
         getFreeflyScalar(kf, i - 1, 'yaw'),
         getFreeflyScalar(kf, i, 'yaw'),
@@ -438,17 +473,31 @@ function interpolateFreefly(keyframes, segIndex, t, posMethod, rotMethod) {
     pitch = lerp(a.freefly?.pitch ?? 0, b.freefly?.pitch ?? 0, t);
   }
 
+  // Sync orbit from interpolated freefly params so the viewer's orbit variables
+  // are reasonable if the next segment switches back to orbit rendering.
+  // Place the synthetic target along the freefly look direction at a blended
+  // radius so the transition to orbit (which always looks at target) is smooth.
+  const rA = a.orbit?.radius ?? 3;
+  const rB = b.orbit?.radius ?? 3;
+  const syncRadius = lerp(rA, rB, t);
+  const cosP = Math.cos(pitch);
+  const syncTarget = [
+    position[0] + syncRadius * cosP * Math.cos(yaw),
+    position[1] + syncRadius * Math.sin(pitch),
+    position[2] + syncRadius * cosP * Math.sin(yaw)
+  ];
+
+  // Derive orbit angles from position-relative-to-target (viewer convention)
+  const offX = position[0] - syncTarget[0];
+  const offY = position[1] - syncTarget[1];
+  const offZ = position[2] - syncTarget[2];
+  const offLen = Math.max(0.01, Math.sqrt(offX * offX + offY * offY + offZ * offZ));
+  const syncTheta = Math.atan2(offZ, offX);
+  const syncPhi = Math.acos(Math.max(-1, Math.min(1, offY / offLen)));
+
   return {
     navigationMode: 'free',
-    orbit: a.orbit
-      ? {
-          radius: a.orbit.radius,
-          targetRadius: a.orbit.targetRadius,
-          theta: a.orbit.theta,
-          phi: a.orbit.phi,
-          target: [a.orbit.target[0], a.orbit.target[1], a.orbit.target[2]]
-        }
-      : { radius: 3, targetRadius: 3, theta: 0, phi: Math.PI / 4, target: [0, 0, 0] },
+    orbit: { radius: offLen, targetRadius: offLen, theta: syncTheta, phi: syncPhi, target: syncTarget },
     freefly: { position, yaw, pitch }
   };
 }
