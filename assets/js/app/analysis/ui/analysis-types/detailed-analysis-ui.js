@@ -29,6 +29,41 @@ import { PageSelectorComponent } from '../shared/page-selector.js';
 import { loadPlotly, purgePlot } from '../../plots/plotly-loader.js';
 import { createLayoutEngine } from '../../plots/layout-engine.js';
 
+function requireSavedPlotOptions(entries) {
+  if (!Array.isArray(entries)) {
+    throw new TypeError('Detailed Analysis savedPlotOptions must be an array');
+  }
+  const optionsByPlot = new Map();
+  for (const entry of entries) {
+    if (
+      !Array.isArray(entry) ||
+      entry.length !== 2 ||
+      typeof entry[0] !== 'string' ||
+      entry[0].length === 0 ||
+      entry[1] === null ||
+      typeof entry[1] !== 'object' ||
+      Array.isArray(entry[1])
+    ) {
+      throw new TypeError(
+        'Detailed Analysis savedPlotOptions must contain [plotType, options] pairs'
+      );
+    }
+    const [plotType, options] = entry;
+    if (!PlotRegistry.get(plotType)) {
+      throw new Error(
+        `Detailed Analysis saved plot type "${plotType}" was not found`
+      );
+    }
+    if (optionsByPlot.has(plotType)) {
+      throw new TypeError(
+        `Detailed Analysis saved plot type "${plotType}" is duplicated`
+      );
+    }
+    optionsByPlot.set(plotType, structuredClone(options));
+  }
+  return optionsByPlot;
+}
+
 /**
  * Detailed Analysis UI Component
  * Extends BaseAnalysisUI with detailed-specific functionality.
@@ -133,12 +168,6 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       return;
     }
 
-    // Auto-select all pages by default if none selected
-    if (this._selectedPages.length === 0 && pages.length > 0) {
-      this._selectedPages = pages.map(p => p.id);
-      this._currentConfig.pages = this._selectedPages;
-    }
-
     // If no pages, show message
     if (pages.length === 0) {
       this._controlsContainer.innerHTML = `
@@ -220,11 +249,15 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       showColorPicker: true,
       showCellCounts: true,
       showSelectAll: true,
-      initialSelection: this._selectedPages,
+      initialSelection: this._selectedPages.length > 0
+        ? this._selectedPages
+        : undefined,
       includeDerivedPages: true,
       getCellCountForPageId: (pageId) => this.dataLayer.getCellCountForPageId(pageId),
       label: 'Compare pages:'
     });
+    this._selectedPages = this._pageSelector.getSelectedPages();
+    this._currentConfig.pages = [...this._selectedPages];
   }
 
   /**
@@ -254,20 +287,26 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
 
   exportSettings() {
     const base = super.exportSettings();
+    const savedPlotOptions = requireSavedPlotOptions(
+      Array.from(this._savedPlotOptions.entries())
+    );
     return {
       ...base,
-      savedPlotOptions: Array.from(this._savedPlotOptions.entries())
+      savedPlotOptions: Array.from(savedPlotOptions.entries())
     };
   }
 
   importSettings(settings) {
-    if (!settings) return;
+    this._requireExactSettingsKeys(
+      settings,
+      ['config', 'savedPlotOptions', 'selectedPages'],
+      'Detailed Analysis settings'
+    );
+    const base = this._requireBaseSettings(settings);
+    const savedPlotOptions = requireSavedPlotOptions(settings.savedPlotOptions);
 
-    if (Array.isArray(settings.savedPlotOptions)) {
-      this._savedPlotOptions = new Map(settings.savedPlotOptions);
-    }
-
-    super.importSettings(settings);
+    this._savedPlotOptions = savedPlotOptions;
+    this._applyBaseSettings(base);
   }
 
   // ===========================================================================
@@ -679,7 +718,9 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
  * Create detailed analysis UI instance
  */
 export function createDetailedAnalysisUI(options) {
-  return new DetailedAnalysisUI(options);
+  const ui = new DetailedAnalysisUI(options);
+  ui.init(options.container);
+  return ui;
 }
 
 export default DetailedAnalysisUI;

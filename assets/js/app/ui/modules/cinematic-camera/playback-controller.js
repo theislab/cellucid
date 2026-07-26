@@ -10,7 +10,13 @@
  * @module ui/modules/cinematic-camera/playback-controller
  */
 
-import { interpolateCameraState, resolveSegmentDurations } from './interpolation-engine.js';
+import {
+  assertCameraPathOptions,
+  interpolateCameraState,
+  resolveSegmentDurations
+} from './interpolation-engine.js';
+import { isCameraPathReady } from './keyframe-store.js';
+import { readCameraBooleanOption } from '../camera-input-contract.js';
 
 const STOPPED = 'STOPPED';
 const PLAYING = 'PLAYING';
@@ -23,6 +29,21 @@ const PAUSED = 'PAUSED';
  * @param {() => Object} options.getInterpolationOptions  Returns { positionMethod, rotationMethod, easing, loop }.
  */
 export function createPlaybackController({ viewer, keyframeStore, getInterpolationOptions }) {
+  if (!viewer || typeof viewer.setCameraState !== 'function') {
+    throw new TypeError('Camera path playback requires viewer.setCameraState().');
+  }
+  if (
+    !keyframeStore ||
+    typeof keyframeStore.getAll !== 'function' ||
+    typeof keyframeStore.on !== 'function' ||
+    typeof keyframeStore.off !== 'function'
+  ) {
+    throw new TypeError('Camera path playback requires the exact keyframe-store contract.');
+  }
+  if (typeof getInterpolationOptions !== 'function') {
+    throw new TypeError('Camera path playback requires getInterpolationOptions().');
+  }
+
   let state = STOPPED;
   let startTime = 0;       // seconds (performance.now / 1000)
   let pauseElapsed = 0;    // seconds elapsed at pause
@@ -32,17 +53,33 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
   // Lightweight event emitter
   const listeners = { stateChange: new Set(), timeUpdate: new Set() };
 
+  function getExactInterpolationOptions() {
+    return assertCameraPathOptions(getInterpolationOptions());
+  }
+
   function on(event, fn) {
-    if (listeners[event]) listeners[event].add(fn);
+    if (!Object.hasOwn(listeners, event)) {
+      throw new RangeError(`Unsupported camera playback event: ${String(event)}.`);
+    }
+    if (typeof fn !== 'function') {
+      throw new TypeError('Camera playback listeners must be functions.');
+    }
+    listeners[event].add(fn);
   }
 
   function off(event, fn) {
-    if (listeners[event]) listeners[event].delete(fn);
+    if (!Object.hasOwn(listeners, event)) {
+      throw new RangeError(`Unsupported camera playback event: ${String(event)}.`);
+    }
+    if (typeof fn !== 'function') {
+      throw new TypeError('Camera playback listeners must be functions.');
+    }
+    listeners[event].delete(fn);
   }
 
   function emit(event, data) {
-    if (listeners[event]) {
-      for (const fn of listeners[event]) fn(data);
+    for (const fn of listeners[event]) {
+      fn(data);
     }
   }
 
@@ -50,7 +87,7 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
 
   function computeTotalDuration() {
     const keyframes = keyframeStore.getAll();
-    const opts = getInterpolationOptions();
+    const opts = getExactInterpolationOptions();
     const durations = resolveSegmentDurations(keyframes, opts.autoPaceSpeed);
     return durations.reduce((s, d) => s + d, 0);
   }
@@ -60,33 +97,38 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
   function tick() {
     if (state !== PLAYING) return;
 
+    const keyframes = keyframeStore.getAll();
+    if (!isCameraPathReady(keyframes)) {
+      stop({ resetCamera: false });
+      return;
+    }
+
     const now = performance.now() / 1000;
     const elapsed = now - startTime;
-    let globalT = totalDuration > 0 ? elapsed / totalDuration : 1;
+    let globalT = elapsed / totalDuration;
 
-    const opts = getInterpolationOptions();
-    const keyframes = keyframeStore.getAll();
+    const opts = getExactInterpolationOptions();
 
     if (globalT >= 1) {
-      if (opts.loop && keyframes.length >= 2) {
+      if (opts.loop) {
         // Seamless loop: reset start time
         startTime = now;
         globalT = 0;
       } else {
-        // Clamp to end and stop
+        // Publish the exact endpoint and finish in place.
         globalT = 1;
         const camState = interpolateCameraState(keyframes, 1, opts);
-        if (camState) viewer.setCameraState(camState);
+        viewer.setCameraState(camState);
         emit('timeUpdate', { globalT: 1, elapsed: totalDuration, totalDuration });
-        stop();
+        stop({ resetCamera: false });
         return;
       }
     }
 
     const camState = interpolateCameraState(keyframes, globalT, opts);
-    if (camState) viewer.setCameraState(camState);
+    viewer.setCameraState(camState);
 
-    emit('timeUpdate', { globalT, elapsed: Math.min(elapsed, totalDuration), totalDuration });
+    emit('timeUpdate', { globalT, elapsed, totalDuration });
 
     rafId = requestAnimationFrame(tick);
   }
@@ -95,10 +137,17 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
 
   function play() {
     const keyframes = keyframeStore.getAll();
-    if (keyframes.length < 2) return;
+    if (!isCameraPathReady(keyframes)) {
+      throw new Error('Camera path playback requires at least two valid keyframes.');
+    }
+    if (state === PLAYING) {
+      throw new Error('Camera path playback is already playing.');
+    }
 
     totalDuration = computeTotalDuration();
-    if (totalDuration <= 0) return;
+    if (!Number.isFinite(totalDuration) || totalDuration <= 0) {
+      throw new Error('Camera path playback requires a positive finite duration.');
+    }
 
     const now = performance.now() / 1000;
 
@@ -117,7 +166,9 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
   }
 
   function pause() {
-    if (state !== PLAYING) return;
+    if (state !== PLAYING) {
+      throw new Error('Camera path playback can pause only while it is playing.');
+    }
     if (rafId != null) cancelAnimationFrame(rafId);
     rafId = null;
 
@@ -126,21 +177,25 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
     emit('stateChange', state);
   }
 
-  function stop() {
+  function stop(options) {
+    const resetCamera = readCameraBooleanOption(
+      options,
+      'resetCamera',
+      'Camera path stop'
+    );
     if (rafId != null) cancelAnimationFrame(rafId);
     rafId = null;
 
-    const wasPlaying = state === PLAYING || state === PAUSED;
     state = STOPPED;
     pauseElapsed = 0;
 
-    // Jump to first keyframe
-    if (wasPlaying) {
+    // The explicit reset command always honors the transport's reset-to-start label.
+    if (resetCamera) {
       const keyframes = keyframeStore.getAll();
-      if (keyframes.length > 0) {
-        const opts = getInterpolationOptions();
+      if (isCameraPathReady(keyframes)) {
+        const opts = getExactInterpolationOptions();
         const camState = interpolateCameraState(keyframes, 0, opts);
-        if (camState) viewer.setCameraState(camState);
+        viewer.setCameraState(camState);
       }
     }
 
@@ -154,26 +209,34 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
    */
   function seekTo(globalT) {
     const keyframes = keyframeStore.getAll();
-    if (keyframes.length < 2) return;
+    if (!isCameraPathReady(keyframes)) {
+      throw new Error('Camera path seeking requires at least two valid keyframes.');
+    }
+    if (!Number.isFinite(globalT) || globalT < 0 || globalT > 1) {
+      throw new RangeError(
+        `Camera path progress must be a finite number from 0 through 1; received ${String(globalT)}.`
+      );
+    }
 
     totalDuration = computeTotalDuration();
-    if (totalDuration <= 0) return;
+    if (!Number.isFinite(totalDuration) || totalDuration <= 0) {
+      throw new Error('Camera path seeking requires a positive finite duration.');
+    }
 
-    const clamped = Math.max(0, Math.min(1, globalT));
-    const opts = getInterpolationOptions();
-    const camState = interpolateCameraState(keyframes, clamped, opts);
-    if (camState) viewer.setCameraState(camState);
+    const opts = getExactInterpolationOptions();
+    const camState = interpolateCameraState(keyframes, globalT, opts);
+    viewer.setCameraState(camState);
 
     if (state === PLAYING) {
       // Adjust startTime so play continues from the seek point
-      startTime = performance.now() / 1000 - clamped * totalDuration;
+      startTime = performance.now() / 1000 - globalT * totalDuration;
     } else {
-      pauseElapsed = clamped * totalDuration;
+      pauseElapsed = globalT * totalDuration;
     }
 
     emit('timeUpdate', {
-      globalT: clamped,
-      elapsed: clamped * totalDuration,
+      globalT,
+      elapsed: globalT * totalDuration,
       totalDuration
     });
   }
@@ -182,10 +245,21 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
     return state;
   }
 
+  function onKeyframeChange() {
+    // Any edit invalidates timing/interpolation cached when playback started.
+    // Stop in place so mutations never continue along stale path geometry.
+    if (state !== STOPPED) {
+      stop({ resetCamera: false });
+    }
+  }
+
+  keyframeStore.on('changed', onKeyframeChange);
+
   function destroy() {
     if (rafId != null) cancelAnimationFrame(rafId);
     rafId = null;
     state = STOPPED;
+    keyframeStore.off('changed', onKeyframeChange);
     listeners.stateChange.clear();
     listeners.timeUpdate.clear();
   }

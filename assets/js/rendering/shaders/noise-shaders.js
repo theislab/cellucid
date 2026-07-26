@@ -23,7 +23,6 @@ precision highp float;
 
 in vec2 v_uv;
 uniform float u_slice;      // Current Z slice [0, 1]
-uniform float u_size;       // Texture size (128)
 
 out vec4 fragColor;
 
@@ -227,7 +226,6 @@ precision highp float;
 
 in vec2 v_uv;
 uniform float u_slice;
-uniform float u_size;
 
 out vec4 fragColor;
 

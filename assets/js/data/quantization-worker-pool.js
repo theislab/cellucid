@@ -8,6 +8,13 @@
  * @module data/quantization-worker-pool
  */
 
+import { validateQuantizationTask } from './quantization-contract.js';
+
+export const QUANTIZATION_BACKEND = Object.freeze({
+  MAIN_THREAD: 'main-thread',
+  WORKER: 'worker',
+});
+
 /**
  * @typedef {'uint8'|'uint16'} QuantizedDType
  *
@@ -20,15 +27,99 @@
  * }} DequantizeTask
  */
 
-class QuantizationWorkerPool {
+function validateWorkerResponse(value) {
+  if (
+    value === null ||
+    typeof value !== 'object' ||
+    Array.isArray(value)
+  ) {
+    throw new Error('Quantization worker response must be an object');
+  }
+  if (typeof value.success !== 'boolean') {
+    throw new Error(
+      'Quantization worker response success must be a boolean'
+    );
+  }
+  const expectedKeys = value.success
+    ? ['requestId', 'success', 'result']
+    : ['requestId', 'success', 'error'];
+  const expected = new Set(expectedKeys);
+  if (
+    expectedKeys.some(key => !Object.hasOwn(value, key)) ||
+    Object.keys(value).some(key => !expected.has(key))
+  ) {
+    throw new Error(
+      `Quantization worker ${value.success ? 'success' : 'error'} response ` +
+      `requires exactly ${expectedKeys.join(', ')}`
+    );
+  }
+  if (typeof value.requestId !== 'string' || value.requestId.length === 0) {
+    throw new Error(
+      'Quantization worker response requestId must be a non-empty string'
+    );
+  }
+  if (value.success) {
+    if (
+      value.result === null ||
+      typeof value.result !== 'object' ||
+      Array.isArray(value.result) ||
+      Object.keys(value.result).length !== 1 ||
+      !Object.hasOwn(value.result, 'buffer') ||
+      !(value.result.buffer instanceof ArrayBuffer)
+    ) {
+      throw new Error(
+        'Quantization worker success result requires exactly one ArrayBuffer'
+      );
+    }
+  } else if (typeof value.error !== 'string' || value.error.length === 0) {
+    throw new Error(
+      'Quantization worker error response requires a non-empty error string'
+    );
+  }
+  return value;
+}
+
+export class QuantizationWorkerPool {
   /**
    * @param {Object} [options]
    * @param {number} [options.poolSize]
    */
   constructor(options = {}) {
-    const desired = Number.isFinite(options.poolSize) ? Math.floor(options.poolSize) : null;
-    const hc = typeof navigator !== 'undefined' ? (navigator.hardwareConcurrency || 4) : 2;
-    this.poolSize = Math.max(1, Math.min(desired || Math.max(1, Math.floor(hc / 2)), 4));
+    if (
+      options === null ||
+      typeof options !== 'object' ||
+      Array.isArray(options) ||
+      Object.keys(options).some(key => key !== 'poolSize')
+    ) {
+      throw new TypeError(
+        'Quantization worker-pool options may contain only poolSize'
+      );
+    }
+    if (
+      Object.hasOwn(options, 'poolSize') &&
+      (
+        !Number.isSafeInteger(options.poolSize) ||
+        options.poolSize < 1 ||
+        options.poolSize > 4
+      )
+    ) {
+      throw new RangeError(
+        'Quantization worker-pool poolSize must be an integer from 1 to 4'
+      );
+    }
+    const hardwareConcurrency =
+      typeof navigator !== 'undefined'
+        ? navigator.hardwareConcurrency
+        : 2;
+    const detectedPoolSize = (
+      Number.isSafeInteger(hardwareConcurrency) &&
+      hardwareConcurrency > 0
+    )
+      ? Math.max(1, Math.min(Math.floor(hardwareConcurrency / 2), 4))
+      : 2;
+    this.poolSize = Object.hasOwn(options, 'poolSize')
+      ? options.poolSize
+      : detectedPoolSize;
 
     /** @type {Worker[]} */
     this.workers = [];
@@ -71,14 +162,28 @@ class QuantizationWorkerPool {
    * @private
    */
   _handleMessage(workerIndex, e) {
-    const data = e?.data || {};
-    const { requestId, success, result, error } = data;
-
-    const pending = this._pending.get(requestId);
-    if (pending) {
-      this._pending.delete(requestId);
-      if (success) pending.resolve(result);
-      else pending.reject(new Error(error || 'Worker task failed'));
+    let data;
+    try {
+      data = validateWorkerResponse(e?.data);
+      const pending = this._pending.get(data.requestId);
+      if (!pending || pending.workerIndex !== workerIndex) {
+        throw new Error(
+          `Quantization worker returned unknown requestId "${data.requestId}"`
+        );
+      }
+      this._pending.delete(data.requestId);
+      if (data.success) {
+        pending.resolve(data.result);
+      } else {
+        pending.reject(new Error(data.error));
+      }
+    } catch (error) {
+      this._handleError(workerIndex, {
+        message: error instanceof Error
+          ? error.message
+          : 'Quantization worker response validation failed',
+      });
+      return;
     }
 
     if (!this._available || this.workers.length === 0) {
@@ -98,10 +203,15 @@ class QuantizationWorkerPool {
    * @private
    */
   _handleError(workerIndex, e) {
-    const message = e?.message || 'Quantization worker error';
+    const message = (
+      typeof e?.message === 'string' &&
+      e.message.length > 0
+    )
+      ? e.message
+      : 'Quantization worker emitted an invalid error event';
     console.warn('[QuantizationWorkerPool] Worker error:', message);
 
-    // Reject any pending requests and queued work; fall back to main-thread decode.
+    // Reject every request owned by the failed worker backend.
     for (const pending of this._pending.values()) {
       try {
         pending.reject(new Error(message));
@@ -166,7 +276,11 @@ class QuantizationWorkerPool {
           return;
         }
         this.states[workerIndex] = 'busy';
-        this._pending.set(requestId, { resolve, reject });
+        this._pending.set(requestId, {
+          resolve,
+          reject,
+          workerIndex,
+        });
         worker.postMessage({ type, payload, requestId }, transferables);
       };
 
@@ -178,16 +292,16 @@ class QuantizationWorkerPool {
 
   /**
    * Dequantize quantized values into Float32Array in a worker.
-   * Falls back to rejection if workers are unavailable.
    *
    * @param {DequantizeTask} task
    * @returns {Promise<Float32Array>}
    */
   async dequantizeToFloat32(task) {
-    const { buffer, dtype, minValue, maxValue, bits } = task || {};
-    if (!(buffer instanceof ArrayBuffer)) {
-      throw new Error('dequantizeToFloat32: missing buffer');
-    }
+    validateQuantizationTask(task, 'Quantization worker-pool task');
+    const { buffer, dtype, minValue, maxValue, bits } = task;
+    const expectedOutputBytes =
+      (buffer.byteLength / (bits / 8)) *
+      Float32Array.BYTES_PER_ELEMENT;
     const workerIndex = this._nextWorkerIndex();
     const result = await this._execute(
       workerIndex,
@@ -196,9 +310,20 @@ class QuantizationWorkerPool {
       [buffer]
     );
 
-    const outBuffer = result?.buffer;
+    const outBuffer = (
+      result !== null &&
+      typeof result === 'object' &&
+      Object.hasOwn(result, 'buffer')
+    )
+      ? result.buffer
+      : null;
     if (!(outBuffer instanceof ArrayBuffer)) {
       throw new Error('dequantizeToFloat32: invalid worker result');
+    }
+    if (outBuffer.byteLength !== expectedOutputBytes) {
+      throw new Error(
+        'dequantizeToFloat32: worker result length does not match the input'
+      );
     }
     return new Float32Array(outBuffer);
   }
@@ -215,19 +340,32 @@ export function getQuantizationWorkerPool() {
 }
 
 /**
- * Convenience: Dequantize in worker when available.
- * @param {DequantizeTask} task
- * @returns {Promise<Float32Array|null>} Float32Array or null if worker unavailable
+ * Select one supported quantization backend before payload acquisition.
+ * A runtime failure after worker selection remains a worker failure.
+ *
+ * @returns {Promise<'main-thread'|'worker'>}
  */
-export async function tryDequantizeToFloat32(task) {
+export async function selectQuantizationBackend() {
+  if (typeof Worker === 'undefined') {
+    return QUANTIZATION_BACKEND.MAIN_THREAD;
+  }
+
   const pool = getQuantizationWorkerPool();
-  await pool.init();
-  if (!pool.workers || pool.workers.length === 0) return null;
-  // IMPORTANT: this transfers the input ArrayBuffer; callers must not rely on fallback decode.
-  return pool.dequantizeToFloat32(task);
+  const available = await pool.init();
+  if (!available || !pool.workers || pool.workers.length === 0) {
+    throw new Error('Quantization workers unavailable');
+  }
+  return QUANTIZATION_BACKEND.WORKER;
 }
 
-export default {
-  getQuantizationWorkerPool,
-  tryDequantizeToFloat32
-};
+/**
+ * Execute one task on the already selected worker backend.
+ *
+ * @param {DequantizeTask} task
+ * @returns {Promise<Float32Array>}
+ */
+export async function dequantizeToFloat32InWorker(task) {
+  validateQuantizationTask(task, 'Quantization worker-pool task');
+  const pool = getQuantizationWorkerPool();
+  return pool.dequantizeToFloat32(task);
+}

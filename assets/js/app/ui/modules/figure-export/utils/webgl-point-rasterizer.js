@@ -20,13 +20,11 @@
  * MATRIX REQUIREMENTS:
  * The WebGL shaders require separate viewMatrix, projectionMatrix, and modelMatrix
  * (not just mvpMatrix) because lighting calculations need eye-space positions.
- * If any matrix is missing, the rasterizer returns null and the caller should
- * fall back to Canvas2D rendering (which produces flat circles, not 3D spheres).
+ * Missing render state is a contract error; export never changes fidelity.
  *
  * CROSS-BROWSER NOTES:
- * - Uses OffscreenCanvas when available for better performance
- * - Falls back to HTMLCanvasElement for broader compatibility
- * - preserveDrawingBuffer is enabled for reliable toBlob/convertToBlob
+ * - Uses one HTMLCanvasElement WebGL2 backend in every supported browser
+ * - preserveDrawingBuffer is enabled for reliable HTMLCanvasElement.toBlob
  *
  * ISOLATION:
  * This module is only invoked during export/preview and does not touch the
@@ -45,8 +43,6 @@ import {
   HP_VS_HIGHLIGHT,
   HP_FS_HIGHLIGHT,
 } from '../../../../../rendering/shaders/high-perf-shaders.js';
-import { isFiniteNumber } from '../../../../utils/number-utils.js';
-
 const DEFAULT_ALPHA_THRESHOLD = 0.01;
 const DEFAULT_HIGHLIGHT_COLOR = [0.4, 0.85, 1.0];
 
@@ -56,19 +52,13 @@ const HIGHLIGHT_STYLE_BY_QUALITY = {
   ultralight: { scale: 1.65, ringWidth: 0.46, haloStrength: 0.55, haloShape: 0.35, ringStyle: 2.0 }
 };
 
-function clamp01(v) {
-  if (!Number.isFinite(v)) return 0;
-  if (v < 0) return 0;
-  if (v > 1) return 1;
-  return v;
-}
-
 function highlightValueToAlphaByte(value) {
-  const v = Number(value);
-  if (!Number.isFinite(v) || v <= 0) return 0;
-  // Support both 0..1 and 0..255 highlight arrays.
-  const a01 = v <= 1.0 ? v : (v >= 255 ? 1.0 : (v / 255));
-  return Math.max(0, Math.min(255, Math.round(clamp01(a01) * 255)));
+  if (!Number.isInteger(value) || value < 0 || value > 255) {
+    throw new RangeError(
+      'Figure-export highlight values must be exact Uint8 intensities.'
+    );
+  }
+  return value;
 }
 
 function buildHighlightOverlayBuffers({
@@ -76,25 +66,18 @@ function buildHighlightOverlayBuffers({
   highlightArray,
   transparency,
   visibilityMask,
-  alphaThreshold = DEFAULT_ALPHA_THRESHOLD
+  alphaThreshold
 }) {
-  if (!positions || !highlightArray) return null;
-
-  const n = Math.min(
-    Math.floor(positions.length / 3),
-    highlightArray.length,
-    transparency ? transparency.length : Infinity,
-    visibilityMask ? visibilityMask.length : Infinity
-  );
-  if (!Number.isFinite(n) || n <= 0) return null;
+  if (highlightArray === null) return null;
+  const n = positions.length / 3;
 
   let count = 0;
   for (let i = 0; i < n; i++) {
     const aByte = highlightValueToAlphaByte(highlightArray[i]);
     if (aByte <= 0) continue;
-    if (visibilityMask && (visibilityMask[i] ?? 0) <= 0) continue;
-    const baseAlpha = transparency ? (transparency[i] ?? 1.0) : 1.0;
-    if (!Number.isFinite(baseAlpha) || baseAlpha < alphaThreshold) continue;
+    if (visibilityMask !== null && visibilityMask[i] <= 0) continue;
+    const baseAlpha = transparency === null ? 1 : transparency[i];
+    if (baseAlpha < alphaThreshold) continue;
     count++;
   }
   if (count <= 0) return null;
@@ -106,9 +89,9 @@ function buildHighlightOverlayBuffers({
   for (let i = 0; i < n; i++) {
     const aByte = highlightValueToAlphaByte(highlightArray[i]);
     if (aByte <= 0) continue;
-    if (visibilityMask && (visibilityMask[i] ?? 0) <= 0) continue;
-    const baseAlpha = transparency ? (transparency[i] ?? 1.0) : 1.0;
-    if (!Number.isFinite(baseAlpha) || baseAlpha < alphaThreshold) continue;
+    if (visibilityMask !== null && visibilityMask[i] <= 0) continue;
+    const baseAlpha = transparency === null ? 1 : transparency[i];
+    if (baseAlpha < alphaThreshold) continue;
 
     const pi = i * 3;
     const oi = cursor * 3;
@@ -148,58 +131,63 @@ function buildHighlightOverlayBuffers({
  */
 
 /**
- * Create an (Offscreen)Canvas for WebGL rasterization.
+ * Create the single browser canvas backend used for WebGL rasterization.
  * @param {number} width
  * @param {number} height
- * @returns {OffscreenCanvas|HTMLCanvasElement|null}
+ * @returns {HTMLCanvasElement}
  */
 function createRasterCanvas(width, height) {
-  const w = Math.max(1, Math.round(width));
-  const h = Math.max(1, Math.round(height));
-  if (typeof OffscreenCanvas !== 'undefined') {
-    try {
-      return new OffscreenCanvas(w, h);
-    } catch {
-      // Fall through to HTML canvas.
-    }
+  if (typeof document === 'undefined' || typeof document.createElement !== 'function') {
+    throw new Error(
+      'Figure-export WebGL2 rasterization requires the browser document canvas backend.'
+    );
   }
-  if (typeof document !== 'undefined' && document?.createElement) {
-    const c = document.createElement('canvas');
-    c.width = w;
-    c.height = h;
-    return c;
-  }
-  return null;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  return canvas;
 }
 
 /**
- * @param {OffscreenCanvas|HTMLCanvasElement} canvas
- * @returns {WebGL2RenderingContext|null}
+ * @param {HTMLCanvasElement} canvas
+ * @returns {WebGL2RenderingContext}
  */
 function getWebgl2Context(canvas) {
+  let gl;
   try {
-    // preserveDrawingBuffer is important for reliable toBlob/convertToBlob across browsers.
-    return /** @type {WebGL2RenderingContext|null} */ (canvas.getContext('webgl2', {
+    // preserveDrawingBuffer is important for reliable HTMLCanvasElement.toBlob across browsers.
+    gl = canvas.getContext('webgl2', {
       alpha: true,
       antialias: true,
       premultipliedAlpha: false,
       preserveDrawingBuffer: true,
       powerPreference: 'high-performance'
-    }));
-  } catch {
-    return null;
+    });
+  } catch (error) {
+    throw new Error(
+      `Figure-export WebGL2 context creation failed: ${error.message}`,
+      { cause: error }
+    );
   }
+  if (!gl) {
+    throw new Error('Figure export requires WebGL2 rasterization support.');
+  }
+  return gl;
 }
 
 function pickShaderSources(shaderQuality) {
-  const q = String(shaderQuality || 'full');
-  if (q === 'ultralight') {
+  if (shaderQuality === 'ultralight') {
     return { vs: HP_VS_LIGHT, fs: HP_FS_ULTRALIGHT, quality: 'ultralight' };
   }
-  if (q === 'light') {
+  if (shaderQuality === 'light') {
     return { vs: HP_VS_LIGHT, fs: HP_FS_LIGHT, quality: 'light' };
   }
-  return { vs: HP_VS_FULL, fs: HP_FS_FULL, quality: 'full' };
+  if (shaderQuality === 'full') {
+    return { vs: HP_VS_FULL, fs: HP_FS_FULL, quality: 'full' };
+  }
+  throw new RangeError(
+    'Figure-export shaderQuality must be full, light, or ultralight.'
+  );
 }
 
 /**
@@ -248,15 +236,15 @@ function packBuffers({
   highlightArray,
   emphasizeSelection,
   selectionMutedOpacity,
-  alphaThreshold = DEFAULT_ALPHA_THRESHOLD,
+  alphaThreshold,
 }) {
-  const n = Math.min(Math.floor(positions.length / 3), Math.floor(colors.length / 4));
+  const n = positions.length / 3;
   const outColors = new Uint8Array(n * 4);
 
   let minX = Infinity, minY = Infinity, minZ = Infinity;
   let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
 
-  const mutedAlpha = Math.max(0, Math.min(1, Number(selectionMutedOpacity) || 0.15));
+  const mutedAlpha = selectionMutedOpacity;
 
   for (let i = 0; i < n; i++) {
     const pi = i * 3;
@@ -275,14 +263,16 @@ function packBuffers({
     let g = colors[ci + 1];
     let b = colors[ci + 2];
 
-    const baseAlpha = transparency ? (transparency[i] ?? 1.0) : (colors[ci + 3] / 255);
-    let a = Math.max(0, Math.min(1, baseAlpha));
+    const baseAlpha = transparency === null
+      ? colors[ci + 3] / 255
+      : transparency[i];
+    let a = baseAlpha;
 
-    if (visibilityMask && (visibilityMask[i] ?? 0) <= 0) {
+    if (visibilityMask !== null && visibilityMask[i] <= 0) {
       a = 0;
     }
 
-    if (emphasizeSelection && highlightArray && (highlightArray[i] ?? 0) <= 0) {
+    if (emphasizeSelection && highlightArray !== null && highlightArray[i] <= 0) {
       r = 160;
       g = 160;
       b = 160;
@@ -290,7 +280,7 @@ function packBuffers({
     }
 
     if (a < alphaThreshold) a = 0;
-    const ao = Math.max(0, Math.min(255, Math.round(a * 255)));
+    const ao = Math.round(a * 255);
 
     outColors[ci] = r;
     outColors[ci + 1] = g;
@@ -323,7 +313,7 @@ function packBuffers({
  * @param {boolean} [options.emphasizeSelection=false]
  * @param {number} [options.selectionMutedOpacity=0.15]
  * @param {number} [options.alphaThreshold=0.01]
- * @returns {OffscreenCanvas|HTMLCanvasElement|null}
+ * @returns {HTMLCanvasElement}
  */
 export function rasterizePointsWebgl({
   positions,
@@ -340,37 +330,119 @@ export function rasterizePointsWebgl({
   selectionMutedOpacity = 0.15,
   alphaThreshold = DEFAULT_ALPHA_THRESHOLD,
 }) {
-  // ============================================================================
-  // VALIDATION: Check all required data is present
-  // ============================================================================
-  // The WebGL shaders require all three matrices (view, projection, model) because:
-  // - Eye-space position is computed as: viewMatrix * modelMatrix * position
-  // - Clip-space position is computed as: projectionMatrix * eyePos
-  // - Lighting/fog calculations need eye-space distances
-  //
-  // If any data is missing, we return null and the caller falls back to Canvas2D.
-  // This produces flat circles instead of 3D-shaded spheres - a visual downgrade.
-  // ============================================================================
-
-  const missing = [];
-  if (!positions) missing.push('positions');
-  if (!colors) missing.push('colors');
-  if (!renderState) {
-    missing.push('renderState');
-  } else {
-    if (!renderState.viewMatrix) missing.push('viewMatrix');
-    if (!renderState.projectionMatrix) missing.push('projectionMatrix');
-    if (!renderState.modelMatrix) missing.push('modelMatrix');
+  if (!renderState || typeof renderState !== 'object') {
+    throw new TypeError('Figure-export renderState is required.');
   }
-
-  if (missing.length > 0) {
-    // Log a warning (not just debug) so users can diagnose why 3D shading isn't working
-    console.warn(
-      `[FigureExport] WebGL rasterizer skipped - missing: ${missing.join(', ')}. ` +
-      'Export will use flat circles instead of 3D-shaded spheres. ' +
-      'Ensure viewer is fully initialized before exporting.'
+  if (
+    !(positions instanceof Float32Array) ||
+    positions.length === 0 ||
+    positions.length % 3 !== 0
+  ) {
+    throw new TypeError(
+      'Figure-export positions must be a non-empty Float32Array of XYZ triples.'
     );
-    return null;
+  }
+  const pointCount = positions.length / 3;
+  if (!(colors instanceof Uint8Array) || colors.length !== pointCount * 4) {
+    throw new TypeError(
+      'Figure-export colors must be a Uint8Array with exactly four values per point.'
+    );
+  }
+  if (
+    transparency !== null &&
+    (!(transparency instanceof Float32Array) || transparency.length !== pointCount)
+  ) {
+    throw new TypeError(
+      'Figure-export transparency must be null or one Float32 value per point.'
+    );
+  }
+  if (
+    visibilityMask !== null &&
+    !(
+      (visibilityMask instanceof Float32Array || visibilityMask instanceof Uint8Array) &&
+      visibilityMask.length === pointCount
+    )
+  ) {
+    throw new TypeError(
+      'Figure-export visibilityMask must be null or one typed value per point.'
+    );
+  }
+  if (
+    highlightArray !== null &&
+    (!(highlightArray instanceof Uint8Array) || highlightArray.length !== pointCount)
+  ) {
+    throw new TypeError(
+      'Figure-export highlightArray must be null or one Uint8 value per point.'
+    );
+  }
+  for (const key of ['mvpMatrix', 'viewMatrix', 'modelMatrix', 'projectionMatrix']) {
+    if (
+      !(renderState[key] instanceof Float32Array) ||
+      renderState[key].length !== 16
+    ) {
+      throw new TypeError(
+        `Figure-export renderState.${key} must be a 16-value Float32Array.`
+      );
+    }
+  }
+  for (const key of [
+    'fov',
+    'pointSize',
+    'sizeAttenuation',
+    'lightingStrength',
+    'fogDensity'
+  ]) {
+    if (!Number.isFinite(renderState[key])) {
+      throw new TypeError(
+        `Figure-export renderState.${key} must be a finite number.`
+      );
+    }
+  }
+  for (const key of ['viewportWidth', 'viewportHeight']) {
+    if (!Number.isInteger(renderState[key]) || renderState[key] <= 0) {
+      throw new RangeError(
+        `Figure-export renderState.${key} must be a positive integer.`
+      );
+    }
+  }
+  for (const key of ['fogColor', 'lightDir', 'cameraPosition']) {
+    const value = renderState[key];
+    if (
+      !(Array.isArray(value) || value instanceof Float32Array) ||
+      value.length !== 3 ||
+      Array.from(value).some((entry) => !Number.isFinite(entry))
+    ) {
+      throw new TypeError(
+        `Figure-export renderState.${key} must contain exactly three finite numbers.`
+      );
+    }
+  }
+  pickShaderSources(renderState.shaderQuality);
+  for (const [name, value] of [
+    ['outputWidthPx', outputWidthPx],
+    ['outputHeightPx', outputHeightPx]
+  ]) {
+    if (!Number.isInteger(value) || value <= 0) {
+      throw new RangeError(`Figure-export ${name} must be a positive integer.`);
+    }
+  }
+  if (!Number.isFinite(pointSizePx) || pointSizePx <= 0) {
+    throw new RangeError('Figure-export pointSizePx must be a finite positive number.');
+  }
+  if (typeof emphasizeSelection !== 'boolean') {
+    throw new TypeError('Figure-export emphasizeSelection must be a boolean.');
+  }
+  if (
+    !Number.isFinite(selectionMutedOpacity) ||
+    selectionMutedOpacity < 0 ||
+    selectionMutedOpacity > 1
+  ) {
+    throw new RangeError(
+      'Figure-export selectionMutedOpacity must be between 0 and 1.'
+    );
+  }
+  if (!Number.isFinite(alphaThreshold) || alphaThreshold < 0 || alphaThreshold > 1) {
+    throw new RangeError('Figure-export alphaThreshold must be between 0 and 1.');
   }
 
   const packed = packBuffers({
@@ -383,37 +455,10 @@ export function rasterizePointsWebgl({
     selectionMutedOpacity,
     alphaThreshold
   });
-  if (packed.count <= 0) return null;
-
-  const outW = Math.max(1, Math.round(outputWidthPx));
-  const outH = Math.max(1, Math.round(outputHeightPx));
-
-  /** @type {OffscreenCanvas|HTMLCanvasElement|null} */
-  let canvas = createRasterCanvas(outW, outH);
-  if (!canvas) {
-    return null;
-  }
-
-  /** @type {WebGL2RenderingContext|null} */
-  let gl = getWebgl2Context(canvas);
-  if (!gl && typeof OffscreenCanvas !== 'undefined' && canvas instanceof OffscreenCanvas) {
-    // Some browsers expose OffscreenCanvas but only support WebGL2 on HTMLCanvasElement.
-    const fallback = typeof document !== 'undefined' && document?.createElement
-      ? /** @type {HTMLCanvasElement} */ (document.createElement('canvas'))
-      : null;
-    if (fallback) {
-      fallback.width = outW;
-      fallback.height = outH;
-      const gl2 = getWebgl2Context(fallback);
-      if (gl2) {
-        canvas = fallback;
-        gl = gl2;
-      }
-    }
-  }
-  if (!gl) {
-    return null;
-  }
+  const outW = outputWidthPx;
+  const outH = outputHeightPx;
+  const canvas = createRasterCanvas(outW, outH);
+  const gl = getWebgl2Context(canvas);
 
   const { vs, fs, quality } = pickShaderSources(renderState.shaderQuality);
 
@@ -437,6 +482,8 @@ export function rasterizePointsWebgl({
   let dummyAlphaTex = null;
   /** @type {WebGLTexture|null} */
   let dummyLodIndexTex = null;
+  /** @type {Error|null} */
+  let rasterizationError = null;
 
   try {
     program = createProgram(gl, vs, fs);
@@ -451,8 +498,8 @@ export function rasterizePointsWebgl({
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-    const srcViewportW = Math.max(1, Math.round(renderState.viewportWidth || 1));
-    const srcViewportH = Math.max(1, Math.round(renderState.viewportHeight || 1));
+    const srcViewportW = renderState.viewportWidth;
+    const srcViewportH = renderState.viewportHeight;
 
     // Letterbox the on-screen viewport into the export canvas (preserves projection/aspect).
     const s = Math.min(outW / srcViewportW, outH / srcViewportH);
@@ -467,7 +514,7 @@ export function rasterizePointsWebgl({
     positionBuffer = gl.createBuffer();
     colorBuffer = gl.createBuffer();
     if (!positionBuffer || !colorBuffer) {
-      return null;
+      throw new Error('Figure-export point-buffer allocation failed.');
     }
 
     const packedPositions = packed.positions.subarray(0, packed.count * 3);
@@ -494,9 +541,9 @@ export function rasterizePointsWebgl({
     setMat4(u('u_modelMatrix'), renderState.modelMatrix);
     setMat4(u('u_projectionMatrix'), renderState.projectionMatrix);
 
-    const fov = isFiniteNumber(renderState.fov) ? renderState.fov : (45 * Math.PI / 180);
-    const sizeAttenuation = isFiniteNumber(renderState.sizeAttenuation) ? renderState.sizeAttenuation : 0.0;
-    const pointSize = isFiniteNumber(pointSizePx) ? pointSizePx : (isFiniteNumber(renderState.pointSize) ? renderState.pointSize : 5.0);
+    const fov = renderState.fov;
+    const sizeAttenuation = renderState.sizeAttenuation;
+    const pointSize = pointSizePx;
 
     setF1(u('u_pointSize'), pointSize);
     setF1(u('u_sizeAttenuation'), sizeAttenuation);
@@ -527,6 +574,9 @@ export function rasterizePointsWebgl({
     //
     // Unit 0: dummy normalized texture for u_alphaTex (sampler2D)
     dummyAlphaTex = gl.createTexture();
+    if (!dummyAlphaTex) {
+      throw new Error('Figure-export dummy alpha-texture allocation failed.');
+    }
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, dummyAlphaTex);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
@@ -539,6 +589,9 @@ export function rasterizePointsWebgl({
 
     // Unit 1: dummy integer texture for u_lodIndexTex (usampler2D)
     dummyLodIndexTex = gl.createTexture();
+    if (!dummyLodIndexTex) {
+      throw new Error('Figure-export dummy LOD-texture allocation failed.');
+    }
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, dummyLodIndexTex);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
@@ -549,18 +602,18 @@ export function rasterizePointsWebgl({
     const lodIndexTexLoc = u('u_lodIndexTex');
     if (lodIndexTexLoc) gl.uniform1i(lodIndexTexLoc, 1);
 
-    const cameraPosition = Array.isArray(renderState.cameraPosition) ? renderState.cameraPosition : [0, 0, 3];
+    const cameraPosition = renderState.cameraPosition;
     const sphere = boundsToSphere(packed.bounds);
-    const dx = (cameraPosition[0] || 0) - sphere.center[0];
-    const dy = (cameraPosition[1] || 0) - sphere.center[1];
-    const dz = (cameraPosition[2] || 0) - sphere.center[2];
+    const dx = cameraPosition[0] - sphere.center[0];
+    const dy = cameraPosition[1] - sphere.center[1];
+    const dz = cameraPosition[2] - sphere.center[2];
     const distToCenter = Math.sqrt(dx * dx + dy * dy + dz * dz);
     const fogNear = Math.max(0, distToCenter - sphere.radius);
     const fogFar = distToCenter + sphere.radius;
-    const fogDensity = isFiniteNumber(renderState.fogDensity) ? renderState.fogDensity : 0.5;
-    const fogColor = renderState.fogColor || [1, 1, 1];
-    const lightingStrength = isFiniteNumber(renderState.lightingStrength) ? renderState.lightingStrength : 0.6;
-    const lightDir = renderState.lightDir || [0.5, 0.7, 0.5];
+    const fogDensity = renderState.fogDensity;
+    const fogColor = renderState.fogColor;
+    const lightingStrength = renderState.lightingStrength;
+    const lightDir = renderState.lightDir;
 
     if (quality === 'full') {
       setF1(u('u_lightingStrength'), lightingStrength);
@@ -574,7 +627,27 @@ export function rasterizePointsWebgl({
     gl.drawArrays(gl.POINTS, 0, packed.count);
 
     // Optional overlay pass (e.g., centroid points rendered larger on top).
-    if (overlayPoints?.positions && overlayPoints?.colors) {
+    if (overlayPoints !== null) {
+      if (!overlayPoints || typeof overlayPoints !== 'object') {
+        throw new TypeError('Figure-export overlayPoints must be null or an object.');
+      }
+      const overlayCount = overlayPoints.positions?.length / 3;
+      if (
+        !(overlayPoints.positions instanceof Float32Array) ||
+        overlayPoints.positions.length === 0 ||
+        overlayPoints.positions.length % 3 !== 0 ||
+        !(overlayPoints.colors instanceof Uint8Array) ||
+        overlayPoints.colors.length !== overlayCount * 4
+      ) {
+        throw new TypeError(
+          'Figure-export overlayPoints require exact Float32 XYZ and Uint8 RGBA arrays.'
+        );
+      }
+      if (!Number.isFinite(overlayPoints.pointSizePx) || overlayPoints.pointSizePx <= 0) {
+        throw new RangeError(
+          'Figure-export overlayPoints.pointSizePx must be a finite positive number.'
+        );
+      }
       const overlayPacked = packBuffers({
         positions: overlayPoints.positions,
         colors: overlayPoints.colors,
@@ -588,24 +661,22 @@ export function rasterizePointsWebgl({
       if (overlayPacked.count > 0) {
         overlayPosBuffer = gl.createBuffer();
         overlayColorBuffer = gl.createBuffer();
-        if (overlayPosBuffer && overlayColorBuffer) {
-          const overlayPositions = overlayPacked.positions.subarray(0, overlayPacked.count * 3);
-          gl.bindBuffer(gl.ARRAY_BUFFER, overlayPosBuffer);
-          gl.bufferData(gl.ARRAY_BUFFER, overlayPositions, gl.STATIC_DRAW);
-          gl.enableVertexAttribArray(0);
-          gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
-
-          gl.bindBuffer(gl.ARRAY_BUFFER, overlayColorBuffer);
-          gl.bufferData(gl.ARRAY_BUFFER, overlayPacked.colors, gl.STATIC_DRAW);
-          gl.enableVertexAttribArray(1);
-          gl.vertexAttribPointer(1, 4, gl.UNSIGNED_BYTE, true, 0, 0);
-
-          const overlaySize = isFiniteNumber(overlayPoints.pointSizePx)
-            ? overlayPoints.pointSizePx
-            : pointSize;
-          setF1(u('u_pointSize'), overlaySize);
-          gl.drawArrays(gl.POINTS, 0, overlayPacked.count);
+        if (!overlayPosBuffer || !overlayColorBuffer) {
+          throw new Error('Figure-export overlay-buffer allocation failed.');
         }
+        const overlayPositions = overlayPacked.positions.subarray(0, overlayPacked.count * 3);
+        gl.bindBuffer(gl.ARRAY_BUFFER, overlayPosBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, overlayPositions, gl.STATIC_DRAW);
+        gl.enableVertexAttribArray(0);
+        gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, overlayColorBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, overlayPacked.colors, gl.STATIC_DRAW);
+        gl.enableVertexAttribArray(1);
+        gl.vertexAttribPointer(1, 4, gl.UNSIGNED_BYTE, true, 0, 0);
+
+        setF1(u('u_pointSize'), overlayPoints.pointSizePx);
+        gl.drawArrays(gl.POINTS, 0, overlayPacked.count);
       }
     }
 
@@ -624,7 +695,9 @@ export function rasterizePointsWebgl({
 
       highlightPosBuffer = gl.createBuffer();
       highlightColorBuffer = gl.createBuffer();
-      if (!highlightPosBuffer || !highlightColorBuffer) return canvas;
+      if (!highlightPosBuffer || !highlightColorBuffer) {
+        throw new Error('Figure-export highlight-buffer allocation failed.');
+      }
 
       gl.bindBuffer(gl.ARRAY_BUFFER, highlightPosBuffer);
       gl.bufferData(gl.ARRAY_BUFFER, highlightOverlay.positions, gl.STATIC_DRAW);
@@ -651,7 +724,7 @@ export function rasterizePointsWebgl({
       setHF1(hu('u_viewportHeight'), srcViewportH);
       setHF1(hu('u_fov'), fov);
 
-      const style = HIGHLIGHT_STYLE_BY_QUALITY[quality] || HIGHLIGHT_STYLE_BY_QUALITY.full;
+      const style = HIGHLIGHT_STYLE_BY_QUALITY[quality];
       setHF1(hu('u_highlightScale'), style.scale);
       setHV3(hu('u_highlightColor'), DEFAULT_HIGHLIGHT_COLOR);
       setHF1(hu('u_ringWidth'), style.ringWidth);
@@ -675,44 +748,49 @@ export function rasterizePointsWebgl({
     }
 
     gl.flush();
-    return canvas;
-  } catch (err) {
-    console.warn('[FigureExport] WebGL point rasterization failed, falling back to CPU renderer:', err);
-    return null;
-  } finally {
-    // Clean up GPU objects but keep the canvas pixels alive for encode/drawImage.
-    try { gl.bindBuffer(gl.ARRAY_BUFFER, null); } catch {}
-    if (positionBuffer) {
-      try { gl.deleteBuffer(positionBuffer); } catch {}
-    }
-    if (colorBuffer) {
-      try { gl.deleteBuffer(colorBuffer); } catch {}
-    }
-    if (overlayPosBuffer) {
-      try { gl.deleteBuffer(overlayPosBuffer); } catch {}
-    }
-    if (overlayColorBuffer) {
-      try { gl.deleteBuffer(overlayColorBuffer); } catch {}
-    }
-    if (highlightPosBuffer) {
-      try { gl.deleteBuffer(highlightPosBuffer); } catch {}
-    }
-    if (highlightColorBuffer) {
-      try { gl.deleteBuffer(highlightColorBuffer); } catch {}
-    }
-    if (dummyAlphaTex) {
-      try { gl.deleteTexture(dummyAlphaTex); } catch {}
-    }
-    if (dummyLodIndexTex) {
-      try { gl.deleteTexture(dummyLodIndexTex); } catch {}
-    }
-    if (highlightProgram) {
-      try { gl.useProgram(null); } catch {}
-      try { gl.deleteProgram(highlightProgram); } catch {}
-    }
-    if (program) {
-      try { gl.useProgram(null); } catch {}
-      try { gl.deleteProgram(program); } catch {}
-    }
+  } catch (error) {
+    rasterizationError = new Error(
+      `Figure-export WebGL2 point rasterization failed: ${error.message}`,
+      { cause: error }
+    );
   }
+
+  // Clean up every allocated GPU object and report all cleanup failures.
+  /** @type {Error[]} */
+  const cleanupErrors = [];
+  const cleanup = (operation, fn) => {
+    try {
+      fn();
+    } catch (error) {
+      cleanupErrors.push(new Error(
+        `Figure-export WebGL2 cleanup failed during ${operation}: ${error.message}`,
+        { cause: error }
+      ));
+    }
+  };
+  cleanup('array-buffer unbind', () => gl.bindBuffer(gl.ARRAY_BUFFER, null));
+  if (positionBuffer) cleanup('position-buffer deletion', () => gl.deleteBuffer(positionBuffer));
+  if (colorBuffer) cleanup('color-buffer deletion', () => gl.deleteBuffer(colorBuffer));
+  if (overlayPosBuffer) cleanup('overlay-position-buffer deletion', () => gl.deleteBuffer(overlayPosBuffer));
+  if (overlayColorBuffer) cleanup('overlay-color-buffer deletion', () => gl.deleteBuffer(overlayColorBuffer));
+  if (highlightPosBuffer) cleanup('highlight-position-buffer deletion', () => gl.deleteBuffer(highlightPosBuffer));
+  if (highlightColorBuffer) cleanup('highlight-color-buffer deletion', () => gl.deleteBuffer(highlightColorBuffer));
+  if (dummyAlphaTex) cleanup('alpha-texture deletion', () => gl.deleteTexture(dummyAlphaTex));
+  if (dummyLodIndexTex) cleanup('LOD-index-texture deletion', () => gl.deleteTexture(dummyLodIndexTex));
+  cleanup('program unbind', () => gl.useProgram(null));
+  if (highlightProgram) cleanup('highlight-program deletion', () => gl.deleteProgram(highlightProgram));
+  if (program) cleanup('point-program deletion', () => gl.deleteProgram(program));
+
+  const failures = [
+    ...(rasterizationError ? [rasterizationError] : []),
+    ...cleanupErrors,
+  ];
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) {
+    throw new AggregateError(
+      failures,
+      'Figure-export WebGL2 rasterization and cleanup failed.'
+    );
+  }
+  return canvas;
 }

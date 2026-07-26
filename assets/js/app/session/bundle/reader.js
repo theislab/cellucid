@@ -19,12 +19,18 @@ import {
   U32_BYTES,
   bytesToU32LE
 } from './format.js';
+import {
+  assertExactKeys,
+  assertNonEmptyString,
+  assertPlainRecord,
+  assertSafeInteger
+} from '../schema-contract.js';
 
 /**
  * @param {AbortSignal | null | undefined} signal
  */
 function throwIfAborted(signal) {
-  if (signal?.aborted) {
+  if (signal !== null && signal.aborted) {
     throw new DOMException('Aborted', 'AbortError');
   }
 }
@@ -32,13 +38,18 @@ function throwIfAborted(signal) {
 class StreamByteReader {
   /**
    * @param {ReadableStreamDefaultReader<Uint8Array>} reader
-   * @param {{ totalBytes?: number | null, signal?: AbortSignal | null, onProgress?: (loadedBytes: number) => void }} [options]
+   * @param {{ totalBytes: number | null, signal: AbortSignal | null, onProgress: ((loadedBytes: number) => void) | null }} options
    */
-  constructor(reader, options = {}) {
+  constructor(reader, options) {
+    assertExactKeys(
+      options,
+      ['totalBytes', 'signal', 'onProgress'],
+      'Session byte reader options'
+    );
     this._reader = reader;
-    this._signal = options.signal ?? null;
-    this._onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
-    this._totalBytes = typeof options.totalBytes === 'number' ? options.totalBytes : null;
+    this._signal = options.signal;
+    this._onProgress = options.onProgress;
+    this._totalBytes = options.totalBytes;
 
     /** @type {Uint8Array[]} */
     this._queue = [];
@@ -56,18 +67,23 @@ class StreamByteReader {
    * Ensure at least one chunk is available in the queue.
    */
   async _fill() {
-    if (this._queue.length > 0 || this._streamDone) return;
-    throwIfAborted(this._signal);
-    const { value, done } = await this._reader.read();
-    if (done) {
-      this._streamDone = true;
-      return;
+    while (this._queue.length === 0 && !this._streamDone) {
+      throwIfAborted(this._signal);
+      const { value, done } = await this._reader.read();
+      if (done) {
+        this._streamDone = true;
+        return;
+      }
+      if (!(value instanceof Uint8Array)) {
+        throw new TypeError('Session byte stream must yield Uint8Array chunks.');
+      }
+      if (value.byteLength === 0) continue;
+      this._queue.push(value);
+      this._loadedBytes += value.byteLength;
+      if (this._onProgress !== null) {
+        this._onProgress(this._loadedBytes);
+      }
     }
-    const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
-    if (!chunk.byteLength) return;
-    this._queue.push(chunk);
-    this._loadedBytes += chunk.byteLength;
-    this._onProgress?.(this._loadedBytes);
   }
 
   /**
@@ -76,7 +92,7 @@ class StreamByteReader {
    * @returns {Promise<Uint8Array>}
    */
   async readExactly(n) {
-    if (!Number.isFinite(n) || n < 0) {
+    if (!Number.isSafeInteger(n) || n < 0) {
       throw new Error(`readExactly: invalid byte count ${n}`);
     }
     throwIfAborted(this._signal);
@@ -127,6 +143,19 @@ class StreamByteReader {
     const bytes = await this.readExactly(U32_BYTES);
     return bytesToU32LE(bytes);
   }
+
+  async assertEnd() {
+    await this._fill();
+    if (this._queue.length !== 0) {
+      throw new Error('Invalid session file: trailing bytes after declared chunks.');
+    }
+    if (!this._streamDone) {
+      throw new Error('Invalid session file: byte stream did not reach its exact end.');
+    }
+    if (this._totalBytes !== null && this._position !== this._totalBytes) {
+      throw new Error('Invalid session file: consumed byte count does not match file size.');
+    }
+  }
 }
 
 /**
@@ -140,28 +169,59 @@ class StreamByteReader {
  * Read a session bundle and return its manifest plus a streaming chunk iterator.
  *
  * @param {Blob|ReadableStream<Uint8Array>} source
- * @param {{ signal?: AbortSignal | null, onProgress?: (loadedBytes: number) => void }} [options]
+ * @param {{ signal: AbortSignal | null, onProgress: ((loadedBytes: number) => void) | null }} options
  * @returns {Promise<{ manifest: any, totalBytes: number|null, chunkStream: AsyncGenerator<BundleChunkRead, void, void> }>}
  */
-export async function readBundle(source, options = {}) {
-  const signal = options.signal ?? null;
+export async function readBundle(source, options) {
+  assertExactKeys(
+    options,
+    ['signal', 'onProgress'],
+    'Session bundle reader options'
+  );
+  const signal = options.signal;
   throwIfAborted(signal);
 
-  const totalBytes = typeof source?.size === 'number' ? source.size : null;
-  const stream =
-    typeof source?.stream === 'function'
-      ? source.stream()
-      : source;
+  let totalBytes = null;
+  let stream = null;
+  if (source !== null && typeof source === 'object' && typeof source.stream === 'function') {
+    stream = source.stream();
+    if (typeof source.size === 'number') {
+      totalBytes = assertSafeInteger(
+        source.size,
+        'Session bundle source size',
+        { maximum: Number.MAX_SAFE_INTEGER },
+      );
+    }
+  } else if (source !== null && typeof source === 'object' && typeof source.getReader === 'function') {
+    stream = source;
+  }
 
-  if (!stream || typeof stream.getReader !== 'function') {
-    throw new Error('readBundle: expected a Blob/File or ReadableStream<Uint8Array>.');
+  if (
+    stream === null
+    || typeof stream !== 'object'
+    || typeof stream.getReader !== 'function'
+  ) {
+    throw new TypeError('readBundle: expected a Blob/File or ReadableStream<Uint8Array>.');
+  }
+  if (
+    signal !== null
+    && (
+      typeof signal !== 'object'
+      || typeof signal.aborted !== 'boolean'
+    )
+  ) {
+    throw new TypeError('readBundle: signal must be an AbortSignal or null.');
+  }
+  const onProgress = options.onProgress;
+  if (onProgress !== null && typeof onProgress !== 'function') {
+    throw new TypeError('readBundle: onProgress must be a function or null.');
   }
 
   const reader = stream.getReader();
   const byteReader = new StreamByteReader(reader, {
     totalBytes,
     signal,
-    onProgress: options.onProgress
+    onProgress
   });
 
   // 1) MAGIC
@@ -180,12 +240,15 @@ export async function readBundle(source, options = {}) {
 
   // 3) Manifest bytes
   const manifestBytes = await byteReader.readExactly(manifestByteLength);
-  let manifest = null;
+  let manifest;
   try {
-    manifest = JSON.parse(new TextDecoder().decode(manifestBytes));
-  } catch (err) {
-    console.warn('[SessionBundle] Failed to parse manifest JSON:', err);
-    throw new Error('Invalid session file (manifest JSON parse failed).');
+    manifest = JSON.parse(
+      new TextDecoder('utf-8', { fatal: true }).decode(manifestBytes),
+    );
+  } catch (error) {
+    throw new Error('Invalid session file (manifest JSON parse failed).', {
+      cause: error,
+    });
   }
 
   if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
@@ -199,19 +262,27 @@ export async function readBundle(source, options = {}) {
     for (let i = 0; i < manifest.chunks.length; i++) {
       throwIfAborted(signal);
       const meta = manifest.chunks[i];
+      assertPlainRecord(meta, `Session manifest chunk ${i}`);
+      const metaId = assertNonEmptyString(
+        meta.id,
+        `Session manifest chunk ${i} id`,
+      );
       const chunkByteLength = await byteReader.readU32LE();
 
       // Absolute size guard to avoid pathological allocations on corrupt input.
       if (chunkByteLength > MAX_STORED_CHUNK_BYTES) {
         throw new Error(
-          `Invalid chunk length for ${meta?.id || `#${i}`}: ${chunkByteLength} exceeds limit (${MAX_STORED_CHUNK_BYTES} bytes).`
+          `Invalid chunk length for ${metaId}: ${chunkByteLength} exceeds limit (${MAX_STORED_CHUNK_BYTES} bytes).`
         );
       }
 
-      // Validate storedBytes when present (redundant but useful for sanity).
-      const storedBytes = meta?.storedBytes;
-      if (typeof storedBytes === 'number' && storedBytes !== chunkByteLength) {
-        throw new Error(`Chunk length mismatch for ${meta?.id || `#${i}`}: header=${chunkByteLength}, manifest=${storedBytes}`);
+      const storedBytes = assertSafeInteger(
+        meta.storedBytes,
+        `Session manifest chunk "${metaId}" storedBytes`,
+        { maximum: MAX_STORED_CHUNK_BYTES },
+      );
+      if (storedBytes !== chunkByteLength) {
+        throw new Error(`Chunk length mismatch for ${metaId}: header=${chunkByteLength}, manifest=${storedBytes}`);
       }
 
       // Bounds check against total file size (prevents "length says 2GB" on short files).
@@ -219,7 +290,7 @@ export async function readBundle(source, options = {}) {
         const remaining = byteReader.totalBytes - byteReader.position;
         if (chunkByteLength > remaining) {
           throw new Error(
-            `Invalid chunk length for ${meta?.id || `#${i}`}: ${chunkByteLength} > remaining ${remaining} (session file truncated?)`
+            `Invalid chunk length for ${metaId}: ${chunkByteLength} > remaining ${remaining} (session file truncated?)`
           );
         }
       }
@@ -227,6 +298,7 @@ export async function readBundle(source, options = {}) {
       const bytes = await byteReader.readExactly(chunkByteLength);
       yield { index: i, meta, bytes };
     }
+    await byteReader.assertEnd();
   }
 
   return { manifest, totalBytes, chunkStream: chunkStream() };

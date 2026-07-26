@@ -152,6 +152,18 @@
   background: var(--color-border-light);
 }
 
+[data-theme="dark"] .sidebar-brand {
+  background: var(--white);
+}
+
+[data-theme="dark"] .sidebar-brand-link:hover {
+  background: var(--gray-100);
+}
+
+[data-theme="dark"] .sidebar-brand-link:active {
+  background: var(--gray-200);
+}
+
 .sidebar-brand-link:focus-visible {
   outline: 2px solid var(--color-border-focus);
   outline-offset: 2px;

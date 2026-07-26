@@ -5,17 +5,15 @@
  * to work with different data backends (local demo, user directory, remote server, Jupyter).
  */
 
-import { ExportsBridgeClient } from './exports-bridge-client.js';
-
 /**
  * @typedef {Object} DatasetStats
  * @property {number} n_cells - Number of cells/points
- * @property {number} [n_genes] - Number of genes (if available)
- * @property {number} [n_obs_fields] - Number of observation fields
- * @property {number} [n_categorical_fields] - Number of categorical fields
- * @property {number} [n_continuous_fields] - Number of continuous fields
- * @property {boolean} [has_connectivity] - Whether KNN data exists
- * @property {number} [n_edges] - Number of edges (if connectivity exists)
+ * @property {number} n_genes - Number of genes
+ * @property {number} n_obs_fields - Number of observation fields
+ * @property {number} n_categorical_fields - Number of categorical fields
+ * @property {number} n_continuous_fields - Number of continuous fields
+ * @property {boolean} has_connectivity - Whether KNN data exists
+ * @property {number|null} n_edges - Edge count, or null without connectivity
  */
 
 /**
@@ -42,13 +40,15 @@ import { ExportsBridgeClient } from './exports-bridge-client.js';
 
 /**
  * @typedef {Object} DatasetMetadata
+ * @property {number} version - Exact dataset identity version
  * @property {string} id - Unique identifier (directory name)
  * @property {string} name - Human-readable display name
- * @property {string} [description] - Optional description
+ * @property {string} description - Description (may be empty)
  * @property {string} [created_at] - ISO timestamp of export
- * @property {string} [cellucid_data_version] - Version of cellucid-data used
+ * @property {string} cellucid_data_version - Version of cellucid-data used
  * @property {DatasetStats} stats - Dataset statistics
- * @property {DatasetObsField[]} [obs_fields] - List of observation fields
+ * @property {Object} embeddings - Exact available/default embedding metadata
+ * @property {DatasetObsField[]} obs_fields - List of observation fields
  * @property {DatasetExportSettings} [export_settings] - Export configuration
  * @property {DatasetSource} [source] - Data source information
  */
@@ -56,39 +56,154 @@ import { ExportsBridgeClient } from './exports-bridge-client.js';
 /**
  * Configuration constants for data loading
  */
-function getExportsBaseUrl() {
-  // Allow quick overrides without rebuilding (useful for testing new dataset hosts).
-  try {
-    const search = (typeof window !== 'undefined' && window.location && window.location.search) ? window.location.search : '';
-    const params = new URLSearchParams(search);
-    const fromQuery = (params.get('exportsBaseUrl') || params.get('exports') || '').trim();
-    if (fromQuery) return fromQuery.endsWith('/') ? fromQuery : fromQuery + '/';
-  } catch {
-    // ignore
-  }
+const EXPORTS_QUERY_KEY = 'exportsBaseUrl';
+const EXPORTS_META_SELECTOR =
+  'meta[name="cellucid-exports-base-url"]';
 
-  // Read from <meta name="cellucid-exports-base-url" content="..."> in index.html.
-  try {
-    if (typeof document === 'undefined') throw new Error('no document');
-    const meta = document.querySelector('meta[name="cellucid-exports-base-url"]');
-    const content = (meta?.getAttribute('content') || '').trim();
-    if (content) return content.endsWith('/') ? content : content + '/';
-  } catch {
-    // ignore
-  }
-
-  // No fallback: demo exports live outside the app repo (see `cellucid-datasets`).
-  // If this is null, `local-demo` is treated as unavailable.
-  return null;
+function exportsConfigurationError(message) {
+  const error = new Error(`Sample dataset configuration: ${message}`);
+  error.name = 'ConfigurationError';
+  return error;
 }
+
+function requireCanonicalPathSegments(
+  pathname,
+  owner,
+  createError = message => new TypeError(message)
+) {
+  const segments = pathname.split('/').slice(1);
+  if (segments.at(-1) === '') segments.pop();
+  for (const segment of segments) {
+    let decoded;
+    try {
+      decoded = decodeURIComponent(segment);
+    } catch {
+      throw createError(
+        `${owner} contains invalid percent encoding`
+      );
+    }
+    if (
+      segment.length === 0 ||
+      decoded === '.' ||
+      decoded === '..' ||
+      decoded.includes('/') ||
+      decoded.includes('\\') ||
+      /[\u0000-\u001f\u007f]/.test(decoded) ||
+      encodeURIComponent(decoded) !== segment
+    ) {
+      throw createError(
+        `${owner} contains a non-canonical path segment`
+      );
+    }
+  }
+}
+
+function validateExportsBaseUrl(value, owner) {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value !== value.trim()
+  ) {
+    throw exportsConfigurationError(
+      `${owner} must contain one exact non-empty URL`
+    );
+  }
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw exportsConfigurationError(
+      `${owner} must be an absolute HTTP(S) URL`
+    );
+  }
+  if (
+    (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') ||
+    parsed.username !== '' ||
+    parsed.password !== '' ||
+    parsed.search !== '' ||
+    parsed.hash !== '' ||
+    !parsed.pathname.endsWith('/') ||
+    parsed.href !== value
+  ) {
+    throw exportsConfigurationError(
+      `${owner} must be one canonical HTTP(S) directory URL with a trailing /`
+    );
+  }
+  requireCanonicalPathSegments(
+    parsed.pathname,
+    owner,
+    exportsConfigurationError
+  );
+  return parsed.href;
+}
+
+function readExportsConfiguration() {
+  if (
+    typeof window === 'undefined' ||
+    typeof window.location?.href !== 'string'
+  ) {
+    return { baseUrl: null, error: null };
+  }
+  try {
+    const pageUrl = new URL(window.location.href);
+    const queryValues =
+      pageUrl.searchParams.getAll(EXPORTS_QUERY_KEY);
+    if (queryValues.length > 1) {
+      throw exportsConfigurationError(
+        `exactly one '${EXPORTS_QUERY_KEY}' query field is allowed`
+      );
+    }
+    if (queryValues.length === 1) {
+      return {
+        baseUrl: validateExportsBaseUrl(
+          queryValues[0],
+          EXPORTS_QUERY_KEY
+        ),
+        error: null,
+      };
+    }
+
+    if (typeof document === 'undefined') {
+      return { baseUrl: null, error: null };
+    }
+    const metas = document.querySelectorAll(EXPORTS_META_SELECTOR);
+    if (metas.length > 1) {
+      throw exportsConfigurationError(
+        'exactly one cellucid-exports-base-url meta element is allowed'
+      );
+    }
+    if (metas.length === 0) {
+      return { baseUrl: null, error: null };
+    }
+    const content = metas[0].getAttribute('content');
+    return {
+      baseUrl: validateExportsBaseUrl(
+        content,
+        'cellucid-exports-base-url meta content'
+      ),
+      error: null,
+    };
+  } catch (error) {
+    return {
+      baseUrl: null,
+      error: error instanceof Error
+        ? error
+        : exportsConfigurationError(String(error)),
+    };
+  }
+}
+
+const exportsConfiguration = readExportsConfiguration();
 
 export const DATA_CONFIG = {
   // Base paths
-  EXPORTS_BASE_URL: getExportsBaseUrl(),
+  EXPORTS_BASE_URL: exportsConfiguration.baseUrl,
+  EXPORTS_CONFIGURATION_ERROR: exportsConfiguration.error,
   DATASETS_MANIFEST: 'datasets.json',
 
   // Required files for a valid dataset
   REQUIRED_FILES: [
+    'dataset_identity.json',
     'obs_manifest.json'
   ],
 
@@ -104,233 +219,209 @@ export const DATA_CONFIG = {
 };
 
 // ============================================================================
-// EXPORTS (cellucid-datasets) CORS-FREE FETCH BRIDGE
+// SAMPLE EXPORT TRANSPORT
 // ============================================================================
 
-/**
- * GitHub Pages typically cannot be configured with CORS headers.
- * To keep the Cellucid web app (`https://www.cellucid.com`) able to load public
- * demo exports from a separate origin (e.g. `https://<user>.github.io/...`),
- * we use a tiny iframe bridge page hosted alongside `exports/` that performs
- * same-origin fetches and returns bytes via postMessage.
- *
- * The bridge lives at `../bridge.html` relative to `EXPORTS_BASE_URL`.
- * See `cellucid-datasets/bridge.html`.
- */
-
-const EXPORTS_FETCH_MODE = {
-  AUTO: 'auto',
-  DIRECT: 'direct',
-  BRIDGE: 'bridge',
-};
-
-let _exportsFetchMode = EXPORTS_FETCH_MODE.AUTO;
-let _exportsBridgeClient = null;
+const REQUEST_METHODS = new Set(['GET', 'HEAD']);
+const REQUEST_CACHES = new Set([
+  'default',
+  'no-store',
+  'reload',
+  'no-cache',
+  'force-cache',
+]);
+const HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9a-z]+$/;
+const SAMPLE_CORS_TRANSPORT = Object.freeze({
+  credentials: 'omit',
+  mode: 'cors',
+  redirect: 'error',
+});
 
 function getAbsoluteUrl(url) {
-  try {
-    return new URL(String(url), window.location.href).toString();
-  } catch {
-    return String(url);
+  if (typeof url !== 'string' || url.length === 0) {
+    throw new TypeError('Fetch URL must be a non-empty string.');
   }
+  const documentUrl =
+    typeof globalThis.window?.location?.href === 'string'
+      ? globalThis.window.location.href
+      : undefined;
+  return documentUrl === undefined
+    ? new URL(url).href
+    : new URL(url, documentUrl).href;
 }
 
 function getAbsoluteExportsBaseUrl() {
   const base = DATA_CONFIG.EXPORTS_BASE_URL;
-  if (!base) return null;
+  if (base === null) return null;
+  validateExportsBaseUrl(base, 'DATA_CONFIG.EXPORTS_BASE_URL');
   return getAbsoluteUrl(base);
-}
-
-function getExportsBridgeUrl() {
-  const exportsBase = getAbsoluteExportsBaseUrl();
-  if (!exportsBase) return null;
-  try {
-    return new URL('../bridge.html', exportsBase).toString();
-  } catch {
-    return null;
-  }
-}
-
-function exportsHostLikelyNoCors() {
-  const exportsBase = getAbsoluteExportsBaseUrl();
-  if (!exportsBase) return false;
-  try {
-    const host = new URL(exportsBase).hostname || '';
-    // GitHub Pages does not allow configuring CORS headers, so direct fetches
-    // from `https://www.cellucid.com` will fail. Use the bridge immediately.
-    return /\.github\.io$/i.test(host);
-  } catch {
-    return false;
-  }
 }
 
 function isExportsUrl(url) {
   const exportsBase = getAbsoluteExportsBaseUrl();
   if (!exportsBase) return false;
-  const abs = getAbsoluteUrl(url);
-  return abs.startsWith(exportsBase);
+  const target = new URL(getAbsoluteUrl(url));
+  const root = new URL(exportsBase);
+  return (
+    target.origin === root.origin &&
+    target.search === '' &&
+    target.hash === '' &&
+    target.pathname.startsWith(root.pathname) &&
+    target.pathname !== root.pathname
+  );
 }
 
-function isCrossOrigin(url) {
-  try {
-    return new URL(url, window.location.href).origin !== window.location.origin;
-  } catch {
-    return false;
+function requireCanonicalExportsFileUrl(originalUrl, absoluteUrl) {
+  if (originalUrl !== absoluteUrl) {
+    throw new TypeError(
+      'Sample request URL must be one canonical absolute URL.'
+    );
   }
+  const exportsBase = getAbsoluteExportsBaseUrl();
+  if (exportsBase === null) {
+    throw new Error('Sample exports root is not configured.');
+  }
+  const target = new URL(absoluteUrl);
+  const root = new URL(exportsBase);
+  if (
+    target.origin !== root.origin ||
+    target.search !== '' ||
+    target.hash !== '' ||
+    !target.pathname.startsWith(root.pathname) ||
+    target.pathname === root.pathname
+  ) {
+    throw new TypeError(
+      'Sample request URL must identify one file below the exact exports root.'
+    );
+  }
+  const relativePath =
+    target.pathname.slice(root.pathname.length);
+  requireCanonicalPathSegments(
+    `/${relativePath}`,
+    'Sample request URL'
+  );
+  return absoluteUrl;
 }
 
-function normalizeBridgeInit(init) {
-  const normalized = {};
-  if (!init || typeof init !== 'object') return normalized;
+function validateExportsRequestOptions(init) {
+  if (
+    init !== undefined &&
+    (
+      init === null ||
+      typeof init !== 'object' ||
+      Array.isArray(init)
+    )
+  ) {
+    throw new TypeError(
+      'Sample request options must be an object when provided.'
+    );
+  }
+  const value = init ?? {};
+  const allowedKeys = new Set([
+    'method',
+    'cache',
+    'headers',
+    'signal',
+  ]);
+  const unsupported = Object.keys(value).filter(
+    key => !allowedKeys.has(key)
+  );
+  if (unsupported.length > 0) {
+    throw new TypeError(
+      `Sample request contains unsupported option(s): ${unsupported.join(', ')}`
+    );
+  }
+  const method = Object.hasOwn(value, 'method')
+    ? value.method
+    : 'GET';
+  const cache = Object.hasOwn(value, 'cache')
+    ? value.cache
+    : 'default';
+  const signal = Object.hasOwn(value, 'signal')
+    ? value.signal
+    : null;
+  if (!REQUEST_METHODS.has(method)) {
+    throw new TypeError(
+      'Sample request method must be exactly GET or HEAD.'
+    );
+  }
+  if (!REQUEST_CACHES.has(cache)) {
+    throw new TypeError(
+      'Sample request cache mode is unsupported.'
+    );
+  }
+  if (
+    signal !== null &&
+    !(signal instanceof AbortSignal)
+  ) {
+    throw new TypeError(
+      'Sample request signal must be an AbortSignal or null.'
+    );
+  }
 
-  if (typeof init.method === 'string') normalized.method = init.method;
-  if (typeof init.cache === 'string') normalized.cache = init.cache;
-
-  // Normalize headers into a plain object of string->string.
-  try {
-    const headersOut = {};
-    const headersIn = init.headers;
-
-    if (headersIn && typeof Headers !== 'undefined' && headersIn instanceof Headers) {
-      for (const [k, v] of headersIn.entries()) {
-        if (typeof k === 'string' && typeof v === 'string') headersOut[k] = v;
-      }
-    } else if (Array.isArray(headersIn)) {
-      for (const pair of headersIn) {
-        if (!Array.isArray(pair) || pair.length !== 2) continue;
-        const [k, v] = pair;
-        if (typeof k === 'string' && typeof v === 'string') headersOut[k] = v;
-      }
-    } else if (headersIn && typeof headersIn === 'object') {
-      for (const [k, v] of Object.entries(headersIn)) {
-        if (typeof k === 'string' && typeof v === 'string') headersOut[k] = v;
-      }
+  const headersValue = Object.hasOwn(value, 'headers')
+    ? value.headers
+    : {};
+  if (
+    headersValue === null ||
+    typeof headersValue !== 'object' ||
+    Array.isArray(headersValue) ||
+    Object.getPrototypeOf(headersValue) !== Object.prototype
+  ) {
+    throw new TypeError(
+      'Sample request headers must be a plain object.'
+    );
+  }
+  const headers = Object.entries(headersValue)
+    .sort(([left], [right]) => left.localeCompare(right));
+  let previous = null;
+  for (const [name, headerValue] of headers) {
+    if (
+      name !== name.toLowerCase() ||
+      !HEADER_NAME.test(name) ||
+      previous === name ||
+      typeof headerValue !== 'string' ||
+      /[\r\n\u0000]/.test(headerValue)
+    ) {
+      throw new TypeError(
+        'Sample request headers require unique lowercase names and string values.'
+      );
     }
-
-    if (Object.keys(headersOut).length) normalized.headers = headersOut;
-  } catch {
-    // ignore
+    previous = name;
   }
-
-  return normalized;
-}
-
-function getExportsBridgeClient() {
-  if (_exportsBridgeClient) return _exportsBridgeClient;
-
-  const bridgeUrl = getExportsBridgeUrl();
-  if (!bridgeUrl) return null;
-
-  _exportsBridgeClient = new ExportsBridgeClient({ bridgeUrl });
-  return _exportsBridgeClient;
-}
-
-function prewarmExportsBridgeIfNeeded() {
-  try {
-    // For GitHub Pages demo exports (no CORS), warming the bridge early reduces the
-    // perceived "first demo load" latency (bridge.html + bridge.js need to load once).
-    if (!exportsHostLikelyNoCors()) return;
-    const exportsBase = getAbsoluteExportsBaseUrl();
-    if (!exportsBase) return;
-    if (!isCrossOrigin(exportsBase)) return;
-
-    const client = getExportsBridgeClient();
-    if (!client) return;
-    client.ensureReady().catch(() => {});
-  } catch {
-    // ignore
-  }
-}
-
-try {
-  setTimeout(prewarmExportsBridgeIfNeeded, 0);
-} catch {
-  // ignore
-}
-
-function responseFromBridgeMessage(msg, urlForError) {
-  if (!msg || typeof msg !== 'object') {
-    throw new Error(`Datasets bridge error: invalid response (${urlForError || 'request'})`);
-  }
-  if (msg.status === 0 && !msg.ok) {
-    throw new Error(`Datasets bridge network error: ${msg.error || 'unknown error'} (${urlForError || 'request'})`);
-  }
-
-  const headers = new Headers();
-  if (typeof msg.contentType === 'string' && msg.contentType) headers.set('content-type', msg.contentType);
-  if (typeof msg.contentLength === 'string' && msg.contentLength) headers.set('content-length', msg.contentLength);
-
-  const body = msg.body instanceof ArrayBuffer ? msg.body : new ArrayBuffer(0);
-  return new Response(body, {
-    status: typeof msg.status === 'number' ? msg.status : 200,
-    statusText: typeof msg.statusText === 'string' ? msg.statusText : '',
+  return Object.freeze({
+    method,
+    cache,
     headers,
+    signal,
   });
 }
 
 /**
- * Fetch a URL, using the datasets bridge automatically for cross-origin demo exports.
- *
- * For non-exports URLs, this is a thin wrapper around `fetch()`.
+ * Fetch one data artifact. Files owned by the configured sample root use its
+ * single current public transport: direct HTTP with browser CORS enforcement.
+ * Other data sources retain the caller-provided HTTP transport options.
  *
  * @param {string} url
  * @param {RequestInit} [init]
  * @returns {Promise<Response>}
  */
-export async function fetchWithExportsBridge(url, init) {
+export async function fetchSampleArtifact(url, init) {
   const absUrl = getAbsoluteUrl(url);
 
-  // Not a demo-exports URL: normal fetch.
   if (!isExportsUrl(absUrl)) {
     return fetch(absUrl, init);
   }
 
-  // Same-origin exports (e.g., if you deploy exports under www.cellucid.com): normal fetch.
-  if (!isCrossOrigin(absUrl)) {
-    _exportsFetchMode = EXPORTS_FETCH_MODE.DIRECT;
-    return fetch(absUrl, init);
-  }
-
-  // Cross-origin exports: prefer direct fetch if CORS works, else fall back to the bridge.
-  if (_exportsFetchMode === EXPORTS_FETCH_MODE.AUTO && exportsHostLikelyNoCors()) {
-    _exportsFetchMode = EXPORTS_FETCH_MODE.BRIDGE;
-  }
-
-  if (_exportsFetchMode === EXPORTS_FETCH_MODE.DIRECT) {
-    return fetch(absUrl, init);
-  }
-
-  if (_exportsFetchMode === EXPORTS_FETCH_MODE.BRIDGE) {
-    const client = getExportsBridgeClient();
-    if (!client) {
-      throw new Error('Demo exports are cross-origin but the datasets bridge URL could not be constructed.');
-    }
-    const msg = await client.fetch(absUrl, normalizeBridgeInit(init), 'arrayBuffer');
-    return responseFromBridgeMessage(msg, absUrl);
-  }
-
-  // AUTO
-  try {
-    const response = await fetch(absUrl, init);
-    _exportsFetchMode = EXPORTS_FETCH_MODE.DIRECT;
-    return response;
-  } catch (directErr) {
-    const client = getExportsBridgeClient();
-    if (!client) throw directErr;
-
-    try {
-      const msg = await client.fetch(absUrl, normalizeBridgeInit(init), 'arrayBuffer');
-      _exportsFetchMode = EXPORTS_FETCH_MODE.BRIDGE;
-      return responseFromBridgeMessage(msg, absUrl);
-    } catch (bridgeErr) {
-      const hint =
-        `Failed to fetch demo exports from a different origin. ` +
-        `If you are using GitHub Pages, ensure the datasets repo is published and includes \`bridge.html\` + \`bridge.js\`.`;
-      const err = new Error(`${hint}\nDirect fetch error: ${directErr?.message || directErr}\nBridge error: ${bridgeErr?.message || bridgeErr}`);
-      err.cause = bridgeErr;
-      throw err;
-    }
-  }
+  requireCanonicalExportsFileUrl(url, absUrl);
+  const request = validateExportsRequestOptions(init);
+  return fetch(absUrl, {
+    ...SAMPLE_CORS_TRANSPORT,
+    method: request.method,
+    cache: request.cache,
+    headers: request.headers,
+    signal: request.signal,
+  });
 }
 
 /**
@@ -365,6 +456,7 @@ export function validateSchemaVersion(version, supportedVersions, context) {
  */
 export const DataSourceErrorCode = {
   NOT_FOUND: 'NOT_FOUND',
+  FILE_NOT_FOUND: 'FILE_NOT_FOUND',
   INVALID_FORMAT: 'INVALID_FORMAT',
   PERMISSION_DENIED: 'PERMISSION_DENIED',
   NETWORK_ERROR: 'NETWORK_ERROR',
@@ -377,6 +469,7 @@ export const DataSourceErrorCode = {
  */
 export const ERROR_MESSAGES = {
   [DataSourceErrorCode.NOT_FOUND]: 'Dataset not found. Check that the directory exists.',
+  [DataSourceErrorCode.FILE_NOT_FOUND]: 'Dataset file not found.',
   [DataSourceErrorCode.INVALID_FORMAT]: 'Invalid dataset format. Missing required files.',
   [DataSourceErrorCode.PERMISSION_DENIED]: 'Cannot access directory. Please grant permission.',
   [DataSourceErrorCode.NETWORK_ERROR]: 'Failed to load dataset. Check your connection.',
@@ -418,14 +511,22 @@ export class DataSourceError extends Error {
  * @returns {string} Resolved absolute URL
  */
 export function resolveUrl(base, relative) {
-  try {
-    const baseUrl = base ? new URL(base, window.location.href) : new URL(window.location.href);
-    return new URL(relative, baseUrl).toString();
-  } catch (_err) {
-    // Fallback for simple path joining
-    const baseClean = base.endsWith('/') ? base : base + '/';
-    return baseClean + relative;
+  if (typeof base !== 'string' || base.length === 0) {
+    throw new TypeError('URL base must be a non-empty string');
   }
+  if (typeof relative !== 'string' || relative.length === 0) {
+    throw new TypeError('URL relative path must be a non-empty string');
+  }
+
+  const documentUrl = (
+    typeof globalThis.window?.location?.href === 'string'
+  )
+    ? globalThis.window.location.href
+    : undefined;
+  const baseUrl = documentUrl === undefined
+    ? new URL(base)
+    : new URL(base, documentUrl);
+  return new URL(relative, baseUrl).toString();
 }
 
 /**
@@ -434,27 +535,11 @@ export function resolveUrl(base, relative) {
  * @returns {Promise<boolean>}
  */
 export async function urlExists(url) {
-  try {
-    const response = await fetchWithExportsBridge(url, { method: 'HEAD' });
-    if (response.ok) return true;
-    // Some servers don't support HEAD, try GET with minimal data transfer
-    if (response.status === 405 || response.status === 501) {
-      // Use Range header to request only 1 byte, and abort after headers received
-      // fetch() resolves once headers arrive, so we can check status then abort to skip body
-      const controller = new AbortController();
-      const getResponse = await fetchWithExportsBridge(url, {
-        headers: { 'Range': 'bytes=0-0' },
-        signal: controller.signal
-      });
-      const exists = getResponse.ok || getResponse.status === 206;
-      // Abort to prevent downloading body data (we only needed headers)
-      controller.abort();
-      return exists;
-    }
-    return false;
-  } catch (_err) {
-    return false;
-  }
+  const response = await fetchSampleArtifact(
+    url,
+    { method: 'HEAD' }
+  );
+  return response.ok;
 }
 
 /**
@@ -465,7 +550,7 @@ export async function urlExists(url) {
  */
 export async function fetchJson(url, sourceType) {
   try {
-    const response = await fetchWithExportsBridge(url);
+    const response = await fetchSampleArtifact(url);
     if (!response.ok) {
       if (response.status === 404) {
         throw new DataSourceError(
@@ -556,8 +641,539 @@ export async function validateDatasetStructure(baseUrl, _sourceType) {
   };
 }
 
+function invalidDatasetIdentity(message, sourceType, details = {}) {
+  return new DataSourceError(
+    `Invalid dataset_identity.json: ${message}`,
+    DataSourceErrorCode.INVALID_FORMAT,
+    sourceType,
+    details
+  );
+}
+
+function isPlainRecord(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function assertExactKeys(value, required, optional, label, sourceType) {
+  if (!isPlainRecord(value)) {
+    throw invalidDatasetIdentity(
+      `${label} must be an object`,
+      sourceType,
+      { label, value }
+    );
+  }
+
+  for (const key of required) {
+    if (!Object.hasOwn(value, key)) {
+      throw invalidDatasetIdentity(
+        `${label} is missing required field '${key}'`,
+        sourceType,
+        { label, key }
+      );
+    }
+  }
+
+  const allowed = new Set([...required, ...optional]);
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) {
+      throw invalidDatasetIdentity(
+        `${label} contains unsupported field '${key}'`,
+        sourceType,
+        { label, key }
+      );
+    }
+  }
+}
+
+function requireNonEmptyString(value, label, sourceType) {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw invalidDatasetIdentity(
+      `${label} must be a non-empty string`,
+      sourceType,
+      { label, value }
+    );
+  }
+}
+
+function requireCount(value, label, sourceType) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw invalidDatasetIdentity(
+      `${label} must be a non-negative safe integer`,
+      sourceType,
+      { label, value }
+    );
+  }
+}
+
+function requireIdentityPayloadPath(value, label, sourceType) {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value !== value.trim() ||
+    value.startsWith('/') ||
+    value.includes('\\') ||
+    /^[A-Za-z]:/.test(value) ||
+    value.split('/').some(part => part === '' || part === '.' || part === '..')
+  ) {
+    throw invalidDatasetIdentity(
+      `${label} must be a safe relative file path`,
+      sourceType,
+      { label, value }
+    );
+  }
+}
+
+function validateIdentityStats(stats, sourceType) {
+  const countKeys = [
+    'n_cells',
+    'n_genes',
+    'n_obs_fields',
+    'n_categorical_fields',
+    'n_continuous_fields',
+  ];
+  assertExactKeys(
+    stats,
+    [...countKeys, 'has_connectivity', 'n_edges'],
+    [],
+    'stats',
+    sourceType
+  );
+  for (const key of countKeys) {
+    requireCount(stats[key], `stats.${key}`, sourceType);
+  }
+  if (
+    stats.n_obs_fields !==
+    stats.n_categorical_fields + stats.n_continuous_fields
+  ) {
+    throw invalidDatasetIdentity(
+      'stats.n_obs_fields must equal categorical plus continuous fields',
+      sourceType,
+      {
+        n_obs_fields: stats.n_obs_fields,
+        n_categorical_fields: stats.n_categorical_fields,
+        n_continuous_fields: stats.n_continuous_fields,
+      }
+    );
+  }
+  if (typeof stats.has_connectivity !== 'boolean') {
+    throw invalidDatasetIdentity(
+      'stats.has_connectivity must be a boolean',
+      sourceType,
+      { value: stats.has_connectivity }
+    );
+  }
+  if (stats.has_connectivity) {
+    requireCount(stats.n_edges, 'stats.n_edges', sourceType);
+  } else if (stats.n_edges !== null) {
+    throw invalidDatasetIdentity(
+      'stats.n_edges must be null when has_connectivity is false',
+      sourceType,
+      { value: stats.n_edges }
+    );
+  }
+}
+
+function validateIdentityEmbeddings(embeddings, sourceType) {
+  assertExactKeys(
+    embeddings,
+    ['available_dimensions', 'default_dimension', 'files'],
+    [],
+    'embeddings',
+    sourceType
+  );
+  const dimensions = embeddings.available_dimensions;
+  if (!Array.isArray(dimensions) || dimensions.length === 0) {
+    throw invalidDatasetIdentity(
+      'embeddings.available_dimensions must be a non-empty array',
+      sourceType
+    );
+  }
+  const dimensionSet = new Set();
+  for (let index = 0; index < dimensions.length; index++) {
+    const dimension = dimensions[index];
+    if (
+      !Number.isSafeInteger(dimension) ||
+      dimension < 1 ||
+      dimension > 3 ||
+      dimensionSet.has(dimension) ||
+      (index > 0 && dimensions[index - 1] >= dimension)
+    ) {
+      throw invalidDatasetIdentity(
+        'embeddings.available_dimensions must contain strictly increasing unique 1D, 2D, or 3D integers',
+        sourceType,
+        { dimensions }
+      );
+    }
+    dimensionSet.add(dimension);
+  }
+  if (
+    !Number.isSafeInteger(embeddings.default_dimension) ||
+    !dimensionSet.has(embeddings.default_dimension)
+  ) {
+    throw invalidDatasetIdentity(
+      'embeddings.default_dimension must be one of the available dimensions',
+      sourceType,
+      {
+        default_dimension: embeddings.default_dimension,
+        available_dimensions: dimensions,
+      }
+    );
+  }
+
+  const files = embeddings.files;
+  if (!isPlainRecord(files)) {
+    throw invalidDatasetIdentity(
+      'embeddings.files must be an object',
+      sourceType
+    );
+  }
+  const expectedFileKeys = dimensions.map(dimension => `${dimension}d`);
+  const actualFileKeys = Object.keys(files);
+  if (
+    actualFileKeys.length !== expectedFileKeys.length ||
+    actualFileKeys.some(key => !expectedFileKeys.includes(key))
+  ) {
+    throw invalidDatasetIdentity(
+      'embeddings.files must contain exactly one path per available dimension',
+      sourceType,
+      { expected: expectedFileKeys, actual: actualFileKeys }
+    );
+  }
+  for (const key of expectedFileKeys) {
+    requireIdentityPayloadPath(
+      files[key],
+      `embeddings.files.${key}`,
+      sourceType
+    );
+  }
+
+}
+
+function validateIdentityExportSettings(settings, sourceType) {
+  assertExactKeys(
+    settings,
+    [
+      'compression',
+      'var_quantization',
+      'obs_continuous_quantization',
+      'obs_categorical_dtype',
+    ],
+    [],
+    'export_settings',
+    sourceType
+  );
+  if (
+    settings.compression !== null &&
+    (
+      !Number.isSafeInteger(settings.compression) ||
+      settings.compression < 1 ||
+      settings.compression > 9
+    )
+  ) {
+    throw invalidDatasetIdentity(
+      'export_settings.compression must be null or an integer from 1 to 9',
+      sourceType
+    );
+  }
+  for (const key of [
+    'var_quantization',
+    'obs_continuous_quantization',
+  ]) {
+    if (
+      settings[key] !== null &&
+      settings[key] !== 8 &&
+      settings[key] !== 16
+    ) {
+      throw invalidDatasetIdentity(
+        `export_settings.${key} must be null, 8, or 16`,
+        sourceType
+      );
+    }
+  }
+  if (
+    settings.obs_categorical_dtype !== 'auto' &&
+    settings.obs_categorical_dtype !== 'uint8' &&
+    settings.obs_categorical_dtype !== 'uint16'
+  ) {
+    throw invalidDatasetIdentity(
+      'export_settings.obs_categorical_dtype must be auto, uint8, or uint16',
+      sourceType
+    );
+  }
+}
+
+function validateIdentitySource(source, sourceType) {
+  assertExactKeys(
+    source,
+    ['name'],
+    ['url', 'citation', 'filename'],
+    'source',
+    sourceType
+  );
+  requireNonEmptyString(source.name, 'source.name', sourceType);
+  for (const key of ['url', 'citation', 'filename']) {
+    if (Object.hasOwn(source, key)) {
+      requireNonEmptyString(
+        source[key],
+        `source.${key}`,
+        sourceType
+      );
+    }
+  }
+}
+
+function validateIdentityVectorFields(vectorFields, sourceType) {
+  assertExactKeys(
+    vectorFields,
+    ['default_field', 'fields'],
+    [],
+    'vector_fields',
+    sourceType
+  );
+  if (
+    !isPlainRecord(vectorFields.fields) ||
+    Object.keys(vectorFields.fields).length === 0
+  ) {
+    throw invalidDatasetIdentity(
+      'vector_fields.fields must be a non-empty object',
+      sourceType
+    );
+  }
+  if (vectorFields.default_field !== null) {
+    requireNonEmptyString(
+      vectorFields.default_field,
+      'vector_fields.default_field',
+      sourceType
+    );
+    if (!Object.hasOwn(
+      vectorFields.fields,
+      vectorFields.default_field
+    )) {
+      throw invalidDatasetIdentity(
+        'vector_fields.default_field must be null or name a declared field',
+        sourceType
+      );
+    }
+  }
+  for (const [fieldId, field] of Object.entries(vectorFields.fields)) {
+    requireNonEmptyString(
+      fieldId,
+      'vector field id',
+      sourceType
+    );
+    const label = `vector_fields.fields.${fieldId}`;
+    assertExactKeys(
+      field,
+      [
+        'label',
+        'basis',
+        'available_dimensions',
+        'default_dimension',
+        'files',
+      ],
+      [],
+      label,
+      sourceType
+    );
+    requireNonEmptyString(field.label, `${label}.label`, sourceType);
+    requireNonEmptyString(field.basis, `${label}.basis`, sourceType);
+    validateIdentityEmbeddings({
+      available_dimensions: field.available_dimensions,
+      default_dimension: field.default_dimension,
+      files: field.files,
+    }, sourceType);
+  }
+}
+
+function validateIdentityObsFields(obsFields, stats, sourceType) {
+  if (!Array.isArray(obsFields)) {
+    throw invalidDatasetIdentity(
+      'obs_fields must be an array',
+      sourceType
+    );
+  }
+  if (obsFields.length !== stats.n_obs_fields) {
+    throw invalidDatasetIdentity(
+      'obs_fields length must equal stats.n_obs_fields',
+      sourceType,
+      { actual: obsFields.length, expected: stats.n_obs_fields }
+    );
+  }
+
+  const keys = new Set();
+  let categoricalCount = 0;
+  let continuousCount = 0;
+  for (let index = 0; index < obsFields.length; index++) {
+    const field = obsFields[index];
+    const label = `obs_fields[${index}]`;
+    if (!isPlainRecord(field)) {
+      throw invalidDatasetIdentity(
+        `${label} must be an object`,
+        sourceType
+      );
+    }
+    if (field.kind === 'category') {
+      assertExactKeys(
+        field,
+        ['key', 'kind', 'n_categories'],
+        [],
+        label,
+        sourceType
+      );
+      requireCount(
+        field.n_categories,
+        `${label}.n_categories`,
+        sourceType
+      );
+      categoricalCount++;
+    } else if (field.kind === 'continuous') {
+      assertExactKeys(
+        field,
+        ['key', 'kind'],
+        [],
+        label,
+        sourceType
+      );
+      continuousCount++;
+    } else {
+      throw invalidDatasetIdentity(
+        `${label}.kind must be 'category' or 'continuous'`,
+        sourceType,
+        { value: field.kind }
+      );
+    }
+    requireNonEmptyString(field.key, `${label}.key`, sourceType);
+    if (keys.has(field.key)) {
+      throw invalidDatasetIdentity(
+        `obs_fields contains duplicate key '${field.key}'`,
+        sourceType,
+        { key: field.key }
+      );
+    }
+    keys.add(field.key);
+  }
+  if (
+    categoricalCount !== stats.n_categorical_fields ||
+    continuousCount !== stats.n_continuous_fields
+  ) {
+    throw invalidDatasetIdentity(
+      'obs_fields kinds must agree with categorical and continuous stats',
+      sourceType,
+      {
+        categoricalCount,
+        continuousCount,
+        expectedCategorical: stats.n_categorical_fields,
+        expectedContinuous: stats.n_continuous_fields,
+      }
+    );
+  }
+}
+
 /**
- * Load dataset metadata from dataset_identity.json or construct from manifests
+ * Validate the sole current dataset_identity.json v2 contract.
+ *
+ * @param {unknown} identity
+ * @param {string} datasetId
+ * @param {string} [sourceType]
+ * @returns {Object}
+ */
+export function validateDatasetIdentity(
+  identity,
+  datasetId,
+  sourceType
+) {
+  requireNonEmptyString(datasetId, 'catalog dataset id', sourceType);
+  assertExactKeys(
+    identity,
+    [
+      'version',
+      'id',
+      'name',
+      'description',
+      'cellucid_data_version',
+      'stats',
+      'embeddings',
+      'obs_fields',
+    ],
+    [
+      'created_at',
+      'export_settings',
+      'source',
+      'vector_fields',
+    ],
+    'dataset identity',
+    sourceType
+  );
+  validateSchemaVersion(
+    identity.version,
+    DATA_CONFIG.SUPPORTED_IDENTITY_VERSIONS,
+    'dataset_identity.json'
+  );
+  requireNonEmptyString(identity.name, 'name', sourceType);
+  if (typeof identity.description !== 'string') {
+    throw invalidDatasetIdentity(
+      'description must be a string',
+      sourceType,
+      { value: identity.description }
+    );
+  }
+  requireNonEmptyString(
+    identity.cellucid_data_version,
+    'cellucid_data_version',
+    sourceType
+  );
+
+  requireNonEmptyString(identity.id, 'id', sourceType);
+  if (identity.id !== datasetId) {
+    throw invalidDatasetIdentity(
+      `id '${identity.id}' does not match catalog id '${datasetId}'`,
+      sourceType,
+      { identityId: identity.id, datasetId }
+    );
+  }
+
+  validateIdentityStats(identity.stats, sourceType);
+  validateIdentityEmbeddings(identity.embeddings, sourceType);
+  validateIdentityObsFields(
+    identity.obs_fields,
+    identity.stats,
+    sourceType
+  );
+
+  if (Object.hasOwn(identity, 'created_at')) {
+    if (
+      typeof identity.created_at !== 'string' ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(
+        identity.created_at
+      ) ||
+      !Number.isFinite(Date.parse(identity.created_at)) ||
+      new Date(identity.created_at).toISOString().replace('.000Z', 'Z') !==
+        identity.created_at
+    ) {
+      throw invalidDatasetIdentity(
+        'created_at must be a valid UTC timestamp',
+        sourceType,
+        { value: identity.created_at }
+      );
+    }
+  }
+  if (Object.hasOwn(identity, 'export_settings')) {
+    validateIdentityExportSettings(
+      identity.export_settings,
+      sourceType
+    );
+  }
+  if (Object.hasOwn(identity, 'source')) {
+    validateIdentitySource(identity.source, sourceType);
+  }
+  if (Object.hasOwn(identity, 'vector_fields')) {
+    validateIdentityVectorFields(identity.vector_fields, sourceType);
+  }
+  return identity;
+}
+
+/**
+ * Load and validate exact metadata from dataset_identity.json.
  * @param {string} baseUrl - Base URL of the dataset
  * @param {string} datasetId - Dataset identifier
  * @param {string} [sourceType] - Source type for context
@@ -569,25 +1185,8 @@ export async function loadDatasetMetadata(baseUrl, datasetId, sourceType) {
 
   try {
     const identity = await fetchJson(identityUrl, sourceType);
-
-    // Validate identity version
-    validateSchemaVersion(
-      identity.version,
-      DATA_CONFIG.SUPPORTED_IDENTITY_VERSIONS,
-      'dataset_identity.json'
-    );
-
-    return {
-      id: datasetId,
-      name: identity.name || datasetId,
-      description: identity.description || '',
-      created_at: identity.created_at,
-      cellucid_data_version: identity.cellucid_data_version,
-      stats: identity.stats || { n_cells: 0 },
-      obs_fields: identity.obs_fields || [],
-      export_settings: identity.export_settings || {},
-      source: identity.source || {}
-    };
+    validateDatasetIdentity(identity, datasetId, sourceType);
+    return { ...identity, id: datasetId };
   } catch (err) {
     if (err instanceof DataSourceError && err.code === DataSourceErrorCode.NOT_FOUND) {
       throw new DataSourceError(

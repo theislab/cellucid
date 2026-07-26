@@ -1,262 +1,472 @@
 /**
- * @fileoverview Session contributor: core state (camera/filters/active field/UI controls/multiview).
- *
- * EAGER chunk (dataset-dependent): enough for "first pixels + UI-ready".
- *
- * Restore order (per session-serializer-plan.md):
- *  1) restore UI controls
- *  2) restore live-view dimension level
- *  3) restore filters
- *  4) restore active fields
- *  5) restore multiview descriptors (incl. per-view camera/dimension)
- *  6) restore camera (locked-cam mode only)
- *  7) push state → viewer sync
+ * @fileoverview Exact current core visualization session state.
  *
  * @module session/contributors/core-state
  */
 
 import { createUiControlSerializer } from '../../state-serializer/ui-controls.js';
-import { createFilterSerializer } from '../../state-serializer/filters.js';
-import { serializeActiveFields, restoreActiveFields, syncFieldSelectsToActiveField } from '../../state-serializer/active-fields.js';
-import { restoreMultiview } from '../../state-serializer/multiview.js';
+import {
+  createFilterSerializer,
+  serializeFiltersForFields,
+  validateFiltersForState
+} from '../../state-serializer/filters.js';
+import {
+  assertActiveFieldsState,
+  restoreActiveFields,
+  serializeActiveFields,
+  syncFieldSelectsToActiveField,
+  validateActiveFieldsForState
+} from '../../state-serializer/active-fields.js';
+import {
+  assertMultiviewState,
+  restoreMultiview
+} from '../../state-serializer/multiview.js';
+import { assertCameraState } from '../../../rendering/camera-state-contract.js';
+import {
+  assertArray,
+  assertBoolean,
+  assertExactKeys,
+  assertNonEmptyString,
+  assertPlainRecord,
+  assertSafeInteger,
+  requireMethod
+} from '../schema-contract.js';
 
 export const id = 'core-state';
 
-/**
- * @param {AbortSignal | null | undefined} signal
- */
+const CORE_PAYLOAD_KEYS = [
+  'camera',
+  'liveDimensionLevel',
+  'uiControls',
+  'filters',
+  'activeFields',
+  'multiview'
+];
+
 function throwIfAborted(signal) {
-  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+  if (signal !== null && signal.aborted) {
+    throw new DOMException('Aborted', 'AbortError');
+  }
 }
 
-/**
- * Session-bundle multiview descriptor serialization.
- *
- * This intentionally omits heavy per-cell arrays (colors/transparency/etc)
- * so the eager stage stays small; multiview restore replays filters/fields.
- *
- * @param {object} options
- * @param {object} options.state
- * @param {object} options.viewer
- * @param {(fields: any[], source: string) => any} options.serializeFiltersForFields
- * @returns {any}
- */
-function serializeMultiviewDescriptors({ state, viewer, serializeFiltersForFields, camerasLocked }) {
-  const viewLayout = viewer.getViewLayout?.() || { mode: 'single', activeId: 'live' };
-  const snapshots = viewer.getSnapshotViews?.() || [];
-  const viewContexts = state.viewContexts instanceof Map ? state.viewContexts : null;
+function assertAbortSignal(signal) {
+  if (
+    signal !== null
+    && (
+      typeof signal !== 'object'
+      || typeof signal.aborted !== 'boolean'
+    )
+  ) {
+    throw new TypeError('Core-state abortSignal must be an AbortSignal or null.');
+  }
+  return signal;
+}
 
-  const liveCameraState = viewer.getViewCameraState?.('live') || null;
+function assertDimensionLevel(value, context) {
+  return assertSafeInteger(value, context, { minimum: 1, maximum: 3 });
+}
 
-  const serializedSnapshots = snapshots.map((s) => {
-    const ctx = viewContexts?.get?.(String(s.id)) || null;
-    const activeFieldKey =
-      ctx?.activeFieldIndex >= 0 ? ctx?.obsData?.fields?.[ctx.activeFieldIndex]?.key : null;
-    const activeVarFieldKey =
-      ctx?.activeVarFieldIndex >= 0 ? ctx?.varData?.fields?.[ctx.activeVarFieldIndex]?.key : null;
-    const activeFieldSource = ctx?.activeFieldSource || (activeVarFieldKey ? 'var' : activeFieldKey ? 'obs' : null);
+function assertFieldArray(data, context) {
+  if (data === null || typeof data !== 'object' || !Array.isArray(data.fields)) {
+    throw new TypeError(`${context} requires a field inventory.`);
+  }
+  return data.fields;
+}
 
-    const ctxFilters = ctx
-      ? {
-          ...serializeFiltersForFields(ctx?.obsData?.fields, 'obs'),
-          ...serializeFiltersForFields(ctx?.varData?.fields, 'var')
-        }
-      : null;
-
-    let ctxOutlierThreshold = null;
-    if (activeFieldSource === 'var' && ctx?.varData?.fields?.[ctx.activeVarFieldIndex]) {
-      ctxOutlierThreshold = ctx.varData.fields[ctx.activeVarFieldIndex]._outlierThreshold ?? null;
-    } else if (activeFieldSource === 'obs' && ctx?.obsData?.fields?.[ctx.activeFieldIndex]) {
-      ctxOutlierThreshold = ctx.obsData.fields[ctx.activeFieldIndex]._outlierThreshold ?? null;
+function serializeContextActiveFields(context, snapshotId) {
+  const source = context.activeFieldSource;
+  const obsFields = assertFieldArray(
+    context.obsData,
+    `Snapshot "${snapshotId}" obs data`
+  );
+  const varFields = assertFieldArray(
+    context.varData,
+    `Snapshot "${snapshotId}" var data`
+  );
+  if (source === null) {
+    if (context.activeFieldIndex !== -1 || context.activeVarFieldIndex !== -1) {
+      throw new TypeError(`Snapshot "${snapshotId}" null active source requires -1 indices.`);
     }
-
     return {
-      id: s.id,
-      label: s.label,
-      fieldKey: s.fieldKey,
-      fieldKind: s.fieldKind,
-      meta: s.meta,
-      dimensionLevel: s.dimensionLevel ?? ctx?.dimensionLevel ?? null,
-      cameraState: viewer.getViewCameraState?.(String(s.id)) || null,
-      activeFields: {
-        activeFieldKey,
-        activeVarFieldKey,
-        activeFieldSource
-      },
-      filters: ctxFilters,
-      outlierThreshold: ctxOutlierThreshold
+      activeFieldKey: null,
+      activeFieldSource: null
     };
+  }
+  if (source !== 'obs' && source !== 'var') {
+    throw new TypeError(`Snapshot "${snapshotId}" has unsupported activeFieldSource.`);
+  }
+  const index = source === 'obs'
+    ? context.activeFieldIndex
+    : context.activeVarFieldIndex;
+  assertSafeInteger(index, `Snapshot "${snapshotId}" active field index`);
+  const fields = source === 'obs' ? obsFields : varFields;
+  if (index >= fields.length) {
+    throw new RangeError(`Snapshot "${snapshotId}" active field index is out of range.`);
+  }
+  const field = fields[index];
+  if (field === null || typeof field !== 'object' || field._isDeleted === true) {
+    throw new TypeError(`Snapshot "${snapshotId}" active field is unavailable.`);
+  }
+  if (source === 'obs' && context.activeVarFieldIndex !== -1) {
+    throw new TypeError(`Snapshot "${snapshotId}" obs source requires activeVarFieldIndex -1.`);
+  }
+  if (source === 'var' && context.activeFieldIndex !== -1) {
+    throw new TypeError(`Snapshot "${snapshotId}" var source requires activeFieldIndex -1.`);
+  }
+  return assertActiveFieldsState({
+    activeFieldKey: assertNonEmptyString(
+      field.key,
+      `Snapshot "${snapshotId}" active field key`
+    ),
+    activeFieldSource: source
   });
+}
 
+function assertSnapshotMeta(meta, snapshotId) {
+  assertExactKeys(meta, ['filtersText'], `Snapshot "${snapshotId}" metadata`);
+  assertArray(meta.filtersText, `Snapshot "${snapshotId}" filter summary`);
+  for (const line of meta.filtersText) {
+    if (typeof line !== 'string') {
+      throw new TypeError(`Snapshot "${snapshotId}" filter summaries must be strings.`);
+    }
+  }
   return {
-    layout: viewLayout,
-    camerasLocked: camerasLocked === true,
-    liveCameraState,
-    snapshots: serializedSnapshots
+    filtersText: [...meta.filtersText]
   };
 }
 
-/**
- * Push state buffers to the viewer (keeps restore fast without reloading data).
- * @param {object} state
- */
-function pushViewerState(state) {
-  // These methods are intentionally "private-ish" on DataState but are the
-  // canonical way to sync the viewer without reloading data.
-  if (state.updateOutlierQuantiles) state.updateOutlierQuantiles();
-  if (state.computeGlobalVisibility) state.computeGlobalVisibility();
-  if (state._pushColorsToViewer) state._pushColorsToViewer();
-  if (state._pushTransparencyToViewer) state._pushTransparencyToViewer();
-  if (state._pushOutliersToViewer) state._pushOutliersToViewer();
-  if (state._pushCentroidsToViewer) state._pushCentroidsToViewer();
-  if (state._pushOutlierThresholdToViewer && state.getCurrentOutlierThreshold) {
-    state._pushOutlierThresholdToViewer(state.getCurrentOutlierThreshold());
+function serializeMultiviewDescriptors({ state, viewer, camerasLocked }) {
+  requireMethod(viewer, 'getViewLayout', 'Core-state viewer');
+  requireMethod(viewer, 'getSnapshotViews', 'Core-state viewer');
+  requireMethod(viewer, 'getViewCameraState', 'Core-state viewer');
+  if (!(state.viewContexts instanceof Map)) {
+    throw new TypeError('Core-state capture requires the current viewContexts Map.');
   }
-}
-
-/**
- * Capture minimal core state for "first pixels + UI-ready".
- * @param {object} ctx
- * @returns {import('../session-serializer.js').SessionChunk[]}
- */
-export function capture(ctx) {
-  const state = ctx?.state;
-  const viewer = ctx?.viewer;
-  const sidebar = ctx?.sidebar;
-  if (!state || !viewer) return [];
-
-  const ui = createUiControlSerializer({ sidebar });
-  const filters = createFilterSerializer({ state });
-  const camerasLocked = viewer.getCamerasLocked?.() ?? true;
-  const liveDimensionLevel = state.getViewDimensionLevel?.('live') ?? state.activeDimensionLevel ?? null;
-
-  return [
-    {
-      id: 'core/state',
-      contributorId: id,
-      priority: 'eager',
-      kind: 'json',
-      codec: 'gzip',
-      label: 'Core state',
-      datasetDependent: true,
-      payload: {
-        camera: viewer.getCameraState?.() || null,
-        camerasLocked: camerasLocked === true,
-        activeDimensionLevel: state.activeDimensionLevel ?? null,
-        liveDimensionLevel,
-        uiControls: ui.collectUIControls(),
-        filters: filters.serializeFilters(),
-        activeFields: serializeActiveFields(state),
-        multiview: serializeMultiviewDescriptors({
-          state,
-          viewer,
-          camerasLocked,
-          serializeFiltersForFields: filters.serializeFiltersForFields
-        })
-      }
+  const layout = viewer.getViewLayout();
+  const viewerSnapshots = assertArray(
+    viewer.getSnapshotViews(),
+    'Current viewer snapshots'
+  );
+  const snapshots = viewerSnapshots.map((snapshot, index) => {
+    if (snapshot === null || typeof snapshot !== 'object') {
+      throw new TypeError(`Current viewer snapshot ${index} must be an object.`);
     }
-  ];
-}
-
-/**
- * Restore minimal core state for "first pixels + UI-ready".
- * @param {object} ctx
- * @param {any} _chunkMeta
- * @param {any} payload
- */
-export async function restore(ctx, _chunkMeta, payload) {
-  const state = ctx?.state;
-  const viewer = ctx?.viewer;
-  const sidebar = ctx?.sidebar;
-  if (!state || !viewer || !payload) return;
-
-  const ui = createUiControlSerializer({ sidebar });
-  const filters = createFilterSerializer({ state });
-  const signal = ctx.abortSignal ?? null;
-
-  // 1) Restore UI controls first (checkboxes, selects, ranges)
-  ui.restoreUIControls(payload.uiControls || {}, { abortSignal: signal });
-  throwIfAborted(signal);
-
-  // 2) Restore dimension level (don’t assume 3D)
-  if (payload.liveDimensionLevel != null && state.setDimensionLevel) {
-    await state.setDimensionLevel(payload.liveDimensionLevel);
-    const dimensionSelect = document.getElementById('dimension-select');
-    if (dimensionSelect) {
-      dimensionSelect.value = String(payload.liveDimensionLevel);
-    }
-  }
-  throwIfAborted(signal);
-
-  // 3) Restore filters (modified-only)
-  if (payload.filters) {
-    await filters.restoreFilters(payload.filters);
-  }
-  throwIfAborted(signal);
-
-  // 4) Restore active fields and sync UI selectors
-  if (payload.activeFields) {
-    await restoreActiveFields(state, payload.activeFields);
-  }
-
-  // Sync outlier slider (AFTER active field is set)
-  const activeField = state.getActiveField?.();
-  if (activeField && activeField.outlierQuantiles?.length > 0) {
-    const outlierSlider = document.getElementById('outlier-filter');
-    const outlierDisplay = document.getElementById('outlier-filter-display');
-    if (outlierSlider) {
-      const pct = Math.round((activeField._outlierThreshold ?? 1.0) * 100);
-      outlierSlider.value = String(pct);
-      if (outlierDisplay) outlierDisplay.textContent = pct + '%';
-    }
-  }
-
-  // Sync dropdowns to match active field without triggering a camera reset.
-  syncFieldSelectsToActiveField(state);
-  throwIfAborted(signal);
-
-  // 5) Restore multiview descriptors/layout (replay logic; no heavy arrays).
-  if (payload.multiview) {
-    const restoreActiveFieldsForMultiview = (af) => restoreActiveFields(state, af);
-    await restoreMultiview(
-      {
-        state,
-        viewer,
-        restoreFilters: filters.restoreFilters,
-        restoreActiveFields: restoreActiveFieldsForMultiview,
-        pushViewerState: () => pushViewerState(state)
-      },
-      payload.multiview
+    const snapshotId = assertNonEmptyString(
+      snapshot.id,
+      `Current viewer snapshot ${index} id`
     );
+    const context = state.viewContexts.get(snapshotId);
+    if (context === undefined || context === null || typeof context !== 'object') {
+      throw new RangeError(`DataState context for snapshot "${snapshotId}" was not found.`);
+    }
+    const activeFields = serializeContextActiveFields(context, snapshotId);
+    const fieldKey = snapshot.fieldKey;
+    const fieldKind = snapshot.fieldKind;
+    if (fieldKey !== activeFields.activeFieldKey) {
+      throw new TypeError(`Snapshot "${snapshotId}" field identity differs from DataState.`);
+    }
+    if (
+      (fieldKind === null && fieldKey !== null)
+      || (
+        fieldKind !== null
+        && fieldKind !== 'category'
+        && fieldKind !== 'continuous'
+      )
+    ) {
+      throw new TypeError(`Snapshot "${snapshotId}" field kind is invalid.`);
+    }
+    return {
+      id: snapshotId,
+      label: assertNonEmptyString(
+        snapshot.label,
+        `Current viewer snapshot "${snapshotId}" label`
+      ),
+      fieldKey,
+      fieldKind,
+      meta: assertSnapshotMeta(snapshot.meta, snapshotId),
+      dimensionLevel: assertDimensionLevel(
+        context.dimensionLevel,
+        `Snapshot "${snapshotId}" dimensionLevel`
+      ),
+      cameraState: assertCameraState(
+        viewer.getViewCameraState(snapshotId),
+        `Snapshot session camera state for "${snapshotId}"`
+      ),
+      activeFields,
+      filters: {
+        ...serializeFiltersForFields(
+          assertFieldArray(context.obsData, `Snapshot "${snapshotId}" obs data`),
+          'obs'
+        ),
+        ...serializeFiltersForFields(
+          assertFieldArray(context.varData, `Snapshot "${snapshotId}" var data`),
+          'var'
+        )
+      }
+    };
+  });
+
+  const multiview = {
+    layout,
+    camerasLocked,
+    liveCameraState: assertCameraState(
+      viewer.getViewCameraState('live'),
+      'Live-view session camera state'
+    ),
+    snapshots
+  };
+  return assertMultiviewState(state, multiview);
+}
+
+function pushViewerState(state) {
+  for (const method of [
+    'updateOutlierQuantiles',
+    'computeGlobalVisibility',
+    '_pushColorsToViewer',
+    '_pushTransparencyToViewer',
+    '_pushCentroidsToViewer',
+    'getCurrentOutlierThreshold'
+  ]) {
+    requireMethod(state, method, 'Core-state viewer synchronization owner');
+  }
+  state.updateOutlierQuantiles();
+  state.computeGlobalVisibility();
+  state._pushColorsToViewer();
+  state._pushTransparencyToViewer();
+  state._pushCentroidsToViewer();
+}
+
+function getOwners(ctx, operation) {
+  if (ctx === null || typeof ctx !== 'object') {
+    throw new TypeError(`Core-state ${operation} requires a session context.`);
+  }
+  if (ctx.state === null || typeof ctx.state !== 'object') {
+    throw new TypeError(`Core-state ${operation} requires the current DataState owner.`);
+  }
+  if (ctx.viewer === null || typeof ctx.viewer !== 'object') {
+    throw new TypeError(`Core-state ${operation} requires the current viewer owner.`);
+  }
+  if (
+    ctx.sidebar === null
+    || typeof ctx.sidebar !== 'object'
+    || typeof ctx.sidebar.querySelectorAll !== 'function'
+  ) {
+    throw new TypeError(`Core-state ${operation} requires the current sidebar.`);
+  }
+  return {
+    state: ctx.state,
+    viewer: ctx.viewer,
+    sidebar: ctx.sidebar
+  };
+}
+
+function assertCorePayload(state, payload) {
+  assertExactKeys(payload, CORE_PAYLOAD_KEYS, 'Core-state payload');
+  assertCameraState(payload.camera, 'Restored session camera state');
+  assertDimensionLevel(payload.liveDimensionLevel, 'Core-state liveDimensionLevel');
+  assertPlainRecord(payload.uiControls, 'Core-state uiControls');
+  validateFiltersForState(state, payload.filters);
+  validateActiveFieldsForState(state, payload.activeFields);
+  assertMultiviewState(state, payload.multiview);
+  return payload;
+}
+
+export function capture(ctx) {
+  const { state, viewer, sidebar } = getOwners(ctx, 'capture');
+  for (const method of [
+    'getCamerasLocked',
+    'getCameraState'
+  ]) {
+    requireMethod(viewer, method, 'Core-state capture viewer');
+  }
+  requireMethod(state, 'getViewDimensionLevel', 'Core-state capture owner');
+  const camerasLocked = viewer.getCamerasLocked();
+  assertBoolean(camerasLocked, 'Core-state camerasLocked');
+  const ui = createUiControlSerializer({ sidebar });
+  const filters = createFilterSerializer({ state });
+  const payload = {
+    camera: assertCameraState(
+      viewer.getCameraState(),
+      'Session camera state'
+    ),
+    liveDimensionLevel: assertDimensionLevel(
+      state.getViewDimensionLevel('live'),
+      'Core-state live dimension'
+    ),
+    uiControls: ui.collectUIControls(),
+    filters: filters.serializeFilters(),
+    activeFields: serializeActiveFields(state),
+    multiview: serializeMultiviewDescriptors({
+      state,
+      viewer,
+      camerasLocked
+    })
+  };
+  assertCorePayload(state, payload);
+
+  return [{
+    id: 'core/state',
+    contributorId: id,
+    priority: 'eager',
+    kind: 'json',
+    codec: 'gzip',
+    label: 'Core state',
+    datasetDependent: true,
+    payload
+  }];
+}
+
+function requireElement(idValue) {
+  const element = document.getElementById(idValue);
+  if (element === null) {
+    throw new TypeError(`Core-state restore requires current element "${idValue}".`);
+  }
+  return element;
+}
+
+function requireRestoreDom() {
+  const elements = {
+    dimensionSelect: requireElement('dimension-select'),
+    categoricalSelect: requireElement('categorical-field'),
+    continuousSelect: requireElement('continuous-field'),
+    geneSearch: requireElement('gene-expression-search'),
+    outlierSlider: requireElement('outlier-filter'),
+    outlierDisplay: requireElement('outlier-filter-display'),
+    navigationSelect: requireElement('navigation-mode'),
+    freeflyControls: requireElement('freefly-controls'),
+    orbitControls: requireElement('orbit-controls'),
+    planarControls: requireElement('planar-controls')
+  };
+  for (const panel of [
+    elements.freeflyControls,
+    elements.orbitControls,
+    elements.planarControls
+  ]) {
+    if (panel.style === null || typeof panel.style !== 'object') {
+      throw new TypeError('Core-state navigation panels require style owners.');
+    }
+  }
+  return elements;
+}
+
+function assertSelectOption(select, value, context) {
+  if (select.options === null || select.options === undefined) {
+    throw new TypeError(`${context} requires an option inventory.`);
+  }
+  const hasOption = Array.from(select.options).some(option => option.value === value);
+  if (!hasOption) {
+    throw new RangeError(`${context} option "${value}" is unavailable.`);
+  }
+}
+
+function syncDomainControls(state, viewer, dom) {
+  syncFieldSelectsToActiveField(state);
+  const threshold = state.getCurrentOutlierThreshold();
+  if (
+    typeof threshold !== 'number'
+    || !Number.isFinite(threshold)
+    || threshold < 0
+    || threshold > 1
+  ) {
+    throw new TypeError('Current outlier threshold must be a finite value from 0 through 1.');
+  }
+  const percentage = Math.round(threshold * 100);
+  dom.outlierSlider.value = String(percentage);
+  dom.outlierDisplay.textContent = `${percentage}%`;
+
+  const activeViewId = state.getActiveViewId();
+  const dimensionLevel = assertDimensionLevel(
+    state.getViewDimensionLevel(activeViewId),
+    `Restored active view "${activeViewId}" dimension`
+  );
+  const dimensionValue = String(dimensionLevel);
+  assertSelectOption(dom.dimensionSelect, dimensionValue, 'Dimension selector');
+  dom.dimensionSelect.value = dimensionValue;
+
+  const camera = assertCameraState(
+    viewer.getCameraState(),
+    'Restored active camera state'
+  );
+  assertSelectOption(dom.navigationSelect, camera.navigationMode, 'Navigation selector');
+  dom.navigationSelect.value = camera.navigationMode;
+  dom.freeflyControls.style.display = camera.navigationMode === 'free' ? 'block' : 'none';
+  dom.orbitControls.style.display = camera.navigationMode === 'orbit' ? 'block' : 'none';
+  dom.planarControls.style.display = camera.navigationMode === 'planar' ? 'block' : 'none';
+}
+
+export async function restore(ctx, _chunkMeta, payload) {
+  const { state, viewer, sidebar } = getOwners(ctx, 'restore');
+  for (const method of [
+    'setDimensionLevel',
+    'getViewDimensionLevel',
+    'getActiveViewId',
+    'setActiveView',
+    '_notifyVisibilityChange',
+    'updateFilteredCount',
+    'updateFilterSummary',
+    'getCurrentOutlierThreshold'
+  ]) {
+    requireMethod(state, method, 'Core-state restore owner');
+  }
+  for (const method of [
+    'setNavigationMode',
+    'setCameraState',
+    'getCameraState'
+  ]) {
+    requireMethod(viewer, method, 'Core-state restore viewer');
+  }
+  const signal = assertAbortSignal(ctx.abortSignal);
+  const ui = createUiControlSerializer({ sidebar });
+  const filters = createFilterSerializer({ state });
+  const dom = requireRestoreDom();
+  const sessionState = assertCorePayload(state, payload);
+  assertSelectOption(
+    dom.dimensionSelect,
+    String(sessionState.liveDimensionLevel),
+    'Live dimension selector'
+  );
+
+  ui.restoreUIControls(sessionState.uiControls, { abortSignal: signal });
+  throwIfAborted(signal);
+
+  const activeViewResult = state.setActiveView('live');
+  if (activeViewResult !== 'live') {
+    throw new Error('DataState rejected the live view before core-state restore.');
+  }
+  await state.setDimensionLevel(sessionState.liveDimensionLevel, {
+    viewId: 'live'
+  });
+  if (state.getViewDimensionLevel('live') !== sessionState.liveDimensionLevel) {
+    throw new Error('DataState did not apply the restored live dimension.');
   }
   throwIfAborted(signal);
 
-  // 6) Restore camera state LAST (locked-cam only; unlocked mode uses per-view camera states)
-  const camerasLocked = payload.multiview?.camerasLocked ?? payload.camerasLocked ?? true;
-  if (camerasLocked === true && payload.camera) {
-    viewer.setCameraState?.(payload.camera);
+  await filters.restoreFilters(sessionState.filters);
+  throwIfAborted(signal);
+  await restoreActiveFields(state, sessionState.activeFields);
+  throwIfAborted(signal);
 
-    // Update the navigation mode UI to match (without triggering an event reset).
-    const navSelect = document.getElementById('navigation-mode');
-    if (navSelect && payload.camera.navigationMode) {
-      navSelect.value = payload.camera.navigationMode;
-      const freeflyControls = document.getElementById('freefly-controls');
-      const orbitControls = document.getElementById('orbit-controls');
-      const planarControls = document.getElementById('planar-controls');
-      if (freeflyControls && orbitControls && planarControls) {
-        const mode = payload.camera.navigationMode;
-        freeflyControls.style.display = mode === 'free' ? 'block' : 'none';
-        orbitControls.style.display = mode === 'orbit' ? 'block' : 'none';
-        planarControls.style.display = mode === 'planar' ? 'block' : 'none';
-      }
-    }
+  await restoreMultiview({
+    state,
+    viewer,
+    restoreFilters: filters.restoreFilters,
+    restoreActiveFields: activeFields => restoreActiveFields(state, activeFields),
+    pushViewerState: () => pushViewerState(state)
+  }, sessionState.multiview);
+  throwIfAborted(signal);
+
+  if (sessionState.multiview.camerasLocked) {
+    const sessionCamera = assertCameraState(
+      sessionState.camera,
+      'Restored session camera state'
+    );
+    viewer.setNavigationMode(sessionCamera.navigationMode);
+    viewer.setCameraState(sessionCamera);
   }
 
-  // Final: ensure state + viewer are in sync even if no active field.
   pushViewerState(state);
-
-  // Trigger lightweight UI/state updates.
-  if (state._notifyVisibilityChange) state._notifyVisibilityChange();
-  if (state.updateFilteredCount) state.updateFilteredCount();
-  if (state.updateFilterSummary) state.updateFilterSummary();
+  syncDomainControls(state, viewer, dom);
+  state._notifyVisibilityChange();
+  state.updateFilteredCount();
+  state.updateFilterSummary();
 }

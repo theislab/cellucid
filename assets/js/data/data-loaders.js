@@ -4,17 +4,26 @@
 // Includes progress tracking with download speed for the notification center.
 
 import { getDataSourceManager } from './data-source-manager.js';
-import { fetchWithExportsBridge, isLocalUserUrl, resolveUrl } from './data-source.js';
+import { fetchSampleArtifact, isLocalUserUrl, resolveUrl } from './data-source.js';
 import { getNotificationCenter } from '../app/notification-center.js';
-import { toUint32Array } from './sparse-utils.js';
-import { tryDequantizeToFloat32 } from './quantization-worker-pool.js';
+import {
+  QUANTIZATION_BACKEND,
+  dequantizeToFloat32InWorker,
+  selectQuantizationBackend,
+} from './quantization-worker-pool.js';
+import { validateQuantizationMetadata } from './quantization-contract.js';
+import {
+  CONNECTIVITY_MANIFEST_CONTEXT,
+  validateConnectivityEdgeData,
+  validateConnectivityManifest,
+} from './connectivity-manifest-contract.js';
+import {
+  getMetadataLoadSignal,
+  throwIfMetadataAborted,
+} from './metadata-load-contract.js';
 // Unified AnnData provider handles both h5ad and zarr sources
 import {
-  isH5adActive,
-  isZarrActive,
-  isH5adUrl,
-  isZarrUrl,
-  isAnnDataActive,
+  isAnnDataUrl,
   anndataLoadPoints,
   anndataGetObsManifest,
   anndataGetVarManifest,
@@ -29,17 +38,12 @@ import {
 
 /**
  * Check if we should use AnnData data loading (h5ad or zarr) for this URL.
- * Returns true if either h5ad/zarr source is active OR the URL uses h5ad:// or zarr:// protocol.
+ * Direct access is selected only by an explicit direct-source protocol.
  * @param {string} url - URL to check
  * @returns {boolean}
  */
 function shouldUseAnnData(url) {
-  // Check if any AnnData source is active (h5ad or zarr)
-  if (isAnnDataActive()) {
-    return true;
-  }
-  // Also check if URL uses h5ad:// or zarr:// protocol
-  return isH5adUrl(url) || isZarrUrl(url);
+  return isAnnDataUrl(url);
 }
 
 // ============================================================================
@@ -50,10 +54,11 @@ function shouldUseAnnData(url) {
  * Resolve any URL (including custom protocols) to a fetchable URL.
  * Delegates to DataSourceManager for all protocol handling.
  * @param {string} url - URL to resolve (may be local-user://, remote://, jupyter://, etc.)
+ * @param {AbortSignal|null} signal - Exact request owner
  * @returns {Promise<string>} Standard fetchable URL (http://, https://, blob://, data://)
  */
-async function resolveAnyUrl(url) {
-  return getDataSourceManager().resolveUrl(url);
+async function resolveAnyUrl(url, signal) {
+  return getDataSourceManager().resolveUrl(url, signal);
 }
 
 /**
@@ -61,41 +66,32 @@ async function resolveAnyUrl(url) {
  * @param {string} url - URL to fetch (may use custom protocol)
  * @returns {Promise<any>}
  */
-async function fetchJsonWithProtocol(url) {
-  const resolvedUrl = await resolveAnyUrl(url);
-  const response = await fetchWithExportsBridge(resolvedUrl);
-
-  if (!response.ok) {
-    throw new Error(`Failed to load: ${url}`);
-  }
-
+async function fetchJsonWithProtocol(url, init) {
+  const response = await fetchOk(url, init);
   return response.json();
 }
 
-// Internal alias for JSON fetching with protocol support
-const fetchLocalUserJson = fetchJsonWithProtocol;
-
-// ============================================================================
-// BROWSER CAPABILITY CHECK
-// ============================================================================
-
-// Check browser capabilities at startup
-const HAS_DECOMPRESSION_STREAM = typeof DecompressionStream !== 'undefined';
-const HAS_PAKO = typeof pako !== 'undefined';
-if (!HAS_DECOMPRESSION_STREAM && !HAS_PAKO) {
-  console.warn('Neither DecompressionStream nor pako available. Gzip-compressed files will not work.');
-  console.warn('Use a modern browser (Chrome 80+, Firefox 113+, Safari 16.4+) or include pako library.');
+function requireGzipDecompressionStream(url) {
+  const GzipDecompressionStream = globalThis.DecompressionStream;
+  if (typeof GzipDecompressionStream !== 'function') {
+    throw new Error(
+      `Gzip payload ${url} requires browser DecompressionStream support`
+    );
+  }
+  return GzipDecompressionStream;
 }
 
 /**
  * Convert ArrayBuffer to typed array based on dtype.
  * @param {ArrayBuffer} buffer - Raw binary data
- * @param {string} dtype - Data type ('float32', 'uint8', 'uint16', 'uint32', 'uint64')
+ * @param {string} dtype - Exact prepared scalar dtype
  * @param {string} url - URL for error messages
  * @returns {TypedArray} Appropriate typed array
  */
 function typedArrayFromBuffer(buffer, dtype, url) {
   switch (dtype) {
+    case 'float64':
+      return new Float64Array(buffer);
     case 'float32':
       return new Float32Array(buffer);
     case 'uint8':
@@ -104,10 +100,67 @@ function typedArrayFromBuffer(buffer, dtype, url) {
       return new Uint16Array(buffer);
     case 'uint32':
       return new Uint32Array(buffer);
-    case 'uint64':
-      return new BigUint64Array(buffer);
     default:
       throw new Error(`Unsupported dtype "${dtype}" for ${url}`);
+  }
+}
+
+function validateCategoricalCodesDtype(dtype, fieldKey) {
+  if (dtype !== 'uint8' && dtype !== 'uint16') {
+    throw new Error(
+      `Unsupported categorical codes dtype "${dtype}" for field "${fieldKey}"; ` +
+      'expected "uint8" or "uint16". Reduce or merge categories before loading.'
+    );
+  }
+  return dtype;
+}
+
+function validateCategoricalStorage({
+  categories,
+  dtype,
+  missingValue,
+  fieldKey,
+}) {
+  validateCategoricalCodesDtype(dtype, fieldKey);
+  if (!Array.isArray(categories)) {
+    throw new Error(
+      `Invalid categorical field "${fieldKey}": categories must be an array`
+    );
+  }
+
+  const seen = new Set();
+  for (const category of categories) {
+    const type = typeof category;
+    if (
+      category === null ||
+      (type !== 'string' && type !== 'boolean' && type !== 'number') ||
+      (type === 'number' && !Number.isFinite(category))
+    ) {
+      throw new Error(
+        `Invalid categorical field "${fieldKey}": every category must be a finite JSON scalar`
+      );
+    }
+    if (seen.has(category)) {
+      throw new Error(
+        `Invalid categorical field "${fieldKey}": categories must be unique`
+      );
+    }
+    seen.add(category);
+  }
+
+  const expectedMissingValue = dtype === 'uint8' ? 255 : 65_535;
+  const maxCategories = dtype === 'uint8' ? 255 : 65_535;
+  if (missingValue !== expectedMissingValue) {
+    throw new Error(
+      `Invalid categorical field "${fieldKey}": ${dtype} codes require ` +
+      `the exact missing sentinel ${expectedMissingValue}`
+    );
+  }
+  if (categories.length > maxCategories) {
+    throw new Error(
+      `Invalid categorical field "${fieldKey}": ${dtype} has capacity for ` +
+      `at most ${maxCategories} categories`
+    );
   }
 }
 
@@ -122,6 +175,17 @@ function typedArrayFromBuffer(buffer, dtype, url) {
  * @returns {Float32Array} Dequantized float32 values
  */
 function dequantize(quantized, minValue, maxValue, bits) {
+  const dtype = quantized instanceof Uint8Array
+    ? 'uint8'
+    : quantized instanceof Uint16Array
+      ? 'uint16'
+      : null;
+  validateQuantizationMetadata({
+    dtype,
+    bits,
+    minValue,
+    maxValue,
+  }, 'Field quantization codec');
   const n = quantized.length;
   const result = new Float32Array(n);
   
@@ -147,47 +211,54 @@ function dequantize(quantized, minValue, maxValue, bits) {
  * @typedef {'uint8'|'uint16'} QuantizedDType
  */
 
-const WORKER_DEQUANTIZE_MIN_BYTES = 256 * 1024;
-
 /**
- * Dequantize quantized uint8/uint16 values into Float32Array, preferring worker decode.
- * IMPORTANT: worker decode transfers the input ArrayBuffer; if worker decode fails, callers
- * should provide refetchBuffer() so we can safely fall back to sync decode.
+ * Dequantize quantized uint8/uint16 values with one preselected backend.
  *
  * @param {Object} options
+ * @param {'main-thread'|'worker'} options.backend
  * @param {ArrayBuffer} options.buffer
  * @param {QuantizedDType} options.dtype
  * @param {number} options.minValue
  * @param {number} options.maxValue
  * @param {8|16} options.bits
- * @param {string} [options.urlForError]
- * @param {(() => Promise<ArrayBuffer>)} [options.refetchBuffer]
  * @returns {Promise<Float32Array>}
  */
 async function dequantizeToFloat32(options) {
-  const { buffer, dtype, minValue, maxValue, bits, urlForError, refetchBuffer } = options || {};
+  if (!options || typeof options !== 'object' || Array.isArray(options)) {
+    throw new Error('dequantizeToFloat32: options must be an object');
+  }
+  const {
+    backend,
+    buffer,
+    dtype,
+    minValue,
+    maxValue,
+    bits,
+  } = options;
 
   if (!(buffer instanceof ArrayBuffer)) {
     throw new Error('dequantizeToFloat32: missing ArrayBuffer');
   }
-  if (dtype !== 'uint8' && dtype !== 'uint16') {
-    throw new Error(`dequantizeToFloat32: unsupported dtype "${String(dtype)}"`);
-  }
+  validateQuantizationMetadata({
+    dtype,
+    bits,
+    minValue,
+    maxValue,
+  }, 'Field quantization codec');
 
-  const shouldTryWorker = buffer.byteLength >= WORKER_DEQUANTIZE_MIN_BYTES;
-  if (shouldTryWorker) {
-    try {
-      const decoded = await tryDequantizeToFloat32({ buffer, dtype, minValue, maxValue, bits });
-      if (decoded) return decoded;
-    } catch (err) {
-      console.warn('[data-loaders] Worker dequantize failed:', urlForError || '(buffer)', err);
-      if (typeof refetchBuffer === 'function') {
-        const fresh = await refetchBuffer();
-        const raw = dtype === 'uint8' ? new Uint8Array(fresh) : new Uint16Array(fresh);
-        return dequantize(raw, minValue, maxValue, bits);
-      }
-      throw err;
-    }
+  if (backend === QUANTIZATION_BACKEND.WORKER) {
+    return dequantizeToFloat32InWorker({
+      buffer,
+      dtype,
+      minValue,
+      maxValue,
+      bits,
+    });
+  }
+  if (backend !== QUANTIZATION_BACKEND.MAIN_THREAD) {
+    throw new Error(
+      `dequantizeToFloat32: unsupported backend ${String(backend)}`
+    );
   }
 
   const raw = dtype === 'uint8' ? new Uint8Array(buffer) : new Uint16Array(buffer);
@@ -200,8 +271,11 @@ async function dequantizeToFloat32(options) {
  * @param {RequestInit} [init]
  */
 async function fetchOk(url, init) {
-  const resolvedUrl = await resolveAnyUrl(url);
-  const response = await fetchWithExportsBridge(resolvedUrl, init);
+  const signal = init?.signal ?? null;
+  throwIfMetadataAborted(signal, 'URL resolution');
+  const resolvedUrl = await resolveAnyUrl(url, signal);
+  throwIfMetadataAborted(signal, 'URL resolution');
+  const response = await fetchSampleArtifact(resolvedUrl, init);
   if (!response.ok) {
     const err = new Error('Failed to load ' + url + ': ' + response.statusText);
     err.status = response.status;
@@ -212,7 +286,7 @@ async function fetchOk(url, init) {
 
 /**
  * Fetch binary data, automatically decompressing gzip if URL ends with .gz
- * Uses native DecompressionStream API (modern browsers).
+ * Uses the browser DecompressionStream API.
  * Supports local-user:// protocol for user directories.
  *
  * @param {string} url - URL to fetch
@@ -220,62 +294,56 @@ async function fetchOk(url, init) {
  * @returns {Promise<ArrayBuffer>} Decompressed binary data
  */
 async function fetchBinary(url, init) {
+  const isGzipped = url.endsWith('.gz');
+  const GzipDecompressionStream = isGzipped
+    ? requireGzipDecompressionStream(url)
+    : null;
   const response = await fetchOk(url, init);
 
-  // Check if this is a gzipped file by URL extension
-  const isGzipped = url.endsWith('.gz');
-
-  if (isGzipped && typeof DecompressionStream !== 'undefined') {
-    // Use native DecompressionStream API for decompression
-    try {
-      const ds = new DecompressionStream('gzip');
-      const decompressedStream = response.body.pipeThrough(ds);
-      const decompressedResponse = new Response(decompressedStream);
-      return decompressedResponse.arrayBuffer();
-    } catch (e) {
-      console.error('DecompressionStream failed for:', url, e);
-      throw e;
-    }
-  } else if (isGzipped) {
-    // Fallback: try to use pako if available (for older browsers)
-    const compressedBuffer = await response.arrayBuffer();
-    if (typeof pako !== 'undefined') {
-      const decompressed = pako.inflate(new Uint8Array(compressedBuffer));
-      // Safety: slice the buffer in case pako returns a view with non-zero byteOffset
-      return decompressed.buffer.slice(decompressed.byteOffset, decompressed.byteOffset + decompressed.byteLength);
-    } else {
-      console.error('Gzip decompression not supported: DecompressionStream unavailable and pako not loaded');
-      console.error('Either use a modern browser or include pako library, or regenerate data without compression');
-      throw new Error('Gzip decompression not supported in this browser. Regenerate data with compression=None');
-    }
+  if (isGzipped) {
+    const decompressedStream = response.body.pipeThrough(
+      new GzipDecompressionStream('gzip')
+    );
+    return new Response(decompressedStream).arrayBuffer();
   }
 
-  // Not gzipped, return as-is
   return response.arrayBuffer();
 }
 
 /**
- * Load points binary, trying .gz version first if the URL doesn't already end in .gz
- * This handles both compressed and uncompressed data transparently.
+ * Load the one cell-position payload advertised by dataset metadata.
+ * Compression is determined solely by the advertised filename.
  * Supports all custom protocols (local-user://, remote://, jupyter://) via DataSourceManager.
  *
  * @param {string} url - URL to fetch
  * @param {Object} options - Optional settings
  * @param {boolean} options.showProgress - Show progress notification (default: false)
  * @param {string} options.displayName - Display name for notification
+ * @param {AbortSignal|null} options.signal - Optional cancellation signal
+ * @param {string|null} options.progressTrackerId - Optional caller-owned tracker
  */
 export async function loadPointsBinary(url, options = {}) {
-  const { showProgress = false, displayName = null, dimension = 3 } = options;
+  const {
+    showProgress = false,
+    displayName = null,
+    dimension = 3,
+    signal = null,
+    progressTrackerId = null
+  } = options;
   const notifications = getNotificationCenter();
   const name = displayName || 'Cell positions';
-  let trackerId = null;
+  let trackerId = progressTrackerId;
+  const ownsTracker = showProgress && !trackerId;
+
+  if (ownsTracker) {
+    trackerId = notifications.startDownload(name);
+  }
 
   // Check if AnnData source (h5ad or zarr) is active - use direct loading
   if (shouldUseAnnData(url)) {
-    if (showProgress) {
-      trackerId = notifications.startDownload(name);
-    }
     try {
+      throwIfAborted(signal);
+
       // Extract dimension from URL if not provided (e.g., points_3d.bin -> 3)
       let dim = dimension;
       const dimMatch = url.match(/points_(\d)d\.bin/);
@@ -283,86 +351,165 @@ export async function loadPointsBinary(url, options = {}) {
         dim = parseInt(dimMatch[1], 10);
       }
 
-      const result = await anndataLoadPoints(dim);
-      if (trackerId) notifications.completeDownload(trackerId);
+      // H5AD/Zarr adapters do not currently accept an AbortSignal. Race the
+      // decoder with the caller's signal so dataset replacement can reject
+      // promptly; the detached decoder is still observed by waitForAbort().
+      const result = await waitForAbort(
+        anndataLoadPoints(url, dim),
+        signal
+      );
+      throwIfAborted(signal);
+      if (ownsTracker) notifications.completeDownload(trackerId);
       return result;
     } catch (err) {
-      if (trackerId) notifications.failDownload(trackerId, err.message);
+      finishOwnedTrackerWithError({
+        error: err,
+        notifications,
+        signal,
+        trackerId: ownsTracker ? trackerId : null
+      });
       throw err;
     }
   }
 
-  if (showProgress) {
-    trackerId = notifications.startDownload(name);
-  }
-
   try {
-    // If URL already ends with .gz, just fetch it directly
-    if (url.endsWith('.gz')) {
-      const arrayBuffer = await fetchBinaryWithProgressInternal(url, trackerId, notifications);
-      if (trackerId) notifications.completeDownload(trackerId);
-      return new Float32Array(arrayBuffer);
-    }
+    throwIfAborted(signal);
 
-    const supportsGzip = HAS_DECOMPRESSION_STREAM || HAS_PAKO;
-
-    // For local-user:// URLs, check if .gz version exists in the file list
-    if (isLocalUserUrl(url)) {
-      if (!supportsGzip) {
-        console.log('Loading uncompressed points file:', url);
-        const arrayBuffer = await fetchBinaryWithProgressInternal(url, trackerId, notifications);
-        if (trackerId) notifications.completeDownload(trackerId);
-        return new Float32Array(arrayBuffer);
-      }
-
-      const gzUrl = url + '.gz';
-      try {
-        const arrayBuffer = await fetchBinaryWithProgressInternal(gzUrl, trackerId, notifications);
-        console.log('Found compressed points file:', gzUrl);
-        if (trackerId) notifications.completeDownload(trackerId);
-        return new Float32Array(arrayBuffer);
-      } catch (_e) {
-        console.log('Loading uncompressed points file:', url);
-        const arrayBuffer = await fetchBinaryWithProgressInternal(url, trackerId, notifications);
-        if (trackerId) notifications.completeDownload(trackerId);
-        return new Float32Array(arrayBuffer);
-      }
-	    }
-
-	    // For all other URLs (including custom protocols like remote://, jupyter://),
-	    // try .gz version first, then fall back to uncompressed
-	    const gzUrl = url + '.gz';
-	    if (supportsGzip) {
-	      try {
-	        const arrayBuffer = await fetchBinaryWithProgressInternal(gzUrl, trackerId, notifications);
-	        console.log('Found compressed points file:', gzUrl);
-	        if (trackerId) notifications.completeDownload(trackerId);
-	        return new Float32Array(arrayBuffer);
-	      } catch (e) {
-	        console.log('Compressed file not available or failed:', e.message || e);
-	      }
-	    }
-
-	    // Fall back to original URL (non-gzipped)
-	    console.log('Loading uncompressed points file:', url);
-	    const arrayBuffer = await fetchBinaryWithProgressInternal(url, trackerId, notifications);
-    if (trackerId) notifications.completeDownload(trackerId);
-    return new Float32Array(arrayBuffer);
-
+    const arrayBuffer = await fetchBinaryWithProgressInternal(
+      url,
+      trackerId,
+      notifications,
+      signal
+    );
+    throwIfAborted(signal);
+    const positions = float32PositionsFromBuffer(arrayBuffer, url);
+    if (ownsTracker) notifications.completeDownload(trackerId);
+    return positions;
   } catch (error) {
-    if (trackerId) {
-      notifications.failDownload(trackerId, error.message);
-    }
+    finishOwnedTrackerWithError({
+      error,
+      notifications,
+      signal,
+      trackerId: ownsTracker ? trackerId : null
+    });
     throw error;
+  }
+}
+
+function float32PositionsFromBuffer(arrayBuffer, url) {
+  if (
+    !(arrayBuffer instanceof ArrayBuffer) ||
+    arrayBuffer.byteLength % Float32Array.BYTES_PER_ELEMENT !== 0
+  ) {
+    throw new Error(
+      `Invalid cell-position payload from ${url}: byte length must be a multiple of 4`
+    );
+  }
+  return new Float32Array(arrayBuffer);
+}
+
+function createAbortError() {
+  const error = new Error('Cell position loading was cancelled.');
+  error.name = 'AbortError';
+  return error;
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) {
+    throw createAbortError();
+  }
+}
+
+/**
+ * Observe a promise while allowing its consumer to stop waiting on abort.
+ *
+ * The underlying operation may not itself be cancellable. Both settlement
+ * handlers remain attached so a late resolve/reject cannot become stale
+ * application work or an unhandled rejection.
+ *
+ * @template T
+ * @param {Promise<T>|T} promise
+ * @param {AbortSignal|null} signal
+ * @returns {Promise<T>}
+ */
+function waitForAbort(promise, signal) {
+  if (!signal) {
+    return Promise.resolve(promise);
+  }
+  throwIfAborted(signal);
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      signal.removeEventListener('abort', onAbort);
+    };
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(createAbortError());
+    };
+
+    signal.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve(promise).then(
+      value => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(value);
+      },
+      error => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      }
+    );
+  });
+}
+
+function rethrowIfAborted(error, signal) {
+  if (error?.name === 'AbortError' || signal?.aborted) {
+    if (error?.name === 'AbortError') throw error;
+    throw createAbortError();
+  }
+}
+
+function finishOwnedTrackerWithError({
+  error,
+  notifications,
+  signal,
+  trackerId
+}) {
+  if (!trackerId) return;
+  if (error?.name === 'AbortError' || signal?.aborted) {
+    notifications.dismissDownload(trackerId);
+  } else {
+    notifications.failDownload(trackerId, error?.message || String(error));
   }
 }
 
 /**
  * Internal helper for progress-tracked binary fetch
  */
-async function fetchBinaryWithProgressInternal(url, trackerId, notifications) {
-  const resolvedUrl = await resolveAnyUrl(url);
-  const response = await fetch(resolvedUrl);
+async function fetchBinaryWithProgressInternal(
+  url,
+  trackerId,
+  notifications,
+  signal = null
+) {
+  throwIfAborted(signal);
+  const isGzipped = url.endsWith('.gz');
+  const GzipDecompressionStream = isGzipped
+    ? requireGzipDecompressionStream(url)
+    : null;
+  const resolvedUrl = await resolveAnyUrl(url, signal);
+  throwIfAborted(signal);
+  const response = await fetchSampleArtifact(
+    resolvedUrl,
+    signal ? { signal } : undefined
+  );
+  throwIfAborted(signal);
 
   if (!response.ok) {
     const err = new Error('Failed to load ' + url + ': ' + response.statusText);
@@ -372,7 +519,6 @@ async function fetchBinaryWithProgressInternal(url, trackerId, notifications) {
 
   const contentLength = response.headers.get('content-length');
   const totalBytes = contentLength ? parseInt(contentLength, 10) : null;
-  const isGzipped = url.endsWith('.gz');
 
   if (trackerId && response.body) {
     const reader = response.body.getReader();
@@ -380,10 +526,12 @@ async function fetchBinaryWithProgressInternal(url, trackerId, notifications) {
 
     // Stream into a new ReadableStream so we can:
     // - track progress without buffering all chunks twice
-    // - support streaming gzip decompression when available
+    // - stream gzip decompression through the selected browser backend
     const monitoredStream = new ReadableStream({
       async pull(controller) {
+        throwIfAborted(signal);
         const { done, value } = await reader.read();
+        throwIfAborted(signal);
         if (done) {
           controller.close();
           return;
@@ -394,7 +542,7 @@ async function fetchBinaryWithProgressInternal(url, trackerId, notifications) {
       },
       cancel() {
         try {
-          reader.cancel();
+          reader.cancel(createAbortError());
         } catch (_err) {
           // Ignore cancel errors
         }
@@ -402,34 +550,20 @@ async function fetchBinaryWithProgressInternal(url, trackerId, notifications) {
     });
 
     if (isGzipped) {
-      if (typeof DecompressionStream !== 'undefined') {
-        const ds = new DecompressionStream('gzip');
-        const decompressedStream = monitoredStream.pipeThrough(ds);
-        const decompressedResponse = new Response(decompressedStream);
-        return decompressedResponse.arrayBuffer();
-      } else if (typeof pako !== 'undefined') {
-        const compressedBuffer = await new Response(monitoredStream).arrayBuffer();
-        const decompressed = pako.inflate(new Uint8Array(compressedBuffer));
-        return decompressed.buffer.slice(decompressed.byteOffset, decompressed.byteOffset + decompressed.byteLength);
-      }
-      throw new Error('Gzip decompression not supported');
+      const decompressedStream = monitoredStream.pipeThrough(
+        new GzipDecompressionStream('gzip')
+      );
+      return new Response(decompressedStream).arrayBuffer();
     }
 
     return new Response(monitoredStream).arrayBuffer();
   }
 
-  // Fallback without progress tracking
-  if (isGzipped && typeof DecompressionStream !== 'undefined') {
-    const ds = new DecompressionStream('gzip');
-    const decompressedStream = response.body.pipeThrough(ds);
-    const decompressedResponse = new Response(decompressedStream);
-    return decompressedResponse.arrayBuffer();
-  } else if (isGzipped && typeof pako !== 'undefined') {
-    const compressedBuffer = await response.arrayBuffer();
-    const decompressed = pako.inflate(new Uint8Array(compressedBuffer));
-    return decompressed.buffer.slice(decompressed.byteOffset, decompressed.byteOffset + decompressed.byteLength);
-  } else if (isGzipped) {
-    throw new Error('Gzip decompression not supported');
+  if (isGzipped) {
+    const decompressedStream = response.body.pipeThrough(
+      new GzipDecompressionStream('gzip')
+    );
+    return new Response(decompressedStream).arrayBuffer();
   }
 
   return response.arrayBuffer();
@@ -439,38 +573,549 @@ async function fetchBinaryWithProgressInternal(url, trackerId, notifications) {
  * Convert filename to safe version (must match Python _safe_filename_component)
  */
 function safeFilenameComponent(name) {
-  let safe = String(name).replace(/[^A-Za-z0-9._-]+/g, '_');
+  if (typeof name !== 'string' || name.length === 0) {
+    throw new Error('Compact manifest field keys must be non-empty strings');
+  }
+  let safe = name.replace(/[^A-Za-z0-9._-]+/g, '_');
   safe = safe.replace(/^[._]+|[._]+$/g, '');
-  return safe || 'field';
+  if (safe.length === 0) {
+    throw new Error(
+      `Compact manifest field key "${name}" has no valid filename characters`
+    );
+  }
+  return safe;
+}
+
+function isRecord(value) {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    !Array.isArray(value)
+  );
+}
+
+function requireRecord(value, label) {
+  if (!isRecord(value)) {
+    throw new Error(`Invalid compact_v1 ${label}: expected an object`);
+  }
+}
+
+function requireExactKeys(value, expectedKeys, label) {
+  requireRecord(value, label);
+  const actualKeys = Object.keys(value);
+  const expected = new Set(expectedKeys);
+  const missing = expectedKeys.filter(key => !Object.hasOwn(value, key));
+  const extra = actualKeys.filter(key => !expected.has(key));
+  if (missing.length > 0 || extra.length > 0) {
+    const details = [];
+    if (missing.length > 0) {
+      details.push(`missing ${missing.join(', ')}`);
+    }
+    if (extra.length > 0) {
+      details.push(`unexpected ${extra.join(', ')}`);
+    }
+    throw new Error(
+      `Invalid compact_v1 ${label} properties: ${details.join('; ')}`
+    );
+  }
+}
+
+function requirePositivePointCount(value, label) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(
+      `Invalid compact_v1 ${label}: n_points must be a positive safe integer`
+    );
+  }
+}
+
+function requireCompression(value, label) {
+  if (
+    value !== null &&
+    (!Number.isInteger(value) || value < 1 || value > 9)
+  ) {
+    throw new Error(
+      `Invalid compact_v1 ${label}: compression must be null or an integer from 1 to 9`
+    );
+  }
+}
+
+function requireRelativePayloadPath(path, label) {
+  if (
+    typeof path !== 'string' ||
+    path.length === 0 ||
+    path.startsWith('/') ||
+    path.includes('\\') ||
+    path.includes('%') ||
+    path.includes('?') ||
+    path.includes('#') ||
+    /^[A-Za-z][A-Za-z0-9+.-]*:/.test(path)
+  ) {
+    throw new Error(
+      `Invalid compact_v1 ${label}: payload path must be a relative POSIX path`
+    );
+  }
+  const components = path.split('/');
+  if (
+    components.some(
+      component =>
+        component.length === 0 ||
+        component === '.' ||
+        component === '..'
+    )
+  ) {
+    throw new Error(
+      `Invalid compact_v1 ${label}: payload path contains an invalid component`
+    );
+  }
+}
+
+function validatePathTemplate({
+  template,
+  placeholders,
+  requiredTail,
+  compression,
+  label,
+}) {
+  if (typeof template !== 'string' || template.length === 0) {
+    throw new Error(
+      `Invalid compact_v1 ${label}: path template must be a non-empty string`
+    );
+  }
+
+  const tokens = template.match(/\{[^{}]*\}/g) ?? [];
+  if (
+    tokens.length !== placeholders.length ||
+    placeholders.some(
+      placeholder =>
+        tokens.filter(token => token === `{${placeholder}}`).length !== 1
+    ) ||
+    tokens.some(token => !placeholders.includes(token.slice(1, -1))) ||
+    template.replace(/\{[^{}]*\}/g, '').includes('{') ||
+    template.replace(/\{[^{}]*\}/g, '').includes('}')
+  ) {
+    throw new Error(
+      `Invalid compact_v1 ${label}: expected exactly the placeholders ` +
+      placeholders.map(value => `{${value}}`).join(', ')
+    );
+  }
+
+  const gzipSuffix = compression === null ? '' : '.gz';
+  if (!template.endsWith(`${requiredTail}${gzipSuffix}`)) {
+    throw new Error(
+      `Invalid compact_v1 ${label}: path must end with ` +
+      `"${requiredTail}${gzipSuffix}" and match compression metadata`
+    );
+  }
+
+  let concrete = template;
+  for (const placeholder of placeholders) {
+    concrete = concrete.replace(
+      `{${placeholder}}`,
+      placeholder === 'key' ? 'FIELD' : 'u8'
+    );
+  }
+  requireRelativePayloadPath(concrete, label);
+}
+
+function validateContinuousSchema(schema, {
+  compression,
+  label,
+  includeKind,
+}) {
+  requireRecord(schema, label);
+  if (typeof schema.quantized !== 'boolean') {
+    throw new Error(
+      `Invalid compact_v1 ${label}: quantized must be a boolean`
+    );
+  }
+
+  const baseKeys = includeKind
+    ? ['kind', 'pathPattern', 'ext', 'dtype', 'quantized']
+    : ['pathPattern', 'ext', 'dtype', 'quantized'];
+  const expectedKeys = schema.quantized
+    ? [...baseKeys, 'quantizationBits']
+    : baseKeys;
+  requireExactKeys(schema, expectedKeys, label);
+  if (includeKind && schema.kind !== 'continuous') {
+    throw new Error(
+      `Invalid compact_v1 ${label}: kind must be "continuous"`
+    );
+  }
+
+  if (schema.quantized) {
+    const expected = schema.quantizationBits === 8
+      ? { dtype: 'uint8', ext: 'u8' }
+      : schema.quantizationBits === 16
+        ? { dtype: 'uint16', ext: 'u16' }
+        : null;
+    if (
+      expected === null ||
+      schema.dtype !== expected.dtype ||
+      schema.ext !== expected.ext
+    ) {
+      throw new Error(
+        `Invalid compact_v1 ${label}: quantizationBits, dtype, and ext ` +
+        'must be exactly 8/uint8/u8 or 16/uint16/u16'
+      );
+    }
+  } else if (schema.dtype !== 'float32' || schema.ext !== 'f32') {
+    throw new Error(
+      `Invalid compact_v1 ${label}: an unquantized schema must use float32/f32`
+    );
+  }
+
+  validatePathTemplate({
+    template: schema.pathPattern,
+    placeholders: ['key'],
+    requiredTail: `{key}.values.${schema.ext}`,
+    compression,
+    label: `${label} pathPattern`,
+  });
+}
+
+function validateCategoricalSchema(schema, compression) {
+  const label = 'obs categorical schema';
+  requireExactKeys(schema, [
+    'codesPathPattern',
+    'outlierPathPattern',
+    'outlierExt',
+    'outlierDtype',
+    'outlierQuantized',
+  ], label);
+  if (typeof schema.outlierQuantized !== 'boolean') {
+    throw new Error(
+      `Invalid compact_v1 ${label}: outlierQuantized must be a boolean`
+    );
+  }
+
+  const outlierPayloadMembers = [
+    schema.outlierPathPattern,
+    schema.outlierExt,
+    schema.outlierDtype,
+  ];
+  const hasNoOutlierPayload = outlierPayloadMembers.every(
+    value => value === null
+  );
+  const hasPartialOutlierPayload = outlierPayloadMembers.some(
+    value => value === null
+  );
+  if (hasPartialOutlierPayload && !hasNoOutlierPayload) {
+    throw new Error(
+      `Invalid compact_v1 ${label}: outlier path, ext, and dtype must be ` +
+      'all present or all null'
+    );
+  }
+  if (hasNoOutlierPayload && schema.outlierQuantized !== false) {
+    throw new Error(
+      `Invalid compact_v1 ${label}: absent outlier data requires ` +
+      'outlierQuantized false'
+    );
+  }
+
+  validatePathTemplate({
+    template: schema.codesPathPattern,
+    placeholders: ['key', 'ext'],
+    requiredTail: '{key}.codes.{ext}',
+    compression,
+    label: `${label} codesPathPattern`,
+  });
+  if (hasNoOutlierPayload) {
+    return;
+  }
+
+  if (schema.outlierQuantized) {
+    const validPair =
+      (schema.outlierDtype === 'uint8' && schema.outlierExt === 'u8') ||
+      (schema.outlierDtype === 'uint16' && schema.outlierExt === 'u16');
+    if (!validPair) {
+      throw new Error(
+        `Invalid compact_v1 ${label}: quantized outliers must use ` +
+        'uint8/u8 or uint16/u16'
+      );
+    }
+  } else if (
+    schema.outlierDtype !== 'float32' ||
+    schema.outlierExt !== 'f32'
+  ) {
+    throw new Error(
+      `Invalid compact_v1 ${label}: unquantized outliers must use float32/f32`
+    );
+  }
+
+  validatePathTemplate({
+    template: schema.outlierPathPattern,
+    placeholders: ['key'],
+    requiredTail: `{key}.outliers.${schema.outlierExt}`,
+    compression,
+    label: `${label} outlierPathPattern`,
+  });
+}
+
+function validateFieldKey(key, {
+  rawKeys,
+  safeKeys,
+  label,
+}) {
+  const safeKey = safeFilenameComponent(key);
+  if (rawKeys.has(key)) {
+    throw new Error(
+      `Invalid compact_v1 ${label}: field key "${key}" is duplicated`
+    );
+  }
+  const collidingKey = safeKeys.get(safeKey);
+  if (collidingKey !== undefined) {
+    throw new Error(
+      `Invalid compact_v1 ${label}: field keys "${collidingKey}" and ` +
+      `"${key}" collide at payload path component "${safeKey}"`
+    );
+  }
+  rawKeys.add(key);
+  safeKeys.set(safeKey, key);
+  return safeKey;
+}
+
+function requireQuantizedBounds(minValue, maxValue, label) {
+  if (!Number.isFinite(minValue) || !Number.isFinite(maxValue)) {
+    throw new Error(
+      `Invalid compact_v1 ${label}: quantization bounds must be finite`
+    );
+  }
+  if (!(minValue < maxValue)) {
+    throw new Error(
+      `Invalid compact_v1 ${label}: minValue must be less than maxValue`
+    );
+  }
+}
+
+function validateCentroids(centroidsByDim, categories, nPoints, fieldKey) {
+  requireRecord(
+    centroidsByDim,
+    `categorical field "${fieldKey}" centroids`
+  );
+  const categorySet = new Set(categories);
+  for (const [dimensionKey, centroids] of Object.entries(centroidsByDim)) {
+    if (!/^[123]$/.test(dimensionKey)) {
+      throw new Error(
+        `Invalid compact_v1 categorical field "${fieldKey}" centroid ` +
+        `dimension "${dimensionKey}": expected 1, 2, or 3`
+      );
+    }
+    if (!Array.isArray(centroids)) {
+      throw new Error(
+        `Invalid compact_v1 categorical field "${fieldKey}" centroids for ` +
+        `${dimensionKey}D: expected an array`
+      );
+    }
+    const dimension = Number(dimensionKey);
+    const seenCategories = new Set();
+    for (const centroid of centroids) {
+      requireExactKeys(
+        centroid,
+        ['category', 'position', 'n_points'],
+        `categorical field "${fieldKey}" centroid`
+      );
+      if (
+        !categorySet.has(centroid.category) ||
+        seenCategories.has(centroid.category)
+      ) {
+        throw new Error(
+          `Invalid compact_v1 categorical field "${fieldKey}" centroid ` +
+          'category must reference one unique declared category'
+        );
+      }
+      seenCategories.add(centroid.category);
+      if (
+        !Array.isArray(centroid.position) ||
+        centroid.position.length !== dimension ||
+        centroid.position.some(value => !Number.isFinite(value))
+      ) {
+        throw new Error(
+          `Invalid compact_v1 categorical field "${fieldKey}" centroid ` +
+          `position must contain exactly ${dimension} finite values`
+        );
+      }
+      if (
+        !Number.isSafeInteger(centroid.n_points) ||
+        centroid.n_points < 0 ||
+        centroid.n_points > nPoints
+      ) {
+        throw new Error(
+          `Invalid compact_v1 categorical field "${fieldKey}" centroid ` +
+          'n_points must be a non-negative safe integer no greater than n_points'
+        );
+      }
+    }
+  }
+}
+
+function validateObsManifestHeader(manifest) {
+  requireExactKeys(manifest, [
+    '_format',
+    'n_points',
+    'centroid_outlier_quantile',
+    'latent_key',
+    'compression',
+    '_obsSchemas',
+    '_continuousFields',
+    '_categoricalFields',
+  ], 'obs manifest');
+  if (manifest._format !== 'compact_v1') {
+    throw new Error(
+      'Invalid obs manifest: expected the current compact_v1 contract'
+    );
+  }
+  requirePositivePointCount(manifest.n_points, 'obs manifest');
+  requireCompression(manifest.compression, 'obs manifest');
+  if (
+    manifest.centroid_outlier_quantile !== null &&
+    (
+      !Number.isFinite(manifest.centroid_outlier_quantile) ||
+      manifest.centroid_outlier_quantile <= 0 ||
+      manifest.centroid_outlier_quantile >= 1
+    )
+  ) {
+    throw new Error(
+      'Invalid compact_v1 obs manifest: centroid_outlier_quantile must be null or a finite number between 0 and 1'
+    );
+  }
+  if (
+    manifest.latent_key !== null &&
+    (
+      typeof manifest.latent_key !== 'string' ||
+      manifest.latent_key.length === 0
+    )
+  ) {
+    throw new Error(
+      'Invalid compact_v1 obs manifest: latent_key must be null or a non-empty string'
+    );
+  }
+  requireRecord(manifest._obsSchemas, 'obs schemas');
+  if (!Array.isArray(manifest._continuousFields)) {
+    throw new Error(
+      'Invalid compact_v1 obs manifest: _continuousFields must be an array'
+    );
+  }
+  if (!Array.isArray(manifest._categoricalFields)) {
+    throw new Error(
+      'Invalid compact_v1 obs manifest: _categoricalFields must be an array'
+    );
+  }
+
+  const expectedSchemaKeys = [];
+  if (manifest._continuousFields.length > 0) {
+    expectedSchemaKeys.push('continuous');
+  }
+  if (manifest._categoricalFields.length > 0) {
+    expectedSchemaKeys.push('categorical');
+  }
+  requireExactKeys(
+    manifest._obsSchemas,
+    expectedSchemaKeys,
+    'obs schemas'
+  );
+}
+
+function validateVarManifestHeader(manifest) {
+  requireExactKeys(manifest, [
+    '_format',
+    'n_points',
+    'var_gene_id_column',
+    'compression',
+    'quantization',
+    '_varSchema',
+    'fields',
+  ], 'var manifest');
+  if (manifest._format !== 'compact_v1') {
+    throw new Error(
+      'Invalid var manifest: expected the current compact_v1 contract'
+    );
+  }
+  requirePositivePointCount(manifest.n_points, 'var manifest');
+  requireCompression(manifest.compression, 'var manifest');
+  if (
+    manifest.var_gene_id_column !== null &&
+    (
+      typeof manifest.var_gene_id_column !== 'string' ||
+      manifest.var_gene_id_column.length === 0
+    )
+  ) {
+    throw new Error(
+      'Invalid compact_v1 var manifest: var_gene_id_column must be null or a non-empty string'
+    );
+  }
+  if (
+    manifest.quantization !== null &&
+    manifest.quantization !== 8 &&
+    manifest.quantization !== 16
+  ) {
+    throw new Error(
+      'Invalid compact_v1 var manifest: quantization must be null, 8, or 16'
+    );
+  }
+  if (!Array.isArray(manifest.fields)) {
+    throw new Error(
+      'Invalid compact_v1 var manifest: fields must be an array'
+    );
+  }
 }
 
 /**
- * Expand compact var manifest to original verbose format.
+ * Expand the sole current compact var manifest into the runtime field shape.
  * Compact format uses _varSchema + field tuples [key, minValue, maxValue].
  * @param {Object} manifest - Raw manifest (possibly compact)
  * @returns {Object} Expanded manifest with fields array
  */
 export function expandVarManifest(manifest) {
-  if (manifest._format !== 'compact_v1' || !manifest._varSchema) {
-    return manifest; // Already in original format
+  validateVarManifestHeader(manifest);
+  const schema = manifest._varSchema;
+  validateContinuousSchema(schema, {
+    compression: manifest.compression,
+    label: 'var schema',
+    includeKind: true,
+  });
+  const expectedQuantization = schema.quantized
+    ? schema.quantizationBits
+    : null;
+  if (manifest.quantization !== expectedQuantization) {
+    throw new Error(
+      'Invalid compact_v1 var manifest: quantization must exactly match the var schema'
+    );
   }
 
-  const schema = manifest._varSchema;
   const fields = [];
-
-  for (const fieldTuple of (manifest.fields || [])) {
+  const rawKeys = new Set();
+  const safeKeys = new Map();
+  for (const fieldTuple of manifest.fields) {
+    if (
+      !Array.isArray(fieldTuple) ||
+      fieldTuple.length !== (schema.quantized ? 3 : 1)
+    ) {
+      throw new Error(
+        `Invalid compact_v1 var field tuple: expected exactly ` +
+        (schema.quantized ? '[key, minValue, maxValue]' : '[key]')
+      );
+    }
     const key = fieldTuple[0];
-    const safeKey = safeFilenameComponent(key);
+    const safeKey = validateFieldKey(key, {
+      rawKeys,
+      safeKeys,
+      label: 'var manifest',
+    });
 
     const field = {
-      key: key,
+      key,
       kind: schema.kind,
       valuesPath: schema.pathPattern.replace('{key}', safeKey),
       valuesDtype: schema.dtype,
+      quantized: schema.quantized,
     };
 
     if (schema.quantized) {
-      field.quantized = true;
+      requireQuantizedBounds(
+        fieldTuple[1],
+        fieldTuple[2],
+        `var field "${key}"`
+      );
       field.quantizationBits = schema.quantizationBits;
       field.minValue = fieldTuple[1];
       field.maxValue = fieldTuple[2];
@@ -479,49 +1124,70 @@ export function expandVarManifest(manifest) {
     fields.push(field);
   }
 
-  // Return expanded manifest without underscore-prefixed keys
-  const result = {};
-  for (const [k, v] of Object.entries(manifest)) {
-    if (!k.startsWith('_')) {
-      result[k] = v;
-    }
-  }
-  result.fields = fields;
-  return result;
+  return {
+    n_points: manifest.n_points,
+    var_gene_id_column: manifest.var_gene_id_column,
+    compression: manifest.compression,
+    quantization: manifest.quantization,
+    fields,
+  };
 }
 
 /**
- * Expand compact obs manifest to original verbose format.
+ * Expand the sole current compact obs manifest into the runtime field shape.
  * Compact format uses _obsSchemas + _continuousFields + _categoricalFields.
  * @param {Object} manifest - Raw manifest (possibly compact)
  * @returns {Object} Expanded manifest with fields array
  */
 export function expandObsManifest(manifest) {
-  if (manifest._format !== 'compact_v1' || !manifest._obsSchemas) {
-    return manifest; // Already in original format
-  }
-
+  validateObsManifestHeader(manifest);
   const schemas = manifest._obsSchemas;
   const fields = [];
+  const rawKeys = new Set();
+  const safeKeys = new Map();
 
-  // Expand continuous fields
-  const contSchema = schemas.continuous;
-  if (contSchema) {
-    for (const fieldTuple of (manifest._continuousFields || [])) {
+  if (manifest._continuousFields.length > 0) {
+    const contSchema = schemas.continuous;
+    validateContinuousSchema(contSchema, {
+      compression: manifest.compression,
+      label: 'obs continuous schema',
+      includeKind: false,
+    });
+    for (const fieldTuple of manifest._continuousFields) {
+      if (
+        !Array.isArray(fieldTuple) ||
+        fieldTuple.length !== (contSchema.quantized ? 3 : 1)
+      ) {
+        throw new Error(
+          `Invalid compact_v1 continuous field tuple: expected exactly ` +
+          (contSchema.quantized
+            ? '[key, minValue, maxValue]'
+            : '[key]')
+        );
+      }
       const key = fieldTuple[0];
-      const safeKey = safeFilenameComponent(key);
+      const safeKey = validateFieldKey(key, {
+        rawKeys,
+        safeKeys,
+        label: 'obs manifest',
+      });
 
       const field = {
-        key: key,
+        key,
         kind: 'continuous',
         valuesPath: contSchema.pathPattern.replace('{key}', safeKey),
         valuesDtype: contSchema.dtype,
+        quantized: contSchema.quantized,
         centroids: null,
         outlierQuantilesPath: null,
       };
 
       if (contSchema.quantized) {
-        field.quantized = true;
+        requireQuantizedBounds(
+          fieldTuple[1],
+          fieldTuple[2],
+          `continuous field "${key}"`
+        );
         field.quantizationBits = contSchema.quantizationBits;
         field.minValue = fieldTuple[1];
         field.maxValue = fieldTuple[2];
@@ -531,48 +1197,67 @@ export function expandObsManifest(manifest) {
     }
   }
 
-  // Expand categorical fields
-  const catSchema = schemas.categorical;
-  if (catSchema) {
-    for (const fieldTuple of (manifest._categoricalFields || [])) {
-      // [key, categories, codesDtype, codesMissingValue, centroidsByDim, outlierMin?, outlierMax?]
-      // centroidsByDim is a dict: {"1": [...], "2": [...], "3": [...]} for per-dimension centroids
+  if (manifest._categoricalFields.length > 0) {
+    const catSchema = schemas.categorical;
+    validateCategoricalSchema(catSchema, manifest.compression);
+    for (const fieldTuple of manifest._categoricalFields) {
+      if (
+        !Array.isArray(fieldTuple) ||
+        fieldTuple.length !== (catSchema.outlierQuantized ? 7 : 5)
+      ) {
+        throw new Error(
+          `Invalid compact_v1 categorical field tuple: expected exactly ` +
+          (catSchema.outlierQuantized
+            ? '[key, categories, codesDtype, codesMissingValue, centroidsByDim, outlierMinValue, outlierMaxValue]'
+            : '[key, categories, codesDtype, codesMissingValue, centroidsByDim]')
+        );
+      }
       const key = fieldTuple[0];
-      const safeKey = safeFilenameComponent(key);
+      const safeKey = validateFieldKey(key, {
+        rawKeys,
+        safeKeys,
+        label: 'obs manifest',
+      });
       const categories = fieldTuple[1];
       const codesDtype = fieldTuple[2];
       const codesMissingValue = fieldTuple[3];
       const centroidsData = fieldTuple[4];
+      validateCategoricalStorage({
+        categories,
+        dtype: codesDtype,
+        missingValue: codesMissingValue,
+        fieldKey: key,
+      });
+      validateCentroids(
+        centroidsData,
+        categories,
+        manifest.n_points,
+        key
+      );
 
-      // Determine codes extension from dtype
       const codesExt = codesDtype === 'uint8' ? 'u8' : 'u16';
 
-      // Centroids must be provided as a dict keyed by dimension ("1", "2", "3", ...).
-      // Development phase policy: legacy centroid formats are not supported.
-      if (Array.isArray(centroidsData)) {
-        throw new Error(
-          `Unsupported legacy centroid format for categorical field "${key}". ` +
-          'Expected centroidsByDim object keyed by dimension.'
-        );
-      }
-      const centroidsByDim = (centroidsData && typeof centroidsData === 'object')
-        ? centroidsData
-        : {};
-
       const field = {
-        key: key,
+        key,
         kind: 'category',
-        categories: categories,
+        categories,
         codesPath: catSchema.codesPathPattern.replace('{key}', safeKey).replace('{ext}', codesExt),
-        codesDtype: codesDtype,
-        codesMissingValue: codesMissingValue,
-        outlierQuantilesPath: catSchema.outlierPathPattern.replace('{key}', safeKey),
+        codesDtype,
+        codesMissingValue,
+        outlierQuantilesPath: catSchema.outlierPathPattern === null
+          ? null
+          : catSchema.outlierPathPattern.replace('{key}', safeKey),
         outlierDtype: catSchema.outlierDtype,
-        centroidsByDim: centroidsByDim,
+        outlierQuantized: catSchema.outlierQuantized,
+        centroidsByDim: centroidsData,
       };
 
       if (catSchema.outlierQuantized) {
-        field.outlierQuantized = true;
+        requireQuantizedBounds(
+          fieldTuple[5],
+          fieldTuple[6],
+          `categorical field "${key}" outliers`
+        );
         field.outlierMinValue = fieldTuple[5];
         field.outlierMaxValue = fieldTuple[6];
       }
@@ -581,66 +1266,313 @@ export function expandObsManifest(manifest) {
     }
   }
 
-  // Return expanded manifest without underscore-prefixed keys
-  const result = {};
-  for (const [k, v] of Object.entries(manifest)) {
-    if (!k.startsWith('_')) {
-      result[k] = v;
-    }
-  }
-  result.fields = fields;
-  return result;
+  return {
+    n_points: manifest.n_points,
+    centroid_outlier_quantile: manifest.centroid_outlier_quantile,
+    latent_key: manifest.latent_key,
+    compression: manifest.compression,
+    fields,
+  };
 }
 
-export async function loadObsManifest(url) {
+function validateExpandedContinuousField(
+  field,
+  label,
+  { observationField = false } = {}
+) {
+  const expectedKeys = [
+    'key',
+    'kind',
+    'valuesPath',
+    'valuesDtype',
+    'quantized',
+    ...(observationField
+      ? ['centroids', 'outlierQuantilesPath']
+      : []),
+    ...(field?.quantized
+      ? ['quantizationBits', 'minValue', 'maxValue']
+      : []),
+  ];
+  requireExactKeys(field, expectedKeys, label);
+  if (
+    typeof field.key !== 'string' ||
+    field.key.length === 0 ||
+    field.kind !== 'continuous' ||
+    typeof field.valuesPath !== 'string' ||
+    field.valuesPath.length === 0 ||
+    typeof field.quantized !== 'boolean'
+  ) {
+    throw new Error(
+      `Invalid ${label}: expected an exact continuous field definition`
+    );
+  }
+  if (
+    observationField &&
+    (field.centroids !== null || field.outlierQuantilesPath !== null)
+  ) {
+    throw new Error(
+      `Invalid ${label}: continuous fields require null categorical metadata`
+    );
+  }
+  requireRelativePayloadPath(field.valuesPath, `${label} valuesPath`);
+
+  if (field.quantized) {
+    validateQuantizationMetadata({
+      dtype: field.valuesDtype,
+      bits: field.quantizationBits,
+      minValue: field.minValue,
+      maxValue: field.maxValue,
+    }, `${label} quantization codec`);
+  } else {
+    if (field.valuesDtype !== 'float32') {
+      throw new Error(
+        `Invalid ${label}: unquantized values must use float32`
+      );
+    }
+    if (
+      Object.hasOwn(field, 'quantizationBits') ||
+      Object.hasOwn(field, 'minValue') ||
+      Object.hasOwn(field, 'maxValue')
+    ) {
+      throw new Error(
+        `Invalid ${label}: unquantized values cannot declare quantization metadata`
+      );
+    }
+  }
+}
+
+function validateExpandedCategoricalField(field, label) {
+  requireExactKeys(field, [
+    'key',
+    'kind',
+    'categories',
+    'codesPath',
+    'codesDtype',
+    'codesMissingValue',
+    'outlierQuantilesPath',
+    'outlierDtype',
+    'outlierQuantized',
+    'centroidsByDim',
+    ...(field?.outlierQuantized
+      ? ['outlierMinValue', 'outlierMaxValue']
+      : []),
+  ], label);
+  if (
+    typeof field.key !== 'string' ||
+    field.key.length === 0 ||
+    field.kind !== 'category' ||
+    typeof field.codesPath !== 'string' ||
+    field.codesPath.length === 0 ||
+    typeof field.outlierQuantized !== 'boolean'
+  ) {
+    throw new Error(
+      `Invalid ${label}: expected an exact categorical field definition`
+    );
+  }
+  requireRelativePayloadPath(field.codesPath, `${label} codesPath`);
+  validateCategoricalStorage({
+    categories: field.categories,
+    dtype: field.codesDtype,
+    missingValue: field.codesMissingValue,
+    fieldKey: field.key,
+  });
+  requireRecord(field.centroidsByDim, `${label} centroidsByDim`);
+
+  const hasNoOutlierPayload =
+    field.outlierQuantilesPath === null &&
+    field.outlierDtype === null;
+  if (hasNoOutlierPayload) {
+    if (
+      field.outlierQuantized !== false ||
+      Object.hasOwn(field, 'outlierMinValue') ||
+      Object.hasOwn(field, 'outlierMaxValue')
+    ) {
+      throw new Error(
+        `Invalid ${label}: absent outlier data requires an exact all-null unquantized state`
+      );
+    }
+    return;
+  }
+  if (
+    typeof field.outlierQuantilesPath !== 'string' ||
+    field.outlierQuantilesPath.length === 0 ||
+    field.outlierDtype === null
+  ) {
+    throw new Error(
+      `Invalid ${label}: outlier path and dtype must be both present or both null`
+    );
+  }
+  requireRelativePayloadPath(
+    field.outlierQuantilesPath,
+    `${label} outlierQuantilesPath`
+  );
+
+  if (field.outlierQuantized) {
+    const bits = field.outlierDtype === 'uint8'
+      ? 8
+      : field.outlierDtype === 'uint16'
+        ? 16
+        : null;
+    validateQuantizationMetadata({
+      dtype: field.outlierDtype,
+      bits,
+      minValue: field.outlierMinValue,
+      maxValue: field.outlierMaxValue,
+    }, `${label} outlier quantization codec`);
+  } else {
+    if (field.outlierDtype !== 'float32') {
+      throw new Error(
+        `Invalid ${label}: unquantized outliers must use float32`
+      );
+    }
+    if (
+      Object.hasOwn(field, 'outlierMinValue') ||
+      Object.hasOwn(field, 'outlierMaxValue')
+    ) {
+      throw new Error(
+        `Invalid ${label}: unquantized outliers cannot declare quantization bounds`
+      );
+    }
+  }
+}
+
+function validateCategoricalCodeValues({
+  codes,
+  categories,
+  missingValue,
+  fieldKey,
+}) {
+  for (let index = 0; index < codes.length; index++) {
+    const code = codes[index];
+    if (code !== missingValue && code >= categories.length) {
+      throw new Error(
+        `Invalid categorical payload for field "${fieldKey}": code ${code} ` +
+        `at index ${index} exceeds ${categories.length} declared categories`
+      );
+    }
+  }
+}
+
+/**
+ * @param {string} url
+ * @param {{signal?: AbortSignal|null}} [options]
+ */
+export async function loadObsManifest(url, options = {}) {
+  const signal = getMetadataLoadSignal(
+    options,
+    'Observation manifest loader'
+  );
+  throwIfMetadataAborted(signal, 'Observation manifest loading');
+  const fetchInit = signal ? { signal } : undefined;
+
   // Handle AnnData source (h5ad or zarr) - unified handling
   if (shouldUseAnnData(url)) {
-    const manifest = anndataGetObsManifest();
+    const manifest = anndataGetObsManifest(url, { signal });
+    throwIfMetadataAborted(signal, 'Observation manifest loading');
     return expandObsManifest(manifest);
   }
 
   // Handle local-user:// URLs
   if (isLocalUserUrl(url)) {
-    const manifest = await fetchLocalUserJson(url);
+    const manifest = await fetchJsonWithProtocol(url, fetchInit);
+    throwIfMetadataAborted(signal, 'Observation manifest loading');
     return expandObsManifest(manifest);
   }
 
-  const response = await fetchOk(url);
+  const response = await fetchOk(url, fetchInit);
   const manifest = await response.json();
+  throwIfMetadataAborted(signal, 'Observation manifest loading');
   return expandObsManifest(manifest);
 }
 
 /**
  * Load obs field data with automatic dequantization for quantized fields.
- * Fully backward compatible with existing non-quantized data.
  * Handles gzip-compressed files automatically.
  * 
  * @param {string} manifestUrl - Base URL for resolving paths
  * @param {object} field - Field metadata from manifest
- * @returns {object} Loaded data with values/codes/outlierQuantiles
+ * @returns {object} Loaded data with declared values, codes, or outlier quantiles
  */
 export async function loadObsFieldData(manifestUrl, field, options = {}) {
   if (!field) throw new Error('No field metadata provided for obs field fetch.');
 
-  const { fetchInit } = options || {};
+  const { fetchInit } = options;
+  const hasValues = Object.hasOwn(field, 'valuesPath');
+  const hasCodes = Object.hasOwn(field, 'codesPath');
+  if (hasValues === hasCodes) {
+    throw new Error(
+      'Invalid obs field: expected exactly one continuous or categorical payload'
+    );
+  }
+  if (hasValues) {
+    validateExpandedContinuousField(
+      field,
+      `obs field "${field.key}"`,
+      { observationField: true }
+    );
+  } else {
+    validateExpandedCategoricalField(field, `obs field "${field.key}"`);
+  }
 
   // Handle AnnData source (h5ad or zarr) - unified handling
   if (shouldUseAnnData(manifestUrl)) {
-    const anndataData = await anndataLoadObsField(field.key);
+    const anndataData = await anndataLoadObsField(
+      manifestUrl,
+      field.key
+    );
     const outputs = { loaded: true };
 
-    if (anndataData.kind === 'continuous') {
+    if (hasValues && anndataData.kind === 'continuous') {
+      if (!(anndataData.data instanceof ArrayBuffer)) {
+        throw new Error(
+          `Invalid direct AnnData continuous payload for field "${field.key}"`
+        );
+      }
       outputs.values = new Float32Array(anndataData.data);
-    } else {
-      // Categorical
-      const dtype = anndataData.dtype === 'uint8' ? Uint8Array : Uint16Array;
-      const raw = new dtype(anndataData.data);
+    } else if (hasCodes && anndataData.kind === 'category') {
+      const codesDtype = validateCategoricalCodesDtype(
+        anndataData.dtype,
+        field.key
+      );
+      validateCategoricalStorage({
+        categories: anndataData.categories,
+        dtype: codesDtype,
+        missingValue: anndataData.missingValue,
+        fieldKey: field.key,
+      });
+      if (
+        codesDtype !== field.codesDtype ||
+        anndataData.missingValue !== field.codesMissingValue ||
+        anndataData.categories.length !== field.categories.length ||
+        anndataData.categories.some(
+          (category, index) => category !== field.categories[index]
+        )
+      ) {
+        throw new Error(
+          `Invalid direct AnnData categorical payload for field "${field.key}": ` +
+          'payload metadata must exactly match the adopted manifest'
+        );
+      }
+      if (!(anndataData.data instanceof ArrayBuffer)) {
+        throw new Error(
+          `Invalid direct AnnData categorical payload for field "${field.key}"`
+        );
+      }
+      const TypedArrayClass =
+        codesDtype === 'uint8' ? Uint8Array : Uint16Array;
+      const raw = new TypedArrayClass(anndataData.data);
+      validateCategoricalCodeValues({
+        codes: raw,
+        categories: anndataData.categories,
+        missingValue: anndataData.missingValue,
+        fieldKey: field.key,
+      });
 
       // Convert uint8 to uint16 for consistency
-      if (anndataData.dtype === 'uint8') {
+      if (codesDtype === 'uint8') {
         const u16 = new Uint16Array(raw.length);
-        const missingU8 = 255;
-        const missingU16 = anndataData.missingValue || 65535;
+        const missingU8 = anndataData.missingValue;
+        const missingU16 = 65_535;
         for (let i = 0; i < raw.length; i++) {
           u16[i] = raw[i] === missingU8 ? missingU16 : raw[i];
         }
@@ -648,9 +1580,10 @@ export async function loadObsFieldData(manifestUrl, field, options = {}) {
       } else {
         outputs.codes = raw;
       }
-
-      // No outlier quantiles from AnnData (would need latent space computation)
-      outputs.outlierQuantiles = new Float32Array(raw.length);
+    } else {
+      throw new Error(
+        `Invalid direct AnnData field "${field.key}": payload kind must match the adopted manifest`
+      );
     }
 
     return outputs;
@@ -660,23 +1593,22 @@ export async function loadObsFieldData(manifestUrl, field, options = {}) {
   const outputs = { loaded: true };
 
   // Load continuous values
-  if (field.valuesPath) {
+  if (hasValues) {
     const url = resolveUrl(manifestUrl, field.valuesPath);
+    const quantizationBackend = field.quantized
+      ? await selectQuantizationBackend()
+      : null;
     const buffer = await fetchBinary(url, fetchInit);
-    const dtype = field.valuesDtype || 'float32';
+    const dtype = field.valuesDtype;
 
-    // Check if quantized and needs dequantization
-    if (field.quantized && (dtype === 'uint8' || dtype === 'uint16') &&
-        field.minValue !== undefined && field.maxValue !== undefined) {
-      const bits = field.quantizationBits || (dtype === 'uint8' ? 8 : 16);
+    if (field.quantized) {
       outputs.values = await dequantizeToFloat32({
+        backend: quantizationBackend,
         buffer,
         dtype,
         minValue: field.minValue,
         maxValue: field.maxValue,
-        bits,
-        urlForError: url,
-        refetchBuffer: () => fetchBinary(url, fetchInit)
+        bits: field.quantizationBits,
       });
     } else {
       // Non-quantized or already float32
@@ -685,17 +1617,26 @@ export async function loadObsFieldData(manifestUrl, field, options = {}) {
   }
 
   // Load categorical codes
-  if (field.codesPath) {
+  if (hasCodes) {
     const url = resolveUrl(manifestUrl, field.codesPath);
     const buffer = await fetchBinary(url, fetchInit);
-    const dtype = field.codesDtype || 'uint16';
+    const dtype = validateCategoricalCodesDtype(
+      field.codesDtype,
+      field.key
+    );
     const raw = typedArrayFromBuffer(buffer, dtype, url);
+    validateCategoricalCodeValues({
+      codes: raw,
+      categories: field.categories,
+      missingValue: field.codesMissingValue,
+      fieldKey: field.key,
+    });
 
     // If uint8 codes, convert to uint16 for consistency with rest of app
     if (dtype === 'uint8') {
       const u16 = new Uint16Array(raw.length);
-      const missingU8 = 255;
-      const missingU16 = field.codesMissingValue !== undefined ? field.codesMissingValue : 65535;
+      const missingU8 = field.codesMissingValue;
+      const missingU16 = 65_535;
       for (let i = 0; i < raw.length; i++) {
         u16[i] = raw[i] === missingU8 ? missingU16 : raw[i];
       }
@@ -708,20 +1649,21 @@ export async function loadObsFieldData(manifestUrl, field, options = {}) {
   // Load outlier quantiles
   if (field.outlierQuantilesPath) {
     const url = resolveUrl(manifestUrl, field.outlierQuantilesPath);
+    const quantizationBackend = field.outlierQuantized
+      ? await selectQuantizationBackend()
+      : null;
     const buffer = await fetchBinary(url, fetchInit);
-    const dtype = field.outlierDtype || 'float32';
+    const dtype = field.outlierDtype;
 
-    // Check if quantized and needs dequantization
-    if (field.outlierQuantized && (dtype === 'uint8' || dtype === 'uint16')) {
+    if (field.outlierQuantized) {
       const bits = dtype === 'uint8' ? 8 : 16;
       outputs.outlierQuantiles = await dequantizeToFloat32({
+        backend: quantizationBackend,
         buffer,
         dtype,
-        minValue: field.outlierMinValue !== undefined ? field.outlierMinValue : 0,
-        maxValue: field.outlierMaxValue !== undefined ? field.outlierMaxValue : 1,
+        minValue: field.outlierMinValue,
+        maxValue: field.outlierMaxValue,
         bits,
-        urlForError: url,
-        refetchBuffer: () => fetchBinary(url, fetchInit)
       });
     } else {
       outputs.outlierQuantiles = typedArrayFromBuffer(buffer, dtype, url);
@@ -732,21 +1674,35 @@ export async function loadObsFieldData(manifestUrl, field, options = {}) {
 }
 
 // Var/gene expression manifest loader
-export async function loadVarManifest(url) {
+/**
+ * @param {string} url
+ * @param {{signal?: AbortSignal|null}} [options]
+ */
+export async function loadVarManifest(url, options = {}) {
+  const signal = getMetadataLoadSignal(
+    options,
+    'Variable manifest loader'
+  );
+  throwIfMetadataAborted(signal, 'Variable manifest loading');
+  const fetchInit = signal ? { signal } : undefined;
+
   // Handle AnnData source (h5ad or zarr) - unified handling
   if (shouldUseAnnData(url)) {
-    const manifest = anndataGetVarManifest();
+    const manifest = anndataGetVarManifest(url, { signal });
+    throwIfMetadataAborted(signal, 'Variable manifest loading');
     return expandVarManifest(manifest);
   }
 
   // Handle local-user:// URLs
   if (isLocalUserUrl(url)) {
-    const manifest = await fetchLocalUserJson(url);
+    const manifest = await fetchJsonWithProtocol(url, fetchInit);
+    throwIfMetadataAborted(signal, 'Variable manifest loading');
     return expandVarManifest(manifest);
   }
 
-  const response = await fetchOk(url);
+  const response = await fetchOk(url, fetchInit);
   const manifest = await response.json();
+  throwIfMetadataAborted(signal, 'Variable manifest loading');
   return expandVarManifest(manifest);
 }
 
@@ -765,34 +1721,36 @@ export async function loadVarFieldData(manifestUrl, field, options = {}) {
 
   // Handle AnnData source (h5ad or zarr) - unified handling
   if (shouldUseAnnData(manifestUrl)) {
-    const values = await anndataLoadGeneExpression(field.key);
+    const values = await anndataLoadGeneExpression(
+      manifestUrl,
+      field.key
+    );
     return { loaded: true, values };
   }
+
+  validateExpandedContinuousField(field, `var field "${field.key}"`);
 
   // Note: Notifications are handled by the caller (state.js) to avoid duplicates
   const outputs = { loaded: true };
 
-  if (field.valuesPath) {
-    const url = resolveUrl(manifestUrl, field.valuesPath);
-    const buffer = await fetchBinary(url, fetchInit);
-    const dtype = field.valuesDtype || 'float32';
+  const url = resolveUrl(manifestUrl, field.valuesPath);
+  const quantizationBackend = field.quantized
+    ? await selectQuantizationBackend()
+    : null;
+  const buffer = await fetchBinary(url, fetchInit);
+  const dtype = field.valuesDtype;
 
-    // Check if quantized and needs dequantization
-    if (field.quantized && (dtype === 'uint8' || dtype === 'uint16') &&
-        field.minValue !== undefined && field.maxValue !== undefined) {
-      const bits = field.quantizationBits || (dtype === 'uint8' ? 8 : 16);
-      outputs.values = await dequantizeToFloat32({
-        buffer,
-        dtype,
-        minValue: field.minValue,
-        maxValue: field.maxValue,
-        bits,
-        urlForError: url,
-        refetchBuffer: () => fetchBinary(url, fetchInit)
-      });
-    } else {
-      outputs.values = typedArrayFromBuffer(buffer, dtype, url);
-    }
+  if (field.quantized) {
+    outputs.values = await dequantizeToFloat32({
+      backend: quantizationBackend,
+      buffer,
+      dtype,
+      minValue: field.minValue,
+      maxValue: field.maxValue,
+      bits: field.quantizationBits,
+    });
+  } else {
+    outputs.values = typedArrayFromBuffer(buffer, dtype, url);
   }
 
   return outputs;
@@ -831,135 +1789,214 @@ export function createVarFieldLoader(manifestUrl, options = {}) {
 // - Direct GPU upload (no CPU processing)
 // - Instanced rendering with texture lookups
 // - Visibility filtering in shader
-// - Support for uint16, uint32, and uint64 indices
+// - Exact uint16 or uint32 prepared indices; direct readers publish uint32
+
+function connectivityContextForUrl(url) {
+  return shouldUseAnnData(url)
+    ? CONNECTIVITY_MANIFEST_CONTEXT.DIRECT
+    : CONNECTIVITY_MANIFEST_CONTEXT.FILE;
+}
+
+function requireConnectivityManifestForUrl(manifestUrl, manifest) {
+  const context = connectivityContextForUrl(manifestUrl);
+  const validated = validateConnectivityManifest(manifest, context);
+  if (validated === null) {
+    throw new Error(
+      'No connectivity data is available for this direct AnnData dataset'
+    );
+  }
+  return { context, manifest: validated };
+}
+
+function readFileConnectivityIndices(buffer, manifest, url) {
+  const expectedBytes = manifest.n_edges * manifest.index_bytes;
+  if (
+    !(buffer instanceof ArrayBuffer) ||
+    buffer.byteLength !== expectedBytes
+  ) {
+    throw new Error(
+      `Invalid connectivity payload from ${url}: expected exactly ` +
+      `${expectedBytes} bytes for ${manifest.n_edges} ${manifest.index_dtype} indices`
+    );
+  }
+  return typedArrayFromBuffer(buffer, manifest.index_dtype, url);
+}
+
+function readFileConnectivityWeights(buffer, manifest, url) {
+  const expectedBytes = manifest.n_edges * manifest.weight_bytes;
+  if (
+    !(buffer instanceof ArrayBuffer) ||
+    buffer.byteLength !== expectedBytes
+  ) {
+    throw new Error(
+      `Invalid connectivity payload from ${url}: expected exactly ` +
+      `${expectedBytes} bytes for ${manifest.n_edges} ${manifest.weight_dtype} weights`
+    );
+  }
+  return typedArrayFromBuffer(buffer, manifest.weight_dtype, url);
+}
+
+function normalizeConnectivityIndices(indices) {
+  if (indices instanceof Uint32Array) {
+    return indices;
+  }
+  if (indices instanceof Uint16Array) {
+    return Uint32Array.from(indices);
+  }
+  throw new TypeError(
+    'Connectivity indices must use the exact uint16 or uint32 manifest dtype'
+  );
+}
+
+async function loadDirectConnectivityEdges(
+  manifestUrl,
+  manifest,
+  signal
+) {
+  const edgeData = await anndataLoadConnectivity(
+    manifestUrl,
+    { signal }
+  );
+  if (edgeData === null) {
+    throw new Error(
+      'Direct AnnData connectivity payload is absent despite its manifest'
+    );
+  }
+  return validateConnectivityEdgeData(edgeData, manifest);
+}
+
+async function loadFileConnectivityIndices(
+  manifestUrl,
+  manifest,
+  path,
+  signal
+) {
+  const url = resolveUrl(manifestUrl, path);
+  const buffer = await fetchBinary(url, { signal });
+  throwIfMetadataAborted(signal, 'Connectivity edge loading');
+  return readFileConnectivityIndices(buffer, manifest, url);
+}
+
+async function loadFileConnectivityWeights(
+  manifestUrl,
+  manifest,
+  signal
+) {
+  const url = resolveUrl(manifestUrl, manifest.weightsPath);
+  const buffer = await fetchBinary(url, { signal });
+  throwIfMetadataAborted(signal, 'Connectivity edge loading');
+  return readFileConnectivityWeights(buffer, manifest, url);
+}
 
 /**
  * Load connectivity manifest
  * @param {string} url - URL to connectivity manifest JSON
- * @returns {Promise<Object>} Connectivity manifest
+ * @param {{signal?: AbortSignal|null}} [options]
+ * @returns {Promise<Object|null>} Connectivity manifest or exact direct absence
  */
-export async function loadConnectivityManifest(url) {
+export async function loadConnectivityManifest(url, options = {}) {
+  const signal = getMetadataLoadSignal(
+    options,
+    'Connectivity manifest loader'
+  );
+  throwIfMetadataAborted(signal, 'Connectivity manifest loading');
+  const context = connectivityContextForUrl(url);
+
   // Handle AnnData source (h5ad or zarr) - unified handling
-  if (shouldUseAnnData(url)) {
-    const manifest = await anndataGetConnectivityManifest();
-    return manifest;
+  if (context === CONNECTIVITY_MANIFEST_CONTEXT.DIRECT) {
+    const manifest = await anndataGetConnectivityManifest(
+      url,
+      { signal }
+    );
+    throwIfMetadataAborted(signal, 'Connectivity manifest loading');
+    return validateConnectivityManifest(manifest, context);
   }
 
-  // Handle local-user:// URLs
-  if (isLocalUserUrl(url)) {
-    return fetchLocalUserJson(url);
-  }
-
-  const response = await fetchOk(url);
-  return response.json();
-}
-
-/**
- * Check if manifest has valid edge format
- * @param {Object} manifest - Connectivity manifest
- * @returns {boolean} True if edge format is available
- */
-export function hasEdgeFormat(manifest) {
-  if (!manifest || manifest.format !== 'edge_pairs') {
-    return false;
-  }
-  // For file-based sources: need sourcesPath and destinationsPath
-  // For anndata sources: just need n_edges > 0 (edges loaded directly from adapter)
-  const hasFilePaths = manifest.sourcesPath && manifest.destinationsPath;
-  const hasAnndataEdges = manifest.n_edges > 0 && !manifest.sourcesPath;
-  return hasFilePaths || hasAnndataEdges;
-}
-
-/**
- * Load edge sources array (sorted for optimal compression)
- * @param {string} manifestUrl - Base URL for manifest
- * @param {Object} manifest - Connectivity manifest
- * @returns {Promise<Uint16Array|Uint32Array|BigUint64Array>} Edge source indices
- */
-export async function loadEdgeSources(manifestUrl, manifest) {
-  if (!hasEdgeFormat(manifest)) {
-    throw new Error('Invalid connectivity manifest: missing edge format.');
-  }
-  // AnnData sources load edges directly from the adapter (no file paths).
-  if (shouldUseAnnData(manifestUrl)) {
-    const edgeData = await anndataLoadConnectivity();
-    if (!edgeData) {
-      throw new Error('No connectivity data in AnnData file');
-    }
-    return edgeData.sources;
-  }
-  const url = resolveUrl(manifestUrl, manifest.sourcesPath);
-  const buffer = await fetchBinary(url);
-  return typedArrayFromBuffer(buffer, manifest.index_dtype, url);
-}
-
-/**
- * Load edge destinations array (sorted for optimal compression)
- * @param {string} manifestUrl - Base URL for manifest
- * @param {Object} manifest - Connectivity manifest
- * @returns {Promise<Uint16Array|Uint32Array|BigUint64Array>} Edge destination indices
- */
-export async function loadEdgeDestinations(manifestUrl, manifest) {
-  if (!hasEdgeFormat(manifest)) {
-    throw new Error('Invalid connectivity manifest: missing edge format.');
-  }
-  // AnnData sources load edges directly from the adapter (no file paths).
-  if (shouldUseAnnData(manifestUrl)) {
-    const edgeData = await anndataLoadConnectivity();
-    if (!edgeData) {
-      throw new Error('No connectivity data in AnnData file');
-    }
-    return edgeData.destinations;
-  }
-  const url = resolveUrl(manifestUrl, manifest.destinationsPath);
-  const buffer = await fetchBinary(url);
-  return typedArrayFromBuffer(buffer, manifest.index_dtype, url);
+  const fetchInit = signal ? { signal } : undefined;
+  const manifest = isLocalUserUrl(url)
+    ? await fetchJsonWithProtocol(url, fetchInit)
+    : await (await fetchOk(url, fetchInit)).json();
+  throwIfMetadataAborted(signal, 'Connectivity manifest loading');
+  return validateConnectivityManifest(manifest, context);
 }
 
 /**
  * Load both edge arrays in parallel
  * @param {string} manifestUrl - Base URL for manifest
  * @param {Object} manifest - Connectivity manifest
- * @returns {Promise<{sources: TypedArray, destinations: TypedArray, nEdges: number, nCells: number, maxNeighbors: number, indexDtype: string}>}
+ * @param {{signal: AbortSignal}} options - Required load owner
+ * @returns {Promise<{sources: Uint32Array, destinations: Uint32Array, weights: Float64Array, nEdges: number, nCells: number, maxNeighbors: number}>}
  */
-export async function loadEdges(manifestUrl, manifest) {
-  // Handle AnnData source (h5ad or zarr) - unified handling
-  if (shouldUseAnnData(manifestUrl)) {
-    const edgeData = await anndataLoadConnectivity();
-    if (!edgeData) {
-      throw new Error('No connectivity data in AnnData file');
-    }
+export async function loadEdges(manifestUrl, manifest, options) {
+  const signal = getMetadataLoadSignal(
+    options,
+    'Connectivity edge loader'
+  );
+  if (signal === null) {
+    throw new TypeError(
+      'Connectivity edge loader options.signal is required'
+    );
+  }
+  throwIfMetadataAborted(signal, 'Connectivity edge loading');
+  const validated = requireConnectivityManifestForUrl(
+    manifestUrl,
+    manifest
+  );
+
+  if (validated.context === CONNECTIVITY_MANIFEST_CONTEXT.DIRECT) {
+    const edgeData = await loadDirectConnectivityEdges(
+      manifestUrl,
+      validated.manifest,
+      signal
+    );
+    throwIfMetadataAborted(signal, 'Connectivity edge loading');
     return {
       sources: edgeData.sources,
       destinations: edgeData.destinations,
+      weights: edgeData.weights,
       nEdges: edgeData.nEdges,
-      nCells: manifest?.n_cells || edgeData.sources.length,
-      maxNeighbors: manifest?.max_neighbors || 0,
-      indexDtype: 'uint32'
+      nCells: edgeData.nCells,
+      maxNeighbors: edgeData.maxNeighbors
     };
   }
 
-  if (!hasEdgeFormat(manifest)) {
-    throw new Error('Invalid connectivity manifest: missing edge format.');
-  }
-  const [rawSources, rawDestinations] = await Promise.all([
-    loadEdgeSources(manifestUrl, manifest),
-    loadEdgeDestinations(manifestUrl, manifest)
+  const [rawSources, rawDestinations, weights] = await Promise.all([
+    loadFileConnectivityIndices(
+      manifestUrl,
+      validated.manifest,
+      validated.manifest.sourcesPath,
+      signal
+    ),
+    loadFileConnectivityIndices(
+      manifestUrl,
+      validated.manifest,
+      validated.manifest.destinationsPath,
+      signal
+    ),
+    loadFileConnectivityWeights(
+      manifestUrl,
+      validated.manifest,
+      signal
+    ),
   ]);
-
-  // Convert to Uint32Array to handle uint64 dtypes (BigUint64Array cannot be
-  // assigned to regular typed arrays, and WebGL textures use uint32 anyway).
-  // This is safe because cell counts > 4 billion are unrealistic.
-  const sources = toUint32Array(rawSources);
-  const destinations = toUint32Array(rawDestinations);
-
+  throwIfMetadataAborted(signal, 'Connectivity edge loading');
+  const edgeData = {
+    sources: normalizeConnectivityIndices(rawSources),
+    destinations: normalizeConnectivityIndices(rawDestinations),
+    weights,
+    nEdges: validated.manifest.n_edges,
+    nCells: validated.manifest.n_cells,
+    maxNeighbors: validated.manifest.max_neighbors,
+  };
+  validateConnectivityEdgeData(edgeData, validated.manifest);
+  throwIfMetadataAborted(signal, 'Connectivity edge loading');
   return {
-    sources,
-    destinations,
-    nEdges: manifest.n_edges,
-    nCells: manifest.n_cells,
-    maxNeighbors: manifest.max_neighbors,
-    indexDtype: 'uint32' // Always uint32 after conversion
+    sources: edgeData.sources,
+    destinations: edgeData.destinations,
+    weights: edgeData.weights,
+    nEdges: edgeData.nEdges,
+    nCells: edgeData.nCells,
+    maxNeighbors: edgeData.maxNeighbors
   };
 }
 
@@ -970,21 +2007,35 @@ export async function loadEdges(manifestUrl, manifest) {
 /**
  * Load dataset identity JSON (includes embeddings metadata for multi-dimensional support)
  * @param {string} url - URL to dataset_identity.json
+ * @param {{signal?: AbortSignal|null}} [options]
  * @returns {Promise<Object>} Dataset identity with embeddings metadata
  */
-export async function loadDatasetIdentity(url) {
+export async function loadDatasetIdentity(url, options = {}) {
+  const signal = getMetadataLoadSignal(
+    options,
+    'Dataset identity loader'
+  );
+  throwIfMetadataAborted(signal, 'Dataset identity loading');
+  const fetchInit = signal ? { signal } : undefined;
+
   // Handle AnnData source (h5ad or zarr) - unified handling
   if (shouldUseAnnData(url)) {
-    return anndataGetDatasetIdentity();
+    const identity = anndataGetDatasetIdentity(url, { signal });
+    throwIfMetadataAborted(signal, 'Dataset identity loading');
+    return identity;
   }
 
   // Handle local-user:// URLs
   if (isLocalUserUrl(url)) {
-    return fetchLocalUserJson(url);
+    const identity = await fetchJsonWithProtocol(url, fetchInit);
+    throwIfMetadataAborted(signal, 'Dataset identity loading');
+    return identity;
   }
 
-  const response = await fetchOk(url);
-  return response.json();
+  const response = await fetchOk(url, fetchInit);
+  const identity = await response.json();
+  throwIfMetadataAborted(signal, 'Dataset identity loading');
+  return identity;
 }
 
 /**
@@ -1003,6 +2054,121 @@ export function getEmbeddingsMetadata(identity) {
 // ANALYSIS-SPECIFIC BULK DATA LOADER
 // ============================================================================
 
+function requireExactAnalysisLoadOptions(
+  options,
+  requiredKeys,
+  optionalKeys,
+  label
+) {
+  if (
+    options === null ||
+    typeof options !== 'object' ||
+    Array.isArray(options)
+  ) {
+    throw new TypeError(`${label} options must be an object`);
+  }
+  const allowed = new Set([...requiredKeys, ...optionalKeys]);
+  const missing = requiredKeys.filter(key => !Object.hasOwn(options, key));
+  const unexpected = Object.keys(options).filter(key => !allowed.has(key));
+  if (missing.length > 0 || unexpected.length > 0) {
+    throw new TypeError(
+      `${label} options must contain the exact current keys; ` +
+      `missing=[${missing.join(', ')}], unexpected=[${unexpected.join(', ')}]`
+    );
+  }
+}
+
+function requireAnalysisManifestSelection({
+  manifest,
+  requestedKeys,
+  variableLabel,
+  manifestLabel,
+}) {
+  if (
+    manifest === null ||
+    typeof manifest !== 'object' ||
+    Array.isArray(manifest) ||
+    !Array.isArray(manifest.fields)
+  ) {
+    throw new TypeError(`${manifestLabel} must contain a fields array`);
+  }
+  if (!Array.isArray(requestedKeys) || requestedKeys.length === 0) {
+    throw new TypeError(
+      `${variableLabel} list must be a non-empty array`
+    );
+  }
+
+  const fieldsByKey = new Map();
+  for (const [index, field] of manifest.fields.entries()) {
+    if (
+      field === null ||
+      typeof field !== 'object' ||
+      Array.isArray(field) ||
+      typeof field.key !== 'string' ||
+      field.key.length === 0 ||
+      field.key !== field.key.trim()
+    ) {
+      throw new TypeError(
+        `${manifestLabel} fields[${index}].key must be exact non-empty text`
+      );
+    }
+    if (fieldsByKey.has(field.key)) {
+      throw new Error(
+        `${manifestLabel} contains duplicate field "${field.key}"`
+      );
+    }
+    fieldsByKey.set(field.key, field);
+  }
+
+  const seen = new Set();
+  for (const [index, key] of requestedKeys.entries()) {
+    if (
+      typeof key !== 'string' ||
+      key.length === 0 ||
+      key !== key.trim()
+    ) {
+      throw new TypeError(
+        `Requested ${variableLabel} at index ${index} must be exact non-empty text`
+      );
+    }
+    if (seen.has(key)) {
+      throw new Error(`Requested ${variableLabel} "${key}" is duplicated`);
+    }
+    seen.add(key);
+    if (!fieldsByKey.has(key)) {
+      throw new Error(
+        `Requested ${variableLabel} "${key}" is not declared by ${manifestLabel}`
+      );
+    }
+  }
+  return fieldsByKey;
+}
+
+function requireAnalysisBatchOptions({
+  manifestUrl,
+  batchSize,
+  onProgress,
+  suppressNotifications,
+  label,
+}) {
+  if (
+    typeof manifestUrl !== 'string' ||
+    manifestUrl.length === 0 ||
+    manifestUrl !== manifestUrl.trim()
+  ) {
+    throw new TypeError(`${label} manifestUrl must be exact non-empty text`);
+  }
+  if (!Number.isSafeInteger(batchSize) || batchSize <= 0) {
+    throw new TypeError(`${label} batchSize must be a positive safe integer`);
+  }
+  if (onProgress !== undefined && typeof onProgress !== 'function') {
+    throw new TypeError(`${label} onProgress must be a function or undefined`);
+  }
+  if (typeof suppressNotifications !== 'boolean') {
+    throw new TypeError(`${label} suppressNotifications must be a boolean`);
+  }
+}
+
 /**
  * Load bulk analysis data: multiple gene expressions in parallel batches.
  * Optimized for analysis workflows requiring many genes at once.
@@ -1014,112 +2180,91 @@ export function getEmbeddingsMetadata(identity) {
  * @param {string[]} options.geneList - Genes to load
  * @param {number} [options.batchSize=20] - Number of genes to load in parallel
  * @param {Function} [options.onProgress] - Progress callback (0-100)
- * @returns {Promise<Object>} { genes: { geneName: Float32Array }, loadedCount, failedCount }
+ * @returns {Promise<Object>} { genes: { geneName: Float32Array }, loadedCount }
  */
 export async function loadAnalysisBulkData(options) {
+  requireExactAnalysisLoadOptions(
+    options,
+    ['manifestUrl', 'varManifest', 'geneList'],
+    ['batchSize', 'onProgress', 'suppressNotifications'],
+    'Bulk gene loader'
+  );
   const {
     manifestUrl,
     varManifest,
     geneList,
     batchSize = 20,
-    onProgress
+    onProgress,
+    suppressNotifications = false
   } = options;
+  requireAnalysisBatchOptions({
+    manifestUrl,
+    batchSize,
+    onProgress,
+    suppressNotifications,
+    label: 'Bulk gene loader',
+  });
+  const fieldsByKey = requireAnalysisManifestSelection({
+    manifest: varManifest,
+    requestedKeys: geneList,
+    variableLabel: 'gene',
+    manifestLabel: 'var_manifest.json',
+  });
 
-  const notifications = getNotificationCenter();
-  const trackerId = notifications.show({
+  const notifications = suppressNotifications ? null : getNotificationCenter();
+  const trackerId = notifications?.show({
     type: 'progress',
     category: 'data',
     title: 'Loading Gene Expression',
     message: `Preparing ${geneList.length} genes...`,
     progress: 0
-  });
-
+  }) ?? null;
   const result = {
     genes: {},
     loadedCount: 0,
-    failedCount: 0,
-    failedGenes: []
   };
 
   try {
-    // Build gene field lookup
-    const fieldLookup = new Map();
-    if (varManifest && varManifest.fields) {
-      for (const field of varManifest.fields) {
-        fieldLookup.set(field.key, field);
-      }
-    }
-
-    // Filter to genes that exist in manifest
-    const validGenes = geneList.filter(gene => fieldLookup.has(gene));
-    const missingGenes = geneList.filter(gene => !fieldLookup.has(gene));
-
-    if (missingGenes.length > 0) {
-      result.failedGenes.push(...missingGenes);
-      result.failedCount += missingGenes.length;
-    }
-
-    if (validGenes.length === 0) {
-      notifications.complete(trackerId, 'No valid genes found');
-      return result;
-    }
-
-    // Load genes in parallel batches
     let loadedCount = 0;
-    const totalGenes = validGenes.length;
+    const totalGenes = geneList.length;
 
-    for (let i = 0; i < validGenes.length; i += batchSize) {
-      const batch = validGenes.slice(i, i + batchSize);
+    for (let i = 0; i < geneList.length; i += batchSize) {
+      const batch = geneList.slice(i, i + batchSize);
+      const batchResults = await Promise.all(
+        batch.map(async geneName => {
+          const data = await loadVarFieldData(
+            manifestUrl,
+            fieldsByKey.get(geneName)
+          );
+          if (!(data.values instanceof Float32Array)) {
+            throw new TypeError(
+              `Gene "${geneName}" must load as a Float32Array`
+            );
+          }
+          return { geneName, values: data.values };
+        })
+      );
 
-      // Load batch in parallel
-      const batchPromises = batch.map(async (geneName) => {
-        const field = fieldLookup.get(geneName);
-        try {
-          const data = await loadVarFieldData(manifestUrl, field);
-          return { geneName, values: data.values, success: true };
-        } catch (error) {
-          console.warn(`[loadAnalysisBulkData] Failed to load gene ${geneName}:`, error.message);
-          return { geneName, values: null, success: false, error: error.message };
-        }
-      });
-
-      const batchResults = await Promise.all(batchPromises);
-
-      // Process batch results
       for (const res of batchResults) {
-        if (res.success && res.values) {
-          result.genes[res.geneName] = res.values;
-          result.loadedCount++;
-        } else {
-          result.failedGenes.push(res.geneName);
-          result.failedCount++;
-        }
+        result.genes[res.geneName] = res.values;
+        result.loadedCount++;
       }
 
-      // Update progress
       loadedCount += batch.length;
       const progress = Math.round((loadedCount / totalGenes) * 100);
-
-      notifications.updateProgress(trackerId, progress, {
+      notifications?.updateProgress(trackerId, progress, {
         message: `Loaded ${loadedCount} of ${totalGenes} genes...`
       });
-
-      if (onProgress) {
-        onProgress(progress);
-      }
+      onProgress?.(progress);
     }
 
-    // Complete notification
-    const message = result.failedCount > 0
-      ? `Loaded ${result.loadedCount} genes (${result.failedCount} failed)`
-      : `Loaded ${result.loadedCount} genes`;
-
-    notifications.complete(trackerId, message);
-
+    notifications?.complete(
+      trackerId,
+      `Loaded ${result.loadedCount} genes`
+    );
     return result;
-
   } catch (error) {
-    notifications.fail(trackerId, `Failed: ${error.message}`);
+    notifications?.fail(trackerId, `Failed: ${error.message}`);
     throw error;
   }
 }
@@ -1137,27 +2282,52 @@ export async function loadAnalysisBulkData(options) {
 export async function loadLatentEmbeddings(options) {
   const { baseUrl, identity, dimension = 2 } = options;
 
+  if (!Number.isInteger(dimension) || dimension < 1 || dimension > 3) {
+    throw new Error(
+      `Requested embedding dimension must be exactly 1, 2, or 3; received ${String(dimension)}`
+    );
+  }
+
+  const embeddings = getEmbeddingsMetadata(identity);
+  const available = embeddings.available_dimensions;
+  if (
+    !Array.isArray(available) ||
+    available.length === 0 ||
+    available.some(
+      value => !Number.isInteger(value) || value < 1 || value > 3
+    ) ||
+    new Set(available).size !== available.length
+  ) {
+    throw new Error(
+      'Embeddings metadata must declare unique numeric available_dimensions from 1, 2, or 3'
+    );
+  }
+  if (!available.includes(dimension)) {
+    throw new Error(
+      `Requested ${dimension}D embedding is not available; ` +
+      `available dimensions: ${available.map(value => `${value}D`).join(', ')}`
+    );
+  }
+
+  const dimKey = `${dimension}d`;
+  const files = embeddings.files;
+  const filePath = files?.[dimKey];
+  if (
+    !files ||
+    typeof files !== 'object' ||
+    Array.isArray(files) ||
+    !Object.hasOwn(files, dimKey) ||
+    typeof filePath !== 'string' ||
+    filePath.length === 0
+  ) {
+    throw new Error(
+      `Embeddings metadata for ${dimension}D must advertise one non-empty file path`
+    );
+  }
+
   const notifications = getNotificationCenter();
   const trackerId = notifications.startDownload(`${dimension}D Embeddings`);
-
   try {
-    const embeddings = getEmbeddingsMetadata(identity);
-
-    if (!embeddings) {
-      throw new Error('No embeddings metadata available');
-    }
-
-    // Check if requested dimension is available
-    const available = embeddings.available_dimensions || [3];
-    if (!available.includes(dimension)) {
-      // Fall back to highest available dimension
-      const fallbackDim = Math.max(...available);
-      console.warn(`[loadLatentEmbeddings] Dimension ${dimension} not available, using ${fallbackDim}`);
-    }
-
-    // Determine file path
-    const dimKey = `${dimension}d`;
-    const filePath = embeddings.files?.[dimKey] || `points_${dimension}d.bin`;
     const url = resolveUrl(baseUrl, filePath);
 
     // Load the points
@@ -1193,26 +2363,61 @@ export async function loadLatentEmbeddings(options) {
  * @param {number[]} options.cellIndices - Cell indices to extract
  * @param {number} [options.batchSize=20] - Batch size for parallel loading
  * @param {Function} [options.onProgress] - Progress callback
+ * @param {boolean} [options.suppressNotifications=false] - Suppress progress UI
  * @returns {Promise<Object>} { genes: { geneName: { values, indices } }, cellCount }
  */
 export async function loadAnalysisSubset(options) {
+  requireExactAnalysisLoadOptions(
+    options,
+    ['manifestUrl', 'varManifest', 'geneList', 'cellIndices'],
+    ['batchSize', 'onProgress', 'suppressNotifications'],
+    'Analysis subset loader'
+  );
   const {
     manifestUrl,
     varManifest,
     geneList,
     cellIndices,
     batchSize = 20,
-    onProgress
+    onProgress,
+    suppressNotifications = false
   } = options;
 
-  const notifications = getNotificationCenter();
-  const trackerId = notifications.show({
+  requireAnalysisBatchOptions({
+    manifestUrl,
+    batchSize,
+    onProgress,
+    suppressNotifications,
+    label: 'Analysis subset loader',
+  });
+  if (!Array.isArray(cellIndices)) {
+    throw new TypeError(
+      'Analysis subset loader cellIndices must be an array'
+    );
+  }
+  const seenCellIndices = new Set();
+  for (const [index, cellIndex] of cellIndices.entries()) {
+    if (!Number.isSafeInteger(cellIndex) || cellIndex < 0) {
+      throw new TypeError(
+        `Analysis subset loader cellIndices[${index}] must be a non-negative safe integer`
+      );
+    }
+    if (seenCellIndices.has(cellIndex)) {
+      throw new Error(
+        `Analysis subset loader cell index ${cellIndex} is duplicated`
+      );
+    }
+    seenCellIndices.add(cellIndex);
+  }
+
+  const notifications = suppressNotifications ? null : getNotificationCenter();
+  const trackerId = notifications?.show({
     type: 'progress',
     category: 'data',
     title: 'Loading Subset Data',
     message: `Loading ${geneList.length} genes for ${cellIndices.length} cells...`,
     progress: 0
-  });
+  }) ?? null;
 
   try {
     // First load all gene data
@@ -1221,57 +2426,78 @@ export async function loadAnalysisSubset(options) {
       varManifest,
       geneList,
       batchSize,
+      suppressNotifications: true,
       onProgress: (p) => {
-        notifications.updateProgress(trackerId, Math.round(p * 0.8), {
+        notifications?.updateProgress(trackerId, Math.round(p * 0.8), {
           message: `Loading genes (${Math.round(p)}%)...`
         });
-        if (onProgress) onProgress(Math.round(p * 0.8));
+        onProgress?.(Math.round(p * 0.8));
       }
     });
 
     // Extract values for specified cell indices
-    notifications.updateProgress(trackerId, 85, {
+    notifications?.updateProgress(trackerId, 85, {
       message: 'Extracting cell values...'
     });
+
+    const loadedGenes = Object.keys(bulkResult.genes);
+    if (
+      loadedGenes.length !== geneList.length ||
+      geneList.some(geneName => !Object.hasOwn(bulkResult.genes, geneName))
+    ) {
+      throw new Error(
+        'Analysis subset loader did not receive every requested gene'
+      );
+    }
+    for (const geneName of geneList) {
+      const fullValues = bulkResult.genes[geneName];
+      if (!(fullValues instanceof Float32Array)) {
+        throw new TypeError(
+          `Analysis subset gene "${geneName}" must be a Float32Array`
+        );
+      }
+      for (const cellIndex of cellIndices) {
+        if (cellIndex >= fullValues.length) {
+          throw new RangeError(
+            `Cell index ${cellIndex} is outside gene "${geneName}" values length ` +
+            `${fullValues.length}`
+          );
+        }
+      }
+    }
 
     const result = {
       genes: {},
       cellCount: cellIndices.length,
-      cellIndices
+      cellIndices: [...cellIndices]
     };
 
-    // Create index set for fast lookup
-    const indexSet = new Set(cellIndices);
-    const indexArray = Array.from(cellIndices);
-
-    for (const [geneName, fullValues] of Object.entries(bulkResult.genes)) {
+    const indexArray = [...cellIndices];
+    for (const geneName of geneList) {
+      const fullValues = bulkResult.genes[geneName];
       const subsetValues = new Float32Array(cellIndices.length);
 
       for (let i = 0; i < indexArray.length; i++) {
         const cellIdx = indexArray[i];
-        if (cellIdx < fullValues.length) {
-          subsetValues[i] = fullValues[cellIdx];
-        } else {
-          subsetValues[i] = NaN;
-        }
+        subsetValues[i] = fullValues[cellIdx];
       }
 
       result.genes[geneName] = {
         values: subsetValues,
-        indices: indexArray
+        indices: [...indexArray]
       };
     }
 
-    notifications.complete(trackerId,
+    notifications?.complete(trackerId,
       `Loaded ${Object.keys(result.genes).length} genes for ${cellIndices.length} cells`
     );
 
-    if (onProgress) onProgress(100);
+    onProgress?.(100);
 
     return result;
 
   } catch (error) {
-    notifications.fail(trackerId, `Failed: ${error.message}`);
+    notifications?.fail(trackerId, `Failed: ${error.message}`);
     throw error;
   }
 }
@@ -1303,17 +2529,36 @@ export async function loadAnalysisSubset(options) {
  * @param {string[]} options.fieldList - Field keys to load
  * @param {number} [options.batchSize=10] - Number of fields to load in parallel (lower than genes due to larger data)
  * @param {Function} [options.onProgress] - Progress callback (0-100)
- * @returns {Promise<Object>} { fields: { fieldKey: { values?, codes?, categories?, kind } }, loadedCount, failedCount }
+ * @returns {Promise<Object>} { fields: { fieldKey: { values?, codes?, categories?, kind } }, loadedCount }
  */
 export async function loadAnalysisBulkObsData(options) {
+  requireExactAnalysisLoadOptions(
+    options,
+    ['manifestUrl', 'obsManifest', 'fieldList'],
+    ['batchSize', 'onProgress', 'suppressNotifications'],
+    'Bulk observation loader'
+  );
   const {
     manifestUrl,
     obsManifest,
     fieldList,
-    batchSize = 10, // Lower batch size than genes - obs fields can be larger
+    batchSize = 10,
     onProgress,
     suppressNotifications = false
   } = options;
+  requireAnalysisBatchOptions({
+    manifestUrl,
+    batchSize,
+    onProgress,
+    suppressNotifications,
+    label: 'Bulk observation loader',
+  });
+  const fieldsByKey = requireAnalysisManifestSelection({
+    manifest: obsManifest,
+    requestedKeys: fieldList,
+    variableLabel: 'observation field',
+    manifestLabel: 'obs_manifest.json',
+  });
 
   const notifications = suppressNotifications ? null : getNotificationCenter();
   const trackerId = notifications ? notifications.show({
@@ -1327,83 +2572,60 @@ export async function loadAnalysisBulkObsData(options) {
   const result = {
     fields: {},
     loadedCount: 0,
-    failedCount: 0,
-    failedFields: []
   };
 
   try {
-    // Build field lookup from manifest
-    const fieldLookup = new Map();
-    if (obsManifest && obsManifest.fields) {
-      for (const field of obsManifest.fields) {
-        fieldLookup.set(field.key, field);
-      }
-    }
-
-    // Filter to fields that exist in manifest
-    const validFields = fieldList.filter(key => fieldLookup.has(key));
-    const missingFields = fieldList.filter(key => !fieldLookup.has(key));
-
-    if (missingFields.length > 0) {
-      result.failedFields.push(...missingFields);
-      result.failedCount += missingFields.length;
-      console.warn('[loadAnalysisBulkObsData] Fields not found in manifest:', missingFields);
-    }
-
-    if (validFields.length === 0) {
-      if (notifications && trackerId) {
-        notifications.complete(trackerId, 'No valid fields found');
-      }
-      return result;
-    }
-
-    // Load fields in parallel batches
     let loadedCount = 0;
-    const totalFields = validFields.length;
+    const totalFields = fieldList.length;
 
-    for (let i = 0; i < validFields.length; i += batchSize) {
-      const batch = validFields.slice(i, i + batchSize);
-
-      // Load batch in parallel
-      const batchPromises = batch.map(async (fieldKey) => {
-        const field = fieldLookup.get(fieldKey);
-        try {
+    for (let i = 0; i < fieldList.length; i += batchSize) {
+      const batch = fieldList.slice(i, i + batchSize);
+      const batchResults = await Promise.all(
+        batch.map(async fieldKey => {
+          const field = fieldsByKey.get(fieldKey);
           const data = await loadObsFieldData(manifestUrl, field);
-
-          // Determine field kind and structure result
+          if (field.kind !== 'continuous' && field.kind !== 'category') {
+            throw new TypeError(
+              `Observation field "${fieldKey}" must declare its exact kind`
+            );
+          }
+          if (
+            field.kind === 'continuous' &&
+            !(data.values instanceof Float32Array)
+          ) {
+            throw new TypeError(
+              `Continuous observation field "${fieldKey}" must load as Float32Array`
+            );
+          }
+          if (
+            field.kind === 'category' &&
+            (!(data.codes instanceof Uint16Array) ||
+              !Array.isArray(field.categories))
+          ) {
+            throw new TypeError(
+              `Categorical observation field "${fieldKey}" must load exact codes and categories`
+            );
+          }
           const fieldResult = {
-            kind: field.kind || (data.codes ? 'category' : 'continuous'),
-            categories: field.categories || null
+            kind: field.kind,
+            categories: field.kind === 'category' ? field.categories : null
           };
 
-          if (data.values) {
+          if (field.kind === 'continuous') {
             fieldResult.values = data.values;
-          }
-          if (data.codes) {
+          } else {
             fieldResult.codes = data.codes;
           }
 
-          return { fieldKey, data: fieldResult, success: true };
-        } catch (error) {
-          console.warn(`[loadAnalysisBulkObsData] Failed to load field ${fieldKey}:`, error.message);
-          return { fieldKey, data: null, success: false, error: error.message };
-        }
-      });
+          return { fieldKey, data: fieldResult };
+        })
+      );
 
-      const batchResults = await Promise.all(batchPromises);
-
-      // Process batch results
       for (const res of batchResults) {
-        if (res.success && res.data) {
-          result.fields[res.fieldKey] = res.data;
-          result.loadedCount++;
-        } else {
-          result.failedFields.push(res.fieldKey);
-          result.failedCount++;
-        }
+        result.fields[res.fieldKey] = res.data;
+        result.loadedCount++;
       }
 
-      // Update progress
       loadedCount += batch.length;
       const progress = Math.round((loadedCount / totalFields) * 100);
 
@@ -1413,18 +2635,14 @@ export async function loadAnalysisBulkObsData(options) {
         });
       }
 
-      if (onProgress) {
-        onProgress(progress);
-      }
+      onProgress?.(progress);
     }
 
-    // Complete notification
-    const message = result.failedCount > 0
-      ? `Loaded ${result.loadedCount} fields (${result.failedCount} failed)`
-      : `Loaded ${result.loadedCount} fields`;
-
     if (notifications && trackerId) {
-      notifications.complete(trackerId, message);
+      notifications.complete(
+        trackerId,
+        `Loaded ${result.loadedCount} fields`
+      );
     }
 
     return result;

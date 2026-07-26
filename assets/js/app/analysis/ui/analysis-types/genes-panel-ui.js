@@ -75,6 +75,16 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     /** @type {HoverContext|null} */
     this._hoverContext = null;
 
+    /**
+     * Exact Plotly listener ownership for the active hover context.
+     * @type {{
+     *   container: HTMLElement,
+     *   hoverHandler: Function,
+     *   unhoverHandler: Function
+     * }|null}
+     */
+    this._hoverPlotBinding = null;
+
     /** @type {ProgressTracker|null} */
     this._progressTracker = null;
 
@@ -279,27 +289,43 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
    */
   _getFormValues() {
     const form = this._formContainer?.querySelector('.analysis-form');
-    if (!form) return {};
+    if (!form) {
+      throw new Error('Marker analysis form is not mounted');
+    }
 
     const getValue = (name) => {
       const el = form.querySelector(`[name="${name}"]`);
-      if (!el) return null;
-      if (el.type === 'checkbox') return el.checked;
+      if (!el) {
+        throw new Error(`Marker analysis form field "${name}" is required`);
+      }
+      if (el.type === 'checkbox') {
+        if (typeof el.checked !== 'boolean') {
+          throw new TypeError(
+            `Marker analysis checkbox "${name}" must expose a boolean checked state`
+          );
+        }
+        return el.checked;
+      }
+      if (typeof el.value !== 'string' || el.value.length === 0) {
+        throw new TypeError(
+          `Marker analysis form field "${name}" must expose a non-empty value`
+        );
+      }
       return el.value;
     };
 
     const values = {
       obsCategory: getValue('obsCategory'),
       mode: getValue('mode'),
-      topNPerGroup: 'all',
-      method: getValue('method') || DEFAULTS.method,
+      topNPerGroup: DEFAULTS.topNPerGroup,
+      method: getValue('method'),
       // Thresholds are adjusted dynamically in the figure modal; keep defaults for initial run.
       pValueThreshold: DEFAULTS.pValueThreshold,
       foldChangeThreshold: DEFAULTS.foldChangeThreshold,
       transform: DEFAULTS.transform,
       colorscale: DEFAULTS.colorscale,
-      distance: getValue('distance') || DEFAULTS.distance,
-      linkage: getValue('linkage') || DEFAULTS.linkage,
+      distance: getValue('distance'),
+      linkage: getValue('linkage'),
       clusterRows: getValue('clusterRows'),
       clusterCols: getValue('clusterCols'),
       useAdjustedPValue: DEFAULTS.useAdjustedPValue,
@@ -310,7 +336,12 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
 
     // Handle custom genes
     if (values.mode === 'custom' && this._customGenesInput) {
-      const text = this._customGenesInput.value || '';
+      if (typeof this._customGenesInput.value !== 'string') {
+        throw new TypeError(
+          'Custom marker gene input must expose a string value'
+        );
+      }
+      const text = this._customGenesInput.value;
       values.customGenes = text
         .split(/[\n,]+/)
         .map(g => g.trim())
@@ -1338,68 +1369,347 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
    * @private
    */
   _setupHoverContext(plotContainer, result) {
-    // Clean up existing hover context
-    if (this._hoverContext) {
-      this._hoverContext.destroy();
+    if (
+      plotContainer === null ||
+      typeof plotContainer !== 'object' ||
+      plotContainer.nodeType !== 1 ||
+      typeof plotContainer.on !== 'function' ||
+      typeof plotContainer.removeListener !== 'function'
+    ) {
+      throw new TypeError(
+        'Marker heatmap container must expose Plotly on and removeListener methods'
+      );
+    }
+    if (
+      result === null ||
+      typeof result !== 'object' ||
+      Array.isArray(result) ||
+      result.data === null ||
+      typeof result.data !== 'object' ||
+      Array.isArray(result.data) ||
+      result.data.matrix === null ||
+      typeof result.data.matrix !== 'object' ||
+      Array.isArray(result.data.matrix)
+    ) {
+      throw new TypeError(
+        'Marker heatmap hover requires an exact result matrix'
+      );
     }
 
-    // Create new hover context
-    this._hoverContext = new HoverContext({
-      container: document.body,
-      markers: result.markers
+    const matrix = result.data.matrix;
+    const { genes, groupIds, groupNames, nRows, nCols } = matrix;
+    if (
+      !Number.isSafeInteger(nRows) ||
+      nRows < 1 ||
+      !Number.isSafeInteger(nCols) ||
+      nCols < 1 ||
+      !Array.isArray(genes) ||
+      genes.length !== nRows ||
+      genes.some(gene => typeof gene !== 'string' || gene.length === 0) ||
+      new Set(genes).size !== genes.length ||
+      !Array.isArray(groupIds) ||
+      groupIds.length !== nCols ||
+      groupIds.some(
+        groupId => typeof groupId !== 'string' || groupId.length === 0
+      ) ||
+      new Set(groupIds).size !== groupIds.length ||
+      !Array.isArray(groupNames) ||
+      groupNames.length !== nCols ||
+      groupNames.some(
+        groupName => typeof groupName !== 'string' || groupName.length === 0
+      )
+    ) {
+      throw new TypeError(
+        'Marker heatmap hover matrix axes must match its exact dimensions'
+      );
+    }
+
+    const markerLookup = this._buildHoverMarkerLookup(
+      result.markers,
+      groupIds
+    );
+    const ownerDocument = plotContainer.ownerDocument;
+    if (
+      ownerDocument === null ||
+      typeof ownerDocument !== 'object' ||
+      ownerDocument.body === null ||
+      typeof ownerDocument.body !== 'object'
+    ) {
+      throw new TypeError(
+        'Marker heatmap container must belong to a mounted document'
+      );
+    }
+
+    this._teardownHoverContext();
+    const hoverContext = new HoverContext({
+      container: ownerDocument.body,
+      offset: 10
     });
 
-    // Attach to plot events
-    plotContainer.on?.('plotly_hover', (data) => {
-      if (!data.points || data.points.length === 0) return;
-
+    const hoverHandler = data => {
+      if (
+        data === null ||
+        typeof data !== 'object' ||
+        Array.isArray(data) ||
+        !Array.isArray(data.points) ||
+        data.points.length !== 1
+      ) {
+        throw new TypeError(
+          'Plotly marker hover must contain exactly one point'
+        );
+      }
       const point = data.points[0];
-      const gene = point.x;
-      const group = point.y;
-      const value = point.z;
-
-      const getClientPosition = () => {
-        const evt = data?.event || point?.event;
-        if (evt?.touches?.length) {
-          return { x: evt.touches[0].clientX, y: evt.touches[0].clientY };
-        }
-        if (Number.isFinite(evt?.clientX) && Number.isFinite(evt?.clientY)) {
-          return { x: evt.clientX, y: evt.clientY };
-        }
-
-        // Plotly provides pixel coordinates relative to the plot area.
-        if (Number.isFinite(point?.xpx) && Number.isFinite(point?.ypx) && plotContainer?.getBoundingClientRect) {
-          const rect = plotContainer.getBoundingClientRect();
-          return { x: rect.left + point.xpx, y: rect.top + point.ypx };
-        }
-
-        // Last resort: center of plot container.
-        if (plotContainer?.getBoundingClientRect) {
-          const rect = plotContainer.getBoundingClientRect();
-          return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
-        }
-
-        return { x: 0, y: 0 };
-      };
-
-      // Find marker info
-      let markerInfo = null;
-      if (result.markers?.groups?.[group]) {
-        markerInfo = result.markers.groups[group].markers.find(m => m.gene === gene);
+      if (
+        point === null ||
+        typeof point !== 'object' ||
+        Array.isArray(point) ||
+        !Array.isArray(point.pointNumber) ||
+        point.pointNumber.length !== 2 ||
+        !Number.isSafeInteger(point.pointNumber[0]) ||
+        !Number.isSafeInteger(point.pointNumber[1])
+      ) {
+        throw new TypeError(
+          'Plotly marker hover point must expose an exact heatmap index pair'
+        );
+      }
+      const [groupIndex, geneIndex] = point.pointNumber;
+      if (
+        groupIndex < 0 ||
+        groupIndex >= nCols ||
+        geneIndex < 0 ||
+        geneIndex >= nRows
+      ) {
+        throw new RangeError(
+          'Plotly marker hover point is outside the heatmap matrix'
+        );
+      }
+      const gene = genes[geneIndex];
+      const group = groupNames[groupIndex];
+      if (
+        point.x !== gene ||
+        point.y !== group ||
+        !Number.isFinite(point.z)
+      ) {
+        throw new TypeError(
+          'Plotly marker hover point does not match the rendered matrix cell'
+        );
+      }
+      const event = data.event;
+      if (
+        event === null ||
+        typeof event !== 'object' ||
+        !Number.isFinite(event.clientX) ||
+        !Number.isFinite(event.clientY)
+      ) {
+        throw new TypeError(
+          'Plotly marker hover event must expose finite client coordinates'
+        );
       }
 
-      this._hoverContext.show({
+      let markerInfo = null;
+      if (markerLookup !== null) {
+        const groupMarkers = markerLookup.get(groupIds[groupIndex]);
+        if (groupMarkers.has(gene)) {
+          markerInfo = groupMarkers.get(gene);
+        }
+      }
+
+      hoverContext.show({
         gene,
         group,
-        value,
-        position: getClientPosition(),
+        value: point.z,
+        position: { x: event.clientX, y: event.clientY },
         markerInfo
       });
-    });
+    };
 
-    plotContainer.on?.('plotly_unhover', () => {
-      this._hoverContext.hide();
-    });
+    const unhoverHandler = () => {
+      hoverContext.hide(100);
+    };
+
+    let hoverAttached = false;
+    let unhoverAttached = false;
+    try {
+      plotContainer.on('plotly_hover', hoverHandler);
+      hoverAttached = true;
+      plotContainer.on('plotly_unhover', unhoverHandler);
+      unhoverAttached = true;
+    } catch (error) {
+      const cleanupErrors = [error];
+      if (unhoverAttached) {
+        try {
+          plotContainer.removeListener('plotly_unhover', unhoverHandler);
+        } catch (cleanupError) {
+          cleanupErrors.push(cleanupError);
+        }
+      }
+      if (hoverAttached) {
+        try {
+          plotContainer.removeListener('plotly_hover', hoverHandler);
+        } catch (cleanupError) {
+          cleanupErrors.push(cleanupError);
+        }
+      }
+      try {
+        hoverContext.destroy();
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+      if (cleanupErrors.length === 1) throw error;
+      throw new AggregateError(
+        cleanupErrors,
+        'Marker heatmap hover setup and cleanup both failed'
+      );
+    }
+
+    this._hoverContext = hoverContext;
+    this._hoverPlotBinding = {
+      container: plotContainer,
+      hoverHandler,
+      unhoverHandler
+    };
+  }
+
+  /**
+   * Normalize current marker results into exact tooltip display records.
+   * @private
+   */
+  _buildHoverMarkerLookup(markers, groupIds) {
+    if (markers === null) return null;
+    if (
+      markers === undefined ||
+      typeof markers !== 'object' ||
+      Array.isArray(markers) ||
+      markers.groups === null ||
+      typeof markers.groups !== 'object' ||
+      Array.isArray(markers.groups)
+    ) {
+      throw new TypeError(
+        'Marker heatmap marker results must be null or own a groups record'
+      );
+    }
+
+    const lookup = new Map();
+    for (const groupId of groupIds) {
+      if (!Object.hasOwn(markers.groups, groupId)) {
+        throw new Error(
+          `Marker heatmap results are missing group "${groupId}"`
+        );
+      }
+      const group = markers.groups[groupId];
+      if (
+        group === null ||
+        typeof group !== 'object' ||
+        Array.isArray(group) ||
+        group.groupId !== groupId ||
+        !Array.isArray(group.markers)
+      ) {
+        throw new TypeError(
+          `Marker heatmap group "${groupId}" is malformed`
+        );
+      }
+      const groupLookup = new Map();
+      for (const marker of group.markers) {
+        if (
+          marker === null ||
+          typeof marker !== 'object' ||
+          Array.isArray(marker) ||
+          typeof marker.gene !== 'string' ||
+          marker.gene.length === 0 ||
+          marker.groupId !== groupId ||
+          !Number.isFinite(marker.pValue) ||
+          marker.pValue < 0 ||
+          marker.pValue > 1 ||
+          (
+            marker.adjustedPValue !== null &&
+            (
+              !Number.isFinite(marker.adjustedPValue) ||
+              marker.adjustedPValue < 0 ||
+              marker.adjustedPValue > 1
+            )
+          ) ||
+          !Number.isFinite(marker.log2FoldChange) ||
+          !Number.isSafeInteger(marker.rank) ||
+          marker.rank < 1
+        ) {
+          throw new TypeError(
+            `Marker heatmap group "${groupId}" contains malformed marker statistics`
+          );
+        }
+        if (groupLookup.has(marker.gene)) {
+          throw new Error(
+            `Marker heatmap group "${groupId}" contains duplicate gene "${marker.gene}"`
+          );
+        }
+        let percentInGroup = null;
+        if (Object.hasOwn(marker, 'percentInGroup')) {
+          if (
+            !Number.isFinite(marker.percentInGroup) ||
+            marker.percentInGroup < 0 ||
+            marker.percentInGroup > 100
+          ) {
+            throw new RangeError(
+              `Marker heatmap gene "${marker.gene}" has an invalid in-group percentage`
+            );
+          }
+          percentInGroup = marker.percentInGroup;
+        }
+        groupLookup.set(marker.gene, {
+          pValue: marker.pValue,
+          adjustedPValue: marker.adjustedPValue,
+          log2FoldChange: marker.log2FoldChange,
+          percentInGroup,
+          rank: marker.rank
+        });
+      }
+      lookup.set(groupId, groupLookup);
+    }
+    return lookup;
+  }
+
+  /**
+   * Release both Plotly listener ownership and tooltip DOM ownership.
+   * @private
+   */
+  _teardownHoverContext() {
+    const binding = this._hoverPlotBinding;
+    const hoverContext = this._hoverContext;
+    this._hoverPlotBinding = null;
+    this._hoverContext = null;
+
+    const errors = [];
+    if (binding !== null) {
+      try {
+        binding.container.removeListener(
+          'plotly_hover',
+          binding.hoverHandler
+        );
+      } catch (error) {
+        errors.push(error);
+      }
+      try {
+        binding.container.removeListener(
+          'plotly_unhover',
+          binding.unhoverHandler
+        );
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (hoverContext !== null) {
+      try {
+        hoverContext.destroy();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) {
+      throw new AggregateError(
+        errors,
+        'Marker heatmap hover cleanup failed'
+      );
+    }
   }
 
   /**
@@ -1453,20 +1763,42 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
    * @override
    */
   destroy() {
-    // Cancel any in-progress tracking
-    if (this._progressTracker) {
-      this._progressTracker.cancel();
-      this._progressTracker = null;
+    const errors = [];
+    const progressTracker = this._progressTracker;
+    this._progressTracker = null;
+    if (progressTracker !== null) {
+      try {
+        progressTracker.cancel();
+      } catch (error) {
+        errors.push(error);
+      }
     }
-    if (this._hoverContext) {
-      this._hoverContext.destroy();
-      this._hoverContext = null;
+    try {
+      this._teardownHoverContext();
+    } catch (error) {
+      errors.push(error);
     }
-    if (this._controller) {
-      this._controller.close();
-      this._controller = null;
+    const controller = this._controller;
+    this._controller = null;
+    if (controller !== null) {
+      try {
+        controller.close();
+      } catch (error) {
+        errors.push(error);
+      }
     }
-    super.destroy();
+    try {
+      super.destroy();
+    } catch (error) {
+      errors.push(error);
+    }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) {
+      throw new AggregateError(
+        errors,
+        'Marker Genes UI cleanup failed'
+      );
+    }
   }
 
   exportSettings() {
@@ -1479,14 +1811,42 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
   }
 
   importSettings(settings) {
-    if (!settings) return;
-    if (typeof settings.modalSelectedGroupId === 'string') {
-      this._modalSelectedGroupId = settings.modalSelectedGroupId;
+    const base = this._requireExactFormSettings(
+      settings,
+      [
+        'formControls',
+        'modalGeneListMode',
+        'modalSelectedGroupId',
+        'selectedPages'
+      ]
+    );
+    if (
+      settings.modalSelectedGroupId !== null &&
+      (
+        typeof settings.modalSelectedGroupId !== 'string' ||
+        settings.modalSelectedGroupId.length === 0
+      )
+    ) {
+      throw new TypeError(
+        'Marker Genes modalSelectedGroupId must be null or a non-empty string'
+      );
     }
-    if (settings.modalGeneListMode === 'all' || settings.modalGeneListMode === 'top10' || settings.modalGeneListMode === 'top20') {
-      this._modalGeneListMode = settings.modalGeneListMode;
+    const geneListModes = new Set([
+      'all',
+      'top5',
+      'top10',
+      'top20',
+      'top100'
+    ]);
+    if (!geneListModes.has(settings.modalGeneListMode)) {
+      throw new TypeError(
+        'Marker Genes modalGeneListMode is unsupported'
+      );
     }
-    super.importSettings(settings);
+
+    this._modalSelectedGroupId = settings.modalSelectedGroupId;
+    this._modalGeneListMode = settings.modalGeneListMode;
+    this._applyFormSettings(base);
   }
 }
 
@@ -1501,7 +1861,9 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
  * @returns {GenesPanelUI}
  */
 export function createGenesPanelUI(options) {
-  return new GenesPanelUI(options);
+  const ui = new GenesPanelUI(options);
+  ui.init(options.container);
+  return ui;
 }
 
 export default GenesPanelUI;

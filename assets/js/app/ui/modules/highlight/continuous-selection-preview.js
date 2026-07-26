@@ -9,6 +9,16 @@
  * @module ui/modules/highlight/continuous-selection-preview
  */
 
+import {
+  requireContinuousPreviewEvent,
+  requireContinuousStatistics,
+  requireExactKeys,
+  requireFieldSource,
+  requireHighlightSelectionState,
+  requireMethods,
+  requireSafeInteger
+} from './exact-contract.js';
+
 /**
  * @param {object} options
  * @param {import('../../../state/core/data-state.js').DataState} options.state
@@ -18,28 +28,74 @@
  * @param {(x: number, y: number, minVal: number, maxVal: number) => void} options.ui.showRangeLabel
  * @param {() => void} options.ui.hideRangeLabel
  */
-export function initContinuousSelectionPreview({ state, viewer, selectionState, ui }) {
-  const showRangeLabel = ui?.showRangeLabel || (() => {});
-  const hideRangeLabel = ui?.hideRangeLabel || (() => {});
+export function initContinuousSelectionPreview(options) {
+  requireExactKeys(
+    options,
+    ['state', 'viewer', 'selectionState', 'ui'],
+    'Continuous selection preview options'
+  );
+  const { state, viewer, selectionState, ui } = options;
+  requireMethods(
+    state,
+    'Continuous selection preview state',
+    [
+      'clearPreviewHighlight',
+      'getActiveField',
+      'getCellIndicesForRange',
+      'getValueForCell',
+      'setPreviewHighlightFromIndices'
+    ]
+  );
+  requireMethods(
+    viewer,
+    'Continuous selection preview viewer',
+    ['getViewTransparency', 'setSelectionPreviewCallback']
+  );
+  requireExactKeys(
+    ui,
+    ['showRangeLabel', 'hideRangeLabel'],
+    'Continuous selection preview UI'
+  );
+  requireMethods(
+    ui,
+    'Continuous selection preview UI',
+    ['showRangeLabel', 'hideRangeLabel']
+  );
+  requireHighlightSelectionState(selectionState);
+  const { showRangeLabel, hideRangeLabel } = ui;
 
   function handleSelectionPreview(previewEvent) {
-    const activeField = state.getActiveField ? state.getActiveField() : null;
-    if (!activeField || activeField.kind !== 'continuous') {
-      hideRangeLabel();
-      return;
+    requireContinuousPreviewEvent(previewEvent);
+    const activeField = state.getActiveField();
+    if (activeField === null || activeField.kind !== 'continuous') {
+      throw new Error(
+        'Continuous selection preview requires an active continuous field.'
+      );
     }
 
-    const fieldIndex = state.activeFieldSource === 'var' ? state.activeVarFieldIndex : state.activeFieldIndex;
-    const source = state.activeFieldSource || 'obs';
+    const source = requireFieldSource(state.activeFieldSource);
+    const fieldIndex = source === 'var'
+      ? state.activeVarFieldIndex
+      : state.activeFieldIndex;
+    requireSafeInteger(
+      fieldIndex,
+      'Continuous selection preview field index',
+      0
+    );
 
     const cellIndex = previewEvent.cellIndex;
     const clickedValue = state.getValueForCell(cellIndex, fieldIndex, source);
-    if (clickedValue == null) {
+    if (Number.isNaN(clickedValue)) {
       hideRangeLabel();
       return;
     }
+    if (!Number.isFinite(clickedValue)) {
+      throw new TypeError(
+        'Continuous selection preview clicked value must be finite or NaN.'
+      );
+    }
 
-    const stats = activeField._continuousStats || { min: 0, max: 1 };
+    const stats = requireContinuousStatistics(activeField);
     const valueRange = stats.max - stats.min;
     const dragScale = 0.005;
     const dragAmount = -previewEvent.dragDeltaY * dragScale * valueRange;
@@ -54,9 +110,9 @@ export function initContinuousSelectionPreview({ state, viewer, selectionState, 
       maxVal = clickedValue;
     }
 
-    const viewTransparency = viewer.getViewTransparency?.(previewEvent.viewId) ?? null;
+    const viewTransparency = viewer.getViewTransparency(previewEvent.viewId);
     const newIndices = state.getCellIndicesForRange(fieldIndex, minVal, maxVal, source, viewTransparency);
-    const mode = previewEvent.mode || 'intersect';
+    const mode = previewEvent.mode;
 
     let combinedIndices;
     const candidateSet = selectionState.annotationCandidateSet;
@@ -77,17 +133,14 @@ export function initContinuousSelectionPreview({ state, viewer, selectionState, 
       combinedIndices = [...candidateSet].filter((idx) => newSet.has(idx));
     }
 
-    if (state.setPreviewHighlightFromIndices && combinedIndices.length > 0) {
+    if (combinedIndices.length > 0) {
       state.setPreviewHighlightFromIndices(combinedIndices);
     } else {
-      state.clearPreviewHighlight?.();
+      state.clearPreviewHighlight();
     }
 
     showRangeLabel(previewEvent.endX, previewEvent.endY, minVal, maxVal);
   }
 
-  if (viewer.setSelectionPreviewCallback) {
-    viewer.setSelectionPreviewCallback(handleSelectionPreview);
-  }
+  viewer.setSelectionPreviewCallback(handleSelectionPreview);
 }
-

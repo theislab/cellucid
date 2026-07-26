@@ -13,8 +13,8 @@
  * When used with WorkerPool, the worker receives an INIT message with its ID.
  * This enables coordinated parallel processing across multiple workers.
  *
- * REFACTORED: Now uses shared operation-handlers.js for all implementations.
- * This eliminates code duplication with fallback-operations.js.
+ * Uses operation-handlers.js so worker and explicitly selected CPU execution
+ * share one scientific implementation.
  */
 
 /* eslint-env worker */
@@ -23,7 +23,7 @@
 // These are ES modules that work in both main thread and worker context
 import { executeOperation } from './operation-handlers.js';
 import { OperationType } from './operations.js';
-import { normalCDF, tCDF } from './math-utils.js';
+import { mannWhitneyPValue, welchTTestFromMoments } from './math-utils.js';
 
 // ============================================================================
 // Worker Pool State
@@ -49,10 +49,40 @@ let poolSize = 1;
 let markerContext = null;
 
 function setMarkerContext(payload) {
-  const { codes, codeToGroupIndex, groupCount, histBins } = payload || {};
+  if (
+    payload === null ||
+    typeof payload !== 'object' ||
+    Array.isArray(payload)
+  ) {
+    throw new TypeError('MARKERS_SET_CONTEXT: payload must be an object');
+  }
+  const { codes, codeToGroupIndex, groupCount } = payload;
 
-  if (!codes || !codeToGroupIndex || !Number.isFinite(groupCount) || groupCount <= 0) {
-    throw new Error('MARKERS_SET_CONTEXT: invalid payload');
+  if (!(codes instanceof Uint16Array) || codes.length === 0) {
+    throw new TypeError(
+      'MARKERS_SET_CONTEXT: codes must be a non-empty Uint16Array'
+    );
+  }
+  if (
+    !(codeToGroupIndex instanceof Int16Array) ||
+    codeToGroupIndex.length === 0
+  ) {
+    throw new TypeError(
+      'MARKERS_SET_CONTEXT: codeToGroupIndex must be a non-empty Int16Array'
+    );
+  }
+  if (!Number.isSafeInteger(groupCount) || groupCount <= 0) {
+    throw new RangeError(
+      'MARKERS_SET_CONTEXT: groupCount must be a positive integer'
+    );
+  }
+  for (let i = 0; i < codeToGroupIndex.length; i++) {
+    const groupIndex = codeToGroupIndex[i];
+    if (groupIndex < -1 || groupIndex >= groupCount) {
+      throw new RangeError(
+        `MARKERS_SET_CONTEXT: code ${i} maps outside groupCount`
+      );
+    }
   }
 
   // Build per-cell group index lookup (-1 for invalid/missing).
@@ -69,37 +99,13 @@ function setMarkerContext(payload) {
     }
   }
 
-  const bins = Number.isFinite(histBins)
-    ? Math.max(16, Math.min(1024, Math.floor(histBins)))
-    : 128;
-
   markerContext = {
     groupCount,
     cellGroupIndex,
-    orderScratch: new Uint32Array(nCells),
-    histBins: bins,
-    histTotal: new Uint32Array(bins),
-    histByGroup: new Uint32Array(groupCount * bins)
+    orderScratch: new Uint32Array(nCells)
   };
 
   return { ok: true, cells: nCells, groups: groupCount };
-}
-
-function welchTTestFromMoments(meanA, varA, nA, meanB, varB, nB) {
-  if (nA < 2 || nB < 2) return { statistic: NaN, pValue: NaN, df: NaN };
-  if (!Number.isFinite(meanA) || !Number.isFinite(meanB)) return { statistic: NaN, pValue: NaN, df: NaN };
-  if (!Number.isFinite(varA) || !Number.isFinite(varB)) return { statistic: NaN, pValue: NaN, df: NaN };
-
-  const se = Math.sqrt(varA / nA + varB / nB);
-  if (se === 0) return { statistic: 0, pValue: 1, df: nA + nB - 2 };
-
-  const t = (meanA - meanB) / se;
-  const num = Math.pow(varA / nA + varB / nB, 2);
-  const denom = Math.pow(varA / nA, 2) / (nA - 1) + Math.pow(varB / nB, 2) / (nB - 1);
-  const df = denom > 0 ? (num / denom) : (nA + nB - 2);
-
-  const pValue = 2 * (1 - tCDF(Math.abs(t), df));
-  return { statistic: t, pValue, df };
 }
 
 function computeGeneMarkers(payload) {
@@ -107,51 +113,72 @@ function computeGeneMarkers(payload) {
     throw new Error('MARKERS_COMPUTE_GENE: marker context not set');
   }
 
+  if (
+    payload === null ||
+    typeof payload !== 'object' ||
+    Array.isArray(payload)
+  ) {
+    throw new TypeError('MARKERS_COMPUTE_GENE: payload must be an object');
+  }
   const {
     values,
-    method = 'wilcox',
-    minCells = 10,
+    method,
+    minCells,
     pseudocount = 0.01
-  } = payload || {};
+  } = payload;
 
-  if (!values || !Number.isFinite(values.length)) {
-    throw new Error('MARKERS_COMPUTE_GENE: invalid values');
+  if (!(values instanceof Float32Array)) {
+    throw new TypeError(
+      'MARKERS_COMPUTE_GENE: values must be a Float32Array'
+    );
+  }
+  if (values.length !== markerContext.cellGroupIndex.length) {
+    throw new RangeError(
+      'MARKERS_COMPUTE_GENE: values length must exactly match marker context'
+    );
+  }
+  if (method !== 'wilcox' && method !== 'ttest') {
+    throw new RangeError(
+      'MARKERS_COMPUTE_GENE: method must be wilcox or ttest'
+    );
+  }
+  if (!Number.isSafeInteger(minCells) || minCells <= 0) {
+    throw new RangeError(
+      'MARKERS_COMPUTE_GENE: minCells must be a positive integer'
+    );
+  }
+  if (!Number.isFinite(pseudocount) || pseudocount <= 0) {
+    throw new RangeError(
+      'MARKERS_COMPUTE_GENE: pseudocount must be a positive finite number'
+    );
   }
 
   const groupCount = markerContext.groupCount;
   const cellGroupIndex = markerContext.cellGroupIndex;
 
-  const useExactWilcox = method === 'wilcox' && cellGroupIndex.length <= 5000;
-  const useApproxWilcox = method === 'wilcox' && !useExactWilcox;
-
   // Per-group accumulators
   const nIn = new Uint32Array(groupCount);
-  const sumIn = new Float64Array(groupCount);
-  const sumSqIn = new Float64Array(groupCount);
+  const runningMeanIn = new Float64Array(groupCount);
+  const runningM2In = new Float64Array(groupCount);
   const exprIn = new Uint32Array(groupCount);
 
   // Totals over valid (non-missing category) cells
   let nAll = 0;
-  let sumAll = 0;
-  let sumSqAll = 0;
+  let runningMeanAll = 0;
+  let runningM2All = 0;
   let exprAll = 0;
 
-  // Wilcoxon:
-  // - exact: sort valid indices (small datasets only)
-  // - approx: histogram-based U statistic (large datasets)
-  const orderScratch = useExactWilcox ? markerContext.orderScratch : null;
+  // Wilcoxon owns one exact rank representation. Quantized data normally has
+  // low value cardinality, so exact per-value counts avoid a full cell sort.
+  // High-cardinality inputs use the same exact ranks through index sorting.
+  const orderScratch = method === 'wilcox'
+    ? markerContext.orderScratch
+    : null;
+  const MAX_EXACT_COUNTED_VALUES = 4096;
+  let countsByValue = method === 'wilcox' ? new Map() : null;
   let validCount = 0;
 
-  const histBins = useApproxWilcox ? markerContext.histBins : 0;
-  const histTotal = useApproxWilcox ? markerContext.histTotal : null;
-  const histByGroup = useApproxWilcox ? markerContext.histByGroup : null;
-  if (useApproxWilcox && histTotal && histByGroup) {
-    histTotal.fill(0);
-    histByGroup.fill(0);
-  }
-
-  const len = Math.min(values.length, cellGroupIndex.length);
-  for (let i = 0; i < len; i++) {
+  for (let i = 0; i < values.length; i++) {
     const gi = cellGroupIndex[i];
     if (gi < 0) continue;
 
@@ -159,33 +186,42 @@ function computeGeneMarkers(payload) {
     if (!Number.isFinite(v)) continue;
 
     nAll++;
-    sumAll += v;
-    sumSqAll += v * v;
+    const totalDelta = v - runningMeanAll;
+    runningMeanAll += totalDelta / nAll;
+    runningM2All += totalDelta * (v - runningMeanAll);
     if (v > 0) exprAll++;
 
     nIn[gi]++;
-    sumIn[gi] += v;
-    sumSqIn[gi] += v * v;
+    const groupDelta = v - runningMeanIn[gi];
+    runningMeanIn[gi] += groupDelta / nIn[gi];
+    runningM2In[gi] += groupDelta * (v - runningMeanIn[gi]);
     if (v > 0) exprIn[gi]++;
 
-    if (useExactWilcox && orderScratch) {
+    if (orderScratch) {
       orderScratch[validCount++] = i;
-    }
-
-    if (useApproxWilcox && histTotal && histByGroup) {
-      const vv = v > 0 ? v : 0;
-      const lv = Math.log1p(vv);
-      const MAX_LOG = 6; // log1p scale cap for binning
-      const scaled = lv >= MAX_LOG ? 1 : (lv / MAX_LOG);
-      const bin = Math.min(histBins - 1, Math.max(0, Math.floor(scaled * (histBins - 1))));
-
-      histTotal[bin]++;
-      histByGroup[gi * histBins + bin]++;
+      if (countsByValue !== null) {
+        let entry = countsByValue.get(v);
+        if (entry === undefined) {
+          if (countsByValue.size >= MAX_EXACT_COUNTED_VALUES) {
+            countsByValue = null;
+          } else {
+            entry = {
+              total: 0,
+              byGroup: new Uint32Array(groupCount)
+            };
+            countsByValue.set(v, entry);
+          }
+        }
+        if (entry !== undefined) {
+          entry.total++;
+          entry.byGroup[gi]++;
+        }
+      }
     }
   }
 
   // Output arrays per group (same order as groups)
-  const pValues = new Float32Array(groupCount);
+  const pValues = new Float64Array(groupCount);
   const statistics = new Float32Array(groupCount);
   const log2FoldChange = new Float32Array(groupCount);
   const meanInGroup = new Float32Array(groupCount);
@@ -225,9 +261,10 @@ function computeGeneMarkers(payload) {
     const nB = nAll - nA;
     nOut[g] = nB;
 
-    const meanA = nA > 0 ? (sumIn[g] / nA) : NaN;
-    const sumB = sumAll - sumIn[g];
-    const meanB = nB > 0 ? (sumB / nB) : NaN;
+    const meanA = nA > 0 ? runningMeanIn[g] : NaN;
+    const meanB = nB > 0
+      ? (runningMeanAll * nAll - meanA * nA) / nB
+      : NaN;
 
     meanInGroup[g] = Number.isFinite(meanA) ? meanA : NaN;
     meanOutGroup[g] = Number.isFinite(meanB) ? meanB : NaN;
@@ -248,17 +285,27 @@ function computeGeneMarkers(payload) {
       const nB = nAll - nA;
       if (nA < Math.max(2, minCells) || nB < Math.max(2, minCells)) continue;
 
-      const meanA = sumIn[g] / nA;
-      const meanB = (sumAll - sumIn[g]) / nB;
+      const meanA = runningMeanIn[g];
+      const meanB = (runningMeanAll * nAll - meanA * nA) / nB;
+      const meanDifference = meanA - meanB;
+      const betweenM2 = meanDifference ** 2 * nA * nB / nAll;
+      let restM2 = runningM2All - runningM2In[g] - betweenM2;
+      const m2Scale = Math.max(
+        1,
+        Math.abs(runningM2All),
+        Math.abs(runningM2In[g]),
+        Math.abs(betweenM2)
+      );
+      if (restM2 < 0 && restM2 >= -32 * Number.EPSILON * m2Scale) {
+        restM2 = 0;
+      }
 
-      const varA = nA > 1 ? (sumSqIn[g] - (sumIn[g] * sumIn[g]) / nA) / (nA - 1) : NaN;
-      const sumSqB = sumSqAll - sumSqIn[g];
-      const sumB = sumAll - sumIn[g];
-      const varB = nB > 1 ? (sumSqB - (sumB * sumB) / nB) / (nB - 1) : NaN;
+      const varA = runningM2In[g] / (nA - 1);
+      const varB = restM2 / (nB - 1);
 
       const test = welchTTestFromMoments(meanA, varA, nA, meanB, varB, nB);
       pValues[g] = Number.isFinite(test.pValue) ? test.pValue : NaN;
-      statistics[g] = Number.isFinite(test.statistic) ? test.statistic : NaN;
+      statistics[g] = Number.isNaN(test.statistic) ? NaN : test.statistic;
     }
 
     return {
@@ -275,13 +322,27 @@ function computeGeneMarkers(payload) {
     };
   }
 
-  // Wilcoxon (Mann-Whitney U) with a single rank pass for all groups.
-  // Uses the same normal-approximation strategy as math-utils.mannWhitneyU().
-  // For large datasets we use an approximate histogram-based U to avoid per-gene sorting.
-  const rankSum = useExactWilcox ? new Float64Array(groupCount) : null;
-  if (rankSum) rankSum.fill(0);
+  // Wilcoxon (Mann-Whitney U) with one exact rank pass for all groups.
+  const rankSum = new Float64Array(groupCount);
+  let wilcoxTieTerm = 0;
 
-  if (useExactWilcox) {
+  if (countsByValue !== null) {
+    const sortedValues = [...countsByValue.keys()].sort((a, b) => a - b);
+    let valuesBelow = 0;
+    for (const value of sortedValues) {
+      const entry = countsByValue.get(value);
+      const tieCount = entry.total;
+      if (tieCount > 1) {
+        wilcoxTieTerm += tieCount ** 3 - tieCount;
+      }
+      const averageRank = valuesBelow + (tieCount + 1) / 2;
+      for (let groupIndex = 0; groupIndex < groupCount; groupIndex++) {
+        rankSum[groupIndex] +=
+          entry.byGroup[groupIndex] * averageRank;
+      }
+      valuesBelow += tieCount;
+    }
+  } else {
     const order = markerContext.orderScratch.subarray(0, validCount);
     order.sort((a, b) => values[a] - values[b]);
 
@@ -290,6 +351,11 @@ function computeGeneMarkers(payload) {
       let j = i + 1;
       const v = values[order[i]];
       while (j < validCount && values[order[j]] === v) j++;
+
+      const tieCount = j - i;
+      if (tieCount > 1) {
+        wilcoxTieTerm += tieCount ** 3 - tieCount;
+      }
 
       const avgRank = (i + j + 1) / 2; // 1-based
       for (let k = i; k < j; k++) {
@@ -307,45 +373,15 @@ function computeGeneMarkers(payload) {
     const nB = nAll - nA;
     if (nA < Math.max(2, minCells) || nB < Math.max(2, minCells)) continue;
 
-    let U;
+    const R1 = rankSum[g];
+    const U1 = R1 - (nA * (nA + 1)) / 2;
+    const U2 = nA * nB - U1;
+    const U = Math.min(U1, U2);
 
-    if (useExactWilcox) {
-      const R1 = rankSum[g];
-      const U1 = R1 - (nA * (nA + 1)) / 2;
-      const U2 = nA * nB - U1;
-      U = Math.min(U1, U2);
-    } else {
-      // Approximate U using histogram bins (counts of pairwise comparisons).
-      // U1 = sum_{bin} countA(bin) * (countB(bins<bin) + 0.5*countB(bin))
-      const bins = markerContext.histBins;
-      const total = markerContext.histTotal;
-      const byGroup = markerContext.histByGroup;
-
-      let cumTotalBelow = 0;
-      let cumGroupBelow = 0;
-      let U1 = 0;
-
-      const base = g * bins;
-      for (let b = 0; b < bins; b++) {
-        const aAt = byGroup[base + b];
-        const totAt = total[b];
-        const bAt = totAt - aAt; // rest-of at this bin
-
-        const bBelow = cumTotalBelow - cumGroupBelow;
-        U1 += aAt * (bBelow + 0.5 * bAt);
-
-        cumTotalBelow += totAt;
-        cumGroupBelow += aAt;
-      }
-
-      const U2 = nA * nB - U1;
-      U = Math.min(U1, U2);
-    }
-
-    const mu = (nA * nB) / 2;
-    const sigma = Math.sqrt((nA * nB * (nA + nB + 1)) / 12);
-    const z = sigma > 0 ? (U - mu) / sigma : 0;
-    const p = 2 * (1 - normalCDF(Math.abs(z)));
+    const { pValue: p } = mannWhitneyPValue(nA, nB, U, {
+      tieTerm: wilcoxTieTerm,
+      allowExact: true
+    });
 
     statistics[g] = Number.isFinite(U) ? U : NaN;
     pValues[g] = Number.isFinite(p) ? p : NaN;
@@ -374,8 +410,20 @@ self.onmessage = function(e) {
 
   // Handle INIT message from worker pool
   if (type === 'INIT') {
+    if (
+      payload === null ||
+      typeof payload !== 'object' ||
+      !Number.isSafeInteger(payload.id) ||
+      payload.id < 0 ||
+      !Number.isSafeInteger(payload.poolSize) ||
+      payload.poolSize <= 0
+    ) {
+      throw new TypeError(
+        'DataWorker INIT requires exact non-negative id and positive poolSize'
+      );
+    }
     workerId = payload.id;
-    poolSize = payload.poolSize || 1;
+    poolSize = payload.poolSize;
     self.postMessage({ type: 'INIT_ACK', workerId });
     return;
   }

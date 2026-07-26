@@ -1,124 +1,258 @@
 /**
- * @fileoverview Active field (obs + var) serialization helpers.
+ * @fileoverview Exact active-field serialization and restoration.
  *
  * @module state-serializer/active-fields
  */
 
-import { debug } from '../../utils/debug.js';
+import {
+  assertExactKeys,
+  assertNonEmptyString,
+  requireMethod
+} from '../session/schema-contract.js';
+
+const ACTIVE_FIELD_KEYS = ['activeFieldKey', 'activeFieldSource'];
+
+function assertFieldInventory(fields, context) {
+  if (!Array.isArray(fields)) {
+    throw new TypeError(`${context} must be an array.`);
+  }
+  const keys = new Set();
+  for (let index = 0; index < fields.length; index++) {
+    const field = fields[index];
+    if (field === null || typeof field !== 'object') {
+      throw new TypeError(`${context} entry ${index} must be an object.`);
+    }
+    const key = assertNonEmptyString(field.key, `${context} entry ${index} key`);
+    if (keys.has(key)) {
+      throw new TypeError(`${context} contains duplicate key "${key}".`);
+    }
+    keys.add(key);
+  }
+  return fields;
+}
+
+export function assertActiveFieldsState(activeFields) {
+  assertExactKeys(activeFields, ACTIVE_FIELD_KEYS, 'Active-field session state');
+  const source = activeFields.activeFieldSource;
+  const key = activeFields.activeFieldKey;
+  if (source === null) {
+    if (key !== null) {
+      throw new TypeError('Active-field key must be null when its source is null.');
+    }
+    return activeFields;
+  }
+  if (source !== 'obs' && source !== 'var') {
+    throw new TypeError('Active-field source must be "obs", "var", or null.');
+  }
+  assertNonEmptyString(key, 'Active-field key');
+  return activeFields;
+}
+
+function getExactCurrentActiveField(state, context) {
+  requireMethod(state, 'getFields', context);
+  requireMethod(state, 'getVarFields', context);
+  const obsFields = assertFieldInventory(
+    state.getFields(),
+    'Current obs field inventory'
+  );
+  const varFields = assertFieldInventory(
+    state.getVarFields(),
+    'Current var field inventory'
+  );
+  const source = state.activeFieldSource;
+  if (source === null) {
+    if (state.activeFieldIndex !== -1 || state.activeVarFieldIndex !== -1) {
+      throw new TypeError(
+        'Inactive current field indexes must both equal -1.'
+      );
+    }
+    return { source, field: null, obsFields };
+  }
+  if (source !== 'obs' && source !== 'var') {
+    throw new TypeError('Current active-field source is unsupported.');
+  }
+  const fieldIndex = source === 'obs'
+    ? state.activeFieldIndex
+    : state.activeVarFieldIndex;
+  const inactiveIndex = source === 'obs'
+    ? state.activeVarFieldIndex
+    : state.activeFieldIndex;
+  if (!Number.isSafeInteger(fieldIndex) || fieldIndex < 0) {
+    throw new TypeError('Current active-field index must be a nonnegative safe integer.');
+  }
+  if (inactiveIndex !== -1) {
+    throw new TypeError('Current inactive field index must equal -1.');
+  }
+  const fields = source === 'obs' ? obsFields : varFields;
+  if (fieldIndex >= fields.length) {
+    throw new RangeError('Current active-field index is out of range.');
+  }
+  const field = fields[fieldIndex];
+  if (field._isDeleted === true) {
+    throw new TypeError('Current active field must not be deleted.');
+  }
+  return { source, field, obsFields };
+}
 
 export function serializeActiveFields(state) {
-  const activeField = state.getActiveField?.();
-  const activeFieldSource = state.activeFieldSource;
-
-  return {
-    activeFieldKey: activeField?.key || null,
-    activeFieldSource: activeFieldSource || null,
-    activeVarFieldKey: state.activeVarFieldIndex >= 0
-      ? state.getVarFields?.()[state.activeVarFieldIndex]?.key
-      : null
-  };
+  const {
+    field: activeField,
+    source: activeFieldSource
+  } = getExactCurrentActiveField(state, 'Active-field capture owner');
+  if (activeField === null) {
+    return assertActiveFieldsState({
+      activeFieldKey: null,
+      activeFieldSource: null
+    });
+  }
+  return assertActiveFieldsState({
+    activeFieldKey: assertNonEmptyString(
+      activeField.key,
+      'Captured active-field key'
+    ),
+    activeFieldSource: activeFieldSource
+  });
 }
 
 /**
- * Restore active field selections.
- * Handles both obs fields (categorical/continuous) and var fields (gene expression).
+ * Restore one exact active field selection.
  * @param {object} state
- * @param {any} activeFields
+ * @param {unknown} activeFields
  */
 export async function restoreActiveFields(state, activeFields) {
-  if (!activeFields) return;
+  const plan = validateActiveFieldsForState(state, activeFields);
 
-  // First, handle var field (gene expression) if present
-  if (activeFields.activeVarFieldKey) {
-    const varFields = state.getVarFields?.() || [];
-    const varIdx = varFields.findIndex(f => f?.key === activeFields.activeVarFieldKey && f?._isDeleted !== true);
-    if (varIdx >= 0) {
-      debug.log(`[SessionSerializer] Activating var field: ${activeFields.activeVarFieldKey} (index: ${varIdx})`);
-      await state.ensureVarFieldLoaded?.(varIdx);
-      state.setActiveVarField?.(varIdx);
-
-      const geneSearch = document.getElementById('gene-expression-search');
-      if (geneSearch) {
-        geneSearch.value = activeFields.activeVarFieldKey;
-      }
-    }
+  if (plan.source === null) {
+    state.clearActiveField();
+    return;
   }
 
-  // Then handle obs field
-  if (activeFields.activeFieldKey && activeFields.activeFieldSource === 'obs') {
-    const fields = state.getFields?.() || [];
-    const idx = fields.findIndex(f => f?.key === activeFields.activeFieldKey && f?._isDeleted !== true);
-
-    if (idx >= 0) {
-      const field = fields[idx];
-      debug.log(`[SessionSerializer] Activating obs field: ${field?.key} (index: ${idx})`);
-
-      await state.ensureFieldLoaded?.(idx);
-      state.setActiveField?.(idx);
-
-      if (field) {
-        const selectId = field.kind === 'category' ? 'categorical-field' : 'continuous-field';
-        const select = document.getElementById(selectId);
-        if (select) {
-          const otherSelectId = field.kind === 'category' ? 'continuous-field' : 'categorical-field';
-          const otherSelect = document.getElementById(otherSelectId);
-          if (otherSelect) {
-            otherSelect.value = '-1';
-          }
-          select.value = String(idx);
-          select.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-      }
-    } else {
-      console.warn(`[SessionSerializer] Obs field not found: ${activeFields.activeFieldKey}`);
+  if (plan.source === 'obs') {
+    await state.ensureFieldLoaded(plan.fieldIndex);
+    const result = state.setActiveField(plan.fieldIndex);
+    if (result === null) {
+      throw new Error(`DataState rejected active obs field "${plan.field.key}".`);
     }
-  } else if (activeFields.activeFieldSource === 'var' && activeFields.activeFieldKey) {
-    // Active field is a var field (gene) - handled above, but also activate it as primary
-    const varFields = state.getVarFields?.() || [];
-    const varIdx = varFields.findIndex(f => f?.key === activeFields.activeFieldKey && f?._isDeleted !== true);
-    if (varIdx >= 0) {
-      debug.log(`[SessionSerializer] Activating var field as primary: ${activeFields.activeFieldKey}`);
-      await state.ensureVarFieldLoaded?.(varIdx);
-      state.setActiveVarField?.(varIdx);
-    }
+    return;
+  }
+
+  await state.ensureVarFieldLoaded(plan.fieldIndex);
+  const result = state.setActiveVarField(plan.fieldIndex);
+  if (result === null) {
+    throw new Error(`DataState rejected active var field "${plan.field.key}".`);
   }
 }
 
+export function validateActiveFieldsForState(state, activeFields) {
+  assertActiveFieldsState(activeFields);
+  requireMethod(state, 'getFields', 'Active-field restore owner');
+  requireMethod(state, 'getVarFields', 'Active-field restore owner');
+
+  const obsFields = assertFieldInventory(
+    state.getFields(),
+    'Current obs field inventory'
+  );
+  const varFields = assertFieldInventory(
+    state.getVarFields(),
+    'Current var field inventory'
+  );
+
+  if (activeFields.activeFieldSource === null) {
+    requireMethod(state, 'clearActiveField', 'Active-field restore owner');
+    return { source: null, fieldIndex: null, field: null };
+  }
+
+  const fields = activeFields.activeFieldSource === 'obs'
+    ? obsFields
+    : varFields;
+  const fieldIndex = fields.findIndex(
+    field => (
+      field.key === activeFields.activeFieldKey
+      && field._isDeleted !== true
+    )
+  );
+  if (fieldIndex < 0) {
+    throw new RangeError(
+      `Current field "${activeFields.activeFieldKey}" was not found for source "${activeFields.activeFieldSource}".`
+    );
+  }
+
+  const field = fields[fieldIndex];
+  if (field.kind !== 'category' && field.kind !== 'continuous') {
+    throw new TypeError(
+      `Current field "${field.key}" has unsupported kind "${String(field.kind)}".`
+    );
+  }
+
+  if (activeFields.activeFieldSource === 'obs') {
+    requireMethod(state, 'ensureFieldLoaded', 'Active-field restore owner');
+    requireMethod(state, 'setActiveField', 'Active-field restore owner');
+    return { source: 'obs', fieldIndex, field };
+  }
+
+  requireMethod(state, 'ensureVarFieldLoaded', 'Active-field restore owner');
+  requireMethod(state, 'setActiveVarField', 'Active-field restore owner');
+  return { source: 'var', fieldIndex, field };
+}
+
+function requireControl(id) {
+  const control = document.getElementById(id);
+  if (control === null) {
+    throw new TypeError(`Active-field UI requires current control "${id}".`);
+  }
+  return control;
+}
+
 /**
- * Sync field select dropdowns to match the current active field in state.
- * This ensures the UI reflects the active field without triggering change events.
+ * Sync the current active field to the three domain-owned controls.
  * @param {object} state
  */
 export function syncFieldSelectsToActiveField(state) {
-  const activeField = state.getActiveField?.();
-  const activeFieldSource = state.activeFieldSource;
-  const fields = state.getFields?.() || [];
+  const {
+    field: activeField,
+    source: activeFieldSource,
+    obsFields: fields
+  } = getExactCurrentActiveField(state, 'Active-field UI sync owner');
 
-  const categoricalSelect = document.getElementById('categorical-field');
-  const continuousSelect = document.getElementById('continuous-field');
-  const geneSearch = document.getElementById('gene-expression-search');
+  const categoricalSelect = requireControl('categorical-field');
+  const continuousSelect = requireControl('continuous-field');
+  const geneSearch = requireControl('gene-expression-search');
 
-  if (!activeField) {
-    if (categoricalSelect) categoricalSelect.value = '-1';
-    if (continuousSelect) continuousSelect.value = '-1';
-    if (geneSearch) geneSearch.value = '';
+  if (activeField === null) {
+    if (activeFieldSource !== null) {
+      throw new TypeError('DataState active-field source must be null when no field is active.');
+    }
+    categoricalSelect.value = '-1';
+    continuousSelect.value = '-1';
+    geneSearch.value = '';
     return;
   }
+  const key = assertNonEmptyString(activeField.key, 'Current active-field key');
 
   if (activeFieldSource === 'var') {
-    if (categoricalSelect) categoricalSelect.value = '-1';
-    if (continuousSelect) continuousSelect.value = '-1';
-    if (geneSearch) geneSearch.value = activeField.key || '';
+    categoricalSelect.value = '-1';
+    continuousSelect.value = '-1';
+    geneSearch.value = key;
     return;
   }
-
-  const fieldIndex = fields.findIndex(f => f?.key === activeField.key);
-  if (activeField.kind === 'category') {
-    if (categoricalSelect) categoricalSelect.value = String(fieldIndex);
-    if (continuousSelect) continuousSelect.value = '-1';
-  } else if (activeField.kind === 'continuous') {
-    if (categoricalSelect) categoricalSelect.value = '-1';
-    if (continuousSelect) continuousSelect.value = String(fieldIndex);
+  if (activeFieldSource !== 'obs') {
+    throw new TypeError('DataState active-field source must be "obs", "var", or null.');
   }
-  if (geneSearch) geneSearch.value = '';
+
+  const fieldIndex = fields.findIndex(
+    field => field.key === key && field._isDeleted !== true
+  );
+  if (fieldIndex < 0) {
+    throw new RangeError(`Current active obs field "${key}" was not found.`);
+  }
+  if (activeField.kind === 'category') {
+    categoricalSelect.value = String(fieldIndex);
+    continuousSelect.value = '-1';
+  } else if (activeField.kind === 'continuous') {
+    categoricalSelect.value = '-1';
+    continuousSelect.value = String(fieldIndex);
+  } else {
+    throw new TypeError(`Current active field "${key}" has an unsupported kind.`);
+  }
+  geneSearch.value = '';
 }

@@ -72,10 +72,12 @@ export {
   Operations,
   GPU_CAPABLE_OPERATIONS,
   WORKER_CAPABLE_OPERATIONS,
+  CPU_CAPABLE_OPERATIONS,
   getOperation,
   isValidOperation,
   isGPUCapable,
   isWorkerCapable,
+  isCPUCapable,
   validatePayload
 } from './compute/operations.js';
 
@@ -116,8 +118,6 @@ export {
 export {
   ComputeManager,
   getComputeManager,
-  createComputeManager,
-  initComputeManager,
   BackendStatus
 } from './compute/compute-manager.js';
 
@@ -134,11 +134,6 @@ export {
   getWorkerPool,
   createWorkerPool
 } from './compute/worker-pool.js';
-
-// Fallback operations
-export {
-  executeFallback
-} from './compute/fallback-operations.js';
 
 // =============================================================================
 // DATA - Data Layer, Transforms, Query Builder
@@ -167,6 +162,7 @@ export {
 
 export {
   chiSquaredTest,
+  fisherExactTest,
   tTest,
   mannWhitneyU,
   oneWayANOVA,
@@ -215,11 +211,6 @@ export {
   LayoutEngine,
   createLayoutEngine
 } from './plots/layout-engine.js';
-
-export {
-  ScatterBuilder,
-  createScatterBuilder
-} from './plots/scatter-builder.js';
 
 // =============================================================================
 // UI - Components

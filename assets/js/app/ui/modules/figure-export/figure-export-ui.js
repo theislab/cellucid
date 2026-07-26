@@ -8,9 +8,8 @@
  */
 
 import { createElement, clearElement } from '../../../utils/dom-utils.js';
-import { clamp, parseNumberOr } from '../../../utils/number-utils.js';
+import { clamp, parseFiniteNumberInRange } from '../../../utils/number-utils.js';
 import { getNotificationCenter } from '../../../notification-center.js';
-import { promptLargeDatasetStrategy } from './components/large-dataset-dialog.js';
 import { confirmExportFidelityWarnings } from './components/fidelity-warning-dialog.js';
 import { computeSingleViewLayout, computeGridDims } from './utils/layout.js';
 import { reducePointsByDensity } from './utils/density-reducer.js';
@@ -21,11 +20,14 @@ import { drawCanvasCentroidOverlay } from './components/centroid-overlay.js';
 import { denormalizeXY } from './utils/coordinate-mapper.js';
 import { drawCanvasOrientationIndicator } from './components/orientation-indicator.js';
 import { applyColorblindSimulationToImageData } from './utils/colorblindness.js';
-import { normalizeCropRect01 } from './utils/crop.js';
+import { assertCropRect01 } from './utils/crop.js';
 import { rgb01ToHex } from './utils/color-utils.js';
+import {
+  assertCameraState,
+  assertNavigationMode
+} from '../../../../rendering/camera-state-contract.js';
 
 const DEFAULT_SIZE = { width: 1600, height: 1200 };
-const LARGE_DATASET_THRESHOLD = 50000;
 
 /**
  * @param {object} options
@@ -35,17 +37,35 @@ const LARGE_DATASET_THRESHOLD = 50000;
  * @param {{ exportFigure: (opts: any) => Promise<any> }} options.engine
  */
 export function initFigureExportUI({ state, viewer, container, engine }) {
+  if (!(container instanceof HTMLElement)) {
+    throw new TypeError('Figure export container must be an HTMLElement.');
+  }
+  if (
+    engine === null ||
+    typeof engine !== 'object' ||
+    typeof engine.exportFigure !== 'function' ||
+    typeof engine.exportFigures !== 'function'
+  ) {
+    throw new TypeError(
+      'Figure export engine must publish exportFigure() and exportFigures().'
+    );
+  }
   // Session bundles must NOT persist Figure Export UI state. Mark the entire
   // subtree as opt-out so generic UI control snapshotting ignores it.
-  container?.setAttribute?.('data-state-serializer-skip', 'true');
+  container.setAttribute('data-state-serializer-skip', 'true');
 
-  try { container?.__cellucidCleanup?.(); } catch { /* ignore */ }
+  if (container.__cellucidCleanup !== undefined) {
+    if (typeof container.__cellucidCleanup !== 'function') {
+      throw new TypeError('Figure export cleanup owner must be a function.');
+    }
+    container.__cellucidCleanup();
+  }
   clearElement(container);
   /** @type {Array<() => void>} */
   const cleanupFns = [];
   container.__cellucidCleanup = () => {
     for (const fn of cleanupFns) {
-      try { fn(); } catch { /* ignore */ }
+      fn();
     }
   };
 
@@ -67,7 +87,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   const sizeRow = createElement('div', { className: 'control-block' });
   sizeRow.appendChild(createElement('label', {}, ['Plot size:']));
 
-  const presetSelect = createElement('select', { className: 'obs-select', 'aria-label': 'Export size preset' });
+  const presetSelect = createElement('select', { className: 'obs-select', ariaLabel: 'Export size preset' });
   presets.forEach((p) => {
     presetSelect.appendChild(createElement('option', { value: p.value }, [p.label]));
   });
@@ -81,7 +101,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     max: '20000',
     step: '10',
     inputMode: 'numeric',
-    'aria-label': 'Export width (px)'
+    ariaLabel: 'Export width (px)'
   });
   const heightInput = createElement('input', {
     type: 'number',
@@ -91,7 +111,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     max: '20000',
     step: '10',
     inputMode: 'numeric',
-    'aria-label': 'Export height (px)'
+    ariaLabel: 'Export height (px)'
   });
 
   const sizeGrid = createElement('div', { className: 'figure-export-size-row' }, [
@@ -112,7 +132,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   const cropEnabledCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-crop-enabled' });
   const cropLockCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-crop-lock' });
   const cropResetBtn = createElement('button', { type: 'button', className: 'toggle-switch figure-export-framing-btn' }, ['Reset']);
-  const cropConfirmBtn = createElement('button', { type: 'button', className: 'toggle-switch figure-export-framing-btn', 'aria-pressed': 'false' }, ['Confirm']);
+  const cropConfirmBtn = createElement('button', { type: 'button', className: 'toggle-switch figure-export-framing-btn', ariaPressed: 'false' }, ['Confirm']);
   const cropFitPlotBtn = createElement('button', { type: 'button', className: 'toggle-switch figure-export-framing-btn' }, ['Fit plot']);
   const cropAspectHint = createElement('span', { className: 'figure-export-crop-aspect' }, ['Aspect: —']);
 
@@ -123,7 +143,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   const lockAspectBtn = createElement('button', {
     type: 'button',
     className: 'toggle-switch figure-export-framing-btn',
-    'aria-pressed': 'false',
+    ariaPressed: 'false',
   }, ['Lock aspect']);
   const framingActionGrid = createElement('div', { className: 'figure-export-framing-grid' }, [
     cropResetBtn,
@@ -145,16 +165,16 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     'Background color and font settings.'
   ]));
 
-  const backgroundSelect = createElement('select', { className: 'obs-select', 'aria-label': 'Background' });
+  const backgroundSelect = createElement('select', { className: 'obs-select', ariaLabel: 'Background' });
   backgroundSelect.appendChild(createElement('option', { value: 'viewer' }, ['Match viewer']));
   backgroundSelect.appendChild(createElement('option', { value: 'white' }, ['White BG']));
   backgroundSelect.appendChild(createElement('option', { value: 'transparent' }, ['Transparent']));
   backgroundSelect.appendChild(createElement('option', { value: 'custom' }, ['Custom…']));
-  const initialViewerBg = typeof viewer?.getRenderState === 'function' ? rgb01ToHex(viewer.getRenderState()?.bgColor) : null;
-  const backgroundColorInput = createElement('input', { type: 'color', className: 'figure-color-picker', value: initialViewerBg || '#ffffff', 'aria-label': 'Custom background color' });
+  const initialViewerBg = rgb01ToHex(viewer.getRenderState().bgColor);
+  const backgroundColorInput = createElement('input', { type: 'color', className: 'figure-color-picker', value: initialViewerBg || '#ffffff', ariaLabel: 'Custom background color' });
   backgroundSelect.value = 'viewer';
 
-  const fontSelect = createElement('select', { className: 'obs-select', 'aria-label': 'Font family' });
+  const fontSelect = createElement('select', { className: 'obs-select', ariaLabel: 'Font family' });
   [
     { label: 'Arial', value: 'Arial, Helvetica, sans-serif' },
     { label: 'Helvetica', value: 'Helvetica, Arial, sans-serif' },
@@ -169,7 +189,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     max: '24',
     step: '1',
     inputMode: 'numeric',
-    'aria-label': 'Base font size (px)'
+    ariaLabel: 'Base font size (px)'
   });
 
   const autoTextSizingCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-text-auto', checked: true });
@@ -182,7 +202,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     max: '24',
     step: '1',
     inputMode: 'numeric',
-    'aria-label': 'Legend font size (px)'
+    ariaLabel: 'Legend font size (px)'
   });
   const tickFontSizeInput = createElement('input', {
     type: 'number',
@@ -192,7 +212,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     max: '24',
     step: '1',
     inputMode: 'numeric',
-    'aria-label': 'Tick font size (px)'
+    ariaLabel: 'Tick font size (px)'
   });
   const axisLabelFontSizeInput = createElement('input', {
     type: 'number',
@@ -202,7 +222,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     max: '36',
     step: '1',
     inputMode: 'numeric',
-    'aria-label': 'Axis label font size (px)'
+    ariaLabel: 'Axis label font size (px)'
   });
   const titleFontSizeInput = createElement('input', {
     type: 'number',
@@ -212,7 +232,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     max: '48',
     step: '1',
     inputMode: 'numeric',
-    'aria-label': 'Title font size (px)'
+    ariaLabel: 'Title font size (px)'
   });
   const centroidLabelFontSizeInput = createElement('input', {
     type: 'number',
@@ -222,7 +242,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     max: '36',
     step: '1',
     inputMode: 'numeric',
-    'aria-label': 'Centroid label font size (px)'
+    ariaLabel: 'Centroid label font size (px)'
   });
 
   // Point radius removed - export now uses viewer's pointSize directly (WYSIWYG)
@@ -286,7 +306,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     type: 'text',
     className: 'figure-input',
     placeholder: 'Optional figure title',
-    'aria-label': 'Figure title'
+    ariaLabel: 'Figure title'
   });
   titleRow.appendChild(titleInput);
 
@@ -296,7 +316,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     className: 'figure-input figure-export-axis-input',
     value: 'X',
     placeholder: 'e.g., UMAP_1',
-    'aria-label': 'X axis label'
+    ariaLabel: 'X axis label'
   });
 
   const yLabelInput = createElement('input', {
@@ -305,7 +325,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     className: 'figure-input figure-export-axis-input',
     value: 'Y',
     placeholder: 'e.g., UMAP_2',
-    'aria-label': 'Y axis label'
+    ariaLabel: 'Y axis label'
   });
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -345,7 +365,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     ]),
   ]);
 
-  const legendPosSelect = createElement('select', { className: 'obs-select', 'aria-label': 'Legend position' });
+  const legendPosSelect = createElement('select', { className: 'obs-select', ariaLabel: 'Legend position' });
   legendPosSelect.appendChild(createElement('option', { value: 'right' }, ['Legend: Right']));
   legendPosSelect.appendChild(createElement('option', { value: 'bottom' }, ['Legend: Bottom']));
 
@@ -380,7 +400,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     max: '1',
     step: '0.05',
     inputMode: 'decimal',
-    'aria-label': 'Non-selected opacity (0..1)'
+    ariaLabel: 'Non-selected opacity (0..1)'
   });
   selectionRow.appendChild(createElement('label', { className: 'checkbox-inline', htmlFor: emphasizeSelectionCheckbox.id }, [
     emphasizeSelectionCheckbox,
@@ -395,7 +415,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   previewRow.appendChild(createElement('label', {}, ['Preview:']));
   const previewEnabledCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-preview-enabled' });
   const previewRefreshBtn = createElement('button', { type: 'button', className: 'toggle-switch figure-export-framing-btn' }, ['Refresh']);
-  const previewModeSelect = createElement('select', { className: 'obs-select figure-export-colorblind-select', 'aria-label': 'Colorblind preview' });
+  const previewModeSelect = createElement('select', { className: 'obs-select figure-export-colorblind-select', ariaLabel: 'Colorblind preview' });
   previewModeSelect.appendChild(createElement('option', { value: 'none' }, ['Normal']));
   previewModeSelect.appendChild(createElement('option', { value: 'deuteranopia' }, ['Deuteranopia']));
   previewModeSelect.appendChild(createElement('option', { value: 'protanopia' }, ['Protanopia']));
@@ -420,7 +440,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     width: '360',
     height: '240',
     role: 'img',
-    'aria-label': 'Figure export preview'
+    ariaLabel: 'Figure export preview'
   });
   const previewBox = createElement('div', { className: 'figure-export-preview-box' }, [
     previewCanvas,
@@ -453,7 +473,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     'Format and resolution for the exported file.'
   ]));
 
-  const downloadSelect = createElement('select', { className: 'obs-select', 'aria-label': 'Download format' });
+  const downloadSelect = createElement('select', { className: 'obs-select', ariaLabel: 'Download format' });
   downloadSelect.appendChild(createElement('option', { value: 'svg' }, ['SVG']));
   downloadSelect.appendChild(createElement('option', { value: 'png' }, ['PNG']));
   downloadSelect.appendChild(createElement('option', { value: 'svg+png' }, ['SVG + PNG']));
@@ -461,29 +481,22 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   downloadSelect.appendChild(createElement('option', { value: 'all' }, ['All']));
   downloadSelect.value = 'png';
 
-  const dpiSelect = createElement('select', { className: 'obs-select', 'aria-label': 'PNG DPI' });
+  const dpiSelect = createElement('select', { className: 'obs-select', ariaLabel: 'PNG DPI' });
   [150, 300, 600].forEach((dpi) => {
     dpiSelect.appendChild(createElement('option', { value: String(dpi) }, [String(dpi)]));
   });
   dpiSelect.value = '300';
 
-  const strategySelect = createElement('select', { className: 'obs-select', 'aria-label': 'Large dataset strategy' });
-  strategySelect.appendChild(createElement('option', { value: 'ask' }, ['Large data: Ask']));
+  const strategySelect = createElement('select', { className: 'obs-select', ariaLabel: 'SVG point strategy' });
+  strategySelect.appendChild(createElement('option', {
+    value: '',
+    disabled: true,
+    selected: true,
+  }, ['Choose SVG strategy…']));
   strategySelect.appendChild(createElement('option', { value: 'full-vector' }, ['Full vector']));
   strategySelect.appendChild(createElement('option', { value: 'optimized-vector' }, ['Optimized vector']));
   strategySelect.appendChild(createElement('option', { value: 'hybrid' }, ['Hybrid']));
-  strategySelect.appendChild(createElement('option', { value: 'raster' }, ['Raster (PNG)']));
 
-  const largeDatasetThresholdInput = createElement('input', {
-    type: 'number',
-    className: 'figure-input figure-input-sm',
-    value: String(LARGE_DATASET_THRESHOLD),
-    min: '1000',
-    max: '2000000',
-    step: '1000',
-    inputMode: 'numeric',
-    'aria-label': 'Large dataset threshold (points)'
-  });
   const optimizedTargetCountInput = createElement('input', {
     type: 'number',
     className: 'figure-input figure-input-sm',
@@ -492,22 +505,17 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     max: '5000000',
     step: '1000',
     inputMode: 'numeric',
-    'aria-label': 'Optimized vector target points'
+    ariaLabel: 'Optimized vector target points'
   });
-  const thresholdGroup = createElement('div', { className: 'figure-export-inline', id: 'figure-export-threshold-group' }, [
-    createElement('span', { className: 'figure-export-label' }, ['Ask ≥']),
-    largeDatasetThresholdInput,
-  ]);
   const targetGroup = createElement('div', { className: 'figure-export-inline', id: 'figure-export-target-group' }, [
     createElement('span', { className: 'figure-export-label' }, ['Keep']),
     optimizedTargetCountInput,
   ]);
   const densitySettingsRow = createElement('div', { className: 'figure-export-style-row', id: 'figure-export-density-settings' }, [
-    thresholdGroup,
     targetGroup,
   ]);
   const densityHint = createElement('div', { className: 'figure-export-hint' }, [
-    'Optimized reduces points preserving density; Hybrid rasterizes for 3D.'
+    'Full Vector writes every point; Optimized Vector writes the exact chosen target count; Hybrid embeds the shader-rendered point pass.'
   ]);
 
   const advancedGrid = createElement('div', { className: 'figure-export-style-row' }, [
@@ -530,17 +538,15 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   actionsRow.appendChild(exportBtn);
 
   function syncFormatDependentUi() {
-    const mode = downloadSelect.value || 'svg';
+    const mode = downloadSelect.value;
     const needsPng = mode === 'png' || mode === 'svg+png' || mode === 'png-multi' || mode === 'all';
     const needsSvg = mode === 'svg' || mode === 'svg+png' || mode === 'all';
     const multiPng = mode === 'png-multi' || mode === 'all';
 
-    const strategy = strategySelect.value || 'ask';
-    const showDensity = needsSvg && (strategy === 'ask' || strategy === 'optimized-vector');
-    densitySettingsRow.style.display = showDensity ? 'flex' : 'none';
-    densityHint.style.display = showDensity ? 'block' : 'none';
-    thresholdGroup.style.display = (showDensity && strategy === 'ask') ? 'inline-flex' : 'none';
-    targetGroup.style.display = showDensity ? 'inline-flex' : 'none';
+    const strategy = strategySelect.value;
+    densitySettingsRow.style.display = needsSvg && strategy === 'optimized-vector' ? 'flex' : 'none';
+    densityHint.style.display = needsSvg ? 'block' : 'none';
+    targetGroup.style.display = strategy === 'optimized-vector' ? 'inline-flex' : 'none';
 
     dpiSelect.style.display = needsPng && !multiPng ? 'block' : 'none';
     strategySelect.style.display = needsSvg ? 'block' : 'none';
@@ -690,7 +696,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     const rs = getPreviewRenderStateForView(viewId);
     const vw = Math.max(1, Number(rs?.viewportWidth) || 1);
     const vh = Math.max(1, Number(rs?.viewportHeight) || 1);
-    const c = normalizeCropRect01({ enabled: true, ...cropRect01 });
+    const c = assertCropRect01({ enabled: true, ...cropRect01 });
     if (!c || !Number.isFinite(c.width) || !Number.isFinite(c.height) || c.width <= 0 || c.height <= 0) return;
 
     const cropAspect = (c.width * vw) / Math.max(1e-6, c.height * vh);
@@ -786,7 +792,6 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   function readSizePreset() {
     const preset = presetSelect.value;
     if (preset !== 'screen' && preset !== 'screen-half') return;
-    if (typeof viewer.getRenderState !== 'function') return;
     const rs = viewer.getRenderState();
     if (!rs) return;
     const scale = preset === 'screen-half' ? 0.5 : 1;
@@ -897,19 +902,20 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     titleAutofillEnabled = value === lastAutoTitle || (auto && value === auto);
   });
 
-  if (typeof state?.on === 'function') {
-    cleanupFns.push(state.on('field:changed', syncAutoTitle));
-    cleanupFns.push(state.on('visibility:changed', syncAutoTitle));
+  if (typeof state.on !== 'function') {
+    throw new TypeError('Figure export state must publish on().');
   }
-  try {
-    const nameEl = typeof document !== 'undefined' ? document.getElementById('dataset-name') : null;
-    if (nameEl && typeof MutationObserver !== 'undefined') {
-      const observer = new MutationObserver(syncAutoTitle);
-      observer.observe(nameEl, { childList: true, characterData: true, subtree: true });
-      cleanupFns.push(() => observer.disconnect());
-    }
-  } catch {
-    // ignore
+  const fieldCleanup = state.on('field:changed', syncAutoTitle);
+  const visibilityCleanup = state.on('visibility:changed', syncAutoTitle);
+  if (typeof fieldCleanup !== 'function' || typeof visibilityCleanup !== 'function') {
+    throw new TypeError('Figure export state subscriptions must return cleanup functions.');
+  }
+  cleanupFns.push(fieldCleanup, visibilityCleanup);
+  const nameEl = document.getElementById('dataset-name');
+  if (nameEl) {
+    const observer = new MutationObserver(syncAutoTitle);
+    observer.observe(nameEl, { childList: true, characterData: true, subtree: true });
+    cleanupFns.push(() => observer.disconnect());
   }
 
   // Seed title once after init (before any state updates arrive).
@@ -923,14 +929,39 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   }
 
   function inferVisiblePointCount() {
-    const viewerCount = typeof viewer.getPointCount === 'function' ? viewer.getPointCount() : null;
-    const stateCount = state?.pointCount ?? null;
-    if (viewerCount != null && stateCount != null && viewerCount !== stateCount) {
-      // Benchmark synthetic mode: state is stale.
-      return viewerCount;
+    const viewerCount = viewer.getPointCount();
+    const stateCount = state.pointCount;
+    if (
+      !Number.isSafeInteger(viewerCount) ||
+      viewerCount < 0 ||
+      !Number.isSafeInteger(stateCount) ||
+      stateCount < 0
+    ) {
+      throw new TypeError(
+        'Figure preview requires exact non-negative viewer and state point counts.'
+      );
     }
-    const filtered = typeof state.getFilteredCount === 'function' ? state.getFilteredCount() : null;
-    return filtered?.shown ?? (state.pointCount || viewerCount || 0);
+    if (viewerCount !== stateCount) {
+      throw new Error(
+        `Figure preview point-count mismatch: viewer has ${viewerCount} points while state has ${stateCount}.`
+      );
+    }
+    if (typeof state.getFilteredCount !== 'function') {
+      throw new TypeError('Figure preview state must publish getFilteredCount().');
+    }
+    const filtered = state.getFilteredCount();
+    if (
+      filtered === null ||
+      typeof filtered !== 'object' ||
+      !Number.isSafeInteger(filtered.shown) ||
+      filtered.shown < 0 ||
+      filtered.shown > stateCount
+    ) {
+      throw new TypeError(
+        'Figure preview filter count must publish an exact valid shown count.'
+      );
+    }
+    return filtered.shown;
   }
 
   // ---------------------------------------------------------------------------
@@ -1009,7 +1040,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     let frameLabel = '—';
     let zoomLabel = '';
     if (cropEnabled) {
-      const c = normalizeCropRect01({ enabled: true, ...cropRect01 }) || cropRect01;
+      const c = assertCropRect01({ enabled: true, ...cropRect01 });
       if (Number.isFinite(c?.width) && Number.isFinite(c?.height) && c.width > 0 && c.height > 0) {
         const frameAspect = (c.width * vw) / Math.max(1e-6, c.height * vh);
         frameLabel = formatAspectLabel(frameAspect);
@@ -1084,30 +1115,23 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
 
   function getCropOptionForExport() {
     if (!cropEnabled) return null;
-    const normalized = normalizeCropRect01({ enabled: true, ...cropRect01 });
+    const normalized = assertCropRect01({ enabled: true, ...cropRect01 });
     return normalized ? { enabled: true, ...normalized } : null;
   }
 
   function getActiveViewIdForPreview() {
-    return String(
-      (typeof state.getActiveViewId === 'function' && state.getActiveViewId()) ||
-      (typeof viewer.getFocusedViewId === 'function' && viewer.getFocusedViewId()) ||
-      'live'
-    );
+    return String(state.getActiveViewId());
   }
 
   function getPreviewRenderStateForView(viewId) {
-    const vid = String(viewId || 'live');
-    if (typeof viewer.getViewRenderState !== 'function') {
-      return typeof viewer.getRenderState === 'function' ? viewer.getRenderState() : null;
+    const vid = String(viewId);
+
+    const layout = viewer.getViewLayout();
+    if (layout.mode !== 'grid') {
+      return viewer.getViewRenderState(vid, null);
     }
 
-    const layout = typeof viewer.getViewLayout === 'function' ? viewer.getViewLayout() : null;
-    if (layout?.mode !== 'grid' || typeof viewer.getSnapshotViews !== 'function' || typeof viewer.getRenderState !== 'function') {
-      return viewer.getViewRenderState(vid);
-    }
-
-    const snapshots = viewer.getSnapshotViews() || [];
+    const snapshots = viewer.getSnapshotViews();
     const viewCount = (layout.liveViewHidden ? 0 : 1) + snapshots.length;
     const { cols, rows } = computeGridDims(viewCount || 1);
     const base = viewer.getRenderState();
@@ -1117,14 +1141,18 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   }
 
   function requiresShaderAccuratePoints(viewId) {
-    const vid = String(viewId || 'live');
-    const dim = typeof state.getViewDimensionLevel === 'function'
-      ? state.getViewDimensionLevel(vid)
-      : (state.getDimensionLevel?.() ?? 3);
-    const cameraState = viewer.getViewCameraState?.(vid) || viewer.getCameraState?.() || null;
-    const navMode = cameraState?.navigationMode || 'orbit';
+    const vid = String(viewId);
+    const dim = state.getViewDimensionLevel(vid);
+    const cameraState = assertCameraState(
+      viewer.getViewCameraState(vid),
+      `Figure-preview camera state for "${vid}"`
+    );
+    const navMode = cameraState.navigationMode;
     const rs = getPreviewRenderStateForView(vid);
-    const shaderQuality = String(rs?.shaderQuality || 'full');
+    const shaderQuality = rs?.shaderQuality;
+    if (!['full', 'light', 'ultralight'].includes(shaderQuality)) {
+      throw new Error(`Figure preview has no exact shader quality for view "${vid}"`);
+    }
     const usesSphereShader = shaderQuality === 'full';
     const is3dProjection = dim > 2 && navMode !== 'planar';
     return usesSphereShader || is3dProjection;
@@ -1134,44 +1162,22 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   function canCreateWebgl2Context() {
     if (cachedWebgl2ExportSupport != null) return cachedWebgl2ExportSupport;
 
-    // Try OffscreenCanvas first (fast path), then fallback to HTMLCanvasElement.
-    try {
-      if (typeof OffscreenCanvas !== 'undefined') {
-        const c = new OffscreenCanvas(2, 2);
-        const gl = c.getContext('webgl2', { alpha: true, antialias: true, premultipliedAlpha: false, preserveDrawingBuffer: true });
-        if (gl) {
-          cachedWebgl2ExportSupport = true;
-          return true;
-        }
-      }
-    } catch {
-      // ignore
-    }
-
-    try {
-      if (typeof document !== 'undefined' && document?.createElement) {
-        const c = document.createElement('canvas');
-        c.width = 2;
-        c.height = 2;
-        const gl = c.getContext('webgl2', { alpha: true, antialias: true, premultipliedAlpha: false, preserveDrawingBuffer: true });
-        if (gl) {
-          cachedWebgl2ExportSupport = true;
-          return true;
-        }
-      }
-    } catch {
-      // ignore
+    const canvas = document.createElement('canvas');
+    canvas.width = 2;
+    canvas.height = 2;
+    const gl = canvas.getContext('webgl2', {
+      alpha: true,
+      antialias: true,
+      premultipliedAlpha: false,
+      preserveDrawingBuffer: true
+    });
+    if (gl) {
+      cachedWebgl2ExportSupport = true;
+      return true;
     }
 
     cachedWebgl2ExportSupport = false;
     return false;
-  }
-
-  // Shader-accurate views cannot be represented faithfully with pure SVG circles.
-  // Default to the Hybrid strategy so SVG exports stay WYSIWYG.
-  const activeViewIdForDefaults = getActiveViewIdForPreview();
-  if (requiresShaderAccuratePoints(activeViewIdForDefaults) && strategySelect.value !== 'hybrid' && strategySelect.value !== 'raster') {
-    strategySelect.value = 'hybrid';
   }
 
   // Seed centroid label font size from the on-screen overlay CSS when available.
@@ -1216,9 +1222,9 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     if (token !== previewBuildToken) return;
 
     const viewId = getActiveViewIdForPreview();
-    const positions = typeof viewer.getViewPositions === 'function' ? viewer.getViewPositions(viewId) : state.positionsArray;
-    const colors = typeof viewer.getViewColors === 'function' ? viewer.getViewColors(viewId) : state.colorsArray;
-    const transparency = typeof viewer.getViewTransparency === 'function' ? viewer.getViewTransparency(viewId) : state.categoryTransparency;
+    const positions = viewer.getViewPositions(viewId);
+    const colors = viewer.getViewColors(viewId);
+    const transparency = viewer.getViewTransparency(viewId);
     const renderState = getPreviewRenderStateForView(viewId);
 
     if (!positions || !colors || !renderState?.mvpMatrix) {
@@ -1228,11 +1234,12 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       return;
     }
 
-    const dim = typeof state.getViewDimensionLevel === 'function'
-      ? state.getViewDimensionLevel(viewId)
-      : (state.getDimensionLevel?.() ?? 3);
-    const cameraState = viewer.getViewCameraState?.(viewId) || viewer.getCameraState?.() || null;
-    const navMode = cameraState?.navigationMode || 'orbit';
+    const dim = state.getViewDimensionLevel(viewId);
+    const cameraState = assertCameraState(
+      viewer.getViewCameraState(viewId),
+      `Figure-preview camera state for "${viewId}"`
+    );
+    const navMode = cameraState.navigationMode;
 
     const safeVisibleCount = Number.isFinite(visibleCount) ? visibleCount : 0;
     const targetCount = clamp(safeVisibleCount, 2000, PREVIEW_TARGET_POINTS);
@@ -1459,7 +1466,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
         srcW = Math.max(1, Number(reduced.viewportWidth) || 1);
         srcH = Math.max(1, Number(reduced.viewportHeight) || 1);
       } else {
-        const norm = normalizeCropRect01({ enabled: true, ...cropRect01 });
+        const norm = assertCropRect01({ enabled: true, ...cropRect01 });
         if (norm) cropRect01 = norm;
         if (norm) {
           srcX0 = norm.x * fullViewportW;
@@ -1497,7 +1504,12 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       ? state.getTotalHighlightedCellCount()
       : (typeof state?.getHighlightedCellCount === 'function' ? state.getHighlightedCellCount() : 0);
     const emphasizeSelection = emphasizeSelectionCheckbox.checked && totalHighlighted > 0;
-    const mutedAlpha = clamp(parseNumberOr(selectionMutedOpacityInput.value, 0.15), 0, 1);
+    const mutedAlpha = parseFiniteNumberInRange(
+      selectionMutedOpacityInput.value,
+      0,
+      1,
+      'Non-selected opacity',
+    );
     const highlightArray = emphasizeSelection ? (state?.highlightArray || null) : null;
 
     const outN = reduced.x.length;
@@ -1544,9 +1556,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     ctx.restore();
 
     // Centroid points + labels (matches the viewer overlay; no separate export toggles).
-    const centroidFlags = typeof viewer.getCentroidFlags === 'function'
-      ? (viewer.getCentroidFlags(String(sample?.viewId || 'live')) || viewer.getCentroidFlags('live'))
-      : { points: false, labels: false };
+    const centroidFlags = viewer.getCentroidFlags(String(sample.viewId));
     const showCentroidPoints = Boolean(centroidFlags?.points);
     const showCentroidLabels = Boolean(centroidFlags?.labels);
 
@@ -1632,10 +1642,12 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
 
     // Axes (approximate bounds from preview sample).
     if (axesEligible && sample.positions) {
-      const navMode = sample?.navMode || sample?.cameraState?.navigationMode || 'orbit';
-      const norm = typeof state?.dimensionManager?.getNormTransform === 'function'
-        ? state.dimensionManager.getNormTransform(sample.dim)
-        : null;
+      const navMode = assertNavigationMode(sample.navMode);
+      if (typeof state.dimensionManager?.getNormTransform !== 'function') {
+        throw new TypeError(
+          'Figure preview state must publish dimensionManager.getNormTransform().'
+        );
+      }
       const useCameraAxes = sample?.dim > 2 && navMode !== 'planar' && sample?.renderState?.viewMatrix;
       const bounds = (
         useCameraAxes
@@ -1648,30 +1660,29 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
           : computeApproxBoundsFromSample({
             reduced: sample.reduced,
             positions: sample.positions,
-            normTransform: norm,
+            normTransform: state.dimensionManager.getNormTransform(sample.dim),
             cropPx: appliedFraming && !usingCropSample ? cropPxForBounds : null
           })
-      ) || { minX: -1, maxX: 1, minY: -1, maxY: 1 };
-      if (bounds) {
-        const axisXLabel = String(xLabelInput.value || '').trim();
-        const axisYLabel = String(yLabelInput.value || '').trim();
-        drawCanvasAxes({
-          ctx,
-          plotRect,
-          bounds,
-          xLabel: axisXLabel,
-          yLabel: axisYLabel,
-          fontFamily,
-          tickFontSize: tickFontSizePx,
-          labelFontSize: axisLabelFontSizePx,
-          color: '#111'
-        });
+      );
+      if (bounds === null) {
+        throw new Error('Figure preview axes require at least one visible point.');
       }
+      drawCanvasAxes({
+        ctx,
+        plotRect,
+        bounds,
+        xLabel: xLabelInput.value,
+        yLabel: yLabelInput.value,
+        fontFamily,
+        tickFontSize: tickFontSizePx,
+        labelFontSize: axisLabelFontSizePx,
+        color: '#111'
+      });
     }
 
     // Framing overlay (photography-style crop guide).
     if (cropEnabled && previewFramingMode === 'edit' && viewportRect?.width > 1 && viewportRect?.height > 1) {
-      const normalized = normalizeCropRect01({ enabled: true, ...cropRect01 });
+      const normalized = assertCropRect01({ enabled: true, ...cropRect01 });
       if (normalized) cropRect01 = normalized;
       const c = normalized || cropRect01;
       const x = viewportRect.x + c.x * viewportRect.width;
@@ -1773,7 +1784,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   function getCropRectLogical() {
     const vr = previewGeom?.viewportRect || null;
     if (!vr) return null;
-    const c = normalizeCropRect01({ enabled: true, ...cropRect01 });
+    const c = assertCropRect01({ enabled: true, ...cropRect01 });
     if (!c) return null;
     return {
       x: vr.x + c.x * vr.width,
@@ -1954,53 +1965,92 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     schedulePreviewDraw();
   });
 
-  exportBtn.addEventListener('click', async () => {
-    const width = parseInt(widthInput.value, 10);
-    const height = parseInt(heightInput.value, 10);
-    const dpi = parseInt(dpiSelect.value, 10);
-    if (!Number.isFinite(width) || width < 100 || !Number.isFinite(height) || height < 100) {
-      widthInput.focus();
-      return;
+  function readExactIntegerInput(input, label, minimum, maximum = Number.MAX_SAFE_INTEGER) {
+    const raw = input.value;
+    if (!/^(0|[1-9][0-9]*)$/.test(raw)) {
+      input.setCustomValidity(`${label} must be a whole number.`);
+      input.reportValidity();
+      return null;
     }
+    const value = Number(raw);
+    if (
+      !Number.isSafeInteger(value) ||
+      value < minimum ||
+      value > maximum
+    ) {
+      input.setCustomValidity(
+        `${label} must be between ${minimum} and ${maximum}.`
+      );
+      input.reportValidity();
+      return null;
+    }
+    input.setCustomValidity('');
+    return value;
+  }
 
-    const visibleCount = inferVisiblePointCount();
-    const mode = downloadSelect.value || 'svg';
+  function readExactDecimalInput(input, label, minimum, maximum) {
+    const raw = input.value;
+    if (!/^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/.test(raw)) {
+      input.setCustomValidity(`${label} must be a decimal number.`);
+      input.reportValidity();
+      return null;
+    }
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value < minimum || value > maximum) {
+      input.setCustomValidity(
+        `${label} must be between ${minimum} and ${maximum}.`
+      );
+      input.reportValidity();
+      return null;
+    }
+    input.setCustomValidity('');
+    return value;
+  }
+
+  exportBtn.addEventListener('click', async () => {
+    const width = readExactIntegerInput(widthInput, 'Width', 100, 20_000);
+    if (width === null) return;
+    const height = readExactIntegerInput(heightInput, 'Height', 100, 20_000);
+    if (height === null) return;
+
+    const mode = downloadSelect.value;
+    if (!['svg', 'png', 'svg+png', 'png-multi', 'all'].includes(mode)) {
+      throw new TypeError('Figure export download mode is not a current UI value.');
+    }
     const needsSvg = mode === 'svg' || mode === 'svg+png' || mode === 'all';
     const needsPng = mode === 'png' || mode === 'svg+png' || mode === 'png-multi' || mode === 'all';
     const multiPng = mode === 'png-multi' || mode === 'all';
+    const dpi = needsPng && !multiPng
+      ? readExactIntegerInput(dpiSelect, 'DPI', 72, 1200)
+      : null;
+    if (needsPng && !multiPng && dpi === null) return;
 
-    let strategy = strategySelect.value || 'ask';
-    const largeThreshold = clamp(parseInt(largeDatasetThresholdInput.value, 10) || LARGE_DATASET_THRESHOLD, 1000, 5000000);
-    const optimizedTargetCount = clamp(parseInt(optimizedTargetCountInput.value, 10) || 100000, 1000, 5000000);
-
-    if (needsSvg && strategy === 'ask' && visibleCount >= largeThreshold) {
-      const chosen = await promptLargeDatasetStrategy({
-        pointCount: visibleCount,
-        threshold: largeThreshold
-      });
-      if (!chosen) return;
-      strategy = chosen;
-      strategySelect.value = chosen;
+    const strategy = needsSvg ? strategySelect.value : null;
+    if (
+      needsSvg &&
+      !['full-vector', 'optimized-vector', 'hybrid'].includes(strategy)
+    ) {
+      strategySelect.setCustomValidity('Choose an SVG point strategy.');
+      strategySelect.reportValidity();
+      return;
     }
+    strategySelect.setCustomValidity('');
+    const optimizedTargetCount = strategy === 'optimized-vector'
+      ? readExactIntegerInput(
+          optimizedTargetCountInput,
+          'Optimized vector target',
+          1000,
+          5_000_000
+        )
+      : null;
+    if (strategy === 'optimized-vector' && optimizedTargetCount === null) return;
 
     const activeViewId = getActiveViewIdForPreview();
-    const shaderAccurate = requiresShaderAccuratePoints(activeViewId);
 
     /** @type {{ title: string; detail: string }[]} */
     const warnings = [];
 
-    // Shader-accurate point rendering cannot be expressed as pure SVG circles.
-    // Force Hybrid for SVG exports so points match the on-screen appearance.
-    if (needsSvg && shaderAccurate && strategy !== 'hybrid' && strategy !== 'raster') {
-      warnings.push({
-        title: 'SVG strategy adjusted for WYSIWYG',
-        detail: 'This view uses 3D/shader-accurate point rendering that cannot be represented as pure SVG circles. Export will use Hybrid SVG (rasterized points, vector annotations).'
-      });
-      strategy = 'hybrid';
-      strategySelect.value = 'hybrid';
-    }
-
-    const needsShaderAccurateRasterization = shaderAccurate && (needsPng || (needsSvg && strategy === 'hybrid'));
+    const needsShaderAccurateRasterization = needsPng || (needsSvg && strategy === 'hybrid');
     if (needsShaderAccurateRasterization) {
       const rs = getPreviewRenderStateForView(activeViewId);
       const missing = [];
@@ -2008,28 +2058,14 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       if (!rs?.viewMatrix || !rs?.projectionMatrix || !rs?.modelMatrix) missing.push('camera matrices');
       if (missing.length) {
         warnings.push({
-          title: 'Shader-accurate export may degrade',
-          detail: `Shader-accurate export requires ${missing.join(' and ')}, but it is not available. Export may fall back to flat circles (not pixel-identical to the current view).`
+          title: 'Exact point export unavailable',
+          detail: `Exact point export requires ${missing.join(' and ')}. Restore that capability before exporting.`
         });
       }
     }
 
-    if (needsSvg && strategy === 'optimized-vector') {
-      warnings.push({
-        title: 'Point reduction enabled',
-        detail: `Optimized vector keeps ~${optimizedTargetCount.toLocaleString()} points to preserve density. This may not be a pixel-for-pixel match to the current view. Use Hybrid or PNG for exact point appearance.`
-      });
-    }
-
-    if (needsSvg && strategy === 'raster') {
-      warnings.push({
-        title: 'SVG will be rasterized',
-        detail: 'Raster strategy outputs PNG (no editable SVG points).'
-      });
-    }
-
-    const showConnectivity = typeof viewer?.getShowConnectivity === 'function' ? viewer.getShowConnectivity() : false;
-    const hasConnectivity = typeof viewer?.hasConnectivityData === 'function' ? viewer.hasConnectivityData() : false;
+    const showConnectivity = viewer.getShowConnectivity();
+    const hasConnectivity = viewer.hasConnectivityData();
     if (showConnectivity && hasConnectivity) {
       warnings.push({
         title: 'Connectivity overlay not exported',
@@ -2043,26 +2079,54 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     setBusy(true);
     try {
 
-      const baseFontSizePx = parseInt(fontSizeInput.value, 10) || 12;
-      const legendFontSizePx = parseInt(legendFontSizeInput.value, 10) || baseFontSizePx;
-      const tickFontSizePx = parseInt(tickFontSizeInput.value, 10) || baseFontSizePx;
-      const axisLabelFontSizePx = parseInt(axisLabelFontSizeInput.value, 10) || baseFontSizePx;
-      const titleFontSizePx = parseInt(titleFontSizeInput.value, 10) || Math.max(14, Math.round(baseFontSizePx * 1.25));
-      const centroidLabelFontSizePx = parseInt(centroidLabelFontSizeInput.value, 10) || baseFontSizePx;
+      const baseFontSizePx = readExactIntegerInput(fontSizeInput, 'Base font size', 1, 500);
+      if (baseFontSizePx === null) return;
+      const legendFontSizePx = readExactIntegerInput(legendFontSizeInput, 'Legend font size', 1, 500);
+      if (legendFontSizePx === null) return;
+      const tickFontSizePx = readExactIntegerInput(tickFontSizeInput, 'Tick font size', 1, 500);
+      if (tickFontSizePx === null) return;
+      const axisLabelFontSizePx = readExactIntegerInput(axisLabelFontSizeInput, 'Axis-label font size', 1, 500);
+      if (axisLabelFontSizePx === null) return;
+      const titleFontSizePx = readExactIntegerInput(titleFontSizeInput, 'Title font size', 1, 500);
+      if (titleFontSizePx === null) return;
+      const centroidLabelFontSizePx = readExactIntegerInput(centroidLabelFontSizeInput, 'Centroid-label font size', 1, 500);
+      if (centroidLabelFontSizePx === null) return;
+      const selectionMutedOpacity = readExactDecimalInput(
+        selectionMutedOpacityInput,
+        'Muted selection opacity',
+        0,
+        1
+      );
+      if (selectionMutedOpacity === null) return;
+      if (!['right', 'bottom'].includes(legendPosSelect.value)) {
+        throw new TypeError('Figure export legend position is not a current UI value.');
+      }
+      if (!['viewer', 'white', 'transparent', 'custom'].includes(backgroundSelect.value)) {
+        throw new TypeError('Figure export background is not a current UI value.');
+      }
+      if (!/^#[0-9a-fA-F]{6}$/.test(backgroundColorInput.value)) {
+        backgroundColorInput.setCustomValidity('Background color must be #RRGGBB.');
+        backgroundColorInput.reportValidity();
+        return;
+      }
+      backgroundColorInput.setCustomValidity('');
+      if (fontSelect.value.trim().length === 0) {
+        throw new TypeError('Figure export font family must be non-empty.');
+      }
 
       const baseOptions = {
         width,
         height,
         exportAllViews: exportAllViewsCheckbox.checked,
-        title: String(titleInput.value || ''),
+        title: titleInput.value,
         includeAxes: includeAxesCheckbox.checked,
         includeLegend: includeLegendCheckbox.checked,
-        legendPosition: legendPosSelect.value === 'bottom' ? 'bottom' : 'right',
-        xLabel: String(xLabelInput.value || ''),
-        yLabel: String(yLabelInput.value || ''),
-        background: backgroundSelect.value || 'white',
-        backgroundColor: String(backgroundColorInput.value || '#ffffff'),
-        fontFamily: String(fontSelect.value || 'Arial, Helvetica, sans-serif'),
+        legendPosition: legendPosSelect.value,
+        xLabel: xLabelInput.value,
+        yLabel: yLabelInput.value,
+        background: backgroundSelect.value,
+        backgroundColor: backgroundColorInput.value,
+        fontFamily: fontSelect.value,
         fontSizePx: baseFontSizePx,
         legendFontSizePx,
         tickFontSizePx,
@@ -2074,15 +2138,15 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
         showOrientation: showOrientationCheckbox.checked,
         depthSort3d: depthSortCheckbox.checked,
         emphasizeSelection: emphasizeSelectionCheckbox.checked,
-        selectionMutedOpacity: parseFloat(selectionMutedOpacityInput.value) || 0.15,
+        selectionMutedOpacity,
         strategy,
         optimizedTargetCount
       };
 
       let result;
-      /** @type {{ format: 'svg'|'png'; dpi?: number }[]} */
+      /** @type {{ format: 'svg'|'png'; dpi: number|null }[]} */
       const jobs = [];
-      if (needsSvg) jobs.push({ format: 'svg' });
+      if (needsSvg) jobs.push({ format: 'svg', dpi: null });
       if (needsPng) {
         if (multiPng) jobs.push(...[150, 300, 600].map((d) => ({ format: 'png', dpi: d })));
         else jobs.push({ format: 'png', dpi });
@@ -2092,18 +2156,14 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
         result = await engine.exportFigure({
           ...baseOptions,
           format: jobs[0].format,
-          dpi: jobs[0].dpi ?? dpi,
+          dpi: jobs[0].dpi,
         });
       } else {
-        if (typeof engine.exportFigures !== 'function') {
-          throw new Error('Figure export engine is missing exportFigures()');
-        }
         const results = await engine.exportFigures({
           ...baseOptions,
-          jobs,
-          dpi
+          jobs
         });
-        result = Array.isArray(results) ? results[0] : results;
+        result = results[0];
       }
 
     } finally {
@@ -2177,7 +2237,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   }).item);
   subAccordion.appendChild(buildSubAccordionItem({
     title: 'Download',
-    desc: 'Format, DPI, large-data strategy',
+    desc: 'Format, DPI, explicit SVG strategy',
     open: false,
     content: [advancedSection]
   }).item);

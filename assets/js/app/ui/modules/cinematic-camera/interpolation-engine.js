@@ -8,6 +8,18 @@
  * @module ui/modules/cinematic-camera/interpolation-engine
  */
 
+import { assertCameraKeyframe } from './keyframe-store.js';
+
+const POSITION_METHODS = new Set(['catmull-rom', 'linear', 'bezier']);
+const ROTATION_METHODS = new Set(['slerp', 'linear']);
+const CAMERA_PATH_OPTION_KEYS = [
+  'autoPaceSpeed',
+  'easing',
+  'loop',
+  'positionMethod',
+  'rotationMethod'
+];
+
 // ---------------------------------------------------------------------------
 // Easing functions
 // ---------------------------------------------------------------------------
@@ -31,6 +43,51 @@ const EASING = {
   'ease-in': easeIn,
   'ease-out': easeOut
 };
+
+function assertKeyframes(keyframes) {
+  if (!Array.isArray(keyframes)) {
+    throw new TypeError('Camera path keyframes must be an array.');
+  }
+  keyframes.forEach((keyframe, index) => {
+    assertCameraKeyframe(keyframe, `Camera path keyframe ${index}`);
+  });
+}
+
+function assertAutoPaceSpeed(autoPaceSpeed) {
+  if (!Number.isFinite(autoPaceSpeed) || autoPaceSpeed <= 0) {
+    throw new TypeError('Camera path autoPaceSpeed must be a positive finite number.');
+  }
+  return autoPaceSpeed;
+}
+
+export function assertCameraPathOptions(options) {
+  if (!options || typeof options !== 'object' || Array.isArray(options)) {
+    throw new TypeError('Camera path interpolation options must be an object.');
+  }
+  const keys = Object.keys(options).sort();
+  if (
+    keys.length !== CAMERA_PATH_OPTION_KEYS.length ||
+    keys.some((key, index) => key !== CAMERA_PATH_OPTION_KEYS[index])
+  ) {
+    throw new TypeError(
+      `Camera path options must contain exactly ${CAMERA_PATH_OPTION_KEYS.join(', ')}.`
+    );
+  }
+  if (!POSITION_METHODS.has(options.positionMethod)) {
+    throw new RangeError(`Unsupported camera path position method: ${String(options.positionMethod)}.`);
+  }
+  if (!ROTATION_METHODS.has(options.rotationMethod)) {
+    throw new RangeError(`Unsupported camera path rotation method: ${String(options.rotationMethod)}.`);
+  }
+  if (!Object.hasOwn(EASING, options.easing)) {
+    throw new RangeError(`Unsupported camera path easing: ${String(options.easing)}.`);
+  }
+  if (typeof options.loop !== 'boolean') {
+    throw new TypeError('Camera path loop must be boolean.');
+  }
+  assertAutoPaceSpeed(options.autoPaceSpeed);
+  return options;
+}
 
 // ---------------------------------------------------------------------------
 // Scalar helpers
@@ -58,6 +115,28 @@ function catmullRomScalar(p0, p1, p2, p3, t) {
     (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 +
     (-p0 + 3 * p1 - 3 * p2 + p3) * t3
   );
+}
+
+/**
+ * Catmull-Rom for a strictly positive scale.
+ *
+ * Camera radii are multiplicative quantities. Interpolating their logarithms
+ * retains Catmull-Rom smoothness without allowing a valid positive path to
+ * cross through zero.
+ */
+function catmullRomPositiveScalar(p0, p1, p2, p3, t, label) {
+  const logValue = catmullRomScalar(
+    Math.log(p0),
+    Math.log(p1),
+    Math.log(p2),
+    Math.log(p3),
+    t
+  );
+  const value = Math.exp(logValue);
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new RangeError(`${label} interpolation exceeded the finite positive camera range.`);
+  }
+  return value;
 }
 
 /** Catmull-Rom for an angle — unwrap neighbours before spline evaluation. */
@@ -104,6 +183,9 @@ function catmullRomAngle(p0, p1, p2, p3, t) {
  * @returns {{ a: number, b: number }}  Interpolated (theta/yaw, phi/pitch).
  */
 function slerpAngles(t1, p1, t2, p2, t, isFreefly) {
+  if (t === 0) return { a: t1, b: p1 };
+  if (t === 1) return { a: t2, b: p2 };
+
   let ax, ay, az, bx, by, bz;
 
   if (isFreefly) {
@@ -127,19 +209,60 @@ function slerpAngles(t1, p1, t2, p2, t, isFreefly) {
 
   const omega = Math.acos(dot);
   if (omega < 1e-6) {
-    // Nearly identical — fall back to linear
-    return isFreefly
-      ? { a: lerpAngle(t1, t2, t), b: lerp(p1, p2, t) }
-      : { a: lerpAngle(t1, t2, t), b: lerp(p1, p2, t) };
+    // This is the exact zero-angle limiting form of SLERP.
+    return { a: lerpAngle(t1, t2, t), b: lerp(p1, p2, t) };
   }
 
-  const sinOmega = Math.sin(omega);
-  const s0 = Math.sin((1 - t) * omega) / sinOmega;
-  const s1 = Math.sin(t * omega) / sinOmega;
+  let cx;
+  let cy;
+  let cz;
+  if (Math.PI - omega < 1e-6) {
+    // Antipodal directions have infinitely many great-circle paths. Choose a
+    // deterministic orthogonal direction instead of dividing by sin(π), whose
+    // round-off noise otherwise causes cross-browser path flips.
+    const absX = Math.abs(ax);
+    const absY = Math.abs(ay);
+    const absZ = Math.abs(az);
+    let ox;
+    let oy;
+    let oz;
+    if (absX <= absY && absX <= absZ) {
+      ox = 0;
+      oy = az;
+      oz = -ay;
+    } else if (absY <= absZ) {
+      ox = -az;
+      oy = 0;
+      oz = ax;
+    } else {
+      ox = ay;
+      oy = -ax;
+      oz = 0;
+    }
+    const orthogonalLength = Math.hypot(ox, oy, oz);
+    ox /= orthogonalLength;
+    oy /= orthogonalLength;
+    oz /= orthogonalLength;
 
-  const cx = s0 * ax + s1 * bx;
-  const cy = s0 * ay + s1 * by;
-  const cz = s0 * az + s1 * bz;
+    const angle = Math.PI * t;
+    const startWeight = Math.cos(angle);
+    const orthogonalWeight = Math.sin(angle);
+    cx = startWeight * ax + orthogonalWeight * ox;
+    cy = startWeight * ay + orthogonalWeight * oy;
+    cz = startWeight * az + orthogonalWeight * oz;
+  } else {
+    const sinOmega = Math.sin(omega);
+    const s0 = Math.sin((1 - t) * omega) / sinOmega;
+    const s1 = Math.sin(t * omega) / sinOmega;
+    cx = s0 * ax + s1 * bx;
+    cy = s0 * ay + s1 * by;
+    cz = s0 * az + s1 * bz;
+  }
+
+  const directionLength = Math.hypot(cx, cy, cz);
+  cx /= directionLength;
+  cy /= directionLength;
+  cz /= directionLength;
 
   if (isFreefly) {
     const pitch = Math.asin(Math.max(-1, Math.min(1, cy)));
@@ -177,27 +300,25 @@ function keyframeDistance(kfA, kfB) {
 
   // Cross-mode or freefly: measure world-space eye-position distance
   if (modeA !== modeB || modeA === 'free') {
-    const posA = kfA.freefly?.position || [0, 0, 0];
-    const posB = kfB.freefly?.position || [0, 0, 0];
+    const posA = kfA.freefly.position;
+    const posB = kfB.freefly.position;
     return vec3Dist(posA, posB) + 0.5; // +0.5 baseline so identical positions still move
   }
 
   // Same-mode orbit / planar: target movement + radius change + arc travel
-  const tA = kfA.orbit?.target || [0, 0, 0];
-  const tB = kfB.orbit?.target || [0, 0, 0];
-  const rA = kfA.orbit?.radius ?? 3;
-  const rB = kfB.orbit?.radius ?? 3;
+  const tA = kfA.orbit.target;
+  const tB = kfB.orbit.target;
+  const rA = kfA.orbit.radius;
+  const rB = kfB.orbit.radius;
   // Account for angular travel (theta, phi) so large orbits around the same
   // target don't collapse to zero distance and whip the camera around.
-  let dTheta = (kfB.orbit?.theta ?? 0) - (kfA.orbit?.theta ?? 0);
+  let dTheta = kfB.orbit.theta - kfA.orbit.theta;
   dTheta -= Math.round(dTheta / (2 * Math.PI)) * 2 * Math.PI; // wrap to [-π, π]
-  const dPhi = (kfB.orbit?.phi ?? Math.PI / 4) - (kfA.orbit?.phi ?? Math.PI / 4);
+  const dPhi = kfB.orbit.phi - kfA.orbit.phi;
   const avgR = (rA + rB) / 2;
   const arcLength = avgR * Math.sqrt(dTheta * dTheta + dPhi * dPhi);
   return vec3Dist(tA, tB) + Math.abs(rA - rB) + arcLength + 0.5;
 }
-
-const DEFAULT_AUTO_PACE_SPEED = 1.5; // scene units per second
 
 // ---------------------------------------------------------------------------
 // Segment timing resolver
@@ -206,11 +327,12 @@ const DEFAULT_AUTO_PACE_SPEED = 1.5; // scene units per second
 /**
  * Compute the duration of each segment.
  * @param {import('./keyframe-store.js').Keyframe[]} keyframes
- * @param {number} [autoPaceSpeed]  Units/s for auto-paced segments (default 1.5).
+ * @param {number} autoPaceSpeed  Positive finite units/s for auto-paced segments.
  * @returns {number[]} Array of durations (seconds), length = keyframes.length - 1.
  */
 export function resolveSegmentDurations(keyframes, autoPaceSpeed) {
-  const speed = (autoPaceSpeed != null && autoPaceSpeed > 0) ? autoPaceSpeed : DEFAULT_AUTO_PACE_SPEED;
+  assertKeyframes(keyframes);
+  const speed = assertAutoPaceSpeed(autoPaceSpeed);
   const n = keyframes.length;
   if (n < 2) return [];
   const durations = [];
@@ -243,20 +365,27 @@ export function resolveSegmentDurations(keyframes, autoPaceSpeed) {
  * @returns {Object|null}  Camera state object for viewer.setCameraState(), or null.
  */
 export function interpolateCameraState(keyframes, globalT, options) {
+  assertKeyframes(keyframes);
   const n = keyframes.length;
   if (n === 0) return null;
+  if (!Number.isFinite(globalT) || globalT < 0 || globalT > 1) {
+    throw new RangeError(
+      `Camera path progress must be a finite number from 0 through 1; received ${String(globalT)}.`
+    );
+  }
+  assertCameraPathOptions(options);
   if (n === 1) return buildCameraState(keyframes[0]);
+  if (globalT === 0) return buildCameraState(keyframes[0]);
+  if (globalT === 1) return buildCameraState(keyframes[n - 1]);
 
   const durations = resolveSegmentDurations(keyframes, options.autoPaceSpeed);
   const totalDuration = durations.reduce((s, d) => s + d, 0);
-  if (totalDuration <= 0) return buildCameraState(keyframes[0]);
 
   // Apply easing to GLOBAL progress so the overall path eases in/out smoothly.
   // Per-segment easing would cause visible stuttering at every keyframe boundary
   // (each segment independently decelerates then re-accelerates).
-  const clamped = Math.max(0, Math.min(1, globalT));
-  const easingFn = EASING[options.easing] || easeLinear;
-  const easedT = easingFn(clamped);
+  const easingFn = EASING[options.easing];
+  const easedT = easingFn(globalT);
   const absTime = easedT * totalDuration;
 
   // Find segment
@@ -270,13 +399,11 @@ export function interpolateCameraState(keyframes, globalT, options) {
     cumulative += durations[i];
   }
 
-  let localT = durations[segIndex] > 0
-    ? (absTime - cumulative) / durations[segIndex]
-    : 0;
+  let localT = (absTime - cumulative) / durations[segIndex];
   localT = Math.max(0, Math.min(1, localT));
 
-  const posMethod = options.positionMethod || 'catmull-rom';
-  const rotMethod = options.rotationMethod || 'slerp';
+  const posMethod = options.positionMethod;
+  const rotMethod = options.rotationMethod;
 
   const modeA = keyframes[segIndex].navigationMode;
   const modeB = keyframes[Math.min(segIndex + 1, n - 1)].navigationMode;
@@ -323,8 +450,8 @@ function interpolateOrbit(keyframes, segIndex, t, posMethod, rotMethod, mode) {
   } else if (posMethod === 'bezier' && n >= 2) {
     target = bezierVec3(kf, i, t, 'orbit');
   } else {
-    const tA = a.orbit?.target || [0, 0, 0];
-    const tB = b.orbit?.target || [0, 0, 0];
+    const tA = a.orbit.target;
+    const tB = b.orbit.target;
     target = [lerp(tA[0], tB[0], t), lerp(tA[1], tB[1], t), lerp(tA[2], tB[2], t)];
   }
 
@@ -335,19 +462,33 @@ function interpolateOrbit(keyframes, segIndex, t, posMethod, rotMethod, mode) {
     const r1 = getOrbitScalar(kf, i, 'radius');
     const r2 = getOrbitScalar(kf, i + 1, 'radius');
     const r3 = getOrbitScalar(kf, i + 2, 'radius');
-    radius = catmullRomScalar(r0, r1, r2, r3, t);
+    radius = catmullRomPositiveScalar(
+      r0,
+      r1,
+      r2,
+      r3,
+      t,
+      'Camera path radius'
+    );
 
     const tr0 = getOrbitScalar(kf, i - 1, 'targetRadius');
     const tr1 = getOrbitScalar(kf, i, 'targetRadius');
     const tr2 = getOrbitScalar(kf, i + 1, 'targetRadius');
     const tr3 = getOrbitScalar(kf, i + 2, 'targetRadius');
-    targetRadius = catmullRomScalar(tr0, tr1, tr2, tr3, t);
+    targetRadius = catmullRomPositiveScalar(
+      tr0,
+      tr1,
+      tr2,
+      tr3,
+      t,
+      'Camera path target radius'
+    );
   } else {
-    const rA = a.orbit?.radius ?? 3;
-    const rB = b.orbit?.radius ?? 3;
+    const rA = a.orbit.radius;
+    const rB = b.orbit.radius;
     radius = lerp(rA, rB, t);
-    const trA = a.orbit?.targetRadius ?? rA;
-    const trB = b.orbit?.targetRadius ?? rB;
+    const trA = a.orbit.targetRadius;
+    const trB = b.orbit.targetRadius;
     targetRadius = lerp(trA, trB, t);
   }
 
@@ -355,8 +496,8 @@ function interpolateOrbit(keyframes, segIndex, t, posMethod, rotMethod, mode) {
   let theta, phi;
   if (mode === 'planar') {
     // Planar mode: theta/phi are fixed
-    theta = a.orbit?.theta ?? 0;
-    phi = a.orbit?.phi ?? 0;
+    theta = a.orbit.theta;
+    phi = a.orbit.phi;
   } else if (rotMethod === 'slerp') {
     if (posMethod === 'catmull-rom' && n >= 2) {
       // Use Catmull-Rom on angles for consistency with position spline.
@@ -377,16 +518,16 @@ function interpolateOrbit(keyframes, segIndex, t, posMethod, rotMethod, mode) {
       );
     } else {
       const res = slerpAngles(
-        a.orbit?.theta ?? 0, a.orbit?.phi ?? 0,
-        b.orbit?.theta ?? 0, b.orbit?.phi ?? 0,
+        a.orbit.theta, a.orbit.phi,
+        b.orbit.theta, b.orbit.phi,
         t, false
       );
       theta = res.a;
       phi = res.b;
     }
   } else {
-    theta = lerpAngle(a.orbit?.theta ?? 0, b.orbit?.theta ?? 0, t);
-    phi = lerp(a.orbit?.phi ?? 0, b.orbit?.phi ?? 0, t);
+    theta = lerpAngle(a.orbit.theta, b.orbit.theta, t);
+    phi = lerp(a.orbit.phi, b.orbit.phi, t);
   }
 
   // Sync freefly from interpolated orbit params so both representations are consistent.
@@ -399,7 +540,7 @@ function interpolateOrbit(keyframes, segIndex, t, posMethod, rotMethod, mode) {
   const fwdX = target[0] - eyeX;
   const fwdY = target[1] - eyeY;
   const fwdZ = target[2] - eyeZ;
-  const fLen = Math.sqrt(fwdX * fwdX + fwdY * fwdY + fwdZ * fwdZ) || 1;
+  const fLen = Math.sqrt(fwdX * fwdX + fwdY * fwdY + fwdZ * fwdZ);
   const syncYaw = Math.atan2(fwdZ / fLen, fwdX / fLen);
   const syncPitch = Math.asin(Math.max(-1, Math.min(1, fwdY / fLen)));
 
@@ -436,8 +577,8 @@ function interpolateFreefly(keyframes, segIndex, t, posMethod, rotMethod) {
   } else if (posMethod === 'bezier' && n >= 2) {
     position = bezierVec3(kf, i, t, 'freefly');
   } else {
-    const pA = a.freefly?.position || [0, 0, 0];
-    const pB = b.freefly?.position || [0, 0, 0];
+    const pA = a.freefly.position;
+    const pB = b.freefly.position;
     position = [lerp(pA[0], pB[0], t), lerp(pA[1], pB[1], t), lerp(pA[2], pB[2], t)];
   }
 
@@ -461,24 +602,24 @@ function interpolateFreefly(keyframes, segIndex, t, posMethod, rotMethod) {
       );
     } else {
       const res = slerpAngles(
-        a.freefly?.yaw ?? 0, a.freefly?.pitch ?? 0,
-        b.freefly?.yaw ?? 0, b.freefly?.pitch ?? 0,
+        a.freefly.yaw, a.freefly.pitch,
+        b.freefly.yaw, b.freefly.pitch,
         t, true
       );
       yaw = res.a;
       pitch = res.b;
     }
   } else {
-    yaw = lerpAngle(a.freefly?.yaw ?? 0, b.freefly?.yaw ?? 0, t);
-    pitch = lerp(a.freefly?.pitch ?? 0, b.freefly?.pitch ?? 0, t);
+    yaw = lerpAngle(a.freefly.yaw, b.freefly.yaw, t);
+    pitch = lerp(a.freefly.pitch, b.freefly.pitch, t);
   }
 
   // Sync orbit from interpolated freefly params so the viewer's orbit variables
   // are reasonable if the next segment switches back to orbit rendering.
   // Place the synthetic target along the freefly look direction at a blended
   // radius so the transition to orbit (which always looks at target) is smooth.
-  const rA = a.orbit?.radius ?? 3;
-  const rB = b.orbit?.radius ?? 3;
+  const rA = a.orbit.radius;
+  const rB = b.orbit.radius;
   const syncRadius = lerp(rA, rB, t);
   const cosP = Math.cos(pitch);
   const syncTarget = [
@@ -491,7 +632,7 @@ function interpolateFreefly(keyframes, segIndex, t, posMethod, rotMethod) {
   const offX = position[0] - syncTarget[0];
   const offY = position[1] - syncTarget[1];
   const offZ = position[2] - syncTarget[2];
-  const offLen = Math.max(0.01, Math.sqrt(offX * offX + offY * offY + offZ * offZ));
+  const offLen = Math.sqrt(offX * offX + offY * offY + offZ * offZ);
   const syncTheta = Math.atan2(offZ, offX);
   const syncPhi = Math.acos(Math.max(-1, Math.min(1, offY / offLen)));
 
@@ -539,68 +680,67 @@ function bezierVec3(keyframes, segIndex, t, mode) {
 }
 
 // ---------------------------------------------------------------------------
-// Safe keyframe accessors (clamp with mirror at boundaries)
+// Spline boundary accessors (mirror extrapolation)
 // ---------------------------------------------------------------------------
 
 function getOrbitTarget(kf, idx) {
   const n = kf.length;
   if (idx < 0) {
-    const a = kf[0].orbit?.target || [0, 0, 0];
-    const b = kf[Math.min(1, n - 1)].orbit?.target || [0, 0, 0];
+    const a = kf[0].orbit.target;
+    const b = kf[Math.min(1, n - 1)].orbit.target;
     return [2 * a[0] - b[0], 2 * a[1] - b[1], 2 * a[2] - b[2]];
   }
   if (idx >= n) {
-    const a = kf[n - 1].orbit?.target || [0, 0, 0];
-    const b = kf[Math.max(0, n - 2)].orbit?.target || [0, 0, 0];
+    const a = kf[n - 1].orbit.target;
+    const b = kf[Math.max(0, n - 2)].orbit.target;
     return [2 * a[0] - b[0], 2 * a[1] - b[1], 2 * a[2] - b[2]];
   }
-  return kf[idx].orbit?.target || [0, 0, 0];
+  return kf[idx].orbit.target;
 }
 
 function getOrbitScalar(kf, idx, prop) {
   const n = kf.length;
-  const defaults = { radius: 3, targetRadius: 3, theta: 0, phi: Math.PI / 4 };
   if (idx < 0) {
-    const a = kf[0].orbit?.[prop] ?? defaults[prop];
-    const b = kf[Math.min(1, n - 1)].orbit?.[prop] ?? defaults[prop];
+    const a = kf[0].orbit[prop];
+    const b = kf[Math.min(1, n - 1)].orbit[prop];
     return 2 * a - b;
   }
   if (idx >= n) {
-    const a = kf[n - 1].orbit?.[prop] ?? defaults[prop];
-    const b = kf[Math.max(0, n - 2)].orbit?.[prop] ?? defaults[prop];
+    const a = kf[n - 1].orbit[prop];
+    const b = kf[Math.max(0, n - 2)].orbit[prop];
     return 2 * a - b;
   }
-  return kf[idx].orbit?.[prop] ?? defaults[prop];
+  return kf[idx].orbit[prop];
 }
 
 function getFreeflyPos(kf, idx) {
   const n = kf.length;
   if (idx < 0) {
-    const a = kf[0].freefly?.position || [0, 0, 0];
-    const b = kf[Math.min(1, n - 1)].freefly?.position || [0, 0, 0];
+    const a = kf[0].freefly.position;
+    const b = kf[Math.min(1, n - 1)].freefly.position;
     return [2 * a[0] - b[0], 2 * a[1] - b[1], 2 * a[2] - b[2]];
   }
   if (idx >= n) {
-    const a = kf[n - 1].freefly?.position || [0, 0, 0];
-    const b = kf[Math.max(0, n - 2)].freefly?.position || [0, 0, 0];
+    const a = kf[n - 1].freefly.position;
+    const b = kf[Math.max(0, n - 2)].freefly.position;
     return [2 * a[0] - b[0], 2 * a[1] - b[1], 2 * a[2] - b[2]];
   }
-  return kf[idx].freefly?.position || [0, 0, 0];
+  return kf[idx].freefly.position;
 }
 
 function getFreeflyScalar(kf, idx, prop) {
   const n = kf.length;
   if (idx < 0) {
-    const a = kf[0].freefly?.[prop] ?? 0;
-    const b = kf[Math.min(1, n - 1)].freefly?.[prop] ?? 0;
+    const a = kf[0].freefly[prop];
+    const b = kf[Math.min(1, n - 1)].freefly[prop];
     return 2 * a - b;
   }
   if (idx >= n) {
-    const a = kf[n - 1].freefly?.[prop] ?? 0;
-    const b = kf[Math.max(0, n - 2)].freefly?.[prop] ?? 0;
+    const a = kf[n - 1].freefly[prop];
+    const b = kf[Math.max(0, n - 2)].freefly[prop];
     return 2 * a - b;
   }
-  return kf[idx].freefly?.[prop] ?? 0;
+  return kf[idx].freefly[prop];
 }
 
 // ---------------------------------------------------------------------------
@@ -610,21 +750,17 @@ function getFreeflyScalar(kf, idx, prop) {
 function buildCameraState(kf) {
   return {
     navigationMode: kf.navigationMode,
-    orbit: kf.orbit
-      ? {
-          radius: kf.orbit.radius,
-          targetRadius: kf.orbit.targetRadius,
-          theta: kf.orbit.theta,
-          phi: kf.orbit.phi,
-          target: [kf.orbit.target[0], kf.orbit.target[1], kf.orbit.target[2]]
-        }
-      : { radius: 3, targetRadius: 3, theta: 0, phi: Math.PI / 4, target: [0, 0, 0] },
-    freefly: kf.freefly
-      ? {
-          position: [kf.freefly.position[0], kf.freefly.position[1], kf.freefly.position[2]],
-          yaw: kf.freefly.yaw,
-          pitch: kf.freefly.pitch
-        }
-      : { position: [0, 0, 3], yaw: 0, pitch: 0 }
+    orbit: {
+      radius: kf.orbit.radius,
+      targetRadius: kf.orbit.targetRadius,
+      theta: kf.orbit.theta,
+      phi: kf.orbit.phi,
+      target: [kf.orbit.target[0], kf.orbit.target[1], kf.orbit.target[2]]
+    },
+    freefly: {
+      position: [kf.freefly.position[0], kf.freefly.position[1], kf.freefly.position[2]],
+      yaw: kf.freefly.yaw,
+      pitch: kf.freefly.pitch
+    }
   };
 }

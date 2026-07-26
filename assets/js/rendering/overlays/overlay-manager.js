@@ -23,8 +23,31 @@ export class OverlayManager {
    * @param {import('./overlay-base.js').OverlayBase} overlay
    */
   register(overlay) {
-    if (!overlay || !overlay.id) throw new Error('OverlayManager.register: overlay must have an id');
-    const id = String(overlay.id);
+    if (!overlay || typeof overlay !== 'object') {
+      throw new TypeError('OverlayManager.register requires an overlay object.');
+    }
+    if (typeof overlay.id !== 'string' || overlay.id.length === 0) {
+      throw new TypeError('OverlayManager.register requires a non-empty string id.');
+    }
+    for (const method of ['init', 'update', 'render', 'dispose']) {
+      if (typeof overlay[method] !== 'function') {
+        throw new TypeError(
+          'OverlayManager.register requires the complete init, update, render, and dispose lifecycle.'
+        );
+      }
+    }
+    if (!Number.isFinite(overlay.priority)) {
+      throw new TypeError('OverlayManager.register requires a finite priority.');
+    }
+    if (typeof overlay.enabled !== 'boolean' || typeof overlay.visible !== 'boolean') {
+      throw new TypeError(
+        'OverlayManager.register requires boolean enabled and visible state.'
+      );
+    }
+    const id = overlay.id;
+    if (this._overlays.has(id)) {
+      throw new Error(`OverlayManager already owns overlay "${id}".`);
+    }
     this._overlays.set(id, overlay);
     this._dirtyOrder = true;
   }
@@ -33,25 +56,31 @@ export class OverlayManager {
    * @param {string} id
    */
   get(id) {
-    return this._overlays.get(String(id)) || null;
+    if (typeof id !== 'string' || id.length === 0) {
+      throw new TypeError('OverlayManager.get requires a non-empty string id.');
+    }
+    return this._overlays.get(id) ?? null;
   }
 
   /**
    * @param {string} id
    */
   unregister(id) {
-    const key = String(id);
-    const overlay = this._overlays.get(key) || null;
-    if (!overlay) return false;
-    overlay.dispose?.();
-    this._overlays.delete(key);
+    if (typeof id !== 'string' || id.length === 0) {
+      throw new TypeError('OverlayManager.unregister requires a non-empty string id.');
+    }
+    const overlay = this._overlays.get(id);
+    if (!overlay) {
+      throw new RangeError(`OverlayManager does not own overlay "${id}".`);
+    }
+    overlay.dispose();
+    this._overlays.delete(id);
     this._dirtyOrder = true;
-    return true;
   }
 
   initAll() {
     for (const overlay of this._overlays.values()) {
-      overlay.init?.();
+      overlay.init();
     }
   }
 
@@ -67,9 +96,12 @@ export class OverlayManager {
    * @param {object} context
    */
   update(dtSeconds, context) {
+    if (!Number.isFinite(dtSeconds) || dtSeconds < 0) {
+      throw new RangeError('OverlayManager.update requires a finite non-negative delta.');
+    }
     const overlays = this._getSorted();
     for (const overlay of overlays) {
-      overlay.update?.(dtSeconds, context);
+      overlay.update(dtSeconds, context);
     }
   }
 
@@ -79,13 +111,13 @@ export class OverlayManager {
   render(context) {
     const overlays = this._getSorted();
     for (const overlay of overlays) {
-      overlay.render?.(context);
+      overlay.render(context);
     }
   }
 
   dispose() {
     for (const overlay of this._overlays.values()) {
-      overlay.dispose?.();
+      overlay.dispose();
     }
     this._overlays.clear();
     this._sorted = [];
@@ -94,9 +126,10 @@ export class OverlayManager {
 
   _getSorted() {
     if (!this._dirtyOrder) return this._sorted;
-    this._sorted = Array.from(this._overlays.values()).sort((a, b) => (a.priority || 0) - (b.priority || 0));
+    this._sorted = Array.from(this._overlays.values()).sort(
+      (a, b) => a.priority - b.priority
+    );
     this._dirtyOrder = false;
     return this._sorted;
   }
 }
-

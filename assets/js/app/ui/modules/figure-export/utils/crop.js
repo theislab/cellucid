@@ -12,12 +12,53 @@
  * @module ui/modules/figure-export/utils/crop
  */
 
-import { clamp } from '../../../../utils/number-utils.js';
-
 const MIN_NORM_SIZE = 0.02;
+const CROP_INPUT_KEYS = Object.freeze([
+  'enabled',
+  'height',
+  'width',
+  'x',
+  'y',
+]);
+const CROP_RECT_KEYS = Object.freeze(['height', 'width', 'x', 'y']);
 
-function clamp01(v) {
-  return clamp(Number(v) || 0, 0, 1);
+function assertExactKeys(value, expectedKeys, context) {
+  if (
+    value === null ||
+    typeof value !== 'object' ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype
+  ) {
+    throw new TypeError(`${context} must be a plain object.`);
+  }
+  const keys = Object.keys(value).sort();
+  if (
+    keys.length !== expectedKeys.length ||
+    keys.some((key, index) => key !== expectedKeys[index])
+  ) {
+    throw new TypeError(
+      `${context} must contain exactly: ${expectedKeys.join(', ')}.`
+    );
+  }
+}
+
+function assertRectNumbers(rect, context) {
+  for (const key of CROP_RECT_KEYS) {
+    if (typeof rect[key] !== 'number' || !Number.isFinite(rect[key])) {
+      throw new TypeError(`${context}.${key} must be a finite number.`);
+    }
+  }
+  if (rect.x < 0 || rect.y < 0) {
+    throw new RangeError(`${context} origin must be within the viewport.`);
+  }
+  if (rect.width < MIN_NORM_SIZE || rect.height < MIN_NORM_SIZE) {
+    throw new RangeError(
+      `${context} width and height must each be at least ${MIN_NORM_SIZE}.`
+    );
+  }
+  if (rect.x + rect.width > 1 || rect.y + rect.height > 1) {
+    throw new RangeError(`${context} must be fully contained in the viewport.`);
+  }
 }
 
 /**
@@ -29,26 +70,29 @@ function clamp01(v) {
  */
 
 /**
- * Normalize a crop rect to a safe 0..1 box (or return null if disabled).
+ * Assert the exact current crop contract.
  *
- * @param {any} crop
+ * `null` means cropping is disabled. Enabled crop objects are validated but
+ * never coerced, clamped, resized, or translated.
+ *
+ * @param {unknown} crop
  * @returns {NormalizedCropRect|null}
  */
-export function normalizeCropRect01(crop) {
-  if (!crop || crop.enabled !== true) return null;
-
-  let x = clamp01(crop.x);
-  let y = clamp01(crop.y);
-  let width = clamp01(crop.width ?? crop.w);
-  let height = clamp01(crop.height ?? crop.h);
-
-  width = Math.max(MIN_NORM_SIZE, width);
-  height = Math.max(MIN_NORM_SIZE, height);
-
-  if (x + width > 1) x = Math.max(0, 1 - width);
-  if (y + height > 1) y = Math.max(0, 1 - height);
-
-  return { x, y, width, height };
+export function assertCropRect01(crop) {
+  if (crop === null) return null;
+  assertExactKeys(crop, CROP_INPUT_KEYS, 'Figure export crop');
+  if (crop.enabled !== true) {
+    throw new TypeError(
+      'Figure export crop.enabled must be true; use null when cropping is disabled.'
+    );
+  }
+  assertRectNumbers(crop, 'Figure export crop');
+  return {
+    x: crop.x,
+    y: crop.y,
+    width: crop.width,
+    height: crop.height,
+  };
 }
 
 /**
@@ -68,14 +112,25 @@ export function normalizeCropRect01(crop) {
  * @returns {PixelRect|null}
  */
 export function cropRect01ToPx(crop01, viewportWidth, viewportHeight) {
-  if (!crop01) return null;
-  const vw = Math.max(1, Number(viewportWidth) || 1);
-  const vh = Math.max(1, Number(viewportHeight) || 1);
+  if (crop01 === null) return null;
+  assertExactKeys(crop01, CROP_RECT_KEYS, 'Normalized figure export crop');
+  assertRectNumbers(crop01, 'Normalized figure export crop');
+  if (
+    typeof viewportWidth !== 'number' ||
+    !Number.isFinite(viewportWidth) ||
+    viewportWidth <= 0 ||
+    typeof viewportHeight !== 'number' ||
+    !Number.isFinite(viewportHeight) ||
+    viewportHeight <= 0
+  ) {
+    throw new TypeError(
+      'Figure export crop viewport dimensions must be finite positive numbers.'
+    );
+  }
   return {
-    x: crop01.x * vw,
-    y: crop01.y * vh,
-    width: Math.max(1, crop01.width * vw),
-    height: Math.max(1, crop01.height * vh),
+    x: crop01.x * viewportWidth,
+    y: crop01.y * viewportHeight,
+    width: crop01.width * viewportWidth,
+    height: crop01.height * viewportHeight,
   };
 }
-

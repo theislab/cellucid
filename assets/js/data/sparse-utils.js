@@ -41,7 +41,8 @@ export function buildCscFromCsr(sparse) {
     return {
       colIndptr: new Int32Array(nCols + 1),
       rowIndices: new Int32Array(0),
-      colData: new Float32Array(0)
+      colData: new Float32Array(0),
+      exactInteger: sparse.exactInteger === true
     };
   }
 
@@ -81,7 +82,40 @@ export function buildCscFromCsr(sparse) {
     }
   }
 
-  return { colIndptr, rowIndices, colData };
+  return {
+    colIndptr,
+    rowIndices,
+    colData,
+    exactInteger: sparse.exactInteger === true
+  };
+}
+
+/**
+ * Add values into Float32 sparse output without turning a finite sum into
+ * infinity during narrowing. Explicit non-finite source values are preserved.
+ *
+ * @param {number} current
+ * @param {number} value
+ * @param {string} label
+ * @returns {number}
+ */
+export function addSparseFloat32(
+  current,
+  value,
+  label = 'Sparse column',
+  requireExactInteger = false
+) {
+  const sum = current + value;
+  const narrowed = Math.fround(sum);
+  if (Number.isFinite(sum) && !Number.isFinite(narrowed)) {
+    throw new Error(`${label} value is outside the Float32 range`);
+  }
+  if (requireExactInteger && Number(narrowed) !== sum) {
+    throw new Error(
+      `${label} integer sum ${sum} cannot be represented exactly in Float32`
+    );
+  }
+  return narrowed;
 }
 
 /**
@@ -98,14 +132,15 @@ export function buildCscFromCsr(sparse) {
  */
 export function getSparseColumn(cscData, colIdx, nRows) {
   const { colIndptr, rowIndices, colData } = cscData;
-  const result = new Float32Array(nRows);
 
-  // Edge case: column index out of range
-  if (colIdx < 0 || colIdx >= colIndptr.length - 1) {
-    console.warn(`[sparse-utils] Column index ${colIdx} out of range, returning zeros`);
-    return result;
+  // Invalid columns must not look like genuine all-zero expression.
+  if (!Number.isSafeInteger(colIdx) ||
+      colIdx < 0 ||
+      colIdx >= colIndptr.length - 1) {
+    throw new Error(`Sparse column index ${colIdx} is out of bounds`);
   }
 
+  const result = new Float32Array(nRows);
   const start = colIndptr[colIdx];
   const end = colIndptr[colIdx + 1];
 
@@ -113,7 +148,13 @@ export function getSparseColumn(cscData, colIdx, nRows) {
     const rowIdx = rowIndices[j];
     // Edge case: validate row index
     if (rowIdx >= 0 && rowIdx < nRows) {
-      result[rowIdx] = colData[j];
+      // Compressed sparse matrices may legally contain duplicate coordinates.
+      result[rowIdx] = addSparseFloat32(
+        result[rowIdx],
+        colData[j],
+        'Sparse column',
+        cscData.exactInteger === true
+      );
     }
   }
 
@@ -121,50 +162,379 @@ export function getSparseColumn(cscData, colIdx, nRows) {
 }
 
 /**
- * Extract connectivity edges from a sparse adjacency matrix.
- * Returns unique edges where source < destination (undirected graph).
+ * Validate one exact direct-AnnData connectivity matrix and construct its
+ * canonical upper-triangle edge pairs without mutating the matrix.
  *
- * @param {Object} sparse - Sparse matrix (CSR or CSC format)
- * @param {Int32Array} sparse.indptr - Row/column pointers
- * @param {Int32Array} sparse.indices - Column/row indices
- * @param {number} nCells - Number of cells (for validation)
- * @returns {{sources: Uint32Array, destinations: Uint32Array, nEdges: number}}
+ * Values must be finite and non-negative, the diagonal must be zero, and the
+ * matrix must be exactly symmetric in both topology and weight. Sparse storage
+ * must contain one strictly positive value per coordinate; explicit zeros and
+ * duplicate coordinates are corruption rather than instructions to drop, sum,
+ * or deduplicate scientific data.
+ *
+ * @param {Object} sparse - Dense, CSR, or CSC connectivity matrix
+ * @param {number} nCells - Exact observation-axis length
+ * @returns {{sources: Uint32Array, destinations: Uint32Array, weights: Float64Array, nCells: number, nEdges: number, maxNeighbors: number}}
  */
-export function extractConnectivityEdges(sparse, nCells) {
-  const { indptr, indices } = sparse;
+const MAX_CONNECTIVITY_WORKING_BYTES = 512 * 1024 * 1024;
 
-  // Edge case: empty connectivity
-  if (!indptr || !indices || indices.length === 0) {
-    return {
-      sources: new Uint32Array(0),
-      destinations: new Uint32Array(0),
-      nEdges: 0
-    };
+function connectivityStorageBytes(values, unpackedBytesPerItem) {
+  if (!values) return 0n;
+  if (Number.isSafeInteger(values.byteLength) && values.byteLength >= 0) {
+    return BigInt(values.byteLength);
+  }
+  if (!Number.isSafeInteger(values.length) || values.length < 0) {
+    throw new Error('Connectivity storage has an invalid length');
+  }
+  return BigInt(values.length) * BigInt(unpackedBytesPerItem);
+}
+
+function requireConnectivityWorkingSet(sourceBytes, additionalBytes) {
+  if (sourceBytes + additionalBytes >
+      BigInt(MAX_CONNECTIVITY_WORKING_BYTES)) {
+    throw new Error(
+      `Connectivity edge working set exceeds the ${MAX_CONNECTIVITY_WORKING_BYTES}-byte browser limit; use the Cellucid server or prepared format`
+    );
+  }
+}
+
+function connectivityWeight(value, label) {
+  if (typeof value !== 'number') {
+    throw new TypeError(
+      `${label} must contain only real numeric weights`
+    );
+  }
+  if (!Number.isFinite(value)) {
+    throw new Error('Connectivity weights must all be finite');
+  }
+  if (value < 0) {
+    throw new Error('Connectivity weights must all be non-negative');
+  }
+  return value;
+}
+
+function buildConnectivityEdgeResult(
+  sources,
+  destinations,
+  weights,
+  nCells
+) {
+  if (
+    !(sources instanceof Uint32Array) ||
+    !(destinations instanceof Uint32Array) ||
+    !(weights instanceof Float64Array) ||
+    sources.length !== destinations.length ||
+    sources.length !== weights.length
+  ) {
+    throw new Error(
+      'Connectivity edge buffers must contain equal-length Uint32 endpoints and Float64 weights'
+    );
+  }
+  const degrees = new Uint32Array(nCells);
+  let maxNeighbors = 0;
+  for (let index = 0; index < sources.length; index++) {
+    const sourceDegree = ++degrees[sources[index]];
+    const destinationDegree = ++degrees[destinations[index]];
+    if (sourceDegree > maxNeighbors) maxNeighbors = sourceDegree;
+    if (destinationDegree > maxNeighbors) {
+      maxNeighbors = destinationDegree;
+    }
+  }
+  return {
+    sources,
+    destinations,
+    weights,
+    nCells,
+    nEdges: sources.length,
+    maxNeighbors,
+  };
+}
+
+function heapSortNumeric(keys, values, length) {
+  const swap = (left, right) => {
+    const key = keys[left];
+    keys[left] = keys[right];
+    keys[right] = key;
+    if (values) {
+      const value = values[left];
+      values[left] = values[right];
+      values[right] = value;
+    }
+  };
+  const siftDown = (start, end) => {
+    let root = start;
+    while (root * 2 + 1 <= end) {
+      let child = root * 2 + 1;
+      if (child + 1 <= end && keys[child] < keys[child + 1]) child++;
+      if (keys[root] >= keys[child]) return;
+      swap(root, child);
+      root = child;
+    }
+  };
+
+  for (let start = Math.floor((length - 2) / 2); start >= 0; start--) {
+    siftDown(start, length - 1);
+  }
+  for (let end = length - 1; end > 0; end--) {
+    swap(0, end);
+    siftDown(0, end - 1);
+  }
+}
+
+export function extractConnectivityEdges(sparse, nCells) {
+  if (!Number.isSafeInteger(nCells) || nCells <= 0) {
+    throw new Error('Connectivity cell count must be a positive safe integer');
+  }
+  if (BigInt(nCells) * BigInt(nCells) > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error('Connectivity dimensions exceed safe edge-key range');
   }
 
-  const nRows = indptr.length - 1;
-  const edgeSources = [];
-  const edgeDestinations = [];
+  if (sparse?.format === 'dense') {
+    const { data, shape } = sparse;
+    if (!Array.isArray(shape) ||
+        shape.length !== 2 ||
+        shape[0] !== nCells ||
+        shape[1] !== nCells ||
+        !data ||
+        data.length !== nCells * nCells) {
+      throw new Error('Dense connectivity matrix must be square and cell-aligned');
+    }
+    const maximumEdgeCount =
+      BigInt(nCells) * BigInt(Math.max(0, nCells - 1)) / 2n;
+    const sourceBytes = connectivityStorageBytes(data, 8);
+    requireConnectivityWorkingSet(
+      sourceBytes,
+      maximumEdgeCount * 44n + BigInt(nCells) * 4n
+    );
 
-  for (let cell = 0; cell < nRows && cell < nCells; cell++) {
-    const start = indptr[cell];
-    const end = indptr[cell + 1];
+    let edgeCount = 0;
+    for (let source = 0; source < nCells; source++) {
+      const diagonal = connectivityWeight(
+        data[source * nCells + source],
+        'Dense connectivity matrix'
+      );
+      if (diagonal !== 0) {
+        throw new Error(
+          'Connectivity diagonal values must all be exactly zero'
+        );
+      }
+      for (let destination = source + 1; destination < nCells; destination++) {
+        const forward = connectivityWeight(
+          data[source * nCells + destination],
+          'Dense connectivity matrix'
+        );
+        const reverse = connectivityWeight(
+          data[destination * nCells + source],
+          'Dense connectivity matrix'
+        );
+        if (forward !== reverse) {
+          throw new Error(
+            'Connectivity matrix topology and weights must be exactly symmetric'
+          );
+        }
+        if (forward > 0) {
+          edgeCount++;
+        }
+      }
+    }
+    requireConnectivityWorkingSet(
+      sourceBytes,
+      BigInt(edgeCount) * 44n + BigInt(nCells) * 4n
+    );
+    const edgeSources = new Uint32Array(edgeCount);
+    const edgeDestinations = new Uint32Array(edgeCount);
+    const edgeWeights = new Float64Array(edgeCount);
+    let edgeIndex = 0;
+    for (let source = 0; source < nCells; source++) {
+      for (let destination = source + 1; destination < nCells; destination++) {
+        const weight = data[source * nCells + destination];
+        if (weight > 0) {
+          edgeSources[edgeIndex] = source;
+          edgeDestinations[edgeIndex] = destination;
+          edgeWeights[edgeIndex] = weight;
+          edgeIndex++;
+        }
+      }
+    }
+    return buildConnectivityEdgeResult(
+      edgeSources,
+      edgeDestinations,
+      edgeWeights,
+      nCells
+    );
+  }
+
+  const { indptr, indices, data, shape } = sparse ?? {};
+  const format = sparse?.format;
+  if (format !== 'csr' && format !== 'csc') {
+    throw new Error(`Unsupported connectivity sparse format '${format}'`);
+  }
+  if (!Array.isArray(shape) ||
+      shape.length !== 2 ||
+      shape[0] !== nCells ||
+      shape[1] !== nCells) {
+    throw new Error('Sparse connectivity matrix must be square and cell-aligned');
+  }
+  if (!data) {
+    throw new Error(
+      'Sparse connectivity data is required; implicit values are not supported'
+    );
+  }
+  if (!indices || !indptr ||
+      !Number.isSafeInteger(indices.length) ||
+      !Number.isSafeInteger(indptr.length) ||
+      !Number.isSafeInteger(data.length) ||
+      indices.length < 0 ||
+      indptr.length < 0 ||
+      data.length < 0) {
+    throw new Error('Sparse connectivity storage has an invalid length');
+  }
+  if (data.length !== indices.length) {
+    throw new Error('Sparse connectivity data and indices lengths differ');
+  }
+
+  const majorAxis = format === 'csr' ? shape[0] : shape[1];
+  if (indptr.length !== majorAxis + 1) {
+    throw new Error('Connectivity pointer array does not match its sparse format');
+  }
+  for (let index = 0; index < indptr.length; index++) {
+    const pointer = indptr[index];
+    if (!Number.isSafeInteger(pointer) ||
+        pointer < 0 ||
+        pointer > indices.length ||
+        (index > 0 && pointer < indptr[index - 1])) {
+      throw new Error(
+        'Connectivity pointers must be monotonic safe integers within the sparse entry bounds'
+      );
+    }
+  }
+  if (indptr[0] !== 0 ||
+      indptr[indptr.length - 1] !== indices.length) {
+    throw new Error('Connectivity pointers must span every sparse entry');
+  }
+
+  const sourceBytes =
+    connectivityStorageBytes(data, 8) +
+    connectivityStorageBytes(indices, 8) +
+    connectivityStorageBytes(indptr, 8);
+  // One non-mutating coordinate-key/weight copy plus the canonical,
+  // render-owned, and GPU-staging edge payloads for the largest valid
+  // symmetric graph. Heap sort below is in-place on the coordinate copy.
+  const maximumEdgeCount = Math.floor(indices.length / 2);
+  requireConnectivityWorkingSet(
+    sourceBytes,
+    BigInt(indices.length) * 16n +
+      BigInt(maximumEdgeCount) * 44n +
+      BigInt(nCells) * 4n
+  );
+  const directedKeys = new Float64Array(indices.length);
+  const directedWeights = new Float64Array(indices.length);
+  const directedCount = indices.length;
+
+  for (let major = 0; major < majorAxis; major++) {
+    const start = indptr[major];
+    const end = indptr[major + 1];
 
     for (let j = start; j < end; j++) {
-      const neighbor = indices[j];
-      // Only add edge once (src < dst) and validate neighbor index
-      if (cell < neighbor && neighbor < nCells) {
-        edgeSources.push(cell);
-        edgeDestinations.push(neighbor);
+      const minor = indices[j];
+      if (!Number.isSafeInteger(minor) || minor < 0 || minor >= nCells) {
+        throw new Error(`Connectivity index ${minor} is outside cell bounds`);
       }
+      const row = format === 'csr' ? major : minor;
+      const column = format === 'csr' ? minor : major;
+      directedKeys[j] = row * nCells + column;
+      const weight = connectivityWeight(
+        data[j],
+        'Sparse connectivity matrix'
+      );
+      if (!(weight > 0)) {
+        throw new Error(
+          'Sparse connectivity storage must omit zero-weight coordinates'
+        );
+      }
+      directedWeights[j] = weight;
     }
   }
 
-  return {
-    sources: new Uint32Array(edgeSources),
-    destinations: new Uint32Array(edgeDestinations),
-    nEdges: edgeSources.length
+  heapSortNumeric(directedKeys, directedWeights, directedCount);
+  let previousKey = -1;
+  for (let index = 0; index < directedCount; index++) {
+    const directedKey = directedKeys[index];
+    if (index > 0 && directedKey === previousKey) {
+      throw new Error(
+        'Sparse connectivity matrix contains a duplicate coordinate'
+      );
+    }
+    previousKey = directedKey;
+    const row = Math.floor(directedKey / nCells);
+    const column = directedKey - row * nCells;
+    if (row === column) {
+      throw new Error(
+        'Connectivity diagonal values must all be exactly zero'
+      );
+    }
+  }
+
+  const findDirectedIndex = key => {
+    let left = 0;
+    let right = directedCount - 1;
+    while (left <= right) {
+      const middle = left + Math.floor((right - left) / 2);
+      const candidate = directedKeys[middle];
+      if (candidate === key) return middle;
+      if (candidate < key) {
+        left = middle + 1;
+      } else {
+        right = middle - 1;
+      }
+    }
+    return -1;
   };
+
+  let edgeCount = 0;
+  for (let index = 0; index < directedCount; index++) {
+    const directedKey = directedKeys[index];
+    const row = Math.floor(directedKey / nCells);
+    const column = directedKey - row * nCells;
+    const reverseIndex = findDirectedIndex(column * nCells + row);
+    if (reverseIndex < 0) {
+      throw new Error(
+        'Connectivity matrix topology and weights must be exactly symmetric'
+      );
+    }
+    if (directedWeights[reverseIndex] !== directedWeights[index]) {
+      throw new Error(
+        'Connectivity matrix topology and weights must be exactly symmetric'
+      );
+    }
+    if (row < column) edgeCount++;
+  }
+
+  requireConnectivityWorkingSet(
+    sourceBytes + BigInt(indices.length) * 16n,
+    BigInt(edgeCount) * 44n + BigInt(nCells) * 4n
+  );
+  const edgeSources = new Uint32Array(edgeCount);
+  const edgeDestinations = new Uint32Array(edgeCount);
+  const edgeWeights = new Float64Array(edgeCount);
+  let edgeIndex = 0;
+  for (let index = 0; index < directedCount; index++) {
+    const directedKey = directedKeys[index];
+    const source = Math.floor(directedKey / nCells);
+    const destination = directedKey - source * nCells;
+    if (source < destination) {
+      edgeSources[edgeIndex] = source;
+      edgeDestinations[edgeIndex] = destination;
+      edgeWeights[edgeIndex] = directedWeights[index];
+      edgeIndex++;
+    }
+  }
+
+  return buildConnectivityEdgeResult(
+    edgeSources,
+    edgeDestinations,
+    edgeWeights,
+    nCells
+  );
 }
 
 /**
@@ -174,32 +544,36 @@ export function extractConnectivityEdges(sparse, nCells) {
  * @param {TypedArray} arr - Source array (may be BigInt64Array, BigUint64Array, or other)
  * @returns {Int32Array} Converted array
  */
-export function toInt32Array(arr) {
+export function toInt32Array(arr, label = 'Integer value') {
+  if (!arr || !Number.isSafeInteger(arr.length) || arr.length < 0) {
+    throw new Error(`${label} array has an invalid length`);
+  }
+
   // Already Int32Array - return as-is
   if (arr instanceof Int32Array) {
     return arr;
   }
 
-  // Handle BigInt64Array and BigUint64Array (int64/uint64 from h5wasm)
-  if (arr instanceof BigInt64Array || arr instanceof BigUint64Array) {
-    const result = new Int32Array(arr.length);
-    for (let i = 0; i < arr.length; i++) {
-      // Convert BigInt to Number, clamping to Int32 range to prevent overflow
-      const val = arr[i];
-      // BigInt comparison uses BigInt literals
-      if (val > 2147483647n) {
-        result[i] = 2147483647; // Int32 max
-      } else if (val < -2147483648n) {
-        result[i] = -2147483648; // Int32 min
-      } else {
-        result[i] = Number(val);
+  const result = new Int32Array(arr.length);
+  for (let i = 0; i < arr.length; i++) {
+    const raw = arr[i];
+    if (typeof raw === 'bigint') {
+      if (raw < -2147483648n || raw > 2147483647n) {
+        throw new Error(`${label} ${raw} is outside the Int32 range`);
       }
+      result[i] = Number(raw);
+      continue;
     }
-    return result;
-  }
 
-  // For other typed arrays (Int8Array, Int16Array, Uint32Array, etc.)
-  return new Int32Array(arr);
+    const value = Number(raw);
+    if (!Number.isSafeInteger(value) ||
+        value < -2147483648 ||
+        value > 2147483647) {
+      throw new Error(`${label} ${String(raw)} is outside the Int32 range`);
+    }
+    result[i] = value;
+  }
+  return result;
 }
 
 /**
@@ -209,74 +583,46 @@ export function toInt32Array(arr) {
  * @param {TypedArray} arr - Source array (may be BigInt64Array, BigUint64Array, or other)
  * @returns {Float32Array} Converted array
  */
-export function toFloat32Array(arr) {
-  // Already Float32Array - return as-is
-  if (arr instanceof Float32Array) {
+export function toFloat32Array(
+  arr,
+  label = 'Numeric value',
+  requireExactInteger = false
+) {
+  if (!arr || !Number.isSafeInteger(arr.length) || arr.length < 0) {
+    throw new Error(`${label} array has an invalid length`);
+  }
+
+  // Already Float32Array - return as-is when no stronger contract is needed.
+  if (arr instanceof Float32Array && !requireExactInteger) {
     return arr;
   }
 
-  // Handle BigInt64Array and BigUint64Array
-  if (arr instanceof BigInt64Array || arr instanceof BigUint64Array) {
-    const result = new Float32Array(arr.length);
-    for (let i = 0; i < arr.length; i++) {
-      result[i] = Number(arr[i]);
-    }
-    return result;
-  }
-
-  // For other typed arrays
-  return new Float32Array(arr);
-}
-
-/**
- * Safely convert a typed array to Uint32Array, handling BigUint64Array.
- * This is needed because BigUint64Array cannot be directly assigned to Uint32Array positions.
- * Used for connectivity indices where uint64 dtypes may appear but values fit in uint32.
- *
- * @param {TypedArray} arr - Source array (may be BigUint64Array or other)
- * @returns {Uint32Array} Converted array
- */
-export function toUint32Array(arr) {
-  // Already Uint32Array - return as-is
-  if (arr instanceof Uint32Array) {
-    return arr;
-  }
-
-  // Handle BigUint64Array (uint64 from zarr/h5wasm)
-  if (arr instanceof BigUint64Array) {
-    const result = new Uint32Array(arr.length);
-    const maxUint32 = 4294967295n; // 2^32 - 1 as BigInt
-    for (let i = 0; i < arr.length; i++) {
-      const val = arr[i];
-      // Clamp to Uint32 range to prevent overflow
-      if (val > maxUint32) {
-        result[i] = 4294967295; // Uint32 max
-      } else {
-        result[i] = Number(val);
+  const result = new Float32Array(arr.length);
+  for (let i = 0; i < arr.length; i++) {
+    const raw = arr[i];
+    let value;
+    if (typeof raw === 'bigint') {
+      if (raw < BigInt(Number.MIN_SAFE_INTEGER) ||
+          raw > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new Error(`${label} integer is outside the safe numeric range`);
       }
+      value = Number(raw);
+    } else {
+      value = Number(raw);
     }
-    return result;
-  }
 
-  // Handle BigInt64Array (int64 - less common for indices but handle it)
-  if (arr instanceof BigInt64Array) {
-    const result = new Uint32Array(arr.length);
-    const maxUint32 = 4294967295n;
-    for (let i = 0; i < arr.length; i++) {
-      const val = arr[i];
-      if (val < 0n) {
-        result[i] = 0; // Negative values clamp to 0
-      } else if (val > maxUint32) {
-        result[i] = 4294967295;
-      } else {
-        result[i] = Number(val);
-      }
+    const narrowed = Math.fround(value);
+    if (Number.isFinite(value) && !Number.isFinite(narrowed)) {
+      throw new Error(`${label} value is outside the Float32 range`);
     }
-    return result;
+    if (requireExactInteger && Number(narrowed) !== value) {
+      throw new Error(
+        `${label} integer value ${value} cannot be represented exactly in Float32`
+      );
+    }
+    result[i] = narrowed;
   }
-
-  // For other typed arrays (Uint16Array, Int32Array, etc.)
-  return new Uint32Array(arr);
+  return result;
 }
 
 /**
@@ -412,4 +758,3 @@ export class LRUCache {
     return this._cache.entries();
   }
 }
-

@@ -55,17 +55,100 @@ import { createVariableSelectorComponent } from './shared/variable-selector.js';
 import { createFigureContainer } from './shared/figure-container.js';
 
 function cloneSettings(value) {
-  if (value == null) return value;
-  try {
-    // structuredClone is supported in all modern browsers we target.
-    return structuredClone(value);
-  } catch (_err) {
-    try {
-      return JSON.parse(JSON.stringify(value));
-    } catch (_err2) {
-      // Fall back to returning as-is (best effort); callers must avoid mutating.
-      return value;
+  return structuredClone(value);
+}
+
+function isPlainObject(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function requireExactKeys(value, expectedKeys, label) {
+  if (!isPlainObject(value)) {
+    throw new TypeError(`${label} must be an object`);
+  }
+  const actualKeys = Object.keys(value).sort();
+  const sortedExpected = [...expectedKeys].sort();
+  if (
+    actualKeys.length !== sortedExpected.length ||
+    actualKeys.some((key, index) => key !== sortedExpected[index])
+  ) {
+    throw new TypeError(
+      `${label} must contain exactly: ${sortedExpected.join(', ')}`
+    );
+  }
+}
+
+function requirePageIds(pageIds, label) {
+  if (!Array.isArray(pageIds)) {
+    throw new TypeError(`${label} must be an array`);
+  }
+  const seen = new Set();
+  for (const pageId of pageIds) {
+    if (typeof pageId !== 'string' || pageId.length === 0) {
+      throw new TypeError(`${label} must contain non-empty string page IDs`);
     }
+    if (seen.has(pageId)) {
+      throw new TypeError(`${label} contains duplicate page ID "${pageId}"`);
+    }
+    seen.add(pageId);
+  }
+}
+
+function requireAnalysisConfig(config) {
+  requireExactKeys(
+    config,
+    ['dataSource', 'pages', 'plotOptions', 'plotType'],
+    'Analysis config'
+  );
+  requireExactKeys(
+    config.dataSource,
+    ['type', 'variable'],
+    'Analysis config dataSource'
+  );
+  const allowedTypes = new Set([
+    '',
+    'categorical_obs',
+    'continuous_obs',
+    'gene_expression'
+  ]);
+  if (
+    typeof config.dataSource.type !== 'string' ||
+    !allowedTypes.has(config.dataSource.type)
+  ) {
+    throw new TypeError('Analysis config dataSource.type is unsupported');
+  }
+  if (typeof config.dataSource.variable !== 'string') {
+    throw new TypeError('Analysis config dataSource.variable must be a string');
+  }
+  if (
+    (config.dataSource.type.length === 0) !==
+    (config.dataSource.variable.length === 0)
+  ) {
+    throw new TypeError(
+      'Analysis config dataSource type and variable must both be empty or both be selected'
+    );
+  }
+  requirePageIds(config.pages, 'Analysis config pages');
+  if (typeof config.plotType !== 'string') {
+    throw new TypeError('Analysis config plotType must be a string');
+  }
+  if (!isPlainObject(config.plotOptions)) {
+    throw new TypeError('Analysis config plotOptions must be an object');
+  }
+}
+
+function requireMatchingPages(selectedPages, configPages) {
+  if (
+    selectedPages.length !== configPages.length ||
+    selectedPages.some((pageId, index) => pageId !== configPages[index])
+  ) {
+    throw new TypeError(
+      'Analysis settings selectedPages must exactly match config.pages'
+    );
   }
 }
 
@@ -205,11 +288,13 @@ export class BaseAnalysisUI {
     this._container = container;
     this._render();
 
-    // Auto-select all pages
-    const pages = this.dataLayer.getPages();
-    if (pages.length > 0) {
-      this._selectedPages = pages.map(p => p.id);
-      this._currentConfig.pages = this._selectedPages;
+    if (this._selectedPages.length === 0) {
+      const pages = this.dataLayer.getPages();
+      const selectablePageIds = pages
+        .filter(page => this.dataLayer.getCellCountForPageId(page.id) > 0)
+        .map(page => page.id);
+      this._selectedPages = selectablePageIds;
+      this._currentConfig.pages = [...selectablePageIds];
     }
   }
 
@@ -218,7 +303,9 @@ export class BaseAnalysisUI {
    * @returns {Object}
    */
   getConfig() {
-    return { ...this._currentConfig };
+    requireAnalysisConfig(this._currentConfig);
+    requireMatchingPages(this._selectedPages, this._currentConfig.pages);
+    return cloneSettings(this._currentConfig);
   }
 
   /**
@@ -226,7 +313,9 @@ export class BaseAnalysisUI {
    * @param {Object} config
    */
   setConfig(config) {
-    this._currentConfig = { ...this._currentConfig, ...config };
+    requireAnalysisConfig(config);
+    requireMatchingPages(this._selectedPages, config.pages);
+    this._currentConfig = cloneSettings(config);
     this._renderControls();
     this._scheduleUpdate();
   }
@@ -237,6 +326,13 @@ export class BaseAnalysisUI {
    * @returns {{ selectedPages: string[], config: Object }}
    */
   exportSettings() {
+    requirePageIds(this._selectedPages, 'Analysis selectedPages');
+    this._requireAvailableSelectedPages(
+      this._selectedPages,
+      'Analysis selectedPages'
+    );
+    requireAnalysisConfig(this._currentConfig);
+    requireMatchingPages(this._selectedPages, this._currentConfig.pages);
     return {
       selectedPages: [...this._selectedPages],
       config: cloneSettings(this._currentConfig)
@@ -244,24 +340,61 @@ export class BaseAnalysisUI {
   }
 
   /**
+   * Require the complete settings key set owned by a concrete subclass.
+   * @param {unknown} settings
+   * @param {string[]} expectedKeys
+   * @param {string} label
+   * @protected
+   */
+  _requireExactSettingsKeys(settings, expectedKeys, label) {
+    requireExactKeys(settings, expectedKeys, label);
+  }
+
+  /**
+   * Validate the settings fields owned by BaseAnalysisUI.
+   * @param {unknown} settings
+   * @returns {{ selectedPages: string[], config: Object }}
+   * @protected
+   */
+  _requireBaseSettings(settings) {
+    if (!isPlainObject(settings)) {
+      throw new TypeError('Analysis settings must be an object');
+    }
+    requirePageIds(settings.selectedPages, 'Analysis settings selectedPages');
+    this._requireAvailableSelectedPages(
+      settings.selectedPages,
+      'Analysis settings selectedPages'
+    );
+    requireAnalysisConfig(settings.config);
+    requireMatchingPages(settings.selectedPages, settings.config.pages);
+
+    return {
+      selectedPages: [...settings.selectedPages],
+      config: cloneSettings(settings.config)
+    };
+  }
+
+  /**
+   * Apply settings after a concrete subclass validates its complete schema.
+   * @param {{ selectedPages: string[], config: Object }} settings
+   * @protected
+   */
+  _applyBaseSettings(settings) {
+    this.onPageSelectionChange([...settings.selectedPages]);
+    this.setConfig(cloneSettings(settings.config));
+  }
+
+  /**
    * Import a settings snapshot previously produced by exportSettings().
-   * @param {{ selectedPages?: string[], config?: Object }|null} settings
+   * @param {{ selectedPages: string[], config: Object }} settings
    */
   importSettings(settings) {
-    if (!settings) return;
-    const selectedPages = Array.isArray(settings.selectedPages) ? settings.selectedPages : null;
-    const config = settings.config && typeof settings.config === 'object' ? settings.config : null;
-
-    // Apply page selection first so dependent controls (e.g., page selectors) render correctly.
-    if (selectedPages && typeof this.onPageSelectionChange === 'function') {
-      this.onPageSelectionChange([...selectedPages]);
-    }
-
-    if (config && typeof this.setConfig === 'function') {
-      // Preserve the explicitly imported page selection if provided.
-      const merged = selectedPages ? { ...config, pages: [...selectedPages] } : config;
-      this.setConfig(cloneSettings(merged));
-    }
+    requireExactKeys(
+      settings,
+      ['config', 'selectedPages'],
+      'Analysis settings'
+    );
+    this._applyBaseSettings(this._requireBaseSettings(settings));
   }
 
   // ===========================================================================
@@ -275,7 +408,9 @@ export class BaseAnalysisUI {
    * @param {string[]} pageIds - Selected page IDs
    */
   onPageSelectionChange(pageIds) {
-    this._selectedPages = pageIds || [];
+    requirePageIds(pageIds, 'Analysis selectedPages');
+    this._requireAvailableSelectedPages(pageIds, 'Analysis selectedPages');
+    this._selectedPages = [...pageIds];
     this._currentConfig.pages = this._selectedPages;
     this._renderControls();
     this._scheduleUpdate();
@@ -287,6 +422,44 @@ export class BaseAnalysisUI {
    */
   getSelectedPages() {
     return [...this._selectedPages];
+  }
+
+  /**
+   * Validate the shape and current ownership of selected page IDs.
+   * @param {unknown} pageIds
+   * @param {string} label
+   * @protected
+   */
+  _requireSelectedPageIds(pageIds, label) {
+    requirePageIds(pageIds, label);
+    this._requireAvailableSelectedPages(pageIds, label);
+  }
+
+  /**
+   * Require selected pages to exist in the current UI inventory and contain
+   * cells.
+   * @param {string[]} pageIds
+   * @param {string} label
+   * @protected
+   */
+  _requireAvailableSelectedPages(pageIds, label) {
+    const pages = this._pageSelector
+      ? this._pageSelector._getPages()
+      : this.dataLayer.getPages();
+    if (!Array.isArray(pages)) {
+      throw new TypeError('Analysis page inventory must be an array');
+    }
+    const availablePageIds = new Set(pages.map(page => page.id));
+    for (const pageId of pageIds) {
+      if (!availablePageIds.has(pageId)) {
+        throw new Error(`${label} page "${pageId}" was not found`);
+      }
+      if (this.dataLayer.getCellCountForPageId(pageId) === 0) {
+        throw new RangeError(
+          `${label} page "${pageId}" has zero cells and cannot be selected`
+        );
+      }
+    }
   }
 
   /**
@@ -623,7 +796,8 @@ export class BaseAnalysisUI {
    * @param {string[]} pageIds - Selected page IDs
    */
   _onPageSelectionChange(pageIds) {
-    this._selectedPages = pageIds;
+    requirePageIds(pageIds, 'Analysis selectedPages');
+    this._selectedPages = [...pageIds];
     this._currentConfig.pages = this._selectedPages;
     this._syncPageColorMapFromState();
     this._scheduleUpdate();

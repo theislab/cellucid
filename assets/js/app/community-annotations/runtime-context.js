@@ -11,46 +11,36 @@
  * - branch
  * - user.id (GitHub numeric id; NOT username/login)
  *
- * Historically, each UI module re-implemented this derivation, which is easy to
- * drift and can cause transient "wrong scope" loads (flicker, confusing UI).
- *
  * This module centralizes the derivation so all callers agree on the same rules.
  *
  * Notes
  * -----
  * - This module is UI-agnostic (no DOM writes).
- * - It does not perform network calls; if the GitHub user object is not yet
- *   loaded, it falls back to the last-known `ghid_<id>` key when available.
+ * - It does not perform network calls. A connected scope requires the current
+ *   authenticated GitHub identity; prior identities are never substituted.
  *
  * @module community-annotations/runtime-context
  */
 
 import { getCommunityAnnotationSession } from './session.js';
 import { isSimulateRepoConnectedEnabled } from './access-store.js';
-import { getAnnotationRepoForDataset, getLastAnnotationRepoForDataset } from './repo-store.js';
-import { getGitHubAuthSession, getLastGitHubUserKey, toGitHubUserKey } from './github-auth.js';
-
-function toCleanString(value) {
-  return String(value ?? '').trim();
-}
-
-function normalizeUsername(value) {
-  return toCleanString(value).replace(/^@+/, '').toLowerCase();
-}
+import { getAnnotationRepoForDataset } from './repo-store.js';
+import { getGitHubAuthSession, toGitHubUserKey } from './github-auth.js';
 
 function parseGitHubUserIdFromKey(userKey) {
-  const raw = normalizeUsername(userKey);
-  const m = raw.match(/^ghid_(\d+)$/);
+  if (typeof userKey !== 'string') return null;
+  const m = userKey.match(/^ghid_([1-9][0-9]*)$/);
   if (!m) return null;
   const n = Number(m[1]);
-  return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : null;
+  return (
+    Number.isSafeInteger(n) &&
+    n > 0 &&
+    userKey === `ghid_${n}`
+  ) ? n : null;
 }
 
 function normalizeGitHubUserIdOrNull(value) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return null;
-  const safe = Math.max(0, Math.floor(n));
-  return safe ? safe : null;
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
 }
 
 /**
@@ -67,35 +57,46 @@ function normalizeGitHubUserIdOrNull(value) {
  *   simulated: boolean
  * }}
  */
-export function getCommunityAnnotationCacheContext({ dataSourceManager = null, datasetId = null } = {}) {
-  const session = getCommunityAnnotationSession();
+export function getCommunityAnnotationCacheContext({ dataSourceManager = null, datasetId = undefined } = {}) {
   const auth = getGitHubAuthSession();
   const simulated = isSimulateRepoConnectedEnabled();
 
-  const did = toCleanString(datasetId ?? dataSourceManager?.getCurrentDatasetId?.() ?? '') || null;
-
-  // Prefer the authenticated GitHub numeric id (stable, required for scoping).
-  const authIdRaw = auth.getUser?.()?.id ?? null;
-  const authId = Number.isFinite(Number(authIdRaw)) ? Math.max(0, Math.floor(Number(authIdRaw))) : null;
-
-  // Repo-map key: prefer `ghid_<id>`. If the auth user object is not loaded yet,
-  // use the last-known key to avoid transient "no repo" scope.
-  const lastKey = getLastGitHubUserKey();
-  const authedKey = toGitHubUserKey(auth.getUser?.());
-  const userKey = normalizeUsername(
-    authedKey ||
-    (auth.isAuthenticated?.() ? lastKey : null) ||
-    (simulated ? lastKey : null) ||
-    session.getProfile?.()?.username ||
-    'local'
-  ) || 'local';
-
-  const userId = authId || parseGitHubUserIdFromKey(userKey) || null;
-
-  let repoRef = did ? (getAnnotationRepoForDataset(did, userKey) || null) : null;
-  if (!repoRef && simulated && did) {
-    repoRef = getLastAnnotationRepoForDataset(did, userKey) || null;
+  const rawDatasetId =
+    datasetId === undefined
+      ? dataSourceManager?.getCurrentDatasetId?.()
+      : datasetId;
+  let did = null;
+  if (rawDatasetId !== null && rawDatasetId !== undefined) {
+    if (
+      typeof rawDatasetId !== 'string' ||
+      !/\S/.test(rawDatasetId) ||
+      /^\s|\s$/.test(rawDatasetId) ||
+      Array.from(rawDatasetId).length > 256
+    ) {
+      throw new Error(
+        'Community annotation datasetId must be an exact nonblank string or null'
+      );
+    }
+    did = rawDatasetId;
   }
+
+  const authUser = auth.getUser();
+  const authId = normalizeGitHubUserIdOrNull(authUser?.id);
+  const authedKey = toGitHubUserKey(authUser);
+  const userKey = authedKey === null ? 'local' : authedKey;
+  const userId =
+    authedKey === null
+      ? null
+      : parseGitHubUserIdFromKey(authedKey);
+  if (authId !== userId) {
+    throw new Error(
+      'Authenticated GitHub identity does not match its exact cache key'
+    );
+  }
+
+  const repoRef = did && authedKey
+    ? getAnnotationRepoForDataset(did, authedKey)
+    : null;
 
   return { datasetId: did, userKey, userId, repoRef, simulated };
 }
@@ -108,30 +109,13 @@ export function getCommunityAnnotationCacheContext({ dataSourceManager = null, d
  * @param {string|null} [options.datasetId]
  * @returns {ReturnType<typeof getCommunityAnnotationCacheContext>}
  */
-export function syncCommunityAnnotationCacheContext({ dataSourceManager = null, datasetId = null } = {}) {
+export function syncCommunityAnnotationCacheContext({ dataSourceManager = null, datasetId = undefined } = {}) {
   const session = getCommunityAnnotationSession();
   const ctx = getCommunityAnnotationCacheContext({ dataSourceManager, datasetId });
-  // Safety: if another module cleared the connected repo mapping (disconnect) while this tab
-  // still holds a fully-scoped session (dataset+repo@branch+userId), avoid wiping in-memory
-  // local intent by resetting the session to an "unscoped" state.
-  //
-  // We only preserve the existing repoRef when the computed context matches the current
-  // dataset + GitHub numeric user id (so we don't leak across scopes).
-  let repoRefForSession = ctx.repoRef;
-  if (!repoRefForSession) {
-    try {
-      const currentDatasetId = toCleanString(session.getDatasetId?.() || '') || null;
-      const currentRepoRef = toCleanString(session.getRepoRef?.() || '') || null;
-      const currentUserId = normalizeGitHubUserIdOrNull(session.getCacheUserId?.());
-      const nextUserId = normalizeGitHubUserIdOrNull(ctx.userId);
-      if (currentRepoRef && currentDatasetId && currentDatasetId === ctx.datasetId && currentUserId && nextUserId && currentUserId === nextUserId) {
-        repoRefForSession = currentRepoRef;
-      }
-    } catch {
-      // ignore
-    }
-  }
-
-  session.setCacheContext?.({ datasetId: ctx.datasetId, repoRef: repoRefForSession, userId: ctx.userId });
+  session.setCacheContext({
+    datasetId: ctx.datasetId,
+    repoRef: ctx.repoRef,
+    userId: ctx.userId,
+  });
   return ctx;
 }

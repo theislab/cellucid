@@ -45,23 +45,24 @@ Plotly needs resolved colors (not `var(--...)`). We centralize this in:
   - reads design tokens via `StyleManager.resolveVariable(...)`
   - applies theme updates to existing plots on `cellucid:theme-change`
 
-## Adding A Theme (Future)
+## Adding A Theme
 
-Cellucid currently ships only `light` and `dark`. To add a new theme later:
+Cellucid currently ships `light` and `dark`. A new theme must update every
+current theme owner:
 
 1. Create `assets/css/themes/_my-theme.css` defining the full `--color-*` semantic token set under `[data-theme="my-theme"]`.
 2. Add it to `assets/css/themes/_index.css`.
 3. Update `types/design-tokens.d.ts` (`ThemeName`) to include the new theme.
 4. Update `assets/js/utils/theme-manager.js` (`VALID_THEMES`) and `index.html` (Theme `<select>`).
-5. Run `node cellucid/scripts/validate-tokens.js`.
+5. Run both validation commands listed below.
 
 ## Validation
 
-- Token + theme contract check: `node cellucid/scripts/validate-tokens.js`
-- Token definitions ↔ type sync: `node cellucid/scripts/validate-token-types.js`
+- Token + theme contract check: `node scripts/validate-tokens.js`
+- Token definitions ↔ type sync: `node scripts/validate-token-types.js`
 - Quick audits:
-  - `rg "style=\\\"" cellucid/index.html` (should be empty)
-  - `rg \"#[0-9a-fA-F]{3,8}\\\\b\" cellucid/assets/css --glob '!cellucid/assets/css/tokens/_colors.css'` (should be empty)
+  - `rg "style=\\\"" index.html` (should be empty)
+  - `rg '#[0-9a-fA-F]{3,8}\\b' assets/css --glob '!assets/css/tokens/_colors.css'` (should be empty)
 
 ## Token Workflow (When Adding/Changing Tokens)
 
@@ -69,5 +70,5 @@ Cellucid currently ships only `light` and `dark`. To add a new theme later:
 2. Add/modify semantic mappings in `assets/css/themes/` (themes should only set `--color-*` tokens).
 3. Update `types/design-tokens.d.ts` so JS gets autocomplete/typo protection.
 4. Run:
-   - `node cellucid/scripts/validate-token-types.js`
-   - `node cellucid/scripts/validate-tokens.js`
+   - `node scripts/validate-token-types.js`
+   - `node scripts/validate-tokens.js`

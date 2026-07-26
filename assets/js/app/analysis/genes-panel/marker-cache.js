@@ -34,7 +34,12 @@ const STORE_NAME = 'markers';
  * Provides tiered caching for marker discovery results.
  *
  * @example
- * const cache = new MarkerCache({ maxCategories: 3, maxAgeDays: 7 });
+ * const cache = new MarkerCache({
+ *   maxCategories: 3,
+ *   maxAgeDays: 7,
+ *   cacheVersion: 1,
+ *   datasetId: 'pbmc3k'
+ * });
  * await cache.init();
  *
  * // Store results
@@ -64,7 +69,17 @@ export class MarkerCache {
     this._cacheVersion = options.cacheVersion ?? DEFAULTS.cacheVersion;
 
     /** @type {string} Dataset identifier */
-    this._datasetId = options.datasetId || 'default';
+    this._datasetId = options.datasetId;
+    if (!Number.isSafeInteger(this._maxCategories) || this._maxCategories < 1) {
+      throw new RangeError('MarkerCache maxCategories must be a positive integer');
+    }
+    if (!Number.isFinite(this._maxAgeDays) || this._maxAgeDays <= 0) {
+      throw new RangeError('MarkerCache maxAgeDays must be a positive finite number');
+    }
+    if (!Number.isSafeInteger(this._cacheVersion) || this._cacheVersion < 1) {
+      throw new RangeError('MarkerCache cacheVersion must be a positive integer');
+    }
+    this._requireDatasetId(this._datasetId);
 
     /** @type {Map<string, { data: any, timestamp: number }>} Hot cache (LRU) */
     this._hotCache = new Map();
@@ -86,9 +101,9 @@ export class MarkerCache {
    * @returns {boolean} true if changed
    */
   setDatasetId(datasetId) {
-    const next = String(datasetId ?? '').trim() || 'default';
-    if (next === this._datasetId) return false;
-    this._datasetId = next;
+    this._requireDatasetId(datasetId);
+    if (datasetId === this._datasetId) return false;
+    this._datasetId = datasetId;
     // Hot cache entries are keyed by datasetId-prefixed keys; clearing keeps the
     // in-memory LRU bounded and avoids wasting space on another dataset.
     this._hotCache.clear();
@@ -100,19 +115,13 @@ export class MarkerCache {
    * @returns {Promise<void>}
    */
   async init() {
+    if (this._db !== null) return;
     if (!this._indexedDBAvailable) {
-      console.debug('[MarkerCache] IndexedDB not available, using memory-only cache');
       return;
     }
 
-    try {
-      this._db = await this._openDatabase();
-      // Clean up expired entries on init
-      await this._cleanupExpired();
-    } catch (err) {
-      console.warn('[MarkerCache] Failed to open IndexedDB, falling back to memory-only:', err.message);
-      this._indexedDBAvailable = false;
-    }
+    this._db = await this._openDatabase();
+    await this._cleanupExpired();
   }
 
   /**
@@ -137,7 +146,7 @@ export class MarkerCache {
     // Check warm cache (IndexedDB)
     if (this._db) {
       const warmEntry = await this._getFromIndexedDB(cacheKey);
-      if (warmEntry) {
+      if (warmEntry !== null) {
         // Promote to hot cache
         this._setHotCache(cacheKey, warmEntry);
         return warmEntry;
@@ -156,6 +165,9 @@ export class MarkerCache {
    * @returns {Promise<void>}
    */
   async set(category, data, params = {}) {
+    if (data === undefined) {
+      throw new TypeError('MarkerCache data must be defined');
+    }
     const cacheKey = this._buildCacheKey(category, params);
 
     // Store in hot cache
@@ -253,20 +265,41 @@ export class MarkerCache {
    * @private
    */
   _buildCacheKey(category, params = {}) {
-    const parts = [
-      this._datasetId,
-      'v' + this._cacheVersion,
-      CACHE_KEYS.MARKERS,
-      category
-    ];
-
-    // Add sorted params to key
-    const paramKeys = Object.keys(params).sort();
-    for (const key of paramKeys) {
-      parts.push(`${key}=${params[key]}`);
+    if (typeof category !== 'string' || category.length === 0 || category.trim().length === 0) {
+      throw new TypeError('MarkerCache category must be non-empty text');
     }
+    if (!params || typeof params !== 'object' || Array.isArray(params)) {
+      throw new TypeError('MarkerCache parameters must be an object');
+    }
+    const entries = Object.keys(params).sort().map(key => {
+      const value = params[key];
+      const scalar =
+        value === null ||
+        typeof value === 'string' ||
+        typeof value === 'boolean' ||
+        (typeof value === 'number' && Number.isFinite(value));
+      if (!scalar) {
+        throw new TypeError(`MarkerCache parameter ${key} must be a finite scalar`);
+      }
+      return [key, value];
+    });
+    return JSON.stringify([
+      this._datasetId,
+      this._cacheVersion,
+      CACHE_KEYS.MARKERS,
+      category,
+      entries
+    ]);
+  }
 
-    return parts.join(':');
+  _requireDatasetId(datasetId) {
+    if (
+      typeof datasetId !== 'string' ||
+      datasetId.length === 0 ||
+      datasetId.trim().length === 0
+    ) {
+      throw new TypeError('MarkerCache datasetId is required and must be a non-empty string');
+    }
   }
 
   /**
@@ -320,13 +353,15 @@ export class MarkerCache {
   async _getFromIndexedDB(key) {
     if (!this._db) return null;
 
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       try {
         const tx = this._db.transaction(STORE_NAME, 'readonly');
         const store = tx.objectStore(STORE_NAME);
         const request = store.get(key);
 
-        request.onerror = () => resolve(null);
+        request.onerror = () => reject(
+          request.error ?? new Error('MarkerCache IndexedDB read failed')
+        );
         request.onsuccess = () => {
           const entry = request.result;
           if (!entry) {
@@ -339,16 +374,17 @@ export class MarkerCache {
           const maxAgeMs = this._maxAgeDays * 24 * 60 * 60 * 1000;
 
           if (ageMs > maxAgeMs) {
-            // Expired, delete and return null
-            this._deleteFromIndexedDB(key);
-            resolve(null);
+            this._deleteFromIndexedDB(key).then(
+              () => resolve(null),
+              reject
+            );
             return;
           }
 
           resolve(entry.data);
         };
       } catch (err) {
-        resolve(null);
+        reject(err);
       }
     });
   }
@@ -372,7 +408,9 @@ export class MarkerCache {
         };
 
         const request = store.put(entry);
-        request.onerror = () => reject(request.error);
+        request.onerror = () => reject(
+          request.error ?? new Error('MarkerCache IndexedDB write failed')
+        );
         request.onsuccess = () => resolve();
       } catch (err) {
         reject(err);
@@ -387,16 +425,18 @@ export class MarkerCache {
   async _deleteFromIndexedDB(key) {
     if (!this._db) return;
 
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       try {
         const tx = this._db.transaction(STORE_NAME, 'readwrite');
         const store = tx.objectStore(STORE_NAME);
         const request = store.delete(key);
 
-        request.onerror = () => resolve();
+        request.onerror = () => reject(
+          request.error ?? new Error('MarkerCache IndexedDB delete failed')
+        );
         request.onsuccess = () => resolve();
       } catch (err) {
-        resolve();
+        reject(err);
       }
     });
   }
@@ -408,16 +448,18 @@ export class MarkerCache {
   async _clearIndexedDB() {
     if (!this._db) return;
 
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       try {
         const tx = this._db.transaction(STORE_NAME, 'readwrite');
         const store = tx.objectStore(STORE_NAME);
         const request = store.clear();
 
-        request.onerror = () => resolve();
+        request.onerror = () => reject(
+          request.error ?? new Error('MarkerCache IndexedDB clear failed')
+        );
         request.onsuccess = () => resolve();
       } catch (err) {
-        resolve();
+        reject(err);
       }
     });
   }
@@ -432,7 +474,7 @@ export class MarkerCache {
     const maxAgeMs = this._maxAgeDays * 24 * 60 * 60 * 1000;
     const cutoff = Date.now() - maxAgeMs;
 
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       try {
         const tx = this._db.transaction(STORE_NAME, 'readwrite');
         const store = tx.objectStore(STORE_NAME);
@@ -440,18 +482,23 @@ export class MarkerCache {
         const range = IDBKeyRange.upperBound(cutoff);
         const request = index.openCursor(range);
 
-        request.onerror = () => resolve();
+        request.onerror = () => reject(
+          request.error ?? new Error('MarkerCache IndexedDB cleanup scan failed')
+        );
         request.onsuccess = (event) => {
           const cursor = event.target.result;
           if (cursor) {
-            cursor.delete();
+            const deleteRequest = cursor.delete();
+            deleteRequest.onerror = () => reject(
+              deleteRequest.error ?? new Error('MarkerCache IndexedDB cleanup delete failed')
+            );
             cursor.continue();
           } else {
             resolve();
           }
         };
       } catch (err) {
-        resolve();
+        reject(err);
       }
     });
   }

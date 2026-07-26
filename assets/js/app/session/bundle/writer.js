@@ -15,6 +15,11 @@ import {
   SESSION_BUNDLE_MAGIC_BYTES,
   u32ToBytesLE
 } from './format.js';
+import {
+  assertArray,
+  assertPlainRecord,
+  assertSafeInteger
+} from '../schema-contract.js';
 
 /**
  * @typedef {object} BundleWriteInput
@@ -29,11 +34,32 @@ import {
  * @returns {Blob}
  */
 export function writeBundle({ manifest, chunks }) {
-  if (!manifest || typeof manifest !== 'object') {
-    throw new Error('writeBundle: manifest is required.');
+  assertPlainRecord(manifest, 'Bundle manifest');
+  assertArray(manifest.chunks, 'Bundle manifest chunks');
+  assertArray(chunks, 'Bundle stored chunks');
+  if (manifest.chunks.length !== chunks.length) {
+    throw new Error(
+      `writeBundle: manifest/stored chunk count mismatch (${manifest.chunks.length} != ${chunks.length}).`,
+    );
   }
-  if (!Array.isArray(chunks)) {
-    throw new Error('writeBundle: chunks must be an array of Uint8Array.');
+
+  for (let index = 0; index < chunks.length; index++) {
+    const chunkBytes = chunks[index];
+    if (!(chunkBytes instanceof Uint8Array)) {
+      throw new TypeError(`writeBundle: stored chunk ${index} must be a Uint8Array.`);
+    }
+    const meta = manifest.chunks[index];
+    assertPlainRecord(meta, `Bundle manifest chunk ${index}`);
+    const storedBytes = assertSafeInteger(
+      meta.storedBytes,
+      `Bundle manifest chunk ${index} storedBytes`,
+      { maximum: 0xffff_ffff },
+    );
+    if (storedBytes !== chunkBytes.byteLength) {
+      throw new Error(
+        `writeBundle: chunk ${index} storedBytes mismatch (${storedBytes} != ${chunkBytes.byteLength}).`,
+      );
+    }
   }
 
   const encoder = new TextEncoder();
@@ -46,13 +72,9 @@ export function writeBundle({ manifest, chunks }) {
   parts.push(manifestBytes);
 
   for (const chunkBytes of chunks) {
-    if (!(chunkBytes instanceof Uint8Array)) {
-      throw new Error('writeBundle: each chunk must be a Uint8Array.');
-    }
     parts.push(u32ToBytesLE(chunkBytes.byteLength));
     parts.push(chunkBytes);
   }
 
   return new Blob(parts, { type: 'application/octet-stream' });
 }
-

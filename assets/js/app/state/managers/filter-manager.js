@@ -8,58 +8,188 @@
  * @module state/managers/filter-manager
  */
 
-import { rgbToCss, COLOR_PICKER_PALETTE, getCategoryColor } from '../../../data/palettes.js';
+import { rgbToCss, COLOR_PICKER_PALETTE } from '../../../data/palettes.js';
 import { NEUTRAL_GRAY_UINT8 } from '../core/constants.js';
 import { BaseManager } from '../core/base-manager.js';
 
-const FULL_RANGE_EPSILON_FLOOR = 1e-9;
-const FULL_RANGE_EPSILON_SCALE = 1e-6;
+function requireCategoryFieldAndIndex(field, index) {
+  if (
+    field === null
+    || typeof field !== 'object'
+    || Array.isArray(field)
+    || field.kind !== 'category'
+    || !Array.isArray(field.categories)
+  ) {
+    throw new TypeError('Category filter operation requires a category field.');
+  }
+  if (
+    !Number.isSafeInteger(index)
+    || index < 0
+    || index >= field.categories.length
+  ) {
+    throw new RangeError('Category filter index is outside the category inventory.');
+  }
+}
 
-function getFullRangeEpsilon(stats) {
-  const range = (stats?.max ?? 0) - (stats?.min ?? 0);
-  if (!Number.isFinite(range) || range <= 0) return FULL_RANGE_EPSILON_FLOOR;
-  const scaled = range * FULL_RANGE_EPSILON_SCALE;
-  return scaled > FULL_RANGE_EPSILON_FLOOR ? scaled : FULL_RANGE_EPSILON_FLOOR;
+function requireRgb(color) {
+  if (!Array.isArray(color) || color.length !== 3) {
+    throw new TypeError('Category color must be an RGB triplet.');
+  }
+  for (let channel = 0; channel < color.length; channel++) {
+    if (
+      !Number.isFinite(color[channel])
+      || color[channel] < 0
+      || color[channel] > 1
+    ) {
+      throw new RangeError('Category color channels must be finite values from 0 through 1.');
+    }
+  }
 }
 
 function isContinuousFilterFullRange(filter, stats) {
-  const epsilon = getFullRangeEpsilon(stats);
   return (
-    filter.min <= stats.min + epsilon &&
-    filter.max >= stats.max - epsilon
+    filter.min === stats.min
+    && filter.max === stats.max
   );
+}
+
+function parseExactFilterId(filterId) {
+  if (typeof filterId !== 'string') {
+    throw new TypeError('Filter id must be a string.');
+  }
+  const match = /^(obs|var)-(continuous|category|outlier)-(0|[1-9][0-9]*)$/.exec(filterId);
+  if (!match) {
+    throw new TypeError('Filter id does not match the current exact filter-id contract.');
+  }
+  const source = match[1];
+  const type = match[2];
+  if (
+    (source === 'var' && type !== 'continuous')
+    || (source === 'obs' && type !== 'continuous' && type !== 'category' && type !== 'outlier')
+  ) {
+    throw new TypeError('Filter id contains an unsupported source/type combination.');
+  }
+  const fieldIndex = Number(match[3]);
+  if (!Number.isSafeInteger(fieldIndex)) {
+    throw new RangeError('Filter field index exceeds the safe integer range.');
+  }
+  return { source, type, fieldIndex };
 }
 
 export class DataStateFilterMethods {
   computeGlobalVisibility() {
-    if (!this.obsData || !this.obsData.fields || !this.pointCount) return;
+    if (this.pointCount === 0 && this.obsData === null) return;
+    if (
+      !Number.isSafeInteger(this.pointCount)
+      || this.pointCount < 1
+      || !this.obsData
+      || !Array.isArray(this.obsData.fields)
+    ) {
+      throw new TypeError('Visibility computation requires exact current observation data.');
+    }
     const fields = this.obsData.fields;
     const pointCount = this.pointCount;
-    const activeVarCandidate = (this.activeFieldSource === 'var' && this.activeVarFieldIndex >= 0)
-      ? this.varData?.fields?.[this.activeVarFieldIndex]
-      : null;
-    const activeVarField = activeVarCandidate && activeVarCandidate._isDeleted !== true ? activeVarCandidate : null;
-    const activeVarValues = activeVarField?.values || [];
-    if (!this.categoryTransparency || this.categoryTransparency.length !== pointCount) {
-      this.categoryTransparency = new Float32Array(pointCount);
+    if (
+      !(this.categoryTransparency instanceof Float32Array)
+      || this.categoryTransparency.length !== pointCount
+      || !(this.cellVisibilityMask instanceof Float32Array)
+      || this.cellVisibilityMask.length !== pointCount
+      || !(this.colorsArray instanceof Uint8Array)
+      || this.colorsArray.length !== pointCount * 4
+    ) {
+      throw new TypeError(
+        'Visibility computation requires complete color, transparency, and cell-mask buffers.'
+      );
+    }
+    for (let index = 0; index < pointCount; index++) {
+      if (this.cellVisibilityMask[index] !== 0 && this.cellVisibilityMask[index] !== 1) {
+        throw new TypeError(`Cell visibility mask entry ${index} must be exactly 0 or 1.`);
+      }
+    }
+
+    if (
+      this.activeFieldSource !== null
+      && this.activeFieldSource !== 'obs'
+      && this.activeFieldSource !== 'var'
+    ) {
+      throw new TypeError('Active field source must be exactly obs, var, or null.');
+    }
+    let activeVarField = null;
+    if (this.activeFieldSource === 'var') {
+      if (
+        !this.varData
+        || !Array.isArray(this.varData.fields)
+        || !Number.isSafeInteger(this.activeVarFieldIndex)
+        || this.activeVarFieldIndex < 0
+        || this.activeVarFieldIndex >= this.varData.fields.length
+      ) {
+        throw new TypeError('Active variable filter requires an exact current variable field.');
+      }
+      const candidate = this.varData.fields[this.activeVarFieldIndex];
+      if (!candidate || typeof candidate !== 'object' || candidate._isDeleted === true) {
+        throw new TypeError('Active variable filter field must be a visible field object.');
+      }
+      activeVarField = candidate;
     }
 
     const applyOutlierFilter = this.isOutlierFilterEnabledForActiveField();
-    const outlierThreshold = applyOutlierFilter ? this.getCurrentOutlierThreshold() : 1.0;
-    const outliers = applyOutlierFilter ? (this.outlierQuantilesArray || []) : [];
+    if (typeof applyOutlierFilter !== 'boolean') {
+      throw new TypeError('Outlier filter state must be exactly true or false.');
+    }
+    let outlierThreshold = null;
+    let outliers = null;
+    if (applyOutlierFilter) {
+      outlierThreshold = this.getCurrentOutlierThreshold();
+      if (
+        !Number.isFinite(outlierThreshold)
+        || outlierThreshold < 0
+        || outlierThreshold > 1
+        || !(this.outlierQuantilesArray instanceof Float32Array)
+        || this.outlierQuantilesArray.length !== pointCount
+      ) {
+        throw new TypeError('Active outlier filtering requires exact threshold and quantile data.');
+      }
+      outliers = this.outlierQuantilesArray;
+      for (let index = 0; index < pointCount; index++) {
+        const quantile = outliers[index];
+        if (!Number.isFinite(quantile) || quantile < -1 || quantile > 1) {
+          throw new RangeError(
+            `Outlier quantile ${index} must be -1 or a finite value from 0 through 1.`
+          );
+        }
+      }
+    }
 
     const categoryFilters = [];
     const continuousFilters = [];
 
     for (let f = 0; f < fields.length; f++) {
       const field = fields[f];
-      if (!field) continue;
+      if (!field || typeof field !== 'object' || Array.isArray(field)) {
+        throw new TypeError(`Observation field ${f} must be an object.`);
+      }
       if (field._isDeleted === true) continue;
 
-      if (field.kind === 'category' && field._categoryVisible && field._categoryFilterEnabled !== false) {
-        const categories = field.categories || [];
+      if (field.kind === 'category' && field._categoryVisible !== undefined) {
+        this.ensureCategoryMetadata(field);
+        if (
+          (!(field.codes instanceof Uint8Array) && !(field.codes instanceof Uint16Array))
+          || field.codes.length !== pointCount
+        ) {
+          throw new TypeError(`Observation category field ${f} requires exact dataset-length codes.`);
+        }
+        const categories = field.categories;
         const numCats = categories.length;
-        if (numCats > 0) {
+        const missingCode = field.codes instanceof Uint8Array ? 255 : 65_535;
+        for (let index = 0; index < pointCount; index++) {
+          const code = field.codes[index];
+          if (code >= numCats && code !== missingCode) {
+            throw new RangeError(
+              `Category filter code ${index} is outside the category inventory.`
+            );
+          }
+        }
+        if (field._categoryFilterEnabled) {
           const visibleMap = field._categoryVisible;
           let hasHidden = false;
           for (let c = 0; c < numCats; c++) {
@@ -69,39 +199,56 @@ export class DataStateFilterMethods {
             }
           }
           if (hasHidden) {
-            categoryFilters.push({ codes: field.codes || [], visibleMap, numCats });
+            categoryFilters.push({
+              codes: field.codes,
+              visibleMap,
+              numCats,
+              missingCode
+            });
           }
         }
       } else if (
-        field.kind === 'continuous' &&
-        field._continuousStats &&
-        field._continuousFilter &&
-        field._filterEnabled !== false
+        field.kind === 'continuous'
+        && (
+          field._continuousStats !== undefined
+          || field._continuousFilter !== undefined
+        )
       ) {
-        const stats = field._continuousStats;
-        const filter = field._continuousFilter;
-        if (!isContinuousFilterFullRange(filter, stats)) {
-          continuousFilters.push({ values: field.values || [], min: filter.min, max: filter.max });
+        const metadata = this.ensureContinuousMetadata(field);
+        if (field._filterEnabled) {
+          const stats = metadata.stats;
+          const filter = metadata.filter;
+          if (!isContinuousFilterFullRange(filter, stats)) {
+            continuousFilters.push({
+              values: field.values,
+              min: filter.min,
+              max: filter.max
+            });
+          }
         }
+      } else if (field.kind !== 'category' && field.kind !== 'continuous') {
+        throw new TypeError(`Observation field ${f} has an unsupported kind.`);
       }
     }
 
     let activeVarFilterMin = null;
     let activeVarFilterMax = null;
     let activeVarFilterEnabled = false;
-    if (
-      activeVarField &&
-      activeVarField.kind === 'continuous' &&
-      activeVarField._continuousStats &&
-      activeVarField._continuousFilter &&
-      activeVarField._filterEnabled !== false
-    ) {
-      const stats = activeVarField._continuousStats;
-      const filter = activeVarField._continuousFilter;
-      if (!isContinuousFilterFullRange(filter, stats)) {
-        activeVarFilterEnabled = true;
-        activeVarFilterMin = filter.min;
-        activeVarFilterMax = filter.max;
+    let activeVarValues = null;
+    if (activeVarField !== null) {
+      if (activeVarField.kind !== 'continuous') {
+        throw new TypeError('Active variable filtering requires a continuous field.');
+      }
+      const metadata = this.ensureContinuousMetadata(activeVarField);
+      if (activeVarField._filterEnabled) {
+        const stats = metadata.stats;
+        const filter = metadata.filter;
+        if (!isContinuousFilterFullRange(filter, stats)) {
+          activeVarFilterEnabled = true;
+          activeVarFilterMin = filter.min;
+          activeVarFilterMax = filter.max;
+          activeVarValues = activeVarField.values;
+        }
       }
     }
 
@@ -120,8 +267,8 @@ export class DataStateFilterMethods {
         for (let cf = 0; cf < categoryFilters.length; cf++) {
           const filter = categoryFilters[cf];
           const code = filter.codes[i];
-          if (code == null || code < 0 || code >= filter.numCats) continue;
-          if (filter.visibleMap[code] === false) {
+          if (code === filter.missingCode) continue;
+          if (!filter.visibleMap[code]) {
             visible = false;
             break;
           }
@@ -131,7 +278,7 @@ export class DataStateFilterMethods {
           for (let cf = 0; cf < continuousFilters.length; cf++) {
             const filter = continuousFilters[cf];
             const v = filter.values[i];
-            if (v === null || Number.isNaN(v) || v < filter.min || v > filter.max) {
+            if (Number.isNaN(v) || v < filter.min || v > filter.max) {
               visible = false;
               break;
             }
@@ -140,18 +287,24 @@ export class DataStateFilterMethods {
 
         if (visible && activeVarFilterEnabled) {
           const v = activeVarValues[i];
-          if (v === null || Number.isNaN(v) || v < activeVarFilterMin || v > activeVarFilterMax) {
+          if (Number.isNaN(v) || v < activeVarFilterMin || v > activeVarFilterMax) {
             visible = false;
           }
         }
 
         // Apply outlier filter for the active field (only when supported).
         if (visible && applyOutlierFilter) {
-          const q = (i < outliers.length) ? outliers[i] : -1;
+          const q = outliers[i];
           if (q >= 0 && q > outlierThreshold) visible = false;
         }
 
         this.categoryTransparency[i] = visible ? 1.0 : 0.0;
+      }
+    }
+
+    for (let i = 0; i < pointCount; i++) {
+      if (this.cellVisibilityMask[i] === 0) {
+        this.categoryTransparency[i] = 0.0;
       }
     }
 
@@ -290,79 +443,71 @@ export class DataStateFilterMethods {
   }
 
   toggleFilterEnabled(filterId, enabled) {
-    // Toggle filter on/off without removing it
-    const parts = filterId.split('-');
-    const source = parts[0]; // 'obs' or 'var'
-    const type = parts[1]; // 'continuous', 'category', or 'outlier'
-    const fieldIndex = parseInt(parts[2], 10);
-    
-    let field = null;
-    if (source === 'obs') {
-      field = this.obsData?.fields?.[fieldIndex];
-    } else if (source === 'var') {
-      field = this.varData?.fields?.[fieldIndex];
+    if (typeof enabled !== 'boolean') {
+      throw new TypeError('Filter enabled state must be exactly true or false.');
     }
-    if (!field) return;
-    
+    const { source, type, fieldIndex } = parseExactFilterId(filterId);
+    const fields = source === 'obs' ? this.obsData?.fields : this.varData?.fields;
+    if (!Array.isArray(fields) || !fields[fieldIndex]) {
+      throw new RangeError('Filter id references an unavailable field.');
+    }
+    const field = fields[fieldIndex];
+
     if (type === 'continuous') {
+      this.ensureContinuousMetadata(field);
       field._filterEnabled = enabled;
     } else if (type === 'category') {
+      this.ensureCategoryMetadata(field);
       field._categoryFilterEnabled = enabled;
-    } else if (type === 'outlier') {
+    } else {
+      if (field.kind !== 'category') {
+        throw new TypeError('Outlier filters require a categorical observation field.');
+      }
       field._outlierFilterEnabled = enabled;
-      // Outlier filter affects the outlierQuantilesArray
       this.updateOutlierQuantiles();
     }
-    
+
     this.computeGlobalVisibility();
-    this.updateFilterSummary();
   }
 
   removeFilter(filterId) {
-    // Remove filter completely (reset to full range or show all categories)
-    const parts = filterId.split('-');
-    const source = parts[0]; // 'obs' or 'var'
-    const type = parts[1]; // 'continuous', 'category', or 'outlier'
-    const fieldIndex = parseInt(parts[2], 10);
-    
-    let field = null;
-    if (source === 'obs') {
-      field = this.obsData?.fields?.[fieldIndex];
-    } else if (source === 'var') {
-      field = this.varData?.fields?.[fieldIndex];
+    const { source, type, fieldIndex } = parseExactFilterId(filterId);
+    const fields = source === 'obs' ? this.obsData?.fields : this.varData?.fields;
+    if (!Array.isArray(fields) || !fields[fieldIndex]) {
+      throw new RangeError('Filter id references an unavailable field.');
     }
-    if (!field) return;
-    
+    const field = fields[fieldIndex];
+
     if (type === 'continuous') {
-      // Reset to full range
-      if (field._continuousStats && field._continuousFilter) {
-        field._continuousFilter.min = field._continuousStats.min;
-        field._continuousFilter.max = field._continuousStats.max;
-      }
+      const metadata = this.ensureContinuousMetadata(field);
+      field._continuousFilter.min = metadata.stats.min;
+      field._continuousFilter.max = metadata.stats.max;
       field._filterEnabled = true;
     } else if (type === 'category') {
-      // Show all categories
-      const categories = field.categories || [];
-      if (!field._categoryVisible) field._categoryVisible = {};
+      this.ensureCategoryMetadata(field);
+      const categories = field.categories;
       for (let i = 0; i < categories.length; i++) {
         field._categoryVisible[i] = true;
       }
       field._categoryFilterEnabled = true;
-      // Update colors to reflect all categories visible
-      this.reapplyCategoryColors(field);
-    } else if (type === 'outlier') {
-      // Reset outlier threshold to 100%
+      this._reapplyCategoryColorsNoRecompute(field);
+    } else {
+      if (field.kind !== 'category') {
+        throw new TypeError('Outlier filters require a categorical observation field.');
+      }
       field._outlierThreshold = 1.0;
       field._outlierFilterEnabled = true;
       this.updateOutlierQuantiles();
     }
-    
+
     this.computeGlobalVisibility();
-    this.updateFilterSummary();
   }
 
   reapplyCategoryColors(field) {
-    if (!field || field.kind !== 'category') return;
+    if (!field || field.kind !== 'category') {
+      throw new TypeError('Category color refresh requires a category field.');
+    }
+    this.ensureCategoryMetadata(field);
     this._reapplyCategoryColorsNoRecompute(field);
     // Let computeGlobalVisibility handle transparency/filtering
     this.computeGlobalVisibility();
@@ -373,23 +518,40 @@ export class DataStateFilterMethods {
    * Used by batch mode to defer the expensive computeGlobalVisibility() call.
    */
   _reapplyCategoryColorsNoRecompute(field) {
-    if (!field || field.kind !== 'category') return;
+    if (!field || field.kind !== 'category') {
+      throw new TypeError('Category color refresh requires a category field.');
+    }
     const n = this.pointCount;
-    const categories = field.categories || [];
-    const codes = field.codes || [];
-    const catColors = field._categoryColors || [];
-    const catVisible = field._categoryVisible || {};
+    const categories = field.categories;
+    const codes = field.codes;
+    const catColors = field._categoryColors;
+    const catVisible = field._categoryVisible;
     const numCats = categories.length;
-    if (!this.categoryTransparency) this.categoryTransparency = new Float32Array(this.pointCount);
+    if (
+      (!Array.isArray(categories))
+      || (!(codes instanceof Uint8Array) && !(codes instanceof Uint16Array))
+      || codes.length !== n
+      || !Array.isArray(catColors)
+      || catColors.length !== numCats
+      || !(this.colorsArray instanceof Uint8Array)
+      || this.colorsArray.length !== n * 4
+      || !(this.categoryTransparency instanceof Float32Array)
+      || this.categoryTransparency.length !== n
+    ) {
+      throw new TypeError('Category color refresh requires complete typed field buffers.');
+    }
+    const missingCode = codes instanceof Uint8Array ? 255 : 65_535;
 
     for (let i = 0; i < n; i++) {
       const code = codes[i];
       let r, g, b;
-      if (code == null || code < 0 || code >= numCats) {
+      if (code === missingCode) {
         r = NEUTRAL_GRAY_UINT8; g = NEUTRAL_GRAY_UINT8; b = NEUTRAL_GRAY_UINT8;
+      } else if (code >= numCats) {
+        throw new RangeError(`Category code ${i} is outside the category inventory.`);
       } else {
-        const isVisible = catVisible[code] !== false;
-        const c = catColors[code] || getCategoryColor(code) || [0.5, 0.5, 0.5];
+        const isVisible = catVisible[code];
+        const c = catColors[code];
         if (!isVisible) {
           // Gray out hidden categories (visual indicator), but don't set transparency here
           r = g = b = 128; // gray in uint8
@@ -422,22 +584,18 @@ export class DataStateFilterMethods {
   }
 
   getColorForCategory(field, idx) {
+    requireCategoryFieldAndIndex(field, idx);
     this.ensureCategoryMetadata(field);
-    const numCats = field.categories?.length ?? 0;
-    if (!Number.isFinite(idx) || idx < 0 || idx >= numCats) {
-      return getCategoryColor(idx);
-    }
     const color = field._categoryColors[idx];
-    if (color && color.length === 3) return color;
-    const fallback = getCategoryColor(idx);
-    if (!field._categoryColors[idx]) field._categoryColors[idx] = fallback;
-    return fallback;
+    requireRgb(color);
+    return [...color];
   }
 
   setColorForCategory(field, idx, color) {
+    requireCategoryFieldAndIndex(field, idx);
+    requireRgb(color);
     this.ensureCategoryMetadata(field);
-    const fallback = getCategoryColor(idx);
-    field._categoryColors[idx] = color || fallback;
+    field._categoryColors[idx] = [...color];
     if (this._batchMode) {
       this._batchDirty.colors = true;
       this._batchDirty.affectedFields.add(field);
@@ -447,6 +605,10 @@ export class DataStateFilterMethods {
   }
 
   setVisibilityForCategory(field, idx, visible) {
+    requireCategoryFieldAndIndex(field, idx);
+    if (typeof visible !== 'boolean') {
+      throw new TypeError('Category visibility must be exactly true or false.');
+    }
     this.ensureCategoryMetadata(field);
     field._categoryVisible[idx] = visible;
     if (this._batchMode) {
@@ -458,23 +620,116 @@ export class DataStateFilterMethods {
     }
   }
 
+  setCellVisibility(cellIndices, visible) {
+    if (typeof visible !== 'boolean') {
+      throw new TypeError(
+        'Cell visibility must be exactly true or false.'
+      );
+    }
+    if (
+      !(this.cellVisibilityMask instanceof Float32Array) ||
+      this.cellVisibilityMask.length !== this.pointCount
+    ) {
+      throw new TypeError(
+        'Cell visibility requires a complete current dataset mask.'
+      );
+    }
+
+    let exactIndices = null;
+    if (cellIndices !== null) {
+      if (!Array.isArray(cellIndices)) {
+        throw new TypeError(
+          'Cell visibility indices must be an array or null.'
+        );
+      }
+      const seen = new Set();
+      exactIndices = [];
+      for (let index = 0; index < cellIndices.length; index++) {
+        const cellIndex = cellIndices[index];
+        if (
+          !Object.hasOwn(cellIndices, index) ||
+          !Number.isInteger(cellIndex) ||
+          cellIndex < 0
+        ) {
+          throw new TypeError(
+            `Cell visibility index ${index} must be a non-negative integer.`
+          );
+        }
+        if (cellIndex >= this.pointCount) {
+          throw new RangeError(
+            `Cell visibility index ${cellIndex} is outside the current point count.`
+          );
+        }
+        if (seen.has(cellIndex)) {
+          throw new TypeError(
+            'Cell visibility indices must not contain duplicates.'
+          );
+        }
+        seen.add(cellIndex);
+        exactIndices.push(cellIndex);
+      }
+    }
+
+    const nextValue = visible ? 1.0 : 0.0;
+    if (exactIndices === null) {
+      this.cellVisibilityMask.fill(nextValue);
+    } else {
+      for (const cellIndex of exactIndices) {
+        this.cellVisibilityMask[cellIndex] = nextValue;
+      }
+    }
+    this.computeGlobalVisibility();
+  }
+
   showAllCategories(field, { onlyAvailable = false } = {}) {
+    if (typeof onlyAvailable !== 'boolean') {
+      throw new TypeError('onlyAvailable must be exactly true or false.');
+    }
     this.ensureCategoryMetadata(field);
-    const categories = field.categories || [];
-    const available = onlyAvailable && field._categoryCounts ? field._categoryCounts.available : null;
+    const categories = field.categories;
+    if (onlyAvailable && !field._categoryCounts) {
+      throw new Error('Available category counts must be computed before scoped visibility changes.');
+    }
+    const available = onlyAvailable ? field._categoryCounts.available : null;
+    if (
+      available !== null
+      && (
+        !Array.isArray(available)
+        || available.length !== categories.length
+        || available.some((count) => !Number.isSafeInteger(count) || count < 0)
+      )
+    ) {
+      throw new TypeError('Available category counts must exactly match the category inventory.');
+    }
     for (let i = 0; i < categories.length; i++) {
-      if (available && (available[i] || 0) <= 0) continue;
+      if (available !== null && available[i] === 0) continue;
       field._categoryVisible[i] = true;
     }
     this.reapplyCategoryColors(field);
   }
 
   hideAllCategories(field, { onlyAvailable = false } = {}) {
+    if (typeof onlyAvailable !== 'boolean') {
+      throw new TypeError('onlyAvailable must be exactly true or false.');
+    }
     this.ensureCategoryMetadata(field);
-    const categories = field.categories || [];
-    const available = onlyAvailable && field._categoryCounts ? field._categoryCounts.available : null;
+    const categories = field.categories;
+    if (onlyAvailable && !field._categoryCounts) {
+      throw new Error('Available category counts must be computed before scoped visibility changes.');
+    }
+    const available = onlyAvailable ? field._categoryCounts.available : null;
+    if (
+      available !== null
+      && (
+        !Array.isArray(available)
+        || available.length !== categories.length
+        || available.some((count) => !Number.isSafeInteger(count) || count < 0)
+      )
+    ) {
+      throw new TypeError('Available category counts must exactly match the category inventory.');
+    }
     for (let i = 0; i < categories.length; i++) {
-      if (available && (available[i] || 0) <= 0) continue;
+      if (available !== null && available[i] === 0) continue;
       field._categoryVisible[i] = false;
     }
     this.reapplyCategoryColors(field);
@@ -502,11 +757,9 @@ export class DataStateFilterMethods {
     this.categoryTransparency.fill(1.0);
     if (this.outlierQuantilesArray) {
       this.outlierQuantilesArray.fill(-1.0);
-      this._pushOutliersToViewer();
     }
     this._pushColorsToViewer();
     this._pushTransparencyToViewer();
-    this._pushOutlierThresholdToViewer(1.0);
     this.clearCentroids();
     this.computeGlobalVisibility();
     this.updateFilterSummary();

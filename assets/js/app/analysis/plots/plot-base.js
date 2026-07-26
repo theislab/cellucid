@@ -91,13 +91,26 @@ export class BasePlot {
 
   /**
    * Get color for a page
-   * @param {Object} layoutEngine - Layout engine instance
+   * @param {Object|null} layoutEngine - Layout engine instance, or null for the palette owner
    * @param {string} pageId - Page ID
-   * @param {number} index - Fallback index
+   * @param {number} index - Palette index when no layout engine owns page colors
    * @returns {string} Color hex string
    */
   static getPageColor(layoutEngine, pageId, index) {
-    return layoutEngine?.getPageColor(pageId) || getPageColor(index);
+    if (layoutEngine === null || layoutEngine === undefined) {
+      if (!Number.isInteger(index) || index < 0) {
+        throw new RangeError('Palette index must be a non-negative integer');
+      }
+      return getPageColor(index);
+    }
+    if (typeof layoutEngine.getPageColor !== 'function') {
+      throw new TypeError('Layout engine getPageColor is required');
+    }
+    const color = layoutEngine.getPageColor(pageId);
+    if (typeof color !== 'string' || color.length === 0) {
+      throw new TypeError(`Layout engine must own a color for page ${pageId}`);
+    }
+    return color;
   }
 
   /**
@@ -118,10 +131,10 @@ export class BasePlot {
       }
     }
 
-    return {
-      min: Number.isFinite(globalMin) ? globalMin : 0,
-      max: Number.isFinite(globalMax) ? globalMax : 1
-    };
+    if (!Number.isFinite(globalMin) || !Number.isFinite(globalMax)) {
+      throw new RangeError('Plot range requires at least one finite numeric value');
+    }
+    return { min: globalMin, max: globalMax };
   }
 
   /**
@@ -163,11 +176,14 @@ export class BasePlot {
   /**
    * Get variable name from page data
    * @param {Object[]} pageData - Page data array
-   * @param {string} [fallback='Value'] - Fallback name
    * @returns {string} Variable name
    */
-  static getVariableName(pageData, fallback = 'Value') {
-    return pageData[0]?.variableInfo?.name || fallback;
+  static getVariableName(pageData) {
+    const name = pageData?.[0]?.variableInfo?.name;
+    if (typeof name !== 'string' || name.length === 0) {
+      throw new TypeError('Plot pageData[0].variableInfo.name is required');
+    }
+    return name;
   }
 
   /**
@@ -183,20 +199,15 @@ export class BasePlot {
    * @returns {Promise<Object>} Plotly figure
    */
   static async renderPlot(buildTraces, buildLayout, pageData, options, container, layoutEngine, plotName) {
-    try {
-      const traces = buildTraces(pageData, options, layoutEngine);
-      const layout = buildLayout(pageData, options, layoutEngine);
-      const config = BasePlot.getPlotlyConfig();
-      const Plotly = await BasePlot.loadPlotly();
-      return await Plotly.newPlot(container, traces, layout, config);
-    } catch (err) {
-      console.error(`[${plotName}] Render error:`, err);
-      throw new Error(`Failed to render ${plotName}: ${err.message}`);
-    }
+    const traces = buildTraces(pageData, options, layoutEngine);
+    const layout = buildLayout(pageData, options, layoutEngine);
+    const config = BasePlot.getPlotlyConfig();
+    const Plotly = await BasePlot.loadPlotly();
+    return await Plotly.newPlot(container, traces, layout, config);
   }
 
   /**
-   * Standard update wrapper with fallback to re-render
+   * Standard update wrapper
    *
    * @param {Function} buildTraces - Function that builds Plotly traces
    * @param {Function} buildLayout - Function that builds Plotly layout
@@ -204,21 +215,15 @@ export class BasePlot {
    * @param {Object[]} pageData - Page data array
    * @param {Object} options - Plot options
    * @param {Object} layoutEngine - Layout engine
-   * @param {Function} renderFallback - Render function to use as fallback
    * @param {string} plotName - Plot name for error messages
    * @returns {Promise<Object>} Updated Plotly figure
    */
-  static async updatePlot(buildTraces, buildLayout, figure, pageData, options, layoutEngine, renderFallback, plotName) {
-    try {
-      const traces = buildTraces(pageData, options, layoutEngine);
-      const layout = buildLayout(pageData, options, layoutEngine);
-      const config = BasePlot.getPlotlyConfig();
-      const Plotly = await BasePlot.loadPlotly();
-      return await Plotly.react(figure, traces, layout, config);
-    } catch (err) {
-      console.warn(`[${plotName}] Update error, falling back to re-render:`, err);
-      return renderFallback(pageData, options, figure, layoutEngine);
-    }
+  static async updatePlot(buildTraces, buildLayout, figure, pageData, options, layoutEngine, plotName) {
+    const traces = buildTraces(pageData, options, layoutEngine);
+    const layout = buildLayout(pageData, options, layoutEngine);
+    const config = BasePlot.getPlotlyConfig();
+    const Plotly = await BasePlot.loadPlotly();
+    return Plotly.react(figure, traces, layout, config);
   }
 
   // ===========================================================================
@@ -249,8 +254,8 @@ export class BasePlot {
   /**
    * Get variable name (instance method)
    */
-  getVariableName(pageData, fallback = 'Value') {
-    return BasePlot.getVariableName(pageData, fallback);
+  getVariableName(pageData) {
+    return BasePlot.getVariableName(pageData);
   }
 
   /**
@@ -266,19 +271,6 @@ export class BasePlot {
   }
 
   /**
-   * Update existing plot - default implementation re-renders
-   * @param {Object} figure - Existing Plotly figure
-   * @param {Object[]} pageData - Array of page data objects
-   * @param {Object} options - Plot options
-   * @param {Object} layoutEngine - Layout engine instance
-   * @returns {Promise<Object>} Updated Plotly figure
-   */
-  async update(figure, pageData, options, layoutEngine) {
-    // Default: fall back to re-render
-    return this.render(pageData, options, figure, layoutEngine);
-  }
-
-  /**
    * Export plot data as CSV - default implementation exports raw values
    * @param {Object[]} pageData - Array of page data objects
    * @param {Object} options - Plot options
@@ -289,10 +281,18 @@ export class BasePlot {
     const columns = ['page', 'cell_index', 'value'];
 
     for (const pd of pageData) {
+      if (
+        (!Array.isArray(pd.cellIndices) && !ArrayBuffer.isView(pd.cellIndices)) ||
+        pd.cellIndices.length !== pd.values.length
+      ) {
+        throw new TypeError(
+          `Plot CSV requires one cell index per value for page ${pd.pageId}`
+        );
+      }
       for (let i = 0; i < pd.values.length; i++) {
         rows.push({
           page: pd.pageName,
-          cell_index: pd.cellIndices?.[i] ?? i,
+          cell_index: pd.cellIndices[i],
           value: pd.values[i]
         });
       }
@@ -323,7 +323,6 @@ export class BasePlot {
       defaultOptions: this.defaultOptions,
       optionSchema: this.optionSchema,
       render: this.render.bind(this),
-      update: this.update.bind(this),
       exportCSV: this.exportCSV.bind(this)
     };
   }
@@ -365,36 +364,12 @@ export function createPlotDefinition(definition) {
     getVariableName: BasePlot.getVariableName
   };
 
-  // Wrap update to provide fallback to render
-  if (!merged.update && merged.render) {
-    merged.update = function(figure, pageData, options, layoutEngine) {
-      return this.render(pageData, options, figure, layoutEngine);
-    };
+  if (typeof merged.render !== 'function' || typeof merged.update !== 'function') {
+    throw new TypeError('Plot definitions require explicit render and update functions');
   }
 
-  // Wrap exportCSV to provide default implementation
-  if (!merged.exportCSV) {
-    merged.exportCSV = function(pageData, options) {
-      const rows = [];
-      for (const pd of pageData) {
-        for (let i = 0; i < pd.values.length; i++) {
-          rows.push({
-            page: pd.pageName,
-            cell_index: pd.cellIndices?.[i] ?? i,
-            value: pd.values[i]
-          });
-        }
-      }
-      return {
-        rows,
-        columns: ['page', 'cell_index', 'value'],
-        metadata: {
-          plotType: merged.id,
-          pageCount: pageData.length,
-          exportDate: new Date().toISOString()
-        }
-      };
-    };
+  if (typeof merged.exportCSV !== 'function') {
+    throw new TypeError('Plot definitions require an explicit exportCSV function');
   }
 
   return merged;

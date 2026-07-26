@@ -15,172 +15,302 @@ import { getGitHubAuthSession, getGitHubWorkerOrigin } from './github-auth.js';
 import {
   getAnnotationRepoForDataset,
   getAnnotationRepoMetaForDataset,
-  setAnnotationRepoForDataset,
-  setAnnotationRepoMetaForDataset
+  setAnnotationRepoForDataset
 } from './repo-store.js';
+import {
+  assertConfigDocument,
+  assertMergesDocument,
+  assertSchemaIdentity,
+  assertUserDocument,
+  parseExactJson,
+} from './wire-contract.js';
+import {
+  isCanonicalGitHubAccount,
+  isCanonicalGitHubBranch,
+  isCanonicalGitHubRepositoryFullName,
+  isCanonicalGitHubRepositoryName,
+  parseCanonicalGitHubRepositoryReference,
+} from './github-reference.js';
 
 const GITHUB_DEFAULT_TIMEOUT_MS = 20_000;
 const DEFAULT_USER_PULL_CONCURRENCY = 8;
-const MAX_TREE_ITEMS = 250_000;
+const MAX_TREE_ITEMS = 100_000;
+const GITHUB_SHA = /^[0-9a-f]{40}$/;
+const PUBLICATION_MODES = new Set(['direct', 'fork-pull-request']);
 
-function toCleanString(value) {
-  return String(value ?? '').trim();
+function assertExactNonblankString(value, label, { max = 2048 } = {}) {
+  if (
+    typeof value !== 'string' ||
+    !value ||
+    /^\s|\s$/.test(value) ||
+    Array.from(value).length > max
+  ) {
+    throw new Error(`${label} must be an exact nonblank string`);
+  }
+  return value;
 }
 
-function normalizeTimeoutMs(rawTimeoutMs, fallbackMs) {
-  const n = Number(rawTimeoutMs);
-  if (!Number.isFinite(n)) return fallbackMs;
-  return Math.max(0, Math.floor(n));
+function assertExactObjectKeys(value, fields, label) {
+  if (
+    value === null ||
+    typeof value !== 'object' ||
+    Array.isArray(value)
+  ) {
+    throw new Error(`${label} must be a JSON object`);
+  }
+  const keys = Object.keys(value);
+  if (
+    keys.length !== fields.length ||
+    fields.some((field) => !Object.hasOwn(value, field))
+  ) {
+    throw new Error(`${label} must contain exactly ${fields.join(', ')}`);
+  }
+  return value;
+}
+
+function assertExactHttpOrigin(value, label) {
+  const origin = assertExactNonblankString(value, label);
+  let parsed;
+  try {
+    parsed = new URL(origin);
+  } catch (cause) {
+    const error = new Error(`${label} must be an exact HTTP(S) origin`);
+    error.cause = cause;
+    throw error;
+  }
+  if (
+    (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') ||
+    parsed.username ||
+    parsed.password ||
+    origin !== parsed.origin
+  ) {
+    throw new Error(`${label} must be an exact HTTP(S) origin`);
+  }
+  return origin;
+}
+
+function assertGitHubBranch(value, label = 'GitHub branch') {
+  const branch = assertExactNonblankString(value, label, { max: 1024 });
+  if (!isCanonicalGitHubBranch(branch)) {
+    throw new Error(`${label} is not a canonical GitHub branch`);
+  }
+  return branch;
+}
+
+function assertGitHubSha(value, label) {
+  const sha = assertExactNonblankString(value, label, { max: 40 });
+  if (!GITHUB_SHA.test(sha)) {
+    throw new Error(`${label} must be a lowercase 40-character Git SHA`);
+  }
+  return sha;
+}
+
+function assertOptionalToken(value) {
+  if (value === null) return null;
+  return assertExactNonblankString(value, 'GitHub token', { max: 4096 });
+}
+
+function assertTimeoutMs(timeoutMs) {
+  if (
+    typeof timeoutMs !== 'number' ||
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs < 0
+  ) {
+    throw new Error('GitHub request timeoutMs must be a nonnegative safe integer');
+  }
+  return timeoutMs;
+}
+
+function assertPublicationMode(value) {
+  if (!PUBLICATION_MODES.has(value)) {
+    throw new Error(
+      'publicationMode must equal "direct" or "fork-pull-request"'
+    );
+  }
+  return value;
+}
+
+function assertGitHubLogin(value, label = 'GitHub login') {
+  const login = assertExactNonblankString(value, label, { max: 64 });
+  if (!isCanonicalGitHubAccount(login)) {
+    throw new Error(`${label} is not a canonical GitHub account`);
+  }
+  return login;
+}
+
+function assertGitHubRepositoryFullName(value, label) {
+  const fullName = assertExactNonblankString(value, label, { max: 256 });
+  if (!isCanonicalGitHubRepositoryFullName(fullName)) {
+    throw new Error(`${label} must equal an exact owner/repository name`);
+  }
+  return fullName;
+}
+
+function assertRepositoryPublicationInfo(repoInfo) {
+  assertExactObjectKeys(
+    repoInfo,
+    [
+      'full_name',
+      'default_branch',
+      'private',
+      'allow_forking',
+      'permissions',
+    ],
+    'GitHub repository metadata'
+  );
+  assertGitHubRepositoryFullName(
+    repoInfo.full_name,
+    'GitHub repository full_name'
+  );
+  assertGitHubBranch(
+    repoInfo.default_branch,
+    'GitHub repository default_branch'
+  );
+  if (typeof repoInfo.private !== 'boolean') {
+    throw new Error('GitHub repository private must be boolean');
+  }
+  if (typeof repoInfo.allow_forking !== 'boolean') {
+    throw new Error('GitHub repository allow_forking must be boolean');
+  }
+  const permissions = repoInfo.permissions;
+  assertExactObjectKeys(
+    permissions,
+    ['pull', 'triage', 'push', 'maintain', 'admin'],
+    'GitHub repository permissions'
+  );
+  for (const key of ['pull', 'triage', 'push', 'maintain', 'admin']) {
+    if (typeof permissions[key] !== 'boolean') {
+      throw new Error(`GitHub repository permissions.${key} must be boolean`);
+    }
+  }
+  return {
+    private: repoInfo.private,
+    allowForking: repoInfo.allow_forking,
+    canDirectPush:
+      permissions.push || permissions.maintain || permissions.admin,
+    canManage: permissions.maintain || permissions.admin,
+  };
+}
+
+export function selectAnnotationPublicationMode(repoInfo) {
+  const capability = assertRepositoryPublicationInfo(repoInfo);
+  if (capability.canDirectPush) return 'direct';
+  if (capability.allowForking) return 'fork-pull-request';
+  return null;
+}
+
+function assertAuthUserResponse(value) {
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    Array.isArray(value) ||
+    Object.keys(value).length !== 2 ||
+    !Object.hasOwn(value, 'id') ||
+    !Object.hasOwn(value, 'login')
+  ) {
+    throw new Error('GitHub auth user response must contain exactly id and login');
+  }
+  if (!Number.isSafeInteger(value.id) || value.id < 1) {
+    throw new Error('GitHub auth user id must be a positive safe integer');
+  }
+  return {
+    id: value.id,
+    login: assertGitHubLogin(value.login, 'GitHub auth user login'),
+  };
 }
 
 function isAbortError(err) {
   return err?.name === 'AbortError';
 }
 
-function safeJsonParse(text) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
+function parseHttpJson(text, label) {
+  if (typeof text !== 'string' || text === '') {
+    throw new Error(`${label} returned an empty response body`);
   }
+  return parseExactJson(text, { path: label });
 }
 
-function nowIso() {
-  try {
-    return new Date().toISOString();
-  } catch {
-    return String(Date.now());
+function assertWorkerErrorDocument(value, label) {
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    Array.isArray(value) ||
+    Object.keys(value).length !== 1 ||
+    !Object.hasOwn(value, 'error')
+  ) {
+    throw new Error(`${label} must contain exactly error`);
   }
-}
-
-function uniqueStrings(values) {
-  const out = [];
-  const seen = new Set();
-  for (const v of Array.isArray(values) ? values : []) {
-    const s = toCleanString(v);
-    if (!s || seen.has(s)) continue;
-    seen.add(s);
-    out.push(s);
-  }
-  return out;
-}
-
-function parseDateMsOrNull(value) {
-  const s = toCleanString(value);
-  if (!s) return null;
-  const ms = Date.parse(s);
-  return Number.isFinite(ms) ? ms : null;
-}
-
-function normalizeDatasetAccessMap(map) {
-  const input = (map && typeof map === 'object' && !Array.isArray(map)) ? map : null;
-  const out = {};
-  if (!input) return out;
-  for (const [datasetIdRaw, entry] of Object.entries(input)) {
-    const datasetId = toCleanString(datasetIdRaw);
-    if (!datasetId || !entry || typeof entry !== 'object') continue;
-    const fields = uniqueStrings(Array.isArray(entry.fieldsToAnnotate) ? entry.fieldsToAnnotate : []).slice(0, 200);
-    const lastAccessedAt = toCleanString(entry.lastAccessedAt) || null;
-    out[datasetId] = { fieldsToAnnotate: fields, lastAccessedAt };
-  }
-  return out;
-}
-
-function mergeDatasetAccessMaps(left, right) {
-  const a = normalizeDatasetAccessMap(left);
-  const b = normalizeDatasetAccessMap(right);
-  const out = { ...a };
-  for (const [datasetId, entry] of Object.entries(b)) {
-    const prev = out[datasetId] || null;
-    if (!prev) {
-      out[datasetId] = entry;
-      continue;
-    }
-    const prevMs = parseDateMsOrNull(prev.lastAccessedAt);
-    const nextMs = parseDateMsOrNull(entry.lastAccessedAt);
-    if (prevMs != null && nextMs != null) {
-      out[datasetId] = nextMs >= prevMs ? entry : prev;
-      continue;
-    }
-    if (prevMs == null && nextMs != null) {
-      out[datasetId] = entry;
-      continue;
-    }
-    if (prevMs != null && nextMs == null) {
-      out[datasetId] = prev;
-      continue;
-    }
-    out[datasetId] = entry.fieldsToAnnotate.length >= prev.fieldsToAnnotate.length ? entry : prev;
-  }
-  return out;
+  return assertExactNonblankString(value.error, `${label} error`, {
+    max: 4096,
+  });
 }
 
 function stableStringifyJson(value) {
-  const seen = new WeakSet();
+  const ancestors = new WeakSet();
   const walk = (v) => {
-    if (v == null) return null;
-    if (typeof v !== 'object') return v;
-    if (Array.isArray(v)) return v.map(walk);
-    if (seen.has(v)) return null;
-    seen.add(v);
+    if (v === null) return null;
+    if (typeof v === 'string' || typeof v === 'boolean') return v;
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+    if (typeof v !== 'object') {
+      throw new Error('Cannot compare a non-JSON value');
+    }
+    if (ancestors.has(v)) throw new Error('Cannot compare cyclic JSON');
+    ancestors.add(v);
+    if (Array.isArray(v)) {
+      const array = v.map(walk);
+      ancestors.delete(v);
+      return array;
+    }
     const out = {};
     for (const k of Object.keys(v).sort()) {
       out[k] = walk(v[k]);
     }
+    ancestors.delete(v);
     return out;
   };
-  try {
-    return JSON.stringify(walk(value));
-  } catch {
-    return '';
-  }
-}
-
-function assertSupportedUserFileSchema(schema, { path = 'annotations/schema.json' } = {}) {
-  const doc = (schema && typeof schema === 'object') ? schema : null;
-  if (!doc) throw new Error(`Invalid JSON schema at ${path}`);
-
-  const versionConst = doc?.properties?.version?.const;
-  const version = Number.isFinite(Number(versionConst)) ? Number(versionConst) : null;
-  if (version !== 1) {
-    throw new Error(
-      `Unsupported annotation user-file schema version in ${path}.\n` +
-      `Expected version=1 but got ${versionConst == null ? 'missing' : String(versionConst)}.`
-    );
-  }
-
-  const required = Array.isArray(doc?.required) ? doc.required.map((v) => toCleanString(v)).filter(Boolean) : [];
-  const req = new Set(required);
-  for (const key of ['version', 'username', 'githubUserId', 'updatedAt', 'suggestions', 'votes']) {
-    if (!req.has(key)) {
-      throw new Error(`Unsupported annotation user-file schema at ${path} (missing required field: ${key}).`);
-    }
-  }
+  return JSON.stringify(walk(value));
 }
 
 function encodeBase64Utf8(text) {
-  const s = toCleanString(text);
-  const bytes = typeof TextEncoder !== 'undefined' ? new TextEncoder().encode(s) : null;
-  if (!bytes) return btoa(unescape(encodeURIComponent(s)));
+  if (typeof text !== 'string') throw new Error('Base64 input must be a string');
+  if (typeof TextEncoder === 'undefined') {
+    throw new Error('TextEncoder is required for GitHub annotation sync');
+  }
+  const bytes = new TextEncoder().encode(text);
   let bin = '';
   for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
   return btoa(bin);
 }
 
 function decodeBase64Utf8(b64) {
-  const base64 = toCleanString(b64).replace(/\s+/g, '');
-  const bin = atob(base64);
-  if (typeof TextDecoder !== 'undefined') {
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    return new TextDecoder().decode(bytes);
+  if (typeof b64 !== 'string') {
+    throw new Error('GitHub annotation content must be a base64 string');
   }
-  return decodeURIComponent(escape(bin));
+  const base64 = b64.replaceAll('\r\n', '').replaceAll('\n', '');
+  if (
+    !base64 ||
+    base64.includes('\r') ||
+    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
+      base64
+    )
+  ) {
+    throw new Error(
+      'GitHub annotation content must be valid base64 with optional line folding'
+    );
+  }
+  const bin = atob(base64);
+  if (typeof TextDecoder === 'undefined') {
+    throw new Error('TextDecoder is required for GitHub annotation sync');
+  }
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  // Preserve a UTF-8 BOM so the exact JSON parser rejects it, matching the
+  // repository validator instead of silently discarding it.
+  return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
 }
 
 async function getGitTreeRecursive({ workerOrigin, owner, repo, token = null, ref }) {
-  const treeish = toCleanString(ref);
-  if (!treeish) throw new Error('Ref required');
+  const treeish = assertGitHubBranch(ref, 'Git tree ref');
   const res = await githubRequest(
     workerOrigin,
     `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/trees/${encodeURIComponent(treeish)}`,
@@ -188,35 +318,54 @@ async function getGitTreeRecursive({ workerOrigin, owner, repo, token = null, re
   );
   const list = Array.isArray(res?.tree) ? res.tree : null;
   if (!list) throw new Error('Expected git tree listing');
-  // Hard cap to avoid pathological repos freezing the browser.
-  return list.slice(0, MAX_TREE_ITEMS);
+  if (res?.truncated === true) {
+    throw new Error('GitHub returned a truncated git tree; annotation Pull is incomplete');
+  }
+  if (list.length > MAX_TREE_ITEMS) {
+    throw new Error(`Git tree contains more than ${MAX_TREE_ITEMS} entries`);
+  }
+  return list;
 }
 
-async function getGitBlobJson({ workerOrigin, owner, repo, token = null, sha }) {
-  const s = toCleanString(sha);
-  if (!s) throw new Error('Blob sha required');
+async function getGitBlobJson({
+  workerOrigin,
+  owner,
+  repo,
+  token = null,
+  sha,
+  path,
+}) {
+  const s = assertGitHubSha(sha, 'Git blob SHA');
   const res = await githubRequest(
     workerOrigin,
     `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/blobs/${encodeURIComponent(s)}`,
     { token }
   );
-  const encoding = toCleanString(res?.encoding || '');
-  const content = toCleanString(res?.content || '');
-  if (!content) throw new Error('Empty blob content');
-  const decoded = encoding.toLowerCase() === 'base64' ? decodeBase64Utf8(content) : content;
-  const parsed = safeJsonParse(decoded);
-  if (!parsed) throw new Error('Invalid JSON');
-  return parsed;
-}
-
-function sleep(ms) {
-  const t = Math.max(0, Math.floor(Number(ms) || 0));
-  return new Promise((resolve) => setTimeout(resolve, t));
+  if (res?.encoding !== 'base64') {
+    throw new Error(`GitHub blob ${JSON.stringify(path)} must use base64 encoding`);
+  }
+  if (typeof res?.content !== 'string' || !res.content.trim()) {
+    throw new Error(`GitHub blob ${JSON.stringify(path)} has empty content`);
+  }
+  const decoded = decodeBase64Utf8(res.content);
+  return parseExactJson(decoded, { path });
 }
 
 async function mapWithConcurrency(items, concurrency, fn) {
-  const list = Array.isArray(items) ? items : [];
-  const limit = Math.max(1, Math.floor(Number(concurrency) || 1));
+  if (!Array.isArray(items)) {
+    throw new Error('Concurrent map items must be an array');
+  }
+  if (
+    !Number.isSafeInteger(concurrency) ||
+    concurrency < 1
+  ) {
+    throw new Error('Concurrent map limit must be a positive safe integer');
+  }
+  if (typeof fn !== 'function') {
+    throw new Error('Concurrent map callback must be a function');
+  }
+  const list = items;
+  const limit = concurrency;
   const results = new Array(list.length);
   if (!list.length) return results;
 
@@ -234,94 +383,20 @@ async function mapWithConcurrency(items, concurrency, fn) {
 }
 
 export function parseOwnerRepo(input) {
-  const raw = toCleanString(input);
-  if (!raw) return null;
-
-  /** @type {string|null} */
-  let ref = null;
-  /** @type {string|null} */
-  let treeRefPath = null;
-
-  let cleaned = raw
-    .replace(/^https?:\/\/github\.com\//i, '')
-    .replace(/^https?:\/\/api\.github\.com\/repos\//i, '')
-    .replace(/^git@github\.com:/i, '')
-    .replace(/^\/+|\/+$/g, '');
-
-  // Drop query params for URL pastes (e.g. "...?tab=readme").
-  const qIdx = cleaned.indexOf('?');
-  if (qIdx >= 0) cleaned = cleaned.slice(0, qIdx);
-
-  // Support ".../owner/repo.git"
-  cleaned = cleaned.replace(/\.git$/i, '');
-
-  // Support ".../owner/repo/tree/branch[/...]" links.
-  // Note: branch names can include slashes, so we capture the entire tail after `/tree/`.
-  const treeMatch = cleaned.match(/^([^/]+\/[^/]+)\/tree\/(.+)$/i);
-  if (treeMatch) {
-    cleaned = treeMatch[1];
-    treeRefPath = toCleanString(treeMatch[2]) || null;
-    // Keep the full tree ref+path tail (may include path segments). We resolve it to a real branch
-    // during connect by probing for the required template files (schema/config).
-    ref = treeRefPath;
-  }
-
-  // Support "owner/repo@branch" and "owner/repo#branch"
-  const hashIdx = cleaned.indexOf('#');
-  if (hashIdx >= 0) {
-    ref = toCleanString(cleaned.slice(hashIdx + 1)) || null;
-    cleaned = cleaned.slice(0, hashIdx);
-  } else {
-    const atIdx = cleaned.lastIndexOf('@');
-    if (atIdx >= 0) {
-      ref = toCleanString(cleaned.slice(atIdx + 1)) || null;
-      cleaned = cleaned.slice(0, atIdx);
-    }
-  }
-
-  const parts = cleaned.split('/');
-  if (parts.length !== 2) return null;
-
-  const owner = toCleanString(parts[0]);
-  const repo = toCleanString(parts[1]);
-
-  // GitHub owner/repo constraints (loose but safe).
-  const re = /^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,98}[A-Za-z0-9])?$/;
-  if (!re.test(owner) || !re.test(repo)) return null;
-
-  if (ref) {
-    // Branch names can include slashes; keep validation permissive while preventing obviously invalid input.
-    const refOk = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,1023}$/.test(ref);
-    if (!refOk) ref = null;
-  }
-
-  const ownerRepo = `${owner}/${repo}`;
-  const ownerRepoRef = ref ? `${ownerRepo}@${ref}` : ownerRepo;
-  return { owner, repo, ownerRepo, ref, ownerRepoRef, treeRefPath };
+  return parseCanonicalGitHubRepositoryReference(input);
 }
 
 function sanitizeUserKeyForPath(userKey) {
-  const raw = toCleanString(userKey).replace(/^@+/, '').toLowerCase();
-  const m = raw.match(/^ghid_(\d+)$/);
+  if (typeof userKey !== 'string') return null;
+  const m = userKey.match(/^ghid_([1-9][0-9]*)$/);
   if (!m) return null;
   const id = Number(m[1]);
-  if (!Number.isFinite(id)) return null;
-  const safe = Math.max(0, Math.floor(id));
-  return safe ? `ghid_${safe}` : null;
-}
-
-function sanitizeBranchPart(value, { maxLen = 40 } = {}) {
-  const raw = toCleanString(value).toLowerCase();
-  const cleaned = raw
-    .replace(/[^a-z0-9._-]+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^[.-]+|[.-]+$/g, '')
-    .slice(0, Math.max(8, Math.floor(Number(maxLen) || 40)));
-  return cleaned || 'default';
+  if (!Number.isSafeInteger(id) || id < 1) return null;
+  return userKey;
 }
 
 function fnv1aHash32(input) {
-  const str = String(input ?? '');
+  const str = assertExactNonblankString(input, 'Hash input', { max: 8192 });
   let hash = 0x811c9dc5;
   for (let i = 0; i < str.length; i++) {
     hash ^= str.charCodeAt(i);
@@ -331,63 +406,96 @@ function fnv1aHash32(input) {
 }
 
 function encodeGitRefPath(ref) {
-  const raw = toCleanString(ref);
-  if (!raw) return '';
+  const raw = assertGitHubBranch(ref, 'GitHub ref path');
   return raw.split('/').map((p) => encodeURIComponent(p)).join('/');
 }
 
 function toDeterministicPrBranch({ datasetId, baseBranch, fileUser }) {
-  const didRaw = toCleanString(datasetId || 'default') || 'default';
-  const baseRaw = toCleanString(baseBranch || 'main') || 'main';
-  const userRaw = toCleanString(fileUser || 'local') || 'local';
-
-  const did = sanitizeBranchPart(didRaw, { maxLen: 32 });
-  const base = sanitizeBranchPart(baseRaw, { maxLen: 32 });
-  const user = sanitizeBranchPart(userRaw, { maxLen: 48 });
-
-  // Avoid collisions from truncation/normalization by suffixing a stable hash.
-  const fingerprint = fnv1aHash32(`${didRaw}::${baseRaw}::${userRaw}`).toString(36);
-  return `cellucid-annotations/${did}/${base}/${user}-${fingerprint}`;
+  const didRaw = assertExactNonblankString(
+    datasetId,
+    'Pull-request dataset id',
+    { max: 256 }
+  );
+  const baseRaw = assertGitHubBranch(baseBranch, 'Pull-request base branch');
+  const userRaw = sanitizeUserKeyForPath(fileUser);
+  if (userRaw === null) {
+    throw new Error('Pull-request file user must be an exact ghid identity');
+  }
+  const fingerprint = fnv1aHash32(
+    `${didRaw}\u0000${baseRaw}\u0000${userRaw}`
+  ).toString(36);
+  return `cellucid-annotations/${userRaw}/${fingerprint}`;
 }
 
 function toWorkerApiUrl(workerOrigin, githubPath) {
-  const origin = String(workerOrigin || '').trim().replace(/\/+$/, '') || getGitHubWorkerOrigin();
-  const p = String(githubPath || '').trim();
+  const origin = assertExactHttpOrigin(workerOrigin, 'GitHub worker origin');
+  const p = assertExactNonblankString(githubPath, 'GitHub API path');
   if (!p.startsWith('/')) throw new Error('GitHub API path must start with "/"');
   return new URL(`${origin}/api${p}`);
 }
 
 function toWorkerAuthUrl(workerOrigin, workerPath) {
-  const origin = String(workerOrigin || '').trim().replace(/\/+$/, '') || getGitHubWorkerOrigin();
-  const p = String(workerPath || '').trim();
+  const origin = assertExactHttpOrigin(workerOrigin, 'GitHub worker origin');
+  const p = assertExactNonblankString(workerPath, 'GitHub worker path');
   if (!p.startsWith('/')) throw new Error('Worker path must start with "/"');
   return new URL(`${origin}${p}`);
 }
 
 async function githubRequest(workerOrigin, path, { token = null, method = 'GET', query = null, body = null, timeoutMs = GITHUB_DEFAULT_TIMEOUT_MS } = {}) {
   const url = toWorkerApiUrl(workerOrigin, path);
-  if (query && typeof query === 'object') {
+  if (
+    query !== null &&
+    (
+      typeof query !== 'object' ||
+      Array.isArray(query)
+    )
+  ) {
+    throw new Error('GitHub query must be a JSON object or null');
+  }
+  if (query !== null) {
     for (const [k, v] of Object.entries(query)) {
-      if (v == null) continue;
-      url.searchParams.set(k, String(v));
+      const key = assertExactNonblankString(k, 'GitHub query key', {
+        max: 128,
+      });
+      let encodedValue;
+      if (typeof v === 'string') {
+        encodedValue = assertExactNonblankString(
+          v,
+          `GitHub query ${key}`,
+          { max: 2048 }
+        );
+      } else if (Number.isSafeInteger(v) && v >= 0) {
+        encodedValue = `${v}`;
+      } else {
+        throw new Error(
+          `GitHub query ${key} must be an exact string or nonnegative safe integer`
+        );
+      }
+      url.searchParams.set(key, encodedValue);
     }
+  }
+  if (method !== 'GET' && method !== 'POST' && method !== 'PUT') {
+    throw new Error('GitHub request method must equal GET, POST, or PUT');
   }
 
   const headers = {
     Accept: 'application/vnd.github+json',
   };
-  if (token) headers.Authorization = `Bearer ${token}`;
+  const exactToken = assertOptionalToken(token);
+  if (exactToken !== null) headers.Authorization = `Bearer ${exactToken}`;
   if (body != null) headers['Content-Type'] = 'application/json';
 
-  const ms = normalizeTimeoutMs(timeoutMs, GITHUB_DEFAULT_TIMEOUT_MS);
-  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
-  const signal = controller?.signal;
+  const ms = assertTimeoutMs(timeoutMs);
+  if (typeof AbortController === 'undefined') {
+    throw new Error('AbortController is required for GitHub annotation requests');
+  }
+  const controller = new AbortController();
 
   /** @type {ReturnType<typeof setTimeout> | null} */
   let timeout = null;
-  if (controller && ms > 0) {
+  if (ms > 0) {
     timeout = setTimeout(() => {
-      try { controller.abort(); } catch { /* ignore */ }
+      controller.abort();
     }, ms);
   }
 
@@ -395,18 +503,32 @@ async function githubRequest(workerOrigin, path, { token = null, method = 'GET',
     const res = await fetch(url.toString(), {
       method,
       headers,
-      body: body != null ? JSON.stringify(body) : undefined,
-      signal: signal || undefined
+      body: body !== null ? stableStringifyJson(body) : undefined,
+      signal: controller.signal
     });
 
     const text = await res.text();
-    const asJson = text ? safeJsonParse(text) : null;
+    let responseJson;
+    try {
+      responseJson = parseHttpJson(
+        text,
+        `GitHub ${method} ${path} response`
+      );
+    } catch (cause) {
+      const error = new Error(
+        `GitHub ${method} ${path} returned invalid JSON: ${cause?.message || cause}`
+      );
+      error.status = res.status;
+      error.github = { path, method };
+      error.cause = cause;
+      throw error;
+    }
 
     if (!res.ok) {
-      const msg =
-        toCleanString(asJson?.message) ||
-        toCleanString(text) ||
-        `GitHub HTTP ${res.status}`;
+      const msg = assertWorkerErrorDocument(
+        responseJson,
+        `GitHub ${method} ${path} error response`
+      );
       const err = new Error(msg);
       // attach minimal context (no token)
       err.status = res.status;
@@ -414,7 +536,7 @@ async function githubRequest(workerOrigin, path, { token = null, method = 'GET',
       throw err;
     }
 
-    return asJson != null ? asJson : (text || null);
+    return responseJson;
   } catch (err) {
     if (isAbortError(err)) {
       const msg = ms > 0 ? `GitHub request timed out after ${Math.max(1, Math.round(ms / 1000))}s` : 'GitHub request aborted';
@@ -423,32 +545,34 @@ async function githubRequest(workerOrigin, path, { token = null, method = 'GET',
       e.github = { path, method };
       throw e;
     }
-    try {
-      if (err && typeof err === 'object' && !err.github) err.github = { path, method };
-    } catch {
-      // ignore
-    }
+    if (err && typeof err === 'object' && !err.github) err.github = { path, method };
     throw err;
   } finally {
-    if (timeout) clearTimeout(timeout);
+    if (timeout !== null) clearTimeout(timeout);
   }
 }
 
 async function workerAuthRequest(workerOrigin, path, { token = null, method = 'GET', body = null, timeoutMs = GITHUB_DEFAULT_TIMEOUT_MS } = {}) {
   const url = toWorkerAuthUrl(workerOrigin, path);
   const headers = {};
-  if (token) headers.Authorization = `Bearer ${token}`;
+  const exactToken = assertOptionalToken(token);
+  if (exactToken !== null) headers.Authorization = `Bearer ${exactToken}`;
   if (body != null) headers['Content-Type'] = 'application/json';
+  if (method !== 'GET' && method !== 'POST') {
+    throw new Error('GitHub worker request method must equal GET or POST');
+  }
 
-  const ms = normalizeTimeoutMs(timeoutMs, GITHUB_DEFAULT_TIMEOUT_MS);
-  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
-  const signal = controller?.signal;
+  const ms = assertTimeoutMs(timeoutMs);
+  if (typeof AbortController === 'undefined') {
+    throw new Error('AbortController is required for GitHub worker requests');
+  }
+  const controller = new AbortController();
 
   /** @type {ReturnType<typeof setTimeout> | null} */
   let timeout = null;
-  if (controller && ms > 0) {
+  if (ms > 0) {
     timeout = setTimeout(() => {
-      try { controller.abort(); } catch { /* ignore */ }
+      controller.abort();
     }, ms);
   }
 
@@ -456,20 +580,37 @@ async function workerAuthRequest(workerOrigin, path, { token = null, method = 'G
     const res = await fetch(url.toString(), {
       method,
       headers,
-      body: body != null ? JSON.stringify(body) : undefined,
-      signal: signal || undefined
+      body: body !== null ? stableStringifyJson(body) : undefined,
+      signal: controller.signal
     });
 
     const text = await res.text();
-    const asJson = text ? safeJsonParse(text) : null;
+    let responseJson;
+    try {
+      responseJson = parseHttpJson(
+        text,
+        `GitHub worker ${method} ${path} response`
+      );
+    } catch (cause) {
+      const error = new Error(
+        `GitHub worker ${method} ${path} returned invalid JSON: ${cause?.message || cause}`
+      );
+      error.status = res.status;
+      error.worker = { path, method };
+      error.cause = cause;
+      throw error;
+    }
     if (!res.ok) {
-      const msg = toCleanString(asJson?.error || asJson?.message || text) || `HTTP ${res.status}`;
+      const msg = assertWorkerErrorDocument(
+        responseJson,
+        `GitHub worker ${method} ${path} error response`
+      );
       const err = new Error(msg);
       err.status = res.status;
       err.worker = { path, method };
       throw err;
     }
-    return asJson != null ? asJson : (text || null);
+    return responseJson;
   } catch (err) {
     if (isAbortError(err)) {
       const msg = ms > 0 ? `Auth request timed out after ${Math.max(1, Math.round(ms / 1000))}s` : 'Auth request aborted';
@@ -478,14 +619,10 @@ async function workerAuthRequest(workerOrigin, path, { token = null, method = 'G
       e.worker = { path, method };
       throw e;
     }
-    try {
-      if (err && typeof err === 'object' && !err.worker) err.worker = { path, method };
-    } catch {
-      // ignore
-    }
+    if (err && typeof err === 'object' && !err.worker) err.worker = { path, method };
     throw err;
   } finally {
-    if (timeout) clearTimeout(timeout);
+    if (timeout !== null) clearTimeout(timeout);
   }
 }
 
@@ -494,107 +631,83 @@ async function getRepoInfo({ workerOrigin, owner, repo, token = null }) {
 }
 
 async function getContent({ workerOrigin, owner, repo, token = null, path, ref = null }) {
-  const p = toCleanString(path).replace(/^\/+/, '');
-  if (!p) throw new Error('GitHub content path required');
+  const p = assertExactNonblankString(path, 'GitHub content path');
+  if (p.startsWith('/') || p.split('/').some((segment) => !segment)) {
+    throw new Error('GitHub content path must be a canonical relative path');
+  }
+  const query =
+    ref === null ? null : { ref: assertGitHubBranch(ref, 'GitHub content ref') };
   return githubRequest(
     workerOrigin,
     `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${p.split('/').map(encodeURIComponent).join('/')}`,
-    { token, query: ref ? { ref } : null }
+    { token, query }
   );
 }
 
 async function putContent({ workerOrigin, owner, repo, token, path, branch, message, contentBase64, sha = null }) {
-  if (!token) throw new Error('GitHub token required');
-  const p = toCleanString(path).replace(/^\/+/, '');
-  if (!p) throw new Error('GitHub content path required');
+  const exactToken = assertExactNonblankString(
+    token,
+    'GitHub token',
+    { max: 4096 }
+  );
+  const p = assertExactNonblankString(path, 'GitHub content path');
+  if (p.startsWith('/') || p.split('/').some((segment) => !segment)) {
+    throw new Error('GitHub content path must be a canonical relative path');
+  }
+  const exactMessage = assertExactNonblankString(
+    message,
+    'GitHub commit message',
+    { max: 256 }
+  );
+  if (
+    typeof contentBase64 !== 'string' ||
+    !contentBase64 ||
+    /^\s|\s$/.test(contentBase64)
+  ) {
+    throw new Error('GitHub base64 content must be an exact nonblank string');
+  }
+  const exactContent = contentBase64;
   const payload = {
-    message: toCleanString(message) || 'Update annotations',
-    content: contentBase64,
-    branch: toCleanString(branch) || undefined,
-    sha: sha || undefined
+    message: exactMessage,
+    content: exactContent,
+    branch: assertGitHubBranch(branch),
   };
+  if (sha !== null) payload.sha = assertGitHubSha(sha, 'Existing content SHA');
   return githubRequest(
     workerOrigin,
     `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${p.split('/').map(encodeURIComponent).join('/')}`,
-    { token, method: 'PUT', body: payload }
+    { token: exactToken, method: 'PUT', body: payload }
   );
 }
 
-function isWriteDeniedError(err) {
-  const status = err?.status;
-  return status === 401 || status === 403;
+function isContentConflictError(error) {
+  return error?.status === 409;
 }
 
-function isProtectedBranchError(err) {
-  const msg = toCleanString(err?.message || '').toLowerCase();
-  if (!msg) return false;
-  return (
-    msg.includes('protected branch') ||
-    msg.includes('branch protection') ||
-    msg.includes('protected branch hook declined') ||
-    msg.includes('pushes to this branch are restricted') ||
-    msg.includes('required pull request') ||
-    msg.includes('required status checks') ||
-    msg.includes('required reviews')
-  );
-}
-
-function isShaMismatchError(err) {
-  const status = err?.status;
-  const msg = toCleanString(err?.message || '').toLowerCase();
-  if (status === 422) {
-    // GitHub often reports sha mismatches / missing sha as 422 with message containing "sha".
-    // Avoid treating protected-branch failures as sha mismatches.
-    if (isProtectedBranchError(err)) return false;
-    return msg.includes('sha');
+function decodeJsonContentFile(content, path) {
+  if (!content || content.type !== 'file') {
+    throw new Error(`Expected file at ${path}`);
   }
-  if (status !== 409) return false;
-  // 409 can be used for non-sha errors (e.g., protected branch update failures).
-  if (isProtectedBranchError(err)) return false;
-  return msg.includes('sha') || msg.includes('does not match') || msg.includes('was not supplied') || msg.includes("wasn't supplied");
-}
-
-async function putContentWithRetry({
-  workerOrigin,
-  owner,
-  repo,
-  token,
-  path,
-  branch,
-  message,
-  contentBase64,
-  sha = null,
-  refForRefresh = null,
-  maxAttempts = 3
-}) {
-  const max = Math.max(1, Math.floor(Number(maxAttempts) || 3));
-  let nextSha = sha;
-  for (let attempt = 0; attempt < max; attempt++) {
-    try {
-      return await putContent({ workerOrigin, owner, repo, token, path, branch, message, contentBase64, sha: nextSha });
-    } catch (err) {
-      // Resolve rare sha mismatch races (concurrent writes).
-      const isShaMismatch = isShaMismatchError(err);
-      if (!isShaMismatch || attempt === max - 1) throw err;
-      const ref = toCleanString(refForRefresh) || toCleanString(branch) || null;
-      const existing = await getContent({ workerOrigin, owner, repo, token, path, ref });
-      nextSha = existing?.type === 'file' ? toCleanString(existing?.sha || '') || null : null;
-      // Small backoff helps when multiple publishes race in different tabs.
-      await sleep(120 * Math.pow(2, attempt));
-    }
+  if (content.encoding !== 'base64') {
+    throw new Error(`GitHub file ${JSON.stringify(path)} must use base64 encoding`);
   }
-  throw new Error('Unable to publish file (retry limit)');
+  if (
+      typeof content.sha !== 'string' ||
+      !content.sha ||
+      !GITHUB_SHA.test(content.sha)
+    ) {
+    throw new Error(`GitHub file ${JSON.stringify(path)} is missing an exact SHA`);
+  }
+  const decoded = decodeBase64Utf8(content.content);
+  return {
+    json: parseExactJson(decoded, { path }),
+    sha: content.sha,
+  };
 }
 
 async function readJsonFile({ workerOrigin, owner, repo, token = null, path, ref = null }) {
   const content = await getContent({ workerOrigin, owner, repo, token, path, ref });
-  if (!content || content.type !== 'file') {
-    throw new Error(`Expected file at ${path}`);
-  }
-  const decoded = decodeBase64Utf8(content.content || '');
-  const parsed = safeJsonParse(decoded);
-  if (!parsed) throw new Error(`Invalid JSON at ${path}`);
-  return { json: parsed, sha: content.sha || null };
+  return decodeJsonContentFile(content, path);
 }
 
 function isNotFoundError(err) {
@@ -610,185 +723,178 @@ async function readJsonFileOrNull({ workerOrigin, owner, repo, token, path, ref 
   }
 }
 
-function normalizeModerationMergesDoc(doc) {
-  const input = (doc && typeof doc === 'object') ? doc : {};
-  const merges = Array.isArray(input?.merges) ? input.merges : [];
-
-  const clamp = (value, maxLen) => {
-    const s = toCleanString(value);
-    if (!s) return '';
-    return s.length > maxLen ? s.slice(0, maxLen) : s;
-  };
-
-  const isNewer = (prev, next) => {
-    const ax = toCleanString(prev?.editedAt || prev?.at || '');
-    const ay = toCleanString(next?.editedAt || next?.at || '');
-    if (ax && ay && ay > ax) return true;
-    if (ax && ay && ax > ay) return false;
-    if (!ax && ay) return true;
-    if (ax && !ay) return false;
-    const score = (m) => (toCleanString(m?.by || '') ? 1 : 0) + (toCleanString(m?.note || '') ? 1 : 0);
-    return score(next) > score(prev);
-  };
-
-  // Moderation merges are an author-maintained "current mapping", not an append-only event log.
-  // Keep at most one active merge per (bucket, fromSuggestionId).
-  const newestByKey = new Map();
-  for (const raw of merges.slice(0, 10000)) {
-    const bucket = toCleanString(raw?.bucket);
-    const fromSuggestionId = toCleanString(raw?.fromSuggestionId);
-    const intoSuggestionId = toCleanString(raw?.intoSuggestionId);
-    if (!bucket || !fromSuggestionId || !intoSuggestionId) continue;
-    if (fromSuggestionId === intoSuggestionId) continue;
-
-    const byRaw = toCleanString(raw?.by || '').replace(/^@+/, '').toLowerCase();
-    const atRaw = toCleanString(raw?.at || '');
-    const by = clamp(byRaw, 64);
-    const at = clamp(atRaw, 64);
-    if (!by || !at) continue;
-
-    const entry = {
-      bucket,
-      fromSuggestionId,
-      intoSuggestionId,
-      by,
-      at,
-      ...(toCleanString(raw?.editedAt || '') ? { editedAt: clamp(raw?.editedAt, 64) } : {}),
-      ...(toCleanString(raw?.note || '') ? { note: clamp(raw?.note, 512) } : {})
-    };
-    const key = `${bucket}::${fromSuggestionId}`;
-    const prev = newestByKey.get(key) || null;
-    if (!prev || isNewer(prev, entry)) newestByKey.set(key, entry);
+function assertForkRecord(value, index, upstreamFullName) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`GitHub fork ${index} must be an object`);
   }
-
-  const mergedList = Array.from(newestByKey.entries())
-    .sort((a, b) => a[0].localeCompare(b[0]))
-    .map(([, v]) => v)
-    .slice(0, 5000);
-
-  return {
-    version: 1,
-    updatedAt: nowIso(),
-    merges: mergedList
-  };
-}
-
-async function listDir({ workerOrigin, owner, repo, token = null, path, ref = null }) {
-  const content = await getContent({ workerOrigin, owner, repo, token, path, ref });
-  if (!Array.isArray(content)) {
-    throw new Error(`Expected directory listing at ${path}`);
-  }
-  return content;
-}
-
-async function ensureForkRepo({ workerOrigin, upstreamOwner, upstreamRepo, token, forkOwner }) {
-  // Best effort: ask GitHub to create a fork; if it already exists, that's fine.
-  /** @type {string|null} */
-  let forkRepoName = null;
-  try {
-    const created = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/forks`, {
-      token,
-      method: 'POST'
-    });
-    forkRepoName = toCleanString(created?.name || '') || null;
-  } catch (err) {
-    // "already_exists" / "fork exists" should not block PR flow.
-    if (err?.status !== 422) throw err;
-  }
-
-  // If we got a name from the fork-creation response, prefer it.
-  if (forkRepoName) return forkRepoName;
-
-  // Common case: fork repo has the same name as upstream.
-  try {
-    const maybe = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(forkOwner)}/${encodeURIComponent(upstreamRepo)}`, { token });
-    const parent = toCleanString(maybe?.parent?.full_name || '') || null;
-    if (parent && parent.toLowerCase() === `${upstreamOwner}/${upstreamRepo}`.toLowerCase()) return upstreamRepo;
-  } catch (err) {
-    if (err?.status !== 404) throw err;
-  }
-
-  // Edge case: fork was renamed (or upstream repo name collides). Find the user's fork via the upstream forks listing.
-  for (let page = 1; page <= 5; page++) {
-    const forks = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/forks`, {
-      token,
-      query: { per_page: 100, page }
-    });
-    const list = Array.isArray(forks) ? forks : [];
-    for (const f of list) {
-      const full = toCleanString(f?.full_name || '');
-      if (!full) continue;
-      const [o, r] = full.split('/');
-      if (!o || !r) continue;
-      if (o.toLowerCase() === String(forkOwner).toLowerCase()) return r;
-    }
-    if (list.length < 100) break;
-  }
-
-  throw new Error(
-    `Unable to locate your fork for ${upstreamOwner}/${upstreamRepo}. ` +
-    `If you renamed your fork or cannot fork into your account, create a fork manually and ensure it's visible to the GitHub App, then try again.`
+  const fullName = assertGitHubRepositoryFullName(
+    value.full_name,
+    `GitHub fork ${index} full_name`
   );
+  if (!value.owner || typeof value.owner !== 'object' || Array.isArray(value.owner)) {
+    throw new Error(`GitHub fork ${index} owner must be an object`);
+  }
+  const owner = assertGitHubLogin(
+    value.owner.login,
+    `GitHub fork ${index} owner login`
+  );
+  const name = assertExactNonblankString(
+    value.name,
+    `GitHub fork ${index} name`,
+    { max: 100 }
+  );
+  if (!isCanonicalGitHubRepositoryName(name)) {
+    throw new Error(`GitHub fork ${index} name is not canonical`);
+  }
+  if (fullName.toLowerCase() !== `${owner}/${name}`.toLowerCase()) {
+    throw new Error(`GitHub fork ${index} identity fields disagree`);
+  }
+  if (
+    value.parent !== undefined &&
+    (
+      !value.parent ||
+      typeof value.parent !== 'object' ||
+      Array.isArray(value.parent) ||
+      assertGitHubRepositoryFullName(
+        value.parent.full_name,
+        `GitHub fork ${index} parent full_name`
+      ).toLowerCase() !== upstreamFullName.toLowerCase()
+    )
+  ) {
+    throw new Error(`GitHub fork ${index} has a different parent repository`);
+  }
+  return { owner, name, fullName };
 }
 
-async function getBranchTipShaOrNull({ workerOrigin, owner, repo, token, branch }) {
-  const b = toCleanString(branch);
-  if (!b) return null;
-  try {
-    const ref = await githubRequest(
+async function selectOrCreateForkRepo({
+  workerOrigin,
+  upstreamOwner,
+  upstreamRepo,
+  token,
+  forkOwner,
+}) {
+  const upstreamFullName = `${upstreamOwner}/${upstreamRepo}`;
+  const exactForkOwner = assertGitHubLogin(forkOwner, 'Fork owner');
+  const matching = [];
+  const seen = new Set();
+  for (let page = 1; page <= 10_000; page += 1) {
+    const document = await githubRequest(
       workerOrigin,
-      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/ref/heads/${encodeGitRefPath(b)}`,
-      { token }
+      `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/forks`,
+      { token, query: { per_page: 100, page } }
     );
-    return toCleanString(ref?.object?.sha || '') || null;
-  } catch (err) {
-    if (err?.status === 404) return null;
-    throw err;
+    if (!Array.isArray(document)) {
+      throw new Error('GitHub forks response must be an array');
+    }
+    if (document.length > 100) {
+      throw new Error('GitHub forks response page exceeds 100 entries');
+    }
+    document.forEach((raw, index) => {
+      const fork = assertForkRecord(
+        raw,
+        (page - 1) * 100 + index,
+        upstreamFullName
+      );
+      const key = fork.fullName.toLowerCase();
+      if (seen.has(key)) {
+        throw new Error(`GitHub forks response repeats ${fork.fullName}`);
+      }
+      seen.add(key);
+      if (fork.owner.toLowerCase() === exactForkOwner.toLowerCase()) {
+        matching.push(fork);
+      }
+    });
+    if (document.length < 100) break;
+    if (page === 10_000) {
+      throw new Error('GitHub forks response exceeds 1,000,000 entries');
+    }
   }
+  if (matching.length > 1) {
+    throw new Error(
+      `GitHub returned multiple forks owned by ${exactForkOwner}`
+    );
+  }
+  if (matching.length === 1) return matching[0].name;
+
+  const created = await githubRequest(
+    workerOrigin,
+    `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/forks`,
+    { token, method: 'POST', body: {} }
+  );
+  const fork = assertForkRecord(created, 'created', upstreamFullName);
+  if (fork.owner.toLowerCase() !== exactForkOwner.toLowerCase()) {
+    throw new Error(
+      `GitHub created the fork for ${fork.owner}, expected ${exactForkOwner}`
+    );
+  }
+  return fork.name;
+}
+
+function requireBranchTipSha(document, label) {
+  if (
+    !document ||
+    typeof document !== 'object' ||
+    Array.isArray(document) ||
+    !document.object ||
+    typeof document.object !== 'object' ||
+    Array.isArray(document.object)
+  ) {
+    throw new Error(`${label} must contain an object SHA`);
+  }
+  return assertGitHubSha(document.object.sha, `${label} object SHA`);
+}
+
+async function getBranchTipSha({ workerOrigin, owner, repo, token, branch }) {
+  const exactBranch = assertGitHubBranch(branch);
+  const ref = await githubRequest(
+    workerOrigin,
+    `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/ref/heads/${encodeGitRefPath(exactBranch)}`,
+    { token }
+  );
+  return requireBranchTipSha(ref, 'GitHub branch response');
 }
 
 async function ensureBranchExists({ workerOrigin, owner, repo, token, branch, baseSha }) {
-  const b = toCleanString(branch);
-  if (!b) throw new Error('PR branch required');
-  const sha = toCleanString(baseSha);
-  if (!sha) throw new Error('Unable to determine base SHA for PR branch');
+  const b = assertGitHubBranch(branch, 'Pull Request branch');
+  const sha = assertGitHubSha(baseSha, 'Pull Request base SHA');
   try {
-    await githubRequest(
+    const existing = await githubRequest(
       workerOrigin,
       `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/ref/heads/${encodeGitRefPath(b)}`,
       { token }
     );
+    requireBranchTipSha(existing, 'Existing Pull Request branch response');
     return;
   } catch (err) {
     if (err?.status !== 404) throw err;
   }
-  try {
-    await githubRequest(workerOrigin, `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/refs`, {
+  await githubRequest(
+    workerOrigin,
+    `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/refs`,
+    {
       token,
       method: 'POST',
       body: { ref: `refs/heads/${b}`, sha }
-    });
-  } catch (err) {
-    // If another publish created it concurrently, proceed.
-    if (err?.status !== 422) throw err;
-  }
+    }
+  );
 }
 
 async function upsertFileOnBranch({ workerOrigin, owner, repo, token, branch, path, message, contentBase64 }) {
-  const b = toCleanString(branch);
-  if (!b) throw new Error('branch required');
-  const p = toCleanString(path).replace(/^\/+/, '');
-  if (!p) throw new Error('path required');
+  const b = assertGitHubBranch(branch, 'Pull Request branch');
+  const p = assertExactNonblankString(path, 'Pull Request file path');
 
   let sha = null;
   try {
     const existing = await getContent({ workerOrigin, owner, repo, token, path: p, ref: b });
-    if (existing?.type === 'file') sha = toCleanString(existing?.sha || '') || null;
+    if (!existing || existing.type !== 'file') {
+      throw new Error(`Expected file at ${p}`);
+    }
+    sha = assertGitHubSha(existing.sha, `Existing ${p} SHA`);
   } catch (err) {
     if (err?.status !== 404) throw err;
   }
 
-  await putContentWithRetry({
+  await putContent({
     workerOrigin,
     owner,
     repo,
@@ -798,16 +904,7 @@ async function upsertFileOnBranch({ workerOrigin, owner, repo, token, branch, pa
     message,
     contentBase64,
     sha,
-    refForRefresh: b
   });
-}
-
-function formatPullRequestHeadForCreate({ upstreamOwner, headOwner, headBranch }) {
-  const u = toCleanString(upstreamOwner).toLowerCase();
-  const h = toCleanString(headOwner).toLowerCase();
-  const b = toCleanString(headBranch);
-  if (!b) throw new Error('headBranch required');
-  return u && h && u === h ? b : `${toCleanString(headOwner)}:${b}`;
 }
 
 async function openOrReusePullRequest({
@@ -822,109 +919,66 @@ async function openOrReusePullRequest({
   title,
   body
 }) {
-  const headQuery = `${toCleanString(headOwner)}:${toCleanString(headBranch)}`;
+  const exactHeadOwner = assertGitHubLogin(headOwner, 'Pull Request head owner');
+  const exactHeadBranch = assertGitHubBranch(
+    headBranch,
+    'Pull Request head branch'
+  );
+  const exactBaseBranch = assertGitHubBranch(
+    baseBranch,
+    'Pull Request base branch'
+  );
+  const exactTitle = assertExactNonblankString(
+    title,
+    'Pull Request title',
+    { max: 256 }
+  );
+  const exactBody = assertExactNonblankString(
+    body,
+    'Pull Request body',
+    { max: 65_536 }
+  );
+  const headQuery = `${exactHeadOwner}:${exactHeadBranch}`;
 
-  // If an open PR already exists for this head/base, reuse it (avoids PR spam).
-  try {
-    const existing = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/pulls`, {
+  const existing = await githubRequest(
+    workerOrigin,
+    `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/pulls`,
+    {
       token,
-      query: { state: 'open', head: headQuery, base: baseBranch, per_page: 5 }
-    });
-    const pr0 = Array.isArray(existing) ? existing[0] : null;
-    if (pr0) return { pr: pr0, reused: true };
-  } catch {
-    // ignore and fall through to creating a PR
+      query: {
+        state: 'open',
+        head: headQuery,
+        base: exactBaseBranch,
+        per_page: 100,
+      }
+    }
+  );
+  if (!Array.isArray(existing)) {
+    throw new Error('GitHub Pull Request lookup must return an array');
+  }
+  if (existing.length > 1) {
+    throw new Error('GitHub returned multiple open Pull Requests for one head');
+  }
+  if (existing.length === 1) {
+    return { pr: existing[0], reused: true };
   }
 
-  const prBody = toCleanString(body);
-  const headCreate = formatPullRequestHeadForCreate({ upstreamOwner, headOwner, headBranch });
-
-  let pr = null;
-  let reused = false;
-  try {
-    pr = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/pulls`, {
+  const pr = await githubRequest(
+    workerOrigin,
+    `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/pulls`,
+    {
       token,
       method: 'POST',
       body: {
-        title: toCleanString(title) || 'Update annotations',
-        head: headCreate,
-        base: baseBranch,
-        body: prBody || undefined,
+        title: exactTitle,
+        head: headQuery,
+        base: exactBaseBranch,
+        body: exactBody,
         maintainer_can_modify: true
       }
-    });
-  } catch (err) {
-    // GitHub returns 422 if a PR already exists for this head/base (sometimes even if closed).
-    if (err?.status !== 422) throw err;
-    try {
-      const prs = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/pulls`, {
-        token,
-        query: { state: 'all', head: headQuery, base: baseBranch, per_page: 10 }
-      });
-      const list = Array.isArray(prs) ? prs : [];
-      const existing = list.find((p) => p && p.number) || null;
-      if (!existing) throw err;
-      reused = true;
-
-      const mergedAt = toCleanString(existing?.merged_at || '');
-      if (existing?.state === 'closed' && mergedAt) {
-        reused = false;
-        const ref = await githubRequest(
-          workerOrigin,
-          `/repos/${encodeURIComponent(headOwner)}/${encodeURIComponent(headRepo)}/git/ref/heads/${encodeGitRefPath(headBranch)}`,
-          { token }
-        );
-        const headSha = toCleanString(ref?.object?.sha || '') || null;
-        if (!headSha) throw err;
-
-        let alt = null;
-        for (let attempt = 0; attempt < 5; attempt++) {
-          const suffix = `${Date.now().toString(36)}${attempt ? `_${attempt}` : ''}`;
-          alt = `${toCleanString(headBranch)}-${suffix}`;
-          try {
-            await githubRequest(workerOrigin, `/repos/${encodeURIComponent(headOwner)}/${encodeURIComponent(headRepo)}/git/refs`, {
-              token,
-              method: 'POST',
-              body: { ref: `refs/heads/${alt}`, sha: headSha }
-            });
-            break;
-          } catch (createErr) {
-            if (createErr?.status !== 422 || attempt === 4) throw createErr;
-          }
-        }
-
-        const headAlt = formatPullRequestHeadForCreate({ upstreamOwner, headOwner, headBranch: alt });
-        pr = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/pulls`, {
-          token,
-          method: 'POST',
-          body: {
-            title: toCleanString(title) || 'Update annotations',
-            head: headAlt,
-            base: baseBranch,
-            body: prBody || undefined,
-            maintainer_can_modify: true
-          }
-        });
-      } else if (existing?.state === 'closed') {
-        try {
-          pr = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/pulls/${encodeURIComponent(existing.number)}`, {
-            token,
-            method: 'PATCH',
-            body: { state: 'open' }
-          });
-        } catch {
-          // If reopen fails (permissions), still return the existing PR link so the user can act.
-          pr = existing;
-        }
-      } else {
-        pr = existing;
-      }
-    } catch (fallbackErr) {
-      throw fallbackErr || err;
     }
-  }
-
-  return { pr, reused };
+  );
+  return { pr, reused: false };
 }
 
 async function publishFileViaPullRequest({
@@ -941,17 +995,22 @@ async function publishFileViaPullRequest({
   body,
   contentBase64
 }) {
-  const upstreamSha = await getBranchTipShaOrNull({ workerOrigin, owner: upstreamOwner, repo: upstreamRepo, token, branch: baseBranch });
+  const upstreamSha = await getBranchTipSha({
+    workerOrigin,
+    owner: upstreamOwner,
+    repo: upstreamRepo,
+    token,
+    branch: baseBranch,
+  });
 
-  let baseSha = upstreamSha;
-  if (!baseSha) {
-    const headInfo = await getRepoInfo({ workerOrigin, owner: headOwner, repo: headRepo, token });
-    const fallback = toCleanString(headInfo?.default_branch || '') || 'main';
-    baseSha = await getBranchTipShaOrNull({ workerOrigin, owner: headOwner, repo: headRepo, token, branch: fallback });
-  }
-  if (!baseSha) throw new Error('Unable to determine base SHA for PR branch');
-
-  await ensureBranchExists({ workerOrigin, owner: headOwner, repo: headRepo, token, branch: headBranch, baseSha });
+  await ensureBranchExists({
+    workerOrigin,
+    owner: headOwner,
+    repo: headRepo,
+    token,
+    branch: headBranch,
+    baseSha: upstreamSha,
+  });
   await upsertFileOnBranch({
     workerOrigin,
     owner: headOwner,
@@ -976,21 +1035,145 @@ async function publishFileViaPullRequest({
     body
   });
 
-  return {
-    prUrl: toCleanString(pr?.html_url || '') || null,
-    prNumber: pr?.number ?? null,
-    reused
-  };
+  if (
+    !pr ||
+    typeof pr !== 'object' ||
+    Array.isArray(pr) ||
+    !Number.isSafeInteger(pr.number) ||
+    pr.number < 1
+  ) {
+    throw new Error('GitHub Pull Request response has an invalid number');
+  }
+  const prUrl = assertExactNonblankString(
+    pr.html_url,
+    'GitHub Pull Request html_url',
+    { max: 2048 }
+  );
+  let parsedPrUrl;
+  try {
+    parsedPrUrl = new URL(prUrl);
+  } catch (cause) {
+    const error = new Error('GitHub Pull Request html_url must be an HTTPS URL');
+    error.cause = cause;
+    throw error;
+  }
+  if (parsedPrUrl.protocol !== 'https:' || parsedPrUrl.toString() !== prUrl) {
+    throw new Error('GitHub Pull Request html_url must be an exact HTTPS URL');
+  }
+  return { prUrl, prNumber: pr.number, reused };
+}
+
+async function publishAnnotationFile({
+  publicationMode,
+  repoInfo,
+  workerOrigin,
+  token,
+  upstreamOwner,
+  upstreamRepo,
+  baseBranch,
+  datasetId,
+  fileUser,
+  path,
+  title,
+  body,
+  contentBase64,
+  sourceSha,
+}) {
+  const mode = assertPublicationMode(publicationMode);
+  const capability = assertRepositoryPublicationInfo(repoInfo);
+  if (mode === 'direct') {
+    if (!capability.canDirectPush) {
+      throw new Error(
+        'Direct annotation publication requires GitHub write permission'
+      );
+    }
+    const response = await putContent({
+      workerOrigin,
+      owner: upstreamOwner,
+      repo: upstreamRepo,
+      token,
+      path,
+      branch: baseBranch,
+      message: title,
+      contentBase64,
+      sha: sourceSha,
+    });
+    const rawSha = response?.content?.sha;
+    return {
+      mode,
+      sha: assertGitHubSha(rawSha, 'Published GitHub content SHA'),
+    };
+  }
+
+  if (!capability.allowForking) {
+    throw new Error(
+      'Fork Pull Request publication is disabled for this repository'
+    );
+  }
+  const authUser = assertAuthUserResponse(
+    await workerAuthRequest(workerOrigin, '/auth/user', { token })
+  );
+  const expectedFileUser = `ghid_${authUser.id}`;
+  if (fileUser !== null && fileUser !== expectedFileUser) {
+    throw new Error(
+      `Pull Request file identity must equal authenticated user ${expectedFileUser}`
+    );
+  }
+  const forkRepo = await selectOrCreateForkRepo({
+    workerOrigin,
+    upstreamOwner,
+    upstreamRepo,
+    token,
+    forkOwner: authUser.login,
+  });
+  const headBranch = toDeterministicPrBranch({
+    datasetId,
+    baseBranch,
+    fileUser: expectedFileUser,
+  });
+  const result = await publishFileViaPullRequest({
+    workerOrigin,
+    token,
+    upstreamOwner,
+    upstreamRepo,
+    baseBranch,
+    headOwner: authUser.login,
+    headRepo: forkRepo,
+    headBranch,
+    path,
+    title,
+    body,
+    contentBase64,
+  });
+  return { mode, ...result };
 }
 
 export class CommunityAnnotationGitHubSync {
   constructor({ datasetId, owner, repo, token = null, branch = null, workerOrigin = null } = {}) {
-    this.datasetId = toCleanString(datasetId) || null;
+    this.datasetId = assertExactNonblankString(
+      datasetId,
+      'Annotation sync datasetId',
+      { max: 256 }
+    );
+    if (
+      typeof owner !== 'string' ||
+      typeof repo !== 'string' ||
+      !isCanonicalGitHubAccount(owner) ||
+      !isCanonicalGitHubRepositoryName(repo)
+    ) {
+      throw new Error('Annotation sync owner and repo must be exact GitHub names');
+    }
     this.owner = owner;
     this.repo = repo;
-    this.token = token;
-    this.branch = branch;
-    this.workerOrigin = toCleanString(workerOrigin) || getGitHubWorkerOrigin();
+    this.token = assertOptionalToken(token);
+    this.branch = branch === null ? null : assertGitHubBranch(branch);
+    const configuredOrigin = workerOrigin === null
+      ? getGitHubWorkerOrigin()
+      : workerOrigin;
+    this.workerOrigin = assertExactHttpOrigin(
+      configuredOrigin,
+      'GitHub worker origin'
+    );
 
     this._schemaCheckedRef = null;
     this._repoInfo = null;
@@ -1005,35 +1188,40 @@ export class CommunityAnnotationGitHubSync {
     if (!token) throw new Error('GitHub sign-in required');
     const workerOrigin = this.workerOrigin;
     const repoInfo = await getRepoInfo({ workerOrigin, owner: this.owner, repo: this.repo, token });
-    this._repoInfo = repoInfo || null;
-    let branch = this.branch || repoInfo?.default_branch || 'main';
-
-    // If the branch came from a GitHub "/tree/<ref>/path" paste, it may include extra path segments
-    // (and ref names can include slashes). Resolve the actual branch by probing git refs.
-    if (branch && branch.includes('/')) {
-      try {
-        const resolved = await this.resolveBranchFromTreeRefPath(branch);
-        if (resolved) branch = resolved;
-      } catch {
-        // ignore and fall through to normal validation (which will surface a clear error)
-      }
-    }
+    assertRepositoryPublicationInfo(repoInfo);
+    this._repoInfo = repoInfo;
+    const branch = this.branch === null
+      ? assertGitHubBranch(
+        repoInfo.default_branch,
+        'GitHub repository default_branch'
+      )
+      : this.branch;
 
     this.branch = branch;
 
-    // Basic structural checks expected by the template.
-    // Note: we intentionally avoid listing `annotations/users/` via the Contents API because
-    // large directories can fail or be truncated; `pullAllUsers()` uses the git tree API.
+    // Validate the complete, exact contract published by the repository.
     if (this._schemaCheckedRef !== branch) {
-      const { json: schema } = await readJsonFile({
-        workerOrigin,
-        owner: this.owner,
-        repo: this.repo,
-        token,
-        path: 'annotations/schema.json',
-        ref: branch
+      const schemaSpecs = [
+        ['user', 'annotations/schema.json'],
+        ['config', 'annotations/config.schema.json'],
+        ['merges', 'annotations/moderation/merges.schema.json'],
+      ];
+      const schemas = await Promise.all(
+        schemaSpecs.map(async ([kind, path]) => {
+          const { json } = await readJsonFile({
+            workerOrigin,
+            owner: this.owner,
+            repo: this.repo,
+            token,
+            path,
+            ref: branch,
+          });
+          return { kind, path, json };
+        })
+      );
+      schemas.forEach(({ kind, path, json }) => {
+        assertSchemaIdentity(json, kind, { path });
       });
-      assertSupportedUserFileSchema(schema, { path: 'annotations/schema.json' });
       this._schemaCheckedRef = branch;
     }
 
@@ -1045,51 +1233,29 @@ export class CommunityAnnotationGitHubSync {
       path: 'annotations/config.json',
       ref: branch
     });
+    assertConfigDocument(config, { path: 'annotations/config.json' });
 
-    const targetDatasetId = toCleanString(datasetId ?? this.datasetId ?? '') || null;
-    const supported = Array.isArray(config?.supportedDatasets) ? config.supportedDatasets : [];
-    const match = targetDatasetId
-      ? supported.find((d) => toCleanString(d?.datasetId) === targetDatasetId) || null
-      : null;
+    const targetDatasetId = datasetId === undefined
+      ? this.datasetId
+      : assertExactNonblankString(
+        datasetId,
+        'Annotation config datasetId',
+        { max: 256 }
+      );
+    const supported = config.supportedDatasets;
+    const match =
+      supported.find((entry) => entry.datasetId === targetDatasetId) ?? null;
 
     return { repoInfo, branch, config, configSha: configSha || null, datasetId: targetDatasetId, datasetConfig: match };
-  }
-
-  async resolveBranchFromTreeRefPath(treeRefPath, { maxSegments = 40 } = {}) {
-    const token = this.token;
-    if (!token) throw new Error('GitHub sign-in required');
-
-    const raw = toCleanString(treeRefPath);
-    if (!raw) return null;
-
-    const parts = raw.split('/').map((s) => toCleanString(s)).filter(Boolean);
-    if (!parts.length) return null;
-
-    const cap = Math.max(1, Math.min(parts.length, Math.floor(Number(maxSegments) || 12)));
-    const workerOrigin = this.workerOrigin;
-
-    for (let n = cap; n >= 1; n--) {
-      const candidate = parts.slice(0, n).join('/');
-      try {
-        await githubRequest(
-          workerOrigin,
-          `/repos/${encodeURIComponent(this.owner)}/${encodeURIComponent(this.repo)}/git/ref/${encodeGitRefPath(`heads/${candidate}`)}`,
-          { token }
-        );
-        return candidate;
-      } catch (err) {
-        if (err?.status === 404) continue;
-        throw err;
-      }
-    }
-
-    return null;
   }
 
   async readRepoConfigJson() {
     const token = this.token;
     if (!token) throw new Error('GitHub sign-in required');
-    const branch = this.branch || 'main';
+    const branch = assertGitHubBranch(
+      this.branch,
+      'Resolved annotation repository branch'
+    );
     return readJsonFile({
       workerOrigin: this.workerOrigin,
       owner: this.owner,
@@ -1102,68 +1268,44 @@ export class CommunityAnnotationGitHubSync {
 
   async updateDatasetFieldsToAnnotate({
     datasetId,
+    datasetName,
     fieldsToAnnotate,
-    annotatableSettings = null,
-    closedFields = null,
+    annotatableSettings,
+    closedFields,
     commitMessage = null,
     conflictIfRemoteShaNotEqual = null,
-    force = false
+    publicationMode,
   } = {}) {
+    const mode = assertPublicationMode(publicationMode);
     const token = this.token;
     if (!token) throw new Error('GitHub sign-in required');
 
     const { repoInfo, branch } = await this.validateAndLoadConfig({ datasetId });
-    const perms = repoInfo?.permissions || null;
-    const canManage = perms ? Boolean(perms.maintain || perms.admin) : false;
-    if (!canManage) throw new Error('Maintain/admin access required to update annotations/config.json');
+    const capability = assertRepositoryPublicationInfo(repoInfo);
+    if (!capability.canManage) {
+      throw new Error(
+        'Maintain/admin access required to update annotations/config.json'
+      );
+    }
 
-    const did = toCleanString(datasetId ?? this.datasetId ?? '') || null;
-    if (!did) throw new Error('datasetId required');
+    const did = datasetId === undefined
+      ? this.datasetId
+      : assertExactNonblankString(datasetId, 'datasetId', { max: 256 });
 
-    const cleanedFields = Array.isArray(fieldsToAnnotate)
-      ? fieldsToAnnotate
-          .map((v) => toCleanString(v))
-          .filter(Boolean)
-          .slice(0, 200)
-      : [];
-
-    const cleanSettings = (settings) => {
-      const input = (settings && typeof settings === 'object') ? settings : {};
-      const out = {};
-      for (const [fieldKey, raw] of Object.entries(input)) {
-        const k = toCleanString(fieldKey);
-        if (!k) continue;
-        const minAnnotators = Number.isFinite(Number(raw?.minAnnotators))
-          ? Math.max(0, Math.min(50, Math.floor(Number(raw.minAnnotators))))
-          : 1;
-        const thresholdRaw = Number(raw?.threshold);
-        const threshold = Number.isFinite(thresholdRaw) ? Math.max(-1, Math.min(1, thresholdRaw)) : 0.5;
-        out[k] = { minAnnotators, threshold };
-      }
-      return out;
-    };
-
-    const cleanClosed = (values) => {
-      const input = Array.isArray(values) ? values : [];
-      const out = [];
-      const seen = new Set();
-      for (const v of input.slice(0, 500)) {
-        const k = toCleanString(v);
-        if (!k || seen.has(k)) continue;
-        seen.add(k);
-        out.push(k);
-      }
-      return out;
-    };
-
-    // Only persist settings for fields that are currently annotatable.
-    const settingsMap = cleanSettings(annotatableSettings);
-
-    const msg = toCleanString(commitMessage) || `Update annotatable fields for ${did}`;
-
-    const expectedSha = toCleanString(conflictIfRemoteShaNotEqual) || null;
-
-    const { json: current, sha } = await readJsonFileOrNull({
+    const msg = commitMessage === null
+      ? `Update annotatable fields for ${did}`
+      : assertExactNonblankString(
+        commitMessage,
+        'Annotation config commit message',
+        { max: 256 }
+      );
+    const expectedSha = conflictIfRemoteShaNotEqual === null
+      ? null
+      : assertGitHubSha(
+        conflictIfRemoteShaNotEqual,
+        'Expected annotation config SHA'
+      );
+    const { json: current, sha } = await readJsonFile({
       workerOrigin: this.workerOrigin,
       owner: this.owner,
       repo: this.repo,
@@ -1171,133 +1313,96 @@ export class CommunityAnnotationGitHubSync {
       path: 'annotations/config.json',
       ref: branch
     });
+    assertConfigDocument(current, { path: 'annotations/config.json' });
 
-    if (!force) {
-      if (!expectedSha) {
-        const err = new Error(
-          'Missing baseline version for annotations/config.json.\n' +
-          'Pull first to load the latest config, then Publish again.'
-        );
-        err.code = 'COMMUNITY_ANNOTATION_CONFLICT';
-        err.path = 'annotations/config.json';
-        err.remoteSha = sha || null;
-        err.expectedSha = null;
-        throw err;
-      }
-      if (sha !== expectedSha) {
-        const err = new Error(
-          'annotations/config.json changed since your last Pull.\n' +
-          'Pull first to review/merge the latest settings, then Publish again.'
-        );
-        err.code = 'COMMUNITY_ANNOTATION_CONFLICT';
-        err.path = 'annotations/config.json';
-        err.remoteSha = sha || null;
-        err.expectedSha = expectedSha;
-        throw err;
-      }
+    if (!expectedSha) {
+      const err = new Error(
+        'Missing baseline version for annotations/config.json.\n' +
+        'Pull first to load the latest config, then Publish again.'
+      );
+      err.code = 'COMMUNITY_ANNOTATION_CONFLICT';
+      err.path = 'annotations/config.json';
+      err.remoteSha = sha || null;
+      err.expectedSha = null;
+      throw err;
+    }
+    if (sha !== expectedSha) {
+      const err = new Error(
+        'annotations/config.json changed since your last Pull.\n' +
+        'Pull first to review the latest settings, then Publish again.'
+      );
+      err.code = 'COMMUNITY_ANNOTATION_CONFLICT';
+      err.path = 'annotations/config.json';
+      err.remoteSha = sha || null;
+      err.expectedSha = expectedSha;
+      throw err;
     }
 
-    const nextConfig = (current && typeof current === 'object')
-      ? { ...current }
-      : { version: 1, supportedDatasets: [] };
-    if (!Array.isArray(nextConfig.supportedDatasets)) nextConfig.supportedDatasets = [];
-
-    let found = false;
-    nextConfig.supportedDatasets = nextConfig.supportedDatasets.map((d) => {
-      if (!d || typeof d !== 'object') return d;
-      const dId = toCleanString(d.datasetId);
-      if (dId !== did) return d;
-      found = true;
-      const next = { ...d, fieldsToAnnotate: cleanedFields };
-      if (annotatableSettings != null) {
-        const merged = { ...cleanSettings(d.annotatableSettings), ...settingsMap };
-        const pruned = {};
-        for (const k of cleanedFields) {
-          if (merged[k]) pruned[k] = merged[k];
-        }
-        next.annotatableSettings = pruned;
-      }
-      if (closedFields != null) {
-        const merged = uniqueStrings(cleanClosed(d.closedFields).concat(cleanClosed(closedFields)));
-        next.closedFields = merged.filter((k) => cleanedFields.includes(k)).slice(0, 500);
-      }
-      return next;
-    });
-
-    if (!found) {
-      const pruned = {};
-      for (const k of cleanedFields) {
-        if (settingsMap[k]) pruned[k] = settingsMap[k];
-      }
-      const prunedClosed = closedFields != null
-        ? cleanClosed(closedFields).filter((k) => cleanedFields.includes(k)).slice(0, 500)
-        : undefined;
-      nextConfig.supportedDatasets = nextConfig.supportedDatasets.concat([
-        {
-          datasetId: did,
-          name: did,
-          fieldsToAnnotate: cleanedFields,
-          ...(annotatableSettings != null ? { annotatableSettings: pruned } : {}),
-          ...(closedFields != null ? { closedFields: prunedClosed } : {})
-        }
-      ]);
-    }
+    const existing = current.supportedDatasets.find((entry) => entry.datasetId === did) || null;
+    const name = datasetName === undefined ? existing?.name : datasetName;
+    const replacement = {
+      datasetId: did,
+      name,
+      fieldsToAnnotate,
+      annotatableSettings,
+      closedFields,
+    };
+    const nextConfig = {
+      version: 1,
+      supportedDatasets: existing
+        ? current.supportedDatasets.map((entry) =>
+          entry.datasetId === did ? replacement : entry
+        )
+        : [...current.supportedDatasets, replacement],
+    };
+    assertConfigDocument(nextConfig, { path: 'annotations/config.json publish payload' });
 
     // Avoid no-op commits: compare semantic JSON ignoring key order.
-    if (current && typeof current === 'object') {
-      const changed = stableStringifyJson(current) !== stableStringifyJson(nextConfig);
-      if (!changed) {
-        const retSettings = {};
-        for (const k of cleanedFields) {
-          if (settingsMap[k]) retSettings[k] = settingsMap[k];
-        }
-        const retClosed = closedFields != null
-          ? cleanClosed(closedFields).filter((k) => cleanedFields.includes(k)).slice(0, 500)
-          : [];
-        return {
-          branch,
-          path: 'annotations/config.json',
-          sha: sha || null,
-          datasetId: did,
-          fieldsToAnnotate: cleanedFields,
-          annotatableSettings: retSettings,
-          closedFields: retClosed,
-          changed: false
-        };
-      }
+    const changed = stableStringifyJson(current) !== stableStringifyJson(nextConfig);
+    if (!changed) {
+      return {
+        mode: 'none',
+        branch,
+        path: 'annotations/config.json',
+        sha: sha || null,
+        ...replacement,
+        changed: false
+      };
     }
 
-    const contentBase64 = encodeBase64Utf8(JSON.stringify(nextConfig, null, 2) + '\n');
+    const contentBase64 = encodeBase64Utf8(
+      JSON.stringify(nextConfig, null, 2) + '\n'
+    );
     try {
-      const res = await putContent({
+      const result = await publishAnnotationFile({
+        publicationMode: mode,
+        repoInfo,
         workerOrigin: this.workerOrigin,
-        owner: this.owner,
-        repo: this.repo,
         token,
-        path: 'annotations/config.json',
-        branch,
-        message: msg,
-        contentBase64,
-        sha
-      });
-      const newSha = toCleanString(res?.content?.sha || res?.sha || '') || null;
-      const retSettings = {};
-      for (const k of cleanedFields) {
-        if (settingsMap[k]) retSettings[k] = settingsMap[k];
-      }
-      return {
-        mode: 'push',
-        branch,
-        path: 'annotations/config.json',
-        sha: newSha,
+        upstreamOwner: this.owner,
+        upstreamRepo: this.repo,
+        baseBranch: branch,
         datasetId: did,
-        fieldsToAnnotate: cleanedFields,
-        annotatableSettings: retSettings,
-        closedFields: closedFields != null ? cleanClosed(closedFields).filter((k) => cleanedFields.includes(k)).slice(0, 500) : [],
+        fileUser: null,
+        path: 'annotations/config.json',
+        title: msg,
+        body: [
+          'Community annotation configuration update from Cellucid.',
+          '',
+          'File: `annotations/config.json`',
+        ].join('\n'),
+        contentBase64,
+        sourceSha: sha,
+      });
+      return {
+        ...result,
+        branch,
+        path: 'annotations/config.json',
+        ...replacement,
         changed: true
       };
     } catch (err) {
-      if (!force && isShaMismatchError(err)) {
+      if (isContentConflictError(err)) {
         const conflict = new Error(
           'annotations/config.json changed while publishing.\n' +
           'Pull first to review/merge the latest settings, then Publish again.'
@@ -1306,125 +1411,110 @@ export class CommunityAnnotationGitHubSync {
         conflict.path = 'annotations/config.json';
         throw conflict;
       }
-
-      if (!(isWriteDeniedError(err) || isProtectedBranchError(err))) throw err;
-
-      const me = await workerAuthRequest(this.workerOrigin, '/auth/user', { token });
-      const meLogin = toCleanString(me?.login || '');
-      if (!meLogin) throw err;
-
-      const prBranch = toDeterministicPrBranch({ datasetId: did, baseBranch: branch, fileUser: `${meLogin}-config` });
-      const prBody = [
-        'Automated community annotation config update from Cellucid.',
-        '',
-        `User: @${meLogin}`,
-        'File: `annotations/config.json`'
-      ].join('\n');
-
-      const prRes = await publishFileViaPullRequest({
-        workerOrigin: this.workerOrigin,
-        token,
-        upstreamOwner: this.owner,
-        upstreamRepo: this.repo,
-        baseBranch: branch,
-        headOwner: this.owner,
-        headRepo: this.repo,
-        headBranch: prBranch,
-        path: 'annotations/config.json',
-        title: msg,
-        body: prBody,
-        contentBase64
-      });
-
-      const retSettings = {};
-      for (const k of cleanedFields) {
-        if (settingsMap[k]) retSettings[k] = settingsMap[k];
-      }
-
-      return {
-        mode: 'pr',
-        branch,
-        path: 'annotations/config.json',
-        sha: sha || null,
-        datasetId: did,
-        fieldsToAnnotate: cleanedFields,
-        annotatableSettings: retSettings,
-        closedFields: closedFields != null ? cleanClosed(closedFields).filter((k) => cleanedFields.includes(k)).slice(0, 500) : [],
-        changed: true,
-        prUrl: prRes?.prUrl || null,
-        prNumber: prRes?.prNumber ?? null,
-        reused: Boolean(prRes?.reused)
-      };
+      throw err;
     }
-
-    // Unreachable (returns above).
   }
 
   async pullModerationMerges({ knownShas = null } = {}) {
     const token = this.token;
     if (!token) throw new Error('GitHub sign-in required');
-    const branch = this.branch || 'main';
+    const branch = assertGitHubBranch(
+      this.branch,
+      'Resolved annotation repository branch'
+    );
     const workerOrigin = this.workerOrigin;
     const path = 'annotations/moderation/merges.json';
-    const known = (knownShas && typeof knownShas === 'object') ? knownShas : null;
+    if (
+      knownShas !== null &&
+      (
+        typeof knownShas !== 'object' ||
+        Array.isArray(knownShas)
+      )
+    ) {
+      throw new Error('Known annotation SHAs must be a JSON object or null');
+    }
+    const previousSha =
+      knownShas !== null && Object.hasOwn(knownShas, path)
+        ? assertGitHubSha(knownShas[path], `Known SHA for ${path}`)
+        : null;
     try {
-      const entries = await listDir({
+      const content = await getContent({
         workerOrigin,
         owner: this.owner,
         repo: this.repo,
         token,
-        path: 'annotations/moderation',
+        path,
         ref: branch
       });
-      const file = Array.isArray(entries)
-        ? entries.find((e) => e?.type === 'file' && toCleanString(e?.name) === 'merges.json')
-        : null;
-      const sha = toCleanString(file?.sha) || null;
-      if (!file) return { doc: null, sha: null, path, fetched: false };
-      const prev = known ? toCleanString(known[path] || '') : '';
-      if (sha && prev && sha === prev) return { doc: null, sha, path, fetched: false };
-
-      try {
-        const { json } = await readJsonFile({
-          workerOrigin,
-          owner: this.owner,
-          repo: this.repo,
-          token,
-          path,
-          ref: branch
-        });
-        return { doc: json, sha, path, fetched: true };
-      } catch (err) {
-        // Treat invalid JSON as a recoverable case so callers can cache the SHA and surface UX.
-        const msg = err?.message || String(err);
-        if (/invalid json/i.test(String(msg))) {
-          return { doc: { __invalid: true, __error: msg }, sha, path, fetched: true };
-        }
-        throw err;
+      if (!content || content.type !== 'file') {
+        throw new Error(`Expected file at ${path}`);
       }
+      const sha = assertGitHubSha(content.sha, `${path} SHA`);
+      if (previousSha === sha) {
+        return { doc: null, sha, path, fetched: false };
+      }
+      const { json } = decodeJsonContentFile(content, path);
+      assertMergesDocument(json, { path });
+      return { doc: json, sha, path, fetched: true };
     } catch (err) {
       if (isNotFoundError(err)) return { doc: null, sha: null, path, fetched: false };
       throw err;
     }
   }
 
-  async pushModerationMerges({ mergesDoc, commitMessage = null, conflictIfRemoteShaNotEqual = null, force = false } = {}) {
+  async pushModerationMerges({
+    mergesDoc,
+    commitMessage = null,
+    conflictIfRemoteShaNotEqual = null,
+    publicationMode,
+  } = {}) {
+    const mode = assertPublicationMode(publicationMode);
     const token = this.token;
     if (!token) throw new Error('GitHub sign-in required');
 
-    const repoInfo = this._repoInfo || await getRepoInfo({ workerOrigin: this.workerOrigin, owner: this.owner, repo: this.repo, token });
-    this._repoInfo = repoInfo || null;
-    const perms = repoInfo?.permissions || null;
-    const canManage = perms ? Boolean(perms.maintain || perms.admin) : false;
-    if (!canManage) throw new Error('Maintain/admin access required to publish moderation merges');
+    const repoInfo =
+      this._repoInfo === null
+        ? await getRepoInfo({
+            workerOrigin: this.workerOrigin,
+            owner: this.owner,
+            repo: this.repo,
+            token,
+          })
+        : this._repoInfo;
+    const capability = assertRepositoryPublicationInfo(repoInfo);
+    this._repoInfo = repoInfo;
+    if (!capability.canManage) {
+      throw new Error(
+        'Maintain/admin access required to publish moderation merges'
+      );
+    }
 
-    const branch = this.branch || repoInfo?.default_branch || 'main';
+    const branch = this.branch === null
+      ? assertGitHubBranch(
+        repoInfo?.default_branch,
+        'GitHub repository default_branch'
+      )
+      : assertGitHubBranch(this.branch);
     this.branch = branch;
 
-    const msg = toCleanString(commitMessage) || 'Update annotation moderation merges';
-    const incoming = normalizeModerationMergesDoc(mergesDoc && typeof mergesDoc === 'object' ? mergesDoc : {});
+    const msg = commitMessage === null
+      ? 'Update annotation moderation merges'
+      : assertExactNonblankString(
+        commitMessage,
+        'Moderation merges commit message',
+        { max: 256 }
+      );
+    assertMergesDocument(mergesDoc, {
+      path: 'annotations/moderation/merges.json publish payload',
+    });
+    const incoming = mergesDoc;
 
-    const expectedSha = toCleanString(conflictIfRemoteShaNotEqual) || null;
+    const expectedSha = conflictIfRemoteShaNotEqual === null
+      ? null
+      : assertGitHubSha(
+        conflictIfRemoteShaNotEqual,
+        'Expected moderation merges SHA'
+      );
 
     const { json: current, sha } = await readJsonFileOrNull({
       workerOrigin: this.workerOrigin,
@@ -1435,58 +1525,80 @@ export class CommunityAnnotationGitHubSync {
       ref: branch
     });
 
-    if (!force) {
-      // If the remote file exists, require a baseline SHA from the last Pull to avoid overwrites.
-      if (!expectedSha && sha) {
-        const err = new Error(
-          'Missing baseline version for annotations/moderation/merges.json.\n' +
-          'Pull first to load the latest merges, then Publish again.'
-        );
-        err.code = 'COMMUNITY_ANNOTATION_CONFLICT';
-        err.path = 'annotations/moderation/merges.json';
-        err.remoteSha = sha || null;
-        err.expectedSha = null;
-        throw err;
-      }
-      if (expectedSha && sha !== expectedSha) {
-        const err = new Error(
-          'annotations/moderation/merges.json changed since your last Pull.\n' +
-          'Pull first to review the latest merges, then Publish again.'
-        );
-        err.code = 'COMMUNITY_ANNOTATION_CONFLICT';
-        err.path = 'annotations/moderation/merges.json';
-        err.remoteSha = sha || null;
-        err.expectedSha = expectedSha;
-        throw err;
-      }
+    // If the remote file exists, require a baseline SHA from the last Pull.
+    if (!expectedSha && sha) {
+      const err = new Error(
+        'Missing baseline version for annotations/moderation/merges.json.\n' +
+        'Pull first to load the latest merges, then Publish again.'
+      );
+      err.code = 'COMMUNITY_ANNOTATION_CONFLICT';
+      err.path = 'annotations/moderation/merges.json';
+      err.remoteSha = sha || null;
+      err.expectedSha = null;
+      throw err;
+    }
+    if (expectedSha && sha !== expectedSha) {
+      const err = new Error(
+        'annotations/moderation/merges.json changed since your last Pull.\n' +
+        'Pull first to review the latest merges, then Publish again.'
+      );
+      err.code = 'COMMUNITY_ANNOTATION_CONFLICT';
+      err.path = 'annotations/moderation/merges.json';
+      err.remoteSha = sha || null;
+      err.expectedSha = expectedSha;
+      throw err;
     }
 
-    const currentNorm = (current && typeof current === 'object') ? normalizeModerationMergesDoc(current) : null;
-    const currentComparable = currentNorm ? { version: 1, merges: Array.isArray(currentNorm?.merges) ? currentNorm.merges : [] } : null;
-    const nextComparable = { version: 1, merges: Array.isArray(incoming?.merges) ? incoming.merges : [] };
+    if (current !== null) {
+      assertMergesDocument(current, { path: 'annotations/moderation/merges.json' });
+    }
+    const currentComparable = current
+      ? { version: current.version, merges: current.merges }
+      : null;
+    const nextComparable = { version: incoming.version, merges: incoming.merges };
     const changed = stableStringifyJson(currentComparable) !== stableStringifyJson(nextComparable);
     if (!changed) {
-      return { branch, path: 'annotations/moderation/merges.json', sha: sha || null, changed: false };
+      return {
+        mode: 'none',
+        branch,
+        path: 'annotations/moderation/merges.json',
+        sha: sha || null,
+        changed: false,
+      };
     }
 
-    const docToWrite = { version: 1, updatedAt: nowIso(), merges: nextComparable.merges };
-    const contentBase64 = encodeBase64Utf8(JSON.stringify(docToWrite, null, 2) + '\n');
+    const contentBase64 = encodeBase64Utf8(
+      JSON.stringify(incoming, null, 2) + '\n'
+    );
     try {
-      const res = await putContent({
+      const result = await publishAnnotationFile({
+        publicationMode: mode,
+        repoInfo,
         workerOrigin: this.workerOrigin,
-        owner: this.owner,
-        repo: this.repo,
         token,
+        upstreamOwner: this.owner,
+        upstreamRepo: this.repo,
+        baseBranch: branch,
+        datasetId: this.datasetId,
+        fileUser: null,
         path: 'annotations/moderation/merges.json',
-        branch,
-        message: msg,
+        title: msg,
+        body: [
+          'Community annotation moderation update from Cellucid.',
+          '',
+          'File: `annotations/moderation/merges.json`',
+        ].join('\n'),
         contentBase64,
-        sha
+        sourceSha: sha,
       });
-      const newSha = toCleanString(res?.content?.sha || res?.sha || '') || null;
-      return { mode: 'push', branch, path: 'annotations/moderation/merges.json', sha: newSha, changed: true };
+      return {
+        ...result,
+        branch,
+        path: 'annotations/moderation/merges.json',
+        changed: true,
+      };
     } catch (err) {
-      if (!force && isShaMismatchError(err)) {
+      if (isContentConflictError(err)) {
         const conflict = new Error(
           'annotations/moderation/merges.json changed while publishing.\n' +
           'Pull first to review the latest merges, then Publish again.'
@@ -1495,109 +1607,117 @@ export class CommunityAnnotationGitHubSync {
         conflict.path = 'annotations/moderation/merges.json';
         throw conflict;
       }
-
-      if (!(isWriteDeniedError(err) || isProtectedBranchError(err))) throw err;
-
-      const me = await workerAuthRequest(this.workerOrigin, '/auth/user', { token });
-      const meLogin = toCleanString(me?.login || '');
-      if (!meLogin) throw err;
-
-      const prBranch = toDeterministicPrBranch({
-        datasetId: this.datasetId || 'default',
-        baseBranch: branch,
-        fileUser: `${meLogin}-merges`
-      });
-      const prBody = [
-        'Automated community annotation moderation merges update from Cellucid.',
-        '',
-        `User: @${meLogin}`,
-        'File: `annotations/moderation/merges.json`'
-      ].join('\n');
-
-      const prRes = await publishFileViaPullRequest({
-        workerOrigin: this.workerOrigin,
-        token,
-        upstreamOwner: this.owner,
-        upstreamRepo: this.repo,
-        baseBranch: branch,
-        headOwner: this.owner,
-        headRepo: this.repo,
-        headBranch: prBranch,
-        path: 'annotations/moderation/merges.json',
-        title: msg,
-        body: prBody,
-        contentBase64
-      });
-
-      return {
-        mode: 'pr',
-        branch,
-        path: 'annotations/moderation/merges.json',
-        sha: sha || null,
-        changed: true,
-        prUrl: prRes?.prUrl || null,
-        prNumber: prRes?.prNumber ?? null,
-        reused: Boolean(prRes?.reused)
-      };
+      throw err;
     }
   }
 
   async getAuthenticatedUser() {
     const token = this.token;
     if (!token) return null;
-    try {
-      return await workerAuthRequest(this.workerOrigin, '/auth/user', { token });
-    } catch {
-      return null;
-    }
+    return assertAuthUserResponse(
+      await workerAuthRequest(this.workerOrigin, '/auth/user', { token })
+    );
   }
 
   async pullAllUsers({ knownShas = null } = {}) {
     const token = this.token;
     if (!token) throw new Error('GitHub sign-in required');
-    const branch = this.branch || 'main';
+    const branch = assertGitHubBranch(
+      this.branch,
+      'Resolved annotation repository branch'
+    );
     const workerOrigin = this.workerOrigin;
 
     const tree = await getGitTreeRecursive({ workerOrigin, owner: this.owner, repo: this.repo, token, ref: branch });
-    const userBlobs = tree.filter((e) => {
-      const path = toCleanString(e?.path || '');
-      if (!path) return false;
-      return e?.type === 'blob' && /^annotations\/users\/ghid_\d+\.json$/i.test(path);
-    });
+    if (!Array.isArray(tree)) {
+      throw new Error('Git tree response must contain an array');
+    }
+    const userBlobs = [];
+    for (const entry of tree) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        throw new Error('Git tree entries must be objects');
+      }
+      const path = entry.path;
+      if (
+        typeof path !== 'string' ||
+        !path ||
+        /^\s|\s$/.test(path)
+      ) {
+        throw new Error('Git tree entry path must be an exact nonblank string');
+      }
+      if (!path.startsWith('annotations/users/')) continue;
+      if (
+        entry.type !== 'blob' ||
+        !/^annotations\/users\/ghid_[1-9][0-9]*\.json$/.test(path)
+      ) {
+        throw new Error(
+          `Invalid annotation user-file path ${JSON.stringify(path)}; ` +
+          'expected annotations/users/ghid_<positive-github-id>.json'
+        );
+      }
+      userBlobs.push(entry);
+    }
 
     /** @type {Record<string, string>} */
     const nextShas = {};
     for (const f of userBlobs) {
-      const path = toCleanString(f?.path || '');
-      const sha = toCleanString(f?.sha || '');
-      if (!path || !sha) continue;
+      const path = f.path;
+      const sha = assertGitHubSha(
+        f.sha,
+        `Git tree SHA for ${JSON.stringify(path)}`
+      );
+      if (Object.hasOwn(nextShas, path)) {
+        throw new Error(`Git tree contains duplicate path ${JSON.stringify(path)}`);
+      }
       nextShas[path] = sha;
     }
 
-    const known = (knownShas && typeof knownShas === 'object') ? knownShas : null;
+    if (
+      knownShas !== null &&
+      (
+        typeof knownShas !== 'object' ||
+        Array.isArray(knownShas)
+      )
+    ) {
+      throw new Error('Known annotation SHAs must be a JSON object or null');
+    }
+    if (knownShas !== null) {
+      for (const [path, sha] of Object.entries(knownShas)) {
+        if (
+          path !== 'annotations/config.json' &&
+          path !== 'annotations/moderation/merges.json' &&
+          !/^annotations\/users\/ghid_[1-9][0-9]*\.json$/.test(path)
+        ) {
+          throw new Error(
+            `Known annotation SHA path is invalid: ${JSON.stringify(path)}`
+          );
+        }
+        assertGitHubSha(sha, `Known SHA for ${path}`);
+      }
+    }
     const needsFetch = (path, sha) => {
-      if (!known) return true;
-      const prev = toCleanString(known[path] || '');
-      return !prev || prev !== sha;
+      if (knownShas === null || !Object.hasOwn(knownShas, path)) return true;
+      return knownShas[path] !== sha;
     };
 
     const allPaths = Object.keys(nextShas).sort((a, b) => a.localeCompare(b));
     const toFetch = allPaths.filter((path) => needsFetch(path, nextShas[path]));
 
     const concurrency = DEFAULT_USER_PULL_CONCURRENCY;
-    const out = (await mapWithConcurrency(toFetch, concurrency, async (path) => {
+    const out = await mapWithConcurrency(toFetch, concurrency, async (path) => {
       const sha = nextShas[path] || null;
-      const fileUser = toCleanString(path.split('/').pop() || '').replace(/\.json$/i, '') || null;
-      try {
-        const json = await getGitBlobJson({ workerOrigin, owner: this.owner, repo: this.repo, token, sha });
-        return (json && typeof json === 'object')
-          ? { ...json, __path: path, __fileUser: fileUser, __sha: sha || null }
-          : { __invalid: true, __path: path, __fileUser: fileUser, __sha: sha || null, __error: 'Invalid JSON shape (expected object)' };
-      } catch (err) {
-        const msg = err?.message || String(err);
-        return { __invalid: true, __path: path, __fileUser: fileUser, __sha: sha || null, __error: msg || 'Failed to load blob' };
-      }
-    })).filter(Boolean);
+      const filename = path.split('/').pop();
+      const json = await getGitBlobJson({
+        workerOrigin,
+        owner: this.owner,
+        repo: this.repo,
+        token,
+        sha,
+        path,
+      });
+      assertUserDocument(json, { path, filename });
+      return { path, sha, doc: json };
+    });
 
     return {
       docs: out,
@@ -1611,7 +1731,10 @@ export class CommunityAnnotationGitHubSync {
   async pullUserFile({ userKey = null } = {}) {
     const token = this.token;
     if (!token) throw new Error('GitHub sign-in required');
-    const branch = this.branch || 'main';
+    const branch = assertGitHubBranch(
+      this.branch,
+      'Resolved annotation repository branch'
+    );
     const workerOrigin = this.workerOrigin;
 
     const key = sanitizeUserKeyForPath(userKey);
@@ -1627,10 +1750,8 @@ export class CommunityAnnotationGitHubSync {
         path,
         ref: branch
       });
-      const doc = (json && typeof json === 'object')
-        ? { ...json, __path: path, __fileUser: key, __sha: sha || null }
-        : null;
-      return doc ? { doc, sha: sha || null, path } : null;
+      assertUserDocument(json, { path, filename: `${key}.json` });
+      return { doc: json, sha: sha || null, path };
     } catch (err) {
       if (err?.status === 404) return null;
       throw err;
@@ -1640,272 +1761,132 @@ export class CommunityAnnotationGitHubSync {
   async pushMyUserFile({
     userDoc,
     commitMessage = null,
-    conflictIfRemoteNewerThan = null,
     conflictIfRemoteShaNotEqual = null,
-    force = false
+    publicationMode,
   } = {}) {
+    const mode = assertPublicationMode(publicationMode);
     const token = this.token;
     if (!token) throw new Error('GitHub token required to push');
-    const branch = this.branch || 'main';
+    const branch = assertGitHubBranch(
+      this.branch,
+      'Resolved annotation repository branch'
+    );
     const workerOrigin = this.workerOrigin;
 
-    const idRaw = userDoc?.githubUserId;
-    const id = Number.isFinite(Number(idRaw)) ? Math.max(0, Math.floor(Number(idRaw))) : 0;
-    if (!id) throw new Error('User doc missing githubUserId');
+    const id = userDoc?.githubUserId;
+    if (!Number.isSafeInteger(id) || id < 1) {
+      throw new Error('User doc githubUserId must be a positive safe integer');
+    }
     const fileUser = `ghid_${id}`;
     const path = `annotations/users/${fileUser}.json`;
-
-    let sha = null;
-    let remoteUpdatedAt = null;
-    let remoteDoc = null;
-    try {
-      const existing = await getContent({ workerOrigin, owner: this.owner, repo: this.repo, token, path, ref: branch });
-      if (existing?.type === 'file' && existing?.sha) {
-        sha = existing.sha;
-        const decoded = decodeBase64Utf8(existing?.content || '');
-        const parsed = decoded ? safeJsonParse(decoded) : null;
-        remoteDoc = (parsed && typeof parsed === 'object') ? parsed : null;
-        remoteUpdatedAt = toCleanString(remoteDoc?.updatedAt) || null;
-      }
-    } catch (err) {
-      // If not found, we'll create it. Otherwise bubble up.
-      if (err?.status !== 404) throw err;
-    }
-
-    // Strong conflict detection: GitHub blob sha is the real source-of-truth version.
-    // This avoids clock-skew issues with `updatedAt` when the same user publishes from multiple devices.
-    const expectedSha = toCleanString(conflictIfRemoteShaNotEqual) || null;
-    if (!force) {
-      // If the remote file exists, require a baseline SHA from the last Pull to avoid overwrites.
-      if (!expectedSha && sha) {
-        const err = new Error(
-          'Missing baseline version for your remote user file.\n' +
-          'Pull first to merge any existing votes/suggestions, then Publish again.'
-        );
-        err.code = 'COMMUNITY_ANNOTATION_CONFLICT';
-        err.remoteUpdatedAt = remoteUpdatedAt;
-        err.remoteSha = sha;
-        err.expectedSha = null;
-        err.path = path;
-        throw err;
-      }
-
-      if (expectedSha && sha !== expectedSha) {
-        const err = new Error(
-          'Remote user file changed since your last Pull.\n' +
-          'Pull first to merge changes, or force overwrite to publish anyway.'
-        );
-        err.code = 'COMMUNITY_ANNOTATION_CONFLICT';
-        err.remoteUpdatedAt = remoteUpdatedAt;
-        err.remoteSha = sha;
-        err.expectedSha = expectedSha;
-        err.path = path;
-        throw err;
-      }
-    }
-
-    if (!force && remoteUpdatedAt && conflictIfRemoteNewerThan) {
-      const localMs = Number.isFinite(Date.parse(conflictIfRemoteNewerThan)) ? Date.parse(conflictIfRemoteNewerThan) : null;
-      const remoteMs = Number.isFinite(Date.parse(remoteUpdatedAt)) ? Date.parse(remoteUpdatedAt) : null;
-      if (localMs != null && remoteMs != null && remoteMs > localMs) {
-        const err = new Error(
-          `Remote user file was updated at ${remoteUpdatedAt}. Pull first, or force overwrite to push anyway.`
-        );
-        err.code = 'COMMUNITY_ANNOTATION_CONFLICT';
-        err.remoteUpdatedAt = remoteUpdatedAt;
-        err.path = path;
-        throw err;
-      }
-    }
-
-    const repoInfo = this._repoInfo || await getRepoInfo({ workerOrigin, owner: this.owner, repo: this.repo, token });
-    this._repoInfo = repoInfo || null;
-    const perms = repoInfo?.permissions || null;
-    const canPushDirect = perms ? Boolean(perms?.push || perms?.maintain || perms?.admin) : null;
-    const isPrivateRepo = Boolean(repoInfo?.private);
-    const allowForking = repoInfo?.allow_forking !== false;
-
-    const docToWrite = { ...(userDoc && typeof userDoc === 'object' ? userDoc : {}), username: fileUser, githubUserId: id };
-    // Preserve per-user dataset access metadata across publishes (informational; does not affect annotations).
-    if (remoteDoc?.datasets != null || docToWrite.datasets != null) {
-      const merged = mergeDatasetAccessMaps(remoteDoc?.datasets, docToWrite.datasets);
-      if (Object.keys(merged).length) docToWrite.datasets = merged;
-      else delete docToWrite.datasets;
-    }
-    const content = encodeBase64Utf8(JSON.stringify(docToWrite, null, 2) + '\n');
-    const login = toCleanString(userDoc?.login || '') || null;
-    const msg = toCleanString(commitMessage) || `Update annotations for @${login || fileUser}`;
-
-    let lastDirectPushError = null;
-    if (canPushDirect !== false) {
-      try {
-        const res = force
-          ? await putContentWithRetry({
-            workerOrigin,
-            owner: this.owner,
-            repo: this.repo,
-            token,
-            path,
-            branch,
-            message: msg,
-            contentBase64: content,
-            sha,
-            refForRefresh: branch
-          })
-          : await putContent({
-            workerOrigin,
-            owner: this.owner,
-            repo: this.repo,
-            token,
-            path,
-            branch,
-            message: msg,
-            contentBase64: content,
-            sha
-          });
-        const newSha = toCleanString(res?.content?.sha || res?.sha || '') || null;
-        return { mode: 'push', path, remoteUpdatedAt, sha: newSha };
-      } catch (err) {
-        if (!force && isShaMismatchError(err)) {
-          const conflict = new Error(
-            'Remote user file changed while publishing.\n' +
-            'Pull first to merge changes, or force overwrite to publish anyway.'
-          );
-          conflict.code = 'COMMUNITY_ANNOTATION_CONFLICT';
-          conflict.remoteUpdatedAt = remoteUpdatedAt;
-          conflict.path = path;
-          throw conflict;
-        }
-        if (!(isWriteDeniedError(err) || isProtectedBranchError(err))) throw err;
-        lastDirectPushError = err;
-      }
-    }
-
-    // At this point, direct publishing was either not allowed or was blocked (e.g. protected branch).
-    if (canPushDirect !== true && !allowForking) {
+    assertUserDocument(userDoc, { path, filename: `${fileUser}.json` });
+    const authenticatedUser = assertAuthUserResponse(
+      await workerAuthRequest(workerOrigin, '/auth/user', { token })
+    );
+    if (authenticatedUser.id !== id) {
       throw new Error(
-        'You do not have permission to publish annotations.\n\n' +
-        'GitHub reports you cannot push, and this repo disables forking, so Pull Request publishing is not possible.'
+        `User document identity ${fileUser} does not match authenticated GitHub user ghid_${authenticatedUser.id}`
       );
     }
 
-    const me = await workerAuthRequest(workerOrigin, '/auth/user', { token });
-    const meLogin = toCleanString(me?.login || '');
-    if (!meLogin) throw new Error('Unable to determine GitHub user (GET /auth/user)');
-
-    const prBranch = toDeterministicPrBranch({ datasetId: this.datasetId, baseBranch: branch, fileUser });
-    const prBody = [
-      'Automated community annotation update from Cellucid.',
-      '',
-      `User: @${meLogin}`,
-      `File: \`${path}\``
-    ].join('\n');
-
-    // Prefer same-repo PR branches when possible (works even when forking is disabled).
-    const shouldTryUpstreamPrFirst =
-      canPushDirect === true ||
-      !allowForking ||
-      isProtectedBranchError(lastDirectPushError);
-
-    if (shouldTryUpstreamPrFirst) {
-      try {
-        const prRes = await publishFileViaPullRequest({
-          workerOrigin,
-          token,
-          upstreamOwner: this.owner,
-          upstreamRepo: this.repo,
-          baseBranch: branch,
-          headOwner: this.owner,
-          headRepo: this.repo,
-          headBranch: prBranch,
-          path,
-          title: msg,
-          body: prBody,
-          contentBase64: content
-        });
-        return {
-          mode: 'pr',
-          path,
-          remoteUpdatedAt,
-          prUrl: prRes?.prUrl || null,
-          prNumber: prRes?.prNumber ?? null,
-          reused: Boolean(prRes?.reused)
-        };
-      } catch (err) {
-        if (!allowForking) throw err;
-      }
+    let sha = null;
+    let remoteUpdatedAt = null;
+    try {
+      const existing = await getContent({ workerOrigin, owner: this.owner, repo: this.repo, token, path, ref: branch });
+      const { json: parsed, sha: existingSha } = decodeJsonContentFile(existing, path);
+      sha = existingSha;
+      assertUserDocument(parsed, { path, filename: `${fileUser}.json` });
+      remoteUpdatedAt = parsed.updatedAt;
+    } catch (err) {
+      if (err?.status !== 404) throw err;
     }
 
-    // Fork + PR flow (no direct write access, or upstream branch PR failed).
-    const forkOwner = meLogin;
-    let forkRepo = null;
+    const expectedSha = conflictIfRemoteShaNotEqual === null
+      ? null
+      : assertGitHubSha(
+        conflictIfRemoteShaNotEqual,
+        'Expected remote user-file SHA'
+      );
+    if (!expectedSha && sha) {
+      const err = new Error(
+        'Missing baseline version for your remote user file.\n' +
+        'Pull first to merge any existing votes/suggestions, then Publish again.'
+      );
+      err.code = 'COMMUNITY_ANNOTATION_CONFLICT';
+      err.remoteUpdatedAt = remoteUpdatedAt;
+      err.remoteSha = sha;
+      err.expectedSha = null;
+      err.path = path;
+      throw err;
+    }
+    if (expectedSha && sha !== expectedSha) {
+      const err = new Error(
+        'Remote user file changed since your last Pull.\n' +
+        'Pull first to merge changes before publishing.'
+      );
+      err.code = 'COMMUNITY_ANNOTATION_CONFLICT';
+      err.remoteUpdatedAt = remoteUpdatedAt;
+      err.remoteSha = sha;
+      err.expectedSha = expectedSha;
+      err.path = path;
+      throw err;
+    }
+
+    const repoInfo =
+      this._repoInfo === null
+        ? await getRepoInfo({
+            workerOrigin,
+            owner: this.owner,
+            repo: this.repo,
+            token,
+          })
+        : this._repoInfo;
+    assertRepositoryPublicationInfo(repoInfo);
+    this._repoInfo = repoInfo;
+    const msg = commitMessage === null
+      ? `Update annotations for @${authenticatedUser.login}`
+      : assertExactNonblankString(
+        commitMessage,
+        'Annotation user-file commit message',
+        { max: 256 }
+      );
+    const content = encodeBase64Utf8(JSON.stringify(userDoc, null, 2) + '\n');
     try {
-      forkRepo = await ensureForkRepo({
+      const result = await publishAnnotationFile({
+        publicationMode: mode,
+        repoInfo,
         workerOrigin,
         upstreamOwner: this.owner,
         upstreamRepo: this.repo,
         token,
-        forkOwner
+        baseBranch: branch,
+        datasetId: this.datasetId,
+        fileUser,
+        path,
+        title: msg,
+        body: [
+          'Community annotation update from Cellucid.',
+          '',
+          `User: @${authenticatedUser.login}`,
+          `File: \`${path}\``,
+        ].join('\n'),
+        contentBase64: content,
+        sourceSha: sha,
       });
+      return { ...result, path, remoteUpdatedAt };
     } catch (err) {
-      const status = err?.status;
-      if (status === 401 || status === 403) {
-        throw new Error(
-          'Unable to create or access a fork for Pull Request publishing. ' +
-          'Make sure the GitHub App is installed for your account, and that you have permission to fork this repository.'
+      if (isContentConflictError(err)) {
+        const conflict = new Error(
+          'Remote user file changed while publishing.\n' +
+          'Pull first to merge changes before publishing.'
         );
+        conflict.code = 'COMMUNITY_ANNOTATION_CONFLICT';
+        conflict.remoteUpdatedAt = remoteUpdatedAt;
+        conflict.path = path;
+        throw conflict;
       }
-      const msg = isPrivateRepo
-        ? (
-          `Unable to locate your fork for this private repository. ` +
-          `Install the Cellucid GitHub App on your personal account (ideally "All repositories"), ` +
-          `then retry Publish.`
-        )
-        : null;
-      if (msg) throw new Error(msg);
       throw err;
     }
-
-    // Wait for fork to become available.
-    let forkInfo = null;
-    for (let attempt = 0; attempt < 12; attempt++) {
-      try {
-        forkInfo = await githubRequest(workerOrigin, `/repos/${encodeURIComponent(forkOwner)}/${encodeURIComponent(forkRepo)}`, { token });
-        if (forkInfo) break;
-      } catch (err) {
-        if (err?.status !== 404) throw err;
-      }
-      await sleep(650 + attempt * 120);
-    }
-    if (!forkInfo) {
-      throw new Error(
-        'Fork not ready. Install the GitHub App on your personal account (ideally "All repositories"), then try again.'
-      );
-    }
-
-    const prRes = await publishFileViaPullRequest({
-      workerOrigin,
-      token,
-      upstreamOwner: this.owner,
-      upstreamRepo: this.repo,
-      baseBranch: branch,
-      headOwner: forkOwner,
-      headRepo: forkRepo,
-      headBranch: prBranch,
-      path,
-      title: msg,
-      body: prBody,
-      contentBase64: content
-    });
-
-    return {
-      mode: 'pr',
-      path,
-      remoteUpdatedAt,
-      prUrl: prRes?.prUrl || null,
-      prNumber: prRes?.prNumber ?? null,
-      reused: Boolean(prRes?.reused)
-    };
   }
 }
 
@@ -1915,8 +1896,16 @@ export function getGitHubSyncForDataset({ datasetId, username = 'local', tokenOv
   const parsed = parseOwnerRepo(repo);
   if (!parsed) return null;
   const meta = getAnnotationRepoMetaForDataset(datasetId, username);
-  const branchMode = meta?.branchMode === 'explicit' ? 'explicit' : 'default';
-  const token = tokenOverride || getGitHubAuthSession().getToken() || null;
+  if (!meta || (meta.branchMode !== 'default' && meta.branchMode !== 'explicit')) {
+    throw new Error('Stored annotation repository connection is missing exact branchMode');
+  }
+  if (meta.branchMode === 'explicit' && parsed.ref === null) {
+    throw new Error('Explicit annotation repository connection is missing its branch');
+  }
+  const branchMode = meta.branchMode;
+  const token = tokenOverride === null
+    ? getGitHubAuthSession().getToken()
+    : assertOptionalToken(tokenOverride);
   return new CommunityAnnotationGitHubSync({
     datasetId,
     owner: parsed.owner,
@@ -1929,41 +1918,25 @@ export function getGitHubSyncForDataset({ datasetId, username = 'local', tokenOv
 
 export function setDatasetAnnotationRepoFromUrlParam({ datasetId, urlParamValue, username = 'local' }) {
   const parsed = parseOwnerRepo(urlParamValue);
-  if (!parsed) return false;
-  const ok = setAnnotationRepoForDataset(datasetId, parsed.ownerRepoRef, username);
-  if (!ok) return false;
-  setAnnotationRepoMetaForDataset(datasetId, username, { branchMode: parsed.ref ? 'explicit' : 'default' });
-  return true;
+  if (!parsed || parsed.ref === null) return false;
+  return setAnnotationRepoForDataset(
+    datasetId,
+    parsed.ownerRepoRef,
+    username,
+    { branchMode: 'explicit' }
+  );
 }
 
 export async function setDatasetAnnotationRepoFromUrlParamAsync({ datasetId, urlParamValue, username = 'local', tokenOverride = null } = {}) {
   const parsed = parseOwnerRepo(urlParamValue);
   if (!parsed) return false;
 
-  // Support GitHub tree URLs where the branch may contain slashes by resolving the
-  // longest matching `refs/heads/...` prefix via the API.
-  if (parsed.treeRefPath) {
-    const token = tokenOverride || getGitHubAuthSession().getToken() || null;
-    if (!token) return false;
-    const sync = new CommunityAnnotationGitHubSync({
-      datasetId,
-      owner: parsed.owner,
-      repo: parsed.repo,
-      token,
-      branch: null,
-      workerOrigin: getGitHubWorkerOrigin()
-    });
-    const resolved = await sync.resolveBranchFromTreeRefPath(parsed.treeRefPath).catch(() => null);
-    if (!resolved) return false;
-    const ok = setAnnotationRepoForDataset(datasetId, `${parsed.ownerRepo}@${resolved}`, username);
-    if (!ok) return false;
-    setAnnotationRepoMetaForDataset(datasetId, username, { branchMode: 'explicit' });
-    return true;
-  }
-
-  // If no branch is specified, resolve the repo's default branch ("HEAD") and persist owner/repo@branch.
+  // Default-branch ownership is resolved once, before the repository reference
+  // becomes persistent state.
   if (!parsed.ref) {
-    const token = tokenOverride || getGitHubAuthSession().getToken() || null;
+    const token = tokenOverride === null
+      ? getGitHubAuthSession().getToken()
+      : assertOptionalToken(tokenOverride);
     if (!token) return false;
     const repoInfo = await getRepoInfo({
       workerOrigin: getGitHubWorkerOrigin(),
@@ -1971,15 +1944,22 @@ export async function setDatasetAnnotationRepoFromUrlParamAsync({ datasetId, url
       repo: parsed.repo,
       token
     });
-    const head = toCleanString(repoInfo?.default_branch || '') || 'main';
-    const ok = setAnnotationRepoForDataset(datasetId, `${parsed.ownerRepo}@${head}`, username);
-    if (!ok) return false;
-    setAnnotationRepoMetaForDataset(datasetId, username, { branchMode: 'default' });
-    return true;
+    const head = assertGitHubBranch(
+      repoInfo?.default_branch,
+      'GitHub repository default_branch'
+    );
+    return setAnnotationRepoForDataset(
+      datasetId,
+      `${parsed.ownerRepo}@${head}`,
+      username,
+      { branchMode: 'default' }
+    );
   }
 
-  const ok = setAnnotationRepoForDataset(datasetId, parsed.ownerRepoRef, username);
-  if (!ok) return false;
-  setAnnotationRepoMetaForDataset(datasetId, username, { branchMode: 'explicit' });
-  return true;
+  return setAnnotationRepoForDataset(
+    datasetId,
+    parsed.ownerRepoRef,
+    username,
+    { branchMode: 'explicit' }
+  );
 }

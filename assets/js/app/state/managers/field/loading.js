@@ -14,6 +14,7 @@
 import { getNotificationCenter } from '../../../notification-center.js';
 import { FieldKind, FieldSource } from '../../../utils/field-constants.js';
 import { getFieldRegistry } from '../../../utils/field-registry.js';
+import { adoptScientificFieldDescriptors } from './descriptor-ownership.js';
 
 export class FieldLoadingMethods {
   setFieldLoader(loaderFn) {
@@ -26,7 +27,9 @@ export class FieldLoadingMethods {
 
   initVarData(varManifest) {
     if (!varManifest) return;
-    const normalizedFields = (varManifest?.fields || []).map((field) => ({
+    const manifestFields = varManifest?.fields || [];
+    this._varFieldDescriptors = adoptScientificFieldDescriptors(manifestFields);
+    const normalizedFields = manifestFields.map((field) => ({
       ...field,
       loaded: Boolean(field?.values),
       _loadingPromise: null
@@ -100,12 +103,16 @@ export class FieldLoadingMethods {
       return field;
     }
 
+    const loaderField = this._obsFieldDescriptors?.[fieldIndex];
+    if (!loaderField) {
+      throw new Error(
+        `No immutable scientific descriptor is available for obs field "${field.key}".`
+      );
+    }
+
     // Show loading notification (unless silent mode for batch operations)
     const notifications = getNotificationCenter();
     const notifId = silent ? null : notifications.loading(`Loading field: ${field.key}`, { category: 'data' });
-
-    // If the field has been renamed, keep network/data lookups stable by loading using the original key.
-    const loaderField = field._originalKey ? { ...field, key: field._originalKey } : field;
 
     field._loadingPromise = this.fieldLoader(loaderField)
       .then((loadedData) => {
@@ -198,12 +205,16 @@ export class FieldLoadingMethods {
       return field;
     }
 
+    const loaderField = this._varFieldDescriptors?.[fieldIndex];
+    if (!loaderField) {
+      throw new Error(
+        `No immutable scientific descriptor is available for var field "${field.key}".`
+      );
+    }
+
     // Show loading notification for gene expression (unless silent mode for batch operations)
     const notifications = getNotificationCenter();
     const notifId = silent ? null : notifications.loading(`Loading gene: ${field.key}`, { category: 'data' });
-
-    // If the gene has been renamed, load using the original key for stable lookups.
-    const loaderField = field._originalKey ? { ...field, key: field._originalKey } : field;
 
     field._loadingPromise = this.varFieldLoader(loaderField)
       .then((loadedData) => {
@@ -314,7 +325,7 @@ export class FieldLoadingMethods {
       this.clearCentroids();
     } else {
       this.updateColorsCategorical(field);
-      this.buildCentroidsForField(field);
+      this.buildCentroidsForField(field, { viewId: this.activeViewId });
     }
 
     if (field.outlierQuantiles && field.outlierQuantiles.length > 0) {
@@ -325,7 +336,6 @@ export class FieldLoadingMethods {
     this._pushColorsToViewer();
     this._pushTransparencyToViewer();
     this._pushCentroidsToViewer();
-    this._pushOutlierThresholdToViewer(this.getCurrentOutlierThreshold());
     this.computeGlobalVisibility();
     this._syncActiveContext();
     this._pushActiveViewLabelToViewer();
@@ -359,7 +369,6 @@ export class FieldLoadingMethods {
     this._pushColorsToViewer();
     this._pushTransparencyToViewer();
     this._pushCentroidsToViewer();
-    this._pushOutlierThresholdToViewer(1.0);
     this.computeGlobalVisibility();
     this._syncActiveContext();
     this._pushActiveViewLabelToViewer();
@@ -417,7 +426,6 @@ export class FieldLoadingMethods {
       }
     }
 
-    this._pushOutliersToViewer();
     this._syncActiveContext();
     this.updateFilteredCount();
     this.updateFilterSummary();

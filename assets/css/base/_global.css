@@ -28,7 +28,7 @@ body.dock-resizing * {
   user-select: none !important;
 }
 
-/* No-script fallback */
+/* JavaScript-required notice */
 .noscript-message {
   padding: var(--space-10);
   max-width: 800px;

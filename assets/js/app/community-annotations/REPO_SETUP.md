@@ -13,10 +13,12 @@ Your annotation repository must contain:
 ```
 annotations/
   config.json
+  config.schema.json
   schema.json
   users/
     (one JSON file per contributor)
   moderation/
+    merges.schema.json
     merges.json   (optional; written by authors via Cellucid)
 .github/
   workflows/
@@ -35,10 +37,13 @@ Option A (recommended):
 1. Create a new GitHub repository (public or private).
 2. Copy the contents of `cellucid-annotation/` into the root of that repo.
 3. Update `annotations/config.json`:
-   - Add one entry per dataset id in `supportedDatasets[].datasetId`
-   - Optionally set `fieldsToAnnotate` (categorical obs columns that are votable)
-   - Optionally set `annotatableSettings` per field (`minAnnotators`, `threshold`)
-   - Optionally set `closedFields` (temporarily lock voting on selected fields)
+   - Add one complete entry per dataset id in `supportedDatasets`
+   - Set a nonempty `name`
+   - Set a nonempty `fieldsToAnnotate` array of categorical obs field keys
+   - Set exactly one `annotatableSettings` object per listed field, containing
+     `minAnnotators` and `threshold`
+   - Set `closedFields` to a unique subset of `fieldsToAnnotate`; use `[]` when
+     no fields are closed
 4. Commit and push.
 
 Option B:
@@ -67,7 +72,9 @@ If the dataset currently loaded in Cellucid is not listed in `annotations/config
 
 - **Annotators** are blocked (no Pull / no viewing or downloading annotations).
 - **Authors** can connect anyway (with a confirmation) to update settings, then **Publish**.
-  - Publish automatically adds/updates the `supportedDatasets[]` entry for the current dataset id in `annotations/config.json` (no manual editing required).
+  - After the author selects at least one annotatable field and supplies the
+    complete settings, Publish adds or updates the `supportedDatasets[]` entry
+    for the current dataset id in `annotations/config.json`.
   - Annotators are unblocked after this is published.
 
 ### Shareable links
@@ -85,17 +92,28 @@ You can share a link that pre-selects the annotation repo:
 
 ### Write access (Publish)
 
-- If you have **push** access to the repo, Cellucid writes directly to:
+- With **push** access to the connected branch, Cellucid writes directly to:
   - `annotations/users/ghid_<your-github-user-id>.json`
-- If you do **not** have push access, Cellucid uses a **fork + Pull Request** flow.
+- Without source-repository write access, Cellucid uses the
+  **fork + Pull Request** route only when GitHub reports that the source
+  repository permits forking.
+
+Cellucid selects `direct` or `fork-pull-request` before the first repository
+mutation. A failure is reported on that selected route and never changes the
+operation into the other route.
 
 Fork + PR notes:
-- The fork must also be accessible to the GitHub App token.
-- Easiest setup: install the app on your personal account with **All repositories**, so new forks are included automatically.
+- The GitHub App needs Administration write, Contents read/write, and Pull
+  requests write permissions.
+- GitHub requires the app on the source account with access to the source repo
+  and on the destination account with access to all repositories.
+- The source repository must permit forking.
 
 ## Author vs Annotator
 
-- **Annotator**: can Pull and submit their own `annotations/users/ghid_<id>.json` (direct push if allowed; otherwise fork + PR).
+- **Annotator**: can Pull and submit their own
+  `annotations/users/ghid_<id>.json` through the direct or Pull Request path
+  selected by their exact GitHub permissions.
 - **Author** (**maintain/admin** access to repo): additionally can:
   - Control which categorical obs columns are annotatable (stored in `annotations/config.json`)
   - Set per-field consensus settings (`minAnnotators`, `threshold`) and optionally close fields (`closedFields`)
@@ -129,9 +147,21 @@ In `annotations/users/ghid_<id>.json`, the `suggestions` and `deletedSuggestions
 
 The template includes:
 
-- `validate.yml`: validates `annotations/config.json` and all `annotations/users/*.json`
+- `validate.yml`: tests the validator and validates the current schemas,
+  `annotations/config.json`, every `annotations/users/*.json`, and the optional
+  `annotations/moderation/merges.json`
 
-This workflow runs entirely in GitHub and keeps the repo consistent for all collaborators.
+Validation is exact and all-or-nothing: unknown fields, wrong JSON types,
+duplicate JSON keys, invalid filenames or ownership, malformed timestamps,
+missing settings, duplicate mappings, cycles, and values over the declared
+limits fail the workflow. Nothing is truncated, coerced, migrated, skipped, or
+repaired.
+
+Repository JSON must be UTF-8 without a byte-order mark. GitHub blob responses
+must use the API's `base64` encoding, and a truncated Git tree fails Pull rather
+than compiling only the returned prefix. Suggestion ids must remain globally
+unambiguous across contributors: the same id cannot identify suggestions owned
+by different users or stored in different buckets.
 
 ### About consensus compilation
 
@@ -143,7 +173,17 @@ Instead, on **Pull** Cellucid:
 - Downloads only files whose GitHub `sha` changed since your last Pull (cached locally per `datasetId + owner/repo@branch + user.id`)
 - Compiles the merged suggestions + consensus view in the browser
 
-From the sidebar you can download a locally-built `consensus.json` snapshot for downstream usage.
+The browser enforces the same current contract before changing cache or session
+state. One invalid remote document fails the Pull; Cellucid never compiles a
+partial set.
+
+The raw-file cache requires both IndexedDB and localStorage. If either storage
+boundary is unavailable, corrupt, or cannot persist a write, Cellucid reports
+the failure and disconnects the annotation scope; it does not switch to an
+in-memory cache.
+
+From the sidebar you can download a locally-built
+`cellucid-consensus.json` snapshot for downstream usage.
 
 ---
 
@@ -161,8 +201,10 @@ By default, Cellucid uses a Cloudflare Worker named:
 This worker is an **auth proxy**:
 
 - `/auth/login` starts the GitHub OAuth flow for the **Cellucid GitHub App**
+- `/auth/callback` completes OAuth state and PKCE validation
 - `/auth/user`, `/auth/installations`, `/auth/installation-repos` expose minimal “who am I” + “which repos did I install the app on” queries
-- `/api/*` proxies requests to `api.github.com/*` so the frontend never needs GitHub App secrets
+- `/api/repos/*` proxies the repository requests used by Cellucid to
+  `api.github.com/repos/*`
 
 ### Why This Is Safer Than PATs
 
@@ -170,7 +212,9 @@ Compared to Personal Access Tokens, the GitHub App model:
 
 - Lets users install the app on **only specific repos**
 - Avoids asking for broad OAuth scopes like full `repo` access
-- Keeps GitHub App secrets (client secret, private key) **server-side only** (Cloudflare Worker secrets)
+- Keeps the GitHub App client secret in Cloudflare Worker secrets
+- Constrains each user token to the intersection of the app's permissions and
+  the signed-in user's permissions
 
 ### Security Notes (Frontend + Worker)
 
@@ -185,15 +229,24 @@ Cellucid is designed so your GitHub credentials and tokens are not casually expo
 
 If you want to run your own worker + GitHub App (recommended for organizations), follow:
 
-- `cellucid/docs/github-oauth-cloudflare-setup.md`
+- `docs/github-oauth-cloudflare-setup.md`
 
-Then configure Cellucid to point at your worker origin (build/deploy-time injection):
+For production, set the exact `DEFAULT_WORKER_ORIGIN` in
+`assets/js/app/community-annotations/github-auth.js`, rebuild Cellucid, and
+deploy the rebuilt site.
 
-- `window.__CELLUCID_GITHUB_WORKER_ORIGIN__ = 'https://your-worker.example.workers.dev'`
+Local development pages may set
+`window.__CELLUCID_GITHUB_WORKER_ORIGIN__` to an exact HTTP(S) origin before
+Cellucid's application modules load.
 
 Notes:
 
-- For security, **non-local builds refuse untrusted worker origins**. In production, set your worker by changing `DEFAULT_WORKER_ORIGIN` in `cellucid/assets/js/app/community-annotations/github-auth.js` and rebuilding.
-- Local dev hosts may use `window.__CELLUCID_GITHUB_WORKER_ORIGIN__` for testing.
+- Non-local builds refuse a runtime origin different from the compiled
+  `DEFAULT_WORKER_ORIGIN`.
+- The Worker `ALLOWED_ORIGINS` secret must contain the exact Cellucid page
+  origin.
+- The self-hosting guide includes the GitHub App permissions, token-expiration
+  setting, required Worker secrets, deploy commands, executable contract tests,
+  live acceptance test, and exact failure diagnosis.
 
 This lets you keep the same repo template and UI while controlling the auth infrastructure.

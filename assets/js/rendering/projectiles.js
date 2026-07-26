@@ -163,32 +163,21 @@ export function createProjectileSystem({
 
   function queryNearbyPoints(center, radius, maxResults = 64) {
     const positionsArray = getPositionsArray();
-    if (!positionsArray || positionsArray.length < 3) return [];
+    if (!(positionsArray instanceof Float32Array) || positionsArray.length < 3) {
+      throw new TypeError(
+        'Projectile collision queries require the published Float32 position array.'
+      );
+    }
 
-    // Get the current dimension level and use the appropriate spatial index
     const dimLevel = getCurrentDimensionLevel();
-    let spatialIndex = hpRenderer?.getSpatialIndex?.(dimLevel);
+    hpRenderer.ensureSpatialIndex(dimLevel);
+    const spatialIndex = hpRenderer.getSpatialIndex(dimLevel);
     if (!spatialIndex) {
-      hpRenderer?.ensureSpatialIndex(dimLevel);
-      spatialIndex = hpRenderer?.getSpatialIndex?.(dimLevel);
-    }
-    if (!spatialIndex) return [];
-
-    // Use the currently displayed LOD level for collision detection
-    const currentLOD = hpRenderer.stats?.lodLevel ?? -1;
-    const hasLOD = currentLOD >= 0 && spatialIndex.lodLevels?.length > 0;
-
-    if (hasLOD) {
-      // Query at the displayed LOD level
-      const hits = spatialIndex.queryRadiusAtLOD(center, radius, currentLOD, maxResults);
-      return hits.map((hit) => ({
-        index: hit.originalIndex,
-        position: hit.position,
-        color: getNormalizedColor(hit.originalIndex),
-      }));
+      throw new Error(
+        `Projectile collision spatial index for ${dimLevel}D data was not published.`
+      );
     }
 
-    // Fallback to full resolution query
     const indices = spatialIndex.queryRadius(center, radius, maxResults);
     return indices.map((idx) => {
       const posBase = idx * 3;
@@ -421,98 +410,56 @@ export function createProjectileSystem({
           break;
         }
 
-        // Check collisions with cells - use averaged normal for smooth surfaces
+        // Check collisions against the exact full-resolution cell positions.
         const pointCount = getPointCount();
         const canBounce = p.age - p.lastBounceTime >= COLLISION_COOLDOWN;
 
         if (pointCount > 0 && !p.resting && canBounce) {
-          // Query nearby points around current position
           const hits = queryNearbyPoints(p.position, collisionRadius * 2.0, 48);
 
-          // Find all colliding cells and compute weighted average normal
-          let totalWeight = 0;
-          const avgNormal = [0, 0, 0];
           let closestHit = null;
           let closestDist = Infinity;
 
           for (const hit of hits) {
             vec3.sub(tempVec3, p.position, hit.position);
             const d = vec3.length(tempVec3);
-            if (d < collisionRadius * 1.2) {
-              // Weight by inverse distance - closer cells contribute more
-              const weight = 1.0 / Math.max(d, 0.001);
-              if (d > 1e-5) {
-                avgNormal[0] += (tempVec3[0] / d) * weight;
-                avgNormal[1] += (tempVec3[1] / d) * weight;
-                avgNormal[2] += (tempVec3[2] / d) * weight;
-              }
-              totalWeight += weight;
-
-              if (d < closestDist) {
-                closestDist = d;
-                closestHit = hit;
-              }
+            if (d > 1e-5 && d < collisionRadius * 1.2 && d < closestDist) {
+              closestDist = d;
+              closestHit = hit;
             }
           }
 
-          if (closestHit && totalWeight > 0) {
-            // Normalize the averaged normal
-            const nLen = Math.sqrt(avgNormal[0]**2 + avgNormal[1]**2 + avgNormal[2]**2);
-            if (nLen > 1e-5) {
-              tempVec3[0] = avgNormal[0] / nLen;
-              tempVec3[1] = avgNormal[1] / nLen;
-              tempVec3[2] = avgNormal[2] / nLen;
-            } else {
-              // Fallback: use opposite of velocity direction
-              vec3.normalize(tempVec3, p.velocity);
-              vec3.scale(tempVec3, tempVec3, -1);
-            }
-
-            // Ensure normal points away from surface (opposes incoming velocity)
-            let vDotN = vec3.dot(p.velocity, tempVec3);
-            if (vDotN > 0) {
-              vec3.scale(tempVec3, tempVec3, -1);
-              vDotN = -vDotN; // Recalculate after flip!
-            }
-
-            // Check if moving fast enough to bounce
+          if (closestHit) {
+            vec3.sub(tempVec3, p.position, closestHit.position);
+            vec3.scale(tempVec3, tempVec3, 1 / closestDist);
+            const vDotN = vec3.dot(p.velocity, tempVec3);
             const speed = vec3.length(p.velocity);
-            if (speed < MIN_BOUNCE_VELOCITY) {
-              // Too slow - stop the projectile
-              vec3.set(p.velocity, 0, 0, 0);
-              p.resting = true;
-            } else {
-              // Decompose velocity into normal and tangent components
-              // vDotN is negative, so tempVec3b points into the surface
-              vec3.scale(tempVec3b, tempVec3, vDotN); // Normal component (into surface)
-              vec3.sub(tempVec3c, p.velocity, tempVec3b); // Tangent component
+            if (vDotN < 0) {
+              if (speed < MIN_BOUNCE_VELOCITY) {
+                vec3.set(p.velocity, 0, 0, 0);
+                p.resting = true;
+              } else {
+                vec3.scale(tempVec3b, tempVec3, vDotN);
+                vec3.sub(tempVec3c, p.velocity, tempVec3b);
+                vec3.scale(tempVec3b, tempVec3b, -PROJECTILE_BOUNCE);
+                vec3.scale(tempVec3c, tempVec3c, 1.0 - PROJECTILE_FRICTION);
+                vec3.add(p.velocity, tempVec3b, tempVec3c);
 
-              // Reflect and reduce normal component (bounce with energy loss)
-              vec3.scale(tempVec3b, tempVec3b, -PROJECTILE_BOUNCE);
+                const newSpeed = vec3.length(p.velocity);
+                if (newSpeed > MAX_VELOCITY) {
+                  vec3.scale(p.velocity, p.velocity, MAX_VELOCITY / newSpeed);
+                }
 
-              // Reduce tangent component (friction)
-              vec3.scale(tempVec3c, tempVec3c, 1.0 - PROJECTILE_FRICTION);
+                const penetration = collisionRadius - closestDist;
+                if (penetration > 0) {
+                  vec3.scaleAndAdd(p.position, p.position, tempVec3, penetration + 0.005);
+                }
 
-              // Combine for new velocity
-              vec3.add(p.velocity, tempVec3b, tempVec3c);
-
-              // Clamp velocity to prevent runaway speeds
-              const newSpeed = vec3.length(p.velocity);
-              if (newSpeed > MAX_VELOCITY) {
-                vec3.scale(p.velocity, p.velocity, MAX_VELOCITY / newSpeed);
+                p.lastBounceTime = p.age;
               }
 
-              // Push position out of collision cleanly
-              const penetration = collisionRadius - closestDist;
-              if (penetration > 0) {
-                vec3.scaleAndAdd(p.position, p.position, tempVec3, penetration + 0.005);
-              }
-
-              // Record bounce time to prevent rapid multi-bounces
-              p.lastBounceTime = p.age;
+              recordImpact(closestHit.position, closestHit.color || pickProjectileColor());
             }
-
-            recordImpact(closestHit.position, closestHit.color || pickProjectileColor());
           }
         }
 

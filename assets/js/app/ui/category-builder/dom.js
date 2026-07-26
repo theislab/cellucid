@@ -69,6 +69,7 @@ const TEMPLATE = `
         </div>
 
         <div class="cat-builder-preview" id="cat-builder-preview"></div>
+        <p class="analysis-error" id="cat-builder-validation" role="status" aria-live="polite" hidden></p>
 
         <div class="cat-builder-actions">
           <button type="button" class="cat-builder-btn secondary" id="cat-builder-cancel">Cancel</button>
@@ -82,27 +83,41 @@ const TEMPLATE = `
 /**
  * Render the CategoryBuilder UI into the given container.
  *
- * @param {HTMLElement|null} containerEl
+ * @param {HTMLElement} containerEl
  * @returns {object} DOM references used by CategoryBuilder
  */
 export function renderCategoryBuilderDom(containerEl) {
-  if (!containerEl) return {};
+  if (containerEl === null || typeof containerEl !== 'object') {
+    throw new TypeError(
+      'Category builder DOM requires one document-owned HTMLElement'
+    );
+  }
+  const ownerDocument = containerEl.ownerDocument;
+  if (ownerDocument === null || ownerDocument === undefined) {
+    throw new TypeError(
+      'Category builder DOM requires one document-owned HTMLElement'
+    );
+  }
+  const view = ownerDocument.defaultView;
+  if (
+    view === null
+    || view === undefined
+    || !(containerEl instanceof view.HTMLElement)
+  ) {
+    throw new TypeError(
+      'Category builder DOM requires one document-owned HTMLElement'
+    );
+  }
 
-  const wrapper = document.createElement('div');
+  const wrapper = ownerDocument.createElement('div');
   wrapper.className = 'analysis-accordion cat-builder-wrapper';
   wrapper.innerHTML = TEMPLATE;
 
-  containerEl.appendChild(wrapper);
-
-  const item = wrapper.querySelector('#cat-builder-accordion-item');
-  const toggle = wrapper.querySelector('.analysis-accordion-header');
-  const panel = wrapper.querySelector('.analysis-accordion-content');
-
-  return {
+  const elements = {
     wrapper,
-    item,
-    toggle,
-    panel,
+    item: wrapper.querySelector('#cat-builder-accordion-item'),
+    toggle: wrapper.querySelector('.analysis-accordion-header'),
+    panel: wrapper.querySelector('.analysis-accordion-content'),
     dropzone: wrapper.querySelector('#cat-builder-dropzone'),
     placeholder: wrapper.querySelector('#dropzone-placeholder'),
     items: wrapper.querySelector('#dropzone-items'),
@@ -117,7 +132,18 @@ export function renderCategoryBuilderDom(containerEl) {
     uncoveredLabel: wrapper.querySelector('#uncovered-label'),
     fieldName: wrapper.querySelector('#cat-builder-name'),
     preview: wrapper.querySelector('#cat-builder-preview'),
+    validation: wrapper.querySelector('#cat-builder-validation'),
     confirmBtn: wrapper.querySelector('#cat-builder-confirm'),
     cancelBtn: wrapper.querySelector('#cat-builder-cancel')
   };
+  for (const [name, element] of Object.entries(elements)) {
+    if (!(element instanceof view.HTMLElement)) {
+      throw new Error(
+        `Category builder DOM is missing required element "${name}"`
+      );
+    }
+  }
+
+  containerEl.replaceChildren(wrapper);
+  return elements;
 }

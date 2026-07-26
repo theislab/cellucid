@@ -1,109 +1,281 @@
 /**
- * @fileoverview DataState field overlay internals.
- *
- * Internal helpers used by field operations:
- * - Apply rename/delete registries to field metadata
- * - Inject user-defined fields into obs/var field lists
- * - Keep highlight group labels and centroid labels consistent after edits
- *
- * Mixed into DataState via `state/managers/field-manager.js`.
+ * @fileoverview Exact internal ownership for field overlays.
  *
  * @module state/managers/field/overlay-internals
  */
 
 import { FieldKind, FieldSource } from '../../../utils/field-constants.js';
+import { StateValidator } from '../../../utils/state-validator.js';
+
+function requireSource(source) {
+  if (source !== FieldSource.OBS && source !== FieldSource.VAR) {
+    throw new TypeError('Field source must be exactly obs or var');
+  }
+  return source;
+}
+
+function requireMethod(owner, methodName, label) {
+  if (
+    owner === null
+    || typeof owner !== 'object'
+    || typeof owner[methodName] !== 'function'
+  ) {
+    throw new TypeError(`${label} must implement ${methodName}()`);
+  }
+}
+
+function requireBoolean(value, label) {
+  if (typeof value !== 'boolean') {
+    throw new TypeError(`${label} must be exactly boolean`);
+  }
+  return value;
+}
+
+function requireIndex(value, label) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${label} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
+function requireIdentifier(value, label) {
+  if (
+    typeof value !== 'string'
+    || value.length === 0
+    || value !== value.trim()
+  ) {
+    throw new TypeError(`${label} must be a non-empty trimmed string`);
+  }
+  return value;
+}
+
+function requireRecord(value, label) {
+  if (
+    value === null
+    || typeof value !== 'object'
+    || Array.isArray(value)
+  ) {
+    throw new TypeError(`${label} must be an object`);
+  }
+  return value;
+}
+
+function requireField(field, label) {
+  requireRecord(field, label);
+  StateValidator.validateFieldKey(field.key);
+  if (
+    field.kind !== FieldKind.CATEGORY
+    && field.kind !== FieldKind.CONTINUOUS
+  ) {
+    throw new TypeError(`${label} has an unsupported kind`);
+  }
+  return field;
+}
+
+function requireFields(value, label, { nullable = false } = {}) {
+  if (nullable && value === null) return null;
+  if (!Array.isArray(value)) {
+    throw new TypeError(`${label} must be an array`);
+  }
+  value.forEach((field, index) => {
+    requireField(field, `${label}[${index}]`);
+  });
+  return value;
+}
+
+function requireInventory(owner, source, { nullable = false } = {}) {
+  requireSource(source);
+  const data = source === FieldSource.VAR
+    ? owner.varData
+    : owner.obsData;
+  if (nullable && data === null) return null;
+  requireRecord(data, `${source} field data`);
+  return requireFields(data.fields, `${source} field inventory`);
+}
+
+function requireCategoryInventory(field, label) {
+  if (!Array.isArray(field.categories) || field.categories.length === 0) {
+    throw new TypeError(`${label} categories must be a non-empty array`);
+  }
+  field.categories.forEach((category) => {
+    StateValidator.validateCategoryLabel(category);
+  });
+  return field.categories;
+}
+
+function requireOriginalKey(field) {
+  if (Object.hasOwn(field, '_originalKey')) {
+    StateValidator.validateFieldKey(field._originalKey);
+    return field._originalKey;
+  }
+  StateValidator.validateFieldKey(field.key);
+  return field.key;
+}
+
+function formatRangeValue(value) {
+  if (!Number.isFinite(value)) {
+    throw new TypeError('Highlight range bounds must be finite numbers');
+  }
+  if (
+    Math.abs(value) >= 1000
+    || (Math.abs(value) > 0 && Math.abs(value) < 0.01)
+  ) {
+    return value.toExponential(2);
+  }
+  return value.toFixed(2);
+}
 
 export class FieldOverlayInternalMethods {
   _ensureActiveSelectionNotDeleted() {
-    if (this.activeFieldSource === FieldSource.OBS && this.activeFieldIndex >= 0) {
-      const field = this.obsData?.fields?.[this.activeFieldIndex];
-      if (field?._isDeleted === true) {
-        this.activeFieldIndex = -1;
-        this.activeFieldSource = null;
+    const source = this.activeFieldSource;
+    if (source === null) {
+      if (
+        this.activeFieldIndex !== -1
+        || this.activeVarFieldIndex !== -1
+      ) {
+        throw new Error(
+          'No active field requires both active field indices to be -1'
+        );
       }
+      return;
     }
-    if (this.activeFieldSource === FieldSource.VAR && this.activeVarFieldIndex >= 0) {
-      const field = this.varData?.fields?.[this.activeVarFieldIndex];
-      if (field?._isDeleted === true) {
-        this.activeVarFieldIndex = -1;
-        this.activeFieldSource = null;
-      }
+    requireSource(source);
+    const activeIndex = source === FieldSource.VAR
+      ? this.activeVarFieldIndex
+      : this.activeFieldIndex;
+    const inactiveIndex = source === FieldSource.VAR
+      ? this.activeFieldIndex
+      : this.activeVarFieldIndex;
+    requireIndex(activeIndex, 'Active field index');
+    if (inactiveIndex !== -1) {
+      throw new Error('Inactive field index must be exactly -1');
+    }
+    const fields = requireInventory(this, source);
+    if (activeIndex >= fields.length) {
+      throw new RangeError(
+        'Active field index is outside its exact inventory'
+      );
+    }
+    if (fields[activeIndex]._isDeleted === true) {
+      this.activeFieldIndex = -1;
+      this.activeVarFieldIndex = -1;
+      this.activeFieldSource = null;
     }
   }
 
   _applyOverlaysToFields(fields, source) {
-    if (!fields || fields.length === 0) return;
+    requireSource(source);
+    const inventory = requireFields(
+      fields,
+      `${source} overlay field inventory`,
+      { nullable: true }
+    );
+    if (inventory === null || inventory.length === 0) return;
+    for (const methodName of [
+      'getDisplayCategory',
+      'getDisplayKey'
+    ]) {
+      requireMethod(this._renameRegistry, methodName, 'Rename registry');
+    }
+    for (const methodName of ['isDeleted', 'isPurged']) {
+      requireMethod(this._deleteRegistry, methodName, 'Delete registry');
+    }
 
-    for (const field of fields) {
-      if (!field) continue;
-      if (field._isUserDefined === true && field._userDefinedId) {
-        // User-defined fields are serialized with their current metadata.
-        // Do not apply rename/delete/category overlays from registries.
+    for (let fieldIndex = 0; fieldIndex < inventory.length; fieldIndex++) {
+      const field = inventory[fieldIndex];
+      if (field._isUserDefined === true) {
+        requireIdentifier(
+          field._userDefinedId,
+          `User-defined ${source} field ${fieldIndex} id`
+        );
+        if (field._fieldSource !== source) {
+          throw new Error(
+            `User-defined ${source} field ${fieldIndex} has mismatched ownership`
+          );
+        }
         continue;
       }
 
-      const originalKey = field._originalKey || field.key;
-      if (!originalKey) continue;
-
-      // Field rename overlay
-      const displayKey = this._renameRegistry.getDisplayKey(source, originalKey);
-      if (displayKey !== originalKey) {
-        field._originalKey = originalKey;
-        field.key = displayKey;
-      } else if (field._originalKey) {
-        // Registry says "no rename" -> restore original.
+      const originalKey = requireOriginalKey(field);
+      const displayKey = this._renameRegistry.getDisplayKey(
+        source,
+        originalKey
+      );
+      StateValidator.validateFieldKey(displayKey);
+      if (displayKey === originalKey) {
         field.key = originalKey;
         delete field._originalKey;
-      }
-
-      // Delete overlay
-      if (this._deleteRegistry.isDeleted(source, originalKey)) {
-        field._isDeleted = true;
       } else {
-        delete field._isDeleted;
+        field._originalKey = originalKey;
+        field.key = displayKey;
       }
 
-      // Confirmed deletion (non-restorable)
-      if (this._deleteRegistry.isPurged?.(source, originalKey)) {
-        field._isPurged = true;
-        field._isDeleted = true;
+      const deleted = requireBoolean(
+        this._deleteRegistry.isDeleted(source, originalKey),
+        'Delete registry deletion state'
+      );
+      const purged = requireBoolean(
+        this._deleteRegistry.isPurged(source, originalKey),
+        'Delete registry purge state'
+      );
+      if (purged && !deleted) {
+        throw new Error('Purged field overlay must also be deleted');
+      }
+      if (deleted) field._isDeleted = true;
+      else delete field._isDeleted;
+      if (purged) field._isPurged = true;
+      else delete field._isPurged;
+
+      if (field.kind !== FieldKind.CATEGORY) continue;
+      const categories = requireCategoryInventory(
+        field,
+        `${source} field ${fieldIndex}`
+      );
+      let originalCategories;
+      if (Object.hasOwn(field, '_originalCategories')) {
+        if (
+          !Array.isArray(field._originalCategories)
+          || field._originalCategories.length !== categories.length
+        ) {
+          throw new TypeError(
+            `${source} field ${fieldIndex} original categories must exactly match its inventory`
+          );
+        }
+        field._originalCategories.forEach((category) => {
+          StateValidator.validateCategoryLabel(category);
+        });
+        originalCategories = [...field._originalCategories];
       } else {
-        delete field._isPurged;
+        originalCategories = [...categories];
       }
 
-      // Category rename overlay (only for categorical fields)
-      if (field.kind === FieldKind.CATEGORY && Array.isArray(field.categories)) {
-        // Reset categories back to originals if we have them.
-        if (Array.isArray(field._originalCategories) && field._originalCategories.length === field.categories.length) {
-          for (let i = 0; i < field.categories.length; i++) {
-            field.categories[i] = field._originalCategories[i];
-          }
+      const displayCategories = originalCategories.map(
+        (originalLabel, categoryIndex) => {
+          const displayLabel = this._renameRegistry.getDisplayCategory(
+            source,
+            originalKey,
+            categoryIndex,
+            originalLabel
+          );
+          StateValidator.validateCategoryLabel(displayLabel);
+          return displayLabel;
         }
-
-        // Apply registry renames.
-        let hasAnyRename = false;
-        for (let i = 0; i < field.categories.length; i++) {
-          const originalLabel = field.categories[i];
-          const displayLabel = this._renameRegistry.getDisplayCategory(source, originalKey, i, originalLabel);
-          if (displayLabel !== originalLabel) {
-            hasAnyRename = true;
-          }
-        }
-
-        if (hasAnyRename && !Array.isArray(field._originalCategories)) {
-          field._originalCategories = [...field.categories];
-        }
-
-        for (let i = 0; i < field.categories.length; i++) {
-          const originalLabel = field._originalCategories?.[i] ?? field.categories[i];
-          const displayLabel = this._renameRegistry.getDisplayCategory(source, originalKey, i, originalLabel);
-          field.categories[i] = displayLabel;
-          this._syncCentroidCategoryLabelAtIndex(field, i);
-        }
-
-        if (!hasAnyRename) {
-          delete field._originalCategories;
-        }
+      );
+      const hasRename = displayCategories.some(
+        (category, index) => category !== originalCategories[index]
+      );
+      field.categories = displayCategories;
+      if (hasRename) {
+        field._originalCategories = originalCategories;
+      } else {
+        delete field._originalCategories;
+      }
+      for (
+        let categoryIndex = 0;
+        categoryIndex < displayCategories.length;
+        categoryIndex++
+      ) {
+        this._syncCentroidCategoryLabelAtIndex(field, categoryIndex);
       }
     }
   }
@@ -114,101 +286,284 @@ export class FieldOverlayInternalMethods {
   }
 
   _injectUserDefinedFieldsForSource(source) {
-    const src = source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
-    const fields = src === FieldSource.VAR ? this.varData?.fields : this.obsData?.fields;
-    if (!fields) return;
+    requireSource(source);
+    const fields = requireInventory(this, source, { nullable: true });
+    if (fields === null) return;
+    requireMethod(
+      this._userDefinedFields,
+      'getAllFieldsForSource',
+      'User-defined field registry'
+    );
 
     const existingIds = new Set();
-    for (const field of fields) {
-      if (field && field._isUserDefined && field._userDefinedId) {
-        existingIds.add(field._userDefinedId);
+    for (let fieldIndex = 0; fieldIndex < fields.length; fieldIndex++) {
+      const field = fields[fieldIndex];
+      if (field._isUserDefined !== true) continue;
+      const fieldId = requireIdentifier(
+        field._userDefinedId,
+        `Injected ${source} field ${fieldIndex} id`
+      );
+      if (field._fieldSource !== source) {
+        throw new Error(
+          `Injected ${source} field ${fieldIndex} has mismatched ownership`
+        );
       }
+      if (existingIds.has(fieldId)) {
+        throw new Error(
+          `Injected ${source} field id "${fieldId}" is duplicated`
+        );
+      }
+      existingIds.add(fieldId);
     }
 
-    const templates = this._userDefinedFields.getAllFieldsForSource
-      ? this._userDefinedFields.getAllFieldsForSource(src)
-      : this._userDefinedFields.getAllFields();
+    const templates = this._userDefinedFields.getAllFieldsForSource(source);
+    if (!Array.isArray(templates)) {
+      throw new TypeError(
+        'User-defined field registry must publish an array'
+      );
+    }
+    const templateIds = new Set();
+    for (let index = 0; index < templates.length; index++) {
+      const template = requireField(
+        templates[index],
+        `User-defined ${source} template ${index}`
+      );
+      const templateId = requireIdentifier(
+        template._userDefinedId,
+        `User-defined ${source} template ${index} id`
+      );
+      if (
+        template._isUserDefined !== true
+        || template._fieldSource !== source
+      ) {
+        throw new Error(
+          `User-defined ${source} template ${index} has inconsistent ownership`
+        );
+      }
+      if (templateIds.has(templateId)) {
+        throw new Error(
+          `User-defined ${source} template id "${templateId}" is duplicated`
+        );
+      }
+      templateIds.add(templateId);
+      if (existingIds.has(templateId)) continue;
 
-    for (const template of templates) {
-      if (!template || !template._userDefinedId) continue;
-      if (existingIds.has(template._userDefinedId)) continue;
-
-      // Clone the definition but keep heavy arrays shared (codes/centroidsByDim).
-      const clone = { ...template };
-      // Reset per-view UI/filter state so each view can diverge safely.
+      const clone = { ...template, _loadingPromise: null };
       delete clone._categoryColors;
       delete clone._categoryVisible;
       delete clone._continuousStats;
       delete clone._continuousFilter;
       delete clone._continuousColorRange;
       delete clone._categoryCounts;
-      clone._loadingPromise = null;
-
       fields.push(clone);
+      existingIds.add(templateId);
     }
   }
 
   _syncCentroidCategoryLabelAtIndex(field, categoryIndex) {
-    const nextLabel = field.categories?.[categoryIndex];
-    if (!nextLabel) return;
-
-    const byDim = field.centroidsByDim || {};
-    for (const centroids of Object.values(byDim)) {
-      if (!Array.isArray(centroids)) continue;
-      const c = centroids[categoryIndex];
-      if (c && typeof c === 'object') c.category = nextLabel;
+    requireField(field, 'Centroid field');
+    if (field.kind !== FieldKind.CATEGORY) {
+      throw new TypeError('Centroid label sync requires a categorical field');
+    }
+    const categories = requireCategoryInventory(field, 'Centroid field');
+    const index = requireIndex(categoryIndex, 'Centroid category index');
+    if (index >= categories.length) {
+      throw new RangeError(
+        'Centroid category label index is outside the category inventory'
+      );
+    }
+    if (!Object.hasOwn(field, 'centroidsByDim')) return;
+    const byDimension = field.centroidsByDim;
+    requireRecord(byDimension, 'Category field centroidsByDim');
+    for (const [dimension, centroids] of Object.entries(byDimension)) {
+      if (!/^[1-3]$/.test(dimension)) {
+        throw new TypeError(
+          'Category centroid dimension keys must be 1, 2, or 3'
+        );
+      }
+      if (
+        !Array.isArray(centroids)
+        || centroids.length !== categories.length
+      ) {
+        throw new TypeError(
+          `Category centroid dimension ${dimension} must match the category inventory`
+        );
+      }
+      const centroid = requireRecord(
+        centroids[index],
+        `Category centroid ${dimension}:${index}`
+      );
+      centroid.category = categories[index];
     }
   }
 
   _refreshHighlightGroupsForField(source, fieldIndex) {
-    for (const page of this.highlightPages || []) {
-      for (const group of (page.highlightedGroups || [])) {
-        if (!group) continue;
-        if (group.fieldSource !== source) continue;
-        if (group.fieldIndex !== fieldIndex) continue;
+    requireSource(source);
+    const index = requireIndex(fieldIndex, 'Highlight field index');
+    const fields = requireInventory(this, source);
+    if (index >= fields.length) {
+      throw new RangeError(
+        'Highlight field index is outside its exact inventory'
+      );
+    }
+    const field = fields[index];
+    if (!Array.isArray(this.highlightPages)) {
+      throw new TypeError('Highlight pages must be an array');
+    }
+    requireMethod(this, '_notifyHighlightChange', 'Highlight state');
 
-        const field = source === FieldSource.VAR
-          ? this.varData?.fields?.[fieldIndex]
-          : this.obsData?.fields?.[fieldIndex];
-        if (!field) continue;
-
-        group.fieldKey = field.key;
-
-        if (group.type === 'category') {
-          const label = field.categories?.[group.categoryIndex];
-          if (label != null) group.categoryName = label;
-          group.label = `${field.key}: ${group.categoryName}`;
-        } else if (group.type === 'range') {
-          const formatVal = (v) => {
-            const num = Number(v);
-            if (!Number.isFinite(num)) return String(v);
-            if (Math.abs(num) >= 1000 || (Math.abs(num) > 0 && Math.abs(num) < 0.01)) return num.toExponential(2);
-            return num.toFixed(2);
-          };
-          group.label = `${field.key}: ${formatVal(group.rangeMin)} – ${formatVal(group.rangeMax)}`;
+    const targets = [];
+    for (let pageIndex = 0; pageIndex < this.highlightPages.length; pageIndex++) {
+      const page = requireRecord(
+        this.highlightPages[pageIndex],
+        `Highlight page ${pageIndex}`
+      );
+      if (!Array.isArray(page.highlightedGroups)) {
+        throw new TypeError(
+          `Highlight page ${pageIndex} highlightedGroups must be an array`
+        );
+      }
+      for (
+        let groupIndex = 0;
+        groupIndex < page.highlightedGroups.length;
+        groupIndex++
+      ) {
+        const group = requireRecord(
+          page.highlightedGroups[groupIndex],
+          `Highlight group ${pageIndex}:${groupIndex}`
+        );
+        if (!Object.hasOwn(group, 'fieldSource')) continue;
+        requireSource(group.fieldSource);
+        requireIndex(
+          group.fieldIndex,
+          `Highlight group ${pageIndex}:${groupIndex} field index`
+        );
+        if (
+          group.fieldSource !== source
+          || group.fieldIndex !== index
+        ) {
+          continue;
         }
+        if (group.type === 'category') {
+          if (field.kind !== FieldKind.CATEGORY) {
+            throw new Error(
+              'Category highlight must reference a categorical field'
+            );
+          }
+          const categories = requireCategoryInventory(
+            field,
+            'Highlighted category field'
+          );
+          const categoryIndex = requireIndex(
+            group.categoryIndex,
+            'Highlight category index'
+          );
+          if (categoryIndex >= categories.length) {
+            throw new RangeError(
+              'Highlight category index is outside its inventory'
+            );
+          }
+        } else if (group.type === 'range') {
+          if (field.kind !== FieldKind.CONTINUOUS) {
+            throw new Error(
+              'Range highlight must reference a continuous field'
+            );
+          }
+          formatRangeValue(group.rangeMin);
+          formatRangeValue(group.rangeMax);
+        } else {
+          throw new TypeError(
+            'Field-owned highlight type must be category or range'
+          );
+        }
+        targets.push(group);
       }
     }
 
-    this._notifyHighlightChange?.();
+    for (const group of targets) {
+      group.fieldKey = field.key;
+      if (group.type === 'category') {
+        const categoryName = field.categories[group.categoryIndex];
+        group.categoryName = categoryName;
+        group.label = `${field.key}: ${categoryName}`;
+      } else {
+        group.label = (
+          `${field.key}: ${formatRangeValue(group.rangeMin)}`
+          + ` – ${formatRangeValue(group.rangeMax)}`
+        );
+      }
+    }
+    this._notifyHighlightChange();
   }
 
   _ensureUserDefinedCentroidsForDim(field, dim) {
-    if (!field || field._isUserDefined !== true || !field._userDefinedId) return;
-
-    const dimKey = String(dim);
-    const centroidsByDim = field.centroidsByDim || {};
-    if (centroidsByDim[dimKey] || centroidsByDim[dim]) return;
-
-    const rawPositions = this.dimensionManager?.positionCache?.get?.(dim);
-    if (!rawPositions) return;
-
-    this._userDefinedFields.recomputeCentroidsForDimension(field._userDefinedId, dim, rawPositions);
-
-    // The new centroids are raw; make sure they are normalized exactly once when rendered.
-    if (field._normalizedDims instanceof Set) {
-      field._normalizedDims.delete(dimKey);
+    requireField(field, 'Dimension field');
+    if (field._isUserDefined !== true) return;
+    if (field.kind !== FieldKind.CATEGORY) return;
+    const fieldId = requireIdentifier(
+      field._userDefinedId,
+      'User-defined centroid field id'
+    );
+    const dimension = requireIndex(dim, 'Centroid dimension');
+    if (dimension < 1 || dimension > 3) {
+      throw new RangeError('Centroid dimension must be from 1 through 3');
     }
+    requireRecord(
+      field.centroidsByDim,
+      'User-defined field centroidsByDim'
+    );
+    const dimensionKey = String(dimension);
+    if (Object.hasOwn(field.centroidsByDim, dimensionKey)) {
+      if (!Array.isArray(field.centroidsByDim[dimensionKey])) {
+        throw new TypeError(
+          `User-defined centroid dimension ${dimensionKey} must be an array`
+        );
+      }
+      return;
+    }
+    if (
+      this.dimensionManager === null
+      || typeof this.dimensionManager !== 'object'
+      || !(this.dimensionManager.positionCache instanceof Map)
+    ) {
+      throw new TypeError(
+        'User-defined centroid computation requires DimensionManager positionCache'
+      );
+    }
+    if (!this.dimensionManager.positionCache.has(dimension)) {
+      throw new Error(
+        `Raw ${dimension}D positions are unavailable for centroid computation`
+      );
+    }
+    const rawPositions = this.dimensionManager.positionCache.get(dimension);
+    if (
+      !(rawPositions instanceof Float32Array)
+      || rawPositions.length !== this.pointCount * dimension
+    ) {
+      throw new TypeError(
+        `Raw ${dimension}D positions must exactly match the current dataset`
+      );
+    }
+    requireMethod(
+      this._userDefinedFields,
+      'recomputeCentroidsForDimension',
+      'User-defined field registry'
+    );
+    this._userDefinedFields.recomputeCentroidsForDimension(
+      fieldId,
+      dimension,
+      rawPositions
+    );
+    if (!Object.hasOwn(field.centroidsByDim, dimensionKey)) {
+      throw new Error(
+        `User-defined centroid dimension ${dimensionKey} was not published`
+      );
+    }
+    if (!(field._normalizedDims instanceof Set)) {
+      throw new TypeError(
+        'User-defined centroid normalization state must be a Set'
+      );
+    }
+    field._normalizedDims.delete(dimensionKey);
   }
 }
-

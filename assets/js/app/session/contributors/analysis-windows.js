@@ -13,16 +13,58 @@
 
 export const id = 'analysis-windows';
 
+function isPlainObject(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function requireManager(ctx, methods) {
+  const manager = ctx?.analysisWindowManager;
+  if (
+    manager === null ||
+    typeof manager !== 'object' ||
+    methods.some(method => typeof manager[method] !== 'function')
+  ) {
+    throw new TypeError(
+      `analysisWindowManager must implement ${methods.join('() and ')}()`
+    );
+  }
+  return manager;
+}
+
+function requireRestorePayload(payload) {
+  if (
+    !isPlainObject(payload) ||
+    Object.keys(payload).length !== 1 ||
+    !Object.hasOwn(payload, 'windows')
+  ) {
+    throw new TypeError(
+      'Analysis-window restore payload must contain exactly: windows'
+    );
+  }
+  if (!Array.isArray(payload.windows)) {
+    throw new TypeError('Analysis-window restore payload windows must be an array');
+  }
+  return structuredClone(payload.windows);
+}
+
 /**
  * Capture all floating analysis windows.
  * @param {object} ctx
  * @returns {import('../session-serializer.js').SessionChunk[]}
  */
 export function capture(ctx) {
-  const mgr = ctx?.analysisWindowManager;
-  if (!mgr?.exportSessionWindows) return [];
-
-  const windows = mgr.exportSessionWindows();
+  const mgr = requireManager(ctx, ['exportSessionWindows']);
+  const exportedWindows = mgr.exportSessionWindows();
+  if (!Array.isArray(exportedWindows)) {
+    throw new TypeError(
+      'analysisWindowManager.exportSessionWindows() must return an array'
+    );
+  }
+  const windows = structuredClone(exportedWindows);
   return [
     {
       id: 'analysis/windows',
@@ -41,19 +83,17 @@ export function capture(ctx) {
  * Restore floating analysis windows from descriptors.
  * @param {object} ctx
  * @param {any} _chunkMeta
- * @param {{ windows?: any[] }} payload
+ * @param {{ windows: any[] }} payload
  */
 export function restore(ctx, _chunkMeta, payload) {
-  const mgr = ctx?.analysisWindowManager;
-  if (!mgr?.createFromSessionDescriptor || !Array.isArray(payload?.windows)) return;
+  const mgr = requireManager(
+    ctx,
+    ['closeAll', 'createFromSessionDescriptor']
+  );
+  const windows = requireRestorePayload(payload);
 
-  // Idempotency: restore into a clean slate.
-  try { mgr.closeAll?.(); } catch { /* ignore */ }
-
-  for (const desc of payload.windows) {
-    try { mgr.createFromSessionDescriptor(desc); } catch (err) {
-      console.warn('[SessionSerializer] Failed to restore analysis window:', err);
-    }
+  mgr.closeAll();
+  for (const descriptor of windows) {
+    mgr.createFromSessionDescriptor(descriptor);
   }
 }
-

@@ -6,7 +6,12 @@
  */
 
 import { GRID_VS_SOURCE, GRID_FS_SOURCE, LINE_INSTANCED_VS_SOURCE, LINE_INSTANCED_FS_SOURCE } from './shaders/edge-grid-shaders.js';
-import { createProgram, createCanvasResizeObserver } from './gl-utils.js';
+import { createConnectivityRenderWeights } from './connectivity-weights.js';
+import {
+  createProgram,
+  createCanvasResizeObserver,
+  createRequiredTexture
+} from './gl-utils.js';
 import { CENTROID_VS, CENTROID_FS } from './shaders/centroid-shaders.js';
 import { SmokeRenderer } from './smoke-cloud/smoke-renderer.js';
 import { HighPerfRenderer } from './high-perf-renderer.js';
@@ -15,10 +20,487 @@ import { OrbitAnchorRenderer } from './orbit-anchor.js';
 import { createProjectileSystem } from './projectiles.js';
 import { OverlayManager } from './overlays/overlay-manager.js';
 import { buildOverlayContext } from './overlays/overlay-context.js';
-import { VelocityOverlay } from './overlays/velocity/velocity-overlay.js';
+import {
+  DEFAULT_VELOCITY_PARTICLE_CAPACITY,
+  VelocityOverlay,
+  validateActiveVelocityFieldId,
+  validateVelocityFieldId,
+  validateVelocityOverlayConfig
+} from './overlays/velocity/velocity-overlay.js';
+import {
+  assertCameraState,
+  assertNavigationMode,
+  cloneCameraState
+} from './camera-state-contract.js';
+
+const VALID_DIMENSION_LEVELS = new Set([1, 2, 3]);
+const INITIAL_DIMENSION_LEVEL = 3;
+const VALID_VIEWER_BACKGROUNDS = new Set(['grid', 'grid-dark', 'white', 'black']);
+const VALID_RENDER_MODES = new Set(['points', 'smoke']);
+
+export {
+  assertCameraState,
+  assertNavigationMode,
+  cloneCameraState
+} from './camera-state-contract.js';
+
+/**
+ * Return the camera default owned by an exact supported embedding dimension.
+ *
+ * @param {unknown} dimensionLevel
+ * @returns {'orbit'|'planar'}
+ */
+export function getDefaultNavigationMode(dimensionLevel) {
+  if (!VALID_DIMENSION_LEVELS.has(dimensionLevel)) {
+    throw new RangeError(
+      `Camera dimension must be exactly 1, 2, or 3; received ${String(dimensionLevel)}.`
+    );
+  }
+  return dimensionLevel === 3 ? 'orbit' : 'planar';
+}
+
+function assertViewId(viewId) {
+  if (typeof viewId !== 'string' || viewId.length === 0) {
+    throw new TypeError('Renderer view id must be a non-empty string.');
+  }
+  return viewId;
+}
+
+function assertExactBoolean(value, label) {
+  if (typeof value !== 'boolean') {
+    throw new TypeError(`${label} state must be an exact boolean.`);
+  }
+  return value;
+}
+
+function assertFiniteNumberInRange(value, min, max, label) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new TypeError(`${label} must be one finite number.`);
+  }
+  if (value < min || value > max) {
+    throw new RangeError(`${label} must be between ${min} and ${max}.`);
+  }
+  return value;
+}
+
+function assertIntegerInRange(value, min, max, label) {
+  if (!Number.isSafeInteger(value)) {
+    throw new TypeError(`${label} must be one safe integer.`);
+  }
+  if (value < min || value > max) {
+    throw new RangeError(`${label} must be between ${min} and ${max}.`);
+  }
+  return value;
+}
+
+function assertExactFunction(value, label) {
+  if (typeof value !== 'function') {
+    throw new TypeError(`${label} must be one function.`);
+  }
+  return value;
+}
+
+function assertNoWebGLError(gl, label) {
+  const errorCode = gl.getError();
+  if (errorCode !== gl.NO_ERROR) {
+    throw new Error(
+      `${label} encountered WebGL error 0x${errorCode.toString(16)}.`
+    );
+  }
+}
+
+function assertNonEmptyTrimmedString(value, label) {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value !== value.trim()
+  ) {
+    throw new TypeError(
+      `${label} must be one non-empty string without leading or trailing whitespace.`
+    );
+  }
+  return value;
+}
+
+function assertExactPlainRecord(value, expectedKeys, label) {
+  if (
+    value === null ||
+    typeof value !== 'object' ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype
+  ) {
+    throw new TypeError(`${label} must be one exact plain object.`);
+  }
+  const actualKeys = Object.keys(value).sort();
+  const exactKeys = expectedKeys.slice().sort();
+  if (
+    actualKeys.length !== exactKeys.length ||
+    actualKeys.some((key, index) => key !== exactKeys[index])
+  ) {
+    throw new TypeError(
+      `${label} must contain exactly: ${exactKeys.join(', ')}.`
+    );
+  }
+  return value;
+}
+
+function assertExactFloat32Array(value, expectedLength, label) {
+  if (!(value instanceof Float32Array)) {
+    throw new TypeError(`${label} must be a Float32Array.`);
+  }
+  if (value.length !== expectedLength) {
+    throw new RangeError(
+      `${label} must contain exactly ${expectedLength} values; received ${value.length}.`
+    );
+  }
+  return value;
+}
+
+function assertFiniteFloat32Array(value, expectedLength, label) {
+  const exact = assertExactFloat32Array(value, expectedLength, label);
+  for (let index = 0; index < exact.length; index += 1) {
+    if (!Number.isFinite(exact[index])) {
+      throw new RangeError(`${label} value ${index} must be finite.`);
+    }
+  }
+  return exact;
+}
+
+function assertExactUint8Array(value, expectedLength, label) {
+  if (!(value instanceof Uint8Array)) {
+    throw new TypeError(`${label} must be a Uint8Array.`);
+  }
+  if (value.length !== expectedLength) {
+    throw new RangeError(
+      `${label} must contain exactly ${expectedLength} bytes; received ${value.length}.`
+    );
+  }
+  return value;
+}
+
+function assertTransparencyArray(value, expectedLength, label) {
+  const exact = assertExactFloat32Array(value, expectedLength, label);
+  for (let index = 0; index < exact.length; index += 1) {
+    const alpha = exact[index];
+    if (!Number.isFinite(alpha) || alpha < 0 || alpha > 1) {
+      throw new RangeError(
+        `${label} value ${index} must be finite and between 0 and 1.`
+      );
+    }
+  }
+  return exact;
+}
+
+function assertOutlierArray(value, expectedLength, label) {
+  const exact = assertExactFloat32Array(value, expectedLength, label);
+  for (let index = 0; index < exact.length; index += 1) {
+    const quantile = exact[index];
+    if (!Number.isFinite(quantile) || quantile < -1) {
+      throw new RangeError(
+        `${label} value ${index} must be finite and at least -1.`
+      );
+    }
+  }
+  return exact;
+}
+
+function assertViewerDataPayload(payload) {
+  const exact = assertExactPlainRecord(
+    payload,
+    [
+      'positions',
+      'colors',
+      'transparency',
+      'dimensionLevel'
+    ],
+    'Viewer data'
+  );
+  const dimensionLevel = exact.dimensionLevel;
+  getDefaultNavigationMode(dimensionLevel);
+  if (
+    !(exact.positions instanceof Float32Array) ||
+    exact.positions.length % 3 !== 0
+  ) {
+    throw new TypeError(
+      'Viewer positions must be a Float32Array with exactly three values per point.'
+    );
+  }
+  const pointCount = exact.positions.length / 3;
+  assertFiniteFloat32Array(
+    exact.positions,
+    pointCount * 3,
+    'Viewer positions'
+  );
+  assertExactUint8Array(exact.colors, pointCount * 4, 'Viewer colors');
+  assertTransparencyArray(
+    exact.transparency,
+    pointCount,
+    'Viewer transparency'
+  );
+  return {
+    positions: exact.positions,
+    colors: exact.colors,
+    transparency: exact.transparency,
+    dimensionLevel,
+    pointCount
+  };
+}
+
+function assertCentroidPayload(payload) {
+  const exact = assertExactPlainRecord(
+    payload,
+    ['positions', 'colors'],
+    'Centroid data'
+  );
+  if (
+    !(exact.positions instanceof Float32Array) ||
+    exact.positions.length % 3 !== 0
+  ) {
+    throw new TypeError(
+      'Centroid positions must be a Float32Array with exactly three values per centroid.'
+    );
+  }
+  const count = exact.positions.length / 3;
+  assertFiniteFloat32Array(
+    exact.positions,
+    count * 3,
+    'Centroid positions'
+  );
+  assertExactUint8Array(exact.colors, count * 4, 'Centroid colors');
+  return {
+    positions: exact.positions,
+    colors: exact.colors,
+    count
+  };
+}
+
+function cloneSnapshotMeta(value, label = 'Snapshot metadata') {
+  const exact = assertExactPlainRecord(
+    value,
+    ['filtersText'],
+    label
+  );
+  if (
+    !Array.isArray(exact.filtersText) ||
+    exact.filtersText.some(
+      (entry) =>
+        typeof entry !== 'string' ||
+        entry.length === 0 ||
+        entry.trim() !== entry
+    )
+  ) {
+    throw new TypeError(
+      `${label} filtersText must be an array of non-empty trimmed strings.`
+    );
+  }
+  return { filtersText: [...exact.filtersText] };
+}
+
+function assertSnapshotFieldDescriptor(fieldKey, fieldKind) {
+  if (fieldKey === null || fieldKind === null) {
+    if (fieldKey !== null || fieldKind !== null) {
+      throw new TypeError(
+        'Snapshot fieldKey and fieldKind must both be null or both be present.'
+      );
+    }
+    return;
+  }
+  assertNonEmptyTrimmedString(fieldKey, 'Snapshot field key');
+  if (fieldKind !== 'category' && fieldKind !== 'continuous') {
+    throw new RangeError(
+      'Snapshot field kind must be exactly "category", "continuous", or null.'
+    );
+  }
+}
+
+function assertSnapshotConfig(config, sourcePointCount) {
+  const exact = assertExactPlainRecord(
+    config,
+    [
+      'cameraState',
+      'centroidColors',
+      'centroidPositions',
+      'colors',
+      'dimensionLevel',
+      'fieldKey',
+      'fieldKind',
+      'label',
+      'meta',
+      'sourceViewId',
+      'transparency'
+    ],
+    'Snapshot configuration'
+  );
+  assertNonEmptyTrimmedString(exact.label, 'Snapshot label');
+  assertSnapshotFieldDescriptor(exact.fieldKey, exact.fieldKind);
+  assertExactUint8Array(
+    exact.colors,
+    sourcePointCount * 4,
+    'Snapshot colors'
+  );
+  assertTransparencyArray(
+    exact.transparency,
+    sourcePointCount,
+    'Snapshot transparency'
+  );
+  const centroidArrays = [
+    exact.centroidPositions,
+    exact.centroidColors
+  ];
+  const allCentroidsNull = centroidArrays.every((value) => value === null);
+  if (
+    !allCentroidsNull &&
+    centroidArrays.some((value) => value === null)
+  ) {
+    throw new TypeError(
+      'Snapshot centroid positions and colors must be published together.'
+    );
+  }
+  let centroidCount = 0;
+  if (!allCentroidsNull) {
+    if (
+      !(exact.centroidPositions instanceof Float32Array) ||
+      exact.centroidPositions.length % 3 !== 0
+    ) {
+      throw new TypeError(
+        'Snapshot centroid positions must contain complete Float32 XYZ triples.'
+      );
+    }
+    centroidCount = exact.centroidPositions.length / 3;
+    assertFiniteFloat32Array(
+      exact.centroidPositions,
+      centroidCount * 3,
+      'Snapshot centroid positions'
+    );
+    assertExactUint8Array(
+      exact.centroidColors,
+      centroidCount * 4,
+      'Snapshot centroid colors'
+    );
+  }
+  const dimensionLevel = exact.dimensionLevel;
+  getDefaultNavigationMode(dimensionLevel);
+  const cameraState = cloneCameraState(
+    exact.cameraState,
+    'Snapshot camera state'
+  );
+  return {
+    label: exact.label,
+    fieldKey: exact.fieldKey,
+    fieldKind: exact.fieldKind,
+    colors: new Uint8Array(exact.colors),
+    transparency: new Float32Array(exact.transparency),
+    centroidPositions: allCentroidsNull
+      ? null
+      : new Float32Array(exact.centroidPositions),
+    centroidColors: allCentroidsNull
+      ? null
+      : new Uint8Array(exact.centroidColors),
+    centroidCount,
+    meta: cloneSnapshotMeta(exact.meta),
+    cameraState,
+    dimensionLevel
+  };
+}
+
+function assertCentroidLabelEntries(labels) {
+  if (!Array.isArray(labels)) {
+    throw new TypeError('Centroid labels must be an array.');
+  }
+  for (const [index, item] of labels.entries()) {
+    const keys = (
+      item !== null &&
+      typeof item === 'object' &&
+      !Array.isArray(item)
+    )
+      ? Object.keys(item).sort().join(',')
+      : '';
+    const hasAlpha = keys === 'alpha,el,position';
+    if (
+      item === null ||
+      typeof item !== 'object' ||
+      Array.isArray(item) ||
+      Object.getPrototypeOf(item) !== Object.prototype ||
+      (keys !== 'el,position' && !hasAlpha) ||
+      !(item.el instanceof HTMLElement) ||
+      !Array.isArray(item.position) ||
+      item.position.length !== 3 ||
+      !item.position.every(
+        (value) => typeof value === 'number' && Number.isFinite(value)
+      ) ||
+      (
+        hasAlpha &&
+        (
+          typeof item.alpha !== 'number' ||
+          !Number.isFinite(item.alpha) ||
+          item.alpha < 0 ||
+          item.alpha > 1
+        )
+      )
+    ) {
+      throw new TypeError(
+        `Centroid label ${index} must be an exact element/finite-3D-position record with optional finite alpha from 0 through 1.`
+      );
+    }
+  }
+  return labels;
+}
+
+function assertViewerBackground(mode) {
+  if (!VALID_VIEWER_BACKGROUNDS.has(mode)) {
+    throw new TypeError(
+      'Viewer background must be exactly "grid", "grid-dark", "white", or "black".'
+    );
+  }
+  return mode;
+}
+
+function assertRenderMode(mode) {
+  if (!VALID_RENDER_MODES.has(mode)) {
+    throw new TypeError('Render mode must be exactly "points" or "smoke".');
+  }
+  return mode;
+}
+
+/**
+ * Track whether dimension defaults still own navigation for each view.
+ * This state changes only on UI/session events and is never read by the render
+ * loop.
+ */
+export function createNavigationModeOwnership() {
+  let sharedUserChoice = false;
+  const viewUserChoices = new Set();
+
+  return Object.freeze({
+    recordSharedUserChoice(mode) {
+      assertNavigationMode(mode);
+      sharedUserChoice = true;
+    },
+    recordViewUserChoice(viewId, mode) {
+      assertNavigationMode(mode);
+      viewUserChoices.add(assertViewId(viewId));
+    },
+    promoteViewUserChoice(viewId, mode) {
+      assertNavigationMode(mode);
+      const exactViewId = assertViewId(viewId);
+      if (!viewUserChoices.has(exactViewId)) {
+        return false;
+      }
+      sharedUserChoice = true;
+      return true;
+    },
+    hasExplicitUserChoice(viewId) {
+      const exactViewId = assertViewId(viewId);
+      return sharedUserChoice || viewUserChoices.has(exactViewId);
+    },
+    deleteView(viewId) {
+      viewUserChoices.delete(assertViewId(viewId));
+    }
+  });
+}
 
 export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onViewFocus }) {
-  // WebGL2 ONLY - no fallback
+  // Every current rendering path requires WebGL2.
   const gl = canvas.getContext('webgl2', { antialias: true, powerPreference: 'high-performance' });
 
   if (!gl) {
@@ -64,6 +546,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     lineWidth:         gl.getUniformLocation(lineInstancedProgram, 'u_lineWidth'),
     maxEdges:          gl.getUniformLocation(lineInstancedProgram, 'u_maxEdges'),
     edgeTexture:       gl.getUniformLocation(lineInstancedProgram, 'u_edgeTexture'),
+    edgeWeightTexture: gl.getUniformLocation(lineInstancedProgram, 'u_edgeWeightTexture'),
     edgeTexDims:       gl.getUniformLocation(lineInstancedProgram, 'u_edgeTexDims'),
     positionTexture:   gl.getUniformLocation(lineInstancedProgram, 'u_positionTexture'),
     posTexDims:        gl.getUniformLocation(lineInstancedProgram, 'u_posTexDims'),
@@ -133,17 +616,37 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
   function ensureVectorFieldOverlay() {
     if (vectorFieldOverlay) return vectorFieldOverlay;
-    vectorFieldOverlay = new VelocityOverlay(gl);
-    vectorFieldOverlay.init();
-    ensureOverlayManager().register(vectorFieldOverlay);
-    return vectorFieldOverlay;
+    const candidate = new VelocityOverlay(gl);
+    try {
+      candidate.init();
+      ensureOverlayManager().register(candidate);
+    } catch (error) {
+      try {
+        candidate.dispose();
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          'Velocity overlay initialization and cleanup both failed.'
+        );
+      }
+      throw error;
+    }
+    vectorFieldOverlay = candidate;
+    return candidate;
   }
 
   // === BUFFERS ===
   // Centroid buffers (small count, separate from main points)
   // Color buffer now stores RGBA as uint8 (alpha packed in)
-  const centroidPositionBuffer = gl.createBuffer();
-  const centroidColorBuffer = gl.createBuffer(); // RGBA uint8
+  let centroidPositionBuffer = gl.createBuffer();
+  let centroidColorBuffer = gl.createBuffer(); // RGBA uint8
+  if (!centroidPositionBuffer || !centroidColorBuffer) {
+    if (centroidPositionBuffer) gl.deleteBuffer(centroidPositionBuffer);
+    if (centroidColorBuffer) gl.deleteBuffer(centroidColorBuffer);
+    throw new Error(
+      'Viewer could not allocate the required centroid buffers.'
+    );
+  }
 
   // === INSTANCED EDGE RENDERING ===
   // Quad geometry buffer for instanced edges (6 vertices, 2 triangles)
@@ -160,9 +663,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   // V2 edge textures (created on demand)
   // Global edge topology texture (shared across all views - edges don't change)
   let edgeTextureV2 = null;
+  let edgeWeightTextureV2 = null;
   let edgeTexDimsV2 = [0, 0];
   let nEdgesV2 = 0;
   let nCellsV2 = 0;
+  let hasEdgeDataV2 = false;
   let useInstancedEdges = false;  // Whether to use v2 instanced rendering
   let edgeLodLimit = 0;  // LOD limit for number of edges to render (0 = all)
 
@@ -262,6 +767,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   let liveViewLabel = 'View 1';
   let liveViewHidden = false; // Whether to hide live view from grid
   let viewFocusHandler = typeof onViewFocus === 'function' ? onViewFocus : null;
+  let navigationModeChangeHandler = null;
+
+  function assertKnownViewId(viewId) {
+    const exactViewId = assertViewId(viewId);
+    if (
+      exactViewId !== LIVE_VIEW_ID &&
+      !snapshotViews.some((snapshot) => snapshot.id === exactViewId)
+    ) {
+      throw new RangeError(`Unknown renderer view "${exactViewId}".`);
+    }
+    return exactViewId;
+  }
 
   // Camera lock state for independent view navigation
   let camerasLocked = true;           // Default: all views share camera
@@ -272,28 +789,99 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   let cachedGridProjection = null;       // { aspect: number, matrix: Float32Array } - shared by all grid cells
 
 	  // Per-view dimension tracking for multi-dimensional support
-	  const viewDimensionLevels = new Map();  // viewId -> dimension level (1, 2, 3, or 4)
+	  const viewDimensionLevels = new Map([
+	    [LIVE_VIEW_ID, INITIAL_DIMENSION_LEVEL]
+	  ]);  // viewId -> exact published dimension level
 	  const viewPositionsCache = new Map();   // viewId -> Float32Array positions
 	  // Per-view render params (avoid per-frame allocations in multiview render loop)
 	  const renderParamsByView = new Map();   // viewId -> mutable params object passed to HighPerfRenderer
 	  // Per-view overlay contexts + stable builder options (avoid per-frame allocations/closures)
 	  const overlayCtxByView = new Map();     // viewId -> OverlayContext
 	  const overlayCtxOptionsByView = new Map(); // viewId -> stable buildOverlayContext options object
+	  const lodChangeListeners = new Set();
+	  const publishedLodLevels = new Map();
 
-  function getFallbackDimensionLevel() {
-    const liveDim = viewDimensionLevels.get(LIVE_VIEW_ID);
-    return liveDim !== undefined ? liveDim : 3;
-  }
-
-	  function getEffectiveDimensionLevel(viewId) {
-	    const vid = String(viewId);
-	    const cached = viewDimensionLevels.get(vid);
-	    if (cached !== undefined) return cached;
-	    return getFallbackDimensionLevel();
+	  function publishLodLevelChange(viewId) {
+	    const exactViewId = assertKnownViewId(viewId);
+	    const lodLevel = hpRenderer.getCurrentLODLevel(exactViewId);
+	    if (!Number.isSafeInteger(lodLevel) || lodLevel < -1) {
+	      throw new Error(
+	        `Renderer published an invalid LOD level for view "${exactViewId}".`
+	      );
+	    }
+	    if (!publishedLodLevels.has(exactViewId)) {
+	      publishedLodLevels.set(exactViewId, lodLevel);
+	      return;
+	    }
+	    if (publishedLodLevels.get(exactViewId) === lodLevel) return;
+	    publishedLodLevels.set(exactViewId, lodLevel);
+	    const event = Object.freeze({ viewId: exactViewId, lodLevel });
+	    for (const listener of lodChangeListeners) {
+	      listener(event);
+	    }
 	  }
 
+	  function getPublishedDimensionLevel(viewId) {
+	    if (typeof viewId !== 'string' || viewId.length === 0) {
+	      throw new TypeError('Renderer view id must be a non-empty string.');
+	    }
+	    if (!viewDimensionLevels.has(viewId)) {
+	      throw new RangeError(
+	        `Dimension state is not published for view "${viewId}".`
+	      );
+	    }
+	    const dimensionLevel = viewDimensionLevels.get(viewId);
+	    getDefaultNavigationMode(dimensionLevel);
+	    return dimensionLevel;
+	  }
+
+	  function getExactViewPositions(viewId) {
+	    if (typeof viewId !== 'string' || viewId.length === 0) {
+	      throw new TypeError('Renderer view id must be a non-empty string.');
+	    }
+	    const positions = viewPositionsCache.get(viewId);
+	    if (!(positions instanceof Float32Array)) {
+	      throw new Error(`Positions are not published for view "${viewId}".`);
+	    }
+	    return positions;
+	  }
+
+		  function getExactViewTransparency(viewId) {
+	    if (typeof viewId !== 'string' || viewId.length === 0) {
+	      throw new TypeError('Renderer view id must be a non-empty string.');
+	    }
+	    if (viewId === LIVE_VIEW_ID) {
+	      if (!(transparencyArray instanceof Float32Array)) {
+	        throw new Error('Transparency is not published for view "live".');
+	      }
+	      return transparencyArray;
+	    }
+	    const snapshot = snapshotViews.find((entry) => entry.id === viewId);
+	    if (!snapshot) {
+	      throw new Error(`View "${viewId}" does not exist.`);
+	    }
+	    if (!(snapshot.transparency instanceof Float32Array)) {
+	      throw new Error(`Transparency is not published for view "${viewId}".`);
+	    }
+		    return snapshot.transparency;
+		  }
+
+		  function requireSnapshotBufferId(viewId) {
+		    const exactId = assertViewId(viewId);
+		    if (exactId === LIVE_VIEW_ID) return null;
+		    if (!hpRenderer.hasSnapshotBuffer(exactId)) {
+		      throw new Error(
+		        `View "${exactId}" has no published snapshot GPU buffer.`
+		      );
+		    }
+		    return exactId;
+		  }
+
 	  function getOrCreateRenderParams(viewId) {
-	    const vid = String(viewId || LIVE_VIEW_ID);
+	    if (typeof viewId !== 'string' || viewId.length === 0) {
+	      throw new TypeError('Renderer view id must be a non-empty string.');
+	    }
+	    const vid = viewId;
 	    let renderParams = renderParamsByView.get(vid);
 	    if (!renderParams) {
 	      renderParams = {
@@ -312,9 +900,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 	        lightDir,
 	        cameraPosition: vec3.create(),
 	        cameraDistance: 0,
+	        forceLOD: -1,
+	        quality: currentShaderQuality,
 	        viewId: vid,
-	        dimensionLevel: 3,
-	        useAlphaTexture: false
+	        dimensionLevel: getPublishedDimensionLevel(vid),
+	        useAlphaTexture: false,
+	        autoFog: true,
+	        overrideBounds: null
 	      };
 	      renderParamsByView.set(vid, renderParams);
 	    }
@@ -394,7 +986,6 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   let positionsArray = null;
   let colorsArray = null;
   let transparencyArray = null;
-  let currentLoadedViewId = null; // Track which view's data is loaded in hpRenderer (for perf optimization)
   let fogNearMean = 0.0;
   let fogFarMean = 1.0;
 
@@ -413,22 +1004,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     getViewportInfoAtScreen,
     getRenderContext: () => getHighlightContext(),
     getNavigationState: () => ({ navigationMode, isDragging }),
-    // Provide view-specific positions for multi-dimensional selection support
-    getViewPositions: (viewId) => {
-      if (!viewId) return positionsArray;
-      return viewPositionsCache.get(String(viewId)) || positionsArray;
-    },
-    // Provide view-specific transparency for per-view filtering support
-    // Each view may have different filters, so selection tools must respect them
-    getViewTransparency: (viewId) => {
-      if (!viewId || viewId === LIVE_VIEW_ID) return transparencyArray;
-      const snapshot = snapshotViews.find(s => s.id === viewId);
-      // Use snapshot's own transparency if it doesn't share live transparency
-      if (snapshot && !snapshot.sharesLiveTransparency && snapshot.transparency) {
-        return snapshot.transparency;
-      }
-      return transparencyArray;
-    },
+    getViewPositions: getExactViewPositions,
+    getViewTransparency: getExactViewTransparency,
     startTime,
     shaderQuality: currentShaderQuality
   });
@@ -451,7 +1028,6 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   let lightingStrength = 0.6;
   let fogDensity = 0.5;
   let sizeAttenuation = 0.65;
-  let outlierThreshold = 1.0;
   // Default to a clean white background; background modes can override.
   let bgColor = [1.0, 1.0, 1.0];
   let fogColor = [1.0, 1.0, 1.0];
@@ -500,6 +1076,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
   // Navigation (orbit + free-fly + planar)
   let navigationMode = 'orbit';
+  const navigationModeOwnership = createNavigationModeOwnership();
   let lookSensitivity = 0.0025; // radians per pixel
   let invertLookX = false;
   let invertLookY = false;
@@ -520,8 +1097,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   let pointerLockEnabled = false;
   let pointerLockActive = false;
   let pointerLockChangeHandler = null;
+  let pointerLockRequestGeneration = 0;
+  let pointerLockRequestPending = false;
   let pendingShot = false;
   let pendingShotViewportInfo = null;  // Cached viewport info for pointer lock shots
+  let projectileBuildGeneration = 0;
+  let projectileBuildTimer = null;
+  let projectileBuildCompletion = null;
   let lookActive = false;
   let lastFrameTime = performance.now();
 
@@ -565,7 +1147,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     getGridBounds: () => ({ min: -GRID_SIZE, max: GRID_SIZE }),
     isGridVisible: () => showGrid && gridOpacity > 0.1,
     // For dimension-aware spatial index collision queries
-    getCurrentDimensionLevel: () => getFallbackDimensionLevel(),
+    getCurrentDimensionLevel: () => getPublishedDimensionLevel(LIVE_VIEW_ID),
   });
 
   function getOrbitSigns() {
@@ -723,7 +1305,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     if (navigationMode === 'free') {
       const wantsShot = e.button === 0;
       // Only request pointer lock if user has enabled it via checkbox
-      if (pointerLockEnabled && !pointerLockActive && canvas.requestPointerLock) {
+      if (pointerLockEnabled && !pointerLockActive) {
         // Pointer lock enabled but not yet active - request it and queue the shot
         // Capture viewport info NOW (before pointer lock changes cursor behavior)
         if (wantsShot) {
@@ -741,7 +1323,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
           };
         }
         pendingShot = pendingShot || wantsShot;
-        canvas.requestPointerLock();
+        requestPointerLockOwned();
       } else {
         // Either pointer lock is disabled, or already active - use normal mouse look
         lookActive = true;
@@ -1014,9 +1596,94 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   };
   addEventListenerWithCleanup(window, 'blur', handleWindowBlur);
 
+  function publishPointerLockState(active, errorMessage) {
+    if (pointerLockChangeHandler !== null) {
+      pointerLockChangeHandler(active, errorMessage);
+    }
+  }
+
+  function clearPointerLockIntent(errorMessage = null) {
+    pointerLockRequestGeneration += 1;
+    pointerLockRequestPending = false;
+    pointerLockActive = false;
+    pointerLockEnabled = false;
+    lookActive = false;
+    pendingShot = false;
+    pendingShotViewportInfo = null;
+    projectileSystem.cancelCharging();
+    canvas.classList.remove('dragging');
+    if (navigationMode === 'free') {
+      canvas.style.cursor = 'crosshair';
+    } else {
+      updateCursorForHighlightMode();
+    }
+    publishPointerLockState(false, errorMessage);
+  }
+
+  function requestPointerLockOwned() {
+    if (typeof canvas.requestPointerLock !== 'function') {
+      clearPointerLockIntent(
+        'Pointer lock is unavailable in this browser or platform context.'
+      );
+      return;
+    }
+    if (pointerLockRequestPending || pointerLockActive) return;
+    const generation = pointerLockRequestGeneration + 1;
+    pointerLockRequestGeneration = generation;
+    pointerLockRequestPending = true;
+    let result;
+    try {
+      result = canvas.requestPointerLock();
+    } catch (error) {
+      clearPointerLockIntent(
+        `Pointer lock request failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+      return;
+    }
+    if (result === undefined) return;
+    if (
+      result === null ||
+      typeof result !== 'object' ||
+      typeof result.then !== 'function'
+    ) {
+      clearPointerLockIntent(
+        'Pointer lock returned an invalid browser request result.'
+      );
+      return;
+    }
+    result.catch((error) => {
+      if (
+        generation !== pointerLockRequestGeneration ||
+        pointerLockActive
+      ) {
+        return;
+      }
+      clearPointerLockIntent(
+        `Pointer lock request failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    });
+  }
+
+  function publishProjectileBuildResult(completion, status, message) {
+    if (completion === null) return;
+    completion(Object.freeze({ status, message }));
+  }
+
+  function cancelPendingProjectileBuild(message) {
+    projectileBuildGeneration += 1;
+    if (projectileBuildTimer !== null) {
+      clearTimeout(projectileBuildTimer);
+      projectileBuildTimer = null;
+    }
+    const completion = projectileBuildCompletion;
+    projectileBuildCompletion = null;
+    publishProjectileBuildResult(completion, 'cancelled', message);
+  }
+
   function handlePointerLockChange() {
     pointerLockActive = document.pointerLockElement === canvas;
     if (pointerLockActive) {
+      pointerLockRequestPending = false;
       lookActive = true;
       if (typeof canvas.focus === 'function') {
         canvas.focus();
@@ -1030,31 +1697,15 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         pendingShot = false;
       }
     } else {
-      lookActive = false;
-      pointerLockEnabled = false;
-      pendingShot = false;
-      pendingShotViewportInfo = null;  // Clear stored viewport info
-      // Cancel charging if pointer lock is released
-      projectileSystem.cancelCharging();
-      canvas.classList.remove('dragging');
-      if (navigationMode === 'free') {
-        canvas.style.cursor = 'crosshair';
-      } else {
-        updateCursorForHighlightMode();
-      }
+      clearPointerLockIntent(null);
+      return;
     }
-    if (typeof pointerLockChangeHandler === 'function') {
-      pointerLockChangeHandler(pointerLockActive);
-    }
+    publishPointerLockState(true, null);
   }
 
   addEventListenerWithCleanup(document, 'pointerlockchange', handlePointerLockChange);
   const handlePointerLockError = () => {
-    pointerLockActive = false;
-    pointerLockEnabled = false;
-    if (typeof pointerLockChangeHandler === 'function') {
-      pointerLockChangeHandler(false);
-    }
+    clearPointerLockIntent('The browser rejected the pointer lock request.');
   };
   addEventListenerWithCleanup(document, 'pointerlockerror', handlePointerLockError);
 
@@ -1063,8 +1714,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     const code = e.code;
     if (pointerLockActive && code === 'Escape') {
       if (document.exitPointerLock) document.exitPointerLock();
-      pointerLockEnabled = false;
-      if (typeof pointerLockChangeHandler === 'function') pointerLockChangeHandler(false);
+      clearPointerLockIntent(null);
       return;
     }
     // WASD navigation works in all modes (free, orbit, planar)
@@ -1202,38 +1852,24 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
   // Compute camera position and axes from a camera state (for multiview projectile support)
   function getCameraFromState(camState) {
-    if (!camState) {
-      return { position: freeflyPosition, axes: getFreeflyAxes() };
+    const exactState = assertCameraState(
+      camState,
+      'Per-view projectile camera state'
+    );
+    const exactViewMatrix = mat4.create();
+    computeViewMatrixFromState(exactState, exactViewMatrix);
+    const exactCamera = getCameraFromViewMatrix(exactViewMatrix);
+    if (exactCamera === null) {
+      throw new Error('Per-view camera matrix is not invertible.');
     }
-    const navMode = camState.navigationMode || 'orbit';
-    if (navMode === 'free' && camState.freefly) {
-      const pos = camState.freefly.position || [0, 0, 5];
-      const yaw = camState.freefly.yaw || 0;
-      const pitch = camState.freefly.pitch || 0;
-      // Compute axes from yaw/pitch - same as getFreeflyAxes()
-      const forward = vec3.fromValues(
-        Math.cos(pitch) * Math.cos(yaw),
-        Math.sin(pitch),
-        Math.cos(pitch) * Math.sin(yaw)
-      );
-      vec3.normalize(forward, forward);
-      const worldUp = vec3.fromValues(0, 1, 0);
-      const right = vec3.cross(vec3.create(), forward, worldUp);
-      if (vec3.length(right) < 1e-6) vec3.set(right, 1, 0, 0);
-      vec3.normalize(right, right);
-      const upVec = vec3.cross(vec3.create(), right, forward);
-      vec3.normalize(upVec, upVec);
-      return { position: pos, axes: { forward, right, upVec } };
-    }
-    // For orbit mode, return current global state (projectiles only work in freefly)
-    return { position: freeflyPosition, axes: getFreeflyAxes() };
+    return exactCamera;
   }
 
   // Get camera position and axes for a specific view (multiview support)
   // Uses cached view matrix for non-focused views (more reliable than camera state)
   function getCameraForView(viewId) {
-    const vid = String(viewId);
-    const isFocused = vid === String(focusedViewId);
+    const vid = assertViewId(viewId);
+    const isFocused = vid === assertViewId(focusedViewId);
     // For the focused view, use global state (always up-to-date)
     if (isFocused || camerasLocked) {
       return { position: freeflyPosition, axes: getFreeflyAxes() };
@@ -1242,9 +1878,14 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     const cached = cachedViewMatrices.get(vid);
     if (cached && cached.viewMatrix) {
       const fromMatrix = getCameraFromViewMatrix(cached.viewMatrix);
-      if (fromMatrix) return fromMatrix;
+      if (fromMatrix === null) {
+        throw new Error(
+          `Cached camera matrix for view "${vid}" is not invertible.`
+        );
+      }
+      return fromMatrix;
     }
-    // Fall back to camera state
+    // Derive from the exact published camera state when the matrix cache is cold.
     const camState = getViewCameraState(vid);
     return getCameraFromState(camState);
   }
@@ -1434,38 +2075,111 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   }
 
   /**
-   * Create edge texture from source and destination arrays
-   * @param {Uint16Array|Uint32Array} sources - Source cell indices
-   * @param {Uint16Array|Uint32Array} destinations - Destination cell indices
+   * Create edge topology and weight textures from one aligned payload.
+   * @param {Uint32Array} sources - Source cell indices
+   * @param {Uint32Array} destinations - Destination cell indices
+   * @param {Float32Array} renderWeights - Validated relative edge strengths
    * @param {number} nEdges - Number of edges
    */
-  function createEdgeTextureV2(sources, destinations, nEdges) {
-    if (edgeTextureV2) {
-      gl.deleteTexture(edgeTextureV2);
-    }
-
-    edgeTexDimsV2 = calcTextureDims(nEdges);
-    const [width, height] = edgeTexDimsV2;
+  function createEdgeTexturesV2(
+    sources,
+    destinations,
+    renderWeights,
+    nEdges
+  ) {
+    const nextDims = calcTextureDims(nEdges);
+    const [width, height] = nextDims;
     const texelCount = width * height;
-
-    // Pack edges into RG32UI texture (2 uint32 per texel)
-    const data = new Uint32Array(texelCount * 2);
-    for (let i = 0; i < nEdges; i++) {
-      data[i * 2] = sources[i];
-      data[i * 2 + 1] = destinations[i];
+    if (texelCount < nEdges) {
+      throw new Error(
+        `Connectivity rendering requires ${nEdges} texture texels, ` +
+        `but this WebGL2 implementation supports ${texelCount}.`
+      );
     }
 
-    edgeTextureV2 = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, edgeTextureV2);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG32UI, width, height, 0, gl.RG_INTEGER, gl.UNSIGNED_INT, data);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const topologyData = new Uint32Array(texelCount * 2);
+    for (let i = 0; i < nEdges; i++) {
+      topologyData[i * 2] = sources[i];
+      topologyData[i * 2 + 1] = destinations[i];
+    }
+    const weightData = new Float32Array(texelCount);
+    weightData.set(renderWeights);
+
+    const nextTopologyTexture = createRequiredTexture(
+      gl,
+      'weighted connectivity topology'
+    );
+    let nextWeightTexture = null;
+
+    try {
+      nextWeightTexture = createRequiredTexture(
+        gl,
+        'weighted connectivity weights'
+      );
+      gl.bindTexture(gl.TEXTURE_2D, nextTopologyTexture);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG32UI, width, height, 0, gl.RG_INTEGER, gl.UNSIGNED_INT, topologyData);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+      gl.bindTexture(gl.TEXTURE_2D, nextWeightTexture);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, width, height, 0, gl.RED, gl.FLOAT, weightData);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    } catch (error) {
+      gl.bindTexture(gl.TEXTURE_2D, null);
+      gl.deleteTexture(nextTopologyTexture);
+      if (nextWeightTexture !== null) {
+        gl.deleteTexture(nextWeightTexture);
+      }
+      throw error;
+    }
     gl.bindTexture(gl.TEXTURE_2D, null);
 
+    if (edgeTextureV2 !== null) {
+      gl.deleteTexture(edgeTextureV2);
+    }
+    if (edgeWeightTextureV2 !== null) {
+      gl.deleteTexture(edgeWeightTextureV2);
+    }
+    edgeTextureV2 = nextTopologyTexture;
+    edgeWeightTextureV2 = nextWeightTexture;
+    edgeTexDimsV2 = nextDims;
     nEdgesV2 = nEdges;
-    console.log(`[Viewer] Created edge texture V2: ${nEdges} edges, ${width}x${height} texture`);
+    console.log(`[Viewer] Created weighted edge textures V2: ${nEdges} edges, ${width}x${height} textures`);
+    return true;
+  }
+
+  function clearEdgeResourcesV2() {
+    if (edgeTextureV2 !== null) {
+      gl.deleteTexture(edgeTextureV2);
+      edgeTextureV2 = null;
+    }
+    if (edgeWeightTextureV2 !== null) {
+      gl.deleteTexture(edgeWeightTextureV2);
+      edgeWeightTextureV2 = null;
+    }
+    for (const entry of edgePositionTexturesV2.values()) {
+      if (entry.texture) {
+        gl.deleteTexture(entry.texture);
+      }
+    }
+    edgePositionTexturesV2.clear();
+    for (const entry of edgeVisibilityTexturesV2.values()) {
+      if (entry.texture) {
+        gl.deleteTexture(entry.texture);
+      }
+    }
+    edgeVisibilityTexturesV2.clear();
+    edgeTexDimsV2 = [0, 0];
+    nEdgesV2 = 0;
+    nCellsV2 = 0;
+    hasEdgeDataV2 = false;
+    useInstancedEdges = false;
+    edgeLodLimit = 0;
   }
 
   // ========================================================================
@@ -1482,33 +2196,24 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
    * @returns {boolean} True if texture was created successfully
    */
   function createPositionTextureV2ForView(viewId, positions, nCells) {
-    const vid = String(viewId);
+    if (typeof viewId !== 'string' || viewId.length === 0) {
+      return false;
+    }
+    const vid = viewId;
 
     // Validate inputs
-    if (!positions || positions.length < nCells * 3) {
-      console.warn(`[Viewer] Invalid positions for view ${vid}: positions=${positions?.length}, expected=${nCells * 3}`);
+    if (
+      !(positions instanceof Float32Array) ||
+      !Number.isSafeInteger(nCells) ||
+      nCells <= 0 ||
+      positions.length !== nCells * 3
+    ) {
+      console.warn(`[Viewer] Invalid positions for view ${vid}`);
       return false;
     }
 
     const existing = edgePositionTexturesV2.get(vid);
     const newDims = calcTextureDims(nCells);
-
-    // Delete existing texture if present
-    if (existing?.texture) {
-      gl.deleteTexture(existing.texture);
-      // Also delete associated visibility texture if dimensions changed
-      // (visibility texture size depends on position texture size)
-      const dimsChanged = !existing.dims ||
-        existing.dims[0] !== newDims[0] ||
-        existing.dims[1] !== newDims[1];
-      if (dimsChanged) {
-        const visEntry = edgeVisibilityTexturesV2.get(vid);
-        if (visEntry?.texture) {
-          gl.deleteTexture(visEntry.texture);
-          edgeVisibilityTexturesV2.delete(vid);
-        }
-      }
-    }
 
     const dims = newDims;
     const [width, height] = dims;
@@ -1522,19 +2227,38 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       data[i * 3 + 2] = positions[i * 3 + 2];
     }
 
-    const texture = gl.createTexture();
-    if (!texture) {
-      console.error(`[Viewer] Failed to create position texture for view ${vid}`);
-      return false;
+    const texture = createRequiredTexture(
+      gl,
+      `weighted connectivity positions for view "${vid}"`
+    );
+    try {
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB32F, width, height, 0, gl.RGB, gl.FLOAT, data);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.bindTexture(gl.TEXTURE_2D, null);
+    } catch (error) {
+      gl.bindTexture(gl.TEXTURE_2D, null);
+      gl.deleteTexture(texture);
+      throw error;
     }
 
-    gl.bindTexture(gl.TEXTURE_2D, texture);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB32F, width, height, 0, gl.RGB, gl.FLOAT, data);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.bindTexture(gl.TEXTURE_2D, null);
+    if (existing?.texture) {
+      gl.deleteTexture(existing.texture);
+      const dimsChanged =
+        !existing.dims ||
+        existing.dims[0] !== newDims[0] ||
+        existing.dims[1] !== newDims[1];
+      if (dimsChanged) {
+        const visEntry = edgeVisibilityTexturesV2.get(vid);
+        if (visEntry?.texture) {
+          gl.deleteTexture(visEntry.texture);
+        }
+        edgeVisibilityTexturesV2.delete(vid);
+      }
+    }
 
     // Store with format tag for validation
     edgePositionTexturesV2.set(vid, { texture, dims, nCells, format: 'RGB32F' });
@@ -1555,10 +2279,16 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
    * @returns {boolean} True if texture was created/updated successfully
    */
   function updateVisibilityTextureV2ForView(viewId, visibility) {
-    const vid = String(viewId);
+    if (typeof viewId !== 'string' || viewId.length === 0) {
+      return false;
+    }
+    const vid = viewId;
 
     // Validate inputs
-    if (!visibility || visibility.length === 0) {
+    if (
+      !(visibility instanceof Float32Array) ||
+      visibility.length === 0
+    ) {
       console.warn(`[Viewer] Invalid visibility for view ${vid}: visibility is empty or null`);
       return false;
     }
@@ -1569,6 +2299,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     const posEntry = edgePositionTexturesV2.get(vid);
     if (!posEntry) {
       console.warn(`[Viewer] Cannot update visibility for view ${vid}: no position texture`);
+      return false;
+    }
+    if (visibility.length !== posEntry.nCells) {
       return false;
     }
 
@@ -1641,19 +2374,23 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     if (!visEntry?.texture) {
       // First time: create texture
-      const texture = gl.createTexture();
-      if (!texture) {
-        console.error(`[Viewer] Failed to create visibility texture for view ${vid}`);
-        return false;
+      const texture = createRequiredTexture(
+        gl,
+        `weighted connectivity visibility for view "${vid}"`
+      );
+      try {
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, width, height, 0, gl.RED, gl.FLOAT, scratchBuffer);
+        gl.bindTexture(gl.TEXTURE_2D, null);
+      } catch (error) {
+        gl.bindTexture(gl.TEXTURE_2D, null);
+        gl.deleteTexture(texture);
+        throw error;
       }
-
-      gl.bindTexture(gl.TEXTURE_2D, texture);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, width, height, 0, gl.RED, gl.FLOAT, scratchBuffer);
-      gl.bindTexture(gl.TEXTURE_2D, null);
 
       // Store with format tag for validation
       edgeVisibilityTexturesV2.set(vid, { texture, dims: [width, height], scratchBuffer, format: 'R32F' });
@@ -1662,22 +2399,29 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       const dirtyRowCount = dirtyRowEnd - dirtyRowStart;
       const usePartialUpload = dirtyRowCount < height * 0.5 && dirtyRowCount > 0;
 
-      gl.bindTexture(gl.TEXTURE_2D, visEntry.texture);
+      try {
+        gl.bindTexture(gl.TEXTURE_2D, visEntry.texture);
 
-      if (usePartialUpload) {
-        // Upload only the dirty rows using a subview of the scratch buffer
-        // texSubImage2D(target, level, xoffset, yoffset, width, height, format, type, srcData, srcOffset)
-        const srcOffset = dirtyRowStart * width;
-        gl.texSubImage2D(
-          gl.TEXTURE_2D, 0, 0, dirtyRowStart, width, dirtyRowCount,
-          gl.RED, gl.FLOAT, scratchBuffer, srcOffset
-        );
-      } else {
-        // Full texture upload
-        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, width, height, gl.RED, gl.FLOAT, scratchBuffer);
+        if (usePartialUpload) {
+          // Upload only the dirty rows using a subview of the scratch buffer
+          // texSubImage2D(target, level, xoffset, yoffset, width, height, format, type, srcData, srcOffset)
+          const srcOffset = dirtyRowStart * width;
+          gl.texSubImage2D(
+            gl.TEXTURE_2D, 0, 0, dirtyRowStart, width, dirtyRowCount,
+            gl.RED, gl.FLOAT, scratchBuffer, srcOffset
+          );
+        } else {
+          // Full texture upload
+          gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, width, height, gl.RED, gl.FLOAT, scratchBuffer);
+        }
+
+        gl.bindTexture(gl.TEXTURE_2D, null);
+      } catch (error) {
+        gl.bindTexture(gl.TEXTURE_2D, null);
+        gl.deleteTexture(visEntry.texture);
+        edgeVisibilityTexturesV2.delete(vid);
+        throw error;
       }
-
-      gl.bindTexture(gl.TEXTURE_2D, null);
 
       // Update scratch buffer reference (it already holds the new values)
       visEntry.scratchBuffer = scratchBuffer;
@@ -1689,9 +2433,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   /**
    * Delete edge textures for a specific view (cleanup on snapshot removal).
    * @param {string} viewId - View identifier
+   * @returns {boolean} Whether an exact view identifier was accepted
    */
   function deleteEdgeTexturesForView(viewId) {
-    const vid = String(viewId);
+    if (typeof viewId !== 'string' || viewId.length === 0) {
+      return false;
+    }
+    const vid = viewId;
 
     const posEntry = edgePositionTexturesV2.get(vid);
     if (posEntry?.texture) {
@@ -1704,6 +2452,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       gl.deleteTexture(visEntry.texture);
     }
     edgeVisibilityTexturesV2.delete(vid);
+    return true;
   }
 
   /**
@@ -1723,22 +2472,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   }
 
   /**
-   * Get edge textures for a specific view.
-   * Handles multiple scenarios:
-   * 1. View has its own position and visibility textures → use both
-   * 2. View has position texture but shares live visibility → use own pos + live vis
-   * 3. View has no textures → fall back to live view's textures entirely
+   * Get the exact edge textures owned by a specific view.
+   * Live and snapshot views each require their own position and visibility
+   * textures so per-view filtering cannot leak across views.
    *
-   * IMPORTANT: Position and visibility textures must have matching dimensions.
    * @param {string} viewId - View identifier
    * @returns {{ posTexture, visTexture, dims } | null} Textures and dimensions, or null if unavailable
    */
   function getEdgeTexturesForView(viewId) {
-    const vid = String(viewId);
-
-    // Get live view textures first (needed for fallbacks)
-    const livePos = edgePositionTexturesV2.get(LIVE_VIEW_ID);
-    const liveVis = edgeVisibilityTexturesV2.get(LIVE_VIEW_ID);
+    if (typeof viewId !== 'string' || viewId.length === 0) {
+      return null;
+    }
+    const vid = viewId;
 
     // Helper to validate and return a texture set
     const validateAndReturn = (posEntry, visEntry, source) => {
@@ -1765,45 +2510,24 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       };
     };
 
-    // For live view, just return its own textures
     if (vid === LIVE_VIEW_ID) {
-      const result = validateAndReturn(livePos, liveVis, 'live');
-      if (result) return result;
-      // Fall through to legacy fallback
+      return validateAndReturn(
+        edgePositionTexturesV2.get(LIVE_VIEW_ID),
+        edgeVisibilityTexturesV2.get(LIVE_VIEW_ID),
+        'live'
+      );
     }
 
-    // For snapshots, check if they share live transparency
     const snapshot = snapshotViews.find(s => s.id === vid);
-    const sharesLiveTransparency = snapshot?.sharesLiveTransparency ?? false;
-
-    // Get position texture for this view
-    const posEntry = edgePositionTexturesV2.get(vid);
-
-    // Determine which visibility texture to use
-    let visEntry;
-    if (sharesLiveTransparency) {
-      // Shares live's filters → use live's visibility texture
-      visEntry = liveVis;
-    } else {
-      // Has own filters → try own visibility, fall back to live's
-      visEntry = edgeVisibilityTexturesV2.get(vid) || liveVis;
+    if (!snapshot) {
+      return null;
     }
 
-    // If snapshot has its own position texture, try to use it
-    if (posEntry?.texture) {
-      const result = validateAndReturn(posEntry, visEntry, `view ${vid}`);
-      if (result) return result;
-      // Validation failed - fall back to live textures
-    }
-
-    // Fall back to live's textures entirely
-    if (livePos?.texture && liveVis?.texture) {
-      const result = validateAndReturn(livePos, liveVis, 'live fallback');
-      if (result) return result;
-    }
-
-    // No valid textures available
-    return null;
+    return validateAndReturn(
+      edgePositionTexturesV2.get(vid),
+      edgeVisibilityTexturesV2.get(vid),
+      `view ${vid}`
+    );
   }
 
   /**
@@ -1812,8 +2536,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
    * @returns {boolean}
    */
   function hasEdgeTexturesForView(viewId) {
-    const vid = String(viewId);
-    return edgePositionTexturesV2.has(vid) && edgeVisibilityTexturesV2.has(vid);
+    if (typeof viewId !== 'string' || viewId.length === 0) {
+      return false;
+    }
+    return edgePositionTexturesV2.has(viewId) &&
+      edgeVisibilityTexturesV2.has(viewId);
   }
 
   /**
@@ -1823,14 +2550,19 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
    *
    * @param {number} widthPx - Viewport width in pixels
    * @param {number} heightPx - Viewport height in pixels
-   * @param {string} [viewId] - Optional view ID for per-view texture lookup
+   * @param {string} viewId - View ID for exact per-view texture lookup
    */
   function drawConnectivityInstanced(widthPx, heightPx, viewId) {
-    if (!showConnectivity || nEdgesV2 === 0 || !edgeTextureV2) {
+    if (
+      !showConnectivity ||
+      nEdgesV2 === 0 ||
+      !edgeTextureV2 ||
+      !edgeWeightTextureV2
+    ) {
       return;
     }
 
-    // Get textures for this view (per-view or fallback to global)
+    // Get textures owned by this view.
     const textures = getEdgeTexturesForView(viewId);
 
     // Need valid textures to render
@@ -1887,6 +2619,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     gl.bindTexture(gl.TEXTURE_2D, visTexture);  // Per-view visibility texture
     gl.uniform1i(lineInstancedUniformLocations.visibilityTexture, 2);
 
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, edgeWeightTextureV2);
+    gl.uniform1i(lineInstancedUniformLocations.edgeWeightTexture, 3);
+
     // Color and fog uniforms
     connectivityColorVec[0] = connectivityColorBytes[0] / 255;
     connectivityColorVec[1] = connectivityColorBytes[1] / 255;
@@ -1910,6 +2646,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     // Cleanup - explicitly unbind textures to prevent state leakage
     gl.disableVertexAttribArray(lineInstancedAttribLocations.quadPos);
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, null);
     gl.activeTexture(gl.TEXTURE2);
     gl.bindTexture(gl.TEXTURE_2D, null);
     gl.activeTexture(gl.TEXTURE1);
@@ -2043,15 +2781,21 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
    * @param {number} [dimensionLevel] - Optional dimension level for tracking changes
    */
   function createCentroidSnapshotBuffer(viewId, positions, colors, dimensionLevel = undefined) {
-    if (!positions || !colors) return false;
+    assertNonEmptyTrimmedString(viewId, 'Centroid snapshot view id');
+    if (
+      !(positions instanceof Float32Array) ||
+      positions.length % 3 !== 0 ||
+      !(colors instanceof Uint8Array) ||
+      colors.length !== (positions.length / 3) * 4
+    ) {
+      throw new TypeError(
+        'Centroid snapshot data requires exact Float32 XYZ positions and Uint8 RGBA colors.'
+      );
+    }
     const count = positions.length / 3;
     if (count === 0) return false;
 
-    // Normalize viewId to string for consistent Map keys
-    const vid = String(viewId);
-
-    // Delete existing if updating
-    deleteCentroidSnapshotBuffer(vid);
+    const vid = viewId;
 
     // Build interleaved buffer: 16 bytes per point (12 pos + 4 color)
     const STRIDE = 16;
@@ -2074,24 +2818,64 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     }
 
     // Create GPU buffer (STATIC_DRAW - uploaded once)
-    const glBuffer = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, glBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, buffer, gl.STATIC_DRAW);
+    assertNoWebGLError(gl, 'Centroid snapshot publication');
+    let glBuffer = null;
+    let vao = null;
+    try {
+      glBuffer = gl.createBuffer();
+      vao = gl.createVertexArray();
+      if (!glBuffer || !vao) {
+        throw new Error(
+          'Viewer could not allocate candidate centroid snapshot resources.'
+        );
+      }
+      gl.bindBuffer(gl.ARRAY_BUFFER, glBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, buffer, gl.STATIC_DRAW);
+      gl.bindVertexArray(vao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, glBuffer);
+      gl.enableVertexAttribArray(centroidAttribLocations.position);
+      gl.vertexAttribPointer(
+        centroidAttribLocations.position,
+        3,
+        gl.FLOAT,
+        false,
+        STRIDE,
+        0
+      );
+      gl.enableVertexAttribArray(centroidAttribLocations.color);
+      gl.vertexAttribPointer(
+        centroidAttribLocations.color,
+        4,
+        gl.UNSIGNED_BYTE,
+        true,
+        STRIDE,
+        12
+      );
+      gl.bindVertexArray(null);
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      assertNoWebGLError(gl, 'Candidate centroid snapshot publication');
+    } catch (error) {
+      gl.bindVertexArray(null);
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      if (vao) gl.deleteVertexArray(vao);
+      if (glBuffer) gl.deleteBuffer(glBuffer);
+      gl.getError();
+      throw error;
+    }
 
-    // Create VAO for fast rendering
-    const vao = gl.createVertexArray();
-    gl.bindVertexArray(vao);
-    gl.bindBuffer(gl.ARRAY_BUFFER, glBuffer);
-    gl.enableVertexAttribArray(centroidAttribLocations.position);
-    gl.vertexAttribPointer(centroidAttribLocations.position, 3, gl.FLOAT, false, STRIDE, 0);
-    gl.enableVertexAttribArray(centroidAttribLocations.color);
-    gl.vertexAttribPointer(centroidAttribLocations.color, 4, gl.UNSIGNED_BYTE, true, STRIDE, 12);
-    gl.bindVertexArray(null);
-
-    // Store dimension level and position fingerprint to detect when buffer needs recreation
-    // Fingerprint is based on count and sampled position values
-    const posFingerprint = computeCentroidFingerprint(positions);
-    centroidSnapshotBuffers.set(vid, { vao, buffer: glBuffer, count, dimensionLevel, posFingerprint });
+    const candidate = {
+      vao,
+      buffer: glBuffer,
+      count,
+      dimensionLevel,
+      posFingerprint: computeCentroidFingerprint(positions)
+    };
+    const previous = centroidSnapshotBuffers.get(vid) || null;
+    centroidSnapshotBuffers.set(vid, candidate);
+    if (previous) {
+      gl.deleteVertexArray(previous.vao);
+      gl.deleteBuffer(previous.buffer);
+    }
     return true;
   }
 
@@ -2106,7 +2890,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     const mid = Math.floor(len / 2) - (Math.floor(len / 2) % 3);  // Align to xyz triplet
     const last = len - 3;
     // Sample first, middle, last positions and include total length
-    return `${len}:${positions[0].toFixed(4)},${positions[mid]?.toFixed(4) || 0},${positions[last]?.toFixed(4) || 0}`;
+    return `${len}:${positions[0].toFixed(4)},${positions[mid].toFixed(4)},${positions[last].toFixed(4)}`;
   }
 
   function deleteCentroidSnapshotBuffer(viewId) {
@@ -2132,12 +2916,17 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
    */
   function centroidBufferNeedsUpdate(viewId, currentDimensionLevel, positions = null) {
     const vid = String(viewId);
+    getDefaultNavigationMode(currentDimensionLevel);
     const existing = centroidSnapshotBuffers.get(vid);
     if (!existing) return true;  // Doesn't exist, need to create
+    if (!VALID_DIMENSION_LEVELS.has(existing.dimensionLevel)) {
+      throw new TypeError(
+        `Centroid buffer for view "${vid}" has no exact dimension state.`
+      );
+    }
     // Check if dimension changed since buffer was created
-    // Also recreate if old buffer doesn't have dimensionLevel stored (legacy buffer)
-    if (existing.dimensionLevel === undefined || existing.dimensionLevel !== currentDimensionLevel) {
-      return true;  // Dimension unknown or changed, need to recreate
+    if (existing.dimensionLevel !== currentDimensionLevel) {
+      return true;
     }
     // Check if positions changed (detects data reload with same dimension)
     if (positions && existing.posFingerprint) {
@@ -2256,7 +3045,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       const allViews = [];
       if (!liveViewHidden) allViews.push({ id: LIVE_VIEW_ID });
       snapshotViews.forEach(s => allViews.push({ id: s.id }));
-      clickedViewId = allViews[viewIndex]?.id || focusedViewId;
+      const clickedView = allViews[viewIndex];
+      if (!clickedView) return -1;
+      clickedViewId = clickedView.id;
     }
 
     // Get effective view matrix for the viewport
@@ -2338,18 +3129,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       if (cached && cached.viewMatrix) {
         effectiveViewMatrix = cached.viewMatrix;
       } else {
-        // Compute view matrix from camera state
-        const camState = getViewCameraState(clickedViewId);
-        if (camState) {
-          effectiveViewMatrix = mat4.create();
-          computeViewMatrixFromState(camState, effectiveViewMatrix);
-        }
-      }
-      // If we still don't have a view matrix, force update camera and use current
-      if (!effectiveViewMatrix) {
-        const [w, h] = canvasResizeObserver.getSize();
-        updateCamera(w, h);
-        // viewMatrix is now up to date, screenToRay will use it as fallback
+        const camState = assertCameraState(
+          getViewCameraState(clickedViewId),
+          `Picking camera state for view "${clickedViewId}"`
+        );
+        effectiveViewMatrix = mat4.create();
+        computeViewMatrixFromState(camState, effectiveViewMatrix);
       }
     }
 
@@ -2360,35 +3145,20 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     // Get view-specific positions for multi-dimensional support
     // Different views may have different position data (e.g., 2D vs 3D embeddings)
-    const globalPositions = hpRenderer.getPositions();
-    if (!globalPositions) return -1;
-    const viewSpecificPositions = viewPositionsCache.get(String(clickedViewId));
-    const positions = viewSpecificPositions || globalPositions;
+    const positions = getExactViewPositions(clickedViewId);
 
-    // Get the dimension level for this view and use spatial index if available
-    // Don't force creation - use brute force fallback if no spatial index exists
-    const viewDimLevel = getEffectiveDimensionLevel(clickedViewId);
-    // Use snapshot's own spatial index for custom-position snapshots, fall back to global
+    // Get the exact spatial index associated with this view when one is built.
+    // A direct query remains scientifically identical when the optional index is
+    // absent; it changes only lookup cost.
+    const viewDimLevel = getPublishedDimensionLevel(clickedViewId);
     let spatialIndex = null;
     if (clickedViewId !== LIVE_VIEW_ID) {
-      // Try to get snapshot's own spatial index first (for custom positions)
       spatialIndex = hpRenderer.getSnapshotSpatialIndex(String(clickedViewId));
-    }
-    // Fall back to global spatial index if no snapshot-specific one exists
-    if (!spatialIndex) {
+    } else {
       spatialIndex = hpRenderer.getSpatialIndex(viewDimLevel);
     }
 
-    // Get view-specific transparency array for filtering check
-    // Each view may have different filters, so we need the clicked view's transparency
-    let viewTransparencyArray = transparencyArray; // Default to live view
-    if (clickedViewId !== LIVE_VIEW_ID) {
-      const clickedSnapshot = snapshotViews.find(s => s.id === clickedViewId);
-      // Use snapshot's own transparency only if it doesn't share live transparency
-      if (clickedSnapshot && !clickedSnapshot.sharesLiveTransparency && clickedSnapshot.transparency) {
-        viewTransparencyArray = clickedSnapshot.transparency;
-      }
-    }
+    const viewTransparencyArray = getExactViewTransparency(clickedViewId);
 
     // Sample along the ray to find the nearest cell
     // Limit iterations to prevent lag (max 500 samples)
@@ -2410,7 +3180,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       if (spatialIndex) {
         candidates = spatialIndex.queryRadius(samplePoint, searchRadius, 32);
       } else {
-        // Fallback: brute force search (slow)
+        // Exact direct query used when the optional acceleration index is absent.
         candidates = [];
         const r2 = searchRadius * searchRadius;
         const n = positions.length / 3;
@@ -2429,7 +3199,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         // Cell is pickable only if visible (not filtered out in this view)
         // Filtered-out cells cannot be interacted with, even if highlighted in another view
         // Use view-specific transparency so each view's filters are respected
-        const isVisible = !viewTransparencyArray || viewTransparencyArray[idx] > 0;
+        const isVisible = viewTransparencyArray[idx] > 0;
         if (!isVisible) continue;
 
         const px = positions[idx * 3];
@@ -2480,24 +3250,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       targetRadius,
       target,
       eye,
-      // Helper to get view-specific transparency for selection operations
-      // Each view may have different filters, so use this to respect per-view filtering
-      getViewTransparency: (viewId) => {
-        if (!viewId || viewId === LIVE_VIEW_ID) {
-          return transparencyArray;
-        }
-        const snapshot = snapshotViews.find(s => s.id === viewId);
-        // Use snapshot's own transparency only if it doesn't share live transparency
-        if (snapshot && !snapshot.sharesLiveTransparency && snapshot.transparency) {
-          return snapshot.transparency;
-        }
-        return transparencyArray;
-      }
+      getViewTransparency: getExactViewTransparency
     };
   }
 
   function getViewFlags(viewId) {
-    const key = String(viewId || LIVE_VIEW_ID);
+    const key = assertKnownViewId(viewId);
     const flags = viewCentroidFlags.get(key);
     return {
       points: flags?.points ?? defaultShowCentroidPoints,
@@ -2506,7 +3264,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   }
 
   function setViewFlags(viewId, partial) {
-    const key = String(viewId || LIVE_VIEW_ID);
+    const key = assertKnownViewId(viewId);
     const prev = viewCentroidFlags.get(key) || {};
     viewCentroidFlags.set(key, {
       points: partial.points != null ? partial.points : (prev.points ?? defaultShowCentroidPoints),
@@ -2515,11 +3273,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   }
 
   function getLabelsForView(viewId) {
-    return viewCentroidLabels.get(String(viewId || LIVE_VIEW_ID)) || [];
+    return viewCentroidLabels.get(assertViewId(viewId)) || [];
   }
 
   function removeLabelsForView(viewId) {
-    const key = String(viewId || LIVE_VIEW_ID);
+    const key = assertViewId(viewId);
     const labels = viewCentroidLabels.get(key) || [];
     labels.forEach((item) => { if (item?.el?.parentElement) item.el.parentElement.removeChild(item.el); });
     viewCentroidLabels.delete(key);
@@ -2827,60 +3585,24 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       if (_renderAllViews.length === 1) {
         const view = _renderAllViews[0];
 
-        // Check if this snapshot has a pre-uploaded GPU buffer
-        // Same logic as grid mode to avoid inconsistent render paths
-        let hasSnapshotBuffer = view.id !== LIVE_VIEW_ID && hpRenderer.hasSnapshotBuffer(view.id);
-
-        // For snapshots without GPU buffers, lazily create one (uploaded once, not per-frame)
-        if (view.id !== LIVE_VIEW_ID && !hasSnapshotBuffer && view.colors && view.transparency) {
-          const viewPositions = viewPositionsCache.get(String(view.id)) || positionsArray;
-          hpRenderer.createSnapshotBuffer(view.id, view.colors, view.transparency, viewPositions);
-          hasSnapshotBuffer = true;
-        }
-
-        // Only update main buffer when NO snapshot buffer exists (fallback path)
-        // When snapshot buffer exists, use it directly - main buffer updates are ignored
-        // Live view updates are handled by state.js via viewer.updateColors/updateTransparency
-        if (!hasSnapshotBuffer && view.id !== LIVE_VIEW_ID && view.id !== currentLoadedViewId) {
-          if (view.colors) hpRenderer.updateColors(view.colors);
-          if (view.transparency) hpRenderer.updateAlphas(view.transparency);
-          currentLoadedViewId = view.id;
-        } else if (view.id === LIVE_VIEW_ID && currentLoadedViewId !== null) {
-          // Reset tracking when switching back to live view
-          currentLoadedViewId = null;
-        }
-
-        // Pass snapshot buffer ID if available (uses immutable snapshot, consistent with grid mode)
-        const snapshotId = hasSnapshotBuffer ? view.id : null;
+        const snapshotId = requireSnapshotBufferId(view.id);
         renderSingleView(width, height, { x: 0, y: 0, w: 1, h: 1 }, view.id, view.centroidCount, snapshotId, dt, timeSeconds);
       } else {
-        // Single-layout mode with multiple views: render the focused view with its snapshot buffer
-        // Reset main buffer tracking since we use snapshot buffers for consistency with grid mode
-        if (currentLoadedViewId !== null) {
-          currentLoadedViewId = null;
-        }
-
-        // Find the focused view (defaults to live view if not found)
-        const view = _renderAllViews.find(v => v.id === focusedViewId) || _renderAllViews[0];
-
-        // Check if this snapshot has a pre-uploaded GPU buffer (same logic as grid mode)
-        let hasSnapshotBuffer = view.id !== LIVE_VIEW_ID && hpRenderer.hasSnapshotBuffer(view.id);
-
-        // For snapshots without GPU buffers, lazily create one (uploaded once, not per-frame)
-        if (view.id !== LIVE_VIEW_ID && !hasSnapshotBuffer && view.colors && view.transparency) {
-          const viewPositions = viewPositionsCache.get(String(view.id)) || positionsArray;
-          hpRenderer.createSnapshotBuffer(view.id, view.colors, view.transparency, viewPositions);
-          hasSnapshotBuffer = true;
+        // The focused view must be part of the published render layout.
+        const view = _renderAllViews.find(v => v.id === focusedViewId);
+        if (!view) {
+          throw new Error(
+            `Focused view "${focusedViewId}" is absent from the published render layout.`
+          );
         }
 
         // Create or recreate centroid snapshot buffer if needed
-        const viewDimLevel = getEffectiveDimensionLevel(view.id);
+        const viewDimLevel = getPublishedDimensionLevel(view.id);
         if (view.centroidPositions && view.centroidColors && centroidBufferNeedsUpdate(view.id, viewDimLevel, view.centroidPositions)) {
           createCentroidSnapshotBuffer(view.id, view.centroidPositions, view.centroidColors, viewDimLevel);
         }
 
-	        // Pass snapshot buffer ID if available (uses immutable snapshot, consistent with grid mode)
-	        const snapshotId = hasSnapshotBuffer ? view.id : null;
+	        const snapshotId = requireSnapshotBufferId(view.id);
 	        renderSingleView(width, height, { x: 0, y: 0, w: 1, h: 1 }, view.id, view.centroidCount, snapshotId, dt, timeSeconds);
 	      }
 	      hideViewTitles(); // No titles in single/fullscreen mode
@@ -2948,19 +3670,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
             // No cache exists yet - compute correct matrix immediately from camera state
             // This avoids a one-frame jump where the wrong camera would be used
             const camState = getViewCameraState(view.id);
-            if (camState) {
-              // Compute and cache the view matrix from camera state
-              const tempViewMatrix = mat4.create();
-              computeViewMatrixFromState(camState, tempViewMatrix);
-              mat4.copy(viewMatrix, tempViewMatrix);
-              radius = camState.orbit?.radius ?? activeRadius;
-              // Cache for future frames
-              updateCachedViewMatrix(view.id, camState);
-            } else {
-              // Truly no camera state - use active view as last resort
-              mat4.copy(viewMatrix, _activeViewMatrixScratch);
-              radius = activeRadius;
-            }
+            // Compute and cache the view matrix from exact published state.
+            const tempViewMatrix = mat4.create();
+            computeViewMatrixFromState(camState, tempViewMatrix);
+            mat4.copy(viewMatrix, tempViewMatrix);
+            radius = camState.orbit.radius;
+            // Cache for future frames
+            updateCachedViewMatrix(view.id, camState);
           }
         } else {
           // Locked mode: non-active views use active view's matrix
@@ -2979,26 +3695,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         gl.scissor(vx, vy, vw, vh);
         gl.clear(gl.DEPTH_BUFFER_BIT);
 
-        // Check if this snapshot has a pre-uploaded GPU buffer (avoids per-frame re-upload)
-        let hasSnapshotBuffer = view.id !== LIVE_VIEW_ID && hpRenderer.hasSnapshotBuffer(view.id);
-
-        // For snapshots without GPU buffers, lazily create one (uploaded once, not per-frame)
-        // Skip live view - state.js handles updates via viewer.updateColors/updateTransparency
-        if (view.id !== LIVE_VIEW_ID && !hasSnapshotBuffer && view.colors && view.transparency) {
-          // CRITICAL: Pass view-specific positions from cache, not global positions
-          const viewPositions = viewPositionsCache.get(String(view.id)) || positionsArray;
-          hpRenderer.createSnapshotBuffer(view.id, view.colors, view.transparency, viewPositions);
-          hasSnapshotBuffer = true;
-        }
-
         // Create or recreate centroid snapshot buffer if needed (dimension change, position change, or doesn't exist)
-        const viewDimLevel = getEffectiveDimensionLevel(view.id);
+        const viewDimLevel = getPublishedDimensionLevel(view.id);
         if (view.centroidPositions && view.centroidColors && centroidBufferNeedsUpdate(view.id, viewDimLevel, view.centroidPositions)) {
           createCentroidSnapshotBuffer(view.id, view.centroidPositions, view.centroidColors, viewDimLevel);
         }
 
-        // Render this viewport - use snapshot buffer if available (no data upload!)
-        const snapshotId = hasSnapshotBuffer ? view.id : null;
+        const snapshotId = requireSnapshotBufferId(view.id);
         renderSingleView(vw, vh, { x: col / cols, y: row / rows, w: 1 / cols, h: 1 / rows }, view.id, view.centroidCount, snapshotId, dt, timeSeconds);
 
         gl.disable(gl.SCISSOR_TEST);
@@ -3018,19 +3721,34 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 	  }
 
 		  function renderSingleView(width, height, viewport, viewId, overrideCentroidCount, snapshotBufferId = null, dtSeconds = 0.016, timeSeconds = 0) {
-		    const vid = viewId || focusedViewId || LIVE_VIEW_ID;
-		    const numCentroids = overrideCentroidCount !== undefined ? overrideCentroidCount : centroidCount;
+		    const vid = assertViewId(viewId);
+		    if (!Number.isSafeInteger(overrideCentroidCount) || overrideCentroidCount < 0) {
+		      throw new TypeError(
+		        `Centroid count for view "${vid}" must be a non-negative safe integer.`
+		      );
+		    }
+		    if (
+		      snapshotBufferId !== null &&
+		      (assertViewId(snapshotBufferId) !== vid || vid === LIVE_VIEW_ID)
+		    ) {
+		      throw new Error(
+		        `Snapshot buffer id must exactly match snapshot view "${vid}".`
+		      );
+		    }
+		    const numCentroids = overrideCentroidCount;
 
 			    // Draw grid first
 			    drawGrid();
 
-	    // Check if this snapshot shares live transparency (uses alpha texture for efficient updates)
-	    const snapshot = snapshotViews.find(s => s.id === vid);
-	    const useAlphaTexture = snapshot?.sharesLiveTransparency ?? false;
-
+	    const snapshot = vid === LIVE_VIEW_ID
+	      ? null
+	      : snapshotViews.find(s => s.id === vid);
+	    if (vid !== LIVE_VIEW_ID && !snapshot) {
+	      throw new Error(`Snapshot view "${vid}" is absent from published viewer state.`);
+	    }
 	    // Render params shared by both render paths
 	    // Get dimension level for this view (used for LOD and frustum culling calculations)
-	    const dimLevel = getEffectiveDimensionLevel(vid);
+	    const dimLevel = getPublishedDimensionLevel(vid);
 	    // Camera distance calculation: use per-view cached distance when available (for multiview support)
 	    // For focused view or locked cameras, global state is authoritative; otherwise use cached per-view value
 	    let camDist;
@@ -3041,7 +3759,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 	    } else {
 	      // Non-active view: use cached camera distance from view's camera state
 	      const cached = cachedViewMatrices.get(vid);
-	      camDist = cached?.cameraDistance ?? radius;
+	      if (!cached || !Number.isFinite(cached.cameraDistance)) {
+	        throw new Error(
+	          `View "${vid}" has no exact cached camera distance for unlocked rendering.`
+	        );
+	      }
+	      camDist = cached.cameraDistance;
 	    }
 	    const renderParams = getOrCreateRenderParams(vid);
 	    renderParams.pointSize = basePointSize;
@@ -3054,7 +3777,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 	    renderParams.fogColor = fogColor;
 	    renderParams.cameraDistance = camDist;
 	    renderParams.dimensionLevel = dimLevel;
-	    renderParams.useAlphaTexture = useAlphaTexture;
+	    renderParams.useAlphaTexture = false;
+	    renderParams.quality = currentShaderQuality;
 
 	    // Camera position is used for fog/lighting; avoid per-view mat4.invert in the render loop.
 	    const cameraPosition = renderParams.cameraPosition;
@@ -3064,16 +3788,21 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 	      cameraPosition[2] = eye[2];
 	    } else {
 	      const cached = cachedViewMatrices.get(vid);
-	      if (cached?.cameraPosition) {
-	        cameraPosition[0] = cached.cameraPosition[0];
-	        cameraPosition[1] = cached.cameraPosition[1];
-	        cameraPosition[2] = cached.cameraPosition[2];
-	      } else {
-	        mat4.invert(tempInvViewMatrix, viewMatrix);
-	        cameraPosition[0] = tempInvViewMatrix[12];
-	        cameraPosition[1] = tempInvViewMatrix[13];
-	        cameraPosition[2] = tempInvViewMatrix[14];
+	      if (
+	        !cached ||
+	        !cached.cameraPosition ||
+	        cached.cameraPosition.length !== 3 ||
+	        !Number.isFinite(cached.cameraPosition[0]) ||
+	        !Number.isFinite(cached.cameraPosition[1]) ||
+	        !Number.isFinite(cached.cameraPosition[2])
+	      ) {
+	        throw new Error(
+	          `View "${vid}" has no exact cached camera position for unlocked rendering.`
+	        );
 	      }
+	      cameraPosition[0] = cached.cameraPosition[0];
+	      cameraPosition[1] = cached.cameraPosition[1];
+	      cameraPosition[2] = cached.cameraPosition[2];
 	    }
 
 	    // Render scatter points - use snapshot buffer if available (no data upload!)
@@ -3082,42 +3811,38 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 	    } else {
       hpRenderer.render(renderParams);
     }
+	    publishLodLevelChange(vid);
 
 	    // Render overlays (after main points, before selection highlights).
 	    if (overlayManager?.hasEnabledOverlays?.()) {
 	      let overlayCtx = overlayCtxByView.get(vid) || null;
 	      let overlayOpts = overlayCtxOptionsByView.get(vid) || null;
 	      if (!overlayOpts) {
-	        const getViewPositions = () => viewPositionsCache.get(String(vid)) || positionsArray;
-	        const getViewTransparency = () => {
-	          if (!vid || vid === LIVE_VIEW_ID) return transparencyArray;
-	          const snap = snapshotViews.find(s => s.id === vid);
-	          if (snap && !snap.sharesLiveTransparency && snap.transparency) {
-	            return snap.transparency;
-	          }
-	          return transparencyArray;
-	        };
-	        overlayOpts = {
-	          gl,
-	          viewId: vid,
+	        const getViewPositions = () => getExactViewPositions(vid);
+	        const getViewTransparency = () => getExactViewTransparency(vid);
+		        overlayOpts = {
+		          gl,
+		          viewId: vid,
 	          renderParams,
 	          timeSeconds,
-	          deltaTimeSeconds: dtSeconds,
-	          isSnapshot: Boolean(snapshotBufferId),
-	          dimensionLevel: dimLevel,
-	          hpRenderer,
-	          getViewPositions,
-	          getViewTransparency,
-	          reuse: overlayCtx
-	        };
+		          deltaTimeSeconds: dtSeconds,
+		          isSnapshot: Boolean(snapshotBufferId),
+		          dimensionLevel: dimLevel,
+		          devicePixelRatio: window.devicePixelRatio,
+		          hpRenderer,
+		          getViewPositions,
+		          getViewTransparency,
+		          target: {}
+		        };
 	        overlayCtxOptionsByView.set(vid, overlayOpts);
 	      } else {
 	        overlayOpts.renderParams = renderParams;
 	        overlayOpts.timeSeconds = timeSeconds;
-	        overlayOpts.deltaTimeSeconds = dtSeconds;
-	        overlayOpts.isSnapshot = Boolean(snapshotBufferId);
-	        overlayOpts.dimensionLevel = dimLevel;
-	        overlayOpts.reuse = overlayCtx;
+		        overlayOpts.deltaTimeSeconds = dtSeconds;
+		        overlayOpts.isSnapshot = Boolean(snapshotBufferId);
+		        overlayOpts.dimensionLevel = dimLevel;
+		        overlayOpts.devicePixelRatio = window.devicePixelRatio;
+		        overlayOpts.target = overlayCtx;
 	      }
 	      overlayCtx = buildOverlayContext(overlayOpts);
 	      overlayCtxByView.set(vid, overlayCtx);
@@ -3127,13 +3852,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     // Draw highlights (selection rings) on top of scatter points
     // Use view-specific positions and transparency for multi-view support
-    const viewPos = viewPositionsCache.get(vid) || positionsArray;
-    // Get view-specific transparency: snapshots may have their own filters
-    // Use snapshot's transparency if it exists and doesn't share live, otherwise use live
-    const viewTransp = (snapshot && !snapshot.sharesLiveTransparency && snapshot.transparency)
-      ? snapshot.transparency
-      : transparencyArray;
-    highlightTools?.renderHighlights?.(renderParams, viewPos, viewTransp);
+    const viewPos = getExactViewPositions(vid);
+    const viewTransp = getExactViewTransparency(vid);
+    highlightTools.renderHighlights(renderParams, viewPos, viewTransp);
 
     // Draw connectivity lines (pass viewId for per-view position/visibility textures)
     drawConnectivityLines(width, height, vid);
@@ -3162,13 +3883,14 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       let viewTarget = target;
       let viewRadius = radius;
       if (!camerasLocked && vid !== focusedViewId) {
-        const camState = getViewCameraState(vid);
-        if (camState && camState.orbit) {
-          viewTheta = camState.orbit.theta ?? theta;
-          viewPhi = camState.orbit.phi ?? phi;
-          viewTarget = camState.orbit.target ?? target;
-          viewRadius = camState.orbit.radius ?? radius;
-        }
+        const camState = assertCameraState(
+          getViewCameraState(vid),
+          `Orbit-anchor camera state for view "${vid}"`
+        );
+        viewTheta = camState.orbit.theta;
+        viewPhi = camState.orbit.phi;
+        viewTarget = camState.orbit.target;
+        viewRadius = camState.orbit.radius;
       }
 	      _orbitAnchorDrawParams.viewId = vid;
 	      _orbitAnchorDrawParams.viewTheta = viewTheta;
@@ -3195,23 +3917,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 	  }
 
   function setBackground(mode) {
-    const VIEWER_BACKGROUND_STORAGE_KEY = 'cellucid_viewer_background';
-
-    function applyViewerBackgroundMode(value) {
-      const root = document.documentElement;
-      if (root) root.dataset.viewerBackground = value;
-      if (document.body) document.body.dataset.viewerBackground = value;
-      try {
-        if (typeof localStorage !== 'undefined') {
-          localStorage.setItem(VIEWER_BACKGROUND_STORAGE_KEY, value);
-        }
-      } catch (_) {
-        // Ignore storage failures (e.g., privacy mode).
-      }
-    }
-
+    const exactMode = assertViewerBackground(mode);
     showGrid = false;
-    switch (mode) {
+    switch (exactMode) {
 	      case 'grid':
 	        showGrid = true;
         // Light grid with subtle gray tint - reduces eye strain and improves
@@ -3219,7 +3927,6 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         targetGridOpacity = 0.85;
         // Subtle warm gray tint instead of pure white
         gl.clearColor(0.965, 0.965, 0.970, 1);
-        applyViewerBackgroundMode('grid');
         bgColor = [0.965, 0.965, 0.970];
         fogColor = [0.965, 0.965, 0.970];
 	        // Light grid lines - subtle but visible on light background
@@ -3234,10 +3941,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 	        gridFogDensityMultiplier = 1.0;
 	        break;
 	      case 'grid-dark':
-	        showGrid = true;
+        showGrid = true;
         targetGridOpacity = 0.75;
         gl.clearColor(0.08, 0.09, 0.1, 1);
-        applyViewerBackgroundMode('grid-dark');
         bgColor = [0.08, 0.09, 0.1];
         fogColor = [0.08, 0.09, 0.1];
 	        gridColor = [0.38, 0.38, 0.42];   // Subtle gray lines
@@ -3252,7 +3958,6 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 	        break;
       case 'black':
         gl.clearColor(0, 0, 0, 1);
-        applyViewerBackgroundMode('black');
         bgColor = [0, 0, 0];
         fogColor = [0.05, 0.05, 0.08];
         // Match grid bg to main bg for clean fade-out
@@ -3261,9 +3966,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         gridFogDensityMultiplier = 1.0;
         break;
       case 'white':
-      default:
         gl.clearColor(1, 1, 1, 1);
-        applyViewerBackgroundMode('white');
         bgColor = [1, 1, 1];
         fogColor = [1, 1, 1];
         // Match grid bg to main bg for clean fade-out
@@ -3275,40 +3978,58 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
   // === Per-view camera helpers ===
   function getViewCameraState(viewId) {
-    if (viewId === LIVE_VIEW_ID) {
-      return liveCameraState || getCurrentCameraStateInternal();
+    const exactViewId = assertKnownViewId(viewId);
+    if (exactViewId === LIVE_VIEW_ID) {
+      return liveCameraState
+        ? liveCameraState
+        : getCurrentCameraStateInternal();
     }
-    const snap = snapshotViews.find(s => s.id === viewId);
-    return snap?.cameraState || getCurrentCameraStateInternal();
+    const snap = snapshotViews.find(s => s.id === exactViewId);
+    if (!snap.cameraState) {
+      throw new TypeError(`Camera state is missing for view "${exactViewId}".`);
+    }
+    return snap.cameraState;
   }
 
   function setViewCameraState(viewId, camState) {
-    if (viewId === LIVE_VIEW_ID) {
-      liveCameraState = camState;
+    const exactViewId = assertKnownViewId(viewId);
+    const ownedState = cloneCameraState(
+      camState,
+      `Camera state for view "${exactViewId}"`
+    );
+    if (exactViewId === LIVE_VIEW_ID) {
+      liveCameraState = ownedState;
     } else {
-      const snap = snapshotViews.find(s => s.id === viewId);
-      if (snap) snap.cameraState = camState;
+      const snap = snapshotViews.find(s => s.id === exactViewId);
+      snap.cameraState = ownedState;
     }
     // Update cached view matrix for this view (avoids per-frame recalculation)
     if (!camerasLocked) {
-      updateCachedViewMatrix(viewId, camState);
+      updateCachedViewMatrix(exactViewId, ownedState);
     }
   }
 
   // === Per-view navigation mode helpers ===
   function getViewNavigationMode(viewId) {
-    const camState = getViewCameraState(viewId);
-    return camState?.navigationMode || navigationMode;
+    const exactViewId = assertKnownViewId(viewId);
+    if (camerasLocked) {
+      return navigationMode;
+    }
+    const camState = getViewCameraState(exactViewId);
+    return assertNavigationMode(camState.navigationMode);
   }
 
   // Sync freefly data from orbit data within a camera state (for non-focused views)
   function syncFreeflyInCameraState(camState) {
-    if (!camState || !camState.orbit) return;
-    const orb = camState.orbit;
-    const r = orb.radius ?? 5;
-    const t = orb.theta ?? 0;
-    const p = orb.phi ?? Math.PI / 2;
-    const tgt = orb.target || [0, 0, 0];
+    const exactState = assertCameraState(
+      camState,
+      'Camera state synchronized from orbit'
+    );
+    const orb = exactState.orbit;
+    const r = orb.radius;
+    const t = orb.theta;
+    const p = orb.phi;
+    const tgt = orb.target;
     // Compute eye position from orbit params
     const eyePos = [
       tgt[0] + r * Math.sin(p) * Math.cos(t),
@@ -3324,14 +4045,15 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     // Compute yaw and pitch from forward
     const syncedYaw = Math.atan2(forward[2], forward[0]);
     const syncedPitch = Math.asin(Math.min(1, Math.max(-1, forward[1])));
-    camState.freefly = {
+    exactState.freefly = {
       position: eyePos,
       yaw: syncedYaw,
       pitch: syncedPitch
     };
   }
 
-  function setViewNavigationMode(viewId, mode) {
+  function applyViewNavigationMode(viewId, mode) {
+    const exactMode = assertNavigationMode(mode);
     // For the focused view, get fresh camera state that includes current global position
     const isFocused = viewId === focusedViewId;
 
@@ -3342,43 +4064,48 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         liveCameraState = getCurrentCameraStateInternal();
       }
       // When switching to free-fly, ensure freefly data is synced from orbit
-      if (mode === 'free' && !isFocused) {
+      if (exactMode === 'free' && !isFocused) {
         syncFreeflyInCameraState(liveCameraState);
       }
-      liveCameraState.navigationMode = mode;
+      liveCameraState.navigationMode = exactMode;
       if (!camerasLocked) {
         updateCachedViewMatrix(viewId, liveCameraState);
       }
     } else {
       // Handle snapshot views
       const snap = snapshotViews.find(s => s.id === viewId);
-      if (snap) {
-        if (!snap.cameraState || isFocused) {
-          // Always refresh camera state for focused view to capture current position
-          snap.cameraState = getCurrentCameraStateInternal();
-        }
-        // When switching to free-fly, ensure freefly data is synced from orbit
-        if (mode === 'free' && !isFocused) {
-          syncFreeflyInCameraState(snap.cameraState);
-        }
-        snap.cameraState.navigationMode = mode;
-        if (!camerasLocked) {
-          updateCachedViewMatrix(viewId, snap.cameraState);
-        }
+      if (!snap) {
+        throw new RangeError(`Unknown camera view "${String(viewId)}".`);
+      }
+      if (!snap.cameraState) {
+        throw new TypeError(`Camera state is missing for view "${viewId}".`);
+      }
+      if (isFocused) {
+        // Refresh the focused view from the active camera.
+        snap.cameraState = getCurrentCameraStateInternal();
+      }
+      // When switching to free-fly, ensure freefly data is synced from orbit
+      if (exactMode === 'free' && !isFocused) {
+        syncFreeflyInCameraState(snap.cameraState);
+      }
+      snap.cameraState.navigationMode = exactMode;
+      if (!camerasLocked) {
+        updateCachedViewMatrix(viewId, snap.cameraState);
       }
     }
     // If this is the focused view, also update the global navigation mode
     if (isFocused) {
-      applyNavigationModeDirectly(mode);
+      applyNavigationModeDirectly(exactMode);
     }
   }
 
   // Apply navigation mode directly without triggering UI sync (internal use)
   // Used when switching views - applies stored freefly params, doesn't sync from orbit
   function applyNavigationModeDirectly(mode) {
+    const exactMode = assertNavigationMode(mode);
     const prev = navigationMode;
-    if (mode === prev) return;
-    navigationMode = mode;
+    if (exactMode === prev) return;
+    navigationMode = exactMode;
     canvas.classList.remove('free-nav', 'planar-nav');
 
     // Reset velocities and active keys when changing modes
@@ -3386,10 +4113,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     vec3.set(freeflyVelocity, 0, 0, 0);
     activeKeys.clear();
 
-    if (mode === 'free') {
+    if (exactMode === 'free') {
       canvas.classList.add('free-nav');
       canvas.style.cursor = pointerLockActive ? 'none' : 'crosshair';
-    } else if (mode === 'planar') {
+    } else if (exactMode === 'planar') {
       canvas.classList.add('planar-nav');
       lookActive = false;
       // Exit pointer lock when switching away from freefly
@@ -3404,6 +4131,81 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       if (document.pointerLockElement === canvas && document.exitPointerLock) {
         document.exitPointerLock();
       }
+      updateCursorForHighlightMode();
+    }
+  }
+
+	  function applyDimensionNavigationDefault(viewId, dimensionLevel) {
+	    const exactViewId = assertViewId(viewId);
+    const defaultMode = getDefaultNavigationMode(dimensionLevel);
+    if (navigationModeOwnership.hasExplicitUserChoice(exactViewId)) {
+      return false;
+    }
+
+    const previousMode = navigationMode;
+    if (camerasLocked || exactViewId === focusedViewId) {
+      applyNavigationModeWithSync(defaultMode);
+    }
+    applyViewNavigationMode(exactViewId, defaultMode);
+    if (navigationMode !== previousMode) {
+      navigationModeChangeHandler?.(exactViewId, navigationMode);
+    }
+    return true;
+  }
+
+  function applyNavigationModeWithSync(mode) {
+    const next = assertNavigationMode(mode);
+    if (next === navigationMode) return;
+    if (next === 'free') {
+      // Ensure orbit state is synced before switching.
+      const width = canvas.clientWidth || canvas.width || 1;
+      const height = canvas.clientHeight || canvas.height || 1;
+      updateCamera(width, height);
+      syncFreeflyFromOrbit();
+      navigationMode = 'free';
+      canvas.classList.add('free-nav');
+      canvas.classList.remove('planar-nav');
+      canvas.style.cursor = pointerLockActive ? 'none' : 'crosshair';
+      velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
+      activeKeys.clear();
+    } else if (next === 'planar') {
+      // Planar mode: fix camera to look at the XY plane.
+      if (navigationMode === 'free') {
+        syncOrbitFromFreefly();
+      }
+      navigationMode = 'planar';
+      canvas.classList.remove('free-nav');
+      canvas.classList.add('planar-nav');
+      const planarWasPointerLocked = document.pointerLockElement === canvas;
+      clearPointerLockIntent(null);
+      if (
+        planarWasPointerLocked &&
+        typeof document.exitPointerLock === 'function'
+      ) {
+        document.exitPointerLock();
+      }
+      activeKeys.clear();
+      vec3.set(freeflyVelocity, 0, 0, 0);
+      velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
+      updateCursorForHighlightMode();
+    } else {
+      // Orbit mode.
+      if (navigationMode === 'free') {
+        syncOrbitFromFreefly();
+      }
+      navigationMode = 'orbit';
+      canvas.classList.remove('free-nav');
+      canvas.classList.remove('planar-nav');
+      const orbitWasPointerLocked = document.pointerLockElement === canvas;
+      clearPointerLockIntent(null);
+      if (
+        orbitWasPointerLocked &&
+        typeof document.exitPointerLock === 'function'
+      ) {
+        document.exitPointerLock();
+      }
+      activeKeys.clear();
+      vec3.set(freeflyVelocity, 0, 0, 0);
       updateCursorForHighlightMode();
     }
   }
@@ -3497,37 +4299,42 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   }
 
   function applyCameraStateTemporarily(camState, { applyNavMode = true } = {}) {
-    if (!camState) return;
+    const exactState = assertCameraState(camState, 'Temporary camera state');
     // Apply navigation mode if requested (when switching views with unlocked cameras)
-    if (applyNavMode && camState.navigationMode) {
-      applyNavigationModeDirectly(camState.navigationMode);
+    if (applyNavMode) {
+      applyNavigationModeDirectly(exactState.navigationMode);
     }
-    if (camState.orbit) {
-      radius = camState.orbit.radius ?? radius;
-      targetRadius = camState.orbit.targetRadius ?? targetRadius;
-      theta = camState.orbit.theta ?? theta;
-      phi = camState.orbit.phi ?? phi;
-      if (camState.orbit.target) {
-        vec3.set(target, camState.orbit.target[0], camState.orbit.target[1], camState.orbit.target[2]);
-      }
-    }
-    if (camState.freefly) {
-      if (camState.freefly.position) {
-        vec3.set(freeflyPosition, camState.freefly.position[0], camState.freefly.position[1], camState.freefly.position[2]);
-      }
-      freeflyYaw = camState.freefly.yaw ?? freeflyYaw;
-      freeflyPitch = camState.freefly.pitch ?? freeflyPitch;
-    }
+    radius = exactState.orbit.radius;
+    targetRadius = exactState.orbit.targetRadius;
+    theta = exactState.orbit.theta;
+    phi = exactState.orbit.phi;
+    vec3.set(
+      target,
+      exactState.orbit.target[0],
+      exactState.orbit.target[1],
+      exactState.orbit.target[2]
+    );
+    vec3.set(
+      freeflyPosition,
+      exactState.freefly.position[0],
+      exactState.freefly.position[1],
+      exactState.freefly.position[2]
+    );
+    freeflyYaw = exactState.freefly.yaw;
+    freeflyPitch = exactState.freefly.pitch;
   }
 
   // Compute viewMatrix from cameraState WITHOUT modifying global state (for cached rendering)
   function computeViewMatrixFromState(camState, outViewMatrix) {
-    if (!camState) return null;
-    const navMode = camState.navigationMode || 'orbit';
-    if (navMode === 'free' && camState.freefly) {
-      const pos = camState.freefly.position || [0, 0, 5];
-      const yaw = camState.freefly.yaw || 0;
-      const pitch = camState.freefly.pitch || 0;
+    const exactState = assertCameraState(
+      camState,
+      'Camera view-matrix state'
+    );
+    const navMode = exactState.navigationMode;
+    if (navMode === 'free') {
+      const pos = exactState.freefly.position;
+      const yaw = exactState.freefly.yaw;
+      const pitch = exactState.freefly.pitch;
       // Compute forward vector from yaw/pitch - must match getFreeflyAxes() convention
       const cosPitch = Math.cos(pitch);
       const forward = [
@@ -3557,17 +4364,17 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         right[0] * forward[1] - right[1] * forward[0]
       ];
       mat4.lookAt(outViewMatrix, pos, lookTarget, upVec);
-    } else if (navMode === 'planar' && camState.orbit) {
+    } else if (navMode === 'planar') {
       // Planar mode: camera looks at XY plane from the Z axis
-      const r = camState.orbit.radius ?? 5;
-      const tgt = camState.orbit.target || [0, 0, 0];
+      const r = exactState.orbit.radius;
+      const tgt = exactState.orbit.target;
       const eyePos = [tgt[0], tgt[1], tgt[2] + r];
       mat4.lookAt(outViewMatrix, eyePos, tgt, up);
-    } else if (camState.orbit) {
-      const r = camState.orbit.radius ?? 5;
-      const t = camState.orbit.theta ?? 0;
-      const p = camState.orbit.phi ?? Math.PI / 2;
-      const tgt = camState.orbit.target || [0, 0, 0];
+    } else {
+      const r = exactState.orbit.radius;
+      const t = exactState.orbit.theta;
+      const p = exactState.orbit.phi;
+      const tgt = exactState.orbit.target;
       const eyePos = [
         tgt[0] + r * Math.sin(p) * Math.cos(t),
         tgt[1] + r * Math.cos(p),
@@ -3580,22 +4387,22 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
   // Update cached view matrix for a specific view (call when camera changes)
 	  function updateCachedViewMatrix(viewId, camState) {
-	    const vid = String(viewId);
-	    if (!camState) {
-	      cachedViewMatrices.delete(vid);
-	      return;
-	    }
+	    const vid = assertViewId(viewId);
+	    const exactState = assertCameraState(
+	      camState,
+	      `Cached camera state for view "${vid}"`
+	    );
 	    let cached = cachedViewMatrices.get(vid);
 	    if (!cached) {
 	      cached = { viewMatrix: mat4.create(), radius: 0, cameraDistance: 0, cameraPosition: vec3.create() };
 	      cachedViewMatrices.set(vid, cached);
 	    }
-	    computeViewMatrixFromState(camState, cached.viewMatrix);
-	    cached.radius = camState.orbit?.radius ?? radius;
+	    computeViewMatrixFromState(exactState, cached.viewMatrix);
+	    cached.radius = exactState.orbit.radius;
 	    // Cache camera distance based on view's navigation mode (for LOD/fog calculations)
-	    if (camState.navigationMode === 'free' && camState.freefly?.position) {
+	    if (exactState.navigationMode === 'free') {
 	      // Freefly mode: distance is length of position vector
-	      const pos = camState.freefly.position;
+	      const pos = exactState.freefly.position;
 	      cached.cameraDistance = Math.sqrt(pos[0] * pos[0] + pos[1] * pos[1] + pos[2] * pos[2]);
 	    } else {
 	      // Orbit mode: distance is the orbit radius
@@ -3604,29 +4411,25 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
 	    // Cache camera position for this view (avoid per-frame mat4.invert in render loop).
 	    const outPos = cached.cameraPosition;
-	    if (camState.navigationMode === 'free' && camState.freefly?.position) {
-	      const pos = camState.freefly.position;
-	      outPos[0] = pos[0] ?? 0;
-	      outPos[1] = pos[1] ?? 0;
-	      outPos[2] = pos[2] ?? 0;
-	    } else if (camState.navigationMode === 'planar' && camState.orbit) {
-	      const r = camState.orbit.radius ?? 5;
-	      const tgt = camState.orbit.target || [0, 0, 0];
-	      outPos[0] = tgt[0] ?? 0;
-	      outPos[1] = tgt[1] ?? 0;
-	      outPos[2] = (tgt[2] ?? 0) + r;
-	    } else if (camState.orbit) {
-	      const r = camState.orbit.radius ?? 5;
-	      const t = camState.orbit.theta ?? 0;
-	      const p = camState.orbit.phi ?? Math.PI / 2;
-	      const tgt = camState.orbit.target || [0, 0, 0];
-	      outPos[0] = (tgt[0] ?? 0) + r * Math.sin(p) * Math.cos(t);
-	      outPos[1] = (tgt[1] ?? 0) + r * Math.cos(p);
-	      outPos[2] = (tgt[2] ?? 0) + r * Math.sin(p) * Math.sin(t);
+	    if (exactState.navigationMode === 'free') {
+	      const pos = exactState.freefly.position;
+	      outPos[0] = pos[0];
+	      outPos[1] = pos[1];
+	      outPos[2] = pos[2];
+	    } else if (exactState.navigationMode === 'planar') {
+	      const r = exactState.orbit.radius;
+	      const tgt = exactState.orbit.target;
+	      outPos[0] = tgt[0];
+	      outPos[1] = tgt[1];
+	      outPos[2] = tgt[2] + r;
 	    } else {
-	      outPos[0] = eye[0];
-	      outPos[1] = eye[1];
-	      outPos[2] = eye[2];
+	      const r = exactState.orbit.radius;
+	      const t = exactState.orbit.theta;
+	      const p = exactState.orbit.phi;
+	      const tgt = exactState.orbit.target;
+	      outPos[0] = tgt[0] + r * Math.sin(p) * Math.cos(t);
+	      outPos[1] = tgt[1] + r * Math.cos(p);
+	      outPos[2] = tgt[2] + r * Math.sin(p) * Math.sin(t);
 	    }
 	  }
 
@@ -3661,35 +4464,49 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
   // === Public API ===
   return {
-    setData({ positions, colors, outlierQuantiles, transparency, dimensionLevel = 3 }) {
-      pointCount = positions.length / 3;
+    setData(payload) {
+      const {
+        positions,
+        colors,
+        transparency,
+        dimensionLevel,
+        pointCount: nextPointCount
+      } = assertViewerDataPayload(payload);
+      // Load data into HP renderer (alpha is packed in colors as RGBA uint8)
+      // Pass dimension level so the renderer can build the appropriate spatial index (BinaryTree/Quadtree/Octree)
+      hpRenderer.loadData(positions, colors, {
+        alphaValues: transparency,
+        dimensionLevel
+      });
+
+      cancelPendingProjectileBuild(
+        'Projectile preparation was cancelled because the dataset changed.'
+      );
+      projectileSystem.setEnabled(false);
+      pointCount = nextPointCount;
       positionsArray = positions;
       colorsArray = colors;
       transparencyArray = transparency;
       computePointBoundsFromPositions(positions);
-
-      // Initialize dimension level for live view (default 3D if not specified)
       viewDimensionLevels.set(LIVE_VIEW_ID, dimensionLevel);
       viewPositionsCache.set(LIVE_VIEW_ID, positions);
-
-      // Load data into HP renderer (alpha is packed in colors as RGBA uint8)
-      // Pass dimension level so the renderer can build the appropriate spatial index (BinaryTree/Quadtree/Octree)
-      hpRenderer.loadData(positions, colors, { dimensionLevel });
+      applyDimensionNavigationDefault(LIVE_VIEW_ID, dimensionLevel);
     },
 
     updateColors(colors) {
-      colorsArray = colors;
+      assertExactUint8Array(colors, pointCount * 4, 'Viewer live colors');
       hpRenderer.updateColors(colors);
-      currentLoadedViewId = LIVE_VIEW_ID; // Mark live view as loaded
+      colorsArray = colors;
     },
 
     updateTransparency(alphaArray) {
-      transparencyArray = alphaArray;
+      assertTransparencyArray(
+        alphaArray,
+        pointCount,
+        'Viewer live transparency'
+      );
       hpRenderer.updateAlphas(alphaArray);
-      currentLoadedViewId = LIVE_VIEW_ID; // Mark live view as loaded
-      // Rebuild highlight buffer when visibility changes (filter applied/removed)
-      highlightTools?.handleTransparencyChange?.(alphaArray);
-
+      transparencyArray = alphaArray;
       // Let overlays (e.g., vector field particles) rebuild spawn sources lazily when visibility changes.
       if (vectorFieldOverlay?.enabled) {
         vectorFieldOverlay.markVisibilityDirty(LIVE_VIEW_ID);
@@ -3698,57 +4515,59 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         }
       }
 
-      // Propagate transparency reference to snapshots that share transparency with live view
-      // NOTE: We do NOT rebuild snapshot GPU buffers here - that was ~16x slower than necessary.
-      // Instead, renderWithSnapshot() uses useAlphaTexture=true for these snapshots, which
-      // samples alpha from the live alpha texture (already uploaded via updateAlphas above).
-      // This reduces GPU uploads from N*16 bytes (full buffer) to N bytes (alpha texture only).
-      for (const snap of snapshotViews) {
-        if (snap.sharesLiveTransparency) {
-          // Just update the transparency reference - rendering will use the live alpha texture
-          snap.transparency = alphaArray;
-        }
-      }
-    },
-
-    updateOutlierQuantiles(outliers) {
-      // HP renderer doesn't use outlier quantiles directly
-      // Filtering should be done via transparency array
+      highlightTools.handleTransparencyChange(LIVE_VIEW_ID);
     },
 
     /**
      * Update positions for dimension switching (maintains same point count and indices)
      * Also updates edge position texture if edge rendering is enabled.
-     * @param {Float32Array} positions - New 3D positions array (n_points * 3)
+    * @param {Float32Array} positions - New 3D positions array (n_points * 3)
      */
     updatePositions(positions) {
-      if (!positions || positions.length !== pointCount * 3) {
-        console.error('[Viewer] updatePositions: position count mismatch');
-        return;
-      }
-      positionsArray = positions;
-      // Also update the view positions cache to keep live view positions consistent
-      // This ensures viewPositionsCache.get('live') returns the same positions as positionsArray
-      viewPositionsCache.set(LIVE_VIEW_ID, positions);
-      computePointBoundsFromPositions(positions);
-
+      assertFiniteFloat32Array(
+        positions,
+        pointCount * 3,
+        'Viewer live positions'
+      );
       // Update HP renderer with new positions (keeps existing colors/transparency)
       // Pass dimension level so the renderer can update for the correct dimension
-      const dimLevel = getFallbackDimensionLevel();
-      if (hpRenderer && hpRenderer.updatePositions) {
+      const dimLevel = getPublishedDimensionLevel(LIVE_VIEW_ID);
+      const previousPositions = positionsArray;
+      let rendererPublished = false;
+      try {
         hpRenderer.updatePositions(positions, dimLevel);
-      } else if (hpRenderer && hpRenderer.loadData) {
-        // Fallback: full reload if incremental update not available
-        hpRenderer.loadData(positions, colorsArray, { dimensionLevel: dimLevel });
-      }
-      // Note: Spatial index is rebuilt lazily by updatePositions only if LOD/frustum culling is enabled
+        rendererPublished = true;
 
-      // Update edge position texture for live view if edges are enabled
-      if (useInstancedEdges && nEdgesV2 > 0) {
-        createPositionTextureV2ForView(LIVE_VIEW_ID, positions, pointCount);
+        // The edge helper stages its texture and preserves the old texture if
+        // upload fails. Only after both owners succeed is the position set
+        // visible to the rest of the viewer.
+        if (useInstancedEdges && nEdgesV2 > 0) {
+          createPositionTextureV2ForView(
+            LIVE_VIEW_ID,
+            positions,
+            pointCount
+          );
+        }
+      } catch (publicationError) {
+        if (rendererPublished) {
+          try {
+            hpRenderer.loadData(previousPositions, colorsArray, {
+              alphaValues: transparencyArray,
+              dimensionLevel: dimLevel
+            });
+          } catch (restorationError) {
+            throw new AggregateError(
+              [publicationError, restorationError],
+              'Viewer position publication and renderer restoration both failed.'
+            );
+          }
+        }
+        throw publicationError;
       }
 
-      currentLoadedViewId = LIVE_VIEW_ID;
+      positionsArray = positions;
+      viewPositionsCache.set(LIVE_VIEW_ID, positions);
+      computePointBoundsFromPositions(positions);
     },
 
     /**
@@ -3778,11 +4597,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     /**
      * Set dimension level for a specific view (for multi-dimensional support)
      * @param {string} viewId - View identifier
-     * @param {number} level - Dimension level (1, 2, 3, or 4)
+     * @param {number} level - Dimension level (1, 2, or 3)
      */
     setViewDimension(viewId, level) {
-      const vid = String(viewId);
-      const oldLevel = viewDimensionLevels.get(vid);
+      const vid = assertViewId(viewId);
+      getDefaultNavigationMode(level);
+      const oldLevel = getPublishedDimensionLevel(vid);
+      if (vid === LIVE_VIEW_ID && oldLevel !== level) {
+        cancelPendingProjectileBuild(
+          'Projectile preparation was cancelled because the live dimension changed.'
+        );
+        projectileSystem.setEnabled(false);
+      }
       viewDimensionLevels.set(vid, level);
 
       // Also update the snapshot object if this is a snapshot view
@@ -3794,12 +4620,6 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       // Invalidate per-view caches when dimension changes (LOD/frustum calculations differ)
       if (oldLevel !== level && hpRenderer) {
         hpRenderer.clearViewState(vid);
-        // If this view has a snapshot buffer, rebuild its spatial index for the new dimension
-        // This ensures LOD/frustum culling works correctly after dimension change
-        if (hpRenderer.hasSnapshotBuffer(vid)) {
-          hpRenderer.rebuildSnapshotSpatialIndex(vid, level);
-        }
-
         // For live view, also update the renderer's dimension level
         // This switches the renderer to use the appropriate spatial index (BinaryTree/Quadtree/Octree)
         if (vid === LIVE_VIEW_ID && hpRenderer.setDimensionLevel) {
@@ -3809,6 +4629,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
       // Invalidate cached view matrix since camera behavior may differ per dimension
       cachedViewMatrices.delete(vid);
+      applyDimensionNavigationDefault(vid, level);
     },
 
     /**
@@ -3817,7 +4638,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
      * @returns {number} Dimension level (defaults to 3)
      */
     getViewDimension(viewId) {
-      return getEffectiveDimensionLevel(viewId);
+      return getPublishedDimensionLevel(viewId);
     },
 
     /**
@@ -3828,34 +4649,35 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
      * @param {Float32Array} positions - 3D positions array
      */
     setViewPositions(viewId, positions) {
-      const vid = String(viewId);
-      viewPositionsCache.set(vid, positions);
+      const vid = assertKnownViewId(viewId);
+      assertFiniteFloat32Array(
+        positions,
+        pointCount * 3,
+        `Positions for view "${vid}"`
+      );
+      const dimLevel = getPublishedDimensionLevel(vid);
 
       // If this is the live view, update the main positions
       if (vid === LIVE_VIEW_ID) {
-        positionsArray = positions;
-        computePointBoundsFromPositions(positions);
         // Pass dimension level so the renderer can build the appropriate spatial index
-        const dimLevel = getEffectiveDimensionLevel(vid);
-        if (hpRenderer && hpRenderer.updatePositions) {
-          hpRenderer.updatePositions(positions, dimLevel);
-        }
+        hpRenderer.updatePositions(positions, dimLevel);
         // Update edge position texture for live view if edges are enabled
         if (useInstancedEdges && nEdgesV2 > 0) {
           const nCells = positions.length / 3;
           createPositionTextureV2ForView(vid, positions, nCells);
         }
+        positionsArray = positions;
+        computePointBoundsFromPositions(positions);
       } else {
         // For snapshot views, update the snapshot buffer positions
-        if (hpRenderer && hpRenderer.updateSnapshotPositions) {
-          hpRenderer.updateSnapshotPositions(vid, positions);
-        }
+        hpRenderer.updateSnapshotPositions(vid, positions, dimLevel);
         // Update edge position texture for this snapshot if edges are enabled
         if (useInstancedEdges && nEdgesV2 > 0) {
           const nCells = positions.length / 3;
           createPositionTextureV2ForView(vid, positions, nCells);
         }
       }
+      viewPositionsCache.set(vid, positions);
     },
 
     /**
@@ -3864,11 +4686,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
      * @returns {Float32Array|null} Positions array or null
      */
     getViewPositions(viewId) {
-      const vid = String(viewId);
-      if (vid === LIVE_VIEW_ID) {
-        return positionsArray;
-      }
-      return viewPositionsCache.get(vid) || positionsArray;
+      return getExactViewPositions(viewId);
     },
 
     /**
@@ -3879,10 +4697,21 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
      * @returns {Uint8Array|null}
      */
     getViewColors(viewId) {
-      const vid = String(viewId || LIVE_VIEW_ID);
-      if (vid === LIVE_VIEW_ID) return colorsArray;
+      const vid = assertViewId(viewId);
+      if (vid === LIVE_VIEW_ID) {
+        if (!(colorsArray instanceof Uint8Array)) {
+          throw new Error('Colors are not published for view "live".');
+        }
+        return colorsArray;
+      }
       const snapshot = snapshotViews.find(s => s.id === vid);
-      return snapshot?.colors || colorsArray;
+      if (!snapshot) {
+        throw new Error(`View "${vid}" does not exist.`);
+      }
+      if (!(snapshot.colors instanceof Uint8Array)) {
+        throw new Error(`Colors are not published for view "${vid}".`);
+      }
+      return snapshot.colors;
     },
 
     /**
@@ -3892,37 +4721,19 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
      * @returns {Float32Array|null} Transparency array (0 = hidden, >0 = visible)
      */
     getViewTransparency(viewId) {
-      if (!viewId || viewId === LIVE_VIEW_ID) {
-        return transparencyArray;
-      }
-      const snapshot = snapshotViews.find(s => s.id === viewId);
-      // Use snapshot's own transparency if it doesn't share live transparency
-      if (snapshot && !snapshot.sharesLiveTransparency && snapshot.transparency) {
-        return snapshot.transparency;
-      }
-      return transparencyArray;
-    },
-
-    /**
-     * Clear view dimension and position cache for a view (on view removal)
-     * @param {string} viewId - View identifier
-     */
-    clearViewDimensionState(viewId) {
-      const vid = String(viewId);
-      viewDimensionLevels.delete(vid);
-      viewPositionsCache.delete(vid);
+      return getExactViewTransparency(viewId);
     },
 
     updateHighlight(highlightData, highlightedIndices = null) {
-      highlightTools?.updateHighlight?.(highlightData, null, highlightedIndices);
+      highlightTools.updateHighlight(highlightData, highlightedIndices);
     },
 
     setHighlightStyle(options = {}) {
-      highlightTools?.setHighlightStyle?.(options);
+      highlightTools.setHighlightStyle(options);
     },
 
     getHighlightedCount() {
-      return highlightTools ? highlightTools.getHighlightedCount() : 0;
+      return highlightTools.getHighlightedCount();
     },
 
     // Cell selection/picking API
@@ -3931,375 +4742,468 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     },
 
     setCellSelectionCallback(callback) {
-      highlightTools?.setCellSelectionCallback?.(callback);
+      highlightTools.setCellSelectionCallback(callback);
     },
 
     setSelectionStepCallback(callback) {
-      highlightTools?.setSelectionStepCallback?.(callback);
+      highlightTools.setSelectionStepCallback(callback);
     },
 
     setCellSelectionEnabled(enabled) {
-      highlightTools?.setCellSelectionEnabled?.(enabled);
+      highlightTools.setCellSelectionEnabled(enabled);
     },
 
     getCellSelectionEnabled() {
-      return highlightTools?.getCellSelectionEnabled?.() ?? true;
+      return highlightTools.getCellSelectionEnabled();
     },
 
     setSelectionPreviewCallback(callback) {
-      highlightTools?.setSelectionPreviewCallback?.(callback);
+      highlightTools.setSelectionPreviewCallback(callback);
     },
 
     getAnnotationState() {
-      return highlightTools?.getAnnotationState?.() || { inProgress: false, stepCount: 0, lastMode: 'intersect' };
+      return highlightTools.getAnnotationState();
     },
 
     confirmAnnotationSelection() {
-      highlightTools?.confirmAnnotationSelection?.();
+      highlightTools.confirmAnnotationSelection();
     },
 
     cancelAnnotationSelection() {
-      highlightTools?.cancelAnnotationSelection?.();
+      highlightTools.cancelAnnotationSelection();
     },
 
     setHighlightMode(mode) {
-      highlightTools?.setHighlightMode?.(mode);
+      highlightTools.setHighlightMode(mode);
     },
 
     getHighlightMode() {
-      return highlightTools?.getHighlightMode?.() || 'none';
+      return highlightTools.getHighlightMode();
     },
 
     // Lasso selection API
     setLassoEnabled(enabled) {
-      highlightTools?.setLassoEnabled?.(enabled);
+      highlightTools.setLassoEnabled(enabled);
     },
 
     getLassoEnabled() {
-      return highlightTools?.getLassoEnabled?.() ?? false;
+      return highlightTools.getLassoEnabled();
     },
 
     setLassoCallback(callback) {
-      highlightTools?.setLassoCallback?.(callback);
+      highlightTools.setLassoCallback(callback);
     },
 
     setLassoPreviewCallback(callback) {
-      highlightTools?.setLassoPreviewCallback?.(callback);
+      highlightTools.setLassoPreviewCallback(callback);
     },
 
     clearLasso() {
-      highlightTools?.clearLasso?.();
+      highlightTools.clearLasso();
     },
 
     // Multi-step lasso selection API
     setLassoStepCallback(callback) {
-      highlightTools?.setLassoStepCallback?.(callback);
+      highlightTools.setLassoStepCallback(callback);
     },
 
     getLassoState() {
-      return highlightTools?.getLassoState?.() || { inProgress: false, stepCount: 0, candidateCount: 0 };
+      return highlightTools.getLassoState();
     },
 
     confirmLassoSelection() {
-      highlightTools?.confirmLassoSelection?.();
+      highlightTools.confirmLassoSelection();
     },
 
     cancelLassoSelection() {
-      highlightTools?.cancelLassoSelection?.();
+      highlightTools.cancelLassoSelection();
     },
 
     // Restore lasso state for undo/redo
     restoreLassoState(candidates, step) {
-      highlightTools?.restoreLassoState?.(candidates, step);
+      highlightTools.restoreLassoState(candidates, step);
     },
 
     // Proximity drag selection API
     setProximityEnabled(enabled) {
-      highlightTools?.setProximityEnabled?.(enabled);
+      highlightTools.setProximityEnabled(enabled);
     },
 
     getProximityEnabled() {
-      return highlightTools?.getProximityEnabled?.() ?? false;
+      return highlightTools.getProximityEnabled();
     },
 
     setProximityCallback(callback) {
-      highlightTools?.setProximityCallback?.(callback);
+      highlightTools.setProximityCallback(callback);
     },
 
     setProximityPreviewCallback(callback) {
-      highlightTools?.setProximityPreviewCallback?.(callback);
+      highlightTools.setProximityPreviewCallback(callback);
     },
 
     setProximityStepCallback(callback) {
-      highlightTools?.setProximityStepCallback?.(callback);
+      highlightTools.setProximityStepCallback(callback);
     },
 
     getProximityState() {
-      return highlightTools?.getProximityState?.() || { inProgress: false, stepCount: 0, candidateCount: 0 };
+      return highlightTools.getProximityState();
     },
 
     confirmProximitySelection() {
-      highlightTools?.confirmProximitySelection?.();
+      highlightTools.confirmProximitySelection();
     },
 
     cancelProximitySelection() {
-      highlightTools?.cancelProximitySelection?.();
+      highlightTools.cancelProximitySelection();
     },
 
     // Restore proximity state for undo/redo
     restoreProximityState(candidates, step) {
-      highlightTools?.restoreProximityState?.(candidates, step);
+      highlightTools.restoreProximityState(candidates, step);
     },
 
     // KNN drag selection API
     setKnnEnabled(enabled) {
-      highlightTools?.setKnnEnabled?.(enabled);
+      highlightTools.setKnnEnabled(enabled);
     },
 
     getKnnEnabled() {
-      return highlightTools?.getKnnEnabled?.() ?? false;
+      return highlightTools.getKnnEnabled();
     },
 
     setKnnCallback(callback) {
-      highlightTools?.setKnnCallback?.(callback);
+      highlightTools.setKnnCallback(callback);
     },
 
     setKnnPreviewCallback(callback) {
-      highlightTools?.setKnnPreviewCallback?.(callback);
+      highlightTools.setKnnPreviewCallback(callback);
     },
 
     setKnnStepCallback(callback) {
-      highlightTools?.setKnnStepCallback?.(callback);
+      highlightTools.setKnnStepCallback(callback);
     },
 
     setKnnEdgeLoadCallback(callback) {
-      highlightTools?.setKnnEdgeLoadCallback?.(callback);
+      highlightTools.setKnnEdgeLoadCallback(callback);
     },
 
     getKnnState() {
-      return highlightTools?.getKnnState?.() || { inProgress: false, stepCount: 0, candidateCount: 0, edgesLoaded: false };
+      return highlightTools.getKnnState();
     },
 
     // Load KNN edges from edge arrays and build adjacency list
     loadKnnEdges(sources, destinations) {
-      return highlightTools ? highlightTools.loadKnnEdges(sources, destinations) : false;
+      return highlightTools.loadKnnEdges(sources, destinations);
+    },
+
+    clearKnnEdges() {
+      highlightTools.clearKnnEdges();
     },
 
     isKnnEdgesLoaded() {
-      return highlightTools?.isKnnEdgesLoaded?.() ?? false;
+      return highlightTools.isKnnEdgesLoaded();
     },
 
     confirmKnnSelection() {
-      highlightTools?.confirmKnnSelection?.();
+      highlightTools.confirmKnnSelection();
     },
 
     cancelKnnSelection() {
-      highlightTools?.cancelKnnSelection?.();
+      highlightTools.cancelKnnSelection();
     },
 
     // Restore KNN state for undo/redo
     restoreKnnState(candidates, step) {
-      highlightTools?.restoreKnnState?.(candidates, step);
+      highlightTools.restoreKnnState(candidates, step);
     },
 
     // Unified selection API (shared state across lasso, proximity, KNN)
     // Allows switching tools mid-selection to refine with different methods
     getUnifiedSelectionState() {
-      return highlightTools?.getUnifiedSelectionState?.() || { inProgress: false, stepCount: 0, candidateCount: 0, candidates: [] };
+      return highlightTools.getUnifiedSelectionState();
     },
 
     confirmUnifiedSelection(callback) {
-      return highlightTools?.confirmUnifiedSelection?.(callback) || [];
+      return highlightTools.confirmUnifiedSelection(callback);
     },
 
     cancelUnifiedSelection() {
-      highlightTools?.cancelUnifiedSelection?.();
+      highlightTools.cancelUnifiedSelection();
     },
 
     restoreUnifiedState(candidates, step) {
-      highlightTools?.restoreUnifiedState?.(candidates, step);
+      highlightTools.restoreUnifiedState(candidates, step);
     },
 
-  setCentroids({ positions, colors, outlierQuantiles, transparency }) {
-    centroidCount = positions ? positions.length / 3 : 0;
-    gl.bindBuffer(gl.ARRAY_BUFFER, centroidPositionBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, positions || new Float32Array(), gl.STATIC_DRAW);
-
-    // Pack alpha into RGBA byte colors when transparency is provided
-    let packedColors = colors;
-    if (transparency && centroidCount > 0) {
-      const byteColors = colors && colors.length >= centroidCount * 4
-        ? new Uint8Array(colors)
-        : new Uint8Array(centroidCount * 4).fill(255);
-      const len = Math.min(centroidCount, transparency.length);
-      for (let i = 0; i < len; i++) {
-        byteColors[i * 4 + 3] = Math.max(0, Math.min(255, Math.round(transparency[i] * 255)));
+  setCentroids(payload) {
+    const {
+      positions,
+      colors,
+      count: nextCentroidCount
+    } = assertCentroidPayload(payload);
+    assertNoWebGLError(gl, 'Viewer centroid publication');
+    let candidatePositions = null;
+    let candidateColors = null;
+    try {
+      candidatePositions = gl.createBuffer();
+      candidateColors = gl.createBuffer();
+      if (!candidatePositions || !candidateColors) {
+        throw new Error(
+          'Viewer could not allocate candidate centroid buffers.'
+        );
       }
-      packedColors = byteColors;
+      gl.bindBuffer(gl.ARRAY_BUFFER, candidatePositions);
+      gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+      gl.bindBuffer(gl.ARRAY_BUFFER, candidateColors);
+      gl.bufferData(gl.ARRAY_BUFFER, colors, gl.STATIC_DRAW);
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      assertNoWebGLError(gl, 'Viewer candidate centroid publication');
+    } catch (error) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      if (candidatePositions) gl.deleteBuffer(candidatePositions);
+      if (candidateColors) gl.deleteBuffer(candidateColors);
+      gl.getError();
+      throw error;
     }
 
-    gl.bindBuffer(gl.ARRAY_BUFFER, centroidColorBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, packedColors || new Uint8Array(), gl.STATIC_DRAW); // RGBA uint8
+    const previousPositions = centroidPositionBuffer;
+    const previousColors = centroidColorBuffer;
+    centroidPositionBuffer = candidatePositions;
+    centroidColorBuffer = candidateColors;
+    centroidCount = nextCentroidCount;
+    gl.deleteBuffer(previousPositions);
+    gl.deleteBuffer(previousColors);
   },
 
     setCentroidLabels(labels, viewId) {
-      const targetId = String(viewId || focusedViewId || LIVE_VIEW_ID);
+      const targetId = assertKnownViewId(viewId);
+      const entries = assertCentroidLabelEntries(labels);
       removeLabelsForView(targetId);
-      const entries = Array.isArray(labels) ? labels : [];
       entries.forEach((item) => {
-        if (item?.el) {
-          item.el.dataset.viewId = targetId;
-          if (item.el.parentElement !== labelLayer) labelLayer.appendChild(item.el);
-        }
+        item.el.dataset.viewId = targetId;
+        if (item.el.parentElement !== labelLayer) labelLayer.appendChild(item.el);
       });
       viewCentroidLabels.set(targetId, entries);
       updateLabelLayerVisibility();
     },
 
-    setPointSize(size) { basePointSize = size; },
-    setSizeAttenuation(value) { sizeAttenuation = value; },
-    setLightingStrength(value) { lightingStrength = value; },
-    setFogDensity(value) { fogDensity = Math.max(0, value); },
-    setOutlierThreshold(value) { outlierThreshold = value; },
-
+    setPointSize(size) {
+      basePointSize = assertFiniteNumberInRange(size, 0.25, 200, 'Point size');
+    },
+    setSizeAttenuation(value) {
+      sizeAttenuation = assertFiniteNumberInRange(
+        value,
+        0,
+        1,
+        'Perspective size scaling'
+      );
+    },
+    setLightingStrength(value) {
+      lightingStrength = assertFiniteNumberInRange(value, 0, 1, 'Lighting strength');
+    },
+    setFogDensity(value) {
+      fogDensity = assertFiniteNumberInRange(value, 0, 1, 'Fog density');
+    },
     setShowCentroidPoints(show, viewId) {
-      setViewFlags(viewId || focusedViewId || LIVE_VIEW_ID, { points: !!show });
+      const exactShow = assertExactBoolean(show, 'Centroid point visibility');
+      setViewFlags(viewId, { points: exactShow });
     },
 
     setShowCentroidLabels(show, viewId) {
-      const key = viewId || focusedViewId || LIVE_VIEW_ID;
-      setViewFlags(key, { labels: !!show });
-      if (!show) hideLabelsForView(key);
+      const exactShow = assertExactBoolean(show, 'Centroid label visibility');
+      const key = assertKnownViewId(viewId);
+      setViewFlags(key, { labels: exactShow });
+      if (!exactShow) hideLabelsForView(key);
       updateLabelLayerVisibility();
     },
 
     getCentroidFlags(viewId) { return getViewFlags(viewId); },
     setBackground,
-    setRenderMode(mode) { renderMode = mode === 'smoke' ? 'smoke' : 'points'; },
+    setRenderMode(mode) {
+      const exactMode = assertRenderMode(mode);
+      if (exactMode === 'smoke' && snapshotViews.length > 0) {
+        throw new RangeError('Smoke render mode is unavailable while snapshots exist.');
+      }
+      renderMode = exactMode;
+    },
     setNavigationMode(mode) {
-      const next = mode === 'free' ? 'free' : (mode === 'planar' ? 'planar' : 'orbit');
-      if (next === navigationMode) return;
-      if (next === 'free') {
-        // Ensure orbit state is synced before switching
-        const width = canvas.clientWidth || canvas.width || 1;
-        const height = canvas.clientHeight || canvas.height || 1;
-        updateCamera(width, height);
-        syncFreeflyFromOrbit();
-        navigationMode = 'free';
-        canvas.classList.add('free-nav');
-        canvas.classList.remove('planar-nav');
-        canvas.style.cursor = pointerLockActive ? 'none' : 'crosshair';
-        velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
-        activeKeys.clear();
-        if (pointerLockEnabled && canvas.requestPointerLock) {
-          canvas.requestPointerLock();
-        }
-      } else if (next === 'planar') {
-        // Planar mode: fix camera to look at XY plane
-        if (navigationMode === 'free') {
-          syncOrbitFromFreefly();
-        }
-        navigationMode = 'planar';
-        canvas.classList.remove('free-nav');
-        canvas.classList.add('planar-nav');
-        lookActive = false;
-        pointerLockEnabled = false;
-        if (document.pointerLockElement === canvas && document.exitPointerLock) {
-          document.exitPointerLock();
-        }
-        activeKeys.clear();
-        vec3.set(freeflyVelocity, 0, 0, 0);
-        velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
-        updateCursorForHighlightMode();
+      const exactMode = assertNavigationMode(mode);
+      const previousMode = navigationMode;
+      if (camerasLocked) {
+        navigationModeOwnership.recordSharedUserChoice(exactMode);
       } else {
-        // Orbit mode
-        if (navigationMode === 'free') {
-          syncOrbitFromFreefly();
+        navigationModeOwnership.recordViewUserChoice(focusedViewId, exactMode);
+      }
+      applyNavigationModeWithSync(exactMode);
+      if (camerasLocked) {
+        applyViewNavigationMode(LIVE_VIEW_ID, exactMode);
+        for (const snapshot of snapshotViews) {
+          applyViewNavigationMode(snapshot.id, exactMode);
         }
-        navigationMode = 'orbit';
-        canvas.classList.remove('free-nav');
-        canvas.classList.remove('planar-nav');
-        lookActive = false;
-        pointerLockEnabled = false;
-        if (document.pointerLockElement === canvas && document.exitPointerLock) {
-          document.exitPointerLock();
-        }
-        activeKeys.clear();
-        vec3.set(freeflyVelocity, 0, 0, 0);
-        updateCursorForHighlightMode();
+      } else {
+        applyViewNavigationMode(focusedViewId, exactMode);
+      }
+      if (navigationMode !== previousMode) {
+        navigationModeChangeHandler?.(focusedViewId, navigationMode);
       }
     },
     getNavigationMode() { return navigationMode; },
     setLookSensitivity(value) {
-      if (!Number.isFinite(value)) return;
-      lookSensitivity = Math.max(0.0005, Math.min(0.02, value));
+      lookSensitivity = assertFiniteNumberInRange(
+        value,
+        0.0005,
+        0.02,
+        'Look sensitivity'
+      );
     },
     setMoveSpeed(value) {
-      if (!Number.isFinite(value)) return;
-      moveSpeed = Math.max(0.01, Math.min(5, value));
+      moveSpeed = assertFiniteNumberInRange(
+        value,
+        0.01,
+        5,
+        'Movement speed'
+      );
     },
-    setInvertLook(value) { invertLookY = !!value; },
-    setInvertLookY(value) { invertLookY = !!value; },
-    setInvertLookX(value) { invertLookX = !!value; },
-    setOrbitInvertRotation(value) { orbitInvertX = !!value; },
-    setOrbitInvertX(value) { orbitInvertX = !!value; },
-    setPlanarZoomToCursor(value) { planarZoomToCursor = !!value; },
-    setPlanarInvertAxes(value) { planarInvertAxes = !!value; },
+    setInvertLookY(value) {
+      invertLookY = assertExactBoolean(value, 'Vertical invert look');
+    },
+    setInvertLookX(value) {
+      invertLookX = assertExactBoolean(value, 'Horizontal invert look');
+    },
+    setOrbitInvertRotation(value) {
+      orbitInvertX = assertExactBoolean(value, 'Orbit rotation inversion');
+    },
+    setPlanarZoomToCursor(value) {
+      planarZoomToCursor = assertExactBoolean(value, 'Planar zoom-to-cursor');
+    },
+    setPlanarInvertAxes(value) {
+      planarInvertAxes = assertExactBoolean(value, 'Planar axis inversion');
+    },
     // Keyboard navigation speed setters
     setOrbitKeySpeed(value) {
-      if (!Number.isFinite(value)) return;
-      orbitKeySpeed = Math.max(0.01, Math.min(2, value));
+      orbitKeySpeed = assertFiniteNumberInRange(
+        value,
+        0.01,
+        2,
+        'Orbit keyboard speed'
+      );
     },
     setPlanarPanSpeed(value) {
-      if (!Number.isFinite(value)) return;
-      planarPanSpeed = Math.max(0.001, Math.min(0.0075, value));
+      planarPanSpeed = assertFiniteNumberInRange(
+        value,
+        0.001,
+        0.0075,
+        'Planar keyboard pan speed'
+      );
     },
     setPointerLockEnabled(enabled) {
-      const desired = !!enabled && navigationMode === 'free';
-      pointerLockEnabled = desired;
-      if (pointerLockEnabled) {
-        if (canvas.requestPointerLock) {
-          canvas.requestPointerLock();
+      const exactEnabled = assertExactBoolean(enabled, 'Pointer lock');
+      if (exactEnabled && navigationMode !== 'free') {
+        throw new RangeError(
+          'Pointer lock can be enabled only in Free Fly navigation mode.'
+        );
+      }
+      if (exactEnabled) {
+        if (typeof canvas.requestPointerLock !== 'function') {
+          clearPointerLockIntent(
+            'Pointer lock is unavailable in this browser or platform context.'
+          );
+          return;
         }
-      } else if (document.pointerLockElement === canvas && document.exitPointerLock) {
-        document.exitPointerLock();
+        pointerLockEnabled = true;
+        requestPointerLockOwned();
       } else {
-        lookActive = false;
-        pointerLockActive = false;
-        canvas.classList.remove('dragging');
-        if (navigationMode === 'free') {
-          canvas.style.cursor = 'crosshair';
-        } else {
-          updateCursorForHighlightMode();
-        }
-        if (typeof pointerLockChangeHandler === 'function') {
-          pointerLockChangeHandler(false);
+        const wasLocked = document.pointerLockElement === canvas;
+        clearPointerLockIntent(null);
+        if (wasLocked) {
+          if (typeof document.exitPointerLock !== 'function') {
+            throw new Error(
+              'The browser cannot release its active pointer lock.'
+            );
+          }
+          document.exitPointerLock();
         }
       }
     },
-    setPointerLockChangeHandler(fn) { pointerLockChangeHandler = typeof fn === 'function' ? fn : null; },
-    setProjectilesEnabled(enabled, onReady) {
-      projectileSystem.setEnabled(enabled);
-      // Get the current dimension level for collision detection
-      const dimLevel = getFallbackDimensionLevel();
-      if (enabled && hpRenderer && !hpRenderer.hasSpatialIndex(dimLevel)) {
-        // Defer spatial index building so UI can update first (show loading message)
-        setTimeout(() => {
-          hpRenderer.ensureSpatialIndex(dimLevel);
-          if (typeof onReady === 'function') onReady();
-        }, 10);
-      } else if (typeof onReady === 'function') {
-        // Already ready
-        onReady();
+    setPointerLockChangeHandler(fn) {
+      pointerLockChangeHandler = assertExactFunction(
+        fn,
+        'Pointer lock change handler'
+      );
+    },
+    setProjectilesEnabled(enabled, onComplete) {
+      const exactEnabled = assertExactBoolean(enabled, 'Projectile visibility');
+      const completion = onComplete === undefined
+        ? null
+        : assertExactFunction(onComplete, 'Projectile completion handler');
+      if (!exactEnabled && completion !== null) {
+        throw new TypeError(
+          'Projectile completion handlers are accepted only when enabling projectiles.'
+        );
       }
+
+      cancelPendingProjectileBuild(
+        'Projectile preparation was superseded by a newer request.'
+      );
+      projectileSystem.setEnabled(false);
+      if (!exactEnabled) return;
+
+      const dimLevel = getPublishedDimensionLevel(LIVE_VIEW_ID);
+      if (hpRenderer.hasSpatialIndex(dimLevel)) {
+        projectileSystem.setEnabled(true);
+        publishProjectileBuildResult(completion, 'ready', null);
+        return;
+      }
+
+      const generation = projectileBuildGeneration;
+      projectileBuildCompletion = completion;
+      projectileBuildTimer = setTimeout(() => {
+        projectileBuildTimer = null;
+        if (
+          generation !== projectileBuildGeneration ||
+          getPublishedDimensionLevel(LIVE_VIEW_ID) !== dimLevel
+        ) {
+          return;
+        }
+        try {
+          hpRenderer.ensureSpatialIndex(dimLevel);
+          if (
+            generation !== projectileBuildGeneration ||
+            getPublishedDimensionLevel(LIVE_VIEW_ID) !== dimLevel
+          ) {
+            return;
+          }
+          const ownedCompletion = projectileBuildCompletion;
+          projectileBuildCompletion = null;
+          projectileSystem.setEnabled(true);
+          publishProjectileBuildResult(ownedCompletion, 'ready', null);
+        } catch (error) {
+          if (generation !== projectileBuildGeneration) return;
+          const ownedCompletion = projectileBuildCompletion;
+          projectileBuildCompletion = null;
+          projectileSystem.setEnabled(false);
+          const detail = error instanceof Error && error.message.length > 0
+            ? error.message
+            : String(error);
+          publishProjectileBuildResult(
+            ownedCompletion,
+            'error',
+            `Projectile preparation failed: ${detail}`
+          );
+        }
+      }, 10);
     },
     isProjectileSpatialIndexReady() {
-      const dimLevel = getFallbackDimensionLevel();
+      const dimLevel = getPublishedDimensionLevel(LIVE_VIEW_ID);
       return !!(hpRenderer && hpRenderer.hasSpatialIndex(dimLevel));
     },
 
     // Orbit anchor visibility control
-    setShowOrbitAnchor(show) { orbitAnchorRenderer.setShowAnchor(show); },
+    setShowOrbitAnchor(show) {
+      orbitAnchorRenderer.setShowAnchor(
+        assertExactBoolean(show, 'Orbit anchor visibility')
+      );
+    },
     getShowOrbitAnchor() { return orbitAnchorRenderer.getShowAnchor(); },
 
     // Smoke renderer API (delegates to SmokeRenderer)
@@ -4311,24 +5215,41 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     setNoiseTextureResolution(size) { smokeRenderer.setNoiseTextureResolution(size); },
     getNoiseTextureResolution() { return smokeRenderer.getNoiseTextureResolution(); },
     getAdaptiveScaleFactor() { return smokeRenderer.getAdaptiveScaleFactor(); },
-    setSmokeHalfResolution(enabled) { smokeRenderer.setHalfResolution(enabled); },
-    setSmokeQualityPreset(preset) { smokeRenderer.setQualityPreset(preset); },
+	    setSmokeQualityPreset(preset) { smokeRenderer.setQualityPreset(preset); },
 
-    setShowConnectivity(show) { showConnectivity = !!show; },
+    setShowConnectivity(show) {
+      showConnectivity = assertExactBoolean(show, 'Connectivity visibility');
+    },
     getShowConnectivity() { return showConnectivity; },
-    setConnectivityLineWidth(width) { connectivityLineWidth = Math.max(0.1, Math.min(10, width)); },
+    setConnectivityLineWidth(width) {
+      connectivityLineWidth = assertFiniteNumberInRange(
+        width,
+        0.1,
+        10,
+        'Connectivity line width'
+      );
+    },
     getConnectivityLineWidth() { return connectivityLineWidth; },
-    setConnectivityAlpha(alpha) { connectivityAlpha = Math.max(0.01, Math.min(1, alpha)); },
+    setConnectivityAlpha(alpha) {
+      connectivityAlpha = assertFiniteNumberInRange(
+        alpha,
+        0.01,
+        1,
+        'Connectivity opacity'
+      );
+    },
     getConnectivityAlpha() { return connectivityAlpha; },
     setConnectivityColor(r, g, b) {
-      const clampByte = (v) => Math.max(0, Math.min(255, Math.round(v)));
-      connectivityColorBytes[0] = clampByte(r);
-      connectivityColorBytes[1] = clampByte(g);
-      connectivityColorBytes[2] = clampByte(b);
+      const red = assertIntegerInRange(r, 0, 255, 'Connectivity red channel');
+      const green = assertIntegerInRange(g, 0, 255, 'Connectivity green channel');
+      const blue = assertIntegerInRange(b, 0, 255, 'Connectivity blue channel');
+      connectivityColorBytes[0] = red;
+      connectivityColorBytes[1] = green;
+      connectivityColorBytes[2] = blue;
     },
     // Returns byte values (0-255)
     getConnectivityColor() { return [connectivityColorBytes[0], connectivityColorBytes[1], connectivityColorBytes[2]]; },
-    hasConnectivityData() { return nEdgesV2 > 0; },
+    hasConnectivityData() { return hasEdgeDataV2; },
     getEdgeCount() { return nEdgesV2; },
 
     // ========================================================================
@@ -4337,29 +5258,74 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     /**
      * Set up V2 instanced edge rendering with edge data
-     * @param {Object} edgeData - Object with sources, destinations, nEdges, nCells
+     * @param {Object} edgeData - Exact weighted edge payload
      * @param {Float32Array} positions - Cell positions (flat xyz array)
      */
     setupEdgesV2(edgeData, positions) {
-      const { sources, destinations, nEdges, nCells } = edgeData;
+      const {
+        sources,
+        destinations,
+        weights,
+        nEdges,
+        nCells,
+      } = edgeData;
 
-      if (!sources || !destinations || nEdges === 0) {
-        console.warn('[Viewer] Invalid edge data for V2 setup');
-        return false;
+      if (
+        !(sources instanceof Uint32Array) ||
+        !(destinations instanceof Uint32Array) ||
+        !(weights instanceof Float64Array) ||
+        !Number.isSafeInteger(nEdges) ||
+        nEdges < 0 ||
+        !Number.isSafeInteger(nCells) ||
+        nCells <= 0 ||
+        sources.length !== nEdges ||
+        destinations.length !== nEdges ||
+        weights.length !== nEdges ||
+        !(positions instanceof Float32Array) ||
+        positions.length !== nCells * 3
+      ) {
+        throw new TypeError(
+          'V2 edge setup requires exact edge summaries, matching ' +
+          'Uint32 endpoints and Float64 weights, and one Float32 XYZ ' +
+          'position per cell.'
+        );
       }
 
-      // Create edge topology texture (shared across all views)
-      createEdgeTextureV2(sources, destinations, nEdges);
+      const renderWeights =
+        createConnectivityRenderWeights(weights).values;
+      clearEdgeResourcesV2();
+      try {
+        createEdgeTexturesV2(
+          sources,
+          destinations,
+          renderWeights,
+          nEdges
+        );
 
-      // Create per-view textures for live view (primary view)
-      const visibility = new Float32Array(nCells);
-      visibility.fill(1.0);
-      createPositionTextureV2ForView(LIVE_VIEW_ID, positions, nCells);
-      updateVisibilityTextureV2ForView(LIVE_VIEW_ID, visibility);
+        const visibility = new Float32Array(nCells);
+        visibility.fill(1.0);
+        if (
+          !createPositionTextureV2ForView(
+            LIVE_VIEW_ID,
+            positions,
+            nCells
+          ) ||
+          !updateVisibilityTextureV2ForView(
+            LIVE_VIEW_ID,
+            visibility
+          )
+        ) {
+          clearEdgeResourcesV2();
+          return false;
+        }
+      } catch (error) {
+        clearEdgeResourcesV2();
+        throw error;
+      }
 
+      hasEdgeDataV2 = true;
       useInstancedEdges = true;
-      edgeLodLimit = 0;  // No LOD limit by default
-
+      edgeLodLimit = 0;
       console.log(`[Viewer] V2 instanced edges enabled: ${nEdges} edges, ${nCells} cells`);
       return true;
     },
@@ -4367,17 +5333,20 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     /**
      * Update visibility texture for V2 edges (live view).
      * Also updates the per-view texture for the live view.
-     * @param {Float32Array|Uint8Array} visibility - Per-cell visibility (0-1)
+     * @param {Float32Array} visibility - Per-cell visibility (0-1)
      */
     updateEdgeVisibilityV2(visibility) {
-      if (!useInstancedEdges) {
+      if (
+        !hasEdgeDataV2 ||
+        !useInstancedEdges ||
+        !edgePositionTexturesV2.has(LIVE_VIEW_ID)
+      ) {
         return false;
       }
-      // Update per-view texture for live view
-      if (edgePositionTexturesV2.has(LIVE_VIEW_ID)) {
-        updateVisibilityTextureV2ForView(LIVE_VIEW_ID, visibility);
-      }
-      return true;
+      return updateVisibilityTextureV2ForView(
+        LIVE_VIEW_ID,
+        visibility
+      );
     },
 
     /**
@@ -4385,7 +5354,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
      * @param {number} limit - Maximum edges to render
      */
     setEdgeLodLimit(limit) {
-      edgeLodLimit = Math.max(0, Math.floor(limit));
+      edgeLodLimit = assertIntegerInRange(
+        limit,
+        0,
+        nEdgesV2,
+        'Connectivity edge LOD limit'
+      );
     },
 
     /**
@@ -4410,19 +5384,31 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     },
 
     /**
-     * Disable V2 instanced edges (fall back to legacy)
+     * Disable V2 instanced edges
      */
     disableEdgesV2() {
       useInstancedEdges = false;
+    },
+
+    clearEdgesV2() {
+      clearEdgeResourcesV2();
     },
 
     /**
      * Enable V2 instanced edges (if set up)
      */
     enableEdgesV2() {
-      if (nEdgesV2 > 0 && edgeTextureV2 && edgePositionTexturesV2.has(LIVE_VIEW_ID)) {
-        useInstancedEdges = true;
+      if (
+        !hasEdgeDataV2 ||
+        edgeTextureV2 === null ||
+        edgeWeightTextureV2 === null ||
+        !edgePositionTexturesV2.has(LIVE_VIEW_ID) ||
+        !edgeVisibilityTexturesV2.has(LIVE_VIEW_ID)
+      ) {
+        return false;
       }
+      useInstancedEdges = true;
+      return true;
     },
 
     // ========================================================================
@@ -4438,15 +5424,33 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
      * @param {number} nCells - Number of cells
      */
     setupEdgesV2ForView(viewId, positions, nCells) {
-      if (!useInstancedEdges || nEdgesV2 === 0) {
+      if (!hasEdgeDataV2 || !useInstancedEdges) {
         console.warn('[Viewer] Cannot setup per-view edges: V2 edges not initialized');
         return false;
       }
-      createPositionTextureV2ForView(viewId, positions, nCells);
-      // Initialize visibility to all visible
+      if (
+        typeof viewId !== 'string' ||
+        viewId.length === 0 ||
+        !Number.isSafeInteger(nCells) ||
+        nCells <= 0 ||
+        nCells !== nCellsV2 ||
+        !(positions instanceof Float32Array) ||
+        positions.length !== nCells * 3
+      ) {
+        throw new TypeError(
+          'Per-view edge setup requires a non-empty view id, an exact ' +
+          'cell count, and one Float32 XYZ position per cell.'
+        );
+      }
+      if (!createPositionTextureV2ForView(viewId, positions, nCells)) {
+        return false;
+      }
       const visibility = new Float32Array(nCells);
       visibility.fill(1.0);
-      updateVisibilityTextureV2ForView(viewId, visibility);
+      if (!updateVisibilityTextureV2ForView(viewId, visibility)) {
+        deleteEdgeTexturesForView(viewId);
+        return false;
+      }
       return true;
     },
 
@@ -4456,21 +5460,17 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
      * @param {Float32Array} visibility - Per-cell visibility (0-1)
      */
     updateEdgeVisibilityV2ForView(viewId, visibility) {
-      if (!useInstancedEdges) {
+      if (!hasEdgeDataV2 || !useInstancedEdges) {
         return false;
       }
-      const vid = String(viewId);
-      // If view doesn't have its own position texture, fall back to live view
+      if (typeof viewId !== 'string' || viewId.length === 0) {
+        return false;
+      }
+      const vid = viewId;
       if (!edgePositionTexturesV2.has(vid)) {
-        if (vid !== LIVE_VIEW_ID && edgePositionTexturesV2.has(LIVE_VIEW_ID)) {
-          // Update live view's visibility texture for views sharing with live
-          updateVisibilityTextureV2ForView(LIVE_VIEW_ID, visibility);
-          return true;
-        }
         return false;
       }
-      updateVisibilityTextureV2ForView(viewId, visibility);
-      return true;
+      return updateVisibilityTextureV2ForView(viewId, visibility);
     },
 
     /**
@@ -4485,9 +5485,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     /**
      * Delete edge textures for a specific view (cleanup on snapshot removal).
      * @param {string} viewId - View identifier
+     * @returns {boolean} Whether an exact view identifier was accepted
      */
     deleteEdgeTexturesForView(viewId) {
-      deleteEdgeTexturesForView(viewId);
+      return deleteEdgeTexturesForView(viewId);
     },
 
     /**
@@ -4507,12 +5508,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
      * @param {boolean} enabled - Whether to enable debug logging
      */
     setEdgeDebugMode(enabled) {
-      edgeDebugMode = !!enabled;
+      edgeDebugMode = assertExactBoolean(enabled, 'Edge debug mode');
       edgeDebugFrameCount = 0;  // Reset frame counter
       if (enabled) {
         console.log('[Viewer] Edge debug mode enabled. Debug output will be logged for next 5 frames.');
         console.log('[Viewer] Edge texture state:', {
           edgeTextureV2: !!edgeTextureV2,
+          edgeWeightTextureV2: !!edgeWeightTextureV2,
           nEdgesV2,
           nCellsV2,
           useInstancedEdges,
@@ -4531,10 +5533,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       vec3.set(freeflyVelocity, 0, 0, 0);
       freeflyYaw = Math.PI / 4;
       freeflyPitch = 0;
-      lookActive = false;
-      pointerLockEnabled = false;
+      const resetWasPointerLocked = document.pointerLockElement === canvas;
+      clearPointerLockIntent(null);
       projectileSystem.reset();
-      if (document.pointerLockElement === canvas && document.exitPointerLock) {
+      if (
+        resetWasPointerLocked &&
+        typeof document.exitPointerLock === 'function'
+      ) {
         document.exitPointerLock();
       }
     },
@@ -4544,7 +5549,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     },
 
     setCameraState(camState) {
-      if (!camState) return;
+      const exactState = assertCameraState(camState);
+      const exactMode = exactState.navigationMode;
+      const previousMode = navigationMode;
 
       // Stop any inertia so the camera holds the exact position we set
       velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
@@ -4553,34 +5560,30 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       // Set navigation mode directly without triggering sync functions —
       // the caller (interpolation engine / goto) already provides fully-synced
       // orbit + freefly data so no re-sync is needed.
-      if (camState.navigationMode) {
-        const next = camState.navigationMode === 'free' ? 'free' : (camState.navigationMode === 'planar' ? 'planar' : 'orbit');
-        navigationMode = next;
-        canvas.classList.remove('free-nav', 'planar-nav');
-        if (next === 'free') {
-          canvas.classList.add('free-nav');
-        } else if (next === 'planar') {
-          canvas.classList.add('planar-nav');
-        }
-      }
+      applyNavigationModeDirectly(exactMode);
 
       // Apply both representations unconditionally so all internal variables
       // stay in sync regardless of which mode is active.
-      if (camState.orbit) {
-        radius = camState.orbit.radius ?? radius;
-        targetRadius = camState.orbit.targetRadius ?? targetRadius;
-        theta = camState.orbit.theta ?? theta;
-        phi = camState.orbit.phi ?? phi;
-        if (camState.orbit.target) {
-          vec3.set(target, camState.orbit.target[0], camState.orbit.target[1], camState.orbit.target[2]);
-        }
-      }
-      if (camState.freefly) {
-        if (camState.freefly.position) {
-          vec3.set(freeflyPosition, camState.freefly.position[0], camState.freefly.position[1], camState.freefly.position[2]);
-        }
-        freeflyYaw = camState.freefly.yaw ?? freeflyYaw;
-        freeflyPitch = camState.freefly.pitch ?? freeflyPitch;
+      radius = exactState.orbit.radius;
+      targetRadius = exactState.orbit.targetRadius;
+      theta = exactState.orbit.theta;
+      phi = exactState.orbit.phi;
+      vec3.set(
+        target,
+        exactState.orbit.target[0],
+        exactState.orbit.target[1],
+        exactState.orbit.target[2]
+      );
+      vec3.set(
+        freeflyPosition,
+        exactState.freefly.position[0],
+        exactState.freefly.position[1],
+        exactState.freefly.position[2]
+      );
+      freeflyYaw = exactState.freefly.yaw;
+      freeflyPitch = exactState.freefly.pitch;
+      if (navigationMode !== previousMode) {
+        navigationModeChangeHandler?.(focusedViewId, navigationMode);
       }
     },
 
@@ -4591,8 +5594,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     // Camera lock API for independent view navigation
     setCamerasLocked(locked) {
+      if (typeof locked !== 'boolean') {
+        throw new TypeError('Camera lock state must be an exact boolean.');
+      }
       const wasLocked = camerasLocked;
-      camerasLocked = Boolean(locked);
+      camerasLocked = locked;
 
       if (wasLocked && !camerasLocked) {
         // Transitioning to unlocked: initialize all view cameras from current state
@@ -4624,6 +5630,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         // Transitioning to locked: adopt active view's camera as global
         const activeCam = getViewCameraState(focusedViewId);
         if (activeCam) {
+          navigationModeOwnership.promoteViewUserChoice(
+            focusedViewId,
+            activeCam.navigationMode
+          );
           applyCameraStateTemporarily(activeCam);
         }
         // Clear cached matrices (not needed in locked mode)
@@ -4634,149 +5644,329 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     getCamerasLocked() { return camerasLocked; },
     getFocusedViewId() { return focusedViewId; },
 
-    getViewCameraState(viewId) { return getViewCameraState(viewId); },
-    setViewCameraState(viewId, camState) { setViewCameraState(viewId, camState); },
+    getViewCameraState(viewId) {
+      return cloneCameraState(
+        getViewCameraState(viewId),
+        `Camera state for view "${String(viewId)}"`
+      );
+    },
+    setViewCameraState(viewId, camState) {
+      const exactViewId = assertKnownViewId(viewId);
+      const exactState = assertCameraState(camState, 'View camera state');
+      const exactMode = exactState.navigationMode;
+      navigationModeOwnership.recordViewUserChoice(exactViewId, exactMode);
+      setViewCameraState(exactViewId, exactState);
+    },
 
     // Per-view navigation mode (only relevant when cameras are unlocked)
     getViewNavigationMode(viewId) { return getViewNavigationMode(viewId); },
-    setViewNavigationMode(viewId, mode) { setViewNavigationMode(viewId, mode); },
+    setViewNavigationMode(viewId, mode) {
+      const exactViewId = assertKnownViewId(viewId);
+      const exactMode = assertNavigationMode(mode);
+      const previousMode = navigationMode;
+      navigationModeOwnership.recordViewUserChoice(exactViewId, exactMode);
+      applyViewNavigationMode(exactViewId, exactMode);
+      if (navigationMode !== previousMode) {
+        navigationModeChangeHandler?.(exactViewId, navigationMode);
+      }
+    },
 
-    setViewFocusHandler(fn) { viewFocusHandler = typeof fn === 'function' ? fn : null; },
-    setLiveViewLabel(label) { liveViewLabel = label || 'View 1'; },
+    setViewFocusHandler(fn) {
+      viewFocusHandler = assertExactFunction(fn, 'View focus handler');
+    },
+    setNavigationModeChangeHandler(fn) {
+      navigationModeChangeHandler = assertExactFunction(
+        fn,
+        'Navigation mode change handler'
+      );
+    },
+    setLiveViewLabel(label) {
+      liveViewLabel = assertNonEmptyTrimmedString(label, 'Live view label');
+    },
     getLiveViewLabel() { return liveViewLabel; },
 
     // Snapshot API - stores view configs for multiview
     createSnapshotView(config) {
-      if (snapshotViews.length >= MAX_SNAPSHOTS) return null;
-      const id = `snap_${nextSnapshotId++}`;
-      // Inherit camera from live view at snapshot time
-      const inheritedCamera = config.cameraState ||
-        (camerasLocked ? getCurrentCameraStateInternal() :
-          JSON.parse(JSON.stringify(liveCameraState || getCurrentCameraStateInternal())));
-
-      // Get initial dimension level from config or inherit from current live view
-      const initialDimLevel = config.dimensionLevel ?? getFallbackDimensionLevel();
-
-      // Track if this snapshot should share transparency with the live view
-      // If sharesLiveTransparency is true, filter changes on live view propagate to this snapshot
-      const sharesLiveTransparency = config.sharesLiveTransparency ?? false;
+      if (snapshotViews.length >= MAX_SNAPSHOTS) {
+        throw new RangeError(`Viewer supports a maximum of ${MAX_SNAPSHOTS} snapshots.`);
+      }
+      if (
+        config === null ||
+        typeof config !== 'object' ||
+        Array.isArray(config) ||
+        Object.getPrototypeOf(config) !== Object.prototype
+      ) {
+        throw new TypeError('Snapshot configuration must be one exact plain object.');
+      }
+      const sourceViewId = assertKnownViewId(config.sourceViewId);
+      const sourcePositions = getExactViewPositions(sourceViewId);
+      const exactConfig = assertSnapshotConfig(
+        config,
+        sourcePositions.length / 3
+      );
+      const inheritedMode = exactConfig.cameraState.navigationMode;
+      const initialDimLevel = exactConfig.dimensionLevel;
+      const id = `snap_${nextSnapshotId}`;
 
       const snapshot = {
         id,
-        label: config.label || `View ${snapshotViews.length + 2}`,
-        fieldKey: config.fieldKey,
-        fieldKind: config.fieldKind,
-        colors: config.colors ? new Uint8Array(config.colors) : null, // RGBA uint8
-        transparency: config.transparency ? new Float32Array(config.transparency) : null,
-        outlierQuantiles: config.outlierQuantiles ? new Float32Array(config.outlierQuantiles) : null,
-        centroidPositions: config.centroidPositions ? new Float32Array(config.centroidPositions) : null,
-        centroidColors: config.centroidColors ? new Uint8Array(config.centroidColors) : null, // RGBA uint8
-        centroidOutliers: config.centroidOutliers ? new Float32Array(config.centroidOutliers) : null,
-        outlierThreshold: config.outlierThreshold ?? 1.0,
-        meta: config.meta || {},
-        cameraState: inheritedCamera,  // Per-view camera state
-        dimensionLevel: initialDimLevel,  // Per-view dimension level for multi-dimensional support
-        sharesLiveTransparency  // If true, filter changes on live view propagate to this snapshot
+        label: exactConfig.label,
+        fieldKey: exactConfig.fieldKey,
+        fieldKind: exactConfig.fieldKind,
+        colors: exactConfig.colors,
+        transparency: exactConfig.transparency,
+        centroidPositions: exactConfig.centroidPositions,
+        centroidColors: exactConfig.centroidColors,
+        meta: exactConfig.meta,
+        cameraState: exactConfig.cameraState,
+        dimensionLevel: initialDimLevel
       };
-      snapshotViews.push(snapshot);
 
-      // Track dimension level for this view
-      viewDimensionLevels.set(id, initialDimLevel);
+      let snapshotBufferAttempted = false;
+      let centroidBufferAttempted = false;
+      let edgeTexturesAttempted = false;
+      try {
+        // Stage every fallible renderer resource before publishing inventory or
+        // consuming the next stable snapshot identity.
+        snapshotBufferAttempted = true;
+        hpRenderer.createSnapshotBuffer(
+          id,
+          snapshot.colors,
+          snapshot.transparency,
+          sourcePositions,
+          initialDimLevel
+        );
 
-      // Get dimension-specific positions for this snapshot
-      // Use the source view's positions (active view when "Keep View" was clicked)
-      const sourceViewId = config.sourceViewId || LIVE_VIEW_ID;
-      const sourcePositions = viewPositionsCache.get(String(sourceViewId)) || positionsArray;
-      // Cache positions for this snapshot view (used by highlight rendering)
-      viewPositionsCache.set(id, sourcePositions);
+        if (snapshot.centroidPositions !== null) {
+          centroidBufferAttempted = true;
+          createCentroidSnapshotBuffer(
+            id,
+            snapshot.centroidPositions,
+            snapshot.centroidColors,
+            initialDimLevel
+          );
+        }
 
-      // Create GPU buffer for this snapshot (uploaded once, not per-frame)
-      // Pass dimension-specific positions so the snapshot renders correctly
-      if (snapshot.colors && hpRenderer) {
-        hpRenderer.createSnapshotBuffer(id, snapshot.colors, snapshot.transparency, sourcePositions);
-      }
-
-      // Create centroid GPU buffer for this snapshot (uploaded once)
-      // Pass dimension level so buffer can be recreated if dimension changes
-      if (snapshot.centroidPositions && snapshot.centroidColors) {
-        const dimLevel = getEffectiveDimensionLevel(id);
-        createCentroidSnapshotBuffer(id, snapshot.centroidPositions, snapshot.centroidColors, dimLevel);
-      }
-
-      // Create per-view edge textures for this snapshot (if edges are enabled)
-      // This allows snapshots with different embeddings to show edges correctly
-      if (useInstancedEdges && nEdgesV2 > 0 && sourcePositions) {
-        const nCells = sourcePositions.length / 3;
-        createPositionTextureV2ForView(id, sourcePositions, nCells);
-        // Initialize visibility from snapshot's transparency data (filtered cells should not show edges)
-        // Uses same 0.01 threshold as getCombinedVisibility in main.js for consistency
-        const visibility = new Float32Array(nCells);
-        if (snapshot.transparency && snapshot.transparency.length >= nCells) {
+        if (useInstancedEdges && nEdgesV2 > 0) {
+          edgeTexturesAttempted = true;
+          const nCells = sourcePositions.length / 3;
+          if (!createPositionTextureV2ForView(id, sourcePositions, nCells)) {
+            throw new Error(`Snapshot edge positions were not published for view "${id}".`);
+          }
+          const visibility = new Float32Array(nCells);
           for (let i = 0; i < nCells; i++) {
             visibility[i] = snapshot.transparency[i] > 0.01 ? 1.0 : 0.0;
           }
-        } else {
-          // No transparency data - default to all visible
-          visibility.fill(1.0);
+          if (!updateVisibilityTextureV2ForView(id, visibility)) {
+            throw new Error(`Snapshot edge visibility was not published for view "${id}".`);
+          }
         }
-        updateVisibilityTextureV2ForView(id, visibility);
+
+        if (!camerasLocked) {
+          updateCachedViewMatrix(id, exactConfig.cameraState);
+        }
+      } catch (error) {
+        const rollbackFailures = [];
+        const rollback = operation => {
+          try {
+            operation();
+          } catch (rollbackError) {
+            rollbackFailures.push(rollbackError);
+          }
+        };
+        if (snapshotBufferAttempted) {
+          rollback(() => hpRenderer.deleteSnapshotBuffer(id));
+          rollback(() => hpRenderer.clearViewState(id));
+        }
+        if (centroidBufferAttempted) {
+          rollback(() => deleteCentroidSnapshotBuffer(id));
+        }
+        if (edgeTexturesAttempted) {
+          rollback(() => deleteEdgeTexturesForView(id));
+        }
+        cachedViewMatrices.delete(id);
+        if (rollbackFailures.length > 0) {
+          throw new AggregateError(
+            [error, ...rollbackFailures],
+            `Snapshot "${id}" creation failed and renderer rollback was incomplete.`
+          );
+        }
+        throw error;
       }
 
-      // Pre-compute cached view matrix for this snapshot (if cameras unlocked)
-      if (!camerasLocked) {
-        updateCachedViewMatrix(id, inheritedCamera);
-      }
-
+      snapshotViews.push(snapshot);
+      viewDimensionLevels.set(id, initialDimLevel);
+      viewPositionsCache.set(id, sourcePositions);
+      navigationModeOwnership.recordViewUserChoice(id, inheritedMode);
+      nextSnapshotId += 1;
       return { id, label: snapshot.label };
     },
 
     updateSnapshotAttributes(id, attrs) {
-      const snap = snapshotViews.find(s => s.id === id);
-      if (!snap) return false;
-      const colorsChanged = !!attrs.colors;
-      const transparencyChanged = !!attrs.transparency;
-      if (attrs.colors) snap.colors = new Uint8Array(attrs.colors); // RGBA uint8
-      if (attrs.transparency) snap.transparency = new Float32Array(attrs.transparency);
-      if (attrs.outlierQuantiles) snap.outlierQuantiles = new Float32Array(attrs.outlierQuantiles);
-      if (attrs.centroidPositions) snap.centroidPositions = new Float32Array(attrs.centroidPositions);
-      if (attrs.centroidColors) snap.centroidColors = new Uint8Array(attrs.centroidColors); // RGBA uint8
-      if (attrs.centroidOutliers) snap.centroidOutliers = new Float32Array(attrs.centroidOutliers);
-      if (typeof attrs.outlierThreshold === 'number') snap.outlierThreshold = attrs.outlierThreshold;
-      if (attrs.label) snap.label = attrs.label;
-      if (attrs.meta) snap.meta = { ...snap.meta, ...attrs.meta };
-
-      // Update snapshot's GPU buffer if colors or transparency changed
-      if ((colorsChanged || transparencyChanged) && snap.colors && hpRenderer) {
-        hpRenderer.updateSnapshotBuffer(id, snap.colors, snap.transparency);
+      const exactId = assertKnownViewId(id);
+      if (exactId === LIVE_VIEW_ID) {
+        throw new RangeError('Live-view attributes are not snapshot attributes.');
+      }
+      if (
+        attrs === null ||
+        typeof attrs !== 'object' ||
+        Array.isArray(attrs) ||
+        Object.getPrototypeOf(attrs) !== Object.prototype
+      ) {
+        throw new TypeError('Snapshot attributes must be one exact plain object.');
+      }
+      const allowedKeys = new Set([
+        'centroidColors',
+        'centroidPositions',
+        'colors',
+        'fieldKey',
+        'fieldKind',
+        'label',
+        'meta',
+        'transparency'
+      ]);
+      const keys = Object.keys(attrs);
+      if (
+        keys.length === 0 ||
+        keys.some((key) => !allowedKeys.has(key))
+      ) {
+        throw new TypeError(
+          'Snapshot attributes must contain only current published snapshot fields.'
+        );
+      }
+      const snap = snapshotViews.find((entry) => entry.id === exactId);
+      const pointCountForSnapshot = getExactViewPositions(exactId).length / 3;
+      const colorsChanged = Object.hasOwn(attrs, 'colors');
+      const transparencyChanged = Object.hasOwn(attrs, 'transparency');
+      const centroidPositionsChanged = Object.hasOwn(
+        attrs,
+        'centroidPositions'
+      );
+      const centroidColorsChanged = Object.hasOwn(attrs, 'centroidColors');
+      if (
+        (colorsChanged || transparencyChanged) &&
+        (centroidPositionsChanged || centroidColorsChanged)
+      ) {
+        throw new TypeError(
+          'Snapshot point buffers and centroid buffers must be published in separate exact updates.'
+        );
+      }
+      if (centroidPositionsChanged !== centroidColorsChanged) {
+        throw new TypeError(
+          'Snapshot centroid positions and colors must be updated together.'
+        );
+      }
+      const fieldKeyChanged = Object.hasOwn(attrs, 'fieldKey');
+      const fieldKindChanged = Object.hasOwn(attrs, 'fieldKind');
+      if (fieldKeyChanged !== fieldKindChanged) {
+        throw new TypeError(
+          'Snapshot fieldKey and fieldKind must be updated together.'
+        );
       }
 
-      // Re-upload centroid GPU buffer if changed
-      // Pass dimension level so buffer can be recreated if dimension changes
-      if ((attrs.centroidPositions || attrs.centroidColors) && snap.centroidPositions && snap.centroidColors) {
-        const dimLevel = getEffectiveDimensionLevel(id);
-        createCentroidSnapshotBuffer(id, snap.centroidPositions, snap.centroidColors, dimLevel);
+      const nextColors = colorsChanged
+        ? new Uint8Array(assertExactUint8Array(
+            attrs.colors,
+            pointCountForSnapshot * 4,
+            'Snapshot colors'
+          ))
+        : snap.colors;
+      const nextTransparency = transparencyChanged
+        ? new Float32Array(assertTransparencyArray(
+            attrs.transparency,
+            pointCountForSnapshot,
+            'Snapshot transparency'
+          ))
+        : snap.transparency;
+      let nextCentroidPositions = snap.centroidPositions;
+      let nextCentroidColors = snap.centroidColors;
+      if (centroidPositionsChanged) {
+        if (
+          !(attrs.centroidPositions instanceof Float32Array) ||
+          attrs.centroidPositions.length % 3 !== 0
+        ) {
+          throw new TypeError(
+            'Snapshot centroid positions must contain complete Float32 XYZ triples.'
+          );
+        }
+        const nextCentroidCount = attrs.centroidPositions.length / 3;
+        nextCentroidPositions = new Float32Array(assertFiniteFloat32Array(
+          attrs.centroidPositions,
+          nextCentroidCount * 3,
+          'Snapshot centroid positions'
+        ));
+        nextCentroidColors = new Uint8Array(assertExactUint8Array(
+          attrs.centroidColors,
+          nextCentroidCount * 4,
+          'Snapshot centroid colors'
+        ));
+      }
+      if (fieldKeyChanged) {
+        assertSnapshotFieldDescriptor(attrs.fieldKey, attrs.fieldKind);
+      }
+      const nextLabel = Object.hasOwn(attrs, 'label')
+        ? assertNonEmptyTrimmedString(attrs.label, 'Snapshot label')
+        : snap.label;
+      const nextMeta = Object.hasOwn(attrs, 'meta')
+        ? cloneSnapshotMeta(attrs.meta)
+        : snap.meta;
+
+      if (colorsChanged || transparencyChanged) {
+        hpRenderer.updateSnapshotBuffer(
+          exactId,
+          nextColors,
+          nextTransparency,
+          getExactViewPositions(exactId),
+          getPublishedDimensionLevel(exactId)
+        );
       }
 
-      // If this is the focused view in single mode, update HP renderer's main buffer too
-      if (viewLayoutMode === 'single' && focusedViewId === id) {
-        if (snap.colors) hpRenderer.updateColors(snap.colors);
-        if (snap.transparency) hpRenderer.updateAlphas(snap.transparency);
+      if (centroidPositionsChanged) {
+        createCentroidSnapshotBuffer(
+          exactId,
+          nextCentroidPositions,
+          nextCentroidColors,
+          getPublishedDimensionLevel(exactId)
+        );
       }
 
-      if (transparencyChanged && vectorFieldOverlay?.enabled) {
-        vectorFieldOverlay.markVisibilityDirty(id);
+      snap.colors = nextColors;
+      snap.transparency = nextTransparency;
+      snap.centroidPositions = nextCentroidPositions;
+      snap.centroidColors = nextCentroidColors;
+      snap.label = nextLabel;
+      snap.meta = nextMeta;
+      if (fieldKeyChanged) {
+        snap.fieldKey = attrs.fieldKey;
+        snap.fieldKind = attrs.fieldKind;
+      }
+      if (centroidPositionsChanged) {
+        snap.centroidCount = nextCentroidPositions.length / 3;
+      }
+
+      if (
+        transparencyChanged &&
+        vectorFieldOverlay !== null &&
+        vectorFieldOverlay.enabled
+      ) {
+        vectorFieldOverlay.markVisibilityDirty(exactId);
+      }
+      if (transparencyChanged) {
+        highlightTools.handleTransparencyChange(exactId);
       }
       return true;
     },
 
     removeSnapshotView(id) {
-      const idx = snapshotViews.findIndex(s => s.id === id);
+      const exactId = assertViewId(id);
+      const idx = snapshotViews.findIndex(s => s.id === exactId);
       if (idx >= 0) {
         // Delete GPU buffer for this snapshot
         if (hpRenderer) {
-          hpRenderer.deleteSnapshotBuffer(id);
-          hpRenderer.clearViewState(id);  // Clear per-view LOD/frustum culling state
+          hpRenderer.deleteSnapshotBuffer(exactId);
+          hpRenderer.clearViewState(exactId);  // Clear per-view LOD/frustum culling state
         }
+        highlightTools.clearViewState(exactId);
         // Delete centroid GPU buffer for this snapshot
         deleteCentroidSnapshotBuffer(id);
         // Delete per-view edge textures for this snapshot
@@ -4791,7 +5981,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 	        // Clean up per-view dimension state
 	        viewDimensionLevels.delete(id);
 	        viewPositionsCache.delete(id);
+	        publishedLodLevels.delete(id);
 	        vectorFieldOverlay?.disposeView?.(id);
+	        navigationModeOwnership.deleteView(String(id));
         snapshotViews.splice(idx, 1);
         const key = String(id);
         if (key !== LIVE_VIEW_ID) {
@@ -4831,14 +6023,17 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         }
       }
 	      // Clean up cached view matrices and dimension state for snapshots (preserve live view)
-	      for (const snap of snapshotViews) {
-	        cachedViewMatrices.delete(snap.id);
+      for (const snap of snapshotViews) {
+        highlightTools.clearViewState(snap.id);
+        cachedViewMatrices.delete(snap.id);
 	        renderParamsByView.delete(snap.id);
 	        overlayCtxByView.delete(snap.id);
 	        overlayCtxOptionsByView.delete(snap.id);
 	        viewDimensionLevels.delete(snap.id);
 	        viewPositionsCache.delete(snap.id);
+	        publishedLodLevels.delete(snap.id);
 	        vectorFieldOverlay?.disposeView?.(snap.id);
+	        navigationModeOwnership.deleteView(String(snap.id));
 	      }
       snapshotViews.length = 0;
       focusedViewId = LIVE_VIEW_ID;
@@ -4865,44 +6060,42 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         label: s.label,
         fieldKey: s.fieldKey,
         fieldKind: s.fieldKind,
-        meta: s.meta
+        meta: cloneSnapshotMeta(s.meta)
       }));
     },
 
     hasSnapshots() { return snapshotViews.length > 0; },
 
     setViewLayout(mode, activeId) {
-      viewLayoutMode = mode === 'single' ? 'single' : 'grid';
-      if (activeId && activeId !== focusedViewId) {
+      if (mode !== 'single' && mode !== 'grid') {
+        throw new TypeError('View layout mode must be exactly "single" or "grid".');
+      }
+      const exactActiveId = assertKnownViewId(activeId);
+      const changesFocus = exactActiveId !== focusedViewId;
+      const nextCamera = changesFocus && !camerasLocked
+        ? assertCameraState(
+            getViewCameraState(exactActiveId),
+            `Camera state for layout view "${exactActiveId}"`
+          )
+        : null;
+
+      viewLayoutMode = mode;
+      if (changesFocus) {
         // Save current camera to previous view before switching (if unlocked)
         if (!camerasLocked) {
           setViewCameraState(focusedViewId, getCurrentCameraStateInternal());
         }
-        focusedViewId = activeId;
+        focusedViewId = exactActiveId;
         // Update active state on title chips
         updateViewTitleActiveState();
         // Load new view's camera (if unlocked)
         if (!camerasLocked) {
-          const newCam = getViewCameraState(focusedViewId);
-          if (newCam) applyCameraStateTemporarily(newCam);
-        }
-        // In single mode, load the focused view's data into HP renderer
-        if (viewLayoutMode === 'single') {
-          if (activeId === LIVE_VIEW_ID) {
-            if (colorsArray) hpRenderer.updateColors(colorsArray);
-            if (transparencyArray) hpRenderer.updateAlphas(transparencyArray);
-          } else {
-            const snap = snapshotViews.find(s => s.id === activeId);
-            if (snap) {
-              if (snap.colors) hpRenderer.updateColors(snap.colors);
-              if (snap.transparency) hpRenderer.updateAlphas(snap.transparency);
-            }
-          }
+          applyCameraStateTemporarily(nextCamera);
         }
       }
       if (viewLayoutMode === 'single') {
         for (const key of viewCentroidLabels.keys()) {
-          if (String(key) !== String(focusedViewId || LIVE_VIEW_ID)) {
+          if (key !== focusedViewId) {
             hideLabelsForView(key);
           }
         }
@@ -4913,7 +6106,23 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     getViewLayout() { return { mode: viewLayoutMode, activeId: focusedViewId, liveViewHidden }; },
 
     setLiveViewHidden(hidden) {
-      liveViewHidden = Boolean(hidden);
+      const exactHidden = assertExactBoolean(hidden, 'Live view visibility');
+      if (exactHidden) {
+        if (snapshotViews.length === 0) {
+          throw new Error(
+            'The live view cannot be hidden without a published snapshot.'
+          );
+        }
+        if (
+          focusedViewId === LIVE_VIEW_ID ||
+          !snapshotViews.some((snapshot) => snapshot.id === focusedViewId)
+        ) {
+          throw new Error(
+            'The live view can be hidden only while a published snapshot has focus.'
+          );
+        }
+      }
+      liveViewHidden = exactHidden;
     },
 
     getLiveViewHidden() {
@@ -4929,7 +6138,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     // ---------------------------------------------------------------------
 
     setVectorFieldOverlayEnabled(enabled) {
-      const on = Boolean(enabled);
+      const on = assertExactBoolean(enabled, 'Vector field overlay visibility');
       if (!on && !vectorFieldOverlay) return;
       const overlay = ensureVectorFieldOverlay();
       overlay.enabled = on;
@@ -4942,23 +6151,60 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     },
 
     setVectorFieldConfig(key, value) {
-      if (!key) return;
+      const particleCapacity = vectorFieldOverlay === null
+        ? DEFAULT_VELOCITY_PARTICLE_CAPACITY
+        : vectorFieldOverlay.config.particleCapacity;
+      const validated = validateVelocityOverlayConfig(
+        key,
+        value,
+        particleCapacity
+      );
       const overlay = vectorFieldOverlay || ensureVectorFieldOverlay();
-      overlay.setConfig?.(key, value);
+      overlay.setConfig(validated.key, validated.value);
     },
 
     setActiveVectorField(fieldId) {
+      const exactFieldId = validateActiveVelocityFieldId(fieldId);
+      if (exactFieldId === null && vectorFieldOverlay === null) return;
       const overlay = vectorFieldOverlay || ensureVectorFieldOverlay();
-      overlay.setActiveField?.(fieldId);
+      overlay.setActiveField(exactFieldId);
     },
 
     setVectorFieldData(fieldId, dimensionLevel, fieldData) {
-      const overlay = vectorFieldOverlay || ensureVectorFieldOverlay();
-      overlay.setVectorFieldData?.(fieldId, dimensionLevel, fieldData);
+      if (vectorFieldOverlay !== null) {
+        vectorFieldOverlay.setVectorFieldData(
+          fieldId,
+          dimensionLevel,
+          fieldData
+        );
+        return;
+      }
+      const candidate = new VelocityOverlay(gl);
+      try {
+        candidate.setVectorFieldData(fieldId, dimensionLevel, fieldData);
+        ensureOverlayManager().register(candidate);
+      } catch (error) {
+        try {
+          candidate.dispose();
+        } catch (cleanupError) {
+          throw new AggregateError(
+            [error, cleanupError],
+            'Velocity field publication and cleanup both failed.'
+          );
+        }
+        throw error;
+      }
+      vectorFieldOverlay = candidate;
     },
 
     hasVectorFieldForDimension(fieldId, dimensionLevel) {
-      return vectorFieldOverlay?.hasFieldForDimension?.(fieldId, dimensionLevel) ?? false;
+      const exactFieldId = validateVelocityFieldId(fieldId);
+      getDefaultNavigationMode(dimensionLevel);
+      if (vectorFieldOverlay === null) return false;
+      return vectorFieldOverlay.hasFieldForDimension(
+        exactFieldId,
+        dimensionLevel
+      );
     },
 
     resetVectorFieldOverlay() {
@@ -5014,14 +6260,46 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
      * Used by figure export to reproduce the exact projection for split views.
      *
      * @param {string} viewId
-     * @param {{ viewportWidth?: number; viewportHeight?: number }} [options]
+     * @param {{ viewportWidth: number; viewportHeight: number } | null} viewport
      */
-    getViewRenderState(viewId, options = {}) {
+    getViewRenderState(viewId, viewport) {
       const [canvasW, canvasH] = canvasResizeObserver.getSize();
-      const viewportWidth = Math.max(1, Math.round(options.viewportWidth ?? canvasW));
-      const viewportHeight = Math.max(1, Math.round(options.viewportHeight ?? canvasH));
+      let viewportWidth;
+      let viewportHeight;
+      if (viewport === null) {
+        viewportWidth = canvasW;
+        viewportHeight = canvasH;
+      } else {
+        if (
+          viewport === null ||
+          typeof viewport !== 'object' ||
+          Array.isArray(viewport) ||
+          Object.getPrototypeOf(viewport) !== Object.prototype ||
+          Object.keys(viewport).sort().join(',') !== 'viewportHeight,viewportWidth'
+        ) {
+          throw new TypeError(
+            'Per-view render-state viewport must be null or an exact viewportHeight/viewportWidth object.'
+          );
+        }
+        viewportWidth = viewport.viewportWidth;
+        viewportHeight = viewport.viewportHeight;
+      }
+      if (
+        !Number.isSafeInteger(viewportWidth) ||
+        viewportWidth <= 0 ||
+        !Number.isSafeInteger(viewportHeight) ||
+        viewportHeight <= 0
+      ) {
+        throw new TypeError(
+          'Per-view render-state viewport dimensions must be positive safe integers.'
+        );
+      }
 
-      const camState = getViewCameraState(String(viewId || LIVE_VIEW_ID));
+      const exactViewId = assertViewId(viewId);
+      const camState = assertCameraState(
+        getViewCameraState(exactViewId),
+        `Render camera state for view "${exactViewId}"`
+      );
       const viewMtx = mat4.create();
       computeViewMatrixFromState(camState, viewMtx);
 
@@ -5034,16 +6312,20 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
       // Derive camera position by inverting the view matrix.
       const invView = mat4.create();
-      mat4.invert(invView, viewMtx);
+      if (mat4.invert(invView, viewMtx) === null) {
+        throw new Error(
+          `Render camera matrix for view "${exactViewId}" is not invertible.`
+        );
+      }
 
-      const navMode = camState?.navigationMode || 'orbit';
-      const cameraDistance = navMode === 'free' && camState?.freefly?.position
+      const navMode = camState.navigationMode;
+      const cameraDistance = navMode === 'free'
         ? Math.sqrt(
           camState.freefly.position[0] ** 2 +
           camState.freefly.position[1] ** 2 +
           camState.freefly.position[2] ** 2
         )
-        : (camState?.orbit?.radius ?? radius);
+        : camState.orbit.radius;
 
       return {
         mvpMatrix: new Float32Array(mvpMtx),
@@ -5070,27 +6352,73 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     // HP renderer controls
     setShaderQuality(quality) {
-      currentShaderQuality = quality || 'full';
-      highlightTools?.setQuality?.(currentShaderQuality);
-      hpRenderer.setQuality(currentShaderQuality);
+      hpRenderer.setQuality(quality);
+      highlightTools.setQuality(quality);
+      currentShaderQuality = quality;
     },
-    setFrustumCulling(enabled) { hpRenderer.setFrustumCulling(enabled); },
-    setAdaptiveLOD(enabled) { hpRenderer.setAdaptiveLOD(enabled); },
-    setForceLOD(level) { hpRenderer.setForceLOD(level); },
-    getRendererStats() { return hpRenderer.getStats(); },
+    setFrustumCulling(enabled) {
+      hpRenderer.setFrustumCulling(
+        assertExactBoolean(enabled, 'Frustum culling')
+      );
+    },
+    setAdaptiveLOD(enabled) {
+      hpRenderer.setAdaptiveLOD(
+        assertExactBoolean(enabled, 'Adaptive LOD')
+      );
+    },
+    setForceLOD(level) {
+      hpRenderer.setForceLOD(
+        assertIntegerInRange(level, -1, 17, 'Forced LOD level')
+      );
+    },
+    hasRendererStats(viewId) {
+      return hpRenderer.hasStats(assertKnownViewId(viewId));
+    },
+    getRendererStats(viewId) {
+      return hpRenderer.getStats(assertKnownViewId(viewId));
+    },
     debugRendererStatus() { return hpRenderer.debugStatus(); },
 
     // LOD visibility for edge filtering and highlight rendering
     // These now support per-view LOD tracking in multiview mode
     getLodVisibilityArray(viewId, dimensionLevel) {
-      return hpRenderer.getLodVisibilityArray(undefined, viewId, dimensionLevel);
+      return hpRenderer.getLodVisibilityArray(
+        assertKnownViewId(viewId),
+        dimensionLevel
+      );
     },
     getCurrentLODLevel(viewId) {
-      return hpRenderer.getCurrentLODLevel(viewId);
+      return hpRenderer.getCurrentLODLevel(assertKnownViewId(viewId));
+    },
+    onLodChanged(listener) {
+      const exactListener = assertExactFunction(
+        listener,
+        'LOD change listener'
+      );
+      lodChangeListeners.add(exactListener);
+      for (const viewId of [
+        LIVE_VIEW_ID,
+        ...snapshotViews.map((snapshot) => snapshot.id)
+      ]) {
+        publishedLodLevels.set(
+          viewId,
+          hpRenderer.getCurrentLODLevel(viewId)
+        );
+      }
+      let subscribed = true;
+      return () => {
+        if (!subscribed) return;
+        subscribed = false;
+        lodChangeListeners.delete(exactListener);
+      };
     },
     // Combined LOD + alpha visibility (preferred for consumers that need filter-aware visibility)
-    getCombinedVisibilityForView(viewId, alphaThreshold) {
-      return hpRenderer.getCombinedVisibilityForView(viewId, alphaThreshold);
+    getCombinedVisibilityForView(viewId, alphaThreshold, dimensionLevel) {
+      return hpRenderer.getCombinedVisibilityForView(
+        assertKnownViewId(viewId),
+        alphaThreshold,
+        dimensionLevel
+      );
     },
 
     start() {
@@ -5140,6 +6468,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 	    dispose() {
 	      if (disposed) return;
 	      disposed = true;
+      cancelPendingProjectileBuild(
+        'Projectile preparation was cancelled because the viewer was disposed.'
+      );
+      projectileSystem.setEnabled(false);
 
 	      // Stop animation loop
 	      if (animationHandle) {
@@ -5230,6 +6562,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 	      // Clean up edge texture
       if (edgeTextureV2) gl.deleteTexture(edgeTextureV2);
       edgeTextureV2 = null;
+      if (edgeWeightTextureV2) gl.deleteTexture(edgeWeightTextureV2);
+      edgeWeightTextureV2 = null;
 
       // Clear caches
       cachedViewMatrices.clear();

@@ -21,18 +21,19 @@
  * Hover Context display component
  *
  * @example
- * const hover = new HoverContext({ container: document.body });
+ * const hover = new HoverContext({ container: document.body, offset: 10 });
  *
  * plotElement.on('plotly_hover', (data) => {
  *   hover.show({
  *     gene: data.points[0].y,
  *     group: data.points[0].x,
  *     value: data.points[0].z,
- *     position: { x: data.event.clientX, y: data.event.clientY }
+ *     position: { x: data.event.clientX, y: data.event.clientY },
+ *     markerInfo: null
  *   });
  * });
  *
- * plotElement.on('plotly_unhover', () => hover.hide());
+ * plotElement.on('plotly_unhover', () => hover.hide(100));
  */
 export class HoverContext {
   /**
@@ -40,21 +41,55 @@ export class HoverContext {
    *
    * @param {Object} options
    * @param {HTMLElement} options.container - Container element
-   * @param {Object} [options.markers] - Marker discovery results for stats lookup
-   * @param {number} [options.offset=10] - Offset from cursor
+   * @param {number} options.offset - Offset from cursor
    */
   constructor(options) {
-    const { container, markers = null, offset = 10 } = options;
-
-    if (!container) {
-      throw new Error('[HoverContext] container is required');
+    if (
+      options === null ||
+      typeof options !== 'object' ||
+      Array.isArray(options) ||
+      Object.keys(options).sort().join(',') !== 'container,offset'
+    ) {
+      throw new TypeError(
+        '[HoverContext] options must contain exactly container and offset'
+      );
+    }
+    const { container, offset } = options;
+    if (
+      container === null ||
+      typeof container !== 'object' ||
+      container.nodeType !== 1 ||
+      container.ownerDocument === null ||
+      typeof container.ownerDocument !== 'object' ||
+      typeof container.appendChild !== 'function'
+    ) {
+      throw new TypeError('[HoverContext] container must be an HTMLElement');
+    }
+    if (!Number.isFinite(offset) || offset < 0) {
+      throw new RangeError(
+        '[HoverContext] offset must be a finite non-negative number'
+      );
+    }
+    const view = container.ownerDocument.defaultView;
+    if (
+      view === null ||
+      typeof view !== 'object' ||
+      typeof view.setTimeout !== 'function' ||
+      typeof view.clearTimeout !== 'function'
+    ) {
+      throw new TypeError(
+        '[HoverContext] container document must own an active window'
+      );
     }
 
     /** @type {HTMLElement} */
     this._container = container;
 
-    /** @type {Object|null} */
-    this._markers = markers;
+    /** @type {Document} */
+    this._document = container.ownerDocument;
+
+    /** @type {Window} */
+    this._view = view;
 
     /** @type {number} */
     this._offset = offset;
@@ -68,6 +103,9 @@ export class HoverContext {
     /** @type {boolean} */
     this._visible = false;
 
+    /** @type {boolean} */
+    this._destroyed = false;
+
     this._createTooltipElement();
   }
 
@@ -79,20 +117,28 @@ export class HoverContext {
    * @param {string} data.group - Group name
    * @param {number} data.value - Expression value
    * @param {{ x: number, y: number }} data.position - Cursor position
-   * @param {Object} [data.markerInfo] - Additional marker statistics
+   * @param {{
+   *   pValue: number,
+   *   adjustedPValue: number|null,
+   *   log2FoldChange: number,
+   *   percentInGroup: number|null,
+   *   rank: number
+   * }|null} data.markerInfo - Normalized marker statistics or explicit absence
    */
   show(data) {
-    const { gene, group, value, position, markerInfo = null } = data;
+    this._requireAlive();
+    this._validateShowData(data);
+    const { gene, group, value, position, markerInfo } = data;
 
     // Cancel any pending hide
-    if (this._hideTimeout) {
-      clearTimeout(this._hideTimeout);
+    if (this._hideTimeout !== null) {
+      this._view.clearTimeout(this._hideTimeout);
       this._hideTimeout = null;
     }
 
     // Build content
     const content = this._buildContent(gene, group, value, markerInfo);
-    this._element.innerHTML = content;
+    this._element.replaceChildren(content);
 
     // Position the tooltip
     this._positionTooltip(position);
@@ -105,14 +151,20 @@ export class HoverContext {
   /**
    * Hide the hover context
    *
-   * @param {number} [delay=100] - Delay before hiding (ms)
+   * @param {number} delay - Delay before hiding (ms)
    */
-  hide(delay = 100) {
-    if (this._hideTimeout) {
-      clearTimeout(this._hideTimeout);
+  hide(delay) {
+    this._requireAlive();
+    if (!Number.isSafeInteger(delay) || delay < 0) {
+      throw new RangeError(
+        '[HoverContext] hide delay must be a non-negative integer'
+      );
+    }
+    if (this._hideTimeout !== null) {
+      this._view.clearTimeout(this._hideTimeout);
     }
 
-    this._hideTimeout = setTimeout(() => {
+    this._hideTimeout = this._view.setTimeout(() => {
       this._element.classList.remove('visible');
       this._visible = false;
       this._hideTimeout = null;
@@ -120,25 +172,20 @@ export class HoverContext {
   }
 
   /**
-   * Update marker data for stats lookup
-   *
-   * @param {Object} markers - Marker discovery results
-   */
-  setMarkers(markers) {
-    this._markers = markers;
-  }
-
-  /**
    * Destroy the component
    */
   destroy() {
-    if (this._hideTimeout) {
-      clearTimeout(this._hideTimeout);
+    if (this._destroyed) return;
+    this._destroyed = true;
+    if (this._hideTimeout !== null) {
+      this._view.clearTimeout(this._hideTimeout);
+      this._hideTimeout = null;
     }
-    if (this._element && this._element.parentNode) {
+    if (this._element.parentNode !== null) {
       this._element.parentNode.removeChild(this._element);
     }
     this._element = null;
+    this._visible = false;
   }
 
   // ===========================================================================
@@ -150,164 +197,95 @@ export class HoverContext {
    * @private
    */
   _createTooltipElement() {
-    this._element = document.createElement('div');
+    this._element = this._document.createElement('div');
     this._element.className = 'hover-context-tooltip';
-    this._element.style.cssText = `
-      position: fixed;
-      z-index: 10000;
-      background: var(--color-bg-elevated, #fff);
-      border: 1px solid var(--color-border, #ddd);
-      border-radius: 6px;
-      padding: 8px 12px;
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
-      font-family: var(--font-sans, system-ui, sans-serif);
-      font-size: 12px;
-      line-height: 1.4;
-      max-width: 280px;
-      pointer-events: none;
-      opacity: 0;
-      transform: translateY(4px);
-      transition: opacity 0.15s ease, transform 0.15s ease;
-    `;
-
-    // Add visible state styles once (avoids leaking <style> tags across reruns).
-    const styleId = 'cellucid-hover-context-tooltip-styles';
-    if (!document.getElementById(styleId)) {
-      const style = document.createElement('style');
-      style.id = styleId;
-      style.textContent = `
-        .hover-context-tooltip.visible {
-          opacity: 1;
-          transform: translateY(0);
-        }
-        .hover-context-tooltip .gene-name {
-          font-weight: 600;
-          font-size: 13px;
-          color: var(--color-text, #333);
-          margin-bottom: 4px;
-        }
-        .hover-context-tooltip .group-name {
-          color: var(--color-text-muted, #666);
-          margin-bottom: 6px;
-        }
-        .hover-context-tooltip .stat-row {
-          display: flex;
-          justify-content: space-between;
-          margin-top: 2px;
-        }
-        .hover-context-tooltip .stat-label {
-          color: var(--color-text-muted, #666);
-        }
-        .hover-context-tooltip .stat-value {
-          font-weight: 500;
-          color: var(--color-text, #333);
-        }
-        .hover-context-tooltip .stat-value.positive {
-          color: var(--color-success, #22c55e);
-        }
-        .hover-context-tooltip .stat-value.negative {
-          color: var(--color-error, #ef4444);
-        }
-        .hover-context-tooltip .divider {
-          border-top: 1px solid var(--color-border, #eee);
-          margin: 6px 0;
-        }
-      `;
-      document.head.appendChild(style);
-    }
     this._container.appendChild(this._element);
   }
 
   /**
-   * Build tooltip content HTML
+   * Build tooltip content
    * @private
    */
   _buildContent(gene, group, value, markerInfo) {
-    let html = `
-      <div class="gene-name">${this._escapeHtml(gene)}</div>
-      <div class="group-name">${this._escapeHtml(group)}</div>
-    `;
-
-    // Value row
+    const fragment = this._document.createDocumentFragment();
+    fragment.appendChild(this._createTextElement('gene-name', gene));
+    fragment.appendChild(this._createTextElement('group-name', group));
     const valueClass = value > 0 ? 'positive' : value < 0 ? 'negative' : '';
-    html += `
-      <div class="stat-row">
-        <span class="stat-label">Value:</span>
-        <span class="stat-value ${valueClass}">${this._formatNumber(value)}</span>
-      </div>
-    `;
+    fragment.appendChild(
+      this._createStatRow('Value:', this._formatNumber(value), valueClass)
+    );
 
-    // Add marker stats if available
-    if (markerInfo) {
-      html += '<div class="divider"></div>';
-
-      if (markerInfo.pValue !== undefined) {
-        html += `
-          <div class="stat-row">
-            <span class="stat-label">p-value:</span>
-            <span class="stat-value">${this._formatPValue(markerInfo.pValue)}</span>
-          </div>
-        `;
+    if (markerInfo !== null) {
+      fragment.appendChild(this._createTextElement('divider', ''));
+      fragment.appendChild(
+        this._createStatRow('p-value:', this._formatPValue(markerInfo.pValue))
+      );
+      if (markerInfo.adjustedPValue !== null) {
+        fragment.appendChild(
+          this._createStatRow(
+            'Adj. p-value:',
+            this._formatPValue(markerInfo.adjustedPValue)
+          )
+        );
       }
-
-      if (markerInfo.adjustedPValue !== undefined && markerInfo.adjustedPValue !== null) {
-        html += `
-          <div class="stat-row">
-            <span class="stat-label">Adj. p-value:</span>
-            <span class="stat-value">${this._formatPValue(markerInfo.adjustedPValue)}</span>
-          </div>
-        `;
+      const foldChangeClass =
+        markerInfo.log2FoldChange > 0
+          ? 'positive'
+          : markerInfo.log2FoldChange < 0
+            ? 'negative'
+            : '';
+      fragment.appendChild(
+        this._createStatRow(
+          'Log2 FC:',
+          this._formatNumber(markerInfo.log2FoldChange),
+          foldChangeClass
+        )
+      );
+      if (markerInfo.percentInGroup !== null) {
+        fragment.appendChild(
+          this._createStatRow(
+            '% in group:',
+            this._formatPercent(markerInfo.percentInGroup)
+          )
+        );
       }
-
-      if (markerInfo.log2FoldChange !== undefined) {
-        const fcClass = markerInfo.log2FoldChange > 0 ? 'positive' : 'negative';
-        html += `
-          <div class="stat-row">
-            <span class="stat-label">Log2 FC:</span>
-            <span class="stat-value ${fcClass}">${this._formatNumber(markerInfo.log2FoldChange)}</span>
-          </div>
-        `;
-      }
-
-      if (markerInfo.percentInGroup !== undefined) {
-        html += `
-          <div class="stat-row">
-            <span class="stat-label">% in group:</span>
-            <span class="stat-value">${this._formatPercent(markerInfo.percentInGroup)}</span>
-          </div>
-        `;
-      }
-
-      if (markerInfo.rank !== undefined) {
-        html += `
-          <div class="stat-row">
-            <span class="stat-label">Rank:</span>
-            <span class="stat-value">#${markerInfo.rank}</span>
-          </div>
-        `;
-      }
-    } else if (this._markers) {
-      // Try to find marker info from stored markers
-      const info = this._findMarkerInfo(gene, group);
-      if (info) {
-        return this._buildContent(gene, group, value, info);
-      }
+      fragment.appendChild(
+        this._createStatRow('Rank:', `#${markerInfo.rank}`)
+      );
     }
 
-    return html;
+    return fragment;
   }
 
   /**
-   * Find marker info for a gene in a group
+   * Create a text-only element.
    * @private
    */
-  _findMarkerInfo(gene, group) {
-    if (!this._markers || !this._markers.groups) return null;
+  _createTextElement(className, text) {
+    const element = this._document.createElement('div');
+    element.className = className;
+    element.textContent = text;
+    return element;
+  }
 
-    const groupData = this._markers.groups[group];
-    if (!groupData || !groupData.markers) return null;
-
-    return groupData.markers.find(m => m.gene === gene);
+  /**
+   * Create one statistics row.
+   * @private
+   */
+  _createStatRow(label, value, valueClass = '') {
+    const row = this._document.createElement('div');
+    row.className = 'stat-row';
+    const labelElement = this._document.createElement('span');
+    labelElement.className = 'stat-label';
+    labelElement.textContent = label;
+    const valueElement = this._document.createElement('span');
+    valueElement.className =
+      valueClass.length === 0
+        ? 'stat-value'
+        : `stat-value ${valueClass}`;
+    valueElement.textContent = value;
+    row.append(labelElement, valueElement);
+    return row;
   }
 
   /**
@@ -317,8 +295,18 @@ export class HoverContext {
   _positionTooltip(position) {
     const { x, y } = position;
     const rect = this._element.getBoundingClientRect();
-    const viewportWidth = window.innerWidth;
-    const viewportHeight = window.innerHeight;
+    const viewportWidth = this._view.innerWidth;
+    const viewportHeight = this._view.innerHeight;
+    if (
+      !Number.isFinite(viewportWidth) ||
+      viewportWidth <= 0 ||
+      !Number.isFinite(viewportHeight) ||
+      viewportHeight <= 0
+    ) {
+      throw new RangeError(
+        '[HoverContext] window dimensions must be finite and positive'
+      );
+    }
 
     let left = x + this._offset;
     let top = y + this._offset;
@@ -346,7 +334,6 @@ export class HoverContext {
    * @private
    */
   _formatNumber(value) {
-    if (!Number.isFinite(value)) return 'N/A';
     if (Math.abs(value) < 0.01) return value.toExponential(2);
     return value.toFixed(2);
   }
@@ -356,7 +343,6 @@ export class HoverContext {
    * @private
    */
   _formatPValue(value) {
-    if (!Number.isFinite(value)) return 'N/A';
     if (value < 0.0001) return value.toExponential(2);
     if (value < 0.001) return value.toFixed(4);
     return value.toFixed(3);
@@ -367,18 +353,96 @@ export class HoverContext {
    * @private
    */
   _formatPercent(value) {
-    if (!Number.isFinite(value)) return 'N/A';
     return `${value.toFixed(1)}%`;
   }
 
   /**
-   * Escape HTML to prevent XSS
+   * Reject use after destroy.
    * @private
    */
-  _escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
+  _requireAlive() {
+    if (this._destroyed) {
+      throw new Error('[HoverContext] component is destroyed');
+    }
+  }
+
+  /**
+   * Validate the normalized tooltip input.
+   * @private
+   */
+  _validateShowData(data) {
+    if (
+      data === null ||
+      typeof data !== 'object' ||
+      Array.isArray(data) ||
+      Object.keys(data).sort().join(',') !==
+        'gene,group,markerInfo,position,value'
+    ) {
+      throw new TypeError(
+        '[HoverContext] show data must contain exactly gene, group, markerInfo, position, and value'
+      );
+    }
+    if (typeof data.gene !== 'string' || data.gene.length === 0) {
+      throw new TypeError('[HoverContext] gene must be a non-empty string');
+    }
+    if (typeof data.group !== 'string' || data.group.length === 0) {
+      throw new TypeError('[HoverContext] group must be a non-empty string');
+    }
+    if (!Number.isFinite(data.value)) {
+      throw new TypeError('[HoverContext] value must be finite');
+    }
+    if (
+      data.position === null ||
+      typeof data.position !== 'object' ||
+      Array.isArray(data.position) ||
+      Object.keys(data.position).sort().join(',') !== 'x,y' ||
+      !Number.isFinite(data.position.x) ||
+      !Number.isFinite(data.position.y)
+    ) {
+      throw new TypeError(
+        '[HoverContext] position must contain exactly finite x and y coordinates'
+      );
+    }
+    if (data.markerInfo === null) return;
+    const info = data.markerInfo;
+    if (
+      typeof info !== 'object' ||
+      Array.isArray(info) ||
+      Object.keys(info).sort().join(',') !==
+        'adjustedPValue,log2FoldChange,pValue,percentInGroup,rank'
+    ) {
+      throw new TypeError(
+        '[HoverContext] markerInfo must be null or the exact normalized marker schema'
+      );
+    }
+    if (
+      !Number.isFinite(info.pValue) ||
+      info.pValue < 0 ||
+      info.pValue > 1 ||
+      (
+        info.adjustedPValue !== null &&
+        (
+          !Number.isFinite(info.adjustedPValue) ||
+          info.adjustedPValue < 0 ||
+          info.adjustedPValue > 1
+        )
+      ) ||
+      !Number.isFinite(info.log2FoldChange) ||
+      (
+        info.percentInGroup !== null &&
+        (
+          !Number.isFinite(info.percentInGroup) ||
+          info.percentInGroup < 0 ||
+          info.percentInGroup > 100
+        )
+      ) ||
+      !Number.isSafeInteger(info.rank) ||
+      info.rank < 1
+    ) {
+      throw new RangeError(
+        '[HoverContext] markerInfo statistics are outside their exact domains'
+      );
+    }
   }
 }
 

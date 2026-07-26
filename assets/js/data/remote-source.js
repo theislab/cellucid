@@ -1,752 +1,1110 @@
 /**
- * RemoteDataSource - Data source for remote server connections
+ * Exact remote Cellucid server data source.
  *
- * Connects to a cellucid data server running on a remote machine
- * (or localhost via SSH tunnel). Supports both HTTP/HTTPS for data loading
- * and WebSocket/WSS for live updates.
- *
- * Protocol handling:
- * - remote://host:port  - Uses HTTP/WS (auto-upgrades to HTTPS/WSS if page is HTTPS)
- * - remotes://host:port - Explicitly uses HTTPS/WSS (secure)
- * - When the web app is served over HTTPS, all connections automatically use
- *   secure protocols to avoid mixed-content blocking.
- *
- * Usage modes:
- * 1. Direct connection: Server running on accessible host:port
- * 2. SSH tunnel: Server on remote machine, accessed via port forwarding
- * 3. Jupyter: Server running alongside Jupyter notebook
- *
- * Connection flow:
- * 1. User enters server URL (e.g., http://localhost:8765)
- * 2. RemoteDataSource.connect() validates connection
- * 3. On success, source is activated and datasets are listed
- * 4. Data is loaded via HTTP/HTTPS from server
+ * A connection is adopted only after the health response, server information,
+ * dataset catalog, and any advertised WebSocket have all satisfied the current
+ * contract. Remote failures are terminal; this source never retries,
+ * reconnects, fabricates dataset metadata, or rewrites caller-supplied URLs.
  */
 
 import {
-  DATA_CONFIG,
   DataSourceError,
   DataSourceErrorCode,
-  loadDatasetMetadata,
-  validateDatasetStructure,
-  validateSchemaVersion
+  loadDatasetMetadata
 } from './data-source.js';
-import { expandObsManifest, expandVarManifest } from './data-loaders.js';
 
 /**
  * @typedef {import('./data-source.js').DatasetMetadata} DatasetMetadata
  */
 
-/**
- * @typedef {Object} RemoteServerInfo
- * @property {string} version - Server version
- * @property {string} host - Server host
- * @property {number} port - Server port
- * @property {string} mode - Server mode ('standalone', 'async', 'jupyter')
- */
+const DEFAULT_CONNECTION_TIMEOUT_MS = 5000;
+const MAX_CONNECTION_TIMEOUT_MS = 120000;
+const REMOTE_MESSAGE_KEYS = Object.freeze(['type', 'payload']);
 
-/**
- * @typedef {Object} ConnectionConfig
- * @property {string} url - Server base URL (e.g., 'http://localhost:8765')
- * @property {number} [timeout=5000] - Connection timeout in ms
- * @property {boolean} [autoReconnect=true] - Attempt auto-reconnect on connection loss
- */
+function isPlainRecord(value) {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    (Object.getPrototypeOf(value) === Object.prototype ||
+      Object.getPrototypeOf(value) === null)
+  );
+}
 
-/**
- * Determine if secure protocols (HTTPS/WSS) should be used.
- * Returns true if the current page is served over HTTPS.
- * This prevents mixed-content blocking in browsers.
- * @returns {boolean}
- */
-function shouldUseSecureProtocol() {
-  // In browser context, check the current page's protocol
-  if (typeof window !== 'undefined' && window.location) {
-    return window.location.protocol === 'https:';
+function requireExactKeys(value, requiredKeys, optionalKeys, label) {
+  if (!isPlainRecord(value)) {
+    throw new TypeError(`${label} must be a JSON object`);
   }
-  // Default to insecure for non-browser contexts (e.g., Node.js testing)
-  return false;
+  const allowedKeys = new Set([...requiredKeys, ...optionalKeys]);
+  const actualKeys = Object.keys(value);
+  const missing = requiredKeys.filter(key => !Object.hasOwn(value, key));
+  const unsupported = actualKeys.filter(key => !allowedKeys.has(key));
+  if (missing.length > 0 || unsupported.length > 0) {
+    const details = [];
+    if (missing.length > 0) details.push(`missing ${missing.join(', ')}`);
+    if (unsupported.length > 0) {
+      details.push(`unsupported ${unsupported.join(', ')}`);
+    }
+    throw new TypeError(
+      `${label} has noncanonical fields (${details.join('; ')})`
+    );
+  }
+  return value;
+}
+
+function requireExactText(value, label, { allowWhitespace = false } = {}) {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value !== value.trim() ||
+    /[\u0000-\u001f\u007f]/.test(value) ||
+    (!allowWhitespace && /\s/.test(value))
+  ) {
+    throw new TypeError(`${label} must be exact non-empty text`);
+  }
+  return value;
+}
+
+function requireNonNegativeSafeInteger(value, label) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${label} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
+function requirePort(value, label) {
+  if (!Number.isInteger(value) || value < 1 || value > 65535) {
+    throw new TypeError(`${label} must be an integer from 1 through 65535`);
+  }
+  return value;
+}
+
+function requireCanonicalPathSegments(pathname, label) {
+  const segments = pathname.split('/').slice(1);
+  if (segments.at(-1) === '') segments.pop();
+  for (const segment of segments) {
+    let decoded;
+    try {
+      decoded = decodeURIComponent(segment);
+    } catch {
+      throw new TypeError(`${label} contains invalid percent encoding`);
+    }
+    if (
+      segment.length === 0 ||
+      decoded === '.' ||
+      decoded === '..' ||
+      decoded.includes('/') ||
+      decoded.includes('\\') ||
+      /[\u0000-\u001f\u007f]/.test(decoded) ||
+      encodeURIComponent(decoded) !== segment
+    ) {
+      throw new TypeError(`${label} contains a noncanonical path segment`);
+    }
+  }
+}
+
+function requireConnectionConfig(config) {
+  requireExactKeys(
+    config,
+    ['url'],
+    ['timeout'],
+    'Remote connection configuration'
+  );
+  const url = requireRemoteServerUrl(config.url);
+  const timeout = Object.hasOwn(config, 'timeout')
+    ? config.timeout
+    : DEFAULT_CONNECTION_TIMEOUT_MS;
+  if (
+    !Number.isInteger(timeout) ||
+    timeout < 1 ||
+    timeout > MAX_CONNECTION_TIMEOUT_MS
+  ) {
+    throw new TypeError(
+      `Remote connection timeout must be an integer from 1 through ${MAX_CONNECTION_TIMEOUT_MS}`
+    );
+  }
+  return Object.freeze({ url, timeout });
+}
+
+function requireRemoteServerUrl(value) {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value !== value.trim() ||
+    /[\u0000-\u0020\u007f]/.test(value) ||
+    value.endsWith('/')
+  ) {
+    throw new TypeError(
+      'Remote server URL must be one exact HTTP(S) base URL without whitespace or a trailing slash'
+    );
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new TypeError('Remote server URL must be an absolute HTTP(S) URL');
+  }
+  if (
+    (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') ||
+    parsed.username ||
+    parsed.password ||
+    parsed.search ||
+    parsed.hash
+  ) {
+    throw new TypeError(
+      'Remote server URL must use HTTP(S) without credentials, query, or fragment'
+    );
+  }
+
+  const canonical = `${parsed.origin}${parsed.pathname === '/' ? '' : parsed.pathname}`;
+  if (canonical !== value) {
+    throw new TypeError('Remote server URL must use one canonical spelling');
+  }
+  requireCanonicalPathSegments(parsed.pathname, 'Remote server URL');
+
+  if (
+    typeof globalThis.window?.location?.protocol === 'string' &&
+    globalThis.window.location.protocol === 'https:' &&
+    parsed.protocol !== 'https:'
+  ) {
+    throw new TypeError(
+      'An HTTPS Cellucid page requires an explicit HTTPS remote server URL'
+    );
+  }
+  return value;
+}
+
+function requireExactJsonValue(value, label, ancestors = new Set()) {
+  if (
+    value === null ||
+    typeof value === 'string' ||
+    typeof value === 'boolean'
+  ) {
+    return;
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      throw new TypeError(`${label} numbers must be finite`);
+    }
+    return;
+  }
+  if (typeof value !== 'object') {
+    throw new TypeError(`${label} must contain only exact JSON values`);
+  }
+  if (ancestors.has(value)) {
+    throw new TypeError(`${label} must not contain cycles`);
+  }
+
+  ancestors.add(value);
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index++) {
+      if (!Object.hasOwn(value, index)) {
+        throw new TypeError(`${label} arrays must not contain holes`);
+      }
+      requireExactJsonValue(value[index], `${label}[${index}]`, ancestors);
+    }
+  } else {
+    if (!isPlainRecord(value)) {
+      throw new TypeError(`${label} objects must be plain JSON objects`);
+    }
+    for (const [key, entry] of Object.entries(value)) {
+      requireExactText(key, `${label} key`, { allowWhitespace: true });
+      requireExactJsonValue(entry, `${label}.${key}`, ancestors);
+    }
+  }
+  ancestors.delete(value);
+}
+
+function requireRemoteMessage(value) {
+  requireExactKeys(value, REMOTE_MESSAGE_KEYS, [], 'Remote WebSocket message');
+  requireExactText(value.type, 'Remote WebSocket message type');
+  requireExactJsonValue(value.payload, 'Remote WebSocket message payload');
+  return value;
+}
+
+function requireRemoteHealthPayload(payload) {
+  if (!isPlainRecord(payload)) {
+    throw new TypeError('Remote health response must be a JSON object');
+  }
+
+  if (payload.type === 'exported') {
+    requireExactKeys(
+      payload,
+      ['status', 'type', 'version'],
+      [],
+      'Remote exported health response'
+    );
+  } else if (payload.type === 'anndata') {
+    requireExactKeys(
+      payload,
+      [
+        'status',
+        'type',
+        'version',
+        'format',
+        'is_backed',
+        'n_cells',
+        'n_genes'
+      ],
+      [],
+      'Remote AnnData health response'
+    );
+    if (!['h5ad', 'zarr', 'in-memory'].includes(payload.format)) {
+      throw new TypeError(
+        'Remote AnnData health format must be exactly h5ad, zarr, or in-memory'
+      );
+    }
+    if (typeof payload.is_backed !== 'boolean') {
+      throw new TypeError(
+        'Remote AnnData health is_backed must be a boolean'
+      );
+    }
+    requireNonNegativeSafeInteger(
+      payload.n_cells,
+      'Remote AnnData health n_cells'
+    );
+    requireNonNegativeSafeInteger(
+      payload.n_genes,
+      'Remote AnnData health n_genes'
+    );
+  } else {
+    throw new TypeError(
+      'Remote health response type must be exactly exported or anndata'
+    );
+  }
+
+  if (payload.status !== 'ok') {
+    throw new TypeError('Remote health response status must be exactly ok');
+  }
+  requireExactText(payload.version, 'Remote health version');
+  return Object.freeze({ ...payload });
+}
+
+function requireRemoteServerInfo(payload, health) {
+  if (!isPlainRecord(payload)) {
+    throw new TypeError('Remote server info must be a JSON object');
+  }
+  const websocketKeys = Object.hasOwn(payload, 'ws_port') ? ['ws_port'] : [];
+  if (health.type === 'exported') {
+    requireExactKeys(
+      payload,
+      ['version', 'host', 'port', 'mode'],
+      websocketKeys,
+      'Remote exported server info'
+    );
+    if (payload.mode !== 'standalone') {
+      throw new TypeError(
+        'Remote exported server mode must be exactly standalone'
+      );
+    }
+  } else {
+    requireExactKeys(
+      payload,
+      [
+        'version',
+        'type',
+        'format',
+        'host',
+        'port',
+        'n_cells',
+        'n_genes',
+        'is_backed'
+      ],
+      websocketKeys,
+      'Remote AnnData server info'
+    );
+    if (payload.type !== 'anndata') {
+      throw new TypeError(
+        'Remote AnnData server info type must be exactly anndata'
+      );
+    }
+    if (
+      payload.format !== health.format ||
+      payload.is_backed !== health.is_backed ||
+      payload.n_cells !== health.n_cells ||
+      payload.n_genes !== health.n_genes
+    ) {
+      throw new TypeError(
+        'Remote AnnData health and server info must describe the same dataset'
+      );
+    }
+  }
+
+  requireExactText(payload.version, 'Remote server version');
+  if (payload.version !== health.version) {
+    throw new TypeError(
+      'Remote health and server info versions must match exactly'
+    );
+  }
+  requireExactText(payload.host, 'Remote server host');
+  requirePort(payload.port, 'Remote server port');
+  if (Object.hasOwn(payload, 'ws_port')) {
+    requirePort(payload.ws_port, 'Remote WebSocket port');
+  }
+  if (health.type === 'anndata') {
+    requireNonNegativeSafeInteger(
+      payload.n_cells,
+      'Remote AnnData server n_cells'
+    );
+    requireNonNegativeSafeInteger(
+      payload.n_genes,
+      'Remote AnnData server n_genes'
+    );
+    if (typeof payload.is_backed !== 'boolean') {
+      throw new TypeError(
+        'Remote AnnData server is_backed must be a boolean'
+      );
+    }
+  }
+  return Object.freeze({ ...payload });
+}
+
+function requireDatasetCatalogPath(value, label) {
+  if (
+    typeof value !== 'string' ||
+    !/^\/(?:[A-Za-z0-9][A-Za-z0-9._-]{0,179}\/)?$/.test(value)
+  ) {
+    throw new TypeError(
+      `${label} must be "/" or one exact portable dataset directory path`
+    );
+  }
+  const component = value === '/' ? null : value.slice(1, -1);
+  if (
+    component !== null &&
+    (component.endsWith('.') ||
+      /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i.test(component))
+  ) {
+    throw new TypeError(`${label} contains a non-portable dataset directory`);
+  }
+  return value;
+}
+
+function requireDatasetCatalogPayload(payload) {
+  requireExactKeys(payload, ['datasets'], [], 'Remote dataset listing');
+  if (!Array.isArray(payload.datasets)) {
+    throw new TypeError('Remote dataset listing datasets must be an array');
+  }
+  if (payload.datasets.length === 0) {
+    throw new TypeError(
+      'Remote dataset listing must declare at least one dataset'
+    );
+  }
+
+  const ids = new Set();
+  const paths = new Set();
+  return Object.freeze(payload.datasets.map((entry, index) => {
+    const label = `Remote dataset listing datasets[${index}]`;
+    requireExactKeys(entry, ['id', 'path', 'name'], [], label);
+    const id = requireExactText(
+      entry.id,
+      `${label}.id`,
+      { allowWhitespace: true }
+    );
+    const path = requireDatasetCatalogPath(entry.path, `${label}.path`);
+    const name = requireExactText(
+      entry.name,
+      `${label}.name`,
+      { allowWhitespace: true }
+    );
+    if (ids.has(id)) {
+      throw new TypeError(`Remote dataset listing contains duplicate id ${id}`);
+    }
+    if (paths.has(path)) {
+      throw new TypeError(
+        `Remote dataset listing contains duplicate path ${path}`
+      );
+    }
+    ids.add(id);
+    paths.add(path);
+    return Object.freeze({ id, path, name });
+  }));
+}
+
+async function requestJson(url, signal, label) {
+  let response;
+  try {
+    response = await fetch(url, {
+      signal,
+      cache: 'no-store',
+      redirect: 'error'
+    });
+  } catch (error) {
+    if (signal.aborted) throw error;
+    throw new DataSourceError(
+      `${label} request failed: ${error instanceof Error ? error.message : String(error)}`,
+      DataSourceErrorCode.NETWORK_ERROR,
+      'remote',
+      { url }
+    );
+  }
+  if (!(response instanceof Response)) {
+    throw new DataSourceError(
+      `${label} fetch must return a Response`,
+      DataSourceErrorCode.VALIDATION_ERROR,
+      'remote',
+      { url }
+    );
+  }
+  if (response.status !== 200) {
+    throw new DataSourceError(
+      `${label} request failed with HTTP ${response.status}`,
+      DataSourceErrorCode.NETWORK_ERROR,
+      'remote',
+      { url, status: response.status }
+    );
+  }
+  if (response.headers.get('Content-Type') !== 'application/json') {
+    throw new DataSourceError(
+      `${label} response Content-Type must be exactly application/json`,
+      DataSourceErrorCode.INVALID_FORMAT,
+      'remote',
+      { url, contentType: response.headers.get('Content-Type') }
+    );
+  }
+  try {
+    return await response.json();
+  } catch (error) {
+    throw new DataSourceError(
+      `${label} response must contain valid JSON`,
+      DataSourceErrorCode.INVALID_FORMAT,
+      'remote',
+      {
+        url,
+        cause: error instanceof Error ? error.message : String(error)
+      }
+    );
+  }
+}
+
+function createWebSocketUrl(serverUrl, wsPort) {
+  const parsed = new URL(serverUrl);
+  const protocol = parsed.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${parsed.hostname}:${wsPort}/`;
+}
+
+function closeSocket(socket) {
+  if (!socket) return;
+  socket.onopen = null;
+  socket.onmessage = null;
+  socket.onerror = null;
+  socket.onclose = null;
+  const closing = globalThis.WebSocket?.CLOSING ?? 2;
+  const closed = globalThis.WebSocket?.CLOSED ?? 3;
+  if (socket.readyState !== closing && socket.readyState !== closed) {
+    socket.close(1000, 'Cellucid remote connection closed');
+  }
+}
+
+function deliverCallbacks(callbacks, args) {
+  const pending = [];
+  for (const callback of callbacks) {
+    const result = callback(...args);
+    if (result instanceof Promise) pending.push(result);
+  }
+  return pending.length === 0 ? undefined : Promise.all(pending);
 }
 
 /**
- * Check if a URL uses the remote:// protocol
- * @param {string} url - URL to check
+ * Check whether a value declares the exact remote custom protocol prefix.
+ *
+ * @param {unknown} value
  * @returns {boolean}
  */
-export function isRemoteUrl(url) {
-  return url?.startsWith('remote://') || url?.startsWith('remotes://');
+export function isRemoteUrl(value) {
+  return (
+    typeof value === 'string' &&
+    (value.startsWith('remote://') || value.startsWith('remotes://'))
+  );
 }
 
 /**
- * Check if a URL explicitly requests secure connection (remotes://)
- * @param {string} url - URL to check
+ * Check whether a value declares the exact secure remote protocol prefix.
+ *
+ * @param {unknown} value
  * @returns {boolean}
  */
-export function isSecureRemoteUrl(url) {
-  return url?.startsWith('remotes://');
+export function isSecureRemoteUrl(value) {
+  return typeof value === 'string' && value.startsWith('remotes://');
 }
 
 /**
- * Parse a remote:// or remotes:// URL into its components.
- * - remote:// uses HTTP/WS (but upgrades to HTTPS/WSS if page is HTTPS)
- * - remotes:// explicitly requests HTTPS/WSS
- * @param {string} url - URL to parse
+ * Parse one canonical remote custom URL.
+ *
+ * @param {unknown} value
  * @returns {{serverUrl: string, path: string, secure: boolean}|null}
  */
-export function parseRemoteUrl(url) {
-  if (!isRemoteUrl(url)) return null;
-
-  // Match both remote:// and remotes://
-  const match = url.match(/^remotes?:\/\/([^/]+)(\/.*)?$/);
+export function parseRemoteUrl(value) {
+  if (!isRemoteUrl(value) || value !== value.trim()) return null;
+  const match = /^(remote|remotes):\/\/([^/?#]+)(\/[^?#]*)$/.exec(value);
   if (!match) return null;
 
-  const hostPort = match[1];
-  const path = (match[2] || '/').substring(1); // Remove leading /
-
-  // Use secure protocol if:
-  // 1. URL explicitly uses remotes:// OR
-  // 2. Current page is served over HTTPS (to avoid mixed-content blocking)
-  const secure = isSecureRemoteUrl(url) || shouldUseSecureProtocol();
-  const protocol = secure ? 'https' : 'http';
-
-  return {
-    serverUrl: `${protocol}://${hostPort}`,
-    path,
+  const secure = match[1] === 'remotes';
+  const protocol = secure ? 'https:' : 'http:';
+  const candidate = `${protocol}//${match[2]}${match[3]}`;
+  let parsed;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    return null;
+  }
+  if (
+    parsed.username ||
+    parsed.password ||
+    parsed.search ||
+    parsed.hash ||
+    `${protocol}//${parsed.host}${parsed.pathname}` !== candidate
+  ) {
+    return null;
+  }
+  try {
+    requireCanonicalPathSegments(parsed.pathname, 'Remote URL');
+  } catch {
+    return null;
+  }
+  return Object.freeze({
+    serverUrl: `${protocol}//${parsed.host}`,
+    path: parsed.pathname.slice(1),
     secure
-  };
+  });
 }
 
 /**
- * Data source for remote server connections
+ * Data source for one explicit remote Cellucid server.
  */
 export class RemoteDataSource {
   constructor() {
-    /** @type {string|null} Server base URL */
+    /** @type {string|null} */
     this._serverUrl = null;
-
-    /** @type {RemoteServerInfo|null} */
+    /** @type {Object|null} */
     this._serverInfo = null;
-
-    /** @type {boolean} */
     this._connected = false;
-
-    /** @type {Map<string, string>} Dataset ID -> base path (from /_cellucid/datasets) */
+    /** @type {Map<string, string>} */
     this._datasetPaths = new Map();
-
     /** @type {Map<string, DatasetMetadata>} */
     this._datasetCache = new Map();
-
-    /** @type {string|null} */
-    this._activeDatasetId = null;
-
     /** @type {WebSocket|null} */
     this._ws = null;
-
-    /** @type {Set<Function>} */
     this._connectionLostCallbacks = new Set();
-
-    /** @type {Set<Function>} */
     this._messageCallbacks = new Set();
-
-    /** @type {boolean} */
-    this._autoReconnect = true;
-
-    /** @type {number} */
-    this._reconnectAttempts = 0;
-
-    /** @type {number} */
-    this._maxReconnectAttempts = 5;
-
-    /** @type {boolean} Flag to prevent concurrent reconnection attempts */
-    this._reconnecting = false;
-
+    this._connecting = false;
+    this._operationId = 0;
+    /** @type {AbortController|null} */
+    this._pendingController = null;
     this.type = 'remote';
   }
 
-  /**
-   * Get the type identifier for this data source
-   * @returns {string}
-   */
   getType() {
     return this.type;
   }
 
-  /**
-   * Check if this data source is available (connected)
-   * @returns {Promise<boolean>}
-   */
   async isAvailable() {
     return this._connected;
   }
 
-  /**
-   * Connect to a remote server
-   * @param {ConnectionConfig} config - Connection configuration
-   * @returns {Promise<RemoteServerInfo>}
-   */
-  async connect(config) {
-    const { url, timeout = 5000, autoReconnect = true } = config;
+  async _requestDatasetCatalog(serverUrl, signal) {
+    const payload = await requestJson(
+      `${serverUrl}/_cellucid/datasets`,
+      signal,
+      'Remote dataset listing'
+    );
+    return requireDatasetCatalogPayload(payload);
+  }
 
-    // Normalize URL
-    let serverUrl = url.trim();
-    if (!serverUrl.startsWith('http://') && !serverUrl.startsWith('https://')) {
-      // If no protocol specified, use https:// when page is served over HTTPS
-      // to avoid mixed-content blocking
-      const protocol = shouldUseSecureProtocol() ? 'https://' : 'http://';
-      serverUrl = protocol + serverUrl;
-    }
-    // Remove trailing slash
-    serverUrl = serverUrl.replace(/\/+$/, '');
-
-    this._serverUrl = serverUrl;
-    this._autoReconnect = autoReconnect;
-
-    console.log(`[RemoteDataSource] Connecting to ${serverUrl}...`);
-
-    // Test connection with health check
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), timeout);
-
-      const response = await fetch(`${serverUrl}/_cellucid/health`, {
-        signal: controller.signal
-      });
-      clearTimeout(timeoutId);
-
-      if (!response.ok) {
-        throw new DataSourceError(
-          `Server returned ${response.status}: ${response.statusText}`,
-          DataSourceErrorCode.NETWORK_ERROR,
-          this.type,
-          { url: serverUrl, status: response.status }
-        );
-      }
-
-      const health = await response.json();
-      if (health.status !== 'ok') {
-        throw new DataSourceError(
-          'Server health check failed',
-          DataSourceErrorCode.VALIDATION_ERROR,
-          this.type,
-          { health }
-        );
-      }
-
-      // Get server info
-      const infoResponse = await fetch(`${serverUrl}/_cellucid/info`);
-      if (!infoResponse.ok) {
-        throw new DataSourceError(
-          `Server info request failed: ${infoResponse.status} ${infoResponse.statusText}`,
-          DataSourceErrorCode.NETWORK_ERROR,
-          this.type,
-          { url: serverUrl, status: infoResponse.status }
-        );
-      }
-      this._serverInfo = await infoResponse.json();
-
-      this._connected = true;
-      this._reconnectAttempts = 0;
-
-      console.log(`[RemoteDataSource] Connected to ${serverUrl}`, this._serverInfo);
-
-      // Cache dataset paths to correctly handle single-dataset root mode.
-      await this._refreshDatasetPaths();
-
-      // Try to connect WebSocket for live updates (optional)
-      this._connectWebSocket();
-
-      return this._serverInfo;
-    } catch (err) {
-      if (err.name === 'AbortError') {
-        throw new DataSourceError(
-          `Connection timeout after ${timeout}ms`,
-          DataSourceErrorCode.NETWORK_ERROR,
-          this.type,
-          { url: serverUrl, timeout }
-        );
-      }
-
-      if (err instanceof DataSourceError) {
-        throw err;
-      }
-
+  async _openAdvertisedWebSocket(serverUrl, serverInfo, signal) {
+    if (!Object.hasOwn(serverInfo, 'ws_port')) return null;
+    if (typeof globalThis.WebSocket !== 'function') {
       throw new DataSourceError(
-        `Failed to connect: ${err.message}`,
-        DataSourceErrorCode.NETWORK_ERROR,
-        this.type,
-        { url: serverUrl, originalError: err.message }
+        'Remote server advertises WebSocket updates, but this runtime has no WebSocket implementation',
+        DataSourceErrorCode.UNSUPPORTED,
+        this.type
       );
     }
-  }
 
-  /**
-   * Connect WebSocket for live updates
-   * @private
-   */
-  _connectWebSocket() {
-    if (!this._serverInfo?.ws_port) {
-      console.log('[RemoteDataSource] Server does not support WebSocket');
-      return;
-    }
-
-    // Use wss:// if the server URL is https:// (to avoid mixed-content blocking)
-    const serverUrlObj = new URL(this._serverUrl);
-    const wsProtocol = serverUrlObj.protocol === 'https:' ? 'wss' : 'ws';
-    const wsUrl = `${wsProtocol}://${serverUrlObj.hostname}:${this._serverInfo.ws_port}`;
-
+    const wsUrl = createWebSocketUrl(serverUrl, serverInfo.ws_port);
+    let socket;
     try {
-      this._ws = new WebSocket(wsUrl);
-
-      this._ws.onopen = () => {
-        console.log('[RemoteDataSource] WebSocket connected');
-      };
-
-      this._ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          this._handleMessage(data);
-        } catch (err) {
-          console.warn('[RemoteDataSource] Invalid WebSocket message:', err);
-        }
-      };
-
-      this._ws.onclose = () => {
-        console.log('[RemoteDataSource] WebSocket disconnected');
-        this._ws = null;
-
-        if (this._autoReconnect && this._connected) {
-          this._attemptReconnect();
-        }
-      };
-
-      this._ws.onerror = (err) => {
-        console.warn('[RemoteDataSource] WebSocket error:', err);
-      };
-    } catch (err) {
-      console.warn('[RemoteDataSource] Failed to connect WebSocket:', err);
-    }
-  }
-
-  /**
-   * Handle incoming WebSocket message
-   * @param {Object} data - Message data
-   * @private
-   */
-  _handleMessage(data) {
-    for (const callback of this._messageCallbacks) {
-      try {
-        callback(data);
-      } catch (err) {
-        console.error('[RemoteDataSource] Message handler error:', err);
-      }
-    }
-  }
-
-  /**
-   * Attempt to reconnect after connection loss
-   * @private
-   */
-  async _attemptReconnect() {
-    // Prevent concurrent reconnection attempts
-    if (this._reconnecting) {
-      return;
-    }
-
-    if (this._reconnectAttempts >= this._maxReconnectAttempts) {
-      console.log('[RemoteDataSource] Max reconnect attempts reached');
-      this._connected = false;
-      this._reconnecting = false;
-      this._notifyConnectionLost();
-      return;
-    }
-
-    this._reconnecting = true;
-    this._reconnectAttempts++;
-    const delay = Math.min(1000 * Math.pow(2, this._reconnectAttempts - 1), 30000);
-
-    console.log(`[RemoteDataSource] Reconnecting in ${delay}ms (attempt ${this._reconnectAttempts})...`);
-
-    await new Promise(resolve => setTimeout(resolve, delay));
-
-    // Check if user called disconnect() during the delay
-    // Note: disconnect() sets both _connected = false AND _reconnecting = false
-    if (!this._reconnecting) {
-      return;
+      socket = new globalThis.WebSocket(wsUrl);
+    } catch (error) {
+      throw new DataSourceError(
+        `Remote WebSocket construction failed: ${error instanceof Error ? error.message : String(error)}`,
+        DataSourceErrorCode.NETWORK_ERROR,
+        this.type,
+        { url: wsUrl }
+      );
     }
 
     try {
-      await this.connect({
-        url: this._serverUrl,
-        autoReconnect: this._autoReconnect
+      await new Promise((resolve, reject) => {
+        const rejectWith = message => {
+          cleanup();
+          reject(new DataSourceError(
+            message,
+            DataSourceErrorCode.NETWORK_ERROR,
+            this.type,
+            { url: wsUrl }
+          ));
+        };
+        const onAbort = () => rejectWith('Remote WebSocket connection was cancelled');
+        const cleanup = () => {
+          signal.removeEventListener('abort', onAbort);
+          socket.onopen = null;
+          socket.onerror = null;
+          socket.onclose = null;
+        };
+
+        socket.onopen = () => {
+          cleanup();
+          resolve();
+        };
+        socket.onerror = () => {
+          rejectWith('Remote server advertised a WebSocket that failed to open');
+        };
+        socket.onclose = event => {
+          rejectWith(
+            `Remote server advertised a WebSocket that closed before opening (code ${event.code})`
+          );
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+        if (signal.aborted) onAbort();
       });
-      this._reconnecting = false;
-    } catch (err) {
-      console.warn('[RemoteDataSource] Reconnect failed:', err.message);
-      // Keep _reconnecting = true to prevent concurrent attempts during recursive call
-      // Schedule next attempt (recursive call will reset _reconnecting at start if needed)
-      setTimeout(() => {
-        this._reconnecting = false;
-        this._attemptReconnect();
-      }, 0);
+    } catch (error) {
+      closeSocket(socket);
+      throw error;
     }
+    return socket;
   }
 
   /**
-   * Notify listeners of connection loss
-   * @private
+   * Establish one exact remote connection.
+   *
+   * @param {{url: string, timeout?: number}} config
+   * @returns {Promise<Object>}
    */
-  _notifyConnectionLost() {
-    for (const callback of this._connectionLostCallbacks) {
-      try {
-        callback();
-      } catch (err) {
-        console.error('[RemoteDataSource] Connection lost handler error:', err);
+  async connect(config) {
+    const exactConfig = requireConnectionConfig(config);
+    if (this._connecting) {
+      throw new DataSourceError(
+        'A remote connection attempt is already in progress',
+        DataSourceErrorCode.NETWORK_ERROR,
+        this.type
+      );
+    }
+
+    this._connecting = true;
+    const operationId = ++this._operationId;
+    const controller = new AbortController();
+    this._pendingController = controller;
+    let deadlineExpired = false;
+    const timeoutId = setTimeout(
+      () => {
+        deadlineExpired = true;
+        controller.abort();
+      },
+      exactConfig.timeout
+    );
+    let stagedSocket = null;
+
+    try {
+      const healthPayload = await requestJson(
+        `${exactConfig.url}/_cellucid/health`,
+        controller.signal,
+        'Remote health'
+      );
+      const health = requireRemoteHealthPayload(healthPayload);
+
+      const infoPayload = await requestJson(
+        `${exactConfig.url}/_cellucid/info`,
+        controller.signal,
+        'Remote server info'
+      );
+      const serverInfo = requireRemoteServerInfo(infoPayload, health);
+      const catalog = await this._requestDatasetCatalog(
+        exactConfig.url,
+        controller.signal
+      );
+      const stagedPaths = new Map(
+        catalog.map(dataset => [dataset.id, dataset.path])
+      );
+      stagedSocket = await this._openAdvertisedWebSocket(
+        exactConfig.url,
+        serverInfo,
+        controller.signal
+      );
+
+      if (operationId !== this._operationId || controller.signal.aborted) {
+        throw new DataSourceError(
+          'Remote connection was cancelled before adoption',
+          DataSourceErrorCode.NETWORK_ERROR,
+          this.type
+        );
       }
+
+      const previousSocket = this._ws;
+      this._serverUrl = exactConfig.url;
+      this._serverInfo = serverInfo;
+      this._datasetPaths = stagedPaths;
+      this._datasetCache = new Map();
+      this._ws = stagedSocket;
+      this._connected = true;
+      if (stagedSocket) this._adoptWebSocket(stagedSocket);
+      stagedSocket = null;
+      closeSocket(previousSocket);
+      return serverInfo;
+    } catch (error) {
+      closeSocket(stagedSocket);
+      if (controller.signal.aborted) {
+        throw new DataSourceError(
+          deadlineExpired
+            ? `Remote connection timed out after ${exactConfig.timeout}ms`
+            : 'Remote connection was cancelled',
+          DataSourceErrorCode.NETWORK_ERROR,
+          this.type,
+          { url: exactConfig.url, timeout: exactConfig.timeout }
+        );
+      }
+      if (error instanceof DataSourceError) throw error;
+      throw new DataSourceError(
+        `Remote server contract validation failed: ${error instanceof Error ? error.message : String(error)}`,
+        DataSourceErrorCode.VALIDATION_ERROR,
+        this.type,
+        { url: exactConfig.url }
+      );
+    } finally {
+      clearTimeout(timeoutId);
+      if (this._pendingController === controller) {
+        this._pendingController = null;
+      }
+      this._connecting = false;
     }
   }
 
-  /**
-   * Disconnect from the server
-   */
-  disconnect() {
+  _adoptWebSocket(socket) {
+    socket.onopen = null;
+    socket.onmessage = async event => {
+      try {
+        if (typeof event.data !== 'string') {
+          throw new TypeError(
+            'Remote WebSocket messages must use one UTF-8 JSON text frame'
+          );
+        }
+        const message = requireRemoteMessage(JSON.parse(event.data));
+        await this._handleMessage(message);
+      } catch (error) {
+        await this._terminateWebSocket(
+          socket,
+          error instanceof Error ? error : new Error(String(error))
+        );
+      }
+    };
+    socket.onerror = async () => {
+      await this._terminateWebSocket(
+        socket,
+        new DataSourceError(
+          'Remote WebSocket failed',
+          DataSourceErrorCode.NETWORK_ERROR,
+          this.type
+        )
+      );
+    };
+    socket.onclose = async event => {
+      await this._terminateWebSocket(
+        socket,
+        new DataSourceError(
+          `Remote WebSocket closed (code ${event.code})`,
+          DataSourceErrorCode.NETWORK_ERROR,
+          this.type,
+          { code: event.code, reason: event.reason }
+        )
+      );
+    };
+  }
+
+  async _terminateWebSocket(socket, error) {
+    if (this._ws !== socket) return;
+    this._operationId += 1;
+    this._ws = null;
     this._connected = false;
-    this._reconnecting = false;
-    this._reconnectAttempts = 0;
+    closeSocket(socket);
+    await this._notifyConnectionLost(error);
+  }
 
-    if (this._ws) {
-      this._ws.close();
-      this._ws = null;
+  _handleMessage(message) {
+    return deliverCallbacks(this._messageCallbacks, [message]);
+  }
+
+  _notifyConnectionLost(error) {
+    return deliverCallbacks(this._connectionLostCallbacks, [error]);
+  }
+
+  disconnect() {
+    this._operationId += 1;
+    if (this._pendingController) {
+      this._pendingController.abort(
+        new Error('Remote connection cancelled by disconnect')
+      );
     }
-
+    const socket = this._ws;
+    this._ws = null;
+    this._connected = false;
     this._serverUrl = null;
     this._serverInfo = null;
-    this._datasetCache.clear();
-    this._activeDatasetId = null;
-
-    console.log('[RemoteDataSource] Disconnected');
+    this._datasetPaths = new Map();
+    this._datasetCache = new Map();
+    closeSocket(socket);
   }
 
-  /**
-   * Check if currently connected
-   * @returns {boolean}
-   */
   isConnected() {
     return this._connected;
   }
 
-  /**
-   * Get connection info
-   * @returns {{url: string, serverInfo: RemoteServerInfo|null, status: string}}
-   */
   getConnectionInfo() {
-    return {
+    return Object.freeze({
       url: this._serverUrl,
       serverInfo: this._serverInfo,
       status: this._connected ? 'connected' : 'disconnected'
-    };
+    });
   }
 
-  /**
-   * Register callback for connection loss
-   * @param {Function} callback
-   */
   onConnectionLost(callback) {
+    if (typeof callback !== 'function') {
+      throw new TypeError('Remote connection-lost callback must be a function');
+    }
     this._connectionLostCallbacks.add(callback);
   }
 
-  /**
-   * Remove connection loss callback
-   * @param {Function} callback
-   */
   offConnectionLost(callback) {
+    if (typeof callback !== 'function') {
+      throw new TypeError('Remote connection-lost callback must be a function');
+    }
     this._connectionLostCallbacks.delete(callback);
   }
 
-  /**
-   * Register callback for WebSocket messages
-   * @param {Function} callback
-   */
   onMessage(callback) {
+    if (typeof callback !== 'function') {
+      throw new TypeError('Remote message callback must be a function');
+    }
     this._messageCallbacks.add(callback);
   }
 
-  /**
-   * Remove message callback
-   * @param {Function} callback
-   */
   offMessage(callback) {
+    if (typeof callback !== 'function') {
+      throw new TypeError('Remote message callback must be a function');
+    }
     this._messageCallbacks.delete(callback);
   }
 
-  /**
-   * Send a message via WebSocket
-   * @param {Object} message
-   */
   sendMessage(message) {
-    if (!this._ws || this._ws.readyState !== WebSocket.OPEN) {
-      console.warn('[RemoteDataSource] WebSocket not connected');
-      return;
+    requireRemoteMessage(message);
+    if (
+      !this._connected ||
+      !this._ws ||
+      this._ws.readyState !== globalThis.WebSocket.OPEN
+    ) {
+      throw new DataSourceError(
+        'Remote WebSocket is not connected',
+        DataSourceErrorCode.NETWORK_ERROR,
+        this.type
+      );
     }
     this._ws.send(JSON.stringify(message));
   }
 
-  /**
-   * List all available datasets from the server
-   * @returns {Promise<DatasetMetadata[]>}
-   */
   async listDatasets() {
-    if (!this._connected) {
-      return [];
-    }
-
-    try {
-      const response = await fetch(`${this._serverUrl}/_cellucid/datasets`);
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-
-      const data = await response.json();
-      const datasetList = (data.datasets || []).filter(ds => ds?.id);
-      this._datasetPaths.clear();
-      for (const ds of datasetList) {
-        let dsPath = typeof ds.path === 'string' ? ds.path : `/${ds.id}/`;
-        if (!dsPath.startsWith('/')) dsPath = `/${dsPath}`;
-        if (!dsPath.endsWith('/')) dsPath = `${dsPath}/`;
-        this._datasetPaths.set(ds.id, dsPath);
-      }
-
-      // Load metadata for all datasets in parallel
-      const metadataPromises = datasetList.map(async (ds) => {
-        try {
-          const dsPath = this._datasetPaths.get(ds.id) || `/${ds.id}/`;
-          const baseUrl = `${this._serverUrl}${dsPath}`;
-          const metadata = await loadDatasetMetadata(baseUrl, ds.id, this.type);
-          this._datasetCache.set(ds.id, metadata);
-          return metadata;
-        } catch (err) {
-          console.warn(`[RemoteDataSource] Failed to load metadata for ${ds.id}:`, err);
-          // Return minimal metadata on failure
-          return {
-            id: ds.id,
-            name: ds.name || ds.id,
-            description: '',
-            stats: { n_cells: 0 }
-          };
-        }
-      });
-
-      return Promise.all(metadataPromises);
-    } catch (err) {
-      console.error('[RemoteDataSource] Failed to list datasets:', err);
-      return [];
-    }
-  }
-
-  /**
-   * Check if a specific dataset exists
-   * @param {string} datasetId - Dataset ID
-   * @returns {Promise<boolean>}
-   */
-  async hasDataset(datasetId) {
-    if (!this._connected) {
-      return false;
-    }
-
-    // Check cache first
-    if (this._datasetCache.has(datasetId)) {
-      return true;
-    }
-
-    // Check against server
-    const datasets = await this.listDatasets();
-    return datasets.some(d => d.id === datasetId);
-  }
-
-  /**
-   * Get metadata for a specific dataset
-   * @param {string} datasetId - Dataset ID
-   * @returns {Promise<DatasetMetadata>}
-   */
-  async getMetadata(datasetId) {
-    if (!this._connected) {
+    if (!this._connected || !this._serverUrl) {
       throw new DataSourceError(
-        'Not connected to server',
+        'Remote dataset listing requires an active connection',
         DataSourceErrorCode.NETWORK_ERROR,
         this.type
       );
     }
 
-    // Check cache
-    if (this._datasetCache.has(datasetId)) {
-      return this._datasetCache.get(datasetId);
-    }
+    const operationId = this._operationId;
+    const serverUrl = this._serverUrl;
+    const catalog = await this._requestDatasetCatalog(
+      serverUrl,
+      new AbortController().signal
+    );
+    const stagedPaths = new Map(
+      catalog.map(dataset => [dataset.id, dataset.path])
+    );
+    const metadataEntries = await Promise.all(catalog.map(async dataset => {
+      const metadata = await loadDatasetMetadata(
+        `${serverUrl}${dataset.path}`,
+        dataset.id,
+        this.type
+      );
+      if (metadata.name !== dataset.name) {
+        throw new DataSourceError(
+          `Remote catalog name for ${JSON.stringify(dataset.id)} does not match dataset_identity.json`,
+          DataSourceErrorCode.VALIDATION_ERROR,
+          this.type,
+          {
+            datasetId: dataset.id,
+            catalogName: dataset.name,
+            identityName: metadata.name
+          }
+        );
+      }
+      return [dataset.id, metadata];
+    }));
 
-    // Determine base URL
-    const baseUrl = this._getDatasetBaseUrl(datasetId);
-
-    try {
-      const metadata = await loadDatasetMetadata(baseUrl, datasetId, this.type);
-      this._datasetCache.set(datasetId, metadata);
-      return metadata;
-    } catch (err) {
+    if (
+      !this._connected ||
+      this._operationId !== operationId ||
+      this._serverUrl !== serverUrl
+    ) {
       throw new DataSourceError(
-        `Failed to load metadata for dataset '${datasetId}': ${err.message}`,
+        'Remote connection changed before dataset listing adoption',
+        DataSourceErrorCode.NETWORK_ERROR,
+        this.type
+      );
+    }
+    this._datasetPaths = stagedPaths;
+    this._datasetCache = new Map(metadataEntries);
+    return metadataEntries.map(([, metadata]) => metadata);
+  }
+
+  _requireDatasetId(datasetId) {
+    return requireExactText(
+      datasetId,
+      'Remote dataset id',
+      { allowWhitespace: true }
+    );
+  }
+
+  _requireDeclaredDatasetPath(datasetId) {
+    const id = this._requireDatasetId(datasetId);
+    if (!this._datasetPaths.has(id)) {
+      throw new DataSourceError(
+        `Remote dataset ${JSON.stringify(id)} is not declared by the current listing`,
         DataSourceErrorCode.NOT_FOUND,
         this.type,
-        { datasetId }
+        { datasetId: id }
       );
     }
+    return this._datasetPaths.get(id);
   }
 
-  /**
-   * Get base URL for a dataset
-   * @param {string} datasetId - Dataset ID
-   * @returns {string}
-   * @private
-   */
-  _getDatasetBaseUrl(datasetId) {
-    if (!this._serverUrl) {
+  async hasDataset(datasetId) {
+    if (!this._connected) {
       throw new DataSourceError(
-        'Not connected to server',
+        'Remote dataset lookup requires an active connection',
         DataSourceErrorCode.NETWORK_ERROR,
         this.type
       );
     }
-    const dsPath = this._datasetPaths.get(datasetId);
-    if (dsPath) return `${this._serverUrl}${dsPath}`;
-    return `${this._serverUrl}/${datasetId}/`;
+    const id = this._requireDatasetId(datasetId);
+    if (this._datasetPaths.has(id)) return true;
+    const datasets = await this.listDatasets();
+    return datasets.some(dataset => dataset.id === id);
   }
 
-  /**
-   * Get the base URL for loading a dataset's files
-   * Returns a remote:// protocol URL for proper handling
-   * @param {string} datasetId - Dataset ID
-   * @returns {string}
-   */
+  async getMetadata(datasetId) {
+    if (!this._connected || !this._serverUrl) {
+      throw new DataSourceError(
+        'Remote metadata loading requires an active connection',
+        DataSourceErrorCode.NETWORK_ERROR,
+        this.type
+      );
+    }
+    const id = this._requireDatasetId(datasetId);
+    if (this._datasetCache.has(id)) return this._datasetCache.get(id);
+    const datasetPath = this._requireDeclaredDatasetPath(id);
+    const operationId = this._operationId;
+    const serverUrl = this._serverUrl;
+    const metadata = await loadDatasetMetadata(
+      `${serverUrl}${datasetPath}`,
+      id,
+      this.type
+    );
+    if (
+      !this._connected ||
+      this._operationId !== operationId ||
+      this._serverUrl !== serverUrl
+    ) {
+      throw new DataSourceError(
+        'Remote connection changed before metadata adoption',
+        DataSourceErrorCode.NETWORK_ERROR,
+        this.type
+      );
+    }
+    this._datasetCache.set(id, metadata);
+    return metadata;
+  }
+
   getBaseUrl(datasetId) {
-    if (!this._serverUrl) {
+    if (!this._connected || !this._serverUrl) {
       throw new DataSourceError(
-        'Not connected to server',
+        'Remote dataset URL requires an active connection',
         DataSourceErrorCode.NETWORK_ERROR,
         this.type
       );
     }
+    const id = this._requireDatasetId(datasetId);
+    const datasetPath = this._requireDeclaredDatasetPath(id);
 
-    this._activeDatasetId = datasetId;
-
-    // Return remote:// (or remotes://) protocol URL.
-    //
-    // Important: preserve any path prefix in the server URL (e.g. reverse proxies,
-    // Jupyter Server Proxy paths like /user/.../proxy/<port>/). The remote:// URL
-    // encodes that prefix into the path segment so resolveUrl() can reconstruct
-    // a correct fetchable HTTP(S) URL.
-    const serverUrlObj = new URL(this._serverUrl);
-    const urlHost = serverUrlObj.host;
-    const prefix = (serverUrlObj.pathname || '').replace(/\/+$/, '');
-    const scheme = serverUrlObj.protocol === 'https:' ? 'remotes' : 'remote';
-
-    let dsPath = this._datasetPaths.get(datasetId) || `/${datasetId}/`;
-    if (!dsPath.startsWith('/')) dsPath = `/${dsPath}`;
-    if (!dsPath.endsWith('/')) dsPath = `${dsPath}/`;
-
-    let fullPath = dsPath;
-    if (prefix && prefix !== '/') {
-      fullPath = `${prefix}${dsPath}`;
-    }
-    if (!fullPath.startsWith('/')) fullPath = `/${fullPath}`;
-    if (!fullPath.endsWith('/')) fullPath = `${fullPath}/`;
-
-    return `${scheme}://${urlHost}${fullPath}`;
+    const server = new URL(this._serverUrl);
+    const prefix = server.pathname === '/' ? '' : server.pathname;
+    const fullPath = `${prefix}${datasetPath}`;
+    const scheme = server.protocol === 'https:' ? 'remotes' : 'remote';
+    return `${scheme}://${server.host}${fullPath}`;
   }
 
-  /**
-   * Refresh dataset base-path mappings from the server.
-   * Ensures correct behavior when the server is hosting a single dataset at `/`.
-   * @private
-   */
-  async _refreshDatasetPaths() {
-    if (!this._serverUrl) return;
-
-    try {
-      const response = await fetch(`${this._serverUrl}/_cellucid/datasets`);
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-      const data = await response.json();
-      const datasetList = data.datasets || [];
-
-      this._datasetPaths.clear();
-      for (const ds of datasetList) {
-        if (!ds?.id) continue;
-        let dsPath = typeof ds.path === 'string' ? ds.path : `/${ds.id}/`;
-        if (!dsPath.startsWith('/')) dsPath = `/${dsPath}`;
-        if (!dsPath.endsWith('/')) dsPath = `${dsPath}/`;
-        this._datasetPaths.set(ds.id, dsPath);
-      }
-    } catch (err) {
-      console.warn('[RemoteDataSource] Failed to fetch /_cellucid/datasets:', err);
-      this._datasetPaths.clear();
-    }
-  }
-
-  /**
-   * Resolve a remote:// URL to a fetchable HTTP URL
-   * @param {string} url - remote:// URL
-   * @returns {Promise<string>}
-   */
   async resolveUrl(url) {
-    if (!isRemoteUrl(url)) {
-      return url;
+    if (!this._connected || !this._serverUrl) {
+      throw new DataSourceError(
+        'Remote URL resolution requires an active connection',
+        DataSourceErrorCode.NETWORK_ERROR,
+        this.type
+      );
     }
-
     const parsed = parseRemoteUrl(url);
     if (!parsed) {
       throw new DataSourceError(
-        `Invalid remote URL: ${url}`,
+        `Remote source cannot resolve a noncanonical remote URL: ${String(url)}`,
         DataSourceErrorCode.INVALID_FORMAT,
         this.type
       );
     }
 
-    // Construct full HTTP URL, avoiding double slashes
-    const path = parsed.path;
-    if (!path || path === '') {
-      return `${parsed.serverUrl}/`;
+    const connected = new URL(this._serverUrl);
+    const resolved = new URL(
+      parsed.path.length === 0 ? '/' : `/${parsed.path}`,
+      `${parsed.serverUrl}/`
+    );
+    const requiredPrefix = connected.pathname === '/' ? '/' : `${connected.pathname}/`;
+    if (
+      resolved.origin !== connected.origin ||
+      (
+        connected.pathname !== '/' &&
+        resolved.pathname !== requiredPrefix &&
+        !resolved.pathname.startsWith(requiredPrefix)
+      )
+    ) {
+      throw new DataSourceError(
+        'Remote URL does not belong to the active remote server',
+        DataSourceErrorCode.VALIDATION_ERROR,
+        this.type,
+        { url }
+      );
     }
-    return `${parsed.serverUrl}/${path}`;
+    return resolved.href;
   }
 
-  /**
-   * Whether this source requires manual reconnection
-   * Remote servers may need re-authentication or could have lost connection
-   * @returns {boolean}
-   */
   requiresManualReconnect() {
-    // If we're connected, auto-restore can work
-    // If disconnected, need manual reconnection
     return !this._connected;
   }
 
-  /**
-   * Refresh cached data
-   */
   refresh() {
-    this._datasetCache.clear();
+    this._datasetCache = new Map();
   }
 
-  /**
-   * Called when this source is deactivated
-   */
   onDeactivate() {
-    // Keep connection alive when switching sources
-    // User might switch back
-    console.log('[RemoteDataSource] Deactivated (connection kept alive)');
+    return undefined;
   }
 }
 
-/**
- * Create a RemoteDataSource instance
- * @returns {RemoteDataSource}
- */
 export function createRemoteDataSource() {
   return new RemoteDataSource();
 }

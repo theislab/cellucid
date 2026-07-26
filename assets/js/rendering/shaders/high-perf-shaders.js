@@ -407,15 +407,11 @@ void main() {
 export const HP_VS_TEXTURE = `#version 300 es
 precision highp float;
 
-// a_pointIndex kept for backwards compatibility but prefer gl_VertexID for >16M points
-layout(location = 0) in float a_pointIndex;
-
 uniform sampler2D u_positionTex;
 uniform sampler2D u_colorTex; // Now stores RGBA
 uniform int u_texWidth;
 uniform mat4 u_mvpMatrix;
 uniform float u_pointSize;
-uniform bool u_useVertexID; // If true, use gl_VertexID instead of a_pointIndex
 
 out vec3 v_color;
 out float v_alpha;
@@ -428,8 +424,7 @@ vec4 fetchFromTexture(sampler2D tex, int idx, int width) {
 }
 
 void main() {
-  // Prefer gl_VertexID for large datasets (>16M points) to avoid float precision loss
-  int idx = u_useVertexID ? gl_VertexID : int(a_pointIndex);
+  int idx = gl_VertexID;
   vec4 pos = fetchFromTexture(u_positionTex, idx, u_texWidth);
   vec4 col = fetchFromTexture(u_colorTex, idx, u_texWidth);
 

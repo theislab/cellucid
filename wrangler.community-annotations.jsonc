@@ -1,0 +1,6 @@
+{
+  "name": "cellucid-github-auth",
+  "main": "assets/js/app/community-annotations/_worker-code.js",
+  "compatibility_date": "2026-07-25",
+  "workers_dev": true
+}

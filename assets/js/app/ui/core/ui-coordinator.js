@@ -28,9 +28,8 @@ import { initCommunityAnnotationControls } from '../modules/community-annotation
 import { initVisualizationReset } from '../modules/visualization-reset.js';
 import { initFigureExport } from '../modules/figure-export/index.js';
 import { initCinematicCamera } from '../modules/cinematic-camera/index.js';
+import { initInfoPopovers } from '../components/info-popovers.js';
 import { debug } from '../../../utils/debug.js';
-
-const LIVE_VIEW_ID = 'live';
 
 /**
  * Initialize the full app UI.
@@ -56,6 +55,9 @@ export function initUI({
   debug.log('[UI] initUI');
 
   const dom = collectDOMReferences(document);
+  const infoPopovers = initInfoPopovers({ root: document });
+  let viewControls = null;
+  let cinematicCamera = null;
 
   initSidebarControls({ dom: dom.sidebar });
 
@@ -87,14 +89,12 @@ export function initUI({
   const communityAnnotationControls = initCommunityAnnotationControls({
     state,
     dom: dom.communityAnnotation,
-    dataSourceManager
+    dataSourceManager,
+    infoPopovers
   });
-
-  let viewControls = null;
 
   const dimensionControls = initDimensionControls({
     state,
-    viewer,
     dom: dom.dimension,
     callbacks: {
       onViewBadgesMaybeChanged: () => viewControls?.renderSplitViewBadges?.()
@@ -131,18 +131,20 @@ export function initUI({
   }
 
   function syncNavigationUiForView(viewId) {
-    const navSelect = dom.camera?.navigationModeSelect || null;
-    if (!navSelect) return;
-    const targetViewId = String(viewId || LIVE_VIEW_ID);
-    const mode = typeof viewer.getViewNavigationMode === 'function'
-      ? viewer.getViewNavigationMode(targetViewId)
-      : (typeof viewer.getNavigationMode === 'function' ? viewer.getNavigationMode() : navSelect.value);
+    const navSelect = dom.camera.navigationModeSelect;
+    const mode = viewer.getViewNavigationMode(viewId);
 
-    if (mode && navSelect.value !== mode) {
+    if (navSelect.value !== mode) {
       navSelect.value = mode;
     }
-    cameraControls.toggleNavigationPanels?.(navSelect.value || 'orbit');
+    cameraControls.toggleNavigationPanels(mode);
+    if (cinematicCamera !== null) {
+      cinematicCamera.syncNavigationMode(mode);
+    }
   }
+  viewer.setNavigationModeChangeHandler((viewId) => {
+    syncNavigationUiForView(viewId);
+  });
 
   function handleVisibilityChange() {
     renderControls.markSmokeDirty?.();
@@ -186,7 +188,11 @@ export function initUI({
         renderControls.markSmokeDirty?.();
       },
       onCycleViewDimension: async (viewId, nextDim) => {
-        await dimensionControls.handleDimensionChange?.(nextDim, viewId, { silent: true });
+        await dimensionControls.handleDimensionChange(
+          nextDim,
+          viewId,
+          { silent: false }
+        );
       },
       onNavigationUiSyncRequested: (viewId) => syncNavigationUiForView(viewId)
     }
@@ -208,7 +214,7 @@ export function initUI({
     dimensionControls.updateDimensionSelectUI?.();
     viewControls?.renderSplitViewBadges?.();
     viewControls?.updateSplitViewUI?.();
-    syncNavigationUiForView(state.getActiveViewId() || LIVE_VIEW_ID);
+    syncNavigationUiForView(state.getActiveViewId());
     renderControls.markSmokeDirty?.();
   }
 
@@ -237,7 +243,7 @@ export function initUI({
         filterControls.render?.();
         highlightControls.renderHighlightSummary?.();
         dimensionControls.updateDimensionSelectUI?.();
-        syncNavigationUiForView(state.getActiveViewId() || LIVE_VIEW_ID);
+        syncNavigationUiForView(state.getActiveViewId());
         renderControls.markSmokeDirty?.();
         viewControls?.renderSplitViewBadges?.();
         viewControls?.updateSplitViewUI?.();
@@ -254,10 +260,12 @@ export function initUI({
     dataSourceManager
   });
 
-  const cinematicCamera = initCinematicCamera({
+  cinematicCamera = initCinematicCamera({
     viewer,
     dom: dom.cinematicCamera,
+    dataSourceManager
   });
+  syncNavigationUiForView(state.getActiveViewId());
 
   initVisualizationReset({
     viewer,
@@ -297,7 +305,7 @@ export function initUI({
   viewControls?.renderSplitViewBadges?.();
   viewControls?.updateSplitViewUI?.();
   handleActiveFieldChanged(buildStatsInfoFromState());
-  syncNavigationUiForView(state.getActiveViewId() || LIVE_VIEW_ID);
+  syncNavigationUiForView(state.getActiveViewId());
 
   return {
     activateField: fieldSelector.activateField,

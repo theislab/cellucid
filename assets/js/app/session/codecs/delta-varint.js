@@ -14,6 +14,11 @@
  */
 
 import { decodeUvarint, pushUvarint } from './varint.js';
+import {
+  assertExactKeys,
+  assertNullableSafeInteger,
+  assertPlainRecord
+} from '../schema-contract.js';
 
 /**
  * Ensure indices are a sorted Uint32Array.
@@ -21,19 +26,30 @@ import { decodeUvarint, pushUvarint } from './varint.js';
  * @returns {Uint32Array}
  */
 function toSortedUint32(indices) {
-  const n = indices?.length ?? 0;
-  const out = new Uint32Array(n);
+  if (
+    indices === null
+    || typeof indices !== 'object'
+    || !Number.isSafeInteger(indices.length)
+    || indices.length < 0
+  ) {
+    throw new TypeError('Delta-uvarint indices must be an exact array-like collection.');
+  }
+  const values = new Array(indices.length);
+  const n = indices.length;
   for (let i = 0; i < n; i++) {
     const v = indices[i];
-    const num = Number(v);
-    if (!Number.isFinite(num) || num < 0) {
-      throw new Error(`Invalid index at ${i}: ${v}`);
+    if (!Number.isInteger(v) || v < 0 || v > 0xffff_ffff) {
+      throw new TypeError(`Delta-uvarint index at ${i} must be an unsigned 32-bit integer.`);
     }
-    out[i] = num >>> 0;
+    values[i] = v;
   }
-  // TypedArray#sort is supported in modern browsers and is stable enough for our needs.
-  out.sort();
-  return out;
+  values.sort((a, b) => a - b);
+  for (let i = 1; i < values.length; i++) {
+    if (values[i] === values[i - 1]) {
+      throw new TypeError('Delta-uvarint indices must be a strict set without duplicates.');
+    }
+  }
+  return new Uint32Array(values);
 }
 
 /**
@@ -64,17 +80,38 @@ export function encodeDeltaUvarint(indices) {
  * Decode delta+uvarint bytes (pre-gzip) into a Uint32Array.
  *
  * @param {Uint8Array} bytes
- * @param {{ maxCount?: number, maxIndex?: number }} [options]
+ * @param {{ maxCount: number|null, maxIndex: number|null, signal: AbortSignal|null }} options
  * @returns {Uint32Array}
  */
-export function decodeDeltaUvarint(bytes, options = {}) {
+export function decodeDeltaUvarint(bytes, options) {
   if (!(bytes instanceof Uint8Array)) {
-    throw new Error('decodeDeltaUvarint: expected Uint8Array.');
+    throw new TypeError('decodeDeltaUvarint: expected Uint8Array.');
   }
-
-  const maxCount = typeof options.maxCount === 'number' ? options.maxCount : null;
-  const maxIndex = typeof options.maxIndex === 'number' ? options.maxIndex : null;
-  const signal = options.signal ?? null;
+  assertPlainRecord(options, 'Delta-uvarint decode options');
+  assertExactKeys(
+    options,
+    ['maxCount', 'maxIndex', 'signal'],
+    'Delta-uvarint decode options'
+  );
+  const maxCount = assertNullableSafeInteger(
+    options.maxCount,
+    'Delta-uvarint maxCount'
+  );
+  const maxIndex = assertNullableSafeInteger(
+    options.maxIndex,
+    'Delta-uvarint maxIndex',
+    { maximum: 0xffff_ffff }
+  );
+  const signal = options.signal;
+  if (
+    signal !== null
+    && (
+      typeof signal !== 'object'
+      || typeof signal.aborted !== 'boolean'
+    )
+  ) {
+    throw new TypeError('Delta-uvarint signal must be an AbortSignal or null.');
+  }
 
   let offset = 0;
   const countRes = decodeUvarint(bytes, offset);
@@ -89,17 +126,26 @@ export function decodeDeltaUvarint(bytes, options = {}) {
   let acc = 0;
 
   for (let i = 0; i < count; i++) {
-    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    if (signal !== null && signal.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
     const { value: delta, nextOffset } = decodeUvarint(bytes, offset);
     offset = nextOffset;
+    if (i > 0 && delta === 0) {
+      throw new Error('decodeDeltaUvarint: decoded indices must be strictly increasing.');
+    }
     acc += delta;
+    if (!Number.isInteger(acc) || acc > 0xffff_ffff) {
+      throw new Error('decodeDeltaUvarint: decoded index exceeds uint32 range.');
+    }
     if (maxIndex != null && acc > maxIndex) {
       throw new Error(`decodeDeltaUvarint: index ${acc} exceeds maxIndex ${maxIndex}.`);
     }
-    out[i] = acc >>> 0;
+    out[i] = acc;
   }
 
-  // Extra trailing bytes are allowed (future extensions / padding), but we
-  // keep them ignored intentionally for robustness.
+  if (offset !== bytes.byteLength) {
+    throw new Error('decodeDeltaUvarint: trailing bytes are not allowed.');
+  }
   return out;
 }

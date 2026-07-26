@@ -7,6 +7,39 @@
 
 import { makeFieldId } from '../utils/field-constants.js';
 import { BaseRegistry } from './base-registry.js';
+import { FieldSource } from '../utils/field-constants.js';
+import { StateValidator } from '../utils/state-validator.js';
+
+function requireSourceAndKey(source, originalKey) {
+  if (source !== FieldSource.OBS && source !== FieldSource.VAR) {
+    throw new TypeError('Delete source must be exactly obs or var');
+  }
+  StateValidator.validateFieldKey(originalKey);
+}
+
+function requireExactStringArray(value, label) {
+  if (!Array.isArray(value)) {
+    throw new TypeError(`${label} must be an array`);
+  }
+  const seen = new Set();
+  for (const item of value) {
+    if (
+      typeof item !== 'string'
+      || item.length === 0
+      || item !== item.trim()
+      || (!item.startsWith('obs:') && !item.startsWith('var:'))
+    ) {
+      throw new TypeError(
+        `${label} entries must be exact obs/var field identifiers`
+      );
+    }
+    if (seen.has(item)) {
+      throw new TypeError(`${label} contains a duplicate identifier`);
+    }
+    seen.add(item);
+  }
+  return value;
+}
 
 export class DeleteRegistry extends BaseRegistry {
   constructor() {
@@ -16,29 +49,37 @@ export class DeleteRegistry extends BaseRegistry {
   }
 
   markDeleted(source, originalKey) {
+    requireSourceAndKey(source, originalKey);
     this._deletedFields.add(makeFieldId(source, originalKey));
   }
 
   markRestored(source, originalKey) {
+    requireSourceAndKey(source, originalKey);
     this._deletedFields.delete(makeFieldId(source, originalKey));
     this._purgedFields.delete(makeFieldId(source, originalKey));
   }
 
   markPurged(source, originalKey) {
+    requireSourceAndKey(source, originalKey);
     const id = makeFieldId(source, originalKey);
     this._deletedFields.add(id);
     this._purgedFields.add(id);
   }
 
   isDeleted(source, originalKey) {
+    requireSourceAndKey(source, originalKey);
     return this._deletedFields.has(makeFieldId(source, originalKey));
   }
 
   isPurged(source, originalKey) {
+    requireSourceAndKey(source, originalKey);
     return this._purgedFields.has(makeFieldId(source, originalKey));
   }
 
   getDeletedKeys(source) {
+    if (source !== FieldSource.OBS && source !== FieldSource.VAR) {
+      throw new TypeError('Delete source must be exactly obs or var');
+    }
     const prefix = `${source}:`;
     return [...this._deletedFields]
       .filter((id) => id.startsWith(prefix))
@@ -65,8 +106,37 @@ export class DeleteRegistry extends BaseRegistry {
   }
 
   fromJSON(data) {
-    this._deletedFields = BaseRegistry.arrayToSet(data?.deleted);
-    this._purgedFields = BaseRegistry.arrayToSet(data?.purged);
+    if (
+      data === null
+      || typeof data !== 'object'
+      || Array.isArray(data)
+      || Object.getPrototypeOf(data) !== Object.prototype
+      || Object.keys(data).length !== 2
+      || !Object.hasOwn(data, 'deleted')
+      || !Object.hasOwn(data, 'purged')
+    ) {
+      throw new TypeError(
+        'Delete registry payload requires exact deleted and purged arrays'
+      );
+    }
+    const deleted = requireExactStringArray(
+      data.deleted,
+      'Deleted field identifiers'
+    );
+    const purged = requireExactStringArray(
+      data.purged,
+      'Purged field identifiers'
+    );
+    const deletedSet = new Set(deleted);
+    for (const id of purged) {
+      if (!deletedSet.has(id)) {
+        throw new TypeError(
+          'Every purged field identifier must also be deleted'
+        );
+      }
+    }
+    this._deletedFields = deletedSet;
+    this._purgedFields = new Set(purged);
   }
 
   clear() {

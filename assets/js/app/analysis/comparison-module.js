@@ -81,6 +81,7 @@ export class ComparisonModule {
     // Track last known highlight page IDs so we can preserve user selections
     // when pages are added/removed/renamed.
     this._lastKnownPageIds = [];
+    this._lastKnownSelectablePageIds = [];
 
     // Notification center
     this._notifications = getNotificationCenter();
@@ -89,6 +90,8 @@ export class ComparisonModule {
     this._lastStatResults = [];
     this._lastStatResultsTimestamp = null;
     this._currentPageData = null;
+    this._datasetReloadResetCount = 0;
+    this._lastDatasetReloadReset = null;
 
     // Current state (shared across analysis UIs)
     this.currentConfig = {
@@ -113,33 +116,54 @@ export class ComparisonModule {
     // Register with memory monitor for automatic cleanup
     this._memoryMonitor = getMemoryMonitor();
     this._memoryMonitor.registerCleanupHandler('comparison-module', (reason) => {
-      // Data layer cache cleanup (safe even for periodic maintenance)
-      if (this.dataLayer && this.dataLayer.performCacheCleanup) {
-        this.dataLayer.performCacheCleanup();
+      const cleanupErrors = [];
+      const cleanup = operation => {
+        try {
+          operation();
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+      };
+
+      if (
+        this.dataLayer === null ||
+        typeof this.dataLayer?.performCacheCleanup !== 'function'
+      ) {
+        cleanupErrors.push(
+          new TypeError('Comparison cleanup requires DataLayer.performCacheCleanup()')
+        );
+      } else {
+        cleanup(() => this.dataLayer.performCacheCleanup());
       }
 
-      // On memory-pressure cleanups, aggressively release UI/WebGL resources too.
-      if (reason !== 'threshold' && reason !== 'critical') return;
+      if (reason === 'threshold' || reason === 'critical') {
+        cleanup(() => clearActiveSourceCaches());
 
-      // Clear dataset-source caches too (h5ad/zarr) so large gene caches/sparse conversions can be released.
-      clearActiveSourceCaches();
-
-      // Close any open analysis modals (removes global listeners + purges plots).
-      try {
-        document.querySelectorAll?.('.analysis-modal')?.forEach?.((modal) => {
-          closeModal(modal);
+        let modals = [];
+        cleanup(() => {
+          modals = document.querySelectorAll('.analysis-modal');
         });
-      } catch (_err) {
-        // Ignore
+        for (const modal of modals) {
+          cleanup(() => closeModal(modal));
+        }
+
+        let previewPlots = [];
+        cleanup(() => {
+          previewPlots = document.querySelectorAll(
+            '.analysis-preview-plot'
+          );
+        });
+        for (const plotEl of previewPlots) {
+          cleanup(() => purgePlot(plotEl));
+        }
       }
 
-      // Purge preview plots so GPU buffers can be reclaimed.
-      try {
-        document.querySelectorAll?.('.analysis-preview-plot')?.forEach?.((plotEl) => {
-          purgePlot(plotEl);
-        });
-      } catch (_err) {
-        // Ignore
+      if (cleanupErrors.length === 1) throw cleanupErrors[0];
+      if (cleanupErrors.length > 1) {
+        throw new AggregateError(
+          cleanupErrors,
+          `Comparison cleanup failed in ${cleanupErrors.length} operations`
+        );
       }
     });
     // Start monitoring if not already active
@@ -304,13 +328,13 @@ export class ComparisonModule {
 
     // Update with current pages
     const pages = this.dataLayer.getPages();
-    if (pages.length > 0) {
-      this.currentConfig.pages = pages.map(p => p.id);
-    }
+    const selectablePageIds = this._getSelectableBasePageIds(pages);
+    this.currentConfig.pages = [...selectablePageIds];
 
     // Seed shared page selection before first mode switch
     this._uiManager.setCurrentPages(this.currentConfig.pages, { notifyActiveUI: false });
     this._lastKnownPageIds = pages.map(p => p.id);
+    this._lastKnownSelectablePageIds = [...selectablePageIds];
 
     // Set default active mode (simple/quick) without auto-opening the accordion item.
     // Users can open the desired section explicitly.
@@ -541,54 +565,113 @@ export class ComparisonModule {
   // ===========================================================================
 
   /**
+   * Return the exact base-page IDs that currently contain cells.
+   * @param {unknown} pages
+   * @returns {string[]}
+   * @private
+   */
+  _getSelectableBasePageIds(pages) {
+    if (!Array.isArray(pages)) {
+      throw new TypeError('Comparison page inventory must be an array');
+    }
+    const selectablePageIds = [];
+    const seenPageIds = new Set();
+    for (const page of pages) {
+      if (
+        page === null ||
+        typeof page !== 'object' ||
+        Array.isArray(page) ||
+        typeof page.id !== 'string' ||
+        page.id.length === 0
+      ) {
+        throw new TypeError(
+          'Comparison pages require a non-empty string id'
+        );
+      }
+      if (seenPageIds.has(page.id)) {
+        throw new TypeError(`Comparison page ID "${page.id}" is duplicated`);
+      }
+      seenPageIds.add(page.id);
+      const cellCount = this.dataLayer.getCellCountForPageId(page.id);
+      if (!Number.isSafeInteger(cellCount) || cellCount < 0) {
+        throw new TypeError(
+          `Comparison page "${page.id}" cell count must be a non-negative safe integer`
+        );
+      }
+      if (cellCount > 0) {
+        selectablePageIds.push(page.id);
+      }
+    }
+    return selectablePageIds;
+  }
+
+  /**
    * Handle pages changed event (pages added/removed/renamed/switched)
    * Unified handling via UI manager
    */
   onPagesChanged() {
     const pages = this.dataLayer.getPages();
     const currentPageIds = pages.map(p => p.id);
-    const currentPageIdSet = new Set(currentPageIds);
-
-    const previousPageIds = Array.isArray(this._lastKnownPageIds) ? this._lastKnownPageIds : [];
+    const selectablePageIds = this._getSelectableBasePageIds(pages);
+    const selectablePageIdSet = new Set(selectablePageIds);
+    const previousPageIds = this._lastKnownPageIds;
+    if (!Array.isArray(previousPageIds)) {
+      throw new TypeError('Previous comparison page IDs must be an array');
+    }
     const previousPageIdSet = new Set(previousPageIds);
-
-    const addedPageIds = currentPageIds.filter(id => !previousPageIdSet.has(id));
+    const previousSelectablePageIds = this._lastKnownSelectablePageIds;
+    if (!Array.isArray(previousSelectablePageIds)) {
+      throw new TypeError(
+        'Previous selectable comparison page IDs must be an array'
+      );
+    }
+    const previousSelectablePageIdSet =
+      new Set(previousSelectablePageIds);
+    const addedSelectablePageIds = selectablePageIds.filter(
+      id => !previousPageIdSet.has(id) || !previousSelectablePageIdSet.has(id)
+    );
 
     // Treat the manager's selection as canonical (it is the shared selection across modes).
-    const previousSelection = this._uiManager?.getCurrentPages?.() ?? this.currentConfig.pages ?? [];
+    const previousSelection = this._uiManager.getCurrentPages();
+    if (!Array.isArray(previousSelection)) {
+      throw new TypeError('Comparison current pages must be an array');
+    }
     const previousSelectionSet = new Set(previousSelection);
 
     const hadAllPreviously =
-      previousPageIds.length > 0 &&
-      previousPageIds.every(id => previousSelectionSet.has(id));
+      previousSelectablePageIds.length > 0 &&
+      previousSelectablePageIds.every(id => previousSelectionSet.has(id));
 
     const nextSelectionSet = new Set(
-      (previousSelection || []).filter(id => currentPageIdSet.has(id))
+      previousSelection.filter(id => selectablePageIdSet.has(id))
     );
 
     // Preserve "Select All" semantics: if the user previously had all pages selected,
     // auto-include newly created pages so the selection remains "all".
     if (hadAllPreviously) {
-      for (const id of addedPageIds) {
+      for (const id of addedSelectablePageIds) {
         nextSelectionSet.add(id);
       }
     }
 
-    // If selection is empty (e.g., deletions), default to selecting all current pages.
+    // If selection is empty after a page-topology change, select every non-empty page.
     if (nextSelectionSet.size === 0) {
-      for (const id of currentPageIds) {
+      for (const id of selectablePageIds) {
         nextSelectionSet.add(id);
       }
     }
 
-    const nextSelection = currentPageIds.filter(id => nextSelectionSet.has(id));
+    const nextSelection = selectablePageIds.filter(
+      id => nextSelectionSet.has(id)
+    );
 
     this.currentConfig.pages = nextSelection;
     this._uiManager.onPageSelectionChange(nextSelection);
     this._lastKnownPageIds = currentPageIds;
+    this._lastKnownSelectablePageIds = selectablePageIds;
 
     // Keep floating analysis windows in sync with page add/remove/rename changes.
-    this._analysisWindowManager?.onPagesChanged?.();
+    this._analysisWindowManager.onPagesChanged();
   }
 
   /**
@@ -596,11 +679,33 @@ export class ComparisonModule {
    * Unified handling via UI manager
    */
   onHighlightChanged() {
+    const selectablePageIds = this._getSelectableBasePageIds(
+      this.dataLayer.getPages()
+    );
+    const selectablePageIdSet = new Set(selectablePageIds);
+    const previousSelection = this._uiManager.getCurrentPages();
+    if (!Array.isArray(previousSelection)) {
+      throw new TypeError('Comparison current pages must be an array');
+    }
+    const nextSelection = previousSelection.filter(
+      pageId => selectablePageIdSet.has(pageId)
+    );
+    if (
+      nextSelection.length !== previousSelection.length ||
+      nextSelection.some(
+        (pageId, index) => pageId !== previousSelection[index]
+      )
+    ) {
+      this.currentConfig.pages = [...nextSelection];
+      this._uiManager.onPageSelectionChange(nextSelection);
+    }
+    this._lastKnownSelectablePageIds = selectablePageIds;
+
     // Notify UI manager (it notifies only the active UI)
     this._uiManager.onHighlightChanged();
 
     // Notify floating analysis windows too
-    this._analysisWindowManager?.onHighlightChanged?.();
+    this._analysisWindowManager.onHighlightChanged();
   }
 
   // ===========================================================================
@@ -814,78 +919,129 @@ export class ComparisonModule {
    * so analysis UIs and caches that assume dataset-stable identities must be
    * cleared to avoid cross-dataset state bleed.
    *
-   * Safe to call even if the module is partially initialized.
-   *
-   * @param {object} [options]
-   * @param {string} [options.reason]
+   * @param {object} options
+   * @param {string} options.reason
    */
-  resetForDatasetReload({ reason = 'dataset-reload' } = {}) {
-    // Close any floating analysis windows first (they can hold WebGL/DOM resources).
-    try {
-      this._analysisWindowManager?.closeAll?.();
-    } catch {
-      // ignore
+  resetForDatasetReload(options) {
+    if (!options || typeof options !== 'object' || Array.isArray(options)) {
+      throw new TypeError('Dataset reload reset options must be an object');
+    }
+    const { reason } = options;
+    if (
+      typeof reason !== 'string' ||
+      reason.length === 0 ||
+      reason !== reason.trim()
+    ) {
+      throw new TypeError(
+        'Dataset reload reset reason must be one exact non-empty string'
+      );
     }
 
-    // Close embedded accordion panels (avoid showing stale results in-place).
-    try {
-      const items = this._modeToggleContainer?.querySelectorAll?.('.analysis-accordion-item') || [];
-      items.forEach((item) => {
-        item.classList.remove('open');
-        const header = item.querySelector?.('.analysis-accordion-header');
-        header?.setAttribute?.('aria-expanded', 'false');
-      });
-    } catch {
-      // ignore
-    }
-    try {
-      this._analysisMode = null;
-      this._uiManager?.clearActiveMode?.();
-    } catch {
-      // ignore
-    }
-
-    // Destroy and reset analysis UIs (clears per-UI caches/results).
-    try {
-      this._uiManager?.reset?.();
-    } catch {
-      // ignore
-    }
-
-    // Clear analysis-layer caches (DataLayer).
-    try {
-      this.dataLayer?.resetForDatasetReload?.();
-    } catch {
+    const errors = [];
+    const run = operation => {
       try {
-        this.dataLayer?.clearAllCaches?.();
-      } catch {
-        // ignore
+        operation();
+      } catch (error) {
+        errors.push(error);
+      }
+    };
+
+    if (this._analysisWindowManager !== null) {
+      if (typeof this._analysisWindowManager?.closeAll !== 'function') {
+        errors.push(
+          new TypeError('AnalysisWindowManager must implement closeAll()')
+        );
+      } else {
+        run(() => this._analysisWindowManager.closeAll());
       }
     }
 
-    // Drop cached analysis helpers/results that may retain dataset-specific state.
+    if (this._modeToggleContainer !== null) {
+      if (
+        typeof this._modeToggleContainer?.querySelectorAll !== 'function'
+      ) {
+        errors.push(
+          new TypeError('Analysis accordion must implement querySelectorAll()')
+        );
+      } else {
+        const items = this._modeToggleContainer.querySelectorAll(
+          '.analysis-accordion-item'
+        );
+        if (items === null || typeof items[Symbol.iterator] !== 'function') {
+          errors.push(
+            new TypeError('Analysis accordion query must return an iterable')
+          );
+        } else {
+          for (const item of items) {
+            run(() => {
+              item.classList.remove('open');
+              const header = item.querySelector('.analysis-accordion-header');
+              if (header !== null) {
+                header.setAttribute('aria-expanded', 'false');
+              }
+            });
+          }
+        }
+      }
+    }
+
+    this._analysisMode = null;
+    if (this._uiManager !== null) {
+      if (
+        typeof this._uiManager?.clearActiveMode !== 'function' ||
+        typeof this._uiManager?.reset !== 'function'
+      ) {
+        errors.push(
+          new TypeError(
+            'AnalysisUIManager must implement clearActiveMode() and reset()'
+          )
+        );
+      } else {
+        run(() => this._uiManager.clearActiveMode());
+        run(() => this._uiManager.reset());
+      }
+    }
+
+    if (
+      this.dataLayer === null ||
+      typeof this.dataLayer?.resetForDatasetReload !== 'function'
+    ) {
+      errors.push(
+        new TypeError('Dataset reload requires DataLayer.resetForDatasetReload()')
+      );
+    } else {
+      run(() => this.dataLayer.resetForDatasetReload());
+    }
+
     this._multiVariableAnalysis = null;
     this._lastStatResults = [];
     this._lastStatResultsTimestamp = null;
     this._currentPageData = null;
 
-    // Re-seed page selection for the new dataset (best effort).
-    try {
-      this.onPagesChanged?.();
-    } catch {
-      // ignore
+    if (typeof this.onPagesChanged !== 'function') {
+      errors.push(
+        new TypeError('ComparisonModule.onPagesChanged() is required')
+      );
+    } else {
+      run(() => this.onPagesChanged());
     }
 
-    // Dev-only introspection hook (no user data, no tokens).
-    try {
-      this._datasetReloadResetCount = (Number(this._datasetReloadResetCount) || 0) + 1;
-      this._lastDatasetReloadReset = {
-        at: Date.now(),
-        reason: String(reason || '').trim() || 'dataset-reload'
-      };
-    } catch {
-      // ignore
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) {
+      throw new AggregateError(
+        errors,
+        `Dataset reload analysis reset failed in ${errors.length} operations`
+      );
     }
+
+    if (!Number.isSafeInteger(this._datasetReloadResetCount)) {
+      throw new TypeError('Dataset reload reset count must be a safe integer');
+    }
+    this._datasetReloadResetCount += 1;
+    this._lastDatasetReloadReset = {
+      at: Date.now(),
+      reason,
+    };
   }
 
   /**

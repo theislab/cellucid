@@ -1,11 +1,15 @@
 /**
- * @fileoverview Highlight selection → UI/viewer synchronization.
- *
- * Centralizes the bookkeeping that keeps the highlight UI (counts/pages) and
- * the viewer buffers in sync with DataState highlight changes.
+ * @fileoverview Event-driven highlight UI/viewer synchronization.
  *
  * @module ui/modules/highlight/selection-sync
  */
+
+import {
+  requireCallback,
+  requireExactKeys,
+  requireLodChangeEvent,
+  requireMethods
+} from './exact-contract.js';
 
 /**
  * @param {object} options
@@ -14,45 +18,79 @@
  * @param {() => void} options.renderHighlightSummary
  * @param {() => void} options.renderHighlightPages
  */
-export function initHighlightSelectionSync({ state, viewer, renderHighlightSummary, renderHighlightPages }) {
-  const unsubscribeHighlightChanged =
-    typeof state.on === 'function'
-      ? state.on('highlight:changed', () => {
-          renderHighlightSummary();
-          renderHighlightPages(); // update page tab counts
-          if (viewer.updateHighlight && state.highlightArray) {
-            viewer.updateHighlight(state.highlightArray);
-          }
-        })
-      : null;
+export function initHighlightSelectionSync(options) {
+  requireExactKeys(
+    options,
+    [
+      'state',
+      'viewer',
+      'renderHighlightSummary',
+      'renderHighlightPages'
+    ],
+    'Highlight selection synchronization options'
+  );
+  const {
+    state,
+    viewer,
+    renderHighlightSummary,
+    renderHighlightPages
+  } = options;
+  requireMethods(
+    state,
+    'Highlight synchronization state',
+    ['getActiveViewId', 'getHighlightedGroups', 'on']
+  );
+  requireMethods(
+    viewer,
+    'Highlight synchronization viewer',
+    ['onLodChanged', 'updateHighlight']
+  );
+  requireCallback(renderHighlightSummary, 'Highlight summary renderer');
+  requireCallback(renderHighlightPages, 'Highlight pages renderer');
 
-  const unsubscribePageChanged =
-    typeof state.on === 'function'
-      ? state.on('page:changed', () => {
-          renderHighlightPages();
-          renderHighlightSummary();
-        })
-      : null;
-
-  let lodInterval = null;
-  if (viewer.getCurrentLODLevel && viewer.getLodVisibilityArray) {
-    let lastHighlightLodLevel = viewer.getCurrentLODLevel();
-    lodInterval = setInterval(() => {
-      const currentLod = viewer.getCurrentLODLevel();
-      if (currentLod === lastHighlightLodLevel) return;
-      lastHighlightLodLevel = currentLod;
-      if ((state.getHighlightedGroups?.() || []).length > 0) {
-        renderHighlightSummary();
+  const unsubscribeHighlightChanged = state.on(
+    'highlight:changed',
+    () => {
+      if (!(state.highlightArray instanceof Uint8Array)) {
+        throw new TypeError(
+          'Highlight state must publish a Uint8Array highlightArray.'
+        );
       }
-    }, 200);
-  }
+      renderHighlightSummary();
+      renderHighlightPages();
+      viewer.updateHighlight(state.highlightArray);
+    }
+  );
+  requireCallback(
+    unsubscribeHighlightChanged,
+    'Highlight change unsubscribe'
+  );
 
+  const unsubscribePageChanged = state.on('page:changed', () => {
+    renderHighlightPages();
+    renderHighlightSummary();
+  });
+  requireCallback(unsubscribePageChanged, 'Highlight page unsubscribe');
+
+  const unsubscribeLodChanged = viewer.onLodChanged(event => {
+    requireLodChangeEvent(event);
+    if (event.viewId !== state.getActiveViewId()) return;
+    const groups = state.getHighlightedGroups();
+    if (!Array.isArray(groups)) {
+      throw new TypeError('Highlighted groups must be an array.');
+    }
+    if (groups.length > 0) renderHighlightSummary();
+  });
+  requireCallback(unsubscribeLodChanged, 'Highlight LOD unsubscribe');
+
+  let destroyed = false;
   return {
     destroy: () => {
-      unsubscribeHighlightChanged?.();
-      unsubscribePageChanged?.();
-      if (lodInterval) clearInterval(lodInterval);
+      if (destroyed) return;
+      destroyed = true;
+      unsubscribeHighlightChanged();
+      unsubscribePageChanged();
+      unsubscribeLodChanged();
     }
   };
 }
-

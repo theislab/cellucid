@@ -75,6 +75,7 @@ export const viewContextCoreMethods = {
       ? (cloneArrays ? new Uint8Array(this.colorsArray) : this.colorsArray)
       : null;
     ctx.categoryTransparency = wrap(this.categoryTransparency);
+    ctx.cellVisibilityMask = wrap(this.cellVisibilityMask);
     ctx.outlierQuantilesArray = wrap(this.outlierQuantilesArray);
     ctx.centroidPositions = wrap(this.centroidPositions);
     ctx.centroidColors = this.centroidColors
@@ -101,6 +102,7 @@ export const viewContextCoreMethods = {
     this.activeFieldSource = ctx.activeFieldSource ?? null;
     this.colorsArray = ctx.colorsArray ? new Uint8Array(ctx.colorsArray) : null;
     this.categoryTransparency = ctx.categoryTransparency ? new Float32Array(ctx.categoryTransparency) : null;
+    this.cellVisibilityMask = ctx.cellVisibilityMask ? new Float32Array(ctx.cellVisibilityMask) : null;
     this.outlierQuantilesArray = ctx.outlierQuantilesArray ? new Float32Array(ctx.outlierQuantilesArray) : null;
     this.centroidPositions = ctx.centroidPositions ? new Float32Array(ctx.centroidPositions) : null;
     this.centroidColors = ctx.centroidColors ? new Uint8Array(ctx.centroidColors) : null;
@@ -123,9 +125,7 @@ export const viewContextCoreMethods = {
     this._syncActiveContext();
     this._pushColorsToViewer();
     this._pushTransparencyToViewer();
-    this._pushOutliersToViewer();
     this._pushCentroidsToViewer();
-    this._pushOutlierThresholdToViewer(this.getCurrentOutlierThreshold());
     this.computeGlobalVisibility();
     this.updateFilterSummary();
   },
@@ -140,6 +140,7 @@ export const viewContextCoreMethods = {
     ctx.activeFieldSource = this.activeFieldSource;
     ctx.colorsArray = this.colorsArray ? new Uint8Array(this.colorsArray) : null;
     ctx.categoryTransparency = this.categoryTransparency ? new Float32Array(this.categoryTransparency) : null;
+    ctx.cellVisibilityMask = this.cellVisibilityMask ? new Float32Array(this.cellVisibilityMask) : null;
     ctx.outlierQuantilesArray = this.outlierQuantilesArray ? new Float32Array(this.outlierQuantilesArray) : null;
     ctx.centroidPositions = this.centroidPositions ? new Float32Array(this.centroidPositions) : null;
     ctx.centroidColors = this.centroidColors ? new Uint8Array(this.centroidColors) : null;
@@ -197,32 +198,76 @@ export const viewContextCoreMethods = {
   },
 
   setActiveView(viewId) {
-    const key = String(viewId || 'live');
-    const ctx = this.viewContexts.get(key) || this.viewContexts.get('live');
-    if (!ctx) return null;
-
-    const prevKey = String(this.activeViewId || 'live');
-    if (prevKey !== key) {
-      const prevCtx = this.viewContexts.get(prevKey);
-      if (prevCtx) {
-        prevCtx.obsData = this._cloneObsData(this.obsData);
-        prevCtx.varData = this._cloneVarData(this.varData);
-        prevCtx.activeFieldIndex = this.activeFieldIndex;
-        prevCtx.activeVarFieldIndex = this.activeVarFieldIndex;
-        prevCtx.activeFieldSource = this.activeFieldSource;
-        prevCtx.colorsArray = this.colorsArray ? new Uint8Array(this.colorsArray) : null;
-        prevCtx.categoryTransparency = this.categoryTransparency ? new Float32Array(this.categoryTransparency) : null;
-        prevCtx.outlierQuantilesArray = this.outlierQuantilesArray ? new Float32Array(this.outlierQuantilesArray) : null;
-        prevCtx.centroidPositions = this.centroidPositions ? new Float32Array(this.centroidPositions) : null;
-        prevCtx.centroidColors = this.centroidColors ? new Uint8Array(this.centroidColors) : null;
-        prevCtx.centroidOutliers = this.centroidOutliers ? new Float32Array(this.centroidOutliers) : null;
-        prevCtx.centroidLabels = this.centroidLabels ? this.centroidLabels.map(c => c ? { ...c } : c) : [];
-        prevCtx.filteredCount = this.filteredCount ? { ...this.filteredCount } : { shown: this.pointCount, total: this.pointCount };
-        prevCtx.dimensionLevel = this.activeDimensionLevel;
-      }
+    if (typeof viewId !== 'string' || viewId.trim().length === 0) {
+      throw new TypeError('Active view id must be a non-empty string.');
+    }
+    if (!(this.viewContexts instanceof Map)) {
+      throw new TypeError('Active view selection requires the exact view-context map.');
+    }
+    if (!this.viewContexts.has(viewId)) {
+      throw new RangeError(`Active view "${viewId}" does not exist.`);
+    }
+    const key = viewId;
+    const ctx = this.viewContexts.get(key);
+    if (
+      ctx === null
+      || typeof ctx !== 'object'
+      || Array.isArray(ctx)
+      || ctx.id !== key
+    ) {
+      throw new TypeError(`Active view "${key}" has an invalid context.`);
     }
 
-    this.activeViewId = ctx.id;
+    const prevKey = this.activeViewId;
+    if (
+      typeof prevKey !== 'string'
+      || prevKey.trim().length === 0
+      || !this.viewContexts.has(prevKey)
+    ) {
+      throw new Error('The current active view does not have an exact context.');
+    }
+    const prevCtx = this.viewContexts.get(prevKey);
+    if (
+      prevCtx === null
+      || typeof prevCtx !== 'object'
+      || Array.isArray(prevCtx)
+      || prevCtx.id !== prevKey
+    ) {
+      throw new TypeError(`Current active view "${prevKey}" has an invalid context.`);
+    }
+    if (
+      !(this.cellVisibilityMask instanceof Float32Array)
+      || this.cellVisibilityMask.length !== this.pointCount
+      || !(ctx.cellVisibilityMask instanceof Float32Array)
+      || ctx.cellVisibilityMask.length !== this.pointCount
+    ) {
+      throw new TypeError(
+        'Active view selection requires complete per-view cell visibility masks.'
+      );
+    }
+    if (prevKey === key) {
+      return key;
+    }
+    const previousCellVisibilityMask = new Float32Array(this.cellVisibilityMask);
+    const nextCellVisibilityMask = new Float32Array(ctx.cellVisibilityMask);
+
+    prevCtx.obsData = this._cloneObsData(this.obsData);
+    prevCtx.varData = this._cloneVarData(this.varData);
+    prevCtx.activeFieldIndex = this.activeFieldIndex;
+    prevCtx.activeVarFieldIndex = this.activeVarFieldIndex;
+    prevCtx.activeFieldSource = this.activeFieldSource;
+    prevCtx.colorsArray = this.colorsArray ? new Uint8Array(this.colorsArray) : null;
+    prevCtx.categoryTransparency = this.categoryTransparency ? new Float32Array(this.categoryTransparency) : null;
+    prevCtx.cellVisibilityMask = previousCellVisibilityMask;
+    prevCtx.outlierQuantilesArray = this.outlierQuantilesArray ? new Float32Array(this.outlierQuantilesArray) : null;
+    prevCtx.centroidPositions = this.centroidPositions ? new Float32Array(this.centroidPositions) : null;
+    prevCtx.centroidColors = this.centroidColors ? new Uint8Array(this.centroidColors) : null;
+    prevCtx.centroidOutliers = this.centroidOutliers ? new Float32Array(this.centroidOutliers) : null;
+    prevCtx.centroidLabels = this.centroidLabels ? this.centroidLabels.map(c => c ? { ...c } : c) : [];
+    prevCtx.filteredCount = this.filteredCount ? { ...this.filteredCount } : { shown: this.pointCount, total: this.pointCount };
+    prevCtx.dimensionLevel = this.activeDimensionLevel;
+
+    this.activeViewId = key;
     if (this.viewer && typeof this.viewer.setViewLayout === 'function') {
       this.viewer.setViewLayout('grid', this.activeViewId);
     }
@@ -233,6 +278,7 @@ export const viewContextCoreMethods = {
     this.activeFieldSource = ctx.activeFieldSource ?? null;
     this.colorsArray = ctx.colorsArray ? new Uint8Array(ctx.colorsArray) : null;
     this.categoryTransparency = ctx.categoryTransparency ? new Float32Array(ctx.categoryTransparency) : null;
+    this.cellVisibilityMask = nextCellVisibilityMask;
     this.outlierQuantilesArray = ctx.outlierQuantilesArray ? new Float32Array(ctx.outlierQuantilesArray) : null;
     this.centroidPositions = ctx.centroidPositions ? new Float32Array(ctx.centroidPositions) : null;
     this.centroidColors = ctx.centroidColors ? new Uint8Array(ctx.centroidColors) : null;
@@ -259,11 +305,10 @@ export const viewContextCoreMethods = {
     this._rebuildLabelLayerFromCentroids();
     this._pushColorsToViewer();
     this._pushTransparencyToViewer();
-    this._pushOutliersToViewer();
     this._pushCentroidsToViewer();
-    this._pushOutlierThresholdToViewer(this.getCurrentOutlierThreshold());
     this.updateFilterSummary();
     this._syncActiveContext();
+    this._notifyVisibilityChange();
     return this.activeViewId;
   },
 
@@ -290,28 +335,28 @@ export const viewContextCoreMethods = {
 
   removeView(viewId) {
     const key = String(viewId);
-    this.viewContexts.delete(key);
     if (String(this.activeViewId) === key) {
       this.setActiveView('live');
     }
+    this.viewContexts.delete(key);
   },
 
   clearSnapshotViews() {
-    const liveCtx = this.viewContexts.get('live') || this._buildContextFromCurrent('live', { cloneArrays: false });
+    this.setActiveView('live');
+    const liveCtx = this.viewContexts.get('live');
     this.viewContexts.clear();
     this.viewContexts.set('live', liveCtx);
-    this.setActiveView('live');
   },
 
   syncSnapshotContexts(snapshotIds) {
     const keep = new Set((snapshotIds || []).map((id) => String(id)));
+    if (!keep.has(String(this.activeViewId)) && this.activeViewId !== 'live') {
+      this.setActiveView('live');
+    }
     const keys = Array.from(this.viewContexts.keys());
     for (const key of keys) {
       if (key === 'live') continue;
       if (!keep.has(String(key))) this.viewContexts.delete(key);
-    }
-    if (!keep.has(String(this.activeViewId)) && this.activeViewId !== 'live') {
-      this.setActiveView('live');
     }
   },
 
@@ -323,4 +368,3 @@ export const viewContextCoreMethods = {
     return String(this.activeViewId) === 'live';
   }
 };
-

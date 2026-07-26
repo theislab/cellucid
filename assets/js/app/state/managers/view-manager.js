@@ -12,6 +12,80 @@ import { viewContextViewerSyncMethods } from './view-context-viewer-sync.js';
 import { getNotificationCenter } from '../../notification-center.js';
 import { isAnnDataActive } from '../../../data/anndata-provider.js';
 
+const SUPPORTED_DIMENSIONS = new Set([1, 2, 3]);
+
+function requireDimensionLevel(level, label = 'Dimension') {
+  if (!Number.isInteger(level) || !SUPPORTED_DIMENSIONS.has(level)) {
+    throw new RangeError(`${label} must be exactly 1, 2, or 3.`);
+  }
+  return level;
+}
+
+function requireViewId(viewId) {
+  if (typeof viewId !== 'string' || viewId.trim().length === 0) {
+    throw new TypeError('Dimension view id must be a non-empty string.');
+  }
+  return viewId;
+}
+
+function requireDimensionChangeOptions(options) {
+  if (
+    options === null ||
+    typeof options !== 'object' ||
+    Array.isArray(options) ||
+    Object.keys(options).length !== 1 ||
+    !Object.hasOwn(options, 'viewId')
+  ) {
+    throw new TypeError(
+      'Dimension options must contain exactly one "viewId".'
+    );
+  }
+  return Object.freeze({ viewId: requireViewId(options.viewId) });
+}
+
+function requireMethod(owner, methodName, label) {
+  if (
+    owner === null ||
+    typeof owner !== 'object' ||
+    typeof owner[methodName] !== 'function'
+  ) {
+    throw new TypeError(`${label} must provide ${methodName}().`);
+  }
+}
+
+function cloneCentroidState(owner) {
+  return Object.freeze({
+    positions: owner.centroidPositions === null
+      ? null
+      : new Float32Array(owner.centroidPositions),
+    colors: owner.centroidColors === null
+      ? null
+      : new Uint8Array(owner.centroidColors),
+    outliers: owner.centroidOutliers === null
+      ? null
+      : new Float32Array(owner.centroidOutliers),
+    labels: owner.centroidLabels.map(label => (
+      label === null ? null : { ...label }
+    )),
+  });
+}
+
+function requireStagedCentroids(owner, label) {
+  if (
+    !(owner.centroidPositions instanceof Float32Array) ||
+    owner.centroidPositions.length % 3 !== 0 ||
+    !(owner.centroidColors instanceof Uint8Array) ||
+    owner.centroidColors.length !==
+      (owner.centroidPositions.length / 3) * 4 ||
+    !(owner.centroidOutliers instanceof Float32Array) ||
+    owner.centroidOutliers.length !== owner.centroidPositions.length / 3 ||
+    !Array.isArray(owner.centroidLabels)
+  ) {
+    throw new TypeError(`${label} produced incomplete centroid buffers.`);
+  }
+  return cloneCentroidState(owner);
+}
+
 export class DataStateViewMethods {
 
   // --- Batch mode for bulk operations -----------------------------------------
@@ -60,9 +134,50 @@ export class DataStateViewMethods {
    * @param {DimensionManager} manager - The dimension manager
    */
   setDimensionManager(manager) {
+    for (const methodName of [
+      'getAvailableDimensions',
+      'getDefaultDimension',
+      'getPositions3D',
+      'hasDimension',
+      'setViewDimension',
+    ]) {
+      requireMethod(manager, methodName, 'Dimension manager');
+    }
+    const defaultDimension = requireDimensionLevel(
+      manager.getDefaultDimension(),
+      'Dimension manager default dimension'
+    );
+    const availableDimensions = manager.getAvailableDimensions();
+    if (!Array.isArray(availableDimensions)) {
+      throw new TypeError(
+        'Dimension manager available dimensions must be an array.'
+      );
+    }
+    let previousDimension = 0;
+    for (const dimension of availableDimensions) {
+      requireDimensionLevel(
+        dimension,
+        'Dimension manager available dimension'
+      );
+      if (dimension <= previousDimension) {
+        throw new TypeError(
+          'Dimension manager available dimensions must be strictly increasing.'
+        );
+      }
+      previousDimension = dimension;
+    }
+    if (
+      availableDimensions.length > 0 &&
+      !availableDimensions.includes(defaultDimension)
+    ) {
+      throw new RangeError(
+        'Dimension manager default dimension must be advertised as available.'
+      );
+    }
     this.dimensionManager = manager;
-    if (manager) {
-      this.activeDimensionLevel = manager.getDefaultDimension();
+    this.activeDimensionLevel = defaultDimension;
+    if (availableDimensions.includes(defaultDimension)) {
+      manager.setViewDimension('live', defaultDimension);
     }
   }
 
@@ -75,42 +190,76 @@ export class DataStateViewMethods {
    * @param {import('../../../data/vector-field-manager.js').VectorFieldManager | null} manager
    */
   setVectorFieldManager(manager) {
-    this.vectorFieldManager = manager || null;
-    this.emit?.('vectorFields:changed', this.getAvailableVectorFields?.() || []);
+    if (
+      manager !== null &&
+      (
+        typeof manager !== 'object' ||
+        typeof manager.hasAny !== 'function' ||
+        typeof manager.getAvailableFields !== 'function' ||
+        typeof manager.getDefaultFieldId !== 'function' ||
+        typeof manager.hasField !== 'function' ||
+        typeof manager.hasFieldDimension !== 'function' ||
+        typeof manager.loadField !== 'function'
+      )
+    ) {
+      throw new TypeError(
+        'setVectorFieldManager requires null or the exact vector-field manager interface.'
+      );
+    }
+    this.vectorFieldManager = manager;
+    this.emit(
+      'vectorFields:changed',
+      manager === null ? [] : manager.getAvailableFields()
+    );
   }
 
   getVectorFieldManager() {
-    return this.vectorFieldManager || null;
+    return this.vectorFieldManager;
   }
 
   hasAnyVectorFields() {
-    return Boolean(this.vectorFieldManager?.hasAny?.());
+    return this.vectorFieldManager === null
+      ? false
+      : this.vectorFieldManager.hasAny();
   }
 
   /**
    * @returns {{ id: string, label: string, availableDimensions: number[], defaultDimension: number }[]}
    */
   getAvailableVectorFields() {
-    return this.vectorFieldManager?.getAvailableFields?.() || [];
+    return this.vectorFieldManager === null
+      ? []
+      : this.vectorFieldManager.getAvailableFields();
   }
 
   /**
    * @returns {string|null}
    */
   getDefaultVectorFieldId() {
-    return this.vectorFieldManager?.getDefaultFieldId?.() || null;
+    return this.vectorFieldManager === null
+      ? null
+      : this.vectorFieldManager.getDefaultFieldId();
   }
 
   hasVectorField(fieldId) {
-    const id = String(fieldId || '');
-    if (!id) return false;
-    return Boolean(this.vectorFieldManager?.hasField?.(id));
+    if (typeof fieldId !== 'string' || fieldId.length === 0) {
+      throw new TypeError('Vector field id must be a non-empty string.');
+    }
+    return this.vectorFieldManager === null
+      ? false
+      : this.vectorFieldManager.hasField(fieldId);
   }
 
   hasVectorFieldForDimension(fieldId, level) {
-    const id = String(fieldId || '');
-    if (!id) return false;
-    return Boolean(this.vectorFieldManager?.hasFieldDimension?.(id, level));
+    if (typeof fieldId !== 'string' || fieldId.length === 0) {
+      throw new TypeError('Vector field id must be a non-empty string.');
+    }
+    if (!Number.isInteger(level) || level < 1 || level > 3) {
+      throw new RangeError('Vector field dimension must be exactly 1, 2, or 3.');
+    }
+    return this.vectorFieldManager === null
+      ? false
+      : this.vectorFieldManager.hasFieldDimension(fieldId, level);
   }
 
   /**
@@ -118,31 +267,88 @@ export class DataStateViewMethods {
    *
    * @param {string} fieldId
    * @param {number} level
-   * @param {{ silent?: boolean }} [options]
+   * @param {{ silent: boolean }} options
    * @returns {Promise<boolean>}
    */
-  async ensureVectorField(fieldId, level, options = {}) {
-    const id = String(fieldId || '');
-    const dim = Math.max(1, Math.min(3, Math.floor(level || 3)));
-    if (!id) return false;
-    if (!this.vectorFieldManager || !this.vectorFieldManager.hasFieldDimension?.(id, dim)) return false;
-    if (!this.viewer?.setVectorFieldData) return false;
-    if (this.viewer.hasVectorFieldForDimension?.(id, dim)) return true;
+  async ensureVectorField(fieldId, level, options) {
+    if (typeof fieldId !== 'string' || fieldId.length === 0) {
+      throw new TypeError('Vector field id must be a non-empty string.');
+    }
+    if (!Number.isInteger(level) || level < 1 || level > 3) {
+      throw new RangeError('Vector field dimension must be exactly 1, 2, or 3.');
+    }
+    if (
+      options === null ||
+      typeof options !== 'object' ||
+      Array.isArray(options) ||
+      Object.keys(options).length !== 1 ||
+      !Object.hasOwn(options, 'silent') ||
+      typeof options.silent !== 'boolean'
+    ) {
+      throw new TypeError(
+        'ensureVectorField options must contain exactly one boolean "silent".'
+      );
+    }
+    if (this.vectorFieldManager === null) {
+      throw new Error('No vector-field manager is active.');
+    }
+    if (!this.vectorFieldManager.hasField(fieldId)) {
+      throw new Error(`Unknown vector field "${fieldId}".`);
+    }
+    if (!this.vectorFieldManager.hasFieldDimension(fieldId, level)) {
+      throw new Error(
+        `Vector field "${fieldId}" does not declare ${level}D data.`
+      );
+    }
+    if (
+      this.viewer === null ||
+      typeof this.viewer !== 'object' ||
+      typeof this.viewer.setVectorFieldData !== 'function' ||
+      typeof this.viewer.hasVectorFieldForDimension !== 'function'
+    ) {
+      throw new TypeError(
+        'The active viewer must provide vector-field upload and query methods.'
+      );
+    }
+    if (this.viewer.hasVectorFieldForDimension(fieldId, level)) return true;
 
-    const silent = options?.silent === true;
-    const needsLocalNotif = typeof isAnnDataActive === 'function' ? isAnnDataActive() : false;
+    const silent = options.silent;
+    const needsLocalNotif = isAnnDataActive();
     const notifications = (!silent && needsLocalNotif) ? getNotificationCenter() : null;
-    const label = this.vectorFieldManager.getAvailableFields().find((f) => f.id === id)?.label || id;
-    const notifId = notifications?.loading?.(`Loading ${dim}D ${label}…`, { category: 'data' }) || null;
+    const descriptor = this.vectorFieldManager
+      .getAvailableFields()
+      .find((field) => field.id === fieldId);
+    if (descriptor === undefined) {
+      throw new Error(
+        `Vector field "${fieldId}" has no public field descriptor.`
+      );
+    }
+    const notifId = notifications === null
+      ? null
+      : notifications.loading(
+          `Loading ${level}D ${descriptor.label}…`,
+          { category: 'data' }
+        );
 
     try {
-      const fieldData = await this.vectorFieldManager.loadField(id, dim, { showProgress: !silent && !needsLocalNotif });
-      this.viewer.setVectorFieldData(id, dim, fieldData);
-      notifications?.complete?.(notifId, `Loaded ${dim}D ${label}`);
+      const fieldData = await this.vectorFieldManager.loadField(
+        fieldId,
+        level,
+        { showProgress: !silent && !needsLocalNotif }
+      );
+      this.viewer.setVectorFieldData(fieldId, level, fieldData);
+      if (notifications !== null) {
+        notifications.complete(notifId, `Loaded ${level}D ${descriptor.label}`);
+      }
       return true;
-    } catch (err) {
-      notifications?.fail?.(notifId, err?.message || `Failed to load ${dim}D ${label}`);
-      throw err;
+    } catch (error) {
+      if (notifications !== null) {
+        const message = error instanceof Error
+          ? error.message
+          : `Vector field "${fieldId}" rejected with a non-Error value.`;
+        notifications.fail(notifId, message);
+      }
+      throw error;
     }
   }
 
@@ -156,50 +362,60 @@ export class DataStateViewMethods {
 
   /**
    * Get current dimension level for the active view
-   * @returns {number} Dimension level (1, 2, 3, or 4)
+   * @returns {number} Dimension level (1, 2, or 3)
    */
   getDimensionLevel() {
-    return this.activeDimensionLevel;
+    return requireDimensionLevel(
+      this.activeDimensionLevel,
+      'Active dimension'
+    );
   }
 
   /**
    * Get dimension level for a specific view
    * @param {string} viewId - View identifier
-   * @returns {number} Dimension level (1, 2, 3, or 4)
+   * @returns {number} Dimension level (1, 2, or 3)
    */
   getViewDimensionLevel(viewId) {
-    const ctx = this.viewContexts.get(String(viewId));
-    if (ctx && ctx.dimensionLevel !== undefined) {
-      return ctx.dimensionLevel;
+    const targetViewId = requireViewId(viewId);
+    if (!(this.viewContexts instanceof Map)) {
+      throw new TypeError(
+        'View dimension lookup requires the exact view-context map.'
+      );
     }
-    return this.dimensionManager?.getDefaultDimension() ?? 3;
+    if (!this.viewContexts.has(targetViewId)) {
+      throw new RangeError(`View "${targetViewId}" does not exist.`);
+    }
+    const context = this.viewContexts.get(targetViewId);
+    if (
+      context === null ||
+      typeof context !== 'object' ||
+      Array.isArray(context) ||
+      context.id !== targetViewId
+    ) {
+      throw new TypeError(
+        `View "${targetViewId}" has an invalid dimension context.`
+      );
+    }
+    return requireDimensionLevel(
+      context.dimensionLevel,
+      `View "${targetViewId}" dimension`
+    );
   }
 
   /**
-   * Set dimension level for the active view (or a specific view)
-   * @param {number} level - Dimension level (1, 2, 3, or 4)
-   * @param {Object} options - Options
-   * @param {boolean} options.updateViewer - Whether to update viewer positions
-   * @param {string} options.viewId - Specific view ID to update (defaults to active view)
+   * Set one view to an available 1-D, 2-D, or 3-D embedding.
+   * @param {number} level - Exact dimension level
+   * @param {{ viewId: string }} options - Exact target view
    * @returns {Promise<void>}
    */
-  async setDimensionLevel(level, { updateViewer = true, viewId = null } = {}) {
-    if (!this.dimensionManager) {
-      console.warn('[State] No dimension manager set');
-      return;
-    }
+  async setDimensionLevel(level, options) {
+    const nextLevel = requireDimensionLevel(level);
+    const { viewId: targetViewId } =
+      requireDimensionChangeOptions(options);
 
-    if (!this.dimensionManager.hasDimension(level)) {
-      console.warn(`[State] Dimension ${level}D not available`);
-      return;
-    }
-
-    // Handle 4D error
-    if (level === 4) {
-      throw new Error('4D visualization is not yet implemented');
-    }
-
-    // Serialize async dimension switches so concurrent callers can’t overlap across `await`.
+    // Serialize dimension transactions so their staged coordinates and
+    // centroid buffers cannot overlap across an await boundary.
     while (this._dimensionChangeLock) {
       await this._dimensionChangeLock;
     }
@@ -210,207 +426,284 @@ export class DataStateViewMethods {
     });
 
     try {
-      // Determine which view to update
-      const targetViewId = viewId ?? this.activeViewId;
-      const isActiveView = String(targetViewId) === String(this.activeViewId);
-
-      // Get the view context
-      const ctx = this.viewContexts.get(String(targetViewId));
-      const previousLevel = isActiveView ? this.activeDimensionLevel : (ctx?.dimensionLevel ?? this.activeDimensionLevel);
-
-      // Skip if no change
-      if (previousLevel === level) {
+      for (const methodName of [
+        'getPositions3D',
+        'hasDimension',
+        'setViewDimension',
+      ]) {
+        requireMethod(
+          this.dimensionManager,
+          methodName,
+          'Dimension manager'
+        );
+      }
+      requireMethod(this, 'getFieldForView', 'DataState');
+      requireMethod(this.viewer, 'setViewDimension', 'Viewer');
+      if (!(this.viewContexts instanceof Map)) {
+        throw new TypeError(
+          'Dimension changes require the exact view-context map.'
+        );
+      }
+      if (!this.viewContexts.has(targetViewId)) {
+        throw new RangeError(`View "${targetViewId}" does not exist.`);
+      }
+      const context = this.viewContexts.get(targetViewId);
+      if (
+        context === null ||
+        typeof context !== 'object' ||
+        Array.isArray(context) ||
+        context.id !== targetViewId
+      ) {
+        throw new TypeError(
+          `View "${targetViewId}" has an invalid dimension context.`
+        );
+      }
+      const previousLevel = this.getViewDimensionLevel(targetViewId);
+      const activeViewId = requireViewId(this.activeViewId);
+      const isActiveView = targetViewId === activeViewId;
+      const previousActiveLevel = this.getDimensionLevel();
+      if (isActiveView && previousActiveLevel !== previousLevel) {
+        throw new Error(
+          `Active view "${targetViewId}" has inconsistent dimension state.`
+        );
+      }
+      if (previousLevel === nextLevel) {
         return;
       }
-
-      // Update the view context's dimension level
-      if (ctx) {
-        ctx.dimensionLevel = level;
+      if (this.dimensionManager.hasDimension(nextLevel) !== true) {
+        throw new RangeError(
+          `Dimension ${nextLevel}D is not available in this dataset.`
+        );
       }
 
-      // Update dimension manager's per-view tracking
-      this.dimensionManager.setViewDimension(targetViewId, level);
-
-      // If this is the active view, also update activeDimensionLevel
-      if (isActiveView) {
-        this.activeDimensionLevel = level;
+      const isLiveView = targetViewId === 'live';
+      if (isLiveView) {
+        requireMethod(this.viewer, 'updatePositions', 'Viewer');
+      } else {
+        requireMethod(this.viewer, 'getViewPositions', 'Viewer');
+        requireMethod(this.viewer, 'setViewPositions', 'Viewer');
       }
 
-      // Load positions for the new dimension
-      if (updateViewer && this.viewer) {
+      const field = this.getFieldForView(targetViewId);
+      if (
+        field !== null &&
+        (
+          typeof field !== 'object' ||
+          Array.isArray(field) ||
+          !['category', 'continuous'].includes(field.kind)
+        )
+      ) {
+        throw new TypeError(
+          `View "${targetViewId}" has an invalid active field.`
+        );
+      }
+      const hasCategoricalField =
+        field !== null && field.kind === 'category';
+      if (hasCategoricalField) {
+        requireMethod(
+          this,
+          '_ensureUserDefinedCentroidsForDim',
+          'DataState'
+        );
+        requireMethod(this, 'buildCentroidsForField', 'DataState');
+        requireMethod(this.viewer, 'setCentroidLabels', 'Viewer');
+        requireMethod(
+          this.viewer,
+          isLiveView ? 'setCentroids' : 'updateSnapshotAttributes',
+          'Viewer'
+        );
+      }
+
+      // Coordinates and derived centroid buffers are complete before any
+      // dimension owner publishes the new level.
+      const positions3D =
+        await this.dimensionManager.getPositions3D(nextLevel);
+      if (
+        !(positions3D instanceof Float32Array) ||
+        positions3D.length !== this.pointCount * 3
+      ) {
+        throw new TypeError(
+          `${nextLevel}D positions must contain exactly ` +
+          `${this.pointCount * 3} Float32 values.`
+        );
+      }
+      const previousPositions = isLiveView
+        ? this.positionsArray
+        : this.viewer.getViewPositions(targetViewId);
+      if (
+        !(previousPositions instanceof Float32Array) ||
+        previousPositions.length !== this.pointCount * 3
+      ) {
+        throw new TypeError(
+          `Published positions for view "${targetViewId}" are incomplete.`
+        );
+      }
+
+      const previousGlobalCentroids = cloneCentroidState(this);
+      const previousContextCentroids = cloneCentroidState(context);
+      let stagedCentroids = null;
+      if (hasCategoricalField) {
+        this.activeDimensionLevel = nextLevel;
         try {
-          const positions3D = await this.dimensionManager.getPositions3D(level);
-
-          // IMPORTANT: Use 'live' check, NOT isActiveView, to determine which buffer to update.
-          // Snapshot views should ALWAYS update their snapshot buffers, even if "active" in UI.
-          // Only the live view should update main positions.
-          const isLiveView = String(targetViewId) === 'live';
-
-          if (isLiveView) {
-            // Live view: update main positions
-            this._updateViewerPositions(positions3D);
-
-            // Rebuild centroids for the new dimension
-            // IMPORTANT: Temporarily set activeDimensionLevel so buildCentroidsForField uses correct dimension
-            // Use try/finally to guarantee restoration even if an exception occurs
-            const savedDimLevel = this.activeDimensionLevel;
-            this.activeDimensionLevel = level;
-            try {
-              // Use getFieldForView to get live's field, NOT getActiveField which returns active view's field
-              const liveField = this.getFieldForView('live');
-              if (liveField && liveField.kind === 'category') {
-                this._ensureUserDefinedCentroidsForDim(liveField, level);
-                this.buildCentroidsForField(liveField, { viewId: 'live' });
-                // Push directly to live view's centroid buffers (don't use _pushCentroidsToViewer
-                // which checks activeViewId and might push to wrong view)
-                if (this.viewer) {
-                  this.viewer.setCentroids({
-                    positions: this.centroidPositions || new Float32Array(),
-                    colors: this.centroidColors || new Uint8Array(),
-                    outlierQuantiles: this.centroidOutliers || new Float32Array()
-                  });
-                  if (this.viewer.setCentroidLabels) {
-                    this.viewer.setCentroidLabels(this.centroidLabels, 'live');
-                  }
-                }
-                // Save centroids to live view's context (consistent with snapshot handling)
-                if (ctx) {
-                  ctx.centroidPositions = this.centroidPositions ? new Float32Array(this.centroidPositions) : null;
-                  ctx.centroidColors = this.centroidColors ? new Uint8Array(this.centroidColors) : null;
-                  ctx.centroidOutliers = this.centroidOutliers ? new Float32Array(this.centroidOutliers) : null;
-                  ctx.centroidLabels = this.centroidLabels ? this.centroidLabels.map(c => c ? { ...c } : c) : [];
-                }
-              }
-            } finally {
-              // Restore if live wasn't active (but keep if it was, which was already set above)
-              if (!isActiveView) {
-                this.activeDimensionLevel = savedDimLevel;
-                // IMPORTANT: Restore active view's centroid state since buildCentroidsForField
-                // overwrote it with live's data
-                const activeCtx = this.viewContexts.get(String(this.activeViewId));
-                if (activeCtx) {
-                  this.centroidPositions = activeCtx.centroidPositions ? new Float32Array(activeCtx.centroidPositions) : null;
-                  this.centroidColors = activeCtx.centroidColors ? new Uint8Array(activeCtx.centroidColors) : null;
-                  this.centroidOutliers = activeCtx.centroidOutliers ? new Float32Array(activeCtx.centroidOutliers) : null;
-                  this.centroidLabels = activeCtx.centroidLabels || [];
-                }
-              }
-            }
-          } else {
-            // Snapshot view: update viewer's per-view position cache
-            // The viewer will use this to update the snapshot buffer
-            if (this.viewer.setViewPositions) {
-              this.viewer.setViewPositions(targetViewId, positions3D);
-            }
-
-            // Rebuild centroids for this snapshot view using its new dimension
-            // We need to temporarily set activeDimensionLevel for buildCentroidsForField
-            // Use try/finally to guarantee restoration even if an exception occurs
-            const savedDimLevel = this.activeDimensionLevel;
-            this.activeDimensionLevel = level;
-            try {
-              // Get the field for this snapshot view from its context
-              const snapshotField = this.getFieldForView(targetViewId);
-              if (snapshotField && snapshotField.kind === 'category') {
-                this._ensureUserDefinedCentroidsForDim(snapshotField, level);
-                this.buildCentroidsForField(snapshotField, { viewId: targetViewId });
-                // Update the snapshot's centroid data in viewer
-                if (this.viewer.updateSnapshotAttributes) {
-                  this.viewer.updateSnapshotAttributes(targetViewId, {
-                    centroidPositions: this.centroidPositions || new Float32Array(),
-                    centroidColors: this.centroidColors || new Uint8Array(),
-                    centroidOutliers: this.centroidOutliers || new Float32Array()
-                  });
-                }
-                // Update centroid labels for this view
-                if (this.viewer.setCentroidLabels) {
-                  this.viewer.setCentroidLabels(this.centroidLabels, targetViewId);
-                }
-                // Also save centroids to the view's context
-                if (ctx) {
-                  ctx.centroidPositions = this.centroidPositions ? new Float32Array(this.centroidPositions) : null;
-                  ctx.centroidColors = this.centroidColors ? new Uint8Array(this.centroidColors) : null;
-                  ctx.centroidOutliers = this.centroidOutliers ? new Float32Array(this.centroidOutliers) : null;
-                  ctx.centroidLabels = this.centroidLabels ? this.centroidLabels.map(c => c ? { ...c } : c) : [];
-                }
-              }
-            } finally {
-              // Restore activeDimensionLevel
-              this.activeDimensionLevel = savedDimLevel;
-
-              // IMPORTANT: If this snapshot is not the active view, restore active view's centroid state
-              // since buildCentroidsForField overwrote it with snapshot's data
-              if (!isActiveView) {
-                const activeCtx = this.viewContexts.get(String(this.activeViewId));
-                if (activeCtx) {
-                  this.centroidPositions = activeCtx.centroidPositions ? new Float32Array(activeCtx.centroidPositions) : null;
-                  this.centroidColors = activeCtx.centroidColors ? new Uint8Array(activeCtx.centroidColors) : null;
-                  this.centroidOutliers = activeCtx.centroidOutliers ? new Float32Array(activeCtx.centroidOutliers) : null;
-                  this.centroidLabels = activeCtx.centroidLabels || [];
-                }
-              }
-            }
-          }
-        } catch (err) {
-          console.error(`[State] Failed to load ${level}D positions:`, err);
-          // Revert to previous level
-          if (ctx) ctx.dimensionLevel = previousLevel;
-          if (isActiveView) this.activeDimensionLevel = previousLevel;
-          this.dimensionManager.setViewDimension(targetViewId, previousLevel);
-          throw err;
+          this._ensureUserDefinedCentroidsForDim(field, nextLevel);
+          this.buildCentroidsForField(field, { viewId: targetViewId });
+          stagedCentroids = requireStagedCentroids(
+            this,
+            `View "${targetViewId}"`
+          );
+        } finally {
+          this.activeDimensionLevel = previousActiveLevel;
+          this.centroidPositions = previousGlobalCentroids.positions;
+          this.centroidColors = previousGlobalCentroids.colors;
+          this.centroidOutliers = previousGlobalCentroids.outliers;
+          this.centroidLabels = previousGlobalCentroids.labels;
         }
       }
 
-      // Update viewer's per-view dimension tracking for multiview rendering
-      if (this.viewer && this.viewer.setViewDimension) {
-        this.viewer.setViewDimension(targetViewId, level);
-      }
+      let positionPublicationAttempted = false;
+      let centroidPublicationAttempted = false;
+      let managerPublicationAttempted = false;
+      let viewerDimensionPublicationAttempted = false;
+      try {
+        positionPublicationAttempted = true;
+        if (isLiveView) {
+          this.viewer.updatePositions(positions3D);
+        } else {
+          this.viewer.setViewPositions(targetViewId, positions3D);
+        }
 
-      // Notify callbacks (only if active view changed, or always for UI sync)
-      if (isActiveView) {
-        this._notifyDimensionChange();
+        if (stagedCentroids !== null) {
+          centroidPublicationAttempted = true;
+          if (isLiveView) {
+            this.viewer.setCentroids({
+              positions: stagedCentroids.positions,
+              colors: stagedCentroids.colors,
+            });
+          } else {
+            this.viewer.updateSnapshotAttributes(targetViewId, {
+              centroidPositions: stagedCentroids.positions,
+              centroidColors: stagedCentroids.colors,
+            });
+          }
+          this.viewer.setCentroidLabels(
+            stagedCentroids.labels,
+            targetViewId
+          );
+        }
+
+        managerPublicationAttempted = true;
+        this.dimensionManager.setViewDimension(
+          targetViewId,
+          nextLevel
+        );
+        viewerDimensionPublicationAttempted = true;
+        this.viewer.setViewDimension(targetViewId, nextLevel);
+
+        if (isLiveView) {
+          this.positionsArray = positions3D;
+        }
+        context.dimensionLevel = nextLevel;
+        if (stagedCentroids !== null) {
+          context.centroidPositions = stagedCentroids.positions;
+          context.centroidColors = stagedCentroids.colors;
+          context.centroidOutliers = stagedCentroids.outliers;
+          context.centroidLabels = stagedCentroids.labels;
+          if (isActiveView) {
+            this.centroidPositions = stagedCentroids.positions;
+            this.centroidColors = stagedCentroids.colors;
+            this.centroidOutliers = stagedCentroids.outliers;
+            this.centroidLabels = stagedCentroids.labels;
+          }
+        }
+        if (isActiveView) {
+          this.activeDimensionLevel = nextLevel;
+          this._notifyDimensionChange();
+        }
+      } catch (error) {
+        context.dimensionLevel = previousLevel;
+        this.activeDimensionLevel = previousActiveLevel;
+        if (isLiveView) {
+          this.positionsArray = previousPositions;
+        }
+        context.centroidPositions = previousContextCentroids.positions;
+        context.centroidColors = previousContextCentroids.colors;
+        context.centroidOutliers = previousContextCentroids.outliers;
+        context.centroidLabels = previousContextCentroids.labels;
+        this.centroidPositions = previousGlobalCentroids.positions;
+        this.centroidColors = previousGlobalCentroids.colors;
+        this.centroidOutliers = previousGlobalCentroids.outliers;
+        this.centroidLabels = previousGlobalCentroids.labels;
+
+        const publicationErrors = [];
+        const restore = operation => {
+          try {
+            operation();
+          } catch (restoreError) {
+            publicationErrors.push(restoreError);
+          }
+        };
+        if (positionPublicationAttempted) {
+          restore(() => {
+            if (isLiveView) {
+              this.viewer.updatePositions(previousPositions);
+            } else {
+              this.viewer.setViewPositions(
+                targetViewId,
+                previousPositions
+              );
+            }
+          });
+        }
+        if (centroidPublicationAttempted) {
+          restore(() => {
+            if (isLiveView) {
+              this.viewer.setCentroids({
+                positions: previousContextCentroids.positions,
+                colors: previousContextCentroids.colors,
+              });
+            } else {
+              this.viewer.updateSnapshotAttributes(targetViewId, {
+                centroidPositions:
+                  previousContextCentroids.positions,
+                centroidColors: previousContextCentroids.colors,
+              });
+            }
+            this.viewer.setCentroidLabels(
+              previousContextCentroids.labels,
+              targetViewId
+            );
+          });
+        }
+        if (managerPublicationAttempted) {
+          restore(() => {
+            this.dimensionManager.setViewDimension(
+              targetViewId,
+              previousLevel
+            );
+          });
+        }
+        if (viewerDimensionPublicationAttempted) {
+          restore(() => {
+            this.viewer.setViewDimension(
+              targetViewId,
+              previousLevel
+            );
+          });
+        }
+        if (publicationErrors.length > 0) {
+          throw new AggregateError(
+            [error, ...publicationErrors],
+            `Dimension publication for view "${targetViewId}" failed ` +
+            'and state restoration was incomplete.'
+          );
+        }
+        throw error;
       }
     } finally {
       if (typeof unlockDimensionChange === 'function') {
         unlockDimensionChange();
       }
       this._dimensionChangeLock = null;
-    }
-  }
-
-  /**
-   * Set dimension level for a specific view (convenience method for multiview)
-   * @param {string} viewId - View identifier
-   * @param {number} level - Dimension level (1, 2, 3, or 4)
-   * @returns {Promise<void>}
-   */
-  async setViewDimensionLevel(viewId, level) {
-    return this.setDimensionLevel(level, { viewId, updateViewer: true });
-  }
-
-  /**
-   * Update viewer with new positions
-   * @param {Float32Array} positions3D - 3D positions array
-   */
-  _updateViewerPositions(positions3D) {
-    if (!this.viewer) return;
-
-    // Store as current positions
-    this.positionsArray = positions3D;
-
-    // Update viewer data
-    if (this.viewer.updatePositions) {
-      this.viewer.updatePositions(positions3D);
-    } else if (this.viewer.setData) {
-      // Full data reload if no incremental update available
-      // Pass dimensionLevel to ensure correct spatial index is built
-      this.viewer.setData({
-        positions: positions3D,
-        colors: this.colorsArray,
-        outlierQuantiles: this.outlierQuantilesArray,
-        transparency: this.categoryTransparency,
-        dimensionLevel: this.activeDimensionLevel
-      });
     }
   }
 
@@ -424,28 +717,32 @@ export class DataStateViewMethods {
   }
 
   /**
-   * Reset dimension level without loading positions (for dataset reload)
-   * Used when switching datasets - positions are already loaded via initScene
-   * @param {number} level - New dimension level
-   */
-  resetDimensionLevel(level) {
-    this.activeDimensionLevel = level;
-
-    // Clear all view context dimension levels
-    for (const ctx of this.viewContexts.values()) {
-      ctx.dimensionLevel = level;
-    }
-
-    // Notify callbacks
-    this._notifyDimensionChange();
-  }
-
-  /**
    * Get available dimensions from dimension manager
    * @returns {number[]} Array of available dimension levels
    */
   getAvailableDimensions() {
-    return this.dimensionManager?.getAvailableDimensions() ?? [3];
+    requireMethod(
+      this.dimensionManager,
+      'getAvailableDimensions',
+      'Dimension manager'
+    );
+    const dimensions = this.dimensionManager.getAvailableDimensions();
+    if (!Array.isArray(dimensions)) {
+      throw new TypeError(
+        'Dimension manager available dimensions must be an array.'
+      );
+    }
+    let previousDimension = 0;
+    for (const dimension of dimensions) {
+      requireDimensionLevel(dimension, 'Available dimension');
+      if (dimension <= previousDimension) {
+        throw new TypeError(
+          'Available dimensions must be strictly increasing.'
+        );
+      }
+      previousDimension = dimension;
+    }
+    return dimensions;
   }
 
   /**
@@ -454,7 +751,13 @@ export class DataStateViewMethods {
    * @returns {boolean}
    */
   hasDimension(dim) {
-    return this.dimensionManager?.hasDimension(dim) ?? (dim === 3);
+    const dimension = requireDimensionLevel(dim);
+    requireMethod(this.dimensionManager, 'hasDimension', 'Dimension manager');
+    const result = this.dimensionManager.hasDimension(dimension);
+    if (typeof result !== 'boolean') {
+      throw new TypeError('Dimension manager hasDimension() must return a boolean.');
+    }
+    return result;
   }
 
 }

@@ -91,7 +91,33 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
    * @param {string[]} pageIds - Selected page IDs [pageA, pageB]
    */
   _handleComparisonChange(pageIds) {
-    this._comparisonPages = pageIds || [];
+    if (!Array.isArray(pageIds) || pageIds.length !== 2) {
+      throw new TypeError(
+        'Differential expression requires exactly two comparison page IDs'
+      );
+    }
+    if (
+      pageIds.some(
+        pageId => typeof pageId !== 'string' || pageId.length === 0
+      )
+    ) {
+      throw new TypeError(
+        'Differential expression comparison page IDs must be non-empty strings'
+      );
+    }
+    if (pageIds[0] === pageIds[1]) {
+      throw new TypeError(
+        'Differential expression comparison pages must be different'
+      );
+    }
+    for (const pageId of pageIds) {
+      if (this.dataLayer.getCellCountForPageId(pageId) === 0) {
+        throw new RangeError(
+          `Differential expression page "${pageId}" has zero cells and cannot be selected`
+        );
+      }
+    }
+    this._comparisonPages = [...pageIds];
   }
 
   /**
@@ -154,8 +180,10 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     // Page comparison selector (handles 2+ pages elegantly)
     const pageSelector = createPageComparisonSelector({
       pages: availablePages.length > 0 ? availablePages : pages,
-      selectedIds: this._comparisonPages.length === 2 ? this._comparisonPages : this._selectedPages.slice(0, 2),
-      onChange: this._handleComparisonChange
+      selectedIds: this._comparisonPages,
+      onChange: this._handleComparisonChange,
+      getCellCountForPageId: pageId =>
+        this.dataLayer.getCellCountForPageId(pageId)
     });
     wrapper.appendChild(pageSelector);
 
@@ -192,25 +220,60 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     };
   }
 
+  _validateForm(formValues) {
+    if (this._comparisonPages.length !== 2) {
+      return {
+        valid: false,
+        error: 'Select two non-empty cell groups to run differential expression'
+      };
+    }
+    if (formValues.method !== 'wilcox' && formValues.method !== 'ttest') {
+      return {
+        valid: false,
+        error: 'Select a supported differential expression method'
+      };
+    }
+    return { valid: true };
+  }
+
   /**
    * Run the differential expression analysis
    * @param {Object} formValues - Form values
    * @returns {Promise<Object>} Analysis result
    */
   async _runAnalysisImpl(formValues) {
-    // Use comparison pages if set, otherwise fall back to first two selected pages
-    const [pageA, pageB] = this._comparisonPages.length === 2
-      ? this._comparisonPages
-      : this._selectedPages.slice(0, 2);
+    if (
+      !Array.isArray(this._comparisonPages) ||
+      this._comparisonPages.length !== 2
+    ) {
+      throw new Error(
+        'Differential expression requires two selected comparison pages'
+      );
+    }
+    const [pageA, pageB] = this._comparisonPages;
+    if (formValues.method !== 'wilcox' && formValues.method !== 'ttest') {
+      throw new TypeError(
+        'Differential expression method must be wilcox or ttest'
+      );
+    }
+    if (
+      formValues.batchConfig === null ||
+      typeof formValues.batchConfig !== 'object' ||
+      Array.isArray(formValues.batchConfig)
+    ) {
+      throw new TypeError(
+        'Differential expression batchConfig must be an object'
+      );
+    }
 
     // Run differential expression with optimized batch loading
     const deResults = await this.multiVariableAnalysis.differentialExpression({
       pageA,
       pageB,
       geneList: null, // Always test all genes; results are sorted so "top genes" naturally surface.
-      method: formValues.method || 'wilcox',
+      method: formValues.method,
       parallelism: formValues.parallelism,
-      batchConfig: formValues.batchConfig || {},
+      batchConfig: formValues.batchConfig,
       onProgress: (progress) => this._updateProgress(progress)
     });
 
@@ -290,46 +353,33 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
   /**
    * Keep the DE ProgressTracker in sync with MultiVariableAnalysis progress emissions.
    * @private
-   * @param {{ phase?: string, progress?: number, loaded?: number, total?: number, message?: string }|number} progress
+   * @param {{ phase: string, progress: number, loaded: number, total: number, message: string }} progress
    */
   _updateProgress(progress) {
     if (!this._progressTracker) return;
-
-    // Back-compat: older callers may pass a numeric percent.
-    if (Number.isFinite(progress)) {
-      this._progressTracker.setPhase('Loading & Computing');
-      this._progressTracker.setTotalItems(100);
-      this._progressTracker.setCompletedItems(Math.floor(progress));
-      return;
+    if (!progress || typeof progress !== 'object' || Array.isArray(progress)) {
+      throw new TypeError('Differential expression progress must be an object');
     }
-
-    const { phase, progress: percent, loaded, total, message } = progress || {};
-
-    if (typeof phase === 'string' && phase.length > 0) {
-      const prevPhase = this._progressTracker.getStats()?.phase;
-      if (prevPhase !== phase) {
-        this._progressTracker.setPhase(phase);
-        this._progressTracker.setTotalItems(100);
-        this._progressTracker.setCompletedItems(0);
-      } else {
-        this._progressTracker.setPhase(phase);
-      }
+    const { phase, progress: percent, loaded, total, message } = progress;
+    if (typeof phase !== 'string' || phase.length === 0) {
+      throw new TypeError('Differential expression progress phase must be non-empty text');
     }
-
-    if (Number.isFinite(total) && total > 0) {
-      this._progressTracker.setTotalItems(total);
+    if (!Number.isFinite(percent) || percent < 0 || percent > 100) {
+      throw new RangeError('Differential expression progress percent must be between 0 and 100');
     }
-
-    if (Number.isFinite(loaded)) {
-      this._progressTracker.setCompletedItems(loaded);
-    } else if (Number.isFinite(percent)) {
-      if (!Number.isFinite(total) || total <= 0) this._progressTracker.setTotalItems(100);
-      this._progressTracker.setCompletedItems(Math.floor(percent));
+    if (!Number.isSafeInteger(total) || total < 1) {
+      throw new RangeError('Differential expression progress total must be a positive integer');
     }
-
-    if (message) {
-      this._progressTracker.setMessage(message);
+    if (!Number.isSafeInteger(loaded) || loaded < 0 || loaded > total) {
+      throw new RangeError('Differential expression progress loaded must be within total');
     }
+    if (typeof message !== 'string' || message.length === 0) {
+      throw new TypeError('Differential expression progress message must be non-empty text');
+    }
+    this._progressTracker.setPhase(phase);
+    this._progressTracker.setTotalItems(total);
+    this._progressTracker.setCompletedItems(loaded);
+    this._progressTracker.setMessage(message);
   }
 
   // ===========================================================================
@@ -419,7 +469,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     let downregulated = 0;
 
     for (const row of results) {
-      const pVal = useAdjustedPValue ? (row.adjustedPValue ?? row.pValue) : row.pValue;
+      const pVal = useAdjustedPValue ? row.adjustedPValue : row.pValue;
       if (!isFiniteNumber(pVal) || !isFiniteNumber(row.log2FoldChange)) continue;
 
       const isSignificant = pVal < pValueThreshold && Math.abs(row.log2FoldChange) >= foldChangeThreshold;
@@ -489,7 +539,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
 
     const getPValue = (row) => {
       if (!row) return null;
-      const raw = useAdjustedPValue ? (row.adjustedPValue ?? row.pValue) : row.pValue;
+      const raw = useAdjustedPValue ? row.adjustedPValue : row.pValue;
       return isFiniteNumber(raw) ? raw : null;
     };
 
@@ -576,6 +626,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
 
     const formatPValueCell = (p) => {
       if (p === null) return 'N/A';
+      if (p === 0) return '0';
       if (p < 0.001) return '<0.001';
       return p.toFixed(4);
     };
@@ -677,18 +728,71 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
   }
 
   importSettings(settings) {
-    if (!settings) return;
-    if (Array.isArray(settings.comparisonPages)) {
-      this._comparisonPages = settings.comparisonPages.slice(0, 2);
+    const base = this._requireExactFormSettings(
+      settings,
+      [
+        'comparisonPages',
+        'formControls',
+        'modalGeneListMode',
+        'selectedPages'
+      ]
+    );
+    if (
+      !Array.isArray(settings.comparisonPages) ||
+      (settings.comparisonPages.length !== 0 &&
+        settings.comparisonPages.length !== 2)
+    ) {
+      throw new TypeError(
+        'Differential expression comparisonPages must contain zero or two page IDs'
+      );
     }
-    if (settings.modalGeneListMode === 'all' ||
-      settings.modalGeneListMode === 'top5' ||
-      settings.modalGeneListMode === 'top10' ||
-      settings.modalGeneListMode === 'top20' ||
-      settings.modalGeneListMode === 'top100') {
-      this._modalGeneListMode = settings.modalGeneListMode;
+    const selectedPageIds = new Set(base.selectedPages);
+    const seenComparisonPageIds = new Set();
+    for (const pageId of settings.comparisonPages) {
+      if (typeof pageId !== 'string' || pageId.length === 0) {
+        throw new TypeError(
+          'Differential expression comparison page IDs must be non-empty strings'
+        );
+      }
+      if (!selectedPageIds.has(pageId)) {
+        throw new Error(
+          `Differential expression comparison page "${pageId}" is not selected`
+        );
+      }
+      if (seenComparisonPageIds.has(pageId)) {
+        throw new TypeError(
+          `Differential expression comparison page "${pageId}" is duplicated`
+        );
+      }
+      seenComparisonPageIds.add(pageId);
     }
-    super.importSettings(settings);
+    const geneListModes = new Set([
+      'all',
+      'top5',
+      'top10',
+      'top20',
+      'top100'
+    ]);
+    if (!geneListModes.has(settings.modalGeneListMode)) {
+      throw new TypeError(
+        'Differential expression modalGeneListMode is unsupported'
+      );
+    }
+    if (
+      base.formControls.method?.type !== 'value' ||
+      (
+        base.formControls.method.value !== 'ttest' &&
+        base.formControls.method.value !== 'wilcox'
+      )
+    ) {
+      throw new TypeError(
+        'Differential expression method control is unsupported'
+      );
+    }
+
+    this._comparisonPages = [...settings.comparisonPages];
+    this._modalGeneListMode = settings.modalGeneListMode;
+    this._applyFormSettings(base);
   }
 }
 
@@ -698,7 +802,9 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
  * @returns {DEAnalysisUI}
  */
 export function createDEAnalysisUI(options) {
-  return new DEAnalysisUI(options);
+  const ui = new DEAnalysisUI(options);
+  ui.init(options.container);
+  return ui;
 }
 
 export default DEAnalysisUI;

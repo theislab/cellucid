@@ -31,66 +31,197 @@
  */
 
 import { toCacheScopeKey, toFileRecordKey, toFileShaIndexKey } from './cache-scope.js';
+import {
+  assertMergesDocument,
+  assertUserDocument,
+  parseExactJson,
+} from './wire-contract.js';
 
 const DB_NAME = 'cellucid_community_annotation_file_cache';
 const DB_VERSION = 1;
 const STORE_NAME = 'files';
 
-function toCleanString(value) {
-  return String(value ?? '').trim();
+function cacheUnavailable(message, cause = null) {
+  const error = new Error(message);
+  error.code = 'LOCAL_RAW_CACHE_UNAVAILABLE';
+  if (cause) error.cause = cause;
+  return error;
 }
 
-function safeJsonParse(text) {
+function abortTransactionAfterFailure(transaction, primaryError, context) {
+  let cleanupError = null;
   try {
-    return JSON.parse(text);
-  } catch {
-    return null;
+    if (!transaction || typeof transaction.abort !== 'function') {
+      throw new TypeError(`${context} transaction must expose abort()`);
+    }
+    transaction.abort();
+  } catch (error) {
+    cleanupError = error;
   }
+  if (cleanupError === null) return primaryError;
+  return new AggregateError(
+    [primaryError, cleanupError],
+    `${context} failed and its IndexedDB transaction could not be aborted`
+  );
+}
+
+function assertCachePath(value) {
+  if (typeof value !== 'string' || value !== value.trim() || value.length > 512) {
+    throw new Error('Community annotation cache path must be an exact string');
+  }
+  if (
+    value !== 'annotations/moderation/merges.json' &&
+    !/^annotations\/users\/ghid_[1-9][0-9]*\.json$/.test(value)
+  ) {
+    throw new Error(`Unsupported community annotation cache path ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
+function assertCacheSha(value) {
+  if (typeof value !== 'string' || !/^[0-9a-f]{40}$/.test(value)) {
+    throw new Error('Community annotation cache SHA must be exactly 40 lowercase hexadecimal characters');
+  }
+  return value;
+}
+
+function assertCachePrefixes(value) {
+  if (value === null) return null;
+  if (!Array.isArray(value)) {
+    throw new Error('Community annotation cache prefixes must be an array or null');
+  }
+  const allowed = new Set([
+    'annotations/users/',
+    'annotations/moderation/',
+  ]);
+  const seen = new Set();
+  return value.map((prefix, index) => {
+    if (!allowed.has(prefix)) {
+      throw new Error(
+        `Community annotation cache prefix ${index} is not supported`
+      );
+    }
+    if (seen.has(prefix)) {
+      throw new Error(
+        `Community annotation cache prefix ${JSON.stringify(prefix)} is duplicated`
+      );
+    }
+    seen.add(prefix);
+    return prefix;
+  });
+}
+
+function assertCacheDocument(path, document) {
+  if (path === 'annotations/moderation/merges.json') {
+    assertMergesDocument(document, { path });
+    return document;
+  }
+  const filename = path.slice('annotations/users/'.length);
+  assertUserDocument(document, { path, filename });
+  return document;
+}
+
+function assertCacheRecord(record, { key, scopeKey, path }) {
+  if (
+    !record ||
+    typeof record !== 'object' ||
+    Array.isArray(record) ||
+    Object.keys(record).length !== 6 ||
+    !Object.hasOwn(record, 'key') ||
+    !Object.hasOwn(record, 'scopeKey') ||
+    !Object.hasOwn(record, 'path') ||
+    !Object.hasOwn(record, 'sha') ||
+    !Object.hasOwn(record, 'json') ||
+    !Object.hasOwn(record, 'storedAt')
+  ) {
+    throw new Error(
+      'Community annotation IndexedDB record must contain exactly key, scopeKey, path, sha, json, and storedAt'
+    );
+  }
+  if (
+    record.key !== key ||
+    record.scopeKey !== scopeKey ||
+    record.path !== path
+  ) {
+    throw new Error(
+      'Community annotation IndexedDB record identity does not match its cache key'
+    );
+  }
+  if (!Number.isSafeInteger(record.storedAt) || record.storedAt < 0) {
+    throw new Error(
+      'Community annotation IndexedDB record storedAt must be a nonnegative safe integer'
+    );
+  }
+  return {
+    sha: assertCacheSha(record.sha),
+    json: assertCacheDocument(path, record.json),
+  };
 }
 
 function readShaIndex(scope) {
   const key = toFileShaIndexKey(scope);
-  if (!key) return {};
-  try {
-    const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(key) : null;
-    const parsed = raw ? safeJsonParse(raw) : null;
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-    /** @type {Record<string, string>} */
-    const out = {};
-    for (const [p, sha] of Object.entries(parsed)) {
-      const path = toCleanString(p);
-      const s = toCleanString(sha);
-      if (!path || !s) continue;
-      if (path.length > 512 || s.length > 128) continue;
-      out[path] = s;
-    }
-    return out;
-  } catch {
-    return {};
+  if (!key) throw new Error('Community annotation cache scope is incomplete');
+  if (typeof localStorage === 'undefined') {
+    throw cacheUnavailable('localStorage is unavailable for the annotation SHA index');
   }
+  const raw = localStorage.getItem(key);
+  if (raw === null) return {};
+  let parsed;
+  try {
+    parsed = parseExactJson(raw, { path: `annotation SHA index ${key}` });
+  } catch (error) {
+    const invalid = new Error(`Invalid community annotation SHA index JSON at ${key}`);
+    invalid.code = 'LOCAL_RAW_CACHE_CORRUPT';
+    invalid.cause = error;
+    throw invalid;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    const invalid = new Error(`Community annotation SHA index at ${key} must be an object`);
+    invalid.code = 'LOCAL_RAW_CACHE_CORRUPT';
+    throw invalid;
+  }
+  /** @type {Record<string, string>} */
+  const out = {};
+  for (const [path, sha] of Object.entries(parsed)) {
+    try {
+      assertCachePath(path);
+      assertCacheSha(sha);
+    } catch (cause) {
+      const invalid = new Error(`Community annotation SHA index at ${key} is invalid`);
+      invalid.code = 'LOCAL_RAW_CACHE_CORRUPT';
+      invalid.cause = cause;
+      throw invalid;
+    }
+    out[path] = sha;
+  }
+  return out;
 }
 
 function writeShaIndex(scope, map) {
   const key = toFileShaIndexKey(scope);
-  if (!key) return false;
-  try {
-    const next = (map && typeof map === 'object') ? map : {};
-    const payload = JSON.stringify(next);
-    if (typeof localStorage !== 'undefined') localStorage.setItem(key, payload);
-    return true;
-  } catch {
-    return false;
+  if (!key) throw new Error('Community annotation cache scope is incomplete');
+  if (!map || typeof map !== 'object' || Array.isArray(map)) {
+    throw new Error('Community annotation SHA index must be an object');
   }
+  for (const [path, sha] of Object.entries(map)) {
+    assertCachePath(path);
+    assertCacheSha(sha);
+  }
+  const payload = JSON.stringify(map);
+  if (typeof localStorage === 'undefined') {
+    throw new Error('localStorage is unavailable for the annotation SHA index');
+  }
+  localStorage.setItem(key, payload);
+  return true;
 }
 
 function deleteShaIndex(scope) {
   const key = toFileShaIndexKey(scope);
-  if (!key) return;
-  try {
-    if (typeof localStorage !== 'undefined') localStorage.removeItem(key);
-  } catch {
-    // ignore
+  if (!key) throw new Error('Community annotation cache scope is incomplete');
+  if (typeof localStorage === 'undefined') {
+    throw cacheUnavailable('localStorage is unavailable for the annotation SHA index');
   }
+  localStorage.removeItem(key);
 }
 
 export class CommunityAnnotationFileCache {
@@ -99,8 +230,6 @@ export class CommunityAnnotationFileCache {
     this._db = null;
     this._indexedDBAvailable = typeof indexedDB !== 'undefined';
     this._initPromise = null;
-    /** @type {Map<string, Map<string, {sha:string, json:any, storedAt:number}>>} */
-    this._mem = new Map();
   }
 
   /**
@@ -108,18 +237,32 @@ export class CommunityAnnotationFileCache {
    * @returns {Promise<void>}
    */
   async init() {
-    if (this._db || !this._indexedDBAvailable) return;
+    if (this._db) return;
+    if (!this._indexedDBAvailable) {
+      throw cacheUnavailable(
+        'IndexedDB is required for the community annotation raw-file cache'
+      );
+    }
     if (this._initPromise) return this._initPromise;
     this._initPromise = this._openDatabase()
-      .then((db) => { this._db = db; })
-      .catch(() => { this._indexedDBAvailable = false; })
-      .finally(() => { this._initPromise = null; });
+      .then((db) => {
+        this._db = db;
+      })
+      .catch((cause) => {
+        throw cacheUnavailable(
+          'Unable to open the community annotation IndexedDB cache',
+          cause
+        );
+      })
+      .finally(() => {
+        this._initPromise = null;
+      });
     return this._initPromise;
   }
 
   getCacheMode() {
     if (this._db) return 'indexeddb';
-    if (this._indexedDBAvailable === false) return 'memory';
+    if (this._indexedDBAvailable === false) return 'unavailable';
     return 'unknown';
   }
 
@@ -136,33 +279,39 @@ export class CommunityAnnotationFileCache {
         };
 
         request.onerror = () => settleOnce(reject, request.error || new Error('IndexedDB open failed'));
+        request.onblocked = () => settleOnce(
+          reject,
+          new Error('IndexedDB upgrade is blocked by another Cellucid tab')
+        );
 
-        request.onupgradeneeded = (event) => {
+        request.onupgradeneeded = () => {
           const db = request.result;
           try {
-            // Create store if it doesn't exist
-            if (!db.objectStoreNames.contains(STORE_NAME)) {
-              const store = db.createObjectStore(STORE_NAME, { keyPath: 'key' });
-              store.createIndex('scopeKey', 'scopeKey', { unique: false });
-            } else {
-              // Ensure index exists (upgrade safety)
-              const store = request.transaction.objectStore(STORE_NAME);
-              if (!store.indexNames.contains('scopeKey')) {
-                store.createIndex('scopeKey', 'scopeKey', { unique: false });
-              }
+            if (db.objectStoreNames.contains(STORE_NAME)) {
+              throw new Error('Unexpected pre-existing annotation cache store');
             }
+            const store = db.createObjectStore(STORE_NAME, { keyPath: 'key' });
+            store.createIndex('scopeKey', 'scopeKey', { unique: false });
           } catch (err) {
-            try {
-              request.transaction?.abort?.();
-            } catch {
-              // ignore
-            }
-            settleOnce(reject, err);
+            settleOnce(
+              reject,
+              abortTransactionAfterFailure(
+                request.transaction,
+                err,
+                'Community annotation cache upgrade'
+              )
+            );
             return;
           }
         };
 
-        request.onsuccess = () => settleOnce(resolve, request.result);
+        request.onsuccess = () => {
+          if (settled) {
+            request.result.close();
+            return;
+          }
+          settleOnce(resolve, request.result);
+        };
       } catch (err) {
         reject(err);
       }
@@ -172,120 +321,94 @@ export class CommunityAnnotationFileCache {
   getKnownShas(scope, { prefixes = null } = {}) {
     const scopeKey = toCacheScopeKey(scope);
     if (!scopeKey) return {};
+    if (!this._db) {
+      throw cacheUnavailable('Community annotation raw-file cache is not initialized');
+    }
 
-    const list = prefixes == null ? null : (Array.isArray(prefixes) ? prefixes : [prefixes]).map((p) => String(p || ''));
-    const filter = (path, sha) => {
+    const list = assertCachePrefixes(prefixes);
+    const filter = (path) => {
       if (!list) return true;
       return list.some((pfx) => path.startsWith(pfx));
     };
 
-    // Persistent mode: use the localStorage-backed SHA index (fast).
-    if (this._db) {
-      const map = readShaIndex(scope);
-      if (!list) return map;
-      const out = {};
-      for (const [path, sha] of Object.entries(map)) {
-        if (filter(path, sha)) out[path] = sha;
-      }
-      return out;
-    }
-
-    // Memory-only fallback (e.g. IndexedDB blocked): derive known SHAs from the in-memory cache.
-    const bucket = this._mem.get(scopeKey) || null;
-    if (!bucket) return {};
+    const map = readShaIndex(scope);
+    if (!list) return map;
     const out = {};
-    for (const [path, rec] of bucket.entries()) {
-      const p = toCleanString(path).replace(/^\/+/, '');
-      const sha = toCleanString(rec?.sha);
-      if (!p || !sha) continue;
-      if (filter(p, sha)) out[p] = sha;
+    for (const [path, sha] of Object.entries(map)) {
+      if (filter(path)) out[path] = sha;
     }
     return out;
   }
 
   async getJson({ datasetId, repoRef, userId, path }) {
     await this.init();
-    const p = toCleanString(path).replace(/^\/+/, '');
+    const p = assertCachePath(path);
     const scope = { datasetId, repoRef, userId };
     const key = toFileRecordKey(scope, p);
     const scopeKey = toCacheScopeKey(scope);
-    if (!key) return null;
+    if (!key || !scopeKey) throw new Error('Community annotation cache scope is incomplete');
+    if (!this._db) throw cacheUnavailable('Community annotation raw-file cache is not initialized');
 
-    if (!scopeKey) return null;
-
-    if (!this._db) {
-      const bucket = this._mem.get(scopeKey) || null;
-      const rec = bucket ? bucket.get(p) : null;
-      const sha = toCleanString(rec?.sha);
-      const json = rec?.json ?? null;
-      if (!sha || !json || typeof json !== 'object') return null;
-      return { sha, json };
-    }
-
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       try {
         const tx = this._db.transaction([STORE_NAME], 'readonly');
         const store = tx.objectStore(STORE_NAME);
         const req = store.get(key);
         req.onsuccess = () => {
-          const rec = req.result || null;
-          if (!rec || typeof rec !== 'object') {
-            try {
+          try {
+            const rec = req.result ?? null;
+            if (rec === null) {
               const idx = readShaIndex(scope);
-              if (idx[p]) {
-                delete idx[p];
-                writeShaIndex(scope, idx);
+              if (Object.hasOwn(idx, p)) {
+                const invalid = new Error(
+                  `Community annotation cache record ${JSON.stringify(p)} is missing`
+                );
+                invalid.code = 'LOCAL_RAW_CACHE_CORRUPT';
+                reject(invalid);
+                return;
               }
-            } catch {
-              // ignore
+              resolve(null);
+              return;
             }
-            return resolve(null);
-          }
-          const sha = toCleanString(rec.sha);
-          const json = rec.json ?? null;
-          if (!sha || !json || typeof json !== 'object') {
             try {
-              const idx = readShaIndex(scope);
-              if (idx[p]) {
-                delete idx[p];
-                writeShaIndex(scope, idx);
-              }
-            } catch {
-              // ignore
+              const exact = assertCacheRecord(rec, {
+                key,
+                scopeKey,
+                path: p,
+              });
+              resolve(exact);
+            } catch (cause) {
+              const invalid = new Error(
+                `Community annotation cache record ${JSON.stringify(p)} is invalid`
+              );
+              invalid.code = 'LOCAL_RAW_CACHE_CORRUPT';
+              invalid.cause = cause;
+              reject(invalid);
+              return;
             }
-            return resolve(null);
+          } catch (error) {
+            reject(error);
           }
-          resolve({ sha, json });
         };
-        req.onerror = () => resolve(null);
-      } catch {
-        resolve(null);
+        req.onerror = () => reject(req.error || new Error('IndexedDB cache read failed'));
+      } catch (error) {
+        reject(error);
       }
     });
   }
 
   async setJson({ datasetId, repoRef, userId, path, sha, json }) {
     await this.init();
-    const p = toCleanString(path).replace(/^\/+/, '');
-    const s = toCleanString(sha);
-    const doc = json;
+    const p = assertCachePath(path);
+    const s = assertCacheSha(sha);
+    const doc = assertCacheDocument(p, json);
     const scope = { datasetId, repoRef, userId };
     const scopeKey = toCacheScopeKey(scope);
     const key = toFileRecordKey(scope, p);
-    if (!scopeKey || !key || !s) return false;
-    if (!doc || typeof doc !== 'object') return false;
+    if (!scopeKey || !key) throw new Error('Community annotation cache scope is incomplete');
+    if (!this._db) throw cacheUnavailable('Community annotation raw-file cache is not initialized');
 
-    if (!this._db) {
-      let bucket = this._mem.get(scopeKey) || null;
-      if (!bucket) {
-        bucket = new Map();
-        this._mem.set(scopeKey, bucket);
-      }
-      bucket.set(p, { sha: s, json: doc, storedAt: Date.now() });
-      return true;
-    }
-
-    const stored = await new Promise((resolve) => {
+    await new Promise((resolve, reject) => {
       try {
         const tx = this._db.transaction([STORE_NAME], 'readwrite');
         const store = tx.objectStore(STORE_NAME);
@@ -298,14 +421,12 @@ export class CommunityAnnotationFileCache {
           storedAt: Date.now()
         });
         tx.oncomplete = () => resolve(true);
-        tx.onerror = () => resolve(false);
-        tx.onabort = () => resolve(false);
-      } catch {
-        resolve(false);
+        tx.onerror = () => reject(tx.error || new Error('IndexedDB cache write failed'));
+        tx.onabort = () => reject(tx.error || new Error('IndexedDB cache write aborted'));
+      } catch (error) {
+        reject(error);
       }
     });
-
-    if (!stored) return false;
 
     // Update the sha index only after the JSON is safely stored.
     const idx = readShaIndex(scope);
@@ -316,41 +437,32 @@ export class CommunityAnnotationFileCache {
 
   async deletePath({ datasetId, repoRef, userId, path }) {
     await this.init();
-    const p = toCleanString(path).replace(/^\/+/, '');
+    const p = assertCachePath(path);
     const scope = { datasetId, repoRef, userId };
     const key = toFileRecordKey(scope, p);
     const scopeKey = toCacheScopeKey(scope);
-    if (!key) return false;
-    if (!scopeKey) return false;
+    if (!key || !scopeKey) throw new Error('Community annotation cache scope is incomplete');
+    if (!this._db) throw cacheUnavailable('Community annotation raw-file cache is not initialized');
 
-    if (!this._db) {
-      const bucket = this._mem.get(scopeKey) || null;
-      if (bucket) {
-        bucket.delete(p);
-        if (!bucket.size) this._mem.delete(scopeKey);
-      }
-      return true;
-    }
-
-    const ok = await new Promise((resolve) => {
+    await new Promise((resolve, reject) => {
       try {
         const tx = this._db.transaction([STORE_NAME], 'readwrite');
         const store = tx.objectStore(STORE_NAME);
         store.delete(key);
         tx.oncomplete = () => resolve(true);
-        tx.onerror = () => resolve(false);
-        tx.onabort = () => resolve(false);
-      } catch {
-        resolve(false);
+        tx.onerror = () => reject(tx.error || new Error('IndexedDB cache delete failed'));
+        tx.onabort = () => reject(tx.error || new Error('IndexedDB cache delete aborted'));
+      } catch (error) {
+        reject(error);
       }
     });
 
     const idx = readShaIndex(scope);
-    if (idx[p]) {
+    if (Object.hasOwn(idx, p)) {
       delete idx[p];
       writeShaIndex(scope, idx);
     }
-    return ok;
+    return true;
   }
 
   /**
@@ -365,18 +477,20 @@ export class CommunityAnnotationFileCache {
    */
   async getManyJson({ datasetId, repoRef, userId, paths }) {
     await this.init();
-    const list = Array.isArray(paths) ? paths : [];
+    if (!Array.isArray(paths)) {
+      throw new Error('Community annotation cache paths must be an array');
+    }
+    const list = paths.map(assertCachePath);
     const scope = { datasetId, repoRef, userId };
     const scopeKey = toCacheScopeKey(scope);
-    if (!scopeKey || !list.length) return {};
+    if (!scopeKey) throw new Error('Community annotation cache scope is incomplete');
+    if (!list.length) return {};
 
     /** @type {Record<string, {sha:string, json:any}>} */
     const out = {};
-    for (const raw of list.slice(0, 10000)) {
-      const p = toCleanString(raw).replace(/^\/+/, '');
-      if (!p) continue;
+    for (const p of list) {
       const hit = await this.getJson({ datasetId, repoRef, userId, path: p });
-      if (hit?.sha && hit?.json) out[p] = hit;
+      if (hit !== null) out[p] = hit;
     }
     return out;
   }
@@ -398,77 +512,81 @@ export class CommunityAnnotationFileCache {
     await this.init();
     const scope = { datasetId, repoRef, userId };
     const scopeKey = toCacheScopeKey(scope);
-    if (!scopeKey) return {};
+    if (!scopeKey) throw new Error('Community annotation cache scope is incomplete');
+    if (!this._db) throw cacheUnavailable('Community annotation raw-file cache is not initialized');
 
-    const pfxList = prefixes == null
-      ? null
-      : (Array.isArray(prefixes) ? prefixes : [prefixes]).map((p) => String(p || ''));
+    const pfxList = assertCachePrefixes(prefixes);
 
     /** @type {Record<string, {sha:string, json:any}>} */
     const out = {};
 
-    if (!this._db) {
-      const bucket = this._mem.get(scopeKey) || null;
-      if (!bucket) return {};
-      for (const [path, rec] of bucket.entries()) {
-        const p = toCleanString(path).replace(/^\/+/, '');
-        const sha = toCleanString(rec?.sha);
-        const json = rec?.json ?? null;
-        const okPrefix = !pfxList || pfxList.some((pfx) => p.startsWith(pfx));
-        if (okPrefix && p && sha && json && typeof json === 'object') {
-          out[p] = { sha, json };
-        }
-      }
-      return out;
-    }
+    const range = (typeof IDBKeyRange !== 'undefined') ? IDBKeyRange.only(scopeKey) : null;
+    if (!range) throw new Error('IDBKeyRange is unavailable');
 
-    try {
-      const range = (typeof IDBKeyRange !== 'undefined') ? IDBKeyRange.only(scopeKey) : null;
-      if (!range) return {};
-
-      await new Promise((resolve) => {
+    await new Promise((resolve, reject) => {
+      try {
         const tx = this._db.transaction([STORE_NAME], 'readonly');
         const store = tx.objectStore(STORE_NAME);
         const index = store.index('scopeKey');
         const req = index.openCursor(range);
         req.onsuccess = () => {
-          const cursor = req.result;
-          if (!cursor) return;
-          const rec = cursor.value || null;
-          const path = toCleanString(rec?.path).replace(/^\/+/, '');
-          const sha = toCleanString(rec?.sha);
-          const json = rec?.json ?? null;
-          const okPrefix = !pfxList || pfxList.some((pfx) => path.startsWith(pfx));
-          if (okPrefix && path && sha && json && typeof json === 'object') {
-            out[path] = { sha, json };
+          try {
+            const cursor = req.result;
+            if (!cursor) return;
+            const rec = cursor.value ?? null;
+            let path;
+            let sha;
+            let json;
+            try {
+              path = assertCachePath(rec?.path);
+              const key = toFileRecordKey(scope, path);
+              if (key === null) {
+                throw new Error(
+                  'Community annotation cache record key cannot be resolved'
+                );
+              }
+              const exact = assertCacheRecord(rec, {
+                key,
+                scopeKey,
+                path,
+              });
+              sha = exact.sha;
+              json = exact.json;
+            } catch (cause) {
+              const invalid = new Error('Community annotation IndexedDB cache contains an invalid record');
+              invalid.code = 'LOCAL_RAW_CACHE_CORRUPT';
+              invalid.cause = cause;
+              throw invalid;
+            }
+            const okPrefix = !pfxList || pfxList.some((pfx) => path.startsWith(pfx));
+            if (okPrefix) {
+              if (Object.hasOwn(out, path)) {
+                const invalid = new Error(
+                  `Community annotation IndexedDB cache contains duplicate path ${JSON.stringify(path)}`
+                );
+                invalid.code = 'LOCAL_RAW_CACHE_CORRUPT';
+                throw invalid;
+              }
+              out[path] = { sha, json };
+            }
+            cursor.continue();
+          } catch (error) {
+            reject(
+              abortTransactionAfterFailure(
+                tx,
+                error,
+                'Community annotation cache scan'
+              )
+            );
           }
-          cursor.continue();
         };
         tx.oncomplete = () => resolve(true);
-        tx.onerror = () => resolve(false);
-        tx.onabort = () => resolve(false);
-      });
-    } catch {
-      return {};
-    }
-
-    // Repair: if the localStorage-backed SHA index contains paths that are missing from IndexedDB,
-    // future pulls may incorrectly skip re-downloading those files. Drop any missing entries so
-    // the next pull self-heals.
-    try {
-      const idx = readShaIndex(scope);
-      let changed = false;
-      for (const path of Object.keys(idx)) {
-        const okPrefix = !pfxList || pfxList.some((pfx) => path.startsWith(pfx));
-        if (!okPrefix) continue;
-        if (out[path]) continue;
-        delete idx[path];
-        changed = true;
+        tx.onerror = () => reject(tx.error || new Error('IndexedDB cache scan failed'));
+        tx.onabort = () => reject(tx.error || new Error('IndexedDB cache scan aborted'));
+      } catch (error) {
+        reject(error);
       }
-      if (changed) writeShaIndex(scope, idx);
-    } catch {
-      // ignore
-    }
+    });
 
     return out;
   }
@@ -484,59 +602,63 @@ export class CommunityAnnotationFileCache {
    */
   async pruneToPaths({ datasetId, repoRef, userId, keepPaths }) {
     await this.init();
-    const keep = keepPaths instanceof Set ? keepPaths : new Set();
+    if (!(keepPaths instanceof Set)) {
+      throw new Error('Community annotation cache keepPaths must be a Set');
+    }
     const scope = { datasetId, repoRef, userId };
     const scopeKey = toCacheScopeKey(scope);
-    if (!scopeKey) return false;
+    if (!scopeKey) throw new Error('Community annotation cache scope is incomplete');
+    if (!this._db) throw cacheUnavailable('Community annotation raw-file cache is not initialized');
 
     const idx = readShaIndex(scope);
-    const keepSet = new Set([...keep].map((p) => toCleanString(p).replace(/^\/+/, '')).filter(Boolean));
+    const keepSet = new Set([...keepPaths].map(assertCachePath));
 
-    if (!this._db) {
-      const bucket = this._mem.get(scopeKey) || null;
-      if (bucket) {
-        for (const p of [...bucket.keys()]) {
-          const normalized = toCleanString(p).replace(/^\/+/, '');
-          if (!normalized || keepSet.has(normalized)) continue;
-          bucket.delete(p);
-        }
-        if (!bucket.size) this._mem.delete(scopeKey);
-      }
-      return true;
-    }
-
-    // Fast path: update sha index first; then best-effort delete content.
     let changed = false;
     for (const p of Object.keys(idx)) {
       if (keepSet.has(p)) continue;
       delete idx[p];
       changed = true;
     }
-    if (changed) writeShaIndex(scope, idx);
-
-    // Best-effort delete old records in IndexedDB.
-    // (Failure here is not fatal; the sha index prevents skipping downloads for missing files.)
-    try {
-      await new Promise((resolve) => {
+    await new Promise((resolve, reject) => {
+      try {
         const tx = this._db.transaction([STORE_NAME], 'readwrite');
         const store = tx.objectStore(STORE_NAME);
         const index = store.index('scopeKey');
         const req = index.openCursor(IDBKeyRange.only(scopeKey));
         req.onsuccess = () => {
-          const cursor = req.result;
-          if (!cursor) return;
-          const rec = cursor.value || null;
-          const path = toCleanString(rec?.path);
-          if (path && !keepSet.has(path)) cursor.delete();
-          cursor.continue();
+          try {
+            const cursor = req.result;
+            if (!cursor) return;
+            const rec = cursor.value || null;
+            let path;
+            try {
+              path = assertCachePath(rec?.path);
+            } catch (cause) {
+              const invalid = new Error('Community annotation IndexedDB cache contains an invalid path');
+              invalid.code = 'LOCAL_RAW_CACHE_CORRUPT';
+              invalid.cause = cause;
+              throw invalid;
+            }
+            if (!keepSet.has(path)) cursor.delete();
+            cursor.continue();
+          } catch (error) {
+            reject(
+              abortTransactionAfterFailure(
+                tx,
+                error,
+                'Community annotation cache prune'
+              )
+            );
+          }
         };
         tx.oncomplete = () => resolve(true);
-        tx.onerror = () => resolve(false);
-        tx.onabort = () => resolve(false);
-      });
-    } catch {
-      // ignore
-    }
+        tx.onerror = () => reject(tx.error || new Error('IndexedDB cache prune failed'));
+        tx.onabort = () => reject(tx.error || new Error('IndexedDB cache prune aborted'));
+      } catch (error) {
+        reject(error);
+      }
+    });
+    if (changed) writeShaIndex(scope, idx);
     return true;
   }
 
@@ -544,13 +666,11 @@ export class CommunityAnnotationFileCache {
     await this.init();
     const scope = { datasetId, repoRef, userId };
     const scopeKey = toCacheScopeKey(scope);
-    if (!scopeKey) return true;
-    deleteShaIndex(scope);
-    this._mem.delete(scopeKey);
-    if (!this._db) return true;
+    if (!scopeKey) throw new Error('Community annotation cache scope is incomplete');
+    if (!this._db) throw cacheUnavailable('Community annotation raw-file cache is not initialized');
 
-    try {
-      await new Promise((resolve) => {
+    await new Promise((resolve, reject) => {
+      try {
         const tx = this._db.transaction([STORE_NAME], 'readwrite');
         const store = tx.objectStore(STORE_NAME);
         const index = store.index('scopeKey');
@@ -562,13 +682,14 @@ export class CommunityAnnotationFileCache {
           cursor.continue();
         };
         tx.oncomplete = () => resolve(true);
-        tx.onerror = () => resolve(false);
-        tx.onabort = () => resolve(false);
-      });
-    } catch {
-      // ignore
-    }
+        tx.onerror = () => reject(tx.error || new Error('IndexedDB cache clear failed'));
+        tx.onabort = () => reject(tx.error || new Error('IndexedDB cache clear aborted'));
+      } catch (error) {
+        reject(error);
+      }
+    });
 
+    deleteShaIndex(scope);
     return true;
   }
 }

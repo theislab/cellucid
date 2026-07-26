@@ -11,15 +11,14 @@
  * ├── operations.js               # Operation definitions (single source of truth)
  * ├── math-utils.js               # Shared mathematical utilities
  * ├── operation-handlers.js       # Shared operation implementations
- * ├── compute-manager.js          # Main orchestrator (GPU → Worker → CPU)
+ * ├── compute-manager.js          # Exact backend selector
  * ├── gpu-compute.js              # WebGL2 GPU backend
  * ├── worker-pool.js              # Multi-worker pool
- * ├── data-worker.js              # Web worker implementation
- * └── fallback-operations.js      # CPU fallback wrapper
+ * └── data-worker.js              # Web worker implementation
  * ```
  *
  * Recommended Usage:
- * - Use ComputeManager for most operations (handles GPU → Worker → CPU fallback)
+ * - Use ComputeManager to select one declared backend before execution
  * - Use WorkerPool directly for parallel batch processing
  * - Use operation handlers directly for synchronous main-thread processing
  */
@@ -35,12 +34,14 @@ export {
   Operations,
   GPU_CAPABLE_OPERATIONS,
   WORKER_CAPABLE_OPERATIONS,
+  CPU_CAPABLE_OPERATIONS,
 
   // Helper functions
   getOperation,
   isValidOperation,
   isGPUCapable,
   isWorkerCapable,
+  isCPUCapable,
   getOperationsByCategory,
   validatePayload,
   getAllOperationIds,
@@ -78,7 +79,6 @@ export {
 
   // Formatting
   formatNumber,
-  formatPValue,
 
   // Value utilities
   filterNumeric,
@@ -124,15 +124,13 @@ export {
 } from './operation-handlers.js';
 
 // ============================================================================
-// ComputeManager (Recommended - handles GPU → Worker → CPU fallback)
+// ComputeManager
 // ============================================================================
 
 export {
   ComputeManager,
   BackendStatus,
-  getComputeManager,
-  createComputeManager,
-  initComputeManager
+  getComputeManager
 } from './compute-manager.js';
 
 // ============================================================================
@@ -156,19 +154,13 @@ export {
 } from './worker-pool.js';
 
 // ============================================================================
-// Fallback Operations (CPU fallback)
-// ============================================================================
-
-export { executeFallback } from './fallback-operations.js';
-
-// ============================================================================
 // Default Export
 // ============================================================================
 
 // Export the most commonly used items as default
 // Note: re-exports do not create local bindings, so we import explicitly.
-import { getComputeManager, initComputeManager } from './compute-manager.js';
+import { getComputeManager } from './compute-manager.js';
 import { OperationType, Operations } from './operations.js';
 import { getWorkerPool } from './worker-pool.js';
 
-export default { getComputeManager, initComputeManager, OperationType, Operations, getWorkerPool };
+export default { getComputeManager, OperationType, Operations, getWorkerPool };

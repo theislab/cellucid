@@ -21,7 +21,7 @@
  * - Points: `loadPointsBinary`
  * - Manifests: `loadObsManifest`, `loadVarManifest`, `loadConnectivityManifest`
  * - Fields: `loadObsFieldData`, `loadVarFieldData`
- * - Graph edges: `loadEdgeSources`, `loadEdgeDestinations`, `loadEdges`
+ * - Graph edges: `loadEdges`
  * - Dataset identity: `loadDatasetIdentity` (+ embeddings metadata helpers)
  * - Analysis payloads: `loadAnalysisBulkData`, `loadAnalysisBulkObsData`, `loadAnalysisSubset`
  * - Latents: `loadLatentEmbeddings`
@@ -34,7 +34,6 @@
  */
 
 import { LRUCache } from '../shared/lru-cache.js';
-import { getComputeManager } from '../compute/compute-manager.js';
 import { getNotificationCenter } from '../../notification-center.js';
 import { getMemoryMonitor } from '../shared/memory-monitor.js';
 import {
@@ -47,12 +46,7 @@ import {
   loadLatentEmbeddings,
   loadAnalysisBulkObsData
 } from '../../../data/data-loaders.js';
-import {
-  filterFiniteNumbers,
-  mean as computeMean,
-  std as computeStd,
-  median as computeMedian
-} from '../shared/number-utils.js';
+import { filterFiniteNumbers } from '../shared/number-utils.js';
 import { debugWarn } from '../shared/debug-utils.js';
 
 // =============================================================================
@@ -232,9 +226,6 @@ export class DataLayer {
     // Page version tracking for cache correctness
     this._pageVersions = enableVersionTracking ? new Map() : null;
 
-    // Compute manager reference (lazy initialized)
-    this._computeManager = null;
-
     // Notification center reference
     this._notifications = enableNotifications ? getNotificationCenter() : null;
 
@@ -359,8 +350,7 @@ export class DataLayer {
       case 'gene_expression':
         return this._getGeneExpressionVariables();
       default:
-        debugWarn('DataLayer', `Unknown variable type: ${type}`);
-        return [];
+        throw new TypeError(`Unknown variable type: ${String(type)}`);
     }
   }
 
@@ -469,7 +459,14 @@ export class DataLayer {
    * @returns {Object[]} Array of page objects
    */
   getPages() {
-    return this.state.getHighlightPages() || [];
+    if (typeof this.state?.getHighlightPages !== 'function') {
+      throw new TypeError('DataLayer state.getHighlightPages is required');
+    }
+    const pages = this.state.getHighlightPages();
+    if (!Array.isArray(pages)) {
+      throw new TypeError('DataLayer state.getHighlightPages must return an array');
+    }
+    return pages;
   }
 
   /**
@@ -478,12 +475,16 @@ export class DataLayer {
    * @returns {string|null}
    */
   getActiveHighlightPageId() {
-    if (typeof this.state?.getActivePageId === 'function') {
-      return this.state.getActivePageId();
+    if (typeof this.state?.getActivePageId !== 'function') {
+      throw new TypeError(
+        'DataLayer state.getActivePageId is required as the active page owner'
+      );
     }
-    // Fallback: return first page ID if state method unavailable
-    const pages = this.getPages();
-    return pages.length > 0 ? pages[0].id : null;
+    const pageId = this.state.getActivePageId();
+    if (pageId !== null && (typeof pageId !== 'string' || pageId.length === 0)) {
+      throw new TypeError('DataLayer active page ID must be a non-empty string or null');
+    }
+    return pageId;
   }
 
   /**
@@ -492,12 +493,14 @@ export class DataLayer {
    * @returns {string|null}
    */
   getPageColor(pageId) {
-    if (typeof this.state?.getHighlightPageColor === 'function') {
-      return this.state.getHighlightPageColor(pageId);
+    if (typeof this.state?.getHighlightPageColor !== 'function') {
+      throw new TypeError('DataLayer state.getHighlightPageColor is required');
     }
-    const pages = this.getPages();
-    const idx = pages.findIndex((p) => p.id === pageId);
-    return (idx >= 0 && pages[idx]?.color) ? pages[idx].color : null;
+    const color = this.state.getHighlightPageColor(pageId);
+    if (color !== null && (typeof color !== 'string' || color.length === 0)) {
+      throw new TypeError('DataLayer page color must be a non-empty string or null');
+    }
+    return color;
   }
 
   /**
@@ -507,7 +510,9 @@ export class DataLayer {
    * @returns {boolean}
    */
   setPageColor(pageId, color) {
-    if (typeof this.state?.setHighlightPageColor !== 'function') return false;
+    if (typeof this.state?.setHighlightPageColor !== 'function') {
+      throw new TypeError('DataLayer state.setHighlightPageColor is required');
+    }
     return this.state.setHighlightPageColor(pageId, color);
   }
 
@@ -578,7 +583,9 @@ export class DataLayer {
    * console.log(`Page has ${cellIndices.length} cells`);
    */
   getCellIndicesForPage(pageId) {
-    if (!pageId) return [];
+    if (typeof pageId !== 'string' || pageId.length === 0) {
+      throw new TypeError('pageId must be exact non-empty text');
+    }
 
     // Derived "rest-of" page: complement of base page indices
     if (isRestOfPageId(pageId)) {
@@ -619,8 +626,7 @@ export class DataLayer {
 
     const page = this.getPages().find(p => p.id === pageId);
     if (!page) {
-      debugWarn('DataLayer', `Page not found: ${pageId}`);
-      return [];
+      throw new Error(`Page not found: ${pageId}`);
     }
 
     // Collect all cell indices from enabled highlight groups
@@ -661,15 +667,21 @@ export class DataLayer {
       return;
     }
 
-    try {
-      if (source === 'obs' && this.state.ensureFieldLoaded) {
-        await this.state.ensureFieldLoaded(fieldIndex, { silent });
-      } else if (source === 'var' && this.state.ensureVarFieldLoaded) {
-        await this.state.ensureVarFieldLoaded(fieldIndex, { silent });
+    if (source === 'obs') {
+      if (typeof this.state.ensureFieldLoaded !== 'function') {
+        throw new Error('Observation field loader is unavailable');
       }
-    } catch (err) {
-      debugWarn('DataLayer', `Failed to load field at index ${fieldIndex}:`, err);
+      await this.state.ensureFieldLoaded(fieldIndex, { silent });
+      return;
     }
+    if (source === 'var') {
+      if (typeof this.state.ensureVarFieldLoaded !== 'function') {
+        throw new Error('Gene field loader is unavailable');
+      }
+      await this.state.ensureVarFieldLoaded(fieldIndex, { silent });
+      return;
+    }
+    throw new TypeError(`Field source must be exactly "obs" or "var"; received ${String(source)}`);
   }
 
   // ===========================================================================
@@ -867,8 +879,9 @@ export class DataLayer {
     // Get the variable info and field
     const variableInfo = this.getVariableInfo(type, variableKey);
     if (!variableInfo) {
-      debugWarn('DataLayer', `Variable not found: ${variableKey} (type: ${type})`);
-      return [];
+      throw new Error(
+        `Variable not found: ${String(variableKey)} (type: ${String(type)})`
+      );
     }
 
     // Get the source and field
@@ -878,16 +891,14 @@ export class DataLayer {
       : this.state.obsData?.fields;
 
     if (!fields) {
-      debugWarn('DataLayer', `No ${source} fields available`);
-      return [];
+      throw new Error(`No ${source} fields are available`);
     }
 
     const fieldIndex = variableInfo._fieldIndex;
     const field = fields[fieldIndex];
 
     if (!field) {
-      debugWarn('DataLayer', `Field not found at index ${fieldIndex}`);
-      return [];
+      throw new Error(`Field not found at index ${String(fieldIndex)}`);
     }
 
     // Ensure field is loaded - show notification if not already loaded (unless silent)
@@ -928,8 +939,7 @@ export class DataLayer {
       : field.values;
 
     if (!rawValues || rawValues.length === 0) {
-      debugWarn('DataLayer', `No values for field: ${variableKey}`);
-      return [];
+      throw new Error(`No values are available for field: ${variableKey}`);
     }
 
     // Categories for decoding (if categorical)
@@ -941,8 +951,7 @@ export class DataLayer {
     for (const pageId of pageIds) {
       const pageInfo = this.getPageInfo(pageId);
       if (!pageInfo) {
-        debugWarn('DataLayer', `Page not found: ${pageId}`);
-        continue;
+        throw new Error(`Page not found: ${pageId}`);
       }
 
       const cellIndices = this.getCellIndicesForPage(pageId);
@@ -961,25 +970,43 @@ export class DataLayer {
 
       // Extract values for cells in this page
       const values = [];
-      const validIndices = [];
+      const exactIndices = [];
 
       for (const idx of cellIndices) {
-        if (idx >= 0 && idx < rawValues.length) {
-          let value = rawValues[idx];
-
-          // Handle missing values
-          if (value === null || value === undefined || (typeof value === 'number' && !Number.isFinite(value))) {
-            continue;
-          }
-
-          // Decode categorical values
-          if (field.kind === 'category') {
-            value = categories[value] ?? `Unknown (${value})`;
-          }
-
-          values.push(value);
-          validIndices.push(idx);
+        if (
+          !Number.isSafeInteger(idx) ||
+          idx < 0 ||
+          idx >= rawValues.length
+        ) {
+          throw new RangeError(
+            `Cell index ${String(idx)} is outside field "${variableKey}" ` +
+            `length ${rawValues.length}`
+          );
         }
+        let value = rawValues[idx];
+        if (field.kind === 'category') {
+          if (!Number.isSafeInteger(value) || value < 0) {
+            throw new TypeError(
+              `Category code at cell ${idx} for "${variableKey}" must be a non-negative integer`
+            );
+          }
+          if (value === 65_535) {
+            value = null;
+          } else if (value >= categories.length) {
+            throw new RangeError(
+              `Category code ${value} for "${variableKey}" is outside ` +
+              `${categories.length} categories`
+            );
+          } else {
+            value = categories[value];
+          }
+        } else if (typeof value !== 'number' || !Number.isFinite(value)) {
+          throw new TypeError(
+            `Continuous value at cell ${idx} for "${variableKey}" must be finite`
+          );
+        }
+        values.push(value);
+        exactIndices.push(idx);
       }
 
       results.push({
@@ -990,7 +1017,7 @@ export class DataLayer {
           categories: field.kind === 'category' ? categories : undefined
         },
         values,
-        cellIndices: validIndices,
+        cellIndices: exactIndices,
         cellCount: values.length
       });
     }
@@ -1385,32 +1412,16 @@ export class DataLayer {
    * instance without a full page refresh. In those cases, any cached field-index
    * lookups and cached page data must be cleared to avoid cross-dataset cache hits.
    *
-   * Safe to call at any time; it never throws.
    */
   resetForDatasetReload() {
-    try {
-      this.clearAllCaches();
-    } catch {
-      // ignore
+    this.clearAllCaches();
+    if (this._pendingRequests !== null) {
+      this._pendingRequests.clear();
     }
-
-    try {
-      this._pendingRequests?.clear?.();
-    } catch {
-      // ignore
-    }
-
-    try {
-      this._geneFieldIndexByKey = null;
-      this._obsFieldIndexByKey = null;
-    } catch {
-      // ignore
-    }
-
-    try {
-      this._pageVersions?.clear?.();
-    } catch {
-      // ignore
+    this._geneFieldIndexByKey = null;
+    this._obsFieldIndexByKey = null;
+    if (this._pageVersions !== null) {
+      this._pageVersions.clear();
     }
   }
 
@@ -1468,19 +1479,6 @@ export class DataLayer {
   // ===========================================================================
   // BULK GENE EXPRESSION LOADING
   // ===========================================================================
-
-  /**
-   * Get or initialize compute manager
-   * @returns {Promise<Object>}
-   * @private
-   */
-  async _getComputeManager() {
-    if (!this._computeManager) {
-      this._computeManager = getComputeManager();
-      await this._computeManager.init();
-    }
-    return this._computeManager;
-  }
 
   /**
    * Evict old/expired entries from bulk gene cache
@@ -1727,11 +1725,17 @@ export class DataLayer {
       const cached = this._getBulkGeneCache(cacheKey);
       if (cached && (Date.now() - cached.timestamp) < this._bulkGeneCacheMaxAge) {
         if (geneList) {
+          const missingGenes = geneList.filter(
+            gene => !Object.hasOwn(cached.data, gene)
+          );
+          if (missingGenes.length > 0) {
+            throw new Error(
+              `Cached bulk gene data is missing requested genes: ${missingGenes.join(', ')}`
+            );
+          }
           const filtered = {};
           for (const gene of geneList) {
-            if (cached.data[gene]) {
-              filtered[gene] = cached.data[gene];
-            }
+            filtered[gene] = cached.data[gene];
           }
           return filtered;
         }
@@ -1923,9 +1927,6 @@ export class DataLayer {
 
     const startTime = performance.now();
 
-    // Initialize compute manager (handles GPU -> Worker -> CPU fallback automatically)
-    await this._getComputeManager();
-
     const result = {
       genes: {},
       pageData: {},
@@ -1955,43 +1956,49 @@ export class DataLayer {
       const manifestUrl = this.state?.manifestUrl || null;
 
       if (varManifest && manifestUrl) {
-        try {
-          const bulkData = await loadAnalysisBulkData({
-            manifestUrl,
-            varManifest,
-            geneList: genes,
-            batchSize: 20,
-            onProgress: (p) => {
-              const adjustedProgress = includeLatent ? Math.round(p * 0.8) : p;
-              if (onProgress) onProgress(adjustedProgress);
-            }
-          });
-
-          for (const [geneName, values] of Object.entries(bulkData.genes)) {
-            result.genes[geneName] = {};
-
-            for (const pageId of pageIds) {
-              const cellIndices = result.pageData[pageId].cellIndices;
-              const pageValues = new Float32Array(cellIndices.length);
-
-              for (let i = 0; i < cellIndices.length; i++) {
-                const cellIdx = cellIndices[i];
-                pageValues[i] = cellIdx < values.length ? values[cellIdx] : NaN;
-              }
-
-              result.genes[geneName][pageId] = {
-                values: pageValues,
-                cellIndices,
-                pageName: result.pageData[pageId].name,
-                cellCount: cellIndices.length
-              };
-            }
-
-            result.stats.genesLoaded++;
+        const bulkData = await loadAnalysisBulkData({
+          manifestUrl,
+          varManifest,
+          geneList: genes,
+          batchSize: 20,
+          suppressNotifications: true,
+          onProgress: (p) => {
+            const adjustedProgress = includeLatent ? Math.round(p * 0.8) : p;
+            if (onProgress) onProgress(adjustedProgress);
           }
-        } catch (error) {
-          debugWarn('DataLayer', 'Bulk loader failed, falling back to sequential:', error.message);
-          await this._loadGenesSequentially(genes, pageIds, result);
+        });
+
+        for (const [geneName, values] of Object.entries(bulkData.genes)) {
+          result.genes[geneName] = {};
+
+          for (const pageId of pageIds) {
+            const cellIndices = result.pageData[pageId].cellIndices;
+            const pageValues = new Float32Array(cellIndices.length);
+
+            for (let i = 0; i < cellIndices.length; i++) {
+              const cellIdx = cellIndices[i];
+              if (
+                !Number.isSafeInteger(cellIdx) ||
+                cellIdx < 0 ||
+                cellIdx >= values.length
+              ) {
+                throw new RangeError(
+                  `Page "${pageId}" cell index ${String(cellIdx)} is outside ` +
+                  `gene "${geneName}" values length ${values.length}`
+                );
+              }
+              pageValues[i] = values[cellIdx];
+            }
+
+            result.genes[geneName][pageId] = {
+              values: pageValues,
+              cellIndices,
+              pageName: result.pageData[pageId].name,
+              cellCount: cellIndices.length
+            };
+          }
+
+          result.stats.genesLoaded++;
         }
       } else {
         await this._loadGenesSequentially(genes, pageIds, result);
@@ -2000,47 +2007,61 @@ export class DataLayer {
 
     // Load latent embeddings if requested
     if (includeLatent) {
-      try {
-        const baseUrl = this.state?.manifestUrl || null;
-        const identity = this.state?.datasetIdentity || null;
-
-        if (baseUrl && identity) {
-          if (onProgress) onProgress(85);
-
-          const latentData = await loadLatentEmbeddings({
-            baseUrl,
-            identity,
-            dimension: latentDimension
-          });
-
-          result.latent = {
-            dimension: latentData.dimension,
-            pages: {}
-          };
-
-          for (const pageId of pageIds) {
-            const cellIndices = result.pageData[pageId].cellIndices;
-            const dim = latentData.dimension;
-            const pageCoords = new Float32Array(cellIndices.length * dim);
-
-            for (let i = 0; i < cellIndices.length; i++) {
-              const cellIdx = cellIndices[i];
-              for (let d = 0; d < dim; d++) {
-                pageCoords[i * dim + d] = latentData.points[cellIdx * dim + d];
-              }
-            }
-
-            result.latent.pages[pageId] = {
-              coordinates: pageCoords,
-              cellCount: cellIndices.length
-            };
-          }
-
-          if (onProgress) onProgress(100);
-        }
-      } catch (error) {
-        debugWarn('DataLayer', 'Failed to load latent embeddings:', error.message);
+      const baseUrl = this.state?.manifestUrl;
+      const identity = this.state?.datasetIdentity;
+      if (
+        typeof baseUrl !== 'string' ||
+        baseUrl.length === 0 ||
+        !identity ||
+        typeof identity !== 'object' ||
+        Array.isArray(identity)
+      ) {
+        throw new Error(
+          'Requested latent data requires exact manifestUrl and datasetIdentity state'
+        );
       }
+      if (onProgress) onProgress(85);
+
+      const latentData = await loadLatentEmbeddings({
+        baseUrl,
+        identity,
+        dimension: latentDimension
+      });
+
+      result.latent = {
+        dimension: latentData.dimension,
+        pages: {}
+      };
+
+      for (const pageId of pageIds) {
+        const cellIndices = result.pageData[pageId].cellIndices;
+        const dim = latentData.dimension;
+        const pageCoords = new Float32Array(cellIndices.length * dim);
+
+        for (let i = 0; i < cellIndices.length; i++) {
+          const cellIdx = cellIndices[i];
+          if (
+            !Number.isSafeInteger(cellIdx) ||
+            cellIdx < 0 ||
+            cellIdx >= latentData.cellCount
+          ) {
+            throw new RangeError(
+              `Page "${pageId}" cell index ${String(cellIdx)} is outside ` +
+              `latent cell count ${latentData.cellCount}`
+            );
+          }
+          for (let d = 0; d < dim; d++) {
+            pageCoords[i * dim + d] = latentData.points[cellIdx * dim + d];
+          }
+        }
+
+        result.latent.pages[pageId] = {
+          coordinates: pageCoords,
+          cellCount: cellIndices.length
+        };
+      }
+
+      if (onProgress) onProgress(100);
     }
 
     result.stats.loadTimeMs = performance.now() - startTime;
@@ -2048,7 +2069,7 @@ export class DataLayer {
   }
 
   /**
-   * Load genes sequentially (fallback method)
+   * Load genes sequentially when no bulk manifest is available.
    * @param {string[]} genes - Gene names to load
    * @param {string[]} pageIds - Page IDs
    * @param {Object} result - Result object to populate
@@ -2060,31 +2081,27 @@ export class DataLayer {
 
     for (let i = 0; i < genes.length; i++) {
       const gene = genes[i];
-      try {
-        const geneData = await this.getDataForPages({
-          type: 'gene_expression',
-          variableKey: gene,
-          pageIds,
-          silent: true // Suppress individual notifications during bulk load
-        });
+      const geneData = await this.getDataForPages({
+        type: 'gene_expression',
+        variableKey: gene,
+        pageIds,
+        silent: true
+      });
 
-        if (onProgress) {
-          onProgress(Math.round(((i + 1) / totalGenes) * 100));
-        }
-
-        result.genes[gene] = {};
-        for (const pd of geneData) {
-          result.genes[gene][pd.pageId] = {
-            values: pd.values,
-            cellIndices: pd.cellIndices,
-            pageName: pd.pageName,
-            cellCount: pd.cellCount
-          };
-        }
-        result.stats.genesLoaded++;
-      } catch (err) {
-        debugWarn('DataLayer', `Failed to load gene ${gene}:`, err.message);
+      if (onProgress) {
+        onProgress(Math.round(((i + 1) / totalGenes) * 100));
       }
+
+      result.genes[gene] = {};
+      for (const pd of geneData) {
+        result.genes[gene][pd.pageId] = {
+          values: pd.values,
+          cellIndices: pd.cellIndices,
+          pageName: pd.pageName,
+          cellCount: pd.cellCount
+        };
+      }
+      result.stats.genesLoaded++;
     }
   }
 
@@ -2119,6 +2136,132 @@ export class DataLayer {
         cellsTotal: 0,
         loadTimeMs: 0
       }
+    };
+
+    const publishField = (fieldKey, fieldData) => {
+      if (
+        fieldData === null ||
+        typeof fieldData !== 'object' ||
+        Array.isArray(fieldData)
+      ) {
+        throw new TypeError(
+          `Observation field "${fieldKey}" must load as an object`
+        );
+      }
+      const rawFieldValues = fieldData.kind === 'continuous'
+        ? fieldData.values
+        : fieldData.kind === 'category'
+          ? fieldData.codes
+          : null;
+      if (
+        fieldData.kind === 'continuous' &&
+        !(rawFieldValues instanceof Float32Array)
+      ) {
+        throw new TypeError(
+          `Continuous observation field "${fieldKey}" must load as Float32Array`
+        );
+      }
+      if (
+        fieldData.kind === 'category' &&
+        (!(rawFieldValues instanceof Uint16Array) ||
+          !Array.isArray(fieldData.categories))
+      ) {
+        throw new TypeError(
+          `Categorical observation field "${fieldKey}" must load exact codes and categories`
+        );
+      }
+      if (!rawFieldValues) {
+        throw new TypeError(
+          `Observation field "${fieldKey}" must declare the exact current kind`
+        );
+      }
+
+      for (const pageId of pageIds) {
+        for (const cellIdx of result.pageData[pageId].cellIndices) {
+          if (
+            !Number.isSafeInteger(cellIdx) ||
+            cellIdx < 0 ||
+            cellIdx >= rawFieldValues.length
+          ) {
+            throw new RangeError(
+              `Cell index ${String(cellIdx)} is outside observation field ` +
+              `"${fieldKey}" length ${rawFieldValues.length}`
+            );
+          }
+          if (
+            fieldData.kind === 'category' &&
+            rawFieldValues[cellIdx] !== 65_535 &&
+            rawFieldValues[cellIdx] >= fieldData.categories.length
+          ) {
+            throw new RangeError(
+              `Category code ${rawFieldValues[cellIdx]} for observation field ` +
+              `"${fieldKey}" is outside ${fieldData.categories.length} categories`
+            );
+          }
+        }
+      }
+
+      const published = {
+        kind: fieldData.kind,
+        categories: fieldData.kind === 'category'
+          ? fieldData.categories
+          : null
+      };
+      if (!subsetPages) {
+        if (fieldData.kind === 'continuous') {
+          published.values = rawFieldValues;
+        } else {
+          published.codes = rawFieldValues;
+        }
+        result.fields[fieldKey] = published;
+        result.stats.fieldsLoaded++;
+        return;
+      }
+
+      for (const pageId of pageIds) {
+        const cellIndices = result.pageData[pageId].cellIndices;
+        if (fieldData.kind === 'continuous') {
+          const pageValues = new Float32Array(cellIndices.length);
+          for (let i = 0; i < cellIndices.length; i++) {
+            pageValues[i] = rawFieldValues[cellIndices[i]];
+          }
+          published[pageId] = {
+            values: pageValues,
+            cellCount: cellIndices.length
+          };
+          continue;
+        }
+
+        const pageCodes = new Uint16Array(cellIndices.length);
+        for (let i = 0; i < cellIndices.length; i++) {
+          pageCodes[i] = rawFieldValues[cellIndices[i]];
+        }
+        const pageEntry = {
+          codes: pageCodes,
+          cellCount: cellIndices.length
+        };
+        if (includeCategoricalValues) {
+          const pageValues = [];
+          for (const code of pageCodes) {
+            if (code === 65_535) {
+              pageValues.push(null);
+              continue;
+            }
+            if (code >= fieldData.categories.length) {
+              throw new RangeError(
+                `Category code ${code} for observation field "${fieldKey}" ` +
+                `is outside ${fieldData.categories.length} categories`
+              );
+            }
+            pageValues.push(fieldData.categories[code]);
+          }
+          pageEntry.values = pageValues;
+        }
+        published[pageId] = pageEntry;
+      }
+
+      result.fields[fieldKey] = published;
+      result.stats.fieldsLoaded++;
     };
 
     // Get cell indices for each page
@@ -2162,8 +2305,7 @@ export class DataLayer {
 
     try {
       if (obsManifest && manifestUrl) {
-        try {
-          const bulkData = await loadAnalysisBulkObsData({
+        const bulkData = await loadAnalysisBulkObsData({
             manifestUrl,
             obsManifest,
             fieldList: obsFields,
@@ -2171,77 +2313,22 @@ export class DataLayer {
             onProgress: handleProgress,
             // DataLayer already owns the progress notification for bulk loading.
             suppressNotifications: true
-          });
+        });
 
-          for (const [fieldKey, fieldData] of Object.entries(bulkData.fields)) {
-            result.fields[fieldKey] = {
-              kind: fieldData.kind,
-              categories: fieldData.categories
-            };
-
-            if (!subsetPages) {
-              // Expose raw arrays for callers that want to compute without per-page copies.
-              // Keeping these references when `subsetPages` is true would retain the full
-              // dataset arrays in memory unnecessarily.
-              result.fields[fieldKey].values = fieldData.values;
-              result.fields[fieldKey].codes = fieldData.codes;
-              result.stats.fieldsLoaded++;
-              continue;
-            }
-
-            for (const pageId of pageIds) {
-              const cellIndices = result.pageData[pageId].cellIndices;
-
-              if (fieldData.kind === 'continuous' && fieldData.values) {
-                const pageValues = new Float32Array(cellIndices.length);
-                for (let i = 0; i < cellIndices.length; i++) {
-                  const cellIdx = cellIndices[i];
-                  pageValues[i] = cellIdx < fieldData.values.length
-                    ? fieldData.values[cellIdx]
-                    : NaN;
-                }
-                result.fields[fieldKey][pageId] = {
-                  values: pageValues,
-                  cellCount: cellIndices.length
-                };
-              } else if (fieldData.codes) {
-                const pageCodes = new Uint16Array(cellIndices.length);
-                for (let i = 0; i < cellIndices.length; i++) {
-                  const cellIdx = cellIndices[i];
-                  pageCodes[i] = cellIdx < fieldData.codes.length
-                    ? fieldData.codes[cellIdx]
-                    : 65535;
-                }
-                const pageEntry = {
-                  codes: pageCodes,
-                  cellCount: cellIndices.length
-                };
-
-                if (includeCategoricalValues) {
-                  const pageValues = [];
-                  for (let i = 0; i < pageCodes.length; i++) {
-                    const code = pageCodes[i];
-                    if (code === 65535 || !fieldData.categories) {
-                      pageValues.push(null);
-                    } else {
-                      pageValues.push(fieldData.categories[code] || `Unknown (${code})`);
-                    }
-                  }
-                  pageEntry.values = pageValues;
-                }
-
-                result.fields[fieldKey][pageId] = pageEntry;
-              }
-            }
-
-            result.stats.fieldsLoaded++;
+        for (const fieldKey of obsFields) {
+          if (!Object.hasOwn(bulkData.fields, fieldKey)) {
+            throw new Error(
+              `Bulk observation loader omitted requested field "${fieldKey}"`
+            );
           }
-        } catch (error) {
-          debugWarn('DataLayer', 'Bulk obs loader failed, falling back to sequential:', error.message);
-          await this._loadObsFieldsSequentially(obsFields, pageIds, result, handleProgress);
+          publishField(fieldKey, bulkData.fields[fieldKey]);
         }
       } else {
-        await this._loadObsFieldsSequentially(obsFields, pageIds, result, handleProgress);
+        await this._loadObsFieldsSequentially(
+          obsFields,
+          handleProgress,
+          publishField
+        );
       }
 
       // Complete notification
@@ -2264,47 +2351,35 @@ export class DataLayer {
   }
 
   /**
-   * Load obs fields sequentially (fallback method)
+   * Load obs fields sequentially when no bulk manifest is available.
    * @param {string[]} obsFields - Field keys to load
-   * @param {string[]} pageIds - Page IDs
-   * @param {Object} result - Result object to populate
    * @param {Function} [onProgress] - Progress callback
+   * @param {Function} publishField - Exact field publication callback
    * @private
    */
-  async _loadObsFieldsSequentially(obsFields, pageIds, result, onProgress) {
+  async _loadObsFieldsSequentially(obsFields, onProgress, publishField) {
     const totalFields = obsFields.length;
 
     for (let i = 0; i < obsFields.length; i++) {
       const fieldKey = obsFields[i];
-      try {
-        const catFields = this.getAvailableVariables('categorical_obs');
-        const isCat = catFields.some(f => f.key === fieldKey);
-        const type = isCat ? 'categorical_obs' : 'continuous_obs';
+      const catFields = this.getAvailableVariables('categorical_obs');
+      const continuousFields = this.getAvailableVariables('continuous_obs');
+      const isCategorical = catFields.some(field => field.key === fieldKey);
+      const isContinuous = continuousFields.some(field => field.key === fieldKey);
+      if (isCategorical === isContinuous) {
+        throw new Error(
+          `Observation field "${fieldKey}" must have exactly one categorical ` +
+          'or continuous declaration'
+        );
+      }
+      const fieldData = await this.ensureObsFieldLoaded(
+        fieldKey,
+        { silent: true }
+      );
+      publishField(fieldKey, fieldData);
 
-        const fieldDataList = await this.getDataForPages({
-          type,
-          variableKey: fieldKey,
-          pageIds,
-          silent: true // Suppress individual notifications during bulk load
-        });
-
-        if (onProgress) {
-          onProgress(Math.round(((i + 1) / totalFields) * 100));
-        }
-
-        result.fields[fieldKey] = {
-          kind: isCat ? 'category' : 'continuous'
-        };
-
-        for (const pd of fieldDataList) {
-          result.fields[fieldKey][pd.pageId] = {
-            values: pd.values,
-            cellCount: pd.cellCount
-          };
-        }
-        result.stats.fieldsLoaded++;
-      } catch (err) {
-        debugWarn('DataLayer', `Failed to load obs field ${fieldKey}:`, err.message);
+      if (onProgress) {
+        onProgress(Math.round(((i + 1) / totalFields) * 100));
       }
     }
   }
@@ -2393,42 +2468,56 @@ export class DataLayer {
     }
 
     if (includeLatent) {
-      try {
-        const baseUrl = this.state?.manifestUrl || null;
-        const identity = this.state?.datasetIdentity || null;
+      const baseUrl = this.state?.manifestUrl;
+      const identity = this.state?.datasetIdentity;
+      if (
+        typeof baseUrl !== 'string' ||
+        baseUrl.length === 0 ||
+        !identity ||
+        typeof identity !== 'object' ||
+        Array.isArray(identity)
+      ) {
+        throw new Error(
+          'Requested latent data requires exact manifestUrl and datasetIdentity state'
+        );
+      }
+      const latentData = await loadLatentEmbeddings({
+        baseUrl,
+        identity,
+        dimension: latentDimension
+      });
 
-        if (baseUrl && identity) {
-          const latentData = await loadLatentEmbeddings({
-            baseUrl,
-            identity,
-            dimension: latentDimension
-          });
+      result.latent = {
+        dimension: latentData.dimension,
+        pages: {}
+      };
 
-          result.latent = {
-            dimension: latentData.dimension,
-            pages: {}
-          };
+      for (const pageId of pageIds) {
+        const cellIndices = result.pageData[pageId].cellIndices;
+        const dim = latentData.dimension;
+        const pageCoords = new Float32Array(cellIndices.length * dim);
 
-          for (const pageId of pageIds) {
-            const cellIndices = result.pageData[pageId].cellIndices;
-            const dim = latentData.dimension;
-            const pageCoords = new Float32Array(cellIndices.length * dim);
-
-            for (let i = 0; i < cellIndices.length; i++) {
-              const cellIdx = cellIndices[i];
-              for (let d = 0; d < dim; d++) {
-                pageCoords[i * dim + d] = latentData.points[cellIdx * dim + d];
-              }
-            }
-
-            result.latent.pages[pageId] = {
-              coordinates: pageCoords,
-              cellCount: cellIndices.length
-            };
+        for (let i = 0; i < cellIndices.length; i++) {
+          const cellIdx = cellIndices[i];
+          if (
+            !Number.isSafeInteger(cellIdx) ||
+            cellIdx < 0 ||
+            cellIdx >= latentData.cellCount
+          ) {
+            throw new RangeError(
+              `Page "${pageId}" cell index ${String(cellIdx)} is outside ` +
+              `latent cell count ${latentData.cellCount}`
+            );
+          }
+          for (let d = 0; d < dim; d++) {
+            pageCoords[i * dim + d] = latentData.points[cellIdx * dim + d];
           }
         }
-      } catch (error) {
-        debugWarn('DataLayer', 'Failed to load latent embeddings:', error.message);
+
+        result.latent.pages[pageId] = {
+          coordinates: pageCoords,
+          cellCount: cellIndices.length
+        };
       }
       completedSteps++;
     }
@@ -2437,103 +2526,6 @@ export class DataLayer {
 
     result.stats.loadTimeMs = performance.now() - startTime;
     return result;
-  }
-
-  // ===========================================================================
-  // GPU/WORKER/CPU ACCELERATED COMPUTATIONS
-  // ===========================================================================
-
-  /**
-   * Compute statistics using GPU/Worker/CPU backends
-   *
-   * @param {PageData} pageData - Page data object
-   * @returns {Promise<BasicStats>} Statistics object
-   */
-  async computeStatsForPage(pageData) {
-    // Always use ComputeManager for consistent GPU -> Worker -> CPU fallback
-    try {
-      const computeManager = await this._getComputeManager();
-      const result = await computeManager.computeStats(pageData.values);
-      return result;
-    } catch (err) {
-      debugWarn('DataLayer', 'Compute stats failed, using local fallback:', err.message);
-      return this._computeStatsLocal(pageData.values);
-    }
-  }
-
-  /**
-   * Local stats computation fallback
-   * Uses centralized statistics utilities from number-utils.js
-   * @param {number[]} values - Values to compute stats for
-   * @returns {BasicStats}
-   * @private
-   */
-  _computeStatsLocal(values) {
-    const numericValues = filterFiniteNumbers(values);
-
-    if (numericValues.length === 0) {
-      return { count: 0, min: null, max: null, mean: null, median: null, std: null };
-    }
-
-    // Sort once for quartiles and min/max
-    const sorted = [...numericValues].sort((a, b) => a - b);
-    const n = sorted.length;
-
-    return {
-      count: n,
-      min: sorted[0],
-      max: sorted[n - 1],
-      mean: computeMean(numericValues),
-      median: computeMedian(numericValues),
-      std: computeStd(numericValues),
-      q1: sorted[Math.floor(n * 0.25)],
-      q3: sorted[Math.floor(n * 0.75)]
-    };
-  }
-
-  /**
-   * Aggregate categories using GPU/Worker/CPU backends
-   *
-   * @param {PageData} pageData - Page data object
-   * @param {boolean} [normalize=false] - Include percentages
-   * @returns {Promise<CategoryAggregation>} Aggregation result
-   */
-  async aggregateCategoriesForPage(pageData, normalize = false) {
-    // Always use ComputeManager for consistent GPU -> Worker -> CPU fallback
-    try {
-      const computeManager = await this._getComputeManager();
-      const result = await computeManager.aggregateCategories(pageData.values, normalize);
-      return result;
-    } catch (err) {
-      debugWarn('DataLayer', 'Compute aggregation failed, using local fallback:', err.message);
-      return this._aggregateCategoriesLocal(pageData.values, normalize);
-    }
-  }
-
-  /**
-   * Local category aggregation fallback
-   * @param {string[]} values - Values to aggregate
-   * @param {boolean} normalize - Include percentages
-   * @returns {CategoryAggregation}
-   * @private
-   */
-  _aggregateCategoriesLocal(values, normalize = false) {
-    const counts = new Map();
-    let total = 0;
-
-    for (const value of values) {
-      counts.set(value, (counts.get(value) || 0) + 1);
-      total++;
-    }
-
-    const entries = Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
-
-    return {
-      categories: entries.map(e => e[0]),
-      counts: entries.map(e => e[1]),
-      percentages: normalize && total > 0 ? entries.map(e => (e[1] / total) * 100) : undefined,
-      total
-    };
   }
 
   // ===========================================================================
@@ -2677,7 +2669,6 @@ export class DataLayer {
     }
 
     // Clear references
-    this._computeManager = null;
     this._notifications = null;
     this._memoryMonitor = null;
 

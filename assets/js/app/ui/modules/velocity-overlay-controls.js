@@ -15,18 +15,279 @@
 
 import { formatCellCount } from '../../../data/data-source.js';
 import { getNotificationCenter } from '../../notification-center.js';
-import { clamp } from '../../utils/number-utils.js';
+import {
+  parseIntegerInput,
+  parseRangeInput
+} from '../core/numeric-input-contract.js';
 
-function clampInt(value, min, max, fallback) {
-  const parsed = Number.parseInt(String(value), 10);
-  if (!Number.isFinite(parsed)) return fallback;
-  return clamp(parsed, min, max);
+const VELOCITY_NUMERIC_INPUTS = Object.freeze({
+  density: Object.freeze({
+    domKey: 'velocityDensityInput',
+    integer: true,
+    label: 'Particle density',
+    maximum: 500,
+    minimum: 1
+  }),
+  speed: Object.freeze({
+    domKey: 'velocitySpeedInput',
+    integer: true,
+    label: 'Flow speed',
+    maximum: 500,
+    minimum: 5
+  }),
+  lifetime: Object.freeze({
+    domKey: 'velocityLifetimeInput',
+    integer: true,
+    label: 'Trail length',
+    maximum: 1500,
+    minimum: 10
+  }),
+  size: Object.freeze({
+    domKey: 'velocitySizeInput',
+    integer: false,
+    label: 'Particle size',
+    maximum: 30,
+    minimum: 0.5
+  }),
+  opacity: Object.freeze({
+    domKey: 'velocityOpacityInput',
+    integer: true,
+    label: 'Opacity',
+    maximum: 100,
+    minimum: 0
+  }),
+  intensity: Object.freeze({
+    domKey: 'velocityIntensityInput',
+    integer: false,
+    label: 'Intensity',
+    maximum: 1.5,
+    minimum: 0.05
+  }),
+  glow: Object.freeze({
+    domKey: 'velocityGlowInput',
+    integer: false,
+    label: 'Glow amount',
+    maximum: 1,
+    minimum: 0
+  }),
+  cometStretch: Object.freeze({
+    domKey: 'velocityCometStretchInput',
+    integer: false,
+    label: 'Comet stretch',
+    maximum: 2,
+    minimum: 0
+  }),
+  coreSharpness: Object.freeze({
+    domKey: 'velocityCoreSharpnessInput',
+    integer: false,
+    label: 'Core sharpness',
+    maximum: 1,
+    minimum: 0
+  }),
+  trailFade: Object.freeze({
+    domKey: 'velocityTrailFadeInput',
+    integer: false,
+    label: 'Trail fade',
+    maximum: 0.995,
+    minimum: 0.9
+  }),
+  chromaticFade: Object.freeze({
+    domKey: 'velocityChromaticFadeInput',
+    integer: false,
+    label: 'Chromatic fade',
+    maximum: 1,
+    minimum: 0
+  }),
+  turbulence: Object.freeze({
+    domKey: 'velocityTurbulenceInput',
+    integer: false,
+    label: 'Turbulence',
+    maximum: 1,
+    minimum: 0
+  }),
+  exposure: Object.freeze({
+    domKey: 'velocityExposureInput',
+    integer: false,
+    label: 'Exposure',
+    maximum: 2,
+    minimum: 0.1
+  }),
+  bloomStrength: Object.freeze({
+    domKey: 'velocityBloomStrengthInput',
+    integer: false,
+    label: 'Bloom strength',
+    maximum: 0.5,
+    minimum: 0
+  }),
+  bloomThreshold: Object.freeze({
+    domKey: 'velocityBloomThresholdInput',
+    integer: false,
+    label: 'Bloom threshold',
+    maximum: 1,
+    minimum: 0.1
+  }),
+  anamorphic: Object.freeze({
+    domKey: 'velocityAnamorphicInput',
+    integer: false,
+    label: 'Anamorphic ratio',
+    maximum: 3,
+    minimum: 1
+  }),
+  saturation: Object.freeze({
+    domKey: 'velocitySaturationInput',
+    integer: false,
+    label: 'Saturation',
+    maximum: 2,
+    minimum: 0.5
+  }),
+  contrast: Object.freeze({
+    domKey: 'velocityContrastInput',
+    integer: false,
+    label: 'Contrast',
+    maximum: 2,
+    minimum: 0.5
+  }),
+  highlights: Object.freeze({
+    domKey: 'velocityHighlightsInput',
+    integer: false,
+    label: 'Highlights',
+    maximum: 1.5,
+    minimum: 0.5
+  }),
+  shadows: Object.freeze({
+    domKey: 'velocityShadowsInput',
+    integer: false,
+    label: 'Shadows',
+    maximum: 1.5,
+    minimum: 0.5
+  }),
+  vignette: Object.freeze({
+    domKey: 'velocityVignetteInput',
+    integer: false,
+    label: 'Vignette',
+    maximum: 1,
+    minimum: 0
+  }),
+  filmGrain: Object.freeze({
+    domKey: 'velocityFilmGrainInput',
+    integer: false,
+    label: 'Film grain',
+    maximum: 0.1,
+    minimum: 0
+  }),
+  chromaticAberration: Object.freeze({
+    domKey: 'velocityChromaticAberrationInput',
+    integer: false,
+    label: 'Chromatic aberration',
+    maximum: 1,
+    minimum: 0
+  })
+});
+
+const REQUIRED_DOM_KEYS = Object.freeze([
+  'velocityControls',
+  'velocitySettings',
+  'velocityInfo',
+  'velocityEnabledCheckbox',
+  'velocityFieldSelect',
+  'velocityDensityDisplay',
+  'velocitySpeedDisplay',
+  'velocityLifetimeDisplay',
+  'velocitySizeDisplay',
+  'velocityOpacityDisplay',
+  'velocityColormapSelect',
+  'velocitySyncLodCheckbox',
+  'velocityIntensityDisplay',
+  'velocityGlowDisplay',
+  'velocityCometStretchDisplay',
+  'velocityCoreSharpnessDisplay',
+  'velocityTrailFadeDisplay',
+  'velocityChromaticFadeDisplay',
+  'velocityTurbulenceDisplay',
+  'velocityExposureDisplay',
+  'velocityBloomStrengthDisplay',
+  'velocityBloomThresholdDisplay',
+  'velocityAnamorphicDisplay',
+  'velocitySaturationDisplay',
+  'velocityContrastDisplay',
+  'velocityHighlightsDisplay',
+  'velocityShadowsDisplay',
+  'velocityVignetteDisplay',
+  'velocityFilmGrainDisplay',
+  'velocityChromaticAberrationDisplay',
+  ...Object.values(VELOCITY_NUMERIC_INPUTS).map(({ domKey }) => domKey)
+]);
+
+function parseVelocityInput(dom, name) {
+  const contract = VELOCITY_NUMERIC_INPUTS[name];
+  if (!contract) {
+    throw new Error(`Unknown vector field overlay numeric input "${String(name)}".`);
+  }
+  const input = dom[contract.domKey];
+  if (!input || typeof input.value !== 'string') {
+    throw new Error(
+      `Vector field overlay is missing its required ${contract.label} input.`
+    );
+  }
+  const options = {
+    minimum: contract.minimum,
+    maximum: contract.maximum,
+    label: contract.label
+  };
+  return contract.integer
+    ? parseIntegerInput(input.value, options)
+    : parseRangeInput(input.value, options);
 }
 
-function clampFloat(value, min, max, fallback) {
-  const parsed = Number.parseFloat(String(value));
-  if (!Number.isFinite(parsed)) return fallback;
-  return clamp(parsed, min, max);
+function assertVelocityOverlayContract(options) {
+  if (
+    !options ||
+    typeof options !== 'object' ||
+    Array.isArray(options) ||
+    Object.keys(options).sort().join(',') !== 'dom,state,viewer'
+  ) {
+    throw new TypeError(
+      'Vector field overlay initialization requires exactly dom, state, and viewer.'
+    );
+  }
+  const { state, viewer, dom } = options;
+  if (!dom || typeof dom !== 'object' || Array.isArray(dom)) {
+    throw new TypeError('Vector field overlay dom must be an object.');
+  }
+  for (const key of REQUIRED_DOM_KEYS) {
+    if (!dom[key]) {
+      throw new Error(`Vector field overlay is missing required DOM owner "${key}".`);
+    }
+  }
+  for (const key of ['velocityEnabledCheckbox', 'velocitySyncLodCheckbox']) {
+    if (typeof dom[key].checked !== 'boolean') {
+      throw new TypeError(`Vector field overlay "${key}" must expose a boolean checked state.`);
+    }
+  }
+  for (const method of [
+    'getDimensionLevel',
+    'getAvailableVectorFields',
+    'getDefaultVectorFieldId',
+    'ensureVectorField',
+    'on',
+    'off'
+  ]) {
+    if (!state || typeof state[method] !== 'function') {
+      throw new TypeError(`Vector field overlay state requires ${method}().`);
+    }
+  }
+  for (const method of [
+    'setVectorFieldOverlayEnabled',
+    'setVectorFieldConfig',
+    'setActiveVectorField'
+  ]) {
+    if (!viewer || typeof viewer[method] !== 'function') {
+      throw new TypeError(`Vector field overlay viewer requires ${method}().`);
+    }
+  }
+  for (const name of Object.keys(VELOCITY_NUMERIC_INPUTS)) {
+    parseVelocityInput(dom, name);
+  }
 }
 
 /**
@@ -35,298 +296,324 @@ function clampFloat(value, min, max, fallback) {
  * @param {object} options.viewer
  * @param {object} options.dom
  */
-export function initVelocityOverlayControls({ state, viewer, dom }) {
-  const controlBlock = dom?.velocityControls || null;
-  const settings = dom?.velocitySettings || null;
-  const infoEl = dom?.velocityInfo || null;
+export function initVelocityOverlayControls(options) {
+  assertVelocityOverlayContract(options);
+  const { state, viewer, dom } = options;
+  const controlBlock = dom.velocityControls;
+  const settings = dom.velocitySettings;
+  const infoEl = dom.velocityInfo;
 
-  const enabledCheckbox = dom?.velocityEnabledCheckbox || null;
-  const fieldSelect = dom?.velocityFieldSelect || null;
-  const densityInput = dom?.velocityDensityInput || null;
-  const densityDisplay = dom?.velocityDensityDisplay || null;
-  const speedInput = dom?.velocitySpeedInput || null;
-  const speedDisplay = dom?.velocitySpeedDisplay || null;
-  const lifetimeInput = dom?.velocityLifetimeInput || null;
-  const lifetimeDisplay = dom?.velocityLifetimeDisplay || null;
-  const sizeInput = dom?.velocitySizeInput || null;
-  const sizeDisplay = dom?.velocitySizeDisplay || null;
-  const opacityInput = dom?.velocityOpacityInput || null;
-  const opacityDisplay = dom?.velocityOpacityDisplay || null;
-  const colormapSelect = dom?.velocityColormapSelect || null;
-  const syncLodCheckbox = dom?.velocitySyncLodCheckbox || null;
+  const enabledCheckbox = dom.velocityEnabledCheckbox;
+  const fieldSelect = dom.velocityFieldSelect;
+  const densityInput = dom.velocityDensityInput;
+  const densityDisplay = dom.velocityDensityDisplay;
+  const speedInput = dom.velocitySpeedInput;
+  const speedDisplay = dom.velocitySpeedDisplay;
+  const lifetimeInput = dom.velocityLifetimeInput;
+  const lifetimeDisplay = dom.velocityLifetimeDisplay;
+  const sizeInput = dom.velocitySizeInput;
+  const sizeDisplay = dom.velocitySizeDisplay;
+  const opacityInput = dom.velocityOpacityInput;
+  const opacityDisplay = dom.velocityOpacityDisplay;
+  const colormapSelect = dom.velocityColormapSelect;
+  const syncLodCheckbox = dom.velocitySyncLodCheckbox;
   // Advanced settings - Particle Rendering
-  const intensityInput = dom?.velocityIntensityInput || null;
-  const intensityDisplay = dom?.velocityIntensityDisplay || null;
-  const glowInput = dom?.velocityGlowInput || null;
-  const glowDisplay = dom?.velocityGlowDisplay || null;
-  const cometStretchInput = dom?.velocityCometStretchInput || null;
-  const cometStretchDisplay = dom?.velocityCometStretchDisplay || null;
-  const coreSharpnessInput = dom?.velocityCoreSharpnessInput || null;
-  const coreSharpnessDisplay = dom?.velocityCoreSharpnessDisplay || null;
+  const intensityInput = dom.velocityIntensityInput;
+  const intensityDisplay = dom.velocityIntensityDisplay;
+  const glowInput = dom.velocityGlowInput;
+  const glowDisplay = dom.velocityGlowDisplay;
+  const cometStretchInput = dom.velocityCometStretchInput;
+  const cometStretchDisplay = dom.velocityCometStretchDisplay;
+  const coreSharpnessInput = dom.velocityCoreSharpnessInput;
+  const coreSharpnessDisplay = dom.velocityCoreSharpnessDisplay;
   // Advanced settings - Trail
-  const trailFadeInput = dom?.velocityTrailFadeInput || null;
-  const trailFadeDisplay = dom?.velocityTrailFadeDisplay || null;
-  const chromaticFadeInput = dom?.velocityChromaticFadeInput || null;
-  const chromaticFadeDisplay = dom?.velocityChromaticFadeDisplay || null;
-  const turbulenceInput = dom?.velocityTurbulenceInput || null;
-  const turbulenceDisplay = dom?.velocityTurbulenceDisplay || null;
+  const trailFadeInput = dom.velocityTrailFadeInput;
+  const trailFadeDisplay = dom.velocityTrailFadeDisplay;
+  const chromaticFadeInput = dom.velocityChromaticFadeInput;
+  const chromaticFadeDisplay = dom.velocityChromaticFadeDisplay;
+  const turbulenceInput = dom.velocityTurbulenceInput;
+  const turbulenceDisplay = dom.velocityTurbulenceDisplay;
   // Advanced settings - HDR & Bloom
-  const exposureInput = dom?.velocityExposureInput || null;
-  const exposureDisplay = dom?.velocityExposureDisplay || null;
-  const bloomStrengthInput = dom?.velocityBloomStrengthInput || null;
-  const bloomStrengthDisplay = dom?.velocityBloomStrengthDisplay || null;
-  const bloomThresholdInput = dom?.velocityBloomThresholdInput || null;
-  const bloomThresholdDisplay = dom?.velocityBloomThresholdDisplay || null;
-  const anamorphicInput = dom?.velocityAnamorphicInput || null;
-  const anamorphicDisplay = dom?.velocityAnamorphicDisplay || null;
+  const exposureInput = dom.velocityExposureInput;
+  const exposureDisplay = dom.velocityExposureDisplay;
+  const bloomStrengthInput = dom.velocityBloomStrengthInput;
+  const bloomStrengthDisplay = dom.velocityBloomStrengthDisplay;
+  const bloomThresholdInput = dom.velocityBloomThresholdInput;
+  const bloomThresholdDisplay = dom.velocityBloomThresholdDisplay;
+  const anamorphicInput = dom.velocityAnamorphicInput;
+  const anamorphicDisplay = dom.velocityAnamorphicDisplay;
   // Advanced settings - Color Grading
-  const saturationInput = dom?.velocitySaturationInput || null;
-  const saturationDisplay = dom?.velocitySaturationDisplay || null;
-  const contrastInput = dom?.velocityContrastInput || null;
-  const contrastDisplay = dom?.velocityContrastDisplay || null;
-  const highlightsInput = dom?.velocityHighlightsInput || null;
-  const highlightsDisplay = dom?.velocityHighlightsDisplay || null;
-  const shadowsInput = dom?.velocityShadowsInput || null;
-  const shadowsDisplay = dom?.velocityShadowsDisplay || null;
+  const saturationInput = dom.velocitySaturationInput;
+  const saturationDisplay = dom.velocitySaturationDisplay;
+  const contrastInput = dom.velocityContrastInput;
+  const contrastDisplay = dom.velocityContrastDisplay;
+  const highlightsInput = dom.velocityHighlightsInput;
+  const highlightsDisplay = dom.velocityHighlightsDisplay;
+  const shadowsInput = dom.velocityShadowsInput;
+  const shadowsDisplay = dom.velocityShadowsDisplay;
   // Advanced settings - Cinematic Effects
-  const vignetteInput = dom?.velocityVignetteInput || null;
-  const vignetteDisplay = dom?.velocityVignetteDisplay || null;
-  const filmGrainInput = dom?.velocityFilmGrainInput || null;
-  const filmGrainDisplay = dom?.velocityFilmGrainDisplay || null;
-  const chromaticAberrationInput = dom?.velocityChromaticAberrationInput || null;
-  const chromaticAberrationDisplay = dom?.velocityChromaticAberrationDisplay || null;
+  const vignetteInput = dom.velocityVignetteInput;
+  const vignetteDisplay = dom.velocityVignetteDisplay;
+  const filmGrainInput = dom.velocityFilmGrainInput;
+  const filmGrainDisplay = dom.velocityFilmGrainDisplay;
+  const chromaticAberrationInput = dom.velocityChromaticAberrationInput;
+  const chromaticAberrationDisplay = dom.velocityChromaticAberrationDisplay;
 
   let enabling = false;
   let suppressFieldChange = false;
 
   const getActiveDim = () => {
-    const level = typeof state.getDimensionLevel === 'function' ? state.getDimensionLevel() : 3;
-    return Math.max(1, Math.min(3, Math.floor(level || 3)));
+    const level = state.getDimensionLevel();
+    if (!Number.isInteger(level) || level < 1 || level > 3) {
+      throw new RangeError(
+        `Vector field overlay dimension must be exactly 1, 2, or 3; received ${String(level)}.`
+      );
+    }
+    return level;
   };
 
   const getAllFields = () => {
-    const fields = typeof state.getAvailableVectorFields === 'function'
-      ? state.getAvailableVectorFields()
-      : [];
-    return Array.isArray(fields) ? fields : [];
+    const fields = state.getAvailableVectorFields();
+    if (!Array.isArray(fields)) {
+      throw new TypeError('Available vector fields must be an array.');
+    }
+    const ids = new Set();
+    for (const field of fields) {
+      if (
+        !field ||
+        typeof field !== 'object' ||
+        Array.isArray(field) ||
+        typeof field.id !== 'string' ||
+        field.id.length === 0 ||
+        typeof field.label !== 'string' ||
+        field.label.length === 0 ||
+        !Array.isArray(field.availableDimensions) ||
+        field.availableDimensions.length === 0 ||
+        !Number.isInteger(field.defaultDimension) ||
+        !field.availableDimensions.includes(field.defaultDimension)
+      ) {
+        throw new TypeError('Each available vector field must expose one complete current descriptor.');
+      }
+      const dimensions = new Set();
+      for (const dimension of field.availableDimensions) {
+        if (
+          !Number.isInteger(dimension) ||
+          dimension < 1 ||
+          dimension > 3 ||
+          dimensions.has(dimension)
+        ) {
+          throw new TypeError(
+            `Vector field "${field.id}" must declare unique dimensions from 1 through 3.`
+          );
+        }
+        dimensions.add(dimension);
+      }
+      if (ids.has(field.id)) {
+        throw new TypeError(`Vector field id "${field.id}" is duplicated.`);
+      }
+      ids.add(field.id);
+    }
+    return fields;
   };
 
   const getFieldsForDim = (dim) => {
-    const d = Math.max(1, Math.min(3, Math.floor(dim || 3)));
-    return getAllFields().filter((f) => Array.isArray(f?.availableDimensions) && f.availableDimensions.includes(d));
+    if (!Number.isInteger(dim) || dim < 1 || dim > 3) {
+      throw new RangeError('Vector field dimension must be exactly 1, 2, or 3.');
+    }
+    return getAllFields().filter((field) => field.availableDimensions.includes(dim));
   };
 
   const getUnionDims = () => {
     const dims = new Set();
     for (const field of getAllFields()) {
-      const list = Array.isArray(field?.availableDimensions) ? field.availableDimensions : [];
-      for (const d of list) {
-        if (Number.isInteger(d) && d >= 1 && d <= 3) dims.add(d);
-      }
+      for (const dimension of field.availableDimensions) dims.add(dimension);
     }
     return Array.from(dims).sort((a, b) => a - b);
   };
 
   const getDefaultFieldId = () => {
-    const id = typeof state.getDefaultVectorFieldId === 'function' ? state.getDefaultVectorFieldId() : null;
-    return id ? String(id) : null;
+    const id = state.getDefaultVectorFieldId();
+    if (id === null) return null;
+    if (typeof id !== 'string' || id.length === 0) {
+      throw new TypeError('The default vector field id must be a non-empty string or null.');
+    }
+    if (!getAllFields().some((field) => field.id === id)) {
+      throw new Error(`Default vector field "${id}" is not declared.`);
+    }
+    return id;
   };
 
   function setInfo(message) {
-    if (infoEl) infoEl.textContent = message || '';
+    if (typeof message !== 'string') {
+      throw new TypeError('Vector field overlay information must be a string.');
+    }
+    infoEl.textContent = message;
   }
 
   function disableOverlayUi() {
-    if (enabledCheckbox) enabledCheckbox.checked = false;
-    if (settings) settings.style.display = 'none';
-    if (typeof viewer.setVectorFieldOverlayEnabled === 'function') {
-      viewer.setVectorFieldOverlayEnabled(false);
-    }
+    enabledCheckbox.checked = false;
+    settings.style.display = 'none';
+    viewer.setVectorFieldOverlayEnabled(false);
   }
 
   function updateSettingsVisibility() {
-    if (!settings || !enabledCheckbox) return;
     settings.style.display = enabledCheckbox.checked ? 'block' : 'none';
   }
 
   function updateDensityDisplay() {
-    if (!densityInput) return 15_000;
-    const thousands = clampInt(densityInput.value, 1, 500, 15);
+    const thousands = parseVelocityInput(dom, 'density');
     const particles = thousands * 1000;
-    if (densityDisplay) densityDisplay.textContent = formatCellCount(particles);
+    densityDisplay.textContent = formatCellCount(particles);
     return particles;
   }
 
   function updateSpeedDisplay() {
-    if (!speedInput) return 3.0;
-    const value = clampFloat(speedInput.value, 5, 500, 300) / 100;
-    if (speedDisplay) speedDisplay.textContent = `${value.toFixed(1)}×`;
+    const value = parseVelocityInput(dom, 'speed') / 100;
+    speedDisplay.textContent = `${value.toFixed(1)}×`;
     return value;
   }
 
   function updateLifetimeDisplay() {
-    if (!lifetimeInput) return 8.0;
-    const value = clampFloat(lifetimeInput.value, 10, 1500, 800) / 100;
-    if (lifetimeDisplay) lifetimeDisplay.textContent = `${value.toFixed(1)}s`;
+    const value = parseVelocityInput(dom, 'lifetime') / 100;
+    lifetimeDisplay.textContent = `${value.toFixed(1)}s`;
     return value;
   }
 
   function updateSizeDisplay() {
-    if (!sizeInput) return 1.0;
-    const value = clampFloat(sizeInput.value, 0.5, 30, 1);
-    if (sizeDisplay) sizeDisplay.textContent = value < 10 ? value.toFixed(1) : `${Math.round(value)}`;
+    const value = parseVelocityInput(dom, 'size');
+    sizeDisplay.textContent = value < 10 ? value.toFixed(1) : `${Math.round(value)}`;
     return value;
   }
 
   function updateOpacityDisplay() {
-    if (!opacityInput) return 0.6;
-    const value = clampFloat(opacityInput.value, 0, 100, 60) / 100;
-    if (opacityDisplay) opacityDisplay.textContent = `${Math.round(value * 100)}%`;
+    const value = parseVelocityInput(dom, 'opacity') / 100;
+    opacityDisplay.textContent = `${Math.round(value * 100)}%`;
     return value;
   }
 
   // Advanced settings display functions - Particle Rendering
   function updateIntensityDisplay() {
-    if (!intensityInput) return 0.25;
-    const value = clampFloat(intensityInput.value, 0.05, 1.5, 0.25);
-    if (intensityDisplay) intensityDisplay.textContent = value.toFixed(2);
+    const value = parseVelocityInput(dom, 'intensity');
+    intensityDisplay.textContent = value.toFixed(2);
     return value;
   }
 
   function updateGlowDisplay() {
-    if (!glowInput) return 0.3;
-    const value = clampFloat(glowInput.value, 0, 1, 0.3);
-    if (glowDisplay) glowDisplay.textContent = value.toFixed(2);
+    const value = parseVelocityInput(dom, 'glow');
+    glowDisplay.textContent = value.toFixed(2);
     return value;
   }
 
   function updateCometStretchDisplay() {
-    if (!cometStretchInput) return 0.6;
-    const value = clampFloat(cometStretchInput.value, 0, 2, 0.6);
-    if (cometStretchDisplay) cometStretchDisplay.textContent = value.toFixed(2);
+    const value = parseVelocityInput(dom, 'cometStretch');
+    cometStretchDisplay.textContent = value.toFixed(2);
     return value;
   }
 
   function updateCoreSharpnessDisplay() {
-    if (!coreSharpnessInput) return 0.7;
-    const value = clampFloat(coreSharpnessInput.value, 0, 1, 0.7);
-    if (coreSharpnessDisplay) coreSharpnessDisplay.textContent = value.toFixed(2);
+    const value = parseVelocityInput(dom, 'coreSharpness');
+    coreSharpnessDisplay.textContent = value.toFixed(2);
     return value;
   }
 
   // Trail settings
   function updateTrailFadeDisplay() {
-    if (!trailFadeInput) return 0.925;
-    const value = clampFloat(trailFadeInput.value, 0.9, 0.995, 0.925);
-    if (trailFadeDisplay) trailFadeDisplay.textContent = value.toFixed(3);
+    const value = parseVelocityInput(dom, 'trailFade');
+    trailFadeDisplay.textContent = value.toFixed(3);
     return value;
   }
 
   function updateChromaticFadeDisplay() {
-    if (!chromaticFadeInput) return 0;
-    const value = clampFloat(chromaticFadeInput.value, 0, 1, 0);
-    if (chromaticFadeDisplay) chromaticFadeDisplay.textContent = value.toFixed(2);
+    const value = parseVelocityInput(dom, 'chromaticFade');
+    chromaticFadeDisplay.textContent = value.toFixed(2);
     return value;
   }
 
   function updateTurbulenceDisplay() {
-    if (!turbulenceInput) return 0.3;
-    const value = clampFloat(turbulenceInput.value, 0, 1, 0.3);
-    if (turbulenceDisplay) turbulenceDisplay.textContent = value.toFixed(2);
+    const value = parseVelocityInput(dom, 'turbulence');
+    turbulenceDisplay.textContent = value.toFixed(2);
     return value;
   }
 
   // HDR & Bloom
   function updateExposureDisplay() {
-    if (!exposureInput) return 0.5;
-    const value = clampFloat(exposureInput.value, 0.1, 2, 0.5);
-    if (exposureDisplay) exposureDisplay.textContent = value.toFixed(2);
+    const value = parseVelocityInput(dom, 'exposure');
+    exposureDisplay.textContent = value.toFixed(2);
     return value;
   }
 
   function updateBloomStrengthDisplay() {
-    if (!bloomStrengthInput) return 0.08;
-    const value = clampFloat(bloomStrengthInput.value, 0, 0.5, 0.08);
-    if (bloomStrengthDisplay) bloomStrengthDisplay.textContent = value.toFixed(2);
+    const value = parseVelocityInput(dom, 'bloomStrength');
+    bloomStrengthDisplay.textContent = value.toFixed(2);
     return value;
   }
 
   function updateBloomThresholdDisplay() {
-    if (!bloomThresholdInput) return 0.75;
-    const value = clampFloat(bloomThresholdInput.value, 0.1, 1, 0.75);
-    if (bloomThresholdDisplay) bloomThresholdDisplay.textContent = value.toFixed(2);
+    const value = parseVelocityInput(dom, 'bloomThreshold');
+    bloomThresholdDisplay.textContent = value.toFixed(2);
     return value;
   }
 
   function updateAnamorphicDisplay() {
-    if (!anamorphicInput) return 1.2;
-    const value = clampFloat(anamorphicInput.value, 1, 3, 1.2);
-    if (anamorphicDisplay) anamorphicDisplay.textContent = value.toFixed(1);
+    const value = parseVelocityInput(dom, 'anamorphic');
+    anamorphicDisplay.textContent = value.toFixed(1);
     return value;
   }
 
   // Color Grading
   function updateSaturationDisplay() {
-    if (!saturationInput) return 1.15;
-    const value = clampFloat(saturationInput.value, 0.5, 2, 1.15);
-    if (saturationDisplay) saturationDisplay.textContent = value.toFixed(2);
+    const value = parseVelocityInput(dom, 'saturation');
+    saturationDisplay.textContent = value.toFixed(2);
     return value;
   }
 
   function updateContrastDisplay() {
-    if (!contrastInput) return 1.05;
-    const value = clampFloat(contrastInput.value, 0.5, 2, 1.05);
-    if (contrastDisplay) contrastDisplay.textContent = value.toFixed(2);
+    const value = parseVelocityInput(dom, 'contrast');
+    contrastDisplay.textContent = value.toFixed(2);
     return value;
   }
 
   function updateHighlightsDisplay() {
-    if (!highlightsInput) return 0.85;
-    const value = clampFloat(highlightsInput.value, 0.5, 1.5, 0.85);
-    if (highlightsDisplay) highlightsDisplay.textContent = value.toFixed(2);
+    const value = parseVelocityInput(dom, 'highlights');
+    highlightsDisplay.textContent = value.toFixed(2);
     return value;
   }
 
   function updateShadowsDisplay() {
-    if (!shadowsInput) return 1.05;
-    const value = clampFloat(shadowsInput.value, 0.5, 1.5, 1.05);
-    if (shadowsDisplay) shadowsDisplay.textContent = value.toFixed(2);
+    const value = parseVelocityInput(dom, 'shadows');
+    shadowsDisplay.textContent = value.toFixed(2);
     return value;
   }
 
   // Cinematic Effects
   function updateVignetteDisplay() {
-    if (!vignetteInput) return 0;
-    const value = clampFloat(vignetteInput.value, 0, 1, 0);
-    if (vignetteDisplay) vignetteDisplay.textContent = value.toFixed(2);
+    const value = parseVelocityInput(dom, 'vignette');
+    vignetteDisplay.textContent = value.toFixed(2);
     return value;
   }
 
   function updateFilmGrainDisplay() {
-    if (!filmGrainInput) return 0;
-    const value = clampFloat(filmGrainInput.value, 0, 0.1, 0);
-    if (filmGrainDisplay) filmGrainDisplay.textContent = value.toFixed(3);
+    const value = parseVelocityInput(dom, 'filmGrain');
+    filmGrainDisplay.textContent = value.toFixed(3);
     return value;
   }
 
   function updateChromaticAberrationDisplay() {
-    if (!chromaticAberrationInput) return 0;
-    const value = clampFloat(chromaticAberrationInput.value, 0, 1, 0);
-    if (chromaticAberrationDisplay) chromaticAberrationDisplay.textContent = value.toFixed(2);
+    const value = parseVelocityInput(dom, 'chromaticAberration');
+    chromaticAberrationDisplay.textContent = value.toFixed(2);
     return value;
   }
 
   function applyConfigFromUi() {
-    if (!enabledCheckbox?.checked) return;
-    if (typeof viewer.setVectorFieldConfig !== 'function') return;
+    if (!enabledCheckbox.checked) return;
 
     viewer.setVectorFieldConfig('particleCount', updateDensityDisplay());
     viewer.setVectorFieldConfig('speedMultiplier', updateSpeedDisplay());
     viewer.setVectorFieldConfig('lifetime', updateLifetimeDisplay());
     viewer.setVectorFieldConfig('particleSize', updateSizeDisplay());
     viewer.setVectorFieldConfig('opacity', updateOpacityDisplay());
-    if (colormapSelect) viewer.setVectorFieldConfig('colormapId', colormapSelect.value);
-    if (syncLodCheckbox) viewer.setVectorFieldConfig('syncWithLOD', Boolean(syncLodCheckbox.checked));
+    viewer.setVectorFieldConfig('colormapId', colormapSelect.value);
+    viewer.setVectorFieldConfig('syncWithLOD', syncLodCheckbox.checked);
     // Advanced settings - Particle Rendering
     viewer.setVectorFieldConfig('intensity', updateIntensityDisplay());
     viewer.setVectorFieldConfig('glowAmount', updateGlowDisplay());
@@ -357,17 +644,23 @@ export function initVelocityOverlayControls({ state, viewer, dom }) {
     const fieldsForDim = getFieldsForDim(dim);
     if (!fieldsForDim.length) return '';
 
-    const current = fieldSelect?.value ? String(fieldSelect.value) : '';
-    if (current && fieldsForDim.some((f) => f.id === current)) return current;
+    const current = fieldSelect.value;
+    if (current.length > 0) {
+      if (!fieldsForDim.some((field) => field.id === current)) {
+        throw new Error(
+          `Selected vector field "${current}" is not declared for ${dim}D.`
+        );
+      }
+      return current;
+    }
 
     const defaultId = getDefaultFieldId();
     if (defaultId && fieldsForDim.some((f) => f.id === defaultId)) return defaultId;
 
-    return String(fieldsForDim[0].id || '');
+    return '';
   }
 
   function renderFieldSelectForActiveDim() {
-    if (!fieldSelect) return;
     const dim = getActiveDim();
     const fieldsForDim = getFieldsForDim(dim);
     const selectedId = getSelectedFieldId();
@@ -375,10 +668,17 @@ export function initVelocityOverlayControls({ state, viewer, dom }) {
     suppressFieldChange = true;
     try {
       fieldSelect.innerHTML = '';
+      if (!selectedId && fieldsForDim.length > 0) {
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = 'Select vector field';
+        placeholder.disabled = true;
+        fieldSelect.appendChild(placeholder);
+      }
       for (const field of fieldsForDim) {
         const opt = document.createElement('option');
-        opt.value = String(field.id);
-        opt.textContent = String(field.label || field.id);
+        opt.value = field.id;
+        opt.textContent = field.label;
         fieldSelect.appendChild(opt);
       }
       fieldSelect.value = selectedId;
@@ -394,7 +694,7 @@ export function initVelocityOverlayControls({ state, viewer, dom }) {
     const fieldsForDim = getFieldsForDim(activeDim);
     const hasForDim = fieldsForDim.length > 0;
 
-    if (controlBlock) controlBlock.style.display = hasAny ? 'block' : 'none';
+    controlBlock.style.display = hasAny ? 'block' : 'none';
 
     if (!hasAny) {
       setInfo('');
@@ -403,20 +703,25 @@ export function initVelocityOverlayControls({ state, viewer, dom }) {
     }
 
     renderFieldSelectForActiveDim();
+    const hasSelectedField = getSelectedFieldId().length > 0;
 
-    if (enabledCheckbox) {
-      enabledCheckbox.disabled = enabling || !hasForDim;
-      if (!hasForDim && enabledCheckbox.checked) {
-        disableOverlayUi();
-      }
+    enabledCheckbox.disabled = enabling || !hasForDim || !hasSelectedField;
+    if (!hasForDim && enabledCheckbox.checked) {
+      disableOverlayUi();
     }
 
-    if (fieldSelect) fieldSelect.disabled = enabling || !hasForDim;
+    fieldSelect.disabled = enabling || !hasForDim;
 
     const dimList = unionDims.map((d) => `${d}D`).join(', ');
     if (!hasForDim) {
       setInfo(`Vector fields available for ${dimList}. Switch embedding dimension to enable.`);
-      if (settings) settings.style.display = 'none';
+      settings.style.display = 'none';
+      return;
+    }
+
+    if (!hasSelectedField) {
+      setInfo(`Available for ${dimList}. Select a vector field before enabling the overlay.`);
+      settings.style.display = 'block';
       return;
     }
 
@@ -427,18 +732,20 @@ export function initVelocityOverlayControls({ state, viewer, dom }) {
   async function ensureFieldForActiveDim() {
     const dim = getActiveDim();
     const fieldId = getSelectedFieldId();
-    if (!fieldId) return false;
-    if (typeof state.ensureVectorField !== 'function') return false;
-    const ok = await state.ensureVectorField(fieldId, dim);
-    if (ok && typeof viewer.setActiveVectorField === 'function') {
-      viewer.setActiveVectorField(fieldId);
+    if (fieldId.length === 0) {
+      throw new Error(
+        'A vector field must be selected before loading overlay data.'
+      );
     }
-    return ok;
+    await state.ensureVectorField(
+      fieldId,
+      dim,
+      { silent: false }
+    );
+    viewer.setActiveVectorField(fieldId);
   }
 
   async function handleEnabledChange() {
-    if (!enabledCheckbox) return;
-
     if (!enabledCheckbox.checked) {
       disableOverlayUi();
       syncAvailability();
@@ -458,34 +765,40 @@ export function initVelocityOverlayControls({ state, viewer, dom }) {
     setInfo('Loading vector field…');
 
     try {
-      const ok = await ensureFieldForActiveDim();
-      if (!ok) {
-        disableOverlayUi();
-        syncAvailability();
-        return;
-      }
-
-      if (typeof viewer.setVectorFieldOverlayEnabled === 'function') {
-        viewer.setVectorFieldOverlayEnabled(true);
-      }
+      await ensureFieldForActiveDim();
+      viewer.setVectorFieldOverlayEnabled(true);
       applyConfigFromUi();
       updateSettingsVisibility();
       syncAvailability();
-    } catch (err) {
-      console.warn('[UI] Failed to enable vector field overlay:', err);
-      getNotificationCenter().error(err?.message || 'Failed to load vector field overlay.', { category: 'render' });
+    } catch (error) {
+      if (!(error instanceof Error) || error.message.length === 0) {
+        throw new TypeError(
+          'Vector field overlay loading must reject with a non-empty Error.'
+        );
+      }
+      getNotificationCenter().error(error.message, { category: 'render' });
       disableOverlayUi();
       setInfo('Failed to load vector field.');
+      throw error;
     } finally {
       enabling = false;
-      if (enabledCheckbox) enabledCheckbox.disabled = false;
+      enabledCheckbox.disabled = false;
       syncAvailability();
     }
   }
 
   async function handleDimensionChanged() {
+    const selectedFieldId = fieldSelect.value;
+    if (
+      selectedFieldId.length > 0 &&
+      !getFieldsForDim(getActiveDim()).some(
+        (field) => field.id === selectedFieldId
+      )
+    ) {
+      fieldSelect.value = '';
+    }
     syncAvailability();
-    if (!enabledCheckbox?.checked) return;
+    if (!enabledCheckbox.checked) return;
 
     // Keep overlay on across dimension switches, but only if a field exists for that dim.
     const dims = getUnionDims();
@@ -498,35 +811,33 @@ export function initVelocityOverlayControls({ state, viewer, dom }) {
 
     try {
       enabling = true;
-      if (enabledCheckbox) enabledCheckbox.disabled = true;
+      enabledCheckbox.disabled = true;
       setInfo('Loading vector field…');
-      const ok = await ensureFieldForActiveDim();
-      if (!ok) {
-        disableOverlayUi();
-        syncAvailability();
-        return;
-      }
-      if (typeof viewer.setVectorFieldOverlayEnabled === 'function') {
-        viewer.setVectorFieldOverlayEnabled(true);
-      }
+      await ensureFieldForActiveDim();
+      viewer.setVectorFieldOverlayEnabled(true);
       applyConfigFromUi();
       syncAvailability();
-    } catch (err) {
-      console.warn('[UI] Failed to load vector field for new dimension:', err);
-      getNotificationCenter().error(err?.message || 'Failed to load vector field.', { category: 'render' });
+    } catch (error) {
+      if (!(error instanceof Error) || error.message.length === 0) {
+        throw new TypeError(
+          'Vector field dimension loading must reject with a non-empty Error.'
+        );
+      }
+      getNotificationCenter().error(error.message, { category: 'render' });
       disableOverlayUi();
       setInfo('Failed to load vector field.');
+      throw error;
     } finally {
       enabling = false;
-      if (enabledCheckbox) enabledCheckbox.disabled = false;
+      enabledCheckbox.disabled = false;
       syncAvailability();
     }
   }
 
   async function handleFieldChanged() {
-    if (!fieldSelect || suppressFieldChange) return;
+    if (suppressFieldChange) return;
     syncAvailability();
-    if (!enabledCheckbox?.checked) return;
+    if (!enabledCheckbox.checked) return;
     if (enabling) return;
 
     enabling = true;
@@ -534,19 +845,19 @@ export function initVelocityOverlayControls({ state, viewer, dom }) {
     fieldSelect.disabled = true;
     setInfo('Loading vector field…');
     try {
-      const ok = await ensureFieldForActiveDim();
-      if (!ok) {
-        disableOverlayUi();
-        syncAvailability();
-        return;
-      }
+      await ensureFieldForActiveDim();
       applyConfigFromUi();
       syncAvailability();
-    } catch (err) {
-      console.warn('[UI] Failed to load selected vector field:', err);
-      getNotificationCenter().error(err?.message || 'Failed to load vector field.', { category: 'render' });
+    } catch (error) {
+      if (!(error instanceof Error) || error.message.length === 0) {
+        throw new TypeError(
+          'Vector field selection loading must reject with a non-empty Error.'
+        );
+      }
+      getNotificationCenter().error(error.message, { category: 'render' });
       disableOverlayUi();
       setInfo('Failed to load vector field.');
+      throw error;
     } finally {
       enabling = false;
       enabledCheckbox.disabled = false;
@@ -557,6 +868,7 @@ export function initVelocityOverlayControls({ state, viewer, dom }) {
 
   function handleVectorFieldsChanged() {
     // Dataset swap: reset toggle state so we don’t keep an overlay enabled across datasets.
+    fieldSelect.value = '';
     disableOverlayUi();
     syncAvailability();
   }
@@ -565,112 +877,114 @@ export function initVelocityOverlayControls({ state, viewer, dom }) {
   // DOM wiring
   // ---------------------------------------------------------------------------
 
-  enabledCheckbox?.addEventListener('change', handleEnabledChange);
-  fieldSelect?.addEventListener('change', handleFieldChanged);
+  enabledCheckbox.addEventListener('change', handleEnabledChange);
+  fieldSelect.addEventListener('change', handleFieldChanged);
 
-  densityInput?.addEventListener('input', () => {
+  densityInput.addEventListener('input', () => {
     const particles = updateDensityDisplay();
-    if (enabledCheckbox?.checked && !enabling) viewer.setVectorFieldConfig?.('particleCount', particles);
+    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('particleCount', particles);
   });
-  speedInput?.addEventListener('input', () => {
+  speedInput.addEventListener('input', () => {
     const speed = updateSpeedDisplay();
-    if (enabledCheckbox?.checked && !enabling) viewer.setVectorFieldConfig?.('speedMultiplier', speed);
+    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('speedMultiplier', speed);
   });
-  lifetimeInput?.addEventListener('input', () => {
+  lifetimeInput.addEventListener('input', () => {
     const lifetime = updateLifetimeDisplay();
-    if (enabledCheckbox?.checked && !enabling) viewer.setVectorFieldConfig?.('lifetime', lifetime);
+    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('lifetime', lifetime);
   });
-  sizeInput?.addEventListener('input', () => {
+  sizeInput.addEventListener('input', () => {
     const size = updateSizeDisplay();
-    if (enabledCheckbox?.checked && !enabling) viewer.setVectorFieldConfig?.('particleSize', size);
+    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('particleSize', size);
   });
-  opacityInput?.addEventListener('input', () => {
+  opacityInput.addEventListener('input', () => {
     const opacity = updateOpacityDisplay();
-    if (enabledCheckbox?.checked && !enabling) viewer.setVectorFieldConfig?.('opacity', opacity);
+    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('opacity', opacity);
   });
-  colormapSelect?.addEventListener('change', () => {
-    if (enabledCheckbox?.checked && !enabling) viewer.setVectorFieldConfig?.('colormapId', colormapSelect.value);
+  colormapSelect.addEventListener('change', () => {
+    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('colormapId', colormapSelect.value);
   });
-  syncLodCheckbox?.addEventListener('change', () => {
-    if (enabledCheckbox?.checked && !enabling) viewer.setVectorFieldConfig?.('syncWithLOD', Boolean(syncLodCheckbox.checked));
+  syncLodCheckbox.addEventListener('change', () => {
+    if (enabledCheckbox.checked && !enabling) {
+      viewer.setVectorFieldConfig('syncWithLOD', syncLodCheckbox.checked);
+    }
   });
 
   // Advanced settings event listeners - Particle Rendering
-  intensityInput?.addEventListener('input', () => {
+  intensityInput.addEventListener('input', () => {
     const value = updateIntensityDisplay();
-    if (enabledCheckbox?.checked && !enabling) viewer.setVectorFieldConfig?.('intensity', value);
+    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('intensity', value);
   });
-  glowInput?.addEventListener('input', () => {
+  glowInput.addEventListener('input', () => {
     const value = updateGlowDisplay();
-    if (enabledCheckbox?.checked && !enabling) viewer.setVectorFieldConfig?.('glowAmount', value);
+    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('glowAmount', value);
   });
-  cometStretchInput?.addEventListener('input', () => {
+  cometStretchInput.addEventListener('input', () => {
     const value = updateCometStretchDisplay();
-    if (enabledCheckbox?.checked && !enabling) viewer.setVectorFieldConfig?.('cometStretch', value);
+    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('cometStretch', value);
   });
-  coreSharpnessInput?.addEventListener('input', () => {
+  coreSharpnessInput.addEventListener('input', () => {
     const value = updateCoreSharpnessDisplay();
-    if (enabledCheckbox?.checked && !enabling) viewer.setVectorFieldConfig?.('coreSharpness', value);
+    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('coreSharpness', value);
   });
   // Trail settings
-  trailFadeInput?.addEventListener('input', () => {
+  trailFadeInput.addEventListener('input', () => {
     const value = updateTrailFadeDisplay();
-    if (enabledCheckbox?.checked && !enabling) viewer.setVectorFieldConfig?.('trailFade', value);
+    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('trailFade', value);
   });
-  chromaticFadeInput?.addEventListener('input', () => {
+  chromaticFadeInput.addEventListener('input', () => {
     const value = updateChromaticFadeDisplay();
-    if (enabledCheckbox?.checked && !enabling) viewer.setVectorFieldConfig?.('chromaticFade', value);
+    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('chromaticFade', value);
   });
-  turbulenceInput?.addEventListener('input', () => {
+  turbulenceInput.addEventListener('input', () => {
     const value = updateTurbulenceDisplay();
-    if (enabledCheckbox?.checked && !enabling) viewer.setVectorFieldConfig?.('turbulence', value);
+    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('turbulence', value);
   });
   // HDR & Bloom
-  exposureInput?.addEventListener('input', () => {
+  exposureInput.addEventListener('input', () => {
     const value = updateExposureDisplay();
-    if (enabledCheckbox?.checked && !enabling) viewer.setVectorFieldConfig?.('exposure', value);
+    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('exposure', value);
   });
-  bloomStrengthInput?.addEventListener('input', () => {
+  bloomStrengthInput.addEventListener('input', () => {
     const value = updateBloomStrengthDisplay();
-    if (enabledCheckbox?.checked && !enabling) viewer.setVectorFieldConfig?.('bloomStrength', value);
+    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('bloomStrength', value);
   });
-  bloomThresholdInput?.addEventListener('input', () => {
+  bloomThresholdInput.addEventListener('input', () => {
     const value = updateBloomThresholdDisplay();
-    if (enabledCheckbox?.checked && !enabling) viewer.setVectorFieldConfig?.('bloomThreshold', value);
+    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('bloomThreshold', value);
   });
-  anamorphicInput?.addEventListener('input', () => {
+  anamorphicInput.addEventListener('input', () => {
     const value = updateAnamorphicDisplay();
-    if (enabledCheckbox?.checked && !enabling) viewer.setVectorFieldConfig?.('anamorphicRatio', value);
+    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('anamorphicRatio', value);
   });
   // Color Grading
-  saturationInput?.addEventListener('input', () => {
+  saturationInput.addEventListener('input', () => {
     const value = updateSaturationDisplay();
-    if (enabledCheckbox?.checked && !enabling) viewer.setVectorFieldConfig?.('saturation', value);
+    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('saturation', value);
   });
-  contrastInput?.addEventListener('input', () => {
+  contrastInput.addEventListener('input', () => {
     const value = updateContrastDisplay();
-    if (enabledCheckbox?.checked && !enabling) viewer.setVectorFieldConfig?.('contrast', value);
+    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('contrast', value);
   });
-  highlightsInput?.addEventListener('input', () => {
+  highlightsInput.addEventListener('input', () => {
     const value = updateHighlightsDisplay();
-    if (enabledCheckbox?.checked && !enabling) viewer.setVectorFieldConfig?.('highlights', value);
+    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('highlights', value);
   });
-  shadowsInput?.addEventListener('input', () => {
+  shadowsInput.addEventListener('input', () => {
     const value = updateShadowsDisplay();
-    if (enabledCheckbox?.checked && !enabling) viewer.setVectorFieldConfig?.('shadows', value);
+    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('shadows', value);
   });
   // Cinematic Effects
-  vignetteInput?.addEventListener('input', () => {
+  vignetteInput.addEventListener('input', () => {
     const value = updateVignetteDisplay();
-    if (enabledCheckbox?.checked && !enabling) viewer.setVectorFieldConfig?.('vignette', value);
+    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('vignette', value);
   });
-  filmGrainInput?.addEventListener('input', () => {
+  filmGrainInput.addEventListener('input', () => {
     const value = updateFilmGrainDisplay();
-    if (enabledCheckbox?.checked && !enabling) viewer.setVectorFieldConfig?.('filmGrain', value);
+    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('filmGrain', value);
   });
-  chromaticAberrationInput?.addEventListener('input', () => {
+  chromaticAberrationInput.addEventListener('input', () => {
     const value = updateChromaticAberrationDisplay();
-    if (enabledCheckbox?.checked && !enabling) viewer.setVectorFieldConfig?.('chromaticAberration', value);
+    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('chromaticAberration', value);
   });
 
   // ---------------------------------------------------------------------------
@@ -680,8 +994,8 @@ export function initVelocityOverlayControls({ state, viewer, dom }) {
   const onVectorFieldsChanged = () => handleVectorFieldsChanged();
   const onDimChanged = () => handleDimensionChanged();
 
-  state?.on?.('vectorFields:changed', onVectorFieldsChanged);
-  state?.on?.('dimension:changed', onDimChanged);
+  state.on('vectorFields:changed', onVectorFieldsChanged);
+  state.on('dimension:changed', onDimChanged);
 
   // Initialize UI state.
   updateDensityDisplay();
@@ -718,10 +1032,10 @@ export function initVelocityOverlayControls({ state, viewer, dom }) {
   return {
     syncAvailability,
     destroy() {
-      enabledCheckbox?.removeEventListener('change', handleEnabledChange);
-      fieldSelect?.removeEventListener('change', handleFieldChanged);
-      state?.off?.('vectorFields:changed', onVectorFieldsChanged);
-      state?.off?.('dimension:changed', onDimChanged);
+      enabledCheckbox.removeEventListener('change', handleEnabledChange);
+      fieldSelect.removeEventListener('change', handleFieldChanged);
+      state.off('vectorFields:changed', onVectorFieldsChanged);
+      state.off('dimension:changed', onDimChanged);
     }
   };
 }

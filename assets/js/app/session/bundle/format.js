@@ -30,10 +30,10 @@ export const U32_BYTES = 4;
 export const MAX_MANIFEST_BYTES = 16 * 1024 * 1024;
 
 /**
- * Default hard cap for decompressed chunk size when `uncompressedBytes` is missing.
- * This is a zip-bomb guard; contributors should also validate decoded content.
+ * Hard cap for every uncompressed chunk.
+ * This is a zip-bomb guard; `uncompressedBytes` is required in the current schema.
  */
-export const DEFAULT_MAX_UNCOMPRESSED_CHUNK_BYTES = 512 * 1024 * 1024;
+export const MAX_UNCOMPRESSED_CHUNK_BYTES = 512 * 1024 * 1024;
 
 /**
  * Hard cap for stored chunk size (after codec, before decompression/JSON parse).
@@ -50,9 +50,12 @@ export const MAX_STORED_CHUNK_BYTES = 512 * 1024 * 1024;
  * @returns {Uint8Array}
  */
 export function u32ToBytesLE(value) {
+  if (!Number.isInteger(value) || value < 0 || value > 0xffff_ffff) {
+    throw new TypeError('u32ToBytesLE: value must be an exact unsigned 32-bit integer.');
+  }
   const out = new Uint8Array(U32_BYTES);
   const view = new DataView(out.buffer);
-  view.setUint32(0, value >>> 0, true);
+  view.setUint32(0, value, true);
   return out;
 }
 

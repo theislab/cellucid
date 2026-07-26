@@ -28,7 +28,7 @@
 
 import { clamp } from '../../../../utils/number-utils.js';
 import { createMulberry32 } from '../../../../utils/random-utils.js';
-import { cropRect01ToPx, normalizeCropRect01 } from './crop.js';
+import { assertCropRect01, cropRect01ToPx } from './crop.js';
 
 /**
  * @typedef {object} ReducedViewportPoints
@@ -93,7 +93,7 @@ export function reducePointsByDensity({
   const viewportH = Math.max(1, renderState.viewportHeight || 1);
   const mvp = renderState.mvpMatrix;
 
-  const crop01 = normalizeCropRect01(crop);
+  const crop01 = assertCropRect01(crop);
   const cropPx = cropRect01ToPx(crop01, viewportW, viewportH);
   const hasCrop = Boolean(
     cropPx &&

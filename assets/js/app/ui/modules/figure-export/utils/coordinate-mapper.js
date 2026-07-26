@@ -8,7 +8,7 @@
  * @module ui/modules/figure-export/utils/coordinate-mapper
  */
 
-import { cropRect01ToPx, normalizeCropRect01 } from './crop.js';
+import { assertCropRect01, cropRect01ToPx } from './crop.js';
 
 /**
  * @typedef {object} NormTransform
@@ -23,11 +23,29 @@ import { cropRect01ToPx, normalizeCropRect01 } from './crop.js';
  * @returns {{ x: number, y: number }}
  */
 export function denormalizeXY(x, y, transform) {
-  const scale = transform?.scale || 1;
-  const center = transform?.center || [0, 0, 0];
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    throw new TypeError('Figure-export coordinates must be finite numbers.');
+  }
+  if (
+    transform === null ||
+    typeof transform !== 'object' ||
+    Array.isArray(transform) ||
+    Object.getPrototypeOf(transform) !== Object.prototype ||
+    Object.keys(transform).sort().join(',') !== 'center,scale' ||
+    !Array.isArray(transform.center) ||
+    transform.center.length !== 3 ||
+    transform.center.some((value) => !Number.isFinite(value)) ||
+    !Number.isFinite(transform.scale) ||
+    transform.scale <= 0
+  ) {
+    throw new TypeError(
+      'Figure-export normalization transform must contain exact finite center and positive scale values.'
+    );
+  }
+  const { scale, center } = transform;
   return {
-    x: (x / scale) + (center[0] || 0),
-    y: (y / scale) + (center[1] || 0),
+    x: (x / scale) + center[0],
+    y: (y / scale) + center[1],
   };
 }
 
@@ -35,8 +53,8 @@ export function denormalizeXY(x, y, transform) {
  * Compute coordinate bounds for the currently visible region by scanning points
  * that fall within clip space.
  *
- * If `normTransform` is available, bounds are reported in "real" (denormalized)
- * coordinates; otherwise bounds fall back to the normalized coordinate space.
+ * Bounds are reported in exact real (denormalized) coordinates. A missing
+ * normalization transform is a contract failure.
  *
  * This is conservative and fast: it does not attempt to reconstruct viewport
  * corners, but matches what is actually drawn (after filtering + clipping).
@@ -49,7 +67,7 @@ export function denormalizeXY(x, y, transform) {
  * @param {number} [options.viewportWidth]
  * @param {number} [options.viewportHeight]
  * @param {{ enabled?: boolean; x?: number; y?: number; width?: number; height?: number } | null} [options.crop]
- * @param {NormTransform|null} [options.normTransform]
+ * @param {NormTransform} options.normTransform
  * @returns {{ minX: number, maxX: number, minY: number, maxY: number } | null}
  */
 export function computeVisibleRealBounds({
@@ -60,7 +78,7 @@ export function computeVisibleRealBounds({
   viewportWidth = 1,
   viewportHeight = 1,
   crop = null,
-  normTransform = null
+  normTransform
 }) {
   if (!positions || !mvpMatrix) return null;
 
@@ -68,7 +86,7 @@ export function computeVisibleRealBounds({
   const m = mvpMatrix;
   const vw = Math.max(1, Number(viewportWidth) || 1);
   const vh = Math.max(1, Number(viewportHeight) || 1);
-  const crop01 = normalizeCropRect01(crop);
+  const crop01 = assertCropRect01(crop);
   const cropPx = cropRect01ToPx(crop01, vw, vh);
   const hasCrop = Boolean(
     cropPx &&
@@ -157,7 +175,7 @@ export function computeVisibleCameraBounds({
   const v = viewMatrix;
   const vw = Math.max(1, Number(viewportWidth) || 1);
   const vh = Math.max(1, Number(viewportHeight) || 1);
-  const crop01 = normalizeCropRect01(crop);
+  const crop01 = assertCropRect01(crop);
   const cropPx = cropRect01ToPx(crop01, vw, vh);
   const hasCrop = Boolean(
     cropPx &&

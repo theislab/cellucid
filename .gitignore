@@ -5,7 +5,8 @@ __pycache__/
 .pytest_cache/
 
 # Virtual envs
-.env
+.env*
+.dev.vars*
 .venv
 env/
 venv/
@@ -18,7 +19,7 @@ venv/
 # Jupyter
 .ipynb_checkpoints/
 
-# Data artifacts (keep placeholders)
+# Data artifacts (keep directory sentinels)
 data/raw/**
 /markdown/*
 !data/raw/.gitkeep
@@ -39,3 +40,9 @@ python/*.egg-info
 
 project_context.txt
 /assets/exports/_*/
+/.playwright-cli
+/node_modules/
+/playwright-report/
+/test-results/
+/output/
+/.cellucid-maintenance

@@ -16,33 +16,169 @@
  * Update browser URL to reflect current data source.
  * Uses replaceState (no history entry, no reload).
  *
- * @param {string|null} sourceType - 'local-demo', 'remote', 'github-repo', 'local-user', or null
- * @param {Object} sourceInfo - Source-specific info:
+ * @param {'local-demo'|'remote'|'github-repo'|'local-user'|'jupyter'|null} sourceType
+ * @param {Object} sourceInfo - Exact source-specific record:
  *   - local-demo: { datasetId }
  *   - remote: { serverUrl }
  *   - github-repo: { path }
- *   - local-user/null: {} (clears URL)
+ *   - local-user/jupyter/null: {}
  */
-export function updateUrlForDataSource(sourceType, sourceInfo = {}) {
-  const url = new URL(window.location.href);
+export function updateUrlForDataSource(sourceType, sourceInfo) {
+  const sourceState = requireUrlSourceState(sourceType, sourceInfo);
+  const browser = requireBrowserHistoryOwner();
+  const url = new URL(browser.location.href);
 
-  // Clear all data-related params first
   url.searchParams.delete('dataset');
   url.searchParams.delete('source');
   url.searchParams.delete('remote');
   url.searchParams.delete('github');
 
-  // Set new params based on source type
-  if (sourceType === 'local-demo' && sourceInfo.datasetId) {
-    url.searchParams.set('dataset', sourceInfo.datasetId);
-  } else if (sourceType === 'remote' && sourceInfo.serverUrl) {
-    url.searchParams.set('remote', sourceInfo.serverUrl);
-  } else if (sourceType === 'github-repo' && sourceInfo.path) {
-    url.searchParams.set('github', sourceInfo.path);
+  if (sourceState.param !== null) {
+    url.searchParams.set(sourceState.param, sourceState.value);
   }
-  // For local-user, h5ad, zarr, or null: leave URL clean (no params)
 
-  history.replaceState(null, '', url.toString());
+  browser.history.replaceState(null, '', url.toString());
+}
+
+const URL_FREE_SOURCE_TYPES = new Set(['local-user', 'jupyter']);
+
+function requirePlainDataRecord(value, expectedKeys, label) {
+  if (
+    value === null ||
+    typeof value !== 'object' ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype
+  ) {
+    throw new TypeError(`${label} must be a plain object.`);
+  }
+
+  const ownKeys = Reflect.ownKeys(value);
+  if (
+    ownKeys.length !== expectedKeys.length ||
+    ownKeys.some(
+      key => typeof key !== 'string' || !expectedKeys.includes(key)
+    )
+  ) {
+    throw new TypeError(
+      `${label} must contain exactly: ${expectedKeys.join(', ')}.`
+    );
+  }
+
+  for (const key of expectedKeys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (
+      descriptor === undefined ||
+      descriptor.enumerable !== true ||
+      !Object.hasOwn(descriptor, 'value')
+    ) {
+      throw new TypeError(`${label}.${key} must be an enumerable data field.`);
+    }
+  }
+
+  return value;
+}
+
+function requireExactString(value, label) {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value.trim() !== value
+  ) {
+    throw new TypeError(`${label} must be a non-empty, unpadded string.`);
+  }
+  return value;
+}
+
+function requireHttpServerUrl(value) {
+  requireExactString(value, 'Remote URL state serverUrl');
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new TypeError(
+      'Remote URL state serverUrl must be an absolute HTTP(S) URL.'
+    );
+  }
+  if (
+    parsed.protocol !== 'http:' &&
+    parsed.protocol !== 'https:'
+  ) {
+    throw new TypeError(
+      'Remote URL state serverUrl must be an absolute HTTP(S) URL.'
+    );
+  }
+  return value;
+}
+
+function requireUrlSourceState(sourceType, sourceInfo) {
+  if (sourceType === null) {
+    requirePlainDataRecord(sourceInfo, [], 'Empty dataset URL state');
+    return { param: null, value: null };
+  }
+  if (sourceType === 'local-demo') {
+    const record = requirePlainDataRecord(
+      sourceInfo,
+      ['datasetId'],
+      'Local demo URL state'
+    );
+    return {
+      param: 'dataset',
+      value: requireExactString(
+        record.datasetId,
+        'Local demo URL state datasetId'
+      ),
+    };
+  }
+  if (sourceType === 'remote') {
+    const record = requirePlainDataRecord(
+      sourceInfo,
+      ['serverUrl'],
+      'Remote URL state'
+    );
+    return {
+      param: 'remote',
+      value: requireHttpServerUrl(record.serverUrl),
+    };
+  }
+  if (sourceType === 'github-repo') {
+    const record = requirePlainDataRecord(
+      sourceInfo,
+      ['path'],
+      'GitHub URL state'
+    );
+    return {
+      param: 'github',
+      value: requireExactString(record.path, 'GitHub URL state path'),
+    };
+  }
+  if (URL_FREE_SOURCE_TYPES.has(sourceType)) {
+    requirePlainDataRecord(
+      sourceInfo,
+      [],
+      `${sourceType} URL state`
+    );
+    return { param: null, value: null };
+  }
+  throw new RangeError('Unknown URL data source type.');
+}
+
+function requireBrowserHistoryOwner() {
+  if (
+    typeof window !== 'object' ||
+    window === null ||
+    typeof window.location !== 'object' ||
+    window.location === null ||
+    typeof window.location.href !== 'string' ||
+    window.location.href.length === 0 ||
+    typeof window.history !== 'object' ||
+    window.history === null ||
+    typeof window.history.replaceState !== 'function'
+  ) {
+    throw new TypeError(
+      'URL state requires a browser location and history owner.'
+    );
+  }
+  return window;
 }
 
 /**

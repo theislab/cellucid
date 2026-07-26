@@ -4,10 +4,11 @@
  * Implements lazy loading for Plotly.js to improve initial page load performance.
  * The library is only loaded when the Page Analysis module is first used.
  *
- * GPU RENDERING POLICY:
- * - WebGL2 is required (no non-WebGL trace fallbacks)
- * - Use GPU-accelerated traces (scattergl/heatmapgl) for performance
- * - Rendering must remain functional across WebGL2-capable browsers/devices
+ * RENDERING POLICY:
+ * - Every 2D Cartesian scatter trace uses Plotly's SVG `scatter` renderer.
+ * - Plotly heatmaps that explicitly select `heatmapgl` require WebGL2.
+ * - A trace renderer is selected once before execution and is never changed to a
+ *   different renderer after failure.
  *
  * Also provides hint management integration - see plotly-hints.js
  */
@@ -17,7 +18,7 @@
 // =============================================================================
 
 /**
- * @typedef {'scattergl'|'scatter'|'scatter3d'|'heatmapgl'|'heatmap'|'histogram'|'box'|'violin'|'bar'|'pie'} TraceType
+ * @typedef {'scatter'|'scatter3d'|'heatmapgl'|'heatmap'|'histogram'|'box'|'violin'|'bar'|'pie'} TraceType
  * Plotly trace types used by the analysis module.
  */
 
@@ -71,7 +72,7 @@
  * @property {number} sampleSize - Sample size when exceeding max
  */
 
-import { attachPlotlyHints, detachPlotlyHints, hidePlotlyNativeHints } from './plotly-hints.js';
+import { attachPlotlyHints, hidePlotlyNativeHints } from './plotly-hints.js';
 import { applyThemeToAllPlots, getPlotTheme, invalidatePlotThemeCache } from '../shared/plot-theme.js';
 
 // Keep Plotly charts in sync with the active CSS theme.
@@ -103,27 +104,14 @@ export const PlotPerformanceConfig = {
   sampleSize: 50000
 };
 
-/**
- * GPU-accelerated trace types mapping
- * All rendering uses WebGL - no SVG fallbacks
- * @type {Object}
- */
-export const GPU_TRACE_TYPES = {
-  scatter: 'scattergl',
-  scatter3d: 'scatter3d',
-  heatmap: 'heatmapgl',
-  histogram: 'histogram',
-  box: 'box',
-  violin: 'violin',
-  bar: 'bar',
-  pie: 'pie'
-};
+/** The sole current Plotly renderer for every 2D Cartesian scatter trace. */
+export const PLOTLY_2D_SCATTER_TRACE_TYPE = 'scatter';
 
 /**
  * Verify WebGL2 support.
  *
- * Note: Plot rendering has non-WebGL fallbacks, but some compute backends
- * (GPUCompute) may still require WebGL2. This helper is kept for those cases.
+ * Two-dimensional scatter plots do not use WebGL. Explicit WebGL plot types
+ * and compute backends still use this capability guard.
  *
  * @throws {Error} If WebGL2 is not supported
  */
@@ -164,37 +152,12 @@ export function isWebGL2Available() {
 }
 
 /**
- * Get the preferred scatter trace type.
- * @returns {'scattergl'|'scatter'}
- */
-export function getScatterTraceType() {
-  requireWebGL2();
-  return 'scattergl';
-}
-
-/**
  * Get the preferred heatmap trace type.
  * @returns {'heatmapgl'|'heatmap'}
  */
 export function getHeatmapTraceType() {
   requireWebGL2();
   return 'heatmapgl';
-}
-
-/**
- * Get the preferred trace type for any base type.
- * @param {string} baseType - Base trace type (scatter, heatmap, etc.)
- * @returns {string} GPU-accelerated trace type
- */
-export function getGPUTraceType(baseType) {
-  if (baseType === 'scatter') return getScatterTraceType();
-  if (baseType === 'heatmap') return getHeatmapTraceType();
-
-  if ((baseType === 'scattergl' || baseType === 'heatmapgl') && !isWebGL2Available()) {
-    requireWebGL2();
-  }
-
-  return GPU_TRACE_TYPES[baseType] || baseType;
 }
 
 /**
@@ -262,13 +225,9 @@ export function loadPlotly() {
     plotlyLoaded = true;
     // Ensure Plotly notifications are routed through NotificationCenter even if
     // Plotly was loaded outside this lazy loader.
-    try {
-      hidePlotlyNativeHints();
-      attachPlotlyHints();
-      nativeHintsHidden = true;
-    } catch (_err) {
-      // Ignore - hint patching is best-effort
-    }
+    hidePlotlyNativeHints();
+    attachPlotlyHints();
+    nativeHintsHidden = true;
     return Promise.resolve(window.Plotly);
   }
 
@@ -288,13 +247,9 @@ export function loadPlotly() {
       // Initialize Plotly hint/notification interception once Plotly is available.
       // This ensures plots created via Plotly.newPlot directly (e.g. PlotFactory)
       // still get the same notification UX as plots created through our wrappers.
-      try {
-        hidePlotlyNativeHints();
-        attachPlotlyHints();
-        nativeHintsHidden = true;
-      } catch (_err) {
-        // Ignore - hint patching is best-effort
-      }
+      hidePlotlyNativeHints();
+      attachPlotlyHints();
+      nativeHintsHidden = true;
       resolve(window.Plotly);
     };
 
@@ -326,12 +281,9 @@ export async function withPlotly(callback) {
  * @param {Object[]} traces
  * @param {Object} layout
  * @param {Object} config
- * @param {Object} [hintOptions] - Options for hint management
- * @param {boolean} [hintOptions.enableHints=true] - Attach custom hints
- * @param {string} [hintOptions.plotName] - Name to include in hints
  * @returns {Promise<Object>}
  */
-export async function newPlot(container, traces, layout, config, hintOptions = {}) {
+export async function newPlot(container, traces, layout, config) {
   const Plotly = await loadPlotly();
 
   // Hide native Plotly hints on first plot creation
@@ -342,13 +294,7 @@ export async function newPlot(container, traces, layout, config, hintOptions = {
 
   const figure = await Plotly.newPlot(container, traces, layout, config);
 
-  // Attach custom hints unless disabled
-  if (hintOptions.enableHints !== false) {
-    attachPlotlyHints(container, {
-      plotName: hintOptions.plotName,
-      showZoomHints: true
-    });
-  }
+  attachPlotlyHints(container);
 
   return figure;
 }
@@ -358,16 +304,12 @@ export async function newPlot(container, traces, layout, config, hintOptions = {
  * @param {HTMLElement} container
  */
 export function purgePlot(container) {
-  if (isPlotlyLoaded() && window.Plotly && container) {
-    try {
-      // Detach hints before purging
-      detachPlotlyHints(container);
-
-      window.Plotly.purge(container);
-    } catch (e) {
-      // Ignore errors during cleanup
-    }
+  if (container === null || container === undefined) return;
+  if (!isPlotlyLoaded()) return;
+  if (typeof window.Plotly?.purge !== 'function') {
+    throw new TypeError('Plotly.purge is required for plot cleanup');
   }
+  window.Plotly.purge(container);
 }
 
 /**
@@ -478,7 +420,7 @@ export async function createMinimalPlotly() {
 }
 
 // Re-export hint management functions for convenience
-export { attachPlotlyHints, detachPlotlyHints, hidePlotlyNativeHints };
+export { attachPlotlyHints, hidePlotlyNativeHints };
 
 export default {
   loadPlotly,
@@ -492,15 +434,12 @@ export default {
   createMinimalPlotly,
   // Hint management
   attachPlotlyHints,
-  detachPlotlyHints,
   hidePlotlyNativeHints,
   // WebGL2 / GPU acceleration helpers
   requireWebGL2,
   isWebGL2Available,
-  getScatterTraceType,
+  PLOTLY_2D_SCATTER_TRACE_TYPE,
   getHeatmapTraceType,
-  getGPUTraceType,
-  GPU_TRACE_TYPES,
   sampleLargeDataset,
   PlotPerformanceConfig
 };

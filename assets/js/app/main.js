@@ -16,6 +16,12 @@ import { createViewer } from '../rendering/viewer.js';
 import { createDataState } from './state/index.js';
 import { initUI } from './ui/core/ui-coordinator.js';
 import { createSessionSerializer } from './session/index.js';
+import {
+  createLatestDatasetReloadCoordinator,
+  handleDatasetReloadFailure,
+  settlePublishedDatasetUi,
+  stageDatasetPositionPayload
+} from './dataset-reload-outcome.js';
 import { initDockableAccordions } from './dockable-accordions.js';
 import { setDockableAccordions } from './dockable-accordions-registry.js';
 import { getNotificationCenter } from './notification-center.js';
@@ -25,75 +31,65 @@ import {
   loadVarManifest,
   createVarFieldLoader,
   loadConnectivityManifest,
-  hasEdgeFormat,
   loadEdges,
   loadDatasetIdentity,
   getEmbeddingsMetadata
 } from '../data/data-loaders.js';
-import { createDimensionManager } from '../data/dimension-manager.js';
+import {
+  createDimensionManager,
+  createInMemoryDimensionManager
+} from '../data/dimension-manager.js';
 import { createVectorFieldManager } from '../data/vector-field-manager.js';
+import {
+  loadDatasetGeneration
+} from '../data/dataset-generation-contract.js';
+import {
+  createDatasetReloadSupersededError,
+  isDatasetReloadSupersededError
+} from '../data/dataset-lifecycle-errors.js';
 import { getDataSourceManager } from '../data/data-source-manager.js';
 import { createLocalUserDirDataSource } from '../data/local-user-source.js';
 import { createRemoteDataSource } from '../data/remote-source.js';
-import { createJupyterBridgeDataSource, isJupyterContext, getJupyterConfig } from '../data/jupyter-source.js';
+import {
+  createJupyterBridgeDataSource,
+  getJupyterConfig,
+  isJupyterContext,
+  uploadJupyterSessionBundle
+} from '../data/jupyter-source.js';
+import {
+  createJupyterCommandHandlers
+} from './jupyter-command-handler.js';
 // formatNumber imported from data-source.js; benchmark module lazy-loaded when needed
 import { formatCellCount as formatNumber } from '../data/data-source.js';
 import { createComparisonModule } from './analysis/comparison-module.js';
 import { ThemeManager } from '../utils/theme-manager.js';
 import { debug } from '../utils/debug.js';
 import { clamp } from './utils/number-utils.js';
-import { createMulberry32 } from './utils/random-utils.js';
+import { shuffleConnectivityEdges } from './utils/random-utils.js';
 import { getGitHubAuthSession } from './community-annotations/github-auth.js';
 import { initKeyboardShortcuts, initWelcomeModal, shouldShowWelcome, showWelcomeModal } from './ui/onboarding/index.js';
 import {
   initAnalytics,
   trackDataLoadMethod,
   beginDataLoad,
+  cancelDataLoad,
   completeDataLoadSuccess,
   completeDataLoadFailure,
   DATA_LOAD_METHODS
 } from '../analytics/tracker.js';
 import { initPerformanceAnalytics } from '../analytics/performance.js';
+import {
+  classifySameOriginHealthAdvertisement,
+  readExactTrueUrlFlag,
+  readOptionalExactUrlParameter,
+  selectIntentDatasetId
+} from './startup-url-intent.js';
+import {
+  normalizeStartupError,
+  publishStartupFailure
+} from './startup-failure.js';
 
 debug.log('Starting…');
-
-ThemeManager.init();
-
-getGitHubAuthSession()
-  .completeSignInFromRedirect()
-  .then((result) => {
-    if (!result) return;
-    const who = String(result.user?.login || '').trim();
-    const message = who ? `Signed in with GitHub as @${who}.` : 'Signed in with GitHub.';
-    const notify = () => {
-      try {
-        getNotificationCenter().success(message, { category: 'annotation', duration: 2800 });
-      } catch {
-        // ignore
-      }
-    };
-    if (document?.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', notify, { once: true });
-    } else {
-      notify();
-    }
-  })
-  .catch((err) => {
-    debug.log('[GitHubAuth] Redirect completion failed:', err);
-    const msg = String(err?.message || '').trim() || 'GitHub sign-in failed.';
-    const notify = () => {
-      try {
-        getNotificationCenter().error(msg, { category: 'annotation', duration: 8000 });
-      } catch {
-        // ignore
-      }
-    };
-    if (document?.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', notify, { once: true });
-    } else {
-      notify();
-    }
-  });
 
 const FAST_BINARY_FETCH_INIT = { cache: 'force-cache' };
 
@@ -101,54 +97,65 @@ const FAST_BINARY_FETCH_INIT = { cache: 'force-cache' };
 let EXPORT_BASE_URL = '';
 
 // Helper to get URLs based on current dataset
-function getObsManifestUrl() { return `${EXPORT_BASE_URL}obs_manifest.json`; }
-function getVarManifestUrl() { return `${EXPORT_BASE_URL}var_manifest.json`; }
-function getConnectivityManifestUrl() { return `${EXPORT_BASE_URL}connectivity_manifest.json`; }
-function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.json`; }
+function getObsManifestUrl(baseUrl) { return `${baseUrl}obs_manifest.json`; }
+function getVarManifestUrl(baseUrl) { return `${baseUrl}var_manifest.json`; }
+function getConnectivityManifestUrl(baseUrl) { return `${baseUrl}connectivity_manifest.json`; }
+function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.json`; }
 
 (async function bootstrap() {
-  const canvas = document.getElementById('glcanvas');
-  const labelLayer = document.getElementById('label-layer');
-  const viewTitleLayer = document.getElementById('view-title-layer');
-  const statsEl = document.getElementById('stats');
-  const themeSelect = document.getElementById('theme-select');
-  const sidebar = document.getElementById('sidebar');
-  const renderModeSelect = document.getElementById('render-mode');
-
-  setDockableAccordions(initDockableAccordions({ sidebar }));
-
-  if (themeSelect instanceof HTMLSelectElement) {
-    themeSelect.value = ThemeManager.getTheme();
-    themeSelect.addEventListener('change', () => {
-      ThemeManager.setTheme(themeSelect.value);
-    });
-  }
-
-  // Show welcome modal immediately for first-time visitors (before heavy initialization)
-  // This ensures the modal appears first, not after everything else loads
-  initWelcomeModal();
-  const welcomeVisible = shouldShowWelcome();
-  if (welcomeVisible) {
-    showWelcomeModal();
-  }
-
-  // Connectivity controls
-  const connectivityControls = document.getElementById('connectivity-controls');
-  const connectivityCheckbox = document.getElementById('toggle-connectivity');
-  const connectivitySliders = document.getElementById('connectivity-sliders');
-  const connectivityAlphaInput = document.getElementById('connectivity-alpha');
-  const connectivityAlphaDisplay = document.getElementById('connectivity-alpha-display');
-  const connectivityWidthInput = document.getElementById('connectivity-width');
-  const connectivityWidthDisplay = document.getElementById('connectivity-width-display');
-  const connectivityColorInput = document.getElementById('connectivity-color');
-  const connectivityLimitInput = document.getElementById('connectivity-limit');
-  const connectivityLimitDisplay = document.getElementById('connectivity-limit-display');
-  const connectivityInfo = document.getElementById('connectivity-info');
-  let ui = null;
+  let statsEl = null;
   let currentDatasetLoadToken = null;
   let buildDatasetAnalyticsContext = () => ({});
 
   try {
+    ThemeManager.init();
+
+    const canvas = document.getElementById('glcanvas');
+    const labelLayer = document.getElementById('label-layer');
+    const viewTitleLayer = document.getElementById('view-title-layer');
+    statsEl = document.getElementById('stats');
+    const themeSelect = document.getElementById('theme-select');
+    const sidebar = document.getElementById('sidebar');
+    const renderModeSelect = document.getElementById('render-mode');
+
+    setDockableAccordions(initDockableAccordions({ sidebar }));
+
+    if (themeSelect instanceof HTMLSelectElement) {
+      themeSelect.value = ThemeManager.getTheme();
+      themeSelect.addEventListener('change', () => {
+        ThemeManager.setTheme(themeSelect.value);
+      });
+    }
+
+    initWelcomeModal({
+      onExplore() {
+        const datasetSelect = document.getElementById('dataset-select');
+        if (!(datasetSelect instanceof HTMLSelectElement)) {
+          throw new Error(
+            'Sample selection requires the dataset controls.'
+          );
+        }
+        datasetSelect.focus();
+      }
+    });
+    if (shouldShowWelcome()) {
+      showWelcomeModal();
+    }
+
+    // Connectivity controls
+    const connectivityControls = document.getElementById('connectivity-controls');
+    const connectivityCheckbox = document.getElementById('toggle-connectivity');
+    const connectivitySliders = document.getElementById('connectivity-sliders');
+    const connectivityAlphaInput = document.getElementById('connectivity-alpha');
+    const connectivityAlphaDisplay = document.getElementById('connectivity-alpha-display');
+    const connectivityWidthInput = document.getElementById('connectivity-width');
+    const connectivityWidthDisplay = document.getElementById('connectivity-width-display');
+    const connectivityColorInput = document.getElementById('connectivity-color');
+    const connectivityLimitInput = document.getElementById('connectivity-limit');
+    const connectivityLimitDisplay = document.getElementById('connectivity-limit-display');
+    const connectivityInfo = document.getElementById('connectivity-info');
+    let ui = null;
+
     debug.log('[Main] Creating viewer...');
     const viewer = createViewer({ canvas, labelLayer, viewTitleLayer, sidebar });
     debug.log('[Main] Viewer created successfully');
@@ -168,8 +175,58 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     const notifications = getNotificationCenter();
     notifications.init();
 
+    // Construct the optional GitHub annotation session inside the startup
+    // boundary so storage/configuration failures cannot leave a blank page.
+    const githubAuthSession = getGitHubAuthSession();
+    try {
+      const signInResult =
+        await githubAuthSession.completeSignInFromRedirect();
+      if (signInResult !== null) {
+        notifications.success(
+          `Signed in with GitHub as @${signInResult.user.login}.`,
+          {
+            category: 'annotation',
+            duration: 2800
+          }
+        );
+      }
+    } catch (error) {
+      if (!(error instanceof Error)) {
+        throw new TypeError(
+          'GitHub redirect completion rejected with a non-Error value.'
+        );
+      }
+      console.error('[GitHubAuth] Redirect completion failed:', error);
+      notifications.error(error.message, {
+        category: 'annotation',
+        duration: 8000
+      });
+    }
+
     // Initialize DataSourceManager
     const dataSourceManager = getDataSourceManager();
+    const datasetReloadCoordinator = createLatestDatasetReloadCoordinator(
+      () => {
+        const source = dataSourceManager.activeSource;
+        if (source === null) {
+          return {
+            source: null,
+            baseUrl: null,
+            datasetId: null,
+            selectionIdentity: null
+          };
+        }
+        const sourceType = dataSourceManager.getCurrentSourceType();
+        return {
+          source,
+          baseUrl: dataSourceManager.getCurrentBaseUrl(),
+          datasetId: dataSourceManager.getCurrentDatasetId(),
+          selectionIdentity: sourceType === 'local-user'
+            ? source.getAdoptionIdentity()
+            : null
+        };
+      }
+    );
     initAnalytics({ dataSourceManager });
 
     buildDatasetAnalyticsContext = (overrides = {}) => {
@@ -239,8 +296,61 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
     // Parse URL parameters early (needed for remote/jupyter detection)
     const urlParams = new URLSearchParams(window.location.search);
+    const remoteUrlParam = readOptionalExactUrlParameter(
+      urlParams,
+      'remote'
+    );
+    const githubPathParam = readOptionalExactUrlParameter(
+      urlParams,
+      'github'
+    );
+    const sourceParam = readOptionalExactUrlParameter(
+      urlParams,
+      'source'
+    );
+    const requestedDataset = readOptionalExactUrlParameter(
+      urlParams,
+      'dataset'
+    );
+    const isAnndataMode = readExactTrueUrlFlag(
+      urlParams,
+      'anndata'
+    );
+    if (remoteUrlParam !== null && githubPathParam !== null) {
+      throw new Error(
+        'Startup cannot request both remote and GitHub dataset sources.'
+      );
+    }
+    if (
+      remoteUrlParam !== null &&
+      sourceParam !== null &&
+      sourceParam !== 'remote'
+    ) {
+      throw new Error(
+        'The "remote" startup parameter requires source="remote".'
+      );
+    }
+    if (
+      githubPathParam !== null &&
+      sourceParam !== null &&
+      sourceParam !== 'github-repo'
+    ) {
+      throw new Error(
+        'The "github" startup parameter requires source="github-repo".'
+      );
+    }
+    if (
+      isAnndataMode &&
+      remoteUrlParam === null &&
+      sourceParam !== null &&
+      sourceParam !== 'remote'
+    ) {
+      throw new Error(
+        'The "anndata" startup parameter requires a remote server source.'
+      );
+    }
 
-    // Always register user directory source (works in all browsers via file input fallback)
+    // Always register the user directory source through browser-independent file inputs.
     const userSource = createLocalUserDirDataSource();
     dataSourceManager.registerSource('local-user', userSource);
 
@@ -249,6 +359,18 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     dataSourceManager.registerSource('remote', remoteSource);
 
     const inJupyter = isJupyterContext();
+    if (
+      inJupyter &&
+      (
+        remoteUrlParam !== null ||
+        githubPathParam !== null ||
+        (sourceParam !== null && sourceParam !== 'jupyter')
+      )
+    ) {
+      throw new Error(
+        'Jupyter startup cannot be combined with another explicit source.'
+      );
+    }
 
     // Check if running in Jupyter context
     let jupyterSource = null;
@@ -257,657 +379,754 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       jupyterSource = createJupyterBridgeDataSource();
       dataSourceManager.registerSource('jupyter', jupyterSource);
 
-      // Try to initialize Jupyter connection
       const jupyterInitialized = await jupyterSource.initialize();
-      if (jupyterInitialized) {
-        debug.log('[Main] Jupyter bridge initialized successfully');
-
-        const jupyterConfig = getJupyterConfig();
-        const jupyterServerUrl =
-          jupyterConfig?.serverUrl || new URL('.', window.location.href).toString().replace(/\/$/, '');
-
-        // Freeze support: keep the view exactly as-is when the kernel/server stops.
-        let jupyterFrozen = false;
-        const freezeJupyterView = () => {
-          if (jupyterFrozen) return;
-          jupyterFrozen = true;
-          try { viewer.pause?.(); } catch {}
-          try {
-            let overlay = document.getElementById('cellucid-jupyter-freeze-overlay');
-            if (!overlay) {
-              overlay = document.createElement('div');
-              overlay.id = 'cellucid-jupyter-freeze-overlay';
-              overlay.style.position = 'fixed';
-              overlay.style.inset = '0';
-              overlay.style.zIndex = '999999';
-              overlay.style.pointerEvents = 'all';
-              overlay.style.background = 'transparent';
-              overlay.setAttribute('aria-hidden', 'true');
-              document.body.appendChild(overlay);
-            }
-            overlay.style.display = 'block';
-          } catch {}
-        };
-
-        // Freeze command from Python (viewer.stop()).
-        try {
-          jupyterSource.onMessage?.((msg) => {
-            if (msg?.type === 'freeze') {
-              freezeJupyterView();
-            }
-          });
-        } catch (err) {
-          console.warn('[Main] Failed to wire Jupyter freeze handler:', err);
-        }
-
-        // Auto-freeze on server disconnect (kernel stopped / viewer stopped).
-        try {
-          const interval = setInterval(async () => {
-            if (jupyterFrozen) {
-              clearInterval(interval);
-              return;
-            }
-            try {
-              const res = await fetch(`${jupyterServerUrl}/_cellucid/health`, { cache: 'no-store' });
-              if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            } catch (err) {
-              console.warn('[Main] Jupyter server unreachable; freezing view:', err?.message || err);
-              freezeJupyterView();
-              clearInterval(interval);
-            }
-          }, 3000);
-        } catch (err) {
-          console.warn('[Main] Failed to start Jupyter health checker:', err);
-        }
-
-        // Forward frontend warnings/errors to Python (for `viewer.debug_connection()`).
-        try {
-          const stringifyArg = (a) => {
-            if (typeof a === 'string') return a;
-            if (a instanceof Error) return a.stack || a.message || String(a);
-            try { return JSON.stringify(a); } catch { return String(a); }
-          };
-          const sendConsoleEvent = (level, args, extra = {}) => {
-            try {
-              const parts = (args || []).map(stringifyArg);
-              const message = parts.join(' ').slice(0, 4000);
-              jupyterSource?.notifyCustomEvent?.('console', {
-                level,
-                message,
-                ts: new Date().toISOString(),
-                ...extra
-              });
-            } catch {}
-          };
-
-          const origWarn = console.warn.bind(console);
-          const origError = console.error.bind(console);
-          console.warn = (...args) => {
-            origWarn(...args);
-            sendConsoleEvent('warn', args);
-          };
-          console.error = (...args) => {
-            origError(...args);
-            sendConsoleEvent('error', args);
-          };
-
-          window.addEventListener('error', (e) => {
-            sendConsoleEvent('error', [e?.message || 'Window error'], {
-              filename: e?.filename || null,
-              lineno: e?.lineno || null,
-              colno: e?.colno || null
-            });
-          });
-          window.addEventListener('unhandledrejection', (e) => {
-            sendConsoleEvent('error', ['UnhandledRejection', e?.reason], {});
-          });
-        } catch (err) {
-          console.warn('[Main] Failed to wire console forwarding to Python:', err);
-        }
-
-        // Forward hover/click events to Python for notebook hooks.
-        // Kept intentionally lightweight (throttled picking).
-        try {
-          let lastHoverCell = null;
-          let lastHoverAt = 0;
-          const HOVER_THROTTLE_MS = 50;
-
-          canvas?.addEventListener?.('mousemove', (e) => {
-            const now = performance.now();
-            if (now - lastHoverAt < HOVER_THROTTLE_MS) return;
-            lastHoverAt = now;
-
-            const cellIdx = typeof viewer.pickCellAtScreen === 'function'
-              ? viewer.pickCellAtScreen(e.clientX, e.clientY)
-              : -1;
-
-            if (cellIdx < 0) {
-              if (lastHoverCell !== null) {
-                lastHoverCell = null;
-                jupyterSource?.notifyHover?.(null, null);
-              }
-              return;
-            }
-
-            if (cellIdx === lastHoverCell) return;
-            lastHoverCell = cellIdx;
-
-            let position = null;
-            const positions = typeof viewer.getPositions === 'function' ? viewer.getPositions() : null;
-            if (positions && positions.length >= cellIdx * 3 + 3) {
-              position = {
-                x: positions[cellIdx * 3],
-                y: positions[cellIdx * 3 + 1],
-                z: positions[cellIdx * 3 + 2]
-              };
-            }
-
-            jupyterSource?.notifyHover?.(cellIdx, position);
-          });
-
-          canvas?.addEventListener?.('mouseleave', () => {
-            if (lastHoverCell !== null) {
-              lastHoverCell = null;
-              jupyterSource?.notifyHover?.(null, null);
-            }
-          });
-
-          canvas?.addEventListener?.('click', (e) => {
-            const cellIdx = typeof viewer.pickCellAtScreen === 'function'
-              ? viewer.pickCellAtScreen(e.clientX, e.clientY)
-              : -1;
-            if (cellIdx < 0) return;
-            jupyterSource?.notifyClick?.(cellIdx, {
-              button: e.button ?? 0,
-              shift: !!e.shiftKey,
-              ctrl: !!(e.ctrlKey || e.metaKey)
-            });
-          });
-        } catch (err) {
-          console.warn('[Main] Failed to wire Jupyter hover/click hooks:', err);
-        }
-
-        // Auto-load first Jupyter dataset
-        try {
-          const jupyterDatasets = await jupyterSource.listDatasets();
-          if (jupyterDatasets.length > 0) {
-            await dataSourceManager.switchToDataset('jupyter', jupyterDatasets[0].id, {
-              loadMethod: DATA_LOAD_METHODS.JUPYTER_AUTO
-            });
-            debug.log(`[Main] Switched to Jupyter dataset: ${jupyterDatasets[0].id}`);
-          }
-        } catch (err) {
-          console.warn('[Main] Failed to load Jupyter datasets:', err.message);
-        }
-      } else {
-        notifications.error(
-          'Cellucid Jupyter initialization failed: could not reach the Python-side server. ' +
-          'This usually means the viewer is blocked from reaching the server URL (mixed-content / proxy / port forwarding). ' +
-          'In Python, run `viewer.debug_connection()` for a detailed report.',
-          { category: 'connectivity', title: 'Jupyter connection' }
+      if (jupyterInitialized !== true) {
+        throw new Error(
+          'Jupyter context must initialize one authenticated Python server'
         );
       }
-    }
+      debug.log('[Main] Jupyter bridge initialized successfully');
 
-    // Check for remote server URL in query parameters
-    const remoteUrlParam = urlParams.get('remote');
-    const isAnndataMode = urlParams.get('anndata') === 'true';
+      const jupyterConfig = getJupyterConfig();
+      if (jupyterConfig === null) {
+        throw new Error(
+          'Initialized Jupyter mode requires its authenticated configuration'
+        );
+      }
 
-    if (remoteUrlParam) {
-      debug.log(`[Main] Remote server URL from param: ${remoteUrlParam}`);
-      try {
-        await remoteSource.connect({ url: remoteUrlParam });
-        debug.log('[Main] Connected to remote server');
+      // Freeze support: keep the last fully rendered view when Python stops.
+      let jupyterFrozen = false;
+      const freezeJupyterView = () => {
+        if (jupyterFrozen) return;
+        let overlay = document.getElementById(
+          'cellucid-jupyter-freeze-overlay'
+        );
+        if (overlay === null) {
+          overlay = document.createElement('div');
+          overlay.id = 'cellucid-jupyter-freeze-overlay';
+          overlay.style.position = 'fixed';
+          overlay.style.inset = '0';
+          overlay.style.zIndex = '999999';
+          overlay.style.pointerEvents = 'all';
+          overlay.style.background = 'transparent';
+          overlay.setAttribute('aria-hidden', 'true');
+          document.body.appendChild(overlay);
+        }
+        viewer.pause();
+        overlay.style.display = 'block';
+        jupyterFrozen = true;
+      };
 
-        // Show AnnData warning if loading directly from AnnData
-        if (isAnndataMode) {
-          debug.log('[Main] AnnData mode detected - loading directly from AnnData');
-          notifications.warning(
-            'Loading data directly from AnnData. This may be slower than using pre-exported data. ' +
-            'For better performance, use prepare() to create optimized binary files.',
-            { duration: 12000 } // 12 seconds to give users time to read
+      jupyterSource.onMessage(message => {
+        if (message.type === 'freeze') {
+          freezeJupyterView();
+        }
+      });
+
+      const healthInterval = setInterval(async () => {
+        if (jupyterFrozen) {
+          clearInterval(healthInterval);
+          return;
+        }
+        try {
+          await jupyterSource.checkHealth();
+        } catch (error) {
+          clearInterval(healthInterval);
+          console.error(
+            '[Main] Jupyter server health contract failed; freezing view:',
+            error
+          );
+          notifications.error(
+            'The Python server stopped or returned an invalid health response. ' +
+            'The last complete view has been frozen.',
+            {
+              category: 'connectivity',
+              title: 'Jupyter server disconnected',
+              duration: 0
+            }
+          );
+          freezeJupyterView();
+        }
+      }, 3000);
+
+      if (
+        typeof viewer.pickCellAtScreen !== 'function' ||
+        typeof viewer.getPositions !== 'function'
+      ) {
+        throw new TypeError(
+          'Jupyter pointer hooks require exact viewer picking and position APIs'
+        );
+      }
+
+      let lastHoverCell = null;
+      let lastHoverAt = 0;
+      const HOVER_THROTTLE_MS = 50;
+
+      canvas.addEventListener('mousemove', async event => {
+        const now = performance.now();
+        if (now - lastHoverAt < HOVER_THROTTLE_MS) return;
+        lastHoverAt = now;
+
+        const cellIndex = viewer.pickCellAtScreen(
+          event.clientX,
+          event.clientY
+        );
+        if (!Number.isInteger(cellIndex) || cellIndex < -1) {
+          throw new TypeError(
+            'Jupyter cell picking must return -1 or a non-negative integer'
           );
         }
-
-        // If connected successfully, try to use remote source as primary
-        if (remoteSource.isConnected()) {
-          const datasets = await remoteSource.listDatasets();
-          if (datasets.length > 0) {
-            // Switch to the first remote dataset
-            await dataSourceManager.switchToDataset('remote', datasets[0].id, {
-              loadMethod: DATA_LOAD_METHODS.REMOTE_URL_PARAM
-            });
-            debug.log(`[Main] Switched to remote dataset: ${datasets[0].id}`);
+        if (cellIndex === -1) {
+          if (lastHoverCell !== null) {
+            lastHoverCell = null;
+            await jupyterSource.notifyHover(null, null);
           }
+          return;
         }
-      } catch (err) {
-        console.warn('[Main] Failed to connect to remote server:', err.message);
-      }
+        if (cellIndex === lastHoverCell) return;
+
+        const activePositions = viewer.getPositions();
+        if (
+          !(activePositions instanceof Float32Array) ||
+          activePositions.length < cellIndex * 3 + 3
+        ) {
+          throw new TypeError(
+            'Jupyter hover requires complete Float32 XYZ positions'
+          );
+        }
+        lastHoverCell = cellIndex;
+        await jupyterSource.notifyHover(cellIndex, {
+          x: activePositions[cellIndex * 3],
+          y: activePositions[cellIndex * 3 + 1],
+          z: activePositions[cellIndex * 3 + 2]
+        });
+      });
+
+      canvas.addEventListener('mouseleave', async () => {
+        if (lastHoverCell !== null) {
+          lastHoverCell = null;
+          await jupyterSource.notifyHover(null, null);
+        }
+      });
+
+      canvas.addEventListener('click', async event => {
+        const cellIndex = viewer.pickCellAtScreen(
+          event.clientX,
+          event.clientY
+        );
+        if (!Number.isInteger(cellIndex) || cellIndex < -1) {
+          throw new TypeError(
+            'Jupyter cell picking must return -1 or a non-negative integer'
+          );
+        }
+        if (cellIndex === -1) return;
+        await jupyterSource.notifyClick(cellIndex, {
+          button: event.button,
+          shift: event.shiftKey,
+          ctrl: event.ctrlKey || event.metaKey
+        });
+      });
+
+      const jupyterDatasets = await jupyterSource.listDatasets();
+      const jupyterDatasetId = selectIntentDatasetId(
+        jupyterDatasets,
+        requestedDataset,
+        'The authenticated Python server'
+      );
+      await dataSourceManager.switchToDataset(
+        'jupyter',
+        jupyterDatasetId,
+        { loadMethod: DATA_LOAD_METHODS.JUPYTER_AUTO }
+      );
+      debug.log(
+        `[Main] Switched to Jupyter dataset: ${jupyterDatasetId}`
+      );
     }
 
-    let sameOriginServerDetected = false;
+    // An explicit remote URL is a terminal source request.
+    if (remoteUrlParam !== null) {
+      debug.log(`[Main] Remote server URL from param: ${remoteUrlParam}`);
+      await remoteSource.connect({ url: remoteUrlParam });
+      if (remoteSource.isConnected() !== true) {
+        throw new Error(
+          'The requested remote source did not publish a connected state.'
+        );
+      }
+      const remoteDatasets = await remoteSource.listDatasets();
+      const remoteDatasetId = selectIntentDatasetId(
+        remoteDatasets,
+        requestedDataset,
+        'The requested remote source'
+      );
+      if (isAnndataMode) {
+        debug.log(
+          '[Main] AnnData mode detected - loading directly from AnnData'
+        );
+        notifications.warning(
+          'Loading data directly from AnnData. This may be slower than using pre-exported data. ' +
+          'For better performance, use prepare() to create optimized binary files.',
+          { duration: 12000 }
+        );
+      }
+      await dataSourceManager.switchToDataset(
+        'remote',
+        remoteDatasetId,
+        { loadMethod: DATA_LOAD_METHODS.REMOTE_URL_PARAM }
+      );
+      debug.log(
+        `[Main] Switched to remote dataset: ${remoteDatasetId}`
+      );
+    }
 
     // Auto-connect to a same-origin Cellucid server when the web app is being
     // served by the Python package itself (CLI/Python server mode).
     //
     // Without this, the app may auto-load the demo dataset and ignore the
     // server-hosted dataset, especially when demo exports are configured.
-    if (!inJupyter && !remoteUrlParam) {
-      const sourceParam = urlParams.get('source');
-      // Allow explicit overrides (e.g. ?source=local-demo) to skip server auto-connect.
-      const shouldAutoConnectServer = !sourceParam || sourceParam === 'remote';
-
-      if (shouldAutoConnectServer) {
-        try {
-          const protocol = window?.location?.protocol || '';
-          if (protocol === 'http:' || protocol === 'https:') {
-            const selfBase = new URL('.', window.location.href).toString().replace(/\/$/, '');
-            const healthRes = await fetch(`${selfBase}/_cellucid/health`, { cache: 'no-store' });
-            if (healthRes.ok) {
-              const health = await healthRes.json().catch(() => null);
-              if (health?.status === 'ok') {
-                sameOriginServerDetected = true;
-                debug.log(`[Main] Detected Cellucid server at current origin (${health.type || 'unknown'}); auto-connecting...`);
-                try {
-                  await remoteSource.connect({ url: selfBase });
-                  if (remoteSource.isConnected?.()) {
-                    const datasets = await remoteSource.listDatasets();
-                    if (datasets.length > 0) {
-                      const requestedDataset = urlParams.get('dataset');
-                      const chosenId =
-                        requestedDataset && datasets.some((d) => d?.id === requestedDataset)
-                          ? requestedDataset
-                          : datasets[0].id;
-
-                      // Mirror the AnnData warning used for explicit remote connections.
-                      if (isAnndataMode) {
-                        notifications.warning(
-                          'Loading data directly from AnnData. This may be slower than using pre-exported data. ' +
-                          'For better performance, use prepare() to create optimized binary files.',
-                          { duration: 12000 }
-                        );
-                      }
-
-                      await dataSourceManager.switchToDataset('remote', chosenId, {
-                        loadMethod: DATA_LOAD_METHODS.SERVER_AUTO
-                      });
-                      debug.log(`[Main] Auto-connected to server dataset: ${chosenId}`);
-                    }
-                  }
-                } catch (err) {
-                  console.warn('[Main] Same-origin server detected but auto-connect failed:', err?.message || err);
-                }
-              }
-            }
+    if (
+      !inJupyter &&
+      remoteUrlParam === null &&
+      (sourceParam === null || sourceParam === 'remote')
+    ) {
+      const protocol = window.location.protocol;
+      if (protocol !== 'http:' && protocol !== 'https:') {
+        if (sourceParam === 'remote') {
+          throw new Error(
+            'Same-origin remote startup requires an HTTP(S) page.'
+          );
+        }
+      } else {
+        const selfBase = new URL('.', window.location.href)
+          .toString()
+          .replace(/\/$/, '');
+        const healthResponse = await fetch(
+          `${selfBase}/_cellucid/health`,
+          { cache: 'no-store' }
+        );
+        if (
+          healthResponse.status === 404 &&
+          sourceParam === null &&
+          !isAnndataMode
+        ) {
+          debug.log(
+            '[Main] Current origin does not advertise a Cellucid server.'
+          );
+        } else {
+          if (!healthResponse.ok) {
+            throw new Error(
+              `Same-origin Cellucid health request failed with HTTP ` +
+              `${healthResponse.status}.`
+            );
           }
-        } catch (err) {
-          // Not a server context; proceed normally (demo/local-user/etc).
+          const healthAdvertisement = await healthResponse.json();
+          const healthKind = classifySameOriginHealthAdvertisement(
+            healthAdvertisement
+          );
+          if (healthKind === 'static') {
+            if (sourceParam === 'remote' || isAnndataMode) {
+              throw new Error(
+                'This origin is the static Cellucid viewer and does not provide the requested Python server source.'
+              );
+            }
+            debug.log(
+              '[Main] Current origin advertises the static Cellucid viewer.'
+            );
+          } else {
+            debug.log(
+              `[Main] Cellucid server endpoint detected at ${selfBase}; ` +
+              'validating the complete remote contract.'
+            );
+            await remoteSource.connect({ url: selfBase });
+            if (remoteSource.isConnected() !== true) {
+              throw new Error(
+                'Same-origin Cellucid source did not publish a connected state.'
+              );
+            }
+            const datasets = await remoteSource.listDatasets();
+            const remoteDatasetId = selectIntentDatasetId(
+              datasets,
+              requestedDataset,
+              'The same-origin Cellucid source'
+            );
+            if (isAnndataMode) {
+              notifications.warning(
+                'Loading data directly from AnnData. This may be slower than using pre-exported data. ' +
+                'For better performance, use prepare() to create optimized binary files.',
+                { duration: 12000 }
+              );
+            }
+            await dataSourceManager.switchToDataset(
+              'remote',
+              remoteDatasetId,
+              { loadMethod: DATA_LOAD_METHODS.SERVER_AUTO }
+            );
+            debug.log(
+              `[Main] Auto-connected to server dataset: ${remoteDatasetId}`
+            );
+          }
         }
       }
     }
 
-    // Initialize with default sources (registers local-demo and github-repo sources).
-    // When the welcome modal is shown, classify the default demo load as an explicit "sample demo".
+    // Register current sources without selecting scientific data.
     await dataSourceManager.initialize({
-      // In Jupyter mode, never auto-load the demo dataset as a fallback. If the bridge/server
-      // is unreachable, we want a loud failure instead of silently showing sample data.
-      autoLoadDefault: !inJupyter && !sameOriginServerDetected,
-      defaultLoadMethod: welcomeVisible ? DATA_LOAD_METHODS.SAMPLE_DEMO : DATA_LOAD_METHODS.DEFAULT_DEMO
+      // Jupyter mode owns one authenticated Python dataset source, so it does
+      // not register the unrelated sample catalog.
+      registerDemoCatalog: !inJupyter
     });
 
     // Check for GitHub repository path in query parameters
     // Must be after initialize() since github-repo source is registered there
-    const githubPathParam = urlParams.get('github');
-    if (githubPathParam && !remoteUrlParam) {
+    if (githubPathParam !== null) {
       debug.log(`[Main] GitHub path from param: ${githubPathParam}`);
-      try {
-        const githubSource = dataSourceManager.getSource('github-repo');
-        if (githubSource) {
-          const { datasets } = await githubSource.connect(githubPathParam);
-          debug.log('[Main] Connected to GitHub repository');
-
-          if (datasets && datasets.length > 0) {
-            await dataSourceManager.switchToDataset('github-repo', datasets[0].id, {
-              loadMethod: DATA_LOAD_METHODS.GITHUB_URL_PARAM
-            });
-            debug.log(`[Main] Switched to GitHub dataset: ${datasets[0].id}`);
-
-            const githubRepoInput = document.getElementById('github-repo-url');
-            if (githubRepoInput) githubRepoInput.value = githubPathParam;
-          }
-        }
-      } catch (err) {
-        console.warn('[Main] Failed to connect to GitHub:', err.message);
-        notifications.error(`Failed to load GitHub data: ${err.message}`, { category: 'connectivity' });
+      const githubSource = dataSourceManager.getSource('github-repo');
+      if (githubSource === null) {
+        throw new Error(
+          'Explicit GitHub startup requires the registered GitHub source.'
+        );
       }
+      const githubConnection =
+        await githubSource.connect(githubPathParam);
+      if (
+        githubConnection === null ||
+        typeof githubConnection !== 'object' ||
+        Array.isArray(githubConnection) ||
+        !Object.hasOwn(githubConnection, 'datasets')
+      ) {
+        throw new TypeError(
+          'GitHub source connection must publish its dataset inventory.'
+        );
+      }
+      const githubDatasetId = selectIntentDatasetId(
+        githubConnection.datasets,
+        requestedDataset,
+        'The requested GitHub repository'
+      );
+      await dataSourceManager.switchToDataset(
+        'github-repo',
+        githubDatasetId,
+        { loadMethod: DATA_LOAD_METHODS.GITHUB_URL_PARAM }
+      );
+      debug.log(
+        `[Main] Switched to GitHub dataset: ${githubDatasetId}`
+      );
+
+      const githubRepoInput =
+        document.getElementById('github-repo-url');
+      if (!(githubRepoInput instanceof HTMLInputElement)) {
+        throw new Error(
+          'GitHub startup requires the repository input control.'
+        );
+      }
+      githubRepoInput.value = githubPathParam;
     }
 
     // Check URL parameters for dataset selection
     // Only process if we haven't already connected via remote/jupyter/github
-    const requestedDataset = urlParams.get('dataset');
-    const requestedSource = urlParams.get('source') || 'local-demo';
+    const requestedSource = sourceParam === null
+      ? 'local-demo'
+      : sourceParam;
     const currentSourceType = dataSourceManager.getCurrentSourceType();
     const skipUrlDataset = currentSourceType === 'remote' || currentSourceType === 'jupyter' || currentSourceType === 'github-repo';
 
-    if (requestedDataset && !skipUrlDataset) {
-      // Try to switch to the requested dataset from the requested source
-      try {
-        const targetSource = dataSourceManager.getSource(requestedSource);
-        if (targetSource) {
-          // Check if dataset exists (hasDataset is optional, so handle if not available)
-          const hasDataset = typeof targetSource.hasDataset === 'function'
-            ? await targetSource.hasDataset(requestedDataset)
-            : true; // Assume exists if hasDataset not available
-
-          if (hasDataset) {
-            await dataSourceManager.switchToDataset(requestedSource, requestedDataset, {
-              loadMethod: DATA_LOAD_METHODS.DATASET_URL_PARAM
-            });
-            debug.log(`[Main] Loaded dataset from URL param: ${requestedSource}/${requestedDataset}`);
-          } else {
-            console.warn(`[Main] Requested dataset '${requestedDataset}' not found in '${requestedSource}'`);
-          }
-        } else {
-          console.warn(`[Main] Requested source '${requestedSource}' not registered`);
-        }
-      } catch (err) {
-        console.warn(`[Main] Failed to load requested dataset '${requestedDataset}':`, err);
+    if (requestedDataset !== null && !skipUrlDataset) {
+      const targetSource = dataSourceManager.getSource(requestedSource);
+      if (targetSource === null) {
+        throw new Error(
+          `Requested source '${requestedSource}' is not registered.`
+        );
       }
+      if (typeof targetSource.hasDataset !== 'function') {
+        throw new TypeError(
+          `Requested source '${requestedSource}' must implement hasDataset().`
+        );
+      }
+      if (!await targetSource.hasDataset(requestedDataset)) {
+        throw new Error(
+          `Requested dataset '${requestedDataset}' was not found in '${requestedSource}'.`
+        );
+      }
+      await dataSourceManager.switchToDataset(
+        requestedSource,
+        requestedDataset,
+        { loadMethod: DATA_LOAD_METHODS.DATASET_URL_PARAM }
+      );
+      debug.log(
+        `[Main] Loaded dataset from URL param: ` +
+        `${requestedSource}/${requestedDataset}`
+      );
     }
 
-    EXPORT_BASE_URL = dataSourceManager.getCurrentBaseUrl() || EXPORT_BASE_URL;
+    const selectedBaseUrl = dataSourceManager.getCurrentBaseUrl();
+    EXPORT_BASE_URL = selectedBaseUrl === null ? '' : selectedBaseUrl;
     debug.log(`[Main] Using dataset base URL: ${EXPORT_BASE_URL}`);
 
-    if (!currentDatasetLoadToken && dataSourceManager.hasActiveDataset?.()) {
+    if (!currentDatasetLoadToken && dataSourceManager.hasActiveDataset()) {
       currentDatasetLoadToken = startDatasetLoad();
     }
 
-    // Initialize dimension manager for multi-dimensional embeddings
-    const dimensionManager = createDimensionManager({ baseUrl: EXPORT_BASE_URL });
+    // The live manager is replaced only when a complete dataset generation and
+    // its default position payload have been staged successfully.
+    let dimensionManager = createDimensionManager({ baseUrl: EXPORT_BASE_URL });
 
-    function notifyUmapResolution(embeddingsMetadata) {
-      const resolution = embeddingsMetadata?.umap_resolution;
-      if (!resolution || resolution.source_key !== 'X_umap') return;
-
-      const dim = resolution.dim;
-      const aliasKey = resolution.alias_key || (typeof dim === 'number' ? `X_umap_${dim}d` : null);
-
-      if (resolution.action === 'used_as' && typeof dim === 'number') {
-        notifications.info(
-          `Detected obsm['X_umap'] (${dim}D); using it as '${aliasKey}'.`,
-          { category: 'dimension', title: 'AnnData embedding' }
-        );
-        return;
-      }
-
-      if (resolution.action === 'ignored' && resolution.reason === 'explicit_key_present' && typeof dim === 'number') {
-        notifications.info(
-          `Detected obsm['X_umap'] (${dim}D) but '${aliasKey}' is present; ignoring X_umap.`,
-          { category: 'dimension', title: 'AnnData embedding' }
-        );
-        return;
-      }
-
-      if (resolution.action === 'ignored' && resolution.reason === 'unsupported_dim' && typeof resolution.n_dims === 'number') {
-        notifications.warning(
-          `Ignoring obsm['X_umap'] (${resolution.n_dims}D); only 1D/2D/3D embeddings are supported.`,
-          { category: 'dimension', title: 'AnnData embedding' }
-        );
-      }
+    function publishEmptyDatasetRuntime() {
+      EXPORT_BASE_URL = '';
+      dimensionManager = createDimensionManager({ baseUrl: '' });
+      state.setDimensionManager(dimensionManager);
+      state.setFieldLoader(null);
+      state.setVarFieldLoader(null);
+      state.varData = null;
+      state._varFieldDescriptors = Object.freeze([]);
+      state.setVectorFieldManager(null);
+      if (statsEl) statsEl.textContent = 'No dataset selected';
     }
 
-    // Development phase: require obs_manifest.json (no legacy obs_values.json fallback).
-    async function loadObsManifestStrict() {
+    async function stageDatasetRuntime({
+      baseUrl,
+      expectedIdentityId,
+      showProgress,
+      signal
+    }) {
+      if (
+        typeof baseUrl !== 'string' ||
+        baseUrl.length === 0 ||
+        !baseUrl.endsWith('/')
+      ) {
+        throw new Error(
+          'Selected dataset base URL must be a non-empty string ending in "/".'
+        );
+      }
+      if (
+        typeof expectedIdentityId !== 'string' ||
+        expectedIdentityId.length === 0
+      ) {
+        throw new Error(
+          'Selected dataset identity id must be a non-empty string.'
+        );
+      }
+      if (!(signal instanceof AbortSignal)) {
+        throw new TypeError(
+          'Dataset runtime staging requires one owner AbortSignal.'
+        );
+      }
+      const candidateDimensionManager = createDimensionManager({
+        baseUrl
+      });
+
       try {
-        const manifest = await loadObsManifest(getObsManifestUrl());
-        state.setFieldLoader(createObsFieldLoader(getObsManifestUrl(), { fetchInit: FAST_BINARY_FETCH_INIT }));
-        return manifest;
-      } catch (err) {
-        if (err?.status === 404) {
-          console.warn('obs_manifest.json not found, using empty obs');
-          return { fields: [], count: 0 };
+        const generation = await loadDatasetGeneration({
+          expectedIdentityId,
+          signal,
+          loadIdentity: generationSignal =>
+            loadDatasetIdentity(
+              getDatasetIdentityUrl(baseUrl),
+              { signal: generationSignal }
+            ),
+          loadObsManifest: generationSignal =>
+            loadObsManifest(
+              getObsManifestUrl(baseUrl),
+              { signal: generationSignal }
+            ),
+          loadVarManifest: generationSignal =>
+            loadVarManifest(
+              getVarManifestUrl(baseUrl),
+              { signal: generationSignal }
+            ),
+          loadConnectivityManifest: generationSignal =>
+            loadConnectivityManifest(
+              getConnectivityManifestUrl(baseUrl),
+              { signal: generationSignal }
+            ),
+        });
+        const embeddingsMetadata = getEmbeddingsMetadata(generation.identity);
+        candidateDimensionManager.initFromMetadata(embeddingsMetadata);
+        const positionStage = await stageDatasetPositionPayload({
+          generation,
+          dimensionManager: candidateDimensionManager,
+          showProgress,
+          signal
+        });
+
+        const fieldLoader = createObsFieldLoader(
+          getObsManifestUrl(baseUrl),
+          { fetchInit: FAST_BINARY_FETCH_INIT }
+        );
+        const varFieldLoader = generation.varManifest
+          ? createVarFieldLoader(
+              getVarManifestUrl(baseUrl),
+              { fetchInit: FAST_BINARY_FETCH_INIT }
+            )
+          : null;
+        const vectorFieldManager = createVectorFieldManager({
+          baseUrl,
+          vectorFieldsMetadata: Object.hasOwn(
+            generation.identity,
+            'vector_fields'
+          )
+            ? generation.identity.vector_fields
+            : null,
+          dimensionManager: candidateDimensionManager
+        });
+
+        return Object.freeze({
+          baseUrl,
+          dimensionManager: candidateDimensionManager,
+          embeddingsMetadata,
+          fieldLoader,
+          generation,
+          positions: positionStage.positions,
+          defaultDimension: positionStage.defaultDimension,
+          varFieldLoader,
+          vectorFieldManager
+        });
+      } catch (error) {
+        candidateDimensionManager.clearCache();
+        throw error;
+      }
+    }
+
+    let obs = null;
+    let connectivityManifest = null;
+    let positions = null;
+    let datasetPublicationGeneration = 0;
+    const connectivityRuntimeOwner = initializeConnectivityControls();
+    if (
+      typeof connectivityRuntimeOwner.prepareDatasetReplacement !==
+      'function' ||
+      typeof connectivityRuntimeOwner.synchronizeDatasetPublication !==
+      'function'
+    ) {
+      throw new TypeError(
+        'Dataset runtime requires one initialized connectivity owner.'
+      );
+    }
+
+    function commitDatasetRuntimeStage(stage) {
+      const previousDimensionManager = dimensionManager;
+
+      // This function is intentionally synchronous. The reload transaction is
+      // checked immediately before this sole publication call, so no newer
+      // selection can interleave with the dataset-owned state replacement.
+      EXPORT_BASE_URL = stage.baseUrl;
+      dimensionManager = stage.dimensionManager;
+      obs = stage.generation.obsManifest;
+      positions = stage.positions;
+      connectivityManifest = stage.generation.connectivityManifest;
+
+      state.setDimensionManager(dimensionManager);
+      state.setFieldLoader(stage.fieldLoader);
+      state.setVarFieldLoader(stage.varFieldLoader);
+      if (stage.generation.varManifest) {
+        state.initVarData(stage.generation.varManifest);
+      } else {
+        state.varData = null;
+        state._varFieldDescriptors = Object.freeze([]);
+      }
+      state.initScene(positions, obs);
+      state.clearActiveField();
+      state.clearAllHighlights();
+      state.setVectorFieldManager(stage.vectorFieldManager);
+      datasetPublicationGeneration++;
+
+      return Object.freeze({
+        generation: datasetPublicationGeneration,
+        previousDimensionManager,
+        stage
+      });
+    }
+
+    function synchronizePublishedDatasetUi(
+      activeMetadata,
+      publication
+    ) {
+      if (
+        publication === null ||
+        typeof publication !== 'object' ||
+        publication.generation !== datasetPublicationGeneration
+      ) {
+        throw new Error(
+          'Published dataset UI synchronization requires the exact current ' +
+          'publication.'
+        );
+      }
+      return settlePublishedDatasetUi({
+        synchronize: () => {
+          connectivityRuntimeOwner.synchronizeDatasetPublication();
+          publication.previousDimensionManager.clearCache();
+          debug.log(
+            `[Main] Published dataset identity ` +
+            `v${publication.stage.generation.identity.version}`
+          );
+          if (publication.stage.generation.varManifest) {
+            debug.log(
+              `Loaded var manifest with ` +
+              `${publication.stage.generation.varManifest.fields.length} genes.`
+            );
+          }
+          if (publication.stage.generation.connectivityManifest) {
+            debug.log(
+              `Loaded connectivity manifest with ` +
+              `${publication.stage.generation.connectivityManifest.n_edges.toLocaleString()} edges.`
+            );
+          }
+          ui.refreshDatasetUI(activeMetadata);
+        },
+        reportFailure: error => {
+          const errorMessage = error instanceof Error
+            ? error.message
+            : String(error);
+          console.error(
+            '[Main] Dataset was published, but UI synchronization failed:',
+            error
+          );
+          notifications.error(
+            `The dataset is loaded, but its controls could not be ` +
+            `synchronized: ${errorMessage}`,
+            {
+              category: 'data',
+              title: 'Dataset controls unavailable',
+              duration: 0
+            }
+          );
         }
-        throw err;
-      }
+      });
     }
 
-    // Start ALL manifest loads in parallel for faster initialization
-    const identityPromise = loadDatasetIdentity(getDatasetIdentityUrl());
-
-    const obsPromise = loadObsManifestStrict();
-
-    const varPromise = loadVarManifest(getVarManifestUrl()).catch(err => {
-      if (err?.status === 404) {
-        debug.log('var_manifest.json not found, gene expression not available.');
-      } else {
-        console.warn('Error loading var manifest:', err);
+    const hasInitialDataset =
+      dataSourceManager.hasActiveDataset() === true;
+    let initialPublication = null;
+    if (hasInitialDataset) {
+      // Capture the exact selected id and URL before any asynchronous metadata
+      // or payload work. A loader may not derive identity from a later source.
+      const initialExpectedIdentityId =
+        dataSourceManager.getCurrentIdentityId();
+      const initialBaseUrl = dataSourceManager.getCurrentBaseUrl();
+      const initialLoadController = new AbortController();
+      try {
+        const initialStage = await stageDatasetRuntime({
+          baseUrl: initialBaseUrl,
+          expectedIdentityId: initialExpectedIdentityId,
+          showProgress: true,
+          signal: initialLoadController.signal
+        });
+        initialPublication = commitDatasetRuntimeStage(initialStage);
+      } catch (error) {
+        if (currentDatasetLoadToken) {
+          completeDataLoadFailure(currentDatasetLoadToken, {
+            ...buildDatasetAnalyticsContext(),
+            error
+          });
+          currentDatasetLoadToken = null;
+        }
+        throw error;
       }
-      return null;
-    });
-
-    const connPromise = loadConnectivityManifest(getConnectivityManifestUrl()).catch(err => {
-      if (err?.status === 404) {
-        debug.log('connectivity_manifest.json not found, connectivity not available.');
-      } else {
-        console.warn('Error loading connectivity manifest:', err);
-      }
-      return null;
-    });
-
-    // Wait for identity first (needed to determine which positions file to load)
-    const datasetIdentity = await identityPromise;
-    const embeddingsMetadata = getEmbeddingsMetadata(datasetIdentity);
-    dimensionManager.initFromMetadata(embeddingsMetadata);
-    notifyUmapResolution(embeddingsMetadata);
-    debug.log(`[Main] Loaded dataset identity v${datasetIdentity.version}`);
-
-    // Set dimension manager on state
-    state.setDimensionManager(dimensionManager);
-
-    // Optional vector fields (dimension-specific) used by the animated overlay.
-    // Only datasets that provide `vector_fields` metadata will surface the UI.
-    state.setVectorFieldManager(createVectorFieldManager({
-      baseUrl: EXPORT_BASE_URL,
-      vectorFieldsMetadata: datasetIdentity?.vector_fields || null,
-      dimensionManager
-    }));
-
-    // Start positions loading NOW (other manifests still loading in parallel)
-    const defaultDim = dimensionManager.getDefaultDimension();
-    const positionsPromise = dimensionManager.getPositions3D(defaultDim);
-
-    // Wait for remaining manifests (already loading in parallel)
-    // Note: connectivityManifest needs to be `let` because reloadActiveDatasetInPlace() reassigns it
-    const [obs, varManifest, connManifestResult] = await Promise.all([
-      obsPromise, varPromise, connPromise
-    ]);
-    let connectivityManifest = connManifestResult;
-
-    // Set up var data if loaded
-    if (varManifest) {
-      state.setVarFieldLoader(createVarFieldLoader(getVarManifestUrl(), { fetchInit: FAST_BINARY_FETCH_INIT }));
-      state.initVarData(varManifest);
-      debug.log(`Loaded var manifest with ${varManifest?.fields?.length || 0} genes.`);
-    }
-
-    // Log connectivity if loaded
-    if (connectivityManifest) {
-      debug.log(`Loaded connectivity manifest with ${connectivityManifest?.n_edges?.toLocaleString() || 0} edges.`);
+    } else {
+      // No explicit selection: publish the empty runtime while the catalog is
+      // listed independently in the data controls.
+      publishEmptyDatasetRuntime();
     }
 
     // In-place dataset reload for sources that cannot survive a page refresh (e.g., local-user)
     async function reloadActiveDatasetInPlace(metadataOverride = null, loadMethodOverride = null) {
+      const reloadTransaction = datasetReloadCoordinator.begin();
+      reloadTransaction.assertCurrent();
+      // Capture both values before staging starts. Dispatch is bound to this
+      // exact selection rather than whatever source might be active later.
       const baseUrl = dataSourceManager.getCurrentBaseUrl();
-      const activeMetadata = metadataOverride || dataSourceManager.getCurrentMetadata?.() || null;
-      if (!baseUrl) {
-        ui?.showSessionStatus?.('No dataset selected', true);
-        return;
+      const expectedIdentityId =
+        dataSourceManager.getCurrentIdentityId();
+      const activeMetadata =
+        metadataOverride ?? dataSourceManager.getCurrentMetadata();
+      if (baseUrl === null) {
+        throw new Error('No dataset selected');
       }
-
-      EXPORT_BASE_URL = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
-
-      // Disable connectivity visuals when switching datasets without reload
-      if (connectivityCheckbox) {
-        connectivityCheckbox.checked = false;
-        connectivityCheckbox.disabled = true;
+      if (
+        activeMetadata !== null &&
+        (
+          typeof activeMetadata !== 'object' ||
+          Array.isArray(activeMetadata)
+        )
+      ) {
+        throw new TypeError(
+          'Selected dataset metadata must be an object or null.'
+        );
       }
-      if (connectivityControls) {
-        connectivityControls.style.display = 'none';
-      }
-      if (connectivitySliders) {
-        connectivitySliders.style.display = 'none';
-      }
-      if (viewer.setShowConnectivity) viewer.setShowConnectivity(false);
-      if (viewer.disableEdgesV2) viewer.disableEdgesV2();
-      connectivityManifest = null;
 
       const loadToken = startDatasetLoad(loadMethodOverride, { metadata: activeMetadata, reload: true });
+      let stage;
 
       try {
-        // Reinitialize dimension manager with new dataset's embeddings metadata
-        dimensionManager.clearCache();
-        dimensionManager.setBaseUrl(EXPORT_BASE_URL);
-
-        // Start ALL manifest loads in parallel for faster reload
-        const reloadIdentityPromise = loadDatasetIdentity(getDatasetIdentityUrl());
-
-        const reloadObsPromise = loadObsManifestStrict();
-
-        const reloadVarPromise = loadVarManifest(getVarManifestUrl()).catch(err => {
-          if (err?.status === 404) {
-            debug.log('[Main] var_manifest.json not found for reloaded dataset (gene expression disabled).');
-          } else {
-            console.warn('[Main] Error loading var manifest for reloaded dataset:', err);
-          }
-          return null;
+        reloadTransaction.assertCurrent();
+        stage = await stageDatasetRuntime({
+          baseUrl,
+          expectedIdentityId,
+          showProgress: false,
+          signal: reloadTransaction.signal
         });
-
-        const reloadConnPromise = loadConnectivityManifest(getConnectivityManifestUrl()).catch(err => {
-          debug.log('[Main] Connectivity not available for reloaded dataset:', err?.message || err);
-          return null;
-        });
-
-        // Wait for identity first (needed to determine positions file)
-        const newDatasetIdentity = await reloadIdentityPromise;
-        const newEmbeddingsMetadata = getEmbeddingsMetadata(newDatasetIdentity);
-        dimensionManager.initFromMetadata(newEmbeddingsMetadata);
-        notifyUmapResolution(newEmbeddingsMetadata);
-        debug.log(`[Main] Reloaded dataset identity v${newDatasetIdentity.version}`);
-
-        state.setVectorFieldManager(createVectorFieldManager({
-          baseUrl: EXPORT_BASE_URL,
-          vectorFieldsMetadata: newDatasetIdentity?.vector_fields || null,
-          dimensionManager
-        }));
-
-        // Start positions loading NOW (other manifests still loading in parallel)
-        const newDefaultDim = dimensionManager.getDefaultDimension();
-        const positionsPromiseReload = dimensionManager.getPositions3D(newDefaultDim);
-
-        // Wait for remaining manifests (already loading in parallel)
-        const [nextObs, nextVarManifest, newConnManifest] = await Promise.all([
-          reloadObsPromise, reloadVarPromise, reloadConnPromise
-        ]);
-
-        // Set up var data if loaded
-        if (nextVarManifest) {
-          state.setVarFieldLoader(createVarFieldLoader(getVarManifestUrl(), { fetchInit: FAST_BINARY_FETCH_INIT }));
-          state.initVarData(nextVarManifest);
-          debug.log(`[Main] Reloaded var manifest with ${nextVarManifest?.fields?.length || 0} genes.`);
-        } else {
-          state.setVarFieldLoader?.(null);
-          state.varData = null;
+        reloadTransaction.assertCurrent();
+        if (window._comparisonModule) {
+          window._comparisonModule.resetForDatasetReload({
+            reason: 'local-user-inplace-reload'
+          });
         }
-
-        // Handle connectivity manifest
-        if (newConnManifest && hasEdgeFormat(newConnManifest)) {
-          connectivityManifest = newConnManifest;
-          debug.log(`[Main] Loaded connectivity manifest for reloaded dataset: ${newConnManifest.n_edges?.toLocaleString()} edges`);
-
-          // Show connectivity controls
-          if (connectivityControls) {
-            connectivityControls.style.display = 'block';
-          }
-          // Reset edge state so checkbox handler reloads edges
-          if (viewer.disableEdgesV2) viewer.disableEdgesV2();
-          if (typeof window.__resetConnectivityState === 'function') {
-            window.__resetConnectivityState();
-          }
-        } else {
-          connectivityManifest = null;
-          if (connectivityControls) {
-            connectivityControls.style.display = 'none';
-          }
-        }
-
-        const nextPositions = await positionsPromiseReload;
-
-        state.initScene(nextPositions, nextObs);
-        if (state.clearActiveField) {
-          state.clearActiveField();
-        }
-        if (state.clearAllHighlights) {
-          state.clearAllHighlights();
-        }
-        try {
-          // In-place reload keeps the same ComparisonModule/DataLayer instance alive; reset
-          // analysis-layer caches and per-UI state that assume dataset identities are stable.
-          if (window._comparisonModule?.resetForDatasetReload) {
-            window._comparisonModule.resetForDatasetReload({ reason: 'local-user-inplace-reload' });
-          } else {
-            window._comparisonModule?.dataLayer?.resetForDatasetReload?.();
-          }
-        } catch {
-          // ignore
-        }
-
-        // Reset dimension level to the new dataset's default
-        dimensionManager.clearViewDimensions();
-        if (state.resetDimensionLevel) {
-          state.resetDimensionLevel(newDefaultDim);
-        }
-
-        // Refresh dataset-aware UI controls (field dropdowns, gene search, stats, dimension slider)
-        ui?.refreshDatasetUI?.(activeMetadata || null);
-        await ui?.activateField?.(-1);
-        ui?.showSessionStatus?.('Dataset loaded', false);
-        completeDataLoadSuccess(loadToken, buildDatasetAnalyticsContext({
-          metadata: activeMetadata,
-          datasetId: dataSourceManager.getCurrentDatasetId?.(),
-          datasetName: activeMetadata?.name,
-          reload: true
-        }));
       } catch (err) {
-        console.error('[Main] Failed to reload dataset in-place:', err);
-        statsEl.textContent = 'Failed to load dataset';
-        notifications.error(`Failed to load dataset: ${err?.message || 'Unknown error'}`, { category: 'data' });
-        ui?.showSessionStatus?.(err?.message || 'Failed to load dataset', true);
-        completeDataLoadFailure(loadToken, {
-          ...buildDatasetAnalyticsContext({
-            metadata: activeMetadata,
-            datasetId: dataSourceManager.getCurrentDatasetId?.(),
-            datasetName: activeMetadata?.name,
-            reload: true
-          }),
-          error: err
+        return handleDatasetReloadFailure({
+          error: err,
+          transaction: reloadTransaction,
+          cancel: () => cancelDataLoad(loadToken),
+          reportFailure: failure => {
+            console.error('[Main] Failed to reload dataset in-place:', failure);
+            completeDataLoadFailure(loadToken, {
+              ...buildDatasetAnalyticsContext({
+                metadata: activeMetadata,
+                datasetId: dataSourceManager.getCurrentDatasetId(),
+                datasetName: activeMetadata?.name,
+                reload: true
+              }),
+              error: failure
+            });
+          }
         });
-      } finally {
-        if (connectivityCheckbox) {
-          connectivityCheckbox.disabled = false;
-        }
       }
+
+      // All fallible dataset I/O and validation has completed, and the owner
+      // was rechecked. Publication is one synchronous, non-interleavable step.
+      connectivityRuntimeOwner.prepareDatasetReplacement();
+      const publication = commitDatasetRuntimeStage(stage);
+      const synchronizationOutcome = synchronizePublishedDatasetUi(
+        activeMetadata,
+        publication
+      );
+      completeDataLoadSuccess(loadToken, buildDatasetAnalyticsContext({
+        metadata: activeMetadata,
+        datasetId: dataSourceManager.getCurrentDatasetId(),
+        datasetName: activeMetadata?.name,
+        reload: true
+      }));
+      return synchronizationOutcome;
     }
-
-    const positions = await positionsPromise;
-
-    state.initScene(positions, obs);
     // One-time helper to rebuild density from current visibility + grid
-    function rebuildSmokeDensity(gridSizeOverride) {
-      const gridSize = gridSizeOverride || 128;
-
-      const visiblePositions = state.getVisiblePositionsForSmoke
-        ? state.getVisiblePositionsForSmoke()
-        : positions;
+    function rebuildSmokeDensity(gridSize) {
+      if (!Number.isInteger(gridSize) || gridSize < 8) {
+        throw new RangeError(
+          'Smoke density rebuild requires an exact gridSize integer of at least 8.'
+        );
+      }
+      if (typeof state.getVisiblePositionsForSmoke !== 'function') {
+        throw new TypeError(
+          'Smoke density rebuild requires getVisiblePositionsForSmoke().'
+        );
+      }
+      const visiblePositions = state.getVisiblePositionsForSmoke();
+      if (
+        !(visiblePositions instanceof Float32Array) ||
+        visiblePositions.length === 0 ||
+        visiblePositions.length % 3 !== 0
+      ) {
+        throw new TypeError(
+          'Smoke density rebuild requires non-empty Float32 XYZ positions.'
+        );
+      }
 
       debug.log(`Building smoke volume at ${gridSize}^3 from ${visiblePositions.length / 3} visible points (GPU)…`);
       // Use GPU-accelerated splatting for dramatic speedup
@@ -927,48 +1146,21 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     // -----------------------------------------------------------------------
     if (jupyterSource) {
       const jupyterConfig = getJupyterConfig();
-      const serverUrl =
-        jupyterConfig?.serverUrl || new URL('.', window.location.href).toString().replace(/\/$/, '');
-      const viewerId = jupyterConfig?.viewerId || null;
-
-      try {
-        jupyterSource.onMessage(async (msg) => {
-          if (!msg || typeof msg !== 'object') return;
-          if (msg.type !== 'requestSessionBundle') return;
-
-          const requestId = String(msg.requestId || '').trim();
-          if (!requestId) return;
-          if (!viewerId) return;
-
-          try {
-            const blob = await sessionSerializer.createSessionBundle();
-            const uploadUrl =
-              `${serverUrl}/_cellucid/session_bundle?viewerId=${encodeURIComponent(viewerId)}&requestId=${encodeURIComponent(requestId)}`;
-
-            const res = await fetch(uploadUrl, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/octet-stream' },
-              body: blob
-            });
-
-            if (!res.ok) {
-              const text = await res.text().catch(() => '');
-              throw new Error(text || `Upload failed (${res.status})`);
-            }
-          } catch (err) {
-            console.warn('[Main] requestSessionBundle failed:', err);
-            try {
-              jupyterSource.notifyCustomEvent('session_bundle', {
-                requestId,
-                status: 'error',
-                error: err?.message || String(err)
-              });
-            } catch {}
-          }
-        });
-      } catch (err) {
-        console.warn('[Main] Failed to wire requestSessionBundle handler:', err);
+      if (jupyterConfig === null) {
+        throw new Error(
+          'Jupyter session upload requires the exact authenticated configuration'
+        );
       }
+      jupyterSource.onMessage(async message => {
+        if (message.type !== 'requestSessionBundle') return;
+        await uploadJupyterSessionBundle({
+          config: jupyterConfig,
+          message,
+          createSessionBundle: () =>
+            sessionSerializer.createSessionBundle(),
+          fetchImpl: fetch
+        });
+      });
     }
 
     ui = initUI({
@@ -983,21 +1175,30 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       jupyterSource
     });
 
-    // Allow session serializer to capture/restore cinematic camera state.
-    try {
-      sessionSerializer.setCinematicCameraRef?.(ui.cinematicCamera);
-    } catch (err) {
-      console.warn('[Main] Failed to wire cinematic camera ref for session restore:', err);
+    if (jupyterSource !== null) {
+      const jupyterCommandHandlers = createJupyterCommandHandlers({
+        state,
+        viewer,
+        refreshUi: ui.refreshUiAfterStateLoad
+      });
+      jupyterSource.onHighlight(
+        jupyterCommandHandlers.handleHighlight
+      );
+      jupyterSource.onMessage(
+        jupyterCommandHandlers.handleMessage
+      );
     }
 
-    // Jupyter: notify Python only after the UI + notebook hooks are fully wired.
-    // This powers `viewer.on_ready` and `viewer.wait_for_ready()`.
-    try {
-      jupyterSource?.notifyReady?.({
-        nCells: state.pointCount || Math.floor((positions?.length || 0) / 3),
-        dimensions: state.activeDimensionLevel || 3
+    // Allow session serializer to capture/restore cinematic camera state.
+    sessionSerializer.setCinematicCameraRef(ui.cinematicCamera);
+
+    // Jupyter: publish readiness only after the complete dataset and UI exist.
+    if (jupyterSource !== null) {
+      await jupyterSource.notifyReady({
+        nCells: state.pointCount,
+        dimensions: state.activeDimensionLevel
       });
-    } catch {}
+    }
 
     // Initialize Page Analysis / Comparison Module
     const pageAnalysisSection = document.getElementById('page-analysis-section');
@@ -1009,17 +1210,20 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       // Store reference for potential external access
       window._comparisonModule = comparisonModule;
       // Allow session restore to reopen analysis windows once the module exists.
-      try {
-        sessionSerializer.setAnalysisRefs?.({
-          comparisonModule,
-          analysisWindowManager: comparisonModule.getAnalysisWindowManager?.()
-        });
-      } catch (err) {
-        console.warn('[Main] Failed to wire analysis refs for session restore:', err);
-      }
+      const analysisWindowManager = comparisonModule.getAnalysisWindowManager();
+      sessionSerializer.setAnalysisRefs({
+        comparisonModule,
+        analysisWindowManager
+      });
     }
 
-    await ui.activateField(-1);
+    if (hasInitialDataset) {
+      synchronizePublishedDatasetUi(
+        dataSourceManager.getCurrentMetadata(),
+        initialPublication
+      );
+      await ui.activateField(-1);
+    }
     if (currentDatasetLoadToken) {
       completeDataLoadSuccess(currentDatasetLoadToken, buildDatasetAnalyticsContext());
       currentDatasetLoadToken = null;
@@ -1028,14 +1232,15 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     // Setup connectivity controls
     // NOTE: Handlers are ALWAYS set up so they work for datasets loaded dynamically (h5ad/zarr)
     // The handlers check if connectivityManifest is available before doing anything
-    {
+    function initializeConnectivityControls() {
       // Show connectivity controls if data is available at bootstrap
-      if (connectivityManifest && hasEdgeFormat(connectivityManifest) && connectivityControls) {
+      if (connectivityManifest !== null && connectivityControls) {
         connectivityControls.style.display = 'block';
       }
 
       // Use getter to always get current edge count (supports dynamic manifest updates)
-      const getTotalEdges = () => connectivityManifest?.n_edges || 0;
+      const getTotalEdges = () =>
+        connectivityManifest === null ? 0 : connectivityManifest.n_edges;
       const EDGE_UI_CAP = 100000000;  // 100M edges max in UI
 
       // Store edge arrays for accurate visible edge counting
@@ -1047,8 +1252,9 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       let lastLodLevel = -1;               // Track LOD level for change detection
       let actualVisibleEdges = getTotalEdges();
 
-      // Reusable buffer for combined visibility (avoids GC pressure)
-      let combinedVisibilityBuffer = null;
+      // Reusable per-view buffers for combined visibility (avoids GC pressure
+      // without allowing one snapshot to overwrite the live-view result).
+      const combinedVisibilityBuffers = new Map();
 
       // Prefix sum for accurate LOD limit calculation
       let visibleEdgePrefixSum = null;
@@ -1058,21 +1264,8 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
        * Uses seeded RNG for reproducibility across sessions.
        * This ensures "first N edges" is a truly random sample.
        */
-      function shuffleEdges(sources, destinations) {
-        const n = sources.length;
-        const rng = createMulberry32(42); // Fixed seed for reproducibility
-
-        for (let i = n - 1; i > 0; i--) {
-          const j = Math.floor(rng() * (i + 1));
-          // Swap sources
-          const tmpSrc = sources[i];
-          sources[i] = sources[j];
-          sources[j] = tmpSrc;
-          // Swap destinations (same permutation)
-          const tmpDst = destinations[i];
-          destinations[i] = destinations[j];
-          destinations[j] = tmpDst;
-        }
+      function shuffleEdges(sources, destinations, weights) {
+        shuffleConnectivityEdges(sources, destinations, weights);
       }
 
       /**
@@ -1081,41 +1274,75 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
        *
        * Performance: Reuses buffer, returns filterVis directly when LOD is disabled/full detail.
        *
-       * @param {string} [viewId] - Optional view ID for per-view visibility (snapshots).
-       *   If not provided, uses global live view visibility.
-       * @param {number} [dimensionLevel] - Optional dimension level for LOD calculation.
+       * @param {string} viewId - Exact live or snapshot view ID.
+       * @param {number} dimensionLevel - Exact dimension level for LOD calculation.
        * @returns {Float32Array|null} Combined visibility array
        */
       function getCombinedVisibility(viewId, dimensionLevel) {
+        if (typeof viewId !== 'string' || viewId.length === 0) {
+          throw new TypeError(
+            'Connectivity visibility requires one exact non-empty view id.'
+          );
+        }
+        if (
+          !Number.isInteger(dimensionLevel) ||
+          dimensionLevel < 1 ||
+          dimensionLevel > 3
+        ) {
+          throw new TypeError(
+            'Connectivity visibility requires an exact 1D, 2D, or 3D dimension.'
+          );
+        }
         // Get filter visibility:
-        // - For live view (no viewId): use state.getVisibilityArray()
+        // - For live view: use state.getVisibilityArray()
         // - For snapshots: use snapshot's transparency if it has its own filters
         let filterVis;
-        if (viewId && viewId !== 'live') {
-          // Get snapshot's transparency as filter visibility
-          const snapshot = viewer.getSnapshotViews?.()?.find(s => s.id === viewId);
-          if (snapshot && !snapshot.sharesLiveTransparency && snapshot.transparency) {
-            // Convert transparency to binary visibility (transparency > 0.01 = visible)
-            filterVis = snapshot.transparency;
-          } else {
-            // Shares live transparency or no snapshot found
-            filterVis = state.getVisibilityArray();
-          }
-        } else {
+        if (viewId === 'live') {
           filterVis = state.getVisibilityArray();
+        } else {
+          filterVis = viewer.getViewTransparency(viewId);
         }
 
         // Get LOD visibility for this specific view and dimension
         const lodVis = viewer.getLodVisibilityArray(viewId, dimensionLevel);
 
-        if (!filterVis) return null;
-        if (!lodVis) return filterVis; // No LOD active, just use filter visibility (no copy needed)
+        if (
+          !(filterVis instanceof Float32Array) ||
+          connectivityManifest === null ||
+          filterVis.length !== connectivityManifest.n_cells
+        ) {
+          throw new TypeError(
+            'Connectivity filtering requires one exact Float32 visibility ' +
+            'value per cell.'
+          );
+        }
+        if (lodVis === null) {
+          return filterVis;
+        }
+        if (
+          !(lodVis instanceof Float32Array) ||
+          lodVis.length !== filterVis.length
+        ) {
+          throw new TypeError(
+            'Connectivity LOD requires one exact Float32 visibility value ' +
+            'per cell.'
+          );
+        }
 
         const n = filterVis.length;
 
-        // Reuse or create buffer
-        if (!combinedVisibilityBuffer || combinedVisibilityBuffer.length !== n) {
+        const bufferKey = viewId;
+        let combinedVisibilityBuffer =
+          combinedVisibilityBuffers.get(bufferKey);
+        if (
+          combinedVisibilityBuffer === undefined ||
+          combinedVisibilityBuffer.length !== n
+        ) {
           combinedVisibilityBuffer = new Float32Array(n);
+          combinedVisibilityBuffers.set(
+            bufferKey,
+            combinedVisibilityBuffer
+          );
         }
 
         // Combined visibility = filter AND LOD
@@ -1129,7 +1356,11 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
       // Format edge count for display (compact)
       function formatEdgeCount(n) {
-        n = parseInt(n);
+        if (!Number.isSafeInteger(n) || n < 0) {
+          throw new TypeError(
+            'Connectivity edge counts must be non-negative safe integers.'
+          );
+        }
         if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
         if (n >= 1000) return (n / 1000).toFixed(0) + 'k';
         return n.toString();
@@ -1143,9 +1374,19 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
        * @returns {{visibleCount: number}}
        */
       function countVisibleEdges(visibility) {
-        if (!edgeSources || !edgeDestinations || !visibility) {
-          visibleEdgePrefixSum = null;
-          return { visibleCount: getTotalEdges() };
+        if (
+          !(edgeSources instanceof Uint32Array) ||
+          !(edgeDestinations instanceof Uint32Array) ||
+          edgeSources.length !== edgeDestinations.length ||
+          !(visibility instanceof Float32Array) ||
+          connectivityManifest === null ||
+          edgeSources.length !== connectivityManifest.n_edges ||
+          visibility.length !== connectivityManifest.n_cells
+        ) {
+          throw new TypeError(
+            'Visible-edge counting requires exact render-owned edge and ' +
+            'visibility arrays.'
+          );
         }
         const n = edgeSources.length;
 
@@ -1170,39 +1411,46 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
        * Find exact LOD limit to show targetVisible edges using binary search on prefix sum.
        * Since edges are shuffled, this gives us exactly targetVisible random edges.
        * @param {number} targetVisible - Desired number of visible edges
-       * @param {Float32Array} visibility - Per-cell visibility (unused, prefix sum is pre-built)
        * @returns {number} - Exact LOD limit
        */
-      function findLodLimitFast(targetVisible, visibility) {
-        if (!edgeSources || !edgeDestinations) {
-          return targetVisible;
+      function findLodLimitFast(targetVisible) {
+        if (
+          !(edgeSources instanceof Uint32Array) ||
+          !(edgeDestinations instanceof Uint32Array) ||
+          edgeSources.length !== edgeDestinations.length
+        ) {
+          throw new Error(
+            'Exact edge LOD requires the current render-owned edge arrays.'
+          );
         }
         if (targetVisible >= actualVisibleEdges) {
-          return getTotalEdges();
+          return edgeSources.length;
         }
         if (actualVisibleEdges <= 0 || targetVisible <= 0) {
           return 0;
         }
 
-        // Use prefix sum with binary search for exact LOD limit
-        if (visibleEdgePrefixSum) {
-          // Binary search: find smallest index i where prefixSum[i] >= targetVisible
-          let lo = 0;
-          let hi = visibleEdgePrefixSum.length - 1;
-          while (lo < hi) {
-            const mid = (lo + hi) >>> 1;
-            if (visibleEdgePrefixSum[mid] < targetVisible) {
-              lo = mid + 1;
-            } else {
-              hi = mid;
-            }
-          }
-          return lo;
+        if (
+          !(visibleEdgePrefixSum instanceof Uint32Array) ||
+          visibleEdgePrefixSum.length !== edgeSources.length + 1
+        ) {
+          throw new Error(
+            'Exact edge LOD requires the current visibility prefix sum.'
+          );
         }
 
-        // Fallback: ratio-based approximation (should rarely happen)
-        const ratio = targetVisible / actualVisibleEdges;
-        return Math.min(getTotalEdges(), Math.round(getTotalEdges() * ratio * 1.05));
+        // Find the smallest prefix containing targetVisible visible edges.
+        let lo = 0;
+        let hi = visibleEdgePrefixSum.length - 1;
+        while (lo < hi) {
+          const mid = (lo + hi) >>> 1;
+          if (visibleEdgePrefixSum[mid] < targetVisible) {
+            lo = mid + 1;
+          } else {
+            hi = mid;
+          }
+        }
+        return lo;
       }
 
       // Track current state - user's preference, NOT auto-adjusted by visibility changes
@@ -1217,7 +1465,19 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       function updateSliderRange(visibleEdges) {
         if (!connectivityLimitInput) return;
         const cappedMax = Math.min(visibleEdges, EDGE_UI_CAP);
-        const minVal = clamp(Math.round(cappedMax * 0.01), 100, 1000);
+        if (cappedMax === 0) {
+          connectivityLimitInput.max = 0;
+          connectivityLimitInput.min = 0;
+          connectivityLimitInput.value = 0;
+          if (connectivityLimitDisplay) {
+            connectivityLimitDisplay.textContent = '0';
+          }
+          return;
+        }
+        const minVal = Math.min(
+          cappedMax,
+          clamp(Math.round(cappedMax * 0.01), 100, 1000)
+        );
 
         connectivityLimitInput.max = cappedMax;
         connectivityLimitInput.min = minVal;
@@ -1248,15 +1508,16 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
        * Only edges where both endpoints pass filters AND are visible at current LOD are shown.
        */
       function applyEdgeLodLimit() {
-        if (!cachedCombinedVisibility) {
-          viewer.setEdgeLodLimit(currentEdgeLimit);
-          updateConnectivityInfo(actualVisibleEdges, Math.min(currentEdgeLimit, actualVisibleEdges));
-          return;
+        if (cachedCombinedVisibility === null) {
+          throw new Error(
+            'Exact edge LOD requires current combined visibility.'
+          );
         }
 
-        // Calculate LOD limit to show approximately currentEdgeLimit visible edges
+        // Calculate the exact render prefix containing currentEdgeLimit
+        // visible edges.
         const targetVisible = Math.min(currentEdgeLimit, actualVisibleEdges);
-        const lodLimit = findLodLimitFast(targetVisible, cachedCombinedVisibility);
+        const lodLimit = findLodLimitFast(targetVisible);
         viewer.setEdgeLodLimit(lodLimit);
         updateConnectivityInfo(actualVisibleEdges, targetVisible);
       }
@@ -1267,38 +1528,305 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
       // Edge loading state
       let edgesLoaded = false;
+      let loadedEdgeData = null;
+      let edgeLoadOwner = null;
+      let connectivityToggleGeneration = 0;
+      let knnLoadPromise = null;
 
-      // Function to reset edge state (called when switching datasets)
-      function resetEdgeState() {
+      function createConnectivitySupersededError() {
+        return createDatasetReloadSupersededError(
+          'Connectivity edge loading was superseded by a newer dataset generation.'
+        );
+      }
+
+      function abortConnectivityLoad() {
+        if (edgeLoadOwner === null) {
+          return;
+        }
+        const owner = edgeLoadOwner;
+        edgeLoadOwner = null;
+        owner.controller.abort(createConnectivitySupersededError());
+      }
+
+      function captureConnectivityLoadOwner() {
+        if (connectivityManifest === null) {
+          throw new Error(
+            'Connectivity edge loading requires a published connectivity manifest.'
+          );
+        }
+
+        const sourceType = dataSourceManager.getCurrentSourceType();
+        const datasetId = dataSourceManager.getCurrentDatasetId();
+        const identityId = dataSourceManager.getCurrentIdentityId();
+        const managerBaseUrl = dataSourceManager.getCurrentBaseUrl();
+        if (
+          datasetPublicationGeneration === 0 ||
+          sourceType === null ||
+          datasetId === null ||
+          identityId === null ||
+          managerBaseUrl !== EXPORT_BASE_URL
+        ) {
+          throw createConnectivitySupersededError();
+        }
+
+        return {
+          controller: new AbortController(),
+          publicationGeneration: datasetPublicationGeneration,
+          manifest: connectivityManifest,
+          exportBaseUrl: EXPORT_BASE_URL,
+          sourceType,
+          datasetId,
+          identityId,
+          managerBaseUrl,
+          localSelectionIdentity: userSource.getSelectionIdentity(),
+          localAdoptionIdentity: userSource.getAdoptionIdentity(),
+          promise: null
+        };
+      }
+
+      function assertCurrentConnectivityLoadOwner(owner) {
+        if (
+          owner !== edgeLoadOwner ||
+          owner.controller.signal.aborted ||
+          owner.publicationGeneration !== datasetPublicationGeneration ||
+          owner.manifest !== connectivityManifest ||
+          owner.exportBaseUrl !== EXPORT_BASE_URL ||
+          owner.sourceType !== dataSourceManager.getCurrentSourceType() ||
+          owner.datasetId !== dataSourceManager.getCurrentDatasetId() ||
+          owner.identityId !== dataSourceManager.getCurrentIdentityId() ||
+          owner.managerBaseUrl !== dataSourceManager.getCurrentBaseUrl() ||
+          owner.localSelectionIdentity !== userSource.getSelectionIdentity() ||
+          owner.localAdoptionIdentity !== userSource.getAdoptionIdentity()
+        ) {
+          throw createConnectivitySupersededError();
+        }
+      }
+
+      function prepareDatasetReplacement() {
+        viewer.setShowConnectivity(false);
+        viewer.clearEdgesV2();
+        viewer.clearKnnEdges();
+        abortConnectivityLoad();
+        connectivityToggleGeneration++;
+        knnLoadPromise = null;
         edgesLoaded = false;
+        loadedEdgeData = null;
         edgeSources = null;
         edgeDestinations = null;
         cachedCombinedVisibility = null;
         visibleEdgePrefixSum = null;
-        combinedVisibilityBuffer = null;
+        combinedVisibilityBuffers.clear();
+        actualVisibleEdges = 0;
+        currentEdgeLimit = 0;
+        lastLodLevel = -1;
+        stopLodTracking();
+        if (edgeVisibilityThrottleTimer !== null) {
+          clearTimeout(edgeVisibilityThrottleTimer);
+          edgeVisibilityThrottleTimer = null;
+        }
+        edgeVisibilityPending = false;
+      }
+
+      function synchronizeDatasetPublication() {
         actualVisibleEdges = getTotalEdges();
         currentEdgeLimit = Math.min(250000, getTotalEdges());
-        lastLodLevel = -1;
-
         if (connectivityCheckbox) {
           connectivityCheckbox.checked = false;
+          connectivityCheckbox.disabled = false;
         }
         if (connectivitySliders) {
           connectivitySliders.style.display = 'none';
         }
         updateSliderRange(actualVisibleEdges);
         updateConnectivityInfo(actualVisibleEdges, Math.min(currentEdgeLimit, actualVisibleEdges));
+        if (connectivityControls) {
+          connectivityControls.style.display =
+            connectivityManifest === null ? 'none' : 'block';
+        }
       }
 
-      // Expose reset function for use by reloadActiveDatasetInPlace
-      window.__resetConnectivityState = resetEdgeState;
+      function publishConnectivityEdges(owner, edgeData) {
+        assertCurrentConnectivityLoadOwner(owner);
+        const renderEdgeData = Object.freeze({
+          ...edgeData,
+          sources: edgeData.sources.slice(),
+          destinations: edgeData.destinations.slice(),
+          weights: edgeData.weights.slice()
+        });
+        shuffleEdges(
+          renderEdgeData.sources,
+          renderEdgeData.destinations,
+          renderEdgeData.weights
+        );
+        assertCurrentConnectivityLoadOwner(owner);
+
+        edgeSources = renderEdgeData.sources;
+        edgeDestinations = renderEdgeData.destinations;
+        if (
+          viewer.setupEdgesV2(
+            renderEdgeData,
+            state.positionsArray
+          ) !== true
+        ) {
+          throw new Error(
+            'The viewer rejected an exact connectivity edge payload.'
+          );
+        }
+
+        const existingSnapshots = viewer.getSnapshotViews();
+        for (const snapshot of existingSnapshots) {
+          const snapshotPositions = viewer.getViewPositions(snapshot.id);
+          if (
+            viewer.setupEdgesV2ForView(
+              snapshot.id,
+              snapshotPositions,
+              snapshotPositions.length / 3
+            ) !== true
+          ) {
+            throw new Error(
+              `The viewer rejected connectivity positions for view "${snapshot.id}".`
+            );
+          }
+        }
+
+        cachedCombinedVisibility = getCombinedVisibility(
+          'live',
+          viewer.getViewDimension('live')
+        );
+        if (cachedCombinedVisibility !== null) {
+          if (
+            viewer.updateEdgeVisibilityV2(
+              cachedCombinedVisibility
+            ) !== true
+          ) {
+            throw new Error(
+              'The viewer rejected live connectivity visibility.'
+            );
+          }
+          for (const snapshot of existingSnapshots) {
+            const snapshotDimension = viewer.getViewDimension(
+              snapshot.id
+            );
+            const snapshotVisibility = getCombinedVisibility(
+              snapshot.id,
+              snapshotDimension
+            );
+            if (snapshotVisibility !== null) {
+              if (
+                viewer.updateEdgeVisibilityV2ForView(
+                  snapshot.id,
+                  snapshotVisibility
+                ) !== true
+              ) {
+                throw new Error(
+                  `The viewer rejected connectivity visibility for view ` +
+                  `"${snapshot.id}".`
+                );
+              }
+            }
+          }
+          const { visibleCount } = countVisibleEdges(
+            cachedCombinedVisibility
+          );
+          actualVisibleEdges = visibleCount;
+        }
+        lastLodLevel = viewer.getCurrentLODLevel(state.getActiveViewId());
+        updateSliderRange(actualVisibleEdges);
+        applyEdgeLodLimit();
+
+        loadedEdgeData = edgeData;
+        edgesLoaded = true;
+        debug.log(
+          `[Main] Connectivity generation published: ` +
+          `${edgeData.nEdges} edges, ${edgeData.nCells} cells, ` +
+          `${actualVisibleEdges} visible.`
+        );
+        return edgeData;
+      }
+
+      function clearPublishedConnectivityEdges() {
+        viewer.setShowConnectivity(false);
+        viewer.clearEdgesV2();
+        viewer.clearKnnEdges();
+        edgesLoaded = false;
+        loadedEdgeData = null;
+        edgeSources = null;
+        edgeDestinations = null;
+        cachedCombinedVisibility = null;
+        visibleEdgePrefixSum = null;
+        combinedVisibilityBuffers.clear();
+        actualVisibleEdges = getTotalEdges();
+        currentEdgeLimit = Math.min(250000, actualVisibleEdges);
+        lastLodLevel = -1;
+        stopLodTracking();
+        if (edgeVisibilityThrottleTimer !== null) {
+          clearTimeout(edgeVisibilityThrottleTimer);
+          edgeVisibilityThrottleTimer = null;
+        }
+        edgeVisibilityPending = false;
+        updateSliderRange(actualVisibleEdges);
+        updateConnectivityInfo(
+          actualVisibleEdges,
+          Math.min(currentEdgeLimit, actualVisibleEdges)
+        );
+      }
+
+      function ensureConnectivityEdgesLoaded() {
+        if (edgesLoaded) {
+          if (loadedEdgeData === null) {
+            throw new Error(
+              'Connectivity edge state is loaded without its exact payload.'
+            );
+          }
+          return Promise.resolve(loadedEdgeData);
+        }
+        if (edgeLoadOwner !== null) {
+          return edgeLoadOwner.promise;
+        }
+
+        const owner = captureConnectivityLoadOwner();
+        edgeLoadOwner = owner;
+        let rendererPublicationStarted = false;
+        owner.promise = (async () => {
+          try {
+            const edgeData = await loadEdges(
+              getConnectivityManifestUrl(owner.exportBaseUrl),
+              owner.manifest,
+              { signal: owner.controller.signal }
+            );
+            assertCurrentConnectivityLoadOwner(owner);
+            rendererPublicationStarted = true;
+            return publishConnectivityEdges(owner, edgeData);
+          } catch (error) {
+            if (owner.controller.signal.aborted) {
+              throw createConnectivitySupersededError();
+            }
+            assertCurrentConnectivityLoadOwner(owner);
+            if (
+              rendererPublicationStarted &&
+              edgeLoadOwner === owner
+            ) {
+              edgeLoadOwner = null;
+              clearPublishedConnectivityEdges();
+            }
+            throw error;
+          } finally {
+            if (edgeLoadOwner === owner) {
+              edgeLoadOwner = null;
+            }
+          }
+        })();
+        Object.freeze(owner);
+        return owner.promise;
+      }
 
       if (connectivityCheckbox) {
         connectivityCheckbox.addEventListener('change', async () => {
           const show = connectivityCheckbox.checked;
+          const toggleGeneration = ++connectivityToggleGeneration;
 
           // Check if connectivity manifest is available
-          if (!connectivityManifest || !hasEdgeFormat(connectivityManifest)) {
+          if (connectivityManifest === null) {
             console.warn('[Main] Connectivity checkbox toggled but no manifest available');
             connectivityCheckbox.checked = false;
             return;
@@ -1309,60 +1837,26 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
             const connNotifId = notifications.loading('Loading connectivity data', { category: 'connectivity' });
             try {
               debug.log('[Main] Loading GPU-optimized edges...');
-              const edgeData = await loadEdges(getConnectivityManifestUrl(), connectivityManifest);
-
-              // Shuffle edges for truly random sampling when using MAX EDGES slider
-              // This ensures "first N edges" gives a representative random sample
-              debug.log('[Main] Shuffling edges for random sampling...');
-              shuffleEdges(edgeData.sources, edgeData.destinations);
-
-              // Store edge arrays for accurate visibility counting
-              edgeSources = edgeData.sources;
-              edgeDestinations = edgeData.destinations;
-
-              // Set up instanced rendering with positions from state (uses shuffled edges)
-              viewer.setupEdgesV2(edgeData, state.positionsArray);
-              edgesLoaded = true;
-
-              // Set up edge textures for any existing snapshots (in case edges loaded after snapshots)
-              const existingSnapshots = viewer.getSnapshotViews?.() || [];
-              for (const snapshot of existingSnapshots) {
-                const positions = viewer.getViewPositions?.(snapshot.id) || state.positionsArray;
-                if (positions && viewer.setupEdgesV2ForView) {
-                  viewer.setupEdgesV2ForView(snapshot.id, positions, positions.length / 3);
-                }
+              const edgeData = await ensureConnectivityEdgesLoaded();
+              if (
+                toggleGeneration !== connectivityToggleGeneration ||
+                connectivityCheckbox.checked !== true ||
+                edgesLoaded !== true ||
+                loadedEdgeData !== edgeData
+              ) {
+                notifications.dismiss(connNotifId);
+                return;
               }
-
-              // Get combined visibility (filter + LOD) and count visible edges for all views
-              cachedCombinedVisibility = getCombinedVisibility();
-              if (cachedCombinedVisibility) {
-                viewer.updateEdgeVisibilityV2(cachedCombinedVisibility);
-                // Also update existing snapshots
-                for (const snapshot of existingSnapshots) {
-                  const snapshotVis = getCombinedVisibility(snapshot.id, snapshot.dimensionLevel);
-                  if (snapshotVis && viewer.updateEdgeVisibilityV2ForView) {
-                    viewer.updateEdgeVisibilityV2ForView(snapshot.id, snapshotVis);
-                  }
-                }
-                const { visibleCount } = countVisibleEdges(cachedCombinedVisibility);
-                actualVisibleEdges = visibleCount;
-              }
-              lastLodLevel = viewer.getCurrentLODLevel();
-
-              // Update slider range and apply LOD
-              updateSliderRange(actualVisibleEdges);
-              applyEdgeLodLimit();
-
-              debug.log(`[Main] Edges loaded: ${edgeData.nEdges} edges, ${edgeData.nCells} cells, visible: ${actualVisibleEdges}`);
-
-              // Also load edges into KNN adjacency list for KNN drag mode
-              if (viewer.loadKnnEdges) {
-                viewer.loadKnnEdges(edgeData.sources, edgeData.destinations);
-              }
-
               notifications.complete(connNotifId, `Loaded ${edgeData.nEdges.toLocaleString()} edges`);
 
             } catch (err) {
+              if (
+                isDatasetReloadSupersededError(err) ||
+                toggleGeneration !== connectivityToggleGeneration
+              ) {
+                notifications.dismiss(connNotifId);
+                return;
+              }
               console.error('Failed to load connectivity data:', err);
               notifications.fail(connNotifId, 'Failed to load connectivity');
               connectivityCheckbox.checked = false;
@@ -1396,17 +1890,49 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         if (!edgesLoaded) return;
 
         // Update live view edges
-        cachedCombinedVisibility = getCombinedVisibility();
-        if (!cachedCombinedVisibility) return;
+        cachedCombinedVisibility = getCombinedVisibility(
+          'live',
+          viewer.getViewDimension('live')
+        );
+        if (cachedCombinedVisibility === null) {
+          throw new Error(
+            'Connectivity visibility is unavailable for the live view.'
+          );
+        }
 
-        viewer.updateEdgeVisibilityV2(cachedCombinedVisibility);
+        if (
+          viewer.updateEdgeVisibilityV2(
+            cachedCombinedVisibility
+          ) !== true
+        ) {
+          throw new Error(
+            'The viewer rejected live connectivity visibility.'
+          );
+        }
 
         // Update all snapshot views' edge visibility
-        const snapshots = viewer.getSnapshotViews?.() || [];
+        const snapshots = viewer.getSnapshotViews();
         for (const snapshot of snapshots) {
-          const snapshotVis = getCombinedVisibility(snapshot.id, snapshot.dimensionLevel);
-          if (snapshotVis) {
-            viewer.updateEdgeVisibilityV2ForView(snapshot.id, snapshotVis);
+          const snapshotVis = getCombinedVisibility(
+            snapshot.id,
+            viewer.getViewDimension(snapshot.id)
+          );
+          if (snapshotVis === null) {
+            throw new Error(
+              `Connectivity visibility is unavailable for view ` +
+              `"${snapshot.id}".`
+            );
+          }
+          if (
+            viewer.updateEdgeVisibilityV2ForView(
+              snapshot.id,
+              snapshotVis
+            ) !== true
+          ) {
+            throw new Error(
+              `The viewer rejected connectivity visibility for view ` +
+              `"${snapshot.id}".`
+            );
           }
         }
 
@@ -1455,7 +1981,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         lodCheckInterval = setInterval(() => {
           if (!edgesLoaded || !connectivityCheckbox?.checked) return;
 
-          const currentLod = viewer.getCurrentLODLevel();
+          const currentLod = viewer.getCurrentLODLevel(state.getActiveViewId());
           if (currentLod !== lastLodLevel) {
             debug.log(`[Edges] LOD changed: ${lastLodLevel} → ${currentLod}`);
             lastLodLevel = currentLod;
@@ -1504,10 +2030,23 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       // Wire up limit slider (LOD control)
       if (connectivityLimitInput && connectivityLimitDisplay) {
         connectivityLimitInput.addEventListener('input', () => {
-          const max = parseInt(connectivityLimitInput.max || EDGE_UI_CAP, 10);
-          const min = parseInt(connectivityLimitInput.min || '1000', 10);
-          const requested = parseInt(connectivityLimitInput.value, 10);
-          currentEdgeLimit = clamp(Number.isFinite(requested) ? requested : 0, min, max);
+          const max = Number(connectivityLimitInput.max);
+          const min = Number(connectivityLimitInput.min);
+          const requested = Number(connectivityLimitInput.value);
+          if (
+            !Number.isSafeInteger(max) ||
+            !Number.isSafeInteger(min) ||
+            !Number.isSafeInteger(requested) ||
+            min < 0 ||
+            max < min ||
+            requested < min ||
+            requested > max
+          ) {
+            throw new TypeError(
+              'Connectivity edge limit controls require exact integer bounds.'
+            );
+          }
+          currentEdgeLimit = clamp(requested, min, max);
           connectivityLimitInput.value = currentEdgeLimit;
           connectivityLimitDisplay.textContent = formatEdgeCount(currentEdgeLimit);
 
@@ -1518,51 +2057,83 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
 
       // Set up KNN edge load callback - triggers when KNN mode needs edges
       // This loads edges on-demand when user first tries to use KNN drag
-      if (viewer.setKnnEdgeLoadCallback) {
-        viewer.setKnnEdgeLoadCallback(async () => {
-          // Check if connectivity manifest is available
-          if (!connectivityManifest || !hasEdgeFormat(connectivityManifest)) {
-            console.warn('[Main] KNN mode requested but no connectivity manifest available');
-            notifications.warn('No neighbor graph available for this dataset', { category: 'connectivity' });
-            return;
-          }
+      viewer.setKnnEdgeLoadCallback(() => {
+        if (connectivityManifest === null) {
+          console.warn(
+            '[Main] KNN mode requested but no connectivity manifest available'
+          );
+          notifications.warning(
+            'No neighbor graph available for this dataset',
+            { category: 'connectivity' }
+          );
+          return;
+        }
+        if (edgesLoaded && viewer.isKnnEdgesLoaded()) {
+          return;
+        }
+        if (knnLoadPromise !== null) {
+          return;
+        }
 
-          // If edges are already loaded, just build the adjacency list
-          if (edgesLoaded && edgeSources && edgeDestinations) {
-            if (!viewer.isKnnEdgesLoaded()) {
-              viewer.loadKnnEdges(edgeSources, edgeDestinations);
-            }
-            return;
-          }
-
-          // Otherwise, load edges first
-          const knnNotifId = notifications.loading('Loading neighbor graph for KNN mode', { category: 'connectivity' });
+        const requestGeneration = datasetPublicationGeneration;
+        const knnNotifId = notifications.loading(
+          'Loading neighbor graph for KNN mode',
+          { category: 'connectivity' }
+        );
+        const operation = (async () => {
           try {
             debug.log('[Main] Loading edges for KNN mode...');
-            const edgeData = await loadEdges(getConnectivityManifestUrl(), connectivityManifest);
-
-            // Shuffle for random sampling (if not already done)
-            shuffleEdges(edgeData.sources, edgeData.destinations);
-
-            // Store edge arrays
-            edgeSources = edgeData.sources;
-            edgeDestinations = edgeData.destinations;
-
-            // Set up V2 rendering (for potential edge display)
-            viewer.setupEdgesV2(edgeData, state.positionsArray);
-            edgesLoaded = true;
-
-            // Build KNN adjacency list
-            viewer.loadKnnEdges(edgeData.sources, edgeData.destinations);
-
-            debug.log(`[Main] KNN edges loaded: ${edgeData.nEdges} edges`);
-            notifications.complete(knnNotifId, `Neighbor graph ready (${edgeData.nEdges.toLocaleString()} edges)`);
+            const edgeData = await ensureConnectivityEdgesLoaded();
+            if (
+              requestGeneration !== datasetPublicationGeneration ||
+              edgesLoaded !== true ||
+              loadedEdgeData !== edgeData
+            ) {
+              notifications.dismiss(knnNotifId);
+              return;
+            }
+            if (
+              viewer.loadKnnEdges(
+                edgeData.sources,
+                edgeData.destinations
+              ) !== true
+            ) {
+              throw new Error(
+                'The viewer rejected an exact KNN connectivity payload.'
+              );
+            }
+            notifications.complete(
+              knnNotifId,
+              `Neighbor graph ready ` +
+              `(${edgeData.nEdges.toLocaleString()} edges)`
+            );
           } catch (err) {
+            if (
+              isDatasetReloadSupersededError(err) ||
+              requestGeneration !== datasetPublicationGeneration
+            ) {
+              notifications.dismiss(knnNotifId);
+              return;
+            }
             console.error('[Main] Failed to load edges for KNN:', err);
-            notifications.fail(knnNotifId, 'Failed to load neighbor graph');
+            notifications.fail(
+              knnNotifId,
+              'Failed to load neighbor graph'
+            );
+          }
+        })();
+        knnLoadPromise = operation;
+        operation.finally(() => {
+          if (knnLoadPromise === operation) {
+            knnLoadPromise = null;
           }
         });
-      }
+      });
+
+      return Object.freeze({
+        prepareDatasetReplacement,
+        synchronizeDatasetPublication
+      });
     }
 
     // ========================================
@@ -1752,7 +2323,12 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         }
 
         const stats = perfTracker.recordFrame();
-        const hpStats = viewer.getRendererStats();
+        const activeViewId = state.getActiveViewId();
+        if (!viewer.hasRendererStats(activeViewId)) {
+          perfLoopHandle = requestAnimationFrame(tick);
+          return;
+        }
+        const hpStats = viewer.getRendererStats(activeViewId);
         if (stats) latestPerfSample = stats;
         if (hpStats) latestRendererStats = hpStats;
 
@@ -1779,7 +2355,11 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     };
 
     const activateBenchmarkingPanel = ({ resetTracker = false } = {}) => {
-      renderBenchmarkStats(null, viewer.getRendererStats(), buildDatasetSnapshot());
+      renderBenchmarkStats(
+        null,
+        null,
+        buildDatasetSnapshot()
+      );
       startPerfMonitoring({ resetTracker });
     };
 
@@ -1907,6 +2487,76 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         return;
       }
       const genTime = Math.round(performance.now() - genStart);
+      let candidateDimensionManager;
+      try {
+        if (
+          !Number.isSafeInteger(pointCount) ||
+          pointCount < 1 ||
+          !(data.positions instanceof Float32Array) ||
+          data.positions.length !== pointCount * 3 ||
+          !(data.colors instanceof Uint8Array) ||
+          data.colors.length !== pointCount * 4
+        ) {
+          throw new TypeError(
+            'Synthetic benchmark data must contain exact dataset-length ' +
+            'Float32 XYZ and Uint8 RGBA arrays.'
+          );
+        }
+        candidateDimensionManager = createInMemoryDimensionManager({
+          positions: data.positions,
+          dimension: data.dimensionLevel
+        });
+      } catch (error) {
+        console.error('Failed to stage benchmark data:', error);
+        notifications.fail(
+          benchNotifId,
+          `Benchmark failed: ${error.message}`
+        );
+        return;
+      }
+
+      const previousDimensionManager = dimensionManager;
+      try {
+        state.initSyntheticScene({
+          positions: data.positions,
+          colors: data.colors,
+          dimensionLevel: data.dimensionLevel,
+          dimensionManager: candidateDimensionManager
+        });
+      } catch (error) {
+        candidateDimensionManager.clearCache();
+        console.error('Failed to publish benchmark data:', error);
+        notifications.fail(
+          benchNotifId,
+          `Benchmark failed: ${error.message}`
+        );
+        return;
+      }
+
+      // The exact DataState generation is now live. Publish the matching app
+      // runtime and retire every previous dataset-count owner synchronously.
+      EXPORT_BASE_URL = '';
+      dimensionManager = candidateDimensionManager;
+      obs = state.obsData;
+      positions = data.positions;
+      connectivityManifest = null;
+      datasetPublicationGeneration++;
+      connectivityRuntimeOwner.prepareDatasetReplacement();
+      connectivityRuntimeOwner.synchronizeDatasetPublication();
+      previousDimensionManager.clearCache();
+      if (window._comparisonModule) {
+        window._comparisonModule.resetForDatasetReload({
+          reason: 'synthetic-benchmark-publication'
+        });
+      }
+
+      // Ensure point rendering mode only after the complete replacement has
+      // succeeded, so a rejected benchmark preserves the previous runtime.
+      if (renderModeSelect && renderModeSelect.value !== 'points') {
+        renderModeSelect.value = 'points';
+        viewer.setRenderMode('points');
+      }
+
       notifications.completeDataGeneration(benchNotifId, genTime);
 
       // Show generation time
@@ -1915,35 +2565,7 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
         benchGenInfoEl.style.display = 'block';
       }
 
-      // Create transparency and outlier arrays
-      const transparency = new Float32Array(pointCount).fill(1.0);
-      const outlierQuantiles = new Float32Array(pointCount).fill(-1.0);
-
-      // Ensure point rendering mode for benchmarks
-      if (renderModeSelect && renderModeSelect.value !== 'points') {
-        renderModeSelect.value = 'points';
-        viewer.setRenderMode('points');
-      }
-
-      // Load into viewer (HP renderer is always used)
-      // Pass dimensionLevel from synthetic data generator for correct spatial index construction
-      // (e.g., flatUMAP returns dimensionLevel: 2 for 2D data)
-      const syntheticDimLevel = data.dimensionLevel ?? 3;
-      viewer.setData({
-        positions: data.positions,
-        colors: data.colors,
-        outlierQuantiles,
-        transparency,
-        dimensionLevel: syntheticDimLevel
-      });
-
-      // Clear centroids
-      viewer.setCentroids({
-        positions: new Float32Array(0),
-        colors: new Uint8Array(0), // RGBA uint8
-        outlierQuantiles: new Float32Array(0),
-        transparency: new Float32Array(0)
-      });
+      const syntheticDimLevel = data.dimensionLevel;
 
       activeDatasetMode = 'synthetic';
       syntheticDatasetInfo = {
@@ -1991,7 +2613,15 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       const reportNotifId = notifications.startReport();
 
       const datasetSnapshot = buildDatasetSnapshot();
-      const rendererStats = viewer.getRendererStats();
+      const activeViewId = state.getActiveViewId();
+      if (!viewer.hasRendererStats(activeViewId)) {
+        notifications.failCalculation(
+          reportNotifId,
+          'Renderer statistics are not ready; wait for the first rendered frame'
+        );
+        return;
+      }
+      const rendererStats = viewer.getRendererStats(activeViewId);
       if (rendererStats) latestRendererStats = rendererStats;
       const report = benchmarkReporter.buildReport({
         dataset: datasetSnapshot,
@@ -2298,21 +2928,6 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
       });
     }
 
-    // Auto-restore the latest session bundle listed in the dataset exports
-    // directory (`state-snapshots.json`) to preserve the legacy "auto-load" workflow.
-    try {
-      const restored = await sessionSerializer.restoreLatestFromDatasetExports?.();
-      if (restored) {
-        ui?.refreshUiAfterStateLoad?.();
-        ui?.showSessionStatus?.('Loaded saved session from data directory');
-      } else {
-        console.info('[Main] No session bundle auto-loaded (state-snapshots.json missing/empty or no .cellucid-session entries).');
-      }
-    } catch (err) {
-      console.warn('[Main] Failed to auto-load session bundle:', err);
-      ui?.showSessionStatus?.(err?.message || 'Failed to auto-load session', true);
-    }
-
     // Define onboarding callback functions now that UI is ready
     toggleSidebarVisibility = () => {
       const sidebarToggleBtn = document.getElementById('sidebar-toggle');
@@ -2348,19 +2963,27 @@ function getDatasetIdentityUrl() { return `${EXPORT_BASE_URL}dataset_identity.js
     };
 
     viewer.start();
-  } catch (err) {
-    console.error(err);
-    if (statsEl) statsEl.textContent = 'Error: ' + err.message;
+  } catch (thrown) {
+    const startupError = normalizeStartupError(thrown);
+    console.error('[Main] Terminal startup failure:', startupError);
+    publishStartupFailure({
+      documentOwner: document,
+      error: startupError,
+      statsElement: statsEl
+    });
     if (currentDatasetLoadToken) {
-      completeDataLoadFailure(currentDatasetLoadToken, {
-        ...buildDatasetAnalyticsContext(),
-        error: err
-      });
-      currentDatasetLoadToken = null;
+      try {
+        completeDataLoadFailure(currentDatasetLoadToken, {
+          ...buildDatasetAnalyticsContext(),
+          error: startupError
+        });
+        currentDatasetLoadToken = null;
+      } catch (analyticsError) {
+        console.error(
+          '[Main] Startup analytics failure reporting also failed:',
+          analyticsError
+        );
+      }
     }
-    // Show error in notification center if initialized
-    try {
-      getNotificationCenter().error(`Initialization error: ${err.message}`, { duration: 10000 });
-    } catch (_) { /* notification center may not be initialized */ }
   }
 })();

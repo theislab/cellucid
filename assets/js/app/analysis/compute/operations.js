@@ -7,7 +7,6 @@
  * This module is designed to be imported by:
  * - compute-manager.js (orchestrator)
  * - data-worker.js (worker implementation)
- * - fallback-operations.js (CPU fallback)
  * - operation-handlers.js (shared implementations)
  */
 
@@ -19,7 +18,7 @@
  * Operation categories for grouping and filtering
  */
 export const OperationCategory = {
-  TRANSFORM: 'transform',        // Element-wise transforms (GPU-capable)
+  TRANSFORM: 'transform',        // Element-wise transforms
   STATISTICS: 'statistics',      // Statistical computations
   EXTRACTION: 'extraction',      // Data extraction operations
   AGGREGATION: 'aggregation',    // Category/value aggregation
@@ -35,7 +34,7 @@ export const OperationCategory = {
  * Supported operation types - use these constants instead of strings.
  */
 export const OperationType = {
-  // Transforms (GPU-accelerated)
+  // Transforms
   LOG1P: 'log1p',
   ZSCORE: 'zscore',
   MINMAX: 'minmax',
@@ -70,14 +69,15 @@ export const OperationType = {
  * - name: Human-readable name
  * - description: Brief description of what the operation does
  * - category: Operation category for grouping
- * - gpuCapable: Whether operation can run on GPU
+ * - gpuCapable: Whether the GPU implementation has exact semantic parity
  * - workerCapable: Whether operation can run in Web Worker
+ * - cpuCapable: Whether operation can run on the main thread
  * - payloadFields: Required and optional payload fields
  * - resultFields: Fields returned in the result
  */
 export const Operations = {
   // =========================================================================
-  // Transform Operations (GPU-capable)
+  // Transform Operations
   // =========================================================================
 
   [OperationType.LOG1P]: {
@@ -85,8 +85,9 @@ export const Operations = {
     name: 'Log1p Transform',
     description: 'Apply log(1 + x) transform, handles values near 0 better than log(1+x)',
     category: OperationCategory.TRANSFORM,
-    gpuCapable: true,
+    gpuCapable: false,
     workerCapable: true,
+    cpuCapable: true,
     payloadFields: {
       required: ['values'],
       optional: []
@@ -99,8 +100,9 @@ export const Operations = {
     name: 'Z-Score Normalization',
     description: 'Normalize values to (x - mean) / std',
     category: OperationCategory.TRANSFORM,
-    gpuCapable: true,
+    gpuCapable: false,
     workerCapable: true,
+    cpuCapable: true,
     payloadFields: {
       required: ['values'],
       optional: ['mean', 'std']  // If not provided, computed from values
@@ -113,8 +115,9 @@ export const Operations = {
     name: 'Min-Max Normalization',
     description: 'Normalize values to (x - min) / (max - min)',
     category: OperationCategory.TRANSFORM,
-    gpuCapable: true,
+    gpuCapable: false,
     workerCapable: true,
+    cpuCapable: true,
     payloadFields: {
       required: ['values'],
       optional: ['min', 'max']  // If not provided, computed from values
@@ -127,8 +130,9 @@ export const Operations = {
     name: 'Scale and Offset',
     description: 'Apply x * scale + offset transform',
     category: OperationCategory.TRANSFORM,
-    gpuCapable: true,
+    gpuCapable: false,
     workerCapable: true,
+    cpuCapable: true,
     payloadFields: {
       required: ['values'],
       optional: ['scale', 'offset']  // Defaults: scale=1, offset=0
@@ -141,8 +145,9 @@ export const Operations = {
     name: 'Clamp Values',
     description: 'Clamp values to [min, max] range',
     category: OperationCategory.TRANSFORM,
-    gpuCapable: true,
+    gpuCapable: false,
     workerCapable: true,
+    cpuCapable: true,
     payloadFields: {
       required: ['values'],
       optional: ['min', 'max']  // Defaults: min=0, max=1
@@ -159,8 +164,9 @@ export const Operations = {
     name: 'Compute Statistics',
     description: 'Compute comprehensive statistics: count, min, max, mean, median, std, q1, q3, iqr',
     category: OperationCategory.STATISTICS,
-    gpuCapable: true,  // Basic stats can use GPU
+    gpuCapable: false,
     workerCapable: true,
+    cpuCapable: true,
     payloadFields: {
       required: ['values'],
       optional: []
@@ -173,8 +179,9 @@ export const Operations = {
     name: 'Compute Histogram',
     description: 'Compute histogram with optimized binning (Sturges, Freedman-Diaconis, or custom)',
     category: OperationCategory.STATISTICS,
-    gpuCapable: true,  // Histogram binning can use GPU
+    gpuCapable: false,
     workerCapable: true,
+    cpuCapable: true,
     payloadFields: {
       required: ['values'],
       optional: ['bins', 'range', 'nbins']  // bins: 'auto', 'sturges', 'fd', or number
@@ -189,6 +196,7 @@ export const Operations = {
     category: OperationCategory.STATISTICS,
     gpuCapable: false,
     workerCapable: true,
+    cpuCapable: true,
     payloadFields: {
       required: ['xValues', 'yValues'],
       optional: ['method']  // 'pearson' (default) or 'spearman'
@@ -203,6 +211,7 @@ export const Operations = {
     category: OperationCategory.STATISTICS,
     gpuCapable: false,
     workerCapable: true,
+    cpuCapable: true,
     payloadFields: {
       required: ['groupAValues', 'groupBValues'],
       optional: ['method']  // 'wilcox' (default) or 'ttest'
@@ -217,6 +226,7 @@ export const Operations = {
     category: OperationCategory.DISTRIBUTION,
     gpuCapable: false,
     workerCapable: true,
+    cpuCapable: true,
     payloadFields: {
       required: ['values'],
       optional: ['points']  // Number of density points (default: 100)
@@ -235,6 +245,7 @@ export const Operations = {
     category: OperationCategory.EXTRACTION,
     gpuCapable: false,
     workerCapable: true,
+    cpuCapable: true,
     payloadFields: {
       required: ['cellIndices', 'rawValues'],
       optional: ['categories', 'isCategorical']
@@ -249,6 +260,7 @@ export const Operations = {
     category: OperationCategory.EXTRACTION,
     gpuCapable: false,
     workerCapable: true,
+    cpuCapable: true,
     payloadFields: {
       required: ['cellIndices', 'variables'],
       optional: []
@@ -267,6 +279,7 @@ export const Operations = {
     category: OperationCategory.AGGREGATION,
     gpuCapable: false,
     workerCapable: true,
+    cpuCapable: true,
     payloadFields: {
       required: ['values'],
       optional: ['normalize']  // Whether to compute percentages
@@ -281,6 +294,7 @@ export const Operations = {
     category: OperationCategory.AGGREGATION,
     gpuCapable: false,
     workerCapable: true,
+    cpuCapable: true,
     payloadFields: {
       required: ['values'],
       optional: ['method', 'binCount', 'customBreaks']  // method: 'equal_width', 'quantile', 'custom'
@@ -299,6 +313,7 @@ export const Operations = {
     category: OperationCategory.FILTERING,
     gpuCapable: false,
     workerCapable: true,
+    cpuCapable: true,
     payloadFields: {
       required: ['cellIndices', 'conditions', 'fieldsData'],
       optional: []
@@ -317,6 +332,7 @@ export const Operations = {
     category: OperationCategory.DISTRIBUTION,
     gpuCapable: false,
     workerCapable: true,
+    cpuCapable: true,
     payloadFields: {
       required: ['groups'],
       optional: ['normalize']  // Whether to normalize histograms
@@ -345,11 +361,24 @@ export const GPU_CAPABLE_OPERATIONS = new Set(
 
 /**
  * Set of operations that can run in Web Workers.
- * All operations support workers (including fallback).
+ * All current operations have the same shared implementation in a worker.
  */
 export const WORKER_CAPABLE_OPERATIONS = new Set(
   Object.values(Operations)
     .filter(op => op.workerCapable)
+    .map(op => op.id)
+);
+
+// ============================================================================
+// CPU-Capable Operations Set
+// ============================================================================
+
+/**
+ * Set of operations with an exact main-thread implementation.
+ */
+export const CPU_CAPABLE_OPERATIONS = new Set(
+  Object.values(Operations)
+    .filter(op => op.cpuCapable)
     .map(op => op.id)
 );
 
@@ -391,6 +420,15 @@ export function isGPUCapable(operationId) {
  */
 export function isWorkerCapable(operationId) {
   return WORKER_CAPABLE_OPERATIONS.has(operationId);
+}
+
+/**
+ * Check if operation can run on the main thread.
+ * @param {string} operationId - Operation ID
+ * @returns {boolean} True if operation has an exact CPU implementation
+ */
+export function isCPUCapable(operationId) {
+  return CPU_CAPABLE_OPERATIONS.has(operationId);
 }
 
 /**
@@ -464,10 +502,12 @@ export default {
   Operations,
   GPU_CAPABLE_OPERATIONS,
   WORKER_CAPABLE_OPERATIONS,
+  CPU_CAPABLE_OPERATIONS,
   getOperation,
   isValidOperation,
   isGPUCapable,
   isWorkerCapable,
+  isCPUCapable,
   getOperationsByCategory,
   validatePayload,
   getAllOperationIds,

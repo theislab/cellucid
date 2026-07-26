@@ -125,12 +125,11 @@ const pieplotDefinition = {
 
   async update(figure, pageData, options, layoutEngine) {
     // Pie charts need full re-render when domain layouts change
-    try {
-      const Plotly = await createMinimalPlotly();
-      Plotly.purge?.(figure);
-    } catch (_purgeErr) {
-      // Ignore purge failures
+    const Plotly = await createMinimalPlotly();
+    if (!Plotly || typeof Plotly.purge !== 'function') {
+      throw new TypeError('Pie plot updates require Plotly.purge()');
     }
+    Plotly.purge(figure);
     return this.render(pageData, options, figure, layoutEngine);
   },
 

@@ -320,12 +320,6 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
 
     if (pages.length === 0) return;
 
-    // Auto-select all pages by default if none selected
-    if (this._selectedPages.length === 0 && pages.length > 0) {
-      this._selectedPages = pages.map(p => p.id);
-      this._currentConfig.pages = this._selectedPages;
-    }
-
     // Create container for the component
     this._pageSelectContainer = document.createElement('div');
     wrapper.appendChild(this._pageSelectContainer);
@@ -342,11 +336,15 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
       showColorPicker: true,
       showCellCounts: true,
       showSelectAll: true,
-      initialSelection: this._selectedPages,
+      initialSelection: this._selectedPages.length > 0
+        ? this._selectedPages
+        : undefined,
       includeDerivedPages: true,
       getCellCountForPageId: (pageId) => this.dataLayer.getCellCountForPageId(pageId),
       label: 'Compare pages:'
     });
+    this._selectedPages = this._pageSelector.getSelectedPages();
+    this._currentConfig.pages = [...this._selectedPages];
   }
 
   /**
@@ -388,6 +386,15 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
     if (!formValues.genes || formValues.genes.length === 0) {
       return { valid: false, error: 'Please enter at least one gene' };
     }
+    if (!['mean', 'sum', 'median'].includes(formValues.method)) {
+      return { valid: false, error: 'Select mean, sum, or median signature scoring' };
+    }
+    if (!['none', 'zscore', 'minmax'].includes(formValues.normalize)) {
+      return { valid: false, error: 'Select a supported signature normalization' };
+    }
+    if (!['violinplot', 'boxplot', 'histogram'].includes(formValues.plotType)) {
+      return { valid: false, error: 'Select a supported signature visualization' };
+    }
     return { valid: true };
   }
 
@@ -401,7 +408,7 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
     const signatureResults = await this.multiVariableAnalysis.computeSignatureScore({
       genes: formValues.genes,
       pageIds: this._selectedPages,
-      method: formValues.method || 'mean'
+      method: formValues.method
     });
 
     // Apply normalization if requested
@@ -693,7 +700,20 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
 
   exportSettings() {
     const base = super.exportSettings();
-    const customColors = this._pageSelector?.getCustomColors() || new Map();
+    if (!this._pageSelector) {
+      throw new Error(
+        'Gene signature settings require an initialized page selector'
+      );
+    }
+    if (
+      base.formControls.genes?.type !== 'value' ||
+      base.formControls.genes.value !== this._savedGeneList
+    ) {
+      throw new TypeError(
+        'Gene signature savedGeneList must exactly match the genes form control'
+      );
+    }
+    const customColors = this._pageSelector.getCustomColors();
     return {
       ...base,
       savedGeneList: this._savedGeneList,
@@ -702,21 +722,60 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
   }
 
   importSettings(settings) {
-    super.importSettings(settings);
-    if (!settings) return;
-
-    // Restore gene list
-    if (settings.savedGeneList) {
-      this._savedGeneList = settings.savedGeneList;
+    const base = this._requireExactFormSettings(
+      settings,
+      [
+        'customPageColors',
+        'formControls',
+        'savedGeneList',
+        'selectedPages'
+      ]
+    );
+    if (typeof settings.savedGeneList !== 'string') {
+      throw new TypeError(
+        'Gene signature savedGeneList must be a string'
+      );
     }
-
-    // Restore custom page colors
-    if (Array.isArray(settings.customPageColors) && this._pageSelector) {
-      settings.customPageColors.forEach(([pageId, color]) => {
-        this._pageSelector.customColors.set(pageId, color);
-      });
-      this._pageSelector.render();
+    if (
+      base.formControls.genes?.type !== 'value' ||
+      base.formControls.genes.value !== settings.savedGeneList
+    ) {
+      throw new TypeError(
+        'Gene signature savedGeneList must exactly match the genes form control'
+      );
     }
+    const method = base.formControls.method;
+    if (
+      method?.type !== 'value' ||
+      !new Set(['mean', 'median', 'sum']).has(method.value)
+    ) {
+      throw new TypeError('Gene signature method control is unsupported');
+    }
+    const normalization = base.formControls.normalize;
+    if (
+      normalization?.type !== 'value' ||
+      !new Set(['minmax', 'none', 'zscore']).has(normalization.value)
+    ) {
+      throw new TypeError(
+        'Gene signature normalization control is unsupported'
+      );
+    }
+    const plotType = base.formControls.plotType;
+    if (
+      plotType?.type !== 'value' ||
+      !new Set(['boxplot', 'histogram', 'violinplot']).has(plotType.value)
+    ) {
+      throw new TypeError(
+        'Gene signature plot type control is unsupported'
+      );
+    }
+    const customPageColors = this._requireCustomPageColors(
+      settings.customPageColors
+    );
+
+    this._savedGeneList = settings.savedGeneList;
+    this._applyFormSettings(base);
+    this._applyCustomPageColors(customPageColors);
   }
 
   // ===========================================================================
@@ -739,7 +798,9 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
  * @returns {GeneSignatureUI}
  */
 export function createGeneSignatureUI(options) {
-  return new GeneSignatureUI(options);
+  const ui = new GeneSignatureUI(options);
+  ui.init(options.container);
+  return ui;
 }
 
 export default GeneSignatureUI;

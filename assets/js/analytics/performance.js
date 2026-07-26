@@ -30,18 +30,14 @@ export function initPerformanceAnalytics({ sampleRate = 1, longTaskSampleRate = 
   const navType = getNavigationType();
 
   // First Contentful Paint & TTFB (static entries, no observers needed)
-  try {
-    const paintEntries = performance.getEntriesByType?.('paint') || [];
-    const fcp = paintEntries.find((e) => e.name === 'first-contentful-paint');
-    if (fcp) {
-      trackPerformanceMetric('FCP', fcp.startTime, { ...getCtx(), navigationType: navType });
-    }
-    const navEntry = performance.getEntriesByType?.('navigation')?.[0];
-    if (navEntry?.responseStart != null) {
-      trackPerformanceMetric('TTFB', navEntry.responseStart, { ...getCtx(), navigationType: navType });
-    }
-  } catch (_) {
-    /* ignore */
+  const paintEntries = performance.getEntriesByType?.('paint') || [];
+  const fcp = paintEntries.find((e) => e.name === 'first-contentful-paint');
+  if (fcp) {
+    trackPerformanceMetric('FCP', fcp.startTime, { ...getCtx(), navigationType: navType });
+  }
+  const navEntry = performance.getEntriesByType?.('navigation')?.[0];
+  if (navEntry?.responseStart != null) {
+    trackPerformanceMetric('TTFB', navEntry.responseStart, { ...getCtx(), navigationType: navType });
   }
 
   // CLS

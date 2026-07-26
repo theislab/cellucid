@@ -302,15 +302,15 @@
 }
 
 .legend-highlight-btn--active {
-  background: var(--color-accent-primary, #3b82f6);
-  color: var(--color-text-on-accent, #fff);
-  border-color: var(--color-accent-primary, #3b82f6);
+  background: var(--color-accent);
+  color: var(--color-text-inverse);
+  border-color: var(--color-accent);
   opacity: 1;
 }
 
 .legend-highlight-btn--active:hover {
-  background: var(--color-accent-hover, #2563eb);
-  border-color: var(--color-accent-hover, #2563eb);
+  background: var(--color-accent-strong);
+  border-color: var(--color-accent-strong);
 }
 
 .legend-count {

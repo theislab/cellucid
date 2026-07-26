@@ -54,6 +54,30 @@ export const PAGE_MODE = {
   MANUAL: 'manual'     // User-selected pages
 };
 
+function isPlainObject(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function requireExactKeys(value, expectedKeys, label) {
+  if (!isPlainObject(value)) {
+    throw new TypeError(`${label} must be an object`);
+  }
+  const actualKeys = Object.keys(value).sort();
+  const sortedExpected = [...expectedKeys].sort();
+  if (
+    actualKeys.length !== sortedExpected.length ||
+    actualKeys.some((key, index) => key !== sortedExpected[index])
+  ) {
+    throw new TypeError(
+      `${label} must contain exactly: ${sortedExpected.join(', ')}`
+    );
+  }
+}
+
 /**
  * PageSelectorComponent Class
  *
@@ -110,9 +134,20 @@ export class PageSelectorComponent {
     this.allowMultiSelect = options.allowMultiSelect ?? true;
 
     // State
-    this._selectedPages = new Set(options.initialSelection || []);
     this._basePages = []; // Store base pages for Select All logic
     this._isDynamicMode = this.supportsDynamicMode && (options.initialDynamicMode ?? true);
+    const pages = this._getPages();
+    if (options.initialSelection === undefined) {
+      this._selectedPages = new Set(
+        this._isDynamicMode ? [] : this._getDefaultSelection(pages)
+      );
+    } else {
+      this._selectedPages = this._requireSelection(
+        options.initialSelection,
+        pages,
+        'Initial selected pages'
+      );
+    }
 
     // DOM references
     this._tabsContainer = null;
@@ -281,8 +316,11 @@ export class PageSelectorComponent {
    * Create a single page tab element
    */
   _createPageTab(page, index) {
-    const isSelected = !this._isDynamicMode && this._selectedPages.has(page.id);
     const cellCount = this._getCellCount(page.id);
+    const isSelectable = cellCount > 0;
+    const isSelected = isSelectable &&
+      !this._isDynamicMode &&
+      this._selectedPages.has(page.id);
     const derived = page?._derived || null;
     const baseId = derived?.baseId || page.id;
 
@@ -305,15 +343,21 @@ export class PageSelectorComponent {
     const tab = document.createElement('div');
     tab.className = 'analysis-page-tab' +
       (derived ? ' derived' : '') +
+      (!isSelectable ? ' disabled' : '') +
       (isSelected ? ' selected' : '');
     tab.dataset.pageId = page.id;
+    tab.setAttribute('aria-disabled', isSelectable ? 'false' : 'true');
+    if (!isSelectable) {
+      tab.tabIndex = -1;
+      tab.title = `${page.name} has zero cells and cannot be selected`;
+    }
 
     // Color swatch
     const colorIndicator = document.createElement('span');
     colorIndicator.className = 'analysis-page-color';
     StyleManager.setVariable(colorIndicator, '--analysis-page-color', currentColor);
 
-    if (this.showColorPicker) {
+    if (this.showColorPicker && isSelectable) {
       colorIndicator.title = 'Click to change color';
 
       // Color picker input
@@ -355,10 +399,12 @@ export class PageSelectorComponent {
       tab.appendChild(countSpan);
     }
 
-    // Click to toggle selection
-    tab.addEventListener('click', () => {
-      this._handlePageClick(page.id, page);
-    });
+    if (isSelectable) {
+      // Click to toggle selection
+      tab.addEventListener('click', () => {
+        this._handlePageClick(page.id, page);
+      });
+    }
 
     return tab;
   }
@@ -369,6 +415,9 @@ export class PageSelectorComponent {
    * @param {Object} page
    */
   _handlePageClick(pageId, page) {
+    const pages = this._getPages();
+    this._requireSelectablePage(pageId, pages);
+
     if (this.supportsDynamicMode) {
       // Switch to manual mode and select this page
       if (this._isDynamicMode) {
@@ -392,7 +441,6 @@ export class PageSelectorComponent {
       }
 
       // Re-render and notify
-      const pages = this._getPages();
       this._renderTabs(pages);
       this._updateModeIndicator();
       this._updateHelpText();
@@ -410,6 +458,7 @@ export class PageSelectorComponent {
    * @param {Object} page
    */
   _togglePageSelectionInternal(pageId, page) {
+    this._requireSelectablePage(pageId, this._getPages());
     if (this._selectedPages.has(pageId)) {
       this._selectedPages.delete(pageId);
     } else {
@@ -500,19 +549,23 @@ export class PageSelectorComponent {
     const actionsRow = document.createElement('div');
     actionsRow.className = 'analysis-page-actions';
 
-    // Only consider base pages for "all selected" check
-    const basePageIds = this._basePages.map(p => p.id);
-    const allBaseSelected = basePageIds.every(id => this._selectedPages.has(id));
+    const selectionCandidates = this._getSelectionCandidates(pages);
+    if (selectionCandidates.length === 0) {
+      return;
+    }
+    const allCandidatesSelected = selectionCandidates.every(
+      id => this._selectedPages.has(id)
+    );
 
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'btn-small';
-    btn.textContent = allBaseSelected ? 'Deselect All' : 'Select All';
+    btn.textContent = allCandidatesSelected ? 'Deselect All' : 'Select All';
 
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
 
-      if (allBaseSelected) {
+      if (allCandidatesSelected) {
         // Deselect all (including any derived)
         this._selectedPages.clear();
         // If dynamic mode is supported and nothing selected, revert to dynamic
@@ -521,8 +574,7 @@ export class PageSelectorComponent {
           return;
         }
       } else {
-        // Select only base pages
-        basePageIds.forEach(id => this._selectedPages.add(id));
+        selectionCandidates.forEach(id => this._selectedPages.add(id));
       }
 
       this._renderTabs(pages);
@@ -537,6 +589,7 @@ export class PageSelectorComponent {
    * Toggle page selection (standard behavior without dynamic mode)
    */
   _togglePageSelection(pageId, page) {
+    this._requireSelectablePage(pageId, this._getPages());
     if (this._selectedPages.has(pageId)) {
       this._selectedPages.delete(pageId);
     } else {
@@ -586,33 +639,135 @@ export class PageSelectorComponent {
    * Get pages from data layer (optionally with derived pages)
    */
   _getPages() {
-    try {
-      const basePages = this.dataLayer.getPages() || [];
-      this._basePages = basePages; // Store for Select All logic
-
-      if (this.includeDerivedPages) {
-        return expandPagesWithDerived(basePages, { includeRestOf: true });
-      }
-      return basePages;
-    } catch (err) {
-      console.error('[PageSelectorComponent] Failed to get pages:', err);
-      return [];
+    const basePages = this.dataLayer.getPages();
+    if (!Array.isArray(basePages)) {
+      throw new TypeError('Page selector data layer must return an array of pages');
     }
+    const seenPageIds = new Set();
+    for (const page of basePages) {
+      if (
+        !isPlainObject(page) ||
+        typeof page.id !== 'string' ||
+        page.id.length === 0 ||
+        typeof page.name !== 'string' ||
+        page.name.length === 0
+      ) {
+        throw new TypeError(
+          'Page selector pages require non-empty string id and name fields'
+        );
+      }
+      if (seenPageIds.has(page.id)) {
+        throw new TypeError(`Page selector page ID "${page.id}" is duplicated`);
+      }
+      seenPageIds.add(page.id);
+    }
+    this._basePages = basePages;
+
+    if (this.includeDerivedPages) {
+      return expandPagesWithDerived(basePages, { includeRestOf: true });
+    }
+    return basePages;
   }
 
   /**
    * Get cell count for a page
    */
   _getCellCount(pageId) {
-    try {
-      // Use custom callback if provided
-      if (typeof this.getCellCountForPageId === 'function') {
-        return this.getCellCountForPageId(pageId) || 0;
+    let cellCount;
+    if (typeof this.getCellCountForPageId === 'function') {
+      cellCount = this.getCellCountForPageId(pageId);
+    } else {
+      const cellIndices = this.dataLayer.getCellIndicesForPage(pageId);
+      if (
+        cellIndices === null ||
+        typeof cellIndices !== 'object' ||
+        !Number.isSafeInteger(cellIndices.length) ||
+        cellIndices.length < 0
+      ) {
+        throw new TypeError(
+          `Page selector cell indices for "${pageId}" must be an array or typed array`
+        );
       }
-      return this.dataLayer.getCellIndicesForPage(pageId)?.length || 0;
-    } catch (err) {
-      return 0;
+      cellCount = cellIndices.length;
     }
+    if (!Number.isSafeInteger(cellCount) || cellCount < 0) {
+      throw new TypeError(
+        `Page selector cell count for "${pageId}" must be a non-negative safe integer`
+      );
+    }
+    return cellCount;
+  }
+
+  /**
+   * Require a page to exist and contain cells before it can be selected.
+   * @param {string} pageId
+   * @param {Array<{id: string}>} pages
+   */
+  _requireSelectablePage(pageId, pages) {
+    const page = pages.find(candidate => candidate.id === pageId);
+    if (!page) {
+      throw new Error(`Page selector page "${pageId}" was not found`);
+    }
+    if (this._getCellCount(pageId) === 0) {
+      throw new RangeError(
+        `Page selector page "${pageId}" has zero cells and cannot be selected`
+      );
+    }
+  }
+
+  /**
+   * Validate one exact page selection.
+   * @param {unknown} pageIds
+   * @param {Array<{id: string}>} pages
+   * @param {string} label
+   * @returns {Set<string>}
+   */
+  _requireSelection(pageIds, pages, label) {
+    if (!Array.isArray(pageIds)) {
+      throw new TypeError(`${label} must be an array`);
+    }
+    const selection = new Set();
+    for (const pageId of pageIds) {
+      if (typeof pageId !== 'string' || pageId.length === 0) {
+        throw new TypeError(`${label} IDs must be non-empty strings`);
+      }
+      this._requireSelectablePage(pageId, pages);
+      if (selection.has(pageId)) {
+        throw new TypeError(
+          `Page selector page "${pageId}" is selected more than once`
+        );
+      }
+      selection.add(pageId);
+    }
+    return selection;
+  }
+
+  /**
+   * Return the selectable base-page IDs, or one derived page when no base page
+   * contains cells.
+   * @param {Array<{id: string, _derived?: Object}>} pages
+   * @returns {string[]}
+   */
+  _getSelectionCandidates(pages) {
+    const basePageIds = this._basePages
+      .filter(page => this._getCellCount(page.id) > 0)
+      .map(page => page.id);
+    if (basePageIds.length > 0) {
+      return basePageIds;
+    }
+    const firstDerivedPage = pages.find(
+      page => page._derived && this._getCellCount(page.id) > 0
+    );
+    return firstDerivedPage ? [firstDerivedPage.id] : [];
+  }
+
+  /**
+   * Get the deterministic fresh manual selection.
+   * @param {Array<{id: string, _derived?: Object}>} pages
+   * @returns {string[]}
+   */
+  _getDefaultSelection(pages) {
+    return this._getSelectionCandidates(pages);
   }
 
   /**
@@ -620,16 +775,23 @@ export class PageSelectorComponent {
    * @returns {string|null}
    */
   _getActivePageId() {
-    try {
-      if (typeof this.dataLayer?.getActiveHighlightPageId === 'function') {
-        return this.dataLayer.getActiveHighlightPageId();
-      }
-      // Fallback to first page
-      const pages = this._basePages.length > 0 ? this._basePages : this._getPages();
-      return pages.length > 0 ? pages[0].id : null;
-    } catch (err) {
+    if (typeof this.dataLayer.getActiveHighlightPageId !== 'function') {
+      throw new TypeError(
+        'Dynamic page selection requires dataLayer.getActiveHighlightPageId()'
+      );
+    }
+    const activePageId = this.dataLayer.getActiveHighlightPageId();
+    if (activePageId === null) {
       return null;
     }
+    if (typeof activePageId !== 'string' || activePageId.length === 0) {
+      throw new TypeError('The active highlight page ID must be null or a non-empty string');
+    }
+    const pages = this._basePages.length > 0 ? this._basePages : this._getPages();
+    if (!pages.some(page => page.id === activePageId)) {
+      throw new Error(`Active highlight page not found: ${activePageId}`);
+    }
+    return activePageId;
   }
 
   /**
@@ -647,13 +809,12 @@ export class PageSelectorComponent {
    * @returns {string}
    */
   _getPageName(pageId) {
-    try {
-      const pages = this._basePages.length > 0 ? this._basePages : this._getPages();
-      const page = pages.find(p => p.id === pageId);
-      return page?.name || pageId;
-    } catch (err) {
-      return pageId;
+    const pages = this._getPages();
+    const page = pages.find(candidate => candidate.id === pageId);
+    if (!page) {
+      throw new Error(`Page selector page not found: ${pageId}`);
     }
+    return page.name;
   }
 
   // ===========================================================================
@@ -678,7 +839,11 @@ export class PageSelectorComponent {
   getEffectivePageIds() {
     if (this._isDynamicMode) {
       const activePageId = this._getActivePageId();
-      return activePageId ? [activePageId] : [];
+      if (activePageId === null) {
+        return [];
+      }
+      this._requireSelectablePage(activePageId, this._getPages());
+      return [activePageId];
     }
     return Array.from(this._selectedPages);
   }
@@ -688,10 +853,16 @@ export class PageSelectorComponent {
    * @param {string[]} pageIds
    */
   setSelectedPages(pageIds) {
+    const pages = this._getPages();
+    const nextSelection = this._requireSelection(
+      pageIds,
+      pages,
+      'Selected pages'
+    );
     if (this.supportsDynamicMode && pageIds.length > 0) {
       this._isDynamicMode = false;
     }
-    this._selectedPages = new Set(pageIds);
+    this._selectedPages = nextSelection;
     this.render();
   }
 
@@ -716,21 +887,17 @@ export class PageSelectorComponent {
    * @param {'dynamic'|'manual'} mode
    */
   setMode(mode) {
-    if (!this.supportsDynamicMode) return;
+    if (mode !== PAGE_MODE.DYNAMIC && mode !== PAGE_MODE.MANUAL) {
+      throw new TypeError('Page selector mode must be dynamic or manual');
+    }
+    if (!this.supportsDynamicMode && mode === PAGE_MODE.DYNAMIC) {
+      throw new TypeError('This page selector does not support dynamic mode');
+    }
 
     const shouldBeDynamic = mode === PAGE_MODE.DYNAMIC;
     if (this._isDynamicMode !== shouldBeDynamic) {
       this._setDynamicModeInternal(shouldBeDynamic);
     }
-  }
-
-  /**
-   * Set dynamic mode directly
-   * @param {boolean} isDynamic
-   */
-  setDynamicMode(isDynamic) {
-    if (!this.supportsDynamicMode) return;
-    this._setDynamicModeInternal(isDynamic);
   }
 
   /**
@@ -741,8 +908,8 @@ export class PageSelectorComponent {
     if (this.supportsDynamicMode) {
       this._isDynamicMode = false;
     }
-    this._getPages(); // Ensure _basePages is populated
-    this._selectedPages = new Set(this._basePages.map(p => p.id));
+    const pages = this._getPages();
+    this._selectedPages = new Set(this._getSelectionCandidates(pages));
     this.render();
     this._notifySelectionChange();
     if (this.supportsDynamicMode) {
@@ -768,30 +935,7 @@ export class PageSelectorComponent {
    * Update cell counts display (call after highlights change)
    */
   updateCounts() {
-    if (!this.container || !this._tabsContainer) return;
-
-    // Update dynamic tab cell count if in dynamic mode
-    if (this.supportsDynamicMode && this._isDynamicMode && this._dynamicTabEl) {
-      const countSpan = this._dynamicTabEl.querySelector('.analysis-page-count');
-      const activePageId = this._getActivePageId();
-      if (countSpan && activePageId) {
-        const cellCount = this._getCellCount(activePageId);
-        countSpan.textContent = cellCount > 0 ? formatCount(cellCount) : '(0)';
-      }
-    }
-
-    // Update regular page tabs
-    const pageTabs = this._tabsContainer.querySelectorAll('.analysis-page-tab:not(.insights-dynamic-tab)');
-    pageTabs.forEach(tab => {
-      const pageId = tab.dataset.pageId;
-      if (pageId && pageId !== PAGE_MODE.DYNAMIC) {
-        const countSpan = tab.querySelector('.analysis-page-count');
-        if (countSpan) {
-          const cellCount = this._getCellCount(pageId);
-          countSpan.textContent = cellCount > 0 ? formatCount(cellCount) : '(0)';
-        }
-      }
-    });
+    this.refresh();
   }
 
   /**
@@ -803,20 +947,29 @@ export class PageSelectorComponent {
 
     const pages = this._getPages();
     const allPageIds = new Set(pages.map(p => p.id));
+    let selectionChanged = false;
 
-    // Remove pages that no longer exist from selection
+    // Remove pages that no longer exist or no longer contain cells.
     for (const pageId of this._selectedPages) {
-      if (!allPageIds.has(pageId)) {
+      if (!allPageIds.has(pageId) || this._getCellCount(pageId) === 0) {
         this._selectedPages.delete(pageId);
+        selectionChanged = true;
       }
     }
 
     // If in manual mode and all selected pages were removed, switch to dynamic
     if (this.supportsDynamicMode && !this._isDynamicMode && this._selectedPages.size === 0) {
       this._isDynamicMode = true;
+      selectionChanged = true;
     }
 
     this.render();
+    if (selectionChanged) {
+      this._notifySelectionChange();
+      if (this.supportsDynamicMode) {
+        this._notifyModeChange();
+      }
+    }
   }
 
   /**
@@ -855,23 +1008,73 @@ export class PageSelectorComponent {
    * @param {Object} state
    */
   importState(state) {
-    if (!state) return;
-
-    // Restore mode
-    if (this.supportsDynamicMode) {
-      this._isDynamicMode = state.mode === PAGE_MODE.DYNAMIC;
+    requireExactKeys(
+      state,
+      ['customColors', 'mode', 'selectedPages'],
+      'Page selector state'
+    );
+    if (state.mode !== PAGE_MODE.DYNAMIC && state.mode !== PAGE_MODE.MANUAL) {
+      throw new TypeError('Page selector mode must be dynamic or manual');
+    }
+    if (!this.supportsDynamicMode && state.mode !== PAGE_MODE.MANUAL) {
+      throw new TypeError('This page selector does not support dynamic mode');
+    }
+    if (!Array.isArray(state.selectedPages)) {
+      throw new TypeError('Page selector selectedPages must be an array');
+    }
+    if (!Array.isArray(state.customColors)) {
+      throw new TypeError('Page selector customColors must be an array');
     }
 
-    // Restore selection
-    if (Array.isArray(state.selectedPages)) {
-      this._selectedPages = new Set(state.selectedPages);
+    const pages = this._getPages();
+    const availablePageIds = new Set(pages.map(page => page.id));
+    const selectedPages = this._requireSelection(
+      state.selectedPages,
+      pages,
+      'Page selector selectedPages'
+    );
+    if (state.mode === PAGE_MODE.DYNAMIC && selectedPages.size !== 0) {
+      throw new TypeError(
+        'Dynamic page selector state must not contain manually selected pages'
+      );
+    }
+    if (
+      this.supportsDynamicMode &&
+      state.mode === PAGE_MODE.MANUAL &&
+      selectedPages.size === 0
+    ) {
+      throw new TypeError('Manual page selector state requires at least one page');
     }
 
-    // Restore custom colors
-    if (Array.isArray(state.customColors)) {
-      this.customColors = new Map(state.customColors);
+    const customColors = new Map();
+    for (const entry of state.customColors) {
+      if (
+        !Array.isArray(entry) ||
+        entry.length !== 2 ||
+        typeof entry[0] !== 'string' ||
+        entry[0].length === 0 ||
+        typeof entry[1] !== 'string' ||
+        !/^#[0-9a-fA-F]{6}$/.test(entry[1])
+      ) {
+        throw new TypeError(
+          'Page selector customColors must contain [pageId, #rrggbb] pairs'
+        );
+      }
+      const [pageId, color] = entry;
+      if (!availablePageIds.has(pageId)) {
+        throw new Error(`Page selector color page "${pageId}" was not found`);
+      }
+      if (customColors.has(pageId)) {
+        throw new TypeError(
+          `Page selector page "${pageId}" has more than one custom color`
+        );
+      }
+      customColors.set(pageId, color);
     }
 
+    this._isDynamicMode = state.mode === PAGE_MODE.DYNAMIC;
+    this._selectedPages = selectedPages;
+    this.customColors = customColors;
     this.render();
   }
 

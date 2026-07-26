@@ -9,26 +9,259 @@
  */
 
 import { StateValidator } from '../../../utils/state-validator.js';
-import { ChangeType, FieldKind, FieldSource } from '../../../utils/field-constants.js';
+import {
+  ChangeType,
+  FieldKind,
+  FieldSource,
+  Limits
+} from '../../../utils/field-constants.js';
 import { getFieldRegistry } from '../../../utils/field-registry.js';
 import { makeUniqueLabel } from '../../../utils/label-utils.js';
+import { getCategoryColor } from '../../../../data/palettes.js';
+
+function requireSource(source) {
+  if (source !== FieldSource.OBS && source !== FieldSource.VAR) {
+    throw new TypeError('Field source must be exactly obs or var');
+  }
+  return source;
+}
+
+function requireRecord(value, label) {
+  if (
+    value === null
+    || typeof value !== 'object'
+    || Array.isArray(value)
+  ) {
+    throw new TypeError(`${label} must be an object`);
+  }
+  return value;
+}
+
+function requireMethod(owner, methodName, label) {
+  if (
+    owner === null
+    || typeof owner !== 'object'
+    || typeof owner[methodName] !== 'function'
+  ) {
+    throw new TypeError(`${label} must implement ${methodName}()`);
+  }
+}
+
+function requireBoolean(value, label) {
+  if (typeof value !== 'boolean') {
+    throw new TypeError(`${label} must be exactly boolean`);
+  }
+  return value;
+}
+
+function requireIdentifier(value, label) {
+  if (
+    typeof value !== 'string'
+    || value.length === 0
+    || value !== value.trim()
+  ) {
+    throw new TypeError(`${label} must be a non-empty trimmed string`);
+  }
+  return value;
+}
+
+function requireField(field, label) {
+  requireRecord(field, label);
+  StateValidator.validateFieldKey(field.key);
+  if (
+    field.kind !== FieldKind.CATEGORY
+    && field.kind !== FieldKind.CONTINUOUS
+  ) {
+    throw new TypeError(`${label} has an unsupported kind`);
+  }
+  return field;
+}
+
+function requireInventory(owner, source, { allowAbsent = false } = {}) {
+  requireSource(source);
+  const data = source === FieldSource.VAR
+    ? owner.varData
+    : owner.obsData;
+  if (allowAbsent && data === null) return [];
+  requireRecord(data, `${source} field data`);
+  if (!Array.isArray(data.fields)) {
+    throw new TypeError(`${source} field inventory must be an array`);
+  }
+  data.fields.forEach((field, index) => {
+    requireField(field, `${source} field inventory[${index}]`);
+  });
+  return data.fields;
+}
+
+function requireFieldAt(owner, source, fieldIndex) {
+  const fields = requireInventory(owner, source);
+  StateValidator.validateFieldIndex(fieldIndex, fields);
+  return { fields, field: fields[fieldIndex], fieldIndex };
+}
+
+function requireCategoryField(field, label) {
+  requireField(field, label);
+  if (field.kind !== FieldKind.CATEGORY) {
+    throw new TypeError(`${label} must be categorical`);
+  }
+  if (!Array.isArray(field.categories) || field.categories.length === 0) {
+    throw new TypeError(`${label} categories must be a non-empty array`);
+  }
+  const seen = new Set();
+  for (const category of field.categories) {
+    StateValidator.validateCategoryLabel(category);
+    if (seen.has(category)) {
+      throw new TypeError(`${label} contains duplicate category labels`);
+    }
+    seen.add(category);
+  }
+  return field;
+}
+
+function requireCategoryPayload(categories, codes, pointCount, label) {
+  if (
+    !Array.isArray(categories)
+    || categories.length === 0
+    || categories.length > Limits.MAX_CATEGORIES_PER_FIELD
+  ) {
+    throw new TypeError(
+      `${label} categories must contain from 1 through ${Limits.MAX_CATEGORIES_PER_FIELD} values`
+    );
+  }
+  const seen = new Set();
+  for (const category of categories) {
+    StateValidator.validateCategoryLabel(category);
+    if (seen.has(category)) {
+      throw new TypeError(`${label} category labels must be unique`);
+    }
+    seen.add(category);
+  }
+  if (
+    (!(codes instanceof Uint8Array) && !(codes instanceof Uint16Array))
+    || codes.length !== pointCount
+  ) {
+    throw new TypeError(
+      `${label} codes must be an exact dataset-length typed array`
+    );
+  }
+  const missing = codes instanceof Uint8Array ? 255 : 65_535;
+  for (let index = 0; index < codes.length; index++) {
+    if (codes[index] >= categories.length && codes[index] !== missing) {
+      throw new RangeError(
+        `${label} code ${index} is outside the category inventory`
+      );
+    }
+  }
+}
+
+function requireOriginalKey(field) {
+  if (Object.hasOwn(field, '_originalKey')) {
+    StateValidator.validateFieldKey(field._originalKey);
+    return field._originalKey;
+  }
+  StateValidator.validateFieldKey(field.key);
+  return field.key;
+}
+
+function requireUserDefinedOwner(owner) {
+  for (const methodName of [
+    'computeCentroidsByDim',
+    'createContinuousAlias',
+    'createFromCategoricalCodes',
+    'getField',
+    'updateField'
+  ]) {
+    requireMethod(
+      owner._userDefinedFields,
+      methodName,
+      'User-defined field registry'
+    );
+  }
+  return owner._userDefinedFields;
+}
+
+function requireExactOptions(options, allowedKeys, label) {
+  requireRecord(options, label);
+  for (const key of Object.keys(options)) {
+    if (!allowedKeys.has(key)) {
+      throw new TypeError(`${label} contains unknown key "${key}"`);
+    }
+  }
+  return options;
+}
 
 export class FieldOverlayPublicMethods {
   // --- Existing API -------------------------------------------------------------
 
   getFields() {
-    return this.obsData?.fields || [];
+    return requireInventory(this, FieldSource.OBS, { allowAbsent: true });
   }
 
   getVarFields() {
-    return this.varData?.fields || [];
+    return requireInventory(this, FieldSource.VAR, { allowAbsent: true });
   }
 
   getActiveField() {
-    if (this.activeFieldSource === 'var') {
-      return this.getVarFields()[this.activeVarFieldIndex];
+    if (this.activeFieldSource === null) {
+      if (
+        this.activeFieldIndex !== -1 ||
+        this.activeVarFieldIndex !== -1
+      ) {
+        throw new Error(
+          'No active field requires both field indices to be -1.'
+        );
+      }
+      return null;
     }
-    return this.getFields()[this.activeFieldIndex];
+    if (
+      this.activeFieldSource !== FieldSource.OBS &&
+      this.activeFieldSource !== FieldSource.VAR
+    ) {
+      throw new TypeError(
+        'Active field source must be exactly obs, var, or null.'
+      );
+    }
+    const isVar = this.activeFieldSource === FieldSource.VAR;
+    const activeIndex = isVar
+      ? this.activeVarFieldIndex
+      : this.activeFieldIndex;
+    const inactiveIndex = isVar
+      ? this.activeFieldIndex
+      : this.activeVarFieldIndex;
+    if (inactiveIndex !== -1) {
+      throw new Error('The inactive field source index must be -1.');
+    }
+    const data = isVar ? this.varData : this.obsData;
+    const sourceLabel = isVar ? 'Variable' : 'Observation';
+    if (
+      data === null ||
+      typeof data !== 'object' ||
+      !Array.isArray(data.fields)
+    ) {
+      throw new TypeError(
+        `${sourceLabel} field metadata must publish a fields array.`
+      );
+    }
+    if (
+      !Number.isSafeInteger(activeIndex) ||
+      activeIndex < 0 ||
+      activeIndex >= data.fields.length
+    ) {
+      throw new RangeError(
+        `${sourceLabel} active field index is outside its exact inventory.`
+      );
+    }
+    const field = data.fields[activeIndex];
+    if (
+      field === null ||
+      typeof field !== 'object' ||
+      Array.isArray(field)
+    ) {
+      throw new TypeError(
+        `${sourceLabel} active field must be one metadata object.`
+      );
+    }
+    return field;
   }
 
   // --- Field operations (rename / delete / user-defined) ----------------------
@@ -42,8 +275,14 @@ export class FieldOverlayPublicMethods {
    * This is safe to call during view switching because it does not touch render buffers.
    */
   applyFieldOverlays() {
-    this._applyOverlaysToFields(this.obsData?.fields, FieldSource.OBS);
-    this._applyOverlaysToFields(this.varData?.fields, FieldSource.VAR);
+    const obsFields = this.obsData === null
+      ? null
+      : requireInventory(this, FieldSource.OBS);
+    const varFields = this.varData === null
+      ? null
+      : requireInventory(this, FieldSource.VAR);
+    this._applyOverlaysToFields(obsFields, FieldSource.OBS);
+    this._applyOverlaysToFields(varFields, FieldSource.VAR);
     this._injectUserDefinedFields();
 
     // Keep active selection pointing at a non-deleted field (buffers remain untouched).
@@ -54,41 +293,39 @@ export class FieldOverlayPublicMethods {
   }
 
   getVisibleFields(source) {
+    requireSource(source);
     return getFieldRegistry().getVisibleFields(source);
   }
 
   isFieldDeleted(source, fieldIndex) {
-    const fields = source === FieldSource.VAR ? this.varData?.fields : this.obsData?.fields;
-    return fields?.[fieldIndex]?._isDeleted === true;
+    const { field } = requireFieldAt(this, source, fieldIndex);
+    if (
+      Object.hasOwn(field, '_isDeleted')
+      && typeof field._isDeleted !== 'boolean'
+    ) {
+      throw new TypeError('Field deletion state must be exactly boolean');
+    }
+    return field._isDeleted === true;
   }
 
   renameField(source, fieldIndex, newKey) {
-    const src = source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
-    const fields = src === FieldSource.VAR ? this.varData?.fields : this.obsData?.fields;
-
-    try {
-      StateValidator.validateFieldIndex(fieldIndex, fields);
-      StateValidator.validateFieldKey(newKey);
-    } catch (e) {
-      console.error('[State] renameField validation failed:', e.message);
-      return false;
-    }
+    const src = requireSource(source);
+    const { fields, field } = requireFieldAt(this, src, fieldIndex);
+    StateValidator.validateFieldKey(newKey);
 
     if (StateValidator.isDuplicateKey(newKey, fields, fieldIndex)) {
-      console.error('[State] renameField: duplicate key', newKey);
-      return false;
+      throw new Error(`Visible field name "${newKey}" already exists`);
     }
 
-    const field = fields[fieldIndex];
-    if (!field) return false;
-
-    const isUserDefined = field._isUserDefined === true && field._userDefinedId;
-
-    if (!field._originalKey) {
+    const isUserDefined = field._isUserDefined === true;
+    if (isUserDefined) {
+      requireIdentifier(field._userDefinedId, 'User-defined field id');
+      requireUserDefinedOwner(this);
+    }
+    if (!Object.hasOwn(field, '_originalKey')) {
       field._originalKey = field.key;
     }
-
-    const originalKey = field._originalKey;
+    const originalKey = requireOriginalKey(field);
     const previousKey = field.key;
 
     if (newKey === originalKey) {
@@ -105,7 +342,16 @@ export class FieldOverlayPublicMethods {
     }
 
     if (isUserDefined) {
-      this._userDefinedFields?.updateField?.(field._userDefinedId, { key: field.key });
+      const updated = requireBoolean(
+        this._userDefinedFields.updateField(
+          field._userDefinedId,
+          { key: field.key }
+        ),
+        'User-defined field rename result'
+      );
+      if (!updated) {
+        throw new Error('User-defined field rename did not complete');
+      }
     }
 
     this._refreshHighlightGroupsForField(src, fieldIndex);
@@ -123,47 +369,47 @@ export class FieldOverlayPublicMethods {
    * @returns {boolean}
    */
   revertFieldRename(source, fieldIndex) {
-    const src = source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
-    const fields = src === FieldSource.VAR ? this.varData?.fields : this.obsData?.fields;
-
-    try {
-      StateValidator.validateFieldIndex(fieldIndex, fields);
-    } catch (e) {
-      console.error('[State] revertFieldRename validation failed:', e.message);
-      return false;
-    }
-
-    const field = fields[fieldIndex];
-    if (!field) return false;
-    if (!field._originalKey) return true;
+    const src = requireSource(source);
+    const { field } = requireFieldAt(this, src, fieldIndex);
+    if (!Object.hasOwn(field, '_originalKey')) return true;
+    StateValidator.validateFieldKey(field._originalKey);
     return this.renameField(src, fieldIndex, field._originalKey);
   }
 
   renameCategory(source, fieldIndex, categoryIndex, newLabel) {
-    const src = source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
-    const fields = src === FieldSource.VAR ? this.varData?.fields : this.obsData?.fields;
-
-    try {
-      StateValidator.validateFieldIndex(fieldIndex, fields);
-      const field = fields[fieldIndex];
-      StateValidator.validateCategoryIndex(categoryIndex, field);
-      StateValidator.validateCategoryLabel(newLabel);
-    } catch (e) {
-      console.error('[State] renameCategory validation failed:', e.message);
-      return false;
+    const src = requireSource(source);
+    const { field } = requireFieldAt(this, src, fieldIndex);
+    requireCategoryField(field, 'Category rename field');
+    StateValidator.validateCategoryIndex(categoryIndex, field);
+    StateValidator.validateCategoryLabel(newLabel);
+    if (
+      field.categories.some(
+        (label, index) => index !== categoryIndex && label === newLabel
+      )
+    ) {
+      throw new Error('Category labels must remain unique');
     }
-
-    const field = fields[fieldIndex];
-    const isUserDefined = field._isUserDefined === true && field._userDefinedId;
-
-    if (!field._originalCategories) {
+    const isUserDefined = field._isUserDefined === true;
+    if (isUserDefined) {
+      requireIdentifier(field._userDefinedId, 'User-defined field id');
+      requireUserDefinedOwner(this);
+    }
+    if (!Object.hasOwn(field, '_originalCategories')) {
       field._originalCategories = [...field.categories];
+    } else if (
+      !Array.isArray(field._originalCategories)
+      || field._originalCategories.length !== field.categories.length
+    ) {
+      throw new TypeError(
+        'Original category inventory must match the current categories'
+      );
     }
 
-    const originalFieldKey = field._originalKey || field.key;
-    const originalLabel = field._originalCategories?.[categoryIndex] ?? field.categories[categoryIndex];
+    const originalFieldKey = requireOriginalKey(field);
+    const originalLabel = field._originalCategories[categoryIndex];
+    StateValidator.validateCategoryLabel(originalLabel);
 
-    if (newLabel === String(originalLabel)) {
+    if (newLabel === originalLabel) {
       // Revert this category label to its original.
       field.categories[categoryIndex] = originalLabel;
       if (!isUserDefined) {
@@ -177,9 +423,21 @@ export class FieldOverlayPublicMethods {
     }
 
     if (isUserDefined && Array.isArray(field._originalCategories)) {
-      const hasAnyRename = field.categories.some((label, idx) => String(label) !== String(field._originalCategories[idx]));
+      const hasAnyRename = field.categories.some(
+        (label, idx) => label !== field._originalCategories[idx]
+      );
       if (!hasAnyRename) {
         delete field._originalCategories;
+      }
+      const updated = requireBoolean(
+        this._userDefinedFields.updateField(
+          field._userDefinedId,
+          { categories: [...field.categories] }
+        ),
+        'User-defined category rename result'
+      );
+      if (!updated) {
+        throw new Error('User-defined category rename did not complete');
       }
     }
 
@@ -189,7 +447,7 @@ export class FieldOverlayPublicMethods {
 
     // If this field is currently active, push centroid label updates.
     if (src === FieldSource.OBS && this.activeFieldSource === FieldSource.OBS && this.activeFieldIndex === fieldIndex) {
-      this.buildCentroidsForField(field);
+      this.buildCentroidsForField(field, { viewId: this.activeViewId });
       this._pushCentroidsToViewer();
     }
 
@@ -200,24 +458,17 @@ export class FieldOverlayPublicMethods {
   }
 
   deleteField(source, fieldIndex) {
-    const src = source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
-    const fields = src === FieldSource.VAR ? this.varData?.fields : this.obsData?.fields;
-
-    try {
-      StateValidator.validateFieldIndex(fieldIndex, fields);
-    } catch (e) {
-      console.error('[State] deleteField validation failed:', e.message);
-      return false;
+    const src = requireSource(source);
+    const { field } = requireFieldAt(this, src, fieldIndex);
+    if (field._isDeleted === true) {
+      throw new Error('Field is already deleted');
     }
-
-    const field = fields[fieldIndex];
-    if (!field) return false;
-
-    if (field._isUserDefined && field._userDefinedId) {
+    if (field._isUserDefined === true) {
+      requireIdentifier(field._userDefinedId, 'User-defined field id');
       return this.deleteUserDefinedField(field._userDefinedId, src);
     }
 
-    const originalKey = field._originalKey || field.key;
+    const originalKey = requireOriginalKey(field);
     this._deleteRegistry.markDeleted(src, originalKey);
     field._isDeleted = true;
 
@@ -231,7 +482,10 @@ export class FieldOverlayPublicMethods {
 
     if (src === FieldSource.VAR) {
       // Free memory when possible; preserveActive prevents unloading if any view still references it.
-      this.unloadVarField(fieldIndex, { preserveActive: true });
+      requireBoolean(
+        this.unloadVarField(fieldIndex, { preserveActive: true }),
+        'Var field unload result'
+      );
     }
 
     getFieldRegistry().invalidate();
@@ -252,32 +506,33 @@ export class FieldOverlayPublicMethods {
    * @returns {boolean}
    */
   purgeDeletedField(source, fieldIndex) {
-    const src = source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
-    const fields = src === FieldSource.VAR ? this.varData?.fields : this.obsData?.fields;
-
-    try {
-      StateValidator.validateFieldIndex(fieldIndex, fields);
-    } catch (e) {
-      console.error('[State] purgeDeletedField validation failed:', e.message);
-      return false;
+    const src = requireSource(source);
+    const { field } = requireFieldAt(this, src, fieldIndex);
+    if (field._isDeleted !== true) {
+      throw new Error('Only a soft-deleted field can be purged');
     }
-
-    const field = fields?.[fieldIndex];
-    if (!field) return false;
-    if (field._isDeleted !== true) return false;
     if (field._isPurged === true) return true;
 
-    const isUserDefined = field._isUserDefined === true && field._userDefinedId;
+    const isUserDefined = field._isUserDefined === true;
 
     if (isUserDefined) {
-      field._isPurged = true;
-      const template = this._userDefinedFields?.getField?.(field._userDefinedId);
-      if (template) {
-        template._isDeleted = true;
-        template._isPurged = true;
+      const fieldId = requireIdentifier(
+        field._userDefinedId,
+        'User-defined field id'
+      );
+      const registry = requireUserDefinedOwner(this);
+      const template = requireField(
+        registry.getField(fieldId),
+        'User-defined field template'
+      );
+      if (template._userDefinedId !== fieldId) {
+        throw new Error('User-defined field template ownership is inconsistent');
       }
+      field._isPurged = true;
+      template._isDeleted = true;
+      template._isPurged = true;
     } else {
-      const originalKey = field._originalKey || field.key;
+      const originalKey = requireOriginalKey(field);
       this._deleteRegistry.markPurged(src, originalKey);
       field._isDeleted = true;
       field._isPurged = true;
@@ -286,72 +541,82 @@ export class FieldOverlayPublicMethods {
     getFieldRegistry().invalidate();
     this.computeGlobalVisibility();
     this.updateFilterSummary();
-    this._notifyFieldChange(src, fieldIndex, ChangeType.UPDATE, { purged: true, userDefinedId: field._userDefinedId || null });
+    this._notifyFieldChange(src, fieldIndex, ChangeType.UPDATE, {
+      purged: true,
+      userDefinedId: isUserDefined ? field._userDefinedId : null
+    });
     return true;
   }
 
   /**
    * Restore a soft-deleted field.
    *
-   * Returns a structured result (instead of a boolean) so the UI can surface
-   * auto-rename details when restoring would create a duplicate visible key.
+   * Restoration never substitutes another name. A visible-key conflict is a
+   * public error that must be resolved explicitly before retrying.
    *
    * @param {string} source - 'obs' | 'var'
    * @param {number} fieldIndex
-   * @returns {{
-   *   ok: boolean,
-   *   originalKey?: string,
-   *   key?: string,
-   *   userDefinedId?: (string|null),
-   *   renamedFrom?: (string|null),
-   *   renamedTo?: (string|null)
-   * }}
+   * @returns {{ok: true, originalKey: string, key: string, userDefinedId: string|null}}
    */
   restoreField(source, fieldIndex) {
-    const src = source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
-    const fields = src === FieldSource.VAR ? this.varData?.fields : this.obsData?.fields;
-    const field = fields?.[fieldIndex];
-    if (!field) return { ok: false };
-
+    const src = requireSource(source);
+    const { fields, field } = requireFieldAt(this, src, fieldIndex);
+    if (field._isDeleted !== true) {
+      throw new Error('Only a soft-deleted field can be restored');
+    }
     if (field._isPurged === true) {
-      console.warn('[State] restoreField: cannot restore a confirmed deletion');
-      return { ok: false };
+      throw new Error('A purged field cannot be restored');
+    }
+    const isUserDefined = field._isUserDefined === true;
+    const originalKey = requireOriginalKey(field);
+    if (
+      fields.some(
+        (candidate, index) => (
+          index !== fieldIndex
+          && candidate._isDeleted !== true
+          && candidate.key === field.key
+        )
+      )
+    ) {
+      throw new Error(
+        `Cannot restore "${field.key}" while that visible field name exists`
+      );
     }
 
-    const isUserDefined = field._isUserDefined === true && field._userDefinedId;
-    const originalKey = field._originalKey || field.key;
-
+    let userDefinedId = null;
     if (isUserDefined) {
-      delete field._isDeleted;
-      const template = this._userDefinedFields?.getField?.(field._userDefinedId);
-      if (template) delete template._isDeleted;
+      userDefinedId = requireIdentifier(
+        field._userDefinedId,
+        'User-defined field id'
+      );
+      const registry = requireUserDefinedOwner(this);
+      const template = requireField(
+        registry.getField(userDefinedId),
+        'User-defined field template'
+      );
+      if (
+        template._userDefinedId !== userDefinedId
+        || template._fieldSource !== src
+      ) {
+        throw new Error(
+          'User-defined field registry ownership is inconsistent'
+        );
+      }
+      if (template._isDeleted !== true || template._isPurged === true) {
+        throw new Error(
+          'User-defined field template is not in a restorable state'
+        );
+      }
+      template._isDeleted = false;
+      field._isDeleted = false;
     } else {
+      requireMethod(
+        this._deleteRegistry,
+        'markRestored',
+        'Delete registry'
+      );
       this._deleteRegistry.markRestored(src, originalKey);
       delete field._isDeleted;
-    }
-
-    // If restoring causes a key conflict, auto-rename the restored field to keep
-    // visible field keys unique (prevents selectors/filters from breaking).
-    let renamedFrom = null;
-    let renamedTo = null;
-    const existingKeys = (fields || [])
-      .map((f, idx) => ({ f, idx }))
-      .filter(({ f, idx }) => idx !== fieldIndex && f && f._isDeleted !== true)
-      .map(({ f }) => f.key);
-
-    if (existingKeys.includes(field.key)) {
-      renamedFrom = field.key;
-      renamedTo = makeUniqueLabel(`${field.key} (restored)`, existingKeys);
-
-      if (isUserDefined) {
-        field.key = renamedTo;
-        this._userDefinedFields?.updateField?.(field._userDefinedId, { key: renamedTo });
-      } else {
-        const okRename = this.renameField(src, fieldIndex, renamedTo);
-        if (!okRename) {
-          field.key = renamedTo;
-        }
-      }
     }
 
     getFieldRegistry().invalidate();
@@ -359,17 +624,13 @@ export class FieldOverlayPublicMethods {
     this.updateFilterSummary();
     this._notifyFieldChange(src, fieldIndex, ChangeType.RESTORE, {
       originalKey,
-      userDefinedId: isUserDefined ? field._userDefinedId : null,
-      renamedFrom,
-      renamedTo
+      userDefinedId
     });
     return {
       ok: true,
       originalKey,
-      userDefinedId: isUserDefined ? field._userDefinedId : null,
-      renamedFrom,
-      renamedTo,
-      key: field.key
+      key: field.key,
+      userDefinedId
     };
   }
 
@@ -381,29 +642,61 @@ export class FieldOverlayPublicMethods {
    *
    * @param {string} userDefinedId
    * @param {'obs'|'var'} source
-   * @returns {{ ok: boolean, key?: string, renamedTo?: string|null }}
+   * @returns {{ok: true, key: string, userDefinedId: string}}
    */
-  restoreUserDefinedField(userDefinedId, source = FieldSource.OBS) {
-    const src = source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
-    const template = this._userDefinedFields?.getField?.(userDefinedId);
-    if (!template) return { ok: false };
+  restoreUserDefinedField(userDefinedId, source) {
+    const src = requireSource(source);
+    const fieldId = requireIdentifier(
+      userDefinedId,
+      'User-defined field id'
+    );
+    const registry = requireUserDefinedOwner(this);
+    const template = requireField(
+      registry.getField(fieldId),
+      'User-defined field template'
+    );
+    if (
+      template._isUserDefined !== true
+      || template._userDefinedId !== fieldId
+      || template._fieldSource !== src
+    ) {
+      throw new Error('User-defined field template ownership is inconsistent');
+    }
+    if (template._isDeleted !== true) {
+      throw new Error('Only a soft-deleted user-defined field can be restored');
+    }
     if (template._isPurged === true) {
-      console.warn('[State] restoreUserDefinedField: cannot restore a confirmed deletion');
-      return { ok: false };
+      throw new Error('A purged user-defined field cannot be restored');
     }
 
-    // Mark template as not deleted
-    delete template._isDeleted;
+    const fields = requireInventory(this, src);
+    const matches = fields.filter(
+      field => field._userDefinedId === fieldId
+    );
+    if (matches.length > 1) {
+      throw new Error(
+        `User-defined field id "${fieldId}" is duplicated in ${src}`
+      );
+    }
+    const injected = matches.length === 1 ? matches[0] : null;
+    const key = injected === null ? template.key : injected.key;
+    StateValidator.validateFieldKey(key);
+    if (
+      fields.some(
+        field => (
+          field !== injected
+          && field._isDeleted !== true
+          && field.key === key
+        )
+      )
+    ) {
+      throw new Error(
+        `Cannot restore "${key}" while that visible field name exists`
+      );
+    }
 
-    // Check if field already exists in array
-    const fields = src === FieldSource.VAR ? this.varData?.fields : this.obsData?.fields;
-    let field = fields?.find?.((f) => f && f._userDefinedId === userDefinedId);
-
-    if (field) {
-      // Field exists in array, just un-delete it
-      delete field._isDeleted;
-    } else {
-      // Field not in array, inject it
+    let field = injected;
+    if (field === null) {
       const clone = { ...template };
       delete clone._categoryColors;
       delete clone._categoryVisible;
@@ -415,28 +708,20 @@ export class FieldOverlayPublicMethods {
       fields.push(clone);
       field = clone;
     }
-
-    // Handle potential key conflicts
-    let renamedTo = null;
-    const existingKeys = (fields || [])
-      .filter((f) => f && f._userDefinedId !== userDefinedId && f._isDeleted !== true)
-      .map((f) => f.key);
-
-    if (existingKeys.includes(field.key)) {
-      renamedTo = makeUniqueLabel(`${field.key} (restored)`, existingKeys);
-      field.key = renamedTo;
-      template.key = renamedTo;
-    }
+    field._isDeleted = false;
+    template._isDeleted = false;
 
     getFieldRegistry().invalidate();
     this.computeGlobalVisibility();
     this.updateFilterSummary();
-    this._notifyFieldChange(src, fields.indexOf(field), ChangeType.RESTORE, {
-      userDefinedId,
-      renamedTo
-    });
+    this._notifyFieldChange(
+      src,
+      fields.indexOf(field),
+      ChangeType.RESTORE,
+      { userDefinedId: fieldId }
+    );
 
-    return { ok: true, key: field.key, renamedTo };
+    return { ok: true, key: field.key, userDefinedId: fieldId };
   }
 
   /**
@@ -449,10 +734,27 @@ export class FieldOverlayPublicMethods {
    * @param {'obs'|'var'} source
    * @returns {boolean}
    */
-  purgeUserDefinedField(userDefinedId, source = FieldSource.OBS) {
-    const src = source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
-    const template = this._userDefinedFields?.getField?.(userDefinedId);
-    if (!template) return false;
+  purgeUserDefinedField(userDefinedId, source) {
+    const src = requireSource(source);
+    const fieldId = requireIdentifier(
+      userDefinedId,
+      'User-defined field id'
+    );
+    const registry = requireUserDefinedOwner(this);
+    const template = requireField(
+      registry.getField(fieldId),
+      'User-defined field template'
+    );
+    if (
+      template._isUserDefined !== true
+      || template._userDefinedId !== fieldId
+      || template._fieldSource !== src
+    ) {
+      throw new Error('User-defined field template ownership is inconsistent');
+    }
+    if (template._isDeleted !== true) {
+      throw new Error('Only a soft-deleted user-defined field can be purged');
+    }
     if (template._isPurged === true) return true;
 
     // Mark template as deleted and purged
@@ -460,9 +762,22 @@ export class FieldOverlayPublicMethods {
     template._isPurged = true;
 
     // If field exists in array, mark it there too
-    const fields = src === FieldSource.VAR ? this.varData?.fields : this.obsData?.fields;
-    const field = fields?.find?.((f) => f && f._userDefinedId === userDefinedId);
-    if (field) {
+    const fields = requireInventory(this, src);
+    const matches = fields.filter(
+      field => field._userDefinedId === fieldId
+    );
+    if (matches.length > 1) {
+      throw new Error(
+        `User-defined field id "${fieldId}" is duplicated in ${src}`
+      );
+    }
+    const field = matches.length === 1 ? matches[0] : null;
+    if (field !== null) {
+      if (field._isDeleted !== true) {
+        throw new Error(
+          'Injected user-defined field is not in a deleted state'
+        );
+      }
       field._isDeleted = true;
       field._isPurged = true;
     }
@@ -471,7 +786,12 @@ export class FieldOverlayPublicMethods {
     this.computeGlobalVisibility();
     this.updateFilterSummary();
     const fieldIndex = field ? fields.indexOf(field) : -1;
-    this._notifyFieldChange(src, fieldIndex, ChangeType.UPDATE, { purged: true, userDefinedId });
+    this._notifyFieldChange(
+      src,
+      fieldIndex,
+      ChangeType.UPDATE,
+      { purged: true, userDefinedId: fieldId }
+    );
     return true;
   }
 
@@ -488,54 +808,77 @@ export class FieldOverlayPublicMethods {
    * @param {number} fieldIndex
    * @param {object} [options]
    * @param {string} [options.newKey]
-   * @returns {Promise<{ newFieldIndex: number, newKey: string }|null>}
+   * @returns {Promise<{newFieldIndex: number, newKey: string}>}
    */
   async duplicateField(source, fieldIndex, options = {}) {
-    const src = source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
-    const fields = src === FieldSource.VAR ? this.varData?.fields : this.obsData?.fields;
-
-    try {
-      StateValidator.validateFieldIndex(fieldIndex, fields);
-    } catch (e) {
-      console.error('[State] duplicateField validation failed:', e.message);
-      return null;
+    const src = requireSource(source);
+    const { fields, field } = requireFieldAt(this, src, fieldIndex);
+    requireExactOptions(
+      options,
+      new Set(['newKey']),
+      'Field duplicate options'
+    );
+    if (field._isDeleted === true) {
+      throw new Error('A deleted field cannot be duplicated');
     }
-
-    const field = fields?.[fieldIndex];
-    if (!field || field._isDeleted === true) return null;
 
     // Ensure the source field has its heavy data materialized first.
-    try {
-      if (src === FieldSource.VAR) {
-        await this.ensureVarFieldLoaded(fieldIndex);
-      } else {
-        await this.ensureFieldLoaded(fieldIndex);
-      }
-    } catch (err) {
-      console.error('[State] duplicateField load failed:', err);
-      return null;
+    if (src === FieldSource.VAR) {
+      await this.ensureVarFieldLoaded(fieldIndex);
+    } else {
+      await this.ensureFieldLoaded(fieldIndex);
     }
 
-    const existingKeys = (fields || []).filter((f) => f && f._isDeleted !== true).map((f) => f.key);
-    const baseKey = String(options.newKey || `${field.key} (copy)`).trim() || `${field.key} (copy)`;
-    const newKey = makeUniqueLabel(baseKey, existingKeys);
+    const existingKeys = fields
+      .filter(candidate => candidate._isDeleted !== true)
+      .map(candidate => candidate.key);
+    let newKey;
+    if (Object.hasOwn(options, 'newKey')) {
+      StateValidator.validateFieldKey(options.newKey);
+      if (existingKeys.includes(options.newKey)) {
+        throw new Error(
+          `Visible field name "${options.newKey}" already exists`
+        );
+      }
+      newKey = options.newKey;
+    } else {
+      newKey = makeUniqueLabel(`${field.key} (copy)`, existingKeys);
+      StateValidator.validateFieldKey(newKey);
+    }
+    const userDefinedRegistry = requireUserDefinedOwner(this);
 
     // ---------------------------------------------------------------------
     // Categorical obs: deep copy codes so subsequent merges don't affect the original.
     // ---------------------------------------------------------------------
     if (field.kind === FieldKind.CATEGORY) {
       if (src !== FieldSource.OBS) {
-        console.warn('[State] duplicateField: categorical var fields are not supported');
-        return null;
+        throw new TypeError(
+          'Categorical var fields cannot be duplicated as gene aliases'
+        );
       }
 
-      const categories = Array.isArray(field.categories) ? [...field.categories] : [];
+      requireCategoryField(field, 'Categorical duplicate source');
+      const categories = [...field.categories];
       const codes = field.codes;
-      if (!codes || typeof codes.length !== 'number') return null;
-      const codesCopy = typeof codes.slice === 'function' ? codes.slice() : codes;
+      if (
+        (!(codes instanceof Uint8Array) && !(codes instanceof Uint16Array))
+        || codes.length !== this.pointCount
+      ) {
+        throw new TypeError(
+          'Categorical duplicate source requires exact dataset-length codes'
+        );
+      }
+      const codesCopy = codes.slice();
 
-      const sourceKey = field._sourceField?.sourceKey || field._originalKey || field.key;
-      const created = this._userDefinedFields.createFromCategoricalCodes(
+      let sourceKey = requireOriginalKey(field);
+      if (Object.hasOwn(field, '_sourceField') && field._sourceField !== null) {
+        requireRecord(field._sourceField, 'Categorical source descriptor');
+        sourceKey = requireIdentifier(
+          field._sourceField.sourceKey,
+          'Categorical source descriptor.sourceKey'
+        );
+      }
+      const created = userDefinedRegistry.createFromCategoricalCodes(
         {
           key: newKey,
           categories,
@@ -556,18 +899,57 @@ export class FieldOverlayPublicMethods {
         },
         this
       );
+      requireRecord(created, 'Categorical duplicate creation result');
+      const createdId = requireIdentifier(
+        created.id,
+        'Categorical duplicate field id'
+      );
+      requireCategoryField(
+        created.field,
+        'Categorical duplicate field'
+      );
 
       // Carry forward category UI state (colors/visibility) as a convenience.
-      try {
-        this.ensureCategoryMetadata(field);
-        const colors = (field._categoryColors || []).map((c) => (Array.isArray(c) ? [...c] : c));
-        const visible = { ...(field._categoryVisible || {}) };
-        created.field._categoryColors = colors;
-        created.field._categoryVisible = visible;
-        created.field._categoryFilterEnabled = field._categoryFilterEnabled ?? true;
-        if (field._colormapId) created.field._colormapId = field._colormapId;
-      } catch (err) {
-        console.warn('[State] duplicateField: failed to carry categorical UI state:', err);
+      this.ensureCategoryMetadata(field);
+      if (
+        !Array.isArray(field._categoryColors)
+        || field._categoryColors.length !== categories.length
+        || field._categoryColors.some(
+          color => (
+            !Array.isArray(color)
+            || color.length !== 3
+            || color.some(channel => !Number.isFinite(channel))
+          )
+        )
+      ) {
+        throw new TypeError(
+          'Categorical duplicate source colors must match its categories'
+        );
+      }
+      requireRecord(
+        field._categoryVisible,
+        'Categorical duplicate source visibility'
+      );
+      const visible = {};
+      for (let index = 0; index < categories.length; index++) {
+        visible[index] = requireBoolean(
+          field._categoryVisible[index],
+          `Categorical duplicate visibility ${index}`
+        );
+      }
+      created.field._categoryColors = field._categoryColors.map(
+        color => [...color]
+      );
+      created.field._categoryVisible = visible;
+      created.field._categoryFilterEnabled = requireBoolean(
+        field._categoryFilterEnabled,
+        'Categorical duplicate filter state'
+      );
+      if (Object.hasOwn(field, '_colormapId')) {
+        created.field._colormapId = requireIdentifier(
+          field._colormapId,
+          'Categorical duplicate colormap id'
+        );
       }
 
       fields.push(created.field);
@@ -575,7 +957,12 @@ export class FieldOverlayPublicMethods {
 
       getFieldRegistry().invalidate();
       this._syncActiveContext();
-      this._notifyFieldChange(FieldSource.OBS, newFieldIndex, ChangeType.CREATE, { userDefinedId: created.id });
+      this._notifyFieldChange(
+        FieldSource.OBS,
+        newFieldIndex,
+        ChangeType.CREATE,
+        { userDefinedId: createdId }
+      );
 
       return { newFieldIndex, newKey };
     }
@@ -584,9 +971,9 @@ export class FieldOverlayPublicMethods {
     // Continuous obs/var: create an alias that can be re-materialized on load.
     // ---------------------------------------------------------------------
     if (field.kind === FieldKind.CONTINUOUS) {
-      const sourceKey = field._originalKey || field.key;
+      const sourceKey = requireOriginalKey(field);
       const kind = src === FieldSource.VAR ? 'gene-expression' : 'continuous-obs';
-      const created = this._userDefinedFields.createContinuousAlias({
+      const created = userDefinedRegistry.createContinuousAlias({
         key: newKey,
         source: src,
         sourceField: { kind, sourceKey, sourceIndex: fieldIndex },
@@ -594,88 +981,163 @@ export class FieldOverlayPublicMethods {
           _operation: { type: 'copy-field', source: src, sourceKey }
         }
       });
+      requireRecord(created, 'Continuous duplicate creation result');
+      const createdId = requireIdentifier(
+        created.id,
+        'Continuous duplicate field id'
+      );
 
-      const aliasField = created.field;
+      const aliasField = requireField(
+        created.field,
+        'Continuous duplicate field'
+      );
       const values = field.values;
-      if (values && typeof values.length === 'number') {
-        aliasField.values = typeof values.slice === 'function' ? values.slice() : values;
-        aliasField.loaded = true;
+      if (
+        !ArrayBuffer.isView(values)
+        || values instanceof DataView
+        || values.length !== this.pointCount
+        || typeof values.slice !== 'function'
+      ) {
+        throw new TypeError(
+          'Continuous duplicate source requires exact dataset-length typed values'
+        );
       }
-      if (src === FieldSource.OBS && field.outlierQuantiles) {
+      aliasField.values = values.slice();
+      aliasField.loaded = true;
+      if (src === FieldSource.OBS && Object.hasOwn(field, 'outlierQuantiles')) {
+        if (
+          !(field.outlierQuantiles instanceof Float32Array)
+          || field.outlierQuantiles.length !== this.pointCount
+        ) {
+          throw new TypeError(
+            'Continuous duplicate outlier quantiles must match the dataset'
+          );
+        }
         aliasField.outlierQuantiles = field.outlierQuantiles;
       }
 
       // Carry forward continuous UI state.
-      if (field._continuousStats) aliasField._continuousStats = { ...field._continuousStats };
-      if (field._continuousFilter) aliasField._continuousFilter = { ...field._continuousFilter };
-      if (field._continuousColorRange) aliasField._continuousColorRange = { ...field._continuousColorRange };
-      if (field._positiveStats) aliasField._positiveStats = { ...field._positiveStats };
-      if (field._useLogScale != null) aliasField._useLogScale = field._useLogScale;
-      if (field._useFilterColorRange != null) aliasField._useFilterColorRange = field._useFilterColorRange;
-      if (field._filterEnabled != null) aliasField._filterEnabled = field._filterEnabled;
-      if (field._outlierFilterEnabled != null) aliasField._outlierFilterEnabled = field._outlierFilterEnabled;
-      if (field._outlierThreshold != null) aliasField._outlierThreshold = field._outlierThreshold;
-      if (field._colormapId) aliasField._colormapId = field._colormapId;
+      for (const key of [
+        '_continuousStats',
+        '_continuousFilter',
+        '_continuousColorRange',
+        '_positiveStats'
+      ]) {
+        if (Object.hasOwn(field, key)) {
+          aliasField[key] = { ...requireRecord(field[key], key) };
+        }
+      }
+      for (const key of [
+        '_useLogScale',
+        '_useFilterColorRange',
+        '_filterEnabled',
+        '_outlierFilterEnabled'
+      ]) {
+        if (Object.hasOwn(field, key)) {
+          aliasField[key] = requireBoolean(field[key], key);
+        }
+      }
+      if (Object.hasOwn(field, '_outlierThreshold')) {
+        if (!Number.isFinite(field._outlierThreshold)) {
+          throw new TypeError(
+            'Continuous duplicate outlier threshold must be finite'
+          );
+        }
+        aliasField._outlierThreshold = field._outlierThreshold;
+      }
+      if (Object.hasOwn(field, '_colormapId')) {
+        aliasField._colormapId = requireIdentifier(
+          field._colormapId,
+          'Continuous duplicate colormap id'
+        );
+      }
 
       fields.push(aliasField);
       const newFieldIndex = fields.length - 1;
 
       getFieldRegistry().invalidate();
       this._syncActiveContext();
-      this._notifyFieldChange(src, newFieldIndex, ChangeType.CREATE, { userDefinedId: created.id });
+      this._notifyFieldChange(
+        src,
+        newFieldIndex,
+        ChangeType.CREATE,
+        { userDefinedId: createdId }
+      );
 
       return { newFieldIndex, newKey };
     }
 
-    console.warn('[State] duplicateField: unsupported field kind:', field.kind);
-    return null;
+    throw new TypeError(`Unsupported duplicate field kind "${field.kind}"`);
   }
 
-  deleteUserDefinedField(fieldId, source = FieldSource.OBS) {
-    const src = source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
-    const fields = src === FieldSource.VAR ? this.varData?.fields : this.obsData?.fields;
-    const field = fields?.find?.((f) => f && f._userDefinedId === fieldId);
-
-    // Mark the template as deleted first (ensures restore works even if field isn't in array)
-    const template = this._userDefinedFields?.getField?.(fieldId);
-    if (template) template._isDeleted = true;
-
-    if (!field) {
-      // Field not in array but template exists - still counts as successful deletion
-      if (template) {
-        getFieldRegistry().invalidate();
-        return true;
-      }
-      return false;
+  deleteUserDefinedField(fieldId, source) {
+    const src = requireSource(source);
+    const exactFieldId = requireIdentifier(
+      fieldId,
+      'User-defined field id'
+    );
+    const registry = requireUserDefinedOwner(this);
+    const template = requireField(
+      registry.getField(exactFieldId),
+      'User-defined field template'
+    );
+    if (
+      template._isUserDefined !== true
+      || template._userDefinedId !== exactFieldId
+      || template._fieldSource !== src
+    ) {
+      throw new Error('User-defined field template ownership is inconsistent');
     }
+    if (template._isDeleted === true) {
+      throw new Error('User-defined field is already deleted');
+    }
+    const fields = requireInventory(this, src);
+    const matches = fields.filter(
+      field => field._userDefinedId === exactFieldId
+    );
+    if (matches.length > 1) {
+      throw new Error(
+        `User-defined field id "${exactFieldId}" is duplicated in ${src}`
+      );
+    }
+    const field = matches.length === 1 ? matches[0] : null;
 
-    // User-defined fields are fully owned by Cellucid and serialized via
-    // UserDefinedFieldsRegistry. For dev-phase workflows we treat deletion as
-    // a soft-delete so the user can restore derived columns (e.g. after
-    // delete→unassigned or drag-merge operations).
-    field._isDeleted = true;
+    template._isDeleted = true;
+    if (field !== null) field._isDeleted = true;
 
     if (src === FieldSource.OBS && this.activeFieldSource === FieldSource.OBS && this.activeFieldIndex >= 0) {
-      const active = this.obsData?.fields?.[this.activeFieldIndex];
-      if (active && active._userDefinedId === fieldId) this.clearActiveField();
+      const active = fields[this.activeFieldIndex];
+      if (active._userDefinedId === exactFieldId) this.clearActiveField();
     }
     if (src === FieldSource.VAR && this.activeFieldSource === FieldSource.VAR && this.activeVarFieldIndex >= 0) {
-      const active = this.varData?.fields?.[this.activeVarFieldIndex];
-      if (active && active._userDefinedId === fieldId) this.clearActiveField();
+      const active = fields[this.activeVarFieldIndex];
+      if (active._userDefinedId === exactFieldId) this.clearActiveField();
     }
 
     getFieldRegistry().invalidate();
     this.computeGlobalVisibility();
     this.updateFilterSummary();
-    const fieldIndex = fields?.indexOf(field) ?? -1;
-    this._notifyFieldChange(src, fieldIndex, ChangeType.DELETE, { userDefinedId: fieldId, originalKey: field._originalKey || field.key });
+    const fieldIndex = field === null ? -1 : fields.indexOf(field);
+    this._notifyFieldChange(src, fieldIndex, ChangeType.DELETE, {
+      userDefinedId: exactFieldId,
+      originalKey: field === null
+        ? template.key
+        : requireOriginalKey(field)
+    });
     return true;
   }
 
   isUserDefinedField(source, fieldIndex) {
-    if (source !== FieldSource.OBS) return false;
-    const field = this.obsData?.fields?.[fieldIndex];
-    return field?._isUserDefined === true;
+    const { field } = requireFieldAt(this, source, fieldIndex);
+    if (
+      Object.hasOwn(field, '_isUserDefined')
+      && typeof field._isUserDefined !== 'boolean'
+    ) {
+      throw new TypeError(
+        'User-defined field ownership flag must be exactly boolean'
+      );
+    }
+    return field._isUserDefined === true;
   }
 
   /**
@@ -693,91 +1155,238 @@ export class FieldOverlayPublicMethods {
    * @param {string[]} options.categories
    * @param {Uint8Array|Uint16Array} options.codes
    * @param {object} [options.meta]
-   * @returns {{ fieldIndex: number, key: string, updatedInPlace: boolean }|null}
+   * @returns {{ fieldIndex: number, key: string, updatedInPlace: boolean }}
    */
-  upsertUserDefinedCategoricalField(options = {}) {
-    const fields = this.obsData?.fields;
-    const key = String(options.key ?? '').trim();
-    const categories = Array.isArray(options.categories) ? options.categories : null;
-    const codes = options.codes;
-    const meta = options.meta && typeof options.meta === 'object' ? options.meta : null;
-
-    try {
-      StateValidator.validateFieldKey(key);
-    } catch (e) {
-      console.error('[State] upsertUserDefinedCategoricalField invalid key:', e.message);
-      return null;
-    }
-    if (!categories || categories.length === 0) {
-      console.error('[State] upsertUserDefinedCategoricalField: categories required');
-      return null;
-    }
-    if (!codes || typeof codes.length !== 'number') {
-      console.error('[State] upsertUserDefinedCategoricalField: codes required');
-      return null;
-    }
-
-    const existingIndex = (fields || []).findIndex((f) => f && f._isDeleted !== true && f.key === key);
-    if (existingIndex >= 0) {
-      const existing = fields[existingIndex];
-      const canUpdate =
-        existing &&
-        existing.kind === FieldKind.CATEGORY &&
-        existing._isUserDefined === true &&
-        Boolean(existing._userDefinedId);
-
-      if (canUpdate) {
-        const centroidsByDim = this._userDefinedFields.computeCentroidsByDim(codes, categories, this);
-        existing.categories = [...categories];
-        existing.codes = codes;
-        existing.centroidsByDim = centroidsByDim;
-        existing.loaded = true;
-
-        if (meta?._sourceField) existing._sourceField = meta._sourceField;
-        if (meta?._operation) existing._operation = meta._operation;
-
-        // Keep serialized template in sync.
-        this._userDefinedFields.updateField(existing._userDefinedId, {
-          categories: existing.categories,
-          codes: existing.codes,
-          centroidsByDim: existing.centroidsByDim,
-          sourceField: meta?._sourceField || undefined,
-          operation: meta?._operation || undefined
-        });
-
-        getFieldRegistry().invalidate();
-        this._syncActiveContext();
-        this._notifyFieldChange(FieldSource.OBS, existingIndex, ChangeType.UPDATE, { operation: 'upsert-user-defined' });
-        return { fieldIndex: existingIndex, key, updatedInPlace: true };
+  upsertUserDefinedCategoricalField(options) {
+    requireExactOptions(
+      options,
+      new Set(['key', 'categories', 'codes', 'meta']),
+      'User-defined categorical upsert options'
+    );
+    for (const key of ['key', 'categories', 'codes']) {
+      if (!Object.hasOwn(options, key)) {
+        throw new TypeError(
+          `User-defined categorical upsert requires "${key}"`
+        );
       }
     }
+    if (!Number.isSafeInteger(this.pointCount) || this.pointCount < 1) {
+      throw new TypeError(
+        'User-defined categorical upsert requires a current positive pointCount'
+      );
+    }
+    const fields = requireInventory(this, FieldSource.OBS);
+    const { key, categories, codes, meta } = options;
+    StateValidator.validateFieldKey(key);
+    requireCategoryPayload(
+      categories,
+      codes,
+      this.pointCount,
+      'User-defined categorical upsert'
+    );
+    if (
+      meta !== undefined
+      && (
+        !meta
+        || typeof meta !== 'object'
+        || Array.isArray(meta)
+        || Object.keys(meta).some(
+          metadataKey => metadataKey !== '_sourceField' && metadataKey !== '_operation'
+        )
+      )
+    ) {
+      throw new TypeError(
+        'User-defined categorical metadata may contain only _sourceField and _operation.'
+      );
+    }
+    if (meta !== undefined) {
+      for (const metadataKey of Object.keys(meta)) {
+        if (
+          !meta[metadataKey]
+          || typeof meta[metadataKey] !== 'object'
+          || Array.isArray(meta[metadataKey])
+        ) {
+          throw new TypeError(
+            `User-defined categorical metadata ${metadataKey} must be an object.`
+          );
+        }
+      }
+    }
+    const registry = requireUserDefinedOwner(this);
 
-    // Create new user-defined field (avoid clobbering source fields).
-    const existingKeys = (fields || []).filter((f) => f && f._isDeleted !== true).map((f) => f.key);
-    const newKey = existingIndex >= 0 ? makeUniqueLabel(key, existingKeys) : key;
+    const existingIndex = fields.findIndex(
+      field => field._isDeleted !== true && field.key === key
+    );
+    if (existingIndex >= 0) {
+      const existing = fields[existingIndex];
+      if (
+        existing.kind !== FieldKind.CATEGORY
+        || existing._isUserDefined !== true
+      ) {
+        throw new Error(
+          `Cannot upsert "${key}" because that visible field is not the owned categorical target`
+        );
+      }
+      const fieldId = requireIdentifier(
+        existing._userDefinedId,
+        'User-defined categorical target id'
+      );
+      if (existing._fieldSource !== FieldSource.OBS) {
+        throw new Error(
+          'User-defined categorical target has mismatched source ownership'
+        );
+      }
+      const template = requireField(
+        registry.getField(fieldId),
+        'User-defined categorical template'
+      );
+      if (
+        template._userDefinedId !== fieldId
+        || template._fieldSource !== FieldSource.OBS
+      ) {
+        throw new Error(
+          'User-defined categorical template ownership is inconsistent'
+        );
+      }
 
-    let created;
-    try {
-      created = this._userDefinedFields.createFromCategoricalCodes(
-        {
-          key: newKey,
-          categories,
-          codes,
-          source: FieldSource.OBS,
-          meta: meta || undefined
-        },
+      const centroidsByDim = registry.computeCentroidsByDim(
+        codes,
+        categories,
         this
       );
-    } catch (err) {
-      console.error('[State] upsertUserDefinedCategoricalField create failed:', err.message);
-      return null;
+      this.ensureCategoryMetadata(existing);
+      const oldIndexByCategory = new Map();
+      for (
+        let categoryIndex = 0;
+        categoryIndex < existing.categories.length;
+        categoryIndex++
+      ) {
+        oldIndexByCategory.set(
+          existing.categories[categoryIndex],
+          categoryIndex
+        );
+      }
+      const categoryColors = new Array(categories.length);
+      const categoryVisible = {};
+      for (
+        let categoryIndex = 0;
+        categoryIndex < categories.length;
+        categoryIndex++
+      ) {
+        const previousIndex = oldIndexByCategory.get(
+          categories[categoryIndex]
+        );
+        if (previousIndex === undefined) {
+          categoryColors[categoryIndex] = getCategoryColor(categoryIndex);
+          categoryVisible[categoryIndex] = true;
+        } else {
+          const previousColor = existing._categoryColors[previousIndex];
+          if (
+            !Array.isArray(previousColor)
+            || previousColor.length !== 3
+            || previousColor.some(channel => !Number.isFinite(channel))
+          ) {
+            throw new TypeError(
+              `Existing category color ${previousIndex} is invalid`
+            );
+          }
+          categoryColors[categoryIndex] = [...previousColor];
+          categoryVisible[categoryIndex] = requireBoolean(
+            existing._categoryVisible[previousIndex],
+            `Existing category visibility ${previousIndex}`
+          );
+        }
+      }
+      const sourceField = (
+        meta === undefined
+        || !Object.hasOwn(meta, '_sourceField')
+      )
+        ? existing._sourceField
+        : meta._sourceField;
+      const operation = (
+        meta === undefined
+        || !Object.hasOwn(meta, '_operation')
+      )
+        ? existing._operation
+        : meta._operation;
+      if (sourceField !== null) {
+        requireRecord(sourceField, 'User-defined categorical source metadata');
+      }
+      if (operation !== null) {
+        requireRecord(operation, 'User-defined categorical operation metadata');
+      }
+      const normalizedDims = new Set();
+
+      const updated = requireBoolean(
+        registry.updateField(fieldId, {
+          categories: [...categories],
+          codes,
+          centroidsByDim,
+          normalizedDims,
+          sourceField,
+          operation
+        }),
+        'User-defined categorical template update result'
+      );
+      if (!updated) {
+        throw new Error(
+          'User-defined categorical template update did not complete'
+        );
+      }
+
+      existing.categories = [...categories];
+      existing.codes = codes;
+      existing.centroidsByDim = centroidsByDim;
+      existing._normalizedDims = normalizedDims;
+      existing.loaded = true;
+      existing._sourceField = sourceField;
+      existing._operation = operation;
+      existing._categoryColors = categoryColors;
+      existing._categoryVisible = categoryVisible;
+      delete existing._categoryCounts;
+      delete existing.outlierQuantiles;
+      delete existing._outlierThreshold;
+
+      getFieldRegistry().invalidate();
+      this._syncActiveContext();
+      this._notifyFieldChange(
+        FieldSource.OBS,
+        existingIndex,
+        ChangeType.UPDATE,
+        { operation: 'upsert-user-defined' }
+      );
+      return { fieldIndex: existingIndex, key, updatedInPlace: true };
     }
 
+    const created = registry.createFromCategoricalCodes(
+      {
+        key,
+        categories,
+        codes,
+        source: FieldSource.OBS,
+        meta
+      },
+      this
+    );
+    requireRecord(created, 'User-defined categorical creation result');
+    const createdId = requireIdentifier(
+      created.id,
+      'User-defined categorical creation id'
+    );
+    requireCategoryField(
+      created.field,
+      'User-defined categorical creation field'
+    );
     fields.push(created.field);
     const newFieldIndex = fields.length - 1;
     getFieldRegistry().invalidate();
     this._syncActiveContext();
-    this._notifyFieldChange(FieldSource.OBS, newFieldIndex, ChangeType.CREATE, { userDefinedId: created.id });
-    return { fieldIndex: newFieldIndex, key: newKey, updatedInPlace: false };
+    this._notifyFieldChange(
+      FieldSource.OBS,
+      newFieldIndex,
+      ChangeType.CREATE,
+      { userDefinedId: createdId }
+    );
+    return { fieldIndex: newFieldIndex, key, updatedInPlace: false };
   }
 }

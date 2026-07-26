@@ -4,7 +4,7 @@
  * Responsibilities (per session-serializer-plan.md):
  * - enumerate contributors in a fixed order
  * - capture chunks + write a single-file `.cellucid-session` bundle
- * - load manifest, apply eager chunks, then schedule lazy chunks
+ * - load manifest and apply eager/lazy chunks in one awaited restore operation
  * - integrate NotificationCenter progress tracking
  * - own cancellation (AbortController) and isolate failures
  *
@@ -16,14 +16,25 @@
 import { readBundle } from './bundle/reader.js';
 import { writeBundle } from './bundle/writer.js';
 import {
-  DEFAULT_MAX_UNCOMPRESSED_CHUNK_BYTES
+  MAX_UNCOMPRESSED_CHUNK_BYTES,
+  MAX_STORED_CHUNK_BYTES
 } from './bundle/format.js';
 import { gzipCompress, gzipDecompress } from './codecs/gzip.js';
 import {
   buildSessionContext,
+  createSessionRestoreTransaction,
   datasetFingerprintMatches,
   getDatasetFingerprint
 } from './session-context.js';
+import {
+  assertArray,
+  assertBoolean,
+  assertExactKeys,
+  assertNonEmptyString,
+  assertPlainRecord,
+  assertSafeInteger,
+  requireMethod
+} from './schema-contract.js';
 
 /**
  * @typedef {'eager'|'lazy'} ChunkPriority
@@ -39,7 +50,6 @@ import {
  * @property {string} label
  * @property {boolean} datasetDependent
  * @property {object|Uint8Array} payload
- * @property {string[]} [dependsOn]
  */
 
 /**
@@ -53,7 +63,7 @@ import {
  * @param {AbortSignal | null | undefined} signal
  */
 function throwIfAborted(signal) {
-  if (signal?.aborted) {
+  if (signal !== null && signal.aborted) {
     throw new DOMException('Aborted', 'AbortError');
   }
 }
@@ -89,41 +99,120 @@ function downloadBlob(blob, filename) {
  * Basic manifest shape validation (untrusted input).
  * @param {any} manifest
  */
-function validateManifest(manifest) {
-  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
-    throw new Error('Invalid session manifest (expected JSON object).');
+function validateManifest(manifest, contributorById) {
+  assertExactKeys(
+    manifest,
+    ['createdAt', 'datasetFingerprint', 'chunks'],
+    'Session manifest'
+  );
+  if (
+    typeof manifest.createdAt !== 'string'
+    || new Date(manifest.createdAt).toISOString() !== manifest.createdAt
+  ) {
+    throw new TypeError('Session manifest createdAt must be a canonical ISO timestamp.');
   }
-  if (!Array.isArray(manifest.chunks)) {
-    throw new Error('Invalid session manifest (missing chunks array).');
-  }
-  for (const entry of manifest.chunks) {
-    const id = entry?.id;
-    if (typeof id !== 'string' || !id) throw new Error('Invalid session manifest (chunk id missing).');
-    if (typeof entry.contributorId !== 'string' || !entry.contributorId) {
-      throw new Error(`Invalid session manifest (chunk contributorId missing): ${id}`);
+  datasetFingerprintMatches(
+    manifest.datasetFingerprint,
+    manifest.datasetFingerprint
+  );
+  assertArray(manifest.chunks, 'Session manifest chunks');
+  const chunkIds = new Set();
+  let sawLazy = false;
+  for (let index = 0; index < manifest.chunks.length; index++) {
+    const entry = manifest.chunks[index];
+    const context = `Session manifest chunk ${index}`;
+    assertExactKeys(
+      entry,
+      [
+        'id',
+        'contributorId',
+        'priority',
+        'kind',
+        'codec',
+        'label',
+        'datasetDependent',
+        'storedBytes',
+        'uncompressedBytes'
+      ],
+      context
+    );
+    const chunkId = assertNonEmptyString(entry.id, `${context} id`);
+    if (chunkIds.has(chunkId)) {
+      throw new TypeError(`Session manifest chunk id "${chunkId}" is duplicated.`);
+    }
+    chunkIds.add(chunkId);
+    const contributorId = assertNonEmptyString(
+      entry.contributorId,
+      `${context} contributorId`
+    );
+    if (!contributorById.has(contributorId)) {
+      throw new Error(
+        `Session contributor "${contributorId}" is not registered for chunk "${chunkId}".`
+      );
     }
     if (entry.priority !== 'eager' && entry.priority !== 'lazy') {
-      throw new Error(`Invalid session manifest (chunk priority): ${id}`);
+      throw new TypeError(`${context} priority must be eager or lazy.`);
+    }
+    if (entry.priority === 'lazy') {
+      sawLazy = true;
+    } else if (sawLazy) {
+      throw new TypeError('Session manifest eager chunks must precede lazy chunks.');
     }
     if (entry.kind !== 'json' && entry.kind !== 'binary') {
-      throw new Error(`Invalid session manifest (chunk kind): ${id}`);
+      throw new TypeError(`${context} kind must be json or binary.`);
     }
     if (entry.codec !== 'none' && entry.codec !== 'gzip') {
-      throw new Error(`Invalid session manifest (chunk codec): ${id}`);
+      throw new TypeError(`${context} codec must be none or gzip.`);
     }
-    if (typeof entry.label !== 'string') {
-      throw new Error(`Invalid session manifest (chunk label): ${id}`);
+    assertNonEmptyString(entry.label, `${context} label`);
+    assertBoolean(entry.datasetDependent, `${context} datasetDependent`);
+    assertSafeInteger(entry.storedBytes, `${context} storedBytes`, {
+      maximum: MAX_STORED_CHUNK_BYTES
+    });
+    assertSafeInteger(entry.uncompressedBytes, `${context} uncompressedBytes`, {
+      maximum: MAX_UNCOMPRESSED_CHUNK_BYTES
+    });
+  }
+  return manifest;
+}
+
+function assertJsonValue(value, context, ancestors = new Set()) {
+  if (
+    value === null
+    || typeof value === 'string'
+    || typeof value === 'boolean'
+  ) {
+    return value;
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      throw new TypeError(`${context} JSON numbers must be finite.`);
     }
-    if (typeof entry.datasetDependent !== 'boolean') {
-      throw new Error(`Invalid session manifest (chunk datasetDependent): ${id}`);
+    return value;
+  }
+  if (typeof value !== 'object') {
+    throw new TypeError(`${context} must contain only exact JSON values.`);
+  }
+  if (ancestors.has(value)) {
+    throw new TypeError(`${context} must not contain cyclic references.`);
+  }
+  ancestors.add(value);
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index++) {
+      if (!Object.hasOwn(value, index)) {
+        throw new TypeError(`${context} arrays must not contain holes.`);
+      }
+      assertJsonValue(value[index], `${context}[${index}]`, ancestors);
     }
-    if (typeof entry.storedBytes === 'number' && entry.storedBytes < 0) {
-      throw new Error(`Invalid session manifest (chunk storedBytes): ${id}`);
-    }
-    if (typeof entry.uncompressedBytes === 'number' && entry.uncompressedBytes < 0) {
-      throw new Error(`Invalid session manifest (chunk uncompressedBytes): ${id}`);
+  } else {
+    assertPlainRecord(value, context);
+    for (const [key, child] of Object.entries(value)) {
+      assertNonEmptyString(key, `${context} property name`);
+      assertJsonValue(child, `${context}.${key}`, ancestors);
     }
   }
+  ancestors.delete(value);
+  return value;
 }
 
 /**
@@ -132,6 +221,7 @@ function validateManifest(manifest) {
  * @returns {Uint8Array}
  */
 function encodeJsonBytes(value) {
+  assertJsonValue(value, 'Session JSON payload');
   return new TextEncoder().encode(JSON.stringify(value));
 }
 
@@ -141,7 +231,113 @@ function encodeJsonBytes(value) {
  * @returns {any}
  */
 function decodeJsonBytes(bytes) {
-  return JSON.parse(new TextDecoder().decode(bytes));
+  if (!(bytes instanceof Uint8Array)) {
+    throw new TypeError('Session JSON bytes must be a Uint8Array.');
+  }
+  const value = JSON.parse(
+    new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+  );
+  return assertJsonValue(value, 'Decoded session JSON payload');
+}
+
+function assertOwner(value, context) {
+  if (value === null || typeof value !== 'object') {
+    throw new TypeError(`${context} must be an object.`);
+  }
+  return value;
+}
+
+function assertNullableOwner(value, context) {
+  if (value === null) return value;
+  return assertOwner(value, context);
+}
+
+function assertAbortController(value, context) {
+  assertOwner(value, context);
+  requireMethod(value, 'abort', context);
+  if (
+    value.signal === null
+    || typeof value.signal !== 'object'
+    || typeof value.signal.aborted !== 'boolean'
+  ) {
+    throw new TypeError(`${context} must expose an AbortSignal.`);
+  }
+  return value;
+}
+
+function assertNotifications(value) {
+  assertOwner(value, 'Session notification owner');
+  for (const methodName of [
+    'startDownload',
+    'updateDownload',
+    'completeDownload',
+    'failDownload',
+    'info'
+  ]) {
+    requireMethod(value, methodName, 'Session notification owner');
+  }
+  return value;
+}
+
+function assertCapturedChunk(chunk, contributorId, chunkIds) {
+  const context = `Session contributor "${contributorId}" chunk`;
+  assertExactKeys(
+    chunk,
+    [
+      'id',
+      'contributorId',
+      'priority',
+      'kind',
+      'codec',
+      'label',
+      'datasetDependent',
+      'payload'
+    ],
+    context
+  );
+  const chunkId = assertNonEmptyString(chunk.id, `${context} id`);
+  if (chunkIds.has(chunkId)) {
+    throw new TypeError(`Session chunk id "${chunkId}" is duplicated.`);
+  }
+  chunkIds.add(chunkId);
+  if (chunk.contributorId !== contributorId) {
+    throw new TypeError(
+      `${context} contributorId must equal its current contributor id.`
+    );
+  }
+  if (chunk.priority !== 'eager' && chunk.priority !== 'lazy') {
+    throw new TypeError(`${context} priority must be eager or lazy.`);
+  }
+  if (chunk.kind !== 'json' && chunk.kind !== 'binary') {
+    throw new TypeError(`${context} kind must be json or binary.`);
+  }
+  if (chunk.codec !== 'none' && chunk.codec !== 'gzip') {
+    throw new TypeError(`${context} codec must be none or gzip.`);
+  }
+  assertNonEmptyString(chunk.label, `${context} label`);
+  assertBoolean(chunk.datasetDependent, `${context} datasetDependent`);
+  if (chunk.kind === 'json') {
+    assertJsonValue(chunk.payload, `${context} payload`);
+  } else if (!(chunk.payload instanceof Uint8Array)) {
+    throw new TypeError(`${context} binary payload must be a Uint8Array.`);
+  }
+  return chunk;
+}
+
+function failureMessage(error) {
+  if (!(error instanceof Error)) {
+    return 'Session operation threw a non-Error value.';
+  }
+  if (typeof error.message !== 'string' || error.message.length === 0) {
+    return error.name;
+  }
+  return error.message;
+}
+
+function preserveRestoreRollbackFailure(error, rollbackError) {
+  if (error instanceof Error && error.cause === undefined) {
+    error.cause = rollbackError;
+  }
 }
 
 export class SessionSerializer {
@@ -153,26 +349,68 @@ export class SessionSerializer {
    * @param {import('../../data/data-source-manager.js').DataSourceManager|null} [options.dataSourceManager]
    * @param {any|null} [options.comparisonModule]
    * @param {any|null} [options.analysisWindowManager]
-   * @param {SessionContributor[]} options.contributors
+  * @param {SessionContributor[]} options.contributors
    */
   constructor(options) {
+    assertExactKeys(
+      options,
+      [
+        'state',
+        'viewer',
+        'sidebar',
+        'dataSourceManager',
+        'comparisonModule',
+        'analysisWindowManager',
+        'cinematicCamera',
+        'contributors'
+      ],
+      'SessionSerializer options'
+    );
     this._base = {
-      state: options.state,
-      viewer: options.viewer,
-      sidebar: options.sidebar || null,
-      dataSourceManager: options.dataSourceManager || null,
-      comparisonModule: options.comparisonModule || null,
-      analysisWindowManager: options.analysisWindowManager || null,
-      cinematicCamera: options.cinematicCamera || null
+      state: assertOwner(options.state, 'SessionSerializer state'),
+      viewer: assertOwner(options.viewer, 'SessionSerializer viewer'),
+      sidebar: assertOwner(options.sidebar, 'SessionSerializer sidebar'),
+      dataSourceManager: assertNullableOwner(
+        options.dataSourceManager,
+        'SessionSerializer dataSourceManager'
+      ),
+      comparisonModule: assertNullableOwner(
+        options.comparisonModule,
+        'SessionSerializer comparisonModule'
+      ),
+      analysisWindowManager: assertNullableOwner(
+        options.analysisWindowManager,
+        'SessionSerializer analysisWindowManager'
+      ),
+      cinematicCamera: assertNullableOwner(
+        options.cinematicCamera,
+        'SessionSerializer cinematicCamera'
+      )
     };
 
     /** @type {SessionContributor[]} */
-    this._contributors = Array.isArray(options.contributors) ? options.contributors : [];
+    this._contributors = assertArray(
+      options.contributors,
+      'SessionSerializer contributors'
+    );
 
     /** @type {Map<string, SessionContributor>} */
     this._contributorById = new Map();
-    for (const c of this._contributors) {
-      if (c?.id) this._contributorById.set(c.id, c);
+    for (let index = 0; index < this._contributors.length; index++) {
+      const contributor = assertOwner(
+        this._contributors[index],
+        `Session contributor ${index}`
+      );
+      const contributorId = assertNonEmptyString(
+        contributor.id,
+        `Session contributor ${index} id`
+      );
+      requireMethod(contributor, 'capture', `Session contributor "${contributorId}"`);
+      requireMethod(contributor, 'restore', `Session contributor "${contributorId}"`);
+      if (this._contributorById.has(contributorId)) {
+        throw new TypeError(`Session contributor id "${contributorId}" is duplicated.`);
+      }
+      this._contributorById.set(contributorId, contributor);
     }
 
     /** @type {AbortController|null} */
@@ -185,26 +423,42 @@ export class SessionSerializer {
    * Update the analysis module references once it is initialized.
    * This avoids hard coupling to `main.js` bootstrap order.
    *
-   * @param {{ comparisonModule?: any, analysisWindowManager?: any }} refs
+   * @param {{ comparisonModule: object, analysisWindowManager: object }} refs
    */
-  setAnalysisRefs(refs = {}) {
-    if (refs.comparisonModule) this._base.comparisonModule = refs.comparisonModule;
-    if (refs.analysisWindowManager) this._base.analysisWindowManager = refs.analysisWindowManager;
+  setAnalysisRefs(refs) {
+    assertExactKeys(
+      refs,
+      ['comparisonModule', 'analysisWindowManager'],
+      'Session analysis references'
+    );
+    this._base.comparisonModule = assertOwner(
+      refs.comparisonModule,
+      'Session comparisonModule'
+    );
+    this._base.analysisWindowManager = assertOwner(
+      refs.analysisWindowManager,
+      'Session analysisWindowManager'
+    );
   }
 
   /**
    * Set the cinematic camera reference once the UI is initialized.
-   * @param {object|null} cinematicCamera
+   * @param {object} cinematicCamera
    */
   setCinematicCameraRef(cinematicCamera) {
-    if (cinematicCamera) this._base.cinematicCamera = cinematicCamera;
+    this._base.cinematicCamera = assertOwner(
+      cinematicCamera,
+      'Session cinematic camera'
+    );
   }
 
   /**
    * Cancel any in-flight restore (especially lazy chunk processing).
    */
   cancelRestore() {
-    try { this._activeRestoreAbort?.abort(); } catch { /* ignore */ }
+    if (this._activeRestoreAbort !== null) {
+      this._activeRestoreAbort.abort();
+    }
     this._activeRestoreAbort = null;
     this._activeLazyTask = null;
   }
@@ -214,17 +468,25 @@ export class SessionSerializer {
    * @returns {Promise<Blob>}
    */
   async createSessionBundle() {
-    const ctx = buildSessionContext(this._base, { abortSignal: null });
+    const ctx = buildSessionContext(this._base, {
+      abortSignal: null,
+      restoreTransaction: null
+    });
 
     /** @type {SessionChunk[]} */
     const emittedChunks = [];
+    const emittedChunkIds = new Set();
     for (const contributor of this._contributors) {
-      try {
-        const produced = await contributor.capture(ctx);
-        if (Array.isArray(produced)) emittedChunks.push(...produced);
-      } catch (err) {
-        // Capture failures should not block other contributors.
-        console.warn(`[SessionSerializer] Contributor capture failed (${contributor?.id}):`, err);
+      const produced = await contributor.capture(ctx);
+      if (!Array.isArray(produced)) {
+        throw new TypeError(
+          `Session contributor "${contributor.id}" capture() must return an array`
+        );
+      }
+      for (const chunk of produced) {
+        emittedChunks.push(
+          assertCapturedChunk(chunk, contributor.id, emittedChunkIds)
+        );
       }
     }
 
@@ -235,7 +497,7 @@ export class SessionSerializer {
     /** @type {SessionChunk[]} */
     const lazyChunks = [];
     for (const chunk of emittedChunks) {
-      if (chunk?.priority === 'lazy') lazyChunks.push(chunk);
+      if (chunk.priority === 'lazy') lazyChunks.push(chunk);
       else eagerChunks.push(chunk);
     }
     const orderedChunks = [...eagerChunks, ...lazyChunks];
@@ -247,27 +509,26 @@ export class SessionSerializer {
     const storedChunks = [];
 
     for (const chunk of orderedChunks) {
-      if (!chunk) continue;
-      if (typeof chunk.id !== 'string' || !chunk.id) throw new Error('Invalid chunk: missing id.');
-      if (typeof chunk.contributorId !== 'string' || !chunk.contributorId) throw new Error(`Invalid chunk: missing contributorId (${chunk.id}).`);
-      if (chunk.priority !== 'eager' && chunk.priority !== 'lazy') throw new Error(`Invalid chunk priority (${chunk.id}).`);
-      if (chunk.kind !== 'json' && chunk.kind !== 'binary') throw new Error(`Invalid chunk kind (${chunk.id}).`);
-      if (chunk.codec !== 'none' && chunk.codec !== 'gzip') throw new Error(`Invalid chunk codec (${chunk.id}).`);
-
       // Serialize payload to bytes.
       const uncompressedBytes =
         chunk.kind === 'json'
           ? encodeJsonBytes(chunk.payload)
-          : (chunk.payload instanceof Uint8Array ? chunk.payload : null);
-
-      if (!uncompressedBytes) {
-        throw new Error(`Invalid chunk payload for ${chunk.id} (expected ${chunk.kind}).`);
+          : chunk.payload;
+      if (uncompressedBytes.byteLength > MAX_UNCOMPRESSED_CHUNK_BYTES) {
+        throw new RangeError(
+          `Session chunk "${chunk.id}" exceeds the uncompressed byte limit.`
+        );
       }
 
       // Apply codec.
       const storedBytes = chunk.codec === 'gzip'
-        ? await gzipCompress(uncompressedBytes)
+        ? await gzipCompress(uncompressedBytes, { signal: null })
         : uncompressedBytes;
+      if (storedBytes.byteLength > MAX_STORED_CHUNK_BYTES) {
+        throw new RangeError(
+          `Session chunk "${chunk.id}" exceeds the stored byte limit.`
+        );
+      }
 
       storedChunks.push(storedBytes);
 
@@ -277,30 +538,29 @@ export class SessionSerializer {
         priority: chunk.priority,
         kind: chunk.kind,
         codec: chunk.codec,
-        label: chunk.label || chunk.id,
-        datasetDependent: chunk.datasetDependent === true,
+        label: chunk.label,
+        datasetDependent: chunk.datasetDependent,
         storedBytes: storedBytes.byteLength,
-        uncompressedBytes: uncompressedBytes.byteLength,
-        dependsOn: Array.isArray(chunk.dependsOn) ? chunk.dependsOn : undefined
+        uncompressedBytes: uncompressedBytes.byteLength
       });
     }
 
     const manifest = {
       createdAt: new Date().toISOString(),
-      dataSource: ctx.dataSourceManager?.getStateSnapshot?.() || null,
       datasetFingerprint: getDatasetFingerprint(ctx),
-      summary: null,
       chunks: manifestChunks
     };
 
+    validateManifest(manifest, this._contributorById);
     return writeBundle({ manifest, chunks: storedChunks });
   }
 
   /**
    * Download a `.cellucid-session` bundle.
-   * @param {string} [filename]
+   * @param {string} filename
    */
-  async downloadSession(filename = 'cellucid-session.cellucid-session') {
+  async downloadSession(filename) {
+    assertNonEmptyString(filename, 'Session download filename');
     const blob = await this.createSessionBundle();
     downloadBlob(blob, filename);
   }
@@ -308,296 +568,136 @@ export class SessionSerializer {
   /**
    * Show a file picker and progressively restore a session bundle.
    *
-   * Resolves after the eager stage completes. Lazy stage continues in the
-   * background (unless canceled).
+   * Resolves only after every selected session chunk has been restored.
    *
    * @returns {Promise<boolean>} True if a file was selected and restore started.
    */
   async loadSessionFromFile() {
     const file = await this._pickSessionFile();
-    if (!file) return false;
+    if (file === null) return false;
     await this.restoreFromBlob(file);
     return true;
   }
 
   /**
    * Restore a session from a Blob/File.
-   * Resolves after eager chunks complete; lazy continues in background.
+   * Resolves only after every selected session chunk has been restored.
    *
    * @param {Blob} blob
    * @returns {Promise<void>}
    */
   async restoreFromBlob(blob) {
-    const totalBytes = typeof blob?.size === 'number' ? blob.size : null;
-    await this._restoreFromBundleSource(blob, { totalBytes });
+    if (!(blob instanceof Blob)) {
+      throw new TypeError('Session restore source must be a Blob or File.');
+    }
+    const totalBytes = assertSafeInteger(
+      blob.size,
+      'Session restore Blob size'
+    );
+    await this._restoreFromBundleSource(blob, {
+      totalBytes,
+      notifications: null,
+      downloadId: null,
+      abortController: null
+    });
   }
 
   /**
    * Restore a session from a URL (fetch + streaming decode).
-   * Resolves after eager chunks complete; lazy continues in background.
+   * Resolves only after every selected session chunk has been restored.
    *
    * @param {string} url
-   * @param {{ cache?: RequestCache }} [options]
+   * @param {{ cache: RequestCache }} options
    * @returns {Promise<void>}
    */
-  async restoreFromUrl(url, options = {}) {
-    const target = String(url || '').trim();
-    if (!target) throw new Error('restoreFromUrl: url is required.');
+  async restoreFromUrl(url, options) {
+    const target = assertNonEmptyString(url, 'Session restore URL');
+    assertExactKeys(options, ['cache'], 'Session URL restore options');
+    const cacheModes = new Set([
+      'default',
+      'no-store',
+      'reload',
+      'no-cache',
+      'force-cache',
+      'only-if-cached'
+    ]);
+    if (!cacheModes.has(options.cache)) {
+      throw new TypeError('Session URL restore cache mode is invalid.');
+    }
 
     // Cancel any in-flight restore so we never interleave chunk application.
     this.cancelRestore();
     const abortController = new AbortController();
     this._activeRestoreAbort = abortController;
 
-    const ctx = buildSessionContext(this._base, { abortSignal: abortController.signal });
-    const notifications = ctx.notifications;
-
-    // Start an indeterminate "download" immediately; we'll upgrade to progress if we
-    // learn a Content-Length after the fetch response headers arrive.
-    const downloadId = notifications.startDownload('Loading session', null, {
-      onCancel: () => {
-        try { abortController.abort(); } catch { /* ignore */ }
-      }
+    const ctx = buildSessionContext(this._base, {
+      abortSignal: abortController.signal,
+      restoreTransaction: null
     });
+    const notifications = assertNotifications(ctx.notifications);
+
+    const downloadId = assertNonEmptyString(
+      notifications.startDownload('Loading session', null, {
+        onCancel: () => abortController.abort()
+      }),
+      'Session download notification id'
+    );
+    let delegatedToRestore = false;
 
     try {
-      const fetchFn = typeof ctx?.dataSourceManager?.fetch === 'function'
-        ? ctx.dataSourceManager.fetch.bind(ctx.dataSourceManager)
-        : fetch;
-
+      const fetchFn = requireMethod(
+        ctx.dataSourceManager,
+        'fetch',
+        'Session URL restore data source manager'
+      ).bind(ctx.dataSourceManager);
       const res = await fetchFn(target, {
         signal: abortController.signal,
-        cache: options.cache || 'no-store'
+        cache: options.cache
       });
-      if (!res?.ok) {
-        throw new Error(`Failed to fetch session (${res?.status || 'unknown'}): ${res?.statusText || target}`);
+      assertOwner(res, 'Session URL response');
+      if (res.ok !== true) {
+        assertSafeInteger(res.status, 'Session URL response status', {
+          minimum: 100,
+          maximum: 599
+        });
+        if (typeof res.statusText !== 'string') {
+          throw new TypeError('Session URL response statusText must be a string.');
+        }
+        throw new Error(
+          `Failed to fetch session (${res.status}): ${res.statusText}`
+        );
       }
-      if (!res.body || typeof res.body.getReader !== 'function') {
+      if (
+        res.body === null
+        || typeof res.body !== 'object'
+        || typeof res.body.getReader !== 'function'
+      ) {
         throw new Error('restoreFromUrl: fetch response has no readable body stream.');
       }
 
-      // NOTE:
-      // `Content-Length` is not always reliable for streamed responses in browsers.
-      // In particular, when servers apply `Content-Encoding` (gzip/br), browsers
-      // transparently decode the body stream but `Content-Length` can reflect the
-      // encoded byte length. Using it for strict EOF/bounds checks can cause false
-      // "truncated" errors (e.g., "Invalid chunk length ... > remaining ...").
-      //
-      // There's an additional CORS pitfall: `Content-Encoding` is not a safelisted
-      // response header, so it may be *present* but not visible to JS unless the
-      // server exposes it. In that case, we must assume encoding is unknown and
-      // avoid treating `Content-Length` as authoritative for parsing.
-      //
-      // We treat `Content-Length` as a progress hint only unless we're confident
-      // the body stream byte length matches it.
-      const responseType = String(res.type || '').trim().toLowerCase();
-      const contentEncodingHeader = res.headers?.get?.('Content-Encoding');
-      const contentEncoding = String(contentEncodingHeader || '').trim().toLowerCase();
-
-      const lenHeader = res.headers?.get?.('Content-Length') || null;
-      const totalBytesHint = lenHeader != null ? Number(lenHeader) : null;
-
-      const isCorsResponse = responseType === 'cors';
-      const canObserveContentEncoding = contentEncodingHeader != null;
-      const isIdentityEncoding = !contentEncoding || contentEncoding === 'identity';
-
-      // Only treat Content-Length as reliable when:
-      // - it's same-origin (Response.type !== 'cors') and there's no Content-Encoding header, OR
-      // - Content-Encoding is explicitly visible and identity.
-      const hasReliableContentLength = canObserveContentEncoding
-        ? isIdentityEncoding
-        : !isCorsResponse;
-
-      const totalBytesForUi = (hasReliableContentLength && Number.isFinite(totalBytesHint) && totalBytesHint > 0)
-        ? totalBytesHint
-        : null;
-
-      if (totalBytesForUi != null) {
-        try { notifications.updateDownload(downloadId, 0, totalBytesForUi); } catch { /* ignore */ }
-      }
-
-      // Present a Blob-like interface to the bundle reader so it can enforce
-      // file-length bounds when the stream length is reliable.
       const source = {
-        // Only provide a trusted size when the response is not content-encoded.
-        // For encoded responses, providing a size can break bundle parsing.
-        size: totalBytesForUi != null ? totalBytesForUi : undefined,
         stream: () => res.body
       };
-
+      delegatedToRestore = true;
       await this._restoreFromBundleSource(source, {
-        totalBytes: totalBytesForUi,
-        notificationsOverride: notifications,
-        downloadIdOverride: downloadId,
-        abortControllerOverride: abortController,
-        trustDatasetMatch: !!options.trustDatasetMatch
+        totalBytes: null,
+        notifications,
+        downloadId,
+        abortController
       });
     } catch (err) {
-      if (err?.name === 'AbortError') {
-        try { notifications.failDownload(downloadId, 'Session restore canceled.'); } catch { /* ignore */ }
-        return;
+      if (!delegatedToRestore) {
+        if (err instanceof Error && err.name === 'AbortError') {
+          notifications.failDownload(downloadId, 'Session restore canceled.');
+        } else {
+          notifications.failDownload(downloadId, failureMessage(err));
+        }
+        if (this._activeRestoreAbort === abortController) {
+          this._activeRestoreAbort = null;
+        }
       }
-      const msg = String(err?.message || err || 'unknown error');
-      try { notifications.failDownload(downloadId, msg); } catch { /* ignore */ }
       throw err;
     }
-  }
-
-  /**
-   * Restore the latest session bundle listed in `state-snapshots.json` under the
-   * current dataset exports directory.
-   *
-   * This preserves the legacy "auto-load from exports" workflow, but the files
-   * are now `.cellucid-session` bundles instead of JSON snapshots.
-   *
-   * @param {{ cache?: RequestCache }} [options]
-   * @returns {Promise<boolean>} True when a bundle was found and restore started.
-   */
-  async restoreLatestFromDatasetExports(options = {}) {
-    const urls = await this.listDatasetSessionBundles(options);
-    if (!urls.length) return false;
-    const target = urls[urls.length - 1];
-    // Sessions bundled in the dataset exports directory are authoritative for
-    // that dataset regardless of the sourceType/datasetId they were originally
-    // saved from (e.g. saved from local-user but deployed for local-demo).
-    await this.restoreFromUrl(target, { ...options, trustDatasetMatch: true });
-    return true;
-  }
-
-  /**
-   * List session bundles in the current dataset exports directory.
-   *
-   * Reads `state-snapshots.json` (manifest) if present and returns resolved URLs
-   * for `.cellucid-session` entries.
-   *
-   * @param {{ cache?: RequestCache }} [options]
-   * @returns {Promise<string[]>}
-   */
-  async listDatasetSessionBundles(options = {}) {
-    const dsm = this._base.dataSourceManager;
-    const baseUrlRaw = dsm?.getCurrentBaseUrl?.() || null;
-    if (!baseUrlRaw) {
-      console.warn('[SessionSerializer] Auto-load skipped: no dataset base URL (no active dataset?).');
-      return [];
-    }
-
-    const fetchFn = typeof dsm?.fetch === 'function' ? dsm.fetch.bind(dsm) : fetch;
-
-    // Resolve `state-snapshots.json` robustly even when `baseUrlRaw` is relative or
-    // lacks a trailing slash.
-    let manifestUrl = null;
-    try {
-      const base = new URL(
-        String(baseUrlRaw),
-        typeof window !== 'undefined' ? window.location?.href : undefined
-      );
-      if (!base.pathname.endsWith('/')) base.pathname = `${base.pathname}/`;
-      manifestUrl = new URL('state-snapshots.json', base).toString();
-    } catch {
-      const baseUrl = String(baseUrlRaw);
-      const baseWithSlash = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
-      manifestUrl = `${baseWithSlash}state-snapshots.json`;
-    }
-
-    /** @type {string[]} */
-    const candidates = [manifestUrl];
-
-    let res = null;
-    let payload = null;
-
-    for (const candidateUrl of candidates) {
-      res = null;
-      payload = null;
-      try {
-        res = await fetchFn(candidateUrl, { cache: options.cache || 'no-store' });
-      } catch (err) {
-        console.warn('[SessionSerializer] Failed to fetch state-snapshots.json:', candidateUrl, err);
-        continue;
-      }
-
-      if (!res?.ok) {
-        console.warn('[SessionSerializer] state-snapshots.json not available:', {
-          url: candidateUrl,
-          resolvedUrl: res?.url || null,
-          status: res?.status,
-          statusText: res?.statusText
-        });
-        continue;
-      }
-
-      try {
-        // Read as text so we can report useful diagnostics when JSON parsing fails.
-        const text = await res.text();
-        payload = JSON.parse(text);
-        manifestUrl = candidateUrl;
-        break;
-      } catch (err) {
-        const contentType = res.headers?.get?.('Content-Type') || null;
-        console.warn('[SessionSerializer] Failed to parse state-snapshots.json (expected JSON):', {
-          url: candidateUrl,
-          resolvedUrl: res.url || null,
-          contentType,
-          error: err
-        });
-        continue;
-      }
-    }
-
-    if (!payload || !res) return [];
-
-    const entries = Array.isArray(payload)
-      ? payload
-      : payload?.states || payload?.files || payload?.snapshots || [];
-    if (!Array.isArray(entries) || entries.length === 0) {
-      console.warn('[SessionSerializer] state-snapshots.json has no entries:', {
-        url: manifestUrl,
-        resolvedUrl: res.url || null
-      });
-      return [];
-    }
-
-    /** @type {string[]} */
-    const out = [];
-    const seen = new Set();
-
-    // Prefer the fetch-resolved response URL (handles redirects). Fall back to
-    // the computed manifest URL.
-    const baseForResolve = String(res?.url || manifestUrl);
-
-    for (const entry of entries) {
-      const entryPath = typeof entry === 'string'
-        ? entry
-        : entry?.url || entry?.path || entry?.href || entry?.file || entry?.filename || entry?.name;
-      if (!entryPath) continue;
-
-      const entryText = String(entryPath).trim();
-      if (!entryText) continue;
-
-      const entrySansQuery = entryText.split('?')[0].split('#')[0];
-      const filename = entrySansQuery.split('/').pop() || '';
-      if (!/\.cellucid-session$/i.test(filename)) continue;
-
-      let abs = null;
-      try {
-        abs = new URL(entryText, baseForResolve).toString();
-      } catch {
-        abs = entryText;
-      }
-
-      if (seen.has(abs)) continue;
-      seen.add(abs);
-      out.push(abs);
-    }
-
-    if (out.length === 0) {
-      console.warn('[SessionSerializer] state-snapshots.json contained no .cellucid-session entries:', {
-        url: manifestUrl,
-        resolvedUrl: res.url || null,
-        entryCount: entries.length
-      });
-    }
-
-    return out;
   }
 
   /**
@@ -605,54 +705,73 @@ export class SessionSerializer {
    * Blob-like `{ size, stream() }` object).
    *
    * @param {any} source
-   * @param {{ totalBytes?: number|null, notificationsOverride?: any, downloadIdOverride?: string|null, abortControllerOverride?: AbortController|null, trustDatasetMatch?: boolean }} [options]
+   * @param {{ totalBytes: number|null, notifications: object|null, downloadId: string|null, abortController: AbortController|null }} options
    * @returns {Promise<void>}
    */
-  async _restoreFromBundleSource(source, options = {}) {
-    const abortController = options.abortControllerOverride || new AbortController();
-    // Cancel any in-flight restore so we never interleave chunk application.
-    // If the caller provided an AbortController, only cancel when it differs
-    // from the current active controller (otherwise we'd abort ourselves).
-    if (this._activeRestoreAbort && this._activeRestoreAbort !== abortController) {
+  async _restoreFromBundleSource(source, options) {
+    assertExactKeys(
+      options,
+      ['totalBytes', 'notifications', 'downloadId', 'abortController'],
+      'Session restore options'
+    );
+    const totalBytes = options.totalBytes === null
+      ? null
+      : assertSafeInteger(options.totalBytes, 'Session restore totalBytes');
+    const providedNotifications = options.notifications === null
+      ? null
+      : assertNotifications(options.notifications);
+    const providedDownloadId = options.downloadId === null
+      ? null
+      : assertNonEmptyString(options.downloadId, 'Session download notification id');
+    const abortController = options.abortController === null
+      ? new AbortController()
+      : assertAbortController(
+        options.abortController,
+        'Session restore AbortController'
+      );
+
+    if (
+      this._activeRestoreAbort !== null
+      && this._activeRestoreAbort !== abortController
+    ) {
       this.cancelRestore();
     }
     this._activeRestoreAbort = abortController;
 
-    const ctx = buildSessionContext(this._base, { abortSignal: abortController.signal });
-    const notifications = options.notificationsOverride || ctx.notifications;
+    const restoreTransaction = createSessionRestoreTransaction();
+    const ctx = buildSessionContext(this._base, {
+      abortSignal: abortController.signal,
+      restoreTransaction
+    });
+    const notifications = providedNotifications === null
+      ? assertNotifications(ctx.notifications)
+      : providedNotifications;
 
     // Progress UI: treat the session file as a "download" so we can reuse the
     // existing progress + speed UI in NotificationCenter.
-    const totalBytes = typeof options.totalBytes === 'number'
-      ? options.totalBytes
-      : (typeof source?.size === 'number' ? source.size : null);
-
-    const downloadId = options.downloadIdOverride || notifications.startDownload('Loading session', totalBytes, {
-      onCancel: () => {
-        try { abortController.abort(); } catch { /* ignore */ }
-      }
-    });
+    const downloadId = providedDownloadId === null
+      ? assertNonEmptyString(
+        notifications.startDownload('Loading session', totalBytes, {
+          onCancel: () => abortController.abort()
+        }),
+        'Session download notification id'
+      )
+      : providedDownloadId;
 
     try {
       const { manifest, chunkStream } = await readBundle(source, {
         signal: abortController.signal,
-        onProgress: (loaded) => {
-          try { notifications.updateDownload(downloadId, loaded, totalBytes); } catch { /* ignore */ }
-        }
+        onProgress: (loaded) =>
+          notifications.updateDownload(downloadId, loaded, totalBytes)
       });
 
-      validateManifest(manifest);
+      validateManifest(manifest, this._contributorById);
 
       const currentFp = getDatasetFingerprint(ctx);
       const fileFp = manifest.datasetFingerprint;
-      const datasetMatches = options.trustDatasetMatch || datasetFingerprintMatches(fileFp, currentFp);
-
-      if (!datasetMatches) {
-        const saved = `${fileFp?.sourceType || 'unknown'}:${fileFp?.datasetId || 'unknown'}`;
-        const current = `${currentFp?.sourceType || 'unknown'}:${currentFp?.datasetId || 'unknown'}`;
-        notifications.warning(
-          `Session dataset mismatch (${saved} ≠ ${current}). Restoring only dataset-agnostic layout.`,
-          { category: 'session' }
+      if (!datasetFingerprintMatches(fileFp, currentFp)) {
+        throw new RangeError(
+          'Session dataset mismatch: the complete saved dataset identity does not match the current dataset.'
         );
       }
 
@@ -662,45 +781,38 @@ export class SessionSerializer {
       // Helper that decodes a chunk payload and dispatches to its contributor.
       const applyChunk = async (meta, storedBytes) => {
         throwIfAborted(abortController.signal);
-
-        if (!meta || typeof meta !== 'object') return;
-        if (!datasetMatches && meta.datasetDependent === true) return; // skip dataset-dependent chunks on mismatch
-
-        const contributor = this._contributorById.get(meta.contributorId) || null;
-        if (!contributor) {
-          console.warn(`[SessionSerializer] No contributor registered for '${meta.contributorId}'. Skipping chunk '${meta.id}'.`);
-          return;
+        assertPlainRecord(meta, 'Session restore chunk metadata');
+        if (!(storedBytes instanceof Uint8Array)) {
+          throw new TypeError('Session restore chunk bytes must be a Uint8Array.');
         }
 
-        // Decode codec.
-        // NOTE: `uncompressedBytes` comes from an untrusted file. Treat it as a
-        // hint and always enforce a hard cap to avoid zip-bomb allocations.
-        const declaredUncompressedBytes =
-          typeof meta.uncompressedBytes === 'number' ? meta.uncompressedBytes : null;
-        const maxOut = declaredUncompressedBytes != null
-          ? Math.min(declaredUncompressedBytes, DEFAULT_MAX_UNCOMPRESSED_CHUNK_BYTES)
-          : DEFAULT_MAX_UNCOMPRESSED_CHUNK_BYTES;
+        const contributor = this._contributorById.get(meta.contributorId);
+        if (contributor === undefined) {
+          throw new Error(
+            `Session contributor "${meta.contributorId}" is not registered ` +
+            `for chunk "${meta.id}"`
+          );
+        }
 
-        let decodedBytes = null;
+        let decodedBytes;
         if (meta.codec === 'gzip') {
-          decodedBytes = await gzipDecompress(storedBytes, { maxOutputBytes: maxOut, signal: abortController.signal });
+          decodedBytes = await gzipDecompress(storedBytes, {
+            maxOutputBytes: meta.uncompressedBytes,
+            signal: abortController.signal
+          });
         } else {
-          // For uncompressed chunks, enforce the same guard (large sessions should gzip + chunk).
-          if (storedBytes.byteLength > maxOut) {
-            throw new Error(`Chunk '${meta.id}' exceeds size limit (${storedBytes.byteLength} > ${maxOut} bytes).`);
-          }
           decodedBytes = storedBytes;
+        }
+        if (decodedBytes.byteLength !== meta.uncompressedBytes) {
+          throw new Error(
+            `Session chunk "${meta.id}" uncompressed byte length does not match its manifest.`
+          );
         }
 
         // Decode kind.
         const payload = meta.kind === 'json' ? decodeJsonBytes(decodedBytes) : decodedBytes;
 
-        try {
-          await contributor.restore(ctx, meta, payload);
-        } catch (err) {
-          // Chunk failures should not brick the session; isolate errors.
-          console.warn(`[SessionSerializer] Failed to restore chunk '${meta.id}' (${meta.contributorId}):`, err);
-        }
+        await contributor.restore(ctx, meta, payload);
       };
 
       // EAGER stage: process until the first lazy chunk (or EOF).
@@ -709,76 +821,74 @@ export class SessionSerializer {
         throwIfAborted(abortController.signal);
         const { value, done } = await iterator.next();
         if (done) break;
-        const meta = value?.meta;
-        if (meta?.priority === 'lazy') {
+        assertExactKeys(
+          value,
+          ['index', 'meta', 'bytes'],
+          'Session streamed chunk'
+        );
+        assertSafeInteger(value.index, 'Session streamed chunk index');
+        if (value.meta.priority === 'lazy') {
           firstLazy = value;
           break;
         }
-        await applyChunk(meta, value.bytes);
+        await applyChunk(value.meta, value.bytes);
       }
 
-      // Lazy stage in background (if any).
+      // Apply the lazy stage in the same public restore operation. Yielding
+      // between chunks keeps the browser responsive without creating a second
+      // failure channel after restoreFromBlob()/restoreFromUrl() has resolved.
       if (firstLazy) {
         const lazyTask = (async () => {
-          try {
-            await applyChunk(firstLazy.meta, firstLazy.bytes);
-            // Process remaining chunks one at a time, yielding between chunks.
-            while (true) {
-              throwIfAborted(abortController.signal);
-              const { value, done } = await iterator.next();
-              if (done) break;
-              await nextTick();
-              await applyChunk(value.meta, value.bytes);
-            }
-          } finally {
-            // Completion is handled by the outer try/catch/finally below.
+          await applyChunk(firstLazy.meta, firstLazy.bytes);
+          while (true) {
+            throwIfAborted(abortController.signal);
+            const { value, done } = await iterator.next();
+            if (done) break;
+            await nextTick();
+            assertExactKeys(
+              value,
+              ['index', 'meta', 'bytes'],
+              'Session streamed chunk'
+            );
+            assertSafeInteger(value.index, 'Session streamed chunk index');
+            await applyChunk(value.meta, value.bytes);
           }
         })();
         this._activeLazyTask = lazyTask;
-
-        lazyTask.finally(() => {
-          // Clear only if this restore is still the active one (avoid clobbering
-          // state for a newer restore).
-          if (this._activeLazyTask === lazyTask) this._activeLazyTask = null;
-          if (this._activeRestoreAbort === abortController) this._activeRestoreAbort = null;
-        });
+        try {
+          await lazyTask;
+        } finally {
+          if (this._activeLazyTask === lazyTask) {
+            this._activeLazyTask = null;
+          }
+        }
       } else {
         this._activeLazyTask = null;
       }
 
-      // Eager stage is done; allow UI refresh callbacks to run immediately.
-      notifications.info('Session restored (eager stage complete).', { category: 'session', duration: 2200 });
-
-      // Wait for lazy stage to finish only for progress completion; do not block the caller.
-      const lazyTask = this._activeLazyTask;
-      if (lazyTask) {
-        lazyTask.then(
-          () => {
-            try { notifications.completeDownload(downloadId, 'Session fully restored.'); } catch { /* ignore */ }
-          },
-          (err) => {
-            if (err?.name === 'AbortError') {
-              try { notifications.failDownload(downloadId, 'Session restore canceled.'); } catch { /* ignore */ }
-            } else {
-              const msg = String(err?.message || err || 'unknown error');
-              try { notifications.failDownload(downloadId, `Session restore failed: ${msg}`); } catch { /* ignore */ }
-            }
-          }
-        );
-      } else {
-        // No lazy stage: the entire file has been consumed already.
-        try { notifications.completeDownload(downloadId, 'Session fully restored.'); } catch { /* ignore */ }
-        if (this._activeRestoreAbort === abortController) this._activeRestoreAbort = null;
+      restoreTransaction.commit();
+      notifications.info('Session fully restored.', {
+        category: 'session',
+        duration: 2200
+      });
+      notifications.completeDownload(downloadId, 'Session fully restored.');
+      if (this._activeRestoreAbort === abortController) {
+        this._activeRestoreAbort = null;
       }
     } catch (err) {
-      if (err?.name === 'AbortError') {
-        try { notifications.failDownload(downloadId, 'Session restore canceled.'); } catch { /* ignore */ }
-        if (this._activeRestoreAbort === abortController) this._activeRestoreAbort = null;
-        return;
+      try {
+        restoreTransaction.rollback();
+      } catch (rollbackError) {
+        preserveRestoreRollbackFailure(err, rollbackError);
       }
-      const msg = String(err?.message || err || 'unknown error');
-      try { notifications.failDownload(downloadId, msg); } catch { /* ignore */ }
-      if (this._activeRestoreAbort === abortController) this._activeRestoreAbort = null;
+      if (err instanceof Error && err.name === 'AbortError') {
+        notifications.failDownload(downloadId, 'Session restore canceled.');
+      } else {
+        notifications.failDownload(downloadId, failureMessage(err));
+      }
+      if (this._activeRestoreAbort === abortController) {
+        this._activeRestoreAbort = null;
+      }
       throw err;
     }
   }
@@ -788,31 +898,10 @@ export class SessionSerializer {
    * @returns {Promise<File|null>}
    */
   async _pickSessionFile() {
-    // Prefer the File System Access API when available because it provides a
-    // reliable cancellation signal (rejects with AbortError).
-    if (typeof window !== 'undefined' && typeof window.showOpenFilePicker === 'function') {
-      try {
-        const handles = await window.showOpenFilePicker({
-          multiple: false,
-          types: [
-            {
-              description: 'Cellucid session bundle',
-              accept: { 'application/octet-stream': ['.cellucid-session'] }
-            }
-          ]
-        });
-        const handle = Array.isArray(handles) ? handles[0] : null;
-        if (!handle?.getFile) return null;
-        return await handle.getFile();
-      } catch (err) {
-        if (err?.name === 'AbortError') return null;
-        throw err;
-      }
-    }
-
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       const input = document.createElement('input');
       input.type = 'file';
+      input.multiple = false;
       input.accept = '.cellucid-session,application/octet-stream';
       input.style.position = 'fixed';
       input.style.left = '-10000px';
@@ -822,52 +911,30 @@ export class SessionSerializer {
 
       let settled = false;
       const cleanup = () => {
-        try { input.remove(); } catch { /* ignore */ }
+        input.remove();
       };
 
-      const settle = (file) => {
+      const settle = (file, error = null) => {
         if (settled) return;
         settled = true;
         cleanup();
-        resolve(file);
+        if (error !== null) reject(error);
+        else resolve(file);
       };
 
-      // Standard selection path.
-      input.addEventListener('change', (e) => {
-        const file = e.target?.files?.[0] || null;
-        settle(file);
+      input.addEventListener('change', () => {
+        if (input.files === null) {
+          settle(null, new TypeError('Session file input did not publish a FileList.'));
+          return;
+        }
+        if (input.files.length > 1) {
+          settle(null, new TypeError('Session file input published more than one file.'));
+          return;
+        }
+        settle(input.files.length === 1 ? input.files[0] : null);
       }, { once: true });
 
-      // Some browsers support `cancel` on file inputs.
-      input.addEventListener?.('cancel', () => settle(null), { once: true });
-      input.oncancel = () => settle(null);
-
-      // Best-effort cancellation: when the picker closes without a selection,
-      // `change` doesn't fire. When focus returns, settle with null.
-      window.addEventListener('focus', () => {
-        // Some browsers update `input.files` after focus returns, but before
-        // dispatching `change`. Poll briefly to avoid settling null too early.
-        const maxChecks = 25;
-        const intervalMs = 80;
-        let checks = 0;
-
-        const poll = () => {
-          if (settled) return;
-          const file = input.files?.[0] || null;
-          if (file) {
-            settle(file);
-            return;
-          }
-          checks += 1;
-          if (checks >= maxChecks) {
-            settle(null);
-            return;
-          }
-          setTimeout(poll, intervalMs);
-        };
-
-        setTimeout(poll, 0);
-      }, { once: true });
+      input.addEventListener('cancel', () => settle(null), { once: true });
 
       input.click();
     });

@@ -1,8 +1,8 @@
 /**
- * @fileoverview PNG metadata embedding (tEXt chunks) for figure export.
+ * @fileoverview PNG metadata embedding (UTF-8 iTXt chunks) for figure export.
  *
- * Browsers don't provide a native way to write PNG tEXt metadata via Canvas,
- * so we post-process the encoded PNG and inject standard tEXt chunks.
+ * Browsers don't provide a native way to write PNG iTXt metadata via Canvas,
+ * so we post-process the encoded PNG and inject standard UTF-8 iTXt chunks.
  *
  * This is only executed on export and does not affect the render loop.
  *
@@ -59,25 +59,17 @@ function crc32(bytes) {
   return (c ^ 0xffffffff) >>> 0;
 }
 
-function asciiBytes(str) {
-  const s = String(str || '');
-  const out = new Uint8Array(s.length);
-  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i) & 0xff;
-  return out;
-}
-
-function latin1Bytes(str) {
-  const s = String(str || '');
-  const out = new Uint8Array(s.length);
-  for (let i = 0; i < s.length; i++) {
-    const code = s.charCodeAt(i);
-    out[i] = code <= 255 ? code : 63; // '?'
+function asciiBytes(value, context) {
+  if (typeof value !== 'string' || !/^[\x20-\x7e]+$/.test(value)) {
+    throw new TypeError(`${context} must be a non-empty printable ASCII string.`);
   }
+  const out = new Uint8Array(value.length);
+  for (let i = 0; i < value.length; i++) out[i] = value.charCodeAt(i);
   return out;
 }
 
 function makeChunk(type, data) {
-  const typeBytes = asciiBytes(type);
+  const typeBytes = asciiBytes(type, 'PNG chunk type');
   const length = data.length >>> 0;
   const out = new Uint8Array(4 + 4 + length + 4);
   writeU32BE(out, 0, length);
@@ -89,58 +81,91 @@ function makeChunk(type, data) {
 }
 
 /**
- * Build a tEXt chunk.
- * Keyword must be 1..79 bytes and Latin-1; we sanitize to ASCII.
+ * Build an uncompressed UTF-8 iTXt chunk.
+ * Keyword must already be 1..79 printable ASCII bytes.
  */
 function makeTextChunk(keyword, text) {
-  const keyRaw = String(keyword || '').trim() || 'Comment';
-  const key = keyRaw.replace(/[^\x20-\x7E]/g, '').slice(0, 79) || 'Comment';
-  const keyBytes = asciiBytes(key);
-  const textBytes = latin1Bytes(String(text ?? ''));
-  const data = new Uint8Array(keyBytes.length + 1 + textBytes.length);
+  if (
+    typeof keyword !== 'string' ||
+    keyword.length < 1 ||
+    keyword.length > 79
+  ) {
+    throw new TypeError('PNG metadata keyword must contain 1 through 79 characters.');
+  }
+  if (typeof text !== 'string' || text.length === 0) {
+    throw new TypeError('PNG metadata text must be a non-empty string.');
+  }
+  const keyBytes = asciiBytes(keyword, 'PNG metadata keyword');
+  const textBytes = new TextEncoder().encode(text);
+  const data = new Uint8Array(keyBytes.length + 5 + textBytes.length);
   data.set(keyBytes, 0);
   data[keyBytes.length] = 0;
-  data.set(textBytes, keyBytes.length + 1);
-  return makeChunk('tEXt', data);
+  data[keyBytes.length + 1] = 0;
+  data[keyBytes.length + 2] = 0;
+  data[keyBytes.length + 3] = 0;
+  data[keyBytes.length + 4] = 0;
+  data.set(textBytes, keyBytes.length + 5);
+  return makeChunk('iTXt', data);
 }
 
 /**
- * Inject PNG tEXt chunks before IEND.
+ * Inject PNG iTXt chunks before IEND.
  *
  * @param {Blob} blob
  * @param {Record<string, string>} textMap
  * @returns {Promise<Blob>}
  */
 export async function embedPngTextChunks(blob, textMap) {
-  if (!blob) return blob;
-  let bytes;
-  try {
-    bytes = new Uint8Array(await blob.arrayBuffer());
-  } catch {
-    return blob;
+  if (!(blob instanceof Blob) || blob.type !== 'image/png') {
+    throw new TypeError('PNG metadata input must be an image/png Blob.');
   }
-  if (!isPng(bytes)) return blob;
+  if (
+    textMap === null ||
+    typeof textMap !== 'object' ||
+    Array.isArray(textMap) ||
+    Object.getPrototypeOf(textMap) !== Object.prototype
+  ) {
+    throw new TypeError('PNG metadata must be a plain object.');
+  }
+  const entries = Object.entries(textMap);
+  if (entries.length === 0) {
+    throw new TypeError('PNG metadata must contain at least one entry.');
+  }
+
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  if (!isPng(bytes)) {
+    throw new Error('PNG metadata input has an invalid PNG signature.');
+  }
 
   // Locate IEND.
   let offset = 8;
   let iendOffset = -1;
   while (offset + 8 <= bytes.length) {
     const len = readU32BE(bytes, offset);
+    if (len > bytes.length - offset - 12) {
+      throw new Error('PNG metadata input contains a truncated chunk.');
+    }
     const type = String.fromCharCode(bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7]);
     const chunkSize = 12 + len;
-    if (offset + chunkSize > bytes.length) break;
+    const expectedCrc = readU32BE(bytes, offset + 8 + len);
+    const actualCrc = crc32(bytes.subarray(offset + 4, offset + 8 + len));
+    if (expectedCrc !== actualCrc) {
+      throw new Error(`PNG metadata input contains an invalid ${type} chunk CRC.`);
+    }
     if (type === 'IEND') {
+      if (len !== 0 || offset + chunkSize !== bytes.length) {
+        throw new Error('PNG metadata input contains an invalid IEND chunk.');
+      }
       iendOffset = offset;
       break;
     }
     offset += chunkSize;
   }
-  if (iendOffset < 0) return blob;
+  if (iendOffset < 0) {
+    throw new Error('PNG metadata input has no IEND chunk.');
+  }
 
-  const entries = Object.entries(textMap || {}).filter(([k, v]) => k && v != null && String(v).length);
-  if (!entries.length) return blob;
-
-  const chunks = entries.map(([k, v]) => makeTextChunk(k, String(v)));
+  const chunks = entries.map(([keyword, text]) => makeTextChunk(keyword, text));
   const insertLen = chunks.reduce((sum, c) => sum + c.length, 0);
 
   const out = new Uint8Array(bytes.length + insertLen);
@@ -154,4 +179,3 @@ export async function embedPngTextChunks(blob, textMap) {
 
   return new Blob([out], { type: 'image/png' });
 }
-

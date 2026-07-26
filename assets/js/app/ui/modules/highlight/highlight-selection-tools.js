@@ -16,6 +16,62 @@ import { initLassoSelection } from './lasso-selection.js';
 import { initProximitySelection } from './proximity-selection.js';
 import { initKnnSelection } from './knn-selection.js';
 import { initContinuousSelectionPreview } from './continuous-selection-preview.js';
+import {
+  requireCallback,
+  requireDomElement,
+  requireExactKeys,
+  requireJupyterSource,
+  requireMethods,
+  requireModeButtons
+} from './exact-contract.js';
+
+const REQUIRED_SELECTION_STATE_METHODS = Object.freeze([
+  'addHighlightDirect',
+  'clearPreviewHighlight',
+  'getActiveField',
+  'getActiveViewId',
+  'getCategoryForCell',
+  'getCellIndicesForCategory',
+  'getCellIndicesForRange',
+  'getHighlightedGroups',
+  'getValueForCell',
+  'on',
+  'setPreviewHighlightFromIndices'
+]);
+
+const REQUIRED_SELECTION_VIEWER_METHODS = Object.freeze([
+  'cancelAnnotationSelection',
+  'cancelKnnSelection',
+  'cancelLassoSelection',
+  'cancelProximitySelection',
+  'cancelUnifiedSelection',
+  'confirmAnnotationSelection',
+  'confirmKnnSelection',
+  'confirmLassoSelection',
+  'confirmProximitySelection',
+  'getUnifiedSelectionState',
+  'getViewTransparency',
+  'onLodChanged',
+  'restoreKnnState',
+  'restoreLassoState',
+  'restoreProximityState',
+  'restoreUnifiedState',
+  'setKnnCallback',
+  'setKnnEnabled',
+  'setKnnPreviewCallback',
+  'setKnnStepCallback',
+  'setLassoCallback',
+  'setLassoEnabled',
+  'setLassoPreviewCallback',
+  'setLassoStepCallback',
+  'setProximityCallback',
+  'setProximityEnabled',
+  'setProximityPreviewCallback',
+  'setProximityStepCallback',
+  'setSelectionPreviewCallback',
+  'setSelectionStepCallback',
+  'updateHighlight'
+]);
 
 /**
  * @param {object} options
@@ -28,20 +84,61 @@ import { initContinuousSelectionPreview } from './continuous-selection-preview.j
  * @param {() => void} options.renderHighlightSummary
  * @param {() => void} options.renderHighlightPages
  */
-export function initHighlightSelectionTools({
-  state,
-  viewer,
-  jupyterSource = null,
-  dom,
-  renderHighlightSummary,
-  renderHighlightPages
-}) {
+export function initHighlightSelectionTools(options) {
+  requireExactKeys(
+    options,
+    [
+      'state',
+      'viewer',
+      'jupyterSource',
+      'dom',
+      'renderHighlightSummary',
+      'renderHighlightPages'
+    ],
+    'Highlight selection tools options'
+  );
+  const {
+    state,
+    viewer,
+    jupyterSource,
+    dom,
+    renderHighlightSummary,
+    renderHighlightPages
+  } = options;
+  requireMethods(
+    state,
+    'Highlight selection state owner',
+    REQUIRED_SELECTION_STATE_METHODS
+  );
+  requireMethods(
+    viewer,
+    'Highlight selection viewer',
+    REQUIRED_SELECTION_VIEWER_METHODS
+  );
+  requireJupyterSource(jupyterSource);
+  requireCallback(renderHighlightSummary, 'Highlight summary renderer');
+  requireCallback(renderHighlightPages, 'Highlight pages renderer');
+  requireExactKeys(
+    dom,
+    ['modeButtons', 'modeDescription'],
+    'Highlight selection DOM'
+  );
+  requireModeButtons(dom.modeButtons);
+  requireDomElement(
+    dom.modeDescription,
+    'Highlight mode description'
+  );
+  requireDomElement(
+    dom.modeDescription.parentElement,
+    'Highlight mode description parent',
+    ['appendChild']
+  );
   const selectionState = createHighlightSelectionState();
 
   const { show: showRangeLabel, hide: hideRangeLabel } = getSelectionRangeLabel();
 
   const ui = {
-    modeDescriptionEl: dom?.modeDescription || null,
+    modeDescriptionEl: dom.modeDescription,
     showRangeLabel,
     hideRangeLabel
   };
@@ -96,18 +193,17 @@ export function initHighlightSelectionTools({
   });
 
   const modeUi = initHighlightModeUI({
-    state,
     viewer,
     dom: {
-      modeButtons: dom?.modeButtons || null,
+      modeButtons: dom.modeButtons,
       modeDescription: ui.modeDescriptionEl
     },
     selectionState,
-    stepHandlers: {
-      handleAnnotationStep: annotation.handleAnnotationStep,
-      handleLassoStep: lasso.handleLassoStep,
-      handleProximityStep: proximity.handleProximityStep,
-      handleKnnStep: knn.handleKnnStep
+    modeHandlers: {
+      restoreAnnotationSelection: annotation.restoreAnnotationSelection,
+      restoreLassoSelection: lasso.restoreLassoSelection,
+      restoreProximitySelection: proximity.restoreProximitySelection,
+      restoreKnnSelection: knn.restoreKnnSelection
     }
   });
 
@@ -115,7 +211,7 @@ export function initHighlightSelectionTools({
     selectionState,
     modeUi,
     destroy: () => {
-      sync.destroy?.();
+      sync.destroy();
     }
   };
 }

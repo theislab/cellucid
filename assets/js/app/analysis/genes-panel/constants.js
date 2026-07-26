@@ -169,29 +169,14 @@ export const ERROR_MESSAGES = {
   GENE_NOT_FOUND:
     'Gene "{symbol}" not found in dataset. Check spelling or try another gene.',
 
-  GENES_NOT_FOUND:
-    '{count} genes not found: {genes}. These will be skipped.',
-
-  COMPUTATION_FAILED:
-    'Analysis failed: {reason}. Try reducing batch size or memory budget.',
-
-  NETWORK_ERROR:
-    'Failed to load gene data. Check connection and retry.',
-
   EMPTY_RESULTS:
     'No significant markers found with current thresholds. Try relaxing p-value ({pValue}) or fold change ({fc}) cutoffs.',
 
   CANCELLED:
     'Analysis cancelled by user.',
 
-  CACHE_ERROR:
-    'Cache operation failed. Results will be recomputed next time.',
-
   MEMORY_PRESSURE:
-    'Low memory detected. Analysis may be slower to avoid crashes.',
-
-  CLUSTERING_FAILED:
-    'Clustering failed for {reason}. Showing unclustered results.'
+    'Low memory detected. The analysis cannot continue within the configured memory budget.'
 };
 
 /**
@@ -206,8 +191,21 @@ export const ERROR_MESSAGES = {
  * // 'Group "T cells" has only 5 cells. Minimum required: 10.'
  */
 export function formatError(template, vars = {}) {
+  if (typeof template !== 'string' || template.length === 0) {
+    throw new TypeError('Error template must be a non-empty string');
+  }
+  if (!vars || typeof vars !== 'object' || Array.isArray(vars)) {
+    throw new TypeError('Error template variables must be an object');
+  }
   return template.replace(/\{(\w+)\}/g, (match, key) => {
-    return vars[key] !== undefined ? String(vars[key]) : match;
+    if (!Object.hasOwn(vars, key)) {
+      throw new TypeError(`Missing error template variable: ${key}`);
+    }
+    const value = vars[key];
+    if (!['string', 'number', 'boolean'].includes(typeof value)) {
+      throw new TypeError(`Error template variable ${key} must be scalar`);
+    }
+    return `${value}`;
   });
 }
 
@@ -269,13 +267,12 @@ export const CACHE_KEYS = {
  * @property {number} meanOutGroup - Mean expression outside group
  * @property {number} percentInGroup - % cells expressing in group
  * @property {number} percentOutGroup - % cells expressing outside
- * @property {number} specificity - Marker specificity score
  */
 
 /**
  * @typedef {Object} GroupMarkers
  * @property {string} groupId - Group identifier
- * @property {string} groupName - Display name
+ * @property {string|number|boolean} groupName - Exact categorical display label
  * @property {number} cellCount - Number of cells in group
  * @property {string} color - Group color for display
  * @property {MarkerGeneResult[]} markers - Sorted by rank ascending
@@ -295,7 +292,7 @@ export const CACHE_KEYS = {
  * @typedef {Object} ExpressionMatrix
  * @property {string[]} genes - Row labels (gene symbols)
  * @property {string[]} groupIds - Column identifiers
- * @property {string[]} groupNames - Column display names
+ * @property {(string|number|boolean)[]} groupNames - Exact categorical display labels
  * @property {string[]} groupColors - Column colors
  * @property {Float32Array} values - Row-major flattened matrix
  * @property {number} nRows - Number of rows
@@ -324,7 +321,7 @@ export const CACHE_KEYS = {
 /**
  * @typedef {Object} GroupSpec
  * @property {string} groupId - Unique group identifier
- * @property {string} groupName - Display name
+ * @property {string|number|boolean} groupName - Exact categorical display label
  * @property {number[]|Uint32Array} cellIndices - Explicit cell indices
  * @property {number[]|Uint32Array} [excludedCellIndices] - For rest-of groups
  * @property {string} [color] - Group color

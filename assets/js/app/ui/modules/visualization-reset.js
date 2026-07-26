@@ -1,14 +1,227 @@
 /**
- * @fileoverview Reset-to-defaults wiring for visualization + camera controls.
+ * @fileoverview Exact reset wiring for visualization and camera controls.
  *
- * Captures the initial UI control values after initialization, then restores
- * them when the user clicks "Reset Camera" (or presses `R` outside inputs).
- *
- * This module bridges render + camera controls, so it intentionally takes both
- * dom groups and the relevant module helpers.
+ * The reset owner captures the initialized control state once every required
+ * owner is present. Resetting restores that exact state; missing controls,
+ * missing methods, malformed values, and unsupported enum values are errors.
  *
  * @module ui/modules/visualization-reset
  */
+
+import { assertNavigationMode } from '../../../rendering/camera-state-contract.js';
+import { parseRangeInput } from '../core/numeric-input-contract.js';
+
+const EXACT_OPTION_KEYS = Object.freeze([
+  'cameraControls',
+  'cameraDom',
+  'renderControls',
+  'renderDom',
+  'viewer'
+]);
+
+const RENDER_VALUE_KEYS = Object.freeze([
+  'backgroundSelect',
+  'renderModeSelect',
+  'pointSizeInput',
+  'lightingInput',
+  'fogInput',
+  'sizeAttenuationInput',
+  'smokeGridInput',
+  'smokeStepsInput',
+  'smokeDensityInput',
+  'smokeSpeedInput',
+  'smokeDetailInput',
+  'smokeWarpInput',
+  'smokeAbsorptionInput',
+  'smokeScatterInput',
+  'smokeEdgeInput',
+  'smokeDirectLightInput',
+  'cloudResolutionInput',
+  'noiseResolutionInput'
+]);
+
+const RENDER_DISPLAY_KEYS = Object.freeze([
+  'lightingDisplay',
+  'fogDisplay',
+  'sizeAttenuationDisplay'
+]);
+
+const CAMERA_VALUE_KEYS = Object.freeze([
+  'navigationModeSelect',
+  'lookSensitivityInput',
+  'moveSpeedInput',
+  'orbitKeySpeedInput',
+  'planarPanSpeedInput'
+]);
+
+const CAMERA_CHECKBOX_KEYS = Object.freeze([
+  'invertLookCheckbox',
+  'projectilesEnabledCheckbox',
+  'pointerLockCheckbox',
+  'orbitReverseCheckbox',
+  'showOrbitAnchorCheckbox',
+  'planarZoomToCursorCheckbox',
+  'planarInvertAxesCheckbox'
+]);
+
+const VIEWER_METHODS = Object.freeze([
+  'resetCamera',
+  'setBackground',
+  'setNavigationMode',
+  'setInvertLookY',
+  'setInvertLookX',
+  'setProjectilesEnabled',
+  'setPointerLockEnabled',
+  'setOrbitInvertRotation',
+  'setPlanarZoomToCursor',
+  'setPlanarInvertAxes',
+  'setShowOrbitAnchor',
+  'setLightingStrength',
+  'setFogDensity',
+  'setSizeAttenuation'
+]);
+
+const RENDER_CONTROL_METHODS = Object.freeze([
+  'applyRenderMode',
+  'applyPointSizeFromSlider',
+  'updateSmokeStepSlider',
+  'updateSmokeDensitySlider',
+  'updateSmokeSpeedSlider',
+  'updateSmokeDetailSlider',
+  'updateSmokeWarpSlider',
+  'updateSmokeAbsorptionSlider',
+  'updateSmokeScatterSlider',
+  'updateSmokeEdgeSlider',
+  'updateSmokeDirectLightSlider',
+  'updateSmokeGridSlider',
+  'updateCloudResolutionSlider',
+  'updateNoiseResolutionSlider'
+]);
+
+const CAMERA_CONTROL_METHODS = Object.freeze([
+  'toggleNavigationPanels',
+  'updateLookSensitivity',
+  'updateMoveSpeed',
+  'updateOrbitKeySpeed',
+  'updatePlanarPanSpeed'
+]);
+
+const BACKGROUND_MODES = Object.freeze(['grid', 'grid-dark', 'white', 'black']);
+const RENDER_MODES = Object.freeze(['points', 'smoke']);
+
+function assertRecord(value, label) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError(`${label} must be an object.`);
+  }
+  return value;
+}
+
+function assertExactOptions(options) {
+  assertRecord(options, 'Visualization reset options');
+  const actualKeys = Object.keys(options).sort();
+  const hasWrongKeys = (
+    actualKeys.length !== EXACT_OPTION_KEYS.length ||
+    actualKeys.some((key, index) => key !== EXACT_OPTION_KEYS[index])
+  );
+  if (hasWrongKeys) {
+    throw new TypeError(
+      `Visualization reset options must contain exactly ${EXACT_OPTION_KEYS.join(', ')}.`
+    );
+  }
+  return options;
+}
+
+function requireValueElements(owner, keys, label) {
+  assertRecord(owner, label);
+  for (const key of keys) {
+    const element = owner[key];
+    if (element === null || typeof element !== 'object') {
+      throw new Error(`${label} is missing the required "${key}" element.`);
+    }
+    if (typeof element.value !== 'string') {
+      throw new TypeError(`${label} "${key}" must expose an exact string value.`);
+    }
+  }
+}
+
+function requireDisplayElements(owner, keys, label) {
+  for (const key of keys) {
+    const element = owner[key];
+    if (element === null || typeof element !== 'object') {
+      throw new Error(`${label} is missing the required "${key}" element.`);
+    }
+  }
+}
+
+function requireCheckboxElements(owner, keys, label) {
+  assertRecord(owner, label);
+  for (const key of keys) {
+    const element = owner[key];
+    if (element === null || typeof element !== 'object') {
+      throw new Error(`${label} is missing the required "${key}" element.`);
+    }
+    if (typeof element.checked !== 'boolean') {
+      throw new TypeError(`${label} "${key}" must expose an exact boolean state.`);
+    }
+  }
+}
+
+function requireResetButton(cameraDom) {
+  const resetButton = cameraDom.resetBtn;
+  if (resetButton === null || typeof resetButton !== 'object') {
+    throw new Error('Visualization reset camera DOM is missing the required "resetBtn" element.');
+  }
+  if (typeof resetButton.addEventListener !== 'function') {
+    throw new TypeError('Visualization reset "resetBtn" must support event listeners.');
+  }
+  return resetButton;
+}
+
+function requireMethods(owner, methods, label) {
+  assertRecord(owner, label);
+  for (const method of methods) {
+    if (typeof owner[method] !== 'function') {
+      throw new TypeError(`${label} must provide ${method}().`);
+    }
+  }
+}
+
+function assertChoice(value, allowedValues, label) {
+  if (typeof value !== 'string' || !allowedValues.includes(value)) {
+    throw new TypeError(
+      `${label} must be exactly one of ${allowedValues.join(', ')}; received ${String(value)}.`
+    );
+  }
+  return value;
+}
+
+function captureRange(input, { minimum, maximum, label }) {
+  const raw = input.value;
+  const value = parseRangeInput(raw, { minimum, maximum, label });
+  return Object.freeze({ raw, value });
+}
+
+function captureBoolean(input, label) {
+  if (typeof input.checked !== 'boolean') {
+    throw new TypeError(`${label} must be an exact boolean.`);
+  }
+  return input.checked;
+}
+
+function restoreRange(input, state, apply) {
+  input.value = state.raw;
+  apply();
+}
+
+function isTextEntryTarget(target) {
+  if (target === null || typeof target !== 'object') {
+    return false;
+  }
+  return (
+    ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName) ||
+    target.isContentEditable === true
+  );
+}
 
 /**
  * @param {object} options
@@ -18,231 +231,335 @@
  * @param {object} options.renderControls
  * @param {object} options.cameraControls
  */
-export function initVisualizationReset({ viewer, renderDom, cameraDom, renderControls, cameraControls }) {
-  const resetCameraBtn = cameraDom?.resetBtn || null;
+export function initVisualizationReset(options) {
+  const exactOptions = assertExactOptions(options);
+  const {
+    viewer,
+    renderDom,
+    cameraDom,
+    renderControls,
+    cameraControls
+  } = exactOptions;
 
-  const backgroundSelect = renderDom?.backgroundSelect || null;
-  const renderModeSelect = renderDom?.renderModeSelect || null;
-  const pointSizeInput = renderDom?.pointSizeInput || null;
-  const lightingStrengthInput = renderDom?.lightingInput || null;
-  const lightingStrengthDisplay = renderDom?.lightingDisplay || null;
-  const fogDensityInput = renderDom?.fogInput || null;
-  const fogDensityDisplay = renderDom?.fogDisplay || null;
-  const sizeAttenuationInput = renderDom?.sizeAttenuationInput || null;
-  const sizeAttenuationDisplay = renderDom?.sizeAttenuationDisplay || null;
+  requireValueElements(renderDom, RENDER_VALUE_KEYS, 'Visualization reset render DOM');
+  requireDisplayElements(renderDom, RENDER_DISPLAY_KEYS, 'Visualization reset render DOM');
+  requireValueElements(cameraDom, CAMERA_VALUE_KEYS, 'Visualization reset camera DOM');
+  requireCheckboxElements(cameraDom, CAMERA_CHECKBOX_KEYS, 'Visualization reset camera DOM');
+  const resetCameraBtn = requireResetButton(cameraDom);
+  requireMethods(viewer, VIEWER_METHODS, 'Visualization reset viewer');
+  requireMethods(
+    renderControls,
+    RENDER_CONTROL_METHODS,
+    'Visualization reset render controls'
+  );
+  requireMethods(
+    cameraControls,
+    CAMERA_CONTROL_METHODS,
+    'Visualization reset camera controls'
+  );
 
-  const smokeStepsInput = renderDom?.smokeStepsInput || null;
-  const smokeDensityInput = renderDom?.smokeDensityInput || null;
-  const smokeSpeedInput = renderDom?.smokeSpeedInput || null;
-  const smokeDetailInput = renderDom?.smokeDetailInput || null;
-  const smokeWarpInput = renderDom?.smokeWarpInput || null;
-  const smokeAbsorptionInput = renderDom?.smokeAbsorptionInput || null;
-  const smokeScatterInput = renderDom?.smokeScatterInput || null;
-  const smokeEdgeInput = renderDom?.smokeEdgeInput || null;
-  const smokeDirectLightInput = renderDom?.smokeDirectLightInput || null;
-  const smokeGridInput = renderDom?.smokeGridInput || null;
-  const cloudResolutionInput = renderDom?.cloudResolutionInput || null;
-  const noiseResolutionInput = renderDom?.noiseResolutionInput || null;
+  const {
+    backgroundSelect,
+    renderModeSelect,
+    pointSizeInput,
+    lightingInput,
+    lightingDisplay,
+    fogInput,
+    fogDisplay,
+    sizeAttenuationInput,
+    sizeAttenuationDisplay,
+    smokeGridInput,
+    smokeStepsInput,
+    smokeDensityInput,
+    smokeSpeedInput,
+    smokeDetailInput,
+    smokeWarpInput,
+    smokeAbsorptionInput,
+    smokeScatterInput,
+    smokeEdgeInput,
+    smokeDirectLightInput,
+    cloudResolutionInput,
+    noiseResolutionInput
+  } = renderDom;
 
-  const navigationModeSelect = cameraDom?.navigationModeSelect || null;
-  const lookSensitivityInput = cameraDom?.lookSensitivityInput || null;
-  const moveSpeedInput = cameraDom?.moveSpeedInput || null;
-  const invertLookCheckbox = cameraDom?.invertLookCheckbox || null;
-  const orbitReverseCheckbox = cameraDom?.orbitReverseCheckbox || null;
-  const planarZoomToCursorCheckbox = cameraDom?.planarZoomToCursorCheckbox || null;
-  const planarInvertAxesCheckbox = cameraDom?.planarInvertAxesCheckbox || null;
-  const showOrbitAnchorCheckbox = cameraDom?.showOrbitAnchorCheckbox || null;
+  const {
+    navigationModeSelect,
+    lookSensitivityInput,
+    moveSpeedInput,
+    invertLookCheckbox,
+    projectilesEnabledCheckbox,
+    pointerLockCheckbox,
+    orbitKeySpeedInput,
+    orbitReverseCheckbox,
+    showOrbitAnchorCheckbox,
+    planarPanSpeedInput,
+    planarZoomToCursorCheckbox,
+    planarInvertAxesCheckbox
+  } = cameraDom;
 
-  let initialUIState = null;
+  let initialUIState;
 
   function captureInitialState() {
-    initialUIState = {
-      background: backgroundSelect?.value || 'white',
-      renderMode: renderModeSelect?.value || 'points',
-      pointSize: pointSizeInput?.value || String(renderControls.pointSizeToSlider?.(0.75) ?? 0),
-      lighting: lightingStrengthInput?.value || '60',
-      fog: fogDensityInput?.value || '50',
-      sizeAttenuation: sizeAttenuationInput?.value || '80',
-
-      smokeGrid: smokeGridInput?.value || '60',
-      smokeSteps: smokeStepsInput?.value || '75',
-      smokeDensity: smokeDensityInput?.value || '56',
-      smokeSpeed: smokeSpeedInput?.value || '40',
-      smokeDetail: smokeDetailInput?.value || '60',
-      smokeWarp: smokeWarpInput?.value || '10',
-      smokeAbsorption: smokeAbsorptionInput?.value || '65',
-      smokeScatter: smokeScatterInput?.value || '0',
-      smokeEdge: smokeEdgeInput?.value || '0',
-      smokeDirectLight: smokeDirectLightInput?.value || '3',
-      cloudResolution: cloudResolutionInput?.value || '15',
-      noiseResolution: noiseResolutionInput?.value || '58',
-
-      navigationMode: navigationModeSelect?.value || 'orbit',
-      lookSensitivity: lookSensitivityInput?.value || '5',
-      moveSpeed: moveSpeedInput?.value || '100',
-      invertLook: invertLookCheckbox?.checked || false,
-      orbitInvertRotation: orbitReverseCheckbox?.checked || false,
-      showOrbitAnchor: showOrbitAnchorCheckbox?.checked ?? true,
-      planarZoomToCursor: planarZoomToCursorCheckbox?.checked ?? true,
-      planarInvertAxes: planarInvertAxesCheckbox?.checked || false
-    };
+    initialUIState = Object.freeze({
+      background: assertChoice(
+        backgroundSelect.value,
+        BACKGROUND_MODES,
+        'Visualization background'
+      ),
+      renderMode: assertChoice(
+        renderModeSelect.value,
+        RENDER_MODES,
+        'Visualization render mode'
+      ),
+      pointSize: captureRange(
+        pointSizeInput,
+        { minimum: 0, maximum: 100, label: 'Point size' }
+      ),
+      lighting: captureRange(
+        lightingInput,
+        { minimum: 0, maximum: 100, label: 'Lighting strength' }
+      ),
+      fog: captureRange(
+        fogInput,
+        { minimum: 0, maximum: 100, label: 'Fog density' }
+      ),
+      sizeAttenuation: captureRange(
+        sizeAttenuationInput,
+        { minimum: 0, maximum: 100, label: 'Size attenuation' }
+      ),
+      smokeGrid: captureRange(
+        smokeGridInput,
+        { minimum: 0, maximum: 100, label: 'Smoke grid' }
+      ),
+      smokeSteps: captureRange(
+        smokeStepsInput,
+        { minimum: 0, maximum: 100, label: 'Smoke steps' }
+      ),
+      smokeDensity: captureRange(
+        smokeDensityInput,
+        { minimum: 0, maximum: 100, label: 'Smoke density' }
+      ),
+      smokeSpeed: captureRange(
+        smokeSpeedInput,
+        { minimum: 0, maximum: 100, label: 'Smoke speed' }
+      ),
+      smokeDetail: captureRange(
+        smokeDetailInput,
+        { minimum: 0, maximum: 100, label: 'Smoke detail' }
+      ),
+      smokeWarp: captureRange(
+        smokeWarpInput,
+        { minimum: 0, maximum: 100, label: 'Smoke warp' }
+      ),
+      smokeAbsorption: captureRange(
+        smokeAbsorptionInput,
+        { minimum: 0, maximum: 100, label: 'Smoke absorption' }
+      ),
+      smokeScatter: captureRange(
+        smokeScatterInput,
+        { minimum: 0, maximum: 100, label: 'Smoke scatter' }
+      ),
+      smokeEdge: captureRange(
+        smokeEdgeInput,
+        { minimum: 0, maximum: 100, label: 'Smoke edge' }
+      ),
+      smokeDirectLight: captureRange(
+        smokeDirectLightInput,
+        { minimum: 0, maximum: 100, label: 'Smoke direct light' }
+      ),
+      cloudResolution: captureRange(
+        cloudResolutionInput,
+        { minimum: 0, maximum: 100, label: 'Cloud resolution' }
+      ),
+      noiseResolution: captureRange(
+        noiseResolutionInput,
+        { minimum: 0, maximum: 100, label: 'Noise resolution' }
+      ),
+      navigationMode: assertNavigationMode(navigationModeSelect.value),
+      lookSensitivity: captureRange(
+        lookSensitivityInput,
+        { minimum: 1, maximum: 30, label: 'Look sensitivity' }
+      ),
+      moveSpeed: captureRange(
+        moveSpeedInput,
+        { minimum: 1, maximum: 500, label: 'Move speed' }
+      ),
+      invertLook: captureBoolean(invertLookCheckbox, 'Invert look'),
+      projectilesEnabled: captureBoolean(
+        projectilesEnabledCheckbox,
+        'Projectile shooting'
+      ),
+      pointerLockEnabled: captureBoolean(pointerLockCheckbox, 'Pointer capture'),
+      orbitKeySpeed: captureRange(
+        orbitKeySpeedInput,
+        { minimum: 1, maximum: 100, label: 'Orbit keyboard speed' }
+      ),
+      orbitInvertRotation: captureBoolean(
+        orbitReverseCheckbox,
+        'Orbit invert rotation'
+      ),
+      showOrbitAnchor: captureBoolean(showOrbitAnchorCheckbox, 'Show orbit anchor'),
+      planarPanSpeed: captureRange(
+        planarPanSpeedInput,
+        { minimum: 1, maximum: 100, label: 'Planar keyboard speed' }
+      ),
+      planarZoomToCursor: captureBoolean(
+        planarZoomToCursorCheckbox,
+        'Planar zoom to cursor'
+      ),
+      planarInvertAxes: captureBoolean(
+        planarInvertAxesCheckbox,
+        'Planar invert axes'
+      )
+    });
+    return initialUIState;
   }
 
   function resetVisualizationToDefaults() {
-    if (!initialUIState) return;
+    viewer.resetCamera();
 
-    viewer.resetCamera?.();
-    const defaultRenderMode = initialUIState.renderMode || 'points';
-    const navMode = initialUIState.navigationMode || 'orbit';
+    backgroundSelect.value = initialUIState.background;
+    viewer.setBackground(initialUIState.background);
 
-    if (backgroundSelect) {
-      backgroundSelect.value = initialUIState.background;
-      viewer.setBackground?.(initialUIState.background);
-    }
+    navigationModeSelect.value = initialUIState.navigationMode;
+    viewer.setNavigationMode(initialUIState.navigationMode);
+    cameraControls.toggleNavigationPanels(initialUIState.navigationMode);
 
-    if (renderModeSelect) {
-      renderModeSelect.value = defaultRenderMode;
-    }
-    renderControls.applyRenderMode?.(defaultRenderMode);
+    restoreRange(
+      lookSensitivityInput,
+      initialUIState.lookSensitivity,
+      cameraControls.updateLookSensitivity
+    );
+    restoreRange(
+      moveSpeedInput,
+      initialUIState.moveSpeed,
+      cameraControls.updateMoveSpeed
+    );
 
-    if (navigationModeSelect) {
-      navigationModeSelect.value = navMode;
-      viewer.setNavigationMode?.(navMode);
-      cameraControls.toggleNavigationPanels?.(navMode);
-    }
+    invertLookCheckbox.checked = initialUIState.invertLook;
+    viewer.setInvertLookY(initialUIState.invertLook);
+    viewer.setInvertLookX(initialUIState.invertLook);
 
-    if (lookSensitivityInput) {
-      lookSensitivityInput.value = initialUIState.lookSensitivity || '5';
-      cameraControls.updateLookSensitivity?.();
-    }
+    projectilesEnabledCheckbox.checked = initialUIState.projectilesEnabled;
+    viewer.setProjectilesEnabled(initialUIState.projectilesEnabled);
 
-    if (moveSpeedInput) {
-      moveSpeedInput.value = initialUIState.moveSpeed || '100';
-      cameraControls.updateMoveSpeed?.();
-    }
+    pointerLockCheckbox.checked = initialUIState.pointerLockEnabled;
+    viewer.setPointerLockEnabled(initialUIState.pointerLockEnabled);
 
-    if (invertLookCheckbox && viewer.setInvertLook) {
-      invertLookCheckbox.checked = Boolean(initialUIState.invertLook);
-      viewer.setInvertLook(Boolean(invertLookCheckbox.checked));
-    }
+    restoreRange(
+      orbitKeySpeedInput,
+      initialUIState.orbitKeySpeed,
+      cameraControls.updateOrbitKeySpeed
+    );
+    orbitReverseCheckbox.checked = initialUIState.orbitInvertRotation;
+    viewer.setOrbitInvertRotation(initialUIState.orbitInvertRotation);
+    showOrbitAnchorCheckbox.checked = initialUIState.showOrbitAnchor;
+    viewer.setShowOrbitAnchor(initialUIState.showOrbitAnchor);
 
-    if (orbitReverseCheckbox && viewer.setOrbitInvertRotation) {
-      orbitReverseCheckbox.checked = Boolean(initialUIState.orbitInvertRotation);
-      viewer.setOrbitInvertRotation(Boolean(orbitReverseCheckbox.checked));
-    }
+    restoreRange(
+      planarPanSpeedInput,
+      initialUIState.planarPanSpeed,
+      cameraControls.updatePlanarPanSpeed
+    );
+    planarZoomToCursorCheckbox.checked = initialUIState.planarZoomToCursor;
+    viewer.setPlanarZoomToCursor(initialUIState.planarZoomToCursor);
+    planarInvertAxesCheckbox.checked = initialUIState.planarInvertAxes;
+    viewer.setPlanarInvertAxes(initialUIState.planarInvertAxes);
 
-    if (planarZoomToCursorCheckbox && viewer.setPlanarZoomToCursor) {
-      planarZoomToCursorCheckbox.checked = Boolean(initialUIState.planarZoomToCursor);
-      viewer.setPlanarZoomToCursor(Boolean(planarZoomToCursorCheckbox.checked));
-    }
+    restoreRange(
+      pointSizeInput,
+      initialUIState.pointSize,
+      renderControls.applyPointSizeFromSlider
+    );
 
-    if (planarInvertAxesCheckbox && viewer.setPlanarInvertAxes) {
-      planarInvertAxesCheckbox.checked = Boolean(initialUIState.planarInvertAxes);
-      viewer.setPlanarInvertAxes(Boolean(planarInvertAxesCheckbox.checked));
-    }
+    lightingInput.value = initialUIState.lighting.raw;
+    viewer.setLightingStrength(initialUIState.lighting.value / 100);
+    lightingDisplay.textContent = initialUIState.lighting.raw;
 
-    if (showOrbitAnchorCheckbox && viewer.setShowOrbitAnchor) {
-      showOrbitAnchorCheckbox.checked = initialUIState.showOrbitAnchor ?? true;
-      viewer.setShowOrbitAnchor(Boolean(showOrbitAnchorCheckbox.checked));
-    }
+    fogInput.value = initialUIState.fog.raw;
+    viewer.setFogDensity(initialUIState.fog.value / 100);
+    fogDisplay.textContent = initialUIState.fog.raw;
 
-    if (pointSizeInput) {
-      pointSizeInput.value = initialUIState.pointSize;
-      renderControls.applyPointSizeFromSlider?.();
-    }
+    sizeAttenuationInput.value = initialUIState.sizeAttenuation.raw;
+    viewer.setSizeAttenuation(initialUIState.sizeAttenuation.value / 100);
+    sizeAttenuationDisplay.textContent = initialUIState.sizeAttenuation.raw;
 
-    if (lightingStrengthInput) {
-      lightingStrengthInput.value = initialUIState.lighting;
-      const v = parseFloat(initialUIState.lighting);
-      viewer.setLightingStrength?.(Number.isFinite(v) ? v / 100.0 : 0.6);
-      if (lightingStrengthDisplay) lightingStrengthDisplay.textContent = lightingStrengthInput.value;
-    }
+    restoreRange(
+      smokeStepsInput,
+      initialUIState.smokeSteps,
+      renderControls.updateSmokeStepSlider
+    );
+    restoreRange(
+      smokeDensityInput,
+      initialUIState.smokeDensity,
+      renderControls.updateSmokeDensitySlider
+    );
+    restoreRange(
+      smokeSpeedInput,
+      initialUIState.smokeSpeed,
+      renderControls.updateSmokeSpeedSlider
+    );
+    restoreRange(
+      smokeDetailInput,
+      initialUIState.smokeDetail,
+      renderControls.updateSmokeDetailSlider
+    );
+    restoreRange(
+      smokeWarpInput,
+      initialUIState.smokeWarp,
+      renderControls.updateSmokeWarpSlider
+    );
+    restoreRange(
+      smokeAbsorptionInput,
+      initialUIState.smokeAbsorption,
+      renderControls.updateSmokeAbsorptionSlider
+    );
+    restoreRange(
+      smokeScatterInput,
+      initialUIState.smokeScatter,
+      renderControls.updateSmokeScatterSlider
+    );
+    restoreRange(
+      smokeEdgeInput,
+      initialUIState.smokeEdge,
+      renderControls.updateSmokeEdgeSlider
+    );
+    restoreRange(
+      smokeDirectLightInput,
+      initialUIState.smokeDirectLight,
+      renderControls.updateSmokeDirectLightSlider
+    );
+    restoreRange(
+      smokeGridInput,
+      initialUIState.smokeGrid,
+      renderControls.updateSmokeGridSlider
+    );
+    restoreRange(
+      cloudResolutionInput,
+      initialUIState.cloudResolution,
+      renderControls.updateCloudResolutionSlider
+    );
+    restoreRange(
+      noiseResolutionInput,
+      initialUIState.noiseResolution,
+      renderControls.updateNoiseResolutionSlider
+    );
 
-    if (fogDensityInput) {
-      fogDensityInput.value = initialUIState.fog;
-      const v = parseFloat(initialUIState.fog);
-      viewer.setFogDensity?.(Number.isFinite(v) ? v / 100.0 : 0.5);
-      if (fogDensityDisplay) fogDensityDisplay.textContent = fogDensityInput.value;
-    }
-
-    if (sizeAttenuationInput) {
-      sizeAttenuationInput.value = initialUIState.sizeAttenuation;
-      const v = parseFloat(initialUIState.sizeAttenuation);
-      viewer.setSizeAttenuation?.(Number.isFinite(v) ? v / 100.0 : 0);
-      if (sizeAttenuationDisplay) sizeAttenuationDisplay.textContent = sizeAttenuationInput.value;
-    }
-
-    if (smokeStepsInput) {
-      smokeStepsInput.value = initialUIState.smokeSteps;
-      renderControls.updateSmokeStepSlider?.();
-    }
-    if (smokeDensityInput) {
-      smokeDensityInput.value = initialUIState.smokeDensity;
-      renderControls.updateSmokeDensitySlider?.();
-    }
-    if (smokeSpeedInput) {
-      smokeSpeedInput.value = initialUIState.smokeSpeed;
-      renderControls.updateSmokeSpeedSlider?.();
-    }
-    if (smokeDetailInput) {
-      smokeDetailInput.value = initialUIState.smokeDetail;
-      renderControls.updateSmokeDetailSlider?.();
-    }
-    if (smokeWarpInput) {
-      smokeWarpInput.value = initialUIState.smokeWarp;
-      renderControls.updateSmokeWarpSlider?.();
-    }
-    if (smokeAbsorptionInput) {
-      smokeAbsorptionInput.value = initialUIState.smokeAbsorption;
-      renderControls.updateSmokeAbsorptionSlider?.();
-    }
-    if (smokeScatterInput) {
-      smokeScatterInput.value = initialUIState.smokeScatter;
-      renderControls.updateSmokeScatterSlider?.();
-    }
-    if (smokeEdgeInput) {
-      smokeEdgeInput.value = initialUIState.smokeEdge;
-      renderControls.updateSmokeEdgeSlider?.();
-    }
-    if (smokeDirectLightInput && initialUIState.smokeDirectLight != null) {
-      smokeDirectLightInput.value = initialUIState.smokeDirectLight;
-      renderControls.updateSmokeDirectLightSlider?.();
-    }
-    if (smokeGridInput) {
-      smokeGridInput.value = initialUIState.smokeGrid;
-      renderControls.updateSmokeGridSlider?.();
-    }
-
-    if (cloudResolutionInput && viewer.setCloudResolutionScale) {
-      const cloudResVal = initialUIState.cloudResolution ?? 25;
-      cloudResolutionInput.value = cloudResVal;
-      renderControls.updateCloudResolutionSlider?.();
-    }
-
-    if (noiseResolutionInput && viewer.setNoiseTextureResolution) {
-      const noiseResVal = initialUIState.noiseResolution ?? 64;
-      noiseResolutionInput.value = noiseResVal;
-      renderControls.updateNoiseResolutionSlider?.();
-    }
-
-    renderControls.rebuildSmokeDensity?.();
-    renderControls.markSmokeClean?.();
+    renderModeSelect.value = initialUIState.renderMode;
+    renderControls.applyRenderMode(initialUIState.renderMode);
   }
-
-  if (resetCameraBtn) {
-    resetCameraBtn.addEventListener('click', () => {
-      resetVisualizationToDefaults();
-    });
-  }
-
-  document.addEventListener('keydown', (e) => {
-    if (e.target?.tagName === 'INPUT' || e.target?.tagName === 'TEXTAREA') return;
-    if (e.key === 'r' || e.key === 'R') {
-      viewer.resetCamera?.();
-    }
-  });
 
   captureInitialState();
 
-  return { resetVisualizationToDefaults, captureInitialState };
+  resetCameraBtn.addEventListener('click', resetVisualizationToDefaults);
+  document.addEventListener('keydown', (event) => {
+    if (isTextEntryTarget(event.target)) {
+      return;
+    }
+    if (event.key === 'r' || event.key === 'R') {
+      viewer.resetCamera();
+    }
+  });
+
+  return Object.freeze({ resetVisualizationToDefaults, captureInitialState });
 }

@@ -84,7 +84,6 @@ export {
   MemoryMonitor,
   getMemoryMonitor,
   createMemoryMonitor,
-  THRESHOLDS as MEMORY_THRESHOLDS,
   INTERVALS as MEMORY_INTERVALS
 } from './memory-monitor.js';
 
@@ -174,9 +173,7 @@ export {
   formatErrorForUser,
   handleError,
   wrapAsync,
-  tryAsync,
-  withTimeout,
-  retry
+  withTimeout
 } from './error-utils.js';
 
 // =============================================================================

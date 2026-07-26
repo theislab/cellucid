@@ -10,17 +10,12 @@
 export const ANNOTATION_CONNECTION_CHANGED_EVENT = 'cellucid:annotation-connection-changed';
 
 export function dispatchAnnotationConnectionChanged(detail = null) {
-  try {
-    if (typeof window === 'undefined' || typeof window.dispatchEvent !== 'function') return false;
-    try {
-      window.dispatchEvent(new CustomEvent(ANNOTATION_CONNECTION_CHANGED_EVENT, { detail: detail || null }));
-      return true;
-    } catch {
-      window.dispatchEvent(new Event(ANNOTATION_CONNECTION_CHANGED_EVENT));
-      return true;
-    }
-  } catch {
-    return false;
+  if (typeof window === 'undefined') return false;
+  if (typeof window.dispatchEvent !== 'function' || typeof CustomEvent !== 'function') {
+    throw new Error('CustomEvent dispatch is required for annotation connection updates');
   }
+  window.dispatchEvent(
+    new CustomEvent(ANNOTATION_CONNECTION_CHANGED_EVENT, { detail })
+  );
+  return true;
 }
-

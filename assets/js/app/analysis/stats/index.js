@@ -14,6 +14,7 @@
 export {
   // Core tests
   chiSquaredTest,
+  fisherExactTest,
   tTest,
   mannWhitneyU,
   oneWayANOVA,
@@ -48,13 +49,10 @@ export {
 } from './multi-variable-analysis.js';
 
 // =============================================================================
-// QUICK STATS (Streaming & Field Scoring)
+// QUICK STATS (Field Scoring)
 // =============================================================================
 
 export {
-  // Streaming statistics
-  computeStreamingStats,
-
   // Field scoring (for intelligent selection)
   computeEntropy,
   computeVarianceScore,

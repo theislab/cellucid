@@ -11,22 +11,60 @@
  * - Settings are copied via UI exportSettings/importSettings (results intentionally excluded)
  */
 
-import { getNotificationCenter } from '../../notification-center.js';
 import { getDockableAccordions } from '../../dockable-accordions-registry.js';
 import { SIDEBAR_MAX_WIDTH_PX, SIDEBAR_MIN_WIDTH_PX } from '../../sidebar-metrics.js';
 import { isFiniteNumber } from '../shared/number-utils.js';
-import { StyleManager } from '../../../utils/style-manager.js';
+import { expandPagesWithDerived } from '../shared/page-derivation-utils.js';
 
 const MAX_ANALYSIS_WINDOWS = 20;
 
-function ensureFloatingRoot() {
-  const existing = document.getElementById('floating-panels-root');
-  if (existing) return existing;
+function isPlainObject(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
 
-  const root = document.createElement('div');
-  root.id = 'floating-panels-root';
-  document.body.appendChild(root);
-  return root;
+function requireExactKeys(value, expectedKeys, label) {
+  if (!isPlainObject(value)) {
+    throw new TypeError(`${label} must be an object`);
+  }
+  const actualKeys = Object.keys(value).sort();
+  const sortedExpected = [...expectedKeys].sort();
+  if (
+    actualKeys.length !== sortedExpected.length ||
+    actualKeys.some((key, index) => key !== sortedExpected[index])
+  ) {
+    throw new TypeError(
+      `${label} must contain exactly: ${sortedExpected.join(', ')}`
+    );
+  }
+}
+
+function requireNonEmptyString(value, label) {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new TypeError(`${label} must be a non-empty string`);
+  }
+}
+
+function requireDockableAccordions() {
+  const dockable = getDockableAccordions();
+  if (
+    dockable === null ||
+    typeof dockable !== 'object' ||
+    dockable.floatingRoot === null ||
+    typeof dockable.floatingRoot !== 'object' ||
+    typeof dockable.floatingRoot.appendChild !== 'function' ||
+    typeof dockable.register !== 'function' ||
+    typeof dockable.float !== 'function' ||
+    typeof dockable.unregister !== 'function'
+  ) {
+    throw new Error(
+      'Analysis windows require an initialized dockable-accordions registry'
+    );
+  }
+  return dockable;
 }
 
 function createWindowId(counter) {
@@ -35,11 +73,47 @@ function createWindowId(counter) {
 }
 
 function getHeaderTitleForMode(typeInfo, modeId) {
-  return typeInfo?.name || typeInfo?.tooltip || modeId || 'Analysis';
+  requireNonEmptyString(typeInfo.name, `Analysis mode "${modeId}" name`);
+  return typeInfo.name;
 }
 
 function isDomRectLike(rect) {
-  return rect && typeof rect.left === 'number' && typeof rect.top === 'number';
+  return (
+    rect !== null &&
+    typeof rect === 'object' &&
+    isFiniteNumber(rect.left) &&
+    isFiniteNumber(rect.top) &&
+    isFiniteNumber(rect.right) &&
+    isFiniteNumber(rect.width) &&
+    isFiniteNumber(rect.height)
+  );
+}
+
+function requireSessionRect(rect) {
+  requireExactKeys(
+    rect,
+    ['height', 'left', 'top', 'width'],
+    'Analysis window rect'
+  );
+  if (
+    !isFiniteNumber(rect.left) ||
+    !isFiniteNumber(rect.top) ||
+    !isFiniteNumber(rect.width) ||
+    !isFiniteNumber(rect.height) ||
+    rect.width <= 0 ||
+    rect.height <= 0
+  ) {
+    throw new TypeError(
+      'Analysis window rect requires finite left/top and positive finite width/height'
+    );
+  }
+}
+
+function requireSettings(settings) {
+  if (!isPlainObject(settings)) {
+    throw new TypeError('Analysis window settings must be an object');
+  }
+  return structuredClone(settings);
 }
 
 export class AnalysisWindowManager {
@@ -50,10 +124,23 @@ export class AnalysisWindowManager {
    * @param {HTMLElement} [options.sidebar] - Sidebar element (for initial positioning)
    */
   constructor(options) {
+    if (
+      options === null ||
+      typeof options !== 'object' ||
+      options.comparisonModule === null ||
+      typeof options.comparisonModule !== 'object' ||
+      options.uiManager === null ||
+      typeof options.uiManager !== 'object' ||
+      options.sidebar === null ||
+      typeof options.sidebar !== 'object'
+    ) {
+      throw new TypeError(
+        'AnalysisWindowManager requires comparisonModule, uiManager, and sidebar'
+      );
+    }
     this._comparisonModule = options.comparisonModule;
     this._uiManager = options.uiManager;
-    this._sidebar = options.sidebar || document.getElementById('sidebar');
-    this._notifications = getNotificationCenter();
+    this._sidebar = options.sidebar;
 
     /** @type {Map<string, { id: string, modeId: string, details: HTMLDetailsElement, content: HTMLDivElement, ui: any, lastKnownPageIds: string[], headerTitle: string, headerDesc: string, floatConstraints: any }>} */
     this._windows = new Map();
@@ -79,34 +166,40 @@ export class AnalysisWindowManager {
     const out = [];
 
     for (const entry of this._windows.values()) {
-      if (!entry?.details) continue;
+      if (
+        entry === null ||
+        typeof entry !== 'object' ||
+        typeof entry.details?.getBoundingClientRect !== 'function'
+      ) {
+        throw new TypeError('Analysis window registry contains an invalid entry');
+      }
+      if (typeof entry.ui?.exportSettings !== 'function') {
+        throw new TypeError(
+          `Analysis window "${entry.id}" UI must implement exportSettings()`
+        );
+      }
+      requireNonEmptyString(entry.modeId, 'Analysis window modeId');
+      requireNonEmptyString(entry.headerTitle, 'Analysis window headerTitle');
+      if (typeof entry.headerDesc !== 'string') {
+        throw new TypeError('Analysis window headerDesc must be a string');
+      }
 
-      // Prefer the persisted StyleManager geometry; fall back to DOMRect.
-      const leftVar = StyleManager.getVariable(entry.details, '--pos-x');
-      const topVar = StyleManager.getVariable(entry.details, '--pos-y');
-      const widthVar = StyleManager.getVariable(entry.details, '--pos-width');
-      const heightVar = StyleManager.getVariable(entry.details, '--pos-height');
-
-      const rectFallback = entry.details.getBoundingClientRect();
-      const left = isFiniteNumber(parseFloat(leftVar)) ? parseFloat(leftVar) : rectFallback.left;
-      const top = isFiniteNumber(parseFloat(topVar)) ? parseFloat(topVar) : rectFallback.top;
-      const width = isFiniteNumber(parseFloat(widthVar)) ? parseFloat(widthVar) : rectFallback.width;
-      const height = isFiniteNumber(parseFloat(heightVar)) ? parseFloat(heightVar) : rectFallback.height;
-
-      const settings = typeof entry.ui?.exportSettings === 'function'
-        ? entry.ui.exportSettings()
-        : {
-          selectedPages: entry.ui?.getSelectedPages?.() ?? [],
-          config: entry.ui?.getConfig?.() ?? {}
-        };
+      const measuredRect = entry.details.getBoundingClientRect();
+      const rect = {
+        left: measuredRect.left,
+        top: measuredRect.top,
+        width: measuredRect.width,
+        height: measuredRect.height
+      };
+      requireSessionRect(rect);
+      const settings = requireSettings(entry.ui.exportSettings());
 
       out.push({
         modeId: entry.modeId,
-        rect: { left, top, width, height },
+        rect,
         settings,
-        headerTitle: entry.headerTitle || '',
-        headerDesc: entry.headerDesc || '',
-        constraints: entry.floatConstraints || null
+        headerTitle: entry.headerTitle,
+        headerDesc: entry.headerDesc
       });
     }
 
@@ -116,33 +209,35 @@ export class AnalysisWindowManager {
   /**
    * Create a floating analysis window from a session restore descriptor.
    *
-   * @param {{ modeId?: string, rect?: any, settings?: any, headerTitle?: string, headerDesc?: string, constraints?: any }} descriptor
-   * @returns {string|null} windowId
+   * @param {{ modeId: string, rect: { left: number, top: number, width: number, height: number }, settings: Object, headerTitle: string, headerDesc: string }} descriptor
+   * @returns {string} windowId
    */
   createFromSessionDescriptor(descriptor) {
-    const modeId = String(descriptor?.modeId || '').trim();
-    if (!modeId) return null;
+    requireExactKeys(
+      descriptor,
+      ['headerDesc', 'headerTitle', 'modeId', 'rect', 'settings'],
+      'Analysis window descriptor'
+    );
+    requireNonEmptyString(descriptor.modeId, 'Analysis window descriptor modeId');
+    requireSessionRect(descriptor.rect);
+    const settings = requireSettings(descriptor.settings);
+    requireNonEmptyString(
+      descriptor.headerTitle,
+      'Analysis window descriptor headerTitle'
+    );
+    if (typeof descriptor.headerDesc !== 'string') {
+      throw new TypeError('Analysis window descriptor headerDesc must be a string');
+    }
 
-    const rect = descriptor?.rect || {};
-    const left = isFiniteNumber(rect.left) ? rect.left : undefined;
-    const top = isFiniteNumber(rect.top) ? rect.top : undefined;
-    const preferredSize = {
-      width: isFiniteNumber(rect.width) ? rect.width : undefined,
-      height: isFiniteNumber(rect.height) ? rect.height : undefined
-    };
-
-    // Use a tiny origin shim so we can reuse the existing creation path.
-    const originUi = {
-      exportSettings: () => descriptor?.settings || null
-    };
-
-    return this._createWindowFromOrigin(modeId, originUi, {
-      left,
-      top,
-      preferredSize,
-      constraints: descriptor?.constraints || null,
-      headerTitle: descriptor?.headerTitle || '',
-      headerDesc: descriptor?.headerDesc || ''
+    return this._createWindow(descriptor.modeId, settings, {
+      left: descriptor.rect.left,
+      top: descriptor.rect.top,
+      preferredSize: {
+        width: descriptor.rect.width,
+        height: descriptor.rect.height
+      },
+      headerTitle: descriptor.headerTitle,
+      headerDesc: descriptor.headerDesc
     });
   }
 
@@ -150,27 +245,45 @@ export class AnalysisWindowManager {
    * Create a floating copy from the embedded (sidebar) analysis mode instance.
    * @param {string} modeId
    * @param {{ sourceRect?: DOMRect, preferredSize?: { width?: number, height?: number }, constraints?: any, headerTitle?: string, headerDesc?: string }} [options]
-   * @returns {string|null} windowId
+   * @returns {string} windowId
    */
   copyFromEmbedded(modeId, options = {}) {
-    const originUi = this._uiManager?.getUI?.(modeId);
-    if (!originUi) {
-      this._notifications.error(`Unable to initialize analysis UI: ${modeId}`);
-      return null;
+    requireNonEmptyString(modeId, 'Analysis mode ID');
+    if (typeof this._uiManager.getUI !== 'function') {
+      throw new TypeError('Analysis UI manager must implement getUI()');
     }
-    return this._createWindowFromOrigin(modeId, originUi, options);
+    const originUi = this._uiManager.getUI(modeId);
+    if (originUi === null || typeof originUi !== 'object') {
+      throw new Error(`Analysis UI is not registered: ${modeId}`);
+    }
+    if (typeof originUi.exportSettings !== 'function') {
+      throw new TypeError(
+        `Analysis UI "${modeId}" must implement exportSettings()`
+      );
+    }
+    const settings = requireSettings(originUi.exportSettings());
+    return this._createWindow(modeId, settings, options);
   }
 
   /**
    * Create a floating copy from an existing floating window.
    * @param {string} windowId
-   * @returns {string|null}
+   * @returns {string}
    */
   copyFromWindow(windowId) {
+    requireNonEmptyString(windowId, 'Analysis window ID');
     const entry = this._windows.get(windowId);
-    if (!entry?.ui) return null;
+    if (!entry) {
+      throw new Error(`Analysis window not found: ${windowId}`);
+    }
+    if (typeof entry.ui?.exportSettings !== 'function') {
+      throw new TypeError(
+        `Analysis window "${windowId}" UI must implement exportSettings()`
+      );
+    }
     const rect = entry.details.getBoundingClientRect();
-    return this._createWindowFromOrigin(entry.modeId, entry.ui, {
+    const settings = requireSettings(entry.ui.exportSettings());
+    return this._createWindow(entry.modeId, settings, {
       sourceRect: rect,
       preferredSize: { width: rect.width, height: rect.height },
       constraints: entry.floatConstraints,
@@ -184,22 +297,49 @@ export class AnalysisWindowManager {
    * @param {string} windowId
    */
   closeWindow(windowId) {
+    requireNonEmptyString(windowId, 'Analysis window ID');
     const entry = this._windows.get(windowId);
-    if (!entry) return;
-
-    try { entry.ui?.destroy?.(); } catch (err) {
-      console.warn('[AnalysisWindowManager] UI destroy failed:', err);
+    if (!entry) {
+      throw new Error(`Analysis window not found: ${windowId}`);
     }
-
-    try { getDockableAccordions()?.unregister?.(entry.details); } catch {}
-
-    try { entry.details.remove(); } catch {}
-
+    const dockable = requireDockableAccordions();
+    const errors = [];
+    try {
+      dockable.unregister(entry.details);
+    } catch (error) {
+      errors.push(error);
+    }
+    try {
+      entry.ui.destroy();
+    } catch (error) {
+      errors.push(error);
+    }
+    try {
+      entry.details.remove();
+    } catch (error) {
+      errors.push(error);
+    }
     this._windows.delete(windowId);
+    if (errors.length > 0) {
+      throw new AggregateError(
+        errors,
+        `Failed to close analysis window "${windowId}"`
+      );
+    }
   }
 
   closeAll() {
-    Array.from(this._windows.keys()).forEach((id) => this.closeWindow(id));
+    const errors = [];
+    for (const id of Array.from(this._windows.keys())) {
+      try {
+        this.closeWindow(id);
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length > 0) {
+      throw new AggregateError(errors, 'Failed to close all analysis windows');
+    }
   }
 
   /**
@@ -207,41 +347,80 @@ export class AnalysisWindowManager {
    * Mirrors ComparisonModule "select all" preservation semantics per window.
    */
   onPagesChanged() {
-    const pages = this._comparisonModule?.dataLayer?.getPages?.() || [];
+    const pages = this._comparisonModule.dataLayer.getPages();
+    if (!Array.isArray(pages)) {
+      throw new TypeError('Analysis data layer must return an array of pages');
+    }
     const currentPageIds = pages.map(p => p.id);
-    const currentPageIdSet = new Set(currentPageIds);
+    const selectablePageIds = this._getSelectablePageIds(pages);
+    const selectablePageIdSet = new Set(selectablePageIds);
+    const selectableBasePageIds = currentPageIds.filter(
+      pageId => selectablePageIdSet.has(pageId)
+    );
 
     for (const entry of this._windows.values()) {
       const ui = entry.ui;
-      if (!ui?.onPageSelectionChange) continue;
+      if (
+        typeof ui.onPageSelectionChange !== 'function' ||
+        typeof ui.getSelectedPages !== 'function'
+      ) {
+        throw new TypeError(
+          `Analysis window "${entry.id}" UI is missing its page selection API`
+        );
+      }
 
-      const previousPageIds = Array.isArray(entry.lastKnownPageIds) ? entry.lastKnownPageIds : [];
+      if (!Array.isArray(entry.lastKnownPageIds)) {
+        throw new TypeError(
+          `Analysis window "${entry.id}" has invalid page history`
+        );
+      }
+      const previousPageIds = entry.lastKnownPageIds;
       const previousPageIdSet = new Set(previousPageIds);
-
-      const addedPageIds = currentPageIds.filter(id => !previousPageIdSet.has(id));
-      const previousSelection = ui?.getSelectedPages?.() ?? [];
+      if (!Array.isArray(entry.lastKnownSelectableBasePageIds)) {
+        throw new TypeError(
+          `Analysis window "${entry.id}" has invalid selectable-page history`
+        );
+      }
+      const previousSelectableBasePageIds =
+        entry.lastKnownSelectableBasePageIds;
+      const previousSelectableBasePageIdSet =
+        new Set(previousSelectableBasePageIds);
+      const addedSelectableBasePageIds = selectableBasePageIds.filter(
+        id => !previousPageIdSet.has(id) ||
+          !previousSelectableBasePageIdSet.has(id)
+      );
+      const previousSelection = ui.getSelectedPages();
+      if (!Array.isArray(previousSelection)) {
+        throw new TypeError(
+          `Analysis window "${entry.id}" selected pages must be an array`
+        );
+      }
       const previousSelectionSet = new Set(previousSelection);
 
       const hadAllPreviously =
-        previousPageIds.length > 0 &&
-        previousPageIds.every(id => previousSelectionSet.has(id));
+        previousSelectableBasePageIds.length > 0 &&
+        previousSelectableBasePageIds.every(
+          id => previousSelectionSet.has(id)
+        );
 
-      const nextSelectionSet = new Set(
-        (previousSelection || []).filter(id => currentPageIdSet.has(id))
+      const nextSelection = previousSelection.filter(
+        id => selectablePageIdSet.has(id)
       );
+      const nextSelectionSet = new Set(nextSelection);
 
       if (hadAllPreviously) {
-        for (const id of addedPageIds) nextSelectionSet.add(id);
+        for (const id of addedSelectableBasePageIds) {
+          if (!nextSelectionSet.has(id)) {
+            nextSelectionSet.add(id);
+            nextSelection.push(id);
+          }
+        }
       }
 
-      if (nextSelectionSet.size === 0) {
-        for (const id of currentPageIds) nextSelectionSet.add(id);
-      }
-
-      const nextSelection = currentPageIds.filter(id => nextSelectionSet.has(id));
       ui.onPageSelectionChange(nextSelection);
 
       entry.lastKnownPageIds = currentPageIds;
+      entry.lastKnownSelectableBasePageIds = selectableBasePageIds;
     }
   }
 
@@ -249,8 +428,46 @@ export class AnalysisWindowManager {
    * Propagate highlight changes (cell counts) to all floating windows.
    */
   onHighlightChanged() {
+    const pages = this._comparisonModule.dataLayer.getPages();
+    if (!Array.isArray(pages)) {
+      throw new TypeError('Analysis data layer must return an array of pages');
+    }
+    const selectablePageIds = this._getSelectablePageIds(pages);
+    const selectablePageIdSet = new Set(selectablePageIds);
+    const basePageIdSet = new Set(pages.map(page => page.id));
+    const selectableBasePageIds = selectablePageIds.filter(
+      pageId => basePageIdSet.has(pageId)
+    );
+
     for (const entry of this._windows.values()) {
-      try { entry.ui?.onHighlightChanged?.(); } catch {}
+      if (
+        typeof entry.ui?.getSelectedPages !== 'function' ||
+        typeof entry.ui?.onPageSelectionChange !== 'function' ||
+        typeof entry.ui?.onHighlightChanged !== 'function'
+      ) {
+        throw new TypeError(
+          `Analysis window "${entry.id}" UI is missing its highlight page API`
+        );
+      }
+      const previousSelection = entry.ui.getSelectedPages();
+      if (!Array.isArray(previousSelection)) {
+        throw new TypeError(
+          `Analysis window "${entry.id}" selected pages must be an array`
+        );
+      }
+      const nextSelection = previousSelection.filter(
+        pageId => selectablePageIdSet.has(pageId)
+      );
+      if (
+        nextSelection.length !== previousSelection.length ||
+        nextSelection.some(
+          (pageId, index) => pageId !== previousSelection[index]
+        )
+      ) {
+        entry.ui.onPageSelectionChange(nextSelection);
+      }
+      entry.lastKnownSelectableBasePageIds = selectableBasePageIds;
+      entry.ui.onHighlightChanged();
     }
   }
 
@@ -258,24 +475,96 @@ export class AnalysisWindowManager {
   // Internal helpers
   // ===========================================================================
 
-  _createWindowFromOrigin(modeId, originUi, options = {}) {
+  _getSelectablePageIds(basePages) {
+    const pages = expandPagesWithDerived(
+      basePages,
+      { includeRestOf: true }
+    );
+    const selectablePageIds = [];
+    const seenPageIds = new Set();
+    for (const page of pages) {
+      if (
+        page === null ||
+        typeof page !== 'object' ||
+        Array.isArray(page) ||
+        typeof page.id !== 'string' ||
+        page.id.length === 0
+      ) {
+        throw new TypeError(
+          'Analysis window pages require a non-empty string id'
+        );
+      }
+      if (seenPageIds.has(page.id)) {
+        throw new TypeError(
+          `Analysis window page ID "${page.id}" is duplicated`
+        );
+      }
+      seenPageIds.add(page.id);
+      const cellCount =
+        this._comparisonModule.dataLayer.getCellCountForPageId(page.id);
+      if (!Number.isSafeInteger(cellCount) || cellCount < 0) {
+        throw new TypeError(
+          `Analysis window page "${page.id}" cell count must be a non-negative safe integer`
+        );
+      }
+      if (cellCount > 0) {
+        selectablePageIds.push(page.id);
+      }
+    }
+    return selectablePageIds;
+  }
+
+  _createWindow(modeId, settings, options = {}) {
     if (this._windows.size >= MAX_ANALYSIS_WINDOWS) {
-      this._notifications.error(`Maximum of ${MAX_ANALYSIS_WINDOWS} analysis windows reached.`);
-      return null;
+      throw new RangeError(
+        `Maximum of ${MAX_ANALYSIS_WINDOWS} analysis windows reached`
+      );
+    }
+    requireNonEmptyString(modeId, 'Analysis mode ID');
+    const exactSettings = requireSettings(settings);
+    if (typeof this._uiManager.getTypeInfo !== 'function') {
+      throw new TypeError('Analysis UI manager must implement getTypeInfo()');
+    }
+    const typeInfo = this._uiManager.getTypeInfo(modeId);
+    if (typeInfo === null || typeof typeInfo !== 'object') {
+      throw new Error(`Unknown analysis mode: ${modeId}`);
+    }
+    if (typeof typeInfo.factory !== 'function') {
+      throw new TypeError(`Analysis mode "${modeId}" must define a factory`);
+    }
+    if (!isPlainObject(typeInfo.factoryOptions)) {
+      throw new TypeError(
+        `Analysis mode "${modeId}" factoryOptions must be an object`
+      );
     }
 
-    const typeInfo = this._uiManager?.getTypeInfo?.(modeId);
-    if (!typeInfo?.factory) {
-      this._notifications.error(`Unknown analysis mode: ${modeId}`);
-      return null;
+    const dockable = requireDockableAccordions();
+    const headerTitle = options.headerTitle === undefined
+      ? getHeaderTitleForMode(typeInfo, modeId)
+      : options.headerTitle;
+    requireNonEmptyString(headerTitle, 'Analysis window headerTitle');
+    const headerDesc = options.headerDesc === undefined ? '' : options.headerDesc;
+    if (typeof headerDesc !== 'string') {
+      throw new TypeError('Analysis window headerDesc must be a string');
     }
-
-    const settings = typeof originUi.exportSettings === 'function'
-      ? originUi.exportSettings()
-      : {
-        selectedPages: originUi?.getSelectedPages?.() ?? [],
-        config: originUi?.getConfig?.() ?? {}
-      };
+    const preferredSize = this._resolvePreferredSize(options);
+    const floatConstraints = this._resolveFloatConstraints(options);
+    const hasLeft = options.left !== undefined;
+    const hasTop = options.top !== undefined;
+    if (hasLeft !== hasTop) {
+      throw new TypeError(
+        'Analysis window position requires both left and top'
+      );
+    }
+    if (
+      hasLeft &&
+      (!isFiniteNumber(options.left) || !isFiniteNumber(options.top))
+    ) {
+      throw new TypeError('Analysis window left and top must be finite numbers');
+    }
+    const computed = hasLeft
+      ? { left: options.left, top: options.top }
+      : this._computeInitialPosition(options.sourceRect);
 
     this._counter += 1;
     const windowId = createWindowId(this._counter);
@@ -290,8 +579,6 @@ export class AnalysisWindowManager {
     details.setAttribute('data-state-serializer-skip', 'true');
 
     const summary = document.createElement('summary');
-    const headerTitle = options.headerTitle?.trim?.() || getHeaderTitleForMode(typeInfo, modeId);
-    const headerDesc = options.headerDesc?.trim?.() || '';
 
     const titleEl = document.createElement('span');
     titleEl.className = 'analysis-accordion-title';
@@ -340,11 +627,31 @@ export class AnalysisWindowManager {
     content.className = 'accordion-content';
     details.appendChild(content);
 
-    const floatingRoot = getDockableAccordions()?.floatingRoot || ensureFloatingRoot();
-    floatingRoot.appendChild(details);
-
-    const currentPages = this._comparisonModule?.dataLayer?.getPages?.() || [];
-    const currentPageIds = currentPages.map(p => p.id);
+    const currentPages = this._comparisonModule.dataLayer.getPages();
+    if (!Array.isArray(currentPages)) {
+      throw new TypeError('Analysis data layer must return an array of pages');
+    }
+    const currentPageIds = [];
+    const seenPageIds = new Set();
+    for (const page of currentPages) {
+      if (
+        page === null ||
+        typeof page !== 'object' ||
+        typeof page.id !== 'string' ||
+        page.id.length === 0
+      ) {
+        throw new TypeError('Analysis pages require non-empty string IDs');
+      }
+      if (seenPageIds.has(page.id)) {
+        throw new TypeError(`Analysis page ID "${page.id}" is duplicated`);
+      }
+      seenPageIds.add(page.id);
+      currentPageIds.push(page.id);
+    }
+    const currentPageIdSet = new Set(currentPageIds);
+    const currentSelectableBasePageIds = this._getSelectablePageIds(
+      currentPages
+    ).filter(pageId => currentPageIdSet.has(pageId));
 
     const windowEntry = {
       id: windowId,
@@ -353,112 +660,199 @@ export class AnalysisWindowManager {
       content,
       ui: null,
       lastKnownPageIds: currentPageIds,
+      lastKnownSelectableBasePageIds: currentSelectableBasePageIds,
       headerTitle,
       headerDesc,
-      floatConstraints: this._resolveFloatConstraints(options)
+      floatConstraints
     };
 
-    this._windows.set(windowId, windowEntry);
-
+    dockable.floatingRoot.appendChild(details);
+    let ui = null;
+    let registrationAttempted = false;
     try {
-      const factoryOptions = { ...(typeInfo.factoryOptions || {}) };
-      delete factoryOptions.onConfigChange;
+      const {
+        onConfigChange: _embeddedConfigCallback,
+        ...factoryOptions
+      } = typeInfo.factoryOptions;
 
-      const ui = typeInfo.factory({
+      ui = typeInfo.factory({
+        ...factoryOptions,
         comparisonModule: this._comparisonModule,
         dataLayer: this._comparisonModule.dataLayer,
         multiVariableAnalysis: this._comparisonModule.multiVariableAnalysis,
         container: content,
-        instanceId: windowId,
-        ...factoryOptions
+        instanceId: windowId
       });
 
-      if (ui?.init && !ui?._container) {
-        ui.init(content);
+      if (
+        ui === null ||
+        typeof ui !== 'object' ||
+        ui._container !== content
+      ) {
+        throw new TypeError(
+          `Analysis factory "${modeId}" must return a fully initialized UI in the supplied container`
+        );
       }
-
-      if (ui && settings) {
-        if (typeof ui.importSettings === 'function') ui.importSettings(settings);
-        else {
-          if (Array.isArray(settings.selectedPages) && ui.onPageSelectionChange) {
-            ui.onPageSelectionChange(settings.selectedPages);
-          }
-          if (settings.config && ui.setConfig) ui.setConfig(settings.config);
+      for (const method of [
+        'destroy',
+        'exportSettings',
+        'getSelectedPages',
+        'importSettings',
+        'onHighlightChanged',
+        'onPageSelectionChange'
+      ]) {
+        if (typeof ui[method] !== 'function') {
+          throw new TypeError(
+            `Analysis factory "${modeId}" UI must implement ${method}()`
+          );
         }
       }
-
+      ui.importSettings(exactSettings);
       windowEntry.ui = ui;
-    } catch (err) {
-      console.warn('[AnalysisWindowManager] Failed to create analysis window:', err);
-      this._notifications.error('Failed to create analysis window.');
-      this.closeWindow(windowId);
-      return null;
-    }
-
-    const computed = this._computeInitialPosition(options.sourceRect);
-    const left = isFiniteNumber(options.left) ? options.left : computed.left;
-    const top = isFiniteNumber(options.top) ? options.top : computed.top;
-    const preferredSize = this._resolvePreferredSize(options);
-    const floatConstraints = this._windows.get(windowId)?.floatConstraints;
-
-    // Enable floating interactions (drag/resize) using dockable-accordions.
-    const dockable = getDockableAccordions();
-    if (dockable?.register) {
-      try {
-        dockable.register(details, { dockable: false });
-        dockable.float(details, { left, top, preferredSize, constraints: floatConstraints });
-      } catch (err) {
-        console.warn('[AnalysisWindowManager] Dockable integration failed:', err);
-        try { dockable.unregister(details); } catch {}
-        details.classList.add('accordion-floating');
-        StyleManager.setPosition(details, {
-          x: left,
-          y: top,
-          width: preferredSize?.width,
-          height: preferredSize?.height,
-        });
-        StyleManager.setLayer(details, 'floating');
-      }
-    } else {
-      // Fallback: make the panel visible/interactive even if dockable accordions were not initialized.
-      details.classList.add('accordion-floating');
-      StyleManager.setPosition(details, {
-        x: left,
-        y: top,
-        width: preferredSize?.width,
-        height: preferredSize?.height,
+      registrationAttempted = true;
+      dockable.register(details, { dockable: false });
+      dockable.float(details, {
+        left: computed.left,
+        top: computed.top,
+        preferredSize,
+        constraints: floatConstraints
       });
-      StyleManager.setLayer(details, 'floating');
+      this._windows.set(windowId, windowEntry);
+      return windowId;
+    } catch (error) {
+      const cleanupErrors = [];
+      if (registrationAttempted) {
+        try {
+          dockable.unregister(details);
+        } catch (cleanupError) {
+          cleanupErrors.push(cleanupError);
+        }
+      }
+      if (ui && typeof ui.destroy === 'function') {
+        try {
+          ui.destroy();
+        } catch (cleanupError) {
+          cleanupErrors.push(cleanupError);
+        }
+      }
+      try {
+        details.remove();
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+      this._windows.delete(windowId);
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError(
+          [error, ...cleanupErrors],
+          `Analysis window "${windowId}" creation and rollback failed`
+        );
+      }
+      throw error;
     }
-
-    return windowId;
   }
 
   _resolvePreferredSize(options = {}) {
-    if (isFiniteNumber(options?.preferredSize?.width) || isFiniteNumber(options?.preferredSize?.height)) {
+    if (options.preferredSize !== undefined) {
+      if (!isPlainObject(options.preferredSize)) {
+        throw new TypeError('Analysis window preferredSize must be an object');
+      }
+      const keys = Object.keys(options.preferredSize);
+      if (
+        keys.some(key => key !== 'width' && key !== 'height') ||
+        (!keys.includes('width') && !keys.includes('height'))
+      ) {
+        throw new TypeError(
+          'Analysis window preferredSize supports only width and height'
+        );
+      }
+      const { width, height } = options.preferredSize;
+      if (
+        width !== undefined &&
+        (!isFiniteNumber(width) || width <= 0)
+      ) {
+        throw new TypeError(
+          'Analysis window preferred width must be a positive finite number'
+        );
+      }
+      if (
+        height !== undefined &&
+        (!isFiniteNumber(height) || height <= 0)
+      ) {
+        throw new TypeError(
+          'Analysis window preferred height must be a positive finite number'
+        );
+      }
+      if (width === undefined && height === undefined) {
+        throw new TypeError(
+          'Analysis window preferredSize requires width or height'
+        );
+      }
       return {
-        width: isFiniteNumber(options.preferredSize.width) ? options.preferredSize.width : undefined,
-        height: isFiniteNumber(options.preferredSize.height) ? options.preferredSize.height : undefined
+        width,
+        height
       };
     }
 
-    const rect = options?.sourceRect;
-    if (rect && isFiniteNumber(rect.width) && isFiniteNumber(rect.height)) {
-      return { width: rect.width, height: rect.height };
+    if (options.sourceRect !== undefined) {
+      if (
+        !isDomRectLike(options.sourceRect) ||
+        options.sourceRect.width <= 0 ||
+        options.sourceRect.height <= 0
+      ) {
+        throw new TypeError(
+          'Analysis window sourceRect requires a positive finite DOM rectangle'
+        );
+      }
+      return {
+        width: options.sourceRect.width,
+        height: options.sourceRect.height
+      };
     }
 
     return null;
   }
 
   _resolveFloatConstraints(options = {}) {
-    if (options?.constraints) return options.constraints;
+    if (options.constraints !== undefined) {
+      requireExactKeys(
+        options.constraints,
+        ['maxHeight', 'maxWidth', 'minHeight', 'minWidth'],
+        'Analysis window constraints'
+      );
+      const { minWidth, maxWidth, minHeight, maxHeight } = options.constraints;
+      if (
+        !isFiniteNumber(minWidth) ||
+        !isFiniteNumber(maxWidth) ||
+        !isFiniteNumber(minHeight) ||
+        !(isFiniteNumber(maxHeight) || maxHeight === Infinity) ||
+        minWidth <= 0 ||
+        maxWidth < minWidth ||
+        minHeight < 0 ||
+        maxHeight < minHeight
+      ) {
+        throw new TypeError('Analysis window constraints are invalid');
+      }
+      return structuredClone(options.constraints);
+    }
 
-    const sidebarWidth = this._sidebar?.getBoundingClientRect?.().width;
-    const referenceWidth = isFiniteNumber(options?.preferredSize?.width)
-      ? options.preferredSize.width
-      : this._sidebar?.querySelector?.('details.accordion-section')?.getBoundingClientRect?.().width;
-
-    const gutter = isFiniteNumber(sidebarWidth) && isFiniteNumber(referenceWidth)
+    if (typeof this._sidebar.getBoundingClientRect !== 'function') {
+      throw new TypeError('Analysis window sidebar must expose its geometry');
+    }
+    const sidebarWidth = this._sidebar.getBoundingClientRect().width;
+    if (!isFiniteNumber(sidebarWidth) || sidebarWidth <= 0) {
+      throw new TypeError('Analysis window sidebar width must be positive and finite');
+    }
+    const preferredWidth = options.preferredSize?.width;
+    let referenceWidth;
+    if (preferredWidth !== undefined) {
+      referenceWidth = preferredWidth;
+    } else {
+      const referenceDetails = typeof this._sidebar.querySelector === 'function'
+        ? this._sidebar.querySelector('details.accordion-section')
+        : null;
+      referenceWidth = referenceDetails?.getBoundingClientRect().width;
+    }
+    const gutter = isFiniteNumber(referenceWidth)
       ? Math.max(0, sidebarWidth - referenceWidth)
       : 0;
 
@@ -476,13 +870,30 @@ export class AnalysisWindowManager {
   _computeInitialPosition(sourceRect) {
     const viewportWidth = window.innerWidth;
     const viewportHeight = window.innerHeight;
+    if (
+      !isFiniteNumber(viewportWidth) ||
+      !isFiniteNumber(viewportHeight) ||
+      viewportWidth <= 0 ||
+      viewportHeight <= 0
+    ) {
+      throw new TypeError('Analysis window requires a positive finite viewport');
+    }
 
-    const sidebarRect = this._sidebar?.getBoundingClientRect?.();
-    const baseLeft = sidebarRect ? sidebarRect.right + 24 : 24;
+    if (typeof this._sidebar.getBoundingClientRect !== 'function') {
+      throw new TypeError('Analysis window sidebar must expose its geometry');
+    }
+    const sidebarRect = this._sidebar.getBoundingClientRect();
+    if (!isDomRectLike(sidebarRect)) {
+      throw new TypeError('Analysis window sidebar geometry is invalid');
+    }
+    if (sourceRect !== undefined && !isDomRectLike(sourceRect)) {
+      throw new TypeError('Analysis window source geometry is invalid');
+    }
+    const baseLeft = sidebarRect.right + 24;
     const baseTop = 80;
 
-    const anchorLeft = isDomRectLike(sourceRect) ? sourceRect.right + 24 : baseLeft;
-    const anchorTop = isDomRectLike(sourceRect) ? sourceRect.top : baseTop;
+    const anchorLeft = sourceRect === undefined ? baseLeft : sourceRect.right + 24;
+    const anchorTop = sourceRect === undefined ? baseTop : sourceRect.top;
 
     // Light cascade so repeated copies don't fully overlap.
     const cascade = (this._windows.size % 8) * 18;

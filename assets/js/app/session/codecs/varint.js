@@ -18,15 +18,14 @@
  * @param {number[]} out
  */
 export function pushUvarint(value, out) {
-  // Defensive: coerce and validate.
-  const n = Number(value);
-  if (!Number.isFinite(n) || n < 0) {
-    throw new Error(`pushUvarint: invalid value ${value}`);
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError('pushUvarint: value must be a non-negative safe integer.');
+  }
+  if (!Array.isArray(out)) {
+    throw new TypeError('pushUvarint: out must be an Array.');
   }
 
-  // Varint encodes 7 bits per byte.
-  // We use >>> 0 only for the fast path, but keep the loop generic for JS numbers.
-  let v = n;
+  let v = value;
   while (v >= 0x80) {
     // Use modulo instead of bitwise ops so values > 2^32 remain correct.
     const low7 = v % 0x80;
@@ -55,7 +54,10 @@ export function encodeUvarint(value) {
  */
 export function decodeUvarint(bytes, offset = 0) {
   if (!(bytes instanceof Uint8Array)) {
-    throw new Error('decodeUvarint: expected Uint8Array.');
+    throw new TypeError('decodeUvarint: expected Uint8Array.');
+  }
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > bytes.byteLength) {
+    throw new TypeError('decodeUvarint: offset must be an exact in-range byte offset.');
   }
   let result = 0;
   let shift = 0;
@@ -67,10 +69,14 @@ export function decodeUvarint(bytes, offset = 0) {
       throw new Error('decodeUvarint: truncated varint.');
     }
     const b = bytes[pos++];
-    result += (b & 0x7f) * Math.pow(2, shift);
+    const group = b & 0x7f;
+    result += group * Math.pow(2, shift);
+    if (!Number.isSafeInteger(result)) {
+      throw new Error('decodeUvarint: value exceeds JS safe integer range.');
+    }
     if ((b & 0x80) === 0) {
-      if (!Number.isSafeInteger(result)) {
-        throw new Error('decodeUvarint: value exceeds JS safe integer range.');
+      if (i > 0 && group === 0) {
+        throw new Error('decodeUvarint: non-canonical varint encoding.');
       }
       return { value: result, nextOffset: pos };
     }

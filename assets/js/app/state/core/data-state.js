@@ -31,22 +31,25 @@ export class DataState extends EventEmitter {
     this.varFieldLoader = null;
 
     this.pointCount = 0;
-    this.positionsArray = null;       // normalized positions used for smoke density
-    this.colorsArray = null;
-    this.outlierQuantilesArray = null;
-    this.categoryTransparency = null;
+    this.positionsArray = new Float32Array(0); // normalized positions used for smoke density
+    this.colorsArray = new Uint8Array(0);
+    this.outlierQuantilesArray = new Float32Array(0);
+    this.categoryTransparency = new Float32Array(0);
+    this.cellVisibilityMask = new Float32Array(0);
     this.obsData = null;
     this.varData = null;
+    this._obsFieldDescriptors = Object.freeze([]);
+    this._varFieldDescriptors = Object.freeze([]);
     this.activeFieldIndex = -1;
     this.activeVarFieldIndex = -1;
     this.activeFieldSource = null; // 'obs', 'var', or null
     this.filteredCount = { shown: 0, total: 0 };
 
     this.centroidCount = 0;
-    this.centroidPositions = null;
-    this.centroidColors = null; // RGBA uint8 (alpha packed in)
+    this.centroidPositions = new Float32Array(0);
+    this.centroidColors = new Uint8Array(0); // RGBA uint8 (alpha packed in)
     this.centroidLabels = [];
-    this.centroidOutliers = null;
+    this.centroidOutliers = new Float32Array(0);
 
     this._visibilityScratch = null; // reusable mask for connectivity visibility
     this._activeCategoryCounts = null;
@@ -60,7 +63,7 @@ export class DataState extends EventEmitter {
 
     // Multi-dimensional embedding support
     this.dimensionManager = null; // Set via setDimensionManager()
-    this.activeDimensionLevel = 3; // Current dimension level for live view (1, 2, 3, or 4)
+    this.activeDimensionLevel = 3; // Current dimension level for live view (1, 2, or 3)
     this._dimensionChangeLock = null; // Serializes async dimension changes to prevent cross-await state corruption
 
     // Optional per-cell vector fields (e.g., velocity, CellRank drift) tied to embedding dimensions.
@@ -93,6 +96,11 @@ export class DataState extends EventEmitter {
 
     // Bind singleton registry for fast lookups.
     getFieldRegistry().bind(this);
+
+    // UI controls are initialized even when no dataset is selected. Publish
+    // that zero-cell runtime as the same exact live-view contract used after
+    // dataset adoption, so startup never needs a fabricated view identity.
+    this._resetViewContexts();
   }
 }
 

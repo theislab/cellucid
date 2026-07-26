@@ -27,7 +27,11 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
   const centroidPointsCheckbox = dom?.centroidPointsCheckbox || null;
   const centroidLabelsCheckbox = dom?.centroidLabelsCheckbox || null;
 
-  const { refreshCategoryCounts, renderCategoricalLegend } = initCategoricalLegend({ state, legendEl, dataSourceManager });
+  const {
+    refreshCategoryCounts,
+    renderCategoricalLegend,
+    destroy: destroyCategoricalLegend
+  } = initCategoricalLegend({ state, legendEl, dataSourceManager });
 
   function setDisplayOptionsVisibility(field) {
     if (!displayOptionsContainer) return;
@@ -37,10 +41,23 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
   function render(field) {
     if (!legendEl) return;
     setDisplayOptionsVisibility(field);
-    legendEl.innerHTML = '';
-    if (!field) return;
+    if (!field) {
+      legendEl.replaceChildren();
+      return;
+    }
     const model = state.getLegendModel(field);
-    if (!model) return;
+    if (
+      model === null
+      || typeof model !== 'object'
+      || (model.kind !== 'continuous' && model.kind !== 'category')
+    ) {
+      throw new TypeError('Legend renderer requires an exact legend model');
+    }
+    if (model.kind === 'category') {
+      renderCategoricalLegend(field, model);
+      return;
+    }
+    legendEl.replaceChildren();
 
     function formatLegendNumber(value) {
       if (value === null || value === undefined || !Number.isFinite(value)) return '—';
@@ -391,8 +408,6 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
       setLiveToggleUI(true);
       updateDisplayFromSliders();
       if (liveFilteringEnabled) applyFilterFromSliders();
-    } else {
-      renderCategoricalLegend(field, model);
     }
   }
 
@@ -473,5 +488,6 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
     render,
     refreshCategoryCounts,
     handleOutlierUI,
+    destroy: destroyCategoricalLegend,
   };
 }

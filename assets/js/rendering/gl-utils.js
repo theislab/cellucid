@@ -1,4 +1,22 @@
 // WebGL helpers for shader/program creation and data normalization.
+export function createRequiredTexture(gl, role) {
+  if (!gl || typeof gl.createTexture !== 'function') {
+    throw new TypeError(
+      'Required WebGL texture allocation needs a WebGL2 context.'
+    );
+  }
+  if (typeof role !== 'string' || role.length === 0) {
+    throw new TypeError('Required WebGL allocation needs a non-empty texture role.');
+  }
+  const texture = gl.createTexture();
+  if (texture === null) {
+    throw new Error(
+      `WebGL2 could not allocate the required ${role} texture.`
+    );
+  }
+  return texture;
+}
+
 export function createShader(gl, type, source) {
   const shader = gl.createShader(type);
   gl.shaderSource(shader, source);

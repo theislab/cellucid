@@ -12,15 +12,148 @@
 import {
   COLOR_PICKER_PALETTE,
   CONTINUOUS_COLORMAPS,
+  DEFAULT_COLORMAP_ID,
   getCategoryColor,
-  getColormap,
   getCssStopsForColormap,
   sampleContinuousColormap
 } from '../../../data/palettes.js';
-import { clamp } from '../../utils/number-utils.js';
 import { NEUTRAL_GRAY_UINT8 } from '../core/constants.js';
 import { BaseManager } from '../core/base-manager.js';
 import { colorOutlierMethods } from './color-outliers.js';
+
+function requireBoolean(value, context) {
+  if (typeof value !== 'boolean') {
+    throw new TypeError(`${context} must be exactly true or false.`);
+  }
+  return value;
+}
+
+function requireContinuousField(field) {
+  if (
+    field === null
+    || typeof field !== 'object'
+    || Array.isArray(field)
+    || field.kind !== 'continuous'
+  ) {
+    throw new TypeError('Continuous color operations require a continuous field.');
+  }
+  if (
+    !(field.values instanceof Float32Array)
+    && !(field.values instanceof Float64Array)
+  ) {
+    throw new TypeError('Continuous field values must be a Float32Array or Float64Array.');
+  }
+  return field;
+}
+
+function requireFiniteRange(range, context, bounds = null) {
+  if (
+    range === null
+    || typeof range !== 'object'
+    || Array.isArray(range)
+    || Object.keys(range).sort().join(',') !== 'max,min'
+    || !Number.isFinite(range.min)
+    || !Number.isFinite(range.max)
+  ) {
+    throw new TypeError(`${context} must contain exactly finite min and max values.`);
+  }
+  if (range.min > range.max) {
+    throw new RangeError(`${context} min must not exceed max.`);
+  }
+  if (
+    bounds !== null
+    && (range.min < bounds.min || range.max > bounds.max)
+  ) {
+    throw new RangeError(`${context} must stay within the field data range.`);
+  }
+  return range;
+}
+
+function requireColormap(colormapId) {
+  if (typeof colormapId !== 'string' || colormapId.length === 0) {
+    throw new TypeError('Continuous colormap id must be a nonempty string.');
+  }
+  const colormap = CONTINUOUS_COLORMAPS.find(entry => entry.id === colormapId);
+  if (!colormap) {
+    throw new RangeError(`Continuous colormap "${colormapId}" is not supported.`);
+  }
+  return colormap;
+}
+
+function requireRgb(color, context) {
+  if (!Array.isArray(color) || color.length !== 3) {
+    throw new TypeError(`${context} must be an RGB triplet.`);
+  }
+  for (let channel = 0; channel < color.length; channel++) {
+    if (
+      !Number.isFinite(color[channel])
+      || color[channel] < 0
+      || color[channel] > 1
+    ) {
+      throw new RangeError(`${context} channels must be finite values from 0 through 1.`);
+    }
+  }
+  return color;
+}
+
+function requireCategoryField(field) {
+  if (
+    field === null
+    || typeof field !== 'object'
+    || Array.isArray(field)
+    || field.kind !== 'category'
+    || !Array.isArray(field.categories)
+    || field.categories.length === 0
+  ) {
+    throw new TypeError('Category color operations require a nonempty category field.');
+  }
+  const categories = new Set();
+  for (let index = 0; index < field.categories.length; index++) {
+    const category = field.categories[index];
+    const type = typeof category;
+    if (
+      (type !== 'string' && type !== 'number' && type !== 'boolean')
+      || (type === 'number' && !Number.isFinite(category))
+    ) {
+      throw new TypeError(
+        `Category ${index} must be a string, finite number, or boolean.`
+      );
+    }
+    if (categories.has(category)) {
+      throw new TypeError(`Category ${index} duplicates an existing category label.`);
+    }
+    categories.add(category);
+  }
+  return field;
+}
+
+function computeContinuousDomain(field, meta, useLog) {
+  const useFilterRange = field._useFilterColorRange;
+  const baseDomain = useFilterRange ? meta.colorRange : meta.stats;
+  let domainMin = baseDomain.min;
+  let domainMax = baseDomain.max;
+
+  if (useLog) {
+    const positive = meta.positiveStats;
+    if (positive === null) {
+      throw new RangeError('Log color scale requires at least one positive field value.');
+    }
+    domainMin = Math.max(domainMin, positive.min);
+    domainMax = Math.min(domainMax, positive.max);
+    if (domainMin > domainMax) {
+      throw new RangeError(
+        'Log color scale requires the selected color range to include a positive value.'
+      );
+    }
+  }
+
+  return {
+    min: domainMin,
+    max: domainMax,
+    scale: useLog ? 'log' : 'linear',
+    usingFilter: useFilterRange
+  };
+}
 
 export class DataStateColorMethods {
   _updateActiveCategoryCounts() {
@@ -36,171 +169,182 @@ export class DataStateColorMethods {
   }
 
   ensureContinuousMetadata(field) {
-    if (!field || field.kind !== 'continuous') return null;
-    const needsStats = !field._continuousStats
-      || !isFinite(field._continuousStats.min)
-      || !isFinite(field._continuousStats.max);
-    if (needsStats) {
-      const values = field.values || [];
-      let min = Infinity;
-      let max = -Infinity;
-      for (let i = 0; i < values.length; i++) {
-        const v = values[i];
-        if (v === null || Number.isNaN(v)) continue;
-        if (v < min) min = v;
-        if (v > max) max = v;
+    requireContinuousField(field);
+    if (field.values.length !== this.pointCount) {
+      throw new RangeError('Continuous field values must match the current point count.');
+    }
+
+    let min = Infinity;
+    let max = -Infinity;
+    let minPositive = Infinity;
+    let maxPositive = -Infinity;
+    for (let index = 0; index < field.values.length; index++) {
+      const value = field.values[index];
+      if (Number.isNaN(value)) continue;
+      if (!Number.isFinite(value)) {
+        throw new TypeError(`Continuous field value ${index} must be finite or NaN.`);
       }
-      if (!isFinite(min) || !isFinite(max)) {
-        min = 0; max = 1;
-      }
-      if (max === min) max = min + 1;
-      if (!field._continuousStats) field._continuousStats = { min, max };
-      else {
-        field._continuousStats.min = min;
-        field._continuousStats.max = max;
+      if (value < min) min = value;
+      if (value > max) max = value;
+      if (value > 0) {
+        if (value < minPositive) minPositive = value;
+        if (value > maxPositive) maxPositive = value;
       }
     }
-    if (!field._continuousFilter) {
-      field._continuousFilter = {
-        min: field._continuousStats.min,
-        max: field._continuousStats.max
+    if (min === Infinity) {
+      throw new RangeError('Continuous field must contain at least one finite value.');
+    }
+
+    const computedStats = { min, max };
+    let stats;
+    if (field._continuousStats === undefined) {
+      stats = computedStats;
+    } else {
+      requireFiniteRange(field._continuousStats, 'Continuous field statistics');
+      if (
+        field._continuousStats.min !== computedStats.min
+        || field._continuousStats.max !== computedStats.max
+      ) {
+        throw new RangeError('Continuous field statistics do not match its values.');
+      }
+      stats = field._continuousStats;
+    }
+
+    let filter;
+    if (field._continuousFilter === undefined) {
+      filter = {
+        min: stats.min,
+        max: stats.max
       };
     } else {
-      field._continuousFilter.min = Math.max(
-        field._continuousStats.min,
-        Math.min(field._continuousFilter.min, field._continuousStats.max)
+      filter = requireFiniteRange(
+        field._continuousFilter,
+        'Continuous filter range',
+        stats
       );
-      field._continuousFilter.max = Math.max(
-        field._continuousStats.min,
-        Math.min(field._continuousFilter.max, field._continuousStats.max)
-      );
-      if (field._continuousFilter.min > field._continuousFilter.max) {
-        field._continuousFilter.min = field._continuousStats.min;
-        field._continuousFilter.max = field._continuousStats.max;
-      }
     }
-    if (field._useFilterColorRange == null) field._useFilterColorRange = true;
-    if (!field._continuousColorRange) {
-      field._continuousColorRange = {
-        min: field._continuousFilter.min,
-        max: field._continuousFilter.max
+
+    let useFilterColorRange;
+    if (field._useFilterColorRange === undefined) {
+      useFilterColorRange = true;
+    } else {
+      useFilterColorRange = requireBoolean(
+        field._useFilterColorRange,
+        'Continuous color rescale'
+      );
+    }
+
+    let colorRange;
+    if (field._continuousColorRange === undefined) {
+      colorRange = {
+        min: filter.min,
+        max: filter.max
       };
     } else {
-      field._continuousColorRange.min = Math.max(
-        field._continuousStats.min,
-        Math.min(field._continuousColorRange.min, field._continuousStats.max)
+      colorRange = requireFiniteRange(
+        field._continuousColorRange,
+        'Continuous color range',
+        stats
       );
-      field._continuousColorRange.max = Math.max(
-        field._continuousStats.min,
-        Math.min(field._continuousColorRange.max, field._continuousStats.max)
+    }
+
+    const computedPositiveStats = minPositive === Infinity
+      ? null
+      : { min: minPositive, max: maxPositive };
+    let positiveStats;
+    if (field._positiveStats === undefined) {
+      positiveStats = computedPositiveStats;
+    } else if (field._positiveStats === null) {
+      if (computedPositiveStats !== null) {
+        throw new RangeError('Continuous positive statistics do not match its values.');
+      }
+      positiveStats = null;
+    } else {
+      requireFiniteRange(field._positiveStats, 'Continuous positive statistics');
+      if (
+        field._positiveStats.min <= 0
+        || field._positiveStats.min !== computedPositiveStats?.min
+        || field._positiveStats.max !== computedPositiveStats?.max
+      ) {
+        throw new RangeError('Continuous positive statistics do not match its values.');
+      }
+      positiveStats = field._positiveStats;
+    }
+
+    let useLogScale;
+    if (field._useLogScale === undefined) {
+      useLogScale = false;
+    } else {
+      useLogScale = requireBoolean(field._useLogScale, 'Continuous log scale');
+    }
+
+    const colormapId = field._colormapId === undefined
+      ? DEFAULT_COLORMAP_ID
+      : field._colormapId;
+    requireColormap(colormapId);
+
+    let filterEnabled;
+    if (field._filterEnabled === undefined) {
+      filterEnabled = true;
+    } else {
+      filterEnabled = requireBoolean(field._filterEnabled, 'Continuous filter enabled');
+    }
+
+    if (useLogScale) {
+      computeContinuousDomain(
+        { _useFilterColorRange: useFilterColorRange },
+        {
+          stats,
+          colorRange,
+          positiveStats
+        },
+        true
       );
-      if (field._continuousColorRange.min > field._continuousColorRange.max) {
-        field._continuousColorRange.min = field._continuousStats.min;
-        field._continuousColorRange.max = field._continuousStats.max;
-      }
     }
-    const needsPositiveStats = !field._positiveStats
-      || !isFinite(field._positiveStats.min)
-      || !isFinite(field._positiveStats.max);
-    if (needsPositiveStats) {
-      const values = field.values || [];
-      let minPos = Infinity;
-      let maxPos = -Infinity;
-      for (let i = 0; i < values.length; i++) {
-        const v = values[i];
-        if (v === null || Number.isNaN(v) || v <= 0) continue;
-        if (v < minPos) minPos = v;
-        if (v > maxPos) maxPos = v;
-      }
-      field._positiveStats = (minPos !== Infinity && maxPos !== -Infinity)
-        ? { min: minPos, max: maxPos }
-        : null;
-    }
-    if (field._useLogScale == null) field._useLogScale = false;
-    const colormap = getColormap(field._colormapId);
-    field._colormapId = colormap.id;
+
+    field._continuousStats = stats;
+    field._continuousFilter = filter;
+    field._useFilterColorRange = useFilterColorRange;
+    field._continuousColorRange = colorRange;
+    field._positiveStats = positiveStats;
+    field._useLogScale = useLogScale;
+    field._colormapId = colormapId;
+    field._filterEnabled = filterEnabled;
+
     return {
-      stats: field._continuousStats,
-      filter: field._continuousFilter,
-      colorRange: field._continuousColorRange,
-      positiveStats: field._positiveStats
+      stats,
+      filter,
+      colorRange,
+      positiveStats
     };
   }
 
   getContinuousColorDomain(field) {
-    if (!field || field.kind !== 'continuous') {
-      return { min: 0, max: 1, scale: 'linear', usingFilter: false };
-    }
     const meta = this.ensureContinuousMetadata(field);
-    if (!meta) return { min: 0, max: 1, scale: 'linear', usingFilter: false };
-    const stats = meta.stats;
-    const useFilterRange = field._useFilterColorRange === true;
-    const baseDomain = useFilterRange ? meta.colorRange : stats;
-    const requestedLog = field._useLogScale === true;
-
-    let domainMin = baseDomain?.min ?? stats.min;
-    let domainMax = baseDomain?.max ?? stats.max;
-    let scale = requestedLog ? 'log' : 'linear';
-
-    if (scale === 'log') {
-      const pos = meta.positiveStats;
-      if (pos && pos.min > 0 && pos.max > 0) {
-        domainMin = Math.max(domainMin, pos.min);
-        domainMax = Math.min(domainMax, pos.max);
-        if (!isFinite(domainMin) || domainMin <= 0) domainMin = pos.min;
-        if (!isFinite(domainMax) || domainMax <= 0) domainMax = pos.max;
-        if (domainMax <= domainMin) {
-          domainMin = pos.min;
-          domainMax = pos.max;
-        }
-      } else {
-        // No positive values to drive a log scale; fall back to a safe dummy range
-        domainMin = 1;
-        domainMax = 10;
-      }
-    }
-
-    if (!isFinite(domainMin) || !isFinite(domainMax)) {
-      domainMin = stats.min;
-      domainMax = stats.max;
-    }
-
-    if (scale === 'log') {
-      if (domainMin <= 0) domainMin = Math.max(domainMax / 10, 1e-6);
-      if (domainMax <= domainMin) domainMax = domainMin * 10;
-    } else if (domainMax === domainMin) {
-      domainMax = domainMin + 1;
-    }
-
-    return {
-      min: domainMin,
-      max: domainMax,
-      scale,
-      usingFilter: useFilterRange
-    };
+    return computeContinuousDomain(field, meta, field._useLogScale);
   }
 
   updateColorsContinuous(field, { resetTransparency = false } = {}) {
-    if (!field || field.kind !== 'continuous') return;
-    const meta = this.ensureContinuousMetadata(field);
+    requireBoolean(resetTransparency, 'Continuous transparency reset');
+    this.ensureContinuousMetadata(field);
     const domain = this.getContinuousColorDomain(field);
-    const colormap = getColormap(field._colormapId);
+    const colormap = requireColormap(field._colormapId);
     const useLog = domain.scale === 'log';
-    let domainMin = domain.min;
-    let domainMax = domain.max;
-    if (!isFinite(domainMin) || !isFinite(domainMax) || domainMin === domainMax) {
-      domainMin = meta?.stats?.min ?? 0;
-      domainMax = meta?.stats?.max ?? (domainMin + 1);
-      if (domainMax === domainMin) domainMax = domainMin + 1;
-    }
+    const domainMin = domain.min;
+    const domainMax = domain.max;
     const logMin = useLog ? Math.log10(domainMin) : 0;
     const denom = useLog ? (Math.log10(domainMax) - logMin) : (domainMax - domainMin);
-    const range = denom || 1;
-    const values = field.values || [];
+    const isConstantDomain = denom === 0;
+    const values = field.values;
     const n = this.pointCount;
 
-    if (!this.categoryTransparency || this.categoryTransparency.length !== n) {
-      this.categoryTransparency = new Float32Array(n);
+    if (
+      !(this.colorsArray instanceof Uint8Array)
+      || this.colorsArray.length !== n * 4
+      || !(this.categoryTransparency instanceof Float32Array)
+      || this.categoryTransparency.length !== n
+    ) {
+      throw new TypeError('Continuous coloring requires complete color and transparency buffers.');
     }
     if (resetTransparency) {
       this.categoryTransparency.fill(1.0);
@@ -209,14 +353,16 @@ export class DataStateColorMethods {
     for (let i = 0; i < n; i++) {
       const v = values[i];
       let r, g, b;
-      if (v === null || Number.isNaN(v) || (useLog && v <= 0)) {
+      if (Number.isNaN(v) || (useLog && v <= 0)) {
         r = NEUTRAL_GRAY_UINT8; g = NEUTRAL_GRAY_UINT8; b = NEUTRAL_GRAY_UINT8;
       } else {
         let t;
-        if (useLog) {
-          t = (Math.log10(v) - logMin) / range;
+        if (isConstantDomain) {
+          t = 0.5;
+        } else if (useLog) {
+          t = (Math.log10(v) - logMin) / denom;
         } else {
-          t = (v - domainMin) / range;
+          t = (v - domainMin) / denom;
         }
         const c = sampleContinuousColormap(colormap.id, t);
         // Convert from 0-1 float to 0-255 uint8
@@ -237,59 +383,124 @@ export class DataStateColorMethods {
   _syncColorsAlpha() {
     const n = this.pointCount;
     const alpha = this.categoryTransparency;
+    if (
+      !(this.colorsArray instanceof Uint8Array)
+      || this.colorsArray.length !== n * 4
+      || !(alpha instanceof Float32Array)
+      || alpha.length !== n
+    ) {
+      throw new TypeError('Color alpha synchronization requires complete typed buffers.');
+    }
     for (let i = 0; i < n; i++) {
-      this.colorsArray[i * 4 + 3] = Math.round((alpha[i] ?? 1.0) * 255);
+      if (!Number.isFinite(alpha[i]) || alpha[i] < 0 || alpha[i] > 1) {
+        throw new RangeError(`Transparency value ${i} must be from 0 through 1.`);
+      }
+      this.colorsArray[i * 4 + 3] = Math.round(alpha[i] * 255);
     }
   }
 
   ensureCategoryMetadata(field) {
-    const categories = field.categories || [];
+    requireCategoryField(field);
+    const categories = field.categories;
     const numCats = categories.length;
-    if (!field._categoryColors) {
-      const catColors = new Array(numCats);
+    let categoryColors;
+    if (field._categoryColors === undefined) {
+      categoryColors = new Array(numCats);
       for (let i = 0; i < numCats; i++) {
-        catColors[i] = getCategoryColor(i);
+        categoryColors[i] = getCategoryColor(i);
       }
-      field._categoryColors = catColors;
     } else {
-      for (let i = 0; i < numCats; i++) {
-        const color = field._categoryColors[i];
-        if (!color || color.length !== 3) {
-          field._categoryColors[i] = getCategoryColor(i);
-        }
+      if (
+        !Array.isArray(field._categoryColors)
+        || field._categoryColors.length !== numCats
+      ) {
+        throw new TypeError('Category colors must contain one RGB triplet per category.');
       }
-    }
-    if (!field._categoryVisible) {
-      field._categoryVisible = {};
       for (let i = 0; i < numCats; i++) {
-        field._categoryVisible[i] = true;
+        requireRgb(field._categoryColors[i], `Category color ${i}`);
       }
+      categoryColors = field._categoryColors;
     }
+
+    let categoryVisible;
+    if (field._categoryVisible === undefined) {
+      categoryVisible = {};
+      for (let i = 0; i < numCats; i++) {
+        categoryVisible[i] = true;
+      }
+    } else {
+      if (
+        field._categoryVisible === null
+        || typeof field._categoryVisible !== 'object'
+        || Array.isArray(field._categoryVisible)
+      ) {
+        throw new TypeError('Category visibility must be an indexed object.');
+      }
+      const visibilityKeys = Object.keys(field._categoryVisible);
+      if (
+        visibilityKeys.length !== numCats
+        || visibilityKeys.some((key, index) => key !== String(index))
+      ) {
+        throw new TypeError('Category visibility must contain every category index exactly once.');
+      }
+      for (let i = 0; i < numCats; i++) {
+        requireBoolean(field._categoryVisible[i], `Category visibility ${i}`);
+      }
+      categoryVisible = field._categoryVisible;
+    }
+
+    let categoryFilterEnabled;
+    if (field._categoryFilterEnabled === undefined) {
+      categoryFilterEnabled = true;
+    } else {
+      categoryFilterEnabled = requireBoolean(
+        field._categoryFilterEnabled,
+        'Category filter enabled'
+      );
+    }
+
+    field._categoryColors = categoryColors;
+    field._categoryVisible = categoryVisible;
+    field._categoryFilterEnabled = categoryFilterEnabled;
   }
 
   updateColorsCategorical(field) {
     const n = this.pointCount;
-    const categories = field.categories || [];
-    const codes = field.codes || [];
+    requireCategoryField(field);
+    const categories = field.categories;
+    const codes = field.codes;
     const numCats = categories.length;
 
+    if (
+      (!(codes instanceof Uint8Array) && !(codes instanceof Uint16Array))
+      || codes.length !== n
+      || !(this.colorsArray instanceof Uint8Array)
+      || this.colorsArray.length !== n * 4
+      || !(this.categoryTransparency instanceof Float32Array)
+      || this.categoryTransparency.length !== n
+    ) {
+      throw new TypeError('Category coloring requires complete category, color, and transparency buffers.');
+    }
     this.ensureCategoryMetadata(field);
     const catColors = field._categoryColors;
     const catVisible = field._categoryVisible;
-
-    if (!this.categoryTransparency || this.categoryTransparency.length !== n) {
-      this.categoryTransparency = new Float32Array(n);
+    const missingCode = codes instanceof Uint8Array ? 255 : 65_535;
+    for (let i = 0; i < n; i++) {
+      const code = codes[i];
+      if (code >= numCats && code !== missingCode) {
+        throw new RangeError(`Category code ${i} is outside the category inventory.`);
+      }
     }
 
     for (let i = 0; i < n; i++) {
       const code = codes[i];
       let r, g, b, alpha;
-      if (code == null || code < 0 || code >= numCats) {
+      if (code === missingCode) {
         r = NEUTRAL_GRAY_UINT8; g = NEUTRAL_GRAY_UINT8; b = NEUTRAL_GRAY_UINT8;
         alpha = 1.0;
       } else {
-        const isVisible = catVisible[code] !== false;
-        const c = catColors[code] || getCategoryColor(code) || [0.5, 0.5, 0.5];
+        const isVisible = catVisible[code];
+        const c = catColors[code];
         if (!isVisible) {
           r = g = b = 128; // gray in uint8
           alpha = 0.0;
@@ -326,15 +537,76 @@ export class DataStateColorMethods {
     this._syncActiveContext();
   }
 
-  buildCentroidsForField(field, { viewId = null } = {}) {
+  buildCentroidsForField(field, options) {
+    requireCategoryField(field);
+    if (
+      options === null
+      || typeof options !== 'object'
+      || Array.isArray(options)
+      || Object.keys(options).join(',') !== 'viewId'
+      || typeof options.viewId !== 'string'
+      || options.viewId.length === 0
+    ) {
+      throw new TypeError('Centroid construction requires exactly one nonempty viewId.');
+    }
     // Get dimension-specific centroids based on current dimension level
-    const currentDim = this.activeDimensionLevel || 3;
-    const centroidsByDim = field.centroidsByDim || {};
+    const currentDim = this.activeDimensionLevel;
+    if (!Number.isInteger(currentDim) || currentDim < 1 || currentDim > 3) {
+      throw new RangeError('Centroid construction requires dimension 1, 2, or 3.');
+    }
+    const centroidsByDim = field.centroidsByDim;
+    if (
+      centroidsByDim === null
+      || typeof centroidsByDim !== 'object'
+      || Array.isArray(centroidsByDim)
+    ) {
+      throw new TypeError('Category field centroidsByDim must be an object.');
+    }
 
     // Get centroids for current dimension
-    let centroids = centroidsByDim[String(currentDim)]
-      || centroidsByDim[currentDim]
-      || [];
+    const dimensionKey = String(currentDim);
+    const centroids = Object.hasOwn(centroidsByDim, dimensionKey)
+      ? centroidsByDim[dimensionKey]
+      : [];
+    if (!Array.isArray(centroids)) {
+      throw new TypeError(`Category centroids for ${currentDim}D must be an array.`);
+    }
+    const categories = field.categories;
+    this.ensureCategoryMetadata(field);
+    const catColors = field._categoryColors;
+    const catIndexByName = new Map();
+    categories.forEach((category, index) => {
+      if (catIndexByName.has(category)) {
+        throw new TypeError('Centroid category inventory must not contain duplicates.');
+      }
+      catIndexByName.set(category, index);
+    });
+    for (let centroidIndex = 0; centroidIndex < centroids.length; centroidIndex++) {
+      const centroid = centroids[centroidIndex];
+      if (
+        centroid === null
+        || typeof centroid !== 'object'
+        || Array.isArray(centroid)
+        || !Array.isArray(centroid.position)
+        || centroid.position.length !== currentDim
+        || !Number.isSafeInteger(centroid.n_points)
+        || centroid.n_points < 0
+      ) {
+        throw new TypeError(
+          `Centroid ${centroidIndex} must contain an exact ${currentDim}D position and point count.`
+        );
+      }
+      for (let coordinate = 0; coordinate < centroid.position.length; coordinate++) {
+        if (!Number.isFinite(centroid.position[coordinate])) {
+          throw new TypeError(
+            `Centroid ${centroidIndex} coordinate ${coordinate} must be finite.`
+          );
+        }
+      }
+      if (!catIndexByName.has(centroid.category)) {
+        throw new RangeError(`Centroid ${centroidIndex} references an unknown category.`);
+      }
+    }
 
     // Lazy normalization: normalize centroids for this dimension if not already done.
     // Each dimension has its own normalization transform, so we track per-dimension.
@@ -342,49 +614,54 @@ export class DataStateColorMethods {
     // was loaded first or when switching between dimensions.
     //
     // centroidsByDim: per-dimension arrays, each normalized with its own transform
-    if (centroids.length > 0 && this.dimensionManager) {
-      // Initialize normalization tracking map if needed
-      if (!field._normalizedDims) {
+    if (centroids.length > 0) {
+      if (field._normalizedDims === null || field._normalizedDims === undefined) {
         field._normalizedDims = new Set();
+      } else if (!(field._normalizedDims instanceof Set)) {
+        throw new TypeError('Centroid normalization state must be a Set.');
       }
 
       const dimKey = String(currentDim);
 
       // Check if this centroid array needs normalization
       if (!field._normalizedDims.has(dimKey)) {
-        const normTransform = this.dimensionManager.getNormTransform(currentDim);
-
-        if (normTransform) {
-          const { center, scale } = normTransform;
-          const [cx, cy, cz] = center;
-
-          // Normalize each centroid's position in-place
-          for (const c of centroids) {
-            const p = c.position;
-            if (!p) continue;
-            // Handle 1D, 2D, and 3D positions
-            if (p.length >= 1) p[0] = (p[0] - cx) * scale;
-            if (p.length >= 2) p[1] = (p[1] - cy) * scale;
-            if (p.length >= 3) p[2] = (p[2] - cz) * scale;
-          }
-
-          // Mark as normalized
-          field._normalizedDims.add(dimKey);
+        if (
+          !this.dimensionManager
+          || typeof this.dimensionManager.getNormTransform !== 'function'
+        ) {
+          throw new TypeError('Centroid normalization requires the current DimensionManager.');
         }
+        const normTransform = this.dimensionManager.getNormTransform(currentDim);
+        if (
+          !normTransform
+          || typeof normTransform !== 'object'
+          || !Array.isArray(normTransform.center)
+          || normTransform.center.length !== 3
+          || normTransform.center.some((coordinate) => !Number.isFinite(coordinate))
+          || !Number.isFinite(normTransform.scale)
+          || normTransform.scale <= 0
+        ) {
+          throw new TypeError('Centroid normalization transform is unavailable or invalid.');
+        }
+        const { center, scale } = normTransform;
+        const [cx, cy, cz] = center;
+
+        // Normalize each centroid's position in-place
+        for (const c of centroids) {
+          const p = c.position;
+          if (p.length >= 1) p[0] = (p[0] - cx) * scale;
+          if (p.length >= 2) p[1] = (p[1] - cy) * scale;
+          if (p.length >= 3) p[2] = (p[2] - cz) * scale;
+        }
+
+        field._normalizedDims.add(dimKey);
       }
     }
 
     // Determine the native dimension of these centroids (from position array length)
-    let nativeDim = 3;
-    if (centroids.length > 0 && centroids[0].position) {
-      nativeDim = centroids[0].position.length;
-    }
+    const nativeDim = currentDim;
 
-    const categories = field.categories || [];
-    this.ensureCategoryMetadata(field);
-    const catColors = field._categoryColors || [];
-    // Use provided viewId or fall back to activeViewId
-    const viewKey = String(viewId || this.activeViewId || 'live');
+    const viewKey = options.viewId;
     this.centroidCount = centroids.length;
     const allowLabels = true;
 
@@ -395,9 +672,6 @@ export class DataStateColorMethods {
 
     this.centroidLabels = [];
     if (allowLabels && this.labelLayer) this._removeLabelsForView(viewKey);
-
-    const catIndexByName = new Map();
-    categories.forEach((cat, idx) => catIndexByName.set(String(cat), idx));
 
     // Pre-compute counts so centroids/labels respect visibility immediately
     // Only compute and save counts when building for the active view, as
@@ -413,22 +687,18 @@ export class DataStateColorMethods {
 
     for (let i = 0; i < centroids.length; i++) {
       const c = centroids[i];
-      const pos = c.position || [0, 0, 0];
+      const pos = c.position;
 
       // Pad lower-dimensional positions to 3D for rendering
       // 1D: [x] -> [x, 0, 0]
       // 2D: [x, y] -> [x, y, 0]
       // 3D: [x, y, z] -> [x, y, z]
-      this.centroidPositions[3 * i] = pos[0] || 0;
-      this.centroidPositions[3 * i + 1] = nativeDim >= 2 ? (pos[1] || 0) : 0;
-      this.centroidPositions[3 * i + 2] = nativeDim >= 3 ? (pos[2] || 0) : 0;
+      this.centroidPositions[3 * i] = pos[0];
+      this.centroidPositions[3 * i + 1] = nativeDim >= 2 ? pos[1] : 0;
+      this.centroidPositions[3 * i + 2] = nativeDim >= 3 ? pos[2] : 0;
 
-      const idx = catIndexByName.get(String(c.category));
-      let color = [0, 0, 0];
-      if (idx != null) {
-        const fallback = getCategoryColor(idx) || [0, 0, 0];
-        color = catColors[idx] || fallback;
-      }
+      const idx = catIndexByName.get(c.category);
+      const color = catColors[idx];
       // Convert float 0-1 to uint8 0-255, RGBA format
       const colBase = i * 4;
       this.centroidColors[colBase] = Math.round(color[0] * 255);
@@ -458,14 +728,19 @@ export class DataStateColorMethods {
   }
 
   updateLegendState(field) {
-    if (!field) return null;
+    if (
+      field === null
+      || typeof field !== 'object'
+      || (field.kind !== 'continuous' && field.kind !== 'category')
+    ) {
+      throw new TypeError('Legend state requires a category or continuous field.');
+    }
     if (field.kind === 'continuous') {
       const meta = this.ensureContinuousMetadata(field);
-      if (!meta) return null;
       const colorDomain = this.getContinuousColorDomain(field);
-      const colorbarMin = colorDomain?.min ?? meta.stats.min;
-      const colorbarMax = colorDomain?.max ?? meta.stats.max;
-      const colormap = getColormap(field._colormapId);
+      const colorbarMin = colorDomain.min;
+      const colorbarMax = colorDomain.max;
+      const colormap = requireColormap(field._colormapId);
       const colorStops = getCssStopsForColormap(colormap.id);
       return {
         kind: 'continuous',
@@ -490,7 +765,7 @@ export class DataStateColorMethods {
     const counts = field._categoryCounts || null;
     return {
       kind: 'category',
-      categories: field.categories || [],
+      categories: field.categories,
       colors: field._categoryColors,
       visible: field._categoryVisible,
       picker: COLOR_PICKER_PALETTE,
@@ -500,22 +775,23 @@ export class DataStateColorMethods {
 
   applyContinuousFilter(fieldIndex, newMin, newMax) {
     const { field } = this.getContinuousFieldRef(fieldIndex);
-    if (!field || field.kind !== 'continuous') return;
+    requireContinuousField(field);
     const meta = this.ensureContinuousMetadata(field);
-    if (!meta) return;
     const stats = meta.stats;
-    const clampedMin = clamp(newMin, stats.min, stats.max);
-    const clampedMax = clamp(newMax, stats.min, stats.max);
-    field._continuousFilter.min = Math.min(clampedMin, clampedMax);
-    field._continuousFilter.max = Math.max(clampedMin, clampedMax);
+    const next = requireFiniteRange(
+      { min: newMin, max: newMax },
+      'Continuous filter range',
+      stats
+    );
+    field._continuousFilter.min = next.min;
+    field._continuousFilter.max = next.max;
     this.computeGlobalVisibility();
   }
 
   resetContinuousFilter(fieldIndex) {
     const { field } = this.getContinuousFieldRef(fieldIndex);
-    if (!field || field.kind !== 'continuous') return;
+    requireContinuousField(field);
     const meta = this.ensureContinuousMetadata(field);
-    if (!meta) return;
     field._continuousFilter.min = meta.stats.min;
     field._continuousFilter.max = meta.stats.max;
     this.computeGlobalVisibility();
@@ -523,9 +799,21 @@ export class DataStateColorMethods {
 
   setContinuousColorRescale(fieldIndex, enabled) {
     const { field } = this.getContinuousFieldRef(fieldIndex);
-    if (!field || field.kind !== 'continuous') return;
+    requireContinuousField(field);
+    requireBoolean(enabled, 'Continuous color rescale');
     this.ensureContinuousMetadata(field);
-    field._useFilterColorRange = Boolean(enabled);
+    if (field._useLogScale) {
+      computeContinuousDomain(
+        { ...field, _useFilterColorRange: enabled },
+        {
+          stats: field._continuousStats,
+          colorRange: field._continuousColorRange,
+          positiveStats: field._positiveStats
+        },
+        true
+      );
+    }
+    field._useFilterColorRange = enabled;
     this.updateColorsContinuous(field);
     this._pushColorsToViewer();
     this._syncActiveContext();
@@ -533,15 +821,21 @@ export class DataStateColorMethods {
 
   setContinuousColorRange(fieldIndex, min, max) {
     const { field } = this.getContinuousFieldRef(fieldIndex);
-    if (!field || field.kind !== 'continuous') return;
+    requireContinuousField(field);
     const meta = this.ensureContinuousMetadata(field);
-    if (!meta) return;
-    const clampedMin = clamp(min, meta.stats.min, meta.stats.max);
-    const clampedMax = clamp(max, meta.stats.min, meta.stats.max);
-    field._continuousColorRange = {
-      min: Math.min(clampedMin, clampedMax),
-      max: Math.max(clampedMin, clampedMax)
-    };
+    const nextRange = requireFiniteRange(
+      { min, max },
+      'Continuous color range',
+      meta.stats
+    );
+    if (field._useFilterColorRange && field._useLogScale) {
+      computeContinuousDomain(
+        { ...field, _continuousColorRange: nextRange },
+        { ...meta, colorRange: nextRange },
+        true
+      );
+    }
+    field._continuousColorRange = nextRange;
     if (field._useFilterColorRange) {
       this.updateColorsContinuous(field);
       this._pushColorsToViewer();
@@ -551,9 +845,11 @@ export class DataStateColorMethods {
 
   setContinuousLogScale(fieldIndex, enabled) {
     const { field } = this.getContinuousFieldRef(fieldIndex);
-    if (!field || field.kind !== 'continuous') return;
-    this.ensureContinuousMetadata(field);
-    field._useLogScale = Boolean(enabled);
+    requireContinuousField(field);
+    requireBoolean(enabled, 'Continuous log scale');
+    const meta = this.ensureContinuousMetadata(field);
+    if (enabled) computeContinuousDomain(field, meta, true);
+    field._useLogScale = enabled;
     this.updateColorsContinuous(field);
     this._pushColorsToViewer();
     this._syncActiveContext();
@@ -561,8 +857,8 @@ export class DataStateColorMethods {
 
   setContinuousColormap(fieldIndex, colormapId) {
     const { field } = this.getContinuousFieldRef(fieldIndex);
-    if (!field || field.kind !== 'continuous') return;
-    const colormap = getColormap(colormapId);
+    requireContinuousField(field);
+    const colormap = requireColormap(colormapId);
     this.ensureContinuousMetadata(field);
     field._colormapId = colormap.id;
     this.updateColorsContinuous(field);

@@ -3,10 +3,9 @@
  *
  * Encapsulates dataset-adjacent connection UX that is orthogonal to the dataset
  * dropdown itself:
- * - Local user data loading (prepared exports, h5ad, zarr)
+ * - Local user data loading (prepared exports, h5ad, zarr zip)
  * - Remote server connect/disconnect
  * - GitHub repo connect/disconnect
- * - Info tooltips for the above
  *
  * Split out of `dataset-controls.js` to keep module responsibilities and file
  * size manageable while preserving runtime behavior.
@@ -19,6 +18,10 @@ import { getNotificationCenter } from '../../notification-center.js';
 import { updateUrlForDataSource, clearUrlDataSource } from '../../url-state.js';
 import { DATA_LOAD_METHODS } from '../../../analytics/tracker.js';
 import { debug } from '../../../utils/debug.js';
+import {
+  activateValidatedLocalDataset,
+  isDatasetReloadSupersededError
+} from '../../dataset-reload-outcome.js';
 
 /**
  * @param {object} options
@@ -26,7 +29,7 @@ import { debug } from '../../../utils/debug.js';
  * @param {object} options.viewer
  * @param {object} options.dom
  * @param {import('../../../data/data-source-manager.js').DataSourceManager|null} options.dataSourceManager
- * @param {(metadata: any) => Promise<void> | void} [options.reloadDataset]
+ * @param {(metadata: any) => Promise<void> | void} options.reloadDataset
  * @param {(message: string, isError?: boolean) => void} [options.showSessionStatus]
  * @param {(metadata: any, sourceTypeOverride?: string|null) => void} [options.updateDatasetInfo]
  * @param {() => Promise<void> | void} [options.populateDatasetDropdown]
@@ -49,27 +52,21 @@ export function initDatasetConnections({
     select: datasetSelect,
 
     userDataH5adBtn,
-    userDataZarrBtn,
+    userDataZarrArchiveBtn,
     userDataBrowseBtn,
     userDataFileInput,
     userDataH5adInput,
-    userDataZarrInput,
-    userDataInfoBtn,
-    userDataInfoTooltip,
+    userDataZarrArchiveInput,
 
     remoteServerUrl,
     remoteConnectBtn,
     remoteDisconnectBtn,
     remoteDisconnectContainer,
-    remoteInfoBtn,
-    remoteInfoTooltip,
 
     githubRepoUrl,
     githubConnectBtn,
     githubDisconnectBtn,
-    githubDisconnectContainer,
-    githubInfoBtn,
-    githubInfoTooltip
+    githubDisconnectContainer
   } = dom;
 
   const populate = () => {
@@ -91,7 +88,10 @@ export function initDatasetConnections({
           else notifications.success(message, { category: 'session' });
         };
 
-  async function loadLocalUserFromFileList(files, { loadMethod, loadingMessage }) {
+  async function loadLocalUserSelection(
+    files,
+    { loadMethod, loadingMessage, load }
+  ) {
     if (!files || files.length === 0) return;
 
     const userSource = dataSourceManager.getSource('local-user');
@@ -104,44 +104,62 @@ export function initDatasetConnections({
     const loadNotifId = notifications.loading(loadingMessage, { category: 'data' });
 
     try {
-      const metadata = await userSource.loadFromFileList(files);
+      const metadata = await load(userSource, files);
       updateDatasetInfo?.(metadata || null);
 
       if (datasetSelect && noneDatasetValue) {
         datasetSelect.value = noneDatasetValue;
       }
 
-      try {
-        await dataSourceManager.switchToDataset('local-user', userSource.datasetId, { loadMethod });
-        if (typeof reloadDataset === 'function') {
-          await reloadDataset(metadata);
-        }
+      const activationOutcome = await activateValidatedLocalDataset({
+        switchDataset: () => dataSourceManager.switchToDataset(
+          'local-user',
+          userSource.datasetId,
+          { loadMethod }
+        ),
+        reloadDataset: () => reloadDataset(metadata)
+      });
+
+      if (activationOutcome.status === 'validated-retained') {
+        debug.warn(
+          '[UI] Could not auto-switch to user source:',
+          activationOutcome.error
+        );
         populate();
         notifications.complete(
           loadNotifId,
-          `User data ready: ${formatDataNumber(metadata?.stats?.n_cells)} cells`
+          'User data validated. Select it from "Sample datasets" to apply.'
         );
-        clearUrlDataSource();
-      } catch (switchErr) {
-        debug.warn('[UI] Could not auto-switch to user source:', switchErr);
-        notifications.complete(loadNotifId, 'User data validated. Select "Load" to apply.');
-        clearUrlDataSource();
+        return;
       }
+
+      populate();
+      notifications.complete(
+        loadNotifId,
+        `User data ready: ${formatDataNumber(metadata?.stats?.n_cells)} cells`
+      );
+      updateUrlForDataSource('local-user', {});
     } catch (err) {
+      if (isDatasetReloadSupersededError(err)) {
+        notifications.dismiss(loadNotifId);
+        return;
+      }
       debug.error('[UI] Failed to load user data:', err);
-      notifications.fail(loadNotifId, err?.getUserMessage?.() || err?.message || 'Failed to load');
+      notifications.fail(loadNotifId, err.message);
     }
   }
 
   // ---------------------------------------------------------------------------
-  // Local user data (prepared / h5ad / zarr)
+  // Local user data (prepared / h5ad / portable zarr zip)
   // ---------------------------------------------------------------------------
 
   if (userDataFileInput) {
     userDataFileInput.addEventListener('change', async (e) => {
-      await loadLocalUserFromFileList(e.target.files, {
+      await loadLocalUserSelection(e.target.files, {
         loadMethod: DATA_LOAD_METHODS.LOCAL_PREPARED,
-        loadingMessage: 'Loading user data files...'
+        loadingMessage: 'Loading prepared dataset...',
+        load: (source, files) =>
+          source.loadFromPreparedDirectory(files)
       });
       userDataFileInput.value = '';
     });
@@ -150,8 +168,11 @@ export function initDatasetConnections({
   if (userDataH5adBtn && userDataH5adInput) {
     userDataH5adBtn.addEventListener('click', () => userDataH5adInput.click());
   }
-  if (userDataZarrBtn && userDataZarrInput) {
-    userDataZarrBtn.addEventListener('click', () => userDataZarrInput.click());
+  if (userDataZarrArchiveBtn && userDataZarrArchiveInput) {
+    userDataZarrArchiveBtn.addEventListener(
+      'click',
+      () => userDataZarrArchiveInput.click()
+    );
   }
   if (userDataBrowseBtn && userDataFileInput) {
     userDataBrowseBtn.addEventListener('click', () => userDataFileInput.click());
@@ -159,100 +180,31 @@ export function initDatasetConnections({
 
   if (userDataH5adInput) {
     userDataH5adInput.addEventListener('change', async (e) => {
-      await loadLocalUserFromFileList(e.target.files, {
+      await loadLocalUserSelection(e.target.files, {
         loadMethod: DATA_LOAD_METHODS.LOCAL_H5AD,
-        loadingMessage: 'Loading h5ad file...'
+        loadingMessage: 'Loading h5ad file...',
+        load: (source, files) =>
+          source.loadFromH5adFile(
+            files.length === 1 ? files[0] : null
+          )
       });
       userDataH5adInput.value = '';
     });
   }
 
-  if (userDataZarrInput) {
-    userDataZarrInput.addEventListener('change', async (e) => {
-      await loadLocalUserFromFileList(e.target.files, {
-        loadMethod: DATA_LOAD_METHODS.LOCAL_ZARR,
-        loadingMessage: 'Loading zarr directory...'
+  if (userDataZarrArchiveInput) {
+    userDataZarrArchiveInput.addEventListener('change', async (e) => {
+      await loadLocalUserSelection(e.target.files, {
+        loadMethod: DATA_LOAD_METHODS.LOCAL_ZARR_ZIP,
+        loadingMessage: 'Loading Zarr ZIP archive...',
+        load: (source, files) =>
+          source.loadFromZarrArchive(
+            files.length === 1 ? files[0] : null
+          )
       });
-      userDataZarrInput.value = '';
+      userDataZarrArchiveInput.value = '';
     });
   }
-
-  // ---------------------------------------------------------------------------
-  // Tooltips (user data / remote / github) - uses fixed positioning to escape overflow
-  // ---------------------------------------------------------------------------
-
-  function positionTooltip(button, tooltip) {
-    if (!button || !tooltip) return;
-    const rect = button.getBoundingClientRect();
-    const tooltipHeight = tooltip.offsetHeight || 120;
-    const spaceBelow = window.innerHeight - rect.bottom;
-    const spaceAbove = rect.top;
-    const gap = 4;
-
-    // Position below button if space, otherwise above
-    if (spaceBelow >= tooltipHeight + gap || spaceBelow >= spaceAbove) {
-      tooltip.style.top = `${rect.bottom + gap}px`;
-      tooltip.style.bottom = 'auto';
-    } else {
-      tooltip.style.bottom = `${window.innerHeight - rect.top + gap}px`;
-      tooltip.style.top = 'auto';
-    }
-
-    // Align left with button, constrain to viewport (240px width + 8px margin)
-    const left = Math.max(8, Math.min(rect.left, window.innerWidth - 248));
-    tooltip.style.left = `${left}px`;
-  }
-
-  function attachTooltipToggle(button, tooltip) {
-    if (!button || !tooltip) return;
-    // Store original parent for cleanup
-    const originalParent = tooltip.parentElement;
-
-    button.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const isVisible = getComputedStyle(tooltip).display !== 'none';
-      if (isVisible) {
-        tooltip.style.display = 'none';
-        // Return tooltip to original location
-        if (originalParent && tooltip.parentElement === document.body) {
-          originalParent.appendChild(tooltip);
-        }
-      } else {
-        // Portal to body to escape transform containment
-        if (tooltip.parentElement !== document.body) {
-          document.body.appendChild(tooltip);
-        }
-        // Position and show
-        positionTooltip(button, tooltip);
-        tooltip.style.display = 'block';
-        // Refine position after layout is computed
-        requestAnimationFrame(() => positionTooltip(button, tooltip));
-      }
-    });
-  }
-
-  attachTooltipToggle(userDataInfoBtn, userDataInfoTooltip);
-  attachTooltipToggle(remoteInfoBtn, remoteInfoTooltip);
-  attachTooltipToggle(githubInfoBtn, githubInfoTooltip);
-
-  document.addEventListener('click', (e) => {
-    const closeIfOutside = (btn, tip) => {
-      if (!btn || !tip) return;
-      if (btn.contains(e.target) || tip.contains(e.target)) return;
-      tip.style.display = 'none';
-    };
-
-    closeIfOutside(userDataInfoBtn, userDataInfoTooltip);
-    closeIfOutside(remoteInfoBtn, remoteInfoTooltip);
-    closeIfOutside(githubInfoBtn, githubInfoTooltip);
-  });
-
-  // Close tooltips on scroll for cleaner UX
-  window.addEventListener('scroll', () => {
-    [userDataInfoTooltip, remoteInfoTooltip, githubInfoTooltip].forEach((tip) => {
-      if (tip) tip.style.display = 'none';
-    });
-  }, { passive: true, capture: true });
 
   // ---------------------------------------------------------------------------
   // Remote server connection
@@ -309,6 +261,10 @@ export function initDatasetConnections({
 
         updateUrlForDataSource('remote', { serverUrl: url });
       } catch (err) {
+        if (isDatasetReloadSupersededError(err)) {
+          notifications.dismiss(connectNotifId);
+          return;
+        }
         notifications.fail(connectNotifId, `Error: ${err?.message || err}`);
         debug.error('[UI] Remote connection error:', err);
       } finally {
@@ -317,7 +273,7 @@ export function initDatasetConnections({
     });
 
     if (remoteDisconnectBtn) {
-      remoteDisconnectBtn.addEventListener('click', async () => {
+      remoteDisconnectBtn.addEventListener('click', () => {
         if (!remoteSource) return;
         try {
           remoteSource.disconnect();
@@ -328,24 +284,6 @@ export function initDatasetConnections({
         getNotificationCenter().success('Disconnected', { category: 'connectivity' });
         updateRemoteUI(false);
         clearUrlDataSource();
-
-        if (dataSourceManager.getCurrentSourceType?.() === 'remote') {
-          try {
-            const demoSource = dataSourceManager.getSource('local-demo');
-            const defaultId = await demoSource?.getDefaultDatasetId?.();
-            if (defaultId) {
-              await dataSourceManager.switchToDataset('local-demo', defaultId, {
-                loadMethod: DATA_LOAD_METHODS.REMOTE_DISCONNECT_FALLBACK
-              });
-              populate();
-              if (typeof reloadDataset === 'function') {
-                await reloadDataset(dataSourceManager.getCurrentMetadata?.());
-              }
-            }
-          } catch (err) {
-            debug.warn('[UI] Failed to switch back to local-demo after disconnect:', err);
-          }
-        }
       });
     }
 
@@ -435,6 +373,10 @@ export function initDatasetConnections({
 
         updateUrlForDataSource('github-repo', { path: repoPath });
       } catch (err) {
+        if (isDatasetReloadSupersededError(err)) {
+          notifications.dismiss(connectNotifId);
+          return;
+        }
         notifications.fail(connectNotifId, `Error: ${err?.message || err}`);
         debug.error('[UI] GitHub connection error:', err);
         updateGithubUI(false);
@@ -444,7 +386,7 @@ export function initDatasetConnections({
     });
 
     if (githubDisconnectBtn) {
-      githubDisconnectBtn.addEventListener('click', async () => {
+      githubDisconnectBtn.addEventListener('click', () => {
         if (!githubSource) return;
         try {
           githubSource.disconnect();
@@ -455,24 +397,6 @@ export function initDatasetConnections({
         getNotificationCenter().success('Disconnected from GitHub', { category: 'connectivity' });
         updateGithubUI(false);
         clearUrlDataSource();
-
-        if (dataSourceManager.getCurrentSourceType?.() === 'github-repo') {
-          try {
-            const demoSource = dataSourceManager.getSource('local-demo');
-            const defaultId = await demoSource?.getDefaultDatasetId?.();
-            if (defaultId) {
-              await dataSourceManager.switchToDataset('local-demo', defaultId, {
-                loadMethod: DATA_LOAD_METHODS.GITHUB_DISCONNECT_FALLBACK
-              });
-              populate();
-              if (typeof reloadDataset === 'function') {
-                await reloadDataset(dataSourceManager.getCurrentMetadata?.());
-              }
-            }
-          } catch (err) {
-            debug.warn('[UI] Failed to switch back to local-demo after GitHub disconnect:', err);
-          }
-        }
       });
     }
 

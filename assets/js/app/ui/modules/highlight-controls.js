@@ -10,8 +10,101 @@
 import { initHighlightPagesUI } from './highlight/highlight-pages-ui.js';
 import { initHighlightSelectionTools } from './highlight/highlight-selection-tools.js';
 import { initHighlightSummaryUI } from './highlight/highlight-summary-ui.js';
+import {
+  requireDomElement,
+  requireExactKeys,
+  requireJupyterSource,
+  requireMethods,
+  requireModeButtons
+} from './highlight/exact-contract.js';
 
-export function initHighlightControls({ state, viewer, dom, jupyterSource = null }) {
+const REQUIRED_STATE_METHODS = Object.freeze([
+  'getActiveField',
+  'getHighlightPages',
+  'getActivePageId',
+  'getHighlightedCellCountForPage',
+  'combineHighlightPages',
+  'switchToPage',
+  'renameHighlightPage',
+  'deleteHighlightPage',
+  'setHighlightPageColor',
+  'createHighlightPage',
+  'ensureHighlightPage',
+  'getHighlightedGroups',
+  'getHighlightedCellCount',
+  'getTotalHighlightedCellCount',
+  'toggleHighlightEnabled',
+  'removeHighlightGroup',
+  'clearAllHighlights',
+  'clearPreviewHighlight',
+  'setPreviewHighlightFromIndices',
+  'addHighlightDirect',
+  'getCategoryForCell',
+  'getCellIndicesForCategory',
+  'getValueForCell',
+  'getCellIndicesForRange',
+  'getActiveViewId',
+  'on'
+]);
+
+const REQUIRED_VIEWER_METHODS = Object.freeze([
+  'setHighlightMode',
+  'getViewTransparency',
+  'setSelectionStepCallback',
+  'setSelectionPreviewCallback',
+  'restoreUnifiedState',
+  'confirmAnnotationSelection',
+  'cancelAnnotationSelection',
+  'getUnifiedSelectionState',
+  'cancelUnifiedSelection',
+  'setLassoEnabled',
+  'setLassoCallback',
+  'setLassoPreviewCallback',
+  'setLassoStepCallback',
+  'restoreLassoState',
+  'confirmLassoSelection',
+  'cancelLassoSelection',
+  'setProximityEnabled',
+  'setProximityCallback',
+  'setProximityStepCallback',
+  'setProximityPreviewCallback',
+  'restoreProximityState',
+  'confirmProximitySelection',
+  'cancelProximitySelection',
+  'setKnnEnabled',
+  'setKnnCallback',
+  'setKnnStepCallback',
+  'setKnnPreviewCallback',
+  'restoreKnnState',
+  'confirmKnnSelection',
+  'cancelKnnSelection',
+  'updateHighlight',
+  'onLodChanged'
+]);
+
+export function initHighlightControls(options) {
+  requireExactKeys(
+    options,
+    ['state', 'viewer', 'dom', 'jupyterSource'],
+    'Highlight controls options'
+  );
+  const { state, viewer, dom, jupyterSource } = options;
+  requireMethods(state, 'Highlight state', REQUIRED_STATE_METHODS);
+  requireMethods(viewer, 'Highlight viewer', REQUIRED_VIEWER_METHODS);
+  requireJupyterSource(jupyterSource);
+  requireExactKeys(
+    dom,
+    [
+      'countEl',
+      'groupsEl',
+      'clearAllBtn',
+      'pagesTabsEl',
+      'addPageBtn',
+      'modeButtons',
+      'modeDescription'
+    ],
+    'Highlight DOM'
+  );
   const {
     countEl: highlightCountEl,
     groupsEl: highlightedGroupsEl,
@@ -20,7 +113,38 @@ export function initHighlightControls({ state, viewer, dom, jupyterSource = null
     addPageBtn: addHighlightPageBtn,
     modeButtons: highlightModeButtons,
     modeDescription: highlightModeDescription
-  } = dom || {};
+  } = dom;
+  requireDomElement(highlightCountEl, 'Highlight count element');
+  requireDomElement(
+    highlightedGroupsEl,
+    'Highlighted groups element',
+    ['appendChild']
+  );
+  requireDomElement(
+    clearAllHighlightsBtn,
+    'Clear highlights button',
+    ['addEventListener']
+  );
+  requireDomElement(
+    highlightPagesTabsEl,
+    'Highlight pages tabs element',
+    ['appendChild', 'querySelectorAll']
+  );
+  requireDomElement(
+    addHighlightPageBtn,
+    'Add highlight page button',
+    ['addEventListener']
+  );
+  requireModeButtons(highlightModeButtons);
+  requireDomElement(
+    highlightModeDescription,
+    'Highlight mode description element'
+  );
+  requireDomElement(
+    highlightModeDescription.parentElement,
+    'Highlight mode description parent',
+    ['appendChild']
+  );
 
   const { renderHighlightSummary } = initHighlightSummaryUI({
     state,
@@ -52,9 +176,8 @@ export function initHighlightControls({ state, viewer, dom, jupyterSource = null
   });
 
   function updateHighlightMode() {
-    if (!viewer.setHighlightMode) return;
-    const activeField = state.getActiveField ? state.getActiveField() : null;
-    if (!activeField) {
+    const activeField = state.getActiveField();
+    if (activeField === null) {
       viewer.setHighlightMode('none');
       return;
     }
@@ -66,7 +189,9 @@ export function initHighlightControls({ state, viewer, dom, jupyterSource = null
       viewer.setHighlightMode('categorical');
       return;
     }
-    viewer.setHighlightMode('none');
+    throw new TypeError(
+      `Unknown active highlight field kind: ${activeField.kind}.`
+    );
   }
 
   return { renderHighlightSummary, renderHighlightPages, updateHighlightMode };

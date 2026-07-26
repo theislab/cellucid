@@ -31,6 +31,8 @@ const MEMORY_DEFAULTS = {
   warningThresholdPercent: 75,
   /** Percentage of heap usage that triggers cleanup */
   cleanupThresholdPercent: 85,
+  /** Percentage of heap usage that triggers critical cleanup */
+  criticalThresholdPercent: 95,
   /** Safety margin when estimating available memory (0-1) */
   safetyMargin: 0.7,
   /** Bytes per Float32 element */
@@ -188,8 +190,9 @@ class PerformanceConfigManager {
   applyPreset(presetName) {
     const preset = this.presets[presetName];
     if (!preset) {
-      console.warn(`[PerformanceConfig] Unknown preset: ${presetName}`);
-      return;
+      throw new Error(
+        `[PerformanceConfig] Unknown preset "${String(presetName)}"`
+      );
     }
 
     this.batch.defaultPreloadCount = preset.preloadCount;
@@ -236,7 +239,37 @@ class PerformanceConfigManager {
    * @property {string} explanation - Human-readable explanation
    */
   getRecommendedSettings(cellCount, geneCount, options = {}) {
+    if (!Number.isSafeInteger(cellCount) || cellCount <= 0) {
+      throw new RangeError(
+        'PerformanceConfig cellCount must be a positive integer'
+      );
+    }
+    if (!Number.isSafeInteger(geneCount) || geneCount <= 0) {
+      throw new RangeError(
+        'PerformanceConfig geneCount must be a positive integer'
+      );
+    }
+    if (
+      options === null ||
+      typeof options !== 'object' ||
+      Array.isArray(options)
+    ) {
+      throw new TypeError('PerformanceConfig options must be an object');
+    }
     const { method = 'wilcox', availableMemoryMB = null } = options;
+    if (method !== 'wilcox' && method !== 'ttest') {
+      throw new RangeError(
+        'PerformanceConfig method must be wilcox or ttest'
+      );
+    }
+    if (
+      availableMemoryMB !== null &&
+      (!Number.isFinite(availableMemoryMB) || availableMemoryMB <= 0)
+    ) {
+      throw new RangeError(
+        'PerformanceConfig availableMemoryMB must be null or a positive finite number'
+      );
+    }
 
     // Calculate data characteristics
     const bytesPerGene = cellCount * this.memory.bytesPerFloat32;
@@ -304,8 +337,8 @@ class PerformanceConfigManager {
     // Determine which preset best matches
     let presetMatch = 'balanced';
     if (recommendedPreload <= 30) presetMatch = 'lowMemory';
-    else if (recommendedPreload >= 200) presetMatch = 'highPerformance';
     else if (recommendedPreload >= 400) presetMatch = 'maximum';
+    else if (recommendedPreload >= 200) presetMatch = 'highPerformance';
 
     // Generate explanation
     const explanation = this._generateExplanation({
@@ -350,6 +383,21 @@ class PerformanceConfigManager {
    * @returns {Object} Memory estimate
    */
   estimateBatchMemory(cellCount, batchSize, method = 'wilcox') {
+    if (!Number.isSafeInteger(cellCount) || cellCount <= 0) {
+      throw new RangeError(
+        'PerformanceConfig cellCount must be a positive integer'
+      );
+    }
+    if (!Number.isSafeInteger(batchSize) || batchSize <= 0) {
+      throw new RangeError(
+        'PerformanceConfig batchSize must be a positive integer'
+      );
+    }
+    if (method !== 'wilcox' && method !== 'ttest') {
+      throw new RangeError(
+        'PerformanceConfig method must be wilcox or ttest'
+      );
+    }
     const bytesPerGene = cellCount * this.memory.bytesPerFloat32;
     const overheadFactor = method === 'wilcox'
       ? this.memory.wilcoxonOverheadFactor
@@ -378,7 +426,19 @@ class PerformanceConfigManager {
    * @returns {Object} Validation result
    */
   validateSettings(settings, cellCount, method = 'wilcox') {
+    if (
+      settings === null ||
+      typeof settings !== 'object' ||
+      Array.isArray(settings)
+    ) {
+      throw new TypeError('PerformanceConfig settings must be an object');
+    }
     const { preloadCount, memoryBudgetMB } = settings;
+    if (!Number.isFinite(memoryBudgetMB) || memoryBudgetMB <= 0) {
+      throw new RangeError(
+        'PerformanceConfig memoryBudgetMB must be a positive finite number'
+      );
+    }
     const estimate = this.estimateBatchMemory(cellCount, preloadCount, method);
 
     const isValid = estimate.withOverheadMB <= memoryBudgetMB;
@@ -459,13 +519,37 @@ class PerformanceConfigManager {
    * @returns {Array<{value: number, label: string, description: string, selected?: boolean}>}
    */
   getBatchSizeOptions(cellCount, geneCount) {
-    return [
-      { value: 50, label: '50 genes', description: 'Minimal memory usage, suitable for constrained environments.' },
-      { value: 100, label: '100 genes', description: 'Reduced memory footprint for standard workstations.' },
-      { value: 200, label: '200 genes', description: 'Moderate throughput with manageable memory consumption.' },
-      { value: 500, label: '500 genes', description: 'Balanced throughput and resource usage for most systems.', selected: true },
-      { value: 1000, label: '1000 genes', description: 'Maximum throughput, requires significant available memory.' }
-    ];
+    const recommended = this.getRecommendedSettings(
+      cellCount,
+      geneCount
+    ).preloadCount;
+    const values = [...new Set([
+      this.batch.minPreloadCount,
+      20,
+      50,
+      100,
+      200,
+      this.batch.maxPreloadCount,
+      recommended
+    ])]
+      .filter(
+        value =>
+          Number.isSafeInteger(value) &&
+          value >= this.batch.minPreloadCount &&
+          value <= this.batch.maxPreloadCount
+      )
+      .sort((a, b) => a - b);
+
+    return values.map(value => ({
+      value,
+      label: value === recommended
+        ? `${value} genes (recommended)`
+        : `${value} genes`,
+      description: value === recommended
+        ? `Exact recommendation for ${cellCount.toLocaleString()} cells and ${geneCount.toLocaleString()} genes.`
+        : `Load ${value} genes per bounded batch.`,
+      selected: value === recommended
+    }));
   }
 
   /**
@@ -473,14 +557,12 @@ class PerformanceConfigManager {
    * @returns {Array<{value: number, label: string, description: string, selected?: boolean}>}
    */
   getMemoryBudgetOptions() {
-    return [
-      { value: 256, label: '256 MB', description: 'Minimal footprint for memory-constrained systems.' },
-      { value: 512, label: '512 MB', description: 'Standard allocation suitable for typical usage.' },
-      { value: 1024, label: '1 GB', description: 'Extended capacity for larger datasets.' },
-      { value: 2048, label: '2 GB', description: 'High capacity for complex multi-gene analyses.' },
-      { value: 4096, label: '4 GB', description: 'Premium allocation for intensive workloads.', selected: true },
-      { value: 8192, label: '8 GB', description: 'Maximum allocation for high-performance systems.' }
-    ];
+    return [256, 512, 1024, 2048, 4096].map(value => ({
+      value,
+      label: value < 1024 ? `${value} MB` : `${value / 1024} GB`,
+      description: `Bound analysis-owned working memory to ${value} MB.`,
+      selected: value === this.memory.defaultBudgetMB
+    }));
   }
 
   /**
@@ -488,13 +570,12 @@ class PerformanceConfigManager {
    * @returns {Array<{value: number, label: string, description: string, selected?: boolean}>}
    */
   getNetworkConcurrencyOptions() {
-    return [
-      { value: 4, label: '4 parallel', description: 'Conservative setting for limited bandwidth connections.' },
-      { value: 6, label: '6 parallel', description: 'Moderate concurrency for standard network connections.' },
-      { value: 10, label: '10 parallel', description: 'Optimized for high-bandwidth networks.', selected: true },
-      { value: 20, label: '20 parallel', description: 'Aggressive concurrency for enterprise networks.' },
-      { value: 50, label: '50 parallel', description: 'Maximum concurrent requests, may saturate connections.' }
-    ];
+    return [2, 4, 6, 8, 10, 20].map(value => ({
+      value,
+      label: `${value} parallel`,
+      description: `Use exactly ${value} concurrent gene requests.`,
+      selected: value === this.batch.networkConcurrency
+    }));
   }
 }
 

@@ -8,7 +8,13 @@
  * @module ui/modules/cinematic-camera/transport-bar
  */
 
-import { resolveSegmentDurations } from './interpolation-engine.js';
+import {
+  assertCameraPathOptions,
+  resolveSegmentDurations
+} from './interpolation-engine.js';
+import { isCameraPathReady } from './keyframe-store.js';
+import { readCameraBooleanOption } from '../camera-input-contract.js';
+import { parseIntegerInput } from '../../core/numeric-input-contract.js';
 
 const HIDE_DELAY = 3000; // ms
 
@@ -21,9 +27,28 @@ const ICON_STOP = `<svg width="14" height="14" viewBox="0 0 24 24" fill="current
  * @param {Object} options
  * @param {import('./playback-controller.js').ReturnType<typeof import('./playback-controller.js').createPlaybackController>} options.playbackController
  * @param {import('./keyframe-store.js').ReturnType<typeof import('./keyframe-store.js').createKeyframeStore>} options.keyframeStore
- * @param {() => Object} [options.getInterpolationOptions]  Returns { autoPaceSpeed, ... }.
+ * @param {() => Object} options.getInterpolationOptions Returns { autoPaceSpeed, ... }.
  */
 export function createTransportBar({ playbackController, keyframeStore, getInterpolationOptions }) {
+  if (
+    !playbackController ||
+    typeof playbackController.getState !== 'function' ||
+    typeof playbackController.play !== 'function' ||
+    typeof playbackController.pause !== 'function' ||
+    typeof playbackController.stop !== 'function' ||
+    typeof playbackController.seekTo !== 'function' ||
+    typeof playbackController.on !== 'function' ||
+    typeof playbackController.off !== 'function'
+  ) {
+    throw new TypeError('Camera transport requires the exact playback-controller contract.');
+  }
+  if (!keyframeStore || typeof keyframeStore.getAll !== 'function') {
+    throw new TypeError('Camera transport requires the exact keyframe-store contract.');
+  }
+  if (typeof getInterpolationOptions !== 'function') {
+    throw new TypeError('Camera transport requires getInterpolationOptions().');
+  }
+
   /** @type {HTMLElement|null} */
   let barEl = null;
   /** @type {HTMLElement|null} */
@@ -46,9 +71,14 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
 
   function create() {
     if (barEl) return;
+    if (!pathIsReady()) {
+      throw new Error('Camera transport can mount only for a ready camera path.');
+    }
 
     barEl = document.createElement('div');
     barEl.className = 'cinematic-transport-bar';
+    barEl.setAttribute('role', 'region');
+    barEl.setAttribute('aria-label', 'Camera path playback');
     barEl.innerHTML = `
       <div class="cinematic-transport-inner">
         <button class="cinematic-transport-btn" data-action="stop" title="Stop (reset to start)">${ICON_STOP}</button>
@@ -66,12 +96,20 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
 
     document.body.appendChild(barEl);
 
-    playBtn = barEl.querySelector('.cinematic-play-btn');
-    progressEl = barEl.querySelector('.cinematic-timeline-progress');
-    scrubberEl = barEl.querySelector('.cinematic-timeline-scrubber');
-    markersEl = barEl.querySelector('.cinematic-timeline-markers');
-    readoutEl = barEl.querySelector('.cinematic-time-readout');
+    const requireElement = (selector) => {
+      const element = barEl.querySelector(selector);
+      if (!element) {
+        throw new Error(`Camera transport failed to create its required "${selector}" element.`);
+      }
+      return element;
+    };
+    playBtn = requireElement('.cinematic-play-btn');
+    progressEl = requireElement('.cinematic-timeline-progress');
+    scrubberEl = requireElement('.cinematic-timeline-scrubber');
+    markersEl = requireElement('.cinematic-timeline-markers');
+    readoutEl = requireElement('.cinematic-time-readout');
 
+    setInteractive(false);
     bindEvents();
     observeSidebar();
   }
@@ -94,26 +132,35 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
           playbackController.play();
         }
       } else if (action === 'stop') {
-        playbackController.stop();
+        playbackController.stop({ resetCamera: true });
       }
     });
 
     // Scrubber interaction
-    scrubberEl.addEventListener('pointerdown', () => {
+    scrubberEl.addEventListener('pointerdown', (event) => {
       isScrubbing = true;
       wasPlayingBeforeScrub = playbackController.getState() === 'PLAYING';
+      scrubberEl.setPointerCapture(event.pointerId);
       if (wasPlayingBeforeScrub) playbackController.pause();
     });
 
     scrubberEl.addEventListener('input', () => {
-      const globalT = parseInt(scrubberEl.value, 10) / 1000;
+      const globalT = parseIntegerInput(scrubberEl.value, {
+        minimum: 0,
+        maximum: 1000,
+        label: 'Camera path timeline position'
+      }) / 1000;
       playbackController.seekTo(globalT);
     });
 
-    const endScrub = () => {
+    const endScrub = (event) => {
       if (!isScrubbing) return;
       isScrubbing = false;
+      if (scrubberEl.hasPointerCapture(event.pointerId)) {
+        scrubberEl.releasePointerCapture(event.pointerId);
+      }
       if (wasPlayingBeforeScrub) playbackController.play();
+      wasPlayingBeforeScrub = false;
     };
 
     scrubberEl.addEventListener('pointerup', endScrub);
@@ -122,24 +169,29 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
     // Auto-hide: track mouse movement over the viewport area
     document.addEventListener('mousemove', onMouseActivity, { passive: true });
     document.addEventListener('pointerdown', onMouseActivity, { passive: true });
+    document.addEventListener('keydown', onKeyboardActivity);
 
     // Keep bar visible while hovering it
     barEl.addEventListener('mouseenter', () => { clearTimeout(hideTimeout); });
     barEl.addEventListener('mouseleave', () => { scheduleHide(); });
+    barEl.addEventListener('focusin', () => { clearTimeout(hideTimeout); });
+    barEl.addEventListener('focusout', () => {
+      setTimeout(scheduleHide, 0);
+    });
 
     // Playback state changes
     playbackController.on('stateChange', onPlaybackStateChange);
     playbackController.on('timeUpdate', onTimeUpdate);
 
-    // Keyframe changes
-    keyframeStore.on('changed', onKeyframeChange);
   }
 
   // ---- Sidebar awareness ----
 
   function observeSidebar() {
     const sidebar = document.getElementById('sidebar');
-    if (!sidebar || !barEl) return;
+    if (!sidebar) {
+      throw new Error('Camera transport requires the application sidebar.');
+    }
 
     const update = () => {
       barEl.classList.toggle('sidebar-hidden', sidebar.classList.contains('hidden'));
@@ -152,22 +204,41 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
 
   // ---- Visibility ----
 
-  function show() {
+  function pathIsReady() {
+    return isCameraPathReady(keyframeStore.getAll());
+  }
+
+  function setInteractive(interactive) {
     if (!barEl) return;
+    barEl.setAttribute('aria-hidden', interactive ? 'false' : 'true');
+    barEl.inert = !interactive;
+    for (const control of barEl.querySelectorAll('button, input')) {
+      control.disabled = !interactive;
+    }
+  }
+
+  function show() {
+    if (!pathIsReady()) return;
+    if (!barEl) create();
+    setInteractive(true);
     barEl.classList.add('visible');
     scheduleHide();
   }
 
-  function hide() {
+  function hide(options) {
+    const force = readCameraBooleanOption(options, 'force', 'Camera transport hide');
     if (!barEl) return;
     // Don't hide during playback
-    if (playbackController.getState() === 'PLAYING') return;
+    if (!force && playbackController.getState() === 'PLAYING') return;
     barEl.classList.remove('visible');
+    setInteractive(false);
   }
 
   function scheduleHide() {
     clearTimeout(hideTimeout);
-    hideTimeout = setTimeout(hide, HIDE_DELAY);
+    if (!barEl || !pathIsReady()) return;
+    if (barEl.contains(document.activeElement)) return;
+    hideTimeout = setTimeout(() => hide({ force: false }), HIDE_DELAY);
   }
 
   function onMouseActivity(e) {
@@ -177,19 +248,35 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
     if (sidebar && !sidebar.classList.contains('hidden') && e.clientX < sidebar.getBoundingClientRect().right) {
       return;
     }
-    if (keyframeStore.getCount() >= 2) {
+    if (pathIsReady()) {
       show();
     }
   }
 
-  /** Update visibility based on keyframe count. */
-  function updateVisibility() {
-    if (keyframeStore.getCount() >= 2) {
+  function onKeyboardActivity(event) {
+    if (event.key === 'Tab' && pathIsReady()) {
+      show();
+    }
+  }
+
+  /** Update availability based on validated path readiness. */
+  function updateVisibility(options) {
+    const reveal = readCameraBooleanOption(
+      options,
+      'reveal',
+      'Camera transport visibility'
+    );
+    if (pathIsReady()) {
       if (!barEl) create();
       updateMarkers();
-      show();
+      if (reveal) {
+        show();
+      } else {
+        hide({ force: true });
+      }
     } else {
-      hide();
+      playbackController.stop({ resetCamera: false });
+      unmount();
     }
   }
 
@@ -200,16 +287,18 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
     markersEl.innerHTML = '';
 
     const keyframes = keyframeStore.getAll();
-    if (keyframes.length < 2) return;
+    if (!isCameraPathReady(keyframes)) return;
 
-    const opts = getInterpolationOptions ? getInterpolationOptions() : {};
+    const opts = assertCameraPathOptions(getInterpolationOptions());
     const durations = resolveSegmentDurations(keyframes, opts.autoPaceSpeed);
     const total = durations.reduce((s, d) => s + d, 0);
-    if (total <= 0) return;
+    if (!Number.isFinite(total) || total <= 0) {
+      throw new Error('Camera transport requires a positive finite path duration.');
+    }
 
     let cum = 0;
     for (let i = 0; i < keyframes.length; i++) {
-      const pct = total > 0 ? (cum / total) * 100 : 0;
+      const pct = (cum / total) * 100;
       const marker = document.createElement('div');
       marker.className = 'cinematic-timeline-marker';
       marker.style.left = `${pct}%`;
@@ -221,6 +310,9 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
   // ---- Progress updates ----
 
   function updateProgress(globalT) {
+    if (!Number.isFinite(globalT) || globalT < 0 || globalT > 1) {
+      throw new RangeError('Camera transport progress must be a finite number from 0 through 1.');
+    }
     if (progressEl) {
       progressEl.style.width = `${(globalT * 100).toFixed(2)}%`;
     }
@@ -235,9 +327,11 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
   }
 
   function formatTime(seconds) {
-    const s = Math.max(0, seconds);
-    const mins = Math.floor(s / 60);
-    const secs = Math.floor(s % 60);
+    if (!Number.isFinite(seconds) || seconds < 0) {
+      throw new RangeError('Camera transport time must be a non-negative finite number.');
+    }
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
     return `${mins}:${String(secs).padStart(2, '0')}`;
   }
 
@@ -246,9 +340,13 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
   function onPlaybackStateChange(playbackState) {
     if (!playBtn) return;
     if (playbackState === 'PLAYING') {
+      if (!pathIsReady()) {
+        playbackController.stop({ resetCamera: false });
+        return;
+      }
       playBtn.innerHTML = ICON_PAUSE;
       playBtn.title = 'Pause';
-      if (barEl) barEl.classList.add('visible');
+      show();
       clearTimeout(hideTimeout);
     } else {
       playBtn.innerHTML = ICON_PLAY;
@@ -266,26 +364,37 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
     updateTimeReadout(elapsed, totalDuration);
   }
 
-  function onKeyframeChange() {
-    updateMarkers();
-    updateVisibility();
-  }
-
   // ---- Cleanup ----
 
-  function destroy() {
+  function unmount() {
     clearTimeout(hideTimeout);
     document.removeEventListener('mousemove', onMouseActivity);
     document.removeEventListener('pointerdown', onMouseActivity);
+    document.removeEventListener('keydown', onKeyboardActivity);
     playbackController.off('stateChange', onPlaybackStateChange);
     playbackController.off('timeUpdate', onTimeUpdate);
-    keyframeStore.off('changed', onKeyframeChange);
     if (sidebarObserver) sidebarObserver.disconnect();
+    sidebarObserver = null;
     if (barEl) {
       barEl.remove();
       barEl = null;
     }
+    playBtn = null;
+    progressEl = null;
+    scrubberEl = null;
+    markersEl = null;
+    readoutEl = null;
+    isScrubbing = false;
+    wasPlayingBeforeScrub = false;
   }
 
-  return { create, show, hide, updateVisibility, updateMarkers, destroy };
+  function destroy() {
+    unmount();
+  }
+
+  return {
+    updateVisibility,
+    destroy,
+    isMounted: () => Boolean(barEl)
+  };
 }

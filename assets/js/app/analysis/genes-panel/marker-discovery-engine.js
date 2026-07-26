@@ -28,15 +28,6 @@ import { DEFAULTS, ERROR_MESSAGES, formatError, ANALYSIS_PHASES } from './consta
 // INTERNAL HELPERS
 // =============================================================================
 
-function clampInt(value, min, max) {
-  const n = Number.isFinite(value) ? Math.floor(value) : min;
-  return Math.min(max, Math.max(min, n));
-}
-
-function safeP(p) {
-  return Number.isFinite(p) ? p : 1;
-}
-
 /**
  * Max-heap that keeps the "worst" element at the root, so we can evict it when
  * we exceed capacity.
@@ -44,10 +35,16 @@ function safeP(p) {
 class TopNHeap {
   /**
    * @param {number} capacity
-   * @param {(a: any, b: any) => boolean} isWorse - returns true if a is worse than b
-   */
+  * @param {(a: any, b: any) => boolean} isWorse - returns true if a is worse than b
+  */
   constructor(capacity, isWorse) {
-    this._cap = Math.max(1, capacity | 0);
+    if (!Number.isSafeInteger(capacity) || capacity <= 0) {
+      throw new RangeError('TopNHeap capacity must be a positive integer');
+    }
+    if (typeof isWorse !== 'function') {
+      throw new TypeError('TopNHeap isWorse must be a function');
+    }
+    this._cap = capacity;
     this._isWorse = isWorse;
     /** @type {any[]} */
     this._arr = [];
@@ -116,36 +113,55 @@ class TopNHeap {
 }
 
 /**
- * Benjamini–Hochberg correction for a Float32Array of p-values.
- * Returns a Float32Array of adjusted p-values (NaN preserved).
+ * Benjamini–Hochberg correction for an array of p-values.
+ * Returns Float64 values so finite extreme tails remain distinguishable.
  *
- * @param {Float32Array} pValues
- * @returns {Float32Array}
+ * @param {ArrayLike<number>} pValues
+ * @returns {Float64Array}
  */
-function benjaminiHochberg(pValues) {
+export function benjaminiHochberg(pValues) {
+  if (
+    pValues === null ||
+    pValues === undefined ||
+    !Number.isSafeInteger(pValues.length) ||
+    pValues.length < 0
+  ) {
+    throw new TypeError(
+      'Benjamini-Hochberg p-values must be an array-like collection'
+    );
+  }
   const n = pValues.length;
-  const out = new Float32Array(n);
-  out.fill(NaN);
+  const out = new Float64Array(n);
 
   /** @type {{ index: number, p: number }[]} */
-  const valid = [];
+  const ordered = [];
   for (let i = 0; i < n; i++) {
     const p = pValues[i];
-    if (Number.isFinite(p)) valid.push({ index: i, p });
+    if (!Number.isFinite(p)) {
+      throw new TypeError(
+        `Benjamini-Hochberg p-value at index ${i} must be finite`
+      );
+    }
+    if (p < 0 || p > 1) {
+      throw new RangeError(
+        `Benjamini-Hochberg p-value at index ${i} must be between 0 and 1`
+      );
+    }
+    ordered.push({ index: i, p });
   }
 
-  if (valid.length === 0) return out;
+  if (ordered.length === 0) return out;
 
-  valid.sort((a, b) => a.p - b.p);
+  ordered.sort((a, b) => a.p - b.p || a.index - b.index);
 
-  const m = valid.length;
-  let nextAdj = valid[m - 1].p;
-  out[valid[m - 1].index] = Math.min(nextAdj, 1);
+  const m = ordered.length;
+  let nextAdj = ordered[m - 1].p;
+  out[ordered[m - 1].index] = Math.min(nextAdj, 1);
 
   for (let i = m - 2; i >= 0; i--) {
-    const raw = (valid[i].p * m) / (i + 1);
+    const raw = (ordered[i].p * m) / (i + 1);
     nextAdj = Math.min(raw, nextAdj);
-    out[valid[i].index] = Math.min(nextAdj, 1);
+    out[ordered[i].index] = Math.min(nextAdj, 1);
   }
 
   return out;
@@ -159,13 +175,36 @@ export class MarkerDiscoveryEngine {
   /**
    * @param {Object} options
    * @param {Object} options.dataLayer - DataLayer instance for gene loading
-   * @param {Object} [options.config]
-   */
+  * @param {Object} [options.config]
+  */
   constructor(options) {
-    const { dataLayer, config = {} } = options || {};
+    if (
+      options === null ||
+      typeof options !== 'object' ||
+      Array.isArray(options)
+    ) {
+      throw new TypeError(
+        '[MarkerDiscoveryEngine] options must be an object'
+      );
+    }
+    const { dataLayer, config = {} } = options;
 
-    if (!dataLayer) {
-      throw new Error('[MarkerDiscoveryEngine] dataLayer is required');
+    if (
+      dataLayer === null ||
+      typeof dataLayer !== 'object'
+    ) {
+      throw new TypeError(
+        '[MarkerDiscoveryEngine] dataLayer must be an object'
+      );
+    }
+    if (
+      config === null ||
+      typeof config !== 'object' ||
+      Array.isArray(config)
+    ) {
+      throw new TypeError(
+        '[MarkerDiscoveryEngine] config must be an object'
+      );
     }
 
     this.dataLayer = dataLayer;
@@ -180,6 +219,48 @@ export class MarkerDiscoveryEngine {
       networkConcurrency: config.networkConcurrency ?? DEFAULTS.networkConcurrency,
       memoryBudgetMB: config.memoryBudgetMB ?? DEFAULTS.memoryBudgetMB
     };
+    if (!Number.isSafeInteger(this._config.minCells) || this._config.minCells <= 0) {
+      throw new RangeError(
+        '[MarkerDiscoveryEngine] minCells must be a positive integer'
+      );
+    }
+    if (
+      !Number.isFinite(this._config.pValueThreshold) ||
+      this._config.pValueThreshold <= 0 ||
+      this._config.pValueThreshold > 1
+    ) {
+      throw new RangeError(
+        '[MarkerDiscoveryEngine] pValueThreshold must be in (0, 1]'
+      );
+    }
+    if (
+      !Number.isFinite(this._config.foldChangeThreshold) ||
+      this._config.foldChangeThreshold < 0
+    ) {
+      throw new RangeError(
+        '[MarkerDiscoveryEngine] foldChangeThreshold must be non-negative'
+      );
+    }
+    if (typeof this._config.useAdjustedPValue !== 'boolean') {
+      throw new TypeError(
+        '[MarkerDiscoveryEngine] useAdjustedPValue must be boolean'
+      );
+    }
+    for (const key of ['progressInterval', 'batchSize', 'networkConcurrency']) {
+      if (!Number.isSafeInteger(this._config[key]) || this._config[key] <= 0) {
+        throw new RangeError(
+          `[MarkerDiscoveryEngine] ${key} must be a positive integer`
+        );
+      }
+    }
+    if (
+      !Number.isFinite(this._config.memoryBudgetMB) ||
+      this._config.memoryBudgetMB <= 0
+    ) {
+      throw new RangeError(
+        '[MarkerDiscoveryEngine] memoryBudgetMB must be positive and finite'
+      );
+    }
   }
 
   /**
@@ -212,8 +293,27 @@ export class MarkerDiscoveryEngine {
   async discoverMarkers(options) {
     const startTime = performance.now();
 
+    if (
+      typeof this.dataLayer.getAvailableVariables !== 'function' ||
+      typeof this.dataLayer.ensureGeneExpressionLoaded !== 'function' ||
+      typeof this.dataLayer.unloadGeneExpression !== 'function' ||
+      typeof this.dataLayer.invalidateVariable !== 'function'
+    ) {
+      throw new TypeError(
+        '[MarkerDiscoveryEngine] dataLayer must implement the exact gene data contract'
+      );
+    }
+    if (
+      options === null ||
+      typeof options !== 'object' ||
+      Array.isArray(options)
+    ) {
+      throw new TypeError(
+        '[MarkerDiscoveryEngine] discovery options must be an object'
+      );
+    }
     const {
-      obsCategory = 'custom',
+      obsCategory,
       groups,
       obsCodes,
       geneList = null,
@@ -228,63 +328,283 @@ export class MarkerDiscoveryEngine {
       onProgress,
       onPartialResults,
       signal
-    } = options || {};
+    } = options;
 
+    if (
+      typeof obsCategory !== 'string' ||
+      obsCategory.length === 0 ||
+      obsCategory !== obsCategory.trim()
+    ) {
+      throw new TypeError(
+        '[MarkerDiscoveryEngine] obsCategory must be a non-empty string'
+      );
+    }
+    if (method !== 'wilcox' && method !== 'ttest') {
+      throw new RangeError(
+        '[MarkerDiscoveryEngine] method must be wilcox or ttest'
+      );
+    }
+    if (!Number.isSafeInteger(minCells) || minCells <= 0) {
+      throw new RangeError(
+        '[MarkerDiscoveryEngine] minCells must be a positive integer'
+      );
+    }
+    if (
+      !Number.isFinite(pValueThreshold) ||
+      pValueThreshold <= 0 ||
+      pValueThreshold > 1
+    ) {
+      throw new RangeError(
+        '[MarkerDiscoveryEngine] pValueThreshold must be in (0, 1]'
+      );
+    }
+    if (
+      !Number.isFinite(foldChangeThreshold) ||
+      foldChangeThreshold < 0
+    ) {
+      throw new RangeError(
+        '[MarkerDiscoveryEngine] foldChangeThreshold must be non-negative'
+      );
+    }
+    if (typeof useAdjustedPValue !== 'boolean') {
+      throw new TypeError(
+        '[MarkerDiscoveryEngine] useAdjustedPValue must be boolean'
+      );
+    }
+    if (
+      topNPerGroup !== 'all' &&
+      (!Number.isSafeInteger(topNPerGroup) || topNPerGroup <= 0)
+    ) {
+      throw new RangeError(
+        '[MarkerDiscoveryEngine] topNPerGroup must be all or a positive integer'
+      );
+    }
+    if (
+      parallelism !== 'auto' &&
+      (!Number.isSafeInteger(parallelism) || parallelism <= 0)
+    ) {
+      throw new RangeError(
+        '[MarkerDiscoveryEngine] parallelism must be auto or a positive integer'
+      );
+    }
+    if (
+      batchConfig === null ||
+      typeof batchConfig !== 'object' ||
+      Array.isArray(batchConfig)
+    ) {
+      throw new TypeError(
+        '[MarkerDiscoveryEngine] batchConfig must be an object'
+      );
+    }
+    for (const [name, value] of [
+      ['preloadCount', batchConfig.preloadCount ?? this._config.batchSize],
+      [
+        'networkConcurrency',
+        batchConfig.networkConcurrency ?? this._config.networkConcurrency
+      ],
+    ]) {
+      if (!Number.isSafeInteger(value) || value <= 0) {
+        throw new RangeError(
+          `[MarkerDiscoveryEngine] ${name} must be a positive integer`
+        );
+      }
+    }
+    const memoryBudgetMB =
+      batchConfig.memoryBudgetMB ?? this._config.memoryBudgetMB;
+    if (!Number.isFinite(memoryBudgetMB) || memoryBudgetMB <= 0) {
+      throw new RangeError(
+        '[MarkerDiscoveryEngine] memoryBudgetMB must be positive and finite'
+      );
+    }
+    for (const [name, callback] of [
+      ['onProgress', onProgress],
+      ['onPartialResults', onPartialResults],
+    ]) {
+      if (callback !== undefined && typeof callback !== 'function') {
+        throw new TypeError(
+          `[MarkerDiscoveryEngine] ${name} must be a function when provided`
+        );
+      }
+    }
+    if (
+      signal !== undefined &&
+      (
+        signal === null ||
+        typeof signal.aborted !== 'boolean' ||
+        typeof signal.addEventListener !== 'function' ||
+        typeof signal.removeEventListener !== 'function'
+      )
+    ) {
+      throw new TypeError(
+        '[MarkerDiscoveryEngine] signal must implement AbortSignal'
+      );
+    }
+    if (signal?.aborted) {
+      throw signal.reason;
+    }
     this._validateGroups(groups, minCells);
-    if (!obsCodes || !Number.isFinite(obsCodes.length) || obsCodes.length === 0) {
-      throw new Error('[MarkerDiscoveryEngine] obsCodes is required for marker discovery');
+    if (!(obsCodes instanceof Uint16Array) || obsCodes.length === 0) {
+      throw new TypeError(
+        '[MarkerDiscoveryEngine] obsCodes must be a non-empty Uint16Array'
+      );
+    }
+    const pointCount = this.dataLayer.state?.pointCount;
+    if (!Number.isSafeInteger(pointCount) || pointCount <= 0) {
+      throw new RangeError(
+        '[MarkerDiscoveryEngine] exact positive dataset pointCount is required'
+      );
+    }
+    if (obsCodes.length !== pointCount) {
+      throw new RangeError(
+        '[MarkerDiscoveryEngine] obsCodes length must exactly match pointCount'
+      );
+    }
+    const groupByCode = new Map(
+      groups.map(group => [group.groupCode, group])
+    );
+    const countsByCode = new Map(
+      groups.map(group => [group.groupCode, 0])
+    );
+    for (let cellIndex = 0; cellIndex < obsCodes.length; cellIndex++) {
+      const code = obsCodes[cellIndex];
+      if (code === 65535) continue;
+      if (!groupByCode.has(code)) {
+        throw new Error(
+          `[MarkerDiscoveryEngine] obs code ${code} has no exact group owner`
+        );
+      }
+      countsByCode.set(code, countsByCode.get(code) + 1);
+    }
+    for (const group of groups) {
+      if (countsByCode.get(group.groupCode) !== group.cellCount) {
+        throw new RangeError(
+          `Group "${group.groupId}" cellCount does not match obsCodes`
+        );
+      }
+      for (const cellIndex of group.cellIndices) {
+        if (obsCodes[cellIndex] !== group.groupCode) {
+          throw new RangeError(
+            `Group "${group.groupId}" cell index ${cellIndex} does not match groupCode`
+          );
+        }
+      }
     }
 
-    const allGenes = geneList || this.dataLayer.getAvailableVariables('gene_expression').map(v => v.key);
-    if (!allGenes || allGenes.length === 0) {
+    const availableVariables =
+      this.dataLayer.getAvailableVariables('gene_expression');
+    if (!Array.isArray(availableVariables) || availableVariables.length === 0) {
       throw new Error('No gene expression variables available for analysis.');
+    }
+    const availableGenes = availableVariables.map((variable, index) => {
+      if (
+        variable === null ||
+        typeof variable !== 'object' ||
+        typeof variable.key !== 'string' ||
+        variable.key.length === 0 ||
+        variable.key !== variable.key.trim()
+      ) {
+        throw new TypeError(
+          `Gene inventory entry ${index} must own a non-empty key`
+        );
+      }
+      return variable.key;
+    });
+    if (new Set(availableGenes).size !== availableGenes.length) {
+      throw new Error('Gene inventory contains duplicate keys');
+    }
+
+    let allGenes;
+    if (geneList === null) {
+      allGenes = availableGenes;
+    } else {
+      if (
+        !Array.isArray(geneList) ||
+        geneList.length === 0 ||
+        geneList.some(
+          gene =>
+            typeof gene !== 'string' ||
+            gene.length === 0 ||
+            gene !== gene.trim()
+        ) ||
+        new Set(geneList).size !== geneList.length
+      ) {
+        throw new TypeError(
+          '[MarkerDiscoveryEngine] geneList must be null or unique non-empty strings'
+        );
+      }
+      const availableGeneSet = new Set(availableGenes);
+      for (const gene of geneList) {
+        if (!availableGeneSet.has(gene)) {
+          throw new Error(
+            `[MarkerDiscoveryEngine] requested gene not found: ${gene}`
+          );
+        }
+      }
+      allGenes = [...geneList];
     }
 
     const groupCount = groups.length;
     const geneCount = allGenes.length;
+    if (
+      topNPerGroup !== 'all' &&
+      topNPerGroup > geneCount
+    ) {
+      throw new RangeError(
+        '[MarkerDiscoveryEngine] topNPerGroup cannot exceed geneCount'
+      );
+    }
 
     // Worker pool (shared singleton used by ComputeManager too).
     const pool = getWorkerPool();
     await pool.init();
-
-    const workersReady = pool.isReady();
-    const poolStats = pool.getStats?.() || { poolSize: 1 };
-    const poolSize = poolStats.poolSize || 1;
+    if (!pool.isReady()) {
+      throw new Error('Marker discovery requires Web Workers');
+    }
+    if (typeof pool.getStats !== 'function') {
+      throw new TypeError(
+        'Marker discovery worker pool must expose getStats()'
+      );
+    }
+    const poolStats = pool.getStats();
+    if (
+      poolStats === null ||
+      typeof poolStats !== 'object' ||
+      !Number.isSafeInteger(poolStats.poolSize) ||
+      poolStats.poolSize <= 0
+    ) {
+      throw new TypeError(
+        'Marker discovery requires an exact positive worker pool size'
+      );
+    }
+    const poolSize = poolStats.poolSize;
 
     // Build a code->groupIndex map (sized to max groupCode + 1).
     let mapLen = 0;
     for (const g of groups) {
-      if (Number.isFinite(g.groupCode)) {
-        mapLen = Math.max(mapLen, (g.groupCode | 0) + 1);
-      }
+      mapLen = Math.max(mapLen, g.groupCode + 1);
     }
-    const codeToGroupIndex = new Int16Array(Math.max(1, mapLen));
+    const codeToGroupIndex = new Int16Array(mapLen);
     codeToGroupIndex.fill(-1);
     for (let i = 0; i < groups.length; i++) {
       const code = groups[i].groupCode;
-      if (Number.isFinite(code) && code >= 0 && code < codeToGroupIndex.length) {
-        codeToGroupIndex[code] = i;
-      }
+      codeToGroupIndex[code] = i;
     }
 
     // Broadcast marker context to workers (once per run).
     // Each worker needs its own backing buffers (transfer detaches).
-    if (workersReady) {
-      await pool.broadcast(
-        'MARKERS_SET_CONTEXT',
-        (/* workerIndex */) => ({
-          codes: new Uint16Array(obsCodes),
-          codeToGroupIndex: new Int16Array(codeToGroupIndex),
-          groupCount,
-          histBins: batchConfig?.wilcoxBins
-        }),
-        { timeout: 30000, signal }
-      );
-    }
+    await pool.broadcast(
+      'MARKERS_SET_CONTEXT',
+      (/* workerIndex */) => ({
+        codes: new Uint16Array(obsCodes),
+        codeToGroupIndex: new Int16Array(codeToGroupIndex),
+        groupCount
+      }),
+      { timeout: 30000, signal }
+    );
 
     // Prepare per-group p-value storage for BH correction.
     const pValuesByGroup = Array.from({ length: groupCount }, () => {
-      const arr = new Float32Array(geneCount);
+      const arr = new Float64Array(geneCount);
       arr.fill(NaN);
       return arr;
     });
@@ -298,17 +618,17 @@ export class MarkerDiscoveryEngine {
 
     const effectiveTopNPerGroup = topNPerGroup === 'all'
       ? geneCount
-      : clampInt(Number(topNPerGroup), 1, geneCount);
+      : topNPerGroup;
 
     // Per-group Top-N heaps for progressive results.
     const heaps = Array.from({ length: groupCount }, () => {
       // "Worst" = higher p-value; tie-break: smaller |log2FC| is worse.
       const isWorse = (a, b) => {
-        const pa = safeP(a.pValue);
-        const pb = safeP(b.pValue);
+        const pa = a.pValue;
+        const pb = b.pValue;
         if (pa !== pb) return pa > pb;
-        const fa = Math.abs(a.log2FoldChange || 0);
-        const fb = Math.abs(b.log2FoldChange || 0);
+        const fa = Math.abs(a.log2FoldChange);
+        const fb = Math.abs(b.log2FoldChange);
         return fa < fb;
       };
       return new TopNHeap(effectiveTopNPerGroup, isWorse);
@@ -317,22 +637,29 @@ export class MarkerDiscoveryEngine {
     const effectiveBatchConfig = {
       preloadCount: batchConfig.preloadCount ?? this._config.batchSize,
       networkConcurrency: batchConfig.networkConcurrency ?? this._config.networkConcurrency,
-      memoryBudgetMB: batchConfig.memoryBudgetMB ?? this._config.memoryBudgetMB,
-      wilcoxBins: batchConfig.wilcoxBins
+      memoryBudgetMB
     };
 
     // Choose bounded concurrency for worker compute.
     const requestedParallelism = parallelism === 'auto'
       ? poolSize
-      : Number(parallelism);
-
-    const maxWorkerParallelism = workersReady ? clampInt(requestedParallelism, 1, Math.min(poolSize, 8)) : 1;
+      : parallelism;
+    if (requestedParallelism > poolSize) {
+      throw new RangeError(
+        `Requested marker parallelism ${requestedParallelism} exceeds worker pool size ${poolSize}`
+      );
+    }
 
     const totalCells = obsCodes.length;
     const bytesPerGene = totalCells * 4 * (method === 'wilcox' ? 2 : 1); // values + (wilcox) order scratch in worker
     const budgetBytes = effectiveBatchConfig.memoryBudgetMB * 1024 * 1024;
-    const maxByMemory = Math.max(1, Math.floor(budgetBytes / Math.max(1, bytesPerGene)));
-    const maxInFlight = Math.max(1, Math.min(maxWorkerParallelism, maxByMemory));
+    const maxByMemory = Math.floor(budgetBytes / bytesPerGene);
+    if (maxByMemory < 1) {
+      throw new RangeError(
+        `Marker memory budget ${effectiveBatchConfig.memoryBudgetMB} MB cannot hold one gene working set`
+      );
+    }
+    const maxInFlight = Math.min(requestedParallelism, maxByMemory);
 
     // Stream raw genes (prefetch + memory-aware unloading).
     const loader = new StreamingGeneLoader({
@@ -348,6 +675,7 @@ export class MarkerDiscoveryEngine {
     let completedGenes = 0;
     let lastPartialEmit = 0;
     const inFlight = new Set();
+    const executionErrors = [];
 
     const reportProgress = () => {
       if (!onProgress) return;
@@ -391,24 +719,36 @@ export class MarkerDiscoveryEngine {
       });
     };
 
-    for await (const { gene, values, index: geneIndex } of loader.streamGenesRaw(allGenes)) {
-      if (signal?.aborted) break;
+    let streamFailure;
+    try {
+      for await (
+        const { gene, values, index: geneIndex } of
+        loader.streamGenesRaw(allGenes)
+      ) {
+        await waitForAvailableSlot(inFlight, maxInFlight);
+        if (executionErrors.length === 1) throw executionErrors[0];
+        if (executionErrors.length > 1) {
+          throw new AggregateError(
+            [...executionErrors],
+            `${executionErrors.length} marker worker operations failed`
+          );
+        }
 
-      await waitForAvailableSlot(inFlight, maxInFlight);
+        // Copy now (bounded by maxInFlight) so DataLayer-owned buffers are
+        // never transferred or retained by worker execution.
+        const valuesCopyForWorker = new Float32Array(values);
 
-      // If we compute in a worker, copy now (bounded by maxInFlight) so we never
-      // hold onto DataLayer-owned buffers beyond the concurrency window.
-      const valuesCopyForWorker = workersReady ? new Float32Array(values) : null;
-
-      const task = (async () => {
-        try {
-          if (workersReady) {
+        let task;
+        task = (async () => {
+          try {
             const res = await pool.execute(
               'MARKERS_COMPUTE_GENE',
               { values: valuesCopyForWorker, method, minCells },
-              // Restart the worker on abort to avoid subsequent runs timing out
-              // behind a canceled long-running compute in the worker.
-              { timeout: 120000, signal, transfer: true, restartWorkerOnAbort: true }
+              {
+                timeout: 120000,
+                signal,
+                transfer: true
+              }
             );
 
             this._ingestGeneResult({
@@ -420,41 +760,47 @@ export class MarkerDiscoveryEngine {
               heaps,
               result: res
             });
-          } else {
-            // Worker-less fallback: do not attempt Wilcoxon on large datasets.
-            // We still provide t-test results to keep the feature usable.
-            if (method === 'wilcox') {
-              throw new Error('Wilcoxon requires Web Workers for performance; try t-test instead.');
-            }
-
-            const res = this._computeGeneMarkersFallback(values, codeToGroupIndex, obsCodes, groups.length, minCells);
-            this._ingestGeneResult({
-              gene,
-              geneIndex,
-              groups,
-              pValuesByGroup,
-              log2FCByGroup,
-              heaps,
-              result: res
-            });
+          } catch (error) {
+            executionErrors.push(error);
+          } finally {
+            completedGenes++;
+            reportProgress();
+            maybeEmitPartial();
           }
-        } finally {
-          completedGenes++;
-          reportProgress();
-          maybeEmitPartial();
-        }
-      })();
+        })().finally(() => inFlight.delete(task));
 
-      inFlight.add(task);
-      task.finally(() => inFlight.delete(task));
+        inFlight.add(task);
+      }
+    } catch (error) {
+      streamFailure = error;
     }
 
-    // Wait for remaining work
-    await Promise.allSettled(Array.from(inFlight));
+    const remainingFailures = [];
+    await Promise.all(
+      [...inFlight].map(task =>
+        task.catch(error => {
+          remainingFailures.push(error);
+        })
+      )
+    );
+    const failures = [];
+    const appendFailure = failure => {
+      if (!failures.includes(failure)) failures.push(failure);
+    };
+    if (streamFailure !== undefined) appendFailure(streamFailure);
+    for (const failure of executionErrors) appendFailure(failure);
+    for (const failure of remainingFailures) appendFailure(failure);
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) {
+      throw new AggregateError(
+        failures,
+        `${failures.length} marker streaming or worker operations failed`
+      );
+    }
 
     // If we were cancelled, do not proceed to heavy post-processing (BH correction).
     if (signal?.aborted) {
-      throw new DOMException('Request aborted', 'AbortError');
+      throw signal.reason;
     }
 
     // BH correction per group
@@ -510,22 +856,127 @@ export class MarkerDiscoveryEngine {
   // ===========================================================================
 
   _validateGroups(groups, minCells) {
-    if (!groups || groups.length < 2) {
-      throw new Error(formatError(ERROR_MESSAGES.TOO_FEW_GROUPS, { n: groups?.length || 0 }));
+    if (!Array.isArray(groups)) {
+      throw new TypeError('[MarkerDiscoveryEngine] groups must be an array');
+    }
+    if (groups.length < 2) {
+      throw new Error(
+        formatError(ERROR_MESSAGES.TOO_FEW_GROUPS, { n: groups.length })
+      );
+    }
+    if (groups.length > 32767) {
+      throw new RangeError(
+        '[MarkerDiscoveryEngine] group count exceeds the Int16 worker contract'
+      );
     }
 
-    for (const group of groups) {
-      if (!group.groupId) {
-        throw new Error('Group must have a groupId');
+    const pointCount = this.dataLayer.state?.pointCount;
+    if (!Number.isSafeInteger(pointCount) || pointCount <= 0) {
+      throw new RangeError(
+        '[MarkerDiscoveryEngine] exact positive dataset pointCount is required'
+      );
+    }
+    const groupIds = new Set();
+    const groupCodes = new Set();
+    for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+      const group = groups[groupIndex];
+      if (
+        group === null ||
+        typeof group !== 'object' ||
+        Array.isArray(group)
+      ) {
+        throw new TypeError(
+          `[MarkerDiscoveryEngine] group ${groupIndex} must be an object`
+        );
       }
-      if (!Number.isFinite(group.groupCode)) {
-        throw new Error(`Group "${group.groupId}" is missing required groupCode`);
+      if (
+        typeof group.groupId !== 'string' ||
+        group.groupId.length === 0 ||
+        group.groupId !== group.groupId.trim()
+      ) {
+        throw new TypeError(
+          `[MarkerDiscoveryEngine] group ${groupIndex} must own a non-empty groupId`
+        );
       }
-      const n = group.cellIndices?.length || group.cellCount || 0;
-      if (n < minCells) {
+      if (groupIds.has(group.groupId)) {
+        throw new Error(
+          `[MarkerDiscoveryEngine] duplicate groupId "${group.groupId}"`
+        );
+      }
+      groupIds.add(group.groupId);
+      if (
+        (
+          typeof group.groupName !== 'string' &&
+          typeof group.groupName !== 'number' &&
+          typeof group.groupName !== 'boolean'
+        ) ||
+        (
+          typeof group.groupName === 'string' &&
+          (
+            group.groupName.length === 0 ||
+            group.groupName !== group.groupName.trim()
+          )
+        ) ||
+        (
+          typeof group.groupName === 'number' &&
+          !Number.isFinite(group.groupName)
+        )
+      ) {
+        throw new TypeError(
+          `Group "${group.groupId}" must own an exact primitive groupName`
+        );
+      }
+      if (
+        !Number.isSafeInteger(group.groupCode) ||
+        group.groupCode < 0 ||
+        group.groupCode >= 65535
+      ) {
+        throw new RangeError(
+          `Group "${group.groupId}" groupCode must be an integer from 0 through 65534`
+        );
+      }
+      if (groupCodes.has(group.groupCode)) {
+        throw new Error(
+          `[MarkerDiscoveryEngine] duplicate groupCode ${group.groupCode}`
+        );
+      }
+      groupCodes.add(group.groupCode);
+      if (!(group.cellIndices instanceof Uint32Array)) {
+        throw new TypeError(
+          `Group "${group.groupId}" cellIndices must be a Uint32Array`
+        );
+      }
+      let previousIndex = -1;
+      for (const cellIndex of group.cellIndices) {
+        if (cellIndex >= pointCount) {
+          throw new RangeError(
+            `Group "${group.groupId}" cell index ${cellIndex} exceeds pointCount`
+          );
+        }
+        if (cellIndex <= previousIndex) {
+          throw new RangeError(
+            `Group "${group.groupId}" cellIndices must be sorted and unique`
+          );
+        }
+        previousIndex = cellIndex;
+      }
+      if (
+        !Number.isSafeInteger(group.cellCount) ||
+        group.cellCount !== group.cellIndices.length
+      ) {
+        throw new RangeError(
+          `Group "${group.groupId}" cellCount must exactly match cellIndices length`
+        );
+      }
+      if (typeof group.color !== 'string' || group.color.length === 0) {
+        throw new TypeError(
+          `Group "${group.groupId}" color must be a non-empty string`
+        );
+      }
+      if (group.cellCount < minCells) {
         throw new Error(formatError(ERROR_MESSAGES.TOO_FEW_CELLS, {
-          name: group.groupName || group.groupId,
-          n,
+          name: group.groupName,
+          n: group.cellCount,
           min: minCells
         }));
       }
@@ -533,21 +984,96 @@ export class MarkerDiscoveryEngine {
   }
 
   _ingestGeneResult({ gene, geneIndex, groups, pValuesByGroup, log2FCByGroup, heaps, result }) {
-    const { pValues, log2FoldChange, meanInGroup, meanOutGroup, percentInGroup, percentOutGroup, nIn, nOut } = result || {};
-    if (!pValues || !log2FoldChange) return;
+    if (
+      typeof gene !== 'string' ||
+      gene.length === 0 ||
+      !Number.isSafeInteger(geneIndex) ||
+      geneIndex < 0
+    ) {
+      throw new TypeError('Marker gene identity and index must be exact');
+    }
+    if (
+      result === null ||
+      typeof result !== 'object' ||
+      Array.isArray(result)
+    ) {
+      throw new TypeError(
+        `Marker worker returned an invalid result for "${gene}"`
+      );
+    }
+    const {
+      nAll,
+      pValues,
+      statistics,
+      log2FoldChange,
+      meanInGroup,
+      meanOutGroup,
+      percentInGroup,
+      percentOutGroup,
+      nIn,
+      nOut
+    } = result;
+    const groupCount = groups.length;
+    const requiredArrays = [
+      ['pValues', pValues, Float64Array],
+      ['statistics', statistics, Float32Array],
+      ['log2FoldChange', log2FoldChange, Float32Array],
+      ['meanInGroup', meanInGroup, Float32Array],
+      ['meanOutGroup', meanOutGroup, Float32Array],
+      ['percentInGroup', percentInGroup, Float32Array],
+      ['percentOutGroup', percentOutGroup, Float32Array],
+      ['nIn', nIn, Uint32Array],
+      ['nOut', nOut, Uint32Array],
+    ];
+    for (const [name, values, ArrayType] of requiredArrays) {
+      if (!(values instanceof ArrayType) || values.length !== groupCount) {
+        throw new TypeError(
+          `Marker worker ${name} for "${gene}" must be a ${ArrayType.name} with one value per group`
+        );
+      }
+    }
+    if (!Number.isSafeInteger(nAll) || nAll <= 0) {
+      throw new RangeError(
+        `Marker worker nAll for "${gene}" must be a positive integer`
+      );
+    }
+    if (
+      geneIndex >= pValuesByGroup[0].length ||
+      geneIndex >= log2FCByGroup[0].length
+    ) {
+      throw new RangeError(
+        `Marker gene index ${geneIndex} is outside result storage`
+      );
+    }
 
     for (let g = 0; g < groups.length; g++) {
       const p = pValues[g];
-      if (Number.isFinite(geneIndex) && geneIndex >= 0 && geneIndex < pValuesByGroup[g].length) {
-        pValuesByGroup[g][geneIndex] = p;
-      }
-
-      if (!Number.isFinite(p)) continue;
       const fc = log2FoldChange[g];
-      if (!Number.isFinite(fc)) continue;
-      if (log2FCByGroup && Number.isFinite(geneIndex) && geneIndex >= 0 && geneIndex < log2FCByGroup[g].length) {
-        log2FCByGroup[g][geneIndex] = fc;
+      if (!Number.isFinite(p) || p < 0 || p > 1) {
+        throw new RangeError(
+          `Marker worker p-value for "${gene}" group "${groups[g].groupId}" must be finite and between 0 and 1`
+        );
       }
+      if (
+        typeof statistics[g] !== 'number' ||
+        Number.isNaN(statistics[g]) ||
+        !Number.isFinite(fc) ||
+        !Number.isFinite(meanInGroup[g]) ||
+        !Number.isFinite(meanOutGroup[g]) ||
+        !Number.isFinite(percentInGroup[g]) ||
+        !Number.isFinite(percentOutGroup[g]) ||
+        percentInGroup[g] < 0 ||
+        percentInGroup[g] > 100 ||
+        percentOutGroup[g] < 0 ||
+        percentOutGroup[g] > 100 ||
+        nIn[g] + nOut[g] !== nAll
+      ) {
+        throw new RangeError(
+          `Marker worker returned malformed statistics for "${gene}" group "${groups[g].groupId}"`
+        );
+      }
+      pValuesByGroup[g][geneIndex] = p;
+      log2FCByGroup[g][geneIndex] = fc;
 
       heaps[g].push({
         gene,
@@ -556,12 +1082,12 @@ export class MarkerDiscoveryEngine {
         pValue: p,
         adjustedPValue: null,
         log2FoldChange: fc,
-        meanInGroup: meanInGroup ? meanInGroup[g] : NaN,
-        meanOutGroup: meanOutGroup ? meanOutGroup[g] : NaN,
-        percentInGroup: percentInGroup ? percentInGroup[g] : NaN,
-        percentOutGroup: percentOutGroup ? percentOutGroup[g] : NaN,
-        nIn: nIn ? nIn[g] : null,
-        nOut: nOut ? nOut[g] : null
+        meanInGroup: meanInGroup[g],
+        meanOutGroup: meanOutGroup[g],
+        percentInGroup: percentInGroup[g],
+        percentOutGroup: percentOutGroup[g],
+        nIn: nIn[g],
+        nOut: nOut[g]
       });
     }
   }
@@ -574,10 +1100,28 @@ export class MarkerDiscoveryEngine {
       const items = heaps[g].toArray();
 
       for (const item of items) {
-        if (adjustedByGroup) {
-          const adj = adjustedByGroup[g]?.[item.geneIndex];
-          item.adjustedPValue = Number.isFinite(adj) ? adj : null;
+        if (adjustedByGroup !== null) {
+          if (
+            !Array.isArray(adjustedByGroup) ||
+            !(adjustedByGroup[g] instanceof Float64Array)
+          ) {
+            throw new TypeError(
+              'Adjusted marker p-values must contain one Float64Array per group'
+            );
+          }
+          const adj = adjustedByGroup[g][item.geneIndex];
+          if (!Number.isFinite(adj) || adj < 0 || adj > 1) {
+            throw new RangeError(
+              `Adjusted marker p-value is invalid for "${item.gene}"`
+            );
+          }
+          item.adjustedPValue = adj;
         }
+      }
+      if (useAdjustedPValue && adjustedByGroup === null) {
+        throw new Error(
+          'Adjusted marker filtering requires adjusted p-values'
+        );
       }
 
       const pKey = useAdjustedPValue ? 'adjustedPValue' : 'pValue';
@@ -589,10 +1133,14 @@ export class MarkerDiscoveryEngine {
       });
 
       filtered.sort((a, b) => {
-        const pa = useAdjustedPValue ? safeP(a.adjustedPValue) : safeP(a.pValue);
-        const pb = useAdjustedPValue ? safeP(b.adjustedPValue) : safeP(b.pValue);
+        const pa = useAdjustedPValue ? a.adjustedPValue : a.pValue;
+        const pb = useAdjustedPValue ? b.adjustedPValue : b.pValue;
         if (pa !== pb) return pa - pb;
-        return Math.abs(b.log2FoldChange) - Math.abs(a.log2FoldChange);
+        const effectOrder =
+          Math.abs(b.log2FoldChange) - Math.abs(a.log2FoldChange);
+        if (effectOrder !== 0) return effectOrder;
+        if (a.geneIndex !== b.geneIndex) return a.geneIndex - b.geneIndex;
+        return a.gene.localeCompare(b.gene);
       });
 
       const markers = filtered.map((m, i) => ({
@@ -605,14 +1153,13 @@ export class MarkerDiscoveryEngine {
         meanInGroup: m.meanInGroup,
         meanOutGroup: m.meanOutGroup,
         percentInGroup: m.percentInGroup,
-        percentOutGroup: m.percentOutGroup,
-        specificity: 0
+        percentOutGroup: m.percentOutGroup
       }));
 
       out[group.groupId] = {
         groupId: group.groupId,
-        groupName: group.groupName || group.groupId,
-        cellCount: group.cellCount ?? (group.cellIndices?.length || 0),
+        groupName: group.groupName,
+        cellCount: group.cellCount,
         color: group.color,
         markers
       };
@@ -621,98 +1168,6 @@ export class MarkerDiscoveryEngine {
     return out;
   }
 
-  /**
-   * Worker-less fallback for t-test only (one-vs-rest, one pass per gene).
-   * Returns a subset of the worker result contract.
-   */
-  _computeGeneMarkersFallback(values, codeToGroupIndex, obsCodes, groupCount, minCells) {
-    // Build per-cell group index (fast path; avoid per-gene allocations beyond sums).
-    const mapLen = codeToGroupIndex.length;
-    const nIn = new Uint32Array(groupCount);
-    const sumIn = new Float64Array(groupCount);
-    const sumSqIn = new Float64Array(groupCount);
-    const exprIn = new Uint32Array(groupCount);
-
-    let nAll = 0;
-    let sumAll = 0;
-    let sumSqAll = 0;
-    let exprAll = 0;
-
-    const len = Math.min(values.length, obsCodes.length);
-    for (let i = 0; i < len; i++) {
-      const code = obsCodes[i];
-      if (code < 0 || code >= mapLen) continue;
-      const gi = codeToGroupIndex[code];
-      if (gi < 0) continue;
-      const v = values[i];
-      if (!Number.isFinite(v)) continue;
-
-      nAll++;
-      sumAll += v;
-      sumSqAll += v * v;
-      if (v > 0) exprAll++;
-
-      nIn[gi]++;
-      sumIn[gi] += v;
-      sumSqIn[gi] += v * v;
-      if (v > 0) exprIn[gi]++;
-    }
-
-    const pValues = new Float32Array(groupCount);
-    const statistics = new Float32Array(groupCount);
-    const log2FoldChange = new Float32Array(groupCount);
-    const meanInGroup = new Float32Array(groupCount);
-    const meanOutGroup = new Float32Array(groupCount);
-    const percentInGroup = new Float32Array(groupCount);
-    const percentOutGroup = new Float32Array(groupCount);
-    const nOut = new Uint32Array(groupCount);
-
-    pValues.fill(NaN);
-    statistics.fill(NaN);
-    log2FoldChange.fill(NaN);
-    meanInGroup.fill(NaN);
-    meanOutGroup.fill(NaN);
-
-    for (let g = 0; g < groupCount; g++) {
-      const nA = nIn[g];
-      const nB = nAll - nA;
-      nOut[g] = nB;
-      if (nA < Math.max(2, minCells) || nB < Math.max(2, minCells)) continue;
-
-      const meanA = sumIn[g] / nA;
-      const sumB = sumAll - sumIn[g];
-      const meanB = sumB / nB;
-
-      const varA = nA > 1 ? (sumSqIn[g] - (sumIn[g] * sumIn[g]) / nA) / (nA - 1) : NaN;
-      const sumSqB = sumSqAll - sumSqIn[g];
-      const varB = nB > 1 ? (sumSqB - (sumB * sumB) / nB) / (nB - 1) : NaN;
-
-      meanInGroup[g] = meanA;
-      meanOutGroup[g] = meanB;
-      log2FoldChange[g] = Math.log2((meanA + 0.01) / (meanB + 0.01));
-      percentInGroup[g] = nA > 0 ? (exprIn[g] / nA) * 100 : 0;
-      const exprB = exprAll - exprIn[g];
-      percentOutGroup[g] = nB > 0 ? (exprB / nB) * 100 : 0;
-
-      // Conservative fallback: no p-value (workers required for accurate distribution CDF).
-      // Use NaN to avoid misleading significance. UI can still rank by log2FC if desired.
-      pValues[g] = NaN;
-      statistics[g] = NaN;
-    }
-
-    return {
-      nAll,
-      pValues,
-      statistics,
-      log2FoldChange,
-      meanInGroup,
-      meanOutGroup,
-      percentInGroup,
-      percentOutGroup,
-      nIn,
-      nOut
-    };
-  }
 }
 
 export function createMarkerDiscoveryEngine(options) {

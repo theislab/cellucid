@@ -8,7 +8,7 @@
  * Plotly calls an internal notifier function that appends ".notifier-note"
  * elements under ".plotly-notifier" on document.body. Patching Plotly internals
  * is brittle because some modules hold local references; observing the DOM is
- * reliable for all plot creation paths (PlotFactory, BasePlot, ScatterBuilder).
+ * reliable for all plot creation paths (PlotFactory and BasePlot).
  *
  * @module plots/plotly-hints
  */
@@ -60,23 +60,28 @@ function inferLevel(text) {
 
 function extractNotifierText(noteEl) {
   if (!noteEl) return '';
-  const p = noteEl.querySelector?.('p');
-  const raw = (p?.textContent || noteEl.textContent || '').trim();
+  const p = noteEl.querySelector('p');
+  const rawText = p === null ? noteEl.textContent : p.textContent;
+  if (rawText === null) return '';
+  const raw = rawText.trim();
   // Plotly includes a close button "×" as a separate node; prefer <p> but keep a guard.
   return raw.replace(/^×\s*/, '').trim();
 }
 
 function forward(message) {
   if (!enabled || !message) return;
-  const text = String(message).trim();
+  if (typeof message !== 'string') {
+    throw new TypeError('Plotly notification message must be a string');
+  }
+  const text = message.trim();
   if (!text) return;
   if (shouldDedupe(text)) return;
 
   const nc = getNotificationCenter();
-  if (!nc?.show) return;
-
-  // Ensure category exists (falls back to default icon if not supported).
-  nc.registerCategory?.('plot', '📊');
+  if (typeof nc.show !== 'function' || typeof nc.registerCategory !== 'function') {
+    throw new TypeError('NotificationCenter show and registerCategory are required');
+  }
+  nc.registerCategory('plot', '📊');
 
   const level = inferLevel(text);
   const type = level === 'warn' ? 'warning' : 'info';
@@ -95,15 +100,15 @@ function handleAddedNode(node) {
   if (!node || node.nodeType !== 1) return;
   const el = /** @type {HTMLElement} */ (node);
 
-  if (el.classList?.contains('notifier-note')) {
+  if (el.classList.contains('notifier-note')) {
     const text = extractNotifierText(el);
     if (text) forward(text);
     return;
   }
 
   // Common containers that may include notes.
-  if (el.classList?.contains('plotly-notifier') || el.classList?.contains('notifier-container')) {
-    const notes = el.querySelectorAll?.('.notifier-note') || [];
+  if (el.classList.contains('plotly-notifier') || el.classList.contains('notifier-container')) {
+    const notes = el.querySelectorAll('.notifier-note');
     for (const note of notes) {
       const text = extractNotifierText(note);
       if (text) forward(text);
@@ -112,7 +117,7 @@ function handleAddedNode(node) {
   }
 
   // Generic: scan subtree for notes.
-  const notes = el.querySelectorAll?.('.notifier-note') || [];
+  const notes = el.querySelectorAll('.notifier-note');
   for (const note of notes) {
     const text = extractNotifierText(note);
     if (text) forward(text);
@@ -122,10 +127,14 @@ function handleAddedNode(node) {
 function ensureObserver() {
   if (!canUseDOM()) return;
   if (observer) return;
-  if (typeof MutationObserver === 'undefined') return;
+  if (typeof MutationObserver === 'undefined') {
+    throw new TypeError('MutationObserver is required for Plotly notification routing');
+  }
 
-  const root = document.body || document.documentElement;
-  if (!root) return;
+  const root = document.body === null ? document.documentElement : document.body;
+  if (!root) {
+    throw new TypeError('A document root is required for Plotly notification routing');
+  }
 
   observer = new MutationObserver((mutations) => {
     for (const mutation of mutations) {
@@ -145,12 +154,16 @@ export function hidePlotlyNativeHints() {
   if (!canUseDOM()) return;
   if (!enabled) return;
   ensureObserver();
-  // If we can't observe/forward notifications, don't hide native hints.
-  if (!observer) return;
+  if (!observer) {
+    throw new Error('Plotly notification observer was not created');
+  }
   if (cssHidden) return;
 
   const styleId = 'plotly-notif-hide';
   if (!document.getElementById(styleId)) {
+    if (!document.head) {
+      throw new TypeError('document.head is required to hide native Plotly notifications');
+    }
     const style = document.createElement('style');
     style.id = styleId;
     // Plotly uses ".plotly-notifier" with ".notifier-note" children.
@@ -166,29 +179,26 @@ export function hidePlotlyNativeHints() {
  * @param {HTMLElement} [container]
  * @param {Object} [_options]
  */
-export function attachPlotlyHints(container, _options = {}) {
+export function attachPlotlyHints(container) {
   // Container is optional; DOM observer captures global Plotly notifier messages.
   // If container exists, we can opportunistically scan it for already-rendered notes.
   ensureObserver();
-  if (container) {
+  if (container !== undefined && container !== null) {
+    if (typeof container.querySelectorAll !== 'function') {
+      throw new TypeError('Plotly hint container must support querySelectorAll');
+    }
     handleAddedNode(container);
   }
-}
-
-/**
- * Detach hint forwarding for a container.
- * (Global observer stays active; Plotly notifier is global.)
- * @param {HTMLElement} [_container]
- */
-export function detachPlotlyHints(_container) {
-  // No-op by design (Plotly notifier is global). Kept for API compatibility.
 }
 
 /**
  * Enable/disable forwarding.
  */
 export function setPlotlyHintsEnabled(value) {
-  enabled = !!value;
+  if (typeof value !== 'boolean') {
+    throw new TypeError('Plotly hint enabled state must be boolean');
+  }
+  enabled = value;
 }
 
 
@@ -197,22 +207,23 @@ export function setPlotlyHintsEnabled(value) {
  */
 export function restorePlotlyNotifications() {
   enabled = false;
-  document.getElementById('plotly-notif-hide')?.remove();
+  if (canUseDOM()) {
+    const style = document.getElementById('plotly-notif-hide');
+    if (style !== null) style.remove();
+  }
   cssHidden = false;
-  observer?.disconnect?.();
+  if (observer !== null) observer.disconnect();
   observer = null;
 }
 
 export const getPlotlyHintsManager = () => ({
   attach: attachPlotlyHints,
-  detach: detachPlotlyHints,
   setEnabled: setPlotlyHintsEnabled,
   destroy: restorePlotlyNotifications
 });
 
 export default {
   attach: attachPlotlyHints,
-  detach: detachPlotlyHints,
   hideNative: hidePlotlyNativeHints,
   setEnabled: setPlotlyHintsEnabled,
   restore: restorePlotlyNotifications

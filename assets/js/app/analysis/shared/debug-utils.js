@@ -39,23 +39,23 @@
 function isDebugEnabled() {
   if (typeof window === 'undefined') return false;
 
-  // Check localStorage
-  try {
-    if (localStorage.getItem('debug') === 'true' || localStorage.getItem('debug') === '1') {
-      return true;
-    }
-  } catch (_e) {
-    // localStorage may not be available
+  const storage = requireDebugStorage();
+  const storedValue = storage.getItem('debug');
+  if (storedValue === 'true' || storedValue === '1') {
+    return true;
   }
 
-  // Check URL parameter
-  try {
-    const url = new URL(window.location.href);
-    if (url.searchParams.get('debug') === '1' || url.searchParams.get('debug') === 'true') {
-      return true;
-    }
-  } catch (_e) {
-    // URL parsing may fail
+  if (
+    !window.location ||
+    typeof window.location.href !== 'string' ||
+    window.location.href.length === 0
+  ) {
+    throw new TypeError('Debug mode requires an exact window.location.href');
+  }
+  const url = new URL(window.location.href);
+  const queryValue = url.searchParams.get('debug');
+  if (queryValue === '1' || queryValue === 'true') {
+    return true;
   }
 
   // Check global flag
@@ -64,6 +64,21 @@ function isDebugEnabled() {
   }
 
   return false;
+}
+
+function requireDebugStorage() {
+  const storage = globalThis.localStorage;
+  if (
+    !storage ||
+    typeof storage.getItem !== 'function' ||
+    typeof storage.setItem !== 'function' ||
+    typeof storage.removeItem !== 'function'
+  ) {
+    throw new TypeError(
+      'Debug mode requires localStorage getItem(), setItem(), and removeItem()'
+    );
+  }
+  return storage;
 }
 
 // Cache the debug state
@@ -93,30 +108,22 @@ export function isDebugMode() {
  * Enable debug mode programmatically
  */
 export function enableDebug() {
-  _debugEnabled = true;
   if (typeof window !== 'undefined') {
+    requireDebugStorage().setItem('debug', 'true');
     window.__CELLUCID_DEBUG__ = true;
-    try {
-      localStorage.setItem('debug', 'true');
-    } catch (_e) {
-      // Ignore
-    }
   }
+  _debugEnabled = true;
 }
 
 /**
  * Disable debug mode programmatically
  */
 export function disableDebug() {
-  _debugEnabled = false;
   if (typeof window !== 'undefined') {
+    requireDebugStorage().removeItem('debug');
     window.__CELLUCID_DEBUG__ = false;
-    try {
-      localStorage.removeItem('debug');
-    } catch (_e) {
-      // Ignore
-    }
   }
+  _debugEnabled = false;
 }
 
 // =============================================================================

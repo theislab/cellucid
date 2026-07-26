@@ -11,14 +11,32 @@
  * @module session/codecs/gzip
  */
 
+import {
+  assertExactKeys,
+  assertSafeInteger
+} from '../schema-contract.js';
+
 /**
  * @param {AbortSignal | null | undefined} signal
  */
 function throwIfAborted(signal) {
-  if (signal?.aborted) {
+  if (signal !== null && signal.aborted) {
     // DOMException is the browser-standard for abort flows.
     throw new DOMException('Aborted', 'AbortError');
   }
+}
+
+function assertSignal(signal, context) {
+  if (
+    signal !== null
+    && (
+      typeof signal !== 'object'
+      || typeof signal.aborted !== 'boolean'
+    )
+  ) {
+    throw new TypeError(`${context} must be an AbortSignal or null.`);
+  }
+  return signal;
 }
 
 /**
@@ -27,6 +45,9 @@ function throwIfAborted(signal) {
  * @returns {ReadableStream<Uint8Array>}
  */
 function bytesToStream(bytes) {
+  if (!(bytes instanceof Uint8Array)) {
+    throw new TypeError('Gzip input must be a Uint8Array.');
+  }
   return new ReadableStream({
     start(controller) {
       controller.enqueue(bytes);
@@ -40,12 +61,26 @@ function bytesToStream(bytes) {
  * maximum byte limit.
  *
  * @param {ReadableStream<Uint8Array>} stream
- * @param {{ maxBytes?: number | null, signal?: AbortSignal | null }} [options]
+ * @param {{ maxBytes: number | null, signal: AbortSignal | null }} options
  * @returns {Promise<Uint8Array>}
  */
-async function streamToUint8Array(stream, options = {}) {
-  const maxBytes = typeof options.maxBytes === 'number' ? options.maxBytes : null;
-  const signal = options.signal ?? null;
+async function streamToUint8Array(stream, options) {
+  assertExactKeys(
+    options,
+    ['maxBytes', 'signal'],
+    'Gzip stream reader options'
+  );
+  if (
+    stream === null
+    || typeof stream !== 'object'
+    || typeof stream.getReader !== 'function'
+  ) {
+    throw new TypeError('Gzip output must be a readable byte stream.');
+  }
+  const maxBytes = options.maxBytes === null
+    ? null
+    : assertSafeInteger(options.maxBytes, 'Gzip maximum output bytes');
+  const signal = assertSignal(options.signal, 'Gzip stream signal');
 
   /** @type {Uint8Array[]} */
   const chunks = [];
@@ -57,20 +92,23 @@ async function streamToUint8Array(stream, options = {}) {
       throwIfAborted(signal);
       const { value, done } = await reader.read();
       if (done) break;
-      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+      if (!(value instanceof Uint8Array)) {
+        throw new TypeError('Gzip byte stream must yield Uint8Array chunks.');
+      }
+      const chunk = value;
       if (!chunk.byteLength) continue;
 
       total += chunk.byteLength;
       if (maxBytes != null && total > maxBytes) {
         // Cancel the underlying stream ASAP to avoid continued decompression work.
-        try { await reader.cancel('maxBytes exceeded'); } catch { /* ignore */ }
+        await reader.cancel('maxBytes exceeded');
         throw new Error(`Decompressed data exceeds limit (${total} > ${maxBytes} bytes).`);
       }
 
       chunks.push(chunk);
     }
   } finally {
-    try { reader.releaseLock(); } catch { /* ignore */ }
+    reader.releaseLock();
   }
 
   // Fast path: single chunk.
@@ -89,14 +127,25 @@ async function streamToUint8Array(stream, options = {}) {
  * gzip-decompress bytes with bounds checks.
  *
  * @param {Uint8Array} compressed
- * @param {{ maxOutputBytes?: number | null, signal?: AbortSignal | null }} [options]
+ * @param {{ maxOutputBytes: number, signal: AbortSignal | null }} options
  * @returns {Promise<Uint8Array>}
  */
-export async function gzipDecompress(compressed, options = {}) {
-  const signal = options.signal ?? null;
+export async function gzipDecompress(compressed, options) {
+  if (!(compressed instanceof Uint8Array)) {
+    throw new TypeError('Gzip compressed input must be a Uint8Array.');
+  }
+  assertExactKeys(
+    options,
+    ['maxOutputBytes', 'signal'],
+    'Gzip decompression options'
+  );
+  const signal = assertSignal(options.signal, 'Gzip decompression signal');
   throwIfAborted(signal);
 
-  const maxOutputBytes = typeof options.maxOutputBytes === 'number' ? options.maxOutputBytes : null;
+  const maxOutputBytes = assertSafeInteger(
+    options.maxOutputBytes,
+    'Gzip maximum output bytes'
+  );
 
   if (typeof DecompressionStream === 'undefined') {
     throw new Error('Gzip decompression requires DecompressionStream (dev-phase requirement).');
@@ -111,11 +160,15 @@ export async function gzipDecompress(compressed, options = {}) {
  * gzip-compress bytes.
  *
  * @param {Uint8Array} uncompressed
- * @param {{ signal?: AbortSignal | null }} [options]
+ * @param {{ signal: AbortSignal | null }} options
  * @returns {Promise<Uint8Array>}
  */
-export async function gzipCompress(uncompressed, options = {}) {
-  const signal = options.signal ?? null;
+export async function gzipCompress(uncompressed, options) {
+  if (!(uncompressed instanceof Uint8Array)) {
+    throw new TypeError('Gzip uncompressed input must be a Uint8Array.');
+  }
+  assertExactKeys(options, ['signal'], 'Gzip compression options');
+  const signal = assertSignal(options.signal, 'Gzip compression signal');
   throwIfAborted(signal);
 
   if (typeof CompressionStream === 'undefined') {

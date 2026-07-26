@@ -22,38 +22,30 @@ let plotOptionsIdCounter = 0;
  * @returns {string}
  */
 function getOrCreatePlotOptionsIdPrefix(container, providedPrefix) {
-  const trimmed = typeof providedPrefix === 'string' ? providedPrefix.trim() : '';
-  if (trimmed) {
-    container.dataset.plotOptionsIdPrefix = trimmed;
-    return trimmed;
+  if (providedPrefix !== undefined && providedPrefix !== null) {
+    if (
+      typeof providedPrefix !== 'string' ||
+      providedPrefix.length === 0 ||
+      providedPrefix.trim() !== providedPrefix
+    ) {
+      throw new TypeError('Plot options idPrefix must be exact non-empty text');
+    }
+    container.dataset.plotOptionsIdPrefix = providedPrefix;
+    return providedPrefix;
   }
 
   const existing = container.dataset.plotOptionsIdPrefix;
-  if (existing) return existing;
+  if (existing !== undefined) {
+    if (existing.length === 0) {
+      throw new TypeError('Stored plot options idPrefix must be non-empty');
+    }
+    return existing;
+  }
 
   plotOptionsIdCounter += 1;
   const next = `plotopts-${plotOptionsIdCounter}`;
   container.dataset.plotOptionsIdPrefix = next;
   return next;
-}
-
-function coerceSelectValue(def, rawValue) {
-  const schemaOptions = def?.options || [];
-  if (schemaOptions.length === 0) return rawValue;
-
-  const optionValues = schemaOptions.map(opt => opt.value);
-  const allNumbers = optionValues.every(v => typeof v === 'number');
-  if (allNumbers) {
-    const parsed = parseFloat(rawValue);
-    return Number.isNaN(parsed) ? rawValue : parsed;
-  }
-
-  const allBooleans = optionValues.every(v => typeof v === 'boolean');
-  if (allBooleans) {
-    return rawValue === 'true';
-  }
-
-  return rawValue;
 }
 
 /**
@@ -65,11 +57,29 @@ function coerceSelectValue(def, rawValue) {
  * @param {{ idPrefix?: string }} [renderOptions] - Optional render options
  */
 export function renderPlotOptions(container, plotTypeId, currentOptions = {}, onChange, renderOptions = {}) {
+  if (!container || typeof container.appendChild !== 'function' || !container.dataset) {
+    throw new TypeError('Plot options container must be an HTML element');
+  }
+  if (typeof plotTypeId !== 'string' || plotTypeId.length === 0) {
+    throw new TypeError('Plot type ID must be a non-empty string');
+  }
+  if (!currentOptions || typeof currentOptions !== 'object' || Array.isArray(currentOptions)) {
+    throw new TypeError('Current plot options must be an object');
+  }
+  if (typeof onChange !== 'function') {
+    throw new TypeError('Plot options onChange callback is required');
+  }
+  if (!renderOptions || typeof renderOptions !== 'object' || Array.isArray(renderOptions)) {
+    throw new TypeError('Plot render options must be an object');
+  }
   container.innerHTML = '';
-  const idPrefix = getOrCreatePlotOptionsIdPrefix(container, renderOptions?.idPrefix);
+  const idPrefix = getOrCreatePlotOptionsIdPrefix(container, renderOptions.idPrefix);
 
   const plotType = PlotRegistry.get(plotTypeId);
-  if (!plotType || !plotType.optionSchema) {
+  if (!plotType) {
+    throw new RangeError(`Unknown plot type: ${plotTypeId}`);
+  }
+  if (!plotType.optionSchema || Object.keys(plotType.optionSchema).length === 0) {
     const empty = document.createElement('div');
     empty.className = 'legend-help';
     empty.textContent = 'No customization options available.';
@@ -81,7 +91,15 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
 
   for (const [key, def] of Object.entries(visibleOptions)) {
     const inputId = `${idPrefix}-analysis-opt-${key}`;
-    const value = currentOptions[key] ?? plotType.defaultOptions[key];
+    if (!plotType.defaultOptions || typeof plotType.defaultOptions !== 'object') {
+      throw new TypeError(`Plot type ${plotTypeId} must define defaultOptions`);
+    }
+    const value = Object.hasOwn(currentOptions, key)
+      ? currentOptions[key]
+      : plotType.defaultOptions[key];
+    if (!def || typeof def !== 'object' || typeof def.label !== 'string' || def.label.length === 0) {
+      throw new TypeError(`Plot option ${key} must define a non-empty label`);
+    }
 
     const optionRow = document.createElement('div');
     optionRow.className = 'analysis-option-row';
@@ -99,15 +117,30 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
         input = document.createElement('select');
         input.className = 'obs-select analysis-option-select';
         input.id = inputId;
-        for (const opt of def.options || []) {
+        if (!Array.isArray(def.options) || def.options.length === 0) {
+          throw new TypeError(`Select option ${key} requires a non-empty options array`);
+        }
+        const selectedIndex = def.options.findIndex(opt => Object.is(opt.value, value));
+        if (selectedIndex < 0) {
+          throw new RangeError(`Select option ${key} does not define its current value`);
+        }
+        for (let optionIndex = 0; optionIndex < def.options.length; optionIndex++) {
+          const opt = def.options[optionIndex];
+          if (!opt || typeof opt.label !== 'string' || opt.label.length === 0) {
+            throw new TypeError(`Select option ${key} contains an invalid choice`);
+          }
           const option = document.createElement('option');
-          option.value = opt.value;
+          option.value = `${optionIndex}`;
           option.textContent = opt.label;
-          if (String(opt.value) === String(value)) option.selected = true;
           input.appendChild(option);
         }
+        input.selectedIndex = selectedIndex;
         input.addEventListener('change', () => {
-          if (onChange) onChange(key, coerceSelectValue(def, input.value));
+          const option = def.options[input.selectedIndex];
+          if (!option) {
+            throw new RangeError(`Select option ${key} has no selected schema value`);
+          }
+          onChange(key, option.value);
         });
         optionRow.appendChild(input);
         break;
@@ -120,9 +153,12 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
         input.type = 'checkbox';
         input.className = 'analysis-option-checkbox';
         input.id = inputId;
-        input.checked = !!value;
+        if (typeof value !== 'boolean') {
+          throw new TypeError(`Checkbox option ${key} must be boolean`);
+        }
+        input.checked = value;
         input.addEventListener('change', () => {
-          if (onChange) onChange(key, input.checked);
+          onChange(key, input.checked);
         });
 
         const checkLabel = document.createElement('label');
@@ -137,6 +173,20 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
 
       case 'range':
       case 'number': {
+        if (
+          !Number.isFinite(def.min) ||
+          !Number.isFinite(def.max) ||
+          !Number.isFinite(def.step) ||
+          def.min >= def.max ||
+          def.step <= 0
+        ) {
+          throw new RangeError(
+            `Numeric option ${key} requires finite min < max and a positive step`
+          );
+        }
+        if (!Number.isFinite(value) || value < def.min || value > def.max) {
+          throw new RangeError(`Numeric option ${key} value must be within its declared range`);
+        }
         const label = document.createElement('label');
         label.className = 'analysis-option-label';
         label.textContent = def.label;
@@ -144,25 +194,31 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
         optionRow.appendChild(label);
 
         input = document.createElement('input');
-        input.type = 'range';
-        input.className = 'analysis-option-range';
+        input.type = def.type;
+        input.className = def.type === 'range'
+          ? 'analysis-option-range'
+          : 'analysis-option-number';
         input.id = inputId;
-        input.min = def.min ?? 0;
-        input.max = def.max ?? 100;
-        input.step = def.step ?? 1;
-        input.value = value ?? def.min ?? 0;
+        input.min = `${def.min}`;
+        input.max = `${def.max}`;
+        input.step = `${def.step}`;
+        input.valueAsNumber = value;
 
         const valueDisplay = document.createElement('span');
         valueDisplay.className = 'analysis-option-value';
-        valueDisplay.textContent = input.value;
+        valueDisplay.textContent = `${value}`;
 
         // Debounce the change handler to prevent memory issues on large datasets
         const debouncedChange = debounce(() => {
-          if (onChange) onChange(key, parseFloat(input.value));
+          const nextValue = input.valueAsNumber;
+          if (!Number.isFinite(nextValue) || nextValue < def.min || nextValue > def.max) {
+            throw new RangeError(`Numeric option ${key} produced an out-of-range value`);
+          }
+          onChange(key, nextValue);
         }, 300);
 
         input.addEventListener('input', () => {
-          valueDisplay.textContent = input.value;
+          valueDisplay.textContent = `${input.valueAsNumber}`;
         });
         input.addEventListener('change', debouncedChange);
 
@@ -185,17 +241,23 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
         input.type = 'text';
         input.className = 'analysis-option-text';
         input.id = inputId;
-        input.value = value ?? '';
-        input.placeholder = def.placeholder ?? '';
+        if (typeof value !== 'string') {
+          throw new TypeError(`Text option ${key} must be a string`);
+        }
+        if (def.placeholder !== undefined && typeof def.placeholder !== 'string') {
+          throw new TypeError(`Text option ${key} placeholder must be a string`);
+        }
+        input.value = value;
+        input.placeholder = def.placeholder === undefined ? '' : def.placeholder;
         input.addEventListener('change', () => {
-          if (onChange) onChange(key, input.value);
+          onChange(key, input.value);
         });
         optionRow.appendChild(input);
         break;
       }
 
       default:
-        continue;
+        throw new RangeError(`Unknown plot option type for ${key}: ${String(def.type)}`);
     }
 
     container.appendChild(optionRow);

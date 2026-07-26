@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "default": "current-ui-prepared",
+  "datasets": [
+    {
+      "id": "current-ui-prepared",
+      "name": "Current UI prepared fixture",
+      "path": "current-ui-prepared/",
+      "n_cells": 120,
+      "n_genes": 6
+    }
+  ]
+}

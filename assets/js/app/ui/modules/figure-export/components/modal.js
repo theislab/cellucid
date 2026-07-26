@@ -15,28 +15,38 @@ let activeKeydownHandler = null;
  * @param {object} options
  * @param {string} options.title
  * @param {HTMLElement} options.content
- * @param {() => void} [options.onClose]
+ * @param {() => void} options.onClose
  * @returns {{ close: () => void }}
  */
 export function showFigureExportModal({ title, content, onClose }) {
+  if (typeof title !== 'string' || title.trim().length === 0) {
+    throw new TypeError('Figure export modal title must be a non-empty string.');
+  }
+  if (!(content instanceof HTMLElement)) {
+    throw new TypeError('Figure export modal content must be an HTMLElement.');
+  }
+  if (typeof onClose !== 'function') {
+    throw new TypeError('Figure export modal onClose must be a function.');
+  }
   if (activeKeydownHandler) {
-    document.removeEventListener('keydown', activeKeydownHandler);
-    activeKeydownHandler = null;
+    throw new Error('A figure export modal is already active.');
   }
 
   const existing = document.querySelector('.figure-export-modal');
-  if (existing) existing.remove();
+  if (existing) {
+    throw new Error('A figure export modal already exists in the document.');
+  }
 
   const modal = createElement('div', {
     className: 'figure-export-modal',
     role: 'dialog',
-    'aria-modal': 'true',
-    'aria-label': title || 'Dialog'
+    ariaModal: 'true',
+    ariaLabel: title
   });
 
   const backdrop = createElement('div', { className: 'figure-export-modal-backdrop' });
   const contentEl = createElement('div', { className: 'figure-export-modal-content', role: 'document' });
-  const titleEl = createElement('div', { className: 'figure-export-modal-title' }, [title || '']);
+  const titleEl = createElement('div', { className: 'figure-export-modal-title' }, [title]);
 
   contentEl.appendChild(titleEl);
   contentEl.appendChild(content);
@@ -59,7 +69,7 @@ export function showFigureExportModal({ title, content, onClose }) {
       activeKeydownHandler = null;
     }
     modal.remove();
-    onClose?.();
+    onClose();
   };
 
   backdrop.addEventListener('click', close);
@@ -69,8 +79,14 @@ export function showFigureExportModal({ title, content, onClose }) {
 
   document.body.appendChild(modal);
 
-  // Focus first button if present.
-  contentEl.querySelector('button')?.focus?.();
+  const firstButton = contentEl.querySelector('button');
+  if (!(firstButton instanceof HTMLButtonElement)) {
+    document.removeEventListener('keydown', onKeyDown);
+    activeKeydownHandler = null;
+    modal.remove();
+    throw new Error('Figure export modal content must contain a button.');
+  }
+  firstButton.focus();
 
   return { close };
 }

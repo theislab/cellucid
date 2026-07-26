@@ -3,7 +3,7 @@
  *
  * Centralizes Plotly lifecycle management to prevent WebGL/DOM leaks:
  * - Prefer `Plotly.react` updates when available (less churn than full re-render)
- * - Fall back to `purge + render` on errors or when no update path exists
+ * - Select update or render before execution and execute that path exactly once
  *
  * @module shared/plot-lifecycle
  */
@@ -41,28 +41,9 @@ export async function renderOrUpdatePlot({
   await loadPlotly();
 
   if (preferUpdate && typeof plotDef.update === 'function') {
-    try {
-      return await plotDef.update(container, data, options, layoutEngine);
-    } catch (_err) {
-      // Fall back to full re-render below.
-    }
+    return plotDef.update(container, data, options, layoutEngine);
   }
 
   purgePlot(container);
   return plotDef.render(data, options, container, layoutEngine);
 }
-
-/**
- * Purge a Plotly plot if present.
- * @param {HTMLElement|null} container
- */
-export function safePurgePlot(container) {
-  if (!container) return;
-  purgePlot(container);
-}
-
-export default {
-  renderOrUpdatePlot,
-  safePurgePlot
-};
-

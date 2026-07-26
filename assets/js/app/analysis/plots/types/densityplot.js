@@ -7,7 +7,7 @@
  */
 
 import { PlotFactory, PlotRegistry, BasePlot, COMMON_HOVER_STYLE } from '../plot-factory.js';
-import { getScatterTraceType } from '../plotly-loader.js';
+import { PLOTLY_2D_SCATTER_TRACE_TYPE } from '../plotly-loader.js';
 import { filterFiniteNumbers, getFiniteMinMax, mean, std } from '../../shared/number-utils.js';
 import { escapeHtml } from '../../../utils/dom-utils.js';
 
@@ -122,9 +122,9 @@ const densityplotDefinition = {
         const { x, y } = calculateDensity(pd.values, bandwidthMult);
         if (x.length === 0) return null;
 
-        // GPU-accelerated density curve
+        // Cross-browser SVG density curve.
         return {
-          type: getScatterTraceType(),
+          type: PLOTLY_2D_SCATTER_TRACE_TYPE,
           mode: 'lines',
           x, y,
           name: pd.pageName,
@@ -140,7 +140,7 @@ const densityplotDefinition = {
 
   buildLayout(pageData, options, layoutEngine) {
     const layout = PlotFactory.createLayout({ pageData, options });
-    const variableName = BasePlot.getVariableName(pageData, 'Value');
+    const variableName = BasePlot.getVariableName(pageData);
 
     layout.xaxis = { title: variableName, automargin: true, type: options.logX ? 'log' : 'linear' };
     layout.yaxis = { title: 'Density', zeroline: true, rangemode: 'tozero', type: options.logY ? 'log' : 'linear' };

@@ -10,6 +10,7 @@
 
 import { escapeHtml } from '../../../../utils/dom-utils.js';
 import { clamp } from '../../../../utils/number-utils.js';
+import { assertCameraState } from '../../../../../rendering/camera-state-contract.js';
 
 /**
  * @typedef {object} PlotRect
@@ -83,19 +84,18 @@ function beginRoundRectPath(ctx, x, y, w, h, r) {
  * @param {any} cameraState
  */
 function getAngleLines(cameraState) {
-  const nav = cameraState?.navigationMode || null;
+  const exactState = assertCameraState(cameraState, 'Orientation-indicator camera state');
+  const nav = exactState.navigationMode;
   if (nav === 'orbit') {
-    const theta = cameraState?.orbit?.theta ?? null;
-    const phi = cameraState?.orbit?.phi ?? null;
-    if (theta == null || phi == null) return [];
+    const theta = exactState.orbit.theta;
+    const phi = exactState.orbit.phi;
     const az = normalizeDegrees(toDegrees(theta));
     const el = clamp(normalizeDegrees(90 - toDegrees(phi)), -90, 90);
     return [`az ${az.toFixed(0)}°`, `el ${el.toFixed(0)}°`];
   }
   if (nav === 'free') {
-    const yaw = cameraState?.freefly?.yaw ?? null;
-    const pitch = cameraState?.freefly?.pitch ?? null;
-    if (yaw == null || pitch == null) return [];
+    const yaw = exactState.freefly.yaw;
+    const pitch = exactState.freefly.pitch;
     const az = normalizeDegrees(toDegrees(yaw));
     const el = clamp(normalizeDegrees(toDegrees(pitch)), -90, 90);
     return [`yaw ${az.toFixed(0)}°`, `pit ${el.toFixed(0)}°`];

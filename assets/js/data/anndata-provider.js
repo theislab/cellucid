@@ -18,6 +18,11 @@
  */
 
 import { getDataSourceManager } from './data-source-manager.js';
+import {
+  getMetadataLoadSignal,
+  throwIfMetadataAborted,
+  waitForMetadata,
+} from './metadata-load-contract.js';
 
 /**
  * Supported AnnData format types
@@ -133,107 +138,242 @@ export function getAnnDataSource() {
   return null;
 }
 
+/**
+ * Resolve one explicit direct-AnnData URL against the exact active dataset.
+ * Direct readers are mutable single-dataset sources, so protocol and dataset
+ * identity must both match before any adapter data is exposed.
+ *
+ * @param {string} url
+ * @returns {{adapter: Object, source: Object, parsed: {protocol: string, datasetId: string, path: string}}}
+ */
+export function getActiveAnnDataBinding(url) {
+  const parsed = parseAnnDataUrl(url);
+  if (!parsed) {
+    throw new Error(
+      `Direct AnnData access requires an explicit h5ad:// or zarr:// URL: ${String(url)}`
+    );
+  }
+  if (
+    typeof parsed.datasetId !== 'string' ||
+    parsed.datasetId.length === 0
+  ) {
+    throw new Error(
+      `Direct AnnData URL is missing its exact dataset id: ${String(url)}`
+    );
+  }
+
+  const manager = getDataSourceManager();
+  const activeFormat = getActiveAnnDataFormat();
+  if (activeFormat !== parsed.protocol) {
+    throw new Error(
+      `Direct AnnData URL uses ${parsed.protocol}://, but the active ` +
+      `dataset protocol is ${activeFormat ? `${activeFormat}://` : 'not AnnData'}`
+    );
+  }
+  if (manager.activeDatasetId !== parsed.datasetId) {
+    throw new Error(
+      `Direct AnnData URL belongs to dataset "${parsed.datasetId}", but ` +
+      `the active dataset is "${String(manager.activeDatasetId)}"`
+    );
+  }
+
+  const source = getAnnDataSource();
+  if (!source || source.datasetId !== parsed.datasetId) {
+    throw new Error(
+      `Direct AnnData source does not own dataset "${parsed.datasetId}"`
+    );
+  }
+  const adapter = source.getAdapter?.();
+  if (!adapter) {
+    throw new Error(
+      `Direct AnnData adapter is unavailable for dataset "${parsed.datasetId}"`
+    );
+  }
+  return { adapter, source, parsed };
+}
+
 // =========================================================================
 // Unified data access functions (work for both h5ad and zarr)
 // =========================================================================
 
 /**
  * Load points (embedding) from AnnData source
+ * @param {string} url - Explicit direct AnnData URL
  * @param {number} dim - Dimension (1, 2, or 3)
  * @returns {Promise<Float32Array>}
  */
-export async function anndataLoadPoints(dim) {
-  const adapter = getAnnDataAdapter();
-  if (!adapter) {
-    throw new Error('No AnnData adapter available');
-  }
+export async function anndataLoadPoints(url, dim) {
+  const { adapter } = getActiveAnnDataBinding(url);
   return adapter.getEmbedding(dim);
 }
 
 /**
  * Load obs manifest from AnnData source
+ * @param {string} url - Explicit direct AnnData URL
+ * @param {{signal?: AbortSignal|null}} [options]
  * @returns {Object}
  */
-export function anndataGetObsManifest() {
-  const adapter = getAnnDataAdapter();
-  if (!adapter) {
-    throw new Error('No AnnData adapter available');
-  }
-  return adapter.getObsManifest();
+export function anndataGetObsManifest(url, options = {}) {
+  const signal = getMetadataLoadSignal(
+    options,
+    'Direct AnnData observation manifest'
+  );
+  throwIfMetadataAborted(
+    signal,
+    'Direct AnnData observation manifest loading'
+  );
+  const { adapter } = getActiveAnnDataBinding(url);
+  const manifest = adapter.getObsManifest();
+  throwIfMetadataAborted(
+    signal,
+    'Direct AnnData observation manifest loading'
+  );
+  return manifest;
 }
 
 /**
  * Load var manifest from AnnData source
+ * @param {string} url - Explicit direct AnnData URL
+ * @param {{signal?: AbortSignal|null}} [options]
  * @returns {Object}
  */
-export function anndataGetVarManifest() {
-  const adapter = getAnnDataAdapter();
-  if (!adapter) {
-    throw new Error('No AnnData adapter available');
-  }
-  return adapter.getVarManifest();
+export function anndataGetVarManifest(url, options = {}) {
+  const signal = getMetadataLoadSignal(
+    options,
+    'Direct AnnData variable manifest'
+  );
+  throwIfMetadataAborted(
+    signal,
+    'Direct AnnData variable manifest loading'
+  );
+  const { adapter } = getActiveAnnDataBinding(url);
+  const manifest = adapter.getVarManifest();
+  throwIfMetadataAborted(
+    signal,
+    'Direct AnnData variable manifest loading'
+  );
+  return manifest;
 }
 
 /**
  * Load obs field data from AnnData source
+ * @param {string} url - Explicit direct AnnData URL
  * @param {string} fieldKey - Field name
  * @returns {Promise<{data: ArrayBuffer, kind: string, categories?: string[]}>}
  */
-export async function anndataLoadObsField(fieldKey) {
-  const adapter = getAnnDataAdapter();
-  if (!adapter) {
-    throw new Error('No AnnData adapter available');
-  }
+export async function anndataLoadObsField(url, fieldKey) {
+  const { adapter } = getActiveAnnDataBinding(url);
   return adapter.getObsFieldData(fieldKey);
 }
 
 /**
  * Load gene expression from AnnData source
+ * @param {string} url - Explicit direct AnnData URL
  * @param {string} geneName - Gene name
  * @returns {Promise<Float32Array>}
  */
-export async function anndataLoadGeneExpression(geneName) {
-  const adapter = getAnnDataAdapter();
-  if (!adapter) {
-    throw new Error('No AnnData adapter available');
-  }
+export async function anndataLoadGeneExpression(url, geneName) {
+  const { adapter } = getActiveAnnDataBinding(url);
   return adapter.getGeneExpression(geneName);
 }
 
 /**
  * Load connectivity edges from AnnData source
- * @returns {Promise<{sources: Uint32Array, destinations: Uint32Array, nEdges: number}|null>}
+ * @param {string} url - Explicit direct AnnData URL
+ * @param {{signal: AbortSignal}} options
+ * @returns {Promise<{sources: Uint32Array, destinations: Uint32Array, weights: Float64Array, nEdges: number}|null>}
  */
-export async function anndataLoadConnectivity() {
-  const adapter = getAnnDataAdapter();
-  if (!adapter) {
-    return null;
+export async function anndataLoadConnectivity(url, options) {
+  const signal = getMetadataLoadSignal(
+    options,
+    'Direct AnnData connectivity payload'
+  );
+  if (signal === null) {
+    throw new TypeError(
+      'Direct AnnData connectivity payload options.signal is required'
+    );
   }
-  return adapter.getConnectivityEdges();
+  throwIfMetadataAborted(
+    signal,
+    'Direct AnnData connectivity payload loading'
+  );
+  const { adapter } = getActiveAnnDataBinding(url);
+  if (typeof adapter.getConnectivityEdges !== 'function') {
+    throw new TypeError(
+      'Direct AnnData adapters are required to implement getConnectivityEdges()'
+    );
+  }
+  const edges = await waitForMetadata(
+    adapter.getConnectivityEdges({ signal }),
+    signal,
+    'Direct AnnData connectivity payload loading'
+  );
+  throwIfMetadataAborted(
+    signal,
+    'Direct AnnData connectivity payload loading'
+  );
+  return edges;
 }
 
 /**
  * Get connectivity manifest from AnnData source
+ * @param {string} url - Explicit direct AnnData URL
+ * @param {{signal?: AbortSignal|null}} [options]
  * @returns {Promise<Object|null>}
  */
-export async function anndataGetConnectivityManifest() {
-  const source = getAnnDataSource();
-  if (!source) {
+export async function anndataGetConnectivityManifest(url, options = {}) {
+  const signal = getMetadataLoadSignal(
+    options,
+    'Direct AnnData connectivity manifest'
+  );
+  throwIfMetadataAborted(
+    signal,
+    'Direct AnnData connectivity manifest loading'
+  );
+  const { source } = getActiveAnnDataBinding(url);
+  if (typeof source.getConnectivityManifest !== 'function') {
+    throw new TypeError(
+      'Direct AnnData sources are required to implement getConnectivityManifest()'
+    );
+  }
+  const manifest = await waitForMetadata(
+    source.getConnectivityManifest({ signal }),
+    signal,
+    'Direct AnnData connectivity manifest loading'
+  );
+  if (manifest === null) {
     return null;
   }
-  return source.getConnectivityManifest?.() || null;
+  if (!manifest) {
+    throw new Error(
+      'Invalid direct connectivity manifest: only exact null represents absence'
+    );
+  }
+  return manifest;
 }
 
 /**
  * Get dataset identity/metadata from AnnData source
+ * @param {string} url - Explicit direct AnnData URL
+ * @param {{signal?: AbortSignal|null}} [options]
  * @returns {Object}
  */
-export function anndataGetDatasetIdentity() {
-  const adapter = getAnnDataAdapter();
-  if (!adapter) {
-    throw new Error('No AnnData adapter available');
-  }
-  return adapter.getMetadata();
+export function anndataGetDatasetIdentity(url, options = {}) {
+  const signal = getMetadataLoadSignal(
+    options,
+    'Direct AnnData dataset identity'
+  );
+  throwIfMetadataAborted(
+    signal,
+    'Direct AnnData dataset identity loading'
+  );
+  const { adapter } = getActiveAnnDataBinding(url);
+  const identity = adapter.getMetadata();
+  throwIfMetadataAborted(
+    signal,
+    'Direct AnnData dataset identity loading'
+  );
+  return identity;
 }
 
 // =========================================================================
@@ -273,7 +413,7 @@ export function isAnnDataUrl(url) {
  * @returns {{protocol: string, datasetId: string, path: string}|null}
  */
 export function parseAnnDataUrl(url) {
-  if (!url) return null;
+  if (typeof url !== 'string' || url.length === 0) return null;
 
   let protocol;
   if (url.startsWith('h5ad://')) {

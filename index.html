@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="light" data-viewer-background="grid">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -11,9 +11,8 @@
     This stamp is used by `cellucid-python`'s hosted-asset proxy cache to decide
     whether it should re-download `index.html` and invalidate its cached
     `/assets/*` files.
-
-    TODO(dev): Update this value whenever you deploy changes to the website.
-    Recommended: use an ISO timestamp or a git commit hash.
+    Release validation owns this immutable value and changes it only together
+    with the exact web-asset inventory after the complete build is accepted.
   -->
   <meta name="cellucid-web-build-id" content="2025-12-31T23:59:59Z-theislab-datasets" />
 
@@ -28,33 +27,30 @@
       - <dataset-id>/obs_manifest.json
       - ...
 
-    If you host datasets on GitHub Pages (or any host where you can't set CORS),
-    Cellucid will automatically fall back to the `cellucid-datasets/bridge.html`
-    iframe bridge (expected at `../bridge.html` relative to this base URL).
-
-    TODO(dev): Set this to your datasets hosting URL (GitHub Pages or custom domain).
+    This exact meta element is the canonical deployed configuration. The
+    canonical `exportsBaseUrl` query field may replace it for a single launch.
+    Every sample artifact uses one direct HTTP request. Cross-origin sample
+    hosts must publish the matching CORS response headers.
   -->
   <meta name="cellucid-exports-base-url" content="https://theislab.github.io/cellucid-datasets/exports/" />
 
-	  <!-- Security (dev-phase strict CSP; no inline scripts) -->
+	  <!-- Security policy for the static application shell -->
 	  <!--
-	    Note: `connect-src https: wss:` is dev-friendly (allows any HTTPS/WSS). It’s fine for now.
-	    If we want this truly strict, we must allowlist the exact endpoints we use (GitHub/GA/worker/etc).
+    This policy is expressed in markup so it is enforced on static hosts.
     The `sha256-...` in `script-src` allowlists the inline JSON-LD `<script type="application/ld+json">`
-    block below (SEO structured data) without enabling `'unsafe-inline'`. If you change that JSON, the
-    hash must be regenerated or the browser will block the block and report a CSP violation.
-    TODO (prod): move CSP to an HTTP response header + generate per-environment.
+    block below (SEO structured data) without enabling `'unsafe-inline'`. `wasm-unsafe-eval` permits
+    compilation of the bundled h5wasm module without granting general JavaScript `unsafe-eval`.
+    If you change that JSON, the hash must be regenerated or the browser will block the block.
   -->
   <meta http-equiv="Content-Security-Policy" content="
     default-src 'self';
     base-uri 'none';
     object-src 'none';
-    script-src 'self' https://www.googletagmanager.com 'sha256-+9zlP/wQVfV23S04wl/L4pHtJlWnuGrS2YNU0z7yjJQ=';
+    script-src 'self' 'wasm-unsafe-eval' https://www.googletagmanager.com 'sha256-+9zlP/wQVfV23S04wl/L4pHtJlWnuGrS2YNU0z7yjJQ=';
     style-src 'self' 'unsafe-inline';
     img-src 'self' data: https:;
     font-src 'self' data:;
     connect-src 'self' https: wss: blob: http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*;
-    frame-src 'self' https:;
     worker-src 'self' blob:;
     manifest-src 'self';
   " />
@@ -67,7 +63,6 @@
   <link rel="canonical" href="https://www.cellucid.com" />
 
   <!-- Preconnect to external services for faster initial connection -->
-  <link rel="preconnect" href="https://www.googletagmanager.com" />
   <link rel="preconnect" href="https://theislab.github.io" crossorigin />
 
   <!-- Open Graph / Social Media -->
@@ -120,8 +115,7 @@
 	    ]
 	  }</script>
 
-  <!-- Google tag (gtag.js) -->
-  <script async src="https://www.googletagmanager.com/gtag/js?id=G-K4774ZWGEQ"></script>
+  <!-- Analytics is initialized only on the declared production hosts. -->
   <script src="assets/js/app/ui/core/ga-init.js"></script>
 
   <!-- Favicons -->
@@ -133,7 +127,7 @@
   <link rel="icon" type="image/png" sizes="32x32" href="assets/img/favicon-32x32.png" />
   <link rel="icon" type="image/png" sizes="16x16" href="assets/img/favicon-16x16.png" />
   <link rel="icon" type="image/svg+xml" href="assets/img/favicon.svg" />
-  <link rel="icon" type="image/x-icon" href="favicon.ico" />
+  <link rel="icon" type="image/x-icon" href="assets/img/favicon.ico" />
   <link rel="apple-touch-icon" sizes="180x180" href="assets/img/apple-touch-icon.png" />
   <link rel="apple-touch-icon" sizes="167x167" href="assets/img/apple-touch-icon-167x167.png" />
   <link rel="apple-touch-icon" sizes="152x152" href="assets/img/apple-touch-icon-152x152.png" />
@@ -144,11 +138,6 @@
   <meta name="msapplication-TileImage" content="assets/img/mstile-150x150.png" />
   <meta name="msapplication-TileColor" content="#111827" />
   <meta name="theme-color" content="#ffffff" />
-
-  <!-- Preload critical fonts to avoid FOUT (Flash of Unstyled Text) -->
-  <link rel="preload" as="font" type="font/woff2" href="assets/fonts/inter-latin.woff2" crossorigin>
-  <link rel="preload" as="font" type="font/woff2" href="assets/fonts/oswald-latin.woff2" crossorigin>
-  <link rel="preload" as="font" type="font/woff2" href="assets/fonts/firacode-latin.woff2" crossorigin>
 
   <!-- Apply persisted theme early to avoid a flash when loading CSS -->
   <script src="assets/js/app/ui/core/theme-init.js"></script>
@@ -173,7 +162,7 @@
 	      <li>Publication export: SVG (vector) + PNG (high-DPI)</li>
 	    </ul>
 	    <h2>Data Sources</h2>
-	    <p>Load prepared exports, AnnData <code>.h5ad</code> files, or <code>.zarr</code> stores directly in the browser, from a Python server, or from a Jupyter notebook.</p>
+	    <p>Load prepared exports, AnnData <code>.h5ad</code> files, or portable <code>.zarr.zip</code> archives directly in the browser, from a Python server, or from a Jupyter notebook.</p>
 	    <h2>Use Cases</h2>
 	    <p>Explore scRNA-seq atlases, query marker genes, compare embeddings, visualize trajectories, and build consensus community annotations.</p>
 	  </main>
@@ -215,8 +204,8 @@
           <button type="button" class="welcome-btn welcome-btn-primary" id="welcome-demo-btn">
             <span class="welcome-btn-icon">◈</span>
             <span class="welcome-btn-text">
-              <span class="welcome-btn-title">Start Exploring</span>
-              <span class="welcome-btn-desc">Dive into the visualization</span>
+              <span class="welcome-btn-title">Choose a Dataset</span>
+              <span class="welcome-btn-desc">Open the data controls</span>
             </span>
           </button>
 
@@ -321,38 +310,68 @@
 	            </select>
 	          </div>
 
-          <!-- User directory selector -->
+          <!-- Local data selectors -->
 	          <div class="control-block mt-1 relative" id="user-data-block" data-state-serializer-skip="true">
-            <label class="d-flex items-center gap-1">
-              Local data:
-              <span id="user-data-info-btn" class="info-btn">i</span>
-            </label>
-            <div id="user-data-info-tooltip" class="info-tooltip">
+            <div class="d-flex items-center gap-1">
+              <label>Local data:</label>
+              <button
+                type="button"
+                id="user-data-info-btn"
+                class="info-btn"
+                aria-label="About local data loading"
+                aria-controls="user-data-info-tooltip"
+                aria-haspopup="dialog"
+                aria-expanded="false"
+              ><span aria-hidden="true">i</span></button>
+            </div>
+            <div
+              id="user-data-info-tooltip"
+              class="info-tooltip"
+              role="dialog"
+              aria-labelledby="user-data-info-btn"
+              tabindex="-1"
+              hidden
+            >
               <div class="info-tooltip-content">
                 <div class="info-step">H5AD: Load .h5ad files directly in browser</div>
-                <div class="info-step">Zarr: Load .zarr directories directly in browser</div>
+                <div class="info-step">Zarr ZIP: Load a <code>.zarr.zip</code> or <code>.zip</code> archive in Safari, Chrome, Edge, or Firefox</div>
                 <div class="info-step">Prepared: Load optimized data via <span class="info-cmd">cellucid prepare</span></div>
                 <div class="info-step">Docs: <a href="https://cellucid.readthedocs.io" target="_blank" rel="noopener noreferrer" class="info-cmd">cellucid.readthedocs.io</a></div>
               </div>
             </div>
-            <div class="user-data-row">
+            <div class="user-data-grid">
               <button id="user-data-h5ad-btn" class="reset-btn data-btn" title="Load single .h5ad file">H5AD</button>
-              <button id="user-data-zarr-btn" class="reset-btn data-btn" title="Load .zarr directory">Zarr</button>
-              <button id="user-data-browse-btn" class="reset-btn data-btn" title="Load prepared directory">Prepared</button>
+              <button id="user-data-zarr-archive-btn" class="reset-btn data-btn" title="Load a portable Zarr ZIP archive in any supported browser">Zarr ZIP</button>
+              <button id="user-data-browse-btn" class="reset-btn data-btn data-btn-wide" title="Load prepared directory">Prepared</button>
               <!-- Hidden file inputs -->
               <input type="file" id="user-data-file-input" class="file-input-hidden" webkitdirectory directory multiple />
               <input type="file" id="user-data-h5ad-input" class="file-input-hidden" accept=".h5ad" />
-              <input type="file" id="user-data-zarr-input" class="file-input-hidden" webkitdirectory directory multiple />
+              <input type="file" id="user-data-zarr-archive-input" class="file-input-hidden" accept=".zarr.zip,.zip,application/zip" />
             </div>
           </div>
 
           <!-- Remote server connection -->
 	          <div class="control-block mt-0-5 relative" id="remote-server-block" data-state-serializer-skip="true">
-            <label class="d-flex items-center gap-1">
-              Remote server:
-              <span id="remote-info-btn" class="info-btn">i</span>
-            </label>
-            <div id="remote-info-tooltip" class="info-tooltip">
+            <div class="d-flex items-center gap-1">
+              <label>Remote server:</label>
+              <button
+                type="button"
+                id="remote-info-btn"
+                class="info-btn"
+                aria-label="About remote server loading"
+                aria-controls="remote-info-tooltip"
+                aria-haspopup="dialog"
+                aria-expanded="false"
+              ><span aria-hidden="true">i</span></button>
+            </div>
+            <div
+              id="remote-info-tooltip"
+              class="info-tooltip"
+              role="dialog"
+              aria-labelledby="remote-info-btn"
+              tabindex="-1"
+              hidden
+            >
               <div class="info-tooltip-content">
                 <div class="info-step">Stream data from a local or remote server.</div>
                 <div class="info-step">Local: <span class="info-cmd">cellucid serve /path/to/data</span></div>
@@ -372,11 +391,26 @@
 
           <!-- GitHub repository data loading -->
 	          <div class="control-block mt-0-5 relative" id="github-repo-block" data-state-serializer-skip="true">
-            <label class="d-flex items-center gap-1">
-              GitHub data:
-              <span id="github-info-btn" class="info-btn">i</span>
-            </label>
-            <div id="github-info-tooltip" class="info-tooltip">
+            <div class="d-flex items-center gap-1">
+              <label>GitHub data:</label>
+              <button
+                type="button"
+                id="github-info-btn"
+                class="info-btn"
+                aria-label="About GitHub data loading"
+                aria-controls="github-info-tooltip"
+                aria-haspopup="dialog"
+                aria-expanded="false"
+              ><span aria-hidden="true">i</span></button>
+            </div>
+            <div
+              id="github-info-tooltip"
+              class="info-tooltip"
+              role="dialog"
+              aria-labelledby="github-info-btn"
+              tabindex="-1"
+              hidden
+            >
               <div class="info-tooltip-content">
                 <div class="info-step">Load prepared data from a public GitHub repository.</div>
                 <div class="info-step">Format: <span class="info-cmd">owner/repo/path/to/data</span></div>
@@ -394,9 +428,29 @@
 
           <!-- Session state save/load -->
           <div class="control-block mt-0" id="session-state-controls">
-            <label>Session state:</label>
-            <div class="legend-help">
-              Save or load the application state including camera, filters, highlights, and settings.
+            <div class="d-flex items-center gap-1">
+              <label>Session state:</label>
+              <button
+                type="button"
+                id="session-state-info-btn"
+                class="info-btn"
+                aria-label="About session state"
+                aria-controls="session-state-info-tooltip"
+                aria-haspopup="dialog"
+                aria-expanded="false"
+              ><span aria-hidden="true">i</span></button>
+            </div>
+            <div
+              id="session-state-info-tooltip"
+              class="info-tooltip"
+              role="dialog"
+              aria-labelledby="session-state-info-btn"
+              tabindex="-1"
+              hidden
+            >
+              <div class="info-tooltip-content">
+                Save or load camera, filters, highlights, and visualization settings.
+              </div>
             </div>
             <div class="control-block d-flex gap-2">
               <button id="save-state-btn" class="reset-btn flex-1">Save State</button>
@@ -406,7 +460,7 @@
         </div>
       </details>
 
-      <details class="accordion-section" open>
+      <details class="accordion-section" id="visualization-section" open>
         <summary>Visualization</summary>
         <div class="accordion-content">
           <!-- Theme -->
@@ -440,14 +494,34 @@
 
           <!-- Depth Perception controls -->
           <div class="control-block" id="depth-controls">
-            <label>Depth perception:</label>
-            <div class="legend-help">
-              Visual cues for 3D depth and spatial awareness.
+            <div class="d-flex items-center gap-1">
+              <label>Depth perception:</label>
+              <button
+                type="button"
+                id="depth-perception-info-btn"
+                class="info-btn"
+                aria-label="About depth perception"
+                aria-controls="depth-perception-info-tooltip"
+                aria-haspopup="dialog"
+                aria-expanded="false"
+              ><span aria-hidden="true">i</span></button>
+            </div>
+            <div
+              id="depth-perception-info-tooltip"
+              class="info-tooltip"
+              role="dialog"
+              aria-labelledby="depth-perception-info-btn"
+              tabindex="-1"
+              hidden
+            >
+              <div class="info-tooltip-content">
+                Lighting, fog, and perspective scaling provide spatial cues in 3D.
+              </div>
             </div>
             <div class="control-block">
               <label for="point-size">Point size (log):</label>
               <div class="slider-row">
-                <input id="point-size" type="range" min="0" max="100" step="0.5" value="0" />
+                <input id="point-size" type="range" min="0" max="100" step="0.5" value="16.5" />
                 <span id="point-size-display" class="slider-value">0.75</span>
               </div>
             </div>
@@ -480,8 +554,30 @@
           <!-- Renderer Settings -->
           <div class="control-block" id="renderer-controls">
             <div class="control-block mt-0 mb-2">
-              <label for="hp-shader-quality">Shader quality:</label>
-              <div class="legend-help">Lower quality reduces GPU load for smoother interaction.</div>
+              <div class="d-flex items-center gap-1">
+                <label for="hp-shader-quality">Shader quality:</label>
+                <button
+                  type="button"
+                  id="shader-quality-info-btn"
+                  class="info-btn"
+                  aria-label="About shader quality"
+                  aria-controls="shader-quality-info-tooltip"
+                  aria-haspopup="dialog"
+                  aria-expanded="false"
+                ><span aria-hidden="true">i</span></button>
+              </div>
+              <div
+                id="shader-quality-info-tooltip"
+                class="info-tooltip"
+                role="dialog"
+                aria-labelledby="shader-quality-info-btn"
+                tabindex="-1"
+                hidden
+              >
+                <div class="info-tooltip-content">
+                  Lower quality reduces GPU work for smoother interaction.
+                </div>
+              </div>
               <select id="hp-shader-quality" class="obs-select">
                 <option value="full">Full (lighting + fog)</option>
                 <option value="light">Light (circular, no lighting)</option>
@@ -489,9 +585,29 @@
               </select>
             </div>
 
-            <label>Renderer settings:</label>
-            <div class="legend-help">
-              Improve performance on large datasets or limited hardware.
+            <div class="d-flex items-center gap-1">
+              <label>Renderer settings:</label>
+              <button
+                type="button"
+                id="renderer-settings-info-btn"
+                class="info-btn"
+                aria-label="About renderer settings"
+                aria-controls="renderer-settings-info-tooltip"
+                aria-haspopup="dialog"
+                aria-expanded="false"
+              ><span aria-hidden="true">i</span></button>
+            </div>
+            <div
+              id="renderer-settings-info-tooltip"
+              class="info-tooltip"
+              role="dialog"
+              aria-labelledby="renderer-settings-info-btn"
+              tabindex="-1"
+              hidden
+            >
+              <div class="info-tooltip-content">
+                Level-of-detail and frustum culling reduce work for large datasets or limited hardware.
+              </div>
             </div>
             <div class="control-block">
               <label class="checkbox-inline">
@@ -518,9 +634,29 @@
 
           <!-- Volumetric smoke controls -->
           <div class="control-block" id="smoke-controls">
-            <label>Volumetric smoke:</label>
-            <div class="legend-help">
-              Physically-based ray-marched smoke. Knobs auto-scale with grid and noise detail.
+            <div class="d-flex items-center gap-1">
+              <label>Volumetric smoke:</label>
+              <button
+                type="button"
+                id="smoke-info-btn"
+                class="info-btn"
+                aria-label="About volumetric smoke"
+                aria-controls="smoke-info-tooltip"
+                aria-haspopup="dialog"
+                aria-expanded="false"
+              ><span aria-hidden="true">i</span></button>
+            </div>
+            <div
+              id="smoke-info-tooltip"
+              class="info-tooltip"
+              role="dialog"
+              aria-labelledby="smoke-info-btn"
+              tabindex="-1"
+              hidden
+            >
+              <div class="info-tooltip-content">
+                Physically based ray-marched smoke; controls scale with grid and noise detail.
+              </div>
             </div>
 
             <label>Quality & performance:</label>
@@ -619,10 +755,29 @@
           <div id="points-controls" class="visible">
             <!-- KNN Connectivity Section -->
             <div class="control-block" id="connectivity-controls">
-              <label>KNN Connectivity:</label>
-
-              <div class="legend-help mb-1-5">
-                Shows edges between visible cells only.
+              <div class="d-flex items-center gap-1">
+                <label>KNN Connectivity:</label>
+                <button
+                  type="button"
+                  id="connectivity-help-btn"
+                  class="info-btn"
+                  aria-label="About KNN connectivity"
+                  aria-controls="connectivity-help-tooltip"
+                  aria-haspopup="dialog"
+                  aria-expanded="false"
+                ><span aria-hidden="true">i</span></button>
+              </div>
+              <div
+                id="connectivity-help-tooltip"
+                class="info-tooltip"
+                role="dialog"
+                aria-labelledby="connectivity-help-btn"
+                tabindex="-1"
+                hidden
+              >
+                <div class="info-tooltip-content">
+                  Connectivity edges are drawn only between currently visible cells.
+                </div>
               </div>
 
               <label class="checkbox-inline">
@@ -666,10 +821,29 @@
 
             <!-- Velocity overlay (GPU particle flow) -->
             <div class="control-block mt-1" id="velocity-overlay-controls" style="display: none;">
-              <label>Vector Field Overlay:</label>
-
-              <div class="legend-help mb-1-5">
-                Animated particle flow from per-cell vector fields (velocity / drift), dimension-specific.
+              <div class="d-flex items-center gap-1">
+                <label>Vector Field Overlay:</label>
+                <button
+                  type="button"
+                  id="vector-field-help-btn"
+                  class="info-btn"
+                  aria-label="About vector field overlays"
+                  aria-controls="vector-field-help-tooltip"
+                  aria-haspopup="dialog"
+                  aria-expanded="false"
+                ><span aria-hidden="true">i</span></button>
+              </div>
+              <div
+                id="vector-field-help-tooltip"
+                class="info-tooltip"
+                role="dialog"
+                aria-labelledby="vector-field-help-btn"
+                tabindex="-1"
+                hidden
+              >
+                <div class="info-tooltip-content">
+                  Animated particle flow uses the selected dimension-specific per-cell velocity or drift vectors.
+                </div>
               </div>
 
               <label class="checkbox-inline">
@@ -919,14 +1093,34 @@
         </div>
       </details>
 
-      <details class="accordion-section" open>
+      <details class="accordion-section" id="compare-views-section" open>
         <summary>Compare Views</summary>
         <div class="accordion-content">
           <!-- Multiview controls -->
           <div class="control-block" id="split-view-controls">
-            <label>Multiview:</label>
-            <div class="legend-help">
-              Keep snapshots to compare UMAP tweaks. Switch to a single view to edit settings.
+            <div class="d-flex items-center gap-1">
+              <label>Multiview:</label>
+              <button
+                type="button"
+                id="multiview-info-btn"
+                class="info-btn"
+                aria-label="About multiview"
+                aria-controls="multiview-info-tooltip"
+                aria-haspopup="dialog"
+                aria-expanded="false"
+              ><span aria-hidden="true">i</span></button>
+            </div>
+            <div
+              id="multiview-info-tooltip"
+              class="info-tooltip"
+              role="dialog"
+              aria-labelledby="multiview-info-btn"
+              tabindex="-1"
+              hidden
+            >
+              <div class="info-tooltip-content">
+                Snapshots keep independent coloring and filters. Choose Edit selected view before changing one panel; changes do not propagate to other panels.
+              </div>
             </div>
 
             <div class="split-view-row">
@@ -972,9 +1166,29 @@
 
           <!-- Dimension Level Selector -->
           <div id="dimension-controls" class="control-block dimension-controls">
-            <label for="dimension-select">Dimension:</label>
-            <div class="legend-help">
-              Switch between embeddings for the current view.
+            <div class="d-flex items-center gap-1">
+              <label for="dimension-select">Dimension:</label>
+              <button
+                type="button"
+                id="dimension-info-btn"
+                class="info-btn"
+                aria-label="About embedding dimensions"
+                aria-controls="dimension-info-tooltip"
+                aria-haspopup="dialog"
+                aria-expanded="false"
+              ><span aria-hidden="true">i</span></button>
+            </div>
+            <div
+              id="dimension-info-tooltip"
+              class="info-tooltip"
+              role="dialog"
+              aria-labelledby="dimension-info-btn"
+              tabindex="-1"
+              hidden
+            >
+              <div class="info-tooltip-content">
+                Switch the selected view between the dataset's available embeddings.
+              </div>
             </div>
             <div class="control-block">
               <select id="dimension-select" class="obs-select">
@@ -985,9 +1199,29 @@
 
           <!-- Navigation controls -->
           <div class="control-block" id="navigation-controls">
-            <label>Navigation:</label>
-            <div class="legend-help">
-              Choose orbit for 3D exploration, planar for 2D embeddings, or free-fly for immersive movement.
+            <div class="d-flex items-center gap-1">
+              <label>Navigation:</label>
+              <button
+                type="button"
+                id="navigation-info-btn"
+                class="info-btn"
+                aria-label="About navigation modes"
+                aria-controls="navigation-info-tooltip"
+                aria-haspopup="dialog"
+                aria-expanded="false"
+              ><span aria-hidden="true">i</span></button>
+            </div>
+            <div
+              id="navigation-info-tooltip"
+              class="info-tooltip"
+              role="dialog"
+              aria-labelledby="navigation-info-btn"
+              tabindex="-1"
+              hidden
+            >
+              <div class="info-tooltip-content">
+                Orbit explores 3D embeddings, planar navigates 2D embeddings, and free-fly enables immersive movement.
+              </div>
             </div>
             <div class="control-block">
               <label for="navigation-mode">Mode:</label>
@@ -1059,12 +1293,32 @@
                 </label>
               </div>
               <div class="control-block">
-                <label class="checkbox-inline">
-                  <input type="checkbox" id="pointer-lock" />
-                  Capture pointer
-                </label>
-                <div class="legend-help mt-1-5">
-                  Hides the cursor and lets you look without dragging. Press Esc to release.
+                <div class="d-flex items-center gap-1">
+                  <label class="checkbox-inline">
+                    <input type="checkbox" id="pointer-lock" />
+                    Capture pointer
+                  </label>
+                  <button
+                    type="button"
+                    id="pointer-lock-info-btn"
+                    class="info-btn mt-1"
+                    aria-label="About pointer capture"
+                    aria-controls="pointer-lock-info-tooltip"
+                    aria-haspopup="dialog"
+                    aria-expanded="false"
+                  ><span aria-hidden="true">i</span></button>
+                </div>
+                <div
+                  id="pointer-lock-info-tooltip"
+                  class="info-tooltip"
+                  role="dialog"
+                  aria-labelledby="pointer-lock-info-btn"
+                  tabindex="-1"
+                  hidden
+                >
+                  <div class="info-tooltip-content">
+                    Pointer capture hides the cursor and enables looking without dragging. Press Esc to release it.
+                  </div>
                 </div>
               </div>
             </div>
@@ -1072,7 +1326,7 @@
         </div>
       </details>
 
-      <details class="accordion-section" open>
+      <details class="accordion-section" id="coloring-filtering-section" open>
         <summary>Coloring & Filtering</summary>
         <div class="accordion-content">
           <!-- Color by obs -->
@@ -1208,7 +1462,30 @@
             <div id="legend"></div>
           </div>
           <div class="control-block" id="active-filters-container">
-            <label>Active filters:</label>
+            <div class="d-flex items-center gap-1">
+              <label>Active filters (selected view only):</label>
+              <button
+                type="button"
+                id="active-filter-scope-btn"
+                class="info-btn"
+                aria-label="About per-view filters"
+                aria-controls="active-filter-scope-tooltip"
+                aria-haspopup="dialog"
+                aria-expanded="false"
+              ><span aria-hidden="true">i</span></button>
+            </div>
+            <div
+              id="active-filter-scope-tooltip"
+              class="info-tooltip"
+              role="dialog"
+              aria-labelledby="active-filter-scope-btn"
+              tabindex="-1"
+              hidden
+            >
+              <div class="info-tooltip-content">
+                Filters stay with the selected panel when its coloring changes; other panels remain unchanged.
+              </div>
+            </div>
             <div id="filter-count" class="filter-info">Showing all points</div>
             <div id="active-filters" class="filter-info-block">
               <div class="filter-info">No filters active</div>
@@ -1278,9 +1555,29 @@
 
           <!-- Navigation controls (mirrors Compare Views block) -->
           <div class="control-block" id="cinematic-navigation-controls">
-            <label>Navigation:</label>
-            <div class="legend-help">
-              Set up your camera before saving keyframes.
+            <div class="d-flex items-center gap-1">
+              <label>Navigation:</label>
+              <button
+                type="button"
+                id="camera-path-info-btn"
+                class="info-btn"
+                aria-label="About camera paths"
+                aria-controls="camera-path-info-tooltip"
+                aria-haspopup="dialog"
+                aria-expanded="false"
+              ><span aria-hidden="true">i</span></button>
+            </div>
+            <div
+              id="camera-path-info-tooltip"
+              class="info-tooltip"
+              role="dialog"
+              aria-labelledby="camera-path-info-btn"
+              tabindex="-1"
+              hidden
+            >
+              <div class="info-tooltip-content">
+                Save at least two positions to enable the top playback bar. Playback never starts automatically.
+              </div>
             </div>
             <div class="control-block">
               <label for="cinematic-nav-mode">Mode:</label>
@@ -1380,9 +1677,29 @@
           <div id="cinematic-interpolation-settings" class="cinematic-settings-box">
             <label>Settings</label>
             <div class="control-block">
-              <label for="cinematic-default-speed">Default speed:</label>
-              <div class="legend-help">
-                Controls how fast the camera moves between keyframes when timing is set to auto.
+              <div class="d-flex items-center gap-1">
+                <label for="cinematic-default-speed">Default speed:</label>
+                <button
+                  type="button"
+                  id="camera-speed-info-btn"
+                  class="info-btn"
+                  aria-label="About automatic camera timing"
+                  aria-controls="camera-speed-info-tooltip"
+                  aria-haspopup="dialog"
+                  aria-expanded="false"
+                ><span aria-hidden="true">i</span></button>
+              </div>
+              <div
+                id="camera-speed-info-tooltip"
+                class="info-tooltip"
+                role="dialog"
+                aria-labelledby="camera-speed-info-btn"
+                tabindex="-1"
+                hidden
+              >
+                <div class="info-tooltip-content">
+                  Default speed controls travel between keyframes whose timing is set to auto.
+                </div>
               </div>
               <div class="slider-row">
                 <input id="cinematic-default-speed" type="range" min="1" max="100" step="1" value="30" />
@@ -1467,13 +1784,32 @@
       <details class="accordion-section" id="benchmark-section" data-state-serializer-skip="true">
         <summary>Performance Benchmark</summary>
         <div class="accordion-content">
-          <div class="legend-help mb-0">
-            Test rendering limits with synthetic data
-          </div>
-
           <!-- Quick presets -->
           <div class="control-block">
-            <label>Quick test:</label>
+            <div class="d-flex items-center gap-1">
+              <label>Quick test:</label>
+              <button
+                type="button"
+                id="benchmark-info-btn"
+                class="info-btn"
+                aria-label="About performance benchmarks"
+                aria-controls="benchmark-info-tooltip"
+                aria-haspopup="dialog"
+                aria-expanded="false"
+              ><span aria-hidden="true">i</span></button>
+            </div>
+            <div
+              id="benchmark-info-tooltip"
+              class="info-tooltip"
+              role="dialog"
+              aria-labelledby="benchmark-info-btn"
+              tabindex="-1"
+              hidden
+            >
+              <div class="info-tooltip-content">
+                Test rendering limits with synthetic data. Adjust renderer settings in Visualization; reload the page to restore the original data.
+              </div>
+            </div>
             <div class="benchmark-presets">
               <button class="btn-small benchmark-preset" data-count="100000">100K</button>
               <button class="btn-small benchmark-preset" data-count="500000">500K</button>
@@ -1641,10 +1977,6 @@
             </div>
           </div>
 
-          <div class="legend-help mt-2">
-            <strong>Tips:</strong> Adjust renderer settings in Visualization section.
-            Reload page to restore original data.
-          </div>
         </div>
       </details>
 

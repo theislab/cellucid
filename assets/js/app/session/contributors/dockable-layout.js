@@ -1,325 +1,222 @@
 /**
- * @fileoverview Session contributor: floating dockable panel layout (non-analysis).
+ * @fileoverview Exact floating dockable-panel layout session contributor.
  *
- * EAGER chunk (dataset-agnostic):
- * - Persist which sidebar accordion sections were torn off into floating panels
- * - Persist their geometry (x/y/width/height) and open/closed state
- *
- * Notes:
- * - Analysis windows are handled by the dedicated analysis-windows contributor.
- * - Geometry is clamped by dockable-accordions itself; we only provide best-effort inputs.
+ * Analysis windows are owned by their dedicated contributor. Every serialized
+ * accordion uses its stable nonempty DOM id; visible summary copy is never an
+ * identity.
  *
  * @module session/contributors/dockable-layout
  */
 
 import { StyleManager } from '../../../utils/style-manager.js';
+import {
+  assertArray,
+  assertBoolean,
+  assertExactKeys,
+  assertFiniteNumber,
+  assertNonEmptyString,
+  assertSafeInteger,
+  requireMethod
+} from '../schema-contract.js';
 
 export const id = 'dockable-layout';
 
-/**
- * Hash a string into a stable u32 value (FNV-1a).
- * Used to deterministically cascade panels that would otherwise restore off-screen.
- *
- * @param {string} s
- * @returns {number}
- */
-function hashString32(s) {
-  let h = 2166136261;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619);
+function assertDetailsElement(value, context) {
+  if (
+    typeof HTMLDetailsElement === 'undefined'
+    || !(value instanceof HTMLDetailsElement)
+  ) {
+    throw new TypeError(`${context} must be an HTMLDetailsElement.`);
   }
-  return h >>> 0;
+  if (
+    typeof value.matches !== 'function'
+    || !value.matches('details.accordion-section')
+  ) {
+    throw new TypeError(`${context} must be a current accordion section.`);
+  }
+  return value;
 }
 
-/**
- * @returns {{ width: number, height: number } | null}
- */
-function getViewportSize() {
-  const w = typeof window !== 'undefined' ? window.innerWidth : null;
-  const h = typeof window !== 'undefined' ? window.innerHeight : null;
-  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return null;
-  return { width: w, height: h };
+function isExcluded(details) {
+  if (typeof details.closest !== 'function') {
+    throw new TypeError('Dockable accordion requires closest().');
+  }
+  if (details.closest('[data-state-serializer-skip]') !== null) return true;
+  if (
+    details.classList === null
+    || typeof details.classList !== 'object'
+    || typeof details.classList.contains !== 'function'
+  ) {
+    throw new TypeError('Dockable accordion requires classList.');
+  }
+  if (details.classList.contains('analysis-window-panel')) return true;
+  if (details.dataset === null || typeof details.dataset !== 'object') {
+    throw new TypeError('Dockable accordion requires dataset metadata.');
+  }
+  return Object.hasOwn(details.dataset, 'analysisWindowId');
 }
 
-/**
- * @param {number} value
- * @param {number} min
- * @param {number} max
- * @returns {number}
- */
-function clamp(value, min, max) {
-  return Math.min(max, Math.max(min, value));
+function assertPanelId(value, context) {
+  return assertNonEmptyString(value, `${context} stable nonempty DOM id`);
 }
 
-/**
- * If saved geometry is invalid or off-screen, choose a safe deterministic position.
- *
- * @param {string} panelId
- * @param {{ width: number, height: number }} viewport
- * @returns {{ left: number, top: number }}
- */
-function cascadeToSafePosition(panelId, viewport) {
-  const margin = 24;
-  const step = 28;
-  const cols = Math.max(1, Math.floor((viewport.width - margin * 2) / step));
-  const rows = Math.max(1, Math.floor((viewport.height - margin * 2) / step));
-  const slots = Math.max(1, cols * rows);
-
-  const idx = hashString32(panelId) % slots;
-  const col = idx % cols;
-  const row = (idx / cols) | 0;
-
-  return {
-    left: margin + col * step,
-    top: margin + row * step
+function readPanelRect(details, context) {
+  requireMethod(details, 'getBoundingClientRect', context);
+  const domRect = details.getBoundingClientRect();
+  if (domRect === null || typeof domRect !== 'object') {
+    throw new TypeError(`${context} must return a DOMRect.`);
+  }
+  const rect = {
+    left: assertFiniteNumber(domRect.left, `${context} left`),
+    top: assertFiniteNumber(domRect.top, `${context} top`),
+    width: assertFiniteNumber(domRect.width, `${context} width`),
+    height: assertFiniteNumber(domRect.height, `${context} height`)
   };
-}
-
-/**
- * Clamp and sanitize floating panel geometry to the current viewport.
- *
- * @param {string} panelId
- * @param {{ left: number, top: number, width: number, height: number }} rect
- * @returns {{ left?: number, top?: number, preferredSize?: { width?: number, height?: number } }}
- */
-function normalizeFloatGeometry(panelId, rect) {
-  const viewport = getViewportSize();
-  const minWidth = 240;
-  const minHeight = 180;
-  const margin = 24;
-
-  const rawLeft = Number(rect?.left);
-  const rawTop = Number(rect?.top);
-  const rawWidth = Number(rect?.width);
-  const rawHeight = Number(rect?.height);
-
-  const hasSize = Number.isFinite(rawWidth) && Number.isFinite(rawHeight) && rawWidth > 0 && rawHeight > 0;
-  const hasPos = Number.isFinite(rawLeft) && Number.isFinite(rawTop);
-
-  /** @type {{ width?: number, height?: number }} */
-  const preferredSize = {};
-
-  if (hasSize) {
-    if (viewport) {
-      preferredSize.width = clamp(rawWidth, minWidth, Math.max(minWidth, viewport.width - margin * 2));
-      preferredSize.height = clamp(rawHeight, minHeight, Math.max(minHeight, viewport.height - margin * 2));
-    } else {
-      preferredSize.width = rawWidth;
-      preferredSize.height = rawHeight;
-    }
+  if (rect.width <= 0 || rect.height <= 0) {
+    throw new RangeError(`${context} width and height must be positive.`);
   }
+  return rect;
+}
 
-  if (!viewport || !hasPos) {
-    // If we can't reason about viewport bounds, use saved geometry as-is when possible.
-    // When position is invalid, fall back to a deterministic cascade.
-    if (viewport && !hasPos) {
-      const fallback = cascadeToSafePosition(panelId, viewport);
-      return { left: fallback.left, top: fallback.top, preferredSize };
-    }
-    return { left: hasPos ? rawLeft : undefined, top: hasPos ? rawTop : undefined, preferredSize };
+function readPanelLayer(details, context) {
+  const raw = StyleManager.getVariable(details, '--z-layer');
+  if (typeof raw !== 'string' || !/^(0|[1-9]\d*)$/.test(raw)) {
+    throw new TypeError(`${context} must have an exact non-negative integer z layer.`);
   }
+  return assertSafeInteger(Number(raw), `${context} z layer`);
+}
 
-  const widthForClamp = preferredSize.width ?? minWidth;
-  const heightForClamp = preferredSize.height ?? minHeight;
-
-  const maxLeft = Math.max(margin, viewport.width - margin - widthForClamp);
-  const maxTop = Math.max(margin, viewport.height - margin - heightForClamp);
-
-  let left = clamp(rawLeft, margin, maxLeft);
-  let top = clamp(rawTop, margin, maxTop);
-
-  // If the saved rect is wildly out of bounds, clamp may still pin to the margin; if that
-  // produces a degenerate placement (e.g., viewport too small), cascade to a safe position.
-  if (!Number.isFinite(left) || !Number.isFinite(top)) {
-    const fallback = cascadeToSafePosition(panelId, viewport);
-    left = fallback.left;
-    top = fallback.top;
+function assertRect(rect, context) {
+  assertExactKeys(rect, ['left', 'top', 'width', 'height'], context);
+  assertFiniteNumber(rect.left, `${context} left`);
+  assertFiniteNumber(rect.top, `${context} top`);
+  assertFiniteNumber(rect.width, `${context} width`);
+  assertFiniteNumber(rect.height, `${context} height`);
+  if (rect.width <= 0 || rect.height <= 0) {
+    throw new RangeError(`${context} width and height must be positive.`);
   }
-
-  return { left, top, preferredSize };
 }
 
-/**
- * Skip ephemeral or non-session panels.
- * @param {Element} el
- * @returns {boolean}
- */
-function isSkipped(el) {
-  if (!el) return true;
-  if (el.closest?.('[data-state-serializer-skip]')) return true;
-  // Analysis windows are session-restored separately.
-  if (el.classList?.contains('analysis-window-panel')) return true;
-  if (el.dataset?.analysisWindowId) return true;
-  return false;
+function assertPanel(panel, context) {
+  assertExactKeys(panel, ['id', 'open', 'rect', 'z'], context);
+  assertPanelId(panel.id, `${context} id`);
+  assertBoolean(panel.open, `${context} open`);
+  assertRect(panel.rect, `${context} rect`);
+  assertSafeInteger(panel.z, `${context} z`);
 }
 
-/**
- * Derive a stable ID for a dockable panel.
- * Prefer the DOM id, otherwise fall back to the summary label.
- *
- * @param {HTMLDetailsElement} details
- * @returns {string|null}
- */
-function getPanelId(details) {
-  const domId = String(details.id || '').trim();
-  if (domId) return domId;
-  const summaryText = details.querySelector('summary')?.textContent?.trim?.() || '';
-  return summaryText || null;
-}
-
-/**
- * Parse a CSS custom property containing a px number.
- * @param {HTMLElement} el
- * @param {string} varName
- * @returns {number|null}
- */
-function readPxVar(el, varName) {
-  const raw = StyleManager.getVariable(el, varName);
-  if (!raw) return null;
-  const text = String(raw).trim();
-  if (!text.endsWith('px')) return null;
-  const n = Number(text.slice(0, -2));
-  return Number.isFinite(n) ? n : null;
-}
-
-/**
- * Read the current floating geometry for a panel.
- * Uses StyleManager custom properties, falling back to DOMRect.
- *
- * @param {HTMLDetailsElement} details
- * @returns {{ left: number, top: number, width: number, height: number }}
- */
-function readPanelRect(details) {
-  const left = readPxVar(details, '--pos-x');
-  const top = readPxVar(details, '--pos-y');
-  const width = readPxVar(details, '--pos-width');
-  const height = readPxVar(details, '--pos-height');
-
-  if (left != null && top != null && width != null && height != null) {
-    return { left, top, width, height };
+function getDockableOwner(ctx, operation) {
+  if (ctx === null || typeof ctx !== 'object') {
+    throw new TypeError(`Dockable layout ${operation} requires a session context.`);
   }
-
-  const rect = details.getBoundingClientRect();
-  return {
-    left: rect.left,
-    top: rect.top,
-    width: rect.width,
-    height: rect.height
-  };
+  const dockable = ctx.dockableAccordions;
+  if (dockable === null || typeof dockable !== 'object') {
+    throw new TypeError(`Dockable layout ${operation} requires the current dockable owner.`);
+  }
+  return dockable;
 }
 
-/**
- * Capture floating dockable panel geometry.
- * @param {object} ctx
- * @returns {import('../session-serializer.js').SessionChunk[]}
- */
 export function capture(ctx) {
-  const floatingRoot = ctx?.dockableAccordions?.floatingRoot || document.getElementById('floating-panels-root');
-  if (!floatingRoot) return [];
+  const dockable = getDockableOwner(ctx, 'capture');
+  const floatingRoot = dockable.floatingRoot;
+  if (
+    floatingRoot === null
+    || typeof floatingRoot !== 'object'
+    || typeof floatingRoot.querySelectorAll !== 'function'
+  ) {
+    throw new TypeError('Dockable layout capture requires the current floating root.');
+  }
 
-  /** @type {any[]} */
   const panels = [];
-
-  floatingRoot.querySelectorAll('details.accordion-section').forEach((details) => {
-    if (!(details instanceof HTMLDetailsElement)) return;
-    if (!details.classList.contains('accordion-floating')) return;
-    if (isSkipped(details)) return;
-
-    const panelId = getPanelId(details);
-    if (!panelId) return;
-
-    const rect = readPanelRect(details);
-    const zRaw = StyleManager.getVariable(details, '--z-layer');
-    const z = zRaw ? Number(String(zRaw).trim()) : null;
-
+  const ids = new Set();
+  for (const candidate of floatingRoot.querySelectorAll('details.accordion-section')) {
+    const details = assertDetailsElement(candidate, 'Floating accordion');
+    if (!details.classList.contains('accordion-floating')) {
+      throw new TypeError('Every accordion in the floating root must be marked floating.');
+    }
+    if (isExcluded(details)) continue;
+    const panelId = assertPanelId(details.id, 'Floating accordion');
+    if (ids.has(panelId)) {
+      throw new TypeError(`Floating accordion id "${panelId}" is duplicated.`);
+    }
+    ids.add(panelId);
     panels.push({
       id: panelId,
       open: details.open === true,
-      rect,
-      z: Number.isFinite(z) ? z : null
+      rect: readPanelRect(details, `Floating accordion "${panelId}" geometry`),
+      z: readPanelLayer(details, `Floating accordion "${panelId}"`)
     });
-  });
+  }
+  panels.sort((a, b) => a.z - b.z || a.id.localeCompare(b.id));
 
-  // Sort by z so restore order preserves stacking as much as possible.
-  panels.sort((a, b) => (a.z ?? 0) - (b.z ?? 0));
-
-  return [
-    {
-      id: 'ui/dockable-layout',
-      contributorId: id,
-      priority: 'eager',
-      kind: 'json',
-      codec: 'gzip',
-      label: 'Floating panels',
-      datasetDependent: false,
-      payload: { panels }
-    }
-  ];
+  return [{
+    id: 'ui/dockable-layout',
+    contributorId: id,
+    priority: 'eager',
+    kind: 'json',
+    codec: 'gzip',
+    label: 'Floating panels',
+    datasetDependent: false,
+    payload: { panels }
+  }];
 }
 
-/**
- * Restore floating dockable panel geometry.
- *
- * @param {object} ctx
- * @param {any} _chunkMeta
- * @param {{ panels?: any[] }} payload
- */
 export function restore(ctx, _chunkMeta, payload) {
-  const dockable = ctx?.dockableAccordions;
-  if (!dockable?.float || !payload?.panels || !Array.isArray(payload.panels)) return;
+  const dockable = getDockableOwner(ctx, 'restore');
+  requireMethod(dockable, 'dock', 'Dockable layout restore owner');
+  requireMethod(dockable, 'float', 'Dockable layout restore owner');
+  assertExactKeys(payload, ['panels'], 'Dockable layout payload');
+  assertArray(payload.panels, 'Dockable layout panels');
 
-  const panels = payload.panels;
+  const ids = new Set();
+  const candidates = [];
+  let previousPanel = null;
+  for (let index = 0; index < payload.panels.length; index++) {
+    const panel = payload.panels[index];
+    const context = `Dockable layout panel ${index}`;
+    assertPanel(panel, context);
+    if (ids.has(panel.id)) {
+      throw new TypeError(`Dockable layout panel id "${panel.id}" is duplicated.`);
+    }
+    ids.add(panel.id);
+    if (
+      previousPanel !== null
+      && (
+        panel.z < previousPanel.z
+        || (panel.z === previousPanel.z && panel.id.localeCompare(previousPanel.id) <= 0)
+      )
+    ) {
+      throw new TypeError('Dockable layout panels must use canonical z/id order.');
+    }
+    previousPanel = panel;
 
-  // Restore in z-order so the last floated panel ends up on top.
-  for (const p of panels) {
-    const panelId = String(p?.id || '').trim();
-    if (!panelId) continue;
+    const details = document.getElementById(panel.id);
+    assertDetailsElement(details, `Dockable layout panel "${panel.id}" current element`);
+    if (isExcluded(details)) {
+      throw new TypeError(`Dockable layout panel "${panel.id}" is not session-owned.`);
+    }
+    candidates.push({ panel, details });
+  }
 
-    const details = findDetailsByPanelId(panelId);
-    if (!details || isSkipped(details)) continue;
-
-    const rect = p.rect || {};
-    const geom = normalizeFloatGeometry(panelId, rect);
-
-    // Float with best-effort geometry. DockableAccordions clamps to viewport.
+  for (const { panel, details } of candidates) {
+    if (details.classList.contains('accordion-floating')) {
+      dockable.dock(details);
+      if (details.classList.contains('accordion-floating')) {
+        throw new Error(`Dockable owner failed to dock current panel "${panel.id}".`);
+      }
+    }
     dockable.float(details, {
-      left: Number.isFinite(geom.left) ? geom.left : undefined,
-      top: Number.isFinite(geom.top) ? geom.top : undefined,
-      preferredSize: geom.preferredSize || undefined
+      left: panel.rect.left,
+      top: panel.rect.top,
+      preferredSize: {
+        width: panel.rect.width,
+        height: panel.rect.height
+      }
     });
-
-    // Restore open/closed state after floating (float forces open=true).
-    if (typeof p.open === 'boolean') {
-      details.open = p.open;
+    if (!details.classList.contains('accordion-floating')) {
+      throw new Error(`Dockable owner failed to float current panel "${panel.id}".`);
     }
-
-    // Best-effort z-layer: if present, apply as a hint.
-    if (Number.isFinite(p.z)) {
-      StyleManager.setLayer(details, p.z);
-    }
+    details.open = panel.open;
+    StyleManager.setLayer(details, panel.z);
   }
-}
-
-/**
- * Find a dockable accordion <details> element by stable id or summary label.
- * Matches the same semantics as the UI-control serializer.
- *
- * @param {string} panelId
- * @returns {HTMLDetailsElement|null}
- */
-function findDetailsByPanelId(panelId) {
-  const roots = [document.getElementById('sidebar'), document.getElementById('floating-panels-root')].filter(Boolean);
-  for (const root of roots) {
-    const matchById = root.querySelector?.(`details.accordion-section#${CSS.escape(panelId)}`);
-    if (matchById instanceof HTMLDetailsElement) return matchById;
-
-    const all = root.querySelectorAll?.('details.accordion-section') || [];
-    for (const details of all) {
-      if (!(details instanceof HTMLDetailsElement)) continue;
-      const summaryText = details.querySelector('summary')?.textContent?.trim?.() || '';
-      if (summaryText === panelId) return details;
-    }
-  }
-  return null;
 }

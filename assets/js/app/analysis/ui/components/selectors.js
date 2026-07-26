@@ -463,22 +463,113 @@ export function createPageComparisonSelector(options = {}) {
     selectedIds = [],
     onChange,
     customColors = new Map(),
-    includeDerivedPages = true
+    includeDerivedPages = true,
+    getCellCountForPageId
   } = options;
+  if (!Array.isArray(pages)) {
+    throw new TypeError('Page comparison pages must be an array');
+  }
+  if (!Array.isArray(selectedIds)) {
+    throw new TypeError('Page comparison selectedIds must be an array');
+  }
+  if (selectedIds.length !== 0 && selectedIds.length !== 2) {
+    throw new TypeError(
+      'Page comparison selectedIds must contain zero or two page IDs'
+    );
+  }
+  if (typeof onChange !== 'function') {
+    throw new TypeError('Page comparison onChange must be a function');
+  }
+  if (typeof getCellCountForPageId !== 'function') {
+    throw new TypeError(
+      'Page comparison requires getCellCountForPageId()'
+    );
+  }
 
   const container = document.createElement('div');
   container.className = 'control-block page-comparison-selector';
 
-  const selectablePages = includeDerivedPages
+  const displayPages = includeDerivedPages
     ? expandPagesWithDerived(pages, { includeRestOf: true })
     : pages;
+  const pageById = new Map();
+  const cellCountByPageId = new Map();
+  for (const page of displayPages) {
+    if (
+      page === null ||
+      typeof page !== 'object' ||
+      Array.isArray(page) ||
+      typeof page.id !== 'string' ||
+      page.id.length === 0 ||
+      typeof page.name !== 'string' ||
+      page.name.length === 0
+    ) {
+      throw new TypeError(
+        'Page comparison pages require non-empty string id and name fields'
+      );
+    }
+    if (pageById.has(page.id)) {
+      throw new TypeError(
+        `Page comparison page ID "${page.id}" is duplicated`
+      );
+    }
+    const cellCount = getCellCountForPageId(page.id);
+    if (!Number.isSafeInteger(cellCount) || cellCount < 0) {
+      throw new TypeError(
+        `Page comparison page "${page.id}" cell count must be a non-negative safe integer`
+      );
+    }
+    pageById.set(page.id, page);
+    cellCountByPageId.set(page.id, cellCount);
+  }
+  const selectedIdSet = new Set();
+  for (const pageId of selectedIds) {
+    if (typeof pageId !== 'string' || pageId.length === 0) {
+      throw new TypeError(
+        'Page comparison selected IDs must be non-empty strings'
+      );
+    }
+    if (!pageById.has(pageId)) {
+      throw new Error(`Page comparison page "${pageId}" was not found`);
+    }
+    if (selectedIdSet.has(pageId)) {
+      throw new TypeError(
+        `Page comparison page "${pageId}" is selected more than once`
+      );
+    }
+    if (cellCountByPageId.get(pageId) === 0) {
+      throw new RangeError(
+        `Page comparison page "${pageId}" has zero cells and cannot be selected`
+      );
+    }
+    selectedIdSet.add(pageId);
+  }
+  const selectablePages = displayPages.filter(
+    page => cellCountByPageId.get(page.id) > 0
+  );
 
   // If fewer than 2 selectable options, show message
   if (selectablePages.length < 2) {
     const notice = document.createElement('div');
     notice.className = 'legend-help';
-    notice.textContent = 'Need at least 1 page for comparison. Create a highlight page using the Highlighted Cells section above.';
+    notice.textContent =
+      'Differential expression requires two non-empty cell groups.';
     container.appendChild(notice);
+    for (const page of displayPages) {
+      const status = document.createElement('div');
+      const cellCount = cellCountByPageId.get(page.id);
+      status.className = 'analysis-page-tab' +
+        (page._derived ? ' derived' : '') +
+        (cellCount === 0 ? ' disabled' : '');
+      status.dataset.pageId = page.id;
+      status.setAttribute(
+        'aria-disabled',
+        cellCount === 0 ? 'true' : 'false'
+      );
+      status.textContent = `${page.name} (${cellCount.toLocaleString()} cells)`;
+      container.appendChild(status);
+    }
+    container._getSelection = () => [];
     return container;
   }
 
@@ -522,16 +613,12 @@ export function createPageComparisonSelector(options = {}) {
   container.appendChild(label);
 
   // Initialize selection with first two if not already selected
-  let selectedA = selectedIds[0] || pages[0]?.id || selectablePages[0]?.id;
-  let selectedB = selectedIds[1] ||
-    (pages.length > 1 && pages[1].id !== selectedA
-      ? pages[1].id
-      : selectablePages.find(p => p.id !== selectedA)?.id || selectedA);
-
-  // Ensure selectedB is different from selectedA
-  if (selectedB === selectedA) {
-    selectedB = selectablePages.find(p => p.id !== selectedA)?.id || selectedA;
-  }
+  let selectedA = selectedIds.length === 2
+    ? selectedIds[0]
+    : selectablePages[0].id;
+  let selectedB = selectedIds.length === 2
+    ? selectedIds[1]
+    : selectablePages[1].id;
 
   const selectRow = document.createElement('div');
   selectRow.className = 'page-comparison-row';
@@ -552,10 +639,15 @@ export function createPageComparisonSelector(options = {}) {
     const addOption = (page, parent) => {
       const option = document.createElement('option');
       option.value = page.id;
-      option.textContent = page.name;
+      const cellCount = cellCountByPageId.get(page.id);
+      option.textContent = cellCount === 0
+        ? `${page.name} (0 cells)`
+        : page.name;
       option.selected = page.id === currentValue;
       // Disable the option if it's selected in the other dropdown
-      if (page.id === otherValue) option.disabled = true;
+      if (page.id === otherValue || cellCount === 0) {
+        option.disabled = true;
+      }
       parent.appendChild(option);
     };
 
@@ -567,7 +659,7 @@ export function createPageComparisonSelector(options = {}) {
     if (includeDerivedPages) {
       const derivedGroup = document.createElement('optgroup');
       derivedGroup.label = 'Wildcards';
-      selectablePages
+      displayPages
         .filter(p => p?._derived)
         .forEach((page) => addOption(page, derivedGroup));
       if (derivedGroup.children.length > 0) {

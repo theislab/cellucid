@@ -1,311 +1,529 @@
 /**
- * @fileoverview Field filter serialization/restoration helpers.
+ * @fileoverview Exact modified-only field-filter session state.
  *
- * This module records only modified filter state to keep session bundles small
- * and avoid forcing unnecessary data loads when restoring.
+ * Every entry is a closed record of explicit changes from the freshly loaded
+ * dataset. Restore validates the complete candidate before loading or mutating
+ * any field.
  *
  * @module state-serializer/filters
  */
 
 import { getCategoryColor } from '../../data/palettes.js';
-import { makeFieldId, parseFieldId } from '../utils/field-constants.js';
+import { makeFieldId } from '../utils/field-constants.js';
+import {
+  assertArray,
+  assertBoolean,
+  assertExactKeys,
+  assertFiniteNumber,
+  assertNonEmptyString,
+  assertNullableFiniteNumber,
+  assertNullableString,
+  assertPlainRecord,
+  assertSafeInteger,
+  requireMethod
+} from '../session/schema-contract.js';
 
-/**
- * Compare two RGB colors for equality within a small epsilon.
- * @param {number[]|null} a
- * @param {number[]|null} b
- * @param {number} [epsilon=1e-4]
- * @returns {boolean}
- */
-function colorsEqual(a, b, epsilon = 1e-4) {
-  if (!a || !b) return !a && !b;
-  return Math.abs(a[0] - b[0]) < epsilon &&
-         Math.abs(a[1] - b[1]) < epsilon &&
-         Math.abs(a[2] - b[2]) < epsilon;
-}
+const COLOR_EPSILON = 1e-4;
+const RANGE_EPSILON = 1e-6;
+const CATEGORY_KEYS = [
+  'kind',
+  'filterEnabled',
+  'visibility',
+  'colors',
+  'colormapId'
+];
+const CONTINUOUS_KEYS = [
+  'kind',
+  'filterEnabled',
+  'filter',
+  'colorRange',
+  'useLogScale',
+  'useFilterColorRange',
+  'outlierFilterEnabled',
+  'outlierThreshold',
+  'colormapId'
+];
 
-function isCategoryFieldModified(field) {
-  if (!field || field.kind !== 'category') return false;
-  if (field._categoryFilterEnabled === false) return true;
-  if (field._categoryVisible) {
-    for (const visible of Object.values(field._categoryVisible)) {
-      if (visible === false) return true;
+function assertRgb(color, context) {
+  if (!Array.isArray(color) || color.length !== 3) {
+    throw new TypeError(`${context} must be an RGB triplet.`);
+  }
+  for (let channel = 0; channel < color.length; channel++) {
+    const value = assertFiniteNumber(color[channel], `${context} channel ${channel}`);
+    if (value < 0 || value > 1) {
+      throw new RangeError(`${context} channels must be from 0 through 1.`);
     }
   }
-  if (field._colormapId) return true;
-  if (field._categoryColors) {
-    for (let i = 0; i < field._categoryColors.length; i++) {
-      const color = field._categoryColors[i];
-      if (color) {
-        const defaultColor = getCategoryColor(i);
-        if (!colorsEqual(color, defaultColor)) return true;
+  return color;
+}
+
+function colorsEqual(a, b) {
+  assertRgb(a, 'Field category color');
+  assertRgb(b, 'Default category color');
+  return (
+    Math.abs(a[0] - b[0]) < COLOR_EPSILON
+    && Math.abs(a[1] - b[1]) < COLOR_EPSILON
+    && Math.abs(a[2] - b[2]) < COLOR_EPSILON
+  );
+}
+
+function assertRange(value, context) {
+  assertExactKeys(value, ['min', 'max'], context);
+  const min = assertFiniteNumber(value.min, `${context} min`);
+  const max = assertFiniteNumber(value.max, `${context} max`);
+  if (min > max) {
+    throw new RangeError(`${context} min must not exceed max.`);
+  }
+  return value;
+}
+
+function assertNullableBoolean(value, context) {
+  if (value === null) return value;
+  return assertBoolean(value, context);
+}
+
+function assertNullableRange(value, context) {
+  if (value === null) return value;
+  return assertRange(value, context);
+}
+
+function assertFieldInventory(fields, context) {
+  assertArray(fields, context);
+  const keys = new Set();
+  for (let index = 0; index < fields.length; index++) {
+    const field = fields[index];
+    if (field === null || typeof field !== 'object') {
+      throw new TypeError(`${context} entry ${index} must be an object.`);
+    }
+    const key = assertNonEmptyString(field.key, `${context} entry ${index} key`);
+    if (keys.has(key)) {
+      throw new TypeError(`${context} contains duplicate key "${key}".`);
+    }
+    keys.add(key);
+    if (field.kind !== 'category' && field.kind !== 'continuous') {
+      throw new TypeError(`${context} field "${key}" has unsupported kind.`);
+    }
+  }
+  return fields;
+}
+
+function explicitBooleanChange(value, changedValue, context) {
+  if (value === undefined) return null;
+  assertBoolean(value, context);
+  return value === changedValue ? value : null;
+}
+
+function explicitNullableColormap(value, unchangedId, context) {
+  if (value === undefined || value === null || value === unchangedId) return null;
+  return assertNonEmptyString(value, context);
+}
+
+function serializeCategoryFilter(field) {
+  const visibility = [];
+  if (field._categoryVisible !== undefined) {
+    assertPlainRecord(field._categoryVisible, `Category visibility for "${field.key}"`);
+    for (const [rawIndex, visible] of Object.entries(field._categoryVisible)) {
+      if (!/^(0|[1-9]\d*)$/.test(rawIndex)) {
+        throw new TypeError(`Category visibility index "${rawIndex}" must be canonical.`);
+      }
+      assertBoolean(visible, `Category visibility "${field.key}"[${rawIndex}]`);
+      if (visible === false) {
+        visibility.push({
+          categoryIndex: Number(rawIndex),
+          visible
+        });
       }
     }
   }
-  return false;
+  visibility.sort((a, b) => a.categoryIndex - b.categoryIndex);
+
+  const colors = [];
+  if (field._categoryColors !== undefined) {
+    assertArray(field._categoryColors, `Category colors for "${field.key}"`);
+    for (let categoryIndex = 0; categoryIndex < field._categoryColors.length; categoryIndex++) {
+      const color = field._categoryColors[categoryIndex];
+      if (color === undefined || color === null) continue;
+      assertRgb(color, `Category color "${field.key}"[${categoryIndex}]`);
+      if (!colorsEqual(color, getCategoryColor(categoryIndex))) {
+        colors.push({
+          categoryIndex,
+          color: [...color]
+        });
+      }
+    }
+  }
+
+  const entry = {
+    kind: 'category',
+    filterEnabled: explicitBooleanChange(
+      field._categoryFilterEnabled,
+      false,
+      `Category filterEnabled for "${field.key}"`
+    ),
+    visibility,
+    colors,
+    colormapId: explicitNullableColormap(
+      field._colormapId,
+      null,
+      `Category colormapId for "${field.key}"`
+    )
+  };
+  const changed = (
+    entry.filterEnabled !== null
+    || entry.visibility.length > 0
+    || entry.colors.length > 0
+    || entry.colormapId !== null
+  );
+  return changed ? entry : null;
 }
 
-function isContinuousFieldModified(field) {
-  if (!field || field.kind !== 'continuous') return false;
+function changedRange(candidate, stats, context) {
+  if (candidate === undefined || candidate === null) return null;
+  assertRange(candidate, context);
+  assertRange(stats, `${context} current stats`);
+  const changed = (
+    Math.abs(candidate.min - stats.min) > RANGE_EPSILON
+    || Math.abs(candidate.max - stats.max) > RANGE_EPSILON
+  );
+  return changed ? { min: candidate.min, max: candidate.max } : null;
+}
 
-  if (field._filterEnabled === false) return true;
-
-  if (field._continuousFilter && field._continuousStats) {
-    const stats = field._continuousStats;
-    const filter = field._continuousFilter;
-    const minChanged = filter.min > stats.min + 1e-6;
-    const maxChanged = filter.max < stats.max - 1e-6;
-    if (minChanged || maxChanged) return true;
+function serializeContinuousFilter(field) {
+  let outlierThreshold = null;
+  if (field._outlierThreshold !== undefined && field._outlierThreshold !== null) {
+    const threshold = assertFiniteNumber(
+      field._outlierThreshold,
+      `Continuous outlierThreshold for "${field.key}"`
+    );
+    if (threshold < 0 || threshold > 1) {
+      throw new RangeError(`Continuous outlierThreshold for "${field.key}" must be from 0 through 1.`);
+    }
+    if (threshold < 0.9999) outlierThreshold = threshold;
   }
 
-  if (field._continuousColorRange && field._continuousStats) {
-    const stats = field._continuousStats;
-    const colorRange = field._continuousColorRange;
-    const minChanged = Math.abs(colorRange.min - stats.min) > 1e-6;
-    const maxChanged = Math.abs(colorRange.max - stats.max) > 1e-6;
-    if (minChanged || maxChanged) return true;
-  }
-
-  if (field._useFilterColorRange === false) return true;
-  if (field._useLogScale) return true;
-
-  const outlierEnabled = field._outlierFilterEnabled !== false;
-  if (!outlierEnabled) return true;
-  if (outlierEnabled && field._outlierThreshold != null && field._outlierThreshold < 0.9999) return true;
-
-  if (field._colormapId && field._colormapId !== 'viridis') return true;
-  return false;
+  const entry = {
+    kind: 'continuous',
+    filterEnabled: explicitBooleanChange(
+      field._filterEnabled,
+      false,
+      `Continuous filterEnabled for "${field.key}"`
+    ),
+    filter: changedRange(
+      field._continuousFilter,
+      field._continuousStats,
+      `Continuous filter for "${field.key}"`
+    ),
+    colorRange: changedRange(
+      field._continuousColorRange,
+      field._continuousStats,
+      `Continuous colorRange for "${field.key}"`
+    ),
+    useLogScale: explicitBooleanChange(
+      field._useLogScale,
+      true,
+      `Continuous useLogScale for "${field.key}"`
+    ),
+    useFilterColorRange: explicitBooleanChange(
+      field._useFilterColorRange,
+      false,
+      `Continuous useFilterColorRange for "${field.key}"`
+    ),
+    outlierFilterEnabled: explicitBooleanChange(
+      field._outlierFilterEnabled,
+      false,
+      `Continuous outlierFilterEnabled for "${field.key}"`
+    ),
+    outlierThreshold,
+    colormapId: explicitNullableColormap(
+      field._colormapId,
+      'viridis',
+      `Continuous colormapId for "${field.key}"`
+    )
+  };
+  const changed = Object.entries(entry).some(
+    ([key, value]) => key !== 'kind' && value !== null
+  );
+  return changed ? entry : null;
 }
 
 export function serializeFiltersForFields(fields, source) {
+  if (source !== 'obs' && source !== 'var') {
+    throw new TypeError('Filter source must be exactly "obs" or "var".');
+  }
+  assertFieldInventory(fields, `Current ${source} field inventory`);
   const filters = {};
-  (fields || []).forEach((field) => {
-    if (!field) return;
-    if (field._isDeleted === true) return;
-
-    const modified =
-      field.kind === 'category'
-        ? isCategoryFieldModified(field)
-        : isContinuousFieldModified(field);
-    if (!modified) return;
-
-    const key = makeFieldId(source, field.key);
-    if (field.kind === 'category') {
-      const visibility = {};
-      if (field._categoryVisible) {
-        Object.entries(field._categoryVisible).forEach(([catIdx, visible]) => {
-          visibility[catIdx] = visible;
-        });
-      }
-      const colors = {};
-      if (field._categoryColors) {
-        field._categoryColors.forEach((color, catIdx) => {
-          if (color) {
-            const defaultColor = getCategoryColor(catIdx);
-            if (!colorsEqual(color, defaultColor)) {
-              colors[catIdx] = [...color];
-            }
-          }
-        });
-      }
-      filters[key] = {
-        kind: 'category',
-        filterEnabled: field._categoryFilterEnabled !== false,
-        visibility,
-        colors,
-        colormapId: field._colormapId || null
-      };
-    } else if (field.kind === 'continuous') {
-      filters[key] = {
-        kind: 'continuous',
-        filterEnabled: field._filterEnabled !== false,
-        filter: field._continuousFilter ? { ...field._continuousFilter } : null,
-        colorRange: field._continuousColorRange ? { ...field._continuousColorRange } : null,
-        useLogScale: field._useLogScale ?? false,
-        useFilterColorRange: field._useFilterColorRange ?? true,
-        outlierFilterEnabled: field._outlierFilterEnabled ?? true,
-        outlierThreshold: field._outlierThreshold ?? 1.0,
-        colormapId: field._colormapId || null
-      };
+  for (const field of fields) {
+    if (field._isDeleted === true) continue;
+    const entry = field.kind === 'category'
+      ? serializeCategoryFilter(field)
+      : serializeContinuousFilter(field);
+    if (entry !== null) {
+      filters[makeFieldId(source, field.key)] = entry;
     }
-  });
+  }
   return filters;
 }
 
-export function createFilterSerializer({ state }) {
-  function serializeFilters() {
-    const filters = {};
-    Object.assign(filters, serializeFiltersForFields(state.getFields?.(), 'obs'));
-    Object.assign(filters, serializeFiltersForFields(state.getVarFields?.(), 'var'));
-    return filters;
+function parseExactFieldId(fieldId) {
+  assertNonEmptyString(fieldId, 'Filter field id');
+  const separator = fieldId.indexOf(':');
+  if (separator <= 0 || separator === fieldId.length - 1) {
+    throw new TypeError(`Filter field id "${fieldId}" must be source:key.`);
+  }
+  const source = fieldId.slice(0, separator);
+  if (source !== 'obs' && source !== 'var') {
+    throw new TypeError(`Filter field id "${fieldId}" has unsupported source.`);
+  }
+  const fieldKey = fieldId.slice(separator + 1);
+  assertNonEmptyString(fieldKey, `Filter field id "${fieldId}" key`);
+  return { source, fieldKey };
+}
+
+function validateCategoryEntry(entry, field, fieldId) {
+  assertExactKeys(entry, CATEGORY_KEYS, `Category filter "${fieldId}"`);
+  if (entry.kind !== 'category') {
+    throw new TypeError(`Category filter "${fieldId}" must declare kind "category".`);
+  }
+  assertNullableBoolean(entry.filterEnabled, `Category filter "${fieldId}" filterEnabled`);
+  assertNullableString(entry.colormapId, `Category filter "${fieldId}" colormapId`);
+  assertArray(entry.visibility, `Category filter "${fieldId}" visibility`);
+  assertArray(entry.colors, `Category filter "${fieldId}" colors`);
+  if (!Array.isArray(field.categories)) {
+    throw new TypeError(`Current category field "${fieldId}" requires a category inventory.`);
   }
 
-  /**
-   * Restore filters to fields (async).
-   * Returns counts so callers can avoid noisy logs when nothing is applied.
-   */
+  const visibilityIndices = new Set();
+  for (const change of entry.visibility) {
+    assertExactKeys(
+      change,
+      ['categoryIndex', 'visible'],
+      `Category filter "${fieldId}" visibility change`
+    );
+    const categoryIndex = assertSafeInteger(
+      change.categoryIndex,
+      `Category filter "${fieldId}" categoryIndex`
+    );
+    if (categoryIndex >= field.categories.length) {
+      throw new RangeError(`Category filter "${fieldId}" categoryIndex is out of range.`);
+    }
+    if (visibilityIndices.has(categoryIndex)) {
+      throw new TypeError(`Category filter "${fieldId}" repeats a visibility categoryIndex.`);
+    }
+    visibilityIndices.add(categoryIndex);
+    if (change.visible !== false) {
+      throw new TypeError(`Category filter "${fieldId}" visibility changes must be explicit false values.`);
+    }
+  }
+
+  const colorIndices = new Set();
+  for (const change of entry.colors) {
+    assertExactKeys(
+      change,
+      ['categoryIndex', 'color'],
+      `Category filter "${fieldId}" color change`
+    );
+    const categoryIndex = assertSafeInteger(
+      change.categoryIndex,
+      `Category filter "${fieldId}" color categoryIndex`
+    );
+    if (categoryIndex >= field.categories.length) {
+      throw new RangeError(`Category filter "${fieldId}" color categoryIndex is out of range.`);
+    }
+    if (colorIndices.has(categoryIndex)) {
+      throw new TypeError(`Category filter "${fieldId}" repeats a color categoryIndex.`);
+    }
+    colorIndices.add(categoryIndex);
+    assertRgb(change.color, `Category filter "${fieldId}" color`);
+  }
+
+  if (
+    entry.filterEnabled === null
+    && entry.visibility.length === 0
+    && entry.colors.length === 0
+    && entry.colormapId === null
+  ) {
+    throw new TypeError(`Category filter "${fieldId}" must contain an explicit change.`);
+  }
+}
+
+function validateContinuousEntry(entry, fieldId) {
+  assertExactKeys(entry, CONTINUOUS_KEYS, `Continuous filter "${fieldId}"`);
+  if (entry.kind !== 'continuous') {
+    throw new TypeError(`Continuous filter "${fieldId}" must declare kind "continuous".`);
+  }
+  assertNullableBoolean(entry.filterEnabled, `Continuous filter "${fieldId}" filterEnabled`);
+  assertNullableRange(entry.filter, `Continuous filter "${fieldId}" filter`);
+  assertNullableRange(entry.colorRange, `Continuous filter "${fieldId}" colorRange`);
+  assertNullableBoolean(entry.useLogScale, `Continuous filter "${fieldId}" useLogScale`);
+  assertNullableBoolean(
+    entry.useFilterColorRange,
+    `Continuous filter "${fieldId}" useFilterColorRange`
+  );
+  assertNullableBoolean(
+    entry.outlierFilterEnabled,
+    `Continuous filter "${fieldId}" outlierFilterEnabled`
+  );
+  const threshold = assertNullableFiniteNumber(
+    entry.outlierThreshold,
+    `Continuous filter "${fieldId}" outlierThreshold`
+  );
+  if (threshold !== null && (threshold < 0 || threshold > 1)) {
+    throw new RangeError(`Continuous filter "${fieldId}" outlierThreshold must be from 0 through 1.`);
+  }
+  assertNullableString(entry.colormapId, `Continuous filter "${fieldId}" colormapId`);
+  if (
+    entry.filterEnabled === null
+    && entry.filter === null
+    && entry.colorRange === null
+    && entry.useLogScale === null
+    && entry.useFilterColorRange === null
+    && entry.outlierFilterEnabled === null
+    && entry.outlierThreshold === null
+    && entry.colormapId === null
+  ) {
+    throw new TypeError(`Continuous filter "${fieldId}" must contain an explicit change.`);
+  }
+}
+
+export function validateFiltersForState(state, filters) {
+  if (state === null || typeof state !== 'object') {
+    throw new TypeError('Filter validation requires the current DataState owner.');
+  }
+  assertPlainRecord(filters, 'Session filters');
+  requireMethod(state, 'getFields', 'Filter validation owner');
+  requireMethod(state, 'getVarFields', 'Filter validation owner');
+  const obsFields = assertFieldInventory(
+    state.getFields(),
+    'Current obs field inventory'
+  );
+  const varFields = assertFieldInventory(
+    state.getVarFields(),
+    'Current var field inventory'
+  );
+  const obsLookup = new Map(obsFields.map((field, index) => [field.key, index]));
+  const varLookup = new Map(varFields.map((field, index) => [field.key, index]));
+  const actions = [];
+
+  for (const [fieldId, entry] of Object.entries(filters)) {
+    const { source, fieldKey } = parseExactFieldId(fieldId);
+    const fields = source === 'obs' ? obsFields : varFields;
+    const lookup = source === 'obs' ? obsLookup : varLookup;
+    const fieldIndex = lookup.get(fieldKey);
+    if (fieldIndex === undefined || fields[fieldIndex]._isDeleted === true) {
+      throw new RangeError(`Current field "${fieldId}" was not found.`);
+    }
+    const field = fields[fieldIndex];
+    if (field.kind === 'category') {
+      validateCategoryEntry(entry, field, fieldId);
+    } else {
+      validateContinuousEntry(entry, fieldId);
+    }
+    if (entry.kind !== field.kind) {
+      throw new TypeError(
+        `Filter "${fieldId}" kind does not match current field kind "${field.kind}".`
+      );
+    }
+    actions.push({ source, fieldIndex, field, entry });
+  }
+  return actions;
+}
+
+export function createFilterSerializer({ state }) {
+  if (state === null || typeof state !== 'object') {
+    throw new TypeError('Filter serializer requires the current DataState owner.');
+  }
+
+  function serializeFilters() {
+    requireMethod(state, 'getFields', 'Filter capture owner');
+    requireMethod(state, 'getVarFields', 'Filter capture owner');
+    return {
+      ...serializeFiltersForFields(state.getFields(), 'obs'),
+      ...serializeFiltersForFields(state.getVarFields(), 'var')
+    };
+  }
+
   async function restoreFilters(filters) {
-    if (!filters) return { restored: 0, skippedNoop: 0 };
+    requireMethod(state, 'ensureFieldLoaded', 'Filter restore owner');
+    requireMethod(state, 'ensureVarFieldLoaded', 'Filter restore owner');
+    requireMethod(state, 'beginBatch', 'Filter restore owner');
+    requireMethod(state, 'endBatch', 'Filter restore owner');
 
-    const entries = Object.entries(filters);
-    if (!entries.length) return { restored: 0, skippedNoop: 0 };
+    const actions = validateFiltersForState(state, filters);
 
-    let restored = 0;
-    let skippedNoop = 0;
+    await Promise.all(actions.map(({ source, fieldIndex }) => (
+      source === 'obs'
+        ? state.ensureFieldLoaded(fieldIndex)
+        : state.ensureVarFieldLoaded(fieldIndex)
+    )));
 
-    const isCategoryFilterNoop = (data) => {
-      if (!data) return true;
-      if (data.filterEnabled === false) return false;
-      if (data.colormapId) return false;
-      if (data.colors && Object.keys(data.colors).length > 0) return false;
-      if (data.visibility) {
-        for (const v of Object.values(data.visibility)) {
-          if (v === false) return false;
-        }
-      }
-      return true;
-    };
-
-    const isContinuousFilterNoop = (data) => {
-      if (!data) return true;
-      if (data.filterEnabled === false) return false;
-      if (data.filter) return false;
-      if (data.colorRange) return false;
-      if (data.useLogScale) return false;
-      if (data.useFilterColorRange) return false;
-      if (data.outlierFilterEnabled === false) return false;
-      if (typeof data.outlierThreshold === 'number' && data.outlierThreshold < 0.9999) return false;
-      if (data.colormapId) return false;
-      return true;
-    };
-
-    const obsFields = state.getFields?.() || [];
-    const varFields = state.getVarFields?.() || [];
-    const obsLookup = new Map();
-    const varLookup = new Map();
-
-    obsFields.forEach((field, idx) => {
-      if (field?.key && field._isDeleted !== true) obsLookup.set(field.key, idx);
-    });
-    varFields.forEach((field, idx) => {
-      if (field?.key && field._isDeleted !== true) varLookup.set(field.key, idx);
-    });
-
-    const toRestore = [];
-
-    for (const [key, data] of entries) {
-      const parsed = parseFieldId(key);
-      const source = parsed?.source;
-      const fieldKey = parsed?.fieldKey;
-      if (!source || !fieldKey) {
-        skippedNoop += 1;
-        continue;
-      }
-
-      const lookup = source === 'var' ? varLookup : obsLookup;
-      const fields = source === 'var' ? varFields : obsFields;
-      const fieldIndex = lookup.get(fieldKey);
-
-      if (fieldIndex == null || fieldIndex < 0) {
-        skippedNoop += 1;
-        continue;
-      }
-
-      const field = fields[fieldIndex];
-      if (!field) {
-        skippedNoop += 1;
-        continue;
-      }
-
-      const isNoop =
-        data.kind === 'category'
-          ? isCategoryFilterNoop(data)
-          : data.kind === 'continuous'
-            ? isContinuousFilterNoop(data)
-            : true;
-
-      if (isNoop) {
-        skippedNoop += 1;
-        continue;
-      }
-
-      toRestore.push({ source, fieldIndex, data });
+    if (actions.some(action => action.entry.kind === 'category')) {
+      requireMethod(state, 'setVisibilityForCategory', 'Category filter restore owner');
+      requireMethod(state, 'setColorForCategory', 'Category filter restore owner');
     }
 
-    if (!toRestore.length) {
-      return { restored: 0, skippedNoop };
-    }
-
-    const preloadPromises = toRestore
-      .map(({ source, fieldIndex }) => {
-        if (source === 'var') {
-          return state.ensureVarFieldLoaded?.(fieldIndex);
-        }
-        return state.ensureFieldLoaded?.(fieldIndex);
-      })
-      .filter(Boolean);
-
-    if (preloadPromises.length > 0) {
-      await Promise.all(preloadPromises);
-    }
-
-    state.beginBatch?.();
-
+    state.beginBatch();
     try {
-      for (const { source, fieldIndex, data } of toRestore) {
-        const fields = source === 'var' ? (state.getVarFields?.() || []) : (state.getFields?.() || []);
-        const field = fields[fieldIndex];
-        if (!field) {
-          skippedNoop += 1;
+      for (const { field, entry } of actions) {
+        if (entry.kind === 'category') {
+          for (const change of entry.visibility) {
+            state.setVisibilityForCategory(
+              field,
+              change.categoryIndex,
+              change.visible
+            );
+          }
+          for (const change of entry.colors) {
+            state.setColorForCategory(
+              field,
+              change.categoryIndex,
+              [...change.color]
+            );
+          }
+          if (entry.filterEnabled !== null) {
+            field._categoryFilterEnabled = entry.filterEnabled;
+          }
+          if (entry.colormapId !== null) {
+            field._colormapId = entry.colormapId;
+          }
           continue;
         }
 
-        if (data.kind === 'category' && field.kind === 'category') {
-          if (data.visibility) {
-            Object.entries(data.visibility).forEach(([catIdx, visible]) => {
-              state.setVisibilityForCategory?.(field, parseInt(catIdx, 10), visible);
-            });
-          }
-          if (data.colors) {
-            Object.entries(data.colors).forEach(([catIdx, color]) => {
-              state.setColorForCategory?.(field, parseInt(catIdx, 10), color);
-            });
-          }
-          field._categoryFilterEnabled = data.filterEnabled !== false;
-          if (data.colormapId) {
-            field._colormapId = data.colormapId;
-          }
-          restored += 1;
-          continue;
+        if (entry.filter !== null) {
+          field._continuousFilter = { ...entry.filter };
         }
-
-        if (data.kind === 'continuous' && field.kind === 'continuous') {
-          if (data.filter) {
-            field._continuousFilter = { ...data.filter };
-          }
-          if (data.colorRange) {
-            field._continuousColorRange = { ...data.colorRange };
-          }
-          field._filterEnabled = data.filterEnabled !== false;
-          field._useLogScale = data.useLogScale ?? false;
-          field._useFilterColorRange = data.useFilterColorRange ?? true;
-          field._outlierFilterEnabled = data.outlierFilterEnabled ?? true;
-          field._outlierThreshold = data.outlierThreshold ?? 1.0;
-          if (data.colormapId) {
-            field._colormapId = data.colormapId;
-          }
-          restored += 1;
-          continue;
+        if (entry.colorRange !== null) {
+          field._continuousColorRange = { ...entry.colorRange };
         }
-
-        skippedNoop += 1;
+        if (entry.filterEnabled !== null) {
+          field._filterEnabled = entry.filterEnabled;
+        }
+        if (entry.useLogScale !== null) {
+          field._useLogScale = entry.useLogScale;
+        }
+        if (entry.useFilterColorRange !== null) {
+          field._useFilterColorRange = entry.useFilterColorRange;
+        }
+        if (entry.outlierFilterEnabled !== null) {
+          field._outlierFilterEnabled = entry.outlierFilterEnabled;
+        }
+        if (entry.outlierThreshold !== null) {
+          field._outlierThreshold = entry.outlierThreshold;
+        }
+        if (entry.colormapId !== null) {
+          field._colormapId = entry.colormapId;
+        }
       }
     } finally {
-      state.endBatch?.();
+      state.endBatch();
     }
 
-    return { restored, skippedNoop };
+    return { restored: actions.length };
   }
 
-  return { serializeFiltersForFields, serializeFilters, restoreFilters };
+  return {
+    serializeFiltersForFields,
+    serializeFilters,
+    validateFilters: filters => validateFiltersForState(state, filters),
+    restoreFilters
+  };
 }

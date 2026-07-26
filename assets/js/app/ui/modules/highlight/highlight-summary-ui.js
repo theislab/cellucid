@@ -7,6 +7,14 @@
  * @module ui/modules/highlight/highlight-summary-ui
  */
 
+import {
+  requireDomElement,
+  requireExactKeys,
+  requireHighlightGroup,
+  requireMethods,
+  requireSafeInteger
+} from './exact-contract.js';
+
 /**
  * @param {object} options
  * @param {import('../../../state/core/data-state.js').DataState} options.state
@@ -15,17 +23,85 @@
  * @param {HTMLElement|null} [options.dom.groupsEl]
  * @param {HTMLButtonElement|null} [options.dom.clearAllBtn]
  */
-export function initHighlightSummaryUI({ state, dom }) {
-  const highlightCountEl = dom?.countEl || null;
-  const highlightedGroupsEl = dom?.groupsEl || null;
-  const clearAllHighlightsBtn = dom?.clearAllBtn || null;
+export function initHighlightSummaryUI(options) {
+  requireExactKeys(
+    options,
+    ['state', 'dom'],
+    'Highlight summary UI options'
+  );
+  const { state, dom } = options;
+  requireMethods(
+    state,
+    'Highlight summary state',
+    [
+      'clearAllHighlights',
+      'getHighlightedCellCount',
+      'getHighlightedGroups',
+      'getTotalHighlightedCellCount',
+      'removeHighlightGroup',
+      'toggleHighlightEnabled'
+    ]
+  );
+  requireExactKeys(
+    dom,
+    ['countEl', 'groupsEl', 'clearAllBtn'],
+    'Highlight summary DOM'
+  );
+  const highlightCountEl = requireDomElement(
+    dom.countEl,
+    'Highlight count element'
+  );
+  const highlightedGroupsEl = requireDomElement(
+    dom.groupsEl,
+    'Highlighted groups element',
+    ['appendChild']
+  );
+  const clearAllHighlightsBtn = requireDomElement(
+    dom.clearAllBtn,
+    'Clear highlights button',
+    ['addEventListener']
+  );
+  const documentOwner = globalThis.document;
+  requireMethods(
+    documentOwner,
+    'Highlight summary document',
+    ['createElement']
+  );
+
+  function requireStateOperation(result, label) {
+    if (result !== true) {
+      throw new Error(`${label} was rejected by highlight state.`);
+    }
+  }
 
   function renderHighlightSummary() {
-    if (!highlightedGroupsEl || !highlightCountEl) return;
-
     const groups = state.getHighlightedGroups();
+    if (!Array.isArray(groups)) {
+      throw new TypeError('Highlighted groups must be an array.');
+    }
     const visibleCount = state.getHighlightedCellCount();
-    const totalCount = state.getTotalHighlightedCellCount ? state.getTotalHighlightedCellCount() : visibleCount;
+    const totalCount = state.getTotalHighlightedCellCount();
+    requireSafeInteger(
+      visibleCount,
+      'Visible highlighted cell count',
+      0
+    );
+    requireSafeInteger(totalCount, 'Total highlighted cell count', 0);
+    if (visibleCount > totalCount) {
+      throw new RangeError(
+        'Visible highlighted cell count must not exceed total count.'
+      );
+    }
+    const seenIds = new Set();
+    for (const group of groups) {
+      requireHighlightGroup(group, 'Highlight group');
+      if (seenIds.has(group.id)) {
+        throw new TypeError(
+          'Highlight group ids must be unique.'
+        );
+      }
+      seenIds.add(group.id);
+    }
 
     if (totalCount === 0) {
       highlightCountEl.textContent = 'No cells highlighted';
@@ -35,42 +111,47 @@ export function initHighlightSummaryUI({ state, dom }) {
       highlightCountEl.textContent = `${visibleCount.toLocaleString()} of ${totalCount.toLocaleString()} highlighted cells visible`;
     }
 
-    if (clearAllHighlightsBtn) {
-      clearAllHighlightsBtn.style.display = groups.length > 0 ? 'inline-block' : 'none';
-    }
+    clearAllHighlightsBtn.style.display =
+      groups.length > 0 ? 'inline-block' : 'none';
 
     highlightedGroupsEl.innerHTML = '';
 
     if (groups.length === 0) return;
 
     groups.forEach((group) => {
-      const enabled = group.enabled !== false;
-      const item = document.createElement('div');
+      const enabled = group.enabled;
+      const item = documentOwner.createElement('div');
       item.className = 'highlight-item' + (enabled ? '' : ' disabled');
       item.dataset.highlightId = group.id;
 
-      const checkbox = document.createElement('input');
+      const checkbox = documentOwner.createElement('input');
       checkbox.type = 'checkbox';
       checkbox.className = 'highlight-checkbox';
       checkbox.checked = enabled;
       checkbox.title = enabled ? 'Disable this highlight' : 'Enable this highlight';
       checkbox.addEventListener('change', () => {
-        state.toggleHighlightEnabled(group.id, checkbox.checked);
+        requireStateOperation(
+          state.toggleHighlightEnabled(group.id, checkbox.checked),
+          'Highlight toggle'
+        );
       });
 
-      const textSpan = document.createElement('span');
+      const textSpan = documentOwner.createElement('span');
       textSpan.className = 'highlight-text';
       textSpan.textContent = `${group.label} (${group.cellCount.toLocaleString()})`;
       textSpan.title = group.label;
 
-      const removeBtn = document.createElement('button');
+      const removeBtn = documentOwner.createElement('button');
       removeBtn.type = 'button';
       removeBtn.className = 'highlight-remove-btn';
       removeBtn.innerHTML = '×';
       removeBtn.title = 'Remove this highlight';
       removeBtn.addEventListener('click', (e) => {
         e.stopPropagation();
-        state.removeHighlightGroup(group.id);
+        requireStateOperation(
+          state.removeHighlightGroup(group.id),
+          'Highlight removal'
+        );
       });
 
       item.appendChild(checkbox);
@@ -80,12 +161,9 @@ export function initHighlightSummaryUI({ state, dom }) {
     });
   }
 
-  if (clearAllHighlightsBtn) {
-    clearAllHighlightsBtn.addEventListener('click', () => {
-      state.clearAllHighlights();
-    });
-  }
+  clearAllHighlightsBtn.addEventListener('click', () => {
+    state.clearAllHighlights();
+  });
 
   return { renderHighlightSummary };
 }
-

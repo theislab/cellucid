@@ -359,46 +359,29 @@ bool intersectBox(vec3 ro, vec3 rd, vec3 bMin, vec3 bMax, out float t0, out floa
 
 void main() {
   // 1. Reconstruct world-space ray using inverse view-projection
-  // Use clip space points at near and far planes
   vec4 clipNear = vec4(v_ndc, -1.0, 1.0);
-  vec4 clipFar = vec4(v_ndc, 1.0, 1.0);
-
   vec4 worldNear = u_invViewProj * clipNear;
-  vec4 worldFar = u_invViewProj * clipFar;
 
-  // Check for degenerate perspective divide (w near zero)
-  if (abs(worldNear.w) < 1e-5 || abs(worldFar.w) < 1e-5) {
+  if (abs(worldNear.w) < 1e-5) {
     fragColor = vec4(0.0, 0.0, 0.0, 0.0);
     return;
   }
 
   worldNear.xyz /= worldNear.w;
-  worldFar.xyz /= worldFar.w;
-
-  // Ray from camera through the pixel
-  // Use worldNear - cameraPos for more stable direction at screen edges
   vec3 rayOrigin = u_cameraPos;
-  vec3 rayDir = normalize(worldNear.xyz - u_cameraPos);
-
-  // Additional check: ensure ray direction components are valid (not NaN/Inf)
-  // Also check for near-zero length which indicates numerical issues
-  float rayDirLen = length(rayDir);
-  if (any(isnan(rayDir)) || any(isinf(rayDir)) || rayDirLen < 0.99 || rayDirLen > 1.01) {
-    // Fallback: use far-near direction
-    vec3 rayVec = worldFar.xyz - worldNear.xyz;
-    float rayVecLen = length(rayVec);
-    if (rayVecLen < 1e-5) {
-      fragColor = vec4(0.0, 0.0, 0.0, 0.0);
-      return;
-    }
-    rayDir = rayVec / rayVecLen;
-  }
-
-  // Final validation of ray direction
-  if (any(isnan(rayDir)) || any(isinf(rayDir))) {
+  vec3 rayVec = worldNear.xyz - u_cameraPos;
+  float rayDirLen = length(rayVec);
+  if (
+    any(isnan(rayVec)) ||
+    any(isinf(rayVec)) ||
+    isnan(rayDirLen) ||
+    isinf(rayDirLen) ||
+    rayDirLen < 1e-5
+  ) {
     fragColor = vec4(0.0, 0.0, 0.0, 0.0);
     return;
   }
+  vec3 rayDir = rayVec / rayDirLen;
 
   // 2. Ray-box intersection
   float tEnter, tExit;

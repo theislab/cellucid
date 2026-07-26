@@ -14,8 +14,7 @@
  * // Wrap an async operation with consistent error handling
  * const result = await wrapAsync(
  *   () => fetchData(),
- *   'DataLoader',
- *   'Failed to load gene data'
+ *   'DataLoader'
  * );
  *
  * // Create typed errors
@@ -128,7 +127,13 @@ export const ERROR_MESSAGES = {
  * @returns {string}
  */
 export function getErrorMessage(code) {
-  return ERROR_MESSAGES[code] || ERROR_MESSAGES.ANALYSIS_ERROR;
+  if (typeof code !== 'string' || code.length === 0) {
+    throw new TypeError('Error code must be a non-empty string');
+  }
+  if (!Object.hasOwn(ERROR_MESSAGES, code)) {
+    throw new RangeError(`Unknown error code: ${code}`);
+  }
+  return ERROR_MESSAGES[code];
 }
 
 // =============================================================================
@@ -167,20 +172,13 @@ export function isTimeoutError(error) {
  * @returns {string}
  */
 export function formatErrorForUser(error) {
-  if (!error) return 'An unknown error occurred';
-
-  // Use custom message if available
-  if (error instanceof AnalysisError) {
-    return error.getUserMessage();
+  if (!(error instanceof Error)) {
+    throw new TypeError('An Error instance is required for user formatting');
   }
-
-  // Use error message if it's user-friendly
-  if (error.message && !error.message.includes('Error:')) {
-    return error.message;
+  if (typeof error.message !== 'string' || error.message.length === 0) {
+    throw new TypeError('The error must contain a non-empty message');
   }
-
-  // Fallback to generic message
-  return 'An unexpected error occurred. Please try again.';
+  return error instanceof AnalysisError ? error.getUserMessage() : error.message;
 }
 
 /**
@@ -222,61 +220,27 @@ export function handleError(error, notifications, options = {}) {
  * @template T
  * @param {() => Promise<T>} fn - Async function to wrap
  * @param {string} context - Context for error logging
- * @param {string} [fallbackMessage] - Message if error has no message
  * @returns {Promise<T>} Result of the function
- * @throws {AnalysisError} Re-throws with standardized format
+ * @throws {unknown} Re-throws the original failure object
  *
  * @example
  * const data = await wrapAsync(
  *   () => api.fetchGenes(),
- *   'GeneLoader',
- *   'Failed to load gene list'
+ *   'GeneLoader'
  * );
  */
-export async function wrapAsync(fn, context, fallbackMessage = 'Operation failed') {
-  try {
-    return await fn();
-  } catch (error) {
-    // Re-throw cancellation errors as-is
-    if (isCancellationError(error)) {
-      throw error;
-    }
-
-    // Already an AnalysisError - re-throw
-    if (error instanceof AnalysisError) {
-      debugError(context, error.message, error);
-      throw error;
-    }
-
-    // Wrap in AnalysisError
-    const message = error?.message || fallbackMessage;
-    debugError(context, message, error);
-    throw new AnalysisError(message, 'ANALYSIS_ERROR', { originalError: error });
+export async function wrapAsync(fn, context) {
+  if (typeof fn !== 'function') {
+    throw new TypeError('wrapAsync requires a function');
   }
-}
-
-/**
- * Try an async operation and return null on failure
- *
- * @template T
- * @param {() => Promise<T>} fn - Async function to try
- * @param {string} context - Context for error logging
- * @returns {Promise<T|null>} Result or null on failure
- *
- * @example
- * const data = await tryAsync(() => loadOptionalData(), 'OptionalLoader');
- * if (data) {
- *   // Use data
- * }
- */
-export async function tryAsync(fn, context) {
+  if (typeof context !== 'string' || context.length === 0) {
+    throw new TypeError('wrapAsync context must be a non-empty string');
+  }
   try {
     return await fn();
   } catch (error) {
-    if (!isCancellationError(error)) {
-      debugError(context, 'Operation failed (non-critical)', error);
-    }
-    return null;
+    debugError(context, 'Async operation failed', error);
+    throw error;
   }
 }
 
@@ -316,57 +280,6 @@ export async function withTimeout(fn, timeoutMs, context = 'Operation') {
   }
 }
 
-/**
- * Retry an async operation with exponential backoff
- *
- * @template T
- * @param {() => Promise<T>} fn - Async function to retry
- * @param {Object} [options] - Retry options
- * @param {number} [options.maxAttempts=3] - Maximum retry attempts
- * @param {number} [options.initialDelayMs=1000] - Initial delay between retries
- * @param {number} [options.maxDelayMs=10000] - Maximum delay between retries
- * @param {string} [options.context] - Context for logging
- * @returns {Promise<T>}
- *
- * @example
- * const data = await retry(
- *   () => unstableApi.fetch(),
- *   { maxAttempts: 3, context: 'UnstableAPI' }
- * );
- */
-export async function retry(fn, options = {}) {
-  const {
-    maxAttempts = 3,
-    initialDelayMs = 1000,
-    maxDelayMs = 10000,
-    context = 'Retry'
-  } = options;
-
-  let lastError;
-  let delay = initialDelayMs;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      return await fn();
-    } catch (error) {
-      lastError = error;
-
-      // Don't retry cancellations or timeouts
-      if (isCancellationError(error) || isTimeoutError(error)) {
-        throw error;
-      }
-
-      if (attempt < maxAttempts) {
-        debug(context, `Attempt ${attempt} failed, retrying in ${delay}ms...`);
-        await new Promise(resolve => setTimeout(resolve, delay));
-        delay = Math.min(delay * 2, maxDelayMs);
-      }
-    }
-  }
-
-  throw lastError;
-}
-
 // =============================================================================
 // DEFAULT EXPORT
 // =============================================================================
@@ -388,7 +301,5 @@ export default {
   handleError,
   // Async wrappers
   wrapAsync,
-  tryAsync,
-  withTimeout,
-  retry
+  withTimeout
 };

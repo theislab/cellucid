@@ -24,6 +24,169 @@ import { escapeHtml } from './utils/dom-utils.js';
 // Singleton instance
 let instance = null;
 
+const NOTIFICATION_TYPES = new Set(Object.values(NotificationType));
+const ACTIVE_NOTIFICATION_TYPES = new Set([
+  NotificationType.LOADING,
+  NotificationType.PROGRESS
+]);
+const TERMINAL_NOTIFICATION_TYPES = new Set([
+  NotificationType.SUCCESS,
+  NotificationType.ERROR
+]);
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const NOTIFICATION_OPTION_KEYS = new Set([
+  'category',
+  'dismissible',
+  'duration',
+  'id',
+  'message',
+  'onCancel',
+  'progress',
+  'speed',
+  'title',
+  'type'
+]);
+
+function isPlainObject(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function requireNonEmptyString(value, name) {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new TypeError(`${name} must be a non-empty string.`);
+  }
+  return value;
+}
+
+function requireCategoryName(value, name) {
+  requireNonEmptyString(value, name);
+  if (!/^[a-z][a-z0-9-]*$/.test(value)) {
+    throw new TypeError(
+      `${name} must use lowercase letters, digits, and hyphens.`
+    );
+  }
+  return value;
+}
+
+function requireFiniteRange(value, name, minimum, maximum) {
+  if (!Number.isFinite(value) || value < minimum || value > maximum) {
+    throw new TypeError(
+      `${name} must be a finite number between ${minimum} and ${maximum}.`
+    );
+  }
+  return value;
+}
+
+function assertNotificationOptions(options, { partial = false } = {}) {
+  if (!isPlainObject(options)) {
+    throw new TypeError('Notification options must be a plain object.');
+  }
+  for (const key of Object.keys(options)) {
+    if (!NOTIFICATION_OPTION_KEYS.has(key)) {
+      throw new TypeError(`Unknown notification option "${key}".`);
+    }
+  }
+  if (Object.hasOwn(options, 'id')) {
+    requireNonEmptyString(options.id, 'Notification id');
+  }
+  if (Object.hasOwn(options, 'type') && !NOTIFICATION_TYPES.has(options.type)) {
+    throw new TypeError(`Unknown notification type "${options.type}".`);
+  }
+  if (Object.hasOwn(options, 'category')) {
+    requireCategoryName(options.category, 'Notification category');
+    if (!Object.hasOwn(CategoryIcons, options.category)) {
+      throw new TypeError(
+        `Unknown notification category "${options.category}". Register it before use.`
+      );
+    }
+  }
+  for (const key of ['title', 'message']) {
+    if (Object.hasOwn(options, key) && typeof options[key] !== 'string') {
+      throw new TypeError(`Notification ${key} must be a string.`);
+    }
+  }
+  if (
+    Object.hasOwn(options, 'progress') &&
+    options.progress !== null
+  ) {
+    requireFiniteRange(options.progress, 'Notification progress', 0, 100);
+  }
+  if (Object.hasOwn(options, 'speed')) {
+    requireFiniteRange(
+      options.speed,
+      'Notification speed',
+      0,
+      Number.MAX_SAFE_INTEGER
+    );
+  }
+  if (
+    Object.hasOwn(options, 'dismissible') &&
+    typeof options.dismissible !== 'boolean'
+  ) {
+    throw new TypeError('Notification dismissible must be a boolean.');
+  }
+  if (
+    Object.hasOwn(options, 'onCancel') &&
+    options.onCancel !== null &&
+    typeof options.onCancel !== 'function'
+  ) {
+    throw new TypeError('Notification onCancel must be a function or null.');
+  }
+  if (Object.hasOwn(options, 'duration')) {
+    requireFiniteRange(
+      options.duration,
+      'Notification duration',
+      0,
+      MAX_TIMER_DELAY_MS
+    );
+  }
+
+  if (!partial) {
+    const type = options.type ?? NotificationType.INFO;
+    if (
+      (Object.hasOwn(options, 'progress') || Object.hasOwn(options, 'speed')) &&
+      type !== NotificationType.LOADING &&
+      type !== NotificationType.PROGRESS
+    ) {
+      throw new TypeError(
+        'Notification progress and speed are only valid for loading or progress notifications.'
+      );
+    }
+    if (
+      options.onCancel !== undefined &&
+      options.onCancel !== null &&
+      type !== NotificationType.LOADING &&
+      type !== NotificationType.PROGRESS
+    ) {
+      throw new TypeError(
+        'Notification onCancel is only valid for loading or progress notifications.'
+      );
+    }
+  }
+}
+
+function assertMethodOptions(options, methodName, reservedKeys) {
+  assertNotificationOptions(options, { partial: true });
+  for (const key of reservedKeys) {
+    if (Object.hasOwn(options, key)) {
+      throw new TypeError(
+        `${methodName} options cannot replace the owned "${key}" field.`
+      );
+    }
+  }
+}
+
+function describeThrownError(error) {
+  if (error instanceof Error && error.message.length > 0) {
+    return error.message;
+  }
+  return 'the handler threw a non-Error value';
+}
+
 class NotificationCenter {
   constructor() {
     this.container = null;
@@ -48,6 +211,17 @@ class NotificationCenter {
    */
   init() {
     if (this.initialized) return;
+    if (
+      typeof document !== 'object' ||
+      document === null ||
+      typeof document.createElement !== 'function' ||
+      document.body === null ||
+      typeof document.body?.appendChild !== 'function'
+    ) {
+      throw new TypeError(
+        'NotificationCenter requires a document with an appendable body.'
+      );
+    }
 
     // Create container
     this.container = document.createElement('div');
@@ -74,6 +248,7 @@ class NotificationCenter {
    * Create notification element
    */
   _createNotificationElement(id, options) {
+    assertNotificationOptions(options);
     const {
       type = NotificationType.INFO,
       category = 'default',
@@ -91,10 +266,10 @@ class NotificationCenter {
     el.dataset.type = type;
 
     // Icon
-    const icon = CategoryIcons[category] || CategoryIcons.default;
+    const icon = CategoryIcons[category];
 
-    const safeTitle = title ? escapeHtml(String(title)) : '';
-    const safeMessage = message ? escapeHtml(String(message)) : '';
+    const safeTitle = title ? escapeHtml(title) : '';
+    const safeMessage = message ? escapeHtml(message) : '';
 
     // Build content
     let html = `
@@ -143,19 +318,16 @@ class NotificationCenter {
 
     if (progressBarWidth) {
       const progressBar = el.querySelector('.notification-progress-bar');
-      if (progressBar) progressBar.style.width = progressBarWidth;
+      if (progressBar === null) {
+        throw new Error('Notification progress bar was not created.');
+      }
+      progressBar.style.width = progressBarWidth;
     }
 
     const cancelBtn = el.querySelector('.notification-dismiss[data-role="cancel"]');
-    if (cancelBtn && typeof onCancel === 'function') {
+    if (cancelBtn !== null) {
       cancelBtn.addEventListener('click', () => {
-        try {
-          cancelBtn.disabled = true;
-          cancelBtn.setAttribute('aria-disabled', 'true');
-        } catch { /* ignore */ }
-        try { onCancel(); } catch (err) {
-          console.warn('[NotificationCenter] Cancel handler failed:', err);
-        }
+        void this._runCancelHandler(cancelBtn, onCancel);
       });
     }
 
@@ -168,14 +340,51 @@ class NotificationCenter {
   }
 
   /**
+   * Run a cancellation handler and publish its exact terminal outcome.
+   * @param {HTMLButtonElement} cancelButton
+   * @param {() => void|Promise<void>} onCancel
+   * @returns {Promise<boolean>} true when cancellation was accepted
+   */
+  async _runCancelHandler(cancelButton, onCancel) {
+    if (
+      cancelButton === null ||
+      typeof cancelButton !== 'object' ||
+      typeof cancelButton.setAttribute !== 'function' ||
+      typeof cancelButton.removeAttribute !== 'function'
+    ) {
+      throw new TypeError('Cancel button must support DOM attributes.');
+    }
+    if (typeof onCancel !== 'function') {
+      throw new TypeError('Cancel handler must be a function.');
+    }
+
+    cancelButton.disabled = true;
+    cancelButton.setAttribute('aria-disabled', 'true');
+
+    try {
+      await onCancel();
+      return true;
+    } catch (error) {
+      cancelButton.disabled = false;
+      cancelButton.removeAttribute('aria-disabled');
+      this.error(`Cancel failed: ${describeThrownError(error)}`, {
+        category: 'default',
+        title: 'Cancellation Error'
+      });
+      return false;
+    }
+  }
+
+  /**
    * Show a notification
    * @param {Object} options - Notification options
    * @returns {string} Notification ID for updates/dismissal
    */
   show(options) {
+    assertNotificationOptions(options, { partial: true });
     if (!this.initialized) this.init();
 
-    const id = options.id || this._generateId();
+    const id = options.id ?? this._generateId();
     const existingNotif = this.notifications.get(id);
 
     // Update existing notification
@@ -195,21 +404,34 @@ class NotificationCenter {
     this.container.appendChild(el);
 
     // Store reference
-    this.notifications.set(id, {
+    const storedOptions = {
+      ...options,
+      type: options.type ?? NotificationType.INFO,
+      category: options.category ?? 'default',
+      dismissible: options.dismissible ?? true
+    };
+    const notification = {
       element: el,
-      options: { ...options },
-      startTime: performance.now()
-    });
+      options: storedOptions,
+      startTime: performance.now(),
+      dismissTimer: null
+    };
+    this.notifications.set(id, notification);
 
     // Trigger enter animation
     requestAnimationFrame(() => {
-      el.classList.add('notification-enter');
+      if (this.notifications.get(id) === notification) {
+        el.classList.add('notification-enter');
+      }
     });
 
     // Auto-dismiss for non-persistent types
-    const duration = options.duration !== undefined ? options.duration : this.defaultDuration;
-    if (duration && options.type !== NotificationType.LOADING && options.type !== NotificationType.PROGRESS) {
-      setTimeout(() => this.dismiss(id), duration);
+    const duration = options.duration ?? this.defaultDuration;
+    if (
+      duration > 0 &&
+      !ACTIVE_NOTIFICATION_TYPES.has(storedOptions.type)
+    ) {
+      this._scheduleDismiss(id, notification, duration);
     }
 
     return id;
@@ -219,41 +441,123 @@ class NotificationCenter {
    * Update an existing notification
    */
   _updateNotification(id, options) {
+    requireNonEmptyString(id, 'Notification id');
+    assertNotificationOptions(options, { partial: true });
     const notif = this.notifications.get(id);
-    if (!notif) return;
+    if (!notif) {
+      throw new RangeError(`Notification "${id}" does not exist.`);
+    }
+    if (Object.hasOwn(options, 'id') && options.id !== id) {
+      throw new TypeError('Notification update id must equal its owner id.');
+    }
+
+    const currentType = notif.options.type;
+    const nextType = options.type ?? currentType;
+    const typeChanged = nextType !== currentType;
+    if (
+      typeChanged &&
+      !(
+        ACTIVE_NOTIFICATION_TYPES.has(currentType) &&
+        (
+          ACTIVE_NOTIFICATION_TYPES.has(nextType) ||
+          TERMINAL_NOTIFICATION_TYPES.has(nextType)
+        )
+      )
+    ) {
+      throw new Error(
+        `Notification type cannot transition from "${currentType}" to "${nextType}".`
+      );
+    }
+    if (
+      (
+        Object.hasOwn(options, 'progress') ||
+        Object.hasOwn(options, 'speed') ||
+        (
+          Object.hasOwn(options, 'onCancel') &&
+          options.onCancel !== null
+        )
+      ) &&
+      !ACTIVE_NOTIFICATION_TYPES.has(nextType)
+    ) {
+      throw new TypeError(
+        'Notification progress, speed, and cancellation require an active notification type.'
+      );
+    }
+    for (const key of ['dismissible', 'onCancel']) {
+      if (
+        Object.hasOwn(options, key) &&
+        options[key] !== notif.options[key]
+      ) {
+        throw new TypeError(
+          `Notification updates cannot replace the "${key}" owner.`
+        );
+      }
+    }
 
     const { element } = notif;
 
+    if (
+      Object.hasOwn(options, 'category') &&
+      options.category !== notif.options.category
+    ) {
+      const iconElement = element.querySelector('.notification-icon');
+      if (iconElement === null) {
+        throw new Error(`Notification "${id}" has no icon element.`);
+      }
+      iconElement.textContent = CategoryIcons[options.category];
+    }
+
     // Update message
     if (options.message !== undefined) {
-      const msgEl = element.querySelector('.notification-message');
-      if (msgEl) msgEl.textContent = options.message;
+      let msgEl = element.querySelector('.notification-message');
+      if (msgEl === null) {
+        msgEl = document.createElement('div');
+        msgEl.className = 'notification-message';
+        const content = element.querySelector('.notification-content');
+        if (content === null) {
+          throw new Error(`Notification "${id}" has no content element.`);
+        }
+        content.appendChild(msgEl);
+      }
+      msgEl.textContent = options.message;
     }
 
     // Update title
     if (options.title !== undefined) {
-      const titleEl = element.querySelector('.notification-title');
-      if (titleEl) titleEl.textContent = options.title;
+      let titleEl = element.querySelector('.notification-title');
+      if (titleEl === null) {
+        titleEl = document.createElement('div');
+        titleEl.className = 'notification-title';
+        const content = element.querySelector('.notification-content');
+        if (content === null) {
+          throw new Error(`Notification "${id}" has no content element.`);
+        }
+        content.prepend(titleEl);
+      }
+      titleEl.textContent = options.title;
     }
 
     // Update progress - only update bar when progress is a valid number
     // When progress is null (unknown total size), keep the indeterminate state
     if (options.progress !== undefined) {
       const progressBar = element.querySelector('.notification-progress-bar');
-      if (progressBar) {
-        if (options.progress !== null && typeof options.progress === 'number') {
-          // Known progress: show determinate bar with percentage width
-          progressBar.classList.remove('indeterminate');
-          progressBar.style.width = options.progress + '%';
-        } else {
-          // Unknown progress (null): ensure indeterminate mode
-          progressBar.classList.add('indeterminate');
-          progressBar.style.width = '100%';
-        }
+      if (progressBar === null) {
+        throw new Error(
+          `Notification "${id}" cannot publish progress because it has no progress bar.`
+        );
+      }
+      if (options.progress !== null) {
+        // Known progress: show determinate bar with percentage width
+        progressBar.classList.remove('indeterminate');
+        progressBar.style.width = options.progress + '%';
+      } else {
+        // Unknown progress (null): ensure indeterminate mode
+        progressBar.classList.add('indeterminate');
+        progressBar.style.width = '100%';
       }
       const progressText = element.querySelector('.notification-progress-text');
       if (progressText) {
-        if (options.progress !== null && typeof options.progress === 'number') {
+        if (options.progress !== null) {
           progressText.textContent = Math.round(options.progress) + '%';
         } else {
           // Hide percentage text when progress is unknown
@@ -268,19 +572,22 @@ class NotificationCenter {
       if (!speedEl) {
         speedEl = document.createElement('div');
         speedEl.className = 'notification-speed';
-        element.querySelector('.notification-content').appendChild(speedEl);
+        const content = element.querySelector('.notification-content');
+        if (content === null) {
+          throw new Error(`Notification "${id}" has no content element.`);
+        }
+        content.appendChild(speedEl);
       }
       speedEl.textContent = formatBytes(options.speed) + '/s';
     }
 
     // Update type (e.g., loading -> success)
-    if (options.type !== undefined && options.type !== notif.options.type) {
+    if (typeChanged) {
       element.className = `notification notification-${options.type} notification-enter`;
       element.dataset.type = options.type;
-      notif.options.type = options.type;
 
       // Remove progress bar if switching to success/error
-      if (options.type === NotificationType.SUCCESS || options.type === NotificationType.ERROR) {
+      if (TERMINAL_NOTIFICATION_TYPES.has(options.type)) {
         const progressContainer = element.querySelector('.notification-progress-container');
         if (progressContainer) progressContainer.remove();
         const speedEl = element.querySelector('.notification-speed');
@@ -291,7 +598,7 @@ class NotificationCenter {
         // Replace "cancel" with a standard dismiss button.
         const existingBtn = element.querySelector('.notification-dismiss');
         if (existingBtn?.dataset?.role === 'cancel') {
-          try { existingBtn.remove(); } catch { /* ignore */ }
+          existingBtn.remove();
         }
 
         // Add dismiss button if not present (completion/failure is always dismissible).
@@ -306,25 +613,67 @@ class NotificationCenter {
         }
 
         // Auto-dismiss
-        const duration = options.duration || this.defaultDuration;
-        setTimeout(() => this.dismiss(id), duration);
+        const duration = options.duration ?? this.defaultDuration;
+        this._scheduleDismiss(id, notif, duration);
       }
+    } else if (
+      TERMINAL_NOTIFICATION_TYPES.has(nextType) &&
+      Object.hasOwn(options, 'duration')
+    ) {
+      this._scheduleDismiss(id, notif, options.duration);
     }
 
     // Update stored options
-    notif.options = { ...notif.options, ...options };
+    const nextOptions = { ...notif.options, ...options };
+    if (TERMINAL_NOTIFICATION_TYPES.has(nextType)) {
+      delete nextOptions.progress;
+      delete nextOptions.speed;
+      delete nextOptions.onCancel;
+      nextOptions.dismissible = true;
+    }
+    notif.options = nextOptions;
+  }
+
+  /**
+   * Own the sole auto-dismiss timer for one notification generation.
+   */
+  _scheduleDismiss(id, notification, duration) {
+    requireFiniteRange(
+      duration,
+      'Notification duration',
+      0,
+      MAX_TIMER_DELAY_MS
+    );
+    if (notification.dismissTimer !== null) {
+      clearTimeout(notification.dismissTimer);
+      notification.dismissTimer = null;
+    }
+    if (duration === 0) return;
+    notification.dismissTimer = setTimeout(() => {
+      notification.dismissTimer = null;
+      if (this.notifications.get(id) === notification) {
+        this.dismiss(id);
+      }
+    }, duration);
   }
 
   /**
    * Dismiss a notification
    */
   dismiss(id) {
+    requireNonEmptyString(id, 'Notification id');
     const notif = this.notifications.get(id);
-    if (!notif) return;
+    if (!notif) return false;
 
     const { element } = notif;
+    this.notifications.delete(id);
+    if (notif.dismissTimer !== null) {
+      clearTimeout(notif.dismissTimer);
+      notif.dismissTimer = null;
+    }
 
     // Trigger exit animation
+    element.removeAttribute('id');
     element.classList.remove('notification-enter');
     element.classList.add('notification-exit');
 
@@ -333,8 +682,8 @@ class NotificationCenter {
       if (element.parentNode) {
         element.parentNode.removeChild(element);
       }
-      this.notifications.delete(id);
     }, 300);
+    return true;
   }
 
   /**
@@ -354,10 +703,12 @@ class NotificationCenter {
    * Show info notification
    */
   info(message, options = {}) {
+    requireNonEmptyString(message, 'Info notification message');
+    assertMethodOptions(options, 'info()', ['message', 'type']);
     return this.show({
+      ...options,
       type: NotificationType.INFO,
-      message,
-      ...options
+      message
     });
   }
 
@@ -365,10 +716,12 @@ class NotificationCenter {
    * Show success notification
    */
   success(message, options = {}) {
+    requireNonEmptyString(message, 'Success notification message');
+    assertMethodOptions(options, 'success()', ['message', 'type']);
     return this.show({
+      ...options,
       type: NotificationType.SUCCESS,
-      message,
-      ...options
+      message
     });
   }
 
@@ -376,11 +729,13 @@ class NotificationCenter {
    * Show error notification
    */
   error(message, options = {}) {
+    requireNonEmptyString(message, 'Error notification message');
+    assertMethodOptions(options, 'error()', ['message', 'type']);
     return this.show({
+      ...options,
       type: NotificationType.ERROR,
       message,
-      duration: 6000, // Errors stay longer
-      ...options
+      duration: options.duration ?? 6000
     });
   }
 
@@ -388,11 +743,13 @@ class NotificationCenter {
    * Show warning notification
    */
   warning(message, options = {}) {
+    requireNonEmptyString(message, 'Warning notification message');
+    assertMethodOptions(options, 'warning()', ['message', 'type']);
     return this.show({
+      ...options,
       type: NotificationType.WARNING,
       message,
-      duration: 5000,
-      ...options
+      duration: options.duration ?? 5000
     });
   }
 
@@ -400,10 +757,12 @@ class NotificationCenter {
    * Start a loading notification (indeterminate progress)
    */
   loading(message, options = {}) {
+    requireNonEmptyString(message, 'Loading notification message');
+    assertMethodOptions(options, 'loading()', ['message', 'type']);
     return this.show({
+      ...options,
       type: NotificationType.LOADING,
-      message,
-      ...options
+      message
     });
   }
 
@@ -411,11 +770,17 @@ class NotificationCenter {
    * Start a progress notification
    */
   progress(message, progressValue = 0, options = {}) {
+    requireNonEmptyString(message, 'Progress notification message');
+    assertMethodOptions(
+      options,
+      'progress()',
+      ['message', 'progress', 'type']
+    );
     return this.show({
+      ...options,
       type: NotificationType.PROGRESS,
       message,
-      progress: progressValue,
-      ...options
+      progress: progressValue
     });
   }
 
@@ -423,9 +788,14 @@ class NotificationCenter {
    * Update progress on an existing notification
    */
   updateProgress(id, progressValue, options = {}) {
+    assertMethodOptions(
+      options,
+      'updateProgress()',
+      ['id', 'progress', 'type']
+    );
     this._updateNotification(id, {
-      progress: progressValue,
-      ...options
+      ...options,
+      progress: progressValue
     });
   }
 
@@ -433,10 +803,16 @@ class NotificationCenter {
    * Complete a progress/loading notification with success
    */
   complete(id, message, options = {}) {
+    requireNonEmptyString(message, 'Completion notification message');
+    assertMethodOptions(
+      options,
+      'complete()',
+      ['id', 'message', 'type']
+    );
     this._updateNotification(id, {
+      ...options,
       type: NotificationType.SUCCESS,
-      message,
-      ...options
+      message
     });
   }
 
@@ -444,10 +820,12 @@ class NotificationCenter {
    * Fail a progress/loading notification with error
    */
   fail(id, message, options = {}) {
+    requireNonEmptyString(message, 'Failure notification message');
+    assertMethodOptions(options, 'fail()', ['id', 'message', 'type']);
     this._updateNotification(id, {
+      ...options,
       type: NotificationType.ERROR,
-      message,
-      ...options
+      message
     });
   }
 
@@ -462,6 +840,8 @@ class NotificationCenter {
    * @returns {string} Notification ID
    */
   startCalculation(name, category = 'calculation') {
+    requireNonEmptyString(name, 'Calculation name');
+    requireCategoryName(category, 'Calculation category');
     return this.show({
       type: NotificationType.LOADING,
       category,
@@ -474,7 +854,10 @@ class NotificationCenter {
    * Complete a calculation
    */
   completeCalculation(id, message, duration = null) {
-    const finalMessage = duration ? `${message} (${formatDuration(duration)})` : message;
+    requireNonEmptyString(message, 'Calculation completion message');
+    const finalMessage = duration !== null
+      ? `${message} (${formatDuration(duration)})`
+      : message;
     this.complete(id, finalMessage);
   }
 
@@ -482,6 +865,7 @@ class NotificationCenter {
    * Fail a calculation
    */
   failCalculation(id, errorMessage) {
+    requireNonEmptyString(errorMessage, 'Calculation error message');
     this.fail(id, errorMessage);
   }
 
@@ -496,6 +880,8 @@ class NotificationCenter {
    * @param {string} icon - Unicode icon character
    */
   registerCategory(category, icon) {
+    requireCategoryName(category, 'Notification category');
+    requireNonEmptyString(icon, 'Notification icon');
     CategoryIcons[category] = icon;
   }
 
@@ -516,7 +902,36 @@ class NotificationCenter {
    * @returns {Promise<Array>} Results from all operations
    */
   async batch(items, operation, options = {}) {
+    if (!Array.isArray(items)) {
+      throw new TypeError('Notification batch items must be an array.');
+    }
+    if (typeof operation !== 'function') {
+      throw new TypeError('Notification batch operation must be a function.');
+    }
+    if (!isPlainObject(options)) {
+      throw new TypeError('Notification batch options must be a plain object.');
+    }
+    for (const key of Object.keys(options)) {
+      if (key !== 'category' && key !== 'parallel') {
+        throw new TypeError(`Unknown notification batch option "${key}".`);
+      }
+    }
     const { category = 'data', parallel = true } = options;
+    requireNonEmptyString(category, 'Notification batch category');
+    if (!Object.hasOwn(CategoryIcons, category)) {
+      throw new TypeError(
+        `Unknown notification category "${category}". Register it before use.`
+      );
+    }
+    if (typeof parallel !== 'boolean') {
+      throw new TypeError('Notification batch parallel must be a boolean.');
+    }
+    for (const [index, item] of items.entries()) {
+      if (!isPlainObject(item)) {
+        throw new TypeError(`Notification batch item ${index} must be a plain object.`);
+      }
+      requireNonEmptyString(item.name, `Notification batch item ${index} name`);
+    }
     const results = [];
 
     if (parallel) {
@@ -527,7 +942,7 @@ class NotificationCenter {
           this.complete(id, `${item.name} complete`);
           return result;
         } catch (error) {
-          this.fail(id, `${item.name}: ${error.message}`);
+          this.fail(id, `${item.name}: ${describeThrownError(error)}`);
           throw error;
         }
       });
@@ -541,7 +956,7 @@ class NotificationCenter {
         this.complete(id, `${item.name} complete`);
         results.push(result);
       } catch (error) {
-        this.fail(id, `${item.name}: ${error.message}`);
+        this.fail(id, `${item.name}: ${describeThrownError(error)}`);
         throw error;
       }
     }

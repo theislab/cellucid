@@ -15,44 +15,55 @@
 
 import { PlotFactory, PlotRegistry, BasePlot, COMMON_HOVER_STYLE } from '../plot-factory.js';
 import { getPlotTheme } from '../../shared/plot-theme.js';
-import { getMatrixMinMax } from '../../shared/matrix-utils.js';
 
 function truncateLabel(label, maxLen) {
-  const text = String(label ?? '');
-  if (!Number.isFinite(maxLen) || maxLen <= 0) return text;
-  if (text.length <= maxLen) return text;
+  if (typeof label !== 'string') {
+    throw new TypeError('Heatmap labels must be strings');
+  }
+  if (!Number.isSafeInteger(maxLen) || maxLen < 2) {
+    throw new RangeError('Heatmap label length must be an integer of at least 2');
+  }
+  if (label.length <= maxLen) return label;
   if (maxLen <= 1) return '…';
   const keep = maxLen - 1;
   const head = Math.ceil(keep / 2);
   const tail = Math.floor(keep / 2);
-  return text.slice(0, head) + '…' + (tail > 0 ? text.slice(text.length - tail) : '');
+  return label.slice(0, head) + '…' + label.slice(label.length - tail);
 }
 
 function buildSparseTicks(labels, maxTicks, truncateLen = null) {
-  const items = Array.isArray(labels) ? labels : [];
-  const n = items.length;
+  if (!Array.isArray(labels) || labels.some(label => typeof label !== 'string')) {
+    throw new TypeError('Heatmap tick labels must be an array of strings');
+  }
+  if (!Number.isSafeInteger(maxTicks) || maxTicks < 2) {
+    throw new RangeError('Heatmap maximum tick count must be an integer of at least 2');
+  }
+  if (truncateLen !== null && (!Number.isSafeInteger(truncateLen) || truncateLen < 2)) {
+    throw new RangeError('Heatmap tick truncation length must be null or an integer of at least 2');
+  }
+  const items = labels;
+  const n = labels.length;
   if (n === 0) return {};
 
-  const max = Number.isFinite(maxTicks) ? Math.max(2, Math.floor(maxTicks)) : n;
-  if (n <= max) {
+  if (n <= maxTicks) {
     return truncateLen
       ? { tickmode: 'array', tickvals: items, ticktext: items.map((l) => truncateLabel(l, truncateLen)) }
       : {};
   }
 
-  const step = Math.ceil(n / max);
+  const step = Math.ceil(n / maxTicks);
   const tickvals = [];
   const ticktext = [];
   for (let i = 0; i < n; i += step) {
     const v = items[i];
     tickvals.push(v);
-    ticktext.push(truncateLen ? truncateLabel(v, truncateLen) : String(v ?? ''));
+    ticktext.push(truncateLen ? truncateLabel(v, truncateLen) : v);
   }
 
   // Ensure the final label is included for context.
   if (tickvals[tickvals.length - 1] !== items[n - 1]) {
     tickvals.push(items[n - 1]);
-    ticktext.push(truncateLen ? truncateLabel(items[n - 1], truncateLen) : String(items[n - 1] ?? ''));
+    ticktext.push(truncateLen ? truncateLabel(items[n - 1], truncateLen) : items[n - 1]);
   }
 
   return { tickmode: 'array', tickvals, ticktext };
@@ -148,7 +159,7 @@ const geneHeatmapDefinition = {
       min: -6,
       max: 6,
       step: 0.1,
-      showWhen: (opts) => opts?.rangeMode === 'fixed' || opts?.rangeMode === 'zscore'
+      showWhen: (opts) => opts?.rangeMode === 'fixed'
     },
     zmax: {
       type: 'range',
@@ -156,7 +167,7 @@ const geneHeatmapDefinition = {
       min: -6,
       max: 6,
       step: 0.1,
-      showWhen: (opts) => opts?.rangeMode === 'fixed' || opts?.rangeMode === 'zscore'
+      showWhen: (opts) => opts?.rangeMode === 'fixed'
     }
   },
 
@@ -169,21 +180,55 @@ const geneHeatmapDefinition = {
    */
   buildTraces(data, options) {
     const {
-      colorscale = 'RdBu',
-      showValues = false,
-      reverseColorscale = true,
-      rangeMode = 'auto',
+      colorscale,
+      showValues,
+      reverseColorscale,
+      rangeMode,
       zmin,
       zmax
     } = options;
+    if (typeof colorscale !== 'string' || colorscale.length === 0) {
+      throw new TypeError('Heatmap colorscale must be a non-empty string');
+    }
+    if (typeof showValues !== 'boolean' || typeof reverseColorscale !== 'boolean') {
+      throw new TypeError('Heatmap display options must be booleans');
+    }
+    if (!['auto', 'zscore', 'fixed'].includes(rangeMode)) {
+      throw new RangeError(`Unknown heatmap rangeMode: ${String(rangeMode)}`);
+    }
 
     const theme = getPlotTheme();
 
     const { values, genes, groupNames, nRows, nCols } = data.matrix;
-    const transform = data.matrix.transform || 'none';
-    const clustering = data?.clustering || null;
-    const showRowDendrogram = options?.showRowDendrogram !== false;
-    const showColDendrogram = options?.showColDendrogram !== false;
+    const transform = data.matrix.transform;
+    if (!['none', 'zscore', 'log1p'].includes(transform)) {
+      throw new RangeError(`Unknown heatmap matrix transform: ${String(transform)}`);
+    }
+    if (!Number.isSafeInteger(nRows) || nRows < 1 || !Number.isSafeInteger(nCols) || nCols < 1) {
+      throw new RangeError('Heatmap matrix dimensions must be positive integers');
+    }
+    if ((!Array.isArray(values) && !ArrayBuffer.isView(values)) || values.length !== nRows * nCols) {
+      throw new TypeError('Heatmap matrix values must match nRows × nCols exactly');
+    }
+    if (!Array.isArray(genes) || genes.length !== nRows || genes.some(gene => typeof gene !== 'string')) {
+      throw new TypeError('Heatmap genes must contain one string for every matrix row');
+    }
+    if (
+      !Array.isArray(groupNames) ||
+      groupNames.length !== nCols ||
+      groupNames.some(group => typeof group !== 'string')
+    ) {
+      throw new TypeError('Heatmap groupNames must contain one string for every matrix column');
+    }
+    const clustering = data.clustering === undefined ? null : data.clustering;
+    if (clustering !== null && (typeof clustering !== 'object' || Array.isArray(clustering))) {
+      throw new TypeError('Heatmap clustering must be an object or null');
+    }
+    const showRowDendrogram = options.showRowDendrogram;
+    const showColDendrogram = options.showColDendrogram;
+    if (typeof showRowDendrogram !== 'boolean' || typeof showColDendrogram !== 'boolean') {
+      throw new TypeError('Heatmap dendrogram display options must be booleans');
+    }
 
     // Convert Float32Array to 2D array for Plotly.
     // Display is transposed: groups (rows) x genes (cols).
@@ -219,36 +264,17 @@ const geneHeatmapDefinition = {
     // toggling "Show values"), so prioritize correctness over GPU acceleration.
     const traceType = 'heatmap';
 
-    // Color range strategy:
-    // - 'auto' always uses Plotly autoscale (even for z-score), so the user can truly revert.
-    // - 'zscore' uses a symmetric fixed range so colors are comparable across runs.
-    // - 'fixed' uses user-specified zmin/zmax (or falls back to data min/max).
-    const mode = (rangeMode === 'fixed' || rangeMode === 'zscore' || rangeMode === 'auto')
-      ? rangeMode
-      : 'auto';
-    const effectiveMode = mode;
-    const wantsFixed = effectiveMode !== 'auto';
-
-    let traceZmin;
-    let traceZmax;
-    let zauto = !wantsFixed;
-
-    if (wantsFixed) {
-      const fallback = effectiveMode === 'zscore'
-        ? { min: -3, max: 3 }
-        : getMatrixMinMax(values);
-
-      const minVal = Number.isFinite(zmin) ? zmin : fallback.min;
-      const maxVal = Number.isFinite(zmax) ? zmax : fallback.max;
-
-      // Ensure a valid range; fall back to autoscale if not.
-      if (Number.isFinite(minVal) && Number.isFinite(maxVal) && minVal < maxVal) {
-        traceZmin = minVal;
-        traceZmax = maxVal;
-        zauto = false;
-      } else {
-        zauto = true;
+    let colorRange = { zauto: true };
+    if (rangeMode === 'zscore') {
+      colorRange = { zauto: false, zmin: -3, zmax: 3 };
+    } else if (rangeMode === 'fixed') {
+      if (!Number.isFinite(zmin) || !Number.isFinite(zmax)) {
+        throw new TypeError('Fixed heatmap range requires finite zmin and zmax');
       }
+      if (zmin >= zmax) {
+        throw new RangeError('Fixed heatmap range requires zmin less than zmax');
+      }
+      colorRange = { zauto: false, zmin, zmax };
     }
 
     const trace = {
@@ -258,7 +284,7 @@ const geneHeatmapDefinition = {
       y: groupNames,
       colorscale,
       reversescale: reverseColorscale,
-      ...(zauto ? { zauto: true } : { zmin: traceZmin, zmax: traceZmax }),
+      ...colorRange,
       showscale: true,
       colorbar: {
         orientation: 'h',
@@ -301,40 +327,45 @@ const geneHeatmapDefinition = {
     traces.push(trace);
 
     const pushDendrogramTraces = (dendrogram, order, axisName) => {
-      if (!dendrogram || !Array.isArray(order) || order.length === 0) return;
+      if (!dendrogram || typeof dendrogram !== 'object') {
+        throw new TypeError(`Heatmap ${axisName} dendrogram root is required`);
+      }
+      if (!Array.isArray(order) || order.length === 0) {
+        throw new TypeError(`Heatmap ${axisName} dendrogram order is required`);
+      }
+      if (new Set(order).size !== order.length) {
+        throw new TypeError(`Heatmap ${axisName} dendrogram order must contain unique leaf IDs`);
+      }
 
       const leafPos = new Map();
       for (let i = 0; i < order.length; i++) {
         leafPos.set(order[i], i);
       }
 
-      let maxHeight = 0;
-      const stack = [dendrogram];
-      while (stack.length) {
-        const node = stack.pop();
-        if (!node) continue;
-        if (Number.isFinite(node.height)) maxHeight = Math.max(maxHeight, node.height);
-        if (!node.isLeaf) {
-          if (node.left) stack.push(node.left);
-          if (node.right) stack.push(node.right);
-        }
-      }
-      maxHeight = maxHeight > 0 ? maxHeight : 1;
-
       const xs = [];
       const ys = [];
 
       const walk = (node) => {
-        if (!node) return { x: 0, y: 0 };
+        if (!node || typeof node !== 'object') {
+          throw new TypeError(`Heatmap ${axisName} dendrogram contains an invalid node`);
+        }
         if (node.isLeaf) {
-          const x = leafPos.get(node.id) ?? 0;
+          if (!leafPos.has(node.id)) {
+            throw new RangeError(
+              `Heatmap ${axisName} dendrogram leaf ${String(node.id)} is absent from its order`
+            );
+          }
+          const x = leafPos.get(node.id);
           return { x, y: 0 };
+        }
+        if (!Number.isFinite(node.height) || node.height < 0) {
+          throw new TypeError(`Heatmap ${axisName} dendrogram heights must be finite and non-negative`);
         }
 
         const left = walk(node.left);
         const right = walk(node.right);
         const x = (left.x + right.x) / 2;
-        const y = Number.isFinite(node.height) ? node.height : 0;
+        const y = node.height;
 
         // vertical left
         xs.push(left.x, left.x, null);
@@ -359,7 +390,7 @@ const geneHeatmapDefinition = {
           y: ys,
           xaxis: 'x2',
           yaxis: 'y2',
-          line: { color: theme.border || '#999', width: 1 },
+          line: { color: theme.axisLine, width: 1 },
           hoverinfo: 'skip',
           showlegend: false
         });
@@ -372,17 +403,17 @@ const geneHeatmapDefinition = {
           y: xs,
           xaxis: 'x3',
           yaxis: 'y3',
-          line: { color: theme.border || '#999', width: 1 },
+          line: { color: theme.axisLine, width: 1 },
           hoverinfo: 'skip',
           showlegend: false
         });
       }
     };
 
-    if (showRowDendrogram && clustering?.rowDendrogram && clustering?.rowOrder) {
+    if (showRowDendrogram && clustering !== null) {
       pushDendrogramTraces(clustering.rowDendrogram, clustering.rowOrder, 'row');
     }
-    if (showColDendrogram && clustering?.colDendrogram && clustering?.colOrder) {
+    if (showColDendrogram && clustering !== null) {
       pushDendrogramTraces(clustering.colDendrogram, clustering.colOrder, 'col');
     }
 
@@ -405,15 +436,28 @@ const geneHeatmapDefinition = {
     const nGroups = groupNames.length;
 
     // Determine if we need to rotate labels
-    const maxGeneLen = genes.reduce((max, g) => Math.max(max, String(g ?? '').length), 0);
+    const maxGeneLen = genes.reduce((max, gene) => {
+      if (typeof gene !== 'string') {
+        throw new TypeError('Heatmap gene labels must be strings');
+      }
+      return Math.max(max, gene.length);
+    }, 0);
     const rotateLabels = nGenes > 8 || maxGeneLen > 10;
     const tickAngle = rotateLabels ? -35 : 0;
     const xTickFontSize = Math.min(10, Math.max(6, Math.floor(220 / Math.max(10, nGenes))));
     const yTickFontSize = Math.min(10, Math.max(7, Math.floor(160 / Math.max(4, nGroups))));
 
-    const clustering = data?.clustering || null;
-    const showRowDendrogram = options?.showRowDendrogram !== false && !!(clustering?.rowDendrogram && clustering?.rowOrder);
-    const showColDendrogram = options?.showColDendrogram !== false && !!(clustering?.colDendrogram && clustering?.colOrder);
+    const clustering = data.clustering === undefined ? null : data.clustering;
+    const showRowDendrogram =
+      options.showRowDendrogram === true &&
+      clustering !== null &&
+      clustering.rowDendrogram !== undefined &&
+      clustering.rowOrder !== undefined;
+    const showColDendrogram =
+      options.showColDendrogram === true &&
+      clustering !== null &&
+      clustering.colDendrogram !== undefined &&
+      clustering.colOrder !== undefined;
 
     const dendroFrac = 0.18;
     // Row dendrogram is drawn above the heatmap (aligned to x).
@@ -483,7 +527,12 @@ const geneHeatmapDefinition = {
     // Adjust margins based on content
     const groupLabelWidth = Math.max(
       40,
-      groupNames.reduce((max, g) => Math.max(max, Math.min(22, String(g ?? '').length) * 6), 0)
+      groupNames.reduce((max, group) => {
+        if (typeof group !== 'string') {
+          throw new TypeError('Heatmap group labels must be strings');
+        }
+        return Math.max(max, Math.min(22, group.length) * 6);
+      }, 0)
     );
     layout.margin = {
       l: Math.min(220, Math.max(60, groupLabelWidth)),

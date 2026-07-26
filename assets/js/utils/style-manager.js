@@ -88,21 +88,26 @@ export const StyleManager = {
     const seen = new Set();
 
     for (let depth = 0; depth < maxDepth; depth++) {
-      const match = value.match(/^var\\(\\s*(--[^,\\s)]+)\\s*(?:,\\s*(.+))?\\s*\\)$/);
-      if (!match) break;
+      if (!value.startsWith('var(')) return value.trim();
+      const match = value.match(/^var\(\s*(--[^,\s)]+)\s*\)$/);
+      if (!match) {
+        throw new TypeError(`CSS token ${property} must reference exactly one custom property`);
+      }
       const nextVar = match[1];
-      const fallback = match[2]?.trim() ?? '';
-      if (seen.has(nextVar)) break;
+      if (seen.has(nextVar)) {
+        throw new Error(`Circular CSS custom-property reference at ${nextVar}`);
+      }
       seen.add(nextVar);
       const nextValue = this.getVariable(element, nextVar);
-      if (nextValue) {
-        value = nextValue;
-        continue;
+      if (!nextValue) {
+        throw new TypeError(`CSS custom property ${nextVar} is not defined`);
       }
-      value = fallback;
-      break;
+      value = nextValue;
     }
 
+    if (value.startsWith('var(')) {
+      throw new RangeError(`CSS token ${property} exceeds resolution depth ${maxDepth}`);
+    }
     return value.trim();
   },
 

@@ -13,21 +13,268 @@
  * @module ui/modules/dataset-controls
  */
 
-import { formatCellCount as formatDataNumber } from '../../../data/data-source.js';
-import { getNotificationCenter } from '../../notification-center.js';
+import {
+  formatCellCount as formatDataNumber,
+  validateDatasetIdentity
+} from '../../../data/data-source.js';
 import { updateUrlForDataSource } from '../../url-state.js';
 import { DATA_LOAD_METHODS } from '../../../analytics/tracker.js';
 import { debug } from '../../../utils/debug.js';
+import { isDatasetReloadSupersededError } from '../../dataset-reload-outcome.js';
 import { initDatasetConnections } from './dataset-connections.js';
 
-export function initDatasetControls({
-  state,
-  viewer,
-  dom,
-  dataSourceManager,
-  reloadDataset,
-  callbacks = {}
-}) {
+export const NONE_DATASET_VALUE = '__none__';
+
+const LOADING_DATASET_VALUE = '__catalog_loading__';
+const EMPTY_CATALOG_VALUE = '__catalog_empty__';
+const CATALOG_ERROR_VALUE = '__catalog_error__';
+const DATASET_CONTROL_KEYS = [
+  'callbacks',
+  'dataSourceManager',
+  'dom',
+  'reloadDataset',
+  'state',
+  'viewer'
+];
+const DATASET_CALLBACK_KEYS = [
+  'clearGeneSelection',
+  'initGeneExpressionDropdown',
+  'refreshUIForActiveView',
+  'renderDeletedFieldsSection',
+  'renderFieldSelects',
+  'showSessionStatus',
+  'updateDimensionSelectUI'
+];
+const DATASET_EVENT_KEYS = [
+  'baseUrl',
+  'datasetId',
+  'loadMethod',
+  'metadata',
+  'previousDatasetId',
+  'previousSourceType',
+  'sourceType'
+];
+
+function isPlainObject(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function requirePlainObject(value, name) {
+  if (!isPlainObject(value)) {
+    throw new TypeError(`${name} must be a plain object.`);
+  }
+  return value;
+}
+
+function requireNonEmptyString(value, name) {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new TypeError(`${name} must be a non-empty string.`);
+  }
+  return value;
+}
+
+function requireExactKeys(value, expectedKeys, name) {
+  requirePlainObject(value, name);
+  const actual = Object.keys(value).sort();
+  const expected = [...expectedKeys].sort();
+  if (
+    actual.length !== expected.length ||
+    actual.some((key, index) => key !== expected[index])
+  ) {
+    throw new TypeError(`${name} must contain exactly: ${expected.join(', ')}.`);
+  }
+}
+
+function requireMethod(owner, methodName, name) {
+  if (
+    owner === null ||
+    typeof owner !== 'object' ||
+    typeof owner[methodName] !== 'function'
+  ) {
+    throw new TypeError(`${name} must implement ${methodName}().`);
+  }
+}
+
+function requireElement(element, name, methods = []) {
+  if (element === null || typeof element !== 'object') {
+    throw new TypeError(`${name} must be a DOM element.`);
+  }
+  for (const method of methods) {
+    if (typeof element[method] !== 'function') {
+      throw new TypeError(`${name} must implement ${method}().`);
+    }
+  }
+  return element;
+}
+
+function requireDatasetMetadata(metadata, sourceType, name) {
+  requirePlainObject(metadata, name);
+  requireNonEmptyString(sourceType, `${name} sourceType`);
+  requireNonEmptyString(metadata.id, `${name} id`);
+  validateDatasetIdentity(metadata, metadata.id, sourceType);
+  return metadata;
+}
+
+function requireDatasetEvent(event) {
+  requireExactKeys(event, DATASET_EVENT_KEYS, 'Dataset change event');
+  for (const key of [
+    'baseUrl',
+    'datasetId',
+    'loadMethod',
+    'previousDatasetId',
+    'previousSourceType',
+    'sourceType'
+  ]) {
+    if (event[key] !== null) {
+      requireNonEmptyString(event[key], `Dataset change event ${key}`);
+    }
+  }
+  const isEmpty = event.datasetId === null;
+  if (
+    isEmpty !== (event.sourceType === null) ||
+    isEmpty !== (event.metadata === null) ||
+    isEmpty !== (event.baseUrl === null)
+  ) {
+    throw new TypeError(
+      'Dataset change event must publish either one complete dataset or the exact None state.'
+    );
+  }
+  if (!isEmpty) {
+    requireDatasetMetadata(
+      event.metadata,
+      event.sourceType,
+      'Dataset change event metadata'
+    );
+    if (event.metadata.id !== event.datasetId) {
+      throw new TypeError(
+        'Dataset change event metadata id must equal datasetId.'
+      );
+    }
+  }
+  return event;
+}
+
+function requireCatalog(catalog) {
+  if (!Array.isArray(catalog)) {
+    throw new TypeError('Dataset catalog must be an array of source records.');
+  }
+  const seenSourceTypes = new Set();
+  const seenDatasetKeys = new Set();
+  const records = catalog.map((record, sourceIndex) => {
+    requireExactKeys(
+      record,
+      ['datasets', 'sourceType'],
+      `Dataset catalog source ${sourceIndex}`
+    );
+    requireNonEmptyString(
+      record.sourceType,
+      `Dataset catalog source ${sourceIndex} sourceType`
+    );
+    if (seenSourceTypes.has(record.sourceType)) {
+      throw new TypeError(
+        `Dataset catalog contains source "${record.sourceType}" more than once.`
+      );
+    }
+    seenSourceTypes.add(record.sourceType);
+    if (!Array.isArray(record.datasets)) {
+      throw new TypeError(
+        `Dataset catalog source "${record.sourceType}" datasets must be an array.`
+      );
+    }
+    const datasets = record.datasets.map((metadata, datasetIndex) => {
+      requireDatasetMetadata(
+        metadata,
+        record.sourceType,
+        `Dataset catalog ${record.sourceType}[${datasetIndex}]`
+      );
+      const datasetKey = datasetSelectionValue(
+        record.sourceType,
+        metadata.id
+      );
+      if (seenDatasetKeys.has(datasetKey)) {
+        throw new TypeError(
+          `Dataset "${record.sourceType}/${metadata.id}" occurs more than once.`
+        );
+      }
+      seenDatasetKeys.add(datasetKey);
+      return metadata;
+    });
+    return { sourceType: record.sourceType, datasets };
+  });
+  return records;
+}
+
+function errorFromUnknown(error, context) {
+  if (error instanceof Error) {
+    return error;
+  }
+  return new TypeError(`${context} rejected with a non-Error value.`, {
+    cause: error
+  });
+}
+
+function datasetSelectionValue(sourceType, datasetId) {
+  requireNonEmptyString(sourceType, 'Dataset selection source type');
+  requireNonEmptyString(datasetId, 'Dataset selection id');
+  return (
+    `dataset:${encodeURIComponent(sourceType)}:` +
+    encodeURIComponent(datasetId)
+  );
+}
+
+export function initDatasetControls(options) {
+  requireExactKeys(options, DATASET_CONTROL_KEYS, 'Dataset controls options');
+  const {
+    state,
+    viewer,
+    dom,
+    dataSourceManager,
+    reloadDataset,
+    callbacks
+  } = options;
+  requirePlainObject(dom, 'Dataset controls DOM');
+  requireExactKeys(callbacks, DATASET_CALLBACK_KEYS, 'Dataset control callbacks');
+  for (const callbackName of DATASET_CALLBACK_KEYS) {
+    if (typeof callbacks[callbackName] !== 'function') {
+      throw new TypeError(
+        `Dataset control callback ${callbackName} must be a function.`
+      );
+    }
+  }
+  if (typeof reloadDataset !== 'function') {
+    throw new TypeError('Dataset controls reloadDataset must be a function.');
+  }
+  for (const method of [
+    'clearActiveDataset',
+    'getAllDatasets',
+    'getCurrentDatasetId',
+    'getCurrentMetadata',
+    'getCurrentSourceType',
+    'getSource',
+    'onDatasetChange',
+    'onSourcesChange',
+    'switchToDataset'
+  ]) {
+    requireMethod(dataSourceManager, method, 'Dataset controls dataSourceManager');
+  }
+  for (const method of [
+    'clearActiveField',
+    'clearAllHighlights',
+    'clearSnapshotViews',
+    'initScene',
+    'setFieldLoader',
+    'setVarFieldLoader'
+  ]) {
+    requireMethod(state, method, 'Dataset controls state');
+  }
+  for (const method of ['clearSnapshotViews', 'updateHighlight']) {
+    requireMethod(viewer, method, 'Dataset controls viewer');
+  }
+
   const {
     renderFieldSelects,
     renderDeletedFieldsSection,
@@ -35,20 +282,8 @@ export function initDatasetControls({
     clearGeneSelection,
     refreshUIForActiveView,
     updateDimensionSelectUI,
-    showSessionStatus: showSessionStatusCallback
+    showSessionStatus
   } = callbacks;
-
-  const showSessionStatus =
-    typeof showSessionStatusCallback === 'function'
-      ? showSessionStatusCallback
-      : (message, isError = false) => {
-          const notifications = getNotificationCenter();
-          if (isError) {
-            notifications.error(message, { category: 'session' });
-          } else {
-            notifications.success(message, { category: 'session' });
-          }
-        };
 
   const {
     select: datasetSelect,
@@ -61,9 +296,119 @@ export function initDatasetControls({
     genesEl: datasetGenesEl,
     obsEl: datasetObsEl,
     connectivityEl: datasetConnectivityEl,
-  } = dom || {};
+  } = dom;
+  requireElement(datasetSelect, 'Dataset select', [
+    'addEventListener',
+    'appendChild',
+    'replaceChildren'
+  ]);
+  requireElement(datasetInfo, 'Dataset info');
+  if (
+    datasetInfo.classList === null ||
+    typeof datasetInfo.classList !== 'object' ||
+    typeof datasetInfo.classList.add !== 'function' ||
+    typeof datasetInfo.classList.remove !== 'function'
+  ) {
+    throw new TypeError('Dataset info must provide classList add/remove.');
+  }
+  for (const [name, element] of Object.entries({
+    datasetCellsEl,
+    datasetConnectivityEl,
+    datasetDescriptionEl,
+    datasetGenesEl,
+    datasetNameEl,
+    datasetObsEl,
+    datasetSourceEl,
+    datasetUrlEl
+  })) {
+    requireElement(element, name);
+  }
+  const ownerDocument = datasetSelect.ownerDocument;
+  if (
+    ownerDocument === null ||
+    typeof ownerDocument !== 'object' ||
+    typeof ownerDocument.createElement !== 'function'
+  ) {
+    throw new TypeError('Dataset select must provide an ownerDocument.');
+  }
+  const datasetOptionsByKey = new Map();
+  let noneDatasetOption = null;
+  let catalogGeneration = 0;
 
-  const NONE_DATASET_VALUE = '__none__';
+  function createNoneDatasetOption() {
+    const option = ownerDocument.createElement('option');
+    option.value = NONE_DATASET_VALUE;
+    option.textContent = 'None';
+    return option;
+  }
+
+  function ensureNoneDatasetOption() {
+    if (noneDatasetOption === null) {
+      noneDatasetOption = createNoneDatasetOption();
+      datasetSelect.appendChild(noneDatasetOption);
+    }
+    return noneDatasetOption;
+  }
+
+  function createDatasetOption(metadata, sourceType) {
+    requireDatasetMetadata(metadata, sourceType, 'Dataset option metadata');
+    const value = datasetSelectionValue(sourceType, metadata.id);
+    if (datasetOptionsByKey.has(value)) {
+      throw new Error(
+        `Dataset option "${sourceType}/${metadata.id}" already exists.`
+      );
+    }
+    const option = ownerDocument.createElement('option');
+    option.value = value;
+    option.dataset.sourceType = sourceType;
+    option.dataset.datasetId = metadata.id;
+    option.textContent =
+      `${metadata.name} (${formatDataNumber(metadata.stats.n_cells)} cells)`;
+    datasetOptionsByKey.set(value, option);
+    return option;
+  }
+
+  function publishSelectionUrl(sourceType, datasetId) {
+    if (sourceType === 'local-demo') {
+      updateUrlForDataSource(sourceType, { datasetId });
+      return;
+    }
+    if (sourceType === 'remote') {
+      const source = dataSourceManager.getSource(sourceType);
+      requireMethod(source, 'getConnectionInfo', 'Remote dataset source');
+      const connectionInfo = source.getConnectionInfo();
+      requirePlainObject(connectionInfo, 'Remote connection info');
+      requireNonEmptyString(
+        connectionInfo.url,
+        'Remote connection info url'
+      );
+      updateUrlForDataSource(sourceType, {
+        serverUrl: connectionInfo.url
+      });
+      return;
+    }
+    if (sourceType === 'github-repo') {
+      const source = dataSourceManager.getSource(sourceType);
+      requireMethod(source, 'getConnectionInfo', 'GitHub dataset source');
+      const connectionInfo = source.getConnectionInfo();
+      requirePlainObject(connectionInfo, 'GitHub connection info');
+      requireNonEmptyString(
+        connectionInfo.inputPath,
+        'GitHub connection info inputPath'
+      );
+      updateUrlForDataSource(sourceType, {
+        path: connectionInfo.inputPath
+      });
+      return;
+    }
+    if (sourceType === 'local-user' || sourceType === 'jupyter') {
+      updateUrlForDataSource(sourceType, {});
+      return;
+    }
+    throw new RangeError(
+      `Dataset source type "${sourceType}" has no URL-state contract.`
+    );
+  }
 
 
 // =========================================================================
@@ -75,64 +420,64 @@ export function initDatasetControls({
  * @param {Object|null} metadata - Dataset metadata
  */
 function updateDatasetInfo(metadata, sourceTypeOverride = null) {
-  if (!datasetInfo || !datasetCellsEl || !datasetGenesEl) return;
-
   const resetValues = () => {
-    if (datasetNameEl) datasetNameEl.textContent = '—';
-    if (datasetSourceEl) datasetSourceEl.textContent = '—';
-    if (datasetDescriptionEl) {
-      datasetDescriptionEl.textContent = '—';
-      datasetDescriptionEl.title = '—';
-    }
-    if (datasetUrlEl) {
-      datasetUrlEl.textContent = '—';
-      datasetUrlEl.title = '—';
-    }
+    datasetNameEl.textContent = '—';
+    datasetSourceEl.textContent = '—';
+    datasetDescriptionEl.textContent = '—';
+    datasetDescriptionEl.title = '—';
+    datasetUrlEl.textContent = '—';
+    datasetUrlEl.title = '—';
     datasetCellsEl.textContent = '–';
     datasetGenesEl.textContent = '–';
-    if (datasetObsEl) datasetObsEl.textContent = '–';
-    if (datasetConnectivityEl) datasetConnectivityEl.textContent = '–';
+    datasetObsEl.textContent = '–';
+    datasetConnectivityEl.textContent = '–';
     datasetInfo.classList.remove('loading', 'error');
   };
 
-  if (!metadata) {
+  if (metadata === null) {
+    if (sourceTypeOverride !== null) {
+      throw new TypeError(
+        'Dataset sourceTypeOverride must be null for the None state.'
+      );
+    }
     resetValues();
     return;
   }
 
-  const stats = metadata.stats || {};
-  const sourceTypeLabel = (sourceTypeOverride || dataSourceManager?.getCurrentSourceType?.() || 'demo')
+  const sourceType = sourceTypeOverride ??
+    dataSourceManager.getCurrentSourceType();
+  requireNonEmptyString(sourceType, 'Dataset info source type');
+  requireDatasetMetadata(metadata, sourceType, 'Dataset info metadata');
+
+  const stats = metadata.stats;
+  const sourceTypeLabel = sourceType
     .replace(/[-_]+/g, ' ')
     .replace(/\b\w/g, (c) => c.toUpperCase());
 
-  // Prefer dataset's own source name (from dataset_identity.json).
-  // Only fall back to the source-type label (e.g., "Local Demo")
-  // if the dataset source name is missing or empty.
-  const sourceName = (metadata.source?.name || '').trim();
-  const sourceLabel = sourceName || sourceTypeLabel;
+  // An explicitly declared dataset source name owns the display label;
+  // otherwise the registered source type owns it.
+  const sourceLabel = metadata.source === undefined
+    ? sourceTypeLabel
+    : metadata.source.name;
 
-  if (datasetNameEl) datasetNameEl.textContent = metadata.name || metadata.id || 'Dataset';
-  if (datasetSourceEl) datasetSourceEl.textContent = sourceLabel;
-  if (datasetDescriptionEl) {
-    const desc = metadata.description || '—';
-    datasetDescriptionEl.textContent = desc;
-    datasetDescriptionEl.title = desc;
-  }
-  if (datasetUrlEl) {
-    const url = metadata.source?.url || metadata.url || '—';
-    datasetUrlEl.textContent = url;
-    datasetUrlEl.title = url;
-  }
+  datasetNameEl.textContent = metadata.name;
+  datasetSourceEl.textContent = sourceLabel;
+  const description = metadata.description.length === 0
+    ? '—'
+    : metadata.description;
+  datasetDescriptionEl.textContent = description;
+  datasetDescriptionEl.title = description;
+  const url = metadata.source?.url ?? '—';
+  datasetUrlEl.textContent = url;
+  datasetUrlEl.title = url;
   datasetCellsEl.textContent = formatDataNumber(stats.n_cells);
   datasetGenesEl.textContent = formatDataNumber(stats.n_genes);
-  if (datasetObsEl) datasetObsEl.textContent = formatDataNumber(stats.n_obs_fields);
-  if (datasetConnectivityEl) {
-    if (stats.has_connectivity) {
-      const edgeText = stats.n_edges ? `${formatDataNumber(stats.n_edges)} edges` : 'Available';
-      datasetConnectivityEl.textContent = edgeText;
-    } else {
-      datasetConnectivityEl.textContent = 'None';
-    }
+  datasetObsEl.textContent = formatDataNumber(stats.n_obs_fields);
+  if (stats.has_connectivity) {
+    datasetConnectivityEl.textContent =
+      `${formatDataNumber(stats.n_edges)} edges`;
+  } else {
+    datasetConnectivityEl.textContent = 'None';
   }
   datasetInfo.classList.remove('loading', 'error');
 }
@@ -147,7 +492,13 @@ function refreshDatasetUI(metadata) {
   initGeneExpressionDropdown();
   clearGeneSelection();
   refreshUIForActiveView();
-  updateDatasetInfo(metadata || (dataSourceManager?.getCurrentMetadata?.() || null));
+  const currentMetadata = metadata === undefined
+    ? dataSourceManager.getCurrentMetadata()
+    : metadata;
+  const currentSourceType = currentMetadata === null
+    ? null
+    : dataSourceManager.getCurrentSourceType();
+  updateDatasetInfo(currentMetadata, currentSourceType);
   // Update dimension dropdown when dataset changes (different datasets may have different available dimensions)
   updateDimensionSelectUI();
 }
@@ -156,33 +507,27 @@ function refreshDatasetUI(metadata) {
  * Populate the dataset dropdown with available datasets from all sources
  */
 async function populateDatasetDropdown() {
+  const generation = ++catalogGeneration;
   debug.log('[UI] populateDatasetDropdown called', { datasetSelect, dataSourceManager });
 
-  if (!datasetSelect) {
-    debug.warn('[UI] Dataset select element not found');
-    return;
-  }
-  if (!dataSourceManager) {
-    debug.warn('[UI] DataSourceManager not provided');
-    datasetSelect.innerHTML = '<option value="" disabled>Manager not available</option>';
-    return;
-  }
-
-  datasetSelect.innerHTML = '<option value="" disabled>Loading...</option>';
+  const loadingOption = ownerDocument.createElement('option');
+  loadingOption.value = LOADING_DATASET_VALUE;
+  loadingOption.disabled = true;
+  loadingOption.selected = true;
+  loadingOption.textContent = 'Loading datasets…';
+  datasetSelect.replaceChildren(loadingOption);
+  datasetOptionsByKey.clear();
+  noneDatasetOption = null;
+  datasetSelect.disabled = true;
 
   try {
     debug.log('[UI] Calling getAllDatasets...');
-
-    // Add timeout to detect hanging
-    const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('Timeout: getAllDatasets took more than 10s')), 10000)
+    const allSourceDatasets = requireCatalog(
+      await dataSourceManager.getAllDatasets()
     );
-
-    // Get datasets from all sources (with timeout)
-    const allSourceDatasets = await Promise.race([
-      dataSourceManager.getAllDatasets(),
-      timeoutPromise
-    ]);
+    if (generation !== catalogGeneration) {
+      return false;
+    }
 
     debug.log('[UI] getAllDatasets returned:', allSourceDatasets);
 
@@ -190,31 +535,26 @@ async function populateDatasetDropdown() {
     const allDatasets = [];
     for (const { sourceType, datasets } of allSourceDatasets) {
       for (const dataset of datasets) {
-        allDatasets.push({ ...dataset, sourceType });
+        allDatasets.push({ metadata: dataset, sourceType });
       }
     }
 
-    datasetSelect.innerHTML = '';
+    datasetSelect.replaceChildren();
+    datasetOptionsByKey.clear();
+    noneDatasetOption = null;
 
-    const addNoneOption = () => {
-      const noneOption = document.createElement('option');
-      noneOption.value = NONE_DATASET_VALUE;
-      noneOption.textContent = 'None';
-      datasetSelect.appendChild(noneOption);
-      return noneOption;
-    };
-
-    addNoneOption();
+    ensureNoneDatasetOption();
 
     if (allDatasets.length === 0) {
-      const emptyMsg = document.createElement('option');
-      emptyMsg.value = '';
+      const emptyMsg = ownerDocument.createElement('option');
+      emptyMsg.value = EMPTY_CATALOG_VALUE;
       emptyMsg.disabled = true;
       emptyMsg.textContent = 'No datasets found';
       datasetSelect.appendChild(emptyMsg);
       datasetSelect.value = NONE_DATASET_VALUE;
+      datasetSelect.disabled = false;
       updateDatasetInfo(null);
-      return;
+      return true;
     }
 
     // Group by source type if there are multiple sources with data
@@ -224,17 +564,13 @@ async function populateDatasetDropdown() {
     if (useGroups) {
       // Create optgroups for each source
       for (const { sourceType, datasets } of sourcesWithData) {
-        const group = document.createElement('optgroup');
+        const group = ownerDocument.createElement('optgroup');
         group.label = sourceType === 'local-demo' ? 'Demo Datasets' :
                       sourceType === 'local-user' ? 'Your Data' :
                       sourceType;
 
         for (const dataset of datasets) {
-          const option = document.createElement('option');
-          option.value = dataset.id;
-          option.dataset.sourceType = sourceType;
-          const cellCount = dataset.stats?.n_cells ? ` (${formatDataNumber(dataset.stats.n_cells)} cells)` : '';
-          option.textContent = `${dataset.name}${cellCount}`;
+          const option = createDatasetOption(dataset, sourceType);
           group.appendChild(option);
         }
 
@@ -242,52 +578,114 @@ async function populateDatasetDropdown() {
       }
     } else {
       // Simple flat list
-      for (const dataset of allDatasets) {
-        const option = document.createElement('option');
-        option.value = dataset.id;
-        option.dataset.sourceType = dataset.sourceType;
-        const cellCount = dataset.stats?.n_cells ? ` (${formatDataNumber(dataset.stats.n_cells)} cells)` : '';
-        option.textContent = `${dataset.name}${cellCount}`;
+      for (const { metadata, sourceType } of allDatasets) {
+        const option = createDatasetOption(metadata, sourceType);
         datasetSelect.appendChild(option);
       }
     }
 
-    // Select the current dataset if any; fall back to None
+    // Represent the exact active selection; no active dataset maps only to None.
     const currentId = dataSourceManager.getCurrentDatasetId();
-    if (currentId) {
-      datasetSelect.value = currentId;
-      updateDatasetInfo(dataSourceManager.getCurrentMetadata());
-    } else if (datasetSelect.querySelector(`option[value=\"${NONE_DATASET_VALUE}\"]`)) {
+    const currentSourceType = dataSourceManager.getCurrentSourceType();
+    const currentMetadata = dataSourceManager.getCurrentMetadata();
+    const hasCurrentDataset = currentId !== null;
+    if (
+      hasCurrentDataset !== (currentSourceType !== null) ||
+      hasCurrentDataset !== (currentMetadata !== null)
+    ) {
+      throw new TypeError(
+        'Dataset manager current id, source type, and metadata must be published together.'
+      );
+    }
+    if (hasCurrentDataset) {
+      requireNonEmptyString(currentId, 'Current dataset id');
+      requireNonEmptyString(currentSourceType, 'Current dataset source type');
+      requireDatasetMetadata(
+        currentMetadata,
+        currentSourceType,
+        'Current dataset metadata'
+      );
+      if (currentMetadata.id !== currentId) {
+        throw new TypeError(
+          'Current dataset metadata id must equal the manager dataset id.'
+        );
+      }
+      const currentCatalogRecord = allDatasets.find(
+        record =>
+          record.sourceType === currentSourceType &&
+          record.metadata.id === currentId
+      );
+      if (currentCatalogRecord === undefined) {
+        throw new Error(
+          `Current dataset "${currentSourceType}/${currentId}" is absent from the active catalog.`
+        );
+      }
+      const currentSelectionValue = datasetSelectionValue(
+        currentSourceType,
+        currentId
+      );
+      datasetSelect.value = currentSelectionValue;
+      if (datasetSelect.value !== currentSelectionValue) {
+        throw new Error(
+          `Dataset select could not represent "${currentSourceType}/${currentId}".`
+        );
+      }
+      updateDatasetInfo(currentMetadata, currentSourceType);
+    } else {
       datasetSelect.value = NONE_DATASET_VALUE;
+      if (datasetSelect.value !== NONE_DATASET_VALUE) {
+        throw new Error('Dataset select could not represent the None state.');
+      }
       updateDatasetInfo(null);
     }
-  } catch (err) {
-    debug.error('[UI] Failed to populate dataset dropdown:', err);
-    datasetSelect.innerHTML = '<option value="" disabled>Error loading datasets</option>';
+    datasetSelect.disabled = false;
+    return true;
+  } catch (error) {
+    if (generation !== catalogGeneration) {
+      return false;
+    }
+    const exactError = errorFromUnknown(error, 'Dataset catalog');
+    const errorOption = ownerDocument.createElement('option');
+    errorOption.value = CATALOG_ERROR_VALUE;
+    errorOption.disabled = true;
+    errorOption.selected = true;
+    errorOption.textContent =
+      `Failed to load dataset catalog: ${exactError.message}`;
+    errorOption.title = errorOption.textContent;
+    datasetSelect.replaceChildren(errorOption);
+    datasetOptionsByKey.clear();
+    noneDatasetOption = null;
+    datasetSelect.disabled = true;
+    datasetInfo.classList.remove('loading');
+    datasetInfo.classList.add('error');
+    showSessionStatus(errorOption.textContent, true);
+    return false;
   }
 }
 
 /**
  * Handle dataset selection change - reloads page with new dataset
  * @param {string} datasetId - The selected dataset ID
- * @param {string} [sourceType='local-demo'] - The source type for the dataset
+ * @param {string} sourceType - The exact source type for the dataset
+ * @returns {Promise<boolean>} Whether the requested dataset became ready
  */
-async function handleDatasetChange(datasetId, sourceType = 'local-demo') {
-  if (!dataSourceManager || !datasetId) return;
+async function handleDatasetChange(datasetId, sourceType) {
+  requireNonEmptyString(datasetId, 'Selected dataset id');
+  requireNonEmptyString(sourceType, 'Selected dataset source type');
 
   // Check if this is already the current dataset
   const currentId = dataSourceManager.getCurrentDatasetId();
   const currentSourceType = dataSourceManager.getCurrentSourceType();
   if (currentId === datasetId && currentSourceType === sourceType) {
-    return; // No change needed
+    return true;
   }
 
+  let datasetReloaded = false;
   try {
-    if (datasetInfo) {
-      datasetInfo.classList.add('loading');
-      datasetCellsEl.textContent = '...';
-      datasetGenesEl.textContent = '...';
-    }
+    datasetInfo.classList.remove('error');
+    datasetInfo.classList.add('loading');
+    datasetCellsEl.textContent = '…';
+    datasetGenesEl.textContent = '…';
 
     showSessionStatus('Switching dataset...', false);
 
@@ -295,251 +693,266 @@ async function handleDatasetChange(datasetId, sourceType = 'local-demo') {
       loadMethod: DATA_LOAD_METHODS.DATASET_DROPDOWN
     });
 
-    // Local-user datasets must be loaded in-place to keep file handles alive
-    if (sourceType === 'local-user') {
-      if (typeof reloadDataset === 'function') {
-        await reloadDataset(dataSourceManager.getCurrentMetadata?.());
-      }
-      showSessionStatus('Dataset loaded', false);
-      return;
+    const metadata = dataSourceManager.getCurrentMetadata();
+    const adoptedDatasetId = dataSourceManager.getCurrentDatasetId();
+    const adoptedSourceType = dataSourceManager.getCurrentSourceType();
+    if (
+      adoptedDatasetId !== datasetId ||
+      adoptedSourceType !== sourceType
+    ) {
+      throw new Error(
+        'Dataset manager did not publish the requested source and dataset.'
+      );
+    }
+    requireDatasetMetadata(metadata, sourceType, 'Selected dataset metadata');
+    if (metadata.id !== datasetId) {
+      throw new Error(
+        'Selected dataset metadata id does not match the requested dataset.'
+      );
     }
 
-    // Update URL and reload for server-hosted sources
-    // Use updateUrlForDataSource to ensure other params (remote, github) are cleared
-    updateUrlForDataSource('local-demo', { datasetId });
-
-    // Small delay to show the status message before reload
-    setTimeout(() => {
-      window.location.reload();
-    }, 100);
-
-  } catch (err) {
-    debug.error('[UI] Failed to switch dataset:', err);
-    if (datasetInfo) datasetInfo.classList.add('error');
-    showSessionStatus(`Failed to switch dataset: ${err.message}`, true);
+    await reloadDataset(metadata);
+    datasetReloaded = true;
+    publishSelectionUrl(sourceType, datasetId);
+    updateDatasetInfo(metadata, sourceType);
+    datasetInfo.classList.remove('loading', 'error');
+    showSessionStatus('Dataset loaded', false);
+    return true;
+  } catch (error) {
+    if (isDatasetReloadSupersededError(error)) {
+      return false;
+    }
+    const exactError = errorFromUnknown(error, 'Dataset switch');
+    datasetInfo.classList.remove('loading');
+    datasetInfo.classList.add('error');
+    const activeMetadata = dataSourceManager.getCurrentMetadata();
+    const activeSourceType = dataSourceManager.getCurrentSourceType();
+    const activeDatasetId = dataSourceManager.getCurrentDatasetId();
+    if (
+      activeMetadata !== null &&
+      activeSourceType !== null &&
+      activeDatasetId !== null
+    ) {
+      requireDatasetMetadata(
+        activeMetadata,
+        activeSourceType,
+        'Active dataset metadata after switch failure'
+      );
+      updateDatasetInfo(activeMetadata, activeSourceType);
+      datasetInfo.classList.add('error');
+    }
+    const prefix = datasetReloaded
+      ? 'Dataset loaded, but URL state failed'
+      : 'Failed to switch dataset';
+    showSessionStatus(`${prefix}: ${exactError.message}`, true);
+    return false;
   }
 }
 
 /**
- * Handle selecting the "None" dataset option - clear data and UI state
+ * Handle selecting the exact None state.
+ *
+ * @returns {Promise<boolean>} Whether the dataset and UI were fully cleared
  */
-function handleNoneDatasetSelection() {
-  if (typeof dataSourceManager?.clearActiveDataset === 'function') {
-    dataSourceManager.clearActiveDataset();
-  }
+async function handleNoneDatasetSelection() {
+  try {
+    datasetInfo.classList.remove('error');
+    datasetInfo.classList.add('loading');
+    showSessionStatus('Clearing dataset...', false);
 
-  // Clear data/state
-  if (state?.initScene) {
-    state.setFieldLoader?.(null);
-    state.setVarFieldLoader?.(null);
-    state.varData = null;
-    state.initScene(new Float32Array(), { fields: [], count: 0 });
-    state.clearActiveField?.();
-    state.clearAllHighlights?.();
-    state.clearSnapshotViews?.();
-  }
-  if (typeof viewer?.clearSnapshotViews === 'function') {
-    viewer.clearSnapshotViews();
-  }
-  if (typeof viewer?.updateHighlight === 'function') {
-    viewer.updateHighlight(new Uint8Array());
-  }
-
-  // Reset UI affordances
-  refreshDatasetUI(null);
-  if (datasetSelect) {
-    datasetSelect.value = NONE_DATASET_VALUE;
-  }
-  showSessionStatus('No dataset selected', false);
-}
-
-// =========================================================================
-// Dev-only self-test (local-user in-place switching)
-// =========================================================================
-
-const isDevSelfTestEnabled = Boolean(debug?.isEnabled);
-
-async function runLocalUserInPlaceSwitchSelfTest({ switchBack = true } = {}) {
-  if (!isDevSelfTestEnabled) {
-    throw new Error('Dev self-test requires CELLUCID_DEBUG=true (see docs).');
-  }
-
-  const sourceType = dataSourceManager?.getCurrentSourceType?.() || null;
-  if (sourceType !== 'local-user') {
-    throw new Error(`Dev self-test requires active sourceType "local-user" (got "${sourceType || 'none'}").`);
-  }
-
-  const fromDatasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
-  if (!fromDatasetId) {
-    throw new Error('Dev self-test requires an active dataset.');
-  }
-
-  const datasets = await dataSourceManager.getDatasets('local-user');
-  const toDatasetId =
-    (Array.isArray(datasets) ? datasets : [])
-      .map((d) => d?.id)
-      .find((id) => id && id !== fromDatasetId) || null;
-
-  if (!toDatasetId) {
-    throw new Error('Dev self-test requires at least 2 local-user datasets.');
-  }
-
-  const cm = (typeof window !== 'undefined') ? window._comparisonModule : null;
-  if (!cm) {
-    throw new Error('Dev self-test requires Page Analysis to be initialized (missing window._comparisonModule).');
-  }
-  const beforeResets = Number(cm?._datasetReloadResetCount) || 0;
-
-  await handleDatasetChange(toDatasetId, 'local-user');
-
-  const afterResets = Number(cm?._datasetReloadResetCount) || 0;
-  const resetOk = afterResets > beforeResets;
-  const cacheStats = cm?.dataLayer?.getCacheStats?.() || null;
-  const cachesOk = cacheStats
-    ? (
-        (cacheStats.dataCache?.size || 0) === 0 &&
-        (cacheStats.bulkGeneCache?.size || 0) === 0 &&
-        (cacheStats.pendingRequests || 0) === 0 &&
-        (cacheStats.prefetchQueue || 0) === 0
-      )
-    : null;
-
-  if (switchBack) {
-    await handleDatasetChange(fromDatasetId, 'local-user');
-  }
-
-  return {
-    fromDatasetId,
-    toDatasetId,
-    switchBack: switchBack !== false,
-    resetOk,
-    cachesOk,
-    cacheStats,
-    datasetResetCount: afterResets
-  };
-}
-
-// Initialize dataset selector
-debug.log('[UI] Dataset selector initialization:', {
-  datasetSelect: !!datasetSelect,
-  dataSourceManager: !!dataSourceManager,
-  datasetInfo: !!datasetInfo,
-  hasUserDataControls: Boolean(dom?.userDataBlock),
-  hasRemoteControls: Boolean(dom?.remoteConnectBtn),
-  hasGithubControls: Boolean(dom?.githubConnectBtn)
-});
-
-
-if (datasetSelect && dataSourceManager) {
-  // Dev-only: in-place switching self-test helper.
-  let devSelfTestBlock = null;
-  let devSelfTestBtn = null;
-  let devSelfTestStatus = null;
-
-  const syncDevSelfTestVisibility = () => {
-    if (!devSelfTestBlock) return;
-    const src = dataSourceManager?.getCurrentSourceType?.() || null;
-    devSelfTestBlock.style.display = (src === 'local-user') ? 'block' : 'none';
-  };
-
-  if (isDevSelfTestEnabled && typeof window !== 'undefined') {
-    try {
-      const parentBlock = datasetSelect.closest?.('.control-block') || null;
-      devSelfTestBlock = document.createElement('div');
-      devSelfTestBlock.className = 'control-block mt-0-5';
-      devSelfTestBlock.style.display = 'none';
-
-      devSelfTestBtn = document.createElement('button');
-      devSelfTestBtn.type = 'button';
-      devSelfTestBtn.className = 'reset-btn';
-      devSelfTestBtn.textContent = 'Dev: local-user switch self-test';
-      devSelfTestBtn.title = 'Switch between two local-user datasets in-place and sanity-check analysis caches';
-
-      devSelfTestStatus = document.createElement('div');
-      devSelfTestStatus.className = 'legend-help';
-      devSelfTestStatus.style.marginTop = '6px';
-      devSelfTestStatus.textContent = '';
-
-      devSelfTestBtn.addEventListener('click', async () => {
-        if (!devSelfTestBtn) return;
-        devSelfTestBtn.disabled = true;
-        devSelfTestStatus.textContent = 'Running self-test…';
-        try {
-          const result = await runLocalUserInPlaceSwitchSelfTest({ switchBack: true });
-          const ok = result.resetOk && (result.cachesOk !== false);
-          devSelfTestStatus.textContent = ok
-            ? `OK (switched ${result.fromDatasetId} → ${result.toDatasetId} → back)`
-            : `WARN (resetOk=${result.resetOk ? 'true' : 'false'}, cachesOk=${result.cachesOk === null ? 'unknown' : String(result.cachesOk)})`;
-        } catch (err) {
-          devSelfTestStatus.textContent = `FAILED: ${err?.message || String(err)}`;
-        } finally {
-          devSelfTestBtn.disabled = false;
-        }
-      });
-
-      devSelfTestBlock.appendChild(devSelfTestBtn);
-      devSelfTestBlock.appendChild(devSelfTestStatus);
-
-      if (parentBlock?.parentNode) {
-        parentBlock.insertAdjacentElement('afterend', devSelfTestBlock);
-      } else if (datasetSelect.parentNode) {
-        datasetSelect.parentNode.appendChild(devSelfTestBlock);
-      }
-
-      window.__CELLUCID_DEV__ = window.__CELLUCID_DEV__ || {};
-      window.__CELLUCID_DEV__.runLocalUserInPlaceSwitchSelfTest = runLocalUserInPlaceSwitchSelfTest;
-    } catch {
-      devSelfTestBlock = null;
+    await dataSourceManager.clearActiveDataset({
+      loadMethod: DATA_LOAD_METHODS.DATASET_DROPDOWN
+    });
+    if (
+      dataSourceManager.getCurrentDatasetId() !== null ||
+      dataSourceManager.getCurrentSourceType() !== null ||
+      dataSourceManager.getCurrentMetadata() !== null
+    ) {
+      throw new Error(
+        'Dataset manager did not publish the exact None state.'
+      );
     }
+
+    await state.setFieldLoader(null);
+    await state.setVarFieldLoader(null);
+    state.varData = null;
+    await state.initScene(new Float32Array(), { fields: [], count: 0 });
+    await state.clearActiveField();
+    await state.clearAllHighlights();
+    await state.clearSnapshotViews();
+    await viewer.clearSnapshotViews();
+    await viewer.updateHighlight(new Uint8Array());
+
+    refreshDatasetUI(null);
+    ensureNoneDatasetOption();
+    datasetSelect.value = NONE_DATASET_VALUE;
+    if (datasetSelect.value !== NONE_DATASET_VALUE) {
+      throw new Error('Dataset select could not represent the None state.');
+    }
+    datasetSelect.disabled = false;
+    updateUrlForDataSource(null, {});
+    datasetInfo.classList.remove('loading', 'error');
+    showSessionStatus('No dataset selected', false);
+    return true;
+  } catch (error) {
+    const exactError = errorFromUnknown(error, 'Dataset clear');
+    datasetInfo.classList.remove('loading');
+    datasetInfo.classList.add('error');
+    showSessionStatus(
+      `Failed to clear dataset: ${exactError.message}`,
+      true
+    );
+    return false;
+  }
+}
+
+function synchronizeDatasetEvent(rawEvent) {
+  const event = requireDatasetEvent(rawEvent);
+  if (
+    (event.previousDatasetId === null) !==
+    (event.previousSourceType === null)
+  ) {
+    throw new TypeError(
+      'Dataset change event previous id and source type must be published together.'
+    );
   }
 
-  // Populate dropdown
-  populateDatasetDropdown();
-
-  // Keep dropdown in sync with source changes and dataset switches
-  if (typeof dataSourceManager.onSourcesChange === 'function') {
-    dataSourceManager.onSourcesChange(() => {
-      populateDatasetDropdown();
-      syncDevSelfTestVisibility();
-    });
-  }
-  if (typeof dataSourceManager.onDatasetChange === 'function') {
-    dataSourceManager.onDatasetChange((event) => {
-      try {
-        if (datasetSelect) {
-          if (event?.datasetId) {
-            datasetSelect.value = event.datasetId;
-          } else if (datasetSelect.querySelector(`option[value=\"${NONE_DATASET_VALUE}\"]`)) {
-            datasetSelect.value = NONE_DATASET_VALUE;
-          }
-        }
-      } catch (_) {
-        /* ignore */
-      }
-      updateDatasetInfo(event?.metadata || null, event?.sourceType || null);
-      syncDevSelfTestVisibility();
-    });
+  if (event.datasetId === null) {
+    ensureNoneDatasetOption();
+    datasetSelect.value = NONE_DATASET_VALUE;
+    if (datasetSelect.value !== NONE_DATASET_VALUE) {
+      throw new Error('Dataset select could not represent the None state.');
+    }
+    updateDatasetInfo(null);
+    return;
   }
 
-  // Handle selection changes
-  datasetSelect.addEventListener('change', (e) => {
-    const selectedValue = e.target.value;
+  const selectionValue = datasetSelectionValue(
+    event.sourceType,
+    event.datasetId
+  );
+  let option = datasetOptionsByKey.get(selectionValue);
+  if (option === undefined) {
+    option = createDatasetOption(event.metadata, event.sourceType);
+    datasetSelect.appendChild(option);
+  }
+  datasetSelect.value = selectionValue;
+  if (datasetSelect.value !== selectionValue) {
+    throw new Error(
+      `Dataset select could not represent "${event.sourceType}/${event.datasetId}".`
+    );
+  }
+  datasetSelect.disabled = false;
+  updateDatasetInfo(event.metadata, event.sourceType);
+}
+
+async function handleDatasetSelectEvent(event) {
+  try {
+    if (
+      event === null ||
+      typeof event !== 'object' ||
+      event.currentTarget !== datasetSelect
+    ) {
+      throw new TypeError(
+        'Dataset change DOM event must be owned by the dataset select.'
+      );
+    }
+    if (
+      datasetSelect.selectedOptions === null ||
+      typeof datasetSelect.selectedOptions !== 'object' ||
+      datasetSelect.selectedOptions.length !== 1
+    ) {
+      throw new Error(
+        'Dataset select must publish exactly one selected option.'
+      );
+    }
+    const selectedOption = datasetSelect.selectedOptions[0];
+    requireElement(selectedOption, 'Selected dataset option');
+    if (selectedOption.value !== datasetSelect.value) {
+      throw new Error(
+        'Selected dataset option must own the select value.'
+      );
+    }
+
+    const selectedValue = selectedOption.value;
     if (selectedValue === NONE_DATASET_VALUE) {
-      handleNoneDatasetSelection();
+      await handleNoneDatasetSelection();
       return;
     }
-    const selectedOption = e.target.selectedOptions[0];
-    const sourceType = selectedOption?.dataset?.sourceType || 'local-demo';
-    handleDatasetChange(selectedValue, sourceType);
-  });
+    if (
+      selectedValue === LOADING_DATASET_VALUE ||
+      selectedValue === EMPTY_CATALOG_VALUE ||
+      selectedValue === CATALOG_ERROR_VALUE
+    ) {
+      throw new Error('A non-selectable dataset status option was selected.');
+    }
 
-  syncDevSelfTestVisibility();
-} else {
-  debug.warn('[UI] Dataset selector not initialized - missing elements:', {
-    datasetSelect: datasetSelect,
-    dataSourceManager: dataSourceManager
-  });
+    const sourceType = requireNonEmptyString(
+      selectedOption.dataset.sourceType,
+      'Selected dataset option source type'
+    );
+    const datasetId = requireNonEmptyString(
+      selectedOption.dataset.datasetId,
+      'Selected dataset option id'
+    );
+    if (selectedValue !== datasetSelectionValue(sourceType, datasetId)) {
+      throw new Error(
+        'Selected dataset option value does not match its exact source and id.'
+      );
+    }
+    await handleDatasetChange(datasetId, sourceType);
+  } catch (error) {
+    const exactError = errorFromUnknown(error, 'Dataset selection event');
+    datasetInfo.classList.remove('loading');
+    datasetInfo.classList.add('error');
+    showSessionStatus(
+      `Dataset selection failed: ${exactError.message}`,
+      true
+    );
+  }
 }
+
+  const initialMetadata = dataSourceManager.getCurrentMetadata();
+  const initialDatasetId = dataSourceManager.getCurrentDatasetId();
+  const initialSourceType = dataSourceManager.getCurrentSourceType();
+  if (
+    initialMetadata === null
+    && initialDatasetId === null
+    && initialSourceType === null
+  ) {
+    updateDatasetInfo(null);
+  } else {
+    if (
+      initialMetadata === null
+      || initialDatasetId === null
+      || initialSourceType === null
+    ) {
+      throw new TypeError(
+        'Initial dataset state must be either complete or the exact None state.'
+      );
+    }
+    requireDatasetMetadata(
+      initialMetadata,
+      initialSourceType,
+      'Initial dataset metadata'
+    );
+    if (initialMetadata.id !== initialDatasetId) {
+      throw new TypeError(
+        'Initial dataset metadata id must equal the manager dataset id.'
+      );
+    }
+    updateDatasetInfo(initialMetadata, initialSourceType);
+  }
+
+  const catalogReady = populateDatasetDropdown();
+
+dataSourceManager.onSourcesChange(() => {
+  void populateDatasetDropdown();
+});
+dataSourceManager.onDatasetChange(synchronizeDatasetEvent);
+datasetSelect.addEventListener('change', event => {
+  void handleDatasetSelectEvent(event);
+});
   initDatasetConnections({
     state,
     viewer,
@@ -552,5 +965,11 @@ if (datasetSelect && dataSourceManager) {
     noneDatasetValue: NONE_DATASET_VALUE
   });
 
-  return { refreshDatasetUI };
+  return {
+    catalogReady,
+    clearDataset: handleNoneDatasetSelection,
+    populateDatasetDropdown,
+    refreshDatasetUI,
+    selectDataset: handleDatasetChange
+  };
 }

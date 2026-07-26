@@ -16,10 +16,10 @@
  * - _renderFormControls(wrapper) - Render form inputs into wrapper
  * - _getFormValues() - Extract form values as object
  * - _runAnalysisImpl(formValues) - Execute analysis, return result object
+ * - _showResult(result) - Render the completed result
  *
  * Subclasses may override:
  * - _validateForm(formValues) - Custom form validation
- * - _showResult(result) - Custom result rendering
  * - _getLoadingMessage() - Custom loading message
  * - _getSuccessMessage() - Custom success message
  * - _getRunButtonText() - Custom button text
@@ -35,9 +35,7 @@
 import { BaseAnalysisUI } from '../../base-analysis-ui.js';
 import {
   createFormButton,
-  createNotice,
-  createResultHeader,
-  createActionsBar
+  createNotice
 } from '../../../shared/dom-utils.js';
 import {
   runAnalysisWithLoadingState,
@@ -54,6 +52,126 @@ import {
 import { loadPlotly, downloadImage, purgePlot } from '../../../plots/plotly-loader.js';
 import { PlotRegistry } from '../../../shared/plot-registry-utils.js';
 import { renderOrUpdatePlot } from '../../../shared/plot-lifecycle.js';
+
+function isPlainObject(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function requireExactKeys(value, expectedKeys, label) {
+  if (!isPlainObject(value)) {
+    throw new TypeError(`${label} must be an object`);
+  }
+  const actualKeys = Object.keys(value).sort();
+  const sortedExpected = [...expectedKeys].sort();
+  if (
+    actualKeys.length !== sortedExpected.length ||
+    actualKeys.some((key, index) => key !== sortedExpected[index])
+  ) {
+    throw new TypeError(
+      `${label} must contain exactly: ${sortedExpected.join(', ')}`
+    );
+  }
+}
+
+function requirePageIds(pageIds) {
+  if (!Array.isArray(pageIds)) {
+    throw new TypeError('Form-based analysis selectedPages must be an array');
+  }
+  const seen = new Set();
+  for (const pageId of pageIds) {
+    if (typeof pageId !== 'string' || pageId.length === 0) {
+      throw new TypeError(
+        'Form-based analysis selectedPages must contain non-empty string IDs'
+      );
+    }
+    if (seen.has(pageId)) {
+      throw new TypeError(
+        `Form-based analysis page "${pageId}" is selected more than once`
+      );
+    }
+    seen.add(pageId);
+  }
+}
+
+function requireFormControlSnapshot(snapshot) {
+  if (!isPlainObject(snapshot)) {
+    throw new TypeError('Form-based analysis formControls must be an object');
+  }
+  for (const [name, control] of Object.entries(snapshot)) {
+    if (name.length === 0) {
+      throw new TypeError('Form control names must be non-empty strings');
+    }
+    requireExactKeys(control, ['type', 'value'], `Form control "${name}"`);
+    if (control.type === 'checkbox') {
+      if (typeof control.value !== 'boolean') {
+        throw new TypeError(
+          `Form control "${name}" checkbox value must be a boolean`
+        );
+      }
+    } else if (control.type === 'value') {
+      if (typeof control.value !== 'string') {
+        throw new TypeError(
+          `Form control "${name}" value must be a string`
+        );
+      }
+    } else {
+      throw new TypeError(
+        `Form control "${name}" type must be checkbox or value`
+      );
+    }
+  }
+}
+
+function throwAfterModalCleanup(owner, modal, primaryError, context) {
+  if (owner._modal === modal) owner._modal = null;
+  try {
+    closeModal(modal);
+  } catch (cleanupError) {
+    throw new AggregateError(
+      [primaryError, cleanupError],
+      `${context} failed and modal teardown also failed`
+    );
+  }
+  throw primaryError;
+}
+
+function throwAfterExportFailureNotification(
+  notifications,
+  primaryError,
+  format
+) {
+  let notificationError = null;
+  try {
+    if (
+      !(primaryError instanceof Error) ||
+      typeof primaryError.message !== 'string' ||
+      primaryError.message.length === 0 ||
+      primaryError.message !== primaryError.message.trim()
+    ) {
+      throw new TypeError('Analysis export failures must be exact Error instances');
+    }
+    if (!notifications || typeof notifications.error !== 'function') {
+      throw new TypeError('Analysis exports require an error notification owner');
+    }
+    notifications.error(
+      `${format} export failed: ${primaryError.message}`,
+      { category: 'download' }
+    );
+  } catch (error) {
+    notificationError = error;
+  }
+  if (notificationError !== null) {
+    throw new AggregateError(
+      [primaryError, notificationError],
+      `${format} export and failure notification both failed`
+    );
+  }
+  throw primaryError;
+}
 
 /**
  * Abstract base class for form-based analysis UIs
@@ -102,11 +220,20 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     /** @type {Record<string, { type: 'checkbox'|'value', value: string|boolean }>} */
     const out = {};
     const form = this._formContainer?.querySelector?.('.analysis-form');
-    if (!form) return out;
+    if (!form) {
+      throw new Error(
+        'Form-based analysis settings require an initialized analysis form'
+      );
+    }
 
     form.querySelectorAll('input[name], select[name], textarea[name]').forEach((el) => {
       const name = el.getAttribute('name');
-      if (!name) return;
+      if (typeof name !== 'string' || name.length === 0) {
+        throw new TypeError('Named form controls require a non-empty name');
+      }
+      if (Object.hasOwn(out, name)) {
+        throw new TypeError(`Form control name "${name}" is duplicated`);
+      }
       if (el instanceof HTMLInputElement && el.type === 'checkbox') {
         out[name] = { type: 'checkbox', value: el.checked };
       } else if (el instanceof HTMLInputElement) {
@@ -115,9 +242,12 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
         out[name] = { type: 'value', value: el.value };
       } else if (el instanceof HTMLTextAreaElement) {
         out[name] = { type: 'value', value: el.value };
+      } else {
+        throw new TypeError(`Form control "${name}" has an unsupported element type`);
       }
     });
 
+    requireFormControlSnapshot(out);
     return out;
   }
 
@@ -127,33 +257,180 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * @protected
    */
   _applyNamedFormControls(snapshot) {
-    if (!snapshot || typeof snapshot !== 'object') return;
+    requireFormControlSnapshot(snapshot);
     const form = this._formContainer?.querySelector?.('.analysis-form');
-    if (!form) return;
+    if (!form) {
+      throw new Error(
+        'Form-based analysis settings require an initialized analysis form'
+      );
+    }
 
+    const namedElements = new Map();
+    form.querySelectorAll('input[name], select[name], textarea[name]').forEach((element) => {
+      const name = element.getAttribute('name');
+      if (typeof name !== 'string' || name.length === 0) {
+        throw new TypeError('Named form controls require a non-empty name');
+      }
+      if (namedElements.has(name)) {
+        throw new TypeError(`Form control name "${name}" is duplicated`);
+      }
+      namedElements.set(name, element);
+    });
+
+    const operations = [];
     for (const [name, data] of Object.entries(snapshot)) {
-      if (!data) continue;
-      const el = form.querySelector(`[name="${CSS.escape(name)}"]`);
-      if (!el) continue;
+      const el = namedElements.get(name);
+      if (!el) {
+        throw new Error(`Form control "${name}" was not found`);
+      }
 
       if (data.type === 'checkbox' && el instanceof HTMLInputElement && el.type === 'checkbox') {
-        el.checked = !!data.value;
-        el.dispatchEvent(new Event('change', { bubbles: true }));
+        operations.push(() => {
+          el.checked = data.value;
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        });
         continue;
       }
 
       if (data.type === 'value' && (el instanceof HTMLInputElement || el instanceof HTMLSelectElement)) {
-        el.value = String(data.value ?? '');
-        el.dispatchEvent(new Event('change', { bubbles: true }));
+        operations.push(() => {
+          el.value = data.value;
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        });
         continue;
       }
 
       if (data.type === 'value' && el instanceof HTMLTextAreaElement) {
-        el.value = String(data.value ?? '');
-        el.dispatchEvent(new Event('input', { bubbles: true }));
+        operations.push(() => {
+          el.value = data.value;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+        });
         continue;
       }
+
+      throw new TypeError(
+        `Form control "${name}" snapshot type does not match its element`
+      );
     }
+
+    for (const apply of operations) {
+      apply();
+    }
+  }
+
+  /**
+   * Validate the complete settings schema owned by a concrete form analysis.
+   * @param {unknown} settings
+   * @param {string[]} expectedKeys
+   * @returns {{ selectedPages: string[], formControls: Object }}
+   * @protected
+   */
+  _requireExactFormSettings(settings, expectedKeys) {
+    requireExactKeys(settings, expectedKeys, 'Form-based analysis settings');
+    requirePageIds(settings.selectedPages);
+    requireFormControlSnapshot(settings.formControls);
+    const pages = this._pageSelector
+      ? this._pageSelector._getPages()
+      : this.dataLayer.getPages();
+    if (!Array.isArray(pages)) {
+      throw new TypeError(
+        'Form-based analysis page inventory must be an array'
+      );
+    }
+    const availablePageIds = new Set(pages.map(page => page.id));
+    for (const pageId of settings.selectedPages) {
+      if (!availablePageIds.has(pageId)) {
+        throw new Error(
+          `Form-based analysis page "${pageId}" was not found`
+        );
+      }
+      if (this.dataLayer.getCellCountForPageId(pageId) === 0) {
+        throw new RangeError(
+          `Form-based analysis page "${pageId}" has zero cells and cannot be selected`
+        );
+      }
+    }
+    return {
+      selectedPages: [...settings.selectedPages],
+      formControls: structuredClone(settings.formControls)
+    };
+  }
+
+  /**
+   * Validate custom page colors against the initialized page selector.
+   * @param {unknown} entries
+   * @returns {Array<[string, string]>}
+   * @protected
+   */
+  _requireCustomPageColors(entries) {
+    if (!Array.isArray(entries)) {
+      throw new TypeError('Custom page colors must be an array');
+    }
+    if (!this._pageSelector) {
+      throw new Error(
+        'Custom page color settings require an initialized page selector'
+      );
+    }
+    const availablePageIds = new Set(
+      this._pageSelector._getPages().map(page => page.id)
+    );
+    const colors = [];
+    const seenPageIds = new Set();
+    for (const entry of entries) {
+      if (
+        !Array.isArray(entry) ||
+        entry.length !== 2 ||
+        typeof entry[0] !== 'string' ||
+        entry[0].length === 0 ||
+        typeof entry[1] !== 'string' ||
+        !/^#[0-9a-fA-F]{6}$/.test(entry[1])
+      ) {
+        throw new TypeError(
+          'Custom page colors must contain [pageId, #rrggbb] pairs'
+        );
+      }
+      const [pageId, color] = entry;
+      if (!availablePageIds.has(pageId)) {
+        throw new Error(`Custom color page "${pageId}" was not found`);
+      }
+      if (seenPageIds.has(pageId)) {
+        throw new TypeError(
+          `Page "${pageId}" has more than one custom color`
+        );
+      }
+      seenPageIds.add(pageId);
+      colors.push([pageId, color]);
+    }
+    return colors;
+  }
+
+  /**
+   * Apply validated custom colors through the selector's exact state boundary.
+   * @param {Array<[string, string]>} colors
+   * @protected
+   */
+  _applyCustomPageColors(colors) {
+    if (!this._pageSelector) {
+      throw new Error(
+        'Custom page color settings require an initialized page selector'
+      );
+    }
+    const state = this._pageSelector.exportState();
+    this._pageSelector.importState({
+      mode: state.mode,
+      selectedPages: state.selectedPages,
+      customColors: colors
+    });
+  }
+
+  /**
+   * Apply settings after the concrete subclass has validated its complete shape.
+   * @param {{ selectedPages: string[], formControls: Object }} settings
+   * @protected
+   */
+  _applyFormSettings(settings) {
+    this.onPageSelectionChange([...settings.selectedPages]);
+    this._applyNamedFormControls(settings.formControls);
   }
 
   /**
@@ -162,6 +439,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * @override
    */
   exportSettings() {
+    requirePageIds(this._selectedPages);
     return {
       selectedPages: [...this._selectedPages],
       formControls: this._snapshotNamedFormControls()
@@ -171,15 +449,14 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
   /**
    * Import a settings snapshot previously produced by exportSettings().
    * @override
-   * @param {{ selectedPages?: string[], formControls?: Record<string, { type: 'checkbox'|'value', value: string|boolean }> }|null} settings
+   * @param {{ selectedPages: string[], formControls: Record<string, { type: 'checkbox'|'value', value: string|boolean }> }} settings
    */
   importSettings(settings) {
-    if (!settings) return;
-    const selectedPages = Array.isArray(settings.selectedPages) ? settings.selectedPages : null;
-    if (selectedPages) {
-      this.onPageSelectionChange([...selectedPages]);
-    }
-    this._applyNamedFormControls(settings.formControls);
+    const validated = this._requireExactFormSettings(
+      settings,
+      ['formControls', 'selectedPages']
+    );
+    this._applyFormSettings(validated);
   }
 
   // ===========================================================================
@@ -243,7 +520,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
   }
 
   // ===========================================================================
-  // Optional Override Methods
+  // Default and Optional Override Methods
   // ===========================================================================
 
   /**
@@ -294,26 +571,11 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
 
   /**
    * Show analysis result
-   * Override for custom result rendering
+   * @abstract
    * @param {Object} result - Analysis result from _runAnalysisImpl()
    */
   async _showResult(result) {
-    // Default implementation - subclasses typically override this
-    this._resultContainer.classList.remove('hidden');
-    this._resultContainer.innerHTML = '';
-
-    // Result header
-    const header = createResultHeader(
-      result.title || this._getTitle(),
-      result.subtitle
-    );
-    this._resultContainer.appendChild(header);
-
-    // Placeholder for result content
-    const content = document.createElement('div');
-    content.className = 'result-content';
-    content.innerHTML = '<p>Analysis complete. Override _showResult() for custom rendering.</p>';
-    this._resultContainer.appendChild(content);
+    throw new Error('_showResult() must be implemented by subclass');
   }
 
   // ===========================================================================
@@ -326,53 +588,63 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * Subclasses can override the _renderModal* methods for custom content.
    */
   async _openExpandedView() {
-    if (!this._lastResult) return;
+    if (!this._lastResult) {
+      throw new Error(
+        'Expanded analysis view requires a completed analysis result'
+      );
+    }
 
-    // Create modal with export handlers
-    this._modal = createAnalysisModal({
-      onClose: () => { this._modal = null; },
+    let modal = null;
+    modal = createAnalysisModal({
+      onClose: () => {
+        if (this._modal === modal) this._modal = null;
+      },
       onExportPNG: () => this._exportModalPNG(),
       onExportSVG: () => this._exportModalSVG(),
       onExportCSV: () => this._exportModalCSV()
     });
+    this._modal = modal;
 
-    // Set modal title
-    if (this._modal._title) {
-      const title = this._lastResult.title || this._getTitle();
-      const subtitle = this._lastResult.subtitle || '';
-      this._modal._title.textContent = subtitle ? `${title}: ${subtitle}` : title;
-    }
-
-    // Render options panel (right side)
-    if (this._modal._optionsContent) {
-      this._renderModalOptions(this._modal._optionsContent);
-    }
-
-    openModal(this._modal);
-
-    // Render plot in modal
-      if (this._modal._plotContainer) {
-        try {
-          await loadPlotly();
-          await this._renderModalPlot(this._modal._plotContainer);
-        } catch (err) {
-          console.error(`[${this.constructor.name}] Modal plot render failed:`, err);
-          this._modal._plotContainer.innerHTML = '';
-          const errorEl = document.createElement('div');
-          errorEl.className = 'analysis-error';
-          errorEl.textContent = `Failed to render: ${err?.message || err}`;
-          this._modal._plotContainer.appendChild(errorEl);
+    try {
+      for (const field of [
+        '_annotationsContent',
+        '_optionsContent',
+        '_plotContainer',
+        '_statsContent',
+        '_title'
+      ]) {
+        if (!(modal[field] instanceof HTMLElement)) {
+          throw new TypeError(
+            `Analysis modal must provide the ${field} element`
+          );
         }
       }
 
-    // Render summary stats (bottom left)
-    if (this._modal._statsContent) {
-      this._renderModalStats(this._modal._statsContent);
-    }
+      // Set modal title
+      const title = this._lastResult.title || this._getTitle();
+      const subtitle = this._lastResult.subtitle || '';
+      modal._title.textContent = subtitle ? `${title}: ${subtitle}` : title;
 
-    // Render statistical annotations (bottom right)
-    if (this._modal._annotationsContent) {
-      this._renderModalAnnotations(this._modal._annotationsContent);
+      // Render options panel (right side)
+      this._renderModalOptions(modal._optionsContent);
+
+      openModal(modal);
+
+      await loadPlotly();
+      await this._renderModalPlot(modal._plotContainer);
+
+      // Render summary stats (bottom left)
+      this._renderModalStats(modal._statsContent);
+
+      // Render statistical annotations (bottom right)
+      this._renderModalAnnotations(modal._annotationsContent);
+    } catch (error) {
+      throwAfterModalCleanup(
+        this,
+        modal,
+        error,
+        `${this.constructor.name} expanded analysis view`
+      );
     }
   }
 
@@ -384,18 +656,12 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     // Default implementation - subclasses should override
     const result = this._lastResult;
     if (!result?.plotType || !result?.data) {
-      container.innerHTML = '<div class="analysis-empty-message">No plot data available</div>';
-      return;
+      throw new Error('Modal plot rendering requires exact plotType and data');
     }
 
     const plotDef = PlotRegistry.get(result.plotType);
     if (!plotDef) {
-      container.innerHTML = '';
-      const errorEl = document.createElement('div');
-      errorEl.className = 'analysis-error';
-      errorEl.textContent = `Unknown plot type: ${result.plotType}`;
-      container.appendChild(errorEl);
-      return;
+      throw new Error(`Unknown modal plot type: ${result.plotType}`);
     }
 
     const mergedOptions = PlotRegistry.mergeOptions(result.plotType, result.options || {});
@@ -456,7 +722,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     }
 
     const revision = ++this._optionRenderRevision;
-    void this._rerenderAfterOptionChange(revision);
+    return this._rerenderAfterOptionChange(revision);
   }
 
   /**
@@ -468,16 +734,25 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     if (revision !== this._optionRenderRevision) return;
 
     const result = this._lastResult;
-    if (!result?.plotType || !result?.data) return;
+    if (result === null || result === undefined) return;
+    if (!result.plotType || !result.data) {
+      throw new Error('Plot option updates require exact plotType and data');
+    }
 
     const plotDef = PlotRegistry.get(result.plotType);
-    if (!plotDef) return;
+    if (!plotDef) {
+      throw new Error(`Unknown plot option update type: ${result.plotType}`);
+    }
 
     const mergedOptions = PlotRegistry.mergeOptions(result.plotType, result.options || {});
 
     // Update modal plot (if open)
-    if (this._modal?._plotContainer) {
+    if (this._modal !== null) {
+      const modal = this._modal;
       try {
+        if (!(modal._plotContainer instanceof HTMLElement)) {
+          throw new TypeError('Analysis modal must provide the _plotContainer element');
+        }
         await loadPlotly();
         if (this._isDestroyed) return;
         if (revision !== this._optionRenderRevision) return;
@@ -485,19 +760,25 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
           plotDef,
           data: result.data,
           options: mergedOptions,
-          container: this._modal._plotContainer,
+          container: modal._plotContainer,
           layoutEngine: null,
           preferUpdate: true
         });
-      } catch (err) {
-        console.error(`[${this.constructor.name}] Modal plot re-render failed:`, err);
-      }
-
-      if (this._modal?._statsContent) {
-        this._renderModalStats(this._modal._statsContent);
-      }
-      if (this._modal?._annotationsContent) {
-        this._renderModalAnnotations(this._modal._annotationsContent);
+        if (!(modal._statsContent instanceof HTMLElement)) {
+          throw new TypeError('Analysis modal must provide the _statsContent element');
+        }
+        if (!(modal._annotationsContent instanceof HTMLElement)) {
+          throw new TypeError('Analysis modal must provide the _annotationsContent element');
+        }
+        this._renderModalStats(modal._statsContent);
+        this._renderModalAnnotations(modal._annotationsContent);
+      } catch (error) {
+        throwAfterModalCleanup(
+          this,
+          modal,
+          error,
+          `${this.constructor.name} modal plot update`
+        );
       }
     }
 
@@ -507,21 +788,17 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       : null;
 
     if (previewContainer) {
-      try {
-        await loadPlotly();
-        if (this._isDestroyed) return;
-        if (revision !== this._optionRenderRevision) return;
-        await renderOrUpdatePlot({
-          plotDef,
-          data: result.data,
-          options: mergedOptions,
-          container: previewContainer,
-          layoutEngine: null,
-          preferUpdate: true
-        });
-      } catch (err) {
-        console.error(`[${this.constructor.name}] Preview plot re-render failed:`, err);
-      }
+      await loadPlotly();
+      if (this._isDestroyed) return;
+      if (revision !== this._optionRenderRevision) return;
+      await renderOrUpdatePlot({
+        plotDef,
+        data: result.data,
+        options: mergedOptions,
+        container: previewContainer,
+        layoutEngine: null,
+        preferUpdate: true
+      });
     }
   }
 
@@ -552,7 +829,9 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    */
   async _exportModalPNG() {
     const container = this._modal?._plotContainer;
-    if (!container) return;
+    if (!(container instanceof HTMLElement)) {
+      throw new Error('PNG export requires an open analysis modal plot');
+    }
 
     try {
       await downloadImage(container, {
@@ -561,10 +840,10 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
         height: 800,
         filename: `${this._getClassName()}_analysis`
       });
-      this._notifications.success('Plot exported as PNG', { category: 'download' });
     } catch (err) {
-      this._notifications.error('PNG export failed: ' + err.message, { category: 'download' });
+      throwAfterExportFailureNotification(this._notifications, err, 'PNG');
     }
+    this._notifications.success('Plot exported as PNG', { category: 'download' });
   }
 
   /**
@@ -572,7 +851,9 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    */
   async _exportModalSVG() {
     const container = this._modal?._plotContainer;
-    if (!container) return;
+    if (!(container instanceof HTMLElement)) {
+      throw new Error('SVG export requires an open analysis modal plot');
+    }
 
     try {
       await downloadImage(container, {
@@ -581,18 +862,17 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
         height: 800,
         filename: `${this._getClassName()}_analysis`
       });
-      this._notifications.success('Plot exported as SVG', { category: 'download' });
     } catch (err) {
-      this._notifications.error('SVG export failed: ' + err.message, { category: 'download' });
+      throwAfterExportFailureNotification(this._notifications, err, 'SVG');
     }
+    this._notifications.success('Plot exported as SVG', { category: 'download' });
   }
 
   /**
    * Export modal data as CSV - Override for custom CSV format
    */
   _exportModalCSV() {
-    // Default implementation - subclasses should override with proper CSV export
-    this._notifications.info('CSV export not implemented for this analysis type', { category: 'download' });
+    throw new Error('_exportModalCSV() must be implemented by subclass');
   }
 
   /**
@@ -701,40 +981,52 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     // Validate form
     const validation = this._validateForm(formValues);
     if (!validation.valid) {
-      this._notifications.error(validation.error || 'Invalid form values');
+      if (
+        typeof validation.error !== 'string' ||
+        validation.error.length === 0 ||
+        validation.error !== validation.error.trim()
+      ) {
+        throw new TypeError('Invalid form validation requires an exact error message');
+      }
+      this._notifications.error(validation.error);
       return;
     }
 
     // Get run button for state management
     const runBtn = this._formContainer.querySelector('.analysis-run-btn');
 
-    try {
-      const result = await runAnalysisWithLoadingState({
-        component: this,
-        runButton: runBtn,
-        loadingMessage: this._getLoadingMessage(),
-        successMessage: this._getSuccessMessage(),
-        analysisFunction: () => this._runAnalysisImpl(formValues)
-      });
+    const result = await runAnalysisWithLoadingState({
+      component: this,
+      runButton: runBtn,
+      loadingMessage: this._getLoadingMessage(),
+      successMessage: this._getSuccessMessage(),
+      analysisFunction: () => this._runAnalysisImpl(formValues)
+    });
 
-      if (result) {
-        if (this._isDestroyed) return;
-        // Store result
-        this._lastResult = result;
-
-        // Store for base class export
-        this._currentPageData = result.data || result;
-
-        // Show result
-        await this._showResult(result);
-
-        // Callback
-        if (this.onResultChange) {
-          this.onResultChange(result);
-        }
+    if (result !== null) {
+      if (!isPlainObject(result)) {
+        throw new TypeError('Form-based analysis must return an exact result object');
       }
-    } catch (error) {
-      console.error(`[${this.constructor.name}] Analysis error:`, error);
+      if (!Object.hasOwn(result, 'data')) {
+        throw new TypeError('Form-based analysis result must contain data');
+      }
+      if (this._isDestroyed) return;
+      // Store result
+      this._lastResult = result;
+
+      // Store for base class export
+      this._currentPageData = result.data;
+
+      // Show result
+      await this._showResult(result);
+
+      // Callback
+      if (this.onResultChange !== null && this.onResultChange !== undefined) {
+        if (typeof this.onResultChange !== 'function') {
+          throw new TypeError('onResultChange must be a function');
+        }
+        this.onResultChange(result);
+      }
     }
   }
 
@@ -747,7 +1039,12 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * @param {string[]} pageIds - Selected page IDs
    */
   onPageSelectionChange(pageIds) {
-    this._selectedPages = pageIds || [];
+    requirePageIds(pageIds);
+    this._requireAvailableSelectedPages(
+      pageIds,
+      'Form-based analysis selectedPages'
+    );
+    this._selectedPages = [...pageIds];
     this._currentConfig.pages = this._selectedPages;
     this._renderControls();
 
@@ -771,19 +1068,25 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    */
   destroy() {
     this._isDestroyed = true;
+    const errors = [];
+    const run = operation => {
+      try {
+        operation();
+      } catch (error) {
+        errors.push(error);
+      }
+    };
     // Purge any preview plot to release Plotly/WebGL resources before DOM removal.
-    try {
+    run(() => {
       const plotEl = this._plotContainerId
         ? document.getElementById(this._plotContainerId)
         : this._container?.querySelector?.('.analysis-preview-plot');
       if (plotEl) purgePlot(plotEl);
-    } catch (_err) {
-      // Ignore purge errors during teardown
-    }
+    });
 
     // Close modal if open
     if (this._modal) {
-      closeModal(this._modal);
+      run(() => closeModal(this._modal));
       this._modal = null;
     }
     // Clear form-specific state
@@ -791,7 +1094,15 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     this._resultContainer = null;
     this._plotContainerId = null;
     // Base class handles _selectedPages, _lastResult, _isLoading
-    super.destroy();
+    run(() => super.destroy());
+
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) {
+      throw new AggregateError(
+        errors,
+        `Form analysis teardown failed in ${errors.length} operations`
+      );
+    }
   }
 }
 
@@ -802,7 +1113,9 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
  * @returns {FormBasedAnalysisUI}
  */
 export function createFormBasedAnalysisUI(UIClass, options) {
-  return new UIClass(options);
+  const ui = new UIClass(options);
+  ui.init(options.container);
+  return ui;
 }
 
 export default FormBasedAnalysisUI;

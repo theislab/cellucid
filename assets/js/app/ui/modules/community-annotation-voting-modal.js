@@ -37,12 +37,37 @@ function toCleanString(value) {
   return String(value ?? '').trim();
 }
 
+function runExactCleanup(context, entries) {
+  const errors = [];
+  for (const [label, operation] of entries) {
+    if (operation === null || operation === undefined) continue;
+    if (typeof operation !== 'function') {
+      errors.push(new TypeError(`${label} cleanup must be a function`));
+      continue;
+    }
+    try {
+      operation();
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) {
+    throw new AggregateError(
+      errors,
+      `${context} failed in ${errors.length} cleanup operations`
+    );
+  }
+}
+
 function describeErrorMessage(err) {
-  const msg = toCleanString(err?.message || '');
-  if (msg) return msg;
-  const fallback = toCleanString(err);
-  if (fallback && fallback !== '[object Object]') return fallback;
-  return 'Request failed';
+  if (!(err instanceof Error)) {
+    throw new TypeError('Community annotation operations must reject with an Error instance');
+  }
+  if (typeof err.message !== 'string' || err.message.length === 0 || err.message !== err.message.trim()) {
+    throw new TypeError('Community annotation errors require a non-empty trimmed message');
+  }
+  return err.message;
 }
 
 function truncateForUi(value, maxLen) {
@@ -53,45 +78,142 @@ function truncateForUi(value, maxLen) {
 }
 
 function formatCommentAuthorHandle(session, username, { maxLen = 12 } = {}) {
-  const raw = toCleanString(username).replace(/^@+/, '');
-  let handle = raw || 'local';
-  try {
-    const prof = session?.getKnownUserProfile?.(raw);
-    const login = toCleanString(prof?.login);
-    if (login) handle = login;
-  } catch {
-    // ignore
+  if (
+    typeof username !== 'string' ||
+    username.length === 0 ||
+    username !== username.trim() ||
+    username.startsWith('@')
+  ) {
+    throw new TypeError('Comment author username must be an exact handle');
   }
-  handle = toCleanString(handle).replace(/^@+/, '') || 'local';
-  if (/^ghid_\d+$/i.test(handle)) handle = 'unknown';
+  if (!session || typeof session.getKnownUserProfile !== 'function') {
+    throw new TypeError('Comment author formatting requires getKnownUserProfile()');
+  }
+  const prof = session.getKnownUserProfile(username);
+  const login = prof?.login ?? '';
+  if (typeof login !== 'string' || login !== login.trim()) {
+    throw new TypeError('Known comment author login must be an exact string');
+  }
+  const handle = login || username;
   return `@${truncateForUi(handle, maxLen)}`;
 }
 
 function bucketKey(session, fieldKey, catIdx) {
-  try {
-    const key = session?.toBucketKey?.(fieldKey, catIdx);
-    if (key) return key;
-  } catch {
-    // ignore
+  if (!session || typeof session.toBucketKey !== 'function') {
+    throw new TypeError('Community annotation session must expose toBucketKey()');
   }
-  const f = toCleanString(fieldKey);
-  const idx = Number.isFinite(catIdx) ? Math.max(0, Math.floor(catIdx)) : 0;
-  return `${f}:${idx}`;
+  const key = session.toBucketKey(fieldKey, catIdx);
+  if (typeof key !== 'string' || key.length === 0 || key !== key.trim()) {
+    throw new TypeError('Community annotation bucket key must be an exact string');
+  }
+  return key;
 }
 
-function resolveMergeTarget(fromId, fromToMap) {
-  const start = toCleanString(fromId);
-  if (!start) return null;
-  let cur = start;
-  const seen = new Set([cur]);
-  while (fromToMap.has(cur)) {
-    const next = toCleanString(fromToMap.get(cur));
-    if (!next) break;
-    if (seen.has(next)) return null;
-    seen.add(next);
-    cur = next;
+function requireSuggestionId(value, label) {
+  if (
+    typeof value !== 'string'
+    || value.length === 0
+    || value !== value.trim()
+  ) {
+    throw new TypeError(`${label} must be a non-empty trimmed string`);
   }
-  return cur;
+  return value;
+}
+
+/**
+ * Validate and deterministically order the exact merge edges that terminate at
+ * one suggestion bundle. Each included edge is returned once.
+ *
+ * @param {{ targetSuggestionId: string, merges: object[] }} input
+ * @returns {{ targetSuggestionId: string, steps: Array<{fromSuggestionId: string, intoSuggestionId: string, merge: object}> }}
+ */
+export function buildMergeTraversal(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw new TypeError('Merge traversal input must be an object');
+  }
+  const targetSuggestionId = requireSuggestionId(
+    input.targetSuggestionId,
+    'Merge traversal targetSuggestionId'
+  );
+  if (!Array.isArray(input.merges)) {
+    throw new TypeError('Merge traversal merges must be an array');
+  }
+
+  const fromTo = new Map();
+  const mergeByFrom = new Map();
+  for (let index = 0; index < input.merges.length; index++) {
+    const merge = input.merges[index];
+    if (!merge || typeof merge !== 'object' || Array.isArray(merge)) {
+      throw new TypeError(`Merge traversal entry ${index} must be an object`);
+    }
+    const fromSuggestionId = requireSuggestionId(
+      merge.fromSuggestionId,
+      `Merge traversal entry ${index} fromSuggestionId`
+    );
+    const intoSuggestionId = requireSuggestionId(
+      merge.intoSuggestionId,
+      `Merge traversal entry ${index} intoSuggestionId`
+    );
+    if (fromSuggestionId === intoSuggestionId) {
+      throw new Error(`Merge traversal entry ${index} cannot merge a suggestion into itself`);
+    }
+    if (fromTo.has(fromSuggestionId)) {
+      throw new Error(`Merge traversal has duplicate source "${fromSuggestionId}"`);
+    }
+    fromTo.set(fromSuggestionId, intoSuggestionId);
+    mergeByFrom.set(fromSuggestionId, merge);
+  }
+
+  if (fromTo.has(targetSuggestionId)) {
+    throw new Error(`Merge traversal target "${targetSuggestionId}" must be terminal`);
+  }
+
+  const terminalByFrom = new Map();
+  for (const start of fromTo.keys()) {
+    let current = start;
+    const path = new Set();
+    while (fromTo.has(current)) {
+      if (path.has(current)) {
+        throw new Error(`Merge traversal contains a cycle at "${current}"`);
+      }
+      path.add(current);
+      current = fromTo.get(current);
+    }
+    terminalByFrom.set(start, current);
+  }
+
+  const includedFromIds = [...fromTo.keys()].filter(
+    (fromSuggestionId) => terminalByFrom.get(fromSuggestionId) === targetSuggestionId
+  );
+  const includedFromSet = new Set(includedFromIds);
+  const includedIntoSet = new Set(
+    includedFromIds.map((fromSuggestionId) => fromTo.get(fromSuggestionId))
+  );
+  const roots = includedFromIds
+    .filter((fromSuggestionId) => !includedIntoSet.has(fromSuggestionId))
+    .sort((left, right) => left.localeCompare(right));
+
+  const emitted = new Set();
+  const steps = [];
+  for (const root of roots) {
+    let current = root;
+    while (current !== targetSuggestionId && includedFromSet.has(current)) {
+      if (emitted.has(current)) break;
+      emitted.add(current);
+      steps.push({
+        fromSuggestionId: current,
+        intoSuggestionId: fromTo.get(current),
+        merge: mergeByFrom.get(current)
+      });
+      current = fromTo.get(current);
+    }
+  }
+
+  if (emitted.size !== includedFromIds.length) {
+    throw new Error('Merge traversal could not reach every included merge from an exact root');
+  }
+
+  return { targetSuggestionId, steps };
 }
 
 function normalizeLabelForCompare(value) {
@@ -151,40 +273,52 @@ function markersToInputText(markers) {
 }
 
 function formatRelativeTime(isoString) {
-  if (!isoString) return '';
-  try {
-    const date = new Date(isoString);
-    const now = Date.now();
-    const diffMs = now - date.getTime();
-    const diffMins = Math.floor(diffMs / 60000);
-    const diffHrs = Math.floor(diffMins / 60);
-    const diffDays = Math.floor(diffHrs / 24);
-
-    if (diffMins < 1) return 'just now';
-    if (diffMins < 60) return `${diffMins}m ago`;
-    if (diffHrs < 24) return `${diffHrs}h ago`;
-    if (diffDays < 30) return `${diffDays}d ago`;
-    return date.toLocaleDateString();
-  } catch {
-    return '';
+  if (isoString === null || isoString === undefined || isoString === '') return '';
+  if (
+    typeof isoString !== 'string' ||
+    isoString !== isoString.trim()
+  ) {
+    throw new TypeError('Comment timestamp must be an exact string');
   }
+  const date = new Date(isoString);
+  const timestamp = date.getTime();
+  if (!Number.isFinite(timestamp)) {
+    throw new RangeError('Comment timestamp must be a valid date');
+  }
+  const diffMs = Date.now() - timestamp;
+  const diffMins = Math.floor(diffMs / 60000);
+  const diffHrs = Math.floor(diffMins / 60);
+  const diffDays = Math.floor(diffHrs / 24);
+
+  if (diffMins < 1) return 'just now';
+  if (diffMins < 60) return `${diffMins}m ago`;
+  if (diffHrs < 24) return `${diffHrs}h ago`;
+  if (diffDays < 30) return `${diffDays}d ago`;
+  return date.toLocaleDateString();
 }
 
 function createDomId(prefix = 'id') {
-  const p = toCleanString(prefix) || 'id';
-  try {
-    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-      return `${p}-${crypto.randomUUID()}`;
-    }
-  } catch {
-    // ignore
+  if (
+    typeof prefix !== 'string' ||
+    prefix.length === 0 ||
+    prefix !== prefix.trim()
+  ) {
+    throw new TypeError('DOM id prefix must be an exact string');
   }
-  return `${p}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  if (
+    typeof globalThis.crypto !== 'object' ||
+    typeof globalThis.crypto.randomUUID !== 'function'
+  ) {
+    throw new TypeError('Community annotation modals require crypto.randomUUID()');
+  }
+  return `${prefix}-${globalThis.crypto.randomUUID()}`;
 }
 
 function listFocusableElements(root) {
-  const container = root || null;
-  if (!container || typeof container.querySelectorAll !== 'function') return [];
+  const container = root;
+  if (!container || typeof container.querySelectorAll !== 'function') {
+    throw new TypeError('Modal focus root must expose querySelectorAll()');
+  }
   const selectors = [
     'a[href]',
     'area[href]',
@@ -198,39 +332,44 @@ function listFocusableElements(root) {
   const nodes = Array.from(container.querySelectorAll(selectors));
   return nodes.filter((node) => {
     if (!(node instanceof HTMLElement)) return false;
-    try {
-      const style = window.getComputedStyle?.(node);
-      if (style?.display === 'none' || style?.visibility === 'hidden') return false;
-      return node.getClientRects().length > 0;
-    } catch {
-      return true;
+    if (typeof window.getComputedStyle !== 'function') {
+      throw new TypeError('Modal focus management requires getComputedStyle()');
     }
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden') return false;
+    return node.getClientRects().length > 0;
   });
 }
 
 function trapModalFocus({ overlay, modal, close, escCancelSelector = null } = {}) {
-  const o = overlay || null;
-  const m = modal || null;
-  if (!o || !m || typeof o.addEventListener !== 'function') return () => {};
+  const o = overlay;
+  const m = modal;
+  if (
+    !o ||
+    typeof o.addEventListener !== 'function' ||
+    typeof o.removeEventListener !== 'function'
+  ) {
+    throw new TypeError('Modal overlay must expose exact event listener methods');
+  }
+  if (!m || typeof m.contains !== 'function') {
+    throw new TypeError('Modal focus container must expose contains()');
+  }
+  if (typeof close !== 'function') {
+    throw new TypeError('Modal focus trap requires a close callback');
+  }
 
   const onKeyDown = (e) => {
-    if (!e) return;
+    if (!e || typeof e.preventDefault !== 'function' || typeof e.stopPropagation !== 'function') {
+      throw new TypeError('Modal focus trap requires exact keyboard event methods');
+    }
     if (e.key === 'Escape') {
-      try {
-        if (escCancelSelector) {
-          const target = e?.target || null;
-          if (target && typeof target.closest === 'function' && target.closest(escCancelSelector)) return;
-        }
-      } catch {
-        // ignore
+      if (escCancelSelector) {
+        const target = e.target;
+        if (target && typeof target.closest === 'function' && target.closest(escCancelSelector)) return;
       }
-      try {
-        e.preventDefault?.();
-        e.stopPropagation?.();
-      } catch {
-        // ignore
-      }
-      close?.();
+      e.preventDefault();
+      e.stopPropagation();
+      close();
       return;
     }
 
@@ -238,11 +377,7 @@ function trapModalFocus({ overlay, modal, close, escCancelSelector = null } = {}
 
     const focusables = listFocusableElements(m);
     if (!focusables.length) {
-      try {
-        e.preventDefault?.();
-      } catch {
-        // ignore
-      }
+      e.preventDefault();
       return;
     }
 
@@ -253,34 +388,26 @@ function trapModalFocus({ overlay, modal, close, escCancelSelector = null } = {}
 
     if (e.shiftKey) {
       if (!containsActive || active === first) {
-        try {
-          e.preventDefault?.();
-          last.focus?.();
-        } catch {
-          // ignore
+        if (typeof last.focus !== 'function') {
+          throw new TypeError('Modal focus target must expose focus()');
         }
+        e.preventDefault();
+        last.focus();
       }
       return;
     }
 
     if (!containsActive || active === last) {
-      try {
-        e.preventDefault?.();
-        first.focus?.();
-      } catch {
-        // ignore
+      if (typeof first.focus !== 'function') {
+        throw new TypeError('Modal focus target must expose focus()');
       }
+      e.preventDefault();
+      first.focus();
     }
   };
 
   o.addEventListener('keydown', onKeyDown, true);
-  return () => {
-    try {
-      o.removeEventListener('keydown', onKeyDown, true);
-    } catch {
-      // ignore
-    }
-  };
+  return () => o.removeEventListener('keydown', onKeyDown, true);
 }
 
 // =============================================================================
@@ -341,17 +468,19 @@ function truncateText(text, maxLen) {
 }
 
 function autoSizeTextarea(textarea, { minHeightPx = null, maxHeightPx = null } = {}) {
-  const el = textarea || null;
-  if (!el) return;
-  try {
-    el.style.height = 'auto';
-    const next = Math.max(minHeightPx ?? 0, el.scrollHeight || 0);
-    const capped = maxHeightPx != null ? Math.min(next, maxHeightPx) : next;
-    el.style.height = `${capped}px`;
-    el.style.overflowY = maxHeightPx != null && next > maxHeightPx ? 'auto' : 'hidden';
-  } catch {
-    // ignore
+  const element = textarea;
+  if (!element || !element.style) {
+    throw new TypeError('Textarea autosizing requires an exact rendered textarea');
   }
+  element.style.height = 'auto';
+  const scrollHeight = element.scrollHeight;
+  if (!Number.isFinite(scrollHeight)) {
+    throw new TypeError('Textarea autosizing requires a finite scrollHeight');
+  }
+  const next = Math.max(minHeightPx ?? 0, scrollHeight);
+  const capped = maxHeightPx != null ? Math.min(next, maxHeightPx) : next;
+  element.style.height = `${capped}px`;
+  element.style.overflowY = maxHeightPx != null && next > maxHeightPx ? 'auto' : 'hidden';
 }
 
 function renderComment({ session, fieldKey, catIdx, suggestionId, comment, canInteract = true, onUpdate }) {
@@ -444,6 +573,9 @@ function renderComment({ session, fieldKey, catIdx, suggestionId, comment, canIn
 }
 
 function showModal({ title, buildContent }) {
+  if (typeof buildContent !== 'function') {
+    throw new TypeError('Community annotation modal requires a content builder');
+  }
   const existing = document.querySelector('.community-annotation-modal-overlay');
   if (existing) existing.remove();
 
@@ -460,7 +592,7 @@ function showModal({ title, buildContent }) {
   header.appendChild(closeBtn);
 
   const content = el('div', { className: 'community-annotation-modal-body' });
-  buildContent?.(content);
+  buildContent(content);
 
   modal.appendChild(header);
   modal.appendChild(content);
@@ -472,17 +604,21 @@ function showModal({ title, buildContent }) {
   const close = () => {
     if (closed) return;
     closed = true;
-    try {
-      cleanupTrap?.();
-    } catch {
-      // ignore
-    }
-    overlay.remove();
-    try {
-      prevFocus?.focus?.();
-    } catch {
-      // ignore
-    }
+    runExactCleanup('Community annotation voting modal teardown', [
+      ['focus trap', cleanupTrap],
+      ['modal overlay', () => overlay.remove()],
+      [
+        'previous focus target',
+        prevFocus === null
+          ? null
+          : () => {
+              if (typeof prevFocus.focus !== 'function') {
+                throw new TypeError('Previous focus target must expose focus()');
+              }
+              prevFocus.focus();
+            }
+      ]
+    ]);
   };
   closeBtn.addEventListener('click', close);
   overlay.addEventListener('click', (e) => {
@@ -491,7 +627,7 @@ function showModal({ title, buildContent }) {
 
   document.body.appendChild(overlay);
   cleanupTrap = trapModalFocus({ overlay, modal, close });
-  closeBtn.focus?.();
+  closeBtn.focus();
 
   return { close, overlay, modal, content };
 }
@@ -617,22 +753,14 @@ function renderMergeRow({ session, fieldKey, catIdx, merge, idToLabel, canDetach
       });
       input.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') {
-          try {
-            e.preventDefault?.();
-            e.stopPropagation?.();
-          } catch {
-            // ignore
-          }
+          e.preventDefault();
+          e.stopPropagation();
           renderMetaDisplay();
           return;
         }
         if (e.key === 'Enter' && !e.shiftKey) {
-          try {
-            e.preventDefault?.();
-            e.stopPropagation?.();
-          } catch {
-            // ignore
-          }
+          e.preventDefault();
+          e.stopPropagation();
           save();
         }
       });
@@ -640,13 +768,11 @@ function renderMergeRow({ session, fieldKey, catIdx, merge, idToLabel, canDetach
       inputWrap.appendChild(input);
       inputWrap.appendChild(charCounter);
       metaEl.appendChild(inputWrap);
-      try {
-        if (typeof requestAnimationFrame === 'function') requestAnimationFrame(resize);
-        else setTimeout(resize, 0);
-      } catch {
-        // ignore
+      if (typeof requestAnimationFrame !== 'function') {
+        throw new TypeError('Merge note editing requires requestAnimationFrame()');
       }
-      input.focus?.();
+      requestAnimationFrame(resize);
+      input.focus();
     };
 
     const detachBtn = el('button', { type: 'button', className: 'btn-small', text: 'Detach' });
@@ -672,10 +798,11 @@ function renderMergeRow({ session, fieldKey, catIdx, merge, idToLabel, canDetach
 }
 
 function showSecondaryModal({ title, buildContent, session = null }) {
-  try {
-    activeSecondaryModal?.close?.();
-  } catch {
-    // ignore
+  if (typeof buildContent !== 'function') {
+    throw new TypeError('Secondary modal requires a content builder');
+  }
+  if (activeSecondaryModal !== null) {
+    activeSecondaryModal.close();
   }
   activeSecondaryModal = null;
 
@@ -699,32 +826,47 @@ function showSecondaryModal({ title, buildContent, session = null }) {
 
   let unsubscribe = null;
   let ownerObserver = null;
+  let closed = false;
   const ownerOverlay = document.querySelector('.community-annotation-modal-overlay');
 
   const render = () => {
     content.innerHTML = '';
-    try {
-      buildContent?.(content, { close });
-    } catch {
-      // ignore
-    }
+    buildContent(content, { close });
   };
 
   const close = () => {
-    try {
-      unsubscribe?.();
-    } catch {
-      // ignore
+    if (closed) return;
+    closed = true;
+    if (activeSecondaryModal !== null && activeSecondaryModal.close === close) {
+      activeSecondaryModal = null;
     }
-    try {
-      ownerObserver?.disconnect?.();
-    } catch {
-      // ignore
-    }
-    try { cleanupTrap?.(); } catch { /* ignore */ }
-    overlay.remove();
-    if (activeSecondaryModal?.close === close) activeSecondaryModal = null;
-    try { prevFocus?.focus?.(); } catch { /* ignore */ }
+    runExactCleanup('Community annotation secondary modal teardown', [
+      ['session subscription', unsubscribe],
+      [
+        'owner observer',
+        ownerObserver === null
+          ? null
+          : () => {
+              if (typeof ownerObserver.disconnect !== 'function') {
+                throw new TypeError('Secondary modal observer must expose disconnect()');
+              }
+              ownerObserver.disconnect();
+            }
+      ],
+      ['focus trap', cleanupTrap],
+      ['secondary modal overlay', () => overlay.remove()],
+      [
+        'previous focus target',
+        prevFocus === null
+          ? null
+          : () => {
+              if (typeof prevFocus.focus !== 'function') {
+                throw new TypeError('Previous focus target must expose focus()');
+              }
+              prevFocus.focus();
+            }
+      ]
+    ]);
   };
 
   closeBtn.addEventListener('click', close);
@@ -735,24 +877,35 @@ function showSecondaryModal({ title, buildContent, session = null }) {
   const cleanupTrap = trapModalFocus({ overlay, modal, close, escCancelSelector: '[data-esc-cancel="true"]' });
 
   document.body.appendChild(overlay);
-  closeBtn.focus?.();
+  closeBtn.focus();
 
   if (session && typeof session.on === 'function') {
     unsubscribe = session.on('changed', () => render());
+    if (typeof unsubscribe !== 'function') {
+      throw new TypeError('Secondary modal session subscription must return an unsubscribe function');
+    }
+  }
+
+  if (ownerOverlay) {
+    ownerObserver = new MutationObserver(() => {
+      if (!document.body.contains(ownerOverlay)) close();
+    });
+    ownerObserver.observe(document.body, { childList: true, subtree: true });
   }
 
   try {
-    if (ownerOverlay && typeof MutationObserver !== 'undefined') {
-      ownerObserver = new MutationObserver(() => {
-        if (!document.body.contains(ownerOverlay)) close();
-      });
-      ownerObserver.observe(document.body, { childList: true, subtree: true });
+    render();
+  } catch (primaryError) {
+    try {
+      close();
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [primaryError, cleanupError],
+        'Secondary modal rendering and teardown both failed'
+      );
     }
-  } catch {
-    // ignore
+    throw primaryError;
   }
-
-  render();
 
   activeSecondaryModal = { close };
   return { close, overlay, modal, content };
@@ -783,27 +936,25 @@ function openMergedSuggestionsModal({ session, fieldKey, catIdx, targetSuggestio
       const canDetach = access.isAuthor();
 
       const idToLabel = new Map();
-      try {
-        const tid = toCleanString(target?.id);
-        if (tid) idToLabel.set(tid, toCleanString(target?.label) || tid);
-        for (const s of mergedFrom) {
-          const id = toCleanString(s?.id);
-          if (!id) continue;
-          idToLabel.set(id, toCleanString(s?.label) || id);
-        }
-      } catch {
-        // ignore
+      const tid = toCleanString(target?.id);
+      if (tid) idToLabel.set(tid, toCleanString(target?.label) || tid);
+      for (const s of mergedFrom) {
+        const id = toCleanString(s?.id);
+        if (!id) continue;
+        idToLabel.set(id, toCleanString(s?.label) || id);
       }
-      try {
-        const snap = session.getStateSnapshot?.() || null;
-        const raw = snap?.suggestions?.[bucket] || [];
-        for (const s of (Array.isArray(raw) ? raw : []).slice(0, 5000)) {
-          const id = toCleanString(s?.id);
-          if (!id || idToLabel.has(id)) continue;
-          idToLabel.set(id, toCleanString(s?.label) || id);
-        }
-      } catch {
-        // ignore
+      if (typeof session.getStateSnapshot !== 'function') {
+        throw new TypeError('Merged suggestion rendering requires getStateSnapshot()');
+      }
+      const snap = session.getStateSnapshot();
+      const raw = snap?.suggestions?.[bucket] || [];
+      if (!Array.isArray(raw)) {
+        throw new TypeError('Merged suggestion snapshot bucket must be an array');
+      }
+      for (const s of raw.slice(0, 5000)) {
+        const id = toCleanString(s?.id);
+        if (!id || idToLabel.has(id)) continue;
+        idToLabel.set(id, toCleanString(s?.label) || id);
       }
 
       const targetId = toCleanString(target?.id);
@@ -819,33 +970,10 @@ function openMergedSuggestionsModal({ session, fieldKey, catIdx, targetSuggestio
         text: 'If you have no direct vote on the bundle main card, your bundle vote is delegated from member votes (majority; ties = none) and shown with a dashed badge.'
       }));
 
-      // Effective mapping (one active merge per from id).
-      const fromTo = new Map();
-      const mergeByFrom = new Map();
-      for (const m of merges) {
-        const from = toCleanString(m?.fromSuggestionId);
-        const into = toCleanString(m?.intoSuggestionId);
-        if (!from || !into || from === into) continue;
-        fromTo.set(from, into);
-        mergeByFrom.set(from, m);
-      }
-
-      // Which "from" ids resolve into this bundle target?
-      const includedFromIds = [];
-      for (const fromId of fromTo.keys()) {
-        const resolved = resolveMergeTarget(fromId, fromTo) || fromId;
-        if (resolved === targetId) includedFromIds.push(fromId);
-      }
-      const includedFromSet = new Set(includedFromIds);
-
-      // Roots: merged suggestions that aren't the "into" of another included merge.
-      const intoSet = new Set();
-      for (const fromId of includedFromIds) {
-        const into = toCleanString(fromTo.get(fromId));
-        if (into) intoSet.add(into);
-      }
-      const roots = includedFromIds.filter((fromId) => !intoSet.has(fromId));
-      roots.sort((a, b) => String(idToLabel.get(a) || a).localeCompare(String(idToLabel.get(b) || b)));
+      const traversal = buildMergeTraversal({
+        targetSuggestionId: targetId,
+        merges
+      });
 
       const suggestionById = new Map();
       if (targetId) suggestionById.set(targetId, target);
@@ -857,7 +985,6 @@ function openMergedSuggestionsModal({ session, fieldKey, catIdx, targetSuggestio
 
       const list = el('div', { className: 'community-annotation-suggestions' });
       const renderedCards = new Set();
-      const renderedMergeFrom = new Set();
 
       const renderCard = (id) => {
         const sid = toCleanString(id);
@@ -879,37 +1006,16 @@ function openMergedSuggestionsModal({ session, fieldKey, catIdx, targetSuggestio
         }));
       };
 
-      const renderChainFrom = (rootId) => {
-        let cur = toCleanString(rootId);
-        const seen = new Set();
-        while (cur && !seen.has(cur) && cur !== targetId && includedFromSet.has(cur)) {
-          seen.add(cur);
-          renderCard(cur);
-
-          const merge = mergeByFrom.get(cur) || null;
-          if (merge) {
-            renderedMergeFrom.add(cur);
-            list.appendChild(renderMergeRow({ session, fieldKey, catIdx, merge, idToLabel, canDetach }));
-          }
-
-          cur = toCleanString(fromTo.get(cur));
-        }
-        if (cur && cur !== targetId) renderCard(cur);
-      };
-
-      for (const root of roots) renderChainFrom(root);
-
-      // Fallback: any included merges not reached by roots (cycles/odd graphs).
-      for (const fromId of includedFromIds) {
-        const from = toCleanString(fromId);
-        if (from) renderCard(from);
-        const merge = mergeByFrom.get(fromId) || null;
-        if (merge && !renderedMergeFrom.has(fromId)) {
-          list.appendChild(renderMergeRow({ session, fieldKey, catIdx, merge, idToLabel, canDetach }));
-          renderedMergeFrom.add(fromId);
-        }
-        const into = toCleanString(fromTo.get(fromId));
-        if (into && into !== targetId) renderCard(into);
+      for (const step of traversal.steps) {
+        renderCard(step.fromSuggestionId);
+        list.appendChild(renderMergeRow({
+          session,
+          fieldKey,
+          catIdx,
+          merge: step.merge,
+          idToLabel,
+          canDetach
+        }));
       }
 
       // Always render the target card last for context.
@@ -1067,7 +1173,7 @@ function renderSuggestionCard({
         editBox.style.display = 'none';
         editBtn.textContent = 'Edit';
       } catch (err) {
-        getNotificationCenter().error(err?.message || 'Failed to update suggestion', { category: 'annotation' });
+        getNotificationCenter().error(describeErrorMessage(err), { category: 'annotation' });
       }
     });
 
@@ -1141,14 +1247,13 @@ function renderSuggestionCard({
     card.appendChild(bundleRow);
   }
 
-  const comments = (() => {
-    try {
-      const list = session.getComments?.(fieldKey, catIdx, suggestion?.id) || [];
-      return Array.isArray(list) ? list : [];
-    } catch {
-      return [];
-    }
-  })();
+  if (typeof session.getComments !== 'function') {
+    throw new TypeError('Comment rendering requires session.getComments()');
+  }
+  const comments = session.getComments(fieldKey, catIdx, suggestion?.id);
+  if (!Array.isArray(comments)) {
+    throw new TypeError('Comment rendering requires an exact comments array');
+  }
   if (!isCompact && suggestion?.id) {
     const commentsBox = el('div', { className: 'community-annotation-comments-inline' });
 
@@ -1193,12 +1298,10 @@ function renderSuggestionCard({
     inputWrap.appendChild(input);
     inputWrap.appendChild(charCounter);
     commentsBox.appendChild(inputWrap);
-    try {
-      if (typeof requestAnimationFrame === 'function') requestAnimationFrame(resizeInput);
-      else setTimeout(resizeInput, 0);
-    } catch {
-      // ignore
+    if (typeof requestAnimationFrame !== 'function') {
+      throw new TypeError('Comment textarea rendering requires requestAnimationFrame()');
     }
+    requestAnimationFrame(resizeInput);
 
     const sorted = comments
       .slice()
@@ -1278,22 +1381,14 @@ function renderSuggestionCard({
         });
         input.addEventListener('keydown', (e) => {
           if (e.key === 'Escape') {
-            try {
-              e.preventDefault?.();
-              e.stopPropagation?.();
-            } catch {
-              // ignore
-            }
+            e.preventDefault();
+            e.stopPropagation();
             renderPreview();
             return;
           }
           if (e.key === 'Enter' && !e.shiftKey) {
-            try {
-              e.preventDefault?.();
-              e.stopPropagation?.();
-            } catch {
-              // ignore
-            }
+            e.preventDefault();
+            e.stopPropagation();
             save();
           }
         });
@@ -1301,13 +1396,11 @@ function renderSuggestionCard({
         inputWrap.appendChild(input);
         inputWrap.appendChild(counter);
         body.appendChild(inputWrap);
-        try {
-          if (typeof requestAnimationFrame === 'function') requestAnimationFrame(resize);
-          else setTimeout(resize, 0);
-        } catch {
-          // ignore
+        if (typeof requestAnimationFrame !== 'function') {
+          throw new TypeError('Comment editing requires requestAnimationFrame()');
         }
-        input.focus?.();
+        requestAnimationFrame(resize);
+        input.focus();
       };
 
       if (isOwn && canInteract) {
@@ -1339,27 +1432,21 @@ function renderSuggestionCard({
       scroll.appendChild(item);
     }
     const updateScrollFade = () => {
-      try {
-        const scrollable = scroll.scrollHeight > scroll.clientHeight + 1;
-        scroll.classList.toggle('is-scrollable', scrollable);
-        if (!scrollable) {
-          scroll.classList.remove('is-at-bottom');
-          return;
-        }
-        const atBottom = scroll.scrollTop + scroll.clientHeight >= scroll.scrollHeight - 1;
-        scroll.classList.toggle('is-at-bottom', atBottom);
-      } catch {
-        // ignore
+      const scrollable = scroll.scrollHeight > scroll.clientHeight + 1;
+      scroll.classList.toggle('is-scrollable', scrollable);
+      if (!scrollable) {
+        scroll.classList.remove('is-at-bottom');
+        return;
       }
+      const atBottom = scroll.scrollTop + scroll.clientHeight >= scroll.scrollHeight - 1;
+      scroll.classList.toggle('is-at-bottom', atBottom);
     };
     scroll.addEventListener('scroll', updateScrollFade, { passive: true });
-    try {
-      if (typeof requestAnimationFrame === 'function') requestAnimationFrame(updateScrollFade);
-      else setTimeout(updateScrollFade, 0);
-      setTimeout(updateScrollFade, 60);
-    } catch {
-      // ignore
+    if (typeof requestAnimationFrame !== 'function') {
+      throw new TypeError('Comment scrolling requires requestAnimationFrame()');
     }
+    requestAnimationFrame(updateScrollFade);
+    setTimeout(updateScrollFade, 60);
     commentsBox.appendChild(scroll);
     card.appendChild(commentsBox);
   }
@@ -1369,16 +1456,15 @@ function renderSuggestionCard({
     card.classList.add('community-annotation-moderation-draggable');
     card.title = 'Drag this suggestion onto another suggestion to merge (author-only).';
     card.addEventListener('dragstart', (e) => {
-      try {
-        e.dataTransfer.effectAllowed = 'move';
-        e.dataTransfer.setData(
-          'application/x-cellucid-suggestion-merge',
-          JSON.stringify({ fieldKey, catIdx, suggestionId: suggestion.id, label: suggestion?.label || '' })
-        );
-        activeSuggestionMergeDrag = { fieldKey: toCleanString(fieldKey), catIdx: Number(catIdx), suggestionId: String(suggestion.id) };
-      } catch {
-        // ignore
+      if (!e.dataTransfer || typeof e.dataTransfer.setData !== 'function') {
+        throw new TypeError('Suggestion merging requires an exact DataTransfer');
       }
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData(
+        'application/x-cellucid-suggestion-merge',
+        JSON.stringify({ fieldKey, catIdx, suggestionId: suggestion.id, label: suggestion?.label || '' })
+      );
+      activeSuggestionMergeDrag = { fieldKey: toCleanString(fieldKey), catIdx: Number(catIdx), suggestionId: String(suggestion.id) };
     });
     card.addEventListener('dragend', () => {
       activeSuggestionMergeDrag = null;
@@ -1386,22 +1472,21 @@ function renderSuggestionCard({
     card.addEventListener('dragover', (e) => {
       e.preventDefault();
       card.classList.add('is-merge-target');
-      try {
-        e.dataTransfer.dropEffect = 'move';
-      } catch {
-        // ignore
+      if (!e.dataTransfer) {
+        throw new TypeError('Suggestion merging requires an exact DataTransfer');
       }
+      e.dataTransfer.dropEffect = 'move';
     });
     card.addEventListener('dragleave', () => card.classList.remove('is-merge-target'));
     card.addEventListener('drop', (e) => {
       e.preventDefault();
       card.classList.remove('is-merge-target');
-      let payload = null;
-      try {
-        payload = JSON.parse(e.dataTransfer.getData('application/x-cellucid-suggestion-merge') || 'null');
-      } catch {
-        payload = null;
+      if (!e.dataTransfer || typeof e.dataTransfer.getData !== 'function') {
+        throw new TypeError('Suggestion merging requires an exact DataTransfer');
       }
+      const payload = JSON.parse(
+        e.dataTransfer.getData('application/x-cellucid-suggestion-merge')
+      );
       const fromId = toCleanString(payload?.suggestionId || '');
       const fromLabel = toCleanString(payload?.label || '');
       const intoId = toCleanString(suggestion?.id || '');
@@ -1694,7 +1779,7 @@ function buildVotingDetail({ session, fieldKey, catIdx }) {
         markerGenesInput.value = '';
         evidenceInput.value = '';
       } catch (err) {
-        getNotificationCenter().error(err?.message || 'Failed to add suggestion', { category: 'annotation' });
+        getNotificationCenter().error(describeErrorMessage(err), { category: 'annotation' });
       }
     });
   }
@@ -1733,14 +1818,13 @@ export function openCommunityAnnotationVotingModal({
   }
 
   const session = getCommunityAnnotationSession();
-  try {
-    const datasetId = session.getDatasetId?.() || null;
-    const ctx = syncCommunityAnnotationCacheContext({ datasetId });
-    // Hide the entire voting UX unless a repo is connected (or dev simulate is enabled).
-    if (!isAnnotationRepoConnected(ctx.datasetId, ctx.userKey)) return null;
-  } catch {
-    return null;
+  if (typeof session.getDatasetId !== 'function') {
+    throw new TypeError('Community voting requires session.getDatasetId()');
   }
+  const datasetId = session.getDatasetId();
+  const ctx = syncCommunityAnnotationCacheContext({ datasetId });
+  // Hide the entire voting UX unless a repo is connected (or dev simulate is enabled).
+  if (!isAnnotationRepoConnected(ctx.datasetId, ctx.userKey)) return null;
 
   /** @type {{close?: Function, overlay?: HTMLElement, modal?: HTMLElement, content?: HTMLElement} | null} */
   let ref = null;
@@ -1750,61 +1834,57 @@ export function openCommunityAnnotationVotingModal({
       const status = el('div', { className: 'legend-help', text: '' });
       content.appendChild(status);
 
-      const lifecycle = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      if (typeof AbortController !== 'function') {
+        throw new TypeError('Community voting requires AbortController');
+      }
+      const lifecycle = new AbortController();
       const autoScrollMargin = 48;
       const autoScrollMaxPx = 28;
       const autoScrollMinPx = 6;
       const dragAutoScroll = (clientY) => {
-        try {
-          if (!activeSuggestionMergeDrag) return;
-          if (!getCommunityAnnotationAccessStore().isAuthor()) return;
-          if (!Number.isFinite(clientY)) return;
-          if (content.scrollHeight <= content.clientHeight) return;
-          const rect = content.getBoundingClientRect();
-          if (!rect || !Number.isFinite(rect.top) || !Number.isFinite(rect.bottom)) return;
-          const topZone = rect.top + autoScrollMargin;
-          const bottomZone = rect.bottom - autoScrollMargin;
-          let delta = 0;
-          if (clientY < topZone) {
-            const t = Math.min(1, Math.max(0, (topZone - clientY) / autoScrollMargin));
-            delta = -Math.ceil(autoScrollMinPx + t * (autoScrollMaxPx - autoScrollMinPx));
-          } else if (clientY > bottomZone) {
-            const t = Math.min(1, Math.max(0, (clientY - bottomZone) / autoScrollMargin));
-            delta = Math.ceil(autoScrollMinPx + t * (autoScrollMaxPx - autoScrollMinPx));
-          }
-          if (delta) content.scrollTop += delta;
-        } catch {
-          // ignore
+        if (!activeSuggestionMergeDrag) return;
+        if (!getCommunityAnnotationAccessStore().isAuthor()) return;
+        if (!Number.isFinite(clientY)) return;
+        if (content.scrollHeight <= content.clientHeight) return;
+        const rect = content.getBoundingClientRect();
+        if (!rect || !Number.isFinite(rect.top) || !Number.isFinite(rect.bottom)) {
+          throw new TypeError('Community voting drag scrolling requires exact bounds');
         }
+        const topZone = rect.top + autoScrollMargin;
+        const bottomZone = rect.bottom - autoScrollMargin;
+        let delta = 0;
+        if (clientY < topZone) {
+          const t = Math.min(1, Math.max(0, (topZone - clientY) / autoScrollMargin));
+          delta = -Math.ceil(autoScrollMinPx + t * (autoScrollMaxPx - autoScrollMinPx));
+        } else if (clientY > bottomZone) {
+          const t = Math.min(1, Math.max(0, (clientY - bottomZone) / autoScrollMargin));
+          delta = Math.ceil(autoScrollMinPx + t * (autoScrollMaxPx - autoScrollMinPx));
+        }
+        if (delta) content.scrollTop += delta;
       };
-      try {
-        if (lifecycle?.signal) {
-          let latestY = null;
-          let rafPending = false;
-          const onDragOver = (e) => {
-            latestY = e?.clientY;
-            if (rafPending) return;
-            rafPending = true;
-            if (typeof requestAnimationFrame === 'function') {
-              requestAnimationFrame(() => {
-                rafPending = false;
-                dragAutoScroll(latestY);
-              });
-              return;
-            }
-            rafPending = false;
-            dragAutoScroll(latestY);
-          };
-          const onDropOrLeave = () => {
-            latestY = null;
-          };
-          content.addEventListener('dragover', onDragOver, { signal: lifecycle.signal });
-          content.addEventListener('drop', onDropOrLeave, { signal: lifecycle.signal });
-          content.addEventListener('dragleave', onDropOrLeave, { signal: lifecycle.signal });
-        }
-      } catch {
-        // ignore
+      if (typeof requestAnimationFrame !== 'function') {
+        throw new TypeError('Community voting drag scrolling requires requestAnimationFrame()');
       }
+      let latestY = null;
+      let rafPending = false;
+      const onDragOver = (e) => {
+        latestY = e.clientY;
+        if (rafPending) return;
+        rafPending = true;
+        requestAnimationFrame(() => {
+          try {
+            dragAutoScroll(latestY);
+          } finally {
+            rafPending = false;
+          }
+        });
+      };
+      const onDropOrLeave = () => {
+        latestY = null;
+      };
+      content.addEventListener('dragover', onDragOver, { signal: lifecycle.signal });
+      content.addEventListener('drop', onDropOrLeave, { signal: lifecycle.signal });
+      content.addEventListener('dragleave', onDropOrLeave, { signal: lifecycle.signal });
 
       let renderVersion = 0;
       let isFirstRender = true;
@@ -1831,7 +1911,7 @@ export function openCommunityAnnotationVotingModal({
         } catch (err) {
           content.innerHTML = '';
           content.appendChild(status);
-          status.textContent = err?.message || 'Failed to load field';
+          status.textContent = describeErrorMessage(err);
           return;
         }
 
@@ -1842,11 +1922,10 @@ export function openCommunityAnnotationVotingModal({
 
         const field = state.getFields?.()?.[fieldIndex] || null;
         const categories = Array.isArray(field?.categories) ? field.categories : [];
-        try {
-          session.setFieldCategories?.(focusField, categories);
-        } catch {
-          // ignore
+        if (typeof session.setFieldCategories !== 'function') {
+          throw new TypeError('Community voting requires session.setFieldCategories()');
         }
+        session.setFieldCategories(focusField, categories);
         const catLabel = categories[focusCatIdx] != null ? String(categories[focusCatIdx]) : `Category ${focusCatIdx}`;
 
         // Build new content then swap atomically to avoid flashing
@@ -1858,38 +1937,50 @@ export function openCommunityAnnotationVotingModal({
         content.appendChild(newContent);
       };
 
+      if (typeof session.on !== 'function') {
+        throw new TypeError('Community voting requires session.on()');
+      }
       const unsubscribe = session.on('changed', () => {
         renderFocused();
       });
+      if (typeof unsubscribe !== 'function') {
+        throw new TypeError('Community voting subscription must return an unsubscribe function');
+      }
 
       renderFocused();
 
       const observer = new MutationObserver(() => {
         if (!document.body.contains(content)) {
-          unsubscribe?.();
-          lifecycle?.abort?.();
-          observer.disconnect();
+          runExactCleanup('Community voting detached-modal teardown', [
+            ['session subscription', unsubscribe],
+            ['modal lifecycle', () => lifecycle.abort()],
+            ['modal observer', () => observer.disconnect()]
+          ]);
         }
       });
       observer.observe(document.body, { childList: true, subtree: true });
 
       // If repo is disconnected (or dev simulate toggles turn off), close this modal.
       const closeIfDisconnected = () => {
-        try {
-          const datasetId = session.getDatasetId?.() || null;
-          const ctx = syncCommunityAnnotationCacheContext({ datasetId });
-          if (!isAnnotationRepoConnected(ctx.datasetId, ctx.userKey)) ref?.close?.();
-        } catch {
-          ref?.close?.();
+        const currentDatasetId = session.getDatasetId();
+        const currentContext = syncCommunityAnnotationCacheContext({
+          datasetId: currentDatasetId
+        });
+        if (!isAnnotationRepoConnected(currentContext.datasetId, currentContext.userKey)) {
+          if (!ref || typeof ref.close !== 'function') {
+            throw new TypeError('Community voting modal reference must expose close()');
+          }
+          ref.close();
         }
       };
-      try {
-        if (typeof window !== 'undefined' && lifecycle?.signal) {
-          window.addEventListener(ANNOTATION_CONNECTION_CHANGED_EVENT, closeIfDisconnected, { signal: lifecycle.signal });
-        }
-      } catch {
-        // ignore
+      if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+        throw new TypeError('Community voting requires window.addEventListener()');
       }
+      window.addEventListener(
+        ANNOTATION_CONNECTION_CHANGED_EVENT,
+        closeIfDisconnected,
+        { signal: lifecycle.signal }
+      );
     }
   });
 

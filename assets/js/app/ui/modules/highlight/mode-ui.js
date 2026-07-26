@@ -1,207 +1,187 @@
 /**
- * @fileoverview Highlight mode toolbelt UI.
- *
- * Manages the mode toggle buttons (annotation / lasso / proximity / KNN),
- * enables/disables the corresponding viewer tools, and handles cross-tool
- * selection persistence via the viewer's unified selection state.
+ * @fileoverview Exact highlight mode toolbelt wiring.
  *
  * @module ui/modules/highlight/mode-ui
  */
 
 import { HIGHLIGHT_MODE_COPY } from './mode-copy.js';
+import {
+  requireDomElement,
+  requireExactKeys,
+  requireHighlightSelectionMode,
+  requireHighlightSelectionState,
+  requireMethods,
+  requireModeButtons,
+  requireUnifiedSelectionState
+} from './exact-contract.js';
+
+const MODE_HANDLER_NAMES = Object.freeze({
+  annotation: 'restoreAnnotationSelection',
+  knn: 'restoreKnnSelection',
+  proximity: 'restoreProximitySelection',
+  lasso: 'restoreLassoSelection'
+});
+
+const HISTORY_KEYS = Object.freeze({
+  annotation: ['annotationHistory', 'annotationRedoStack'],
+  knn: ['knnHistory', 'knnRedoStack'],
+  proximity: ['proximityHistory', 'proximityRedoStack'],
+  lasso: ['lassoHistory', 'lassoRedoStack']
+});
+
+function requireModeHandlers(modeHandlers) {
+  requireExactKeys(
+    modeHandlers,
+    Object.values(MODE_HANDLER_NAMES),
+    'Highlight mode handlers'
+  );
+  requireMethods(
+    modeHandlers,
+    'Highlight mode handlers',
+    Object.values(MODE_HANDLER_NAMES)
+  );
+  return modeHandlers;
+}
 
 /**
  * @param {object} options
- * @param {import('../../../state/core/data-state.js').DataState} options.state
  * @param {object} options.viewer
- * @param {object} [options.dom]
- * @param {HTMLElement|HTMLElement[]|null} [options.dom.modeButtons]
- * @param {HTMLElement|null} [options.dom.modeDescription]
+ * @param {object} options.dom
+ * @param {HTMLElement[]} options.dom.modeButtons
+ * @param {HTMLElement} options.dom.modeDescription
  * @param {ReturnType<import('./selection-state.js').createHighlightSelectionState>} options.selectionState
- * @param {object} options.stepHandlers
- * @param {(evt: any) => void} [options.stepHandlers.handleAnnotationStep]
- * @param {(evt: any) => void} [options.stepHandlers.handleLassoStep]
- * @param {(evt: any) => void} [options.stepHandlers.handleProximityStep]
- * @param {(evt: any) => void} [options.stepHandlers.handleKnnStep]
+ * @param {object} options.modeHandlers
  */
-export function initHighlightModeUI({ state, viewer, dom, selectionState, stepHandlers }) {
-  const highlightModeButtonsList = Array.isArray(dom?.modeButtons)
-    ? dom.modeButtons
-    : dom?.modeButtons
-      ? [dom.modeButtons]
-      : [];
+export function initHighlightModeUI(options) {
+  requireExactKeys(
+    options,
+    ['viewer', 'dom', 'selectionState', 'modeHandlers'],
+    'Highlight mode UI options'
+  );
+  const { viewer, dom, selectionState, modeHandlers } = options;
+  requireMethods(
+    viewer,
+    'Highlight mode viewer',
+    [
+      'cancelUnifiedSelection',
+      'getUnifiedSelectionState',
+      'restoreUnifiedState',
+      'setKnnEnabled',
+      'setLassoEnabled',
+      'setProximityEnabled'
+    ]
+  );
+  requireExactKeys(
+    dom,
+    ['modeButtons', 'modeDescription'],
+    'Highlight mode DOM'
+  );
+  const {
+    buttons: highlightModeButtonsList,
+    pressedMode
+  } = requireModeButtons(dom.modeButtons);
+  const highlightModeDescriptionEl = requireDomElement(
+    dom.modeDescription,
+    'Highlight mode description'
+  );
+  requireDomElement(
+    highlightModeDescriptionEl.parentElement,
+    'Highlight mode description parent',
+    ['appendChild']
+  );
+  requireHighlightSelectionState(selectionState);
+  requireModeHandlers(modeHandlers);
 
-  const highlightModeDescriptionEl = dom?.modeDescription || null;
+  const documentOwner = globalThis.document;
+  requireMethods(
+    documentOwner,
+    'Highlight document',
+    ['getElementById']
+  );
 
-  let activeHighlightMode = selectionState.activeMode || 'annotation';
+  if (pressedMode !== selectionState.activeMode) {
+    throw new TypeError(
+      'Pressed highlight mode must match selectionState.activeMode.'
+    );
+  }
+  let activeHighlightMode = pressedMode;
 
   function removeStepControls() {
-    document.getElementById('lasso-step-controls')?.remove();
-    document.getElementById('proximity-step-controls')?.remove();
-    document.getElementById('knn-step-controls')?.remove();
-    document.getElementById('annotation-step-controls')?.remove();
+    for (const id of [
+      'lasso-step-controls',
+      'proximity-step-controls',
+      'knn-step-controls',
+      'annotation-step-controls'
+    ]) {
+      const controls = documentOwner.getElementById(id);
+      if (controls !== null) controls.remove();
+    }
+  }
+
+  function resetModeHistory(mode) {
+    for (const key of HISTORY_KEYS[mode]) {
+      selectionState[key] = [];
+    }
+  }
+
+  function restoreModeSelection(mode, unifiedState) {
+    const handlerName = MODE_HANDLER_NAMES[mode];
+    modeHandlers[handlerName](unifiedState);
   }
 
   function setHighlightModeUI(mode) {
-    const wasLasso = activeHighlightMode === 'lasso';
-    const wasProximity = activeHighlightMode === 'proximity';
-    const wasKnn = activeHighlightMode === 'knn';
-    const wasAnnotation = activeHighlightMode === 'annotation';
+    const exactMode = requireHighlightSelectionMode(mode);
+    const previousMode = activeHighlightMode;
 
-    const selectionModes = new Set(['lasso', 'proximity', 'knn', 'annotation']);
-    const wasSelectionMode = selectionModes.has(activeHighlightMode);
-    const isSelectionMode = selectionModes.has(mode);
-
-    activeHighlightMode = mode;
-    selectionState.activeMode = mode;
-
-    highlightModeButtonsList.forEach((btn) => {
-      const isActive = btn?.dataset?.mode === mode;
-      btn?.setAttribute?.('aria-pressed', isActive ? 'true' : 'false');
-    });
-
-    if (wasSelectionMode && !isSelectionMode) {
-      selectionState.lassoHistory = [];
-      selectionState.lassoRedoStack = [];
-      selectionState.proximityHistory = [];
-      selectionState.proximityRedoStack = [];
-      selectionState.knnHistory = [];
-      selectionState.knnRedoStack = [];
-      selectionState.annotationHistory = [];
-      selectionState.annotationRedoStack = [];
-      selectionState.annotationCandidateSet = null;
-      selectionState.annotationStepCount = 0;
-
-      viewer.cancelUnifiedSelection?.();
-      viewer.cancelAnnotationSelection?.();
-      state.clearPreviewHighlight?.();
+    if (
+      previousMode === 'annotation'
+      && selectionState.annotationCandidateSet !== null
+    ) {
+      if (selectionState.annotationCandidateSet.size === 0) {
+        viewer.cancelUnifiedSelection();
+      } else {
+        viewer.restoreUnifiedState(
+          [...selectionState.annotationCandidateSet],
+          selectionState.annotationStepCount
+        );
+      }
     }
+    const unifiedState = requireUnifiedSelectionState(
+      viewer.getUnifiedSelectionState()
+    );
 
-    const oldMode = wasLasso ? 'lasso' : wasProximity ? 'proximity' : wasKnn ? 'knn' : wasAnnotation ? 'annotation' : null;
-    if (wasSelectionMode && isSelectionMode && oldMode !== mode) {
-      if (wasLasso) {
-        selectionState.lassoHistory = [];
-        selectionState.lassoRedoStack = [];
-      }
-      if (wasProximity) {
-        selectionState.proximityHistory = [];
-        selectionState.proximityRedoStack = [];
-      }
-      if (wasKnn) {
-        selectionState.knnHistory = [];
-        selectionState.knnRedoStack = [];
-      }
-      if (wasAnnotation) {
-        selectionState.annotationHistory = [];
-        selectionState.annotationRedoStack = [];
-      }
+    viewer.setLassoEnabled(exactMode === 'lasso');
+    viewer.setProximityEnabled(exactMode === 'proximity');
+    viewer.setKnnEnabled(exactMode === 'knn');
+
+    if (previousMode !== exactMode) {
+      resetModeHistory(previousMode);
+    }
+    activeHighlightMode = exactMode;
+    selectionState.activeMode = exactMode;
+
+    for (const button of highlightModeButtonsList) {
+      button.setAttribute(
+        'aria-pressed',
+        button.dataset.mode === exactMode ? 'true' : 'false'
+      );
     }
 
     removeStepControls();
-
-    if (highlightModeDescriptionEl) {
-      const text = HIGHLIGHT_MODE_COPY[mode] || '';
-      highlightModeDescriptionEl.textContent = text;
-      highlightModeDescriptionEl.style.display = text ? 'block' : 'none';
-    }
-
-    if (wasAnnotation && selectionState.annotationCandidateSet && selectionState.annotationCandidateSet.size > 0) {
-      viewer.restoreUnifiedState?.([...selectionState.annotationCandidateSet], selectionState.annotationStepCount);
-    }
-
-    if (mode === 'annotation') {
-      const unifiedState = viewer.getUnifiedSelectionState?.() || { inProgress: false };
-      if (unifiedState.inProgress && unifiedState.candidateCount > 0) {
-        selectionState.annotationCandidateSet = new Set(unifiedState.candidates);
-        selectionState.annotationStepCount = unifiedState.stepCount;
-      }
-    }
-
-    if (isSelectionMode) {
-      setTimeout(() => {
-        const unifiedState = viewer.getUnifiedSelectionState?.() || { inProgress: false };
-        if (!unifiedState.inProgress || unifiedState.candidateCount <= 0) return;
-
-        const stepEvent = {
-          step: unifiedState.stepCount,
-          candidateCount: unifiedState.candidateCount,
-          candidates: unifiedState.candidates,
-          mode: 'intersect'
-        };
-
-        if (mode === 'lasso' && typeof stepHandlers.handleLassoStep === 'function') {
-          stepHandlers.handleLassoStep(stepEvent);
-        } else if (mode === 'proximity' && typeof stepHandlers.handleProximityStep === 'function') {
-          stepHandlers.handleProximityStep(stepEvent);
-        } else if (mode === 'knn' && typeof stepHandlers.handleKnnStep === 'function') {
-          stepHandlers.handleKnnStep({ ...stepEvent, degree: 0, edgesLoaded: viewer.isKnnEdgesLoaded?.() });
-        } else if (mode === 'annotation' && typeof stepHandlers.handleAnnotationStep === 'function') {
-          stepHandlers.handleAnnotationStep(stepEvent);
-        }
-      }, 0);
-    }
-
-    viewer.setLassoEnabled?.(mode === 'lasso');
-    viewer.setProximityEnabled?.(mode === 'proximity');
-
-    if (viewer.setKnnEnabled) {
-      viewer.setKnnEnabled(mode === 'knn');
-
-      if (mode === 'knn' && !viewer.isKnnEdgesLoaded?.()) {
-        if (highlightModeDescriptionEl) {
-          highlightModeDescriptionEl.innerHTML =
-            HIGHLIGHT_MODE_COPY.knn +
-            '<br><small class="highlight-mode-note">Loading neighbor graph... (see notifications)</small>';
-        }
-
-        let attempts = 0;
-        const maxAttempts = 100;
-        const checkLoaded = setInterval(() => {
-          attempts += 1;
-          if (viewer.isKnnEdgesLoaded?.()) {
-            clearInterval(checkLoaded);
-            if (highlightModeDescriptionEl && activeHighlightMode === 'knn') {
-              highlightModeDescriptionEl.innerHTML = HIGHLIGHT_MODE_COPY.knn;
-            }
-            return;
-          }
-          if (attempts >= maxAttempts) {
-            clearInterval(checkLoaded);
-            if (highlightModeDescriptionEl && activeHighlightMode === 'knn') {
-              highlightModeDescriptionEl.innerHTML =
-                HIGHLIGHT_MODE_COPY.knn +
-                '<br><small class="highlight-mode-note">Neighbor graph not available. Enable "Show edges" to load connectivity data.</small>';
-            }
-          }
-        }, 100);
-      }
-    }
+    highlightModeDescriptionEl.textContent = HIGHLIGHT_MODE_COPY[exactMode];
+    highlightModeDescriptionEl.style.display = 'block';
+    restoreModeSelection(exactMode, unifiedState);
   }
 
-  function initHighlightModeButtons() {
-    if (!highlightModeButtonsList.length) {
-      setHighlightModeUI(activeHighlightMode);
-      return;
-    }
-
-    highlightModeButtonsList.forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const nextMode = btn.dataset.mode || 'annotation';
-        setHighlightModeUI(nextMode);
-      });
+  for (const button of highlightModeButtonsList) {
+    button.addEventListener('click', () => {
+      setHighlightModeUI(button.dataset.mode);
     });
-
-    const pressed = highlightModeButtonsList.find((btn) => btn.getAttribute('aria-pressed') === 'true');
-    const initialMode = pressed?.dataset?.mode || activeHighlightMode;
-    setHighlightModeUI(initialMode);
   }
-
-  initHighlightModeButtons();
+  setHighlightModeUI(pressedMode);
 
   return {
     setHighlightModeUI,
-    initHighlightModeButtons,
     getActiveMode: () => activeHighlightMode
   };
 }
-

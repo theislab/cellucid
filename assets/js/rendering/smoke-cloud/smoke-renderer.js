@@ -10,14 +10,56 @@ import {
   setNoiseResolution,
   getResolutionScaleFactor,
 } from './noise-textures.js';
+import { getNotificationCenter } from '../../app/notification-center.js';
+
+function requireFiniteNumber(value, owner, minimum = -Infinity, maximum = Infinity) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new TypeError(`${owner} must be an exact finite number.`);
+  }
+  if (value < minimum || value > maximum) {
+    throw new RangeError(
+      `${owner} must be between ${minimum} and ${maximum}; received ${value}.`
+    );
+  }
+  return value;
+}
+
+function requireVector3(value, owner) {
+  if (
+    !(Array.isArray(value) || value instanceof Float32Array) ||
+    value.length !== 3 ||
+    Array.from(value).some((entry) => !Number.isFinite(entry))
+  ) {
+    throw new TypeError(`${owner} must contain exactly three finite numbers.`);
+  }
+  return value;
+}
+
+function requireCleanWebGLState(gl, owner) {
+  const errorCode = gl.getError();
+  if (errorCode !== gl.NO_ERROR) {
+    throw new Error(
+      `${owner} encountered WebGL error 0x${errorCode.toString(16)}.`
+    );
+  }
+}
 
 export class SmokeRenderer {
   constructor(gl, createProgram) {
+    if (!gl || typeof gl !== 'object') {
+      throw new TypeError('SmokeRenderer requires a WebGL2 rendering context.');
+    }
+    if (typeof createProgram !== 'function') {
+      throw new TypeError('SmokeRenderer requires the exact shader-program factory.');
+    }
     this.gl = gl;
 
     // === PROGRAMS ===
     this.smokeProgram = createProgram(gl, SMOKE_VS_SOURCE, SMOKE_FS_SOURCE);
     this.compositeProgram = createProgram(gl, SMOKE_COMPOSITE_VS, SMOKE_COMPOSITE_FS);
+    if (!this.smokeProgram || !this.compositeProgram) {
+      throw new Error('SmokeRenderer shader program creation failed.');
+    }
 
     // === ATTRIBUTE LOCATIONS ===
     this.smokeAttribLocations = {
@@ -64,6 +106,9 @@ export class SmokeRenderer {
     // === BUFFERS ===
     // Fullscreen triangle for smoke rendering
     this.quadBuffer = gl.createBuffer();
+    if (!this.quadBuffer) {
+      throw new Error('SmokeRenderer fullscreen-buffer allocation failed.');
+    }
     gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
 
@@ -97,7 +142,7 @@ export class SmokeRenderer {
     this.noiseTextures = null;
     this.noiseResolution = 128;
     this.noiseGenerationInProgress = false;
-    this.noiseGenerationFailed = false;  // Prevents infinite retry loop on failure
+    this.noiseGenerationError = null;
 
     // Animation
     this.startTime = performance.now();
@@ -108,23 +153,51 @@ export class SmokeRenderer {
 
   setVolume(volumeDesc) {
     const gl = this.gl;
-    if (!volumeDesc || !volumeDesc.data) {
-      this.textureInfo = null;
-      return;
+    if (
+      volumeDesc === null ||
+      typeof volumeDesc !== 'object' ||
+      Array.isArray(volumeDesc) ||
+      Object.getPrototypeOf(volumeDesc) !== Object.prototype ||
+      Object.keys(volumeDesc).sort().join(',') !==
+        'boundsMax,boundsMin,data,gridSize'
+    ) {
+      throw new TypeError(
+        'SmokeRenderer volume descriptor must contain exactly boundsMax, boundsMin, data, and gridSize.'
+      );
     }
-    if (this.textureInfo?.texture) {
-      gl.deleteTexture(this.textureInfo.texture);
+    if (!(volumeDesc.data instanceof Float32Array)) {
+      throw new TypeError('SmokeRenderer volume data must be a Float32Array.');
     }
-    this.textureInfo = createDensityTexture3D(gl, volumeDesc);
-    console.log(`[SmokeRenderer] Created 3D density texture (${volumeDesc.gridSize}³)`);
+    if (!Number.isInteger(volumeDesc.gridSize) || volumeDesc.gridSize < 8) {
+      throw new RangeError(
+        'SmokeRenderer volume gridSize must be an integer of at least 8.'
+      );
+    }
+    const boundsMin = requireVector3(
+      volumeDesc.boundsMin,
+      'SmokeRenderer boundsMin'
+    );
+    const boundsMax = requireVector3(
+      volumeDesc.boundsMax,
+      'SmokeRenderer boundsMax'
+    );
+    for (let axis = 0; axis < 3; axis++) {
+      if (boundsMin[axis] >= boundsMax[axis]) {
+        throw new RangeError(
+          `SmokeRenderer boundsMin[${axis}] must be smaller than boundsMax[${axis}].`
+        );
+      }
+    }
 
-    if (volumeDesc.boundsMin && volumeDesc.boundsMax) {
-      this.volumeMin.set(volumeDesc.boundsMin);
-      this.volumeMax.set(volumeDesc.boundsMax);
-    } else {
-      this.volumeMin.set([-1, -1, -1]);
-      this.volumeMax.set([1, 1, 1]);
+    const nextTextureInfo = createDensityTexture3D(gl, volumeDesc);
+    const previousTexture = this.textureInfo?.texture ?? null;
+    this.textureInfo = nextTextureInfo;
+    this.volumeMin.set(boundsMin);
+    this.volumeMax.set(boundsMax);
+    if (previousTexture) {
+      gl.deleteTexture(previousTexture);
     }
+    console.log(`[SmokeRenderer] Created 3D density texture (${volumeDesc.gridSize}³)`);
   }
 
   buildVolumeGPU(positions, options = {}) {
@@ -140,26 +213,69 @@ export class SmokeRenderer {
   // === PARAMETER SETTERS ===
 
   setParams(params) {
-    if (!params) return;
-    if (typeof params.density === 'number') this.density = params.density;
-    if (typeof params.noiseScale === 'number') this.noiseScale = params.noiseScale;
-    if (typeof params.warpStrength === 'number') this.warpStrength = params.warpStrength;
-    if (typeof params.stepMultiplier === 'number') this.stepMultiplier = params.stepMultiplier;
-    if (typeof params.animationSpeed === 'number') this.animationSpeed = params.animationSpeed;
-    if (typeof params.detailLevel === 'number') this.detailLevel = params.detailLevel;
-    if (typeof params.lightAbsorption === 'number') this.lightAbsorption = params.lightAbsorption;
-    if (typeof params.scatterStrength === 'number') this.scatterStrength = params.scatterStrength;
-    if (typeof params.edgeSoftness === 'number') this.edgeSoftness = params.edgeSoftness;
-    if (typeof params.directLightIntensity === 'number') {
-      this.directLight = Math.max(0.0, Math.min(2.0, params.directLightIntensity));
+    if (
+      params === null ||
+      typeof params !== 'object' ||
+      Array.isArray(params) ||
+      Object.getPrototypeOf(params) !== Object.prototype
+    ) {
+      throw new TypeError(
+        'SmokeRenderer parameters must be one exact plain object.'
+      );
     }
-    if (typeof params.lightSamples === 'number') {
-      this.lightSamples = Math.max(1, Math.min(12, params.lightSamples));
+    const validators = {
+      density: (value) => ['density', requireFiniteNumber(value, 'SmokeRenderer density', 0)],
+      noiseScale: (value) => ['noiseScale', requireFiniteNumber(value, 'SmokeRenderer noiseScale', Number.MIN_VALUE)],
+      warpStrength: (value) => ['warpStrength', requireFiniteNumber(value, 'SmokeRenderer warpStrength', 0)],
+      stepMultiplier: (value) => ['stepMultiplier', requireFiniteNumber(value, 'SmokeRenderer stepMultiplier', Number.MIN_VALUE)],
+      animationSpeed: (value) => ['animationSpeed', requireFiniteNumber(value, 'SmokeRenderer animationSpeed', 0)],
+      detailLevel: (value) => ['detailLevel', requireFiniteNumber(value, 'SmokeRenderer detailLevel', 0)],
+      lightAbsorption: (value) => ['lightAbsorption', requireFiniteNumber(value, 'SmokeRenderer lightAbsorption', 0)],
+      scatterStrength: (value) => ['scatterStrength', requireFiniteNumber(value, 'SmokeRenderer scatterStrength', 0)],
+      edgeSoftness: (value) => ['edgeSoftness', requireFiniteNumber(value, 'SmokeRenderer edgeSoftness', 0)],
+      directLightIntensity: (value) => [
+        'directLight',
+        requireFiniteNumber(
+          value,
+          'SmokeRenderer directLightIntensity',
+          0,
+          2
+        )
+      ],
+      lightSamples: (value) => {
+        requireFiniteNumber(
+          value,
+          'SmokeRenderer lightSamples',
+          1,
+          12
+        );
+        if (!Number.isInteger(value)) {
+          throw new TypeError(
+            'SmokeRenderer lightSamples must be an integer.'
+          );
+        }
+        return ['lightSamples', value];
+      },
+    };
+    const staged = {};
+    for (const [key, value] of Object.entries(params)) {
+      const validate = validators[key];
+      if (!validate) {
+        throw new RangeError(`SmokeRenderer parameter "${key}" is unknown.`);
+      }
+      const [ownedKey, exactValue] = validate(value);
+      staged[ownedKey] = exactValue;
     }
+    Object.assign(this, staged);
   }
 
   setResolutionScale(scale) {
-    this.resolutionScale = Math.max(0.25, Math.min(2.0, scale));
+    this.resolutionScale = requireFiniteNumber(
+      scale,
+      'SmokeRenderer resolutionScale',
+      0.25,
+      2
+    );
     this.targetWidth = 0;
     this.targetHeight = 0;
   }
@@ -169,8 +285,12 @@ export class SmokeRenderer {
   }
 
   setNoiseTextureResolution(size) {
+    requireFiniteNumber(size, 'SmokeRenderer noise resolution', 32, 256);
+    if (!Number.isInteger(size)) {
+      throw new TypeError('SmokeRenderer noise resolution must be an integer.');
+    }
     const prevScale = getResolutionScaleFactor();
-    const newSize = Math.max(32, Math.min(256, size));
+    const newSize = size;
     if (newSize !== this.noiseResolution) {
       this.noiseResolution = newSize;
       setNoiseResolution(newSize, newSize);
@@ -183,8 +303,7 @@ export class SmokeRenderer {
         if (this.noiseTextures.blueNoise) gl.deleteTexture(this.noiseTextures.blueNoise);
         this.noiseTextures = null;
       }
-      // Reset failure flag to allow retry with new resolution
-      this.noiseGenerationFailed = false;
+      this.noiseGenerationError = null;
       console.log(`[SmokeRenderer] Noise resolution changed to ${newSize}³, will regenerate`);
     }
   }
@@ -195,13 +314,6 @@ export class SmokeRenderer {
 
   getAdaptiveScaleFactor() {
     return getResolutionScaleFactor();
-  }
-
-  // Backwards compatibility
-  setHalfResolution(enabled) {
-    this.resolutionScale = enabled ? 0.5 : 1.0;
-    this.targetWidth = 0;
-    this.targetHeight = 0;
   }
 
   setQualityPreset(preset) {
@@ -230,6 +342,10 @@ export class SmokeRenderer {
         this.lightSamples = 12;
         this.resolutionScale = 1.0;
         break;
+      default:
+        throw new RangeError(
+          'SmokeRenderer quality preset must be performance, balanced, quality, or ultra.'
+        );
     }
     this.targetWidth = 0;
     this.targetHeight = 0;
@@ -239,6 +355,8 @@ export class SmokeRenderer {
 
   ensureRenderTarget(w, h) {
     const gl = this.gl;
+    requireFiniteNumber(w, 'SmokeRenderer target width', Number.MIN_VALUE);
+    requireFiniteNumber(h, 'SmokeRenderer target height', Number.MIN_VALUE);
     const scale = this.resolutionScale;
     const targetW = Math.max(1, Math.floor(w * scale));
     const targetH = Math.max(1, Math.floor(h * scale));
@@ -247,49 +365,127 @@ export class SmokeRenderer {
       return;
     }
 
-    if (this.framebuffer) {
-      gl.deleteFramebuffer(this.framebuffer);
-      gl.deleteTexture(this.colorTex);
+    requireCleanWebGLState(gl, 'SmokeRenderer render-target publication');
+    const previousFramebufferBinding =
+      gl.getParameter(gl.FRAMEBUFFER_BINDING);
+    const previousTextureBinding =
+      gl.getParameter(gl.TEXTURE_BINDING_2D);
+    let candidateTexture = null;
+    let candidateFramebuffer = null;
+    try {
+      candidateTexture = gl.createTexture();
+      if (!candidateTexture) {
+        throw new Error(
+          'SmokeRenderer target texture allocation failed.'
+        );
+      }
+      gl.bindTexture(gl.TEXTURE_2D, candidateTexture);
+      gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        gl.RGBA,
+        targetW,
+        targetH,
+        0,
+        gl.RGBA,
+        gl.UNSIGNED_BYTE,
+        null
+      );
+      gl.texParameteri(
+        gl.TEXTURE_2D,
+        gl.TEXTURE_MIN_FILTER,
+        gl.LINEAR
+      );
+      gl.texParameteri(
+        gl.TEXTURE_2D,
+        gl.TEXTURE_MAG_FILTER,
+        gl.LINEAR
+      );
+      gl.texParameteri(
+        gl.TEXTURE_2D,
+        gl.TEXTURE_WRAP_S,
+        gl.CLAMP_TO_EDGE
+      );
+      gl.texParameteri(
+        gl.TEXTURE_2D,
+        gl.TEXTURE_WRAP_T,
+        gl.CLAMP_TO_EDGE
+      );
+
+      candidateFramebuffer = gl.createFramebuffer();
+      if (!candidateFramebuffer) {
+        throw new Error(
+          'SmokeRenderer framebuffer allocation failed.'
+        );
+      }
+      gl.bindFramebuffer(gl.FRAMEBUFFER, candidateFramebuffer);
+      gl.framebufferTexture2D(
+        gl.FRAMEBUFFER,
+        gl.COLOR_ATTACHMENT0,
+        gl.TEXTURE_2D,
+        candidateTexture,
+        0
+      );
+
+      const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+      if (status !== gl.FRAMEBUFFER_COMPLETE) {
+        const statusNames = {
+          [gl.FRAMEBUFFER_INCOMPLETE_ATTACHMENT]:
+            'INCOMPLETE_ATTACHMENT',
+          [gl.FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT]:
+            'INCOMPLETE_MISSING_ATTACHMENT',
+          [gl.FRAMEBUFFER_INCOMPLETE_DIMENSIONS]:
+            'INCOMPLETE_DIMENSIONS',
+          [gl.FRAMEBUFFER_UNSUPPORTED]: 'UNSUPPORTED',
+        };
+        const statusName = Object.hasOwn(statusNames, status)
+          ? statusNames[status]
+          : `0x${status.toString(16)}`;
+        throw new Error(
+          `SmokeRenderer framebuffer is incomplete: ${statusName} (${targetW}x${targetH}).`
+        );
+      }
+      requireCleanWebGLState(
+        gl,
+        'SmokeRenderer candidate render-target publication'
+      );
+    } catch (error) {
+      gl.bindFramebuffer(
+        gl.FRAMEBUFFER,
+        previousFramebufferBinding
+      );
+      gl.bindTexture(gl.TEXTURE_2D, previousTextureBinding);
+      if (candidateFramebuffer) {
+        gl.deleteFramebuffer(candidateFramebuffer);
+      }
+      if (candidateTexture) gl.deleteTexture(candidateTexture);
+      gl.getError();
+      throw error;
     }
 
+    const previousFramebuffer = this.framebuffer;
+    const previousTexture = this.colorTex;
+    this.framebuffer = candidateFramebuffer;
+    this.colorTex = candidateTexture;
     this.targetWidth = targetW;
     this.targetHeight = targetH;
 
-    this.colorTex = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, this.colorTex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, targetW, targetH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-
-    this.framebuffer = gl.createFramebuffer();
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.framebuffer);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.colorTex, 0);
-
-    // Check framebuffer completeness to catch GPU/driver issues early
-    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
-    if (status !== gl.FRAMEBUFFER_COMPLETE) {
-      const statusNames = {
-        [gl.FRAMEBUFFER_INCOMPLETE_ATTACHMENT]: 'INCOMPLETE_ATTACHMENT',
-        [gl.FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT]: 'INCOMPLETE_MISSING_ATTACHMENT',
-        [gl.FRAMEBUFFER_INCOMPLETE_DIMENSIONS]: 'INCOMPLETE_DIMENSIONS',
-        [gl.FRAMEBUFFER_UNSUPPORTED]: 'UNSUPPORTED',
-      };
-      const statusName = statusNames[status] || `0x${status.toString(16)}`;
-      console.error(`[SmokeRenderer] Framebuffer incomplete: ${statusName} (${targetW}x${targetH})`);
-      // Clean up failed resources
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-      gl.deleteFramebuffer(this.framebuffer);
-      gl.deleteTexture(this.colorTex);
-      this.framebuffer = null;
-      this.colorTex = null;
-      this.targetWidth = 0;
-      this.targetHeight = 0;
-      return;
+    gl.bindFramebuffer(
+      gl.FRAMEBUFFER,
+      previousFramebufferBinding === previousFramebuffer
+        ? candidateFramebuffer
+        : previousFramebufferBinding
+    );
+    gl.bindTexture(
+      gl.TEXTURE_2D,
+      previousTextureBinding === previousTexture
+        ? candidateTexture
+        : previousTextureBinding
+    );
+    if (previousFramebuffer) {
+      gl.deleteFramebuffer(previousFramebuffer);
     }
-
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    if (previousTexture) gl.deleteTexture(previousTexture);
   }
 
   // === MAIN RENDER METHOD ===
@@ -299,34 +495,53 @@ export class SmokeRenderer {
 
     if (!this.textureInfo) return;
 
-    // Generate noise textures on first use (lazy initialization)
-    // Check noiseGenerationFailed to prevent infinite retry loop on failure
-    if (!this.noiseTextures && !this.noiseGenerationInProgress && !this.noiseGenerationFailed) {
+    if (this.noiseGenerationError) {
+      throw this.noiseGenerationError;
+    }
+
+    // Generate noise textures on first use.
+    if (!this.noiseTextures && !this.noiseGenerationInProgress) {
       this.noiseGenerationInProgress = true;
       console.log('[SmokeRenderer] Generating cloud noise textures...');
 
-      generateCloudNoiseTextures(gl).then(textures => {
+      let generation;
+      try {
+        generation = generateCloudNoiseTextures(gl);
+      } catch (error) {
+        this.noiseGenerationInProgress = false;
+        this.noiseGenerationError = error;
+        getNotificationCenter().error(
+          `Smoke noise generation failed: ${error.message}`,
+          { category: 'render' }
+        );
+        throw error;
+      }
+      generation.then((textures) => {
+        if (
+          !textures?.shape ||
+          !textures.detail ||
+          !textures.blueNoise
+        ) {
+          throw new Error(
+            'Smoke noise generation did not publish the complete GPU texture set.'
+          );
+        }
         this.noiseTextures = textures;
         this.noiseGenerationInProgress = false;
         console.log('[SmokeRenderer] Cloud noise textures ready');
-      }).catch(err => {
-        console.error('[SmokeRenderer] Failed to generate noise textures:', err);
+      }).catch((error) => {
         this.noiseGenerationInProgress = false;
-        this.noiseGenerationFailed = true;  // Prevent retry on every frame
+        this.noiseGenerationError = error;
+        getNotificationCenter().error(
+          `Smoke noise generation failed: ${error.message}`,
+          { category: 'render' }
+        );
       });
-
-      // Show loading state
-      gl.viewport(0, 0, width, height);
-      gl.clearColor(bgColor[0], bgColor[1], bgColor[2], 1.0);
-      gl.clear(gl.COLOR_BUFFER_BIT);
       return;
     }
 
-    // Still generating or failed - show loading/fallback state
+    // The existing scene remains visible while exact GPU noise generation finishes.
     if (!this.noiseTextures) {
-      gl.viewport(0, 0, width, height);
-      gl.clearColor(bgColor[0], bgColor[1], bgColor[2], 1.0);
-      gl.clear(gl.COLOR_BUFFER_BIT);
       return;
     }
 

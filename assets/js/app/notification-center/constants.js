@@ -18,6 +18,9 @@ export const NotificationType = {
 // Category icons (unicode, no external dependencies).
 // `registerCategory()` mutates this object at runtime to add new categories.
 export const CategoryIcons = {
+  analysis: '∑',
+  annotation: '✎',
+  cinematic: '▶',
   download: '↓',
   upload: '↑',
   calculation: '◐',
@@ -32,8 +35,9 @@ export const CategoryIcons = {
   lasso: '⌒',
   benchmark: '⏱',
   knn: '⋈',
+  plot: '▥',
+  rendering: '◉',
   view: '◫',
   dimension: '⊡',
   default: '●'
 };
-

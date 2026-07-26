@@ -3,7 +3,7 @@
  *
  * Contains all operation implementations used by:
  * - data-worker.js (Web Worker context)
- * - fallback-operations.js (CPU fallback on main thread)
+ * - compute-manager.js (explicitly selected CPU context)
  *
  * Each handler is a pure function that takes a payload and returns a result.
  * No side effects, no external state dependencies.
@@ -15,8 +15,7 @@
 import { OperationType } from './operations.js';
 import {
   mean,
-  normalCDF,
-  tCDF,
+  tTwoSidedPValue,
   computeRanks,
   mannWhitneyU,
   welchTTest,
@@ -479,12 +478,12 @@ export function computeCorrelation(payload) {
     r = denom === 0 ? 0 : numerator / denom;
   }
 
-  // Compute p-value using t-distribution approximation.
+  // Compute a two-sided p-value from the Student t distribution.
   const rSquared = r * r;
   const denomT = 1 - rSquared;
   const t = denomT <= 0 ? (r >= 0 ? Infinity : -Infinity) : r * Math.sqrt((n - 2) / denomT);
   const pValue = Number.isFinite(t)
-    ? 2 * (1 - tCDF(Math.abs(t), n - 2))
+    ? tTwoSidedPValue(t, n - 2)
     : 0;
 
   return {

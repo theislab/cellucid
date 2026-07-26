@@ -10,13 +10,16 @@
  */
 
 import { PlotRegistry, BasePlot, COMMON_HOVER_STYLE, createMinimalPlotly, getPlotlyConfig } from '../plot-factory.js';
-import { getScatterTraceType } from '../plotly-loader.js';
+import { PLOTLY_2D_SCATTER_TRACE_TYPE } from '../plotly-loader.js';
 import { getFiniteMinMax, isFiniteNumber, mean } from '../../shared/number-utils.js';
 import { applyLegendPosition } from '../../shared/legend-utils.js';
 import { getPlotTheme } from '../../shared/plot-theme.js';
 import { generateCategoryColors } from '../../shared/color-utils.js';
 import { escapeHtml } from '../../../utils/dom-utils.js';
 
+// Correlation plots use Plotly's SVG Cartesian trace in every browser. The main
+// Cellucid renderer owns the page's WebGL context; Plotly must not allocate a
+// second context or replace scientific output with its WebGL-failure overlay.
 const scatterPlotDefinition = {
   id: 'scatterplot',
   name: 'Scatter Plot',
@@ -192,7 +195,7 @@ const scatterPlotDefinition = {
           hoverinfo: 'none'
         });
 
-        // Add sparse scatter points on top (GPU-accelerated)
+        // Add sparse SVG scatter points on top of the density layer.
         const sampleSize = Math.min(500, xData.length);
         const step = Math.max(1, Math.floor(xData.length / sampleSize));
         const sampledX = [];
@@ -203,7 +206,7 @@ const scatterPlotDefinition = {
         }
 
         traces.push({
-          type: getScatterTraceType(),
+          type: PLOTLY_2D_SCATTER_TRACE_TYPE,
           mode: 'markers',
           name: pageResult.pageName,
           x: sampledX,
@@ -235,7 +238,7 @@ const scatterPlotDefinition = {
           if (catX.length === 0) continue;
 
           traces.push({
-            type: getScatterTraceType(),
+            type: PLOTLY_2D_SCATTER_TRACE_TYPE,
             mode: 'markers',
             name: cat,
             legendgroup: cat,
@@ -254,9 +257,9 @@ const scatterPlotDefinition = {
           });
         }
       } else {
-        // Regular scatter plot (GPU-accelerated)
+        // Regular cross-browser SVG scatter plot.
         traces.push({
-          type: getScatterTraceType(),
+          type: PLOTLY_2D_SCATTER_TRACE_TYPE,
           mode: 'markers',
           name: pageResult.pageName,
           x: xData,
@@ -281,7 +284,7 @@ const scatterPlotDefinition = {
         const yRange = xRange.map(x => pageResult.slope * x + pageResult.intercept);
 
         traces.push({
-          type: getScatterTraceType(),
+          type: PLOTLY_2D_SCATTER_TRACE_TYPE,
           mode: 'lines',
           name: `Trend (${pageResult.pageName})`,
           x: xRange,
@@ -310,7 +313,7 @@ const scatterPlotDefinition = {
           const lowerY = xPoints.map((x) => ciLower(x));
 
           traces.push({
-            type: getScatterTraceType(),
+            type: PLOTLY_2D_SCATTER_TRACE_TYPE,
             mode: 'lines',
             x: [...xPoints, ...xPoints.reverse()],
             y: [...upperY, ...lowerY.reverse()],
@@ -425,14 +428,11 @@ const scatterPlotDefinition = {
    * @returns {Promise<Object>} Updated Plotly figure
    */
   async update(figure, correlationData, _options, layoutEngine) {
-    // For scatter plots with complex trace manipulation, a full re-render is often cleaner.
-    // Purge first to avoid leaking WebGL contexts / DOM on repeated updates.
-    try {
-      const Plotly = await createMinimalPlotly();
-      Plotly.purge?.(figure);
-    } catch (_purgeErr) {
-      // Ignore purge failures
+    const Plotly = await createMinimalPlotly();
+    if (typeof Plotly.purge !== 'function') {
+      throw new TypeError('Scatter plot update requires Plotly.purge');
     }
+    Plotly.purge(figure);
 
     return this.render(correlationData, _options, figure, layoutEngine);
   },

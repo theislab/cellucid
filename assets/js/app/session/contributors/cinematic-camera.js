@@ -8,6 +8,9 @@
  * @module session/contributors/cinematic-camera
  */
 
+import { assertCameraPathSessionState } from '../../ui/modules/cinematic-camera/index.js';
+import { requireMethod } from '../schema-contract.js';
+
 export const id = 'cinematic-camera';
 
 /**
@@ -16,11 +19,14 @@ export const id = 'cinematic-camera';
  * @returns {import('../session-serializer.js').SessionChunk[]}
  */
 export function capture(ctx) {
-  const cam = ctx?.cinematicCamera;
-  if (!cam?.exportSessionState) return [];
+  if (ctx === null || typeof ctx !== 'object') {
+    throw new TypeError('Cinematic camera capture requires a session context.');
+  }
+  const cam = ctx.cinematicCamera;
+  requireMethod(cam, 'exportSessionState', 'Cinematic camera capture owner');
 
-  const data = cam.exportSessionState();
-  if (!data?.keyframes?.length) return [];
+  const data = assertCameraPathSessionState(cam.exportSessionState());
+  if (data.keyframes.length === 0) return [];
 
   return [
     {
@@ -43,12 +49,11 @@ export function capture(ctx) {
  * @param {object} payload
  */
 export function restore(ctx, _chunkMeta, payload) {
-  const cam = ctx?.cinematicCamera;
-  if (!cam?.restoreSessionState || !payload) return;
-
-  try {
-    cam.restoreSessionState(payload);
-  } catch (err) {
-    console.warn('[SessionSerializer] Failed to restore cinematic camera state:', err);
+  if (ctx === null || typeof ctx !== 'object') {
+    throw new TypeError('Cinematic camera restore requires a session context.');
   }
+  const cam = ctx.cinematicCamera;
+  requireMethod(cam, 'restoreSessionState', 'Cinematic camera restore owner');
+  assertCameraPathSessionState(payload);
+  cam.restoreSessionState(payload);
 }

@@ -12,7 +12,6 @@ export const colorOutlierMethods = {
     const field = this.getActiveField();
     if (!field || !field.outlierQuantiles || !field.outlierQuantiles.length) return;
     field._outlierThreshold = threshold;
-    this._pushOutlierThresholdToViewer(threshold);
     this.updateOutlierQuantiles();
     this.computeGlobalVisibility();
   },
@@ -39,4 +38,3 @@ export const colorOutlierMethods = {
     return 1.0;
   }
 };
-

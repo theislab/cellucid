@@ -1,12 +1,9 @@
 /**
  * Analysis Resource Cleanup Utilities
  *
- * Centralizes best-effort cleanup logic used across analysis modes to keep code DRY:
- * - recycle idle workers (frees worker heaps / transferred ArrayBuffers)
+ * Centralizes exact cleanup logic used across analysis modes:
  * - prune analysis caches
- * - clear dataset-level caches when the active source supports it (e.g., h5ad dense X cache)
- *
- * NOTE: All functions in this module must be safe to call in any state; they should never throw.
+ * - clear dataset-level caches exposed by the active source
  *
  * @module shared/resource-cleanup
  */
@@ -18,81 +15,132 @@ import { getDataSourceManager } from '../../../data/data-source-manager.js';
  */
 
 /**
- * Best-effort cache release on the active dataset source.
+ * Release caches exposed by the active dataset source.
  *
  * Some sources (notably local h5ad / zarr) cache large buffers (e.g., dense X matrix).
  * Clearing those caches after gene-heavy analyses helps return memory to the browser.
+ *
+ * @returns {number} Number of source cache owners cleared
  */
 export function clearActiveSourceCaches() {
-  try {
-    const manager = getDataSourceManager?.();
-    const source = manager?.activeSource || null;
+  const manager = getDataSourceManager();
+  const source = manager.activeSource;
+  if (source === null) return 0;
 
-    // Direct hook on the source (if implemented).
-    if (typeof source?.clearCaches === 'function') {
-      source.clearCaches();
-      return;
-    }
-
-    // local-user exposes underlying sources (h5ad/zarr) via getters.
-    const h5ad = source?.getH5adSource?.();
-    if (typeof h5ad?.clearCaches === 'function') {
-      h5ad.clearCaches();
-    }
-
-    const zarr = source?.getZarrSource?.();
-    if (typeof zarr?.clearCaches === 'function') {
-      zarr.clearCaches();
-    }
-  } catch (_err) {
-    // Ignore cleanup errors
+  if (typeof source.clearCaches === 'function') {
+    source.clearCaches();
+    return 1;
   }
+
+  const cacheOwners = [];
+  if (typeof source.getH5adSource === 'function') {
+    const h5adSource = source.getH5adSource();
+    if (h5adSource !== null) cacheOwners.push(h5adSource);
+  }
+  if (typeof source.getZarrSource === 'function') {
+    const zarrSource = source.getZarrSource();
+    if (zarrSource !== null) cacheOwners.push(zarrSource);
+  }
+  for (const cacheOwner of cacheOwners) {
+    if (typeof cacheOwner?.clearCaches !== 'function') {
+      throw new TypeError(
+        'Active dataset cache owner must implement clearCaches()'
+      );
+    }
+    cacheOwner.clearCaches();
+  }
+  return cacheOwners.length;
 }
 
 /**
  * Run a standard post-analysis cleanup pass.
  *
  * @param {Object} params
- * @param {any} [params.computeManager] - ComputeManager-like object
  * @param {any} [params.dataLayer] - DataLayer-like object
  * @param {boolean} [params.clearSourceCaches=true]
- * @param {number} [params.keepAtLeastIdleWorkers=0]
  * @param {DataLayerCleanupLevel} [params.dataLayerCleanup='expired'] - How aggressively to clear DataLayer caches
  */
-export function bestEffortCleanupAnalysisResources({
-  computeManager,
-  dataLayer,
-  clearSourceCaches: shouldClearSourceCaches = true,
-  keepAtLeastIdleWorkers = 0,
-  dataLayerCleanup = 'expired'
-} = {}) {
-  // Compute backend cleanup (worker/GPU)
-  try {
-    computeManager?.cleanupIdleResources?.({ keepAtLeastIdleWorkers });
-  } catch (_err) {
-    // Ignore cleanup errors
+export function cleanupAnalysisResources(params) {
+  if (!params || typeof params !== 'object' || Array.isArray(params)) {
+    throw new TypeError('Analysis cleanup parameters must be an object');
+  }
+  const allowedKeys = new Set([
+    'dataLayer',
+    'clearSourceCaches',
+    'dataLayerCleanup'
+  ]);
+  for (const key of Object.keys(params)) {
+    if (!allowedKeys.has(key)) {
+      throw new TypeError(`Analysis cleanup contains unknown key "${key}"`);
+    }
+  }
+  const {
+    dataLayer = null,
+    clearSourceCaches: shouldClearSourceCaches = true,
+    dataLayerCleanup = 'expired',
+  } = params;
+  if (typeof shouldClearSourceCaches !== 'boolean') {
+    throw new TypeError('clearSourceCaches must be exactly boolean');
+  }
+  if (!['none', 'expired', 'bulk', 'all'].includes(dataLayerCleanup)) {
+    throw new TypeError(
+      `Unknown DataLayer cleanup level: ${String(dataLayerCleanup)}`
+    );
   }
 
-  // DataLayer cache pruning
-  try {
-    if (dataLayerCleanup === 'all') {
-      dataLayer?.clearAllCaches?.();
-    } else if (dataLayerCleanup === 'bulk') {
-      dataLayer?.clearBulkGeneCache?.();
-      dataLayer?.performCacheCleanup?.();
-    } else if (dataLayerCleanup === 'expired') {
-      dataLayer?.performCacheCleanup?.();
+  const errors = [];
+  const run = operation => {
+    try {
+      operation();
+    } catch (error) {
+      errors.push(error);
     }
-  } catch (_err) {
-    // Ignore cleanup errors
+  };
+
+  if (dataLayerCleanup !== 'none') {
+    if (dataLayer === null || typeof dataLayer !== 'object') {
+      throw new TypeError(
+        `DataLayer cleanup level "${dataLayerCleanup}" requires dataLayer`
+      );
+    }
+    if (dataLayerCleanup === 'all') {
+      if (typeof dataLayer.clearAllCaches !== 'function') {
+        throw new TypeError('dataLayer must implement clearAllCaches()');
+      }
+      run(() => dataLayer.clearAllCaches());
+    } else if (dataLayerCleanup === 'bulk') {
+      if (
+        typeof dataLayer.clearBulkGeneCache !== 'function' ||
+        typeof dataLayer.performCacheCleanup !== 'function'
+      ) {
+        throw new TypeError(
+          'bulk DataLayer cleanup requires clearBulkGeneCache() and performCacheCleanup()'
+        );
+      }
+      run(() => dataLayer.clearBulkGeneCache());
+      run(() => dataLayer.performCacheCleanup());
+    } else {
+      if (typeof dataLayer.performCacheCleanup !== 'function') {
+        throw new TypeError('dataLayer must implement performCacheCleanup()');
+      }
+      run(() => dataLayer.performCacheCleanup());
+    }
   }
 
   if (shouldClearSourceCaches) {
-    clearActiveSourceCaches();
+    run(() => clearActiveSourceCaches());
+  }
+
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) {
+    throw new AggregateError(
+      errors,
+      `Analysis cleanup failed in ${errors.length} operations`
+    );
   }
 }
 
 export default {
   clearActiveSourceCaches,
-  bestEffortCleanupAnalysisResources
+  cleanupAnalysisResources,
 };

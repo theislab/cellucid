@@ -19,9 +19,66 @@ import { makeUniqueLabel } from '../../../utils/label-utils.js';
 import {
   buildDeleteToUnassignedTransform,
   buildMergeCategoriesTransform,
-  applyCategoryIndexMapping,
-  applyCategoryIndexMappingInPlace
+  applyCategoryIndexMapping
 } from '../../../utils/categorical-ops.js';
+
+function requireEditableCodes(codes, pointCount) {
+  if (
+    (!(codes instanceof Uint8Array) && !(codes instanceof Uint16Array))
+    || codes.length !== pointCount
+  ) {
+    throw new TypeError(
+      'Category editing requires Uint8Array or Uint16Array codes matching the dataset.'
+    );
+  }
+  return codes;
+}
+
+function requireCategoryEditBaseKey(options, generatedKey) {
+  if (options.newKey === undefined) return generatedKey;
+  StateValidator.validateFieldKey(options.newKey);
+  return options.newKey;
+}
+
+function collectHighlightCategoryRemaps(state, fieldIndex, mapping) {
+  if (!Array.isArray(state.highlightPages)) {
+    throw new TypeError('Category editing requires the exact highlight-page inventory.');
+  }
+  const remaps = [];
+  for (let pageIndex = 0; pageIndex < state.highlightPages.length; pageIndex++) {
+    const page = state.highlightPages[pageIndex];
+    if (!page || typeof page !== 'object' || !Array.isArray(page.highlightedGroups)) {
+      throw new TypeError(`Highlight page ${pageIndex} has invalid group state.`);
+    }
+    for (let groupIndex = 0; groupIndex < page.highlightedGroups.length; groupIndex++) {
+      const group = page.highlightedGroups[groupIndex];
+      if (!group || typeof group !== 'object') {
+        throw new TypeError(`Highlight page ${pageIndex} group ${groupIndex} must be an object.`);
+      }
+      if (
+        group.type !== 'category'
+        || group.fieldSource !== FieldSource.OBS
+        || group.fieldIndex !== fieldIndex
+      ) {
+        continue;
+      }
+      if (
+        !Number.isSafeInteger(group.categoryIndex)
+        || group.categoryIndex < 0
+        || group.categoryIndex >= mapping.length
+      ) {
+        throw new RangeError(
+          `Highlight page ${pageIndex} group ${groupIndex} has an invalid category reference.`
+        );
+      }
+      remaps.push({
+        group,
+        categoryIndex: mapping[group.categoryIndex]
+      });
+    }
+  }
+  return remaps;
+}
 
 export class FieldCategoryOpsMethods {
   /**
@@ -38,73 +95,81 @@ export class FieldCategoryOpsMethods {
    *
    * @param {number} fieldIndex
    * @param {number} categoryIndex
-   * @param {object} [options]
-   * @param {string} [options.unassignedLabel='unassigned']
+   * @param {object} options
+   * @param {boolean} options.editInPlace
+   * @param {string} options.unassignedLabel
    * @param {string} [options.newKey] - Optional explicit new field key
-   * @returns {{ newFieldIndex: number, newKey: string }|null}
+   * @returns {{
+   *   newFieldIndex: number,
+   *   newKey: string,
+   *   updatedInPlace: boolean
+   * }}
    */
-  deleteCategoryToUnassigned(fieldIndex, categoryIndex, options = {}) {
+  deleteCategoryToUnassigned(fieldIndex, categoryIndex, options) {
     const fields = this.obsData?.fields;
 
-    try {
-      StateValidator.validateFieldIndex(fieldIndex, fields);
-      const field = fields[fieldIndex];
-      StateValidator.validateCategoryIndex(categoryIndex, field);
-    } catch (e) {
-      console.error('[State] deleteCategoryToUnassigned validation failed:', e.message);
-      return null;
-    }
-
+    StateValidator.validateFieldIndex(fieldIndex, fields);
     const sourceField = fields[fieldIndex];
-    if (!sourceField || sourceField.kind !== FieldKind.CATEGORY) return null;
-    if (sourceField._isDeleted === true) return null;
+    StateValidator.validateCategoryIndex(categoryIndex, sourceField);
+    if (!options || typeof options !== 'object' || Array.isArray(options)) {
+      throw new TypeError('Delete-category options must be an object.');
+    }
+    if (sourceField._isDeleted === true) {
+      throw new Error('Deleted fields cannot be edited.');
+    }
+    if (typeof options.editInPlace !== 'boolean') {
+      throw new TypeError('Delete-category editInPlace must be exactly true or false.');
+    }
+    if (
+      typeof options.unassignedLabel !== 'string'
+      || options.unassignedLabel.length === 0
+      || options.unassignedLabel !== options.unassignedLabel.trim()
+    ) {
+      throw new TypeError('Delete-category unassignedLabel must be a non-empty trimmed string.');
+    }
 
     const canEditInPlace = sourceField._isUserDefined === true && Boolean(sourceField._userDefinedId);
-    const editInPlace = options.editInPlace !== false && canEditInPlace;
-
-    const deletedLabel = String(sourceField.categories?.[categoryIndex] ?? '');
-    const unassignedLabel = String(options.unassignedLabel ?? 'unassigned').trim() || 'unassigned';
-
-    let transform;
-    try {
-      transform = buildDeleteToUnassignedTransform(sourceField.categories || [], categoryIndex, { unassignedLabel });
-    } catch (err) {
-      console.error('[State] deleteCategoryToUnassigned failed:', err.message);
-      return null;
+    if (options.editInPlace && !canEditInPlace) {
+      throw new Error('Only registered user-defined fields can be edited in place.');
     }
+    const editInPlace = options.editInPlace;
+
+    const deletedLabel = sourceField.categories[categoryIndex];
+    const unassignedLabel = options.unassignedLabel;
+    requireEditableCodes(sourceField.codes, this.pointCount);
+    const transform = buildDeleteToUnassignedTransform(
+      sourceField.categories,
+      categoryIndex,
+      { unassignedLabel }
+    );
 
     const nextCategories = transform.categories;
+    const nextCodes = applyCategoryIndexMapping(
+      sourceField.codes,
+      transform.mapping,
+      nextCategories.length
+    );
+    requireEditableCodes(nextCodes, this.pointCount);
+    this.ensureCategoryMetadata(sourceField);
 
     // In-place edit for user-defined derived fields:
     // avoids creating another full field copy on repeated destructive edits.
     if (editInPlace) {
-      // Prefer in-place remapping to avoid allocating a full codes copy on every edit.
-      // Fallback to allocating when codes isn't a TypedArray (unexpected).
-      let nextCodes = sourceField.codes;
-      const didInPlace = applyCategoryIndexMappingInPlace(nextCodes, transform.mapping);
-      if (!didInPlace) {
-        nextCodes = applyCategoryIndexMapping(sourceField.codes, transform.mapping, nextCategories.length);
-      }
-
-      try {
-        this.ensureCategoryMetadata(sourceField);
-      } catch {}
-
-      const oldColors = sourceField._categoryColors || [];
-      const oldVisible = sourceField._categoryVisible || {};
+      const oldColors = sourceField._categoryColors;
+      const oldVisible = sourceField._categoryVisible;
 
       const newColors = new Array(nextCategories.length);
       const newVisible = {};
       for (let i = 0; i < nextCategories.length; i++) newVisible[i] = true;
 
-      const merged = new Set(transform.mergedOldIndices || []);
+      const merged = new Set(transform.mergedOldIndices);
       const unassignedOld = transform.keptOldUnassignedIndex;
       const unassignedNew = transform.unassignedNewIndex;
 
       // Unassigned bucket: prefer the kept old unassigned color, otherwise palette default.
-      if (unassignedOld != null && oldColors[unassignedOld]) {
-        newColors[unassignedNew] = oldColors[unassignedOld];
-        newVisible[unassignedNew] = oldVisible[unassignedOld] !== false;
+      if (unassignedOld !== null) {
+        newColors[unassignedNew] = [...oldColors[unassignedOld]];
+        newVisible[unassignedNew] = oldVisible[unassignedOld];
       } else {
         newColors[unassignedNew] = getCategoryColor(unassignedNew);
         newVisible[unassignedNew] = true;
@@ -115,62 +180,57 @@ export class FieldCategoryOpsMethods {
         if (oldIdx === unassignedOld) continue;
         if (merged.has(oldIdx)) continue;
         const newIdx = transform.mapping[oldIdx];
-        const c = oldColors[oldIdx];
-        if (c) newColors[newIdx] = c;
-        newVisible[newIdx] = oldVisible[oldIdx] !== false;
+        newColors[newIdx] = [...oldColors[oldIdx]];
+        newVisible[newIdx] = oldVisible[oldIdx];
       }
 
+      const nextCentroidsByDim = this._userDefinedFields.computeCentroidsByDim(
+        nextCodes,
+        nextCategories,
+        this
+      );
+      const template = this._userDefinedFields.getField(sourceField._userDefinedId);
+      if (!template) {
+        throw new Error('The user-defined field registry does not own the edited field.');
+      }
+      const highlightRemaps = collectHighlightCategoryRemaps(
+        this,
+        fieldIndex,
+        transform.mapping
+      );
+
       sourceField.categories = nextCategories;
-      if (!didInPlace) sourceField.codes = nextCodes;
+      sourceField.codes = nextCodes;
       sourceField._categoryColors = newColors;
       sourceField._categoryVisible = newVisible;
+      sourceField.centroidsByDim = nextCentroidsByDim;
 
       delete sourceField._originalCategories;
       delete sourceField.outlierQuantiles;
       delete sourceField._outlierThreshold;
 
-      try {
-        sourceField.centroidsByDim = this._userDefinedFields.computeCentroidsByDim(nextCodes, nextCategories, this);
-      } catch (err) {
-        console.warn('[State] deleteCategoryToUnassigned in-place centroid compute failed:', err);
-      }
-
       sourceField._operation = {
         type: 'delete-to-unassigned',
         deletedCategoryIndex: categoryIndex,
         deletedCategoryLabel: deletedLabel,
-        unassignedLabel: String(unassignedLabel)
+        unassignedLabel
       };
 
       // Keep serialized template in sync for persistence.
-      const template = this._userDefinedFields?.getField?.(sourceField._userDefinedId);
-      if (template) {
-        template.categories = nextCategories;
-        template.codes = sourceField.codes;
-        if (sourceField.centroidsByDim) template.centroidsByDim = sourceField.centroidsByDim;
-        template._operation = sourceField._operation;
-      }
+      template.categories = nextCategories;
+      template.codes = sourceField.codes;
+      template.centroidsByDim = sourceField.centroidsByDim;
+      template._operation = sourceField._operation;
 
       // Remap any category-based highlight groups referencing this field.
-      for (const page of this.highlightPages || []) {
-        for (const group of (page.highlightedGroups || [])) {
-          if (!group || group.type !== 'category') continue;
-          if (group.fieldSource !== FieldSource.OBS) continue;
-          if (group.fieldIndex !== fieldIndex) continue;
-          const oldCat = group.categoryIndex;
-          if (!Number.isInteger(oldCat) || oldCat < 0 || oldCat >= transform.mapping.length) continue;
-          group.categoryIndex = transform.mapping[oldCat];
-        }
+      for (const remap of highlightRemaps) {
+        remap.group.categoryIndex = remap.categoryIndex;
       }
 
       getFieldRegistry().invalidate();
       this._syncActiveContext();
 
-      try {
-        this.setActiveField(fieldIndex);
-      } catch (err) {
-        console.warn('[State] Failed to re-activate edited field:', err);
-      }
+      this.setActiveField(fieldIndex);
 
       this.updateFilterSummary();
       this._refreshHighlightGroupsForField(FieldSource.OBS, fieldIndex);
@@ -184,83 +244,66 @@ export class FieldCategoryOpsMethods {
       return { newFieldIndex: fieldIndex, newKey: sourceField.key, updatedInPlace: true };
     }
 
-    const nextCodes = applyCategoryIndexMapping(sourceField.codes, transform.mapping, nextCategories.length);
-
     const rootKey = sourceField._sourceField?.sourceKey || sourceField._originalKey || sourceField.key;
-    const baseKey = String(options.newKey || `${rootKey} (edited)`).trim() || `${rootKey} (edited)`;
-    const existingKeys = (fields || []).filter((f) => f && f._isDeleted !== true).map((f) => f.key);
+    const baseKey = requireCategoryEditBaseKey(options, `${rootKey} (edited)`);
+    const existingKeys = fields.filter((f) => f && f._isDeleted !== true).map((f) => f.key);
     const newKey = makeUniqueLabel(baseKey, existingKeys);
 
-    let created;
-    try {
-      created = this._userDefinedFields.createFromCategoricalCodes(
-        {
-          key: newKey,
-          categories: nextCategories,
-          codes: nextCodes,
-          meta: {
-            _sourceField: {
-              kind: 'categorical-obs',
-              sourceKey: rootKey,
-              sourceIndex: fieldIndex
-            },
-            _operation: {
-              type: 'delete-to-unassigned',
-              deletedCategoryIndex: categoryIndex,
-              deletedCategoryLabel: String(sourceField.categories?.[categoryIndex] ?? ''),
-              unassignedLabel: String(unassignedLabel)
-            }
+    const created = this._userDefinedFields.createFromCategoricalCodes(
+      {
+        key: newKey,
+        categories: nextCategories,
+        codes: nextCodes,
+        source: FieldSource.OBS,
+        meta: {
+          _sourceField: {
+            kind: 'categorical-obs',
+            sourceKey: rootKey,
+            sourceIndex: fieldIndex
+          },
+          _operation: {
+            type: 'delete-to-unassigned',
+            deletedCategoryIndex: categoryIndex,
+            deletedCategoryLabel: deletedLabel,
+            unassignedLabel
           }
-        },
-        this
-      );
-    } catch (err) {
-      console.error('[State] deleteCategoryToUnassigned create failed:', err.message);
-      return null;
-    }
+        }
+      },
+      this
+    );
 
     const derivedField = created.field;
 
     // Carry forward category UI state (colors/visibility) as a convenience.
-    try {
-      this.ensureCategoryMetadata(sourceField);
-      const newColors = new Array(nextCategories.length);
-      const newVisible = {};
-      for (let i = 0; i < nextCategories.length; i++) newVisible[i] = true;
+    const newColors = new Array(nextCategories.length);
+    const newVisible = {};
+    for (let i = 0; i < nextCategories.length; i++) newVisible[i] = true;
 
-      const oldColors = sourceField._categoryColors || [];
-      const oldVisible = sourceField._categoryVisible || {};
+    const oldColors = sourceField._categoryColors;
+    const oldVisible = sourceField._categoryVisible;
 
-      // Unassigned bucket: prefer the kept old unassigned color, otherwise palette default.
-      const unassignedOld = transform.keptOldUnassignedIndex;
-      const unassignedNew = transform.unassignedNewIndex;
-      if (unassignedOld != null && oldColors[unassignedOld]) {
-        newColors[unassignedNew] = oldColors[unassignedOld];
-        newVisible[unassignedNew] = oldVisible[unassignedOld] !== false;
-      } else {
-        newColors[unassignedNew] = getCategoryColor(unassignedNew);
-        newVisible[unassignedNew] = true;
-      }
-
-      // Copy remaining categories (skip those merged into unassigned).
-      const merged = new Set(transform.mergedOldIndices || []);
-      for (let oldIdx = 0; oldIdx < transform.mapping.length; oldIdx++) {
-        if (oldIdx === unassignedOld) continue;
-        if (merged.has(oldIdx)) continue;
-        const newIdx = transform.mapping[oldIdx];
-        const c = oldColors[oldIdx];
-        if (c) newColors[newIdx] = c;
-        newVisible[newIdx] = oldVisible[oldIdx] !== false;
-      }
-
-      derivedField._categoryColors = newColors;
-      derivedField._categoryVisible = newVisible;
-      derivedField._categoryFilterEnabled = sourceField._categoryFilterEnabled ?? true;
-      if (sourceField._colormapId) derivedField._colormapId = sourceField._colormapId;
-    } catch (err) {
-      console.warn('[State] Failed to carry category UI state to derived field:', err);
+    const unassignedOld = transform.keptOldUnassignedIndex;
+    const unassignedNew = transform.unassignedNewIndex;
+    if (unassignedOld !== null) {
+      newColors[unassignedNew] = [...oldColors[unassignedOld]];
+      newVisible[unassignedNew] = oldVisible[unassignedOld];
+    } else {
+      newColors[unassignedNew] = getCategoryColor(unassignedNew);
+      newVisible[unassignedNew] = true;
     }
 
+    const merged = new Set(transform.mergedOldIndices);
+    for (let oldIdx = 0; oldIdx < transform.mapping.length; oldIdx++) {
+      if (oldIdx === unassignedOld) continue;
+      if (merged.has(oldIdx)) continue;
+      const newIdx = transform.mapping[oldIdx];
+      newColors[newIdx] = [...oldColors[oldIdx]];
+      newVisible[newIdx] = oldVisible[oldIdx];
+    }
+
+    derivedField._categoryColors = newColors;
+    derivedField._categoryVisible = newVisible;
+    derivedField._categoryFilterEnabled = sourceField._categoryFilterEnabled;
     // Ensure this derived field does not carry latent outlier filtering state.
     delete derivedField.outlierQuantiles;
     delete derivedField._outlierThreshold;
@@ -273,16 +316,12 @@ export class FieldCategoryOpsMethods {
     this._notifyFieldChange(FieldSource.OBS, newFieldIndex, ChangeType.CREATE, { userDefinedId: created.id });
 
     // Activate new field before deleting the previous one (avoids a brief "no field" state).
-    try {
-      this.setActiveField(newFieldIndex);
-    } catch (err) {
-      console.warn('[State] Failed to activate derived field:', err);
-    }
+    this.setActiveField(newFieldIndex);
 
     // Soft-delete the source field for a clean UX; restoration is available in Deleted Fields.
     this.deleteField(FieldSource.OBS, fieldIndex);
 
-    return { newFieldIndex, newKey };
+    return { newFieldIndex, newKey, updatedInPlace: false };
   }
 
   /**
@@ -297,100 +336,126 @@ export class FieldCategoryOpsMethods {
    * @param {number} fieldIndex
    * @param {number} fromCategoryIndex
    * @param {number} toCategoryIndex
-   * @param {object} [options]
+   * @param {object} options
+   * @param {boolean} options.editInPlace
    * @param {string} [options.newKey]
-   * @returns {{ newFieldIndex: number, newKey: string }|null}
+   * @returns {{
+   *   newFieldIndex: number,
+   *   newKey: string,
+   *   updatedInPlace: boolean,
+   *   mergedCategoryLabel: string
+   * }}
    */
-  mergeCategoriesToNewField(fieldIndex, fromCategoryIndex, toCategoryIndex, options = {}) {
+  mergeCategoriesToNewField(fieldIndex, fromCategoryIndex, toCategoryIndex, options) {
     const fields = this.obsData?.fields;
 
-    try {
-      StateValidator.validateFieldIndex(fieldIndex, fields);
-      const field = fields[fieldIndex];
-      StateValidator.validateCategoryIndex(fromCategoryIndex, field);
-      StateValidator.validateCategoryIndex(toCategoryIndex, field);
-    } catch (e) {
-      console.error('[State] mergeCategoriesToNewField validation failed:', e.message);
-      return null;
-    }
-
+    StateValidator.validateFieldIndex(fieldIndex, fields);
     const sourceField = fields[fieldIndex];
-    if (!sourceField || sourceField.kind !== FieldKind.CATEGORY) return null;
-    if (sourceField._isDeleted === true) return null;
+    StateValidator.validateCategoryIndex(fromCategoryIndex, sourceField);
+    StateValidator.validateCategoryIndex(toCategoryIndex, sourceField);
+    if (!options || typeof options !== 'object' || Array.isArray(options)) {
+      throw new TypeError('Merge-category options must be an object.');
+    }
+    if (sourceField._isDeleted === true) {
+      throw new Error('Deleted fields cannot be edited.');
+    }
+    if (typeof options.editInPlace !== 'boolean') {
+      throw new TypeError('Merge-category editInPlace must be exactly true or false.');
+    }
+    if (
+      options.mergedLabel !== undefined
+      && (
+        typeof options.mergedLabel !== 'string'
+        || options.mergedLabel.length === 0
+        || options.mergedLabel !== options.mergedLabel.trim()
+      )
+    ) {
+      throw new TypeError('Merge-category mergedLabel must be a non-empty trimmed string.');
+    }
 
     const canEditInPlace = sourceField._isUserDefined === true && Boolean(sourceField._userDefinedId);
-    const editInPlace = options.editInPlace !== false && canEditInPlace;
-
-    let transform;
-    try {
-      transform = buildMergeCategoriesTransform(sourceField.categories || [], fromCategoryIndex, toCategoryIndex);
-    } catch (err) {
-      console.error('[State] mergeCategoriesToNewField failed:', err.message);
-      return null;
+    if (options.editInPlace && !canEditInPlace) {
+      throw new Error('Only registered user-defined fields can be edited in place.');
     }
+    const editInPlace = options.editInPlace;
+
+    requireEditableCodes(sourceField.codes, this.pointCount);
+    const transform = buildMergeCategoriesTransform(
+      sourceField.categories,
+      fromCategoryIndex,
+      toCategoryIndex
+    );
 
     const nextCategories = transform.categories;
-    const fromLabel = String(sourceField.categories?.[fromCategoryIndex] ?? '');
-    const toLabel = String(sourceField.categories?.[toCategoryIndex] ?? '');
+    const fromLabel = sourceField.categories[fromCategoryIndex];
+    const toLabel = sourceField.categories[toCategoryIndex];
     const targetNewIndex = transform.targetNewIndex;
+    if (
+      !Number.isSafeInteger(targetNewIndex)
+      || targetNewIndex < 0
+      || targetNewIndex >= nextCategories.length
+    ) {
+      throw new RangeError('Category merge returned an invalid target category index.');
+    }
 
     // Rename the merged bucket so the result is explicit to the user.
     // The merged label is "dragged + target" so drag direction is visible.
-    const mergedBase = String(options.mergedLabel ?? `merged ${fromLabel} + ${toLabel}`).trim() || 'merged';
+    const mergedBase = options.mergedLabel ?? `merged ${fromLabel} + ${toLabel}`;
     const mergedLabel = makeUniqueLabel(
       mergedBase,
       nextCategories.filter((_, idx) => idx !== targetNewIndex)
     );
-    if (nextCategories[targetNewIndex] != null) {
-      nextCategories[targetNewIndex] = mergedLabel;
-    }
+    nextCategories[targetNewIndex] = mergedLabel;
+    const nextCodes = applyCategoryIndexMapping(
+      sourceField.codes,
+      transform.mapping,
+      nextCategories.length
+    );
+    requireEditableCodes(nextCodes, this.pointCount);
+    this.ensureCategoryMetadata(sourceField);
 
     if (editInPlace) {
-      // Prefer in-place remapping to avoid allocating a full codes copy on every edit.
-      // Fallback to allocating when codes isn't a TypedArray (unexpected).
-      let nextCodes = sourceField.codes;
-      const didInPlace = applyCategoryIndexMappingInPlace(nextCodes, transform.mapping);
-      if (!didInPlace) {
-        nextCodes = applyCategoryIndexMapping(sourceField.codes, transform.mapping, nextCategories.length);
-      }
-
-      try {
-        this.ensureCategoryMetadata(sourceField);
-      } catch {}
-
-      const oldColors = sourceField._categoryColors || [];
-      const oldVisible = sourceField._categoryVisible || {};
+      const oldColors = sourceField._categoryColors;
+      const oldVisible = sourceField._categoryVisible;
       const newColors = new Array(nextCategories.length);
       const newVisible = {};
       for (let i = 0; i < nextCategories.length; i++) newVisible[i] = true;
 
       // Merged bucket color should come from the dragged category.
-      const draggedColor = oldColors[fromCategoryIndex] || getCategoryColor(fromCategoryIndex);
-      newColors[targetNewIndex] = draggedColor;
-      newVisible[targetNewIndex] = (oldVisible[fromCategoryIndex] !== false) || (oldVisible[toCategoryIndex] !== false);
+      newColors[targetNewIndex] = [...oldColors[fromCategoryIndex]];
+      newVisible[targetNewIndex] = oldVisible[fromCategoryIndex] || oldVisible[toCategoryIndex];
 
       for (let oldIdx = 0; oldIdx < transform.mapping.length; oldIdx++) {
         if (oldIdx === fromCategoryIndex || oldIdx === toCategoryIndex) continue;
         const newIdx = transform.mapping[oldIdx];
-        const c = oldColors[oldIdx];
-        if (c) newColors[newIdx] = c;
-        newVisible[newIdx] = oldVisible[oldIdx] !== false;
+        newColors[newIdx] = [...oldColors[oldIdx]];
+        newVisible[newIdx] = oldVisible[oldIdx];
       }
 
+      const nextCentroidsByDim = this._userDefinedFields.computeCentroidsByDim(
+        nextCodes,
+        nextCategories,
+        this
+      );
+      const template = this._userDefinedFields.getField(sourceField._userDefinedId);
+      if (!template) {
+        throw new Error('The user-defined field registry does not own the edited field.');
+      }
+      const highlightRemaps = collectHighlightCategoryRemaps(
+        this,
+        fieldIndex,
+        transform.mapping
+      );
+
       sourceField.categories = nextCategories;
-      if (!didInPlace) sourceField.codes = nextCodes;
+      sourceField.codes = nextCodes;
       sourceField._categoryColors = newColors;
       sourceField._categoryVisible = newVisible;
+      sourceField.centroidsByDim = nextCentroidsByDim;
 
       delete sourceField._originalCategories;
       delete sourceField.outlierQuantiles;
       delete sourceField._outlierThreshold;
-
-      try {
-        sourceField.centroidsByDim = this._userDefinedFields.computeCentroidsByDim(nextCodes, nextCategories, this);
-      } catch (err) {
-        console.warn('[State] mergeCategoriesToNewField in-place centroid compute failed:', err);
-      }
 
       sourceField._operation = {
         type: 'merge-categories',
@@ -402,34 +467,20 @@ export class FieldCategoryOpsMethods {
       };
 
       // Keep serialized template in sync for persistence.
-      const template = this._userDefinedFields?.getField?.(sourceField._userDefinedId);
-      if (template) {
-        template.categories = nextCategories;
-        template.codes = sourceField.codes;
-        if (sourceField.centroidsByDim) template.centroidsByDim = sourceField.centroidsByDim;
-        template._operation = sourceField._operation;
-      }
+      template.categories = nextCategories;
+      template.codes = sourceField.codes;
+      template.centroidsByDim = sourceField.centroidsByDim;
+      template._operation = sourceField._operation;
 
       // Remap any category-based highlight groups referencing this field.
-      for (const page of this.highlightPages || []) {
-        for (const group of (page.highlightedGroups || [])) {
-          if (!group || group.type !== 'category') continue;
-          if (group.fieldSource !== FieldSource.OBS) continue;
-          if (group.fieldIndex !== fieldIndex) continue;
-          const oldCat = group.categoryIndex;
-          if (!Number.isInteger(oldCat) || oldCat < 0 || oldCat >= transform.mapping.length) continue;
-          group.categoryIndex = transform.mapping[oldCat];
-        }
+      for (const remap of highlightRemaps) {
+        remap.group.categoryIndex = remap.categoryIndex;
       }
 
       getFieldRegistry().invalidate();
       this._syncActiveContext();
 
-      try {
-        this.setActiveField(fieldIndex);
-      } catch (err) {
-        console.warn('[State] Failed to re-activate merged field:', err);
-      }
+      this.setActiveField(fieldIndex);
 
       this.updateFilterSummary();
       this._refreshHighlightGroupsForField(FieldSource.OBS, fieldIndex);
@@ -441,75 +492,59 @@ export class FieldCategoryOpsMethods {
       return { newFieldIndex: fieldIndex, newKey: sourceField.key, updatedInPlace: true, mergedCategoryLabel: mergedLabel };
     }
 
-    const nextCodes = applyCategoryIndexMapping(sourceField.codes, transform.mapping, nextCategories.length);
-
     const rootKey = sourceField._sourceField?.sourceKey || sourceField._originalKey || sourceField.key;
-    const baseKey = String(options.newKey || `${rootKey} (merged)`).trim() || `${rootKey} (merged)`;
-    const existingKeys = (fields || []).filter((f) => f && f._isDeleted !== true).map((f) => f.key);
+    const baseKey = requireCategoryEditBaseKey(options, `${rootKey} (merged)`);
+    const existingKeys = fields.filter((f) => f && f._isDeleted !== true).map((f) => f.key);
     const newKey = makeUniqueLabel(baseKey, existingKeys);
 
-    let created;
-    try {
-      created = this._userDefinedFields.createFromCategoricalCodes(
-        {
-          key: newKey,
-          categories: nextCategories,
-          codes: nextCodes,
-          meta: {
-            _sourceField: {
-              kind: 'categorical-obs',
-              sourceKey: rootKey,
-              sourceIndex: fieldIndex
-            },
-            _operation: {
-              type: 'merge-categories',
-              fromCategoryIndex,
-              toCategoryIndex,
-              fromCategoryLabel: String(sourceField.categories?.[fromCategoryIndex] ?? ''),
-              toCategoryLabel: String(sourceField.categories?.[toCategoryIndex] ?? '')
-            }
+    const created = this._userDefinedFields.createFromCategoricalCodes(
+      {
+        key: newKey,
+        categories: nextCategories,
+        codes: nextCodes,
+        source: FieldSource.OBS,
+        meta: {
+          _sourceField: {
+            kind: 'categorical-obs',
+            sourceKey: rootKey,
+            sourceIndex: fieldIndex
+          },
+          _operation: {
+            type: 'merge-categories',
+            fromCategoryIndex,
+            toCategoryIndex,
+            fromCategoryLabel: fromLabel,
+            toCategoryLabel: toLabel,
+            mergedCategoryLabel: mergedLabel
           }
-        },
-        this
-      );
-    } catch (err) {
-      console.error('[State] mergeCategoriesToNewField create failed:', err.message);
-      return null;
-    }
+        }
+      },
+      this
+    );
 
     const derivedField = created.field;
 
     // Carry forward category UI state (colors/visibility).
-    try {
-      this.ensureCategoryMetadata(sourceField);
-      const newColors = new Array(nextCategories.length);
-      const newVisible = {};
-      for (let i = 0; i < nextCategories.length; i++) newVisible[i] = true;
+    const newColors = new Array(nextCategories.length);
+    const newVisible = {};
+    for (let i = 0; i < nextCategories.length; i++) newVisible[i] = true;
 
-      const oldColors = sourceField._categoryColors || [];
-      const oldVisible = sourceField._categoryVisible || {};
+    const oldColors = sourceField._categoryColors;
+    const oldVisible = sourceField._categoryVisible;
 
-      // Merged bucket color comes from the dragged category.
-      const draggedColor = oldColors[fromCategoryIndex] || getCategoryColor(fromCategoryIndex);
-      newColors[targetNewIndex] = draggedColor;
-      newVisible[targetNewIndex] = (oldVisible[fromCategoryIndex] !== false) || (oldVisible[toCategoryIndex] !== false);
+    newColors[targetNewIndex] = [...oldColors[fromCategoryIndex]];
+    newVisible[targetNewIndex] = oldVisible[fromCategoryIndex] || oldVisible[toCategoryIndex];
 
-      // Copy remaining categories (skip merged source and avoid overwriting merged bucket).
-      for (let oldIdx = 0; oldIdx < transform.mapping.length; oldIdx++) {
-        if (oldIdx === fromCategoryIndex || oldIdx === toCategoryIndex) continue;
-        const newIdx = transform.mapping[oldIdx];
-        const c = oldColors[oldIdx];
-        if (c) newColors[newIdx] = c;
-        newVisible[newIdx] = oldVisible[oldIdx] !== false;
-      }
-
-      derivedField._categoryColors = newColors;
-      derivedField._categoryVisible = newVisible;
-      derivedField._categoryFilterEnabled = sourceField._categoryFilterEnabled ?? true;
-      if (sourceField._colormapId) derivedField._colormapId = sourceField._colormapId;
-    } catch (err) {
-      console.warn('[State] Failed to carry category UI state to merged field:', err);
+    for (let oldIdx = 0; oldIdx < transform.mapping.length; oldIdx++) {
+      if (oldIdx === fromCategoryIndex || oldIdx === toCategoryIndex) continue;
+      const newIdx = transform.mapping[oldIdx];
+      newColors[newIdx] = [...oldColors[oldIdx]];
+      newVisible[newIdx] = oldVisible[oldIdx];
     }
+
+    derivedField._categoryColors = newColors;
+    derivedField._categoryVisible = newVisible;
+    derivedField._categoryFilterEnabled = sourceField._categoryFilterEnabled;
 
     delete derivedField.outlierQuantiles;
     delete derivedField._outlierThreshold;
@@ -521,33 +556,94 @@ export class FieldCategoryOpsMethods {
     this._syncActiveContext();
     this._notifyFieldChange(FieldSource.OBS, newFieldIndex, ChangeType.CREATE, { userDefinedId: created.id });
 
-    try {
-      this.setActiveField(newFieldIndex);
-    } catch (err) {
-      console.warn('[State] Failed to activate merged field:', err);
-    }
+    this.setActiveField(newFieldIndex);
 
     this.deleteField(FieldSource.OBS, fieldIndex);
 
-    return { newFieldIndex, newKey, mergedCategoryLabel: mergedLabel };
+    return {
+      newFieldIndex,
+      newKey,
+      updatedInPlace: false,
+      mergedCategoryLabel: mergedLabel
+    };
   }
 
   createCategoricalFromPages(options) {
-    const result = this._userDefinedFields.createFromPages(options, this);
-
-    if (result.field) {
-      if (!this.obsData) this.obsData = { fields: [] };
-      if (!this.obsData.fields) this.obsData.fields = [];
-
-      this.obsData.fields.push(result.field);
-      const newIndex = this.obsData.fields.length - 1;
-
-      getFieldRegistry().invalidate();
-      this._syncActiveContext();
-      this._notifyFieldChange(FieldSource.OBS, newIndex, ChangeType.CREATE, { userDefinedId: result.id });
+    StateValidator.validateUserDefinedOptions(options);
+    if (
+      this.obsData === null
+      || typeof this.obsData !== 'object'
+      || Array.isArray(this.obsData)
+      || !Array.isArray(this.obsData.fields)
+    ) {
+      throw new TypeError(
+        'Highlight-page categorical creation requires the current observation field inventory.'
+      );
     }
+    for (let index = 0; index < this.obsData.fields.length; index++) {
+      const field = this.obsData.fields[index];
+      if (
+        field === null
+        || typeof field !== 'object'
+        || Array.isArray(field)
+        || typeof field.key !== 'string'
+        || field.key.length === 0
+      ) {
+        throw new TypeError(
+          `Observation field ${index} is malformed.`
+        );
+      }
+      if (field._isDeleted !== true && field.key === options.key) {
+        throw new Error(
+          `A visible observation field named "${options.key}" already exists.`
+        );
+      }
+    }
+    if (
+      this._userDefinedFields === null
+      || typeof this._userDefinedFields !== 'object'
+      || typeof this._userDefinedFields.createFromPages !== 'function'
+    ) {
+      throw new TypeError(
+        'Highlight-page categorical creation requires its field registry.'
+      );
+    }
+    const result = this._userDefinedFields.createFromPages(options, this);
+    if (
+      result === null
+      || typeof result !== 'object'
+      || Array.isArray(result)
+      || Object.keys(result).sort().join(',') !==
+        'conflicts,field,id,uncoveredCount'
+      || typeof result.id !== 'string'
+      || result.id.length === 0
+      || result.field === null
+      || typeof result.field !== 'object'
+      || Array.isArray(result.field)
+      || result.field.key !== options.key
+      || result.field._userDefinedId !== result.id
+      || !Number.isSafeInteger(result.conflicts)
+      || result.conflicts < 0
+      || !Number.isSafeInteger(result.uncoveredCount)
+      || result.uncoveredCount < 0
+    ) {
+      throw new TypeError(
+        'User-defined field registry returned a malformed categorical result.'
+      );
+    }
+
+    this.obsData.fields.push(result.field);
+    const newIndex = this.obsData.fields.length - 1;
+
+    getFieldRegistry().invalidate();
+    this._syncActiveContext();
+    this._notifyFieldChange(
+      FieldSource.OBS,
+      newIndex,
+      ChangeType.CREATE,
+      { userDefinedId: result.id }
+    );
 
     return result;
   }
 }
-

@@ -61,27 +61,21 @@ export function collectDOMReferences(root) {
 
       userDataBlock: byId('user-data-block'),
       userDataH5adBtn: byId('user-data-h5ad-btn'),
-      userDataZarrBtn: byId('user-data-zarr-btn'),
+      userDataZarrArchiveBtn: byId('user-data-zarr-archive-btn'),
       userDataBrowseBtn: byId('user-data-browse-btn'),
       userDataFileInput: byId('user-data-file-input'),
       userDataH5adInput: byId('user-data-h5ad-input'),
-      userDataZarrInput: byId('user-data-zarr-input'),
-      userDataInfoBtn: byId('user-data-info-btn'),
-      userDataInfoTooltip: byId('user-data-info-tooltip'),
+      userDataZarrArchiveInput: byId('user-data-zarr-archive-input'),
 
       remoteServerUrl: byId('remote-server-url'),
       remoteConnectBtn: byId('remote-connect-btn'),
       remoteDisconnectBtn: byId('remote-disconnect-btn'),
       remoteDisconnectContainer: byId('remote-disconnect-container'),
-      remoteInfoBtn: byId('remote-info-btn'),
-      remoteInfoTooltip: byId('remote-info-tooltip'),
 
       githubRepoUrl: byId('github-repo-url'),
       githubConnectBtn: byId('github-connect-btn'),
       githubDisconnectBtn: byId('github-disconnect-btn'),
       githubDisconnectContainer: byId('github-disconnect-container'),
-      githubInfoBtn: byId('github-info-btn'),
-      githubInfoTooltip: byId('github-info-tooltip'),
     },
 
     session: {
@@ -258,7 +252,6 @@ export function collectDOMReferences(root) {
       badgesBox: byId('split-view-badges-box'),
       badgesList: byId('split-view-badges-list'),
       badgesHint: $('.split-view-hint'),
-      boxTitle: $('.split-view-box-title'),
     },
 
     dimension: {
@@ -298,8 +291,6 @@ export function collectDOMReferences(root) {
     },
 
     cinematicCamera: {
-      section: byId('cinematic-camera-section'),
-
       // Navigation controls (mirrors Compare Views)
       navModeSelect: byId('cinematic-nav-mode'),
       orbitControls: byId('cinematic-orbit-controls'),
@@ -322,7 +313,6 @@ export function collectDOMReferences(root) {
 
       // Keyframe controls
       saveBtn: byId('cinematic-save-btn'),
-      loopBackBtn: byId('cinematic-loop-back-btn'),
       keyframeList: byId('cinematic-keyframe-list'),
       clearBtn: byId('cinematic-clear-btn'),
       timingActions: byId('cinematic-timing-actions'),
@@ -336,7 +326,6 @@ export function collectDOMReferences(root) {
       rotationInterp: byId('cinematic-rotation-interp'),
       easingSelect: byId('cinematic-easing'),
       loopCheckbox: byId('cinematic-loop'),
-      interpolationSettings: byId('cinematic-interpolation-settings'),
     },
   };
 }

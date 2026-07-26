@@ -1,8 +1,6 @@
 // Lightweight Google Analytics helpers to track dataset loads and UI interactions
 // without impacting rendering performance.
 
-const MAX_QUEUE_LENGTH = 50;
-const MAX_FLUSH_ATTEMPTS = 8;
 const ANALYTICS_ID_MAX = 60;
 const BUTTON_SELECTOR = 'button, [role="button"], a, input[type="button"], input[type="submit"]';
 
@@ -14,13 +12,12 @@ export const DATA_LOAD_METHODS = {
   SAMPLE_DEMO: 'sample-demo',
   LOCAL_PREPARED: 'local-user-prepared',
   LOCAL_H5AD: 'local-user-h5ad',
-  LOCAL_ZARR: 'local-user-zarr',
+  LOCAL_ZARR_DIRECTORY: 'local-user-zarr-directory',
+  LOCAL_ZARR_ZIP: 'local-user-zarr-zip',
   REMOTE_URL_PARAM: 'remote-url-param',
   REMOTE_CONNECT: 'remote-connect',
-  REMOTE_DISCONNECT_FALLBACK: 'remote-disconnect-fallback',
   GITHUB_URL_PARAM: 'github-url-param',
   GITHUB_CONNECT: 'github-connect',
-  GITHUB_DISCONNECT_FALLBACK: 'github-disconnect-fallback',
   JUPYTER_AUTO: 'jupyter-auto',
   BENCHMARK_SYNTHETIC: 'benchmark-synthetic',
   STATE_RESTORE_FILE: 'state-restore-file',
@@ -46,10 +43,7 @@ const KNOWN_BUTTON_IDS = {
   'bottleneck-analyze-btn': 'benchmark:analyze'
 };
 
-const pendingEvents = [];
-let flushHandle = null;
 let buttonTrackingAttached = false;
-let flushAttempts = 0;
 const loadSessions = new Map();
 
 const clampString = (value, maxLen = 120) => {
@@ -59,15 +53,11 @@ const clampString = (value, maxLen = 120) => {
   return s.length > maxLen ? s.slice(0, maxLen) : s;
 };
 
-const scheduleIdle = (fn, timeout = 500) => {
-  if (typeof requestIdleCallback === 'function') {
-    return requestIdleCallback(() => fn(), { timeout });
-  }
-  return setTimeout(fn, timeout);
-};
-
-function isGtagReady() {
-  return typeof window !== 'undefined' && typeof window.gtag === 'function';
+function isAnalyticsEnabled() {
+  return (
+    typeof window !== 'undefined' &&
+    window.cellucidAnalyticsEnabled === true
+  );
 }
 
 function safeNumber(value) {
@@ -84,35 +74,14 @@ function normalizeAnalyticsId(rawId) {
     .slice(0, ANALYTICS_ID_MAX);
 }
 
-function scheduleFlush() {
-  if (flushHandle) return;
-  if (flushAttempts >= MAX_FLUSH_ATTEMPTS && !isGtagReady()) {
-    pendingEvents.length = 0;
-    return;
-  }
-  flushHandle = scheduleIdle(() => {
-    flushHandle = null;
-    flushAttempts += 1;
-    flushPending();
-  }, 400);
-}
-
-function flushPending() {
-  if (!pendingEvents.length) return;
-  if (!isGtagReady()) {
-    scheduleFlush();
-    return;
-  }
-  const gtag = window.gtag;
-  flushAttempts = 0;
-  while (pendingEvents.length) {
-    const evt = pendingEvents.shift();
-    gtag('event', evt.name, evt.params);
-  }
-}
-
 function sendEvent(name, params = {}) {
   if (!name) return;
+  if (!isAnalyticsEnabled()) return;
+  if (typeof window.gtag !== 'function') {
+    throw new Error(
+      'Analytics is enabled but the production bootstrap is incomplete'
+    );
+  }
 
   // Drop empty/undefined values to keep payload lean
   const cleaned = {};
@@ -122,16 +91,7 @@ function sendEvent(name, params = {}) {
   }
   cleaned.transport_type = cleaned.transport_type || 'beacon';
 
-  if (isGtagReady()) {
-    window.gtag('event', name, cleaned);
-    return;
-  }
-
-  if (pendingEvents.length >= MAX_QUEUE_LENGTH) {
-    pendingEvents.shift();
-  }
-  pendingEvents.push({ name, params: cleaned });
-  scheduleFlush();
+  window.gtag('event', name, cleaned);
 }
 
 function tagKnownButtons() {
@@ -253,6 +213,16 @@ export function completeDataLoadFailure(token, context = {}) {
     httpStatus: context.httpStatus || httpStatus,
     failureReason: context.failureReason || failureReason
   });
+  loadSessions.delete(token);
+}
+
+/**
+ * Discard an in-flight load session without recording success or failure.
+ * Used when a newer dataset request supersedes work before it owns any result.
+ *
+ * @param {string} token
+ */
+export function cancelDataLoad(token) {
   loadSessions.delete(token);
 }
 

@@ -1,12 +1,5 @@
 /**
- * @fileoverview Deleted fields (restore / confirm delete) UI.
- *
- * Extracted from `field-selector.js` to keep the main selector module focused
- * on active field selection + field actions, while this module owns the
- * "Deleted Fields" panel rendering and click handling.
- *
- * UI updates are driven by `state.emit('field:changed', …)`; the coordinator
- * listens and calls `renderDeletedFieldsSection()` as needed.
+ * @fileoverview Exact deleted-field restore/purge panel contract.
  *
  * @module ui/modules/field-selector-deleted-fields
  */
@@ -15,196 +8,532 @@ import { getNotificationCenter } from '../../notification-center.js';
 import { showConfirmDialog } from '../components/confirm-dialog.js';
 import { getFieldRegistry } from '../../utils/field-registry.js';
 import { FieldSource } from '../../utils/field-constants.js';
+import { StateValidator } from '../../utils/state-validator.js';
+
+const INIT_KEYS = new Set(['state', 'deletedFieldsSection']);
+
+function requirePlainRecord(value, label) {
+  if (
+    value === null
+    || typeof value !== 'object'
+    || Array.isArray(value)
+    || Object.getPrototypeOf(value) !== Object.prototype
+  ) {
+    throw new TypeError(`${label} must be a plain object`);
+  }
+  return value;
+}
+
+function requireExactKeys(value, keys, label) {
+  requirePlainRecord(value, label);
+  for (const key of Object.keys(value)) {
+    if (!keys.has(key)) {
+      throw new TypeError(`${label} contains unknown key "${key}"`);
+    }
+  }
+  for (const key of keys) {
+    if (!Object.hasOwn(value, key)) {
+      throw new TypeError(`${label} requires key "${key}"`);
+    }
+  }
+  return value;
+}
+
+function requireMethod(owner, methodName, label) {
+  if (
+    owner === null
+    || typeof owner !== 'object'
+    || typeof owner[methodName] !== 'function'
+  ) {
+    throw new TypeError(`${label} must implement ${methodName}()`);
+  }
+}
+
+function requireBoolean(value, label) {
+  if (typeof value !== 'boolean') {
+    throw new TypeError(`${label} must be exactly boolean`);
+  }
+  return value;
+}
+
+function requireTrue(value, label) {
+  requireBoolean(value, label);
+  if (value !== true) {
+    throw new Error(`${label} did not complete`);
+  }
+  return true;
+}
+
+function requireError(value, label) {
+  if (!(value instanceof Error)) {
+    throw new TypeError(`${label} must fail with an Error`);
+  }
+  if (typeof value.message !== 'string' || value.message.length === 0) {
+    throw new TypeError(`${label} Error must own a non-empty message`);
+  }
+  return value;
+}
+
+function requireIndex(value, label) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${label} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
+function parseDeletedIndex(value) {
+  if (value === '-1') return -1;
+  if (
+    typeof value !== 'string'
+    || !/^(0|[1-9][0-9]*)$/.test(value)
+  ) {
+    throw new TypeError(
+      'Deleted field index must be -1 or a canonical non-negative integer'
+    );
+  }
+  return requireIndex(Number(value), 'Deleted field index');
+}
+
+function requireIdentifier(value, label) {
+  if (
+    typeof value !== 'string'
+    || value.length === 0
+    || value !== value.trim()
+  ) {
+    throw new TypeError(`${label} must be a non-empty trimmed string`);
+  }
+  return value;
+}
+
+function requireField(field, label) {
+  if (
+    field === null
+    || typeof field !== 'object'
+    || Array.isArray(field)
+  ) {
+    throw new TypeError(`${label} must be one field metadata object`);
+  }
+  StateValidator.validateFieldKey(field.key);
+  return field;
+}
+
+function requireInventory(value, label) {
+  if (!Array.isArray(value)) {
+    throw new TypeError(`${label} must be an array`);
+  }
+  value.forEach((field, index) => {
+    requireField(field, `${label}[${index}]`);
+  });
+  return value;
+}
+
+function requireDeletedEntries(value, inventory, source) {
+  if (!Array.isArray(value)) {
+    throw new TypeError(`Deleted ${source} fields must be an array`);
+  }
+  return value.map((entry, entryIndex) => {
+    requireExactKeys(
+      entry,
+      new Set(['field', 'index']),
+      `Deleted ${source} fields[${entryIndex}]`
+    );
+    const field = requireField(
+      entry.field,
+      `Deleted ${source} fields[${entryIndex}].field`
+    );
+    if (field._isDeleted !== true || field._isPurged === true) {
+      throw new Error(
+        `Deleted ${source} fields[${entryIndex}] must be restorable`
+      );
+    }
+    const index = entry.index;
+    if (index === -1) {
+      requireIdentifier(
+        field._userDefinedId,
+        `Deleted ${source} virtual field identifier`
+      );
+    } else {
+      requireIndex(index, `Deleted ${source} field index`);
+      if (index >= inventory.length || inventory[index] !== field) {
+        throw new Error(
+          `Deleted ${source} field must reference its exact inventory slot`
+        );
+      }
+    }
+    return { field, index };
+  });
+}
+
+function readPanelOpen(section) {
+  const value = section.dataset.open;
+  if (value === undefined) return false;
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  throw new TypeError(
+    'Deleted fields panel open state must be exactly true or false'
+  );
+}
+
+function requireRestoreFieldResult(value) {
+  requireExactKeys(
+    value,
+    new Set(['ok', 'originalKey', 'key', 'userDefinedId']),
+    'Restore field result'
+  );
+  requireTrue(value.ok, 'Restore field result.ok');
+  StateValidator.validateFieldKey(value.originalKey);
+  StateValidator.validateFieldKey(value.key);
+  if (value.userDefinedId !== null) {
+    requireIdentifier(
+      value.userDefinedId,
+      'Restore field result.userDefinedId'
+    );
+  }
+  return value;
+}
+
+function requireRestoreVirtualResult(value) {
+  requireExactKeys(
+    value,
+    new Set(['ok', 'key', 'userDefinedId']),
+    'Restore virtual field result'
+  );
+  requireTrue(value.ok, 'Restore virtual field result.ok');
+  StateValidator.validateFieldKey(value.key);
+  requireIdentifier(
+    value.userDefinedId,
+    'Restore virtual field result.userDefinedId'
+  );
+  return value;
+}
 
 /**
  * @param {object} options
  * @param {import('../../state/core/data-state.js').DataState} options.state
- * @param {HTMLElement|null} options.deletedFieldsSection
+ * @param {HTMLElement} options.deletedFieldsSection
  */
-export function initDeletedFieldsPanel({ state, deletedFieldsSection }) {
+export function initDeletedFieldsPanel(options) {
+  requireExactKeys(options, INIT_KEYS, 'Deleted fields panel options');
+  const { state, deletedFieldsSection } = options;
+  for (const methodName of [
+    'getFields',
+    'getUserDefinedFieldsRegistry',
+    'getVarFields',
+    'purgeDeletedField',
+    'purgeUserDefinedField',
+    'restoreField',
+    'restoreUserDefinedField'
+  ]) {
+    requireMethod(state, methodName, 'Deleted fields panel state');
+  }
+  const ownerDocument = deletedFieldsSection?.ownerDocument;
+  const view = ownerDocument?.defaultView;
+  if (
+    view === null
+    || view === undefined
+    || !(deletedFieldsSection instanceof view.HTMLElement)
+  ) {
+    throw new TypeError(
+      'Deleted fields panel requires one document-owned HTMLElement'
+    );
+  }
+  const registry = getFieldRegistry();
+  for (const methodName of ['getDeletedFields']) {
+    requireMethod(registry, methodName, 'Field registry');
+  }
+  const userDefinedRegistry = state.getUserDefinedFieldsRegistry();
+  requireMethod(
+    userDefinedRegistry,
+    'getField',
+    'User-defined field registry'
+  );
+
+  const lifecycle = new view.AbortController();
+  let destroyed = false;
+
+  function assertAlive() {
+    if (destroyed) {
+      throw new Error('Deleted fields panel has been destroyed');
+    }
+  }
+
+  function reportActionFailure(error, action) {
+    const exactError = requireError(error, `Deleted field ${action}`);
+    console.error(exactError);
+    getNotificationCenter().error(
+      `Failed to ${action} field: ${exactError.message}`,
+      { category: 'filter' }
+    );
+  }
+
+  function readInventories() {
+    return {
+      obs: requireInventory(state.getFields(), 'Obs field inventory'),
+      var: requireInventory(state.getVarFields(), 'Var field inventory')
+    };
+  }
+
+  function getDeletedFields() {
+    const inventories = readInventories();
+    return {
+      obs: requireDeletedEntries(
+        registry.getDeletedFields(FieldSource.OBS),
+        inventories.obs,
+        FieldSource.OBS
+      ),
+      var: requireDeletedEntries(
+        registry.getDeletedFields(FieldSource.VAR),
+        inventories.var,
+        FieldSource.VAR
+      )
+    };
+  }
+
+  function createElement(tagName, className, textContent = null) {
+    const element = ownerDocument.createElement(tagName);
+    if (className.length > 0) element.className = className;
+    if (textContent !== null) element.textContent = textContent;
+    return element;
+  }
+
   function renderDeletedFieldsSection() {
-    if (!deletedFieldsSection) return;
-
-    const deletedObs = getFieldRegistry().getDeletedFields(FieldSource.OBS);
-    const deletedVar = getFieldRegistry().getDeletedFields(FieldSource.VAR);
-    const total = deletedObs.length + deletedVar.length;
-
-    if (!total) {
+    assertAlive();
+    const deleted = getDeletedFields();
+    const total = deleted.obs.length + deleted.var.length;
+    if (total === 0) {
       deletedFieldsSection.hidden = true;
-      deletedFieldsSection.innerHTML = '';
+      deletedFieldsSection.replaceChildren();
       return;
     }
 
+    const open = readPanelOpen(deletedFieldsSection);
     deletedFieldsSection.hidden = false;
-    deletedFieldsSection.innerHTML = '';
+    const wrapper = createElement(
+      'div',
+      'analysis-accordion deleted-fields-wrapper'
+    );
+    const item = createElement(
+      'div',
+      `analysis-accordion-item${open ? ' open' : ''}`
+    );
+    item.id = 'deleted-fields-accordion-item';
+    const toggle = createElement(
+      'button',
+      'analysis-accordion-header'
+    );
+    toggle.type = 'button';
+    toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    toggle.appendChild(
+      createElement('span', 'analysis-accordion-title', 'Deleted Fields')
+    );
+    toggle.appendChild(
+      createElement(
+        'span',
+        'analysis-accordion-desc',
+        `${total} restorable item${total === 1 ? '' : 's'}`
+      )
+    );
+    const chevron = createElement(
+      'span',
+      'analysis-accordion-chevron'
+    );
+    chevron.setAttribute('aria-hidden', 'true');
+    toggle.appendChild(chevron);
 
-    const open = deletedFieldsSection.dataset.open === 'true';
+    const content = createElement('div', 'analysis-accordion-content');
+    content.appendChild(
+      createElement(
+        'div',
+        'deleted-fields-hint',
+        'Restore soft-deleted fields, or confirm deletion to remove restore capability.'
+      )
+    );
+    const list = createElement('div', 'deleted-fields-list');
+    list.id = 'deleted-fields-list';
+    content.appendChild(list);
+    item.appendChild(toggle);
+    item.appendChild(content);
+    wrapper.appendChild(item);
 
-    const wrapper = document.createElement('div');
-    wrapper.className = 'analysis-accordion deleted-fields-wrapper';
-    wrapper.innerHTML = `
-      <div class="analysis-accordion-item ${open ? 'open' : ''}" id="deleted-fields-accordion-item">
-        <button type="button" class="analysis-accordion-header" aria-expanded="${open ? 'true' : 'false'}">
-          <span class="analysis-accordion-title">Deleted Fields</span>
-          <span class="analysis-accordion-desc">${total} restorable item${total === 1 ? '' : 's'}</span>
-          <span class="analysis-accordion-chevron" aria-hidden="true"></span>
-        </button>
-
-        <div class="analysis-accordion-content">
-          <div class="deleted-fields-hint">
-            Restore soft-deleted fields, or confirm deletion to remove restore capability.
-          </div>
-          <div class="deleted-fields-list" id="deleted-fields-list"></div>
-        </div>
-      </div>
-    `;
-
-    deletedFieldsSection.appendChild(wrapper);
-
-    const item = wrapper.querySelector('#deleted-fields-accordion-item');
-    const toggle = wrapper.querySelector('.analysis-accordion-header');
-    const list = wrapper.querySelector('#deleted-fields-list');
-
-    toggle?.addEventListener('click', () => {
-      const next = !(deletedFieldsSection.dataset.open === 'true');
+    toggle.addEventListener('click', () => {
+      const next = !readPanelOpen(deletedFieldsSection);
       deletedFieldsSection.dataset.open = next ? 'true' : 'false';
       toggle.setAttribute('aria-expanded', next ? 'true' : 'false');
-      item?.classList.toggle('open', next);
-    });
+      item.classList.toggle('open', next);
+    }, { signal: lifecycle.signal });
 
-    const addGroup = (title, entries, source) => {
-      if (!entries.length || !list) return;
-
-      const groupTitle = document.createElement('div');
-      groupTitle.className = 'deleted-fields-group-title';
-      groupTitle.textContent = title;
-      list.appendChild(groupTitle);
-
-      entries.forEach(({ field, index }) => {
-        const row = document.createElement('div');
-        row.className = 'deleted-field-row';
-
-        const name = document.createElement('span');
-        name.className = 'deleted-field-name';
-        name.textContent = field._originalKey ? `${field.key} *` : field.key;
-        if (field._originalKey) name.title = `Original: ${field._originalKey}`;
-
-        const buttons = document.createElement('div');
-        buttons.className = 'deleted-field-actions';
-
-        const restoreBtn = document.createElement('button');
-        restoreBtn.type = 'button';
-        restoreBtn.className = 'deleted-field-restore-btn';
-        restoreBtn.textContent = 'Restore';
-        restoreBtn.dataset.action = 'restore-field';
-        restoreBtn.dataset.source = source;
-        restoreBtn.dataset.index = String(index);
-        if (field._userDefinedId) restoreBtn.dataset.userDefinedId = field._userDefinedId;
-
-        const confirmBtn = document.createElement('button');
-        confirmBtn.type = 'button';
-        confirmBtn.className = 'deleted-field-confirm-btn';
-        confirmBtn.textContent = 'Confirm';
-        confirmBtn.dataset.action = 'purge-field';
-        confirmBtn.dataset.source = source;
-        confirmBtn.dataset.index = String(index);
-        confirmBtn.title = 'Permanently confirm deletion (cannot be restored)';
-        if (field._userDefinedId) confirmBtn.dataset.userDefinedId = field._userDefinedId;
-
-        buttons.appendChild(restoreBtn);
-        buttons.appendChild(confirmBtn);
-
+    function addGroup(title, entries, source) {
+      if (entries.length === 0) return;
+      list.appendChild(
+        createElement('div', 'deleted-fields-group-title', title)
+      );
+      for (const { field, index } of entries) {
+        const row = createElement('div', 'deleted-field-row');
+        let fieldLabel = field.key;
+        if (Object.hasOwn(field, '_originalKey')) {
+          StateValidator.validateFieldKey(field._originalKey);
+          fieldLabel = `${field.key} *`;
+        }
+        const name = createElement(
+          'span',
+          'deleted-field-name',
+          fieldLabel
+        );
+        if (Object.hasOwn(field, '_originalKey')) {
+          name.title = `Original: ${field._originalKey}`;
+        }
+        const buttons = createElement('div', 'deleted-field-actions');
+        const restoreButton = createElement(
+          'button',
+          'deleted-field-restore-btn',
+          'Restore'
+        );
+        restoreButton.type = 'button';
+        restoreButton.dataset.action = 'restore-field';
+        restoreButton.dataset.source = source;
+        restoreButton.dataset.index = String(index);
+        const purgeButton = createElement(
+          'button',
+          'deleted-field-confirm-btn',
+          'Confirm'
+        );
+        purgeButton.type = 'button';
+        purgeButton.dataset.action = 'purge-field';
+        purgeButton.dataset.source = source;
+        purgeButton.dataset.index = String(index);
+        purgeButton.title = (
+          'Permanently confirm deletion (cannot be restored)'
+        );
+        if (index === -1) {
+          const userDefinedId = requireIdentifier(
+            field._userDefinedId,
+            'Deleted virtual field identifier'
+          );
+          restoreButton.dataset.userDefinedId = userDefinedId;
+          purgeButton.dataset.userDefinedId = userDefinedId;
+        }
+        buttons.appendChild(restoreButton);
+        buttons.appendChild(purgeButton);
         row.appendChild(name);
         row.appendChild(buttons);
         list.appendChild(row);
-      });
-    };
+      }
+    }
 
-    addGroup('Obs', deletedObs, FieldSource.OBS);
-    addGroup('Genes', deletedVar, FieldSource.VAR);
+    addGroup('Obs', deleted.obs, FieldSource.OBS);
+    addGroup('Genes', deleted.var, FieldSource.VAR);
+    deletedFieldsSection.replaceChildren(wrapper);
   }
 
-  if (deletedFieldsSection) {
-    deletedFieldsSection.addEventListener('click', (e) => {
-      const target = /** @type {HTMLElement|null} */ (e.target);
+  function readAction(button) {
+    const source = button.dataset.source;
+    if (source !== FieldSource.OBS && source !== FieldSource.VAR) {
+      throw new TypeError(
+        'Deleted field action source must be exactly obs or var'
+      );
+    }
+    const index = parseDeletedIndex(button.dataset.index);
+    const inventories = readInventories();
+    if (index >= 0) {
+      const inventory = source === FieldSource.VAR
+        ? inventories.var
+        : inventories.obs;
+      if (index >= inventory.length) {
+        throw new RangeError(
+          'Deleted field action index is outside its inventory'
+        );
+      }
+      return {
+        source,
+        index,
+        field: inventory[index],
+        userDefinedId: null
+      };
+    }
+    const userDefinedId = requireIdentifier(
+      button.dataset.userDefinedId,
+      'Deleted virtual field identifier'
+    );
+    const field = requireField(
+      userDefinedRegistry.getField(userDefinedId),
+      'Deleted virtual field'
+    );
+    return { source, index, field, userDefinedId };
+  }
 
-      const purgeBtn = target?.closest?.('button[data-action="purge-field"]');
-      if (purgeBtn) {
-        const source = purgeBtn.dataset.source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
-        const fieldIndex = parseInt(purgeBtn.dataset.index || '-1', 10);
-        const userDefinedId = purgeBtn.dataset.userDefinedId || null;
+  deletedFieldsSection.addEventListener('click', (event) => {
+    assertAlive();
+    if (!(event.target instanceof view.Element)) {
+      throw new TypeError('Deleted field click target must be an Element');
+    }
+    const button = event.target.closest(
+      'button[data-action="purge-field"], button[data-action="restore-field"]'
+    );
+    if (button === null) return;
+    if (!(button instanceof view.HTMLButtonElement)) {
+      throw new TypeError(
+        'Deleted field action must originate from a button'
+      );
+    }
+    const action = button.dataset.action;
+    if (action !== 'purge-field' && action !== 'restore-field') {
+      throw new TypeError('Deleted field action is unsupported');
+    }
+    const {
+      source,
+      index,
+      field,
+      userDefinedId
+    } = readAction(button);
 
-        let label = 'field';
-        if (fieldIndex >= 0) {
-          const fields = source === FieldSource.VAR ? state.getVarFields?.() : state.getFields?.();
-          const field = fields?.[fieldIndex];
-          label = field?.key || 'field';
-        } else if (userDefinedId) {
-          const template = state.getUserDefinedFieldsRegistry?.()?.getField?.(userDefinedId);
-          label = template?.key || 'field';
-        } else {
-          return;
-        }
-
-        showConfirmDialog({
-          title: 'Confirm deletion',
-          message:
-            `Permanently confirm deletion of "${label}"?\n\n` +
-            `This removes restore capability for this field in the current session and in saved states.`,
-          confirmText: 'Confirm delete',
-          onConfirm: () => {
-            let ok;
-            if (fieldIndex >= 0) {
-              ok = state.purgeDeletedField?.(source, fieldIndex);
-            } else if (userDefinedId) {
-              ok = state.purgeUserDefinedField?.(userDefinedId, source);
-            }
-            if (!ok) {
-              getNotificationCenter().error('Failed to confirm deletion', { category: 'filter' });
-              return;
-            }
-            getNotificationCenter().success(`Confirmed deletion of "${label}"`, { category: 'filter', duration: 2500 });
+    if (action === 'purge-field') {
+      showConfirmDialog({
+        title: 'Confirm deletion',
+        message:
+          `Permanently confirm deletion of "${field.key}"?\n\n`
+          + 'This removes restore capability for this field in the current session and in saved states.',
+        confirmText: 'Confirm delete',
+        onConfirm: () => {
+          try {
+            requireTrue(
+              index >= 0
+                ? state.purgeDeletedField(source, index)
+                : state.purgeUserDefinedField(userDefinedId, source),
+              'Deleted field purge result'
+            );
+            getNotificationCenter().success(
+              `Confirmed deletion of "${field.key}"`,
+              { category: 'filter', duration: 2500 }
+            );
+          } catch (error) {
+            reportActionFailure(error, 'confirm deletion of');
           }
-        });
-        return;
-      }
+        }
+      });
+      return;
+    }
 
-      const restoreBtn = target?.closest?.('button[data-action="restore-field"]');
-      if (!restoreBtn) return;
+    try {
+      const result = index >= 0
+        ? requireRestoreFieldResult(state.restoreField(source, index))
+        : requireRestoreVirtualResult(
+            state.restoreUserDefinedField(userDefinedId, source)
+          );
+      getNotificationCenter().success(
+        `Restored "${result.key}"`,
+        { category: 'filter', duration: 2500 }
+      );
+    } catch (error) {
+      reportActionFailure(error, 'restore');
+    }
+  }, { signal: lifecycle.signal });
 
-      const source = restoreBtn.dataset.source === FieldSource.VAR ? FieldSource.VAR : FieldSource.OBS;
-      const fieldIndex = parseInt(restoreBtn.dataset.index || '-1', 10);
-      const userDefinedId = restoreBtn.dataset.userDefinedId || null;
-
-      let result;
-      let label = 'field';
-
-      if (fieldIndex >= 0) {
-        // Restore by index (field exists in array)
-        const fields = source === FieldSource.VAR ? state.getVarFields?.() : state.getFields?.();
-        const field = fields?.[fieldIndex];
-        label = field?.key || 'field';
-        result = state.restoreField?.(source, fieldIndex);
-      } else if (userDefinedId) {
-        // Restore by userDefinedId (field only in registry)
-        result = state.restoreUserDefinedField?.(userDefinedId, source);
-        label = result?.key || 'field';
-      } else {
-        return;
-      }
-
-      if (!result || result.ok !== true) {
-        getNotificationCenter().error('Failed to restore field', { category: 'filter' });
-        return;
-      }
-
-      if (result.renamedTo) {
-        getNotificationCenter().success(`Restored "${label}" as "${result.key}"`, { category: 'filter', duration: 2800 });
-      } else {
-        getNotificationCenter().success(`Restored "${result.key || label}"`, { category: 'filter', duration: 2500 });
-      }
-    });
+  function destroy() {
+    if (destroyed) return;
+    destroyed = true;
+    lifecycle.abort();
+    deletedFieldsSection.replaceChildren();
   }
 
-  return { renderDeletedFieldsSection };
+  return { destroy, renderDeletedFieldsSection };
 }

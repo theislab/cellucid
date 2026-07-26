@@ -16,6 +16,7 @@ import * as highlightsMeta from './contributors/highlights-meta.js';
 import * as highlightsCells from './contributors/highlights-cells.js';
 import * as analysisArtifacts from './contributors/analysis-artifacts.js';
 import * as cinematicCamera from './contributors/cinematic-camera.js';
+import { assertExactKeys } from './schema-contract.js';
 
 /**
  * Create the SessionSerializer.
@@ -31,6 +32,11 @@ import * as cinematicCamera from './contributors/cinematic-camera.js';
  * @returns {SessionSerializer}
  */
 export function createSessionSerializer(options) {
+  assertExactKeys(
+    options,
+    ['state', 'viewer', 'sidebar', 'dataSourceManager'],
+    'Session factory options'
+  );
   // Contributors are registered in a fixed order (plan requirement).
   const contributors = [
     fieldOverlays,
@@ -43,5 +49,14 @@ export function createSessionSerializer(options) {
     analysisArtifacts,
     cinematicCamera
   ];
-  return new SessionSerializer({ ...options, contributors });
+  return new SessionSerializer({
+    state: options.state,
+    viewer: options.viewer,
+    sidebar: options.sidebar,
+    dataSourceManager: options.dataSourceManager,
+    comparisonModule: null,
+    analysisWindowManager: null,
+    cinematicCamera: null,
+    contributors
+  });
 }

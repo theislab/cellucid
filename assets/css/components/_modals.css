@@ -517,7 +517,7 @@
     var(--color-surface-elevated);
   border: 1px solid color-mix(in srgb, var(--color-border-default) 70%, transparent);
   box-shadow:
-    0 26px 88px rgba(var(--shadow-rgb), var(--opacity-28)),
+    0 26px 88px rgba(var(--shadow-rgb), var(--opacity-30)),
     0 10px 26px rgba(var(--shadow-rgb), var(--opacity-12));
   /* Flexbox for main layout - more predictable than grid for resizing */
   display: flex;

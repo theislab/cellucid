@@ -164,11 +164,6 @@ export {
 } from './analysis-types/index.js';
 
 // Cross-highlighting
-export {
-  CrossHighlightManager,
-  getCrossHighlightManager,
-  createCrossHighlightManager
-} from './cross-highlighting.js';
 
 // =============================================================================
 // DEFAULT EXPORT

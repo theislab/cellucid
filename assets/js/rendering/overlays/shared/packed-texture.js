@@ -15,14 +15,79 @@
  * @param {number} itemCount
  */
 export function computePackedDims(gl, itemCount) {
+  if (!Number.isSafeInteger(itemCount) || itemCount < 0) {
+    throw new RangeError(
+      'Packed texture itemCount must be a non-negative safe integer.'
+    );
+  }
   const maxTexSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
-  const count = Math.max(0, Math.floor(itemCount || 0));
-  const width = Math.max(1, Math.min(count || 1, maxTexSize));
-  const height = Math.max(1, Math.ceil((count || 1) / width));
+  if (!Number.isSafeInteger(maxTexSize) || maxTexSize <= 0) {
+    throw new Error('WebGL MAX_TEXTURE_SIZE must be a positive safe integer.');
+  }
+  const packedCount = itemCount === 0 ? 1 : itemCount;
+  const width = Math.min(packedCount, maxTexSize);
+  const height = Math.ceil(packedCount / width);
   if (height > maxTexSize) {
     throw new Error(`Packed texture dims ${width}x${height} exceed MAX_TEXTURE_SIZE=${maxTexSize}`);
   }
   return { width, height, maxTexSize };
+}
+
+function uploadStagedTexture(gl, existing, label, upload) {
+  if (existing !== null && !gl.isTexture(existing)) {
+    throw new TypeError(`${label} existing texture is not owned by WebGL.`);
+  }
+  const priorError = gl.getError();
+  if (priorError !== gl.NO_ERROR) {
+    throw new Error(
+      `${label} cannot start while WebGL error 0x${priorError.toString(16)} is pending.`
+    );
+  }
+  const previousBinding = gl.getParameter(gl.TEXTURE_BINDING_2D);
+  const previousAlignment = gl.getParameter(gl.UNPACK_ALIGNMENT);
+  const candidate = gl.createTexture();
+  if (candidate === null) {
+    throw new Error(`WebGL failed to allocate ${label}.`);
+  }
+  const restoreBinding = previousBinding === existing
+    ? candidate
+    : previousBinding;
+  try {
+    gl.bindTexture(gl.TEXTURE_2D, candidate);
+    upload();
+    const uploadError = gl.getError();
+    if (uploadError !== gl.NO_ERROR) {
+      throw new Error(
+        `${label} upload failed with WebGL error 0x${uploadError.toString(16)}.`
+      );
+    }
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, previousAlignment);
+    gl.bindTexture(gl.TEXTURE_2D, restoreBinding);
+  } catch (error) {
+    const cleanupErrors = [];
+    for (const cleanup of [
+      () => gl.pixelStorei(gl.UNPACK_ALIGNMENT, previousAlignment),
+      () => gl.bindTexture(gl.TEXTURE_2D, previousBinding),
+      () => gl.deleteTexture(candidate)
+    ]) {
+      try {
+        cleanup();
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+    }
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        [error, ...cleanupErrors],
+        `${label} upload failed and cleanup was incomplete.`
+      );
+    }
+    throw error;
+  }
+  if (existing !== null) {
+    gl.deleteTexture(existing);
+  }
+  return candidate;
 }
 
 /**
@@ -37,15 +102,42 @@ export function computePackedDims(gl, itemCount) {
  * @returns {{ texture: WebGLTexture, width: number, height: number, components: number }}
  */
 export function createOrUpdatePackedFloatTexture(gl, options) {
-  const { texture: existing = null, data, itemCount, components } = options || {};
-
-  const comps = components === 1 || components === 2 || components === 3 || components === 4 ? components : 3;
-  const count = Math.max(0, Math.floor(itemCount || 0));
-  if (!(data instanceof Float32Array)) {
-    throw new Error('createOrUpdatePackedFloatTexture: data must be Float32Array');
+  if (
+    options === null ||
+    typeof options !== 'object' ||
+    Array.isArray(options) ||
+    Object.getPrototypeOf(options) !== Object.prototype ||
+    Object.keys(options).sort().join(',') !==
+      'components,data,itemCount,texture'
+  ) {
+    throw new TypeError(
+      'Packed float texture options must contain exactly components, data, itemCount, and texture.'
+    );
   }
-  if (data.length < count * comps) {
-    throw new Error(`createOrUpdatePackedFloatTexture: data length ${data.length} < expected ${count * comps}`);
+  const {
+    texture: existing,
+    data,
+    itemCount: count,
+    components: comps
+  } = options;
+  if (existing !== null && typeof existing !== 'object') {
+    throw new TypeError('Packed float texture must be a WebGLTexture or null.');
+  }
+  if (![1, 2, 3, 4].includes(comps)) {
+    throw new RangeError('Packed float texture components must be exactly 1, 2, 3, or 4.');
+  }
+  if (!Number.isSafeInteger(count) || count < 0) {
+    throw new RangeError(
+      'Packed float texture itemCount must be a non-negative safe integer.'
+    );
+  }
+  if (!(data instanceof Float32Array)) {
+    throw new TypeError('Packed float texture data must be a Float32Array.');
+  }
+  if (data.length !== count * comps) {
+    throw new RangeError(
+      `Packed float texture data must contain exactly ${count * comps} values; received ${data.length}.`
+    );
   }
 
   const { width, height } = computePackedDims(gl, count);
@@ -61,29 +153,52 @@ export function createOrUpdatePackedFloatTexture(gl, options) {
     comps === 3 ? gl.RGB :
     gl.RGBA;
 
-  const texture = existing || gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_2D, texture);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const texture = uploadStagedTexture(
+    gl,
+    existing,
+    'packed float texture',
+    () => {
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
-  // Allocate storage, then stream rows to avoid padded CPU copies.
-  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-  gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, width, height, 0, format, gl.FLOAT, null);
+      // Allocate storage, then stream rows to avoid padded CPU copies.
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        internalFormat,
+        width,
+        height,
+        0,
+        format,
+        gl.FLOAT,
+        null
+      );
 
-  let remaining = count;
-  let srcOffset = 0;
-  for (let y = 0; y < height && remaining > 0; y++) {
-    const rowItems = Math.min(width, remaining);
-    const rowLen = rowItems * comps;
-    const row = data.subarray(srcOffset, srcOffset + rowLen);
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, y, rowItems, 1, format, gl.FLOAT, row);
-    remaining -= rowItems;
-    srcOffset += rowLen;
-  }
-
-  gl.bindTexture(gl.TEXTURE_2D, null);
+      let remaining = count;
+      let srcOffset = 0;
+      for (let y = 0; y < height && remaining > 0; y++) {
+        const rowItems = Math.min(width, remaining);
+        const rowLen = rowItems * comps;
+        const row = data.subarray(srcOffset, srcOffset + rowLen);
+        gl.texSubImage2D(
+          gl.TEXTURE_2D,
+          0,
+          0,
+          y,
+          rowItems,
+          1,
+          format,
+          gl.FLOAT,
+          row
+        );
+        remaining -= rowItems;
+        srcOffset += rowLen;
+      }
+    }
+  );
   return { texture, width, height, components: comps };
 }
 
@@ -98,38 +213,80 @@ export function createOrUpdatePackedFloatTexture(gl, options) {
  * @returns {{ texture: WebGLTexture, width: number, height: number }}
  */
 export function createOrUpdatePackedUintTexture(gl, options) {
-  const { texture: existing = null, data, itemCount } = options || {};
-
-  const count = Math.max(0, Math.floor(itemCount || 0));
-  if (!(data instanceof Uint32Array)) {
-    throw new Error('createOrUpdatePackedUintTexture: data must be Uint32Array');
+  if (
+    options === null ||
+    typeof options !== 'object' ||
+    Array.isArray(options) ||
+    Object.getPrototypeOf(options) !== Object.prototype ||
+    Object.keys(options).sort().join(',') !== 'data,itemCount,texture'
+  ) {
+    throw new TypeError(
+      'Packed uint texture options must contain exactly data, itemCount, and texture.'
+    );
   }
-  if (data.length < count) {
-    throw new Error(`createOrUpdatePackedUintTexture: data length ${data.length} < expected ${count}`);
+  const { texture: existing, data, itemCount: count } = options;
+  if (existing !== null && typeof existing !== 'object') {
+    throw new TypeError('Packed uint texture must be a WebGLTexture or null.');
+  }
+  if (!Number.isSafeInteger(count) || count < 0) {
+    throw new RangeError(
+      'Packed uint texture itemCount must be a non-negative safe integer.'
+    );
+  }
+  if (!(data instanceof Uint32Array)) {
+    throw new TypeError('Packed uint texture data must be a Uint32Array.');
+  }
+  if (data.length !== count) {
+    throw new RangeError(
+      `Packed uint texture data must contain exactly ${count} values; received ${data.length}.`
+    );
   }
 
   const { width, height } = computePackedDims(gl, count);
 
-  const texture = existing || gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_2D, texture);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const texture = uploadStagedTexture(
+    gl,
+    existing,
+    'packed uint texture',
+    () => {
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
-  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32UI, width, height, 0, gl.RED_INTEGER, gl.UNSIGNED_INT, null);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        gl.R32UI,
+        width,
+        height,
+        0,
+        gl.RED_INTEGER,
+        gl.UNSIGNED_INT,
+        null
+      );
 
-  let remaining = count;
-  let srcOffset = 0;
-  for (let y = 0; y < height && remaining > 0; y++) {
-    const rowItems = Math.min(width, remaining);
-    const row = data.subarray(srcOffset, srcOffset + rowItems);
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, y, rowItems, 1, gl.RED_INTEGER, gl.UNSIGNED_INT, row);
-    remaining -= rowItems;
-    srcOffset += rowItems;
-  }
-
-  gl.bindTexture(gl.TEXTURE_2D, null);
+      let remaining = count;
+      let srcOffset = 0;
+      for (let y = 0; y < height && remaining > 0; y++) {
+        const rowItems = Math.min(width, remaining);
+        const row = data.subarray(srcOffset, srcOffset + rowItems);
+        gl.texSubImage2D(
+          gl.TEXTURE_2D,
+          0,
+          0,
+          y,
+          rowItems,
+          1,
+          gl.RED_INTEGER,
+          gl.UNSIGNED_INT,
+          row
+        );
+        remaining -= rowItems;
+        srcOffset += rowItems;
+      }
+    }
+  );
   return { texture, width, height };
 }

@@ -1,5 +1,5 @@
 /**
- * Memory Utilities (best-effort, browser-safe)
+ * Memory Utilities (capability-aware and browser-safe)
  *
  * Centralizes memory measurement in one place so we can:
  * - keep monitoring logic DRY across analysis modules
@@ -89,7 +89,7 @@ export function getHeapMemoryUsage() {
 }
 
 /**
- * Best-effort user-agent specific memory measurement (Chromium, async).
+ * User-agent specific memory capability measurement (Chromium, async).
  * @returns {Promise<UserAgentMemoryUsage>}
  */
 export async function measureUserAgentSpecificMemory() {

@@ -22,6 +22,107 @@ import { PageSelectorComponent } from '../shared/page-selector.js';
 import { purgePlot } from '../../plots/plotly-loader.js';
 import { isFiniteNumber } from '../../shared/number-utils.js';
 
+function requireCorrelationVariable(variable, label) {
+  if (
+    variable === null ||
+    typeof variable !== 'object' ||
+    Array.isArray(variable) ||
+    Object.keys(variable).length !== 2 ||
+    !Object.hasOwn(variable, 'type') ||
+    !Object.hasOwn(variable, 'key') ||
+    (variable.type !== 'continuous_obs' && variable.type !== 'gene_expression') ||
+    typeof variable.key !== 'string' ||
+    variable.key.length === 0
+  ) {
+    throw new TypeError(
+      `${label} must contain exactly a continuous_obs or gene_expression type and non-empty key`
+    );
+  }
+}
+
+function requireReadyPageData(pageData, pageIds, variableKey) {
+  if (!Array.isArray(pageData)) {
+    throw new TypeError(
+      `Correlation readiness for "${variableKey}" must return an array`
+    );
+  }
+  if (pageData.length !== pageIds.length) {
+    throw new Error(
+      `Correlation readiness for "${variableKey}" returned ${pageData.length} ` +
+      `pages instead of ${pageIds.length}`
+    );
+  }
+
+  const expectedPageIds = new Set(pageIds);
+  const seenPageIds = new Set();
+  for (const page of pageData) {
+    if (
+      page === null ||
+      typeof page !== 'object' ||
+      Array.isArray(page) ||
+      typeof page.pageId !== 'string' ||
+      !expectedPageIds.has(page.pageId) ||
+      page.values === null ||
+      typeof page.values !== 'object' ||
+      !Number.isSafeInteger(page.values.length) ||
+      page.cellIndices === null ||
+      typeof page.cellIndices !== 'object' ||
+      !Number.isSafeInteger(page.cellIndices.length) ||
+      page.values.length !== page.cellIndices.length
+    ) {
+      throw new TypeError(
+        `Correlation readiness for "${variableKey}" returned invalid page data`
+      );
+    }
+    if (seenPageIds.has(page.pageId)) {
+      throw new TypeError(
+        `Correlation readiness for "${variableKey}" duplicated page "${page.pageId}"`
+      );
+    }
+    seenPageIds.add(page.pageId);
+  }
+}
+
+function requireStoredCorrelationVariable(variable, label, dataLayer) {
+  if (
+    variable === null ||
+    typeof variable !== 'object' ||
+    Array.isArray(variable) ||
+    Object.keys(variable).length !== 2 ||
+    !Object.hasOwn(variable, 'type') ||
+    !Object.hasOwn(variable, 'variable') ||
+    typeof variable.type !== 'string' ||
+    typeof variable.variable !== 'string'
+  ) {
+    throw new TypeError(
+      `${label} must contain exactly string type and variable fields`
+    );
+  }
+  if (variable.type.length === 0 || variable.variable.length === 0) {
+    if (variable.type.length !== 0 || variable.variable.length !== 0) {
+      throw new TypeError(
+        `${label} type and variable must both be empty or both be selected`
+      );
+    }
+    return;
+  }
+  if (
+    variable.type !== 'continuous_obs' &&
+    variable.type !== 'gene_expression'
+  ) {
+    throw new TypeError(`${label} type is unsupported`);
+  }
+  const inventory = dataLayer.getAvailableVariables(variable.type);
+  if (!Array.isArray(inventory)) {
+    throw new TypeError(`${label} variable inventory must be an array`);
+  }
+  if (!inventory.some(candidate => candidate?.key === variable.variable)) {
+    throw new Error(
+      `${label} variable "${variable.variable}" was not found`
+    );
+  }
+}
+
 /**
  * @typedef {{ type: 'continuous_obs'|'gene_expression', key: string }} CorrelationVariable
  * @typedef {{ variableX: CorrelationVariable|null, variableY: CorrelationVariable|null, method: 'pearson'|'spearman' }} CorrelationFormValues
@@ -297,12 +398,6 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
 
     if (pages.length === 0) return;
 
-    // Auto-select all pages by default if none selected
-    if (this._selectedPages.length === 0 && pages.length > 0) {
-      this._selectedPages = pages.map(p => p.id);
-      this._currentConfig.pages = this._selectedPages;
-    }
-
     // Create container for the component
     this._pageSelectContainer = document.createElement('div');
     wrapper.appendChild(this._pageSelectContainer);
@@ -319,11 +414,15 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
       showColorPicker: true,
       showCellCounts: true,
       showSelectAll: true,
-      initialSelection: this._selectedPages,
+      initialSelection: this._selectedPages.length > 0
+        ? this._selectedPages
+        : undefined,
       includeDerivedPages: true,
       getCellCountForPageId: (pageId) => this.dataLayer.getCellCountForPageId(pageId),
       label: 'Compare pages:'
     });
+    this._selectedPages = this._pageSelector.getSelectedPages();
+    this._currentConfig.pages = [...this._selectedPages];
   }
 
   /**
@@ -402,12 +501,65 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     if (!this.multiVariableAnalysis?.correlationAnalysis) {
       throw new Error('Correlation analysis module not available');
     }
+    if (typeof this.dataLayer?.getDataForPages !== 'function') {
+      throw new TypeError('Correlation analysis requires dataLayer.getDataForPages()');
+    }
+    requireCorrelationVariable(formValues.variableX, 'Correlation X variable');
+    requireCorrelationVariable(formValues.variableY, 'Correlation Y variable');
+    if (
+      !Array.isArray(this._selectedPages) ||
+      this._selectedPages.length === 0 ||
+      this._selectedPages.some(
+        pageId => typeof pageId !== 'string' || pageId.length === 0
+      ) ||
+      new Set(this._selectedPages).size !== this._selectedPages.length
+    ) {
+      throw new TypeError(
+        'Correlation analysis requires unique non-empty selected page IDs'
+      );
+    }
+
+    const pageIds = [...this._selectedPages];
+    const readinessRequests = [
+      {
+        type: formValues.variableX.type,
+        variableKey: formValues.variableX.key,
+        pageIds
+      },
+      {
+        type: formValues.variableY.type,
+        variableKey: formValues.variableY.key,
+        pageIds
+      }
+    ];
+    if (formValues.colorBy !== null) {
+      if (typeof formValues.colorBy !== 'string' || formValues.colorBy.length === 0) {
+        throw new TypeError('Correlation colorBy must be null or a non-empty string');
+      }
+      readinessRequests.push({
+        type: 'categorical_obs',
+        variableKey: formValues.colorBy,
+        pageIds
+      });
+    }
+
+    // Materialize each scientific array in a deterministic sequence before the
+    // compute request. This is one execution path: readiness failure terminates
+    // the analysis, and no alternate render or delayed second attempt is scheduled.
+    for (const request of readinessRequests) {
+      const readyPageData = await this.dataLayer.getDataForPages(request);
+      requireReadyPageData(
+        readyPageData,
+        pageIds,
+        request.variableKey
+      );
+    }
 
     const correlationResults = await this.multiVariableAnalysis.correlationAnalysis({
       varX: formValues.variableX,
       varY: formValues.variableY,
-      pageIds: this._selectedPages,
-      method: formValues.method || 'pearson',
+      pageIds,
+      method: formValues.method,
       colorBy: formValues.colorBy ? { type: 'categorical_obs', key: formValues.colorBy } : null
     });
 
@@ -457,7 +609,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     previewContainer.className = 'analysis-preview-container';
     previewContainer.style.cursor = 'pointer';
     previewContainer.title = 'Click to open in full view with statistics and export options';
-    previewContainer.addEventListener('click', () => this._openFigureModal?.());
+    previewContainer.addEventListener('click', () => this._openExpandedView());
     this._resultContainer.appendChild(previewContainer);
 
     const plotContainer = document.createElement('div');
@@ -687,47 +839,124 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
 
   exportSettings() {
     const base = super.exportSettings();
-    const customColors = this._pageSelector?.getCustomColors() || new Map();
+    if (!this._xSelector || !this._ySelector || !this._pageSelector) {
+      throw new Error(
+        'Correlation settings require initialized variable and page selectors'
+      );
+    }
+    const customColors = this._pageSelector.getCustomColors();
     return {
       ...base,
-      variableX: this._xSelector?.getSelectedVariable?.() || null,
-      variableY: this._ySelector?.getSelectedVariable?.() || null,
+      variableX: this._xSelector.getSelectedVariable(),
+      variableY: this._ySelector.getSelectedVariable(),
       colorBy: this._colorByVariable,
       customPageColors: Array.from(customColors.entries())
     };
   }
 
   importSettings(settings) {
-    super.importSettings(settings);
-    if (!settings) return;
-
-    const variableX = settings.variableX;
-    const variableY = settings.variableY;
-
-    if (variableX?.type && variableX?.variable && this._xSelector?.setSelectedVariable) {
-      this._xSelector.setSelectedVariable(variableX.type, variableX.variable);
+    const base = this._requireExactFormSettings(
+      settings,
+      [
+        'colorBy',
+        'customPageColors',
+        'formControls',
+        'selectedPages',
+        'variableX',
+        'variableY'
+      ]
+    );
+    requireStoredCorrelationVariable(
+      settings.variableX,
+      'Correlation X variable',
+      this.dataLayer
+    );
+    requireStoredCorrelationVariable(
+      settings.variableY,
+      'Correlation Y variable',
+      this.dataLayer
+    );
+    if (
+      settings.colorBy !== null &&
+      (typeof settings.colorBy !== 'string' || settings.colorBy.length === 0)
+    ) {
+      throw new TypeError(
+        'Correlation colorBy must be null or a non-empty string'
+      );
     }
-    if (variableY?.type && variableY?.variable && this._ySelector?.setSelectedVariable) {
-      this._ySelector.setSelectedVariable(variableY.type, variableY.variable);
+    const categoricalVariables =
+      this.dataLayer.getAvailableVariables('categorical_obs');
+    if (!Array.isArray(categoricalVariables)) {
+      throw new TypeError(
+        'Correlation categorical variable inventory must be an array'
+      );
     }
+    if (
+      settings.colorBy !== null &&
+      !categoricalVariables.some(variable => variable?.key === settings.colorBy)
+    ) {
+      throw new Error(
+        `Correlation color variable "${settings.colorBy}" was not found`
+      );
+    }
+    const methodControl = base.formControls.method;
+    if (
+      methodControl?.type !== 'value' ||
+      (methodControl.value !== 'pearson' &&
+        methodControl.value !== 'spearman')
+    ) {
+      throw new TypeError(
+        'Correlation method control must be pearson or spearman'
+      );
+    }
+    const colorControl = base.formControls.colorBy;
+    const expectedColorValue = settings.colorBy ?? NONE_VALUE;
+    if (
+      categoricalVariables.length > 0 &&
+      (
+        colorControl?.type !== 'value' ||
+        colorControl.value !== expectedColorValue
+      )
+    ) {
+      throw new TypeError(
+        'Correlation colorBy must exactly match its form control'
+      );
+    }
+    if (categoricalVariables.length === 0 && colorControl !== undefined) {
+      throw new TypeError(
+        'Correlation colorBy control is unavailable for this dataset'
+      );
+    }
+    const customPageColors = this._requireCustomPageColors(
+      settings.customPageColors
+    );
 
-    // Restore colorBy
-    if (settings.colorBy) {
-      this._colorByVariable = settings.colorBy;
+    this._applyFormSettings(base);
+    if (settings.variableX.type.length === 0) {
+      this._xSelector.clear();
+    } else {
+      this._xSelector.setSelectedVariable(
+        settings.variableX.type,
+        settings.variableX.variable
+      );
     }
-
-    // Restore custom page colors to component
-    if (Array.isArray(settings.customPageColors) && this._pageSelector) {
-      settings.customPageColors.forEach(([pageId, color]) => {
-        this._pageSelector.customColors.set(pageId, color);
-      });
-      this._pageSelector.render();
+    if (settings.variableY.type.length === 0) {
+      this._ySelector.clear();
+    } else {
+      this._ySelector.setSelectedVariable(
+        settings.variableY.type,
+        settings.variableY.variable
+      );
     }
+    this._colorByVariable = settings.colorBy;
+    this._applyCustomPageColors(customPageColors);
   }
 }
 
 export function createCorrelationAnalysisUI(options) {
-  return new CorrelationAnalysisUI(options);
+  const ui = new CorrelationAnalysisUI(options);
+  ui.init(options.container);
+  return ui;
 }
 
 export default CorrelationAnalysisUI;

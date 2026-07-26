@@ -46,6 +46,142 @@ import {
 } from '../components/index.js';
 import { getNotificationCenter } from '../../../notification-center.js';
 
+const FIGURE_OPTION_KEYS = new Set([
+  'container',
+  'customColors',
+  'expandable',
+  'onExportCSV',
+  'onExportPNG',
+  'onExportSVG',
+  'onPlotOptionChange',
+  'showOptions',
+  'showStats'
+]);
+const LAYOUT_OPTION_KEYS = new Set([
+  'colorScheme',
+  'syncXAxis',
+  'syncYAxis'
+]);
+
+function requireError(error, context) {
+  if (error instanceof Error) {
+    return error;
+  }
+  return new TypeError(`${context} threw a non-Error value.`, {
+    cause: error
+  });
+}
+
+function isPlainObject(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function requirePlainObject(value, name) {
+  if (!isPlainObject(value)) {
+    throw new TypeError(`${name} must be a plain object.`);
+  }
+  return value;
+}
+
+function clonePlainObject(value, name) {
+  requirePlainObject(value, name);
+  try {
+    const clone = structuredClone(value);
+    requirePlainObject(clone, name);
+    return clone;
+  } catch (error) {
+    throw new TypeError(`${name} must be structured-cloneable.`, {
+      cause: error
+    });
+  }
+}
+
+function requireNonEmptyString(value, name) {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new TypeError(`${name} must be a non-empty string.`);
+  }
+  return value;
+}
+
+function requireElement(value, name) {
+  if (
+    value === null ||
+    typeof value !== 'object' ||
+    typeof value.appendChild !== 'function'
+  ) {
+    throw new TypeError(`${name} must be an appendable element.`);
+  }
+  return value;
+}
+
+function requirePageData(pageData) {
+  const pageIds = new Set();
+  let variableName = null;
+  let variableKind = null;
+  for (const [index, page] of pageData.entries()) {
+    requirePlainObject(page, `Figure pageData[${index}]`);
+    requireNonEmptyString(page.pageId, `Figure pageData[${index}] pageId`);
+    requireNonEmptyString(
+      page.pageName,
+      `Figure pageData[${index}] pageName`
+    );
+    if (pageIds.has(page.pageId)) {
+      throw new TypeError(
+        `Figure pageData contains duplicate page id "${page.pageId}".`
+      );
+    }
+    pageIds.add(page.pageId);
+    requirePlainObject(
+      page.variableInfo,
+      `Figure pageData[${index}] variableInfo`
+    );
+    requireNonEmptyString(
+      page.variableInfo.name,
+      `Figure pageData[${index}] variable name`
+    );
+    if (
+      page.variableInfo.kind !== 'category' &&
+      page.variableInfo.kind !== 'continuous'
+    ) {
+      throw new TypeError(
+        `Figure pageData[${index}] variable kind must be "category" or "continuous".`
+      );
+    }
+    if (index === 0) {
+      variableName = page.variableInfo.name;
+      variableKind = page.variableInfo.kind;
+    } else if (
+      page.variableInfo.name !== variableName ||
+      page.variableInfo.kind !== variableKind
+    ) {
+      throw new TypeError(
+        'Figure pageData must describe one exact variable name and kind.'
+      );
+    }
+  }
+  return { variableKind, variableName };
+}
+
+function requireColorMap(colors, knownPageIds = null) {
+  if (!(colors instanceof Map)) {
+    throw new TypeError('Figure custom colors must be a Map.');
+  }
+  for (const [pageId, color] of colors) {
+    requireNonEmptyString(pageId, 'Figure custom color page id');
+    requireNonEmptyString(color, `Figure custom color for "${pageId}"`);
+    if (knownPageIds !== null && !knownPageIds.includes(pageId)) {
+      throw new RangeError(
+        `Figure custom color references unknown page "${pageId}".`
+      );
+    }
+  }
+  return colors;
+}
+
 /**
  * FigureContainer Class
  *
@@ -65,6 +201,40 @@ export class FigureContainer {
    * @param {Map} [options.customColors] - Custom page colors map
    */
   constructor(options) {
+    requirePlainObject(options, 'FigureContainer options');
+    for (const key of Object.keys(options)) {
+      if (!FIGURE_OPTION_KEYS.has(key)) {
+        throw new TypeError(`Unknown FigureContainer option "${key}".`);
+      }
+    }
+    requireElement(options.container, 'FigureContainer container');
+    if (
+      typeof document !== 'object' ||
+      document === null ||
+      typeof document.createElement !== 'function'
+    ) {
+      throw new TypeError(
+        'FigureContainer requires a document with createElement().'
+      );
+    }
+    for (const key of [
+      'onExportPNG',
+      'onExportSVG',
+      'onExportCSV',
+      'onPlotOptionChange'
+    ]) {
+      if (options[key] !== undefined && typeof options[key] !== 'function') {
+        throw new TypeError(`FigureContainer ${key} must be a function.`);
+      }
+    }
+    for (const key of ['expandable', 'showStats', 'showOptions']) {
+      if (options[key] !== undefined && typeof options[key] !== 'boolean') {
+        throw new TypeError(`FigureContainer ${key} must be a boolean.`);
+      }
+    }
+    if (options.customColors !== undefined) {
+      requireColorMap(options.customColors);
+    }
     this.container = options.container;
     this.onExportPNG = options.onExportPNG;
     this.onExportSVG = options.onExportSVG;
@@ -75,7 +245,7 @@ export class FigureContainer {
     this.expandable = options.expandable ?? true;
     this.showStats = options.showStats ?? true;
     this.showOptions = options.showOptions ?? true;
-    this.customColors = options.customColors || new Map();
+    this.customColors = new Map(options.customColors ?? []);
 
     // State
     this._currentPlotType = null;
@@ -83,6 +253,10 @@ export class FigureContainer {
     this._currentOptions = {};
     this._layoutEngine = null;
     this._modal = null;
+    this._currentVariableName = null;
+    this._currentVariableKind = null;
+    this._renderGeneration = 0;
+    this._destroyed = false;
 
     // DOM references
     this._previewContainer = null;
@@ -91,6 +265,13 @@ export class FigureContainer {
 
     // Notifications
     this._notifications = getNotificationCenter();
+    for (const method of ['error', 'success']) {
+      if (typeof this._notifications[method] !== 'function') {
+        throw new TypeError(
+          `FigureContainer notification owner must implement ${method}().`
+        );
+      }
+    }
 
     // Render initial state
     this._render();
@@ -115,6 +296,21 @@ export class FigureContainer {
     this.container.appendChild(this._actionsContainer);
   }
 
+  _assertAlive() {
+    if (this._destroyed) {
+      throw new Error('FigureContainer has been destroyed.');
+    }
+  }
+
+  _resetCurrentPlotState() {
+    this._currentPlotType = null;
+    this._currentPageData = null;
+    this._currentOptions = {};
+    this._layoutEngine = null;
+    this._currentVariableName = null;
+    this._currentVariableKind = null;
+  }
+
   // ===========================================================================
   // State Display Methods
   // ===========================================================================
@@ -123,8 +319,10 @@ export class FigureContainer {
    * Show loading state
    */
   showLoading() {
+    this._assertAlive();
     // Purge any existing plot to prevent WebGL memory leaks
     this._cleanup();
+    this._resetCurrentPlotState();
     this._previewContainer.innerHTML = '';
     this._previewContainer.classList.remove('empty');
     this._previewContainer.classList.add('loading');
@@ -136,16 +334,27 @@ export class FigureContainer {
    * @param {string} message - Error message
    */
   showError(message) {
+    this._assertAlive();
+    requireNonEmptyString(message, 'Figure error message');
     this._cleanup();
+    this._resetCurrentPlotState();
     this._previewContainer.classList.remove('loading');
     this._previewContainer.classList.add('empty');
     this._previewContainer.innerHTML = '';
     const errorEl = document.createElement('div');
     errorEl.className = 'analysis-error';
-    errorEl.textContent = String(message);
+    errorEl.textContent = message;
     this._previewContainer.appendChild(errorEl);
     this._actionsContainer.style.display = 'none';
 
+    const modalPlot = this._modal?._plotContainer;
+    if (modalPlot !== undefined && modalPlot !== null) {
+      modalPlot.innerHTML = '';
+      const modalError = document.createElement('div');
+      modalError.className = 'analysis-error';
+      modalError.textContent = message;
+      modalPlot.appendChild(modalError);
+    }
     this._notifications.error(message, { category: 'data', title: 'Analysis Error' });
   }
 
@@ -154,7 +363,12 @@ export class FigureContainer {
    * @param {string} [message] - Optional message
    */
   showEmpty(message) {
+    this._assertAlive();
+    if (message !== undefined) {
+      requireNonEmptyString(message, 'Figure empty-state message');
+    }
     this._cleanup();
+    this._resetCurrentPlotState();
     this._previewContainer.classList.remove('loading');
     this._previewContainer.classList.add('empty');
 
@@ -162,7 +376,7 @@ export class FigureContainer {
     if (message) {
       const emptyEl = document.createElement('div');
       emptyEl.className = 'analysis-empty-message';
-      emptyEl.textContent = String(message);
+      emptyEl.textContent = message;
       this._previewContainer.appendChild(emptyEl);
     }
 
@@ -179,68 +393,140 @@ export class FigureContainer {
    * @param {Object[]} pageData - Page data array
    * @param {Object} [options] - Plot options
    * @param {Object} [layoutEngineOptions] - Layout engine options
-   * @returns {Promise<void>}
+   * @returns {Promise<boolean>} Whether this request rendered the current plot
    */
   async renderPlot(plotTypeId, pageData, options = {}, layoutEngineOptions = {}) {
-    if (!plotTypeId || !pageData || pageData.length === 0) {
+    this._assertAlive();
+    requireNonEmptyString(plotTypeId, 'Figure plot type');
+    if (!Array.isArray(pageData)) {
+      throw new TypeError('Figure pageData must be an array.');
+    }
+    const generation = ++this._renderGeneration;
+    if (pageData.length === 0) {
+      this._resetCurrentPlotState();
       this.showEmpty('No data to display');
-      return;
+      return false;
     }
 
-    this._cleanup();
-    this.showLoading();
-
+    let candidatePlotDiv = null;
     try {
-      await loadPlotly();
+      const plotType = PlotRegistry.get(plotTypeId);
+      if (plotType === null) {
+        throw new RangeError(`Unknown plot type: ${plotTypeId}`);
+      }
+      const { variableKind, variableName } = requirePageData(pageData);
+      const ownedOptions = clonePlainObject(options, 'Figure plot options');
+      requirePlainObject(
+        layoutEngineOptions,
+        'Figure layout engine options'
+      );
+      for (const key of Object.keys(layoutEngineOptions)) {
+        if (!LAYOUT_OPTION_KEYS.has(key)) {
+          throw new TypeError(
+            `Unknown Figure layout engine option "${key}".`
+          );
+        }
+      }
+      const ownedLayoutOptions = clonePlainObject(
+        layoutEngineOptions,
+        'Figure layout engine options'
+      );
+      const ownedPageData = [...pageData];
 
-      // Store current state
-      this._currentPlotType = plotTypeId;
-      this._currentPageData = pageData;
-      this._currentOptions = options;
+      this._resetCurrentPlotState();
+      this.showLoading();
 
       // Create layout engine
-      this._layoutEngine = createLayoutEngine({
-        pageCount: pageData.length,
-        pageIds: pageData.map(pd => pd.pageId),
-        pageNames: pageData.map(pd => pd.pageName),
+      const layoutEngine = createLayoutEngine({
+        pageCount: ownedPageData.length,
+        pageIds: ownedPageData.map(pd => pd.pageId),
+        pageNames: ownedPageData.map(pd => pd.pageName),
         syncXAxis: true,
         syncYAxis: true,
         customColors: this.customColors,
-        ...layoutEngineOptions
+        ...ownedLayoutOptions
       });
 
-      // Get plot type definition
-      const plotType = PlotRegistry.get(plotTypeId);
-      if (!plotType) {
-        throw new Error(`Unknown plot type: ${plotTypeId}`);
+      await loadPlotly();
+      if (
+        this._destroyed ||
+        generation !== this._renderGeneration
+      ) {
+        return false;
       }
 
       // Merge options with defaults
-      const mergedOptions = PlotRegistry.mergeOptions(plotTypeId, options);
+      const mergedOptions = PlotRegistry.mergeOptions(
+        plotTypeId,
+        ownedOptions
+      );
 
       // Create plot div
       this._previewContainer.classList.remove('loading');
       this._previewContainer.classList.remove('empty');
       this._previewContainer.innerHTML = '';
 
-      this._plotDiv = document.createElement('div');
-      this._plotDiv.className = 'analysis-preview-plot';
-      this._previewContainer.appendChild(this._plotDiv);
+      candidatePlotDiv = document.createElement('div');
+      candidatePlotDiv.className = 'analysis-preview-plot';
+      this._plotDiv = candidatePlotDiv;
+      this._previewContainer.appendChild(candidatePlotDiv);
 
       // Render the plot
-      await plotType.render(pageData, mergedOptions, this._plotDiv, this._layoutEngine);
+      await plotType.render(
+        ownedPageData,
+        mergedOptions,
+        candidatePlotDiv,
+        layoutEngine
+      );
+      if (
+        this._destroyed ||
+        generation !== this._renderGeneration
+      ) {
+        purgePlot(candidatePlotDiv);
+        if (this._plotDiv === candidatePlotDiv) {
+          this._plotDiv = null;
+        }
+        return false;
+      }
+
+      this._currentPlotType = plotTypeId;
+      this._currentPageData = ownedPageData;
+      this._currentOptions = ownedOptions;
+      this._layoutEngine = layoutEngine;
+      this._currentVariableName = variableName;
+      this._currentVariableKind = variableKind;
 
       // Show actions
       this._renderActions();
 
       // Update modal if open
       if (this._modal?._plotContainer) {
-        await this._updateModal(plotType, mergedOptions, pageData);
+        await this._updateModal(plotType, mergedOptions, ownedPageData);
       }
-
-    } catch (err) {
-      console.error('[FigureContainer] Plot render failed:', err);
-      this.showError('Failed to render plot: ' + err.message);
+      if (
+        this._destroyed ||
+        generation !== this._renderGeneration
+      ) {
+        return false;
+      }
+      return true;
+    } catch (error) {
+      if (
+        this._destroyed ||
+        generation !== this._renderGeneration
+      ) {
+        if (candidatePlotDiv !== null) {
+          purgePlot(candidatePlotDiv);
+          if (this._plotDiv === candidatePlotDiv) {
+            this._plotDiv = null;
+          }
+        }
+        return false;
+      }
+      const exactError = requireError(error, `Figure plot "${plotTypeId}"`);
+      this._resetCurrentPlotState();
+      this.showError(`Failed to render plot: ${exactError.message}`);
+      throw exactError;
     }
   }
 
@@ -248,11 +534,16 @@ export class FigureContainer {
    * Render action buttons
    */
   _renderActions() {
+    this._assertAlive();
     this._actionsContainer.innerHTML = '';
     this._actionsContainer.style.display = 'flex';
 
     if (this.expandable) {
-      const expandBtn = createExpandButton(() => this._openModal());
+      const expandBtn = createExpandButton(() => {
+        void this._openModal().catch(error => {
+          this._showModalError(error);
+        });
+      });
       this._actionsContainer.appendChild(expandBtn);
     }
   }
@@ -265,33 +556,43 @@ export class FigureContainer {
    * Open the expanded modal view
    */
   async _openModal() {
-    if (!this._currentPlotType || !this._currentPageData) return;
+    this._assertAlive();
+    if (this._currentPlotType === null || this._currentPageData === null) {
+      throw new Error('Cannot open a figure modal before rendering a plot.');
+    }
+    if (this._modal !== null) {
+      throw new Error('Figure modal is already open.');
+    }
 
-    this._modal = createAnalysisModal({
+    const modal = createAnalysisModal({
       onClose: () => { this._modal = null; },
       onExportPNG: () => this._handleExportPNG(),
       onExportSVG: () => this._handleExportSVG(),
       onExportCSV: () => this._handleExportCSV()
     });
+    for (const key of [
+      '_annotationsContent',
+      '_optionsContent',
+      '_plotContainer',
+      '_statsContent',
+      '_title'
+    ]) {
+      requireElement(modal[key], `Figure modal ${key}`);
+    }
+    this._modal = modal;
 
     // Set title
-    if (this._modal._title && this._currentPageData[0]?.variableInfo?.name) {
-      this._modal._title.textContent = `Comparing: ${this._currentPageData[0].variableInfo.name}`;
-    }
+    this._modal._title.textContent =
+      `Comparing: ${this._currentVariableName}`;
 
     // Render plot options
-    if (this.showOptions && this._modal._optionsContent) {
+    if (this.showOptions) {
       renderPlotOptions(
         this._modal._optionsContent,
         this._currentPlotType,
         this._currentOptions,
         (key, value) => {
-          this._currentOptions[key] = value;
-          if (this.onPlotOptionChange) {
-            this.onPlotOptionChange(key, value);
-          }
-          // Re-render with new options
-          this._renderModalPlot();
+          void this._applyPlotOptionChange(key, value);
         }
       );
     }
@@ -299,26 +600,66 @@ export class FigureContainer {
     openModal(this._modal);
 
     // Render plot in modal
-    await this._renderModalPlot();
+    const modalRendered = await this._renderModalPlot();
+    if (!modalRendered || this._modal !== modal) {
+      return false;
+    }
 
     // Render statistics
-    if (this.showStats && this._modal._statsContent) {
+    if (this.showStats) {
       renderSummaryStats(
         this._modal._statsContent,
         this._currentPageData,
-        this._currentPageData[0]?.variableInfo?.name || 'Variable'
+        this._currentVariableName
       );
     }
 
     // Render statistical annotations
-    if (this._modal._annotationsContent) {
-      const dataType = this._currentPageData[0]?.variableInfo?.kind === 'categorical'
-        ? 'categorical_obs' : 'continuous_obs';
-      renderStatisticalAnnotations(
-        this._modal._annotationsContent,
-        this._currentPageData,
-        dataType
+    const dataType = this._currentVariableKind === 'category'
+      ? 'categorical_obs'
+      : 'continuous_obs';
+    renderStatisticalAnnotations(
+      this._modal._annotationsContent,
+      this._currentPageData,
+      dataType
+    );
+    return true;
+  }
+
+  async _applyPlotOptionChange(key, value) {
+    let hadPreviousValue = false;
+    let previousValue;
+    try {
+      requireNonEmptyString(key, 'Figure plot option key');
+      if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(key)) {
+        throw new TypeError(
+          'Figure plot option key must be an identifier.'
+        );
+      }
+      hadPreviousValue = Object.hasOwn(this._currentOptions, key);
+      previousValue = this._currentOptions[key];
+      const candidateOptions = {
+        ...this._currentOptions,
+        [key]: value
+      };
+      this._currentOptions = clonePlainObject(
+        candidateOptions,
+        'Figure plot options'
       );
+      if (this.onPlotOptionChange !== undefined) {
+        await this.onPlotOptionChange(key, value);
+      }
+      return await this._renderModalPlot();
+    } catch (error) {
+      if (typeof key === 'string') {
+        if (hadPreviousValue) {
+          this._currentOptions[key] = previousValue;
+        } else {
+          delete this._currentOptions[key];
+        }
+      }
+      this._showModalError(error);
+      return false;
     }
   }
 
@@ -326,57 +667,91 @@ export class FigureContainer {
    * Render plot in modal
    */
   async _renderModalPlot() {
-    if (!this._modal?._plotContainer) return;
-
-    try {
-      await loadPlotly();
-
-      purgePlot(this._modal._plotContainer);
-
-      const plotType = PlotRegistry.get(this._currentPlotType);
-      const mergedOptions = PlotRegistry.mergeOptions(
-        this._currentPlotType,
-        this._currentOptions
-      );
-
-      await plotType.render(
-        this._currentPageData,
-        mergedOptions,
-        this._modal._plotContainer,
-        this._layoutEngine
-      );
-    } catch (err) {
-      console.error('[FigureContainer] Modal plot render failed:', err);
-      if (this._modal._plotContainer) {
-        this._modal._plotContainer.innerHTML = '';
-        const errorEl = document.createElement('div');
-        errorEl.className = 'analysis-error';
-        errorEl.textContent = `Failed to render: ${err?.message || err}`;
-        this._modal._plotContainer.appendChild(errorEl);
-      }
+    this._assertAlive();
+    const modal = this._modal;
+    if (modal === null || modal._plotContainer === null) {
+      throw new Error('Cannot render a figure modal without its plot container.');
     }
+
+    await loadPlotly();
+    if (this._modal !== modal) {
+      return false;
+    }
+
+    purgePlot(modal._plotContainer);
+
+    const plotType = PlotRegistry.get(this._currentPlotType);
+    if (plotType === null) {
+      throw new RangeError(`Unknown plot type: ${this._currentPlotType}`);
+    }
+    const mergedOptions = PlotRegistry.mergeOptions(
+      this._currentPlotType,
+      this._currentOptions
+    );
+
+    await plotType.render(
+      this._currentPageData,
+      mergedOptions,
+      modal._plotContainer,
+      this._layoutEngine
+    );
+    return this._modal === modal;
+  }
+
+  /**
+   * Publish a modal rendering failure in the modal and notification log.
+   * @param {*} error
+   */
+  _showModalError(error) {
+    const exactError = requireError(error, 'Figure modal render');
+    const plotContainer = this._modal?._plotContainer;
+    if (plotContainer !== undefined && plotContainer !== null) {
+      plotContainer.innerHTML = '';
+      const errorEl = document.createElement('div');
+      errorEl.className = 'analysis-error';
+      errorEl.textContent = `Failed to render: ${exactError.message}`;
+      plotContainer.appendChild(errorEl);
+    }
+    this._notifications.error(
+      `Expanded plot failed: ${exactError.message}`,
+      { category: 'data', title: 'Analysis Error' }
+    );
   }
 
   /**
    * Update modal after options change
    */
   async _updateModal(plotType, options, pageData) {
-    purgePlot(this._modal._plotContainer);
-    await plotType.render(pageData, options, this._modal._plotContainer, this._layoutEngine);
+    const modal = this._modal;
+    if (modal === null || modal._plotContainer === null) {
+      throw new Error('Cannot update a figure modal without its plot container.');
+    }
+    purgePlot(modal._plotContainer);
+    await plotType.render(
+      pageData,
+      options,
+      modal._plotContainer,
+      this._layoutEngine
+    );
+    if (this._modal !== modal) {
+      return false;
+    }
 
-    if (this._modal._statsContent) {
+    if (this.showStats) {
       renderSummaryStats(
-        this._modal._statsContent,
+        modal._statsContent,
         pageData,
-        pageData[0]?.variableInfo?.name || 'Variable'
+        this._currentVariableName
       );
     }
+    return true;
   }
 
   /**
    * Close modal if open
    */
   closeModal() {
+    this._assertAlive();
     if (this._modal) {
       closeModal(this._modal);
       this._modal = null;
@@ -391,16 +766,22 @@ export class FigureContainer {
    * Handle PNG export
    */
   async _handleExportPNG() {
-    if (this.onExportPNG) {
-      this.onExportPNG();
-      return;
-    }
-
-    // Default export behavior
-    const container = this._modal?._plotContainer || this._plotDiv;
-    if (!container) return;
-
+    this._assertAlive();
     try {
+      if (this.onExportPNG) {
+        await this.onExportPNG();
+        return true;
+      }
+
+      const container = this._modal?._plotContainer ?? this._plotDiv;
+      if (
+        container === null ||
+        this._currentPlotType === null ||
+        this._currentPageData === null
+      ) {
+        throw new Error('No rendered plot is available for PNG export.');
+      }
+      requireElement(container, 'PNG export plot');
       await downloadImage(container, {
         format: 'png',
         width: 1200,
@@ -408,8 +789,14 @@ export class FigureContainer {
         filename: 'analysis'
       });
       this._notifications.success('Plot exported as PNG', { category: 'download' });
-    } catch (err) {
-      this._notifications.error('PNG export failed: ' + err.message, { category: 'download' });
+      return true;
+    } catch (error) {
+      const exactError = requireError(error, 'PNG export');
+      this._notifications.error(
+        `PNG export failed: ${exactError.message}`,
+        { category: 'download' }
+      );
+      return false;
     }
   }
 
@@ -417,16 +804,22 @@ export class FigureContainer {
    * Handle SVG export
    */
   async _handleExportSVG() {
-    if (this.onExportSVG) {
-      this.onExportSVG();
-      return;
-    }
-
-    // Default export behavior
-    const container = this._modal?._plotContainer || this._plotDiv;
-    if (!container) return;
-
+    this._assertAlive();
     try {
+      if (this.onExportSVG) {
+        await this.onExportSVG();
+        return true;
+      }
+
+      const container = this._modal?._plotContainer ?? this._plotDiv;
+      if (
+        container === null ||
+        this._currentPlotType === null ||
+        this._currentPageData === null
+      ) {
+        throw new Error('No rendered plot is available for SVG export.');
+      }
+      requireElement(container, 'SVG export plot');
       await downloadImage(container, {
         format: 'svg',
         width: 1200,
@@ -434,8 +827,14 @@ export class FigureContainer {
         filename: 'analysis'
       });
       this._notifications.success('Plot exported as SVG', { category: 'download' });
-    } catch (err) {
-      this._notifications.error('SVG export failed: ' + err.message, { category: 'download' });
+      return true;
+    } catch (error) {
+      const exactError = requireError(error, 'SVG export');
+      this._notifications.error(
+        `SVG export failed: ${exactError.message}`,
+        { category: 'download' }
+      );
+      return false;
     }
   }
 
@@ -443,23 +842,27 @@ export class FigureContainer {
    * Handle CSV export
    */
   async _handleExportCSV() {
-    if (this.onExportCSV) {
-      this.onExportCSV();
-      return;
-    }
-
-    // Default export behavior
-    if (!this._currentPageData || this._currentPageData.length === 0) return;
-
+    this._assertAlive();
     try {
-      const variableName =
-        this._currentPageData?.[0]?.variableInfo?.name ||
-        this._currentPageData?.[0]?.variableInfo?.key ||
-        'value';
+      if (this.onExportCSV) {
+        await this.onExportCSV();
+        return true;
+      }
+      if (this._currentPageData === null || this._currentPageData.length === 0) {
+        throw new Error('No analysis data is available for CSV export.');
+      }
+      const variableName = this._currentPageData[0]?.variableInfo?.name;
+      requireNonEmptyString(variableName, 'CSV export variable name');
       const csv = pageDataToCSV(this._currentPageData, variableName);
       downloadCSV(csv, 'analysis-data', this._notifications);
-    } catch (err) {
-      this._notifications.error('CSV export failed: ' + err.message, { category: 'download' });
+      return true;
+    } catch (error) {
+      const exactError = requireError(error, 'CSV export');
+      this._notifications.error(
+        `CSV export failed: ${exactError.message}`,
+        { category: 'download' }
+      );
+      return false;
     }
   }
 
@@ -472,6 +875,7 @@ export class FigureContainer {
    * @returns {HTMLElement|null}
    */
   getPlotElement() {
+    this._assertAlive();
     return this._plotDiv;
   }
 
@@ -480,7 +884,8 @@ export class FigureContainer {
    * @returns {HTMLElement|null}
    */
   getModalPlotElement() {
-    return this._modal?._plotContainer || null;
+    this._assertAlive();
+    return this._modal === null ? null : this._modal._plotContainer;
   }
 
   /**
@@ -488,7 +893,10 @@ export class FigureContainer {
    * @returns {Object[]|null}
    */
   getPageData() {
-    return this._currentPageData;
+    this._assertAlive();
+    return this._currentPageData === null
+      ? null
+      : [...this._currentPageData];
   }
 
   /**
@@ -496,6 +904,7 @@ export class FigureContainer {
    * @returns {string|null}
    */
   getPlotType() {
+    this._assertAlive();
     return this._currentPlotType;
   }
 
@@ -504,7 +913,8 @@ export class FigureContainer {
    * @returns {Object}
    */
   getOptions() {
-    return { ...this._currentOptions };
+    this._assertAlive();
+    return clonePlainObject(this._currentOptions, 'Figure plot options');
   }
 
   /**
@@ -512,9 +922,14 @@ export class FigureContainer {
    * @param {Map} colors
    */
   setCustomColors(colors) {
-    this.customColors = colors;
-    if (this._layoutEngine) {
-      this._layoutEngine.setCustomColors(colors);
+    this._assertAlive();
+    requireColorMap(
+      colors,
+      this._layoutEngine === null ? null : this._layoutEngine.pageIds
+    );
+    this.customColors = new Map(colors);
+    if (this._layoutEngine !== null) {
+      this._layoutEngine.customColors = new Map(colors);
     }
   }
 
@@ -523,7 +938,8 @@ export class FigureContainer {
    * @returns {boolean}
    */
   hasPlot() {
-    return !!(this._plotDiv && this._currentPageData);
+    this._assertAlive();
+    return this._plotDiv !== null && this._currentPageData !== null;
   }
 
   /**
@@ -544,28 +960,30 @@ export class FigureContainer {
    * Refresh the plot (re-render with current data and options)
    */
   async refresh() {
-    if (this._currentPlotType && this._currentPageData) {
-      await this.renderPlot(
-        this._currentPlotType,
-        this._currentPageData,
-        this._currentOptions
-      );
+    this._assertAlive();
+    if (this._currentPlotType === null || this._currentPageData === null) {
+      throw new Error('Cannot refresh a figure before rendering a plot.');
     }
+    await this.renderPlot(
+      this._currentPlotType,
+      this._currentPageData,
+      this._currentOptions
+    );
   }
 
   /**
    * Destroy and cleanup
    */
   destroy() {
+    this._assertAlive();
+    this._renderGeneration++;
     this._cleanup();
     this.closeModal();
 
-    this._currentPlotType = null;
-    this._currentPageData = null;
-    this._currentOptions = {};
-    this._layoutEngine = null;
+    this._resetCurrentPlotState();
 
     this.container.innerHTML = '';
+    this._destroyed = true;
   }
 }
 

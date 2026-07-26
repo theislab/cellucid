@@ -233,15 +233,64 @@ export class AnalysisUIManager {
    * @param {boolean} [options.notifyActiveUI=true] - Whether to notify the active UI
    */
   setCurrentPages(pageIds, options = {}) {
-    const { notifyActiveUI = true } = options;
-    this._currentPages = pageIds || [];
+    if (!Array.isArray(pageIds)) {
+      throw new TypeError('Analysis manager current pages must be an array');
+    }
+    if (
+      options === null ||
+      typeof options !== 'object' ||
+      Array.isArray(options) ||
+      Object.keys(options).some(key => key !== 'notifyActiveUI')
+    ) {
+      throw new TypeError(
+        'Analysis manager page options may contain only notifyActiveUI'
+      );
+    }
+    const notifyActiveUI = Object.hasOwn(options, 'notifyActiveUI')
+      ? options.notifyActiveUI
+      : true;
+    if (typeof notifyActiveUI !== 'boolean') {
+      throw new TypeError('notifyActiveUI must be a boolean');
+    }
+    const pages = this.dataLayer.getPages();
+    if (!Array.isArray(pages)) {
+      throw new TypeError('Analysis manager page inventory must be an array');
+    }
+    const availablePageIds = new Set(pages.map(page => page.id));
+    const nextPages = [];
+    const seenPageIds = new Set();
+    for (const pageId of pageIds) {
+      if (typeof pageId !== 'string' || pageId.length === 0) {
+        throw new TypeError(
+          'Analysis manager page IDs must be non-empty strings'
+        );
+      }
+      if (!availablePageIds.has(pageId)) {
+        throw new Error(
+          `Analysis manager page "${pageId}" was not found`
+        );
+      }
+      if (seenPageIds.has(pageId)) {
+        throw new TypeError(
+          `Analysis manager page "${pageId}" is selected more than once`
+        );
+      }
+      if (this.dataLayer.getCellCountForPageId(pageId) === 0) {
+        throw new RangeError(
+          `Analysis manager page "${pageId}" has zero cells and cannot be selected`
+        );
+      }
+      seenPageIds.add(pageId);
+      nextPages.push(pageId);
+    }
+    this._currentPages = nextPages;
 
     if (!notifyActiveUI) return;
 
     // Only notify active UI
     const entry = this._uis.get(this._activeMode);
     if (entry?.ui?.onPageSelectionChange) {
-      entry.ui.onPageSelectionChange(this._currentPages);
+      entry.ui.onPageSelectionChange([...this._currentPages]);
     }
   }
 
@@ -391,15 +440,18 @@ export class AnalysisUIManager {
       ...config.factoryOptions
     };
 
-    // Create UI via factory
-    entry.ui = config.factory(options);
-
-    // Some UIs initialize in factory, others need explicit init
-    // Check if init() exists and container isn't set (meaning it hasn't been initialized)
-    if (entry.ui.init && !entry.ui._container) {
-      entry.ui.init(entry.container);
+    const ui = config.factory(options);
+    if (
+      ui === null ||
+      typeof ui !== 'object' ||
+      ui._container !== entry.container
+    ) {
+      throw new TypeError(
+        `Analysis factory "${id}" must return a fully initialized UI in the supplied container`
+      );
     }
 
+    entry.ui = ui;
     entry.initialized = true;
   }
 

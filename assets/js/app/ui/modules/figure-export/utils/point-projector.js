@@ -3,7 +3,7 @@
  *
  * PURPOSE:
  * Projects 3D points to 2D viewport coordinates for Canvas2D rendering.
- * This is the fallback renderer when WebGL2 rasterization is unavailable.
+ * This is the explicitly selected vector-projection renderer.
  *
  * PERFORMANCE DESIGN:
  * - Zero per-point allocations (all arrays pre-allocated)
@@ -30,7 +30,7 @@
  * @module ui/modules/figure-export/utils/point-projector
  */
 
-import { cropRect01ToPx, normalizeCropRect01 } from './crop.js';
+import { assertCropRect01, cropRect01ToPx } from './crop.js';
 
 /**
  * @typedef {object} RenderStateLike
@@ -89,7 +89,7 @@ export function forEachProjectedPoint({
   const viewportW = Math.max(1, renderState.viewportWidth || 1);
   const viewportH = Math.max(1, renderState.viewportHeight || 1);
 
-  const crop01 = normalizeCropRect01(crop);
+  const crop01 = assertCropRect01(crop);
   const cropPx = cropRect01ToPx(crop01, viewportW, viewportH);
   const hasCrop = Boolean(
     cropPx &&

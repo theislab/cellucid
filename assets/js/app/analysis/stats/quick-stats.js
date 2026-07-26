@@ -2,7 +2,6 @@
  * Quick Statistics Module
  *
  * Provides efficient statistical utilities for quick insights and field scoring:
- * - Streaming statistics for large datasets (reservoir sampling)
  * - Field informativeness scoring (entropy, variance, missingness)
  * - Two-page comparison utilities (effect sizes, categorical shifts)
  * - Quick differential expression analysis
@@ -10,142 +9,14 @@
  * These functions are designed for performance with large single-cell datasets.
  */
 
-import { normalCDF } from '../compute/math-utils.js';
+import { welchTTest } from '../compute/math-utils.js';
 import {
   isFiniteNumber,
   mean as computeMean,
   std as computeStd,
   variance as computeVar,
-  median as computeMedian,
   filterFiniteNumbers
 } from '../shared/number-utils.js';
-
-// =============================================================================
-// STREAMING STATISTICS (for huge pages)
-// =============================================================================
-
-/**
- * Compute approximate statistics without full sorting
- * Uses reservoir sampling and running statistics
- * @param {number[]} values - Numeric values
- * @param {number} maxSampleSize - Max samples for exact computation (default 10000)
- * @returns {Object} Statistics
- */
-export function computeStreamingStats(values, maxSampleSize = 10000) {
-  const n = values.length;
-
-  if (n === 0) {
-    return { count: 0, min: null, max: null, mean: null, median: null, std: null, approximate: false };
-  }
-
-  // For small arrays, compute exact stats
-  if (n <= maxSampleSize) {
-    const valid = filterFiniteNumbers(values);
-    if (valid.length === 0) {
-      return { count: 0, min: null, max: null, mean: null, median: null, std: null, approximate: false };
-    }
-
-    // Sort once for quartiles and min/max
-    const sorted = [...valid].sort((a, b) => a - b);
-    const len = valid.length;
-
-    return {
-      count: len,
-      min: sorted[0],
-      max: sorted[len - 1],
-      mean: computeMean(valid),
-      median: computeMedian(valid),
-      std: computeStd(valid),
-      q1: sorted[Math.floor(len * 0.25)],
-      q3: sorted[Math.floor(len * 0.75)],
-      approximate: false
-    };
-  }
-
-  // Streaming computation for large arrays
-  let count = 0;
-  let sum = 0;
-  let sumSq = 0;
-  let min = Infinity;
-  let max = -Infinity;
-
-  // Reservoir sample for median estimation
-  const reservoirSize = Math.min(1000, n);
-  const reservoir = new Float64Array(reservoirSize);
-  let reservoirFilled = 0;
-
-  // P-square algorithm bins for quantile estimation
-  const pSquareN = 5;
-  const markers = new Float64Array(pSquareN);
-  const markerPos = new Float64Array(pSquareN);
-  let pSquareInitialized = false;
-
-  for (let i = 0; i < n; i++) {
-    const v = values[i];
-    if (!Number.isFinite(v)) continue;
-
-    // Update running stats
-    count++;
-    sum += v;
-    sumSq += v * v;
-    if (v < min) min = v;
-    if (v > max) max = v;
-
-    // Reservoir sampling
-    if (reservoirFilled < reservoirSize) {
-      reservoir[reservoirFilled++] = v;
-    } else {
-      // Randomly replace elements
-      const j = Math.floor(Math.random() * count);
-      if (j < reservoirSize) {
-        reservoir[j] = v;
-      }
-    }
-
-    // Initialize P-square markers
-    if (!pSquareInitialized && count === pSquareN) {
-      const sorted = Array.from(reservoir.slice(0, count)).sort((a, b) => a - b);
-      for (let k = 0; k < pSquareN; k++) {
-        markers[k] = sorted[k];
-        markerPos[k] = k;
-      }
-      pSquareInitialized = true;
-    }
-  }
-
-  if (count === 0) {
-    return { count: 0, min: null, max: null, mean: null, median: null, std: null, approximate: true };
-  }
-
-  const mean = sum / count;
-  const variance = (sumSq / count) - (mean * mean);
-
-  // Estimate median from reservoir sample
-  const sortedReservoir = Array.from(reservoir.slice(0, Math.min(reservoirFilled, reservoirSize)))
-    .sort((a, b) => a - b);
-
-  const sampleLen = sortedReservoir.length;
-  const midSample = Math.floor(sampleLen / 2);
-  const medianEstimate = sampleLen % 2 === 0
-    ? (sortedReservoir[midSample - 1] + sortedReservoir[midSample]) / 2
-    : sortedReservoir[midSample];
-
-  const q1Estimate = sortedReservoir[Math.floor(sampleLen * 0.25)];
-  const q3Estimate = sortedReservoir[Math.floor(sampleLen * 0.75)];
-
-  return {
-    count,
-    min,
-    max,
-    mean,
-    median: medianEstimate,
-    std: Math.sqrt(Math.max(0, variance)),
-    q1: q1Estimate,
-    q3: q3Estimate,
-    approximate: true,
-    sampleSize: sampleLen
-  };
-}
 
 // =============================================================================
 // FIELD SCORING (for intelligent selection)
@@ -171,23 +42,23 @@ export function computeEntropy(counts, total) {
 }
 
 /**
- * Compute variance for continuous data (streaming)
+ * Compute exact variance for continuous data
  * @param {number[]} values - Numeric values
- * @param {number} sampleSize - Max samples
  * @returns {Object} { variance, coefficient_of_variation }
  */
-export function computeVarianceScore(values, sampleSize = 5000) {
-  const sampled = values.length <= sampleSize
-    ? values
-    : values.filter(() => Math.random() < sampleSize / values.length);
+export function computeVarianceScore(values) {
+  if (!Array.isArray(values) && !ArrayBuffer.isView(values)) {
+    throw new TypeError('Variance scoring values must be an array or typed array');
+  }
+  const valid = filterFiniteNumbers(values);
+  if (valid.length < 2) return { variance: null, cv: null };
 
-  const valid = sampled.filter(v => isFiniteNumber(v));
-  if (valid.length < 2) return { variance: 0, cv: 0 };
-
-  // Use centralized statistics utilities
   const meanVal = computeMean(valid);
   const varianceVal = computeVar(valid);
-  const cv = meanVal !== 0 ? Math.sqrt(varianceVal) / Math.abs(meanVal) : 0;
+  const standardDeviation = Math.sqrt(varianceVal);
+  const cv = meanVal === 0
+    ? (standardDeviation === 0 ? null : Infinity)
+    : standardDeviation / Math.abs(meanVal);
 
   return { variance: varianceVal, cv };
 }
@@ -261,6 +132,9 @@ export function scoreCategoricalField(values, pageContext = null) {
 export function scoreContinuousField(values, pageContext = null) {
   const { variance, cv } = computeVarianceScore(values);
   const missingness = computeMissingness(values);
+  if (variance === null || cv === null) {
+    return { score: null, variance, cv, missingness };
+  }
 
   // Score formula:
   // - Prefer higher coefficient of variation (more spread relative to mean)
@@ -462,28 +336,30 @@ export function computeCategoricalShifts(group1, group2) {
     const diff = prop1 - prop2;
     const absDiff = Math.abs(diff);
 
-    // Log odds ratio for effect size
-    const p1 = Math.max(0.001, Math.min(0.999, prop1));
-    const p2 = Math.max(0.001, Math.min(0.999, prop2));
-    const logOddsRatio = Math.log((p1 / (1 - p1)) / (p2 / (1 - p2)));
-
-    // Standard error for log odds ratio CI
+    // Haldane–Anscombe correction gives a finite, disclosed 2×2 odds ratio
+    // when any cell count is zero.
+    const selected1 = count1 + 0.5;
+    const other1 = total1 - count1 + 0.5;
+    const selected2 = count2 + 0.5;
+    const other2 = total2 - count2 + 0.5;
+    const logOddsRatio = Math.log(
+      (selected1 / other1) / (selected2 / other2)
+    );
     const se = Math.sqrt(
-      1 / (count1 + 0.5) + 1 / (total1 - count1 + 0.5) +
-      1 / (count2 + 0.5) + 1 / (total2 - count2 + 0.5)
+      1 / selected1 + 1 / other1 + 1 / selected2 + 1 / other2
     );
 
     shifts.push({
       category: cat,
       count1,
       count2,
-      percent1: (prop1 * 100).toFixed(1),
-      percent2: (prop2 * 100).toFixed(1),
-      percentDiff: (diff * 100).toFixed(1),
+      percent1: prop1 * 100,
+      percent2: prop2 * 100,
+      percentDiff: diff * 100,
       absDiff,
-      logOddsRatio: isFinite(logOddsRatio) ? logOddsRatio : 0,
-      logOrCiLow: isFinite(logOddsRatio) ? logOddsRatio - 1.96 * se : 0,
-      logOrCiHigh: isFinite(logOddsRatio) ? logOddsRatio + 1.96 * se : 0,
+      logOddsRatio,
+      logOrCiLow: logOddsRatio - 1.96 * se,
+      logOrCiHigh: logOddsRatio + 1.96 * se,
       direction: diff > 0 ? 'enriched' : diff < 0 ? 'depleted' : 'unchanged'
     });
   }
@@ -496,7 +372,7 @@ export function computeCategoricalShifts(group1, group2) {
 
 /**
  * Perform quick differential expression analysis between two pages
- * Uses approximate statistics for speed
+ * Uses exact Welch inference for every tested gene
  * @param {Object} dataLayer - Data layer instance
  * @param {string} pageId1 - First page ID
  * @param {string} pageId2 - Second page ID
@@ -504,53 +380,84 @@ export function computeCategoricalShifts(group1, group2) {
  * @returns {Promise<Object[]>} Top differential genes
  */
 export async function computeQuickDifferentialExpression(dataLayer, pageId1, pageId2, maxGenes = 50) {
+  if (
+    !dataLayer ||
+    typeof dataLayer.getAvailableVariables !== 'function' ||
+    typeof dataLayer.getDataForPages !== 'function'
+  ) {
+    throw new TypeError('Quick differential expression requires a complete data layer');
+  }
+  if (
+    typeof pageId1 !== 'string' ||
+    pageId1.length === 0 ||
+    typeof pageId2 !== 'string' ||
+    pageId2.length === 0 ||
+    pageId1 === pageId2
+  ) {
+    throw new TypeError('Quick differential expression requires two distinct page IDs');
+  }
+  if (!Number.isSafeInteger(maxGenes) || maxGenes < 1) {
+    throw new RangeError('Quick differential expression maxGenes must be a positive integer');
+  }
   const geneVars = dataLayer.getAvailableVariables('gene_expression');
+  if (!Array.isArray(geneVars)) {
+    throw new TypeError('Gene variable discovery must return an array');
+  }
   if (geneVars.length === 0) return [];
 
   const results = [];
-  const genesToTest = geneVars.slice(0, Math.min(maxGenes, geneVars.length));
+  const genesToTest = geneVars.slice(0, maxGenes);
 
   for (const gene of genesToTest) {
-    try {
-      const pageData = await dataLayer.getDataForPages({
-        type: 'gene_expression',
-        variableKey: gene.key,
-        pageIds: [pageId1, pageId2]
-      });
+    if (
+      !gene ||
+      typeof gene.key !== 'string' ||
+      gene.key.length === 0 ||
+      typeof gene.name !== 'string' ||
+      gene.name.length === 0
+    ) {
+      throw new TypeError('Every gene variable requires exact key and name strings');
+    }
+    const pageData = await dataLayer.getDataForPages({
+      type: 'gene_expression',
+      variableKey: gene.key,
+      pageIds: [pageId1, pageId2]
+    });
 
-      if (pageData.length !== 2) continue;
+    if (!Array.isArray(pageData) || pageData.length !== 2) {
+      throw new TypeError(`Gene ${gene.key} must return data for exactly two pages`);
+    }
 
-      const [pd1, pd2] = pageData;
-      const effect = computeEffectSizeWithCI(pd1.values, pd2.values);
+    const [pd1, pd2] = pageData;
+    if (!pd1 || !pd2 || !pd1.values || !pd2.values) {
+      throw new TypeError(`Gene ${gene.key} page values are required`);
+    }
+    const values1 = filterFiniteNumbers(pd1.values);
+    const values2 = filterFiniteNumbers(pd2.values);
+    if (values1.length < 2 || values2.length < 2) {
+      throw new RangeError(`Gene ${gene.key} requires at least two finite values per page`);
+    }
+    const effect = computeEffectSizeWithCI(values1, values2);
 
-      if (Math.abs(effect.effectSize) > 0.2) { // Only include if at least small effect
-        // Compute log2 fold change
-        const log2FC = effect.mean1 > 0 && effect.mean2 > 0
-          ? Math.log2(effect.mean1 / effect.mean2)
-          : 0;
-
-        // Approximate p-value using Welch's t-test approximation
-        const t = (effect.mean1 - effect.mean2) / Math.sqrt(
-          (effect.std1 ** 2 / effect.n1) + (effect.std2 ** 2 / effect.n2)
-        );
-        // Approximation for large samples: use normal distribution
-        const approxPValue = 2 * (1 - normalCDF(Math.abs(t)));
-
-        results.push({
-          gene: gene.key,
-          geneName: gene.name || gene.key,
-          log2FC,
-          effectSize: effect.effectSize,
-          effectSizeCiLow: effect.ci95Low,
-          effectSizeCiHigh: effect.ci95High,
-          pValue: approxPValue,
-          mean1: effect.mean1,
-          mean2: effect.mean2,
-          interpretation: effect.interpretation
-        });
+    if (Math.abs(effect.effectSize) > 0.2) {
+      if (effect.mean1 < 0 || effect.mean2 < 0) {
+        throw new RangeError(`Gene ${gene.key} has a negative mean and no defined log2 fold change`);
       }
-    } catch (err) {
-      // Skip failed genes
+      const log2FC = Math.log2(effect.mean1 / effect.mean2);
+      const { pValue } = welchTTest(values1, values2);
+
+      results.push({
+        gene: gene.key,
+        geneName: gene.name,
+        log2FC,
+        effectSize: effect.effectSize,
+        effectSizeCiLow: effect.ci95Low,
+        effectSizeCiHigh: effect.ci95High,
+        pValue,
+        mean1: effect.mean1,
+        mean2: effect.mean2,
+        interpretation: effect.interpretation
+      });
     }
   }
 
@@ -565,9 +472,6 @@ export async function computeQuickDifferentialExpression(dataLayer, pageId1, pag
 // =============================================================================
 
 export default {
-  // Streaming statistics
-  computeStreamingStats,
-
   // Field scoring
   computeEntropy,
   computeVarianceScore,

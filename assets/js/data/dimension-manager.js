@@ -11,17 +11,138 @@
 
 import { loadPointsBinary } from './data-loaders.js';
 import { normalizePositions } from '../rendering/gl-utils.js';
+import { getNotificationCenter } from '../app/notification-center.js';
 
 const SUPPORTED_DIMENSIONS = new Set([1, 2, 3]);
-// Dimension priority for default selection: 3D > 2D > 1D
-const DIMENSION_PRIORITY = [3, 2, 1];
+const DEFAULT_MAX_POSITION_BYTES = 512 * 1024 * 1024;
+const FLOAT32_BYTES = Float32Array.BYTES_PER_ELEMENT;
 
 function toSupportedDimension(value) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return null;
-  const dim = Math.floor(n);
-  if (!SUPPORTED_DIMENSIONS.has(dim)) return null;
-  return dim;
+  if (!Number.isInteger(value) || !SUPPORTED_DIMENSIONS.has(value)) {
+    return null;
+  }
+  return value;
+}
+
+function requireViewId(viewId) {
+  if (typeof viewId !== 'string' || viewId.length === 0) {
+    throw new TypeError('View id must be a non-empty string.');
+  }
+  return viewId;
+}
+
+/**
+ * Parse the sole current embeddings metadata contract without mutating a
+ * DimensionManager. Callers may commit the returned values only after this
+ * function has validated the complete candidate.
+ *
+ * @param {unknown} meta
+ * @returns {{
+ *   availableDimensions: readonly number[],
+ *   defaultDimension: number,
+ *   dimensionFiles: Readonly<Record<string, string>>,
+ *   pathMapKind: 'files'|'obsm_keys'
+ * }}
+ */
+export function parseEmbeddingMetadata(meta) {
+  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) {
+    throw new Error(
+      'Embeddings metadata must be an object using the current contract.'
+    );
+  }
+
+  const rawAvailable = meta.available_dimensions;
+  if (!Array.isArray(rawAvailable) || rawAvailable.length === 0) {
+    throw new Error(
+      'Embeddings metadata must declare a non-empty available_dimensions array.'
+    );
+  }
+  const availableSet = new Set();
+  for (let index = 0; index < rawAvailable.length; index++) {
+    const value = rawAvailable[index];
+    const dimension = toSupportedDimension(value);
+    if (
+      dimension == null ||
+      availableSet.has(dimension) ||
+      (
+        index > 0 &&
+        dimension <= rawAvailable[index - 1]
+      )
+    ) {
+      throw new Error(
+        'available_dimensions must contain strictly increasing unique ' +
+        'integer dimensions 1, 2, or 3.'
+      );
+    }
+    availableSet.add(dimension);
+  }
+  const availableDimensions = [...rawAvailable];
+
+  const defaultDimension = toSupportedDimension(meta.default_dimension);
+  if (defaultDimension == null || !availableSet.has(defaultDimension)) {
+    throw new Error(
+      'default_dimension must be one of the advertised available_dimensions.'
+    );
+  }
+
+  const hasFiles = Object.hasOwn(meta, 'files');
+  const hasObsmKeys = Object.hasOwn(meta, 'obsm_keys');
+  if (hasFiles === hasObsmKeys) {
+    throw new Error(
+      'Embeddings metadata must declare exactly one path map: files or obsm_keys.'
+    );
+  }
+  const pathMapKind = hasFiles ? 'files' : 'obsm_keys';
+  const rawDimensionFiles = meta[pathMapKind];
+  if (
+    !rawDimensionFiles ||
+    typeof rawDimensionFiles !== 'object' ||
+    Array.isArray(rawDimensionFiles)
+  ) {
+    throw new Error('The embedding path map must be an object.');
+  }
+
+  const expectedKeys =
+    availableDimensions.map(dimension => `${dimension}d`);
+  const actualKeys = Object.keys(rawDimensionFiles);
+  if (
+    actualKeys.length !== expectedKeys.length ||
+    actualKeys.some(key => !expectedKeys.includes(key))
+  ) {
+    throw new Error(
+      'The embedding path map must contain exactly one advertised dimension path.'
+    );
+  }
+  const dimensionFiles = {};
+  for (const key of expectedKeys) {
+    const path = rawDimensionFiles[key];
+    if (typeof path !== 'string' || path.length === 0) {
+      throw new Error(
+        `Embedding path map must declare one non-empty path for ${key}.`
+      );
+    }
+    dimensionFiles[key] = path;
+  }
+
+  const allowedKeys = new Set([
+    'available_dimensions',
+    'default_dimension',
+    pathMapKind,
+  ]);
+  for (const key of Object.keys(meta)) {
+    if (!allowedKeys.has(key)) {
+      throw new Error(
+        `Embeddings metadata contains unsupported field "${key}".`
+      );
+    }
+  }
+
+  return Object.freeze({
+    availableDimensions: Object.freeze(availableDimensions),
+    defaultDimension,
+    dimensionFiles: Object.freeze(dimensionFiles),
+    pathMapKind,
+  });
 }
 
 /**
@@ -29,16 +150,103 @@ function toSupportedDimension(value) {
  * @param {Object} options - Configuration options
  * @param {string} options.baseUrl - Base URL for loading dimension files
  * @param {Object} options.embeddingsMetadata - Embeddings metadata from dataset_identity.json
+ * @param {boolean} options.keepRawPositions - Keep raw coordinate buffers after normalization
+ * @param {number} options.maxPositionBytes - Maximum retained/transient position bytes
  * @returns {DimensionManager}
  */
 export function createDimensionManager(options = {}) {
   return new DimensionManager(options);
 }
 
+/**
+ * Create the exact single-dimension owner used by an in-memory dataset.
+ *
+ * The supplied positions are already normalized XYZ coordinates. They remain
+ * owned by the caller and are published directly from the padded-position
+ * cache; no URL or synthetic file entry is fabricated.
+ *
+ * @param {{ positions: Float32Array, dimension: number }} candidate
+ * @returns {DimensionManager}
+ */
+export function createInMemoryDimensionManager(candidate) {
+  if (
+    candidate === null ||
+    typeof candidate !== 'object' ||
+    Array.isArray(candidate)
+  ) {
+    throw new TypeError(
+      'In-memory dimension data must be an exact object.'
+    );
+  }
+  const keys = Object.keys(candidate);
+  if (
+    keys.length !== 2 ||
+    !Object.hasOwn(candidate, 'positions') ||
+    !Object.hasOwn(candidate, 'dimension')
+  ) {
+    throw new TypeError(
+      'In-memory dimension data must contain exactly positions and dimension.'
+    );
+  }
+  const dimension = toSupportedDimension(candidate.dimension);
+  if (dimension === null) {
+    throw new RangeError(
+      'In-memory dimension must be exactly 1, 2, or 3.'
+    );
+  }
+  const positions = candidate.positions;
+  if (
+    !(positions instanceof Float32Array) ||
+    positions.length === 0 ||
+    positions.length % 3 !== 0 ||
+    positions.byteLength !==
+      positions.length * Float32Array.BYTES_PER_ELEMENT
+  ) {
+    throw new TypeError(
+      'In-memory positions must be a non-empty exact Float32 XYZ array.'
+    );
+  }
+  for (let index = 0; index < positions.length; index += 1) {
+    if (!Number.isFinite(positions[index])) {
+      throw new RangeError(
+        `In-memory position ${index} must be finite.`
+      );
+    }
+  }
+
+  const manager = new DimensionManager();
+  manager.availableDimensions = [dimension];
+  manager.defaultDimension = dimension;
+  manager.dimensionFiles = {};
+  manager.nCells = positions.length / 3;
+  manager.paddedPositionCache.set(dimension, positions);
+  manager.viewDimensions.set('live', dimension);
+  return manager;
+}
+
 class DimensionManager {
-  constructor({ baseUrl = '', embeddingsMetadata = null, keepRawPositions = false } = {}) {
+  constructor({
+    baseUrl = '',
+    embeddingsMetadata = null,
+    keepRawPositions = false,
+    maxPositionBytes = DEFAULT_MAX_POSITION_BYTES
+  } = {}) {
+    if (
+      !Number.isSafeInteger(maxPositionBytes) ||
+      maxPositionBytes <= 0
+    ) {
+      throw new TypeError(
+        'DimensionManager maxPositionBytes must be a positive safe integer.'
+      );
+    }
+    if (typeof keepRawPositions !== 'boolean') {
+      throw new TypeError(
+        'DimensionManager keepRawPositions must be a boolean.'
+      );
+    }
     this.baseUrl = baseUrl;
-    this.keepRawPositions = Boolean(keepRawPositions);
+    this.keepRawPositions = keepRawPositions;
+    this._maxPositionBytes = BigInt(maxPositionBytes);
 
     // Available dimensions from metadata
     this.availableDimensions = [];
@@ -51,11 +259,19 @@ class DimensionManager {
     // Loading promises to prevent duplicate fetches
     this.loadingPromises = new Map();
 
+    // Active network controllers. Cache invalidation aborts the underlying
+    // request instead of merely discarding its eventual result.
+    this.loadingControllers = new Map();
+
     // Per-view dimension state: viewId -> dimension
     this.viewDimensions = new Map();
 
     // Normalized/padded positions for 3D rendering: dimension -> Float32Array (n_cells * 3)
     this.paddedPositionCache = new Map();
+
+    // In-flight padding/normalization transactions. All concurrent callers for
+    // a dimension share one result and one progress/cancellation owner.
+    this.paddedLoadingPromises = new Map();
 
     // Normalization transforms per dimension: dimension -> { center: [x,y,z], scale: number }
     // Used to apply the same transform to centroids in state.js
@@ -63,6 +279,10 @@ class DimensionManager {
 
     // Number of cells (consistent across all dimensions)
     this.nCells = 0;
+
+    // Lifecycle generation. Clearing the manager invalidates every result that
+    // started against the previous dataset, including overridden load seams.
+    this._generation = 0;
 
     // Parse metadata if provided
     if (embeddingsMetadata) {
@@ -75,46 +295,15 @@ class DimensionManager {
    * @param {Object} meta - Embeddings metadata object
    */
   initFromMetadata(meta) {
-    if (!meta) return;
-
-    const rawAvailable = Array.isArray(meta.available_dimensions) ? meta.available_dimensions : [3];
-    const availableSet = new Set();
-    for (const value of rawAvailable) {
-      const dim = toSupportedDimension(value);
-      if (dim != null) availableSet.add(dim);
-    }
-
-    if (availableSet.size === 0) {
-      throw new Error('No supported embeddings available (supported: 1D/2D/3D).');
-    }
-
-    this.availableDimensions = Array.from(availableSet).sort((a, b) => a - b);
-
-    const requestedDefault = toSupportedDimension(meta.default_dimension);
-    if (requestedDefault != null && availableSet.has(requestedDefault)) {
-      this.defaultDimension = requestedDefault;
-    } else {
-      this.defaultDimension = this._selectDefaultDimension(availableSet);
-    }
-    this.dimensionFiles = meta.files || {};
+    const parsed = parseEmbeddingMetadata(meta);
+    this.clearCache();
+    this.viewDimensions.clear();
+    this.availableDimensions = [...parsed.availableDimensions];
+    this.defaultDimension = parsed.defaultDimension;
+    this.dimensionFiles = { ...parsed.dimensionFiles };
 
     console.log(`[DimensionManager] Available dimensions: ${this.availableDimensions.join(', ')}D`);
     console.log(`[DimensionManager] Default dimension: ${this.defaultDimension}D`);
-  }
-
-  /**
-   * Select default dimension based on priority
-   * @param {Set<number>|null} [availableSet=null]
-   * @returns {number} Default dimension (1, 2, or 3)
-   */
-  _selectDefaultDimension(availableSet = null) {
-    const dims = availableSet || new Set(this.availableDimensions);
-    for (const dim of DIMENSION_PRIORITY) {
-      if (dims.has(dim)) {
-        return dim;
-      }
-    }
-    return this.availableDimensions[0] || 3;
   }
 
   /**
@@ -160,7 +349,11 @@ class DimensionManager {
    * @returns {Promise<Float32Array>} Raw position data
    */
   async loadDimension(dim, options = {}) {
-    const { showProgress = true } = options;
+    const generation = this._generation;
+    const {
+      showProgress = true,
+      progressTrackerId = null
+    } = options;
     const supportedDim = toSupportedDimension(dim);
     if (supportedDim == null) {
       throw new Error(`Dimension ${dim}D is not supported (supported: 1D/2D/3D).`);
@@ -174,7 +367,10 @@ class DimensionManager {
 
     // Return cached data if available
     if (this.positionCache.has(dim)) {
-      return this.positionCache.get(dim);
+      const cached = this.positionCache.get(dim);
+      await Promise.resolve();
+      this._assertGeneration(generation);
+      return cached;
     }
 
     // Return existing loading promise if in progress
@@ -183,16 +379,44 @@ class DimensionManager {
     }
 
     // Start loading
-    const filename = this.dimensionFiles[`${dim}d`] || `points_${dim}d.bin`;
+    const dimensionKey = `${dim}d`;
+    const filename = this.dimensionFiles[dimensionKey];
+    if (
+      !Object.hasOwn(this.dimensionFiles, dimensionKey) ||
+      typeof filename !== 'string' ||
+      filename.length === 0
+    ) {
+      throw new Error(
+        `No embedding path is advertised for dimension ${dim}D.`
+      );
+    }
     const url = `${this.baseUrl}${filename}`;
 
     console.log(`[DimensionManager] Loading ${dim}D positions from ${url}`);
 
-    const promise = loadPointsBinary(url, {
-      showProgress,
-      displayName: `${dim}D cell positions`
+    const controller = new AbortController();
+    this.loadingControllers.set(dim, controller);
+    const notifications = getNotificationCenter();
+    const ownsTracker = showProgress && !progressTrackerId;
+    const trackerId = ownsTracker
+      ? notifications.startDownload(
+          `${dim}D cell positions`,
+          null,
+          { onCancel: () => controller.abort() }
+        )
+      : progressTrackerId;
+
+    let promise;
+    promise = loadPointsBinary(url, {
+      dimension: dim,
+      displayName: `${dim}D cell positions`,
+      progressTrackerId: trackerId,
+      showProgress: false,
+      signal: controller.signal
     })
       .then(positions => {
+        this._assertGeneration(generation, dim, promise);
+
         // Validate and cache
         if (positions.length % dim !== 0) {
           throw new Error(
@@ -214,14 +438,38 @@ class DimensionManager {
         }
 
         this.positionCache.set(dim, positions);
-        this.loadingPromises.delete(dim);
+        if (this.loadingPromises.get(dim) === promise) {
+          this.loadingPromises.delete(dim);
+        }
         console.log(`[DimensionManager] Loaded ${dim}D: ${nCells.toLocaleString()} cells`);
+        if (ownsTracker) {
+          notifications.completeDownload(trackerId);
+        }
         return positions;
       })
       .catch(err => {
-        this.loadingPromises.delete(dim);
-        console.error(`[DimensionManager] Failed to load ${dim}D:`, err);
+        if (ownsTracker) {
+          if (err?.name === 'AbortError' || controller.signal.aborted) {
+            notifications.dismissDownload(trackerId);
+          } else {
+            notifications.failDownload(
+              trackerId,
+              err?.message || String(err)
+            );
+          }
+        }
+        if (err?.name !== 'AbortError') {
+          console.error(`[DimensionManager] Failed to load ${dim}D:`, err);
+        }
         throw err;
+      })
+      .finally(() => {
+        if (this.loadingPromises.get(dim) === promise) {
+          this.loadingPromises.delete(dim);
+        }
+        if (this.loadingControllers.get(dim) === controller) {
+          this.loadingControllers.delete(dim);
+        }
       });
 
     this.loadingPromises.set(dim, promise);
@@ -233,9 +481,13 @@ class DimensionManager {
    * This pads 1D and 2D data with zeros to create valid 3D coordinates.
    *
    * @param {number} dim - Dimension (1, 2, or 3)
+   * @param {Object} [options]
+   * @param {boolean} [options.showProgress=true]
    * @returns {Promise<Float32Array>} 3D positions (n_cells * 3)
    */
-  async getPositions3D(dim) {
+  async getPositions3D(dim, options = {}) {
+    const generation = this._generation;
+    const { showProgress = true } = options;
     const supportedDim = toSupportedDimension(dim);
     if (supportedDim == null) {
       throw new Error(`Unsupported dimension ${dim}D (supported: 1D/2D/3D).`);
@@ -244,53 +496,295 @@ class DimensionManager {
 
     // Check cache first (cached positions are already normalized)
     if (this.paddedPositionCache.has(dim)) {
-      return this.paddedPositionCache.get(dim);
+      const cached = this.paddedPositionCache.get(dim);
+      // Refresh least-recently-used order without changing byte ownership.
+      this.paddedPositionCache.delete(dim);
+      this.paddedPositionCache.set(dim, cached);
+      await Promise.resolve();
+      this._assertGeneration(generation);
+      return cached;
     }
 
-    // Load raw positions
-    const rawPositions = await this.loadDimension(dim);
-    const nCells = rawPositions.length / dim;
+    // First caller owns the transaction's progress policy. Later callers share
+    // its padding, normalization, result, and cancellation outcome.
+    if (this.paddedLoadingPromises.has(dim)) {
+      return this.paddedLoadingPromises.get(dim);
+    }
 
-    let positions3D;
-
-    if (dim === 3) {
-      // For 3D, normalize in-place unless the caller explicitly requests keeping raw positions.
-      positions3D = this.keepRawPositions ? new Float32Array(rawPositions) : rawPositions;
-    } else if (dim === 1) {
-      // 1D: X values only, Y and Z are zero
-      positions3D = new Float32Array(nCells * 3);
-      for (let i = 0; i < nCells; i++) {
-        positions3D[i * 3] = rawPositions[i];     // X
-        positions3D[i * 3 + 1] = 0;                // Y = 0
-        positions3D[i * 3 + 2] = 0;                // Z = 0
+    let promise;
+    promise = this._loadPositions3DTransaction(dim, {
+      generation,
+      showProgress
+    }).finally(() => {
+      if (this.paddedLoadingPromises.get(dim) === promise) {
+        this.paddedLoadingPromises.delete(dim);
       }
-    } else if (dim === 2) {
-      // 2D: X and Y values, Z is zero
-      positions3D = new Float32Array(nCells * 3);
-      for (let i = 0; i < nCells; i++) {
-        positions3D[i * 3] = rawPositions[i * 2];     // X
-        positions3D[i * 3 + 1] = rawPositions[i * 2 + 1]; // Y
-        positions3D[i * 3 + 2] = 0;                    // Z = 0
+    });
+    this.paddedLoadingPromises.set(dim, promise);
+    return promise;
+  }
+
+  /**
+   * Run the single shared padding/normalization transaction for a dimension.
+   *
+   * @param {number} dim
+   * @param {Object} options
+   * @param {number} options.generation
+   * @param {boolean} options.showProgress
+   * @returns {Promise<Float32Array>}
+   * @private
+   */
+  async _loadPositions3DTransaction(dim, { generation, showProgress }) {
+    const notifications = getNotificationCenter();
+    const trackerId = showProgress
+      ? notifications.startDownload(
+          `${dim}D cell positions`,
+          null,
+          {
+            onCancel: () => {
+              this.loadingControllers.get(dim)?.abort();
+            }
+          }
+        )
+      : null;
+    let rawPositions = null;
+
+    try {
+      // The outer padded-position transaction owns the terminal progress
+      // state. The raw loader only contributes byte updates to its tracker.
+      rawPositions = await this.loadDimension(dim, {
+        progressTrackerId: trackerId,
+        showProgress: false
+      });
+      this._assertGeneration(generation);
+      const positionPlan = this._planPositionPadding(rawPositions, dim);
+      const allocatesPaddedBuffer = dim !== 3 || this.keepRawPositions;
+      this._preparePositionWorkspace(
+        dim,
+        rawPositions,
+        allocatesPaddedBuffer ? positionPlan.paddedBytes : 0n
+      );
+      const nCells = positionPlan.nCells;
+
+      let positions3D;
+
+      if (dim === 3) {
+        // For 3D, normalize in-place unless the caller explicitly requests keeping raw positions.
+        positions3D = this.keepRawPositions ? new Float32Array(rawPositions) : rawPositions;
+      } else if (dim === 1) {
+        // 1D: X values only, Y and Z are zero
+        positions3D = new Float32Array(positionPlan.paddedLength);
+        for (let i = 0; i < nCells; i++) {
+          positions3D[i * 3] = rawPositions[i];     // X
+          positions3D[i * 3 + 1] = 0;                // Y = 0
+          positions3D[i * 3 + 2] = 0;                // Z = 0
+        }
+      } else if (dim === 2) {
+        // 2D: X and Y values, Z is zero
+        positions3D = new Float32Array(positionPlan.paddedLength);
+        for (let i = 0; i < nCells; i++) {
+          positions3D[i * 3] = rawPositions[i * 2];     // X
+          positions3D[i * 3 + 1] = rawPositions[i * 2 + 1]; // Y
+          positions3D[i * 3 + 2] = 0;                    // Z = 0
+        }
       }
+
+      // Normalize positions to [-1,1] range for consistent rendering
+      // This ensures all dimensions render at the same scale regardless of original data range
+      // Note: For 1D/2D, only the used dimensions will affect normalization scale
+      const normTransform = normalizePositions(positions3D);
+      this._assertGeneration(generation);
+      console.log(`[DimensionManager] Created normalized 3D positions for ${dim}D (scale: ${normTransform.scale.toFixed(4)})`);
+
+      // Store both the normalized positions and the transform used
+      // The transform is needed by state.js to normalize centroids consistently
+      this.paddedPositionCache.set(dim, positions3D);
+      this.normTransformCache.set(dim, normTransform);
+
+      // Policy: keep raw positions only if explicitly requested.
+      if (!this.keepRawPositions) {
+        this.positionCache.delete(dim);
+      }
+
+      if (trackerId) {
+        notifications.completeDownload(trackerId);
+      }
+      return positions3D;
+    } catch (error) {
+      if (
+        rawPositions &&
+        this.positionCache.get(dim) === rawPositions &&
+        !this.paddedPositionCache.has(dim)
+      ) {
+        this.positionCache.delete(dim);
+      }
+      if (trackerId) {
+        if (
+          error?.name === 'AbortError' ||
+          generation !== this._generation
+        ) {
+          notifications.dismissDownload(trackerId);
+        } else {
+          notifications.failDownload(
+            trackerId,
+            error?.message || String(error)
+          );
+        }
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Validate raw position shape and calculate the padded allocation without
+   * touching coordinate values.
+   *
+   * @param {Float32Array} rawPositions
+   * @param {number} dim
+   * @returns {{ nCells: number, paddedBytes: bigint, paddedLength: number }}
+   * @private
+   */
+  _planPositionPadding(rawPositions, dim) {
+    const rawLength = Number(rawPositions?.length);
+    const rawByteLength = Number(rawPositions?.byteLength);
+    if (
+      !Number.isSafeInteger(rawLength) ||
+      rawLength < 0 ||
+      rawLength % dim !== 0 ||
+      !Number.isSafeInteger(rawByteLength) ||
+      rawByteLength !== rawLength * FLOAT32_BYTES
+    ) {
+      throw new Error(
+        `${dim}D positions have an invalid Float32 shape or byte length.`
+      );
     }
 
-    // Normalize positions to [-1,1] range for consistent rendering
-    // This ensures all dimensions render at the same scale regardless of original data range
-    // Note: For 1D/2D, only the used dimensions will affect normalization scale
-    const normTransform = normalizePositions(positions3D);
-    console.log(`[DimensionManager] Created normalized 3D positions for ${dim}D (scale: ${normTransform.scale.toFixed(4)})`);
+    const nCells = rawLength / dim;
+    const paddedLengthBigInt = BigInt(nCells) * 3n;
+    const paddedBytes =
+      paddedLengthBigInt * BigInt(FLOAT32_BYTES);
+    if (paddedLengthBigInt > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new Error(
+        `${dim}D positions require an unsafe padded coordinate count.`
+      );
+    }
+    return {
+      nCells,
+      paddedBytes,
+      paddedLength: Number(paddedLengthBigInt)
+    };
+  }
 
-    // Store both the normalized positions and the transform used
-    // The transform is needed by state.js to normalize centroids consistently
-    this.paddedPositionCache.set(dim, positions3D);
-    this.normTransformCache.set(dim, normTransform);
-
-    // Policy: keep raw positions only if explicitly requested.
-    if (!this.keepRawPositions) {
-      this.positionCache.delete(dim);
+  /**
+   * Return a stable allocation identity and retained byte count. Typed-array
+   * views keep their complete backing buffer alive, so views of one buffer are
+   * charged once and by the backing buffer's full size.
+   *
+   * @param {ArrayBufferView|Object} positions
+   * @returns {{ identity: Object, bytes: bigint }}
+   * @private
+   */
+  _describePositionBuffer(positions) {
+    if (!positions || typeof positions !== 'object') {
+      throw new Error('Position cache contains an invalid buffer.');
     }
 
-    return positions3D;
+    const backingBuffer = positions.buffer;
+    const identity = (
+      backingBuffer &&
+      typeof backingBuffer === 'object'
+    ) ? backingBuffer : positions;
+    const byteLength = Number(
+      identity === backingBuffer
+        ? backingBuffer.byteLength
+        : positions.byteLength
+    );
+    if (!Number.isSafeInteger(byteLength) || byteLength < 0) {
+      throw new Error('Position cache contains an invalid byte length.');
+    }
+    return { identity, bytes: BigInt(byteLength) };
+  }
+
+  /**
+   * Count uniquely retained coordinate backing buffers.
+   *
+   * @param {Array<ArrayBufferView|Object>} [extraBuffers=[]]
+   * @returns {bigint}
+   * @private
+   */
+  _getRetainedPositionBytes(extraBuffers = []) {
+    const uniqueBuffers = new Map();
+    const add = positions => {
+      const descriptor = this._describePositionBuffer(positions);
+      if (!uniqueBuffers.has(descriptor.identity)) {
+        uniqueBuffers.set(descriptor.identity, descriptor.bytes);
+      }
+    };
+
+    for (const positions of this.positionCache.values()) add(positions);
+    for (const positions of this.paddedPositionCache.values()) add(positions);
+    for (const positions of extraBuffers) add(positions);
+
+    let total = 0n;
+    for (const bytes of uniqueBuffers.values()) total += bytes;
+    return total;
+  }
+
+  /**
+   * Release least-recently-used caches that are not assigned to a view, then
+   * enforce the raw-plus-new-output peak before any coordinate iteration or
+   * typed-array allocation.
+   *
+   * @param {number} dim
+   * @param {Float32Array} rawPositions
+   * @param {bigint} additionalOutputBytes
+   * @private
+   */
+  _preparePositionWorkspace(dim, rawPositions, additionalOutputBytes) {
+    const protectedDimensions = new Set([dim]);
+    for (const viewDimension of this.viewDimensions.values()) {
+      protectedDimensions.add(viewDimension);
+    }
+
+    const candidateDimensions = [];
+    const seen = new Set();
+    const addCandidate = candidateDim => {
+      if (
+        protectedDimensions.has(candidateDim) ||
+        seen.has(candidateDim)
+      ) {
+        return;
+      }
+      seen.add(candidateDim);
+      candidateDimensions.push(candidateDim);
+    };
+    for (const candidateDim of this.paddedPositionCache.keys()) {
+      addCandidate(candidateDim);
+    }
+    for (const candidateDim of this.positionCache.keys()) {
+      addCandidate(candidateDim);
+    }
+
+    const plannedBytes = () => (
+      this._getRetainedPositionBytes([rawPositions]) +
+      additionalOutputBytes
+    );
+    let workingBytes = plannedBytes();
+    for (const candidateDim of candidateDimensions) {
+      if (workingBytes <= this._maxPositionBytes) break;
+      this.paddedPositionCache.delete(candidateDim);
+      this.positionCache.delete(candidateDim);
+      workingBytes = plannedBytes();
+    }
+
+    if (workingBytes > this._maxPositionBytes) {
+      throw new Error(
+        `${dim}D position raw-plus-padded working set ` +
+        `(${workingBytes.toString()} bytes) exceeds the ` +
+        `${this._maxPositionBytes.toString()}-byte browser limit; ` +
+        'use the Cellucid server or reduce the embedding size.'
+      );
+    }
   }
 
   /**
@@ -299,7 +793,19 @@ class DimensionManager {
    * @returns {number} Dimension for this view
    */
   getViewDimension(viewId) {
-    return this.viewDimensions.get(viewId) || this.defaultDimension;
+    requireViewId(viewId);
+    if (!this.viewDimensions.has(viewId)) {
+      throw new RangeError(
+        `Dimension state is not published for view "${viewId}".`
+      );
+    }
+    const dimension = this.viewDimensions.get(viewId);
+    if (!this.hasDimension(dimension)) {
+      throw new Error(
+        `Published dimension state for view "${viewId}" is invalid.`
+      );
+    }
+    return dimension;
   }
 
   /**
@@ -308,9 +814,12 @@ class DimensionManager {
    * @param {number} dim - Dimension to set
    */
   setViewDimension(viewId, dim) {
+    requireViewId(viewId);
     if (!this.hasDimension(dim)) {
-      console.warn(`[DimensionManager] Dimension ${dim}D not available, using default`);
-      dim = this.defaultDimension;
+      throw new Error(
+        `Dimension ${String(dim)}D is not available. ` +
+        `Available: ${this.availableDimensions.join(', ')}D`
+      );
     }
     this.viewDimensions.set(viewId, dim);
   }
@@ -330,6 +839,7 @@ class DimensionManager {
    * @param {string} viewId - View identifier
    */
   removeView(viewId) {
+    requireViewId(viewId);
     this.viewDimensions.delete(viewId);
   }
 
@@ -363,18 +873,50 @@ class DimensionManager {
    * @returns {boolean}
    */
   isLoading() {
-    return this.loadingPromises.size > 0;
+    return (
+      this.loadingPromises.size > 0 ||
+      this.paddedLoadingPromises.size > 0
+    );
   }
 
   /**
    * Clear all cached data
    */
   clearCache() {
+    this._generation += 1;
+    for (const controller of this.loadingControllers.values()) {
+      controller.abort();
+    }
     this.positionCache.clear();
     this.paddedPositionCache.clear();
+    this.paddedLoadingPromises.clear();
     this.normTransformCache.clear();
     this.loadingPromises.clear();
+    this.loadingControllers.clear();
     this.nCells = 0;
+  }
+
+  /**
+   * Reject work that belongs to a cleared/replaced dataset.
+   *
+   * @param {number} generation
+   * @param {number|null} [dim=null]
+   * @param {Promise<Float32Array>|null} [promise=null]
+   * @private
+   */
+  _assertGeneration(generation, dim = null, promise = null) {
+    const promiseIsCurrent = (
+      dim == null ||
+      promise == null ||
+      this.loadingPromises.get(dim) === promise
+    );
+    if (generation !== this._generation || !promiseIsCurrent) {
+      const error = new Error(
+        'Dimension load was superseded because the dataset cache changed.'
+      );
+      error.name = 'AbortError';
+      throw error;
+    }
   }
 
 }

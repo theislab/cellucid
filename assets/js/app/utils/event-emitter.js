@@ -7,6 +7,26 @@
  * @module utils/event-emitter
  */
 
+function assertEventName(event) {
+  if (
+    typeof event !== 'string'
+    || event.length === 0
+    || event.trim() !== event
+  ) {
+    throw new TypeError(
+      'Event name must be one non-empty, exactly trimmed string.'
+    );
+  }
+  return event;
+}
+
+function assertCallback(callback) {
+  if (typeof callback !== 'function') {
+    throw new TypeError('Event callback must be a function.');
+  }
+  return callback;
+}
+
 export class EventEmitter {
   constructor() {
     /** @type {Map<string, Set<Function>>} */
@@ -17,71 +37,74 @@ export class EventEmitter {
    * Register an event listener.
    * @param {string} event
    * @param {Function} callback
-   * @returns {Function} Unsubscribe function
-   */
+  * @returns {Function} Unsubscribe function
+  */
   on(event, callback) {
-    if (!event || typeof callback !== 'function') return () => {};
-    if (!this._listeners.has(event)) {
-      this._listeners.set(event, new Set());
+    const exactEvent = assertEventName(event);
+    const exactCallback = assertCallback(callback);
+    if (!this._listeners.has(exactEvent)) {
+      this._listeners.set(exactEvent, new Set());
     }
-    this._listeners.get(event).add(callback);
-    return () => this.off(event, callback);
+    this._listeners.get(exactEvent).add(exactCallback);
+    return () => this.off(exactEvent, exactCallback);
   }
 
   /**
    * Register a one-time event listener.
    * @param {string} event
    * @param {Function} callback
-   * @returns {Function} Unsubscribe function
-   */
+  * @returns {Function} Unsubscribe function
+  */
   once(event, callback) {
-    if (!event || typeof callback !== 'function') return () => {};
+    const exactEvent = assertEventName(event);
+    const exactCallback = assertCallback(callback);
     const wrapper = (data) => {
-      this.off(event, wrapper);
-      callback(data);
+      this.off(exactEvent, wrapper);
+      exactCallback(data);
     };
-    return this.on(event, wrapper);
+    return this.on(exactEvent, wrapper);
   }
 
   /**
-   * Remove a listener.
-   * @param {string} event
-   * @param {Function} callback
-   */
+  * Remove a listener.
+  * @param {string} event
+  * @param {Function} callback
+   * @returns {boolean} Whether the listener was registered
+  */
   off(event, callback) {
-    const listeners = this._listeners.get(event);
-    if (!listeners) return;
-    listeners.delete(callback);
+    const exactEvent = assertEventName(event);
+    const exactCallback = assertCallback(callback);
+    const listeners = this._listeners.get(exactEvent);
+    if (listeners === undefined) return false;
+    const removed = listeners.delete(exactCallback);
     if (listeners.size === 0) {
-      this._listeners.delete(event);
+      this._listeners.delete(exactEvent);
     }
+    return removed;
   }
 
   /**
    * Emit an event to all listeners.
    * @param {string} event
-   * @param {*} [data]
-   */
+  * @param {*} [data]
+  */
   emit(event, data) {
-    const listeners = this._listeners.get(event);
-    if (!listeners) return;
+    const exactEvent = assertEventName(event);
+    const listeners = this._listeners.get(exactEvent);
+    if (listeners === undefined) return;
 
-    for (const callback of listeners) {
-      try {
-        callback(data);
-      } catch (err) {
-        console.error(`[EventEmitter] Error in '${event}':`, err);
-      }
+    for (const callback of [...listeners]) {
+      callback(data);
     }
   }
 
   /**
    * Remove all listeners for a specific event (or all events).
-   * @param {string} [event]
-   */
+  * @param {string} [event]
+  */
   removeAllListeners(event) {
-    if (event) {
-      this._listeners.delete(event);
+    if (event !== undefined) {
+      this._listeners.delete(assertEventName(event));
       return;
     }
     this._listeners.clear();
@@ -90,10 +113,10 @@ export class EventEmitter {
   /**
    * Get listener count for an event.
    * @param {string} event
-   * @returns {number}
-   */
+  * @returns {number}
+  */
   listenerCount(event) {
-    return this._listeners.get(event)?.size ?? 0;
+    const listeners = this._listeners.get(assertEventName(event));
+    return listeners === undefined ? 0 : listeners.size;
   }
 }
-

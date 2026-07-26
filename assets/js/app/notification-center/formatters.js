@@ -14,10 +14,22 @@
  * @returns {string}
  */
 export function formatBytes(bytes, decimals = 1) {
-  if (!bytes || bytes <= 0) return '0 B';
+  if (
+    !Number.isFinite(bytes) ||
+    bytes < 0 ||
+    bytes > Number.MAX_SAFE_INTEGER
+  ) {
+    throw new TypeError(
+      'bytes must be a finite non-negative number no greater than Number.MAX_SAFE_INTEGER.'
+    );
+  }
+  if (!Number.isInteger(decimals) || decimals < 0 || decimals > 20) {
+    throw new TypeError('decimals must be an integer between 0 and 20.');
+  }
+  if (bytes === 0) return '0 B';
   if (bytes < 1) return bytes.toFixed(decimals) + ' B';
   const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
   const i = Math.min(sizes.length - 1, Math.max(0, Math.floor(Math.log(bytes) / Math.log(k))));
   return parseFloat((bytes / Math.pow(k, i)).toFixed(decimals)) + ' ' + sizes[i];
 }
@@ -28,6 +40,11 @@ export function formatBytes(bytes, decimals = 1) {
  * @returns {string}
  */
 export function formatDuration(ms) {
+  if (!Number.isFinite(ms) || ms < 0 || ms > Number.MAX_SAFE_INTEGER) {
+    throw new TypeError(
+      'duration must be a finite non-negative number of milliseconds no greater than Number.MAX_SAFE_INTEGER.'
+    );
+  }
   if (ms < 1000) return `${Math.round(ms)}ms`;
   if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
   return `${Math.floor(ms / 60000)}m ${Math.round((ms % 60000) / 1000)}s`;
@@ -39,11 +56,11 @@ export function formatDuration(ms) {
  * @returns {string}
  */
 export function formatCompactNumber(n) {
-  const value = typeof n === 'number' ? n : Number(n);
-  if (!Number.isFinite(value)) return String(n ?? '');
-  if (value >= 1e9) return (value / 1e9).toFixed(1) + 'B';
-  if (value >= 1e6) return (value / 1e6).toFixed(1) + 'M';
-  if (value >= 1e3) return (value / 1e3).toFixed(1) + 'K';
-  return String(value);
+  if (!Number.isFinite(n)) {
+    throw new TypeError('number must be finite.');
+  }
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return String(n);
 }
-

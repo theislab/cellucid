@@ -505,22 +505,39 @@ function initializeResizers(content, body, footerArea, verticalResizer, horizont
   }, 250);
 
   return () => {
-    verticalResizer.removeEventListener('pointerdown', onVerticalDown);
-    horizontalResizer.removeEventListener('pointerdown', onHorizontalDown);
-    footerResizer.removeEventListener('pointerdown', onFooterDown);
-    intersectionResizer.removeEventListener('pointerdown', onIntersectionDown);
+    const errors = [];
+    const run = operation => {
+      try {
+        operation();
+      } catch (error) {
+        errors.push(error);
+      }
+    };
 
-    document.removeEventListener('pointermove', handlePointerMove);
-    document.removeEventListener('pointerup', handlePointerUp);
-    window.removeEventListener('resize', onWindowResize);
+    run(() => verticalResizer.removeEventListener('pointerdown', onVerticalDown));
+    run(() => horizontalResizer.removeEventListener('pointerdown', onHorizontalDown));
+    run(() => footerResizer.removeEventListener('pointerdown', onFooterDown));
+    run(() => intersectionResizer.removeEventListener('pointerdown', onIntersectionDown));
 
-    try {
-      resizeObserver.disconnect();
-    } catch (_err) {
-      // Ignore
+    run(() => document.removeEventListener('pointermove', handlePointerMove));
+    run(() => document.removeEventListener('pointerup', handlePointerUp));
+    run(() => window.removeEventListener('resize', onWindowResize));
+
+    if (typeof resizeObserver.disconnect !== 'function') {
+      errors.push(new TypeError('Analysis modal ResizeObserver must expose disconnect()'));
+    } else {
+      run(() => resizeObserver.disconnect());
     }
 
-    clearTimeout(intersectionTimeout);
+    run(() => clearTimeout(intersectionTimeout));
+
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) {
+      throw new AggregateError(
+        errors,
+        `Analysis modal resize teardown failed in ${errors.length} operations`
+      );
+    }
   };
 }
 
@@ -650,12 +667,25 @@ export function openModal(modal) {
  * @param {HTMLElement} modal - Modal element to close
  */
 export function closeModal(modal) {
-  if (!modal || modal._cleanupDone) return;
+  if (!modal || typeof modal !== 'object') {
+    throw new TypeError('closeModal requires a modal element');
+  }
+  if (modal._cleanupDone === true) return;
+  const errors = [];
+  const run = operation => {
+    try {
+      operation();
+    } catch (error) {
+      errors.push(error);
+    }
+  };
   modal._cleanupDone = true;
 
   // Stop Escape handler (important: openModal doesn't always remove it).
   if (modal._escapeHandler) {
-    document.removeEventListener('keydown', modal._escapeHandler);
+    run(() => {
+      document.removeEventListener('keydown', modal._escapeHandler);
+    });
     modal._escapeHandler = null;
   }
 
@@ -667,27 +697,37 @@ export function closeModal(modal) {
 
   // Purge Plotly/WebGL resources before detaching from DOM.
   if (modal._plotContainer) {
-    purgePlot(modal._plotContainer);
+    run(() => purgePlot(modal._plotContainer));
   }
 
   // Remove any global listeners/observers registered during initialization.
   if (Array.isArray(modal._cleanupFns)) {
     for (const cleanup of modal._cleanupFns) {
-      try {
-        if (typeof cleanup === 'function') cleanup();
-      } catch (_err) {
-        // Ignore teardown errors
+      if (typeof cleanup !== 'function') {
+        errors.push(
+          new TypeError('Modal cleanup entries must be functions')
+        );
+      } else {
+        run(cleanup);
       }
     }
     modal._cleanupFns.length = 0;
   }
 
-  modal.classList.remove('open');
+  run(() => modal.classList.remove('open'));
   setTimeout(() => {
     if (modal.parentNode) {
       modal.parentNode.removeChild(modal);
     }
   }, 200);
+
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) {
+    throw new AggregateError(
+      errors,
+      `Modal teardown failed in ${errors.length} operations`
+    );
+  }
 }
 
 // =============================================================================

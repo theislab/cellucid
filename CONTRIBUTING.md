@@ -154,7 +154,13 @@ node scripts/validate-tokens.js
 
 ## Testing & validation (manual is mandatory)
 
-There is no single “unit test suite” for the web app yet; manual smoke testing is required.
+The web app does not yet have one comprehensive unit suite. Focused Analysis statistics regressions can be run with Node.js 18 or newer:
+
+```bash
+node --test tests/statistical-tests.test.mjs
+```
+
+These focused tests do not replace manual smoke testing.
 
 Recommended checklist:
 - load a dataset (local-demo or local-user)

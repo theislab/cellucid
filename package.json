@@ -1,0 +1,14 @@
+{
+  "name": "cellucid-web",
+  "private": true,
+  "scripts": {
+    "test": "node scripts/run-web-tests.mjs",
+    "test:browser": "playwright test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.0"
+  }
+}

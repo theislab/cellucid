@@ -13,6 +13,8 @@
  * @see https://celltype.info/docs/python-client-for-cap-api
  */
 
+import { parseExactJson } from './wire-contract.js';
+
 const CAP_GRAPHQL_URL = 'https://celltype.info/graphql';
 const CAP_DEFAULT_TIMEOUT_MS = 12_000;
 
@@ -23,21 +25,13 @@ function toCleanString(value) {
 function normalizeForSearch(value) {
   const s = toCleanString(value);
   if (!s) return '';
-  try {
-    return s
-      .normalize('NFKD')
-      .replace(/[\u0300-\u036f]/g, '')
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/gi, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-  } catch {
-    return s
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/gi, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-  }
+  return s
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function tokenizeSearch(value) {
@@ -76,16 +70,27 @@ function isNetworkError(err) {
  * @returns {Promise<Object>} - Response data
  */
 async function executeQuery(query, variables = {}, options = {}) {
-  const timeoutMs = Number.isFinite(Number(options?.timeoutMs)) ? Math.max(0, Number(options.timeoutMs)) : CAP_DEFAULT_TIMEOUT_MS;
+  const timeoutMs = options.timeoutMs === undefined
+    ? CAP_DEFAULT_TIMEOUT_MS
+    : options.timeoutMs;
+  if (
+    typeof timeoutMs !== 'number' ||
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs < 0
+  ) {
+    throw new Error('CAP timeoutMs must be a nonnegative safe integer');
+  }
 
-  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
-  const signal = controller?.signal;
+  if (typeof AbortController === 'undefined') {
+    throw new Error('AbortController is required for CAP requests');
+  }
+  const controller = new AbortController();
 
   /** @type {ReturnType<typeof setTimeout> | null} */
   let timeout = null;
-  if (controller && timeoutMs > 0) {
+  if (timeoutMs > 0) {
     timeout = setTimeout(() => {
-      try { controller.abort(); } catch { /* ignore */ }
+      controller.abort();
     }, timeoutMs);
   }
 
@@ -94,32 +99,46 @@ async function executeQuery(query, variables = {}, options = {}) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ query, variables }),
-      signal: signal || undefined
+      signal: controller.signal
     });
 
     const text = await response.text();
-    let result = null;
+    let result;
     try {
-      result = text ? JSON.parse(text) : null;
-    } catch {
-      result = null;
+      if (!text) throw new Error('empty response body');
+      result = parseExactJson(text, { path: 'CAP GraphQL response' });
+    } catch (cause) {
+      throw new Error(`CAP API returned invalid JSON: ${cause?.message || cause}`, {
+        cause,
+      });
     }
 
     if (!response.ok) {
       const msg =
         toCleanString(result?.errors?.[0]?.message) ||
         toCleanString(result?.message) ||
-        toCleanString(text) ||
         `HTTP ${response.status}`;
       throw new Error(`CAP API error: ${response.status} ${msg}`);
     }
 
-    if (!result || typeof result !== 'object') {
-      throw new Error('CAP API returned invalid JSON');
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+      throw new Error('CAP API response must be a JSON object');
     }
 
-    if (result.errors?.length) {
-      throw new Error(`CAP GraphQL error: ${result.errors[0].message}`);
+    if (Object.hasOwn(result, 'errors')) {
+      if (!Array.isArray(result.errors)) {
+        throw new Error('CAP GraphQL errors must be an array');
+      }
+      if (result.errors.length) {
+        const message = result.errors[0]?.message;
+        if (typeof message !== 'string' || !message.trim()) {
+          throw new Error('CAP GraphQL error is missing its message');
+        }
+        throw new Error(`CAP GraphQL error: ${message}`);
+      }
+    }
+    if (!result.data || typeof result.data !== 'object' || Array.isArray(result.data)) {
+      throw new Error('CAP GraphQL response data must be a JSON object');
     }
 
     return result.data;
@@ -132,8 +151,21 @@ async function executeQuery(query, variables = {}, options = {}) {
     }
     throw err;
   } finally {
-    if (timeout) clearTimeout(timeout);
+    if (timeout !== null) clearTimeout(timeout);
   }
+}
+
+function requireResultArray(data, field) {
+  const value = data?.[field];
+  if (!Array.isArray(value)) {
+    throw new Error(`CAP GraphQL data.${field} must be an array`);
+  }
+  value.forEach((entry, index) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new Error(`CAP GraphQL data.${field}[${index}] must be an object`);
+    }
+  });
+  return value;
 }
 
 function computeStringMatchScore(value, ctx) {
@@ -261,14 +293,31 @@ function computeCellTypeRelevance(result, ctx, { markerGenes = null } = {}) {
  * }>>}
  */
 export async function searchCellTypes(searchTerm, limit = 10, options = {}) {
-  if (!searchTerm?.trim()) return [];
+  if (searchTerm === null || searchTerm === undefined || searchTerm === '') return [];
+  if (typeof searchTerm !== 'string') {
+    throw new Error('CAP search term must be a string');
+  }
+  if (!searchTerm.trim()) return [];
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+    throw new Error('CAP result limit must be an integer from 1 to 200');
+  }
+  if (!options || typeof options !== 'object' || Array.isArray(options)) {
+    throw new Error('CAP search options must be an object');
+  }
+  if (
+    Object.hasOwn(options, 'markerGenes') &&
+    options.markerGenes !== null &&
+    !Array.isArray(options.markerGenes)
+  ) {
+    throw new Error('CAP markerGenes must be an array or null');
+  }
 
   const trimmed = searchTerm.trim();
   const searchLower = trimmed.toLowerCase();
   const searchNorm = normalizeForSearch(trimmed);
   const tokens = tokenizeSearch(trimmed);
   const ctx = { searchLower, searchNorm, tokens };
-  const markerGenes = Array.isArray(options?.markerGenes) ? options.markerGenes : null;
+  const markerGenes = options.markerGenes ?? null;
 
   const query = `
     query SearchCells($limit: Int!, $name: String!) {
@@ -285,11 +334,10 @@ export async function searchCellTypes(searchTerm, limit = 10, options = {}) {
     }
   `;
 
-  const maxClient = Number.isFinite(Number(limit)) ? Math.max(1, Math.floor(Number(limit))) : 10;
   // Request more results to re-rank client-side (CAP search ordering can be noisy).
-  const expandedLimit = Math.min(200, Math.max(maxClient * 10, 80));
+  const expandedLimit = Math.min(200, Math.max(limit * 10, 80));
   const data = await executeQuery(query, { limit: expandedLimit, name: trimmed });
-  const results = data?.lookupCells || [];
+  const results = requireResultArray(data, 'lookupCells');
 
   const scored = [];
   const seen = new Set();
@@ -317,7 +365,7 @@ export async function searchCellTypes(searchTerm, limit = 10, options = {}) {
     return 0;
   });
 
-  return scored.slice(0, maxClient).map((s) => s.r);
+  return scored.slice(0, limit).map((s) => s.r);
 }
 
 /**
@@ -336,7 +384,11 @@ export async function searchCellTypes(searchTerm, limit = 10, options = {}) {
  * } | null>}
  */
 export async function lookupByOntologyId(ontologyId) {
-  if (!ontologyId?.trim()) return null;
+  if (ontologyId === null || ontologyId === undefined || ontologyId === '') return null;
+  if (typeof ontologyId !== 'string') {
+    throw new Error('CAP ontology id must be a string');
+  }
+  if (!ontologyId.trim()) return null;
 
   // CAP doesn't have a direct ontology ID lookup, so we search by the ID
   const results = await searchCellTypes(ontologyId.trim(), 5);
@@ -346,7 +398,7 @@ export async function lookupByOntologyId(ontologyId) {
     (r) => r.ontologyTermId?.toLowerCase() === ontologyId.trim().toLowerCase()
   );
 
-  return match || results[0] || null;
+  return match ?? null;
 }
 
 /**
@@ -356,7 +408,11 @@ export async function lookupByOntologyId(ontologyId) {
  * @returns {Promise<Object | null>}
  */
 export async function lookupByName(name) {
-  if (!name?.trim()) return null;
+  if (name === null || name === undefined || name === '') return null;
+  if (typeof name !== 'string') {
+    throw new Error('CAP cell type name must be a string');
+  }
+  if (!name.trim()) return null;
 
   const results = await searchCellTypes(name.trim(), 5);
 
@@ -365,10 +421,19 @@ export async function lookupByName(name) {
   const match = results.find(
     (r) =>
       r.fullName?.toLowerCase() === normalizedSearch ||
-      r.name?.toLowerCase() === normalizedSearch
+      r.name?.toLowerCase() === normalizedSearch ||
+      r.ontologyTerm?.toLowerCase() === normalizedSearch ||
+      (
+        Array.isArray(r.synonyms) &&
+        r.synonyms.some(
+          (synonym) =>
+            typeof synonym === 'string' &&
+            synonym.toLowerCase() === normalizedSearch
+        )
+      )
   );
 
-  return match || results[0] || null;
+  return match ?? null;
 }
 
 /**
@@ -383,7 +448,13 @@ export async function lookupByName(name) {
  * } | null>}
  */
 export async function getCommunityFeedback(cellTypeName) {
-  if (!cellTypeName?.trim()) return null;
+  if (cellTypeName === null || cellTypeName === undefined || cellTypeName === '') {
+    return null;
+  }
+  if (typeof cellTypeName !== 'string') {
+    throw new Error('CAP feedback cell type name must be a string');
+  }
+  if (!cellTypeName.trim()) return null;
 
   const query = `
     query GetFeedback($limit: Int!, $name: String!) {
@@ -401,22 +472,29 @@ export async function getCommunityFeedback(cellTypeName) {
   `;
 
   const data = await executeQuery(query, { limit: 5, name: cellTypeName.trim() });
-  const results = data?.lookupCells || [];
+  const results = requireResultArray(data, 'lookupCells');
 
   if (!results.length) return null;
 
   // Find best match
   const normalizedSearch = cellTypeName.trim().toLowerCase();
-  const label =
-    results.find(
-      (r) =>
-        r.fullName?.toLowerCase() === normalizedSearch ||
-        r.name?.toLowerCase() === normalizedSearch
-    ) || results[0];
+  const label = results.find(
+    (r) =>
+      r.fullName?.toLowerCase() === normalizedSearch ||
+      r.name?.toLowerCase() === normalizedSearch
+  );
 
-  if (!label?.scores) return null;
+  if (!label) return null;
+  if (!label.scores || typeof label.scores !== 'object' || Array.isArray(label.scores)) {
+    throw new Error('CAP exact feedback result is missing scores');
+  }
 
-  const { agree = 0, disagree = 0, idk = 0, total = 0 } = label.scores;
+  const { agree, disagree, idk, total } = label.scores;
+  for (const [field, value] of Object.entries({ agree, disagree, idk, total })) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error(`CAP feedback scores.${field} must be a nonnegative integer`);
+    }
+  }
   const agreePercent = total > 0 ? Math.round((agree / total) * 100) : 0;
 
   return {
@@ -440,7 +518,13 @@ export async function getCommunityFeedback(cellTypeName) {
  * } | null>}
  */
 export async function findSynonyms(cellTypeName) {
-  if (!cellTypeName?.trim()) return null;
+  if (cellTypeName === null || cellTypeName === undefined || cellTypeName === '') {
+    return null;
+  }
+  if (typeof cellTypeName !== 'string') {
+    throw new Error('CAP synonym cell type name must be a string');
+  }
+  if (!cellTypeName.trim()) return null;
 
   const label = await lookupByName(cellTypeName);
 
@@ -450,14 +534,17 @@ export async function findSynonyms(cellTypeName) {
   const allNames = new Set([label.name]);
   if (label.fullName) allNames.add(label.fullName);
   if (label.ontologyTerm) allNames.add(label.ontologyTerm);
-  if (label.synonyms?.length) {
+  if (!Array.isArray(label.synonyms)) {
+    throw new Error('CAP exact cell type result is missing its synonyms array');
+  }
+  if (label.synonyms.length) {
     label.synonyms.filter((s) => s && s !== 'unknown').forEach((s) => allNames.add(s));
   }
 
   return {
     name: label.fullName || label.name,
     ontologyTermId: label.ontologyTermId,
-    synonyms: label.synonyms?.filter((s) => s && s !== 'unknown') || [],
+    synonyms: label.synonyms.filter((s) => s && s !== 'unknown'),
     allNames: [...allNames]
   };
 }
@@ -528,6 +615,12 @@ export async function checkIfSynonyms(name1, name2) {
  * @returns {Promise<Array<Object>>}
  */
 export async function searchDatasets({ search, limit = 20 } = {}) {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+    throw new Error('CAP dataset limit must be an integer from 1 to 200');
+  }
+  if (search !== undefined && typeof search !== 'string') {
+    throw new Error('CAP dataset search must be a string when provided');
+  }
   const query = `
     query SearchDatasets($limit: Int!, $search: LookupDatasetsSearchInput) {
       lookupDatasets(options: { limit: $limit }, search: $search) {
@@ -540,5 +633,5 @@ export async function searchDatasets({ search, limit = 20 } = {}) {
 
   const searchInput = search ? { name: search } : null;
   const data = await executeQuery(query, { limit, search: searchInput });
-  return data?.lookupDatasets || [];
+  return requireResultArray(data, 'lookupDatasets');
 }

@@ -270,7 +270,11 @@ export class HighPerfBenchmark {
       cameraDistance: 5.0,
       forceLOD: this.config.forceLODLevel,
       quality: this.config.shaderQuality,
-      dimensionLevel: this.config.dimensionLevel
+      viewId: 'benchmark',
+      dimensionLevel: this.config.dimensionLevel,
+      useAlphaTexture: false,
+      autoFog: true,
+      overrideBounds: null
     };
   }
 
@@ -300,17 +304,18 @@ export class HighPerfBenchmark {
     if (!this.renderer) {
       return null;
     }
-    return this.renderer.getStats();
+    return this.renderer.getStats('benchmark');
   }
   
   /**
    * Get LOD level information
    */
   getLODInfo() {
-    const dimLevel = this.renderer?.currentDimensionLevel ?? this.config.dimensionLevel;
-    if (!this.renderer || !this.renderer.hasSpatialIndex(dimLevel)) {
+    if (!this.renderer) {
       return null;
     }
+    const dimLevel = this.renderer.currentDimensionLevel;
+    if (!this.renderer.hasSpatialIndex(dimLevel)) return null;
 
     const lodBuffers = this.renderer.getLodBuffersForDimension(dimLevel);
     return {
@@ -576,9 +581,18 @@ export class HighPerfBenchmark {
       const baselineTest = baseline.results.find(b => b.name === currentTest.name);
       if (!baselineTest) continue;
 
-      // Use raw (unrounded) FPS for accurate comparison, fall back to rounded if unavailable
-      const baselineFps = baselineTest.fpsRaw ?? baselineTest.fps;
-      const currentFps = currentTest.fpsRaw ?? currentTest.fps;
+      if (!Number.isFinite(baselineTest.fpsRaw) || baselineTest.fpsRaw <= 0) {
+        throw new TypeError(
+          `Baseline benchmark "${currentTest.name}" is missing its finite positive fpsRaw value`
+        );
+      }
+      if (!Number.isFinite(currentTest.fpsRaw) || currentTest.fpsRaw <= 0) {
+        throw new TypeError(
+          `Current benchmark "${currentTest.name}" is missing its finite positive fpsRaw value`
+        );
+      }
+      const baselineFps = baselineTest.fpsRaw;
+      const currentFps = currentTest.fpsRaw;
 
       // Calculate changes using raw values for precision
       const fpsChange = baselineFps > 0
@@ -2299,8 +2313,8 @@ export class SyntheticDataGenerator {
 /**
  * GPU Timer using EXT_disjoint_timer_query_webgl2 extension
  *
- * Provides precise GPU timing measurements using async query objects.
- * Falls back gracefully when the extension is unavailable.
+ * Provides precise GPU timing measurements using the WebGL2 async-query
+ * extension. An unavailable extension is reported as unavailable.
  */
 export class GPUTimer {
   constructor(gl) {
@@ -2317,19 +2331,13 @@ export class GPUTimer {
   _init() {
     if (!this.gl) return;
 
-    // Try to get the timer query extension
     this.ext = this.gl.getExtension('EXT_disjoint_timer_query_webgl2');
-    if (!this.ext) {
-      // Try WebGL1 version as fallback
-      this.ext = this.gl.getExtension('EXT_disjoint_timer_query');
-    }
-
     this.available = !!this.ext;
 
     if (this.available) {
       console.log('[GPUTimer] EXT_disjoint_timer_query available');
     } else {
-      console.log('[GPUTimer] GPU timing extension not available; using fallback');
+      console.log('[GPUTimer] EXT_disjoint_timer_query_webgl2 is unavailable');
     }
   }
 
@@ -3127,7 +3135,7 @@ export class BottleneckAnalyzer {
           if (frameCount > 0 && frameTime > 0.1 && frameTime < 1000) {
             frameTimes.push(frameTime);
             rendererStats.push({
-              ...this.renderer.getStats(),
+              ...this.renderer.getStats('benchmark'),
               cpuRenderTime: renderTime
             });
           }
@@ -3349,13 +3357,20 @@ export class BottleneckAnalyzer {
     // Test 2: Vary LOD level (affects vertex count)
     console.log('  - Testing LOD level scaling...');
     const lodTests = {};
-    const lodLevels = this.renderer.getLODLevelCount?.() || 10;
+    const lodLevels = this.renderer.getLODLevelCount(
+      renderParams.dimensionLevel
+    );
+    if (!Number.isSafeInteger(lodLevels) || lodLevels <= 0) {
+      throw new Error(
+        'Bound analysis requires at least one published LOD level.'
+      );
+    }
     const testLevels = [0, Math.floor(lodLevels / 4), Math.floor(lodLevels / 2), lodLevels - 1];
 
     for (const level of testLevels) {
       const params = { ...renderParams, forceLOD: level };
       const times = await this._measureFrameTimes(config.testFrames / 8, params);
-      const stats = this.renderer.getStats();
+      const stats = this.renderer.getStats('benchmark');
       lodTests[level] = {
         avg: this._avg(times),
         min: Math.min(...times),
@@ -3399,7 +3414,7 @@ export class BottleneckAnalyzer {
    * Phase 5: Memory analysis
    */
   _analyzeMemory() {
-    const stats = this.renderer.getStats();
+    const stats = this.renderer.getStats('benchmark');
     const gl = this.gl;
 
     // Estimate memory usage
@@ -4696,7 +4711,16 @@ export class BottleneckAnalyzer {
             }
           }
 
-          const stats = this.renderer?.getStats() || {};
+          if (
+            !this.renderer ||
+            typeof this.renderer.hasStats !== 'function' ||
+            !this.renderer.hasStats('benchmark')
+          ) {
+            throw new Error(
+              'Live benchmark monitoring requires published statistics for view "benchmark".'
+            );
+          }
+          const stats = this.renderer.getStats('benchmark');
           const avgFrameTime = frameTimes.length > 0
             ? frameTimes.reduce((a, b) => a + b) / frameTimes.length
             : 0;
@@ -4916,14 +4940,15 @@ export class BenchmarkReporter {
     const ua = nav.userAgent || '';
     const brands = nav.userAgentData?.brands || [];
 
-    // Parse browser version
-    const browserInfo = this._parseBrowserInfo(ua, brands);
+    const browserInfo = this._parseBrowserInfo(ua);
 
     return {
       // Basic info
       ...browserInfo,
       userAgent: ua,
-      platform: nav.userAgentData?.platform || nav.platform || 'unknown',
+      clientHintBrands: brands.map(b => `${b.brand} ${b.version}`).join(', '),
+      clientHintPlatform: nav.userAgentData?.platform ?? null,
+      platform: nav.platform || null,
       language: nav.language || null,
       languages: nav.languages ? [...nav.languages] : [],
 
@@ -4999,40 +5024,25 @@ export class BenchmarkReporter {
   }
 
   /**
-   * Parse browser name and version from user agent
+   * Parse browser name and version from the recorded user-agent string.
    */
-  _parseBrowserInfo(ua, brands) {
-    // Try userAgentData first (more accurate)
-    if (brands && brands.length > 0) {
-      const significant = brands.find(b =>
-        !b.brand.includes('Not') && !b.brand.includes('Chromium')
-      ) || brands.find(b => b.brand === 'Chromium') || brands[0];
-
-      return {
-        name: significant?.brand || 'Unknown',
-        version: significant?.version || null,
-        brands: brands.map(b => `${b.brand} ${b.version}`).join(', ')
-      };
-    }
-
-    // Fallback to user agent parsing
+  _parseBrowserInfo(ua) {
     const browsers = [
       { regex: /Firefox\/(\d+(\.\d+)?)/, name: 'Firefox' },
       { regex: /Edg\/(\d+(\.\d+)?)/, name: 'Edge' },
       { regex: /OPR\/(\d+(\.\d+)?)/, name: 'Opera' },
       { regex: /Chrome\/(\d+(\.\d+)?)/, name: 'Chrome' },
-      { regex: /Safari\/(\d+(\.\d+)?)/, name: 'Safari' },
-      { regex: /Version\/(\d+(\.\d+)?).*Safari/, name: 'Safari' }
+      { regex: /Version\/(\d+(\.\d+)?).*Safari/, name: 'Safari' },
     ];
 
     for (const { regex, name } of browsers) {
       const match = ua.match(regex);
       if (match) {
-        return { name, version: match[1], brands: null };
+        return { name, version: match[1] };
       }
     }
 
-    return { name: 'Unknown', version: null, brands: null };
+    return { name: 'Unknown', version: null };
   }
 
   /**
@@ -5675,64 +5685,6 @@ export class BenchmarkReporter {
     };
   }
 
-  /**
-   * Legacy method for backward compatibility
-   */
-  _collectEnvironment(gl) {
-    const nav = typeof navigator !== 'undefined' ? navigator : {};
-    const scr = typeof screen !== 'undefined' ? screen : {};
-
-    const hardware = this._collectHardware(nav, scr);
-    const browser = this._collectBrowser(nav);
-    const network = this._collectNetwork(nav);
-    const webgl = this._collectWebGL(gl);
-
-    // Build legacy-compatible env object
-    const env = {
-      browser: browser.brands || browser.userAgent || 'unknown',
-      browserUA: browser.userAgent || null,
-      platform: browser.platform,
-      language: browser.language,
-      hardwareConcurrency: hardware.cpu.cores,
-      deviceMemory: hardware.memory.deviceMemoryGB,
-      pixelRatio: hardware.viewport?.devicePixelRatio || null,
-      screen: hardware.screen,
-      connection: network.connection?.effectiveType || network.connection?.type || null,
-      maxTouchPoints: hardware.input.maxTouchPoints,
-      timezone: (() => {
-        try {
-          return Intl.DateTimeFormat().resolvedOptions().timeZone;
-        } catch {
-          return null;
-        }
-      })(),
-      arch: hardware.cpu.architecture.detected,
-      isApple: hardware.cpu.architecture.isApple,
-      appleSiliconHint: hardware.cpu.architecture.appleSiliconHint,
-      jsHeap: hardware.memory.jsHeap,
-      // Extended info
-      hardware,
-      browser: { ...browser },
-      network,
-      webgl: webgl ? {
-        version: webgl.version,
-        renderer: webgl.params.renderer,
-        vendor: webgl.params.vendor,
-        shadingLanguage: webgl.params.shadingLanguageVersion,
-        maxTextureSize: webgl.params.maxTextureSize,
-        supportsFloatTextures: webgl.extensions.keyExtensions['OES_texture_float'] ||
-          webgl.extensions.keyExtensions['OES_texture_half_float'],
-        supportsColorBufferFloat: webgl.extensions.keyExtensions['EXT_color_buffer_float'] ||
-          webgl.extensions.keyExtensions['WEBGL_color_buffer_float'],
-        maxAnisotropy: webgl.extensions.maxAnisotropy,
-        // Full WebGL info
-        full: webgl
-      } : null
-    };
-
-    return env;
-  }
-
   _collectDataSnapshot(context = {}) {
     const fromState = this.state || null;
     const filteredCount = context.filteredCount ||
@@ -5765,9 +5717,31 @@ export class BenchmarkReporter {
   }
 
   _collectRendererSnapshot(gl, context = {}) {
-    const rendererStats = context.rendererStats ??
-      (this.viewer && typeof this.viewer.getRendererStats === 'function' ? this.viewer.getRendererStats() : null) ??
-      {};
+    let rendererStats = context.rendererStats;
+    if (rendererStats === undefined) {
+      if (
+        this.viewer &&
+        typeof this.viewer.getRendererStats === 'function' &&
+        typeof this.viewer.hasRendererStats === 'function'
+      ) {
+        const viewId = context.viewId !== undefined
+          ? context.viewId
+          : this.state?.getActiveViewId?.();
+        if (typeof viewId !== 'string' || viewId.length === 0) {
+          throw new TypeError(
+            'Benchmark renderer collection requires an exact active view id.'
+          );
+        }
+        rendererStats = this.viewer.hasRendererStats(viewId)
+          ? this.viewer.getRendererStats(viewId)
+          : null;
+      } else {
+        rendererStats = null;
+      }
+    }
+    if (rendererStats !== null && typeof rendererStats !== 'object') {
+      throw new TypeError('Benchmark rendererStats must be an object or null.');
+    }
     const perfStats = context.perfStats ?? null;
     const rendererConfig = context.rendererConfig || {};
     const renderMode = rendererConfig.renderMode || context.renderMode || null;
@@ -5778,11 +5752,11 @@ export class BenchmarkReporter {
           height: typeof window !== 'undefined' ? window.innerHeight : null
         };
 
-    const fps = perfStats?.fps ?? rendererStats.fps ?? null;
-    const frameTime = perfStats?.avgFrameTime ?? rendererStats.lastFrameTime ?? null;
-    const renderFrameMs = rendererStats.lastFrameTime ?? null;
+    const fps = perfStats?.fps ?? rendererStats?.fps ?? null;
+    const frameTime = perfStats?.avgFrameTime ?? rendererStats?.lastFrameTime ?? null;
+    const renderFrameMs = rendererStats?.lastFrameTime ?? null;
 
-    const estimatedMemoryMB = rendererStats.gpuMemoryMB ??
+    const estimatedMemoryMB = rendererStats?.gpuMemoryMB ??
       (context.dataset && context.dataset.pointCount
         ? (context.dataset.pointCount * 28) / (1024 * 1024)
         : null);
@@ -6012,7 +5986,7 @@ export class BenchmarkReporter {
       }
       if (env.webgl.supportsColorBufferFloat === false) {
         addIssue(S.INFO, 'webgl', 'Color buffer float not supported', {
-          recommendation: 'Fallback precision may apply for some effects'
+          recommendation: 'Effects that require floating-point render targets are unavailable'
         });
       }
     }
@@ -6049,15 +6023,6 @@ export class BenchmarkReporter {
       }
     }
     return summary;
-  }
-
-  /**
-   * Format issues as simple strings (legacy format)
-   * @param {Array} issues - Array of issue objects
-   * @returns {Array<string>} Array of message strings
-   */
-  static formatIssuesAsStrings(issues) {
-    return issues.map(i => `[${i.severity.toUpperCase()}] ${i.message}`);
   }
 
   /**
@@ -6238,363 +6203,4 @@ export class BenchmarkReporter {
 
     return report;
   }
-}
-
-/**
- * Format bytes to human-readable string
- */
-export function formatBytes(bytes) {
-  if (bytes == null || isNaN(bytes)) return 'n/a';
-  if (bytes === 0) return '0 B';
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-}
-
-/**
- * Benchmark Data Exporter
- *
- * Provides utilities to export benchmark results to various formats
- * including CSV, JSON Lines, and structured JSON.
- */
-export class BenchmarkExporter {
-  /**
-   * Export benchmark results to CSV format
-   * @param {Object} benchmarkResults - Results from runBenchmarkSuite
-   * @returns {string} CSV formatted string
-   */
-  static toCSV(benchmarkResults) {
-    const { results, metadata } = benchmarkResults;
-    if (!results || results.length === 0) return '';
-
-    // Define columns
-    const columns = [
-      'name', 'fps', 'avgFrameTime', 'minFrameTime', 'maxFrameTime',
-      'medianFrameTime', 'p95FrameTime', 'p99FrameTime', 'stdDev',
-      'frames', 'jankFrames', 'jankPercent'
-    ];
-
-    // Header row
-    const header = columns.join(',');
-
-    // Data rows
-    const rows = results.map(result => {
-      return columns.map(col => {
-        const value = result[col];
-        if (value == null) return '';
-        if (typeof value === 'string') return `"${value.replace(/"/g, '""')}"`;
-        if (typeof value === 'number') return value.toFixed ? value.toFixed(4) : value;
-        return value;
-      }).join(',');
-    });
-
-    // Add metadata as comment header
-    const metaLines = [
-      `# Benchmark Export`,
-      `# Generated: ${metadata?.timestamp || new Date().toISOString()}`,
-      `# Point Count: ${metadata?.pointCount || 'unknown'}`,
-      `# Frames Per Test: ${metadata?.framesPerTest || 'unknown'}`,
-      `# Warmup Frames: ${metadata?.warmupFrames || 'unknown'}`,
-      ''
-    ];
-
-    return metaLines.join('\n') + header + '\n' + rows.join('\n');
-  }
-
-  /**
-   * Export benchmark results to JSON Lines format (one JSON object per line)
-   * Useful for streaming and appending to log files
-   * @param {Object} benchmarkResults - Results from runBenchmarkSuite
-   * @returns {string} JSON Lines formatted string
-   */
-  static toJSONLines(benchmarkResults) {
-    const { results, metadata } = benchmarkResults;
-    if (!results || results.length === 0) return '';
-
-    const timestamp = metadata?.timestamp || new Date().toISOString();
-
-    return results.map(result => {
-      const entry = {
-        timestamp,
-        pointCount: metadata?.pointCount,
-        ...result
-      };
-      // Remove rawFrameTimes to keep lines manageable
-      delete entry.rawFrameTimes;
-      return JSON.stringify(entry);
-    }).join('\n');
-  }
-
-  /**
-   * Export performance tracker history to CSV
-   * @param {Array} history - History from PerformanceTracker
-   * @returns {string} CSV formatted string
-   */
-  static historyToCSV(history) {
-    if (!history || history.length === 0) return '';
-
-    const columns = ['timestamp', 'fps', 'avgFrameTime', 'p95FrameTime', 'jankPercent'];
-    const header = columns.join(',');
-
-    const rows = history.map(entry => {
-      return columns.map(col => {
-        const value = entry[col];
-        if (value == null) return '';
-        if (typeof value === 'number') return value.toFixed(4);
-        return value;
-      }).join(',');
-    });
-
-    return header + '\n' + rows.join('\n');
-  }
-
-  /**
-   * Export frame times as raw data for external analysis
-   * @param {Array} frameTimes - Array of frame times in ms
-   * @param {Object} options - Export options
-   * @returns {string} Formatted string based on options.format
-   */
-  static frameTimesToFormat(frameTimes, options = {}) {
-    const { format = 'json', includeStats = true } = options;
-
-    if (!frameTimes || frameTimes.length === 0) return '';
-
-    const data = {
-      frameTimes,
-      count: frameTimes.length
-    };
-
-    if (includeStats) {
-      const sorted = [...frameTimes].sort((a, b) => a - b);
-      const sum = sorted.reduce((a, b) => a + b, 0);
-      const avg = sum / sorted.length;
-      const sumSquares = sorted.reduce((a, b) => a + b * b, 0);
-      const variance = (sumSquares / sorted.length) - (avg * avg);
-
-      data.stats = {
-        avg,
-        min: sorted[0],
-        max: sorted[sorted.length - 1],
-        median: sorted[Math.floor(sorted.length * 0.5)],
-        p95: sorted[Math.floor(sorted.length * 0.95)],
-        stdDev: Math.sqrt(Math.max(0, variance))
-      };
-    }
-
-    switch (format) {
-      case 'csv':
-        return frameTimes.join('\n');
-      case 'json':
-        return JSON.stringify(data, null, 2);
-      case 'jsonl':
-        return frameTimes.map((t, i) => JSON.stringify({ frame: i, timeMs: t })).join('\n');
-      default:
-        return JSON.stringify(data);
-    }
-  }
-
-  /**
-   * Create a downloadable file from export data
-   * @param {string} data - Export data string
-   * @param {string} filename - Filename for download
-   * @param {string} mimeType - MIME type
-   */
-  static download(data, filename, mimeType = 'text/plain') {
-    if (typeof document === 'undefined') {
-      console.warn('[BenchmarkExporter] download() requires browser environment');
-      return;
-    }
-
-    const blob = new Blob([data], { type: mimeType });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  }
-
-  /**
-   * Convenience method to export and download benchmark results
-   * @param {Object} benchmarkResults - Results from runBenchmarkSuite
-   * @param {string} format - 'csv', 'json', or 'jsonl'
-   */
-  static exportAndDownload(benchmarkResults, format = 'csv') {
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    let data, filename, mimeType;
-
-    switch (format) {
-      case 'csv':
-        data = this.toCSV(benchmarkResults);
-        filename = `benchmark-${timestamp}.csv`;
-        mimeType = 'text/csv';
-        break;
-      case 'jsonl':
-        data = this.toJSONLines(benchmarkResults);
-        filename = `benchmark-${timestamp}.jsonl`;
-        mimeType = 'application/x-ndjson';
-        break;
-      case 'json':
-      default:
-        data = JSON.stringify(benchmarkResults, null, 2);
-        filename = `benchmark-${timestamp}.json`;
-        mimeType = 'application/json';
-        break;
-    }
-
-    this.download(data, filename, mimeType);
-  }
-}
-
-// Re-export formatNumber for backward compatibility (imported at top of file)
-export { formatNumber };
-
-// Export for global access
-if (typeof window !== 'undefined') {
-  window.SyntheticDataGenerator = SyntheticDataGenerator;
-  window.PerformanceTracker = PerformanceTracker;
-  window.HighPerfBenchmark = HighPerfBenchmark;
-  window.BenchmarkConfig = BenchmarkConfig;
-  window.formatNumber = formatNumber;
-  window.formatBytes = formatBytes;
-  window.GLBParser = GLBParser;
-  window.MeshSurfaceSampler = MeshSurfaceSampler;
-  window.BenchmarkReporter = BenchmarkReporter;
-  window.GPUTimer = GPUTimer;
-  window.BenchmarkExporter = BenchmarkExporter;
-  window.BottleneckAnalyzer = BottleneckAnalyzer;
-
-  // ============================================================
-  // EASY ACCESS HELPERS - Just type these in the browser console
-  // ============================================================
-
-  /**
-   * Start the live FPS monitor - just type: startLiveMonitor()
-   */
-  window.startLiveMonitor = function(options = {}) {
-    // Find canvas and get GL context
-    const canvas = document.querySelector('canvas');
-    if (!canvas) {
-      console.error('[Benchmark] No canvas found on page');
-      return null;
-    }
-
-    const gl = canvas.getContext('webgl2');
-    if (!gl) {
-      console.error('[Benchmark] Could not get WebGL2 context');
-      return null;
-    }
-
-    // Try to find the hpRenderer from the viewer
-    // Look for it in common places
-    let renderer = null;
-
-    // Check if there's a global viewer or state object
-    if (window._cellucidViewer?.getHPRenderer) {
-      renderer = window._cellucidViewer.getHPRenderer();
-    } else if (window._cellucidState?.viewer?.getHPRenderer) {
-      renderer = window._cellucidState.viewer.getHPRenderer();
-    }
-
-    // Create analyzer (renderer can be null, monitor still works for FPS)
-    const analyzer = new BottleneckAnalyzer(gl, renderer);
-    const monitor = analyzer.createLiveMonitor({
-      position: options.position || 'top-left',
-      updateInterval: options.updateInterval || 100,
-      showGraph: options.showGraph !== false,
-      ...options
-    });
-
-    monitor.start();
-
-    // Store globally so user can stop it
-    window._liveMonitor = monitor;
-    window._bottleneckAnalyzer = analyzer;
-
-    console.log('[Benchmark] Live monitor started! Type stopLiveMonitor() to stop.');
-    return monitor;
-  };
-
-  /**
-   * Stop the live FPS monitor - just type: stopLiveMonitor()
-   */
-  window.stopLiveMonitor = function() {
-    if (window._liveMonitor) {
-      window._liveMonitor.stop();
-      console.log('[Benchmark] Live monitor stopped.');
-    } else {
-      console.log('[Benchmark] No live monitor running.');
-    }
-  };
-
-  /**
-   * Run full bottleneck analysis - just type: analyzeBottleneck()
-   */
-  window.analyzeBottleneck = async function(options = {}) {
-    const canvas = document.querySelector('canvas');
-    if (!canvas) {
-      console.error('[Benchmark] No canvas found on page');
-      return null;
-    }
-
-    const gl = canvas.getContext('webgl2');
-    if (!gl) {
-      console.error('[Benchmark] Could not get WebGL2 context');
-      return null;
-    }
-
-    // Try to find the hpRenderer
-    let renderer = null;
-    if (window._cellucidViewer?.getHPRenderer) {
-      renderer = window._cellucidViewer.getHPRenderer();
-    } else if (window._cellucidState?.viewer?.getHPRenderer) {
-      renderer = window._cellucidState.viewer.getHPRenderer();
-    }
-
-    if (!renderer) {
-      console.error('[Benchmark] Could not find renderer. Make sure data is loaded.');
-      console.log('[Benchmark] Tip: The viewer needs to expose hpRenderer via window._cellucidViewer.getHPRenderer()');
-      return null;
-    }
-
-    console.log('[Benchmark] Starting bottleneck analysis... (takes ~10-20 seconds)');
-
-    const analyzer = new BottleneckAnalyzer(gl, renderer);
-    window._bottleneckAnalyzer = analyzer;
-
-    const results = await analyzer.runAnalysis({
-      warmupFrames: options.warmupFrames || 30,
-      testFrames: options.testFrames || 120,
-      ...options
-    });
-
-    // Show the visual panel
-    analyzer.showMetricsPanel({ position: options.position || 'top-right' });
-
-    // Also log to console
-    console.log(analyzer.formatReport());
-
-    return results;
-  };
-
-  /**
-   * Hide the metrics panel - just type: hideMetrics()
-   */
-  window.hideMetrics = function() {
-    if (window._bottleneckAnalyzer) {
-      window._bottleneckAnalyzer.hideMetricsPanel();
-    }
-    // Also remove by ID in case analyzer was lost
-    const panel = document.getElementById('bottleneck-metrics-panel');
-    if (panel) panel.remove();
-  };
-
-  console.log('[Benchmark] Helpers loaded! Available commands:');
-  console.log('  startLiveMonitor()  - Show live FPS monitor');
-  console.log('  stopLiveMonitor()   - Stop the monitor');
-  console.log('  analyzeBottleneck() - Run full analysis (needs data loaded)');
-  console.log('  hideMetrics()       - Hide the metrics panel');
 }

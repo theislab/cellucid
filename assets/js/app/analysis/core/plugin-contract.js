@@ -394,8 +394,7 @@ export class PlotPluginRegistry extends BasePluginRegistry {
 /**
  * Transform Plugin Registry
  *
- * Unified registry for data transforms with automatic backend selection.
- * Supports GPU > Worker > CPU fallback pattern for optimal performance.
+ * Unified registry for data transforms with pre-execution backend selection.
  */
 export class TransformPluginRegistry extends BasePluginRegistry {
   constructor() {
@@ -460,29 +459,49 @@ export class TransformPluginRegistry extends BasePluginRegistry {
   }
 
   /**
-   * Select the best backend for a transform
-   * Priority: GPU > Worker > CPU (based on availability, not array size)
+   * Select one supported backend before a transform starts.
+   * Priority without an explicit request is GPU, Worker, then CPU.
    * @param {Object} plugin - Transform plugin
    * @param {string} [preferredBackend] - Preferred backend override
    * @returns {string} 'gpu' | 'worker' | 'cpu'
    */
   selectBackend(plugin, preferredBackend = null) {
-    // Respect explicit preference if backend is available
-    if (preferredBackend === 'gpu' && this._gpuAvailable && plugin.gpuMethod) return 'gpu';
-    if (preferredBackend === 'worker' && this._workerAvailable && plugin.workerMethod) return 'worker';
-    if (preferredBackend === 'cpu') return 'cpu';
+    if (
+      preferredBackend !== null &&
+      preferredBackend !== 'gpu' &&
+      preferredBackend !== 'worker' &&
+      preferredBackend !== 'cpu'
+    ) {
+      throw new TypeError(
+        'preferredBackend must be exactly "gpu", "worker", "cpu", or null'
+      );
+    }
+    if (preferredBackend !== null) {
+      const supported = preferredBackend === 'cpu' ||
+        (
+          preferredBackend === 'gpu' &&
+          this._gpuAvailable &&
+          Boolean(plugin.gpuMethod)
+        ) ||
+        (
+          preferredBackend === 'worker' &&
+          this._workerAvailable &&
+          Boolean(plugin.workerMethod)
+        );
+      if (!supported) {
+        throw new Error(
+          `Requested transform backend "${preferredBackend}" is unavailable`
+        );
+      }
+      return preferredBackend;
+    }
 
-    // GPU first if available and transform supports it
     if (plugin.gpuMethod && this._gpuAvailable) {
       return 'gpu';
     }
-
-    // Worker second if available and transform supports it
     if (plugin.workerMethod && this._workerAvailable) {
       return 'worker';
     }
-
-    // CPU as final fallback
     return 'cpu';
   }
 
@@ -551,29 +570,12 @@ export class TransformPluginRegistry extends BasePluginRegistry {
     // Select backend
     const backend = this.selectBackend(plugin, context.preferredBackend);
 
-    // Execute with timing
     const startTime = performance.now();
-    let result;
-
-    try {
-      result = await plugin.execute(data, mergedOptions, {
-        ...context,
-        backend,
-        registry: this
-      });
-    } catch (err) {
-      // Fallback to CPU if accelerated backend fails
-      if (backend !== 'cpu') {
-        debugWarn('TransformRegistry', `${backend} execution failed, falling back to CPU:`, err.message);
-        result = await plugin.execute(data, mergedOptions, {
-          ...context,
-          backend: 'cpu',
-          registry: this
-        });
-      } else {
-        throw err;
-      }
-    }
+    const result = await plugin.execute(data, mergedOptions, {
+      ...context,
+      backend,
+      registry: this
+    });
 
     const elapsed = performance.now() - startTime;
 

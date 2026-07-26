@@ -1,82 +1,243 @@
 /**
- * @fileoverview Vector field loader/normalizer (dimension-specific).
+ * @fileoverview Exact vector-field loader for dimension-specific displacement data.
  *
- * Vector fields are per-cell displacement vectors in an embedding space (e.g.
- * scVelo velocity or CellRank drift vectors derived from transition matrices).
- *
- * Coordinate-space contract
- * -------------------------
- * Cellucid’s embedding positions go through two normalization stages:
- * 1) Export/adapters often normalize embeddings into a stable [-1, 1] range.
- * 2) The frontend DimensionManager normalizes again after padding to 3D.
- *
- * For visual correctness, vector fields MUST be expressed in the same coordinate
- * space as the embedding positions *before* the frontend's second normalization.
- * This manager then multiplies vectors by the DimensionManager's per-dimension
- * normalization scale so the final vectors live in the exact render space.
- *
- * Data sources supported (matches Cellucid's 14 loading options):
- * - Prepared exports / server-backed exports: `dataset_identity.json` provides `vector_fields.fields[*].files`
- * - Direct browser AnnData (h5ad / zarr): adapter exposes `getVectorField(fieldId, dim)`
+ * Vector values are scaled by the DimensionManager normalization scale so they
+ * inhabit the same render space as the corresponding embedding. Metadata,
+ * dimensions, file mappings, and numerical payloads are never inferred,
+ * coerced, repaired, or substituted.
  *
  * @module data/vector-field-manager
  */
 
 import { loadPointsBinary } from './data-loaders.js';
-import { getAnnDataAdapter, isAnnDataActive } from './anndata-provider.js';
+import { getActiveAnnDataBinding } from './anndata-provider.js';
+import { resolveUrl } from './data-source.js';
 
-/**
- * @typedef {object} VectorFieldEntry
- * @property {string} [label]
- * @property {string} [basis]
- * @property {number[]} [available_dimensions]
- * @property {number} [default_dimension]
- * @property {{ [key: string]: string }} [files] - For prepared exports: { "2d": "vectors/velocity_umap_2d.bin.gz", ... }
- * @property {{ [key: string]: number }} [components] - Optional override: { "2d": 2, "3d": 3 }
- */
+const SUPPORTED_DIMENSIONS = Object.freeze([1, 2, 3]);
+const SUPPORTED_DIMENSION_SET = new Set(SUPPORTED_DIMENSIONS);
 
-/**
- * @typedef {object} VectorFieldsMetadata
- * @property {string} [default_field]
- * @property {{ [fieldId: string]: VectorFieldEntry }} [fields]
- */
+function isPlainRecord(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
 
-export function createVectorFieldManager(options = {}) {
+function requireExactKeys(value, requiredKeys, optionalKeys, label) {
+  if (!isPlainRecord(value)) {
+    throw new TypeError(`${label} must be a plain object.`);
+  }
+  const allowed = new Set([...requiredKeys, ...optionalKeys]);
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) {
+      throw new TypeError(`${label} contains unsupported key "${key}".`);
+    }
+  }
+  for (const key of requiredKeys) {
+    if (!Object.hasOwn(value, key)) {
+      throw new TypeError(`${label} must declare "${key}".`);
+    }
+  }
+}
+
+function requireNonEmptyString(value, label) {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new TypeError(`${label} must be a non-empty string.`);
+  }
+  return value;
+}
+
+function requireDimension(value, label) {
+  if (!Number.isInteger(value) || !SUPPORTED_DIMENSION_SET.has(value)) {
+    throw new RangeError(`${label} must be exactly 1, 2, or 3.`);
+  }
+  return value;
+}
+
+function requireDimensions(value, label) {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new TypeError(`${label} must be a non-empty array.`);
+  }
+  const dimensions = value.map((dimension, index) =>
+    requireDimension(dimension, `${label}[${index}]`)
+  );
+  for (let index = 1; index < dimensions.length; index++) {
+    if (dimensions[index] <= dimensions[index - 1]) {
+      throw new TypeError(
+        `${label} must contain unique dimensions in ascending order.`
+      );
+    }
+  }
+  return Object.freeze(dimensions);
+}
+
+function requireDimensionPathMap(value, dimensions, label) {
+  if (!isPlainRecord(value)) {
+    throw new TypeError(`${label} must be a plain object.`);
+  }
+  const expectedKeys = dimensions.map((dimension) => `${dimension}d`);
+  const actualKeys = Object.keys(value);
+  if (
+    actualKeys.length !== expectedKeys.length ||
+    expectedKeys.some((key) => !Object.hasOwn(value, key))
+  ) {
+    throw new TypeError(
+      `${label} must declare exactly ${expectedKeys.join(', ')}.`
+    );
+  }
+  const result = {};
+  for (const key of expectedKeys) {
+    result[key] = requireNonEmptyString(value[key], `${label}.${key}`);
+  }
+  return Object.freeze(result);
+}
+
+function parseFieldEntry(fieldId, value) {
+  const label = `vector_fields.fields.${fieldId}`;
+  requireExactKeys(
+    value,
+    ['label', 'basis', 'available_dimensions', 'default_dimension'],
+    ['files', 'obsm_keys'],
+    label
+  );
+  const dimensions = requireDimensions(
+    value.available_dimensions,
+    `${label}.available_dimensions`
+  );
+  const defaultDimension = requireDimension(
+    value.default_dimension,
+    `${label}.default_dimension`
+  );
+  if (!dimensions.includes(defaultDimension)) {
+    throw new TypeError(
+      `${label}.default_dimension must be one of its available_dimensions.`
+    );
+  }
+  const hasFiles = Object.hasOwn(value, 'files');
+  const hasObsmKeys = Object.hasOwn(value, 'obsm_keys');
+  if (hasFiles === hasObsmKeys) {
+    throw new TypeError(
+      `${label} must declare exactly one of "files" or "obsm_keys".`
+    );
+  }
+
+  return Object.freeze({
+    label: requireNonEmptyString(value.label, `${label}.label`),
+    basis: requireNonEmptyString(value.basis, `${label}.basis`),
+    available_dimensions: dimensions,
+    default_dimension: defaultDimension,
+    ...(hasFiles
+      ? {
+          files: requireDimensionPathMap(
+            value.files,
+            dimensions,
+            `${label}.files`
+          )
+        }
+      : {
+          obsm_keys: requireDimensionPathMap(
+            value.obsm_keys,
+            dimensions,
+            `${label}.obsm_keys`
+          )
+        }),
+  });
+}
+
+function parseMetadata(value) {
+  if (value === null) {
+    return Object.freeze({
+      defaultField: null,
+      fields: new Map(),
+    });
+  }
+  requireExactKeys(
+    value,
+    ['default_field', 'fields'],
+    [],
+    'vector_fields'
+  );
+  if (!isPlainRecord(value.fields) || Object.keys(value.fields).length === 0) {
+    throw new TypeError('vector_fields.fields must be a non-empty plain object.');
+  }
+
+  const fields = new Map();
+  for (const [fieldId, field] of Object.entries(value.fields)) {
+    requireNonEmptyString(fieldId, 'vector field id');
+    fields.set(fieldId, parseFieldEntry(fieldId, field));
+  }
+
+  let defaultField = null;
+  if (value.default_field !== null) {
+    defaultField = requireNonEmptyString(
+      value.default_field,
+      'vector_fields.default_field'
+    );
+    if (!fields.has(defaultField)) {
+      throw new TypeError(
+        'vector_fields.default_field must be null or name a declared field.'
+      );
+    }
+  }
+  return Object.freeze({ defaultField, fields });
+}
+
+function requireManagerOptions(options) {
+  requireExactKeys(
+    options,
+    ['baseUrl', 'vectorFieldsMetadata', 'dimensionManager'],
+    [],
+    'VectorFieldManager options'
+  );
+  const baseUrl = requireNonEmptyString(options.baseUrl, 'VectorFieldManager baseUrl');
+  if (!baseUrl.endsWith('/')) {
+    throw new TypeError(
+      'VectorFieldManager baseUrl must be an explicit directory URL ending in "/".'
+    );
+  }
+  const dimensionManager = options.dimensionManager;
+  if (
+    dimensionManager === null ||
+    typeof dimensionManager !== 'object' ||
+    typeof dimensionManager.getPositions3D !== 'function' ||
+    typeof dimensionManager.getNormTransform !== 'function'
+  ) {
+    throw new TypeError(
+      'VectorFieldManager dimensionManager must provide getPositions3D() and getNormTransform().'
+    );
+  }
+  return {
+    baseUrl,
+    dimensionManager,
+    metadata: parseMetadata(options.vectorFieldsMetadata),
+  };
+}
+
+function requireLoadOptions(options) {
+  requireExactKeys(options, ['showProgress'], [], 'VectorFieldManager load options');
+  if (typeof options.showProgress !== 'boolean') {
+    throw new TypeError(
+      'VectorFieldManager load options.showProgress must be a boolean.'
+    );
+  }
+  return options.showProgress;
+}
+
+export function createVectorFieldManager(options) {
   return new VectorFieldManager(options);
 }
 
 export class VectorFieldManager {
-  constructor({ baseUrl = '', vectorFieldsMetadata = null, dimensionManager = null } = {}) {
-    this.baseUrl = baseUrl || '';
-    this.dimensionManager = dimensionManager || null;
+  constructor(options) {
+    const parsed = requireManagerOptions(options);
+    this.baseUrl = parsed.baseUrl;
+    this.dimensionManager = parsed.dimensionManager;
+    this._fields = parsed.metadata.fields;
+    this._defaultField = parsed.metadata.defaultField;
 
-    /** @type {VectorFieldsMetadata|null} */
-    this._meta = vectorFieldsMetadata && typeof vectorFieldsMetadata === 'object'
-      ? vectorFieldsMetadata
-      : null;
-
-    /** @type {Map<string, VectorFieldEntry>} */
-    this._fields = new Map();
-
-    /** @type {string|null} */
-    this._defaultField = null;
-
-    /** @type {Map<string, Map<number, Promise<any>>>} */
-    this._loading = new Map(); // fieldId -> (dim -> promise)
-
-    this._ingestMetadata(this._meta);
-  }
-
-  setBaseUrl(url) {
-    this.baseUrl = url || '';
-  }
-
-  setMetadata(meta) {
-    this._meta = meta && typeof meta === 'object' ? meta : null;
-    this._fields.clear();
-    this._defaultField = null;
-    this._loading.clear();
-    this._ingestMetadata(this._meta);
+    /** @type {Map<string, Map<number, Promise<object>>>} */
+    this._loading = new Map();
   }
 
   hasAny() {
@@ -93,199 +254,211 @@ export class VectorFieldManager {
   getAvailableFields() {
     const result = [];
     for (const [id, entry] of this._fields.entries()) {
-      const dims = Array.isArray(entry?.available_dimensions)
-        ? entry.available_dimensions.filter((d) => Number.isInteger(d) && d >= 1 && d <= 3)
-        : [];
-      const defaultDim = Number.isInteger(entry?.default_dimension) ? entry.default_dimension : (dims[dims.length - 1] || 3);
-      result.push({
+      result.push(Object.freeze({
         id,
-        label: String(entry?.label || id),
-        availableDimensions: dims,
-        defaultDimension: Math.max(1, Math.min(3, Math.floor(defaultDim || 3)))
-      });
+        label: entry.label,
+        availableDimensions: entry.available_dimensions,
+        defaultDimension: entry.default_dimension,
+      }));
     }
-    // Stable ordering: default first, then alpha.
     const defaultId = this._defaultField;
     result.sort((a, b) => {
-      if (defaultId && a.id === defaultId) return -1;
-      if (defaultId && b.id === defaultId) return 1;
-      return a.label.localeCompare(b.label);
+      if (defaultId !== null && a.id === defaultId) return -1;
+      if (defaultId !== null && b.id === defaultId) return 1;
+      if (a.label < b.label) return -1;
+      if (a.label > b.label) return 1;
+      if (a.id < b.id) return -1;
+      if (a.id > b.id) return 1;
+      return 0;
     });
     return result;
   }
 
   hasField(fieldId) {
-    return this._fields.has(String(fieldId || ''));
+    return this._fields.has(
+      requireNonEmptyString(fieldId, 'VectorFieldManager fieldId')
+    );
   }
 
-  hasFieldDimension(fieldId, dim) {
-    const entry = this._fields.get(String(fieldId || '')) || null;
-    if (!entry) return false;
-    const d = Math.max(1, Math.min(3, Math.floor(dim || 3)));
-    const dims = Array.isArray(entry.available_dimensions) ? entry.available_dimensions : [];
-    return dims.includes(d);
+  hasFieldDimension(fieldId, dimension) {
+    const id = requireNonEmptyString(fieldId, 'VectorFieldManager fieldId');
+    const dim = requireDimension(
+      dimension,
+      'VectorFieldManager dimension'
+    );
+    const entry = this._fields.get(id);
+    return entry !== undefined &&
+      entry.available_dimensions.includes(dim);
   }
 
   /**
-   * Load vectors for a field + dimension and scale them into the final render space.
-   *
-   * Returned vectors are shaped as a flat Float32Array:
-   * - components=1: [vx0, vx1, ...]
-   * - components=2: [vx0, vy0, vx1, vy1, ...]
-   * - components=3: [vx0, vy0, vz0, vx1, vy1, vz1, ...]
+   * Load vectors for an exact field and dimension, then apply the embedding
+   * normalization scale. The returned buffer always has `dimension`
+   * components per cell.
    *
    * @param {string} fieldId
-   * @param {number} dim
-   * @param {{ showProgress?: boolean }} [options]
+   * @param {number} dimension
+   * @param {{ showProgress: boolean }} options
    * @returns {Promise<{ vectors: Float32Array, components: 1|2|3, cellCount: number, maxMagnitude: number }>}
    */
-  async loadField(fieldId, dim, options = {}) {
-    const id = String(fieldId || '');
-    const entry = this._fields.get(id) || null;
-    if (!entry) {
-      throw new Error(`VectorFieldManager.loadField: unknown field "${id}"`);
+  async loadField(fieldId, dimension, options) {
+    const id = requireNonEmptyString(
+      fieldId,
+      'VectorFieldManager fieldId'
+    );
+    const dim = requireDimension(
+      dimension,
+      'VectorFieldManager dimension'
+    );
+    const showProgress = requireLoadOptions(options);
+    const entry = this._fields.get(id);
+    if (entry === undefined) {
+      throw new Error(`VectorFieldManager.loadField: unknown field "${id}".`);
     }
-
-    const d = Math.max(1, Math.min(3, Math.floor(dim || 3)));
-    if (!this.dimensionManager) {
-      throw new Error('VectorFieldManager.loadField: missing dimensionManager');
+    if (!entry.available_dimensions.includes(dim)) {
+      throw new Error(
+        `VectorFieldManager.loadField: field "${id}" does not declare ${dim}D data.`
+      );
     }
 
     let perField = this._loading.get(id);
-    if (!perField) {
+    if (perField === undefined) {
       perField = new Map();
       this._loading.set(id, perField);
     }
-    if (perField.has(d)) return perField.get(d);
+    const activeLoad = perField.get(dim);
+    if (activeLoad !== undefined) {
+      return activeLoad;
+    }
 
-    const showProgress = options.showProgress !== false;
-
-    const promise = (async () => {
-      // Ensure the dimension manager has computed the normalization scale for this dimension.
-      const positions3D = await this.dimensionManager.getPositions3D(d);
-      const cellCount = Math.floor((positions3D?.length || 0) / 3);
-      if (cellCount <= 0) {
-        throw new Error('VectorFieldManager.loadField: positions not loaded');
-      }
-
-      const transform = typeof this.dimensionManager.getNormTransform === 'function'
-        ? this.dimensionManager.getNormTransform(d)
-        : null;
-      const scale = Number(transform?.scale) || 1;
-
-      /** @type {1|2|3} */
-      let components = (entry?.components && typeof entry.components === 'object')
-        ? (Number(entry.components[`${d}d`]) || Number(entry.components[String(d)]) || d)
-        : d;
-      components = (components === 1 || components === 2 || components === 3) ? components : d;
-
-      let vectors = null;
-
-      if (isAnnDataActive()) {
-        const adapter = getAnnDataAdapter();
-        if (!adapter || typeof adapter.getVectorField !== 'function') {
-          throw new Error('VectorFieldManager.loadField: active AnnData adapter does not support getVectorField()');
-        }
-        // Clone to avoid mutating adapter caches when applying DimensionManager scaling/sanitization.
-        vectors = new Float32Array(await adapter.getVectorField(id, d));
-        components = d;
-      } else {
-        const files = entry?.files || null;
-        const filename = files?.[`${d}d`] || files?.[String(d)] || null;
-        if (!filename) {
-          throw new Error(`VectorFieldManager.loadField: files missing entry for "${id}" ${d}d`);
-        }
-        const url = this.baseUrl.endsWith('/') ? `${this.baseUrl}${filename}` : `${this.baseUrl}/${filename}`;
-        vectors = await loadPointsBinary(url, {
-          showProgress,
-          displayName: `${d}D vector field`,
-          dimension: d
-        });
-      }
-
-      if (!(vectors instanceof Float32Array)) {
-        throw new Error('VectorFieldManager.loadField: expected Float32Array');
-      }
-      const expected = cellCount * components;
-      if (vectors.length !== expected) {
-        throw new Error(`VectorFieldManager.loadField: vectors length ${vectors.length} !== expected ${expected}`);
-      }
-
-      // Scale into the final render space (translation doesn't apply to vectors).
-      let maxMag = 0;
-      const stride = components;
-      if (scale !== 1) {
-        for (let i = 0; i < cellCount; i++) {
-          const base = i * stride;
-          let sumSq = 0;
-          for (let c = 0; c < stride; c++) {
-            const v = vectors[base + c];
-            const scaled = Number.isFinite(v) ? v * scale : 0;
-            vectors[base + c] = scaled;
-            sumSq += scaled * scaled;
-          }
-          const mag = Math.sqrt(sumSq);
-          if (mag > maxMag) maxMag = mag;
-        }
-      } else {
-        for (let i = 0; i < cellCount; i++) {
-          const base = i * stride;
-          let sumSq = 0;
-          for (let c = 0; c < stride; c++) {
-            const v = vectors[base + c];
-            const safe = Number.isFinite(v) ? v : 0;
-            if (!Number.isFinite(v)) vectors[base + c] = 0;
-            sumSq += safe * safe;
-          }
-          const mag = Math.sqrt(sumSq);
-          if (mag > maxMag) maxMag = mag;
-        }
-      }
-
-      if (!Number.isFinite(maxMag) || maxMag <= 0) maxMag = 1;
-
-      return {
-        vectors,
-        components,
-        cellCount,
-        maxMagnitude: maxMag
-      };
-    })();
-
-    perField.set(d, promise);
+    const promise = this._loadExactField(id, entry, dim, showProgress);
+    perField.set(dim, promise);
     try {
       return await promise;
     } finally {
-      perField.delete(d);
+      perField.delete(dim);
+      if (perField.size === 0) {
+        this._loading.delete(id);
+      }
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Internals
-  // ---------------------------------------------------------------------------
-
-  _ingestMetadata(meta) {
-    const fieldsObj = meta?.fields;
-    if (!fieldsObj || typeof fieldsObj !== 'object') return;
-
-    for (const [id, entry] of Object.entries(fieldsObj)) {
-      if (!id || !entry || typeof entry !== 'object') continue;
-
-      const dims = Array.isArray(entry.available_dimensions)
-        ? entry.available_dimensions.filter((d) => Number.isInteger(d) && d >= 1 && d <= 3)
-        : [];
-      if (dims.length === 0) continue;
-
-      this._fields.set(String(id), /** @type {VectorFieldEntry} */ (entry));
+  async _loadExactField(id, entry, dimension, showProgress) {
+    const positions3D = await this.dimensionManager.getPositions3D(dimension);
+    if (
+      !(positions3D instanceof Float32Array) ||
+      positions3D.length === 0 ||
+      positions3D.length % 3 !== 0
+    ) {
+      throw new Error(
+        'VectorFieldManager.loadField: getPositions3D() must return a non-empty Float32Array with three components per cell.'
+      );
     }
+    const cellCount = positions3D.length / 3;
 
-    const defaultField = meta?.default_field;
-    if (defaultField && this._fields.has(String(defaultField))) {
-      this._defaultField = String(defaultField);
+    const transform = this.dimensionManager.getNormTransform(dimension);
+    if (
+      !isPlainRecord(transform) ||
+      !Object.hasOwn(transform, 'scale') ||
+      typeof transform.scale !== 'number' ||
+      !Number.isFinite(transform.scale) ||
+      transform.scale <= 0
+    ) {
+      throw new Error(
+        `VectorFieldManager.loadField: ${dimension}D normalization scale must be a finite positive number.`
+      );
+    }
+    const scale = transform.scale;
+
+    let vectors;
+    if (Object.hasOwn(entry, 'obsm_keys')) {
+      const binding = getActiveAnnDataBinding(this.baseUrl);
+      if (typeof binding.adapter.getVectorField !== 'function') {
+        throw new Error(
+          'VectorFieldManager.loadField: the active AnnData adapter must provide getVectorField().'
+        );
+      }
+      const adapterVectors = await binding.adapter.getVectorField(
+        id,
+        dimension
+      );
+      const currentBinding = getActiveAnnDataBinding(this.baseUrl);
+      if (
+        currentBinding.adapter !== binding.adapter ||
+        currentBinding.source !== binding.source
+      ) {
+        throw new Error(
+          `VectorFieldManager.loadField: direct AnnData ownership changed while loading field "${id}".`
+        );
+      }
+      if (!(adapterVectors instanceof Float32Array)) {
+        throw new Error(
+          'VectorFieldManager.loadField: AnnData getVectorField() must return Float32Array.'
+        );
+      }
+      vectors = new Float32Array(adapterVectors);
     } else {
-      // Prefer velocity_umap if present, otherwise first by insertion order.
-      if (this._fields.has('velocity_umap')) this._defaultField = 'velocity_umap';
-      else this._defaultField = this._fields.size ? this._fields.keys().next().value : null;
+      const filename = entry.files[`${dimension}d`];
+      vectors = await loadPointsBinary(
+        resolveUrl(this.baseUrl, filename),
+        {
+          showProgress,
+          displayName: `${dimension}D vector field`,
+          dimension,
+          signal: null,
+          progressTrackerId: null,
+        }
+      );
     }
+
+    if (!(vectors instanceof Float32Array)) {
+      throw new Error(
+        'VectorFieldManager.loadField: vector payload must be Float32Array.'
+      );
+    }
+    const expectedLength = cellCount * dimension;
+    if (vectors.length !== expectedLength) {
+      throw new Error(
+        `VectorFieldManager.loadField: vectors length ${vectors.length} does not equal expected length ${expectedLength}.`
+      );
+    }
+
+    let maxMagnitude = 0;
+    for (let cellIndex = 0; cellIndex < cellCount; cellIndex++) {
+      const offset = cellIndex * dimension;
+      const scaledComponents = [];
+      for (let component = 0; component < dimension; component++) {
+        const value = vectors[offset + component];
+        if (!Number.isFinite(value)) {
+          throw new Error(
+            `VectorFieldManager.loadField: field "${id}" contains a non-finite value at cell ${cellIndex}, component ${component}.`
+          );
+        }
+        vectors[offset + component] = value * scale;
+        const scaled = vectors[offset + component];
+        if (!Number.isFinite(scaled)) {
+          throw new Error(
+            `VectorFieldManager.loadField: scaling field "${id}" overflowed at cell ${cellIndex}, component ${component}.`
+          );
+        }
+        scaledComponents.push(scaled);
+      }
+      const magnitude = Math.hypot(...scaledComponents);
+      if (!Number.isFinite(magnitude)) {
+        throw new Error(
+          `VectorFieldManager.loadField: field "${id}" produced a non-finite magnitude at cell ${cellIndex}.`
+        );
+      }
+      if (magnitude > maxMagnitude) {
+        maxMagnitude = magnitude;
+      }
+    }
+
+    return Object.freeze({
+      vectors,
+      components: dimension,
+      cellCount,
+      maxMagnitude,
+    });
   }
 }

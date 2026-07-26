@@ -22,6 +22,9 @@ import {
  */
 export class GPUNoiseGenerator {
   constructor(gl) {
+    if (!gl || typeof gl !== 'object') {
+      throw new TypeError('GPUNoiseGenerator requires a WebGL2 rendering context.');
+    }
     this.gl = gl;
     this.programs = {};
     this.quadVAO = null;
@@ -34,13 +37,16 @@ export class GPUNoiseGenerator {
   _compileShader(source, type) {
     const gl = this.gl;
     const shader = gl.createShader(type);
+    if (!shader) {
+      throw new Error('GPU noise shader allocation failed.');
+    }
     gl.shaderSource(shader, source);
     gl.compileShader(shader);
 
     if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-      console.error('Shader compile error:', gl.getShaderInfoLog(shader));
+      const log = gl.getShaderInfoLog(shader);
       gl.deleteShader(shader);
-      return null;
+      throw new Error(`GPU noise shader compilation failed: ${log}`);
     }
     return shader;
   }
@@ -50,17 +56,22 @@ export class GPUNoiseGenerator {
     const vs = this._compileShader(vsSource, gl.VERTEX_SHADER);
     const fs = this._compileShader(fsSource, gl.FRAGMENT_SHADER);
 
-    if (!vs || !fs) return null;
-
     const program = gl.createProgram();
+    if (!program) {
+      gl.deleteShader(vs);
+      gl.deleteShader(fs);
+      throw new Error('GPU noise program allocation failed.');
+    }
     gl.attachShader(program, vs);
     gl.attachShader(program, fs);
     gl.linkProgram(program);
 
     if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-      console.error('Program link error:', gl.getProgramInfoLog(program));
+      const log = gl.getProgramInfoLog(program);
       gl.deleteProgram(program);
-      return null;
+      gl.deleteShader(vs);
+      gl.deleteShader(fs);
+      throw new Error(`GPU noise program linking failed: ${log}`);
     }
 
     gl.deleteShader(vs);
@@ -78,18 +89,20 @@ export class GPUNoiseGenerator {
 
     this.uniforms = {};
 
-    if (this.programs.shape) {
-      this.uniforms.shape = {
-        slice: gl.getUniformLocation(this.programs.shape, 'u_slice'),
-        size: gl.getUniformLocation(this.programs.shape, 'u_size')
-      };
-    }
-
-    if (this.programs.detail) {
-      this.uniforms.detail = {
-        slice: gl.getUniformLocation(this.programs.detail, 'u_slice'),
-        size: gl.getUniformLocation(this.programs.detail, 'u_size')
-      };
+    this.uniforms.shape = {
+      slice: gl.getUniformLocation(this.programs.shape, 'u_slice')
+    };
+    this.uniforms.detail = {
+      slice: gl.getUniformLocation(this.programs.detail, 'u_slice')
+    };
+    for (const [name, uniforms] of Object.entries(this.uniforms)) {
+      for (const [uniformName, location] of Object.entries(uniforms)) {
+        if (location === null) {
+          throw new Error(
+            `GPU noise ${name} shader is missing required uniform ${uniformName}.`
+          );
+        }
+      }
     }
   }
 
@@ -106,6 +119,9 @@ export class GPUNoiseGenerator {
 
     this.quadVAO = gl.createVertexArray();
     this.quadVBO = gl.createBuffer();
+    if (!this.quadVAO || !this.quadVBO) {
+      throw new Error('GPU noise quad allocation failed.');
+    }
 
     gl.bindVertexArray(this.quadVAO);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.quadVBO);
@@ -113,13 +129,12 @@ export class GPUNoiseGenerator {
 
     // Setup attribute for all programs
     for (const prog of Object.values(this.programs)) {
-      if (prog) {
-        const loc = gl.getAttribLocation(prog, 'a_position');
-        if (loc >= 0) {
-          gl.enableVertexAttribArray(loc);
-          gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-        }
+      const loc = gl.getAttribLocation(prog, 'a_position');
+      if (loc < 0) {
+        throw new Error('GPU noise shader is missing required a_position input.');
       }
+      gl.enableVertexAttribArray(loc);
+      gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
     }
 
     gl.bindVertexArray(null);
@@ -134,6 +149,9 @@ export class GPUNoiseGenerator {
 
     // Create 3D texture
     const texture = gl.createTexture();
+    if (!texture) {
+      throw new Error('GPU noise 3D texture allocation failed.');
+    }
     gl.bindTexture(gl.TEXTURE_3D, texture);
 
     // Allocate 3D texture storage
@@ -145,6 +163,10 @@ export class GPUNoiseGenerator {
 
     // Create framebuffer for rendering
     const framebuffer = gl.createFramebuffer();
+    if (!framebuffer) {
+      gl.deleteTexture(texture);
+      throw new Error('GPU noise framebuffer allocation failed.');
+    }
     gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
 
     // Save current state
@@ -156,8 +178,6 @@ export class GPUNoiseGenerator {
     gl.useProgram(program);
     gl.bindVertexArray(this.quadVAO);
 
-    gl.uniform1f(uniforms.size, size);
-
     // Render each Z-slice
     for (let z = 0; z < size; z++) {
       // Attach current slice to framebuffer
@@ -165,8 +185,13 @@ export class GPUNoiseGenerator {
 
       // Check framebuffer status
       if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
-        console.error('Framebuffer incomplete for slice', z);
-        continue;
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.deleteFramebuffer(framebuffer);
+        gl.deleteTexture(texture);
+        gl.viewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+        gl.useProgram(prevProgram);
+        gl.bindVertexArray(null);
+        throw new Error(`GPU noise framebuffer is incomplete for slice ${z}.`);
       }
 
       // Set slice uniform (normalized 0-1)
@@ -210,17 +235,30 @@ export class GPUNoiseGenerator {
 
     // Create 2D texture
     const texture = gl.createTexture();
+    if (!texture) {
+      throw new Error('GPU blue-noise texture allocation failed.');
+    }
     gl.bindTexture(gl.TEXTURE_2D, texture);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG8, size, size, 0, gl.RG, gl.UNSIGNED_BYTE, null);
 
     // Create framebuffer
     const framebuffer = gl.createFramebuffer();
+    if (!framebuffer) {
+      gl.deleteTexture(texture);
+      throw new Error('GPU blue-noise framebuffer allocation failed.');
+    }
     gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
 
     // Save state
     const prevViewport = gl.getParameter(gl.VIEWPORT);
     const prevProgram = gl.getParameter(gl.CURRENT_PROGRAM);
+    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.deleteFramebuffer(framebuffer);
+      gl.deleteTexture(texture);
+      throw new Error('GPU blue-noise framebuffer is incomplete.');
+    }
 
     // Render
     gl.viewport(0, 0, size, size);
@@ -253,6 +291,16 @@ export class GPUNoiseGenerator {
    * Returns immediately with textures (synchronous, very fast)
    */
   generate(shapeSize = 128, detailSize = 32) {
+    for (const [name, value] of [
+      ['shapeSize', shapeSize],
+      ['detailSize', detailSize]
+    ]) {
+      if (!Number.isInteger(value) || value < 32 || value > 256) {
+        throw new RangeError(
+          `GPU noise ${name} must be an integer between 32 and 256.`
+        );
+      }
+    }
     console.log('=== Generating Cloud Noise Textures (GPU) ===');
     const totalStart = performance.now();
 
@@ -269,39 +317,24 @@ export class GPUNoiseGenerator {
     gl.disable(gl.CULL_FACE);
 
     // Generate shape noise (128³)
-    let shape = null;
-    if (this.programs.shape && this.uniforms.shape) {
-      console.log(`Generating shape noise (${shapeSize}³)...`);
-      shape = this._generate3DTexture(
-        this.programs.shape,
-        this.uniforms.shape,
-        shapeSize
-      );
-    } else {
-      console.error('Shape noise program not available');
-    }
+    console.log(`Generating shape noise (${shapeSize}³)...`);
+    const shape = this._generate3DTexture(
+      this.programs.shape,
+      this.uniforms.shape,
+      shapeSize
+    );
 
     // Generate detail noise (32³)
-    let detail = null;
-    if (this.programs.detail && this.uniforms.detail) {
-      console.log(`Generating detail noise (${detailSize}³)...`);
-      detail = this._generate3DTexture(
-        this.programs.detail,
-        this.uniforms.detail,
-        detailSize
-      );
-    } else {
-      console.error('Detail noise program not available');
-    }
+    console.log(`Generating detail noise (${detailSize}³)...`);
+    const detail = this._generate3DTexture(
+      this.programs.detail,
+      this.uniforms.detail,
+      detailSize
+    );
 
     // Generate blue noise (128²)
-    let blueNoiseResult = { texture: null, size: 128 };
-    if (this.programs.blueNoise) {
-      console.log('Generating blue noise (128²)...');
-      blueNoiseResult = this._generateBlueNoise();
-    } else {
-      console.error('Blue noise program not available');
-    }
+    console.log('Generating blue noise (128²)...');
+    const blueNoiseResult = this._generateBlueNoise();
 
     // Restore GL state
     if (prevDepthTest) gl.enable(gl.DEPTH_TEST);

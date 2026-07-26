@@ -17,29 +17,41 @@
  * - periodic renewals
  * - storage-event based lock-loss detection
  *
- * No backward compatibility is required (dev phase).
+ * Lock records use only the exact current storage contract.
  */
 
 import { EventEmitter } from '../utils/event-emitter.js';
+import { parseExactJson } from './wire-contract.js';
 
 const TAB_ID_KEY = 'cellucid:community-annotations:tab-id:v1';
 const LOCK_PREFIX = 'cellucid:community-annotations:lock:';
-const BROADCAST_CHANNEL = 'cellucid:community-annotations:scope-lock:v1';
 
-// More tolerant defaults: background timer throttling should not cause spurious lock loss.
 const DEFAULT_LEASE_MS = 60_000;
 const DEFAULT_RENEW_MS = 15_000;
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const UTC_INSTANT_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
-function toCleanString(value) {
-  return String(value ?? '').trim();
+function assertExactString(value, label, { max = 2048 } = {}) {
+  if (
+    typeof value !== 'string' ||
+    !value ||
+    /^\s|\s$/.test(value) ||
+    Array.from(value).length > max
+  ) {
+    throw new Error(`${label} must be an exact nonblank string`);
+  }
+  return value;
 }
 
-function safeJsonParse(text) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
+function storageFailure(storageName, operation, cause) {
+  const error = new Error(
+    `${storageName} ${operation} failed for the annotation scope lock`
+  );
+  error.code = 'LOCK_STORAGE_FAILED';
+  error.cause = cause;
+  return error;
 }
 
 function nowMs() {
@@ -47,70 +59,84 @@ function nowMs() {
 }
 
 function nowIso() {
-  try {
-    return new Date().toISOString();
-  } catch {
-    return String(Date.now());
-  }
+  return new Date().toISOString();
 }
 
 function createTabId() {
-  try {
-    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-      return crypto.randomUUID();
-    }
-  } catch {
-    // ignore
+  if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
+    const error = new Error(
+      'crypto.randomUUID is required for exact cross-tab annotation locking'
+    );
+    error.code = 'LOCK_PLATFORM_UNAVAILABLE';
+    throw error;
   }
-  return `tab_${Math.random().toString(36).slice(2)}_${Date.now().toString(36)}`;
+  const id = crypto.randomUUID();
+  if (!UUID_PATTERN.test(id)) {
+    const error = new Error('crypto.randomUUID returned an invalid UUID');
+    error.code = 'LOCK_PLATFORM_INVALID';
+    throw error;
+  }
+  return id;
 }
 
 function readSessionItem(key) {
   try {
+    if (typeof sessionStorage === 'undefined') {
+      throw new Error('sessionStorage is unavailable');
+    }
     return sessionStorage.getItem(key);
-  } catch {
-    return null;
+  } catch (cause) {
+    throw storageFailure('sessionStorage', 'read', cause);
   }
 }
 
 function writeSessionItem(key, value) {
   try {
+    if (typeof sessionStorage === 'undefined') {
+      throw new Error('sessionStorage is unavailable');
+    }
     sessionStorage.setItem(key, value);
-    return true;
-  } catch {
-    return false;
+  } catch (cause) {
+    throw storageFailure('sessionStorage', 'write', cause);
   }
 }
 
 function readLocalItem(key) {
   try {
+    if (typeof localStorage === 'undefined') {
+      throw new Error('localStorage is unavailable');
+    }
     return localStorage.getItem(key);
-  } catch {
-    return null;
+  } catch (cause) {
+    throw storageFailure('localStorage', 'read', cause);
   }
 }
 
 function writeLocalItem(key, value) {
   try {
+    if (typeof localStorage === 'undefined') {
+      throw new Error('localStorage is unavailable');
+    }
     localStorage.setItem(key, value);
-    return true;
-  } catch {
-    return false;
+  } catch (cause) {
+    throw storageFailure('localStorage', 'write', cause);
   }
 }
 
 function removeLocalItem(key) {
   try {
+    if (typeof localStorage === 'undefined') {
+      throw new Error('localStorage is unavailable');
+    }
     localStorage.removeItem(key);
-    return true;
-  } catch {
-    return false;
+  } catch (cause) {
+    throw storageFailure('localStorage', 'remove', cause);
   }
 }
 
 function normalizeScopeKey(scopeKey) {
-  const key = toCleanString(scopeKey);
-  return key ? key : null;
+  if (scopeKey === null || scopeKey === undefined || scopeKey === '') return null;
+  return assertExactString(scopeKey, 'Annotation lock scope key', { max: 4096 });
 }
 
 function lockStorageKey(scopeKey) {
@@ -118,13 +144,43 @@ function lockStorageKey(scopeKey) {
 }
 
 function parseLockRecord(raw) {
-  const parsed = raw ? safeJsonParse(raw) : null;
-  if (!parsed || typeof parsed !== 'object') return null;
-  const owner = toCleanString(parsed.owner);
-  const acquiredAt = toCleanString(parsed.acquiredAt);
-  const expiresAtMs = Number(parsed.expiresAtMs);
-  if (!owner || !Number.isFinite(expiresAtMs)) return null;
-  return { owner, acquiredAt: acquiredAt || null, expiresAtMs };
+  if (raw === null) return null;
+  if (typeof raw !== 'string' || raw === '') {
+    throw new Error('Annotation scope lock record must be nonempty JSON text');
+  }
+  const parsed = parseExactJson(raw, { path: 'annotation scope lock record' });
+  if (
+    !parsed ||
+    typeof parsed !== 'object' ||
+    Array.isArray(parsed) ||
+    Object.keys(parsed).length !== 3 ||
+    !Object.hasOwn(parsed, 'owner') ||
+    !Object.hasOwn(parsed, 'acquiredAt') ||
+    !Object.hasOwn(parsed, 'expiresAtMs')
+  ) {
+    throw new Error(
+      'Annotation scope lock record must contain exactly owner, acquiredAt, and expiresAtMs'
+    );
+  }
+  const owner = assertExactString(parsed.owner, 'Annotation lock owner', { max: 36 });
+  if (!UUID_PATTERN.test(owner)) {
+    throw new Error('Annotation lock owner must be an exact UUID');
+  }
+  const acquiredAt = assertExactString(
+    parsed.acquiredAt,
+    'Annotation lock acquisition time',
+    { max: 24 }
+  );
+  if (
+    !UTC_INSTANT_PATTERN.test(acquiredAt) ||
+    new Date(acquiredAt).toISOString() !== acquiredAt
+  ) {
+    throw new Error('Annotation lock acquisition time must be an exact UTC instant');
+  }
+  if (!Number.isSafeInteger(parsed.expiresAtMs) || parsed.expiresAtMs < 1) {
+    throw new Error('Annotation lock expiry must be a positive safe integer');
+  }
+  return { owner, acquiredAt, expiresAtMs: parsed.expiresAtMs };
 }
 
 function isExpired(rec, now) {
@@ -135,23 +191,37 @@ function isExpired(rec, now) {
 export class CommunityAnnotationScopeLock extends EventEmitter {
   constructor({ leaseMs = DEFAULT_LEASE_MS, renewMs = DEFAULT_RENEW_MS } = {}) {
     super();
+    if (!Number.isSafeInteger(leaseMs) || leaseMs < 8_000) {
+      throw new Error('Annotation lock leaseMs must be a safe integer of at least 8000');
+    }
+    if (
+      !Number.isSafeInteger(renewMs) ||
+      renewMs < 2_000 ||
+      renewMs > leaseMs - 1_000
+    ) {
+      throw new Error(
+        'Annotation lock renewMs must be a safe integer from 2000 through leaseMs - 1000'
+      );
+    }
     this._tabId = null;
     this._scopeKey = null;
     this._lockKey = null;
-    this._leaseMs = Math.max(8_000, Math.floor(Number(leaseMs) || DEFAULT_LEASE_MS));
-    this._renewMs = Math.max(2_000, Math.min(this._leaseMs - 1_000, Math.floor(Number(renewMs) || DEFAULT_RENEW_MS)));
+    this._leaseMs = leaseMs;
+    this._renewMs = renewMs;
     this._renewTimer = null;
     this._renewTick = null;
     this._visibilityListener = null;
     this._storageListener = null;
-    this._bc = null;
-    this._bcListener = null;
   }
 
   getTabId() {
     if (this._tabId) return this._tabId;
-    const existing = toCleanString(readSessionItem(TAB_ID_KEY) || '');
-    if (existing) {
+    const stored = readSessionItem(TAB_ID_KEY);
+    if (stored !== null) {
+      const existing = assertExactString(stored, 'Annotation tab id', { max: 36 });
+      if (!UUID_PATTERN.test(existing)) {
+        throw new Error('Stored annotation tab id must be an exact UUID');
+      }
       this._tabId = existing;
       return existing;
     }
@@ -167,25 +237,29 @@ export class CommunityAnnotationScopeLock extends EventEmitter {
 
   isHolding(scopeKey) {
     const key = normalizeScopeKey(scopeKey);
-    return Boolean(key && this._scopeKey && key === this._scopeKey);
+    if (!key || !this._scopeKey || key !== this._scopeKey || !this._lockKey) {
+      return false;
+    }
+    const current = parseLockRecord(readLocalItem(this._lockKey));
+    return Boolean(
+      current &&
+      current.owner === this.getTabId() &&
+      !isExpired(current, nowMs())
+    );
   }
 
   release() {
     const key = this._lockKey;
     const scopeKey = this._scopeKey;
-    const tabId = this.getTabId();
-    if (key && scopeKey) {
-      this._broadcast({ type: 'lock-released', scopeKey, owner: tabId, at: nowIso() });
-    }
+    const tabId = key && scopeKey ? this.getTabId() : null;
     this._stopRenew();
     this._detachStorageListener();
-    this._detachBroadcastChannel();
     this._lockKey = null;
     this._scopeKey = null;
 
     if (!key || !scopeKey) return { released: true };
 
-    const existing = parseLockRecord(readLocalItem(key) || '');
+    const existing = parseLockRecord(readLocalItem(key));
     if (existing && existing.owner === tabId) {
       removeLocalItem(key);
     }
@@ -193,12 +267,31 @@ export class CommunityAnnotationScopeLock extends EventEmitter {
   }
 
   setScopeKey(scopeKey) {
-    const nextScopeKey = normalizeScopeKey(scopeKey);
-    if (nextScopeKey === this._scopeKey) return { ok: true, scopeKey: nextScopeKey };
-
-    this.release();
-    if (!nextScopeKey) return { ok: true, scopeKey: null };
-    return this._acquire(nextScopeKey);
+    let nextScopeKey;
+    try {
+      nextScopeKey = normalizeScopeKey(scopeKey);
+      if (nextScopeKey === this._scopeKey) {
+        try {
+          if (nextScopeKey === null || this.isHolding(nextScopeKey)) {
+            return { ok: true, scopeKey: nextScopeKey };
+          }
+        } catch (cause) {
+          this.release();
+          throw cause;
+        }
+      }
+      this.release();
+      if (!nextScopeKey) return { ok: true, scopeKey: null };
+      return this._acquire(nextScopeKey);
+    } catch (cause) {
+      return {
+        ok: false,
+        code: cause?.code || 'LOCK_RECORD_INVALID',
+        scopeKey: nextScopeKey ?? null,
+        message: `Unable to establish the exact annotation scope lock: ${cause?.message || cause}`,
+        cause,
+      };
+    }
   }
 
   _acquire(scopeKey) {
@@ -206,18 +299,18 @@ export class CommunityAnnotationScopeLock extends EventEmitter {
     const key = lockStorageKey(scopeKey);
     const now = nowMs();
 
-    const existing = parseLockRecord(readLocalItem(key) || '');
+    const existing = parseLockRecord(readLocalItem(key));
     if (existing && !isExpired(existing, now) && existing.owner !== tabId) {
       return {
         ok: false,
         code: 'LOCK_HELD',
         scopeKey,
-        message:
+          message:
           'Another browser tab/window is already connected to this annotation project.\n' +
           'To prevent accidental overwrites, this tab cannot connect.\n\n' +
-          `Lock acquired: ${existing.acquiredAt || 'unknown'}\n` +
-          `Try again in ~${Math.max(1, Math.round((existing.expiresAtMs - now) / 1000))}s, or close the other tab/window.\n\n` +
-          'Tip: if you can’t find it, close other Cellucid tabs/windows for this site and retry.',
+          `Lock acquired: ${existing.acquiredAt}\n` +
+          `Lease remaining: ~${Math.max(1, Math.round((existing.expiresAtMs - now) / 1000))}s.\n\n` +
+          'Close the other Cellucid tab/window before starting a new connection.',
         holder: existing
       };
     }
@@ -228,20 +321,8 @@ export class CommunityAnnotationScopeLock extends EventEmitter {
       expiresAtMs: now + this._leaseMs
     };
 
-    const wrote = writeLocalItem(key, JSON.stringify(record));
-    if (!wrote) {
-      return {
-        ok: false,
-        code: 'LOCK_STORAGE_FAILED',
-        scopeKey,
-        message:
-          'Unable to access localStorage for cross-tab safety locking.\n' +
-          'This is required to prevent silent annotation data loss.\n\n' +
-          'Fix: disable private browsing restrictions or allow site storage, then retry.'
-      };
-    }
-
-    const confirmed = parseLockRecord(readLocalItem(key) || '');
+    writeLocalItem(key, JSON.stringify(record));
+    const confirmed = parseLockRecord(readLocalItem(key));
     if (!confirmed || confirmed.owner !== tabId || isExpired(confirmed, nowMs())) {
       return {
         ok: false,
@@ -249,65 +330,68 @@ export class CommunityAnnotationScopeLock extends EventEmitter {
         scopeKey,
         message:
           'Failed to acquire the cross-tab lock for this annotation project.\n' +
-          'Another tab likely raced and won the lock. Please close other tabs and retry.'
+          'Another tab acquired it first. Close the other tab before starting a new connection.'
       };
     }
 
     this._scopeKey = scopeKey;
     this._lockKey = key;
     this._attachStorageListener();
-    this._attachBroadcastChannel();
     this._startRenew();
+    if (!this.isHolding(scopeKey)) {
+      return {
+        ok: false,
+        code: 'LOCK_VERIFY_FAILED',
+        scopeKey,
+        message: 'The annotation scope lock was lost during renewal setup',
+      };
+    }
     this._installUnloadRelease();
-    this._broadcast({ type: 'lock-acquired', scopeKey, owner: tabId, at: nowIso() });
 
     return { ok: true, scopeKey };
   }
 
   _installUnloadRelease() {
-    try {
-      if (typeof window === 'undefined') return;
-      // Best-effort release on tab close/navigation.
-      window.addEventListener('pagehide', () => this.release(), { once: true });
-    } catch {
-      // ignore
-    }
+    if (typeof window === 'undefined') return;
+    window.addEventListener('pagehide', () => this.release(), { once: true });
   }
 
   _startRenew() {
     if (this._renewTimer) return;
     const tick = () => {
       if (!this._scopeKey || !this._lockKey) return;
-      const tabId = this.getTabId();
-      const now = nowMs();
-      const current = parseLockRecord(readLocalItem(this._lockKey) || '');
+      try {
+        const tabId = this.getTabId();
+        const now = nowMs();
+        const current = parseLockRecord(readLocalItem(this._lockKey));
 
-      if (!current || current.owner !== tabId || isExpired(current, now)) {
-        this._handleLockLost('Lock expired or was taken by another tab.');
-        return;
-      }
+        if (!current || current.owner !== tabId || isExpired(current, now)) {
+          this._handleLockLost('Lock expired or was taken by another tab.');
+          return;
+        }
 
-      const next = {
-        owner: tabId,
-        acquiredAt: current.acquiredAt || nowIso(),
-        expiresAtMs: now + this._leaseMs
-      };
-      const wrote = writeLocalItem(this._lockKey, JSON.stringify(next));
-      if (!wrote) {
-        this._handleLockLost('Unable to renew the cross-tab lock (localStorage write failed).');
+        const next = {
+          owner: tabId,
+          acquiredAt: current.acquiredAt,
+          expiresAtMs: now + this._leaseMs
+        };
+        writeLocalItem(this._lockKey, JSON.stringify(next));
+      } catch (cause) {
+        this._handleLockLost(
+          `Exact lock renewal failed: ${cause?.message || cause}`
+        );
       }
     };
 
     this._renewTick = tick;
     this._renewTimer = setInterval(tick, this._renewMs);
     this._attachVisibilityListener();
-    // Renew immediately to reduce chance of expiry under timer throttling.
-    try { tick(); } catch { /* ignore */ }
+    tick();
   }
 
   _stopRenew() {
     if (!this._renewTimer) return;
-    try { clearInterval(this._renewTimer); } catch { /* ignore */ }
+    clearInterval(this._renewTimer);
     this._renewTimer = null;
     this._renewTick = null;
     this._detachVisibilityListener();
@@ -317,143 +401,86 @@ export class CommunityAnnotationScopeLock extends EventEmitter {
     if (this._visibilityListener) return;
     if (typeof document === 'undefined') return;
     const onVisible = () => {
+      if (!this._renewTick) return;
+      if (document.visibilityState && document.visibilityState !== 'visible') return;
       try {
-        if (!this._renewTick) return;
-        if (document.visibilityState && document.visibilityState !== 'visible') return;
         this._renewTick();
-      } catch {
-        // ignore
+      } catch (cause) {
+        this._handleLockLost(
+          `Exact lock renewal failed after visibility change: ${cause?.message || cause}`
+        );
       }
     };
     this._visibilityListener = onVisible;
-    try { document.addEventListener('visibilitychange', onVisible); } catch { /* ignore */ }
-    try { window.addEventListener('focus', onVisible); } catch { /* ignore */ }
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', onVisible);
   }
 
   _detachVisibilityListener() {
     if (!this._visibilityListener) return;
-    try { document.removeEventListener('visibilitychange', this._visibilityListener); } catch { /* ignore */ }
-    try { window.removeEventListener('focus', this._visibilityListener); } catch { /* ignore */ }
+    document.removeEventListener('visibilitychange', this._visibilityListener);
+    window.removeEventListener('focus', this._visibilityListener);
     this._visibilityListener = null;
-  }
-
-  _attachBroadcastChannel() {
-    if (this._bc) return;
-    if (typeof BroadcastChannel === 'undefined') return;
-    try {
-      const bc = new BroadcastChannel(BROADCAST_CHANNEL);
-      const onMessage = (event) => {
-        try {
-          const data = event?.data;
-          if (!data || typeof data !== 'object') return;
-          const type = toCleanString(data.type);
-          if (type !== 'lock-acquired') return;
-          const scopeKey = toCleanString(data.scopeKey);
-          const owner = toCleanString(data.owner);
-          if (!scopeKey || !owner) return;
-          if (!this._scopeKey || !this._lockKey) return;
-          if (scopeKey !== this._scopeKey) return;
-          const tabId = this.getTabId();
-          if (owner === tabId) return;
-
-          // Double-check current localStorage record to avoid false positives from raced broadcasts.
-          const now = nowMs();
-          const current = parseLockRecord(readLocalItem(this._lockKey) || '');
-          if (current && !isExpired(current, now) && current.owner === tabId) return;
-
-          this._handleLockLost('Another tab acquired the cross-tab lock.');
-        } catch {
-          // ignore
-        }
-      };
-      bc.addEventListener('message', onMessage);
-      this._bc = bc;
-      this._bcListener = onMessage;
-    } catch {
-      this._bc = null;
-      this._bcListener = null;
-    }
-  }
-
-  _detachBroadcastChannel() {
-    if (!this._bc) return;
-    try {
-      if (this._bcListener) this._bc.removeEventListener('message', this._bcListener);
-    } catch {
-      // ignore
-    }
-    try {
-      this._bc.close();
-    } catch {
-      // ignore
-    } finally {
-      this._bc = null;
-      this._bcListener = null;
-    }
-  }
-
-  _broadcast(payload) {
-    if (!payload || typeof payload !== 'object') return;
-    if (!this._bc) return;
-    try {
-      this._bc.postMessage(payload);
-    } catch {
-      // ignore
-    }
   }
 
   _attachStorageListener() {
     if (this._storageListener) return;
     if (typeof window === 'undefined') return;
     const onStorage = (event) => {
+      if (!event) return;
+      if (!this._lockKey || !this._scopeKey) return;
+      if (event.key !== this._lockKey) return;
       try {
-        if (!event) return;
-        if (!this._lockKey || !this._scopeKey) return;
-        if (event.key !== this._lockKey) return;
         const tabId = this.getTabId();
         const now = nowMs();
-        const current = parseLockRecord(String(event.newValue || '')) || parseLockRecord(readLocalItem(this._lockKey) || '');
-        if (!current) return;
-        if (isExpired(current, now)) return;
-        if (current.owner !== tabId) {
-          this._handleLockLost('Another tab acquired the cross-tab lock.');
+        const current = event.newValue === null
+          ? parseLockRecord(readLocalItem(this._lockKey))
+          : parseLockRecord(event.newValue);
+        if (!current || isExpired(current, now) || current.owner !== tabId) {
+          this._handleLockLost(
+            'The authoritative localStorage lock record was removed, expired, or replaced.'
+          );
         }
-      } catch {
-        // ignore
+      } catch (cause) {
+        this._handleLockLost(
+          `The authoritative localStorage lock record is invalid: ${cause?.message || cause}`
+        );
       }
     };
     this._storageListener = onStorage;
-    try {
-      window.addEventListener('storage', onStorage);
-    } catch {
-      this._storageListener = null;
-    }
+    window.addEventListener('storage', onStorage);
   }
 
   _detachStorageListener() {
     if (!this._storageListener) return;
-    try {
-      if (typeof window !== 'undefined') {
-        window.removeEventListener('storage', this._storageListener);
-      }
-    } catch {
-      // ignore
-    } finally {
-      this._storageListener = null;
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('storage', this._storageListener);
     }
+    this._storageListener = null;
   }
 
   _handleLockLost(reason) {
+    const exactReason = assertExactString(reason, 'Annotation lock loss reason');
     const scopeKey = this._scopeKey;
-    this.release();
+    let cleanupError = null;
+    try {
+      this.release();
+    } catch (cause) {
+      cleanupError = cause;
+    }
     this.emit('lost', {
       scopeKey,
       code: 'LOCK_LOST',
       message:
         'This tab lost the cross-tab lock for the current annotation project.\n' +
         'To prevent accidental overwrites or silent data loss, the app must disconnect from the annotation repo.\n\n' +
-        `Reason: ${toCleanString(reason) || 'unknown'}\n\n` +
+        `Reason: ${exactReason}\n` +
+        (cleanupError
+          ? `Lock cleanup also failed: ${cleanupError?.message || cleanupError}\n`
+          : '') +
+        '\n' +
         'Fix: close other tabs/windows for this dataset/repo/user, then reconnect and Pull.',
+      cleanupError,
     });
   }
 }

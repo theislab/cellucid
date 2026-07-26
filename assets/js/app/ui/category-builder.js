@@ -17,16 +17,128 @@ import { StyleManager } from '../../utils/style-manager.js';
 import { getCategoryColor, rgbToCss } from '../../data/palettes.js';
 import { formatCellCount } from '../../data/data-source.js';
 import { Limits, OverlapStrategy } from '../utils/field-constants.js';
-import { makeUniqueLabel } from '../utils/label-utils.js';
 import { renderCategoryBuilderDom } from './category-builder/dom.js';
 import { formatIntersectionLabel, renderIntersectionLabelInputs } from './category-builder/intersections.js';
 
 const DROP_MIME = 'application/x-highlight-page';
+const STRATEGIES = new Set([
+  OverlapStrategy.FIRST,
+  OverlapStrategy.LAST,
+  OverlapStrategy.OVERLAP_LABEL,
+  OverlapStrategy.INTERSECTIONS
+]);
+
+function requireRecord(value, label) {
+  if (
+    value === null
+    || typeof value !== 'object'
+    || Array.isArray(value)
+  ) {
+    throw new TypeError(`${label} must be an object`);
+  }
+  return value;
+}
+
+function requireMethod(owner, methodName, label) {
+  requireRecord(owner, label);
+  if (typeof owner[methodName] !== 'function') {
+    throw new TypeError(`${label} must implement ${methodName}()`);
+  }
+}
+
+function requireIdentifier(value, label) {
+  if (
+    typeof value !== 'string'
+    || value.length === 0
+    || value !== value.trim()
+  ) {
+    throw new TypeError(`${label} must be a non-empty trimmed string`);
+  }
+  return value;
+}
+
+function requireCanonicalIndex(value, length, label) {
+  if (
+    typeof value !== 'string'
+    || !/^(0|[1-9][0-9]*)$/.test(value)
+  ) {
+    throw new TypeError(
+      `${label} must be a canonical non-negative integer`
+    );
+  }
+  const index = Number(value);
+  if (
+    !Number.isSafeInteger(index)
+    || index < 0
+    || index >= length
+  ) {
+    throw new RangeError(`${label} is outside its exact inventory`);
+  }
+  return index;
+}
+
+function requireCount(value, maximum, label) {
+  if (
+    !Number.isSafeInteger(value)
+    || value < 0
+    || value > maximum
+  ) {
+    throw new RangeError(
+      `${label} must be an integer between 0 and ${maximum}`
+    );
+  }
+  return value;
+}
+
+function requireCountDifference(total, used, label) {
+  requireCount(used, total, `${label} used count`);
+  return total - used;
+}
+
+function requireHexColor(value, label) {
+  if (
+    typeof value !== 'string'
+    || !/^#[0-9a-fA-F]{6}$/.test(value)
+  ) {
+    throw new TypeError(`${label} must be an exact six-digit hex color`);
+  }
+  return value;
+}
+
+function requireError(value, label) {
+  if (!(value instanceof Error)) {
+    throw new TypeError(`${label} must fail with an Error`);
+  }
+  if (typeof value.message !== 'string' || value.message.length === 0) {
+    throw new TypeError(`${label} Error must own a non-empty message`);
+  }
+  return value;
+}
+
+function cleanupAll(cleanups, message) {
+  const errors = [];
+  for (const cleanup of cleanups) {
+    try {
+      cleanup();
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) throw new AggregateError(errors, message);
+}
 
 export class CategoryBuilder {
   constructor(state, containerEl) {
     this._state = state;
     this._container = containerEl;
+    this._initialized = false;
+    this._unsubscribePageChanged = null;
+    this._lifecycle = null;
+    this._droppedItemsLifecycle = null;
+    this._intersectionInputsLifecycle = null;
+    this._document = null;
+    this._view = null;
 
     this._isOpen = false;
     this._droppedPages = []; // [{ pageId, label, originalName }]
@@ -38,52 +150,347 @@ export class CategoryBuilder {
   }
 
   init() {
-    if (!this._container) return;
-    this._render();
-    this._bind();
+    if (this._initialized) {
+      throw new Error('Category builder is already initialized');
+    }
+    if (this._container === null || typeof this._container !== 'object') {
+      throw new TypeError(
+        'Category builder requires one document-owned HTMLElement'
+      );
+    }
+    const ownerDocument = this._container.ownerDocument;
+    if (ownerDocument === null || ownerDocument === undefined) {
+      throw new TypeError(
+        'Category builder requires one document-owned HTMLElement'
+      );
+    }
+    const view = ownerDocument.defaultView;
+    if (
+      view === null
+      || view === undefined
+      || !(this._container instanceof view.HTMLElement)
+    ) {
+      throw new TypeError(
+        'Category builder requires one document-owned HTMLElement'
+      );
+    }
+    for (const methodName of [
+      'createCategoricalFromPages',
+      'getFields',
+      'getHighlightedCellCountForPage',
+      'getHighlightPageColor',
+      'on',
+      'setHighlightPageColor'
+    ]) {
+      requireMethod(this._state, methodName, 'Category builder state');
+    }
+    if (
+      !Number.isSafeInteger(this._state.pointCount)
+      || this._state.pointCount < 0
+    ) {
+      throw new TypeError(
+        'Category builder state requires a non-negative pointCount'
+      );
+    }
+    this._requirePageInventory();
 
-    // Keep colors/names/counts synced with global highlight page state.
-    this._state.on('page:changed', () => {
+    this._document = ownerDocument;
+    this._view = view;
+    this._lifecycle = new view.AbortController();
+    this._initialized = true;
+    let unsubscribe = null;
+    try {
+      this._render();
+      this._bind();
+      this._syncDatasetAvailability();
+
+      // Keep colors, names, and counts synchronized with page ownership.
+      unsubscribe = this._state.on('page:changed', () => {
+        this._assertInitialized();
+        this._syncDatasetAvailability();
+        this._reconcileDroppedPages();
+        this._previewKey = null;
+        this._renderDroppedItems();
+        this._updatePreview(true);
+        this._updateConfirmState();
+      });
+      if (typeof unsubscribe !== 'function') {
+        throw new TypeError(
+          'Category builder page subscription must return an unsubscribe function'
+        );
+      }
+      this._unsubscribePageChanged = unsubscribe;
+    } catch (error) {
+      const setupError = requireError(
+        error,
+        'Category builder initialization'
+      );
+      const cleanups = [];
+      if (typeof unsubscribe === 'function') {
+        cleanups.push(() => unsubscribe());
+      }
+      cleanups.push(
+        () => this._abortRenderLifecycles(),
+        () => this._lifecycle.abort(),
+        () => this._container.replaceChildren()
+      );
+      try {
+        cleanupAll(
+          cleanups,
+          'Category builder initialization cleanup failed'
+        );
+      } catch (cleanupError) {
+        this._resetLifecycleState();
+        throw new AggregateError(
+          [setupError, cleanupError],
+          'Category builder initialization and cleanup failed'
+        );
+      }
+      this._resetLifecycleState();
+      throw setupError;
+    }
+  }
+
+  _assertInitialized() {
+    if (
+      !this._initialized
+      || this._document === null
+      || this._view === null
+      || this._lifecycle === null
+    ) {
+      throw new Error('Category builder is not initialized');
+    }
+  }
+
+  _resetLifecycleState() {
+    this._initialized = false;
+    this._unsubscribePageChanged = null;
+    this._lifecycle = null;
+    this._droppedItemsLifecycle = null;
+    this._intersectionInputsLifecycle = null;
+    this._document = null;
+    this._view = null;
+    this._els = {};
+  }
+
+  _requirePageInventory() {
+    if (!Array.isArray(this._state.highlightPages)) {
+      throw new TypeError(
+        'Category builder state highlightPages must be an array'
+      );
+    }
+    const ids = new Set();
+    for (
+      let pageIndex = 0;
+      pageIndex < this._state.highlightPages.length;
+      pageIndex++
+    ) {
+      const page = requireRecord(
+        this._state.highlightPages[pageIndex],
+        `Highlight page ${pageIndex}`
+      );
+      const pageId = requireIdentifier(
+        page.id,
+        `Highlight page ${pageIndex} id`
+      );
+      requireIdentifier(
+        page.name,
+        `Highlight page ${pageIndex} name`
+      );
+      if (ids.has(pageId)) {
+        throw new Error(`Highlight page id "${pageId}" is duplicated`);
+      }
+      ids.add(pageId);
+      if (!Array.isArray(page.highlightedGroups)) {
+        throw new TypeError(
+          `Highlight page "${pageId}" highlightedGroups must be an array`
+        );
+      }
+    }
+    return this._state.highlightPages;
+  }
+
+  _getPage(pageId) {
+    requireIdentifier(pageId, 'Highlight page id');
+    const matches = this._requirePageInventory().filter(
+      page => page.id === pageId
+    );
+    if (matches.length !== 1) {
+      throw new Error(
+        `Highlight page "${pageId}" is not present exactly once`
+      );
+    }
+    return matches[0];
+  }
+
+  _reconcileDroppedPages() {
+    const pagesById = new Map(
+      this._requirePageInventory().map(page => [page.id, page])
+    );
+    this._droppedPages = this._droppedPages.flatMap(
+      (droppedPage, droppedIndex) => {
+        requireRecord(droppedPage, `Dropped page ${droppedIndex}`);
+        requireIdentifier(
+          droppedPage.pageId,
+          `Dropped page ${droppedIndex} id`
+        );
+        const page = pagesById.get(droppedPage.pageId);
+        if (page === undefined) return [];
+        if (typeof droppedPage.label !== 'string') {
+          throw new TypeError(
+            `Dropped page ${droppedIndex} label must be a string`
+          );
+        }
+        return [{
+          pageId: droppedPage.pageId,
+          label: droppedPage.label,
+          originalName: page.name
+        }];
+      }
+    );
+  }
+
+  _abortRenderLifecycles() {
+    if (this._droppedItemsLifecycle !== null) {
+      this._droppedItemsLifecycle.abort();
+      this._droppedItemsLifecycle = null;
+    }
+    if (this._intersectionInputsLifecycle !== null) {
+      this._intersectionInputsLifecycle.abort();
+      this._intersectionInputsLifecycle = null;
+    }
+  }
+
+  _clearIntersectionInputs() {
+    if (this._intersectionInputsLifecycle !== null) {
+      this._intersectionInputsLifecycle.abort();
+      this._intersectionInputsLifecycle = null;
+    }
+    this._els.intersectionList.replaceChildren();
+  }
+
+  _syncDatasetAvailability() {
+    this._assertInitialized();
+    if (
+      !Number.isSafeInteger(this._state.pointCount)
+      || this._state.pointCount < 0
+    ) {
+      throw new TypeError(
+        'Category builder state requires a non-negative pointCount'
+      );
+    }
+    const available = this._state.pointCount > 0;
+    this._els.toggle.disabled = !available;
+    this._els.toggle.setAttribute(
+      'aria-disabled',
+      available ? 'false' : 'true'
+    );
+    this._els.dropzone.setAttribute(
+      'aria-disabled',
+      available ? 'false' : 'true'
+    );
+    this._els.dropzone.classList.toggle('disabled', !available);
+    if (!available) {
+      this._droppedPages = [];
+      this._isOpen = false;
+      this._els.toggle.setAttribute('aria-expanded', 'false');
+      this._els.item.classList.remove('open');
       this._renderDroppedItems();
-      this._updatePreview();
-    });
+      this._updatePreview(true);
+    }
   }
 
   _render() {
+    this._assertInitialized();
     this._els = renderCategoryBuilderDom(this._container);
   }
 
   _bind() {
-    const { toggle, panel, item, dropzone, uncoveredLabel, overlapLabel, confirmBtn, cancelBtn } = this._els;
-    if (!toggle || !panel || !item || !dropzone) return;
+    this._assertInitialized();
+    const {
+      toggle,
+      panel,
+      item,
+      dropzone,
+      uncoveredLabel,
+      overlapLabel,
+      fieldName,
+      confirmBtn,
+      cancelBtn
+    } = this._els;
+    const signal = this._lifecycle.signal;
 
     toggle.addEventListener('click', () => {
       this._isOpen = !this._isOpen;
       toggle.setAttribute('aria-expanded', this._isOpen ? 'true' : 'false');
       item.classList.toggle('open', this._isOpen);
-    });
+    }, { signal });
 
     bindDropZone(dropzone, {
-      onDrop: (dt) => {
-        const pageId = dt.getData(DROP_MIME) || dt.getData('text/plain');
-        if (pageId) this._handlePageDrop(pageId);
+      onDrop: dataTransfer => {
+        const pageId = dataTransfer.getData(DROP_MIME);
+        if (pageId.length === 0) return;
+        this._handlePageDrop(pageId);
+      },
+      dragClass: 'dragover',
+      signal
+    });
+
+    uncoveredLabel.addEventListener('input', () => {
+      this._updatePreview(true);
+      this._updateConfirmState();
+    }, { signal });
+    overlapLabel.addEventListener('input', () => {
+      this._updatePreview(true);
+      this._updateConfirmState();
+    }, { signal });
+    fieldName.addEventListener(
+      'input',
+      () => this._updateConfirmState(),
+      { signal }
+    );
+    const radios = panel.querySelectorAll(
+      'input[name="overlap-strategy"]'
+    );
+    if (radios.length !== STRATEGIES.size) {
+      throw new Error(
+        'Category builder must render every overlap strategy exactly once'
+      );
+    }
+    radios.forEach(radio => {
+      if (!(radio instanceof this._view.HTMLInputElement)) {
+        throw new TypeError(
+          'Category builder overlap strategy controls must be inputs'
+        );
       }
+      radio.addEventListener('change', () => {
+        this._updatePreview(true);
+        this._updateConfirmState();
+      }, { signal });
     });
 
-    uncoveredLabel?.addEventListener('input', () => this._updatePreview());
-    overlapLabel?.addEventListener('input', () => this._updatePreview());
-    panel.querySelectorAll('input[name="overlap-strategy"]').forEach((radio) => {
-      radio.addEventListener('change', () => this._updatePreview());
-    });
-
-    confirmBtn?.addEventListener('click', () => this._handleConfirm());
-    cancelBtn?.addEventListener('click', () => this._handleCancel());
+    confirmBtn.addEventListener(
+      'click',
+      () => this._handleConfirm(),
+      { signal }
+    );
+    cancelBtn.addEventListener(
+      'click',
+      () => this._handleCancel(),
+      { signal }
+    );
   }
 
   _handlePageDrop(pageId) {
+    this._assertInitialized();
+    if (this._state.pointCount === 0) {
+      throw new Error(
+        'Category builder is disabled until a dataset is loaded'
+      );
+    }
+    requireIdentifier(pageId, 'Dropped highlight page id');
     if (this._droppedPages.some((p) => p.pageId === pageId)) return;
-    const page = this._state.highlightPages?.find?.((p) => p.id === pageId);
-    if (!page) return;
+    const page = this._getPage(pageId);
 
     this._droppedPages.push({
       pageId,
@@ -92,77 +499,110 @@ export class CategoryBuilder {
     });
 
     this._renderDroppedItems();
-    this._updatePreview();
+    this._updatePreview(true);
     this._updateConfirmState();
   }
 
   _renderDroppedItems() {
+    this._assertInitialized();
     const { items, placeholder } = this._els;
-    if (!items || !placeholder) return;
+    if (this._droppedItemsLifecycle !== null) {
+      this._droppedItemsLifecycle.abort();
+    }
+    this._droppedItemsLifecycle = new this._view.AbortController();
+    const signal = this._droppedItemsLifecycle.signal;
 
     if (this._droppedPages.length === 0) {
       placeholder.hidden = false;
-      items.innerHTML = '';
+      items.replaceChildren();
       return;
     }
 
     placeholder.hidden = true;
-    items.innerHTML = '';
+    const fragment = this._document.createDocumentFragment();
 
     this._droppedPages.forEach((p, idx) => {
-      const page = this._state.highlightPages?.find?.((hp) => hp.id === p.pageId) || null;
-      const pageColor = page?.color || this._state.getHighlightPageColor?.(p.pageId) || '#888888';
-      const pageCount = this._state.getHighlightedCellCountForPage?.(p.pageId) ?? 0;
+      requireRecord(p, `Dropped page ${idx}`);
+      const page = this._getPage(p.pageId);
+      if (typeof p.label !== 'string') {
+        throw new TypeError(
+          `Dropped page ${idx} label must be a string`
+        );
+      }
+      requireIdentifier(
+        p.originalName,
+        `Dropped page ${idx} original name`
+      );
+      const pageColor = requireHexColor(
+        this._state.getHighlightPageColor(p.pageId),
+        `Highlight page "${p.pageId}" color`
+      );
+      const pageCount = requireCount(
+        this._state.getHighlightedCellCountForPage(p.pageId),
+        this._state.pointCount,
+        `Highlight page "${p.pageId}" count`
+      );
 
-      const row = document.createElement('div');
+      const row = this._document.createElement('div');
       row.className = 'dropzone-item';
       row.draggable = true;
       row.dataset.idx = String(idx);
 
-      const colorIndicator = document.createElement('span');
+      const colorIndicator = this._document.createElement('span');
       colorIndicator.className = 'dropzone-item-color';
       StyleManager.setVariable(colorIndicator, '--dropzone-item-color', pageColor);
       colorIndicator.title = 'Click to change page color';
 
-      const colorInput = document.createElement('input');
+      const colorInput = this._document.createElement('input');
       colorInput.type = 'color';
       colorInput.className = 'dropzone-item-color-input';
       colorInput.value = pageColor;
       colorInput.title = 'Click to change page color';
-      colorInput.addEventListener('input', (e) => {
-        const newColor = e.target.value;
+      colorInput.addEventListener('input', () => {
+        const newColor = requireHexColor(
+          colorInput.value,
+          'Highlight page color input'
+        );
         StyleManager.setVariable(colorIndicator, '--dropzone-item-color', newColor);
-        this._state.setHighlightPageColor?.(p.pageId, newColor);
-      });
-      colorInput.addEventListener('click', (e) => e.stopPropagation());
+        this._state.setHighlightPageColor(p.pageId, newColor);
+      }, { signal });
+      colorInput.addEventListener(
+        'click',
+        event => event.stopPropagation(),
+        { signal }
+      );
       colorIndicator.appendChild(colorInput);
 
-      const handle = document.createElement('span');
+      const handle = this._document.createElement('span');
       handle.className = 'dropzone-item-handle';
       handle.title = 'Drag to reorder';
       handle.textContent = '⋮⋮';
 
-      const input = document.createElement('input');
+      const input = this._document.createElement('input');
       input.type = 'text';
       input.className = 'dropzone-item-label';
       input.value = p.label;
       input.dataset.idx = String(idx);
-      input.addEventListener('input', (e) => {
-        const i = parseInt(e.target.dataset.idx, 10);
-        if (Number.isNaN(i) || !this._droppedPages[i]) return;
-        this._droppedPages[i].label = e.target.value;
-        this._updatePreview();
-      });
+      input.addEventListener('input', () => {
+        const i = requireCanonicalIndex(
+          input.dataset.idx,
+          this._droppedPages.length,
+          'Dropped page label index'
+        );
+        this._droppedPages[i].label = input.value;
+        this._updatePreview(true);
+        this._updateConfirmState();
+      }, { signal });
 
-      const source = document.createElement('span');
+      const source = this._document.createElement('span');
       source.className = 'dropzone-item-source';
       source.textContent = `(${p.originalName})`;
 
-      const count = document.createElement('span');
+      const count = this._document.createElement('span');
       count.className = 'dropzone-item-count';
-      count.textContent = pageCount > 0 ? formatCellCount(pageCount) : '(0)';
+      count.textContent = `(${formatCellCount(pageCount)})`;
 
-      const remove = document.createElement('button');
+      const remove = this._document.createElement('button');
       remove.type = 'button';
       remove.className = 'dropzone-item-remove';
       remove.title = 'Remove';
@@ -170,9 +610,9 @@ export class CategoryBuilder {
       remove.addEventListener('click', () => {
         this._droppedPages.splice(idx, 1);
         this._renderDroppedItems();
-        this._updatePreview();
+        this._updatePreview(true);
         this._updateConfirmState();
-      });
+      }, { signal });
 
       row.appendChild(colorIndicator);
       row.appendChild(handle);
@@ -180,82 +620,166 @@ export class CategoryBuilder {
       row.appendChild(source);
       row.appendChild(count);
       row.appendChild(remove);
-      items.appendChild(row);
+      fragment.appendChild(row);
     });
 
+    items.replaceChildren(fragment);
     this._setupReordering(items);
   }
 
   _setupReordering(container) {
+    this._assertInitialized();
+    if (this._droppedItemsLifecycle === null) {
+      throw new Error(
+        'Category builder dropped-item lifecycle is unavailable'
+      );
+    }
+    const signal = this._droppedItemsLifecycle.signal;
     let draggedIdx = null;
 
     container.querySelectorAll('.dropzone-item').forEach((item) => {
       item.addEventListener('dragstart', (e) => {
-        draggedIdx = parseInt(item.dataset.idx, 10);
+        draggedIdx = requireCanonicalIndex(
+          item.dataset.idx,
+          this._droppedPages.length,
+          'Dragged page index'
+        );
         item.classList.add('dragging');
-        if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
-      });
+        if (e.dataTransfer === null) {
+          throw new TypeError('Page dragstart requires DataTransfer');
+        }
+        e.dataTransfer.effectAllowed = 'move';
+      }, { signal });
 
       item.addEventListener('dragend', () => {
         draggedIdx = null;
         item.classList.remove('dragging');
         container.querySelectorAll('.dropzone-item').forEach((el) => el.classList.remove('drag-over'));
-      });
+      }, { signal });
 
       item.addEventListener('dragover', (e) => {
         e.preventDefault();
-        if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
-      });
+        if (e.dataTransfer === null) {
+          throw new TypeError('Page dragover requires DataTransfer');
+        }
+        e.dataTransfer.dropEffect = 'move';
+      }, { signal });
 
       item.addEventListener('dragenter', () => {
-        const targetIdx = parseInt(item.dataset.idx, 10);
-        if (draggedIdx != null && draggedIdx !== targetIdx) item.classList.add('drag-over');
-      });
+        const targetIdx = requireCanonicalIndex(
+          item.dataset.idx,
+          this._droppedPages.length,
+          'Page drag target index'
+        );
+        if (draggedIdx !== null && draggedIdx !== targetIdx) {
+          item.classList.add('drag-over');
+        }
+      }, { signal });
 
-      item.addEventListener('dragleave', () => item.classList.remove('drag-over'));
+      item.addEventListener(
+        'dragleave',
+        () => item.classList.remove('drag-over'),
+        { signal }
+      );
 
       item.addEventListener('drop', (e) => {
         e.preventDefault();
         item.classList.remove('drag-over');
-        const targetIdx = parseInt(item.dataset.idx, 10);
-        if (draggedIdx == null || Number.isNaN(targetIdx) || draggedIdx === targetIdx) return;
+        const targetIdx = requireCanonicalIndex(
+          item.dataset.idx,
+          this._droppedPages.length,
+          'Page drop target index'
+        );
+        if (draggedIdx === null || draggedIdx === targetIdx) return;
 
         const [moved] = this._droppedPages.splice(draggedIdx, 1);
+        requireRecord(moved, 'Dragged page');
         this._droppedPages.splice(targetIdx, 0, moved);
+        draggedIdx = null;
         this._renderDroppedItems();
-        this._updatePreview();
-      });
+        this._updatePreview(true);
+        this._updateConfirmState();
+      }, { signal });
     });
   }
 
   _getOverlapStrategy() {
-    const radio = this._els.panel?.querySelector?.('input[name="overlap-strategy"]:checked');
-    const value = radio?.value;
-    if (value === OverlapStrategy.LAST) return OverlapStrategy.LAST;
-    if (value === OverlapStrategy.OVERLAP_LABEL) return OverlapStrategy.OVERLAP_LABEL;
-    if (value === OverlapStrategy.INTERSECTIONS) return OverlapStrategy.INTERSECTIONS;
-    return OverlapStrategy.FIRST;
+    this._assertInitialized();
+    const radio = this._els.panel.querySelector(
+      'input[name="overlap-strategy"]:checked'
+    );
+    if (!(radio instanceof this._view.HTMLInputElement)) {
+      throw new Error(
+        'Category builder requires one selected overlap strategy'
+      );
+    }
+    if (!STRATEGIES.has(radio.value)) {
+      throw new TypeError(
+        `Category builder overlap strategy "${radio.value}" is unsupported`
+      );
+    }
+    return radio.value;
   }
 
   _computePreview(overlapStrategy) {
-    const pointCount = this._state.pointCount || 0;
-    const strategy = overlapStrategy || OverlapStrategy.FIRST;
+    this._assertInitialized();
+    if (!STRATEGIES.has(overlapStrategy)) {
+      throw new TypeError(
+        `Category preview strategy "${overlapStrategy}" is unsupported`
+      );
+    }
+    const pointCount = this._state.pointCount;
+    if (!Number.isSafeInteger(pointCount) || pointCount < 1) {
+      throw new TypeError(
+        'Category preview requires a positive loaded pointCount'
+      );
+    }
+    const strategy = overlapStrategy;
     const pageCounts = new Array(this._droppedPages.length).fill(0);
 
     const buildCellSet = (pageId) => {
-      const page = this._state.highlightPages?.find?.((p) => p.id === pageId);
-      if (!page) return null;
+      const page = this._getPage(pageId);
       const cellSet = new Set();
-      for (const group of (page.highlightedGroups || [])) {
-        if (group.enabled === false) continue;
-        for (const idx of (group.cellIndices || [])) {
-          if (idx >= 0 && idx < pointCount) cellSet.add(idx);
+      for (
+        let groupIndex = 0;
+        groupIndex < page.highlightedGroups.length;
+        groupIndex++
+      ) {
+        const group = requireRecord(
+          page.highlightedGroups[groupIndex],
+          `Highlight page "${pageId}" group ${groupIndex}`
+        );
+        if (typeof group.enabled !== 'boolean') {
+          throw new TypeError(
+            `Highlight page "${pageId}" group ${groupIndex} requires exact enabled state`
+          );
+        }
+        if (
+          !Array.isArray(group.cellIndices)
+          && !(group.cellIndices instanceof Uint32Array)
+        ) {
+          throw new TypeError(
+            `Highlight page "${pageId}" group ${groupIndex} requires cell indices`
+          );
+        }
+        if (!group.enabled) continue;
+        for (const idx of group.cellIndices) {
+          if (
+            !Number.isSafeInteger(idx)
+            || idx < 0
+            || idx >= pointCount
+          ) {
+            throw new RangeError(
+              `Highlight page "${pageId}" group ${groupIndex} has an out-of-range cell index`
+            );
+          }
+          cellSet.add(idx);
         }
       }
       return cellSet;
     };
 
-    const isPowerOfTwo = (v) => v && (v & (v - 1)) === 0;
+    const isPowerOfTwo = v => v > 0 && (v & (v - 1)) === 0;
     const bitCount32 = (v) => {
       let x = v >>> 0;
       let c = 0;
@@ -267,13 +791,20 @@ export class CategoryBuilder {
     // Intersections: every overlap combination becomes a category
     // ────────────────────────────────────────────────────────────────────
     if (strategy === OverlapStrategy.INTERSECTIONS) {
+      if (this._droppedPages.length > Limits.MAX_INTERSECTION_PAGES) {
+        throw new RangeError(
+          `Each intersection supports at most ${Limits.MAX_INTERSECTION_PAGES} pages`
+        );
+      }
       const membershipByCell = new Map(); // cellIdx -> bitmask
       this._droppedPages.forEach((pageInfo, pageIndex) => {
         const cellSet = buildCellSet(pageInfo.pageId);
-        if (!cellSet) return;
         const bit = 1 << pageIndex;
         for (const idx of cellSet) {
-          membershipByCell.set(idx, (membershipByCell.get(idx) || 0) | bit);
+          const previous = membershipByCell.has(idx)
+            ? membershipByCell.get(idx)
+            : 0;
+          membershipByCell.set(idx, previous | bit);
         }
       });
 
@@ -285,15 +816,28 @@ export class CategoryBuilder {
           pageCounts[Math.log2(mask)] += 1;
         } else {
           overlapCount += 1;
-          intersectionCounts.set(mask, (intersectionCounts.get(mask) || 0) + 1);
+          const count = intersectionCounts.has(mask)
+            ? intersectionCounts.get(mask)
+            : 0;
+          intersectionCounts.set(mask, count + 1);
         }
       }
 
       const intersectionRows = [...intersectionCounts.entries()]
         .map(([mask, count]) => ({ mask, count }))
-        .sort((a, b) => bitCount32(a.mask) - bitCount32(b.mask) || a.mask - b.mask);
+        .sort((a, b) => {
+          const cardinality =
+            bitCount32(a.mask) - bitCount32(b.mask);
+          return cardinality === 0
+            ? a.mask - b.mask
+            : cardinality;
+        });
 
-      const uncoveredCount = Math.max(0, pointCount - membershipByCell.size);
+      const uncoveredCount = requireCountDifference(
+        pointCount,
+        membershipByCell.size,
+        'Intersection preview'
+      );
       return { overlapCount, uncoveredCount, pageCounts, intersectionRows };
     }
 
@@ -306,7 +850,6 @@ export class CategoryBuilder {
 
       this._droppedPages.forEach((pageInfo, catIndex) => {
         const cellSet = buildCellSet(pageInfo.pageId);
-        if (!cellSet) return;
 
         for (const idx of cellSet) {
           const prev = assigned.get(idx);
@@ -322,13 +865,25 @@ export class CategoryBuilder {
         }
       });
 
-      const uncoveredCount = Math.max(0, pointCount - assigned.size);
+      const uncoveredCount = requireCountDifference(
+        pointCount,
+        assigned.size,
+        'Overlap preview'
+      );
       return { overlapCount, uncoveredCount, pageCounts, overlapBucketCount: overlapCount, intersectionRows: [] };
     }
 
     // ────────────────────────────────────────────────────────────────────
     // First/last: overlaps assigned to first/last page in order
     // ────────────────────────────────────────────────────────────────────
+    if (
+      strategy !== OverlapStrategy.FIRST
+      && strategy !== OverlapStrategy.LAST
+    ) {
+      throw new TypeError(
+        `Category preview strategy "${strategy}" has no implementation`
+      );
+    }
     const assigned = new Map(); // cellIdx -> category index
     const overlapping = new Set();
 
@@ -350,15 +905,24 @@ export class CategoryBuilder {
 
     this._droppedPages.forEach((pageInfo, catIndex) => {
       const cellSet = buildCellSet(pageInfo.pageId);
-      if (!cellSet) return;
       for (const idx of cellSet) addCell(idx, catIndex);
     });
 
-    const uncoveredCount = Math.max(0, pointCount - assigned.size);
+    const uncoveredCount = requireCountDifference(
+      pointCount,
+      assigned.size,
+      'Ordered-overlap preview'
+    );
     return { overlapCount: overlapping.size, uncoveredCount, pageCounts, intersectionRows: [] };
   }
 
-  _updatePreview() {
+  _updatePreview(refreshIntersectionInputs) {
+    this._assertInitialized();
+    if (typeof refreshIntersectionInputs !== 'boolean') {
+      throw new TypeError(
+        'Category preview refreshIntersectionInputs must be exactly boolean'
+      );
+    }
     const {
       preview,
       conflictSection,
@@ -370,27 +934,39 @@ export class CategoryBuilder {
       uncoveredCount,
       uncoveredLabel
     } = this._els;
-    if (!preview || !conflictSection || !uncoveredSection) return;
 
     if (this._droppedPages.length === 0) {
-      preview.innerHTML = '';
+      preview.replaceChildren();
       conflictSection.hidden = true;
       uncoveredSection.hidden = true;
+      overlapLabelSection.hidden = true;
+      intersectionSection.hidden = true;
+      this._clearIntersectionInputs();
       this._preview = null;
       this._previewKey = null;
+      this._updateConfirmState();
       return;
     }
 
-    let strategy = this._getOverlapStrategy();
-    if (strategy === OverlapStrategy.INTERSECTIONS && this._droppedPages.length > Limits.MAX_INTERSECTION_PAGES) {
-      // Hard safety guard: intersections can explode combinatorially.
-      getNotificationCenter().warning(
-        `Intersections supports up to ${Limits.MAX_INTERSECTION_PAGES} pages`,
-        { category: 'highlight', duration: 3500 }
-      );
-      strategy = OverlapStrategy.FIRST;
-      const firstRadio = this._els.panel?.querySelector?.('input[name="overlap-strategy"][value="first"]');
-      if (firstRadio) firstRadio.checked = true;
+    const strategy = this._getOverlapStrategy();
+    if (
+      strategy === OverlapStrategy.INTERSECTIONS
+      && this._droppedPages.length > Limits.MAX_INTERSECTION_PAGES
+    ) {
+      const errorElement = this._document.createElement('div');
+      errorElement.className = 'analysis-error';
+      errorElement.textContent =
+        `Each intersection supports at most ${Limits.MAX_INTERSECTION_PAGES} pages.`;
+      preview.replaceChildren(errorElement);
+      conflictSection.hidden = true;
+      uncoveredSection.hidden = true;
+      overlapLabelSection.hidden = true;
+      intersectionSection.hidden = true;
+      this._clearIntersectionInputs();
+      this._preview = null;
+      this._previewKey = null;
+      this._updateConfirmState();
+      return;
     }
 
     const nextKey = `${strategy}:${this._droppedPages.map((p) => p.pageId).join('|')}`;
@@ -401,37 +977,66 @@ export class CategoryBuilder {
     }
 
     conflictSection.hidden = this._preview.overlapCount === 0;
-    if (!conflictSection.hidden && conflictText) {
+    if (!conflictSection.hidden) {
       conflictText.textContent = `${this._preview.overlapCount.toLocaleString()} cells appear in multiple pages`;
     }
 
     uncoveredSection.hidden = this._preview.uncoveredCount === 0;
-    if (!uncoveredSection.hidden && uncoveredCount) {
+    if (!uncoveredSection.hidden) {
       uncoveredCount.textContent = this._preview.uncoveredCount.toLocaleString();
     }
 
-    if (overlapLabelSection) {
-      overlapLabelSection.hidden = conflictSection.hidden || strategy !== OverlapStrategy.OVERLAP_LABEL;
-    }
-    if (intersectionSection) {
-      intersectionSection.hidden = conflictSection.hidden || strategy !== OverlapStrategy.INTERSECTIONS;
-    }
-    if (strategy === OverlapStrategy.INTERSECTIONS && !conflictSection.hidden && shouldRecompute) {
-      this._renderIntersectionLabelInputs(this._preview.intersectionRows || []);
+    overlapLabelSection.hidden =
+      conflictSection.hidden
+      || strategy !== OverlapStrategy.OVERLAP_LABEL;
+    const pageLabelError = this._getPageLabelValidationError();
+    intersectionSection.hidden =
+      conflictSection.hidden
+      || strategy !== OverlapStrategy.INTERSECTIONS
+      || pageLabelError !== null;
+    if (
+      strategy === OverlapStrategy.INTERSECTIONS
+      && !conflictSection.hidden
+      && pageLabelError === null
+    ) {
+      if (refreshIntersectionInputs) {
+        this._renderIntersectionLabelInputs(
+          this._preview.intersectionRows
+        );
+      }
+    } else {
+      this._clearIntersectionInputs();
     }
 
-    preview.innerHTML = '';
-
-    const categoriesWrap = document.createElement('div');
+    const categoriesWrap = this._document.createElement('div');
     categoriesWrap.className = 'preview-categories';
 
-    const usedLabels = [];
-
     const addPreviewRow = ({ labelText, countValue, colorIndex = null, uncovered = false }) => {
-      const item = document.createElement('div');
+      if (typeof labelText !== 'string') {
+        throw new TypeError('Preview category label must be a string');
+      }
+      requireCount(
+        countValue,
+        this._state.pointCount,
+        'Preview category count'
+      );
+      if (
+        colorIndex !== null
+        && (!Number.isSafeInteger(colorIndex) || colorIndex < 0)
+      ) {
+        throw new TypeError(
+          'Preview category color index must be null or non-negative'
+        );
+      }
+      if (typeof uncovered !== 'boolean') {
+        throw new TypeError(
+          'Preview uncovered state must be exactly boolean'
+        );
+      }
+      const item = this._document.createElement('div');
       item.className = uncovered ? 'preview-category uncovered' : 'preview-category';
 
-      const swatch = document.createElement('span');
+      const swatch = this._document.createElement('span');
       swatch.className = 'preview-swatch';
       if (uncovered) {
         StyleManager.setVariable(swatch, '--preview-swatch-color', 'var(--color-text-secondary)');
@@ -440,13 +1045,13 @@ export class CategoryBuilder {
         StyleManager.setVariable(swatch, '--preview-swatch-color', cssColor);
       }
 
-      const label = document.createElement('span');
+      const label = this._document.createElement('span');
       label.className = 'preview-label';
       label.textContent = labelText;
 
-      const count = document.createElement('span');
+      const count = this._document.createElement('span');
       count.className = 'preview-count';
-      count.textContent = (countValue || 0).toLocaleString();
+      count.textContent = countValue.toLocaleString();
 
       item.appendChild(swatch);
       item.appendChild(label);
@@ -454,137 +1059,403 @@ export class CategoryBuilder {
       categoriesWrap.appendChild(item);
     };
 
-    const pageLabels = this._droppedPages.map((p) => String(p.label || p.originalName || 'Category'));
-    this._droppedPages.forEach((p, i) => {
+    const pageLabels = this._droppedPages.map((page, pageIndex) => {
+      if (typeof page.label !== 'string') {
+        throw new TypeError(
+          `Dropped page ${pageIndex} label must be a string`
+        );
+      }
+      return page.label.trim();
+    });
+    this._droppedPages.forEach((_page, i) => {
       const labelText = pageLabels[i];
-      usedLabels.push(labelText);
-      addPreviewRow({ labelText, countValue: this._preview.pageCounts[i] || 0, colorIndex: i });
+      addPreviewRow({
+        labelText,
+        countValue: this._preview.pageCounts[i],
+        colorIndex: i
+      });
     });
 
     if (strategy === OverlapStrategy.OVERLAP_LABEL) {
-      const base = String(overlapLabel?.value || 'Overlap').trim() || 'Overlap';
-      const labelText = makeUniqueLabel(base, usedLabels);
-      usedLabels.push(labelText);
+      if (typeof overlapLabel.value !== 'string') {
+        throw new TypeError(
+          'Category builder overlap label input must be a string'
+        );
+      }
       addPreviewRow({
-        labelText,
-        countValue: this._preview.overlapCount || 0,
+        labelText: overlapLabel.value.trim(),
+        countValue: this._preview.overlapCount,
         colorIndex: this._droppedPages.length
       });
     }
 
-    if (strategy === OverlapStrategy.INTERSECTIONS) {
-      const rows = this._preview.intersectionRows || [];
+    if (
+      strategy === OverlapStrategy.INTERSECTIONS
+      && pageLabelError === null
+    ) {
+      const rows = this._preview.intersectionRows;
       rows.forEach((row, idx) => {
         const maskKey = String(row.mask);
-        const labelText = makeUniqueLabel(
-          String(this._intersectionLabels[maskKey] || this._formatIntersectionLabel(row.mask, pageLabels) || 'Overlap'),
-          usedLabels
-        );
-        usedLabels.push(labelText);
+        if (
+          !Object.hasOwn(this._intersectionLabels, maskKey)
+          || typeof this._intersectionLabels[maskKey] !== 'string'
+        ) {
+          throw new Error(
+            `Intersection label ${maskKey} is not initialized`
+          );
+        }
         addPreviewRow({
-          labelText,
+          labelText: this._intersectionLabels[maskKey].trim(),
           countValue: row.count,
           colorIndex: this._droppedPages.length + idx
         });
       });
     }
 
-    const uncoveredText = String(uncoveredLabel?.value || '').trim();
-    if (this._preview.uncoveredCount > 0 && uncoveredText) {
-      const labelText = makeUniqueLabel(uncoveredText, usedLabels);
-      usedLabels.push(labelText);
-      addPreviewRow({ labelText, countValue: this._preview.uncoveredCount, uncovered: true });
+    if (typeof uncoveredLabel.value !== 'string') {
+      throw new TypeError(
+        'Category builder uncovered label input must be a string'
+      );
+    }
+    const uncoveredText = uncoveredLabel.value.trim();
+    if (
+      this._preview.uncoveredCount > 0
+      && uncoveredText.length > 0
+    ) {
+      addPreviewRow({
+        labelText: uncoveredText,
+        countValue: this._preview.uncoveredCount,
+        uncovered: true
+      });
     }
 
-    const stats = document.createElement('div');
+    const stats = this._document.createElement('div');
     stats.className = 'preview-stats';
     stats.textContent = `Total: ${this._state.pointCount.toLocaleString()} cells | ${categoriesWrap.childElementCount} categories`;
 
-    preview.appendChild(categoriesWrap);
-    preview.appendChild(stats);
+    preview.replaceChildren(categoriesWrap, stats);
+    this._updateConfirmState();
   }
 
   _formatIntersectionLabel(mask, pageLabels) {
-    const labels = pageLabels || this._droppedPages.map((p) => String(p.label || p.originalName || 'Category'));
-    return formatIntersectionLabel(Number(mask) || 0, labels);
+    if (!Array.isArray(pageLabels)) {
+      throw new TypeError(
+        'Intersection page labels must be an array'
+      );
+    }
+    return formatIntersectionLabel(mask, pageLabels);
   }
 
   _renderIntersectionLabelInputs(rows) {
-    const pageLabels = this._droppedPages.map((p) => String(p.label || p.originalName || 'Category'));
-    renderIntersectionLabelInputs({
-      listEl: this._els.intersectionList,
-      rows,
-      pageLabels,
-      labelsByMask: this._intersectionLabels,
-      onLabelsChanged: () => this._updatePreview()
+    if (!Array.isArray(rows)) {
+      throw new TypeError('Intersection rows must be an array');
+    }
+    const pageLabels = this._droppedPages.map((page, pageIndex) => {
+      const label = requireIdentifier(
+        page.label.trim(),
+        `Dropped page ${pageIndex} label`
+      );
+      return label;
     });
-  }
-
-  _updateConfirmState() {
-    if (this._els.confirmBtn) {
-      this._els.confirmBtn.disabled = this._droppedPages.length === 0;
+    this._clearIntersectionInputs();
+    this._intersectionInputsLifecycle =
+      new this._view.AbortController();
+    try {
+      renderIntersectionLabelInputs({
+        listEl: this._els.intersectionList,
+        rows,
+        pageLabels,
+        labelsByMask: this._intersectionLabels,
+        onLabelsChanged: () => this._updatePreview(false),
+        signal: this._intersectionInputsLifecycle.signal
+      });
+    } catch (error) {
+      this._intersectionInputsLifecycle.abort();
+      this._intersectionInputsLifecycle = null;
+      throw error;
     }
   }
 
-  _handleConfirm() {
-    const fieldName = String(this._els.fieldName?.value || '').trim() || 'Custom Categories';
-    const uncoveredLabel = String(this._els.uncoveredLabel?.value || '').trim();
-    const overlapStrategy = this._getOverlapStrategy();
-    const overlapLabel = String(this._els.overlapLabel?.value || '').trim();
-    const intersectionLabels = overlapStrategy === OverlapStrategy.INTERSECTIONS
-      ? { ...this._intersectionLabels }
-      : undefined;
+  _getPageLabelValidationError() {
+    for (
+      let pageIndex = 0;
+      pageIndex < this._droppedPages.length;
+      pageIndex++
+    ) {
+      const label = this._droppedPages[pageIndex].label;
+      if (
+        typeof label !== 'string'
+        || label.length === 0
+        || label !== label.trim()
+        || label.length > Limits.MAX_CATEGORY_LABEL_LENGTH
+      ) {
+        return `Page ${pageIndex + 1} requires a valid non-empty trimmed label`;
+      }
+    }
+    return null;
+  }
 
+  _getDraftValidationError() {
+    this._assertInitialized();
+    if (
+      !Number.isSafeInteger(this._state.pointCount)
+      || this._state.pointCount < 0
+    ) {
+      throw new TypeError(
+        'Category builder state requires a non-negative pointCount'
+      );
+    }
+    if (this._state.pointCount === 0) {
+      return 'Load a dataset before creating a categorical field';
+    }
+    if (this._droppedPages.length === 0) {
+      return 'Add at least one highlight page';
+    }
+    if (this._preview === null) {
+      return 'Category preview is unavailable';
+    }
+    const fieldName = this._els.fieldName.value;
+    if (
+      typeof fieldName !== 'string'
+      || fieldName.length === 0
+      || fieldName !== fieldName.trim()
+      || fieldName.length > Limits.MAX_FIELD_KEY_LENGTH
+      || fieldName.includes(':')
+    ) {
+      return 'Column name must be a valid non-empty trimmed field name';
+    }
+    const fields = this._state.getFields();
+    if (!Array.isArray(fields)) {
+      throw new TypeError(
+        'Category builder state.getFields() must return an array'
+      );
+    }
+    for (let fieldIndex = 0; fieldIndex < fields.length; fieldIndex++) {
+      const field = requireRecord(
+        fields[fieldIndex],
+        `Observation field ${fieldIndex}`
+      );
+      if (
+        typeof field.key !== 'string'
+        || field.key.length === 0
+      ) {
+        throw new TypeError(
+          `Observation field ${fieldIndex} requires a field key`
+        );
+      }
+      if (field._isDeleted !== true && field.key === fieldName) {
+        return `A visible observation field named "${fieldName}" already exists`;
+      }
+    }
+
+    const pageLabelError = this._getPageLabelValidationError();
+    if (pageLabelError !== null) return pageLabelError;
+    const labels = this._droppedPages.map(page => page.label);
+
+    const strategy = this._getOverlapStrategy();
+    if (
+      strategy === OverlapStrategy.INTERSECTIONS
+      && this._droppedPages.length > Limits.MAX_INTERSECTION_PAGES
+    ) {
+      return `Each intersection supports at most ${Limits.MAX_INTERSECTION_PAGES} pages`;
+    }
+    const overlapLabel = this._els.overlapLabel.value;
+    if (
+      typeof overlapLabel !== 'string'
+      || overlapLabel !== overlapLabel.trim()
+    ) {
+      return 'Overlap label must be a trimmed string';
+    }
+    if (strategy === OverlapStrategy.OVERLAP_LABEL) {
+      if (
+        overlapLabel.length === 0
+        || overlapLabel.length > Limits.MAX_CATEGORY_LABEL_LENGTH
+      ) {
+        return 'Overlap strategy requires a valid non-empty label';
+      }
+      labels.push(overlapLabel);
+    }
+    if (strategy === OverlapStrategy.INTERSECTIONS) {
+      for (const row of this._preview.intersectionRows) {
+        const maskKey = String(row.mask);
+        const label = this._intersectionLabels[maskKey];
+        if (
+          typeof label !== 'string'
+          || label.length === 0
+          || label !== label.trim()
+          || label.length > Limits.MAX_CATEGORY_LABEL_LENGTH
+        ) {
+          return `Intersection ${maskKey} requires a valid non-empty trimmed label`;
+        }
+        labels.push(label);
+      }
+    }
+
+    const uncoveredLabel = this._els.uncoveredLabel.value;
+    if (
+      typeof uncoveredLabel !== 'string'
+      || uncoveredLabel !== uncoveredLabel.trim()
+      || uncoveredLabel.length > Limits.MAX_CATEGORY_LABEL_LENGTH
+    ) {
+      return 'Uncovered label must be a valid trimmed string';
+    }
+    if (
+      this._preview.uncoveredCount > 0
+      && uncoveredLabel.length > 0
+    ) {
+      labels.push(uncoveredLabel);
+    }
+    if (new Set(labels).size !== labels.length) {
+      return 'Every category label must be unique';
+    }
+    if (labels.length > Limits.MAX_CATEGORIES_PER_FIELD) {
+      return `A field supports at most ${Limits.MAX_CATEGORIES_PER_FIELD} categories`;
+    }
+    return null;
+  }
+
+  _buildDraft() {
+    const validationError = this._getDraftValidationError();
+    if (validationError !== null) {
+      throw new Error(validationError);
+    }
+    const overlapStrategy = this._getOverlapStrategy();
+    const intersectionLabels = {};
+    if (overlapStrategy === OverlapStrategy.INTERSECTIONS) {
+      for (const row of this._preview.intersectionRows) {
+        const maskKey = String(row.mask);
+        intersectionLabels[maskKey] =
+          this._intersectionLabels[maskKey];
+      }
+    }
+    return {
+      key: this._els.fieldName.value,
+      pages: this._droppedPages.map(page => ({
+        pageId: page.pageId,
+        label: page.label
+      })),
+      uncoveredLabel: this._els.uncoveredLabel.value,
+      overlapStrategy,
+      overlapLabel: this._els.overlapLabel.value,
+      intersectionLabels
+    };
+  }
+
+  _updateConfirmState() {
+    this._assertInitialized();
+    const validationError = this._getDraftValidationError();
+    this._els.confirmBtn.disabled = validationError !== null;
+    this._els.validation.hidden = validationError === null;
+    this._els.validation.textContent =
+      validationError === null ? '' : validationError;
+  }
+
+  _handleConfirm() {
+    this._assertInitialized();
     const notifyId = getNotificationCenter().loading('Creating categorical...', { category: 'data' });
 
     try {
-      if (overlapStrategy === OverlapStrategy.INTERSECTIONS && this._droppedPages.length > Limits.MAX_INTERSECTION_PAGES) {
-        throw new Error(`Intersections supports up to ${Limits.MAX_INTERSECTION_PAGES} pages`);
-      }
-
-      const result = this._state.createCategoricalFromPages({
-        key: fieldName,
-        pages: this._droppedPages.map((p) => ({ pageId: p.pageId, label: String(p.label || '').trim() })),
-        uncoveredLabel,
-        overlapStrategy,
-        overlapLabel,
-        intersectionLabels
-      });
-
-      if (result?.field) {
-        getNotificationCenter().complete(
-          notifyId,
-          `Created "${fieldName}" (${result.field.categories.length} categories)`
+      const draft = this._buildDraft();
+      const result = requireRecord(
+        this._state.createCategoricalFromPages(draft),
+        'Create categorical result'
+      );
+      if (
+        typeof result.id !== 'string'
+        || result.id.length === 0
+        || result.field === null
+        || typeof result.field !== 'object'
+        || !Array.isArray(result.field.categories)
+        || result.field.categories.length === 0
+        || !Number.isSafeInteger(result.conflicts)
+        || result.conflicts < 0
+        || !Number.isSafeInteger(result.uncoveredCount)
+        || result.uncoveredCount < 0
+      ) {
+        throw new TypeError(
+          'Create categorical result does not match the exact current schema'
         );
-        this._handleCancel();
-      } else {
-        getNotificationCenter().fail(notifyId, 'Failed to create categorical');
       }
-    } catch (err) {
-      getNotificationCenter().fail(notifyId, err?.message || 'Failed to create categorical');
+      getNotificationCenter().complete(
+        notifyId,
+        `Created "${draft.key}" (${result.field.categories.length} categories)`
+      );
+      this._handleCancel();
+    } catch (error) {
+      const exactError = requireError(
+        error,
+        'Create categorical action'
+      );
+      console.error(exactError);
+      getNotificationCenter().fail(notifyId, exactError.message);
     }
   }
 
   _handleCancel() {
+    this._assertInitialized();
     this._droppedPages = [];
     this._preview = null;
     this._previewKey = null;
     this._intersectionLabels = {};
 
-    if (this._els.fieldName) this._els.fieldName.value = '';
-    if (this._els.uncoveredLabel) this._els.uncoveredLabel.value = 'Unassigned';
-    if (this._els.overlapLabel) this._els.overlapLabel.value = 'Overlap';
-    if (this._els.intersectionList) this._els.intersectionList.innerHTML = '';
-    const first = this._els.panel?.querySelector?.('input[name="overlap-strategy"][value="first"]');
-    if (first) first.checked = true;
+    this._els.fieldName.value = '';
+    this._els.uncoveredLabel.value = 'Unassigned';
+    this._els.overlapLabel.value = 'Overlap';
+    this._clearIntersectionInputs();
+    const first = this._els.panel.querySelector(
+      'input[name="overlap-strategy"][value="first"]'
+    );
+    if (!(first instanceof this._view.HTMLInputElement)) {
+      throw new Error(
+        'Category builder first-page strategy control is missing'
+      );
+    }
+    first.checked = true;
 
     this._renderDroppedItems();
-    this._updatePreview();
+    this._updatePreview(true);
     this._updateConfirmState();
 
     // Collapse panel
     this._isOpen = false;
-    this._els.toggle?.setAttribute('aria-expanded', 'false');
-    this._els.item?.classList.remove('open');
+    this._els.toggle.setAttribute('aria-expanded', 'false');
+    this._els.item.classList.remove('open');
+  }
+
+  destroy() {
+    if (!this._initialized) return;
+    const unsubscribe = this._unsubscribePageChanged;
+    if (typeof unsubscribe !== 'function') {
+      throw new Error(
+        'Category builder lost its page subscription before destruction'
+      );
+    }
+    const lifecycle = this._lifecycle;
+    const droppedItemsLifecycle = this._droppedItemsLifecycle;
+    const intersectionInputsLifecycle =
+      this._intersectionInputsLifecycle;
+    this._resetLifecycleState();
+    cleanupAll(
+      [
+        () => lifecycle.abort(),
+        () => {
+          if (droppedItemsLifecycle !== null) {
+            droppedItemsLifecycle.abort();
+          }
+        },
+        () => {
+          if (intersectionInputsLifecycle !== null) {
+            intersectionInputsLifecycle.abort();
+          }
+        },
+        () => unsubscribe(),
+        () => this._container.replaceChildren()
+      ],
+      'Category builder cleanup failed'
+    );
+    this._droppedPages = [];
+    this._preview = null;
+    this._previewKey = null;
+    this._intersectionLabels = {};
   }
 }

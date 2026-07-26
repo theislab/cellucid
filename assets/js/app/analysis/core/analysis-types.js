@@ -70,6 +70,7 @@
  * @property {string} testName - Human-readable test name
  * @property {number} statistic - Test statistic value
  * @property {number} pValue - P-value
+ * @property {string} [pValueMethod] - Inference method used for the p-value
  * @property {number} [effectSize] - Effect size (Cohen's d, etc.)
  * @property {number[]} [confidenceInterval] - [lower, upper] bounds
  * @property {number} [degreesOfFreedom] - DoF for the test

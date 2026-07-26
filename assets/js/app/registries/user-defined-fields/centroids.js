@@ -7,6 +7,30 @@
  * @module registries/user-defined-fields/centroids
  */
 
+function requireCategoryInventory(categories) {
+  if (!Array.isArray(categories) || categories.length === 0) {
+    throw new TypeError('Centroid categories must be a non-empty array');
+  }
+  const seen = new Set();
+  for (let categoryIndex = 0; categoryIndex < categories.length; categoryIndex++) {
+    const category = categories[categoryIndex];
+    const type = typeof category;
+    if (
+      (type !== 'string' && type !== 'number' && type !== 'boolean')
+      || (type === 'number' && !Number.isFinite(category))
+    ) {
+      throw new TypeError(
+        `Centroid category ${categoryIndex} must be a string, finite number, or boolean`
+      );
+    }
+    if (seen.has(category)) {
+      throw new TypeError(`Centroid category ${categoryIndex} is duplicated`);
+    }
+    seen.add(category);
+  }
+  return categories;
+}
+
 /**
  * Compute per-dimension centroids for all available dimensions (up to 3D).
  *
@@ -15,27 +39,54 @@
  * `{ category, position, n_points }`.
  *
  * @param {Uint8Array|Uint16Array} codes
- * @param {string[]} categories
+ * @param {(string|number|boolean)[]} categories
  * @param {object} state - DataState (needs `dimensionManager`, `positionsArray`, `activeDimensionLevel`)
- * @returns {Record<string, Array<{category: string, position: number[], n_points: number}>>}
+ * @returns {Record<string, Array<{category: string|number|boolean, position: number[], n_points: number}>>}
  */
 export function computeAllDimensionCentroids(codes, categories, state) {
-  const centroidsByDim = {};
-  const dimensionManager = state?.dimensionManager;
-
-  if (!dimensionManager) {
-    const positions = state?.positionsArray;
-    if (positions && positions.length) {
-      centroidsByDim['3'] = computeCentroidsForDimension(codes, categories, positions, 3, { strideOverride: 3 });
+  if (!(codes instanceof Uint8Array) && !(codes instanceof Uint16Array)) {
+    throw new TypeError('Centroid category codes must be Uint8Array or Uint16Array');
+  }
+  requireCategoryInventory(categories);
+  const missingCode = codes instanceof Uint8Array ? 255 : 65_535;
+  for (let codeIndex = 0; codeIndex < codes.length; codeIndex++) {
+    if (codes[codeIndex] >= categories.length && codes[codeIndex] !== missingCode) {
+      throw new RangeError(`Centroid category code ${codeIndex} is outside the category inventory`);
     }
-    return centroidsByDim;
+  }
+  if (
+    !state
+    || typeof state !== 'object'
+    || !Number.isSafeInteger(state.pointCount)
+    || state.pointCount < 1
+    || codes.length !== state.pointCount
+  ) {
+    throw new TypeError('Centroid computation requires exact current dataset state');
+  }
+  const dimensionManager = state.dimensionManager;
+  if (
+    !dimensionManager
+    || typeof dimensionManager.getAvailableDimensions !== 'function'
+    || !(dimensionManager.positionCache instanceof Map)
+  ) {
+    throw new TypeError('Centroid computation requires the current DimensionManager');
+  }
+  const availableDims = dimensionManager.getAvailableDimensions();
+  if (!Array.isArray(availableDims) || availableDims.length === 0) {
+    throw new TypeError('Centroid computation requires available dimensions');
+  }
+  const seenDimensions = new Set();
+  for (const dim of availableDims) {
+    if (!Number.isSafeInteger(dim) || dim < 1 || dim > 3 || seenDimensions.has(dim)) {
+      throw new TypeError('Available centroid dimensions must be unique integers from 1 through 3');
+    }
+    seenDimensions.add(dim);
   }
 
-  const availableDims = dimensionManager.getAvailableDimensions?.() || [state?.activeDimensionLevel || 3];
+  const centroidsByDim = {};
   for (const dim of availableDims) {
-    if (dim > 3) continue;
-    const positions = dimensionManager.positionCache?.get?.(dim);
-    if (!positions) continue;
+    if (!dimensionManager.positionCache.has(dim)) continue;
+    const positions = dimensionManager.positionCache.get(dim);
     centroidsByDim[String(dim)] = computeCentroidsForDimension(codes, categories, positions, dim);
   }
 
@@ -45,17 +96,26 @@ export function computeAllDimensionCentroids(codes, categories, state) {
 /**
  * Compute centroid objects for a single dimension.
  * @param {Uint8Array|Uint16Array} codes
- * @param {string[]} categories
+ * @param {(string|number|boolean)[]} categories
  * @param {Float32Array} positions - raw positions with stride = dim (unless overridden)
  * @param {number} dim
- * @param {object} [options]
- * @param {number} [options.strideOverride]
- * @returns {Array<{category: string, position: number[], n_points: number}>}
+ * @returns {Array<{category: string|number|boolean, position: number[], n_points: number}>}
  */
-export function computeCentroidsForDimension(codes, categories, positions, dim, options = {}) {
+export function computeCentroidsForDimension(codes, categories, positions, dim) {
+  if (!(codes instanceof Uint8Array) && !(codes instanceof Uint16Array)) {
+    throw new TypeError('Centroid category codes must be Uint8Array or Uint16Array');
+  }
+  requireCategoryInventory(categories);
+  if (!Number.isSafeInteger(dim) || dim < 1 || dim > 3) {
+    throw new TypeError('Centroid dimension must be an integer from 1 through 3');
+  }
+  if (!(positions instanceof Float32Array) || positions.length !== codes.length * dim) {
+    throw new TypeError('Centroid positions must be an exact dataset-length Float32Array');
+  }
+
   const numCategories = categories.length;
-  const stride = options.strideOverride ?? dim;
-  const pointCount = Math.min(codes.length, Math.floor(positions.length / stride));
+  const missingCode = codes instanceof Uint8Array ? 255 : 65_535;
+  const pointCount = codes.length;
 
   const sumsX = new Float64Array(numCategories);
   const sumsY = new Float64Array(numCategories);
@@ -64,11 +124,19 @@ export function computeCentroidsForDimension(codes, categories, positions, dim, 
 
   for (let i = 0; i < pointCount; i++) {
     const cat = codes[i];
-    if (cat >= numCategories) continue;
-    const base = i * stride;
-    sumsX[cat] += positions[base] || 0;
-    if (dim >= 2) sumsY[cat] += positions[base + 1] || 0;
-    if (dim >= 3) sumsZ[cat] += positions[base + 2] || 0;
+    if (cat === missingCode) continue;
+    if (cat >= numCategories) {
+      throw new RangeError(`Centroid category code ${i} is outside the category inventory`);
+    }
+    const base = i * dim;
+    for (let axis = 0; axis < dim; axis++) {
+      if (!Number.isFinite(positions[base + axis])) {
+        throw new TypeError(`Centroid position ${i}, axis ${axis} must be finite`);
+      }
+    }
+    sumsX[cat] += positions[base];
+    if (dim >= 2) sumsY[cat] += positions[base + 1];
+    if (dim >= 3) sumsZ[cat] += positions[base + 2];
     counts[cat]++;
   }
 
@@ -80,11 +148,10 @@ export function computeCentroidsForDimension(codes, categories, positions, dim, 
     const z = count ? sumsZ[catIdx] / count : 0;
     const pos = dim === 1 ? [x] : dim === 2 ? [x, y] : [x, y, z];
     out.push({
-      category: String(categories[catIdx] ?? `Category ${catIdx + 1}`),
+      category: categories[catIdx],
       position: pos,
       n_points: count
     });
   }
   return out;
 }
-

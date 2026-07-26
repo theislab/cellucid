@@ -110,6 +110,8 @@ const CONFIG = Object.freeze({
   syncWithLOD: true
 });
 
+export const DEFAULT_VELOCITY_PARTICLE_CAPACITY = CONFIG.particleCapacity;
+
 // Particle data layout: position (vec3) + velocity (vec3) + age (float) + cellIndex (uint)
 // = 3 + 3 + 1 + 1 = 8 floats worth (28 bytes with padding)
 const FLOATS_PER_PARTICLE = 8;
@@ -119,22 +121,307 @@ const BYTES_PER_PARTICLE = FLOATS_PER_PARTICLE * 4;
 // UTILITY FUNCTIONS
 // =============================================================================
 
-function clamp(value, min, max, fallback) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return fallback;
-  return Math.min(max, Math.max(min, n));
+function requireNumber(value, key, min, max, integer = false) {
+  if (
+    typeof value !== 'number' ||
+    !Number.isFinite(value) ||
+    (integer && !Number.isInteger(value))
+  ) {
+    const numberKind = integer ? 'integer number' : 'number';
+    throw new TypeError(`VelocityOverlay ${key} must be an exact ${numberKind}.`);
+  }
+  if (value < min || value > max) {
+    throw new RangeError(
+      `VelocityOverlay ${key} must be between ${min} and ${max}; received ${value}.`
+    );
+  }
+  return value;
 }
 
-function clampArray(value, fallback) {
-  if (!Array.isArray(value) || value.length !== 3) return fallback;
-  return value.map((v, i) => {
-    const n = Number(v);
-    return Number.isFinite(n) ? Math.max(0, Math.min(2, n)) : fallback[i];
-  });
+function readNumberOption(options, key, min, max, integer = false) {
+  if (!Object.hasOwn(options, key)) return CONFIG[key];
+  return requireNumber(options[key], key, min, max, integer);
+}
+
+function requireBoolean(value, key) {
+  if (typeof value !== 'boolean') {
+    throw new TypeError(`VelocityOverlay ${key} must be an exact boolean.`);
+  }
+  return value;
+}
+
+function readBooleanOption(options, key) {
+  if (!Object.hasOwn(options, key)) return CONFIG[key];
+  return requireBoolean(options[key], key);
+}
+
+function requireColorTint(value) {
+  if (!Array.isArray(value) || value.length !== 3) {
+    throw new TypeError(
+      'VelocityOverlay colorTint must be an exact three-number array.'
+    );
+  }
+  for (const entry of value) {
+    requireNumber(entry, 'colorTint channel', 0, 2);
+  }
+  return value.slice();
+}
+
+function readColorTintOption(options) {
+  return Object.hasOwn(options, 'colorTint')
+    ? requireColorTint(options.colorTint)
+    : CONFIG.colorTint.slice();
+}
+
+function requireNonEmptyString(value, key) {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value.trim() !== value
+  ) {
+    throw new TypeError(
+      `VelocityOverlay ${key} must be an exact non-empty trimmed string.`
+    );
+  }
+  return value;
+}
+
+/**
+ * Validate one public velocity-overlay configuration update without creating
+ * an overlay or allocating GPU resources.
+ *
+ * @param {unknown} key
+ * @param {unknown} value
+ * @param {unknown} particleCapacity
+ * @returns {{ key: string; value: unknown }}
+ */
+export function validateVelocityOverlayConfig(
+  key,
+  value,
+  particleCapacity
+) {
+  const exactKey = requireNonEmptyString(key, 'configuration key');
+  const exactCapacity = requireNumber(
+    particleCapacity,
+    'particleCapacity',
+    1000,
+    500_000,
+    true
+  );
+  let exactValue;
+  switch (exactKey) {
+    case 'particleCount':
+      exactValue = requireNumber(value, exactKey, 0, exactCapacity, true);
+      break;
+    case 'speedMultiplier':
+      exactValue = requireNumber(value, exactKey, 0.1, 20);
+      break;
+    case 'lifetime':
+      exactValue = requireNumber(value, exactKey, 0.5, 30);
+      break;
+    case 'dropRate':
+    case 'dropRateBump':
+      exactValue = requireNumber(value, exactKey, 0, 0.1);
+      break;
+    case 'turbulence':
+      exactValue = requireNumber(value, exactKey, 0, 2);
+      break;
+    case 'particleSize':
+      exactValue = requireNumber(value, exactKey, 1, 50);
+      break;
+    case 'minSize':
+      exactValue = requireNumber(value, exactKey, 0.5, 10);
+      break;
+    case 'maxSize':
+      exactValue = requireNumber(value, exactKey, 5, 100);
+      break;
+    case 'intensity':
+      exactValue = requireNumber(value, exactKey, 0.1, 5);
+      break;
+    case 'glowAmount':
+    case 'coreSharpness':
+      exactValue = requireNumber(value, exactKey, 0, 1);
+      break;
+    case 'cometStretch':
+      exactValue = requireNumber(value, exactKey, 0, 2);
+      break;
+    case 'trailFade':
+      exactValue = requireNumber(value, exactKey, 0.5, 0.999);
+      break;
+    case 'trailResolution':
+      exactValue = requireNumber(value, exactKey, 0.25, 2);
+      break;
+    case 'chromaticFade':
+      exactValue = requireNumber(value, exactKey, 0, 1);
+      break;
+    case 'cameraMotionFade':
+      exactValue = requireNumber(value, exactKey, 0.5, 1);
+      break;
+    case 'cameraMotionThreshold':
+      exactValue = requireNumber(value, exactKey, 0.0001, 0.1);
+      break;
+    case 'bloomEnabled':
+      exactValue = requireBoolean(value, exactKey);
+      break;
+    case 'bloomStrength':
+      exactValue = requireNumber(value, exactKey, 0, 2);
+      break;
+    case 'bloomThreshold':
+    case 'bloomKnee':
+      exactValue = requireNumber(value, exactKey, 0, 1);
+      break;
+    case 'bloomBlurSize':
+      exactValue = requireNumber(value, exactKey, 1, 16);
+      break;
+    case 'anamorphicRatio':
+      exactValue = requireNumber(value, exactKey, 1, 3);
+      break;
+    case 'exposure':
+      exactValue = requireNumber(value, exactKey, 0.5, 4);
+      break;
+    case 'contrast':
+      exactValue = requireNumber(value, exactKey, 0.5, 2);
+      break;
+    case 'saturation':
+      exactValue = requireNumber(value, exactKey, 0, 2);
+      break;
+    case 'gamma':
+      exactValue = requireNumber(value, exactKey, 0.5, 2.5);
+      break;
+    case 'highlights':
+      exactValue = requireNumber(value, exactKey, 0.5, 2);
+      break;
+    case 'shadows':
+      exactValue = requireNumber(value, exactKey, 0.5, 2);
+      break;
+    case 'colorTint':
+      exactValue = requireColorTint(value);
+      break;
+    case 'vignette':
+      exactValue = requireNumber(value, exactKey, 0, 1);
+      break;
+    case 'filmGrain':
+      exactValue = requireNumber(value, exactKey, 0, 0.5);
+      break;
+    case 'chromaticAberration':
+      exactValue = requireNumber(value, exactKey, 0, 2);
+      break;
+    case 'opacity':
+      exactValue = requireNumber(value, exactKey, 0, 1);
+      break;
+    case 'colormapId': {
+      exactValue = requireNonEmptyString(value, exactKey);
+      if (getColormap(exactValue).id !== exactValue) {
+        throw new RangeError(
+          `VelocityOverlay colormapId "${exactValue}" is unknown.`
+        );
+      }
+      break;
+    }
+    case 'spawnTableSize':
+      exactValue = requireNumber(value, exactKey, 1024, 1_048_576, true);
+      break;
+    case 'syncWithLOD':
+      exactValue = requireBoolean(value, exactKey);
+      break;
+    default:
+      throw new RangeError(
+        `VelocityOverlay configuration key "${exactKey}" is unknown.`
+      );
+  }
+  return { key: exactKey, value: exactValue };
+}
+
+export function validateVelocityFieldId(fieldId) {
+  return requireNonEmptyString(fieldId, 'fieldId');
+}
+
+export function validateActiveVelocityFieldId(fieldId) {
+  return fieldId === null ? null : validateVelocityFieldId(fieldId);
+}
+
+export function validateVelocityFieldData(
+  fieldId,
+  dimensionLevel,
+  fieldData
+) {
+  const id = validateVelocityFieldId(fieldId);
+  const dimension = requireDimensionLevel(dimensionLevel);
+  if (
+    fieldData === null ||
+    typeof fieldData !== 'object' ||
+    Array.isArray(fieldData) ||
+    Object.getPrototypeOf(fieldData) !== Object.prototype ||
+    Object.keys(fieldData).sort().join(',') !==
+      'cellCount,components,maxMagnitude,vectors'
+  ) {
+    throw new TypeError(
+      'VelocityOverlay fieldData must contain exactly cellCount, components, maxMagnitude, and vectors.'
+    );
+  }
+  const {
+    vectors,
+    components,
+    cellCount,
+    maxMagnitude
+  } = fieldData;
+  if (!(vectors instanceof Float32Array)) {
+    throw new TypeError('VelocityOverlay vectors must be a Float32Array.');
+  }
+  if (components !== 1 && components !== 2 && components !== 3) {
+    throw new RangeError(
+      'VelocityOverlay components must be exactly 1, 2, or 3.'
+    );
+  }
+  requireNumber(cellCount, 'cellCount', 1, Number.MAX_SAFE_INTEGER, true);
+  if (vectors.length !== cellCount * components) {
+    throw new RangeError(
+      `VelocityOverlay vectors must contain exactly ${cellCount * components} values; received ${vectors.length}.`
+    );
+  }
+  for (let index = 0; index < vectors.length; index += 1) {
+    if (!Number.isFinite(vectors[index])) {
+      throw new RangeError(
+        `VelocityOverlay vector value ${index} must be finite.`
+      );
+    }
+  }
+  requireNumber(maxMagnitude, 'maxMagnitude', 0, Number.MAX_VALUE);
+  return {
+    id,
+    dimension,
+    vectors,
+    components,
+    cellCount,
+    maxMagnitude
+  };
+}
+
+function readStringOption(options, key) {
+  return Object.hasOwn(options, key)
+    ? requireNonEmptyString(options[key], key)
+    : CONFIG[key];
+}
+
+function requireDimensionLevel(value) {
+  if (!Number.isInteger(value) || value < 1 || value > 3) {
+    throw new RangeError(
+      `VelocityOverlay dimensionLevel must be exactly 1, 2, or 3; received ${String(value)}.`
+    );
+  }
+  return value;
+}
+
+function requireViewId(value) {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new TypeError('VelocityOverlay viewId must be a non-empty string.');
+  }
+  return value;
 }
 
 function createRNG(seed) {
   let state = seed >>> 0;
+  if (state === 0) state = 0x6d2b79f5;
   return {
     next() {
       state ^= (state << 13) >>> 0;
@@ -143,7 +430,10 @@ function createRNG(seed) {
       return state >>> 0;
     },
     nextInt(max) {
-      return (this.next() % Math.max(1, max | 0)) | 0;
+      if (!Number.isSafeInteger(max) || max <= 0 || max > 0x1_0000_0000) {
+        throw new RangeError('VelocityOverlay random sample bound must be an integer from 1 through 2^32.');
+      }
+      return Math.floor((this.next() / 0x1_0000_0000) * max);
     }
   };
 }
@@ -158,56 +448,83 @@ export class VelocityOverlay extends OverlayBase {
    * @param {object} [options]
    */
   constructor(gl, options = {}) {
+    if (!options || typeof options !== 'object' || Array.isArray(options)) {
+      throw new TypeError('VelocityOverlay options must be an object.');
+    }
     super(gl, { id: 'velocity', priority: 30, ...options });
 
     // Configuration
+    const particleCapacity = readNumberOption(
+      options,
+      'particleCapacity',
+      1000,
+      500_000,
+      true
+    );
     this.config = {
-      particleCapacity: clamp(options.particleCapacity, 1000, 500_000, CONFIG.particleCapacity),
-      particleCount: clamp(options.particleCount, 0, 500_000, CONFIG.particleCount),
-      speedMultiplier: clamp(options.speedMultiplier, 0.1, 20.0, CONFIG.speedMultiplier),
-      lifetime: clamp(options.lifetime, 0.5, 30.0, CONFIG.lifetime),
-      dropRate: clamp(options.dropRate, 0.0, 0.1, CONFIG.dropRate),
-      dropRateBump: clamp(options.dropRateBump, 0.0, 0.1, CONFIG.dropRateBump),
-      turbulence: clamp(options.turbulence, 0.0, 2.0, CONFIG.turbulence),
+      particleCapacity,
+      particleCount: readNumberOption(
+        options,
+        'particleCount',
+        0,
+        particleCapacity,
+        true
+      ),
+      speedMultiplier: readNumberOption(options, 'speedMultiplier', 0.1, 20),
+      lifetime: readNumberOption(options, 'lifetime', 0.5, 30),
+      dropRate: readNumberOption(options, 'dropRate', 0, 0.1),
+      dropRateBump: readNumberOption(options, 'dropRateBump', 0, 0.1),
+      turbulence: readNumberOption(options, 'turbulence', 0, 2),
 
-      particleSize: clamp(options.particleSize, 1.0, 50.0, CONFIG.particleSize),
-      minSize: clamp(options.minSize, 0.5, 10.0, CONFIG.minSize),
-      maxSize: clamp(options.maxSize, 5.0, 100.0, CONFIG.maxSize),
-      intensity: clamp(options.intensity, 0.1, 5.0, CONFIG.intensity),
-      glowAmount: clamp(options.glowAmount, 0.0, 1.0, CONFIG.glowAmount),
-      coreSharpness: clamp(options.coreSharpness, 0.0, 1.0, CONFIG.coreSharpness),
-      cometStretch: clamp(options.cometStretch, 0.0, 2.0, CONFIG.cometStretch),
+      particleSize: readNumberOption(options, 'particleSize', 1, 50),
+      minSize: readNumberOption(options, 'minSize', 0.5, 10),
+      maxSize: readNumberOption(options, 'maxSize', 5, 100),
+      intensity: readNumberOption(options, 'intensity', 0.1, 5),
+      glowAmount: readNumberOption(options, 'glowAmount', 0, 1),
+      coreSharpness: readNumberOption(options, 'coreSharpness', 0, 1),
+      cometStretch: readNumberOption(options, 'cometStretch', 0, 2),
 
-      trailFade: clamp(options.trailFade, 0.5, 0.999, CONFIG.trailFade),
-      trailResolution: clamp(options.trailResolution, 0.25, 2.0, CONFIG.trailResolution),
-      chromaticFade: clamp(options.chromaticFade, 0.0, 1.0, CONFIG.chromaticFade),
+      trailFade: readNumberOption(options, 'trailFade', 0.5, 0.999),
+      trailResolution: readNumberOption(options, 'trailResolution', 0.25, 2),
+      chromaticFade: readNumberOption(options, 'chromaticFade', 0, 1),
 
-      cameraMotionFade: clamp(options.cameraMotionFade, 0.5, 1.0, CONFIG.cameraMotionFade),
-      cameraMotionThreshold: clamp(options.cameraMotionThreshold, 0.0001, 0.1, CONFIG.cameraMotionThreshold),
+      cameraMotionFade: readNumberOption(options, 'cameraMotionFade', 0.5, 1),
+      cameraMotionThreshold: readNumberOption(
+        options,
+        'cameraMotionThreshold',
+        0.0001,
+        0.1
+      ),
 
-      bloomEnabled: options.bloomEnabled !== undefined ? Boolean(options.bloomEnabled) : CONFIG.bloomEnabled,
-      bloomStrength: clamp(options.bloomStrength, 0.0, 2.0, CONFIG.bloomStrength),
-      bloomThreshold: clamp(options.bloomThreshold, 0.0, 1.0, CONFIG.bloomThreshold),
-      bloomBlurSize: clamp(options.bloomBlurSize, 1.0, 16.0, CONFIG.bloomBlurSize),
-      bloomKnee: clamp(options.bloomKnee, 0.0, 1.0, CONFIG.bloomKnee),
-      anamorphicRatio: clamp(options.anamorphicRatio, 1.0, 3.0, CONFIG.anamorphicRatio),
-      exposure: clamp(options.exposure, 0.5, 4.0, CONFIG.exposure),
-      contrast: clamp(options.contrast, 0.5, 2.0, CONFIG.contrast),
-      saturation: clamp(options.saturation, 0.0, 2.0, CONFIG.saturation),
-      gamma: clamp(options.gamma, 0.5, 2.5, CONFIG.gamma),
+      bloomEnabled: readBooleanOption(options, 'bloomEnabled'),
+      bloomStrength: readNumberOption(options, 'bloomStrength', 0, 2),
+      bloomThreshold: readNumberOption(options, 'bloomThreshold', 0, 1),
+      bloomBlurSize: readNumberOption(options, 'bloomBlurSize', 1, 16),
+      bloomKnee: readNumberOption(options, 'bloomKnee', 0, 1),
+      anamorphicRatio: readNumberOption(options, 'anamorphicRatio', 1, 3),
+      exposure: readNumberOption(options, 'exposure', 0.5, 4),
+      contrast: readNumberOption(options, 'contrast', 0.5, 2),
+      saturation: readNumberOption(options, 'saturation', 0, 2),
+      gamma: readNumberOption(options, 'gamma', 0.5, 2.5),
 
-      highlights: clamp(options.highlights, 0.5, 2.0, CONFIG.highlights),
-      shadows: clamp(options.shadows, 0.5, 2.0, CONFIG.shadows),
-      colorTint: clampArray(options.colorTint, CONFIG.colorTint),
+      highlights: readNumberOption(options, 'highlights', 0.5, 2),
+      shadows: readNumberOption(options, 'shadows', 0.5, 2),
+      colorTint: readColorTintOption(options),
 
-      vignette: clamp(options.vignette, 0.0, 1.0, CONFIG.vignette),
-      filmGrain: clamp(options.filmGrain, 0.0, 0.5, CONFIG.filmGrain),
-      chromaticAberration: clamp(options.chromaticAberration, 0.0, 2.0, CONFIG.chromaticAberration),
+      vignette: readNumberOption(options, 'vignette', 0, 1),
+      filmGrain: readNumberOption(options, 'filmGrain', 0, 0.5),
+      chromaticAberration: readNumberOption(options, 'chromaticAberration', 0, 2),
 
-      opacity: clamp(options.opacity, 0.0, 1.0, CONFIG.opacity),
-      colormapId: String(options.colormapId || CONFIG.colormapId),
-      spawnTableSize: clamp(options.spawnTableSize, 1024, 1_048_576, CONFIG.spawnTableSize),
-      syncWithLOD: options.syncWithLOD !== undefined ? Boolean(options.syncWithLOD) : CONFIG.syncWithLOD
+      opacity: readNumberOption(options, 'opacity', 0, 1),
+      colormapId: readStringOption(options, 'colormapId'),
+      spawnTableSize: readNumberOption(
+        options,
+        'spawnTableSize',
+        1024,
+        1_048_576,
+        true
+      ),
+      syncWithLOD: readBooleanOption(options, 'syncWithLOD')
     };
 
     // Vector field storage: fieldId -> dimensionLevel -> field data
@@ -271,7 +588,7 @@ export class VelocityOverlay extends OverlayBase {
   // ===========================================================================
 
   setActiveField(fieldId) {
-    this._activeFieldId = fieldId ? String(fieldId) : null;
+    this._activeFieldId = validateActiveVelocityFieldId(fieldId);
   }
 
   getActiveFieldId() {
@@ -279,49 +596,38 @@ export class VelocityOverlay extends OverlayBase {
   }
 
   setVectorFieldData(fieldId, dimensionLevel, fieldData) {
-    const id = String(fieldId || '');
-    if (!id) throw new Error('VelocityOverlay: fieldId required');
-
-    const dim = Math.max(1, Math.min(3, Math.floor(dimensionLevel || 3)));
-    const { vectors, components, cellCount, maxMagnitude } = fieldData || {};
-
-    if (!(vectors instanceof Float32Array)) {
-      throw new Error('VelocityOverlay: vectors must be Float32Array');
-    }
-    if (components !== 1 && components !== 2 && components !== 3) {
-      throw new Error(`VelocityOverlay: invalid components=${components}`);
-    }
-    if (!cellCount || cellCount <= 0) {
-      throw new Error('VelocityOverlay: cellCount must be > 0');
-    }
-    if (vectors.length !== cellCount * components) {
-      throw new Error(`VelocityOverlay: vectors length mismatch`);
-    }
-
+    const validated = validateVelocityFieldData(
+      fieldId,
+      dimensionLevel,
+      fieldData
+    );
     this.init();
 
-    let perField = this._fieldsById.get(id);
+    let perField = this._fieldsById.get(validated.id);
     if (!perField) {
       perField = new Map();
-      this._fieldsById.set(id, perField);
     }
 
-    const existing = perField.get(dim);
+    const existing = perField.get(validated.dimension);
     const textureInfo = createOrUpdatePackedFloatTexture(this.gl, {
-      texture: existing?.texture || null,
-      data: vectors,
-      itemCount: cellCount,
-      components
+      texture: null,
+      data: validated.vectors,
+      itemCount: validated.cellCount,
+      components: validated.components
     });
 
-    perField.set(dim, {
+    perField.set(validated.dimension, {
       ...textureInfo,
-      cellCount,
-      maxMagnitude: Math.max(1e-8, Number(maxMagnitude) || 1)
+      cellCount: validated.cellCount,
+      maxMagnitude: validated.maxMagnitude
     });
+    this._fieldsById.set(validated.id, perField);
+    if (existing !== undefined) {
+      this.gl.deleteTexture(existing.texture);
+    }
 
-    if (!this._activeFieldId) {
-      this._activeFieldId = id;
+    if (this._activeFieldId === null) {
+      this._activeFieldId = validated.id;
     }
 
     // Mark spawn tables dirty
@@ -332,13 +638,14 @@ export class VelocityOverlay extends OverlayBase {
   }
 
   hasFieldForDimension(fieldId, dimensionLevel) {
-    const id = String(fieldId || '');
-    const dim = Math.max(1, Math.min(3, Math.floor(dimensionLevel || 3)));
-    return Boolean(this._fieldsById.get(id)?.has(dim));
+    const id = validateVelocityFieldId(fieldId);
+    const dim = requireDimensionLevel(dimensionLevel);
+    const fields = this._fieldsById.get(id);
+    return fields !== undefined && fields.has(dim);
   }
 
   markVisibilityDirty(viewId) {
-    const key = String(viewId || 'live');
+    const key = requireViewId(viewId);
     const state = this._spawnByView.get(key);
     if (state) {
       state.dirty = true;
@@ -347,11 +654,15 @@ export class VelocityOverlay extends OverlayBase {
   }
 
   disposeView(viewId) {
-    const key = String(viewId || 'live');
+    const key = requireViewId(viewId);
     const gl = this.gl;
 
     // Clean spawn table
     const spawn = this._spawnByView.get(key);
+    if (spawn && spawn.notificationId !== null) {
+      getNotificationCenter().dismiss(spawn.notificationId);
+      spawn.notificationId = null;
+    }
     if (spawn?.textureInfo?.texture) {
       gl.deleteTexture(spawn.textureInfo.texture);
     }
@@ -369,129 +680,27 @@ export class VelocityOverlay extends OverlayBase {
   }
 
   setConfig(key, value) {
-    if (!key) return;
+    const validated = validateVelocityOverlayConfig(
+      key,
+      value,
+      this.config.particleCapacity
+    );
     this.init();
 
     const cfg = this.config;
-    switch (key) {
-      case 'particleCount':
-        cfg.particleCount = clamp(value, 0, cfg.particleCapacity, cfg.particleCount);
-        break;
-      case 'speedMultiplier':
-        cfg.speedMultiplier = clamp(value, 0.1, 20.0, cfg.speedMultiplier);
-        break;
-      case 'lifetime':
-        cfg.lifetime = clamp(value, 0.5, 30.0, cfg.lifetime);
-        break;
-      case 'dropRate':
-        cfg.dropRate = clamp(value, 0.0, 0.1, cfg.dropRate);
-        break;
-      case 'dropRateBump':
-        cfg.dropRateBump = clamp(value, 0.0, 0.1, cfg.dropRateBump);
-        break;
-      case 'turbulence':
-        cfg.turbulence = clamp(value, 0.0, 2.0, cfg.turbulence);
-        break;
-      case 'particleSize':
-        cfg.particleSize = clamp(value, 1.0, 50.0, cfg.particleSize);
-        break;
-      case 'minSize':
-        cfg.minSize = clamp(value, 0.5, 10.0, cfg.minSize);
-        break;
-      case 'maxSize':
-        cfg.maxSize = clamp(value, 5.0, 100.0, cfg.maxSize);
-        break;
-      case 'intensity':
-        cfg.intensity = clamp(value, 0.1, 5.0, cfg.intensity);
-        break;
-      case 'glowAmount':
-        cfg.glowAmount = clamp(value, 0.0, 1.0, cfg.glowAmount);
-        break;
-      case 'coreSharpness':
-        cfg.coreSharpness = clamp(value, 0.0, 1.0, cfg.coreSharpness);
-        break;
-      case 'cometStretch':
-        cfg.cometStretch = clamp(value, 0.0, 2.0, cfg.cometStretch);
-        break;
-      case 'trailFade':
-        cfg.trailFade = clamp(value, 0.5, 0.999, cfg.trailFade);
-        break;
-      case 'trailResolution':
-        cfg.trailResolution = clamp(value, 0.25, 2.0, cfg.trailResolution);
-        for (const k of this._fboByView.keys()) this._disposeFBOs(k);
-        break;
-      case 'chromaticFade':
-        cfg.chromaticFade = clamp(value, 0.0, 1.0, cfg.chromaticFade);
-        break;
-      case 'cameraMotionFade':
-        cfg.cameraMotionFade = clamp(value, 0.5, 1.0, cfg.cameraMotionFade);
-        break;
-      case 'cameraMotionThreshold':
-        cfg.cameraMotionThreshold = clamp(value, 0.0001, 0.1, cfg.cameraMotionThreshold);
-        break;
-      case 'bloomEnabled':
-        cfg.bloomEnabled = Boolean(value);
-        break;
-      case 'bloomStrength':
-        cfg.bloomStrength = clamp(value, 0.0, 2.0, cfg.bloomStrength);
-        break;
-      case 'bloomThreshold':
-        cfg.bloomThreshold = clamp(value, 0.0, 1.0, cfg.bloomThreshold);
-        break;
-      case 'bloomBlurSize':
-        cfg.bloomBlurSize = clamp(value, 1.0, 16.0, cfg.bloomBlurSize);
-        break;
-      case 'bloomKnee':
-        cfg.bloomKnee = clamp(value, 0.0, 1.0, cfg.bloomKnee);
-        break;
-      case 'anamorphicRatio':
-        cfg.anamorphicRatio = clamp(value, 1.0, 3.0, cfg.anamorphicRatio);
-        break;
-      case 'exposure':
-        cfg.exposure = clamp(value, 0.5, 4.0, cfg.exposure);
-        break;
-      case 'contrast':
-        cfg.contrast = clamp(value, 0.5, 2.0, cfg.contrast);
-        break;
-      case 'saturation':
-        cfg.saturation = clamp(value, 0.0, 2.0, cfg.saturation);
-        break;
-      case 'gamma':
-        cfg.gamma = clamp(value, 0.5, 2.5, cfg.gamma);
-        break;
-      case 'highlights':
-        cfg.highlights = clamp(value, 0.5, 2.0, cfg.highlights);
-        break;
-      case 'shadows':
-        cfg.shadows = clamp(value, 0.5, 2.0, cfg.shadows);
-        break;
-      case 'colorTint':
-        cfg.colorTint = clampArray(value, cfg.colorTint);
-        break;
-      case 'vignette':
-        cfg.vignette = clamp(value, 0.0, 1.0, cfg.vignette);
-        break;
-      case 'filmGrain':
-        cfg.filmGrain = clamp(value, 0.0, 0.5, cfg.filmGrain);
-        break;
-      case 'chromaticAberration':
-        cfg.chromaticAberration = clamp(value, 0.0, 2.0, cfg.chromaticAberration);
-        break;
-      case 'opacity':
-        cfg.opacity = clamp(value, 0.0, 1.0, cfg.opacity);
-        break;
-      case 'colormapId':
-        cfg.colormapId = String(value || CONFIG.colormapId);
-        this._updateColormap();
-        break;
-      case 'spawnTableSize':
-        cfg.spawnTableSize = clamp(value, 1024, 1_048_576, cfg.spawnTableSize);
-        for (const s of this._spawnByView.values()) { s.dirty = true; s.version++; }
-        break;
-      case 'syncWithLOD':
-        cfg.syncWithLOD = Boolean(value);
-        for (const s of this._spawnByView.values()) { s.dirty = true; s.version++; }
-        break;
+    cfg[validated.key] = validated.value;
+    if (validated.key === 'trailResolution') {
+      for (const viewId of this._fboByView.keys()) this._disposeFBOs(viewId);
+    } else if (validated.key === 'colormapId') {
+      this._updateColormap();
+    } else if (
+      validated.key === 'spawnTableSize' ||
+      validated.key === 'syncWithLOD'
+    ) {
+      for (const spawn of this._spawnByView.values()) {
+        spawn.dirty = true;
+        spawn.version += 1;
+      }
     }
   }
 
@@ -532,7 +741,11 @@ export class VelocityOverlay extends OverlayBase {
   }
 
   _doUpdate(dt, ctx) {
-    const dim = Math.max(1, Math.min(3, Math.floor(ctx?.dimensionLevel || 3)));
+    if (!ctx || typeof ctx !== 'object') {
+      throw new TypeError('VelocityOverlay update context is required.');
+    }
+    requireNumber(dt, 'update delta', 0, Number.MAX_VALUE);
+    const dim = requireDimensionLevel(ctx.dimensionLevel);
     const field = this._activeFieldId
       ? this._fieldsById.get(this._activeFieldId)?.get(dim)
       : null;
@@ -548,19 +761,37 @@ export class VelocityOverlay extends OverlayBase {
 
     // LOD-aware particle count
     let targetCount = this.config.particleCount;
-    if (this.config.syncWithLOD && typeof ctx?.getLodLevel === 'function') {
+    if (this.config.syncWithLOD) {
+      if (typeof ctx.getLodLevel !== 'function') {
+        throw new TypeError('VelocityOverlay context getLodLevel() is required.');
+      }
       const lod = ctx.getLodLevel();
+      if (!Number.isInteger(lod) || lod < -1) {
+        throw new RangeError(
+          'VelocityOverlay context LOD level must be an integer greater than or equal to -1.'
+        );
+      }
       if (lod >= 0) {
         const factor = lod >= 6 ? 0 : lod >= 3 ? 0.25 : lod >= 1 ? 0.5 : 1.0;
         targetCount = Math.floor(targetCount * factor);
       }
     }
-    this._activeParticleCount = Math.min(targetCount, this.config.particleCapacity);
+    this._activeParticleCount = targetCount;
     if (this._activeParticleCount <= 0) return;
 
-    const viewId = String(ctx?.viewId || 'live');
-    const positions = ctx?.getViewPositions?.();
-    if (!(positions instanceof Float32Array) || positions.length === 0) return;
+    const viewId = requireViewId(ctx.viewId);
+    if (typeof ctx.getViewPositions !== 'function') {
+      throw new TypeError('VelocityOverlay context getViewPositions() is required.');
+    }
+    const positions = ctx.getViewPositions();
+    if (
+      !(positions instanceof Float32Array) ||
+      positions.length !== field.cellCount * 3
+    ) {
+      throw new TypeError(
+        `VelocityOverlay positions for view "${viewId}" must be a Float32Array with exactly three values for each field cell.`
+      );
+    }
 
     const posTexture = this._ensurePositionTexture(viewId, positions);
     const spawnState = this._ensureSpawnTable(viewId, ctx, field.cellCount);
@@ -570,14 +801,17 @@ export class VelocityOverlay extends OverlayBase {
   }
 
   _doRender(ctx) {
-    const dim = Math.max(1, Math.min(3, Math.floor(ctx?.dimensionLevel || 3)));
+    if (!ctx || typeof ctx !== 'object') {
+      throw new TypeError('VelocityOverlay render context is required.');
+    }
+    const dim = requireDimensionLevel(ctx.dimensionLevel);
     const field = this._activeFieldId
       ? this._fieldsById.get(this._activeFieldId)?.get(dim)
       : null;
 
     if (!field || this._activeParticleCount <= 0) return;
 
-    const viewId = String(ctx?.viewId || 'live');
+    const viewId = requireViewId(ctx.viewId);
     this._renderFlow(ctx, field, viewId);
   }
 
@@ -631,6 +865,10 @@ export class VelocityOverlay extends OverlayBase {
 
     // Spawn tables
     for (const state of this._spawnByView.values()) {
+      if (state?.notificationId !== null) {
+        getNotificationCenter().dismiss(state.notificationId);
+        state.notificationId = null;
+      }
       if (state?.textureInfo?.texture) gl.deleteTexture(state.textureInfo.texture);
     }
     this._spawnByView.clear();
@@ -729,7 +967,7 @@ export class VelocityOverlay extends OverlayBase {
     const u = this._uniformsUpdate;
     gl.useProgram(this._programUpdate);
     gl.uniform1f(u.u_dt, dt);
-    gl.uniform1f(u.u_time, ctx.time || 0);
+    gl.uniform1f(u.u_time, ctx.time);
     gl.uniform1f(u.u_speedMultiplier, this.config.speedMultiplier);
     gl.uniform1f(u.u_lifetime, this.config.lifetime);
     gl.uniform1f(u.u_dropRate, this.config.dropRate);
@@ -764,7 +1002,6 @@ export class VelocityOverlay extends OverlayBase {
   _renderFlow(ctx, field, viewId) {
     const gl = this.gl;
     const fbos = this._ensureFBOs(viewId, ctx.viewportWidth, ctx.viewportHeight);
-    if (!fbos) return;
 
     const savedFBO = gl.getParameter(gl.FRAMEBUFFER_BINDING);
 
@@ -833,13 +1070,13 @@ export class VelocityOverlay extends OverlayBase {
     gl.uniformMatrix4fv(u.u_modelMatrix, false, ctx.modelMatrix);
 
     // Camera
-    gl.uniform3fv(u.u_cameraPosition, ctx.cameraPosition || [0, 0, 5]);
+    gl.uniform3fv(u.u_cameraPosition, ctx.cameraPosition);
     gl.uniform1f(u.u_viewportHeight, fbos.height);
-    gl.uniform1f(u.u_fov, ctx.fov ?? 1);
-    gl.uniform1f(u.u_sizeAttenuation, ctx.sizeAttenuation ?? 1);
+    gl.uniform1f(u.u_fov, ctx.fov);
+    gl.uniform1f(u.u_sizeAttenuation, ctx.sizeAttenuation);
 
     // Particle appearance
-    gl.uniform1f(u.u_particleSize, this.config.particleSize * (ctx.devicePixelRatio || 1));
+    gl.uniform1f(u.u_particleSize, this.config.particleSize * ctx.devicePixelRatio);
     gl.uniform1f(u.u_minSize, this.config.minSize);
     gl.uniform1f(u.u_maxSize, this.config.maxSize);
     gl.uniform1f(u.u_intensity, this.config.intensity);
@@ -848,22 +1085,25 @@ export class VelocityOverlay extends OverlayBase {
     gl.uniform1f(u.u_cometStretch, this.config.cometStretch);
 
     // Velocity normalization
-    gl.uniform1f(u.u_invMaxMagnitude, 1.0 / Math.max(1e-8, field.maxMagnitude));
+    gl.uniform1f(
+      u.u_invMaxMagnitude,
+      field.maxMagnitude === 0 ? 0 : 1.0 / field.maxMagnitude
+    );
 
     // Visibility
-    const useAlpha = Boolean(ctx.useAlphaTexture && ctx.alphaTexture && ctx.alphaTexWidth > 0);
+    const useAlpha = ctx.useAlphaTexture;
     gl.uniform1i(u.u_useAlphaTex, useAlpha ? 1 : 0);
     gl.uniform1i(u.u_alphaTexWidth, useAlpha ? ctx.alphaTexWidth : 0);
 
     // Fog
-    gl.uniform1f(u.u_fogNear, ctx.fogNear ?? 0);
-    gl.uniform1f(u.u_fogFar, ctx.fogFar ?? 100);
-    gl.uniform1f(u.u_fogDensity, ctx.fogDensity ?? 0.5);
-    gl.uniform3fv(u.u_fogColor, ctx.fogColor || [0.02, 0.02, 0.04]);
+    gl.uniform1f(u.u_fogNear, ctx.fogNear);
+    gl.uniform1f(u.u_fogFar, ctx.fogFar);
+    gl.uniform1f(u.u_fogDensity, ctx.fogDensity);
+    gl.uniform3fv(u.u_fogColor, ctx.fogColor);
 
     // Bind textures
     gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, ctx.alphaTexture || null);
+    gl.bindTexture(gl.TEXTURE_2D, ctx.alphaTexture);
     gl.activeTexture(gl.TEXTURE3);
     gl.bindTexture(gl.TEXTURE_2D, this._colormapTexture);
 
@@ -960,7 +1200,7 @@ export class VelocityOverlay extends OverlayBase {
     gl.uniform1f(u.u_exposure, this.config.exposure);
     gl.uniform1f(u.u_contrast, this.config.contrast);
     gl.uniform1f(u.u_saturation, this.config.saturation);
-    gl.uniform1f(u.u_time, ctx.time || 0);
+    gl.uniform1f(u.u_time, ctx.time);
 
     // Advanced color grading
     gl.uniform1f(u.u_highlights, this.config.highlights);
@@ -1025,13 +1265,16 @@ export class VelocityOverlay extends OverlayBase {
       }
     }
 
-    this._floatTextureFormat = formats[2];
-    return this._floatTextureFormat;
+    throw new Error(
+      'VelocityOverlay requires a complete renderable trail texture format.'
+    );
   }
 
   _ensureFBOs(viewId, vpWidth, vpHeight) {
     const gl = this.gl;
-    const key = String(viewId || 'live');
+    const key = requireViewId(viewId);
+    requireNumber(vpWidth, 'viewportWidth', Number.MIN_VALUE, Number.MAX_VALUE);
+    requireNumber(vpHeight, 'viewportHeight', Number.MIN_VALUE, Number.MAX_VALUE);
 
     const scale = this.config.trailResolution;
     const w = Math.max(1, Math.floor(vpWidth * scale));
@@ -1094,7 +1337,9 @@ export class VelocityOverlay extends OverlayBase {
       gl.deleteFramebuffer(fbo);
       for (const t of trail) if (t) gl.deleteTexture(t);
       for (const t of bloom) if (t) gl.deleteTexture(t);
-      return null;
+      throw new Error(
+        `VelocityOverlay framebuffer is incomplete for view "${key}" (status ${status}).`
+      );
     }
 
     fbos = {
@@ -1114,7 +1359,7 @@ export class VelocityOverlay extends OverlayBase {
 
   _disposeFBOs(viewId) {
     const gl = this.gl;
-    const key = String(viewId || 'live');
+    const key = requireViewId(viewId);
     const fbos = this._fboByView.get(key);
     if (!fbos) return;
 
@@ -1237,13 +1482,8 @@ export class VelocityOverlay extends OverlayBase {
    * Sets _cameraMotionAmount which is used to accelerate trail fade during movement.
    */
   _updateCameraMotion(ctx) {
-    const camPos = ctx?.cameraPosition;
-    const viewMatrix = ctx?.viewMatrix;
-
-    if (!camPos || !viewMatrix) {
-      this._cameraMotionAmount = 0;
-      return;
-    }
+    const camPos = ctx.cameraPosition;
+    const viewMatrix = ctx.viewMatrix;
 
     let motion = 0;
 
@@ -1255,8 +1495,7 @@ export class VelocityOverlay extends OverlayBase {
       const posDelta = Math.sqrt(dx * dx + dy * dy + dz * dz);
 
       // Normalize by camera distance for scale-independent motion detection
-      const camDist = Math.max(0.1, ctx.cameraDistance || 1);
-      motion = posDelta / camDist;
+      motion = posDelta / ctx.cameraDistance;
     }
 
     // Check view matrix rotation change (use first row to detect rotation)
@@ -1332,31 +1571,34 @@ export class VelocityOverlay extends OverlayBase {
   }
 
   _ensurePositionTexture(viewId, positions3D) {
-    const key = String(viewId || 'live');
+    const key = requireViewId(viewId);
     const prev = this._positionsRefByView.get(key);
 
     if (prev === positions3D) {
       const entry = this._positionTexturePool.get(positions3D);
-      return entry?.textureInfo || null;
+      if (!entry?.textureInfo) {
+        throw new Error(
+          `VelocityOverlay position texture ownership is invalid for view "${key}".`
+        );
+      }
+      return entry.textureInfo;
     }
-
-    if (prev) {
-      this._releasePositionTexture(prev);
-    }
-
-    this._positionsRefByView.set(key, positions3D);
 
     let entry = this._positionTexturePool.get(positions3D);
     if (!entry) {
       const textureInfo = createOrUpdatePackedFloatTexture(this.gl, {
         texture: null,
         data: positions3D,
-        itemCount: Math.floor(positions3D.length / 3),
+        itemCount: positions3D.length / 3,
         components: 3
       });
       entry = { textureInfo, refs: 0 };
       this._positionTexturePool.set(positions3D, entry);
     }
+    if (prev) {
+      this._releasePositionTexture(prev);
+    }
+    this._positionsRefByView.set(key, positions3D);
     entry.refs++;
     return entry.textureInfo;
   }
@@ -1374,16 +1616,28 @@ export class VelocityOverlay extends OverlayBase {
   }
 
   _ensureSpawnTable(viewId, ctx, cellCount) {
-    const key = String(viewId || 'live');
+    const key = requireViewId(viewId);
     let state = this._spawnByView.get(key);
 
     if (!state) {
-      state = { dirty: true, version: 0, building: false, textureInfo: null, tableSize: 0, tableWidth: 1, lastLod: null };
+      state = {
+        dirty: true,
+        version: 0,
+        building: false,
+        notificationId: null,
+        textureInfo: null,
+        tableSize: 0,
+        tableWidth: 1,
+        lastLod: null
+      };
       this._spawnByView.set(key, state);
     }
 
     // Check LOD change
-    const lod = typeof ctx?.getLodLevel === 'function' ? ctx.getLodLevel() : -1;
+    if (typeof ctx.getLodLevel !== 'function') {
+      throw new TypeError('VelocityOverlay context getLodLevel() is required.');
+    }
+    const lod = ctx.getLodLevel();
     if (this.config.syncWithLOD && state.lastLod !== null && lod !== state.lastLod) {
       state.dirty = true;
       state.version++;
@@ -1398,41 +1652,69 @@ export class VelocityOverlay extends OverlayBase {
     const notifications = getNotificationCenter();
     const showNotif = !state.textureInfo;
     const notifId = showNotif ? notifications.loading('Preparing velocity overlay...', { category: 'render' }) : null;
+    state.notificationId = notifId;
 
     const schedule = typeof requestIdleCallback === 'function'
       ? fn => requestIdleCallback(fn, { timeout: 500 })
       : fn => setTimeout(fn, 0);
 
     schedule(() => {
-      if (this._disposed) {
-        state.building = false;
+      const ownsState = this._spawnByView.get(key) === state;
+      if (
+        this._disposed ||
+        !ownsState ||
+        state.version !== scheduledVersion
+      ) {
+        if (ownsState) {
+          state.building = false;
+          state.dirty = true;
+        }
+        if (state.notificationId === notifId && notifId !== null) {
+          notifications.dismiss(notifId);
+          state.notificationId = null;
+        }
         return;
       }
 
       let success = false;
       try {
-        const transparency = ctx?.getViewTransparency?.();
-        if (!(transparency instanceof Float32Array) || transparency.length < cellCount) {
-          state.tableSize = 0;
-          state.tableWidth = 1;
-          state.textureInfo = null;
-          return;
+        if (typeof ctx.getViewTransparency !== 'function') {
+          throw new TypeError(
+            'VelocityOverlay context getViewTransparency() is required.'
+          );
+        }
+        const transparency = ctx.getViewTransparency();
+        if (
+          !(transparency instanceof Float32Array) ||
+          transparency.length !== cellCount
+        ) {
+          throw new TypeError(
+            `VelocityOverlay transparency for view "${key}" must contain exactly one Float32 value per field cell.`
+          );
         }
 
-        const lodIndices = this.config.syncWithLOD && typeof ctx?.getLodIndices === 'function'
-          ? ctx.getLodIndices()
-          : null;
+        if (typeof ctx.getLodIndices !== 'function') {
+          throw new TypeError('VelocityOverlay context getLodIndices() is required.');
+        }
+        const lodIndices = this.config.syncWithLOD ? ctx.getLodIndices() : null;
 
         const table = this._buildSpawnTable(transparency, cellCount, lodIndices);
         if (table.length <= 0) {
+          if (state.textureInfo !== null) {
+            this.gl.deleteTexture(state.textureInfo.texture);
+          }
           state.tableSize = 0;
           state.tableWidth = 1;
           state.textureInfo = null;
+          success = true;
           return;
         }
 
+        const existingTexture = state.textureInfo === null
+          ? null
+          : state.textureInfo.texture;
         const textureInfo = createOrUpdatePackedUintTexture(this.gl, {
-          texture: state.textureInfo?.texture || null,
+          texture: existingTexture,
           data: table,
           itemCount: table.length
         });
@@ -1442,20 +1724,29 @@ export class VelocityOverlay extends OverlayBase {
         state.tableWidth = textureInfo.width;
         success = true;
       } catch (err) {
-        console.warn('[VelocityOverlay] spawn table error:', err);
-        state.textureInfo = null;
-        state.tableSize = 0;
-        state.tableWidth = 1;
+        this.enabled = false;
+        notifications.error(
+          `Velocity overlay preparation failed: ${err.message}`,
+          { category: 'render' }
+        );
       } finally {
         state.building = false;
         state.dirty = !(success && state.version === scheduledVersion);
 
         if (notifId) {
-          if (state.tableSize > 0) {
-            notifications.complete(notifId, 'Velocity overlay ready');
+          if (success) {
+            notifications.complete(
+              notifId,
+              state.tableSize > 0
+                ? 'Velocity overlay ready'
+                : 'Velocity overlay ready (no visible cells)'
+            );
           } else {
             notifications.fail(notifId, 'Velocity overlay unavailable');
           }
+        }
+        if (state.notificationId === notifId) {
+          state.notificationId = null;
         }
       }
     });
@@ -1464,45 +1755,56 @@ export class VelocityOverlay extends OverlayBase {
   }
 
   _buildSpawnTable(transparency, cellCount, lodIndices) {
-    const maxSize = Math.min(this.config.spawnTableSize, cellCount);
+    if (
+      !(transparency instanceof Float32Array) ||
+      !Number.isSafeInteger(cellCount) ||
+      cellCount < 0 ||
+      transparency.length !== cellCount
+    ) {
+      throw new TypeError(
+        'VelocityOverlay spawn sampling requires exactly one Float32 transparency value per cell.'
+      );
+    }
+    if (lodIndices !== null && !(lodIndices instanceof Uint32Array)) {
+      throw new TypeError(
+        'VelocityOverlay LOD spawn candidates must be a Uint32Array or null.'
+      );
+    }
+    const candidates = lodIndices;
+    const candidateCount = candidates ? candidates.length : cellCount;
+    const maxSize = Math.min(this.config.spawnTableSize, candidateCount);
     const table = new Uint32Array(maxSize);
     const threshold = 0.01;
-
-    const rng = createRNG((Date.now() ^ (cellCount * 2654435761)) >>> 0);
-    const candidates = lodIndices instanceof Uint32Array && lodIndices.length > 0 ? lodIndices : null;
-    const candidateCount = candidates ? candidates.length : cellCount;
-
+    const seed = (
+      0x9e3779b9
+      ^ Math.imul(cellCount, 0x85ebca6b)
+      ^ Math.imul(candidateCount, 0xc2b2ae35)
+    ) >>> 0;
+    const rng = createRNG(seed);
     let filled = 0;
-    const maxAttempts = maxSize * 24;
+    let visibleCount = 0;
 
-    for (let attempt = 0; attempt < maxAttempts && filled < maxSize; attempt++) {
-      const pick = rng.nextInt(candidateCount);
-      const idx = candidates ? candidates[pick] : pick;
-      if (idx >= cellCount) continue;
-      if ((transparency[idx] || 0) > threshold) {
-        table[filled++] = idx >>> 0;
+    for (let candidateIndex = 0; candidateIndex < candidateCount; candidateIndex++) {
+      const idx = candidates ? candidates[candidateIndex] : candidateIndex;
+      if (idx >= cellCount) {
+        throw new RangeError(
+          `VelocityOverlay LOD spawn index ${idx} exceeds the ${cellCount}-cell field.`
+        );
+      }
+      if (transparency[idx] <= threshold) continue;
+
+      visibleCount++;
+      if (filled < maxSize) {
+        table[filled++] = idx;
+        continue;
+      }
+
+      const replacementIndex = rng.nextInt(visibleCount);
+      if (replacementIndex < maxSize) {
+        table[replacementIndex] = idx;
       }
     }
 
-    if (filled === maxSize) return table;
-
-    // Fallback: sequential fill
-    if (candidates) {
-      for (let i = 0; i < candidates.length && filled < maxSize; i++) {
-        const idx = candidates[i];
-        if (idx >= cellCount) continue;
-        if ((transparency[idx] || 0) > threshold) {
-          table[filled++] = idx >>> 0;
-        }
-      }
-    } else {
-      for (let idx = 0; idx < cellCount && filled < maxSize; idx++) {
-        if ((transparency[idx] || 0) > threshold) {
-          table[filled++] = idx >>> 0;
-        }
-      }
-    }
-
-    return filled === maxSize ? table : table.subarray(0, filled);
+    return filled === table.length ? table : table.slice(0, filled);
   }
 }

@@ -10,6 +10,23 @@
 import { debug } from '../../../../utils/debug.js';
 import { HIGHLIGHT_MODE_COPY } from './mode-copy.js';
 import { MAX_HISTORY_STEPS } from './selection-state.js';
+import {
+  deliverSelectionToJupyter,
+  showSelectionDeliveryFailure
+} from './selection-notification.js';
+import {
+  requireCompletedSelectionEvent,
+  requireDomElement,
+  requireExactKeys,
+  requireFiniteNumber,
+  requireHighlightSelectionState,
+  requireJupyterSource,
+  requireMethods,
+  requireSavedHighlightGroup,
+  requireSelectionPreviewEvent,
+  requireSelectionStepEvent,
+  requireUnifiedSelectionState
+} from './exact-contract.js';
 
 /**
  * @param {object} options
@@ -21,34 +38,76 @@ import { MAX_HISTORY_STEPS } from './selection-state.js';
  * @param {HTMLElement|null} options.ui.modeDescriptionEl
  * @returns {{ handleLassoStep: (stepEvent: any) => void }}
  */
-export function initLassoSelection({ state, viewer, jupyterSource = null, selectionState, ui }) {
-  const highlightModeDescriptionEl = ui?.modeDescriptionEl || null;
+export function initLassoSelection(options) {
+  requireExactKeys(
+    options,
+    ['state', 'viewer', 'jupyterSource', 'selectionState', 'ui'],
+    'Lasso selection options'
+  );
+  const { state, viewer, jupyterSource, selectionState, ui } = options;
+  requireMethods(
+    state,
+    'Lasso selection state',
+    [
+      'addHighlightDirect',
+      'clearPreviewHighlight',
+      'setPreviewHighlightFromIndices'
+    ]
+  );
+  requireMethods(
+    viewer,
+    'Lasso selection viewer',
+    [
+      'cancelLassoSelection',
+      'confirmLassoSelection',
+      'restoreLassoState',
+      'setLassoCallback',
+      'setLassoPreviewCallback',
+      'setLassoStepCallback'
+    ]
+  );
+  requireJupyterSource(jupyterSource);
+  requireHighlightSelectionState(selectionState);
+  requireExactKeys(ui, ['modeDescriptionEl'], 'Lasso selection UI');
+  const highlightModeDescriptionEl = requireDomElement(
+    ui.modeDescriptionEl,
+    'Lasso mode description'
+  );
+  requireDomElement(
+    highlightModeDescriptionEl.parentElement,
+    'Lasso mode description parent',
+    ['appendChild']
+  );
+  const documentOwner = globalThis.document;
+  requireMethods(
+    documentOwner,
+    'Lasso selection document',
+    ['createElement', 'getElementById']
+  );
 
   function handleLassoSelection(lassoEvent) {
-    if (!lassoEvent.cellIndices || lassoEvent.cellIndices.length === 0) {
-      debug.log('[UI] Lasso selection empty');
-      state.clearPreviewHighlight?.();
-      selectionState.lassoHistory = [];
-      selectionState.lassoRedoStack = [];
-      selectionState.lastLassoCandidates = null;
-      selectionState.lastLassoStep = 0;
-      updateLassoUI(null);
-      return;
-    }
+    requireCompletedSelectionEvent(lassoEvent, 'lasso');
 
     const stepsLabel = lassoEvent.steps > 1 ? ` (${lassoEvent.steps} views)` : '';
-    const group = state.addHighlightDirect({
+    const savedGroup = state.addHighlightDirect({
       type: 'lasso',
       label: `Lasso${stepsLabel} (${lassoEvent.cellCount.toLocaleString()} cells)`,
       cellIndices: lassoEvent.cellIndices
     });
+    requireSavedHighlightGroup(
+      savedGroup,
+      'lasso',
+      lassoEvent.cellCount,
+      'Saved lasso highlight group'
+    );
 
-    if (group) {
-      debug.log(`[UI] Lasso selected ${lassoEvent.cellCount} cells from ${lassoEvent.steps} view(s)`);
-    }
-    try {
-      jupyterSource?.notifySelection?.(lassoEvent.cellIndices, 'lasso');
-    } catch {}
+    debug.log(`[UI] Lasso selected ${lassoEvent.cellCount} cells from ${lassoEvent.steps} view(s)`);
+    void deliverSelectionToJupyter({
+      jupyterSource,
+      cellIndices: lassoEvent.cellIndices,
+      source: 'lasso',
+      onFailure: error => showSelectionDeliveryFailure(error, 'lasso')
+    });
 
     selectionState.lassoHistory = [];
     selectionState.lassoRedoStack = [];
@@ -58,13 +117,14 @@ export function initLassoSelection({ state, viewer, jupyterSource = null, select
   }
 
   function handleLassoStep(stepEvent) {
+    requireSelectionStepEvent(stepEvent, 'lasso');
     if (stepEvent.cancelled) {
       selectionState.lassoHistory = [];
       selectionState.lassoRedoStack = [];
       selectionState.lastLassoCandidates = null;
       selectionState.lastLassoStep = 0;
       updateLassoUI(null);
-      state.clearPreviewHighlight?.();
+      state.clearPreviewHighlight();
       return;
     }
 
@@ -79,15 +139,15 @@ export function initLassoSelection({ state, viewer, jupyterSource = null, select
       selectionState.lassoRedoStack = [];
     }
 
-    selectionState.lastLassoCandidates = stepEvent.candidates ? [...stepEvent.candidates] : null;
+    selectionState.lastLassoCandidates = [...stepEvent.candidates];
     selectionState.lastLassoStep = stepEvent.step;
 
     updateLassoUI(stepEvent);
 
     if (stepEvent.candidates && stepEvent.candidates.length > 0) {
-      state.setPreviewHighlightFromIndices?.(stepEvent.candidates);
+      state.setPreviewHighlightFromIndices(stepEvent.candidates);
     } else {
-      state.clearPreviewHighlight?.();
+      state.clearPreviewHighlight();
     }
   }
 
@@ -103,19 +163,18 @@ export function initLassoSelection({ state, viewer, jupyterSource = null, select
     selectionState.lastLassoCandidates = prevState.candidates;
     selectionState.lastLassoStep = prevState.step;
 
-    viewer.restoreLassoState?.(prevState.candidates, prevState.step);
+    viewer.restoreLassoState(prevState.candidates, prevState.step);
 
     if (prevState.candidates && prevState.candidates.length > 0) {
       updateLassoUI({
         step: prevState.step,
         candidateCount: prevState.candidates.length,
-        candidates: prevState.candidates,
-        mode: 'intersect'
+        restored: true
       });
-      state.setPreviewHighlightFromIndices?.(prevState.candidates);
+      state.setPreviewHighlightFromIndices(prevState.candidates);
     } else {
-      updateLassoUI({ step: 0, candidateCount: 0, mode: 'intersect', keepControls: true });
-      state.clearPreviewHighlight?.();
+      updateLassoUI({ step: 0, candidateCount: 0, keepControls: true });
+      state.clearPreviewHighlight();
     }
   }
 
@@ -131,28 +190,98 @@ export function initLassoSelection({ state, viewer, jupyterSource = null, select
     selectionState.lastLassoCandidates = redoState.candidates;
     selectionState.lastLassoStep = redoState.step;
 
-    viewer.restoreLassoState?.(redoState.candidates, redoState.step);
+    viewer.restoreLassoState(redoState.candidates, redoState.step);
 
     if (redoState.candidates && redoState.candidates.length > 0) {
       updateLassoUI({
         step: redoState.step,
         candidateCount: redoState.candidates.length,
-        candidates: redoState.candidates,
-        mode: 'intersect'
+        restored: true
       });
-      state.setPreviewHighlightFromIndices?.(redoState.candidates);
+      state.setPreviewHighlightFromIndices(redoState.candidates);
     } else {
-      updateLassoUI({ step: 0, candidateCount: 0, mode: 'intersect', keepControls: true });
-      state.clearPreviewHighlight?.();
+      updateLassoUI({ step: 0, candidateCount: 0, keepControls: true });
+      state.clearPreviewHighlight();
     }
   }
 
-  function updateLassoUI(stepEvent) {
-    if (!highlightModeDescriptionEl) return;
+  function handleLassoPreview(previewEvent) {
+    requireSelectionPreviewEvent(
+      previewEvent,
+      'lasso',
+      ['polygon']
+    );
+    if (!Array.isArray(previewEvent.polygon) || previewEvent.polygon.length < 3) {
+      throw new TypeError(
+        'Lasso preview polygon must contain at least three points.'
+      );
+    }
+    for (const point of previewEvent.polygon) {
+      requireExactKeys(point, ['x', 'y'], 'Lasso preview polygon point');
+      requireFiniteNumber(point.x, 'Lasso preview polygon x');
+      requireFiniteNumber(point.y, 'Lasso preview polygon y');
+    }
+    if (previewEvent.cellIndices.length === 0) {
+      state.clearPreviewHighlight();
+    } else {
+      state.setPreviewHighlightFromIndices(previewEvent.cellIndices);
+    }
+  }
 
+  function getLassoControls() {
+    let controls = documentOwner.getElementById('lasso-step-controls');
+    const created = controls === null;
+    if (created) {
+      controls = documentOwner.createElement('div');
+      controls.id = 'lasso-step-controls';
+      controls.className = 'lasso-step-controls';
+      controls.innerHTML = `
+        <button type="button" class="btn-small lasso-confirm" id="lasso-confirm-btn">Confirm</button>
+        <button type="button" class="btn-small btn-undo" id="lasso-undo-btn" title="Undo">↩</button>
+        <button type="button" class="btn-small btn-redo" id="lasso-redo-btn" title="Redo">↪</button>
+        <button type="button" class="btn-small lasso-cancel" id="lasso-cancel-btn">Cancel</button>
+      `;
+      highlightModeDescriptionEl.parentElement.appendChild(controls);
+    }
+
+    const undoButton = requireDomElement(
+      documentOwner.getElementById('lasso-undo-btn'),
+      'Lasso undo button',
+      ['addEventListener']
+    );
+    const redoButton = requireDomElement(
+      documentOwner.getElementById('lasso-redo-btn'),
+      'Lasso redo button',
+      ['addEventListener']
+    );
+    const confirmButton = requireDomElement(
+      documentOwner.getElementById('lasso-confirm-btn'),
+      'Lasso confirm button',
+      ['addEventListener']
+    );
+    const cancelButton = requireDomElement(
+      documentOwner.getElementById('lasso-cancel-btn'),
+      'Lasso cancel button',
+      ['addEventListener']
+    );
+    if (created) {
+      undoButton.addEventListener('click', handleLassoUndo);
+      redoButton.addEventListener('click', handleLassoRedo);
+      confirmButton.addEventListener('click', () => {
+        viewer.confirmLassoSelection();
+        state.clearPreviewHighlight();
+      });
+      cancelButton.addEventListener('click', () => {
+        viewer.cancelLassoSelection();
+      });
+    }
+    return { undoButton, redoButton, confirmButton };
+  }
+
+  function updateLassoUI(stepEvent) {
     if (!stepEvent || (stepEvent.step === 0 && !stepEvent.keepControls)) {
       highlightModeDescriptionEl.innerHTML = HIGHLIGHT_MODE_COPY.lasso;
-      const existingControls = document.getElementById('lasso-step-controls');
+      const existingControls = documentOwner.getElementById('lasso-step-controls');
       if (existingControls) existingControls.remove();
       return;
     }
@@ -161,41 +290,19 @@ export function initLassoSelection({ state, viewer, jupyterSource = null, select
       const stepInfo =
         '<strong>No selection</strong><br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>';
 
-      let controls = document.getElementById('lasso-step-controls');
-      if (!controls) {
-        controls = document.createElement('div');
-        controls.id = 'lasso-step-controls';
-        controls.className = 'lasso-step-controls';
-        controls.innerHTML = `
-          <button type="button" class="btn-small lasso-confirm" id="lasso-confirm-btn">Confirm</button>
-          <button type="button" class="btn-small btn-undo" id="lasso-undo-btn" title="Undo">↩</button>
-          <button type="button" class="btn-small btn-redo" id="lasso-redo-btn" title="Redo">↪</button>
-          <button type="button" class="btn-small lasso-cancel" id="lasso-cancel-btn">Cancel</button>
-        `;
-        highlightModeDescriptionEl.parentElement?.appendChild(controls);
-
-        document.getElementById('lasso-undo-btn')?.addEventListener('click', () => handleLassoUndo());
-        document.getElementById('lasso-redo-btn')?.addEventListener('click', () => handleLassoRedo());
-        document.getElementById('lasso-confirm-btn')?.addEventListener('click', () => {
-          viewer.confirmLassoSelection?.();
-          state.clearPreviewHighlight?.();
-        });
-        document.getElementById('lasso-cancel-btn')?.addEventListener('click', () => viewer.cancelLassoSelection?.());
-      }
-
-      const undoBtn = document.getElementById('lasso-undo-btn');
-      const redoBtn = document.getElementById('lasso-redo-btn');
-      const confirmBtn = document.getElementById('lasso-confirm-btn');
-      if (undoBtn) undoBtn.disabled = selectionState.lassoHistory.length === 0;
-      if (redoBtn) redoBtn.disabled = selectionState.lassoRedoStack.length === 0;
-      if (confirmBtn) confirmBtn.disabled = true;
+      const { undoButton, redoButton, confirmButton } = getLassoControls();
+      undoButton.disabled = selectionState.lassoHistory.length === 0;
+      redoButton.disabled = selectionState.lassoRedoStack.length === 0;
+      confirmButton.disabled = true;
 
       highlightModeDescriptionEl.innerHTML = stepInfo;
       return;
     }
 
     let modeLabel = '';
-    if (stepEvent.mode === 'union') {
+    if (stepEvent.restored === true) {
+      modeLabel = ' <span class="lasso-mode-tag intersect">current selection</span>';
+    } else if (stepEvent.mode === 'union') {
       modeLabel = ' <span class="lasso-mode-tag union">+added</span>';
     } else if (stepEvent.mode === 'subtract') {
       modeLabel = ' <span class="lasso-mode-tag subtract">−removed</span>';
@@ -205,42 +312,43 @@ export function initLassoSelection({ state, viewer, jupyterSource = null, select
 
     const stepInfo = `<strong>Step ${stepEvent.step}:</strong> ${stepEvent.candidateCount.toLocaleString()} cells${modeLabel}<br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>`;
 
-    let controls = document.getElementById('lasso-step-controls');
-    if (!controls) {
-      controls = document.createElement('div');
-      controls.id = 'lasso-step-controls';
-      controls.className = 'lasso-step-controls';
-      controls.innerHTML = `
-        <button type="button" class="btn-small lasso-confirm" id="lasso-confirm-btn">Confirm</button>
-        <button type="button" class="btn-small btn-undo" id="lasso-undo-btn" title="Undo">↩</button>
-        <button type="button" class="btn-small btn-redo" id="lasso-redo-btn" title="Redo">↪</button>
-        <button type="button" class="btn-small lasso-cancel" id="lasso-cancel-btn">Cancel</button>
-      `;
-      highlightModeDescriptionEl.parentElement?.appendChild(controls);
-
-      document.getElementById('lasso-undo-btn')?.addEventListener('click', () => handleLassoUndo());
-      document.getElementById('lasso-redo-btn')?.addEventListener('click', () => handleLassoRedo());
-      document.getElementById('lasso-confirm-btn')?.addEventListener('click', () => {
-        viewer.confirmLassoSelection?.();
-        state.clearPreviewHighlight?.();
-      });
-      document.getElementById('lasso-cancel-btn')?.addEventListener('click', () => viewer.cancelLassoSelection?.());
-    }
-
-    const undoBtn = document.getElementById('lasso-undo-btn');
-    const redoBtn = document.getElementById('lasso-redo-btn');
-    if (undoBtn) undoBtn.disabled = selectionState.lassoHistory.length === 0;
-    if (redoBtn) redoBtn.disabled = selectionState.lassoRedoStack.length === 0;
+    const { undoButton, redoButton, confirmButton } = getLassoControls();
+    undoButton.disabled = selectionState.lassoHistory.length === 0;
+    redoButton.disabled = selectionState.lassoRedoStack.length === 0;
+    confirmButton.disabled = stepEvent.candidateCount === 0;
 
     highlightModeDescriptionEl.innerHTML = stepInfo;
   }
 
-  if (viewer.setLassoCallback) {
-    viewer.setLassoCallback(handleLassoSelection);
-  }
-  if (viewer.setLassoStepCallback) {
-    viewer.setLassoStepCallback(handleLassoStep);
+  function restoreLassoSelection(unifiedState) {
+    requireUnifiedSelectionState(unifiedState);
+    selectionState.lassoHistory = [];
+    selectionState.lassoRedoStack = [];
+    selectionState.lastLassoCandidates = unifiedState.inProgress
+      ? [...unifiedState.candidates]
+      : null;
+    selectionState.lastLassoStep = unifiedState.stepCount;
+    if (!unifiedState.inProgress) {
+      updateLassoUI(null);
+      state.clearPreviewHighlight();
+      return;
+    }
+    updateLassoUI({
+      step: unifiedState.stepCount,
+      candidateCount: unifiedState.candidateCount,
+      candidates: unifiedState.candidates,
+      restored: true
+    });
+    if (unifiedState.candidateCount === 0) {
+      state.clearPreviewHighlight();
+    } else {
+      state.setPreviewHighlightFromIndices(unifiedState.candidates);
+    }
   }
 
-  return { handleLassoStep };
+  viewer.setLassoCallback(handleLassoSelection);
+  viewer.setLassoPreviewCallback(handleLassoPreview);
+  viewer.setLassoStepCallback(handleLassoStep);
+
+  return { handleLassoStep, restoreLassoSelection };
 }

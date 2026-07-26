@@ -1,236 +1,319 @@
 /**
- * @fileoverview UI control save/restore helpers for session bundles.
+ * @fileoverview Exact UI-control save/restore helpers for session bundles.
  *
- * This module is intentionally DOM-focused and does not depend on DataState
- * internals. It is used by the SessionSerializer eager stage to capture/restore
- * lightweight sidebar + floating panel UI inputs in a generic way.
+ * The current session format owns one closed inventory of stable DOM ids. A
+ * candidate is validated completely before any control is changed.
  *
  * @module state-serializer/ui-controls
  */
 
+const SERIALIZABLE_INPUT_TYPES = new Set([
+  'checkbox',
+  'range',
+  'number',
+  'color',
+  'text',
+  'search',
+]);
+
+// These controls are serialized by their feature owners, never by the generic
+// DOM-control contributor.
+const DOMAIN_OWNED_IDS = new Set([
+  'navigation-mode',
+  'categorical-field',
+  'continuous-field',
+  'outlier-filter',
+  'gene-expression-search',
+  'dimension-select',
+  'dataset-select',
+  'remote-server-url',
+  'github-repo-url',
+]);
+
+function assertPlainRecord(value, context) {
+  if (
+    value === null
+    || typeof value !== 'object'
+    || Array.isArray(value)
+    || (
+      Object.getPrototypeOf(value) !== Object.prototype
+      && Object.getPrototypeOf(value) !== null
+    )
+  ) {
+    throw new TypeError(`${context} must be a plain object.`);
+  }
+}
+
+function assertExactKeys(record, expectedKeys, context) {
+  const actualKeys = Object.keys(record).sort();
+  const exactKeys = [...expectedKeys].sort();
+  if (
+    actualKeys.length !== exactKeys.length
+    || actualKeys.some((key, index) => key !== exactKeys[index])
+  ) {
+    throw new TypeError(
+      `${context} must contain the exact keys ${exactKeys.join(', ')}.`,
+    );
+  }
+}
+
 function getUiRoots(sidebar) {
-  const roots = [];
-  if (sidebar) roots.push(sidebar);
+  if (!sidebar || typeof sidebar.querySelectorAll !== 'function') {
+    throw new TypeError('Session UI serialization requires the current sidebar root.');
+  }
+  const roots = [sidebar];
   const floatingRoot = document.getElementById('floating-panels-root');
-  if (floatingRoot) roots.push(floatingRoot);
+  if (floatingRoot !== null) {
+    if (typeof floatingRoot.querySelectorAll !== 'function') {
+      throw new TypeError('The floating-panels root must support DOM queries.');
+    }
+    roots.push(floatingRoot);
+  }
   return roots;
 }
 
 function queryAll(sidebar, selector) {
-  const roots = getUiRoots(sidebar);
   const out = [];
-  for (const root of roots) {
+  for (const root of getUiRoots(sidebar)) {
     out.push(...root.querySelectorAll(selector));
   }
   return out;
 }
 
-/**
- * Skip ephemeral UI subtrees from session bundle capture/restore.
- * Used for floating, copy-only panels that should not be serialized.
- * @param {Element|null} el
- * @returns {boolean}
- */
-function isStateSerializerSkipped(el) {
-  if (!el) return false;
-  return !!el.closest?.('[data-state-serializer-skip]');
+function isStateSerializerSkipped(element) {
+  if (typeof element.closest !== 'function') {
+    throw new TypeError('Every serialized UI element must support ancestor lookup.');
+  }
+  return element.closest('[data-state-serializer-skip]') !== null;
 }
 
-// IDs that should be skipped during general restoration (handled specially or
-// intentionally excluded from session bundles).
-const SPECIAL_IDS = new Set([
-  'navigation-mode', // Camera-related, handled separately
-  'categorical-field', // Dynamically populated, handled via activeFields
-  'continuous-field', // Dynamically populated, handled via activeFields
-  'outlier-filter', // Per-field state, restored after active field is set
-  'gene-expression-search', // Restored via activeFields
-  'dimension-select', // Restored explicitly by core-state (avoid async handler races)
-  'dataset-select', // Not part of session state (dataset assumed already loaded)
-  'remote-server-url', // Connection UI only; not session state
-  'github-repo-url', // Connection UI only; not session state
-]);
+function assertStableId(id, context) {
+  if (typeof id !== 'string' || id.length === 0 || id !== id.trim()) {
+    throw new TypeError(`${context} must have a stable nonempty DOM id.`);
+  }
+  return id;
+}
 
-function restoreSingleControl(id, data, options = {}) {
-  // NOTE: We keep this helper resilient to dynamic UIs. Some selects are
-  // populated asynchronously (e.g., after dataset metadata arrives). The
-  // restore logic retries setting select values for a short period to avoid
-  // noisy warnings and to improve fidelity.
-  if (!data) return;
-  const abortSignal = options.abortSignal || null;
-  const el = document.getElementById(id);
-  if (!el) {
-    console.warn(`[SessionSerializer] Control not found: ${id}`);
+function registerInventoryEntry(inventory, key, entry) {
+  if (inventory.has(key)) {
+    throw new TypeError(`Session UI control id "${key}" is not unique.`);
+  }
+  inventory.set(key, entry);
+}
+
+function buildCurrentInventory(sidebar) {
+  const inventory = new Map();
+
+  for (const input of queryAll(sidebar, 'input[id]')) {
+    if (isStateSerializerSkipped(input)) continue;
+    if (!SERIALIZABLE_INPUT_TYPES.has(input.type)) continue;
+    const elementId = assertStableId(input.id, 'Every serialized input');
+    if (DOMAIN_OWNED_IDS.has(elementId)) continue;
+    registerInventoryEntry(inventory, elementId, {
+      element: input,
+      type: input.type === 'search' ? 'text' : input.type,
+    });
+  }
+
+  for (const select of queryAll(sidebar, 'select[id]')) {
+    if (isStateSerializerSkipped(select)) continue;
+    const elementId = assertStableId(select.id, 'Every serialized select');
+    if (DOMAIN_OWNED_IDS.has(elementId)) continue;
+    registerInventoryEntry(inventory, elementId, {
+      element: select,
+      type: 'select',
+    });
+  }
+
+  for (const details of queryAll(sidebar, 'details.accordion-section')) {
+    if (isStateSerializerSkipped(details)) continue;
+    const elementId = assertStableId(
+      details.id,
+      'Every serialized accordion',
+    );
+    registerInventoryEntry(inventory, `accordion:${elementId}`, {
+      element: details,
+      type: 'details',
+    });
+  }
+
+  return inventory;
+}
+
+function assertFiniteNumericControlValue(element, value, id) {
+  if (value.length === 0 || !Number.isFinite(Number(value))) {
+    throw new TypeError(`Session UI control "${id}" value must be a finite numeric string.`);
+  }
+  const numericValue = Number(value);
+  if (typeof element.min === 'string' && element.min.length > 0) {
+    const minimum = Number(element.min);
+    if (!Number.isFinite(minimum) || numericValue < minimum) {
+      throw new RangeError(`Session UI control "${id}" value is below its current minimum.`);
+    }
+  }
+  if (typeof element.max === 'string' && element.max.length > 0) {
+    const maximum = Number(element.max);
+    if (!Number.isFinite(maximum) || numericValue > maximum) {
+      throw new RangeError(`Session UI control "${id}" value is above its current maximum.`);
+    }
+  }
+}
+
+function validateControlRecord(id, record, inventoryEntry) {
+  assertPlainRecord(record, `Session UI control "${id}"`);
+  const { element, type } = inventoryEntry;
+
+  if (record.type !== type) {
+    throw new TypeError(
+      `Session UI control "${id}" must declare current type "${type}".`,
+    );
+  }
+
+  if (type === 'checkbox') {
+    assertExactKeys(record, ['type', 'checked'], `Session UI control "${id}"`);
+    if (typeof record.checked !== 'boolean') {
+      throw new TypeError(`Session UI control "${id}" checked must be boolean.`);
+    }
     return;
   }
-  if (isStateSerializerSkipped(el)) return;
 
-  try {
-    if (data.type === 'checkbox' && el.type === 'checkbox') {
-      // Avoid dispatching change events if state is already in sync (saves expensive recomputations)
-      if (el.checked !== data.checked) {
-        el.checked = data.checked;
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-      }
-    } else if (data.type === 'select' && el.tagName === 'SELECT') {
-      const nextValue = data.value ?? '';
-      const stringValue = String(nextValue);
-
-      // Empty string is commonly used by placeholder options (or by selects that
-      // haven't been populated yet). Treat it as "no-op" unless the option
-      // actually exists.
-      if (stringValue === '') {
-        const hasEmptyOption = Array.from(el.options).some(opt => opt.value === '');
-        if (hasEmptyOption && el.value !== '') {
-          el.value = '';
-          el.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-        return;
-      }
-
-      const optionExists = Array.from(el.options).some(opt => opt.value === stringValue);
-      if (optionExists) {
-        if (el.value !== stringValue) {
-          el.value = stringValue;
-          el.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-        return;
-      }
-
-      // If the option isn't present yet, the select may be dynamically
-      // populated. Defer a few retries instead of warning immediately.
-      const maxAttempts = 30;
-      const delayMs = 100;
-      let attempt = 0;
-
-      const retry = () => {
-        if (abortSignal?.aborted) return;
-        attempt += 1;
-        const current = document.getElementById(id);
-        if (!current || current.tagName !== 'SELECT') return;
-
-        const exists = Array.from(current.options).some(opt => opt.value === stringValue);
-        if (exists) {
-          if (current.value !== stringValue) {
-            current.value = stringValue;
-            current.dispatchEvent(new Event('change', { bubbles: true }));
-          }
-          return;
-        }
-
-        if (attempt >= maxAttempts) {
-          console.warn(`[SessionSerializer] Option '${stringValue}' not found in select '${id}'`);
-          return;
-        }
-
-        setTimeout(retry, delayMs);
-      };
-
-      if (!abortSignal?.aborted) setTimeout(retry, 0);
-    } else if ((data.type === 'range' || data.type === 'number') && el.type === data.type) {
-      const nextValue = String(data.value);
-      if (el.value !== nextValue) {
-        el.value = nextValue;
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-      }
-    } else if (data.type === 'color' && el.type === 'color') {
-      if (el.value !== data.value) {
-        el.value = data.value;
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-      }
-    } else if (data.type === 'text' && (el.type === 'text' || el.type === 'search')) {
-      if (el.value !== data.value) {
-        el.value = data.value;
-        // Also dispatch input event for search fields that might have handlers
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-      }
+  if (type === 'details') {
+    assertExactKeys(record, ['type', 'open'], `Session UI control "${id}"`);
+    if (typeof record.open !== 'boolean') {
+      throw new TypeError(`Session UI control "${id}" open must be boolean.`);
     }
-  } catch (err) {
-    console.error(`[SessionSerializer] Error restoring control '${id}':`, err);
+    return;
+  }
+
+  assertExactKeys(record, ['type', 'value'], `Session UI control "${id}"`);
+  if (typeof record.value !== 'string') {
+    throw new TypeError(`Session UI control "${id}" value must be a string.`);
+  }
+
+  if (type === 'select') {
+    const options = Array.from(element.options);
+    const optionExists = options.some(
+      option => option.value === record.value,
+    );
+    const exactUnavailableState = options.length === 0 && record.value === '';
+    if (!optionExists && !exactUnavailableState) {
+      throw new RangeError(
+        `Session UI select option "${record.value}" is not available in current control "${id}".`,
+      );
+    }
+  } else if (type === 'range' || type === 'number') {
+    assertFiniteNumericControlValue(element, record.value, id);
+  } else if (type === 'color' && !/^#[0-9a-f]{6}$/.test(record.value)) {
+    throw new TypeError(
+      `Session UI control "${id}" color must be an exact lowercase six-digit hex value.`,
+    );
+  }
+}
+
+function validateCompleteControls(controls, inventory) {
+  assertPlainRecord(controls, 'Session UI controls');
+  const candidateKeys = Object.keys(controls).sort();
+  const currentKeys = [...inventory.keys()].sort();
+
+  for (const key of candidateKeys) {
+    if (!inventory.has(key)) {
+      throw new TypeError(
+        `Session UI control "${key}" does not exist in the current interface.`,
+      );
+    }
+  }
+  for (const key of currentKeys) {
+    if (!Object.hasOwn(controls, key)) {
+      throw new TypeError(`Session UI state is missing current control "${key}".`);
+    }
+  }
+  if (candidateKeys.length !== currentKeys.length) {
+    throw new TypeError('Session UI state must match the complete current control inventory.');
+  }
+
+  for (const key of currentKeys) {
+    validateControlRecord(key, controls[key], inventory.get(key));
+  }
+}
+
+function dispatchControlEvent(element, type) {
+  element.dispatchEvent(new Event(type, { bubbles: true }));
+}
+
+function restoreValidatedControl(entry, data) {
+  const { element, type } = entry;
+  if (type === 'checkbox') {
+    if (element.checked !== data.checked) {
+      element.checked = data.checked;
+      dispatchControlEvent(element, 'change');
+    }
+    return;
+  }
+  if (type === 'details') {
+    element.open = data.open;
+    return;
+  }
+  if (element.value === data.value) return;
+  element.value = data.value;
+  dispatchControlEvent(element, type === 'select' ? 'change' : 'input');
+}
+
+function assertRestoreOptions(options) {
+  assertPlainRecord(options, 'Session UI restore options');
+  assertExactKeys(
+    options,
+    Object.hasOwn(options, 'abortSignal') ? ['abortSignal'] : [],
+    'Session UI restore options',
+  );
+  if (
+    Object.hasOwn(options, 'abortSignal')
+    && options.abortSignal !== null
+    && typeof options.abortSignal?.aborted !== 'boolean'
+  ) {
+    throw new TypeError('Session UI abortSignal must expose a boolean aborted state.');
   }
 }
 
 export function createUiControlSerializer({ sidebar }) {
-  /**
-   * Dynamically collect all UI control values from the sidebar.
-   * Uses element IDs as keys for restoration.
-   */
+  getUiRoots(sidebar);
+
   function collectUIControls() {
     const controls = {};
-
-    queryAll(sidebar, 'input[id]').forEach(input => {
-      if (isStateSerializerSkipped(input)) return;
-      const id = input.id;
-      if (input.type === 'checkbox') {
-        controls[id] = { type: 'checkbox', checked: input.checked };
-      } else if (input.type === 'range' || input.type === 'number') {
-        controls[id] = { type: input.type, value: input.value };
-      } else if (input.type === 'color') {
-        controls[id] = { type: 'color', value: input.value };
-      } else if (input.type === 'text' || input.type === 'search') {
-        controls[id] = { type: 'text', value: input.value };
+    const inventory = buildCurrentInventory(sidebar);
+    for (const [id, { element, type }] of inventory) {
+      if (type === 'checkbox') {
+        controls[id] = { type, checked: element.checked };
+      } else if (type === 'details') {
+        controls[id] = { type, open: element.open };
+      } else {
+        controls[id] = { type, value: element.value };
       }
-    });
-
-    queryAll(sidebar, 'select[id]').forEach(select => {
-      if (isStateSerializerSkipped(select)) return;
-      controls[select.id] = { type: 'select', value: select.value };
-    });
-
-    queryAll(sidebar, 'details.accordion-section').forEach(details => {
-      if (isStateSerializerSkipped(details)) return;
-      const summary = details.querySelector('summary');
-      const key = summary?.textContent?.trim() || details.id;
-      if (key) {
-        controls[`accordion:${key}`] = { type: 'details', open: details.open };
-      }
-    });
-
+    }
     return controls;
   }
 
-  /**
-   * Restore UI controls from saved state.
-   * @param {Object} controls - Saved control values
-   * @param {{ skipIds?: Set<string>, abortSignal?: AbortSignal | null }} [options]
-   */
   function restoreUIControls(controls, options = {}) {
-    if (!controls) return;
+    assertRestoreOptions(options);
+    const abortSignal = Object.hasOwn(options, 'abortSignal')
+      ? options.abortSignal
+      : null;
+    if (abortSignal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
 
-    const skipIds = options.skipIds instanceof Set ? options.skipIds : new Set();
-    const abortSignal = options.abortSignal || null;
-    const allSkipIds = new Set([...SPECIAL_IDS, ...skipIds]);
+    const inventory = buildCurrentInventory(sidebar);
+    validateCompleteControls(controls, inventory);
 
-    // First pass: restore accordions
-    Object.entries(controls).forEach(([id, data]) => {
-      if (!id.startsWith('accordion:')) return;
-      const key = id.replace('accordion:', '');
-      queryAll(sidebar, 'details.accordion-section').forEach(details => {
-        if (isStateSerializerSkipped(details)) return;
-        const summary = details.querySelector('summary');
-        const summaryText = summary?.textContent?.trim();
-        if (summaryText === key || details.id === key) {
-          details.open = data.open;
+    const restoreOrder = ['details', 'checkbox', 'select', 'range', 'number', 'color', 'text'];
+    for (const type of restoreOrder) {
+      for (const [id, entry] of inventory) {
+        if (entry.type !== type) continue;
+        if (abortSignal?.aborted) {
+          throw new DOMException('Aborted', 'AbortError');
         }
-      });
-    });
-
-    // Second pass: restore controls in order (checkboxes first, then selects, then ranges)
-    const checkboxes = [];
-    const selects = [];
-    const ranges = [];
-    const others = [];
-
-    Object.entries(controls).forEach(([id, data]) => {
-      if (allSkipIds.has(id) || id.startsWith('accordion:')) return;
-      if (data.type === 'checkbox') checkboxes.push([id, data]);
-      else if (data.type === 'select') selects.push([id, data]);
-      else if (data.type === 'range' || data.type === 'number') ranges.push([id, data]);
-      else others.push([id, data]);
-    });
-
-    [...checkboxes, ...selects, ...ranges, ...others].forEach(([id, data]) => {
-      restoreSingleControl(id, data, { abortSignal });
-    });
+        restoreValidatedControl(entry, controls[id]);
+      }
+    }
   }
 
   return { collectUIControls, restoreUIControls };

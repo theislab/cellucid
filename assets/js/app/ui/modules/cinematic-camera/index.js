@@ -11,11 +11,21 @@
  * @module ui/modules/cinematic-camera/index
  */
 
-import { createKeyframeStore } from './keyframe-store.js';
+import {
+  createKeyframeStore,
+  isValidCameraKeyframe,
+  MAX_KEYFRAMES,
+  MAX_TRANSITION_DURATION_SECONDS
+} from './keyframe-store.js';
 import { createPlaybackController } from './playback-controller.js';
 import { createTransportBar } from './transport-bar.js';
+import { assertCameraPathOptions } from './interpolation-engine.js';
 import { getNotificationCenter } from '../../../notification-center.js';
-import { clamp } from '../../../utils/number-utils.js';
+import { assertNavigationMode } from '../../../../rendering/camera-state-contract.js';
+import {
+  parseIntegerInput,
+  parseRangeInput
+} from '../../core/numeric-input-contract.js';
 
 // SVG icons (12 × 12, 2 px stroke, matching field-action-btn icons)
 const SVG_UP = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"/></svg>`;
@@ -23,6 +33,49 @@ const SVG_DOWN = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" st
 const SVG_GOTO = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>`;
 const SVG_DELETE = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`;
 const LOOP_BACK_LABEL = '\u21A9 Return to Start';
+const CAMERA_PATH_SESSION_KEYS = [
+  'defaultSpeed',
+  'easing',
+  'keyframes',
+  'loopBackKeyframeId',
+  'loopPlayback',
+  'navigationMode',
+  'nextIndex',
+  'positionMethod',
+  'rotationMethod'
+];
+const REQUIRED_DOM_KEYS = [
+  'navModeSelect',
+  'orbitControls',
+  'planarControls',
+  'freeflyControls',
+  'orbitKeySpeedInput',
+  'orbitKeySpeedDisplay',
+  'orbitReverseCheckbox',
+  'showOrbitAnchorCheckbox',
+  'planarPanSpeedInput',
+  'planarPanSpeedDisplay',
+  'planarZoomToCursorCheckbox',
+  'planarInvertAxesCheckbox',
+  'lookSensitivityInput',
+  'lookSensitivityDisplay',
+  'moveSpeedInput',
+  'moveSpeedDisplay',
+  'invertLookCheckbox',
+  'pointerLockCheckbox',
+  'saveBtn',
+  'keyframeList',
+  'clearBtn',
+  'timingActions',
+  'setAllDuration',
+  'setAllBtn',
+  'defaultSpeedInput',
+  'defaultSpeedDisplay',
+  'positionInterp',
+  'rotationInterp',
+  'easingSelect',
+  'loopCheckbox'
+];
 
 // Speed slider labels (maps slider 1-100 to descriptive text)
 const SPEED_LABELS = [
@@ -46,21 +99,100 @@ function speedLabel(val) {
  * 1 ≈ 0.1, 100 ≈ 4.0.
  */
 function sliderToAutoPaceSpeed(raw) {
-  const v = clamp(parseFloat(raw) || 30, 1, 100);
+  const v = parseRangeInput(raw, {
+    minimum: 1,
+    maximum: 100,
+    label: 'Camera path default speed'
+  });
   // Exponential mapping for a nice feel
   return 0.1 * Math.pow(40, v / 100);
+}
+
+export function assertCameraPathSessionState(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new TypeError('Camera Path session state must be an object.');
+  }
+  const keys = Object.keys(data).sort();
+  if (
+    keys.length !== CAMERA_PATH_SESSION_KEYS.length ||
+    keys.some((key, index) => key !== CAMERA_PATH_SESSION_KEYS[index])
+  ) {
+    throw new TypeError(
+      `Camera Path session state must contain exactly ${CAMERA_PATH_SESSION_KEYS.join(', ')}.`
+    );
+  }
+  if (
+    !Array.isArray(data.keyframes) ||
+    data.keyframes.length > MAX_KEYFRAMES ||
+    !data.keyframes.every(isValidCameraKeyframe)
+  ) {
+    throw new TypeError('Camera Path session state contains invalid keyframes.');
+  }
+  const ids = new Set(data.keyframes.map(({ id }) => id));
+  if (ids.size !== data.keyframes.length) {
+    throw new TypeError('Camera Path session keyframe ids must be unique.');
+  }
+  if (!Number.isInteger(data.nextIndex) || data.nextIndex <= 0) {
+    throw new TypeError('Camera Path session nextIndex must be a positive integer.');
+  }
+  if (typeof data.defaultSpeed !== 'string') {
+    throw new TypeError('Camera Path session defaultSpeed must be a range-input string.');
+  }
+  assertCameraPathOptions({
+    positionMethod: data.positionMethod,
+    rotationMethod: data.rotationMethod,
+    easing: data.easing,
+    loop: data.loopPlayback,
+    autoPaceSpeed: sliderToAutoPaceSpeed(data.defaultSpeed)
+  });
+  assertNavigationMode(data.navigationMode);
+
+  if (data.loopBackKeyframeId !== null) {
+    if (
+      typeof data.loopBackKeyframeId !== 'string' ||
+      data.keyframes.length < 3 ||
+      data.keyframes[data.keyframes.length - 1].id !== data.loopBackKeyframeId
+    ) {
+      throw new TypeError(
+        'Camera Path session loopBackKeyframeId must be null or identify the final keyframe of a complete loop.'
+      );
+    }
+  }
+  return data;
 }
 
 /**
  * @param {Object} options
  * @param {Object} options.viewer   Viewer API.
  * @param {Object} options.dom      Cached DOM references (cinematicCamera block).
+ * @param {Object} options.dataSourceManager Dataset lifecycle source.
  */
-export function initCinematicCamera({ viewer, dom }) {
-  if (!dom?.saveBtn) return {};
+export function initCinematicCamera({
+  viewer,
+  dom,
+  dataSourceManager
+}) {
+  if (!dom || typeof dom !== 'object' || Array.isArray(dom)) {
+    throw new TypeError('Camera Path requires a DOM reference object.');
+  }
+  for (const key of REQUIRED_DOM_KEYS) {
+    if (!dom[key]) {
+      throw new Error(`Camera Path UI is missing its required "${key}" element.`);
+    }
+  }
+  if (
+    !dataSourceManager ||
+    typeof dataSourceManager.onDatasetChange !== 'function' ||
+    typeof dataSourceManager.offDatasetChange !== 'function'
+  ) {
+    throw new TypeError(
+      'Camera Path requires dataset change subscription and unsubscription methods.'
+    );
+  }
 
   const keyframeStore = createKeyframeStore();
   let loopBackKeyframeId = null;
+  let suppressTransportReveal = false;
 
   function hasLoopBackKeyframe() {
     return Boolean(loopBackKeyframeId && keyframeStore.getById(loopBackKeyframeId));
@@ -116,150 +248,148 @@ export function initCinematicCamera({ viewer, dom }) {
   // =========================================================================
 
   function toggleNavigationPanels(mode) {
-    if (dom.freeflyControls) dom.freeflyControls.style.display = mode === 'free' ? 'block' : 'none';
-    if (dom.orbitControls) dom.orbitControls.style.display = mode === 'orbit' ? 'block' : 'none';
-    if (dom.planarControls) dom.planarControls.style.display = mode === 'planar' ? 'block' : 'none';
+    dom.freeflyControls.style.display = mode === 'free' ? 'block' : 'none';
+    dom.orbitControls.style.display = mode === 'orbit' ? 'block' : 'none';
+    dom.planarControls.style.display = mode === 'planar' ? 'block' : 'none';
   }
 
-  if (dom.navModeSelect) {
-    // Sync dropdown → viewer on change
-    dom.navModeSelect.addEventListener('change', () => {
-      const mode = dom.navModeSelect.value === 'free' ? 'free' : (dom.navModeSelect.value === 'planar' ? 'planar' : 'orbit');
-      viewer.setNavigationMode?.(mode);
-      toggleNavigationPanels(mode);
-      dom.navModeSelect.blur();
-    });
-
-    // Sync viewer → dropdown on init
-    const startMode = viewer.getNavigationMode?.() || 'orbit';
-    dom.navModeSelect.value = startMode;
-    toggleNavigationPanels(startMode);
+  function syncNavigationMode(mode) {
+    assertNavigationMode(mode);
+    dom.navModeSelect.value = mode;
+    toggleNavigationPanels(mode);
   }
+
+  // Sync dropdown → viewer on change
+  dom.navModeSelect.addEventListener('change', () => {
+    viewer.setNavigationMode(dom.navModeSelect.value);
+    const mode = dom.navModeSelect.value;
+    syncNavigationMode(mode);
+    dom.navModeSelect.blur();
+  });
+
+  // Sync viewer → dropdown on init
+  syncNavigationMode(viewer.getNavigationMode());
 
   // ---- Orbit controls ----
 
   function updateOrbitKeySpeed() {
-    if (!dom.orbitKeySpeedInput) return;
-    const value = parseFloat(dom.orbitKeySpeedInput.value) / 100;
-    if (dom.orbitKeySpeedDisplay) dom.orbitKeySpeedDisplay.textContent = value.toFixed(2) + 'x';
-    viewer.setOrbitKeySpeed?.(value);
-  }
-
-  if (dom.orbitKeySpeedInput) {
-    updateOrbitKeySpeed();
-    dom.orbitKeySpeedInput.addEventListener('input', updateOrbitKeySpeed);
-  }
-
-  if (dom.orbitReverseCheckbox && viewer.setOrbitInvertRotation) {
-    viewer.setOrbitInvertRotation(Boolean(dom.orbitReverseCheckbox.checked));
-    dom.orbitReverseCheckbox.addEventListener('change', () => {
-      viewer.setOrbitInvertRotation(Boolean(dom.orbitReverseCheckbox.checked));
+    const rawValue = parseRangeInput(dom.orbitKeySpeedInput.value, {
+      minimum: 1,
+      maximum: 100,
+      label: 'Camera Path orbit keyboard speed'
     });
+    const value = rawValue / 100;
+    dom.orbitKeySpeedDisplay.textContent = value.toFixed(2) + 'x';
+    viewer.setOrbitKeySpeed(value);
   }
 
-  if (dom.showOrbitAnchorCheckbox && viewer.setShowOrbitAnchor) {
-    viewer.setShowOrbitAnchor(Boolean(dom.showOrbitAnchorCheckbox.checked));
-    dom.showOrbitAnchorCheckbox.addEventListener('change', () => {
-      viewer.setShowOrbitAnchor(Boolean(dom.showOrbitAnchorCheckbox.checked));
-    });
-  }
+  updateOrbitKeySpeed();
+  dom.orbitKeySpeedInput.addEventListener('input', updateOrbitKeySpeed);
+
+  viewer.setOrbitInvertRotation(dom.orbitReverseCheckbox.checked);
+  dom.orbitReverseCheckbox.addEventListener('change', () => {
+    viewer.setOrbitInvertRotation(dom.orbitReverseCheckbox.checked);
+  });
+
+  viewer.setShowOrbitAnchor(dom.showOrbitAnchorCheckbox.checked);
+  dom.showOrbitAnchorCheckbox.addEventListener('change', () => {
+    viewer.setShowOrbitAnchor(dom.showOrbitAnchorCheckbox.checked);
+  });
 
   // ---- Planar controls ----
 
   function updatePlanarPanSpeed() {
-    if (!dom.planarPanSpeedInput) return;
-    const t = (parseFloat(dom.planarPanSpeedInput.value) - 1) / 99;
+    const rawValue = parseRangeInput(dom.planarPanSpeedInput.value, {
+      minimum: 1,
+      maximum: 100,
+      label: 'Camera Path planar keyboard pan speed'
+    });
+    const t = (rawValue - 1) / 99;
     const value = 0.001 + t * (0.0075 - 0.001);
-    if (dom.planarPanSpeedDisplay) dom.planarPanSpeedDisplay.textContent = value.toFixed(4) + 'x';
-    viewer.setPlanarPanSpeed?.(value);
+    dom.planarPanSpeedDisplay.textContent = value.toFixed(4) + 'x';
+    viewer.setPlanarPanSpeed(value);
   }
 
-  if (dom.planarPanSpeedInput) {
-    updatePlanarPanSpeed();
-    dom.planarPanSpeedInput.addEventListener('input', updatePlanarPanSpeed);
-  }
+  updatePlanarPanSpeed();
+  dom.planarPanSpeedInput.addEventListener('input', updatePlanarPanSpeed);
 
-  if (dom.planarZoomToCursorCheckbox && viewer.setPlanarZoomToCursor) {
-    viewer.setPlanarZoomToCursor(Boolean(dom.planarZoomToCursorCheckbox.checked));
-    dom.planarZoomToCursorCheckbox.addEventListener('change', () => {
-      viewer.setPlanarZoomToCursor(Boolean(dom.planarZoomToCursorCheckbox.checked));
-    });
-  }
+  viewer.setPlanarZoomToCursor(dom.planarZoomToCursorCheckbox.checked);
+  dom.planarZoomToCursorCheckbox.addEventListener('change', () => {
+    viewer.setPlanarZoomToCursor(dom.planarZoomToCursorCheckbox.checked);
+  });
 
-  if (dom.planarInvertAxesCheckbox && viewer.setPlanarInvertAxes) {
-    viewer.setPlanarInvertAxes(Boolean(dom.planarInvertAxesCheckbox.checked));
-    dom.planarInvertAxesCheckbox.addEventListener('change', () => {
-      viewer.setPlanarInvertAxes(Boolean(dom.planarInvertAxesCheckbox.checked));
-    });
-  }
+  viewer.setPlanarInvertAxes(dom.planarInvertAxesCheckbox.checked);
+  dom.planarInvertAxesCheckbox.addEventListener('change', () => {
+    viewer.setPlanarInvertAxes(dom.planarInvertAxesCheckbox.checked);
+  });
 
   // ---- Free-fly controls ----
 
   function updateLookSensitivity() {
-    if (!dom.lookSensitivityInput) return;
-    const v = clamp(parseFloat(dom.lookSensitivityInput.value) || 5, 1, 30);
+    const v = parseRangeInput(dom.lookSensitivityInput.value, {
+      minimum: 1,
+      maximum: 30,
+      label: 'Camera Path look sensitivity'
+    });
     const sensitivity = v * 0.0005;
-    if (dom.lookSensitivityDisplay) dom.lookSensitivityDisplay.textContent = (v / 100).toFixed(2) + 'x';
-    viewer.setLookSensitivity?.(sensitivity);
+    dom.lookSensitivityDisplay.textContent = (v / 100).toFixed(2) + 'x';
+    viewer.setLookSensitivity(sensitivity);
   }
 
   function updateMoveSpeed() {
-    if (!dom.moveSpeedInput) return;
-    const v = clamp(parseFloat(dom.moveSpeedInput.value) || 100, 1, 500);
+    const v = parseRangeInput(dom.moveSpeedInput.value, {
+      minimum: 1,
+      maximum: 500,
+      label: 'Camera Path move speed'
+    });
     const speed = v / 100;
-    if (dom.moveSpeedDisplay) dom.moveSpeedDisplay.textContent = speed.toFixed(2) + ' u/s';
-    viewer.setMoveSpeed?.(speed);
+    dom.moveSpeedDisplay.textContent = speed.toFixed(2) + ' u/s';
+    viewer.setMoveSpeed(speed);
   }
 
-  if (dom.lookSensitivityInput) {
-    updateLookSensitivity();
-    dom.lookSensitivityInput.addEventListener('input', updateLookSensitivity);
-  }
+  updateLookSensitivity();
+  dom.lookSensitivityInput.addEventListener('input', updateLookSensitivity);
 
-  if (dom.moveSpeedInput) {
-    updateMoveSpeed();
-    dom.moveSpeedInput.addEventListener('input', updateMoveSpeed);
-  }
+  updateMoveSpeed();
+  dom.moveSpeedInput.addEventListener('input', updateMoveSpeed);
 
-  if (dom.invertLookCheckbox && viewer.setInvertLook) {
-    const setY = viewer.setInvertLookY || viewer.setInvertLook;
-    const setX = viewer.setInvertLookX || viewer.setInvertLook;
-    const apply = (val) => { setY.call(viewer, val); setX.call(viewer, val); };
-    apply(Boolean(dom.invertLookCheckbox.checked));
-    dom.invertLookCheckbox.addEventListener('change', () => {
-      apply(Boolean(dom.invertLookCheckbox.checked));
-    });
-  }
+  const applyInvertLook = (value) => {
+    viewer.setInvertLookY(value);
+    viewer.setInvertLookX(value);
+  };
+  applyInvertLook(dom.invertLookCheckbox.checked);
+  dom.invertLookCheckbox.addEventListener('change', () => {
+    applyInvertLook(dom.invertLookCheckbox.checked);
+  });
 
-  if (dom.pointerLockCheckbox && viewer.setPointerLockEnabled) {
-    dom.pointerLockCheckbox.checked = false;
-    dom.pointerLockCheckbox.addEventListener('change', () => {
-      const mode = dom.navModeSelect?.value;
-      if (mode !== 'free') {
-        dom.pointerLockCheckbox.checked = false;
-        return;
-      }
-      viewer.setPointerLockEnabled(Boolean(dom.pointerLockCheckbox.checked));
-    });
-  }
+  dom.pointerLockCheckbox.checked = false;
+  dom.pointerLockCheckbox.addEventListener('change', () => {
+    const mode = dom.navModeSelect.value;
+    if (mode !== 'free') {
+      dom.pointerLockCheckbox.checked = false;
+      return;
+    }
+    viewer.setPointerLockEnabled(dom.pointerLockCheckbox.checked);
+  });
 
   // =========================================================================
   // Default speed slider
   // =========================================================================
 
-  let autoPaceSpeed = sliderToAutoPaceSpeed(dom.defaultSpeedInput?.value ?? 30);
+  let autoPaceSpeed = sliderToAutoPaceSpeed(dom.defaultSpeedInput.value);
 
   function updateDefaultSpeedDisplay() {
-    if (!dom.defaultSpeedInput) return;
-    const raw = parseFloat(dom.defaultSpeedInput.value) || 30;
-    autoPaceSpeed = sliderToAutoPaceSpeed(raw);
-    if (dom.defaultSpeedDisplay) dom.defaultSpeedDisplay.textContent = speedLabel(raw);
+    const raw = parseRangeInput(dom.defaultSpeedInput.value, {
+      minimum: 1,
+      maximum: 100,
+      label: 'Camera path default speed'
+    });
+    autoPaceSpeed = sliderToAutoPaceSpeed(dom.defaultSpeedInput.value);
+    dom.defaultSpeedDisplay.textContent = speedLabel(raw);
   }
 
-  if (dom.defaultSpeedInput) {
-    updateDefaultSpeedDisplay();
-    dom.defaultSpeedInput.addEventListener('input', updateDefaultSpeedDisplay);
-  }
+  updateDefaultSpeedDisplay();
+  dom.defaultSpeedInput.addEventListener('input', updateDefaultSpeedDisplay);
 
   // =========================================================================
   // Interpolation options reader
@@ -267,10 +397,10 @@ export function initCinematicCamera({ viewer, dom }) {
 
   function getInterpolationOptions() {
     return {
-      positionMethod: dom.positionInterp?.value || 'catmull-rom',
-      rotationMethod: dom.rotationInterp?.value || 'slerp',
-      easing: dom.easingSelect?.value || 'linear',
-      loop: dom.loopCheckbox?.checked || false,
+      positionMethod: dom.positionInterp.value,
+      rotationMethod: dom.rotationInterp.value,
+      easing: dom.easingSelect.value,
+      loop: dom.loopCheckbox.checked,
       autoPaceSpeed
     };
   }
@@ -290,17 +420,12 @@ export function initCinematicCamera({ viewer, dom }) {
     keyframeStore,
     getInterpolationOptions
   });
-  transportBar.create();
 
   // Keep the nav mode UI in sync when playback changes modes (cross-mode paths)
   // or when playback stops (which jumps to the first keyframe's mode).
   playbackController.on('stateChange', (newState) => {
     if (newState === 'STOPPED' && dom.navModeSelect) {
-      const mode = viewer.getNavigationMode?.();
-      if (mode) {
-        dom.navModeSelect.value = mode;
-        toggleNavigationPanels(mode);
-      }
+      syncNavigationMode(viewer.getNavigationMode());
     }
   });
 
@@ -329,25 +454,27 @@ export function initCinematicCamera({ viewer, dom }) {
   // Clear All
   // =========================================================================
 
-  if (dom.clearBtn) {
-    dom.clearBtn.addEventListener('click', () => {
-      if (keyframeStore.getCount() === 0) return;
-      playbackController.stop();
-      keyframeStore.clear();
-    });
-  }
+  dom.clearBtn.addEventListener('click', () => {
+    if (keyframeStore.getCount() === 0) return;
+    playbackController.stop({ resetCamera: true });
+    keyframeStore.clear();
+  });
 
   // =========================================================================
   // Set All Timing
   // =========================================================================
 
-  if (dom.setAllBtn) {
-    dom.setAllBtn.addEventListener('click', () => {
-      const raw = dom.setAllDuration?.value;
-      const val = raw === '' || raw == null ? null : parseFloat(raw);
-      keyframeStore.setAllDurations(val);
-    });
-  }
+  dom.setAllBtn.addEventListener('click', () => {
+    const raw = dom.setAllDuration.value;
+    const value = raw === ''
+      ? null
+      : parseRangeInput(raw, {
+          minimum: 0.1,
+          maximum: MAX_TRANSITION_DURATION_SECONDS,
+          label: 'Camera Path transition duration'
+        });
+    keyframeStore.setAllDurations(value);
+  });
 
   // =========================================================================
   // Unified keyframe + timing list rendering
@@ -380,7 +507,7 @@ export function initCinematicCamera({ viewer, dom }) {
     <button class="cinematic-kf-btn" data-action="goto" title="Go to position">${SVG_GOTO}</button>
     <button class="cinematic-kf-btn cinematic-kf-delete" data-action="delete" title="Delete">${SVG_DELETE}</button>
   </div>`;
-      html += `<div class="cinematic-keyframe-item${isLoopBack ? ' cinematic-keyframe-item-loopback' : ''}" data-id="${kf.id}">
+      html += `<div class="cinematic-keyframe-item${isLoopBack ? ' cinematic-keyframe-item-loopback' : ''}" data-id="${escapeHtml(kf.id)}">
   <span class="cinematic-keyframe-index">${i + 1}</span>
   <span class="cinematic-keyframe-label${isLoopBack ? ' cinematic-keyframe-label-static' : ''}"${isLoopBack ? '' : ' data-action="rename" title="Click to rename"'}>${escapeHtml(kf.label)}</span>
   ${actionButtons}
@@ -455,10 +582,7 @@ export function initCinematicCamera({ viewer, dom }) {
           });
           // Keep the navigation dropdown and sub-panels in sync with the
           // keyframe's mode so the user sees the correct controls after goto.
-          if (dom.navModeSelect && kf.navigationMode) {
-            dom.navModeSelect.value = kf.navigationMode;
-            toggleNavigationPanels(kf.navigationMode);
-          }
+          syncNavigationMode(kf.navigationMode);
         }
       } else if (action === 'rename') {
         if (isLoopBack) return;
@@ -470,7 +594,7 @@ export function initCinematicCamera({ viewer, dom }) {
     dom.keyframeList.addEventListener('change', (e) => {
       const loopBackToggle = e.target.closest('.cinematic-loopback-list-toggle');
       if (loopBackToggle) {
-        setLoopBackEnabled(Boolean(loopBackToggle.checked));
+        setLoopBackEnabled(loopBackToggle.checked);
         // keyframeStore.add emits before loopBackKeyframeId is assigned, so force
         // a final render here to avoid the "double click to activate" behavior.
         renderKeyframeList();
@@ -478,10 +602,20 @@ export function initCinematicCamera({ viewer, dom }) {
       }
       const input = e.target.closest('.cinematic-duration-input');
       if (!input) return;
-      const pairIndex = parseInt(input.dataset.pairIndex, 10);
+      const pairIndex = parseIntegerInput(input.dataset.pairIndex, {
+        minimum: 0,
+        maximum: keyframeStore.MAX_KEYFRAMES - 1,
+        label: 'Camera Path keyframe pair index'
+      });
       const raw = input.value;
-      const val = raw === '' ? null : parseFloat(raw);
-      keyframeStore.setDuration(pairIndex, val);
+      const value = raw === ''
+        ? null
+        : parseRangeInput(raw, {
+            minimum: 0.1,
+            maximum: MAX_TRANSITION_DURATION_SECONDS,
+            label: 'Camera Path transition duration'
+          });
+      keyframeStore.setDuration(pairIndex, value);
     });
   }
 
@@ -534,11 +668,13 @@ export function initCinematicCamera({ viewer, dom }) {
   // React to keyframe store changes
   // =========================================================================
 
-  keyframeStore.on('changed', () => {
+  function handleKeyframeStoreChange() {
     if (!syncLoopBackState()) return;
     renderKeyframeList();
-    transportBar.updateVisibility();
-  });
+    transportBar.updateVisibility({ reveal: !suppressTransportReveal });
+  }
+
+  keyframeStore.on('changed', handleKeyframeStoreChange);
 
   // =========================================================================
   // Initial render
@@ -546,6 +682,21 @@ export function initCinematicCamera({ viewer, dom }) {
 
   syncLoopBackState();
   renderKeyframeList();
+
+  // Camera paths belong to the dataset that was active when they were made.
+  // A replacement must never retain or execute coordinates from the old data.
+  function resetCameraPath() {
+    playbackController.stop({ resetCamera: false });
+    loopBackKeyframeId = null;
+    if (keyframeStore.getCount() > 0) {
+      keyframeStore.clear();
+    } else {
+      transportBar.updateVisibility({ reveal: false });
+    }
+  }
+
+  const handleDatasetChange = () => resetCameraPath();
+  dataSourceManager.onDatasetChange(handleDatasetChange);
 
   // =========================================================================
   // Session export / restore
@@ -560,13 +711,13 @@ export function initCinematicCamera({ viewer, dom }) {
       ...keyframeStore.exportAll(),
       loopBackKeyframeId,
       // Interpolation & playback settings
-      loopPlayback: dom.loopCheckbox?.checked || false,
-      positionMethod: dom.positionInterp?.value || 'catmull-rom',
-      rotationMethod: dom.rotationInterp?.value || 'slerp',
-      easing: dom.easingSelect?.value || 'linear',
-      defaultSpeed: dom.defaultSpeedInput?.value ?? '30',
+      loopPlayback: dom.loopCheckbox.checked,
+      positionMethod: dom.positionInterp.value,
+      rotationMethod: dom.rotationInterp.value,
+      easing: dom.easingSelect.value,
+      defaultSpeed: dom.defaultSpeedInput.value,
       // Navigation mode
-      navigationMode: dom.navModeSelect?.value || 'orbit'
+      navigationMode: viewer.getNavigationMode()
     };
   }
 
@@ -575,49 +726,55 @@ export function initCinematicCamera({ viewer, dom }) {
    * @param {object} data
    */
   function restoreSessionState(data) {
-    if (!data) return;
-    playbackController.stop();
+    assertCameraPathSessionState(data);
+    playbackController.stop({ resetCamera: false });
 
-    // Restore interpolation & playback settings before importing keyframes
-    // so that duration computation uses the correct speed / methods.
-    if (dom.positionInterp && data.positionMethod) {
+    suppressTransportReveal = true;
+    loopBackKeyframeId = null;
+    try {
+      const imported = keyframeStore.importAll({
+        keyframes: data.keyframes,
+        nextIndex: data.nextIndex
+      });
+      if (!imported) {
+        throw new TypeError('Camera Path session keyframes failed exact import.');
+      }
+      loopBackKeyframeId = data.loopBackKeyframeId;
+
       dom.positionInterp.value = data.positionMethod;
-    }
-    if (dom.rotationInterp && data.rotationMethod) {
       dom.rotationInterp.value = data.rotationMethod;
-    }
-    if (dom.easingSelect && data.easing) {
       dom.easingSelect.value = data.easing;
-    }
-    if (dom.defaultSpeedInput && data.defaultSpeed != null) {
       dom.defaultSpeedInput.value = data.defaultSpeed;
       dom.defaultSpeedInput.dispatchEvent(new Event('input', { bubbles: true }));
-    }
-    if (dom.loopCheckbox && typeof data.loopPlayback === 'boolean') {
       dom.loopCheckbox.checked = data.loopPlayback;
-    }
-    if (dom.navModeSelect && data.navigationMode) {
-      dom.navModeSelect.value = data.navigationMode;
-      viewer.setNavigationMode?.(data.navigationMode);
-      toggleNavigationPanels(data.navigationMode);
-    }
+      viewer.setNavigationMode(data.navigationMode);
+      syncNavigationMode(data.navigationMode);
 
-    keyframeStore.importAll(data);
-    loopBackKeyframeId = data.loopBackKeyframeId || null;
-    syncLoopBackState();
-    renderKeyframeList();
-    transportBar.updateVisibility();
-    // Auto-play the path once the DOM has settled.
-    if (keyframeStore.getCount() >= 2) {
-      requestAnimationFrame(() => playbackController.play());
+      syncLoopBackState();
+      renderKeyframeList();
+      // A restored path is available, but stays idle and out of the way until
+      // the user explicitly reveals and starts it.
+      transportBar.updateVisibility({ reveal: false });
+    } finally {
+      suppressTransportReveal = false;
     }
+  }
+
+  function destroy() {
+    keyframeStore.off('changed', handleKeyframeStoreChange);
+    dataSourceManager.offDatasetChange(handleDatasetChange);
+    transportBar.destroy();
+    playbackController.destroy();
   }
 
   return {
     getKeyframeStore: () => keyframeStore,
     getPlaybackController: () => playbackController,
     exportSessionState,
-    restoreSessionState
+    restoreSessionState,
+    syncNavigationMode,
+    resetCameraPath,
+    destroy
   };
 }
 

@@ -34,18 +34,31 @@ import {
  * @typedef {Object} JupyterConfig
  * @property {string} serverUrl - URL of the cellucid data server (from Python side)
  * @property {string} viewerId - Unique viewer ID for message routing
- * @property {string|null} viewerToken - Per-viewer token for postMessage auth (recommended)
- * @property {string} [kernelId] - Jupyter kernel ID (optional)
+ * @property {string} viewerToken - Per-viewer authentication token
  */
+
+function requireSingleJupyterParameter(params, key) {
+  const values = params.getAll(key);
+  if (
+    values.length !== 1 ||
+    values[0].length === 0 ||
+    values[0] !== values[0].trim() ||
+    /\s/.test(values[0])
+  ) {
+    throw new Error(
+      'Jupyter configuration requires exactly one non-whitespace ' +
+      'viewerId and viewerToken'
+    );
+  }
+  return values[0];
+}
 
 /**
  * Check if running in Jupyter iframe context
  * @returns {boolean}
  */
 export function isJupyterContext() {
-  // Check URL parameters
-  const params = new URLSearchParams(window.location.search);
-  return params.get('jupyter') === 'true';
+  return getJupyterConfig() !== null;
 }
 
 /**
@@ -54,25 +67,40 @@ export function isJupyterContext() {
  */
 export function getJupyterConfig() {
   const params = new URLSearchParams(window.location.search);
-
-  if (!params.get('jupyter')) {
+  const declaredKeys = [...params.keys()];
+  const modeValues = params.getAll('jupyter');
+  if (modeValues.length === 0) {
     return null;
   }
-
-  // In the recommended "local viewer" mode, the web app is served by the Python
-  // server itself, so the server URL is the current location base.
-  //
-  // Important: some notebook environments proxy ports behind a path prefix, so
-  // `window.location.origin` is not sufficient (it would drop the prefix).
+  const annDataValues = params.getAll('anndata');
+  if (
+    (declaredKeys.length !== 3 && declaredKeys.length !== 4) ||
+    declaredKeys.some(
+      key =>
+        key !== 'jupyter' &&
+        key !== 'viewerId' &&
+        key !== 'viewerToken' &&
+        key !== 'anndata'
+    ) ||
+    (annDataValues.length !== 0 &&
+      (annDataValues.length !== 1 || annDataValues[0] !== 'true'))
+  ) {
+    throw new Error(
+      'Jupyter mode URL must contain exact routing fields and only the ' +
+      'optional anndata=true server discriminator'
+    );
+  }
+  if (modeValues.length !== 1 || modeValues[0] !== 'true') {
+    throw new Error('Jupyter mode must be declared exactly once as jupyter=true');
+  }
+  const viewerId = requireSingleJupyterParameter(params, 'viewerId');
+  const viewerToken = requireSingleJupyterParameter(params, 'viewerToken');
   const defaultBase = new URL('.', window.location.href).toString().replace(/\/$/, '');
-  const remote = params.get('remote') || defaultBase;
-  const viewerId = params.get('viewerId');
 
   return {
-    serverUrl: remote,
-    viewerId: viewerId || 'default',
-    viewerToken: params.get('viewerToken') || null,
-    kernelId: params.get('kernelId') || null
+    serverUrl: defaultBase,
+    viewerId,
+    viewerToken
   };
 }
 
@@ -102,6 +130,417 @@ export function parseJupyterUrl(url) {
   };
 }
 
+function requireJupyterRuntimeConfig(config) {
+  if (
+    config === null ||
+    typeof config !== 'object' ||
+    Array.isArray(config) ||
+    Object.keys(config).length !== 3 ||
+    !Object.hasOwn(config, 'serverUrl') ||
+    !Object.hasOwn(config, 'viewerId') ||
+    !Object.hasOwn(config, 'viewerToken')
+  ) {
+    throw new TypeError(
+      'Jupyter configuration must contain exactly serverUrl, viewerId, and viewerToken'
+    );
+  }
+  for (const key of ['serverUrl', 'viewerId', 'viewerToken']) {
+    if (
+      typeof config[key] !== 'string' ||
+      config[key].length === 0 ||
+      config[key] !== config[key].trim() ||
+      /\s/.test(config[key])
+    ) {
+      throw new TypeError(`Jupyter ${key} must be exact non-whitespace text`);
+    }
+  }
+  const serverUrl = new URL(config.serverUrl);
+  if (
+    (serverUrl.protocol !== 'http:' && serverUrl.protocol !== 'https:') ||
+    serverUrl.username ||
+    serverUrl.password ||
+    serverUrl.search ||
+    serverUrl.hash ||
+    config.serverUrl.endsWith('/')
+  ) {
+    throw new TypeError(
+      'Jupyter serverUrl must be an exact HTTP(S) base URL without credentials, query, fragment, or trailing slash'
+    );
+  }
+  return config;
+}
+
+function requireJupyterSuccessPayload(payload, label) {
+  if (
+    payload === null ||
+    typeof payload !== 'object' ||
+    Array.isArray(payload) ||
+    Object.keys(payload).length !== 2 ||
+    payload.status !== 'ok' ||
+    payload.delivered !== true
+  ) {
+    throw new Error(
+      `${label} returned a noncanonical success payload`
+    );
+  }
+}
+
+function isPlainRecord(value) {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    (Object.getPrototypeOf(value) === Object.prototype ||
+      Object.getPrototypeOf(value) === null)
+  );
+}
+
+function requireExactKeys(value, expectedKeys, label) {
+  if (!isPlainRecord(value)) {
+    throw new TypeError(`${label} must be a JSON object`);
+  }
+  const actualKeys = Object.keys(value);
+  if (
+    actualKeys.length !== expectedKeys.length ||
+    expectedKeys.some(key => !Object.hasOwn(value, key))
+  ) {
+    throw new TypeError(
+      `${label} must contain exactly ${expectedKeys.join(', ')}`
+    );
+  }
+  return value;
+}
+
+function requireExactText(value, label, { allowWhitespace = false } = {}) {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value !== value.trim() ||
+    /[\u0000-\u001f\u007f]/.test(value) ||
+    (!allowWhitespace && /\s/.test(value))
+  ) {
+    throw new TypeError(`${label} must be exact non-empty text`);
+  }
+  return value;
+}
+
+function requireExactJsonValue(value, label, ancestors = new Set()) {
+  if (
+    value === null ||
+    typeof value === 'string' ||
+    typeof value === 'boolean'
+  ) {
+    return;
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      throw new TypeError(`${label} numbers must be finite`);
+    }
+    return;
+  }
+  if (typeof value !== 'object') {
+    throw new TypeError(`${label} must contain only exact JSON values`);
+  }
+  if (ancestors.has(value)) {
+    throw new TypeError(`${label} must not contain cycles`);
+  }
+  ancestors.add(value);
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index++) {
+      if (!Object.hasOwn(value, index)) {
+        throw new TypeError(`${label} arrays must not contain holes`);
+      }
+      requireExactJsonValue(value[index], `${label}[${index}]`, ancestors);
+    }
+  } else {
+    if (!isPlainRecord(value)) {
+      throw new TypeError(`${label} objects must be plain JSON objects`);
+    }
+    for (const [key, entry] of Object.entries(value)) {
+      requireExactText(key, `${label} key`, { allowWhitespace: true });
+      requireExactJsonValue(entry, `${label}.${key}`, ancestors);
+    }
+  }
+  ancestors.delete(value);
+}
+
+function requireNonNegativeInteger(value, label) {
+  if (!Number.isInteger(value) || value < 0) {
+    throw new TypeError(`${label} must be a non-negative integer`);
+  }
+  return value;
+}
+
+function requireCellIndices(value, label) {
+  if (!Array.isArray(value)) {
+    throw new TypeError(`${label} must be an array`);
+  }
+  const seen = new Set();
+  for (let index = 0; index < value.length; index++) {
+    if (!Object.hasOwn(value, index)) {
+      throw new TypeError(`${label} must not contain holes`);
+    }
+    const cellIndex = requireNonNegativeInteger(
+      value[index],
+      `${label}[${index}]`
+    );
+    if (seen.has(cellIndex)) {
+      throw new TypeError(`${label} must not contain duplicate cell indices`);
+    }
+    seen.add(cellIndex);
+  }
+  return value;
+}
+
+function requireJupyterHealthPayload(payload) {
+  if (!isPlainRecord(payload)) {
+    throw new TypeError('Jupyter health response must be a JSON object');
+  }
+  if (payload.type === 'exported') {
+    requireExactKeys(
+      payload,
+      ['status', 'type', 'version'],
+      'Jupyter exported health response'
+    );
+  } else if (payload.type === 'anndata') {
+    requireExactKeys(
+      payload,
+      [
+        'status',
+        'type',
+        'version',
+        'format',
+        'is_backed',
+        'n_cells',
+        'n_genes'
+      ],
+      'Jupyter AnnData health response'
+    );
+    requireExactText(
+      payload.format,
+      'Jupyter AnnData health format',
+      { allowWhitespace: true }
+    );
+    if (typeof payload.is_backed !== 'boolean') {
+      throw new TypeError('Jupyter AnnData health is_backed must be a boolean');
+    }
+    requireNonNegativeInteger(
+      payload.n_cells,
+      'Jupyter AnnData health n_cells'
+    );
+    requireNonNegativeInteger(
+      payload.n_genes,
+      'Jupyter AnnData health n_genes'
+    );
+  } else {
+    throw new TypeError(
+      'Jupyter health response type must be exactly exported or anndata'
+    );
+  }
+  if (payload.status !== 'ok') {
+    throw new TypeError('Jupyter health response status must be exactly ok');
+  }
+  requireExactText(
+    payload.version,
+    'Jupyter health version',
+    { allowWhitespace: true }
+  );
+  return payload;
+}
+
+async function requestJupyterHealth(config) {
+  const exactConfig = requireJupyterRuntimeConfig(config);
+  const response = await fetch(
+    `${exactConfig.serverUrl}/_cellucid/health`,
+    { cache: 'no-store' }
+  );
+  if (!(response instanceof Response)) {
+    throw new TypeError('Jupyter health fetch must return a Response');
+  }
+  if (!response.ok) {
+    throw new Error(
+      `Jupyter health request failed with HTTP ${response.status}`
+    );
+  }
+  return requireJupyterHealthPayload(await response.json());
+}
+
+function requireDatasetCatalogPath(value, label) {
+  if (
+    typeof value !== 'string' ||
+    !/^\/(?:[A-Za-z0-9][A-Za-z0-9._-]{0,179}\/)?$/.test(value) ||
+    value.includes('/./') ||
+    value.includes('/../')
+  ) {
+    throw new TypeError(
+      `${label} must be "/" or one exact portable dataset directory path`
+    );
+  }
+  const component = value === '/' ? null : value.slice(1, -1);
+  if (
+    component !== null &&
+    (component.endsWith('.') ||
+      /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i.test(component))
+  ) {
+    throw new TypeError(`${label} contains a non-portable dataset directory`);
+  }
+  return value;
+}
+
+function requireDatasetCatalogPayload(payload) {
+  requireExactKeys(payload, ['datasets'], 'Jupyter dataset listing');
+  if (!Array.isArray(payload.datasets)) {
+    throw new TypeError('Jupyter dataset listing datasets must be an array');
+  }
+  const ids = new Set();
+  const paths = new Set();
+  return payload.datasets.map((entry, index) => {
+    const label = `Jupyter dataset listing datasets[${index}]`;
+    requireExactKeys(entry, ['id', 'path', 'name'], label);
+    const id = requireExactText(
+      entry.id,
+      `${label}.id`,
+      { allowWhitespace: true }
+    );
+    const path = requireDatasetCatalogPath(entry.path, `${label}.path`);
+    const name = requireExactText(
+      entry.name,
+      `${label}.name`,
+      { allowWhitespace: true }
+    );
+    if (ids.has(id)) {
+      throw new TypeError(`Jupyter dataset listing contains duplicate id ${id}`);
+    }
+    if (paths.has(path)) {
+      throw new TypeError(
+        `Jupyter dataset listing contains duplicate path ${path}`
+      );
+    }
+    ids.add(id);
+    paths.add(path);
+    return Object.freeze({ id, path, name });
+  });
+}
+
+function requireJupyterSessionUploadPayload(payload, expectedBytes) {
+  requireExactKeys(
+    payload,
+    ['status', 'bytes'],
+    'Jupyter session upload response'
+  );
+  if (payload.status !== 'ok') {
+    throw new TypeError(
+      'Jupyter session upload response status must be exactly ok'
+    );
+  }
+  requireNonNegativeInteger(
+    payload.bytes,
+    'Jupyter session upload response bytes'
+  );
+  if (payload.bytes !== expectedBytes) {
+    throw new Error(
+      'Jupyter session upload response bytes must match the uploaded bundle'
+    );
+  }
+}
+
+function deliverCallbacks(callbacks, args) {
+  const pending = [];
+  for (const callback of callbacks) {
+    const result = callback(...args);
+    if (result instanceof Promise) {
+      pending.push(result);
+    }
+  }
+  return pending.length === 0 ? undefined : Promise.all(pending);
+}
+
+/**
+ * Build and upload one authenticated session bundle for one exact Python request.
+ *
+ * @param {{
+ *   config: JupyterConfig,
+ *   message: Object,
+ *   createSessionBundle: () => Promise<Blob>,
+ *   fetchImpl: typeof fetch,
+ * }} options
+ */
+export async function uploadJupyterSessionBundle(options) {
+  if (
+    options === null ||
+    typeof options !== 'object' ||
+    Array.isArray(options) ||
+    Object.keys(options).length !== 4 ||
+    !Object.hasOwn(options, 'config') ||
+    !Object.hasOwn(options, 'message') ||
+    !Object.hasOwn(options, 'createSessionBundle') ||
+    !Object.hasOwn(options, 'fetchImpl')
+  ) {
+    throw new TypeError(
+      'Session upload options must contain exactly config, message, createSessionBundle, and fetchImpl'
+    );
+  }
+  const config = requireJupyterRuntimeConfig(options.config);
+  const message = options.message;
+  if (
+    message === null ||
+    typeof message !== 'object' ||
+    Array.isArray(message) ||
+    Object.keys(message).length !== 4 ||
+    message.type !== 'requestSessionBundle' ||
+    message.viewerId !== config.viewerId ||
+    message.viewerToken !== config.viewerToken
+  ) {
+    throw new TypeError(
+      'Session request must contain exactly authenticated type, requestId, viewerId, and viewerToken'
+    );
+  }
+  if (
+    typeof message.requestId !== 'string' ||
+    message.requestId.length === 0 ||
+    message.requestId !== message.requestId.trim() ||
+    /\s/.test(message.requestId)
+  ) {
+    throw new TypeError('Session requestId must be exact non-empty text without whitespace');
+  }
+  if (typeof options.createSessionBundle !== 'function') {
+    throw new TypeError('createSessionBundle must be a function');
+  }
+  if (typeof options.fetchImpl !== 'function') {
+    throw new TypeError('fetchImpl must be a function');
+  }
+
+  const blob = await options.createSessionBundle();
+  if (!(blob instanceof Blob) || blob.size <= 0) {
+    throw new TypeError('Session serializer must produce one non-empty Blob');
+  }
+  const query = new URLSearchParams([
+    ['viewerId', config.viewerId],
+    ['viewerToken', config.viewerToken],
+    ['requestId', message.requestId],
+  ]);
+  const response = await options.fetchImpl(
+    `${config.serverUrl}/_cellucid/session_bundle?${query.toString()}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: blob
+    }
+  );
+  if (!(response instanceof Response)) {
+    throw new TypeError('Session upload fetch must return a Response');
+  }
+  if (!response.ok) {
+    throw new Error(
+      `Jupyter session upload failed with HTTP ${response.status}`
+    );
+  }
+  requireJupyterSessionUploadPayload(
+    await response.json(),
+    blob.size
+  );
+}
+
 /**
  * Data source for Jupyter notebook integration
  */
@@ -126,26 +565,11 @@ export class JupyterBridgeDataSource {
     /** @type {Map<string, string>} Dataset ID -> base path (from /_cellucid/datasets) */
     this._datasetPaths = new Map();
 
-    /** @type {string|null} */
-    this._activeDatasetId = null;
-
-    /** @type {Map<string, Function>} Pending request callbacks */
-    this._pendingRequests = new Map();
-
-    /** @type {number} */
-    this._requestId = 0;
-
     /** @type {Set<Function>} */
     this._messageCallbacks = new Set();
 
     /** @type {Set<Function>} */
-    this._selectionCallbacks = new Set();
-
-    /** @type {Set<Function>} */
     this._highlightCallbacks = new Set();
-
-    /** @type {number|null} Debounce timer for hover events */
-    this._hoverDebounceTimer = null;
 
     this.type = 'jupyter';
 
@@ -177,33 +601,25 @@ export class JupyterBridgeDataSource {
   async initialize() {
     const config = getJupyterConfig();
     if (!config) {
-      console.log('[JupyterBridge] Not in Jupyter context');
       return false;
     }
+
+    await requestJupyterHealth(config);
 
     this._config = config;
-    console.log('[JupyterBridge] Initializing with config:', config);
+    this._connected = true;
+    return true;
+  }
 
-    // Test connection to server
-    try {
-      const response = await fetch(`${config.serverUrl}/_cellucid/health`);
-      if (!response.ok) {
-        throw new Error(`Server returned ${response.status}`);
-      }
-      this._connected = true;
-
-      // Notify parent that we're ready
-      this._postToParent({
-        type: 'ready',
-        viewerId: config.viewerId
-      });
-
-      console.log('[JupyterBridge] Connected to server');
-      return true;
-    } catch (err) {
-      console.error('[JupyterBridge] Failed to connect:', err);
-      return false;
+  /**
+   * Validate the live Python server against the current health contract.
+   * @returns {Promise<Object>}
+   */
+  async checkHealth() {
+    if (!this._connected) {
+      throw new Error('Jupyter health check requires an initialized connection');
     }
+    return requestJupyterHealth(this._config);
   }
 
   /**
@@ -213,107 +629,118 @@ export class JupyterBridgeDataSource {
    */
   _handleMessage(event) {
     const data = event.data;
-    if (!data || typeof data !== 'object') return;
+    if (!isPlainRecord(data)) return;
 
-    // Dev-phase strictness: require per-viewer token authentication.
-    // Notebook frontends can be hosted on non-loopback origins (Colab, VSCode webviews),
-    // so we do not attempt origin allowlisting here.
-    if (!this._config?.viewerToken) return;
+    const config = requireJupyterRuntimeConfig(this._config);
+
+    // Messages without this viewer's secret are unrelated window traffic.
     if (data.viewerToken !== this._config.viewerToken) return;
 
-    // Capture parent origin after validation so outgoing messages can target it.
+    if (data.viewerId !== config.viewerId) {
+      throw new TypeError(
+        'Authenticated Jupyter message viewerId must match this viewer'
+      );
+    }
+    requireExactText(data.type, 'Authenticated Jupyter message type');
+    requireExactText(
+      event.origin,
+      'Authenticated Jupyter message origin',
+      { allowWhitespace: true }
+    );
+
     if (!this._parentOrigin) {
       this._parentOrigin = event.origin;
+    } else if (event.origin !== this._parentOrigin) {
+      throw new Error(
+        'Authenticated Jupyter message origin must match the pinned parent origin'
+      );
     }
-
-    // Check viewer ID if present
-    if (data.viewerId && this._config && data.viewerId !== this._config.viewerId) {
-      return;
-    }
-
-    console.log('[JupyterBridge] Received message:', data.type);
 
     switch (data.type) {
       case 'ping':
-        // Lightweight round-trip used by `viewer.debug_connection()` on Python side.
-        this._postEventToPython({
+        requireExactKeys(
+          data,
+          ['type', 'requestId', 'viewerId', 'viewerToken'],
+          'Jupyter ping message'
+        );
+        requireExactText(data.requestId, 'Jupyter ping requestId');
+        return this._postEventToPython({
           type: 'pong',
-          requestId: data.requestId || null,
-          t: Date.now(),
-          viewerId: this._config?.viewerId
+          requestId: data.requestId,
+          t: Date.now()
         });
-        break;
 
       case 'debug_snapshot':
-        // One-shot diagnostic payload for `viewer.debug_connection()`.
-        // Important: this is sent via the same HTTP event channel as hooks, so it works
-        // across notebook frontends (Jupyter/JupyterLab/Colab/VSCode).
-        this._postEventToPython({
+        requireExactKeys(
+          data,
+          ['type', 'requestId', 'viewerId', 'viewerToken'],
+          'Jupyter debug snapshot message'
+        );
+        requireExactText(
+          data.requestId,
+          'Jupyter debug snapshot requestId'
+        );
+        return this._postEventToPython({
           type: 'debug_snapshot',
-          requestId: data.requestId || null,
+          requestId: data.requestId,
           ts: new Date().toISOString(),
           locationHref: window.location.href,
           origin: window.location.origin,
-          serverUrl: this._config?.serverUrl || null,
-          connected: !!this._connected,
+          serverUrl: config.serverUrl,
+          connected: this._connected,
           parentOrigin: this._parentOrigin,
-          userAgent: (typeof navigator !== 'undefined' && navigator.userAgent) ? navigator.userAgent : null,
-          viewerId: this._config?.viewerId
+          userAgent: (typeof navigator !== 'undefined' && navigator.userAgent) ? navigator.userAgent : null
         });
-        break;
-
-      case 'response':
-        this._handleResponse(data);
-        break;
 
       case 'highlight':
-        this._handleHighlight(data);
-        break;
+        return this._handleHighlight(data);
 
       case 'setColorBy':
-        this._handleSetColorBy(data);
-        break;
+        return this._handleSetColorBy(data);
 
       case 'setVisibility':
-        this._handleSetVisibility(data);
-        break;
+        return this._handleSetVisibility(data);
 
       case 'clearHighlights':
-        this._handleClearHighlights();
-        break;
+        requireExactKeys(
+          data,
+          ['type', 'viewerId', 'viewerToken'],
+          'Jupyter clear-highlights message'
+        );
+        return this._handleClearHighlights();
 
       case 'resetCamera':
-        this._handleResetCamera();
-        break;
+        requireExactKeys(
+          data,
+          ['type', 'viewerId', 'viewerToken'],
+          'Jupyter reset-camera message'
+        );
+        return this._handleResetCamera(data);
+
+      case 'freeze':
+        requireExactKeys(
+          data,
+          ['type', 'viewerId', 'viewerToken'],
+          'Jupyter freeze message'
+        );
+        return deliverCallbacks(this._messageCallbacks, [data]);
+
+      case 'requestSessionBundle':
+        requireExactKeys(
+          data,
+          ['type', 'requestId', 'viewerId', 'viewerToken'],
+          'Jupyter session-bundle request'
+        );
+        requireExactText(
+          data.requestId,
+          'Jupyter session-bundle requestId'
+        );
+        return deliverCallbacks(this._messageCallbacks, [data]);
 
       default:
-        // Pass to generic handlers
-        for (const callback of this._messageCallbacks) {
-          try {
-            callback(data);
-          } catch (err) {
-            console.error('[JupyterBridge] Message handler error:', err);
-          }
-        }
+        requireExactJsonValue(data, 'Authenticated Jupyter message');
+        return deliverCallbacks(this._messageCallbacks, [data]);
     }
-  }
-
-  /**
-   * Handle response to a pending request
-   * @param {Object} data
-   * @private
-   */
-  _handleResponse(data) {
-    const { requestId, result, error } = data;
-
-    const callback = this._pendingRequests.get(requestId);
-    if (!callback) {
-      console.warn('[JupyterBridge] No pending request for ID:', requestId);
-      return;
-    }
-
-    this._pendingRequests.delete(requestId);
-    callback({ result, error });
   }
 
   /**
@@ -322,14 +749,27 @@ export class JupyterBridgeDataSource {
    * @private
    */
   _handleHighlight(data) {
+    requireExactKeys(
+      data,
+      ['type', 'cells', 'color', 'viewerId', 'viewerToken'],
+      'Jupyter highlight message'
+    );
     const { cells, color } = data;
-    for (const callback of this._highlightCallbacks) {
-      try {
-        callback(cells, color);
-      } catch (err) {
-        console.error('[JupyterBridge] Highlight handler error:', err);
-      }
+    requireCellIndices(cells, 'Jupyter highlight cells');
+    if (cells.length === 0) {
+      throw new TypeError(
+        'Jupyter highlight cells must be a non-empty array'
+      );
     }
+    if (
+      typeof color !== 'string' ||
+      !/^#[0-9a-fA-F]{6}$/.test(color)
+    ) {
+      throw new TypeError(
+        'Jupyter highlight color must be an exact six-digit hex color'
+      );
+    }
+    return deliverCallbacks(this._highlightCallbacks, [cells, color]);
   }
 
   /**
@@ -338,14 +778,18 @@ export class JupyterBridgeDataSource {
    * @private
    */
   _handleSetColorBy(data) {
+    requireExactKeys(
+      data,
+      ['type', 'field', 'viewerId', 'viewerToken'],
+      'Jupyter set-color-by message'
+    );
     const { field } = data;
-    for (const callback of this._messageCallbacks) {
-      try {
-        callback({ type: 'setColorBy', field });
-      } catch (err) {
-        console.error('[JupyterBridge] Handler error:', err);
-      }
-    }
+    requireExactText(
+      field,
+      'Jupyter set-color-by field',
+      { allowWhitespace: true }
+    );
+    return deliverCallbacks(this._messageCallbacks, [data]);
   }
 
   /**
@@ -354,14 +798,21 @@ export class JupyterBridgeDataSource {
    * @private
    */
   _handleSetVisibility(data) {
+    requireExactKeys(
+      data,
+      ['type', 'cells', 'visible', 'viewerId', 'viewerToken'],
+      'Jupyter set-visibility message'
+    );
     const { cells, visible } = data;
-    for (const callback of this._messageCallbacks) {
-      try {
-        callback({ type: 'setVisibility', cells, visible });
-      } catch (err) {
-        console.error('[JupyterBridge] Handler error:', err);
-      }
+    if (cells !== null) {
+      requireCellIndices(cells, 'Jupyter set-visibility cells');
     }
+    if (typeof visible !== 'boolean') {
+      throw new TypeError(
+        'Jupyter set-visibility visible must be a boolean'
+      );
+    }
+    return deliverCallbacks(this._messageCallbacks, [data]);
   }
 
   /**
@@ -369,109 +820,63 @@ export class JupyterBridgeDataSource {
    * @private
    */
   _handleClearHighlights() {
-    for (const callback of this._highlightCallbacks) {
-      try {
-        callback([], null); // Empty highlight
-      } catch (err) {
-        console.error('[JupyterBridge] Handler error:', err);
-      }
-    }
+    return deliverCallbacks(this._highlightCallbacks, [[], null]);
   }
 
   /**
    * Handle reset camera command
    * @private
    */
-  _handleResetCamera() {
-    for (const callback of this._messageCallbacks) {
-      try {
-        callback({ type: 'resetCamera' });
-      } catch (err) {
-        console.error('[JupyterBridge] Handler error:', err);
-      }
-    }
-  }
-
-  /**
-   * Post message to parent frame (Jupyter) - for Python → Frontend responses
-   * @param {Object} message
-   * @private
-   */
-  _postToParent(message) {
-    if (window.parent === window) {
-      console.warn('[JupyterBridge] Not in iframe, cannot post to parent');
-      return;
-    }
-
-    // Prefer a specific targetOrigin once we have a validated parent origin.
-    // Fall back to '*' only until the parent origin is learned.
-    const targetOrigin = this._parentOrigin || '*';
-    window.parent.postMessage(message, targetOrigin);
+  _handleResetCamera(data) {
+    return deliverCallbacks(this._messageCallbacks, [data]);
   }
 
   /**
    * Post event to Python via HTTP POST to the data server.
    * This enables Frontend → Python communication in ALL environments.
-   * @param {Object} event - Event data with 'type' and 'viewerId'
+   * @param {Object} event - Event data with a non-empty type
    * @private
    */
-  _postEventToPython(event) {
-    if (!this._config?.serverUrl) {
-      return;
+  async _postEventToPython(event) {
+    const config = requireJupyterRuntimeConfig(this._config);
+    if (
+      !isPlainRecord(event) ||
+      typeof event.type !== 'string' ||
+      event.type.length === 0 ||
+      event.type !== event.type.trim() ||
+      /\s/.test(event.type) ||
+      Object.hasOwn(event, 'viewerId') ||
+      Object.hasOwn(event, 'viewerToken')
+    ) {
+      throw new TypeError(
+        'Jupyter event must have one exact type and must not supply routing credentials'
+      );
     }
-
-    // POST to the events endpoint on the data server
-    // Use fetch with keepalive to ensure delivery even on page unload
-    fetch(`${this._config.serverUrl}/_cellucid/events`, {
+    requireExactJsonValue(event, 'Jupyter event');
+    const response = await fetch(`${config.serverUrl}/_cellucid/events`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify(event),
+      body: JSON.stringify({
+        ...event,
+        viewerId: config.viewerId,
+        viewerToken: config.viewerToken,
+      }),
       keepalive: true
-    }).catch(err => {
-      // Silently ignore errors - this is a fire-and-forget notification
-      // The server might not be running or the event might be for a stale viewer
-      console.debug('[JupyterBridge] Failed to POST event:', err.message);
     });
-  }
-
-  /**
-   * Send a request to Python side and wait for response
-   * @param {string} type - Request type
-   * @param {Object} params - Request parameters
-   * @returns {Promise<any>}
-   */
-  async sendRequest(type, params = {}) {
-    const requestId = `req_${++this._requestId}`;
-
-    return new Promise((resolve, reject) => {
-      // Set up response handler
-      this._pendingRequests.set(requestId, ({ result, error }) => {
-        if (error) {
-          reject(new Error(error));
-        } else {
-          resolve(result);
-        }
-      });
-
-      // Send request
-      this._postToParent({
-        type: 'request',
-        requestId,
-        requestType: type,
-        params,
-        viewerId: this._config?.viewerId
-      });
-
-      // Timeout after 30 seconds
-      setTimeout(() => {
-        if (this._pendingRequests.has(requestId)) {
-          this._pendingRequests.delete(requestId);
-          reject(new Error('Request timeout'));
-        }
-      }, 30000);
-    });
+    if (!(response instanceof Response)) {
+      throw new TypeError('Jupyter event fetch must return a Response');
+    }
+    if (!response.ok) {
+      throw new Error(
+        `Jupyter event delivery failed with HTTP ${response.status}`
+      );
+    }
+    requireJupyterSuccessPayload(
+      await response.json(),
+      'Jupyter event delivery'
+    );
   }
 
   // =========================================================================
@@ -479,81 +884,134 @@ export class JupyterBridgeDataSource {
   // =========================================================================
   // These methods send events to Python via HTTP POST to the data server.
   // This works in ALL environments (Jupyter, JupyterLab, Colab, VSCode).
-  // They are safe to call even when not connected - they will silently no-op.
-
   /**
    * Notify Python of cell selection change
    * @param {number[]} cellIndices - Selected cell indices
-   * @param {string} [source='unknown'] - Selection source ('lasso', 'click', 'range')
+   * @param {string} source - Selection source ('lasso', 'click', 'range')
    */
-  notifySelection(cellIndices, source = 'unknown') {
-    if (!this._connected) return;
+  async notifySelection(cellIndices, source) {
+    if (!this._connected) {
+      throw new Error('Jupyter event source is not connected');
+    }
+    requireCellIndices(cellIndices, 'Jupyter selection cells');
+    requireExactText(source, 'Jupyter selection source');
     const event = {
       type: 'selection',
       cells: cellIndices,
-      source: source,
-      viewerId: this._config?.viewerId
+      source: source
     };
-    this._postEventToPython(event);
+    return this._postEventToPython(event);
   }
 
   /**
    * Notify Python of cell hover (debounced internally)
    * @param {number|null} cellIndex - Hovered cell index, or null if not hovering
-   * @param {{x: number, y: number, z: number}} [position] - World coordinates
+   * @param {{x: number, y: number, z: number}|null} position - World coordinates
    */
-  notifyHover(cellIndex, position = null) {
-    if (!this._connected) return;
-
-    // Debounce hover events to avoid flooding Python
-    clearTimeout(this._hoverDebounceTimer);
-    this._hoverDebounceTimer = setTimeout(() => {
-      const event = {
-        type: 'hover',
-        cell: cellIndex,
-        position: position,
-        viewerId: this._config?.viewerId
-      };
-      this._postEventToPython(event);
-    }, 50); // 50ms debounce
+  async notifyHover(cellIndex, position) {
+    if (!this._connected) {
+      throw new Error('Jupyter event source is not connected');
+    }
+    if (cellIndex !== null) {
+      requireNonNegativeInteger(cellIndex, 'Jupyter hover cell');
+    }
+    if (position !== null) {
+      requireExactKeys(
+        position,
+        ['x', 'y', 'z'],
+        'Jupyter hover position'
+      );
+      for (const axis of ['x', 'y', 'z']) {
+        if (!Number.isFinite(position[axis])) {
+          throw new TypeError(
+            `Jupyter hover position ${axis} must be finite`
+          );
+        }
+      }
+    }
+    return this._postEventToPython({
+      type: 'hover',
+      cell: cellIndex,
+      position
+    });
   }
 
   /**
    * Notify Python of cell click
    * @param {number} cellIndex - Clicked cell index
-   * @param {Object} [options] - Click options
-   * @param {number} [options.button=0] - Mouse button (0=left, 1=middle, 2=right)
-   * @param {boolean} [options.shift=false] - Shift key held
-   * @param {boolean} [options.ctrl=false] - Ctrl/Cmd key held
+   * @param {Object} options - Click options
+   * @param {number} options.button - Mouse button (0=left, 1=middle, 2=right)
+   * @param {boolean} options.shift - Shift key held
+   * @param {boolean} options.ctrl - Ctrl/Cmd key held
    */
-  notifyClick(cellIndex, options = {}) {
-    if (!this._connected) return;
+  async notifyClick(cellIndex, options) {
+    if (!this._connected) {
+      throw new Error('Jupyter event source is not connected');
+    }
+    requireNonNegativeInteger(cellIndex, 'Jupyter click cell');
+    requireExactKeys(
+      options,
+      ['button', 'shift', 'ctrl'],
+      'Jupyter click options'
+    );
+    if (
+      !Number.isInteger(options.button) ||
+      options.button < 0 ||
+      options.button > 2
+    ) {
+      throw new TypeError(
+        'Jupyter click button must be the integer 0, 1, or 2'
+      );
+    }
+    if (
+      typeof options.shift !== 'boolean' ||
+      typeof options.ctrl !== 'boolean'
+    ) {
+      throw new TypeError(
+        'Jupyter click shift and ctrl must be booleans'
+      );
+    }
     const event = {
       type: 'click',
       cell: cellIndex,
-      button: options.button ?? 0,
-      shift: options.shift ?? false,
-      ctrl: options.ctrl ?? false,
-      viewerId: this._config?.viewerId
+      button: options.button,
+      shift: options.shift,
+      ctrl: options.ctrl
     };
-    this._postEventToPython(event);
+    return this._postEventToPython(event);
   }
 
   /**
    * Notify Python that viewer is ready with dataset info
-   * @param {Object} [info] - Dataset info
-   * @param {number} [info.nCells] - Number of cells
-   * @param {number} [info.dimensions] - Embedding dimensions (2 or 3)
+   * @param {Object} info - Dataset info
+   * @param {number} info.nCells - Number of cells
+   * @param {number} info.dimensions - Embedding dimensions (1, 2, or 3)
    */
-  notifyReady(info = {}) {
-    if (!this._connected) return;
+  async notifyReady(info) {
+    if (!this._connected) {
+      throw new Error('Jupyter event source is not connected');
+    }
+    requireExactKeys(
+      info,
+      ['nCells', 'dimensions'],
+      'Jupyter ready info'
+    );
+    requireNonNegativeInteger(info.nCells, 'Jupyter ready nCells');
+    if (
+      info.dimensions !== 1 &&
+      info.dimensions !== 2 &&
+      info.dimensions !== 3
+    ) {
+      throw new TypeError(
+        'Jupyter ready dimensions must be exactly 1, 2, or 3'
+      );
+    }
     const event = {
       type: 'ready',
-      n_cells: info.nCells ?? 0,
-      dimensions: info.dimensions ?? 3,
-      viewerId: this._config?.viewerId
+      n_cells: info.nCells,
+      dimensions: info.dimensions
     };
-    this._postEventToPython(event);
+    return this._postEventToPython(event);
   }
 
   /**
@@ -562,14 +1020,29 @@ export class JupyterBridgeDataSource {
    * @param {string} eventType - Custom event type name
    * @param {Object} data - Event data
    */
-  notifyCustomEvent(eventType, data = {}) {
-    if (!this._connected) return;
+  async notifyCustomEvent(eventType, data) {
+    if (!this._connected) {
+      throw new Error('Jupyter event source is not connected');
+    }
+    requireExactText(eventType, 'Jupyter custom event type');
+    if (!isPlainRecord(data)) {
+      throw new TypeError('Jupyter custom event data must be a JSON object');
+    }
+    if (
+      Object.hasOwn(data, 'type') ||
+      Object.hasOwn(data, 'viewerId') ||
+      Object.hasOwn(data, 'viewerToken')
+    ) {
+      throw new TypeError(
+        'Jupyter custom event data must not supply type or routing credentials'
+      );
+    }
+    requireExactJsonValue(data, 'Jupyter custom event data');
     const event = {
       type: eventType,
-      ...data,
-      viewerId: this._config?.viewerId
+      ...data
     };
-    this._postEventToPython(event);
+    return this._postEventToPython(event);
   }
 
   // =========================================================================
@@ -581,6 +1054,9 @@ export class JupyterBridgeDataSource {
    * @param {Function} callback - Called with (cells, color)
    */
   onHighlight(callback) {
+    if (typeof callback !== 'function') {
+      throw new TypeError('Jupyter highlight callback must be a function');
+    }
     this._highlightCallbacks.add(callback);
   }
 
@@ -589,15 +1065,10 @@ export class JupyterBridgeDataSource {
    * @param {Function} callback
    */
   offHighlight(callback) {
+    if (typeof callback !== 'function') {
+      throw new TypeError('Jupyter highlight callback must be a function');
+    }
     this._highlightCallbacks.delete(callback);
-  }
-
-  /**
-   * Register callback for selection sync from Python
-   * @param {Function} callback
-   */
-  onSelectionSync(callback) {
-    this._selectionCallbacks.add(callback);
   }
 
   /**
@@ -605,6 +1076,9 @@ export class JupyterBridgeDataSource {
    * @param {Function} callback
    */
   onMessage(callback) {
+    if (typeof callback !== 'function') {
+      throw new TypeError('Jupyter message callback must be a function');
+    }
     this._messageCallbacks.add(callback);
   }
 
@@ -614,75 +1088,67 @@ export class JupyterBridgeDataSource {
    */
   async listDatasets() {
     if (!this._connected || !this._config) {
-      return [];
+      throw new DataSourceError(
+        'Jupyter dataset listing requires an initialized connection',
+        DataSourceErrorCode.NETWORK_ERROR,
+        this.type
+      );
     }
 
-    try {
-      const response = await fetch(`${this._config.serverUrl}/_cellucid/datasets`);
-      if (!response.ok) {
-        return [];
-      }
-
-      const data = await response.json();
-      const datasetList = (data.datasets || []).filter(ds => ds?.id);
-
-      this._datasetPaths.clear();
-      for (const ds of datasetList) {
-        let dsPath = typeof ds.path === 'string' ? ds.path : `/${ds.id}/`;
-        if (!dsPath.startsWith('/')) dsPath = `/${dsPath}`;
-        if (!dsPath.endsWith('/')) dsPath = `${dsPath}/`;
-        this._datasetPaths.set(ds.id, dsPath);
-      }
-
-      // Load metadata for all datasets in parallel
-      const metadataPromises = datasetList.map(async (ds) => {
-        try {
-          const dsPath = this._datasetPaths.get(ds.id) || `/${ds.id}/`;
-          const baseUrl = `${this._config.serverUrl}${dsPath}`;
-          const metadata = await loadDatasetMetadata(baseUrl, ds.id, this.type);
-          this._datasetCache.set(ds.id, metadata);
-          return metadata;
-        } catch (err) {
-          console.warn(`[JupyterBridge] Failed to load metadata for ${ds.id}:`, err);
-          return {
-            id: ds.id,
-            name: ds.name || ds.id,
-            description: '',
-            stats: { n_cells: 0 }
-          };
-        }
-      });
-
-      return Promise.all(metadataPromises);
-    } catch (err) {
-      console.error('[JupyterBridge] Failed to list datasets:', err);
-      return [];
+    const response = await fetch(
+      `${this._config.serverUrl}/_cellucid/datasets`
+    );
+    if (!(response instanceof Response)) {
+      throw new TypeError(
+        'Jupyter dataset listing fetch must return a Response'
+      );
     }
+    if (!response.ok) {
+      throw new Error(
+        `Jupyter dataset listing failed with HTTP ${response.status}`
+      );
+    }
+
+    const datasetList = requireDatasetCatalogPayload(await response.json());
+    const stagedPaths = new Map(
+      datasetList.map(dataset => [dataset.id, dataset.path])
+    );
+    const stagedMetadataEntries = await Promise.all(
+      datasetList.map(async dataset => {
+        const metadata = await loadDatasetMetadata(
+          `${this._config.serverUrl}${dataset.path}`,
+          dataset.id,
+          this.type
+        );
+        return [dataset.id, metadata];
+      })
+    );
+    const stagedCache = new Map(stagedMetadataEntries);
+
+    this._datasetPaths = stagedPaths;
+    this._datasetCache = stagedCache;
+    return stagedMetadataEntries.map(([, metadata]) => metadata);
   }
 
-  async _refreshDatasetPaths() {
-    if (!this._config?.serverUrl) return;
+  _requireDatasetId(datasetId) {
+    return requireExactText(
+      datasetId,
+      'Jupyter dataset id',
+      { allowWhitespace: true }
+    );
+  }
 
-    try {
-      const response = await fetch(`${this._config.serverUrl}/_cellucid/datasets`);
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-
-      const data = await response.json();
-      const datasetList = (data.datasets || []).filter(ds => ds?.id);
-
-      this._datasetPaths.clear();
-      for (const ds of datasetList) {
-        let dsPath = typeof ds.path === 'string' ? ds.path : `/${ds.id}/`;
-        if (!dsPath.startsWith('/')) dsPath = `/${dsPath}`;
-        if (!dsPath.endsWith('/')) dsPath = `${dsPath}/`;
-        this._datasetPaths.set(ds.id, dsPath);
-      }
-    } catch (err) {
-      console.warn('[JupyterBridge] Failed to fetch /_cellucid/datasets:', err);
-      this._datasetPaths.clear();
+  _requireDeclaredDatasetPath(datasetId) {
+    const id = this._requireDatasetId(datasetId);
+    if (!this._datasetPaths.has(id)) {
+      throw new DataSourceError(
+        `Jupyter dataset ${JSON.stringify(id)} is not declared by the current listing`,
+        DataSourceErrorCode.NOT_FOUND,
+        this.type,
+        { datasetId: id }
+      );
     }
+    return this._datasetPaths.get(id);
   }
 
   /**
@@ -692,17 +1158,20 @@ export class JupyterBridgeDataSource {
    */
   async hasDataset(datasetId) {
     if (!this._connected || !this._config) {
-      return false;
+      throw new DataSourceError(
+        'Jupyter dataset lookup requires an initialized connection',
+        DataSourceErrorCode.NETWORK_ERROR,
+        this.type
+      );
     }
+    const id = this._requireDatasetId(datasetId);
 
-    // Check cache first
-    if (this._datasetCache.has(datasetId)) {
+    if (this._datasetPaths.has(id)) {
       return true;
     }
 
-    // Check against server
     const datasets = await this.listDatasets();
-    return datasets.some(d => d.id === datasetId);
+    return datasets.some(dataset => dataset.id === id);
   }
 
   /**
@@ -718,25 +1187,19 @@ export class JupyterBridgeDataSource {
         this.type
       );
     }
+    const id = this._requireDatasetId(datasetId);
 
-    if (this._datasetCache.has(datasetId)) {
-      if (!this._datasetPaths.has(datasetId)) {
-        await this._refreshDatasetPaths();
-      }
-      return this._datasetCache.get(datasetId);
+    if (this._datasetCache.has(id)) {
+      return this._datasetCache.get(id);
     }
 
-    let dsPath = this._datasetPaths.get(datasetId);
-    if (!dsPath) {
-      await this._refreshDatasetPaths();
-      dsPath = this._datasetPaths.get(datasetId);
-    }
-
-    const baseUrl = dsPath
-      ? `${this._config.serverUrl}${dsPath}`
-      : `${this._config.serverUrl}/${datasetId}/`;
-    const metadata = await loadDatasetMetadata(baseUrl, datasetId, this.type);
-    this._datasetCache.set(datasetId, metadata);
+    const datasetPath = this._requireDeclaredDatasetPath(id);
+    const metadata = await loadDatasetMetadata(
+      `${this._config.serverUrl}${datasetPath}`,
+      id,
+      this.type
+    );
+    this._datasetCache.set(id, metadata);
     return metadata;
   }
 
@@ -746,25 +1209,19 @@ export class JupyterBridgeDataSource {
    * @returns {string}
    */
   getBaseUrl(datasetId) {
-    if (!this._config) {
+    if (!this._connected || !this._config) {
       throw new DataSourceError(
-        'Not initialized',
+        'Jupyter dataset URL requires an initialized connection',
         DataSourceErrorCode.NETWORK_ERROR,
         this.type
       );
     }
 
-    this._activeDatasetId = datasetId;
-
-    // Use jupyter:// protocol for consistent handling
-    const dsPath = this._datasetPaths.get(datasetId);
-    if (dsPath === '/') {
+    const datasetPath = this._requireDeclaredDatasetPath(datasetId);
+    if (datasetPath === '/') {
       return `jupyter://${this._config.viewerId}/`;
     }
-    if (dsPath) {
-      return `jupyter://${this._config.viewerId}${dsPath}`;
-    }
-    return `jupyter://${this._config.viewerId}/${datasetId}/`;
+    return `jupyter://${this._config.viewerId}${datasetPath}`;
   }
 
   /**
@@ -774,7 +1231,11 @@ export class JupyterBridgeDataSource {
    */
   async resolveUrl(url) {
     if (!isJupyterUrl(url)) {
-      return url;
+      throw new DataSourceError(
+        `Jupyter source cannot resolve a non-Jupyter URL: ${url}`,
+        DataSourceErrorCode.INVALID_FORMAT,
+        this.type
+      );
     }
 
     if (!this._config) {
@@ -793,11 +1254,36 @@ export class JupyterBridgeDataSource {
         this.type
       );
     }
+    if (parsed.viewerId !== this._config.viewerId) {
+      throw new DataSourceError(
+        'Jupyter URL viewer id does not match the active viewer',
+        DataSourceErrorCode.INVALID_FORMAT,
+        this.type,
+        {
+          expectedViewerId: this._config.viewerId,
+          actualViewerId: parsed.viewerId
+        }
+      );
+    }
 
-    // Convert to HTTP URL, avoiding double slashes
     const path = parsed.path;
-    if (!path || path === '') {
+    if (path === '') {
       return `${this._config.serverUrl}/`;
+    }
+    if (
+      path.startsWith('/') ||
+      path.endsWith('/') ||
+      path.includes('\\') ||
+      path.includes('?') ||
+      path.includes('#') ||
+      /\s/.test(path) ||
+      path.split('/').some(part => part === '' || part === '.' || part === '..')
+    ) {
+      throw new DataSourceError(
+        `Invalid Jupyter artifact path: ${path}`,
+        DataSourceErrorCode.INVALID_FORMAT,
+        this.type
+      );
     }
     return `${this._config.serverUrl}/${path}`;
   }
@@ -841,7 +1327,7 @@ export class JupyterBridgeDataSource {
    * Cleanup on deactivation
    */
   onDeactivate() {
-    console.log('[JupyterBridge] Deactivated');
+    return undefined;
   }
 
   /**
@@ -849,16 +1335,13 @@ export class JupyterBridgeDataSource {
    */
   disconnect() {
     window.removeEventListener('message', this._boundMessageHandler);
-    clearTimeout(this._hoverDebounceTimer);
     this._connected = false;
     this._config = null;
     this._parentOrigin = null;
     this._datasetCache.clear();
     this._datasetPaths.clear();
-    this._pendingRequests.clear();
     this._messageCallbacks.clear();
     this._highlightCallbacks.clear();
-    this._selectionCallbacks.clear();
   }
 }
 

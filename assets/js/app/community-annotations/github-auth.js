@@ -11,11 +11,15 @@
 
 import { EventEmitter } from '../utils/event-emitter.js';
 import { isLocalDevHost } from '../utils/local-dev.js';
+import { parseExactJson } from './wire-contract.js';
+import {
+  isCanonicalGitHubAccount,
+  isCanonicalGitHubRepositoryFullName,
+} from './github-reference.js';
 
 const DEFAULT_WORKER_ORIGIN = 'https://cellucid-github-auth.benkemalim.workers.dev';
 
-const TOKEN_KEY = 'cellucid:github-app-auth:token:v1';
-const USER_KEY = 'cellucid:github-app-auth:user:v1';
+const SESSION_KEY = 'cellucid:github-app-auth:session';
 const LAST_GITHUB_USER_KEY = 'cellucid:community-annotations:last-github-user-key';
 
 const AUTH_FLAG_PARAM = 'cellucid_github_auth';
@@ -24,57 +28,93 @@ const AUTH_ERROR_PARAM = 'cellucid_github_error';
 
 const DEFAULT_FETCH_TIMEOUT_MS = 20_000;
 
-function toCleanString(value) {
-  return String(value ?? '').trim();
-}
-
-function normalizeTimeoutMs(rawTimeoutMs, fallbackMs) {
-  const n = Number(rawTimeoutMs);
-  if (!Number.isFinite(n)) return fallbackMs;
-  return Math.max(0, Math.floor(n));
+function assertTimeoutMs(timeoutMs) {
+  if (
+    typeof timeoutMs !== 'number' ||
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs < 1
+  ) {
+    throw new Error('GitHub request timeout must be a positive safe integer');
+  }
+  return timeoutMs;
 }
 
 function isAbortError(err) {
   return err?.name === 'AbortError';
 }
 
-function normalizeOriginOrNull(rawOrigin) {
-  const raw = toCleanString(rawOrigin);
-  if (!raw) return null;
-  try {
-    const url = new URL(raw);
-    if (url.protocol !== 'https:' && url.protocol !== 'http:') return null;
-    return url.origin;
-  } catch {
-    return null;
+function assertExactHttpOrigin(raw, label) {
+  if (
+    typeof raw !== 'string' ||
+    !raw ||
+    /^\s|\s$/.test(raw)
+  ) {
+    throw new Error(`${label} must be an exact nonblank HTTP(S) origin`);
   }
+  let url;
+  try {
+    url = new URL(raw);
+  } catch (cause) {
+    const error = new Error(
+      `${label} must be an exact nonblank HTTP(S) origin`
+    );
+    error.cause = cause;
+    throw error;
+  }
+  if (
+    (url.protocol !== 'https:' && url.protocol !== 'http:') ||
+    url.username ||
+    url.password ||
+    raw !== url.origin
+  ) {
+    throw new Error(`${label} must be an exact nonblank HTTP(S) origin`);
+  }
+  return raw;
 }
 
-function safeJsonParse(text) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
+function storageFailure(kind, operation, cause) {
+  const error = new Error(
+    `${kind} ${operation} failed for the GitHub annotation session`
+  );
+  error.code = 'GITHUB_AUTH_STORAGE_FAILED';
+  error.cause = cause;
+  return error;
 }
 
-function safeJsonStringify(obj) {
-  try {
-    return JSON.stringify(obj);
-  } catch {
-    return null;
+function assertWorkerErrorDocument(value, label) {
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    Array.isArray(value) ||
+    Object.keys(value).length !== 1 ||
+    !Object.hasOwn(value, 'error') ||
+    typeof value.error !== 'string' ||
+    !value.error ||
+    /^\s|\s$/.test(value.error) ||
+    Array.from(value.error).length > 4096
+  ) {
+    throw new Error(`${label} must contain exactly one exact error string`);
   }
+  return value.error;
 }
 
 export function getGitHubWorkerOrigin() {
   if (typeof window === 'undefined') return DEFAULT_WORKER_ORIGIN;
-  const overrideRaw = toCleanString(window.__CELLUCID_GITHUB_WORKER_ORIGIN__ || '');
-  if (!overrideRaw) return DEFAULT_WORKER_ORIGIN;
+  const overrideRaw = window.__CELLUCID_GITHUB_WORKER_ORIGIN__;
+  if (overrideRaw === undefined) {
+    return DEFAULT_WORKER_ORIGIN;
+  }
 
-  const overrideOrigin = normalizeOriginOrNull(overrideRaw);
-  if (!overrideOrigin) {
+  let overrideOrigin;
+  try {
+    overrideOrigin = assertExactHttpOrigin(
+      overrideRaw,
+      'GitHub worker origin override'
+    );
+  } catch (cause) {
     const err = new Error('Invalid GitHub worker origin override. Refusing to continue.');
     err.code = 'GITHUB_WORKER_ORIGIN_INVALID';
+    err.cause = cause;
     throw err;
   }
 
@@ -97,57 +137,75 @@ export function getGitHubWorkerOrigin() {
 
 function readSessionItem(key) {
   try {
+    if (typeof sessionStorage === 'undefined') {
+      throw new Error('sessionStorage is unavailable');
+    }
     return sessionStorage.getItem(key);
-  } catch {
-    return null;
+  } catch (cause) {
+    throw storageFailure('sessionStorage', 'read', cause);
   }
 }
 
 function writeSessionItem(key, value) {
   try {
+    if (typeof sessionStorage === 'undefined') {
+      throw new Error('sessionStorage is unavailable');
+    }
     sessionStorage.setItem(key, value);
     return true;
-  } catch {
-    return false;
+  } catch (cause) {
+    throw storageFailure('sessionStorage', 'write', cause);
   }
 }
 
 function removeSessionItem(key) {
   try {
+    if (typeof sessionStorage === 'undefined') {
+      throw new Error('sessionStorage is unavailable');
+    }
     sessionStorage.removeItem(key);
     return true;
-  } catch {
-    return false;
+  } catch (cause) {
+    throw storageFailure('sessionStorage', 'remove', cause);
   }
 }
 
 function readLocalItem(key) {
   try {
+    if (typeof localStorage === 'undefined') {
+      throw new Error('localStorage is unavailable');
+    }
     return localStorage.getItem(key);
-  } catch {
-    return null;
+  } catch (cause) {
+    throw storageFailure('localStorage', 'read', cause);
   }
 }
 
 function writeLocalItem(key, value) {
   try {
+    if (typeof localStorage === 'undefined') {
+      throw new Error('localStorage is unavailable');
+    }
     localStorage.setItem(key, value);
     return true;
-  } catch {
-    return false;
+  } catch (cause) {
+    throw storageFailure('localStorage', 'write', cause);
   }
 }
 
 async function fetchJson(url, { method = 'GET', headers = null, body = null, timeoutMs = DEFAULT_FETCH_TIMEOUT_MS } = {}) {
-  const ms = normalizeTimeoutMs(timeoutMs, DEFAULT_FETCH_TIMEOUT_MS);
-  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
-  const signal = controller?.signal;
+  const ms = assertTimeoutMs(timeoutMs);
+  if (typeof AbortController !== 'function') {
+    throw new Error('AbortController is required for GitHub annotation requests');
+  }
+  const controller = new AbortController();
+  const signal = controller.signal;
 
   /** @type {ReturnType<typeof setTimeout> | null} */
   let timeout = null;
-  if (controller && ms > 0) {
+  if (ms > 0) {
     timeout = setTimeout(() => {
-      try { controller.abort(); } catch { /* ignore */ }
+      controller.abort();
     }, ms);
   }
 
@@ -156,19 +214,36 @@ async function fetchJson(url, { method = 'GET', headers = null, body = null, tim
       method,
       headers: headers || undefined,
       body: body != null ? JSON.stringify(body) : undefined,
-      signal: signal || undefined
+      signal
     });
 
     const text = await res.text();
-    const asJson = text ? safeJsonParse(text) : null;
+    let responseJson;
+    try {
+      if (!text) throw new Error('empty response body');
+      responseJson = parseExactJson(text, {
+        path: `GitHub annotation endpoint ${url}`,
+      });
+    } catch (cause) {
+      const error = new Error(
+        `GitHub annotation endpoint returned invalid JSON: ${cause?.message || cause}`
+      );
+      error.status = res.status;
+      error.url = url;
+      error.cause = cause;
+      throw error;
+    }
     if (!res.ok) {
-      const msg = toCleanString(asJson?.error || asJson?.message || text) || `HTTP ${res.status}`;
+      const msg = assertWorkerErrorDocument(
+        responseJson,
+        `GitHub annotation endpoint ${url} error response`
+      );
       const err = new Error(msg);
       err.status = res.status;
       err.url = url;
       throw err;
     }
-    return asJson != null ? asJson : (text || null);
+    return responseJson;
   } catch (err) {
     if (isAbortError(err)) {
       const msg = ms > 0 ? `Request timed out after ${Math.max(1, Math.round(ms / 1000))}s` : 'Request aborted';
@@ -179,54 +254,235 @@ async function fetchJson(url, { method = 'GET', headers = null, body = null, tim
     }
     throw err;
   } finally {
-    if (timeout) clearTimeout(timeout);
+    if (timeout !== null) clearTimeout(timeout);
   }
 }
 
 export function getGitHubLoginUrl(workerOrigin = null) {
-  const origin = toCleanString(workerOrigin || getGitHubWorkerOrigin()).replace(/\/+$/, '');
+  const rawOrigin = workerOrigin === null
+    ? getGitHubWorkerOrigin()
+    : workerOrigin;
+  const origin = assertExactHttpOrigin(rawOrigin, 'GitHub worker origin');
   return `${origin}/auth/login`;
 }
 
 export function toGitHubUserKey(user) {
-  const id = Number(user?.id);
-  if (!Number.isFinite(id)) return null;
-  const safe = Math.max(0, Math.floor(id));
-  return safe ? `ghid_${safe}` : null;
+  if (user === null) return null;
+  const exactUser = assertStoredGitHubUser(user);
+  return `ghid_${exactUser.id}`;
 }
 
 export function getLastGitHubUserKey() {
-  const raw = toCleanString(readLocalItem(LAST_GITHUB_USER_KEY) || '').replace(/^@+/, '').toLowerCase();
-  const m = raw.match(/^ghid_(\d+)$/);
-  if (!m) return null;
+  const raw = readLocalItem(LAST_GITHUB_USER_KEY);
+  if (raw === null) return null;
+  const m = raw.match(/^ghid_([1-9][0-9]*)$/);
+  if (!m) throw new Error('Stored GitHub user key has an invalid exact identity');
   const id = Number(m[1]);
-  if (!Number.isFinite(id)) return null;
-  const safe = Math.max(0, Math.floor(id));
-  return safe ? `ghid_${safe}` : null;
+  if (!Number.isSafeInteger(id) || id < 1) {
+    throw new Error('Stored GitHub user key exceeds the safe integer identity range');
+  }
+  return raw;
+}
+
+function assertStoredGitHubUser(user) {
+  if (!user || typeof user !== 'object' || Array.isArray(user)) {
+    throw new Error('Stored GitHub user must be an object');
+  }
+  if (!Number.isSafeInteger(user.id) || user.id < 1) {
+    throw new Error('Stored GitHub user id must be a positive safe integer');
+  }
+  assertGitHubLogin(user.login, 'Stored GitHub user login');
+  if (
+    Object.keys(user).length !== 2 ||
+    !Object.hasOwn(user, 'id') ||
+    !Object.hasOwn(user, 'login')
+  ) {
+    throw new Error('Stored GitHub user must contain exactly id and login');
+  }
+  return user;
+}
+
+function assertExactObjectKeys(value, keys, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${label} must be an object`);
+  }
+  const actual = Object.keys(value);
+  if (
+    actual.length !== keys.length ||
+    keys.some((key) => !Object.hasOwn(value, key))
+  ) {
+    throw new Error(`${label} must contain exactly ${keys.join(', ')}`);
+  }
+  return value;
+}
+
+function assertGitHubUserResponse(user) {
+  assertExactObjectKeys(user, ['id', 'login'], 'GitHub user endpoint');
+  return assertStoredGitHubUser(user);
+}
+
+function assertGitHubLogin(login, label) {
+  if (
+    typeof login !== 'string' ||
+    !login ||
+    /^\s|\s$/.test(login) ||
+    Array.from(login).length > 64 ||
+    !isCanonicalGitHubAccount(login)
+  ) {
+    throw new Error(`${label} must be an exact nonblank string`);
+  }
+  return login;
+}
+
+function assertInstallationsResponse(document) {
+  assertExactObjectKeys(
+    document,
+    ['installations'],
+    'GitHub installations endpoint'
+  );
+  if (!Array.isArray(document.installations)) {
+    throw new Error('GitHub installations endpoint installations must be an array');
+  }
+  const seenIds = new Set();
+  const seenAccounts = new Set();
+  const installations = document.installations.map((installation, index) => {
+    assertExactObjectKeys(
+      installation,
+      ['id', 'account'],
+      `GitHub installation ${index}`
+    );
+    if (!Number.isSafeInteger(installation.id) || installation.id < 1) {
+      throw new Error(
+        `GitHub installation ${index} id must be a positive safe integer`
+      );
+    }
+    assertExactObjectKeys(
+      installation.account,
+      ['login'],
+      `GitHub installation ${index} account`
+    );
+    const login = assertGitHubLogin(
+      installation.account.login,
+      `GitHub installation ${index} account login`
+    );
+    const accountKey = login.toLowerCase();
+    if (seenIds.has(installation.id) || seenAccounts.has(accountKey)) {
+      throw new Error('GitHub installations endpoint contains duplicate entries');
+    }
+    seenIds.add(installation.id);
+    seenAccounts.add(accountKey);
+    return { id: installation.id, account: { login } };
+  });
+  return { installations };
+}
+
+function assertRepositoryFullName(fullName, label) {
+  if (!isCanonicalGitHubRepositoryFullName(fullName)) {
+    throw new Error(`${label} must be an exact owner/repository name`);
+  }
+  return fullName;
+}
+
+function assertInstallationRepositoriesResponse(document) {
+  assertExactObjectKeys(
+    document,
+    ['repositories'],
+    'GitHub installation repositories endpoint'
+  );
+  if (!Array.isArray(document.repositories)) {
+    throw new Error(
+      'GitHub installation repositories endpoint repositories must be an array'
+    );
+  }
+  const seenIds = new Set();
+  const seenNames = new Set();
+  const repositories = document.repositories.map((repository, index) => {
+    assertExactObjectKeys(
+      repository,
+      ['id', 'full_name', 'private'],
+      `GitHub installation repository ${index}`
+    );
+    if (!Number.isSafeInteger(repository.id) || repository.id < 1) {
+      throw new Error(
+        `GitHub installation repository ${index} id must be a positive safe integer`
+      );
+    }
+    const fullName = assertRepositoryFullName(
+      repository.full_name,
+      `GitHub installation repository ${index} full_name`
+    );
+    if (typeof repository.private !== 'boolean') {
+      throw new Error(
+        `GitHub installation repository ${index} private must be boolean`
+      );
+    }
+    const nameKey = fullName.toLowerCase();
+    if (seenIds.has(repository.id) || seenNames.has(nameKey)) {
+      throw new Error(
+        'GitHub installation repositories endpoint contains duplicate entries'
+      );
+    }
+    seenIds.add(repository.id);
+    seenNames.add(nameKey);
+    return {
+      id: repository.id,
+      full_name: fullName,
+      private: repository.private,
+    };
+  });
+  return { repositories };
 }
 
 function readAuthResultFromUrl(urlString) {
   if (typeof window === 'undefined') return null;
-  const href = toCleanString(urlString || window.location?.href || '');
+  const candidate =
+    urlString === null || urlString === undefined || urlString === ''
+      ? window.location?.href
+      : urlString;
+  if (typeof candidate !== 'string') {
+    throw new Error('GitHub auth callback URL must be a string');
+  }
+  const href = candidate;
   if (!href) return null;
 
-  /** @type {URL|null} */
-  let url = null;
+  /** @type {URL} */
+  let url;
   try {
     url = new URL(href);
-  } catch {
-    return null;
+  } catch (cause) {
+    const error = new Error('GitHub auth callback URL is invalid');
+    error.cause = cause;
+    throw error;
   }
 
   const hash = String(url.hash || '').replace(/^#/, '');
   if (!hash) return null;
 
   const params = new URLSearchParams(hash);
-  const flag = toCleanString(params.get(AUTH_FLAG_PARAM) || '');
-  if (!flag) return null;
-
-  const token = toCleanString(params.get(AUTH_TOKEN_PARAM) || '') || null;
-  const error = toCleanString(params.get(AUTH_ERROR_PARAM) || '') || null;
+  const flags = params.getAll(AUTH_FLAG_PARAM);
+  if (!flags.length) return null;
+  if (flags.length !== 1 || flags[0] !== '1') {
+    throw new Error('GitHub auth callback flag must occur once with value "1"');
+  }
+  const tokens = params.getAll(AUTH_TOKEN_PARAM);
+  const errors = params.getAll(AUTH_ERROR_PARAM);
+  if (
+    tokens.length > 1 ||
+    errors.length > 1 ||
+    (tokens.length === 0) === (errors.length === 0)
+  ) {
+    throw new Error(
+      'GitHub auth callback must contain exactly one token or one error'
+    );
+  }
+  const token = tokens.length ? tokens[0] : null;
+  const error = errors.length ? errors[0] : null;
+  if (token !== null && (!token || /^\s|\s$/.test(token))) {
+    throw new Error('GitHub auth callback token must be an exact nonblank string');
+  }
+  if (error !== null && (!error || /^\s|\s$/.test(error))) {
+    throw new Error('GitHub auth callback error must be an exact nonblank string');
+  }
 
   params.delete(AUTH_FLAG_PARAM);
   params.delete(AUTH_TOKEN_PARAM);
@@ -247,22 +503,53 @@ export class GitHubAuthSession extends EventEmitter {
   }
 
   _loadFromSessionStorage() {
-    const token = toCleanString(readSessionItem(TOKEN_KEY) || '');
-    this._token = token || null;
-    const rawUser = readSessionItem(USER_KEY);
-    const parsed = rawUser ? safeJsonParse(rawUser) : null;
-    this._user = parsed && typeof parsed === 'object' ? parsed : null;
+    const rawSession = readSessionItem(SESSION_KEY);
+    if (rawSession === null) {
+      this._token = null;
+      this._user = null;
+      return;
+    }
+    const session = parseExactJson(rawSession, {
+      path: 'GitHub auth session',
+    });
+    assertExactObjectKeys(
+      session,
+      ['token', 'user'],
+      'Stored GitHub auth session'
+    );
+    if (
+      typeof session.token !== 'string' ||
+      !session.token ||
+      /^\s|\s$/.test(session.token)
+    ) {
+      throw new Error('Stored GitHub token must be an exact nonblank string');
+    }
+    this._token = session.token;
+    this._user = assertStoredGitHubUser(session.user);
   }
 
   _persist() {
-    if (this._token) writeSessionItem(TOKEN_KEY, this._token);
-    else removeSessionItem(TOKEN_KEY);
-    if (this._user) {
-      const payload = safeJsonStringify(this._user);
-      if (payload) writeSessionItem(USER_KEY, payload);
-    } else {
-      removeSessionItem(USER_KEY);
+    if (this._token === null && this._user === null) {
+      removeSessionItem(SESSION_KEY);
+      return;
     }
+    if (
+      typeof this._token !== 'string' ||
+      !this._token ||
+      /^\s|\s$/.test(this._token) ||
+      this._user === null
+    ) {
+      throw new Error(
+        'GitHub auth session requires one exact token and user identity'
+      );
+    }
+    writeSessionItem(
+      SESSION_KEY,
+      JSON.stringify({
+        token: this._token,
+        user: assertStoredGitHubUser(this._user),
+      })
+    );
   }
 
   getWorkerOrigin() {
@@ -274,40 +561,37 @@ export class GitHubAuthSession extends EventEmitter {
   }
 
   getUser() {
-    return this._user;
+    return this._user === null ? null : { ...this._user };
   }
 
   isAuthenticated() {
-    return Boolean(this._token);
+    return this._token !== null && this._user !== null;
   }
 
   async fetchUser() {
     const token = this._token;
     if (!token) return null;
     const workerOrigin = this.getWorkerOrigin();
-    const url = `${workerOrigin.replace(/\/+$/, '')}/auth/user`;
-    const user = await fetchJson(url, {
+    const url = `${workerOrigin}/auth/user`;
+    const userResponse = await fetchJson(url, {
       method: 'GET',
       headers: { Authorization: `Bearer ${token}` }
     });
-    if (user && typeof user === 'object') {
-      this._user = user;
-      this._persist();
-      const key = toGitHubUserKey(this._user);
-      if (key) writeLocalItem(LAST_GITHUB_USER_KEY, key);
-      this.emit('changed', { token: this._token, user: this._user });
-    }
+    this._user = assertGitHubUserResponse(userResponse);
+    this._persist();
+    const key = toGitHubUserKey(this._user);
+    writeLocalItem(LAST_GITHUB_USER_KEY, key);
+    this.emit('changed', { token: this._token, user: this._user });
     return this._user;
   }
 
   async _acceptToken(token) {
-    const t = toCleanString(token || '');
-    if (!t) throw new Error('Missing GitHub token');
+    if (typeof token !== 'string' || !token || /^\s|\s$/.test(token)) {
+      throw new Error('Missing or inexact GitHub token');
+    }
 
-    this._token = t;
+    this._token = token;
     this._user = null;
-    this._persist();
-    this.emit('changed', { token: this._token, user: this._user });
     try {
       await this.fetchUser();
     } catch (err) {
@@ -319,15 +603,14 @@ export class GitHubAuthSession extends EventEmitter {
 
   async completeSignInFromRedirect({ url = null } = {}) {
     if (typeof window === 'undefined') throw new Error('GitHub login requires a browser context');
-    const result = readAuthResultFromUrl(url || window.location?.href || '');
+    const result = readAuthResultFromUrl(url);
     if (!result) return null;
 
     if (result.cleanedUrl) {
-      try {
-        window.history?.replaceState?.(null, '', result.cleanedUrl);
-      } catch {
-        // ignore
+      if (typeof window.history?.replaceState !== 'function') {
+        throw new Error('History.replaceState is required to remove the GitHub token fragment');
       }
+      window.history.replaceState(null, '', result.cleanedUrl);
     }
 
     if (result.error) {
@@ -348,18 +631,14 @@ export class GitHubAuthSession extends EventEmitter {
   signIn({ returnTo = null } = {}) {
     if (typeof window === 'undefined') throw new Error('GitHub login requires a browser context');
     const workerOrigin = this.getWorkerOrigin();
-    const rt = (() => {
-      const raw = toCleanString(returnTo || '');
-      if (raw) return raw;
-      try {
-        const { origin, pathname, search } = window.location;
-        return `${origin}${pathname}${search || ''}`;
-      } catch {
-        return toCleanString(window.location?.href || '');
-      }
-    })();
+    const rt = returnTo === null
+      ? `${window.location.origin}${window.location.pathname}${window.location.search}`
+      : returnTo;
+    if (typeof rt !== 'string' || !rt || /^\s|\s$/.test(rt)) {
+      throw new Error('GitHub sign-in returnTo must be an exact nonblank URL');
+    }
     const url = new URL(getGitHubLoginUrl(workerOrigin));
-    if (rt) url.searchParams.set('return_to', rt);
+    url.searchParams.set('return_to', rt);
     window.location.assign(url.toString());
   }
 
@@ -374,25 +653,28 @@ export class GitHubAuthSession extends EventEmitter {
     const token = this._token;
     if (!token) throw new Error('Not signed in');
     const workerOrigin = this.getWorkerOrigin();
-    const url = `${workerOrigin.replace(/\/+$/, '')}/auth/installations`;
-    return fetchJson(url, {
+    const url = `${workerOrigin}/auth/installations`;
+    const response = await fetchJson(url, {
       method: 'GET',
       headers: { Authorization: `Bearer ${token}` }
     });
+    return assertInstallationsResponse(response);
   }
 
   async listInstallationRepos(installationId) {
     const token = this._token;
     if (!token) throw new Error('Not signed in');
-    const id = Number(installationId);
-    if (!Number.isFinite(id)) throw new Error('Invalid installation_id');
+    if (!Number.isSafeInteger(installationId) || installationId < 1) {
+      throw new Error('Invalid installation_id');
+    }
     const workerOrigin = this.getWorkerOrigin();
-    const url = `${workerOrigin.replace(/\/+$/, '')}/auth/installation-repos`;
-    return fetchJson(url, {
+    const url = `${workerOrigin}/auth/installation-repos`;
+    const response = await fetchJson(url, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: { installation_id: id }
+      body: { installation_id: installationId }
     });
+    return assertInstallationRepositoriesResponse(response);
   }
 }
 

@@ -7,15 +7,33 @@
  * @module ui/modules/sidebar-controls
  */
 
-import { SIDEBAR_MIN_WIDTH_PX, clampSidebarWidthPx } from '../../sidebar-metrics.js';
+import { clampSidebarWidthPx } from '../../sidebar-metrics.js';
 import { StyleManager } from '../../../utils/style-manager.js';
 
 export function initSidebarControls({ dom }) {
-  const sidebar = dom?.el || null;
-  const sidebarToggle = dom?.toggleBtn || null;
-  const sidebarResizeHandle = dom?.resizeHandle || null;
-
-  if (!sidebar || !sidebarToggle) return {};
+  if (dom === null || typeof dom !== 'object' || Array.isArray(dom)) {
+    throw new TypeError('Sidebar controls require one DOM reference object.');
+  }
+  const { el: sidebar, toggleBtn: sidebarToggle, resizeHandle: sidebarResizeHandle } = dom;
+  for (const [label, element] of [
+    ['sidebar', sidebar],
+    ['sidebar toggle', sidebarToggle],
+    ['sidebar resize handle', sidebarResizeHandle],
+  ]) {
+    if (!(element instanceof HTMLElement)) {
+      throw new TypeError(`Sidebar controls require the ${label} HTMLElement.`);
+    }
+  }
+  const ownerDocument = sidebar.ownerDocument;
+  if (
+    sidebarToggle.ownerDocument !== ownerDocument ||
+    sidebarResizeHandle.ownerDocument !== ownerDocument
+  ) {
+    throw new TypeError('Sidebar controls require elements from one document.');
+  }
+  if (!(ownerDocument.documentElement instanceof HTMLElement)) {
+    throw new TypeError('Sidebar controls require an HTML document root.');
+  }
 
   const syncSidebarToggleState = () => {
     const isHidden = sidebar.classList.contains('hidden');
@@ -27,17 +45,20 @@ export function initSidebarControls({ dom }) {
   };
 
   sidebarToggle.type = 'button';
-  sidebarToggle.setAttribute('aria-controls', sidebar.id || 'sidebar');
-
-  try {
-    StyleManager.setVariable(
-      document.documentElement,
-      '--sidebar-width',
-      `${Math.round(sidebar.getBoundingClientRect().width)}px`
-    );
-  } catch {
-    // ignore: running outside browser
+  if (sidebar.id.length === 0) {
+    throw new TypeError('Sidebar controls require a non-empty sidebar id.');
   }
+  sidebarToggle.setAttribute('aria-controls', sidebar.id);
+
+  const initialWidth = sidebar.getBoundingClientRect().width;
+  if (!Number.isFinite(initialWidth) || initialWidth <= 0) {
+    throw new RangeError('Sidebar width must be positive before initialization.');
+  }
+  StyleManager.setVariable(
+    ownerDocument.documentElement,
+    '--sidebar-width',
+    `${Math.round(initialWidth)}px`
+  );
   syncSidebarToggleState();
 
   sidebarToggle.addEventListener('click', () => {
@@ -45,42 +66,47 @@ export function initSidebarControls({ dom }) {
     syncSidebarToggleState();
   });
 
-  if (sidebarResizeHandle) {
-    let isResizing = false;
-    let startX = 0;
-    let startWidth = 0;
+  let isResizing = false;
+  let startX = 0;
+  let startWidth = 0;
 
-    const updateSidebarWidth = (width) => {
-      const clampedWidth = clampSidebarWidthPx(width);
-      StyleManager.setVariable(document.documentElement, '--sidebar-width', `${clampedWidth}px`);
-    };
+  const updateSidebarWidth = (width) => {
+    const clampedWidth = clampSidebarWidthPx(width);
+    StyleManager.setVariable(
+      ownerDocument.documentElement,
+      '--sidebar-width',
+      `${clampedWidth}px`
+    );
+  };
 
-    sidebarResizeHandle.addEventListener('mousedown', (e) => {
-      isResizing = true;
-      startX = e.clientX;
-      startWidth = sidebar.offsetWidth;
-      if (startWidth < SIDEBAR_MIN_WIDTH_PX) startWidth = SIDEBAR_MIN_WIDTH_PX;
-      sidebar.classList.add('resizing');
-      document.body.style.cursor = 'ew-resize';
-      document.body.style.userSelect = 'none';
-      e.preventDefault();
-    });
+  sidebarResizeHandle.addEventListener('mousedown', (event) => {
+    if (!(event instanceof MouseEvent)) {
+      throw new TypeError('Sidebar resize start requires a MouseEvent.');
+    }
+    if (!Number.isFinite(sidebar.offsetWidth) || sidebar.offsetWidth <= 0) {
+      throw new RangeError('Sidebar resize requires a positive current width.');
+    }
+    isResizing = true;
+    startX = event.clientX;
+    startWidth = sidebar.offsetWidth;
+    sidebar.classList.add('resizing');
+    ownerDocument.body.style.cursor = 'ew-resize';
+    ownerDocument.body.style.userSelect = 'none';
+    event.preventDefault();
+  });
 
-    document.addEventListener('mousemove', (e) => {
-      if (!isResizing) return;
-      const deltaX = e.clientX - startX;
-      updateSidebarWidth(startWidth + deltaX);
-    });
+  ownerDocument.addEventListener('mousemove', (event) => {
+    if (!isResizing) return;
+    updateSidebarWidth(startWidth + event.clientX - startX);
+  });
 
-    document.addEventListener('mouseup', () => {
-      if (!isResizing) return;
-      isResizing = false;
-      sidebar.classList.remove('resizing');
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
-    });
-  }
+  ownerDocument.addEventListener('mouseup', () => {
+    if (!isResizing) return;
+    isResizing = false;
+    sidebar.classList.remove('resizing');
+    ownerDocument.body.style.cursor = '';
+    ownerDocument.body.style.userSelect = '';
+  });
 
   return { syncSidebarToggleState };
 }
-

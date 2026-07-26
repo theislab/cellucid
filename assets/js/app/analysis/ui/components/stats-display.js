@@ -192,9 +192,14 @@ export function renderStatisticalAnnotations(container, pageData, dataType) {
     testName.textContent = formatted.test;
 
     const significance = document.createElement('span');
-    significance.className = `analysis-test-significance ${result.significance === 'ns' ? 'not-significant' : 'significant'}`;
+    const isUnavailable = result.significance === 'N/A';
+    significance.className = `analysis-test-significance ${
+      result.significance === 'ns' || isUnavailable ? 'not-significant' : 'significant'
+    }`;
     significance.textContent = result.significance;
-    significance.title = result.significance === 'ns'
+    significance.title = isUnavailable
+      ? 'Statistical significance is not available'
+      : result.significance === 'ns'
       ? 'Not significant (p ≥ 0.05)'
       : result.significance === '*' ? 'p < 0.05'
       : result.significance === '**' ? 'p < 0.01'
@@ -226,6 +231,9 @@ export function renderStatisticalAnnotations(container, pageData, dataType) {
 
     addRow('Statistic', formatted.statistic);
     addRow('p-value', formatted.pValue, true);
+    if (formatted.method) {
+      addRow('Method', formatted.method);
+    }
     if (formatted.effectSize !== 'N/A') {
       addRow('Effect Size', formatted.effectSize);
     }

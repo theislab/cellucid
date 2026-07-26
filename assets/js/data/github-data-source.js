@@ -5,19 +5,22 @@
  * Uses GitHub's raw content URLs for direct file access with lazy loading.
  *
  * URL Format:
- * - Input: owner/repo/path/to/exports or owner/repo/branch/path
+ * - Input: owner/repo/path/to/exports or owner/repo@branch/path/to/exports
+ * - URL: https://github.com/owner/repo/tree/branch/path/to/exports
+ * - Raw URL: https://raw.githubusercontent.com/owner/repo/branch/path/to/exports
  * - Resolved: https://raw.githubusercontent.com/owner/repo/main/path/to/exports/
  *
  * Features:
  * - Lazy loading: Files fetched on-demand, identical to local-demo behavior
  * - Multi-dataset support: Reads datasets.json
- * - Branch selection: Default 'main', can specify 'master' or other branches
+ * - Deterministic branch selection: shorthand uses 'main' unless @branch is explicit
  */
 
 import {
   DATA_CONFIG,
   DataSourceError,
   DataSourceErrorCode,
+  fetchJson,
   loadDatasetMetadata,
   resolveUrl,
   validateSchemaVersion
@@ -28,87 +31,152 @@ import { getNotificationCenter } from '../app/notification-center.js';
  * @typedef {import('./data-source.js').DatasetMetadata} DatasetMetadata
  */
 
+const DEFAULT_GITHUB_BRANCH = 'main';
+const GITHUB_SOURCE_TYPE = 'github-repo';
+
+function isSafeGitHubSegment(value) {
+  return !(
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value === '.' ||
+    value === '..' ||
+    value.includes('/') ||
+    value.includes('\\') ||
+    value.includes('?') ||
+    value.includes('#') ||
+    /[\u0000-\u001f\u007f]/.test(value)
+  );
+}
+
+function decodeGitHubSegment(value) {
+  let decoded;
+  try {
+    decoded = decodeURIComponent(value);
+  } catch {
+    return null;
+  }
+  return isSafeGitHubSegment(decoded) ? decoded : null;
+}
+
+function splitGitHubSegments(value, { urlPath = false } = {}) {
+  let raw = value;
+  if (urlPath) {
+    if (!raw.startsWith('/')) return null;
+    raw = raw.slice(1);
+  }
+  if (raw.endsWith('/')) {
+    raw = raw.slice(0, -1);
+  }
+  if (raw.length === 0) return [];
+  const encodedSegments = raw.split('/');
+  if (encodedSegments.some(segment => segment.length === 0)) {
+    return null;
+  }
+  const segments = encodedSegments.map(decodeGitHubSegment);
+  return segments.some(segment => segment === null)
+    ? null
+    : segments;
+}
+
 /**
  * Parse a GitHub repository URL/path into components
- * @param {string} input - Input like "owner/repo/path" or "owner/repo/branch/path"
- * @returns {{owner: string, repo: string, branch: string|null, pathSegments: string[], path: string, branchExplicit: boolean}|null}
+ * @param {string} input - Exact shorthand, GitHub tree URL, or GitHub raw URL
+ * @returns {{owner: string, repo: string, branch: string, path: string}|null}
  */
 export function parseGitHubPath(input) {
-  if (!input || typeof input !== 'string') return null;
+  if (typeof input !== 'string') return null;
+  const cleaned = input.trim();
+  if (cleaned.length === 0) return null;
 
-  let cleaned = input.trim();
-  let host = null;
-  let path = cleaned;
-
-  // Accept full URLs (github.com + raw.githubusercontent.com).
+  let url = null;
   try {
-    const url = new URL(cleaned);
-    host = (url.hostname || '').toLowerCase();
-    path = url.pathname || '';
+    url = new URL(cleaned);
   } catch {
-    // Not a URL; accept github.com/... and raw.githubusercontent.com/... without protocol.
-    cleaned = cleaned.replace(/^https?:\/\//i, '');
-    const lower = cleaned.toLowerCase();
-    if (lower.startsWith('github.com/')) {
-      host = 'github.com';
-      cleaned = cleaned.slice('github.com/'.length);
-    } else if (lower.startsWith('raw.githubusercontent.com/')) {
-      host = 'raw.githubusercontent.com';
-      cleaned = cleaned.slice('raw.githubusercontent.com/'.length);
+    // Exact shorthand is handled below.
+  }
+
+  if (url !== null) {
+    if (
+      url.protocol !== 'https:' ||
+      url.username !== '' ||
+      url.password !== '' ||
+      url.port !== '' ||
+      url.search !== '' ||
+      url.hash !== ''
+    ) {
+      return null;
     }
-    path = cleaned;
-  }
+    const segments = splitGitHubSegments(
+      url.pathname,
+      { urlPath: true }
+    );
+    if (segments === null) return null;
 
-  // Normalize path: strip leading/trailing slashes and remove query/hash suffixes.
-  path = (path || '').split('?')[0].split('#')[0];
-  path = path.replace(/^\/+|\/+$/g, '');
-
-  // If the user pasted a direct datasets.json URL, treat its parent as the exports root.
-  if (path.toLowerCase().endsWith('/datasets.json')) {
-    path = path.slice(0, -'/datasets.json'.length);
-  }
-
-  const parts = path.split('/').filter(Boolean);
-  if (parts.length < 2) {
+    if (url.hostname.toLowerCase() === 'github.com') {
+      if (segments.length < 4 || segments[2] !== 'tree') {
+        return null;
+      }
+      return {
+        owner: segments[0],
+        repo: segments[1],
+        branch: segments[3],
+        path: segments.slice(4).join('/'),
+      };
+    }
+    if (
+      url.hostname.toLowerCase() ===
+      'raw.githubusercontent.com'
+    ) {
+      if (segments.length < 3) return null;
+      return {
+        owner: segments[0],
+        repo: segments[1],
+        branch: segments[2],
+        path: segments.slice(3).join('/'),
+      };
+    }
     return null;
   }
 
-  const owner = parts[0];
-  let repo = parts[1];
-  let branch = null;
-  let branchExplicit = false;
-
-  // Allow explicit branch via owner/repo@branch/path or owner/repo#branch/path
-  const repoBranchMatch = repo.match(/^([^@#]+)[@#]([^@#]+)$/);
-  if (repoBranchMatch) {
-    repo = repoBranchMatch[1];
-    branch = repoBranchMatch[2];
-    branchExplicit = true;
+  if (
+    cleaned.includes('://') ||
+    cleaned.includes('?') ||
+    cleaned.includes('#') ||
+    /^github\.com\//i.test(cleaned) ||
+    /^raw\.githubusercontent\.com\//i.test(cleaned)
+  ) {
+    return null;
   }
+  const segments = splitGitHubSegments(cleaned);
+  if (segments === null || segments.length < 2) return null;
 
-  let rest = parts.slice(2);
-
-  // Parse GitHub "tree/blob" URLs: /owner/repo/tree/<branch>/...
-  if ((host === 'github.com' || host === null) && rest.length >= 2 && (rest[0] === 'tree' || rest[0] === 'blob')) {
-    branch = rest[1];
-    branchExplicit = true;
-    rest = rest.slice(2);
+  const owner = segments[0];
+  const repoSpecifier = segments[1];
+  const atIndex = repoSpecifier.indexOf('@');
+  let repo = repoSpecifier;
+  let branch = DEFAULT_GITHUB_BRANCH;
+  if (atIndex !== -1) {
+    if (
+      atIndex === 0 ||
+      atIndex === repoSpecifier.length - 1 ||
+      repoSpecifier.indexOf('@', atIndex + 1) !== -1
+    ) {
+      return null;
+    }
+    repo = repoSpecifier.slice(0, atIndex);
+    branch = repoSpecifier.slice(atIndex + 1);
   }
-
-  // Parse raw URLs: /owner/repo/<branch>/...
-  if (host === 'raw.githubusercontent.com' && rest.length >= 1) {
-    branch = rest[0];
-    branchExplicit = true;
-    rest = rest.slice(1);
+  if (
+    !isSafeGitHubSegment(repo) ||
+    !isSafeGitHubSegment(branch)
+  ) {
+    return null;
   }
-
   return {
     owner,
     repo,
     branch,
-    pathSegments: rest,
-    path: rest.join('/'),
-    branchExplicit
+    path: segments.slice(2).join('/'),
   };
 }
 
@@ -119,57 +187,285 @@ export function parseGitHubPath(input) {
  */
 function buildRawUrl(parsed) {
   const { owner, repo, branch, path } = parsed;
-  let url = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}`;
-  if (path) {
-    url += `/${path}`;
+  const segments = [owner, repo, branch];
+  if (path.length > 0) {
+    segments.push(...path.split('/'));
   }
-  if (!url.endsWith('/')) {
-    url += '/';
+  return (
+    'https://raw.githubusercontent.com/' +
+    segments.map(segment => encodeURIComponent(segment)).join('/') +
+    '/'
+  );
+}
+
+function invalidGitHubCatalog(message, details = {}) {
+  return new DataSourceError(
+    `Invalid datasets.json: ${message}`,
+    DataSourceErrorCode.INVALID_FORMAT,
+    GITHUB_SOURCE_TYPE,
+    details
+  );
+}
+
+function isPlainRecord(value) {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    !Array.isArray(value)
+  );
+}
+
+function requireExactKeys(value, required, optional, label) {
+  if (!isPlainRecord(value)) {
+    throw invalidGitHubCatalog(`${label} must be an object`);
   }
-  return url;
+  for (const key of required) {
+    if (!Object.hasOwn(value, key)) {
+      throw invalidGitHubCatalog(
+        `${label} is missing required field '${key}'`,
+        { label, key }
+      );
+    }
+  }
+  const allowed = new Set([...required, ...optional]);
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) {
+      throw invalidGitHubCatalog(
+        `${label} contains unsupported field '${key}'`,
+        { label, key }
+      );
+    }
+  }
+}
+
+function validateDatasetDirectoryPath(value, id, baseUrl) {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value !== value.trim() ||
+    !value.endsWith('/') ||
+    value.startsWith('/') ||
+    value.includes('\\') ||
+    value.includes('?') ||
+    value.includes('#') ||
+    /^[A-Za-z]:/.test(value) ||
+    /[\u0000-\u001f\u007f]/.test(value)
+  ) {
+    throw invalidGitHubCatalog(
+      `dataset '${id}' must declare a safe relative directory path ending in '/'`,
+      { id, path: value }
+    );
+  }
+  const encodedSegments = value.slice(0, -1).split('/');
+  if (encodedSegments.some(segment => segment.length === 0)) {
+    throw invalidGitHubCatalog(
+      `dataset '${id}' must declare a safe relative directory path`,
+      { id, path: value }
+    );
+  }
+  const decodedSegments = [];
+  for (const encodedSegment of encodedSegments) {
+    const segment = decodeGitHubSegment(encodedSegment);
+    if (segment === null) {
+      throw invalidGitHubCatalog(
+        `dataset '${id}' must declare a safe relative directory path`,
+        { id, path: value }
+      );
+    }
+    decodedSegments.push(segment);
+  }
+  const canonicalPath =
+    decodedSegments
+      .map(segment => encodeURIComponent(segment))
+      .join('/') +
+    '/';
+  const resolved = resolveUrl(baseUrl, canonicalPath);
+  if (!resolved.startsWith(baseUrl)) {
+    throw invalidGitHubCatalog(
+      `dataset '${id}' must declare a safe relative directory path`,
+      { id, path: value }
+    );
+  }
+  return resolved;
 }
 
 /**
- * Check if a URL is a github-repo:// protocol URL
- * @param {string} url
- * @returns {boolean}
+ * Validate the sole current GitHub datasets.json contract.
  */
-export function isGitHubRepoUrl(url) {
-  return url?.startsWith('github-repo://');
-}
-
-/**
- * Parse a github-repo:// URL
- * @param {string} url
- * @returns {{datasetId: string, path: string}|null}
- */
-export function parseGitHubRepoUrl(url) {
-  if (!isGitHubRepoUrl(url)) return null;
-
-  const withoutProtocol = url.substring('github-repo://'.length);
-  const slashIdx = withoutProtocol.indexOf('/');
-
-  if (slashIdx === -1) {
-    return { datasetId: withoutProtocol, path: '' };
+function validateGitHubCatalog(manifest, baseUrl) {
+  requireExactKeys(
+    manifest,
+    ['version', 'default', 'datasets'],
+    [],
+    'catalog'
+  );
+  validateSchemaVersion(
+    manifest.version,
+    DATA_CONFIG.SUPPORTED_MANIFEST_VERSIONS,
+    'datasets.json'
+  );
+  if (
+    typeof manifest.default !== 'string' ||
+    manifest.default.length === 0 ||
+    manifest.default !== manifest.default.trim()
+  ) {
+    throw invalidGitHubCatalog(
+      'an explicit default dataset id is required'
+    );
+  }
+  if (
+    !Array.isArray(manifest.datasets) ||
+    manifest.datasets.length === 0
+  ) {
+    throw invalidGitHubCatalog(
+      'datasets must be a non-empty array'
+    );
   }
 
-  return {
-    datasetId: withoutProtocol.substring(0, slashIdx),
-    path: withoutProtocol.substring(slashIdx + 1)
-  };
+  const ids = new Set();
+  const paths = new Set();
+  for (
+    let index = 0;
+    index < manifest.datasets.length;
+    index++
+  ) {
+    const entry = manifest.datasets[index];
+    const label = `dataset entry ${index}`;
+    requireExactKeys(
+      entry,
+      ['id', 'path'],
+      ['name', 'description', 'n_cells', 'n_genes'],
+      label
+    );
+    if (
+      typeof entry.id !== 'string' ||
+      entry.id.length === 0 ||
+      entry.id !== entry.id.trim() ||
+      /[\u0000-\u001f\u007f]/.test(entry.id)
+    ) {
+      throw invalidGitHubCatalog(
+        `${label} requires a non-empty string id`,
+        { index, id: entry.id }
+      );
+    }
+    if (ids.has(entry.id)) {
+      throw invalidGitHubCatalog(
+        `every dataset requires a unique id; '${entry.id}' is duplicated`,
+        { index, id: entry.id }
+      );
+    }
+    ids.add(entry.id);
+
+    const resolvedPath = validateDatasetDirectoryPath(
+      entry.path,
+      entry.id,
+      baseUrl
+    );
+    if (paths.has(resolvedPath)) {
+      throw invalidGitHubCatalog(
+        `every dataset requires a unique path; '${entry.path}' is reused`,
+        { index, id: entry.id, path: entry.path }
+      );
+    }
+    paths.add(resolvedPath);
+
+    if (
+      Object.hasOwn(entry, 'name') &&
+      (
+        typeof entry.name !== 'string' ||
+        entry.name.trim().length === 0
+      )
+    ) {
+      throw invalidGitHubCatalog(
+        `dataset '${entry.id}' name must be a non-empty string`,
+        { id: entry.id, name: entry.name }
+      );
+    }
+    if (
+      Object.hasOwn(entry, 'description') &&
+      typeof entry.description !== 'string'
+    ) {
+      throw invalidGitHubCatalog(
+        `dataset '${entry.id}' description must be a string`,
+        { id: entry.id, description: entry.description }
+      );
+    }
+    for (const key of ['n_cells', 'n_genes']) {
+      if (
+        Object.hasOwn(entry, key) &&
+        (
+          !Number.isSafeInteger(entry[key]) ||
+          entry[key] < 0
+        )
+      ) {
+        throw invalidGitHubCatalog(
+          `dataset '${entry.id}' ${key} must be a non-negative safe integer`,
+          { id: entry.id, key, value: entry[key] }
+        );
+      }
+    }
+  }
+  if (!ids.has(manifest.default)) {
+    throw invalidGitHubCatalog(
+      `default '${manifest.default}' is not present in datasets`,
+      { default: manifest.default }
+    );
+  }
+  return manifest;
 }
 
-/**
- * Fetch JSON from URL with error handling
- * @param {string} url
- * @returns {Promise<Object>}
- */
-async function fetchJson(url) {
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+function requireCatalogIdentityAgreement(entry, metadata) {
+  const assertions = [
+    ['name', metadata.name],
+    ['description', metadata.description],
+    ['n_cells', metadata.stats.n_cells],
+    ['n_genes', metadata.stats.n_genes],
+  ];
+  for (const [key, identityValue] of assertions) {
+    if (
+      Object.hasOwn(entry, key) &&
+      entry[key] !== identityValue
+    ) {
+      throw invalidGitHubCatalog(
+        `dataset '${entry.id}' catalog ${key} does not match canonical dataset_identity.json ${key}`,
+        {
+          datasetId: entry.id,
+          key,
+          catalogValue: entry[key],
+          identityValue,
+        }
+      );
+    }
   }
-  return response.json();
+}
+
+async function loadGitHubDatasets(
+  manifest,
+  baseUrl,
+  sourceType
+) {
+  validateGitHubCatalog(manifest, baseUrl);
+  const datasets = [];
+  for (const entry of manifest.datasets) {
+    try {
+      const datasetBaseUrl = resolveUrl(baseUrl, entry.path);
+      const metadata = await loadDatasetMetadata(
+        datasetBaseUrl,
+        entry.id,
+        sourceType
+      );
+      requireCatalogIdentityAgreement(entry, metadata);
+      datasets.push(metadata);
+    } catch (error) {
+      throw new DataSourceError(
+        `Dataset '${entry.id}' is invalid: ${error?.message || error}`,
+        DataSourceErrorCode.INVALID_FORMAT,
+        sourceType,
+        { datasetId: entry.id, cause: error }
+      );
+    }
+  }
+  return datasets;
 }
 
 /**
@@ -197,6 +493,9 @@ export class GitHubDataSource {
 
     /** @type {boolean} */
     this._connected = false;
+
+    /** @type {number} Connection generation for stale refresh rejection */
+    this._connectionRevision = 0;
 
     this.type = 'github-repo';
   }
@@ -227,10 +526,8 @@ export class GitHubDataSource {
     const trackerId = notifications.loading('Connecting to GitHub repository...', { category: 'data' });
 
     try {
-      this._inputPath = inputPath;
-      this._parsedPath = parseGitHubPath(inputPath);
-
-      if (!this._parsedPath) {
+      const parsedPath = parseGitHubPath(inputPath);
+      if (!parsedPath) {
         throw new DataSourceError(
           'Invalid GitHub path. Use format: owner/repo/exports (or owner/repo@branch/exports), or paste a GitHub URL.',
           DataSourceErrorCode.INVALID_FORMAT,
@@ -239,107 +536,43 @@ export class GitHubDataSource {
         );
       }
 
-      const commonBranches = ['main', 'master', 'gh-pages', 'develop', 'dev'];
-
-      const attempts = [];
-      const tried = new Set();
-
-      const tryManifest = async ({ owner, repo, branch, path }) => {
-        const baseUrl = buildRawUrl({ owner, repo, branch, path });
-        const manifestUrl = resolveUrl(baseUrl, DATA_CONFIG.DATASETS_MANIFEST);
-        if (tried.has(manifestUrl)) return null;
-        tried.add(manifestUrl);
-
-        try {
-          const manifest = await fetchJson(manifestUrl);
-          validateSchemaVersion(
-            manifest.version,
-            DATA_CONFIG.SUPPORTED_MANIFEST_VERSIONS,
-            'datasets.json'
-          );
-          return { baseUrl, manifestUrl, manifest, branch, path };
-        } catch (err) {
-          attempts.push({
-            baseUrl,
-            manifestUrl,
-            error: err?.message || String(err)
-          });
-          return null;
-        }
-      };
-
-      const owner = this._parsedPath.owner;
-      const repo = this._parsedPath.repo;
-
-      let chosen = null;
-      if (this._parsedPath.branch) {
-        chosen = await tryManifest({
-          owner,
-          repo,
-          branch: this._parsedPath.branch,
-          path: this._parsedPath.path
-        });
-      } else {
-        // First: default branches + the full path (most common: owner/repo/exports).
-        for (const b of commonBranches) {
-          chosen = await tryManifest({ owner, repo, branch: b, path: this._parsedPath.path });
-          if (chosen) break;
-        }
-
-        // Next: treat the first path segment as a branch name (owner/repo/<branch>/<exportsPath>).
-        if (!chosen && this._parsedPath.pathSegments.length >= 2) {
-          const b = this._parsedPath.pathSegments[0];
-          const p = this._parsedPath.pathSegments.slice(1).join('/');
-          chosen = await tryManifest({ owner, repo, branch: b, path: p });
-        }
-
-        // Last resort: treat a single segment as a branch (owner/repo/<branch>).
-        if (!chosen && this._parsedPath.pathSegments.length === 1) {
-          const b = this._parsedPath.pathSegments[0];
-          chosen = await tryManifest({ owner, repo, branch: b, path: '' });
-        }
-      }
-
-      if (!chosen) {
-        const hint = attempts[0]?.manifestUrl
-          ? ` (example tried: ${attempts[0].manifestUrl})`
-          : '';
-        throw new DataSourceError(
-          `datasets.json not found at this GitHub path${hint}. ` +
-          `Make sure you point at an exports root folder that contains datasets.json.`,
-          DataSourceErrorCode.NOT_FOUND,
-          this.type,
-          { input: inputPath, parsed: this._parsedPath, attempts }
-        );
-      }
-
-      this._baseUrl = chosen.baseUrl;
-      this._manifest = chosen.manifest;
-      this._parsedPath.branch = chosen.branch;
-      this._parsedPath.path = chosen.path;
-      this._parsedPath.pathSegments = (chosen.path || '').split('/').filter(Boolean);
-      console.log(`[GitHubDataSource] Connecting to: ${this._baseUrl}`);
-
-      console.log(`[GitHubDataSource] Found datasets manifest with ${this._manifest.datasets?.length || 0} datasets`);
-
-      // Load datasets
-      this._datasets = await this._loadDatasets();
-      this._connected = true;
+      const baseUrl = buildRawUrl(parsedPath);
+      const manifestUrl = resolveUrl(
+        baseUrl,
+        DATA_CONFIG.DATASETS_MANIFEST
+      );
+      const manifest = await fetchJson(manifestUrl, this.type);
+      const datasets = await loadGitHubDatasets(
+        manifest,
+        baseUrl,
+        this.type
+      );
 
       const repoInfo = {
-        owner,
-        repo,
-        branch: chosen.branch,
-        path: chosen.path,
-        baseUrl: this._baseUrl,
+        owner: parsedPath.owner,
+        repo: parsedPath.repo,
+        branch: parsedPath.branch,
+        path: parsedPath.path,
+        baseUrl,
       };
 
-      notifications.complete(trackerId, `Connected to ${this._parsedPath.owner}/${this._parsedPath.repo}`);
+      this._inputPath = inputPath.trim();
+      this._parsedPath = parsedPath;
+      this._baseUrl = baseUrl;
+      this._manifest = manifest;
+      this._datasets = datasets;
+      this._activeDatasetId = null;
+      this._connected = true;
+      this._connectionRevision++;
+
+      notifications.complete(
+        trackerId,
+        `Connected to ${parsedPath.owner}/${parsedPath.repo}`
+      );
       console.log('[GitHubDataSource] Connected:', repoInfo);
 
-      return { repoInfo, datasets: this._datasets };
+      return { repoInfo, datasets };
     } catch (err) {
-      this._cleanup();
       notifications.fail(trackerId, err.message || 'Failed to connect');
 
       if (err instanceof DataSourceError) {
@@ -353,61 +586,6 @@ export class GitHubDataSource {
         { input: inputPath, originalError: err.message }
       );
     }
-  }
-
-  /**
-   * Load datasets from manifest
-   * @returns {Promise<DatasetMetadata[]>}
-   * @private
-   */
-  async _loadDatasets() {
-    if (!this._manifest) {
-      throw new DataSourceError(
-        'datasets.json manifest not loaded',
-        DataSourceErrorCode.INVALID_FORMAT,
-        this.type,
-        { url: this._baseUrl }
-      );
-    }
-
-    // Multi-dataset mode
-    const datasets = [];
-    const failures = [];
-    for (const entry of (this._manifest?.datasets || [])) {
-      try {
-        const datasetBaseUrl = resolveUrl(this._baseUrl, entry.path);
-        const metadata = await loadDatasetMetadata(datasetBaseUrl, entry.id, this.type);
-
-        if (entry.name) {
-          metadata.name = entry.name;
-        }
-        if (entry.description) {
-          metadata.description = entry.description;
-        }
-
-        datasets.push(metadata);
-      } catch (err) {
-        console.warn(`[GitHubDataSource] Failed to load dataset '${entry.id}':`, err);
-        failures.push({
-          id: entry.id,
-          message: err?.message || String(err)
-        });
-      }
-    }
-
-    if (datasets.length === 0) {
-      const hint = failures.length
-        ? ` (first error: ${failures[0].message})`
-        : '';
-      throw new DataSourceError(
-        `No valid datasets found at this GitHub path${hint}`,
-        DataSourceErrorCode.INVALID_FORMAT,
-        this.type,
-        { url: this._baseUrl, failures }
-      );
-    }
-
-    return datasets;
   }
 
   /**
@@ -430,6 +608,7 @@ export class GitHubDataSource {
     this._datasets = null;
     this._activeDatasetId = null;
     this._connected = false;
+    this._connectionRevision++;
   }
 
   /**
@@ -484,7 +663,7 @@ export class GitHubDataSource {
 
   /**
    * Get the base URL for loading a dataset's files
-   * Files are loaded directly from GitHub raw URLs - no github-repo:// protocol needed
+   * Files are loaded directly from the exact GitHub raw URL.
    * @param {string} datasetId
    * @returns {string}
    */
@@ -496,16 +675,29 @@ export class GitHubDataSource {
         this.type
       );
     }
-
-    this._activeDatasetId = datasetId;
-
-    // For multi-dataset, find the dataset's path
-    const entry = this._manifest?.datasets?.find(d => d.id === datasetId);
-    if (entry?.path) {
-      return resolveUrl(this._baseUrl, entry.path);
+    if (!this._manifest) {
+      throw new DataSourceError(
+        'GitHub dataset catalog has not been loaded',
+        DataSourceErrorCode.INVALID_FORMAT,
+        this.type
+      );
+    }
+    validateGitHubCatalog(this._manifest, this._baseUrl);
+    const entry = this._manifest.datasets.find(
+      dataset => dataset.id === datasetId
+    );
+    if (!entry) {
+      throw new DataSourceError(
+        `Dataset '${datasetId}' not found in datasets.json`,
+        DataSourceErrorCode.NOT_FOUND,
+        this.type,
+        { datasetId }
+      );
     }
 
-    return this._baseUrl;
+    const datasetBaseUrl = resolveUrl(this._baseUrl, entry.path);
+    this._activeDatasetId = datasetId;
+    return datasetBaseUrl;
   }
 
   /**
@@ -534,22 +726,51 @@ export class GitHubDataSource {
    * Refresh cached data
    */
   async refresh() {
-    if (!this._connected || !this._inputPath) {
-      return;
+    if (!this._connected || !this._inputPath || !this._baseUrl) {
+      throw new DataSourceError(
+        'Not connected to GitHub repository',
+        DataSourceErrorCode.NETWORK_ERROR,
+        this.type
+      );
     }
 
-    // Re-load manifest + datasets
-    if (!this._baseUrl) return;
-
-    const manifestUrl = resolveUrl(this._baseUrl, DATA_CONFIG.DATASETS_MANIFEST);
-    this._manifest = await fetchJson(manifestUrl);
-    validateSchemaVersion(
-      this._manifest.version,
-      DATA_CONFIG.SUPPORTED_MANIFEST_VERSIONS,
-      'datasets.json'
+    const baseUrl = this._baseUrl;
+    const inputPath = this._inputPath;
+    const connectionRevision = this._connectionRevision;
+    const manifestUrl = resolveUrl(
+      baseUrl,
+      DATA_CONFIG.DATASETS_MANIFEST
+    );
+    const manifest = await fetchJson(manifestUrl, this.type);
+    const datasets = await loadGitHubDatasets(
+      manifest,
+      baseUrl,
+      this.type
     );
 
-    this._datasets = await this._loadDatasets();
+    if (
+      !this._connected ||
+      this._baseUrl !== baseUrl ||
+      this._inputPath !== inputPath ||
+      this._connectionRevision !== connectionRevision
+    ) {
+      throw new DataSourceError(
+        'GitHub repository connection changed during refresh',
+        DataSourceErrorCode.VALIDATION_ERROR,
+        this.type
+      );
+    }
+
+    this._manifest = manifest;
+    this._datasets = datasets;
+    if (
+      this._activeDatasetId !== null &&
+      !manifest.datasets.some(
+        entry => entry.id === this._activeDatasetId
+      )
+    ) {
+      this._activeDatasetId = null;
+    }
   }
 
   /**

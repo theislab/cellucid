@@ -44,7 +44,7 @@
 
 .community-annotation-panel-title {
   font-family: var(--font-display);
-  font-size: var(--text-base);
+  font-size: var(--text-md);
   font-weight: var(--font-weight-semibold);
   letter-spacing: var(--tracking-tight);
   margin-bottom: var(--space-1);
@@ -526,7 +526,7 @@
   height: 8px;
   background: var(--color-surface-tertiary);
   border: var(--border-strong);
-  box-shadow: inset 0 1px 2px color-mix(in srgb, var(--color-shadow-rgb) 8%, transparent);
+  box-shadow: inset 0 1px 2px rgba(var(--shadow-rgb), var(--opacity-8));
 }
 
 .community-annotation-progress-fill {

@@ -17,7 +17,11 @@
 
 import { BasePlot, COMMON_HOVER_STYLE, createMinimalPlotly, getPlotlyConfig } from './plot-base.js';
 import { PlotHelpers, getPageColor, PAGE_COLORS } from '../core/plugin-contract.js';
-import { getScatterTraceType, getHeatmapTraceType, requireWebGL2 } from './plotly-loader.js';
+import {
+  PLOTLY_2D_SCATTER_TRACE_TYPE,
+  getHeatmapTraceType,
+  requireWebGL2
+} from './plotly-loader.js';
 import { mean, std, median } from '../shared/number-utils.js';
 import { applyLegendPosition } from '../shared/legend-utils.js';
 import { getPlotTheme } from '../shared/plot-theme.js';
@@ -84,7 +88,7 @@ export class PlotFactory {
   }
 
   /**
-   * Standard update pipeline with fallback to full render
+   * Standard update pipeline
    *
    * @param {Object} config - Update configuration
    * @param {Object} config.definition - Plot definition
@@ -93,55 +97,42 @@ export class PlotFactory {
    * @param {Object} config.options - Plot options
    * @param {Object} [config.layoutEngine] - Layout engine instance
    * @returns {Promise<Object>} Updated Plotly figure
-   */
+  */
   static async update({ definition, figure, pageData, options, layoutEngine }) {
-    try {
-      const traces = definition.buildTraces(pageData, options, layoutEngine);
-      const layout = definition.buildLayout(pageData, options, layoutEngine);
-      applyLegendPosition(layout, options?.legendPosition);
-      const Plotly = await createMinimalPlotly();
-      const config = getPlotlyConfig();
+    const traces = definition.buildTraces(pageData, options, layoutEngine);
+    const layout = definition.buildLayout(pageData, options, layoutEngine);
+    applyLegendPosition(layout, options?.legendPosition);
+    const Plotly = await createMinimalPlotly();
+    const config = getPlotlyConfig();
 
-      // Plotly.react can silently fail or render blank when switching trace types
-      // (notably between WebGL and non-WebGL heatmaps). Detect type changes and
-      // force a clean re-render to keep plots stable across browsers/devices.
-      const existingTraces = Array.isArray(figure?.data) ? figure.data : null;
-      const nextTraces = Array.isArray(traces) ? traces : null;
+    // Plotly.react can render blank when switching trace types (notably between
+    // WebGL and non-WebGL heatmaps). Select a clean render before execution when
+    // the trace types differ.
+    const existingTraces = Array.isArray(figure?.data) ? figure.data : null;
+    const nextTraces = Array.isArray(traces) ? traces : null;
 
-      let mustFullRender = false;
-      if (existingTraces && nextTraces) {
-        const n = Math.min(existingTraces.length, nextTraces.length);
-        for (let i = 0; i < n; i++) {
-          const prevType = existingTraces[i]?.type;
-          const nextType = nextTraces[i]?.type;
-          if (prevType && nextType && prevType !== nextType) {
-            mustFullRender = true;
-            break;
-          }
+    let mustFullRender = false;
+    if (existingTraces && nextTraces) {
+      const n = Math.min(existingTraces.length, nextTraces.length);
+      for (let i = 0; i < n; i++) {
+        const prevType = existingTraces[i]?.type;
+        const nextType = nextTraces[i]?.type;
+        if (prevType && nextType && prevType !== nextType) {
+          mustFullRender = true;
+          break;
         }
       }
-
-      if (mustFullRender) {
-        try {
-          Plotly.purge?.(figure);
-        } catch (_purgeErr) {
-          // Ignore purge failures
-        }
-        return await Plotly.newPlot(figure, traces, layout, config);
-      }
-
-      return await Plotly.react(figure, traces, layout, config);
-    } catch (err) {
-      console.warn(`[${definition.id}] Update error, falling back to render:`, err);
-      // IMPORTANT: Purge before full re-render to avoid leaking WebGL contexts / DOM.
-      try {
-        const Plotly = await createMinimalPlotly();
-        Plotly.purge?.(figure);
-      } catch (_purgeErr) {
-        // Ignore purge failures
-      }
-      return PlotFactory.render({ definition, pageData, options, container: figure, layoutEngine });
     }
+
+    if (mustFullRender) {
+      if (typeof Plotly.purge !== 'function') {
+        throw new Error('Plotly.purge is required when the trace type changes');
+      }
+      Plotly.purge(figure);
+      return Plotly.newPlot(figure, traces, layout, config);
+    }
+
+    return Plotly.react(figure, traces, layout, config);
   }
 
   // ===========================================================================
@@ -272,11 +263,11 @@ export class PlotFactory {
   }
 
   // ===========================================================================
-  // GPU-ACCELERATED TRACE BUILDERS
+  // CARTESIAN TRACE BUILDERS
   // ===========================================================================
 
   /**
-   * Create a scatter trace (prefers WebGL when available).
+   * Create a cross-browser SVG scatter trace.
    *
    * @param {Object} config - Trace configuration
    * @param {string} config.name - Trace name
@@ -290,9 +281,9 @@ export class PlotFactory {
    * @param {boolean} [config.showlegend=true] - Show in legend
    * @param {any[]} [config.customdata] - Custom data for hover
    * @param {Object} [config.line] - Line configuration for 'lines' mode
-   * @returns {Object} GPU-accelerated Plotly trace object
+   * @returns {Object} Plotly scatter trace object
    */
-  static createGPUScatterTrace({
+  static createScatterTrace({
     name,
     x,
     y,
@@ -307,7 +298,7 @@ export class PlotFactory {
     text
   }) {
     const trace = {
-      type: getScatterTraceType(),
+      type: PLOTLY_2D_SCATTER_TRACE_TYPE,
       mode,
       name,
       x,
@@ -439,7 +430,12 @@ export class PlotFactory {
       showGrid = true
     } = options;
 
-    const variableName = valueAxisLabel || BasePlot.getVariableName(pageData, 'Value');
+    const variableName = valueAxisLabel === undefined
+      ? BasePlot.getVariableName(pageData)
+      : valueAxisLabel;
+    if (typeof variableName !== 'string' || variableName.length === 0) {
+      throw new TypeError('Distribution axis label must be a non-empty string');
+    }
     const theme = getPlotTheme();
     const gridColor = showGrid ? theme.grid : 'transparent';
     const isVertical = orientation === 'vertical';
@@ -488,7 +484,7 @@ export class PlotFactory {
   static configureHistogramAxes(layout, { pageData, options }) {
     const { logX = false, logY = false, histnorm = '' } = options;
 
-    const variableName = BasePlot.getVariableName(pageData, 'Value');
+    const variableName = BasePlot.getVariableName(pageData);
 
     layout.xaxis = {
       title: variableName,
@@ -984,5 +980,5 @@ export default PlotFactory;
 // Re-export commonly used items for convenience
 export { BasePlot, COMMON_HOVER_STYLE, createMinimalPlotly, getPlotlyConfig, PlotHelpers, getPageColor, PAGE_COLORS };
 
-// Re-export GPU trace type utilities for centralized access
-export { getScatterTraceType, getHeatmapTraceType, requireWebGL2 };
+// Re-export current trace contracts for centralized access.
+export { PLOTLY_2D_SCATTER_TRACE_TYPE, getHeatmapTraceType, requireWebGL2 };

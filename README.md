@@ -28,17 +28,21 @@ GPU-powered atlas viewer with real-time filtering, velocity overlays, and collab
 ### Option 1: Browser File Picker (No Setup)
 
 1. Go to [cellucid.com](https://www.cellucid.com)
-2. Click "Browse local data..."
-3. Select a pre-exported folder, `.h5ad` file, or `.zarr` store
+2. Expand **Session** in the sidebar.
+3. Choose **Prepared**, **H5AD**, or **Zarr ZIP**.
+4. Select a prepared export folder, one `.h5ad` file, or one `.zarr.zip` /
+   `.zip` archive containing an AnnData Zarr v2 store.
 
 ### Option 2: Python CLI
 
 ```bash
 pip install cellucid
 
-# Serve any data (format auto-detected)
-cellucid serve /path/to/data.h5ad
-cellucid serve /path/to/data.zarr
+# Direct AnnData input requires an explicit dataset identity
+cellucid serve /path/to/data.h5ad --dataset-name "My dataset" --dataset-id my-dataset
+cellucid serve /path/to/data.zarr --dataset-name "My dataset" --dataset-id my-dataset
+
+# A prepared generation already contains its identity
 cellucid serve ./my_export
 ```
 
@@ -46,16 +50,25 @@ cellucid serve ./my_export
 
 ```python
 from cellucid import show_anndata
-show_anndata(adata)  # In-memory or file path
+
+viewer = show_anndata(
+    adata,
+    dataset_name="My dataset",
+    dataset_id="my-dataset",
+)
 ```
 
 ## Figure Export (SVG/PNG)
 
 Use the **Figure Export** accordion in the sidebar to export the current view:
 
-- **SVG**: best for Illustrator/Inkscape editing; for large datasets you’ll be prompted to choose Full Vector, Optimized Vector (density-preserving), or Hybrid (points raster + vector annotations).
+- **SVG**: choose Full Vector (editable circles), Optimized Vector (density-preserving editable circles at the entered target count), or Hybrid (shader-rendered points + vector annotations). The choice is required, honored exactly, and never changed automatically.
 - **PNG**: best compatibility; choose DPI (150/300/600).
-- **Axes**: only rendered for **2D planar views** (switch navigation to Planar) to avoid misleading axes on 3D projections.
+- **Axes**: use denormalized embedding coordinates in planar views and camera-space bounds in 3D orbit views; missing transforms or visible bounds block export instead of substituting generic `-1…1` axes.
+
+## Compare Views
+
+**Keep view** creates an independent panel with its own coloring and filter stack. Filters always belong to the selected panel: switching that panel from one color field to another preserves its filtered cells, while other panels remain unchanged. Select a panel before editing its filters; Cellucid never synchronizes filters across panels implicitly.
 
 ## Community Annotation (GitHub Sync)
 
@@ -64,56 +77,52 @@ Use the **Figure Export** accordion in the sidebar to export the current view:
 - Annotation repo template: `cellucid-annotation/README.md`.
 - Detailed repo + auth setup: `cellucid/assets/js/app/community-annotations/REPO_SETUP.md`.
 
-## All 14 Loading Options
+## 14 Loading Workflows
 
-Cellucid supports 6 deployment modes, each with support for pre-exported binary data, h5ad files, and zarr stores:
+“Lazy genes” means that the browser requests expression one gene at a time.
+It does not mean that every source format is opened lazily by Python.
 
-| # | Method | Exported | h5ad | zarr | Python | Lazy Load | Performance |
-|---|--------|----------|------|------|--------|-----------|-------------|
-| 1 | Local Demo (GitHub) | ✅ | - | - | No* | Yes | Best |
-| 2 | Remote Demo (GitHub) | ✅ | - | - | No* | Yes | Best |
-| 3 | Browser File Picker | ✅ | - | - | No | Yes | Best |
-| 4 | Browser File Picker | - | ✅ | - | No | **No** | Slower |
-| 5 | Browser File Picker | - | - | ✅ | No | **No** | Slower |
-| 6 | Server CLI | ✅ | - | - | Yes | Yes | Best |
-| 7 | Server CLI | - | ✅ | ✅ | Yes | Yes | Good |
-| 8 | Python serve() | ✅ | - | - | Yes | Yes | Best |
-| 9 | Python serve_anndata() | - | ✅ | ✅ | Yes | Yes | Good |
-| 10 | Jupyter show() | ✅ | - | - | Yes | Yes | Best |
-| 11 | Jupyter show_anndata() | - | ✅ | ✅ | Yes | Yes | Good |
+| # | Where | Trigger | Data | Lazy genes | Source loading |
+|---:|---|---|---|---|---|
+| 1 | Web app | Built-in sample picker | Prepared | Yes | Browser fetches prepared files on demand |
+| 2 | Web app | Public GitHub export (`?github=...`) | Prepared | Yes | Browser fetches prepared files on demand |
+| 3 | Web app | Browser **Prepared** picker | Prepared folder | Yes | Browser reads selected prepared files on demand |
+| 4 | Web app | Browser **H5AD** picker | `.h5ad` | No | Browser holds the selected file in memory |
+| 5 | Web app | Browser **Zarr ZIP picker** | `.zarr.zip` / `.zip` containing one Zarr v2 store | Yes | Browser indexes the archive, then reads gene-expression chunks on demand |
+| 6 | CLI | `cellucid serve <export_dir>` | Prepared | Yes | Server streams prepared files |
+| 7 | CLI | `cellucid serve data.h5ad --dataset-name "My dataset" --dataset-id my-dataset` | `.h5ad` | Yes | AnnData is opened read-only-backed |
+| 8 | CLI | `cellucid serve data.zarr --dataset-name "My dataset" --dataset-id my-dataset` | `.zarr` | Yes | Zarr is materialized eagerly |
+| 9 | Python | `cellucid.serve(<export_dir>)` | Prepared | Yes | Server streams prepared files |
+| 10 | Python | `cellucid.serve_anndata(<data.h5ad>, dataset_name="My dataset", dataset_id="my-dataset")` | `.h5ad` | Yes | AnnData is opened read-only-backed |
+| 11 | Python | `cellucid.serve_anndata(<data.zarr>, dataset_name="My dataset", dataset_id="my-dataset")` | `.zarr` | Yes | Zarr is materialized eagerly |
+| 12 | Jupyter | `cellucid.show(<export_dir>)` | Prepared | Yes | Notebook server streams prepared files |
+| 13 | Jupyter | `cellucid.show_anndata(<data.h5ad>, dataset_name="My dataset", dataset_id="my-dataset")` | `.h5ad` | Yes | AnnData is opened read-only-backed |
+| 14 | Jupyter | `cellucid.show_anndata(<data.zarr or AnnData>, dataset_name="My dataset", dataset_id="my-dataset")` | `.zarr` / in-memory | Yes | Zarr and in-memory AnnData are materialized eagerly |
 
-\* Python required for initial export, not for viewing
+Prepared data is the fastest path for production and sharing. Browser H5AD is
+intended for files within the UI’s documented 512 MiB limit. Browser Zarr
+accepts one ZIP archive; Python accepts a complete Zarr v2 directory and loads
+it eagerly.
 
-**Summary by method:**
-| Method | Exported | h5ad | zarr | Total |
-|--------|----------|------|------|-------|
-| Local/Remote Demo | ✅ | - | - | 2 |
-| Browser File Picker | ✅ | ✅ | ✅ | 3 |
-| Server CLI | ✅ | ✅ | ✅ | 3 |
-| Python serve | ✅ | ✅ | ✅ | 3 |
-| Jupyter | ✅ | ✅ | ✅ | 3 |
-| **Total** | | | | **14** |
+## h5ad / Zarr Requirements
 
-### Key Notes
-
-- **Browser h5ad/zarr (Options 4-5)**: Entire file loaded into browser memory - no lazy loading possible due to JavaScript limitations. Best for datasets < 100k cells.
-- **Python h5ad/zarr modes (Options 7, 9, 11)**: True lazy loading via AnnData backed mode (h5ad) or zarr's native chunked access. Recommended for large datasets.
-- **Pre-exported data**: Always fastest - recommended for production and sharing.
-- **zarr stores**: Can be a directory (.zarr) or a file - the Python server auto-detects the format.
-
-## h5ad / zarr Requirements
-
-- **Required:** `obsm['X_umap']` or `obsm['X_umap_3d']` (shape: n_cells × 2 or 3)
+- **Required:** at least one exact embedding key:
+  `obsm['X_umap_1d']` with shape `(n_cells, 1)`,
+  `obsm['X_umap_2d']` with shape `(n_cells, 2)`, or
+  `obsm['X_umap_3d']` with shape `(n_cells, 3)`.
 - **Optional:** `obs` (cell metadata), `X` (expression matrix), `obsp['connectivities']` (KNN graph)
 
 ## Vector Field Overlay (Velocity / Drift)
 
 Cellucid can render an animated particle-flow overlay from **per-cell displacement vectors** (e.g. scVelo velocity, CellRank drift).
 
-- **AnnData**: store vectors in `adata.obsm` using keys like `velocity_umap_2d`, `velocity_umap_3d`, `T_fwd_umap_2d`, etc. (shape: n_cells × dim).
+- **AnnData**: store vectors in `adata.obsm` under exact dimension-suffixed
+  keys such as `velocity_umap_1d`, `velocity_umap_2d`,
+  `velocity_umap_3d`, or `T_fwd_umap_2d` (shape: `n_cells × dimension`).
 - **Prepared exports**: include binary vector files under `vectors/` and a `vector_fields` block in `dataset_identity.json`.
 
-Naming/import details: [VECTOR_FIELD_OVERLAY_CONVENTIONS.md](markdown/VECTOR_FIELD_OVERLAY_CONVENTIONS.md)
+Naming, dimensions, controls, and troubleshooting:
+[Vector field and velocity documentation](https://cellucid.readthedocs.io/en/latest/user_guide/web_app/i_vector_field_velocity/index.html)
 
 ### Saving as zarr
 
@@ -128,7 +137,18 @@ For best performance, especially with large datasets:
 
 ```python
 from cellucid import prepare
-prepare(adata, output_dir="./my_export", compress=True)
+
+embedding = adata.obsm["X_umap_2d"]
+prepare(
+    latent_space=embedding,
+    obs=adata.obs,
+    out_dir="./my_export",
+    obs_categorical_dtype="uint16",
+    dataset_name="My dataset",
+    dataset_id="my-dataset",
+    X_umap_2d=embedding,
+    compression=6,
+)
 ```
 
 ## Repository Structure
@@ -150,9 +170,7 @@ Sample datasets (prepared exports) live in a separate repo/site:
 
 ```
 cellucid-datasets/
-├── exports/                 # Static exports (datasets.json + dataset folders)
-├── bridge.html              # CORS-free fetch bridge (GitHub Pages)
-└── bridge.js
+└── exports/                 # CORS-enabled datasets.json + dataset folders
 ```
 
 ## CSS Design System
@@ -167,8 +185,9 @@ cellucid-datasets/
 
 ```bash
 python -m http.server 8000
-open http://localhost:8000
 ```
+
+Visit http://localhost:8000 in a supported browser.
 
 ## Python Package
 

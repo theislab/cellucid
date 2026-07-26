@@ -7,7 +7,7 @@
  *
  * ARCHITECTURE:
  * - Generates SVG as a string (no DOM manipulation) for performance
- * - Supports 4 export strategies based on dataset size and editability needs
+ * - Supports three explicit export strategies based on editability needs
  * - Maintains vector annotations (axes, legend, title) even in hybrid mode
  *
  * EXPORT STRATEGIES:
@@ -22,15 +22,11 @@
  *    - Preserves visual appearance while reducing file size
  *    - Best for: Medium datasets (50k-200k points)
  *
- * 3. HYBRID ('hybrid') [RECOMMENDED for 3D]:
+ * 3. HYBRID ('hybrid'):
  *    - Points rasterized as embedded PNG using WebGL shaders
  *    - Annotations remain vector (editable text, crisp at any zoom)
  *    - Best for: Large datasets (>200k) or when 3D shading is important
  *    - Produces WYSIWYG output matching the viewer's 3D appearance
- *
- * 4. RASTER ('raster'):
- *    - Redirects to PNG renderer (no SVG produced)
- *    - Best for: Maximum compatibility, no editability needed
  *
  * LAYOUT SYSTEM (IMPORTANT):
  * The payload.width and payload.height parameters represent the desired PLOT
@@ -44,7 +40,7 @@
  * CROSS-BROWSER NOTES:
  * - SVG generated as string, no DOM dependencies
  * - Embedded images use base64 data URLs for portability
- * - Font stacks use web-safe fallbacks
+ * - The requested font-family string is preserved verbatim
  *
  * @module ui/modules/figure-export/renderers/svg-renderer
  */
@@ -57,22 +53,24 @@ import { forEachProjectedPoint } from '../utils/point-projector.js';
 	import { renderSvgOrientationIndicator } from '../components/orientation-indicator.js';
 	import { renderSvgCentroidOverlay } from '../components/centroid-overlay.js';
 	import { computeVisibleRealBounds } from '../utils/coordinate-mapper.js';
-	import { cropRect01ToPx, normalizeCropRect01 } from '../utils/crop.js';
+	import { assertCropRect01, cropRect01ToPx } from '../utils/crop.js';
 	import { reducePointsByDensity } from '../utils/density-reducer.js';
 	import { blobToDataUrl } from '../utils/export-helpers.js';
 	import { hashStringToSeed } from '../utils/hash.js';
 import { rasterizePointsWebgl } from '../utils/webgl-point-rasterizer.js';
 import { getEffectivePointDiameterPx, getLodVisibilityMask } from '../utils/point-size.js';
 import { hexToRgb01, rgb01ToHex } from '../utils/color-utils.js';
-	import { clamp, parseNumberOr } from '../../../../utils/number-utils.js';
 	import { computeLetterboxedRect } from '../utils/letterbox.js';
+import { assertCameraState } from '../../../../../rendering/camera-state-contract.js';
+import { assertFigureExportPayload } from '../figure-export-contract.js';
 
 function applyExportBackgroundToRenderState(renderState, background, backgroundColor) {
-  if (!renderState) return renderState;
   if (background === 'viewer' || background === 'transparent') return renderState;
 
   const rgb = hexToRgb01(backgroundColor);
-  if (!rgb) return renderState;
+  if (rgb === null) {
+    throw new TypeError('SVG export backgroundColor must be an exact #RRGGBB color.');
+  }
 
   return {
     ...renderState,
@@ -108,7 +106,7 @@ function highlightValueToAlpha01(value) {
 	  const v = viewMatrix;
 	  const vw = Math.max(1, Number(viewportWidth) || 1);
 	  const vh = Math.max(1, Number(viewportHeight) || 1);
-	  const crop01 = normalizeCropRect01(crop);
+	  const crop01 = assertCropRect01(crop);
 	  const cropPx = cropRect01ToPx(crop01, vw, vh);
 	  const hasCrop = Boolean(
 	    cropPx &&
@@ -215,13 +213,13 @@ function highlightValueToAlpha01(value) {
 	        width: Number.isFinite(payload?.width) ? payload.width : null,
 	        height: Number.isFinite(payload?.height) ? payload.height : null,
 	        dpi: Number.isFinite(payload?.dpi) ? payload.dpi : null,
-	        strategy: payload?.options?.strategy || null,
-	        includeAxes: payload?.options?.includeAxes ?? null,
-	        includeLegend: payload?.options?.includeLegend ?? null,
-	        legendPosition: payload?.options?.legendPosition ?? null,
-	        background: payload?.options?.background ?? null,
-	        backgroundColor: payload?.options?.backgroundColor ?? null,
-	        crop: payload?.options?.crop ?? null,
+	        strategy: payload.options.strategy,
+	        includeAxes: payload.options.includeAxes,
+	        includeLegend: payload.options.includeLegend,
+	        legendPosition: payload.options.legendPosition,
+	        background: payload.options.background,
+	        backgroundColor: payload.options.backgroundColor,
+	        crop: payload.options.crop,
 	      }
 	    },
 	    null,
@@ -251,11 +249,10 @@ function highlightValueToAlpha01(value) {
 /**
  * Rasterize points to a data URL for embedding in SVG (hybrid mode).
  *
- * First attempts WebGL2 rasterizer for 3D-shaded spheres matching the viewer.
- * Falls back to Canvas2D flat circles if WebGL2 unavailable or matrices missing.
+ * Uses the exact WebGL2 point pass for 3D-shaded spheres matching the viewer.
  *
  * @param {object} options
- * @returns {Promise<string|null>} Base64 data URL of PNG, or null if data missing
+ * @returns {Promise<string>} Base64 data URL of the point pass
  */
 async function rasterizePointsToDataUrl({
   positions,
@@ -265,36 +262,64 @@ async function rasterizePointsToDataUrl({
   renderState,
   plotRect,
   radiusPx,
-  seed = 0,
   highlightArray = null,
   emphasizeSelection = false,
   selectionMutedOpacity = 0.15,
-  sortByDepth = false,
-  maxSortedPoints = 200000,
   crop = null,
   overlayPositions = null,
   overlayColors = null,
   overlayPointDiameterViewportPx = null
 }) {
-  // Early validation - cannot rasterize without basic data
-  if (!positions || !colors || !renderState?.mvpMatrix) {
-    console.warn('[FigureExport] SVG hybrid rasterization skipped - missing data:', {
-      hasPositions: !!positions,
-      hasColors: !!colors,
-      hasMvpMatrix: !!renderState?.mvpMatrix
-    });
-    return null;
+  if (!positions || !colors) {
+    throw new TypeError('SVG Hybrid export requires positions and colors');
+  }
+  if (!renderState?.mvpMatrix) {
+    throw new TypeError('SVG Hybrid export requires a complete renderState');
+  }
+  if (
+    !Number.isFinite(plotRect?.width) ||
+    plotRect.width <= 0 ||
+    !Number.isFinite(plotRect?.height) ||
+    plotRect.height <= 0
+  ) {
+    throw new TypeError('SVG Hybrid export requires a positive plot rectangle');
+  }
+  if (!Number.isFinite(radiusPx) || radiusPx <= 0) {
+    throw new TypeError('SVG Hybrid export requires a positive point radius');
   }
 
   const rasterScale = 2;
-  const pxW = Math.max(1, Math.round(plotRect.width * rasterScale));
-  const pxH = Math.max(1, Math.round(plotRect.height * rasterScale));
-  const crop01 = normalizeCropRect01(crop);
+  const pxW = Math.round(plotRect.width * rasterScale);
+  const pxH = Math.round(plotRect.height * rasterScale);
+  const crop01 = assertCropRect01(crop);
 
-  const srcViewportW = Math.max(1, Math.round(renderState?.viewportWidth || 1));
-  const srcViewportH = Math.max(1, Math.round(renderState?.viewportHeight || 1));
+  const srcViewportW = renderState.viewportWidth;
+  const srcViewportH = renderState.viewportHeight;
+  if (
+    !Number.isFinite(srcViewportW) ||
+    srcViewportW <= 0 ||
+    !Number.isFinite(srcViewportH) ||
+    srcViewportH <= 0
+  ) {
+    throw new TypeError('SVG Hybrid export requires positive render-state viewport dimensions');
+  }
   const viewportScale = computeLetterboxedRect({ srcWidth: srcViewportW, srcHeight: srcViewportH, dstWidth: pxW, dstHeight: pxH }).scale;
-  const pointDiameterViewportPx = Math.max(1, Number(radiusPx || 1.5) * 2);
+  const pointDiameterViewportPx = radiusPx * 2;
+
+  const hasAnyOverlayInput =
+    overlayPositions != null ||
+    overlayColors != null ||
+    overlayPointDiameterViewportPx != null;
+  if (
+    hasAnyOverlayInput &&
+    (!overlayPositions || !overlayColors ||
+      !Number.isFinite(overlayPointDiameterViewportPx) ||
+      overlayPointDiameterViewportPx <= 0)
+  ) {
+    throw new TypeError(
+      'SVG Hybrid centroid overlay requires positions, colors, and a positive point diameter together'
+    );
+  }
 
   const webglCanvas = rasterizePointsWebgl({
     positions,
@@ -304,12 +329,12 @@ async function rasterizePointsToDataUrl({
     renderState,
     outputWidthPx: pxW,
     outputHeightPx: pxH,
-    pointSizePx: Math.max(1, pointDiameterViewportPx * viewportScale),
-    overlayPoints: (overlayPositions && overlayColors && Number.isFinite(overlayPointDiameterViewportPx))
+    pointSizePx: pointDiameterViewportPx * viewportScale,
+    overlayPoints: hasAnyOverlayInput
       ? {
         positions: overlayPositions,
         colors: overlayColors,
-        pointSizePx: Math.max(1, Number(overlayPointDiameterViewportPx) * viewportScale)
+        pointSizePx: overlayPointDiameterViewportPx * viewportScale
       }
       : null,
     highlightArray,
@@ -317,127 +342,46 @@ async function rasterizePointsToDataUrl({
     selectionMutedOpacity
   });
 
-  if (webglCanvas) {
-    if (!crop01) {
-      const blob = typeof webglCanvas.convertToBlob === 'function'
-        ? await webglCanvas.convertToBlob({ type: 'image/png' })
-        : await new Promise((resolve, reject) => {
-          /** @type {HTMLCanvasElement} */ (webglCanvas).toBlob(
-            (b) => (b ? resolve(b) : reject(new Error('PNG encode failed'))),
-            'image/png'
-          );
-        });
-      return blobToDataUrl(blob);
-    }
-
-    /** @type {OffscreenCanvas|HTMLCanvasElement} */
-    const out = typeof OffscreenCanvas !== 'undefined'
-      ? new OffscreenCanvas(pxW, pxH)
-      : (() => {
-        const c = document.createElement('canvas');
-        c.width = pxW;
-        c.height = pxH;
-        return c;
-      })();
-    const outCtx = /** @type {CanvasRenderingContext2D|null} */ (out.getContext('2d', { alpha: true }));
-    if (!outCtx) return null;
-
-    const vp = computeLetterboxedRect({ srcWidth: srcViewportW, srcHeight: srcViewportH, dstWidth: pxW, dstHeight: pxH });
-    const sx = vp.x + crop01.x * vp.width;
-    const sy = vp.y + crop01.y * vp.height;
-    const sw = crop01.width * vp.width;
-    const sh = crop01.height * vp.height;
-    outCtx.drawImage(webglCanvas, sx, sy, sw, sh, 0, 0, pxW, pxH);
-
-    const blob = typeof out.convertToBlob === 'function'
-      ? await out.convertToBlob({ type: 'image/png' })
-      : await new Promise((resolve, reject) => {
-        /** @type {HTMLCanvasElement} */ (out).toBlob(
-          (b) => (b ? resolve(b) : reject(new Error('PNG encode failed'))),
-          'image/png'
-        );
-      });
+  if (!crop01) {
+    const blob = await new Promise((resolve, reject) => {
+      webglCanvas.toBlob(
+        (encoded) => (
+          encoded
+            ? resolve(encoded)
+            : reject(new Error('SVG Hybrid point-pass PNG encoding failed'))
+        ),
+        'image/png'
+      );
+    });
     return blobToDataUrl(blob);
   }
 
-  // WebGL rasterizer returned null - fall back to Canvas2D flat circles
-  // This happens when viewMatrix/projectionMatrix/modelMatrix are missing
-  // (Canvas2D fallback produces flat circles instead of 3D spheres.)
-
-  /** @type {OffscreenCanvas|HTMLCanvasElement} */
-  const canvas = typeof OffscreenCanvas !== 'undefined'
-    ? new OffscreenCanvas(pxW, pxH)
-    : (() => {
-      const c = document.createElement('canvas');
-      c.width = pxW;
-      c.height = pxH;
-      return c;
-    })();
-
-  const ctx = /** @type {CanvasRenderingContext2D|null} */ (canvas.getContext('2d', { alpha: true }));
-  if (!ctx) return null;
-
-  ctx.save();
-  ctx.scale(rasterScale, rasterScale);
-
-  // Simple deterministic jitter to reduce overplotting artifacts.
-  const jitter = (seed % 7) * 0.03;
-  const mutedAlpha = clamp(parseNumberOr(selectionMutedOpacity, 0.15), 0, 1);
-
-  const localPlot = { x: 0, y: 0, width: plotRect.width, height: plotRect.height };
-  const cropPx = cropRect01ToPx(crop01, srcViewportW, srcViewportH);
-  const cropW = cropPx ? cropPx.width : srcViewportW;
-  const cropH = cropPx ? cropPx.height : srcViewportH;
-  const radiusPlot = (Number(radiusPx || 1.5)) * computeLetterboxedRect({ srcWidth: cropW, srcHeight: cropH, dstWidth: plotRect.width, dstHeight: plotRect.height }).scale;
-
-  forEachProjectedPoint({
-    positions,
-    colors,
-    transparency,
-    visibilityMask,
-    renderState,
-    plotRect: localPlot,
-    radiusPx: radiusPlot,
-    crop,
-    sortByDepth,
-    maxSortedPoints,
-    onPoint: (x, y, r, g, b, a, radius, index) => {
-      let rr = r;
-      let gg = g;
-      let bb = b;
-      let aa = a;
-
-      if (emphasizeSelection && highlightArray && (highlightArray[index] ?? 0) <= 0) {
-        rr = 160;
-        gg = 160;
-        bb = 160;
-        aa = aa * mutedAlpha;
-      }
-
-      if (aa < 0.01) return;
-
-      const px = x + jitter;
-      const py = y + jitter;
-      ctx.fillStyle = `rgba(${rr},${gg},${bb},${aa})`;
-      if (radius <= 1) {
-        const s = radius * 2;
-        ctx.fillRect(px - radius, py - radius, s, s);
-      } else {
-        ctx.beginPath();
-        ctx.arc(px, py, radius, 0, Math.PI * 2);
-        ctx.fill();
-      }
-    }
+  if (typeof document === 'undefined') {
+    throw new Error('SVG Hybrid crop encoding requires an HTML document');
+  }
+  const canvas = document.createElement('canvas');
+  canvas.width = pxW;
+  canvas.height = pxH;
+  const ctx = canvas.getContext('2d', { alpha: true });
+  if (!ctx) {
+    throw new Error('SVG Hybrid crop encoding requires a Canvas 2D context');
+  }
+  const vp = computeLetterboxedRect({ srcWidth: srcViewportW, srcHeight: srcViewportH, dstWidth: pxW, dstHeight: pxH });
+  const sx = vp.x + crop01.x * vp.width;
+  const sy = vp.y + crop01.y * vp.height;
+  const sw = crop01.width * vp.width;
+  const sh = crop01.height * vp.height;
+  ctx.drawImage(webglCanvas, sx, sy, sw, sh, 0, 0, pxW, pxH);
+  const blob = await new Promise((resolve, reject) => {
+    canvas.toBlob(
+      (encoded) => (
+        encoded
+          ? resolve(encoded)
+          : reject(new Error('SVG Hybrid cropped point-pass PNG encoding failed'))
+      ),
+      'image/png'
+    );
   });
-
-  ctx.restore();
-
-  const blob = typeof canvas.convertToBlob === 'function'
-    ? await canvas.convertToBlob({ type: 'image/png' })
-    : await new Promise((resolve, reject) => {
-      /** @type {HTMLCanvasElement} */ (canvas).toBlob((b) => (b ? resolve(b) : reject(new Error('PNG encode failed'))), 'image/png');
-    });
-
   return blobToDataUrl(blob);
 }
 
@@ -452,56 +396,76 @@ async function rasterizePointsToDataUrl({
  * @param {import('../../../state/core/data-state.js').DataState} options.state
  * @param {object} options.viewer
  * @param {any} options.payload
- * @returns {Promise<{ blob: Blob; suggestedExt: string }>}
+ * @returns {Promise<Blob>}
  */
 export async function renderFigureToSvgBlob({ state, viewer, payload }) {
-  // User-specified dimensions represent desired PLOT content size
-  const desiredPlotWidth = Math.max(1, Math.round(payload?.width || 1200));
-  const desiredPlotHeight = Math.max(1, Math.round(payload?.height || 900));
-  const title = String(payload?.title || '').trim();
-  const opts = payload?.options || {};
-  const meta = payload?.meta || {};
-  const views = Array.isArray(payload?.views) ? payload.views : [];
+  assertFigureExportPayload(payload);
+  if (payload.format !== 'svg') {
+    throw new TypeError('SVG renderer requires payload.format exactly "svg".');
+  }
+  if (!Number.isInteger(payload?.width) || payload.width <= 0) {
+    throw new TypeError('SVG export width must be a positive integer');
+  }
+  if (!Number.isInteger(payload?.height) || payload.height <= 0) {
+    throw new TypeError('SVG export height must be a positive integer');
+  }
+  const desiredPlotWidth = payload.width;
+  const desiredPlotHeight = payload.height;
+  const title = payload.title.trim();
+  const opts = payload.options;
+  const meta = payload.meta;
+  const views = payload.views;
 
-  const includeAxes = opts.includeAxes !== false;
-  const includeLegend = opts.includeLegend !== false;
-  const legendPosition = opts.legendPosition === 'bottom' ? 'bottom' : 'right';
-  const strategy = opts.strategy || 'full-vector';
-  const showOrientation = opts.showOrientation !== false;
-  const depthSort3d = opts.depthSort3d !== false;
-  const crop = opts.crop || null;
+  const includeAxes = opts.includeAxes;
+  const includeLegend = opts.includeLegend;
+  const legendPosition = opts.legendPosition;
+  const strategy = opts.strategy;
+  const showOrientation = opts.showOrientation;
+  const depthSort3d = opts.depthSort3d;
+  const crop = opts.crop;
 
-  const fontFamily = String(opts.fontFamily || 'Arial, Helvetica, sans-serif');
-  const baseFontSize = Math.max(6, Math.round(parseNumberOr(opts.fontSizePx, 12)));
-  const legendFontSize = Math.max(6, Math.round(parseNumberOr(opts.legendFontSizePx, baseFontSize)));
-  const tickFontSize = Math.max(6, Math.round(parseNumberOr(opts.tickFontSizePx, baseFontSize)));
-  const axisLabelFontSize = Math.max(6, Math.round(parseNumberOr(opts.axisLabelFontSizePx, baseFontSize)));
-  const titleFontSize = Math.max(10, Math.round(parseNumberOr(opts.titleFontSizePx, Math.max(14, baseFontSize * 1.25))));
-  const centroidLabelFontSize = Math.max(6, Math.round(parseNumberOr(opts.centroidLabelFontSizePx, baseFontSize)));
+  const fontFamily = opts.fontFamily;
+  const baseFontSize = opts.fontSizePx;
+  const legendFontSize = opts.legendFontSizePx;
+  const tickFontSize = opts.tickFontSizePx;
+  const axisLabelFontSize = opts.axisLabelFontSizePx;
+  const titleFontSize = opts.titleFontSizePx;
+  const centroidLabelFontSize = opts.centroidLabelFontSizePx;
   // Point size comes from the interactive viewer (WYSIWYG).
-  const selectionMutedOpacity = clamp(parseNumberOr(opts.selectionMutedOpacity, 0.15), 0, 1);
-  const totalHighlighted = typeof state?.getTotalHighlightedCellCount === 'function'
-    ? state.getTotalHighlightedCellCount()
-    : 0;
-  const emphasizeSelection = opts.emphasizeSelection === true && totalHighlighted > 0;
-  const highlightCount = emphasizeSelection && typeof state?.getHighlightedCellCount === 'function'
+  const selectionMutedOpacity = opts.selectionMutedOpacity;
+  if (
+    typeof state.getTotalHighlightedCellCount !== 'function' ||
+    typeof state.getHighlightedCellCount !== 'function' ||
+    typeof state.getFieldForView !== 'function' ||
+    typeof state.getLegendModel !== 'function' ||
+    typeof state.getViewDimensionLevel !== 'function' ||
+    typeof state.dimensionManager?.getNormTransform !== 'function'
+  ) {
+    throw new TypeError('SVG export state is missing its exact current export methods.');
+  }
+  const totalHighlighted = state.getTotalHighlightedCellCount();
+  const emphasizeSelection = opts.emphasizeSelection && totalHighlighted > 0;
+  const highlightCount = emphasizeSelection
     ? state.getHighlightedCellCount()
     : totalHighlighted;
-  const highlightArray = totalHighlighted > 0 ? (state?.highlightArray || null) : null;
+  const highlightArray = totalHighlighted > 0 ? state.highlightArray : null;
 
-  const viewerBgHex = rgb01ToHex(views[0]?.renderState?.bgColor) || '#ffffff';
-  const background = opts.background || 'white';
+  const viewerBgHex = rgb01ToHex(views[0].renderState.bgColor);
+  if (viewerBgHex === null) {
+    throw new Error('SVG export render state has no exact viewer background color.');
+  }
+  const background = opts.background;
   const backgroundColor = background === 'custom'
-    ? String(opts.backgroundColor || '#ffffff')
+    ? opts.backgroundColor
     : (background === 'viewer' ? viewerBgHex : '#ffffff');
 
   const singleView = views.length === 1;
-  const singleViewId = singleView ? String(views[0]?.id || 'live') : null;
+  const singleViewId = singleView ? views[0].id : null;
 
-  const singleLegendField = singleView && includeLegend && typeof state.getFieldForView === 'function'
+  const singleLegendField = singleView && includeLegend
     ? state.getFieldForView(singleViewId)
-    : (singleView && includeLegend && typeof state.getActiveField === 'function' ? state.getActiveField() : null);
-  const singleLegendModel = singleView && singleLegendField && typeof state.getLegendModel === 'function'
+    : null;
+  const singleLegendModel = singleView && singleLegendField
     ? state.getLegendModel(singleLegendField)
     : null;
 
@@ -511,16 +475,17 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
   let singleLayout = null;
   let singleAxesEligible = false;
   let singleDim = 3;
-  let singleNavMode = 'orbit';
+  let singleNavMode = null;
   let singleCameraState = null;
 
   if (singleView) {
     const view = views[0];
-    singleCameraState = view?.cameraState || viewer?.getViewCameraState?.(singleViewId) || viewer?.getCameraState?.() || null;
-    singleNavMode = singleCameraState?.navigationMode || 'orbit';
-    singleDim = typeof state?.getViewDimensionLevel === 'function'
-      ? state.getViewDimensionLevel(singleViewId)
-      : (state?.getDimensionLevel?.() ?? 3);
+    singleCameraState = assertCameraState(
+      view.cameraState,
+      `SVG camera state for "${singleViewId}"`
+    );
+    singleNavMode = singleCameraState.navigationMode;
+    singleDim = state.getViewDimensionLevel(singleViewId);
     singleAxesEligible = includeAxes;
 
     singleLayout = computeSingleViewLayout({
@@ -545,7 +510,7 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
 
   const parts = [];
   parts.push(
-    `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="${svgWidth}" height="${svgHeight}" viewBox="0 0 ${svgWidth} ${svgHeight}">`
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${svgWidth}" height="${svgHeight}" viewBox="0 0 ${svgWidth} ${svgHeight}">`
   );
   parts.push(buildSvgMetadata(meta, payload));
 
@@ -565,7 +530,7 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
     if (!renderState?.mvpMatrix) throw new Error('Figure export renderState missing for SVG render');
 
     const dim = singleDim;
-    const cameraState = singleCameraState || view?.cameraState || null;
+    const cameraState = singleCameraState;
     const navMode = singleNavMode;
     const axesEligible = singleAxesEligible;
     const shouldDepthSort = depthSort3d && dim > 2 && navMode !== 'planar';
@@ -659,7 +624,7 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
       ? opts.includeCentroidLabels
       : Boolean(centroidFlags?.labels);
 
-    const crop01 = normalizeCropRect01(crop);
+    const crop01 = assertCropRect01(crop);
     const srcViewportW = Math.max(1, renderState?.viewportWidth || 1);
     const srcViewportH = Math.max(1, renderState?.viewportHeight || 1);
     const cropPx = cropRect01ToPx(crop01, srcViewportW, srcViewportH);
@@ -674,7 +639,6 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
     let centroidPointsRasterized = false;
 
     if (strategy === 'hybrid') {
-      const seed = hashStringToSeed(meta?.datasetId || meta?.datasetName || viewId);
       const renderStateForPoints = applyExportBackgroundToRenderState(renderState, background, backgroundColor);
       const dataUrl = await rasterizePointsToDataUrl({
         positions,
@@ -684,68 +648,19 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
         renderState: renderStateForPoints,
         plotRect,
         radiusPx: pointRadiusViewportPx,
-        seed,
         highlightArray,
         emphasizeSelection,
         selectionMutedOpacity,
-        sortByDepth: shouldDepthSort,
         crop,
         overlayPositions: includeCentroidPoints ? centroidPositions : null,
         overlayColors: includeCentroidPoints ? centroidColors : null,
         overlayPointDiameterViewportPx: includeCentroidPoints ? centroidDiameterViewportPx : null,
       });
-      if (dataUrl) {
-        centroidPointsRasterized = includeCentroidPoints && Boolean(centroidPositions) && Boolean(centroidColors);
-        // Add both href and xlink:href for better compatibility across SVG consumers.
-        parts.push(
-          `<image x="${plotRect.x}" y="${plotRect.y}" width="${plotRect.width}" height="${plotRect.height}" href="${dataUrl}" xlink:href="${dataUrl}" preserveAspectRatio="none"/>`
-        );
-      } else {
-        // Fallback: rasterization unavailable (e.g., WebGL2 blocked) -> draw vector circles.
-        const radiusPlot = pointRadiusViewportPx * plotScale;
-        forEachProjectedPoint({
-          positions,
-          colors,
-          transparency,
-          visibilityMask,
-          renderState,
-          plotRect,
-          radiusPx: radiusPlot,
-          crop,
-          sortByDepth: shouldDepthSort,
-          onPoint: (x, y, r, g, b, a, radius, index) => {
-            let rr = r;
-            let gg = g;
-            let bb = b;
-            let aa = a;
-            if (emphasizeSelection && highlightArray && (highlightArray[index] ?? 0) <= 0) {
-              rr = 160;
-              gg = 160;
-              bb = 160;
-              aa = aa * selectionMutedOpacity;
-            }
-            if (aa < 0.01) return;
-            if (aa >= 0.999) {
-              parts.push(`<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${radius.toFixed(2)}" fill="rgb(${rr},${gg},${bb})"/>`);
-            } else {
-              parts.push(`<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${radius.toFixed(2)}" fill="rgb(${rr},${gg},${bb})" fill-opacity="${aa.toFixed(3)}"/>`);
-            }
-
-            const h = highlightArray ? highlightValueToAlpha01(highlightArray[index] ?? 0) : 0;
-            if (h > 0) {
-              const ringR = radius * DEFAULT_HIGHLIGHT_SCALE;
-              const sw = Math.max(0.75, radius * 0.45);
-              const op = Math.max(0.25, 0.85 * h);
-              parts.push(
-                `<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${ringR.toFixed(2)}" ` +
-                `fill="none" stroke="rgb(${DEFAULT_HIGHLIGHT_RGB.r},${DEFAULT_HIGHLIGHT_RGB.g},${DEFAULT_HIGHLIGHT_RGB.b})" ` +
-                `stroke-width="${sw.toFixed(2)}" stroke-opacity="${op.toFixed(3)}"/>`
-              );
-            }
-          }
-        });
-      }
-    } else if (strategy === 'optimized-vector' && renderState) {
+      centroidPointsRasterized = includeCentroidPoints && Boolean(centroidPositions) && Boolean(centroidColors);
+      parts.push(
+        `<image x="${plotRect.x}" y="${plotRect.y}" width="${plotRect.width}" height="${plotRect.height}" href="${dataUrl}" preserveAspectRatio="none"/>`
+      );
+    } else if (strategy === 'optimized-vector') {
       const seed = hashStringToSeed(meta?.datasetId || meta?.datasetName || viewId);
       const reduced = reducePointsByDensity({
         positions,
@@ -753,7 +668,7 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
         transparency,
         visibilityMask,
         renderState,
-        targetCount: Math.max(1000, Math.floor(opts.optimizedTargetCount || 100000)),
+        targetCount: opts.optimizedTargetCount,
         seed,
         crop
       });
@@ -800,7 +715,7 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
           );
         }
       }
-    } else {
+    } else if (strategy === 'full-vector') {
       const radiusPlot = pointRadiusViewportPx * plotScale;
       forEachProjectedPoint({
         positions,
@@ -868,9 +783,6 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
 
     // Axes (2D uses embedding coordinates; 3D uses camera-space coordinates).
     if (axesEligible && renderState) {
-      const norm = typeof state?.dimensionManager?.getNormTransform === 'function'
-        ? state.dimensionManager.getNormTransform(dim)
-        : null;
       const useCameraAxes = dim > 2 && navMode !== 'planar' && renderState?.viewMatrix;
       const bounds = (
         useCameraAxes
@@ -892,23 +804,22 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
             viewportWidth: renderState.viewportWidth,
             viewportHeight: renderState.viewportHeight,
             crop,
-            normTransform: norm
+            normTransform: state.dimensionManager.getNormTransform(dim)
           })
-      ) || { minX: -1, maxX: 1, minY: -1, maxY: 1 };
-      if (bounds) {
-        const axisXLabel = opts?.xLabel == null ? 'X' : String(opts.xLabel);
-        const axisYLabel = opts?.yLabel == null ? 'Y' : String(opts.yLabel);
-        parts.push(renderSvgAxes({
-          plotRect,
-          bounds,
-          xLabel: axisXLabel,
-          yLabel: axisYLabel,
-          fontFamily,
-          tickFontSize,
-          labelFontSize: axisLabelFontSize,
-          color: '#111'
-        }));
+      );
+      if (bounds === null) {
+        throw new Error('SVG axes require at least one visible point.');
       }
+      parts.push(renderSvgAxes({
+        plotRect,
+        bounds,
+        xLabel: opts.xLabel,
+        yLabel: opts.yLabel,
+        fontFamily,
+        tickFontSize,
+        labelFontSize: axisLabelFontSize,
+        color: '#111'
+      }));
     }
   } else {
     const outerPadding = 20;
@@ -997,50 +908,21 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
       const renderState = view?.renderState || null;
       if (!renderState?.mvpMatrix) throw new Error('Figure export renderState missing for SVG multiview render');
 
-      const dim = typeof state.getViewDimensionLevel === 'function'
-        ? state.getViewDimensionLevel(viewId)
-        : (state.getDimensionLevel?.() ?? 3);
-      const navMode = view?.cameraState?.navigationMode || 'orbit';
+      const dim = state.getViewDimensionLevel(viewId);
+      const navMode = assertCameraState(
+        view.cameraState,
+        `SVG camera state for "${viewId}"`
+      ).navigationMode;
       const visibilityMask = getLodVisibilityMask({ viewer, viewId, dimensionLevel: dim });
       const pointRadiusViewportPx = getEffectivePointDiameterPx({ viewer, renderState, viewId, dimensionLevel: dim }) / 2;
 
-      const crop01 = normalizeCropRect01(crop);
+      const crop01 = assertCropRect01(crop);
       const srcViewportW = Math.max(1, renderState?.viewportWidth || 1);
       const srcViewportH = Math.max(1, renderState?.viewportHeight || 1);
       const cropPx = cropRect01ToPx(crop01, srcViewportW, srcViewportH);
       const cropW = cropPx ? cropPx.width : srcViewportW;
       const cropH = cropPx ? cropPx.height : srcViewportH;
       const radiusPlot = pointRadiusViewportPx * computeLetterboxedRect({ srcWidth: cropW, srcHeight: cropH, dstWidth: plotRect.width, dstHeight: plotRect.height }).scale;
-
-      forEachProjectedPoint({
-        positions,
-        colors,
-        transparency,
-        renderState,
-        plotRect,
-        radiusPx: radiusPlot,
-        visibilityMask,
-        crop,
-        sortByDepth: depthSort3d && dim > 2 && navMode !== 'planar',
-        onPoint: (x, y, r, g, b, a, radius, index) => {
-          let rr = r;
-          let gg = g;
-          let bb = b;
-          let aa = a;
-          if (emphasizeSelection && highlightArray && (highlightArray[index] ?? 0) <= 0) {
-            rr = 160;
-            gg = 160;
-            bb = 160;
-            aa = aa * selectionMutedOpacity;
-          }
-          if (aa < 0.01) return;
-          if (aa >= 0.999) {
-            parts.push(`<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${radius.toFixed(2)}" fill="rgb(${rr},${gg},${bb})"/>`);
-          } else {
-            parts.push(`<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${radius.toFixed(2)}" fill="rgb(${rr},${gg},${bb})" fill-opacity="${aa.toFixed(3)}"/>`);
-          }
-        }
-      });
 
       const centroidPositions = data?.centroidPositions || null;
       const centroidColors = data?.centroidColors || null;
@@ -1054,12 +936,143 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
         : Boolean(centroidFlags?.labels);
       const centroidDiameterViewportPx = Math.max(1, (Number(renderState?.pointSize || 5) * 4.0));
       const centroidRadiusPlotPx = Math.max(0.5, (centroidDiameterViewportPx / 2) * computeLetterboxedRect({ srcWidth: cropW, srcHeight: cropH, dstWidth: plotRect.width, dstHeight: plotRect.height }).scale);
+      let centroidPointsRasterized = false;
+
+      if (strategy === 'hybrid') {
+        const renderStateForPoints = applyExportBackgroundToRenderState(
+          renderState,
+          background,
+          backgroundColor
+        );
+        const dataUrl = await rasterizePointsToDataUrl({
+          positions,
+          colors,
+          transparency,
+          visibilityMask,
+          renderState: renderStateForPoints,
+          plotRect,
+          radiusPx: pointRadiusViewportPx,
+          highlightArray,
+          emphasizeSelection,
+          selectionMutedOpacity,
+          crop,
+          overlayPositions: includeCentroidPoints ? centroidPositions : null,
+          overlayColors: includeCentroidPoints ? centroidColors : null,
+          overlayPointDiameterViewportPx: includeCentroidPoints ? centroidDiameterViewportPx : null,
+        });
+        centroidPointsRasterized =
+          includeCentroidPoints &&
+          Boolean(centroidPositions) &&
+          Boolean(centroidColors);
+        parts.push(
+          `<image x="${plotRect.x}" y="${plotRect.y}" width="${plotRect.width}" height="${plotRect.height}" href="${dataUrl}" preserveAspectRatio="none"/>`
+        );
+      } else if (strategy === 'optimized-vector') {
+        const seed = hashStringToSeed(meta?.datasetId || meta?.datasetName || viewId);
+        const reduced = reducePointsByDensity({
+          positions,
+          colors,
+          transparency,
+          visibilityMask,
+          renderState,
+          targetCount: opts.optimizedTargetCount,
+          seed,
+          crop
+        });
+        const scale = Math.min(
+          plotRect.width / reduced.viewportWidth,
+          plotRect.height / reduced.viewportHeight
+        );
+        const offsetX = plotRect.x + (plotRect.width - reduced.viewportWidth * scale) / 2;
+        const offsetY = plotRect.y + (plotRect.height - reduced.viewportHeight * scale) / 2;
+        const pointRadiusPx = pointRadiusViewportPx * scale;
+
+        for (let i = 0; i < reduced.x.length; i++) {
+          let a = reduced.alpha[i] ?? 1.0;
+          const srcIndex = reduced.index?.[i] ?? i;
+          const x = offsetX + reduced.x[i] * scale;
+          const y = offsetY + reduced.y[i] * scale;
+          const j = i * 4;
+          let r = reduced.rgba[j];
+          let g = reduced.rgba[j + 1];
+          let b = reduced.rgba[j + 2];
+          if (emphasizeSelection && highlightArray && (highlightArray[srcIndex] ?? 0) <= 0) {
+            r = 160;
+            g = 160;
+            b = 160;
+            a *= selectionMutedOpacity;
+          }
+          if (a < 0.01) continue;
+          if (a >= 0.999) {
+            parts.push(`<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${pointRadiusPx.toFixed(2)}" fill="rgb(${r},${g},${b})"/>`);
+          } else {
+            parts.push(`<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${pointRadiusPx.toFixed(2)}" fill="rgb(${r},${g},${b})" fill-opacity="${a.toFixed(3)}"/>`);
+          }
+
+          const h = highlightArray ? highlightValueToAlpha01(highlightArray[srcIndex] ?? 0) : 0;
+          if (h > 0) {
+            const ringR = pointRadiusPx * DEFAULT_HIGHLIGHT_SCALE;
+            const sw = Math.max(0.75, pointRadiusPx * 0.45);
+            const op = Math.max(0.25, 0.85 * h);
+            parts.push(
+              `<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${ringR.toFixed(2)}" ` +
+              `fill="none" stroke="rgb(${DEFAULT_HIGHLIGHT_RGB.r},${DEFAULT_HIGHLIGHT_RGB.g},${DEFAULT_HIGHLIGHT_RGB.b})" ` +
+              `stroke-width="${sw.toFixed(2)}" stroke-opacity="${op.toFixed(3)}"/>`
+            );
+          }
+        }
+      } else if (strategy === 'full-vector') {
+        forEachProjectedPoint({
+          positions,
+          colors,
+          transparency,
+          renderState,
+          plotRect,
+          radiusPx: radiusPlot,
+          visibilityMask,
+          crop,
+          sortByDepth: depthSort3d && dim > 2 && navMode !== 'planar',
+          onPoint: (x, y, r, g, b, a, radius, index) => {
+            let rr = r;
+            let gg = g;
+            let bb = b;
+            let aa = a;
+            if (emphasizeSelection && highlightArray && (highlightArray[index] ?? 0) <= 0) {
+              rr = 160;
+              gg = 160;
+              bb = 160;
+              aa *= selectionMutedOpacity;
+            }
+            if (aa < 0.01) return;
+            if (aa >= 0.999) {
+              parts.push(`<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${radius.toFixed(2)}" fill="rgb(${rr},${gg},${bb})"/>`);
+            } else {
+              parts.push(`<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${radius.toFixed(2)}" fill="rgb(${rr},${gg},${bb})" fill-opacity="${aa.toFixed(3)}"/>`);
+            }
+
+            const h = highlightArray ? highlightValueToAlpha01(highlightArray[index] ?? 0) : 0;
+            if (h > 0) {
+              const ringR = radius * DEFAULT_HIGHLIGHT_SCALE;
+              const sw = Math.max(0.75, radius * 0.45);
+              const op = Math.max(0.25, 0.85 * h);
+              parts.push(
+                `<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${ringR.toFixed(2)}" ` +
+                `fill="none" stroke="rgb(${DEFAULT_HIGHLIGHT_RGB.r},${DEFAULT_HIGHLIGHT_RGB.g},${DEFAULT_HIGHLIGHT_RGB.b})" ` +
+                `stroke-width="${sw.toFixed(2)}" stroke-opacity="${op.toFixed(3)}"/>`
+              );
+            }
+          }
+        });
+      }
 
       const centroidSvg = renderSvgCentroidOverlay({
         positions: centroidPositions,
         colors: centroidColors,
         labelTexts: centroidLabelTexts,
-        flags: { points: includeCentroidPoints, labels: includeCentroidLabels },
+        flags: {
+          points: includeCentroidPoints && !centroidPointsRasterized,
+          labels: includeCentroidLabels
+        },
         renderState,
         plotRect,
         pointRadiusPx: centroidRadiusPlotPx,
@@ -1096,6 +1109,5 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
 
   parts.push(`</svg>`);
   const svg = parts.join('');
-  const blob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' });
-  return { blob, suggestedExt: 'svg' };
+  return new Blob([svg], { type: 'image/svg+xml' });
 }

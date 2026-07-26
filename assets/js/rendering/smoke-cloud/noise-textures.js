@@ -22,8 +22,18 @@ export function getNoiseResolution() {
 
 // Set noise resolution (will take effect on next generation)
 export function setNoiseResolution(shapeSize, detailSize) {
-  NOISE_SIZE = Math.max(32, Math.min(256, shapeSize || 128));
-  DETAIL_SIZE = Math.max(32, Math.min(256, detailSize || NOISE_SIZE));
+  for (const [name, value] of [
+    ['shapeSize', shapeSize],
+    ['detailSize', detailSize]
+  ]) {
+    if (!Number.isInteger(value) || value < 32 || value > 256) {
+      throw new RangeError(
+        `Smoke noise ${name} must be an integer between 32 and 256.`
+      );
+    }
+  }
+  NOISE_SIZE = shapeSize;
+  DETAIL_SIZE = detailSize;
   console.log(`[NoiseTextures] Resolution set to shape=${NOISE_SIZE}³, detail=${DETAIL_SIZE}³`);
 }
 

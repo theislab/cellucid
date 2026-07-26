@@ -26,6 +26,9 @@ in vec2 a_quadPos;
 
 // Edge data texture (RG32UI: source index, dest index)
 uniform highp usampler2D u_edgeTexture;
+// Relative edge strength (R32F), deterministically derived from canonical
+// Float64 weights by dividing every weight by the graph maximum.
+uniform highp sampler2D u_edgeWeightTexture;
 uniform ivec2 u_edgeTexDims;
 
 // Position texture (RGB32F: x, y, z)
@@ -46,6 +49,7 @@ uniform float u_lineWidth;
 uniform int u_maxEdges;
 
 out float v_viewDistance;
+flat out float v_edgeStrength;
 
 // Convert linear index to 2D texture coordinate
 ivec2 idxToCoord(int idx, ivec2 dims) {
@@ -54,6 +58,7 @@ ivec2 idxToCoord(int idx, ivec2 dims) {
 
 void main() {
   int edgeIdx = gl_InstanceID;
+  v_edgeStrength = 0.0;
 
   // LOD: skip edges beyond limit (degenerate triangle)
   if (edgeIdx >= u_maxEdges) {
@@ -66,6 +71,7 @@ void main() {
   uvec4 edgeData = texelFetch(u_edgeTexture, edgeCoord, 0);
   int srcIdx = int(edgeData.r);
   int dstIdx = int(edgeData.g);
+  v_edgeStrength = texelFetch(u_edgeWeightTexture, edgeCoord, 0).r;
 
   // Fetch visibility for both endpoints
   ivec2 srcCoord = idxToCoord(srcIdx, u_posTexDims);
@@ -124,6 +130,7 @@ export const LINE_INSTANCED_FS_SOURCE = `#version 300 es
 precision highp float;
 
 in float v_viewDistance;
+flat in float v_edgeStrength;
 
 uniform vec3 u_lineColor;
 uniform float u_lineAlpha;
@@ -142,7 +149,7 @@ void main() {
   float transmittance = exp(-extinction * normalizedDistance);
 
   vec3 finalColor = mix(u_fogColor, u_lineColor, transmittance);
-  float alpha = u_lineAlpha * (0.2 + 0.8 * transmittance);
+  float alpha = u_lineAlpha * v_edgeStrength * (0.2 + 0.8 * transmittance);
 
   fragColor = vec4(finalColor, alpha);
 }

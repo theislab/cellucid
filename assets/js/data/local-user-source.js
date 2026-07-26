@@ -10,10 +10,23 @@ import {
   DataSourceError,
   DataSourceErrorCode,
   isLocalUserUrl,
-  parseLocalUserUrl,
-  validateSchemaVersion
+  validateDatasetIdentity
 } from './data-source.js';
 import { expandObsManifest, expandVarManifest } from './data-loaders.js';
+import {
+  CONNECTIVITY_MANIFEST_CONTEXT,
+  getConnectivityIndexStorage,
+  validateConnectivityManifest,
+} from './connectivity-manifest-contract.js';
+import {
+  createDatasetReloadSupersededError,
+} from './dataset-lifecycle-errors.js';
+import {
+  throwIfMetadataAborted,
+  validateAbortSignalOrNull,
+  waitForMetadata,
+} from './metadata-load-contract.js';
+import { parseEmbeddingMetadata } from './dimension-manager.js';
 import { isH5adFile, createH5adLoader, H5adDataSource, createH5adDataSource } from './h5ad.js';
 import { isZarrDirectory, createZarrLoader, ZarrDataSource, createZarrDataSource } from './zarr.js';
 import { getNotificationCenter } from '../app/notification-center.js';
@@ -22,21 +35,686 @@ import { getNotificationCenter } from '../app/notification-center.js';
  * @typedef {import('./data-source.js').DatasetMetadata} DatasetMetadata
  */
 
-/**
- * Simple string hash for generating stable dataset IDs.
- * Uses djb2 algorithm - fast and produces reasonably distributed hashes.
- * @param {string} str - String to hash
- * @returns {string} Hex hash string
- */
-function hashString(str) {
-  let hash = 5381;
-  for (let i = 0; i < str.length; i++) {
-    hash = ((hash << 5) + hash) ^ str.charCodeAt(i);
-  }
-  // Convert to unsigned 32-bit and then to hex
-  return (hash >>> 0).toString(16);
+function isZarrZipArchive(file) {
+  return Boolean(
+    file &&
+    typeof file.name === 'string' &&
+    /\.zip$/i.test(file.name)
+  );
 }
 
+function createLocalApplicationDatasetId(kind, sourceDatasetId) {
+  if (
+    typeof sourceDatasetId !== 'string' ||
+    sourceDatasetId.length === 0
+  ) {
+    throw preparedDataError(
+      `The ${kind} reader did not provide a dataset identity.`,
+      'local-user'
+    );
+  }
+  return `local-user:${kind}:${encodeURIComponent(sourceDatasetId)}`;
+}
+
+const PREPARED_LOCAL_URL_PREFIX = 'local-user://dataset/';
+
+function parsePreparedLocalUrl(url) {
+  if (
+    typeof url !== 'string' ||
+    !url.startsWith(PREPARED_LOCAL_URL_PREFIX)
+  ) {
+    return null;
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  if (
+    parsed.protocol !== 'local-user:' ||
+    parsed.hostname !== 'dataset' ||
+    parsed.username !== '' ||
+    parsed.password !== '' ||
+    parsed.port !== '' ||
+    parsed.search !== '' ||
+    parsed.hash !== '' ||
+    parsed.href !== url
+  ) {
+    return null;
+  }
+
+  const encodedParts = parsed.pathname.split('/').slice(1);
+  if (
+    encodedParts.length < 2 ||
+    encodedParts.some(part => part.length === 0)
+  ) {
+    return null;
+  }
+
+  let datasetId;
+  let fileParts;
+  try {
+    datasetId = decodeURIComponent(encodedParts[0]);
+    fileParts = encodedParts.slice(1).map(part => decodeURIComponent(part));
+  } catch {
+    return null;
+  }
+  if (
+    datasetId.length === 0 ||
+    encodeURIComponent(datasetId) !== encodedParts[0] ||
+    fileParts.some(part => (
+      part.length === 0 ||
+      part === '.' ||
+      part === '..' ||
+      part.includes('/') ||
+      part.includes('\\') ||
+      /[\u0000-\u001f\u007f]/.test(part)
+    ))
+  ) {
+    return null;
+  }
+
+  const filename = fileParts.join('/');
+  let canonicalUrl;
+  try {
+    canonicalUrl = new URL(
+      filename,
+      `${PREPARED_LOCAL_URL_PREFIX}${encodeURIComponent(datasetId)}/`
+    ).href;
+  } catch {
+    return null;
+  }
+  return canonicalUrl === url
+    ? { datasetId, filename }
+    : null;
+}
+
+const MAX_PREPARED_BROWSER_BYTES = 512 * 1024 * 1024;
+const MAX_PREPARED_METADATA_BYTES = 64 * 1024 * 1024;
+const MAX_EAGER_GENE_VALIDATION_BYTES = 64 * 1024 * 1024;
+const MAX_EAGER_GENE_VALIDATION_FILES = 256;
+const FLOAT32_BYTES = Float32Array.BYTES_PER_ELEMENT;
+const PREPARED_DIMENSIONS = new Set([1, 2, 3]);
+const PREPARED_DTYPE_INFO = Object.freeze({
+  float64: {
+    bytes: 8,
+    read: (view, offset) => view.getFloat64(offset, true),
+  },
+  float32: {
+    bytes: 4,
+    read: (view, offset) => view.getFloat32(offset, true),
+  },
+  uint8: {
+    bytes: 1,
+    read: (view, offset) => view.getUint8(offset),
+  },
+  uint16: {
+    bytes: 2,
+    read: (view, offset) => view.getUint16(offset, true),
+  },
+  uint32: {
+    bytes: 4,
+    read: (view, offset) => view.getUint32(offset, true),
+  },
+});
+
+function preparedDataError(message, source, details = {}) {
+  return new DataSourceError(
+    message,
+    DataSourceErrorCode.INVALID_FORMAT,
+    source,
+    details
+  );
+}
+
+function requirePreparedGzipDecompressionStream(filename, source) {
+  const GzipDecompressionStream = globalThis.DecompressionStream;
+  if (typeof GzipDecompressionStream !== 'function') {
+    throw preparedDataError(
+      `${filename}: gzip validation requires browser DecompressionStream support`,
+      source,
+      { filename }
+    );
+  }
+  return GzipDecompressionStream;
+}
+
+function validatePreparedPath(path, label, source) {
+  if (
+    typeof path !== 'string' ||
+    path.length === 0 ||
+    path.startsWith('/') ||
+    path.includes('\\') ||
+    /^[A-Za-z]:/.test(path) ||
+    path.split('/').some(part => part === '' || part === '.' || part === '..')
+  ) {
+    throw preparedDataError(
+      `${label} must be a safe relative file path`,
+      source,
+      { path }
+    );
+  }
+  return path;
+}
+
+function preparedDtypeBytes(dtype, label, source) {
+  const info = PREPARED_DTYPE_INFO[dtype];
+  if (!info) {
+    throw preparedDataError(
+      `${label} uses unsupported dtype "${String(dtype)}"`,
+      source,
+      { dtype }
+    );
+  }
+  return info.bytes;
+}
+
+function checkedPreparedBytes(count, width, label, source) {
+  if (
+    !Number.isSafeInteger(count) ||
+    count < 0 ||
+    !Number.isSafeInteger(width) ||
+    width <= 0 ||
+    count > Math.floor(Number.MAX_SAFE_INTEGER / width)
+  ) {
+    throw preparedDataError(
+      `${label} has an invalid or unsafe element count`,
+      source,
+      { count, width }
+    );
+  }
+  const bytes = count * width;
+  if (bytes > MAX_PREPARED_BROWSER_BYTES) {
+    throw preparedDataError(
+      `${label} requires more than the 512 MiB browser working-set limit; use the Cellucid server instead`,
+      source,
+      { bytes, limit: MAX_PREPARED_BROWSER_BYTES }
+    );
+  }
+  return bytes;
+}
+
+function checkedPreparedWorkingSet(parts, label, source) {
+  let total = 0n;
+  for (const part of parts) {
+    if (!Number.isSafeInteger(part) || part < 0) {
+      throw preparedDataError(
+        `${label} has an invalid working-set plan`,
+        source,
+        { parts }
+      );
+    }
+    total += BigInt(part);
+  }
+  if (total > BigInt(MAX_PREPARED_BROWSER_BYTES)) {
+    throw preparedDataError(
+      `${label} working set exceeds the 512 MiB browser limit; use the Cellucid server instead`,
+      source,
+      {
+        bytes: total.toString(),
+        limit: MAX_PREPARED_BROWSER_BYTES,
+      }
+    );
+  }
+  return Number(total);
+}
+
+function createPreparedAbortError() {
+  return createDatasetReloadSupersededError(
+    'Prepared dataset validation was superseded by a newer selection.'
+  );
+}
+
+function throwIfPreparedAborted(signal) {
+  if (signal?.aborted) throw createPreparedAbortError();
+}
+
+function linkPreparedAbortSignals(first, second) {
+  const signals = [...new Set([first, second].filter(Boolean))];
+  if (signals.length === 0) {
+    return { signal: null, release() {} };
+  }
+  if (signals.length === 1) {
+    return { signal: signals[0], release() {} };
+  }
+
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  for (const signal of signals) {
+    signal.addEventListener('abort', abort, { once: true });
+  }
+  if (signals.some(signal => signal.aborted)) {
+    controller.abort();
+  }
+  return {
+    signal: controller.signal,
+    release() {
+      for (const signal of signals) {
+        signal.removeEventListener('abort', abort);
+      }
+    },
+  };
+}
+
+function isPlainObject(value) {
+  return Boolean(
+    value &&
+    typeof value === 'object' &&
+    !Array.isArray(value)
+  );
+}
+
+function requirePreparedExactKeys(
+  object,
+  required,
+  optional,
+  label,
+  source
+) {
+  if (!isPlainObject(object)) {
+    throw preparedDataError(`${label} must be an object.`, source);
+  }
+  const requiredSet = new Set(required);
+  const allowed = new Set([...required, ...optional]);
+  const actual = Object.keys(object);
+  const missing = required.filter(key => !Object.hasOwn(object, key));
+  const extra = actual.filter(key => !allowed.has(key));
+  if (missing.length > 0 || extra.length > 0) {
+    throw preparedDataError(
+      `${label} must contain exactly the current contract fields.`,
+      source,
+      { missing, extra, required: [...requiredSet], optional }
+    );
+  }
+}
+
+function requirePreparedCompressionLevel(value, label, source) {
+  if (
+    value !== null &&
+    (
+      !Number.isSafeInteger(value) ||
+      value < 1 ||
+      value > 9
+    )
+  ) {
+    throw preparedDataError(
+      `${label} must be null or an integer from 1 through 9.`,
+      source,
+      { value }
+    );
+  }
+  return value;
+}
+
+function requirePreparedQuantization(value, label, source) {
+  if (value !== null && value !== 8 && value !== 16) {
+    throw preparedDataError(
+      `${label} must be null, 8, or 16.`,
+      source,
+      { value }
+    );
+  }
+  return value;
+}
+
+function validatePreparedPathCompression(
+  path,
+  compression,
+  label,
+  source
+) {
+  const compressed = path.endsWith('.gz');
+  if (compressed !== (compression !== null)) {
+    throw preparedDataError(
+      `${label} must ${compression === null ? 'not ' : ''}end in .gz ` +
+      `to match export compression.`,
+      source,
+      { path, compression }
+    );
+  }
+}
+
+function validatePreparedIdentityExportContract(identity, source) {
+  if (
+    !Object.hasOwn(identity, 'created_at') ||
+    !Object.hasOwn(identity, 'export_settings')
+  ) {
+    throw preparedDataError(
+      'Prepared dataset_identity.json requires created_at and export_settings.',
+      source
+    );
+  }
+  const settings = identity.export_settings;
+  requirePreparedExactKeys(
+    settings,
+    [
+      'compression',
+      'var_quantization',
+      'obs_continuous_quantization',
+      'obs_categorical_dtype',
+    ],
+    [],
+    'dataset_identity.json export_settings',
+    source
+  );
+  requirePreparedCompressionLevel(
+    settings.compression,
+    'dataset_identity.json export_settings.compression',
+    source
+  );
+  requirePreparedQuantization(
+    settings.var_quantization,
+    'dataset_identity.json export_settings.var_quantization',
+    source
+  );
+  requirePreparedQuantization(
+    settings.obs_continuous_quantization,
+    'dataset_identity.json export_settings.obs_continuous_quantization',
+    source
+  );
+  if (
+    settings.obs_categorical_dtype !== 'uint8' &&
+    settings.obs_categorical_dtype !== 'uint16'
+  ) {
+    throw preparedDataError(
+      'dataset_identity.json export_settings.obs_categorical_dtype ' +
+      'must be exactly "uint8" or "uint16".',
+      source,
+      { value: settings.obs_categorical_dtype }
+    );
+  }
+  return settings;
+}
+
+function getPreparedEmbeddingPlans(identity, source) {
+  const nCells = identity.stats.n_cells;
+  let parsed;
+  try {
+    parsed = parseEmbeddingMetadata(identity.embeddings);
+  } catch (cause) {
+    throw preparedDataError(
+      `Invalid dataset_identity.json embeddings: ${cause?.message || cause}`,
+      source,
+      { cause }
+    );
+  }
+  if (parsed.pathMapKind !== 'files') {
+    throw preparedDataError(
+      'Prepared dataset embeddings must use the exact files path map.',
+      source
+    );
+  }
+
+  return {
+    defaultDimension: parsed.defaultDimension,
+    nCells,
+    plans: parsed.availableDimensions.map(dimension => {
+      const key = `${dimension}d`;
+      const filename = validatePreparedPath(
+        parsed.dimensionFiles[key],
+        `Embedding file for ${dimension}D`,
+        source
+      );
+      validatePreparedPathCompression(
+        filename,
+        identity.export_settings.compression,
+        `Embedding file for ${dimension}D`,
+        source
+      );
+      return {
+        dimension,
+        filename,
+        expectedBytes: checkedPreparedBytes(
+          nCells,
+          dimension * FLOAT32_BYTES,
+          filename,
+          source
+        ),
+        paddedBytes: checkedPreparedBytes(
+          nCells,
+          3 * FLOAT32_BYTES,
+          `${filename} padded rendering coordinates`,
+          source
+        ),
+      };
+    }),
+  };
+}
+
+function validatePreparedPayloadPathUniqueness(
+  {
+    embeddingPlan,
+    obsManifest,
+    varManifest,
+    connectivityManifest,
+    vectorFields,
+  },
+  source
+) {
+  const ownersByPath = new Map();
+  const claim = (path, label) => {
+    const filename = validatePreparedPath(path, label, source);
+    const existingOwner = ownersByPath.get(filename);
+    if (existingOwner) {
+      throw preparedDataError(
+        `Advertised payload path "${filename}" is used more than once: ${existingOwner} and ${label}`,
+        source,
+        { filename, existingOwner, conflictingOwner: label }
+      );
+    }
+    ownersByPath.set(filename, label);
+  };
+
+  for (const metadataPath of [
+    'dataset_identity.json',
+    'obs_manifest.json',
+    'var_manifest.json',
+    'connectivity_manifest.json',
+  ]) {
+    claim(metadataPath, `structural metadata "${metadataPath}"`);
+  }
+
+  for (const plan of embeddingPlan.plans) {
+    claim(plan.filename, `${plan.dimension}D embedding`);
+  }
+  for (const field of obsManifest.fields) {
+    if (field.kind === 'continuous') {
+      claim(
+        field.valuesPath,
+        `observation values for "${field.key}"`
+      );
+    } else {
+      claim(
+        field.codesPath,
+        `observation codes for "${field.key}"`
+      );
+    }
+    if (field.outlierQuantilesPath) {
+      claim(
+        field.outlierQuantilesPath,
+        `observation outliers for "${field.key}"`
+      );
+    }
+  }
+  for (const field of varManifest?.fields || []) {
+    claim(field.valuesPath, `gene values for "${field.key}"`);
+  }
+  if (connectivityManifest) {
+    claim(
+      connectivityManifest.sourcesPath,
+      'connectivity sources'
+    );
+    claim(
+      connectivityManifest.destinationsPath,
+      'connectivity destinations'
+    );
+    claim(
+      connectivityManifest.weightsPath,
+      'connectivity weights'
+    );
+  }
+  for (const [fieldId, field] of Object.entries(
+    vectorFields?.fields || {}
+  )) {
+    for (const dimension of field.available_dimensions) {
+      claim(
+        field.files[`${dimension}d`],
+        `vector field "${fieldId}" ${dimension}D`
+      );
+    }
+  }
+}
+
+function validatePreparedObsManifest(rawManifest, identity, source) {
+  let manifest;
+  try {
+    manifest = expandObsManifest(rawManifest);
+  } catch (cause) {
+    throw preparedDataError(
+      `Invalid obs_manifest.json: ${cause?.message || cause}`,
+      source,
+      { cause }
+    );
+  }
+
+  if (!manifest || typeof manifest !== 'object') {
+    throw preparedDataError(
+      'Invalid obs_manifest.json: expected a JSON object',
+      source
+    );
+  }
+  if (
+    !Number.isSafeInteger(manifest.n_points) ||
+    manifest.n_points < 0
+  ) {
+    throw preparedDataError(
+      'Invalid obs_manifest.json: n_points must be a non-negative safe integer',
+      source
+    );
+  }
+  if (manifest.n_points !== identity.stats.n_cells) {
+    throw preparedDataError(
+      `Invalid obs_manifest.json: n_points (${manifest.n_points}) does not match dataset_identity.json stats.n_cells (${identity.stats.n_cells})`,
+      source
+    );
+  }
+  if (!Array.isArray(manifest.fields)) {
+    throw preparedDataError(
+      'Invalid obs_manifest.json: fields must be an array',
+      source
+    );
+  }
+  const settings = identity.export_settings;
+  if (manifest.compression !== settings.compression) {
+    throw preparedDataError(
+      'obs_manifest.json compression must exactly match ' +
+      'dataset_identity.json export_settings.compression.',
+      source,
+      {
+        manifestCompression: manifest.compression,
+        exportCompression: settings.compression,
+      }
+    );
+  }
+
+  const seenKeys = new Set();
+  for (const field of manifest.fields) {
+    if (
+      !field ||
+      typeof field.key !== 'string' ||
+      field.key.length === 0 ||
+      seenKeys.has(field.key)
+    ) {
+      throw preparedDataError(
+        'Invalid obs_manifest.json: field keys must be non-empty and unique',
+        source
+      );
+    }
+    seenKeys.add(field.key);
+    if (field.kind !== 'continuous' && field.kind !== 'category') {
+      throw preparedDataError(
+        `Invalid obs_manifest.json: field "${field.key}" has unsupported kind "${String(field.kind)}"`,
+        source
+      );
+    }
+    if (field.kind === 'continuous') {
+      const expectedBits = settings.obs_continuous_quantization;
+      if (
+        field.quantized !== (expectedBits !== null) ||
+        (
+          field.quantized &&
+          field.quantizationBits !== expectedBits
+        )
+      ) {
+        throw preparedDataError(
+          `Observation field "${field.key}" quantization must exactly ` +
+          'match dataset_identity.json export_settings.',
+          source
+        );
+      }
+      validatePreparedPathCompression(
+        field.valuesPath,
+        settings.compression,
+        `Observation values for "${field.key}"`,
+        source
+      );
+    } else {
+      if (field.codesDtype !== settings.obs_categorical_dtype) {
+        throw preparedDataError(
+          `Observation field "${field.key}" categorical dtype must ` +
+          'exactly match dataset_identity.json export_settings.',
+          source
+        );
+      }
+      validatePreparedPathCompression(
+        field.codesPath,
+        settings.compression,
+        `Observation codes for "${field.key}"`,
+        source
+      );
+      if (field.outlierQuantilesPath !== null) {
+        const expectedBits = settings.obs_continuous_quantization;
+        const actualBits = field.outlierDtype === 'uint8'
+          ? 8
+          : field.outlierDtype === 'uint16'
+            ? 16
+            : null;
+        if (
+          field.outlierQuantized !== (expectedBits !== null) ||
+          (
+            field.outlierQuantized &&
+            actualBits !== expectedBits
+          )
+        ) {
+          throw preparedDataError(
+            `Observation field "${field.key}" outlier quantization must ` +
+            'exactly match dataset_identity.json export_settings.',
+            source
+          );
+        }
+        validatePreparedPathCompression(
+          field.outlierQuantilesPath,
+          settings.compression,
+          `Observation outliers for "${field.key}"`,
+          source
+        );
+      }
+    }
+  }
+  return manifest;
+}
+
+/**
+ * Record the user-selected Zarr container at the UI-facing metadata seam.
+ * The underlying reader sees only an indexed Zarr store, so it cannot
+ * distinguish a browser directory selection from a portable ZIP archive.
+ *
+ * @param {DatasetMetadata} metadata
+ * @param {{archiveFile?: File|Blob|null}} [options]
+ * @returns {DatasetMetadata}
+ */
 /**
  * Data source for user-selected local directories
  */
@@ -54,8 +732,25 @@ export class LocalUserDirDataSource {
     /** @type {DatasetMetadata|null} */
     this._metadata = null;
 
+    /**
+     * Exact dataset_identity.json id owned by the adopted source. This may
+     * differ from the application-facing dataset id for prepared directories.
+     * @type {string|null}
+     */
+    this._identityId = null;
+
     /** @type {Map<string, string>} */
     this._objectUrls = new Map();
+
+    /**
+     * Large gene collections are validated when a payload is first requested,
+     * rather than streaming thousands of files during folder adoption.
+     * @type {Map<string, {dtype: string, expectedBytes: number}>}
+     */
+    this._preparedLazyValidationPlans = new Map();
+
+    /** @type {Map<string, Promise<void>>} */
+    this._preparedLazyValidationPromises = new Map();
 
     /** @type {H5adDataSource|null} H5AD source for h5ad files */
     this._h5adSource = null;
@@ -66,7 +761,62 @@ export class LocalUserDirDataSource {
     /** @type {'directory'|'h5ad'|'zarr'|null} */
     this._sourceMode = null;
 
+    /**
+     * Monotonic identity for user selections. Async work may publish state only
+     * while the epoch it captured is still current.
+     * @type {number}
+     */
+    this._selectionEpoch = 0;
+
+    /** @type {AbortController|null} */
+    this._selectionController = null;
+
+    /**
+     * Monotonic identity of committed working source state. Unlike the
+     * selection epoch, rejected candidates do not advance this identity.
+     * @type {number}
+     */
+    this._adoptionEpoch = 0;
+
     this.type = 'local-user';
+  }
+
+  /**
+   * Start a new user selection.
+   * @returns {number} Epoch owned by the new selection
+   * @private
+   */
+  _beginSelection() {
+    this._selectionController?.abort();
+    this._selectionController = new AbortController();
+    this._selectionEpoch += 1;
+    return this._selectionEpoch;
+  }
+
+  /**
+   * Create an actionable cancellation error for work superseded by a newer
+   * user selection.
+   * @returns {Error}
+   * @private
+   */
+  _createSupersededSelectionError() {
+    return createDatasetReloadSupersededError(
+      'This local data selection was superseded by a newer selection.'
+    );
+  }
+
+  /**
+   * Prevent stale async work from publishing or returning as a successful load.
+   * @param {number} selectionEpoch
+   * @private
+   */
+  _assertSelectionCurrent(selectionEpoch, signal = null) {
+    if (
+      signal?.aborted ||
+      selectionEpoch !== this._selectionEpoch
+    ) {
+      throw this._createSupersededSelectionError();
+    }
   }
 
   /**
@@ -75,6 +825,25 @@ export class LocalUserDirDataSource {
    */
   getType() {
     return this.type;
+  }
+
+  /**
+   * Return the monotonic identity of the current local selection.
+   * Consumers use this to reject async work that spans a replacement.
+   *
+   * @returns {number}
+   */
+  getSelectionIdentity() {
+    return this._selectionEpoch;
+  }
+
+  /**
+   * Return the identity of the currently adopted working source.
+   *
+   * @returns {number}
+   */
+  getAdoptionIdentity() {
+    return this._adoptionEpoch;
   }
 
   /**
@@ -103,49 +872,12 @@ export class LocalUserDirDataSource {
   }
 
   /**
-   * Load files from a FileList (from <input type="file" webkitdirectory> or single file input)
-   * Automatically detects if a single h5ad file or zarr directory is selected
-   * @param {FileList} fileList - Files from file input
-   * @returns {Promise<DatasetMetadata>}
-   */
-  async loadFromFileList(fileList) {
-    if (!fileList || fileList.length === 0) {
-      throw new DataSourceError(
-        'No files selected',
-        DataSourceErrorCode.INVALID_FORMAT,
-        this.type
-      );
-    }
-
-    // Check if this is a single h5ad file
-    const firstFile = fileList[0];
-    if (fileList.length === 1 && isH5adFile(firstFile)) {
-      return this.loadFromH5adFile(firstFile);
-    }
-
-    // Check if this is a zarr directory
-    if (isZarrDirectory(fileList)) {
-      return this.loadFromZarrDirectory(fileList);
-    }
-
-    // Check if any file in the list is an h5ad file (user might have selected h5ad from directory picker)
-    for (const file of fileList) {
-      if (isH5adFile(file)) {
-        // Found an h5ad file, load it directly
-        return this.loadFromH5adFile(file);
-      }
-    }
-
-    // Standard directory loading
-    return this._loadFromDirectory(fileList);
-  }
-
-  /**
    * Load an h5ad file directly
    * @param {File} file - h5ad file
    * @returns {Promise<DatasetMetadata>}
    */
   async loadFromH5adFile(file) {
+    const selectionEpoch = this._beginSelection();
     if (!isH5adFile(file)) {
       throw new DataSourceError(
         'Not an h5ad file. Expected .h5ad extension.',
@@ -154,21 +886,58 @@ export class LocalUserDirDataSource {
       );
     }
 
-    // Clear previous state
-    this._cleanup();
+    const candidateSource = createH5adDataSource();
+    let adopted = false;
 
-    // Create and initialize h5ad source
-    this._h5adSource = createH5adDataSource();
-    await this._h5adSource.loadFromFile(file);
+    try {
+      const sourceDatasetId =
+        `h5ad_${file.name.replace(/\.h5ad$/i, '')}`;
+      const candidateDatasetId = createLocalApplicationDatasetId(
+        'h5ad',
+        sourceDatasetId
+      );
+      await candidateSource.loadFromFile(
+        file,
+        {
+          showProgress: false,
+          datasetId: candidateDatasetId,
+          description: 'Loaded directly from H5AD file',
+          source: {
+            name: 'H5AD file',
+            filename: file.name,
+          },
+        }
+      );
+      this._assertSelectionCurrent(selectionEpoch);
 
-    this._sourceMode = 'h5ad';
-    this.datasetId = this._h5adSource.datasetId;
-    this.directoryPath = file.name;
-    this._metadata = await this._h5adSource.getMetadata(this.datasetId);
+      const candidateMetadata =
+        await candidateSource.getMetadata(candidateDatasetId);
+      this._assertSelectionCurrent(selectionEpoch);
 
-    console.log(`[LocalUserDirDataSource] Loaded h5ad file: ${file.name}`);
+      // Commit only after the candidate is completely usable.
+      this._cleanup();
+      this._h5adSource = candidateSource;
+      this._sourceMode = 'h5ad';
+      this.datasetId = candidateDatasetId;
+      this.directoryPath = file.name;
+      this._metadata = candidateMetadata;
+      this._identityId = candidateMetadata.id;
+      this._adoptionEpoch += 1;
+      adopted = true;
 
-    return this._metadata;
+      console.log(`[LocalUserDirDataSource] Loaded h5ad file: ${file.name}`);
+
+      return this._metadata;
+    } catch (error) {
+      if (selectionEpoch !== this._selectionEpoch) {
+        throw this._createSupersededSelectionError();
+      }
+      throw error;
+    } finally {
+      if (!adopted) {
+        candidateSource.clear();
+      }
+    }
   }
 
   /**
@@ -177,6 +946,7 @@ export class LocalUserDirDataSource {
    * @returns {Promise<DatasetMetadata>}
    */
   async loadFromZarrDirectory(fileList) {
+    const selectionEpoch = this._beginSelection();
     if (!isZarrDirectory(fileList)) {
       throw new DataSourceError(
         'Not a zarr directory. Expected .zarr extension or zarr structure files.',
@@ -185,102 +955,264 @@ export class LocalUserDirDataSource {
       );
     }
 
-    // Clear previous state
-    this._cleanup();
+    const candidateSource = createZarrDataSource();
+    let adopted = false;
 
-    // Create and initialize zarr source
-    this._zarrSource = createZarrDataSource();
-    await this._zarrSource.loadFromFileList(fileList);
+    try {
+      const firstPath = (
+        fileList[0].webkitRelativePath || fileList[0].name
+      ).replace(/\\/g, '/');
+      const sourceDatasetId =
+        `zarr_${firstPath.split('/')[0].replace(/\.zarr$/i, '')}`;
+      const candidateDatasetId = createLocalApplicationDatasetId(
+        'zarr-directory',
+        sourceDatasetId
+      );
+      await candidateSource.loadFromFileList(
+        fileList,
+        {
+          showProgress: false,
+          datasetId: candidateDatasetId,
+          description: 'Loaded directly from Zarr directory',
+          source: {
+            name: 'Zarr directory',
+          },
+        }
+      );
+      this._assertSelectionCurrent(selectionEpoch);
 
-    this._sourceMode = 'zarr';
-    this.datasetId = this._zarrSource.datasetId;
-    this.directoryPath = this._zarrSource.dirname;
-    this._metadata = await this._zarrSource.getMetadata(this.datasetId);
+      const candidateDirectoryPath = candidateSource.dirname;
+      const candidateMetadata =
+        await candidateSource.getMetadata(candidateDatasetId);
+      this._assertSelectionCurrent(selectionEpoch);
 
-    console.log(`[LocalUserDirDataSource] Loaded zarr directory: ${this.directoryPath}`);
+      // Commit only after the candidate is completely usable.
+      this._cleanup();
+      this._zarrSource = candidateSource;
+      this._sourceMode = 'zarr';
+      this.datasetId = candidateDatasetId;
+      this.directoryPath = candidateDirectoryPath;
+      this._metadata = candidateMetadata;
+      this._identityId = candidateMetadata.id;
+      this._adoptionEpoch += 1;
+      adopted = true;
 
-    return this._metadata;
+      console.log(`[LocalUserDirDataSource] Loaded zarr directory: ${this.directoryPath}`);
+
+      return this._metadata;
+    } catch (error) {
+      if (selectionEpoch !== this._selectionEpoch) {
+        throw this._createSupersededSelectionError();
+      }
+      throw error;
+    } finally {
+      if (!adopted) {
+        candidateSource.clear();
+      }
+    }
   }
 
   /**
-   * Load from a directory (exported data format)
-   * @param {FileList} fileList - Files from directory input
+   * Load a portable ZIP archive containing a Zarr v2 store.
+   * @param {File|Blob} file
    * @returns {Promise<DatasetMetadata>}
-   * @private
    */
-  async _loadFromDirectory(fileList) {
-    // Clear previous state
-    this._cleanup();
-
-    this._sourceMode = 'directory';
-
-    // Extract directory name from the first file's path
-    // webkitRelativePath format: "dirname/filename.ext" or "dirname/subdir/filename.ext"
-    const firstFile = fileList[0];
-    const relativePath = firstFile.webkitRelativePath || firstFile.name;
-    const pathParts = relativePath.split('/');
-    this.directoryPath = pathParts[0] || 'Selected folder';
-
-    // Generate stable dataset ID using hash of directory path
-    // This ensures the same directory always gets the same ID (important for state restoration)
-    this.datasetId = `user_${this.directoryPath}_${hashString(relativePath)}`;
-
-    console.log(`[LocalUserDirDataSource] Loading ${fileList.length} files from: ${this.directoryPath}`);
-
-    // Index files by their name (relative to the root directory)
-    for (const file of fileList) {
-      const relativePath = file.webkitRelativePath || file.name;
-      const pathParts = relativePath.split('/');
-
-      // Get filename relative to the root directory
-      // For "dirname/obs_manifest.json" -> "obs_manifest.json"
-      // For "dirname/obs/field.bin" -> "obs/field.bin"
-      const filename = pathParts.slice(1).join('/');
-
-      if (filename) {
-        this._files.set(filename, file);
-      }
+  async loadFromZarrArchive(file) {
+    const selectionEpoch = this._beginSelection();
+    if (!isZarrZipArchive(file)) {
+      throw new DataSourceError(
+        'Not a Zarr ZIP archive. Expected a .zip file.',
+        DataSourceErrorCode.INVALID_FORMAT,
+        this.type
+      );
     }
 
-    console.log(`[LocalUserDirDataSource] Indexed ${this._files.size} files`);
+    const candidateSource = createZarrDataSource();
+    let adopted = false;
 
-    // Validate and load metadata
-    await this._validateAndLoadMetadata();
+    try {
+      const sourceDatasetId =
+        `zarr_${file.name
+          .replace(/\.zip$/i, '')
+          .replace(/\.zarr$/i, '')}`;
+      const candidateDatasetId = createLocalApplicationDatasetId(
+        'zarr-archive',
+        sourceDatasetId
+      );
+      await candidateSource.loadFromArchiveFile(
+        file,
+        {
+          showProgress: false,
+          datasetId: candidateDatasetId,
+          description: 'Loaded directly from Zarr ZIP archive',
+          source: {
+            name: 'Zarr ZIP archive',
+            filename: file.name,
+          },
+        }
+      );
+      this._assertSelectionCurrent(selectionEpoch);
 
-    return this._metadata;
+      const candidateDirectoryPath = candidateSource.dirname;
+      const candidateMetadata =
+        await candidateSource.getMetadata(candidateDatasetId);
+      this._assertSelectionCurrent(selectionEpoch);
+
+      this._cleanup();
+      this._zarrSource = candidateSource;
+      this._sourceMode = 'zarr';
+      this.datasetId = candidateDatasetId;
+      this.directoryPath = candidateDirectoryPath;
+      this._metadata = candidateMetadata;
+      this._identityId = candidateMetadata.id;
+      this._adoptionEpoch += 1;
+      adopted = true;
+
+      console.log(
+        `[LocalUserDirDataSource] Loaded Zarr ZIP archive: ` +
+        `${this.directoryPath}`
+      );
+      return this._metadata;
+    } catch (error) {
+      if (selectionEpoch !== this._selectionEpoch) {
+        throw this._createSupersededSelectionError();
+      }
+      throw error;
+    } finally {
+      if (!adopted) {
+        candidateSource.clear();
+      }
+    }
+  }
+
+  /**
+   * Load one prepared Cellucid export directory.
+   * @param {FileList} fileList - Files from directory input
+   * @returns {Promise<DatasetMetadata>}
+   */
+  async loadFromPreparedDirectory(fileList) {
+    const selectionEpoch = this._beginSelection();
+    if (!fileList || fileList.length === 0) {
+      throw new DataSourceError(
+        'No prepared dataset directory selected.',
+        DataSourceErrorCode.INVALID_FORMAT,
+        this.type
+      );
+    }
+    const signal = this._selectionController.signal;
+    const candidateSource = new LocalUserDirDataSource();
+    let adopted = false;
+
+    const firstFile = fileList[0];
+    const firstPath = firstFile?.webkitRelativePath;
+    if (
+      typeof firstPath !== 'string' ||
+      firstPath.length === 0 ||
+      !firstPath.includes('/')
+    ) {
+      throw preparedDataError(
+        'Prepared data must be selected with the prepared-directory control.',
+        this.type
+      );
+    }
+    const rootDirectory = firstPath.split('/')[0];
+    if (!rootDirectory) {
+      throw preparedDataError(
+        'Prepared directory entries must include one common root directory.',
+        this.type
+      );
+    }
+    candidateSource.directoryPath = rootDirectory;
+    candidateSource._sourceMode = 'directory';
+
+    console.log(
+      `[LocalUserDirDataSource] Loading ${fileList.length} files from: ` +
+      candidateSource.directoryPath
+    );
+
+    for (const file of fileList) {
+      const entryPath = file?.webkitRelativePath;
+      if (
+        typeof entryPath !== 'string' ||
+        entryPath.length === 0
+      ) {
+        throw preparedDataError(
+          'Every prepared directory entry must include its relative path.',
+          this.type
+        );
+      }
+      const pathParts = entryPath.split('/');
+      if (pathParts[0] !== rootDirectory) {
+        throw preparedDataError(
+          'A prepared selection must contain exactly one root directory.',
+          this.type,
+          { entryPath, rootDirectory }
+        );
+      }
+      const filename = validatePreparedPath(
+        pathParts.slice(1).join('/'),
+        'Prepared directory entry',
+        this.type
+      );
+      if (candidateSource._files.has(filename)) {
+        throw preparedDataError(
+          `Prepared directory contains duplicate path "${filename}".`,
+          this.type,
+          { filename }
+        );
+      }
+      candidateSource._files.set(filename, file);
+    }
+
+    console.log(
+      `[LocalUserDirDataSource] Indexed ${candidateSource._files.size} files`
+    );
+
+    try {
+      // Validate against isolated candidate state. The working source remains
+      // untouched if validation fails or this selection becomes stale.
+      await candidateSource._validateAndLoadMetadata({ signal });
+      this._assertSelectionCurrent(selectionEpoch, signal);
+
+      this._cleanup();
+      this._files = candidateSource._files;
+      candidateSource._files = new Map();
+      this._preparedLazyValidationPlans =
+        candidateSource._preparedLazyValidationPlans;
+      candidateSource._preparedLazyValidationPlans = new Map();
+      this._sourceMode = 'directory';
+      this.datasetId = candidateSource.datasetId;
+      this.directoryPath = candidateSource.directoryPath;
+      this._metadata = candidateSource._metadata;
+      this._identityId = candidateSource._identityId;
+      this._adoptionEpoch += 1;
+      adopted = true;
+
+      return this._metadata;
+    } catch (error) {
+      if (selectionEpoch !== this._selectionEpoch) {
+        throw this._createSupersededSelectionError();
+      }
+      throw error;
+    } finally {
+      if (!adopted) {
+        candidateSource._cleanup();
+      }
+    }
   }
 
   /**
    * Validate directory structure and load metadata
    * @private
    */
-  async _validateAndLoadMetadata() {
-    // Check for required files
+  async _validateAndLoadMetadata({ signal = null } = {}) {
+    throwIfPreparedAborted(signal);
     const requiredFiles = [...DATA_CONFIG.REQUIRED_FILES];
     const missing = [];
 
     for (const filename of requiredFiles) {
-      const exists = this._fileExists(filename);
-      if (!exists) {
-        missing.push(filename);
-      }
+      if (!this._fileExists(filename)) missing.push(filename);
     }
-
-    // Check for dimensional points files (3D preferred, then 2D, then 1D)
-    let pointsFile = null;
-    for (const candidate of DATA_CONFIG.POINTS_FILES) {
-      if (this._fileExists(candidate + '.gz')) {
-        pointsFile = candidate + '.gz';
-        break;
-      } else if (this._fileExists(candidate)) {
-        pointsFile = candidate;
-        break;
-      }
-    }
-    if (!pointsFile) {
-      missing.push('points_Xd.bin (at least one of: ' + DATA_CONFIG.POINTS_FILES.join(', ') + ')');
-    }
-
     if (missing.length > 0) {
       throw new DataSourceError(
         `Invalid dataset: missing required files: ${missing.join(', ')}`,
@@ -290,8 +1222,7 @@ export class LocalUserDirDataSource {
       );
     }
 
-    // Load metadata from dataset_identity.json or construct from manifests
-    await this._loadMetadata(pointsFile);
+    await this._loadMetadata({ signal });
   }
 
   /**
@@ -313,7 +1244,12 @@ export class LocalUserDirDataSource {
   _getFile(filename) {
     const file = this._files.get(filename);
     if (!file) {
-      throw new Error(`File not found: ${filename}`);
+      throw new DataSourceError(
+        `File not found: ${filename}`,
+        DataSourceErrorCode.FILE_NOT_FOUND,
+        this.type,
+        { filename }
+      );
     }
     return file;
   }
@@ -324,9 +1260,30 @@ export class LocalUserDirDataSource {
    * @returns {Promise<string>}
    * @private
    */
-  async _readFileAsText(filename) {
+  async _readFileAsText(filename, signal = null) {
+    throwIfPreparedAborted(signal);
     const file = this._getFile(filename);
-    return file.text();
+    if (
+      !Number.isSafeInteger(file.size) ||
+      file.size < 0 ||
+      file.size > MAX_PREPARED_METADATA_BYTES
+    ) {
+      throw preparedDataError(
+        `${filename} exceeds the ${MAX_PREPARED_METADATA_BYTES}-byte metadata limit`,
+        this.type,
+        { filename, size: file.size }
+      );
+    }
+    const text = await file.text();
+    throwIfPreparedAborted(signal);
+    if (text.length > MAX_PREPARED_METADATA_BYTES) {
+      throw preparedDataError(
+        `${filename} exceeds the ${MAX_PREPARED_METADATA_BYTES}-character metadata limit`,
+        this.type,
+        { filename, length: text.length }
+      );
+    }
+    return text;
   }
 
   /**
@@ -335,101 +1292,1316 @@ export class LocalUserDirDataSource {
    * @returns {Promise<any>}
    * @private
    */
-  async _readFileAsJson(filename) {
-    const text = await this._readFileAsText(filename);
+  async _readFileAsJson(filename, signal = null) {
+    const text = await this._readFileAsText(filename, signal);
     return JSON.parse(text);
+  }
+
+  async _readRequiredJson(filename, signal = null) {
+    try {
+      return await this._readFileAsJson(filename, signal);
+    } catch (cause) {
+      if (cause?.name === 'AbortError') throw cause;
+      throw preparedDataError(
+        `Invalid ${filename}: ${cause?.message || cause}`,
+        this.type,
+        { filename, cause }
+      );
+    }
+  }
+
+  _validatePreparedFileEnvelope(filename, expectedBytes) {
+    let file;
+    try {
+      file = this._getFile(filename);
+    } catch (cause) {
+      throw preparedDataError(
+        `${filename}: missing advertised payload`,
+        this.type,
+        { filename, cause }
+      );
+    }
+    if (
+      !Number.isSafeInteger(file.size) ||
+      file.size < 0 ||
+      file.size > MAX_PREPARED_BROWSER_BYTES
+    ) {
+      throw preparedDataError(
+        `${filename}: compressed or binary file size exceeds the 512 MiB browser limit`,
+        this.type,
+        { filename, actualBytes: file.size }
+      );
+    }
+    if (filename.endsWith('.gz')) {
+      if (file.size < 18) {
+        throw preparedDataError(
+          `${filename}: invalid or truncated gzip payload`,
+          this.type
+        );
+      }
+    } else if (file.size !== expectedBytes) {
+      throw preparedDataError(
+        `${filename}: expected ${expectedBytes} bytes, found ${file.size}`,
+        this.type,
+        { filename, expectedBytes, actualBytes: file.size }
+      );
+    }
+    return file;
+  }
+
+  async _validatePreparedFileLength(
+    filename,
+    expectedBytes,
+    {
+      dtype = null,
+      signal = null,
+      validateValue = null,
+    } = {}
+  ) {
+    throwIfPreparedAborted(signal);
+    const file = this._validatePreparedFileEnvelope(
+      filename,
+      expectedBytes
+    );
+    const GzipDecompressionStream = filename.endsWith('.gz')
+      ? requirePreparedGzipDecompressionStream(filename, this.type)
+      : null;
+    if (filename.endsWith('.gz')) {
+      const header = new Uint8Array(
+        await file.slice(0, 10).arrayBuffer()
+      );
+      throwIfPreparedAborted(signal);
+      if (
+        header[0] !== 0x1f ||
+        header[1] !== 0x8b ||
+        header[2] !== 8 ||
+        (header[3] & 0xe0) !== 0
+      ) {
+        throw preparedDataError(
+          `${filename}: invalid gzip header`,
+          this.type,
+          { filename }
+        );
+      }
+      const trailer = await file.slice(file.size - 4, file.size).arrayBuffer();
+      throwIfPreparedAborted(signal);
+      const declaredBytes = new DataView(trailer).getUint32(0, true);
+      if (declaredBytes !== expectedBytes) {
+        throw preparedDataError(
+          `${filename}: expected ${expectedBytes} bytes after decompression, but gzip declares ${declaredBytes} bytes`,
+          this.type,
+          { filename, expectedBytes, declaredBytes }
+        );
+      }
+    }
+
+    if (!dtype) return;
+    await this._validatePreparedBinaryStream(
+      file,
+      filename,
+      expectedBytes,
+      {
+        dtype,
+        signal,
+        validateValue,
+        GzipDecompressionStream,
+      }
+    );
+  }
+
+  async _validatePreparedFileOnDemand(filename, ownerSignal) {
+    validateAbortSignalOrNull(
+      ownerSignal,
+      'Prepared file URL resolution signal'
+    );
+    throwIfMetadataAborted(
+      ownerSignal,
+      'Prepared file URL resolution'
+    );
+    const plan = this._preparedLazyValidationPlans.get(filename);
+    if (!plan) return;
+
+    const pending = this._preparedLazyValidationPromises.get(filename);
+    if (pending) {
+      await waitForMetadata(
+        pending,
+        ownerSignal,
+        'Prepared file URL resolution'
+      );
+      return;
+    }
+
+    const adoptionEpoch = this._adoptionEpoch;
+    const linked = linkPreparedAbortSignals(
+      this._selectionController?.signal ?? null,
+      ownerSignal
+    );
+    const validation = (async () => {
+      try {
+        await this._validatePreparedFileLength(
+          filename,
+          plan.expectedBytes,
+          { dtype: plan.dtype, signal: linked.signal }
+        );
+        if (adoptionEpoch !== this._adoptionEpoch) {
+          throw this._createSupersededSelectionError();
+        }
+        if (this._preparedLazyValidationPlans.get(filename) === plan) {
+          this._preparedLazyValidationPlans.delete(filename);
+        }
+      } finally {
+        linked.release();
+      }
+    })();
+    this._preparedLazyValidationPromises.set(filename, validation);
+    const clearSettledValidation = () => {
+      if (this._preparedLazyValidationPromises.get(filename) === validation) {
+        this._preparedLazyValidationPromises.delete(filename);
+      }
+    };
+    validation.then(
+      clearSettledValidation,
+      clearSettledValidation
+    );
+    await waitForMetadata(
+      validation,
+      ownerSignal,
+      'Prepared file URL resolution'
+    );
+  }
+
+  async _validatePreparedBinaryStream(
+    file,
+    filename,
+    expectedBytes,
+    {
+      dtype,
+      signal = null,
+      validateValue = null,
+      GzipDecompressionStream = null,
+    }
+  ) {
+    const dtypeInfo = PREPARED_DTYPE_INFO[dtype];
+    if (!dtypeInfo) {
+      throw preparedDataError(
+        `${filename}: unsupported validation dtype "${String(dtype)}"`,
+        this.type
+      );
+    }
+    let stream;
+    let reader = null;
+    try {
+      throwIfPreparedAborted(signal);
+      if (filename.endsWith('.gz')) {
+        if (typeof GzipDecompressionStream !== 'function') {
+          throw new Error(
+            'gzip validation requires a selected DecompressionStream backend'
+          );
+        }
+        stream = file.stream().pipeThrough(
+          new GzipDecompressionStream('gzip')
+        );
+      } else {
+        stream = file.stream();
+      }
+
+      reader = stream.getReader();
+      let totalBytes = 0;
+      let carry = new Uint8Array(0);
+      let valueIndex = 0;
+      while (true) {
+        const readPromise = Promise.resolve(reader.read());
+        let abortListener = null;
+        const abortPromise = signal
+          ? new Promise((_, reject) => {
+              abortListener = () => {
+                const error = createPreparedAbortError();
+                Promise.resolve(reader.cancel(error)).catch(() => {});
+                reject(error);
+              };
+              signal.addEventListener('abort', abortListener, { once: true });
+              if (signal.aborted) abortListener();
+            })
+          : null;
+        let result;
+        try {
+          result = abortPromise
+            ? await Promise.race([readPromise, abortPromise])
+            : await readPromise;
+        } finally {
+          if (abortListener) {
+            signal.removeEventListener('abort', abortListener);
+          }
+        }
+        throwIfPreparedAborted(signal);
+        const { done, value } = result;
+        if (done) break;
+        const chunk = value instanceof Uint8Array
+          ? value
+          : new Uint8Array(value);
+        totalBytes += chunk.byteLength;
+        if (totalBytes > expectedBytes) {
+          throw preparedDataError(
+            `${filename}: expected ${expectedBytes} bytes, decompressed beyond that size`,
+            this.type,
+            { filename, expectedBytes, actualBytes: totalBytes }
+          );
+        }
+
+        let bytes = chunk;
+        if (carry.byteLength > 0) {
+          bytes = new Uint8Array(carry.byteLength + chunk.byteLength);
+          bytes.set(carry);
+          bytes.set(chunk, carry.byteLength);
+        }
+
+        const completeBytes =
+          bytes.byteLength - (bytes.byteLength % dtypeInfo.bytes);
+        const values = new DataView(
+          bytes.buffer,
+          bytes.byteOffset,
+          completeBytes
+        );
+        for (
+          let offset = 0;
+          offset < completeBytes;
+          offset += dtypeInfo.bytes
+        ) {
+          const parsed = dtypeInfo.read(values, offset);
+          if (validateValue) {
+            validateValue(parsed, valueIndex);
+          }
+          valueIndex++;
+        }
+        carry = bytes.slice(completeBytes);
+      }
+
+      if (totalBytes !== expectedBytes || carry.byteLength !== 0) {
+        throw preparedDataError(
+          `${filename}: expected ${expectedBytes} bytes, decompressed to ${totalBytes}`,
+          this.type,
+          { filename, expectedBytes, actualBytes: totalBytes }
+        );
+      }
+    } catch (cause) {
+      if (cause?.name === 'AbortError') throw cause;
+      if (cause instanceof DataSourceError) throw cause;
+      throw preparedDataError(
+        `${filename}: invalid gzip, compressed, or binary payload (${cause?.message || cause})`,
+        this.type,
+        { filename, cause }
+      );
+    } finally {
+      try {
+        reader?.releaseLock();
+      } catch {
+        // The stream may already be cancelled and unlocked.
+      }
+    }
+  }
+
+  async _validatePreparedObsPayloads(obsManifest, signal = null) {
+    for (const field of obsManifest.fields) {
+      throwIfPreparedAborted(signal);
+      if (field.kind === 'continuous') {
+        const filename = validatePreparedPath(
+          field.valuesPath,
+          `Observation values for "${field.key}"`,
+          this.type
+        );
+        const dtypeBytes = preparedDtypeBytes(
+          field.valuesDtype,
+          `Observation values for "${field.key}"`,
+          this.type
+        );
+        const expectedBytes = checkedPreparedBytes(
+          obsManifest.n_points,
+          dtypeBytes,
+          filename,
+          this.type
+        );
+        await this._validatePreparedFileLength(
+          filename,
+          expectedBytes,
+          {
+            dtype: field.valuesDtype,
+            signal,
+          }
+        );
+      } else {
+        if (!Array.isArray(field.categories)) {
+          throw preparedDataError(
+            `Invalid obs_manifest.json: categorical field "${field.key}" is missing categories`,
+            this.type
+          );
+        }
+        if (field.categories.length > 65_535) {
+          throw preparedDataError(
+            `Invalid obs_manifest.json: categorical field "${field.key}" exceeds 65,535 categories`,
+            this.type
+          );
+        }
+        const seenCategories = new Set();
+        for (const category of field.categories) {
+          if (
+            category === null ||
+            category === undefined ||
+            (typeof category !== 'string' &&
+              typeof category !== 'boolean' &&
+              typeof category !== 'number') ||
+            (typeof category === 'number' && !Number.isFinite(category)) ||
+            seenCategories.has(category)
+          ) {
+            throw preparedDataError(
+              `Invalid obs_manifest.json: categorical field "${field.key}" has missing, duplicate, or unsupported categories`,
+              this.type
+            );
+          }
+          seenCategories.add(category);
+        }
+        const filename = validatePreparedPath(
+          field.codesPath,
+          `Observation codes for "${field.key}"`,
+          this.type
+        );
+        const codesDtype = field.codesDtype;
+        if (codesDtype !== 'uint8' && codesDtype !== 'uint16') {
+          throw preparedDataError(
+            `Observation codes for "${field.key}" must use uint8 or uint16`,
+            this.type
+          );
+        }
+        const dtypeBytes = preparedDtypeBytes(
+          codesDtype,
+          `Observation codes for "${field.key}"`,
+          this.type
+        );
+        const expectedBytes = checkedPreparedBytes(
+          obsManifest.n_points,
+          dtypeBytes,
+          filename,
+          this.type
+        );
+        const defaultMissing = codesDtype === 'uint8' ? 255 : 65_535;
+        const missingValue = field.codesMissingValue;
+        if (
+          !Number.isInteger(missingValue) ||
+          missingValue < 0 ||
+          missingValue > defaultMissing ||
+          field.categories.length > missingValue
+        ) {
+          throw preparedDataError(
+            `Invalid obs_manifest.json: categorical field "${field.key}" has an invalid missing-code contract`,
+            this.type
+          );
+        }
+        await this._validatePreparedFileLength(
+          filename,
+          expectedBytes,
+          {
+            dtype: codesDtype,
+            signal,
+            validateValue: (value, index) => {
+              if (
+                value !== missingValue &&
+                value >= field.categories.length
+              ) {
+                throw preparedDataError(
+                  `${filename}: categorical code ${value} at cell ${index} exceeds ${field.categories.length} categories`,
+                  this.type,
+                  { filename, index, value }
+                );
+              }
+            },
+          }
+        );
+      }
+
+      if (field.outlierQuantilesPath) {
+        const filename = validatePreparedPath(
+          field.outlierQuantilesPath,
+          `Observation outliers for "${field.key}"`,
+          this.type
+        );
+        const dtypeBytes = preparedDtypeBytes(
+          field.outlierDtype,
+          `Observation outliers for "${field.key}"`,
+          this.type
+        );
+        const expectedBytes = checkedPreparedBytes(
+          obsManifest.n_points,
+          dtypeBytes,
+          filename,
+          this.type
+        );
+        await this._validatePreparedFileLength(
+          filename,
+          expectedBytes,
+          {
+            dtype: field.outlierDtype,
+            signal,
+          }
+        );
+      }
+    }
+  }
+
+  async _validatePreparedVarPayloads(identity, signal = null) {
+    this._preparedLazyValidationPlans.clear();
+    const stats = identity.stats;
+    const hasManifest = this._fileExists('var_manifest.json');
+    const advertisedGenes = stats.n_genes;
+    if (!hasManifest) {
+      if (advertisedGenes > 0) {
+        throw preparedDataError(
+          'dataset_identity.json advertises genes but var_manifest.json is missing',
+          this.type
+        );
+      }
+      return null;
+    }
+
+    const rawManifest = await this._readRequiredJson(
+      'var_manifest.json',
+      signal
+    );
+    let manifest;
+    try {
+      manifest = expandVarManifest(rawManifest);
+    } catch (cause) {
+      throw preparedDataError(
+        `Invalid var_manifest.json: ${cause?.message || cause}`,
+        this.type,
+        { cause }
+      );
+    }
+    if (
+      !isPlainObject(manifest) ||
+      !Number.isSafeInteger(manifest.n_points) ||
+      manifest.n_points !== identity.stats.n_cells ||
+      !Array.isArray(manifest.fields)
+    ) {
+      throw preparedDataError(
+        'Invalid var_manifest.json: n_points must match the dataset and fields must be an array',
+        this.type
+      );
+    }
+    if (
+      manifest.compression !== identity.export_settings.compression ||
+      manifest.quantization !==
+        identity.export_settings.var_quantization
+    ) {
+      throw preparedDataError(
+        'var_manifest.json compression and quantization must exactly ' +
+        'match dataset_identity.json export_settings.',
+        this.type
+      );
+    }
+
+    const seenKeys = new Set();
+    const seenPaths = new Set();
+    const plans = [];
+    let totalExpectedBytes = 0n;
+    for (const field of manifest.fields) {
+      throwIfPreparedAborted(signal);
+      if (
+        !isPlainObject(field) ||
+        typeof field.key !== 'string' ||
+        field.key.length === 0 ||
+        seenKeys.has(field.key) ||
+        field.kind !== 'continuous'
+      ) {
+        throw preparedDataError(
+          'Invalid var_manifest.json: gene fields require unique non-empty keys and continuous kind',
+          this.type
+        );
+      }
+      seenKeys.add(field.key);
+      const filename = validatePreparedPath(
+        field.valuesPath,
+        `Gene values for "${field.key}"`,
+        this.type
+      );
+      validatePreparedPathCompression(
+        filename,
+        identity.export_settings.compression,
+        `Gene values for "${field.key}"`,
+        this.type
+      );
+      if (seenPaths.has(filename)) {
+        throw preparedDataError(
+          `Invalid var_manifest.json: multiple genes map to "${filename}"`,
+          this.type
+        );
+      }
+      seenPaths.add(filename);
+      const dtype = field.valuesDtype;
+      const dtypeBytes = preparedDtypeBytes(
+        dtype,
+        `Gene values for "${field.key}"`,
+        this.type
+      );
+      if (
+        field.quantized &&
+        (
+          (dtype !== 'uint8' && dtype !== 'uint16') ||
+          !Number.isFinite(field.minValue) ||
+          !Number.isFinite(field.maxValue) ||
+          field.minValue > field.maxValue
+        )
+      ) {
+        throw preparedDataError(
+          `Invalid var_manifest.json: gene "${field.key}" has an invalid quantization contract`,
+          this.type
+        );
+      }
+      const expectedBytes = checkedPreparedBytes(
+        manifest.n_points,
+        dtypeBytes,
+        filename,
+        this.type
+      );
+      totalExpectedBytes += BigInt(expectedBytes);
+      plans.push({ dtype, expectedBytes, filename });
+    }
+
+    if (advertisedGenes !== plans.length) {
+      throw preparedDataError(
+        `dataset_identity.json stats.n_genes (${advertisedGenes}) does not match var_manifest.json (${plans.length})`,
+        this.type,
+        { advertisedGenes, actualGenes: plans.length }
+      );
+    }
+    const eagerIntegrityScan =
+      plans.length <= MAX_EAGER_GENE_VALIDATION_FILES &&
+      totalExpectedBytes <= BigInt(MAX_EAGER_GENE_VALIDATION_BYTES);
+    if (eagerIntegrityScan) {
+      for (const plan of plans) {
+        await this._validatePreparedFileLength(
+          plan.filename,
+          plan.expectedBytes,
+          { dtype: plan.dtype, signal }
+        );
+      }
+    } else {
+      for (const plan of plans) {
+        throwIfPreparedAborted(signal);
+        this._validatePreparedFileEnvelope(
+          plan.filename,
+          plan.expectedBytes
+        );
+        this._preparedLazyValidationPlans.set(plan.filename, {
+          dtype: plan.dtype,
+          expectedBytes: plan.expectedBytes,
+        });
+      }
+    }
+    return manifest;
+  }
+
+  async _validatePreparedConnectivity(identity, signal = null) {
+    const stats = identity.stats;
+    const hasManifest = this._fileExists('connectivity_manifest.json');
+    const advertised = stats.has_connectivity;
+    if (
+      !Object.hasOwn(stats, 'has_connectivity') ||
+      typeof advertised !== 'boolean'
+    ) {
+      throw preparedDataError(
+        'dataset_identity.json stats.has_connectivity is required and must be boolean',
+        this.type
+      );
+    }
+    if (!Object.hasOwn(stats, 'n_edges')) {
+      throw preparedDataError(
+        'dataset_identity.json stats.n_edges is required',
+        this.type
+      );
+    }
+    if (advertised === false) {
+      if (stats.n_edges !== null) {
+        throw preparedDataError(
+          'dataset_identity.json stats.n_edges must be null when has_connectivity is false',
+          this.type
+        );
+      }
+      if (hasManifest) {
+        throw preparedDataError(
+          'dataset_identity.json connectivity summary contradicts connectivity_manifest.json',
+          this.type
+        );
+      }
+      return null;
+    }
+    if (!Number.isSafeInteger(stats.n_edges) || stats.n_edges < 0) {
+      throw preparedDataError(
+        'dataset_identity.json stats.n_edges must be a non-negative safe integer when has_connectivity is true',
+        this.type
+      );
+    }
+    if (!hasManifest) {
+      throw preparedDataError(
+        'dataset_identity.json advertises connectivity but connectivity_manifest.json is missing',
+        this.type
+      );
+    }
+
+    const rawManifest = await this._readRequiredJson(
+      'connectivity_manifest.json',
+      signal
+    );
+    let manifest;
+    try {
+      manifest = validateConnectivityManifest(
+        rawManifest,
+        CONNECTIVITY_MANIFEST_CONTEXT.FILE
+      );
+    } catch (cause) {
+      throw preparedDataError(
+        `Invalid connectivity_manifest.json: ${cause?.message || cause}`,
+        this.type,
+        { cause }
+      );
+    }
+    requirePreparedExactKeys(
+      manifest,
+      [
+        'format',
+        'n_cells',
+        'n_edges',
+        'max_neighbors',
+        'index_bytes',
+        'index_dtype',
+        'sourcesPath',
+        'destinationsPath',
+        'weightsPath',
+        'weight_bytes',
+        'weight_dtype',
+        'compression',
+      ],
+      [],
+      'connectivity_manifest.json',
+      this.type
+    );
+    if (
+      manifest.format !== 'edge_pairs' ||
+      !Number.isSafeInteger(manifest.n_cells) ||
+      manifest.n_cells !== identity.stats.n_cells ||
+      !Number.isSafeInteger(manifest.n_edges) ||
+      manifest.n_edges < 0
+    ) {
+      throw preparedDataError(
+        'Invalid connectivity_manifest.json: expected cell-aligned edge_pairs metadata',
+        this.type
+      );
+    }
+    if (manifest.n_cells > 0x1_0000_0000) {
+      throw preparedDataError(
+        'connectivity_manifest.json exceeds the browser uint32 cell-index limit',
+        this.type
+      );
+    }
+    const {
+      dtype: expectedDtype,
+      bytes: expectedWidth,
+    } = getConnectivityIndexStorage(manifest.n_cells);
+    if (
+      manifest.index_dtype !== expectedDtype ||
+      manifest.index_bytes !== expectedWidth
+    ) {
+      throw preparedDataError(
+        'Invalid connectivity_manifest.json: index_dtype and index_bytes ' +
+        'must use the smallest exact unsigned cell-index representation.',
+        this.type,
+        {
+          expectedDtype,
+          expectedWidth,
+          actualDtype: manifest.index_dtype,
+          actualWidth: manifest.index_bytes,
+        }
+      );
+    }
+    if (
+      manifest.weight_dtype !== 'float64' ||
+      manifest.weight_bytes !== Float64Array.BYTES_PER_ELEMENT
+    ) {
+      throw preparedDataError(
+        'Invalid connectivity_manifest.json: weight_dtype and weight_bytes ' +
+        'must use exact float64/8-byte edge weights.',
+        this.type
+      );
+    }
+    requirePreparedCompressionLevel(
+      manifest.compression,
+      'connectivity_manifest.json compression',
+      this.type
+    );
+    if (
+      manifest.compression !== identity.export_settings.compression
+    ) {
+      throw preparedDataError(
+        'connectivity_manifest.json compression must exactly match ' +
+        'dataset_identity.json export_settings.compression.',
+        this.type
+      );
+    }
+    if (
+      (
+        !Number.isSafeInteger(manifest.max_neighbors) ||
+        manifest.max_neighbors < 0 ||
+        manifest.max_neighbors >
+          Math.max(0, manifest.n_cells - 1)
+      )
+    ) {
+      throw preparedDataError(
+        'Invalid connectivity_manifest.json: max_neighbors is outside the cell axis',
+        this.type
+      );
+    }
+    const sourcesPath = validatePreparedPath(
+      manifest.sourcesPath,
+      'Connectivity sources',
+      this.type
+    );
+    const destinationsPath = validatePreparedPath(
+      manifest.destinationsPath,
+      'Connectivity destinations',
+      this.type
+    );
+    const weightsPath = validatePreparedPath(
+      manifest.weightsPath,
+      'Connectivity weights',
+      this.type
+    );
+    validatePreparedPathCompression(
+      sourcesPath,
+      manifest.compression,
+      'Connectivity sources',
+      this.type
+    );
+    validatePreparedPathCompression(
+      destinationsPath,
+      manifest.compression,
+      'Connectivity destinations',
+      this.type
+    );
+    validatePreparedPathCompression(
+      weightsPath,
+      manifest.compression,
+      'Connectivity weights',
+      this.type
+    );
+    if (
+      new Set([sourcesPath, destinationsPath, weightsPath]).size !== 3
+    ) {
+      throw preparedDataError(
+        'Invalid connectivity_manifest.json: source, destination, and weight paths must differ',
+        this.type
+      );
+    }
+    const expectedBytes = checkedPreparedBytes(
+      manifest.n_edges,
+      expectedWidth,
+      'Connectivity edge arrays',
+      this.type
+    );
+    const expectedWeightBytes = checkedPreparedBytes(
+      manifest.n_edges,
+      Float64Array.BYTES_PER_ELEMENT,
+      'Connectivity weight array',
+      this.type
+    );
+    const normalizedIndexBytes = checkedPreparedBytes(
+      manifest.n_edges,
+      Uint32Array.BYTES_PER_ELEMENT,
+      'Connectivity normalized edge arrays',
+      this.type
+    );
+    const degreeBytes = checkedPreparedBytes(
+      manifest.n_cells,
+      Uint32Array.BYTES_PER_ELEMENT,
+      'Connectivity degree summary',
+      this.type
+    );
+    checkedPreparedWorkingSet(
+      [
+        expectedBytes,
+        expectedBytes,
+        normalizedIndexBytes,
+        normalizedIndexBytes,
+        normalizedIndexBytes,
+        normalizedIndexBytes,
+        expectedWeightBytes,
+        degreeBytes,
+      ],
+      'Connectivity edge arrays',
+      this.type
+    );
+    if (stats.n_edges !== manifest.n_edges) {
+      throw preparedDataError(
+        `dataset_identity.json stats.n_edges (${stats.n_edges}) does not match connectivity_manifest.json (${manifest.n_edges})`,
+        this.type,
+        {
+          advertisedEdges: stats.n_edges,
+          actualEdges: manifest.n_edges,
+        }
+      );
+    }
+
+    const sources = new Uint32Array(manifest.n_edges);
+    const destinations = new Uint32Array(manifest.n_edges);
+    const captureIndex = (target, streamLabel) => (value, index) => {
+      const inBounds = typeof value === 'bigint'
+        ? value < BigInt(manifest.n_cells)
+        : value < manifest.n_cells;
+      if (!inBounds) {
+        throw preparedDataError(
+          `Connectivity index ${String(value)} at edge ${index} exceeds the cell axis`,
+          this.type
+        );
+      }
+      const numericValue = Number(value);
+      if (!Number.isSafeInteger(numericValue) || numericValue < 0) {
+        throw preparedDataError(
+          `${streamLabel} index ${String(value)} at edge ${index} is invalid`,
+          this.type
+        );
+      }
+      target[index] = numericValue;
+    };
+    await this._validatePreparedFileLength(
+      sourcesPath,
+      expectedBytes,
+      {
+        dtype: expectedDtype,
+        signal,
+        validateValue: captureIndex(sources, 'Connectivity source'),
+      }
+    );
+    await this._validatePreparedFileLength(
+      destinationsPath,
+      expectedBytes,
+      {
+        dtype: expectedDtype,
+        signal,
+        validateValue: captureIndex(
+          destinations,
+          'Connectivity destination'
+        ),
+      }
+    );
+    await this._validatePreparedFileLength(
+      weightsPath,
+      expectedWeightBytes,
+      {
+        dtype: 'float64',
+        signal,
+        validateValue: (value, index) => {
+          if (!Number.isFinite(value) || !(value > 0)) {
+            throw preparedDataError(
+              `Connectivity weight ${String(value)} at edge ${index} must be finite and strictly positive`,
+              this.type,
+              { index, value }
+            );
+          }
+        },
+      }
+    );
+
+    const degrees = new Uint32Array(manifest.n_cells);
+    let actualMaxNeighbors = 0;
+    let previousSource = -1;
+    let previousDestination = -1;
+    for (let index = 0; index < manifest.n_edges; index++) {
+      const source = sources[index];
+      const destination = destinations[index];
+      if (source >= destination) {
+        throw preparedDataError(
+          `Connectivity edge ${index} must satisfy source < destination.`,
+          this.type,
+          { index, source, destination }
+        );
+      }
+      if (
+        index > 0 &&
+        (
+          source < previousSource ||
+          (
+            source === previousSource &&
+            destination <= previousDestination
+          )
+        )
+      ) {
+        throw preparedDataError(
+          'Connectivity edges must be unique and strictly ordered by ' +
+          'source, then destination.',
+          this.type,
+          { index, source, destination }
+        );
+      }
+      previousSource = source;
+      previousDestination = destination;
+      const sourceDegree = ++degrees[source];
+      const destinationDegree = ++degrees[destination];
+      actualMaxNeighbors = Math.max(
+        actualMaxNeighbors,
+        sourceDegree,
+        destinationDegree
+      );
+    }
+    if (manifest.max_neighbors !== actualMaxNeighbors) {
+      throw preparedDataError(
+        `connectivity_manifest.json max_neighbors (${manifest.max_neighbors}) ` +
+        `does not match the edge payload (${actualMaxNeighbors}).`,
+        this.type,
+        {
+          advertisedMaxNeighbors: manifest.max_neighbors,
+          actualMaxNeighbors,
+        }
+      );
+    }
+    return manifest;
+  }
+
+  async _validatePreparedVectorFields(identity, signal = null) {
+    const metadata = identity.vector_fields;
+    if (metadata == null) return null;
+    requirePreparedExactKeys(
+      metadata,
+      ['default_field', 'fields'],
+      [],
+      'dataset_identity.json vector_fields',
+      this.type
+    );
+    if (
+      !isPlainObject(metadata.fields) ||
+      Object.keys(metadata.fields).length === 0 ||
+      typeof metadata.default_field !== 'string' ||
+      metadata.default_field.length === 0 ||
+      !Object.hasOwn(metadata.fields, metadata.default_field)
+    ) {
+      throw preparedDataError(
+        'dataset_identity.json vector_fields must declare fields and one exact default_field',
+        this.type
+      );
+    }
+
+    for (const [fieldId, field] of Object.entries(metadata.fields)) {
+      throwIfPreparedAborted(signal);
+      const isUmap = fieldId.endsWith('_umap');
+      requirePreparedExactKeys(
+        field,
+        [
+          'label',
+          'available_dimensions',
+          'default_dimension',
+          'files',
+          ...(isUmap ? ['basis'] : []),
+        ],
+        [],
+        `dataset_identity.json vector field "${fieldId}"`,
+        this.type
+      );
+      if (
+        !/^[A-Za-z0-9-](?:[A-Za-z0-9._-]*[A-Za-z0-9-])?$/.test(
+          fieldId
+        ) ||
+        field.label !== fieldId ||
+        !Array.isArray(field.available_dimensions) ||
+        !isPlainObject(field.files) ||
+        (isUmap && field.basis !== 'umap')
+      ) {
+        throw preparedDataError(
+          `Invalid vector field "${fieldId}" portable id, label, or basis ` +
+          'in dataset_identity.json.',
+          this.type
+        );
+      }
+      const dimensions = [];
+      const seen = new Set();
+      for (const dimension of field.available_dimensions) {
+        if (
+          !Number.isSafeInteger(dimension) ||
+          !PREPARED_DIMENSIONS.has(dimension) ||
+          seen.has(dimension) ||
+          !identity.embeddings.available_dimensions.includes(dimension)
+        ) {
+          throw preparedDataError(
+            `Invalid vector field "${fieldId}" dimensions`,
+            this.type
+          );
+        }
+        seen.add(dimension);
+        dimensions.push(dimension);
+      }
+      if (
+        dimensions.length === 0 ||
+        dimensions.some(
+          (dimension, index) =>
+            index > 0 && dimension <= dimensions[index - 1]
+        ) ||
+        field.default_dimension !== dimensions.at(-1)
+      ) {
+        throw preparedDataError(
+          `Invalid vector field "${fieldId}" ordered dimensions or default dimension`,
+          this.type
+        );
+      }
+      const expectedFileKeys =
+        dimensions.map(dimension => `${dimension}d`);
+      const actualFileKeys = Object.keys(field.files);
+      if (
+        actualFileKeys.length !== expectedFileKeys.length ||
+        actualFileKeys.some(key => !expectedFileKeys.includes(key))
+      ) {
+        throw preparedDataError(
+          `Vector field "${fieldId}" files must contain exactly one path per advertised dimension.`,
+          this.type,
+          { expectedFileKeys, actualFileKeys }
+        );
+      }
+      for (const dimension of dimensions) {
+        const filename = validatePreparedPath(
+          field.files[`${dimension}d`],
+          `Vector field "${fieldId}" ${dimension}D`,
+          this.type
+        );
+        const expectedFilename =
+          `vectors/${fieldId}_${dimension}d.bin` +
+          (identity.export_settings.compression === null ? '' : '.gz');
+        if (filename !== expectedFilename) {
+          throw preparedDataError(
+            `Vector field "${fieldId}" ${dimension}D must use exact ` +
+            `producer path "${expectedFilename}".`,
+            this.type,
+            { filename, expectedFilename }
+          );
+        }
+        validatePreparedPathCompression(
+          filename,
+          identity.export_settings.compression,
+          `Vector field "${fieldId}" ${dimension}D`,
+          this.type
+        );
+        const expectedBytes = checkedPreparedBytes(
+          identity.stats.n_cells,
+          dimension * FLOAT32_BYTES,
+          filename,
+          this.type
+        );
+        const paddedPositionBytes = checkedPreparedBytes(
+          identity.stats.n_cells,
+          3 * FLOAT32_BYTES,
+          `${fieldId} position cache`,
+          this.type
+        );
+        checkedPreparedWorkingSet(
+          [expectedBytes, paddedPositionBytes],
+          `Vector field "${fieldId}" ${dimension}D`,
+          this.type
+        );
+        await this._validatePreparedFileLength(
+          filename,
+          expectedBytes,
+          {
+            dtype: 'float32',
+            signal,
+            validateValue: (value, index) => {
+              if (!Number.isFinite(value)) {
+                throw preparedDataError(
+                  `${filename}: vector component ${index} is not finite`,
+                  this.type
+                );
+              }
+            },
+          }
+        );
+      }
+    }
+    return metadata;
+  }
+
+  _validatePreparedIdentitySummaries(
+    identity,
+    obsManifest,
+    varManifest,
+    connectivityManifest
+  ) {
+    const derivedObs = obsManifest.fields.map(field => ({
+      key: field.key,
+      kind: field.kind,
+      ...(field.kind === 'category'
+        ? { n_categories: field.categories.length }
+        : {}),
+    }));
+    if (
+      identity.obs_fields.length !== derivedObs.length ||
+      identity.obs_fields.some((summary, index) => {
+        const actual = derivedObs[index];
+        return (
+          summary.key !== actual.key ||
+          summary.kind !== actual.kind ||
+          (
+            summary.kind === 'category' &&
+            summary.n_categories !== actual.n_categories
+          )
+        );
+      })
+    ) {
+      throw preparedDataError(
+        'dataset_identity.json obs_fields must exactly match obs_manifest.json in order and content.',
+        this.type
+      );
+    }
+
+    const actualGeneCount = varManifest?.fields.length ?? 0;
+    if (identity.stats.n_genes !== actualGeneCount) {
+      throw preparedDataError(
+        'dataset_identity.json stats.n_genes must exactly match var_manifest.json.',
+        this.type
+      );
+    }
+    const actualConnectivity = connectivityManifest !== null;
+    if (
+      identity.stats.has_connectivity !== actualConnectivity ||
+      (
+        actualConnectivity &&
+        identity.stats.n_edges !== connectivityManifest.n_edges
+      )
+    ) {
+      throw preparedDataError(
+        'dataset_identity.json connectivity stats must exactly match connectivity_manifest.json.',
+        this.type
+      );
+    }
+
+    return {
+      obsFields: identity.obs_fields,
+      stats: identity.stats,
+    };
   }
 
   /**
    * Load dataset metadata
-   * @param {string} pointsFile - Name of the points file (e.g., 'points_3d.bin' or 'points_2d.bin.gz')
    * @private
    */
-  async _loadMetadata(pointsFile) {
-    // Try to load dataset_identity.json first
-    try {
-      const identity = await this._readFileAsJson(DATA_CONFIG.DATASET_IDENTITY_FILE);
-
-      // Validate schema version for compatibility
-      validateSchemaVersion(
-        identity.version,
-        DATA_CONFIG.SUPPORTED_IDENTITY_VERSIONS,
-        'dataset_identity.json'
+  async _loadMetadata({ signal = null } = {}) {
+    const identity = await this._readRequiredJson(
+      DATA_CONFIG.DATASET_IDENTITY_FILE,
+      signal
+    );
+    if (
+      !isPlainObject(identity) ||
+      !Object.hasOwn(identity, 'id') ||
+      typeof identity.id !== 'string' ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(identity.id) ||
+      identity.id.endsWith('.')
+    ) {
+      throw preparedDataError(
+        'Invalid dataset_identity.json: id is required and must be a portable identifier using letters, numbers, dot, underscore, or hyphen.',
+        this.type
       );
+    }
+    validateDatasetIdentity(identity, identity.id, this.type);
+    validatePreparedIdentityExportContract(identity, this.type);
+    const applicationDatasetId = `local-user:${identity.id}`;
 
-      this._metadata = {
-        id: this.datasetId,
-        name: identity.name || this.directoryPath,
-        description: identity.description || '',
-        created_at: identity.created_at,
-        cellucid_data_version: identity.cellucid_data_version,
-        stats: identity.stats || { n_cells: 0 },
-        obs_fields: identity.obs_fields || [],
-        export_settings: identity.export_settings || {},
-        source: identity.source || {},
-        pointsFile // Store which points file variant exists
-      };
-      console.log('[LocalUserDirDataSource] Loaded metadata from dataset_identity.json');
-      return;
-    } catch (_err) {
-      console.log('[LocalUserDirDataSource] No dataset_identity.json, constructing from manifests');
+    const rawObsManifest = await this._readRequiredJson(
+      'obs_manifest.json',
+      signal
+    );
+    const obsManifest = validatePreparedObsManifest(
+      rawObsManifest,
+      identity,
+      this.type
+    );
+    const embeddingPlan = getPreparedEmbeddingPlans(identity, this.type);
+    for (const plan of embeddingPlan.plans) {
+      checkedPreparedWorkingSet(
+        plan.dimension === 3
+          ? [plan.expectedBytes]
+          : [plan.expectedBytes, plan.paddedBytes],
+        `${plan.filename} embedding`,
+        this.type
+      );
     }
 
-    // Fallback: construct from obs_manifest.json
-    const rawObsManifest = await this._readFileAsJson('obs_manifest.json');
-    // Expand compact manifest format to verbose format with fields array
-    const obsManifest = expandObsManifest(rawObsManifest);
-
-    // Try to get gene count from var_manifest
-    let n_genes = 0;
-    try {
-      const rawVarManifest = await this._readFileAsJson('var_manifest.json');
-      const varManifest = expandVarManifest(rawVarManifest);
-      n_genes = varManifest.fields?.length || 0;
-    } catch (_) {
-      // No var manifest
+    const missingEmbeddingFiles = embeddingPlan.plans
+      .map(plan => plan.filename)
+      .filter(filename => !this._fileExists(filename));
+    if (missingEmbeddingFiles.length > 0) {
+      throw preparedDataError(
+        `Invalid dataset: missing required embedding files: ${missingEmbeddingFiles.join(', ')}`,
+        this.type,
+        { missing: missingEmbeddingFiles }
+      );
     }
 
-    // Check for connectivity
-    let has_connectivity = false;
-    let n_edges = 0;
-    try {
-      const connManifest = await this._readFileAsJson('connectivity_manifest.json');
-      has_connectivity = true;
-      n_edges = connManifest.n_edges || 0;
-    } catch (_) {
-      // No connectivity
-    }
-
-    // Count field types from expanded manifest
-    const fields = obsManifest.fields || [];
-    const categoricalCount = fields.filter(f => f.kind === 'category').length;
-    const continuousCount = fields.filter(f => f.kind === 'continuous').length;
-
-    this._metadata = {
-      id: this.datasetId,
-      name: this.directoryPath,
-      description: 'User-provided dataset',
-      stats: {
-        n_cells: obsManifest.n_points || 0,
-        n_genes,
-        n_obs_fields: fields.length,
-        n_categorical_fields: categoricalCount,
-        n_continuous_fields: continuousCount,
-        has_connectivity,
-        n_edges
+    const varManifest = await this._validatePreparedVarPayloads(
+      identity,
+      signal
+    );
+    const connectivityManifest =
+      await this._validatePreparedConnectivity(identity, signal);
+    const vectorFields = await this._validatePreparedVectorFields(
+      identity,
+      signal
+    );
+    validatePreparedPayloadPathUniqueness(
+      {
+        embeddingPlan,
+        obsManifest,
+        varManifest,
+        connectivityManifest,
+        vectorFields,
       },
-      obs_fields: fields.map(f => ({
-        key: f.key,
-        kind: f.kind,
-        n_categories: f.categories?.length
-      })),
-      export_settings: {
-        compression: obsManifest.compression,
-        obs_continuous_quantization: obsManifest._obsSchemas?.continuous?.quantizationBits || null
-      },
-      pointsFile // Store which points file variant exists
+      this.type
+    );
+    const summaries = this._validatePreparedIdentitySummaries(
+      identity,
+      obsManifest,
+      varManifest,
+      connectivityManifest
+    );
+
+    await this._validatePreparedObsPayloads(obsManifest, signal);
+    for (const plan of embeddingPlan.plans) {
+      await this._validatePreparedFileLength(
+        plan.filename,
+        plan.expectedBytes,
+        {
+          dtype: 'float32',
+          signal,
+          validateValue: (value, index) => {
+            if (!Number.isFinite(value)) {
+              throw preparedDataError(
+                `${plan.filename}: position ${index} is not a finite Float32 value`,
+                this.type
+              );
+            }
+          },
+        }
+      );
+    }
+    throwIfPreparedAborted(signal);
+
+    const candidateMetadata = {
+      ...identity,
+      id: applicationDatasetId,
+      stats: summaries.stats,
+      embeddings: identity.embeddings,
+      obs_fields: summaries.obsFields,
+      ...(vectorFields ? { vector_fields: vectorFields } : {}),
     };
+    validateDatasetIdentity(
+      candidateMetadata,
+      applicationDatasetId,
+      this.type
+    );
+    this.datasetId = applicationDatasetId;
+    this._identityId = identity.id;
+    this._metadata = candidateMetadata;
+    console.log('[LocalUserDirDataSource] Validated prepared dataset before adoption');
   }
 
   /**
@@ -456,8 +2628,15 @@ export class LocalUserDirDataSource {
         this.type
       );
     }
-    // Validate datasetId if provided (future-proofing for multi-directory support)
-    if (datasetId && datasetId !== this.datasetId) {
+    if (typeof datasetId !== 'string' || datasetId.length === 0) {
+      throw new DataSourceError(
+        'An exact current dataset id is required.',
+        DataSourceErrorCode.NOT_FOUND,
+        this.type,
+        { requestedId: datasetId, currentId: this.datasetId }
+      );
+    }
+    if (datasetId !== this.datasetId) {
       throw new DataSourceError(
         `Dataset '${datasetId}' not found. Current dataset is '${this.datasetId}'.`,
         DataSourceErrorCode.NOT_FOUND,
@@ -466,6 +2645,33 @@ export class LocalUserDirDataSource {
       );
     }
     return this._metadata;
+  }
+
+  /**
+   * Return the exact dataset_identity.json id for the current adopted dataset.
+   * @param {string} datasetId - Exact application-facing dataset id
+   * @returns {string}
+   */
+  getIdentityId(datasetId) {
+    if (
+      typeof datasetId !== 'string' ||
+      datasetId.length === 0 ||
+      datasetId !== this.datasetId ||
+      typeof this._identityId !== 'string' ||
+      this._identityId.length === 0
+    ) {
+      throw new DataSourceError(
+        'An exact adopted dataset identity id is required.',
+        DataSourceErrorCode.NOT_FOUND,
+        this.type,
+        {
+          requestedId: datasetId,
+          currentId: this.datasetId,
+          identityId: this._identityId,
+        }
+      );
+    }
+    return this._identityId;
   }
 
   /**
@@ -481,9 +2687,18 @@ export class LocalUserDirDataSource {
   /**
    * Get an object URL for a file (for use with fetch)
    * @param {string} filename - Filename
+   * @param {AbortSignal|null} signal - Exact request owner
    * @returns {Promise<string>}
    */
-  async getFileUrl(filename) {
+  async getFileUrl(filename, signal) {
+    validateAbortSignalOrNull(signal, 'Prepared file URL resolution signal');
+    throwIfMetadataAborted(signal, 'Prepared file URL resolution');
+    const adoptionEpoch = this._adoptionEpoch;
+    await this._validatePreparedFileOnDemand(filename, signal);
+    throwIfMetadataAborted(signal, 'Prepared file URL resolution');
+    if (adoptionEpoch !== this._adoptionEpoch) {
+      throw this._createSupersededSelectionError();
+    }
     if (this._objectUrls.has(filename)) {
       return this._objectUrls.get(filename);
     }
@@ -499,10 +2714,23 @@ export class LocalUserDirDataSource {
    * Get the base URL for loading a dataset's files
    * For local user directories, this returns a special protocol identifier
    * that the data loaders need to handle specially.
-   * @param {string} [_datasetId] - Dataset identifier (unused, kept for interface consistency)
+   * @param {string} datasetId - Exact adopted dataset identifier
    * @returns {string}
    */
-  getBaseUrl(_datasetId) {
+  getBaseUrl(datasetId) {
+    if (
+      typeof datasetId !== 'string' ||
+      datasetId.length === 0 ||
+      datasetId !== this.datasetId
+    ) {
+      throw new DataSourceError(
+        `Dataset '${String(datasetId)}' not found. Current dataset is ` +
+        `'${this.datasetId}'.`,
+        DataSourceErrorCode.NOT_FOUND,
+        this.type,
+        { requestedId: datasetId, currentId: this.datasetId }
+      );
+    }
     // In h5ad mode, use h5ad:// protocol
     if (this._sourceMode === 'h5ad' && this._h5adSource) {
       return this._h5adSource.getBaseUrl(this.datasetId);
@@ -511,18 +2739,22 @@ export class LocalUserDirDataSource {
     if (this._sourceMode === 'zarr' && this._zarrSource) {
       return this._zarrSource.getBaseUrl(this.datasetId);
     }
-    // Return a special marker that data-loaders.js will recognize
-    // The actual file loading will use getFileUrl()
-    // Note: We use this.datasetId since local-user only supports one dataset at a time
-    return `local-user://${this.datasetId}/`;
+    // Keep the application dataset identity in an encoded path segment. It
+    // cannot be a URL host because exact local identities contain colons.
+    return (
+      `local-user://dataset/${encodeURIComponent(this.datasetId)}/`
+    );
   }
 
   /**
    * Resolve a local-user:// URL to a fetchable blob URL
    * @param {string} url - local-user:// URL
+   * @param {AbortSignal|null} signal - Exact request owner
    * @returns {Promise<string>} Blob URL for fetching
    */
-  async resolveUrl(url) {
+  async resolveUrl(url, signal) {
+    validateAbortSignalOrNull(signal, 'Local-user URL resolution signal');
+    throwIfMetadataAborted(signal, 'Local-user URL resolution');
     if (!isLocalUserUrl(url)) {
       throw new DataSourceError(
         `Not a local-user URL: ${url}`,
@@ -531,7 +2763,7 @@ export class LocalUserDirDataSource {
       );
     }
 
-    const parsed = parseLocalUserUrl(url);
+    const parsed = parsePreparedLocalUrl(url);
     if (!parsed) {
       throw new DataSourceError(
         `Invalid local-user URL format: ${url}`,
@@ -539,13 +2771,23 @@ export class LocalUserDirDataSource {
         this.type
       );
     }
+    if (parsed.datasetId !== this.datasetId) {
+      throw new DataSourceError(
+        `Local dataset URL belongs to "${parsed.datasetId}", but the ` +
+        `currently adopted dataset is "${this.datasetId}".`,
+        DataSourceErrorCode.NOT_FOUND,
+        this.type,
+        {
+          requestedDatasetId: parsed.datasetId,
+          currentDatasetId: this.datasetId,
+        }
+      );
+    }
 
-    return this.getFileUrl(parsed.filename);
+    const resolvedUrl = await this.getFileUrl(parsed.filename, signal);
+    throwIfMetadataAborted(signal, 'Local-user URL resolution');
+    return resolvedUrl;
   }
-
-  // Static URL helper methods are exported from data-source.js:
-  // - isLocalUserUrl(url)
-  // - parseLocalUserUrl(url)
 
   /**
    * Cleanup resources
@@ -557,6 +2799,8 @@ export class LocalUserDirDataSource {
       URL.revokeObjectURL(url);
     }
     this._objectUrls.clear();
+    this._preparedLazyValidationPlans.clear();
+    this._preparedLazyValidationPromises.clear();
 
     // Clean up h5ad source if present
     if (this._h5adSource) {
@@ -574,6 +2818,7 @@ export class LocalUserDirDataSource {
     this.datasetId = null;
     this.directoryPath = null;
     this._metadata = null;
+    this._identityId = null;
     this._sourceMode = null;
   }
 
@@ -613,7 +2858,10 @@ export class LocalUserDirDataSource {
    * Clear the current directory selection
    */
   clear() {
+    // Explicit clearing also supersedes any candidate still loading.
+    this._beginSelection();
     this._cleanup();
+    this._adoptionEpoch += 1;
   }
 
   /**

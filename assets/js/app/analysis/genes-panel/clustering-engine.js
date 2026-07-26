@@ -93,8 +93,8 @@ export class ClusteringEngine {
       signal
     } = options;
 
-    if (!matrix || !matrix.values) {
-      throw new Error('[ClusteringEngine] matrix with values is required');
+    if (!matrix || (!Array.isArray(matrix.values) && !ArrayBuffer.isView(matrix.values))) {
+      throw new TypeError('[ClusteringEngine] matrix with numeric values is required');
     }
 
     const throwIfAborted = () => {
@@ -104,33 +104,48 @@ export class ClusteringEngine {
     };
 
     const { values, nRows, nCols } = matrix;
+    if (!Number.isSafeInteger(nRows) || nRows < 1 || !Number.isSafeInteger(nCols) || nCols < 1) {
+      throw new RangeError('[ClusteringEngine] matrix dimensions must be positive integers');
+    }
+    if (values.length !== nRows * nCols) {
+      throw new RangeError('[ClusteringEngine] matrix value count must equal nRows × nCols');
+    }
+    for (let index = 0; index < values.length; index++) {
+      if (!isFiniteNumber(values[index])) {
+        throw new TypeError(`[ClusteringEngine] matrix value ${index} must be finite`);
+      }
+    }
+    if (typeof clusterRows !== 'boolean' || typeof clusterCols !== 'boolean') {
+      throw new TypeError('[ClusteringEngine] clusterRows and clusterCols must be booleans');
+    }
+    if (!['correlation', 'euclidean', 'cosine'].includes(distance)) {
+      throw new RangeError(`[ClusteringEngine] unknown distance metric: ${String(distance)}`);
+    }
+    if (!['average', 'complete', 'single'].includes(linkage)) {
+      throw new RangeError(`[ClusteringEngine] unknown linkage method: ${String(linkage)}`);
+    }
+    if (onProgress !== undefined && typeof onProgress !== 'function') {
+      throw new TypeError('[ClusteringEngine] onProgress must be a function');
+    }
     let rowOrder = Array.from({ length: nRows }, (_, i) => i);
     let colOrder = Array.from({ length: nCols }, (_, i) => i);
     let rowDendrogram = null;
     let colDendrogram = null;
 
-    // Safety guard: hierarchical clustering is O(n^2) memory/time.
-    // Avoid locking up the UI on large matrices; the heatmap is still useful unclustered.
+    // Hierarchical clustering is O(n²) in memory and time.
     const MAX_CLUSTER_DIM = 500;
-    const doClusterRows = clusterRows && nRows > 1 && nRows <= MAX_CLUSTER_DIM;
-    const doClusterCols = clusterCols && nCols > 1 && nCols <= MAX_CLUSTER_DIM;
-
-    if (onProgress) {
-      if (clusterRows && !doClusterRows) {
-        onProgress({
-          phase: ANALYSIS_PHASES.CLUSTERING,
-          progress: 0,
-          message: `Row clustering skipped (rows=${nRows}, max=${MAX_CLUSTER_DIM})`
-        });
-      }
-      if (clusterCols && !doClusterCols) {
-        onProgress({
-          phase: ANALYSIS_PHASES.CLUSTERING,
-          progress: 0,
-          message: `Column clustering skipped (cols=${nCols}, max=${MAX_CLUSTER_DIM})`
-        });
-      }
+    if (clusterRows && nRows > MAX_CLUSTER_DIM) {
+      throw new RangeError(
+        `[ClusteringEngine] row clustering requested for ${nRows} rows; maximum is ${MAX_CLUSTER_DIM}`
+      );
     }
+    if (clusterCols && nCols > MAX_CLUSTER_DIM) {
+      throw new RangeError(
+        `[ClusteringEngine] column clustering requested for ${nCols} columns; maximum is ${MAX_CLUSTER_DIM}`
+      );
+    }
+    const doClusterRows = clusterRows && nRows > 1;
+    const doClusterCols = clusterCols && nCols > 1;
 
     if (!doClusterRows && !doClusterCols) {
       return {
@@ -238,30 +253,36 @@ export class ClusteringEngine {
    */
   applyOrdering(matrix, clustering) {
     const { rowOrder, colOrder } = clustering;
+    const requirePermutation = (order, size, name) => {
+      if (
+        !Array.isArray(order) ||
+        order.length !== size ||
+        new Set(order).size !== size ||
+        order.some(index => !Number.isSafeInteger(index) || index < 0 || index >= size)
+      ) {
+        throw new TypeError(`[ClusteringEngine] ${name} must be an exact permutation`);
+      }
+    };
+    requirePermutation(rowOrder, matrix.nRows, 'rowOrder');
+    requirePermutation(colOrder, matrix.nCols, 'colOrder');
 
     // Reorder values
-    let reorderedValues = matrix.values;
+    let reorderedValues = reorderRows(matrix.values, matrix.nRows, matrix.nCols, rowOrder);
     let reorderedRaw = matrix.rawValues;
-
-    if (rowOrder && rowOrder.length === matrix.nRows) {
-      reorderedValues = reorderRows(reorderedValues, matrix.nRows, matrix.nCols, rowOrder);
-      if (reorderedRaw) {
-        reorderedRaw = reorderRows(reorderedRaw, matrix.nRows, matrix.nCols, rowOrder);
-      }
+    if (reorderedRaw !== undefined && reorderedRaw !== null) {
+      reorderedRaw = reorderRows(reorderedRaw, matrix.nRows, matrix.nCols, rowOrder);
     }
 
-    if (colOrder && colOrder.length === matrix.nCols) {
-      reorderedValues = reorderCols(reorderedValues, matrix.nRows, matrix.nCols, colOrder);
-      if (reorderedRaw) {
-        reorderedRaw = reorderCols(reorderedRaw, matrix.nRows, matrix.nCols, colOrder);
-      }
+    reorderedValues = reorderCols(reorderedValues, matrix.nRows, matrix.nCols, colOrder);
+    if (reorderedRaw !== undefined && reorderedRaw !== null) {
+      reorderedRaw = reorderCols(reorderedRaw, matrix.nRows, matrix.nCols, colOrder);
     }
 
     // Reorder metadata
-    const reorderedGenes = rowOrder ? rowOrder.map(i => matrix.genes[i]) : matrix.genes;
-    const reorderedGroupIds = colOrder ? colOrder.map(i => matrix.groupIds[i]) : matrix.groupIds;
-    const reorderedGroupNames = colOrder ? colOrder.map(i => matrix.groupNames[i]) : matrix.groupNames;
-    const reorderedGroupColors = colOrder ? colOrder.map(i => matrix.groupColors[i]) : matrix.groupColors;
+    const reorderedGenes = rowOrder.map(i => matrix.genes[i]);
+    const reorderedGroupIds = colOrder.map(i => matrix.groupIds[i]);
+    const reorderedGroupNames = colOrder.map(i => matrix.groupNames[i]);
+    const reorderedGroupColors = colOrder.map(i => matrix.groupColors[i]);
 
     return {
       ...matrix,
@@ -282,27 +303,24 @@ export class ClusteringEngine {
     return new Promise(resolve => setTimeout(resolve, 0));
   }
 
-  _finiteOrInf(v) {
-    return isFiniteNumber(v) ? v : Infinity;
-  }
-
   _linkageDistance(linkage, dIK, dJK, sizeI, sizeJ) {
-    const a = this._finiteOrInf(dIK);
-    const b = this._finiteOrInf(dJK);
+    if (!isFiniteNumber(dIK) || !isFiniteNumber(dJK)) {
+      throw new TypeError('[ClusteringEngine] linkage distances must be finite');
+    }
+    if (!Number.isSafeInteger(sizeI) || sizeI < 1 || !Number.isSafeInteger(sizeJ) || sizeJ < 1) {
+      throw new RangeError('[ClusteringEngine] linkage cluster sizes must be positive integers');
+    }
 
     if (linkage === 'single') {
-      return Math.min(a, b);
+      return Math.min(dIK, dJK);
     }
     if (linkage === 'complete') {
-      return Math.max(a, b);
+      return Math.max(dIK, dJK);
     }
-
-    // Average (UPGMA)
-    if (!Number.isFinite(a) && !Number.isFinite(b)) return Infinity;
-    if (!Number.isFinite(a)) return b;
-    if (!Number.isFinite(b)) return a;
-    const denom = (sizeI + sizeJ) || 1;
-    return (a * sizeI + b * sizeJ) / denom;
+    if (linkage !== 'average') {
+      throw new RangeError(`[ClusteringEngine] unknown linkage method: ${String(linkage)}`);
+    }
+    return (dIK * sizeI + dJK * sizeJ) / (sizeI + sizeJ);
   }
 
   /**
@@ -397,6 +415,15 @@ export class ClusteringEngine {
    * @private
    */
   async _hierarchicalCluster(distMatrix, n, linkage, options = {}) {
+    if (!Number.isSafeInteger(n) || n < 1) {
+      throw new RangeError('[ClusteringEngine] cluster size must be a positive integer');
+    }
+    if (
+      (!Array.isArray(distMatrix) && !ArrayBuffer.isView(distMatrix)) ||
+      distMatrix.length !== n * n
+    ) {
+      throw new RangeError('[ClusteringEngine] distance matrix must contain n × n values');
+    }
     if (n <= 1) {
       return {
         order: [0],
@@ -404,7 +431,7 @@ export class ClusteringEngine {
       };
     }
 
-    const { signal, onProgress, progressBase = 0, progressSpan = 100, label = 'items' } = options || {};
+    const { signal, onProgress, progressBase = 0, progressSpan = 100, label = 'items' } = options;
     const throwIfAborted = () => {
       if (signal?.aborted) {
         throw new DOMException('Request aborted', 'AbortError');
@@ -437,12 +464,16 @@ export class ClusteringEngine {
 
     const heap = this._createPairHeap();
 
-    // Initialize heap with all finite pair distances.
+    // Initialize heap with every pair distance.
     // For n<=500 this is safe and keeps clustering O(n^2 log n) without UI lock-ups.
     for (let i = 0; i < n; i++) {
       for (let j = i + 1; j < n; j++) {
         const d = dist[i * n + j];
-        if (!isFiniteNumber(d)) continue;
+        if (!isFiniteNumber(d)) {
+          throw new TypeError(
+            `[ClusteringEngine] distance between items ${i} and ${j} must be finite`
+          );
+        }
         heap.push(d, i, j, 0, 0);
       }
 
@@ -453,7 +484,7 @@ export class ClusteringEngine {
     }
 
     if (heap.size() === 0) {
-      return { order: Array.from({ length: n }, (_, i) => i), dendrogram: null };
+      throw new Error('[ClusteringEngine] distance heap is empty for a multi-item matrix');
     }
 
     let merges = 0;
@@ -472,7 +503,11 @@ export class ClusteringEngine {
         break;
       }
 
-      if (!entry) break;
+      if (!entry) {
+        throw new Error(
+          `[ClusteringEngine] no valid merge pair remains with ${activeCount} active clusters`
+        );
+      }
 
       const { dist: minDist } = entry;
       let i = entry.i;
@@ -486,8 +521,11 @@ export class ClusteringEngine {
       const newSize = sizeI + sizeJ;
 
       // Create dendrogram node and attach to the merge target (i).
-      const leftNode = nodes[nodeIdByCluster[i]] || { id: i, isLeaf: true, height: 0, left: null, right: null };
-      const rightNode = nodes[nodeIdByCluster[j]] || { id: j, isLeaf: true, height: 0, left: null, right: null };
+      const leftNode = nodes[nodeIdByCluster[i]];
+      const rightNode = nodes[nodeIdByCluster[j]];
+      if (!leftNode || !rightNode) {
+        throw new Error('[ClusteringEngine] dendrogram node ownership is incomplete');
+      }
       const newNode = { id: nextNodeId, isLeaf: false, height: minDist, left: leftNode, right: rightNode };
       nodes[nextNodeId] = newNode;
       nodeIdByCluster[i] = nextNodeId;
@@ -508,6 +546,9 @@ export class ClusteringEngine {
         const dIK = dist[i * n + k];
         const dJK = dist[j * n + k];
         const newDist = this._linkageDistance(linkage, dIK, dJK, sizeI, sizeJ);
+        if (!isFiniteNumber(newDist)) {
+          throw new TypeError('[ClusteringEngine] linkage produced a non-finite distance');
+        }
 
         dist[i * n + k] = newDist;
         dist[k * n + i] = newDist;
@@ -541,12 +582,20 @@ export class ClusteringEngine {
       if (active[i]) { rootIdx = i; break; }
     }
 
-    const rootNode = rootIdx >= 0 ? nodes[nodeIdByCluster[rootIdx]] : null;
-    const order = rootNode ? this._extractLeafOrder(rootNode) : Array.from({ length: n }, (_, i) => i);
-
-    // Ensure the order contains all leaves exactly once; otherwise fall back to identity.
-    if (order.length !== n) {
-      return { order: Array.from({ length: n }, (_, i) => i), dendrogram: rootNode };
+    if (rootIdx < 0 || activeCount !== 1) {
+      throw new Error('[ClusteringEngine] clustering did not produce exactly one root');
+    }
+    const rootNode = nodes[nodeIdByCluster[rootIdx]];
+    if (!rootNode) {
+      throw new Error('[ClusteringEngine] clustering root node is missing');
+    }
+    const order = this._extractLeafOrder(rootNode);
+    if (
+      order.length !== n ||
+      new Set(order).size !== n ||
+      order.some(index => !Number.isSafeInteger(index) || index < 0 || index >= n)
+    ) {
+      throw new Error('[ClusteringEngine] dendrogram leaf order is not an exact permutation');
     }
 
     return { order, dendrogram: rootNode };
@@ -560,8 +609,13 @@ export class ClusteringEngine {
    * @private
    */
   _extractLeafOrder(node) {
-    if (!node) return [];
+    if (!node || typeof node !== 'object') {
+      throw new TypeError('[ClusteringEngine] dendrogram node is required');
+    }
     if (node.isLeaf) return [node.id];
+    if (!node.left || !node.right) {
+      throw new TypeError('[ClusteringEngine] internal dendrogram nodes require left and right children');
+    }
 
     const leftOrder = this._extractLeafOrder(node.left);
     const rightOrder = this._extractLeafOrder(node.right);

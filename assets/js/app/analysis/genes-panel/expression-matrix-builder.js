@@ -18,6 +18,99 @@ import { zscoreRows, log1pTransform } from '../shared/matrix-utils.js';
 import { isFiniteNumber } from '../shared/number-utils.js';
 import { DEFAULTS, ANALYSIS_PHASES } from './constants.js';
 
+function encodeGroupName(groupName, groupId) {
+  if (typeof groupName === 'string') {
+    if (groupName.length === 0 || groupName.trim().length === 0) {
+      throw new TypeError(
+        `Expression group "${groupId}" name must not be empty`
+      );
+    }
+    return groupName;
+  }
+  if (typeof groupName === 'number') {
+    if (!Number.isFinite(groupName)) {
+      throw new TypeError(
+        `Expression group "${groupId}" numeric name must be finite`
+      );
+    }
+    return String(groupName);
+  }
+  if (typeof groupName === 'boolean') {
+    return String(groupName);
+  }
+  throw new TypeError(
+    `Expression group "${groupId}" name must be a string, finite number, or boolean`
+  );
+}
+
+function buildGroupMetadata(groups) {
+  if (!Array.isArray(groups) || groups.length === 0) {
+    throw new TypeError(
+      '[ExpressionMatrixBuilder] groups must be a non-empty array'
+    );
+  }
+
+  const groupIds = new Array(groups.length);
+  const groupNames = new Array(groups.length);
+  const groupColors = new Array(groups.length);
+  const seenIds = new Set();
+  const seenNames = new Set();
+
+  for (let index = 0; index < groups.length; index++) {
+    const group = groups[index];
+    if (
+      group === null ||
+      typeof group !== 'object' ||
+      Array.isArray(group)
+    ) {
+      throw new TypeError(
+        `Expression group ${index} must be an object`
+      );
+    }
+    const groupId = group.groupId;
+    if (
+      typeof groupId !== 'string' ||
+      groupId.length === 0 ||
+      groupId.trim().length === 0
+    ) {
+      throw new TypeError(
+        `Expression group ${index} must own a non-empty groupId`
+      );
+    }
+    if (seenIds.has(groupId)) {
+      throw new Error(
+        `Expression groups contain duplicate groupId "${groupId}"`
+      );
+    }
+    seenIds.add(groupId);
+
+    const groupName = encodeGroupName(group.groupName, groupId);
+    if (seenNames.has(groupName)) {
+      throw new Error(
+        `Expression groups encode to duplicate display name "${groupName}"`
+      );
+    }
+    seenNames.add(groupName);
+
+    const color = group.color;
+    if (
+      typeof color !== 'string' ||
+      color.length === 0 ||
+      color.trim().length === 0
+    ) {
+      throw new TypeError(
+        `Expression group "${groupId}" must own a non-empty color`
+      );
+    }
+
+    groupIds[index] = groupId;
+    groupNames[index] = groupName;
+    groupColors[index] = color;
+  }
+
+  return { groupIds, groupNames, groupColors };
+}
+
 // =============================================================================
 // EXPRESSION MATRIX BUILDER
 // =============================================================================
@@ -70,9 +163,9 @@ export class ExpressionMatrixBuilder {
    * @param {string[]} options.genes - Gene symbols (rows)
    * @param {Object[]} options.groups - Group specifications (columns)
    * @param {string} options.groups[].groupId - Unique group identifier
-   * @param {string} [options.groups[].groupName] - Display name
+   * @param {string|number|boolean} options.groups[].groupName - Exact display label
    * @param {number[]|Uint32Array} options.groups[].cellIndices - Cell indices
-   * @param {string} [options.groups[].color] - Group color
+   * @param {string} options.groups[].color - Group color owned by the category
    * @param {'none'|'zscore'|'log1p'} [options.transform='zscore'] - Transform to apply
    * @param {Function} [options.onProgress] - Progress callback
    * @param {AbortSignal} [options.signal] - AbortSignal for cancellation
@@ -91,9 +184,7 @@ export class ExpressionMatrixBuilder {
     if (!genes || genes.length === 0) {
       throw new Error('[ExpressionMatrixBuilder] genes array is required');
     }
-    if (!groups || groups.length === 0) {
-      throw new Error('[ExpressionMatrixBuilder] groups array is required');
-    }
+    const groupMetadata = buildGroupMetadata(groups);
 
     const nRows = genes.length;
     const nCols = groups.length;
@@ -152,16 +243,9 @@ export class ExpressionMatrixBuilder {
       transformedMatrix = log1pTransform(rawMatrix);
     }
 
-    // Build metadata arrays
-    const groupIds = groups.map(g => g.groupId);
-    const groupNames = groups.map(g => g.groupName || g.groupId);
-    const groupColors = groups.map(g => g.color || '#999999');
-
     return {
       genes,
-      groupIds,
-      groupNames,
-      groupColors,
+      ...groupMetadata,
       values: transformedMatrix,
       rawValues: transform !== 'none' ? rawMatrix : null,
       nRows,
@@ -189,6 +273,7 @@ export class ExpressionMatrixBuilder {
       transform = DEFAULTS.transform
     } = options;
 
+    const groupMetadata = buildGroupMetadata(groups);
     const nRows = genes.length;
     const nCols = groups.length;
 
@@ -221,16 +306,9 @@ export class ExpressionMatrixBuilder {
       transformedMatrix = log1pTransform(rawMatrix);
     }
 
-    // Build metadata arrays
-    const groupIds = groups.map(g => g.groupId);
-    const groupNames = groups.map(g => g.groupName || g.groupId);
-    const groupColors = groups.map(g => g.color || '#999999');
-
     return {
       genes,
-      groupIds,
-      groupNames,
-      groupColors,
+      ...groupMetadata,
       values: transformedMatrix,
       rawValues: transform !== 'none' ? rawMatrix : null,
       nRows,

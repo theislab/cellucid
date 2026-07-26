@@ -2,7 +2,6 @@
  * Shared Mathematical Utilities for Compute Module
  *
  * Centralizes all mathematical and statistical helper functions used by:
- * - fallback-operations.js
  * - data-worker.js
  * - operation-handlers.js
  *
@@ -54,43 +53,68 @@ export function std(arr, ddof = 0) {
 // ============================================================================
 
 /**
- * Normal CDF approximation using Abramowitz and Stegun method.
- * Accurate to about 7 decimal places.
+ * Standard-normal survival function P(Z > z).
+ *
+ * The gamma relationship evaluates positive tails directly, avoiding the
+ * catastrophic cancellation caused by subtracting a CDF rounded to one.
  *
  * @param {number} z - Z-score value
- * @returns {number} Cumulative probability P(X <= z)
+ * @returns {number} Upper-tail probability
  */
-export function normalCDF(z) {
-  const a1 = 0.254829592;
-  const a2 = -0.284496736;
-  const a3 = 1.421413741;
-  const a4 = -1.453152027;
-  const a5 = 1.061405429;
-  const p = 0.3275911;
+export function normalSurvival(z) {
+  if (Number.isNaN(z)) return NaN;
+  if (z === Infinity) return 0;
+  if (z === -Infinity) return 1;
 
-  const sign = z < 0 ? -1 : 1;
-  z = Math.abs(z) / Math.sqrt(2);
-
-  const t = 1.0 / (1.0 + p * z);
-  const y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-z * z);
-
-  return 0.5 * (1.0 + sign * y);
+  const positiveTail = 0.5 * regularizedGammaQ(0.5, (z * z) / 2);
+  return z >= 0 ? positiveTail : 1 - positiveTail;
 }
 
 /**
- * T-distribution CDF approximation.
- * Uses normal approximation for df >= 30.
+ * Standard-normal cumulative distribution function P(Z <= z).
+ *
+ * @param {number} z - Z-score value
+ * @returns {number} Cumulative probability
+ */
+export function normalCDF(z) {
+  return normalSurvival(-z);
+}
+
+/**
+ * Student t-distribution CDF.
+ *
+ * Uses the regularized incomplete beta identity for finite degrees of freedom.
+ * This remains important around common significance thresholds even at
+ * moderately large df, where substituting the normal CDF can change the
+ * reported significance.
  *
  * @param {number} t - T-statistic value
  * @param {number} df - Degrees of freedom
  * @returns {number} Cumulative probability
  */
 export function tCDF(t, df) {
-  if (df <= 0) return NaN;
-  if (df >= 30) return normalCDF(t); // Normal approximation for large df
+  if (Number.isNaN(t) || df <= 0 || Number.isNaN(df)) return NaN;
+  if (t === -Infinity) return 0;
+  if (t === Infinity) return 1;
+  if (df === Infinity) return normalCDF(t);
+  if (!Number.isFinite(t) || !Number.isFinite(df)) return NaN;
 
   const x = df / (df + t * t);
-  return 1 - 0.5 * incompleteBeta(x, df / 2, 0.5);
+  const lowerTail = 0.5 * incompleteBeta(x, df / 2, 0.5);
+  return t < 0 ? lowerTail : 1 - lowerTail;
+}
+
+/**
+ * Two-sided Student t p-value evaluated through the stable lower tail.
+ *
+ * @param {number} t - T statistic
+ * @param {number} df - Degrees of freedom
+ * @returns {number} Two-sided p-value
+ */
+export function tTwoSidedPValue(t, df) {
+  if (Number.isNaN(t)) return NaN;
+  const pValue = 2 * tCDF(-Math.abs(t), df);
+  return Number.isNaN(pValue) ? NaN : Math.min(1, Math.max(0, pValue));
 }
 
 /**
@@ -182,21 +206,117 @@ export function gammaLn(z) {
   return 0.5 * Math.log(2 * Math.PI) + (z + 0.5) * Math.log(t) - t + Math.log(x);
 }
 
+const GAMMA_EPSILON = 1e-14;
+const GAMMA_MIN_ITERATIONS = 1000;
+const GAMMA_MAX_ITERATIONS = 100000;
+const GAMMA_FPMIN = 1e-300;
+
+function regularizedGammaSeries(a, x) {
+  let sum = 1 / a;
+  let term = sum;
+  let ap = a;
+  const maxIterations = Math.min(
+    GAMMA_MAX_ITERATIONS,
+    Math.max(GAMMA_MIN_ITERATIONS, Math.ceil(16 * Math.sqrt(a)))
+  );
+
+  for (let n = 1; n <= maxIterations; n++) {
+    ap += 1;
+    term *= x / ap;
+    sum += term;
+    if (Math.abs(term) <= Math.abs(sum) * GAMMA_EPSILON) {
+      return sum * Math.exp(-x + a * Math.log(x) - gammaLn(a));
+    }
+  }
+  return NaN;
+}
+
+function regularizedGammaContinuedFraction(a, x) {
+  let b = x + 1 - a;
+  if (Math.abs(b) < GAMMA_FPMIN) b = GAMMA_FPMIN;
+
+  let c = 1 / GAMMA_FPMIN;
+  let d = 1 / b;
+  let h = d;
+  const maxIterations = Math.min(
+    GAMMA_MAX_ITERATIONS,
+    Math.max(GAMMA_MIN_ITERATIONS, Math.ceil(16 * Math.sqrt(a)))
+  );
+
+  for (let i = 1; i <= maxIterations; i++) {
+    const an = -i * (i - a);
+    b += 2;
+    d = an * d + b;
+    if (Math.abs(d) < GAMMA_FPMIN) d = GAMMA_FPMIN;
+    c = b + an / c;
+    if (Math.abs(c) < GAMMA_FPMIN) c = GAMMA_FPMIN;
+    d = 1 / d;
+    const delta = d * c;
+    h *= delta;
+    if (Math.abs(delta - 1) <= GAMMA_EPSILON) {
+      return Math.exp(-x + a * Math.log(x) - gammaLn(a)) * h;
+    }
+  }
+  return NaN;
+}
+
 /**
- * Chi-squared CDF approximation using Wilson-Hilferty transformation.
+ * Regularized lower incomplete gamma P(a, x).
+ *
+ * @param {number} a - Positive shape parameter
+ * @param {number} x - Non-negative evaluation point
+ * @returns {number} Probability in [0, 1]
+ */
+export function regularizedGammaP(a, x) {
+  if (!(a > 0) || x < 0 || Number.isNaN(x)) return NaN;
+  if (x === 0) return 0;
+  if (x === Infinity) return 1;
+  if (!Number.isFinite(a) || !Number.isFinite(x)) return NaN;
+
+  const value = x < a + 1
+    ? regularizedGammaSeries(a, x)
+    : 1 - regularizedGammaContinuedFraction(a, x);
+  return Math.min(1, Math.max(0, value));
+}
+
+/**
+ * Regularized upper incomplete gamma Q(a, x).
+ *
+ * @param {number} a - Positive shape parameter
+ * @param {number} x - Non-negative evaluation point
+ * @returns {number} Upper-tail probability in [0, 1]
+ */
+export function regularizedGammaQ(a, x) {
+  if (!(a > 0) || x < 0 || Number.isNaN(x)) return NaN;
+  if (x === 0) return 1;
+  if (x === Infinity) return 0;
+  if (!Number.isFinite(a) || !Number.isFinite(x)) return NaN;
+
+  const value = x < a + 1
+    ? 1 - regularizedGammaSeries(a, x)
+    : regularizedGammaContinuedFraction(a, x);
+  return Math.min(1, Math.max(0, value));
+}
+
+/**
+ * Chi-squared CDF via the regularized incomplete gamma function.
  *
  * @param {number} x - Chi-squared statistic value
  * @param {number} df - Degrees of freedom
  * @returns {number} Cumulative probability
  */
 export function chiSquaredCDF(x, df) {
+  if (!Number.isFinite(df) || df <= 0 || Number.isNaN(x)) return NaN;
   if (x <= 0) return 0;
-  if (df <= 0) return NaN;
+  if (x === Infinity) return 1;
+  const probability = regularizedGammaP(df / 2, x / 2);
+  if (!Number.isNaN(probability)) return probability;
 
-  // Wilson-Hilferty approximation
-  const z = Math.pow(x / df, 1/3) - (1 - 2 / (9 * df));
-  const denom = Math.sqrt(2 / (9 * df));
-  return normalCDF(z / denom);
+  // Bounded approximation for shapes too large to converge within the iteration
+  // guard. Wilson-Hilferty is highly accurate in this large-df regime.
+  const z = (Math.cbrt(x / df) - (1 - 2 / (9 * df))) /
+    Math.sqrt(2 / (9 * df));
+  return normalCDF(z);
 }
 
 /**
@@ -207,7 +327,15 @@ export function chiSquaredCDF(x, df) {
  * @returns {number} P-value
  */
 export function chiSquaredPValue(statistic, df) {
-  return 1 - chiSquaredCDF(statistic, df);
+  if (!Number.isFinite(df) || df <= 0 || Number.isNaN(statistic)) return NaN;
+  if (statistic <= 0) return 1;
+  if (statistic === Infinity) return 0;
+  const probability = regularizedGammaQ(df / 2, statistic / 2);
+  if (!Number.isNaN(probability)) return probability;
+
+  const z = (Math.cbrt(statistic / df) - (1 - 2 / (9 * df))) /
+    Math.sqrt(2 / (9 * df));
+  return normalSurvival(z);
 }
 
 /**
@@ -219,7 +347,12 @@ export function chiSquaredPValue(statistic, df) {
  * @returns {number} P-value (upper tail)
  */
 export function fDistributionPValue(f, df1, df2) {
+  if (!Number.isFinite(df1) || !Number.isFinite(df2) || df1 <= 0 || df2 <= 0) {
+    return NaN;
+  }
+  if (Number.isNaN(f)) return NaN;
   if (f <= 0) return 1;
+  if (f === Infinity) return 0;
   // Using beta function approximation
   const x = df2 / (df2 + df1 * f);
   return incompleteBeta(x, df2 / 2, df1 / 2);
@@ -342,20 +475,119 @@ export function linearRegression(pairs) {
 // Statistical Tests
 // ============================================================================
 
+const exactMannWhitneyCache = new Map();
+
+/**
+ * Build the exact null distribution for the smaller sample's U statistic.
+ * The cache makes repeated comparisons with the same group sizes inexpensive.
+ *
+ * @param {number} nSmall
+ * @param {number} nLarge
+ * @returns {{cumulative: Float64Array, total: number}}
+ */
+function getExactMannWhitneyDistribution(nSmall, nLarge) {
+  const key = `${nSmall}:${nLarge}`;
+  const cached = exactMannWhitneyCache.get(key);
+  if (cached) return cached;
+
+  const n = nSmall + nLarge;
+  const minRankSum = (nSmall * (nSmall + 1)) / 2;
+  const maxRankSum = (nSmall * (2 * n - nSmall + 1)) / 2;
+  const maxU = nSmall * nLarge;
+  const rankSumCounts = Array.from(
+    { length: nSmall + 1 },
+    () => new Float64Array(maxRankSum + 1)
+  );
+  rankSumCounts[0][0] = 1;
+
+  for (let rank = 1; rank <= n; rank++) {
+    for (let selected = Math.min(rank, nSmall); selected >= 1; selected--) {
+      for (let sum = maxRankSum; sum >= rank; sum--) {
+        rankSumCounts[selected][sum] += rankSumCounts[selected - 1][sum - rank];
+      }
+    }
+  }
+
+  const cumulative = new Float64Array(maxU + 1);
+  let running = 0;
+  for (let u = 0; u <= maxU; u++) {
+    running += rankSumCounts[nSmall][minRankSum + u];
+    cumulative[u] = running;
+  }
+
+  const distribution = { cumulative, total: running };
+  exactMannWhitneyCache.set(key, distribution);
+  return distribution;
+}
+
+/**
+ * Calculate a two-sided Mann-Whitney p-value from a U statistic.
+ *
+ * Exact inference is used for small, untied inputs. Otherwise this applies the
+ * tie-adjusted asymptotic variance and a continuity correction.
+ *
+ * @param {number} n1 - First sample size
+ * @param {number} n2 - Second sample size
+ * @param {number} statistic - U statistic (either tail)
+ * @param {{tieTerm?: number, allowExact?: boolean}} [options]
+ * @returns {{pValue: number, pValueMethod: 'exact'|'asymptotic'}}
+ */
+export function mannWhitneyPValue(n1, n2, statistic, options = {}) {
+  const { tieTerm = 0, allowExact = true } = options;
+  const n = n1 + n2;
+  const hasTies = tieTerm > 0;
+  // Match R's long-standing automatic policy: exact only when both samples
+  // contain fewer than 50 finite values and there are no ties.
+  const canUseExact = allowExact && !hasTies && n1 < 50 && n2 < 50;
+
+  if (canUseExact) {
+    const nSmall = Math.min(n1, n2);
+    const nLarge = Math.max(n1, n2);
+    const maxU = nSmall * nLarge;
+    const observedU = Math.max(0, Math.min(maxU, Math.round(statistic)));
+    const lowerU = Math.min(observedU, maxU - observedU);
+    const { cumulative, total } = getExactMannWhitneyDistribution(nSmall, nLarge);
+    const pValue = Math.min(1, (2 * cumulative[lowerU]) / total);
+    return { pValue, pValueMethod: 'exact' };
+  }
+
+  const mu = (n1 * n2) / 2;
+  const tieAdjustment = n > 1 ? tieTerm / (n * (n - 1)) : 0;
+  const variance = (n1 * n2 / 12) * (n + 1 - tieAdjustment);
+  if (!(variance > 0)) {
+    if (statistic === mu) {
+      return { pValue: 1, pValueMethod: 'asymptotic' };
+    }
+    throw new RangeError(
+      'Mann-Whitney variance is zero for a non-null statistic'
+    );
+  }
+
+  const z = Math.max(0, (Math.abs(statistic - mu) - 0.5) / Math.sqrt(variance));
+  const pValue = Math.min(1, Math.max(0, 2 * normalSurvival(z)));
+  return { pValue, pValueMethod: 'asymptotic' };
+}
+
 /**
  * Mann-Whitney U test (Wilcoxon rank-sum test).
  * Non-parametric test for comparing two independent samples.
  *
- * @param {number[]} group1 - First group of values
- * @param {number[]} group2 - Second group of values
- * @returns {{statistic: number, pValue: number}} Test statistic and p-value
+ * @param {ArrayLike<number>} group1 - First group of values
+ * @param {ArrayLike<number>} group2 - Second group of values
+ * @returns {{statistic: number, pValue: number, pValueMethod: 'exact'|'asymptotic', u1: number, u2: number}} Test statistic and p-value
  */
 export function mannWhitneyU(group1, group2) {
   const n1 = group1.length;
   const n2 = group2.length;
 
   if (n1 === 0 || n2 === 0) {
-    return { statistic: NaN, pValue: NaN };
+    return {
+      statistic: NaN,
+      pValue: NaN,
+      pValueMethod: 'asymptotic',
+      u1: NaN,
+      u2: NaN
+    };
   }
 
   // Combine and rank (TypedArray-safe; avoids `.map()` which behaves differently on TypedArrays).
@@ -370,11 +602,17 @@ export function mannWhitneyU(group1, group2) {
 
   // Rank-sum for group 1 with tie handling (no separate ranks[] allocation).
   let R1 = 0;
+  let tieTerm = 0;
   let i = 0;
   while (i < n) {
     let j = i + 1;
     const v = valueAt(order[i]);
     while (j < n && valueAt(order[j]) === v) j++;
+
+    const tieCount = j - i;
+    if (tieCount > 1) {
+      tieTerm += tieCount ** 3 - tieCount;
+    }
 
     const avgRank = (i + j + 1) / 2; // ranks are 1-based
     for (let k = i; k < j; k++) {
@@ -387,13 +625,65 @@ export function mannWhitneyU(group1, group2) {
   const U2 = n1 * n2 - U1;
   const U = Math.min(U1, U2);
 
-  // Normal approximation for p-value
-  const mu = (n1 * n2) / 2;
-  const sigma = Math.sqrt((n1 * n2 * (n1 + n2 + 1)) / 12);
-  const z = sigma > 0 ? (U - mu) / sigma : 0;
-  const pValue = 2 * (1 - normalCDF(Math.abs(z)));
+  const { pValue, pValueMethod } = mannWhitneyPValue(n1, n2, U, { tieTerm });
 
-  return { statistic: U, pValue };
+  return { statistic: U, pValue, pValueMethod, u1: U1, u2: U2 };
+}
+
+/**
+ * Welch's t-test from precomputed sample moments.
+ *
+ * @param {number} mean1 - First sample mean
+ * @param {number} variance1 - First sample variance (ddof=1)
+ * @param {number} n1 - First sample size
+ * @param {number} mean2 - Second sample mean
+ * @param {number} variance2 - Second sample variance (ddof=1)
+ * @param {number} n2 - Second sample size
+ * @returns {{statistic: number, pValue: number, df: number}} Test statistic, p-value, and degrees of freedom
+ */
+export function welchTTestFromMoments(mean1, variance1, n1, mean2, variance2, n2) {
+  if (
+    n1 < 2 ||
+    n2 < 2 ||
+    !Number.isFinite(mean1) ||
+    !Number.isFinite(mean2) ||
+    !Number.isFinite(variance1) ||
+    !Number.isFinite(variance2) ||
+    variance1 < 0 ||
+    variance2 < 0
+  ) {
+    return { statistic: NaN, pValue: NaN, df: NaN };
+  }
+
+  const se = Math.sqrt(variance1 / n1 + variance2 / n2);
+  if (se === 0) {
+    const difference = mean1 - mean2;
+    if (difference === 0) {
+      return {
+        statistic: 0,
+        pValue: 1,
+        df: n1 + n2 - 2
+      };
+    }
+    return {
+      statistic: difference < 0 ? -Infinity : Infinity,
+      pValue: 0,
+      df: n1 + n2 - 2
+    };
+  }
+
+  const t = (mean1 - mean2) / se;
+
+  // Welch-Satterthwaite degrees of freedom
+  const num = Math.pow(variance1 / n1 + variance2 / n2, 2);
+  const denom =
+    Math.pow(variance1 / n1, 2) / (n1 - 1) +
+    Math.pow(variance2 / n2, 2) / (n2 - 1);
+  const df = num / denom;
+
+  const pValue = tTwoSidedPValue(t, df);
+
+  return { statistic: t, pValue, df };
 }
 
 /**
@@ -407,30 +697,22 @@ export function mannWhitneyU(group1, group2) {
 export function welchTTest(group1, group2) {
   const n1 = group1.length;
   const n2 = group2.length;
-
   if (n1 < 2 || n2 < 2) {
     return { statistic: NaN, pValue: NaN, df: NaN };
   }
 
-  const m1 = group1.reduce((a, b) => a + b, 0) / n1;
-  const m2 = group2.reduce((a, b) => a + b, 0) / n2;
+  const mean1 = group1.reduce((sum, value) => sum + value, 0) / n1;
+  const mean2 = group2.reduce((sum, value) => sum + value, 0) / n2;
+  const variance1 = group1.reduce(
+    (sum, value) => sum + (value - mean1) ** 2,
+    0
+  ) / (n1 - 1);
+  const variance2 = group2.reduce(
+    (sum, value) => sum + (value - mean2) ** 2,
+    0
+  ) / (n2 - 1);
 
-  const v1 = group1.reduce((a, b) => a + Math.pow(b - m1, 2), 0) / (n1 - 1);
-  const v2 = group2.reduce((a, b) => a + Math.pow(b - m2, 2), 0) / (n2 - 1);
-
-  const se = Math.sqrt(v1 / n1 + v2 / n2);
-  if (se === 0) return { statistic: 0, pValue: 1, df: n1 + n2 - 2 };
-
-  const t = (m1 - m2) / se;
-
-  // Welch-Satterthwaite degrees of freedom
-  const num = Math.pow(v1 / n1 + v2 / n2, 2);
-  const denom = Math.pow(v1 / n1, 2) / (n1 - 1) + Math.pow(v2 / n2, 2) / (n2 - 1);
-  const df = num / denom;
-
-  const pValue = 2 * (1 - tCDF(Math.abs(t), df));
-
-  return { statistic: t, pValue, df };
+  return welchTTestFromMoments(mean1, variance1, n1, mean2, variance2, n2);
 }
 
 // ============================================================================
@@ -656,9 +938,13 @@ export default {
 
   // Distribution functions
   normalCDF,
+  normalSurvival,
   tCDF,
+  tTwoSidedPValue,
   incompleteBeta,
   gammaLn,
+  regularizedGammaP,
+  regularizedGammaQ,
   chiSquaredCDF,
   chiSquaredPValue,
   fDistributionPValue,
@@ -670,7 +956,9 @@ export default {
   linearRegression,
 
   // Statistical tests
+  mannWhitneyPValue,
   mannWhitneyU,
+  welchTTestFromMoments,
   welchTTest,
 
   // Binning functions

@@ -11,6 +11,8 @@
  * @module shared/dom-utils
  */
 
+import { PerformanceConfig } from './performance-config.js';
+
 // =============================================================================
 // CONSTANTS
 // =============================================================================
@@ -545,17 +547,56 @@ export function createActionsBar(buttons) {
  * @returns {HTMLDivElement} Performance settings section element
  */
 export function createPerformanceSettings(options) {
-  const { dataLayer, className = 'analysis-performance-settings', collapsed = true } = options;
-
-  // Lazy import to avoid circular dependencies
-  const getPerformanceConfig = async () => {
-    const mod = await import('./performance-config.js');
-    return mod.PerformanceConfig;
-  };
+  if (
+    options === null ||
+    typeof options !== 'object' ||
+    Array.isArray(options)
+  ) {
+    throw new TypeError('Performance settings options must be an object');
+  }
+  const {
+    dataLayer,
+    className = 'analysis-performance-settings',
+    collapsed = true
+  } = options;
+  if (
+    dataLayer === null ||
+    typeof dataLayer !== 'object' ||
+    dataLayer.state === null ||
+    typeof dataLayer.state !== 'object' ||
+    typeof dataLayer.getAvailableVariables !== 'function'
+  ) {
+    throw new TypeError(
+      'Performance settings require a DataLayer with exact dataset metadata'
+    );
+  }
+  if (typeof className !== 'string' || className.length === 0) {
+    throw new TypeError(
+      'Performance settings className must be a non-empty string'
+    );
+  }
+  if (typeof collapsed !== 'boolean') {
+    throw new TypeError('Performance settings collapsed must be a boolean');
+  }
 
   // Get data characteristics
-  const pointCount = dataLayer?.state?.pointCount || 100000;
-  const geneCount = dataLayer?.getAvailableVariables?.('gene_expression')?.length || 20000;
+  const pointCount = dataLayer.state.pointCount;
+  if (!Number.isSafeInteger(pointCount) || pointCount <= 0) {
+    throw new RangeError(
+      'Performance settings require an exact positive dataset pointCount'
+    );
+  }
+  const genes = dataLayer.getAvailableVariables('gene_expression');
+  if (!Array.isArray(genes) || genes.length === 0) {
+    throw new Error(
+      'Performance settings require the exact available gene inventory'
+    );
+  }
+  const geneCount = genes.length;
+  const recommended = PerformanceConfig.getRecommendedSettings(
+    pointCount,
+    geneCount
+  );
 
   // Create container
   const container = document.createElement('div');
@@ -580,60 +621,72 @@ export function createPerformanceSettings(options) {
   content.className = `${className.replace('settings', 'content')} analysis-perf-content`;
   content.style.display = collapsed ? 'none' : 'block';
 
-  // Populate content asynchronously
-  getPerformanceConfig().then(PerformanceConfig => {
-    const dataInfo = PerformanceConfig.getRecommendedSettings(pointCount, geneCount);
+  // Batch size selector
+  const batchOptions = PerformanceConfig.getBatchSizeOptions(
+    pointCount,
+    geneCount
+  );
+  const batchSelect = createFormSelect('batchSize', batchOptions.map(opt => ({
+    value: String(opt.value),
+    label: opt.label,
+    description: opt.description,
+    selected: opt.selected
+  })));
+  content.appendChild(createFormRow('Batch size:', batchSelect));
 
-    // Batch size selector
-    const batchOptions = PerformanceConfig.getBatchSizeOptions(pointCount, geneCount);
-    const batchSelect = createFormSelect('batchSize', batchOptions.map(opt => ({
+  // Memory budget selector
+  const memoryOptions = PerformanceConfig.getMemoryBudgetOptions();
+  const memorySelect = createFormSelect('memoryBudget', memoryOptions.map(opt => ({
+    value: String(opt.value),
+    label: opt.label,
+    description: opt.description,
+    selected: opt.value === recommended.memoryBudgetMB
+  })));
+  content.appendChild(createFormRow('Memory budget:', memorySelect));
+
+  // Network concurrency selector
+  const networkOptions = PerformanceConfig.getNetworkConcurrencyOptions();
+  const networkSelect = createFormSelect(
+    'networkConcurrency',
+    networkOptions.map(opt => ({
       value: String(opt.value),
       label: opt.label,
       description: opt.description,
-      selected: opt.selected
-    })));
-    content.appendChild(createFormRow('Batch size:', batchSelect));
+      selected: opt.value === recommended.networkConcurrency
+    }))
+  );
+  content.appendChild(createFormRow('Network parallelism:', networkSelect));
 
-    // Memory budget selector
-    const memoryOptions = PerformanceConfig.getMemoryBudgetOptions();
-    const memorySelect = createFormSelect('memoryBudget', memoryOptions.map(opt => ({
-      value: String(opt.value),
-      label: opt.label,
-      description: opt.description,
-      selected: opt.selected
-    })));
-    content.appendChild(createFormRow('Memory budget:', memorySelect));
-
-    // Network concurrency selector
-    const networkOptions = PerformanceConfig.getNetworkConcurrencyOptions();
-    const networkSelect = createFormSelect('networkConcurrency', networkOptions.map(opt => ({
-      value: String(opt.value),
-      label: opt.label,
-      description: opt.description,
-      selected: opt.selected
-    })));
-    content.appendChild(createFormRow('Network parallelism:', networkSelect));
-
-    // Parallelism selector
-    const parallelismSelect = createFormSelect('parallelism', [
-      { value: 'auto', label: 'Auto', description: 'Automatically distributes work across available cores.' },
-      { value: '1', label: '1 core', description: 'Sequential processing with minimal resource usage.' },
-      { value: '2', label: '2 cores', description: 'Light parallel processing for moderate workloads.' },
-      { value: '4', label: '4 cores', description: 'Balanced parallel processing.' },
-      { value: '8', label: '8 cores', description: 'Full parallel processing for maximum throughput.', selected: true }
-    ]);
-    content.appendChild(createFormRow('Compute parallelism:', parallelismSelect));
-
-    const wilcoxBinsSelect = createFormSelect('wilcoxBins', [
-      { value: '64', label: '64 bins', description: 'Lower memory, coarser Wilcoxon approximation.' },
-      { value: '128', label: '128 bins', description: 'Default balance of accuracy and speed.', selected: true },
-      { value: '256', label: '256 bins', description: 'More accurate, slightly more memory.' },
-      { value: '512', label: '512 bins', description: 'Most accurate approximation, more memory.' }
-    ]);
-    content.appendChild(createFormRow('Wilcoxon bins:', wilcoxBinsSelect));
-
-    // Dataset info display intentionally omitted (too verbose for the UI).
-  });
+  // Parallelism selector
+  const parallelismSelect = createFormSelect('parallelism', [
+    {
+      value: 'auto',
+      label: 'Auto',
+      description: 'Uses the exact initialized worker-pool size.',
+      selected: true
+    },
+    {
+      value: '1',
+      label: '1 core',
+      description: 'Sequential worker processing.'
+    },
+    {
+      value: '2',
+      label: '2 cores',
+      description: 'Two concurrent worker operations.'
+    },
+    {
+      value: '4',
+      label: '4 cores',
+      description: 'Four concurrent worker operations.'
+    },
+    {
+      value: '8',
+      label: '8 cores',
+      description: 'Eight concurrent worker operations.'
+    }
+  ]);
+  content.appendChild(createFormRow('Compute parallelism:', parallelismSelect));
 
   // Toggle functionality
   let isExpanded = !collapsed;
@@ -656,21 +709,61 @@ export function createPerformanceSettings(options) {
  * @returns {Object} Performance settings object
  */
 export function getPerformanceFormValues(formContainer) {
-  const getValue = (name) => formContainer.querySelector(`[name="${name}"]`)?.value;
+  if (
+    formContainer === null ||
+    typeof formContainer !== 'object' ||
+    typeof formContainer.querySelector !== 'function'
+  ) {
+    throw new TypeError(
+      'Performance form values require a queryable form container'
+    );
+  }
+  const getValue = (name) => {
+    const field = formContainer.querySelector(`[name="${name}"]`);
+    if (
+      field === null ||
+      typeof field !== 'object' ||
+      typeof field.value !== 'string' ||
+      field.value.length === 0
+    ) {
+      throw new Error(`Performance form field "${name}" is required`);
+    }
+    return field.value;
+  };
+  const readPositiveInteger = (name, value) => {
+    const parsed = Number(value);
+    if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+      throw new RangeError(
+        `Performance form field "${name}" must be a positive integer`
+      );
+    }
+    return parsed;
+  };
 
-  const parallelismRaw = getValue('parallelism') || 'auto';
+  const parallelismRaw = getValue('parallelism');
   const batchSizeRaw = getValue('batchSize');
   const memoryBudgetRaw = getValue('memoryBudget');
   const networkConcurrencyRaw = getValue('networkConcurrency');
-  const wilcoxBinsRaw = getValue('wilcoxBins');
+  if (
+    parallelismRaw !== 'auto' &&
+    !['1', '2', '4', '8'].includes(parallelismRaw)
+  ) {
+    throw new RangeError(
+      'Performance form parallelism must be auto, 1, 2, 4, or 8'
+    );
+  }
 
   return {
-    parallelism: parallelismRaw === 'auto' ? 'auto' : parseInt(parallelismRaw, 10),
+    parallelism: parallelismRaw === 'auto'
+      ? 'auto'
+      : readPositiveInteger('parallelism', parallelismRaw),
     batchConfig: {
-      preloadCount: batchSizeRaw ? parseInt(batchSizeRaw, 10) : undefined,
-      memoryBudgetMB: memoryBudgetRaw ? parseInt(memoryBudgetRaw, 10) : undefined,
-      networkConcurrency: networkConcurrencyRaw ? parseInt(networkConcurrencyRaw, 10) : undefined,
-      wilcoxBins: wilcoxBinsRaw ? parseInt(wilcoxBinsRaw, 10) : undefined
+      preloadCount: readPositiveInteger('batchSize', batchSizeRaw),
+      memoryBudgetMB: readPositiveInteger('memoryBudget', memoryBudgetRaw),
+      networkConcurrency: readPositiveInteger(
+        'networkConcurrency',
+        networkConcurrencyRaw
+      )
     }
   };
 }

@@ -1,0 +1,1 @@
+{"_format": "compact_v1", "n_points": 120, "var_gene_id_column": null, "compression": null, "quantization": null, "_varSchema": {"kind": "continuous", "pathPattern": "var/{key}.values.f32", "ext": "f32", "dtype": "float32", "quantized": false}, "fields": [["ENSG000000"], ["ENSG000001"], ["ENSG000002"], ["ENSG000003"], ["ENSG000004"], ["ENSG000005"]]}

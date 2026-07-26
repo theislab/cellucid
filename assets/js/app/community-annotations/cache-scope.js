@@ -15,52 +15,47 @@
  *
  * Notes
  * -----
- * - No backward compatibility is provided intentionally (development phase).
- * - If any scope dimension is missing, persistence is disabled (in-memory only).
+ * - Only the current exact scope representation is accepted.
+ * - If any scope dimension is missing, no persistent scope key exists.
  */
 
-import { parseOwnerRepo } from './github-sync.js';
+import { parseCanonicalGitHubRepositoryReference } from './github-reference.js';
 
 const CACHE_ROOT_PREFIX = 'cellucid:community-annotations:cache:';
 
-function toCleanString(value) {
-  return String(value ?? '').trim();
-}
-
-function fnv1aHex(input) {
-  const s = toCleanString(input);
-  let h = 0x811c9dc5;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
-  }
-  return (h >>> 0).toString(16).padStart(8, '0');
-}
-
 function normalizeDatasetIdOrNull(datasetId) {
-  const did = toCleanString(datasetId);
-  if (!did) return null;
-  // Keep cache keys bounded even if dataset ids are long (paths/URLs).
-  if (did.length <= 128) return did;
-  const hash = fnv1aHex(did);
-  return `${did.slice(0, 96)}~${hash}`;
+  if (datasetId === null || datasetId === undefined || datasetId === '') return null;
+  if (
+    typeof datasetId !== 'string' ||
+    !/\S/.test(datasetId) ||
+    /^\s|\s$/.test(datasetId) ||
+    Array.from(datasetId).length > 256
+  ) {
+    return null;
+  }
+  return datasetId;
 }
 
 function normalizeGitHubUserIdOrNull(userId) {
-  const n = Number(userId);
-  if (!Number.isFinite(n)) return null;
-  const safe = Math.max(0, Math.floor(n));
-  return safe ? String(safe) : null;
+  if (!Number.isSafeInteger(userId) || userId < 1) return null;
+  return String(userId);
 }
 
 function parseRepoRefStrictOrNull(repoRef) {
-  const parsed = parseOwnerRepo(repoRef);
+  if (
+    typeof repoRef !== 'string' ||
+    !repoRef ||
+    /^\s|\s$/.test(repoRef)
+  ) {
+    return null;
+  }
+  const parsed = parseCanonicalGitHubRepositoryReference(repoRef);
   if (!parsed?.ownerRepo || !parsed?.ref) return null;
   return { ownerRepo: parsed.ownerRepo, branch: parsed.ref };
 }
 
 function enc(value) {
-  return encodeURIComponent(toCleanString(value));
+  return encodeURIComponent(value);
 }
 
 /**
@@ -105,7 +100,12 @@ export function toFileShaIndexKey(scope) {
 
 export function toFileRecordKey(scope, path) {
   const key = toCacheScopeKey(scope);
-  const p = toCleanString(path).replace(/^\/+/, '');
+  const p =
+    typeof path === 'string' &&
+    path &&
+    !/^\s|\s$/.test(path)
+      ? path
+      : null;
   if (!key || !p) return null;
   return `${key}::${p}`;
 }

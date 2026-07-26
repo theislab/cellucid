@@ -279,7 +279,7 @@ export class GenesPanelController {
       const genesForMatrix = this._extractTopNGenes(markers, DEFAULT_HEATMAP_TOP_N);
 
       const matrix = await this._matrixBuilder.buildMatrix({
-        genes: genesForMatrix.length > 0 ? genesForMatrix : allGenes,
+        genes: genesForMatrix,
         groups,
         transform,
         batchConfig,
@@ -293,28 +293,17 @@ export class GenesPanelController {
       let orderedMatrix = matrix;
 
       if (mode === 'clustered' && (clusterRows || clusterCols)) {
-        try {
-          clustering = await this._clusteringEngine.clusterMatrix({
-            matrix,
-            clusterRows,
-            clusterCols,
-            distance,
-            linkage,
-            onProgress,
-            signal
-          });
-          throwIfAborted();
-
-          // Apply ordering
-          orderedMatrix = this._clusteringEngine.applyOrdering(matrix, clustering);
-        } catch (err) {
-          // If clustering fails (or is cancelled), keep the unclustered matrix
-          // so the panel remains usable.
-          if (signal?.aborted) throw err;
-          console.warn('[GenesPanelController] Clustering failed, showing unclustered heatmap:', err?.message || err);
-          clustering = null;
-          orderedMatrix = matrix;
-        }
+        clustering = await this._clusteringEngine.clusterMatrix({
+          matrix,
+          clusterRows,
+          clusterCols,
+          distance,
+          linkage,
+          onProgress,
+          signal
+        });
+        throwIfAborted();
+        orderedMatrix = this._clusteringEngine.applyOrdering(matrix, clustering);
       }
 
       // Report render phase
@@ -346,16 +335,16 @@ export class GenesPanelController {
           parallelism,
           batchConfig,
           geneCount: allGenes.length,
-          matrixGeneCount: genesForMatrix.length > 0 ? genesForMatrix.length : allGenes.length,
+          matrixGeneCount: genesForMatrix.length,
           groupCount: groups.length,
           duration,
-          cached: !!(useCache && cacheHit)
+          cached: useCache && cacheHit
         }
       };
 
     } catch (error) {
       if (error.name === 'AbortError' || signal.aborted) {
-        throw new Error(ERROR_MESSAGES.CANCELLED);
+        throw error;
       }
       throw error;
     } finally {
@@ -515,47 +504,59 @@ export class GenesPanelController {
    * @private
    */
   _getDatasetId() {
-    const state = this.dataLayer?.state || null;
-    const fromDataLayer = String(state?.datasetId || '').trim();
-    if (fromDataLayer) return fromDataLayer;
-
-    try {
-      const manager = getDataSourceManager?.();
-      const fromManager = String(manager?.getCurrentDatasetId?.() || '').trim();
-      if (fromManager) return fromManager;
-    } catch {
-      // ignore
+    const manager = getDataSourceManager();
+    if (!manager || typeof manager.getCurrentDatasetId !== 'function') {
+      throw new TypeError('The active dataset owner getCurrentDatasetId is required');
     }
-
-    // Fallback: include point count to reduce collision risk when datasetId is missing.
-    const count = state?.pointCount;
-    const countPart = Number.isFinite(Number(count)) ? String(Math.max(0, Math.floor(Number(count)))) : '';
-    return countPart ? `unknown_${countPart}` : 'unknown';
+    const datasetId = manager.getCurrentDatasetId();
+    if (
+      typeof datasetId !== 'string' ||
+      datasetId.length === 0 ||
+      datasetId.trim().length === 0
+    ) {
+      throw new TypeError('An exact active datasetId is required for marker analysis');
+    }
+    return datasetId;
   }
 
   _syncCacheDatasetId() {
-    const id = this._getDatasetId();
-    try {
-      this._cache?.setDatasetId?.(id);
-    } catch {
-      // ignore
+    if (!this._cache || typeof this._cache.setDatasetId !== 'function') {
+      throw new TypeError('Marker cache setDatasetId is required');
     }
+    const id = this._getDatasetId();
+    this._cache.setDatasetId(id);
   }
 
   _extractTopNGenes(markers, topNPerGroup) {
-    const groups = markers?.groups || {};
-    const n = Number.isFinite(topNPerGroup) ? Math.max(1, Math.floor(topNPerGroup)) : 5;
+    if (!markers || !markers.groups || typeof markers.groups !== 'object') {
+      throw new TypeError('Marker groups are required');
+    }
+    if (!Number.isSafeInteger(topNPerGroup) || topNPerGroup < 1) {
+      throw new RangeError('topNPerGroup must be a positive integer');
+    }
+    const groups = markers.groups;
     const wanted = new Set();
 
     for (const group of Object.values(groups)) {
-      const list = group?.markers || [];
-      const limit = Math.min(list.length, n);
+      if (!group || !Array.isArray(group.markers)) {
+        throw new TypeError('Every marker group must own a markers array');
+      }
+      const list = group.markers;
+      const limit = Math.min(list.length, topNPerGroup);
       for (let i = 0; i < limit; i++) {
-        if (list[i]?.gene) wanted.add(list[i].gene);
+        const gene = list[i]?.gene;
+        if (typeof gene !== 'string' || gene.length === 0) {
+          throw new TypeError('Every selected marker must own a non-empty gene name');
+        }
+        wanted.add(gene);
       }
     }
 
-    return Array.from(wanted);
+    const genes = Array.from(wanted);
+    if (genes.length === 0) {
+      throw new Error('Marker groups did not provide any genes for the expression matrix');
+    }
+    return genes;
   }
 
   /**
@@ -569,9 +570,36 @@ export class GenesPanelController {
    * @returns {Promise<GroupSpec[]>} Array of group specifications
    */
   async _getGroupsFromCategory(obsCategory, options = {}) {
-    const { onProgress, signal } = options || {};
+    if (
+      typeof obsCategory !== 'string' ||
+      obsCategory.length === 0 ||
+      obsCategory !== obsCategory.trim()
+    ) {
+      throw new TypeError('obsCategory must be a non-empty string');
+    }
+    if (
+      options === null ||
+      typeof options !== 'object' ||
+      Array.isArray(options)
+    ) {
+      throw new TypeError('Group-loading options must be an object');
+    }
+    const { onProgress, signal } = options;
+    if (onProgress !== undefined && typeof onProgress !== 'function') {
+      throw new TypeError('Group-loading onProgress must be a function');
+    }
+    if (
+      signal !== undefined &&
+      (
+        signal === null ||
+        typeof signal.aborted !== 'boolean' ||
+        typeof signal.addEventListener !== 'function'
+      )
+    ) {
+      throw new TypeError('Group-loading signal must implement AbortSignal');
+    }
     if (signal?.aborted) {
-      throw new DOMException('Request aborted', 'AbortError');
+      throw signal.reason;
     }
 
     // If the field is not yet loaded, allow DataLayer/state to show a notification.
@@ -580,7 +608,14 @@ export class GenesPanelController {
     const obsFields = this.dataLayer?.state?.obsData?.fields;
     if (Array.isArray(obsFields)) {
       const field = obsFields.find(f => f?.key === obsCategory);
-      silent = !!field?.loaded;
+      if (field !== undefined) {
+        if (typeof field.loaded !== 'boolean') {
+          throw new TypeError(
+            `Observation field "${obsCategory}" loaded state must be boolean`
+          );
+        }
+        silent = field.loaded;
+      }
     }
 
     if (onProgress) {
@@ -594,22 +629,62 @@ export class GenesPanelController {
     // Load the observation field data
     const fieldData = await this.dataLayer.ensureObsFieldLoaded(obsCategory, { silent });
     if (signal?.aborted) {
-      throw new DOMException('Request aborted', 'AbortError');
+      throw signal.reason;
     }
 
-    if (!fieldData || fieldData.kind !== 'category') {
+    if (
+      fieldData === null ||
+      typeof fieldData !== 'object' ||
+      fieldData.kind !== 'category'
+    ) {
       throw new Error(formatError(ERROR_MESSAGES.NO_CATEGORICAL_OBS));
     }
 
     const { codes, categories, colors = {} } = fieldData;
 
-    if (!codes || codes.length === 0) {
+    if (!(codes instanceof Uint16Array) || codes.length === 0) {
       throw new Error(formatError(ERROR_MESSAGES.NO_CATEGORICAL_OBS));
     }
 
-    const catCount = Array.isArray(categories) ? categories.length : 0;
+    if (!Array.isArray(categories)) {
+      throw new TypeError(
+        `Observation field "${obsCategory}" categories must be an array`
+      );
+    }
+    const catCount = categories.length;
     if (catCount <= 0) {
       throw new Error(formatError(ERROR_MESSAGES.NO_CATEGORICAL_OBS));
+    }
+    const categorySet = new Set();
+    for (let code = 0; code < categories.length; code++) {
+      const category = categories[code];
+      if (
+        (
+          typeof category !== 'string' &&
+          typeof category !== 'number' &&
+          typeof category !== 'boolean'
+        ) ||
+        (typeof category === 'number' && !Number.isFinite(category))
+      ) {
+        throw new TypeError(
+          `Observation category ${code} must be an exact primitive label`
+        );
+      }
+      if (categorySet.has(category)) {
+        throw new Error(
+          `Observation category label at code ${code} is duplicated`
+        );
+      }
+      categorySet.add(category);
+    }
+    if (
+      colors === null ||
+      typeof colors !== 'object' ||
+      Array.isArray(colors)
+    ) {
+      throw new TypeError(
+        `Observation field "${obsCategory}" colors must be an object`
+      );
     }
 
     // Two-pass, typed-array group index construction:
@@ -622,16 +697,19 @@ export class GenesPanelController {
     for (let i = 0; i < codes.length; i++) {
       const code = codes[i];
       if (code === missingCode) continue;
-      if (code < 0 || code >= catCount) continue;
-      if (!categories[code]) continue;
+      if (code >= catCount) {
+        throw new RangeError(
+          `Observation code ${code} at cell ${i} exceeds the category inventory`
+        );
+      }
       countsByCode[code]++;
     }
 
-    /** @type {{ code: number, name: string, count: number }[]} */
+    /** @type {{ code: number, name: string|number|boolean, count: number }[]} */
     const present = [];
     for (let code = 0; code < catCount; code++) {
       const count = countsByCode[code];
-      if (count > 0 && categories[code]) {
+      if (count > 0) {
         present.push({ code, name: categories[code], count });
       }
     }
@@ -641,7 +719,7 @@ export class GenesPanelController {
     }
 
     // Sort groups by size (descending) for a stable and intuitive UI.
-    present.sort((a, b) => b.count - a.count);
+    present.sort((a, b) => b.count - a.count || a.code - b.code);
 
     // Map code -> group index (in `present` order)
     const codeToGroupIdx = new Int32Array(catCount);
@@ -657,22 +735,46 @@ export class GenesPanelController {
     for (let i = 0; i < codes.length; i++) {
       const code = codes[i];
       if (code === missingCode) continue;
-      if (code < 0 || code >= catCount) continue;
+      if (code >= catCount) {
+        throw new RangeError(
+          `Observation code ${code} at cell ${i} exceeds the category inventory`
+        );
+      }
       const gi = codeToGroupIdx[code];
-      if (gi < 0) continue;
+      if (gi < 0) {
+        throw new Error(
+          `Observation code ${code} has no present marker group`
+        );
+      }
       const w = writePtr[gi]++;
       indicesByGroup[gi][w] = i;
     }
 
     // Build groups array
-    const groups = present.map((p, idx) => ({
-      groupId: p.name,
-      groupName: p.name,
-      groupCode: p.code,
-      cellIndices: indicesByGroup[idx],
-      cellCount: p.count,
-      color: colors[p.name] || this._generateColor(idx)
-    }));
+    const groups = present.map((p, idx) => {
+      const declaredColor =
+        typeof p.name === 'string' && Object.hasOwn(colors, p.name)
+          ? colors[p.name]
+          : undefined;
+      if (
+        declaredColor !== undefined &&
+        (typeof declaredColor !== 'string' || declaredColor.length === 0)
+      ) {
+        throw new TypeError(
+          `Category "${p.name}" color must be a non-empty string`
+        );
+      }
+      return {
+        groupId: `category-code:${p.code}`,
+        groupName: p.name,
+        groupCode: p.code,
+        cellIndices: indicesByGroup[idx],
+        cellCount: p.count,
+        color: declaredColor === undefined
+          ? this._generateColor(idx)
+          : declaredColor
+      };
+    });
 
     return { groups, obsCodes: codes, categories };
   }
@@ -710,22 +812,56 @@ export class GenesPanelController {
       signal
     } = options;
 
-    // Validate genes exist
-    const availableGenes = new Set(this.dataLayer.getAvailableVariables('gene_expression').map(v => v.key));
-    const validGenes = genes.filter(g => availableGenes.has(g));
-    const invalidGenes = genes.filter(g => !availableGenes.has(g));
-
-    if (invalidGenes.length > 0) {
-      console.warn(`[GenesPanelController] Genes not found: ${invalidGenes.join(', ')}`);
+    if (
+      !Array.isArray(genes) ||
+      genes.length === 0 ||
+      genes.some(
+        gene =>
+          typeof gene !== 'string' ||
+          gene.length === 0 ||
+          gene !== gene.trim()
+      ) ||
+      new Set(genes).size !== genes.length
+    ) {
+      throw new TypeError(
+        'Custom marker genes must be unique non-empty strings'
+      );
     }
-
-    if (validGenes.length === 0) {
+    const availableVariables =
+      this.dataLayer.getAvailableVariables('gene_expression');
+    if (!Array.isArray(availableVariables) || availableVariables.length === 0) {
       throw new Error(ERROR_MESSAGES.GENE_NOT_FOUND);
+    }
+    const availableGenes = new Set();
+    for (const [index, variable] of availableVariables.entries()) {
+      if (
+        variable === null ||
+        typeof variable !== 'object' ||
+        typeof variable.key !== 'string' ||
+        variable.key.length === 0
+      ) {
+        throw new TypeError(
+          `Available gene entry ${index} must own a non-empty key`
+        );
+      }
+      if (availableGenes.has(variable.key)) {
+        throw new Error(
+          `Available gene inventory contains duplicate key "${variable.key}"`
+        );
+      }
+      availableGenes.add(variable.key);
+    }
+    for (const gene of genes) {
+      if (!availableGenes.has(gene)) {
+        throw new Error(
+          `Requested custom gene "${gene}" was not found`
+        );
+      }
     }
 
     // Build expression matrix
     const matrix = await this._matrixBuilder.buildMatrix({
-      genes: validGenes,
+      genes: [...genes],
       groups,
       transform,
       onProgress,
@@ -759,9 +895,8 @@ export class GenesPanelController {
         transform,
         distance,
         linkage,
-        geneCount: validGenes.length,
-        groupCount: groups.length,
-        invalidGenes: invalidGenes.length > 0 ? invalidGenes : null
+        geneCount: genes.length,
+        groupCount: groups.length
       }
     };
   }

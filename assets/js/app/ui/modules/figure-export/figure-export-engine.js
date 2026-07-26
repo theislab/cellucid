@@ -3,7 +3,7 @@
  *
  * Orchestrates:
  * - Snapshotting the current view data (positions, colors, visibility)
- * - Choosing large-dataset strategies
+ * - Preserving the explicitly requested SVG strategy
  * - Delegating rendering to SVG/PNG renderers
  * - Download + notification lifecycle
  *
@@ -14,9 +14,17 @@
  */
 
 import { getNotificationCenter } from '../../../notification-center.js';
-import { clamp, parseNumberOr } from '../../../utils/number-utils.js';
 import { buildExportFilename, downloadBlob, formatTimestampForFilename } from './utils/export-helpers.js';
+import { createFigureExportZip } from './utils/zip-archive.js';
 import { computeGridDims } from './utils/layout.js';
+import { assertCameraState } from '../../../../rendering/camera-state-contract.js';
+import {
+  assertFigureExportBatchRequest,
+  assertFigureExportPayload,
+  assertFigureExportSingleRequest,
+  assertFigureExportViewId,
+  createFigureExportPayloadOptions,
+} from './figure-export-contract.js';
 
 const LIVE_VIEW_ID = 'live';
 
@@ -27,7 +35,7 @@ const LIVE_VIEW_ID = 'live';
 /**
  * @typedef {object} FigureExportJob
  * @property {FigureExportFormat} format
- * @property {number} [dpi]
+ * @property {number|null} dpi
  */
 
 /**
@@ -35,7 +43,7 @@ const LIVE_VIEW_ID = 'live';
  * @property {FigureExportFormat} format
  * @property {number} width
  * @property {number} height
- * @property {number} [dpi]
+ * @property {number|null} dpi
  * @property {boolean} [exportAllViews]
  * @property {string} [title]
  * @property {boolean} [includeAxes]
@@ -59,8 +67,8 @@ const LIVE_VIEW_ID = 'live';
  * @property {boolean} [emphasizeSelection]
  * @property {number} [selectionMutedOpacity]
  * @property {{ enabled?: boolean; x?: number; y?: number; width?: number; height?: number } | null} [crop]
- * @property {'ask'|'full-vector'|'optimized-vector'|'hybrid'|'raster'} [strategy]
- * @property {number} [optimizedTargetCount]
+ * @property {'full-vector'|'optimized-vector'|'hybrid'|null} strategy
+ * @property {number|null} optimizedTargetCount
  * @property {FigureExportJob[]} [jobs]
  */
 
@@ -82,27 +90,30 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
    *   datasetSourceCitation: string|null,
    *   datasetUserPath: string|null
    * }}
-   */
+  */
   function getDatasetIdentity() {
-    const meta = dataSourceManager?.getCurrentMetadata?.() || null;
-    const datasetId = dataSourceManager?.getCurrentDatasetId?.() || meta?.id || null;
-    const datasetName = meta?.name || meta?.id || null;
-    const sourceType = dataSourceManager?.getCurrentSourceType?.() || null;
-    const datasetBaseUrl = dataSourceManager?.getCurrentBaseUrl?.() || null;
-    const datasetSourceName = meta?.source?.name || null;
-    const datasetSourceUrl = meta?.source?.url || null;
-    const datasetSourceCitation = meta?.source?.citation || null;
-    const datasetUserPath = dataSourceManager?.getStateSnapshot?.()?.userPath || null;
-
-    // If the viewer/state point counts disagree (e.g., benchmark synthetic mode),
-    // avoid reusing stale DataSourceManager labels.
-    const viewerCount = typeof viewer.getPointCount === 'function' ? viewer.getPointCount() : null;
-    const stateCount = state?.pointCount ?? null;
-    if (viewerCount != null && stateCount != null && viewerCount !== stateCount) {
+    const viewerCount = viewer.getPointCount();
+    const stateCount = state.pointCount;
+    if (
+      !Number.isSafeInteger(viewerCount) ||
+      viewerCount < 0 ||
+      !Number.isSafeInteger(stateCount) ||
+      stateCount < 0
+    ) {
+      throw new TypeError(
+        'Figure export requires exact non-negative viewer and state point counts.'
+      );
+    }
+    if (viewerCount !== stateCount) {
+      throw new Error(
+        `Figure export point-count mismatch: viewer has ${viewerCount} points while state has ${stateCount}`
+      );
+    }
+    if (dataSourceManager === null) {
       return {
-        datasetName: 'Synthetic',
-        datasetId: 'synthetic',
-        sourceType: 'benchmark',
+        datasetName: null,
+        datasetId: null,
+        sourceType: null,
         datasetBaseUrl: null,
         datasetSourceName: null,
         datasetSourceUrl: null,
@@ -110,6 +121,39 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
         datasetUserPath: null,
       };
     }
+    for (const methodName of [
+      'getCurrentMetadata',
+      'getCurrentDatasetId',
+      'getCurrentSourceType',
+      'getCurrentBaseUrl',
+      'getStateSnapshot',
+    ]) {
+      if (typeof dataSourceManager[methodName] !== 'function') {
+        throw new TypeError(
+          `Figure export data source manager is missing ${methodName}().`
+        );
+      }
+    }
+    const meta = dataSourceManager.getCurrentMetadata();
+    if (meta !== null && (typeof meta !== 'object' || Array.isArray(meta))) {
+      throw new TypeError('Figure export dataset metadata must be an object or null.');
+    }
+    const dataSourceSnapshot = dataSourceManager.getStateSnapshot();
+    if (
+      dataSourceSnapshot === null ||
+      typeof dataSourceSnapshot !== 'object' ||
+      Array.isArray(dataSourceSnapshot)
+    ) {
+      throw new TypeError('Figure export data source snapshot must be an object.');
+    }
+    const datasetId = dataSourceManager.getCurrentDatasetId();
+    const datasetName = meta === null ? null : (meta.name ?? null);
+    const sourceType = dataSourceManager.getCurrentSourceType();
+    const datasetBaseUrl = dataSourceManager.getCurrentBaseUrl();
+    const datasetSourceName = meta?.source?.name ?? null;
+    const datasetSourceUrl = meta?.source?.url ?? null;
+    const datasetSourceCitation = meta?.source?.citation ?? null;
+    const datasetUserPath = dataSourceSnapshot.userPath ?? null;
 
     return {
       datasetName,
@@ -129,16 +173,12 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
    * @param {string} viewId
    */
   function getViewData(viewId) {
-    const vid = String(viewId || LIVE_VIEW_ID);
-    const ctx = state?.viewContexts?.get?.(vid) || null;
-
-    if (
-      typeof viewer.getViewPositions !== 'function' ||
-      typeof viewer.getViewColors !== 'function' ||
-      typeof viewer.getViewTransparency !== 'function' ||
-      typeof viewer.getPointCount !== 'function'
-    ) {
-      throw new Error('Figure export requires viewer.getViewPositions/getViewColors/getViewTransparency/getPointCount');
+    const vid = assertFigureExportViewId(viewId);
+    const ctx = vid === LIVE_VIEW_ID
+      ? null
+      : state.viewContexts.get(vid);
+    if (vid !== LIVE_VIEW_ID && !ctx) {
+      throw new Error(`Figure export has no state context for view "${vid}".`);
     }
 
     const positions = viewer.getViewPositions(vid);
@@ -146,20 +186,37 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
     const transparency = viewer.getViewTransparency(vid);
     const pointCount = viewer.getPointCount();
 
-    const centroidPositions = ctx?.centroidPositions
-      || (vid === LIVE_VIEW_ID ? (state.centroidPositions || null) : null);
-    const centroidColors = ctx?.centroidColors
-      || (vid === LIVE_VIEW_ID ? (state.centroidColors || null) : null);
-    const centroidLabelTexts = Array.isArray(ctx?.centroidLabels)
-      ? ctx.centroidLabels.map((entry) => {
+    const centroidPositions = vid === LIVE_VIEW_ID
+      ? state.centroidPositions
+      : ctx.centroidPositions;
+    const centroidColors = vid === LIVE_VIEW_ID
+      ? state.centroidColors
+      : ctx.centroidColors;
+    const centroidLabels = vid === LIVE_VIEW_ID
+      ? state.centroidLabels
+      : ctx.centroidLabels;
+    if (!Array.isArray(centroidLabels)) {
+      throw new TypeError(
+        `Figure export centroid labels for view "${vid}" must be an array.`
+      );
+    }
+    const centroidLabelTexts = centroidLabels.map((entry, index) => {
+        if (entry === null || typeof entry !== 'object') {
+          throw new TypeError(
+            `Figure export centroid label ${index} for view "${vid}" must be an object.`
+          );
+        }
         const elText = entry?.el?.textContent;
         const rawText = entry?.text;
-        return String(elText ?? rawText ?? '');
-      })
-      : (Array.isArray(state?.centroidLabels) && vid === LIVE_VIEW_ID
-        ? state.centroidLabels.map((entry) => String(entry?.el?.textContent ?? entry?.text ?? ''))
-        : []);
-    const centroidFlags = viewer.getCentroidFlags?.(vid) || null;
+        const text = elText ?? rawText;
+        if (typeof text !== 'string') {
+          throw new TypeError(
+            `Figure export centroid label ${index} for view "${vid}" must publish text.`
+          );
+        }
+        return text;
+      });
+    const centroidFlags = viewer.getCentroidFlags(vid);
 
     return {
       positions,
@@ -179,10 +236,11 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
    * @param {FigureExportOptions} options
    */
   async function exportFigure(options) {
-    const results = await exportFigures({
-      ...options,
-      jobs: [{ format: options?.format === 'png' ? 'png' : 'svg', dpi: options?.dpi }],
-    });
+    const exactOptions = assertFigureExportSingleRequest(options);
+    const results = await runExport(
+      exactOptions,
+      [{ format: exactOptions.format, dpi: exactOptions.dpi }]
+    );
     return results[0];
   }
 
@@ -193,27 +251,14 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
    * @returns {Promise<Array<{ format: FigureExportFormat; filename: string; metadata: any }>>}
    */
   async function exportFigures(options) {
-    const width = Math.max(10, Math.round(options?.width || 1200));
-    const height = Math.max(10, Math.round(options?.height || 900));
-    const exportAllViews = options?.exportAllViews === true;
-    const strategy = options?.strategy || 'ask';
+    const exactOptions = assertFigureExportBatchRequest(options);
+    return runExport(exactOptions, exactOptions.jobs);
+  }
 
-    const rawJobs = Array.isArray(options?.jobs) && options.jobs.length
-      ? options.jobs
-      : [{ format: options?.format === 'png' ? 'png' : 'svg', dpi: options?.dpi }];
-
-    /** @type {Array<{ requested: FigureExportFormat; format: FigureExportFormat; dpi: number }>} */
-    const jobs = [];
-    const seen = new Set();
-    for (const job of rawJobs) {
-      const requested = job?.format === 'png' ? 'png' : 'svg';
-      const format = requested === 'svg' && strategy === 'raster' ? 'png' : requested;
-      const dpi = Math.max(72, Math.round(job?.dpi ?? options?.dpi ?? 300));
-      const key = format === 'png' ? `png:${dpi}` : 'svg';
-      if (seen.has(key)) continue;
-      seen.add(key);
-      jobs.push({ requested, format, dpi });
-    }
+  async function runExport(options, jobs) {
+    const width = options.width;
+    const height = options.height;
+    const exportAllViews = options.exportAllViews;
 
     const {
       datasetName,
@@ -225,87 +270,116 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
       datasetSourceCitation,
       datasetUserPath,
     } = getDatasetIdentity();
-    const activeViewId = typeof state.getActiveViewId === 'function'
-      ? state.getActiveViewId()
-      : (typeof viewer.getFocusedViewId === 'function' ? viewer.getFocusedViewId() : LIVE_VIEW_ID);
-    const viewId = String(activeViewId || LIVE_VIEW_ID);
+    const viewId = assertFigureExportViewId(state.getActiveViewId());
+    const liveViewLabel = viewer.getLiveViewLabel();
+    assertFigureExportViewId(liveViewLabel, 'Figure export live view label');
+    const snapshotViews = viewer.getSnapshotViews().map((view, index) => {
+      if (
+        view === null ||
+        typeof view !== 'object' ||
+        typeof view.id !== 'string' ||
+        view.id.length === 0 ||
+        typeof view.label !== 'string' ||
+        view.label.length === 0
+      ) {
+        throw new TypeError(
+          `Figure export snapshot descriptor ${index} must publish exact id and label strings.`
+        );
+      }
+      return { id: view.id, label: view.label };
+    });
+    const activeSnapshot = viewId === LIVE_VIEW_ID
+      ? null
+      : snapshotViews.find((view) => view.id === viewId);
+    if (viewId !== LIVE_VIEW_ID && !activeSnapshot) {
+      throw new Error(`Active figure export view "${viewId}" does not exist.`);
+    }
     const viewLabel = viewId === LIVE_VIEW_ID
-      ? (viewer.getLiveViewLabel?.() || 'View 1')
-      : viewId;
+      ? liveViewLabel
+      : activeSnapshot.label;
 
-    const field = typeof state.getFieldForView === 'function'
-      ? state.getFieldForView(viewId)
-      : (typeof state.getActiveField === 'function' ? state.getActiveField() : null);
-    const fieldKey = field?.key || null;
-    const fieldKind = field?.kind || null;
-    const filters = typeof state.getFilterSummaryForView === 'function'
-      ? state.getFilterSummaryForView(viewId)
-      : (typeof state.getFilterSummaryLines === 'function' ? state.getFilterSummaryLines() : []);
+    if (
+      typeof state.getFieldForView !== 'function' ||
+      typeof state.getFilterSummaryForView !== 'function'
+    ) {
+      throw new TypeError(
+        'Figure export state must publish getFieldForView() and getFilterSummaryForView().'
+      );
+    }
+    const field = state.getFieldForView(viewId);
+    if (
+      field !== null &&
+      (typeof field !== 'object' || Array.isArray(field))
+    ) {
+      throw new TypeError(
+        `Figure export field for view "${viewId}" must be an object or null.`
+      );
+    }
+    const fieldKey = field === null ? null : field.key;
+    const fieldKind = field === null ? null : field.kind;
+    const filters = state.getFilterSummaryForView(viewId);
+    if (!Array.isArray(filters) || filters.some((line) => typeof line !== 'string')) {
+      throw new TypeError('Figure export filters must be an array of strings.');
+    }
 
-    const viewLayout = typeof viewer.getViewLayout === 'function' ? viewer.getViewLayout() : null;
-    const wantsGrid = exportAllViews && viewLayout?.mode === 'grid' && typeof viewer.getSnapshotViews === 'function';
+    const viewLayout = viewer.getViewLayout();
+    const wantsGrid = exportAllViews && viewLayout.mode === 'grid';
 
     const views = wantsGrid
-      ? [{ id: LIVE_VIEW_ID, label: viewer.getLiveViewLabel?.() || 'View 1' }, ...viewer.getSnapshotViews()]
-      : [{ id: viewId, label: viewId === LIVE_VIEW_ID ? (viewer.getLiveViewLabel?.() || 'View 1') : viewId }];
+      ? [
+          ...(viewLayout.liveViewHidden
+            ? []
+            : [{ id: LIVE_VIEW_ID, label: liveViewLabel }]),
+          ...snapshotViews,
+        ]
+      : [{ id: viewId, label: viewLabel }];
+    if (views.length === 0) {
+      throw new Error('Figure export grid contains no published views.');
+    }
 
     // Snapshot per-view render state so exports match the exact on-screen projection,
     // especially in split-view grid mode where each pane has its own viewport aspect.
-    if (typeof viewer.getViewRenderState !== 'function') {
-      throw new Error('Figure export requires viewer.getViewRenderState');
-    }
-    if (typeof viewer.getViewCameraState !== 'function') {
-      throw new Error('Figure export requires viewer.getViewCameraState');
-    }
-    const baseRenderState = viewer.getViewRenderState(viewId);
+    const baseRenderState = viewer.getViewRenderState(viewId, null);
 
-    const gridViewport = wantsGrid && baseRenderState?.viewportWidth && baseRenderState?.viewportHeight
+    const gridViewport = wantsGrid
       ? (() => {
-        const { cols, rows } = computeGridDims(views.length || 1);
-        const viewportWidth = Math.max(1, Math.floor(baseRenderState.viewportWidth / cols));
-        const viewportHeight = Math.max(1, Math.floor(baseRenderState.viewportHeight / rows));
+        if (
+          !Number.isSafeInteger(baseRenderState.viewportWidth) ||
+          baseRenderState.viewportWidth <= 0 ||
+          !Number.isSafeInteger(baseRenderState.viewportHeight) ||
+          baseRenderState.viewportHeight <= 0
+        ) {
+          throw new TypeError(
+            'Figure export grid requires exact positive render-state viewport dimensions.'
+          );
+        }
+        const { cols, rows } = computeGridDims(views.length);
+        const viewportWidth = Math.floor(baseRenderState.viewportWidth / cols);
+        const viewportHeight = Math.floor(baseRenderState.viewportHeight / rows);
+        if (viewportWidth < 1 || viewportHeight < 1) {
+          throw new RangeError('Figure export grid viewport is too small for its view count.');
+        }
         return { viewportWidth, viewportHeight };
       })()
       : null;
 
     function getViewRenderStateSnapshot(vid) {
-      const key = String(vid || LIVE_VIEW_ID);
-      return gridViewport ? viewer.getViewRenderState(key, gridViewport) : viewer.getViewRenderState(key);
+      const key = assertFigureExportViewId(vid);
+      return viewer.getViewRenderState(key, gridViewport);
     }
 
     function getViewCameraStateSnapshot(vid) {
-      return viewer.getViewCameraState(String(vid || LIVE_VIEW_ID));
+      const key = assertFigureExportViewId(vid);
+      return assertCameraState(
+        viewer.getViewCameraState(key),
+        `Figure-export camera state for "${key}"`
+      );
     }
 
     const payloadBase = {
       width,
       height,
-      title: options?.title || '',
-      options: {
-        includeAxes: options?.includeAxes !== false,
-        includeLegend: options?.includeLegend !== false,
-        legendPosition: options?.legendPosition === 'bottom' ? 'bottom' : 'right',
-        xLabel: options?.xLabel || 'X',
-        yLabel: options?.yLabel || 'Y',
-        background: options?.background || 'white',
-        backgroundColor: options?.backgroundColor || '#ffffff',
-        fontFamily: options?.fontFamily || 'Arial, Helvetica, sans-serif',
-        fontSizePx: Number.isFinite(options?.fontSizePx) ? options.fontSizePx : 12,
-        legendFontSizePx: Number.isFinite(options?.legendFontSizePx) ? options.legendFontSizePx : (Number.isFinite(options?.fontSizePx) ? options.fontSizePx : 12),
-        tickFontSizePx: Number.isFinite(options?.tickFontSizePx) ? options.tickFontSizePx : (Number.isFinite(options?.fontSizePx) ? options.fontSizePx : 12),
-        axisLabelFontSizePx: Number.isFinite(options?.axisLabelFontSizePx) ? options.axisLabelFontSizePx : null,
-        titleFontSizePx: Number.isFinite(options?.titleFontSizePx) ? options.titleFontSizePx : null,
-        centroidLabelFontSizePx: Number.isFinite(options?.centroidLabelFontSizePx) ? options.centroidLabelFontSizePx : null,
-        includeCentroidPoints: options?.includeCentroidPoints,
-        includeCentroidLabels: options?.includeCentroidLabels,
-        crop: options?.crop || null,
-        showOrientation: options?.showOrientation !== false,
-        depthSort3d: options?.depthSort3d !== false,
-        emphasizeSelection: options?.emphasizeSelection === true,
-        selectionMutedOpacity: clamp(parseNumberOr(options?.selectionMutedOpacity, 0.15), 0, 1),
-        strategy,
-        optimizedTargetCount: Number.isFinite(options?.optimizedTargetCount) ? options.optimizedTargetCount : 100000
-      },
+      title: options.title,
       meta: {
         exportedAt: new Date().toISOString(),
         exporter: {
@@ -327,7 +401,8 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
         filters
       },
       views: views.map((v) => ({
-        ...v,
+        id: v.id,
+        label: v.label,
         data: getViewData(v.id),
         renderState: getViewRenderStateSnapshot(v.id),
         cameraState: getViewCameraStateSnapshot(v.id)
@@ -336,7 +411,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
 
     const notifications = getNotificationCenter();
     const countLabel = jobs.length === 1
-      ? jobs[0]?.format?.toUpperCase?.() || 'EXPORT'
+      ? jobs[0].format.toUpperCase()
       : `${jobs.length} exports`;
     const notifId = notifications.startCalculation(`Preparing ${countLabel}…`, 'render');
     const t0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
@@ -350,6 +425,8 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
       let svgRenderer = null;
       /** @type {{ renderFigureToPngBlob?: Function } | null} */
       let pngRenderer = null;
+      /** @type {{ blob: Blob; filename: string; result: { format: FigureExportFormat; filename: string; metadata: any } }[]} */
+      const stagedDownloads = [];
 
       for (let idx = 0; idx < jobs.length; idx++) {
         const job = jobs[idx];
@@ -361,49 +438,103 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
           message: `Rendering ${idx + 1}/${jobs.length}: ${format.toUpperCase()}…`
         });
 
-        const payload = { ...payloadBase, dpi };
+        const payload = {
+          ...payloadBase,
+          format,
+          dpi,
+          options: createFigureExportPayloadOptions(options, format),
+        };
+        assertFigureExportPayload(payload);
 
         if (format === 'svg') {
           if (!svgRenderer) svgRenderer = await import('./renderers/svg-renderer.js');
-          const { blob, suggestedExt } = await svgRenderer.renderFigureToSvgBlob({ state, viewer, payload });
+          const blob = await svgRenderer.renderFigureToSvgBlob({ state, viewer, payload });
+          if (!(blob instanceof Blob) || blob.type !== 'image/svg+xml') {
+            throw new TypeError(
+              'SVG renderer must publish exactly one image/svg+xml Blob.'
+            );
+          }
           const filename = buildExportFilename({
             datasetName,
             fieldKey,
-            viewLabel: wantsGrid ? 'multiview' : views[0]?.label || null,
+            viewLabel: wantsGrid ? 'multiview' : views[0].label,
             variant: null,
-            ext: suggestedExt || 'svg',
+            ext: 'svg',
             timestamp: ts
           });
-          downloadBlob(blob, filename);
-          results.push({ format: 'svg', filename, metadata: payloadBase.meta });
+          stagedDownloads.push({
+            blob,
+            filename,
+            result: { format: 'svg', filename, metadata: payloadBase.meta },
+          });
         } else {
           if (!pngRenderer) pngRenderer = await import('./renderers/png-renderer.js');
           const blob = await pngRenderer.renderFigureToPngBlob({ state, viewer, payload });
+          if (!(blob instanceof Blob) || blob.type !== 'image/png') {
+            throw new TypeError(
+              'PNG renderer must publish exactly one image/png Blob.'
+            );
+          }
           const variant = needsMultiplePng ? `dpi${dpi}` : null;
           const filename = buildExportFilename({
             datasetName,
             fieldKey,
-            viewLabel: wantsGrid ? 'multiview' : views[0]?.label || null,
+            viewLabel: wantsGrid ? 'multiview' : views[0].label,
             variant,
             ext: 'png',
             timestamp: ts
           });
-          downloadBlob(blob, filename);
-          results.push({ format: 'png', filename, metadata: payloadBase.meta });
+          stagedDownloads.push({
+            blob,
+            filename,
+            result: { format: 'png', filename, metadata: payloadBase.meta },
+          });
         }
       }
+
+      let deliveryBlob;
+      let deliveryFilename;
+      if (stagedDownloads.length === 1) {
+        deliveryBlob = stagedDownloads[0].blob;
+        deliveryFilename = stagedDownloads[0].filename;
+      } else {
+        deliveryBlob = await createFigureExportZip(
+          stagedDownloads.map(staged => ({
+            filename: staged.filename,
+            blob: staged.blob,
+          }))
+        );
+        if (deliveryBlob.type !== 'application/zip') {
+          throw new TypeError(
+            'Figure export batch archive must be exactly application/zip.'
+          );
+        }
+        deliveryFilename = buildExportFilename({
+          datasetName,
+          fieldKey,
+          viewLabel: wantsGrid ? 'multiview' : views[0].label,
+          variant: 'batch',
+          ext: 'zip',
+          timestamp: ts
+        });
+      }
+      downloadBlob(deliveryBlob, deliveryFilename);
+      results.push(...stagedDownloads.map(staged => staged.result));
 
       const t1 = typeof performance !== 'undefined' ? performance.now() : Date.now();
       notifications.completeCalculation(notifId, 'Export complete', t1 - t0);
       notifications.success(
-        `Exported ${results.length} file${results.length === 1 ? '' : 's'}`,
+        results.length === 1
+          ? 'Exported 1 file'
+          : `Exported ${results.length} files in one ZIP archive`,
         { category: 'download', duration: 2500 }
       );
       return results;
     } catch (err) {
       console.error('[FigureExport] Export failed:', err);
-      notifications.failCalculation(notifId, err?.message || 'Export failed');
-      notifications.error(`Export failed: ${err?.message || err}`, { category: 'render', duration: 6000 });
+      const message = err instanceof Error ? err.message : String(err);
+      notifications.failCalculation(notifId, message);
+      notifications.error(`Export failed: ${message}`, { category: 'render', duration: 6000 });
       throw err;
     }
   }

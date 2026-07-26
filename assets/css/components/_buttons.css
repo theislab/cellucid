@@ -58,30 +58,48 @@
 
 /* Info button (small circular "i" icon) */
 .info-btn {
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: var(--space-3);
-  height: var(--space-3);
+  width: var(--space-3-5);
+  height: var(--space-3-5);
+  min-width: var(--space-3-5);
+  min-height: var(--space-3-5);
   font-family: var(--font-display);
-  font-size: calc(var(--text-2xs) - var(--space-px));
-  font-weight: 500;
+  font-size: var(--text-2xs);
+  font-weight: var(--font-weight-medium);
   line-height: 1;
-  padding-left: calc(var(--space-px) / 2);
-  padding-bottom: var(--space-px);
+  margin: 0;
+  padding: 0;
   border-radius: 50%;
   border: var(--border-width-1) solid var(--color-text-tertiary);
   background: transparent;
   color: var(--color-text-tertiary);
   cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
   transition: var(--transition-all);
   flex-shrink: 0;
   text-transform: lowercase;
 }
 
-.info-btn:hover {
+.info-btn::before {
+  content: '';
+  position: absolute;
+  inset: calc(-1 * var(--space-1-5));
+  border-radius: 50%;
+}
+
+.info-btn:hover,
+.info-btn[aria-expanded="true"] {
   border-color: var(--color-text-secondary);
   color: var(--color-text-secondary);
+  background: var(--color-surface-secondary);
+}
+
+.info-btn:focus-visible {
+  outline-offset: var(--space-1);
 }
 
 /* Info tooltip popup - uses fixed positioning to escape accordion overflow.
@@ -92,8 +110,14 @@
   background: var(--color-surface-elevated);
   border: var(--border-strong);
   box-shadow: var(--shadow-md);
-  width: 240px;
+  width: min(240px, calc(100vw - var(--space-4)));
+  max-height: calc(100vh - var(--space-4));
+  overflow: auto;
   box-sizing: border-box;
+  color: var(--color-text-secondary);
+}
+
+.info-tooltip[hidden] {
   display: none;
 }
 

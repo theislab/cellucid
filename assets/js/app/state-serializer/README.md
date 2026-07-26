@@ -7,7 +7,8 @@ It is **not** the save/load implementation by itself anymore:
 - Features persist state via small **contributors** under `cellucid/assets/js/app/session/contributors/`
 
 Dev-phase constraints:
-- No backward compatibility, no migrations, no version fields.
+- Only the current state document is accepted; incompatible documents are
+  rejected and the document carries no version field.
 - Remove old snapshot save/load code paths.
 - Sessions are treated as **untrusted input** (bounds checks + size guards).
 
@@ -25,33 +26,13 @@ The intent is:
 
 ---
 
-## Auto-Load on Startup (Dataset Base URL)
+## Explicit Session Loading
 
-How it works:
-- On startup, `cellucid/assets/js/app/main.js` calls `sessionSerializer.restoreLatestFromDatasetExports()`.
-- The SessionSerializer reads `state-snapshots.json` from the **current dataset base URL** (the same folder that contains `obs_manifest.json`, `points_3d.bin.gz`, etc.).
-- It filters for entries whose **filename ends with** `.cellucid-session` (case-insensitive, query/hash ignored) and loads the **last** entry.
-- It resolves bundle URLs relative to the fetched manifest URL (`Response.url`) so redirects and absolute/relative entries work the same.
-
-Expected files (example for the `suo` demo dataset, assuming an exports base like `https://theislab.github.io/cellucid-datasets/exports/`):
-- `https://theislab.github.io/cellucid-datasets/exports/suo/state-snapshots.json`
-- `https://theislab.github.io/cellucid-datasets/exports/suo/cellucid-session-YYYY-MM-DDTHH-MM-SS.cellucid-session`
-
-Supported `state-snapshots.json` shapes (dev-phase):
-- `{ "states": ["file.cellucid-session", ...] }` (recommended)
-- `["file.cellucid-session", ...]` (also accepted)
-
-### Troubleshooting (when auto-load “does nothing”)
-
-If nothing happens and you see no notifications:
-- Open DevTools → Console:
-  - The loader logs when `state-snapshots.json` can’t be fetched/parsed or contains no `.cellucid-session` entries.
-  - If you see `[Main] No session bundle auto-loaded…`, the manifest was missing/empty or had no matching `.cellucid-session` entries.
-  - If you see `Invalid chunk length … (session file truncated?)`, the `.cellucid-session` response was incomplete or corrupted.
-- Open DevTools → Network:
-  - Verify `.../state-snapshots.json` returns **real JSON** (not an HTML SPA fallback page).
-  - Verify the resolved `.cellucid-session` URL returns `200` and the response body is not empty.
-  - Check response headers for `Content-Encoding`: if your host compresses `.cellucid-session`, `Content-Length` can be unreliable for bounds checks in browsers (fixed in recent builds by treating it as a hint only).
+Cellucid never discovers or restores session state during startup. A user saves
+and restores a `.cellucid-session` file through the **Save State** and
+**Load State** controls. Loading a session is the only action that may restore
+camera state or camera-path keyframes, and playback remains stopped until the
+user presses Play.
 
 ---
 
