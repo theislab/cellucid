@@ -27,7 +27,7 @@
   --space-24: 96px;
 
   /* Layout primitives. */
-  --sidebar-width: 280px;
+  --sidebar-width: var(--sidebar-user-width, 280px);
   --sidebar-min-width: 200px;
   --sidebar-max-width: 450px;
   --header-height: 36px;

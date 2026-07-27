@@ -84,6 +84,88 @@ function requireHighlightTransparency(transparency, pointCount) {
   return transparency;
 }
 
+function requireHighlightMatrix(matrix, label) {
+  if (!(matrix instanceof Float32Array) || matrix.length !== 16) {
+    throw new TypeError(`${label} must be a Float32Array with exactly 16 entries.`);
+  }
+  for (let i = 0; i < matrix.length; i++) {
+    if (!Number.isFinite(matrix[i])) {
+      throw new TypeError(`${label} must contain only finite numbers.`);
+    }
+  }
+  return matrix;
+}
+
+function requireHighlightDirection(direction, label) {
+  if (!(direction instanceof Float32Array) || direction.length !== 3) {
+    throw new TypeError(`${label} must be a Float32Array with exactly 3 entries.`);
+  }
+  const squaredLength =
+    direction[0] * direction[0] +
+    direction[1] * direction[1] +
+    direction[2] * direction[2];
+  if (
+    !Number.isFinite(squaredLength) ||
+    Math.abs(squaredLength - 1) > 1e-5
+  ) {
+    throw new TypeError(`${label} must be a normalized finite direction.`);
+  }
+  return direction;
+}
+
+function requireFiniteHighlightNumber(value, label, { positive = false } = {}) {
+  if (!Number.isFinite(value) || (positive && value <= 0)) {
+    const qualifier = positive ? 'positive finite' : 'finite';
+    throw new TypeError(`${label} must be a ${qualifier} number.`);
+  }
+  return value;
+}
+
+function requireHighlightViewport(viewport, label) {
+  if (!viewport || typeof viewport !== 'object' || Array.isArray(viewport)) {
+    throw new TypeError(`${label} must be an exact viewport object.`);
+  }
+
+  requireHighlightViewId(viewport.viewId, `${label} viewId`);
+  requireFiniteHighlightNumber(viewport.vpWidth, `${label} width`, { positive: true });
+  requireFiniteHighlightNumber(viewport.vpHeight, `${label} height`, { positive: true });
+  requireFiniteHighlightNumber(viewport.vpAspect, `${label} aspect`, { positive: true });
+  requireFiniteHighlightNumber(viewport.vpOffsetX, `${label} X offset`);
+  requireFiniteHighlightNumber(viewport.vpOffsetY, `${label} Y offset`);
+  requireFiniteHighlightNumber(viewport.vpLocalX, `${label} local X`);
+  requireFiniteHighlightNumber(viewport.vpLocalY, `${label} local Y`);
+  requireFiniteHighlightNumber(
+    viewport.projectionCenterNdcX,
+    `${label} projection center`
+  );
+  requireHighlightMatrix(viewport.projectionMatrix, `${label} projection matrix`);
+  requireHighlightDirection(viewport.cameraForward, `${label} camera forward`);
+  requireFiniteHighlightNumber(
+    viewport.cameraTargetRadius,
+    `${label} camera target radius`,
+    { positive: true }
+  );
+  if (viewport.effectiveViewMatrix !== null) {
+    requireHighlightMatrix(
+      viewport.effectiveViewMatrix,
+      `${label} effective view matrix`
+    );
+  }
+  return viewport;
+}
+
+function captureHighlightViewport(viewport, mat4, label) {
+  const exactViewport = requireHighlightViewport(viewport, label);
+  const projectionMatrix = mat4.create();
+  mat4.copy(projectionMatrix, exactViewport.projectionMatrix);
+  const cameraForward = new Float32Array(exactViewport.cameraForward);
+  return {
+    ...exactViewport,
+    projectionMatrix,
+    cameraForward
+  };
+}
+
 function requireHighlightData(highlightData, pointCount = null) {
   if (!(highlightData instanceof Uint8Array)) {
     throw new TypeError('Highlight data must be a Uint8Array.');
@@ -717,9 +799,6 @@ export function drawProximityIndicator({
   proximityCenter,
   proximityCurrentRadius,
   mat4,
-  fov,
-  near,
-  far,
   viewMatrix,
   modelMatrix
 }) {
@@ -731,17 +810,20 @@ export function drawProximityIndicator({
   lassoCtx.scale(dpr, dpr);
   lassoCtx.clearRect(0, 0, rect.width, rect.height);
 
-  const vp = proximityCenter.viewport;
-  const vpWidth = vp ? vp.vpWidth : rect.width;
-  const vpHeight = vp ? vp.vpHeight : rect.height;
-  const vpOffsetX = vp ? vp.vpOffsetX : 0;
-  const vpOffsetY = vp ? vp.vpOffsetY : 0;
+  const vp = requireHighlightViewport(
+    proximityCenter.viewport,
+    'Proximity indicator viewport'
+  );
+  const vpWidth = vp.vpWidth;
+  const vpHeight = vp.vpHeight;
+  const vpOffsetX = vp.vpOffsetX;
+  const vpOffsetY = vp.vpOffsetY;
 
   const localMvp = mat4.create();
-  const localProj = mat4.create();
-  mat4.perspective(localProj, fov, vpWidth / vpHeight, near, far);
-  const effectiveView = (vp && vp.effectiveViewMatrix) ? vp.effectiveViewMatrix : viewMatrix;
-  mat4.multiply(localMvp, localProj, effectiveView);
+  const effectiveView = vp.effectiveViewMatrix === null
+    ? requireHighlightMatrix(viewMatrix, 'Proximity indicator view matrix')
+    : vp.effectiveViewMatrix;
+  mat4.multiply(localMvp, vp.projectionMatrix, effectiveView);
   mat4.multiply(localMvp, localMvp, modelMatrix);
 
   const centerScreen = projectPointToScreen(
@@ -1756,15 +1838,19 @@ export class HighlightTools {
       }
       this.lassoPath = [{ x: localX, y: localY }];
 
-      const vpInfo = this.getViewportInfoAtScreen(e.clientX, e.clientY);
+      const vpInfo = captureHighlightViewport(
+        this.getViewportInfoAtScreen(e.clientX, e.clientY),
+        this.mat4,
+        'Lasso interaction viewport'
+      );
       const viewId = requireHighlightViewId(
-        vpInfo?.viewId,
+        vpInfo.viewId,
         'Lasso interaction viewId'
       );
       const capturedViewMatrix = this.mat4.create();
-      const sourceViewMatrix = vpInfo.effectiveViewMatrix
-        ? vpInfo.effectiveViewMatrix
-        : ctx.viewMatrix;
+      const sourceViewMatrix = vpInfo.effectiveViewMatrix === null
+        ? requireHighlightMatrix(ctx.viewMatrix, 'Lasso interaction view matrix')
+        : vpInfo.effectiveViewMatrix;
       this.mat4.copy(capturedViewMatrix, sourceViewMatrix);
       this.lassoViewContext = {
         viewId,
@@ -1783,9 +1869,13 @@ export class HighlightTools {
       const cellIdx = this.pickCellAtScreen(e.clientX, e.clientY);
 
       // Get view-specific positions for multi-dimensional support
-      const vpInfo = this.getViewportInfoAtScreen(e.clientX, e.clientY);
+      const vpInfo = captureHighlightViewport(
+        this.getViewportInfoAtScreen(e.clientX, e.clientY),
+        this.mat4,
+        'Proximity interaction viewport'
+      );
       const viewId = requireHighlightViewId(
-        vpInfo?.viewId,
+        vpInfo.viewId,
         'Proximity interaction viewId'
       );
       const positions = requireHighlightPositions(
@@ -1819,15 +1909,24 @@ export class HighlightTools {
         const count = this.proximityCandidateSet.size;
         cx /= count; cy /= count; cz /= count;
 
-        const rect = this.canvas.getBoundingClientRect();
-        const localX = e.clientX - rect.left;
-        const localY = e.clientY - rect.top;
-        const ray = this.screenToRay(localX, localY, rect.width, rect.height);
+        const rayViewMatrix = vpInfo.effectiveViewMatrix === null
+          ? requireHighlightMatrix(
+            ctx.viewMatrix,
+            'Proximity interaction view matrix'
+          )
+          : vpInfo.effectiveViewMatrix;
+        const ray = this.screenToRay(
+          vpInfo.vpLocalX,
+          vpInfo.vpLocalY,
+          vpInfo.vpWidth,
+          vpInfo.vpHeight,
+          vpInfo.vpAspect,
+          rayViewMatrix,
+          vpInfo.projectionCenterNdcX
+        );
 
-        if (ray && ctx.target && ctx.eye) {
-          const viewDir = this.vec3.sub(this.vec3.create(), ctx.target, ctx.eye);
-          this.vec3.normalize(viewDir, viewDir);
-
+        if (ray) {
+          const viewDir = vpInfo.cameraForward;
           const centroid = [cx, cy, cz];
           const denom = viewDir[0] * ray.direction[0] + viewDir[1] * ray.direction[1] + viewDir[2] * ray.direction[2];
 
@@ -1867,9 +1966,6 @@ export class HighlightTools {
           proximityCenter: this.proximityCenter,
           proximityCurrentRadius: this.proximityCurrentRadius,
           mat4: this.mat4,
-          fov: ctx.fov,
-          near: ctx.near,
-          far: ctx.far,
           viewMatrix: ctx.viewMatrix,
           modelMatrix: ctx.modelMatrix
         });
@@ -1894,9 +1990,13 @@ export class HighlightTools {
           return true;
         }
 
-        const vpInfo = this.getViewportInfoAtScreen(e.clientX, e.clientY);
+        const vpInfo = captureHighlightViewport(
+          this.getViewportInfoAtScreen(e.clientX, e.clientY),
+          this.mat4,
+          'KNN interaction viewport'
+        );
         const viewId = requireHighlightViewId(
-          vpInfo?.viewId,
+          vpInfo.viewId,
           'KNN interaction viewId'
         );
         this.knnSeedCell = {
@@ -1920,9 +2020,6 @@ export class HighlightTools {
           knnSeedCell: this.knnSeedCell,
           knnCurrentDegree: this.knnCurrentDegree,
           mat4: this.mat4,
-          fov: ctx.fov,
-          near: ctx.near,
-          far: ctx.far,
           viewMatrix: ctx.viewMatrix,
           modelMatrix: ctx.modelMatrix,
           viewPositions: knnViewPositions
@@ -1997,11 +2094,7 @@ export class HighlightTools {
           const previewIndices = findCellsInLasso({
             lassoPath: this.lassoPath,
             lassoViewContext: this.lassoViewContext,
-            canvas: this.canvas,
             mat4: this.mat4,
-            fov: ctx.fov,
-            near: ctx.near,
-            far: ctx.far,
             modelMatrix: ctx.modelMatrix,
             transparencyArray: viewTransparency,
             viewPositions
@@ -2022,7 +2115,10 @@ export class HighlightTools {
       const dy = e.clientY - this.proximityCenter.screenY;
       const pixelDist = Math.sqrt(dx * dx + dy * dy);
 
-      this.proximityCurrentRadius = pixelDistanceToWorldRadius(pixelDist, ctx.targetRadius);
+      this.proximityCurrentRadius = pixelDistanceToWorldRadius(
+        pixelDist,
+        this.proximityCenter.viewport.cameraTargetRadius
+      );
 
       drawProximityIndicator({
         canvas: this.canvas,
@@ -2030,9 +2126,6 @@ export class HighlightTools {
         proximityCenter: this.proximityCenter,
         proximityCurrentRadius: this.proximityCurrentRadius,
         mat4: this.mat4,
-        fov: ctx.fov,
-        near: ctx.near,
-        far: ctx.far,
         viewMatrix: ctx.viewMatrix,
         modelMatrix: ctx.modelMatrix
       });
@@ -2105,9 +2198,6 @@ export class HighlightTools {
           knnSeedCell: this.knnSeedCell,
           knnCurrentDegree: this.knnCurrentDegree,
           mat4: this.mat4,
-          fov: ctx.fov,
-          near: ctx.near,
-          far: ctx.far,
           viewMatrix: ctx.viewMatrix,
           modelMatrix: ctx.modelMatrix,
           viewPositions: knnViewPositions
@@ -2195,11 +2285,7 @@ export class HighlightTools {
         const selectedIndices = findCellsInLasso({
           lassoPath: this.lassoPath,
           lassoViewContext: this.lassoViewContext,
-          canvas: this.canvas,
           mat4: this.mat4,
-          fov: ctx.fov,
-          near: ctx.near,
-          far: ctx.far,
           modelMatrix: ctx.modelMatrix,
           transparencyArray: viewTransparency,
           viewPositions
@@ -2619,9 +2705,6 @@ export function drawKnnIndicator({
   knnSeedCell,
   knnCurrentDegree,
   mat4,
-  fov,
-  near,
-  far,
   viewMatrix,
   modelMatrix,
   viewPositions
@@ -2641,20 +2724,20 @@ export function drawKnnIndicator({
   lassoCtx.scale(dpr, dpr);
   lassoCtx.clearRect(0, 0, rect.width, rect.height);
 
-  const vp = knnSeedCell.viewport;
-  if (!vp || typeof vp !== 'object') {
-    throw new Error('KNN indicator requires its exact viewport state.');
-  }
+  const vp = requireHighlightViewport(
+    knnSeedCell.viewport,
+    'KNN indicator viewport'
+  );
   const vpWidth = vp.vpWidth;
   const vpHeight = vp.vpHeight;
   const vpOffsetX = vp.vpOffsetX;
   const vpOffsetY = vp.vpOffsetY;
 
   const localMvp = mat4.create();
-  const localProj = mat4.create();
-  mat4.perspective(localProj, fov, vpWidth / vpHeight, near, far);
-  const effectiveView = (vp && vp.effectiveViewMatrix) ? vp.effectiveViewMatrix : viewMatrix;
-  mat4.multiply(localMvp, localProj, effectiveView);
+  const effectiveView = vp.effectiveViewMatrix === null
+    ? requireHighlightMatrix(viewMatrix, 'KNN indicator view matrix')
+    : vp.effectiveViewMatrix;
+  mat4.multiply(localMvp, vp.projectionMatrix, effectiveView);
   mat4.multiply(localMvp, localMvp, modelMatrix);
 
   const px = positions[knnSeedCell.cellIndex * 3];
@@ -2748,13 +2831,8 @@ export function pointInPolygon(x, y, polygon) {
 export function findCellsInLasso({
   lassoPath,
   lassoViewContext,
-  canvas,
   mat4,
-  fov,
-  near,
-  far,
   modelMatrix,
-  viewMatrix,
   transparencyArray,
   viewPositions
 }) {
@@ -2770,7 +2848,6 @@ export function findCellsInLasso({
     pointCount
   );
 
-  const rect = canvas.getBoundingClientRect();
   if (
     !lassoViewContext ||
     typeof lassoViewContext !== 'object' ||
@@ -2783,24 +2860,26 @@ export function findCellsInLasso({
     lassoViewContext.viewId,
     'Lasso-selection viewId'
   );
-  const vp = lassoViewContext.viewport;
+  const vp = requireHighlightViewport(
+    lassoViewContext.viewport,
+    'Lasso-selection viewport'
+  );
   const vpOffsetX = vp.vpOffsetX;
   const vpOffsetY = vp.vpOffsetY;
   const vpWidth = vp.vpWidth;
   const vpHeight = vp.vpHeight;
-  const lassoViewMatrixLocal = lassoViewContext.viewMatrix;
+  const lassoViewMatrixLocal = requireHighlightMatrix(
+    lassoViewContext.viewMatrix,
+    'Lasso-selection view matrix'
+  );
 
   const localLassoPath = lassoPath.map(pt => ({
     x: pt.x - vpOffsetX,
     y: pt.y - vpOffsetY
   }));
 
-  const vpAspect = vpWidth / vpHeight;
-  const vpProjection = mat4.create();
-  mat4.perspective(vpProjection, fov, vpAspect, near, far);
-
   const vpMvpMatrix = mat4.create();
-  mat4.multiply(vpMvpMatrix, vpProjection, lassoViewMatrixLocal);
+  mat4.multiply(vpMvpMatrix, vp.projectionMatrix, lassoViewMatrixLocal);
   mat4.multiply(vpMvpMatrix, vpMvpMatrix, modelMatrix);
 
   const selectedIndices = [];

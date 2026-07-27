@@ -205,7 +205,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     let ui = null;
 
     debug.log('[Main] Creating viewer...');
-    const viewer = createViewer({ canvas, labelLayer, viewTitleLayer, sidebar });
+    const viewer = createViewer({ canvas, labelLayer, viewTitleLayer });
     debug.log('[Main] Viewer created successfully');
 
     // Expose viewer globally for dev tools (benchmark, debugging)

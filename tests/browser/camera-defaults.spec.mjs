@@ -66,13 +66,22 @@ const obsManifest = {
 
 function createDeterministic3dPositions() {
   const buffer = Buffer.alloc(CELL_COUNT * 3 * Float32Array.BYTES_PER_ELEMENT);
+  const points = [
+    [0, 0, 0],
+    [1, 0, 0],
+    [-1, 0, 0],
+    [0, 1, 0],
+    [0, -1, 0],
+    [0, 0, 1],
+    [0, 0, -1],
+    [0.7, 0.7, 0.7],
+    [-0.7, -0.7, -0.7],
+    [0.7, -0.7, 0.7],
+    [-0.7, 0.7, -0.7],
+    [0.7, 0.7, -0.7],
+  ];
   for (let index = 0; index < CELL_COUNT; index++) {
-    const angle = (2 * Math.PI * index) / CELL_COUNT;
-    const point = [
-      Math.cos(angle),
-      Math.sin(angle),
-      (index - ((CELL_COUNT - 1) / 2)) / ((CELL_COUNT - 1) / 2),
-    ];
+    const point = points[index];
     for (let axis = 0; axis < point.length; axis++) {
       buffer.writeFloatLE(point[axis], ((index * 3) + axis) * 4);
     }
@@ -151,6 +160,36 @@ async function installSynthetic3dFixture(page) {
   });
 }
 
+async function readTargetVisualCenter(page) {
+  return page.evaluate(() => {
+    const viewer = window._cellucidViewer;
+    const camera = viewer.getCameraState();
+    const render = viewer.getRenderState();
+    const matrix = render.mvpMatrix;
+    const [x, y, z] = camera.orbit.target;
+    const clipX =
+      matrix[0] * x + matrix[4] * y + matrix[8] * z + matrix[12];
+    const clipW =
+      matrix[3] * x + matrix[7] * y + matrix[11] * z + matrix[15];
+    const canvas = document.getElementById('glcanvas');
+    const sidebar = document.getElementById('sidebar');
+    const canvasRect = canvas.getBoundingClientRect();
+    const sidebarRight = sidebar.offsetLeft + sidebar.offsetWidth;
+    const visibleLeft = sidebar.classList.contains('hidden')
+      ? canvasRect.left
+      : Math.max(canvasRect.left, sidebarRight);
+    return {
+      camera,
+      navigationMode: viewer.getNavigationMode(),
+      projectedX:
+        canvasRect.left + (((clipX / clipW) + 1) * canvasRect.width) / 2,
+      expectedX: (visibleLeft + canvasRect.right) / 2,
+      expectedY: (canvasRect.top + canvasRect.bottom) / 2,
+      sidebarWidth: sidebar.offsetWidth,
+    };
+  });
+}
+
 test('a fresh deterministic 3-D dataset selects dimension 3 and Orbit', async ({
   context,
   page,
@@ -181,6 +220,407 @@ test('a fresh deterministic 3-D dataset selects dimension 3 and Orbit', async ({
   await expect(page.locator('#navigation-mode')).toHaveValue('orbit');
   await expect(page.locator('.cinematic-transport-bar')).toHaveCount(0);
 
+  expect(productErrors).toEqual([]);
+});
+
+test('Orbit and Planar targets follow the sidebar-aware visual center', async ({
+  page,
+}) => {
+  const productErrors = observeProductErrors(page);
+  await installSynthetic3dFixture(page);
+
+  await page.goto(
+    `/?exportsBaseUrl=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
+      `&dataset=${DATASET_ID}&acceptance=sidebar-aware-camera-center`,
+    { waitUntil: 'domcontentloaded' },
+  );
+  await dismissWelcome(page);
+  await expect(page.locator('#dataset-name')).toHaveText(
+    'Deterministic 3-D orbit fixture',
+  );
+
+  const initial = await readTargetVisualCenter(page);
+  expect(initial.navigationMode).toBe('orbit');
+  expect(Math.abs(initial.projectedX - initial.expectedX)).toBeLessThan(1);
+
+  const resizeHandle = page.locator('#sidebar-resize-handle');
+  const handleBox = await resizeHandle.boundingBox();
+  expect(handleBox).not.toBeNull();
+  await page.mouse.move(
+    handleBox.x + handleBox.width / 2,
+    handleBox.y + handleBox.height / 2,
+  );
+  await page.mouse.down();
+  await page.mouse.move(handleBox.x + handleBox.width / 2 + 80, handleBox.y + 20);
+  await page.mouse.up();
+
+  const resized = await readTargetVisualCenter(page);
+  expect(resized.sidebarWidth).toBeGreaterThan(initial.sidebarWidth);
+  expect(Math.abs(resized.projectedX - resized.expectedX)).toBeLessThan(1);
+  expect(resized.camera).toEqual(initial.camera);
+
+  await page.locator('#sidebar-toggle').click();
+  await expect(page.locator('#sidebar')).toHaveClass(/hidden/);
+  const collapsed = await readTargetVisualCenter(page);
+  expect(Math.abs(collapsed.projectedX - collapsed.expectedX)).toBeLessThan(1);
+  expect(collapsed.camera).toEqual(initial.camera);
+
+  await page.locator('#sidebar-toggle').click();
+  await expect(page.locator('#sidebar')).not.toHaveClass(/hidden/);
+  await page.selectOption('#navigation-mode', 'planar');
+  await expect(page.locator('#navigation-mode')).toHaveValue('planar');
+  const planar = await readTargetVisualCenter(page);
+  expect(planar.navigationMode).toBe('planar');
+  expect(Math.abs(planar.projectedX - planar.expectedX)).toBeLessThan(1);
+
+  await page.mouse.move(planar.expectedX, planar.expectedY);
+  const beforeZoom = planar.camera;
+  await page.mouse.wheel(0, -80);
+  await page.evaluate(() => new Promise(resolve => {
+    requestAnimationFrame(() => requestAnimationFrame(resolve));
+  }));
+  const afterZoom = await readTargetVisualCenter(page);
+  expect(afterZoom.camera.orbit.radius).toBeLessThan(
+    beforeZoom.orbit.radius,
+  );
+  expect(afterZoom.camera.orbit.target).toEqual(beforeZoom.orbit.target);
+
+  await page.locator('#sidebar-toggle').click();
+  await expect(page.locator('#sidebar')).toHaveClass(/hidden/);
+  const collapsedPlanar = await readTargetVisualCenter(page);
+  expect(
+    Math.abs(collapsedPlanar.projectedX - collapsedPlanar.expectedX),
+  ).toBeLessThan(1);
+  expect(collapsedPlanar.camera).toEqual(afterZoom.camera);
+  await page.locator('#sidebar-toggle').click();
+  await expect(page.locator('#sidebar')).not.toHaveClass(/hidden/);
+
+  const interactionProof = await page.evaluate(() => {
+    const viewer = window._cellucidViewer;
+    const canvas = document.getElementById('glcanvas');
+    const sidebar = document.getElementById('sidebar');
+    const canvasRect = canvas.getBoundingClientRect();
+    const sidebarRight = sidebar.offsetLeft + sidebar.offsetWidth;
+    const visualCenterX =
+      (Math.max(canvasRect.left, sidebarRight) + canvasRect.right) / 2;
+    const centerY = (canvasRect.top + canvasRect.bottom) / 2;
+    const singlePick = viewer.pickCellAtScreen(visualCenterX, centerY);
+    viewer.createSnapshotView({
+      sourceViewId: 'live',
+      label: 'Visual-center snapshot',
+      fieldKey: null,
+      fieldKind: null,
+      colors: viewer.getColors(),
+      transparency: viewer.getViewTransparency('live'),
+      centroidPositions: null,
+      centroidColors: null,
+      meta: { filtersText: [] },
+      cameraState: viewer.getCameraState(),
+      dimensionLevel: viewer.getViewDimension('live'),
+    });
+    viewer.setViewLayout('grid', 'live');
+    const paneWidth = canvasRect.width / 2;
+    const leftPaneRight = canvasRect.left + paneWidth;
+    const rightPaneLeft = leftPaneRight;
+    return {
+      singlePick,
+      leftPick: viewer.pickCellAtScreen(
+        (Math.max(canvasRect.left, sidebarRight) + leftPaneRight) / 2,
+        centerY,
+      ),
+      rightPick: viewer.pickCellAtScreen(
+        (rightPaneLeft + canvasRect.right) / 2,
+        centerY,
+      ),
+      webglError: viewer.getGLContext().getError(),
+    };
+  });
+  expect(interactionProof.singlePick).toBeGreaterThanOrEqual(0);
+  expect(interactionProof.leftPick).toBe(interactionProof.singlePick);
+  expect(interactionProof.rightPick).toBe(interactionProof.singlePick);
+  expect(interactionProof.webglError).toBe(0);
+
+  expect(productErrors).toEqual([]);
+});
+
+test('unlocked mixed-mode panes render orbit anchors only in Orbit panes', async ({
+  page,
+}) => {
+  const productErrors = observeProductErrors(page);
+  await installSynthetic3dFixture(page);
+
+  await page.goto(
+    `/?exportsBaseUrl=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
+      `&dataset=${DATASET_ID}&acceptance=per-pane-orbit-anchor`,
+    { waitUntil: 'domcontentloaded' },
+  );
+  await dismissWelcome(page);
+  await expect(page.locator('#dataset-name')).toHaveText(
+    'Deterministic 3-D orbit fixture',
+  );
+
+  const snapshotId = await page.evaluate(() => {
+    const viewer = window._cellucidViewer;
+    const snapshot = viewer.createSnapshotView({
+      sourceViewId: 'live',
+      label: 'Mixed navigation snapshot',
+      fieldKey: null,
+      fieldKind: null,
+      colors: viewer.getColors(),
+      transparency: viewer.getViewTransparency('live'),
+      centroidPositions: null,
+      centroidColors: null,
+      meta: { filtersText: [] },
+      cameraState: viewer.getCameraState(),
+      dimensionLevel: viewer.getViewDimension('live'),
+    });
+    viewer.setViewLayout('grid', 'live');
+    viewer.setCamerasLocked(false);
+
+    const gl = viewer.getGLContext();
+    const drawElements = gl.drawElements.bind(gl);
+    window.__orbitAnchorViewportXs = [];
+    gl.drawElements = (mode, count, type, offset) => {
+      if (mode === gl.TRIANGLES && type === gl.UNSIGNED_SHORT) {
+        window.__orbitAnchorViewportXs.push(
+          gl.getParameter(gl.VIEWPORT)[0],
+        );
+      }
+      return drawElements(mode, count, type, offset);
+    };
+    viewer.setShowOrbitAnchor(true);
+    return snapshot.id;
+  });
+
+  const readAnchorPaneXs = async () => {
+    await page.evaluate(() => new Promise(resolve => {
+      requestAnimationFrame(() => requestAnimationFrame(resolve));
+    }));
+    return page.evaluate(() => (
+      [...new Set(window.__orbitAnchorViewportXs)].sort((a, b) => a - b)
+    ));
+  };
+
+  await page.evaluate(id => {
+    const viewer = window._cellucidViewer;
+    window.__orbitAnchorViewportXs.length = 0;
+    viewer.setViewNavigationMode('live', 'orbit');
+    viewer.setViewNavigationMode(id, 'planar');
+  }, snapshotId);
+  const orbitFocusedPaneXs = await readAnchorPaneXs();
+  expect(orbitFocusedPaneXs).toEqual([0]);
+
+  await page.evaluate(id => {
+    const viewer = window._cellucidViewer;
+    window.__orbitAnchorViewportXs.length = 0;
+    viewer.setViewNavigationMode('live', 'planar');
+    viewer.setViewNavigationMode(id, 'orbit');
+  }, snapshotId);
+  const orbitSnapshotPaneXs = await readAnchorPaneXs();
+  expect(orbitSnapshotPaneXs).toHaveLength(1);
+  expect(orbitSnapshotPaneXs[0]).toBeGreaterThan(0);
+
+  const webglError = await page.evaluate(
+    () => window._cellucidViewer.getGLContext().getError(),
+  );
+  expect(webglError).toBe(0);
+  expect(productErrors).toEqual([]);
+});
+
+test('responsive sidebar CSS remains live and republishes the target center', async ({
+  page,
+}) => {
+  const productErrors = observeProductErrors(page);
+  await page.setViewportSize({ width: 800, height: 720 });
+  await installSynthetic3dFixture(page);
+
+  await page.goto(
+    `/?exportsBaseUrl=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
+      `&dataset=${DATASET_ID}&acceptance=responsive-sidebar-camera-center`,
+    { waitUntil: 'domcontentloaded' },
+  );
+  await dismissWelcome(page);
+  await expect(page.locator('#dataset-name')).toHaveText(
+    'Deterministic 3-D orbit fixture',
+  );
+
+  const compact = await readTargetVisualCenter(page);
+  expect(compact.sidebarWidth).toBe(260);
+  expect(Math.abs(compact.projectedX - compact.expectedX)).toBeLessThan(1);
+  const resizeHandle = page.locator('#sidebar-resize-handle');
+  await expect(resizeHandle).toBeHidden();
+  const hiddenDragResult = await page.evaluate(() => {
+    const handle = document.getElementById('sidebar-resize-handle');
+    const root = document.documentElement;
+    handle.dispatchEvent(new MouseEvent('mousedown', {
+      bubbles: true,
+      button: 0,
+      clientX: 260,
+    }));
+    document.dispatchEvent(new MouseEvent('mousemove', {
+      bubbles: true,
+      clientX: 600,
+    }));
+    document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+    return root.style.getPropertyValue('--sidebar-user-width');
+  });
+  expect(hiddenDragResult).toBe('');
+
+  await page.setViewportSize({ width: 1000, height: 720 });
+  await expect.poll(async () => (
+    await readTargetVisualCenter(page)
+  ).sidebarWidth).toBe(280);
+  const wide = await readTargetVisualCenter(page);
+  expect(Math.abs(wide.projectedX - wide.expectedX)).toBeLessThan(1);
+  expect(wide.camera).toEqual(compact.camera);
+
+  await expect(resizeHandle).toBeVisible();
+  const handleBox = await resizeHandle.boundingBox();
+  expect(handleBox).not.toBeNull();
+  await page.mouse.move(
+    handleBox.x + handleBox.width / 2,
+    handleBox.y + handleBox.height / 2,
+  );
+  await page.mouse.down();
+  await page.mouse.move(handleBox.x + handleBox.width / 2 + 120, handleBox.y + 20);
+  await page.mouse.up();
+  const userSizedWide = await readTargetVisualCenter(page);
+  expect(userSizedWide.sidebarWidth).toBe(400);
+  expect(
+    Math.abs(userSizedWide.projectedX - userSizedWide.expectedX),
+  ).toBeLessThan(1);
+
+  await page.setViewportSize({ width: 800, height: 720 });
+  await expect.poll(async () => (
+    await readTargetVisualCenter(page)
+  ).sidebarWidth).toBe(260);
+  const compactAgain = await readTargetVisualCenter(page);
+  expect(
+    Math.abs(compactAgain.projectedX - compactAgain.expectedX),
+  ).toBeLessThan(1);
+  expect(compactAgain.camera).toEqual(compact.camera);
+
+  await page.setViewportSize({ width: 700, height: 720 });
+  await expect.poll(async () => (
+    await readTargetVisualCenter(page)
+  ).sidebarWidth).toBe(700);
+  await page.setViewportSize({ width: 1000, height: 720 });
+  await expect.poll(async () => (
+    await readTargetVisualCenter(page)
+  ).sidebarWidth).toBe(400);
+  const userSizedWideAgain = await readTargetVisualCenter(page);
+  expect(
+    Math.abs(userSizedWideAgain.projectedX - userSizedWideAgain.expectedX),
+  ).toBeLessThan(1);
+  expect(userSizedWideAgain.camera).toEqual(compact.camera);
+
+  const resumedHandleBox = await resizeHandle.boundingBox();
+  expect(resumedHandleBox).not.toBeNull();
+  await page.mouse.move(
+    resumedHandleBox.x + resumedHandleBox.width / 2,
+    resumedHandleBox.y + resumedHandleBox.height / 2,
+  );
+  await page.mouse.down();
+  await page.mouse.move(
+    resumedHandleBox.x + resumedHandleBox.width / 2 + 20,
+    resumedHandleBox.y + 20,
+  );
+  await expect.poll(() => page.evaluate(
+    () => document.documentElement.style.getPropertyValue('--sidebar-user-width'),
+  )).toBe('420px');
+  await page.setViewportSize({ width: 800, height: 720 });
+  await expect(resizeHandle).toBeHidden();
+  await expect.poll(() => page.evaluate(() => ({
+    resizing: document.getElementById('sidebar').classList.contains('resizing'),
+    cursor: document.body.style.cursor,
+    userSelect: document.body.style.userSelect,
+    userWidth: document.documentElement.style.getPropertyValue(
+      '--sidebar-user-width',
+    ),
+  }))).toEqual({
+    resizing: false,
+    cursor: '',
+    userSelect: '',
+    userWidth: '420px',
+  });
+  await page.mouse.move(700, 200);
+  await page.mouse.up();
+  expect(await page.evaluate(
+    () => document.documentElement.style.getPropertyValue('--sidebar-user-width'),
+  )).toBe('420px');
+  await page.setViewportSize({ width: 1000, height: 720 });
+  await expect.poll(async () => (
+    await readTargetVisualCenter(page)
+  ).sidebarWidth).toBe(420);
+  expect(productErrors).toEqual([]);
+});
+
+test('sidebar drag coalesces camera geometry without synchronous layout reads', async ({
+  page,
+}) => {
+  const productErrors = observeProductErrors(page);
+  await page.addInitScript(() => {
+    const getBoundingClientRect = Element.prototype.getBoundingClientRect;
+    window.__cellucidCanvasRectReads = 0;
+    Element.prototype.getBoundingClientRect = function (...args) {
+      if (this.id === 'glcanvas') {
+        window.__cellucidCanvasRectReads += 1;
+      }
+      return getBoundingClientRect.apply(this, args);
+    };
+  });
+  await installSynthetic3dFixture(page);
+  await page.goto(
+    `/?exportsBaseUrl=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
+      `&dataset=${DATASET_ID}&acceptance=sidebar-resize-performance`,
+    { waitUntil: 'domcontentloaded' },
+  );
+  await dismissWelcome(page);
+  await expect(page.locator('#dataset-name')).toHaveText(
+    'Deterministic 3-D orbit fixture',
+  );
+
+  const burst = await page.evaluate(() => {
+    const sidebar = document.getElementById('sidebar');
+    const handle = document.getElementById('sidebar-resize-handle');
+    const startX = sidebar.offsetLeft + sidebar.offsetWidth;
+    window.__cellucidCanvasRectReads = 0;
+    handle.dispatchEvent(new MouseEvent('mousedown', {
+      bubbles: true,
+      button: 0,
+      clientX: startX,
+    }));
+    for (let delta = 1; delta <= 120; delta += 1) {
+      document.dispatchEvent(new MouseEvent('mousemove', {
+        bubbles: true,
+        clientX: startX + delta,
+      }));
+    }
+    document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+    return {
+      readsDuringBurst: window.__cellucidCanvasRectReads,
+      userWidth: document.documentElement.style.getPropertyValue(
+        '--sidebar-user-width',
+      ),
+    };
+  });
+  expect(burst).toEqual({
+    readsDuringBurst: 0,
+    userWidth: '400px',
+  });
+  const readsAfterSettlement = await page.evaluate(() => new Promise(resolve => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => resolve(window.__cellucidCanvasRectReads));
+    });
+  }));
+  expect(readsAfterSettlement).toBeGreaterThanOrEqual(1);
+  expect(readsAfterSettlement).toBeLessThanOrEqual(2);
+
+  await expect.poll(async () => (
+    await readTargetVisualCenter(page)
+  ).sidebarWidth).toBe(400);
+  const settled = await readTargetVisualCenter(page);
+  expect(Math.abs(settled.projectedX - settled.expectedX)).toBeLessThan(1);
   expect(productErrors).toEqual([]);
 });
 
@@ -251,6 +691,9 @@ test('public viewer controls reject invalid values before renderer mutation', as
       ['setProjectilesEnabled', ['false']],
       ['setProjectilesEnabled', [false, 42]],
       ['setShowOrbitAnchor', [1]],
+      ['setViewportLeftOcclusionRatio', [-0.1]],
+      ['setViewportLeftOcclusionRatio', [1.1]],
+      ['setViewportLeftOcclusionRatio', ['0.2']],
       ['setShowConnectivity', ['false']],
       ['setConnectivityLineWidth', [100]],
       ['setConnectivityAlpha', [0]],

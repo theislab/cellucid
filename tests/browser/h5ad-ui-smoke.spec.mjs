@@ -413,6 +413,178 @@ test('an advertised sample applies one verified static state without camera moti
   expect(browserErrors).toEqual([]);
 });
 
+test('a published no-vector sample replaces a prior vector-field select generation', async ({
+  browserName,
+  page,
+}, testInfo) => {
+  const browserErrors = [];
+  const browserDiagnostics = [];
+  page.on('console', message => {
+    if (
+      message.type() === 'warning'
+      && /GL Driver Message .*GPU stall due to ReadPixels/.test(message.text())
+    ) {
+      browserDiagnostics.push(message.text());
+    } else if (message.type() === 'error' || message.type() === 'warning') {
+      browserErrors.push(`console ${message.type()}: ${message.text()}`);
+    }
+  });
+  page.on('pageerror', error => {
+    browserErrors.push(`page: ${error.stack || error.message}`);
+  });
+  page.on('response', response => {
+    if (response.status() >= 400) {
+      browserErrors.push(`http ${response.status()}: ${response.url()}`);
+    }
+  });
+
+  const applicationUrl =
+    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=vector-state-replacement-ci';
+  await page.goto(applicationUrl, { waitUntil: 'domcontentloaded' });
+  await dismissWelcome(page);
+  await expectPlanarCurrentDataset(page, 'Current UI prepared fixture');
+
+  const downloadPromise = page.waitForEvent('download');
+  await page.locator('#save-state-btn').click();
+  const download = await downloadPromise;
+  const statePath = testInfo.outputPath(
+    'published-no-vector.cellucid-session',
+  );
+  await download.saveAs(statePath);
+  const stateBytes = await createPublishedDefaultBytes(
+    await readFile(statePath),
+  );
+  const stateSha256 = createHash('sha256')
+    .update(stateBytes)
+    .digest('hex');
+
+  const catalog = JSON.parse(
+    await readFile(preparedCatalogPath, 'utf8'),
+  );
+  const preparedEntry = {
+    ...catalog.datasets[0],
+    state_manifest: 'state-snapshots.json',
+    state_sha256: stateSha256,
+  };
+  const vectorEntry = {
+    ...catalog.datasets[0],
+    id: 'current-ui-vector',
+    name: 'Current UI vector fixture',
+    path: 'current-ui-vector/',
+  };
+  catalog.default = vectorEntry.id;
+  catalog.datasets = [vectorEntry, preparedEntry];
+
+  const identity = JSON.parse(
+    await readFile(
+      path.join(preparedFixturePath, 'dataset_identity.json'),
+      'utf8',
+    ),
+  );
+  identity.id = vectorEntry.id;
+  identity.name = vectorEntry.name;
+  identity.vector_fields = {
+    default_field: 'velocity_umap',
+    fields: {
+      velocity_umap: {
+        label: 'velocity_umap',
+        basis: 'umap',
+        available_dimensions: [2],
+        default_dimension: 2,
+        files: {
+          '2d': 'vectors/velocity_umap_2d.bin',
+        },
+      },
+    },
+  };
+
+  await page.route(
+    '**/tests/browser/fixtures/exports/datasets.json',
+    route => route.fulfill({
+      body: JSON.stringify(catalog),
+      contentType: 'application/json',
+      status: 200,
+    }),
+  );
+  await page.route(
+    '**/tests/browser/fixtures/exports/current-ui-vector/dataset_identity.json',
+    route => route.fulfill({
+      body: JSON.stringify(identity),
+      contentType: 'application/json',
+      status: 200,
+    }),
+  );
+  for (const filename of [
+    'obs_manifest.json',
+    'points_2d.bin',
+    'var_manifest.json',
+  ]) {
+    await page.route(
+      `**/tests/browser/fixtures/exports/current-ui-vector/${filename}`,
+      route => route.fulfill({
+        path: path.join(preparedFixturePath, filename),
+        status: 200,
+      }),
+    );
+  }
+
+  let manifestRequests = 0;
+  let stateRequests = 0;
+  await page.route(
+    '**/tests/browser/fixtures/exports/current-ui-prepared/state-snapshots.json',
+    route => {
+      manifestRequests++;
+      return route.fulfill({
+        body: JSON.stringify({
+          states: ['default.cellucid-session'],
+        }),
+        contentType: 'application/json',
+        status: 200,
+      });
+    },
+  );
+  await page.route(
+    '**/tests/browser/fixtures/exports/current-ui-prepared/default.cellucid-session',
+    route => {
+      stateRequests++;
+      return route.fulfill({
+        body: stateBytes,
+        contentType: 'application/octet-stream',
+        status: 200,
+      });
+    },
+  );
+
+  await page.goto(
+    applicationUrl.replace(
+      'dataset=current-ui-prepared',
+      'dataset=current-ui-vector',
+    ),
+    { waitUntil: 'domcontentloaded' },
+  );
+  await dismissWelcome(page);
+  await expectPlanarCurrentDataset(page, vectorEntry.name);
+  await expect(page.locator('#velocity-field')).toHaveValue('velocity_umap');
+  await expect(page.locator('#velocity-field option')).toHaveCount(1);
+
+  await page.locator('#dataset-select').selectOption(
+    'dataset:local-demo:current-ui-prepared',
+  );
+  await expectPlanarCurrentDataset(page, 'Current UI prepared fixture');
+  await expect(page.locator('#velocity-field')).toHaveValue('');
+  await expect(page.locator('#velocity-field option')).toHaveCount(0);
+  await expect.poll(() => manifestRequests).toBe(1);
+  await expect.poll(() => stateRequests).toBe(1);
+  await expect(page.getByText(
+    /published sample view could not be applied|Session UI select option/i,
+  )).toHaveCount(0);
+  expect(browserErrors).toEqual([]);
+  expect(browserDiagnostics.length).toBeLessThanOrEqual(4);
+  if (browserName !== 'chromium') {
+    expect(browserDiagnostics).toEqual([]);
+  }
+});
+
 test('camera path state round-trips every owned control and commits autoplay', async ({ page }, testInfo) => {
   const browserErrors = [];
   page.on('console', message => {

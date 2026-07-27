@@ -41,6 +41,7 @@ export function collectDOMReferences(root) {
       el: byId('sidebar'),
       toggleBtn: byId('sidebar-toggle'),
       resizeHandle: byId('sidebar-resize-handle'),
+      canvas: byId('glcanvas'),
     },
 
     stats: {

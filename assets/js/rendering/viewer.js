@@ -32,6 +32,10 @@ import {
   assertNavigationMode,
   cloneCameraState
 } from './camera-state-contract.js';
+import {
+  applyHorizontalProjectionCenter,
+  computePaneCenterNdcX
+} from './viewport-center.js';
 
 const VALID_DIMENSION_LEVELS = new Set([1, 2, 3]);
 const INITIAL_DIMENSION_LEVEL = 3;
@@ -499,7 +503,7 @@ export function createNavigationModeOwnership() {
   });
 }
 
-export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onViewFocus }) {
+export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }) {
   // Every current rendering path requires WebGL2.
   const gl = canvas.getContext('webgl2', { antialias: true, powerPreference: 'high-performance' });
 
@@ -786,7 +790,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
   // Cached view matrices for unlocked camera mode (avoids per-frame recalculation)
   const cachedViewMatrices = new Map();  // viewId -> { viewMatrix: Float32Array, radius: number, dirty: boolean }
-  let cachedGridProjection = null;       // { aspect: number, matrix: Float32Array } - shared by all grid cells
+  const cachedGridProjections = new Map();
+  let cachedGridProjectionAspect = null;
 
 	  // Per-view dimension tracking for multi-dimensional support
 	  const viewDimensionLevels = new Map([
@@ -914,7 +919,6 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 	  }
 
   const viewTitleLayerEl = viewTitleLayer || null;
-  const sidebarEl = sidebar || null;
   let viewTitleEntries = [];
   let lastTitleKey = null;
   // Cache for view title layout to avoid per-frame style updates
@@ -1023,6 +1027,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   const far = 1000.0;
   const fov = 45 * Math.PI / 180;
   const minOrbitRadius = 0.05;
+  let viewportLeftOcclusionRatio = 0;
 
   let basePointSize = 1.0;
   let lightingStrength = 0.6;
@@ -1543,7 +1548,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       // In multiview mode, use viewport-local coordinates for correct NDC calculation
       const vpInfo = getViewportInfoAtScreen(e.clientX, e.clientY);
       // Normalized device coords (-1 to 1) relative to the viewport
-      const ndcX = (vpInfo.vpLocalX / vpInfo.vpWidth) * 2 - 1;
+      const rawNdcX = (vpInfo.vpLocalX / vpInfo.vpWidth) * 2 - 1;
+      const ndcX = rawNdcX - (vpInfo.projectionCenterNdcX ?? 0);
       const ndcY = -((vpInfo.vpLocalY / vpInfo.vpHeight) * 2 - 1);
       // In planar mode with perspective, calculate world offset at target plane
       const aspect = vpInfo.vpAspect;
@@ -2021,9 +2027,70 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     }
   }
 
+  function getProjectionCenterNdcX(
+    paneLeftRatio,
+    paneWidthRatio,
+    paneNavigationMode = navigationMode
+  ) {
+    const exactMode = assertNavigationMode(paneNavigationMode);
+    if (exactMode === 'free') return 0;
+    return computePaneCenterNdcX(
+      paneLeftRatio,
+      paneWidthRatio,
+      viewportLeftOcclusionRatio
+    );
+  }
+
+  function configureInteractiveProjection(
+    output,
+    aspect,
+    paneLeftRatio = 0,
+    paneWidthRatio = 1,
+    paneNavigationMode = navigationMode
+  ) {
+    mat4.perspective(output, fov, aspect, near, far);
+    const centerNdcX = getProjectionCenterNdcX(
+      paneLeftRatio,
+      paneWidthRatio,
+      paneNavigationMode
+    );
+    if (centerNdcX !== null) {
+      applyHorizontalProjectionCenter(output, centerNdcX);
+    }
+    return centerNdcX;
+  }
+
+  function getCachedGridProjection(
+    aspect,
+    paneLeftRatio,
+    paneWidthRatio,
+    paneNavigationMode
+  ) {
+    const centerNdcX = getProjectionCenterNdcX(
+      paneLeftRatio,
+      paneWidthRatio,
+      paneNavigationMode
+    );
+    if (cachedGridProjectionAspect !== aspect) {
+      cachedGridProjections.clear();
+      cachedGridProjectionAspect = aspect;
+    }
+    const cacheKey = centerNdcX === null ? -1 : centerNdcX;
+    let matrix = cachedGridProjections.get(cacheKey);
+    if (!matrix) {
+      matrix = mat4.create();
+      mat4.perspective(matrix, fov, aspect, near, far);
+      if (centerNdcX !== null) {
+        applyHorizontalProjectionCenter(matrix, centerNdcX);
+      }
+      cachedGridProjections.set(cacheKey, matrix);
+    }
+    return matrix;
+  }
+
   function updateCamera(width, height) {
     const aspect = width / height;
-    mat4.perspective(projectionMatrix, fov, aspect, near, far);
+    configureInteractiveProjection(projectionMatrix, aspect);
     if (navigationMode === 'free') {
       const { forward, upVec } = getFreeflyAxes();
       vec3.copy(eye, freeflyPosition);
@@ -2960,7 +3027,15 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   // === CELL PICKING ===
   // Convert screen coordinates to a ray and find the nearest cell
   // Optional viewportAspect parameter allows using a different aspect ratio than the global projection matrix
-  function screenToRay(screenX, screenY, canvasWidth, canvasHeight, viewportAspect = null, customViewMatrix = null) {
+  function screenToRay(
+    screenX,
+    screenY,
+    canvasWidth,
+    canvasHeight,
+    viewportAspect = null,
+    customViewMatrix = null,
+    projectionCenterNdcX = 0
+  ) {
     // Normalize to clip space (-1 to 1)
     const ndcX = (screenX / canvasWidth) * 2 - 1;
     const ndcY = 1 - (screenY / canvasHeight) * 2;
@@ -2973,6 +3048,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     if (viewportAspect !== null) {
       const tempProj = mat4.create();
       mat4.perspective(tempProj, fov, viewportAspect, near, far);
+      if (projectionCenterNdcX !== null) {
+        applyHorizontalProjectionCenter(tempProj, projectionCenterNdcX);
+      }
       mat4.multiply(viewProj, tempProj, effectiveViewMatrix);
     } else {
       mat4.multiply(viewProj, projectionMatrix, effectiveViewMatrix);
@@ -3052,17 +3130,65 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     // Get effective view matrix for the viewport
     let effectiveViewMatrix = null;
+    let effectiveNavigationMode = navigationMode;
+    let effectiveTargetRadius = targetRadius;
     if (!camerasLocked && viewCount > 1) {
+      const cameraState = assertCameraState(
+        getViewCameraState(clickedViewId),
+        `Viewport camera state for view "${clickedViewId}"`
+      );
+      effectiveNavigationMode = cameraState.navigationMode;
+      effectiveTargetRadius = cameraState.orbit.targetRadius;
       const cached = cachedViewMatrices.get(clickedViewId);
       if (cached && cached.viewMatrix) {
         effectiveViewMatrix = cached.viewMatrix;
       } else {
-        const camState = getViewCameraState(clickedViewId);
-        if (camState) {
-          effectiveViewMatrix = mat4.create();
-          computeViewMatrixFromState(camState, effectiveViewMatrix);
-        }
+        effectiveViewMatrix = mat4.create();
+        computeViewMatrixFromState(cameraState, effectiveViewMatrix);
       }
+    }
+
+    const paneLeftRatio = vpOffsetX / rect.width;
+    const paneWidthRatio = vpWidth / rect.width;
+    const projectionCenterNdcX = getProjectionCenterNdcX(
+      paneLeftRatio,
+      paneWidthRatio,
+      effectiveNavigationMode
+    );
+    const viewportProjectionMatrix = mat4.create();
+    mat4.perspective(
+      viewportProjectionMatrix,
+      fov,
+      vpWidth / vpHeight,
+      near,
+      far
+    );
+    if (projectionCenterNdcX !== null) {
+      applyHorizontalProjectionCenter(
+        viewportProjectionMatrix,
+        projectionCenterNdcX
+      );
+    }
+    const interactionViewMatrix = effectiveViewMatrix ?? viewMatrix;
+    const cameraForward = vec3.fromValues(
+      -interactionViewMatrix[2],
+      -interactionViewMatrix[6],
+      -interactionViewMatrix[10]
+    );
+    const forwardLength = vec3.length(cameraForward);
+    if (!Number.isFinite(forwardLength) || forwardLength <= 0) {
+      throw new Error(
+        `Viewport camera forward vector for view "${clickedViewId}" is invalid.`
+      );
+    }
+    vec3.scale(cameraForward, cameraForward, 1 / forwardLength);
+    if (
+      !Number.isFinite(effectiveTargetRadius) ||
+      effectiveTargetRadius <= 0
+    ) {
+      throw new Error(
+        `Viewport camera target radius for view "${clickedViewId}" is invalid.`
+      );
     }
 
     return {
@@ -3074,73 +3200,38 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
       vpLocalY,
       viewId: clickedViewId,
       effectiveViewMatrix,
-      vpAspect: vpWidth / vpHeight
+      vpAspect: vpWidth / vpHeight,
+      paneLeftRatio,
+      paneWidthRatio,
+      projectionCenterNdcX,
+      projectionMatrix: viewportProjectionMatrix,
+      cameraForward,
+      cameraTargetRadius: effectiveTargetRadius
     };
   }
 
   function pickCellAtScreen(screenX, screenY) {
-    const rect = canvas.getBoundingClientRect();
-    const localX = screenX - rect.left;
-    const localY = screenY - rect.top;
-
-    // Determine viewport dimensions based on view layout
-    let vpLocalX = localX;
-    let vpLocalY = localY;
-    let vpWidth = rect.width;
-    let vpHeight = rect.height;
-    let clickedViewId = focusedViewId;
-
-    // Count active views (same logic as render())
-    const viewCount = (liveViewHidden ? 0 : 1) + snapshotViews.length;
-
-    // In grid mode with multiple views, find which viewport was clicked
-    if (viewLayoutMode === 'grid' && viewCount > 1) {
-      const cols = viewCount <= 3 ? viewCount : Math.ceil(Math.sqrt(viewCount));
-      const rows = Math.ceil(viewCount / cols);
-      vpWidth = rect.width / cols;
-      vpHeight = rect.height / rows;
-
-      // Determine which viewport cell was clicked
-      const col = Math.floor(localX / vpWidth);
-      const row = Math.floor(localY / vpHeight);
-
-      // Clamp to valid range
-      const clampedCol = Math.max(0, Math.min(col, cols - 1));
-      const clampedRow = Math.max(0, Math.min(row, rows - 1));
-
-      // Convert to viewport-local coordinates
-      vpLocalX = localX - clampedCol * vpWidth;
-      vpLocalY = localY - clampedRow * vpHeight;
-
-      // Determine which view was clicked
-      const viewIndex = clampedRow * cols + clampedCol;
-      const allViews = [];
-      if (!liveViewHidden) allViews.push({ id: LIVE_VIEW_ID });
-      snapshotViews.forEach(s => allViews.push({ id: s.id }));
-      clickedViewId = allViews[viewIndex]?.id || focusedViewId;
-    }
-
-    // Get the correct view matrix for the clicked viewport
-    // If cameras are unlocked, each view has its own camera
-    let effectiveViewMatrix = null;
-    if (!camerasLocked && viewCount > 1) {
-      // Try to get cached view matrix first (faster)
-      const cached = cachedViewMatrices.get(clickedViewId);
-      if (cached && cached.viewMatrix) {
-        effectiveViewMatrix = cached.viewMatrix;
-      } else {
-        const camState = assertCameraState(
-          getViewCameraState(clickedViewId),
-          `Picking camera state for view "${clickedViewId}"`
-        );
-        effectiveViewMatrix = mat4.create();
-        computeViewMatrixFromState(camState, effectiveViewMatrix);
-      }
-    }
-
-    // Compute viewport aspect ratio for correct projection
-    const vpAspect = vpWidth / vpHeight;
-    const ray = screenToRay(vpLocalX, vpLocalY, vpWidth, vpHeight, vpAspect, effectiveViewMatrix);
+    const viewport = getViewportInfoAtScreen(screenX, screenY);
+    if (viewport === -1) return -1;
+    const {
+      vpLocalX,
+      vpLocalY,
+      vpWidth,
+      vpHeight,
+      vpAspect,
+      effectiveViewMatrix,
+      projectionCenterNdcX,
+      viewId: clickedViewId
+    } = viewport;
+    const ray = screenToRay(
+      vpLocalX,
+      vpLocalY,
+      vpWidth,
+      vpHeight,
+      vpAspect,
+      effectiveViewMatrix,
+      projectionCenterNdcX
+    );
     if (!ray) return -1;
 
     // Get view-specific positions for multi-dimensional support
@@ -3586,7 +3677,17 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         const view = _renderAllViews[0];
 
         const snapshotId = requireSnapshotBufferId(view.id);
-        renderSingleView(width, height, { x: 0, y: 0, w: 1, h: 1 }, view.id, view.centroidCount, snapshotId, dt, timeSeconds);
+        renderSingleView(
+          width,
+          height,
+          { x: 0, y: 0, w: 1, h: 1 },
+          view.id,
+          view.centroidCount,
+          snapshotId,
+          dt,
+          timeSeconds,
+          navigationMode
+        );
       } else {
         // The focused view must be part of the published render layout.
         const view = _renderAllViews.find(v => v.id === focusedViewId);
@@ -3603,7 +3704,17 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         }
 
 	        const snapshotId = requireSnapshotBufferId(view.id);
-	        renderSingleView(width, height, { x: 0, y: 0, w: 1, h: 1 }, view.id, view.centroidCount, snapshotId, dt, timeSeconds);
+	        renderSingleView(
+	          width,
+	          height,
+	          { x: 0, y: 0, w: 1, h: 1 },
+	          view.id,
+	          view.centroidCount,
+	          snapshotId,
+	          dt,
+	          timeSeconds,
+	          navigationMode
+	        );
 	      }
 	      hideViewTitles(); // No titles in single/fullscreen mode
 	      updateLabelLayerVisibility();
@@ -3628,15 +3739,6 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     const vh = Math.floor(height / rows);
     const vpAspect = vw / vh;
 
-    // OPTIMIZATION: Cache projection matrix for grid cells (all have same aspect ratio)
-    if (!cachedGridProjection || cachedGridProjection.aspect !== vpAspect) {
-      cachedGridProjection = {
-        aspect: vpAspect,
-        matrix: mat4.create()
-      };
-      mat4.perspective(cachedGridProjection.matrix, fov, vpAspect, near, far);
-    }
-
     // Store active view's matrices (computed once in updateCamera before this loop)
     // Use preallocated scratch matrix to avoid per-frame allocation
     mat4.copy(_activeViewMatrixScratch, viewMatrix);
@@ -3653,6 +3755,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         const vy = (rows - 1 - row) * vh; // Flip Y for GL
 
         const isActiveView = view.id === focusedViewId;
+        let paneNavigationMode = navigationMode;
 
         // OPTIMIZATION: Use cached view matrices instead of per-frame recalculation
         // No global state modification, no applyCameraStateTemporarily, no updateCamera
@@ -3662,6 +3765,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
           radius = activeRadius;
         } else if (!camerasLocked) {
           const cached = cachedViewMatrices.get(view.id);
+          const cameraState = assertCameraState(
+            getViewCameraState(view.id),
+            `Grid camera state for view "${view.id}"`
+          );
+          paneNavigationMode = cameraState.navigationMode;
           if (cached) {
             // Use pre-computed cached viewMatrix directly
             mat4.copy(viewMatrix, cached.viewMatrix);
@@ -3669,14 +3777,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
           } else {
             // No cache exists yet - compute correct matrix immediately from camera state
             // This avoids a one-frame jump where the wrong camera would be used
-            const camState = getViewCameraState(view.id);
             // Compute and cache the view matrix from exact published state.
             const tempViewMatrix = mat4.create();
-            computeViewMatrixFromState(camState, tempViewMatrix);
+            computeViewMatrixFromState(cameraState, tempViewMatrix);
             mat4.copy(viewMatrix, tempViewMatrix);
-            radius = camState.orbit.radius;
+            radius = cameraState.orbit.radius;
             // Cache for future frames
-            updateCachedViewMatrix(view.id, camState);
+            updateCachedViewMatrix(view.id, cameraState);
           }
         } else {
           // Locked mode: non-active views use active view's matrix
@@ -3684,8 +3791,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
           radius = activeRadius;
         }
 
-        // OPTIMIZATION: Use cached projection matrix (same for all grid cells)
-        mat4.copy(projectionMatrix, cachedGridProjection.matrix);
+        const cachedProjection = getCachedGridProjection(
+          vpAspect,
+          col / cols,
+          1 / cols,
+          paneNavigationMode
+        );
+        mat4.copy(projectionMatrix, cachedProjection);
         mat4.multiply(mvpMatrix, projectionMatrix, viewMatrix);
         mat4.multiply(mvpMatrix, mvpMatrix, modelMatrix);
 
@@ -3702,7 +3814,17 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
         }
 
         const snapshotId = requireSnapshotBufferId(view.id);
-        renderSingleView(vw, vh, { x: col / cols, y: row / rows, w: 1 / cols, h: 1 / rows }, view.id, view.centroidCount, snapshotId, dt, timeSeconds);
+        renderSingleView(
+          vw,
+          vh,
+          { x: col / cols, y: row / rows, w: 1 / cols, h: 1 / rows },
+          view.id,
+          view.centroidCount,
+          snapshotId,
+          dt,
+          timeSeconds,
+          paneNavigationMode
+        );
 
         gl.disable(gl.SCISSOR_TEST);
       }
@@ -3712,7 +3834,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     radius = activeRadius;
 
 	    // Restore projection matrix for full canvas aspect
-	    mat4.perspective(projectionMatrix, fov, width / height, near, far);
+	    configureInteractiveProjection(projectionMatrix, width / height);
 	    mat4.multiply(mvpMatrix, projectionMatrix, viewMatrix);
 	    mat4.multiply(mvpMatrix, mvpMatrix, modelMatrix);
 
@@ -3720,8 +3842,21 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 	    updateLabelLayerVisibility();
 	  }
 
-		  function renderSingleView(width, height, viewport, viewId, overrideCentroidCount, snapshotBufferId = null, dtSeconds = 0.016, timeSeconds = 0) {
+		  function renderSingleView(
+		    width,
+		    height,
+		    viewport,
+		    viewId,
+		    overrideCentroidCount,
+		    snapshotBufferId = null,
+		    dtSeconds = 0.016,
+		    timeSeconds = 0,
+		    paneNavigationMode
+		  ) {
 		    const vid = assertViewId(viewId);
+		    const exactPaneNavigationMode = assertNavigationMode(
+		      paneNavigationMode
+		    );
 		    if (!Number.isSafeInteger(overrideCentroidCount) || overrideCentroidCount < 0) {
 		      throw new TypeError(
 		        `Centroid count for view "${vid}" must be a non-negative safe integer.`
@@ -3875,8 +4010,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 	    _projectileDrawParams.fov = fov;
 	    projectileSystem.draw(_projectileDrawParams);
 
-    // Draw orbit anchor compass visualization (only in orbit navigation mode)
-    if (navigationMode === 'orbit') {
+    // Draw the orbit anchor only for panes whose exact camera mode is Orbit.
+    if (exactPaneNavigationMode === 'orbit') {
       // Get camera state for this view (supports per-view cameras in unlocked mode)
       let viewTheta = theta;
       let viewPhi = phi;
@@ -3903,7 +4038,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 	      _orbitAnchorDrawParams.fogDensity = fogDensity;
 	      _orbitAnchorDrawParams.fogColor = fogColor;
 	      _orbitAnchorDrawParams.lightingStrength = lightingStrength;
-	      _orbitAnchorDrawParams.navigationMode = navigationMode;
+		      _orbitAnchorDrawParams.navigationMode = exactPaneNavigationMode;
 	      orbitAnchorRenderer.draw(_orbitAnchorDrawParams);
 	    }
 
@@ -4436,30 +4571,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
   // Invalidate all cached matrices (call when switching lock modes)
   function invalidateAllCachedMatrices() {
     cachedViewMatrices.clear();
-    cachedGridProjection = null;
+    cachedGridProjections.clear();
+    cachedGridProjectionAspect = null;
   }
 
   function getViewIdAtScreenPosition(screenX, screenY) {
-    const rect = canvas.getBoundingClientRect();
-    const localX = screenX - rect.left;
-    const localY = screenY - rect.top;
-
-    const viewCount = (liveViewHidden ? 0 : 1) + snapshotViews.length;
-    if (viewLayoutMode !== 'grid' || viewCount <= 1) return focusedViewId;
-
-    const cols = viewCount <= 3 ? viewCount : Math.ceil(Math.sqrt(viewCount));
-    const rows = Math.ceil(viewCount / cols);
-    const cellW = rect.width / cols;
-    const cellH = rect.height / rows;
-    const col = Math.floor(localX / cellW);
-    const row = Math.floor(localY / cellH);
-    const viewIndex = row * cols + col;
-
-    const allViews = [];
-    if (!liveViewHidden) allViews.push({ id: LIVE_VIEW_ID });
-    snapshotViews.forEach(s => allViews.push({ id: s.id }));
-
-    return allViews[viewIndex]?.id || focusedViewId;
+    const viewport = getViewportInfoAtScreen(screenX, screenY);
+    return viewport === -1 ? focusedViewId : viewport.viewId;
   }
 
   // === Public API ===
@@ -5019,6 +5137,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     getCentroidFlags(viewId) { return getViewFlags(viewId); },
     setBackground,
+    setViewportLeftOcclusionRatio(value) {
+      const exactRatio = assertFiniteNumberInRange(
+        value,
+        0,
+        1,
+        'Viewport left occlusion ratio'
+      );
+      if (exactRatio === viewportLeftOcclusionRatio) return;
+      viewportLeftOcclusionRatio = exactRatio;
+      cachedGridProjections.clear();
+      cachedGridProjectionAspect = null;
+    },
     setRenderMode(mode) {
       const exactMode = assertRenderMode(mode);
       if (exactMode === 'smoke' && snapshotViews.length > 0) {

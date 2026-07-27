@@ -1,0 +1,48 @@
+{
+  "name": "cellucid",
+  "version": "0.0.1",
+  "description": "Name reservation for Cellucid — a browser-first, GPU-accelerated workspace for exploring large single-cell datasets. The application runs at https://www.cellucid.com",
+  "keywords": [
+    "single-cell",
+    "visualization",
+    "umap",
+    "webgl",
+    "scRNA-seq",
+    "bioinformatics",
+    "anndata",
+    "cellucid"
+  ],
+  "homepage": "https://www.cellucid.com",
+  "bugs": {
+    "url": "https://github.com/theislab/cellucid/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/theislab/cellucid.git",
+    "directory": "npm"
+  },
+  "license": "BSD-3-Clause",
+  "author": {
+    "name": "Kemal Inecik",
+    "email": "k.inecik@gmail.com"
+  },
+  "type": "module",
+  "exports": {
+    ".": "./index.mjs"
+  },
+  "bin": {
+    "cellucid": "bin/cellucid.mjs"
+  },
+  "files": [
+    "bin/",
+    "index.mjs",
+    "LICENSE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

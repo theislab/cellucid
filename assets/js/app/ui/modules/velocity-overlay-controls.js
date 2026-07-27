@@ -695,6 +695,7 @@ export function initVelocityOverlayControls(options) {
     const hasForDim = fieldsForDim.length > 0;
 
     controlBlock.style.display = hasAny ? 'block' : 'none';
+    renderFieldSelectForActiveDim();
 
     if (!hasAny) {
       setInfo('');
@@ -702,7 +703,6 @@ export function initVelocityOverlayControls(options) {
       return;
     }
 
-    renderFieldSelectForActiveDim();
     const hasSelectedField = getSelectedFieldId().length > 0;
 
     enabledCheckbox.disabled = enabling || !hasForDim || !hasSelectedField;

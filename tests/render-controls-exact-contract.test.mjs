@@ -351,6 +351,35 @@ test('public smoke rebuild requires one explicit exact grid size', t => {
   assert.deepEqual(smokeCalls, [128]);
 });
 
+test('committed smoke visibility changes coalesce without the slider debounce timer', async t => {
+  const restore = installDocument();
+  t.after(restore);
+  const { viewer, dom, smoke, smokeCalls } = makeOptions();
+  const controls = initRenderControls({ viewer, dom, smoke });
+
+  controls.applyRenderMode('smoke');
+  smokeCalls.length = 0;
+  const currentGridSize = controls.getSmokeGridSize();
+
+  const originalSetTimeout = globalThis.setTimeout;
+  let debounceScheduled = false;
+  globalThis.setTimeout = () => {
+    debounceScheduled = true;
+    return 1;
+  };
+  t.after(() => {
+    globalThis.setTimeout = originalSetTimeout;
+  });
+
+  controls.markSmokeDirty();
+  controls.markSmokeDirty();
+  controls.markSmokeDirty();
+  await new Promise(resolve => queueMicrotask(resolve));
+
+  assert.equal(debounceScheduled, false);
+  assert.deepEqual(smokeCalls, [currentGridSize]);
+});
+
 test('current render-control source contains no normalization/default route', async () => {
   const source = await import('node:fs/promises').then(({ readFile }) =>
     readFile(

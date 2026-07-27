@@ -61,7 +61,10 @@ export function initUI({
   let viewControls = null;
   let cinematicCamera = null;
 
-  initSidebarControls({ dom: dom.sidebar });
+  initSidebarControls({
+    dom: dom.sidebar,
+    onViewportOcclusionChange: viewer.setViewportLeftOcclusionRatio,
+  });
 
   const statsDisplay = initStatsDisplay({ dom: dom.stats });
   const renderControls = initRenderControls({

@@ -7,6 +7,10 @@
   :root {
     --sidebar-width: 260px;
   }
+
+  #sidebar-resize-handle {
+    display: none;
+  }
 }
 
 /* Mobile layout: pin sidebar to the viewport edges for maximum usable space. */

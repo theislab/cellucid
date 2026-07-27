@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "build_id": "2026-07-27.5",
+  "build_id": "2026-07-27.9",
   "assets": [
     {
       "path": "assets/css/README.md",
@@ -142,8 +142,8 @@
     },
     {
       "path": "assets/css/layouts/_responsive.css",
-      "sha256": "f351b75d000805913b203b5eaa750cffbe7cd734d12ed572ab65136acf308986",
-      "bytes": 639,
+      "sha256": "85a8eae8ff6ecf1fedfc495708916218e7e029e150185d21e9eb5e68fe2b1f4e",
+      "bytes": 690,
       "content_type": "text/css; charset=utf-8"
     },
     {
@@ -214,8 +214,8 @@
     },
     {
       "path": "assets/css/tokens/_spacing.css",
-      "sha256": "da6f88bed566cc3750cb4e725aee4d797503cf6369938d78edff57b61792a75f",
-      "bytes": 739,
+      "sha256": "88632de993846a84c0fdb9f19ecbba6cd3604f518b5b355c2cf2ca56f0ddd60e",
+      "bytes": 766,
       "content_type": "text/css; charset=utf-8"
     },
     {
@@ -1252,8 +1252,8 @@
     },
     {
       "path": "assets/js/app/main.js",
-      "sha256": "618b5f2db8aee372f04a229aa81ada28178ddcda4d59687df3cc9ab89df5b918",
-      "bytes": 135684,
+      "sha256": "6f3c4e3bca6dca0e2610db6ecf5771d3b14c1364d3f939375030d0a7c5017671",
+      "bytes": 135675,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -1660,8 +1660,8 @@
     },
     {
       "path": "assets/js/app/ui/core/dom-cache.js",
-      "sha256": "e521897ceb1d44af0cf2d125a63c169d4eafd16bf60eab0a4fc6f397fb1efc9c",
-      "bytes": 14208,
+      "sha256": "e1ece9cb002e35e965be9fb642c337697cf694cfcbf56d47ed1b941dc64ae7a5",
+      "bytes": 14240,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -1696,8 +1696,8 @@
     },
     {
       "path": "assets/js/app/ui/core/ui-coordinator.js",
-      "sha256": "85137b96f7340a315191fcc5b060595bea6086610e17d423ad4b612eb6cbc643",
-      "bytes": 11039,
+      "sha256": "a33b637291b5e9ef265ac1b1cefdc6ca42d4c078122cb8a3bf55f66d93d47208",
+      "bytes": 11115,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2080,8 +2080,8 @@
     },
     {
       "path": "assets/js/app/ui/modules/render-controls.js",
-      "sha256": "18d96a0f0c72a82091c8594a7ce268524bff858f6fe31dc2e009ff1227921aa5",
-      "bytes": 25003,
+      "sha256": "1dbbdb49a742b0ee2342c3737f8747df1708b9fed67e3c3eea183d8694f2e887",
+      "bytes": 25696,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2092,8 +2092,8 @@
     },
     {
       "path": "assets/js/app/ui/modules/sidebar-controls.js",
-      "sha256": "808fc8a97ed5bad5bd2f949c4eb0e0853b3e15cef1a9fdf187d527ffcb1c10c9",
-      "bytes": 3876,
+      "sha256": "4eb01d56d9c22d6e6ee4bbdeb9547b0e97894d74621264a6fccef99fbd42e5a2",
+      "bytes": 6295,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2104,7 +2104,7 @@
     },
     {
       "path": "assets/js/app/ui/modules/velocity-overlay-controls.js",
-      "sha256": "de6558867c66c7991d5d5de7a5b86bdfdf8e85efa26111a0127820bee6257d31",
+      "sha256": "081e80baadc405634a90a15eb17692d2aef6bc3076a3ff736b54e63221a7b047",
       "bytes": 34385,
       "content_type": "application/javascript; charset=utf-8"
     },
@@ -2410,8 +2410,8 @@
     },
     {
       "path": "assets/js/rendering/highlight-renderer.js",
-      "sha256": "db982296e5061d5afb65fbd1281423b477935707f21a72c714123326af56498f",
-      "bytes": 96740,
+      "sha256": "8d9c8f819a2492369d020a0573a21c8c35c66cd27b75a07b19e808e0b79d6c98",
+      "bytes": 99581,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2542,8 +2542,14 @@
     },
     {
       "path": "assets/js/rendering/viewer.js",
-      "sha256": "c84b9a86a11ec87b52469b522cba2d76ca6239036eba5b68690caabefd549a34",
-      "bytes": 236337,
+      "sha256": "c1a528e024b594f3473d2373e201ce6cfe9c30820f38111df24c208b7f8ebb71",
+      "bytes": 238219,
+      "content_type": "application/javascript; charset=utf-8"
+    },
+    {
+      "path": "assets/js/rendering/viewport-center.js",
+      "sha256": "eccb44363b2ce6bb726745fd4106eb868e936dcddbdb1b4ffe479f4c75cd73c7",
+      "bytes": 3815,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2572,7 +2578,7 @@
     },
     {
       "path": "index.html",
-      "sha256": "615cc95bafeed9307e4255e469593d50ddd7062cf7bbda7a8b9f047fa7825ab2",
+      "sha256": "2fde5f3fb4962f6683788f92b82999338988c5408c19c08f92a81b808dc13036",
       "bytes": 98822,
       "content_type": "text/html; charset=utf-8"
     },

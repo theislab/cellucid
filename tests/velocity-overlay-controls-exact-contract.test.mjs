@@ -82,6 +82,29 @@ function makeElement(value = '') {
   };
 }
 
+function makeSelectElement(initialOptions = []) {
+  const select = makeElement();
+  select.options = initialOptions.map(value => ({ value }));
+  let innerHTML = '';
+  Object.defineProperty(select, 'innerHTML', {
+    configurable: true,
+    get() {
+      return innerHTML;
+    },
+    set(value) {
+      innerHTML = value;
+      if (value === '') {
+        select.options.length = 0;
+        select.value = '';
+      }
+    },
+  });
+  select.appendChild = option => {
+    select.options.push(option);
+  };
+  return select;
+}
+
 function makeDom(overrides = {}) {
   const dom = {};
   for (const key of OTHER_DOM_KEYS) dom[key] = makeElement();
@@ -279,6 +302,56 @@ test('multiple vector fields require an explicit sidebar selection', () => {
     controls.syncAvailability();
     assert.equal(dom.velocityEnabledCheckbox.disabled, false);
     assert.equal(dom.velocitySettings.style.display, 'none');
+    controls.destroy();
+  } finally {
+    if (previousDocument === undefined) {
+      delete globalThis.document;
+    } else {
+      globalThis.document = previousDocument;
+    }
+  }
+});
+
+test('dataset replacement clears the prior vector-field select inventory', () => {
+  const previousDocument = globalThis.document;
+  globalThis.document = {
+    createElement() {
+      return makeElement();
+    },
+  };
+  try {
+    const listeners = new Map();
+    let fields = [{
+      id: 'velocity_umap',
+      label: 'Velocity (UMAP)',
+      availableDimensions: [2],
+      defaultDimension: 2,
+    }];
+    const fieldSelect = makeSelectElement(['velocity_umap']);
+    fieldSelect.value = 'velocity_umap';
+    const controls = initVelocityOverlayControls({
+      dom: makeDom({ velocityFieldSelect: fieldSelect }),
+      state: makeState({
+        getAvailableVectorFields: () => fields,
+        getDefaultVectorFieldId: () => (
+          fields.length === 0 ? null : 'velocity_umap'
+        ),
+        on(name, listener) {
+          listeners.set(name, listener);
+        },
+      }),
+      viewer: makeViewer(),
+    });
+
+    assert.deepEqual(
+      fieldSelect.options.map(option => option.value),
+      ['velocity_umap'],
+    );
+    fields = [];
+    listeners.get('vectorFields:changed')();
+
+    assert.equal(fieldSelect.value, '');
+    assert.deepEqual(fieldSelect.options, []);
     controls.destroy();
   } finally {
     if (previousDocument === undefined) {

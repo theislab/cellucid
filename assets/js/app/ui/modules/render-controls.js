@@ -317,29 +317,47 @@ export function initRenderControls(options) {
   let smokeGridSize = 128;
   let noiseResolutionScale = assertAdaptiveScale(viewer.getAdaptiveScaleFactor());
 
-  // Debounced auto-rebuild for smoke density
+  // Slider input remains debounced; completed state publications must not wait
+  // on browser timers, which can be deferred for occluded/background pages.
   let smokeRebuildTimeout = null;
-  function scheduleAutoRebuild() {
-    if (smokeRebuildTimeout) clearTimeout(smokeRebuildTimeout);
+  let committedSmokeRebuildQueued = false;
+
+  function rebuildDirtySmokeIfActive() {
+    if (renderModeSelect.value !== 'smoke' || !smokeDirty) return;
+    rebuildSmokeDensity(smokeGridSize);
+    markSmokeClean();
+  }
+
+  function scheduleSliderSmokeRebuild() {
+    if (smokeRebuildTimeout !== null) clearTimeout(smokeRebuildTimeout);
     smokeDirty = true;
     smokeRebuildTimeout = setTimeout(() => {
-      if (renderModeSelect.value === 'smoke') {
-        rebuildSmokeDensity(smokeGridSize);
-        markSmokeClean();
-      }
+      smokeRebuildTimeout = null;
+      rebuildDirtySmokeIfActive();
     }, 300);
   }
 
   function markSmokeDirty() {
     smokeDirty = true;
-    if (renderModeSelect.value === 'smoke') {
-      scheduleAutoRebuild();
+    if (renderModeSelect.value !== 'smoke' || committedSmokeRebuildQueued) return;
+    if (smokeRebuildTimeout !== null) {
+      clearTimeout(smokeRebuildTimeout);
+      smokeRebuildTimeout = null;
     }
+    committedSmokeRebuildQueued = true;
+    queueMicrotask(() => {
+      committedSmokeRebuildQueued = false;
+      rebuildDirtySmokeIfActive();
+    });
   }
 
   function markSmokeClean() {
     smokeDirty = false;
     smokeBuiltOnce = true;
+    if (smokeRebuildTimeout !== null) {
+      clearTimeout(smokeRebuildTimeout);
+      smokeRebuildTimeout = null;
+    }
   }
 
   // Log-scale point size mapping
@@ -577,7 +595,7 @@ export function initRenderControls(options) {
       updateSmokeAbsorptionSlider();
       updateSmokeScatterSlider();
       updateSmokeStepSlider();
-      scheduleAutoRebuild();
+      scheduleSliderSmokeRebuild();
     }
   }
 
