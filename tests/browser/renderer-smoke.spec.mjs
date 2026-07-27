@@ -134,28 +134,32 @@ test('smoke owns an empty filtered view without errors or stale density', async 
   await expect(renderMode).toHaveValue('smoke');
   await expect(page.locator('#smoke-controls')).toHaveClass(/visible/);
   await expect(page.locator('#points-controls')).not.toHaveClass(/visible/);
+  expect(await page.evaluate(
+    () => window._cellucidViewer.hasSmokeVolume(),
+  )).toBe(false);
 
-  const densityBuilt = page.waitForEvent(
-    'console',
-    message => message.text().includes(
-      '[SmokeRenderer] Created 3D density texture (32³)',
-    ),
-  );
   await legend.getByRole('button', { name: 'Show All', exact: true }).click();
   await expect(page.locator('#filter-count')).toHaveText(
     'Showing all 120 points',
   );
-  await densityBuilt;
+  await expect.poll(
+    () => page.evaluate(() => window._cellucidViewer.hasSmokeVolume()),
+  ).toBe(true);
 
   await legend.getByRole('button', { name: 'Hide All', exact: true }).click();
   await expect(page.locator('#filter-count')).toHaveText(
     'Showing 0 of 120 points',
   );
-  await page.waitForTimeout(400);
+  await expect.poll(
+    () => page.evaluate(() => window._cellucidViewer.hasSmokeVolume()),
+  ).toBe(false);
   await renderMode.selectOption('points');
   await renderMode.selectOption('smoke');
   await expect(renderMode).toHaveValue('smoke');
   await expect(page.locator('#smoke-controls')).toHaveClass(/visible/);
+  expect(await page.evaluate(
+    () => window._cellucidViewer.hasSmokeVolume(),
+  )).toBe(false);
 
   const webglError = await page.locator('#glcanvas').evaluate(canvas => (
     canvas.getContext('webgl2').getError()

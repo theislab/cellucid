@@ -11,6 +11,11 @@ test('web origin serves every declared MIME family exactly', async ({
   const inventory = await inventoryResponse.json();
   expect(inventory.version).toBe(1);
   expect(Array.isArray(inventory.assets)).toBe(true);
+  expect(
+    inventory.assets.some(
+      asset => asset.path === 'assets/img/og-preview.jpg'
+    )
+  ).toBe(false);
 
   const representativeByContentType = new Map();
   for (const asset of inventory.assets) {

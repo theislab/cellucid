@@ -2717,6 +2717,7 @@ export class PerformanceTracker {
     // Frame tracking
     this.lastTime = 0;
     this.running = false;
+    this._paused = false;
     this._frameNumber = 0;
     this._warmupComplete = false;
 
@@ -2763,6 +2764,7 @@ export class PerformanceTracker {
     this._max = -Infinity;
     this._frameNumber = 0;
     this._warmupComplete = false;
+    this._paused = false;
     this._jankFrames = 0;
     this._consecutiveJanks = 0;
     this._maxConsecutiveJanks = 0;
@@ -2777,6 +2779,7 @@ export class PerformanceTracker {
    */
   recordFrame() {
     if (!this.running) return null;
+    if (this._paused) return this.getStats();
 
     const now = performance.now();
     const frameTime = now - this.lastTime;
@@ -2789,8 +2792,9 @@ export class PerformanceTracker {
     }
     this._warmupComplete = true;
 
-    // Skip obviously invalid frames (e.g., tab was hidden)
-    if (frameTime > 1000 || frameTime < 0.1) {
+    // Only finite, positive browser-rendered intervals are measurements.
+    // Slow visible frames remain truthful measurements at any duration.
+    if (!Number.isFinite(frameTime) || frameTime < 0.1) {
       return this.getStats();
     }
 
@@ -2824,6 +2828,26 @@ export class PerformanceTracker {
     }
 
     return this.getStats();
+  }
+
+  /**
+   * Pause without discarding collected measurements.
+   *
+   * Call this when rendering is suspended, such as while the document is
+   * hidden, so the suspension interval is not reported as frame time.
+   */
+  pause() {
+    if (!this.running) return;
+    this._paused = true;
+  }
+
+  /**
+   * Resume after a suspension without recording the elapsed suspension gap.
+   */
+  resume() {
+    if (!this.running || !this._paused) return;
+    this.lastTime = performance.now();
+    this._paused = false;
   }
 
   /**
@@ -2922,6 +2946,7 @@ export class PerformanceTracker {
    */
   stop() {
     this.running = false;
+    this._paused = false;
   }
 
   /**

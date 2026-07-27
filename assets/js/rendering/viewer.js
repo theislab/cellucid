@@ -5210,6 +5210,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
     setSmokeVolume(volumeDesc) { smokeRenderer.setVolume(volumeDesc); },
     clearSmokeVolume() { smokeRenderer.clearVolume(); },
     buildSmokeVolumeGPU(positions, options = {}) { return smokeRenderer.buildVolumeGPU(positions, options); },
+    hasSmokeVolume() { return smokeRenderer.hasVolume(); },
     setSmokeParams(params) { smokeRenderer.setParams(params); },
     setCloudResolutionScale(scale) { smokeRenderer.setResolutionScale(scale); },
     getCloudResolutionScale() { return smokeRenderer.getResolutionScale(); },

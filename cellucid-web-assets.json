@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "build_id": "2026-07-27.2",
+  "build_id": "2026-07-27.5",
   "assets": [
     {
       "path": "assets/css/README.md",
@@ -499,12 +499,6 @@
       "sha256": "f04ede45a66b45eba6c3bcd062afd6828fcc59513dea3aad80f20544377d70b4",
       "bytes": 7785,
       "content_type": "image/png"
-    },
-    {
-      "path": "assets/img/og-preview.jpg",
-      "sha256": "ccebd1589d37dd6a09a2020ea0e6645620600e1eb8b92e8ca5ce9b72440ae880",
-      "bytes": 438830,
-      "content_type": "image/jpeg"
     },
     {
       "path": "assets/img/safari-pinned-tab.svg",
@@ -1258,8 +1252,8 @@
     },
     {
       "path": "assets/js/app/main.js",
-      "sha256": "2d2bca6fd61be6f0bcada29df4a2e0365f63490ee8fc570917f56c431ddf22aa",
-      "bytes": 135010,
+      "sha256": "618b5f2db8aee372f04a229aa81ada28178ddcda4d59687df3cc9ab89df5b918",
+      "bytes": 135684,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2380,8 +2374,8 @@
     },
     {
       "path": "assets/js/dev/benchmark.js",
-      "sha256": "24ccc54c164d71c6f8b6a2228fa9f297a547f255388c54a5d7c3425d1062b329",
-      "bytes": 222774,
+      "sha256": "4d0cf28972aee89692d537e95b08b9c53874711f1569db87a47f6836380423d3",
+      "bytes": 223505,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2548,8 +2542,8 @@
     },
     {
       "path": "assets/js/rendering/viewer.js",
-      "sha256": "202f2f0d864104b2081565a2a70ae7d6e8de93fd30685b7514c283e4a56272f1",
-      "bytes": 236277,
+      "sha256": "c84b9a86a11ec87b52469b522cba2d76ca6239036eba5b68690caabefd549a34",
+      "bytes": 236337,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2578,7 +2572,7 @@
     },
     {
       "path": "index.html",
-      "sha256": "0aaefb9b3070934eee6ba18f973eacc6f71bc2b3096a3d322a23ae48e9938334",
+      "sha256": "615cc95bafeed9307e4255e469593d50ddd7062cf7bbda7a8b9f047fa7825ab2",
       "bytes": 98822,
       "content_type": "text/html; charset=utf-8"
     },

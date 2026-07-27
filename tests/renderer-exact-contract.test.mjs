@@ -37,6 +37,7 @@ import {
   GPUTimer,
   HighPerfBenchmark,
   MeshSurfaceSampler,
+  PerformanceTracker,
   SyntheticDataGenerator,
 } from '../assets/js/dev/benchmark.js';
 
@@ -134,6 +135,32 @@ test('renderer statistics publish only after an exact per-view render update', (
 
   assert.equal(renderer.hasStats('live'), true);
   assert.equal(renderer.getStats('live').visiblePoints, 6);
+});
+
+test('performance tracking distinguishes slow visible frames from suspension gaps', () => {
+  const tracker = new PerformanceTracker({ warmupFrames: 0 });
+  tracker.start();
+
+  tracker.lastTime = performance.now() - 1500;
+  const slowVisibleStats = tracker.recordFrame();
+  assert.equal(slowVisibleStats.samples, 1);
+  assert.ok(slowVisibleStats.maxFrameTime > 1000);
+
+  tracker.pause();
+  tracker.lastTime = performance.now() - 5000;
+  const pausedStats = tracker.recordFrame();
+  assert.equal(pausedStats.samples, 1);
+  assert.equal(pausedStats.maxFrameTime, slowVisibleStats.maxFrameTime);
+
+  const beforeResume = performance.now();
+  tracker.resume();
+  const afterResume = performance.now();
+  assert.ok(tracker.lastTime >= beforeResume);
+  assert.ok(tracker.lastTime <= afterResume);
+
+  tracker.lastTime = Number.NEGATIVE_INFINITY;
+  const nonFiniteStats = tracker.recordFrame();
+  assert.equal(nonFiniteStats.samples, 1);
 });
 
 test('renderer frame timing remains owned by the view that produced it', () => {

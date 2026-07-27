@@ -203,6 +203,11 @@ test('smoke volume validation and upload failures preserve the published volume'
   assert.equal(gl._state.textures.size, 1);
   assert.equal(gl._state.texture3dBinding, null);
   assert.equal(gl._state.unpackAlignment, 4);
+
+  gl.failTexture3dUpload = false;
+  renderer.setVolume(createVolume());
+  assert.equal(renderer.hasVolume(), true);
+  assert.notEqual(renderer.textureInfo.texture, existing);
 });
 
 test('clearing smoke volume releases the exact texture and is idempotent', () => {
@@ -215,11 +220,13 @@ test('clearing smoke volume releases the exact texture and is idempotent', () =>
   renderer.clearVolume();
 
   assert.equal(renderer.textureInfo, null);
+  assert.equal(renderer.hasVolume(), false);
   assert.equal(gl._state.textures.has(existing), false);
   assert.deepEqual(gl._state.deletedTextures, [existing]);
   assert.equal(gl._state.texture3dBinding, null);
 
   renderer.clearVolume();
+  assert.equal(renderer.hasVolume(), false);
   assert.deepEqual(gl._state.deletedTextures, [existing]);
 });
 

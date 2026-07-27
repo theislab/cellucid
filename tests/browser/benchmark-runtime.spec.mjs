@@ -48,6 +48,13 @@ test('GLB benchmark publishes one complete state generation', async ({
   await expect(page.locator('#filter-count')).toHaveText(
     'Showing all 120 points'
   );
+  await page.evaluate(() => {
+    const viewer = window._cellucidViewer;
+    viewer.hasRendererStats = () => false;
+    viewer.getRendererStats = () => {
+      throw new Error('Renderer statistics are intentionally unavailable');
+    };
+  });
 
   await page.locator('#benchmark-section > summary').click();
   await expect(page.locator('#benchmark-section')).toHaveAttribute('open', '');
@@ -65,6 +72,7 @@ test('GLB benchmark publishes one complete state generation', async ({
   await expect.poll(async () => Number.parseFloat(
     await page.locator('#bench-fps').textContent()
   )).toBeGreaterThan(0);
+  await expect(page.locator('#bench-lod')).toHaveText('-');
 
   const publication = await page.evaluate(() => {
     const state = window._cellucidState;

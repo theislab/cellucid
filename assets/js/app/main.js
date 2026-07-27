@@ -2912,6 +2912,16 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     let latestPerfSample = null;
     let latestRendererStats = null;
     let perfLoopHandle = null;
+    let perfVisibilityListenerActive = false;
+
+    const synchronizePerfTrackerVisibility = () => {
+      if (!benchmarkActive || !perfTracker) return;
+      if (document.hidden) {
+        perfTracker.pause();
+      } else {
+        perfTracker.resume();
+      }
+    };
 
     const rendererConfigSnapshot = () => ({
       shaderQuality: hpShaderQuality?.value || 'full',
@@ -3029,6 +3039,14 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         perfTracker.start();
       }
       benchmarkActive = true;
+      if (!perfVisibilityListenerActive) {
+        document.addEventListener(
+          'visibilitychange',
+          synchronizePerfTrackerVisibility
+        );
+        perfVisibilityListenerActive = true;
+      }
+      synchronizePerfTrackerVisibility();
 
       const tick = () => {
         if (!benchmarkActive) {
@@ -3038,11 +3056,9 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
 
         const stats = perfTracker.recordFrame();
         const activeViewId = state.getActiveViewId();
-        if (!viewer.hasRendererStats(activeViewId)) {
-          perfLoopHandle = requestAnimationFrame(tick);
-          return;
-        }
-        const hpStats = viewer.getRendererStats(activeViewId);
+        const hpStats = viewer.hasRendererStats(activeViewId)
+          ? viewer.getRendererStats(activeViewId)
+          : null;
         if (stats) latestPerfSample = stats;
         if (hpStats) latestRendererStats = hpStats;
 
@@ -3059,6 +3075,13 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
 
     const stopPerfMonitoring = () => {
       benchmarkActive = false;
+      if (perfVisibilityListenerActive) {
+        document.removeEventListener(
+          'visibilitychange',
+          synchronizePerfTrackerVisibility
+        );
+        perfVisibilityListenerActive = false;
+      }
       if (perfTracker) {
         perfTracker.stop();
       }

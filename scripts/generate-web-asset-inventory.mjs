@@ -16,6 +16,9 @@ import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 const INVENTORY_FILENAME = 'cellucid-web-assets.json';
+const DEPLOY_ONLY_SOCIAL_PREVIEW_PATH = 'assets/img/og-preview.jpg';
+const DEPLOY_ONLY_SOCIAL_PREVIEW_PATHSPEC =
+  `:(top,exclude)${DEPLOY_ONLY_SOCIAL_PREVIEW_PATH}`;
 const REQUIRED_ROOT_ASSETS = Object.freeze([
   'browserconfig.xml',
   'index.html',
@@ -83,6 +86,11 @@ export function contentTypeForAssetPath(path) {
   return contentType;
 }
 
+export function isRuntimeCacheAssetPath(path) {
+  const exactPath = assertPortableAssetPath(path);
+  return exactPath !== DEPLOY_ONLY_SOCIAL_PREVIEW_PATH;
+}
+
 function extractBuildId(indexBytes) {
   const indexHtml = indexBytes.toString('utf8');
   const matches = Array.from(indexHtml.matchAll(
@@ -111,6 +119,11 @@ export async function buildWebAssetInventory({ rootDir, paths }) {
   const uniquePaths = new Set();
   for (const candidate of paths) {
     const path = assertPortableAssetPath(candidate);
+    if (!isRuntimeCacheAssetPath(path)) {
+      throw new TypeError(
+        `Deploy-only social preview must not enter the runtime cache inventory: ${path}`
+      );
+    }
     if (path === INVENTORY_FILENAME) {
       throw new TypeError('The web asset inventory must not list itself.');
     }
@@ -169,13 +182,19 @@ export function serializeWebAssetInventory(inventory) {
   return Buffer.from(`${JSON.stringify(inventory, null, 2)}\n`, 'utf8');
 }
 
-export async function listSourceControlledAssets(rootDir) {
+export async function listSourceControlledAssets(
+  rootDir,
+  executeGit = execFileAsync
+) {
+  if (typeof executeGit !== 'function') {
+    throw new TypeError('Web inventory Git executor must be a function.');
+  }
   const options = {
     encoding: 'buffer',
     maxBuffer: 16 * 1024 * 1024,
   };
   const [{ stdout }, { stdout: deletedStdout }] = await Promise.all([
-    execFileAsync(
+    executeGit(
       'git',
       [
         '-C',
@@ -188,10 +207,11 @@ export async function listSourceControlledAssets(rootDir) {
         '--',
         ...REQUIRED_ROOT_ASSETS,
         'assets',
+        DEPLOY_ONLY_SOCIAL_PREVIEW_PATHSPEC,
       ],
       options
     ),
-    execFileAsync(
+    executeGit(
       'git',
       [
         '-C',
@@ -202,6 +222,7 @@ export async function listSourceControlledAssets(rootDir) {
         '--',
         ...REQUIRED_ROOT_ASSETS,
         'assets',
+        DEPLOY_ONLY_SOCIAL_PREVIEW_PATHSPEC,
       ],
       options
     ),
@@ -215,7 +236,12 @@ export async function listSourceControlledAssets(rootDir) {
   return stdout
     .toString('utf8')
     .split('\0')
-    .filter(path => path.length > 0 && !deletedPaths.has(path));
+    .filter(
+      path =>
+        path.length > 0 &&
+        !deletedPaths.has(path) &&
+        isRuntimeCacheAssetPath(path)
+    );
 }
 
 async function writeInventoryAtomically(outputPath, bytes) {
