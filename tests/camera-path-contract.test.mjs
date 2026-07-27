@@ -138,6 +138,7 @@ test('Camera Path session state accepts only the exact current fields', async ()
     '../assets/js/app/ui/modules/cinematic-camera/index.js'
   );
   const state = {
+    autoplay: false,
     keyframes: [keyframe('one'), keyframe('two')],
     nextIndex: 3,
     loopBackKeyframeId: null,
@@ -146,7 +147,16 @@ test('Camera Path session state accepts only the exact current fields', async ()
     rotationMethod: 'linear',
     easing: 'linear',
     defaultSpeed: '30',
-    navigationMode: 'orbit'
+    navigationMode: 'orbit',
+    orbitKeySpeed: '40',
+    orbitReverse: true,
+    showOrbitAnchor: true,
+    planarPanSpeed: '100',
+    planarZoomToCursor: true,
+    planarInvertAxes: false,
+    lookSensitivity: '5',
+    moveSpeed: '100',
+    invertLook: false
   };
 
   assert.equal(assertCameraPathSessionState(state), state);
@@ -162,6 +172,14 @@ test('Camera Path session state accepts only the exact current fields', async ()
   assert.throws(
     () => assertCameraPathSessionState({ ...state, defaultSpeed: '30 trailing' }),
     /default speed/i
+  );
+  assert.throws(
+    () => assertCameraPathSessionState({ ...state, autoplay: 1 }),
+    /autoplay/i
+  );
+  assert.throws(
+    () => assertCameraPathSessionState({ ...state, moveSpeed: '501' }),
+    /move speed/i
   );
 });
 
@@ -554,7 +572,7 @@ test('camera playback internals expose one explicit current control contract', (
   );
 });
 
-test('camera paths are idle on startup/restore and reset on dataset changes', () => {
+test('camera paths default to idle, restore autoplay transactionally, and reset with datasets', () => {
   const restoreStart = cameraModuleSource.indexOf('function restoreSessionState');
   const restoreEnd = cameraModuleSource.indexOf('\n  return {', restoreStart);
   assert.ok(restoreStart >= 0 && restoreEnd > restoreStart);
@@ -563,7 +581,7 @@ test('camera paths are idle on startup/restore and reset on dataset changes', ()
   assert.doesNotMatch(
     restoreBody,
     /playbackController\.play\s*\(/,
-    'restoring a camera path must never start playback'
+    'raw path restoration must not bypass the session transaction'
   );
   assert.doesNotMatch(
     cameraModuleSource,
@@ -574,7 +592,12 @@ test('camera paths are idle on startup/restore and reset on dataset changes', ()
   assert.match(cameraModuleSource, /dataSourceManager\.offDatasetChange\(handleDatasetChange\)/);
   assert.doesNotMatch(cameraModuleSource, /dataSourceManager\?\./);
   assert.match(uiCoordinatorSource, /initCinematicCamera\(\{[\s\S]*?dataSourceManager/);
-  assert.match(indexHtml, /Playback never starts automatically\./);
+  assert.match(indexHtml, /Autoplay is opt-in\./);
+  assert.match(
+    indexHtml,
+    /id="cinematic-loop"[\s\S]*?Loop playback[\s\S]*?id="cinematic-autoplay"[\s\S]*?Autoplay/
+  );
+  assert.match(cameraModuleSource, /function startAutoplay\(\)/);
 });
 
 test('dataset publication never auto-restores a camera path or session bundle', () => {

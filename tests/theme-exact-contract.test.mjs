@@ -312,7 +312,7 @@ test('HTML declares the exact theme and background defaults before bootstrap', a
   const html = await readFile(INDEX_URL, 'utf8');
   assert.match(
     html,
-    /<html\s+lang="en"\s+data-theme="light"\s+data-viewer-background="white">/,
+    /<html\s+lang="en"\s+data-theme="light"\s+data-viewer-background="grid">/,
   );
 });
 

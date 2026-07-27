@@ -18,8 +18,9 @@ test('every startup shows onboarding and adopts the catalog default with exact U
   );
   await expect(page.locator('#cinematic-camera-section')).not.toHaveAttribute('open', '');
   await expect(page.locator('#community-annotation-section')).not.toHaveAttribute('open', '');
-  await expect(page.locator('html')).toHaveAttribute('data-viewer-background', 'white');
-  await expect(page.locator('#background-select')).toHaveValue('white');
+  await expect(page.locator('html')).toHaveAttribute('data-viewer-background', 'grid');
+  await expect(page.locator('#background-select')).toHaveValue('grid');
+  await expect(page.locator('#cinematic-autoplay')).not.toBeChecked();
 
   const buildIdentity = await page.evaluate(() => ({
     meta: document

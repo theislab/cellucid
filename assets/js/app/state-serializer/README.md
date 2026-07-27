@@ -31,8 +31,9 @@ The intent is:
 Cellucid never discovers or restores session state during startup. A user saves
 and restores a `.cellucid-session` file through the **Save State** and
 **Load State** controls. Loading a session is the only action that may restore
-camera state or camera-path keyframes, and playback remains stopped until the
-user presses Play.
+camera state or camera-path keyframes. Playback remains stopped unless the
+saved Camera Path explicitly enables Autoplay; enabled autoplay starts only
+after the complete session transaction commits.
 
 ---
 

@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "build_id": "2026-07-26.4",
+  "build_id": "2026-07-27.1",
   "assets": [
     {
       "path": "assets/css/README.md",
@@ -1378,8 +1378,8 @@
     },
     {
       "path": "assets/js/app/session/contributors/cinematic-camera.js",
-      "sha256": "06b99acf929ef5f1ec942de114144b7d27aeadabde3926a1a3db034a3e20f239",
-      "bytes": 1822,
+      "sha256": "b9847c71f3fa8b2fb057af7f4be4d77782cab02122af7475eea7d4e9cbfd384c",
+      "bytes": 2916,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -1462,8 +1462,8 @@
     },
     {
       "path": "assets/js/app/state-serializer/README.md",
-      "sha256": "7e97c001087091ff63f5403f9cf84a0aa606dbccbd4ed6519f8a6f2881bdf032",
-      "bytes": 10998,
+      "sha256": "b0d8c75c5927674145a872639af6255c438a5382897937950543a5cbe89c6f70",
+      "bytes": 11100,
       "content_type": "text/markdown; charset=utf-8"
     },
     {
@@ -1486,8 +1486,8 @@
     },
     {
       "path": "assets/js/app/state-serializer/ui-controls.js",
-      "sha256": "e22eb681fc3403c2a98cff47c4e39505c6a5875fc6f517ac260da1927f8017de",
-      "bytes": 9943,
+      "sha256": "c25394790ddacdc279aa057069457f8ed5c10a0c035aff918f3cbd9145e6371a",
+      "bytes": 9961,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -1654,8 +1654,8 @@
     },
     {
       "path": "assets/js/app/ui/core/dom-cache.js",
-      "sha256": "6a735001e14138c7843d60a976d21dd9f8f87ca1fba4c5a8ab128387749eee6e",
-      "bytes": 14156,
+      "sha256": "e521897ceb1d44af0cf2d125a63c169d4eafd16bf60eab0a4fc6f397fb1efc9c",
+      "bytes": 14208,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -1714,8 +1714,8 @@
     },
     {
       "path": "assets/js/app/ui/modules/cinematic-camera/index.js",
-      "sha256": "7e73c85e980d39776e96c4fb8214e372e7f2fd9c8b95dfccb90bb66c942993c4",
-      "bytes": 27305,
+      "sha256": "6f812a31abe5393d483976dc5fa13dc7f08b9e63e2b6d9b85b120d32ffc6e262",
+      "bytes": 31202,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2566,8 +2566,8 @@
     },
     {
       "path": "index.html",
-      "sha256": "9c70df86819a51044febcd18b54fcf4e92414201e73b82799a0816898b3a64cd",
-      "bytes": 98614,
+      "sha256": "c7fd9c86a03dbd896dbb2ee68588e14d8815fa9613a16cecad0d362b083f64fa",
+      "bytes": 98822,
       "content_type": "text/html; charset=utf-8"
     },
     {

@@ -845,15 +845,25 @@ test('field-overlay restore validates all registries and payload before clearing
 test('cinematic-camera owner failures are public restore failures', () => {
   const failure = new Error('camera path rejected');
   const payload = {
+    autoplay: false,
     defaultSpeed: '30',
     easing: 'linear',
     keyframes: [],
+    invertLook: false,
+    lookSensitivity: '5',
     loopBackKeyframeId: null,
     loopPlayback: false,
+    moveSpeed: '100',
     navigationMode: 'orbit',
     nextIndex: 1,
+    orbitKeySpeed: '40',
+    orbitReverse: true,
+    planarInvertAxes: false,
+    planarPanSpeed: '100',
+    planarZoomToCursor: true,
     positionMethod: 'linear',
     rotationMethod: 'linear',
+    showOrbitAnchor: true,
   };
   assert.throws(
     () => restoreCinematicCamera(
@@ -872,6 +882,80 @@ test('cinematic-camera owner failures are public restore failures', () => {
   assert.throws(
     () => captureCinematicCamera({ cinematicCamera: null }),
     /cinematic camera/i,
+  );
+});
+
+test('camera autoplay starts only on complete session commit and stops on rollback', () => {
+  const restoreTransaction = createSessionRestoreTransaction();
+  let restores = 0;
+  let starts = 0;
+  let stops = 0;
+  const payload = {
+    autoplay: true,
+    defaultSpeed: '30',
+    easing: 'linear',
+    keyframes: [],
+    invertLook: false,
+    lookSensitivity: '5',
+    loopBackKeyframeId: null,
+    loopPlayback: false,
+    moveSpeed: '100',
+    navigationMode: 'orbit',
+    nextIndex: 1,
+    orbitKeySpeed: '40',
+    orbitReverse: true,
+    planarInvertAxes: false,
+    planarPanSpeed: '100',
+    planarZoomToCursor: true,
+    positionMethod: 'linear',
+    rotationMethod: 'linear',
+    showOrbitAnchor: true,
+  };
+
+  restoreCinematicCamera(
+    {
+      cinematicCamera: {
+        restoreSessionState(data) {
+          assert.strictEqual(data, payload);
+          restores += 1;
+        },
+        startAutoplay() {
+          starts += 1;
+          return true;
+        },
+        stopAutoplay() {
+          stops += 1;
+        },
+      },
+      restoreTransaction,
+    },
+    {},
+    payload,
+  );
+
+  assert.equal(restores, 1);
+  assert.equal(starts, 0);
+  restoreTransaction.commit();
+  assert.equal(starts, 1);
+  restoreTransaction.rollback();
+  assert.equal(stops, 1);
+
+  const invalidResultTransaction = createSessionRestoreTransaction();
+  restoreCinematicCamera(
+    {
+      cinematicCamera: {
+        restoreSessionState() {},
+        startAutoplay() {},
+        stopAutoplay() {},
+      },
+      restoreTransaction: invalidResultTransaction,
+    },
+    {},
+    payload,
+  );
+  assert.throws(
+    () => invalidResultTransaction.commit(),
+    /must report a boolean start result/i,
   );
 });
 

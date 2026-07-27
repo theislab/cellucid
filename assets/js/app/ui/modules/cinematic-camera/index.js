@@ -13,6 +13,7 @@
 
 import {
   createKeyframeStore,
+  isCameraPathReady,
   isValidCameraKeyframe,
   MAX_KEYFRAMES,
   MAX_TRANSITION_DURATION_SECONDS
@@ -34,15 +35,25 @@ const SVG_GOTO = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" st
 const SVG_DELETE = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`;
 const LOOP_BACK_LABEL = '\u21A9 Return to Start';
 const CAMERA_PATH_SESSION_KEYS = [
+  'autoplay',
   'defaultSpeed',
   'easing',
+  'invertLook',
   'keyframes',
+  'lookSensitivity',
   'loopBackKeyframeId',
   'loopPlayback',
+  'moveSpeed',
   'navigationMode',
   'nextIndex',
+  'orbitKeySpeed',
+  'orbitReverse',
+  'planarInvertAxes',
+  'planarPanSpeed',
+  'planarZoomToCursor',
   'positionMethod',
-  'rotationMethod'
+  'rotationMethod',
+  'showOrbitAnchor'
 ];
 const REQUIRED_DOM_KEYS = [
   'navModeSelect',
@@ -74,7 +85,8 @@ const REQUIRED_DOM_KEYS = [
   'positionInterp',
   'rotationInterp',
   'easingSelect',
-  'loopCheckbox'
+  'loopCheckbox',
+  'autoplayCheckbox'
 ];
 
 // Speed slider labels (maps slider 1-100 to descriptive text)
@@ -138,6 +150,40 @@ export function assertCameraPathSessionState(data) {
   if (typeof data.defaultSpeed !== 'string') {
     throw new TypeError('Camera Path session defaultSpeed must be a range-input string.');
   }
+  if (typeof data.autoplay !== 'boolean') {
+    throw new TypeError('Camera Path session autoplay must be boolean.');
+  }
+  for (const booleanKey of [
+    'invertLook',
+    'orbitReverse',
+    'planarInvertAxes',
+    'planarZoomToCursor',
+    'showOrbitAnchor'
+  ]) {
+    if (typeof data[booleanKey] !== 'boolean') {
+      throw new TypeError(`Camera Path session ${booleanKey} must be boolean.`);
+    }
+  }
+  parseRangeInput(data.orbitKeySpeed, {
+    minimum: 1,
+    maximum: 100,
+    label: 'Camera Path session orbit keyboard speed'
+  });
+  parseRangeInput(data.planarPanSpeed, {
+    minimum: 1,
+    maximum: 100,
+    label: 'Camera Path session planar keyboard speed'
+  });
+  parseRangeInput(data.lookSensitivity, {
+    minimum: 1,
+    maximum: 30,
+    label: 'Camera Path session look sensitivity'
+  });
+  parseRangeInput(data.moveSpeed, {
+    minimum: 1,
+    maximum: 500,
+    label: 'Camera Path session move speed'
+  });
   assertCameraPathOptions({
     positionMethod: data.positionMethod,
     rotationMethod: data.rotationMethod,
@@ -193,6 +239,7 @@ export function initCinematicCamera({
   const keyframeStore = createKeyframeStore();
   let loopBackKeyframeId = null;
   let suppressTransportReveal = false;
+  let pathWasReady = false;
 
   function hasLoopBackKeyframe() {
     return Boolean(loopBackKeyframeId && keyframeStore.getById(loopBackKeyframeId));
@@ -426,6 +473,30 @@ export function initCinematicCamera({
   playbackController.on('stateChange', (newState) => {
     if (newState === 'STOPPED' && dom.navModeSelect) {
       syncNavigationMode(viewer.getNavigationMode());
+    }
+  });
+
+  function startAutoplay() {
+    if (!dom.autoplayCheckbox.checked || !isCameraPathReady(keyframeStore.getAll())) {
+      return false;
+    }
+    if (playbackController.getState() === 'PLAYING') {
+      return true;
+    }
+    transportBar.updateVisibility({ reveal: true });
+    playbackController.play();
+    return true;
+  }
+
+  function stopAutoplay() {
+    if (playbackController.getState() !== 'STOPPED') {
+      playbackController.stop({ resetCamera: false });
+    }
+  }
+
+  dom.autoplayCheckbox.addEventListener('change', () => {
+    if (dom.autoplayCheckbox.checked) {
+      startAutoplay();
     }
   });
 
@@ -670,8 +741,18 @@ export function initCinematicCamera({
 
   function handleKeyframeStoreChange() {
     if (!syncLoopBackState()) return;
+    const pathIsReady = isCameraPathReady(keyframeStore.getAll());
     renderKeyframeList();
     transportBar.updateVisibility({ reveal: !suppressTransportReveal });
+    if (
+      !suppressTransportReveal &&
+      !pathWasReady &&
+      pathIsReady &&
+      dom.autoplayCheckbox.checked
+    ) {
+      startAutoplay();
+    }
+    pathWasReady = pathIsReady;
   }
 
   keyframeStore.on('changed', handleKeyframeStoreChange);
@@ -682,6 +763,7 @@ export function initCinematicCamera({
 
   syncLoopBackState();
   renderKeyframeList();
+  pathWasReady = isCameraPathReady(keyframeStore.getAll());
 
   // Camera paths belong to the dataset that was active when they were made.
   // A replacement must never retain or execute coordinates from the old data.
@@ -693,6 +775,7 @@ export function initCinematicCamera({
     } else {
       transportBar.updateVisibility({ reveal: false });
     }
+    pathWasReady = false;
   }
 
   const handleDatasetChange = () => resetCameraPath();
@@ -711,11 +794,22 @@ export function initCinematicCamera({
       ...keyframeStore.exportAll(),
       loopBackKeyframeId,
       // Interpolation & playback settings
+      autoplay: dom.autoplayCheckbox.checked,
       loopPlayback: dom.loopCheckbox.checked,
       positionMethod: dom.positionInterp.value,
       rotationMethod: dom.rotationInterp.value,
       easing: dom.easingSelect.value,
       defaultSpeed: dom.defaultSpeedInput.value,
+      // Navigation interaction settings
+      invertLook: dom.invertLookCheckbox.checked,
+      lookSensitivity: dom.lookSensitivityInput.value,
+      moveSpeed: dom.moveSpeedInput.value,
+      orbitKeySpeed: dom.orbitKeySpeedInput.value,
+      orbitReverse: dom.orbitReverseCheckbox.checked,
+      planarInvertAxes: dom.planarInvertAxesCheckbox.checked,
+      planarPanSpeed: dom.planarPanSpeedInput.value,
+      planarZoomToCursor: dom.planarZoomToCursorCheckbox.checked,
+      showOrbitAnchor: dom.showOrbitAnchorCheckbox.checked,
       // Navigation mode
       navigationMode: viewer.getNavigationMode()
     };
@@ -747,13 +841,38 @@ export function initCinematicCamera({
       dom.defaultSpeedInput.value = data.defaultSpeed;
       dom.defaultSpeedInput.dispatchEvent(new Event('input', { bubbles: true }));
       dom.loopCheckbox.checked = data.loopPlayback;
+      dom.autoplayCheckbox.checked = data.autoplay;
       viewer.setNavigationMode(data.navigationMode);
       syncNavigationMode(data.navigationMode);
 
+      dom.orbitKeySpeedInput.value = data.orbitKeySpeed;
+      updateOrbitKeySpeed();
+      dom.orbitReverseCheckbox.checked = data.orbitReverse;
+      viewer.setOrbitInvertRotation(data.orbitReverse);
+      dom.showOrbitAnchorCheckbox.checked = data.showOrbitAnchor;
+      viewer.setShowOrbitAnchor(data.showOrbitAnchor);
+
+      dom.planarPanSpeedInput.value = data.planarPanSpeed;
+      updatePlanarPanSpeed();
+      dom.planarZoomToCursorCheckbox.checked = data.planarZoomToCursor;
+      viewer.setPlanarZoomToCursor(data.planarZoomToCursor);
+      dom.planarInvertAxesCheckbox.checked = data.planarInvertAxes;
+      viewer.setPlanarInvertAxes(data.planarInvertAxes);
+
+      dom.lookSensitivityInput.value = data.lookSensitivity;
+      updateLookSensitivity();
+      dom.moveSpeedInput.value = data.moveSpeed;
+      updateMoveSpeed();
+      dom.invertLookCheckbox.checked = data.invertLook;
+      applyInvertLook(data.invertLook);
+      dom.pointerLockCheckbox.checked = false;
+      viewer.setPointerLockEnabled(false);
+
       syncLoopBackState();
       renderKeyframeList();
-      // A restored path is available, but stays idle and out of the way until
-      // the user explicitly reveals and starts it.
+      pathWasReady = isCameraPathReady(keyframeStore.getAll());
+      // The session transaction starts enabled autoplay only after every
+      // session chunk has restored successfully.
       transportBar.updateVisibility({ reveal: false });
     } finally {
       suppressTransportReveal = false;
@@ -772,6 +891,8 @@ export function initCinematicCamera({
     getPlaybackController: () => playbackController,
     exportSessionState,
     restoreSessionState,
+    startAutoplay,
+    stopAutoplay,
     syncNavigationMode,
     resetCameraPath,
     destroy

@@ -26,6 +26,7 @@ const DOMAIN_OWNED_IDS = new Set([
   'gene-expression-search',
   'dimension-select',
   'dataset-select',
+  'pointer-lock',
   'remote-server-url',
   'github-repo-url',
 ]);

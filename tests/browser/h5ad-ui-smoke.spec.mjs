@@ -30,6 +30,15 @@ async function expectPlanarCurrentDataset(page, name) {
   await expect(page.locator('.cinematic-transport-bar')).toHaveCount(0);
 }
 
+async function expectFileInputCleared(page, selector) {
+  await expect.poll(
+    () => page.locator(selector).evaluate(input => ({
+      fileCount: input.files.length,
+      value: input.value,
+    })),
+  ).toEqual({ fileCount: 0, value: '' });
+}
+
 async function captureReadableDataset(page, outputPath) {
   await page.evaluate(async () => {
     const pointSize = document.getElementById('point-size');
@@ -139,7 +148,7 @@ test('replaces prepared, Zarr ZIP, and H5AD datasets through the visible control
   );
 
   await page.locator('#user-data-zarr-archive-input').setInputFiles(zarrFixturePath);
-  await expect(page.locator('#user-data-zarr-archive-input')).toHaveValue('');
+  await expectFileInputCleared(page, '#user-data-zarr-archive-input');
   await expectPlanarCurrentDataset(page, 'current-ui-smoke');
   await colorByCellType(page);
   await expectUserDataReadyNotification(page);
@@ -150,7 +159,7 @@ test('replaces prepared, Zarr ZIP, and H5AD datasets through the visible control
   await dismissAllNotifications(page);
 
   await page.locator('#user-data-h5ad-input').setInputFiles(fixturePath);
-  await expect(page.locator('#user-data-h5ad-input')).toHaveValue('');
+  await expectFileInputCleared(page, '#user-data-h5ad-input');
   await expectPlanarCurrentDataset(page, 'current-ui-smoke');
   await colorByCellType(page);
   await expectUserDataReadyNotification(page);
@@ -182,7 +191,7 @@ test('replaces prepared, Zarr ZIP, and H5AD datasets through the visible control
   );
 
   await page.locator('#user-data-file-input').setInputFiles(preparedFixturePath);
-  await expect(page.locator('#user-data-file-input')).toHaveValue('');
+  await expectFileInputCleared(page, '#user-data-file-input');
   await expectPlanarCurrentDataset(page, 'Current UI prepared fixture');
   await expect(page.locator('#notification-center .notification')).toHaveCount(0);
 
@@ -242,13 +251,139 @@ test('saves and restores the exact current UI state through one file-input contr
   await chooser.setFiles(sessionPath);
 
   await expect(page.locator('#theme-select')).toHaveValue('light');
-  await expect(page.locator('#background-select')).toHaveValue('white');
+  await expect(page.locator('#background-select')).toHaveValue('grid');
   await expect(page.locator('#point-size')).toHaveValue('16.5');
   await expect(page.locator('#visualization-section')).toHaveAttribute('open', '');
   await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
   await expect(page.locator('#dimension-select')).toHaveValue('2');
   await expect(page.locator('#navigation-mode')).toHaveValue('planar');
   await expect(page.locator('.cinematic-transport-bar')).toHaveCount(0);
+
+  expect(browserErrors).toEqual([]);
+});
+
+test('camera path state round-trips every owned control and commits autoplay', async ({ page }, testInfo) => {
+  const browserErrors = [];
+  page.on('console', message => {
+    if (message.type() === 'error') browserErrors.push(`console: ${message.text()}`);
+  });
+  page.on('pageerror', error => {
+    browserErrors.push(`page: ${error.stack || error.message}`);
+  });
+  page.on('response', response => {
+    if (response.status() >= 400) {
+      browserErrors.push(`http ${response.status()}: ${response.url()}`);
+    }
+  });
+
+  await page.goto(
+    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=camera-session-ci',
+    { waitUntil: 'domcontentloaded' },
+  );
+  await dismissWelcome(page);
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await page.locator('#cinematic-camera-section > summary').click();
+  await page.locator('#cinematic-save-btn').click();
+  await page.locator('#cinematic-save-btn').click();
+  await expect(page.locator('.cinematic-keyframe-item')).toHaveCount(2);
+
+  await page.locator('.cinematic-duration-input').first().fill('10');
+  await page.locator('.cinematic-duration-input').first().dispatchEvent('change');
+  await page.locator('.cinematic-loopback-list-toggle').check();
+  await page.locator('#cinematic-position-interp').selectOption('linear');
+  await page.locator('#cinematic-rotation-interp').selectOption('linear');
+  await page.locator('#cinematic-easing').selectOption('ease-in-out');
+  await page.evaluate(() => {
+    const setRange = (id, value) => {
+      const element = document.getElementById(id);
+      element.value = value;
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+    };
+    const setCheckbox = (id, checked) => {
+      const element = document.getElementById(id);
+      element.checked = checked;
+      element.dispatchEvent(new Event('change', { bubbles: true }));
+    };
+    setRange('cinematic-orbit-key-speed', '73');
+    setRange('cinematic-default-speed', '47');
+    setCheckbox('cinematic-orbit-reverse', false);
+    setCheckbox('cinematic-show-orbit-anchor', false);
+    setRange('cinematic-planar-pan-speed', '61');
+    setCheckbox('cinematic-planar-zoom-to-cursor', false);
+    setCheckbox('cinematic-planar-invert-axes', true);
+    setRange('cinematic-look-sensitivity', '9');
+    setRange('cinematic-move-speed', '234');
+    setCheckbox('cinematic-invert-look', true);
+  });
+  await page.locator('#cinematic-loop').check();
+  await page.locator('#cinematic-autoplay').check();
+  await expect(page.locator('.cinematic-play-btn')).toHaveAttribute('title', 'Pause');
+
+  const downloadPromise = page.waitForEvent('download');
+  await page.locator('#save-state-btn').click();
+  const download = await downloadPromise;
+  const sessionPath = testInfo.outputPath('camera-autoplay.cellucid-session');
+  await download.saveAs(sessionPath);
+
+  await page.locator('[data-action="stop"]').click();
+  await page.locator('#cinematic-clear-btn').click();
+  await page.locator('#cinematic-loop').uncheck();
+  await page.locator('#cinematic-autoplay').uncheck();
+  await page.locator('#cinematic-nav-mode').selectOption('free');
+  await page.locator('#cinematic-position-interp').selectOption('catmull-rom');
+  await page.locator('#cinematic-rotation-interp').selectOption('slerp');
+  await page.locator('#cinematic-easing').selectOption('linear');
+  await page.evaluate(() => {
+    for (const [id, value] of [
+      ['cinematic-default-speed', '30'],
+      ['cinematic-orbit-key-speed', '40'],
+      ['cinematic-planar-pan-speed', '100'],
+      ['cinematic-look-sensitivity', '5'],
+      ['cinematic-move-speed', '100'],
+    ]) {
+      const element = document.getElementById(id);
+      element.value = value;
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    for (const [id, checked] of [
+      ['cinematic-orbit-reverse', true],
+      ['cinematic-show-orbit-anchor', true],
+      ['cinematic-planar-zoom-to-cursor', true],
+      ['cinematic-planar-invert-axes', false],
+      ['cinematic-invert-look', false],
+    ]) {
+      const element = document.getElementById(id);
+      element.checked = checked;
+      element.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  });
+
+  const chooserPromise = page.waitForEvent('filechooser');
+  await page.locator('#load-state-btn').click();
+  const chooser = await chooserPromise;
+  await chooser.setFiles(sessionPath);
+
+  await expect(page.locator('.cinematic-keyframe-item')).toHaveCount(3);
+  await expect(page.locator('.cinematic-loopback-list-toggle')).toBeChecked();
+  await expect(page.locator('.cinematic-duration-input').first()).toHaveValue('10');
+  await expect(page.locator('#cinematic-loop')).toBeChecked();
+  await expect(page.locator('#cinematic-autoplay')).toBeChecked();
+  await expect(page.locator('#cinematic-nav-mode')).toHaveValue('planar');
+  await expect(page.locator('#cinematic-default-speed')).toHaveValue('47');
+  await expect(page.locator('#cinematic-position-interp')).toHaveValue('linear');
+  await expect(page.locator('#cinematic-rotation-interp')).toHaveValue('linear');
+  await expect(page.locator('#cinematic-easing')).toHaveValue('ease-in-out');
+  await expect(page.locator('#cinematic-orbit-key-speed')).toHaveValue('73');
+  await expect(page.locator('#cinematic-orbit-reverse')).not.toBeChecked();
+  await expect(page.locator('#cinematic-show-orbit-anchor')).not.toBeChecked();
+  await expect(page.locator('#cinematic-planar-pan-speed')).toHaveValue('61');
+  await expect(page.locator('#cinematic-planar-zoom-to-cursor')).not.toBeChecked();
+  await expect(page.locator('#cinematic-planar-invert-axes')).toBeChecked();
+  await expect(page.locator('#cinematic-look-sensitivity')).toHaveValue('9');
+  await expect(page.locator('#cinematic-move-speed')).toHaveValue('234');
+  await expect(page.locator('#cinematic-invert-look')).toBeChecked();
+  await expect(page.locator('.cinematic-play-btn')).toHaveAttribute('title', 'Pause');
+  await page.locator('[data-action="stop"]').click();
 
   expect(browserErrors).toEqual([]);
 });

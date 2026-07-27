@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="light" data-viewer-background="white">
+<html lang="en" data-theme="light" data-viewer-background="grid">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -14,7 +14,7 @@
     Release validation owns this immutable value and changes it only together
     with the exact web-asset inventory after the complete build is accepted.
   -->
-  <meta name="cellucid-web-build-id" content="2026-07-26.4" />
+  <meta name="cellucid-web-build-id" content="2026-07-27.1" />
 
   <!--
     CELLUCID_EXPORTS_BASE_URL
@@ -476,8 +476,8 @@
           <div class="control-block">
             <label for="background-select">Background:</label>
             <select id="background-select">
-              <option value="white" selected>White</option>
-              <option value="grid">Grid (light)</option>
+              <option value="white">White</option>
+              <option value="grid" selected>Grid (light)</option>
               <option value="grid-dark">Grid (dark)</option>
               <option value="black">Black</option>
             </select>
@@ -1576,7 +1576,7 @@
               hidden
             >
               <div class="info-tooltip-content">
-                Save at least two positions to enable the top playback bar. Playback never starts automatically.
+                Save at least two positions to enable the top playback bar. Autoplay is opt-in.
               </div>
             </div>
             <div class="control-block">
@@ -1734,6 +1734,10 @@
               <label style="margin-top:0;display:flex;align-items:center;gap:var(--space-1-5);">
                 <input type="checkbox" id="cinematic-loop" />
                 Loop playback
+              </label>
+              <label style="margin-top:var(--space-1-5);display:flex;align-items:center;gap:var(--space-1-5);">
+                <input type="checkbox" id="cinematic-autoplay" />
+                Autoplay
               </label>
             </div>
           </div>

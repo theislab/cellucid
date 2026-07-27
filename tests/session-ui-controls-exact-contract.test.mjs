@@ -194,7 +194,12 @@ test('UI capture omits controls owned by exact domain restorers', () => {
     value: 'light',
     options: ['light', 'dark'],
   });
-  const fixture = installDocument([navigation, theme]);
+  const pointerLock = new FakeControl({
+    id: 'pointer-lock',
+    type: 'checkbox',
+    checked: true,
+  });
+  const fixture = installDocument([navigation, pointerLock, theme]);
   try {
     const serializer = createUiControlSerializer({ sidebar: fixture.sidebar });
     assert.deepEqual(serializer.collectUIControls(), {

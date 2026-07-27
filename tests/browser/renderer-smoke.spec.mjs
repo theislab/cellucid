@@ -32,8 +32,10 @@ test('volumetric smoke completes its exact GPU density and noise path', async ({
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
 
-  await page.locator('#render-mode').selectOption('smoke');
-  await expect(page.locator('#render-mode')).toHaveValue('smoke');
+  const renderMode = page.locator('#render-mode');
+  await expect(renderMode).toHaveValue('points');
+  await renderMode.selectOption('smoke');
+  await expect(renderMode).toHaveValue('smoke');
   await noiseReady;
   await page.evaluate(() => new Promise(resolve => {
     requestAnimationFrame(() => requestAnimationFrame(resolve));

@@ -326,6 +326,7 @@ export function collectDOMReferences(root) {
       rotationInterp: byId('cinematic-rotation-interp'),
       easingSelect: byId('cinematic-easing'),
       loopCheckbox: byId('cinematic-loop'),
+      autoplayCheckbox: byId('cinematic-autoplay'),
     },
   };
 }

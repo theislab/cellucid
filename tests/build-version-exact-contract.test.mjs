@@ -27,10 +27,10 @@ function createDocument(buildIds) {
 }
 
 test('footer publishes the one exact web build identity', () => {
-  const documentOwner = createDocument(['2026-07-26.4']);
-  assert.equal(publishWebBuildVersion(documentOwner), '2026-07-26.4');
-  assert.equal(documentOwner.output.textContent, '2026-07-26.4');
-  assert.equal(documentOwner.output.title, 'Website build 2026-07-26.4');
+  const documentOwner = createDocument(['2026-07-27.1']);
+  assert.equal(publishWebBuildVersion(documentOwner), '2026-07-27.1');
+  assert.equal(documentOwner.output.textContent, '2026-07-27.1');
+  assert.equal(documentOwner.output.title, 'Website build 2026-07-27.1');
 });
 
 test('web build publication rejects missing, duplicate, and malformed identities', () => {
