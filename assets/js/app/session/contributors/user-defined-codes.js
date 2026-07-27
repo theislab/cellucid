@@ -7,11 +7,16 @@
 import { decodeUvarint, pushUvarint } from '../codecs/varint.js';
 import {
   assertArray,
+  assertExactKeys,
   assertNonEmptyString,
   assertPlainRecord,
   assertSafeInteger,
   requireMethod
 } from '../schema-contract.js';
+import {
+  getCriticalUserDefinedFieldIds,
+  USER_DEFINED_CODES_RESTORE_TRANSACTION_ID
+} from './user-defined-code-inventory.js';
 
 export const id = 'user-defined-codes';
 
@@ -20,11 +25,35 @@ const ENC_RAW_U16 = 1;
 const ENC_RLE_U8 = 2;
 const ENC_RLE_U16 = 3;
 const CHUNK_PREFIX = 'user-defined/codes/';
+const COOPERATIVE_DECODE_BUDGET = 64 * 1024;
+const CHUNK_META_KEYS = Object.freeze([
+  'id',
+  'contributorId',
+  'priority',
+  'kind',
+  'codec',
+  'label',
+  'datasetDependent',
+  'storedBytes',
+  'uncompressedBytes'
+]);
 
 function throwIfAborted(signal) {
   if (signal !== null && signal.aborted) {
-    throw new DOMException('Aborted', 'AbortError');
+    throw signal.reason ?? new DOMException('Aborted', 'AbortError');
   }
+}
+
+function yieldToMacrotask() {
+  return new Promise(resolve => {
+    const channel = new MessageChannel();
+    channel.port1.onmessage = () => {
+      channel.port1.close();
+      channel.port2.close();
+      resolve();
+    };
+    channel.port2.postMessage(null);
+  });
 }
 
 function assertSignal(signal) {
@@ -101,7 +130,7 @@ function encodeCodesBinary(codes) {
   return rleOut.byteLength < rawOut.byteLength ? rleOut : rawOut;
 }
 
-function decodeCodesBinary(bytes, options) {
+async function decodeCodesBinary(bytes, options) {
   if (!(bytes instanceof Uint8Array) || bytes.byteLength < 2) {
     throw new TypeError('Invalid user-defined codes payload.');
   }
@@ -157,7 +186,27 @@ function decodeCodesBinary(bytes, options) {
     if (bytes.byteLength - offset !== length) {
       throw new Error('Invalid raw-u8 user-defined codes byte length or trailing bytes.');
     }
-    return new Uint8Array(bytes.subarray(offset));
+    const codes = new Uint8Array(length);
+    for (
+      let outputOffset = 0;
+      outputOffset < length;
+      outputOffset += COOPERATIVE_DECODE_BUDGET
+    ) {
+      throwIfAborted(signal);
+      const end = Math.min(
+        outputOffset + COOPERATIVE_DECODE_BUDGET,
+        length
+      );
+      codes.set(
+        bytes.subarray(offset + outputOffset, offset + end),
+        outputOffset
+      );
+      if (end < length) {
+        await yieldToMacrotask();
+      }
+    }
+    throwIfAborted(signal);
+    return codes;
   }
 
   if (encoding === ENC_RAW_U16) {
@@ -167,8 +216,16 @@ function decodeCodesBinary(bytes, options) {
     const codes = new Uint16Array(length);
     const view = new DataView(bytes.buffer, bytes.byteOffset + offset, length * 2);
     for (let index = 0; index < length; index++) {
+      throwIfAborted(signal);
       codes[index] = view.getUint16(index * 2, true);
+      if (
+        index + 1 < length
+        && (index + 1) % COOPERATIVE_DECODE_BUDGET === 0
+      ) {
+        await yieldToMacrotask();
+      }
     }
+    throwIfAborted(signal);
     return codes;
   }
 
@@ -182,10 +239,11 @@ function decodeCodesBinary(bytes, options) {
     throw new Error('Invalid user-defined RLE pair count.');
   }
 
-  const pairs = new Array(pairCount);
+  const codes = isU8 ? new Uint8Array(length) : new Uint16Array(length);
   let decodedLength = 0;
   let previousValue = null;
   const maximumValue = isU8 ? 0xff : 0xffff;
+  let workSinceYield = 0;
   for (let pairIndex = 0; pairIndex < pairCount; pairIndex++) {
     throwIfAborted(signal);
     const valueResult = decodeUvarint(bytes, offset);
@@ -207,7 +265,29 @@ function decodeCodesBinary(bytes, options) {
     if (!Number.isSafeInteger(decodedLength) || decodedLength > length) {
       throw new Error('User-defined RLE runs exceed the declared codes length.');
     }
-    pairs[pairIndex] = { value, run };
+    const runStart = decodedLength - run;
+    let fillStart = runStart;
+    while (fillStart < decodedLength) {
+      const fillCount = Math.min(
+        decodedLength - fillStart,
+        COOPERATIVE_DECODE_BUDGET - workSinceYield
+      );
+      const fillEnd = fillStart + fillCount;
+      codes.fill(value, fillStart, fillEnd);
+      fillStart = fillEnd;
+      workSinceYield += fillCount;
+      if (
+        workSinceYield === COOPERATIVE_DECODE_BUDGET
+        && (
+          fillStart < decodedLength
+          || pairIndex + 1 < pairCount
+        )
+      ) {
+        workSinceYield = 0;
+        await yieldToMacrotask();
+        throwIfAborted(signal);
+      }
+    }
     previousValue = value;
   }
   if (decodedLength !== length) {
@@ -216,16 +296,7 @@ function decodeCodesBinary(bytes, options) {
   if (offset !== bytes.byteLength) {
     throw new Error('User-defined RLE payload contains trailing bytes.');
   }
-
-  const codes = isU8 ? new Uint8Array(length) : new Uint16Array(length);
-  let outputIndex = 0;
-  for (const pair of pairs) {
-    const end = outputIndex + pair.run;
-    for (; outputIndex < end; outputIndex++) {
-      if ((outputIndex & 0x3fff) === 0) throwIfAborted(signal);
-      codes[outputIndex] = pair.value;
-    }
-  }
+  throwIfAborted(signal);
   return codes;
 }
 
@@ -239,83 +310,6 @@ function getState(ctx, operation) {
     throw new TypeError(`User-defined codes ${operation} requires the current DataState owner.`);
   }
   return ctx.state;
-}
-
-function addCriticalField(ids, field, context) {
-  if (field === null) return;
-  if (field === undefined || typeof field !== 'object') {
-    throw new TypeError(`${context} must be an object or null.`);
-  }
-  if (field._isUserDefined !== true) return;
-  if (field.kind !== 'category') {
-    if (field.kind !== 'continuous') {
-      throw new TypeError(`${context} has unsupported kind.`);
-    }
-    return;
-  }
-  ids.add(assertNonEmptyString(field._userDefinedId, `${context} user-defined id`));
-}
-
-function getExactActiveField(owner, context) {
-  const source = owner.activeFieldSource;
-  if (source === null) {
-    if (owner.activeFieldIndex !== -1 || owner.activeVarFieldIndex !== -1) {
-      throw new TypeError(
-        `${context} inactive field indexes must both equal -1.`
-      );
-    }
-    return null;
-  }
-  if (source !== 'obs' && source !== 'var') {
-    throw new TypeError(`${context} has unsupported activeFieldSource.`);
-  }
-  const fieldIndex = source === 'obs'
-    ? owner.activeFieldIndex
-    : owner.activeVarFieldIndex;
-  const inactiveIndex = source === 'obs'
-    ? owner.activeVarFieldIndex
-    : owner.activeFieldIndex;
-  assertSafeInteger(fieldIndex, `${context} active field index`);
-  if (inactiveIndex !== -1) {
-    throw new TypeError(`${context} inactive field index must equal -1.`);
-  }
-  const data = source === 'obs' ? owner.obsData : owner.varData;
-  if (data === null || typeof data !== 'object' || !Array.isArray(data.fields)) {
-    throw new TypeError(`${context} requires its active field inventory.`);
-  }
-  if (fieldIndex >= data.fields.length) {
-    throw new RangeError(`${context} active field index is out of range.`);
-  }
-  const field = data.fields[fieldIndex];
-  if (field === null || typeof field !== 'object') {
-    throw new TypeError(`${context} active field must be an object.`);
-  }
-  return field;
-}
-
-function getCriticalUserDefinedFieldIds(state) {
-  if (!(state.viewContexts instanceof Map)) {
-    throw new TypeError('User-defined codes capture requires the current viewContexts Map.');
-  }
-  const ids = new Set();
-  addCriticalField(
-    ids,
-    getExactActiveField(state, 'Current field state'),
-    'Current active field'
-  );
-
-  for (const [viewId, context] of state.viewContexts) {
-    const exactViewId = assertNonEmptyString(viewId, 'Snapshot view id');
-    if (context === null || typeof context !== 'object') {
-      throw new TypeError(`Snapshot view "${exactViewId}" context must be an object.`);
-    }
-    addCriticalField(
-      ids,
-      getExactActiveField(context, `Snapshot view "${exactViewId}"`),
-      `Snapshot view "${exactViewId}" active field`
-    );
-  }
-  return ids;
 }
 
 export function capture(ctx) {
@@ -424,13 +418,66 @@ function collectInjectedFields(state, fieldId) {
   return copies;
 }
 
-export function restore(ctx, chunkMeta, payload) {
+function getInventoryTracker(ctx) {
+  const transaction = ctx.restoreTransaction;
+  if (transaction === null || transaction === undefined) return null;
+  if (typeof transaction !== 'object') {
+    throw new TypeError(
+      'User-defined codes restoreTransaction must be an object or null.'
+    );
+  }
+  requireMethod(
+    transaction,
+    'get',
+    'User-defined codes restore transaction'
+  );
+  let tracker;
+  try {
+    tracker = transaction.get(USER_DEFINED_CODES_RESTORE_TRANSACTION_ID);
+  } catch (error) {
+    if (error instanceof RangeError) {
+      throw new TypeError(
+        'User-defined code chunks require the prior field-overlays inventory.'
+      );
+    }
+    throw error;
+  }
+  requireMethod(
+    tracker,
+    'record',
+    'User-defined code inventory tracker'
+  );
+  return tracker;
+}
+
+export async function restore(ctx, chunkMeta, payload) {
   const state = getState(ctx, 'restore');
   if (!(payload instanceof Uint8Array)) {
     throw new TypeError('User-defined codes payload must be a Uint8Array.');
   }
-  if (chunkMeta === null || typeof chunkMeta !== 'object') {
-    throw new TypeError('User-defined codes chunk metadata must be an object.');
+  assertExactKeys(
+    chunkMeta,
+    CHUNK_META_KEYS,
+    'User-defined codes chunk metadata'
+  );
+  if (chunkMeta.contributorId !== id) {
+    throw new TypeError(
+      `User-defined codes contributorId must equal "${id}".`
+    );
+  }
+  if (chunkMeta.priority !== 'eager' && chunkMeta.priority !== 'lazy') {
+    throw new TypeError(
+      'User-defined codes priority must be eager or lazy.'
+    );
+  }
+  if (
+    chunkMeta.kind !== 'binary'
+    || chunkMeta.codec !== 'gzip'
+    || chunkMeta.datasetDependent !== true
+  ) {
+    throw new TypeError(
+      'User-defined codes chunks must be binary, gzip, and dataset-dependent.'
+    );
   }
   const chunkId = assertNonEmptyString(chunkMeta.id, 'User-defined codes chunk id');
   if (!chunkId.startsWith(CHUNK_PREFIX)) {
@@ -459,6 +506,28 @@ export function restore(ctx, chunkMeta, payload) {
     || template._userDefinedId !== fieldId
   ) {
     throw new TypeError(`User-defined field "${fieldId}" metadata is inconsistent.`);
+  }
+  const fieldKey = assertNonEmptyString(
+    template.key,
+    `User-defined field "${fieldId}" key`
+  );
+  if (chunkMeta.label !== `User-defined codes: ${fieldKey}`) {
+    throw new TypeError(
+      `User-defined codes chunk label must match field "${fieldId}".`
+    );
+  }
+  assertSafeInteger(
+    chunkMeta.storedBytes,
+    'User-defined codes chunk storedBytes'
+  );
+  const uncompressedBytes = assertSafeInteger(
+    chunkMeta.uncompressedBytes,
+    'User-defined codes chunk uncompressedBytes'
+  );
+  if (uncompressedBytes !== payload.byteLength) {
+    throw new RangeError(
+      'User-defined codes payload length must equal metadata uncompressedBytes.'
+    );
   }
   if (template._codesLengthHint !== pointCount) {
     throw new RangeError(
@@ -499,7 +568,8 @@ export function restore(ctx, chunkMeta, payload) {
   }
 
   const signal = assertSignal(ctx.abortSignal);
-  const codes = decodeCodesBinary(payload, {
+  const inventoryTracker = getInventoryTracker(ctx);
+  const codes = await decodeCodesBinary(payload, {
     expectedLength: pointCount,
     expectedCodesType: template._codesTypeHint,
     signal
@@ -523,5 +593,8 @@ export function restore(ctx, chunkMeta, payload) {
     state._pushColorsToViewer();
     state._pushCentroidsToViewer();
     state.computeGlobalVisibility();
+  }
+  if (inventoryTracker !== null) {
+    inventoryTracker.record(fieldId, chunkMeta.priority);
   }
 }

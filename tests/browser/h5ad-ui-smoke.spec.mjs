@@ -1,7 +1,23 @@
+import { createHash } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from '@playwright/test';
+import {
+  readBundle,
+} from '../../assets/js/app/session/bundle/reader.js';
+import {
+  writeBundle,
+} from '../../assets/js/app/session/bundle/writer.js';
 import { dismissWelcome } from './helpers/welcome.mjs';
+
+const PUBLISHED_DEFAULT_CHUNK_IDS = Object.freeze([
+  'core/field-overlays',
+  'core/state',
+  'ui/dockable-layout',
+  'analysis/windows',
+  'highlights/meta',
+]);
 
 const fixturePath = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -18,6 +34,10 @@ const preparedFixturePath = path.join(
   'fixtures',
   'exports',
   'current-ui-prepared',
+);
+const preparedCatalogPath = path.join(
+  path.dirname(preparedFixturePath),
+  'datasets.json',
 );
 
 async function expectPlanarCurrentDataset(page, name) {
@@ -78,6 +98,42 @@ async function colorByCellType(page) {
   const field = page.locator('#categorical-field');
   await field.selectOption({ label: 'cell_type' });
   await expect(field.locator('option:checked')).toHaveText('cell_type');
+}
+
+async function createPublishedDefaultBytes(genericBytes) {
+  const { manifest, chunkStream } = await readBundle(
+    new Blob([genericBytes]),
+    {
+      signal: null,
+      onProgress: null,
+    },
+  );
+  const chunksById = new Map();
+  for await (const chunk of chunkStream) {
+    if (chunksById.has(chunk.meta.id)) {
+      throw new Error(
+        `Generic browser fixture duplicated chunk "${chunk.meta.id}".`,
+      );
+    }
+    chunksById.set(chunk.meta.id, chunk);
+  }
+  const selected = PUBLISHED_DEFAULT_CHUNK_IDS.map(chunkId => {
+    const chunk = chunksById.get(chunkId);
+    if (chunk === undefined) {
+      throw new Error(
+        `Generic browser fixture omitted published chunk "${chunkId}".`,
+      );
+    }
+    return chunk;
+  });
+  const published = writeBundle({
+    manifest: {
+      ...manifest,
+      chunks: selected.map(chunk => chunk.meta),
+    },
+    chunks: selected.map(chunk => chunk.bytes),
+  });
+  return Buffer.from(await published.arrayBuffer());
 }
 
 test('loads the current H5AD contract with a planar 2-D camera and no playback', async ({ page }) => {
@@ -259,6 +315,101 @@ test('saves and restores the exact current UI state through one file-input contr
   await expect(page.locator('#navigation-mode')).toHaveValue('planar');
   await expect(page.locator('.cinematic-transport-bar')).toHaveCount(0);
 
+  expect(browserErrors).toEqual([]);
+});
+
+test('an advertised sample applies one verified static state without camera motion', async ({ page }, testInfo) => {
+  const browserErrors = [];
+  page.on('console', message => {
+    if (message.type() === 'error') {
+      browserErrors.push(`console: ${message.text()}`);
+    }
+  });
+  page.on('pageerror', error => {
+    browserErrors.push(`page: ${error.stack || error.message}`);
+  });
+  page.on('response', response => {
+    if (response.status() >= 400) {
+      browserErrors.push(`http ${response.status()}: ${response.url()}`);
+    }
+  });
+
+  const applicationUrl =
+    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=published-state-ci';
+  await page.goto(applicationUrl, { waitUntil: 'domcontentloaded' });
+  await dismissWelcome(page);
+  await expectPlanarCurrentDataset(page, 'Current UI prepared fixture');
+  await colorByCellType(page);
+  await page.locator('#point-size').fill('31');
+  await page.locator('#point-size').dispatchEvent('input');
+
+  const downloadPromise = page.waitForEvent('download');
+  await page.locator('#save-state-btn').click();
+  const download = await downloadPromise;
+  const statePath = testInfo.outputPath(
+    'published-default.cellucid-session',
+  );
+  await download.saveAs(statePath);
+  const genericStateBytes = await readFile(statePath);
+  const stateBytes = await createPublishedDefaultBytes(genericStateBytes);
+  const stateSha256 = createHash('sha256')
+    .update(stateBytes)
+    .digest('hex');
+
+  const catalog = JSON.parse(
+    await readFile(preparedCatalogPath, 'utf8'),
+  );
+  catalog.datasets[0].state_manifest = 'state-snapshots.json';
+  catalog.datasets[0].state_sha256 = stateSha256;
+  let manifestRequests = 0;
+  let stateRequests = 0;
+  await page.route(
+    '**/tests/browser/fixtures/exports/datasets.json',
+    async route => {
+      await route.fulfill({
+        body: JSON.stringify(catalog),
+        contentType: 'application/json',
+        status: 200,
+      });
+    },
+  );
+  await page.route(
+    '**/tests/browser/fixtures/exports/current-ui-prepared/state-snapshots.json',
+    async route => {
+      manifestRequests++;
+      await route.fulfill({
+        body: JSON.stringify({
+          states: ['default.cellucid-session'],
+        }),
+        contentType: 'application/json',
+        status: 200,
+      });
+    },
+  );
+  await page.route(
+    '**/tests/browser/fixtures/exports/current-ui-prepared/default.cellucid-session',
+    async route => {
+      stateRequests++;
+      await route.fulfill({
+        body: stateBytes,
+        contentType: 'application/octet-stream',
+        status: 200,
+      });
+    },
+  );
+
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await dismissWelcome(page);
+  await expectPlanarCurrentDataset(page, 'Current UI prepared fixture');
+  await expect(
+    page.locator('#categorical-field option:checked'),
+  ).toHaveText('cell_type');
+  await expect(page.locator('#point-size')).toHaveValue('31');
+  await expect(page.locator('#cinematic-camera-section')).not
+    .toHaveAttribute('open', '');
+  await expect(page.locator('.cinematic-transport-bar')).toHaveCount(0);
+  await expect.poll(() => manifestRequests).toBe(1);
+  await expect.poll(() => stateRequests).toBe(1);
   expect(browserErrors).toEqual([]);
 });
 

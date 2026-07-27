@@ -36,6 +36,20 @@ const mainSource = await readFile(
   new URL('../assets/js/app/main.js', import.meta.url),
   'utf8'
 );
+const datasetStateSource = await readFile(
+  new URL(
+    '../assets/js/app/session/dataset-state-manifest.js',
+    import.meta.url
+  ),
+  'utf8'
+);
+const sessionSerializerSource = await readFile(
+  new URL(
+    '../assets/js/app/session/session-serializer.js',
+    import.meta.url
+  ),
+  'utf8'
+);
 const indexHtml = await readFile(new URL('../index.html', import.meta.url), 'utf8');
 
 function keyframe(id, offset = 0) {
@@ -600,9 +614,21 @@ test('camera paths default to idle, restore autoplay transactionally, and reset 
   assert.match(cameraModuleSource, /function startAutoplay\(\)/);
 });
 
-test('dataset publication never auto-restores a camera path or session bundle', () => {
+test('dataset publication restores only an integrity-pinned static sample view', () => {
   assert.doesNotMatch(mainSource, /restoreLatestFromDatasetExports/);
-  assert.doesNotMatch(mainSource, /state-snapshots\.json/);
+  assert.match(mainSource, /restoreCurrentDatasetState\(\{/);
+  assert.match(
+    datasetStateSource,
+    /restorePublishedDefaultState[\s\S]*new Blob\(\[stateBytes\]/
+  );
+  assert.match(
+    sessionSerializerSource,
+    /Published default session must not contain cinematic camera data\./
+  );
+  assert.match(
+    sessionSerializerSource,
+    /manifestProfile:\s*'published-default'/
+  );
 });
 
 test('the Camera Path DOM cache exposes only controls consumed by the current module', () => {

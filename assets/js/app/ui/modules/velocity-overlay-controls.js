@@ -469,7 +469,7 @@ export function initVelocityOverlayControls(options) {
 
   function updateSpeedDisplay() {
     const value = parseVelocityInput(dom, 'speed') / 100;
-    speedDisplay.textContent = `${value.toFixed(1)}×`;
+    speedDisplay.textContent = `${value.toFixed(value < 0.1 ? 2 : 1)}×`;
     return value;
   }
 

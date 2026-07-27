@@ -1,7 +1,7 @@
 /**
  * @fileoverview Session bundle orchestrator.
  *
- * Responsibilities (per session-serializer-plan.md):
+ * Responsibilities:
  * - enumerate contributors in a fixed order
  * - capture chunks + write a single-file `.cellucid-session` bundle
  * - load manifest and apply eager/lazy chunks in one awaited restore operation
@@ -21,10 +21,14 @@ import {
 } from './bundle/format.js';
 import { gzipCompress, gzipDecompress } from './codecs/gzip.js';
 import {
+  ANALYSIS_CACHE_INVENTORY_CHUNK_PROFILE
+} from './contributors/analysis-artifacts.js';
+import {
   buildSessionContext,
   createSessionRestoreTransaction,
   datasetFingerprintMatches,
-  getDatasetFingerprint
+  getDatasetFingerprint,
+  registerSessionRestoreSnapshots
 } from './session-context.js';
 import {
   assertArray,
@@ -59,11 +63,161 @@ import {
  * @property {(ctx: any, chunkMeta: any, payload: any) => Promise<void>|void} restore
  */
 
+const MAX_PUBLISHED_DEFAULT_STATE_BYTES = 32 * 1024;
+const MAX_PUBLISHED_DEFAULT_UNCOMPRESSED_BYTES = 64 * 1024;
+
+export const SESSION_RESTORE_SUPERSEDED_CODE =
+  'CELLUCID_SESSION_RESTORE_SUPERSEDED';
+export const SESSION_RESTORE_CANCELED_CODE =
+  'CELLUCID_SESSION_RESTORE_CANCELED';
+
+export function createSessionRestoreCanceledError() {
+  const error = new Error('Session restore was canceled by the user.');
+  error.name = 'AbortError';
+  error.code = SESSION_RESTORE_CANCELED_CODE;
+  return error;
+}
+
+export function isSessionRestoreCanceledError(error) {
+  return error?.code === SESSION_RESTORE_CANCELED_CODE;
+}
+
+export function createSessionRestoreSupersededError() {
+  const error = new Error(
+    'Session restore was superseded by a newer restore.'
+  );
+  error.name = 'AbortError';
+  error.code = SESSION_RESTORE_SUPERSEDED_CODE;
+  return error;
+}
+
+export function isSessionRestoreSupersededError(error) {
+  return error?.code === SESSION_RESTORE_SUPERSEDED_CODE;
+}
+
+const PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE = Object.freeze([
+  Object.freeze({
+    id: 'core/field-overlays',
+    contributorId: 'field-overlays',
+    priority: 'eager',
+    kind: 'json',
+    codec: 'gzip',
+    label: 'Field overlays',
+    datasetDependent: true
+  }),
+  Object.freeze({
+    id: 'core/state',
+    contributorId: 'core-state',
+    priority: 'eager',
+    kind: 'json',
+    codec: 'gzip',
+    label: 'Core state',
+    datasetDependent: true
+  }),
+  Object.freeze({
+    id: 'ui/dockable-layout',
+    contributorId: 'dockable-layout',
+    priority: 'eager',
+    kind: 'json',
+    codec: 'gzip',
+    label: 'Floating panels',
+    datasetDependent: false
+  }),
+  Object.freeze({
+    id: 'analysis/windows',
+    contributorId: 'analysis-windows',
+    priority: 'eager',
+    kind: 'json',
+    codec: 'gzip',
+    label: 'Analysis windows',
+    datasetDependent: true
+  }),
+  Object.freeze({
+    id: 'highlights/meta',
+    contributorId: 'highlights-meta',
+    priority: 'eager',
+    kind: 'json',
+    codec: 'gzip',
+    label: 'Highlight metadata',
+    datasetDependent: true
+  })
+]);
+const CINEMATIC_CAMERA_CHUNK_PROFILE = Object.freeze({
+  id: 'cinematic/camera',
+  contributorId: 'cinematic-camera',
+  priority: 'eager',
+  kind: 'json',
+  codec: 'gzip',
+  label: 'Cinematic camera path',
+  datasetDependent: true
+});
+const CURRENT_GENERIC_STATIC_CHUNK_PROFILES = Object.freeze([
+  ...PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE,
+  ANALYSIS_CACHE_INVENTORY_CHUNK_PROFILE,
+  CINEMATIC_CAMERA_CHUNK_PROFILE
+]);
+const STATIC_CHUNK_PROFILE_KEYS = Object.freeze([
+  'id',
+  'contributorId',
+  'priority',
+  'kind',
+  'codec',
+  'label',
+  'datasetDependent'
+]);
+const BUILT_IN_STATIC_CHUNK_PROFILES = Object.freeze([
+  ...CURRENT_GENERIC_STATIC_CHUNK_PROFILES
+]);
+const STATIC_PROFILE_BY_ID = new Map(
+  BUILT_IN_STATIC_CHUNK_PROFILES.map(profile => [profile.id, profile])
+);
+const STATIC_PROFILE_BY_CONTRIBUTOR = new Map(
+  BUILT_IN_STATIC_CHUNK_PROFILES
+    .filter(profile => profile.contributorId !== 'analysis-artifacts')
+    .map(
+      profile => [profile.contributorId, profile]
+    )
+);
+
+function validateBuiltInStaticChunkProfile(entry, context) {
+  const idProfile = STATIC_PROFILE_BY_ID.get(entry.id);
+  const contributorProfile =
+    STATIC_PROFILE_BY_CONTRIBUTOR.get(entry.contributorId);
+  if (
+    idProfile !== undefined
+    && contributorProfile !== undefined
+    && idProfile !== contributorProfile
+  ) {
+    throw new TypeError(
+      `${context} mixes two canonical built-in chunk identities.`
+    );
+  }
+  const expected = idProfile ?? contributorProfile;
+  if (expected === undefined) return;
+  for (const key of STATIC_CHUNK_PROFILE_KEYS) {
+    if (entry[key] !== expected[key]) {
+      throw new TypeError(
+        `${context} must match canonical built-in chunk "${expected.id}".`
+      );
+    }
+  }
+}
+
+function isExpectedRestoreDismissal(error, signal) {
+  return (
+    isSessionRestoreSupersededError(error)
+    || isSessionRestoreCanceledError(error)
+    || isSessionRestoreSupersededError(signal.reason)
+    || isSessionRestoreCanceledError(signal.reason)
+  );
+}
+
 /**
  * @param {AbortSignal | null | undefined} signal
  */
 function throwIfAborted(signal) {
   if (signal !== null && signal.aborted) {
+    if (signal.reason instanceof Error) throw signal.reason;
     throw new DOMException('Aborted', 'AbortError');
   }
 }
@@ -74,7 +228,7 @@ function throwIfAborted(signal) {
  */
 function nextTick() {
   if (typeof requestAnimationFrame !== 'function') {
-    throw new Error('Session restore requires requestAnimationFrame (dev-phase requirement).');
+    throw new Error('Session restore requires requestAnimationFrame.');
   }
   return new Promise((resolve) => requestAnimationFrame(() => resolve()));
 }
@@ -99,7 +253,13 @@ function downloadBlob(blob, filename) {
  * Basic manifest shape validation (untrusted input).
  * @param {any} manifest
  */
-function validateManifest(manifest, contributorById) {
+function validateManifest(manifest, contributorById, manifestProfile) {
+  if (
+    manifestProfile !== null
+    && manifestProfile !== 'published-default'
+  ) {
+    throw new TypeError('Session manifest profile is invalid.');
+  }
   assertExactKeys(
     manifest,
     ['createdAt', 'datasetFingerprint', 'chunks'],
@@ -117,7 +277,15 @@ function validateManifest(manifest, contributorById) {
   );
   assertArray(manifest.chunks, 'Session manifest chunks');
   const chunkIds = new Set();
+  const contributorOrder = new Map(
+    [...contributorById.keys()].map(
+      (contributorId, index) => [contributorId, index]
+    )
+  );
+  let fieldOverlaysAvailable = false;
   let sawLazy = false;
+  let lastEagerContributorIndex = -1;
+  let lastLazyContributorIndex = -1;
   for (let index = 0; index < manifest.chunks.length; index++) {
     const entry = manifest.chunks[index];
     const context = `Session manifest chunk ${index}`;
@@ -150,6 +318,20 @@ function validateManifest(manifest, contributorById) {
         `Session contributor "${contributorId}" is not registered for chunk "${chunkId}".`
       );
     }
+    if (
+      chunkId === 'core/field-overlays'
+      && contributorId === 'field-overlays'
+    ) {
+      fieldOverlaysAvailable = true;
+    }
+    if (
+      contributorId === 'user-defined-codes'
+      && !fieldOverlaysAvailable
+    ) {
+      throw new TypeError(
+        'User-defined code chunks require the prior field-overlays chunk.'
+      );
+    }
     if (entry.priority !== 'eager' && entry.priority !== 'lazy') {
       throw new TypeError(`${context} priority must be eager or lazy.`);
     }
@@ -157,6 +339,23 @@ function validateManifest(manifest, contributorById) {
       sawLazy = true;
     } else if (sawLazy) {
       throw new TypeError('Session manifest eager chunks must precede lazy chunks.');
+    }
+    if (manifestProfile === null) {
+      const currentContributorIndex = contributorOrder.get(contributorId);
+      const previousContributorIndex = entry.priority === 'eager'
+        ? lastEagerContributorIndex
+        : lastLazyContributorIndex;
+      if (currentContributorIndex < previousContributorIndex) {
+        throw new TypeError(
+          `Session manifest ${entry.priority} contributor groups must ` +
+          'match their registered order.'
+        );
+      }
+      if (entry.priority === 'eager') {
+        lastEagerContributorIndex = currentContributorIndex;
+      } else {
+        lastLazyContributorIndex = currentContributorIndex;
+      }
     }
     if (entry.kind !== 'json' && entry.kind !== 'binary') {
       throw new TypeError(`${context} kind must be json or binary.`);
@@ -166,12 +365,117 @@ function validateManifest(manifest, contributorById) {
     }
     assertNonEmptyString(entry.label, `${context} label`);
     assertBoolean(entry.datasetDependent, `${context} datasetDependent`);
+    validateBuiltInStaticChunkProfile(entry, context);
+    if (
+      contributorId === ANALYSIS_CACHE_INVENTORY_CHUNK_PROFILE.contributorId
+      && entry.priority === 'eager'
+      && chunkId !== ANALYSIS_CACHE_INVENTORY_CHUNK_PROFILE.id
+    ) {
+      throw new TypeError(
+        'The analysis-artifacts contributor has exactly one canonical eager cache inventory.'
+      );
+    }
     assertSafeInteger(entry.storedBytes, `${context} storedBytes`, {
       maximum: MAX_STORED_CHUNK_BYTES
     });
     assertSafeInteger(entry.uncompressedBytes, `${context} uncompressedBytes`, {
       maximum: MAX_UNCOMPRESSED_CHUNK_BYTES
     });
+  }
+  if (manifestProfile === null) {
+    for (const expected of CURRENT_GENERIC_STATIC_CHUNK_PROFILES) {
+      if (
+        contributorById.has(expected.contributorId)
+        && !chunkIds.has(expected.id)
+      ) {
+        throw new TypeError(
+          `Current session manifests require singleton chunk "${expected.id}".`
+        );
+      }
+    }
+  }
+  return manifest;
+}
+
+/**
+ * Published official defaults are intentionally much narrower than an
+ * interactive user-authored session. Validate the complete static profile
+ * before the chunk iterator can dispatch even its first contributor.
+ *
+ * @param {any} manifest
+ */
+function validatePublishedDefaultManifest(manifest) {
+  if (
+    manifest === null
+    || typeof manifest !== 'object'
+    || !Array.isArray(manifest.chunks)
+  ) {
+    throw new TypeError(
+      'Published default session must match the exact static profile.'
+    );
+  }
+
+  for (const entry of manifest.chunks) {
+    if (
+      entry !== null
+      && typeof entry === 'object'
+      && (
+        (
+          typeof entry.id === 'string'
+          && entry.id.startsWith('cinematic/')
+        )
+        || entry.contributorId === 'cinematic-camera'
+      )
+    ) {
+      throw new TypeError(
+        'Published default session must not contain cinematic camera data.'
+      );
+    }
+  }
+
+  if (
+    manifest.chunks.length
+    !== PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE.length
+  ) {
+    throw new TypeError(
+      'Published default session must match the exact static profile.'
+    );
+  }
+
+  let aggregateUncompressedBytes = 0;
+  for (
+    let index = 0;
+    index < PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE.length;
+    index++
+  ) {
+    const actual = manifest.chunks[index];
+    const expected = PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE[index];
+    if (actual === null || typeof actual !== 'object') {
+      throw new TypeError(
+        'Published default session must match the exact static profile.'
+      );
+    }
+    for (const key of STATIC_CHUNK_PROFILE_KEYS) {
+      if (actual[key] !== expected[key]) {
+        throw new TypeError(
+          'Published default session must match the exact static profile.'
+        );
+      }
+    }
+    const uncompressedBytes = assertSafeInteger(
+      actual.uncompressedBytes,
+      `Published default chunk "${actual.id}" uncompressedBytes`,
+      { maximum: MAX_PUBLISHED_DEFAULT_UNCOMPRESSED_BYTES }
+    );
+    aggregateUncompressedBytes += uncompressedBytes;
+    if (
+      aggregateUncompressedBytes
+      > MAX_PUBLISHED_DEFAULT_UNCOMPRESSED_BYTES
+    ) {
+      throw new RangeError(
+        'Published default session exceeds the 64 KiB aggregate uncompressed byte limit.'
+      );
+    }
   }
   return manifest;
 }
@@ -265,12 +569,23 @@ function assertAbortController(value, context) {
   return value;
 }
 
+function assertAbortSignal(value, context) {
+  assertOwner(value, context);
+  if (typeof value.aborted !== 'boolean') {
+    throw new TypeError(`${context} must expose an aborted boolean.`);
+  }
+  requireMethod(value, 'addEventListener', context);
+  requireMethod(value, 'removeEventListener', context);
+  return value;
+}
+
 function assertNotifications(value) {
   assertOwner(value, 'Session notification owner');
   for (const methodName of [
     'startDownload',
     'updateDownload',
     'completeDownload',
+    'dismissDownload',
     'failDownload',
     'info'
   ]) {
@@ -322,6 +637,52 @@ function assertCapturedChunk(chunk, contributorId, chunkIds) {
     throw new TypeError(`${context} binary payload must be a Uint8Array.`);
   }
   return chunk;
+}
+
+async function captureRestoreSnapshots(
+  ctx,
+  contributorById,
+  manifest,
+  manifestProfile
+) {
+  const snapshots = new Map();
+  const capturedIds = new Set();
+  const incomingChunkIds = new Set(
+    manifest.chunks.map(chunk => chunk.id)
+  );
+  const requiredProfiles = manifestProfile === 'published-default'
+    ? PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE
+    : PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE.filter(
+      profile => incomingChunkIds.has(profile.id)
+    );
+  for (const expected of requiredProfiles) {
+    const contributor = contributorById.get(expected.contributorId);
+    if (contributor === undefined) {
+      throw new Error(
+        `Session rollback contributor "${expected.contributorId}" is not registered.`
+      );
+    }
+    const produced = await contributor.capture(ctx);
+    if (!Array.isArray(produced) || produced.length !== 1) {
+      throw new TypeError(
+        `Session rollback contributor "${expected.contributorId}" must capture exactly one chunk.`
+      );
+    }
+    const chunk = assertCapturedChunk(
+      produced[0],
+      expected.contributorId,
+      capturedIds
+    );
+    for (const key of STATIC_CHUNK_PROFILE_KEYS) {
+      if (chunk[key] !== expected[key]) {
+        throw new TypeError(
+          `Session rollback chunk "${expected.id}" does not match its current profile.`
+        );
+      }
+    }
+    snapshots.set(expected.id, structuredClone(chunk.payload));
+  }
+  return snapshots;
 }
 
 function failureMessage(error) {
@@ -416,6 +777,8 @@ export class SessionSerializer {
     /** @type {AbortController|null} */
     this._activeRestoreAbort = null;
     /** @type {Promise<void>|null} */
+    this._activeRestoreTask = null;
+    /** @type {Promise<void>|null} */
     this._activeLazyTask = null;
   }
 
@@ -453,14 +816,120 @@ export class SessionSerializer {
   }
 
   /**
-   * Cancel any in-flight restore (especially lazy chunk processing).
+   * Cancel any in-flight restore and return an awaitable settlement boundary.
+   *
+   * Aborting remains synchronous for existing UI callers. Awaiting the returned
+   * promise guarantees that no contributor from the canceled restore is still
+   * running.
+   *
+   * @returns {Promise<void>}
    */
   cancelRestore() {
     if (this._activeRestoreAbort !== null) {
-      this._activeRestoreAbort.abort();
+      this._activeRestoreAbort.abort(
+        createSessionRestoreCanceledError()
+      );
     }
-    this._activeRestoreAbort = null;
-    this._activeLazyTask = null;
+    const activeTask = this._activeRestoreTask;
+    if (activeTask === null) return Promise.resolve();
+    return activeTask.then(
+      () => {},
+      () => {}
+    );
+  }
+
+  /**
+   * Explicitly cancel and await the owned restore operation.
+   *
+   * @returns {Promise<void>}
+   */
+  async cancelRestoreAndWait() {
+    await this.cancelRestore();
+  }
+
+  /**
+   * Serialize restore ownership. A replacement aborts the current owner, waits
+   * for every contributor in that operation to settle, and only then starts.
+   *
+   * @param {(abortController: AbortController) => Promise<void>} operation
+   * @param {{ signal: AbortSignal|null }} options
+   * @returns {Promise<void>}
+   */
+  _runOwnedRestore(operation, options) {
+    if (typeof operation !== 'function') {
+      throw new TypeError('Session restore operation must be a function.');
+    }
+    assertExactKeys(options, ['signal'], 'Owned session restore options');
+    const callerSignal = options.signal === null
+      ? null
+      : assertAbortSignal(
+        options.signal,
+        'Owned session restore caller signal'
+      );
+
+    const previousTask = this._activeRestoreTask;
+    if (this._activeRestoreAbort !== null) {
+      this._activeRestoreAbort.abort(
+        createSessionRestoreSupersededError()
+      );
+    }
+
+    const abortController = new AbortController();
+    let detachCallerAbort = null;
+    if (callerSignal !== null) {
+      const forwardCallerAbort = () => abortController.abort();
+      callerSignal.addEventListener('abort', forwardCallerAbort, {
+        once: true
+      });
+      detachCallerAbort = () => {
+        callerSignal.removeEventListener('abort', forwardCallerAbort);
+      };
+      if (callerSignal.aborted) {
+        abortController.abort();
+      }
+    }
+
+    const ownedTask = (async () => {
+      if (previousTask !== null) {
+        try {
+          await previousTask;
+        } catch {
+          // The prior caller owns its result. Replacement only needs settlement.
+        }
+      }
+      throwIfAborted(abortController.signal);
+      try {
+        await operation(abortController);
+      } catch (error) {
+        if (
+          abortController.signal.aborted
+          && (
+            isSessionRestoreSupersededError(
+              abortController.signal.reason
+            )
+            || isSessionRestoreCanceledError(
+              abortController.signal.reason
+            )
+          )
+        ) {
+          throw abortController.signal.reason;
+        }
+        throw error;
+      }
+    })();
+
+    this._activeRestoreAbort = abortController;
+    this._activeRestoreTask = ownedTask;
+
+    const releaseOwnership = () => {
+      if (detachCallerAbort !== null) detachCallerAbort();
+      if (this._activeRestoreTask === ownedTask) {
+        this._activeRestoreTask = null;
+        this._activeRestoreAbort = null;
+      }
+    };
+    ownedTask.then(releaseOwnership, releaseOwnership);
+    return ownedTask;
   }
 
   /**
@@ -551,7 +1020,7 @@ export class SessionSerializer {
       chunks: manifestChunks
     };
 
-    validateManifest(manifest, this._contributorById);
+    validateManifest(manifest, this._contributorById, null);
     return writeBundle({ manifest, chunks: storedChunks });
   }
 
@@ -575,8 +1044,18 @@ export class SessionSerializer {
   async loadSessionFromFile() {
     const file = await this._pickSessionFile();
     if (file === null) return false;
-    await this.restoreFromBlob(file);
-    return true;
+    try {
+      await this.restoreFromBlob(file);
+      return true;
+    } catch (error) {
+      if (
+        isSessionRestoreCanceledError(error)
+        || isSessionRestoreSupersededError(error)
+      ) {
+        return false;
+      }
+      throw error;
+    }
   }
 
   /**
@@ -594,12 +1073,72 @@ export class SessionSerializer {
       blob.size,
       'Session restore Blob size'
     );
-    await this._restoreFromBundleSource(blob, {
-      totalBytes,
-      notifications: null,
-      downloadId: null,
-      abortController: null
-    });
+    await this._runOwnedRestore(
+      (abortController) => this._restoreFromBundleSource(blob, {
+        totalBytes,
+        notifications: null,
+        downloadId: null,
+        abortController,
+        manifestProfile: null,
+        refreshUi: null
+      }),
+      { signal: null }
+    );
+  }
+
+  /**
+   * Restore the one official static default published with a dataset.
+   *
+   * This path is deliberately distinct from arbitrary user session restore:
+   * the transport is bounded and its manifest must match the exact static
+   * profile before any contributor can mutate application state.
+   *
+   * @param {Blob} blob
+   * @param {{ signal: AbortSignal, refreshUi: (options: {phase: 'commit'|'rollback'}) => Promise<void>|void }} options
+   * @returns {Promise<void>}
+   */
+  async restorePublishedDefaultState(blob, options) {
+    if (!(blob instanceof Blob)) {
+      throw new TypeError(
+        'Published default session restore source must be a Blob.'
+      );
+    }
+    assertExactKeys(
+      options,
+      ['signal', 'refreshUi'],
+      'Published default session restore options'
+    );
+    const callerSignal = assertAbortSignal(
+      options.signal,
+      'Published default session restore signal'
+    );
+    throwIfAborted(callerSignal);
+    if (typeof options.refreshUi !== 'function') {
+      throw new TypeError(
+        'Published default session restore refreshUi must be a function.'
+      );
+    }
+    const totalBytes = assertSafeInteger(
+      blob.size,
+      'Published default session Blob size'
+    );
+    if (totalBytes > MAX_PUBLISHED_DEFAULT_STATE_BYTES) {
+      throw new RangeError(
+        'Published default session exceeds the 32 KiB byte limit.'
+      );
+    }
+
+    await this._runOwnedRestore(
+      (abortController) => this._restoreFromBundleSource(blob, {
+        totalBytes,
+        notifications: null,
+        downloadId: null,
+        abortController,
+        manifestProfile: 'published-default',
+        refreshUi: options.refreshUi
+      }),
+      { signal: callerSignal }
+    );
   }
 
   /**
@@ -625,79 +1164,86 @@ export class SessionSerializer {
       throw new TypeError('Session URL restore cache mode is invalid.');
     }
 
-    // Cancel any in-flight restore so we never interleave chunk application.
-    this.cancelRestore();
-    const abortController = new AbortController();
-    this._activeRestoreAbort = abortController;
-
-    const ctx = buildSessionContext(this._base, {
-      abortSignal: abortController.signal,
-      restoreTransaction: null
-    });
-    const notifications = assertNotifications(ctx.notifications);
-
-    const downloadId = assertNonEmptyString(
-      notifications.startDownload('Loading session', null, {
-        onCancel: () => abortController.abort()
-      }),
-      'Session download notification id'
-    );
-    let delegatedToRestore = false;
-
-    try {
-      const fetchFn = requireMethod(
-        ctx.dataSourceManager,
-        'fetch',
-        'Session URL restore data source manager'
-      ).bind(ctx.dataSourceManager);
-      const res = await fetchFn(target, {
-        signal: abortController.signal,
-        cache: options.cache
+    await this._runOwnedRestore(async (abortController) => {
+      const ctx = buildSessionContext(this._base, {
+        abortSignal: abortController.signal,
+        restoreTransaction: null
       });
-      assertOwner(res, 'Session URL response');
-      if (res.ok !== true) {
-        assertSafeInteger(res.status, 'Session URL response status', {
-          minimum: 100,
-          maximum: 599
+      const notifications = assertNotifications(ctx.notifications);
+
+      const downloadId = assertNonEmptyString(
+        notifications.startDownload('Loading session', null, {
+          onCancel: () => abortController.abort(
+            createSessionRestoreCanceledError()
+          )
+        }),
+        'Session download notification id'
+      );
+      let delegatedToRestore = false;
+
+      try {
+        const fetchFn = requireMethod(
+          ctx.dataSourceManager,
+          'fetch',
+          'Session URL restore data source manager'
+        ).bind(ctx.dataSourceManager);
+        const res = await fetchFn(target, {
+          signal: abortController.signal,
+          cache: options.cache
         });
-        if (typeof res.statusText !== 'string') {
-          throw new TypeError('Session URL response statusText must be a string.');
+        assertOwner(res, 'Session URL response');
+        if (res.ok !== true) {
+          assertSafeInteger(res.status, 'Session URL response status', {
+            minimum: 100,
+            maximum: 599
+          });
+          if (typeof res.statusText !== 'string') {
+            throw new TypeError(
+              'Session URL response statusText must be a string.'
+            );
+          }
+          throw new Error(
+            `Failed to fetch session (${res.status}): ${res.statusText}`
+          );
         }
-        throw new Error(
-          `Failed to fetch session (${res.status}): ${res.statusText}`
-        );
-      }
-      if (
-        res.body === null
-        || typeof res.body !== 'object'
-        || typeof res.body.getReader !== 'function'
-      ) {
-        throw new Error('restoreFromUrl: fetch response has no readable body stream.');
-      }
+        if (
+          res.body === null
+          || typeof res.body !== 'object'
+          || typeof res.body.getReader !== 'function'
+        ) {
+          throw new Error(
+            'restoreFromUrl: fetch response has no readable body stream.'
+          );
+        }
 
-      const source = {
-        stream: () => res.body
-      };
-      delegatedToRestore = true;
-      await this._restoreFromBundleSource(source, {
-        totalBytes: null,
-        notifications,
-        downloadId,
-        abortController
-      });
-    } catch (err) {
-      if (!delegatedToRestore) {
-        if (err instanceof Error && err.name === 'AbortError') {
-          notifications.failDownload(downloadId, 'Session restore canceled.');
-        } else {
-          notifications.failDownload(downloadId, failureMessage(err));
+        const source = {
+          stream: () => res.body
+        };
+        delegatedToRestore = true;
+        await this._restoreFromBundleSource(source, {
+          totalBytes: null,
+          notifications,
+          downloadId,
+          abortController,
+          manifestProfile: null,
+          refreshUi: null
+        });
+      } catch (err) {
+        if (!delegatedToRestore) {
+          if (isExpectedRestoreDismissal(err, abortController.signal)) {
+            notifications.dismissDownload(downloadId);
+          } else if (err instanceof Error && err.name === 'AbortError') {
+            notifications.failDownload(
+              downloadId,
+              'Session restore canceled.'
+            );
+          } else {
+            notifications.failDownload(downloadId, failureMessage(err));
+          }
         }
-        if (this._activeRestoreAbort === abortController) {
-          this._activeRestoreAbort = null;
-        }
+        throw err;
       }
-      throw err;
-    }
+    }, { signal: null });
   }
 
   /**
@@ -705,13 +1251,20 @@ export class SessionSerializer {
    * Blob-like `{ size, stream() }` object).
    *
    * @param {any} source
-   * @param {{ totalBytes: number|null, notifications: object|null, downloadId: string|null, abortController: AbortController|null }} options
+   * @param {{ totalBytes: number|null, notifications: object|null, downloadId: string|null, abortController: AbortController, manifestProfile: 'published-default'|null, refreshUi: (() => Promise<void>|void)|null }} options
    * @returns {Promise<void>}
    */
   async _restoreFromBundleSource(source, options) {
     assertExactKeys(
       options,
-      ['totalBytes', 'notifications', 'downloadId', 'abortController'],
+      [
+        'totalBytes',
+        'notifications',
+        'downloadId',
+        'abortController',
+        'manifestProfile',
+        'refreshUi'
+      ],
       'Session restore options'
     );
     const totalBytes = options.totalBytes === null
@@ -723,22 +1276,48 @@ export class SessionSerializer {
     const providedDownloadId = options.downloadId === null
       ? null
       : assertNonEmptyString(options.downloadId, 'Session download notification id');
-    const abortController = options.abortController === null
-      ? new AbortController()
-      : assertAbortController(
-        options.abortController,
-        'Session restore AbortController'
-      );
-
+    const abortController = assertAbortController(
+      options.abortController,
+      'Session restore AbortController'
+    );
     if (
-      this._activeRestoreAbort !== null
-      && this._activeRestoreAbort !== abortController
+      options.manifestProfile !== null
+      && options.manifestProfile !== 'published-default'
     ) {
-      this.cancelRestore();
+      throw new TypeError('Session restore manifest profile is invalid.');
     }
-    this._activeRestoreAbort = abortController;
+    const manifestProfile = options.manifestProfile;
+    const refreshUi = options.refreshUi === null
+      ? null
+      : options.refreshUi;
+    if (
+      (manifestProfile === 'published-default')
+      !== (typeof refreshUi === 'function')
+    ) {
+      throw new TypeError(
+        'Published default restore requires exactly one refreshUi function.'
+      );
+    }
 
     const restoreTransaction = createSessionRestoreTransaction();
+    if (refreshUi !== null) {
+      restoreTransaction.register(
+        'published-default/ui-rollback-refresh',
+        {
+          value: null,
+          prepare() {},
+          commit() {},
+          rollback() {
+            return refreshUi({ phase: 'rollback' });
+          }
+        }
+      );
+    }
+    const restoreSnapshots = new Map();
+    registerSessionRestoreSnapshots(
+      restoreTransaction,
+      restoreSnapshots
+    );
     const ctx = buildSessionContext(this._base, {
       abortSignal: abortController.signal,
       restoreTransaction
@@ -752,7 +1331,9 @@ export class SessionSerializer {
     const downloadId = providedDownloadId === null
       ? assertNonEmptyString(
         notifications.startDownload('Loading session', totalBytes, {
-          onCancel: () => abortController.abort()
+          onCancel: () => abortController.abort(
+            createSessionRestoreCanceledError()
+          )
         }),
         'Session download notification id'
       )
@@ -765,7 +1346,14 @@ export class SessionSerializer {
           notifications.updateDownload(downloadId, loaded, totalBytes)
       });
 
-      validateManifest(manifest, this._contributorById);
+      if (manifestProfile === 'published-default') {
+        validatePublishedDefaultManifest(manifest);
+      }
+      validateManifest(
+        manifest,
+        this._contributorById,
+        manifestProfile
+      );
 
       const currentFp = getDatasetFingerprint(ctx);
       const fileFp = manifest.datasetFingerprint;
@@ -774,7 +1362,16 @@ export class SessionSerializer {
           'Session dataset mismatch: the complete saved dataset identity does not match the current dataset.'
         );
       }
-
+      const capturedSnapshots = await captureRestoreSnapshots(
+        ctx,
+        this._contributorById,
+        manifest,
+        manifestProfile
+      );
+      throwIfAborted(abortController.signal);
+      for (const [chunkId, payload] of capturedSnapshots) {
+        restoreSnapshots.set(chunkId, payload);
+      }
       // Phase split: apply eager chunks now, then continue lazy in the background.
       const iterator = chunkStream[Symbol.asyncIterator]();
 
@@ -866,28 +1463,46 @@ export class SessionSerializer {
         this._activeLazyTask = null;
       }
 
-      restoreTransaction.commit();
+      if (refreshUi !== null) {
+        restoreTransaction.register(
+          'published-default/ui-commit-refresh',
+          {
+            value: null,
+            prepare() {},
+            commit() {
+              return refreshUi({ phase: 'commit' });
+            },
+            rollback() {}
+          }
+        );
+      }
+      await restoreTransaction.commit();
       notifications.info('Session fully restored.', {
         category: 'session',
         duration: 2200
       });
       notifications.completeDownload(downloadId, 'Session fully restored.');
-      if (this._activeRestoreAbort === abortController) {
-        this._activeRestoreAbort = null;
-      }
     } catch (err) {
       try {
-        restoreTransaction.rollback();
+        await restoreTransaction.rollback();
       } catch (rollbackError) {
         preserveRestoreRollbackFailure(err, rollbackError);
       }
-      if (err instanceof Error && err.name === 'AbortError') {
+      const isAbortFailure =
+        err instanceof Error && err.name === 'AbortError';
+      const isSilentReplacement =
+        isExpectedRestoreDismissal(err, abortController.signal)
+        || (
+          manifestProfile === 'published-default'
+          && isAbortFailure
+          && abortController.signal.aborted
+        );
+      if (isSilentReplacement) {
+        notifications.dismissDownload(downloadId);
+      } else if (isAbortFailure) {
         notifications.failDownload(downloadId, 'Session restore canceled.');
       } else {
         notifications.failDownload(downloadId, failureMessage(err));
-      }
-      if (this._activeRestoreAbort === abortController) {
-        this._activeRestoreAbort = null;
       }
       throw err;
     }

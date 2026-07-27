@@ -65,6 +65,7 @@ import {
   serializeAutoPullPreferences,
 } from '../../community-annotations/auto-pull-preferences.js';
 
+const CONSENSUS_SNAPSHOT_FILENAME = 'cellucid-consensus.json';
 
 function el(tag, props = {}, children = []) {
   const node = document.createElement(tag);
@@ -4675,11 +4676,13 @@ export function initCommunityAnnotationControls({
     downloadBtn.title = 'Download cellucid-consensus.json';
     downloadBtn.addEventListener('click', () => {
       try {
-        const did = dataSourceManager?.getCurrentDatasetId?.() || null;
         const doc = session.buildConsensusDocument({ includeComments: false, includeMergedFrom: false });
         if (!doc) throw new Error('Consensus snapshot unavailable');
-        downloadJsonAsFile('cellucid-consensus.json', doc);
-        notifications.success(`Downloaded ${filename}`, { category: 'annotation', duration: 2200 });
+        downloadJsonAsFile(CONSENSUS_SNAPSHOT_FILENAME, doc);
+        notifications.success(
+          `Downloaded ${CONSENSUS_SNAPSHOT_FILENAME}`,
+          { category: 'annotation', duration: 2200 }
+        );
       } catch (err) {
         notifications.error(err?.message || 'Failed to build cellucid-consensus.json', { category: 'annotation', duration: 6000 });
       }

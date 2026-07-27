@@ -11,6 +11,9 @@ const {
   interpolateCameraState,
   resolveSegmentDurations
 } = await import('../assets/js/app/ui/modules/cinematic-camera/interpolation-engine.js');
+const {
+  capture: captureCoreState
+} = await import('../assets/js/app/session/contributors/core-state.js');
 
 const scopedSources = await Promise.all([
   '../assets/js/app/session/contributors/core-state.js',
@@ -48,6 +51,83 @@ function cameraState(navigationMode = 'orbit') {
     }
   };
 }
+
+test('locked-camera session capture publishes one coherent current camera', t => {
+  const previousDocument = globalThis.document;
+  globalThis.document = {
+    getElementById() {
+      return null;
+    }
+  };
+  t.after(() => {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  });
+
+  const currentCamera = cameraState();
+  currentCamera.orbit.radius = 2.43;
+  currentCamera.orbit.targetRadius = 2.43;
+  const staleLiveCamera = cameraState();
+  const fields = [{
+    key: 'cell_type',
+    kind: 'category',
+    categories: ['A', 'B']
+  }];
+  const state = {
+    activeFieldSource: 'obs',
+    activeFieldIndex: 0,
+    activeVarFieldIndex: -1,
+    viewContexts: new Map(),
+    getFields() {
+      return fields;
+    },
+    getVarFields() {
+      return [];
+    },
+    async ensureFieldLoaded() {
+      return fields[0];
+    },
+    setActiveField() {
+      return { field: fields[0], pointCount: 2, centroidInfo: '' };
+    },
+    getViewDimensionLevel() {
+      return 3;
+    }
+  };
+  const [chunk] = captureCoreState({
+    state,
+    viewer: {
+      getCamerasLocked() {
+        return true;
+      },
+      getCameraState() {
+        return currentCamera;
+      },
+      getViewLayout() {
+        return {
+          mode: 'grid',
+          activeId: 'live',
+          liveViewHidden: false
+        };
+      },
+      getSnapshotViews() {
+        return [];
+      },
+      getViewCameraState(viewId) {
+        assert.equal(viewId, 'live');
+        return staleLiveCamera;
+      }
+    },
+    sidebar: {
+      querySelectorAll() {
+        return [];
+      }
+    }
+  });
+
+  assert.deepEqual(chunk.payload.camera, currentCamera);
+  assert.deepEqual(chunk.payload.multiview.liveCameraState, currentCamera);
+});
 
 test('the current camera-state contract requires both synchronized representations', () => {
   for (const mode of ['orbit', 'planar', 'free']) {

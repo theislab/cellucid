@@ -32,10 +32,15 @@ import {
   restore as restoreCinematicCamera,
 } from '../assets/js/app/session/contributors/cinematic-camera.js';
 import {
+  ANALYSIS_CACHE_INVENTORY_CHUNK_PROFILE,
   capture as captureAnalysisArtifacts,
   restore as restoreAnalysisArtifact,
 } from '../assets/js/app/session/contributors/analysis-artifacts.js';
 import {
+  DataLayer,
+} from '../assets/js/app/analysis/data/data-layer.js';
+import {
+  capture as captureFieldOverlays,
   restore as restoreFieldOverlays,
 } from '../assets/js/app/session/contributors/field-overlays.js';
 import {
@@ -61,11 +66,21 @@ import {
   getDatasetFingerprint,
 } from '../assets/js/app/session/session-context.js';
 import {
+  isSessionRestoreCanceledError,
   SessionSerializer,
 } from '../assets/js/app/session/session-serializer.js';
 import {
   getNotificationCenter,
 } from '../assets/js/app/notification-center.js';
+import {
+  initSessionControls,
+} from '../assets/js/app/ui/modules/session-controls.js';
+import {
+  createKeyframeStore,
+} from '../assets/js/app/ui/modules/cinematic-camera/keyframe-store.js';
+import {
+  createPlaybackController,
+} from '../assets/js/app/ui/modules/cinematic-camera/playback-controller.js';
 import {
   restoreActiveFields,
 } from '../assets/js/app/state-serializer/active-fields.js';
@@ -128,7 +143,7 @@ function installDocumentById(entries = {}) {
   };
 }
 
-test('integer and delta codecs reject coercion, overflow, duplicates, and trailing bytes', () => {
+test('integer and delta codecs reject coercion, overflow, duplicates, and trailing bytes', async () => {
   for (const invalid of ['1', -1, 1.5, Number.NaN, 2 ** 53]) {
     assert.throws(() => pushUvarint(invalid, []), /integer|safe|value/i);
   }
@@ -156,8 +171,8 @@ test('integer and delta codecs reject coercion, overflow, duplicates, and traili
   const canonical = encodeDeltaUvarint([1, 4]);
   const withTrailing = new Uint8Array(canonical.byteLength + 1);
   withTrailing.set(canonical);
-  assert.throws(
-    () => decodeDeltaUvarint(withTrailing, {
+  await assert.rejects(
+    decodeDeltaUvarint(withTrailing, {
       maxCount: null,
       maxIndex: null,
       signal: null,
@@ -249,6 +264,17 @@ test('bundle framing rejects chunk-count mismatches and trailing bytes', async (
   );
 });
 
+async function rewriteSessionBundle(blob, mutate) {
+  const { manifest, chunkStream } = await readBundle(blob, {
+    signal: null,
+    onProgress: null,
+  });
+  const chunks = [];
+  for await (const chunk of chunkStream) chunks.push(chunk.bytes);
+  mutate(manifest, chunks);
+  return writeBundle({ manifest, chunks });
+}
+
 function makeSessionSerializer(contributors, pointCount = 3) {
   return new SessionSerializer({
     state: {
@@ -275,6 +301,60 @@ function exactSessionChunk(contributorId) {
     label: 'Exact test chunk',
     datasetDependent: false,
     payload: { exact: true },
+  };
+}
+
+function userDefinedCodesChunkMeta(payload, overrides = {}) {
+  return {
+    id: 'user-defined/codes/field-a',
+    contributorId: 'user-defined-codes',
+    priority: 'lazy',
+    kind: 'binary',
+    codec: 'gzip',
+    label: 'User-defined codes: restored_groups',
+    datasetDependent: true,
+    storedBytes: payload.byteLength,
+    uncompressedBytes: payload.byteLength,
+    ...overrides,
+  };
+}
+
+function highlightCellsChunkMeta(payload, overrides = {}) {
+  return {
+    id: 'highlights/cells/highlight_1',
+    contributorId: 'highlights-cells',
+    priority: 'lazy',
+    kind: 'binary',
+    codec: 'gzip',
+    label: 'Highlight cells: Two cells',
+    datasetDependent: true,
+    storedBytes: payload.byteLength,
+    uncompressedBytes: payload.byteLength,
+    ...overrides,
+  };
+}
+
+function categoricalSessionMeta(id, key) {
+  return {
+    id,
+    source: 'obs',
+    kind: 'category',
+    key,
+    categories: ['A', 'B'],
+    isDeleted: false,
+    isPurged: false,
+    codesLength: 3,
+    codesType: 'Uint8Array',
+    centroidsByDim: {},
+    normalizedDims: [],
+    sourceField: null,
+    operation: null,
+    sourcePages: [],
+    overlapStrategy: 'first',
+    overlapLabel: null,
+    intersectionLabels: null,
+    uncoveredLabel: null,
+    createdAt: 123,
   };
 }
 
@@ -343,6 +423,7 @@ async function withNotificationHarness(run) {
   const notifications = getNotificationCenter();
   const names = [
     'completeDownload',
+    'dismissDownload',
     'failDownload',
     'info',
     'startDownload',
@@ -351,6 +432,7 @@ async function withNotificationHarness(run) {
   ];
   const originals = new Map(names.map(name => [name, notifications[name]]));
   notifications.completeDownload = () => {};
+  notifications.dismissDownload = () => {};
   notifications.failDownload = () => {};
   notifications.info = () => {};
   notifications.startDownload = () => 'session-adjacent-test';
@@ -360,6 +442,64 @@ async function withNotificationHarness(run) {
     return await run();
   } finally {
     for (const [name, original] of originals) notifications[name] = original;
+  }
+}
+
+async function withSessionNotificationRecorder(run) {
+  const notifications = getNotificationCenter();
+  const names = [
+    'completeDownload',
+    'dismissDownload',
+    'error',
+    'failDownload',
+    'info',
+    'startDownload',
+    'success',
+    'updateDownload',
+  ];
+  const originals = new Map(names.map(name => [name, notifications[name]]));
+  const events = [];
+  const cancelHandlers = new Map();
+  let nextId = 0;
+  notifications.startDownload = (_label, _total, options) => {
+    const id = `generic-session-${++nextId}`;
+    events.push({ id, kind: 'start' });
+    cancelHandlers.set(id, options.onCancel);
+    return id;
+  };
+  notifications.updateDownload = () => {};
+  notifications.completeDownload = id => {
+    events.push({ id, kind: 'complete' });
+  };
+  notifications.dismissDownload = id => {
+    events.push({ id, kind: 'dismiss' });
+  };
+  notifications.failDownload = (id, message) => {
+    events.push({ id, kind: 'fail', message });
+  };
+  notifications.info = message => {
+    events.push({ kind: 'info', message });
+  };
+  notifications.error = message => {
+    events.push({ kind: 'ui-error', message });
+  };
+  notifications.success = message => {
+    events.push({ kind: 'ui-success', message });
+  };
+  try {
+    return await run(events, {
+      cancel(id) {
+        const handler = cancelHandlers.get(id);
+        if (typeof handler !== 'function') {
+          throw new Error(`Notification "${id}" has no cancel handler.`);
+        }
+        handler();
+      },
+    });
+  } finally {
+    for (const [name, original] of originals) {
+      notifications[name] = original;
+    }
   }
 }
 
@@ -381,6 +521,69 @@ test('session capture rejects open/coercive chunks before bundle encoding', asyn
     serializer.createSessionBundle(),
     /exact keys|label|datasetDependent|legacyLabel/i,
   );
+});
+
+test('generic manifests require every registered singleton in exact contributor order', async () => {
+  const profiles = [{
+    id: 'core/state',
+    contributorId: 'core-state',
+    priority: 'eager',
+    kind: 'json',
+    codec: 'gzip',
+    label: 'Core state',
+    datasetDependent: true,
+  }, {
+    id: 'cinematic/camera',
+    contributorId: 'cinematic-camera',
+    priority: 'eager',
+    kind: 'json',
+    codec: 'gzip',
+    label: 'Cinematic camera path',
+    datasetDependent: true,
+  }];
+  const contributors = profiles.map(profile => ({
+    id: profile.contributorId,
+    capture() {
+      return [{ ...profile, payload: {} }];
+    },
+    restore() {
+      throw new Error('Malformed singleton manifest reached a contributor.');
+    },
+  }));
+  const bundle = await makeSessionSerializer(contributors).createSessionBundle();
+  const malformedBundles = [
+    {
+      message: /require singleton chunk "cinematic\/camera"/i,
+      bundle: await rewriteSessionBundle(bundle, (manifest, chunks) => {
+        manifest.chunks.pop();
+        chunks.pop();
+      }),
+    },
+    {
+      message: /contributor groups.*registered order/i,
+      bundle: await rewriteSessionBundle(bundle, (manifest, chunks) => {
+        manifest.chunks.reverse();
+        chunks.reverse();
+      }),
+    },
+    {
+      message: /canonical built-in chunk "cinematic\/camera"/i,
+      bundle: await rewriteSessionBundle(bundle, manifest => {
+        manifest.chunks[1].id = 'cinematic/camera-alias';
+      }),
+    },
+  ];
+
+  await withNotificationHarness(async () => {
+    for (const malformed of malformedBundles) {
+      await assert.rejects(
+        makeSessionSerializer(contributors).restoreFromBlob(
+          malformed.bundle,
+        ),
+        malformed.message,
+      );
+    }
+  });
 });
 
 test('dataset mismatch rejects atomically before any contributor restore', async () => {
@@ -410,6 +613,213 @@ test('dataset mismatch rejects atomically before any contributor restore', async
     );
   });
   assert.equal(restoreCalls, 0);
+});
+
+test('generic Blob and pre-delegation URL cancellation dismiss exactly once', async () => {
+  const contributorId = 'cancel-probe';
+  const bundle = await makeSessionSerializer([{
+    id: contributorId,
+    capture() {
+      return [exactSessionChunk(contributorId)];
+    },
+    restore() {},
+  }]).createSessionBundle();
+
+  let blobEnteredResolve;
+  const blobEntered = new Promise(resolve => {
+    blobEnteredResolve = resolve;
+  });
+  const blobSerializer = makeSessionSerializer([{
+    id: contributorId,
+    capture() {
+      return [exactSessionChunk(contributorId)];
+    },
+    async restore(ctx) {
+      blobEnteredResolve();
+      await new Promise((resolve, reject) => {
+        ctx.abortSignal.addEventListener(
+          'abort',
+          () => reject(new DOMException('Aborted', 'AbortError')),
+          { once: true },
+        );
+      });
+    },
+  }]);
+  await withSessionNotificationRecorder(async (events, controls) => {
+    const restore = blobSerializer.restoreFromBlob(bundle);
+    const rejection = assert.rejects(
+      restore,
+      error => (
+        error?.name === 'AbortError'
+        && isSessionRestoreCanceledError(error)
+      ),
+    );
+    await blobEntered;
+    controls.cancel('generic-session-1');
+    await rejection;
+    assert.deepEqual(
+      events.filter(event => event.id === 'generic-session-1'),
+      [
+        { id: 'generic-session-1', kind: 'start' },
+        { id: 'generic-session-1', kind: 'dismiss' },
+      ],
+    );
+  });
+
+  let urlEnteredResolve;
+  const urlEntered = new Promise(resolve => {
+    urlEnteredResolve = resolve;
+  });
+  const urlSerializer = new SessionSerializer({
+    state: { pointCount: 3, varData: { fields: [] } },
+    viewer: {},
+    sidebar: {},
+    dataSourceManager: {
+      fetch(_url, options) {
+        urlEnteredResolve();
+        return new Promise((resolve, reject) => {
+          options.signal.addEventListener(
+            'abort',
+            () => reject(new DOMException('Aborted', 'AbortError')),
+            { once: true },
+          );
+        });
+      },
+    },
+    comparisonModule: null,
+    analysisWindowManager: null,
+    cinematicCamera: null,
+    contributors: [],
+  });
+  await withSessionNotificationRecorder(async (events, controls) => {
+    const restore = urlSerializer.restoreFromUrl(
+      'https://example.invalid/session.cellucid-session',
+      { cache: 'no-store' },
+    );
+    const rejection = assert.rejects(
+      restore,
+      error => (
+        error?.name === 'AbortError'
+        && isSessionRestoreCanceledError(error)
+      ),
+    );
+    await urlEntered;
+    controls.cancel('generic-session-1');
+    await rejection;
+    assert.deepEqual(
+      events.filter(event => event.id === 'generic-session-1'),
+      [
+        { id: 'generic-session-1', kind: 'start' },
+        { id: 'generic-session-1', kind: 'dismiss' },
+      ],
+    );
+  });
+});
+
+test('session controls treat exact cancel and supersession as silent no-ops', async () => {
+  const contributorId = 'session-controls-probe';
+  const bundle = await makeSessionSerializer([{
+    id: contributorId,
+    capture() {
+      return [exactSessionChunk(contributorId)];
+    },
+    restore() {},
+  }]).createSessionBundle();
+
+  function createButton() {
+    let clickHandler = null;
+    return {
+      addEventListener(type, handler) {
+        assert.equal(type, 'click');
+        clickHandler = handler;
+      },
+      click() {
+        if (clickHandler === null) {
+          throw new Error('Session control click handler was not registered.');
+        }
+        return clickHandler();
+      },
+    };
+  }
+
+  async function runUiCase(mode) {
+    let enteredResolve;
+    const entered = new Promise(resolve => {
+      enteredResolve = resolve;
+    });
+    let restoreCalls = 0;
+    const serializer = makeSessionSerializer([{
+      id: contributorId,
+      capture() {
+        return [exactSessionChunk(contributorId)];
+      },
+      async restore(ctx) {
+        restoreCalls += 1;
+        if (restoreCalls !== 1) return;
+        enteredResolve();
+        await new Promise((resolve, reject) => {
+          ctx.abortSignal.addEventListener(
+            'abort',
+            () => reject(new DOMException('Aborted', 'AbortError')),
+            { once: true },
+          );
+        });
+      },
+    }]);
+    serializer._pickSessionFile = async () => bundle;
+    const loadButton = createButton();
+    let afterLoads = 0;
+    initSessionControls({
+      dom: { loadBtn: loadButton },
+      sessionSerializer: serializer,
+      onAfterLoad() {
+        afterLoads += 1;
+      },
+    });
+
+    const originalConsoleError = console.error;
+    const consoleErrors = [];
+    console.error = (...args) => {
+      consoleErrors.push(args);
+    };
+    try {
+      await withSessionNotificationRecorder(async (events, controls) => {
+        const click = loadButton.click();
+        await entered;
+        let replacement = null;
+        if (mode === 'cancel') {
+          controls.cancel('generic-session-1');
+        } else {
+          replacement = serializer.restoreFromBlob(bundle);
+        }
+        await click;
+        if (replacement !== null) await replacement;
+        assert.deepEqual(
+          events.filter(event => event.id === 'generic-session-1'),
+          [
+            { id: 'generic-session-1', kind: 'start' },
+            { id: 'generic-session-1', kind: 'dismiss' },
+          ],
+        );
+        assert.deepEqual(
+          events.filter(
+            event => (
+              event.kind === 'ui-error'
+              || event.kind === 'ui-success'
+            ),
+          ),
+          [],
+        );
+      });
+    } finally {
+      console.error = originalConsoleError;
+    }
+    assert.deepEqual(consoleErrors, []);
+    assert.equal(afterLoads, 0);
+  }
+
+  await runUiCase('cancel');
+  await runUiCase('supersede');
 });
 
 test('highlight restore commits once after exact lazy cells and preserves old state on failure', async () => {
@@ -842,6 +1252,96 @@ test('field-overlay restore validates all registries and payload before clearing
   assert.equal(clears, 0);
 });
 
+test('field-overlay rollback reconstructs exact categorical user-defined codes', () => {
+  class JsonRegistry {
+    constructor(value) {
+      this.value = structuredClone(value);
+    }
+    clear() {
+      this.value = {};
+    }
+    fromJSON(value) {
+      this.value = structuredClone(value);
+    }
+    toJSON() {
+      return structuredClone(this.value);
+    }
+  }
+
+  const userDefinedRegistry = new UserDefinedFieldsRegistry();
+  userDefinedRegistry.fromSessionMeta([{
+    id: 'field-a',
+    source: 'obs',
+    kind: 'category',
+    key: 'restored_groups',
+    categories: ['A', 'B'],
+    isDeleted: false,
+    isPurged: false,
+    codesLength: 3,
+    codesType: 'Uint8Array',
+    centroidsByDim: {},
+    normalizedDims: [],
+    sourceField: null,
+    operation: null,
+    sourcePages: [],
+    overlapStrategy: 'first',
+    overlapLabel: null,
+    intersectionLabels: null,
+    uncoveredLabel: null,
+    createdAt: 123,
+  }]);
+  const previousField = userDefinedRegistry.getField('field-a');
+  previousField.codes = new Uint8Array([0, 1, 0]);
+  const previousCodes = previousField.codes;
+  previousField.loaded = true;
+  delete previousField._codesLengthHint;
+  delete previousField._codesTypeHint;
+
+  const renameRegistry = new JsonRegistry({
+    fields: { restored_groups: 'Original groups' },
+    categories: {},
+  });
+  const deleteRegistry = new JsonRegistry({
+    deleted: [],
+    purged: [],
+  });
+  let overlayApplications = 0;
+  const state = {
+    applyFieldOverlays() {
+      overlayApplications += 1;
+    },
+    getDeleteRegistry() {
+      return deleteRegistry;
+    },
+    getRenameRegistry() {
+      return renameRegistry;
+    },
+    getUserDefinedFieldsRegistry() {
+      return userDefinedRegistry;
+    },
+  };
+  const transaction = createSessionRestoreTransaction();
+  restoreFieldOverlays(
+    { state, restoreTransaction: transaction },
+    {},
+    {
+      renames: { fields: {}, categories: {} },
+      deletedFields: { deleted: [], purged: [] },
+      userDefinedFields: [],
+    },
+  );
+  assert.equal(userDefinedRegistry.getField('field-a'), undefined);
+
+  transaction.rollback();
+  const restoredField = userDefinedRegistry.getField('field-a');
+  assert.strictEqual(restoredField.codes, previousCodes);
+  assert.deepEqual(Array.from(restoredField.codes), [0, 1, 0]);
+  assert.equal(restoredField.loaded, true);
+  assert.equal(Object.hasOwn(restoredField, '_codesLengthHint'), false);
+  assert.equal(Object.hasOwn(restoredField, '_codesTypeHint'), false);
+  assert.equal(overlayApplications, 3);
+});
+
 test('cinematic-camera owner failures are public restore failures', () => {
   const failure = new Error('camera path rejected');
   const payload = {
@@ -911,12 +1411,30 @@ test('camera autoplay starts only on complete session commit and stops on rollba
     rotationMethod: 'linear',
     showOrbitAnchor: true,
   };
+  const previousPayload = {
+    ...payload,
+    autoplay: true,
+    defaultSpeed: '20',
+  };
 
   restoreCinematicCamera(
     {
       cinematicCamera: {
+        exportSessionState() {
+          return previousPayload;
+        },
+        capturePlaybackSnapshot() {
+          return {
+            state: 'STOPPED',
+            globalT: 0,
+            camera: exactCameraState(),
+          };
+        },
+        getNavigationMode() {
+          return 'orbit';
+        },
         restoreSessionState(data) {
-          assert.strictEqual(data, payload);
+          assert.ok(data === payload || data.defaultSpeed === '20');
           restores += 1;
         },
         startAutoplay() {
@@ -925,6 +1443,10 @@ test('camera autoplay starts only on complete session commit and stops on rollba
         },
         stopAutoplay() {
           stops += 1;
+        },
+        restorePlaybackSnapshot(snapshot) {
+          assert.equal(snapshot.state, 'STOPPED');
+          assert.equal(snapshot.globalT, 0);
         },
       },
       restoreTransaction,
@@ -939,12 +1461,27 @@ test('camera autoplay starts only on complete session commit and stops on rollba
   assert.equal(starts, 1);
   restoreTransaction.rollback();
   assert.equal(stops, 1);
+  assert.equal(restores, 2);
 
   const invalidResultTransaction = createSessionRestoreTransaction();
   restoreCinematicCamera(
     {
       cinematicCamera: {
+        exportSessionState() {
+          return previousPayload;
+        },
+        capturePlaybackSnapshot() {
+          return {
+            state: 'STOPPED',
+            globalT: 0,
+            camera: exactCameraState(),
+          };
+        },
+        getNavigationMode() {
+          return 'orbit';
+        },
         restoreSessionState() {},
+        restorePlaybackSnapshot() {},
         startAutoplay() {},
         stopAutoplay() {},
       },
@@ -957,6 +1494,316 @@ test('camera autoplay starts only on complete session commit and stops on rollba
     () => invalidResultTransaction.commit(),
     /must report a boolean start result/i,
   );
+});
+
+test('cinematic rollback restores nonzero playing and paused timeline snapshots exactly', () => {
+  const target = exactCameraPathState({
+    autoplay: false,
+    defaultSpeed: '80',
+  });
+  for (const state of ['PLAYING', 'PAUSED']) {
+    const previousPath = exactCameraPathState({
+      autoplay: true,
+      defaultSpeed: '20',
+    });
+    const previousPlayback = {
+      state,
+      globalT: state === 'PLAYING' ? 0.63 : 0.41,
+      camera: exactCameraState(
+        state === 'PLAYING' ? 'free' : 'planar',
+      ),
+    };
+    const restoredPlayback = [];
+    const transaction = createSessionRestoreTransaction();
+    const cameraOwner = {
+      exportSessionState() {
+        return previousPath;
+      },
+      capturePlaybackSnapshot() {
+        return previousPlayback;
+      },
+      getNavigationMode() {
+        return target.navigationMode;
+      },
+      restoreSessionState() {},
+      restorePlaybackSnapshot(snapshot) {
+        restoredPlayback.push(structuredClone(snapshot));
+      },
+      startAutoplay() {
+        return false;
+      },
+      stopAutoplay() {},
+    };
+    restoreCinematicCamera(
+      {
+        cinematicCamera: cameraOwner,
+        restoreTransaction: transaction,
+      },
+      {},
+      target,
+    );
+    transaction.register(`late-${state}`, {
+      value: null,
+      prepare() {},
+      commit() {
+        throw new Error(`late ${state} failure`);
+      },
+      rollback() {},
+    });
+    assert.throws(
+      () => transaction.commit(),
+      new RegExp(`late ${state} failure`, 'i'),
+    );
+    assert.deepEqual(restoredPlayback, [previousPlayback]);
+  }
+});
+
+test('cinematic transaction stops stale RAF and resumes exact old timeline after late failure', () => {
+  const originalRequestAnimationFrame = globalThis.requestAnimationFrame;
+  const originalCancelAnimationFrame = globalThis.cancelAnimationFrame;
+  const originalPerformance = globalThis.performance;
+  const frames = new Map();
+  let nextFrameId = 1;
+  let nowMs = 1_000;
+  globalThis.requestAnimationFrame = callback => {
+    const frameId = nextFrameId++;
+    frames.set(frameId, callback);
+    return frameId;
+  };
+  globalThis.cancelAnimationFrame = frameId => {
+    frames.delete(frameId);
+  };
+  Object.defineProperty(globalThis, 'performance', {
+    configurable: true,
+    value: { now: () => nowMs },
+  });
+
+  function cameraAt(theta) {
+    const camera = exactCameraState('orbit');
+    camera.orbit.theta = theta;
+    camera.freefly.position[0] = theta;
+    return camera;
+  }
+
+  function pathFrom(first, second, defaultSpeed) {
+    const store = createKeyframeStore();
+    store.add(first);
+    store.add(second);
+    const exported = store.exportAll();
+    return exactCameraPathState({
+      autoplay: false,
+      defaultSpeed,
+      keyframes: exported.keyframes,
+      navigationMode: first.navigationMode,
+      nextIndex: exported.nextIndex,
+    });
+  }
+
+  const oldPath = pathFrom(cameraAt(0), cameraAt(2), '20');
+  const targetPath = pathFrom(cameraAt(10), cameraAt(12), '80');
+  const targetCamera = cameraAt(11);
+
+  function runScenario({ fail }) {
+    frames.clear();
+    let viewerCamera = cameraAt(0);
+    const viewer = {
+      getCameraState() {
+        return structuredClone(viewerCamera);
+      },
+      setCameraState(value) {
+        viewerCamera = structuredClone(value);
+      },
+    };
+    const store = createKeyframeStore();
+    assert.equal(store.importAll({
+      keyframes: oldPath.keyframes,
+      nextIndex: oldPath.nextIndex,
+    }), true);
+    let currentPath = structuredClone(oldPath);
+    const controller = createPlaybackController({
+      viewer,
+      keyframeStore: store,
+      getInterpolationOptions: () => ({
+        positionMethod: currentPath.positionMethod,
+        rotationMethod: currentPath.rotationMethod,
+        easing: currentPath.easing,
+        loop: currentPath.loopPlayback,
+        autoPaceSpeed: 1,
+      }),
+    });
+    controller.play();
+    controller.seekTo(0.6);
+    const oldProgress = controller.getProgress();
+    const oldCamera = viewer.getCameraState();
+    assert.equal(frames.size, 1);
+
+    const owner = {
+      exportSessionState() {
+        return structuredClone(currentPath);
+      },
+      capturePlaybackSnapshot() {
+        return {
+          state: controller.getState(),
+          globalT: controller.getProgress(),
+          camera: viewer.getCameraState(),
+        };
+      },
+      getNavigationMode() {
+        return viewerCamera.navigationMode;
+      },
+      restoreSessionState(value) {
+        if (controller.getState() !== 'STOPPED') {
+          controller.stop({ resetCamera: false });
+        }
+        currentPath = structuredClone(value);
+        assert.equal(store.importAll({
+          keyframes: currentPath.keyframes,
+          nextIndex: currentPath.nextIndex,
+        }), true);
+      },
+      restorePlaybackSnapshot(snapshot) {
+        if (controller.getState() !== 'STOPPED') {
+          controller.stop({ resetCamera: false });
+        }
+        if (snapshot.state !== 'STOPPED') {
+          controller.play();
+          controller.seekTo(snapshot.globalT);
+          if (snapshot.state === 'PAUSED') controller.pause();
+        }
+        viewer.setCameraState(snapshot.camera);
+      },
+      startAutoplay() {
+        return false;
+      },
+      stopAutoplay() {
+        if (controller.getState() !== 'STOPPED') {
+          controller.stop({ resetCamera: false });
+        }
+      },
+    };
+    const transaction = createSessionRestoreTransaction();
+    restoreCinematicCamera(
+      {
+        cinematicCamera: owner,
+        restoreTransaction: transaction,
+      },
+      {},
+      targetPath,
+    );
+    assert.equal(controller.getState(), 'STOPPED');
+    assert.equal(frames.size, 0);
+
+    viewer.setCameraState(targetCamera);
+    transaction.register('test/core-camera', {
+      value: null,
+      prepare() {},
+      commit() {},
+      rollback() {
+        viewer.setCameraState(oldCamera);
+      },
+    });
+    if (fail) {
+      transaction.register('test/late-camera-failure', {
+        value: null,
+        prepare() {},
+        commit() {
+          throw new Error('late camera failure');
+        },
+        rollback() {},
+      });
+      assert.throws(
+        () => transaction.commit(),
+        /late camera failure/i,
+      );
+      assert.deepEqual(viewer.getCameraState(), oldCamera);
+      assert.equal(controller.getState(), 'PLAYING');
+      assert.equal(controller.getProgress(), oldProgress);
+      assert.equal(frames.size, 1);
+      nowMs += 100;
+      const [frameId, frame] = frames.entries().next().value;
+      frames.delete(frameId);
+      frame(nowMs);
+      assert.ok(controller.getProgress() > oldProgress);
+      assert.notDeepEqual(viewer.getCameraState(), targetCamera);
+    } else {
+      assert.doesNotThrow(() => transaction.commit());
+      nowMs += 100;
+      assert.equal(frames.size, 0);
+      assert.deepEqual(viewer.getCameraState(), targetCamera);
+    }
+    controller.destroy();
+  }
+
+  try {
+    runScenario({ fail: false });
+    runScenario({ fail: true });
+  } finally {
+    if (originalRequestAnimationFrame === undefined) {
+      delete globalThis.requestAnimationFrame;
+    } else {
+      globalThis.requestAnimationFrame = originalRequestAnimationFrame;
+    }
+    if (originalCancelAnimationFrame === undefined) {
+      delete globalThis.cancelAnimationFrame;
+    } else {
+      globalThis.cancelAnimationFrame = originalCancelAnimationFrame;
+    }
+    Object.defineProperty(globalThis, 'performance', {
+      configurable: true,
+      value: originalPerformance,
+    });
+  }
+});
+
+test('cinematic prepare rejects a core navigation-mode mismatch and rolls back', () => {
+  const previousPath = exactCameraPathState({
+    navigationMode: 'free',
+  });
+  const targetPath = exactCameraPathState({
+    navigationMode: 'orbit',
+  });
+  const previousPlayback = {
+    state: 'STOPPED',
+    globalT: 0,
+    camera: exactCameraState('free'),
+  };
+  let currentPath = previousPath;
+  let restoredPlayback = null;
+  const transaction = createSessionRestoreTransaction();
+  restoreCinematicCamera(
+    {
+      cinematicCamera: {
+        exportSessionState() {
+          return currentPath;
+        },
+        capturePlaybackSnapshot() {
+          return previousPlayback;
+        },
+        getNavigationMode() {
+          return 'free';
+        },
+        restoreSessionState(value) {
+          currentPath = value;
+        },
+        restorePlaybackSnapshot(value) {
+          restoredPlayback = value;
+        },
+        startAutoplay() {
+          return false;
+        },
+        stopAutoplay() {},
+      },
+      restoreTransaction: transaction,
+    },
+    {},
+    targetPath,
+  );
+  assert.throws(
+    () => transaction.commit(),
+    /navigation mode.*restored core camera mode/i,
+  );
+  assert.deepEqual(currentPath, previousPath);
+  assert.deepEqual(restoredPlayback, previousPlayback);
 });
 
 test('highlight metadata rejects alternate active-page identity before replacing state', () => {
@@ -1088,16 +1935,18 @@ test('highlight constructors publish explicit enabled state and metadata uses ex
   ]);
 });
 
-test('highlight cell restore requires staged metadata and rejects count mismatches atomically', () => {
+test('highlight cell restore requires staged metadata and rejects count mismatches atomically', async () => {
   const payload = encodeDeltaUvarint([1]);
   const stateWithoutGroup = {
     pointCount: 3,
     highlightPages: [],
   };
-  assert.throws(
-    () => restoreHighlightCells(
+  await assert.rejects(
+    restoreHighlightCells(
       { state: stateWithoutGroup, abortSignal: null },
-      { id: 'highlights/cells/highlight_99' },
+      highlightCellsChunkMeta(payload, {
+        id: 'highlights/cells/highlight_99',
+      }),
       payload,
     ),
     /restore transaction/i,
@@ -1144,10 +1993,10 @@ test('highlight cell restore requires staged metadata and rejects count mismatch
       activePageId: 'page_1',
     },
   );
-  assert.throws(
-    () => restoreHighlightCells(
+  await assert.rejects(
+    restoreHighlightCells(
       context,
-      { id: 'highlights/cells/highlight_1' },
+      highlightCellsChunkMeta(payload),
       payload,
     ),
     /decoded cell count does not match metadata/i,
@@ -1157,12 +2006,13 @@ test('highlight cell restore requires staged metadata and rejects count mismatch
   assert.equal(state.activePageId, 'page_9');
 });
 
-test('user-defined codes reject trailing bytes and dataset length mismatch before mutation', () => {
+test('user-defined codes reject trailing bytes and dataset length mismatch before mutation', async () => {
   function makeState(pointCount) {
     const template = {
       _userDefinedId: 'field-a',
       _isUserDefined: true,
       kind: 'category',
+      key: 'restored_groups',
       codes: null,
       loaded: false,
       _codesLengthHint: pointCount,
@@ -1191,22 +2041,24 @@ test('user-defined codes reject trailing bytes and dataset length mismatch befor
   }
 
   const trailing = makeState(2);
-  assert.throws(
-    () => restoreUserDefinedCodes(
+  const trailingPayload = new Uint8Array([0, 2, 4, 5, 99]);
+  await assert.rejects(
+    restoreUserDefinedCodes(
       { state: trailing.state, abortSignal: null },
-      { id: 'user-defined/codes/field-a' },
-      new Uint8Array([0, 2, 4, 5, 99]),
+      userDefinedCodesChunkMeta(trailingPayload),
+      trailingPayload,
     ),
     /trailing/i,
   );
   assert.equal(trailing.template.codes, null);
 
   const mismatched = makeState(3);
-  assert.throws(
-    () => restoreUserDefinedCodes(
+  const mismatchedPayload = new Uint8Array([0, 2, 4, 5]);
+  await assert.rejects(
+    restoreUserDefinedCodes(
       { state: mismatched.state, abortSignal: null },
-      { id: 'user-defined/codes/field-a' },
-      new Uint8Array([0, 2, 4, 5]),
+      userDefinedCodesChunkMeta(mismatchedPayload),
+      mismatchedPayload,
     ),
     /pointCount|length/i,
   );
@@ -1217,18 +2069,140 @@ test('user-defined codes reject trailing bytes and dataset length mismatch befor
     obsData: { fields: [] },
     varData: { fields: [] },
   });
-  assert.throws(
-    () => restoreUserDefinedCodes(
+  const invalidViewPayload = new Uint8Array([0, 2, 4, 5]);
+  await assert.rejects(
+    restoreUserDefinedCodes(
       { state: invalidViewIdentity.state, abortSignal: null },
-      { id: 'user-defined/codes/field-a' },
-      new Uint8Array([0, 2, 4, 5]),
+      userDefinedCodesChunkMeta(invalidViewPayload),
+      invalidViewPayload,
     ),
     /snapshot view id.*non.?empty.*string/i,
   );
   assert.equal(invalidViewIdentity.template.codes, null);
 });
 
-test('user-defined categorical hydration publishes no placeholder codes and becomes terminally loaded', () => {
+test('dynamic code and highlight chunks reject each dishonest metadata field before mutation', async () => {
+  const codePayload = new Uint8Array([0, 3, 0, 1, 0]);
+  const codeTemplate = {
+    _userDefinedId: 'field-a',
+    _isUserDefined: true,
+    kind: 'category',
+    key: 'restored_groups',
+    codes: null,
+    loaded: false,
+    _codesLengthHint: 3,
+    _codesTypeHint: 'Uint8Array',
+    centroidsByDim: {},
+  };
+  const codeState = {
+    pointCount: 3,
+    obsData: { fields: [] },
+    varData: { fields: [] },
+    viewContexts: new Map(),
+    getUserDefinedFieldsRegistry() {
+      return {
+        getField(fieldId) {
+          return fieldId === 'field-a' ? codeTemplate : null;
+        },
+      };
+    },
+    getActiveField() {
+      return null;
+    },
+  };
+  const invalidCodeMetadata = [
+    [{ contributorId: 'other' }, /contributorId/i],
+    [{ priority: 'critical' }, /priority/i],
+    [{ kind: 'json' }, /binary/i],
+    [{ codec: 'none' }, /gzip/i],
+    [{ label: 'Wrong' }, /label/i],
+    [{ datasetDependent: false }, /dataset-dependent/i],
+    [{ storedBytes: -1 }, /storedBytes|nonnegative/i],
+    [{ uncompressedBytes: codePayload.byteLength + 1 }, /payload length/i],
+    [{ id: 'user-defined/other/field-a' }, /chunk id/i],
+    [{ unexpected: true }, /exact keys|unexpected/i],
+  ];
+  for (const [overrides, expected] of invalidCodeMetadata) {
+    await assert.rejects(
+      restoreUserDefinedCodes(
+        { state: codeState, abortSignal: null },
+        userDefinedCodesChunkMeta(codePayload, overrides),
+        codePayload,
+      ),
+      expected,
+    );
+    assert.equal(codeTemplate.codes, null);
+  }
+
+  const highlightPayload = encodeDeltaUvarint([1, 2]);
+  const oldPages = [{
+    id: 'page_9',
+    name: 'Old',
+    color: '#778899',
+    highlightedGroups: [],
+  }];
+  const highlightState = {
+    pointCount: 3,
+    highlightPages: oldPages,
+    activePageId: 'page_9',
+    _highlightPageIdCounter: 9,
+    _highlightIdCounter: 0,
+    _recomputeHighlightArray() {},
+    _notifyHighlightPageChange() {},
+    _notifyHighlightChange() {},
+  };
+  const restoreTransaction = createSessionRestoreTransaction();
+  const highlightContext = {
+    state: highlightState,
+    abortSignal: null,
+    restoreTransaction,
+  };
+  restoreHighlightMeta(
+    highlightContext,
+    { id: 'highlights/meta' },
+    {
+      pages: [{
+        id: 'page_1',
+        name: 'Restored',
+        color: '#112233',
+        highlightedGroups: [{
+          id: 'highlight_1',
+          type: 'lasso',
+          label: 'Two cells',
+          enabled: true,
+          cellCount: 2,
+        }],
+      }],
+      activePageId: 'page_1',
+    },
+  );
+  const invalidHighlightMetadata = [
+    [{ contributorId: 'other' }, /contributorId/i],
+    [{ priority: 'eager' }, /lazy/i],
+    [{ kind: 'json' }, /binary/i],
+    [{ codec: 'none' }, /gzip/i],
+    [{ label: 'Wrong' }, /label/i],
+    [{ datasetDependent: false }, /dataset-dependent/i],
+    [{ storedBytes: -1 }, /storedBytes|nonnegative/i],
+    [{ uncompressedBytes: highlightPayload.byteLength + 1 }, /payload length/i],
+    [{ id: 'highlights/other/highlight_1' }, /chunk id/i],
+    [{ unexpected: true }, /exact keys|unexpected/i],
+  ];
+  for (const [overrides, expected] of invalidHighlightMetadata) {
+    await assert.rejects(
+      restoreHighlightCells(
+        highlightContext,
+        highlightCellsChunkMeta(highlightPayload, overrides),
+        highlightPayload,
+      ),
+      expected,
+    );
+    assert.strictEqual(highlightState.highlightPages, oldPages);
+  }
+  restoreTransaction.rollback();
+});
+
+test('user-defined categorical hydration publishes no placeholder codes and becomes terminally loaded', async () => {
   const registry = new UserDefinedFieldsRegistry();
   registry.fromSessionMeta([{
     id: 'field-a',
@@ -1279,10 +2253,11 @@ test('user-defined categorical hydration publishes no placeholder codes and beco
       return null;
     },
   };
-  restoreUserDefinedCodes(
+  const restoredCodesPayload = new Uint8Array([0, 3, 0, 1, 0]);
+  await restoreUserDefinedCodes(
     { state, abortSignal: null },
-    { id: 'user-defined/codes/field-a' },
-    new Uint8Array([0, 3, 0, 1, 0]),
+    userDefinedCodesChunkMeta(restoredCodesPayload),
+    restoredCodesPayload,
   );
 
   assert.ok(template.codes instanceof Uint8Array);
@@ -1311,6 +2286,326 @@ test('user-defined categorical hydration publishes no placeholder codes and beco
   assert.equal(chunk.priority, 'lazy');
 });
 
+test('field overlays require every categorical code chunk with truthful active priority', async () => {
+  class JsonRegistry {
+    constructor(value) {
+      this.value = structuredClone(value);
+    }
+    clear() {
+      this.value = {};
+    }
+    fromJSON(value) {
+      this.value = structuredClone(value);
+    }
+    toJSON() {
+      return structuredClone(this.value);
+    }
+  }
+
+  function createHarness() {
+    const registry = new UserDefinedFieldsRegistry();
+    registry.fromSessionMeta([
+      categoricalSessionMeta('old-field', 'old_groups'),
+    ]);
+    const oldField = registry.getField('old-field');
+    oldField.codes = new Uint8Array([0, 1, 0]);
+    oldField.loaded = true;
+    delete oldField._codesLengthHint;
+    delete oldField._codesTypeHint;
+    const oldCodes = oldField.codes;
+    const renameRegistry = new JsonRegistry({
+      fields: {},
+      categories: {},
+    });
+    const deleteRegistry = new JsonRegistry({
+      deleted: [],
+      purged: [],
+    });
+    const state = {
+      pointCount: 3,
+      activeFieldSource: null,
+      activeFieldIndex: -1,
+      activeVarFieldIndex: -1,
+      obsData: { fields: [] },
+      varData: { fields: [] },
+      viewContexts: new Map(),
+      applyFieldOverlays() {
+        this.obsData = {
+          fields: registry.getAllFields().filter(
+            field => field._fieldSource === 'obs',
+          ),
+        };
+        this.varData = { fields: [] };
+      },
+      getActiveField() {
+        if (this.activeFieldSource === null) return null;
+        return this.obsData.fields[this.activeFieldIndex];
+      },
+      updateColorsCategorical() {},
+      buildCentroidsForField() {},
+      getActiveViewId() {
+        return 'live';
+      },
+      _pushColorsToViewer() {},
+      _pushCentroidsToViewer() {},
+      computeGlobalVisibility() {},
+      getDeleteRegistry() {
+        return deleteRegistry;
+      },
+      getRenameRegistry() {
+        return renameRegistry;
+      },
+      getUserDefinedFieldsRegistry() {
+        return registry;
+      },
+    };
+    state.applyFieldOverlays();
+    const transaction = createSessionRestoreTransaction();
+    const context = {
+      state,
+      abortSignal: null,
+      restoreTransaction: transaction,
+    };
+    restoreFieldOverlays(context, {}, {
+      renames: { fields: {}, categories: {} },
+      deletedFields: { deleted: [], purged: [] },
+      userDefinedFields: [
+        categoricalSessionMeta('field-active', 'active_groups'),
+        categoricalSessionMeta('field-unused', 'unused_groups'),
+      ],
+    });
+    state.activeFieldSource = 'obs';
+    state.activeFieldIndex = state.obsData.fields.findIndex(
+      field => field._userDefinedId === 'field-active',
+    );
+    state.activeVarFieldIndex = -1;
+    assert.notEqual(state.activeFieldIndex, -1);
+
+    const payload = new Uint8Array([0, 3, 0, 1, 0]);
+    const restoreCodes = (fieldId, fieldKey, priority) => (
+      restoreUserDefinedCodes(
+        context,
+        userDefinedCodesChunkMeta(payload, {
+          id: `user-defined/codes/${fieldId}`,
+          label: `User-defined codes: ${fieldKey}`,
+          priority,
+        }),
+        payload,
+      )
+    );
+    return {
+      context,
+      oldCodes,
+      registry,
+      restoreCodes,
+      transaction,
+    };
+  }
+
+  const missing = createHarness();
+  await missing.restoreCodes('field-active', 'active_groups', 'eager');
+  assert.throws(
+    () => missing.transaction.commit(),
+    /advertise 2 categorical code chunks but restored 1/i,
+  );
+  assert.strictEqual(
+    missing.registry.getField('old-field').codes,
+    missing.oldCodes,
+  );
+
+  const dishonest = createHarness();
+  await dishonest.restoreCodes('field-unused', 'unused_groups', 'eager');
+  await dishonest.restoreCodes('field-active', 'active_groups', 'lazy');
+  assert.throws(
+    () => dishonest.transaction.commit(),
+    /must be (eager|lazy).*active-field graph/i,
+  );
+  assert.strictEqual(
+    dishonest.registry.getField('old-field').codes,
+    dishonest.oldCodes,
+  );
+
+  const exact = createHarness();
+  await exact.restoreCodes('field-active', 'active_groups', 'eager');
+  await exact.restoreCodes('field-unused', 'unused_groups', 'lazy');
+  assert.doesNotThrow(() => exact.transaction.commit());
+  assert.deepEqual(
+    exact.registry.getAllFields().map(field => ({
+      id: field._userDefinedId,
+      loaded: field.loaded,
+    })),
+    [
+      { id: 'field-active', loaded: true },
+      { id: 'field-unused', loaded: true },
+    ],
+  );
+});
+
+test('generic restore rejects reordered same-priority user code chunks and rolls back', async () => {
+  class JsonRegistry {
+    constructor(value) {
+      this.value = structuredClone(value);
+    }
+    clear() {
+      this.value = {};
+    }
+    fromJSON(value) {
+      this.value = structuredClone(value);
+    }
+    toJSON() {
+      return structuredClone(this.value);
+    }
+  }
+
+  const targetPayload = {
+    renames: { fields: {}, categories: {} },
+    deletedFields: { deleted: [], purged: [] },
+    userDefinedFields: [
+      categoricalSessionMeta('field-a', 'groups_a'),
+      categoricalSessionMeta('field-b', 'groups_b'),
+    ],
+  };
+  const codePayload = new Uint8Array([0, 3, 0, 1, 0]);
+  const source = makeSessionSerializer([{
+    id: 'field-overlays',
+    capture() {
+      return [{
+        id: 'core/field-overlays',
+        contributorId: 'field-overlays',
+        priority: 'eager',
+        kind: 'json',
+        codec: 'gzip',
+        label: 'Field overlays',
+        datasetDependent: true,
+        payload: targetPayload,
+      }];
+    },
+    restore() {},
+  }, {
+    id: 'user-defined-codes',
+    capture() {
+      return [
+        {
+          id: 'user-defined/codes/field-a',
+          contributorId: 'user-defined-codes',
+          priority: 'lazy',
+          kind: 'binary',
+          codec: 'gzip',
+          label: 'User-defined codes: groups_a',
+          datasetDependent: true,
+          payload: codePayload,
+        },
+        {
+          id: 'user-defined/codes/field-b',
+          contributorId: 'user-defined-codes',
+          priority: 'lazy',
+          kind: 'binary',
+          codec: 'gzip',
+          label: 'User-defined codes: groups_b',
+          datasetDependent: true,
+          payload: codePayload,
+        },
+      ];
+    },
+    restore() {},
+  }]);
+  const bundle = await source.createSessionBundle();
+  const reordered = await rewriteSessionBundle(
+    bundle,
+    (manifest, chunks) => {
+      [manifest.chunks[1], manifest.chunks[2]] = [
+        manifest.chunks[2],
+        manifest.chunks[1],
+      ];
+      [chunks[1], chunks[2]] = [chunks[2], chunks[1]];
+    },
+  );
+
+  const registry = new UserDefinedFieldsRegistry();
+  registry.fromSessionMeta([
+    categoricalSessionMeta('old-field', 'old_groups'),
+  ]);
+  const oldField = registry.getField('old-field');
+  oldField.codes = new Uint8Array([0, 1, 0]);
+  oldField.loaded = true;
+  delete oldField._codesLengthHint;
+  delete oldField._codesTypeHint;
+  const oldCodes = oldField.codes;
+  const renameRegistry = new JsonRegistry({
+    fields: {},
+    categories: {},
+  });
+  const deleteRegistry = new JsonRegistry({
+    deleted: [],
+    purged: [],
+  });
+  const state = {
+    pointCount: 3,
+    activeFieldSource: null,
+    activeFieldIndex: -1,
+    activeVarFieldIndex: -1,
+    obsData: { fields: [] },
+    varData: { fields: [] },
+    viewContexts: new Map(),
+    applyFieldOverlays() {
+      this.obsData = { fields: registry.getAllFields() };
+      this.varData = { fields: [] };
+    },
+    getActiveField() {
+      return null;
+    },
+    getDeleteRegistry() {
+      return deleteRegistry;
+    },
+    getRenameRegistry() {
+      return renameRegistry;
+    },
+    getUserDefinedFieldsRegistry() {
+      return registry;
+    },
+  };
+  state.applyFieldOverlays();
+  const destination = new SessionSerializer({
+    state,
+    viewer: {},
+    sidebar: {},
+    dataSourceManager: null,
+    comparisonModule: null,
+    analysisWindowManager: null,
+    cinematicCamera: null,
+    contributors: [{
+      id: 'field-overlays',
+      capture: captureFieldOverlays,
+      restore: restoreFieldOverlays,
+    }, {
+      id: 'user-defined-codes',
+      capture: captureUserDefinedCodes,
+      restore: restoreUserDefinedCodes,
+    }],
+  });
+
+  const previousAnimationFrame = globalThis.requestAnimationFrame;
+  globalThis.requestAnimationFrame = callback => {
+    queueMicrotask(() => callback(0));
+    return 1;
+  };
+  try {
+    await withNotificationHarness(async () => {
+      await assert.rejects(
+        destination.restoreFromBlob(reordered),
+        /lazy code chunks.*exact.*inventory order/i,
+      );
+    });
+  } finally {
+    if (previousAnimationFrame === undefined) {
+      delete globalThis.requestAnimationFrame;
+    } else {
+      globalThis.requestAnimationFrame = previousAnimationFrame;
+    }
+  }
+  assert.strictEqual(registry.getField('old-field').codes, oldCodes);
+});
+
 function exactAnalysisArtifact() {
   return {
     kind: 'bulk-gene',
@@ -1326,7 +2621,35 @@ function exactAnalysisArtifact() {
   };
 }
 
+function exactCameraPathState(overrides = {}) {
+  return {
+    autoplay: false,
+    defaultSpeed: '30',
+    easing: 'linear',
+    keyframes: [],
+    invertLook: false,
+    lookSensitivity: '5',
+    loopBackKeyframeId: null,
+    loopPlayback: false,
+    moveSpeed: '100',
+    navigationMode: 'orbit',
+    nextIndex: 1,
+    orbitKeySpeed: '40',
+    orbitReverse: true,
+    planarInvertAxes: false,
+    planarPanSpeed: '100',
+    planarZoomToCursor: true,
+    positionMethod: 'linear',
+    rotationMethod: 'linear',
+    showOrbitAnchor: true,
+    ...overrides,
+  };
+}
+
 function analysisChunkMeta(chunk, overrides = {}) {
+  const payloadBytes = chunk.kind === 'json'
+    ? new TextEncoder().encode(JSON.stringify(chunk.payload)).byteLength
+    : chunk.payload.byteLength;
   return {
     id: chunk.id,
     contributorId: chunk.contributorId,
@@ -1335,11 +2658,483 @@ function analysisChunkMeta(chunk, overrides = {}) {
     codec: chunk.codec,
     label: chunk.label,
     datasetDependent: chunk.datasetDependent,
-    storedBytes: chunk.payload.byteLength,
-    uncompressedBytes: chunk.payload.byteLength,
+    storedBytes: payloadBytes,
+    uncompressedBytes: payloadBytes,
     ...overrides,
   };
 }
+
+test('generic restore rolls back cinematic state and analysis cache after a later artifact failure', async () => {
+  const initialArtifact = exactAnalysisArtifact();
+  const firstTargetArtifact = {
+    ...exactAnalysisArtifact(),
+    cacheKey: 'bulk_genes:target-a',
+    gene: 'TARGET_A',
+    pageId: 'target-a',
+    pageName: 'Target A',
+  };
+  const failingTargetArtifact = {
+    ...exactAnalysisArtifact(),
+    cacheKey: 'bulk_genes:target-b',
+    gene: 'TARGET_FAIL',
+    pageId: 'target-b',
+    pageName: 'Target B',
+  };
+  const initialCamera = exactCameraPathState({
+    defaultSpeed: '20',
+    navigationMode: 'planar',
+  });
+  const targetCamera = exactCameraPathState({
+    defaultSpeed: '80',
+    navigationMode: 'free',
+  });
+  const analysisContributor = {
+    id: 'analysis-artifacts',
+    capture: captureAnalysisArtifacts,
+    restore: restoreAnalysisArtifact,
+  };
+  const sourceSerializer = new SessionSerializer({
+    state: { pointCount: 3, varData: { fields: [] } },
+    viewer: {},
+    sidebar: {},
+    dataSourceManager: null,
+    comparisonModule: {
+      dataLayer: {
+        exportSessionCache() {
+          return [firstTargetArtifact, failingTargetArtifact];
+        },
+      },
+    },
+    analysisWindowManager: null,
+    cinematicCamera: {},
+    contributors: [{
+      id: 'cinematic-camera',
+      capture() {
+        return [{
+          id: 'cinematic/camera',
+          contributorId: 'cinematic-camera',
+          priority: 'eager',
+          kind: 'json',
+          codec: 'gzip',
+          label: 'Cinematic camera path',
+          datasetDependent: true,
+          payload: targetCamera,
+        }];
+      },
+      restore() {},
+    }, analysisContributor],
+  });
+  const bundle = await sourceSerializer.createSessionBundle();
+
+  let cameraState = structuredClone(initialCamera);
+  const cameraOwner = {
+    exportSessionState() {
+      return structuredClone(cameraState);
+    },
+    capturePlaybackSnapshot() {
+      return {
+        state: 'STOPPED',
+        globalT: 0,
+        camera: exactCameraState(),
+      };
+    },
+    getNavigationMode() {
+      return cameraState.navigationMode;
+    },
+    restoreSessionState(value) {
+      cameraState = structuredClone(value);
+    },
+    startAutoplay() {
+      return false;
+    },
+    restorePlaybackSnapshot(snapshot) {
+      assert.equal(snapshot.state, 'STOPPED');
+      assert.equal(snapshot.globalT, 0);
+    },
+    stopAutoplay() {},
+  };
+  const initialCacheArtifact = structuredClone(initialArtifact);
+  let cache = [initialCacheArtifact];
+  let rollbackPreservedBuffers = false;
+  const dataLayer = {
+    beginSessionCacheReplacement() {
+      const previousCache = cache;
+      cache = [];
+      return {
+        commit() {},
+        rollback() {
+          cache = previousCache;
+          rollbackPreservedBuffers =
+            cache[0].values === initialCacheArtifact.values
+            && cache[0].cellIndices === initialCacheArtifact.cellIndices;
+        },
+      };
+    },
+    exportSessionCache() {
+      return cache;
+    },
+    importSessionCache(value) {
+      const artifacts = Array.isArray(value) ? value : [value];
+      if (artifacts.some(artifact => artifact.gene === 'TARGET_FAIL')) {
+        return 0;
+      }
+      cache.push(...structuredClone(artifacts));
+      return artifacts.length;
+    },
+  };
+  const destinationSerializer = new SessionSerializer({
+    state: { pointCount: 3, varData: { fields: [] } },
+    viewer: {},
+    sidebar: {},
+    dataSourceManager: null,
+    comparisonModule: { dataLayer },
+    analysisWindowManager: null,
+    cinematicCamera: cameraOwner,
+    contributors: [{
+      id: 'cinematic-camera',
+      capture: captureCinematicCamera,
+      restore: restoreCinematicCamera,
+    }, analysisContributor],
+  });
+
+  const previousAnimationFrame = globalThis.requestAnimationFrame;
+  globalThis.requestAnimationFrame = callback => {
+    queueMicrotask(() => callback(0));
+    return 1;
+  };
+  try {
+    await withNotificationHarness(async () => {
+      await assert.rejects(
+        destinationSerializer.restoreFromBlob(bundle),
+        /importSessionCache.*exactly one/i,
+      );
+    });
+  } finally {
+    if (previousAnimationFrame === undefined) {
+      delete globalThis.requestAnimationFrame;
+    } else {
+      globalThis.requestAnimationFrame = previousAnimationFrame;
+    }
+  }
+
+  assert.deepEqual(cameraState, initialCamera);
+  assert.deepEqual(cache, [initialArtifact]);
+  assert.equal(rollbackPreservedBuffers, true);
+});
+
+test('generic empty analysis inventory replaces stale cache and cannot be omitted', async () => {
+  const analysisContributor = {
+    id: 'analysis-artifacts',
+    capture: captureAnalysisArtifacts,
+    restore: restoreAnalysisArtifact,
+  };
+  const source = new SessionSerializer({
+    state: { pointCount: 3, varData: { fields: [] } },
+    viewer: {},
+    sidebar: {},
+    dataSourceManager: null,
+    comparisonModule: {
+      dataLayer: {
+        exportSessionCache() {
+          return [];
+        },
+      },
+    },
+    analysisWindowManager: null,
+    cinematicCamera: null,
+    contributors: [analysisContributor],
+  });
+  const bundle = await source.createSessionBundle();
+  const { manifest } = await readBundle(bundle, {
+    signal: null,
+    onProgress: null,
+  });
+  assert.deepEqual(
+    manifest.chunks.map(chunk => chunk.id),
+    ['analysis/cache-inventory'],
+  );
+
+  const oldArtifact = exactAnalysisArtifact();
+  const oldCache = [oldArtifact];
+  let cache = oldCache;
+  let replacements = 0;
+  let imports = 0;
+  const dataLayer = {
+    beginSessionCacheReplacement() {
+      replacements += 1;
+      const previous = cache;
+      cache = [];
+      return {
+        commit() {},
+        rollback() {
+          cache = previous;
+        },
+      };
+    },
+    importSessionCache(value) {
+      imports += 1;
+      cache.push(value);
+      return 1;
+    },
+  };
+  const destination = new SessionSerializer({
+    state: { pointCount: 3, varData: { fields: [] } },
+    viewer: {},
+    sidebar: {},
+    dataSourceManager: null,
+    comparisonModule: { dataLayer },
+    analysisWindowManager: null,
+    cinematicCamera: null,
+    contributors: [analysisContributor],
+  });
+  await withNotificationHarness(
+    () => destination.restoreFromBlob(bundle),
+  );
+  assert.deepEqual(cache, []);
+  assert.equal(replacements, 1);
+  assert.equal(imports, 0);
+
+  const omitted = await rewriteSessionBundle(
+    bundle,
+    (rewrittenManifest, chunks) => {
+      rewrittenManifest.chunks.length = 0;
+      chunks.length = 0;
+    },
+  );
+  cache = oldCache;
+  replacements = 0;
+  await withNotificationHarness(async () => {
+    await assert.rejects(
+      destination.restoreFromBlob(omitted),
+      /require singleton chunk "analysis\/cache-inventory"/i,
+    );
+  });
+  assert.strictEqual(cache, oldCache);
+  assert.equal(replacements, 0);
+});
+
+test('analysis inventory enforces exact artifact order and count transactionally', () => {
+  const first = exactAnalysisArtifact();
+  const second = {
+    ...exactAnalysisArtifact(),
+    cacheKey: 'bulk_genes:second',
+    gene: 'SECOND',
+    pageId: 'page-2',
+    pageName: 'Second',
+  };
+  const chunks = captureAnalysisArtifacts({
+    comparisonModule: {
+      dataLayer: {
+        exportSessionCache() {
+          return [first, second];
+        },
+      },
+    },
+  });
+
+  function createHarness() {
+    const oldArtifact = exactAnalysisArtifact();
+    const oldCache = [oldArtifact];
+    let cache = oldCache;
+    let importCalls = 0;
+    const dataLayer = {
+      beginSessionCacheReplacement() {
+        const previous = cache;
+        cache = [];
+        return {
+          commit() {},
+          rollback() {
+            cache = previous;
+          },
+        };
+      },
+      importSessionCache(value) {
+        importCalls += 1;
+        cache.push(value);
+        return 1;
+      },
+    };
+    const transaction = createSessionRestoreTransaction();
+    return {
+      context: {
+        comparisonModule: { dataLayer },
+        restoreTransaction: transaction,
+      },
+      getCache() {
+        return cache;
+      },
+      getImportCalls() {
+        return importCalls;
+      },
+      oldCache,
+      transaction,
+    };
+  }
+
+  const reordered = createHarness();
+  restoreAnalysisArtifact(
+    reordered.context,
+    analysisChunkMeta(chunks[0]),
+    chunks[0].payload,
+  );
+  assert.throws(
+    () => restoreAnalysisArtifact(
+      reordered.context,
+      analysisChunkMeta(chunks[2]),
+      chunks[2].payload,
+    ),
+    /does not match advertised cache inventory/i,
+  );
+  assert.equal(reordered.getImportCalls(), 0);
+  reordered.transaction.rollback();
+  assert.strictEqual(reordered.getCache(), reordered.oldCache);
+
+  const incomplete = createHarness();
+  restoreAnalysisArtifact(
+    incomplete.context,
+    analysisChunkMeta(chunks[0]),
+    chunks[0].payload,
+  );
+  restoreAnalysisArtifact(
+    incomplete.context,
+    analysisChunkMeta(chunks[1]),
+    chunks[1].payload,
+  );
+  assert.throws(
+    () => incomplete.transaction.commit(),
+    /advertised 2 artifacts but restored 1/i,
+  );
+  assert.strictEqual(incomplete.getCache(), incomplete.oldCache);
+
+  const exact = createHarness();
+  for (const chunk of chunks) {
+    restoreAnalysisArtifact(
+      exact.context,
+      analysisChunkMeta(chunk),
+      chunk.payload,
+    );
+  }
+  assert.doesNotThrow(() => exact.transaction.commit());
+  assert.deepEqual(
+    exact.getCache().map(artifact => artifact.gene),
+    ['IL/7', 'SECOND'],
+  );
+});
+
+test('analysis cache replacement swaps exact Map and LRU identities without copying', () => {
+  const layer = Object.create(DataLayer.prototype);
+  const values = new Float32Array([1, 2]);
+  const previousCache = new Map([['cache-a', {
+    data: { GENE: { page: { values } } },
+  }]]);
+  const previousOrder = ['cache-a'];
+  layer._bulkGeneCache = previousCache;
+  layer._bulkGeneCacheAccessOrder = previousOrder;
+  layer._bulkGeneCacheGeneration = 0;
+  layer._bulkGeneCacheReplacementOwner = null;
+
+  const replacement = layer.beginSessionCacheReplacement();
+  assert.notStrictEqual(layer._bulkGeneCache, previousCache);
+  assert.notStrictEqual(layer._bulkGeneCacheAccessOrder, previousOrder);
+  layer._bulkGeneCache.set('target', {});
+  layer._bulkGeneCacheAccessOrder.push('target');
+  replacement.commit();
+  replacement.rollback();
+  assert.strictEqual(layer._bulkGeneCache, previousCache);
+  assert.strictEqual(layer._bulkGeneCacheAccessOrder, previousOrder);
+  assert.strictEqual(
+    layer._bulkGeneCache.get('cache-a').data.GENE.page.values,
+    values,
+  );
+});
+
+test('session cache replacement generation-isolates in-flight analysis writes', async () => {
+  function createLayer() {
+    const layer = Object.create(DataLayer.prototype);
+    const oldCache = new Map([['old', {
+      data: {},
+      timestamp: Date.now(),
+      geneCount: 0,
+    }]]);
+    const oldOrder = ['old'];
+    layer._bulkGeneCache = oldCache;
+    layer._bulkGeneCacheAccessOrder = oldOrder;
+    layer._bulkGeneCacheGeneration = 0;
+    layer._bulkGeneCacheReplacementOwner = null;
+    layer._bulkGeneCacheMaxAge = 60_000;
+    layer._bulkGeneCacheMaxSize = 5;
+    layer._notifications = null;
+    layer.refreshPageVersions = () => {};
+    layer.getAvailableVariables = () => [{
+      key: 'GENE',
+    }];
+    let enter;
+    let release;
+    const entered = new Promise(resolve => {
+      enter = resolve;
+    });
+    layer.getDataForPages = () => new Promise(resolve => {
+      release = () => resolve([{
+        pageId: 'page_1',
+        pageName: 'Page 1',
+        values: new Float32Array([1]),
+        cellIndices: new Uint32Array([0]),
+        cellCount: 1,
+      }]);
+      enter();
+    });
+    return {
+      entered,
+      layer,
+      oldCache,
+      oldOrder,
+      release() {
+        release();
+      },
+    };
+  }
+
+  const before = createLayer();
+  const beforeFetch = before.layer.fetchBulkGeneExpression({
+    pageIds: ['page_1'],
+    geneList: ['GENE'],
+  });
+  await before.entered;
+  const beforeReplacement = before.layer.beginSessionCacheReplacement();
+  before.layer._bulkGeneCache.set('session', {
+    data: {},
+    timestamp: 1,
+    geneCount: 0,
+  });
+  before.layer._bulkGeneCacheAccessOrder.push('session');
+  before.release();
+  await beforeFetch;
+  assert.deepEqual([...before.layer._bulkGeneCache.keys()], ['session']);
+  beforeReplacement.rollback();
+  assert.strictEqual(before.layer._bulkGeneCache, before.oldCache);
+  assert.strictEqual(
+    before.layer._bulkGeneCacheAccessOrder,
+    before.oldOrder,
+  );
+
+  const during = createLayer();
+  const duringReplacement = during.layer.beginSessionCacheReplacement();
+  during.layer._bulkGeneCache.set('session', {
+    data: {},
+    timestamp: 1,
+    geneCount: 0,
+  });
+  during.layer._bulkGeneCacheAccessOrder.push('session');
+  const duringFetch = during.layer.fetchBulkGeneExpression({
+    pageIds: ['page_1'],
+    geneList: ['GENE'],
+  });
+  await during.entered;
+  duringReplacement.commit();
+  during.release();
+  await duringFetch;
+  assert.deepEqual([...during.layer._bulkGeneCache.keys()], ['session']);
+});
 
 test('analysis artifacts round-trip every exact cache identity and metadata field', () => {
   const artifact = exactAnalysisArtifact();
@@ -1352,9 +3147,17 @@ test('analysis artifacts round-trip every exact cache identity and metadata fiel
       },
     },
   });
-  assert.equal(chunks.length, 1);
+  assert.equal(chunks.length, 2);
+  assert.deepEqual(chunks[0], {
+    ...ANALYSIS_CACHE_INVENTORY_CHUNK_PROFILE,
+    payload: {
+      artifactIds: [
+        'analysis/artifacts/bulk-gene/bulk_genes%3Apage%2F%CE%B1/IL%2F7/page%2F1',
+      ],
+    },
+  });
   assert.equal(
-    chunks[0].id,
+    chunks[1].id,
     'analysis/artifacts/bulk-gene/bulk_genes%3Apage%2F%CE%B1/IL%2F7/page%2F1',
   );
 
@@ -1368,7 +3171,7 @@ test('analysis artifacts round-trip every exact cache identity and metadata fiel
         },
       },
     },
-  }, analysisChunkMeta(chunks[0]), chunks[0].payload);
+  }, analysisChunkMeta(chunks[1]), chunks[1].payload);
 
   assert.equal(imported.length, 1);
   assert.deepEqual(imported[0], artifact);
@@ -1398,7 +3201,7 @@ test('analysis artifacts reject missing owners, malformed exports, and noncanoni
   );
 
   const artifact = exactAnalysisArtifact();
-  const [chunk] = captureAnalysisArtifacts({
+  const chunks = captureAnalysisArtifacts({
     comparisonModule: {
       dataLayer: {
         exportSessionCache() {
@@ -1407,6 +3210,7 @@ test('analysis artifacts reject missing owners, malformed exports, and noncanoni
       },
     },
   });
+  const chunk = chunks[1];
   let importCalls = 0;
   const restoreContext = {
     comparisonModule: {
@@ -1442,7 +3246,7 @@ test('analysis artifacts reject missing owners, malformed exports, and noncanoni
 
 test('analysis artifact import refusal is a public restore failure', () => {
   const artifact = exactAnalysisArtifact();
-  const [chunk] = captureAnalysisArtifacts({
+  const chunks = captureAnalysisArtifacts({
     comparisonModule: {
       dataLayer: {
         exportSessionCache() {
@@ -1451,6 +3255,7 @@ test('analysis artifact import refusal is a public restore failure', () => {
       },
     },
   });
+  const chunk = chunks[1];
   assert.throws(
     () => restoreAnalysisArtifact({
       comparisonModule: {

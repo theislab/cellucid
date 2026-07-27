@@ -278,6 +278,11 @@ function captureDownloadNotifications(t) {
     return id;
   };
   notifications.updateDownload = (id, loadedBytes, totalBytes) => {
+    if (totalBytes !== null && loadedBytes > totalBytes) {
+      throw new RangeError(
+        `Download loadedBytes ${loadedBytes} exceeds totalBytes ${totalBytes}.`
+      );
+    }
     events.push({ id, kind: 'update', loadedBytes, totalBytes });
   };
   notifications.completeDownload = id => {
@@ -859,6 +864,227 @@ test('reload owner suppresses stale failure reporting and cancels bookkeeping', 
   assert.deepEqual(reported, []);
 });
 
+test('published-state settlement gives superseded reloads one cancel and no success', async () => {
+  const {
+    createDatasetReloadSupersededError,
+    isDatasetReloadSupersededError,
+    settleInitialPublishedDatasetStateOutcome,
+    settlePublishedDatasetStateOutcome
+  } = await import(outcomeModuleUrl);
+
+  for (const {
+    current,
+    outcome
+  } of [
+    {
+      current: true,
+      outcome: { status: 'superseded' }
+    },
+    {
+      current: false,
+      outcome: { status: 'ready-state-restored' }
+    }
+  ]) {
+    let cancellations = 0;
+    let completions = 0;
+    const transaction = {
+      isCurrent: () => current,
+      assertCurrent() {
+        if (!current) {
+          throw createDatasetReloadSupersededError(
+            'Dataset reload was superseded by a newer selection.'
+          );
+        }
+      }
+    };
+    await assert.rejects(
+      settlePublishedDatasetStateOutcome({
+        outcome,
+        transaction,
+        cancel() {
+          cancellations += 1;
+        },
+        complete() {
+          completions += 1;
+        }
+      }),
+      error => isDatasetReloadSupersededError(error)
+    );
+    assert.equal(cancellations, 1);
+    assert.equal(completions, 0);
+  }
+
+  let cancellations = 0;
+  let completions = 0;
+  for (const status of [
+    'ready-state-replaced',
+    'ready-state-canceled'
+  ]) {
+    const readyOutcome = { status };
+    const settled = await settlePublishedDatasetStateOutcome({
+      outcome: readyOutcome,
+      transaction: {
+        isCurrent: () => true,
+        assertCurrent() {}
+      },
+      cancel() {
+        cancellations += 1;
+      },
+      complete() {
+        completions += 1;
+      }
+    });
+    assert.strictEqual(settled, readyOutcome);
+  }
+  assert.equal(cancellations, 0);
+  assert.equal(completions, 2);
+
+  cancellations = 0;
+  completions = 0;
+  const initialOutcome =
+    await settleInitialPublishedDatasetStateOutcome({
+      outcome: { status: 'superseded' },
+      transaction: {
+        isCurrent: () => false,
+        assertCurrent() {
+          throw createDatasetReloadSupersededError(
+            'Dataset reload was superseded by a newer selection.'
+          );
+        }
+      },
+      cancel() {
+        cancellations += 1;
+      },
+      complete() {
+        completions += 1;
+      }
+    });
+  assert.deepEqual(initialOutcome, { status: 'superseded' });
+  assert.equal(cancellations, 1);
+  assert.equal(completions, 0);
+});
+
+test('reload owner adopts one committed identity before published-state success', async () => {
+  const {
+    createLatestDatasetReloadCoordinator,
+    isDatasetReloadSupersededError,
+    settlePublishedDatasetStateOutcome
+  } = await import(outcomeModuleUrl);
+  const oldSource = {};
+  const newSource = {};
+  let identity = {
+    source: oldSource,
+    baseUrl: 'zarr://old/',
+    datasetId: 'old',
+    selectionIdentity: null
+  };
+  const coordinator = createLatestDatasetReloadCoordinator(
+    () => identity
+  );
+  const transaction = coordinator.begin();
+  transaction.assertCurrent();
+
+  identity = {
+    source: newSource,
+    baseUrl: 'zarr://new/',
+    datasetId: 'new',
+    selectionIdentity: null
+  };
+  assert.equal(transaction.isCurrent(), false);
+  transaction.adoptCurrentIdentity();
+  assert.equal(transaction.isCurrent(), true);
+  assert.throws(
+    () => transaction.adoptCurrentIdentity(),
+    /already adopted/i
+  );
+
+  let cancellations = 0;
+  let completions = 0;
+  await settlePublishedDatasetStateOutcome({
+    outcome: { status: 'ready-state-restored' },
+    transaction,
+    cancel() {
+      cancellations += 1;
+    },
+    complete() {
+      completions += 1;
+    }
+  });
+  assert.equal(cancellations, 0);
+  assert.equal(completions, 1);
+
+  const superseded = coordinator.begin();
+  assert.equal(transaction.signal.aborted, true);
+  assert.throws(
+    () => transaction.adoptCurrentIdentity(),
+    error => isDatasetReloadSupersededError(error)
+  );
+  superseded.assertCurrent();
+
+  identity = {
+    source: {},
+    baseUrl: 'zarr://reentrant-publication/',
+    datasetId: 'reentrant-publication',
+    selectionIdentity: null
+  };
+  superseded.adoptCurrentIdentity();
+  const listenerReplacement = coordinator.begin();
+  assert.equal(superseded.signal.aborted, true);
+  cancellations = 0;
+  completions = 0;
+  await assert.rejects(
+    settlePublishedDatasetStateOutcome({
+      outcome: { status: 'ready-state-restored' },
+      transaction: superseded,
+      cancel() {
+        cancellations += 1;
+      },
+      complete() {
+        completions += 1;
+      }
+    }),
+    error => isDatasetReloadSupersededError(error)
+  );
+  assert.equal(cancellations, 1);
+  assert.equal(completions, 0);
+  listenerReplacement.assertCurrent();
+});
+
+test('manual session replacement is a ready state outcome without an error banner', async () => {
+  const mainSource = await readFile(
+    new URL('../assets/js/app/main.js', import.meta.url),
+    'utf8'
+  );
+  const restoreOwnerStart = mainSource.indexOf(
+    'async function restoreAdvertisedDatasetState({ signal })'
+  );
+  const restoreOwnerEnd = mainSource.indexOf(
+    '// -----------------------------------------------------------------------',
+    restoreOwnerStart
+  );
+  const restoreOwner = mainSource.slice(
+    restoreOwnerStart,
+    restoreOwnerEnd
+  );
+  const classificationIndex = restoreOwner.indexOf(
+    'classifyAdvertisedDatasetStateRestoreError(error'
+  );
+  const consoleErrorIndex = restoreOwner.indexOf(
+    'console.error(',
+    classificationIndex
+  );
+  assert.ok(classificationIndex >= 0);
+  assert.ok(consoleErrorIndex > classificationIndex);
+  assert.match(
+    restoreOwner.slice(classificationIndex, consoleErrorIndex),
+    /if \(classified !== null\) return classified;/
+  );
+  assert.doesNotMatch(
+    restoreOwner.slice(classificationIndex, consoleErrorIndex),
+    /notifications\.error|console\.error/
+  );
+});
+
 test('reload failure handling requires exact transaction and handler ownership', async () => {
   const { handleDatasetReloadFailure } =
     await import(outcomeModuleUrl);
@@ -1437,6 +1663,43 @@ test('direct position loading fails before publishing success for malformed byte
   );
 });
 
+test('Fetch-decoded response progress never compares decoded bytes with encoded length', async t => {
+  const originalFetch = globalThis.fetch;
+  const events = captureDownloadNotifications(t);
+  const decoded = new Float32Array([0, 1, 2, 3, 4, 5]);
+  globalThis.fetch = async () => new Response(decoded.buffer, {
+    headers: {
+      'content-encoding': 'gzip',
+      'content-length': '8',
+    },
+    status: 200,
+  });
+  t.after(() => {
+    if (originalFetch === undefined) delete globalThis.fetch;
+    else globalThis.fetch = originalFetch;
+  });
+
+  const points = await loadPointsBinary(
+    'https://cellucid.test/data/points_2d.bin',
+    { showProgress: true }
+  );
+
+  assert.deepEqual(Array.from(points), Array.from(decoded));
+  assert.deepEqual(
+    events.map(event => event.kind),
+    ['start', 'update', 'complete']
+  );
+  assert.deepEqual(
+    events.find(event => event.kind === 'update'),
+    {
+      id: 'download-1',
+      kind: 'update',
+      loadedBytes: decoded.byteLength,
+      totalBytes: null,
+    }
+  );
+});
+
 test('gzip loading requires its one native backend before any request', async t => {
   const originalDescriptor = Object.getOwnPropertyDescriptor(
     globalThis,
@@ -1599,6 +1862,14 @@ test('in-place reload stages one generation before reversible publication', asyn
     'reloadTransaction.assertCurrent();',
     runtimeStageIndex
   );
+  const priorStateSettlementIndex = reloadSource.indexOf(
+    'await cancelPublishedDatasetStateAndWait();',
+    ownerRecheckIndex
+  );
+  const publicationOwnerRecheckIndex = reloadSource.indexOf(
+    'reloadTransaction.assertCurrent();',
+    priorStateSettlementIndex
+  );
   const stagingCatch = reloadSource.indexOf('} catch (err) {');
   const stagingCatchEnd = reloadSource.indexOf(
     '// All fallible dataset I/O and validation has completed',
@@ -1616,7 +1887,9 @@ test('in-place reload stages one generation before reversible publication', asyn
     runtimeStageIndex > urlStageIndex &&
     runtimeStageIndex > stagedSourceIndex &&
     ownerRecheckIndex > runtimeStageIndex &&
-    stagingCatch > ownerRecheckIndex
+    priorStateSettlementIndex > ownerRecheckIndex &&
+    publicationOwnerRecheckIndex > priorStateSettlementIndex &&
+    stagingCatch > publicationOwnerRecheckIndex
   );
   assert.match(
     reloadSource.slice(runtimeStageIndex, stagingCatch),
@@ -1650,12 +1923,16 @@ test('in-place reload stages one generation before reversible publication', asyn
     'commitDatasetRuntimeStage(runtimeStage)',
     managerCommitIndex
   );
+  const identityAdoptionIndex = reloadSource.indexOf(
+    'reloadTransaction.adoptCurrentIdentity()',
+    runtimeCommitIndex
+  );
   const managerPublishIndex = reloadSource.indexOf(
     'dataSourceManager.publishDatasetSelection(managerPublication)',
     runtimeCommitIndex
   );
   const successIndex = reloadSource.indexOf(
-    'completeDataLoadSuccess(loadToken'
+    'complete: () => completeDataLoadSuccess('
   );
   const uiSyncIndex = reloadSource.indexOf(
     'const synchronizationOutcome = synchronizePublishedDatasetUi('
@@ -1664,14 +1941,25 @@ test('in-place reload stages one generation before reversible publication', asyn
     'dataSourceManager.finalizeDatasetSelection(managerPublication)',
     uiSyncIndex
   );
+  const stateRestoreIndex = reloadSource.indexOf(
+    'const stateOutcome = await restoreAdvertisedDatasetState({',
+    finalizationIndex
+  );
+  const stateSettlementIndex = reloadSource.indexOf(
+    'await settlePublishedDatasetStateOutcome({',
+    stateRestoreIndex
+  );
   assert.ok(
     urlCommitIndex > stagingCatchEnd &&
     managerCommitIndex > urlCommitIndex &&
     runtimeCommitIndex > managerCommitIndex &&
-    managerPublishIndex > runtimeCommitIndex &&
+    identityAdoptionIndex > runtimeCommitIndex &&
+    managerPublishIndex > identityAdoptionIndex &&
     uiSyncIndex > managerPublishIndex &&
     finalizationIndex > uiSyncIndex &&
-    successIndex > finalizationIndex
+    stateRestoreIndex > finalizationIndex &&
+    stateSettlementIndex > stateRestoreIndex &&
+    successIndex > stateSettlementIndex
   );
   const managerPublicationCatch = reloadSource.slice(
     reloadSource.indexOf('} catch (error) {', urlCommitIndex),

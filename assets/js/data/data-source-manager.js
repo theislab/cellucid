@@ -923,6 +923,79 @@ export class DataSourceManager {
   }
 
   /**
+   * Get the active local-demo dataset's explicitly advertised state manifest.
+   * Other source types and demo catalogs without the capability return null
+   * without a network probe.
+   *
+   * @returns {string|null}
+   */
+  getCurrentStateDescriptor() {
+    if (!this.activeSource || !this.activeDatasetId) return null;
+    if (
+      readSourceType(this.activeSource, 'Active data source')
+      !== 'local-demo'
+    ) {
+      return null;
+    }
+    if (typeof this.activeSource.getStateDescriptor !== 'function') {
+      throw new TypeError(
+        'Active local-demo source must implement getStateDescriptor().'
+      );
+    }
+    const sourceDescriptor = this.activeSource.getStateDescriptor(
+      this.activeDatasetId
+    );
+    if (sourceDescriptor === null) return null;
+    if (
+      sourceDescriptor === null
+      || typeof sourceDescriptor !== 'object'
+      || Array.isArray(sourceDescriptor)
+      || Object.keys(sourceDescriptor).sort().join(',')
+        !== 'manifestUrl,stateSha256'
+    ) {
+      throw new TypeError(
+        'Active dataset state descriptor must contain exactly manifestUrl and stateSha256.'
+      );
+    }
+    const baseUrl = this.getCurrentBaseUrl();
+    const expectedManifestUrl = new URL(
+      'state-snapshots.json',
+      baseUrl
+    ).href;
+    if (sourceDescriptor.manifestUrl !== expectedManifestUrl) {
+      throw new TypeError(
+        'Active dataset state manifest URL must be the exact dataset sibling.'
+      );
+    }
+    if (
+      typeof sourceDescriptor.stateSha256 !== 'string'
+      || !/^[0-9a-f]{64}$/.test(sourceDescriptor.stateSha256)
+    ) {
+      throw new TypeError(
+        'Active dataset state SHA-256 must be one lowercase digest.'
+      );
+    }
+    if (
+      typeof this.activeIdentityId !== 'string'
+      || this.activeIdentityId.length === 0
+      || this.activeIdentityId !== this.activeIdentityId.trim()
+    ) {
+      throw new TypeError(
+        'Active dataset state descriptor requires the exact identity id.'
+      );
+    }
+    return {
+      baseUrl,
+      datasetId: this.activeDatasetId,
+      identityId: this.activeIdentityId,
+      manifestUrl: sourceDescriptor.manifestUrl,
+      selectionRevision: this._selectionRevision,
+      sourceType: 'local-demo',
+      stateSha256: sourceDescriptor.stateSha256,
+    };
+  }
+
+  /**
    * Get metadata for the current dataset
    * @returns {DatasetMetadata|null}
    */

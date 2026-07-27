@@ -5,6 +5,9 @@ import test from 'node:test';
 import {
   initVelocityOverlayControls,
 } from '../assets/js/app/ui/modules/velocity-overlay-controls.js';
+import {
+  validateVelocityOverlayConfig,
+} from '../assets/js/rendering/overlays/velocity/velocity-overlay.js';
 
 const NUMERIC_VALUES = Object.freeze({
   velocityDensityInput: '15',
@@ -117,6 +120,80 @@ test('velocity controls accept the exact current HTML values', () => {
   });
   assert.equal(typeof controls.syncAvailability, 'function');
   assert.equal(typeof controls.destroy, 'function');
+  controls.destroy();
+});
+
+test('renderer accepts every endpoint exposed by the visible velocity sliders', async () => {
+  const html = await readFile(new URL('../index.html', import.meta.url), 'utf8');
+  const endpoints = Object.freeze([
+    Object.freeze({
+      html: /id="velocity-speed"[^>]*min="5"[^>]*max="500"/,
+      key: 'speedMultiplier',
+      minimum: 0.05,
+      maximum: 5,
+    }),
+    Object.freeze({
+      html: /id="velocity-lifetime"[^>]*min="10"[^>]*max="1500"/,
+      key: 'lifetime',
+      minimum: 0.1,
+      maximum: 15,
+    }),
+    Object.freeze({
+      html: /id="velocity-size"[^>]*min="0\.5"[^>]*max="30"/,
+      key: 'particleSize',
+      minimum: 0.5,
+      maximum: 30,
+    }),
+    Object.freeze({
+      html: /id="velocity-intensity"[^>]*min="0\.05"[^>]*max="1\.5"/,
+      key: 'intensity',
+      minimum: 0.05,
+      maximum: 1.5,
+    }),
+    Object.freeze({
+      html: /id="velocity-exposure"[^>]*min="0\.1"[^>]*max="2"/,
+      key: 'exposure',
+      minimum: 0.1,
+      maximum: 2,
+    }),
+  ]);
+
+  for (const endpoint of endpoints) {
+    assert.match(html, endpoint.html);
+    assert.deepEqual(
+      validateVelocityOverlayConfig(endpoint.key, endpoint.minimum, 500_000),
+      { key: endpoint.key, value: endpoint.minimum },
+    );
+    assert.deepEqual(
+      validateVelocityOverlayConfig(endpoint.key, endpoint.maximum, 500_000),
+      { key: endpoint.key, value: endpoint.maximum },
+    );
+  }
+});
+
+test('minimum flow speed is displayed and published without rounding away its value', () => {
+  let onSpeedInput = null;
+  const speedInput = makeElement('5');
+  speedInput.addEventListener = (event, handler) => {
+    if (event === 'input') onSpeedInput = handler;
+  };
+  const dom = makeDom({ velocitySpeedInput: speedInput });
+  const updates = [];
+  const controls = initVelocityOverlayControls({
+    dom,
+    state: makeState(),
+    viewer: makeViewer({
+      setVectorFieldConfig(key, value) {
+        updates.push([key, value]);
+      },
+    }),
+  });
+
+  dom.velocityEnabledCheckbox.checked = true;
+  assert.equal(typeof onSpeedInput, 'function');
+  onSpeedInput();
+  assert.equal(dom.velocitySpeedDisplay.textContent, '0.05×');
+  assert.deepEqual(updates, [['speedMultiplier', 0.05]]);
   controls.destroy();
 });
 

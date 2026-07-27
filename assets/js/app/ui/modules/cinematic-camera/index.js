@@ -22,7 +22,11 @@ import { createPlaybackController } from './playback-controller.js';
 import { createTransportBar } from './transport-bar.js';
 import { assertCameraPathOptions } from './interpolation-engine.js';
 import { getNotificationCenter } from '../../../notification-center.js';
-import { assertNavigationMode } from '../../../../rendering/camera-state-contract.js';
+import {
+  assertCameraState,
+  assertNavigationMode,
+  cloneCameraState
+} from '../../../../rendering/camera-state-contract.js';
 import {
   parseIntegerInput,
   parseRangeInput
@@ -55,6 +59,7 @@ const CAMERA_PATH_SESSION_KEYS = [
   'rotationMethod',
   'showOrbitAnchor'
 ];
+const PLAYBACK_SNAPSHOT_KEYS = ['camera', 'globalT', 'state'];
 const REQUIRED_DOM_KEYS = [
   'navModeSelect',
   'orbitControls',
@@ -205,6 +210,44 @@ export function assertCameraPathSessionState(data) {
     }
   }
   return data;
+}
+
+export function assertCameraPathPlaybackSnapshot(value) {
+  if (
+    value === null
+    || typeof value !== 'object'
+    || Array.isArray(value)
+  ) {
+    throw new TypeError('Camera Path playback snapshot must be an object.');
+  }
+  const keys = Object.keys(value).sort();
+  if (
+    keys.length !== PLAYBACK_SNAPSHOT_KEYS.length
+    || keys.some((key, index) => key !== PLAYBACK_SNAPSHOT_KEYS[index])
+  ) {
+    throw new TypeError(
+      'Camera Path playback snapshot must contain exact camera, globalT, and state keys.'
+    );
+  }
+  if (
+    value.state !== 'STOPPED'
+    && value.state !== 'PLAYING'
+    && value.state !== 'PAUSED'
+  ) {
+    throw new TypeError('Camera Path playback snapshot state is invalid.');
+  }
+  if (
+    !Number.isFinite(value.globalT)
+    || value.globalT < 0
+    || value.globalT > 1
+    || (value.state === 'STOPPED' && value.globalT !== 0)
+  ) {
+    throw new RangeError(
+      'Camera Path playback snapshot globalT must match its exact playback state.'
+    );
+  }
+  assertCameraState(value.camera, 'Camera Path playback snapshot camera');
+  return value;
 }
 
 /**
@@ -492,6 +535,44 @@ export function initCinematicCamera({
     if (playbackController.getState() !== 'STOPPED') {
       playbackController.stop({ resetCamera: false });
     }
+  }
+
+  function capturePlaybackSnapshot() {
+    if (typeof viewer.getCameraState !== 'function') {
+      throw new TypeError(
+        'Camera Path playback snapshot requires viewer.getCameraState().'
+      );
+    }
+    return {
+      state: playbackController.getState(),
+      globalT: playbackController.getProgress(),
+      camera: cloneCameraState(
+        viewer.getCameraState(),
+        'Camera Path playback snapshot camera'
+      )
+    };
+  }
+
+  function restorePlaybackSnapshot(snapshot) {
+    const exact = assertCameraPathPlaybackSnapshot(snapshot);
+    stopAutoplay();
+    if (exact.state !== 'STOPPED') {
+      if (!isCameraPathReady(keyframeStore.getAll())) {
+        throw new Error(
+          'Camera Path playback restore requires a complete path.'
+        );
+      }
+      transportBar.updateVisibility({ reveal: true });
+      playbackController.play();
+      playbackController.seekTo(exact.globalT);
+      if (exact.state === 'PAUSED') playbackController.pause();
+    }
+    viewer.setCameraState(
+      cloneCameraState(
+        exact.camera,
+        'Camera Path playback restore camera'
+      )
+    );
   }
 
   dom.autoplayCheckbox.addEventListener('change', () => {
@@ -890,7 +971,10 @@ export function initCinematicCamera({
     getKeyframeStore: () => keyframeStore,
     getPlaybackController: () => playbackController,
     exportSessionState,
+    capturePlaybackSnapshot,
+    getNavigationMode: () => viewer.getNavigationMode(),
     restoreSessionState,
+    restorePlaybackSnapshot,
     startAutoplay,
     stopAutoplay,
     syncNavigationMode,

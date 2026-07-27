@@ -519,7 +519,8 @@ export async function uploadJupyterSessionBundle(options) {
     ['viewerToken', config.viewerToken],
     ['requestId', message.requestId],
   ]);
-  const response = await options.fetchImpl(
+  const fetchImpl = options.fetchImpl;
+  const response = await fetchImpl(
     `${config.serverUrl}/_cellucid/session_bundle?${query.toString()}`,
     {
       method: 'POST',

@@ -19,6 +19,17 @@ import {
 
 export const id = 'highlights-cells';
 const CHUNK_PREFIX = 'highlights/cells/';
+const CHUNK_META_KEYS = Object.freeze([
+  'id',
+  'contributorId',
+  'priority',
+  'kind',
+  'codec',
+  'label',
+  'datasetDependent',
+  'storedBytes',
+  'uncompressedBytes'
+]);
 
 function getState(ctx, operation) {
   if (
@@ -176,13 +187,30 @@ export function capture(ctx) {
   return chunks;
 }
 
-export function restore(ctx, chunkMeta, payload) {
+export async function restore(ctx, chunkMeta, payload) {
   const state = getState(ctx, 'restore');
   if (!(payload instanceof Uint8Array)) {
     throw new TypeError('Highlight cells payload must be a Uint8Array.');
   }
-  if (chunkMeta === null || typeof chunkMeta !== 'object') {
-    throw new TypeError('Highlight cells chunk metadata must be an object.');
+  assertExactKeys(
+    chunkMeta,
+    CHUNK_META_KEYS,
+    'Highlight cells chunk metadata'
+  );
+  if (chunkMeta.contributorId !== id) {
+    throw new TypeError(
+      `Highlight cells contributorId must equal "${id}".`
+    );
+  }
+  if (
+    chunkMeta.priority !== 'lazy'
+    || chunkMeta.kind !== 'binary'
+    || chunkMeta.codec !== 'gzip'
+    || chunkMeta.datasetDependent !== true
+  ) {
+    throw new TypeError(
+      'Highlight cells chunks must be lazy, binary, gzip, and dataset-dependent.'
+    );
   }
   const chunkId = assertNonEmptyString(
     chunkMeta.id,
@@ -234,6 +262,28 @@ export function restore(ctx, chunkMeta, payload) {
       `Highlight group "${groupId}" was not found in staged metadata.`
     );
   }
+  const groupLabel = assertNonEmptyString(
+    targetGroup.label,
+    `Highlight group "${groupId}" label`
+  );
+  if (chunkMeta.label !== `Highlight cells: ${groupLabel}`) {
+    throw new TypeError(
+      `Highlight cells chunk label must match group "${groupId}".`
+    );
+  }
+  assertSafeInteger(
+    chunkMeta.storedBytes,
+    'Highlight cells chunk storedBytes'
+  );
+  const uncompressedBytes = assertSafeInteger(
+    chunkMeta.uncompressedBytes,
+    'Highlight cells chunk uncompressedBytes'
+  );
+  if (uncompressedBytes !== payload.byteLength) {
+    throw new RangeError(
+      'Highlight cells payload length must equal metadata uncompressedBytes.'
+    );
+  }
   const expectedCellCount = assertSafeInteger(
     targetGroup.cellCount,
     `Highlight group "${groupId}" cellCount`,
@@ -250,7 +300,7 @@ export function restore(ctx, chunkMeta, payload) {
   ) {
     throw new TypeError('Highlight cells abortSignal must be an AbortSignal or null.');
   }
-  const decoded = decodeDeltaUvarint(payload, {
+  const decoded = await decodeDeltaUvarint(payload, {
     maxCount: pointCount,
     maxIndex: pointCount - 1,
     signal

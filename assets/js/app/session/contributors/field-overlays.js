@@ -14,6 +14,13 @@ import {
   assertSafeInteger,
   requireMethod
 } from '../schema-contract.js';
+import {
+  getSessionRestoreSnapshot
+} from '../session-context.js';
+import {
+  getCriticalUserDefinedFieldIds,
+  USER_DEFINED_CODES_RESTORE_TRANSACTION_ID
+} from './user-defined-code-inventory.js';
 
 export const id = 'field-overlays';
 
@@ -224,6 +231,186 @@ function getOwners(state, operation) {
   return { renameRegistry, deleteRegistry, userDefinedRegistry };
 }
 
+function capturePayload(owners) {
+  const payload = {
+    renames: owners.renameRegistry.toJSON(),
+    deletedFields: owners.deleteRegistry.toJSON(),
+    userDefinedFields: owners.userDefinedRegistry.toSessionMeta()
+  };
+  assertPayload(payload);
+  return payload;
+}
+
+function applyPayload(state, owners, payload) {
+  assertPayload(payload);
+  owners.renameRegistry.clear();
+  owners.deleteRegistry.clear();
+  owners.userDefinedRegistry.clear();
+  owners.renameRegistry.fromJSON(payload.renames);
+  owners.deleteRegistry.fromJSON(payload.deletedFields);
+  owners.userDefinedRegistry.fromSessionMeta(payload.userDefinedFields);
+  state.applyFieldOverlays();
+}
+
+function captureCategoricalCodes(userDefinedRegistry, payload) {
+  const categoricalMetadata = payload.userDefinedFields.filter(
+    field => field.kind === 'category'
+  );
+  if (categoricalMetadata.length === 0) return new Map();
+  requireMethod(
+    userDefinedRegistry,
+    'getField',
+    'UserDefinedFieldsRegistry categorical rollback owner'
+  );
+  const snapshots = new Map();
+  for (const metadata of categoricalMetadata) {
+    const field = userDefinedRegistry.getField(metadata.id);
+    if (
+      field === null
+      || typeof field !== 'object'
+      || (
+        !(field.codes instanceof Uint8Array)
+        && !(field.codes instanceof Uint16Array)
+      )
+    ) {
+      throw new TypeError(
+        `User-defined field "${metadata.id}" requires exact rollback codes.`
+      );
+    }
+    if (
+      field.codes.length !== metadata.codesLength
+      || field.codes.constructor.name !== metadata.codesType
+    ) {
+      throw new RangeError(
+        `User-defined field "${metadata.id}" rollback codes do not match its metadata.`
+      );
+    }
+    snapshots.set(metadata.id, field.codes);
+  }
+  return snapshots;
+}
+
+function restoreCategoricalCodes(
+  state,
+  userDefinedRegistry,
+  codeSnapshots
+) {
+  if (codeSnapshots.size === 0) return;
+  requireMethod(
+    userDefinedRegistry,
+    'getField',
+    'UserDefinedFieldsRegistry categorical rollback owner'
+  );
+  for (const [fieldId, codes] of codeSnapshots) {
+    const field = userDefinedRegistry.getField(fieldId);
+    if (field === null || typeof field !== 'object') {
+      throw new RangeError(
+        `User-defined field "${fieldId}" was not reconstructed for rollback.`
+      );
+    }
+    field.codes = codes;
+    field.loaded = true;
+    delete field._codesLengthHint;
+    delete field._codesTypeHint;
+  }
+  state.applyFieldOverlays();
+}
+
+function createCategoricalCodeInventoryTracker(state, payload) {
+  const categoricalIds = payload.userDefinedFields
+    .filter(field => field.kind === 'category')
+    .map(field => field.id);
+  const expectedIds = new Set(categoricalIds);
+  const receivedPriorities = new Map();
+  const receivedOrder = {
+    eager: [],
+    lazy: []
+  };
+
+  return Object.freeze({
+    record(fieldId, priority) {
+      const exactId = assertNonEmptyString(
+        fieldId,
+        'Restored user-defined code field id'
+      );
+      if (!expectedIds.has(exactId)) {
+        throw new RangeError(
+          `User-defined code field "${exactId}" is not in the field-overlay inventory.`
+        );
+      }
+      if (priority !== 'eager' && priority !== 'lazy') {
+        throw new TypeError(
+          `User-defined code field "${exactId}" has an invalid priority.`
+        );
+      }
+      if (receivedPriorities.has(exactId)) {
+        throw new TypeError(
+          `User-defined code field "${exactId}" was restored more than once.`
+        );
+      }
+      receivedPriorities.set(exactId, priority);
+      receivedOrder[priority].push(exactId);
+    },
+
+    prepare() {
+      if (receivedPriorities.size !== expectedIds.size) {
+        throw new RangeError(
+          `Field overlays advertise ${expectedIds.size} categorical code ` +
+          `chunks but restored ${receivedPriorities.size}.`
+        );
+      }
+      if (expectedIds.size === 0) return;
+      const criticalIds = getCriticalUserDefinedFieldIds(state);
+      for (const criticalId of criticalIds) {
+        if (!expectedIds.has(criticalId)) {
+          throw new RangeError(
+            `Active user-defined field "${criticalId}" is absent from ` +
+            'the field-overlay code inventory.'
+          );
+        }
+      }
+      for (const fieldId of expectedIds) {
+        const actualPriority = receivedPriorities.get(fieldId);
+        if (actualPriority === undefined) {
+          throw new RangeError(
+            `User-defined code field "${fieldId}" is missing its chunk.`
+          );
+        }
+        const expectedPriority = criticalIds.has(fieldId)
+          ? 'eager'
+          : 'lazy';
+        if (actualPriority !== expectedPriority) {
+          throw new TypeError(
+            `User-defined code field "${fieldId}" must be ${expectedPriority} ` +
+            'for the restored active-field graph.'
+          );
+        }
+      }
+      for (const priority of ['eager', 'lazy']) {
+        const expectedOrder = categoricalIds.filter(
+          fieldId => (
+            criticalIds.has(fieldId)
+              ? priority === 'eager'
+              : priority === 'lazy'
+          )
+        );
+        const actualOrder = receivedOrder[priority];
+        if (
+          actualOrder.length !== expectedOrder.length
+          || actualOrder.some(
+            (fieldId, index) => fieldId !== expectedOrder[index]
+          )
+        ) {
+          throw new TypeError(
+            `User-defined ${priority} code chunks must match the exact ` +
+            'field-overlay inventory order.'
+          );
+        }
+      }
+    }
+  });
+}
+
 export function capture(ctx) {
   if (ctx === null || typeof ctx !== 'object' || ctx.state === null || typeof ctx.state !== 'object') {
     throw new TypeError('Field-overlay capture requires the current DataState owner.');
@@ -233,12 +420,11 @@ export function capture(ctx) {
     deleteRegistry,
     userDefinedRegistry
   } = getOwners(ctx.state, 'capture');
-  const payload = {
-    renames: renameRegistry.toJSON(),
-    deletedFields: deleteRegistry.toJSON(),
-    userDefinedFields: userDefinedRegistry.toSessionMeta()
-  };
-  assertPayload(payload);
+  const payload = capturePayload({
+    renameRegistry,
+    deleteRegistry,
+    userDefinedRegistry
+  });
 
   return [{
     id: 'core/field-overlays',
@@ -261,11 +447,56 @@ export function restore(ctx, _chunkMeta, payload) {
   requireMethod(state, 'applyFieldOverlays', 'Field-overlay restore owner');
   assertPayload(payload);
 
-  owners.renameRegistry.clear();
-  owners.deleteRegistry.clear();
-  owners.userDefinedRegistry.clear();
-  owners.renameRegistry.fromJSON(payload.renames);
-  owners.deleteRegistry.fromJSON(payload.deletedFields);
-  owners.userDefinedRegistry.fromSessionMeta(payload.userDefinedFields);
-  state.applyFieldOverlays();
+  const restoreTransaction = ctx.restoreTransaction;
+  if (
+    restoreTransaction === null
+    || typeof restoreTransaction !== 'object'
+  ) {
+    applyPayload(state, owners, payload);
+    return;
+  }
+  requireMethod(
+    restoreTransaction,
+    'register',
+    'Field-overlay restore transaction'
+  );
+  const sharedSnapshot = getSessionRestoreSnapshot(
+    ctx,
+    'core/field-overlays'
+  );
+  const previousPayload = sharedSnapshot === undefined
+    ? capturePayload(owners)
+    : structuredClone(sharedSnapshot);
+  assertPayload(previousPayload);
+  const previousCodes = captureCategoricalCodes(
+    owners.userDefinedRegistry,
+    previousPayload
+  );
+  const codeInventoryTracker = createCategoricalCodeInventoryTracker(
+    state,
+    payload
+  );
+  let applied = false;
+  const rollbackState = () => {
+    if (!applied) return;
+    applyPayload(state, owners, previousPayload);
+    restoreCategoricalCodes(
+      state,
+      owners.userDefinedRegistry,
+      previousCodes
+    );
+    applied = false;
+  };
+  restoreTransaction.register(USER_DEFINED_CODES_RESTORE_TRANSACTION_ID, {
+    value: Object.freeze({
+      rollback: rollbackState,
+      record: codeInventoryTracker.record
+    }),
+    prepare: codeInventoryTracker.prepare,
+    commit() {},
+    rollback: rollbackState
+  });
+
+  applied = true;
+  applyPayload(state, owners, payload);
 }

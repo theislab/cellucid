@@ -322,6 +322,40 @@ function dequantize(quantized, minValue, maxValue, bits) {
 }
 
 /**
+ * Adopt a prepared categorical-outlier payload into DataState's exact domain.
+ *
+ * Prepared files represent a scientifically unavailable quantile as NaN (or
+ * the declared terminal integer marker before dequantization). DataState uses
+ * exactly -1 for that same unavailable value so its hot visibility loop can
+ * distinguish it from the valid [0, 1] quantile interval without non-finite
+ * values. This is the sole wire-to-runtime representation boundary.
+ *
+ * @param {Float32Array} quantiles
+ * @param {string} fieldKey
+ * @returns {Float32Array}
+ */
+function adoptRuntimeOutlierQuantiles(quantiles, fieldKey) {
+  if (!(quantiles instanceof Float32Array)) {
+    throw new TypeError(
+      `Outlier quantiles for "${fieldKey}" must decode to Float32Array.`
+    );
+  }
+  for (let index = 0; index < quantiles.length; index++) {
+    const quantile = quantiles[index];
+    if (Number.isNaN(quantile)) {
+      quantiles[index] = -1;
+      continue;
+    }
+    if (!Number.isFinite(quantile) || quantile < 0 || quantile > 1) {
+      throw new RangeError(
+        `Outlier quantile ${index} for "${fieldKey}" must be -1 or a finite value from 0 through 1.`
+      );
+    }
+  }
+  return quantiles;
+}
+
+/**
  * @typedef {'uint8'|'uint16'} QuantizedDType
  */
 
@@ -649,8 +683,19 @@ async function fetchBinaryWithProgressInternal(
     throw err;
   }
 
+  const contentEncoding = response.headers.get('content-encoding');
   const contentLength = response.headers.get('content-length');
-  const totalBytes = contentLength ? parseInt(contentLength, 10) : null;
+  const totalBytes = contentEncoding === null && contentLength !== null
+    ? Number(contentLength)
+    : null;
+  if (
+    totalBytes !== null &&
+    (!Number.isSafeInteger(totalBytes) || totalBytes < 0)
+  ) {
+    throw new Error(
+      `Invalid Content-Length for ${url}: ${contentLength}`
+    );
+  }
 
   if (trackerId && response.body) {
     const reader = response.body.getReader();
@@ -1805,9 +1850,10 @@ export async function loadObsFieldData(manifestUrl, field, options = {}) {
     const buffer = await fetchBinary(url, fetchInit);
     const dtype = field.outlierDtype;
 
+    let decodedOutlierQuantiles;
     if (field.outlierQuantized) {
       const bits = dtype === 'uint8' ? 8 : 16;
-      outputs.outlierQuantiles = await dequantizeToFloat32({
+      decodedOutlierQuantiles = await dequantizeToFloat32({
         backend: quantizationBackend,
         buffer,
         dtype,
@@ -1816,8 +1862,12 @@ export async function loadObsFieldData(manifestUrl, field, options = {}) {
         bits,
       });
     } else {
-      outputs.outlierQuantiles = typedArrayFromBuffer(buffer, dtype, url);
+      decodedOutlierQuantiles = typedArrayFromBuffer(buffer, dtype, url);
     }
+    outputs.outlierQuantiles = adoptRuntimeOutlierQuantiles(
+      decodedOutlierQuantiles,
+      field.key
+    );
   }
 
   return outputs;

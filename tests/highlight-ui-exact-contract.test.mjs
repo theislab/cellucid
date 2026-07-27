@@ -219,7 +219,7 @@ test('highlight modules expose one exact current UI contract without probes, tim
   assert.doesNotMatch(source, /\bdegree:\s*0\b/);
 });
 
-test('category highlights preserve primitive identity through save, restore, and summary rendering', () => {
+test('category highlights preserve primitive identity through save, restore, and summary rendering', async () => {
   const sourceState = createCategoryHighlightState();
   for (let categoryIndex = 0; categoryIndex < 5; categoryIndex++) {
     sourceState.addHighlightFromCategory(0, categoryIndex, 'obs');
@@ -257,10 +257,15 @@ test('category highlights preserve primitive identity through save, restore, and
     metaChunk.payload
   );
   for (const cellChunk of cellChunks) {
-    restoreHighlightCells(
+    const { payload, ...metadata } = cellChunk;
+    await restoreHighlightCells(
       restoreContext,
-      cellChunk,
-      cellChunk.payload
+      {
+        ...metadata,
+        storedBytes: payload.byteLength,
+        uncompressedBytes: payload.byteLength
+      },
+      payload
     );
   }
   restoreTransaction.commit();

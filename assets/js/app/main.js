@@ -15,11 +15,19 @@
 import { createViewer } from '../rendering/viewer.js';
 import { createDataState } from './state/index.js';
 import { initUI } from './ui/core/ui-coordinator.js';
-import { createSessionSerializer } from './session/index.js';
+import {
+  createSessionSerializer
+} from './session/index.js';
+import {
+  classifyAdvertisedDatasetStateRestoreError,
+  restoreCurrentDatasetState
+} from './session/dataset-state-manifest.js';
 import {
   createDatasetRuntimeRetirementOwner,
   createLatestDatasetReloadCoordinator,
   handleDatasetReloadFailure,
+  settleInitialPublishedDatasetStateOutcome,
+  settlePublishedDatasetStateOutcome,
   settlePublishedDatasetUi,
   stageDatasetPositionPayload
 } from './dataset-reload-outcome.js';
@@ -63,8 +71,11 @@ import {
 import {
   createJupyterCommandHandlers
 } from './jupyter-command-handler.js';
-// formatNumber imported from data-source.js; benchmark module lazy-loaded when needed
-import { formatCellCount as formatNumber } from '../data/data-source.js';
+// benchmark module is lazy-loaded when needed
+import {
+  fetchSampleArtifact,
+  formatCellCount as formatNumber
+} from '../data/data-source.js';
 import { createComparisonModule } from './analysis/comparison-module.js';
 import { ThemeManager } from '../utils/theme-manager.js';
 import { debug } from '../utils/debug.js';
@@ -1129,6 +1140,9 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
 
     const hasInitialDataset =
       dataSourceManager.hasActiveDataset() === true;
+    const initialReloadTransaction = hasInitialDataset
+      ? datasetReloadCoordinator.begin()
+      : null;
     let initialPublication = null;
     if (hasInitialDataset) {
       // Capture the exact selected id and URL before any asynchronous metadata
@@ -1280,6 +1294,8 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           signal: reloadTransaction.signal,
           stagedSource
         });
+        reloadTransaction.assertCurrent();
+        await cancelPublishedDatasetStateAndWait();
         reloadTransaction.assertCurrent();
       } catch (err) {
         const stagingErrors = [err];
@@ -1452,6 +1468,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           }
         });
       }
+      reloadTransaction.adoptCurrentIdentity();
       try {
         dataSourceManager.publishDatasetSelection(managerPublication);
       } catch (error) {
@@ -1490,18 +1507,34 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           }
         );
       }
-      completeDataLoadSuccess(loadToken, buildDatasetAnalyticsContext({
-        metadata: selectionStage.metadata,
-        datasetId,
-        datasetName: selectionStage.metadata.name,
-        reload: true
-      }));
+      const stateOutcome = await restoreAdvertisedDatasetState({
+        signal: reloadTransaction.signal
+      });
+      debug.log(
+        `[Main] Published dataset state outcome: ${stateOutcome.status}`
+      );
+      await settlePublishedDatasetStateOutcome({
+        outcome: stateOutcome,
+        transaction: reloadTransaction,
+        cancel: () => cancelDataLoad(loadToken),
+        complete: () => completeDataLoadSuccess(
+          loadToken,
+          buildDatasetAnalyticsContext({
+            metadata: selectionStage.metadata,
+            datasetId,
+            datasetName: selectionStage.metadata.name,
+            reload: true
+          })
+        )
+      });
       return synchronizationOutcome.status === 'ready' ||
         synchronizationOutcome.status === 'ready-ui-error';
     }
 
     async function clearActiveDatasetInPlace() {
       const reloadTransaction = datasetReloadCoordinator.begin();
+      reloadTransaction.assertCurrent();
+      await cancelPublishedDatasetStateAndWait();
       reloadTransaction.assertCurrent();
       const clearStage = dataSourceManager.stageDatasetClear({
         loadMethod: DATA_LOAD_METHODS.DATASET_DROPDOWN
@@ -1647,12 +1680,16 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       const visiblePositions = state.getVisiblePositionsForSmoke();
       if (
         !(visiblePositions instanceof Float32Array) ||
-        visiblePositions.length === 0 ||
         visiblePositions.length % 3 !== 0
       ) {
         throw new TypeError(
-          'Smoke density rebuild requires non-empty Float32 XYZ positions.'
+          'Smoke density rebuild requires a Float32Array with exact XYZ positions.'
         );
+      }
+      if (visiblePositions.length === 0) {
+        viewer.clearSmokeVolume();
+        debug.log('Cleared smoke volume because no cells are visible.');
+        return;
       }
 
       debug.log(`Building smoke volume at ${gridSize}^3 from ${visiblePositions.length / 3} visible points (GPU)…`);
@@ -1666,7 +1703,98 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     // Smoke volume is built lazily when switching to smoke mode
     // (no initial build to save startup time)
 
-    const sessionSerializer = createSessionSerializer({ state, viewer, sidebar, dataSourceManager });
+    const sessionSerializer = createSessionSerializer({
+      state,
+      viewer,
+      sidebar,
+      dataSourceManager
+    });
+    let activePublishedStateController = null;
+    let activePublishedStateTask = null;
+
+    async function cancelPublishedDatasetStateAndWait() {
+      const task = activePublishedStateTask;
+      activePublishedStateController?.abort();
+      await sessionSerializer.cancelRestoreAndWait();
+      if (task !== null) {
+        await task;
+      }
+    }
+
+    async function restoreAdvertisedDatasetState({ signal }) {
+      if (!(signal instanceof AbortSignal)) {
+        throw new TypeError(
+          'Published dataset state requires one owner AbortSignal.'
+        );
+      }
+      if (activePublishedStateTask !== null) {
+        throw new Error(
+          'Published dataset state replacement must await its prior owner.'
+        );
+      }
+
+      const controller = new AbortController();
+      const relayAbort = () => controller.abort();
+      if (signal.aborted) {
+        controller.abort();
+      } else {
+        signal.addEventListener('abort', relayAbort, { once: true });
+      }
+      activePublishedStateController = controller;
+
+      const task = (async () => {
+        try {
+          const restored = await restoreCurrentDatasetState({
+            dataSourceManager,
+            fetchArtifact: fetchSampleArtifact,
+            getPublicationRevision: () => datasetPublicationGeneration,
+            refreshUi: ui.refreshUiAfterStateLoad,
+            sessionSerializer,
+            signal: controller.signal
+          });
+          return {
+            status: restored ? 'ready-state-restored' : 'ready'
+          };
+        } catch (error) {
+          const classified =
+            classifyAdvertisedDatasetStateRestoreError(error, {
+              ownerAborted: controller.signal.aborted
+            });
+          if (classified !== null) return classified;
+          const message = error instanceof Error
+            ? error.message
+            : String(error);
+          console.error(
+            '[Main] Dataset loaded, but its advertised default state failed:',
+            error
+          );
+          notifications.error(
+            `The dataset is loaded, but its published sample view could not ` +
+            `be applied: ${message}`,
+            {
+              category: 'data',
+              duration: 0,
+              title: 'Sample view unavailable'
+            }
+          );
+          return {
+            error,
+            status: 'ready-state-error'
+          };
+        } finally {
+          signal.removeEventListener('abort', relayAbort);
+        }
+      })();
+      activePublishedStateTask = task;
+      try {
+        return await task;
+      } finally {
+        if (activePublishedStateTask === task) {
+          activePublishedStateTask = null;
+          activePublishedStateController = null;
+        }
+      }
+    }
 
     // -----------------------------------------------------------------------
     // Jupyter "no-download" session bundle capture (viewer → Python)
@@ -1747,15 +1875,49 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     }
 
     if (hasInitialDataset) {
-      synchronizePublishedDatasetUi(
-        dataSourceManager.getCurrentMetadata(),
-        initialPublication
-      );
-      await ui.activateField(-1);
-    }
-    if (currentDatasetLoadToken) {
-      completeDataLoadSuccess(currentDatasetLoadToken, buildDatasetAnalyticsContext());
+      if (initialReloadTransaction === null) {
+        throw new Error(
+          'Initial dataset state requires one reload transaction.'
+        );
+      }
+      if (currentDatasetLoadToken === null) {
+        throw new Error(
+          'Initial dataset state requires one analytics load token.'
+        );
+      }
+      let stateOutcome = { status: 'superseded' };
+      if (initialReloadTransaction.isCurrent()) {
+        synchronizePublishedDatasetUi(
+          dataSourceManager.getCurrentMetadata(),
+          initialPublication
+        );
+        await ui.activateField(-1);
+        if (initialReloadTransaction.isCurrent()) {
+          stateOutcome = await restoreAdvertisedDatasetState({
+            signal: initialReloadTransaction.signal
+          });
+        }
+      }
+      const initialLoadToken = currentDatasetLoadToken;
+      const settledStateOutcome =
+        await settleInitialPublishedDatasetStateOutcome({
+          outcome: stateOutcome,
+          transaction: initialReloadTransaction,
+          cancel: () => cancelDataLoad(initialLoadToken),
+          complete: () => completeDataLoadSuccess(
+            initialLoadToken,
+            buildDatasetAnalyticsContext()
+          )
+        });
       currentDatasetLoadToken = null;
+      debug.log(
+        `[Main] Initial dataset state outcome: ` +
+        `${settledStateOutcome.status}`
+      );
+    } else if (currentDatasetLoadToken !== null) {
+      throw new Error(
+        'Dataset analytics token exists without an initial dataset.'
+      );
     }
 
     // Setup connectivity controls
@@ -2719,23 +2881,29 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     let SyntheticDataGenerator = null;  // For synthetic data generation
     let BenchmarkReporter = null;       // For report generation
     let benchmarkModuleLoaded = false;
+    let benchmarkModuleLoadTask = null;
 
     // Lazy-load benchmark module when first needed
-    async function ensureBenchmarkModule() {
-      if (benchmarkModuleLoaded) return true;
-      try {
-        const benchmarkModule = await import('../dev/benchmark.js');
-        SyntheticDataGenerator = benchmarkModule.SyntheticDataGenerator;
-        BenchmarkReporter = benchmarkModule.BenchmarkReporter;
-        const PerformanceTrackerClass = benchmarkModule.PerformanceTracker;
-        perfTracker = new PerformanceTrackerClass();
-        benchmarkModuleLoaded = true;
-        debug.log('[Main] Benchmark module lazy-loaded');
-        return true;
-      } catch (err) {
-        console.error('[Main] Failed to load benchmark module:', err);
-        return false;
-      }
+    function ensureBenchmarkModule() {
+      if (benchmarkModuleLoaded) return Promise.resolve(true);
+      if (benchmarkModuleLoadTask !== null) return benchmarkModuleLoadTask;
+
+      benchmarkModuleLoadTask = (async () => {
+        try {
+          const benchmarkModule = await import('../dev/benchmark.js');
+          SyntheticDataGenerator = benchmarkModule.SyntheticDataGenerator;
+          BenchmarkReporter = benchmarkModule.BenchmarkReporter;
+          const PerformanceTrackerClass = benchmarkModule.PerformanceTracker;
+          perfTracker = new PerformanceTrackerClass();
+          benchmarkModuleLoaded = true;
+          debug.log('[Main] Benchmark module lazy-loaded');
+          return true;
+        } catch (err) {
+          console.error('[Main] Failed to load benchmark module:', err);
+          return false;
+        }
+      })();
+      return benchmarkModuleLoadTask;
     }
 
     let benchmarkActive = false;
@@ -3070,6 +3238,29 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       });
       const previousRuntimeStage = activeRuntimeStage;
       let syntheticPublication;
+      try {
+        await cancelPublishedDatasetStateAndWait();
+      } catch (error) {
+        try {
+          runtimeRetirementOwner.retire(candidateDimensionManager);
+        } catch (retirementError) {
+          throw new AggregateError(
+            [error, retirementError],
+            'Published state cancellation and benchmark retirement failed.'
+          );
+        }
+        console.error(
+          'Failed to cancel the current dataset state:',
+          error
+        );
+        notifications.fail(
+          benchNotifId,
+          `Benchmark failed: ${error instanceof Error
+            ? error.message
+            : String(error)}`
+        );
+        return;
+      }
       try {
         syntheticPublication =
           commitSyntheticRuntimeStage(syntheticStage);

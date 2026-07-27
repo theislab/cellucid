@@ -980,6 +980,91 @@ test('field loaders dequantize only the exact declared range and missing marker'
   assert.equal(Number.isNaN(loaded.values[3]), true);
 });
 
+test('prepared categorical outliers adopt the exact runtime missing sentinel', async t => {
+  const manager = getDataSourceManager();
+  const originalActiveSource = manager.activeSource;
+  const originalFetch = globalThis.fetch;
+  manager.activeSource = null;
+  t.after(() => {
+    manager.activeSource = originalActiveSource;
+    globalThis.fetch = originalFetch;
+  });
+
+  await t.test('quantized reserved marker becomes -1', async () => {
+    globalThis.fetch = async url => new Response(
+      String(url).includes('.codes.')
+        ? Uint8Array.of(0, 1)
+        : Uint8Array.of(127, 255)
+    );
+    const [field] = expandObsManifest(currentObsManifest({
+      continuousFields: [],
+      categoricalSchema: {
+        codesPathPattern: 'obs/{key}.codes.{ext}',
+        outlierPathPattern: 'obs/{key}.outliers.u8',
+        outlierExt: 'u8',
+        outlierDtype: 'uint8',
+        outlierQuantized: true,
+      },
+      categoricalFields: [[
+        'cluster', ['A', 'B'], 'uint8', 255, {}, 0, 1,
+      ]],
+    })).fields;
+
+    const loaded = await loadObsFieldData(
+      'https://example.test/obs_manifest.json',
+      field
+    );
+    assert.deepEqual(
+      Array.from(loaded.outlierQuantiles),
+      [Math.fround(127 / 254), -1]
+    );
+  });
+
+  await t.test('unquantized NaN becomes -1', async () => {
+    globalThis.fetch = async url => new Response(
+      String(url).includes('.codes.')
+        ? Uint8Array.of(0, 1)
+        : Float32Array.of(0.25, Number.NaN)
+    );
+    const fields = expandObsManifest(currentObsManifest({
+      continuousFields: [],
+    })).fields;
+
+    const loaded = await loadObsFieldData(
+      'https://example.test/obs_manifest.json',
+      fields[0]
+    );
+    assert.deepEqual(Array.from(loaded.outlierQuantiles), [0.25, -1]);
+  });
+});
+
+test('prepared categorical outliers reject non-missing values outside [0, 1]', async t => {
+  const manager = getDataSourceManager();
+  const originalActiveSource = manager.activeSource;
+  const originalFetch = globalThis.fetch;
+  manager.activeSource = null;
+  globalThis.fetch = async url => new Response(
+    String(url).includes('.codes.')
+      ? Uint8Array.of(0, 1)
+      : Float32Array.of(-0.5, 0.5)
+  );
+  t.after(() => {
+    manager.activeSource = originalActiveSource;
+    globalThis.fetch = originalFetch;
+  });
+
+  const [field] = expandObsManifest(currentObsManifest({
+    continuousFields: [],
+  })).fields;
+  await assert.rejects(
+    loadObsFieldData(
+      'https://example.test/obs_manifest.json',
+      field
+    ),
+    /outlier quantile 0.*-1 or a finite value from 0 through 1/i
+  );
+});
+
 test('field quantization selects one backend before fetch and never refetches after failure', async t => {
   const manager = getDataSourceManager();
   const originalActiveSource = manager.activeSource;

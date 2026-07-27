@@ -6,7 +6,11 @@
  * @module session
  */
 
-import { SessionSerializer } from './session-serializer.js';
+import {
+  SessionSerializer,
+  isSessionRestoreCanceledError,
+  isSessionRestoreSupersededError
+} from './session-serializer.js';
 import * as fieldOverlays from './contributors/field-overlays.js';
 import * as userDefinedCodes from './contributors/user-defined-codes.js';
 import * as coreState from './contributors/core-state.js';
@@ -17,6 +21,11 @@ import * as highlightsCells from './contributors/highlights-cells.js';
 import * as analysisArtifacts from './contributors/analysis-artifacts.js';
 import * as cinematicCamera from './contributors/cinematic-camera.js';
 import { assertExactKeys } from './schema-contract.js';
+
+export {
+  isSessionRestoreCanceledError,
+  isSessionRestoreSupersededError
+};
 
 /**
  * Create the SessionSerializer.
@@ -41,13 +50,13 @@ export function createSessionSerializer(options) {
   const contributors = [
     fieldOverlays,
     userDefinedCodes,
+    cinematicCamera,
     coreState,
     dockableLayout,
     analysisWindows,
     highlightsMeta,
     highlightsCells,
-    analysisArtifacts,
-    cinematicCamera
+    analysisArtifacts
   ];
   return new SessionSerializer({
     state: options.state,

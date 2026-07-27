@@ -200,6 +200,14 @@ export class SmokeRenderer {
     console.log(`[SmokeRenderer] Created 3D density texture (${volumeDesc.gridSize}³)`);
   }
 
+  clearVolume() {
+    const previousTexture = this.textureInfo?.texture ?? null;
+    this.textureInfo = null;
+    if (previousTexture) {
+      this.gl.deleteTexture(previousTexture);
+    }
+  }
+
   buildVolumeGPU(positions, options = {}) {
     const volumeDesc = buildDensityVolumeGPU(this.gl, positions, options);
     this.setVolume(volumeDesc);

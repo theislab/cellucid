@@ -20,6 +20,7 @@ import {
 const DEFAULT_CONNECTION_TIMEOUT_MS = 5000;
 const MAX_CONNECTION_TIMEOUT_MS = 120000;
 const REMOTE_MESSAGE_KEYS = Object.freeze(['type', 'payload']);
+const REMOTE_STATE_MANIFEST = 'state-snapshots.json';
 
 function isPlainRecord(value) {
   return (
@@ -380,6 +381,34 @@ function requireDatasetCatalogPath(value, label) {
   return value;
 }
 
+function requireDatasetStateCapability(entry, label) {
+  const hasStateManifest = Object.hasOwn(entry, 'state_manifest');
+  const hasStateSha256 = Object.hasOwn(entry, 'state_sha256');
+  if (hasStateManifest !== hasStateSha256) {
+    throw new TypeError(
+      `${label} state_manifest and state_sha256 must be declared together`
+    );
+  }
+  if (!hasStateManifest) return null;
+  if (entry.state_manifest !== REMOTE_STATE_MANIFEST) {
+    throw new TypeError(
+      `${label}.state_manifest must be exactly ${REMOTE_STATE_MANIFEST}`
+    );
+  }
+  if (
+    typeof entry.state_sha256 !== 'string'
+    || !/^[0-9a-f]{64}$/.test(entry.state_sha256)
+  ) {
+    throw new TypeError(
+      `${label}.state_sha256 must be one lowercase SHA-256 digest`
+    );
+  }
+  return Object.freeze({
+    state_manifest: entry.state_manifest,
+    state_sha256: entry.state_sha256
+  });
+}
+
 function requireDatasetCatalogPayload(payload) {
   requireExactKeys(payload, ['datasets'], [], 'Remote dataset listing');
   if (!Array.isArray(payload.datasets)) {
@@ -395,7 +424,12 @@ function requireDatasetCatalogPayload(payload) {
   const paths = new Set();
   return Object.freeze(payload.datasets.map((entry, index) => {
     const label = `Remote dataset listing datasets[${index}]`;
-    requireExactKeys(entry, ['id', 'path', 'name'], [], label);
+    requireExactKeys(
+      entry,
+      ['id', 'path', 'name'],
+      ['state_manifest', 'state_sha256'],
+      label
+    );
     const id = requireExactText(
       entry.id,
       `${label}.id`,
@@ -407,6 +441,7 @@ function requireDatasetCatalogPayload(payload) {
       `${label}.name`,
       { allowWhitespace: true }
     );
+    const stateCapability = requireDatasetStateCapability(entry, label);
     if (ids.has(id)) {
       throw new TypeError(`Remote dataset listing contains duplicate id ${id}`);
     }
@@ -417,7 +452,11 @@ function requireDatasetCatalogPayload(payload) {
     }
     ids.add(id);
     paths.add(path);
-    return Object.freeze({ id, path, name });
+    return Object.freeze(
+      stateCapability === null
+        ? { id, path, name }
+        : { id, path, name, ...stateCapability }
+    );
   }));
 }
 

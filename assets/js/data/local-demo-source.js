@@ -128,6 +128,38 @@ function validateDemoManifestContract(manifest, source) {
         );
       }
     }
+    const hasStateManifest = Object.hasOwn(entry, 'state_manifest');
+    const hasStateSha256 = Object.hasOwn(entry, 'state_sha256');
+    if (hasStateManifest !== hasStateSha256) {
+      throw invalidDemoManifest(
+        `dataset '${entry.id}' state_manifest and state_sha256 must be declared together`,
+        source,
+        { id: entry.id }
+      );
+    }
+    if (
+      hasStateManifest
+      && entry.state_manifest !== 'state-snapshots.json'
+    ) {
+      throw invalidDemoManifest(
+        `dataset '${entry.id}' state_manifest must be exactly state-snapshots.json`,
+        source,
+        { id: entry.id, stateManifest: entry.state_manifest }
+      );
+    }
+    if (
+      hasStateSha256
+      && (
+        typeof entry.state_sha256 !== 'string'
+        || !/^[0-9a-f]{64}$/.test(entry.state_sha256)
+      )
+    ) {
+      throw invalidDemoManifest(
+        `dataset '${entry.id}' state_sha256 must be one lowercase SHA-256 digest`,
+        source,
+        { id: entry.id, stateSha256: entry.state_sha256 }
+      );
+    }
   }
 
   if (
@@ -416,6 +448,25 @@ export class LocalDemoDataSource {
       );
     }
     return resolveUrl(this.baseUrl, entry.path);
+  }
+
+  /**
+   * Resolve the explicitly advertised default-state manifest for a dataset.
+   * Catalogs without this current optional capability are never probed.
+   *
+   * @param {string} datasetId - Dataset identifier
+   * @returns {string|null}
+   */
+  getStateDescriptor(datasetId) {
+    const baseUrl = this.getBaseUrl(datasetId);
+    const entry = this._manifest.datasets.find(
+      dataset => dataset.id === datasetId
+    );
+    if (!Object.hasOwn(entry, 'state_manifest')) return null;
+    return {
+      manifestUrl: resolveUrl(baseUrl, entry.state_manifest),
+      stateSha256: entry.state_sha256,
+    };
   }
 
   /**

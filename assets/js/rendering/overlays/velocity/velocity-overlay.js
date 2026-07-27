@@ -214,10 +214,10 @@ export function validateVelocityOverlayConfig(
       exactValue = requireNumber(value, exactKey, 0, exactCapacity, true);
       break;
     case 'speedMultiplier':
-      exactValue = requireNumber(value, exactKey, 0.1, 20);
+      exactValue = requireNumber(value, exactKey, 0.05, 20);
       break;
     case 'lifetime':
-      exactValue = requireNumber(value, exactKey, 0.5, 30);
+      exactValue = requireNumber(value, exactKey, 0.1, 30);
       break;
     case 'dropRate':
     case 'dropRateBump':
@@ -227,7 +227,7 @@ export function validateVelocityOverlayConfig(
       exactValue = requireNumber(value, exactKey, 0, 2);
       break;
     case 'particleSize':
-      exactValue = requireNumber(value, exactKey, 1, 50);
+      exactValue = requireNumber(value, exactKey, 0.5, 50);
       break;
     case 'minSize':
       exactValue = requireNumber(value, exactKey, 0.5, 10);
@@ -236,7 +236,7 @@ export function validateVelocityOverlayConfig(
       exactValue = requireNumber(value, exactKey, 5, 100);
       break;
     case 'intensity':
-      exactValue = requireNumber(value, exactKey, 0.1, 5);
+      exactValue = requireNumber(value, exactKey, 0.05, 5);
       break;
     case 'glowAmount':
     case 'coreSharpness':
@@ -277,7 +277,7 @@ export function validateVelocityOverlayConfig(
       exactValue = requireNumber(value, exactKey, 1, 3);
       break;
     case 'exposure':
-      exactValue = requireNumber(value, exactKey, 0.5, 4);
+      exactValue = requireNumber(value, exactKey, 0.1, 4);
       break;
     case 'contrast':
       exactValue = requireNumber(value, exactKey, 0.5, 2);
@@ -470,16 +470,16 @@ export class VelocityOverlay extends OverlayBase {
         particleCapacity,
         true
       ),
-      speedMultiplier: readNumberOption(options, 'speedMultiplier', 0.1, 20),
-      lifetime: readNumberOption(options, 'lifetime', 0.5, 30),
+      speedMultiplier: readNumberOption(options, 'speedMultiplier', 0.05, 20),
+      lifetime: readNumberOption(options, 'lifetime', 0.1, 30),
       dropRate: readNumberOption(options, 'dropRate', 0, 0.1),
       dropRateBump: readNumberOption(options, 'dropRateBump', 0, 0.1),
       turbulence: readNumberOption(options, 'turbulence', 0, 2),
 
-      particleSize: readNumberOption(options, 'particleSize', 1, 50),
+      particleSize: readNumberOption(options, 'particleSize', 0.5, 50),
       minSize: readNumberOption(options, 'minSize', 0.5, 10),
       maxSize: readNumberOption(options, 'maxSize', 5, 100),
-      intensity: readNumberOption(options, 'intensity', 0.1, 5),
+      intensity: readNumberOption(options, 'intensity', 0.05, 5),
       glowAmount: readNumberOption(options, 'glowAmount', 0, 1),
       coreSharpness: readNumberOption(options, 'coreSharpness', 0, 1),
       cometStretch: readNumberOption(options, 'cometStretch', 0, 2),
@@ -502,7 +502,7 @@ export class VelocityOverlay extends OverlayBase {
       bloomBlurSize: readNumberOption(options, 'bloomBlurSize', 1, 16),
       bloomKnee: readNumberOption(options, 'bloomKnee', 0, 1),
       anamorphicRatio: readNumberOption(options, 'anamorphicRatio', 1, 3),
-      exposure: readNumberOption(options, 'exposure', 0.5, 4),
+      exposure: readNumberOption(options, 'exposure', 0.1, 4),
       contrast: readNumberOption(options, 'contrast', 0.5, 2),
       saturation: readNumberOption(options, 'saturation', 0, 2),
       gamma: readNumberOption(options, 'gamma', 0.5, 2.5),

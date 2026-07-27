@@ -21,7 +21,10 @@ import {
   assertMultiviewState,
   restoreMultiview
 } from '../../state-serializer/multiview.js';
-import { assertCameraState } from '../../../rendering/camera-state-contract.js';
+import {
+  assertCameraState,
+  cloneCameraState
+} from '../../../rendering/camera-state-contract.js';
 import {
   assertArray,
   assertBoolean,
@@ -31,6 +34,9 @@ import {
   assertSafeInteger,
   requireMethod
 } from '../schema-contract.js';
+import {
+  getSessionRestoreSnapshot
+} from '../session-context.js';
 
 export const id = 'core-state';
 
@@ -135,7 +141,12 @@ function assertSnapshotMeta(meta, snapshotId) {
   };
 }
 
-function serializeMultiviewDescriptors({ state, viewer, camerasLocked }) {
+function serializeMultiviewDescriptors({
+  state,
+  viewer,
+  camerasLocked,
+  currentCamera
+}) {
   requireMethod(viewer, 'getViewLayout', 'Core-state viewer');
   requireMethod(viewer, 'getSnapshotViews', 'Core-state viewer');
   requireMethod(viewer, 'getViewCameraState', 'Core-state viewer');
@@ -188,10 +199,15 @@ function serializeMultiviewDescriptors({ state, viewer, camerasLocked }) {
         context.dimensionLevel,
         `Snapshot "${snapshotId}" dimensionLevel`
       ),
-      cameraState: assertCameraState(
-        viewer.getViewCameraState(snapshotId),
-        `Snapshot session camera state for "${snapshotId}"`
-      ),
+      cameraState: camerasLocked
+        ? cloneCameraState(
+          currentCamera,
+          `Locked snapshot session camera state for "${snapshotId}"`
+        )
+        : assertCameraState(
+          viewer.getViewCameraState(snapshotId),
+          `Snapshot session camera state for "${snapshotId}"`
+        ),
       activeFields,
       filters: {
         ...serializeFiltersForFields(
@@ -209,10 +225,12 @@ function serializeMultiviewDescriptors({ state, viewer, camerasLocked }) {
   const multiview = {
     layout,
     camerasLocked,
-    liveCameraState: assertCameraState(
-      viewer.getViewCameraState('live'),
-      'Live-view session camera state'
-    ),
+    liveCameraState: camerasLocked
+      ? cloneCameraState(currentCamera, 'Locked live-view session camera state')
+      : assertCameraState(
+        viewer.getViewCameraState('live'),
+        'Live-view session camera state'
+      ),
     snapshots
   };
   return assertMultiviewState(state, multiview);
@@ -284,11 +302,12 @@ export function capture(ctx) {
   assertBoolean(camerasLocked, 'Core-state camerasLocked');
   const ui = createUiControlSerializer({ sidebar });
   const filters = createFilterSerializer({ state });
+  const camera = cloneCameraState(
+    viewer.getCameraState(),
+    'Session camera state'
+  );
   const payload = {
-    camera: assertCameraState(
-      viewer.getCameraState(),
-      'Session camera state'
-    ),
+    camera,
     liveDimensionLevel: assertDimensionLevel(
       state.getViewDimensionLevel('live'),
       'Core-state live dimension'
@@ -299,7 +318,8 @@ export function capture(ctx) {
     multiview: serializeMultiviewDescriptors({
       state,
       viewer,
-      camerasLocked
+      camerasLocked,
+      currentCamera: camera
     })
   };
   assertCorePayload(state, payload);
@@ -394,7 +414,7 @@ function syncDomainControls(state, viewer, dom) {
   dom.planarControls.style.display = camera.navigationMode === 'planar' ? 'block' : 'none';
 }
 
-export async function restore(ctx, _chunkMeta, payload) {
+async function applyCorePayload(ctx, payload, signalOverride) {
   const { state, viewer, sidebar } = getOwners(ctx, 'restore');
   for (const method of [
     'setDimensionLevel',
@@ -415,7 +435,7 @@ export async function restore(ctx, _chunkMeta, payload) {
   ]) {
     requireMethod(viewer, method, 'Core-state restore viewer');
   }
-  const signal = assertAbortSignal(ctx.abortSignal);
+  const signal = assertAbortSignal(signalOverride);
   const ui = createUiControlSerializer({ sidebar });
   const filters = createFilterSerializer({ state });
   const dom = requireRestoreDom();
@@ -469,4 +489,67 @@ export async function restore(ctx, _chunkMeta, payload) {
   state._notifyVisibilityChange();
   state.updateFilteredCount();
   state.updateFilterSummary();
+}
+
+function getFieldOverlayRollbackDependency(restoreTransaction) {
+  let dependency;
+  try {
+    dependency = restoreTransaction.get('field-overlays/state');
+  } catch (error) {
+    if (error instanceof RangeError) return null;
+    throw error;
+  }
+  if (
+    dependency === null
+    || typeof dependency !== 'object'
+    || typeof dependency.rollback !== 'function'
+  ) {
+    throw new TypeError(
+      'Core-state rollback requires the field-overlay rollback owner.'
+    );
+  }
+  return dependency.rollback;
+}
+
+export async function restore(ctx, _chunkMeta, payload) {
+  const { state } = getOwners(ctx, 'restore');
+  assertCorePayload(state, payload);
+  const signal = assertAbortSignal(ctx.abortSignal);
+  const restoreTransaction = ctx.restoreTransaction;
+  if (
+    restoreTransaction === null
+    || typeof restoreTransaction !== 'object'
+  ) {
+    await applyCorePayload(ctx, payload, signal);
+    return;
+  }
+  requireMethod(
+    restoreTransaction,
+    'register',
+    'Core-state restore transaction'
+  );
+
+  const sharedSnapshot = getSessionRestoreSnapshot(ctx, 'core/state');
+  const previousPayload = sharedSnapshot === undefined
+    ? capture(ctx)[0].payload
+    : structuredClone(sharedSnapshot);
+  const rollbackFieldOverlay =
+    getFieldOverlayRollbackDependency(restoreTransaction);
+  let applied = false;
+  restoreTransaction.register('core-state/state', {
+    value: payload,
+    prepare() {},
+    commit() {},
+    async rollback() {
+      if (!applied) return;
+      if (rollbackFieldOverlay !== null) {
+        await rollbackFieldOverlay();
+      }
+      await applyCorePayload(ctx, previousPayload, null);
+      applied = false;
+    }
+  });
+
+  applied = true;
+  await applyCorePayload(ctx, payload, signal);
 }

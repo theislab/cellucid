@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import {
+  buildDensityVolumeGPU,
+} from '../assets/js/rendering/smoke-cloud/smoke-density.js';
 import { SmokeRenderer } from '../assets/js/rendering/smoke-cloud/smoke-renderer.js';
 
 function createFakeGl() {
@@ -200,6 +203,47 @@ test('smoke volume validation and upload failures preserve the published volume'
   assert.equal(gl._state.textures.size, 1);
   assert.equal(gl._state.texture3dBinding, null);
   assert.equal(gl._state.unpackAlignment, 4);
+});
+
+test('clearing smoke volume releases the exact texture and is idempotent', () => {
+  const gl = createFakeGl();
+  const renderer = createRendererState(gl);
+  const existing = gl.createTexture();
+  renderer.textureInfo = { texture: existing, gridSize: 8, is3D: true };
+  gl.bindTexture(gl.TEXTURE_3D, existing);
+
+  renderer.clearVolume();
+
+  assert.equal(renderer.textureInfo, null);
+  assert.equal(gl._state.textures.has(existing), false);
+  assert.deepEqual(gl._state.deletedTextures, [existing]);
+  assert.equal(gl._state.texture3dBinding, null);
+
+  renderer.clearVolume();
+  assert.deepEqual(gl._state.deletedTextures, [existing]);
+});
+
+test('float smoke accumulation explicitly requires both WebGL extensions', () => {
+  const requestedExtensions = [];
+  const gl = {
+    getExtension(name) {
+      requestedExtensions.push(name);
+      return name === 'EXT_color_buffer_float' ? {} : null;
+    },
+  };
+
+  assert.throws(
+    () => buildDensityVolumeGPU(
+      gl,
+      new Float32Array([0, 0, 0]),
+      { gridSize: 8 },
+    ),
+    /requires EXT_float_blend/,
+  );
+  assert.deepEqual(requestedExtensions, [
+    'EXT_color_buffer_float',
+    'EXT_float_blend',
+  ]);
 });
 
 test('smoke render-target replacement is atomic on incomplete or failed GPU state', () => {

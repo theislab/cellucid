@@ -222,6 +222,8 @@ export class DataLayer {
     this._bulkGeneCacheMaxAge = bulkCacheMaxAge;
     this._bulkGeneCacheMaxSize = bulkCacheMaxSize;
     this._bulkGeneCacheAccessOrder = [];
+    this._bulkGeneCacheGeneration = 0;
+    this._bulkGeneCacheReplacementOwner = null;
 
     // Page version tracking for cache correctness
     this._pageVersions = enableVersionTracking ? new Map() : null;
@@ -1560,6 +1562,60 @@ export class DataLayer {
   // ===========================================================================
 
   /**
+   * Replace the bulk session cache transactionally without copying retained
+   * scientific arrays. Rollback restores the exact prior Map and LRU order
+   * identities; a successful transaction releases them with its owner.
+   *
+   * @returns {Readonly<{commit: () => void, rollback: () => void}>}
+   */
+  beginSessionCacheReplacement() {
+    if (this._bulkGeneCacheReplacementOwner !== null) {
+      throw new Error(
+        'A session cache replacement is already active.'
+      );
+    }
+    const previousCache = this._bulkGeneCache;
+    const previousAccessOrder = this._bulkGeneCacheAccessOrder;
+    const replacementOwner = {};
+    this._bulkGeneCacheReplacementOwner = replacementOwner;
+    this._bulkGeneCacheGeneration += 1;
+    this._bulkGeneCache = new Map();
+    this._bulkGeneCacheAccessOrder = [];
+    let committed = false;
+    let rolledBack = false;
+
+    return Object.freeze({
+      commit: () => {
+        if (committed || rolledBack) return;
+        if (this._bulkGeneCacheReplacementOwner !== replacementOwner) {
+          throw new Error(
+            'Session cache replacement ownership changed before commit.'
+          );
+        }
+        this._bulkGeneCacheReplacementOwner = null;
+        this._bulkGeneCacheGeneration += 1;
+        committed = true;
+      },
+      rollback: () => {
+        if (rolledBack) return;
+        if (
+          this._bulkGeneCacheReplacementOwner !== null
+          && this._bulkGeneCacheReplacementOwner !== replacementOwner
+        ) {
+          throw new Error(
+            'Session cache replacement cannot roll back across a newer owner.'
+          );
+        }
+        this._bulkGeneCache = previousCache;
+        this._bulkGeneCacheAccessOrder = previousAccessOrder;
+        this._bulkGeneCacheReplacementOwner = null;
+        this._bulkGeneCacheGeneration += 1;
+        rolledBack = true;
+      }
+    });
+  }
+
+  /**
    * Export portable analysis caches for inclusion in a session bundle.
    *
    * IMPORTANT:
@@ -1709,6 +1765,7 @@ export class DataLayer {
    */
   async fetchBulkGeneExpression(options) {
     const { pageIds, geneList = null, forceReload = false, onProgress } = options;
+    const cacheGeneration = this._bulkGeneCacheGeneration;
 
     if (!pageIds || pageIds.length === 0) {
       return {};
@@ -1806,11 +1863,16 @@ export class DataLayer {
         await new Promise(resolve => setTimeout(resolve, 0));
       }
 
-      this._setBulkGeneCache(cacheKey, {
-        data: results,
-        timestamp: Date.now(),
-        geneCount: genesToFetch.length
-      });
+      if (
+        this._bulkGeneCacheReplacementOwner === null
+        && this._bulkGeneCacheGeneration === cacheGeneration
+      ) {
+        this._setBulkGeneCache(cacheKey, {
+          data: results,
+          timestamp: Date.now(),
+          geneCount: genesToFetch.length
+        });
+      }
 
       const duration = performance.now() - startTime;
       if (this._notifications && notificationId) {

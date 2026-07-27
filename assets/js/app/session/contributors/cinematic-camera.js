@@ -8,11 +8,14 @@
  * @module session/contributors/cinematic-camera
  */
 
-import { assertCameraPathSessionState } from '../../ui/modules/cinematic-camera/index.js';
+import {
+  assertCameraPathPlaybackSnapshot,
+  assertCameraPathSessionState
+} from '../../ui/modules/cinematic-camera/index.js';
 import { requireMethod } from '../schema-contract.js';
 
 export const id = 'cinematic-camera';
-const AUTOPLAY_PARTICIPANT_ID = 'cinematic-camera/autoplay';
+const CAMERA_STATE_PARTICIPANT_ID = 'cinematic-camera/state';
 
 /**
  * Capture cinematic camera keyframes and path state.
@@ -27,7 +30,6 @@ export function capture(ctx) {
   requireMethod(cam, 'exportSessionState', 'Cinematic camera capture owner');
 
   const data = assertCameraPathSessionState(cam.exportSessionState());
-  if (data.keyframes.length === 0) return [];
 
   return [
     {
@@ -56,40 +58,77 @@ export function restore(ctx, _chunkMeta, payload) {
   const cam = ctx.cinematicCamera;
   requireMethod(cam, 'restoreSessionState', 'Cinematic camera restore owner');
   const data = assertCameraPathSessionState(payload);
+  const transaction = ctx.restoreTransaction;
 
-  if (data.autoplay) {
-    const transaction = ctx.restoreTransaction;
-    if (transaction === null || typeof transaction !== 'object') {
+  if (transaction === null || typeof transaction !== 'object') {
+    if (data.autoplay) {
       throw new TypeError(
         'Cinematic camera autoplay restore requires the session restore transaction.'
       );
     }
-    requireMethod(
-      transaction,
-      'register',
-      'Cinematic camera autoplay transaction'
-    );
-    requireMethod(cam, 'startAutoplay', 'Cinematic camera autoplay owner');
-    requireMethod(cam, 'stopAutoplay', 'Cinematic camera autoplay owner');
-
-    let started = false;
-    transaction.register(AUTOPLAY_PARTICIPANT_ID, {
-      value: data.autoplay,
-      prepare() {},
-      commit() {
-        const result = cam.startAutoplay();
-        if (typeof result !== 'boolean') {
-          throw new TypeError(
-            'Cinematic camera autoplay owner must report a boolean start result.'
-          );
-        }
-        started = result;
-      },
-      rollback() {
-        if (started) cam.stopAutoplay();
-      }
-    });
+    cam.restoreSessionState(data);
+    return;
   }
 
+  requireMethod(
+    transaction,
+    'register',
+    'Cinematic camera state transaction'
+  );
+  requireMethod(cam, 'exportSessionState', 'Cinematic camera rollback owner');
+  requireMethod(
+    cam,
+    'capturePlaybackSnapshot',
+    'Cinematic camera rollback owner'
+  );
+  requireMethod(
+    cam,
+    'restorePlaybackSnapshot',
+    'Cinematic camera rollback owner'
+  );
+  requireMethod(
+    cam,
+    'getNavigationMode',
+    'Cinematic camera transaction owner'
+  );
+  requireMethod(cam, 'startAutoplay', 'Cinematic camera autoplay owner');
+  requireMethod(cam, 'stopAutoplay', 'Cinematic camera autoplay owner');
+  const previousState = structuredClone(
+    assertCameraPathSessionState(cam.exportSessionState())
+  );
+  const previousPlaybackSnapshot = structuredClone(
+    assertCameraPathPlaybackSnapshot(cam.capturePlaybackSnapshot())
+  );
+  let applied = false;
+  let targetAutoplayStarted = false;
+  transaction.register(CAMERA_STATE_PARTICIPANT_ID, {
+    value: data,
+    prepare() {
+      if (cam.getNavigationMode() !== data.navigationMode) {
+        throw new TypeError(
+          'Cinematic camera navigation mode must match the restored core camera mode.'
+        );
+      }
+    },
+    commit() {
+      if (!data.autoplay) return;
+      const result = cam.startAutoplay();
+      if (typeof result !== 'boolean') {
+        throw new TypeError(
+          'Cinematic camera autoplay owner must report a boolean start result.'
+        );
+      }
+      targetAutoplayStarted = result;
+    },
+    rollback() {
+      if (!applied) return;
+      if (targetAutoplayStarted) cam.stopAutoplay();
+      cam.restoreSessionState(previousState);
+      cam.restorePlaybackSnapshot(previousPlaybackSnapshot);
+      applied = false;
+    }
+  });
+
+  applied = true;
   cam.restoreSessionState(data);
 }

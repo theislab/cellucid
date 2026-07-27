@@ -1,13 +1,21 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
+import {
+  mkdtemp,
+  mkdir,
+  readFile,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import test from 'node:test';
 
 import {
   assertPortableAssetPath,
   buildWebAssetInventory,
   contentTypeForAssetPath,
+  isDirectModuleInvocation,
   serializeWebAssetInventory,
 } from '../scripts/generate-web-asset-inventory.mjs';
 
@@ -65,6 +73,10 @@ test('web inventory MIME types are explicit and never guessed', () => {
   assert.equal(
     contentTypeForAssetPath('assets/fonts/app.woff2'),
     'font/woff2'
+  );
+  assert.equal(
+    contentTypeForAssetPath('assets/img/favicon.ico'),
+    'image/vnd.microsoft.icon'
   );
   assert.equal(
     contentTypeForAssetPath('site.webmanifest'),
@@ -169,3 +181,25 @@ test('web inventory binds exact bytes to the single index build id', async () =>
 
   assert.ok((await readFile(join(rootDir, 'assets', 'js', 'app.js'))).length > 0);
 });
+
+test(
+  'inventory CLI identity resolves an equivalent symlinked script path',
+  { skip: process.platform === 'win32' },
+  async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), 'cellucid-inventory-cli-'));
+    const realDir = join(rootDir, 'real');
+    const aliasDir = join(rootDir, 'alias');
+    await mkdir(realDir);
+    const modulePath = join(realDir, 'inventory.mjs');
+    await writeFile(modulePath, 'export {};\n');
+    await symlink(realDir, aliasDir, 'dir');
+
+    assert.equal(
+      await isDirectModuleInvocation({
+        argvPath: join(aliasDir, 'inventory.mjs'),
+        moduleUrl: pathToFileURL(modulePath).href,
+      }),
+      true
+    );
+  }
+);

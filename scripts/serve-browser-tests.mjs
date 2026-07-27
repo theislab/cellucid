@@ -50,7 +50,7 @@ const contentTypes = new Map([
   ['.h5ad', 'application/x-hdf5'],
   ['.htm', 'text/html; charset=utf-8'],
   ['.html', 'text/html; charset=utf-8'],
-  ['.ico', 'image/x-icon'],
+  ['.ico', 'image/vnd.microsoft.icon'],
   ['.jpeg', 'image/jpeg'],
   ['.jpg', 'image/jpeg'],
   ['.js', 'text/javascript; charset=utf-8'],

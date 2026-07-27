@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process';
 import {
   lstat,
   readFile,
+  realpath,
   rename,
   unlink,
   writeFile,
@@ -27,7 +28,7 @@ const MIME_BY_EXTENSION = Object.freeze({
   '.css': 'text/css; charset=utf-8',
   '.glb': 'model/gltf-binary',
   '.html': 'text/html; charset=utf-8',
-  '.ico': 'image/x-icon',
+  '.ico': 'image/vnd.microsoft.icon',
   '.jpeg': 'image/jpeg',
   '.jpg': 'image/jpeg',
   '.js': 'application/javascript; charset=utf-8',
@@ -265,9 +266,23 @@ async function runCli() {
   await writeInventoryAtomically(outputPath, bytes);
 }
 
-const invokedPath = process.argv[1] === undefined
-  ? null
-  : resolve(process.argv[1]);
-if (invokedPath === fileURLToPath(import.meta.url)) {
+export async function isDirectModuleInvocation({
+  argvPath,
+  moduleUrl,
+}) {
+  if (argvPath === undefined) {
+    return false;
+  }
+  const [invokedPath, modulePath] = await Promise.all([
+    realpath(argvPath),
+    realpath(fileURLToPath(moduleUrl)),
+  ]);
+  return invokedPath === modulePath;
+}
+
+if (await isDirectModuleInvocation({
+  argvPath: process.argv[1],
+  moduleUrl: import.meta.url,
+})) {
   await runCli();
 }

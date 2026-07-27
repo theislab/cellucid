@@ -7,8 +7,8 @@
  *  3) manifest JSON bytes (UTF-8)
  *  4) repeated chunks: [chunkByteLength (u32 LE), chunkBytes...]
  *
- * IMPORTANT (dev-phase constraints from session-serializer-plan.md):
- * - No version fields and no migration logic.
+ * Current format constraints:
+ * - No version, compatibility, or migration fields.
  * - Treat session files as untrusted input; enforce strict bounds.
  *
  * @module session/bundle/format
@@ -25,7 +25,6 @@ export const U32_BYTES = 4;
 
 /**
  * Hard cap for manifest size to avoid pathological allocations on corrupt input.
- * The plan recommends 8–16MB; choose 16MB for dev-phase flexibility.
  */
 export const MAX_MANIFEST_BYTES = 16 * 1024 * 1024;
 

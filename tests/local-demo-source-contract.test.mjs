@@ -172,6 +172,85 @@ test('demo catalog resolves only explicitly declared dataset paths', () => {
   );
 });
 
+test('demo catalog opts into one exact per-dataset state manifest', () => {
+  const source = sourceWithManifest(
+    manifest({
+      datasets: [
+        {
+          id: 'first',
+          path: 'first/',
+          name: 'First',
+          state_manifest: 'state-snapshots.json',
+          state_sha256: 'a'.repeat(64),
+        },
+        { id: 'second', path: 'second/', name: 'Second' },
+      ],
+    })
+  );
+  assert.deepEqual(
+    source.getStateDescriptor('first'),
+    {
+      manifestUrl:
+        'https://catalog.cellucid.test/exports/first/state-snapshots.json',
+      stateSha256: 'a'.repeat(64),
+    },
+  );
+  assert.equal(source.getStateDescriptor('second'), null);
+
+  const manager = createDataSourceManager();
+  manager.activeSource = source;
+  manager.activeDatasetId = 'first';
+  manager.activeIdentityId = 'first-generation';
+  assert.deepEqual(
+    manager.getCurrentStateDescriptor(),
+    {
+      baseUrl: 'https://catalog.cellucid.test/exports/first/',
+      datasetId: 'first',
+      identityId: 'first-generation',
+      manifestUrl:
+        'https://catalog.cellucid.test/exports/first/state-snapshots.json',
+      selectionRevision: 0,
+      sourceType: 'local-demo',
+      stateSha256: 'a'.repeat(64),
+    },
+  );
+  manager.activeDatasetId = 'second';
+  manager.activeIdentityId = 'second-generation';
+  assert.equal(manager.getCurrentStateDescriptor(), null);
+
+  for (const [stateManifest, stateSha256] of [
+    ['states.json', 'a'.repeat(64)],
+    ['../state-snapshots.json', 'a'.repeat(64)],
+    ['/state-snapshots.json', 'a'.repeat(64)],
+    [' state-snapshots.json', 'a'.repeat(64)],
+    ['state-snapshots.json', 'A'.repeat(64)],
+    ['state-snapshots.json', 'short'],
+    ['state-snapshots.json', undefined],
+    [undefined, 'a'.repeat(64)],
+  ]) {
+    const entry = {
+      id: 'first',
+      path: 'first/',
+    };
+    if (stateManifest !== undefined) {
+      entry.state_manifest = stateManifest;
+    }
+    if (stateSha256 !== undefined) {
+      entry.state_sha256 = stateSha256;
+    }
+    const invalid = sourceWithManifest(
+      manifest({
+        datasets: [entry],
+        default: 'first',
+      })
+    );
+    assert.throws(
+      () => invalid.getStateDescriptor('first'),
+      /state_manifest|state_sha256|state-snapshots\.json|sha-256/i
+    );
+  }
+});
+
 test('demo catalog rejects incomplete identities and count contradictions', async t => {
   await t.test('identity required fields cannot be defaulted', async t => {
     const source = sourceWithManifest(
@@ -614,9 +693,18 @@ test('an explicit empty bootstrap never adopts a synthetic zero-point scene', as
   const uiStart = mainSource.indexOf('ui = initUI({', sceneEnd);
   const uiEnd = mainSource.indexOf('// Setup connectivity controls', uiStart);
   assert.ok(uiStart >= 0 && uiEnd > uiStart);
+  const initialUiSource = mainSource.slice(uiStart, uiEnd);
   assert.match(
-    mainSource.slice(uiStart, uiEnd),
-    /if \(hasInitialDataset\) \{\s*synchronizePublishedDatasetUi\([\s\S]*initialPublication\s*\);\s*await ui\.activateField\(-1\);\s*\}/
+    selectionBootstrap,
+    /const initialReloadTransaction = hasInitialDataset[\s\S]*datasetReloadCoordinator\.begin\(\)/
+  );
+  assert.match(
+    initialUiSource,
+    /if \(hasInitialDataset\) \{[\s\S]*initialReloadTransaction\.isCurrent\(\)[\s\S]*synchronizePublishedDatasetUi\([\s\S]*initialPublication[\s\S]*await ui\.activateField\(-1\);[\s\S]*restoreAdvertisedDatasetState\(\{[\s\S]*initialReloadTransaction\.signal[\s\S]*settleInitialPublishedDatasetStateOutcome\(\{[\s\S]*cancel:\s*\(\) => cancelDataLoad\(initialLoadToken\)[\s\S]*complete:\s*\(\) => completeDataLoadSuccess\([\s\S]*currentDatasetLoadToken = null/
+  );
+  assert.doesNotMatch(
+    initialUiSource,
+    /completeDataLoadSuccess\(currentDatasetLoadToken/
   );
 });
 

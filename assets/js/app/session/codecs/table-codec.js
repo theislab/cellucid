@@ -5,7 +5,7 @@
  * - a small JSON header describing columns + byte lengths
  * - a binary payload containing columnar data blocks
  *
- * Supported column encodings (dev-phase):
+ * Supported current column encodings:
  * - numeric typed arrays (little-endian)
  * - boolean bitset
  * - string dictionary + Uint32 codes

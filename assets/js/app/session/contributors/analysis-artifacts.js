@@ -28,6 +28,17 @@ import {
 export const id = 'analysis-artifacts';
 
 const CHUNK_PREFIX = 'analysis/artifacts/bulk-gene/';
+const RESTORE_PARTICIPANT_ID = 'analysis-artifacts/cache';
+export const ANALYSIS_CACHE_INVENTORY_CHUNK_PROFILE = Object.freeze({
+  id: 'analysis/cache-inventory',
+  contributorId: id,
+  priority: 'eager',
+  kind: 'json',
+  codec: 'gzip',
+  label: 'Analysis cache inventory',
+  datasetDependent: true
+});
+const INVENTORY_PAYLOAD_KEYS = Object.freeze(['artifactIds']);
 const ARTIFACT_KEYS = Object.freeze([
   'kind',
   'cacheKey',
@@ -81,6 +92,114 @@ function requireDataLayer(ctx, methodName) {
   }
   requireMethod(dataLayer, methodName, 'Analysis artifact dataLayer');
   return dataLayer;
+}
+
+function registerCacheReplacementInventory(ctx, dataLayer, artifactIds) {
+  const transaction = ctx.restoreTransaction;
+  if (transaction === null || typeof transaction !== 'object') {
+    throw new TypeError(
+      'Analysis cache inventory restore requires the current restore transaction.'
+    );
+  }
+  requireMethod(
+    transaction,
+    'get',
+    'Analysis artifact restore transaction'
+  );
+  requireMethod(
+    transaction,
+    'register',
+    'Analysis artifact restore transaction'
+  );
+  try {
+    transaction.get(RESTORE_PARTICIPANT_ID);
+    throw new TypeError(
+      'Analysis cache inventory may appear exactly once in a session.'
+    );
+  } catch (error) {
+    if (!(error instanceof RangeError)) throw error;
+  }
+
+  requireMethod(
+    dataLayer,
+    'beginSessionCacheReplacement',
+    'Analysis artifact cache replacement owner'
+  );
+  const replacement = dataLayer.beginSessionCacheReplacement();
+  requireMethod(
+    replacement,
+    'commit',
+    'Analysis artifact cache replacement'
+  );
+  requireMethod(
+    replacement,
+    'rollback',
+    'Analysis artifact cache replacement'
+  );
+  let nextArtifactIndex = 0;
+  const tracker = Object.freeze({
+    importArtifact(chunkId, artifact) {
+      const expectedId = artifactIds[nextArtifactIndex];
+      if (expectedId === undefined) {
+        throw new RangeError(
+          `Analysis artifact chunk "${chunkId}" exceeds the advertised cache inventory.`
+        );
+      }
+      if (chunkId !== expectedId) {
+        throw new TypeError(
+          `Analysis artifact chunk "${chunkId}" does not match advertised ` +
+          `cache inventory entry "${expectedId}".`
+        );
+      }
+      const imported = dataLayer.importSessionCache(artifact);
+      if (imported !== 1) {
+        throw new Error(
+          'Analysis dataLayer importSessionCache() must apply exactly one artifact.'
+        );
+      }
+      nextArtifactIndex += 1;
+    }
+  });
+  transaction.register(RESTORE_PARTICIPANT_ID, {
+    value: tracker,
+    prepare() {
+      if (nextArtifactIndex !== artifactIds.length) {
+        throw new RangeError(
+          `Analysis cache inventory advertised ${artifactIds.length} artifacts ` +
+          `but restored ${nextArtifactIndex}.`
+        );
+      }
+    },
+    commit() {
+      replacement.commit();
+    },
+    rollback() {
+      replacement.rollback();
+    }
+  });
+}
+
+function getCacheReplacementTracker(ctx) {
+  const transaction = ctx.restoreTransaction;
+  if (transaction === null || typeof transaction !== 'object') return null;
+  requireMethod(
+    transaction,
+    'get',
+    'Analysis artifact restore transaction'
+  );
+  let tracker;
+  try {
+    tracker = transaction.get(RESTORE_PARTICIPANT_ID);
+  } catch (error) {
+    if (error instanceof RangeError) {
+      throw new TypeError(
+        'Analysis artifact chunks require the prior analysis cache inventory.'
+      );
+    }
+    throw error;
+  }
+  requireMethod(tracker, 'importArtifact', 'Analysis cache inventory tracker');
+  return tracker;
 }
 
 function assertArtifactMetadata(value, context) {
@@ -193,6 +312,66 @@ function parseChunkIdentity(chunkId) {
     throw new TypeError('Analysis artifact chunk id must be canonical.');
   }
   return { cacheKey, gene, pageId };
+}
+
+function assertInventoryPayload(value) {
+  assertExactKeys(
+    value,
+    INVENTORY_PAYLOAD_KEYS,
+    'Analysis cache inventory payload'
+  );
+  const artifactIds = assertArray(
+    value.artifactIds,
+    'Analysis cache inventory artifactIds'
+  );
+  const identities = [];
+  const seen = new Set();
+  for (let index = 0; index < artifactIds.length; index++) {
+    const chunkId = assertNonEmptyString(
+      artifactIds[index],
+      `Analysis cache inventory artifactIds ${index}`
+    );
+    parseChunkIdentity(chunkId);
+    if (seen.has(chunkId)) {
+      throw new TypeError(
+        `Analysis cache inventory artifact id "${chunkId}" is duplicated.`
+      );
+    }
+    seen.add(chunkId);
+    identities.push(chunkId);
+  }
+  return identities;
+}
+
+function assertInventoryChunkMeta(chunkMeta, payload) {
+  assertExactKeys(
+    chunkMeta,
+    CHUNK_META_KEYS,
+    'Analysis cache inventory chunk metadata'
+  );
+  for (const [key, expected] of Object.entries(
+    ANALYSIS_CACHE_INVENTORY_CHUNK_PROFILE
+  )) {
+    if (chunkMeta[key] !== expected) {
+      throw new TypeError(
+        'Analysis cache inventory chunk metadata must match its exact profile.'
+      );
+    }
+  }
+  assertSafeInteger(
+    chunkMeta.storedBytes,
+    'Analysis cache inventory storedBytes'
+  );
+  const uncompressedBytes = assertSafeInteger(
+    chunkMeta.uncompressedBytes,
+    'Analysis cache inventory uncompressedBytes'
+  );
+  const canonicalBytes = new TextEncoder().encode(JSON.stringify(payload));
+  if (uncompressedBytes !== canonicalBytes.byteLength) {
+    throw new RangeError(
+      'Analysis cache inventory payload length must equal metadata uncompressedBytes.'
+    );
+  }
 }
 
 function metadataFromArtifact(artifact) {
@@ -382,7 +561,12 @@ export function capture(ctx) {
       payload: encodeArtifactPayload(artifact)
     });
   }
-  return chunks;
+  return [{
+    ...ANALYSIS_CACHE_INVENTORY_CHUNK_PROFILE,
+    payload: {
+      artifactIds: chunks.map(chunk => chunk.id)
+    }
+  }, ...chunks];
 }
 
 /**
@@ -393,6 +577,23 @@ export function capture(ctx) {
  * @param {Uint8Array} payload
  */
 export function restore(ctx, chunkMeta, payload) {
+  assertPlainRecord(chunkMeta, 'Analysis artifact restore chunk metadata');
+  if (chunkMeta.id === ANALYSIS_CACHE_INVENTORY_CHUNK_PROFILE.id) {
+    const artifactIds = assertInventoryPayload(payload);
+    assertInventoryChunkMeta(chunkMeta, { artifactIds });
+    const dataLayer = requireDataLayer(
+      ctx,
+      'beginSessionCacheReplacement'
+    );
+    requireMethod(
+      dataLayer,
+      'importSessionCache',
+      'Analysis artifact dataLayer'
+    );
+    registerCacheReplacementInventory(ctx, dataLayer, artifactIds);
+    return;
+  }
+
   const dataLayer = requireDataLayer(ctx, 'importSessionCache');
   if (!(payload instanceof Uint8Array)) {
     throw new TypeError('Analysis artifact payload must be a Uint8Array.');
@@ -411,8 +612,16 @@ export function restore(ctx, chunkMeta, payload) {
   if (chunkMeta.label !== expectedLabel) {
     throw new TypeError('Analysis artifact chunk label must match its exact payload identity.');
   }
-  const imported = dataLayer.importSessionCache(artifact);
-  if (imported !== 1) {
-    throw new Error('Analysis dataLayer importSessionCache() must apply exactly one artifact.');
+
+  const tracker = getCacheReplacementTracker(ctx);
+  if (tracker === null) {
+    const imported = dataLayer.importSessionCache(artifact);
+    if (imported !== 1) {
+      throw new Error(
+        'Analysis dataLayer importSessionCache() must apply exactly one artifact.'
+      );
+    }
+  } else {
+    tracker.importArtifact(chunkId, artifact);
   }
 }

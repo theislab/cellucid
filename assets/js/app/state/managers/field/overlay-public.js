@@ -407,6 +407,7 @@ export class FieldOverlayPublicMethods {
 
     const originalFieldKey = requireOriginalKey(field);
     const originalLabel = field._originalCategories[categoryIndex];
+    const previousCategories = [...field.categories];
     StateValidator.validateCategoryLabel(originalLabel);
 
     if (newLabel === originalLabel) {
@@ -442,7 +443,7 @@ export class FieldOverlayPublicMethods {
     }
 
     // Keep centroid labels consistent with the category list.
-    this._syncCentroidCategoryLabelAtIndex(field, categoryIndex);
+    this._syncCentroidCategoryLabels(field, previousCategories);
     this._refreshHighlightGroupsForField(src, fieldIndex);
 
     // If this field is currently active, push centroid label updates.

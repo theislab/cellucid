@@ -777,6 +777,7 @@ async function withSessionNotificationHarness(run) {
   const notifications = getNotificationCenter();
   const methodNames = [
     'completeDownload',
+    'dismissDownload',
     'failDownload',
     'info',
     'startDownload',
@@ -789,6 +790,7 @@ async function withSessionNotificationHarness(run) {
   notifications.startDownload = () => 'session-test-download';
   notifications.updateDownload = () => {};
   notifications.completeDownload = () => {};
+  notifications.dismissDownload = () => {};
   notifications.failDownload = () => {};
   notifications.info = () => {};
   notifications.warning = () => {};

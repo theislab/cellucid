@@ -11,6 +11,10 @@
  * @module session/contributors/analysis-windows
  */
 
+import {
+  getSessionRestoreSnapshot
+} from '../session-context.js';
+
 export const id = 'analysis-windows';
 
 function isPlainObject(value) {
@@ -85,15 +89,51 @@ export function capture(ctx) {
  * @param {any} _chunkMeta
  * @param {{ windows: any[] }} payload
  */
+function applyWindows(manager, windows) {
+  manager.closeAll();
+  for (const descriptor of windows) {
+    manager.createFromSessionDescriptor(descriptor);
+  }
+}
+
 export function restore(ctx, _chunkMeta, payload) {
   const mgr = requireManager(
     ctx,
     ['closeAll', 'createFromSessionDescriptor']
   );
   const windows = requireRestorePayload(payload);
-
-  mgr.closeAll();
-  for (const descriptor of windows) {
-    mgr.createFromSessionDescriptor(descriptor);
+  const restoreTransaction = ctx?.restoreTransaction;
+  if (
+    restoreTransaction === null
+    || typeof restoreTransaction !== 'object'
+  ) {
+    applyWindows(mgr, windows);
+    return;
   }
+  if (typeof restoreTransaction.register !== 'function') {
+    throw new TypeError(
+      'Analysis-window restore transaction must implement register().'
+    );
+  }
+  const sharedSnapshot = getSessionRestoreSnapshot(
+    ctx,
+    'analysis/windows'
+  );
+  const previousWindows = sharedSnapshot === undefined
+    ? requireRestorePayload(capture(ctx)[0].payload)
+    : requireRestorePayload(structuredClone(sharedSnapshot));
+  let applied = false;
+  restoreTransaction.register('analysis-windows/state', {
+    value: windows,
+    prepare() {},
+    commit() {},
+    rollback() {
+      if (!applied) return;
+      applyWindows(mgr, previousWindows);
+      applied = false;
+    }
+  });
+
+  applied = true;
+  applyWindows(mgr, windows);
 }

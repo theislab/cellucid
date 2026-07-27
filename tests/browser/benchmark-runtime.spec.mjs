@@ -5,9 +5,30 @@ test('GLB benchmark publishes one complete state generation', async ({
   page
 }, testInfo) => {
   const browserErrors = [];
+  let benchmarkModulePublications = 0;
+  let publishBenchmarkModuleRequest;
+  const benchmarkModuleRequested = new Promise(resolve => {
+    publishBenchmarkModuleRequest = resolve;
+  });
+  let releaseBenchmarkModule;
+  const benchmarkModuleRelease = new Promise(resolve => {
+    releaseBenchmarkModule = resolve;
+  });
+
+  await page.addInitScript(() => {
+    localStorage.setItem('CELLUCID_DEBUG', 'true');
+  });
+  await page.route('**/assets/js/dev/benchmark.js', async route => {
+    publishBenchmarkModuleRequest();
+    await benchmarkModuleRelease;
+    await route.continue();
+  });
   page.on('console', message => {
     if (message.type() === 'error') {
       browserErrors.push(`console: ${message.text()}`);
+    }
+    if (message.text().includes('[Main] Benchmark module lazy-loaded')) {
+      benchmarkModulePublications++;
     }
   });
   page.on('pageerror', error => {
@@ -30,15 +51,20 @@ test('GLB benchmark publishes one complete state generation', async ({
 
   await page.locator('#benchmark-section > summary').click();
   await expect(page.locator('#benchmark-section')).toHaveAttribute('open', '');
+  await benchmarkModuleRequested;
   await page.locator('#benchmark-count').fill('1000');
   await page.locator('#benchmark-pattern').selectOption('glb');
   await page.locator('#benchmark-run').click();
+  releaseBenchmarkModule();
 
   await expect.poll(
     () => page.evaluate(() => window._cellucidState.pointCount)
   ).toBe(1000);
+  expect(benchmarkModulePublications).toBe(1);
   await expect(page.locator('#bench-points')).toHaveText('1K');
-  await expect(page.locator('#bench-fps')).not.toHaveText('-');
+  await expect.poll(async () => Number.parseFloat(
+    await page.locator('#bench-fps').textContent()
+  )).toBeGreaterThan(0);
 
   const publication = await page.evaluate(() => {
     const state = window._cellucidState;

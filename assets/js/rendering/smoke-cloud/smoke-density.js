@@ -137,6 +137,11 @@ export function buildDensityVolumeGPU(gl, positions, options = {}) {
       'GPU smoke density requires EXT_color_buffer_float for exact R32F accumulation.'
     );
   }
+  if (!gl.getExtension('EXT_float_blend')) {
+    throw new Error(
+      'GPU smoke density requires EXT_float_blend for exact R32F accumulation.'
+    );
+  }
   const pointCount = positions.length / 3;
   const halfExtent = 1.0;
 

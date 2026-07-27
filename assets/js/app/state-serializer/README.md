@@ -2,38 +2,45 @@
 
 This folder contains **small, feature-scoped helpers** used by Cellucid’s **Session Bundle** system (`cellucid/assets/js/app/session/`).
 
-It is **not** the save/load implementation by itself anymore:
+It is **not** the save/load orchestrator:
 - The **orchestrator** is `cellucid/assets/js/app/session/session-serializer.js`
 - Features persist state via small **contributors** under `cellucid/assets/js/app/session/contributors/`
 
-Dev-phase constraints:
-- Only the current state document is accepted; incompatible documents are
+Current constraints:
+- Only the one current state document is accepted; incompatible documents are
   rejected and the document carries no version field.
-- Remove old snapshot save/load code paths.
-- Sessions are treated as **untrusted input** (bounds checks + size guards).
+- The reader implements one exact current document shape and rejects every
+  other shape; restoration is always all-or-nothing.
+- Sessions are treated as **untrusted input** with exact profiles, bounds,
+  single-member gzip preflight, and transactional rollback.
 
 ---
 
 ## Big Picture
 
 A `.cellucid-session` is a single-file container with a manifest + length-prefixed chunks:
-- **Eager chunks**: restore “first pixels + UI-ready” quickly.
-- **Lazy chunks**: restore heavy artifacts in the background with NotificationCenter progress + cancel.
+- **Eager chunks** establish dependencies and UI-critical state first.
+- **Lazy chunks** carry heavier arrays and run with responsive yielding.
 
-The intent is:
-1) You see the correct view immediately (camera + layout + active field + filters),
-2) Then heavier artifacts converge in the background (highlights memberships, user-defined codes, analysis caches).
+Both classes belong to one awaited public operation. Success is emitted only
+after the complete inventory applies, every participant commits, and the final
+UI refresh succeeds. Any later failure rolls back earlier state.
 
 ---
 
 ## Explicit Session Loading
 
-Cellucid never discovers or restores session state during startup. A user saves
-and restores a `.cellucid-session` file through the **Save State** and
-**Load State** controls. Loading a session is the only action that may restore
-camera state or camera-path keyframes. Playback remains stopped unless the
-saved Camera Path explicitly enables Autoplay; enabled autoplay starts only
-after the complete session transaction commits.
+Ordinary user state is saved and restored through **Save State** and **Load
+State**. Separately, an official catalog generation may explicitly advertise
+one SHA-256-pinned five-chunk `default.cellucid-session`; Cellucid applies that
+bounded static view automatically after the scientific dataset is published.
+Other startup/data-source paths are not probed.
+
+Generic sessions always carry `cinematic/camera`, including an explicit empty
+path. Playback remains stopped unless the saved Camera Path explicitly enables
+Autoplay; enabled autoplay starts only after the complete transaction commits.
+Rollback restores the exact prior keyframes, nonzero timeline position,
+playing/paused/stopped state, and viewer camera.
 
 ---
 
@@ -43,7 +50,7 @@ This is the source-of-truth list of what the current session system persists.
 
 ### Core Visualization + UI (“first pixels + UI-ready”)
 
-Saved + restored eagerly:
+Scheduled eagerly:
 - **Camera state** (position/orbit target/navigation mode, etc.)
   - Locked cameras: one global camera state
   - Unlocked cameras: per-view camera states (live + each snapshot view)
@@ -89,12 +96,13 @@ This answers: “Do I keep ALL renamed/deleted things in Filtering/Coloring?” 
 ### Highlights
 
 Saved:
-- **Eager**: highlight pages + group metadata **without** memberships (so the UI structure appears immediately)
-- **Lazy**: highlight group memberships (cell index sets) as compact binary chunks
+- **Eager**: highlight pages + group metadata **without** memberships
+- **Lazy**: exactly one compact binary membership chunk per advertised group
 
 Restored:
-- Pages/groups appear immediately.
-- Memberships fill in progressively; highlight buffers recompute in a throttled way.
+- Metadata precedes membership arrays.
+- Terminal success waits for every membership and buffer refresh; a missing,
+  reordered, or invalid chunk rejects and rolls back the complete operation.
 
 ### User-Defined Categorical Codes
 
@@ -106,16 +114,21 @@ Saved:
 Restored:
 - Codes attach to the correct user-defined field by stable field id.
 - If the restored field is currently active, colors/centroids refresh automatically.
+- Exactly one codes chunk is required for every categorical overlay field.
+  Priority and within-priority order must exactly match the target active-field
+  dependency graph.
 
 ### Analysis Windows + Caches
 
 Saved:
 - **Eager**: open floating analysis windows (modeId + geometry + exportSettings)
-- **Lazy**: analysis caches/artifacts (dev-phase: DataLayer bulk gene cache)
+- **Eager**: one `analysis/cache-inventory`, including an empty artifact list
+- **Lazy**: DataLayer bulk-gene cache artifacts
 
 Restored:
-- Windows reopen quickly (settings only; results excluded).
-- Caches stream in later and accelerate subsequent analysis operations.
+- Windows and the exact declared cache inventory commit together.
+- Cache container ownership swaps without copying cell-scale arrays; in-flight
+  writers are generation-isolated so they cannot contaminate the replacement.
 
 ---
 
@@ -130,14 +143,27 @@ These are the chunk IDs you will see inside a `.cellucid-session` file:
 | `ui/dockable-layout` | eager | no | floating non-analysis panels geometry + open/closed |
 | `analysis/windows` | eager | yes | open analysis windows descriptors (settings + geometry) |
 | `highlights/meta` | eager | yes | highlight pages + group shells (no cellIndices) |
+| `analysis/cache-inventory` | eager | yes | exact ordered analysis-artifact ids, including an empty list |
+| `cinematic/camera` | eager | yes | exact Camera Path, settings, and explicit empty state |
 | `user-defined/codes/<fieldId>` | eager/lazy | yes | user-defined categorical codes (binary) |
 | `highlights/cells/<groupId>` | lazy | yes | highlight group membership indices (binary) |
-| `analysis/artifacts/*` | lazy | yes | analysis caches/artifacts (binary) |
+| `analysis/artifacts/bulk-gene/<cacheKey>` | lazy | yes | one cache artifact named by the eager inventory |
 
 Dataset mismatch behavior:
 - If the bundle’s dataset fingerprint does not match the currently loaded dataset:
-  - dataset-dependent chunks are skipped (highlights, codes, caches, core state)
-  - dataset-agnostic layout (floating panels) can still restore
+  - the complete restore rejects and rolls back
+  - no dataset-agnostic layout subset is salvaged
+
+Every manifest chunk has exactly `id`, `contributorId`, `priority`, `kind`,
+`codec`, `label`, `datasetDependent`, `storedBytes`, and
+`uncompressedBytes`. Every generic singleton above is mandatory; dynamic
+families are complete and ordered. Unknown, missing, duplicate, aliased,
+reordered, or dishonestly described chunks are rejected before success.
+
+The official published-default path is deliberately different. It accepts
+exactly the first five static gzip/JSON chunks through `highlights/meta`, in
+that order, only after catalog manifest and SHA-256 verification. It contains
+no cinematic/cache data and is not accepted by generic **Load State**.
 
 ---
 
@@ -243,11 +269,11 @@ The session system does **not** persist:
 
 ---
 
-## Recommended Additions (If You Want More Value)
+## Extension Rule
 
-High-value candidates that are currently NOT guaranteed to be serialized (unless already represented as sidebar controls with ids):
-- Selection/brush tool state (mode, operator, last selection scope) for true “continue where I left off”
-
-Rule of thumb:
-- Put small, UI-critical things in the eager `core/state` chunk.
-- Put potentially large/slow things in a dedicated lazy contributor chunk.
+A new persisted feature changes the only current format. Define its exact
+metadata/payload and owner transaction, encode empty replacement state, bound
+stored/decoded work, avoid cloning cell-scale arrays, and add causal success,
+late-failure, cancellation, supersession, rollback, ordering, and browser
+coverage. Update every current producer, consumer, fixture, and reference
+together; do not add a reader for an older shape.

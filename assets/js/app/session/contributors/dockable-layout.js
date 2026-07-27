@@ -18,6 +18,9 @@ import {
   assertSafeInteger,
   requireMethod
 } from '../schema-contract.js';
+import {
+  getSessionRestoreSnapshot
+} from '../session-context.js';
 
 export const id = 'dockable-layout';
 
@@ -161,7 +164,7 @@ export function capture(ctx) {
   }];
 }
 
-export function restore(ctx, _chunkMeta, payload) {
+function applyLayout(ctx, payload) {
   const dockable = getDockableOwner(ctx, 'restore');
   requireMethod(dockable, 'dock', 'Dockable layout restore owner');
   requireMethod(dockable, 'float', 'Dockable layout restore owner');
@@ -198,13 +201,39 @@ export function restore(ctx, _chunkMeta, payload) {
     candidates.push({ panel, details });
   }
 
-  for (const { panel, details } of candidates) {
-    if (details.classList.contains('accordion-floating')) {
-      dockable.dock(details);
-      if (details.classList.contains('accordion-floating')) {
-        throw new Error(`Dockable owner failed to dock current panel "${panel.id}".`);
-      }
+  const floatingRoot = dockable.floatingRoot;
+  if (
+    floatingRoot === null
+    || typeof floatingRoot !== 'object'
+    || typeof floatingRoot.querySelectorAll !== 'function'
+  ) {
+    throw new TypeError(
+      'Dockable layout restore requires the current floating root.'
+    );
+  }
+  for (
+    const candidate
+    of floatingRoot.querySelectorAll('details.accordion-section')
+  ) {
+    const details = assertDetailsElement(
+      candidate,
+      'Current floating accordion'
+    );
+    if (isExcluded(details)) continue;
+    if (!details.classList.contains('accordion-floating')) {
+      throw new TypeError(
+        'Every accordion in the floating root must be marked floating.'
+      );
     }
+    dockable.dock(details);
+    if (details.classList.contains('accordion-floating')) {
+      throw new Error(
+        `Dockable owner failed to dock current panel "${details.id}".`
+      );
+    }
+  }
+
+  for (const { panel, details } of candidates) {
     dockable.float(details, {
       left: panel.rect.left,
       top: panel.rect.top,
@@ -219,4 +248,41 @@ export function restore(ctx, _chunkMeta, payload) {
     details.open = panel.open;
     StyleManager.setLayer(details, panel.z);
   }
+}
+
+export function restore(ctx, _chunkMeta, payload) {
+  const restoreTransaction = ctx?.restoreTransaction;
+  if (
+    restoreTransaction === null
+    || typeof restoreTransaction !== 'object'
+  ) {
+    applyLayout(ctx, payload);
+    return;
+  }
+  requireMethod(
+    restoreTransaction,
+    'register',
+    'Dockable layout restore transaction'
+  );
+  const sharedSnapshot = getSessionRestoreSnapshot(
+    ctx,
+    'ui/dockable-layout'
+  );
+  const previousPayload = sharedSnapshot === undefined
+    ? capture(ctx)[0].payload
+    : structuredClone(sharedSnapshot);
+  let applied = false;
+  restoreTransaction.register('dockable-layout/state', {
+    value: payload,
+    prepare() {},
+    commit() {},
+    rollback() {
+      if (!applied) return;
+      applyLayout(ctx, previousPayload);
+      applied = false;
+    }
+  });
+
+  applied = true;
+  applyLayout(ctx, payload);
 }

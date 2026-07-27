@@ -20,6 +20,26 @@ import {
   assertPlainRecord
 } from '../schema-contract.js';
 
+const COOPERATIVE_DECODE_BUDGET = 64 * 1024;
+
+function throwIfAborted(signal) {
+  if (signal !== null && signal.aborted) {
+    throw signal.reason ?? new DOMException('Aborted', 'AbortError');
+  }
+}
+
+function yieldToMacrotask() {
+  return new Promise(resolve => {
+    const channel = new MessageChannel();
+    channel.port1.onmessage = () => {
+      channel.port1.close();
+      channel.port2.close();
+      resolve();
+    };
+    channel.port2.postMessage(null);
+  });
+}
+
 /**
  * Ensure indices are a sorted Uint32Array.
  * @param {ArrayLike<number>} indices
@@ -81,9 +101,9 @@ export function encodeDeltaUvarint(indices) {
  *
  * @param {Uint8Array} bytes
  * @param {{ maxCount: number|null, maxIndex: number|null, signal: AbortSignal|null }} options
- * @returns {Uint32Array}
+ * @returns {Promise<Uint32Array>}
  */
-export function decodeDeltaUvarint(bytes, options) {
+export async function decodeDeltaUvarint(bytes, options) {
   if (!(bytes instanceof Uint8Array)) {
     throw new TypeError('decodeDeltaUvarint: expected Uint8Array.');
   }
@@ -112,6 +132,7 @@ export function decodeDeltaUvarint(bytes, options) {
   ) {
     throw new TypeError('Delta-uvarint signal must be an AbortSignal or null.');
   }
+  throwIfAborted(signal);
 
   let offset = 0;
   const countRes = decodeUvarint(bytes, offset);
@@ -124,11 +145,10 @@ export function decodeDeltaUvarint(bytes, options) {
 
   const out = new Uint32Array(count);
   let acc = 0;
+  let lastYieldOffset = offset;
 
   for (let i = 0; i < count; i++) {
-    if (signal !== null && signal.aborted) {
-      throw new DOMException('Aborted', 'AbortError');
-    }
+    throwIfAborted(signal);
     const { value: delta, nextOffset } = decodeUvarint(bytes, offset);
     offset = nextOffset;
     if (i > 0 && delta === 0) {
@@ -142,10 +162,22 @@ export function decodeDeltaUvarint(bytes, options) {
       throw new Error(`decodeDeltaUvarint: index ${acc} exceeds maxIndex ${maxIndex}.`);
     }
     out[i] = acc;
+    if (
+      i + 1 < count
+      && (
+        (i + 1) % COOPERATIVE_DECODE_BUDGET === 0
+        || offset - lastYieldOffset >= COOPERATIVE_DECODE_BUDGET
+      )
+    ) {
+      lastYieldOffset = offset;
+      await yieldToMacrotask();
+      throwIfAborted(signal);
+    }
   }
 
   if (offset !== bytes.byteLength) {
     throw new Error('decodeDeltaUvarint: trailing bytes are not allowed.');
   }
+  throwIfAborted(signal);
   return out;
 }

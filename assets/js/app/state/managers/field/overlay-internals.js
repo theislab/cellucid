@@ -231,6 +231,7 @@ export class FieldOverlayInternalMethods {
         field,
         `${source} field ${fieldIndex}`
       );
+      const previousCategories = [...categories];
       let originalCategories;
       if (Object.hasOwn(field, '_originalCategories')) {
         if (
@@ -270,13 +271,7 @@ export class FieldOverlayInternalMethods {
       } else {
         delete field._originalCategories;
       }
-      for (
-        let categoryIndex = 0;
-        categoryIndex < displayCategories.length;
-        categoryIndex++
-      ) {
-        this._syncCentroidCategoryLabelAtIndex(field, categoryIndex);
-      }
+      this._syncCentroidCategoryLabels(field, previousCategories);
     }
   }
 
@@ -360,41 +355,78 @@ export class FieldOverlayInternalMethods {
     }
   }
 
-  _syncCentroidCategoryLabelAtIndex(field, categoryIndex) {
+  _syncCentroidCategoryLabels(field, previousCategories) {
     requireField(field, 'Centroid field');
     if (field.kind !== FieldKind.CATEGORY) {
       throw new TypeError('Centroid label sync requires a categorical field');
     }
     const categories = requireCategoryInventory(field, 'Centroid field');
-    const index = requireIndex(categoryIndex, 'Centroid category index');
-    if (index >= categories.length) {
-      throw new RangeError(
-        'Centroid category label index is outside the category inventory'
+    if (
+      !Array.isArray(previousCategories)
+      || previousCategories.length !== categories.length
+    ) {
+      throw new TypeError(
+        'Previous centroid category inventory must match the current inventory'
+      );
+    }
+    const categoryMapping = new Map();
+    for (let index = 0; index < previousCategories.length; index++) {
+      const previousCategory = previousCategories[index];
+      StateValidator.validateCategoryLabel(previousCategory);
+      if (categoryMapping.has(previousCategory)) {
+        throw new TypeError(
+          'Previous centroid category inventory must contain unique identities'
+        );
+      }
+      categoryMapping.set(previousCategory, categories[index]);
+    }
+    if (new Set(categories).size !== categories.length) {
+      throw new TypeError(
+        'Current centroid category inventory must contain unique identities'
       );
     }
     if (!Object.hasOwn(field, 'centroidsByDim')) return;
     const byDimension = field.centroidsByDim;
     requireRecord(byDimension, 'Category field centroidsByDim');
+    const pendingUpdates = [];
     for (const [dimension, centroids] of Object.entries(byDimension)) {
       if (!/^[1-3]$/.test(dimension)) {
         throw new TypeError(
           'Category centroid dimension keys must be 1, 2, or 3'
         );
       }
-      if (
-        !Array.isArray(centroids)
-        || centroids.length !== categories.length
-      ) {
+      if (!Array.isArray(centroids)) {
         throw new TypeError(
-          `Category centroid dimension ${dimension} must match the category inventory`
+          `Category centroid dimension ${dimension} must be an array`
         );
       }
-      const centroid = requireRecord(
-        centroids[index],
-        `Category centroid ${dimension}:${index}`
-      );
-      centroid.category = categories[index];
+      const seenCategories = new Set();
+      for (let centroidIndex = 0; centroidIndex < centroids.length; centroidIndex++) {
+        const centroid = requireRecord(
+          centroids[centroidIndex],
+          `Category centroid ${dimension}:${centroidIndex}`
+        );
+        StateValidator.validateCategoryLabel(centroid.category);
+        if (!categoryMapping.has(centroid.category)) {
+          throw new TypeError(
+            `Category centroid dimension ${dimension} references an unknown category identity`
+          );
+        }
+        if (seenCategories.has(centroid.category)) {
+          throw new TypeError(
+            `Category centroid dimension ${dimension} duplicates a category identity`
+          );
+        }
+        seenCategories.add(centroid.category);
+        pendingUpdates.push([
+          centroid,
+          categoryMapping.get(centroid.category),
+        ]);
+      }
     }
+    pendingUpdates.forEach(([centroid, category]) => {
+      centroid.category = category;
+    });
   }
 
   _refreshHighlightGroupsForField(source, fieldIndex) {

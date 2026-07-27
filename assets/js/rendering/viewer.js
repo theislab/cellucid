@@ -5208,6 +5208,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, sidebar, onVi
 
     // Smoke renderer API (delegates to SmokeRenderer)
     setSmokeVolume(volumeDesc) { smokeRenderer.setVolume(volumeDesc); },
+    clearSmokeVolume() { smokeRenderer.clearVolume(); },
     buildSmokeVolumeGPU(positions, options = {}) { return smokeRenderer.buildVolumeGPU(positions, options); },
     setSmokeParams(params) { smokeRenderer.setParams(params); },
     setCloudResolutionScale(scale) { smokeRenderer.setResolutionScale(scale); },

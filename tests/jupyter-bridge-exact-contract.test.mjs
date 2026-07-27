@@ -184,7 +184,8 @@ test('session bundle upload includes exact token query and rejects coercion', as
         viewerToken: 'secret-1',
       },
       createSessionBundle: async () => new Blob([Uint8Array.of(1, 2, 3)]),
-      fetchImpl: async (url, init) => {
+      fetchImpl: async function (url, init) {
+        assert.equal(this, undefined);
         captured = { url, init };
         return new Response(
           JSON.stringify({ status: 'ok', bytes: 3 }),

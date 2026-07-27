@@ -311,6 +311,7 @@ function reloadIdentitiesMatch(left, right) {
  *
  * @param {() => object} captureIdentity
  * @returns {{begin: () => {
+ *   adoptCurrentIdentity: () => void,
  *   isLatest: () => boolean,
  *   isCurrent: () => boolean,
  *   assertCurrent: () => void,
@@ -327,13 +328,31 @@ export function createLatestDatasetReloadCoordinator(captureIdentity) {
 
   return Object.freeze({
     begin() {
-      const identity = captureReloadIdentity(captureIdentity);
+      let identity = captureReloadIdentity(captureIdentity);
       latestController?.abort();
       const controller = new AbortController();
       latestController = controller;
       const generation = ++latestGeneration;
+      let publicationIdentityAdopted = false;
 
       return Object.freeze({
+        adoptCurrentIdentity() {
+          if (
+            controller.signal.aborted
+            || generation !== latestGeneration
+          ) {
+            throw createDatasetReloadSupersededError(
+              RELOAD_SUPERSEDED_MESSAGE
+            );
+          }
+          if (publicationIdentityAdopted) {
+            throw new Error(
+              'Dataset reload publication identity was already adopted.'
+            );
+          }
+          identity = captureReloadIdentity(captureIdentity);
+          publicationIdentityAdopted = true;
+        },
         signal: controller.signal,
         isLatest() {
           return generation === latestGeneration;
@@ -419,6 +438,100 @@ export async function handleDatasetReloadFailure(options) {
     throw error;
   }
   return reportRequiredDatasetReloadFailure(error, reportFailure);
+}
+
+const PUBLISHED_STATE_READY_OUTCOMES = new Set([
+  'ready',
+  'ready-state-canceled',
+  'ready-state-error',
+  'ready-state-replaced',
+  'ready-state-restored'
+]);
+
+/**
+ * Publish exactly one analytics terminal for the dataset reload that still
+ * owns the generation after advertised-state restoration.
+ *
+ * @param {object} options
+ * @param {{status: string}} options.outcome
+ * @param {{isCurrent: () => boolean, assertCurrent: () => void}} options.transaction
+ * @param {() => void} options.cancel
+ * @param {() => void} options.complete
+ * @returns {Promise<object>}
+ */
+export async function settlePublishedDatasetStateOutcome(options) {
+  requireExactKeys(
+    options,
+    ['outcome', 'transaction', 'cancel', 'complete'],
+    'published dataset state outcome'
+  );
+  const {
+    outcome,
+    transaction,
+    cancel,
+    complete
+  } = options;
+  if (
+    outcome === null
+    || typeof outcome !== 'object'
+    || Array.isArray(outcome)
+    || typeof outcome.status !== 'string'
+  ) {
+    throw new TypeError(
+      'Published dataset state outcome must expose one status string.'
+    );
+  }
+  if (
+    typeof transaction?.isCurrent !== 'function'
+    || typeof transaction?.assertCurrent !== 'function'
+    || typeof cancel !== 'function'
+    || typeof complete !== 'function'
+  ) {
+    throw new TypeError(
+      'Published dataset state settlement owners are invalid.'
+    );
+  }
+  if (
+    outcome.status === 'superseded'
+    || !transaction.isCurrent()
+  ) {
+    return handleDatasetReloadFailure({
+      error: createDatasetReloadSupersededError(
+        RELOAD_SUPERSEDED_MESSAGE
+      ),
+      transaction,
+      cancel,
+      reportFailure() {
+        throw new Error(
+          'A superseded dataset reload must not publish failure analytics.'
+        );
+      }
+    });
+  }
+  if (!PUBLISHED_STATE_READY_OUTCOMES.has(outcome.status)) {
+    throw new TypeError(
+      `Published dataset state outcome "${outcome.status}" is invalid.`
+    );
+  }
+  transaction.assertCurrent();
+  complete();
+  return outcome;
+}
+
+/**
+ * Settle bootstrap analytics without converting an expected interactive
+ * replacement into a terminal startup failure.
+ *
+ * @param {Parameters<typeof settlePublishedDatasetStateOutcome>[0]} options
+ * @returns {Promise<object>}
+ */
+export async function settleInitialPublishedDatasetStateOutcome(options) {
+  try {
+    return await settlePublishedDatasetStateOutcome(options);
+  } catch (error) {
+    if (!isDatasetReloadSupersededError(error)) throw error;
+    return Object.freeze({ status: 'superseded' });
+  }
 }
 
 /**

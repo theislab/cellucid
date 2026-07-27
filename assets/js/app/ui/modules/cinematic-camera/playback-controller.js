@@ -245,6 +245,24 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
     return state;
   }
 
+  function getProgress() {
+    if (state === STOPPED) return 0;
+    if (!Number.isFinite(totalDuration) || totalDuration <= 0) {
+      throw new Error(
+        'Camera path playback progress requires a positive finite duration.'
+      );
+    }
+    const elapsed = state === PLAYING
+      ? performance.now() / 1000 - startTime
+      : pauseElapsed;
+    const opts = getExactInterpolationOptions();
+    if (opts.loop) {
+      const wrapped = elapsed % totalDuration;
+      return Math.max(0, wrapped / totalDuration);
+    }
+    return Math.max(0, Math.min(1, elapsed / totalDuration));
+  }
+
   function onKeyframeChange() {
     // Any edit invalidates timing/interpolation cached when playback started.
     // Stop in place so mutations never continue along stale path geometry.
@@ -264,5 +282,15 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
     listeners.timeUpdate.clear();
   }
 
-  return { play, pause, stop, seekTo, getState, on, off, destroy };
+  return {
+    play,
+    pause,
+    stop,
+    seekTo,
+    getState,
+    getProgress,
+    on,
+    off,
+    destroy
+  };
 }

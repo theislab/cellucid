@@ -36,6 +36,17 @@ function preserveRollbackFailure(error, rollbackError) {
   }
 }
 
+const RESTORE_SNAPSHOTS_PARTICIPANT_ID =
+  'session/restore-snapshots';
+
+function isPromiseLike(value) {
+  return (
+    value !== null
+    && (typeof value === 'object' || typeof value === 'function')
+    && typeof value.then === 'function'
+  );
+}
+
 /**
  * Create the exact transaction shared by contributors during one restore.
  *
@@ -46,13 +57,14 @@ function preserveRollbackFailure(error, rollbackError) {
  * @returns {{
  *   register: (id: string, participant: object) => void,
  *   get: (id: string) => any,
- *   commit: () => void,
- *   rollback: () => void
+ *   commit: () => Promise<void>|void,
+ *   rollback: () => Promise<void>|void
  * }}
  */
 export function createSessionRestoreTransaction() {
   const participants = new Map();
   let phase = 'open';
+  let rollbackTask = null;
 
   function requireOpen(operation) {
     if (phase !== 'open') {
@@ -62,22 +74,9 @@ export function createSessionRestoreTransaction() {
     }
   }
 
-  function rollbackParticipants() {
-    if (phase === 'rolled-back') return;
-    if (phase === 'rolling-back') {
-      throw new Error('Session restore transaction rollback is already in progress.');
-    }
-    phase = 'rolling-back';
-    const rollbackErrors = [];
-    const entries = [...participants.values()];
-    for (let index = entries.length - 1; index >= 0; index--) {
-      try {
-        entries[index].rollback();
-      } catch (error) {
-        rollbackErrors.push(error);
-      }
-    }
+  function finishRollback(rollbackErrors) {
     phase = 'rolled-back';
+    rollbackTask = null;
     if (rollbackErrors.length === 1) throw rollbackErrors[0];
     if (rollbackErrors.length > 1) {
       throw new AggregateError(
@@ -85,6 +84,84 @@ export function createSessionRestoreTransaction() {
         'Multiple session restore participants failed to roll back.'
       );
     }
+  }
+
+  function rollbackParticipants() {
+    if (phase === 'rolled-back') return;
+    if (phase === 'rolling-back') {
+      return rollbackTask;
+    }
+    phase = 'rolling-back';
+    const rollbackErrors = [];
+    const entries = [...participants.values()];
+    let pending = null;
+    for (let index = entries.length - 1; index >= 0; index--) {
+      const participant = entries[index];
+      const invokeRollback = () => {
+        try {
+          const result = participant.rollback();
+          if (isPromiseLike(result)) {
+            return Promise.resolve(result).catch(error => {
+              rollbackErrors.push(error);
+            });
+          }
+          return undefined;
+        } catch (error) {
+          rollbackErrors.push(error);
+          return undefined;
+        }
+      };
+      if (pending === null) {
+        const result = invokeRollback();
+        if (isPromiseLike(result)) pending = result;
+      } else {
+        pending = pending.then(invokeRollback);
+      }
+    }
+    if (pending === null) {
+      finishRollback(rollbackErrors);
+      return;
+    }
+    rollbackTask = pending.then(() => finishRollback(rollbackErrors));
+    return rollbackTask;
+  }
+
+  function runParticipantMethod(entries, methodName) {
+    for (let index = 0; index < entries.length; index++) {
+      const result = entries[index][methodName]();
+      if (!isPromiseLike(result)) continue;
+      return (async () => {
+        await result;
+        for (
+          let remainingIndex = index + 1;
+          remainingIndex < entries.length;
+          remainingIndex++
+        ) {
+          await entries[remainingIndex][methodName]();
+        }
+      })();
+    }
+    return undefined;
+  }
+
+  function failCommit(error) {
+    let rollbackResult;
+    try {
+      rollbackResult = rollbackParticipants();
+    } catch (rollbackError) {
+      preserveRollbackFailure(error, rollbackError);
+      throw error;
+    }
+    if (!isPromiseLike(rollbackResult)) throw error;
+    return Promise.resolve(rollbackResult).then(
+      () => {
+        throw error;
+      },
+      rollbackError => {
+        preserveRollbackFailure(error, rollbackError);
+        throw error;
+      }
+    );
   }
 
   return Object.freeze({
@@ -125,30 +202,122 @@ export function createSessionRestoreTransaction() {
 
     commit() {
       requireOpen('commit');
+      const entries = [...participants.values()];
+
+      const commitPreparedParticipants = () => {
+        phase = 'committing';
+        const commitResult = runParticipantMethod(entries, 'commit');
+        if (!isPromiseLike(commitResult)) {
+          phase = 'committed';
+          return undefined;
+        }
+        return Promise.resolve(commitResult).then(() => {
+          phase = 'committed';
+        });
+      };
+
       try {
         phase = 'preparing';
-        for (const participant of participants.values()) {
-          participant.prepare();
+        const prepareResult = runParticipantMethod(entries, 'prepare');
+        if (isPromiseLike(prepareResult)) {
+          return Promise.resolve(prepareResult)
+            .then(commitPreparedParticipants)
+            .catch(error => failCommit(error));
         }
-        phase = 'committing';
-        for (const participant of participants.values()) {
-          participant.commit();
+        const commitResult = commitPreparedParticipants();
+        if (isPromiseLike(commitResult)) {
+          return Promise.resolve(commitResult)
+            .catch(error => failCommit(error));
         }
-        phase = 'committed';
       } catch (error) {
-        try {
-          rollbackParticipants();
-        } catch (rollbackError) {
-          preserveRollbackFailure(error, rollbackError);
-        }
-        throw error;
+        return failCommit(error);
       }
     },
 
     rollback() {
-      rollbackParticipants();
+      return rollbackParticipants();
     }
   });
+}
+
+/**
+ * Register the immutable pre-restore payload inventory used by reversible
+ * contributors. The serializer owns population before contributor dispatch.
+ *
+ * @param {object} restoreTransaction
+ * @param {Map<string, any>} snapshots
+ */
+export function registerSessionRestoreSnapshots(
+  restoreTransaction,
+  snapshots
+) {
+  if (
+    restoreTransaction === null
+    || typeof restoreTransaction !== 'object'
+  ) {
+    throw new TypeError(
+      'Session restore snapshots require the current restore transaction.'
+    );
+  }
+  requireMethod(
+    restoreTransaction,
+    'register',
+    'Session restore snapshot transaction'
+  );
+  if (!(snapshots instanceof Map)) {
+    throw new TypeError('Session restore snapshots must be a Map.');
+  }
+  restoreTransaction.register(
+    RESTORE_SNAPSHOTS_PARTICIPANT_ID,
+    {
+      value: snapshots,
+      prepare() {},
+      commit() {},
+      rollback() {}
+    }
+  );
+}
+
+/**
+ * Read one pre-restore JSON payload when the serializer captured it.
+ * Direct contributor unit calls may omit the shared snapshot participant.
+ *
+ * @param {object} ctx
+ * @param {string} chunkId
+ * @returns {any|undefined}
+ */
+export function getSessionRestoreSnapshot(ctx, chunkId) {
+  const exactChunkId = assertNonEmptyString(
+    chunkId,
+    'Session restore snapshot chunk id'
+  );
+  const restoreTransaction = ctx?.restoreTransaction;
+  if (
+    restoreTransaction === null
+    || typeof restoreTransaction !== 'object'
+  ) {
+    return undefined;
+  }
+  requireMethod(
+    restoreTransaction,
+    'get',
+    'Session restore snapshot transaction'
+  );
+  let snapshots;
+  try {
+    snapshots = restoreTransaction.get(
+      RESTORE_SNAPSHOTS_PARTICIPANT_ID
+    );
+  } catch (error) {
+    if (error instanceof RangeError) return undefined;
+    throw error;
+  }
+  if (!(snapshots instanceof Map)) {
+    throw new TypeError(
+      'Session restore snapshot participant must own a Map.'
+    );
+  }
+  return snapshots.get(exactChunkId);
 }
 
 function assertRestoreTransaction(value) {
@@ -251,13 +420,13 @@ export function buildSessionContext(base, options) {
 }
 
 /**
- * Create a dataset fingerprint for dev-phase safety checks.
+ * Create the exact current dataset fingerprint.
  *
- * Minimum fields (per plan): { sourceType, datasetId }
- * Recommended: include fast mismatch guards (cellCount, varCount).
+ * All four fields are mandatory; source identity may be explicitly null only
+ * when no data-source manager owns the loaded state.
  *
  * @param {object} ctx
- * @returns {{ sourceType: string|null, datasetId: string|null, cellCount?: number, varCount?: number }}
+ * @returns {{ sourceType: string|null, datasetId: string|null, cellCount: number, varCount: number }}
  */
 export function getDatasetFingerprint(ctx) {
   assertPlainRecord(ctx, 'Session context');

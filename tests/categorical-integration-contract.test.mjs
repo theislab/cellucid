@@ -581,7 +581,7 @@ test('mutable state owns a writable copy of immutable loader categories', () => 
       pageChangeCount += 1;
     },
     _resetViewContexts() {},
-    _syncCentroidCategoryLabelAtIndex() {},
+    _syncCentroidCategoryLabels() {},
     _userDefinedFields: {
       clear() {}
     },

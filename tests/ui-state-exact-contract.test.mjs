@@ -15,6 +15,9 @@ import {
   FieldOverlayPublicMethods,
 } from '../assets/js/app/state/managers/field/overlay-public.js';
 import {
+  FieldOverlayInternalMethods,
+} from '../assets/js/app/state/managers/field/overlay-internals.js';
+import {
   DataStateColorMethods,
 } from '../assets/js/app/state/managers/color-manager.js';
 import {
@@ -61,6 +64,74 @@ function exactCategoryMetadata(field) {
   field._categoryFilterEnabled = true;
   return field;
 }
+
+test('field overlays preserve valid category-keyed centroid subsets by identity', () => {
+  const field = {
+    key: 'cell_type',
+    kind: 'category',
+    categories: ['alpha', 'beta', 'gamma'],
+    centroidsByDim: {
+      1: [
+        { category: 'alpha', position: [0], n_points: 4 },
+        { category: 'gamma', position: [1], n_points: 2 },
+      ],
+      2: [
+        { category: 'alpha', position: [0, 0], n_points: 4 },
+        { category: 'gamma', position: [1, 1], n_points: 2 },
+      ],
+    },
+  };
+  const categoryRenames = new Map();
+  const state = Object.assign(
+    Object.create(FieldOverlayInternalMethods.prototype),
+    {
+      _renameRegistry: {
+        getDisplayKey(_source, originalKey) {
+          return originalKey;
+        },
+        getDisplayCategory(_source, _fieldKey, categoryIndex, originalLabel) {
+          return categoryRenames.get(categoryIndex) ?? originalLabel;
+        },
+      },
+      _deleteRegistry: {
+        isDeleted() {
+          return false;
+        },
+        isPurged() {
+          return false;
+        },
+      },
+    },
+  );
+
+  assert.doesNotThrow(
+    () => state._applyOverlaysToFields([field], FieldSource.OBS),
+  );
+  assert.deepEqual(
+    field.centroidsByDim['1'].map(centroid => centroid.category),
+    ['alpha', 'gamma'],
+  );
+
+  categoryRenames.set(2, 'gamma cells');
+  state._applyOverlaysToFields([field], FieldSource.OBS);
+  assert.deepEqual(field.categories, ['alpha', 'beta', 'gamma cells']);
+  assert.deepEqual(
+    field.centroidsByDim['1'].map(centroid => centroid.category),
+    ['alpha', 'gamma cells'],
+  );
+  assert.deepEqual(
+    field.centroidsByDim['2'].map(centroid => centroid.category),
+    ['alpha', 'gamma cells'],
+  );
+
+  categoryRenames.clear();
+  state._applyOverlaysToFields([field], FieldSource.OBS);
+  assert.deepEqual(field.categories, ['alpha', 'beta', 'gamma']);
+  assert.deepEqual(
+    field.centroidsByDim['1'].map(centroid => centroid.category),
+    ['alpha', 'gamma'],
+  );
+});
 
 test('active-field lookup publishes null or one exact owned field', () => {
   const noSelection = Object.assign(
