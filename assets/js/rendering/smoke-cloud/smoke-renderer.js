@@ -4,13 +4,26 @@
 // Provides a clean API for volumetric cloud visualization
 
 import { SMOKE_VS_SOURCE, SMOKE_FS_SOURCE, SMOKE_COMPOSITE_VS, SMOKE_COMPOSITE_FS } from '../shaders/smoke-shaders.js';
-import { createDensityTexture3D, buildDensityVolumeGPU } from './smoke-density.js';
+import {
+  buildDensityTextureGPU,
+  createDensityTexture3D,
+  disposeDensityPipelineResources,
+  invalidateDensityPipelineResources,
+} from './smoke-density.js';
+import {
+  MAX_SMOKE_GRID_SIZE,
+  SmokeDensityBuildError,
+} from './smoke-density-contract.js';
 import {
   generateCloudNoiseTextures,
   setNoiseResolution,
   getResolutionScaleFactor,
 } from './noise-textures.js';
 import { getNotificationCenter } from '../../app/notification-center.js';
+
+function asError(value, message) {
+  return value instanceof Error ? value : new Error(message);
+}
 
 function requireFiniteNumber(value, owner, minimum = -Infinity, maximum = Infinity) {
   if (typeof value !== 'number' || !Number.isFinite(value)) {
@@ -209,13 +222,157 @@ export class SmokeRenderer {
   }
 
   buildVolumeGPU(positions, options = {}) {
-    const volumeDesc = buildDensityVolumeGPU(this.gl, positions, options);
-    this.setVolume(volumeDesc);
-    return volumeDesc;
+    const gl = this.gl;
+    const notifications = getNotificationCenter();
+    const notificationId = notifications.startCalculation(
+      'Building smoke density volume',
+      'render'
+    );
+    const startTime = performance.now();
+    const previousTextureInfo = this.textureInfo;
+    const previousBoundsMin = new Float32Array(this.volumeMin);
+    const previousBoundsMax = new Float32Array(this.volumeMax);
+    let candidate = null;
+    let published = false;
+    let summary = null;
+
+    try {
+      candidate = buildDensityTextureGPU(gl, positions, options);
+      if (candidate === null) {
+        const gridSize = Object.hasOwn(options, 'gridSize')
+          ? options.gridSize
+          : 128;
+        this.textureInfo = null;
+        this.volumeMin.set([-1, -1, -1]);
+        this.volumeMax.set([1, 1, 1]);
+        published = true;
+        summary = Object.freeze({
+          empty: true,
+          gridSize,
+        });
+        const elapsed = performance.now() - startTime;
+        notifications.completeCalculation(
+          notificationId,
+          'Smoke density cleared (no visible cells)',
+          elapsed
+        );
+      } else {
+        if (
+          typeof candidate !== 'object'
+          || Array.isArray(candidate)
+          || Object.keys(candidate).sort().join(',') !==
+            'boundsMax,boundsMin,gridSize,is3D,texture'
+          || !candidate.texture
+          || !Number.isInteger(candidate.gridSize)
+          || candidate.gridSize < 8
+          || candidate.gridSize > MAX_SMOKE_GRID_SIZE
+          || candidate.is3D !== true
+        ) {
+          throw new TypeError(
+            'GPU smoke density builder must return null or one complete native 3D texture.'
+          );
+        }
+        const boundsMin = requireVector3(
+          candidate.boundsMin,
+          'SmokeRenderer GPU boundsMin'
+        );
+        const boundsMax = requireVector3(
+          candidate.boundsMax,
+          'SmokeRenderer GPU boundsMax'
+        );
+        for (let axis = 0; axis < 3; axis++) {
+          if (boundsMin[axis] >= boundsMax[axis]) {
+            throw new RangeError(
+              `SmokeRenderer GPU boundsMin[${axis}] must be smaller than boundsMax[${axis}].`
+            );
+          }
+        }
+        this.textureInfo = {
+          texture: candidate.texture,
+          gridSize: candidate.gridSize,
+          is3D: true,
+        };
+        this.volumeMin.set(boundsMin);
+        this.volumeMax.set(boundsMax);
+        published = true;
+        summary = Object.freeze({
+          boundsMax: Object.freeze(Array.from(boundsMax)),
+          boundsMin: Object.freeze(Array.from(boundsMin)),
+          gridSize: candidate.gridSize,
+        });
+        const elapsed = performance.now() - startTime;
+        notifications.completeCalculation(
+          notificationId,
+          `Smoke density ready (${candidate.gridSize}³)`,
+          elapsed
+        );
+      }
+    } catch (error) {
+      const failures = [asError(
+        error,
+        'GPU smoke density publication failed with a non-Error value.'
+      )];
+      if (published) {
+        this.textureInfo = previousTextureInfo;
+        this.volumeMin.set(previousBoundsMin);
+        this.volumeMax.set(previousBoundsMax);
+      }
+      if (
+        candidate?.texture
+        && candidate.texture !== previousTextureInfo?.texture
+      ) {
+        try {
+          gl.deleteTexture(candidate.texture);
+        } catch (cleanupError) {
+          failures.push(asError(
+            cleanupError,
+            'GPU smoke density candidate rollback failed with a non-Error value.'
+          ));
+        }
+      }
+      try {
+        notifications.failCalculation(
+          notificationId,
+          `Smoke density unavailable: ${failures[0].message}`
+        );
+      } catch (notificationError) {
+        failures.push(asError(
+          notificationError,
+          'Smoke density failure notification rejected a non-Error value.'
+        ));
+      }
+      const cause = failures.length === 1
+        ? failures[0]
+        : new AggregateError(
+          failures,
+          'GPU smoke density publication and rollback failed.'
+        );
+      throw new SmokeDensityBuildError(failures[0].message, cause);
+    }
+
+    const previousTexture = previousTextureInfo?.texture ?? null;
+    if (
+      previousTexture !== null
+      && previousTexture !== candidate?.texture
+    ) {
+      gl.deleteTexture(previousTexture);
+    }
+    if (candidate === null) {
+      console.log('[SmokeRenderer] Cleared density texture (no visible cells)');
+    } else {
+      console.log(
+        `[SmokeRenderer] Created 3D density texture (${candidate.gridSize}³)`
+      );
+    }
+    return summary;
   }
 
   hasVolume() {
     return this.textureInfo !== null;
+  }
+
+  handleContextLost() {
+    return invalidateDensityPipelineResources(this.gl);
   }
 
   // === PARAMETER SETTERS ===
@@ -685,5 +842,6 @@ export class SmokeRenderer {
 
     gl.deleteProgram(this.smokeProgram);
     gl.deleteProgram(this.compositeProgram);
+    disposeDensityPipelineResources(gl);
   }
 }

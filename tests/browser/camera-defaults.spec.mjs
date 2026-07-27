@@ -190,6 +190,60 @@ async function readTargetVisualCenter(page) {
   });
 }
 
+async function waitForTargetVisualCenter(page, expectedSidebarWidth = null) {
+  let settledSample = null;
+  await expect.poll(async () => {
+    const sample = await readTargetVisualCenter(page);
+    const widthMatches =
+      expectedSidebarWidth === null ||
+      sample.sidebarWidth === expectedSidebarWidth;
+    const centerMatches =
+      Math.abs(sample.projectedX - sample.expectedX) < 1;
+    if (widthMatches && centerMatches) {
+      settledSample = sample;
+      return true;
+    }
+    return false;
+  }).toBe(true);
+  return settledSample;
+}
+
+async function keepCurrentViewThroughUi(page) {
+  await page.locator('#split-keep-view-btn').click();
+  await expect.poll(() => page.evaluate(() => {
+    const viewer = window._cellucidViewer;
+    const state = window._cellucidState;
+    const snapshots = viewer.getSnapshotViews();
+    if (snapshots.length !== 1) {
+      return { snapshotCount: snapshots.length };
+    }
+    const snapshotId = snapshots[0].id;
+    const layout = viewer.getViewLayout();
+    return {
+      snapshotCount: snapshots.length,
+      snapshotId,
+      activeId: state.getActiveViewId(),
+      stateDimension: state.getViewDimensionLevel(snapshotId),
+      viewerDimension: viewer.getViewDimension(snapshotId),
+      layout,
+      badgeCount: document.querySelectorAll('.split-badge').length,
+    };
+  })).toEqual({
+    snapshotCount: 1,
+    snapshotId: 'snap_1',
+    activeId: 'snap_1',
+    stateDimension: 3,
+    viewerDimension: 3,
+    layout: {
+      mode: 'grid',
+      activeId: 'snap_1',
+      liveViewHidden: false,
+    },
+    badgeCount: 2,
+  });
+  return 'snap_1';
+}
+
 test('a fresh deterministic 3-D dataset selects dimension 3 and Orbit', async ({
   context,
   page,
@@ -239,9 +293,8 @@ test('Orbit and Planar targets follow the sidebar-aware visual center', async ({
     'Deterministic 3-D orbit fixture',
   );
 
-  const initial = await readTargetVisualCenter(page);
+  const initial = await waitForTargetVisualCenter(page, 280);
   expect(initial.navigationMode).toBe('orbit');
-  expect(Math.abs(initial.projectedX - initial.expectedX)).toBeLessThan(1);
 
   const resizeHandle = page.locator('#sidebar-resize-handle');
   const handleBox = await resizeHandle.boundingBox();
@@ -254,24 +307,21 @@ test('Orbit and Planar targets follow the sidebar-aware visual center', async ({
   await page.mouse.move(handleBox.x + handleBox.width / 2 + 80, handleBox.y + 20);
   await page.mouse.up();
 
-  const resized = await readTargetVisualCenter(page);
+  const resized = await waitForTargetVisualCenter(page);
   expect(resized.sidebarWidth).toBeGreaterThan(initial.sidebarWidth);
-  expect(Math.abs(resized.projectedX - resized.expectedX)).toBeLessThan(1);
   expect(resized.camera).toEqual(initial.camera);
 
   await page.locator('#sidebar-toggle').click();
   await expect(page.locator('#sidebar')).toHaveClass(/hidden/);
-  const collapsed = await readTargetVisualCenter(page);
-  expect(Math.abs(collapsed.projectedX - collapsed.expectedX)).toBeLessThan(1);
+  const collapsed = await waitForTargetVisualCenter(page);
   expect(collapsed.camera).toEqual(initial.camera);
 
   await page.locator('#sidebar-toggle').click();
   await expect(page.locator('#sidebar')).not.toHaveClass(/hidden/);
   await page.selectOption('#navigation-mode', 'planar');
   await expect(page.locator('#navigation-mode')).toHaveValue('planar');
-  const planar = await readTargetVisualCenter(page);
+  const planar = await waitForTargetVisualCenter(page);
   expect(planar.navigationMode).toBe('planar');
-  expect(Math.abs(planar.projectedX - planar.expectedX)).toBeLessThan(1);
 
   await page.mouse.move(planar.expectedX, planar.expectedY);
   const beforeZoom = planar.camera;
@@ -287,15 +337,12 @@ test('Orbit and Planar targets follow the sidebar-aware visual center', async ({
 
   await page.locator('#sidebar-toggle').click();
   await expect(page.locator('#sidebar')).toHaveClass(/hidden/);
-  const collapsedPlanar = await readTargetVisualCenter(page);
-  expect(
-    Math.abs(collapsedPlanar.projectedX - collapsedPlanar.expectedX),
-  ).toBeLessThan(1);
+  const collapsedPlanar = await waitForTargetVisualCenter(page);
   expect(collapsedPlanar.camera).toEqual(afterZoom.camera);
   await page.locator('#sidebar-toggle').click();
   await expect(page.locator('#sidebar')).not.toHaveClass(/hidden/);
 
-  const interactionProof = await page.evaluate(() => {
+  const singlePick = await page.evaluate(() => {
     const viewer = window._cellucidViewer;
     const canvas = document.getElementById('glcanvas');
     const sidebar = document.getElementById('sidebar');
@@ -304,26 +351,22 @@ test('Orbit and Planar targets follow the sidebar-aware visual center', async ({
     const visualCenterX =
       (Math.max(canvasRect.left, sidebarRight) + canvasRect.right) / 2;
     const centerY = (canvasRect.top + canvasRect.bottom) / 2;
-    const singlePick = viewer.pickCellAtScreen(visualCenterX, centerY);
-    viewer.createSnapshotView({
-      sourceViewId: 'live',
-      label: 'Visual-center snapshot',
-      fieldKey: null,
-      fieldKind: null,
-      colors: viewer.getColors(),
-      transparency: viewer.getViewTransparency('live'),
-      centroidPositions: null,
-      centroidColors: null,
-      meta: { filtersText: [] },
-      cameraState: viewer.getCameraState(),
-      dimensionLevel: viewer.getViewDimension('live'),
-    });
-    viewer.setViewLayout('grid', 'live');
+    return viewer.pickCellAtScreen(visualCenterX, centerY);
+  });
+  expect(singlePick).toBeGreaterThanOrEqual(0);
+
+  await keepCurrentViewThroughUi(page);
+  const interactionProof = await page.evaluate(() => {
+    const viewer = window._cellucidViewer;
+    const canvas = document.getElementById('glcanvas');
+    const sidebar = document.getElementById('sidebar');
+    const canvasRect = canvas.getBoundingClientRect();
+    const sidebarRight = sidebar.offsetLeft + sidebar.offsetWidth;
+    const centerY = (canvasRect.top + canvasRect.bottom) / 2;
     const paneWidth = canvasRect.width / 2;
     const leftPaneRight = canvasRect.left + paneWidth;
     const rightPaneLeft = leftPaneRight;
     return {
-      singlePick,
       leftPick: viewer.pickCellAtScreen(
         (Math.max(canvasRect.left, sidebarRight) + leftPaneRight) / 2,
         centerY,
@@ -335,9 +378,8 @@ test('Orbit and Planar targets follow the sidebar-aware visual center', async ({
       webglError: viewer.getGLContext().getError(),
     };
   });
-  expect(interactionProof.singlePick).toBeGreaterThanOrEqual(0);
-  expect(interactionProof.leftPick).toBe(interactionProof.singlePick);
-  expect(interactionProof.rightPick).toBe(interactionProof.singlePick);
+  expect(interactionProof.leftPick).toBe(singlePick);
+  expect(interactionProof.rightPick).toBe(singlePick);
   expect(interactionProof.webglError).toBe(0);
 
   expect(productErrors).toEqual([]);
@@ -359,24 +401,18 @@ test('unlocked mixed-mode panes render orbit anchors only in Orbit panes', async
     'Deterministic 3-D orbit fixture',
   );
 
-  const snapshotId = await page.evaluate(() => {
-    const viewer = window._cellucidViewer;
-    const snapshot = viewer.createSnapshotView({
-      sourceViewId: 'live',
-      label: 'Mixed navigation snapshot',
-      fieldKey: null,
-      fieldKind: null,
-      colors: viewer.getColors(),
-      transparency: viewer.getViewTransparency('live'),
-      centroidPositions: null,
-      centroidColors: null,
-      meta: { filtersText: [] },
-      cameraState: viewer.getCameraState(),
-      dimensionLevel: viewer.getViewDimension('live'),
-    });
-    viewer.setViewLayout('grid', 'live');
-    viewer.setCamerasLocked(false);
+  const snapshotId = await keepCurrentViewThroughUi(page);
+  await page.locator('#camera-lock-btn').click();
+  await expect(page.locator('#camera-lock-btn')).toHaveAttribute(
+    'aria-pressed',
+    'false',
+  );
+  await expect.poll(
+    () => page.evaluate(() => window._cellucidViewer.getCamerasLocked()),
+  ).toBe(false);
 
+  await page.evaluate(() => {
+    const viewer = window._cellucidViewer;
     const gl = viewer.getGLContext();
     const drawElements = gl.drawElements.bind(gl);
     window.__orbitAnchorViewportXs = [];
@@ -389,33 +425,36 @@ test('unlocked mixed-mode panes render orbit anchors only in Orbit panes', async
       return drawElements(mode, count, type, offset);
     };
     viewer.setShowOrbitAnchor(true);
-    return snapshot.id;
   });
 
-  const readAnchorPaneXs = async () => {
-    await page.evaluate(() => new Promise(resolve => {
-      requestAnimationFrame(() => requestAnimationFrame(resolve));
-    }));
-    return page.evaluate(() => (
+  const readAnchorPaneXs = () => page.evaluate(() => (
       [...new Set(window.__orbitAnchorViewportXs)].sort((a, b) => a - b)
-    ));
-  };
+  ));
 
   await page.evaluate(id => {
     const viewer = window._cellucidViewer;
-    window.__orbitAnchorViewportXs.length = 0;
     viewer.setViewNavigationMode('live', 'orbit');
     viewer.setViewNavigationMode(id, 'planar');
+    window.__orbitAnchorViewportXs.length = 0;
+    viewer.setShowOrbitAnchor(false);
+    viewer.setShowOrbitAnchor(true);
   }, snapshotId);
+  await expect.poll(readAnchorPaneXs).toEqual([0]);
   const orbitFocusedPaneXs = await readAnchorPaneXs();
   expect(orbitFocusedPaneXs).toEqual([0]);
 
   await page.evaluate(id => {
     const viewer = window._cellucidViewer;
-    window.__orbitAnchorViewportXs.length = 0;
     viewer.setViewNavigationMode('live', 'planar');
     viewer.setViewNavigationMode(id, 'orbit');
+    window.__orbitAnchorViewportXs.length = 0;
+    viewer.setShowOrbitAnchor(false);
+    viewer.setShowOrbitAnchor(true);
   }, snapshotId);
+  await expect.poll(async () => {
+    const paneXs = await readAnchorPaneXs();
+    return paneXs.length === 1 && paneXs[0] > 0;
+  }).toBe(true);
   const orbitSnapshotPaneXs = await readAnchorPaneXs();
   expect(orbitSnapshotPaneXs).toHaveLength(1);
   expect(orbitSnapshotPaneXs[0]).toBeGreaterThan(0);
@@ -444,9 +483,7 @@ test('responsive sidebar CSS remains live and republishes the target center', as
     'Deterministic 3-D orbit fixture',
   );
 
-  const compact = await readTargetVisualCenter(page);
-  expect(compact.sidebarWidth).toBe(260);
-  expect(Math.abs(compact.projectedX - compact.expectedX)).toBeLessThan(1);
+  const compact = await waitForTargetVisualCenter(page, 260);
   const resizeHandle = page.locator('#sidebar-resize-handle');
   await expect(resizeHandle).toBeHidden();
   const hiddenDragResult = await page.evaluate(() => {
@@ -467,11 +504,7 @@ test('responsive sidebar CSS remains live and republishes the target center', as
   expect(hiddenDragResult).toBe('');
 
   await page.setViewportSize({ width: 1000, height: 720 });
-  await expect.poll(async () => (
-    await readTargetVisualCenter(page)
-  ).sidebarWidth).toBe(280);
-  const wide = await readTargetVisualCenter(page);
-  expect(Math.abs(wide.projectedX - wide.expectedX)).toBeLessThan(1);
+  const wide = await waitForTargetVisualCenter(page, 280);
   expect(wide.camera).toEqual(compact.camera);
 
   await expect(resizeHandle).toBeVisible();
@@ -484,34 +517,21 @@ test('responsive sidebar CSS remains live and republishes the target center', as
   await page.mouse.down();
   await page.mouse.move(handleBox.x + handleBox.width / 2 + 120, handleBox.y + 20);
   await page.mouse.up();
-  const userSizedWide = await readTargetVisualCenter(page);
-  expect(userSizedWide.sidebarWidth).toBe(400);
-  expect(
-    Math.abs(userSizedWide.projectedX - userSizedWide.expectedX),
-  ).toBeLessThan(1);
+  const userSizedWide = await waitForTargetVisualCenter(page, 400);
+  expect(userSizedWide.camera).toEqual(compact.camera);
 
   await page.setViewportSize({ width: 800, height: 720 });
-  await expect.poll(async () => (
-    await readTargetVisualCenter(page)
-  ).sidebarWidth).toBe(260);
-  const compactAgain = await readTargetVisualCenter(page);
-  expect(
-    Math.abs(compactAgain.projectedX - compactAgain.expectedX),
-  ).toBeLessThan(1);
+  const compactAgain = await waitForTargetVisualCenter(page, 260);
   expect(compactAgain.camera).toEqual(compact.camera);
 
   await page.setViewportSize({ width: 700, height: 720 });
   await expect.poll(async () => (
     await readTargetVisualCenter(page)
   ).sidebarWidth).toBe(700);
+  const mobile = await readTargetVisualCenter(page);
+  expect(mobile.camera).toEqual(compact.camera);
   await page.setViewportSize({ width: 1000, height: 720 });
-  await expect.poll(async () => (
-    await readTargetVisualCenter(page)
-  ).sidebarWidth).toBe(400);
-  const userSizedWideAgain = await readTargetVisualCenter(page);
-  expect(
-    Math.abs(userSizedWideAgain.projectedX - userSizedWideAgain.expectedX),
-  ).toBeLessThan(1);
+  const userSizedWideAgain = await waitForTargetVisualCenter(page, 400);
   expect(userSizedWideAgain.camera).toEqual(compact.camera);
 
   const resumedHandleBox = await resizeHandle.boundingBox();
@@ -549,9 +569,8 @@ test('responsive sidebar CSS remains live and republishes the target center', as
     () => document.documentElement.style.getPropertyValue('--sidebar-user-width'),
   )).toBe('420px');
   await page.setViewportSize({ width: 1000, height: 720 });
-  await expect.poll(async () => (
-    await readTargetVisualCenter(page)
-  ).sidebarWidth).toBe(420);
+  const finalWide = await waitForTargetVisualCenter(page, 420);
+  expect(finalWide.camera).toEqual(compact.camera);
   expect(productErrors).toEqual([]);
 });
 
@@ -616,11 +635,7 @@ test('sidebar drag coalesces camera geometry without synchronous layout reads', 
   expect(readsAfterSettlement).toBeGreaterThanOrEqual(1);
   expect(readsAfterSettlement).toBeLessThanOrEqual(2);
 
-  await expect.poll(async () => (
-    await readTargetVisualCenter(page)
-  ).sidebarWidth).toBe(400);
-  const settled = await readTargetVisualCenter(page);
-  expect(Math.abs(settled.projectedX - settled.expectedX)).toBeLessThan(1);
+  await waitForTargetVisualCenter(page, 400);
   expect(productErrors).toEqual([]);
 });
 

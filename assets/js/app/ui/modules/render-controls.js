@@ -15,6 +15,11 @@ import {
   parseFiniteNumberInRange
 } from '../../utils/number-utils.js';
 import { getNotificationCenter } from '../../notification-center.js';
+import {
+  MAX_SMOKE_GRID_SIZE,
+  SMOKE_GRID_SIZES,
+  SmokeDensityBuildError,
+} from '../../../rendering/smoke-cloud/smoke-density-contract.js';
 
 const VIEWER_BACKGROUNDS = Object.freeze(['grid', 'grid-dark', 'white', 'black']);
 const RENDER_MODES = Object.freeze(['points', 'smoke']);
@@ -177,8 +182,14 @@ function assertAdaptiveScale(value) {
 }
 
 function assertSmokeGridSize(value) {
-  if (!Number.isSafeInteger(value) || value < 8) {
-    throw new RangeError('Smoke grid size must be an integer of at least 8.');
+  if (
+    !Number.isSafeInteger(value)
+    || value < 8
+    || value > MAX_SMOKE_GRID_SIZE
+  ) {
+    throw new RangeError(
+      `Smoke grid size must be an integer from 8 through ${MAX_SMOKE_GRID_SIZE}.`
+    );
   }
   return value;
 }
@@ -317,15 +328,20 @@ export function initRenderControls(options) {
   let smokeGridSize = 128;
   let noiseResolutionScale = assertAdaptiveScale(viewer.getAdaptiveScaleFactor());
 
-  // Slider input remains debounced; completed state publications must not wait
-  // on browser timers, which can be deferred for occluded/background pages.
+  // Slider input remains debounced. A committed visibility generation first
+  // gets one paint opportunity, then starts density work in the following
+  // frame so a large build cannot hide the newly published UI state.
   let smokeRebuildTimeout = null;
   let committedSmokeRebuildQueued = false;
 
   function rebuildDirtySmokeIfActive() {
     if (renderModeSelect.value !== 'smoke' || !smokeDirty) return;
-    rebuildSmokeDensity(smokeGridSize);
-    markSmokeClean();
+    try {
+      rebuildSmokeDensity(smokeGridSize);
+      markSmokeClean();
+    } catch (error) {
+      settleSmokeBuildFailure(error);
+    }
   }
 
   function scheduleSliderSmokeRebuild() {
@@ -345,9 +361,11 @@ export function initRenderControls(options) {
       smokeRebuildTimeout = null;
     }
     committedSmokeRebuildQueued = true;
-    queueMicrotask(() => {
-      committedSmokeRebuildQueued = false;
-      rebuildDirtySmokeIfActive();
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        committedSmokeRebuildQueued = false;
+        rebuildDirtySmokeIfActive();
+      });
     });
   }
 
@@ -400,6 +418,30 @@ export function initRenderControls(options) {
   }
 
   let currentRenderMode = renderModeSelect.value;
+  function publishRenderMode(mode) {
+    viewer.setRenderMode(mode);
+    renderModeSelect.value = mode;
+    smokeControls.classList.toggle('visible', mode === 'smoke');
+    pointsControls.classList.toggle('visible', mode === 'points');
+    depthControls.style.display = mode === 'smoke' ? 'none' : 'block';
+    rendererControls.style.display = mode === 'smoke' ? 'none' : 'block';
+    currentRenderMode = mode;
+  }
+
+  function settleSmokeBuildFailure(error) {
+    smokeDirty = true;
+    if (!(error instanceof SmokeDensityBuildError)) {
+      const message = error instanceof Error
+        ? error.message
+        : String(error);
+      getNotificationCenter().error(
+        `Smoke density could not be built: ${message}`,
+        { category: 'rendering' }
+      );
+    }
+    publishRenderMode('points');
+  }
+
   function applyRenderMode(mode) {
     const exactMode = assertRenderMode(mode);
     if (exactMode === 'smoke' && viewer.hasSnapshots()) {
@@ -408,17 +450,16 @@ export function initRenderControls(options) {
 
     // Build smoke volume on first switch to smoke mode, or if dirty.
     if (exactMode === 'smoke' && (!smokeBuiltOnce || smokeDirty)) {
-      rebuildSmokeDensity(smokeGridSize);
-      smokeBuiltOnce = true;
-      smokeDirty = false;
+      try {
+        rebuildSmokeDensity(smokeGridSize);
+        markSmokeClean();
+      } catch (error) {
+        settleSmokeBuildFailure(error);
+        return false;
+      }
     }
-    viewer.setRenderMode(exactMode);
-    renderModeSelect.value = exactMode;
-    smokeControls.classList.toggle('visible', exactMode === 'smoke');
-    pointsControls.classList.toggle('visible', exactMode === 'points');
-    depthControls.style.display = exactMode === 'smoke' ? 'none' : 'block';
-    rendererControls.style.display = exactMode === 'smoke' ? 'none' : 'block';
-    currentRenderMode = exactMode;
+    publishRenderMode(exactMode);
+    return true;
   }
 
   // ---------------------------------------------------------------------------
@@ -569,14 +610,16 @@ export function initRenderControls(options) {
   updateSmokeDirectLightSlider();
   smokeDirectLightInput.addEventListener('input', updateSmokeDirectLightSlider);
 
-  const GRID_SIZES = [32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024];
   function sliderToGridSize(sliderValue) {
     if (!isFiniteNumber(sliderValue) || sliderValue < 0 || sliderValue > 100) {
       throw new RangeError('Smoke grid density must be a finite number between 0 and 100.');
     }
     const t = sliderValue / 100;
-    const idx = Math.min(GRID_SIZES.length - 1, Math.floor(t * GRID_SIZES.length));
-    return GRID_SIZES[idx];
+    const idx = Math.min(
+      SMOKE_GRID_SIZES.length - 1,
+      Math.floor(t * SMOKE_GRID_SIZES.length)
+    );
+    return SMOKE_GRID_SIZES[idx];
   }
 
   function updateSmokeGridSlider() {

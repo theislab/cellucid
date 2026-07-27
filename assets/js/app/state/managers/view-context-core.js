@@ -110,8 +110,14 @@ export const viewContextCoreMethods = {
     this.centroidLabels = ctx.centroidLabels ? ctx.centroidLabels.map((c) => (c ? { ...c } : c)) : [];
     this.filteredCount = ctx.filteredCount ? { ...ctx.filteredCount } : { shown: this.pointCount, total: this.pointCount };
 
-    this._applyOverlaysToFields(this.obsData?.fields, FieldSource.OBS);
-    this._applyOverlaysToFields(this.varData?.fields, FieldSource.VAR);
+    this._applyOverlaysToFields(
+      this.obsData === null ? null : this.obsData.fields,
+      FieldSource.OBS
+    );
+    this._applyOverlaysToFields(
+      this.varData === null ? null : this.varData.fields,
+      FieldSource.VAR
+    );
     this._injectUserDefinedFields();
     this._ensureActiveSelectionNotDeleted();
     getFieldRegistry().invalidate();
@@ -286,8 +292,14 @@ export const viewContextCoreMethods = {
     this.centroidLabels = ctx.centroidLabels ? ctx.centroidLabels.map(c => c ? { ...c } : c) : [];
     this.filteredCount = ctx.filteredCount ? { ...ctx.filteredCount } : { shown: this.pointCount, total: this.pointCount };
 
-    this._applyOverlaysToFields(this.obsData?.fields, FieldSource.OBS);
-    this._applyOverlaysToFields(this.varData?.fields, FieldSource.VAR);
+    this._applyOverlaysToFields(
+      this.obsData === null ? null : this.obsData.fields,
+      FieldSource.OBS
+    );
+    this._applyOverlaysToFields(
+      this.varData === null ? null : this.varData.fields,
+      FieldSource.VAR
+    );
     this._injectUserDefinedFields();
     this._ensureActiveSelectionNotDeleted();
     getFieldRegistry().invalidate();

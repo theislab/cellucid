@@ -1,10 +1,142 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
-  buildDensityVolumeGPU,
+  buildDensityTextureGPU,
 } from '../assets/js/rendering/smoke-cloud/smoke-density.js';
 import { SmokeRenderer } from '../assets/js/rendering/smoke-cloud/smoke-renderer.js';
+import {
+  viewContextViewerSyncMethods,
+} from '../assets/js/app/state/managers/view-context-viewer-sync.js';
+
+test('GPU smoke density never synchronizes a volume through product readback', async () => {
+  const source = await readFile(
+    new URL(
+      '../assets/js/rendering/smoke-cloud/smoke-density.js',
+      import.meta.url,
+    ),
+    'utf8',
+  );
+  assert.doesNotMatch(source, /\bgl\.readPixels\s*\(/);
+});
+
+test('GPU smoke density rejects invalid positions before touching WebGL', () => {
+  const gl = new Proxy({}, {
+    get(_target, property) {
+      throw new Error(`WebGL must not be touched during preflight: ${String(property)}`);
+    },
+  });
+  assert.throws(
+    () => buildDensityTextureGPU(
+      gl,
+      new Float32Array([Number.NaN, 0, 0]),
+      { gridSize: 8 },
+    ),
+    /component 0 must be finite/,
+  );
+  assert.throws(
+    () => buildDensityTextureGPU(
+      gl,
+      new Float32Array([2, 2, 2]),
+      { gridSize: 8 },
+    ),
+    /at least one visible point inside.*\[-1, 1\]/,
+  );
+});
+
+test('GPU smoke density rejects scalar contracts before scanning point contents', () => {
+  const gl = new Proxy({}, {
+    get(_target, property) {
+      throw new Error(`WebGL must not be touched during preflight: ${String(property)}`);
+    },
+  });
+  const positionsWithInvalidContent = new Float32Array([Number.NaN, 0, 0]);
+
+  assert.throws(
+    () => buildDensityTextureGPU(
+      gl,
+      positionsWithInvalidContent,
+      { gridSize: 129 },
+    ),
+    /gridSize.*8 through 128/i,
+  );
+  assert.throws(
+    () => buildDensityTextureGPU(
+      gl,
+      positionsWithInvalidContent,
+      { gamma: Number.MIN_VALUE, gridSize: 8 },
+    ),
+    /gamma.*normal Float32/i,
+  );
+  assert.throws(
+    () => buildDensityTextureGPU(
+      gl,
+      positionsWithInvalidContent,
+      { gamma: Number.MAX_VALUE, gridSize: 8 },
+    ),
+    /gamma.*normal Float32/i,
+  );
+  assert.throws(
+    () => buildDensityTextureGPU(
+      gl,
+      positionsWithInvalidContent,
+      { gridSize: 8, surprise: true },
+    ),
+    /option "surprise" is unknown/i,
+  );
+});
+
+test('smoke density source retains dataset arrays without an O(n) position copy', () => {
+  const positions = new Float32Array([
+    -0.5, 0, 0.5,
+    0.5, 0, -0.5,
+  ]);
+  const alpha = new Float32Array([1, 0]);
+  const outlierQuantiles = new Float32Array([0.2, -1]);
+  const source = viewContextViewerSyncMethods.getSmokeDensitySource.call({
+    categoryTransparency: alpha,
+    getCurrentOutlierThreshold() {
+      return 0.75;
+    },
+    isOutlierFilterEnabledForActiveField() {
+      return true;
+    },
+    outlierQuantilesArray: outlierQuantiles,
+    pointCount: 2,
+    positionsArray: positions,
+  });
+
+  assert.equal(Object.isFrozen(source), true);
+  assert.strictEqual(source.positions, positions);
+  assert.strictEqual(source.alpha, alpha);
+  assert.strictEqual(source.outlierQuantiles, outlierQuantiles);
+  assert.equal(source.outlierThreshold, 0.75);
+});
+
+test('an all-hidden smoke source settles empty before touching WebGL', () => {
+  const gl = new Proxy({}, {
+    get(_target, property) {
+      throw new Error(`WebGL must not be touched for an empty source: ${String(property)}`);
+    },
+  });
+  const result = buildDensityTextureGPU(
+    gl,
+    new Float32Array([
+      -0.5, 0, 0.5,
+      0.5, 0, -0.5,
+    ]),
+    {
+      gridSize: 8,
+      visibility: {
+        alpha: new Float32Array([0, 0]),
+        outlierQuantiles: null,
+        outlierThreshold: null,
+      },
+    },
+  );
+  assert.equal(result, null);
+});
 
 function createFakeGl() {
   let nextId = 1;
@@ -233,6 +365,9 @@ test('clearing smoke volume releases the exact texture and is idempotent', () =>
 test('float smoke accumulation explicitly requires both WebGL extensions', () => {
   const requestedExtensions = [];
   const gl = {
+    isContextLost() {
+      return false;
+    },
     getExtension(name) {
       requestedExtensions.push(name);
       return name === 'EXT_color_buffer_float' ? {} : null;
@@ -240,7 +375,7 @@ test('float smoke accumulation explicitly requires both WebGL extensions', () =>
   };
 
   assert.throws(
-    () => buildDensityVolumeGPU(
+    () => buildDensityTextureGPU(
       gl,
       new Float32Array([0, 0, 0]),
       { gridSize: 8 },

@@ -472,7 +472,7 @@ export const viewContextViewerSyncMethods = {
     if (!total) return new Float32Array();
 
     const alpha = this.categoryTransparency || new Float32Array(total).fill(1.0);
-    const applyOutlierFilter = this.isOutlierFilterEnabledForActiveField?.();
+    const applyOutlierFilter = this.isOutlierFilterEnabledForActiveField();
     const outliers = applyOutlierFilter ? (this.outlierQuantilesArray || []) : [];
     const outlierThreshold = applyOutlierFilter ? this.getCurrentOutlierThreshold() : 1.0;
 
@@ -492,38 +492,67 @@ export const viewContextViewerSyncMethods = {
     return mask;
   },
 
-  getVisiblePositionsForSmoke() {
+  getSmokeDensitySource() {
     const positions = this.positionsArray;
-    if (!positions || !this.pointCount) return new Float32Array();
-
-    const alpha = this.categoryTransparency || new Float32Array(this.pointCount).fill(1.0);
-    const applyOutlierFilter = this.isOutlierFilterEnabledForActiveField?.();
-    const outliers = applyOutlierFilter ? (this.outlierQuantilesArray || []) : [];
-    const outlierThreshold = applyOutlierFilter ? this.getCurrentOutlierThreshold() : 1.0;
-
-    let visibleCount = 0;
-    for (let i = 0; i < this.pointCount; i++) {
-      if (alpha[i] <= 0.001) continue;
-      if (applyOutlierFilter) {
-        const q = (i < outliers.length) ? outliers[i] : -1;
-        if (q >= 0 && q > outlierThreshold) continue;
-      }
-      visibleCount++;
+    const pointCount = this.pointCount;
+    if (
+      !(positions instanceof Float32Array)
+      || positions.length !== pointCount * 3
+    ) {
+      throw new TypeError(
+        'Smoke density source requires the exact dataset Float32 XYZ array.'
+      );
     }
-
-    const result = new Float32Array(visibleCount * 3);
-    let dst = 0;
-    for (let i = 0; i < this.pointCount; i++) {
-      if (alpha[i] <= 0.001) continue;
-      if (applyOutlierFilter) {
-        const q = (i < outliers.length) ? outliers[i] : -1;
-        if (q >= 0 && q > outlierThreshold) continue;
-      }
-      const srcIdx = 3 * i;
-      result[dst++] = positions[srcIdx];
-      result[dst++] = positions[srcIdx + 1];
-      result[dst++] = positions[srcIdx + 2];
+    const alpha = this.categoryTransparency;
+    if (
+      !(alpha instanceof Float32Array)
+      || alpha.length !== pointCount
+    ) {
+      throw new TypeError(
+        'Smoke density source requires the exact dataset visibility array.'
+      );
     }
-    return result;
+    const applyOutlierFilter = this.isOutlierFilterEnabledForActiveField();
+    if (typeof applyOutlierFilter !== 'boolean') {
+      throw new TypeError(
+        'Smoke density source requires exact outlier-filter ownership.'
+      );
+    }
+    const outlierQuantiles = applyOutlierFilter
+      ? this.outlierQuantilesArray
+      : null;
+    const outlierThreshold = applyOutlierFilter
+      ? this.getCurrentOutlierThreshold()
+      : null;
+    if (
+      outlierQuantiles !== null
+      && (
+        !(outlierQuantiles instanceof Float32Array)
+        || outlierQuantiles.length !== pointCount
+      )
+    ) {
+      throw new TypeError(
+        'Smoke density source requires exact dataset outlier quantiles.'
+      );
+    }
+    if (
+      outlierThreshold !== null
+      && (
+        typeof outlierThreshold !== 'number'
+        || !Number.isFinite(outlierThreshold)
+        || outlierThreshold < 0
+        || outlierThreshold > 1
+      )
+    ) {
+      throw new RangeError(
+        'Smoke density source outlier threshold must be between 0 and 1.'
+      );
+    }
+    return Object.freeze({
+      alpha,
+      outlierQuantiles,
+      outlierThreshold,
+      positions,
+    });
   }
 };

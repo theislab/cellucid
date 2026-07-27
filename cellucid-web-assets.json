@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "build_id": "2026-07-27.9",
+  "build_id": "2026-07-27.10",
   "assets": [
     {
       "path": "assets/css/README.md",
@@ -1252,8 +1252,8 @@
     },
     {
       "path": "assets/js/app/main.js",
-      "sha256": "6f3c4e3bca6dca0e2610db6ecf5771d3b14c1364d3f939375030d0a7c5017671",
-      "bytes": 135675,
+      "sha256": "f5cf611bbc1dec6d13e032d94801893e0a7712379386d45072d76660172d1f0f",
+      "bytes": 136285,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -1594,14 +1594,14 @@
     },
     {
       "path": "assets/js/app/state/managers/view-context-core.js",
-      "sha256": "dd8b9706e0693c7c284cae80c1e4a6df5c9babe6b128b535549db0612d6500cf",
-      "bytes": 15859,
+      "sha256": "e9ef3d29784ab6858e0b8e28b08e3ccee8a2b44c1ddc0c0d8f3c29ce4bec5e27",
+      "bytes": 16051,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
       "path": "assets/js/app/state/managers/view-context-viewer-sync.js",
-      "sha256": "32a87109f6c2b2c7ccffd29bfb0737548b5a9bf4631581fd42b72092e9b11fb2",
-      "bytes": 17765,
+      "sha256": "adabb8e18589a4c8aa03c2fc1092986c94cf0d15166ee86a819d3073fc97c4e9",
+      "bytes": 18251,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2080,8 +2080,8 @@
     },
     {
       "path": "assets/js/app/ui/modules/render-controls.js",
-      "sha256": "1dbbdb49a742b0ee2342c3737f8747df1708b9fed67e3c3eea183d8694f2e887",
-      "bytes": 25696,
+      "sha256": "3364e5cd88378b36d60d6666f41ed979f148e471e7229a18e91a8eddb3955e31",
+      "bytes": 26619,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2482,8 +2482,8 @@
     },
     {
       "path": "assets/js/rendering/shaders/density-shaders.js",
-      "sha256": "37de331feefeab2813e29786f78c2dae00704410a10c10f87286e6409fb64bd6",
-      "bytes": 3171,
+      "sha256": "6bd33af4f06f9242414731c5e79092ab5d2827f12dc198b4fe97df2d31cb2c68",
+      "bytes": 4013,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2529,21 +2529,27 @@
       "content_type": "application/javascript; charset=utf-8"
     },
     {
+      "path": "assets/js/rendering/smoke-cloud/smoke-density-contract.js",
+      "sha256": "95e0c2d2de47c2cba64aa6c4d40f55f136eeed8f236b8b1ffa8018c295d2c405",
+      "bytes": 304,
+      "content_type": "application/javascript; charset=utf-8"
+    },
+    {
       "path": "assets/js/rendering/smoke-cloud/smoke-density.js",
-      "sha256": "01448a589325af5eebb2101c3ee7f92bc9bf0aa15da73f40e139d83a4d7e975b",
-      "bytes": 17143,
+      "sha256": "00fda088920332f5f21b4a3adf73fa3d3888c7113d9b7ec109594d440d3de7bd",
+      "bytes": 41639,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
       "path": "assets/js/rendering/smoke-cloud/smoke-renderer.js",
-      "sha256": "e5d7608aabba46322b7bdca6d5a82c9d94e48c0aa41929855ecb9d9f12f60709",
-      "bytes": 24685,
+      "sha256": "f5d4f2db1f85f0b0575380558e37650956024b23295a3db21470d8a3b5532d60",
+      "bytes": 29636,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
       "path": "assets/js/rendering/viewer.js",
-      "sha256": "c1a528e024b594f3473d2373e201ce6cfe9c30820f38111df24c208b7f8ebb71",
-      "bytes": 238219,
+      "sha256": "2903da28a20c3a5d8969e119367780a85145feef567bdfedc035ef4eb0fe5543",
+      "bytes": 238258,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2578,8 +2584,8 @@
     },
     {
       "path": "index.html",
-      "sha256": "2fde5f3fb4962f6683788f92b82999338988c5408c19c08f92a81b808dc13036",
-      "bytes": 98822,
+      "sha256": "186dd4b603987ce8b9ba1663948a1ce7ad7a71e08d5ba75f6ab277b882a18adb",
+      "bytes": 98823,
       "content_type": "text/html; charset=utf-8"
     },
     {

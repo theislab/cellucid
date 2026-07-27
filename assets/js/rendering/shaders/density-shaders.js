@@ -101,11 +101,37 @@ void main() {
 }
 `;
 
+// Reduces one R32F atlas level to the maximum of each 2x2 texel block.
+// Repeating this pass down to 1x1 preserves the exact global maximum without
+// synchronizing the GPU back to JavaScript.
+export const REDUCE_MAX_FS = `#version 300 es
+precision highp float;
+
+uniform sampler2D u_input;
+uniform ivec2 u_inputSize;
+
+out vec4 fragColor;
+
+void main() {
+  ivec2 base = ivec2(gl_FragCoord.xy) * 2;
+  float maximum = 0.0;
+  for (int y = 0; y < 2; y++) {
+    for (int x = 0; x < 2; x++) {
+      ivec2 coord = base + ivec2(x, y);
+      if (all(lessThan(coord, u_inputSize))) {
+        maximum = max(maximum, texelFetch(u_input, coord, 0).r);
+      }
+    }
+  }
+  fragColor = vec4(maximum, 0.0, 0.0, 1.0);
+}
+`;
+
 export const NORMALIZE_FS = `#version 300 es
 precision highp float;
 
 uniform sampler2D u_atlas;
-uniform float u_maxValue;
+uniform sampler2D u_maxAtlas;
 uniform float u_gamma;
 
 in vec2 v_uv;
@@ -113,8 +139,10 @@ out vec4 fragColor;
 
 void main() {
   float density = texture(u_atlas, v_uv).r;
-  float normalized = density / max(u_maxValue, 0.0001);
-  float result = pow(normalized, u_gamma);
-  fragColor = vec4(result, 0.0, 0.0, 1.0);
+  float maximum = texelFetch(u_maxAtlas, ivec2(0), 0).r;
+  float normalized = density / max(maximum, 0.0001);
+  float result = pow(clamp(normalized, 0.0, 1.0), u_gamma);
+  float quantized = floor(result * 255.0 + 0.5) / 255.0;
+  fragColor = vec4(quantized, 0.0, 0.0, 1.0);
 }
 `;

@@ -13,6 +13,9 @@
  * @module main
  */
 import { createViewer } from '../rendering/viewer.js';
+import {
+  MAX_SMOKE_GRID_SIZE
+} from '../rendering/smoke-cloud/smoke-density-contract.js';
 import { createDataState } from './state/index.js';
 import { initUI } from './ui/core/ui-coordinator.js';
 import {
@@ -1667,36 +1670,54 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     }
     // One-time helper to rebuild density from current visibility + grid
     function rebuildSmokeDensity(gridSize) {
-      if (!Number.isInteger(gridSize) || gridSize < 8) {
-        throw new RangeError(
-          'Smoke density rebuild requires an exact gridSize integer of at least 8.'
-        );
-      }
-      if (typeof state.getVisiblePositionsForSmoke !== 'function') {
-        throw new TypeError(
-          'Smoke density rebuild requires getVisiblePositionsForSmoke().'
-        );
-      }
-      const visiblePositions = state.getVisiblePositionsForSmoke();
       if (
-        !(visiblePositions instanceof Float32Array) ||
-        visiblePositions.length % 3 !== 0
+        !Number.isInteger(gridSize)
+        || gridSize < 8
+        || gridSize > MAX_SMOKE_GRID_SIZE
+      ) {
+        throw new RangeError(
+          `Smoke density rebuild requires an exact gridSize integer from 8 through ${MAX_SMOKE_GRID_SIZE}.`
+        );
+      }
+      if (typeof state.getSmokeDensitySource !== 'function') {
+        throw new TypeError(
+          'Smoke density rebuild requires getSmokeDensitySource().'
+        );
+      }
+      const source = state.getSmokeDensitySource();
+      if (
+        source === null
+        || typeof source !== 'object'
+        || Array.isArray(source)
+        || Object.getPrototypeOf(source) !== Object.prototype
+        || Object.keys(source).sort().join(',') !==
+          'alpha,outlierQuantiles,outlierThreshold,positions'
+        || !(source.positions instanceof Float32Array)
+        || source.positions.length % 3 !== 0
       ) {
         throw new TypeError(
-          'Smoke density rebuild requires a Float32Array with exact XYZ positions.'
+          'Smoke density rebuild requires one exact zero-copy dataset source.'
         );
       }
-      if (visiblePositions.length === 0) {
+      if (source.positions.length === 0) {
         viewer.clearSmokeVolume();
-        debug.log('Cleared smoke volume because no cells are visible.');
+        debug.log('Cleared smoke volume because the dataset is empty.');
         return;
       }
 
-      debug.log(`Building smoke volume at ${gridSize}^3 from ${visiblePositions.length / 3} visible points (GPU)…`);
-      // Use GPU-accelerated splatting for dramatic speedup
-      viewer.buildSmokeVolumeGPU(visiblePositions, {
+      debug.log(
+        `Building smoke volume at ${gridSize}^3 from ` +
+        `${source.positions.length / 3} dataset points with bounded ` +
+        `visibility streaming (GPU)…`
+      );
+      viewer.buildSmokeVolumeGPU(source.positions, {
         gridSize,
-        gamma: 0.7
+        gamma: 0.7,
+        visibility: {
+          alpha: source.alpha,
+          outlierQuantiles: source.outlierQuantiles,
+          outlierThreshold: source.outlierThreshold,
+        },
       });
     }
 

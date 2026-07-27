@@ -3,6 +3,9 @@ import test from 'node:test';
 
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
 import { initRenderControls } from '../assets/js/app/ui/modules/render-controls.js';
+import {
+  SmokeDensityBuildError,
+} from '../assets/js/rendering/smoke-cloud/smoke-density-contract.js';
 
 class FakeElement {
   constructor({
@@ -44,7 +47,7 @@ const INPUT_DEFAULTS = Object.freeze({
   lightingInput: ['60', '1'],
   fogInput: ['50', '1'],
   sizeAttenuationInput: ['80', '1'],
-  smokeGridInput: ['60', '1'],
+  smokeGridInput: ['80', '1'],
   smokeStepsInput: ['75', '1'],
   smokeDensityInput: ['56', '1'],
   smokeSpeedInput: ['40', '1'],
@@ -176,13 +179,14 @@ function installDocument(background = 'grid', storage = null) {
   };
 }
 
-function makeOptions(viewerOptions) {
+function makeOptions(viewerOptions, rebuild = null) {
   const viewer = makeViewer(viewerOptions);
   const dom = makeDom();
   const smokeCalls = [];
   const smoke = {
     rebuildSmokeDensity(gridSize) {
       smokeCalls.push(gridSize);
+      if (rebuild !== null) return rebuild(gridSize);
     },
   };
   return { viewer, dom, smoke, smokeCalls };
@@ -341,17 +345,65 @@ test('public smoke rebuild requires one explicit exact grid size', t => {
 
   assert.throws(
     () => controls.rebuildSmokeDensity(),
-    /grid size.*integer.*at least 8/i,
+    /grid size.*integer.*8 through 128/i,
   );
   assert.throws(
     () => controls.rebuildSmokeDensity('128'),
-    /grid size.*integer.*at least 8/i,
+    /grid size.*integer.*8 through 128/i,
+  );
+  assert.throws(
+    () => controls.rebuildSmokeDensity(129),
+    /grid size.*integer.*8 through 128/i,
   );
   controls.rebuildSmokeDensity(128);
   assert.deepEqual(smokeCalls, [128]);
 });
 
-test('committed smoke visibility changes coalesce without the slider debounce timer', async t => {
+test('smoke grid defaults to bounded 128³ and exposes no oversized UI choice', t => {
+  const restore = installDocument();
+  t.after(restore);
+  const { viewer, dom, smoke } = makeOptions();
+  const controls = initRenderControls({ viewer, dom, smoke });
+
+  assert.equal(controls.getSmokeGridSize(), 128);
+  assert.equal(dom.smokeGridDisplay.textContent, '128³');
+});
+
+test('failed smoke entry rolls every visible control back to points', t => {
+  const restore = installDocument();
+  t.after(restore);
+  const failure = new SmokeDensityBuildError(
+    'synthetic unavailable smoke renderer',
+    new Error('synthetic GPU capability failure'),
+  );
+  const { viewer, dom, smoke } = makeOptions(
+    undefined,
+    () => {
+      throw failure;
+    },
+  );
+  initRenderControls({ viewer, dom, smoke });
+
+  dom.renderModeSelect.value = 'smoke';
+  assert.doesNotThrow(() => dom.renderModeSelect.dispatch('change'));
+  assert.equal(dom.renderModeSelect.value, 'points');
+  assert.deepEqual(
+    viewer.calls.filter(([name]) => name === 'setRenderMode').at(-1),
+    ['setRenderMode', 'points'],
+  );
+  assert.deepEqual(dom.smokeControls.classList.toggles.at(-1), [
+    'visible',
+    false,
+  ]);
+  assert.deepEqual(dom.pointsControls.classList.toggles.at(-1), [
+    'visible',
+    true,
+  ]);
+  assert.equal(dom.depthControls.style.display, 'block');
+  assert.equal(dom.rendererControls.style.display, 'block');
+});
+
+test('committed smoke changes coalesce and rebuild after one paint generation', t => {
   const restore = installDocument();
   t.after(restore);
   const { viewer, dom, smoke, smokeCalls } = makeOptions();
@@ -370,14 +422,97 @@ test('committed smoke visibility changes coalesce without the slider debounce ti
   t.after(() => {
     globalThis.setTimeout = originalSetTimeout;
   });
+  const priorRequestAnimationFrame = Object.getOwnPropertyDescriptor(
+    globalThis,
+    'requestAnimationFrame',
+  );
+  const frameCallbacks = [];
+  Object.defineProperty(globalThis, 'requestAnimationFrame', {
+    configurable: true,
+    writable: true,
+    value(callback) {
+      frameCallbacks.push(callback);
+      return frameCallbacks.length;
+    },
+  });
+  t.after(() => {
+    if (priorRequestAnimationFrame === undefined) {
+      delete globalThis.requestAnimationFrame;
+    } else {
+      Object.defineProperty(
+        globalThis,
+        'requestAnimationFrame',
+        priorRequestAnimationFrame,
+      );
+    }
+  });
 
   controls.markSmokeDirty();
   controls.markSmokeDirty();
   controls.markSmokeDirty();
-  await new Promise(resolve => queueMicrotask(resolve));
 
   assert.equal(debounceScheduled, false);
+  assert.deepEqual(smokeCalls, []);
+  assert.equal(frameCallbacks.length, 1);
+  frameCallbacks.shift()(1);
+  assert.deepEqual(smokeCalls, []);
+  assert.equal(frameCallbacks.length, 1);
+  frameCallbacks.shift()(2);
   assert.deepEqual(smokeCalls, [currentGridSize]);
+});
+
+test('a failed committed smoke rebuild settles inside its frame owner', t => {
+  const restore = installDocument();
+  t.after(restore);
+  let failRebuild = false;
+  const { viewer, dom, smoke } = makeOptions(
+    undefined,
+    () => {
+      if (failRebuild) {
+        throw new SmokeDensityBuildError(
+          'synthetic scheduled smoke failure',
+          new Error('synthetic scheduled GPU failure'),
+        );
+      }
+    },
+  );
+  const controls = initRenderControls({ viewer, dom, smoke });
+  controls.applyRenderMode('smoke');
+  failRebuild = true;
+
+  const priorRequestAnimationFrame = Object.getOwnPropertyDescriptor(
+    globalThis,
+    'requestAnimationFrame',
+  );
+  const frameCallbacks = [];
+  Object.defineProperty(globalThis, 'requestAnimationFrame', {
+    configurable: true,
+    writable: true,
+    value(callback) {
+      frameCallbacks.push(callback);
+      return frameCallbacks.length;
+    },
+  });
+  t.after(() => {
+    if (priorRequestAnimationFrame === undefined) {
+      delete globalThis.requestAnimationFrame;
+    } else {
+      Object.defineProperty(
+        globalThis,
+        'requestAnimationFrame',
+        priorRequestAnimationFrame,
+      );
+    }
+  });
+
+  controls.markSmokeDirty();
+  frameCallbacks.shift()(1);
+  assert.doesNotThrow(() => frameCallbacks.shift()(2));
+  assert.equal(dom.renderModeSelect.value, 'points');
+  assert.deepEqual(
+    viewer.calls.filter(([name]) => name === 'setRenderMode').at(-1),
+    ['setRenderMode', 'points'],
+  );
 });
 
 test('current render-control source contains no normalization/default route', async () => {

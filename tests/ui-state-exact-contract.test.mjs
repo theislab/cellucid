@@ -735,12 +735,69 @@ test('an exact zero-cell observation generation owns valid empty visibility', ()
   );
 });
 
+test('view restoration preserves exact null field inventories', () => {
+  const overlayCalls = [];
+  const state = {
+    pointCount: 2,
+    obsData: { fields: [] },
+    varData: null,
+    activeFieldIndex: -1,
+    activeVarFieldIndex: -1,
+    activeFieldSource: null,
+    activeDimensionLevel: 2,
+    activeViewId: 'live',
+    colorsArray: new Uint8Array(8),
+    categoryTransparency: Float32Array.from([1, 1]),
+    cellVisibilityMask: Float32Array.from([1, 1]),
+    outlierQuantilesArray: Float32Array.from([-1, -1]),
+    centroidPositions: new Float32Array(),
+    centroidColors: new Uint8Array(),
+    centroidOutliers: new Float32Array(),
+    centroidLabels: [],
+    filteredCount: { shown: 2, total: 2 },
+    viewContexts: new Map(),
+    _cloneFieldState: viewContextCoreMethods._cloneFieldState,
+    _cloneObsData: viewContextCoreMethods._cloneObsData,
+    _cloneVarData: viewContextCoreMethods._cloneVarData,
+    _buildContextFromCurrent: viewContextCoreMethods._buildContextFromCurrent,
+    _resetViewContexts: viewContextCoreMethods._resetViewContexts,
+    _syncActiveContext: viewContextCoreMethods._syncActiveContext,
+    restoreContext: viewContextCoreMethods.restoreContext,
+    _applyOverlaysToFields(fields, source) {
+      overlayCalls.push([source, fields === null ? null : fields.length]);
+      FieldOverlayInternalMethods.prototype._applyOverlaysToFields.call(
+        this,
+        fields,
+        source,
+      );
+    },
+    _injectUserDefinedFields() {},
+    _ensureActiveSelectionNotDeleted() {},
+    _pushColorsToViewer() {},
+    _pushTransparencyToViewer() {},
+    _pushCentroidsToViewer() {},
+    computeGlobalVisibility() {},
+    updateFilterSummary() {},
+  };
+  const context = state._buildContextFromCurrent('live', {
+    cloneArrays: true,
+  });
+
+  state.restoreContext(context, { preserveSnapshots: false });
+
+  assert.equal(state.varData, null);
+  assert.deepEqual(overlayCalls, [
+    [FieldSource.OBS, 0],
+    [FieldSource.VAR, null],
+  ]);
+});
+
 test('view switching restores cloned cell masks and rejects invalid targets atomically', () => {
   const pointCount = 4;
   const state = {
     pointCount,
     obsData: { fields: [] },
-    varData: { fields: [] },
+    varData: null,
     activeFieldIndex: -1,
     activeVarFieldIndex: -1,
     activeFieldSource: null,
@@ -771,7 +828,8 @@ test('view switching restores cloned cell masks and rejects invalid targets atom
     computeGlobalVisibility:
       DataStateFilterMethods.prototype.computeGlobalVisibility,
     _syncColorsAlpha: DataStateColorMethods.prototype._syncColorsAlpha,
-    _applyOverlaysToFields() {},
+    _applyOverlaysToFields:
+      FieldOverlayInternalMethods.prototype._applyOverlaysToFields,
     _injectUserDefinedFields() {},
     _ensureActiveSelectionNotDeleted() {},
     _reinitializeActiveField() {},

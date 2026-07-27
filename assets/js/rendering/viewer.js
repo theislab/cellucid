@@ -1254,6 +1254,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     e.preventDefault();
     if (webglContextLost) return;
     webglContextLost = true;
+    smokeRenderer.handleContextLost();
 
     // Stop animation loop immediately to avoid GL calls on a lost context.
     if (animationHandle) {
