@@ -423,11 +423,14 @@ export async function handleDatasetReloadFailure(options) {
 
 /**
  * Synchronize non-scientific UI after a complete dataset has already been
- * published. A synchronization error is reported as a ready dataset with
- * impaired controls, never relabeled as a failed scientific reload.
+ * published. Resource finalization runs exactly once after synchronization,
+ * including when synchronization throws. Either error is reported as a ready
+ * dataset with impaired controls, never relabeled as a failed scientific
+ * reload.
  *
  * @param {object} options
  * @param {() => void} options.synchronize
+ * @param {() => void} options.finalize
  * @param {(error: unknown) => void} options.reportFailure
  * @returns {
  *   {status: 'ready'} |
@@ -437,25 +440,67 @@ export async function handleDatasetReloadFailure(options) {
 export function settlePublishedDatasetUi(options) {
   requireExactKeys(
     options,
-    ['synchronize', 'reportFailure'],
+    ['synchronize', 'finalize', 'reportFailure'],
     'published dataset UI synchronization'
   );
-  const { synchronize, reportFailure } = options;
+  const { finalize, synchronize, reportFailure } = options;
   if (
     typeof synchronize !== 'function' ||
+    typeof finalize !== 'function' ||
     typeof reportFailure !== 'function'
   ) {
     throw new TypeError(
       'Published dataset UI synchronization handlers must be functions.'
     );
   }
+  const errors = [];
   try {
     synchronize();
-    return { status: 'ready' };
   } catch (error) {
-    reportFailure(error);
-    return { status: 'ready-ui-error', error };
+    errors.push(error);
   }
+  try {
+    finalize();
+  } catch (error) {
+    errors.push(error);
+  }
+  if (errors.length === 0) return { status: 'ready' };
+  const error = errors.length === 1
+    ? errors[0]
+    : new AggregateError(
+        errors,
+        'Dataset UI synchronization and resource retirement failed.'
+      );
+  reportFailure(error);
+  return { status: 'ready-ui-error', error };
+}
+
+/**
+ * Create one exact owner for cache-bearing runtime resources. A retirement is
+ * attempted at most once even when clearCache() itself throws, preventing
+ * failure handlers from repeatedly touching an already-invalid generation.
+ *
+ * @returns {Readonly<{retire(resource: Object): boolean}>}
+ */
+export function createDatasetRuntimeRetirementOwner() {
+  const retiredResources = new WeakSet();
+  return Object.freeze({
+    retire(resource) {
+      if (
+        resource === null ||
+        typeof resource !== 'object' ||
+        typeof resource.clearCache !== 'function'
+      ) {
+        throw new TypeError(
+          'Dataset runtime retirement requires one cache-bearing resource.'
+        );
+      }
+      if (retiredResources.has(resource)) return false;
+      retiredResources.add(resource);
+      resource.clearCache();
+      return true;
+    }
+  });
 }
 
 /**

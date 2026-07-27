@@ -572,10 +572,12 @@ export class VelocityOverlay extends OverlayBase {
     this._fboByView = new Map();
 
     // Texture format detection
-    this._floatTextureFormat = null;
+    this._textureFormat = null;
 
-    // Empty VAO for fullscreen passes
-    this._emptyVAO = null;
+    // Fullscreen passes use gl_VertexID, but Firefox desktop OpenGL still
+    // requires an enabled attribute-zero array to avoid emulation.
+    this._fullscreenVAO = null;
+    this._fullscreenAttrib0Buffer = null;
 
     // Camera motion tracking for trail fade compensation
     this._lastCameraPosition = null;
@@ -735,7 +737,7 @@ export class VelocityOverlay extends OverlayBase {
     this._colormapTexture = gl.createTexture();
     this._updateColormap(true);
 
-    this._emptyVAO = gl.createVertexArray();
+    this._createFullscreenGeometry();
 
     this._bindSamplers();
   }
@@ -843,9 +845,13 @@ export class VelocityOverlay extends OverlayBase {
     if (this._colormapTexture) gl.deleteTexture(this._colormapTexture);
     this._colormapTexture = null;
 
-    // Empty VAO
-    if (this._emptyVAO) gl.deleteVertexArray(this._emptyVAO);
-    this._emptyVAO = null;
+    // Fullscreen geometry
+    if (this._fullscreenVAO) gl.deleteVertexArray(this._fullscreenVAO);
+    if (this._fullscreenAttrib0Buffer) {
+      gl.deleteBuffer(this._fullscreenAttrib0Buffer);
+    }
+    this._fullscreenVAO = null;
+    this._fullscreenAttrib0Buffer = null;
 
     // Fields
     for (const perField of this._fieldsById.values()) {
@@ -883,6 +889,70 @@ export class VelocityOverlay extends OverlayBase {
   // ===========================================================================
   // PARTICLE BUFFER MANAGEMENT
   // ===========================================================================
+
+  _createFullscreenGeometry() {
+    const gl = this.gl;
+    if (
+      this._fullscreenVAO !== null ||
+      this._fullscreenAttrib0Buffer !== null
+    ) {
+      throw new Error(
+        'VelocityOverlay fullscreen geometry is already initialized.'
+      );
+    }
+
+    const vao = gl.createVertexArray();
+    if (vao === null) {
+      throw new Error(
+        'VelocityOverlay could not allocate the fullscreen vertex array.'
+      );
+    }
+    const buffer = gl.createBuffer();
+    if (buffer === null) {
+      gl.deleteVertexArray(vao);
+      throw new Error(
+        'VelocityOverlay could not allocate the fullscreen attribute-zero buffer.'
+      );
+    }
+
+    try {
+      gl.bindVertexArray(vao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+      gl.bufferData(
+        gl.ARRAY_BUFFER,
+        new Float32Array([0, 1, 2, 3]),
+        gl.STATIC_DRAW
+      );
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 1, gl.FLOAT, false, 0, 0);
+      gl.bindVertexArray(null);
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    } catch (error) {
+      const cleanupErrors = [];
+      for (const cleanup of [
+        () => gl.bindVertexArray(null),
+        () => gl.bindBuffer(gl.ARRAY_BUFFER, null),
+        () => gl.deleteBuffer(buffer),
+        () => gl.deleteVertexArray(vao),
+      ]) {
+        try {
+          cleanup();
+        } catch (cleanupError) {
+          cleanupErrors.push(cleanupError);
+        }
+      }
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError(
+          [error, ...cleanupErrors],
+          'VelocityOverlay fullscreen geometry setup and cleanup both failed.'
+        );
+      }
+      throw error;
+    }
+
+    this._fullscreenVAO = vao;
+    this._fullscreenAttrib0Buffer = buffer;
+  }
 
   _createParticleBuffers() {
     const gl = this.gl;
@@ -1043,7 +1113,7 @@ export class VelocityOverlay extends OverlayBase {
     gl.bindTexture(gl.TEXTURE_2D, fbos.trail[readIdx]);
     gl.uniform1i(this._uniformsFade.u_previousFrame, 0);
 
-    gl.bindVertexArray(this._emptyVAO);
+    gl.bindVertexArray(this._fullscreenVAO);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     gl.bindVertexArray(null);
 
@@ -1133,7 +1203,7 @@ export class VelocityOverlay extends OverlayBase {
     gl.bindTexture(gl.TEXTURE_2D, fbos.trail[fbos.trailIdx]);
     gl.uniform1i(this._uniformsThreshold.u_source, 0);
 
-    gl.bindVertexArray(this._emptyVAO);
+    gl.bindVertexArray(this._fullscreenVAO);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
     // Horizontal blur
@@ -1220,7 +1290,7 @@ export class VelocityOverlay extends OverlayBase {
     gl.bindTexture(gl.TEXTURE_2D, fbos.bloom[0]);
     gl.uniform1i(u.u_bloomTex, 1);
 
-    gl.bindVertexArray(this._emptyVAO);
+    gl.bindVertexArray(this._fullscreenVAO);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     gl.bindVertexArray(null);
 
@@ -1232,22 +1302,45 @@ export class VelocityOverlay extends OverlayBase {
   // ===========================================================================
 
   _detectTextureFormat() {
-    if (this._floatTextureFormat) return this._floatTextureFormat;
+    if (this._textureFormat) return this._textureFormat;
 
     const gl = this.gl;
-    const formats = [
-      { internal: gl.RGBA16F, format: gl.RGBA, type: gl.HALF_FLOAT, ext: 'EXT_color_buffer_half_float' },
-      { internal: gl.RGBA32F, format: gl.RGBA, type: gl.FLOAT, ext: 'EXT_color_buffer_float' },
-      { internal: gl.RGBA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE, ext: null }
-    ];
+    const colorBufferFloat = gl.getExtension('EXT_color_buffer_float');
+    const textureFloatLinear = gl.getExtension('OES_texture_float_linear');
+    const floatBlend = gl.getExtension('EXT_float_blend');
+    const formats = [];
+    if (
+      colorBufferFloat !== null &&
+      textureFloatLinear !== null &&
+      floatBlend !== null
+    ) {
+      formats.push(
+        {
+          internal: gl.RGBA16F,
+          format: gl.RGBA,
+          type: gl.HALF_FLOAT,
+        },
+        {
+          internal: gl.RGBA32F,
+          format: gl.RGBA,
+          type: gl.FLOAT,
+        }
+      );
+    }
+    formats.push({
+      internal: gl.RGBA8,
+      format: gl.RGBA,
+      type: gl.UNSIGNED_BYTE,
+    });
 
     for (const fmt of formats) {
-      if (fmt.ext && !gl.getExtension(fmt.ext)) continue;
-
       const tex = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_2D, tex);
       gl.texImage2D(gl.TEXTURE_2D, 0, fmt.internal, 4, 4, 0, fmt.format, fmt.type, null);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
       const fbo = gl.createFramebuffer();
       gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
@@ -1260,7 +1353,7 @@ export class VelocityOverlay extends OverlayBase {
       gl.deleteTexture(tex);
 
       if (status === gl.FRAMEBUFFER_COMPLETE) {
-        this._floatTextureFormat = fmt;
+        this._textureFormat = fmt;
         return fmt;
       }
     }

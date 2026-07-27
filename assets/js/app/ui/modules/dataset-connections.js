@@ -1,186 +1,385 @@
 /**
- * @fileoverview Dataset connection controls.
+ * Exact dataset connection and local-file controls.
  *
- * Encapsulates dataset-adjacent connection UX that is orthogonal to the dataset
- * dropdown itself:
- * - Local user data loading (prepared exports, h5ad, zarr zip)
- * - Remote server connect/disconnect
- * - GitHub repo connect/disconnect
- *
- * Split out of `dataset-controls.js` to keep module responsibilities and file
- * size manageable while preserving runtime behavior.
- *
- * @module ui/modules/dataset-connections
+ * Remote/GitHub connection attempts always use isolated source candidates.
+ * Zero-dataset and failed candidates are disconnected without replacing the
+ * registered source. One dataset is transactionally activated; multiple
+ * datasets require an explicit enabled-selector choice.
  */
 
-import { formatCellCount as formatDataNumber } from '../../../data/data-source.js';
+import {
+  formatCellCount as formatDataNumber,
+  validateDatasetId,
+  validateDatasetIdentity
+} from '../../../data/data-source.js';
 import { getNotificationCenter } from '../../notification-center.js';
-import { updateUrlForDataSource, clearUrlDataSource } from '../../url-state.js';
 import { DATA_LOAD_METHODS } from '../../../analytics/tracker.js';
 import { debug } from '../../../utils/debug.js';
 import {
-  activateValidatedLocalDataset,
+  createDatasetReloadSupersededError,
   isDatasetReloadSupersededError
 } from '../../dataset-reload-outcome.js';
 
-/**
- * @param {object} options
- * @param {object} options.state
- * @param {object} options.viewer
- * @param {object} options.dom
- * @param {import('../../../data/data-source-manager.js').DataSourceManager|null} options.dataSourceManager
- * @param {(metadata: any) => Promise<void> | void} options.reloadDataset
- * @param {(message: string, isError?: boolean) => void} [options.showSessionStatus]
- * @param {(metadata: any, sourceTypeOverride?: string|null) => void} [options.updateDatasetInfo]
- * @param {() => Promise<void> | void} [options.populateDatasetDropdown]
- * @param {string} options.noneDatasetValue
- */
-export function initDatasetConnections({
-  state,
-  viewer,
-  dom,
-  dataSourceManager,
-  reloadDataset,
-  showSessionStatus,
-  updateDatasetInfo,
-  populateDatasetDropdown,
-  noneDatasetValue
-}) {
-  if (!dom || !dataSourceManager) return;
+const CONNECTION_OPTION_KEYS = Object.freeze([
+  'activateDataset',
+  'clearDataset',
+  'dataSourceManager',
+  'dom',
+  'noneDatasetValue',
+  'populateDatasetDropdown'
+]);
 
-  const {
-    select: datasetSelect,
+function isPlainObject(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  return Object.getPrototypeOf(value) === Object.prototype;
+}
 
-    userDataH5adBtn,
-    userDataZarrArchiveBtn,
-    userDataBrowseBtn,
-    userDataFileInput,
-    userDataH5adInput,
-    userDataZarrArchiveInput,
+function requireExactOptions(options) {
+  if (!isPlainObject(options)) {
+    throw new TypeError('Dataset connections options must be a plain object.');
+  }
+  const ownKeys = Reflect.ownKeys(options);
+  if (
+    ownKeys.some(key => typeof key !== 'string') ||
+    ownKeys.some(key => {
+      const descriptor = Object.getOwnPropertyDescriptor(options, key);
+      return (
+        descriptor === undefined ||
+        descriptor.enumerable !== true ||
+        !Object.hasOwn(descriptor, 'value')
+      );
+    })
+  ) {
+    throw new TypeError(
+      'Dataset connections options must use enumerable own data fields.'
+    );
+  }
+  const actual = ownKeys.sort();
+  const expected = [...CONNECTION_OPTION_KEYS].sort();
+  if (
+    actual.length !== expected.length ||
+    actual.some((key, index) => key !== expected[index])
+  ) {
+    throw new TypeError(
+      `Dataset connections options must contain exactly: ` +
+      `${expected.join(', ')}.`
+    );
+  }
+}
 
-    remoteServerUrl,
-    remoteConnectBtn,
-    remoteDisconnectBtn,
-    remoteDisconnectContainer,
+function requireFunction(value, label) {
+  if (typeof value !== 'function') {
+    throw new TypeError(`${label} must be a function.`);
+  }
+  return value;
+}
 
-    githubRepoUrl,
-    githubConnectBtn,
-    githubDisconnectBtn,
-    githubDisconnectContainer
-  } = dom;
+function requireMethod(owner, method, label) {
+  if (
+    owner === null ||
+    typeof owner !== 'object' ||
+    typeof owner[method] !== 'function'
+  ) {
+    throw new TypeError(`${label} must implement ${method}().`);
+  }
+}
 
-  const populate = () => {
-    if (typeof populateDatasetDropdown === 'function') {
-      try {
-        populateDatasetDropdown();
-      } catch (err) {
-        debug.warn('[UI] populateDatasetDropdown failed:', err);
-      }
+function requireSource(source, sourceType, label) {
+  for (const method of [
+    'connect',
+    'createConnectionCandidate',
+    'disconnect',
+    'getConnectionInfo',
+    'getType',
+    'listDatasets'
+  ]) {
+    requireMethod(source, method, label);
+  }
+  if (source.getType() !== sourceType) {
+    throw new TypeError(`${label} must own source type "${sourceType}".`);
+  }
+  return source;
+}
+
+function requireControlGroup(dom, keys, label) {
+  const values = keys.map(key => dom[key]);
+  const present = values.filter(value => value !== undefined).length;
+  if (present === 0) return null;
+  if (present !== keys.length) {
+    throw new TypeError(
+      `${label} controls must provide together: ${keys.join(', ')}.`
+    );
+  }
+  for (const [index, value] of values.entries()) {
+    if (value === null || typeof value !== 'object') {
+      throw new TypeError(`${label} ${keys[index]} must be a DOM element.`);
     }
-  };
+  }
+  return Object.fromEntries(keys.map((key, index) => [key, values[index]]));
+}
 
-  const showStatus =
-    typeof showSessionStatus === 'function'
-      ? showSessionStatus
-      : (message, isError = false) => {
-          const notifications = getNotificationCenter();
-          if (isError) notifications.error(message, { category: 'session' });
-          else notifications.success(message, { category: 'session' });
-        };
+function requireDatasetInventory(value, sourceType) {
+  if (!Array.isArray(value)) {
+    throw new TypeError(
+      `${sourceType} connection must publish a dataset array.`
+    );
+  }
+  const seen = new Set();
+  return value.map((metadata, index) => {
+    if (
+      metadata === null ||
+      typeof metadata !== 'object' ||
+      Array.isArray(metadata)
+    ) {
+      throw new TypeError(
+        `${sourceType} dataset ${index} must be metadata.`
+      );
+    }
+    const id = validateDatasetId(
+      metadata.id,
+      `${sourceType} dataset ${index} id`
+    );
+    if (seen.has(id)) {
+      throw new TypeError(
+        `${sourceType} connection published duplicate dataset id "${id}".`
+      );
+    }
+    validateDatasetIdentity(metadata, id, sourceType);
+    seen.add(id);
+    return metadata;
+  });
+}
 
+function errorMessage(error) {
+  if (error instanceof AggregateError) {
+    const causes = error.errors.map(item => errorMessage(item));
+    return `${error.message} Causes: ${causes.join('; ')}`;
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * @param {Object} options
+ * @param {(datasetId: string, sourceType: string, loadMethod: string, source?: Object|null) => Promise<boolean>} options.activateDataset
+ * @param {() => Promise<boolean>} options.clearDataset
+ * @param {Object} options.dataSourceManager
+ * @param {Object} options.dom
+ * @param {string} options.noneDatasetValue
+ * @param {() => Promise<boolean>} options.populateDatasetDropdown
+ */
+export function initDatasetConnections(options) {
+  requireExactOptions(options);
+  const {
+    activateDataset,
+    clearDataset,
+    dataSourceManager,
+    dom,
+    noneDatasetValue,
+    populateDatasetDropdown
+  } = options;
+  requireFunction(activateDataset, 'Dataset activation owner');
+  requireFunction(clearDataset, 'Dataset clear owner');
+  requireFunction(
+    populateDatasetDropdown,
+    'Dataset catalog population owner'
+  );
+  if (!isPlainObject(dom)) {
+    throw new TypeError('Dataset connections DOM must be a plain object.');
+  }
+  validateDatasetId(noneDatasetValue, 'None dataset control value');
+  for (const method of [
+    'getCurrentSourceType',
+    'getSource',
+    'registerSource',
+    'unregisterSource'
+  ]) {
+    requireMethod(
+      dataSourceManager,
+      method,
+      'Dataset connections dataSourceManager'
+    );
+  }
+
+  const notifications = getNotificationCenter();
+  const datasetSelect = dom.select;
+  if (
+    datasetSelect === null ||
+    typeof datasetSelect !== 'object' ||
+    typeof datasetSelect.focus !== 'function'
+  ) {
+    throw new TypeError(
+      'Dataset connections select must be a focusable DOM element.'
+    );
+  }
+
+  async function populate() {
+    const outcome = await populateDatasetDropdown();
+    if (!isPlainObject(outcome)) {
+      throw new TypeError(
+        'Dataset catalog population must publish one exact outcome.'
+      );
+    }
+    const keys = Reflect.ownKeys(outcome);
+    if (
+      outcome.status === 'ready' &&
+      keys.length === 1 &&
+      keys[0] === 'status'
+    ) {
+      return;
+    }
+    if (
+      outcome.status === 'superseded' &&
+      keys.length === 1 &&
+      keys[0] === 'status'
+    ) {
+      throw createDatasetReloadSupersededError(
+        'Dataset catalog publication was superseded.'
+      );
+    }
+    if (
+      outcome.status === 'failed' &&
+      keys.length === 2 &&
+      keys.includes('error') &&
+      keys.includes('status') &&
+      outcome.error instanceof Error
+    ) {
+      throw outcome.error;
+    }
+    throw new TypeError(
+      'Dataset catalog population published a malformed outcome.'
+    );
+  }
+
+  let localSelectionRevision = 0;
   async function loadLocalUserSelection(
     files,
     { loadMethod, loadingMessage, load }
   ) {
     if (!files || files.length === 0) return;
+    const selectionRevision = ++localSelectionRevision;
+    const assertCurrentSelection = () => {
+      if (selectionRevision !== localSelectionRevision) {
+        throw createDatasetReloadSupersededError(
+          'Local dataset selection was superseded.'
+        );
+      }
+    };
 
-    const userSource = dataSourceManager.getSource('local-user');
-    if (!userSource) {
-      showStatus('User data source not available', true);
+    const registeredSource = dataSourceManager.getSource('local-user');
+    if (registeredSource === null) {
+      notifications.error('User data source is not available.', {
+        category: 'data'
+      });
       return;
     }
+    for (const method of [
+      'createSelectionCandidate',
+      'disconnect',
+      'getType'
+    ]) {
+      requireMethod(
+        registeredSource,
+        method,
+        'Registered local-user source'
+      );
+    }
+    const userSource = registeredSource.createSelectionCandidate();
+    if (
+      userSource === registeredSource ||
+      userSource === null ||
+      typeof userSource !== 'object' ||
+      userSource.getType() !== 'local-user' ||
+      typeof userSource.disconnect !== 'function'
+    ) {
+      throw new TypeError(
+        'Local-user selection candidate must be one isolated local-user source.'
+      );
+    }
 
-    const notifications = getNotificationCenter();
-    const loadNotifId = notifications.loading(loadingMessage, { category: 'data' });
-
+    const loadNotifId = notifications.loading(loadingMessage, {
+      category: 'data'
+    });
+    let candidatePublished = false;
     try {
       const metadata = await load(userSource, files);
-      updateDatasetInfo?.(metadata || null);
-
-      if (datasetSelect && noneDatasetValue) {
-        datasetSelect.value = noneDatasetValue;
-      }
-
-      const activationOutcome = await activateValidatedLocalDataset({
-        switchDataset: () => dataSourceManager.switchToDataset(
-          'local-user',
-          userSource.datasetId,
-          { loadMethod }
-        ),
-        reloadDataset: () => reloadDataset(metadata)
-      });
-
-      if (activationOutcome.status === 'validated-retained') {
-        debug.warn(
-          '[UI] Could not auto-switch to user source:',
-          activationOutcome.error
+      assertCurrentSelection();
+      const ready = await activateDataset(
+        userSource.datasetId,
+        'local-user',
+        loadMethod,
+        userSource
+      );
+      assertCurrentSelection();
+      if (ready !== true) {
+        throw new Error(
+          'Validated user data did not publish one ready generation.'
         );
-        populate();
-        notifications.complete(
-          loadNotifId,
-          'User data validated. Select it from "Sample datasets" to apply.'
-        );
-        return;
       }
-
-      populate();
+      if (dataSourceManager.getSource('local-user') !== userSource) {
+        throw new Error(
+          'Local-user activation did not adopt its isolated source candidate.'
+        );
+      }
+      candidatePublished = true;
+      await populate();
+      assertCurrentSelection();
       notifications.complete(
         loadNotifId,
-        `User data ready: ${formatDataNumber(metadata?.stats?.n_cells)} cells`
+        `User data ready: ${formatDataNumber(metadata.stats.n_cells)} cells`
       );
-      updateUrlForDataSource('local-user', {});
-    } catch (err) {
-      if (isDatasetReloadSupersededError(err)) {
+    } catch (error) {
+      if (isDatasetReloadSupersededError(error)) {
+        if (!candidatePublished) userSource.disconnect();
         notifications.dismiss(loadNotifId);
         return;
       }
-      debug.error('[UI] Failed to load user data:', err);
-      notifications.fail(loadNotifId, err.message);
+      if (!candidatePublished) userSource.disconnect();
+      debug.error('[UI] Failed to load user data:', error);
+      notifications.fail(loadNotifId, errorMessage(error));
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Local user data (prepared / h5ad / portable zarr zip)
-  // ---------------------------------------------------------------------------
+  const localPrepared = requireControlGroup(
+    dom,
+    ['userDataBrowseBtn', 'userDataFileInput'],
+    'Prepared-directory'
+  );
+  const localH5ad = requireControlGroup(
+    dom,
+    ['userDataH5adBtn', 'userDataH5adInput'],
+    'H5AD'
+  );
+  const localZarr = requireControlGroup(
+    dom,
+    ['userDataZarrArchiveBtn', 'userDataZarrArchiveInput'],
+    'Zarr ZIP'
+  );
 
-  if (userDataFileInput) {
-    userDataFileInput.addEventListener('change', async (e) => {
-      await loadLocalUserSelection(e.target.files, {
+  if (localPrepared !== null) {
+    const { userDataBrowseBtn, userDataFileInput } = localPrepared;
+    userDataBrowseBtn.addEventListener(
+      'click',
+      () => userDataFileInput.click()
+    );
+    userDataFileInput.addEventListener('change', async event => {
+      await loadLocalUserSelection(event.target.files, {
         loadMethod: DATA_LOAD_METHODS.LOCAL_PREPARED,
         loadingMessage: 'Loading prepared dataset...',
-        load: (source, files) =>
-          source.loadFromPreparedDirectory(files)
+        load: (source, files) => source.loadFromPreparedDirectory(files)
       });
       userDataFileInput.value = '';
     });
   }
-
-  if (userDataH5adBtn && userDataH5adInput) {
-    userDataH5adBtn.addEventListener('click', () => userDataH5adInput.click());
-  }
-  if (userDataZarrArchiveBtn && userDataZarrArchiveInput) {
-    userDataZarrArchiveBtn.addEventListener(
+  if (localH5ad !== null) {
+    const { userDataH5adBtn, userDataH5adInput } = localH5ad;
+    userDataH5adBtn.addEventListener(
       'click',
-      () => userDataZarrArchiveInput.click()
+      () => userDataH5adInput.click()
     );
-  }
-  if (userDataBrowseBtn && userDataFileInput) {
-    userDataBrowseBtn.addEventListener('click', () => userDataFileInput.click());
-  }
-
-  if (userDataH5adInput) {
-    userDataH5adInput.addEventListener('change', async (e) => {
-      await loadLocalUserSelection(e.target.files, {
+    userDataH5adInput.addEventListener('change', async event => {
+      await loadLocalUserSelection(event.target.files, {
         loadMethod: DATA_LOAD_METHODS.LOCAL_H5AD,
         loadingMessage: 'Loading h5ad file...',
         load: (source, files) =>
@@ -191,10 +390,17 @@ export function initDatasetConnections({
       userDataH5adInput.value = '';
     });
   }
-
-  if (userDataZarrArchiveInput) {
-    userDataZarrArchiveInput.addEventListener('change', async (e) => {
-      await loadLocalUserSelection(e.target.files, {
+  if (localZarr !== null) {
+    const {
+      userDataZarrArchiveBtn,
+      userDataZarrArchiveInput
+    } = localZarr;
+    userDataZarrArchiveBtn.addEventListener(
+      'click',
+      () => userDataZarrArchiveInput.click()
+    );
+    userDataZarrArchiveInput.addEventListener('change', async event => {
+      await loadLocalUserSelection(event.target.files, {
         loadMethod: DATA_LOAD_METHODS.LOCAL_ZARR_ZIP,
         loadingMessage: 'Loading Zarr ZIP archive...',
         load: (source, files) =>
@@ -206,207 +412,521 @@ export function initDatasetConnections({
     });
   }
 
-  // ---------------------------------------------------------------------------
-  // Remote server connection
-  // ---------------------------------------------------------------------------
+  function wireConnection(config) {
+    const {
+      connectButton,
+      connectionInput,
+      disconnectButton,
+      disconnectContainer,
+      inputLabel,
+      loadMethod,
+      sourceType
+    } = config;
+    let source = requireSource(
+      dataSourceManager.getSource(sourceType),
+      sourceType,
+      `${inputLabel} registered source`
+    );
+    let recoveryBlocked = false;
+    let operationRevision = 0;
 
-  if (remoteConnectBtn && remoteServerUrl) {
-    const remoteSource = dataSourceManager.getSource('remote');
-
-    const updateRemoteUI = (connected) => {
-      remoteConnectBtn.textContent = connected ? 'Reconnect' : 'Connect';
-      if (remoteDisconnectContainer) remoteDisconnectContainer.style.display = connected ? 'flex' : 'none';
-      remoteServerUrl.disabled = connected;
-    };
-
-    remoteConnectBtn.addEventListener('click', async () => {
-      const url = remoteServerUrl.value?.trim();
-      if (!url) {
-        getNotificationCenter().error('Please enter a server URL', { category: 'connectivity' });
-        return;
+    function assertCurrentOperation(revision) {
+      if (revision !== operationRevision) {
+        throw createDatasetReloadSupersededError(
+          `${inputLabel} operation was superseded.`
+        );
       }
-      if (!remoteSource) {
-        getNotificationCenter().error('Remote source not available', { category: 'connectivity' });
-        return;
+    }
+
+    function sourceConnected(candidate) {
+      const info = candidate.getConnectionInfo();
+      if (info === null || typeof info !== 'object') {
+        throw new TypeError(
+          `${inputLabel} source must publish connection information.`
+        );
       }
+      if (sourceType === 'remote') {
+        return info.status === 'connected';
+      }
+      return info.connected === true;
+    }
 
-      const notifications = getNotificationCenter();
-      const connectNotifId = notifications.loading(`Connecting to ${url}...`, { category: 'connectivity' });
-      remoteConnectBtn.disabled = true;
+    function sourceInputValue(candidate) {
+      const info = candidate.getConnectionInfo();
+      return sourceType === 'remote' ? info.url : info.inputPath;
+    }
 
+    function updateConnectionUI(connected) {
+      if (typeof connected !== 'boolean') {
+        throw new TypeError(
+          `${inputLabel} UI state must be a boolean.`
+        );
+      }
+      connectButton.textContent = connected ? 'Reconnect' : 'Connect';
+      disconnectContainer.style.display = connected ? 'flex' : 'none';
+      connectionInput.disabled = connected || recoveryBlocked;
+    }
+
+    function createCandidate() {
+      const candidate = source.createConnectionCandidate();
+      if (candidate === source) {
+        throw new Error(
+          `${inputLabel} connection candidate must be isolated.`
+        );
+      }
+      return requireSource(
+        candidate,
+        sourceType,
+        `${inputLabel} connection candidate`
+      );
+    }
+
+    async function restorePriorSource(priorSource, candidate) {
+      if (dataSourceManager.getSource(sourceType) === candidate) {
+        dataSourceManager.registerSource(sourceType, priorSource);
+        await populate();
+      }
+      source = priorSource;
+      updateConnectionUI(sourceConnected(priorSource));
+    }
+
+    async function adoptMultipleCandidate(
+      priorSource,
+      candidate,
+      datasets,
+      revision
+    ) {
+      assertCurrentOperation(revision);
+      dataSourceManager.registerSource(sourceType, candidate);
       try {
-        await remoteSource.connect({ url });
-        if (!remoteSource.isConnected()) {
-          notifications.fail(connectNotifId, 'Connection failed');
-          return;
+        await populate();
+        assertCurrentOperation(revision);
+      } catch (error) {
+        if (dataSourceManager.getSource(sourceType) === candidate) {
+          dataSourceManager.registerSource(sourceType, priorSource);
+          await populate();
         }
-
-        updateRemoteUI(true);
-        const datasets = await remoteSource.listDatasets();
-        if (!datasets.length) {
-          notifications.fail(connectNotifId, 'Connected - no datasets found');
-          return;
-        }
-
-        notifications.complete(connectNotifId, `Connected - ${datasets.length} dataset(s) found`);
-
-        await dataSourceManager.switchToDataset('remote', datasets[0].id, {
-          loadMethod: DATA_LOAD_METHODS.REMOTE_CONNECT
-        });
-        populate();
-
-        if (typeof reloadDataset === 'function') {
-          await reloadDataset(datasets[0]);
-        }
-
-        updateUrlForDataSource('remote', { serverUrl: url });
-      } catch (err) {
-        if (isDatasetReloadSupersededError(err)) {
-          notifications.dismiss(connectNotifId);
-          return;
-        }
-        notifications.fail(connectNotifId, `Error: ${err?.message || err}`);
-        debug.error('[UI] Remote connection error:', err);
-      } finally {
-        remoteConnectBtn.disabled = false;
+        throw error;
       }
-    });
-
-    if (remoteDisconnectBtn) {
-      remoteDisconnectBtn.addEventListener('click', () => {
-        if (!remoteSource) return;
-        try {
-          remoteSource.disconnect();
-        } catch (err) {
-          debug.warn('[UI] remoteSource.disconnect failed:', err);
-        }
-
-        getNotificationCenter().success('Disconnected', { category: 'connectivity' });
-        updateRemoteUI(false);
-        clearUrlDataSource();
-      });
-    }
-
-    try {
-      remoteSource?.onConnectionLost?.(() => {
-        getNotificationCenter().error('Connection lost', { category: 'connectivity' });
-        updateRemoteUI(false);
-      });
-    } catch (err) {
-      debug.warn('[UI] remoteSource.onConnectionLost handler failed:', err);
-    }
-
-    const urlParams = new URLSearchParams(window.location.search);
-    const remoteParam = urlParams.get('remote');
-    if (remoteParam) {
-      remoteServerUrl.value = remoteParam;
-    }
-
-    if (remoteSource?.isConnected?.()) {
-      // If the connection was established programmatically (e.g. when served by the
-      // Python server itself), the URL param may be absent; still show the connected URL.
+      source = candidate;
+      updateConnectionUI(true);
+      datasetSelect.disabled = false;
+      datasetSelect.focus();
+      let cleanupError = null;
       try {
-        if (!remoteServerUrl.value) {
-          const info = remoteSource.getConnectionInfo?.();
-          const connectedUrl = info?.url;
-          if (connectedUrl) {
-            remoteServerUrl.value = connectedUrl;
+        priorSource.disconnect();
+      } catch (error) {
+        cleanupError = error;
+      }
+      return {
+        cleanupError,
+        count: datasets.length
+      };
+    }
+
+    async function recoverConnectionLoss(lostSource, error) {
+      if (dataSourceManager.getSource(sourceType) !== lostSource) return;
+      const revision = ++operationRevision;
+      connectButton.disabled = true;
+      disconnectButton.disabled = true;
+      const wasActive =
+        dataSourceManager.getCurrentSourceType() === sourceType;
+      if (wasActive) {
+        const cleared = await clearDataset();
+        assertCurrentOperation(revision);
+        if (cleared !== true) {
+          recoveryBlocked = true;
+          connectButton.disabled = true;
+          connectionInput.disabled = true;
+          notifications.error(
+            `${inputLabel} connection was lost and the active dataset could ` +
+            `not be cleared safely. Reload the page before reconnecting. ` +
+            `Cause: ${errorMessage(error)}`,
+            {
+              category: 'connectivity',
+              duration: 0,
+              title: 'Connection recovery blocked'
+            }
+          );
+          return;
+        }
+      }
+
+      assertCurrentOperation(revision);
+      lostSource.disconnect();
+      dataSourceManager.unregisterSource(sourceType);
+      const disconnectedSource = lostSource.createConnectionCandidate();
+      requireSource(
+        disconnectedSource,
+        sourceType,
+        `${inputLabel} disconnected replacement`
+      );
+      dataSourceManager.registerSource(sourceType, disconnectedSource);
+      source = disconnectedSource;
+      await populate();
+      assertCurrentOperation(revision);
+      updateConnectionUI(false);
+      connectButton.disabled = false;
+      disconnectButton.disabled = false;
+      notifications.error(
+        `${inputLabel} connection was lost. Reconnect to continue.`,
+        {
+          category: 'connectivity',
+          title: 'Connection lost',
+          duration: 0
+        }
+      );
+    }
+
+    function attachConnectionLoss(candidate) {
+      if (sourceType !== 'remote') return;
+      requireMethod(
+        candidate,
+        'onConnectionLost',
+        'Remote connection source'
+      );
+      candidate.onConnectionLost(error => {
+        void recoverConnectionLoss(candidate, error).catch(
+          recoveryError => {
+            if (isDatasetReloadSupersededError(recoveryError)) return;
+            recoveryBlocked = true;
+            connectButton.disabled = true;
+            disconnectButton.disabled = true;
+            connectionInput.disabled = true;
+            notifications.error(
+              `Remote connection recovery failed: ` +
+              `${errorMessage(recoveryError)}. Reload the page before reconnecting.`,
+              {
+                category: 'connectivity',
+                duration: 0,
+                title: 'Connection recovery blocked'
+              }
+            );
           }
-        }
-      } catch {
-        // ignore
-      }
-      updateRemoteUI(true);
+        );
+      });
     }
-  }
 
-  // ---------------------------------------------------------------------------
-  // GitHub repository connection
-  // ---------------------------------------------------------------------------
+    attachConnectionLoss(source);
 
-  if (githubConnectBtn && githubRepoUrl) {
-    const githubSource = dataSourceManager.getSource('github-repo');
-
-    const updateGithubUI = (connected) => {
-      githubConnectBtn.textContent = connected ? 'Reconnect' : 'Connect';
-      if (githubDisconnectContainer) githubDisconnectContainer.style.display = connected ? 'flex' : 'none';
-      githubRepoUrl.disabled = connected;
-    };
-
-    githubConnectBtn.addEventListener('click', async () => {
-      const repoPath = githubRepoUrl.value?.trim();
-      if (!repoPath) {
-        getNotificationCenter().error('Please enter a GitHub repository path', { category: 'connectivity' });
+    connectButton.addEventListener('click', async () => {
+      if (dataSourceManager.getCurrentSourceType() === sourceType) {
+        notifications.error(
+          `${inputLabel} is the active dataset source. Disconnect it before reconnecting.`,
+          { category: 'connectivity' }
+        );
         return;
       }
-      if (!githubSource) {
-        getNotificationCenter().error('GitHub source not available', { category: 'connectivity' });
+      const inputValue = connectionInput.value;
+      if (typeof inputValue !== 'string' || inputValue.trim().length === 0) {
+        notifications.error(
+          `Enter one ${inputLabel.toLowerCase()} before connecting.`,
+          { category: 'connectivity' }
+        );
         return;
       }
 
-      const notifications = getNotificationCenter();
-      const connectNotifId = notifications.loading(`Connecting to GitHub: ${repoPath}...`, { category: 'connectivity' });
-      githubConnectBtn.disabled = true;
+      const priorSource = source;
+      const revision = ++operationRevision;
+      const connectNotifId = notifications.loading(
+        `Connecting to ${inputLabel}: ${inputValue}...`,
+        { category: 'connectivity' }
+      );
+      connectButton.disabled = true;
+      let candidate = null;
+      let candidateDisconnectAttempted = false;
+      let candidatePublished = false;
+
+      function disconnectCandidateOnce() {
+        if (
+          candidate === null ||
+          candidatePublished ||
+          candidateDisconnectAttempted
+        ) {
+          return null;
+        }
+        candidateDisconnectAttempted = true;
+        try {
+          candidate.disconnect();
+          return null;
+        } catch (error) {
+          return error;
+        }
+      }
 
       try {
-        const { repoInfo, datasets } = await githubSource.connect(repoPath);
-        updateGithubUI(true);
-
-        if (!datasets.length) {
-          notifications.fail(connectNotifId, 'Connected - no datasets found');
+        candidate = createCandidate();
+        if (sourceType === 'remote') {
+          await candidate.connect({ url: inputValue });
+        } else {
+          await candidate.connect(inputValue);
+        }
+        assertCurrentOperation(revision);
+        if (!sourceConnected(candidate)) {
+          throw new Error(
+            `${inputLabel} source did not publish a connected state.`
+          );
+        }
+        const datasets = requireDatasetInventory(
+          await candidate.listDatasets(),
+          sourceType
+        );
+        assertCurrentOperation(revision);
+        if (datasets.length === 0) {
+          const cleanupError = disconnectCandidateOnce();
+          if (cleanupError !== null) throw cleanupError;
+          updateConnectionUI(sourceConnected(priorSource));
+          notifications.fail(
+            connectNotifId,
+            `Connected ${inputLabel} has no datasets. Add a valid export and reconnect.`
+          );
           return;
         }
 
+        attachConnectionLoss(candidate);
+        if (datasets.length === 1) {
+          const ready = await activateDataset(
+            datasets[0].id,
+            sourceType,
+            loadMethod,
+            candidate
+          );
+          assertCurrentOperation(revision);
+          if (ready !== true) {
+            throw new Error(
+              `${inputLabel} dataset activation did not publish a ready generation.`
+            );
+          }
+          // The activation transaction registered the candidate and finalized
+          // the displaced transport exactly once.
+          if (dataSourceManager.getSource(sourceType) !== candidate) {
+            throw new Error(
+              `${inputLabel} activation did not adopt its connection candidate.`
+            );
+          }
+          source = candidate;
+          updateConnectionUI(true);
+          candidatePublished = true;
+          await populate();
+          assertCurrentOperation(revision);
+          notifications.complete(
+            connectNotifId,
+            `Connected - dataset "${datasets[0].name}" loaded`
+          );
+          return;
+        }
+
+        const adoption = await adoptMultipleCandidate(
+          priorSource,
+          candidate,
+          datasets,
+          revision
+        );
+        candidatePublished = true;
+        if (adoption.cleanupError !== null) {
+          notifications.fail(
+            connectNotifId,
+            `Connected - ${adoption.count} datasets found, but the prior ` +
+            `connection could not be released: ` +
+            `${errorMessage(adoption.cleanupError)}`
+          );
+          return;
+        }
         notifications.complete(
           connectNotifId,
-          `Connected to ${repoInfo.owner}/${repoInfo.repo} - ${datasets.length} dataset(s)`
+          `Connected - ${adoption.count} datasets found. Choose one from Sample datasets.`
         );
-
-        await dataSourceManager.switchToDataset('github-repo', datasets[0].id, {
-          loadMethod: DATA_LOAD_METHODS.GITHUB_CONNECT
-        });
-        populate();
-
-        if (typeof reloadDataset === 'function') {
-          await reloadDataset(datasets[0]);
+      } catch (error) {
+        if (
+          !candidatePublished &&
+          candidate !== null &&
+          dataSourceManager.getSource(sourceType) === candidate &&
+          dataSourceManager.getCurrentSourceType() === sourceType
+        ) {
+          candidatePublished = true;
+          source = candidate;
+          updateConnectionUI(true);
         }
-
-        updateUrlForDataSource('github-repo', { path: repoPath });
-      } catch (err) {
-        if (isDatasetReloadSupersededError(err)) {
+        if (candidatePublished) {
+          notifications.fail(
+            connectNotifId,
+            `Dataset loaded, but the catalog could not be refreshed: ` +
+            `${errorMessage(error)}`
+          );
+          debug.error(
+            `[UI] ${inputLabel} post-publication catalog error:`,
+            error
+          );
+          return;
+        }
+        const failureErrors = [error];
+        if (candidate !== null) {
+          if (dataSourceManager.getSource(sourceType) === candidate) {
+            // A failed post-registration multi-source adoption is restored;
+            // a published one-dataset activation is never rolled back here.
+            if (
+              dataSourceManager.getCurrentSourceType() !== sourceType
+            ) {
+              try {
+                await restorePriorSource(priorSource, candidate);
+              } catch (restorationError) {
+                failureErrors.push(restorationError);
+              }
+            }
+          }
+        }
+        const cleanupError = disconnectCandidateOnce();
+        if (cleanupError !== null) failureErrors.push(cleanupError);
+        if (
+          isDatasetReloadSupersededError(error) &&
+          failureErrors.length === 1
+        ) {
           notifications.dismiss(connectNotifId);
           return;
         }
-        notifications.fail(connectNotifId, `Error: ${err?.message || err}`);
-        debug.error('[UI] GitHub connection error:', err);
-        updateGithubUI(false);
+        try {
+          updateConnectionUI(sourceConnected(source));
+        } catch (uiError) {
+          failureErrors.push(uiError);
+        }
+        const exactError = failureErrors.length === 1
+          ? error
+          : new AggregateError(
+              failureErrors,
+              `${inputLabel} connection recovery failed.`
+            );
+        notifications.fail(
+          connectNotifId,
+          `Connection failed: ${errorMessage(exactError)}`
+        );
+        debug.error(`[UI] ${inputLabel} connection error:`, exactError);
       } finally {
-        githubConnectBtn.disabled = false;
+        if (revision === operationRevision && !recoveryBlocked) {
+          connectButton.disabled = false;
+        }
       }
     });
 
-    if (githubDisconnectBtn) {
-      githubDisconnectBtn.addEventListener('click', () => {
-        if (!githubSource) return;
-        try {
-          githubSource.disconnect();
-        } catch (err) {
-          debug.warn('[UI] githubSource.disconnect failed:', err);
+    disconnectButton.addEventListener('click', async () => {
+      const revision = ++operationRevision;
+      const connectedSource = source;
+      connectButton.disabled = true;
+      disconnectButton.disabled = true;
+      try {
+        const wasActive =
+          dataSourceManager.getCurrentSourceType() === sourceType;
+        if (wasActive) {
+          const cleared = await clearDataset();
+          assertCurrentOperation(revision);
+          if (cleared !== true) {
+            notifications.error(
+              `${inputLabel} remains connected because the active dataset could not be cleared.`,
+              {
+                category: 'connectivity',
+                duration: 0,
+                title: 'Disconnect blocked'
+              }
+            );
+            return;
+          }
         }
 
-        getNotificationCenter().success('Disconnected from GitHub', { category: 'connectivity' });
-        updateGithubUI(false);
-        clearUrlDataSource();
-      });
-    }
+        assertCurrentOperation(revision);
+        const disconnectedSource =
+          connectedSource.createConnectionCandidate();
+        requireSource(
+          disconnectedSource,
+          sourceType,
+          `${inputLabel} disconnected replacement`
+        );
+        connectedSource.disconnect();
+        dataSourceManager.unregisterSource(sourceType);
+        dataSourceManager.registerSource(sourceType, disconnectedSource);
+        source = disconnectedSource;
+        updateConnectionUI(false);
+        await populate();
+        assertCurrentOperation(revision);
+        notifications.success(`Disconnected from ${inputLabel}.`, {
+          category: 'connectivity'
+        });
+      } catch (error) {
+        if (isDatasetReloadSupersededError(error)) return;
+        recoveryBlocked = true;
+        connectButton.disabled = true;
+        disconnectButton.disabled = true;
+        connectionInput.disabled = true;
+        notifications.error(
+          `${inputLabel} disconnect could not finish safely. Reload the ` +
+          `page before reconnecting. Cause: ${errorMessage(error)}`,
+          {
+            category: 'connectivity',
+            duration: 0,
+            title: 'Disconnect recovery blocked'
+          }
+        );
+        debug.error(`[UI] ${inputLabel} disconnect error:`, error);
+      } finally {
+        if (revision === operationRevision && !recoveryBlocked) {
+          connectButton.disabled = false;
+          disconnectButton.disabled = false;
+        }
+      }
+    });
 
-    const urlParams = new URLSearchParams(window.location.search);
-    const githubParam = urlParams.get('github');
-    if (githubParam) {
-      githubRepoUrl.value = githubParam;
+    const initialConnected = sourceConnected(source);
+    if (initialConnected && connectionInput.value.length === 0) {
+      const value = sourceInputValue(source);
+      if (typeof value !== 'string' || value.length === 0) {
+        throw new TypeError(
+          `${inputLabel} connected source must publish its input value.`
+        );
+      }
+      connectionInput.value = value;
     }
+    updateConnectionUI(initialConnected);
+  }
 
-    const connected = githubSource?.getConnectionInfo?.().connected;
-    if (connected) updateGithubUI(true);
+  const remote = requireControlGroup(
+    dom,
+    [
+      'remoteConnectBtn',
+      'remoteDisconnectBtn',
+      'remoteDisconnectContainer',
+      'remoteServerUrl'
+    ],
+    'Remote'
+  );
+  if (remote !== null) {
+    wireConnection({
+      connectButton: remote.remoteConnectBtn,
+      connectionInput: remote.remoteServerUrl,
+      disconnectButton: remote.remoteDisconnectBtn,
+      disconnectContainer: remote.remoteDisconnectContainer,
+      inputLabel: 'Remote server',
+      loadMethod: DATA_LOAD_METHODS.REMOTE_CONNECT,
+      sourceType: 'remote'
+    });
+  }
+
+  const github = requireControlGroup(
+    dom,
+    [
+      'githubConnectBtn',
+      'githubDisconnectBtn',
+      'githubDisconnectContainer',
+      'githubRepoUrl'
+    ],
+    'GitHub'
+  );
+  if (github !== null) {
+    wireConnection({
+      connectButton: github.githubConnectBtn,
+      connectionInput: github.githubRepoUrl,
+      disconnectButton: github.githubDisconnectBtn,
+      disconnectContainer: github.githubDisconnectContainer,
+      inputLabel: 'GitHub repository',
+      loadMethod: DATA_LOAD_METHODS.GITHUB_CONNECT,
+      sourceType: 'github-repo'
+    });
   }
 }

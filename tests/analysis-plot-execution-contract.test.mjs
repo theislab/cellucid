@@ -5,7 +5,7 @@ import test from 'node:test';
 const ROOT = new URL('../assets/js/app/analysis/', import.meta.url);
 
 async function source(path) {
-  return readFile(new URL(path, ROOT), 'utf8');
+  return (await readFile(new URL(path, ROOT), 'utf8')).replaceAll('\r\n', '\n');
 }
 
 function between(text, start, end) {

@@ -79,6 +79,18 @@ export class FieldSummaryMethods {
           const extra = hiddenNames.length > 2 ? ` +${hiddenNames.length - 2}` : '';
           filters.push(`${fieldKey}: hiding ${preview}${extra}`);
         }
+        if (
+          ctx.activeFieldSource === 'obs'
+          && ctx.activeFieldIndex === fi
+          && field.outlierQuantiles
+          && field.outlierQuantiles.length
+          && field._outlierFilterEnabled !== false
+        ) {
+          const threshold = field._outlierThreshold ?? 1;
+          if (threshold < 0.9999) {
+            filters.push(`${fieldKey}: outlier ≤ ${Math.round(threshold * 100)}%`);
+          }
+        }
       }
     }
 
@@ -390,4 +402,3 @@ export class FieldSummaryMethods {
     return changed;
   }
 }
-

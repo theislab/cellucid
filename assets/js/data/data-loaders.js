@@ -57,8 +57,12 @@ function shouldUseAnnData(url) {
  * @param {AbortSignal|null} signal - Exact request owner
  * @returns {Promise<string>} Standard fetchable URL (http://, https://, blob://, data://)
  */
-async function resolveAnyUrl(url, signal) {
-  return getDataSourceManager().resolveUrl(url, signal);
+async function resolveAnyUrl(url, signal, stagedSource = null) {
+  const manager = getDataSourceManager();
+  if (stagedSource === null) {
+    return manager.resolveUrl(url, signal);
+  }
+  return manager.resolveUrlWithSource(url, signal, stagedSource);
 }
 
 /**
@@ -66,9 +70,119 @@ async function resolveAnyUrl(url, signal) {
  * @param {string} url - URL to fetch (may use custom protocol)
  * @returns {Promise<any>}
  */
-async function fetchJsonWithProtocol(url, init) {
-  const response = await fetchOk(url, init);
+async function fetchJsonWithProtocol(
+  url,
+  init,
+  stagedSource = null
+) {
+  const response = await fetchOk(url, init, stagedSource);
   return response.json();
+}
+
+function getStagedMetadataLoadOwner(options, label) {
+  if (
+    options === null ||
+    typeof options !== 'object' ||
+    Array.isArray(options) ||
+    (
+      Object.getPrototypeOf(options) !== Object.prototype &&
+      Object.getPrototypeOf(options) !== null
+    )
+  ) {
+    throw new TypeError(`${label} options must be an object`);
+  }
+  const supported = new Set([
+    'candidateAnnDataBinding',
+    'signal',
+    'stagedSource',
+  ]);
+  const ownKeys = Reflect.ownKeys(options);
+  const unexpected = ownKeys.filter(
+    key => typeof key !== 'string' || !supported.has(key)
+  );
+  if (unexpected.length > 0) {
+    throw new TypeError(
+      `${label} options contain unexpected key(s): ` +
+      unexpected.map(key => String(key)).join(', ')
+    );
+  }
+  for (const key of ownKeys) {
+    const descriptor = Object.getOwnPropertyDescriptor(options, key);
+    if (
+      descriptor === undefined ||
+      descriptor.enumerable !== true ||
+      !Object.hasOwn(descriptor, 'value')
+    ) {
+      throw new TypeError(
+        `${label} options.${key} must be an enumerable own data field.`
+      );
+    }
+  }
+  const signalOptions = Object.hasOwn(options, 'signal')
+    ? { signal: options.signal }
+    : {};
+  const signal = getMetadataLoadSignal(signalOptions, label);
+  const candidateAnnDataBinding =
+    Object.hasOwn(options, 'candidateAnnDataBinding')
+      ? options.candidateAnnDataBinding
+      : null;
+  const stagedSource = Object.hasOwn(options, 'stagedSource')
+    ? options.stagedSource
+    : null;
+  if (
+    candidateAnnDataBinding !== null &&
+    (
+      typeof candidateAnnDataBinding !== 'object' ||
+      stagedSource !== null
+    )
+  ) {
+    throw new TypeError(
+      `${label} requires at most one exact candidate AnnData binding or ` +
+      'staged custom-protocol source.'
+    );
+  }
+  if (
+    stagedSource !== null &&
+    typeof stagedSource !== 'object'
+  ) {
+    throw new TypeError(
+      `${label} stagedSource must be an object or exact null.`
+    );
+  }
+  return {
+    candidateAnnDataBinding,
+    signal,
+    stagedSource,
+  };
+}
+
+function requireStagedOwnerForUrl(
+  url,
+  candidateAnnDataBinding,
+  stagedSource,
+  label
+) {
+  if (shouldUseAnnData(url)) {
+    if (stagedSource !== null) {
+      throw new TypeError(
+        `${label} direct AnnData URL cannot use a custom-protocol source.`
+      );
+    }
+    return;
+  }
+  if (candidateAnnDataBinding !== null) {
+    throw new TypeError(
+      `${label} candidate AnnData binding requires an h5ad:// or zarr:// URL.`
+    );
+  }
+  if (
+    stagedSource !== null &&
+    !getDataSourceManager().isCustomProtocolUrl(url)
+  ) {
+    throw new TypeError(
+      `${label} staged source requires one custom-protocol URL.`
+    );
+  }
 }
 
 function requireGzipDecompressionStream(url) {
@@ -270,10 +384,14 @@ async function dequantizeToFloat32(options) {
  * @param {string} url
  * @param {RequestInit} [init]
  */
-async function fetchOk(url, init) {
+async function fetchOk(url, init, stagedSource = null) {
   const signal = init?.signal ?? null;
   throwIfMetadataAborted(signal, 'URL resolution');
-  const resolvedUrl = await resolveAnyUrl(url, signal);
+  const resolvedUrl = await resolveAnyUrl(
+    url,
+    signal,
+    stagedSource
+  );
   throwIfMetadataAborted(signal, 'URL resolution');
   const response = await fetchSampleArtifact(resolvedUrl, init);
   if (!response.ok) {
@@ -293,12 +411,12 @@ async function fetchOk(url, init) {
  * @param {RequestInit} [init]
  * @returns {Promise<ArrayBuffer>} Decompressed binary data
  */
-async function fetchBinary(url, init) {
+async function fetchBinary(url, init, stagedSource = null) {
   const isGzipped = url.endsWith('.gz');
   const GzipDecompressionStream = isGzipped
     ? requireGzipDecompressionStream(url)
     : null;
-  const response = await fetchOk(url, init);
+  const response = await fetchOk(url, init, stagedSource);
 
   if (isGzipped) {
     const decompressedStream = response.body.pipeThrough(
@@ -324,12 +442,20 @@ async function fetchBinary(url, init) {
  */
 export async function loadPointsBinary(url, options = {}) {
   const {
+    candidateAnnDataBinding = null,
     showProgress = false,
     displayName = null,
     dimension = 3,
     signal = null,
-    progressTrackerId = null
+    progressTrackerId = null,
+    stagedSource = null
   } = options;
+  requireStagedOwnerForUrl(
+    url,
+    candidateAnnDataBinding,
+    stagedSource,
+    'Cell position loader'
+  );
   const notifications = getNotificationCenter();
   const name = displayName || 'Cell positions';
   let trackerId = progressTrackerId;
@@ -355,7 +481,7 @@ export async function loadPointsBinary(url, options = {}) {
       // decoder with the caller's signal so dataset replacement can reject
       // promptly; the detached decoder is still observed by waitForAbort().
       const result = await waitForAbort(
-        anndataLoadPoints(url, dim),
+        anndataLoadPoints(url, dim, candidateAnnDataBinding),
         signal
       );
       throwIfAborted(signal);
@@ -379,7 +505,8 @@ export async function loadPointsBinary(url, options = {}) {
       url,
       trackerId,
       notifications,
-      signal
+      signal,
+      stagedSource
     );
     throwIfAborted(signal);
     const positions = float32PositionsFromBuffer(arrayBuffer, url);
@@ -496,14 +623,19 @@ async function fetchBinaryWithProgressInternal(
   url,
   trackerId,
   notifications,
-  signal = null
+  signal = null,
+  stagedSource = null
 ) {
   throwIfAborted(signal);
   const isGzipped = url.endsWith('.gz');
   const GzipDecompressionStream = isGzipped
     ? requireGzipDecompressionStream(url)
     : null;
-  const resolvedUrl = await resolveAnyUrl(url, signal);
+  const resolvedUrl = await resolveAnyUrl(
+    url,
+    signal,
+    stagedSource
+  );
   throwIfAborted(signal);
   const response = await fetchSampleArtifact(
     resolvedUrl,
@@ -1458,8 +1590,18 @@ function validateCategoricalCodeValues({
  * @param {{signal?: AbortSignal|null}} [options]
  */
 export async function loadObsManifest(url, options = {}) {
-  const signal = getMetadataLoadSignal(
+  const {
+    candidateAnnDataBinding,
+    signal,
+    stagedSource,
+  } = getStagedMetadataLoadOwner(
     options,
+    'Observation manifest loader'
+  );
+  requireStagedOwnerForUrl(
+    url,
+    candidateAnnDataBinding,
+    stagedSource,
     'Observation manifest loader'
   );
   throwIfMetadataAborted(signal, 'Observation manifest loading');
@@ -1467,19 +1609,27 @@ export async function loadObsManifest(url, options = {}) {
 
   // Handle AnnData source (h5ad or zarr) - unified handling
   if (shouldUseAnnData(url)) {
-    const manifest = anndataGetObsManifest(url, { signal });
+    const manifest = anndataGetObsManifest(
+      url,
+      { signal },
+      candidateAnnDataBinding
+    );
     throwIfMetadataAborted(signal, 'Observation manifest loading');
     return expandObsManifest(manifest);
   }
 
   // Handle local-user:// URLs
   if (isLocalUserUrl(url)) {
-    const manifest = await fetchJsonWithProtocol(url, fetchInit);
+    const manifest = await fetchJsonWithProtocol(
+      url,
+      fetchInit,
+      stagedSource
+    );
     throwIfMetadataAborted(signal, 'Observation manifest loading');
     return expandObsManifest(manifest);
   }
 
-  const response = await fetchOk(url, fetchInit);
+  const response = await fetchOk(url, fetchInit, stagedSource);
   const manifest = await response.json();
   throwIfMetadataAborted(signal, 'Observation manifest loading');
   return expandObsManifest(manifest);
@@ -1679,8 +1829,18 @@ export async function loadObsFieldData(manifestUrl, field, options = {}) {
  * @param {{signal?: AbortSignal|null}} [options]
  */
 export async function loadVarManifest(url, options = {}) {
-  const signal = getMetadataLoadSignal(
+  const {
+    candidateAnnDataBinding,
+    signal,
+    stagedSource,
+  } = getStagedMetadataLoadOwner(
     options,
+    'Variable manifest loader'
+  );
+  requireStagedOwnerForUrl(
+    url,
+    candidateAnnDataBinding,
+    stagedSource,
     'Variable manifest loader'
   );
   throwIfMetadataAborted(signal, 'Variable manifest loading');
@@ -1688,19 +1848,27 @@ export async function loadVarManifest(url, options = {}) {
 
   // Handle AnnData source (h5ad or zarr) - unified handling
   if (shouldUseAnnData(url)) {
-    const manifest = anndataGetVarManifest(url, { signal });
+    const manifest = anndataGetVarManifest(
+      url,
+      { signal },
+      candidateAnnDataBinding
+    );
     throwIfMetadataAborted(signal, 'Variable manifest loading');
     return expandVarManifest(manifest);
   }
 
   // Handle local-user:// URLs
   if (isLocalUserUrl(url)) {
-    const manifest = await fetchJsonWithProtocol(url, fetchInit);
+    const manifest = await fetchJsonWithProtocol(
+      url,
+      fetchInit,
+      stagedSource
+    );
     throwIfMetadataAborted(signal, 'Variable manifest loading');
     return expandVarManifest(manifest);
   }
 
-  const response = await fetchOk(url, fetchInit);
+  const response = await fetchOk(url, fetchInit, stagedSource);
   const manifest = await response.json();
   throwIfMetadataAborted(signal, 'Variable manifest loading');
   return expandVarManifest(manifest);
@@ -1895,8 +2063,18 @@ async function loadFileConnectivityWeights(
  * @returns {Promise<Object|null>} Connectivity manifest or exact direct absence
  */
 export async function loadConnectivityManifest(url, options = {}) {
-  const signal = getMetadataLoadSignal(
+  const {
+    candidateAnnDataBinding,
+    signal,
+    stagedSource,
+  } = getStagedMetadataLoadOwner(
     options,
+    'Connectivity manifest loader'
+  );
+  requireStagedOwnerForUrl(
+    url,
+    candidateAnnDataBinding,
+    stagedSource,
     'Connectivity manifest loader'
   );
   throwIfMetadataAborted(signal, 'Connectivity manifest loading');
@@ -1906,7 +2084,8 @@ export async function loadConnectivityManifest(url, options = {}) {
   if (context === CONNECTIVITY_MANIFEST_CONTEXT.DIRECT) {
     const manifest = await anndataGetConnectivityManifest(
       url,
-      { signal }
+      { signal },
+      candidateAnnDataBinding
     );
     throwIfMetadataAborted(signal, 'Connectivity manifest loading');
     return validateConnectivityManifest(manifest, context);
@@ -1914,8 +2093,8 @@ export async function loadConnectivityManifest(url, options = {}) {
 
   const fetchInit = signal ? { signal } : undefined;
   const manifest = isLocalUserUrl(url)
-    ? await fetchJsonWithProtocol(url, fetchInit)
-    : await (await fetchOk(url, fetchInit)).json();
+    ? await fetchJsonWithProtocol(url, fetchInit, stagedSource)
+    : await (await fetchOk(url, fetchInit, stagedSource)).json();
   throwIfMetadataAborted(signal, 'Connectivity manifest loading');
   return validateConnectivityManifest(manifest, context);
 }
@@ -2011,8 +2190,18 @@ export async function loadEdges(manifestUrl, manifest, options) {
  * @returns {Promise<Object>} Dataset identity with embeddings metadata
  */
 export async function loadDatasetIdentity(url, options = {}) {
-  const signal = getMetadataLoadSignal(
+  const {
+    candidateAnnDataBinding,
+    signal,
+    stagedSource,
+  } = getStagedMetadataLoadOwner(
     options,
+    'Dataset identity loader'
+  );
+  requireStagedOwnerForUrl(
+    url,
+    candidateAnnDataBinding,
+    stagedSource,
     'Dataset identity loader'
   );
   throwIfMetadataAborted(signal, 'Dataset identity loading');
@@ -2020,19 +2209,27 @@ export async function loadDatasetIdentity(url, options = {}) {
 
   // Handle AnnData source (h5ad or zarr) - unified handling
   if (shouldUseAnnData(url)) {
-    const identity = anndataGetDatasetIdentity(url, { signal });
+    const identity = anndataGetDatasetIdentity(
+      url,
+      { signal },
+      candidateAnnDataBinding
+    );
     throwIfMetadataAborted(signal, 'Dataset identity loading');
     return identity;
   }
 
   // Handle local-user:// URLs
   if (isLocalUserUrl(url)) {
-    const identity = await fetchJsonWithProtocol(url, fetchInit);
+    const identity = await fetchJsonWithProtocol(
+      url,
+      fetchInit,
+      stagedSource
+    );
     throwIfMetadataAborted(signal, 'Dataset identity loading');
     return identity;
   }
 
-  const response = await fetchOk(url, fetchInit);
+  const response = await fetchOk(url, fetchInit, stagedSource);
   const identity = await response.json();
   throwIfMetadataAborted(signal, 'Dataset identity loading');
   return identity;

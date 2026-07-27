@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { dismissWelcome } from './helpers/welcome.mjs';
 
 const PREPARED_DATASET_URL =
   '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=info-popovers-ci';
@@ -37,6 +38,7 @@ test('compact information popovers are accessible, exclusive, and viewport-safe'
 }, testInfo) => {
   const productErrors = observeProductErrors(page);
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
+  await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture'
   );
@@ -128,6 +130,8 @@ test('compact information popovers are accessible, exclusive, and viewport-safe'
   const communityButton = page.getByRole('button', {
     name: 'About community annotation'
   });
+  await page.locator('#community-annotation-section > summary').click();
+  await expect(page.locator('#community-annotation-section')).toHaveAttribute('open', '');
   await communityButton.click();
   await expect(page.locator('#community-annotation-info-1')).toBeVisible();
   await expect(page.locator('#community-annotation-info-1')).toContainText(

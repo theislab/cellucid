@@ -88,12 +88,3 @@ export function hideWelcomeModal() {
 export function isWelcomeModalVisible() {
   return Boolean(welcomeModal && !welcomeModal.classList.contains('hidden'));
 }
-
-export function shouldShowWelcome() {
-  const params = new URLSearchParams(window.location.search);
-  if (params.get('remote') || params.get('github') || params.get('dataset') || params.get('jupyter')) {
-    return false;
-  }
-  return true;
-}
-

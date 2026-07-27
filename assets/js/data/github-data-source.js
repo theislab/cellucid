@@ -509,6 +509,16 @@ export class GitHubDataSource {
   }
 
   /**
+   * Create an isolated connection candidate. Repository validation never
+   * mutates the currently registered source.
+   *
+   * @returns {GitHubDataSource}
+   */
+  createConnectionCandidate() {
+    return new GitHubDataSource();
+  }
+
+  /**
    * Check if connected to a repository
    * @returns {Promise<boolean>}
    */

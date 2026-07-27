@@ -1319,6 +1319,9 @@ test('direct and local metadata transports receive the exact owner signal', asyn
     let resolutionSignal = null;
     let receivedSignal = null;
     manager.sources.set('local-user', {
+      getType() {
+        return 'local-user';
+      },
       async resolveUrl(_url, signal) {
         resolutionSignal = signal;
         return 'https://local.cellucid.test/dataset_identity.json';
@@ -1367,6 +1370,9 @@ test('direct and local metadata transports receive the exact owner signal', asyn
     let receivedSignal = null;
     let fetchCalls = 0;
     manager.sources.set('local-user', {
+      getType() {
+        return 'local-user';
+      },
       resolveUrl(_url, signal) {
         receivedSignal = signal;
         started.resolve();

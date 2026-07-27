@@ -17,12 +17,17 @@ import {
 } from '../assets/js/data/data-source-manager.js';
 import {
   loadConnectivityManifest,
+  loadDatasetIdentity,
   loadEdges,
   loadObsFieldData,
   loadObsManifest,
+  loadPointsBinary,
   loadVarFieldData,
   loadVarManifest,
 } from '../assets/js/data/data-loaders.js';
+import {
+  DimensionManager,
+} from '../assets/js/data/dimension-manager.js';
 import {
   ZarrDataSource
 } from '../assets/js/data/zarr.js';
@@ -1189,6 +1194,133 @@ test('prepared local URLs cannot cross dataset adoption generations', async t =>
   ).json();
   assert.equal(currentIdentity.id, 'new-generation');
 });
+
+test(
+  'a staged prepared candidate owns generation and position reads before publication',
+  async t => {
+    const manager = getDataSourceManager();
+    const previous = {
+      activeDatasetId: manager.activeDatasetId,
+      activeDatasetMetadata: manager.activeDatasetMetadata,
+      activeIdentityId: manager.activeIdentityId,
+      activeSource: manager.activeSource,
+      registeredSource: manager.sources.get('local-user'),
+    };
+    const priorSource = {
+      datasetId: 'local-user:prior-prepared',
+      getType() {
+        return 'local-user';
+      },
+      async resolveUrl() {
+        throw new Error(
+          'The registered prior prepared source must not be consulted.'
+        );
+      },
+    };
+    manager.activeDatasetId = priorSource.datasetId;
+    manager.activeDatasetMetadata = Object.freeze({
+      id: priorSource.datasetId,
+    });
+    manager.activeIdentityId = 'prior-prepared';
+    manager.activeSource = priorSource;
+    manager.sources.set('local-user', priorSource);
+
+    const candidate = new LocalUserDirDataSource();
+    await candidate.loadFromPreparedDirectory(
+      createPreparedDirectory('staged-prepared', {
+        nCells: 3,
+        pointsContents: float32Bytes([
+          -1, -1,
+          0, 1,
+          1, 0,
+        ]),
+      })
+    );
+    t.after(() => {
+      candidate.clear();
+      manager.activeDatasetId = previous.activeDatasetId;
+      manager.activeDatasetMetadata =
+        previous.activeDatasetMetadata;
+      manager.activeIdentityId = previous.activeIdentityId;
+      manager.activeSource = previous.activeSource;
+      if (previous.registeredSource === undefined) {
+        manager.sources.delete('local-user');
+      } else {
+        manager.sources.set(
+          'local-user',
+          previous.registeredSource
+        );
+      }
+    });
+
+    const signal = new AbortController().signal;
+    const baseUrl = candidate.getBaseUrl(candidate.datasetId);
+    const owner = { signal, stagedSource: candidate };
+    const identity = await loadDatasetIdentity(
+      `${baseUrl}dataset_identity.json`,
+      owner
+    );
+    const obsManifest = await loadObsManifest(
+      `${baseUrl}obs_manifest.json`,
+      owner
+    );
+    assert.equal(identity.id, 'staged-prepared');
+    assert.equal(obsManifest.n_points, 3);
+
+    const positions = await loadPointsBinary(
+      `${baseUrl}points_2d.bin`,
+      {
+        dimension: 2,
+        signal,
+        stagedSource: candidate,
+      }
+    );
+    assert.deepEqual(
+      Array.from(positions),
+      [-1, -1, 0, 1, 1, 0]
+    );
+    const dimensionManager = new DimensionManager({
+      baseUrl,
+      embeddingsMetadata: identity.embeddings,
+      stagedSource: candidate,
+    });
+    assert.equal(
+      (await dimensionManager.loadDimension(
+        identity.embeddings.default_dimension,
+        { showProgress: false }
+      )).length,
+      6
+    );
+
+    assert.equal(manager.activeSource, priorSource);
+    assert.equal(
+      manager.activeDatasetId,
+      'local-user:prior-prepared'
+    );
+    assert.equal(manager.getSource('local-user'), priorSource);
+    await assert.rejects(
+      loadDatasetIdentity(
+        `${baseUrl}dataset_identity.json`,
+        { signal }
+      ),
+      /registered prior prepared source must not be consulted/i
+    );
+    await assert.rejects(
+      loadDatasetIdentity(
+        `${baseUrl}dataset_identity.json`,
+        {
+          signal,
+          stagedSource: {
+            getType() {
+              return 'remote';
+            },
+          },
+        }
+      ),
+      /requires one exact 'local-user' source owner/i
+    );
+  }
+);
 
 test('prepared metadata and base URLs require the exact adopted dataset id', async t => {
   const source = new LocalUserDirDataSource();

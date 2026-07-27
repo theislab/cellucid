@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { dismissWelcome } from './helpers/welcome.mjs';
 
 test('volumetric smoke completes its exact GPU density and noise path', async ({ page }) => {
   const browserErrors = [];
@@ -28,6 +29,7 @@ test('volumetric smoke completes its exact GPU density and noise path', async ({
     '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=renderer-smoke-ci',
     { waitUntil: 'domcontentloaded' },
   );
+  await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
 
   await page.locator('#render-mode').selectOption('smoke');
@@ -64,6 +66,7 @@ test('projectiles use the published full-resolution collision index', async ({ p
     '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=renderer-projectile-ci',
     { waitUntil: 'domcontentloaded' },
   );
+  await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
 
   await page.locator('#navigation-mode').selectOption('free');
@@ -113,6 +116,7 @@ test('spatial-index construction failures settle every owned notification', asyn
     '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=renderer-spatial-failure-ci',
     { waitUntil: 'domcontentloaded' },
   );
+  await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
 
   const result = await page.evaluate(async () => {

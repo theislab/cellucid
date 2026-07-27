@@ -643,6 +643,27 @@ test('observation filters compose across fields while cloned view state remains 
   assert.equal(obsData.fields[1]._continuousFilter.min, 1);
 });
 
+test('an exact zero-cell observation generation owns valid empty visibility', () => {
+  const state = Object.assign(
+    Object.create(DataStateFilterMethods.prototype),
+    {
+      pointCount: 0,
+      obsData: { count: 0, fields: [] },
+      categoryTransparency: new Float32Array(),
+      cellVisibilityMask: new Float32Array(),
+      colorsArray: new Uint8Array(),
+    },
+  );
+
+  assert.doesNotThrow(() => state.computeGlobalVisibility());
+
+  state.obsData = { count: 0, fields: [{ key: 'impossible' }] };
+  assert.throws(
+    () => state.computeGlobalVisibility(),
+    /exact empty observation generation/i,
+  );
+});
+
 test('view switching restores cloned cell masks and rejects invalid targets atomically', () => {
   const pointCount = 4;
   const state = {

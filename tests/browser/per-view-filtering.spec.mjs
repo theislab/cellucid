@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { dismissWelcome } from './helpers/welcome.mjs';
 
 const PREPARED_DATASET_URL =
   '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=per-view-filtering-ci';
@@ -24,6 +25,7 @@ function observeProductErrors(page) {
 test('side-by-side filters stay with one view and survive coloring changes', async ({ page }, testInfo) => {
   const productErrors = observeProductErrors(page);
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
+  await dismissWelcome(page);
 
   await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
   await expect(page.locator('#filter-count')).toHaveText('Showing all 120 points');
@@ -105,6 +107,7 @@ test('side-by-side filters stay with one view and survive coloring changes', asy
 test('Jupyter visibility replay stays isolated across live and snapshot views', async ({ page }, testInfo) => {
   const productErrors = observeProductErrors(page);
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
+  await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
 
   const proof = await page.evaluate(async () => {

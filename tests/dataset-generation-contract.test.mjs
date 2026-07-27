@@ -481,6 +481,20 @@ test('bootstrap and reload share one complete staged generation before publicati
     stageSource.indexOf('await loadDatasetGeneration({') <
       stageSource.indexOf('await stageDatasetPositionPayload({')
   );
+  assert.match(
+    stageSource,
+    /createDimensionManager\(\{[\s\S]*baseUrl,[\s\S]*candidateAnnDataBinding,[\s\S]*stagedSource[\s\S]*\}\)/
+  );
+  assert.equal(
+    stageSource.match(/candidateAnnDataBinding,/g)?.length,
+    6,
+    'one staged AnnData binding argument must own the dimension manager and all four generation readers'
+  );
+  assert.equal(
+    stageSource.match(/stagedSource/g)?.length,
+    6,
+    'one staged custom source must own the stage argument, dimension manager, and all four generation readers'
+  );
   assert.doesNotMatch(
     stageSource,
     /state\.(?:setDimensionManager|setFieldLoader|setVarFieldLoader|initVarData|initScene|setVectorFieldManager)/
@@ -518,18 +532,27 @@ test('bootstrap and reload share one complete staged generation before publicati
   );
   assert.ok(reloadEnd > reloadStart);
   const reloadSource = mainSource.slice(reloadStart, reloadEnd);
-  assert.ok(
-    reloadSource.indexOf('getCurrentIdentityId()') <
-      reloadSource.indexOf('await stageDatasetRuntime({')
+  const selectionStageIndex = reloadSource.indexOf(
+    'selectionStage = await dataSourceManager.stageDatasetSelection('
+  );
+  const runtimeStageIndex = reloadSource.indexOf(
+    'runtimeStage = await stageDatasetRuntime({'
+  );
+  const ownerCheckIndex = reloadSource.indexOf(
+    'reloadTransaction.assertCurrent()',
+    runtimeStageIndex
+  );
+  const runtimeCommitIndex = reloadSource.indexOf(
+    'commitDatasetRuntimeStage(runtimeStage)'
   );
   assert.ok(
-    reloadSource.indexOf('await stageDatasetRuntime({') <
-      reloadSource.indexOf('reloadTransaction.assertCurrent()',
-        reloadSource.indexOf('await stageDatasetRuntime({'))
+    selectionStageIndex >= 0 &&
+    runtimeStageIndex > selectionStageIndex &&
+    ownerCheckIndex > runtimeStageIndex &&
+    runtimeCommitIndex > ownerCheckIndex
   );
-  assert.ok(
-    reloadSource.indexOf('reloadTransaction.assertCurrent()',
-      reloadSource.indexOf('await stageDatasetRuntime({')) <
-      reloadSource.indexOf('commitDatasetRuntimeStage(stage)')
+  assert.match(
+    reloadSource.slice(runtimeStageIndex, ownerCheckIndex),
+    /expectedIdentityId:\s*selectionStage\.identityId/
   );
 });

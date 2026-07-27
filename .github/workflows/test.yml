@@ -68,4 +68,33 @@ jobs:
         run: npx playwright install ${{ matrix.browser }}
 
       - name: Load the current H5AD contract through the real UI
+        if: matrix.browser != 'firefox'
         run: npm run test:browser -- --project=${{ matrix.browser }}
+
+      - name: Verify Firefox WebGL2 through the Linux display server
+        if: matrix.browser == 'firefox' && runner.os == 'Linux'
+        run: >-
+          xvfb-run --auto-servernum --
+          npm run test:browser --
+          --project=firefox
+          --headed
+          tests/browser/webgl2-runtime.spec.mjs
+
+      - name: Verify Firefox WebGL2 on macOS and Windows
+        if: matrix.browser == 'firefox' && runner.os != 'Linux'
+        run: >-
+          npm run test:browser --
+          --project=firefox
+          tests/browser/webgl2-runtime.spec.mjs
+
+      - name: Load the current H5AD contract through headed Firefox on Linux
+        if: matrix.browser == 'firefox' && runner.os == 'Linux'
+        run: >-
+          xvfb-run --auto-servernum --
+          npm run test:browser --
+          --project=firefox
+          --headed
+
+      - name: Load the current H5AD contract through Firefox
+        if: matrix.browser == 'firefox' && runner.os != 'Linux'
+        run: npm run test:browser -- --project=firefox

@@ -527,7 +527,7 @@ body.dock-dragging .accordion-section:not(.accordion-floating) {
   padding-top: var(--space-2);
   border-top: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 8%, transparent);
   text-align: center;
-  white-space: nowrap;
+  white-space: normal;
 }
 
 #copyright a {

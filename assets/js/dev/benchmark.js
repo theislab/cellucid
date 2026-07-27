@@ -15,6 +15,31 @@
 import { HighPerfRenderer, RendererConfig } from '../rendering/high-perf-renderer.js';
 import { formatCellCount as formatNumber } from '../data/data-source.js';
 
+const glbBufferPromises = new Map();
+
+function requireSyntheticPointCount(count) {
+  if (!Number.isSafeInteger(count) || count < 1) {
+    throw new RangeError(
+      'Synthetic point count must be one positive safe integer.'
+    );
+  }
+  return count;
+}
+
+function hueToRgbChannel(p, q, rawT) {
+  let t = rawT;
+  if (t < 0) t += 1;
+  if (t > 1) t -= 1;
+  if (t < 1 / 6) return p + (q - p) * 6 * t;
+  if (t < 1 / 2) return q;
+  if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+  return p;
+}
+
+function normalizedByte(value) {
+  return Math.round(Math.max(0, Math.min(1, value)) * 255);
+}
+
 /**
  * Benchmark configuration for high-performance renderer tests
  */
@@ -1390,52 +1415,119 @@ export class GLBParser {
  */
 export class MeshSurfaceSampler {
   constructor(positions, indices) {
+    if (
+      !(positions instanceof Float32Array) ||
+      positions.length < 9 ||
+      positions.length % 3 !== 0
+    ) {
+      throw new TypeError(
+        'Mesh surface positions must be non-empty Float32 XYZ vertices.'
+      );
+    }
+    if (
+      indices !== null &&
+      !(
+        indices instanceof Uint8Array ||
+        indices instanceof Uint16Array ||
+        indices instanceof Uint32Array
+      )
+    ) {
+      throw new TypeError(
+        'Mesh surface indices must be null or an unsigned integer array.'
+      );
+    }
+    if (indices !== null && (indices.length < 3 || indices.length % 3 !== 0)) {
+      throw new TypeError(
+        'Mesh surface indices must contain complete triangles.'
+      );
+    }
+    if (indices === null && positions.length % 9 !== 0) {
+      throw new TypeError(
+        'A non-indexed mesh must contain complete triangle vertices.'
+      );
+    }
     this.positions = positions;
     this.indices = indices;
     this.triangleCount = indices ? indices.length / 3 : positions.length / 9;
 
-    // Compute triangle areas for weighted sampling
-    this.areas = new Float32Array(this.triangleCount);
-    this.cumulativeAreas = new Float32Array(this.triangleCount);
+    // Float64 cumulative weights avoid precision collapse on large meshes.
+    // Per-triangle origin, two edges, and unit normal eliminate all
+    // per-sample vertex-array and normal-array allocations.
+    this.areas = new Float64Array(this.triangleCount);
+    this.cumulativeAreas = new Float64Array(this.triangleCount);
+    this.triangleData = new Float32Array(this.triangleCount * 12);
     this.totalArea = 0;
 
     this._computeAreas();
   }
 
   _computeAreas() {
+    const positions = this.positions;
+    const indices = this.indices;
+    const vertexCount = positions.length / 3;
     for (let i = 0; i < this.triangleCount; i++) {
-      const [v0, v1, v2] = this._getTriangleVertices(i);
+      const triangleOffset = i * 3;
+      const i0 = indices === null ? triangleOffset : indices[triangleOffset];
+      const i1 = indices === null
+        ? triangleOffset + 1
+        : indices[triangleOffset + 1];
+      const i2 = indices === null
+        ? triangleOffset + 2
+        : indices[triangleOffset + 2];
+      if (i0 >= vertexCount || i1 >= vertexCount || i2 >= vertexCount) {
+        throw new RangeError(
+          `Mesh triangle ${i} references a vertex outside the mesh.`
+        );
+      }
 
-      // Cross product to get area
-      const ax = v1[0] - v0[0], ay = v1[1] - v0[1], az = v1[2] - v0[2];
-      const bx = v2[0] - v0[0], by = v2[1] - v0[1], bz = v2[2] - v0[2];
+      const v0Offset = i0 * 3;
+      const v1Offset = i1 * 3;
+      const v2Offset = i2 * 3;
+      const x0 = positions[v0Offset];
+      const y0 = positions[v0Offset + 1];
+      const z0 = positions[v0Offset + 2];
+      const ax = positions[v1Offset] - x0;
+      const ay = positions[v1Offset + 1] - y0;
+      const az = positions[v1Offset + 2] - z0;
+      const bx = positions[v2Offset] - x0;
+      const by = positions[v2Offset + 1] - y0;
+      const bz = positions[v2Offset + 2] - z0;
       const cx = ay * bz - az * by;
       const cy = az * bx - ax * bz;
       const cz = ax * by - ay * bx;
+      const crossLength = Math.sqrt(cx * cx + cy * cy + cz * cz);
+      const area = 0.5 * crossLength;
+      if (!Number.isFinite(area)) {
+        throw new RangeError(
+          `Mesh triangle ${i} has non-finite geometry.`
+        );
+      }
 
-      this.areas[i] = 0.5 * Math.sqrt(cx * cx + cy * cy + cz * cz);
-      this.totalArea += this.areas[i];
+      const dataOffset = i * 12;
+      this.triangleData[dataOffset] = x0;
+      this.triangleData[dataOffset + 1] = y0;
+      this.triangleData[dataOffset + 2] = z0;
+      this.triangleData[dataOffset + 3] = ax;
+      this.triangleData[dataOffset + 4] = ay;
+      this.triangleData[dataOffset + 5] = az;
+      this.triangleData[dataOffset + 6] = bx;
+      this.triangleData[dataOffset + 7] = by;
+      this.triangleData[dataOffset + 8] = bz;
+      if (crossLength > 0) {
+        this.triangleData[dataOffset + 9] = cx / crossLength;
+        this.triangleData[dataOffset + 10] = cy / crossLength;
+        this.triangleData[dataOffset + 11] = cz / crossLength;
+      }
+
+      this.areas[i] = area;
+      this.totalArea += area;
       this.cumulativeAreas[i] = this.totalArea;
     }
-  }
-
-  _getTriangleVertices(triIdx) {
-    let i0, i1, i2;
-    if (this.indices) {
-      i0 = this.indices[triIdx * 3];
-      i1 = this.indices[triIdx * 3 + 1];
-      i2 = this.indices[triIdx * 3 + 2];
-    } else {
-      i0 = triIdx * 3;
-      i1 = triIdx * 3 + 1;
-      i2 = triIdx * 3 + 2;
+    if (!Number.isFinite(this.totalArea) || this.totalArea <= 0) {
+      throw new RangeError(
+        'Mesh surface must contain at least one finite non-degenerate triangle.'
+      );
     }
-
-    return [
-      [this.positions[i0 * 3], this.positions[i0 * 3 + 1], this.positions[i0 * 3 + 2]],
-      [this.positions[i1 * 3], this.positions[i1 * 3 + 1], this.positions[i1 * 3 + 2]],
-      [this.positions[i2 * 3], this.positions[i2 * 3 + 1], this.positions[i2 * 3 + 2]]
-    ];
   }
 
   /**
@@ -1445,7 +1537,7 @@ export class MeshSurfaceSampler {
     let lo = 0, hi = this.triangleCount - 1;
     while (lo < hi) {
       const mid = (lo + hi) >>> 1;
-      if (this.cumulativeAreas[mid] < r) {
+      if (this.cumulativeAreas[mid] <= r) {
         lo = mid + 1;
       } else {
         hi = mid;
@@ -1455,15 +1547,17 @@ export class MeshSurfaceSampler {
   }
 
   /**
-   * Sample a random point on the mesh surface
-   * @returns {Object} - { position: [x,y,z], normal: [nx,ny,nz] }
+   * Internal allocation-free sample used by the tens-of-millions generator.
    */
-  sample() {
-    // Pick triangle weighted by area (binary search for speed)
+  _sampleIntoUnchecked(
+    positionTarget,
+    positionOffset,
+    normalTarget,
+    normalOffset
+  ) {
     const r = Math.random() * this.totalArea;
     const triIdx = this._binarySearchTriangle(r);
-
-    const [v0, v1, v2] = this._getTriangleVertices(triIdx);
+    const dataOffset = triIdx * 12;
 
     // Random barycentric coordinates
     let u = Math.random();
@@ -1472,25 +1566,85 @@ export class MeshSurfaceSampler {
       u = 1 - u;
       v = 1 - v;
     }
-    const w = 1 - u - v;
+    const triangleData = this.triangleData;
+    positionTarget[positionOffset] =
+      triangleData[dataOffset] +
+      u * triangleData[dataOffset + 3] +
+      v * triangleData[dataOffset + 6];
+    positionTarget[positionOffset + 1] =
+      triangleData[dataOffset + 1] +
+      u * triangleData[dataOffset + 4] +
+      v * triangleData[dataOffset + 7];
+    positionTarget[positionOffset + 2] =
+      triangleData[dataOffset + 2] +
+      u * triangleData[dataOffset + 5] +
+      v * triangleData[dataOffset + 8];
+    normalTarget[normalOffset] = triangleData[dataOffset + 9];
+    normalTarget[normalOffset + 1] = triangleData[dataOffset + 10];
+    normalTarget[normalOffset + 2] = triangleData[dataOffset + 11];
+  }
 
-    // Interpolate position
-    const position = [
-      w * v0[0] + u * v1[0] + v * v2[0],
-      w * v0[1] + u * v1[1] + v * v2[1],
-      w * v0[2] + u * v1[2] + v * v2[2]
-    ];
+  /**
+   * Sample into caller-owned buffers.
+   *
+   * @param {Float32Array|Float64Array} positionTarget
+   * @param {number} positionOffset
+   * @param {Float32Array|Float64Array} normalTarget
+   * @param {number} normalOffset
+   */
+  sampleInto(
+    positionTarget,
+    positionOffset,
+    normalTarget,
+    normalOffset = 0
+  ) {
+    if (
+      !(
+        positionTarget instanceof Float32Array ||
+        positionTarget instanceof Float64Array
+      ) ||
+      !(
+        normalTarget instanceof Float32Array ||
+        normalTarget instanceof Float64Array
+      )
+    ) {
+      throw new TypeError(
+        'Mesh samples require floating-point position and normal targets.'
+      );
+    }
+    if (
+      !Number.isSafeInteger(positionOffset) ||
+      positionOffset < 0 ||
+      positionOffset + 3 > positionTarget.length ||
+      !Number.isSafeInteger(normalOffset) ||
+      normalOffset < 0 ||
+      normalOffset + 3 > normalTarget.length
+    ) {
+      throw new RangeError(
+        'Mesh sample target offsets must own three writable values.'
+      );
+    }
+    this._sampleIntoUnchecked(
+      positionTarget,
+      positionOffset,
+      normalTarget,
+      normalOffset
+    );
+  }
 
-    // Compute face normal
-    const ax = v1[0] - v0[0], ay = v1[1] - v0[1], az = v1[2] - v0[2];
-    const bx = v2[0] - v0[0], by = v2[1] - v0[1], bz = v2[2] - v0[2];
-    const nx = ay * bz - az * by;
-    const ny = az * bx - ax * bz;
-    const nz = ax * by - ay * bx;
-    const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
-    const normal = [nx / len, ny / len, nz / len];
-
-    return { position, normal };
+  /**
+   * Sample a random point on the mesh surface.
+   *
+   * @returns {{position: number[], normal: number[]}}
+   */
+  sample() {
+    const position = new Float64Array(3);
+    const normal = new Float64Array(3);
+    this._sampleIntoUnchecked(position, 0, normal, 0);
+    return {
+      position: Array.from(position),
+      normal: Array.from(normal)
+    };
   }
 }
 
@@ -2182,6 +2336,12 @@ export class SyntheticDataGenerator {
    * @returns {Object} - { positions: Float32Array, colors: Uint8Array (RGBA), dimensionLevel: number }
    */
   static fromGLB(count, glbBuffer) {
+    requireSyntheticPointCount(count);
+    if (!(glbBuffer instanceof ArrayBuffer) || glbBuffer.byteLength === 0) {
+      throw new TypeError(
+        'GLB benchmark input must be one non-empty ArrayBuffer.'
+      );
+    }
     console.log(`[GLB] Sampling ${count.toLocaleString()} points from GLB mesh...`);
     const startTime = performance.now();
 
@@ -2218,6 +2378,7 @@ export class SyntheticDataGenerator {
     console.log('[GLB] Sampling points...');
     const positions = new Float32Array(count * 3);
     const colors = new Uint8Array(count * 4); // RGBA packed as uint8
+    const normal = new Float64Array(3);
     const logInterval = Math.max(100000, Math.floor(count / 10));
 
     for (let i = 0; i < count; i++) {
@@ -2225,32 +2386,43 @@ export class SyntheticDataGenerator {
         console.log(`[GLB] Sampled ${(i / 1000).toFixed(0)}K / ${(count / 1000).toFixed(0)}K points...`);
       }
 
-      const sample = sampler.sample();
       const idx = i * 3;
+      sampler._sampleIntoUnchecked(positions, idx, normal, 0);
 
       // Center and scale to fit in [-1, 1] range
-      positions[idx] = (sample.position[0] - centerX) * scale;
-      positions[idx + 1] = (sample.position[1] - centerY) * scale;
-      positions[idx + 2] = (sample.position[2] - centerZ) * scale;
+      positions[idx] = (positions[idx] - centerX) * scale;
+      positions[idx + 1] = (positions[idx + 1] - centerY) * scale;
+      positions[idx + 2] = (positions[idx + 2] - centerZ) * scale;
 
       // Color based on normal direction (hemisphere coloring)
-      const nx = sample.normal[0];
-      const ny = sample.normal[1];
-      const nz = sample.normal[2];
+      const nx = normal[0];
+      const ny = normal[1];
+      const nz = normal[2];
 
       // Convert normal to color (warm/cool scheme)
       const warmCool = (ny + 1) * 0.5;
       const hue = 0.55 - warmCool * 0.4;
       const sat = 0.6 + Math.abs(nz) * 0.2;
       const light = 0.45 + Math.abs(nx) * 0.15;
-
-      const color = this._hslToRgb(hue, sat, light);
+      const q = light < 0.5
+        ? light * (1 + sat)
+        : light + sat - light * sat;
+      const p = 2 * light - q;
+      const red = hueToRgbChannel(p, q, hue + 1 / 3);
+      const green = hueToRgbChannel(p, q, hue);
+      const blue = hueToRgbChannel(p, q, hue - 1 / 3);
 
       // Add slight noise for visual interest (convert to uint8)
       const cidx = i * 4;
-      colors[cidx] = Math.round(Math.max(0, Math.min(1, color[0] + (Math.random() - 0.5) * 0.05)) * 255);
-      colors[cidx + 1] = Math.round(Math.max(0, Math.min(1, color[1] + (Math.random() - 0.5) * 0.05)) * 255);
-      colors[cidx + 2] = Math.round(Math.max(0, Math.min(1, color[2] + (Math.random() - 0.5) * 0.05)) * 255);
+      colors[cidx] = normalizedByte(
+        red + (Math.random() - 0.5) * 0.05
+      );
+      colors[cidx + 1] = normalizedByte(
+        green + (Math.random() - 0.5) * 0.05
+      );
+      colors[cidx + 2] = normalizedByte(
+        blue + (Math.random() - 0.5) * 0.05
+      );
       colors[cidx + 3] = 255; // full alpha
     }
 
@@ -2267,15 +2439,46 @@ export class SyntheticDataGenerator {
    * @returns {Promise<Object>} - { positions: Float32Array, colors: Uint8Array (RGBA), dimensionLevel: number }
    */
   static async fromGLBUrl(count, url = 'assets/img/kemal-inecik.glb') {
+    requireSyntheticPointCount(count);
+    if (
+      typeof url !== 'string' ||
+      url.length === 0 ||
+      url !== url.trim()
+    ) {
+      throw new TypeError(
+        'GLB benchmark URL must be one non-empty exact string.'
+      );
+    }
     const resolvedUrl = typeof window !== 'undefined'
       ? new URL(url, window.location.href).toString()
       : url;
     console.log(`Loading GLB from: ${resolvedUrl}`);
-    const response = await fetch(resolvedUrl, { cache: 'no-store' });
-    if (!response.ok) {
-      throw new Error(`Failed to load GLB: ${response.status} ${response.statusText}`);
+    let bufferPromise = glbBufferPromises.get(resolvedUrl);
+    if (bufferPromise === undefined) {
+      bufferPromise = (async () => {
+        const response = await fetch(resolvedUrl, { cache: 'default' });
+        if (!response.ok) {
+          throw new Error(
+            `Failed to load GLB: ${response.status} ${response.statusText}`
+          );
+        }
+        const buffer = await response.arrayBuffer();
+        if (buffer.byteLength === 0) {
+          throw new Error('Failed to load GLB: response body is empty');
+        }
+        return buffer;
+      })();
+      glbBufferPromises.set(resolvedUrl, bufferPromise);
     }
-    const buffer = await response.arrayBuffer();
+    let buffer;
+    try {
+      buffer = await bufferPromise;
+    } catch (error) {
+      if (glbBufferPromises.get(resolvedUrl) === bufferPromise) {
+        glbBufferPromises.delete(resolvedUrl);
+      }
+      throw error;
+    }
     console.log(`GLB loaded: ${(buffer.byteLength / 1024).toFixed(1)} KB`);
     return this.fromGLB(count, buffer);
   }
@@ -2292,19 +2495,11 @@ export class SyntheticDataGenerator {
     if (s === 0) {
       r = g = b = l;
     } else {
-      const hue2rgb = (p, q, t) => {
-        if (t < 0) t += 1;
-        if (t > 1) t -= 1;
-        if (t < 1/6) return p + (q - p) * 6 * t;
-        if (t < 1/2) return q;
-        if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
-        return p;
-      };
       const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
       const p = 2 * l - q;
-      r = hue2rgb(p, q, h + 1/3);
-      g = hue2rgb(p, q, h);
-      b = hue2rgb(p, q, h - 1/3);
+      r = hueToRgbChannel(p, q, h + 1 / 3);
+      g = hueToRgbChannel(p, q, h);
+      b = hueToRgbChannel(p, q, h - 1 / 3);
     }
     return [r, g, b];
   }

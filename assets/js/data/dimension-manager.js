@@ -226,10 +226,12 @@ export function createInMemoryDimensionManager(candidate) {
 
 class DimensionManager {
   constructor({
+    candidateAnnDataBinding = null,
     baseUrl = '',
     embeddingsMetadata = null,
     keepRawPositions = false,
-    maxPositionBytes = DEFAULT_MAX_POSITION_BYTES
+    maxPositionBytes = DEFAULT_MAX_POSITION_BYTES,
+    stagedSource = null
   } = {}) {
     if (
       !Number.isSafeInteger(maxPositionBytes) ||
@@ -244,9 +246,31 @@ class DimensionManager {
         'DimensionManager keepRawPositions must be a boolean.'
       );
     }
+    if (
+      candidateAnnDataBinding !== null &&
+      (
+        typeof candidateAnnDataBinding !== 'object' ||
+        stagedSource !== null
+      )
+    ) {
+      throw new TypeError(
+        'DimensionManager requires at most one candidate AnnData binding or ' +
+        'staged custom-protocol source.'
+      );
+    }
+    if (
+      stagedSource !== null &&
+      typeof stagedSource !== 'object'
+    ) {
+      throw new TypeError(
+        'DimensionManager stagedSource must be an object or exact null.'
+      );
+    }
     this.baseUrl = baseUrl;
+    this.candidateAnnDataBinding = candidateAnnDataBinding;
     this.keepRawPositions = keepRawPositions;
     this._maxPositionBytes = BigInt(maxPositionBytes);
+    this.stagedSource = stagedSource;
 
     // Available dimensions from metadata
     this.availableDimensions = [];
@@ -408,11 +432,13 @@ class DimensionManager {
 
     let promise;
     promise = loadPointsBinary(url, {
+      candidateAnnDataBinding: this.candidateAnnDataBinding,
       dimension: dim,
       displayName: `${dim}D cell positions`,
       progressTrackerId: trackerId,
       showProgress: false,
-      signal: controller.signal
+      signal: controller.signal,
+      stagedSource: this.stagedSource
     })
       .then(positions => {
         this._assertGeneration(generation, dim, promise);

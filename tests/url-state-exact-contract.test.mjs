@@ -3,6 +3,8 @@ import test from 'node:test';
 
 import {
   clearUrlDataSource,
+  prepareUrlForDatasetSelection,
+  prepareUrlForDataSource,
   updateUrlForDataSource,
 } from '../assets/js/app/url-state.js';
 
@@ -88,9 +90,10 @@ test('local-demo publishes exactly its dataset URL state', async () => {
   });
 });
 
-test('remote publishes exactly its server URL state', async () => {
+test('remote publishes exactly its server and dataset URL state', async () => {
   await withBrowser(browser => {
     updateUrlForDataSource('remote', {
+      datasetId: 'served',
       serverUrl: 'https://data.example.test/cellucid',
     });
 
@@ -100,22 +103,23 @@ test('remote publishes exactly its server URL state', async () => {
       url.searchParams.get('remote'),
       'https://data.example.test/cellucid'
     );
-    assert.equal(url.searchParams.has('dataset'), false);
+    assert.equal(url.searchParams.get('dataset'), 'served');
     assert.equal(url.searchParams.has('source'), false);
     assert.equal(url.searchParams.has('github'), false);
   });
 });
 
-test('github-repo publishes exactly its repository path URL state', async () => {
+test('github-repo publishes exactly its repository and dataset URL state', async () => {
   await withBrowser(browser => {
     updateUrlForDataSource('github-repo', {
+      datasetId: 'atlas',
       path: 'cellucid/data/example',
     });
 
     assert.equal(browser.calls.length, 1);
     const url = assertPreservedApplicationState(browser.href);
     assert.equal(url.searchParams.get('github'), 'cellucid/data/example');
-    assert.equal(url.searchParams.has('dataset'), false);
+    assert.equal(url.searchParams.get('dataset'), 'atlas');
     assert.equal(url.searchParams.has('source'), false);
     assert.equal(url.searchParams.has('remote'), false);
   });
@@ -172,11 +176,42 @@ test('invalid, empty, partial, and unknown source records preserve the prior URL
     () => updateUrlForDataSource('local-demo', {}),
     () => updateUrlForDataSource('local-demo', { datasetId: '' }),
     () => updateUrlForDataSource('local-demo', { datasetId: ' pbmc-3k' }),
+    () => updateUrlForDataSource('local-demo', { datasetId: 'pbmc\n3k' }),
     () => updateUrlForDataSource('remote', {}),
     () => updateUrlForDataSource('remote', { serverUrl: '' }),
     () => updateUrlForDataSource('remote', { serverUrl: 'ftp://data.test' }),
+    () => updateUrlForDataSource('remote', {
+      datasetId: 'served',
+      serverUrl: 'https://data.test/',
+    }),
+    () => updateUrlForDataSource('remote', {
+      datasetId: 'served',
+      serverUrl: 'https://user@data.test',
+    }),
+    () => updateUrlForDataSource('remote', {
+      datasetId: 'served',
+      serverUrl: 'https://data.test?candidate=true',
+    }),
+    () => updateUrlForDataSource('remote', {
+      datasetId: 'served',
+      serverUrl: 'https://data.test#candidate',
+    }),
+    () => updateUrlForDataSource('remote', {
+      datasetId: '',
+      serverUrl: 'https://data.test',
+    }),
+    () => updateUrlForDataSource('remote', {
+      serverUrl: 'https://data.test',
+    }),
     () => updateUrlForDataSource('github-repo', {}),
     () => updateUrlForDataSource('github-repo', { path: ' ' }),
+    () => updateUrlForDataSource('github-repo', {
+      datasetId: '',
+      path: 'owner/repo',
+    }),
+    () => updateUrlForDataSource('github-repo', {
+      path: 'owner/repo',
+    }),
     () => updateUrlForDataSource('local-user', { datasetId: 'local' }),
     () => updateUrlForDataSource('jupyter', { serverUrl: 'https://data.test' }),
     () => updateUrlForDataSource(null, { datasetId: 'old' }),
@@ -244,4 +279,87 @@ test('history publication failure leaves the prior browser URL intact', async ()
       },
     }
   );
+});
+
+test('prepared URL publication validates before mutation and can restore its exact prior URL', async () => {
+  await withBrowser(browser => {
+    const priorHref = browser.href;
+    const publication = prepareUrlForDataSource('remote', {
+      datasetId: 'served',
+      serverUrl: 'https://data.example.test/cellucid',
+    });
+
+    assert.equal(browser.calls.length, 0);
+    assert.equal(browser.href, priorHref);
+    publication.commit();
+    assert.equal(browser.calls.length, 1);
+    assert.equal(
+      new URL(browser.href).searchParams.get('dataset'),
+      'served'
+    );
+    publication.rollback();
+    assert.equal(browser.calls.length, 2);
+    assert.equal(browser.href, priorHref);
+    assert.throws(() => publication.commit(), /already committed/i);
+    assert.throws(() => publication.rollback(), /already restored/i);
+  });
+});
+
+test('an older URL publication cannot restore over a newer committed generation', async () => {
+  await withBrowser(browser => {
+    const initialHref = browser.href;
+    const older = prepareUrlForDataSource('remote', {
+      datasetId: 'remote-a',
+      serverUrl: 'https://remote-a.test',
+    });
+    const newer = prepareUrlForDataSource('github-repo', {
+      datasetId: 'github-b',
+      path: 'owner/repo/exports',
+    });
+
+    older.commit();
+    const olderHref = browser.href;
+    newer.commit();
+    const newerHref = browser.href;
+    assert.notEqual(olderHref, newerHref);
+
+    assert.throws(() => older.rollback(), /newer|superseded/i);
+    assert.equal(browser.href, newerHref);
+    newer.rollback();
+    assert.equal(browser.href, olderHref);
+    assert.notEqual(browser.href, initialHref);
+    assert.throws(() => older.rollback(), /newer|superseded/i);
+    assert.equal(browser.href, olderHref);
+  });
+});
+
+test('selection URL preparation reads one exact candidate source without mutation', async () => {
+  await withBrowser(browser => {
+    const priorHref = browser.href;
+    const source = {
+      getConnectionInfo() {
+        return {
+          status: 'connected',
+          url: 'https://candidate.example.test/cellucid',
+        };
+      },
+      getType() {
+        return 'remote';
+      },
+    };
+    const publication = prepareUrlForDatasetSelection({
+      datasetId: 'candidate',
+      source,
+      sourceType: 'remote',
+    });
+    assert.equal(browser.href, priorHref);
+    assert.equal(browser.calls.length, 0);
+    publication.commit();
+    const url = new URL(browser.href);
+    assert.equal(
+      url.searchParams.get('remote'),
+      'https://candidate.example.test/cellucid'
+    );
+    assert.equal(url.searchParams.get('dataset'), 'candidate');
+  });
 });

@@ -828,6 +828,9 @@ test('custom protocol resolution requires one registered exact resolver', async 
     let getFileUrlCalls = 0;
     manager.registerProtocol('strict://', 'strict-source');
     manager.registerSource('strict-source', {
+      getType() {
+        return 'strict-source';
+      },
       async getFileUrl() {
         getFileUrlCalls += 1;
         return 'https://example.test/legacy.bin';
@@ -848,6 +851,9 @@ test('custom protocol resolution requires one registered exact resolver', async 
     let calls = 0;
     manager.registerProtocol('strict://', 'strict-source');
     manager.registerSource('strict-source', {
+      getType() {
+        return 'strict-source';
+      },
       async resolveUrl(url, signal) {
         calls += 1;
         assert.equal(url, requestedUrl);

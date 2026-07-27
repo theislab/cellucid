@@ -11,8 +11,7 @@ export {
   initWelcomeModal,
   showWelcomeModal,
   hideWelcomeModal,
-  isWelcomeModalVisible,
-  shouldShowWelcome
+  isWelcomeModalVisible
 } from './welcome-modal.js';
 
 export function initOnboarding(config = {}) {
@@ -20,4 +19,3 @@ export function initOnboarding(config = {}) {
   initWelcomeModal(welcomeCallbacks);
   initKeyboardShortcuts(shortcutCallbacks);
 }
-

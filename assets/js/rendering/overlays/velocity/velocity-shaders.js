@@ -277,17 +277,21 @@ void main() {
 export const FULLSCREEN_VS = `#version 300 es
 precision highp float;
 
+layout(location = 0) in float a_vertexId;
+
 out vec2 v_uv;
 
 void main() {
-  // Generate fullscreen quad from vertex ID
+  // Generate the fullscreen quad from an explicitly owned attribute. Firefox
+  // desktop OpenGL requires attribute zero to affect the active program rather
+  // than merely being enabled on the bound vertex array.
   vec2 positions[4] = vec2[4](
     vec2(-1.0, -1.0),
     vec2( 1.0, -1.0),
     vec2(-1.0,  1.0),
     vec2( 1.0,  1.0)
   );
-  vec2 pos = positions[gl_VertexID];
+  vec2 pos = positions[int(a_vertexId)];
   v_uv = pos * 0.5 + 0.5;
   gl_Position = vec4(pos, 0.0, 1.0);
 }

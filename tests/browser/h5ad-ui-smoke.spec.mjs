@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from '@playwright/test';
+import { dismissWelcome } from './helpers/welcome.mjs';
 
 const fixturePath = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -42,27 +43,26 @@ async function captureReadableDataset(page, outputPath) {
   await page.screenshot({ path: outputPath, fullPage: true });
 }
 
-async function dismissVisibleNotifications(page) {
-  const notifications = page.locator('#notification-center .notification');
-  while (await notifications.count() > 0) {
-    await notifications.first().locator('.notification-dismiss').click();
-    await expect(notifications).toHaveCount(
-      Math.max(0, await notifications.count() - 1),
+async function dismissAllNotifications(page) {
+  await expect.poll(() => page.evaluate(async () => {
+    const { getNotificationCenter } = await import(
+      '/assets/js/app/notification-center.js'
     );
-  }
+    const activeNotification = document.querySelector(
+      '#notification-center .notification-loading, '
+        + '#notification-center .notification-progress'
+    );
+    if (activeNotification !== null) return false;
+    getNotificationCenter().dismissAll();
+    return true;
+  })).toBe(true);
+  await expect(page.locator('#notification-center .notification')).toHaveCount(0);
 }
 
-async function retainUserDataReadyNotification(page) {
+async function expectUserDataReadyNotification(page) {
   const notifications = page.locator('#notification-center .notification');
   const userReady = notifications.filter({ hasText: 'User data ready:' });
-  const other = notifications.filter({ hasNotText: 'User data ready:' });
   await expect(userReady).toHaveCount(1);
-  while (await other.count() > 0) {
-    const first = other.first();
-    await expect(first.locator('.notification-dismiss')).toHaveCount(1);
-    await first.locator('.notification-dismiss').click();
-    await expect(first).toHaveCount(0);
-  }
 }
 
 async function colorByCellType(page) {
@@ -89,6 +89,7 @@ test('loads the current H5AD contract with a planar 2-D camera and no playback',
     '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=browser-ci',
     { waitUntil: 'domcontentloaded' },
   );
+  await dismissWelcome(page);
 
   await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
   await expect(page.locator('#filter-count')).toHaveText('Showing all 120 points');
@@ -127,6 +128,7 @@ test('replaces prepared, Zarr ZIP, and H5AD datasets through the visible control
     '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=all-local-loaders-ci',
     { waitUntil: 'domcontentloaded' },
   );
+  await dismissWelcome(page);
   await expectPlanarCurrentDataset(page, 'Current UI prepared fixture');
 
   await expect(page.locator('#user-data-file-input')).toHaveAttribute('webkitdirectory', '');
@@ -140,23 +142,23 @@ test('replaces prepared, Zarr ZIP, and H5AD datasets through the visible control
   await expect(page.locator('#user-data-zarr-archive-input')).toHaveValue('');
   await expectPlanarCurrentDataset(page, 'current-ui-smoke');
   await colorByCellType(page);
-  await retainUserDataReadyNotification(page);
+  await expectUserDataReadyNotification(page);
   await captureReadableDataset(
     page,
     testInfo.outputPath(`zarr-zip-loaded-${testInfo.project.name}.png`),
   );
-  await dismissVisibleNotifications(page);
+  await dismissAllNotifications(page);
 
   await page.locator('#user-data-h5ad-input').setInputFiles(fixturePath);
   await expect(page.locator('#user-data-h5ad-input')).toHaveValue('');
   await expectPlanarCurrentDataset(page, 'current-ui-smoke');
   await colorByCellType(page);
-  await retainUserDataReadyNotification(page);
+  await expectUserDataReadyNotification(page);
   await captureReadableDataset(
     page,
     testInfo.outputPath(`h5ad-loaded-${testInfo.project.name}.png`),
   );
-  await dismissVisibleNotifications(page);
+  await dismissAllNotifications(page);
   await page.locator('#sidebar-toggle').click();
   await expect(page.locator('#sidebar-toggle')).toHaveAttribute(
     'aria-expanded',
@@ -212,6 +214,7 @@ test('saves and restores the exact current UI state through one file-input contr
     '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=session-ci',
     { waitUntil: 'domcontentloaded' },
   );
+  await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
   await expect(page.locator('#dimension-select')).toHaveValue('2');
   await expect(page.locator('#navigation-mode')).toHaveValue('planar');
@@ -239,7 +242,7 @@ test('saves and restores the exact current UI state through one file-input contr
   await chooser.setFiles(sessionPath);
 
   await expect(page.locator('#theme-select')).toHaveValue('light');
-  await expect(page.locator('#background-select')).toHaveValue('grid');
+  await expect(page.locator('#background-select')).toHaveValue('white');
   await expect(page.locator('#point-size')).toHaveValue('16.5');
   await expect(page.locator('#visualization-section')).toHaveAttribute('open', '');
   await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
@@ -268,6 +271,7 @@ test('viewer controls reject invalid values atomically and persist one exact bac
     '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=viewer-contract-ci',
     { waitUntil: 'domcontentloaded' },
   );
+  await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
 
   const outcome = await page.evaluate(() => {
@@ -340,6 +344,7 @@ test('viewer controls reject invalid values atomically and persist one exact bac
   });
 
   await page.reload({ waitUntil: 'domcontentloaded' });
+  await dismissWelcome(page);
   await expect(page.locator('#background-select')).toHaveValue('black');
   await expect.poll(() => page.evaluate(() => ({
     stored: localStorage.getItem('cellucid_viewer_background'),
@@ -369,6 +374,7 @@ test('viewer owns snapshot atomicity, exact identity, capacity, and smoke exclus
     '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=viewer-snapshot-contract-ci',
     { waitUntil: 'domcontentloaded' },
   );
+  await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
 
   const outcome = await page.evaluate(() => {

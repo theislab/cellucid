@@ -9,10 +9,12 @@
 
 export const colorOutlierMethods = {
   setOutlierThresholdForActive(threshold) {
+    if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
+      throw new RangeError('Outlier threshold must be a finite value from 0 through 1.');
+    }
     const field = this.getActiveField();
     if (!field || !field.outlierQuantiles || !field.outlierQuantiles.length) return;
     field._outlierThreshold = threshold;
-    this.updateOutlierQuantiles();
     this.computeGlobalVisibility();
   },
 
@@ -26,7 +28,15 @@ export const colorOutlierMethods = {
    */
   isOutlierFilterEnabledForActiveField() {
     const field = this.getActiveField?.();
-    if (!field || !field.outlierQuantiles || !field.outlierQuantiles.length) return false;
+    if (
+      this.activeFieldSource !== 'obs'
+      || !field
+      || field._isDeleted === true
+      || !field.outlierQuantiles
+      || !field.outlierQuantiles.length
+    ) {
+      return false;
+    }
     if (field._outlierFilterEnabled === false) return false;
     const threshold = field._outlierThreshold != null ? field._outlierThreshold : 1.0;
     return threshold < 0.9999;

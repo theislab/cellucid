@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { dismissWelcome } from './helpers/welcome.mjs';
 
 const SYNTHETIC_3D_ROOT =
   'http://127.0.0.1:4173/tests/browser/fixtures/generated-3d/';
@@ -166,6 +167,7 @@ test('a fresh deterministic 3-D dataset selects dimension 3 and Orbit', async ({
       `&dataset=${DATASET_ID}&acceptance=fresh-3d-orbit-ci`,
     { waitUntil: 'domcontentloaded' },
   );
+  await dismissWelcome(page);
 
   await expect(page.locator('#dataset-name')).toHaveText(
     'Deterministic 3-D orbit fixture',
@@ -193,6 +195,7 @@ test('public viewer controls reject invalid values before renderer mutation', as
       `&dataset=${DATASET_ID}&acceptance=viewer-public-control-contract`,
     { waitUntil: 'domcontentloaded' },
   );
+  await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Deterministic 3-D orbit fixture',
   );
@@ -446,6 +449,7 @@ test('a failed GPU dataset publication preserves the complete live renderer', as
       `&dataset=${DATASET_ID}&acceptance=renderer-data-transaction`,
     { waitUntil: 'domcontentloaded' },
   );
+  await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Deterministic 3-D orbit fixture',
   );
@@ -526,6 +530,7 @@ test('adaptive LOD publishes complete dimension-owned GPU resources', async ({
       `&dataset=${DATASET_ID}&acceptance=renderer-lod-transaction`,
     { waitUntil: 'domcontentloaded' },
   );
+  await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Deterministic 3-D orbit fixture',
   );

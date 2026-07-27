@@ -1,5 +1,12 @@
 import { defineConfig, devices } from '@playwright/test';
 
+const firefoxWebGLPreferences = Object.freeze({
+  'webgl.disabled': false,
+  'webgl.enable-webgl2': true,
+  'webgl.forbid-software': false,
+  'webgl.force-enabled': true,
+});
+
 export default defineConfig({
   testDir: './tests/browser',
   fullyParallel: false,
@@ -26,7 +33,12 @@ export default defineConfig({
     },
     {
       name: 'firefox',
-      use: { ...devices['Desktop Firefox'] },
+      use: {
+        ...devices['Desktop Firefox'],
+        launchOptions: {
+          firefoxUserPrefs: firefoxWebGLPreferences,
+        },
+      },
     },
     {
       name: 'webkit',

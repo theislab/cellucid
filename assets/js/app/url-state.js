@@ -6,11 +6,18 @@
  *
  * URL Format:
  * - ?dataset=suo                    → Demo dataset
- * - ?remote=http://localhost:8765   → Remote server
- * - ?github=owner/repo/path         → GitHub repository
+ * - ?remote=http://localhost:8765&dataset=served
+ *                                   → Remote server dataset
+ * - ?github=owner/repo/path&dataset=atlas
+ *                                   → GitHub repository dataset
  * - ?annotations=owner/repo[@branch]→ Community annotation repo (votes/suggestions)
  * - (no params)                     → Local file or empty state
  */
+
+import { validateDatasetId } from '../data/data-source.js';
+import { validateRemoteServerUrl } from '../data/remote-source.js';
+
+let latestPublicationGeneration = 0;
 
 /**
  * Update browser URL to reflect current data source.
@@ -19,25 +26,176 @@
  * @param {'local-demo'|'remote'|'github-repo'|'local-user'|'jupyter'|null} sourceType
  * @param {Object} sourceInfo - Exact source-specific record:
  *   - local-demo: { datasetId }
- *   - remote: { serverUrl }
- *   - github-repo: { path }
+ *   - remote: { serverUrl, datasetId }
+ *   - github-repo: { path, datasetId }
  *   - local-user/jupyter/null: {}
  */
 export function updateUrlForDataSource(sourceType, sourceInfo) {
+  return prepareUrlForDataSource(sourceType, sourceInfo).commit();
+}
+
+/**
+ * Prepare URL publication from the exact source instance whose dataset is
+ * being staged. A not-yet-registered Remote/GitHub connection candidate can
+ * therefore publish one atomic source+dataset URL only if its runtime also
+ * succeeds.
+ *
+ * @param {{
+ *   datasetId: string,
+ *   source: Object,
+ *   sourceType: 'local-demo'|'remote'|'github-repo'|'local-user'|'jupyter'
+ * }} selection
+ * @returns {Readonly<{commit: () => string, rollback: () => string}>}
+ */
+export function prepareUrlForDatasetSelection(selection) {
+  const record = requirePlainDataRecord(
+    selection,
+    ['datasetId', 'source', 'sourceType'],
+    'Dataset selection URL state'
+  );
+  validateDatasetId(
+    record.datasetId,
+    'Dataset selection URL state datasetId'
+  );
+  if (
+    record.source === null ||
+    typeof record.source !== 'object' ||
+    typeof record.source.getType !== 'function' ||
+    record.source.getType() !== record.sourceType
+  ) {
+    throw new TypeError(
+      'Dataset selection URL source must own the exact sourceType.'
+    );
+  }
+  if (record.sourceType === 'local-demo') {
+    return prepareUrlForDataSource('local-demo', {
+      datasetId: record.datasetId
+    });
+  }
+  if (record.sourceType === 'remote') {
+    if (typeof record.source.getConnectionInfo !== 'function') {
+      throw new TypeError(
+        'Remote dataset URL source must implement getConnectionInfo().'
+      );
+    }
+    const connection = record.source.getConnectionInfo();
+    if (connection === null || typeof connection !== 'object') {
+      throw new TypeError(
+        'Remote dataset URL source must publish connection information.'
+      );
+    }
+    return prepareUrlForDataSource('remote', {
+      datasetId: record.datasetId,
+      serverUrl: connection.url
+    });
+  }
+  if (record.sourceType === 'github-repo') {
+    if (typeof record.source.getConnectionInfo !== 'function') {
+      throw new TypeError(
+        'GitHub dataset URL source must implement getConnectionInfo().'
+      );
+    }
+    const connection = record.source.getConnectionInfo();
+    if (connection === null || typeof connection !== 'object') {
+      throw new TypeError(
+        'GitHub dataset URL source must publish connection information.'
+      );
+    }
+    return prepareUrlForDataSource('github-repo', {
+      datasetId: record.datasetId,
+      path: connection.inputPath
+    });
+  }
+  if (
+    record.sourceType === 'local-user' ||
+    record.sourceType === 'jupyter'
+  ) {
+    return prepareUrlForDataSource(record.sourceType, {});
+  }
+  throw new RangeError(
+    'Dataset selection URL source has an unknown sourceType.'
+  );
+}
+
+/**
+ * Validate one complete URL-state publication before dataset I/O begins.
+ * The returned owner commits all data-source parameters in one replaceState
+ * call and can restore the exact prior URL if final dataset publication stops.
+ *
+ * @param {'local-demo'|'remote'|'github-repo'|'local-user'|'jupyter'|null} sourceType
+ * @param {Object} sourceInfo
+ * @returns {Readonly<{
+ *   commit: () => string,
+ *   rollback: () => string
+ * }>}
+ */
+export function prepareUrlForDataSource(sourceType, sourceInfo) {
   const sourceState = requireUrlSourceState(sourceType, sourceInfo);
   const browser = requireBrowserHistoryOwner();
-  const url = new URL(browser.location.href);
+  let publicationState = 'prepared';
+  let publicationGeneration = null;
+  let priorHref = null;
+  let publishedHref = null;
 
-  url.searchParams.delete('dataset');
-  url.searchParams.delete('source');
-  url.searchParams.delete('remote');
-  url.searchParams.delete('github');
+  return Object.freeze({
+    commit() {
+      if (publicationState !== 'prepared') {
+        throw new Error('URL data-source publication was already committed.');
+      }
+      if (globalThis.window !== browser) {
+        throw new Error(
+          'URL data-source publication browser owner changed before commit.'
+        );
+      }
+      const nextUrl = new URL(browser.location.href);
+      for (const name of ['dataset', 'source', 'remote', 'github']) {
+        nextUrl.searchParams.delete(name);
+      }
+      for (const [name, value] of sourceState.entries) {
+        nextUrl.searchParams.set(name, value);
+      }
 
-  if (sourceState.param !== null) {
-    url.searchParams.set(sourceState.param, sourceState.value);
-  }
-
-  browser.history.replaceState(null, '', url.toString());
+      const ownedPriorHref = browser.location.href;
+      const nextHref = nextUrl.toString();
+      browser.history.replaceState(null, '', nextHref);
+      priorHref = ownedPriorHref;
+      publishedHref = nextHref;
+      publicationGeneration = ++latestPublicationGeneration;
+      publicationState = 'committed';
+      return nextHref;
+    },
+    rollback() {
+      if (publicationState === 'prepared') {
+        throw new Error(
+          'URL data-source publication cannot be restored before commit.'
+        );
+      }
+      if (publicationState === 'restored') {
+        throw new Error(
+          'URL data-source publication was already restored.'
+        );
+      }
+      if (globalThis.window !== browser) {
+        throw new Error(
+          'URL data-source publication browser owner changed before restore.'
+        );
+      }
+      if (publicationGeneration !== latestPublicationGeneration) {
+        throw new Error(
+          'URL data-source publication was superseded by a newer generation.'
+        );
+      }
+      if (browser.location.href !== publishedHref) {
+        throw new Error(
+          'URL changed after data-source publication and cannot be restored atomically.'
+        );
+      }
+      browser.history.replaceState(null, '', priorHref);
+      latestPublicationGeneration++;
+      publicationState = 'restored';
+      return priorHref;
+    }
+  });
 }
 
 const URL_FREE_SOURCE_TYPES = new Set(['local-user', 'jupyter']);
@@ -89,31 +247,10 @@ function requireExactString(value, label) {
   return value;
 }
 
-function requireHttpServerUrl(value) {
-  requireExactString(value, 'Remote URL state serverUrl');
-  let parsed;
-  try {
-    parsed = new URL(value);
-  } catch {
-    throw new TypeError(
-      'Remote URL state serverUrl must be an absolute HTTP(S) URL.'
-    );
-  }
-  if (
-    parsed.protocol !== 'http:' &&
-    parsed.protocol !== 'https:'
-  ) {
-    throw new TypeError(
-      'Remote URL state serverUrl must be an absolute HTTP(S) URL.'
-    );
-  }
-  return value;
-}
-
 function requireUrlSourceState(sourceType, sourceInfo) {
   if (sourceType === null) {
     requirePlainDataRecord(sourceInfo, [], 'Empty dataset URL state');
-    return { param: null, value: null };
+    return { entries: [] };
   }
   if (sourceType === 'local-demo') {
     const record = requirePlainDataRecord(
@@ -122,33 +259,54 @@ function requireUrlSourceState(sourceType, sourceInfo) {
       'Local demo URL state'
     );
     return {
-      param: 'dataset',
-      value: requireExactString(
-        record.datasetId,
-        'Local demo URL state datasetId'
-      ),
+      entries: [[
+        'dataset',
+        validateDatasetId(
+          record.datasetId,
+          'Local demo URL state datasetId'
+        )
+      ]]
     };
   }
   if (sourceType === 'remote') {
     const record = requirePlainDataRecord(
       sourceInfo,
-      ['serverUrl'],
+      ['datasetId', 'serverUrl'],
       'Remote URL state'
     );
     return {
-      param: 'remote',
-      value: requireHttpServerUrl(record.serverUrl),
+      entries: [
+        ['remote', validateRemoteServerUrl(record.serverUrl)],
+        [
+          'dataset',
+          validateDatasetId(
+            record.datasetId,
+            'Remote URL state datasetId'
+          )
+        ]
+      ]
     };
   }
   if (sourceType === 'github-repo') {
     const record = requirePlainDataRecord(
       sourceInfo,
-      ['path'],
+      ['datasetId', 'path'],
       'GitHub URL state'
     );
     return {
-      param: 'github',
-      value: requireExactString(record.path, 'GitHub URL state path'),
+      entries: [
+        [
+          'github',
+          requireExactString(record.path, 'GitHub URL state path')
+        ],
+        [
+          'dataset',
+          validateDatasetId(
+            record.datasetId,
+            'GitHub URL state datasetId'
+          )
+        ]
+      ]
     };
   }
   if (URL_FREE_SOURCE_TYPES.has(sourceType)) {
@@ -157,7 +315,7 @@ function requireUrlSourceState(sourceType, sourceInfo) {
       [],
       `${sourceType} URL state`
     );
-    return { param: null, value: null };
+    return { entries: [] };
   }
   throw new RangeError('Unknown URL data source type.');
 }
@@ -179,28 +337,6 @@ function requireBrowserHistoryOwner() {
     );
   }
   return window;
-}
-
-/**
- * Parse current URL for data source info.
- *
- * @returns {{type: string, serverUrl?: string, path?: string, datasetId?: string}|null}
- *   Returns source info object or null if no data params in URL
- */
-export function parseUrlDataSource() {
-  const params = new URLSearchParams(window.location.search);
-
-  if (params.has('remote')) {
-    return { type: 'remote', serverUrl: params.get('remote') };
-  }
-  if (params.has('github')) {
-    return { type: 'github-repo', path: params.get('github') };
-  }
-  if (params.has('dataset')) {
-    return { type: 'local-demo', datasetId: params.get('dataset') };
-  }
-
-  return null;
 }
 
 /**

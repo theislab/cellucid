@@ -1,5 +1,5 @@
 import { createReadStream } from 'node:fs';
-import { lstat } from 'node:fs/promises';
+import { lstat, readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,6 +8,39 @@ const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url))
 const host = '127.0.0.1';
 const port = 4173;
 const samplePort = 4174;
+const inventory = JSON.parse(
+  await readFile(
+    path.join(repositoryRoot, 'cellucid-web-assets.json'),
+    'utf8'
+  )
+);
+if (
+  inventory === null ||
+  typeof inventory !== 'object' ||
+  Array.isArray(inventory) ||
+  inventory.version !== 1 ||
+  !Array.isArray(inventory.assets)
+) {
+  throw new TypeError(
+    'Browser-test server requires the exact web asset inventory v1.'
+  );
+}
+const inventoryContentTypes = new Map();
+for (const asset of inventory.assets) {
+  if (
+    asset === null ||
+    typeof asset !== 'object' ||
+    Array.isArray(asset) ||
+    typeof asset.path !== 'string' ||
+    typeof asset.content_type !== 'string' ||
+    inventoryContentTypes.has(asset.path)
+  ) {
+    throw new TypeError(
+      'Browser-test server requires unique inventory paths and content types.'
+    );
+  }
+  inventoryContentTypes.set(asset.path, asset.content_type);
+}
 const contentTypes = new Map([
   ['.bin', 'application/octet-stream'],
   ['.css', 'text/css; charset=utf-8'],
@@ -88,9 +121,11 @@ async function serve(request, response) {
   }
 
   const extension = path.extname(candidate).toLowerCase();
+  const portableRelative = relative.split(path.sep).join('/');
   const contentType = pathname === '/_cellucid/health'
     ? 'text/plain; charset=utf-8'
-    : contentTypes.get(extension);
+    : inventoryContentTypes.get(portableRelative) ??
+      contentTypes.get(extension);
   if (contentType === undefined) {
     send(
       response,

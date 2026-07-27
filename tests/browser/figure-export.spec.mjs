@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { expect, test } from '@playwright/test';
+import { dismissWelcome } from './helpers/welcome.mjs';
 
 const PREPARED_DATASET_URL =
   '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared';
@@ -63,6 +64,7 @@ async function openFigureExport(page, acceptance) {
     `${PREPARED_DATASET_URL}&acceptance=${encodeURIComponent(acceptance)}`,
     { waitUntil: 'domcontentloaded' },
   );
+  await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture',
   );

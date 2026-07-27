@@ -110,7 +110,7 @@ function requireConnectionConfig(config) {
     ['timeout'],
     'Remote connection configuration'
   );
-  const url = requireRemoteServerUrl(config.url);
+  const url = validateRemoteServerUrl(config.url);
   const timeout = Object.hasOwn(config, 'timeout')
     ? config.timeout
     : DEFAULT_CONNECTION_TIMEOUT_MS;
@@ -126,7 +126,7 @@ function requireConnectionConfig(config) {
   return Object.freeze({ url, timeout });
 }
 
-function requireRemoteServerUrl(value) {
+export function validateRemoteServerUrl(value) {
   if (
     typeof value !== 'string' ||
     value.length === 0 ||
@@ -596,6 +596,16 @@ export class RemoteDataSource {
 
   getType() {
     return this.type;
+  }
+
+  /**
+   * Create an isolated connection candidate. Connection attempts never mutate
+   * the currently registered transport owner.
+   *
+   * @returns {RemoteDataSource}
+   */
+  createConnectionCandidate() {
+    return new RemoteDataSource();
   }
 
   async isAvailable() {

@@ -332,7 +332,7 @@ function unreadPositionProxy(values, onCoordinateRead) {
   });
 }
 
-async function runLocalSelection(t, { switchDataset, reloadDataset }) {
+async function runLocalSelection(t, { activateDataset }) {
   const browserState = installBrowserStubs(t);
   const notificationEvents = captureNotifications(t);
   const originalDebugError = debug.error;
@@ -346,29 +346,79 @@ async function runLocalSelection(t, { switchDataset, reloadDataset }) {
     name: 'Local data',
     stats: { n_cells: 2 }
   };
-  const userSource = {
+  const candidate = {
     datasetId: 'local',
-    loadFromH5adFile: async () => metadata
+    disconnectCalls: 0,
+    disconnect() {
+      this.disconnectCalls++;
+    },
+    getType() {
+      return 'local-user';
+    },
+    loadFromH5adFile: async () => metadata,
   };
+  const userSource = {
+    candidateCreations: 0,
+    createSelectionCandidate() {
+      this.candidateCreations++;
+      return candidate;
+    },
+    disconnect() {},
+    getType() {
+      return 'local-user';
+    },
+  };
+  const sources = new Map([['local-user', userSource]]);
   let populateCalls = 0;
 
   initDatasetConnections({
-    state: {},
-    viewer: {},
-    dom: { userDataH5adInput: input },
-    dataSourceManager: {
-      getSource: type => type === 'local-user' ? userSource : null,
-      switchToDataset: switchDataset
+    activateDataset: async (
+      datasetId,
+      sourceType,
+      loadMethod,
+      source
+    ) => {
+      const ready = await activateDataset({
+        datasetId,
+        loadMethod,
+        source,
+        sourceType,
+      });
+      if (ready === true) sources.set(sourceType, source);
+      return ready;
     },
-    reloadDataset,
+    clearDataset: async () => true,
+    dom: {
+      select: { focus() {} },
+      userDataH5adBtn: createButton(),
+      userDataH5adInput: input,
+    },
+    dataSourceManager: {
+      getCurrentSourceType: () => null,
+      getSource: type => sources.get(type) ?? null,
+      registerSource(type, source) {
+        sources.set(type, source);
+      },
+      unregisterSource(type) {
+        sources.delete(type);
+      },
+    },
     populateDatasetDropdown: () => {
       populateCalls++;
+      return Object.freeze({ status: 'ready' });
     },
     noneDatasetValue: '__none__'
   });
 
   await input.select([{ name: 'example.h5ad' }]);
-  return { browserState, metadata, notificationEvents, populateCalls };
+  return {
+    browserState,
+    candidate,
+    metadata,
+    notificationEvents,
+    populateCalls,
+    userSource,
+  };
 }
 
 test('required dataset reload reports failure before rejecting the original error', async () => {
@@ -847,29 +897,96 @@ test('reload failure handling requires exact transaction and handler ownership',
 });
 
 test('post-publication UI errors remain truthful ready outcomes', async () => {
-  const { settlePublishedDatasetUi } =
+  const {
+    createDatasetRuntimeRetirementOwner,
+    settlePublishedDatasetUi
+  } =
     await import(outcomeModuleUrl);
+  let readyFinalizations = 0;
   const ready = settlePublishedDatasetUi({
     synchronize() {},
+    finalize() {
+      readyFinalizations++;
+    },
     reportFailure: () => assert.fail('ready UI was reported as failed')
   });
   assert.deepEqual(ready, { status: 'ready' });
+  assert.equal(readyFinalizations, 1);
 
   const uiError = new Error('dimension selector render failed');
   const reported = [];
+  let impairedFinalizations = 0;
   const impaired = settlePublishedDatasetUi({
     synchronize() {
       throw uiError;
+    },
+    finalize() {
+      impairedFinalizations++;
     },
     reportFailure: error => reported.push(error)
   });
   assert.equal(impaired.status, 'ready-ui-error');
   assert.equal(impaired.error, uiError);
   assert.deepEqual(reported, [uiError]);
+  assert.equal(impairedFinalizations, 1);
+
+  const retirementError = new Error('coordinate cache release failed');
+  const retirementReports = [];
+  const retirementImpaired = settlePublishedDatasetUi({
+    synchronize() {},
+    finalize() {
+      throw retirementError;
+    },
+    reportFailure: error => retirementReports.push(error)
+  });
+  assert.equal(retirementImpaired.status, 'ready-ui-error');
+  assert.equal(retirementImpaired.error, retirementError);
+  assert.deepEqual(retirementReports, [retirementError]);
+
+  const combinedReports = [];
+  const combined = settlePublishedDatasetUi({
+    synchronize() {
+      throw uiError;
+    },
+    finalize() {
+      throw retirementError;
+    },
+    reportFailure: error => combinedReports.push(error)
+  });
+  assert.equal(combined.status, 'ready-ui-error');
+  assert.ok(combined.error instanceof AggregateError);
+  assert.deepEqual(combined.error.errors, [uiError, retirementError]);
+  assert.deepEqual(combinedReports, [combined.error]);
+
+  const retirementOwner = createDatasetRuntimeRetirementOwner();
+  let successfulClears = 0;
+  const successfulResource = {
+    clearCache() {
+      successfulClears++;
+    }
+  };
+  assert.equal(retirementOwner.retire(successfulResource), true);
+  assert.equal(retirementOwner.retire(successfulResource), false);
+  assert.equal(successfulClears, 1);
+
+  let failedClears = 0;
+  const failedResource = {
+    clearCache() {
+      failedClears++;
+      throw retirementError;
+    }
+  };
+  assert.throws(
+    () => retirementOwner.retire(failedResource),
+    error => error === retirementError
+  );
+  assert.equal(retirementOwner.retire(failedResource), false);
+  assert.equal(failedClears, 1);
 
   assert.throws(
     () => settlePublishedDatasetUi({
       synchronize() {},
+      finalize() {},
       reportFailure() {},
       fallbackToOldUi: true
     }),
@@ -1386,7 +1503,7 @@ test('prepared gzip loaders expose one exact decompression backend', async () =>
   );
   assert.ok(
     progressSource.indexOf('requireGzipDecompressionStream(url)') <
-      progressSource.indexOf('resolveAnyUrl(url, signal)')
+      progressSource.indexOf('resolveAnyUrl(')
   );
   assert.equal(
     progressSource.match(/new GzipDecompressionStream\('gzip'\)/g)
@@ -1439,7 +1556,7 @@ test('3D position padding owns one outer progress transaction', async t => {
   );
 });
 
-test('in-place reload stages silently and publishes through one synchronous commit', async () => {
+test('in-place reload stages one generation before reversible publication', async () => {
   const mainSource = await readFile(
     new URL('../assets/js/app/main.js', import.meta.url),
     'utf8'
@@ -1463,23 +1580,79 @@ test('in-place reload stages silently and publishes through one synchronous comm
     /baseUrl\.endsWith\('\/'\)\s*\?\s*baseUrl\s*:\s*`\$\{baseUrl\}\//,
     'application staging must reject a non-directory source URL, not repair it'
   );
-  assert.match(
-    reloadSource,
-    /await stageDatasetRuntime\(\{\s*baseUrl,\s*expectedIdentityId,\s*showProgress:\s*false,\s*signal:\s*reloadTransaction\.signal\s*\}\)/
+  const selectionStageIndex = reloadSource.indexOf(
+    'selectionStage = await dataSourceManager.stageDatasetSelection('
   );
-  assert.equal(
-    reloadSource.match(/commitDatasetRuntimeStage\(/g)?.length,
-    1
+  const urlStageIndex = reloadSource.indexOf(
+    'urlPublication = prepareUrlForDatasetSelection({'
+  );
+  const runtimeStageIndex = reloadSource.indexOf(
+    'runtimeStage = await stageDatasetRuntime({'
+  );
+  const candidateBindingIndex = reloadSource.indexOf(
+    'createCandidateAnnDataBinding('
+  );
+  const stagedSourceIndex = reloadSource.indexOf(
+    'dataSourceManager.isCustomProtocolUrl('
+  );
+  const ownerRecheckIndex = reloadSource.indexOf(
+    'reloadTransaction.assertCurrent();',
+    runtimeStageIndex
   );
   const stagingCatch = reloadSource.indexOf('} catch (err) {');
-  const analysisResetIndex = reloadSource.indexOf(
-    'window._comparisonModule.resetForDatasetReload({'
+  const stagingCatchEnd = reloadSource.indexOf(
+    '// All fallible dataset I/O and validation has completed',
+    stagingCatch
   );
-  const commitIndex = reloadSource.indexOf(
-    'commitDatasetRuntimeStage(stage)'
+  const stagingCatchSource = reloadSource.slice(
+    stagingCatch,
+    stagingCatchEnd
   );
-  const resourceReplacementIndex = reloadSource.indexOf(
-    'connectivityRuntimeOwner.prepareDatasetReplacement()'
+  assert.ok(
+    selectionStageIndex >= 0 &&
+    urlStageIndex > selectionStageIndex &&
+    candidateBindingIndex > urlStageIndex &&
+    stagedSourceIndex > candidateBindingIndex &&
+    runtimeStageIndex > urlStageIndex &&
+    runtimeStageIndex > stagedSourceIndex &&
+    ownerRecheckIndex > runtimeStageIndex &&
+    stagingCatch > ownerRecheckIndex
+  );
+  assert.match(
+    reloadSource.slice(runtimeStageIndex, stagingCatch),
+    /baseUrl:\s*selectionStage\.baseUrl[\s\S]*candidateAnnDataBinding,[\s\S]*expectedIdentityId:\s*selectionStage\.identityId[\s\S]*showProgress:\s*false[\s\S]*signal:\s*reloadTransaction\.signal,[\s\S]*stagedSource/
+  );
+  assert.match(stagingCatchSource, /if \(runtimeStage !== null\)/);
+  assert.equal(
+    stagingCatchSource.match(
+      /runtimeRetirementOwner\.retire\(\s*runtimeStage\.dimensionManager\s*\)/g
+    )?.length,
+    1
+  );
+  assert.match(
+    stagingCatchSource,
+    /dataSourceManager\.discardDatasetSelection\(selectionStage\)/
+  );
+  assert.doesNotMatch(
+    reloadSource.slice(selectionStageIndex, stagingCatchEnd),
+    /urlPublication\.commit|commitDatasetSelection|commitDatasetRuntimeStage/
+  );
+
+  const urlCommitIndex = reloadSource.indexOf(
+    'urlPublication.commit()',
+    stagingCatchEnd
+  );
+  const managerCommitIndex = reloadSource.indexOf(
+    'dataSourceManager.commitDatasetSelection(selectionStage)',
+    urlCommitIndex
+  );
+  const runtimeCommitIndex = reloadSource.indexOf(
+    'commitDatasetRuntimeStage(runtimeStage)',
+    managerCommitIndex
+  );
+  const managerPublishIndex = reloadSource.indexOf(
+    'dataSourceManager.publishDatasetSelection(managerPublication)',
+    runtimeCommitIndex
   );
   const successIndex = reloadSource.indexOf(
     'completeDataLoadSuccess(loadToken'
@@ -1487,37 +1660,35 @@ test('in-place reload stages silently and publishes through one synchronous comm
   const uiSyncIndex = reloadSource.indexOf(
     'const synchronizationOutcome = synchronizePublishedDatasetUi('
   );
-  assert.ok(
-    analysisResetIndex >= 0 &&
-    analysisResetIndex < stagingCatch &&
-    resourceReplacementIndex > stagingCatch &&
-    resourceReplacementIndex < commitIndex &&
-    commitIndex > stagingCatch &&
-    uiSyncIndex > commitIndex &&
-    successIndex > uiSyncIndex
-  );
-  const uiSyncFunctionStart = mainSource.indexOf(
-    'function synchronizePublishedDatasetUi'
-  );
-  const initialSelectionStart = mainSource.indexOf(
-    'const hasInitialDataset =',
-    uiSyncFunctionStart
+  const finalizationIndex = reloadSource.indexOf(
+    'dataSourceManager.finalizeDatasetSelection(managerPublication)',
+    uiSyncIndex
   );
   assert.ok(
-    uiSyncFunctionStart >= 0 &&
-    initialSelectionStart > uiSyncFunctionStart
+    urlCommitIndex > stagingCatchEnd &&
+    managerCommitIndex > urlCommitIndex &&
+    runtimeCommitIndex > managerCommitIndex &&
+    managerPublishIndex > runtimeCommitIndex &&
+    uiSyncIndex > managerPublishIndex &&
+    finalizationIndex > uiSyncIndex &&
+    successIndex > finalizationIndex
   );
-  assert.doesNotMatch(
-    mainSource.slice(uiSyncFunctionStart, initialSelectionStart),
-    /resetForDatasetReload/
+  const managerPublicationCatch = reloadSource.slice(
+    reloadSource.indexOf('} catch (error) {', urlCommitIndex),
+    reloadSource.indexOf('let publication;', managerCommitIndex)
+  );
+  assert.match(managerPublicationCatch, /urlPublication\.rollback\(\)/);
+  assert.match(
+    managerPublicationCatch,
+    /runtimeRetirementOwner\.retire\(\s*runtimeStage\.dimensionManager\s*\)/
+  );
+  assert.match(
+    managerPublicationCatch,
+    /return handleDatasetReloadFailure\(\{/
   );
   assert.doesNotMatch(
     reloadSource,
     /state\.(?:setDimensionManager|setFieldLoader|setVarFieldLoader|initVarData|initScene|setVectorFieldManager)/
-  );
-  assert.doesNotMatch(
-    reloadSource,
-    /notifications\.(?:complete|error|fail|success)|showSessionStatus/
   );
 });
 
@@ -1768,46 +1939,11 @@ test('connectivity edge publication has one abortable generation owner', async (
   );
 });
 
-test('local dataset connection publishes exactly one truthful terminal outcome', async t => {
-  await t.test('auto-switch failure completes with the validated source retained', async t => {
+test('isolated local dataset candidates publish one truthful terminal outcome', async t => {
+  await t.test('activation failure retires the candidate and preserves the source', async t => {
     const result = await runLocalSelection(t, {
-      switchDataset: async () => {
-        throw new Error('synthetic switch failure');
-      },
-      reloadDataset: async () => {
-        assert.fail('reload must not run after a failed switch');
-      }
-    });
-
-    const terminal = result.notificationEvents.filter(
-      event => event.kind === 'complete' || event.kind === 'fail'
-    );
-    assert.deepEqual(
-      terminal.map(event => event.kind),
-      ['complete']
-    );
-    assert.deepEqual(
-      {
-        historyReplacements: result.browserState.historyReplacements,
-        instructionIsTruthful:
-          /validated.*"Sample datasets".*apply/i.test(terminal[0].message),
-        locationHref: globalThis.window.location.href,
-        populateCalls: result.populateCalls
-      },
-      {
-        historyReplacements: [],
-        instructionIsTruthful: true,
-        locationHref: result.browserState.initialHref,
-        populateCalls: 1
-      }
-    );
-  });
-
-  await t.test('post-switch reload failure publishes failure only', async t => {
-    const result = await runLocalSelection(t, {
-      switchDataset: async () => {},
-      reloadDataset: async () => {
-        throw new Error('synthetic required reload failure');
+      activateDataset: async () => {
+        throw new Error('synthetic activation failure');
       }
     });
 
@@ -1818,7 +1954,27 @@ test('local dataset connection publishes exactly one truthful terminal outcome',
       terminal.map(event => event.kind),
       ['fail']
     );
-    assert.match(terminal[0].message, /required reload failure/i);
+    assert.match(terminal[0].message, /activation failure/i);
+    assert.equal(result.candidate.disconnectCalls, 1);
+    assert.equal(result.userSource.candidateCreations, 1);
+    assert.equal(result.populateCalls, 0);
+    assert.deepEqual(result.browserState.historyReplacements, []);
+  });
+
+  await t.test('false activation outcome is a failure, never ready', async t => {
+    const result = await runLocalSelection(t, {
+      activateDataset: async () => false
+    });
+
+    const terminal = result.notificationEvents.filter(
+      event => event.kind === 'complete' || event.kind === 'fail'
+    );
+    assert.deepEqual(
+      terminal.map(event => event.kind),
+      ['fail']
+    );
+    assert.match(terminal[0].message, /did not publish one ready generation/i);
+    assert.equal(result.candidate.disconnectCalls, 1);
     assert.equal(result.populateCalls, 0);
   });
 
@@ -1826,8 +1982,7 @@ test('local dataset connection publishes exactly one truthful terminal outcome',
     const { createDatasetReloadSupersededError } =
       await import(outcomeModuleUrl);
     const result = await runLocalSelection(t, {
-      switchDataset: async () => {},
-      reloadDataset: async () => {
+      activateDataset: async () => {
         throw createDatasetReloadSupersededError(
           'Dataset reload was superseded by a newer selection.'
         );
@@ -1842,14 +1997,16 @@ test('local dataset connection publishes exactly one truthful terminal outcome',
       result.notificationEvents.some(event => event.kind === 'dismiss'),
       true
     );
+    assert.equal(result.candidate.disconnectCalls, 1);
     assert.equal(result.populateCalls, 0);
   });
 
-  await t.test('successful switch and reload complete as ready', async t => {
+  await t.test('successful activation adopts the isolated candidate', async t => {
+    const activations = [];
     const result = await runLocalSelection(t, {
-      switchDataset: async () => {},
-      reloadDataset: async metadata => {
-        assert.equal(metadata.name, 'Local data');
+      activateDataset: async selection => {
+        activations.push(selection);
+        return true;
       }
     });
 
@@ -1862,35 +2019,22 @@ test('local dataset connection publishes exactly one truthful terminal outcome',
     );
     assert.match(terminal[0].message, /ready.*2 cells/i);
     assert.equal(result.populateCalls, 1);
-    assert.equal(result.browserState.historyReplacements.length, 1);
-    assert.equal(globalThis.window.location.search, '');
-
-    const connectionSource = await readFile(
-      new URL(
-        '../assets/js/app/ui/modules/dataset-connections.js',
-        import.meta.url
-      ),
-      'utf8'
+    assert.equal(result.candidate.disconnectCalls, 0);
+    assert.equal(activations.length, 1);
+    assert.equal(activations[0].source, result.candidate);
+    assert.deepEqual(
+      {
+        datasetId: activations[0].datasetId,
+        loadMethod: activations[0].loadMethod,
+        sourceType: activations[0].sourceType,
+      },
+      {
+        datasetId: 'local',
+        loadMethod: DATA_LOAD_METHODS.LOCAL_H5AD,
+        sourceType: 'local-user',
+      }
     );
-    const localSelectionStart = connectionSource.indexOf(
-      'async function loadLocalUserSelection'
-    );
-    const localSelectionEnd = connectionSource.indexOf(
-      '// ---------------------------------------------------------------------------',
-      localSelectionStart
-    );
-    assert.ok(
-      localSelectionStart >= 0 && localSelectionEnd > localSelectionStart
-    );
-    const localSelectionSource = connectionSource.slice(
-      localSelectionStart,
-      localSelectionEnd
-    );
-    assert.match(
-      localSelectionSource,
-      /updateUrlForDataSource\('local-user', \{\}\)/
-    );
-    assert.doesNotMatch(localSelectionSource, /clearUrlDataSource\(\)/);
+    assert.deepEqual(result.browserState.historyReplacements, []);
   });
 });
 
@@ -1908,21 +2052,46 @@ test('local validation failures publish the validator error message exactly', as
     'Zarr archive is missing required .zgroup metadata'
   );
   validationError.getUserMessage = () => 'Could not load this dataset';
+  const candidate = {
+    datasetId: null,
+    disconnectCalls: 0,
+    disconnect() {
+      this.disconnectCalls++;
+    },
+    getType() {
+      return 'local-user';
+    },
+    async loadFromZarrArchive() {
+      throw validationError;
+    },
+  };
+  const registered = {
+    createSelectionCandidate: () => candidate,
+    disconnect() {},
+    getType: () => 'local-user',
+  };
+  let activationCalls = 0;
 
   initDatasetConnections({
-    state: {},
-    viewer: {},
-    dom: { userDataZarrArchiveInput: input },
+    activateDataset: async () => {
+      activationCalls++;
+      return true;
+    },
+    clearDataset: async () => true,
+    dom: {
+      select: { focus() {} },
+      userDataZarrArchiveBtn: createButton(),
+      userDataZarrArchiveInput: input,
+    },
     dataSourceManager: {
-      getSource: type => type === 'local-user'
-        ? {
-            async loadFromZarrArchive() {
-              throw validationError;
-            },
-          }
-        : null,
+      getCurrentSourceType: () => null,
+      getSource: type => type === 'local-user' ? registered : null,
+      registerSource() {},
+      unregisterSource() {},
     },
     noneDatasetValue: '__none__',
+    populateDatasetDropdown: async () =>
+      Object.freeze({ status: 'ready' }),
   });
 
   await input.select([
@@ -1937,6 +2106,8 @@ test('local validation failures publish the validator error message exactly', as
       message: validationError.message,
     }]
   );
+  assert.equal(candidate.disconnectCalls, 1);
+  assert.equal(activationCalls, 0);
 });
 
 test('connection analytics expose only exact current load methods', () => {
@@ -1966,7 +2137,6 @@ test('disconnect controls clear only their connection and never choose science',
       connectButtonKey: 'remoteConnectBtn',
       disconnectButtonKey: 'remoteDisconnectBtn',
       disconnectContainerKey: 'remoteDisconnectContainer',
-      disconnectedMessage: 'Disconnected',
       fieldKey: 'remoteServerUrl',
       initialHref:
         'https://cellucid.test/?remote=https%3A%2F%2Fserver.test%2F',
@@ -1976,7 +2146,6 @@ test('disconnect controls clear only their connection and never choose science',
       connectButtonKey: 'githubConnectBtn',
       disconnectButtonKey: 'githubDisconnectBtn',
       disconnectContainerKey: 'githubDisconnectContainer',
-      disconnectedMessage: 'Disconnected from GitHub',
       fieldKey: 'githubRepoUrl',
       initialHref: 'https://cellucid.test/?github=owner%2Frepository',
       sourceType: 'github-repo',
@@ -1993,6 +2162,7 @@ test('disconnect controls clear only their connection and never choose science',
       const disconnectContainer = { style: {} };
       const field = { disabled: false, value: '' };
       const dom = {
+        select: { focus() {} },
         [connection.connectButtonKey]: connectButton,
         [connection.disconnectButtonKey]: disconnectButton,
         [connection.disconnectContainerKey]: disconnectContainer,
@@ -2000,53 +2170,67 @@ test('disconnect controls clear only their connection and never choose science',
       };
       let disconnectCalls = 0;
       let populateCalls = 0;
-      let reloadCalls = 0;
-      let switchCalls = 0;
+      let clearCalls = 0;
       const sourceLookups = [];
-      const connectionSource = {
+      const createConnectionSource = connected => ({
+        async connect() {},
+        createConnectionCandidate() {
+          return createConnectionSource(false);
+        },
         disconnect() {
           disconnectCalls++;
         },
         getConnectionInfo() {
           return connection.sourceType === 'remote'
-            ? { connected: true, url: 'https://server.test/' }
-            : { connected: true };
+            ? {
+                status: connected ? 'connected' : 'disconnected',
+                url: connected ? 'https://server.test/' : null,
+              }
+            : {
+                connected,
+                inputPath: connected ? 'owner/repository' : null,
+              };
         },
-        isConnected() {
-          return true;
+        getType() {
+          return connection.sourceType;
         },
-      };
+        async listDatasets() {
+          return [];
+        },
+        onConnectionLost() {},
+      });
+      const connectionSource = createConnectionSource(true);
+      const sources = new Map([
+        [connection.sourceType, connectionSource],
+      ]);
+      let currentSourceType = connection.sourceType;
 
       initDatasetConnections({
-        state: {},
-        viewer: {},
+        activateDataset: async () => {
+          assert.fail('disconnect must not activate a dataset');
+        },
+        clearDataset: async () => {
+          clearCalls++;
+          currentSourceType = null;
+          return true;
+        },
         dom,
         dataSourceManager: {
-          getCurrentSourceType: () => connection.sourceType,
+          getCurrentSourceType: () => currentSourceType,
           getSource(type) {
             sourceLookups.push(type);
-            if (type === connection.sourceType) return connectionSource;
-            if (type === 'local-demo') {
-              return {
-                async getDefaultDatasetId() {
-                  return 'demo-that-must-not-be-selected';
-                },
-              };
-            }
-            return null;
+            return sources.get(type) ?? null;
           },
-          async switchToDataset() {
-            switchCalls++;
+          registerSource(type, source) {
+            sources.set(type, source);
           },
-          getCurrentMetadata() {
-            return { id: 'demo-that-must-not-be-selected' };
+          unregisterSource(type) {
+            sources.delete(type);
           },
-        },
-        async reloadDataset() {
-          reloadCalls++;
         },
         populateDatasetDropdown() {
           populateCalls++;
+          return Object.freeze({ status: 'ready' });
         },
         noneDatasetValue: '__none__',
       });
@@ -2058,18 +2242,22 @@ test('disconnect controls clear only their connection and never choose science',
       assert.equal(disconnectContainer.style.display, 'none');
       assert.equal(field.disabled, false);
       assert.deepEqual(sourceLookups, [connection.sourceType]);
-      assert.equal(switchCalls, 0);
-      assert.equal(reloadCalls, 0);
-      assert.equal(populateCalls, 0);
-      assert.deepEqual(
-        notificationEvents.filter(event => event.kind === 'success'),
-        [{
-          kind: 'success',
-          message: connection.disconnectedMessage,
-        }]
+      assert.equal(clearCalls, 1);
+      assert.equal(populateCalls, 1);
+      assert.notEqual(
+        sources.get(connection.sourceType),
+        connectionSource
       );
-      assert.equal(browserState.historyReplacements.length, 1);
-      assert.equal(globalThis.window.location.search, '');
+      const successes = notificationEvents.filter(
+        event => event.kind === 'success'
+      );
+      assert.equal(successes.length, 1);
+      assert.match(successes[0].message, /disconnected/i);
+      assert.equal(browserState.historyReplacements.length, 0);
+      assert.equal(
+        globalThis.window.location.href,
+        connection.initialHref
+      );
     });
   }
 });
@@ -2081,8 +2269,7 @@ test('dedicated Zarr ZIP control opens and activates the portable archive input'
   const button = createButton();
   const archive = { name: 'portable.zarr.zip' };
   let selectedFiles = null;
-  let reloadMetadata = null;
-  let switchArguments = null;
+  let activation = null;
   const metadata = {
     id: 'portable',
     name: 'portable.zarr',
@@ -2090,29 +2277,50 @@ test('dedicated Zarr ZIP control opens and activates the portable archive input'
   };
   const userSource = {
     datasetId: 'portable',
+    disconnect() {},
+    getType: () => 'local-user',
     async loadFromZarrArchive(file) {
       selectedFiles = [file];
       return metadata;
     }
   };
+  const registeredSource = {
+    createSelectionCandidate: () => userSource,
+    disconnect() {},
+    getType: () => 'local-user',
+  };
+  const sources = new Map([['local-user', registeredSource]]);
 
   initDatasetConnections({
-    state: {},
-    viewer: {},
+    activateDataset: async (
+      datasetId,
+      sourceType,
+      loadMethod,
+      source
+    ) => {
+      activation = { datasetId, loadMethod, source, sourceType };
+      sources.set(sourceType, source);
+      return true;
+    },
+    clearDataset: async () => true,
     dom: {
+      select: { focus() {} },
       userDataZarrArchiveBtn: button,
       userDataZarrArchiveInput: input
     },
     dataSourceManager: {
-      getSource: type => type === 'local-user' ? userSource : null,
-      async switchToDataset(...args) {
-        switchArguments = args;
-      }
+      getCurrentSourceType: () => null,
+      getSource: type => sources.get(type) ?? null,
+      registerSource(type, source) {
+        sources.set(type, source);
+      },
+      unregisterSource(type) {
+        sources.delete(type);
+      },
     },
-    async reloadDataset(value) {
-      reloadMetadata = value;
-    },
-    noneDatasetValue: '__none__'
+    noneDatasetValue: '__none__',
+    populateDatasetDropdown: async () =>
+      Object.freeze({ status: 'ready' }),
   });
 
   button.activate();
@@ -2120,12 +2328,12 @@ test('dedicated Zarr ZIP control opens and activates the portable archive input'
   await input.select([archive]);
 
   assert.deepEqual(selectedFiles, [archive]);
-  assert.deepEqual(switchArguments, [
-    'local-user',
-    'portable',
-    { loadMethod: 'local-user-zarr-zip' }
-  ]);
-  assert.equal(reloadMetadata, metadata);
+  assert.deepEqual(activation, {
+    datasetId: 'portable',
+    loadMethod: DATA_LOAD_METHODS.LOCAL_ZARR_ZIP,
+    source: userSource,
+    sourceType: 'local-user',
+  });
   assert.equal(input.value, '');
   assert.deepEqual(
     notificationEvents
@@ -2143,63 +2351,83 @@ test('browser local-data wiring invokes only portable current transports', async
   const zarrInput = createFileInput();
   const archiveInput = createFileInput();
   const calls = [];
-  const switches = [];
-  const userSource = {
-    datasetId: null,
-    async loadFromPreparedDirectory(files) {
-      calls.push(['prepared', files]);
-      this.datasetId = 'prepared';
-      return {
-        id: this.datasetId,
-        name: 'Prepared',
-        stats: { n_cells: 1 },
-      };
-    },
-    async loadFromH5adFile(file) {
-      calls.push(['h5ad', file]);
-      this.datasetId = 'h5ad';
-      return {
-        id: this.datasetId,
-        name: 'H5AD',
-        stats: { n_cells: 1 },
-      };
-    },
-    async loadFromZarrDirectory(files) {
-      calls.push(['zarr-directory', files]);
-      this.datasetId = 'zarr-directory';
-      return {
-        id: this.datasetId,
-        name: 'Zarr directory',
-        stats: { n_cells: 1 },
-      };
-    },
-    async loadFromZarrArchive(file) {
-      calls.push(['zarr-archive', file]);
-      this.datasetId = 'zarr-archive';
-      return {
-        id: this.datasetId,
-        name: 'Zarr archive',
-        stats: { n_cells: 1 },
-      };
-    },
-  };
+  const activations = [];
+  function createUserSource() {
+    return {
+      datasetId: null,
+      createSelectionCandidate: createUserSource,
+      disconnect() {},
+      getType: () => 'local-user',
+      async loadFromPreparedDirectory(files) {
+        calls.push(['prepared', files]);
+        this.datasetId = 'prepared';
+        return {
+          id: this.datasetId,
+          name: 'Prepared',
+          stats: { n_cells: 1 },
+        };
+      },
+      async loadFromH5adFile(file) {
+        calls.push(['h5ad', file]);
+        this.datasetId = 'h5ad';
+        return {
+          id: this.datasetId,
+          name: 'H5AD',
+          stats: { n_cells: 1 },
+        };
+      },
+      async loadFromZarrArchive(file) {
+        calls.push(['zarr-archive', file]);
+        this.datasetId = 'zarr-archive';
+        return {
+          id: this.datasetId,
+          name: 'Zarr archive',
+          stats: { n_cells: 1 },
+        };
+      },
+    };
+  }
+  const sources = new Map([['local-user', createUserSource()]]);
 
   initDatasetConnections({
-    state: {},
-    viewer: {},
+    activateDataset: async (
+      datasetId,
+      sourceType,
+      loadMethod,
+      source
+    ) => {
+      activations.push({
+        datasetId,
+        loadMethod,
+        source,
+        sourceType,
+      });
+      sources.set(sourceType, source);
+      return true;
+    },
+    clearDataset: async () => true,
     dom: {
+      select: { focus() {} },
+      userDataBrowseBtn: createButton(),
       userDataFileInput: preparedInput,
+      userDataH5adBtn: createButton(),
       userDataH5adInput: h5adInput,
       userDataZarrInput: zarrInput,
+      userDataZarrArchiveBtn: createButton(),
       userDataZarrArchiveInput: archiveInput,
     },
     dataSourceManager: {
-      getSource: type => type === 'local-user' ? userSource : null,
-      async switchToDataset(...args) {
-        switches.push(args);
+      getCurrentSourceType: () => null,
+      getSource: type => sources.get(type) ?? null,
+      registerSource(type, source) {
+        sources.set(type, source);
+      },
+      unregisterSource(type) {
+        sources.delete(type);
       },
     },
-    reloadDataset: async () => {},
+    populateDatasetDropdown: async () =>
+      Object.freeze({ status: 'ready' }),
     noneDatasetValue: '__none__',
   });
 
@@ -2227,9 +2455,9 @@ test('browser local-data wiring invokes only portable current transports', async
   assert.equal(calls[1][1], h5adFile);
   assert.equal(calls[2][1], archiveFile);
   assert.deepEqual(
-    switches.map(([, datasetId, options]) => [
+    activations.map(({ datasetId, loadMethod }) => [
       datasetId,
-      options.loadMethod,
+      loadMethod,
     ]),
     [
       ['prepared', 'local-user-prepared'],

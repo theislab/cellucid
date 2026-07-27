@@ -695,6 +695,28 @@ function requireNonEmptyString(value, label, sourceType) {
   }
 }
 
+/**
+ * Validate one exact dataset id shared by catalogs, identities, manager
+ * selections, and browser URL publication.
+ *
+ * @param {unknown} value
+ * @param {string} [label]
+ * @returns {string}
+ */
+export function validateDatasetId(value, label = 'Dataset id') {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value !== value.trim() ||
+    /[\u0000-\u001f\u007f]/.test(value)
+  ) {
+    throw new TypeError(
+      `${label} must be one non-empty, unpadded string without control characters.`
+    );
+  }
+  return value;
+}
+
 function requireCount(value, label, sourceType) {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw invalidDatasetIdentity(
@@ -1082,7 +1104,15 @@ export function validateDatasetIdentity(
   datasetId,
   sourceType
 ) {
-  requireNonEmptyString(datasetId, 'catalog dataset id', sourceType);
+  try {
+    validateDatasetId(datasetId, 'Catalog dataset id');
+  } catch (error) {
+    throw invalidDatasetIdentity(
+      error.message,
+      sourceType,
+      { datasetId }
+    );
+  }
   assertExactKeys(
     identity,
     [
@@ -1123,7 +1153,15 @@ export function validateDatasetIdentity(
     sourceType
   );
 
-  requireNonEmptyString(identity.id, 'id', sourceType);
+  try {
+    validateDatasetId(identity.id, 'Dataset identity id');
+  } catch (error) {
+    throw invalidDatasetIdentity(
+      error.message,
+      sourceType,
+      { value: identity.id }
+    );
+  }
   if (identity.id !== datasetId) {
     throw invalidDatasetIdentity(
       `id '${identity.id}' does not match catalog id '${datasetId}'`,

@@ -79,6 +79,27 @@ function parseExactFilterId(filterId) {
 export class DataStateFilterMethods {
   computeGlobalVisibility() {
     if (this.pointCount === 0 && this.obsData === null) return;
+    if (this.pointCount === 0) {
+      if (
+        this.obsData === null ||
+        typeof this.obsData !== 'object' ||
+        Array.isArray(this.obsData) ||
+        this.obsData.count !== 0 ||
+        !Array.isArray(this.obsData.fields) ||
+        this.obsData.fields.length !== 0 ||
+        !(this.categoryTransparency instanceof Float32Array) ||
+        this.categoryTransparency.length !== 0 ||
+        !(this.cellVisibilityMask instanceof Float32Array) ||
+        this.cellVisibilityMask.length !== 0 ||
+        !(this.colorsArray instanceof Uint8Array) ||
+        this.colorsArray.length !== 0
+      ) {
+        throw new TypeError(
+          'Zero-cell visibility requires one exact empty observation generation.'
+        );
+      }
+      return;
+    }
     if (
       !Number.isSafeInteger(this.pointCount)
       || this.pointCount < 1
@@ -391,7 +412,12 @@ export class DataStateFilterMethods {
         }
         
         // Outlier filter
-        if (field.outlierQuantiles && field.outlierQuantiles.length) {
+        if (
+          this.activeFieldSource === 'obs'
+          && this.activeFieldIndex === fi
+          && field.outlierQuantiles
+          && field.outlierQuantiles.length
+        ) {
           const threshold = field._outlierThreshold != null ? field._outlierThreshold : 1.0;
           if (threshold < 0.9999) {
             const enabled = field._outlierFilterEnabled !== false; // default true
@@ -464,7 +490,6 @@ export class DataStateFilterMethods {
         throw new TypeError('Outlier filters require a categorical observation field.');
       }
       field._outlierFilterEnabled = enabled;
-      this.updateOutlierQuantiles();
     }
 
     this.computeGlobalVisibility();
@@ -497,7 +522,6 @@ export class DataStateFilterMethods {
       }
       field._outlierThreshold = 1.0;
       field._outlierFilterEnabled = true;
-      this.updateOutlierQuantiles();
     }
 
     this.computeGlobalVisibility();

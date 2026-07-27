@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { dismissWelcome } from './helpers/welcome.mjs';
 
 test('GLB benchmark publishes one complete state generation', async ({
   page
@@ -22,6 +23,7 @@ test('GLB benchmark publishes one complete state generation', async ({
     '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=benchmark-runtime-ci',
     { waitUntil: 'domcontentloaded' }
   );
+  await dismissWelcome(page);
   await expect(page.locator('#filter-count')).toHaveText(
     'Showing all 120 points'
   );

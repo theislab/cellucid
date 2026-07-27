@@ -17,6 +17,9 @@ import {
 import {
   loadDatasetGeneration,
 } from '../assets/js/data/dataset-generation-contract.js';
+import {
+  createCandidateAnnDataBinding,
+} from '../assets/js/data/anndata-provider.js';
 import { H5adDataSource } from '../assets/js/data/h5ad.js';
 import { ZarrDataSource } from '../assets/js/data/zarr.js';
 
@@ -264,6 +267,27 @@ async function createDirectSource(format, id) {
     source.dirname = filename;
   }
   return { adapter, identity, loader, source };
+}
+
+function createLocalAnnDataCandidate(format, fixture) {
+  return {
+    datasetId: fixture.id,
+    getH5adSource() {
+      return format === 'h5ad' ? fixture.source : null;
+    },
+    getType() {
+      return 'local-user';
+    },
+    getZarrSource() {
+      return format === 'zarr' ? fixture.source : null;
+    },
+    isH5adMode() {
+      return format === 'h5ad';
+    },
+    isZarrMode() {
+      return format === 'zarr';
+    },
+  };
 }
 
 test('H5AD and Zarr publish one exact v2 identity before direct adoption', async t => {
@@ -579,6 +603,202 @@ test('direct dispatch requires the exact protocol and adopted dataset id', async
     manager.activeDatasetMetadata =
       previous.activeDatasetMetadata;
   }
+});
+
+test(
+  'staged H5AD and Zarr candidates load completely while prepared data stays active',
+  async t => {
+    const manager = getDataSourceManager();
+    const previous = {
+      activeSource: manager.activeSource,
+      activeDatasetId: manager.activeDatasetId,
+      activeIdentityId: manager.activeIdentityId,
+      activeDatasetMetadata: manager.activeDatasetMetadata,
+    };
+    const preparedSource = {
+      datasetId: 'active-prepared',
+      getType() {
+        return 'local-user';
+      },
+      isH5adMode() {
+        return false;
+      },
+      isZarrMode() {
+        return false;
+      },
+    };
+    const preparedMetadata = Object.freeze({
+      id: 'active-prepared',
+    });
+    manager.activeSource = preparedSource;
+    manager.activeDatasetId = preparedSource.datasetId;
+    manager.activeIdentityId = 'active-prepared-identity';
+    manager.activeDatasetMetadata = preparedMetadata;
+    t.after(() => {
+      manager.activeSource = previous.activeSource;
+      manager.activeDatasetId = previous.activeDatasetId;
+      manager.activeIdentityId = previous.activeIdentityId;
+      manager.activeDatasetMetadata =
+        previous.activeDatasetMetadata;
+    });
+
+    for (const format of ['h5ad', 'zarr']) {
+      const id = `staged-${format}`;
+      const fixture = {
+        id,
+        ...await createDirectSource(format, id),
+      };
+      t.after(() => fixture.source.clear());
+      const candidate = createLocalAnnDataCandidate(format, fixture);
+      const baseUrl = `${format}://${id}/`;
+      const binding = createCandidateAnnDataBinding(
+        baseUrl,
+        candidate
+      );
+      const signal = new AbortController().signal;
+      const options = {
+        candidateAnnDataBinding: binding,
+        signal,
+      };
+
+      const generation = await loadDatasetGeneration({
+        signal,
+        expectedIdentityId: id,
+        loadIdentity: generationSignal =>
+          loadDatasetIdentity(
+            `${baseUrl}dataset_identity.json`,
+            {
+              candidateAnnDataBinding: binding,
+              signal: generationSignal,
+            }
+          ),
+        loadObsManifest: generationSignal =>
+          loadObsManifest(
+            `${baseUrl}obs_manifest.json`,
+            {
+              candidateAnnDataBinding: binding,
+              signal: generationSignal,
+            }
+          ),
+        loadVarManifest: generationSignal =>
+          loadVarManifest(
+            `${baseUrl}var_manifest.json`,
+            {
+              candidateAnnDataBinding: binding,
+              signal: generationSignal,
+            }
+          ),
+        loadConnectivityManifest: generationSignal =>
+          loadConnectivityManifest(
+            `${baseUrl}connectivity_manifest.json`,
+            {
+              candidateAnnDataBinding: binding,
+              signal: generationSignal,
+            }
+          ),
+      });
+      assert.strictEqual(generation.identity, fixture.identity);
+      assert.equal(generation.obsManifest.n_points, 3);
+      assert.equal(generation.varManifest, null);
+      assert.equal(generation.connectivityManifest.n_edges, 2);
+      assert.equal(
+        (
+          await loadVarManifest(
+            `${baseUrl}var_manifest.json`,
+            options
+          )
+        ).n_points,
+        3
+      );
+
+      const points = await loadPointsBinary(
+        `${baseUrl}points_2d.bin`,
+        {
+          candidateAnnDataBinding: binding,
+          dimension: 2,
+          signal,
+        }
+      );
+      assert.equal(points.length, 6);
+      assert.equal(manager.activeSource, preparedSource);
+      assert.equal(manager.activeDatasetId, 'active-prepared');
+      assert.equal(
+        manager.activeDatasetMetadata,
+        preparedMetadata
+      );
+
+      const otherFormat = format === 'h5ad' ? 'zarr' : 'h5ad';
+      assert.throws(
+        () => createCandidateAnnDataBinding(
+          `${otherFormat}://${id}/`,
+          candidate
+        ),
+        /candidate.*owns|protocol|mode/i
+      );
+      assert.throws(
+        () => createCandidateAnnDataBinding(
+          `${format}://${id}-other/`,
+          candidate
+        ),
+        /belongs to dataset|candidate source owns/i
+      );
+      await assert.rejects(
+        loadDatasetIdentity(
+          `${format}://${id}-other/dataset_identity.json`,
+          options
+        ),
+        /binding does not own.*protocol.*dataset id/i
+      );
+      await assert.rejects(
+        loadDatasetIdentity(
+          `${baseUrl}dataset_identity.json`,
+          {
+            candidateAnnDataBinding: Object.freeze({
+              datasetId: id,
+              protocol: format,
+            }),
+            signal,
+          }
+        ),
+        /must be created by createCandidateAnnDataBinding/i
+      );
+    }
+  }
+);
+
+test('staged metadata owners reject non-data option shapes before I/O', async () => {
+  let accessorReads = 0;
+  const accessor = {};
+  Object.defineProperty(accessor, 'stagedSource', {
+    enumerable: true,
+    get() {
+      accessorReads++;
+      return null;
+    },
+  });
+  const nonEnumerable = {};
+  Object.defineProperty(nonEnumerable, 'stagedSource', {
+    enumerable: false,
+    value: null,
+  });
+  const inherited = Object.create({ stagedSource: null });
+  const symbol = { [Symbol('stagedSource')]: null };
+
+  for (const options of [
+    accessor,
+    nonEnumerable,
+    inherited,
+    symbol,
+  ]) {
+    await assert.rejects(
+      loadDatasetIdentity(
+        'https://ordinary.test/dataset_identity.json',
+        options
+      ),
+      TypeError
+    );
+  }
+  assert.equal(accessorReads, 0);
 });
 
 test('progress-tracked cross-origin points use one direct streaming CORS request', () => {

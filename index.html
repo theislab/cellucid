@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="light" data-viewer-background="grid">
+<html lang="en" data-theme="light" data-viewer-background="white">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -14,7 +14,7 @@
     Release validation owns this immutable value and changes it only together
     with the exact web-asset inventory after the complete build is accepted.
   -->
-  <meta name="cellucid-web-build-id" content="2025-12-31T23:59:59Z-theislab-datasets" />
+  <meta name="cellucid-web-build-id" content="2026-07-26.4" />
 
   <!--
     CELLUCID_EXPORTS_BASE_URL
@@ -188,7 +188,7 @@
 	    </div>
 	  </noscript>
 
-  <!-- Welcome Modal (shown on first visit, hidden by default) -->
+  <!-- Welcome Modal (ordinary catalog startup only; hidden until exact startup intent is resolved) -->
   <div id="welcome-modal" class="welcome-modal hidden" role="dialog" aria-modal="true" aria-labelledby="welcome-title">
     <div class="welcome-backdrop"></div>
     <div class="welcome-content">
@@ -476,9 +476,9 @@
           <div class="control-block">
             <label for="background-select">Background:</label>
             <select id="background-select">
-              <option value="grid" selected>Grid (light)</option>
+              <option value="white" selected>White</option>
+              <option value="grid">Grid (light)</option>
               <option value="grid-dark">Grid (dark)</option>
-              <option value="white">White</option>
               <option value="black">Black</option>
             </select>
           </div>
@@ -1498,7 +1498,7 @@
       </details>
 
       <!-- Community Annotation is network/auth-driven and intentionally excluded from session bundles. -->
-      <details class="accordion-section" open id="community-annotation-section" data-state-serializer-skip="true">
+      <details class="accordion-section" id="community-annotation-section" data-state-serializer-skip="true">
         <summary>Community Annotation</summary>
         <div class="accordion-content">
           <div id="community-annotation-controls"></div>
@@ -1549,7 +1549,7 @@
         </div>
       </details>
 
-      <details class="accordion-section" id="cinematic-camera-section" data-state-serializer-skip="true" open>
+      <details class="accordion-section" id="cinematic-camera-section" data-state-serializer-skip="true">
         <summary>Camera Path</summary>
         <div class="accordion-content">
 
@@ -1984,7 +1984,9 @@
 
     <div id="stats" class="sr-only">Loading data…</div>
 
-      <div id="copyright">© Kemal Inecik · <a href="https://kemalinecik.com" target="_blank" rel="noopener noreferrer">kemalinecik.com</a> · <a href="#" id="license-link">BSD 3-Clause</a></div>
+      <div id="copyright">
+        © Kemal Inecik · <a href="https://kemalinecik.com" target="_blank" rel="noopener noreferrer">kemalinecik.com</a> · <a href="#" id="license-link">BSD 3-Clause</a> · Build <span id="web-build-version" aria-label="Website build version"></span>
+      </div>
 		  </div>
 	  </div>
 

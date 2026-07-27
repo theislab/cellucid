@@ -36,6 +36,8 @@ import {
 import {
   GPUTimer,
   HighPerfBenchmark,
+  MeshSurfaceSampler,
+  SyntheticDataGenerator,
 } from '../assets/js/dev/benchmark.js';
 
 const renderingRoot = new URL('../assets/js/rendering/', import.meta.url);
@@ -213,6 +215,30 @@ test('high-performance data entry points do not clamp or default dimensions', as
     rendererSource,
     /Invalid quality[\s\S]{0,120}using "full"/
   );
+});
+
+test('an exact empty scene publishes empty alpha state without a synthetic texture', () => {
+  let cacheInvalidations = 0;
+  const renderer = Object.assign(Object.create(HighPerfRenderer.prototype), {
+    pointCount: 0,
+    _alphaTexture: null,
+    _alphaTexData: new Uint8Array(),
+    _alphaTexWidth: 0,
+    _alphaTexHeight: 0,
+    _useAlphaTexture: false,
+    _currentAlphas: null,
+    invalidateLodVisibilityCache() {
+      cacheInvalidations += 1;
+    },
+  });
+  const alphas = new Float32Array();
+
+  renderer.updateAlphas(alphas);
+
+  assert.equal(renderer.getCurrentAlphas(), alphas);
+  assert.equal(renderer._useAlphaTexture, false);
+  assert.equal(renderer._alphaTexture, null);
+  assert.equal(cacheInvalidations, 1);
 });
 
 test('high-performance rendering has no legacy alpha or global-view path', async () => {
@@ -578,6 +604,117 @@ test('renderer benchmark consumers request one exact per-view statistics owner',
     benchmarkSource,
     /export\s+(?:class\s+BenchmarkExporter|\{\s*formatNumber\s*\})/
   );
+});
+
+test('GLB surface sampling writes exact caller-owned buffers', () => {
+  const sampler = new MeshSurfaceSampler(
+    Float32Array.from([
+      0, 0, 0,
+      1, 0, 0,
+      0, 1, 0,
+    ]),
+    null
+  );
+  const sampledPosition = new Float32Array(3);
+  const sampledNormal = new Float32Array(3);
+  const originalRandom = Math.random;
+  const values = [0.5, 0.2, 0.3];
+  Math.random = () => values.shift();
+  try {
+    sampler.sampleInto(
+      sampledPosition,
+      0,
+      sampledNormal,
+      0
+    );
+  } finally {
+    Math.random = originalRandom;
+  }
+
+  assert.ok(Math.abs(sampledPosition[0] - 0.2) < 1e-6);
+  assert.ok(Math.abs(sampledPosition[1] - 0.3) < 1e-6);
+  assert.equal(sampledPosition[2], 0);
+  assert.deepEqual(Array.from(sampledNormal), [0, 0, 1]);
+  assert.throws(
+    () => sampler.sampleInto(
+      new Float32Array(2),
+      0,
+      sampledNormal,
+      0
+    ),
+    /three writable values/
+  );
+  assert.throws(
+    () => new MeshSurfaceSampler(
+      Float32Array.from([
+        0, 0, 0,
+        0, 0, 0,
+        0, 0, 0,
+      ]),
+      null
+    ),
+    /non-degenerate triangle/
+  );
+});
+
+test('GLB URL generation shares one exact browser fetch per asset', async () => {
+  const previousWindow = Object.getOwnPropertyDescriptor(
+    globalThis,
+    'window'
+  );
+  const previousFetch = Object.getOwnPropertyDescriptor(
+    globalThis,
+    'fetch'
+  );
+  const originalFromGLB = SyntheticDataGenerator.fromGLB;
+  const buffer = new ArrayBuffer(16);
+  const observedBuffers = [];
+  let fetchCalls = 0;
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: {
+      location: {
+        href: 'https://viewer.test/?acceptance=glb-cache'
+      }
+    }
+  });
+  Object.defineProperty(globalThis, 'fetch', {
+    configurable: true,
+    value: async (_url, options) => {
+      fetchCalls += 1;
+      assert.deepEqual(options, { cache: 'default' });
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        async arrayBuffer() {
+          return buffer;
+        }
+      };
+    }
+  });
+  SyntheticDataGenerator.fromGLB = (count, receivedBuffer) => {
+    observedBuffers.push(receivedBuffer);
+    return { count };
+  };
+
+  try {
+    const url = `assets/test-${process.pid}-${Date.now()}.glb`;
+    const [first, second] = await Promise.all([
+      SyntheticDataGenerator.fromGLBUrl(10, url),
+      SyntheticDataGenerator.fromGLBUrl(20, url),
+    ]);
+    assert.deepEqual(first, { count: 10 });
+    assert.deepEqual(second, { count: 20 });
+    assert.equal(fetchCalls, 1);
+    assert.deepEqual(observedBuffers, [buffer, buffer]);
+  } finally {
+    SyntheticDataGenerator.fromGLB = originalFromGLB;
+    if (previousWindow === undefined) delete globalThis.window;
+    else Object.defineProperty(globalThis, 'window', previousWindow);
+    if (previousFetch === undefined) delete globalThis.fetch;
+    else Object.defineProperty(globalThis, 'fetch', previousFetch);
+  }
 });
 
 test('benchmark comparisons require current unrounded measurements', () => {

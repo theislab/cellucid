@@ -39,7 +39,8 @@ import { debug } from '../../../utils/debug.js';
  * @param {object} options.viewer
  * @param {{ rebuildSmokeDensity?: (gridSize?: number) => void } | null} [options.smoke]
  * @param {import('../../../data/data-source-manager.js').DataSourceManager | null} [options.dataSourceManager]
- * @param {(metadata: any) => Promise<void> | void} [options.reloadActiveDataset]
+ * @param {() => Promise<boolean>} options.clearActiveDataset
+ * @param {(selection: Object) => Promise<boolean>} options.reloadActiveDataset
  * @param {object|null} [options.sessionSerializer]
  * @param {any|null} [options.jupyterSource]
  */
@@ -48,6 +49,7 @@ export function initUI({
   viewer,
   smoke = null,
   dataSourceManager = null,
+  clearActiveDataset,
   reloadActiveDataset = null,
   sessionSerializer = null,
   jupyterSource = null
@@ -111,6 +113,10 @@ export function initUI({
     visibilityUiScheduled = true;
     scheduleFrame(() => {
       visibilityUiScheduled = false;
+      // Field activation publishes visibility before the selector can commit
+      // the replacement legend. Refreshing counts in the same frame keeps the
+      // DOM and active model in one completed UI generation.
+      legend.refreshCategoryCounts?.();
       filterControls.render?.();
       highlightControls.renderHighlightSummary?.();
       viewControls?.renderSplitViewBadges?.();
@@ -148,7 +154,6 @@ export function initUI({
 
   function handleVisibilityChange() {
     renderControls.markSmokeDirty?.();
-    legend.refreshCategoryCounts?.();
     scheduleVisibilityUiUpdate();
   }
 
@@ -224,11 +229,13 @@ export function initUI({
     onAfterLoad: refreshUiAfterStateLoad
   });
 
-  const { refreshDatasetUI } = initDatasetControls({
-    state,
-    viewer,
+  const {
+    catalogReady: datasetCatalogReady,
+    refreshDatasetUI
+  } = initDatasetControls({
     dom: dom.dataset,
     dataSourceManager,
+    clearDataset: clearActiveDataset,
     reloadDataset: reloadActiveDataset,
     callbacks: {
       renderFieldSelects: fieldSelector.renderFieldSelects,
@@ -312,6 +319,7 @@ export function initUI({
     refreshUiAfterStateLoad,
     showSessionStatus,
     refreshDatasetUI,
+    datasetCatalogReady,
     cinematicCamera
   };
 }

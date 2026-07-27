@@ -2715,6 +2715,16 @@ export class HighPerfRenderer {
       }
     }
 
+    // An exact empty dataset has no alpha texture by construction. Publishing
+    // its empty alpha generation is still a valid state transition and must not
+    // require a synthetic GPU resource.
+    if (this.pointCount === 0) {
+      this._useAlphaTexture = false;
+      this._currentAlphas = alphas;
+      this.invalidateLodVisibilityCache();
+      return;
+    }
+
     // Use alpha texture for efficient updates (avoids full buffer rebuild)
     // This is ~16x faster: uploading N bytes vs N*16 bytes
     if (!this._alphaTexture) {

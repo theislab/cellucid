@@ -76,6 +76,129 @@ export function readExactTrueUrlFlag(searchParams, name) {
   return true;
 }
 
+function requireJupyterConfigEvidence(value) {
+  if (value === null) return false;
+  if (
+    typeof value !== 'object' ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype ||
+    Object.keys(value).length !== 3 ||
+    !Object.hasOwn(value, 'serverUrl') ||
+    !Object.hasOwn(value, 'viewerId') ||
+    !Object.hasOwn(value, 'viewerToken')
+  ) {
+    throw new TypeError(
+      'Startup Jupyter evidence must be null or one exact configuration.'
+    );
+  }
+  for (const key of ['serverUrl', 'viewerId', 'viewerToken']) {
+    if (
+      typeof value[key] !== 'string' ||
+      value[key].length === 0 ||
+      value[key] !== value[key].trim() ||
+      /\s/.test(value[key])
+    ) {
+      throw new TypeError(
+        `Startup Jupyter evidence ${key} must be exact non-whitespace text.`
+      );
+    }
+  }
+  return true;
+}
+
+/**
+ * Resolve the exact startup data-source intent before any onboarding can paint.
+ *
+ * The Jupyter data source remains the sole owner of its authenticated URL
+ * parser. Its validated configuration is passed here as evidence rather than
+ * reinterpreting query keys heuristically.
+ *
+ * @param {URLSearchParams} searchParams
+ * @param {Object|null} jupyterConfig
+ * @returns {{
+ *   remoteUrlParam: string|null,
+ *   githubPathParam: string|null,
+ *   sourceParam: string|null,
+ *   requestedDataset: string|null,
+ *   isAnndataMode: boolean,
+ *   inJupyter: boolean,
+ *   shouldShowWelcome: boolean
+ * }}
+ */
+export function resolveStartupUrlIntent(searchParams, jupyterConfig) {
+  const params = requireSearchParams(searchParams);
+  const remoteUrlParam = readOptionalExactUrlParameter(params, 'remote');
+  const githubPathParam = readOptionalExactUrlParameter(params, 'github');
+  const sourceParam = readOptionalExactUrlParameter(params, 'source');
+  const requestedDataset = readOptionalExactUrlParameter(params, 'dataset');
+  const isAnndataMode = readExactTrueUrlFlag(params, 'anndata');
+  const inJupyter = requireJupyterConfigEvidence(jupyterConfig);
+
+  if (remoteUrlParam !== null && githubPathParam !== null) {
+    throw new Error(
+      'Startup cannot request both remote and GitHub dataset sources.'
+    );
+  }
+  if (
+    remoteUrlParam !== null &&
+    sourceParam !== null &&
+    sourceParam !== 'remote'
+  ) {
+    throw new Error(
+      'The "remote" startup parameter requires source="remote".'
+    );
+  }
+  if (
+    githubPathParam !== null &&
+    sourceParam !== null &&
+    sourceParam !== 'github-repo'
+  ) {
+    throw new Error(
+      'The "github" startup parameter requires source="github-repo".'
+    );
+  }
+  if (
+    isAnndataMode &&
+    remoteUrlParam === null &&
+    sourceParam !== null &&
+    sourceParam !== 'remote'
+  ) {
+    throw new Error(
+      'The "anndata" startup parameter requires a remote server source.'
+    );
+  }
+  if (
+    inJupyter &&
+    (
+      remoteUrlParam !== null ||
+      githubPathParam !== null ||
+      (sourceParam !== null && sourceParam !== 'jupyter')
+    )
+  ) {
+    throw new Error(
+      'Jupyter startup cannot be combined with another explicit source.'
+    );
+  }
+
+  const shouldShowWelcome = !(
+    inJupyter ||
+    remoteUrlParam !== null ||
+    githubPathParam !== null ||
+    sourceParam === 'remote' ||
+    isAnndataMode
+  );
+
+  return Object.freeze({
+    remoteUrlParam,
+    githubPathParam,
+    sourceParam,
+    requestedDataset,
+    isAnndataMode,
+    inJupyter,
+    shouldShowWelcome
+  });
+}
+
 /**
  * Classify the exact same-origin health advertisement.
  *
@@ -137,11 +260,7 @@ export function classifySameOriginHealthAdvertisement(payload) {
  * @param {string} sourceLabel
  * @returns {string}
  */
-export function selectIntentDatasetId(
-  datasets,
-  requestedDatasetId,
-  sourceLabel
-) {
+function requireIntentDatasetIds(datasets, sourceLabel) {
   if (!Array.isArray(datasets) || datasets.length === 0) {
     throw new Error(
       `${sourceLabel} declared no datasets for the explicit startup request.`
@@ -167,6 +286,15 @@ export function selectIntentDatasetId(
     seen.add(dataset.id);
     ids.push(dataset.id);
   }
+  return { ids, seen };
+}
+
+export function selectIntentDatasetId(
+  datasets,
+  requestedDatasetId,
+  sourceLabel
+) {
+  const { ids, seen } = requireIntentDatasetIds(datasets, sourceLabel);
 
   if (requestedDatasetId !== null) {
     if (
@@ -194,4 +322,41 @@ export function selectIntentDatasetId(
     );
   }
   return ids[0];
+}
+
+/**
+ * Resolve a connected same-origin server selection. A unique dataset can be
+ * adopted automatically; a valid multi-dataset inventory remains connected
+ * but requires explicit selector input.
+ *
+ * @param {unknown} datasets
+ * @param {string|null} requestedDatasetId
+ * @param {string} sourceLabel
+ * @returns {string|null}
+ */
+export function selectConnectedDatasetId(
+  datasets,
+  requestedDatasetId,
+  sourceLabel
+) {
+  const { ids, seen } = requireIntentDatasetIds(datasets, sourceLabel);
+  if (requestedDatasetId !== null) {
+    if (
+      typeof requestedDatasetId !== 'string' ||
+      requestedDatasetId.length === 0 ||
+      requestedDatasetId !== requestedDatasetId.trim()
+    ) {
+      throw new TypeError(
+        'Requested startup dataset id must be one non-empty exact string.'
+      );
+    }
+    if (!seen.has(requestedDatasetId)) {
+      throw new Error(
+        `${sourceLabel} does not declare requested dataset ` +
+        `"${requestedDatasetId}".`
+      );
+    }
+    return requestedDatasetId;
+  }
+  return ids.length === 1 ? ids[0] : null;
 }

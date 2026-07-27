@@ -1742,10 +1742,10 @@ test('direct AnnData vector discovery requires dimension-suffixed obsm keys', as
 });
 
 test('H5WASM initialization preserves the failure and leaves a later caller independent', async () => {
-  const source = await readFile(
+  const source = (await readFile(
     new URL('../assets/js/data/h5ad.js', import.meta.url),
     'utf8'
-  );
+  )).replaceAll('\r\n', '\n');
   const start = source.indexOf('async function initH5wasm()');
   const end = source.indexOf(
     '/**\n * Check if h5wasm is available',

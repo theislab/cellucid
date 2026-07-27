@@ -828,6 +828,16 @@ export class LocalUserDirDataSource {
   }
 
   /**
+   * Create an isolated local-file selection candidate. File parsing and
+   * prepared-data validation must never mutate the registered generation.
+   *
+   * @returns {LocalUserDirDataSource}
+   */
+  createSelectionCandidate() {
+    return new LocalUserDirDataSource();
+  }
+
+  /**
    * Return the monotonic identity of the current local selection.
    * Consumers use this to reject async work that spans a replacement.
    *
@@ -2862,6 +2872,14 @@ export class LocalUserDirDataSource {
     this._beginSelection();
     this._cleanup();
     this._adoptionEpoch += 1;
+  }
+
+  /**
+   * Retire a displaced registered local source through the same lifecycle
+   * method used by connected transports.
+   */
+  disconnect() {
+    this.clear();
   }
 
   /**

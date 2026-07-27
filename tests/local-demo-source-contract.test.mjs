@@ -588,7 +588,7 @@ test('an explicit empty bootstrap never adopts a synthetic zero-point scene', as
     'const hasInitialDataset ='
   );
   const sceneEnd = mainSource.indexOf(
-    '// One-time helper to rebuild density',
+    '// Stage one exact manager/source/runtime/URL generation',
     selectionStart
   );
   assert.ok(selectionStart >= 0 && sceneEnd > selectionStart);
@@ -600,7 +600,7 @@ test('an explicit empty bootstrap never adopts a synthetic zero-point scene', as
   );
   assert.match(
     selectionBootstrap,
-    /catch \(error\) \{[\s\S]*completeDataLoadFailure\([\s\S]*throw error;\s*\}/
+    /catch \(error\) \{[\s\S]*completeDataLoadFailure\([\s\S]*throw exactError;\s*\}/
   );
   assert.doesNotMatch(
     selectionBootstrap,
@@ -811,77 +811,92 @@ test(
     assert.equal(invalidIdentityRequests, 1);
     assert.equal(failingCatalogManager.hasActiveDataset(), false);
 
-    const manager = createDataSourceManager();
-    const localMetadata = {
-      id: 'local-h5ad',
-      name: 'Local H5AD',
-      stats: { n_cells: 2 },
-    };
-    const zarrMetadata = {
-      id: 'local-h5ad',
-      name: 'Local Zarr ZIP',
-      stats: { n_cells: 3 },
-    };
-    const preparedMetadata = {
-      id: 'local-h5ad',
-      name: 'Local prepared',
-      stats: { n_cells: 4 },
-    };
-    let activeLocalMetadata = localMetadata;
-    const localSource = {
-      datasetId: 'local-h5ad',
-      getBaseUrl(datasetId) {
-        assert.equal(datasetId, 'local-h5ad');
-        return 'h5ad://local-h5ad/';
-      },
-      async getMetadata(datasetId) {
-        assert.equal(datasetId, 'local-h5ad');
-        return activeLocalMetadata;
-      },
-      getIdentityId(datasetId) {
-        assert.equal(datasetId, 'local-h5ad');
-        return 'local-h5ad';
-      },
-      getType() {
-        return 'local-user';
-      },
-      async isAvailable() {
-        return false;
-      },
-      async listDatasets() {
-        return [];
-      },
-      async loadFromH5adFile(file) {
-        assert.equal(file?.name, 'working.h5ad');
-        activeLocalMetadata = localMetadata;
-        return localMetadata;
-      },
-      async loadFromZarrArchive(file) {
-        assert.equal(file?.name, 'working.zarr.zip');
-        activeLocalMetadata = zarrMetadata;
-        return zarrMetadata;
-      },
-      async loadFromPreparedDirectory(files) {
-        assert.deepEqual(
-          Array.from(files, file => file.name),
-          ['dataset_identity.json', 'points_2d.bin']
-        );
-        activeLocalMetadata = preparedMetadata;
-        return preparedMetadata;
-      },
-    };
-    manager.registerSource('local-user', localSource);
+    const localMetadata = identity('local-user', 'Local H5AD', 2);
+    const zarrMetadata = identity(
+      'local-user',
+      'Local Zarr ZIP',
+      3
+    );
+    const preparedMetadata = identity(
+      'local-user',
+      'Local prepared',
+      4
+    );
+    const localCandidates = [];
 
+    function createLocalCandidate() {
+      let activeMetadata = null;
+      const candidate = {
+        datasetId: 'local-user',
+        disconnectCalls: 0,
+        createSelectionCandidate: createLocalCandidate,
+        disconnect() {
+          this.disconnectCalls++;
+        },
+        getBaseUrl(datasetId) {
+          assert.equal(datasetId, 'local-user');
+          return 'local-user://selection/';
+        },
+        async getMetadata(datasetId) {
+          assert.equal(datasetId, 'local-user');
+          assert.ok(activeMetadata);
+          return activeMetadata;
+        },
+        getIdentityId(datasetId) {
+          assert.equal(datasetId, 'local-user');
+          return 'local-user';
+        },
+        getType() {
+          return 'local-user';
+        },
+        async isAvailable() {
+          return false;
+        },
+        async listDatasets() {
+          return [];
+        },
+        async loadFromH5adFile(file) {
+          assert.equal(file?.name, 'working.h5ad');
+          activeMetadata = localMetadata;
+          return activeMetadata;
+        },
+        async loadFromPreparedDirectory(files) {
+          assert.deepEqual(
+            Array.from(files, file => file.name),
+            ['dataset_identity.json', 'points_2d.bin']
+          );
+          activeMetadata = preparedMetadata;
+          return activeMetadata;
+        },
+        async loadFromZarrArchive(file) {
+          assert.equal(file?.name, 'working.zarr.zip');
+          activeMetadata = zarrMetadata;
+          return activeMetadata;
+        },
+      };
+      localCandidates.push(candidate);
+      return candidate;
+    }
+
+    const manager = createDataSourceManager();
+    const localSource = createLocalCandidate();
+    manager.registerSource('local-user', localSource);
     await manager.initialize();
     assert.equal(manager.hasActiveDataset(), false);
-    await assert.rejects(
-      manager.getAllDatasets(),
-      /rejected.*dataset_identity.*unsupported field.*_cellucid_version_marker/i
-    );
+
+    let rejectedCatalogError = null;
+    await assert.rejects(manager.getAllDatasets(), error => {
+      assert.match(
+        error.message,
+        /rejected.*dataset_identity.*unsupported field.*_cellucid_version_marker/i
+      );
+      rejectedCatalogError = error;
+      return true;
+    });
     const requestsAfterCatalogRejection = invalidIdentityRequests;
     await assert.rejects(
       manager.getAllDatasets(),
-      /rejected.*dataset_identity.*unsupported field.*_cellucid_version_marker/i
+      error => error === rejectedCatalogError
     );
     assert.equal(manager.hasActiveDataset(), false);
     assert.equal(manager.getCurrentDatasetId(), null);
@@ -889,22 +904,41 @@ test(
     assert.ok(manager.getSource('local-demo'));
     assert.ok(manager.getSource('github-repo'));
     assert.equal(manager.getSource('local-user'), localSource);
-
     assert.equal(
       invalidIdentityRequests,
       requestsAfterCatalogRejection,
       'the rejected configured sample must not be retried and republished'
     );
 
-    const createInput = () => {
+    const createButton = () => {
       const listeners = new Map();
       return {
-        value: '',
+        disabled: false,
         listeners,
+        textContent: '',
         addEventListener(type, listener) {
           listeners.set(type, listener);
         },
       };
+    };
+    const createInput = (value = '') => {
+      const listeners = new Map();
+      return {
+        disabled: false,
+        listeners,
+        value,
+        addEventListener(type, listener) {
+          listeners.set(type, listener);
+        },
+        click() {},
+      };
+    };
+    const select = {
+      disabled: true,
+      focusCalls: 0,
+      focus() {
+        this.focusCalls++;
+      },
     };
     const h5adInput = createInput();
     const zarrInput = createInput();
@@ -918,17 +952,11 @@ test(
         search: '?dataset=rejected',
       },
     };
-    globalThis.history = {
-      replaceState(_state, _title, href) {
-        globalThis.window.location.href = String(href);
-        globalThis.window.location.search = new URL(String(href)).search;
-      },
-    };
-    globalThis.window.history = globalThis.history;
     const notificationEvents = [];
     notifications.loading = message => {
-      notificationEvents.push(['loading', message]);
-      return 'local-h5ad-load';
+      const id = `dataset-load-${notificationEvents.length}`;
+      notificationEvents.push(['loading', id, message]);
+      return id;
     };
     notifications.complete = (id, message) => {
       notificationEvents.push(['complete', id, message]);
@@ -940,23 +968,44 @@ test(
       notificationEvents.push(['fail', id, message]);
     };
 
-    let reloadCalls = 0;
-    const reloadedMetadata = [];
+    const activatedMetadata = [];
+    const activateDataset = async (
+      datasetId,
+      sourceType,
+      loadMethod,
+      source
+    ) => {
+      const stage = await manager.stageDatasetSelection(
+        sourceType,
+        datasetId,
+        { loadMethod, source }
+      );
+      const publication = manager.commitDatasetSelection(stage);
+      manager.publishDatasetSelection(publication);
+      manager.finalizeDatasetSelection(publication);
+      activatedMetadata.push(stage.metadata);
+      return true;
+    };
+    const failedCatalogOutcome = async () => Object.freeze({
+      error: rejectedCatalogError,
+      status: 'failed',
+    });
+
     initDatasetConnections({
-      state: {},
-      viewer: {},
+      activateDataset,
+      clearDataset: async () => true,
+      dataSourceManager: manager,
       dom: {
+        select,
+        userDataBrowseBtn: createButton(),
         userDataFileInput: preparedInput,
+        userDataH5adBtn: createButton(),
         userDataH5adInput: h5adInput,
+        userDataZarrArchiveBtn: createButton(),
         userDataZarrArchiveInput: zarrInput,
       },
-      dataSourceManager: manager,
-      reloadDataset: async metadata => {
-        reloadCalls++;
-        reloadedMetadata.push(metadata);
-      },
-      populateDatasetDropdown() {},
       noneDatasetValue: '__none__',
+      populateDatasetDropdown: failedCatalogOutcome,
     });
 
     await h5adInput.listeners.get('change')({
@@ -981,90 +1030,102 @@ test(
     assert.equal(h5adInput.value, '');
     assert.equal(zarrInput.value, '');
     assert.equal(preparedInput.value, '');
-    assert.equal(reloadCalls, 3);
     assert.deepEqual(
-      reloadedMetadata,
+      activatedMetadata,
       [localMetadata, zarrMetadata, preparedMetadata]
     );
+    assert.equal(localCandidates.length, 4);
     assert.equal(manager.getCurrentSourceType(), 'local-user');
-    assert.equal(manager.getCurrentDatasetId(), 'local-h5ad');
+    assert.equal(manager.getCurrentDatasetId(), 'local-user');
     assert.deepEqual(
       notificationEvents.map(event => event[0]),
-      [
-        'loading',
-        'complete',
-        'loading',
-        'complete',
-        'loading',
-        'complete',
-      ]
-    );
-    assert.equal(
-      new URL(globalThis.window.location.href).searchParams.has('dataset'),
-      false
+      ['loading', 'fail', 'loading', 'fail', 'loading', 'fail']
     );
 
-    const remoteMetadata = {
-      id: 'served',
-      name: 'Server AnnData',
-      stats: { n_cells: 5 },
-    };
-    const remoteSource = {
-      connected: false,
-      async connect({ url }) {
-        assert.equal(url, 'http://127.0.0.1:8765');
-        this.connected = true;
-      },
-      isConnected() {
-        return this.connected;
-      },
-      async listDatasets() {
-        return [remoteMetadata];
-      },
-      async getMetadata(datasetId) {
-        assert.equal(datasetId, 'served');
-        return remoteMetadata;
-      },
-      getBaseUrl(datasetId) {
-        assert.equal(datasetId, 'served');
-        return 'http://127.0.0.1:8765/';
-      },
-      getType() {
-        return 'remote';
-      },
-    };
+    const remoteMetadata = identity(
+      'served',
+      'Server AnnData',
+      5
+    );
+    const remoteCandidates = [];
+    function createRemoteCandidate() {
+      const candidate = {
+        connected: false,
+        disconnectCalls: 0,
+        async connect({ url }) {
+          assert.equal(url, 'http://127.0.0.1:8765');
+          this.connected = true;
+        },
+        createConnectionCandidate: createRemoteCandidate,
+        disconnect() {
+          this.connected = false;
+          this.disconnectCalls++;
+        },
+        getBaseUrl(datasetId) {
+          assert.equal(datasetId, 'served');
+          return 'http://127.0.0.1:8765/';
+        },
+        getConnectionInfo() {
+          return {
+            status: this.connected ? 'connected' : 'disconnected',
+            url: this.connected ? 'http://127.0.0.1:8765' : null,
+          };
+        },
+        async getMetadata(datasetId) {
+          assert.equal(datasetId, 'served');
+          return remoteMetadata;
+        },
+        getType() {
+          return 'remote';
+        },
+        async listDatasets() {
+          assert.equal(this.connected, true);
+          return [remoteMetadata];
+        },
+        onConnectionLost() {},
+      };
+      remoteCandidates.push(candidate);
+      return candidate;
+    }
+    const remoteSource = createRemoteCandidate();
     manager.registerSource('remote', remoteSource);
-    const remoteListeners = new Map();
-    const remoteConnectBtn = {
-      disabled: false,
-      textContent: 'Connect',
-      addEventListener(type, listener) {
-        remoteListeners.set(type, listener);
-      },
-    };
-    const remoteServerUrl = {
-      disabled: false,
-      value: 'http://127.0.0.1:8765',
-    };
+    const remoteConnectBtn = createButton();
+    const remoteServerUrl = createInput(
+      'http://127.0.0.1:8765'
+    );
     initDatasetConnections({
-      state: {},
-      viewer: {},
+      activateDataset,
+      clearDataset: async () => true,
+      dataSourceManager: manager,
       dom: {
         remoteConnectBtn,
+        remoteDisconnectBtn: createButton(),
+        remoteDisconnectContainer: { style: {} },
         remoteServerUrl,
+        select,
       },
-      dataSourceManager: manager,
-      reloadDataset: async metadata => {
-        reloadedMetadata.push(metadata);
-      },
-      populateDatasetDropdown() {},
       noneDatasetValue: '__none__',
+      populateDatasetDropdown: failedCatalogOutcome,
     });
-    await remoteListeners.get('click')();
+    await remoteConnectBtn.listeners.get('click')();
     assert.equal(remoteConnectBtn.disabled, false);
     assert.equal(remoteConnectBtn.textContent, 'Reconnect');
     assert.equal(manager.getCurrentSourceType(), 'remote');
     assert.equal(manager.getCurrentDatasetId(), 'served');
-    assert.equal(reloadedMetadata.at(-1), remoteMetadata);
+    assert.equal(activatedMetadata.at(-1), remoteMetadata);
+    assert.equal(remoteCandidates.length, 2);
+    assert.deepEqual(
+      notificationEvents.map(event => event[0]),
+      [
+        'loading',
+        'fail',
+        'loading',
+        'fail',
+        'loading',
+        'fail',
+        'loading',
+        'fail',
+      ]
+    );
   }
 );

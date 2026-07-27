@@ -17,7 +17,6 @@ import {
   formatCellCount as formatDataNumber,
   validateDatasetIdentity
 } from '../../../data/data-source.js';
-import { updateUrlForDataSource } from '../../url-state.js';
 import { DATA_LOAD_METHODS } from '../../../analytics/tracker.js';
 import { debug } from '../../../utils/debug.js';
 import { isDatasetReloadSupersededError } from '../../dataset-reload-outcome.js';
@@ -30,11 +29,10 @@ const EMPTY_CATALOG_VALUE = '__catalog_empty__';
 const CATALOG_ERROR_VALUE = '__catalog_error__';
 const DATASET_CONTROL_KEYS = [
   'callbacks',
+  'clearDataset',
   'dataSourceManager',
   'dom',
-  'reloadDataset',
-  'state',
-  'viewer'
+  'reloadDataset'
 ];
 const DATASET_CALLBACK_KEYS = [
   'clearGeneSelection',
@@ -229,10 +227,9 @@ function datasetSelectionValue(sourceType, datasetId) {
 export function initDatasetControls(options) {
   requireExactKeys(options, DATASET_CONTROL_KEYS, 'Dataset controls options');
   const {
-    state,
-    viewer,
     dom,
     dataSourceManager,
+    clearDataset,
     reloadDataset,
     callbacks
   } = options;
@@ -248,33 +245,21 @@ export function initDatasetControls(options) {
   if (typeof reloadDataset !== 'function') {
     throw new TypeError('Dataset controls reloadDataset must be a function.');
   }
+  if (typeof clearDataset !== 'function') {
+    throw new TypeError('Dataset controls clearDataset must be a function.');
+  }
   for (const method of [
-    'clearActiveDataset',
     'getAllDatasets',
     'getCurrentDatasetId',
     'getCurrentMetadata',
     'getCurrentSourceType',
     'getSource',
     'onDatasetChange',
-    'onSourcesChange',
-    'switchToDataset'
+    'registerSource',
+    'unregisterSource'
   ]) {
     requireMethod(dataSourceManager, method, 'Dataset controls dataSourceManager');
   }
-  for (const method of [
-    'clearActiveField',
-    'clearAllHighlights',
-    'clearSnapshotViews',
-    'initScene',
-    'setFieldLoader',
-    'setVarFieldLoader'
-  ]) {
-    requireMethod(state, method, 'Dataset controls state');
-  }
-  for (const method of ['clearSnapshotViews', 'updateHighlight']) {
-    requireMethod(viewer, method, 'Dataset controls viewer');
-  }
-
   const {
     renderFieldSelects,
     renderDeletedFieldsSection,
@@ -367,49 +352,6 @@ export function initDatasetControls(options) {
     datasetOptionsByKey.set(value, option);
     return option;
   }
-
-  function publishSelectionUrl(sourceType, datasetId) {
-    if (sourceType === 'local-demo') {
-      updateUrlForDataSource(sourceType, { datasetId });
-      return;
-    }
-    if (sourceType === 'remote') {
-      const source = dataSourceManager.getSource(sourceType);
-      requireMethod(source, 'getConnectionInfo', 'Remote dataset source');
-      const connectionInfo = source.getConnectionInfo();
-      requirePlainObject(connectionInfo, 'Remote connection info');
-      requireNonEmptyString(
-        connectionInfo.url,
-        'Remote connection info url'
-      );
-      updateUrlForDataSource(sourceType, {
-        serverUrl: connectionInfo.url
-      });
-      return;
-    }
-    if (sourceType === 'github-repo') {
-      const source = dataSourceManager.getSource(sourceType);
-      requireMethod(source, 'getConnectionInfo', 'GitHub dataset source');
-      const connectionInfo = source.getConnectionInfo();
-      requirePlainObject(connectionInfo, 'GitHub connection info');
-      requireNonEmptyString(
-        connectionInfo.inputPath,
-        'GitHub connection info inputPath'
-      );
-      updateUrlForDataSource(sourceType, {
-        path: connectionInfo.inputPath
-      });
-      return;
-    }
-    if (sourceType === 'local-user' || sourceType === 'jupyter') {
-      updateUrlForDataSource(sourceType, {});
-      return;
-    }
-    throw new RangeError(
-      `Dataset source type "${sourceType}" has no URL-state contract.`
-    );
-  }
-
 
 // =========================================================================
 // Dataset Selector
@@ -639,10 +581,10 @@ async function populateDatasetDropdown() {
       updateDatasetInfo(null);
     }
     datasetSelect.disabled = false;
-    return true;
+    return Object.freeze({ status: 'ready' });
   } catch (error) {
     if (generation !== catalogGeneration) {
-      return false;
+      return Object.freeze({ status: 'superseded' });
     }
     const exactError = errorFromUnknown(error, 'Dataset catalog');
     const errorOption = ownerDocument.createElement('option');
@@ -659,7 +601,10 @@ async function populateDatasetDropdown() {
     datasetInfo.classList.remove('loading');
     datasetInfo.classList.add('error');
     showSessionStatus(errorOption.textContent, true);
-    return false;
+    return Object.freeze({
+      error: exactError,
+      status: 'failed'
+    });
   }
 }
 
@@ -669,7 +614,12 @@ async function populateDatasetDropdown() {
  * @param {string} sourceType - The exact source type for the dataset
  * @returns {Promise<boolean>} Whether the requested dataset became ready
  */
-async function handleDatasetChange(datasetId, sourceType) {
+async function handleDatasetChange(
+  datasetId,
+  sourceType,
+  loadMethod = DATA_LOAD_METHODS.DATASET_DROPDOWN,
+  sourceOverride = null
+) {
   requireNonEmptyString(datasetId, 'Selected dataset id');
   requireNonEmptyString(sourceType, 'Selected dataset source type');
 
@@ -689,9 +639,23 @@ async function handleDatasetChange(datasetId, sourceType) {
 
     showSessionStatus('Switching dataset...', false);
 
-    await dataSourceManager.switchToDataset(sourceType, datasetId, {
-      loadMethod: DATA_LOAD_METHODS.DATASET_DROPDOWN
+    const source = sourceOverride ?? dataSourceManager.getSource(sourceType);
+    if (source === null) {
+      throw new Error(
+        `Dataset source "${sourceType}" is not registered or staged.`
+      );
+    }
+    const ready = await reloadDataset({
+      datasetId,
+      loadMethod,
+      source,
+      sourceType
     });
+    if (ready !== true) {
+      throw new Error(
+        'Dataset activation did not publish one ready generation.'
+      );
+    }
 
     const metadata = dataSourceManager.getCurrentMetadata();
     const adoptedDatasetId = dataSourceManager.getCurrentDatasetId();
@@ -711,16 +675,14 @@ async function handleDatasetChange(datasetId, sourceType) {
       );
     }
 
-    await reloadDataset(metadata);
     datasetReloaded = true;
-    publishSelectionUrl(sourceType, datasetId);
     updateDatasetInfo(metadata, sourceType);
     datasetInfo.classList.remove('loading', 'error');
     showSessionStatus('Dataset loaded', false);
     return true;
   } catch (error) {
     if (isDatasetReloadSupersededError(error)) {
-      return false;
+      throw error;
     }
     const exactError = errorFromUnknown(error, 'Dataset switch');
     datasetInfo.classList.remove('loading');
@@ -760,9 +722,12 @@ async function handleNoneDatasetSelection() {
     datasetInfo.classList.add('loading');
     showSessionStatus('Clearing dataset...', false);
 
-    await dataSourceManager.clearActiveDataset({
-      loadMethod: DATA_LOAD_METHODS.DATASET_DROPDOWN
-    });
+    const cleared = await clearDataset();
+    if (cleared !== true) {
+      throw new Error(
+        'Dataset clear did not publish one ready None generation.'
+      );
+    }
     if (
       dataSourceManager.getCurrentDatasetId() !== null ||
       dataSourceManager.getCurrentSourceType() !== null ||
@@ -773,16 +738,6 @@ async function handleNoneDatasetSelection() {
       );
     }
 
-    await state.setFieldLoader(null);
-    await state.setVarFieldLoader(null);
-    state.varData = null;
-    await state.initScene(new Float32Array(), { fields: [], count: 0 });
-    await state.clearActiveField();
-    await state.clearAllHighlights();
-    await state.clearSnapshotViews();
-    await viewer.clearSnapshotViews();
-    await viewer.updateHighlight(new Uint8Array());
-
     refreshDatasetUI(null);
     ensureNoneDatasetOption();
     datasetSelect.value = NONE_DATASET_VALUE;
@@ -790,7 +745,6 @@ async function handleNoneDatasetSelection() {
       throw new Error('Dataset select could not represent the None state.');
     }
     datasetSelect.disabled = false;
-    updateUrlForDataSource(null, {});
     datasetInfo.classList.remove('loading', 'error');
     showSessionStatus('No dataset selected', false);
     return true;
@@ -902,6 +856,32 @@ async function handleDatasetSelectEvent(event) {
     }
     await handleDatasetChange(datasetId, sourceType);
   } catch (error) {
+    if (isDatasetReloadSupersededError(error)) {
+      datasetInfo.classList.remove('loading', 'error');
+      const activeMetadata = dataSourceManager.getCurrentMetadata();
+      const activeSourceType = dataSourceManager.getCurrentSourceType();
+      const activeDatasetId = dataSourceManager.getCurrentDatasetId();
+      if (
+        activeMetadata !== null &&
+        activeSourceType !== null &&
+        activeDatasetId !== null
+      ) {
+        updateDatasetInfo(activeMetadata, activeSourceType);
+        datasetSelect.value = datasetSelectionValue(
+          activeSourceType,
+          activeDatasetId
+        );
+      } else {
+        updateDatasetInfo(null);
+        datasetSelect.value = NONE_DATASET_VALUE;
+      }
+      datasetSelect.disabled = false;
+      showSessionStatus(
+        'A newer dataset selection is now active.',
+        false
+      );
+      return;
+    }
     const exactError = errorFromUnknown(error, 'Dataset selection event');
     datasetInfo.classList.remove('loading');
     datasetInfo.classList.add('error');
@@ -946,21 +926,15 @@ async function handleDatasetSelectEvent(event) {
 
   const catalogReady = populateDatasetDropdown();
 
-dataSourceManager.onSourcesChange(() => {
-  void populateDatasetDropdown();
-});
 dataSourceManager.onDatasetChange(synchronizeDatasetEvent);
 datasetSelect.addEventListener('change', event => {
   void handleDatasetSelectEvent(event);
 });
   initDatasetConnections({
-    state,
-    viewer,
+    activateDataset: handleDatasetChange,
+    clearDataset: handleNoneDatasetSelection,
     dom,
     dataSourceManager,
-    reloadDataset,
-    showSessionStatus,
-    updateDatasetInfo,
     populateDatasetDropdown,
     noneDatasetValue: NONE_DATASET_VALUE
   });

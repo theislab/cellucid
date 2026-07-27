@@ -6,6 +6,8 @@ import {
   classifySameOriginHealthAdvertisement,
   readExactTrueUrlFlag,
   readOptionalExactUrlParameter,
+  resolveStartupUrlIntent,
+  selectConnectedDatasetId,
   selectIntentDatasetId
 } from '../assets/js/app/startup-url-intent.js';
 import {
@@ -96,6 +98,89 @@ test('startup parameters reject duplicates, empty values, and boolean coercion',
   );
 });
 
+test('welcome policy is exact for catalog and user-served startup intents', async t => {
+  const jupyterConfig = {
+    serverUrl: 'http://127.0.0.1:8765',
+    viewerId: 'viewer-1',
+    viewerToken: 'token-1'
+  };
+
+  for (const [name, search] of [
+    ['bare catalog', ''],
+    ['configured catalog', 'exportsBaseUrl=https%3A%2F%2Fdata.test%2Fexports%2F'],
+    ['explicit Suo sample', 'dataset=suo'],
+    ['explicit local-demo sample', 'source=local-demo&dataset=suo'],
+    ['remote lookalike', 'remotely=https%3A%2F%2Fserver.test'],
+    ['GitHub lookalike', 'githubRepo=owner%2Frepo%2Fexports'],
+    ['Jupyter lookalike', 'jupyterMode=true'],
+  ]) {
+    await t.test(`${name} shows onboarding`, () => {
+      const intent = resolveStartupUrlIntent(
+        new URLSearchParams(search),
+        null
+      );
+      assert.equal(intent.shouldShowWelcome, true);
+    });
+  }
+
+  for (const [name, search, config] of [
+    [
+      'explicit remote URL',
+      'remote=http%3A%2F%2F127.0.0.1%3A8765',
+      null
+    ],
+    ['same-origin prepared server', 'source=remote', null],
+    ['same-origin AnnData server', 'anndata=true', null],
+    [
+      'explicit GitHub repository',
+      'github=owner%2Frepo%2Fexports',
+      null
+    ],
+    [
+      'authenticated Jupyter',
+      'jupyter=true&viewerId=viewer-1&viewerToken=token-1',
+      jupyterConfig
+    ],
+    [
+      'authenticated Jupyter AnnData',
+      'jupyter=true&viewerId=viewer-1&viewerToken=token-1&anndata=true',
+      jupyterConfig
+    ],
+  ]) {
+    await t.test(`${name} suppresses onboarding`, () => {
+      const intent = resolveStartupUrlIntent(
+        new URLSearchParams(search),
+        config
+      );
+      assert.equal(intent.shouldShowWelcome, false);
+    });
+  }
+
+  await t.test('Jupyter evidence is exact rather than truthy', () => {
+    assert.throws(
+      () => resolveStartupUrlIntent(
+        new URLSearchParams(
+          'jupyter=true&viewerId=viewer-1&viewerToken=token-1'
+        ),
+        true
+      ),
+      /Jupyter evidence/
+    );
+  });
+
+  await t.test('source conflicts remain terminal before presentation', () => {
+    assert.throws(
+      () => resolveStartupUrlIntent(
+        new URLSearchParams(
+          'remote=http%3A%2F%2Fserver.test&source=local-demo'
+        ),
+        null
+      ),
+      /requires source="remote"/
+    );
+  });
+});
+
 test('same-origin health advertisement has exact static and server identities', () => {
   assert.equal(
     classifySameOriginHealthAdvertisement({
@@ -174,6 +259,42 @@ test('explicit source selection never substitutes the first dataset', () => {
   );
 });
 
+test('same-origin served catalogs auto-select only an exact unique dataset', () => {
+  const datasets = [{ id: 'alpha' }, { id: 'beta' }];
+  assert.equal(
+    selectConnectedDatasetId(
+      datasets,
+      null,
+      'The same-origin Cellucid source'
+    ),
+    null
+  );
+  assert.equal(
+    selectConnectedDatasetId(
+      datasets,
+      'beta',
+      'The same-origin Cellucid source'
+    ),
+    'beta'
+  );
+  assert.equal(
+    selectConnectedDatasetId(
+      [{ id: 'only' }],
+      null,
+      'The same-origin Cellucid source'
+    ),
+    'only'
+  );
+  assert.throws(
+    () => selectConnectedDatasetId(
+      datasets,
+      'missing',
+      'The same-origin Cellucid source'
+    ),
+    /does not declare requested dataset/
+  );
+});
+
 test('terminal startup failure has one persistent accessible visible owner', () => {
   const documentOwner = createFakeDocument();
   const statsElement = { textContent: 'Loading' };
@@ -221,6 +342,18 @@ test('main startup uses terminal source intent and one fatal surface', async () 
   );
   assert.match(source, /remoteUrlParam !== null/);
   assert.match(source, /selectIntentDatasetId\(/);
+  assert.match(
+    source,
+    /const remoteDatasetId = selectConnectedDatasetId\(/
+  );
+  assert.match(
+    source,
+    /if \(remoteDatasetId === null\) \{\s*datasetSelectFocusRequested = true;/
+  );
+  assert.doesNotMatch(
+    source,
+    /switchToDataset\(\s*['"]remote['"]\s*,\s*datasets\[0\]/
+  );
   assert.match(source, /publishStartupFailure\(\{/);
   assert.doesNotMatch(
     source,
@@ -242,9 +375,26 @@ function createManagerSource(type, {
   const source = {
     async getMetadata(datasetId) {
       return {
+        version: 2,
         id: datasetId,
         name: datasetId,
-        cellCount: 1
+        description: '',
+        cellucid_data_version: '1.0.0',
+        stats: {
+          n_cells: 1,
+          n_genes: 0,
+          n_obs_fields: 0,
+          n_categorical_fields: 0,
+          n_continuous_fields: 0,
+          has_connectivity: false,
+          n_edges: null
+        },
+        embeddings: {
+          available_dimensions: [2],
+          default_dimension: 2,
+          files: { '2d': 'points_2d.bin' }
+        },
+        obs_fields: []
       };
     },
     getBaseUrl(datasetId) {
@@ -300,7 +450,7 @@ test('DataSourceManager publishes exact source identity and listener failure', a
   );
 });
 
-test('DataSourceManager deactivation failure preserves the prior selection', async () => {
+test('DataSourceManager cleanup failure retains the published new selection', async () => {
   const deactivationFailure = new Error('deactivation failed');
   const manager = createDataSourceManager();
   manager.registerSource(
@@ -318,12 +468,6 @@ test('DataSourceManager deactivation failure preserves the prior selection', asy
     manager.switchToDataset('beta', 'dataset-b'),
     error => error === deactivationFailure
   );
-  assert.equal(manager.getCurrentSourceType(), 'alpha');
-  assert.equal(manager.getCurrentDatasetId(), 'dataset-a');
-  assert.throws(
-    () => manager.clearActiveDataset(),
-    error => error === deactivationFailure
-  );
-  assert.equal(manager.getCurrentSourceType(), 'alpha');
-  assert.equal(manager.getCurrentDatasetId(), 'dataset-a');
+  assert.equal(manager.getCurrentSourceType(), 'beta');
+  assert.equal(manager.getCurrentDatasetId(), 'dataset-b');
 });

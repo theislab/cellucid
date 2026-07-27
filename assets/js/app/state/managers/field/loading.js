@@ -394,41 +394,36 @@ export class FieldLoadingMethods {
   updateOutlierQuantiles() {
     if (!this.pointCount || !this.obsData || !this.obsData.fields) return;
 
-    if (!this.outlierQuantilesArray || this.outlierQuantilesArray.length !== this.pointCount) {
-      this.outlierQuantilesArray = new Float32Array(this.pointCount);
-    }
-    this.outlierQuantilesArray.fill(-1.0);
-
-    const fields = this.obsData.fields;
-    for (let f = 0; f < fields.length; f++) {
-      const field = fields[f];
-      if (field?._isDeleted === true) continue;
-      if (!field || !field.outlierQuantiles || !field.outlierQuantiles.length) continue;
-      
-      // Check if outlier filter is enabled
-      const outlierFilterEnabled = field._outlierFilterEnabled !== false;
-      if (!outlierFilterEnabled) continue;
-      
-      const rawThreshold = field._outlierThreshold != null ? field._outlierThreshold : 1.0;
-      if (rawThreshold >= 0.9999) continue;
-
-      const threshold = Math.max(rawThreshold, 0.001);
-      const qList = field.outlierQuantiles;
-      for (let i = 0; i < this.pointCount; i++) {
-        const q = qList[i];
-        if (q === null || q === undefined || Number.isNaN(q)) continue;
-        if (q > rawThreshold) {
-          const ratio = q / threshold;
-          if (this.outlierQuantilesArray[i] < 0 || ratio > this.outlierQuantilesArray[i]) {
-            this.outlierQuantilesArray[i] = ratio;
-          }
+    const activeField = this.activeFieldSource === 'obs' ? this.getActiveField() : null;
+    const source = activeField?.outlierQuantiles;
+    if (source !== undefined && source !== null) {
+      if (!(source instanceof Float32Array) || source.length !== this.pointCount) {
+        throw new TypeError(
+          'Active outlier filtering requires one Float32 quantile per observation.'
+        );
+      }
+      for (let index = 0; index < source.length; index++) {
+        const quantile = source[index];
+        if (
+          !Number.isFinite(quantile)
+          || (quantile !== -1 && (quantile < 0 || quantile > 1))
+        ) {
+          throw new RangeError(
+            `Active-field outlier quantile ${index} must be -1 or a finite value from 0 through 1.`
+          );
         }
       }
     }
 
+    if (!this.outlierQuantilesArray || this.outlierQuantilesArray.length !== this.pointCount) {
+      this.outlierQuantilesArray = new Float32Array(this.pointCount);
+    }
+    if (source instanceof Float32Array) {
+      this.outlierQuantilesArray.set(source);
+    } else {
+      this.outlierQuantilesArray.fill(-1.0);
+    }
+
     this._syncActiveContext();
-    this.updateFilteredCount();
-    this.updateFilterSummary();
-    this._notifyVisibilityChange();
   }
 }

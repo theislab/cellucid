@@ -104,6 +104,14 @@ intended for files within the UI’s documented 512 MiB limit. Browser Zarr
 accepts one ZIP archive; Python accepts a complete Zarr v2 directory and loads
 it eagerly.
 
+The welcome overlay appears on every ordinary bundled or catalog page load,
+including a direct Suo selection; dismissing it is never cached. Exact
+user-served launches skip the overlay from the first paint: authenticated
+Jupyter URLs, `?remote=...`, same-origin `?source=remote`,
+same-origin `?anndata=true`, and `?github=...`. A failed explicit source remains
+an explicit failure with an actionable startup message; it activates neither
+the bundled catalog nor onboarding.
+
 ## h5ad / Zarr Requirements
 
 - **Required:** at least one exact embedding key:
