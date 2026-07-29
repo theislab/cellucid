@@ -212,6 +212,14 @@ export class DataLayer {
 
     // Pending requests for deduplication
     this._pendingRequests = enableDedup ? new Map() : null;
+    // Dataset identity invalidates returned data; cache identity invalidates only
+    // publication. Keeping these generations separate lets an explicit cache
+    // cleanup avoid corrupting or rejecting otherwise valid in-flight work.
+    this._datasetGeneration = 0;
+    this._cacheGeneration = 0;
+    this._fieldLoadLifecycle = new AbortController();
+    this._destroyed = false;
+    this._destroyPromise = null;
 
     // Prefetch queue
     this._prefetchQueue = [];
@@ -291,6 +299,8 @@ export class DataLayer {
    */
   _handleMemoryCleanup() {
     const beforeMemory = this.estimateMemoryUsage();
+    this._cacheGeneration += 1;
+    this._bulkGeneCacheGeneration += 1;
 
     // Clear bulk gene cache first (largest memory consumer)
     this._bulkGeneCache.clear();
@@ -660,27 +670,60 @@ export class DataLayer {
    */
   async _ensureFieldLoaded(field, fieldIndex, source, options = {}) {
     const { silent = true } = options;
+    const datasetGeneration = this._datasetGeneration;
+    const lifecycle = this._fieldLoadLifecycle;
+    if (!(lifecycle instanceof AbortController)) {
+      throw new TypeError(
+        'DataLayer field-load lifecycle owner must be an AbortController'
+      );
+    }
+    this._requireCurrentDatasetGeneration(datasetGeneration);
+    if (lifecycle.signal.aborted) {
+      throw lifecycle.signal.reason;
+    }
 
     if (field.loaded) return;
 
-    // If there's a loading promise in progress, wait for it
-    if (field._loadingPromise) {
-      await field._loadingPromise;
-      return;
-    }
-
+    // Always enter through DataState, even when a core load already exists.
+    // Its shared loader registers this analysis call as an independent lease;
+    // directly awaiting field._loadingPromise would let an unrelated UI abort
+    // cancel the core while analysis still needs it.
     if (source === 'obs') {
       if (typeof this.state.ensureFieldLoaded !== 'function') {
         throw new Error('Observation field loader is unavailable');
       }
-      await this.state.ensureFieldLoaded(fieldIndex, { silent });
+      await this.state.ensureFieldLoaded(fieldIndex, {
+        signal: lifecycle.signal,
+        silent
+      });
+      this._requireCurrentDatasetGeneration(datasetGeneration);
+      if (
+        lifecycle !== this._fieldLoadLifecycle
+        || this.state.obsData?.fields?.[fieldIndex] !== field
+      ) {
+        throw this._createAnalysisDataInvalidationError(
+          'a dataset lifecycle change'
+        );
+      }
       return;
     }
     if (source === 'var') {
       if (typeof this.state.ensureVarFieldLoaded !== 'function') {
         throw new Error('Gene field loader is unavailable');
       }
-      await this.state.ensureVarFieldLoaded(fieldIndex, { silent });
+      await this.state.ensureVarFieldLoaded(fieldIndex, {
+        signal: lifecycle.signal,
+        silent
+      });
+      this._requireCurrentDatasetGeneration(datasetGeneration);
+      if (
+        lifecycle !== this._fieldLoadLifecycle
+        || this.state.varData?.fields?.[fieldIndex] !== field
+      ) {
+        throw this._createAnalysisDataInvalidationError(
+          'a dataset lifecycle change'
+        );
+      }
       return;
     }
     throw new TypeError(`Field source must be exactly "obs" or "var"; received ${String(source)}`);
@@ -702,6 +745,8 @@ export class DataLayer {
    */
   async ensureGeneExpressionLoaded(geneKey, options = {}) {
     const { silent = true } = options;
+    const datasetGeneration = this._datasetGeneration;
+    this._requireCurrentDatasetGeneration(datasetGeneration);
 
     const fields = this.state.varData?.fields;
     if (!fields) {
@@ -720,6 +765,15 @@ export class DataLayer {
 
     const wasLoaded = !!field.loaded;
     await this._ensureFieldLoaded(field, fieldIndex, 'var', { silent });
+    this._requireCurrentDatasetGeneration(datasetGeneration);
+    if (
+      this.state.varData?.fields !== fields
+      || fields[fieldIndex] !== field
+    ) {
+      throw this._createAnalysisDataInvalidationError(
+        'a dataset lifecycle change'
+      );
+    }
 
     return { fieldIndex, values: field.values, wasLoaded };
   }
@@ -751,6 +805,8 @@ export class DataLayer {
    */
   async ensureObsFieldLoaded(obsKey, options = {}) {
     const { silent = true } = options;
+    const datasetGeneration = this._datasetGeneration;
+    this._requireCurrentDatasetGeneration(datasetGeneration);
 
     const obsData = this.state.obsData;
     if (!obsData || !obsData.fields) {
@@ -764,6 +820,15 @@ export class DataLayer {
 
     const field = obsData.fields[fieldIndex];
     await this._ensureFieldLoaded(field, fieldIndex, 'obs', { silent });
+    this._requireCurrentDatasetGeneration(datasetGeneration);
+    if (
+      this.state.obsData !== obsData
+      || obsData.fields[fieldIndex] !== field
+    ) {
+      throw this._createAnalysisDataInvalidationError(
+        'a dataset lifecycle change'
+      );
+    }
 
     if (field.kind === 'category') {
       return {
@@ -821,7 +886,30 @@ export class DataLayer {
    * }
    */
   async getDataForPages(options) {
-    const { type, variableKey, pageIds, silent = false, noCache = false } = options;
+    if (!options || typeof options !== 'object' || Array.isArray(options)) {
+      throw new TypeError('Page-data fetch options must be an object');
+    }
+    const {
+      type,
+      variableKey,
+      pageIds: requestedPageIds,
+      silent = false,
+      noCache = false
+    } = options;
+    const pageIds = Array.isArray(requestedPageIds)
+      ? [...requestedPageIds]
+      : requestedPageIds;
+    const ownedOptions = {
+      ...options,
+      type,
+      variableKey,
+      pageIds,
+      silent,
+      noCache
+    };
+    const datasetGeneration = this._datasetGeneration;
+    const cacheGeneration = this._cacheGeneration;
+    this._requireCurrentDatasetGeneration(datasetGeneration);
 
     if (!pageIds || pageIds.length === 0) {
       return [];
@@ -835,7 +923,7 @@ export class DataLayer {
 
     // Check cache first (if enabled)
     if (this._dataCache && !noCache) {
-      const cacheKey = this._getCacheKey(options);
+      const cacheKey = this._getCacheKey(ownedOptions);
 
       if (this._dataCache.has(cacheKey)) {
         return this._dataCache.get(cacheKey);
@@ -847,7 +935,10 @@ export class DataLayer {
       }
 
       // Create new request
-      const requestPromise = this._fetchDataForPages(options);
+      const requestPromise = this._fetchDataForPages(
+        ownedOptions,
+        datasetGeneration
+      );
 
       if (this._pendingRequests) {
         this._pendingRequests.set(cacheKey, requestPromise);
@@ -855,17 +946,50 @@ export class DataLayer {
 
       try {
         const result = await requestPromise;
-        this._dataCache.set(cacheKey, result);
+        this._requireCurrentDatasetGeneration(datasetGeneration);
+        if (this._cacheGeneration === cacheGeneration) {
+          this._dataCache.set(cacheKey, result);
+        }
         return result;
       } finally {
-        if (this._pendingRequests) {
+        if (this._pendingRequests?.get(cacheKey) === requestPromise) {
           this._pendingRequests.delete(cacheKey);
         }
       }
     }
 
     // No caching, fetch directly
-    return this._fetchDataForPages(options);
+    const result = await this._fetchDataForPages(
+      ownedOptions,
+      datasetGeneration
+    );
+    this._requireCurrentDatasetGeneration(datasetGeneration);
+    return result;
+  }
+
+  _requireCurrentDatasetGeneration(generation) {
+    if (
+      this._destroyed ||
+      generation !== this._datasetGeneration
+    ) {
+      throw this._createAnalysisDataInvalidationError(
+        'a dataset lifecycle change'
+      );
+    }
+  }
+
+  /**
+   * Create the one exact error contract used for invalidated analysis reads.
+   * @param {string} reason
+   * @returns {Error & {code: string}}
+   * @private
+   */
+  _createAnalysisDataInvalidationError(reason) {
+    const error = new Error(
+      `Analysis data request was invalidated by ${reason}`
+    );
+    error.code = 'ANALYSIS_DATA_REQUEST_INVALIDATED';
+    return error;
   }
 
   /**
@@ -875,8 +999,12 @@ export class DataLayer {
    * @returns {Promise<PageData[]>}
    * @private
    */
-  async _fetchDataForPages(options) {
+  async _fetchDataForPages(
+    options,
+    datasetGeneration = this._datasetGeneration
+  ) {
     const { type, variableKey, pageIds, silent = false } = options;
+    this._requireCurrentDatasetGeneration(datasetGeneration);
 
     // Get the variable info and field
     const variableInfo = this.getVariableInfo(type, variableKey);
@@ -908,9 +1036,10 @@ export class DataLayer {
     let loadStartTime = null;
     const MIN_NOTIFICATION_DURATION = 800; // Minimum time to show notification (ms)
 
-    if (!field.loaded && this._notifications && !silent) {
+    const notifications = this._notifications;
+    if (!field.loaded && notifications && !silent) {
       loadStartTime = performance.now();
-      loadingNotificationId = this._notifications.show({
+      loadingNotificationId = notifications.show({
         type: 'loading',
         category: 'data',
         message: `Loading ${variableKey}...`
@@ -920,20 +1049,21 @@ export class DataLayer {
     try {
       await this._ensureFieldLoaded(field, fieldIndex, source);
     } finally {
-      if (loadingNotificationId && this._notifications) {
+      if (loadingNotificationId && notifications) {
         // Ensure notification is visible for minimum duration
         const elapsed = performance.now() - loadStartTime;
         const remainingTime = MIN_NOTIFICATION_DURATION - elapsed;
 
         if (remainingTime > 0) {
           setTimeout(() => {
-            this._notifications.dismiss(loadingNotificationId);
+            notifications.dismiss(loadingNotificationId);
           }, remainingTime);
         } else {
-          this._notifications.dismiss(loadingNotificationId);
+          notifications.dismiss(loadingNotificationId);
         }
       }
     }
+    this._requireCurrentDatasetGeneration(datasetGeneration);
 
     // Get values array
     const rawValues = field.kind === 'category'
@@ -1332,6 +1462,11 @@ export class DataLayer {
   invalidatePages(pageIds) {
     const uniquePageIds = Array.from(new Set(pageIds || []));
     if (uniquePageIds.length === 0) return;
+    this._cacheGeneration += 1;
+    this._bulkGeneCacheGeneration += 1;
+    if (this._pendingRequests !== null) {
+      this._pendingRequests.clear();
+    }
 
     const pageIdSet = new Set(uniquePageIds);
 
@@ -1375,6 +1510,10 @@ export class DataLayer {
    * Clear internal caches
    */
   clearCache() {
+    this._cacheGeneration += 1;
+    if (this._pendingRequests !== null) {
+      this._pendingRequests.clear();
+    }
     this._variableCache.clear();
     if (this._dataCache) {
       this._dataCache.clear();
@@ -1386,6 +1525,7 @@ export class DataLayer {
    * Useful after gene-heavy analyses that shouldn't keep multi-gene page caches alive.
    */
   clearBulkGeneCache() {
+    this._bulkGeneCacheGeneration += 1;
     this._bulkGeneCache.clear();
     this._bulkGeneCacheAccessOrder = [];
   }
@@ -1394,6 +1534,10 @@ export class DataLayer {
    * Clear all caches including bulk gene cache
    */
   clearAllCaches() {
+    this._cacheGeneration += 1;
+    if (this._pendingRequests !== null) {
+      this._pendingRequests.clear();
+    }
     this._variableCache.clear();
     if (this._dataCache) {
       this._dataCache.clear();
@@ -1416,6 +1560,17 @@ export class DataLayer {
    *
    */
   resetForDatasetReload() {
+    if (this._destroyed) {
+      throw new Error('Cannot reset a destroyed DataLayer.');
+    }
+    this._fieldLoadLifecycle.abort(
+      this._createAnalysisDataInvalidationError(
+        'a dataset lifecycle change'
+      )
+    );
+    this._fieldLoadLifecycle = new AbortController();
+    this._datasetGeneration += 1;
+    this._bulkGeneCacheReplacementOwner = null;
     this.clearAllCaches();
     if (this._pendingRequests !== null) {
       this._pendingRequests.clear();
@@ -1437,7 +1592,13 @@ export class DataLayer {
    * @param {FetchOptions} options - Fetch options for prefetch
    */
   prefetch(options) {
-    if (!this._options.enablePrefetch || !this._dataCache) return;
+    if (
+      this._destroyed ||
+      !this._options.enablePrefetch ||
+      !this._dataCache
+    ) {
+      return;
+    }
 
     const cacheKey = this._getCacheKey(options);
 
@@ -1460,6 +1621,10 @@ export class DataLayer {
    */
   async _processPrefetchQueue() {
     this._prefetchTimeout = null;
+    if (this._destroyed) {
+      this._prefetchQueue = [];
+      return;
+    }
 
     const batch = this._prefetchQueue.splice(0, 3);
 
@@ -1467,11 +1632,15 @@ export class DataLayer {
       try {
         await this.getDataForPages(options);
       } catch (err) {
-        console.debug('[DataLayer] Prefetch failed:', err.message);
+        if (!this._destroyed) {
+          console.debug('[DataLayer] Prefetch failed:', err.message);
+        }
       }
     }
 
-    if (this._prefetchQueue.length > 0) {
+    if (this._destroyed) {
+      this._prefetchQueue = [];
+    } else if (this._prefetchQueue.length > 0) {
       this._prefetchTimeout = setTimeout(() => {
         this._processPrefetchQueue();
       }, 500);
@@ -1577,16 +1746,28 @@ export class DataLayer {
     const previousCache = this._bulkGeneCache;
     const previousAccessOrder = this._bulkGeneCacheAccessOrder;
     const replacementOwner = {};
+    const datasetGeneration = this._datasetGeneration;
     this._bulkGeneCacheReplacementOwner = replacementOwner;
     this._bulkGeneCacheGeneration += 1;
     this._bulkGeneCache = new Map();
     this._bulkGeneCacheAccessOrder = [];
     let committed = false;
     let rolledBack = false;
+    const requireCurrentLifecycle = () => {
+      if (
+        this._destroyed ||
+        this._datasetGeneration !== datasetGeneration
+      ) {
+        throw new Error(
+          'Session cache replacement was invalidated by a dataset lifecycle change.'
+        );
+      }
+    };
 
     return Object.freeze({
       commit: () => {
         if (committed || rolledBack) return;
+        requireCurrentLifecycle();
         if (this._bulkGeneCacheReplacementOwner !== replacementOwner) {
           throw new Error(
             'Session cache replacement ownership changed before commit.'
@@ -1598,6 +1779,7 @@ export class DataLayer {
       },
       rollback: () => {
         if (rolledBack) return;
+        requireCurrentLifecycle();
         if (
           this._bulkGeneCacheReplacementOwner !== null
           && this._bulkGeneCacheReplacementOwner !== replacementOwner
@@ -1754,6 +1936,8 @@ export class DataLayer {
    * @param {string[]} [options.geneList] - Optional subset of genes
    * @param {boolean} [options.forceReload=false] - Bypass cache
    * @param {Function} [options.onProgress] - Progress callback (0-100)
+   * @param {Function} [options.isCurrent] - Cooperative request ownership predicate
+   * @param {Function} [options.registerInvalidationCleanup] - Required when isCurrent is provided
    * @returns {Promise<Object>} Map of geneName -> { pageId: values[] }
    *
    * @example
@@ -1764,8 +1948,84 @@ export class DataLayer {
    * });
    */
   async fetchBulkGeneExpression(options) {
-    const { pageIds, geneList = null, forceReload = false, onProgress } = options;
+    if (!options || typeof options !== 'object' || Array.isArray(options)) {
+      throw new TypeError('Bulk gene fetch options must be an object');
+    }
+    const {
+      pageIds: requestedPageIds,
+      geneList: requestedGeneList = null,
+      forceReload = false,
+      onProgress,
+      isCurrent: currentPredicate,
+      registerInvalidationCleanup
+    } = options;
+    const hasCooperativeOwner = currentPredicate !== undefined;
+    if (hasCooperativeOwner && typeof currentPredicate !== 'function') {
+      throw new TypeError(
+        'Bulk gene fetch isCurrent must be a function when provided'
+      );
+    }
+    if (
+      hasCooperativeOwner &&
+      typeof registerInvalidationCleanup !== 'function'
+    ) {
+      throw new TypeError(
+        'Bulk gene fetch registerInvalidationCleanup must be a function ' +
+        'when isCurrent is provided'
+      );
+    }
+    if (
+      !hasCooperativeOwner &&
+      registerInvalidationCleanup !== undefined
+    ) {
+      throw new TypeError(
+        'Bulk gene fetch registerInvalidationCleanup requires isCurrent'
+      );
+    }
+    const pageIds = Array.isArray(requestedPageIds)
+      ? [...requestedPageIds]
+      : requestedPageIds;
+    const geneList = Array.isArray(requestedGeneList)
+      ? [...requestedGeneList]
+      : requestedGeneList;
+    const datasetGeneration = this._datasetGeneration;
     const cacheGeneration = this._bulkGeneCacheGeneration;
+    const notifications = this._notifications;
+    let ownershipInvalidated = false;
+    let notificationId = null;
+    let notificationSettled = false;
+
+    const settleNotification = (method, message) => {
+      if (notificationSettled) return;
+      notificationSettled = true;
+      if (
+        notifications === null ||
+        notifications === undefined ||
+        notificationId === null
+      ) {
+        return;
+      }
+      notifications[method](notificationId, message);
+    };
+    const requireCurrentOwnership = () => {
+      this._requireCurrentDatasetGeneration(datasetGeneration);
+      if (
+        ownershipInvalidated ||
+        (hasCooperativeOwner && !currentPredicate())
+      ) {
+        throw this._createAnalysisDataInvalidationError(
+          'an analysis request ownership change'
+        );
+      }
+    };
+
+    if (hasCooperativeOwner) {
+      registerInvalidationCleanup(() => {
+        ownershipInvalidated = true;
+        settleNotification('dismiss');
+      });
+    }
+    requireCurrentOwnership();
 
     if (!pageIds || pageIds.length === 0) {
       return {};
@@ -1781,6 +2041,7 @@ export class DataLayer {
     if (!forceReload) {
       const cached = this._getBulkGeneCache(cacheKey);
       if (cached && (Date.now() - cached.timestamp) < this._bulkGeneCacheMaxAge) {
+        requireCurrentOwnership();
         if (geneList) {
           const missingGenes = geneList.filter(
             gene => !Object.hasOwn(cached.data, gene)
@@ -1810,9 +2071,8 @@ export class DataLayer {
     }
 
     // Show loading notification
-    let notificationId = null;
-    if (this._notifications) {
-      notificationId = this._notifications.show({
+    if (notifications) {
+      notificationId = notifications.show({
         type: 'progress',
         category: 'data',
         title: 'Loading Gene Expression',
@@ -1830,8 +2090,9 @@ export class DataLayer {
         const batch = genesToFetch.slice(i, i + batchSize);
         const progress = Math.round((i / genesToFetch.length) * 100);
 
-        if (this._notifications && notificationId) {
-          this._notifications.updateProgress(notificationId, progress, {
+        requireCurrentOwnership();
+        if (notifications && notificationId !== null) {
+          notifications.updateProgress(notificationId, progress, {
             message: `Loading genes ${i + 1}-${Math.min(i + batchSize, genesToFetch.length)} of ${genesToFetch.length}...`
           });
         }
@@ -1841,12 +2102,14 @@ export class DataLayer {
         }
 
         await Promise.all(batch.map(async (geneInfo) => {
+          requireCurrentOwnership();
           const geneData = await this.getDataForPages({
             type: 'gene_expression',
             variableKey: geneInfo.key,
             pageIds,
             silent: true // Suppress individual notifications during bulk load
           });
+          requireCurrentOwnership();
 
           results[geneInfo.key] = {};
           for (const pd of geneData) {
@@ -1858,11 +2121,14 @@ export class DataLayer {
             };
           }
         }));
+        requireCurrentOwnership();
 
         // Yield to event loop
         await new Promise(resolve => setTimeout(resolve, 0));
+        requireCurrentOwnership();
       }
 
+      requireCurrentOwnership();
       if (
         this._bulkGeneCacheReplacementOwner === null
         && this._bulkGeneCacheGeneration === cacheGeneration
@@ -1875,17 +2141,22 @@ export class DataLayer {
       }
 
       const duration = performance.now() - startTime;
-      if (this._notifications && notificationId) {
-        this._notifications.complete(notificationId,
-          `Loaded ${genesToFetch.length} genes (${(duration / 1000).toFixed(1)}s)`
-        );
-      }
+      requireCurrentOwnership();
+      settleNotification(
+        'complete',
+        `Loaded ${genesToFetch.length} genes (${(duration / 1000).toFixed(1)}s)`
+      );
 
       return results;
 
     } catch (error) {
-      if (this._notifications && notificationId) {
-        this._notifications.fail(notificationId,
+      if (
+        error?.code === 'ANALYSIS_DATA_REQUEST_INVALIDATED'
+      ) {
+        settleNotification('dismiss');
+      } else {
+        settleNotification(
+          'fail',
           `Failed to load gene expression: ${error.message}`
         );
       }
@@ -1898,23 +2169,85 @@ export class DataLayer {
    *
    * @param {string[]} geneList - Genes to get
    * @param {string[]} pageIds - Page IDs
+   * @param {Object} [options] - Cooperative request ownership
+   * @param {Function} [options.isCurrent] - Exact request ownership predicate
+   * @param {Function} [options.registerInvalidationCleanup] - Required with isCurrent
    * @returns {Promise<Object>} Gene data by gene name
    */
-  async getGeneExpressionSubset(geneList, pageIds) {
-    const cacheKey = this._getBulkGeneCacheKey(pageIds);
+  async getGeneExpressionSubset(geneList, pageIds, options = {}) {
+    if (!options || typeof options !== 'object' || Array.isArray(options)) {
+      throw new TypeError('Gene expression subset options must be an object');
+    }
+    const {
+      isCurrent: currentPredicate,
+      registerInvalidationCleanup
+    } = options;
+    const hasCooperativeOwner = currentPredicate !== undefined;
+    if (hasCooperativeOwner && typeof currentPredicate !== 'function') {
+      throw new TypeError(
+        'Gene expression subset isCurrent must be a function when provided'
+      );
+    }
+    if (
+      hasCooperativeOwner &&
+      typeof registerInvalidationCleanup !== 'function'
+    ) {
+      throw new TypeError(
+        'Gene expression subset registerInvalidationCleanup must be a function ' +
+        'when isCurrent is provided'
+      );
+    }
+    if (
+      !hasCooperativeOwner &&
+      registerInvalidationCleanup !== undefined
+    ) {
+      throw new TypeError(
+        'Gene expression subset registerInvalidationCleanup requires isCurrent'
+      );
+    }
+    const ownedGeneList = Array.isArray(geneList)
+      ? [...geneList]
+      : geneList;
+    const ownedPageIds = Array.isArray(pageIds)
+      ? [...pageIds]
+      : pageIds;
+    const datasetGeneration = this._datasetGeneration;
+    let ownershipInvalidated = false;
+    const requireCurrentOwnership = () => {
+      this._requireCurrentDatasetGeneration(datasetGeneration);
+      if (
+        ownershipInvalidated ||
+        (hasCooperativeOwner && !currentPredicate())
+      ) {
+        throw this._createAnalysisDataInvalidationError(
+          'an analysis request ownership change'
+        );
+      }
+    };
+    if (hasCooperativeOwner) {
+      registerInvalidationCleanup(() => {
+        ownershipInvalidated = true;
+      });
+    }
+    requireCurrentOwnership();
+
+    const cacheKey = this._getBulkGeneCacheKey(ownedPageIds);
     const cached = this._getBulkGeneCache(cacheKey);
 
     if (cached && (Date.now() - cached.timestamp) < this._bulkGeneCacheMaxAge) {
       const results = {};
-      for (const gene of geneList) {
+      for (const gene of ownedGeneList) {
+        requireCurrentOwnership();
         if (cached.data[gene]) {
           results[gene] = cached.data[gene];
         } else {
           const geneData = await this.getDataForPages({
             type: 'gene_expression',
             variableKey: gene,
-            pageIds
+            pageIds: ownedPageIds,
+            silent: true
           });
+          requireCurrentOwnership();
 
           results[gene] = {};
           for (const pd of geneData) {
@@ -1927,14 +2260,22 @@ export class DataLayer {
           }
         }
       }
+      requireCurrentOwnership();
       return results;
     }
 
-    return this.fetchBulkGeneExpression({
-      pageIds,
-      geneList,
+    const fetchOptions = {
+      pageIds: ownedPageIds,
+      geneList: ownedGeneList,
       forceReload: false
-    });
+    };
+    if (hasCooperativeOwner) {
+      fetchOptions.isCurrent = currentPredicate;
+      fetchOptions.registerInvalidationCleanup = registerInvalidationCleanup;
+    }
+    const result = await this.fetchBulkGeneExpression(fetchOptions);
+    requireCurrentOwnership();
+    return result;
   }
 
   /**
@@ -2705,36 +3046,59 @@ export class DataLayer {
    * - Cancel pending operations
    */
   destroy() {
-    // Unregister memory cleanup handler
-    if (this._memoryMonitor && this._instanceId) {
-      this._memoryMonitor.unregisterCleanupHandler(this._instanceId);
-    }
-
-    // Clear all caches
-    if (this._dataCache) {
-      this._dataCache.clear();
-    }
-    this._bulkGeneCache.clear();
-    this._bulkGeneCacheAccessOrder = [];
-    this._variableCache.clear();
-
-    // Clear pending requests
-    if (this._pendingRequests) {
-      this._pendingRequests.clear();
-    }
-
-    // Clear prefetch queue
+    if (this._destroyPromise != null) return this._destroyPromise;
+    this._destroyed = true;
+    this._fieldLoadLifecycle.abort(
+      this._createAnalysisDataInvalidationError(
+        'DataLayer destruction'
+      )
+    );
+    this._datasetGeneration += 1;
+    this._cacheGeneration += 1;
+    this._bulkGeneCacheGeneration += 1;
+    this._bulkGeneCacheReplacementOwner = null;
+    // Stop background admission immediately. Cache contents remain owned by
+    // a running memory-pressure handler until unregister drains below, but no
+    // timer may start new work against the terminal generation.
     this._prefetchQueue = [];
-    if (this._prefetchTimeout) {
+    if (this._prefetchTimeout !== null) {
       clearTimeout(this._prefetchTimeout);
       this._prefetchTimeout = null;
     }
 
-    // Clear references
-    this._notifications = null;
-    this._memoryMonitor = null;
+    const memoryMonitor = this._memoryMonitor;
+    const instanceId = this._instanceId;
+    this._destroyPromise = Promise.resolve().then(async () => {
+      let unregisterError = null;
+      if (memoryMonitor && instanceId) {
+        try {
+          await memoryMonitor.unregisterCleanupHandler(instanceId);
+        } catch (error) {
+          unregisterError = error;
+        }
+      }
 
-    console.debug('[DataLayer] Instance destroyed');
+      // A running memory-pressure handler may still own these caches. Clear
+      // them only after unregisterCleanupHandler() has drained that owner.
+      if (this._dataCache) {
+        this._dataCache.clear();
+      }
+      this._bulkGeneCache.clear();
+      this._bulkGeneCacheAccessOrder = [];
+      this._variableCache.clear();
+
+      if (this._pendingRequests) {
+        this._pendingRequests.clear();
+      }
+
+      this._notifications = null;
+      this._memoryMonitor = null;
+
+      console.debug('[DataLayer] Instance destroyed');
+      if (unregisterError !== null) throw unregisterError;
+    });
+    void this._destroyPromise.catch(() => {});
+    return this._destroyPromise;
   }
 }
 

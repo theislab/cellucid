@@ -369,6 +369,103 @@ test('smoke grid defaults to bounded 128³ and exposes no oversized UI choice', 
   assert.equal(dom.smokeGridDisplay.textContent, '128³');
 });
 
+test('smoke render resolution exposes an exact native detent and exact endpoints', t => {
+  const restore = installDocument();
+  t.after(restore);
+  const { viewer, dom, smoke } = makeOptions();
+  initRenderControls({ viewer, dom, smoke });
+
+  const expectations = [
+    ['0', 0.25, '0.25x'],
+    ['42', 0.985, '0.98x'],
+    ['43', 1, '1.00x'],
+    ['44', 1.02, '1.02x'],
+    ['100', 2, '2.00x'],
+  ];
+  for (const [raw, exactScale, display] of expectations) {
+    dom.cloudResolutionInput.value = raw;
+    dom.cloudResolutionInput.dispatch('input');
+    assert.deepEqual(
+      viewer.calls
+        .filter(([name]) => name === 'setCloudResolutionScale')
+        .at(-1),
+      ['setCloudResolutionScale', exactScale],
+    );
+    assert.equal(dom.cloudResolutionDisplay.textContent, display);
+  }
+});
+
+test('late-bound render-mode observer covers programmatic and DOM publications exactly', t => {
+  const restore = installDocument();
+  t.after(restore);
+  const { viewer, dom, smoke } = makeOptions();
+  const controls = initRenderControls({ viewer, dom, smoke });
+  const observed = [];
+
+  assert.throws(
+    () => controls.setRenderModeChangeHandler(null),
+    /render-mode change handler.*exact function/i,
+  );
+  controls.setRenderModeChangeHandler(mode => {
+    observed.push([mode, dom.renderModeSelect.value]);
+  });
+
+  assert.equal(controls.applyRenderMode('smoke'), true);
+  dom.renderModeSelect.value = 'points';
+  dom.renderModeSelect.dispatch('change');
+
+  assert.deepEqual(observed, [
+    ['smoke', 'smoke'],
+    ['points', 'points'],
+  ]);
+});
+
+test('render-mode observer failure cannot veto the committed viewer and DOM mode', t => {
+  const restore = installDocument();
+  t.after(restore);
+  const { viewer, dom, smoke } = makeOptions();
+  const controls = initRenderControls({ viewer, dom, smoke });
+  const failure = new Error('synthetic render-mode observer failure');
+  const priorQueueMicrotask = Object.getOwnPropertyDescriptor(
+    globalThis,
+    'queueMicrotask',
+  );
+  const deferred = [];
+  Object.defineProperty(globalThis, 'queueMicrotask', {
+    configurable: true,
+    writable: true,
+    value(callback) {
+      deferred.push(callback);
+    },
+  });
+  t.after(() => {
+    if (priorQueueMicrotask === undefined) {
+      delete globalThis.queueMicrotask;
+    } else {
+      Object.defineProperty(
+        globalThis,
+        'queueMicrotask',
+        priorQueueMicrotask,
+      );
+    }
+  });
+  controls.setRenderModeChangeHandler(() => {
+    throw failure;
+  });
+
+  assert.equal(controls.applyRenderMode('smoke'), true);
+  assert.equal(dom.renderModeSelect.value, 'smoke');
+  assert.deepEqual(
+    viewer.calls.filter(([name]) => name === 'setRenderMode').at(-1),
+    ['setRenderMode', 'smoke'],
+  );
+  assert.equal(deferred.length, 1);
+  assert.throws(
+    () => deferred[0](),
+    error => error === failure,
+  );
+});
+
 test('failed smoke entry rolls every visible control back to points', t => {
   const restore = installDocument();
   t.after(restore);
@@ -401,6 +498,55 @@ test('failed smoke entry rolls every visible control back to points', t => {
   ]);
   assert.equal(dom.depthControls.style.display, 'block');
   assert.equal(dom.rendererControls.style.display, 'block');
+});
+
+test('runtime smoke failure settlement synchronizes UI without republishing viewer state', t => {
+  const restore = installDocument();
+  t.after(restore);
+  const { viewer, dom, smoke } = makeOptions();
+  const controls = initRenderControls({ viewer, dom, smoke });
+  const observedModes = [];
+  controls.setRenderModeChangeHandler(mode => {
+    observedModes.push(mode);
+  });
+  controls.applyRenderMode('smoke');
+  const setModeCallsBefore = viewer.calls.filter(
+    ([name]) => name === 'setRenderMode'
+  ).length;
+  const notificationCenter = getNotificationCenter();
+  const originalError = notificationCenter.error;
+  const notifications = [];
+  notificationCenter.error = (message, options) => {
+    notifications.push([message, options]);
+  };
+  t.after(() => {
+    notificationCenter.error = originalError;
+  });
+
+  controls.settleSmokeRenderFailure(
+    new Error('synthetic ray-march failure')
+  );
+
+  assert.equal(dom.renderModeSelect.value, 'points');
+  assert.deepEqual(dom.smokeControls.classList.toggles.at(-1), [
+    'visible',
+    false,
+  ]);
+  assert.deepEqual(dom.pointsControls.classList.toggles.at(-1), [
+    'visible',
+    true,
+  ]);
+  assert.equal(dom.depthControls.style.display, 'block');
+  assert.equal(dom.rendererControls.style.display, 'block');
+  assert.equal(
+    viewer.calls.filter(([name]) => name === 'setRenderMode').length,
+    setModeCallsBefore,
+  );
+  assert.deepEqual(observedModes, ['smoke', 'points']);
+  assert.deepEqual(notifications, [[
+    'Smoke rendering failed: synthetic ray-march failure',
+    { category: 'rendering' },
+  ]]);
 });
 
 test('committed smoke changes coalesce and rebuild after one paint generation', t => {

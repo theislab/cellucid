@@ -55,6 +55,15 @@ test('GLB benchmark publishes one complete state generation', async ({
       throw new Error('Renderer statistics are intentionally unavailable');
     };
   });
+  await page.locator('#smoke-grid').evaluate(input => {
+    input.value = '0';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  await page.locator('#render-mode').selectOption('smoke');
+  await expect(page.locator('#render-mode')).toHaveValue('smoke');
+  await expect(page.locator('#smoke-controls')).toHaveClass(/visible/);
+  await expect(page.locator('#points-controls')).not.toHaveClass(/visible/);
+  await expect(page.locator('#split-keep-view-btn')).toBeDisabled();
 
   await page.locator('#benchmark-section > summary').click();
   await expect(page.locator('#benchmark-section')).toHaveAttribute('open', '');
@@ -67,6 +76,11 @@ test('GLB benchmark publishes one complete state generation', async ({
   await expect.poll(
     () => page.evaluate(() => window._cellucidState.pointCount)
   ).toBe(1000);
+  await expect(page.locator('#render-mode')).toHaveValue('points');
+  await expect(page.locator('#points-controls')).toHaveClass(/visible/);
+  await expect(page.locator('#smoke-controls')).not.toHaveClass(/visible/);
+  await expect(page.locator('#split-keep-view-btn')).toBeEnabled();
+  await expect(page.locator('#view-layout-mode')).toBeEnabled();
   expect(benchmarkModulePublications).toBe(1);
   await expect(page.locator('#bench-points')).toHaveText('1K');
   await expect.poll(async () => Number.parseFloat(

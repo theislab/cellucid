@@ -28,9 +28,7 @@ import { GenesPanelController } from '../../genes-panel/genes-panel-controller.j
 import { HoverContext } from '../components/hover-context.js';
 import { ProgressTracker } from '../../shared/progress-tracker.js';
 import { PlotRegistry } from '../../shared/plot-registry-utils.js';
-import { renderOrUpdatePlot } from '../../shared/plot-lifecycle.js';
-import { purgePlot } from '../../plots/plotly-loader.js';
-import { downloadCSV } from '../../shared/analysis-utils.js';
+import { downloadCSV, toCSVCell } from '../../shared/analysis-utils.js';
 import {
   DEFAULTS,
   DISTANCE_OPTIONS,
@@ -72,6 +70,9 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     /** @type {GenesPanelController|null} */
     this._controller = null;
 
+    /** @type {Error|AggregateError|null} Deferred controller cleanup diagnostic */
+    this._controllerCloseError = null;
+
     /** @type {HoverContext|null} */
     this._hoverContext = null;
 
@@ -84,6 +85,8 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
      * }|null}
      */
     this._hoverPlotBinding = null;
+    /** @type {Map<HTMLElement, { context: HoverContext, binding: Object }>} */
+    this._hoverOwners = new Map();
 
     /** @type {ProgressTracker|null} */
     this._progressTracker = null;
@@ -114,6 +117,18 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
 
     /** @type {any|null} Full (unsliced) heatmap matrix from last run */
     this._fullMatrix = null;
+
+    /** @type {'top5'|'top10'|'top20'|'top100'|'all'|null} */
+    this._committedGeneListMode = null;
+
+    /**
+     * Serial owner for latest-intent heatmap reconciliation. Plot render
+     * revisions may supersede one another, but every latest visual intent still
+     * reconciles the requested scientific selection before it can commit.
+     * @type {Promise<void>}
+     * @private
+     */
+    this._geneOptionTail = Promise.resolve();
 
     // Bind methods
     this._handleModeChange = this._handleModeChange.bind(this);
@@ -360,21 +375,29 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     if (this._isDestroyed) return;
 
     // Get form values
-    const formValues = this._getFormValues();
+    const formValues = structuredClone(this._getFormValues());
 
     // Validate form
     const validation = this._validateForm(formValues);
     if (!validation.valid) {
+      this._invalidateAnalysisRequest();
       this._notifications.error(validation.error || 'Invalid form values');
       return;
     }
 
-    // Prevent concurrent runs
-    if (this._isLoading) return;
+    const requestId = this._startAnalysisRequest();
+    if (requestId === null) return;
 
     // Get run button for state management
     const runBtn = this._formContainer?.querySelector('.analysis-run-btn');
     const originalText = runBtn?.textContent;
+    let buttonRestored = false;
+    const restoreButton = () => {
+      if (!runBtn || buttonRestored) return;
+      runBtn.disabled = false;
+      runBtn.textContent = originalText;
+      buttonRestored = true;
+    };
 
     // Update button state
     if (runBtn) {
@@ -382,10 +405,8 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       runBtn.textContent = 'Running...';
     }
 
-    this._isLoading = true;
-
     // Create progress tracker with phases matching the controller
-    this._progressTracker = new ProgressTracker({
+    const progressTracker = new ProgressTracker({
       totalItems: 1, // Updated dynamically once totals are known
       phases: [
         ANALYSIS_PHASES.INIT,
@@ -399,23 +420,70 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       showNotification: true
     });
 
-    this._progressTracker.start();
+    this._progressTracker = progressTracker;
+    progressTracker.start();
+    let progressSettled = false;
+    const controllerRunOwner = {
+      controller: null,
+      active: false
+    };
+    this._registerAnalysisInvalidationCleanup(requestId, () => {
+      const cleanupErrors = [];
+      if (controllerRunOwner.active) {
+        controllerRunOwner.active = false;
+        try {
+          controllerRunOwner.controller.abort();
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+      }
+      if (!progressSettled) {
+        try {
+          progressTracker.cancel();
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+        progressSettled = true;
+      }
+      if (this._progressTracker === progressTracker) {
+        this._progressTracker = null;
+      }
+      try {
+        restoreButton();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+      if (cleanupErrors.length === 1) throw cleanupErrors[0];
+      if (cleanupErrors.length > 1) {
+        throw new AggregateError(
+          cleanupErrors,
+          'Genes Panel request invalidation cleanup failed'
+        );
+      }
+    });
 
     try {
-      const result = await this._runAnalysisImpl(formValues);
+      const analysisOutput = await this._runAnalysisImpl(
+        formValues,
+        requestId,
+        progressTracker,
+        controllerRunOwner
+      );
 
-      if (result) {
-        if (this._isDestroyed) return;
+      if (analysisOutput) {
+        if (!this._isCurrentAnalysisRequest(requestId)) return;
+        const { result, fullMatrix } = analysisOutput;
 
-        // Complete progress tracker
-        this._progressTracker.complete('Marker genes discovery complete');
+        await this._showResult(result, requestId);
+        if (!this._isCurrentAnalysisRequest(requestId)) return;
 
-        // Store result
+        progressTracker.complete('Marker genes discovery complete');
+        progressSettled = true;
+        this._fullMatrix = fullMatrix;
+        this._committedGeneListMode = this._modalGeneListMode;
         this._lastResult = result;
         this._currentPageData = result.data || result;
-
-        // Show result
-        await this._showResult(result);
+        this._requestedPlotOptions = structuredClone(result.options || {});
 
         // Callback
         if (this.onResultChange) {
@@ -423,22 +491,31 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
         }
       }
     } catch (error) {
+      if (!this._isCurrentAnalysisRequest(requestId)) return;
       console.error('[GenesPanelUI] Analysis error:', error);
-      this._progressTracker.fail(`Analysis failed: ${error.message}`);
+      progressTracker.fail(`Analysis failed: ${error.message}`);
+      progressSettled = true;
     } finally {
-      this._isLoading = false;
-      this._progressTracker = null;
-      if (runBtn) {
-        runBtn.disabled = false;
-        runBtn.textContent = originalText;
+      if (
+        this._isCurrentAnalysisRequest(requestId) &&
+        this._progressTracker === progressTracker
+      ) {
+        this._progressTracker = null;
       }
+      this._finishAnalysisRequest(requestId);
+      if (!this._isLoading) restoreButton();
     }
   }
 
   /**
    * @override
    */
-  async _runAnalysisImpl(formValues) {
+  async _runAnalysisImpl(
+    formValues,
+    requestId,
+    progressTracker,
+    controllerRunOwner = null
+  ) {
     // Initialize controller if needed
     if (!this._controller) {
       this._controller = new GenesPanelController({
@@ -446,66 +523,196 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       });
       await this._controller.init();
     }
+    if (!this._isCurrentAnalysisRequest(requestId)) return null;
 
     // Run analysis with progress updates
-    const panelResult = await this._controller.runAnalysis({
-      ...formValues,
-      onProgress: (progress) => {
-        this._updateProgress(progress);
+    const controller = this._controller;
+    if (controllerRunOwner !== null) {
+      controllerRunOwner.controller = controller;
+      controllerRunOwner.active = true;
+    }
+    let panelResult;
+    try {
+      panelResult = await controller.runAnalysis({
+        ...formValues,
+        onProgress: (progress) => {
+          if (this._isCurrentAnalysisRequest(requestId)) {
+            this._updateProgress(progress, progressTracker);
+          }
+        }
+      });
+    } finally {
+      if (
+        controllerRunOwner !== null &&
+        controllerRunOwner.controller === controller
+      ) {
+        controllerRunOwner.active = false;
       }
-    });
+    }
+    if (!this._isCurrentAnalysisRequest(requestId)) return null;
 
-    // Cache the full matrix so we can re-slice it when the modal "Top N" changes.
-    this._fullMatrix = panelResult.matrix || null;
-
-    const displayMatrix = this._buildHeatmapMatrixForMode({
-      matrix: panelResult.matrix,
-      markers: panelResult.markers,
-      mode: this._modalGeneListMode
-    });
+    let fullMatrix = panelResult.matrix;
+    let resultMarkers = panelResult.markers;
+    let selectedGenes = null;
+    if (panelResult.markers !== null) {
+      const selection = this._prepareMarkerSelection({
+        markers: panelResult.markers,
+        topN: this._getTopNFromMode(this._modalGeneListMode),
+        thresholdOptions: formValues
+      });
+      resultMarkers = {
+        ...panelResult.markers,
+        groups: selection.groups
+      };
+      selectedGenes = selection.genes;
+      if (
+        selectedGenes.length > 0 &&
+        !this._matrixCoversGenes(fullMatrix, selectedGenes)
+      ) {
+        const { groups } = await controller.getGroupsAndCodes(
+          formValues.obsCategory,
+          {}
+        );
+        if (!this._isCurrentAnalysisRequest(requestId)) return null;
+        fullMatrix = await controller.buildMatrixForGenes({
+          genes: selectedGenes,
+          groups,
+          transform: formValues.transform,
+          batchConfig: panelResult.metadata?.batchConfig || {},
+          onProgress: null
+        });
+        if (!this._isCurrentAnalysisRequest(requestId)) return null;
+        if (!this._matrixCoversGenes(fullMatrix, selectedGenes)) {
+          throw new Error(
+            'Initial marker matrix does not cover every selected gene'
+          );
+        }
+      }
+    }
+    const displayMatrix = selectedGenes === null
+      ? fullMatrix
+      : (selectedGenes.length === 0
+          ? this._createEmptyHeatmapMatrix(fullMatrix)
+          : this._sliceHeatmapMatrixForGenes(
+              fullMatrix,
+              selectedGenes
+            ));
+    const clusteringMatchesDisplay = (
+      panelResult.clustering !== null &&
+      panelResult.matrix?.transform === displayMatrix?.transform &&
+      this._sameExactTextArray(
+        panelResult.matrix?.genes,
+        displayMatrix?.genes
+      ) &&
+      this._sameExactTextArray(
+        panelResult.matrix?.groupIds,
+        displayMatrix?.groupIds
+      )
+    );
+    const clustering = clusteringMatchesDisplay
+      ? panelResult.clustering
+      : null;
 
     // Clustered/custom mode: render heatmap
     return {
-      type: 'genes_panel',
-      plotType: 'gene-heatmap',
-      data: { matrix: displayMatrix, clustering: panelResult.clustering },
-      options: {
-        pValueThreshold: formValues.pValueThreshold,
-        foldChangeThreshold: formValues.foldChangeThreshold,
-        useAdjustedPValue: formValues.useAdjustedPValue,
-        hasClustering: !!panelResult.clustering,
-        colorscale: formValues.colorscale,
-        showValues: false,
-        reverseColorscale: true
-      },
-      title: 'Marker Genes',
-      subtitle: formValues.obsCategory,
-      markers: panelResult.markers,
-      clustering: panelResult.clustering,
-      metadata: panelResult.metadata
+      fullMatrix: fullMatrix || null,
+      result: {
+        type: 'genes_panel',
+        plotType: 'gene-heatmap',
+        data: { matrix: displayMatrix, clustering },
+        options: {
+          pValueThreshold: formValues.pValueThreshold,
+          foldChangeThreshold: formValues.foldChangeThreshold,
+          useAdjustedPValue: formValues.useAdjustedPValue,
+          transform: formValues.transform,
+          hasClustering: clustering !== null,
+          colorscale: formValues.colorscale,
+          showValues: false,
+          reverseColorscale: true
+        },
+        title: 'Marker Genes',
+        subtitle: formValues.obsCategory,
+        markers: resultMarkers,
+        clustering,
+        metadata: {
+          ...panelResult.metadata,
+          matrixGeneCount: displayMatrix?.nRows ?? 0
+        }
+      }
     };
   }
 
   _handlePlotOptionChange(key, value) {
-    super._handlePlotOptionChange(key, value);
+    const prepared = this._preparePlotOptionChange(key, value);
+    if (prepared === null || prepared === undefined) return;
+    const { revision, requestedOptions } = prepared;
 
-    if (key === 'pValueThreshold' || key === 'foldChangeThreshold' || key === 'useAdjustedPValue') {
-      const revision = this._optionRenderRevision;
-      void this._refreshMarkersAndHeatmapFromThresholds(revision);
-    }
-
-    if (key === 'transform') {
-      const revision = this._optionRenderRevision;
-      void this._refreshHeatmapTransform(revision, value);
-    }
+    return this._trackInteractiveTask(
+      this._enqueueGeneHeatmapReconciliation(
+        revision,
+        requestedOptions,
+        this._modalGeneListMode
+      ),
+      (
+        key === 'pValueThreshold' ||
+        key === 'foldChangeThreshold' ||
+        key === 'useAdjustedPValue'
+      )
+        ? 'Marker threshold update'
+        : (key === 'transform'
+            ? 'Gene heatmap transform update'
+            : 'Gene heatmap option update')
+    );
   }
 
-  _getMarkerThresholdOptions() {
-    const opts = this._lastResult?.options || {};
+  _getMarkerThresholdOptions(
+    options = this._requestedPlotOptions ??
+      this._lastResult?.options ??
+      {}
+  ) {
+    if (
+      options === null ||
+      typeof options !== 'object' ||
+      Array.isArray(options)
+    ) {
+      throw new TypeError('Marker threshold options must be an object');
+    }
+    const opts = options;
+    const pValueThreshold = Object.hasOwn(opts, 'pValueThreshold')
+      ? opts.pValueThreshold
+      : DEFAULTS.pValueThreshold;
+    const foldChangeThreshold = Object.hasOwn(opts, 'foldChangeThreshold')
+      ? opts.foldChangeThreshold
+      : DEFAULTS.foldChangeThreshold;
+    const useAdjustedPValue = Object.hasOwn(opts, 'useAdjustedPValue')
+      ? opts.useAdjustedPValue
+      : DEFAULTS.useAdjustedPValue;
+    if (
+      !Number.isFinite(pValueThreshold) ||
+      pValueThreshold < 0 ||
+      pValueThreshold > 1
+    ) {
+      throw new RangeError(
+        'Marker p-value threshold must be finite and between 0 and 1'
+      );
+    }
+    if (
+      !Number.isFinite(foldChangeThreshold) ||
+      foldChangeThreshold < 0
+    ) {
+      throw new RangeError(
+        'Marker fold-change threshold must be finite and non-negative'
+      );
+    }
+    if (typeof useAdjustedPValue !== 'boolean') {
+      throw new TypeError(
+        'Marker adjusted-p-value selection must be boolean'
+      );
+    }
     return {
-      pValueThreshold: Number.isFinite(opts.pValueThreshold) ? opts.pValueThreshold : DEFAULTS.pValueThreshold,
-      foldChangeThreshold: Number.isFinite(opts.foldChangeThreshold) ? opts.foldChangeThreshold : DEFAULTS.foldChangeThreshold,
-      useAdjustedPValue: opts.useAdjustedPValue !== false
+      pValueThreshold,
+      foldChangeThreshold,
+      useAdjustedPValue
     };
   }
 
@@ -529,72 +736,50 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
   /**
    * @override
    */
-  async _showResult(result) {
-    this._resultContainer.classList.remove('hidden');
-
-    // Purge any existing plots to prevent WebGL memory leaks
-    purgePlot(this._resultContainer.querySelector('.analysis-preview-plot'));
-    this._resultContainer.innerHTML = '';
+  async _showResult(result, requestId) {
+    if (!this._isCurrentAnalysisRequest(requestId)) return;
 
     if (!result.plotType) {
+      if (this._previewPlotSlot != null) {
+        await this._previewPlotSlot.destroy();
+        this._previewPlotSlot = null;
+        this._previewPlotHost = null;
+      }
+      if (!this._isCurrentAnalysisRequest(requestId)) return;
+      this._resultContainer.innerHTML = '';
+      this._resultContainer.classList.remove('hidden');
       this._renderRankedMarkers(result, this._resultContainer);
       return;
     }
 
-    const previewContainer = document.createElement('div');
-    previewContainer.className = 'analysis-preview-container';
-    this._resultContainer.appendChild(previewContainer);
-
-    const plotContainer = document.createElement('div');
-    plotContainer.className = 'analysis-preview-plot';
-    plotContainer.id = this._plotContainerId || `genes-panel-plot-${Date.now()}`;
-    this._plotContainerId = plotContainer.id;
-    // Explicit height helps Plotly compute layout reliably in the sidebar.
-    plotContainer.style.cssText = 'width: 100%; height: 380px;';
-    previewContainer.appendChild(plotContainer);
-
     // Ensure plot type is registered
     await import('../../plots/types/gene-heatmap.js');
+    if (!this._isCurrentAnalysisRequest(requestId)) return;
 
-    const plotDef = PlotRegistry.get(result.plotType);
-    if (!plotDef) {
-      plotContainer.innerHTML = '';
-      const errorEl = document.createElement('div');
-      errorEl.className = 'plot-error';
-      errorEl.textContent = `Unknown plot type: ${result.plotType}`;
-      plotContainer.appendChild(errorEl);
-      return;
-    }
-
-    const mergedOptions = PlotRegistry.mergeOptions(result.plotType, result.options || {});
-    try {
-      await renderOrUpdatePlot({
-        plotDef,
-        data: result.data,
-        options: mergedOptions,
-        container: plotContainer,
-        layoutEngine: null,
-        preferUpdate: false
-      });
-    } catch (err) {
-      console.error('[GenesPanelUI] Plot render error:', err);
-      plotContainer.innerHTML = '';
-      const errorEl = document.createElement('div');
-      errorEl.className = 'plot-error';
-      errorEl.textContent = `Failed to render heatmap: ${err?.message || err}`;
-      plotContainer.appendChild(errorEl);
-      return;
-    }
-
+    const containerId = this._plotContainerId ||
+      `genes-panel-plot-${this._instanceId || 'default'}`;
+    const candidate = await this._renderPreviewPlot({
+      result,
+      requestId,
+      containerId,
+      height: 380,
+      onRendered: plotCandidate => this._setupHoverContext(
+        plotCandidate,
+        result,
+        { replaceExisting: false }
+      )
+    });
+    if (candidate === null || !this._isCurrentAnalysisRequest(requestId)) return;
     // Expand (modal) action
+    const priorActions = this._resultContainer.querySelector(
+      '.analysis-actions'
+    );
+    if (priorActions) priorActions.remove();
     const actionsContainer = document.createElement('div');
     actionsContainer.className = 'analysis-actions';
     actionsContainer.style.display = 'flex';
     actionsContainer.appendChild(this._createExpandButton());
     this._resultContainer.appendChild(actionsContainer);
-
-    // Setup hover context (marker stats)
-    this._setupHoverContext(plotContainer, result);
   }
 
   // ===========================================================================
@@ -604,52 +789,35 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
   /**
    * @override
    */
-  async _renderModalPlot(container) {
-    if (!this._lastResult) return;
-
-    container.innerHTML = '';
-    const plotContainer = document.createElement('div');
-    plotContainer.style.cssText = 'width: 100%; height: 500px;';
-    container.appendChild(plotContainer);
-
-    const result = this._lastResult;
+  async _renderModalPlot(
+    container,
+    {
+      isCurrent = () => true,
+      modal = this._modal,
+      result = this._lastResult
+    } = {}
+  ) {
+    if (!result) return null;
     if (!result.plotType) {
-      plotContainer.innerHTML = '<div class="analysis-empty-message">No plot for Ranked mode.</div>';
-      return;
+      container.innerHTML =
+        '<div class="analysis-empty-message">No plot for Ranked mode.</div>';
+      return null;
     }
 
     await import('../../plots/types/gene-heatmap.js');
-    const plotDef = PlotRegistry.get(result.plotType);
-    if (!plotDef) {
-      plotContainer.innerHTML = '';
-      const errorEl = document.createElement('div');
-      errorEl.className = 'plot-error';
-      errorEl.textContent = `Unknown plot type: ${result.plotType}`;
-      plotContainer.appendChild(errorEl);
-      return;
+    if (!PlotRegistry.get(result.plotType)) {
+      throw new RangeError(`Unknown plot type: ${result.plotType}`);
     }
 
-    const mergedOptions = PlotRegistry.mergeOptions(result.plotType, result.options || {});
-    try {
-      await renderOrUpdatePlot({
-        plotDef,
-        data: result.data,
-        options: mergedOptions,
-        container: plotContainer,
-        layoutEngine: null,
-        preferUpdate: false
-      });
-    } catch (err) {
-      console.error('[GenesPanelUI] Modal plot render error:', err);
-      plotContainer.innerHTML = '';
-      const errorEl = document.createElement('div');
-      errorEl.className = 'plot-error';
-      errorEl.textContent = `Failed to render heatmap: ${err?.message || err}`;
-      plotContainer.appendChild(errorEl);
-      return;
+    const slot = this._ensureModalPlotSlot(modal);
+    if (modal._beforeClose == null) {
+      modal._beforeClose = () => this._destroyModalPlotOwner(modal);
     }
-
-    this._setupHoverContext(plotContainer, result);
+    return this._renderGeneResultInSlot({
+      slot,
+      result,
+      isCurrent
+    });
   }
 
   /**
@@ -663,22 +831,11 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     // Heatmap CSV
     const matrix = result?.data?.matrix;
     if (matrix) {
-      const { genes, groupNames, values, nRows, nCols } = matrix;
-      const header = ['gene', ...groupNames].join(',');
-      const lines = new Array(nRows + 1);
-      lines[0] = header;
-
-      for (let r = 0; r < nRows; r++) {
-        const row = new Array(nCols + 1);
-        row[0] = genes[r];
-        for (let c = 0; c < nCols; c++) {
-          const v = values[r * nCols + c];
-          row[c + 1] = Number.isFinite(v) ? String(v) : '';
-        }
-        lines[r + 1] = row.join(',');
-      }
-
-      downloadCSV(lines.join('\n'), 'marker_genes_heatmap', this._notifications);
+      downloadCSV(
+        this._serializeHeatmapCSV(matrix),
+        'marker_genes_heatmap',
+        this._notifications
+      );
       return;
     }
 
@@ -705,6 +862,58 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     }
 
     downloadCSV(rows.join('\n'), 'marker_genes_ranked', this._notifications);
+  }
+
+  /**
+   * Serialize the exact displayed heatmap, including the valid zero-row state.
+   * @param {Object} matrix
+   * @returns {string}
+   * @private
+   */
+  _serializeHeatmapCSV(matrix) {
+    if (
+      matrix === null ||
+      typeof matrix !== 'object' ||
+      Array.isArray(matrix)
+    ) {
+      throw new TypeError('Marker heatmap CSV requires a matrix object');
+    }
+    const { genes, groupNames, values, nRows, nCols } = matrix;
+    if (
+      !Number.isSafeInteger(nRows) ||
+      nRows < 0 ||
+      !Number.isSafeInteger(nCols) ||
+      nCols < 1 ||
+      !Array.isArray(genes) ||
+      genes.length !== nRows ||
+      genes.some(gene => typeof gene !== 'string' || gene.length === 0) ||
+      !Array.isArray(groupNames) ||
+      groupNames.length !== nCols ||
+      groupNames.some(
+        groupName => typeof groupName !== 'string' || groupName.length === 0
+      ) ||
+      (
+        !Array.isArray(values) &&
+        !ArrayBuffer.isView(values)
+      ) ||
+      values.length !== nRows * nCols
+    ) {
+      throw new TypeError(
+        'Marker heatmap CSV axes and values must match exact matrix dimensions'
+      );
+    }
+
+    const lines = new Array(nRows + 1);
+    lines[0] = ['gene', ...groupNames].map(toCSVCell).join(',');
+    for (let r = 0; r < nRows; r++) {
+      const row = new Array(nCols + 1);
+      row[0] = toCSVCell(genes[r]);
+      for (let c = 0; c < nCols; c++) {
+        row[c + 1] = toCSVCell(values[r * nCols + c]);
+      }
+      lines[r + 1] = row.join(',');
+    }
+    return lines.join('\n');
   }
 
   /**
@@ -906,7 +1115,10 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
         ? v
         : 'top5';
       this._renderModalAnnotations(container);
-      this._rerenderHeatmapForModalSelection();
+      this._trackInteractiveTask(
+        this._rerenderHeatmapForModalSelection(),
+        'Gene heatmap list update'
+      );
     });
     headerRow.appendChild(topSelect);
 
@@ -1040,6 +1252,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
         gene: geneKeys[i],
         geneIndex: i,
         groupId,
+        effectivePValue: p,
         pValue: Number.isFinite(pValuesRaw?.[i]) ? pValuesRaw[i] : p,
         adjustedPValue: Number.isFinite(adjPValues?.[i]) ? adjPValues[i] : null,
         log2FoldChange: fc
@@ -1047,20 +1260,34 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     }
 
     out.sort((a, b) => {
-      const pa = Number.isFinite(a.adjustedPValue) ? a.adjustedPValue : (Number.isFinite(a.pValue) ? a.pValue : 1);
-      const pb = Number.isFinite(b.adjustedPValue) ? b.adjustedPValue : (Number.isFinite(b.pValue) ? b.pValue : 1);
-      if (pa !== pb) return pa - pb;
-      return Math.abs(b.log2FoldChange) - Math.abs(a.log2FoldChange);
+      if (a.effectivePValue !== b.effectivePValue) {
+        return a.effectivePValue - b.effectivePValue;
+      }
+      const effectOrder =
+        Math.abs(b.log2FoldChange) - Math.abs(a.log2FoldChange);
+      if (effectOrder !== 0) return effectOrder;
+      if (a.geneIndex !== b.geneIndex) return a.geneIndex - b.geneIndex;
+      return a.gene.localeCompare(b.gene);
     });
 
-    return out.slice(0, Math.min(out.length, topN));
+    return out
+      .slice(0, Math.min(out.length, topN))
+      .map(({ effectivePValue: _effectivePValue, ...marker }) => marker);
   }
 
-  _rebuildMarkerGroupsFromStats({ markers, topN }) {
+  _rebuildMarkerGroupsFromStats({
+    markers,
+    topN,
+    thresholdOptions
+  }) {
     const stats = markers?.stats;
     if (!stats?.genes || !stats.groupIds || !stats.pValuesByGroup || !stats.log2FoldChangeByGroup) return null;
 
-    const { pValueThreshold, foldChangeThreshold, useAdjustedPValue } = this._getMarkerThresholdOptions();
+    const {
+      pValueThreshold,
+      foldChangeThreshold,
+      useAdjustedPValue
+    } = this._getMarkerThresholdOptions(thresholdOptions);
 
     /** @type {Record<string, any>} */
     const nextGroups = {};
@@ -1089,185 +1316,725 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     return nextGroups;
   }
 
-  _computeHeatmapGeneSet({ markers, topN }) {
-    const nextGroups = this._rebuildMarkerGroupsFromStats({ markers, topN });
+  _computeHeatmapGeneSet({ markers, topN, thresholdOptions }) {
+    const nextGroups = this._rebuildMarkerGroupsFromStats({
+      markers,
+      topN,
+      thresholdOptions
+    });
     const groups = nextGroups || markers?.groups || {};
+    return this._collectHeatmapGenesFromGroups(groups, topN);
+  }
 
+  _collectHeatmapGenesFromGroups(groups, topN = Infinity) {
+    if (
+      groups === null ||
+      typeof groups !== 'object' ||
+      Array.isArray(groups)
+    ) {
+      throw new TypeError('Marker heatmap groups must be an object');
+    }
+    if (
+      topN !== Infinity &&
+      (!Number.isSafeInteger(topN) || topN < 1)
+    ) {
+      throw new RangeError(
+        'Marker heatmap Top-N must be Infinity or a positive integer'
+      );
+    }
     const wanted = new Set();
     for (const group of Object.values(groups)) {
-      const list = group?.markers || [];
+      if (
+        group === null ||
+        typeof group !== 'object' ||
+        !Array.isArray(group.markers)
+      ) {
+        throw new TypeError(
+          'Every marker heatmap group must own a markers array'
+        );
+      }
+      const list = group.markers;
       const limit = Math.min(list.length, topN);
       for (let i = 0; i < limit; i++) {
-        if (list[i]?.gene) wanted.add(list[i].gene);
+        const gene = list[i]?.gene;
+        if (
+          typeof gene !== 'string' ||
+          gene.length === 0 ||
+          gene !== gene.trim()
+        ) {
+          throw new TypeError(
+            'Every selected marker must own an exact non-empty gene'
+          );
+        }
+        wanted.add(gene);
       }
     }
     return wanted;
   }
 
-  _buildHeatmapMatrixForMode({ matrix, markers, mode }) {
-    if (!matrix || !markers) return matrix;
+  _prepareMarkerSelection({
+    markers,
+    topN,
+    thresholdOptions
+  }) {
+    const groups = this._rebuildMarkerGroupsFromStats({
+      markers,
+      topN,
+      thresholdOptions
+    });
+    if (groups === null) {
+      throw new Error(
+        'Interactive marker selection requires full marker statistics'
+      );
+    }
+    return {
+      groups,
+      genes: Array.from(
+        this._collectHeatmapGenesFromGroups(groups, topN)
+      )
+    };
+  }
 
-    const topN = this._getTopNFromMode(mode);
-    if (!Number.isFinite(topN)) return matrix;
+  _matrixCoversGenes(matrix, genes) {
+    if (
+      matrix === null ||
+      typeof matrix !== 'object' ||
+      !Array.isArray(matrix.genes)
+    ) {
+      return false;
+    }
+    const available = new Set(matrix.genes);
+    if (available.size !== matrix.genes.length) {
+      throw new Error('Marker heatmap source matrix contains duplicate genes');
+    }
+    return genes.every(gene => available.has(gene));
+  }
 
-    const wanted = this._computeHeatmapGeneSet({ markers, topN });
+  _createEmptyHeatmapMatrix(matrix) {
+    if (
+      matrix === null ||
+      typeof matrix !== 'object' ||
+      !Number.isSafeInteger(matrix.nCols) ||
+      matrix.nCols < 1 ||
+      !Array.isArray(matrix.groupIds) ||
+      matrix.groupIds.length !== matrix.nCols ||
+      !Array.isArray(matrix.groupNames) ||
+      matrix.groupNames.length !== matrix.nCols
+    ) {
+      throw new TypeError(
+        'Empty marker heatmap requires exact non-empty group axes'
+      );
+    }
+    return {
+      ...matrix,
+      genes: [],
+      values: new Float32Array(0),
+      rawValues: matrix.rawValues === null
+        ? null
+        : new Float32Array(0),
+      nRows: 0
+    };
+  }
 
-    if (wanted.size === 0) return matrix;
-
-    const genes = matrix.genes || [];
-    const keepRows = [];
-    for (let i = 0; i < genes.length; i++) {
-      if (wanted.has(genes[i])) keepRows.push(i);
+  _sliceHeatmapMatrixForGenes(matrix, requestedGenes) {
+    if (
+      matrix === null ||
+      typeof matrix !== 'object' ||
+      !Array.isArray(matrix.genes) ||
+      !Number.isSafeInteger(matrix.nRows) ||
+      matrix.nRows < 1 ||
+      matrix.genes.length !== matrix.nRows ||
+      !Number.isSafeInteger(matrix.nCols) ||
+      matrix.nCols < 1 ||
+      (
+        !Array.isArray(matrix.values) &&
+        !ArrayBuffer.isView(matrix.values)
+      ) ||
+      matrix.values.length !== matrix.nRows * matrix.nCols
+    ) {
+      throw new TypeError(
+        'Marker heatmap source matrix must own exact positive dimensions'
+      );
+    }
+    if (
+      !Array.isArray(requestedGenes) ||
+      requestedGenes.some(
+        gene =>
+          typeof gene !== 'string' ||
+          gene.length === 0 ||
+          gene !== gene.trim()
+      ) ||
+      new Set(requestedGenes).size !== requestedGenes.length
+    ) {
+      throw new TypeError(
+        'Marker heatmap selection must contain unique non-empty genes'
+      );
+    }
+    if (requestedGenes.length === 0) {
+      return this._createEmptyHeatmapMatrix(matrix);
     }
 
-    if (keepRows.length === 0 || keepRows.length === genes.length) return matrix;
-
-    const nCols = matrix.nCols || (matrix.groupIds?.length || 0);
-    const nRows = keepRows.length;
-    const outValues = new Float32Array(nRows * nCols);
-    outValues.fill(NaN);
-    const outRaw = matrix.rawValues ? new Float32Array(nRows * nCols) : null;
-
-    for (let r = 0; r < nRows; r++) {
-      const srcRow = keepRows[r];
-      const srcOffset = srcRow * nCols;
-      const dstOffset = r * nCols;
-      for (let c = 0; c < nCols; c++) {
-        outValues[dstOffset + c] = matrix.values[srcOffset + c];
-        if (outRaw && matrix.rawValues) {
-          outRaw[dstOffset + c] = matrix.rawValues[srcOffset + c];
-        }
+    const wanted = new Set(requestedGenes);
+    const keepRows = [];
+    const covered = new Set();
+    for (let i = 0; i < matrix.genes.length; i++) {
+      const gene = matrix.genes[i];
+      if (wanted.has(gene)) {
+        keepRows.push(i);
+        covered.add(gene);
       }
     }
+    if (covered.size !== wanted.size) {
+      const missing = requestedGenes.filter(gene => !covered.has(gene));
+      throw new Error(
+        `Marker heatmap source matrix is missing selected genes: ${missing.join(', ')}`
+      );
+    }
+    if (keepRows.length === matrix.genes.length) return matrix;
 
-    const out = {
+    const nCols = matrix.nCols;
+    const nRows = keepRows.length;
+    const outValues = new Float32Array(nRows * nCols);
+    const outRaw = matrix.rawValues === null
+      ? null
+      : new Float32Array(nRows * nCols);
+    for (let r = 0; r < nRows; r++) {
+      const srcOffset = keepRows[r] * nCols;
+      const dstOffset = r * nCols;
+      outValues.set(
+        matrix.values.subarray
+          ? matrix.values.subarray(srcOffset, srcOffset + nCols)
+          : matrix.values.slice(srcOffset, srcOffset + nCols),
+        dstOffset
+      );
+      if (outRaw !== null) {
+        if (
+          (
+            !Array.isArray(matrix.rawValues) &&
+            !ArrayBuffer.isView(matrix.rawValues)
+          ) ||
+          matrix.rawValues.length !== matrix.nRows * nCols
+        ) {
+          throw new TypeError(
+            'Marker heatmap raw values must match exact matrix dimensions'
+          );
+        }
+        outRaw.set(
+          matrix.rawValues.subarray
+            ? matrix.rawValues.subarray(srcOffset, srcOffset + nCols)
+            : matrix.rawValues.slice(srcOffset, srcOffset + nCols),
+          dstOffset
+        );
+      }
+    }
+    return {
       ...matrix,
-      genes: keepRows.map(i => genes[i]),
+      genes: keepRows.map(index => matrix.genes[index]),
       values: outValues,
       rawValues: outRaw,
       nRows
     };
+  }
 
-    return out;
+  _buildHeatmapMatrixForMode({
+    matrix,
+    markers,
+    mode,
+    thresholdOptions
+  }) {
+    if (!matrix || !markers) return matrix;
+
+    const topN = this._getTopNFromMode(mode);
+    const selection = this._prepareMarkerSelection({
+      markers,
+      topN,
+      thresholdOptions
+    });
+    return this._sliceHeatmapMatrixForGenes(matrix, selection.genes);
   }
 
   async _rerenderHeatmapForModalSelection() {
     if (!this._lastResult?.plotType || this._lastResult.plotType !== 'gene-heatmap') return;
     if (!this._fullMatrix || !this._lastResult.markers) return;
-
-    // Update marker lists to match current threshold options.
-    const topN = this._getTopNFromMode(this._modalGeneListMode);
-    const rebuilt = this._rebuildMarkerGroupsFromStats({ markers: this._lastResult.markers, topN });
-    if (rebuilt) {
-      this._lastResult.markers.groups = rebuilt;
-    }
-
-    const nextMatrix = this._buildHeatmapMatrixForMode({
-      matrix: this._fullMatrix,
-      markers: this._lastResult.markers,
-      mode: this._modalGeneListMode
-    });
-
-    // Update the cached result and re-render preview plot.
-    const clustering = this._lastResult.data?.clustering || this._lastResult.clustering || null;
-    this._lastResult.data = { matrix: nextMatrix, clustering };
-    if (this._lastResult.options) this._lastResult.options.hasClustering = !!clustering;
     const revision = ++this._optionRenderRevision;
-    void this._rerenderAfterOptionChange(revision);
+    const requestedOptions = structuredClone(
+      this._requestedPlotOptions ??
+      this._lastResult.options ??
+      {}
+    );
+    return this._enqueueGeneHeatmapReconciliation(
+      revision,
+      requestedOptions,
+      this._modalGeneListMode
+    );
   }
 
-  async _refreshMarkersAndHeatmapFromThresholds(revision) {
-    if (this._isDestroyed) return;
-    if (revision !== this._optionRenderRevision) return;
-    if (!this._lastResult?.markers) return;
+  _enqueueGeneHeatmapReconciliation(
+    revision,
+    requestedOptions,
+    mode
+  ) {
+    const ownedOptions = structuredClone(requestedOptions);
+    const predecessor = Promise.resolve(this._geneOptionTail).catch(() => {});
+    const operation = predecessor.then(() => (
+      this._reconcileGeneHeatmapIntent(
+        revision,
+        ownedOptions,
+        mode
+      )
+    ));
+    this._geneOptionTail = operation;
+    void operation.catch(() => {});
+    return operation;
+  }
 
-    const topN = this._getTopNFromMode(this._modalGeneListMode);
-    const rebuilt = this._rebuildMarkerGroupsFromStats({ markers: this._lastResult.markers, topN });
-    if (rebuilt) {
-      this._lastResult.markers.groups = rebuilt;
+  _isGeneHeatmapIntentCurrent(
+    revision,
+    ownedResult,
+    ownedController
+  ) {
+    return (
+      !this._isDestroyed &&
+      revision === this._optionRenderRevision &&
+      this._lastResult === ownedResult &&
+      this._controller === ownedController
+    );
+  }
+
+  _getRequestedHeatmapTransform(requestedOptions, defaultTransform) {
+    const transform = Object.hasOwn(requestedOptions, 'transform')
+      ? requestedOptions.transform
+      : defaultTransform;
+    if (!['none', 'zscore', 'log1p'].includes(transform)) {
+      throw new RangeError(
+        `Unknown marker heatmap transform: ${String(transform)}`
+      );
+    }
+    return transform;
+  }
+
+  _sameExactTextArray(left, right) {
+    return (
+      Array.isArray(left) &&
+      Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((value, index) => value === right[index])
+    );
+  }
+
+  async _stageGeneHeatmapIntent({
+    revision,
+    requestedOptions,
+    mode,
+    ownedResult,
+    ownedController
+  }) {
+    if (
+      requestedOptions === null ||
+      typeof requestedOptions !== 'object' ||
+      Array.isArray(requestedOptions)
+    ) {
+      throw new TypeError(
+        'Gene heatmap reconciliation requires an options object'
+      );
+    }
+    const requestedThresholds =
+      this._getMarkerThresholdOptions(requestedOptions);
+    const targetTransform = this._getRequestedHeatmapTransform(
+      requestedOptions,
+      ownedResult.metadata?.transform ??
+        ownedResult.data?.matrix?.transform ??
+        DEFAULTS.transform
+    );
+    const sourceMatrix = this._fullMatrix ?? ownedResult.data?.matrix;
+    if (
+      sourceMatrix === null ||
+      typeof sourceMatrix !== 'object' ||
+      !Array.isArray(sourceMatrix.genes)
+    ) {
+      throw new TypeError(
+        'Gene heatmap reconciliation requires a canonical matrix'
+      );
     }
 
-    // Compute desired gene set for heatmap.
-    const wanted = Array.from(this._computeHeatmapGeneSet({ markers: this._lastResult.markers, topN }))
-      .filter(Boolean);
-
-    if (wanted.length === 0) {
-      return;
-    }
-
-    // If the gene set is fully covered by the current matrix, slice locally.
-    const current = this._fullMatrix;
-    const geneSet = new Set(current?.genes || []);
-    const canSlice = current && current.values && wanted.every(g => geneSet.has(g));
-
-    let nextMatrix;
-    if (canSlice) {
-      nextMatrix = this._buildHeatmapMatrixForMode({
-        matrix: current,
-        markers: this._lastResult.markers,
-        mode: this._modalGeneListMode
-      });
+    let stagedMarkers = ownedResult.markers;
+    let wantedGenes;
+    if (ownedResult.markers === null) {
+      wantedGenes = [...sourceMatrix.genes];
     } else {
-      // Rebuild matrix for the new gene set (no re-run of marker discovery).
-      const obsCategory = this._lastResult.metadata?.obsCategory;
-      if (!obsCategory || !this._controller) return;
+      const topN = this._getTopNFromMode(mode);
+      const committedThresholds = this._getMarkerThresholdOptions(
+        ownedResult.options || {}
+      );
+      const selectionIsCommitted = (
+        this._committedGeneListMode === mode &&
+        committedThresholds.pValueThreshold ===
+          requestedThresholds.pValueThreshold &&
+        committedThresholds.foldChangeThreshold ===
+          requestedThresholds.foldChangeThreshold &&
+        committedThresholds.useAdjustedPValue ===
+          requestedThresholds.useAdjustedPValue
+      );
+      const selection = selectionIsCommitted
+        ? {
+            groups: ownedResult.markers.groups,
+            genes: Array.from(
+              this._collectHeatmapGenesFromGroups(
+                ownedResult.markers.groups,
+                topN
+              )
+            )
+          }
+        : this._prepareMarkerSelection({
+            markers: ownedResult.markers,
+            topN,
+            thresholdOptions: requestedOptions
+          });
+      stagedMarkers = {
+        ...ownedResult.markers,
+        groups: selection.groups
+      };
+      wantedGenes = selection.genes;
+    }
 
-      const { groups } = await this._controller.getGroupsAndCodes(obsCategory, {});
-      if (this._isDestroyed) return;
-      if (revision !== this._optionRenderRevision) return;
-
-      nextMatrix = await this._controller.buildMatrixForGenes({
-        genes: wanted,
+    let canonicalMatrix = sourceMatrix;
+    if (wantedGenes.length > 0 &&
+        !this._matrixCoversGenes(sourceMatrix, wantedGenes)) {
+      const obsCategory = ownedResult.metadata?.obsCategory;
+      if (
+        typeof obsCategory !== 'string' ||
+        obsCategory.length === 0 ||
+        ownedController === null ||
+        typeof ownedController?.getGroupsAndCodes !== 'function' ||
+        typeof ownedController?.buildMatrixForGenes !== 'function'
+      ) {
+        throw new Error(
+          'Missing marker genes require an exact matrix rebuild owner'
+        );
+      }
+      const { groups } = await ownedController.getGroupsAndCodes(
+        obsCategory,
+        {}
+      );
+      if (!this._isGeneHeatmapIntentCurrent(
+        revision,
+        ownedResult,
+        ownedController
+      )) {
+        return null;
+      }
+      canonicalMatrix = await ownedController.buildMatrixForGenes({
+        genes: wantedGenes,
         groups,
-        transform: this._lastResult.metadata?.transform || DEFAULTS.transform,
-        batchConfig: this._lastResult.metadata?.batchConfig || {},
+        transform: targetTransform,
+        batchConfig: ownedResult.metadata?.batchConfig || {},
         onProgress: null
       });
-      this._fullMatrix = nextMatrix;
+      if (!this._isGeneHeatmapIntentCurrent(
+        revision,
+        ownedResult,
+        ownedController
+      )) {
+        return null;
+      }
+      if (!this._matrixCoversGenes(canonicalMatrix, wantedGenes)) {
+        throw new Error(
+          'Rebuilt marker matrix does not cover every selected gene'
+        );
+      }
+    } else if (canonicalMatrix.transform !== targetTransform) {
+      if (
+        ownedController === null ||
+        typeof ownedController?.retransform !== 'function'
+      ) {
+        throw new Error(
+          'Marker heatmap transform requires an exact controller owner'
+        );
+      }
+      const transformed = ownedController.retransform(
+        { matrix: canonicalMatrix },
+        targetTransform
+      );
+      if (
+        transformed === null ||
+        typeof transformed !== 'object' ||
+        transformed.matrix === null ||
+        typeof transformed.matrix !== 'object'
+      ) {
+        throw new TypeError(
+          'Marker heatmap transform must return an exact matrix'
+        );
+      }
+      canonicalMatrix = transformed.matrix;
     }
 
-    const clustering = this._lastResult.data?.clustering || this._lastResult.clustering || null;
-    this._lastResult.data = { matrix: nextMatrix, clustering };
-    if (this._lastResult.options) this._lastResult.options.hasClustering = !!clustering;
-    const nextRevision = ++this._optionRenderRevision;
-    void this._rerenderAfterOptionChange(nextRevision);
+    const displayMatrix = wantedGenes.length === 0
+      ? this._createEmptyHeatmapMatrix(canonicalMatrix)
+      : this._sliceHeatmapMatrixForGenes(
+          canonicalMatrix,
+          wantedGenes
+        );
+    const priorMatrix = ownedResult.data?.matrix;
+    const matrixIdentityUnchanged = (
+      priorMatrix !== null &&
+      typeof priorMatrix === 'object' &&
+      priorMatrix.transform === displayMatrix.transform &&
+      this._sameExactTextArray(priorMatrix.genes, displayMatrix.genes) &&
+      this._sameExactTextArray(
+        priorMatrix.groupIds,
+        displayMatrix.groupIds
+      )
+    );
+    const priorClustering =
+      ownedResult.data?.clustering ??
+      ownedResult.clustering ??
+      null;
+    const clustering = matrixIdentityUnchanged
+      ? priorClustering
+      : null;
+    const options = {
+      ...requestedOptions,
+      transform: targetTransform,
+      hasClustering: clustering !== null
+    };
+    const metadata = {
+      ...(ownedResult.metadata || {}),
+      transform: targetTransform,
+      matrixGeneCount: displayMatrix.nRows
+    };
+    const stagedResult = {
+      ...ownedResult,
+      data: { matrix: displayMatrix, clustering },
+      options,
+      markers: stagedMarkers,
+      clustering,
+      metadata
+    };
+    return {
+      canonicalMatrix,
+      stagedResult
+    };
   }
 
-  async _refreshHeatmapTransform(revision, transform) {
-    if (this._isDestroyed) return;
-    if (revision !== this._optionRenderRevision) return;
-    if (!this._controller || !this._fullMatrix) return;
+  _renderGeneResultInSlot({
+    slot,
+    result,
+    isCurrent
+  }) {
+    if (slot === null || typeof slot?.render !== 'function') {
+      throw new TypeError(
+        'Gene heatmap render requires an exact plot slot'
+      );
+    }
+    if (typeof isCurrent !== 'function') {
+      throw new TypeError(
+        'Gene heatmap render requires an ownership predicate'
+      );
+    }
+    const matrix = result.data?.matrix;
+    const isEmpty = matrix?.nRows === 0;
+    const plotDef = isEmpty ? null : PlotRegistry.get(result.plotType);
+    if (!isEmpty && !plotDef) {
+      throw new RangeError(`Unknown plot type: ${result.plotType}`);
+    }
+    const mergedOptions = isEmpty
+      ? null
+      : PlotRegistry.mergeOptions(
+          result.plotType,
+          result.options || {}
+        );
+    const payload = {
+      render: plotCandidate => {
+        if (isEmpty) {
+          const ownerDocument = plotCandidate.ownerDocument;
+          if (
+            ownerDocument === null ||
+            typeof ownerDocument?.createElement !== 'function' ||
+            typeof plotCandidate.replaceChildren !== 'function'
+          ) {
+            throw new TypeError(
+              'Empty marker heatmap candidate requires an owner document'
+            );
+          }
+          const empty = ownerDocument.createElement('div');
+          empty.className = 'analysis-empty-message';
+          empty.setAttribute('role', 'status');
+          empty.textContent =
+            'No marker genes match the current thresholds.';
+          plotCandidate.replaceChildren(empty);
+          return null;
+        }
+        return plotDef.render(
+          result.data,
+          mergedOptions,
+          plotCandidate,
+          null
+        );
+      }
+    };
+    if (!isEmpty) {
+      payload.onRendered = plotCandidate => this._setupHoverContext(
+        plotCandidate,
+        result,
+        { replaceExisting: false }
+      );
+    }
+    return slot.render(payload, { isCurrent });
+  }
 
-    // Re-transform the full matrix (preserves rawValues so repeated toggles work).
-    const wrapper = { matrix: this._fullMatrix };
-    const transformed = this._controller.retransform(wrapper, transform)?.matrix || null;
-    if (!transformed) return;
+  async _renderStagedGeneResult({
+    result,
+    revision,
+    ownedResult,
+    ownedController
+  }) {
+    const isCurrent = () => this._isGeneHeatmapIntentCurrent(
+      revision,
+      ownedResult,
+      ownedController
+    );
+    if (!isCurrent()) return false;
 
-    this._fullMatrix = transformed;
-    if (this._lastResult?.metadata) {
-      this._lastResult.metadata.transform = transform;
+    const modal = this._modal;
+    if (modal !== null) {
+      const modalSlot = this._ensureModalPlotSlot(modal);
+      const modalCandidate = await this._renderGeneResultInSlot({
+        slot: modalSlot,
+        result,
+        isCurrent
+      });
+      if (modalCandidate === null || !isCurrent()) return false;
     }
 
-    const nextMatrix = this._buildHeatmapMatrixForMode({
-      matrix: this._fullMatrix,
-      markers: this._lastResult?.markers,
-      mode: this._modalGeneListMode
+    if (this._previewPlotSlot !== null) {
+      const previewCandidate = await this._renderGeneResultInSlot({
+        slot: this._previewPlotSlot,
+        result,
+        isCurrent
+      });
+      if (previewCandidate === null || !isCurrent()) return false;
+    }
+    return isCurrent();
+  }
+
+  _commitStagedGeneResult({
+    ownedResult,
+    stagedResult,
+    canonicalMatrix,
+    mode
+  }) {
+    ownedResult.data = stagedResult.data;
+    ownedResult.options = stagedResult.options;
+    ownedResult.markers = stagedResult.markers;
+    ownedResult.clustering = stagedResult.clustering;
+    ownedResult.metadata = stagedResult.metadata;
+    this._fullMatrix = canonicalMatrix;
+    this._committedGeneListMode = mode;
+    this._currentPageData = stagedResult.data;
+    this._requestedPlotOptions = structuredClone(
+      stagedResult.options
+    );
+
+    const modal = this._modal;
+    if (modal !== null) {
+      this._renderModalOptions(modal._optionsContent);
+      this._renderModalStats(modal._statsContent);
+      this._renderModalAnnotations(modal._annotationsContent);
+    }
+  }
+
+  async _reconcileGeneHeatmapIntent(
+    revision,
+    requestedOptions,
+    mode
+  ) {
+    if (
+      this._isDestroyed ||
+      revision !== this._optionRenderRevision
+    ) {
+      return;
+    }
+    const ownedResult = this._lastResult;
+    const ownedController = this._controller;
+    if (
+      ownedResult === null ||
+      ownedResult?.plotType !== 'gene-heatmap'
+    ) {
+      return;
+    }
+    const staged = await this._stageGeneHeatmapIntent({
+      revision,
+      requestedOptions,
+      mode,
+      ownedResult,
+      ownedController
     });
-
-    const clustering = this._lastResult?.data?.clustering || this._lastResult?.clustering || null;
-    if (this._lastResult) {
-      if (!this._lastResult.options) this._lastResult.options = {};
-      this._lastResult.options.transform = transform;
-      this._lastResult.data = { matrix: nextMatrix, clustering };
+    if (staged === null || !this._isGeneHeatmapIntentCurrent(
+      revision,
+      ownedResult,
+      ownedController
+    )) {
+      return;
     }
+    const rendered = await this._renderStagedGeneResult({
+      result: staged.stagedResult,
+      revision,
+      ownedResult,
+      ownedController
+    });
+    if (!rendered || !this._isGeneHeatmapIntentCurrent(
+      revision,
+      ownedResult,
+      ownedController
+    )) {
+      return;
+    }
+    this._commitStagedGeneResult({
+      ownedResult,
+      stagedResult: staged.stagedResult,
+      canonicalMatrix: staged.canonicalMatrix,
+      mode
+    });
+  }
 
-    const nextRevision = ++this._optionRenderRevision;
-    void this._rerenderAfterOptionChange(nextRevision);
+  _refreshMarkersAndHeatmapFromThresholds(
+    revision,
+    requestedOptions = this._requestedPlotOptions
+  ) {
+    return this._reconcileGeneHeatmapIntent(
+      revision,
+      structuredClone(requestedOptions),
+      this._modalGeneListMode
+    );
+  }
+
+  _refreshHeatmapTransform(
+    revision,
+    transform,
+    requestedOptions = this._requestedPlotOptions
+  ) {
+    return this._reconcileGeneHeatmapIntent(
+      revision,
+      {
+        ...structuredClone(requestedOptions),
+        transform
+      },
+      this._modalGeneListMode
+    );
   }
 
   // ===========================================================================
   // PRIVATE METHODS
   // ===========================================================================
+
+  /**
+   * @override
+   */
+  _discardFormResult() {
+    this._fullMatrix = null;
+    this._committedGeneListMode = null;
+    return super._discardFormResult();
+  }
 
   /**
    * Get available categorical observation fields
@@ -1368,7 +2135,11 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
    * Setup hover context for detailed gene info
    * @private
    */
-  _setupHoverContext(plotContainer, result) {
+  _setupHoverContext(
+    plotContainer,
+    result,
+    { replaceExisting = true } = {}
+  ) {
     if (
       plotContainer === null ||
       typeof plotContainer !== 'object' ||
@@ -1440,7 +2211,12 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       );
     }
 
-    this._teardownHoverContext();
+    this._hoverOwners ??= new Map();
+    if (replaceExisting) {
+      this._teardownHoverContext();
+    } else if (this._hoverOwners.has(plotContainer)) {
+      this._teardownHoverContext(plotContainer);
+    }
     const hoverContext = new HoverContext({
       container: ownerDocument.body,
       offset: 10
@@ -1562,12 +2338,18 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       );
     }
 
-    this._hoverContext = hoverContext;
-    this._hoverPlotBinding = {
+    const binding = {
       container: plotContainer,
       hoverHandler,
       unhoverHandler
     };
+    this._hoverOwners.set(plotContainer, {
+      context: hoverContext,
+      binding
+    });
+    this._hoverContext = hoverContext;
+    this._hoverPlotBinding = binding;
+    return () => this._teardownHoverContext(plotContainer);
   }
 
   /**
@@ -1671,36 +2453,58 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
    * Release both Plotly listener ownership and tooltip DOM ownership.
    * @private
    */
-  _teardownHoverContext() {
-    const binding = this._hoverPlotBinding;
-    const hoverContext = this._hoverContext;
-    this._hoverPlotBinding = null;
-    this._hoverContext = null;
-
-    const errors = [];
-    if (binding !== null) {
-      try {
-        binding.container.removeListener(
-          'plotly_hover',
-          binding.hoverHandler
-        );
-      } catch (error) {
-        errors.push(error);
-      }
-      try {
-        binding.container.removeListener(
-          'plotly_unhover',
-          binding.unhoverHandler
-        );
-      } catch (error) {
-        errors.push(error);
-      }
+  _teardownHoverContext(plotContainer = null) {
+    this._hoverOwners ??= new Map();
+    const owners = [];
+    if (plotContainer !== null) {
+      const owner = this._hoverOwners.get(plotContainer);
+      if (owner !== undefined) owners.push(owner);
+      this._hoverOwners.delete(plotContainer);
+    } else if (this._hoverOwners.size > 0) {
+      owners.push(...this._hoverOwners.values());
+      this._hoverOwners.clear();
+    } else if (
+      this._hoverPlotBinding !== null ||
+      this._hoverContext !== null
+    ) {
+      owners.push({
+        binding: this._hoverPlotBinding,
+        context: this._hoverContext
+      });
     }
-    if (hoverContext !== null) {
-      try {
-        hoverContext.destroy();
-      } catch (error) {
-        errors.push(error);
+    if (
+      plotContainer === null ||
+      this._hoverPlotBinding?.container === plotContainer
+    ) {
+      this._hoverPlotBinding = null;
+      this._hoverContext = null;
+    }
+    const errors = [];
+    for (const { binding, context: hoverContext } of owners) {
+      if (binding != null) {
+        try {
+          binding.container.removeListener(
+            'plotly_hover',
+            binding.hoverHandler
+          );
+        } catch (error) {
+          errors.push(error);
+        }
+        try {
+          binding.container.removeListener(
+            'plotly_unhover',
+            binding.unhoverHandler
+          );
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      if (hoverContext != null) {
+        try {
+          hoverContext.destroy();
+        } catch (error) {
+          errors.push(error);
+        }
       }
     }
     if (errors.length === 1) throw errors[0];
@@ -1721,8 +2525,8 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
    * @param {number} progress.progress - Progress percentage (0-100)
    * @param {string} progress.message - Progress message
    */
-  _updateProgress(progress) {
-    if (!this._progressTracker) return;
+  _updateProgress(progress, progressTracker = this._progressTracker) {
+    if (!progressTracker) return;
 
     const { phase, progress: percent, loaded, total, message } = progress || {};
 
@@ -1730,39 +2534,40 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     // notification doesn't appear "stuck" on the initial phase.
     if (typeof phase === 'string' && phase.length > 0) {
       // If phase changes, reset the per-phase counters for a sane ETA.
-      const prevPhase = this._progressTracker.getStats()?.phase;
+      const prevPhase = progressTracker.getStats()?.phase;
       if (prevPhase !== phase) {
-        this._progressTracker.setPhase(phase);
-        this._progressTracker.setTotalItems(100);
-        this._progressTracker.setCompletedItems(0);
+        progressTracker.setPhase(phase);
+        progressTracker.setTotalItems(100);
+        progressTracker.setCompletedItems(0);
       } else {
-        this._progressTracker.setPhase(phase);
+        progressTracker.setPhase(phase);
       }
     }
 
     if (Number.isFinite(total) && total > 0) {
-      this._progressTracker.setTotalItems(total);
+      progressTracker.setTotalItems(total);
     }
 
     if (Number.isFinite(loaded)) {
-      this._progressTracker.setCompletedItems(loaded);
+      progressTracker.setCompletedItems(loaded);
     } else if (Number.isFinite(percent)) {
       // For phases that only report percentage (e.g., init/clustering), treat
       // the phase total as 100.
       if (!Number.isFinite(total) || total <= 0) {
-        this._progressTracker.setTotalItems(100);
+        progressTracker.setTotalItems(100);
       }
-      this._progressTracker.setCompletedItems(Math.floor(percent));
+      progressTracker.setCompletedItems(Math.floor(percent));
     }
 
     const displayMessage = message || (phase ? `${phase}...` : 'Working...');
-    this._progressTracker.setMessage(displayMessage);
+    progressTracker.setMessage(displayMessage);
   }
 
   /**
    * @override
    */
   destroy() {
+    if (this._destroyPromise != null) return this._destroyPromise;
     const errors = [];
     const progressTracker = this._progressTracker;
     this._progressTracker = null;
@@ -1780,25 +2585,33 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     }
     const controller = this._controller;
     this._controller = null;
-    if (controller !== null) {
+    if (controller !== null && controller !== undefined) {
       try {
-        controller.close();
+        const closeTask = controller.close();
+        if (closeTask && typeof closeTask.then === 'function') {
+          this._registerFormDestroyTask(closeTask);
+        }
       } catch (error) {
         errors.push(error);
       }
     }
-    try {
-      super.destroy();
-    } catch (error) {
-      errors.push(error);
-    }
-    if (errors.length === 1) throw errors[0];
-    if (errors.length > 1) {
-      throw new AggregateError(
-        errors,
-        'Marker Genes UI cleanup failed'
-      );
-    }
+    const parentTask = super.destroy();
+    if (errors.length === 0) return parentTask;
+    const destruction = Promise.resolve(parentTask).then(
+      () => {
+        if (errors.length === 1) throw errors[0];
+        throw new AggregateError(errors, 'Marker Genes UI cleanup failed');
+      },
+      parentError => {
+        throw new AggregateError(
+          [...errors, parentError],
+          'Marker Genes UI cleanup failed'
+        );
+      }
+    );
+    this._destroyPromise = destruction;
+    void destruction.catch(() => {});
+    return destruction;
   }
 
   exportSettings() {

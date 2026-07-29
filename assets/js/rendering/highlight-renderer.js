@@ -7,6 +7,22 @@ const HIGHLIGHT_MODE_VALUES = Object.freeze([
   'continuous',
   'categorical',
 ]);
+const HIGHLIGHT_CANVAS_CLASSES = Object.freeze([
+  'selecting',
+  'selecting-continuous',
+  'highlight-continuous',
+  'highlight-categorical',
+  'lassoing',
+  'lasso-mode',
+  'proximity-dragging',
+  'proximity-mode',
+  'knn-dragging',
+  'knn-mode',
+]);
+// CPU transparency is Float32Array-backed and GLSL `0.01` is a float. Use the
+// same representable boundary so a point is selectable exactly when the point
+// shader keeps it visible.
+const HIGHLIGHT_VISIBILITY_THRESHOLD = Math.fround(0.01);
 
 function requireHighlightMode(mode) {
   if (!HIGHLIGHT_MODE_VALUES.includes(mode)) {
@@ -84,6 +100,65 @@ function requireHighlightTransparency(transparency, pointCount) {
   return transparency;
 }
 
+function requireSpatialQueryOwner(owner, expectedViewId) {
+  const exactViewId = requireHighlightViewId(
+    expectedViewId,
+    'Spatial-query owner viewId'
+  );
+  if (
+    owner === null ||
+    typeof owner !== 'object' ||
+    Array.isArray(owner) ||
+    owner.viewId !== exactViewId
+  ) {
+    throw new Error(
+      `Spatial-query owner must match exact view "${exactViewId}".`
+    );
+  }
+  const positions = requireHighlightPositions(
+    owner.positions,
+    `Spatial-query owner positions for view "${exactViewId}"`
+  );
+  const publishedPositions = requireHighlightPositions(
+    owner.publishedPositions ?? positions,
+    `Spatial-query published positions for view "${exactViewId}"`
+  );
+  const pointCount = positions.length / 3;
+  if (publishedPositions.length !== positions.length) {
+    throw new Error(
+      `Spatial-query positions for view "${exactViewId}" must have one exact point count.`
+    );
+  }
+  const transparency = requireHighlightTransparency(
+    owner.transparency,
+    pointCount
+  );
+  const dimensionLevel = requireHighlightDimension(owner.dimensionLevel);
+  const spatialIndex = owner.spatialIndex ?? null;
+  if (
+    spatialIndex !== null &&
+    (
+      typeof spatialIndex !== 'object' ||
+      spatialIndex.pointCount !== pointCount ||
+      spatialIndex.positions !== positions ||
+      typeof spatialIndex.visitRadiusCandidates !== 'function' ||
+      typeof spatialIndex.visitProjectedRectCandidates !== 'function'
+    )
+  ) {
+    throw new Error(
+      `Spatial-query owner for view "${exactViewId}" has no exact matching index.`
+    );
+  }
+  return {
+    viewId: exactViewId,
+    positions,
+    publishedPositions,
+    transparency,
+    dimensionLevel,
+    spatialIndex,
+  };
+}
+
 function requireHighlightMatrix(matrix, label) {
   if (!(matrix instanceof Float32Array) || matrix.length !== 16) {
     throw new TypeError(`${label} must be a Float32Array with exactly 16 entries.`);
@@ -158,10 +233,19 @@ function captureHighlightViewport(viewport, mat4, label) {
   const exactViewport = requireHighlightViewport(viewport, label);
   const projectionMatrix = mat4.create();
   mat4.copy(projectionMatrix, exactViewport.projectionMatrix);
+  let effectiveViewMatrix = null;
+  if (exactViewport.effectiveViewMatrix !== null) {
+    effectiveViewMatrix = mat4.create();
+    mat4.copy(
+      effectiveViewMatrix,
+      exactViewport.effectiveViewMatrix
+    );
+  }
   const cameraForward = new Float32Array(exactViewport.cameraForward);
   return {
     ...exactViewport,
     projectionMatrix,
+    effectiveViewMatrix,
     cameraForward
   };
 }
@@ -230,6 +314,10 @@ export class HighlightRenderer {
     // Per-view GPU buffers + bookkeeping (fixes multi-view race condition)
     // Map<viewId, { buffer, pointCount, lodSignature, positionsFingerprint }>
     this._viewBuffers = new Map();
+    this._pendingBufferDeletes = new Set();
+    this._pendingProgramDeletes = new Set();
+    this._disposeStarted = false;
+    this._disposed = false;
 
     // Track total highlighted count across all views (for UI feedback)
     this._totalHighlightedCount = 0;
@@ -501,6 +589,7 @@ export class HighlightRenderer {
       viewBuffer.pointCount = 0;
       viewBuffer.lodSignature = sigValue;
       viewBuffer.positionsFingerprint = positionsFingerprint;
+      this._recomputeTotalHighlightedCount();
       return;
     }
 
@@ -587,26 +676,105 @@ export class HighlightRenderer {
   clearViewBuffer(viewId) {
     const vid = requireHighlightViewId(viewId);
     const viewBuffer = this._viewBuffers.get(vid);
-    if (viewBuffer && viewBuffer.buffer) {
-      this.gl.deleteBuffer(viewBuffer.buffer);
-    }
+    // Detach the logical view first. A failed WebGL deletion must never leave a
+    // half-retired buffer dispatchable through the view map.
     this._viewBuffers.delete(vid);
-    // Recompute total after removing a view
+    if (viewBuffer?.buffer) {
+      this._pendingBufferDeletes.add(viewBuffer.buffer);
+      viewBuffer.buffer = null;
+    }
     this._recomputeTotalHighlightedCount();
+
+    const failures = this._flushPendingResourceDeletes();
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        `Highlight view "${vid}" retirement retains ${failures.length} pending resource failure(s).`
+      );
+    }
+    return viewBuffer !== undefined;
+  }
+
+  _flushPendingResourceDeletes({ includePrograms = false } = {}) {
+    const failures = [];
+    for (const buffer of this._pendingBufferDeletes) {
+      try {
+        this.gl.deleteBuffer(buffer);
+        this._pendingBufferDeletes.delete(buffer);
+      } catch (error) {
+        failures.push(
+          error instanceof Error
+            ? error
+            : new Error(
+              'Highlight buffer deletion failed with a non-Error value.',
+              { cause: error }
+            )
+        );
+      }
+    }
+    if (includePrograms) {
+      for (const program of this._pendingProgramDeletes) {
+        try {
+          this.gl.deleteProgram(program);
+          this._pendingProgramDeletes.delete(program);
+        } catch (error) {
+          failures.push(
+            error instanceof Error
+              ? error
+              : new Error(
+                'Highlight program deletion failed with a non-Error value.',
+                { cause: error }
+              )
+          );
+        }
+      }
+    }
+    return failures;
   }
 
   /**
    * Dispose all GPU resources
    */
   dispose() {
-    const gl = this.gl;
-    for (const [, viewBuffer] of this._viewBuffers) {
-      if (viewBuffer.buffer) {
-        gl.deleteBuffer(viewBuffer.buffer);
+    if (this._disposed) return false;
+
+    if (!this._disposeStarted) {
+      this._disposeStarted = true;
+
+      // Detach the complete live publication before the first fallible GL
+      // operation. Pending sets remain authoritative across disposal retries.
+      for (const viewBuffer of this._viewBuffers.values()) {
+        if (viewBuffer.buffer) {
+          this._pendingBufferDeletes.add(viewBuffer.buffer);
+          viewBuffer.buffer = null;
+        }
       }
+      this._viewBuffers.clear();
+      if (this.program) this._pendingProgramDeletes.add(this.program);
+      this.program = null;
+
+      this._totalHighlightedCount = 0;
+      this._highlightedIndicesCache = null;
+      this._highlightDataRef = null;
+      this._highlightDataFingerprint = 0;
+      this.attribLocations = null;
+      this.uniformLocations = null;
+      this.hpRenderer = null;
     }
-    this._viewBuffers.clear();
-    this._totalHighlightedCount = 0;
+
+    const failures = this._flushPendingResourceDeletes({
+      includePrograms: true,
+    });
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        `HighlightRenderer disposal retains ${failures.length} pending resource failure(s).`
+      );
+    }
+
+    this._disposed = true;
+    this.gl = null;
+    return true;
   }
 
   /**
@@ -714,11 +882,68 @@ export class HighlightRenderer {
 // 2D OVERLAY & HIGHLIGHT TOOLS (LASSO, PROXIMITY, KNN)
 // ============================================================================
 
+const lassoParentPositionOwners = new WeakMap();
+
+function acquireLassoParentPosition(parentElement) {
+  const existing = lassoParentPositionOwners.get(parentElement);
+  if (existing) {
+    existing.ownerCount++;
+    return { parentElement, record: existing, released: false };
+  }
+
+  const previousInlinePosition = parentElement.style.position;
+  const computedPosition = window.getComputedStyle(parentElement).position;
+  const changedInlinePosition = computedPosition === 'static';
+  if (changedInlinePosition) {
+    parentElement.style.position = 'relative';
+  }
+  const record = {
+    ownerCount: 1,
+    previousInlinePosition,
+    changedInlinePosition,
+  };
+  lassoParentPositionOwners.set(parentElement, record);
+  return { parentElement, record, released: false };
+}
+
+function releaseLassoParentPosition(lease) {
+  if (!lease || lease.released) return;
+  const { parentElement, record } = lease;
+  const current = lassoParentPositionOwners.get(parentElement);
+  if (current !== record) {
+    lease.released = true;
+    return;
+  }
+  if (record.ownerCount > 1) {
+    record.ownerCount--;
+    lease.released = true;
+    return;
+  }
+
+  // Restore only the inline value owned by this overlay generation. If another
+  // component changed the parent meanwhile, its newer publication wins.
+  if (
+    record.changedInlinePosition &&
+    parentElement.style.position === 'relative'
+  ) {
+    parentElement.style.position = record.previousInlinePosition;
+  }
+  lassoParentPositionOwners.delete(parentElement);
+  lease.released = true;
+}
+
 /**
  * Create a 2D overlay canvas attached to the same parent as the main canvas.
- * Returns { lassoCanvas, lassoCtx }.
+ * Returns the canvas, context, resize subscription, and parent-style lease.
  */
 export function createLassoOverlay(canvas) {
+  const parentElement = canvas.parentElement;
+  if (!parentElement) {
+    throw new Error(
+      'Highlight lasso overlay requires the main canvas to have a parent element.'
+    );
+  }
+
   const lassoCanvas = document.createElement('canvas');
   lassoCanvas.id = 'lasso-overlay';
   lassoCanvas.style.cssText = `
@@ -730,11 +955,13 @@ export function createLassoOverlay(canvas) {
     pointer-events: none;
     z-index: 10;
   `;
-  canvas.parentElement.style.position = 'relative';
-  canvas.parentElement.appendChild(lassoCanvas);
-  const lassoCtx = lassoCanvas.getContext('2d');
+  const parentPositionLease = acquireLassoParentPosition(parentElement);
+  let lassoCtx = null;
+  let observer = null;
+  let resizeSubscriptionActive = true;
 
   function syncLassoCanvasSize() {
+    if (!resizeSubscriptionActive) return;
     const rect = canvas.getBoundingClientRect();
     const dpr = window.devicePixelRatio || 1;
     lassoCanvas.width = rect.width * dpr;
@@ -745,11 +972,55 @@ export function createLassoOverlay(canvas) {
     lassoCtx.scale(dpr, dpr);
   }
 
-  syncLassoCanvasSize();
-  const observer = new ResizeObserver(syncLassoCanvasSize);
-  observer.observe(canvas);
+  try {
+    parentElement.appendChild(lassoCanvas);
+    lassoCtx = lassoCanvas.getContext('2d');
+    if (!lassoCtx) {
+      throw new Error('Unable to allocate the highlight lasso 2D context.');
+    }
+    syncLassoCanvasSize();
+    observer = new ResizeObserver(syncLassoCanvasSize);
+    observer.observe(canvas);
+  } catch (error) {
+    resizeSubscriptionActive = false;
+    const cleanupFailures = [];
+    try {
+      observer?.disconnect();
+    } catch (cleanupError) {
+      cleanupFailures.push(cleanupError);
+    }
+    try {
+      lassoCanvas.remove();
+    } catch (cleanupError) {
+      cleanupFailures.push(cleanupError);
+    }
+    try {
+      releaseLassoParentPosition(parentPositionLease);
+    } catch (cleanupError) {
+      cleanupFailures.push(cleanupError);
+    }
+    if (cleanupFailures.length > 0) {
+      throw new AggregateError(
+        [error, ...cleanupFailures],
+        'Highlight lasso overlay construction and rollback both failed.'
+      );
+    }
+    throw error;
+  }
 
-  return { lassoCanvas, lassoCtx };
+  const resizeSubscription = {
+    disconnect() {
+      // Fence an already-queued callback before the fallible observer cleanup.
+      resizeSubscriptionActive = false;
+      observer.disconnect();
+    },
+  };
+  return {
+    lassoCanvas,
+    lassoCtx,
+    resizeSubscription,
+    parentPositionLease,
+  };
 }
 
 export function drawLasso({ canvas, lassoCtx, lassoPath }) {
@@ -872,11 +1143,18 @@ export function clearProximityOverlay({ canvas, lassoCtx }) {
   clearLassoOverlay({ canvas, lassoCtx });
 }
 
+/**
+ * Return the exact proximity-selection cell-ID set. With a spatial index the
+ * array follows spatial traversal order; callers must treat cell IDs as an
+ * unordered selection set (there is no distance/rank meaning in this API).
+ */
 export function findCellsInProximity({
   transparencyArray,
   centerPos,
   radius3D,
-  viewPositions
+  viewPositions,
+  spatialIndex = null,
+  queryStats = null
 }) {
   const positions = requireHighlightPositions(
     viewPositions,
@@ -902,22 +1180,58 @@ export function findCellsInProximity({
     );
   }
   if (radius3D === 0) return [];
+  if (
+    spatialIndex !== null &&
+    (
+      typeof spatialIndex !== 'object' ||
+      spatialIndex.pointCount !== pointCount ||
+      spatialIndex.positions !== positions ||
+      typeof spatialIndex.visitRadiusCandidates !== 'function'
+    )
+  ) {
+    throw new TypeError(
+      'Proximity-selection spatialIndex must be null or an exact matching spatial owner.'
+    );
+  }
+  if (
+    queryStats !== null &&
+    (
+      typeof queryStats !== 'object' ||
+      Array.isArray(queryStats)
+    )
+  ) {
+    throw new TypeError('Proximity-selection queryStats must be null or an object.');
+  }
 
   const selectedIndices = [];
   const radiusSq = radius3D * radius3D;
-
-  // Brute-force search - fast enough for interactive brush selection
-  const n = positions.length / 3;
-  for (let i = 0; i < n; i++) {
+  let examinedPointCount = 0;
+  const evaluatePoint = i => {
+    examinedPointCount++;
     // Cell is selectable only if visible (not filtered out in this view)
     // Filtered-out cells cannot be interacted with, even if highlighted in another view
-    if (alphas[i] <= 0) continue;
+    if (!(alphas[i] >= HIGHLIGHT_VISIBILITY_THRESHOLD)) return;
     const dx = positions[i * 3] - centerPos[0];
     const dy = positions[i * 3 + 1] - centerPos[1];
     const dz = positions[i * 3 + 2] - centerPos[2];
     if (dx * dx + dy * dy + dz * dz <= radiusSq) {
       selectedIndices.push(i);
     }
+  };
+
+  if (spatialIndex === null) {
+    for (let i = 0; i < pointCount; i++) {
+      evaluatePoint(i);
+    }
+  } else {
+    spatialIndex.visitRadiusCandidates(
+      centerPos,
+      radius3D,
+      evaluatePoint
+    );
+  }
+  if (queryStats !== null) {
+    queryStats.examinedPointCount = examinedPointCount;
   }
 
   return selectedIndices;
@@ -938,6 +1252,7 @@ export class HighlightTools {
     getNavigationState,
     getViewPositions,
     getViewTransparency,
+    getSpatialQueryOwner,
     startTime = performance.now(),
     shaderQuality = 'full'
   }) {
@@ -949,6 +1264,7 @@ export class HighlightTools {
       ['getNavigationState', getNavigationState],
       ['getViewPositions', getViewPositions],
       ['getViewTransparency', getViewTransparency],
+      ['getSpatialQueryOwner', getSpatialQueryOwner],
     ]) {
       if (typeof callback !== 'function') {
         throw new TypeError(`HighlightTools ${name} must be a function.`);
@@ -966,13 +1282,38 @@ export class HighlightTools {
     this.getNavigationState = getNavigationState;
     this.getViewPositions = getViewPositions;
     this.getViewTransparency = getViewTransparency;
+    this.getSpatialQueryOwner = getSpatialQueryOwner;
 
     this.highlightRenderer = new HighlightRenderer(gl, hpRenderer, startTime);
-    this.highlightRenderer.setQuality(shaderQuality);
+    let lassoOverlay;
+    try {
+      this.highlightRenderer.setQuality(shaderQuality);
+      lassoOverlay = createLassoOverlay(canvas);
+    } catch (error) {
+      try {
+        this.highlightRenderer.dispose();
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          'HighlightTools construction and renderer rollback both failed.'
+        );
+      }
+      throw error;
+    }
 
-    const { lassoCanvas, lassoCtx } = createLassoOverlay(canvas);
+    const {
+      lassoCanvas,
+      lassoCtx,
+      resizeSubscription,
+      parentPositionLease,
+    } = lassoOverlay;
     this.lassoCanvas = lassoCanvas;
     this.lassoCtx = lassoCtx;
+    this._lassoResizeSubscription = resizeSubscription;
+    this._lassoParentPositionLease = parentPositionLease;
+    this._previousCanvasCursor = canvas.style.cursor;
+    this._disposeState = null;
+    this._disposed = false;
 
     this.highlightArray = null;
     this.highlightMode = 'none';
@@ -998,6 +1339,7 @@ export class HighlightTools {
     this.lassoPreviewCallback = null;
     this.lassoStepCallback = null;
     this.lassoMode = 'intersect';
+    this._lassoPreviewPublished = false;
 
     this.proximityEnabled = false;
     this.isProximityDragging = false;
@@ -1006,6 +1348,7 @@ export class HighlightTools {
     this.proximityCallback = null;
     this.proximityPreviewCallback = null;
     this.proximityStepCallback = null;
+    this._proximityPreviewPublished = false;
 
     this.knnEnabled = false;
     this.isKnnDragging = false;
@@ -1185,8 +1528,115 @@ export class HighlightTools {
     }
   }
 
+  _retireActiveSpatialInteractions(viewId = null) {
+    const exactViewId = viewId === null
+      ? null
+      : requireHighlightViewId(viewId);
+    let retired = false;
+    let lassoRetirementEvent = null;
+    let proximityRetirementEvent = null;
+    if (
+      this.isLassoing &&
+      (
+        exactViewId === null ||
+        this.lassoViewContext?.viewId === exactViewId
+      )
+    ) {
+      if (
+        this._lassoPreviewPublished &&
+        this.lassoPreviewCallback &&
+        this.lassoPath.length >= 3
+      ) {
+        lassoRetirementEvent = {
+          type: 'lasso-preview',
+          cellIndices: [],
+          cellCount: 0,
+          polygon: this.lassoPath.map(point => ({
+            x: point.x,
+            y: point.y,
+          })),
+        };
+      }
+      this.isLassoing = false;
+      this.canvas.classList.remove('lassoing');
+      clearLassoOverlay({ canvas: this.canvas, lassoCtx: this.lassoCtx });
+      this.lassoPath = [];
+      this.lassoViewContext = null;
+      this._lassoPreviewPublished = false;
+      retired = true;
+    }
+    if (
+      this.isProximityDragging &&
+      (
+        exactViewId === null ||
+        this.proximityCenter?.viewId === exactViewId
+      )
+    ) {
+      if (
+        this._proximityPreviewPublished &&
+        this.proximityPreviewCallback
+      ) {
+        proximityRetirementEvent = {
+          type: 'proximity-preview',
+          cellIndices: [],
+          cellCount: 0,
+          newCellCount: 0,
+          centerCellIndex:
+            this.proximityCenter?.cellIndex ?? -1,
+          radius: this.proximityCurrentRadius,
+          mode:
+            this.proximityCenter?.mode ?? 'intersect',
+        };
+      }
+      this.isProximityDragging = false;
+      this.canvas.classList.remove('proximity-dragging');
+      clearProximityOverlay({
+        canvas: this.canvas,
+        lassoCtx: this.lassoCtx
+      });
+      this.proximityCenter = null;
+      this.proximityCurrentRadius = 0;
+      this._proximityPreviewPublished = false;
+      retired = true;
+    }
+    if (retired) this.updateCursorForHighlightMode();
+    if (lassoRetirementEvent !== null) {
+      this.lassoPreviewCallback(lassoRetirementEvent);
+    }
+    if (proximityRetirementEvent !== null) {
+      this.proximityPreviewCallback(proximityRetirementEvent);
+    }
+    return retired;
+  }
+
+  retireSpatialInteractions(viewId) {
+    return this._retireActiveSpatialInteractions(
+      requireHighlightViewId(viewId)
+    );
+  }
+
+  _spatialQueryOwnerIsCurrent(capturedOwner) {
+    try {
+      const currentOwner = requireSpatialQueryOwner(
+        this.getSpatialQueryOwner(capturedOwner.viewId, false),
+        capturedOwner.viewId
+      );
+      return (
+        currentOwner.positions === capturedOwner.positions &&
+        currentOwner.publishedPositions ===
+          capturedOwner.publishedPositions &&
+        currentOwner.transparency === capturedOwner.transparency &&
+        currentOwner.dimensionLevel === capturedOwner.dimensionLevel &&
+        currentOwner.spatialIndex === capturedOwner.spatialIndex
+      );
+    } catch {
+      return false;
+    }
+  }
+
   clearViewState(viewId) {
     const vid = requireHighlightViewId(viewId);
+    this._retireActiveSpatialInteractions(vid);
     this._lastUsedPositionsMap.delete(vid);
     this._lastPositionFingerprintMap.delete(vid);
     this._lastTransparencyFingerprintMap.delete(vid);
@@ -1435,11 +1885,9 @@ export class HighlightTools {
     this.lassoEnabled = requireExactBoolean(enabled, 'Lasso selection state');
     if (!this.lassoEnabled) {
       if (this.isLassoing) {
-        this.isLassoing = false;
-        clearLassoOverlay({ canvas: this.canvas, lassoCtx: this.lassoCtx });
-        this.lassoPath = [];
-        this.lassoViewContext = null;
-        this.canvas.classList.remove('lassoing');
+        this._retireActiveSpatialInteractions(
+          this.lassoViewContext?.viewId ?? null
+        );
       }
     }
     if (this.lassoEnabled) {
@@ -1467,8 +1915,10 @@ export class HighlightTools {
 
   clearLasso() {
     if (this.isLassoing) {
-      this.isLassoing = false;
-      this.canvas.classList.remove('lassoing');
+      this._retireActiveSpatialInteractions(
+        this.lassoViewContext?.viewId ?? null
+      );
+      return;
     }
     clearLassoOverlay({ canvas: this.canvas, lassoCtx: this.lassoCtx });
     this.lassoPath = [];
@@ -1504,6 +1954,11 @@ export class HighlightTools {
   }
 
   cancelLassoSelection() {
+    if (this.isLassoing) {
+      this._retireActiveSpatialInteractions(
+        this.lassoViewContext?.viewId ?? null
+      );
+    }
     this.lassoCandidateSet = null;
     this.lassoStepCount = 0;
     if (this.lassoStepCallback) {
@@ -1534,9 +1989,9 @@ export class HighlightTools {
     );
     if (!this.proximityEnabled) {
       if (this.isProximityDragging) {
-        this.isProximityDragging = false;
-        clearProximityOverlay({ canvas: this.canvas, lassoCtx: this.lassoCtx });
-        this.canvas.classList.remove('proximity-dragging');
+        this._retireActiveSpatialInteractions(
+          this.proximityCenter?.viewId ?? null
+        );
       }
     }
     if (this.proximityEnabled) {
@@ -1597,6 +2052,11 @@ export class HighlightTools {
   }
 
   cancelProximitySelection() {
+    if (this.isProximityDragging) {
+      this._retireActiveSpatialInteractions(
+        this.proximityCenter?.viewId ?? null
+      );
+    }
     this.proximityCandidateSet = null;
     this.proximityStepCount = 0;
     if (this.proximityStepCallback) {
@@ -1606,14 +2066,6 @@ export class HighlightTools {
         candidates: [],
         cancelled: true
       });
-    }
-    if (this.isProximityDragging) {
-      this.isProximityDragging = false;
-      this.canvas.classList.remove('proximity-dragging');
-      clearProximityOverlay({ canvas: this.canvas, lassoCtx: this.lassoCtx });
-      this.proximityCenter = null;
-      this.proximityCurrentRadius = 0;
-      this.updateCursorForHighlightMode();
     }
   }
 
@@ -1815,6 +2267,7 @@ export class HighlightTools {
   }
 
   handleWindowBlur() {
+    this._retireActiveSpatialInteractions();
     this.altKeyDown = false;
     this.updateCursorForHighlightMode();
   }
@@ -1828,16 +2281,6 @@ export class HighlightTools {
       const localX = e.clientX - rect.left;
       const localY = e.clientY - rect.top;
 
-      this.isLassoing = true;
-      if (e.ctrlKey || e.metaKey) {
-        this.lassoMode = 'subtract';
-      } else if (e.shiftKey) {
-        this.lassoMode = 'union';
-      } else {
-        this.lassoMode = 'intersect';
-      }
-      this.lassoPath = [{ x: localX, y: localY }];
-
       const vpInfo = captureHighlightViewport(
         this.getViewportInfoAtScreen(e.clientX, e.clientY),
         this.mat4,
@@ -1847,15 +2290,40 @@ export class HighlightTools {
         vpInfo.viewId,
         'Lasso interaction viewId'
       );
+      const spatialOwner = requireSpatialQueryOwner(
+        this.getSpatialQueryOwner(viewId, true),
+        viewId
+      );
       const capturedViewMatrix = this.mat4.create();
       const sourceViewMatrix = vpInfo.effectiveViewMatrix === null
         ? requireHighlightMatrix(ctx.viewMatrix, 'Lasso interaction view matrix')
         : vpInfo.effectiveViewMatrix;
       this.mat4.copy(capturedViewMatrix, sourceViewMatrix);
+      const capturedModelMatrix = this.mat4.create();
+      this.mat4.copy(
+        capturedModelMatrix,
+        requireHighlightMatrix(
+          ctx.modelMatrix,
+          'Lasso interaction model matrix'
+        )
+      );
+
+      this.isLassoing = true;
+      if (e.ctrlKey || e.metaKey) {
+        this.lassoMode = 'subtract';
+      } else if (e.shiftKey) {
+        this.lassoMode = 'union';
+      } else {
+        this.lassoMode = 'intersect';
+      }
+      this.lassoPath = [{ x: localX, y: localY }];
+      this._lassoPreviewPublished = false;
       this.lassoViewContext = {
         viewId,
         viewport: vpInfo,
-        viewMatrix: capturedViewMatrix
+        viewMatrix: capturedViewMatrix,
+        modelMatrix: capturedModelMatrix,
+        spatialOwner
       };
 
       this.canvas.style.cursor = 'crosshair';
@@ -1878,9 +2346,26 @@ export class HighlightTools {
         vpInfo.viewId,
         'Proximity interaction viewId'
       );
-      const positions = requireHighlightPositions(
-        this.getViewPositions(viewId),
-        'Proximity interaction view positions'
+      const spatialOwner = requireSpatialQueryOwner(
+        this.getSpatialQueryOwner(viewId, true),
+        viewId
+      );
+      const positions = spatialOwner.positions;
+      const capturedViewMatrix = this.mat4.create();
+      const sourceViewMatrix = vpInfo.effectiveViewMatrix === null
+        ? requireHighlightMatrix(
+          ctx.viewMatrix,
+          'Proximity interaction view matrix'
+        )
+        : vpInfo.effectiveViewMatrix;
+      this.mat4.copy(capturedViewMatrix, sourceViewMatrix);
+      const capturedModelMatrix = this.mat4.create();
+      this.mat4.copy(
+        capturedModelMatrix,
+        requireHighlightMatrix(
+          ctx.modelMatrix,
+          'Proximity interaction model matrix'
+        )
       );
 
       let proximityMode = 'intersect';
@@ -1954,9 +2439,13 @@ export class HighlightTools {
           cellIndex: clickedCellIdx,
           mode: proximityMode,
           viewport: vpInfo,
-          viewId: viewId  // Store viewId for multi-dimensional support
+          viewId,
+          viewMatrix: capturedViewMatrix,
+          modelMatrix: capturedModelMatrix,
+          spatialOwner
         };
         this.proximityCurrentRadius = 0;
+        this._proximityPreviewPublished = false;
         this.isProximityDragging = true;
         this.canvas.style.cursor = 'crosshair';
         this.canvas.classList.add('proximity-dragging');
@@ -1966,8 +2455,8 @@ export class HighlightTools {
           proximityCenter: this.proximityCenter,
           proximityCurrentRadius: this.proximityCurrentRadius,
           mat4: this.mat4,
-          viewMatrix: ctx.viewMatrix,
-          modelMatrix: ctx.modelMatrix
+          viewMatrix: capturedViewMatrix,
+          modelMatrix: capturedModelMatrix
         });
         e.preventDefault();
         return true;
@@ -2071,6 +2560,16 @@ export class HighlightTools {
     const ctx = this.getRenderContext();
 
     if (this.isLassoing) {
+      const spatialOwner = this.lassoViewContext?.spatialOwner;
+      if (
+        !spatialOwner ||
+        !this._spatialQueryOwnerIsCurrent(spatialOwner)
+      ) {
+        this._retireActiveSpatialInteractions(
+          this.lassoViewContext?.viewId ?? null
+        );
+        return true;
+      }
       const rect = this.canvas.getBoundingClientRect();
       const localX = e.clientX - rect.left;
       const localY = e.clientY - rect.top;
@@ -2084,21 +2583,16 @@ export class HighlightTools {
         drawLasso({ canvas: this.canvas, lassoCtx: this.lassoCtx, lassoPath: this.lassoPath });
 
         if (this.lassoPreviewCallback && this.lassoPath.length >= 3) {
-          // Get view-specific positions and transparency for multi-view support
-          const viewId = requireHighlightViewId(
-            this.lassoViewContext?.viewId,
-            'Lasso-preview viewId'
-          );
-          const viewPositions = this.getViewPositions(viewId);
-          const viewTransparency = this.getViewTransparency(viewId);
           const previewIndices = findCellsInLasso({
             lassoPath: this.lassoPath,
             lassoViewContext: this.lassoViewContext,
             mat4: this.mat4,
-            modelMatrix: ctx.modelMatrix,
-            transparencyArray: viewTransparency,
-            viewPositions
+            modelMatrix: this.lassoViewContext.modelMatrix,
+            transparencyArray: spatialOwner.transparency,
+            viewPositions: spatialOwner.positions,
+            spatialIndex: spatialOwner.spatialIndex
           });
+          this._lassoPreviewPublished = true;
           this.lassoPreviewCallback({
             type: 'lasso-preview',
             cellIndices: previewIndices,
@@ -2111,6 +2605,16 @@ export class HighlightTools {
     }
 
     if (this.isProximityDragging && this.proximityCenter) {
+      const spatialOwner = this.proximityCenter.spatialOwner;
+      if (
+        !spatialOwner ||
+        !this._spatialQueryOwnerIsCurrent(spatialOwner)
+      ) {
+        this._retireActiveSpatialInteractions(
+          this.proximityCenter.viewId
+        );
+        return true;
+      }
       const dx = e.clientX - this.proximityCenter.screenX;
       const dy = e.clientY - this.proximityCenter.screenY;
       const pixelDist = Math.sqrt(dx * dx + dy * dy);
@@ -2126,23 +2630,17 @@ export class HighlightTools {
         proximityCenter: this.proximityCenter,
         proximityCurrentRadius: this.proximityCurrentRadius,
         mat4: this.mat4,
-        viewMatrix: ctx.viewMatrix,
-        modelMatrix: ctx.modelMatrix
+        viewMatrix: this.proximityCenter.viewMatrix,
+        modelMatrix: this.proximityCenter.modelMatrix
       });
 
       if (this.proximityPreviewCallback && this.proximityCurrentRadius > 0) {
-        // Get view-specific positions and transparency for multi-view support
-        const viewId = requireHighlightViewId(
-          this.proximityCenter.viewId,
-          'Proximity-preview viewId'
-        );
-        const viewPositions = this.getViewPositions(viewId);
-        const viewTransparency = this.getViewTransparency(viewId);
         const newIndices = findCellsInProximity({
-          transparencyArray: viewTransparency,
+          transparencyArray: spatialOwner.transparency,
           centerPos: this.proximityCenter.worldPos,
           radius3D: this.proximityCurrentRadius,
-          viewPositions
+          viewPositions: spatialOwner.positions,
+          spatialIndex: spatialOwner.spatialIndex
         });
         const mode = this.proximityCenter.mode || 'intersect';
 
@@ -2163,6 +2661,7 @@ export class HighlightTools {
           combinedIndices = [...this.proximityCandidateSet].filter(idx => newSet.has(idx));
         }
 
+        this._proximityPreviewPublished = true;
         this.proximityPreviewCallback({
           type: 'proximity-preview',
           cellIndices: combinedIndices,
@@ -2269,26 +2768,28 @@ export class HighlightTools {
   }
 
   handleMouseUp(_e) {
-    const ctx = this.getRenderContext();
-
     if (this.isLassoing) {
+      const spatialOwner = this.lassoViewContext?.spatialOwner;
+      if (
+        !spatialOwner ||
+        !this._spatialQueryOwnerIsCurrent(spatialOwner)
+      ) {
+        this._retireActiveSpatialInteractions(
+          this.lassoViewContext?.viewId ?? null
+        );
+        return true;
+      }
       this.isLassoing = false;
       this.canvas.classList.remove('lassoing');
       if (this.lassoPath.length >= 3) {
-        // Get view-specific positions and transparency for multi-view support
-        const viewId = requireHighlightViewId(
-          this.lassoViewContext?.viewId,
-          'Lasso-selection viewId'
-        );
-        const viewPositions = this.getViewPositions(viewId);
-        const viewTransparency = this.getViewTransparency(viewId);
         const selectedIndices = findCellsInLasso({
           lassoPath: this.lassoPath,
           lassoViewContext: this.lassoViewContext,
           mat4: this.mat4,
-          modelMatrix: ctx.modelMatrix,
-          transparencyArray: viewTransparency,
-          viewPositions
+          modelMatrix: this.lassoViewContext.modelMatrix,
+          transparencyArray: spatialOwner.transparency,
+          viewPositions: spatialOwner.positions,
+          spatialIndex: spatialOwner.spatialIndex
         });
         if (selectedIndices.length > 0 || this.lassoMode === 'subtract') {
           const newSet = new Set(selectedIndices);
@@ -2325,27 +2826,32 @@ export class HighlightTools {
       clearLassoOverlay({ canvas: this.canvas, lassoCtx: this.lassoCtx });
       this.lassoPath = [];
       this.lassoViewContext = null;
+      this._lassoPreviewPublished = false;
       this.updateCursorForHighlightMode();
       return true;
     }
 
     if (this.isProximityDragging && this.proximityCenter) {
+      const spatialOwner = this.proximityCenter.spatialOwner;
+      if (
+        !spatialOwner ||
+        !this._spatialQueryOwnerIsCurrent(spatialOwner)
+      ) {
+        this._retireActiveSpatialInteractions(
+          this.proximityCenter.viewId
+        );
+        return true;
+      }
       this.isProximityDragging = false;
       this.canvas.classList.remove('proximity-dragging');
 
       if (this.proximityCurrentRadius > 0) {
-        // Get view-specific positions and transparency for multi-view support
-        const viewId = requireHighlightViewId(
-          this.proximityCenter.viewId,
-          'Proximity-selection viewId'
-        );
-        const viewPositions = this.getViewPositions(viewId);
-        const viewTransparency = this.getViewTransparency(viewId);
         const newIndices = findCellsInProximity({
-          transparencyArray: viewTransparency,
+          transparencyArray: spatialOwner.transparency,
           centerPos: this.proximityCenter.worldPos,
           radius3D: this.proximityCurrentRadius,
-          viewPositions
+          viewPositions: spatialOwner.positions,
+          spatialIndex: spatialOwner.spatialIndex
         });
         const mode = this.proximityCenter.mode || 'intersect';
         const newSet = new Set(newIndices);
@@ -2386,6 +2892,7 @@ export class HighlightTools {
       clearProximityOverlay({ canvas: this.canvas, lassoCtx: this.lassoCtx });
       this.proximityCenter = null;
       this.proximityCurrentRadius = 0;
+      this._proximityPreviewPublished = false;
       this.updateCursorForHighlightMode();
       return true;
     }
@@ -2482,6 +2989,216 @@ export class HighlightTools {
     }
 
     return false;
+  }
+
+  /**
+   * Release every DOM, callback, CPU, and GPU owner held by the highlight
+   * interaction stack. Logical publications are detached before any fallible
+   * external cleanup, while the private disposal record retains only failed
+   * owners for an exact retry.
+   *
+   * @returns {boolean} true when this call completes disposal, false if already disposed
+   */
+  dispose() {
+    if (this._disposed) return false;
+
+    if (!this._disposeState) {
+      const canvas = this.canvas ?? null;
+      this._disposeState = {
+        renderer: this.highlightRenderer ?? null,
+        resizeSubscription: this._lassoResizeSubscription ?? null,
+        lassoCanvas: this.lassoCanvas ?? null,
+        parentPositionLease: this._lassoParentPositionLease ?? null,
+        canvas,
+        canvasClasses: canvas
+          ? new Set(HIGHLIGHT_CANVAS_CLASSES)
+          : new Set(),
+        cursorPending: Boolean(canvas?.style),
+        previousCanvasCursor: this._previousCanvasCursor ?? '',
+      };
+
+      // Fence every interaction and detach all public/live references before
+      // disconnecting observers, removing DOM, or deleting WebGL resources.
+      this.highlightRenderer = null;
+      this._lassoResizeSubscription = null;
+      this._lassoParentPositionLease = null;
+      this._previousCanvasCursor = null;
+      this.lassoCanvas = null;
+      this.lassoCtx = null;
+      this.canvas = null;
+
+      this.highlightArray = null;
+      this.highlightMode = 'none';
+      this.cellSelectionEnabled = false;
+      this.selectionDragStart = null;
+      this.selectionDragCurrent = null;
+      this.annotationStepCount = 0;
+      this.annotationLastMode = 'intersect';
+      this._unifiedCandidateSet = null;
+      this._unifiedStepCount = 0;
+      this.lassoEnabled = false;
+      this.lassoPath = [];
+      this.isLassoing = false;
+      this.lassoViewContext = null;
+      this.lassoMode = 'intersect';
+      this._lassoPreviewPublished = false;
+      this.proximityEnabled = false;
+      this.isProximityDragging = false;
+      this.proximityCenter = null;
+      this.proximityCurrentRadius = 0;
+      this._proximityPreviewPublished = false;
+      this.knnEnabled = false;
+      this.isKnnDragging = false;
+      this.knnSeedCell = null;
+      this.knnCurrentDegree = 0;
+      this.knnAdjacencyList = null;
+      this.knnEdgesLoaded = false;
+      this.altKeyDown = false;
+
+      for (const callbackName of [
+        'cellSelectionCallback',
+        'selectionPreviewCallback',
+        'selectionStepCallback',
+        'lassoCallback',
+        'lassoPreviewCallback',
+        'lassoStepCallback',
+        'proximityCallback',
+        'proximityPreviewCallback',
+        'proximityStepCallback',
+        'knnCallback',
+        'knnPreviewCallback',
+        'knnStepCallback',
+        'knnEdgeLoadCallback',
+        'pickCellAtScreen',
+        'screenToRay',
+        'getViewportInfoAtScreen',
+        'getRenderContext',
+        'getNavigationState',
+        'getViewPositions',
+        'getViewTransparency',
+        'getSpatialQueryOwner',
+      ]) {
+        this[callbackName] = null;
+      }
+
+      this._lastUsedPositionsMap = null;
+      this._lastPositionFingerprintMap = null;
+      this._lastTransparencyFingerprintMap = null;
+      this.gl = null;
+      this.hpRenderer = null;
+      this.mat4 = null;
+      this.vec3 = null;
+      resetKnnCache();
+    }
+
+    const pending = this._disposeState;
+    const failures = [];
+    const attempt = (operation, onSuccess, nonErrorMessage) => {
+      try {
+        operation();
+        onSuccess();
+      } catch (error) {
+        failures.push(
+          error instanceof Error
+            ? error
+            : new Error(nonErrorMessage, { cause: error })
+        );
+      }
+    };
+
+    if (pending.resizeSubscription) {
+      const subscription = pending.resizeSubscription;
+      attempt(
+        () => subscription.disconnect(),
+        () => {
+          if (pending.resizeSubscription === subscription) {
+            pending.resizeSubscription = null;
+          }
+        },
+        'Highlight lasso resize-listener cleanup failed with a non-Error value.'
+      );
+    }
+
+    if (pending.canvas) {
+      for (const className of pending.canvasClasses) {
+        attempt(
+          () => pending.canvas.classList.remove(className),
+          () => pending.canvasClasses.delete(className),
+          `Highlight canvas class "${className}" cleanup failed with a non-Error value.`
+        );
+      }
+      if (pending.cursorPending) {
+        attempt(
+          () => {
+            pending.canvas.style.cursor = pending.previousCanvasCursor;
+          },
+          () => {
+            pending.cursorPending = false;
+          },
+          'Highlight canvas cursor cleanup failed with a non-Error value.'
+        );
+      }
+      if (
+        pending.canvasClasses.size === 0 &&
+        !pending.cursorPending
+      ) {
+        pending.canvas = null;
+      }
+    }
+
+    if (pending.lassoCanvas) {
+      const lassoCanvas = pending.lassoCanvas;
+      attempt(
+        () => {
+          if (typeof lassoCanvas.remove === 'function') {
+            lassoCanvas.remove();
+          } else if (lassoCanvas.parentNode) {
+            lassoCanvas.parentNode.removeChild(lassoCanvas);
+          }
+        },
+        () => {
+          if (pending.lassoCanvas === lassoCanvas) {
+            pending.lassoCanvas = null;
+          }
+        },
+        'Highlight lasso DOM cleanup failed with a non-Error value.'
+      );
+    }
+
+    if (pending.parentPositionLease && pending.lassoCanvas === null) {
+      const lease = pending.parentPositionLease;
+      attempt(
+        () => releaseLassoParentPosition(lease),
+        () => {
+          if (pending.parentPositionLease === lease) {
+            pending.parentPositionLease = null;
+          }
+        },
+        'Highlight lasso parent-style cleanup failed with a non-Error value.'
+      );
+    }
+
+    if (pending.renderer) {
+      const renderer = pending.renderer;
+      attempt(
+        () => renderer.dispose(),
+        () => {
+          if (pending.renderer === renderer) pending.renderer = null;
+        },
+        'Highlight renderer cleanup failed with a non-Error value.'
+      );
+    }
+
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        `HighlightTools disposal retains ${failures.length} pending owner failure(s).`
+      );
+    }
+
+    this._disposeState = null;
+    this._disposed = true;
+    return true;
   }
 }
 
@@ -2828,13 +3545,20 @@ export function pointInPolygon(x, y, polygon) {
   return inside;
 }
 
+/**
+ * Return the exact lasso-selection cell-ID set. With a spatial index the array
+ * follows spatial traversal order; callers must treat cell IDs as an unordered
+ * selection set (there is no polygon/rank meaning in this API).
+ */
 export function findCellsInLasso({
   lassoPath,
   lassoViewContext,
   mat4,
   modelMatrix,
   transparencyArray,
-  viewPositions
+  viewPositions,
+  spatialIndex = null,
+  queryStats = null
 }) {
   if (!lassoPath || lassoPath.length < 3) return [];
 
@@ -2872,34 +3596,115 @@ export function findCellsInLasso({
     lassoViewContext.viewMatrix,
     'Lasso-selection view matrix'
   );
+  const exactModelMatrix = requireHighlightMatrix(
+    modelMatrix,
+    'Lasso-selection model matrix'
+  );
+  if (
+    spatialIndex !== null &&
+    (
+      typeof spatialIndex !== 'object' ||
+      spatialIndex.pointCount !== pointCount ||
+      spatialIndex.positions !== positions ||
+      typeof spatialIndex.visitProjectedRectCandidates !== 'function'
+    )
+  ) {
+    throw new TypeError(
+      'Lasso-selection spatialIndex must be null or an exact matching spatial owner.'
+    );
+  }
+  if (
+    queryStats !== null &&
+    (
+      typeof queryStats !== 'object' ||
+      Array.isArray(queryStats)
+    )
+  ) {
+    throw new TypeError('Lasso-selection queryStats must be null or an object.');
+  }
 
-  const localLassoPath = lassoPath.map(pt => ({
-    x: pt.x - vpOffsetX,
-    y: pt.y - vpOffsetY
-  }));
+  const localLassoPath = new Array(lassoPath.length);
+  let minimumScreenX = Infinity;
+  let maximumScreenX = -Infinity;
+  let minimumScreenY = Infinity;
+  let maximumScreenY = -Infinity;
+  for (let index = 0; index < lassoPath.length; index++) {
+    const x = lassoPath[index].x - vpOffsetX;
+    const y = lassoPath[index].y - vpOffsetY;
+    localLassoPath[index] = { x, y };
+    minimumScreenX = Math.min(minimumScreenX, x);
+    maximumScreenX = Math.max(maximumScreenX, x);
+    minimumScreenY = Math.min(minimumScreenY, y);
+    maximumScreenY = Math.max(maximumScreenY, y);
+  }
 
   const vpMvpMatrix = mat4.create();
   mat4.multiply(vpMvpMatrix, vp.projectionMatrix, lassoViewMatrixLocal);
-  mat4.multiply(vpMvpMatrix, vpMvpMatrix, modelMatrix);
+  mat4.multiply(vpMvpMatrix, vpMvpMatrix, exactModelMatrix);
 
   const selectedIndices = [];
-  const n = pointCount;
-
-  for (let i = 0; i < n; i++) {
+  let examinedPointCount = 0;
+  const evaluatePoint = i => {
+    examinedPointCount++;
     // Cell is selectable only if visible (not filtered out in this view)
     // Filtered-out cells cannot be interacted with, even if highlighted in another view
-    if (alphas[i] <= 0) continue;
+    if (!(alphas[i] >= HIGHLIGHT_VISIBILITY_THRESHOLD)) return;
 
     const px = positions[i * 3];
     const py = positions[i * 3 + 1];
     const pz = positions[i * 3 + 2];
 
-    const screenPos = projectPointToScreen(px, py, pz, vpMvpMatrix, vpWidth, vpHeight);
-    if (!screenPos) continue;
+    // Keep the exact projectPointToScreen predicate/equations while avoiding
+    // one short-lived object allocation per candidate at 10M+ scale.
+    const clipX =
+      vpMvpMatrix[0] * px +
+      vpMvpMatrix[4] * py +
+      vpMvpMatrix[8] * pz +
+      vpMvpMatrix[12];
+    const clipY =
+      vpMvpMatrix[1] * px +
+      vpMvpMatrix[5] * py +
+      vpMvpMatrix[9] * pz +
+      vpMvpMatrix[13];
+    const clipZ =
+      vpMvpMatrix[2] * px +
+      vpMvpMatrix[6] * py +
+      vpMvpMatrix[10] * pz +
+      vpMvpMatrix[14];
+    const clipW =
+      vpMvpMatrix[3] * px +
+      vpMvpMatrix[7] * py +
+      vpMvpMatrix[11] * pz +
+      vpMvpMatrix[15];
+    if (Math.abs(clipW) < 1e-10) return;
+    const ndcZ = clipZ / clipW;
+    if (ndcZ < -1 || ndcZ > 1) return;
+    const screenX = (clipX / clipW + 1) * 0.5 * vpWidth;
+    const screenY = (1 - clipY / clipW) * 0.5 * vpHeight;
 
-    if (pointInPolygon(screenPos.x, screenPos.y, localLassoPath)) {
+    if (pointInPolygon(screenX, screenY, localLassoPath)) {
       selectedIndices.push(i);
     }
+  };
+
+  if (spatialIndex === null) {
+    for (let i = 0; i < pointCount; i++) {
+      evaluatePoint(i);
+    }
+  } else {
+    spatialIndex.visitProjectedRectCandidates(
+      vpMvpMatrix,
+      {
+        minX: minimumScreenX * 2 / vpWidth - 1,
+        maxX: maximumScreenX * 2 / vpWidth - 1,
+        minY: 1 - maximumScreenY * 2 / vpHeight,
+        maxY: 1 - minimumScreenY * 2 / vpHeight,
+      },
+      evaluatePoint
+    );
+  }
+  if (queryStats !== null) {
+    queryStats.examinedPointCount = examinedPointCount;
   }
 
   return selectedIndices;

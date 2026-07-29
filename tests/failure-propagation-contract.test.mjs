@@ -4,6 +4,7 @@ import test from 'node:test';
 
 import { closeModal } from '../assets/js/app/analysis/ui/components/modal.js';
 import { FormBasedAnalysisUI } from '../assets/js/app/analysis/ui/analysis-types/base/form-based-analysis.js';
+import { createRequestIdTracker } from '../assets/js/app/analysis/shared/cancellable-operation.js';
 import { enableDebug } from '../assets/js/app/analysis/shared/debug-utils.js';
 import { CommunityAnnotationFileCache } from '../assets/js/app/community-annotations/file-cache.js';
 
@@ -147,6 +148,9 @@ test('form-based analysis requires concrete result rendering and propagates exec
   const ui = Object.create(FormBasedAnalysisUI.prototype);
   ui._isDestroyed = false;
   ui._isLoading = false;
+  ui._analysisRequestTracker = createRequestIdTracker();
+  ui._activeAnalysisRequestId = null;
+  ui._analysisInvalidationOwner = null;
   ui._getFormValues = () => ({});
   ui._validateForm = () => ({ valid: true });
   ui._formContainer = {

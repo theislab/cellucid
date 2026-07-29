@@ -45,6 +45,8 @@ function uploadStagedTexture(gl, existing, label, upload) {
   }
   const previousBinding = gl.getParameter(gl.TEXTURE_BINDING_2D);
   const previousAlignment = gl.getParameter(gl.UNPACK_ALIGNMENT);
+  const previousPixelUnpackBuffer =
+    gl.getParameter(gl.PIXEL_UNPACK_BUFFER_BINDING);
   const candidate = gl.createTexture();
   if (candidate === null) {
     throw new Error(`WebGL failed to allocate ${label}.`);
@@ -54,6 +56,7 @@ function uploadStagedTexture(gl, existing, label, upload) {
     : previousBinding;
   try {
     gl.bindTexture(gl.TEXTURE_2D, candidate);
+    gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, null);
     upload();
     const uploadError = gl.getError();
     if (uploadError !== gl.NO_ERROR) {
@@ -62,11 +65,19 @@ function uploadStagedTexture(gl, existing, label, upload) {
       );
     }
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, previousAlignment);
+    gl.bindBuffer(
+      gl.PIXEL_UNPACK_BUFFER,
+      previousPixelUnpackBuffer
+    );
     gl.bindTexture(gl.TEXTURE_2D, restoreBinding);
   } catch (error) {
     const cleanupErrors = [];
     for (const cleanup of [
       () => gl.pixelStorei(gl.UNPACK_ALIGNMENT, previousAlignment),
+      () => gl.bindBuffer(
+        gl.PIXEL_UNPACK_BUFFER,
+        previousPixelUnpackBuffer
+      ),
       () => gl.bindTexture(gl.TEXTURE_2D, previousBinding),
       () => gl.deleteTexture(candidate)
     ]) {
@@ -85,7 +96,52 @@ function uploadStagedTexture(gl, existing, label, upload) {
     throw error;
   }
   if (existing !== null) {
-    gl.deleteTexture(existing);
+    try {
+      gl.deleteTexture(existing);
+    } catch (error) {
+      // A host wrapper may perform the WebGL deletion and then throw. In that
+      // case the replacement has already committed and rolling the candidate
+      // back would leave the caller with no live texture at all.
+      let existingIsLive;
+      try {
+        existingIsLive = gl.isTexture(existing);
+      } catch (inspectionError) {
+        const ownershipErrors = [error, inspectionError];
+        try {
+          gl.deleteTexture(candidate);
+        } catch (cleanupError) {
+          ownershipErrors.push(cleanupError);
+        }
+        throw new AggregateError(
+          ownershipErrors,
+          `${label} replacement retirement state could not be determined; candidate cleanup was attempted.`
+        );
+      }
+      if (!existingIsLive) return candidate;
+      const cleanupErrors = [];
+      for (const cleanup of [
+        () => gl.pixelStorei(gl.UNPACK_ALIGNMENT, previousAlignment),
+        () => gl.bindBuffer(
+          gl.PIXEL_UNPACK_BUFFER,
+          previousPixelUnpackBuffer
+        ),
+        () => gl.bindTexture(gl.TEXTURE_2D, previousBinding),
+        () => gl.deleteTexture(candidate)
+      ]) {
+        try {
+          cleanup();
+        } catch (cleanupError) {
+          cleanupErrors.push(cleanupError);
+        }
+      }
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError(
+          [error, ...cleanupErrors],
+          `${label} replacement retirement failed and cleanup was incomplete.`
+        );
+      }
+      throw error;
+    }
   }
   return candidate;
 }

@@ -5,49 +5,65 @@
 // All noise generation is performed on the GPU using fragment shaders.
 // This is ~100-200x faster than CPU generation.
 
-import { generateCloudNoiseTexturesGPU } from './gpu-noise-generator.js';
-
-// Default sizes - can be adjusted via setNoiseResolution
-let NOISE_SIZE = 128;  // Base shape noise resolution
-let DETAIL_SIZE = 128; // Detail noise resolution
+import {
+  generateCloudNoiseTexturesGPU,
+  startCloudNoiseGenerationGPU,
+} from './gpu-noise-generator.js';
 
 // Reference resolution for adaptive parameter scaling
 // Parameters are tuned to look best at this resolution
 export const REFERENCE_RESOLUTION = 96;
 
-// Get current noise sizes
-export function getNoiseResolution() {
-  return { shapeSize: NOISE_SIZE, detailSize: DETAIL_SIZE };
-}
-
-// Set noise resolution (will take effect on next generation)
-export function setNoiseResolution(shapeSize, detailSize) {
-  for (const [name, value] of [
-    ['shapeSize', shapeSize],
-    ['detailSize', detailSize]
-  ]) {
-    if (!Number.isInteger(value) || value < 32 || value > 256) {
-      throw new RangeError(
-        `Smoke noise ${name} must be an integer between 32 and 256.`
-      );
-    }
+function requireNoiseResolution(value, owner) {
+  if (!Number.isInteger(value) || value < 32 || value > 256) {
+    throw new RangeError(
+      `Smoke noise ${owner} must be an integer between 32 and 256.`
+    );
   }
-  NOISE_SIZE = shapeSize;
-  DETAIL_SIZE = detailSize;
-  console.log(`[NoiseTextures] Resolution set to shape=${NOISE_SIZE}³, detail=${DETAIL_SIZE}³`);
+  return value;
 }
 
 // Calculate scale factor for adaptive parameter adjustment
 // Returns a multiplier to apply to spatial parameters (noiseScale, warpStrength, etc.)
 // so they produce visually consistent results at different resolutions
-export function getResolutionScaleFactor() {
+export function getResolutionScaleFactor(noiseSize) {
+  const exactNoiseSize = requireNoiseResolution(noiseSize, 'resolution');
   // When resolution increases, noise has more detail per unit space
   // To maintain the same visual scale, we need to reduce spatial parameters
-  return REFERENCE_RESOLUTION / NOISE_SIZE;
+  return REFERENCE_RESOLUTION / exactNoiseSize;
 }
 
 // Main export: GPU-based generation (synchronous, very fast ~50-200ms)
-export function generateCloudNoiseTextures(gl) {
-  console.log(`[NoiseTextures] Using GPU-accelerated generation (${NOISE_SIZE}³)`);
-  return Promise.resolve(generateCloudNoiseTexturesGPU(gl, NOISE_SIZE, DETAIL_SIZE));
+export function generateCloudNoiseTextures(gl, shapeSize, detailSize) {
+  const exactShapeSize = requireNoiseResolution(shapeSize, 'shapeSize');
+  const exactDetailSize = requireNoiseResolution(detailSize, 'detailSize');
+  console.log(
+    `[NoiseTextures] Using GPU-accelerated generation `
+    + `(shape=${exactShapeSize}³, detail=${exactDetailSize}³)`
+  );
+  return Promise.resolve(
+    generateCloudNoiseTexturesGPU(gl, exactShapeSize, exactDetailSize)
+  );
+}
+
+// Frame-batched generation used by SmokeRenderer. The returned transaction
+// owns every candidate resource until exact completion and explicit transfer.
+export function startCloudNoiseTextureGeneration(
+  gl,
+  shapeSize,
+  detailSize,
+  options = undefined
+) {
+  const exactShapeSize = requireNoiseResolution(shapeSize, 'shapeSize');
+  const exactDetailSize = requireNoiseResolution(detailSize, 'detailSize');
+  console.log(
+    `[NoiseTextures] Starting frame-batched GPU generation `
+    + `(shape=${exactShapeSize}³, detail=${exactDetailSize}³)`
+  );
+  return startCloudNoiseGenerationGPU(
+    gl,
+    exactShapeSize,
+    exactDetailSize,
+    options
+  );
 }

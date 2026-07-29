@@ -9,6 +9,9 @@ import {
 import {
   writeBundle,
 } from '../../assets/js/app/session/bundle/writer.js';
+import {
+  gzipDecompress,
+} from '../../assets/js/app/session/codecs/gzip.js';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const PUBLISHED_DEFAULT_CHUNK_IDS = Object.freeze([
@@ -134,6 +137,28 @@ async function createPublishedDefaultBytes(genericBytes) {
     chunks: selected.map(chunk => chunk.bytes),
   });
   return Buffer.from(await published.arrayBuffer());
+}
+
+async function readCoreStatePayload(sessionPath) {
+  const bytes = await readFile(sessionPath);
+  const { chunkStream } = await readBundle(
+    new Blob([bytes]),
+    {
+      signal: null,
+      onProgress: null,
+    },
+  );
+  for await (const chunk of chunkStream) {
+    if (chunk.meta.id !== 'core/state') continue;
+    const payloadBytes = chunk.meta.codec === 'gzip'
+      ? await gzipDecompress(chunk.bytes, {
+          maxOutputBytes: chunk.meta.uncompressedBytes,
+          signal: null,
+        })
+      : chunk.bytes;
+    return JSON.parse(new TextDecoder().decode(payloadBytes));
+  }
+  throw new Error('Downloaded session omitted the core/state chunk.');
 }
 
 test('loads the current H5AD contract with a planar 2-D camera and no playback', async ({ page }) => {
@@ -317,6 +342,229 @@ test('saves and restores the exact current UI state through one file-input contr
 
   expect(browserErrors).toEqual([]);
 });
+
+test('session restore rebuilds saved smoke once after retiring current snapshots', async ({
+  page,
+}, testInfo) => {
+  const browserErrors = [];
+  page.on('console', message => {
+    if (message.type() === 'error') {
+      browserErrors.push(`console: ${message.text()}`);
+    }
+  });
+  page.on('pageerror', error => {
+    browserErrors.push(`page: ${error.stack || error.message}`);
+  });
+
+  await page.goto(
+    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=session-smoke-replay-ci',
+    { waitUntil: 'domcontentloaded' },
+  );
+  await dismissWelcome(page);
+  await expectPlanarCurrentDataset(page, 'Current UI prepared fixture');
+  await page.locator('#smoke-grid').evaluate(input => {
+    input.value = '0';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  await page.locator('#noise-resolution').evaluate(input => {
+    input.value = '0';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  await page.locator('#render-mode').selectOption('smoke');
+  await expect(page.locator('#render-mode')).toHaveValue('smoke');
+  await expect.poll(
+    () => page.evaluate(() => window._cellucidViewer.hasSmokeVolume()),
+  ).toBe(true);
+
+  const downloadPromise = page.waitForEvent('download');
+  await page.locator('#save-state-btn').click();
+  const download = await downloadPromise;
+  const sessionPath = testInfo.outputPath('saved-smoke.cellucid-session');
+  await download.saveAs(sessionPath);
+
+  await page.locator('#render-mode').selectOption('points');
+  await page.locator('#split-keep-view-btn').click();
+  await expect.poll(
+    () => page.evaluate(() => window._cellucidViewer.getSnapshotViews().length),
+  ).toBe(1);
+  await page.evaluate(() => {
+    const viewer = window._cellucidViewer;
+    const buildSmokeVolumeGPU = viewer.buildSmokeVolumeGPU.bind(viewer);
+    window.__sessionSmokeBuildCount = 0;
+    viewer.buildSmokeVolumeGPU = (...args) => {
+      window.__sessionSmokeBuildCount += 1;
+      return buildSmokeVolumeGPU(...args);
+    };
+  });
+
+  const chooserPromise = page.waitForEvent('filechooser');
+  await page.locator('#load-state-btn').click();
+  const chooser = await chooserPromise;
+  await chooser.setFiles(sessionPath);
+  await expect(page.locator('#render-mode')).toHaveValue('smoke');
+  await expect.poll(
+    () => page.evaluate(() => window._cellucidViewer.getSnapshotViews().length),
+  ).toBe(0);
+  await page.evaluate(() => new Promise(resolve => {
+    let remainingFrames = 5;
+    const advance = () => {
+      remainingFrames -= 1;
+      if (remainingFrames === 0) {
+        resolve();
+      } else {
+        requestAnimationFrame(advance);
+      }
+    };
+    requestAnimationFrame(advance);
+  }));
+  expect(await page.evaluate(() => window.__sessionSmokeBuildCount)).toBe(1);
+  expect(browserErrors).toEqual([]);
+});
+
+test('session restore catches a real control-owner failure and rolls back', async ({
+  page,
+}, testInfo) => {
+  const pageErrors = [];
+  page.on('pageerror', error => {
+    pageErrors.push(error.stack || error.message);
+  });
+
+  await page.goto(
+    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=session-control-owner-ci',
+    { waitUntil: 'domcontentloaded' },
+  );
+  await dismissWelcome(page);
+  await expectPlanarCurrentDataset(page, 'Current UI prepared fixture');
+
+  await page.locator('#cloud-resolution').evaluate(input => {
+    input.value = '43';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  await expect(page.locator('#cloud-resolution')).toHaveValue('43');
+  await expect.poll(
+    () => page.evaluate(
+      () => window._cellucidViewer.getCloudResolutionScale(),
+    ),
+  ).toBe(1);
+
+  const downloadPromise = page.waitForEvent('download');
+  await page.locator('#save-state-btn').click();
+  const download = await downloadPromise;
+  const sessionPath = testInfo.outputPath(
+    'control-owner.cellucid-session',
+  );
+  await download.saveAs(sessionPath);
+
+  await page.locator('#cloud-resolution').evaluate(input => {
+    input.value = '15';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  const rollbackScale = 0.25 + (15 / 100) * 1.75;
+  await expect(page.locator('#cloud-resolution')).toHaveValue('15');
+  await expect.poll(
+    () => page.evaluate(
+      () => window._cellucidViewer.getCloudResolutionScale(),
+    ),
+  ).toBe(rollbackScale);
+
+  await page.evaluate(() => {
+    const viewer = window._cellucidViewer;
+    const setCloudResolutionScale =
+      viewer.setCloudResolutionScale.bind(viewer);
+    viewer.setCloudResolutionScale = (scale) => {
+      if (scale === 1) {
+        throw new Error('synthetic smoke target owner failure');
+      }
+      return setCloudResolutionScale(scale);
+    };
+  });
+
+  const chooserPromise = page.waitForEvent('filechooser');
+  await page.locator('#load-state-btn').click();
+  const chooser = await chooserPromise;
+  await chooser.setFiles(sessionPath);
+
+  await expect(
+    page.locator('#notification-center .notification-error')
+      .filter({ hasText: 'synthetic smoke target owner failure' }),
+  ).toHaveCount(1);
+  await expect(page.locator('#cloud-resolution')).toHaveValue('15');
+  await expect.poll(
+    () => page.evaluate(
+      () => window._cellucidViewer.getCloudResolutionScale(),
+    ),
+  ).toBe(rollbackScale);
+  await expectPlanarCurrentDataset(page, 'Current UI prepared fixture');
+  expect(pageErrors).toEqual([]);
+});
+
+test(
+  'session Save drains a deferred categorical selection before capture',
+  async ({ page }, testInfo) => {
+    const browserErrors = [];
+    page.on('console', message => {
+      if (message.type() === 'error') {
+        browserErrors.push(`console: ${message.text()}`);
+      }
+    });
+    page.on('pageerror', error => {
+      browserErrors.push(`page: ${error.stack || error.message}`);
+    });
+
+    await page.goto(
+      '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=session-field-owner-ci',
+      { waitUntil: 'domcontentloaded' },
+    );
+    await dismissWelcome(page);
+    await expectPlanarCurrentDataset(
+      page,
+      'Current UI prepared fixture',
+    );
+
+    let releaseCodes;
+    const codesGate = new Promise(resolve => {
+      releaseCodes = resolve;
+    });
+    let codesRequests = 0;
+    await page.route(
+      '**/tests/browser/fixtures/exports/current-ui-prepared/obs/cell_type.codes.u8',
+      async route => {
+        codesRequests++;
+        await codesGate;
+        await route.continue();
+      },
+    );
+
+    const field = page.locator('#categorical-field');
+    await field.selectOption({ label: 'cell_type' });
+    await expect.poll(() => codesRequests).toBe(1);
+    await expect(field.locator('option:checked')).toHaveText('cell_type');
+
+    let downloadObserved = false;
+    page.once('download', () => {
+      downloadObserved = true;
+    });
+    const downloadPromise = page.waitForEvent('download');
+    await page.locator('#save-state-btn').click();
+    await page.evaluate(() => new Promise(resolve => {
+      requestAnimationFrame(() => queueMicrotask(resolve));
+    }));
+    expect(downloadObserved).toBe(false);
+
+    releaseCodes();
+    const download = await downloadPromise;
+    const sessionPath = testInfo.outputPath(
+      'deferred-field.cellucid-session',
+    );
+    await download.saveAs(sessionPath);
+    const coreState = await readCoreStatePayload(sessionPath);
+    expect(coreState.activeFields).toEqual({
+      activeFieldKey: 'cell_type',
+      activeFieldSource: 'obs',
+    });
+    expect(browserErrors).toEqual([]);
+  },
+);
 
 test('an advertised sample applies one verified static state without camera motion', async ({ page }, testInfo) => {
   const browserErrors = [];
@@ -861,6 +1109,13 @@ test('viewer owns snapshot atomicity, exact identity, capacity, and smoke exclus
       }
     };
 
+    viewer.setRenderMode('smoke');
+    const snapshotWhileSmoke = attempt(
+      () => viewer.createSnapshotView(makeConfig('live')),
+    );
+    const countAfterSmokeConflict = viewer.getSnapshotViews().length;
+    viewer.setRenderMode('points');
+
     const invalidSource = attempt(
       () => viewer.createSnapshotView(makeConfig('missing-view')),
     );
@@ -881,6 +1136,8 @@ test('viewer owns snapshot atomicity, exact identity, capacity, and smoke exclus
     const smokeConflict = attempt(() => viewer.setRenderMode('smoke'));
 
     return {
+      snapshotWhileSmoke,
+      countAfterSmokeConflict,
       invalidSource,
       countAfterInvalidSource,
       invalidIdentity,
@@ -892,6 +1149,11 @@ test('viewer owns snapshot atomicity, exact identity, capacity, and smoke exclus
     };
   });
 
+  expect(outcome.snapshotWhileSmoke.name).toBe('RangeError');
+  expect(outcome.snapshotWhileSmoke.message).toMatch(
+    /snapshot.*unavailable.*smoke render mode/i,
+  );
+  expect(outcome.countAfterSmokeConflict).toBe(0);
   expect(outcome.invalidSource.name).toBe('RangeError');
   expect(outcome.invalidSource.message).toMatch(
     /unknown renderer view.*missing-view/i,

@@ -47,9 +47,11 @@ uniform float u_dt;
 uniform float u_time;
 uniform float u_speedMultiplier;
 uniform float u_lifetime;
-uniform float u_dropRate;
-uniform float u_dropRateBump;
+uniform float u_dropChanceFast;
+uniform float u_dropChanceSlow;
 uniform float u_turbulence;
+uniform bool u_forceRespawn;
+uniform float u_velocityBlend;
 
 // Velocity field texture
 uniform sampler2D u_velocityTex;
@@ -213,13 +215,17 @@ void main() {
 
   // Windy.com-style: slow particles drop faster (creates visual density variation)
   float speedNorm = clamp(speed * 2.0, 0.0, 1.0);
-  float dropChance = u_dropRate + u_dropRateBump * (1.0 - speedNorm);
-  bool randomDrop = rand01(seed) < dropChance * dt * 60.0;
+  float dropChance = mix(
+    u_dropChanceSlow,
+    u_dropChanceFast,
+    speedNorm
+  );
+  bool randomDrop = rand01(seed) < dropChance;
 
   // Age the particle
   float newAge = a_age + dt / life;
   bool expired = newAge >= 1.0;
-  bool respawn = expired || randomDrop;
+  bool respawn = u_forceRespawn || expired || randomDrop;
 
   if (respawn) {
     // Respawn at a random visible cell
@@ -245,8 +251,8 @@ void main() {
     // Advect along velocity field with smooth interpolation
     vec3 newPos = a_position + (velocity + turbulenceOffset) * dt * u_speedMultiplier;
 
-    // Smooth velocity update (blend old and new for continuity)
-    vec3 newVel = mix(a_velocity, velocity, 0.25);
+    // The CPU normalizes this spatially uniform coefficient once per pane.
+    vec3 newVel = mix(a_velocity, velocity, u_velocityBlend);
 
     v_position = newPos;
     v_velocity = newVel;
@@ -301,11 +307,9 @@ void main() {
  * CHROMATIC trail fade - different decay rates per channel for beautiful persistence!
  * Red fades slowest, blue fades fastest - creates warm-to-cool trail gradient.
  *
- * Enhanced with:
- * - Smoother chromatic color transitions
- * - Subtle color temperature shift over time
- * - Preserved HDR information in trails
- * - Gentle bloom/glow preservation
+ * The pass is deliberately non-energy-injecting: particle rendering is the
+ * sole source term, while elapsed-time-normalized channel retention creates
+ * the warm-to-cool history gradient.
  */
 export const TRAIL_FADE_FS = `#version 300 es
 precision highp float;
@@ -313,21 +317,23 @@ precision highp float;
 in vec2 v_uv;
 
 uniform sampler2D u_previousFrame;
-uniform float u_fadeAmount;
-uniform float u_chromaticFade; // 0 = uniform, 1 = full chromatic
+uniform float u_fadeR;
+uniform float u_fadeG;
+uniform float u_fadeB;
+uniform float u_fadeAlpha;
+uniform float u_frameScale; // elapsed 60 Hz frames
 
 out vec4 fragColor;
 
-// Soft color temperature shift for more natural trail aging
-vec3 temperatureShift(vec3 color, float amount) {
-  // Shift towards cooler (blue) as trails age - mimics natural light behavior
-  float luma = dot(color, vec3(0.299, 0.587, 0.114));
-  vec3 cool = vec3(luma * 0.9, luma * 0.95, luma * 1.1);
-  return mix(color, cool, amount * 0.15);
-}
-
 void main() {
   vec4 prev = texture(u_previousFrame, v_uv);
+
+  // A zero-delta frame is an exact identity operation, including values below
+  // the normal trail-retirement cutoff.
+  if (u_frameScale <= 0.0) {
+    fragColor = prev;
+    return;
+  }
 
   // Early out for very dark pixels
   if (prev.a < 0.001) {
@@ -335,53 +341,16 @@ void main() {
     return;
   }
 
-  // Chromatic fade: R fades slowest, B fades fastest
-  // This creates beautiful warm-to-cool trailing gradients
-  float baseFade = u_fadeAmount;
-
-  // Enhanced differential fade with smoother curves
-  // Using non-linear fade for more organic trail decay
-  float fadeStrength = u_chromaticFade;
-
-  // Red channel: persists longest, gives trails warm "heat" look
-  float fadeR = baseFade * mix(1.0, 1.025, fadeStrength);
-
-  // Green channel: slight boost for natural color preservation
-  float fadeG = baseFade * mix(1.0, 1.005, fadeStrength);
-
-  // Blue channel: fades faster, but not too aggressively
-  float fadeB = baseFade * mix(1.0, 0.965, fadeStrength);
-
-  // Apply chromatic fade
-  vec3 faded = vec3(
-    prev.r * fadeR,
-    prev.g * fadeG,
-    prev.b * fadeB
+  // The fade pass has no energy source: every channel is multiplied by an
+  // elapsed-time-normalized factor in [0, 1]. New particle draws are the sole
+  // source of trail/HDR energy, preventing self-amplifying history at maximum
+  // persistence while preserving the chromatic differential.
+  fragColor = vec4(
+    prev.r * u_fadeR,
+    prev.g * u_fadeG,
+    prev.b * u_fadeB,
+    prev.a * u_fadeAlpha
   );
-
-  // Apply subtle temperature shift based on brightness
-  // Brighter areas stay warmer, dimmer areas cool down
-  float brightness = max(max(faded.r, faded.g), faded.b);
-  float tempShiftAmount = (1.0 - brightness) * fadeStrength;
-  faded = temperatureShift(faded, tempShiftAmount);
-
-  // Luminance-based glow preservation
-  // Helps maintain beautiful soft edges on trails
-  float luminance = dot(faded, vec3(0.299, 0.587, 0.114));
-
-  // Subtle ambient glow that prevents harsh cutoff
-  // Uses smooth hermite interpolation for natural falloff
-  float glowFactor = smoothstep(0.0, 0.15, luminance);
-  vec3 ambientGlow = vec3(0.0008, 0.0006, 0.0015) * glowFactor;
-
-  // Preserve HDR information for bloom
-  // Bright particles maintain their glow character longer
-  float hdrBoost = smoothstep(0.5, 1.5, luminance) * 0.02;
-  faded *= 1.0 + hdrBoost;
-
-  // Final output with preserved alpha for compositing
-  float alphaFade = baseFade * mix(1.0, 0.995, fadeStrength);
-  fragColor = vec4(faded + ambientGlow, prev.a * alphaFade);
 }
 `;
 
@@ -418,6 +387,7 @@ uniform vec3 u_cameraPosition;
 uniform float u_viewportHeight;
 uniform float u_fov;
 uniform float u_sizeAttenuation;
+uniform float u_rasterScale;
 
 // Particle appearance
 uniform float u_particleSize;
@@ -537,7 +507,7 @@ void main() {
   finalSize *= sqrt(stretchFactor);
 
   // Apply min/max constraints
-  gl_PointSize = clamp(finalSize, u_minSize, u_maxSize);
+  gl_PointSize = clamp(finalSize, u_minSize, u_maxSize) * u_rasterScale;
   v_pointSize = gl_PointSize;
 }
 `;

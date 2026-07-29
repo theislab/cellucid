@@ -98,6 +98,7 @@ export class QuickInsights extends BaseAnalysisUI {
 
     // Pending update flag (for when accordion is closed during highlight changes)
     this._pendingUpdateWhenVisible = false;
+    this._destroyPromise = null;
 
     // Content container (for insights, separate from page selector)
     this._contentContainer = null;
@@ -251,28 +252,44 @@ export class QuickInsights extends BaseAnalysisUI {
   }
 
   /**
+   * Invalidate every pending/deferred computation synchronously.
+   *
+   * Ownership must advance when user intent changes, not when a later debounce
+   * callback happens to start. Otherwise an older non-abort failure can still
+   * publish during the debounce window (or while the panel is hidden).
+   *
+   * @returns {number} The newly owned request generation
+   * @private
+   */
+  _beginUpdateIntent() {
+    this._currentRequestId++;
+
+    if (this._abortController) {
+      this._abortController.abort();
+      this._abortController = null;
+    }
+
+    if (this._debounceTimer) {
+      clearTimeout(this._debounceTimer);
+      this._debounceTimer = null;
+    }
+
+    return this._currentRequestId;
+  }
+
+  /**
    * Trigger debounced update
    * @private
    */
   _triggerUpdate() {
+    this._beginUpdateIntent();
+
     // Skip fetch if not visible - will refresh when accordion opens
     if (!this._isVisible()) {
       this._pendingUpdateWhenVisible = true;
       return;
     }
     this._pendingUpdateWhenVisible = false;
-
-    // Cancel any pending computation
-    if (this._abortController) {
-      this._abortController.abort();
-      this._abortController = null;
-    }
-
-    // Clear any pending debounce timer
-    if (this._debounceTimer) {
-      clearTimeout(this._debounceTimer);
-      this._debounceTimer = null;
-    }
 
     const pageIds = this._getEffectivePageIds();
     if (pageIds.length === 0) {
@@ -283,7 +300,10 @@ export class QuickInsights extends BaseAnalysisUI {
     // Debounce rapid changes
     this._debounceTimer = setTimeout(() => {
       this._debounceTimer = null;
-      this.updateForSelectedPages();
+      this._trackInteractiveTask(
+        this.updateForSelectedPages(),
+        'Quick Insights update'
+      );
     }, 150);
   }
 
@@ -463,15 +483,7 @@ export class QuickInsights extends BaseAnalysisUI {
    * Update insights for selected pages (supports multiple pages)
    */
   async updateForSelectedPages() {
-    // Cancel any pending computation FIRST
-    if (this._abortController) {
-      this._abortController.abort();
-      this._abortController = null;
-    }
-
-    // Increment request ID to track this specific request
-    this._currentRequestId++;
-    const requestId = this._currentRequestId;
+    const requestId = this._beginUpdateIntent();
 
     // Get effective page IDs based on mode
     const pageIds = this._getEffectivePageIds();
@@ -1622,41 +1634,60 @@ export class QuickInsights extends BaseAnalysisUI {
    * @override
    */
   destroy() {
+    if (this._destroyPromise != null) return this._destroyPromise;
     this._isDestroyed = true;
-    // Cancel any pending debounced update
-    if (this._debounceTimer) {
-      clearTimeout(this._debounceTimer);
-      this._debounceTimer = null;
-    }
-
-    // Abort any pending computation
-    if (this._abortController) {
-      this._abortController.abort();
-      this._abortController = null;
-    }
-
-    // Increment request ID to invalidate any in-flight requests
-    this._currentRequestId++;
+    const errors = [];
+    const run = operation => {
+      try {
+        operation();
+      } catch (error) {
+        errors.push(error);
+      }
+    };
+    run(() => this._beginUpdateIntent());
 
     // Clear cache
-    this._cache.clear();
+    run(() => this._cache.clear());
 
-    this._destroyFieldPickers();
-    this._destroyPageSelector();
+    run(() => this._destroyFieldPickers());
+    run(() => this._destroyPageSelector());
 
     // Remove floating window toggle listener
     if (this._detailsToggleListener) {
-      const floatingDetails = this._container?.closest('details.analysis-window-panel');
-      floatingDetails?.removeEventListener('toggle', this._detailsToggleListener);
+      run(() => {
+        const floatingDetails = this._container?.closest(
+          'details.analysis-window-panel'
+        );
+        if (floatingDetails) {
+          floatingDetails.removeEventListener(
+            'toggle',
+            this._detailsToggleListener
+          );
+        }
+      });
       this._detailsToggleListener = null;
     }
 
-    // Clear container
-    if (this._container) {
-      this._container.innerHTML = '';
+    const parentTask = super.destroy();
+    if (errors.length === 0) {
+      this._destroyPromise = parentTask;
+      return parentTask;
     }
-
-    super.destroy();
+    const destruction = Promise.resolve(parentTask).then(
+      () => {
+        if (errors.length === 1) throw errors[0];
+        throw new AggregateError(errors, 'Quick Insights cleanup failed');
+      },
+      parentError => {
+        throw new AggregateError(
+          [...errors, parentError],
+          'Quick Insights cleanup failed'
+        );
+      }
+    );
+    this._destroyPromise = destruction;
+    void destruction.catch(() => {});
+    return destruction;
   }
 }
 

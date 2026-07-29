@@ -103,6 +103,13 @@ function assertMethod(owner, method, label) {
   }
 }
 
+function assertExactFunction(value, label) {
+  if (typeof value !== 'function') {
+    throw new TypeError(`${label} must be one exact function.`);
+  }
+  return value;
+}
+
 function assertEventControl(control, label) {
   if (
     control === null
@@ -418,14 +425,51 @@ export function initRenderControls(options) {
   }
 
   let currentRenderMode = renderModeSelect.value;
-  function publishRenderMode(mode) {
-    viewer.setRenderMode(mode);
+  let renderModeChangeHandler = null;
+
+  function notifyRenderModeChange(mode) {
+    const observer = renderModeChangeHandler;
+    if (observer === null) return;
+    try {
+      observer(mode);
+    } catch (error) {
+      const exactError = error instanceof Error
+        ? error
+        : new Error(
+          'Render-mode change handler failed with a non-Error value.'
+        );
+      queueMicrotask(() => {
+        throw exactError;
+      });
+    }
+  }
+
+  function syncRenderModeUi(mode) {
     renderModeSelect.value = mode;
     smokeControls.classList.toggle('visible', mode === 'smoke');
     pointsControls.classList.toggle('visible', mode === 'points');
     depthControls.style.display = mode === 'smoke' ? 'none' : 'block';
     rendererControls.style.display = mode === 'smoke' ? 'none' : 'block';
     currentRenderMode = mode;
+  }
+
+  function publishRenderMode(mode) {
+    viewer.setRenderMode(mode);
+    syncRenderModeUi(mode);
+    notifyRenderModeChange(mode);
+  }
+
+  function settleSmokeRenderFailure(error) {
+    const exactError = error instanceof Error
+      ? error
+      : new Error('Smoke rendering failed with a non-Error value.');
+    smokeDirty = true;
+    syncRenderModeUi('points');
+    notifyRenderModeChange('points');
+    getNotificationCenter().error(
+      `Smoke rendering failed: ${exactError.message}`,
+      { category: 'rendering' }
+    );
   }
 
   function settleSmokeBuildFailure(error) {
@@ -649,12 +693,14 @@ export function initRenderControls(options) {
   smokeGridInput.addEventListener('input', updateSmokeGridSlider);
 
   function updateCloudResolutionSlider() {
-    const t = readExactRange(
+    const raw = readExactRange(
       cloudResolutionInput,
       'Smoke render resolution',
       '1'
-    ) / 100;
-    const scale = 0.25 + t * 1.75;
+    );
+    const scale = raw === 43
+      ? 1
+      : 0.25 + (raw / 100) * 1.75;
     cloudResolutionDisplay.textContent = scale.toFixed(2) + 'x';
     viewer.setCloudResolutionScale(scale);
   }
@@ -788,6 +834,13 @@ export function initRenderControls(options) {
   return {
     markSmokeDirty,
     markSmokeClean,
+    settleSmokeRenderFailure,
+    setRenderModeChangeHandler(fn) {
+      renderModeChangeHandler = assertExactFunction(
+        fn,
+        'Render-mode change handler'
+      );
+    },
     applyRenderMode,
     applyPointSizeFromSlider,
     pointSizeToSlider,

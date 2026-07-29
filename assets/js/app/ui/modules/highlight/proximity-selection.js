@@ -236,7 +236,7 @@ export function initProximitySelection(options) {
     requireSafeInteger(
       previewEvent.centerCellIndex,
       'Proximity preview centerCellIndex',
-      0
+      -1
     );
     requireFiniteNumber(previewEvent.radius, 'Proximity preview radius');
     requireCombineMode(previewEvent.mode, 'Proximity preview');

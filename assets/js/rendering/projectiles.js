@@ -38,15 +38,16 @@ export function createProjectileSystem({
 }) {
   // Projectile buffers (small, dynamic)
   // Color buffers store RGBA as uint8 (alpha packed in)
-  const projectilePositionBuffer = gl.createBuffer();
-  const projectileColorBuffer = gl.createBuffer(); // RGBA uint8
-  const impactPositionBuffer = gl.createBuffer();
-  const impactColorBuffer = gl.createBuffer(); // RGBA uint8
+  let projectilePositionBuffer = gl.createBuffer();
+  let projectileColorBuffer = gl.createBuffer(); // RGBA uint8
+  let impactPositionBuffer = gl.createBuffer();
+  let impactColorBuffer = gl.createBuffer(); // RGBA uint8
 
   // Projectile sandbox state
   const projectiles = [];
   const impactFlashes = [];
   let projectilesEnabled = false;
+  let disposeRequested = false;
   let disposed = false;
   let projectileBufferDirty = true;
   let impactBufferDirty = true;
@@ -103,6 +104,7 @@ export function createProjectileSystem({
   let chargeStartTime = 0;
   let chargeLevel = 0;
   let chargeViewportInfo = null;
+  let chargeIndicatorNeedsClear = false;
 
   // Track total projectile points for draw call
   let projectilePointCount = 0;
@@ -785,6 +787,11 @@ export function createProjectileSystem({
     }
     const arcColor = `rgb(${r}, ${g}, ${b})`;
 
+    // Publish cleanup ownership before the first drawing operation. If a
+    // Canvas2D call fails after partially painting the ring, disabling or
+    // disposing the system will still retry the clear.
+    chargeIndicatorNeedsClear = true;
+
     // Draw background ring (subtle dark outline)
     lassoCtx.beginPath();
     lassoCtx.arc(cx, cy, outerRadius - ringWidth / 2, 0, Math.PI * 2);
@@ -827,16 +834,22 @@ export function createProjectileSystem({
   }
 
   function clearChargeIndicator() {
+    if (!chargeIndicatorNeedsClear) return;
     const lassoCtx = getLassoCtx();
-    if (!lassoCtx) return;
+    if (!lassoCtx) {
+      chargeIndicatorNeedsClear = false;
+      return;
+    }
     const rect = canvas.getBoundingClientRect();
     lassoCtx.setTransform(1, 0, 0, 1, 0, 0);
     const dpr = window.devicePixelRatio || 1;
     lassoCtx.scale(dpr, dpr);
     lassoCtx.clearRect(0, 0, rect.width, rect.height);
+    chargeIndicatorNeedsClear = false;
   }
 
   function startCharging(viewportInfo) {
+    if (!projectilesEnabled || disposeRequested) return;
     isCharging = true;
     chargeStartTime = performance.now();
     chargeLevel = 0;
@@ -844,10 +857,11 @@ export function createProjectileSystem({
   }
 
   function cancelCharging() {
-    if (isCharging) {
-      isCharging = false;
-      chargeLevel = 0;
-      chargeViewportInfo = null;
+    const needsClear = isCharging || chargeIndicatorNeedsClear;
+    isCharging = false;
+    chargeLevel = 0;
+    chargeViewportInfo = null;
+    if (needsClear) {
       clearChargeIndicator();
     }
   }
@@ -875,9 +889,10 @@ export function createProjectileSystem({
   }
 
   function updateChargeUI() {
+    if (!projectilesEnabled || disposeRequested) return;
     if (isCharging) {
       drawChargeIndicator();
-    } else if (chargeLevel > 0) {
+    } else if (chargeLevel > 0 || chargeIndicatorNeedsClear) {
       clearChargeIndicator();
       chargeLevel = 0;
     }
@@ -892,17 +907,29 @@ export function createProjectileSystem({
       spawnProjectile({ navigationMode, pointerLockActive, viewportInfo, speedMultiplier });
     },
     update(dt) {
+      if (!projectilesEnabled || disposeRequested) return;
       stepProjectiles(dt);
       updateImpactFlashes(dt);
       if (projectileBufferDirty) rebuildProjectileBuffers();
       if (impactBufferDirty) rebuildImpactBuffers();
-	    },
-	    draw(params) {
-	      drawProjectiles(params);
-	      drawImpactFlashes(params);
-	    },
+    },
+    draw(params) {
+      if (!projectilesEnabled || disposeRequested) return;
+      drawProjectiles(params);
+      drawImpactFlashes(params);
+    },
+    /**
+     * Disabling is a pause-and-hide operation: simulation ages, buffer uploads,
+     * draw calls, spawning, and charge UI work all stop. Existing projectile
+     * and impact state remains owned so a later enable resumes that exact state.
+     */
     setEnabled(enabled) {
-      projectilesEnabled = !!enabled;
+      const nextEnabled = !!enabled;
+      if (nextEnabled && disposeRequested) {
+        throw new Error('A disposing projectile system cannot be re-enabled.');
+      }
+      projectilesEnabled = nextEnabled;
+      if (!nextEnabled) cancelCharging();
     },
     reset() {
       projectiles.length = 0;
@@ -914,26 +941,66 @@ export function createProjectileSystem({
      * Dispose of all WebGL resources to prevent GPU memory leaks.
      * Call this when the projectile system is no longer needed.
      */
-	    dispose() {
-	      if (disposed) return;
-	      disposed = true;
+    dispose() {
+      if (disposed) return false;
 
-	      // Delete all WebGL buffers
-	      if (projectilePositionBuffer) gl.deleteBuffer(projectilePositionBuffer);
-	      if (projectileColorBuffer) gl.deleteBuffer(projectileColorBuffer);
-	      if (impactPositionBuffer) gl.deleteBuffer(impactPositionBuffer);
-	      if (impactColorBuffer) gl.deleteBuffer(impactColorBuffer);
+      // Fence public work before any fallible cleanup. A failed deletion keeps
+      // only that exact handle for the next dispose() attempt.
+      disposeRequested = true;
+      projectilesEnabled = false;
+      const failures = [];
+      try {
+        cancelCharging();
+      } catch (error) {
+        failures.push(error);
+      }
 
-	      // Clear state
-	      projectiles.length = 0;
-	      impactFlashes.length = 0;
+      const retireBuffer = (buffer, clearOwner) => {
+        if (buffer === null) return;
+        try {
+          gl.deleteBuffer(buffer);
+          clearOwner();
+        } catch (error) {
+          failures.push(error);
+        }
+      };
+      retireBuffer(
+        projectilePositionBuffer,
+        () => { projectilePositionBuffer = null; }
+      );
+      retireBuffer(
+        projectileColorBuffer,
+        () => { projectileColorBuffer = null; }
+      );
+      retireBuffer(
+        impactPositionBuffer,
+        () => { impactPositionBuffer = null; }
+      );
+      retireBuffer(
+        impactColorBuffer,
+        () => { impactColorBuffer = null; }
+      );
+
+      // Logical state is terminal even when a GL handle must be retried.
+      isCharging = false;
+      chargeLevel = 0;
+      chargeViewportInfo = null;
+      projectiles.length = 0;
+      impactFlashes.length = 0;
       projectilePositions = new Float32Array();
       projectileColors = new Uint8Array();
       impactPositions = new Float32Array();
       impactColors = new Uint8Array();
       projectilePointCount = 0;
 
-      console.log('[Projectiles] WebGL resources disposed');
+      if (failures.length > 0) {
+        throw new AggregateError(
+          failures,
+          `Projectile disposal failed for ${failures.length} owned resource(s).`
+        );
+      }
+      disposed = true;
+      return true;
     },
     // Charge system
     startCharging,

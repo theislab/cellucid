@@ -27,6 +27,7 @@ import {
 } from './session/dataset-state-manifest.js';
 import {
   createDatasetRuntimeRetirementOwner,
+  createLatestDatasetPublicationContinuationOwner,
   createLatestDatasetReloadCoordinator,
   handleDatasetReloadFailure,
   settleInitialPublishedDatasetStateOutcome,
@@ -74,6 +75,10 @@ import {
 import {
   createJupyterCommandHandlers
 } from './jupyter-command-handler.js';
+import {
+  createJupyterHealthMonitor,
+  createJupyterPointerDelivery
+} from './jupyter-pointer-delivery.js';
 // benchmark module is lazy-loaded when needed
 import {
   fetchSampleArtifact,
@@ -115,6 +120,33 @@ import {
 debug.log('Starting…');
 
 const FAST_BINARY_FETCH_INIT = { cache: 'force-cache' };
+const BENCHMARK_GPU_ESTIMATE_BYTES_PER_POINT = 28;
+const MEBIBYTE = 1024 * 1024;
+
+function estimateBenchmarkGpuMemoryMB(pointCount) {
+  return Number.isSafeInteger(pointCount) && pointCount >= 0
+    ? (
+      pointCount *
+      BENCHMARK_GPU_ESTIMATE_BYTES_PER_POINT /
+      MEBIBYTE
+    )
+    : null;
+}
+
+function formatBenchmarkGpuMemory(rendererStats, pointCount) {
+  const exactGpuMemoryMB = rendererStats?.gpuMemoryMB;
+  if (
+    Number.isFinite(exactGpuMemoryMB) &&
+    exactGpuMemoryMB >= 0
+  ) {
+    return `${exactGpuMemoryMB.toFixed(1)} MB`;
+  }
+  const estimatedGpuMemoryMB =
+    estimateBenchmarkGpuMemoryMB(pointCount);
+  return estimatedGpuMemoryMB === null
+    ? 'Unavailable'
+    : `~${estimatedGpuMemoryMB.toFixed(1)} MB (estimate)`;
+}
 
 // Default export base URL (will be updated by DataSourceManager)
 let EXPORT_BASE_URL = '';
@@ -357,7 +389,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     let jupyterSource = null;
     if (inJupyter) {
       debug.log('[Main] Detected Jupyter context, initializing bridge...');
-      jupyterSource = createJupyterBridgeDataSource();
+      jupyterSource = createJupyterBridgeDataSource(jupyterConfig);
       dataSourceManager.registerSource('jupyter', jupyterSource);
 
       const jupyterInitialized = await jupyterSource.initialize();
@@ -376,25 +408,58 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
 
       // Freeze support: keep the last fully rendered view when Python stops.
       let jupyterFrozen = false;
-      const freezeJupyterView = () => {
-        if (jupyterFrozen) return;
-        let overlay = document.getElementById(
-          'cellucid-jupyter-freeze-overlay'
-        );
-        if (overlay === null) {
-          overlay = document.createElement('div');
-          overlay.id = 'cellucid-jupyter-freeze-overlay';
-          overlay.style.position = 'fixed';
-          overlay.style.inset = '0';
-          overlay.style.zIndex = '999999';
-          overlay.style.pointerEvents = 'all';
-          overlay.style.background = 'transparent';
-          overlay.setAttribute('aria-hidden', 'true');
-          document.body.appendChild(overlay);
+      let jupyterPointerDelivery = null;
+      let jupyterHealthMonitor = null;
+      let retireJupyterPointerInputs = () => {};
+      const reportJupyterConsoleError = (...args) => {
+        try {
+          console.error(...args);
+        } catch {
+          // Terminal/error reporting is observational and cannot reopen input
+          // or turn a listener path into a thrown failure.
         }
-        viewer.pause();
-        overlay.style.display = 'block';
+      };
+      const freezeJupyterView = () => {
+        if (jupyterFrozen) return false;
+        // Publish the terminal fence before any fallible observer, renderer,
+        // timer, or DOM work.
         jupyterFrozen = true;
+        const failures = [];
+        const attempt = operation => {
+          try {
+            operation();
+          } catch (error) {
+            failures.push(error);
+          }
+        };
+        attempt(() => retireJupyterPointerInputs());
+        attempt(() => jupyterPointerDelivery?.freeze());
+        attempt(() => jupyterHealthMonitor?.freeze());
+        attempt(() => viewer.pause());
+        attempt(() => {
+          let overlay = document.getElementById(
+            'cellucid-jupyter-freeze-overlay'
+          );
+          if (overlay === null) {
+            overlay = document.createElement('div');
+            overlay.id = 'cellucid-jupyter-freeze-overlay';
+            overlay.style.position = 'fixed';
+            overlay.style.inset = '0';
+            overlay.style.zIndex = '999999';
+            overlay.style.pointerEvents = 'all';
+            overlay.style.background = 'transparent';
+            overlay.setAttribute('aria-hidden', 'true');
+            document.body.appendChild(overlay);
+          }
+          overlay.style.display = 'block';
+        });
+        for (const failure of failures) {
+          reportJupyterConsoleError(
+            '[Main] Jupyter freeze cleanup failed:',
+            failure
+          );
+        }
+        return true;
       };
 
       jupyterSource.onMessage(message => {
@@ -403,108 +468,190 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         }
       });
 
-      const healthInterval = setInterval(async () => {
-        if (jupyterFrozen) {
-          clearInterval(healthInterval);
-          return;
-        }
-        try {
-          await jupyterSource.checkHealth();
-        } catch (error) {
-          clearInterval(healthInterval);
-          console.error(
+      jupyterHealthMonitor = createJupyterHealthMonitor({
+        checkHealth: () => jupyterSource.checkHealth(),
+        onFailure: error => {
+          freezeJupyterView();
+          reportJupyterConsoleError(
             '[Main] Jupyter server health contract failed; freezing view:',
             error
           );
-          notifications.error(
-            'The Python server stopped or returned an invalid health response. ' +
-            'The last complete view has been frozen.',
-            {
-              category: 'connectivity',
-              title: 'Jupyter server disconnected',
-              duration: 0
-            }
-          );
-          freezeJupyterView();
-        }
-      }, 3000);
+          try {
+            notifications.error(
+              'The Python server stopped or returned an invalid health response. ' +
+              'The last complete view has been frozen.',
+              {
+                category: 'connectivity',
+                title: 'Jupyter server disconnected',
+                duration: 0
+              }
+            );
+          } catch (notificationError) {
+            reportJupyterConsoleError(
+              '[Main] Jupyter disconnect notification failed:',
+              notificationError
+            );
+          }
+        },
+        intervalMs: 3000,
+      });
+      jupyterHealthMonitor.start();
 
       if (
-        typeof viewer.pickCellAtScreen !== 'function' ||
-        typeof viewer.getPositions !== 'function'
+        typeof viewer.pickCellRecordAtScreen !== 'function'
       ) {
         throw new TypeError(
-          'Jupyter pointer hooks require exact viewer picking and position APIs'
+          'Jupyter pointer hooks require exact per-view picking records'
         );
       }
 
-      let lastHoverCell = null;
       let lastHoverAt = 0;
       const HOVER_THROTTLE_MS = 50;
-
-      canvas.addEventListener('mousemove', async event => {
-        const now = performance.now();
-        if (now - lastHoverAt < HOVER_THROTTLE_MS) return;
-        lastHoverAt = now;
-
-        const cellIndex = viewer.pickCellAtScreen(
-          event.clientX,
-          event.clientY
+      const reportJupyterPointerError = (error, channel) => {
+        reportJupyterConsoleError(
+          `[Main] Jupyter ${channel} pointer delivery failed:`,
+          error
         );
-        if (!Number.isInteger(cellIndex) || cellIndex < -1) {
-          throw new TypeError(
-            'Jupyter cell picking must return -1 or a non-negative integer'
-          );
+      };
+      jupyterPointerDelivery = createJupyterPointerDelivery({
+        notifyHover: (cellIndex, position) =>
+          jupyterSource.notifyHover(cellIndex, position),
+        notifyClick: (cellIndex, modifiers) =>
+          jupyterSource.notifyClick(cellIndex, modifiers),
+        reportError: reportJupyterPointerError,
+      });
+      window.addEventListener(
+        'pagehide',
+        () => {
+          freezeJupyterView();
+        },
+        { once: true }
+      );
+
+      let pendingHoverClientX = 0;
+      let pendingHoverClientY = 0;
+      let hasPendingHoverPoint = false;
+      let hoverSampleTimer = null;
+      const clearHoverSampleTimer = () => {
+        if (hoverSampleTimer !== null) {
+          clearTimeout(hoverSampleTimer);
+          hoverSampleTimer = null;
         }
-        if (cellIndex === -1) {
-          if (lastHoverCell !== null) {
-            lastHoverCell = null;
-            await jupyterSource.notifyHover(null, null);
+      };
+      retireJupyterPointerInputs = () => {
+        hasPendingHoverPoint = false;
+        clearHoverSampleTimer();
+      };
+      const sampleLatestJupyterHover = () => {
+        hoverSampleTimer = null;
+        try {
+          if (jupyterFrozen || !hasPendingHoverPoint) return;
+          const now = performance.now();
+          const remaining =
+            HOVER_THROTTLE_MS - (now - lastHoverAt);
+          if (remaining > 0) {
+            hoverSampleTimer = setTimeout(
+              sampleLatestJupyterHover,
+              remaining
+            );
+            return;
           }
-          return;
-        }
-        if (cellIndex === lastHoverCell) return;
+          const clientX = pendingHoverClientX;
+          const clientY = pendingHoverClientY;
+          hasPendingHoverPoint = false;
+          lastHoverAt = now;
 
-        const activePositions = viewer.getPositions();
-        if (
-          !(activePositions instanceof Float32Array) ||
-          activePositions.length < cellIndex * 3 + 3
-        ) {
-          throw new TypeError(
-            'Jupyter hover requires complete Float32 XYZ positions'
+          const pickRecord = viewer.pickCellRecordAtScreen(
+            clientX,
+            clientY
           );
+          if (
+            pickRecord !== null &&
+            (
+              !Object.isFrozen(pickRecord) ||
+              typeof pickRecord.viewId !== 'string' ||
+              pickRecord.viewId.length === 0 ||
+              !Number.isSafeInteger(pickRecord.cellIndex) ||
+              pickRecord.cellIndex < 0 ||
+              pickRecord.position === null ||
+              typeof pickRecord.position !== 'object'
+            )
+          ) {
+            throw new TypeError(
+              'Jupyter cell picking must return null or one exact frozen per-view record'
+            );
+          }
+          if (pickRecord !== null) {
+            const activePosition = pickRecord.position;
+            if (
+              !Object.isFrozen(activePosition) ||
+              !Number.isFinite(activePosition.x) ||
+              !Number.isFinite(activePosition.y) ||
+              !Number.isFinite(activePosition.z)
+            ) {
+              throw new TypeError(
+                'Jupyter hover requires one complete finite XYZ position'
+              );
+            }
+          }
+          jupyterPointerDelivery.requestHover(pickRecord);
+        } catch (error) {
+          reportJupyterPointerError(error, 'hover');
         }
-        lastHoverCell = cellIndex;
-        await jupyterSource.notifyHover(cellIndex, {
-          x: activePositions[cellIndex * 3],
-          y: activePositions[cellIndex * 3 + 1],
-          z: activePositions[cellIndex * 3 + 2]
-        });
+      };
+
+      canvas.addEventListener('mousemove', event => {
+        pendingHoverClientX = event.clientX;
+        pendingHoverClientY = event.clientY;
+        hasPendingHoverPoint = true;
+        if (hoverSampleTimer === null) {
+          sampleLatestJupyterHover();
+        }
       });
 
-      canvas.addEventListener('mouseleave', async () => {
-        if (lastHoverCell !== null) {
-          lastHoverCell = null;
-          await jupyterSource.notifyHover(null, null);
+      canvas.addEventListener('mouseleave', () => {
+        try {
+          if (!jupyterFrozen) {
+            hasPendingHoverPoint = false;
+            clearHoverSampleTimer();
+            jupyterPointerDelivery.requestHover(null);
+          }
+        } catch (error) {
+          reportJupyterPointerError(error, 'hover');
         }
       });
 
-      canvas.addEventListener('click', async event => {
-        const cellIndex = viewer.pickCellAtScreen(
-          event.clientX,
-          event.clientY
-        );
-        if (!Number.isInteger(cellIndex) || cellIndex < -1) {
-          throw new TypeError(
-            'Jupyter cell picking must return -1 or a non-negative integer'
+      canvas.addEventListener('click', event => {
+        try {
+          if (jupyterFrozen) return;
+          const pickRecord = viewer.pickCellRecordAtScreen(
+            event.clientX,
+            event.clientY
           );
+          if (
+            pickRecord !== null &&
+            (
+              !Object.isFrozen(pickRecord) ||
+              typeof pickRecord.viewId !== 'string' ||
+              pickRecord.viewId.length === 0 ||
+              !Number.isSafeInteger(pickRecord.cellIndex) ||
+              pickRecord.cellIndex < 0
+            )
+          ) {
+            throw new TypeError(
+              'Jupyter cell picking must return null or one exact frozen per-view record'
+            );
+          }
+          if (pickRecord === null) return;
+          jupyterPointerDelivery.requestClick({
+            cellIndex: pickRecord.cellIndex,
+            button: event.button,
+            shift: event.shiftKey,
+            ctrl: event.ctrlKey || event.metaKey,
+          });
+        } catch (error) {
+          reportJupyterPointerError(error, 'click');
         }
-        if (cellIndex === -1) return;
-        await jupyterSource.notifyClick(cellIndex, {
-          button: event.button,
-          shift: event.shiftKey,
-          ctrl: event.ctrlKey || event.metaKey
-        });
       });
 
       const jupyterDatasets = await jupyterSource.listDatasets();
@@ -808,13 +955,51 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     let activeRuntimeStage = null;
     const runtimeRetirementOwner =
       createDatasetRuntimeRetirementOwner();
+    const datasetPublicationOwner =
+      createLatestDatasetPublicationContinuationOwner();
+    let datasetPublicationGeneration = 0;
+    let activeDatasetPublication = null;
 
-    function publishEmptyDatasetRuntime({ clearViews }) {
-      if (typeof clearViews !== 'boolean') {
-        throw new TypeError(
-          'Empty dataset runtime publication requires clearViews.'
+    function publishRuntimeContinuation(details) {
+      const publication = datasetPublicationOwner.publish(details);
+      datasetPublicationGeneration = publication.generation;
+      activeDatasetPublication = publication;
+      return publication;
+    }
+
+    function requireRestorablePublication(expectedPublication) {
+      if (
+        expectedPublication === null ||
+        typeof expectedPublication !== 'object' ||
+        activeDatasetPublication !== expectedPublication ||
+        expectedPublication.isCurrent() !== true
+      ) {
+        throw new Error(
+          'Runtime restoration requires its exact current publication continuation.'
         );
       }
+      return expectedPublication;
+    }
+
+    function publishEmptyDatasetRuntime({
+      clearViews,
+      restorationPublication = null
+    }) {
+      if (
+        typeof clearViews !== 'boolean' ||
+        (
+          restorationPublication !== null &&
+          typeof restorationPublication !== 'object'
+        )
+      ) {
+        throw new TypeError(
+          'Empty dataset runtime publication requires boolean clearViews and an optional restoration publication.'
+        );
+      }
+      if (restorationPublication !== null) {
+        requireRestorablePublication(restorationPublication);
+      }
+      ui?.prepareDatasetReplacement?.();
       EXPORT_BASE_URL = '';
       dimensionManager = createDimensionManager({ baseUrl: '' });
       obs = null;
@@ -836,6 +1021,9 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       }
       if (statsEl) statsEl.textContent = 'No dataset selected';
       activeRuntimeStage = null;
+      return restorationPublication !== null
+        ? requireRestorablePublication(restorationPublication)
+        : publishRuntimeContinuation({ runtimeKind: 'empty' });
     }
 
     async function stageDatasetRuntime({
@@ -973,7 +1161,6 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     let obs = null;
     let connectivityManifest = null;
     let positions = null;
-    let datasetPublicationGeneration = 0;
     const connectivityRuntimeOwner = initializeConnectivityControls();
     if (
       typeof connectivityRuntimeOwner.prepareDatasetReplacement !==
@@ -986,7 +1173,10 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       );
     }
 
-    function commitDatasetRuntimeStage(stage) {
+    function commitDatasetRuntimeStage(
+      stage,
+      { restorationPublication = null } = {}
+    ) {
       if (
         stage === null ||
         typeof stage !== 'object' ||
@@ -996,12 +1186,24 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           'Dataset runtime publication requires one exact staged generation.'
         );
       }
+      if (
+        restorationPublication !== null &&
+        typeof restorationPublication !== 'object'
+      ) {
+        throw new TypeError(
+          'Dataset runtime restoration publication must be an object or null.'
+        );
+      }
+      if (restorationPublication !== null) {
+        requireRestorablePublication(restorationPublication);
+      }
       const previousDimensionManager = dimensionManager;
       const previousRuntimeStage = activeRuntimeStage;
 
       // This function is intentionally synchronous. The reload transaction is
       // checked immediately before this sole publication call, so no newer
       // selection can interleave with the dataset-owned state replacement.
+      ui?.prepareDatasetReplacement?.();
       EXPORT_BASE_URL = stage.baseUrl;
       dimensionManager = stage.dimensionManager;
       obs = stage.generation.obsManifest;
@@ -1021,18 +1223,21 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       state.clearActiveField();
       state.clearAllHighlights();
       state.setVectorFieldManager(stage.vectorFieldManager);
-      datasetPublicationGeneration++;
       activeRuntimeStage = stage;
 
-      return Object.freeze({
-        generation: datasetPublicationGeneration,
-        previousDimensionManager,
-        previousRuntimeStage,
-        stage
-      });
+      return restorationPublication !== null
+        ? requireRestorablePublication(restorationPublication)
+        : publishRuntimeContinuation({
+            previousDimensionManager,
+            previousRuntimeStage,
+            stage
+          });
     }
 
-    function commitSyntheticRuntimeStage(stage) {
+    function commitSyntheticRuntimeStage(
+      stage,
+      { restorationPublication = null } = {}
+    ) {
       if (
         stage === null ||
         typeof stage !== 'object' ||
@@ -1044,8 +1249,20 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           'Synthetic runtime publication requires one exact staged scene.'
         );
       }
+      if (
+        restorationPublication !== null &&
+        typeof restorationPublication !== 'object'
+      ) {
+        throw new TypeError(
+          'Synthetic runtime restoration publication must be an object or null.'
+        );
+      }
+      if (restorationPublication !== null) {
+        requireRestorablePublication(restorationPublication);
+      }
       const previousDimensionManager = dimensionManager;
       const previousRuntimeStage = activeRuntimeStage;
+      ui?.prepareDatasetReplacement?.();
       state.initSyntheticScene({
         positions: stage.positions,
         colors: stage.colors,
@@ -1057,45 +1274,140 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       obs = state.obsData;
       positions = stage.positions;
       connectivityManifest = null;
-      datasetPublicationGeneration++;
       activeRuntimeStage = stage;
-      return Object.freeze({
-        generation: datasetPublicationGeneration,
-        previousDimensionManager,
-        previousRuntimeStage,
-        stage
+      return restorationPublication !== null
+        ? requireRestorablePublication(restorationPublication)
+        : publishRuntimeContinuation({
+            previousDimensionManager,
+            previousRuntimeStage,
+            stage
+          });
+    }
+
+    function restoreRuntimeStage(stage, restorationPublication) {
+      if (stage?.runtimeKind === 'synthetic') {
+        return commitSyntheticRuntimeStage(stage, {
+          restorationPublication
+        });
+      }
+      return commitDatasetRuntimeStage(stage, {
+        restorationPublication
       });
     }
 
-    function restoreRuntimeStage(stage) {
-      if (stage?.runtimeKind === 'synthetic') {
-        return commitSyntheticRuntimeStage(stage);
+    function assertCurrentDatasetPublication(publication) {
+      if (
+        publication === null ||
+        typeof publication !== 'object' ||
+        !Number.isSafeInteger(publication.generation) ||
+        publication.generation < 1 ||
+        !(publication.signal instanceof AbortSignal) ||
+        typeof publication.isCurrent !== 'function' ||
+        typeof publication.assertCurrent !== 'function'
+      ) {
+        throw new TypeError(
+          'Dataset continuation requires one exact publication token.'
+        );
       }
-      return commitDatasetRuntimeStage(stage);
+      publication.assertCurrent();
+      if (publication.generation !== datasetPublicationGeneration) {
+        throw createDatasetReloadSupersededError(
+          'Dataset continuation was superseded by a newer runtime publication.'
+        );
+      }
     }
 
-    function synchronizePublishedDatasetUi(
+    function retirePublishedDatasetSnapshotViews(publication) {
+      assertCurrentDatasetPublication(publication);
+      const hadSnapshots = viewer.hasSnapshots();
+      if (typeof hadSnapshots !== 'boolean') {
+        throw new TypeError(
+          'Dataset view retirement requires an exact viewer snapshot inventory.'
+        );
+      }
+      const retirementFailures = [];
+      if (hadSnapshots) {
+        // Kept views own the previous dataset's GPU buffers and DataState
+        // contexts. Retire them only after scientific publication succeeds so
+        // a failed runtime commit can still restore the complete prior scene.
+        try {
+          viewer.clearSnapshotViews();
+        } catch (error) {
+          retirementFailures.push(error);
+        }
+      }
+      // State may already have reset itself during dataset publication, but
+      // clear its secondary inventory independently of renderer cleanup so a
+      // prior partial failure cannot preserve a stale active-view identity.
+      try {
+        state.clearSnapshotViews();
+      } catch (error) {
+        retirementFailures.push(error);
+      }
+
+      const hasSnapshots = viewer.hasSnapshots();
+      const activeViewId = state.getActiveViewId();
+      const layout = viewer.getViewLayout();
+      if (
+        hasSnapshots !== false ||
+        activeViewId !== 'live' ||
+        layout === null ||
+        typeof layout !== 'object' ||
+        layout.activeId !== 'live' ||
+        layout.liveViewHidden !== false
+      ) {
+        retirementFailures.push(
+          new Error(
+            'Published dataset view retirement did not restore the visible live view.'
+          )
+        );
+      }
+      if (retirementFailures.length === 1) {
+        throw retirementFailures[0];
+      }
+      if (retirementFailures.length > 1) {
+        throw new AggregateError(
+          retirementFailures,
+          'Published dataset kept-view retirement was incomplete.'
+        );
+      }
+    }
+
+    async function synchronizePublishedDatasetUi(
       activeMetadata,
       publication
     ) {
       if (
         publication === null ||
         typeof publication !== 'object' ||
-        publication.generation !== datasetPublicationGeneration
+        publication.stage?.runtimeKind !== 'dataset'
       ) {
-        throw new Error(
-          'Published dataset UI synchronization requires the exact current ' +
-          'publication.'
+        throw new TypeError(
+          'Published dataset UI synchronization requires one dataset publication.'
         );
       }
-      return settlePublishedDatasetUi({
-        synchronize: () => {
+      return await settlePublishedDatasetUi({
+        synchronize: async () => {
+          assertCurrentDatasetPublication(publication);
+          // The scientific runtime is already committed. Retire kept views
+          // before the first await so an animation frame can never combine
+          // the new live dataset with snapshot buffers from its predecessor.
+          retirePublishedDatasetSnapshotViews(publication);
+          try {
+            await ui?.settleFieldInteractions?.();
+          } finally {
+            assertCurrentDatasetPublication(publication);
+          }
           connectivityRuntimeOwner.prepareDatasetReplacement();
           connectivityRuntimeOwner.synchronizeDatasetPublication();
           if (window._comparisonModule) {
-            window._comparisonModule.resetForDatasetReload({
-              reason: 'dataset-publication'
-            });
+            try {
+              await window._comparisonModule.resetForDatasetReload({
+                reason: 'dataset-publication'
+              });
+            } finally {
+              assertCurrentDatasetPublication(publication);
+            }
           }
           debug.log(
             `[Main] Published dataset identity ` +
@@ -1121,6 +1433,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           );
         },
         reportFailure: error => {
+          if (publication.isCurrent() !== true) return;
           const errorMessage = error instanceof Error
             ? error.message
             : String(error);
@@ -1143,9 +1456,6 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
 
     const hasInitialDataset =
       dataSourceManager.hasActiveDataset() === true;
-    const initialReloadTransaction = hasInitialDataset
-      ? datasetReloadCoordinator.begin()
-      : null;
     let initialPublication = null;
     if (hasInitialDataset) {
       // Capture the exact selected id and URL before any asynchronous metadata
@@ -1404,15 +1714,22 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
 
       let publication;
       const previousRuntimeStage = activeRuntimeStage;
+      const previousPublication = activeDatasetPublication;
       try {
         publication = commitDatasetRuntimeStage(runtimeStage);
       } catch (runtimeError) {
         let restorationError = null;
         try {
           if (previousRuntimeStage === null) {
-            publishEmptyDatasetRuntime({ clearViews: false });
+            publishEmptyDatasetRuntime({
+              clearViews: false,
+              restorationPublication: previousPublication
+            });
           } else {
-            restoreRuntimeStage(previousRuntimeStage);
+            restoreRuntimeStage(
+              previousRuntimeStage,
+              previousPublication
+            );
           }
         } catch (error) {
           restorationError = error;
@@ -1471,17 +1788,50 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           }
         });
       }
-      reloadTransaction.adoptCurrentIdentity();
+      let managerListenerError = null;
       try {
         dataSourceManager.publishDatasetSelection(managerPublication);
       } catch (error) {
+        managerListenerError = error;
+      }
+      const synchronizationOutcome = await synchronizePublishedDatasetUi(
+        selectionStage.metadata,
+        publication
+      );
+      let managerFinalizationError = null;
+      try {
+        dataSourceManager.finalizeDatasetSelection(managerPublication);
+      } catch (error) {
+        managerFinalizationError = error;
+      }
+      if (
+        synchronizationOutcome.status === 'superseded' ||
+        publication.isCurrent() !== true
+      ) {
+        return handleDatasetReloadFailure({
+          error: createDatasetReloadSupersededError(
+            'Dataset reload was superseded during UI synchronization.'
+          ),
+          transaction: publication,
+          cancel: () => cancelDataLoad(loadToken),
+          reportFailure() {
+            throw new Error(
+              'A superseded publication must not report reload failure.'
+            );
+          }
+        });
+      }
+      assertCurrentDatasetPublication(publication);
+      if (managerListenerError !== null) {
         console.error(
           '[Main] Dataset loaded, but manager listeners failed:',
-          error
+          managerListenerError
         );
         notifications.error(
           `The dataset is loaded, but a selection control could not be ` +
-          `synchronized: ${error instanceof Error ? error.message : String(error)}`,
+          `synchronized: ${managerListenerError instanceof Error
+            ? managerListenerError.message
+            : String(managerListenerError)}`,
           {
             category: 'data',
             title: 'Dataset controls unavailable',
@@ -1489,20 +1839,16 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           }
         );
       }
-      const synchronizationOutcome = synchronizePublishedDatasetUi(
-        selectionStage.metadata,
-        publication
-      );
-      try {
-        dataSourceManager.finalizeDatasetSelection(managerPublication);
-      } catch (error) {
+      if (managerFinalizationError !== null) {
         console.error(
           '[Main] Dataset loaded, but prior-source cleanup failed:',
-          error
+          managerFinalizationError
         );
         notifications.error(
           `The new dataset is loaded, but prior-source resources could not ` +
-          `be fully released: ${error instanceof Error ? error.message : String(error)}`,
+          `be fully released: ${managerFinalizationError instanceof Error
+            ? managerFinalizationError.message
+            : String(managerFinalizationError)}`,
           {
             category: 'data',
             title: 'Prior dataset cleanup failed',
@@ -1511,25 +1857,27 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         );
       }
       const stateOutcome = await restoreAdvertisedDatasetState({
-        signal: reloadTransaction.signal
+        signal: publication.signal
       });
+      const settledStateOutcome =
+        await settlePublishedDatasetStateOutcome({
+          outcome: stateOutcome,
+          transaction: publication,
+          cancel: () => cancelDataLoad(loadToken),
+          complete: () => completeDataLoadSuccess(
+            loadToken,
+            buildDatasetAnalyticsContext({
+              metadata: selectionStage.metadata,
+              datasetId,
+              datasetName: selectionStage.metadata.name,
+              reload: true
+            })
+          )
+        });
       debug.log(
-        `[Main] Published dataset state outcome: ${stateOutcome.status}`
+        `[Main] Published dataset state outcome: ` +
+        `${settledStateOutcome.status}`
       );
-      await settlePublishedDatasetStateOutcome({
-        outcome: stateOutcome,
-        transaction: reloadTransaction,
-        cancel: () => cancelDataLoad(loadToken),
-        complete: () => completeDataLoadSuccess(
-          loadToken,
-          buildDatasetAnalyticsContext({
-            metadata: selectionStage.metadata,
-            datasetId,
-            datasetName: selectionStage.metadata.name,
-            reload: true
-          })
-        )
-      });
       return synchronizationOutcome.status === 'ready' ||
         synchronizationOutcome.status === 'ready-ui-error';
     }
@@ -1555,8 +1903,11 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
 
       const previousRuntimeStage = activeRuntimeStage;
       const previousDimensionManager = dimensionManager;
+      const previousPublication = activeDatasetPublication;
+      let emptyPublication = null;
       try {
-        publishEmptyDatasetRuntime({ clearViews: true });
+        emptyPublication =
+          publishEmptyDatasetRuntime({ clearViews: true });
       } catch (runtimeError) {
         const rollbackErrors = [runtimeError];
         const rejectedEmptyDimensionManager =
@@ -1565,9 +1916,15 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
             : dimensionManager;
         try {
           if (previousRuntimeStage === null) {
-            publishEmptyDatasetRuntime({ clearViews: false });
+            publishEmptyDatasetRuntime({
+              clearViews: false,
+              restorationPublication: previousPublication
+            });
           } else {
-            restoreRuntimeStage(previousRuntimeStage);
+            restoreRuntimeStage(
+              previousRuntimeStage,
+              previousPublication
+            );
           }
         } catch (error) {
           rollbackErrors.push(error);
@@ -1600,50 +1957,32 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
               'Dataset clear runtime publication and rollback failed.'
             );
       }
+      let managerListenerError = null;
       if (managerPublication !== null) {
         try {
           dataSourceManager.publishDatasetSelection(managerPublication);
         } catch (error) {
-          console.error(
-            '[Main] Empty dataset published, but manager listeners failed:',
-            error
-          );
-          notifications.error(
-            `The dataset was cleared, but a selection control could not be ` +
-            `synchronized: ${error instanceof Error ? error.message : String(error)}`,
-            {
-              category: 'data',
-              title: 'Dataset controls unavailable',
-              duration: 0
-            }
-          );
-        }
-        try {
-          dataSourceManager.finalizeDatasetSelection(managerPublication);
-        } catch (error) {
-          console.error(
-            '[Main] Dataset cleared, but prior-source cleanup failed:',
-            error
-          );
-          notifications.error(
-            `The dataset was cleared, but prior-source resources could not ` +
-            `be fully released: ${error instanceof Error ? error.message : String(error)}`,
-            {
-              category: 'data',
-              title: 'Prior dataset cleanup failed',
-              duration: 0
-            }
-          );
+          managerListenerError = error;
         }
       }
-      settlePublishedDatasetUi({
-        synchronize: () => {
+      const synchronizationOutcome = await settlePublishedDatasetUi({
+        synchronize: async () => {
+          assertCurrentDatasetPublication(emptyPublication);
+          try {
+            await ui?.settleFieldInteractions?.();
+          } finally {
+            assertCurrentDatasetPublication(emptyPublication);
+          }
           connectivityRuntimeOwner.prepareDatasetReplacement();
           connectivityRuntimeOwner.synchronizeDatasetPublication();
           if (window._comparisonModule) {
-            window._comparisonModule.resetForDatasetReload({
-              reason: 'dataset-clear'
-            });
+            try {
+              await window._comparisonModule.resetForDatasetReload({
+                reason: 'dataset-clear'
+              });
+            } finally {
+              assertCurrentDatasetPublication(emptyPublication);
+            }
           }
           ui.refreshDatasetUI(null);
         },
@@ -1651,6 +1990,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           runtimeRetirementOwner.retire(previousDimensionManager);
         },
         reportFailure: error => {
+          if (emptyPublication.isCurrent() !== true) return;
           console.error(
             '[Main] Dataset cleared, but UI synchronization failed:',
             error
@@ -1666,6 +2006,66 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           );
         }
       });
+      let managerFinalizationError = null;
+      if (managerPublication !== null) {
+        try {
+          dataSourceManager.finalizeDatasetSelection(managerPublication);
+        } catch (error) {
+          managerFinalizationError = error;
+        }
+      }
+      if (
+        synchronizationOutcome.status === 'superseded' ||
+        emptyPublication.isCurrent() !== true
+      ) {
+        return handleDatasetReloadFailure({
+          error: createDatasetReloadSupersededError(
+            'Dataset clear was superseded during UI synchronization.'
+          ),
+          transaction: emptyPublication,
+          cancel() {},
+          reportFailure() {
+            throw new Error(
+              'A superseded clear must not report dataset failure.'
+            );
+          }
+        });
+      }
+      assertCurrentDatasetPublication(emptyPublication);
+      if (managerListenerError !== null) {
+        console.error(
+          '[Main] Empty dataset published, but manager listeners failed:',
+          managerListenerError
+        );
+        notifications.error(
+          `The dataset was cleared, but a selection control could not be ` +
+          `synchronized: ${managerListenerError instanceof Error
+            ? managerListenerError.message
+            : String(managerListenerError)}`,
+          {
+            category: 'data',
+            title: 'Dataset controls unavailable',
+            duration: 0
+          }
+        );
+      }
+      if (managerFinalizationError !== null) {
+        console.error(
+          '[Main] Dataset cleared, but prior-source cleanup failed:',
+          managerFinalizationError
+        );
+        notifications.error(
+          `The dataset was cleared, but prior-source resources could not ` +
+          `be fully released: ${managerFinalizationError instanceof Error
+            ? managerFinalizationError.message
+            : String(managerFinalizationError)}`,
+          {
+            category: 'data',
+            title: 'Prior dataset cleanup failed',
+            duration: 0
+          }
+        );
+      }
       return true;
     }
     // One-time helper to rebuild density from current visibility + grid
@@ -1896,9 +2296,9 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     }
 
     if (hasInitialDataset) {
-      if (initialReloadTransaction === null) {
+      if (initialPublication === null) {
         throw new Error(
-          'Initial dataset state requires one reload transaction.'
+          'Initial dataset state requires one runtime publication.'
         );
       }
       if (currentDatasetLoadToken === null) {
@@ -1907,23 +2307,38 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         );
       }
       let stateOutcome = { status: 'superseded' };
-      if (initialReloadTransaction.isCurrent()) {
-        synchronizePublishedDatasetUi(
+      if (initialPublication.isCurrent()) {
+        const synchronizationOutcome = await synchronizePublishedDatasetUi(
           dataSourceManager.getCurrentMetadata(),
           initialPublication
         );
-        await ui.activateField(-1);
-        if (initialReloadTransaction.isCurrent()) {
-          stateOutcome = await restoreAdvertisedDatasetState({
-            signal: initialReloadTransaction.signal
-          });
+        if (
+          synchronizationOutcome.status !== 'superseded' &&
+          initialPublication.isCurrent()
+        ) {
+          assertCurrentDatasetPublication(initialPublication);
+          let fieldActivationError = null;
+          try {
+            await ui.activateField(-1);
+          } catch (error) {
+            fieldActivationError = error;
+          }
+          if (initialPublication.isCurrent()) {
+            assertCurrentDatasetPublication(initialPublication);
+            if (fieldActivationError !== null) {
+              throw fieldActivationError;
+            }
+            stateOutcome = await restoreAdvertisedDatasetState({
+              signal: initialPublication.signal
+            });
+          }
         }
       }
       const initialLoadToken = currentDatasetLoadToken;
       const settledStateOutcome =
         await settleInitialPublishedDatasetStateOutcome({
           outcome: stateOutcome,
-          transaction: initialReloadTransaction,
+          transaction: initialPublication,
           cancel: () => cancelDataLoad(initialLoadToken),
           complete: () => completeDataLoadSuccess(
             initialLoadToken,
@@ -2393,8 +2808,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         edgeDestinations = renderEdgeData.destinations;
         if (
           viewer.setupEdgesV2(
-            renderEdgeData,
-            state.positionsArray
+            renderEdgeData
           ) !== true
         ) {
           throw new Error(
@@ -2404,13 +2818,8 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
 
         const existingSnapshots = viewer.getSnapshotViews();
         for (const snapshot of existingSnapshots) {
-          const snapshotPositions = viewer.getViewPositions(snapshot.id);
           if (
-            viewer.setupEdgesV2ForView(
-              snapshot.id,
-              snapshotPositions,
-              snapshotPositions.length / 3
-            ) !== true
+            viewer.setupEdgesV2ForView(snapshot.id) !== true
           ) {
             throw new Error(
               `The viewer rejected connectivity positions for view "${snapshot.id}".`
@@ -2997,8 +3406,8 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       if (benchVisibleEl) benchVisibleEl.textContent = formatNumber(visiblePoints ?? pointCount ?? 0);
 
       if (benchMemoryEl) {
-        const gpuMemMB = ((pointCount ?? visiblePoints ?? 0) * 28 / 1024 / 1024).toFixed(1);
-        benchMemoryEl.textContent = `${gpuMemMB} MB`;
+        benchMemoryEl.textContent =
+          formatBenchmarkGpuMemory(hpStats, pointCount);
       }
 
       if (benchGenInfoEl && benchGenTimeEl) {
@@ -3185,18 +3594,36 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     }
 
     async function runBenchmark(pointCount, pattern) {
+      const syntheticTransaction = datasetReloadCoordinator.begin();
       // Ensure benchmark module is loaded before running
       const moduleLoaded = await ensureBenchmarkModule();
+      if (!syntheticTransaction.isCurrent()) return false;
+      syntheticTransaction.assertCurrent();
       if (!moduleLoaded || !SyntheticDataGenerator) {
         console.error('[Main] Cannot run benchmark: SyntheticDataGenerator not available');
         notifications.error('Benchmark module failed to load', { category: 'benchmark' });
-        return;
+        return false;
       }
 
       debug.log(`Running benchmark: ${formatNumber(pointCount)} points (${pattern})`);
 
       // Show notification for benchmark data generation
       const benchNotifId = notifications.startDataGeneration(pattern, pointCount);
+      let candidateDimensionManager = null;
+      const dismissSupersededBenchmark = ({ retireCandidate = false } = {}) => {
+        try {
+          if (
+            retireCandidate &&
+            candidateDimensionManager !== null &&
+            candidateDimensionManager !== dimensionManager
+          ) {
+            runtimeRetirementOwner.retire(candidateDimensionManager);
+          }
+        } finally {
+          notifications.dismiss(benchNotifId);
+        }
+        return false;
+      };
 
       ensureBenchmarkStatsVisible();
       if (benchFpsEl) benchFpsEl.textContent = '-';
@@ -3231,21 +3658,31 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
             // Async loading from GLB file - update notification
             notifications.updateBenchmark(benchNotifId, 10, 'Loading GLB model...');
             data = await SyntheticDataGenerator.fromGLBUrl(pointCount);
+            if (!syntheticTransaction.isCurrent()) {
+              return dismissSupersededBenchmark();
+            }
+            syntheticTransaction.assertCurrent();
             break;
           case 'clusters':
           default:
             data = SyntheticDataGenerator.gaussianClusters(pointCount);
         }
       } catch (err) {
+        if (!syntheticTransaction.isCurrent()) {
+          return dismissSupersededBenchmark();
+        }
         console.error('Failed to generate data:', err);
         const message = pattern === 'glb'
           ? `GLB load failed: ${err.message || err}`
           : `Error: ${err.message || err}`;
         notifications.fail(benchNotifId, `Benchmark failed: ${message}`);
-        return;
+        return false;
       }
+      if (!syntheticTransaction.isCurrent()) {
+        return dismissSupersededBenchmark();
+      }
+      syntheticTransaction.assertCurrent();
       const genTime = Math.round(performance.now() - genStart);
-      let candidateDimensionManager;
       try {
         if (
           !Number.isSafeInteger(pointCount) ||
@@ -3270,7 +3707,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           benchNotifId,
           `Benchmark failed: ${error.message}`
         );
-        return;
+        return false;
       }
 
       const syntheticStage = Object.freeze({
@@ -3281,10 +3718,22 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         runtimeKind: 'synthetic'
       });
       const previousRuntimeStage = activeRuntimeStage;
+      const previousPublication = activeDatasetPublication;
       let syntheticPublication;
       try {
         await cancelPublishedDatasetStateAndWait();
+        if (!syntheticTransaction.isCurrent()) {
+          return dismissSupersededBenchmark({
+            retireCandidate: true
+          });
+        }
+        syntheticTransaction.assertCurrent();
       } catch (error) {
+        if (!syntheticTransaction.isCurrent()) {
+          return dismissSupersededBenchmark({
+            retireCandidate: true
+          });
+        }
         try {
           runtimeRetirementOwner.retire(candidateDimensionManager);
         } catch (retirementError) {
@@ -3303,7 +3752,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
             ? error.message
             : String(error)}`
         );
-        return;
+        return false;
       }
       try {
         syntheticPublication =
@@ -3312,9 +3761,15 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         const publicationErrors = [error];
         try {
           if (previousRuntimeStage === null) {
-            publishEmptyDatasetRuntime({ clearViews: false });
+            publishEmptyDatasetRuntime({
+              clearViews: false,
+              restorationPublication: previousPublication
+            });
           } else {
-            restoreRuntimeStage(previousRuntimeStage);
+            restoreRuntimeStage(
+              previousRuntimeStage,
+              previousPublication
+            );
           }
         } catch (restorationError) {
           publicationErrors.push(restorationError);
@@ -3335,19 +3790,29 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           benchNotifId,
           `Benchmark failed: ${exactError.message}`
         );
-        return;
+        return false;
       }
 
       // The exact DataState generation is now live. Publish the matching app
       // runtime and retire every previous dataset-count owner synchronously.
-      settlePublishedDatasetUi({
-        synchronize: () => {
+      const synchronizationOutcome = await settlePublishedDatasetUi({
+        synchronize: async () => {
+          assertCurrentDatasetPublication(syntheticPublication);
+          try {
+            await ui?.settleFieldInteractions?.();
+          } finally {
+            assertCurrentDatasetPublication(syntheticPublication);
+          }
           connectivityRuntimeOwner.prepareDatasetReplacement();
           connectivityRuntimeOwner.synchronizeDatasetPublication();
           if (window._comparisonModule) {
-            window._comparisonModule.resetForDatasetReload({
-              reason: 'synthetic-benchmark-publication'
-            });
+            try {
+              await window._comparisonModule.resetForDatasetReload({
+                reason: 'synthetic-benchmark-publication'
+              });
+            } finally {
+              assertCurrentDatasetPublication(syntheticPublication);
+            }
           }
         },
         finalize: () => {
@@ -3356,6 +3821,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           );
         },
         reportFailure: error => {
+          if (syntheticPublication.isCurrent() !== true) return;
           console.error(
             '[Main] Synthetic benchmark was published, but cleanup failed:',
             error
@@ -3371,12 +3837,23 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           );
         }
       });
+      if (
+        synchronizationOutcome.status === 'superseded' ||
+        syntheticPublication.isCurrent() !== true
+      ) {
+        return dismissSupersededBenchmark();
+      }
+      assertCurrentDatasetPublication(syntheticPublication);
 
       // Ensure point rendering mode only after the complete replacement has
       // succeeded, so a rejected benchmark preserves the previous runtime.
       if (renderModeSelect && renderModeSelect.value !== 'points') {
-        renderModeSelect.value = 'points';
-        viewer.setRenderMode('points');
+        const applied = ui.applyRenderMode('points');
+        if (applied !== true || renderModeSelect.value !== 'points') {
+          throw new Error(
+            'Synthetic benchmark publication could not settle exact Points mode.'
+          );
+        }
       }
 
       notifications.completeDataGeneration(benchNotifId, genTime);
@@ -3409,12 +3886,18 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         success: 1
       });
 
-      const gpuMemMB = (pointCount * 28 / 1024 / 1024).toFixed(1);
+      const gpuMemEstimateMB =
+        estimateBenchmarkGpuMemoryMB(pointCount);
 
       // Refresh stat panel immediately and start perf tracking loop
       activateBenchmarkingPanel({ resetTracker: true });
 
-      debug.log(`Benchmark loaded: ${formatNumber(pointCount)} points, ~${gpuMemMB}MB GPU memory (gen: ${genTime}ms)`);
+      debug.log(
+        `Benchmark loaded: ${formatNumber(pointCount)} points, ` +
+        `~${gpuMemEstimateMB.toFixed(1)}MB estimated GPU memory ` +
+        `(gen: ${genTime}ms)`
+      );
+      return true;
     }
 
     async function generateSituationReport() {
@@ -3705,7 +4188,13 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           const bnShaderOverhead = document.getElementById('bn-shader-overhead');
 
           if (bnVisiblePoints) bnVisiblePoints.textContent = formatNumShort(s.rendering.visiblePoints);
-          if (bnGpuMemory) bnGpuMemory.textContent = s.rendering.gpuMemoryMB + 'MB';
+          if (bnGpuMemory) {
+            bnGpuMemory.textContent =
+              `${s.rendering.gpuMemoryMB}MB` +
+              (s.rendering.gpuMemoryEstimated
+                ? ' (estimate)'
+                : '');
+          }
           if (bnLodLevel) bnLodLevel.textContent = Math.round(s.rendering.lodLevel);
           if (bnDrawCalls) bnDrawCalls.textContent = Math.round(s.rendering.drawCalls);
           if (bnFrametime) bnFrametime.textContent = s.performance.avgFrameTimeMs.toFixed(1) + 'ms';

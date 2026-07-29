@@ -22,6 +22,9 @@ export class OrbitAnchorRenderer {
 
     // Per-view state
     this.viewStates = new Map();
+    this._pendingViewRetirements = new Map();
+    this._disposeRequested = false;
+    this._disposed = false;
 
     // Global settings
     this.showAnchor = true;
@@ -35,17 +38,43 @@ export class OrbitAnchorRenderer {
   }
 
   dispose() {
-    const gl = this.gl;
+    if (this._disposed) return false;
 
-    for (const viewId of Array.from(this.viewStates.keys())) {
-      this.deleteViewState(viewId);
+    const gl = this.gl;
+    this._disposeRequested = true;
+    const failures = [];
+
+    // Detach every logical view before the first fallible GL deletion. Failed
+    // resource owners remain private and retryable, never render-dispatchable.
+    for (const [viewId, state] of this.viewStates) {
+      this._pendingViewRetirements.set(viewId, state);
     }
     this.viewStates.clear();
 
-    if (this.program3D) gl.deleteProgram(this.program3D);
-    if (this.program2D) gl.deleteProgram(this.program2D);
-    this.program3D = null;
-    this.program2D = null;
+    for (const [viewId, state] of this._pendingViewRetirements) {
+      failures.push(...this._retireViewState(viewId, state));
+    }
+
+    const retireProgram = (program, clearOwner) => {
+      if (program === null) return;
+      try {
+        gl.deleteProgram(program);
+        clearOwner();
+      } catch (error) {
+        failures.push(error);
+      }
+    };
+    retireProgram(this.program3D, () => { this.program3D = null; });
+    retireProgram(this.program2D, () => { this.program2D = null; });
+
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        `Orbit-anchor disposal failed for ${failures.length} owned resource(s).`
+      );
+    }
+    this._disposed = true;
+    return true;
   }
 
   _createShader(type, source) {
@@ -122,6 +151,14 @@ export class OrbitAnchorRenderer {
 
   // Get or create per-view state
   getViewState(viewId) {
+    if (this._disposeRequested) {
+      throw new Error('A disposing orbit-anchor renderer cannot publish view state.');
+    }
+    if (this._pendingViewRetirements.has(viewId)) {
+      throw new Error(
+        `Orbit-anchor view "${String(viewId)}" is pending resource retirement.`
+      );
+    }
     if (!this.viewStates.has(viewId)) {
       const gl = this.gl;
       this.viewStates.set(viewId, {
@@ -147,20 +184,54 @@ export class OrbitAnchorRenderer {
     return this.viewStates.get(viewId);
   }
 
+  _retireViewState(viewId, state) {
+    const failures = [];
+    const bufferProperties = [
+      'positionBuffer',
+      'normalBuffer',
+      'colorBuffer',
+      'indexBuffer',
+      'linePositionBuffer',
+      'lineNormalBuffer',
+      'lineColorBuffer',
+    ];
+    for (const property of bufferProperties) {
+      const buffer = state[property];
+      if (buffer === null) continue;
+      try {
+        this.gl.deleteBuffer(buffer);
+        state[property] = null;
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length === 0) {
+      this._pendingViewRetirements.delete(viewId);
+    }
+    return failures;
+  }
+
   // Clean up view state
   deleteViewState(viewId) {
-    const gl = this.gl;
-    const state = this.viewStates.get(viewId);
+    let state = this.viewStates.get(viewId);
     if (state) {
-      gl.deleteBuffer(state.positionBuffer);
-      gl.deleteBuffer(state.normalBuffer);
-      gl.deleteBuffer(state.colorBuffer);
-      gl.deleteBuffer(state.indexBuffer);
-      gl.deleteBuffer(state.linePositionBuffer);
-      gl.deleteBuffer(state.lineNormalBuffer);
-      gl.deleteBuffer(state.lineColorBuffer);
+      // Logical retirement is published before cleanup can fail.
       this.viewStates.delete(viewId);
+      this._pendingViewRetirements.set(viewId, state);
+    } else {
+      state = this._pendingViewRetirements.get(viewId);
     }
+    if (!state) return false;
+
+    const failures = this._retireViewState(viewId, state);
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        `Orbit-anchor view "${String(viewId)}" retirement failed for `
+          + `${failures.length} buffer(s).`
+      );
+    }
+    return true;
   }
 
   // Trigger rebuild for all views
@@ -1034,6 +1105,8 @@ export class OrbitAnchorRenderer {
 
   // Draw the orbit anchor for a view
   draw(params) {
+    if (this._disposeRequested) return;
+
     const {
       viewId,
       viewTheta,

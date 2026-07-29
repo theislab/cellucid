@@ -29,6 +29,92 @@ import { DEFAULTS, ERROR_MESSAGES, formatError, ANALYSIS_PHASES } from './consta
 // =============================================================================
 
 /**
+ * Marker workers retain one module-global categorical context. A discovery run
+ * therefore owns every worker from context broadcast until its final marker
+ * task settles. The queue is module-scoped so separate engine instances cannot
+ * overwrite each other's scientific context.
+ */
+let markerContextLeaseActive = false;
+const markerContextLeaseWaiters = [];
+
+function getAbortReason(signal) {
+  return signal?.reason ??
+    new DOMException('Marker discovery was aborted', 'AbortError');
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) {
+    throw getAbortReason(signal);
+  }
+}
+
+/**
+ * @param {AbortSignal|undefined} signal
+ * @returns {Promise<() => void>}
+ */
+async function acquireMarkerContextLease(signal) {
+  throwIfAborted(signal);
+
+  const createRelease = () => {
+    let released = false;
+    return () => {
+      if (released) {
+        throw new Error('Marker worker context lease was released more than once');
+      }
+      released = true;
+
+      while (markerContextLeaseWaiters.length > 0) {
+        const waiter = markerContextLeaseWaiters.shift();
+        waiter.removeAbortListener();
+        if (waiter.signal?.aborted) {
+          waiter.reject(getAbortReason(waiter.signal));
+          continue;
+        }
+        waiter.resolve(createRelease());
+        return;
+      }
+      markerContextLeaseActive = false;
+    };
+  };
+
+  let release;
+  if (!markerContextLeaseActive) {
+    markerContextLeaseActive = true;
+    release = createRelease();
+  } else {
+    release = await new Promise((resolve, reject) => {
+      const waiter = {
+        signal,
+        resolve,
+        reject,
+        removeAbortListener: () => {}
+      };
+      if (signal) {
+        const handleAbort = () => {
+          const index = markerContextLeaseWaiters.indexOf(waiter);
+          if (index >= 0) {
+            markerContextLeaseWaiters.splice(index, 1);
+          }
+          waiter.removeAbortListener();
+          reject(getAbortReason(signal));
+        };
+        waiter.removeAbortListener = () => {
+          signal.removeEventListener('abort', handleAbort);
+        };
+        signal.addEventListener('abort', handleAbort, { once: true });
+      }
+      markerContextLeaseWaiters.push(waiter);
+    });
+  }
+
+  if (signal?.aborted) {
+    release();
+    throw getAbortReason(signal);
+  }
+  return release;
+}
+
+/**
  * Max-heap that keeps the "worst" element at the root, so we can evict it when
  * we exceed capacity.
  */
@@ -314,8 +400,8 @@ export class MarkerDiscoveryEngine {
     }
     const {
       obsCategory,
-      groups,
-      obsCodes,
+      groups: requestedGroups,
+      obsCodes: requestedObsCodes,
       geneList = null,
       method = DEFAULTS.method,
       topNPerGroup = DEFAULTS.topNPerGroup,
@@ -396,12 +482,13 @@ export class MarkerDiscoveryEngine {
         '[MarkerDiscoveryEngine] batchConfig must be an object'
       );
     }
+    const preloadCount =
+      batchConfig.preloadCount ?? this._config.batchSize;
+    const networkConcurrency =
+      batchConfig.networkConcurrency ?? this._config.networkConcurrency;
     for (const [name, value] of [
-      ['preloadCount', batchConfig.preloadCount ?? this._config.batchSize],
-      [
-        'networkConcurrency',
-        batchConfig.networkConcurrency ?? this._config.networkConcurrency
-      ],
+      ['preloadCount', preloadCount],
+      ['networkConcurrency', networkConcurrency],
     ]) {
       if (!Number.isSafeInteger(value) || value <= 0) {
         throw new RangeError(
@@ -442,8 +529,8 @@ export class MarkerDiscoveryEngine {
     if (signal?.aborted) {
       throw signal.reason;
     }
-    this._validateGroups(groups, minCells);
-    if (!(obsCodes instanceof Uint16Array) || obsCodes.length === 0) {
+    this._validateGroups(requestedGroups, minCells);
+    if (!(requestedObsCodes instanceof Uint16Array) || requestedObsCodes.length === 0) {
       throw new TypeError(
         '[MarkerDiscoveryEngine] obsCodes must be a non-empty Uint16Array'
       );
@@ -454,11 +541,20 @@ export class MarkerDiscoveryEngine {
         '[MarkerDiscoveryEngine] exact positive dataset pointCount is required'
       );
     }
-    if (obsCodes.length !== pointCount) {
+    if (requestedObsCodes.length !== pointCount) {
       throw new RangeError(
         '[MarkerDiscoveryEngine] obsCodes length must exactly match pointCount'
       );
     }
+    const groups = requestedGroups.map(group => ({
+      groupId: group.groupId,
+      groupName: group.groupName,
+      groupCode: group.groupCode,
+      cellIndices: group.cellIndices,
+      cellCount: group.cellCount,
+      color: group.color
+    }));
+    const obsCodes = new Uint16Array(requestedObsCodes);
     const groupByCode = new Map(
       groups.map(group => [group.groupCode, group])
     );
@@ -554,9 +650,12 @@ export class MarkerDiscoveryEngine {
       );
     }
 
+    const releaseMarkerContext = await acquireMarkerContextLease(signal);
+    try {
     // Worker pool (shared singleton used by ComputeManager too).
     const pool = getWorkerPool();
     await pool.init();
+    throwIfAborted(signal);
     if (!pool.isReady()) {
       throw new Error('Marker discovery requires Web Workers');
     }
@@ -599,8 +698,9 @@ export class MarkerDiscoveryEngine {
         codeToGroupIndex: new Int16Array(codeToGroupIndex),
         groupCount
       }),
-      { timeout: 30000, signal }
+      { timeout: 30000 }
     );
+    throwIfAborted(signal);
 
     // Prepare per-group p-value storage for BH correction.
     const pValuesByGroup = Array.from({ length: groupCount }, () => {
@@ -635,8 +735,8 @@ export class MarkerDiscoveryEngine {
     });
 
     const effectiveBatchConfig = {
-      preloadCount: batchConfig.preloadCount ?? this._config.batchSize,
-      networkConcurrency: batchConfig.networkConcurrency ?? this._config.networkConcurrency,
+      preloadCount,
+      networkConcurrency,
       memoryBudgetMB
     };
 
@@ -678,7 +778,7 @@ export class MarkerDiscoveryEngine {
     const executionErrors = [];
 
     const reportProgress = () => {
-      if (!onProgress) return;
+      if (signal?.aborted || !onProgress) return;
       onProgress({
         phase: ANALYSIS_PHASES.DISCOVERY,
         progress: Math.round((completedGenes / geneCount) * 100),
@@ -691,7 +791,7 @@ export class MarkerDiscoveryEngine {
     reportProgress();
 
     const maybeEmitPartial = () => {
-      if (!onPartialResults) return;
+      if (signal?.aborted || !onPartialResults) return;
       if (completedGenes - lastPartialEmit < this._config.progressInterval) return;
       lastPartialEmit = completedGenes;
 
@@ -725,7 +825,9 @@ export class MarkerDiscoveryEngine {
         const { gene, values, index: geneIndex } of
         loader.streamGenesRaw(allGenes)
       ) {
+        throwIfAborted(signal);
         await waitForAvailableSlot(inFlight, maxInFlight);
+        throwIfAborted(signal);
         if (executionErrors.length === 1) throw executionErrors[0];
         if (executionErrors.length > 1) {
           throw new AggregateError(
@@ -746,11 +848,11 @@ export class MarkerDiscoveryEngine {
               { values: valuesCopyForWorker, method, minCells },
               {
                 timeout: 120000,
-                signal,
                 transfer: true
               }
             );
 
+            if (signal?.aborted) return;
             this._ingestGeneResult({
               gene,
               geneIndex,
@@ -760,12 +862,11 @@ export class MarkerDiscoveryEngine {
               heaps,
               result: res
             });
-          } catch (error) {
-            executionErrors.push(error);
-          } finally {
             completedGenes++;
             reportProgress();
             maybeEmitPartial();
+          } catch (error) {
+            executionErrors.push(error);
           }
         })().finally(() => inFlight.delete(task));
 
@@ -790,17 +891,26 @@ export class MarkerDiscoveryEngine {
     if (streamFailure !== undefined) appendFailure(streamFailure);
     for (const failure of executionErrors) appendFailure(failure);
     for (const failure of remainingFailures) appendFailure(failure);
+    if (signal?.aborted) {
+      const abortReason = getAbortReason(signal);
+      const nonAbortFailures = failures.filter(
+        failure => failure !== abortReason
+      );
+      if (nonAbortFailures.length === 1) throw nonAbortFailures[0];
+      if (nonAbortFailures.length > 1) {
+        throw new AggregateError(
+          nonAbortFailures,
+          `${nonAbortFailures.length} marker cleanup operations failed after cancellation`
+        );
+      }
+      throw abortReason;
+    }
     if (failures.length === 1) throw failures[0];
     if (failures.length > 1) {
       throw new AggregateError(
         failures,
         `${failures.length} marker streaming or worker operations failed`
       );
-    }
-
-    // If we were cancelled, do not proceed to heavy post-processing (BH correction).
-    if (signal?.aborted) {
-      throw signal.reason;
     }
 
     // BH correction per group
@@ -818,7 +928,7 @@ export class MarkerDiscoveryEngine {
 
     const duration = performance.now() - startTime;
 
-    if (onPartialResults) {
+    if (!signal?.aborted && onPartialResults) {
       onPartialResults({
         markers: {
           obsCategory,
@@ -833,6 +943,7 @@ export class MarkerDiscoveryEngine {
         isComplete: true
       });
     }
+    throwIfAborted(signal);
 
     return {
       obsCategory,
@@ -849,6 +960,9 @@ export class MarkerDiscoveryEngine {
         log2FoldChangeByGroup: log2FCByGroup
       }
     };
+    } finally {
+      releaseMarkerContext();
+    }
   }
 
   // ===========================================================================

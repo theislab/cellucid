@@ -33,6 +33,45 @@
  * manager.onPageSelectionChange(pageIds);
  */
 
+function createOwnedOperation(assign, operation) {
+  let rejectOperation;
+  let resolveOperation;
+  const task = new Promise((resolve, reject) => {
+    resolveOperation = resolve;
+    rejectOperation = reject;
+  });
+  assign(task);
+  void Promise.resolve()
+    .then(operation)
+    .then(resolveOperation, rejectOperation);
+  return task;
+}
+
+function appendRejectedOutcomes(errors, outcomes) {
+  for (const outcome of outcomes) {
+    if (outcome.status === 'rejected') {
+      errors.push(outcome.reason);
+    }
+  }
+}
+
+function throwLifecycleErrors(errors, message) {
+  const exactErrors = [...new Set(errors)];
+  if (exactErrors.length === 1) throw exactErrors[0];
+  if (exactErrors.length > 1) {
+    throw new AggregateError(exactErrors, message);
+  }
+}
+
+function destroyUI(ui) {
+  if (typeof ui?.destroy !== 'function') return Promise.resolve();
+  try {
+    return Promise.resolve(ui.destroy());
+  } catch (error) {
+    return Promise.reject(error);
+  }
+}
+
 /**
  * AnalysisUIManager class
  */
@@ -63,6 +102,13 @@ export class AnalysisUIManager {
 
     // Current page selection (shared across mode switches)
     this._currentPages = [];
+
+    // Lifecycle ownership. Reset is reusable after settlement; destroy is
+    // terminal and keeps its exact task for referential idempotency.
+    this._unregisterTasks = new Map();
+    this._resetPromise = null;
+    this._destroyPromise = null;
+    this._destroyRequested = false;
   }
 
   // ===========================================================================
@@ -82,6 +128,14 @@ export class AnalysisUIManager {
    * @param {string} [config.tooltip] - Tooltip text
    */
   register(config) {
+    if (this._destroyRequested === true) {
+      throw new Error('Cannot register an analysis UI after manager destruction');
+    }
+    if (this._unregisterTasks?.has(config.id)) {
+      throw new Error(
+        `Cannot register analysis UI "${config.id}" while it is unregistering`
+      );
+    }
     this._registry.set(config.id, {
       id: config.id,
       name: config.name,
@@ -99,16 +153,58 @@ export class AnalysisUIManager {
    * @param {string} id - Analysis type ID
    */
   unregister(id) {
-    // Destroy UI if initialized
-    const entry = this._uis.get(id);
-    if (entry?.ui?.destroy) {
-      entry.ui.destroy();
+    if (this._destroyPromise !== null && this._destroyPromise !== undefined) {
+      return this._destroyPromise;
     }
-    if (entry?.container) {
-      entry.container.remove();
-    }
-    this._uis.delete(id);
-    this._registry.delete(id);
+    this._unregisterTasks ??= new Map();
+    const existingTask = this._unregisterTasks.get(id);
+    if (existingTask !== undefined) return existingTask;
+    const resetPrerequisite = this._resetPromise ?? null;
+
+    const task = createOwnedOperation(
+      ownedTask => {
+        this._unregisterTasks.set(id, ownedTask);
+      },
+      async () => {
+        const errors = [];
+        if (resetPrerequisite !== null) {
+          const resetOutcome = await Promise.allSettled([resetPrerequisite]);
+          appendRejectedOutcomes(errors, resetOutcome);
+        }
+
+        const entry = this._uis.get(id);
+        if (entry?.ui !== null && entry?.ui !== undefined) {
+          const destroyOutcomes = await Promise.allSettled([
+            destroyUI(entry.ui)
+          ]);
+          appendRejectedOutcomes(errors, destroyOutcomes);
+        }
+
+        if (entry?.container) {
+          try {
+            entry.container.remove();
+          } catch (error) {
+            errors.push(error);
+          }
+        }
+        this._uis.delete(id);
+        this._registry.delete(id);
+        if (this._activeMode === id) {
+          this._activeMode = null;
+        }
+        throwLifecycleErrors(
+          errors,
+          `Analysis UI "${id}" unregistration failed`
+        );
+      }
+    );
+    const releaseTask = () => {
+      if (this._unregisterTasks.get(id) === task) {
+        this._unregisterTasks.delete(id);
+      }
+    };
+    void task.then(releaseTask, releaseTask);
+    return task;
   }
 
   // ===========================================================================
@@ -121,6 +217,16 @@ export class AnalysisUIManager {
    * If containerMap was provided, uses those containers instead of creating new ones
    */
   initContainers() {
+    if (this._destroyRequested === true) {
+      throw new Error(
+        'Cannot initialize analysis containers after manager destruction'
+      );
+    }
+    if (this._resetPromise !== null && this._resetPromise !== undefined) {
+      throw new Error(
+        'Cannot initialize analysis containers while the manager is resetting'
+      );
+    }
     for (const [id, config] of this._registry) {
       let container;
 
@@ -429,6 +535,16 @@ export class AnalysisUIManager {
    * @param {Object} entry - UI entry from _uis map
    */
   _initializeUI(id, entry) {
+    if (this._destroyRequested === true) {
+      throw new Error(
+        `Cannot initialize analysis UI "${id}" after manager destruction`
+      );
+    }
+    if (this._resetPromise !== null && this._resetPromise !== undefined) {
+      throw new Error(
+        `Cannot initialize analysis UI "${id}" while the manager is resetting`
+      );
+    }
     const config = entry.config;
 
     // Build options object
@@ -461,36 +577,104 @@ export class AnalysisUIManager {
 
   /**
    * Destroy all UIs and cleanup
+   * @returns {Promise<void>}
    */
   destroy() {
-    for (const [id, entry] of this._uis) {
-      if (entry.ui?.destroy) {
-        entry.ui.destroy();
-      }
-      if (entry.container?.parentNode) {
-        entry.container.remove();
-      }
+    if (this._destroyPromise !== null && this._destroyPromise !== undefined) {
+      return this._destroyPromise;
     }
+    this._destroyRequested = true;
+    this._unregisterTasks ??= new Map();
+    const prerequisiteTasks = [
+      ...(this._resetPromise ? [this._resetPromise] : []),
+      ...this._unregisterTasks.values()
+    ];
 
-    this._uis.clear();
-    this._registry.clear();
-    this._activeMode = null;
-    this._currentPages = [];
+    return createOwnedOperation(
+      ownedTask => {
+        this._destroyPromise = ownedTask;
+      },
+      async () => {
+        const errors = [];
+        if (prerequisiteTasks.length > 0) {
+          const prerequisiteOutcomes =
+            await Promise.allSettled(prerequisiteTasks);
+          appendRejectedOutcomes(errors, prerequisiteOutcomes);
+        }
+
+        const entries = [...this._uis.values()];
+        const destroyOutcomes = await Promise.allSettled(
+          entries.map(entry => destroyUI(entry.ui))
+        );
+        appendRejectedOutcomes(errors, destroyOutcomes);
+
+        for (const entry of entries) {
+          if (entry.container?.parentNode) {
+            try {
+              entry.container.remove();
+            } catch (error) {
+              errors.push(error);
+            }
+          }
+        }
+        this._uis.clear();
+        this._registry.clear();
+        this._activeMode = null;
+        this._currentPages = [];
+        throwLifecycleErrors(
+          errors,
+          'Analysis UI manager destruction failed'
+        );
+      }
+    );
   }
 
   /**
    * Reset to initial state (destroys UIs but keeps registry)
+   * @returns {Promise<void>}
    */
   reset() {
-    for (const [id, entry] of this._uis) {
-      if (entry.ui?.destroy) {
-        entry.ui.destroy();
-      }
-      entry.ui = null;
-      entry.initialized = false;
+    if (this._destroyPromise !== null && this._destroyPromise !== undefined) {
+      return this._destroyPromise;
     }
-    this._activeMode = null;
-    this._currentPages = [];
+    if (this._resetPromise !== null && this._resetPromise !== undefined) {
+      return this._resetPromise;
+    }
+    this._unregisterTasks ??= new Map();
+    const prerequisiteTasks = [...this._unregisterTasks.values()];
+    const task = createOwnedOperation(
+      ownedTask => {
+        this._resetPromise = ownedTask;
+      },
+      async () => {
+        const errors = [];
+        if (prerequisiteTasks.length > 0) {
+          const prerequisiteOutcomes =
+            await Promise.allSettled(prerequisiteTasks);
+          appendRejectedOutcomes(errors, prerequisiteOutcomes);
+        }
+
+        const entries = [...this._uis.values()];
+        const destroyOutcomes = await Promise.allSettled(
+          entries.map(entry => destroyUI(entry.ui))
+        );
+        appendRejectedOutcomes(errors, destroyOutcomes);
+        for (const entry of entries) {
+          entry.ui = null;
+          entry.initialized = false;
+        }
+        this._activeMode = null;
+        this._currentPages = [];
+        throwLifecycleErrors(errors, 'Analysis UI manager reset failed');
+      }
+    );
+    const releaseTask = () => {
+      if (this._resetPromise === task) {
+        this._resetPromise = null;
+      }
+    };
+    void task.then(releaseTask, releaseTask);
+    return task;
   }
 }
 

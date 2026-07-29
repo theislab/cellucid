@@ -107,18 +107,22 @@ test('viewer edge teardown releases every dataset-owned GPU edge state', async (
     new URL('../assets/js/rendering/viewer.js', import.meta.url),
     'utf8'
   );
-  const clearStart = source.indexOf('function clearEdgeResourcesV2()');
+  const clearStart = source.indexOf('function detachEdgeResourcesV2()');
   const nextFunction = source.indexOf(
     'function createPositionTextureV2ForView',
     clearStart
   );
   assert.ok(clearStart >= 0 && nextFunction > clearStart);
   const clearSource = source.slice(clearStart, nextFunction);
-  assert.match(clearSource, /gl\.deleteTexture\(edgeTextureV2\)/);
   assert.match(
     clearSource,
-    /gl\.deleteTexture\(edgeWeightTextureV2\)/
+    /if \(edgeTextureV2 !== null\) retiringTextures\.add\(edgeTextureV2\)/
   );
+  assert.match(
+    clearSource,
+    /retiringTextures\.add\(edgeWeightTextureV2\)/
+  );
+  assert.match(clearSource, /edgePositionTexturePoolV2\.clear\(\)/);
   assert.match(clearSource, /edgePositionTexturesV2\.clear\(\)/);
   assert.match(clearSource, /edgeVisibilityTexturesV2\.clear\(\)/);
   assert.match(clearSource, /nEdgesV2 = 0/);
@@ -127,11 +131,86 @@ test('viewer edge teardown releases every dataset-owned GPU edge state', async (
   assert.match(clearSource, /useInstancedEdges = false/);
   assert.match(clearSource, /edgeLodLimit = 0/);
   assert.match(
+    clearSource,
+    /for \(const texture of retiringTextures\) \{\s*queueEdgeTextureRetirement\(texture\)/
+  );
+  assert.match(
+    clearSource,
+    /failures\.push\(\.\.\.drainEdgeTextureRetirements\(\)\)/
+  );
+  assert.match(
+    clearSource,
+    /throw new AggregateError\(\s*failures,\s*'Connectivity resources were detached with pending texture retirement failures\.'/
+  );
+  const detachIndex = clearSource.indexOf('edgeTextureV2 = null;');
+  const queueIndex = clearSource.indexOf(
+    'queueEdgeTextureRetirement(texture);'
+  );
+  const drainIndex = clearSource.indexOf('drainEdgeTextureRetirements()');
+  assert.ok(detachIndex >= 0 && detachIndex < queueIndex);
+  assert.ok(queueIndex < drainIndex);
+
+  const queueStart = source.indexOf(
+    'function queueEdgeTextureRetirement(texture)'
+  );
+  const retirementEnd = source.indexOf(
+    'function reportCommittedRetirementFailures',
+    queueStart
+  );
+  assert.ok(queueStart >= 0 && retirementEnd > queueStart);
+  const retirementSource = source.slice(queueStart, retirementEnd);
+  assert.match(
+    retirementSource,
+    /pendingEdgeTextureRetirements\.add\(texture\)/
+  );
+  assert.match(
+    retirementSource,
+    /return drainExactTextureRetirements\(\s*gl,\s*pendingEdgeTextureRetirements/
+  );
+  const exactRetirementStart = source.indexOf(
+    'export function drainExactTextureRetirements'
+  );
+  const exactRetirementEnd = source.indexOf(
+    'function assertNonEmptyTrimmedString',
+    exactRetirementStart
+  );
+  const exactRetirementSource = source.slice(
+    exactRetirementStart,
+    exactRetirementEnd
+  );
+  assert.match(
+    exactRetirementSource,
+    /for \(const texture of Array\.from\(pending\)\)/
+  );
+  assert.match(
+    exactRetirementSource,
+    /gl\.deleteTexture\(texture\);\s*pending\.delete\(texture\)/
+  );
+  assert.match(
+    exactRetirementSource,
+    /definitelyRetired = gl\.isTexture\(texture\) === false/
+  );
+  assert.match(
+    exactRetirementSource,
+    /if \(definitelyRetired\) \{\s*pending\.delete\(texture\)/
+  );
+  assert.match(
+    exactRetirementSource,
+    /else \{\s*failures\.push\(exactError\)/
+  );
+  assert.match(
     source,
     /clearEdgesV2\(\) \{\s*clearEdgeResourcesV2\(\);\s*\}/
   );
+  assert.match(
+    source,
+    /hpRenderer\.loadData\([\s\S]+?reportCommittedRetirementFailures\(\s*detachEdgeResourcesV2\(\),\s*'Connectivity resources from the prior committed dataset generation could not be fully retired\.'\s*\)/
+  );
 
-  const setupStart = source.indexOf('setupEdgesV2(edgeData, positions)');
+  const setupStart = source.indexOf(
+    'setupEdgesV2(edgeData, positions = null)'
+  );
+  assert.ok(setupStart >= 0);
   const updateStart = source.indexOf(
     'updateEdgeVisibilityV2(visibility)',
     setupStart
@@ -191,9 +270,7 @@ test('viewer edge teardown releases every dataset-owned GPU edge state', async (
     /sharesLiveTransparency/
   );
 
-  const perViewSetupStart = source.indexOf(
-    'setupEdgesV2ForView(viewId, positions, nCells)'
-  );
+  const perViewSetupStart = source.indexOf('setupEdgesV2ForView(');
   const perViewUpdateStart = source.indexOf(
     'updateEdgeVisibilityV2ForView(viewId, visibility)',
     perViewSetupStart

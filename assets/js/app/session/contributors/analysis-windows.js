@@ -89,14 +89,14 @@ export function capture(ctx) {
  * @param {any} _chunkMeta
  * @param {{ windows: any[] }} payload
  */
-function applyWindows(manager, windows) {
-  manager.closeAll();
+async function applyWindows(manager, windows) {
+  await manager.closeAll();
   for (const descriptor of windows) {
-    manager.createFromSessionDescriptor(descriptor);
+    await manager.createFromSessionDescriptor(descriptor);
   }
 }
 
-export function restore(ctx, _chunkMeta, payload) {
+export async function restore(ctx, _chunkMeta, payload) {
   const mgr = requireManager(
     ctx,
     ['closeAll', 'createFromSessionDescriptor']
@@ -107,7 +107,7 @@ export function restore(ctx, _chunkMeta, payload) {
     restoreTransaction === null
     || typeof restoreTransaction !== 'object'
   ) {
-    applyWindows(mgr, windows);
+    await applyWindows(mgr, windows);
     return;
   }
   if (typeof restoreTransaction.register !== 'function') {
@@ -127,13 +127,13 @@ export function restore(ctx, _chunkMeta, payload) {
     value: windows,
     prepare() {},
     commit() {},
-    rollback() {
+    async rollback() {
       if (!applied) return;
-      applyWindows(mgr, previousWindows);
+      await applyWindows(mgr, previousWindows);
       applied = false;
     }
   });
 
   applied = true;
-  applyWindows(mgr, windows);
+  await applyWindows(mgr, windows);
 }

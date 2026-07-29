@@ -38,26 +38,47 @@ const MIN_SIZES = {
  * - Resizable grid layout with plot, options panel, and statistical panel
  * - Summary statistics and statistical annotations
  * @param {Object} options
+ * @param {Function} [options.beforeClose] - Awaited teardown before Plotly/DOM cleanup
  * @param {Function} options.onClose - Callback when modal is closed
+ * @param {Function} [options.onCloseError] - Observer for event-triggered close failures
  * @param {Function} options.onExportPNG - Export PNG callback
  * @param {Function} options.onExportSVG - Export SVG callback
  * @param {Function} options.onExportCSV - Export CSV callback
  * @returns {HTMLElement}
  */
 export function createAnalysisModal(options = {}) {
-  const { onClose, onExportPNG, onExportSVG, onExportCSV } = options;
+  const {
+    beforeClose,
+    onClose,
+    onCloseError,
+    onExportPNG,
+    onExportSVG,
+    onExportCSV
+  } = options;
+  for (const [name, callback] of [
+    ['beforeClose', beforeClose],
+    ['onClose', onClose],
+    ['onCloseError', onCloseError]
+  ]) {
+    if (callback !== undefined && typeof callback !== 'function') {
+      throw new TypeError(`Analysis modal ${name} must be a function`);
+    }
+  }
 
   // Create modal backdrop
   const modal = document.createElement('div');
   modal.className = 'analysis-modal';
   modal._cleanupFns = [];
   modal._cleanupDone = false;
+  modal._beforeClose = beforeClose ?? null;
+  modal._onClose = onClose ?? null;
+  modal._onCloseError = onCloseError ?? null;
+  modal._closePromise = null;
 
   const backdrop = document.createElement('div');
   backdrop.className = 'analysis-modal-backdrop';
   backdrop.addEventListener('click', () => {
-    if (onClose) onClose();
-    closeModal(modal);
+    requestModalClose(modal);
   });
   modal.appendChild(backdrop);
 
@@ -79,8 +100,7 @@ export function createAnalysisModal(options = {}) {
   closeBtn.innerHTML = '×';
   closeBtn.title = 'Close';
   closeBtn.addEventListener('click', () => {
-    if (onClose) onClose();
-    closeModal(modal);
+    requestModalClose(modal);
   });
 
   header.appendChild(title);
@@ -655,28 +675,69 @@ export function openModal(modal) {
   // Close on Escape
   const handleEscape = (e) => {
     if (e.key === 'Escape') {
-      closeModal(modal);
+      requestModalClose(modal);
     }
   };
   modal._escapeHandler = handleEscape;
   document.addEventListener('keydown', handleEscape);
 }
 
-/**
- * Close the analysis modal
- * @param {HTMLElement} modal - Modal element to close
- */
-export function closeModal(modal) {
-  if (!modal || typeof modal !== 'object') {
-    throw new TypeError('closeModal requires a modal element');
+function combineErrors(errors, message) {
+  const present = [...new Set(errors.filter(Boolean))];
+  if (present.length === 0) return null;
+  if (present.length === 1) return present[0];
+  return new AggregateError(present, message);
+}
+
+function requireCloseError(error) {
+  if (error instanceof Error) return error;
+  return new TypeError('Analysis modal close rejected with a non-Error value');
+}
+
+function reportEventCloseFailure(modal, error) {
+  const exactError = requireCloseError(error);
+  if (typeof modal._onCloseError !== 'function') {
+    console.error('[AnalysisModal] Close failed:', exactError);
+    return;
   }
-  if (modal._cleanupDone === true) return;
+  try {
+    modal._onCloseError(exactError);
+  } catch (reportError) {
+    console.error(
+      '[AnalysisModal] Close and failure reporting both failed:',
+      new AggregateError(
+        [exactError, requireCloseError(reportError)],
+        'Analysis modal close and failure reporting both failed'
+      )
+    );
+  }
+}
+
+function requestModalClose(modal) {
+  try {
+    const result = closeModal(modal);
+    if (result && typeof result.then === 'function') {
+      void result.catch(error => {
+        reportEventCloseFailure(modal, error);
+      });
+    }
+  } catch (error) {
+    reportEventCloseFailure(modal, error);
+  }
+}
+
+function beginModalCleanup(modal) {
+  if (modal._cleanupDone === true) {
+    return { errors: [], tasks: [] };
+  }
   const errors = [];
+  const tasks = [];
   const run = operation => {
     try {
-      operation();
+      return operation();
     } catch (error) {
       errors.push(error);
+      return undefined;
     }
   };
   modal._cleanupDone = true;
@@ -695,7 +756,8 @@ export function closeModal(modal) {
     modal._openPositionTimeout = null;
   }
 
-  // Purge Plotly/WebGL resources before detaching from DOM.
+  // Slot-owning callers retire their exact child before this parent purge
+  // runs. Directly owned modal plots retain synchronous cleanup here.
   if (modal._plotContainer) {
     run(() => purgePlot(modal._plotContainer));
   }
@@ -715,19 +777,130 @@ export function closeModal(modal) {
   }
 
   run(() => modal.classList.remove('open'));
-  setTimeout(() => {
-    if (modal.parentNode) {
-      modal.parentNode.removeChild(modal);
-    }
-  }, 200);
-
-  if (errors.length === 1) throw errors[0];
-  if (errors.length > 1) {
-    throw new AggregateError(
-      errors,
-      `Modal teardown failed in ${errors.length} operations`
-    );
+  if (modal.parentNode) {
+    tasks.push(new Promise((resolve, reject) => {
+      modal._detachTimeout = setTimeout(() => {
+        modal._detachTimeout = null;
+        try {
+          if (modal.parentNode) {
+            modal.parentNode.removeChild(modal);
+          }
+          resolve();
+        } catch (error) {
+          reject(requireCloseError(error));
+        }
+      }, 200);
+    }));
   }
+
+  if (typeof modal._onClose === 'function') {
+    const onCloseResult = run(() => modal._onClose());
+    if (onCloseResult && typeof onCloseResult.then === 'function') {
+      tasks.push(Promise.resolve(onCloseResult));
+    }
+  }
+
+  return { errors, tasks };
+}
+
+async function settleModalCleanup(
+  { errors, tasks },
+  closePromise
+) {
+  const outcomes = await Promise.allSettled(
+    tasks.filter(task => task !== closePromise)
+  );
+  for (const outcome of outcomes) {
+    if (outcome.status === 'rejected') {
+      errors.push(requireCloseError(outcome.reason));
+    }
+  }
+  const failure = combineErrors(errors, 'Analysis modal teardown failed');
+  if (failure) throw failure;
+}
+
+function createClosePromiseOwner(modal) {
+  let rejectClose;
+  let resolveClose;
+  const closePromise = new Promise((resolve, reject) => {
+    resolveClose = resolve;
+    rejectClose = reject;
+  });
+  modal._closePromise = closePromise;
+  // Some event-driven close callers cannot observe a returned Promise. Keep
+  // the rejection handled here while preserving it for every explicit await.
+  void closePromise.catch(() => {});
+  return { closePromise, rejectClose, resolveClose };
+}
+
+/**
+ * Close the analysis modal
+ * @param {HTMLElement} modal - Modal element to close
+ * @returns {Promise<void>} Stable Promise for the complete close lifecycle
+ */
+export function closeModal(modal) {
+  if (!modal || typeof modal !== 'object') {
+    throw new TypeError('closeModal requires a modal element');
+  }
+  if (modal._closePromise !== null && modal._closePromise !== undefined) {
+    return modal._closePromise;
+  }
+  if (modal._cleanupDone === true) return Promise.resolve();
+
+  const {
+    closePromise,
+    rejectClose,
+    resolveClose
+  } = createClosePromiseOwner(modal);
+
+  if (typeof modal._beforeClose !== 'function') {
+    const cleanup = beginModalCleanup(modal);
+    const synchronousFailure = combineErrors(
+      cleanup.errors,
+      'Analysis modal teardown failed'
+    );
+    if (synchronousFailure) {
+      rejectClose(synchronousFailure);
+      void Promise.allSettled(cleanup.tasks);
+      throw synchronousFailure;
+    }
+    void settleModalCleanup(cleanup, closePromise).then(
+      resolveClose,
+      rejectClose
+    );
+    return closePromise;
+  }
+
+  // Defer invocation until after `_closePromise` is published. A reentrant
+  // close from `beforeClose` therefore observes this exact Promise and cannot
+  // start a second teardown.
+  void Promise.resolve().then(async () => {
+    const errors = [];
+    try {
+      const beforeCloseResult = modal._beforeClose();
+      if (beforeCloseResult !== closePromise) {
+        await beforeCloseResult;
+      }
+    } catch (error) {
+      errors.push(requireCloseError(error));
+    }
+    const cleanup = beginModalCleanup(modal);
+    errors.push(...cleanup.errors.map(requireCloseError));
+    const outcomes = await Promise.allSettled(
+      cleanup.tasks.filter(task => task !== closePromise)
+    );
+    for (const outcome of outcomes) {
+      if (outcome.status === 'rejected') {
+        errors.push(requireCloseError(outcome.reason));
+      }
+    }
+    const failure = combineErrors(
+      errors,
+      'Analysis modal pre-close and teardown failed'
+    );
+    if (failure) throw failure;
+  }).then(resolveClose, rejectClose);
+  return closePromise;
 }
 
 // =============================================================================

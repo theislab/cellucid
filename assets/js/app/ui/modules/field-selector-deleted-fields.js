@@ -216,6 +216,7 @@ export function initDeletedFieldsPanel(options) {
   requireExactKeys(options, INIT_KEYS, 'Deleted fields panel options');
   const { state, deletedFieldsSection } = options;
   for (const methodName of [
+    'getDatasetGeneration',
     'getFields',
     'getUserDefinedFieldsRegistry',
     'getVarFields',
@@ -249,11 +250,58 @@ export function initDeletedFieldsPanel(options) {
   );
 
   const lifecycle = new view.AbortController();
+  const transientClosers = new Set();
   let destroyed = false;
 
   function assertAlive() {
     if (destroyed) {
       throw new Error('Deleted fields panel has been destroyed');
+    }
+  }
+
+  function readDatasetGeneration() {
+    const generation = state.getDatasetGeneration();
+    if (!Number.isSafeInteger(generation) || generation < 0) {
+      throw new TypeError(
+        'Deleted fields dataset generation must be a non-negative safe integer'
+      );
+    }
+    return generation;
+  }
+
+  function ownTransient(close) {
+    if (typeof close !== 'function') {
+      throw new TypeError('Deleted field transient closer must be a function');
+    }
+    transientClosers.add(close);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      transientClosers.delete(close);
+    };
+  }
+
+  function closeTransientInteractions() {
+    const closers = [...transientClosers];
+    transientClosers.clear();
+    const failures = [];
+    for (const close of closers) {
+      try {
+        close();
+      } catch (error) {
+        failures.push(requireError(
+          error,
+          'Deleted field transient cleanup'
+        ));
+      }
+    }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) {
+      throw new AggregateError(
+        failures,
+        'Deleted field transient cleanup failed'
+      );
     }
   }
 
@@ -298,6 +346,7 @@ export function initDeletedFieldsPanel(options) {
 
   function renderDeletedFieldsSection() {
     assertAlive();
+    closeTransientInteractions();
     const deleted = getDeletedFields();
     const total = deleted.obs.length + deleted.var.length;
     if (total === 0) {
@@ -485,15 +534,38 @@ export function initDeletedFieldsPanel(options) {
       field,
       userDefinedId
     } = readAction(button);
+    const datasetGeneration = readDatasetGeneration();
+
+    const isCapturedFieldCurrent = () => {
+      if (
+        destroyed
+        || readDatasetGeneration() !== datasetGeneration
+      ) {
+        return false;
+      }
+      if (index >= 0) {
+        const fields = source === FieldSource.VAR
+          ? state.getVarFields()
+          : state.getFields();
+        return Array.isArray(fields) && fields[index] === field;
+      }
+      return userDefinedRegistry.getField(userDefinedId) === field;
+    };
 
     if (action === 'purge-field') {
-      showConfirmDialog({
+      let releaseTransient = () => {};
+      let retired = false;
+      const closeDialog = showConfirmDialog({
         title: 'Confirm deletion',
         message:
           `Permanently confirm deletion of "${field.key}"?\n\n`
           + 'This removes restore capability for this field in the current session and in saved states.',
         confirmText: 'Confirm delete',
         onConfirm: () => {
+          const ownsInteraction = retired === false;
+          retired = true;
+          releaseTransient();
+          if (!ownsInteraction || !isCapturedFieldCurrent()) return;
           try {
             requireTrue(
               index >= 0
@@ -508,7 +580,15 @@ export function initDeletedFieldsPanel(options) {
           } catch (error) {
             reportActionFailure(error, 'confirm deletion of');
           }
+        },
+        onCancel: () => {
+          retired = true;
+          releaseTransient();
         }
+      });
+      releaseTransient = ownTransient(() => {
+        retired = true;
+        closeDialog();
       });
       return;
     }
@@ -531,8 +611,25 @@ export function initDeletedFieldsPanel(options) {
   function destroy() {
     if (destroyed) return;
     destroyed = true;
-    lifecycle.abort();
-    deletedFieldsSection.replaceChildren();
+    const failures = [];
+    for (const cleanup of [
+      closeTransientInteractions,
+      () => lifecycle.abort(),
+      () => deletedFieldsSection.replaceChildren()
+    ]) {
+      try {
+        cleanup();
+      } catch (error) {
+        failures.push(requireError(error, 'Deleted fields panel cleanup'));
+      }
+    }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) {
+      throw new AggregateError(
+        failures,
+        'Deleted fields panel cleanup failed'
+      );
+    }
   }
 
   return { destroy, renderDeletedFieldsSection };

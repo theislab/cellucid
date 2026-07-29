@@ -7,6 +7,13 @@ import {
 } from '../assets/js/rendering/smoke-cloud/smoke-density.js';
 import { SmokeRenderer } from '../assets/js/rendering/smoke-cloud/smoke-renderer.js';
 import {
+  getResolutionScaleFactor,
+} from '../assets/js/rendering/smoke-cloud/noise-textures.js';
+import {
+  MAX_SMOKE_LIGHT_SAMPLES,
+  SMOKE_FS_SOURCE,
+} from '../assets/js/rendering/shaders/smoke-shaders.js';
+import {
   viewContextViewerSyncMethods,
 } from '../assets/js/app/state/managers/view-context-viewer-sync.js';
 
@@ -142,7 +149,9 @@ function createFakeGl() {
   let nextId = 1;
   let texture2dBinding = null;
   let texture3dBinding = null;
-  let framebufferBinding = null;
+  let drawFramebufferBinding = null;
+  let readFramebufferBinding = null;
+  let pixelUnpackBufferBinding = null;
   let unpackAlignment = 4;
   let error = 0;
   const textures = new Set();
@@ -152,12 +161,19 @@ function createFakeGl() {
 
   const gl = {
     NO_ERROR: 0,
+    INVALID_VALUE: 0x0501,
     TEXTURE_2D: 0x0DE1,
     TEXTURE_3D: 0x806F,
     TEXTURE_BINDING_2D: 0x8069,
     TEXTURE_BINDING_3D: 0x806A,
     FRAMEBUFFER: 0x8D40,
     FRAMEBUFFER_BINDING: 0x8CA6,
+    DRAW_FRAMEBUFFER: 0x8CA9,
+    DRAW_FRAMEBUFFER_BINDING: 0x8CA6,
+    READ_FRAMEBUFFER: 0x8CA8,
+    READ_FRAMEBUFFER_BINDING: 0x8CAA,
+    PIXEL_UNPACK_BUFFER: 0x88EC,
+    PIXEL_UNPACK_BUFFER_BINDING: 0x88EF,
     FRAMEBUFFER_COMPLETE: 0x8CD5,
     FRAMEBUFFER_INCOMPLETE_ATTACHMENT: 0x8CD6,
     FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT: 0x8CD7,
@@ -180,6 +196,7 @@ function createFakeGl() {
     framebufferStatus: 0x8CD5,
     failTexture3dUpload: false,
     failTexture2dUpload: false,
+    texture2dUploadError: 0,
     createTexture() {
       const texture = { kind: 'texture', id: nextId++ };
       textures.add(texture);
@@ -190,6 +207,9 @@ function createFakeGl() {
       deletedTextures.push(texture);
       if (texture2dBinding === texture) texture2dBinding = null;
       if (texture3dBinding === texture) texture3dBinding = null;
+    },
+    isTexture(texture) {
+      return textures.has(texture);
     },
     bindTexture(target, texture) {
       if (target === gl.TEXTURE_2D) texture2dBinding = texture;
@@ -204,19 +224,47 @@ function createFakeGl() {
     deleteFramebuffer(framebuffer) {
       framebuffers.delete(framebuffer);
       deletedFramebuffers.push(framebuffer);
-      if (framebufferBinding === framebuffer) framebufferBinding = null;
+      if (drawFramebufferBinding === framebuffer) {
+        drawFramebufferBinding = null;
+      }
+      if (readFramebufferBinding === framebuffer) {
+        readFramebufferBinding = null;
+      }
+    },
+    isFramebuffer(framebuffer) {
+      return framebuffers.has(framebuffer);
     },
     bindFramebuffer(target, framebuffer) {
-      assert.equal(target, gl.FRAMEBUFFER);
-      framebufferBinding = framebuffer;
+      if (target === gl.FRAMEBUFFER) {
+        drawFramebufferBinding = framebuffer;
+        readFramebufferBinding = framebuffer;
+      } else if (target === gl.DRAW_FRAMEBUFFER) {
+        drawFramebufferBinding = framebuffer;
+      } else if (target === gl.READ_FRAMEBUFFER) {
+        readFramebufferBinding = framebuffer;
+      } else {
+        throw new TypeError(`unexpected framebuffer target ${target}`);
+      }
+    },
+    bindBuffer(target, buffer) {
+      assert.equal(target, gl.PIXEL_UNPACK_BUFFER);
+      pixelUnpackBufferBinding = buffer;
     },
     framebufferTexture2D() {},
     checkFramebufferStatus() {
       return gl.framebufferStatus;
     },
     texImage2D() {
+      if (pixelUnpackBufferBinding !== null) {
+        throw new Error(
+          'synthetic smoke target upload observed a caller unpack buffer'
+        );
+      }
       if (gl.failTexture2dUpload) {
         throw new Error('synthetic smoke target upload failure');
+      }
+      if (gl.texture2dUploadError !== gl.NO_ERROR) {
+        error = gl.texture2dUploadError;
       }
     },
     texImage3D() {
@@ -233,7 +281,18 @@ function createFakeGl() {
     getParameter(parameter) {
       if (parameter === gl.TEXTURE_BINDING_2D) return texture2dBinding;
       if (parameter === gl.TEXTURE_BINDING_3D) return texture3dBinding;
-      if (parameter === gl.FRAMEBUFFER_BINDING) return framebufferBinding;
+      if (
+        parameter === gl.FRAMEBUFFER_BINDING
+        || parameter === gl.DRAW_FRAMEBUFFER_BINDING
+      ) {
+        return drawFramebufferBinding;
+      }
+      if (parameter === gl.READ_FRAMEBUFFER_BINDING) {
+        return readFramebufferBinding;
+      }
+      if (parameter === gl.PIXEL_UNPACK_BUFFER_BINDING) {
+        return pixelUnpackBufferBinding;
+      }
       if (parameter === gl.UNPACK_ALIGNMENT) return unpackAlignment;
       throw new TypeError(`unexpected parameter ${parameter}`);
     },
@@ -254,7 +313,16 @@ function createFakeGl() {
         return texture3dBinding;
       },
       get framebufferBinding() {
-        return framebufferBinding;
+        return drawFramebufferBinding;
+      },
+      get drawFramebufferBinding() {
+        return drawFramebufferBinding;
+      },
+      get readFramebufferBinding() {
+        return readFramebufferBinding;
+      },
+      get pixelUnpackBufferBinding() {
+        return pixelUnpackBufferBinding;
       },
       get unpackAlignment() {
         return unpackAlignment;
@@ -311,6 +379,44 @@ test('smoke parameter patches preflight completely before committing', () => {
   renderer.setParams({ density: 2, lightSamples: 4 });
   assert.equal(renderer.density, 2);
   assert.equal(renderer.lightSamples, 4);
+});
+
+test('smoke resolution scaling is a pure exact-size contract', () => {
+  assert.equal(getResolutionScaleFactor(32), 3);
+  assert.equal(getResolutionScaleFactor(128), 0.75);
+  assert.equal(getResolutionScaleFactor(32), 3);
+  assert.throws(
+    () => getResolutionScaleFactor(),
+    /resolution must be an integer between 32 and 256/,
+  );
+  assert.throws(
+    () => getResolutionScaleFactor(257),
+    /resolution must be an integer between 32 and 256/,
+  );
+});
+
+test('smoke CPU validation and shader share the exact light-sample ceiling', () => {
+  assert.equal(MAX_SMOKE_LIGHT_SAMPLES, 12);
+  assert.match(
+    SMOKE_FS_SOURCE,
+    new RegExp(
+      `for \\(int i = 1; i <= ${MAX_SMOKE_LIGHT_SAMPLES}; i\\+\\+\\)`,
+    ),
+  );
+
+  const renderer = createRendererState(createFakeGl());
+  renderer.setParams({ lightSamples: MAX_SMOKE_LIGHT_SAMPLES });
+  assert.equal(renderer.lightSamples, MAX_SMOKE_LIGHT_SAMPLES);
+  assert.throws(
+    () => renderer.setParams({
+      lightSamples: MAX_SMOKE_LIGHT_SAMPLES + 1,
+    }),
+    /lightSamples must be between 1 and 12/,
+  );
+  assert.equal(renderer.lightSamples, MAX_SMOKE_LIGHT_SAMPLES);
+
+  renderer.setQualityPreset('ultra');
+  assert.equal(renderer.lightSamples, MAX_SMOKE_LIGHT_SAMPLES);
 });
 
 test('smoke volume validation and upload failures preserve the published volume', () => {
@@ -393,10 +499,15 @@ test('smoke render-target replacement is atomic on incomplete or failed GPU stat
   const renderer = createRendererState(gl);
   const existingTexture = gl.createTexture();
   const existingFramebuffer = gl.createFramebuffer();
+  const callerReadFramebuffer = gl.createFramebuffer();
+  const callerPixelUnpackBuffer = { kind: 'pixel-unpack-buffer' };
   renderer.colorTex = existingTexture;
   renderer.framebuffer = existingFramebuffer;
   renderer.targetWidth = 100;
   renderer.targetHeight = 50;
+  gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, existingFramebuffer);
+  gl.bindFramebuffer(gl.READ_FRAMEBUFFER, callerReadFramebuffer);
+  gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, callerPixelUnpackBuffer);
 
   gl.framebufferStatus = gl.FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
   assert.throws(
@@ -407,7 +518,32 @@ test('smoke render-target replacement is atomic on incomplete or failed GPU stat
   assert.equal(renderer.framebuffer, existingFramebuffer);
   assert.equal(renderer.targetWidth, 100);
   assert.equal(renderer.targetHeight, 50);
+  assert.equal(gl._state.drawFramebufferBinding, existingFramebuffer);
+  assert.equal(gl._state.readFramebufferBinding, callerReadFramebuffer);
+  assert.equal(
+    gl._state.pixelUnpackBufferBinding,
+    callerPixelUnpackBuffer,
+  );
 
+  gl.framebufferStatus = gl.FRAMEBUFFER_COMPLETE;
+  gl.texture2dUploadError = gl.INVALID_VALUE;
+  assert.throws(
+    () => renderer.ensureRenderTarget(400, 200),
+    /0x501/,
+  );
+  assert.equal(renderer.colorTex, existingTexture);
+  assert.equal(renderer.framebuffer, existingFramebuffer);
+  assert.equal(renderer.targetWidth, 100);
+  assert.equal(renderer.targetHeight, 50);
+  assert.equal(gl._state.drawFramebufferBinding, existingFramebuffer);
+  assert.equal(gl._state.readFramebufferBinding, callerReadFramebuffer);
+  assert.equal(
+    gl._state.pixelUnpackBufferBinding,
+    callerPixelUnpackBuffer,
+  );
+  assert.equal(gl.getError(), gl.NO_ERROR);
+
+  gl.texture2dUploadError = gl.NO_ERROR;
   gl.framebufferStatus = gl.FRAMEBUFFER_COMPLETE;
   renderer.ensureRenderTarget(400, 200);
   assert.notEqual(renderer.colorTex, existingTexture);
@@ -416,4 +552,143 @@ test('smoke render-target replacement is atomic on incomplete or failed GPU stat
   assert.equal(renderer.targetHeight, 100);
   assert.equal(gl._state.textures.has(existingTexture), false);
   assert.equal(gl._state.framebuffers.has(existingFramebuffer), false);
+  assert.equal(gl._state.drawFramebufferBinding, renderer.framebuffer);
+  assert.equal(gl._state.readFramebufferBinding, callerReadFramebuffer);
+  assert.equal(
+    gl._state.pixelUnpackBufferBinding,
+    callerPixelUnpackBuffer,
+  );
+});
+
+test('first smoke render-target publication preserves default caller bindings', () => {
+  const gl = createFakeGl();
+  const renderer = createRendererState(gl);
+
+  renderer.ensureRenderTarget(400, 200);
+
+  assert.notEqual(renderer.colorTex, null);
+  assert.notEqual(renderer.framebuffer, null);
+  assert.equal(renderer.targetWidth, 200);
+  assert.equal(renderer.targetHeight, 100);
+  assert.equal(gl._state.drawFramebufferBinding, null);
+  assert.equal(gl._state.readFramebufferBinding, null);
+  assert.equal(gl._state.texture2dBinding, null);
+  assert.equal(gl._state.pixelUnpackBufferBinding, null);
+  assert.equal(gl.getError(), gl.NO_ERROR);
+});
+
+test('native smoke resolution releases its obsolete target once while unchanged scales preserve it', () => {
+  const gl = createFakeGl();
+  const renderer = createRendererState(gl);
+  const texture = gl.createTexture();
+  const framebuffer = gl.createFramebuffer();
+  renderer.colorTex = texture;
+  renderer.framebuffer = framebuffer;
+  renderer.targetWidth = 320;
+  renderer.targetHeight = 180;
+
+  renderer.setResolutionScale(0.5);
+  assert.equal(renderer.colorTex, texture);
+  assert.equal(renderer.framebuffer, framebuffer);
+  assert.equal(renderer.targetWidth, 320);
+  assert.equal(renderer.targetHeight, 180);
+  assert.deepEqual(gl._state.deletedTextures, []);
+  assert.deepEqual(gl._state.deletedFramebuffers, []);
+
+  renderer.setResolutionScale(1);
+  assert.equal(renderer.resolutionScale, 1);
+  assert.equal(renderer.colorTex, null);
+  assert.equal(renderer.framebuffer, null);
+  assert.equal(renderer.targetWidth, 0);
+  assert.equal(renderer.targetHeight, 0);
+  assert.deepEqual(gl._state.deletedTextures, [texture]);
+  assert.deepEqual(gl._state.deletedFramebuffers, [framebuffer]);
+
+  renderer.setResolutionScale(1);
+  assert.deepEqual(gl._state.deletedTextures, [texture]);
+  assert.deepEqual(gl._state.deletedFramebuffers, [framebuffer]);
+});
+
+test('native smoke resolution settles delete-then-throw ownership exactly once', () => {
+  const gl = createFakeGl();
+  const renderer = createRendererState(gl);
+  const texture = gl.createTexture();
+  const framebuffer = gl.createFramebuffer();
+  renderer.colorTex = texture;
+  renderer.framebuffer = framebuffer;
+  renderer.targetWidth = 320;
+  renderer.targetHeight = 180;
+  const originalDeleteFramebuffer = gl.deleteFramebuffer;
+  gl.deleteFramebuffer = (resource) => {
+    originalDeleteFramebuffer(resource);
+    throw new Error('synthetic native framebuffer cleanup failure');
+  };
+
+  assert.doesNotThrow(() => renderer.setResolutionScale(1));
+  assert.equal(renderer.resolutionScale, 1);
+  assert.equal(renderer.colorTex, null);
+  assert.equal(renderer.framebuffer, null);
+  assert.equal(renderer.targetWidth, 0);
+  assert.equal(renderer.targetHeight, 0);
+  assert.deepEqual(gl._state.deletedFramebuffers, [framebuffer]);
+  assert.deepEqual(gl._state.deletedTextures, [texture]);
+
+  assert.doesNotThrow(() => renderer.setResolutionScale(0.75));
+  assert.equal(renderer.resolutionScale, 0.75);
+  assert.deepEqual(gl._state.deletedFramebuffers, [framebuffer]);
+  assert.deepEqual(gl._state.deletedTextures, [texture]);
+});
+
+test('smoke resource retirement retries only resources still live after deletion rejects', () => {
+  const gl = createFakeGl();
+  const renderer = createRendererState(gl);
+  const texture = gl.createTexture();
+  const framebuffer = gl.createFramebuffer();
+  renderer.colorTex = texture;
+  renderer.framebuffer = framebuffer;
+  renderer.targetWidth = 320;
+  renderer.targetHeight = 180;
+  const originalDeleteFramebuffer = gl.deleteFramebuffer;
+  let rejectBeforeDeletion = true;
+  gl.deleteFramebuffer = (resource) => {
+    if (rejectBeforeDeletion) {
+      rejectBeforeDeletion = false;
+      throw new Error('synthetic live framebuffer cleanup failure');
+    }
+    originalDeleteFramebuffer(resource);
+  };
+
+  assert.throws(
+    () => renderer.setResolutionScale(1),
+    /synthetic live framebuffer cleanup failure/,
+  );
+  assert.equal(gl.isFramebuffer(framebuffer), true);
+  assert.deepEqual(gl._state.deletedFramebuffers, []);
+  assert.deepEqual(gl._state.deletedTextures, [texture]);
+
+  assert.doesNotThrow(() => renderer.setResolutionScale(0.75));
+  assert.equal(renderer.resolutionScale, 0.75);
+  assert.equal(gl.isFramebuffer(framebuffer), false);
+  assert.deepEqual(gl._state.deletedFramebuffers, [framebuffer]);
+  assert.deepEqual(gl._state.deletedTextures, [texture]);
+});
+
+test('native quality presets release targets through the exact resolution owner', () => {
+  for (const preset of ['quality', 'ultra']) {
+    const gl = createFakeGl();
+    const renderer = createRendererState(gl);
+    const texture = gl.createTexture();
+    const framebuffer = gl.createFramebuffer();
+    renderer.colorTex = texture;
+    renderer.framebuffer = framebuffer;
+    renderer.targetWidth = 320;
+    renderer.targetHeight = 180;
+
+    renderer.setQualityPreset(preset);
+    assert.equal(renderer.resolutionScale, 1);
+    assert.equal(renderer.colorTex, null);
+    assert.equal(renderer.framebuffer, null);
+    assert.deepEqual(gl._state.deletedTextures, [texture]);
+    assert.deepEqual(gl._state.deletedFramebuffers, [framebuffer]);
+  }
 });

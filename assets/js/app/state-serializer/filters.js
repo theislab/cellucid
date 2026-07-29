@@ -44,6 +44,23 @@ const CONTINUOUS_KEYS = [
   'colormapId'
 ];
 
+function requireRestoreSignal(options) {
+  assertExactKeys(options, ['signal'], 'Filter restore options');
+  const signal = options.signal;
+  if (signal !== null && !(signal instanceof AbortSignal)) {
+    throw new TypeError(
+      'Filter restore signal must be an AbortSignal or null.'
+    );
+  }
+  return signal;
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted !== true) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  throw new DOMException('Filter restore was aborted.', 'AbortError');
+}
+
 function assertRgb(color, context) {
   if (!Array.isArray(color) || color.length !== 3) {
     throw new TypeError(`${context} must be an RGB triplet.`);
@@ -442,19 +459,84 @@ export function createFilterSerializer({ state }) {
     };
   }
 
-  async function restoreFilters(filters) {
+  async function restoreFilters(
+    filters,
+    options = { signal: null }
+  ) {
+    const signal = requireRestoreSignal(options);
     requireMethod(state, 'ensureFieldLoaded', 'Filter restore owner');
     requireMethod(state, 'ensureVarFieldLoaded', 'Filter restore owner');
     requireMethod(state, 'beginBatch', 'Filter restore owner');
     requireMethod(state, 'endBatch', 'Filter restore owner');
 
     const actions = validateFiltersForState(state, filters);
+    throwIfAborted(signal);
 
-    await Promise.all(actions.map(({ source, fieldIndex }) => (
-      source === 'obs'
-        ? state.ensureFieldLoaded(fieldIndex)
-        : state.ensureVarFieldLoaded(fieldIndex)
-    )));
+    const loadController = new AbortController();
+    const forwardCallerAbort = () => {
+      if (loadController.signal.aborted) return;
+      loadController.abort(signal?.reason);
+    };
+    if (signal !== null) {
+      signal.addEventListener('abort', forwardCallerAbort, { once: true });
+      if (signal.aborted) forwardCallerAbort();
+    }
+    let loadOutcomes;
+    try {
+      loadOutcomes = await Promise.allSettled(actions.map(async ({
+        source,
+        fieldIndex
+      }) => {
+        try {
+          if (source === 'obs') {
+            await state.ensureFieldLoaded(fieldIndex, {
+              signal: loadController.signal
+            });
+          } else {
+            await state.ensureVarFieldLoaded(fieldIndex, {
+              signal: loadController.signal
+            });
+          }
+        } catch (error) {
+          if (!loadController.signal.aborted) {
+            loadController.abort(error);
+          }
+          throw error;
+        }
+      }));
+    } finally {
+      signal?.removeEventListener('abort', forwardCallerAbort);
+    }
+    throwIfAborted(signal);
+    const loadFailures = [];
+    for (const outcome of loadOutcomes) {
+      if (
+        outcome.status === 'rejected'
+        && !loadFailures.includes(outcome.reason)
+      ) {
+        loadFailures.push(outcome.reason);
+      }
+    }
+    if (loadFailures.length === 1) throw loadFailures[0];
+    if (loadFailures.length > 1) {
+      throw new AggregateError(
+        loadFailures,
+        'Filter field preloads failed.'
+      );
+    }
+    const currentObsFields = state.getFields();
+    const currentVarFields = state.getVarFields();
+    for (const action of actions) {
+      const currentFields = action.source === 'obs'
+        ? currentObsFields
+        : currentVarFields;
+      if (currentFields[action.fieldIndex] !== action.field) {
+        throw new Error(
+          `Filter field "${action.source}:${action.field.key}" was ` +
+          'superseded by a replacement inventory.'
+        );
+      }
+    }
 
     if (actions.some(action => action.entry.kind === 'category')) {
       requireMethod(state, 'setVisibilityForCategory', 'Category filter restore owner');
@@ -464,6 +546,7 @@ export function createFilterSerializer({ state }) {
     state.beginBatch();
     try {
       for (const { field, entry } of actions) {
+        throwIfAborted(signal);
         if (entry.kind === 'category') {
           for (const change of entry.visibility) {
             state.setVisibilityForCategory(
@@ -513,6 +596,7 @@ export function createFilterSerializer({ state }) {
           field._colormapId = entry.colormapId;
         }
       }
+      throwIfAborted(signal);
     } finally {
       state.endBatch();
     }

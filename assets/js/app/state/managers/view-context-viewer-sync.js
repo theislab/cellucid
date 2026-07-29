@@ -154,7 +154,8 @@ export const viewContextViewerSyncMethods = {
     // IMPORTANT: Do NOT call _pushColorsToViewer() here!
     // The alpha texture fast path in hp-renderer handles transparency updates efficiently
     // without requiring full buffer rebuilds. Calling updateColors() here would set
-    // _bufferDirty and _lodBuffersDirty, negating the alpha texture optimization
+    // full-detail and dimension-specific LOD color dirtiness, negating the
+    // alpha texture optimization
     // and causing stuttering on large datasets during filter changes.
     // The updateTransparency/updateAlphas path handles both:
     // - Alpha texture case: just updates texture (fast, ~16x faster than buffer rebuild)
@@ -227,6 +228,7 @@ export const viewContextViewerSyncMethods = {
   },
 
   initScene(positions, obs) {
+    this._datasetGeneration = (this._datasetGeneration ?? 0) + 1;
     // Dataset swap: ensure GPU overlay resources referencing the previous dataset
     // are released before we upload new buffers.
     this.viewer.resetVectorFieldOverlay?.();
@@ -240,6 +242,7 @@ export const viewContextViewerSyncMethods = {
         : field?.categories,
       loaded: Boolean(field?.values || field?.codes),
       _loadingPromise: null,
+      _loadingSignal: null,
       _normalizedDims: null
     }));
     this.obsData = { ...obs, fields: normalizedFields };
@@ -380,6 +383,7 @@ export const viewContextViewerSyncMethods = {
       throw publicationError;
     }
 
+    this._datasetGeneration = (this._datasetGeneration ?? 0) + 1;
     viewer.clearSnapshotViews();
     viewer.resetVectorFieldOverlay();
 

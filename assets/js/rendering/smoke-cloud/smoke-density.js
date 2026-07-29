@@ -17,9 +17,13 @@ const MIN_NORMAL_FLOAT32 = 2 ** -126;
 
 function deleteCachedGPUSplatResources(gl, resources) {
   const failures = [];
-  for (const buffer of [resources.cornerBuffer, resources.quadBuffer]) {
+  resources.retiring = true;
+  for (const key of ['cornerBuffer', 'quadBuffer']) {
+    const buffer = resources[key];
+    if (!buffer) continue;
     try {
       gl.deleteBuffer(buffer);
+      resources[key] = null;
     } catch (error) {
       failures.push(asError(
         error,
@@ -27,13 +31,16 @@ function deleteCachedGPUSplatResources(gl, resources) {
       ));
     }
   }
-  for (const program of [
-    resources.splatProgram,
-    resources.reduceMaxProgram,
-    resources.normalizeProgram,
+  for (const key of [
+    'splatProgram',
+    'reduceMaxProgram',
+    'normalizeProgram',
   ]) {
+    const program = resources[key];
+    if (!program) continue;
     try {
       gl.deleteProgram(program);
+      resources[key] = null;
     } catch (error) {
       failures.push(asError(
         error,
@@ -41,7 +48,9 @@ function deleteCachedGPUSplatResources(gl, resources) {
       ));
     }
   }
-  gpuSplatResourcesByContext.delete(gl);
+  if (failures.length === 0) {
+    gpuSplatResourcesByContext.delete(gl);
+  }
   if (failures.length === 1) throw failures[0];
   if (failures.length > 1) {
     throw new AggregateError(
@@ -53,7 +62,8 @@ function deleteCachedGPUSplatResources(gl, resources) {
 
 function cachedGPUSplatResourcesAreCurrent(gl, resources) {
   return (
-    gl.isProgram(resources.splatProgram)
+    resources.retiring !== true
+    && gl.isProgram(resources.splatProgram)
     && gl.isProgram(resources.reduceMaxProgram)
     && gl.isProgram(resources.normalizeProgram)
     && gl.isBuffer(resources.cornerBuffer)
@@ -85,7 +95,11 @@ export function invalidateDensityPipelineResources(gl) {
 function getOrCreateGPUSplatResources(gl) {
   const cached = gpuSplatResourcesByContext.get(gl);
   if (cached) {
-    if (cachedGPUSplatResourcesAreCurrent(gl, cached)) return cached;
+    if (cached.retiring === true) {
+      deleteCachedGPUSplatResources(gl, cached);
+    } else if (cachedGPUSplatResourcesAreCurrent(gl, cached)) {
+      return cached;
+    }
     // A restored WebGL context invalidates every pre-loss object. Those handles
     // no longer belong to the current object namespace and must not be deleted
     // through it; dropping the cache lets the browser reclaim them with the
@@ -258,6 +272,7 @@ function getOrCreateGPUSplatResources(gl) {
       normalizeLocs,
       cornerBuffer,
       quadBuffer,
+      retiring: false,
     };
     gpuSplatResourcesByContext.set(gl, resources);
     return resources;

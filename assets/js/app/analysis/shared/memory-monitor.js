@@ -42,8 +42,34 @@ const INTERVALS = {
  */
 class MemoryMonitor {
   constructor() {
-    /** @type {Map<string, Function>} Registered cleanup handlers */
+    /**
+     * Registered cleanup-handler generations.
+     * @type {Map<string, {
+     *   cleanupFn: Function,
+     *   registered: boolean,
+     *   tasks: Set<Promise<void>>,
+     *   drainPromise: Promise<void>|null
+     * }>}
+     */
     this._cleanupHandlers = new Map();
+
+    /**
+     * Retiring generations retain their exact drain task until settlement so
+     * repeated teardown calls cannot lose ownership of running work.
+     * @type {Map<string, {
+     *   cleanupFn: Function,
+     *   registered: boolean,
+     *   tasks: Set<Promise<void>>,
+     *   drainPromise: Promise<void>|null
+     * }>}
+     */
+    this._cleanupHandlerRetirements = new Map();
+
+    /** @type {Map<unknown, Promise<Object>>} In-flight cleanups by reason */
+    this._cleanupTasks = new Map();
+
+    /** @type {Promise<void>} Serial owner for non-reentrant cleanup handlers */
+    this._cleanupTail = Promise.resolve();
 
     /** @type {number|null} Check interval ID */
     this._checkIntervalId = null;
@@ -133,7 +159,7 @@ class MemoryMonitor {
 
     // Start periodic cleanup
     this._cleanupIntervalId = setInterval(() => {
-      this.performCleanup('periodic');
+      this._performCleanupInBackground('periodic');
     }, cleanupInterval);
 
     this._active = true;
@@ -163,7 +189,7 @@ class MemoryMonitor {
   /**
    * Register a cleanup handler for a component
    * @param {string} componentId - Unique component identifier
-   * @param {(reason?: string) => void} cleanupFn - Cleanup function to call
+   * @param {(reason?: string) => void|Promise<void>} cleanupFn - Cleanup function to call
    */
   registerCleanupHandler(componentId, cleanupFn) {
     if (typeof componentId !== 'string' || componentId.length === 0) {
@@ -175,22 +201,66 @@ class MemoryMonitor {
     if (this._cleanupHandlers.has(componentId)) {
       throw new Error(`MemoryMonitor cleanup handler already registered: ${componentId}`);
     }
-    this._cleanupHandlers.set(componentId, cleanupFn);
+    const retiredOwner = this._cleanupHandlerRetirements.get(componentId);
+    if (retiredOwner) {
+      throw new Error(`MemoryMonitor cleanup handler is still retiring: ${componentId}`);
+    }
+    this._cleanupHandlers.set(componentId, {
+      cleanupFn,
+      registered: true,
+      tasks: new Set(),
+      drainPromise: null
+    });
   }
 
   /**
-   * Unregister a cleanup handler
+   * Unregister a cleanup handler and drain work already running for its exact
+   * generation. Cleanup generations that were queued but have not invoked the
+   * handler skip it after retirement.
    * @param {string} componentId - Component identifier
+   * @returns {Promise<void>} Stable drain task for the retired generation
    */
   unregisterCleanupHandler(componentId) {
-    if (!this._cleanupHandlers.delete(componentId)) {
+    const existingRetirement = this._cleanupHandlerRetirements.get(componentId);
+    if (existingRetirement) {
+      return existingRetirement.drainPromise;
+    }
+
+    const owner = this._cleanupHandlers.get(componentId);
+    if (!owner) {
       throw new Error(`MemoryMonitor cleanup handler is not registered: ${componentId}`);
     }
+    this._cleanupHandlers.delete(componentId);
+    owner.registered = false;
+
+    owner.drainPromise = Promise.allSettled([...owner.tasks]).then(outcomes => {
+      if (this._cleanupHandlerRetirements.get(componentId) === owner) {
+        this._cleanupHandlerRetirements.delete(componentId);
+      }
+      const errors = [...new Set(
+        outcomes
+          .filter(outcome => outcome.status === 'rejected')
+          .map(outcome => outcome.reason)
+      )];
+      if (errors.length === 1) throw errors[0];
+      if (errors.length > 1) {
+        throw new AggregateError(
+          errors,
+          `Memory cleanup handler ${componentId} failed in ${errors.length} task(s)`
+        );
+      }
+    });
+    this._cleanupHandlerRetirements.set(componentId, owner);
+    // Some synchronous handler owners do not need to await an already-settled
+    // drain. Observe failures internally while preserving them for awaiters.
+    void owner.drainPromise.catch(() => {});
+
     // If no components remain registered, stop background polling to avoid
     // unnecessary CPU/battery usage.
     if (this._cleanupHandlers.size === 0) {
       this.stop();
     }
+    return owner.drainPromise;
   }
 
   /**
@@ -327,11 +397,11 @@ class MemoryMonitor {
     if (level === 'critical') {
       this._notifyPressureChange(level, usage);
       debugWarn('MemoryMonitor', `CRITICAL: Memory usage at ${usedMB}MB - triggering aggressive cleanup`);
-      this.performCleanup('critical');
+      this._performCleanupInBackground('critical');
     } else if (level === 'cleanup') {
       this._notifyPressureChange(level, usage);
       debugWarn('MemoryMonitor', `HIGH: Memory usage at ${usedMB}MB - triggering cleanup`);
-      this.performCleanup('threshold');
+      this._performCleanupInBackground('threshold');
     } else if (level === 'warning') {
       this._notifyPressureChange(level, usage);
       debug('MemoryMonitor', `Warning: Memory usage at ${usedMB}MB`);
@@ -361,71 +431,195 @@ class MemoryMonitor {
   }
 
   /**
+   * Start a cleanup from a timer/pressure callback and explicitly observe any
+   * failure because those call sites have no awaiting caller.
+   * @param {string} reason
+   * @private
+   */
+  _performCleanupInBackground(reason) {
+    let cleanupTask;
+    try {
+      cleanupTask = this.performCleanup(reason);
+    } catch (error) {
+      this._reportCleanupFailure(`${reason} cleanup failed:`, error);
+      return;
+    }
+
+    void Promise.resolve(cleanupTask).catch(error => {
+      this._reportCleanupFailure(`${reason} cleanup failed:`, error);
+    });
+  }
+
+  /**
+   * Report a cleanup failure without allowing optional diagnostics to replace
+   * the exact owned failure.
+   * @param {string} message
+   * @param {unknown} error
+   * @private
+   */
+  _reportCleanupFailure(message, error) {
+    try {
+      debugError('MemoryMonitor', message, error);
+    } catch {
+      // Cleanup ownership must not depend on optional debug infrastructure.
+    }
+  }
+
+  /**
    * Perform cleanup across all registered handlers
    * @param {string} [reason='manual'] - Reason for cleanup
-   * @returns {Object} Cleanup results
+   * @returns {Promise<Object>} Cleanup results
    */
   performCleanup(reason = 'manual') {
+    const existingTask = this._cleanupTasks.get(reason);
+    if (existingTask) {
+      return existingTask;
+    }
+
+    let rejectTask;
+    let resolveTask;
+    const cleanupTask = new Promise((resolve, reject) => {
+      rejectTask = reject;
+      resolveTask = resolve;
+    });
+    this._cleanupTasks.set(reason, cleanupTask);
+
     this._stats.cleanupsTriggered++;
     this._stats.lastCleanup = Date.now();
 
-    const beforeUsage = this.getMemoryUsage();
-    const results = {
-      reason,
-      handlersRun: 0,
-      errors: [],
-      beforeMB: beforeUsage.usedMB,
-      afterMB: null,
-      freedMB: null
-    };
+    // Snapshot ownership at request time. A handler registered after this call
+    // belongs to the next cleanup generation.
+    const cleanupHandlers = [...this._cleanupHandlers.entries()];
 
-    // Show user notification for non-periodic cleanups
-    const notifications = this._getNotifications();
-    const shouldNotify = this._showNotifications && notifications && reason !== 'periodic';
+    const operation = async () => {
+      const beforeUsage = this.getMemoryUsage();
+      const results = {
+        reason,
+        handlersRun: 0,
+        errors: [],
+        beforeMB: beforeUsage.usedMB,
+        afterMB: null,
+        freedMB: null
+      };
 
-    if (shouldNotify) {
-      const reasonText = reason === 'critical'
-        ? 'High memory usage detected'
-        : reason === 'threshold'
-          ? 'Memory optimization in progress'
-          : 'Clearing analysis cache';
+      // Show user notification for non-periodic cleanups
+      const notifications = this._getNotifications();
+      const shouldNotify = this._showNotifications && notifications && reason !== 'periodic';
 
-      notifications.show({
-        type: 'warning',
-        category: 'data',
-        message: `${reasonText}. Some cached data may need to be reloaded.`,
-        duration: 5000
-      });
-    }
+      if (shouldNotify) {
+        const reasonText = reason === 'critical'
+          ? 'High memory usage detected'
+          : reason === 'threshold'
+            ? 'Memory optimization in progress'
+            : 'Clearing analysis cache';
 
-    // Run all cleanup handlers and preserve every failure.
-    for (const [componentId, cleanupFn] of this._cleanupHandlers) {
-      try {
-        cleanupFn(reason);
-        results.handlersRun++;
-      } catch (error) {
-        debugError('MemoryMonitor', `Cleanup error in ${componentId}:`, error);
+        notifications.show({
+          type: 'warning',
+          category: 'data',
+          message: `${reasonText}. Some cached data may need to be reloaded.`,
+          duration: 5000
+        });
+      }
+
+      // Start every owned handler without serializing independent components,
+      // then settle them together. Promise.all preserves registration order.
+      const handlerOutcomes = await Promise.all(
+        cleanupHandlers.map(([componentId, owner]) => {
+          if (
+            !owner.registered ||
+            this._cleanupHandlers.get(componentId) !== owner
+          ) {
+            return { status: 'skipped', componentId };
+          }
+
+          let rejectHandlerTask;
+          let resolveHandlerTask;
+          const handlerTask = new Promise((resolve, reject) => {
+            rejectHandlerTask = reject;
+            resolveHandlerTask = resolve;
+          });
+          owner.tasks.add(handlerTask);
+          const clearHandlerTask = () => {
+            owner.tasks.delete(handlerTask);
+          };
+          void handlerTask.then(clearHandlerTask, clearHandlerTask);
+
+          let handlerResult;
+          try {
+            handlerResult = owner.cleanupFn(reason);
+            results.handlersRun++;
+          } catch (error) {
+            rejectHandlerTask(error);
+            return handlerTask.then(
+              () => ({ status: 'fulfilled', componentId }),
+              handlerError => ({
+                status: 'rejected',
+                componentId,
+                error: handlerError
+              })
+            );
+          }
+
+          void Promise.resolve(handlerResult).then(
+            () => resolveHandlerTask(),
+            rejectHandlerTask
+          );
+          return handlerTask.then(
+            () => ({ status: 'fulfilled', componentId }),
+            error => ({ status: 'rejected', componentId, error })
+          );
+        })
+      );
+
+      for (const outcome of handlerOutcomes) {
+        if (outcome.status !== 'rejected') continue;
+        const { componentId, error } = outcome;
+        this._reportCleanupFailure(`Cleanup error in ${componentId}:`, error);
         results.errors.push({ component: componentId, error });
       }
-    }
 
-    // Check memory after cleanup
-    const afterUsage = this.getMemoryUsage();
-    results.afterMB = afterUsage.usedMB;
+      // Measure only after every handler has settled so freed memory reflects
+      // the complete cleanup generation.
+      const afterUsage = this.getMemoryUsage();
+      results.afterMB = afterUsage.usedMB;
 
-    if (afterUsage.available && beforeUsage.available) {
-      results.freedMB = beforeUsage.usedMB - afterUsage.usedMB;
-    }
+      if (afterUsage.available && beforeUsage.available) {
+        results.freedMB = beforeUsage.usedMB - afterUsage.usedMB;
+      }
 
-    debug('MemoryMonitor', `Cleanup complete: ${results.handlersRun} handlers, freed ~${results.freedMB}MB`);
+      debug('MemoryMonitor', `Cleanup complete: ${results.handlersRun} handlers, freed ~${results.freedMB}MB`);
 
-    if (results.errors.length > 0) {
-      throw new AggregateError(
-        results.errors.map(entry => entry.error),
-        `Memory cleanup failed in ${results.errors.length} handler(s)`
-      );
-    }
-    return results;
+      const errors = [...new Set(results.errors.map(entry => entry.error))];
+      if (errors.length === 1) {
+        throw errors[0];
+      }
+      if (errors.length > 1) {
+        throw new AggregateError(
+          errors,
+          `Memory cleanup failed in ${errors.length} handler(s)`
+        );
+      }
+      return results;
+    };
+
+    const scheduledOperation = this._cleanupTail.then(
+      operation,
+      operation
+    );
+    this._cleanupTail = scheduledOperation.then(
+      () => undefined,
+      () => undefined
+    );
+    void scheduledOperation.then(resolveTask, rejectTask);
+
+    const clearTask = () => {
+      if (this._cleanupTasks.get(reason) === cleanupTask) {
+        this._cleanupTasks.delete(reason);
+      }
+    };
+    void cleanupTask.then(clearTask, clearTask);
+
+    return cleanupTask;
   }
 
   /**

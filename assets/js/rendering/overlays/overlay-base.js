@@ -28,13 +28,22 @@ export class OverlayBase {
 
     this._initialized = false;
     this._disposed = false;
+    this._disposeRequested = false;
   }
 
   init() {
-    if (this._disposed) return;
+    this._assertMutableLifecycle('initialize');
     if (this._initialized) return;
     this._doInit();
     this._initialized = true;
+  }
+
+  _assertMutableLifecycle(operation = 'mutate') {
+    if (this._disposeRequested || this._disposed) {
+      throw new Error(
+        `${this.constructor.name} cannot ${operation} after disposal has begun.`
+      );
+    }
   }
 
   /**
@@ -42,7 +51,14 @@ export class OverlayBase {
    * @param {object} context
    */
   update(dtSeconds, context) {
-    if (!this.enabled || !this._initialized || this._disposed) return;
+    if (
+      !this.enabled ||
+      !this._initialized ||
+      this._disposeRequested ||
+      this._disposed
+    ) {
+      return;
+    }
     this._doUpdate(dtSeconds, context);
   }
 
@@ -50,17 +66,30 @@ export class OverlayBase {
    * @param {object} context
    */
   render(context) {
-    if (!this.enabled || !this.visible || !this._initialized || this._disposed) return;
+    if (
+      !this.enabled ||
+      !this.visible ||
+      !this._initialized ||
+      this._disposeRequested ||
+      this._disposed
+    ) {
+      return;
+    }
     this._doRender(context);
   }
 
   dispose() {
     if (this._disposed) return;
-    try {
-      this._doDispose();
-    } finally {
-      this._disposed = true;
-    }
+    // Publish the terminal fence before fallible subclass cleanup. A failed
+    // attempt may retain exact handles for dispose() retry, but it must never
+    // resume update/render work or accept a fresh initialization generation.
+    this._disposeRequested = true;
+    this.enabled = false;
+    // A failed subclass cleanup still owns live handles and must remain
+    // retryable. Publish the terminal lifecycle state only after every owned
+    // resource has been released successfully.
+    this._doDispose();
+    this._disposed = true;
   }
 
   // ---------------------------------------------------------------------------
@@ -83,4 +112,3 @@ export class OverlayBase {
     // Optional for subclasses.
   }
 }
-

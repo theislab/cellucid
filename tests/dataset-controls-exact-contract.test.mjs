@@ -573,6 +573,43 @@ test('selection reloads in place and None clears every exact runtime owner', asy
   });
 });
 
+test('a superseded None selection remains owned by the newer dataset intent', async t => {
+  const metadata = makeIdentity('current', 'Current');
+  const harness = makeHarness([
+    { sourceType: 'local-user', datasets: [metadata] }
+  ]);
+  t.after(harness.browser.restore);
+  const {
+    createDatasetReloadSupersededError,
+    isDatasetReloadSupersededError
+  } = await import('../assets/js/app/dataset-reload-outcome.js');
+  const superseded = createDatasetReloadSupersededError(
+    'A newer selection owns dataset publication.'
+  );
+  const { initDatasetControls } = await import(moduleUrl);
+  const controls = initDatasetControls({
+    dom: harness.dom,
+    dataSourceManager: harness.manager,
+    clearDataset: async () => {
+      throw superseded;
+    },
+    reloadDataset: harness.reloadDataset,
+    callbacks: harness.callbacks
+  });
+  assert.deepEqual(await controls.catalogReady, { status: 'ready' });
+
+  await assert.rejects(
+    controls.clearDataset(),
+    error => error === superseded && isDatasetReloadSupersededError(error)
+  );
+  assert.equal(
+    harness.statuses.some(({ message, isError }) =>
+      isError === true && message.startsWith('Failed to clear dataset:')
+    ),
+    false
+  );
+});
+
 test('terminal switch and malformed event failures are not guessed or hidden', async t => {
   const metadata = makeIdentity('broken', 'Broken');
   const harness = makeHarness([

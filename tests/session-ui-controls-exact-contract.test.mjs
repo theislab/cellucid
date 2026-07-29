@@ -284,6 +284,73 @@ test('UI restore applies one complete exact record synchronously', () => {
   }
 });
 
+test('UI restore validates the complete record before deferring exact controls', () => {
+  const enabled = new FakeControl({
+    id: 'enabled',
+    type: 'checkbox',
+    checked: false,
+  });
+  const mode = new FakeControl({
+    id: 'mode',
+    tagName: 'SELECT',
+    value: 'points',
+    options: ['points', 'smoke'],
+  });
+  const fixture = installDocument([enabled, mode]);
+  try {
+    const serializer = createUiControlSerializer({ sidebar: fixture.sidebar });
+    const controls = {
+      enabled: { type: 'checkbox', checked: true },
+      mode: { type: 'select', value: 'smoke' },
+    };
+    serializer.validateUIControls(controls);
+    assert.equal(enabled.checked, false);
+    assert.equal(mode.value, 'points');
+
+    const restoreDeferred = serializer.restoreUIControls(controls, {
+      deferControlIds: ['mode'],
+    });
+    assert.equal(enabled.checked, true);
+    assert.equal(mode.value, 'points');
+    assert.deepEqual(mode.events, []);
+
+    controls.mode.value = 'points';
+    restoreDeferred();
+    assert.equal(mode.value, 'smoke');
+    assert.deepEqual(mode.events, ['change']);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test('UI restore rejects a consumer that silently reverts an exact value', () => {
+  const mode = new FakeControl({
+    id: 'mode',
+    tagName: 'SELECT',
+    value: 'points',
+    options: ['points', 'smoke'],
+  });
+  mode.dispatchEvent = (event) => {
+    mode.events.push(event.type);
+    mode.value = 'points';
+    return true;
+  };
+  const fixture = installDocument([mode]);
+  try {
+    const serializer = createUiControlSerializer({ sidebar: fixture.sidebar });
+    assert.throws(
+      () => serializer.restoreUIControls({
+        mode: { type: 'select', value: 'smoke' },
+      }),
+      /mode.*rejected restored value.*smoke/i,
+    );
+    assert.equal(mode.value, 'points');
+    assert.deepEqual(mode.events, ['change']);
+  } finally {
+    fixture.restore();
+  }
+});
+
 test('UI restore preserves an exact empty select when the current feature has no choices', () => {
   const unavailableField = new FakeControl({
     id: 'velocity-field',

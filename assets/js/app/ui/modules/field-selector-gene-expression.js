@@ -7,9 +7,17 @@
 import { getNotificationCenter } from '../../notification-center.js';
 import { FieldSource } from '../../utils/field-constants.js';
 import { StateValidator } from '../../utils/state-validator.js';
+import {
+  createDatasetFieldLoadSupersededError,
+  isDatasetFieldLoadSupersededError
+} from '../../state/managers/field/loading.js';
+import {
+  isFieldInteractionSupersededError
+} from './field-interaction-owner.js';
 
 const INIT_KEYS = new Set([
   'state',
+  'interactionOwner',
   'dom',
   'callbacks',
   'obsDom',
@@ -227,15 +235,36 @@ function requireDuplicateResult(value, state) {
  */
 export function initGeneExpressionSelector(options) {
   requireExactKeys(options, INIT_KEYS, 'Gene expression selector options');
-  const { state, dom, callbacks, obsDom, noneFieldValue } = options;
+  const {
+    state,
+    interactionOwner,
+    dom,
+    callbacks,
+    obsDom,
+    noneFieldValue
+  } = options;
   for (const methodName of [
     'duplicateField',
     'ensureVarFieldLoaded',
+    'getDatasetGeneration',
     'getVarFields',
     'getVisibleFields',
     'setActiveVarField'
   ]) {
     requireMethod(state, methodName, 'Gene expression selector state');
+  }
+  for (const methodName of [
+    'assertCurrent',
+    'isCurrent',
+    'isSuspended',
+    'run',
+    'track'
+  ]) {
+    requireMethod(
+      interactionOwner,
+      methodName,
+      'Gene selector interaction owner'
+    );
   }
   requireExactKeys(callbacks, CALLBACK_KEYS, 'Gene selector callbacks');
   for (const callbackName of CALLBACK_KEYS) {
@@ -310,7 +339,14 @@ export function initGeneExpressionSelector(options) {
     ) {
       throw new TypeError('Gene selector UI task must be a Promise');
     }
+    interactionOwner.track(task);
     task.catch((error) => {
+      if (
+        isFieldInteractionSupersededError(error)
+        || isDatasetFieldLoadSupersededError(error)
+      ) {
+        return;
+      }
       const exactError = requireError(error, 'Gene selector UI task');
       console.error(exactError);
       getNotificationCenter().error(
@@ -318,6 +354,16 @@ export function initGeneExpressionSelector(options) {
         { category }
       );
     });
+  }
+
+  function readDatasetGeneration() {
+    const generation = state.getDatasetGeneration();
+    if (!Number.isSafeInteger(generation) || generation < 0) {
+      throw new TypeError(
+        'Gene selector dataset generation must be a non-negative safe integer'
+      );
+    }
+    return generation;
   }
 
   function readVarInventory() {
@@ -475,42 +521,66 @@ export function initGeneExpressionSelector(options) {
     updateGeneActionButtons();
   }
 
-  async function selectGene(originalIdx) {
+  function selectGene(originalIdx) {
     assertAlive();
-    const { field, originalIdx: index } = findGeneEntry(originalIdx);
-    hideGeneDropdown();
-    selectedGeneOriginalIdx = index;
-    categoricalSelect.value = noneFieldValue;
-    continuousSelect.value = noneFieldValue;
-    geneSearch.value = field.key;
-    updateGeneActionButtons();
-    callbacks.onBusyChanged(true);
-    try {
-      await state.ensureVarFieldLoaded(index);
-      const info = requireFieldInfo(
-        state.setActiveVarField(index),
-        field
-      );
-      callbacks.onActiveFieldChanged(info);
-      return info;
-    } catch (error) {
-      const selectionError = requireError(error, 'Gene selection');
-      try {
-        syncFromState();
-      } catch (rollbackError) {
-        throw new AggregateError(
-          [
-            selectionError,
-            requireError(rollbackError, 'Gene selection rollback')
-          ],
-          'Gene selection and UI rollback failed'
-        );
-      }
-      throw selectionError;
-    } finally {
-      callbacks.onBusyChanged(false);
-      updateGeneActionButtons(false);
+    if (interactionOwner.isSuspended()) {
+      return Promise.resolve(null);
     }
+    const datasetGeneration = readDatasetGeneration();
+    return interactionOwner.run(async token => {
+      const { field, originalIdx: index } = findGeneEntry(originalIdx);
+      hideGeneDropdown();
+      selectedGeneOriginalIdx = index;
+      categoricalSelect.value = noneFieldValue;
+      continuousSelect.value = noneFieldValue;
+      geneSearch.value = field.key;
+      updateGeneActionButtons();
+      callbacks.onBusyChanged(true);
+      try {
+        await state.ensureVarFieldLoaded(index, {
+          signal: token.signal
+        });
+        interactionOwner.assertCurrent(token);
+        if (
+          readDatasetGeneration() !== datasetGeneration
+          || readVarInventory()[index] !== field
+        ) {
+          throw createDatasetFieldLoadSupersededError();
+        }
+        const info = requireFieldInfo(
+          state.setActiveVarField(index),
+          field
+        );
+        callbacks.onActiveFieldChanged(info);
+        return info;
+      } catch (error) {
+        if (
+          interactionOwner.isCurrent(token) === false
+          || isFieldInteractionSupersededError(error)
+          || isDatasetFieldLoadSupersededError(error)
+        ) {
+          return null;
+        }
+        const selectionError = requireError(error, 'Gene selection');
+        try {
+          syncFromState();
+        } catch (rollbackError) {
+          throw new AggregateError(
+            [
+              selectionError,
+              requireError(rollbackError, 'Gene selection rollback')
+            ],
+            'Gene selection and UI rollback failed'
+          );
+        }
+        throw selectionError;
+      } finally {
+        if (interactionOwner.isCurrent(token)) {
+          callbacks.onBusyChanged(false);
+          updateGeneActionButtons(false);
+        }
+      }
+    });
   }
 
   async function clearGeneSelection() {
@@ -549,6 +619,7 @@ export function initGeneExpressionSelector(options) {
     const { field, originalIdx } = findGeneEntry(
       selectedGeneOriginalIdx
     );
+    const intent = interactionOwner.beginIntent();
     const notifications = getNotificationCenter();
     const notificationId = notifications.loading(
       `Duplicating "${field.key}"…`,
@@ -559,6 +630,7 @@ export function initGeneExpressionSelector(options) {
         await state.duplicateField(FieldSource.VAR, originalIdx),
         state
       );
+      interactionOwner.assertIntentCurrent(intent);
       initGeneExpressionDropdown();
       await selectGene(result.newFieldIndex);
       notifications.complete(
@@ -566,6 +638,13 @@ export function initGeneExpressionSelector(options) {
         `Created "${result.newKey}"`
       );
     } catch (error) {
+      if (
+        isDatasetFieldLoadSupersededError(error)
+        || isFieldInteractionSupersededError(error)
+      ) {
+        notifications.dismiss(notificationId);
+        return;
+      }
       const exactError = requireError(error, 'Gene duplication');
       console.error(exactError);
       notifications.fail(

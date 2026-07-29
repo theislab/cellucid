@@ -162,6 +162,78 @@ test('notification and formatter inputs reject coercion and missing trackers', (
     () => center.error('exact message', null),
     /options must be a plain object/i,
   );
+  assert.throws(
+    () => center.hasNotification(''),
+    /notification id must be a non-empty string/i,
+  );
+});
+
+test('notification existence reflects pressure or manual retirement without exposing storage', () => {
+  const center = new NotificationCenter();
+  const notification = {
+    dismissTimer: null,
+    element: {},
+    options: { type: NotificationType.LOADING },
+  };
+  center.notifications.set('async-owner', notification);
+
+  assert.equal(center.hasNotification('async-owner'), true);
+  center.notifications.delete('async-owner');
+  assert.equal(center.hasNotification('async-owner'), false);
+});
+
+test('notification pressure evicts oldest non-active work and never active owners', () => {
+  const center = new NotificationCenter();
+  center.maxNotifications = 2;
+  const dismissed = [];
+  center.dismiss = id => {
+    dismissed.push(id);
+    return center.notifications.delete(id);
+  };
+  const record = type => ({
+    dismissTimer: null,
+    element: {},
+    options: { type },
+  });
+  center.notifications.set(
+    'active-oldest',
+    record(NotificationType.LOADING),
+  );
+  center.notifications.set(
+    'terminal-middle',
+    record(NotificationType.SUCCESS),
+  );
+
+  center._evictNonActiveUntil(center.maxNotifications - 1);
+
+  assert.deepEqual(dismissed, ['terminal-middle']);
+  assert.equal(center.hasNotification('active-oldest'), true);
+  assert.equal(center.notifications.size, 1);
+
+  center.notifications.set(
+    'active-newer',
+    record(NotificationType.PROGRESS),
+  );
+  center._evictNonActiveUntil(center.maxNotifications - 1);
+
+  // Both active generations remain owned even though a new notification will
+  // temporarily take the center beyond its nominal visual cap.
+  assert.deepEqual(dismissed, ['terminal-middle']);
+  assert.equal(center.notifications.size, 2);
+
+  center.notifications.set(
+    'active-overflow',
+    record(NotificationType.LOADING),
+  );
+  center.notifications.get('active-oldest').options.type =
+    NotificationType.ERROR;
+  center._evictNonActiveUntil(center.maxNotifications);
+
+  assert.deepEqual(dismissed, [
+    'terminal-middle',
+    'active-oldest',
+  ]);
+  assert.equal(center.hasNotification('active-newer'), true);
 });
 
 test('download zero-byte totals remain exact and tracker adoption is transactional', () => {

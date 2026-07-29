@@ -16,10 +16,22 @@ import {
 function bareDataLayer(state = {}) {
   const layer = Object.create(DataLayer.prototype);
   layer.state = state;
+  layer._datasetGeneration = 0;
+  layer._cacheGeneration = 0;
+  layer._fieldLoadLifecycle = new AbortController();
+  layer._destroyed = false;
   layer._notifications = null;
   layer.getCellIndicesForPage = () => Uint32Array.of(0);
   layer.getPages = () => [{ id: 'page-1', name: 'Page 1' }];
   return layer;
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise(resolvePromise => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }
 
 function transformRegistry(execute, {
@@ -106,6 +118,168 @@ test('bulk gene loader failure is not converted into a sequential result', async
     error => error === injected,
   );
   assert.equal(sequentialCalls, 0);
+});
+
+test('dataset reset generation-isolates old cache and pending-request settlement', async t => {
+  const layer = new DataLayer({}, {
+    enableNotifications: false,
+    enablePrefetch: false,
+    enableVersionTracking: false,
+  });
+  t.after(() => layer.destroy());
+
+  const older = deferred();
+  const newer = deferred();
+  const pending = [older, newer];
+  layer.refreshPageVersions = () => {};
+  layer._getCacheKey = () => 'same-request';
+  layer._fetchDataForPages = () => pending.shift().promise;
+
+  const request = {
+    type: 'continuous_obs',
+    variableKey: 'score',
+    pageIds: ['page-1'],
+  };
+  const olderRequest = layer.getDataForPages(request);
+  assert.equal(layer._pendingRequests.get('same-request'), older.promise);
+
+  layer.resetForDatasetReload();
+  const newerRequest = layer.getDataForPages(request);
+  assert.equal(layer._pendingRequests.get('same-request'), newer.promise);
+
+  older.resolve(['old-dataset']);
+  await assert.rejects(
+    olderRequest,
+    /analysis data request.*invalidated|invalidated.*analysis data request/i,
+  );
+  assert.equal(
+    layer._dataCache.has('same-request'),
+    false,
+    'an old dataset generation must not repopulate the cache',
+  );
+  assert.equal(
+    layer._pendingRequests.get('same-request'),
+    newer.promise,
+    'an old finally block must not delete the newer same-key pending owner',
+  );
+
+  newer.resolve(['new-dataset']);
+  assert.deepEqual(await newerRequest, ['new-dataset']);
+  assert.deepEqual(layer._dataCache.get('same-request'), ['new-dataset']);
+  assert.equal(layer._pendingRequests.has('same-request'), false);
+});
+
+test('page-data requests snapshot caller-owned page IDs before cache keying and awaits', async t => {
+  const layer = new DataLayer({}, {
+    enableNotifications: false,
+    enablePrefetch: false,
+    enableVersionTracking: false,
+  });
+  t.after(() => layer.destroy());
+
+  const gate = deferred();
+  layer.refreshPageVersions = () => {};
+  layer._getCacheKey = ({ pageIds }) => `pages:${pageIds.join(',')}`;
+  layer._fetchDataForPages = async ({ pageIds }) => {
+    await gate.promise;
+    return [...pageIds];
+  };
+
+  const pageIds = ['page-A'];
+  const request = layer.getDataForPages({
+    type: 'continuous_obs',
+    variableKey: 'score',
+    pageIds,
+  });
+  pageIds[0] = 'page-B';
+  gate.resolve();
+
+  assert.deepEqual(await request, ['page-A']);
+  assert.deepEqual(layer._dataCache.get('pages:page-A'), ['page-A']);
+  assert.equal(layer._dataCache.has('pages:page-B'), false);
+});
+
+test('dataset reset rejects an old bulk-gene generation without cache or notification publication', async t => {
+  const layer = new DataLayer({}, {
+    enableNotifications: false,
+    enablePrefetch: false,
+    enableVersionTracking: false,
+  });
+  t.after(() => layer.destroy());
+
+  const gate = deferred();
+  const terminal = [];
+  layer._notifications = {
+    show() {
+      return 'bulk-old';
+    },
+    updateProgress() {},
+    complete(id) {
+      terminal.push(['complete', id]);
+    },
+    fail(id) {
+      terminal.push(['fail', id]);
+    },
+    dismiss(id) {
+      terminal.push(['dismiss', id]);
+    },
+  };
+  layer.refreshPageVersions = () => {};
+  layer.getAvailableVariables = () => [{ key: 'Gene A' }];
+  layer.getDataForPages = async () => gate.promise;
+
+  const request = layer.fetchBulkGeneExpression({
+    pageIds: ['page-1'],
+    geneList: ['Gene A'],
+  });
+  layer.resetForDatasetReload();
+  gate.resolve([{
+    pageId: 'page-1',
+    pageName: 'Old page',
+    values: [1],
+    cellIndices: [0],
+    cellCount: 1,
+  }]);
+
+  await assert.rejects(
+    request,
+    /analysis data request.*invalidated|invalidated.*analysis data request/i,
+  );
+  assert.equal(layer._bulkGeneCache.size, 0);
+  assert.deepEqual(terminal, [['dismiss', 'bulk-old']]);
+});
+
+test('session cache rollback cannot resurrect an older dataset after reset or destroy', async t => {
+  for (const lifecycle of ['reset', 'destroy']) {
+    await t.test(lifecycle, () => {
+      const layer = new DataLayer({}, {
+        enableNotifications: false,
+        enablePrefetch: false,
+        enableVersionTracking: false,
+      });
+      layer._bulkGeneCache.set('old-dataset', {
+        data: {},
+        timestamp: 1,
+        geneCount: 0,
+      });
+      layer._bulkGeneCacheAccessOrder.push('old-dataset');
+      const replacement = layer.beginSessionCacheReplacement();
+
+      if (lifecycle === 'reset') {
+        layer.resetForDatasetReload();
+      } else {
+        layer.destroy();
+      }
+      assert.deepEqual([...layer._bulkGeneCache.keys()], []);
+      assert.throws(
+        () => replacement.rollback(),
+        /dataset|lifecycle|invalidated|ownership changed/i,
+      );
+      assert.deepEqual([...layer._bulkGeneCache.keys()], []);
+
+      if (lifecycle !== 'destroy') layer.destroy();
+    });
+  }
 });
 
 test('bulk observation loader failure is not converted into a sequential result', async () => {

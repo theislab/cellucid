@@ -696,11 +696,15 @@ test('an explicit empty bootstrap never adopts a synthetic zero-point scene', as
   const initialUiSource = mainSource.slice(uiStart, uiEnd);
   assert.match(
     selectionBootstrap,
-    /const initialReloadTransaction = hasInitialDataset[\s\S]*datasetReloadCoordinator\.begin\(\)/
+    /let initialPublication = null;[\s\S]*initialPublication = commitDatasetRuntimeStage\(initialStage\)/
+  );
+  assert.doesNotMatch(
+    selectionBootstrap,
+    /initialReloadTransaction/
   );
   assert.match(
     initialUiSource,
-    /if \(hasInitialDataset\) \{[\s\S]*initialReloadTransaction\.isCurrent\(\)[\s\S]*synchronizePublishedDatasetUi\([\s\S]*initialPublication[\s\S]*await ui\.activateField\(-1\);[\s\S]*restoreAdvertisedDatasetState\(\{[\s\S]*initialReloadTransaction\.signal[\s\S]*settleInitialPublishedDatasetStateOutcome\(\{[\s\S]*cancel:\s*\(\) => cancelDataLoad\(initialLoadToken\)[\s\S]*complete:\s*\(\) => completeDataLoadSuccess\([\s\S]*currentDatasetLoadToken = null/
+    /if \(hasInitialDataset\) \{[\s\S]*initialPublication\.isCurrent\(\)[\s\S]*synchronizePublishedDatasetUi\([\s\S]*initialPublication[\s\S]*await ui\.activateField\(-1\);[\s\S]*restoreAdvertisedDatasetState\(\{[\s\S]*initialPublication\.signal[\s\S]*settleInitialPublishedDatasetStateOutcome\(\{[\s\S]*transaction:\s*initialPublication,[\s\S]*cancel:\s*\(\) => cancelDataLoad\(initialLoadToken\)[\s\S]*complete:\s*\(\) => completeDataLoadSuccess\([\s\S]*currentDatasetLoadToken = null/
   );
   assert.doesNotMatch(
     initialUiSource,

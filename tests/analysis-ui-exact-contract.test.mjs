@@ -5,6 +5,7 @@ import test from 'node:test';
 import { AnalysisUIManager } from '../assets/js/app/analysis/ui/analysis-ui-manager.js';
 import { AnalysisWindowManager } from '../assets/js/app/analysis/ui/analysis-window-manager.js';
 import { BaseAnalysisUI } from '../assets/js/app/analysis/ui/base-analysis-ui.js';
+import { PlotRegistry } from '../assets/js/app/analysis/shared/plot-registry-utils.js';
 import {
   PAGE_MODE,
   PageSelectorComponent,
@@ -18,6 +19,7 @@ import { CorrelationAnalysisUI } from '../assets/js/app/analysis/ui/analysis-typ
 import { FormBasedAnalysisUI } from '../assets/js/app/analysis/ui/analysis-types/base/form-based-analysis.js';
 import { GeneSignatureUI } from '../assets/js/app/analysis/ui/analysis-types/gene-signature-ui.js';
 import { DEAnalysisUI } from '../assets/js/app/analysis/ui/analysis-types/de-analysis-ui.js';
+import { createRequestIdTracker } from '../assets/js/app/analysis/shared/cancellable-operation.js';
 import { MultiVariableAnalysis } from '../assets/js/app/analysis/stats/multi-variable-analysis.js';
 import {
   capture as captureAnalysisWindows,
@@ -31,6 +33,31 @@ import {
   deResultsToCSV,
   toCSV,
 } from '../assets/js/app/analysis/shared/analysis-utils.js';
+
+function deferred() {
+  let reject;
+  let resolve;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    reject = rejectPromise;
+    resolve = resolvePromise;
+  });
+  return { promise, reject, resolve };
+}
+
+function instrumentRejectionObservers(task) {
+  let count = 0;
+  const originalThen = task.then.bind(task);
+  const originalCatch = task.catch.bind(task);
+  task.then = (onFulfilled, onRejected) => {
+    if (typeof onRejected === 'function') count++;
+    return originalThen(onFulfilled, onRejected);
+  };
+  task.catch = onRejected => {
+    if (typeof onRejected === 'function') count++;
+    return originalCatch(onRejected);
+  };
+  return () => count;
+}
 
 function baseSettingsHarness() {
   const ui = Object.create(BaseAnalysisUI.prototype);
@@ -496,6 +523,159 @@ async function withFakeDOM(run) {
   }
 }
 
+test('Form plot-option events observe and drain work while direct callers retain the exact render task', { concurrency: false }, async () => {
+  await withFakeDOM(async () => {
+    const directRender = deferred();
+    const eventRender = deferred();
+    const rejectionObserverCount = instrumentRejectionObservers(
+      eventRender.promise,
+    );
+    const ui = new FormBasedAnalysisUI({
+      comparisonModule: {},
+      dataLayer: {},
+    });
+    ui._lastResult = {
+      data: {},
+      options: { enabled: false },
+      plotType: 'probe',
+    };
+    let rerenderCalls = 0;
+    ui._rerenderAfterOptionChange = () => {
+      rerenderCalls++;
+      return rerenderCalls === 1
+        ? directRender.promise
+        : eventRender.promise;
+    };
+
+    const directTask = ui._handlePlotOptionChange('enabled', false);
+    assert.equal(
+      directTask,
+      directRender.promise,
+      'the callable owner must preserve its exact render task',
+    );
+    directRender.resolve();
+    await directTask;
+
+    const plotDefinition = {
+      defaultOptions: { enabled: false },
+      optionSchema: {
+        enabled: {
+          label: 'Enabled',
+          type: 'checkbox',
+        },
+      },
+    };
+    const originalGet = PlotRegistry.get;
+    const originalGetVisibleOptions = PlotRegistry.getVisibleOptions;
+    PlotRegistry.get = () => plotDefinition;
+    PlotRegistry.getVisibleOptions = () => plotDefinition.optionSchema;
+    try {
+      const optionsContainer = new FakeElement('div');
+      ui._renderModalOptions(optionsContainer);
+      const checkbox = optionsContainer.children[0]?.children[0] ?? null;
+      assert.equal(
+        checkbox?.tagName,
+        'INPUT',
+        'the real options renderer must wire its checkbox',
+      );
+      checkbox.checked = true;
+      for (const listener of checkbox.listeners.get('change') ?? []) {
+        listener.call(checkbox, { target: checkbox });
+      }
+      await Promise.resolve();
+
+      const observedBeforeDestroy = rejectionObserverCount() > 0;
+      let destroySettled = false;
+      const destroying = ui.destroy();
+      void destroying.then(
+        () => {
+          destroySettled = true;
+        },
+        () => {
+          destroySettled = true;
+        },
+      );
+      for (let turn = 0; turn < 12; turn++) await Promise.resolve();
+      const settledBeforeEventRender = destroySettled;
+
+      eventRender.resolve();
+      await destroying;
+
+      assert.deepEqual({
+        observedBeforeDestroy,
+        rerenderCalls,
+        settledBeforeEventRender,
+      }, {
+        observedBeforeDestroy: true,
+        rerenderCalls: 2,
+        settledBeforeEventRender: false,
+      });
+    } finally {
+      PlotRegistry.get = originalGet;
+      PlotRegistry.getVisibleOptions = originalGetVisibleOptions;
+    }
+  });
+});
+
+test('Form preview expand events observe failures and destruction drains the active modal-open task', { concurrency: false }, async () => {
+  await withFakeDOM(async () => {
+    const openTask = deferred();
+    const rejectionObserverCount = instrumentRejectionObservers(
+      openTask.promise,
+    );
+    const ui = new FormBasedAnalysisUI({
+      comparisonModule: {},
+      dataLayer: {},
+    });
+    ui._resultContainer = new FakeElement('div');
+    ui._createOwnedPlotSlot = () => ({
+      destroy() {
+        return Promise.resolve();
+      },
+    });
+    let openCalls = 0;
+    ui._openExpandedView = () => {
+      openCalls++;
+      return openTask.promise;
+    };
+
+    await ui._ensurePreviewPlotSlot({
+      clickable: true,
+      containerId: 'event-owner-preview',
+    });
+    const preview = ui._resultContainer.children[0];
+    preview.click();
+    await Promise.resolve();
+
+    const observedBeforeDestroy = rejectionObserverCount() > 0;
+    let destroySettled = false;
+    const destroying = ui.destroy();
+    void destroying.then(
+      () => {
+        destroySettled = true;
+      },
+      () => {
+        destroySettled = true;
+      },
+    );
+    for (let turn = 0; turn < 12; turn++) await Promise.resolve();
+    const settledBeforeOpenTask = destroySettled;
+
+    openTask.resolve();
+    await destroying;
+
+    assert.deepEqual({
+      observedBeforeDestroy,
+      openCalls,
+      settledBeforeOpenTask,
+    }, {
+      observedBeforeDestroy: true,
+      openCalls: 1,
+      settledBeforeOpenTask: false,
+    });
+  });
+});
+
 function createWindowManagerHarness() {
   const pages = [{ id: 'page-a', name: 'Page A' }];
   const comparisonModule = {
@@ -684,17 +864,17 @@ test('analysis-window session capture requires the exact manager API', () => {
   );
 });
 
-test('analysis-window session restore is terminal on invalid boundaries and manager failures', () => {
-  assert.throws(
-    () => restoreAnalysisWindows({}, {}, { windows: [] }),
+test('analysis-window session restore is terminal on invalid boundaries and manager failures', async () => {
+  await assert.rejects(
+    restoreAnalysisWindows({}, {}, { windows: [] }),
     /analysisWindowManager.*closeAll.*createFromSessionDescriptor/i,
   );
   const exactManager = {
     closeAll() {},
     createFromSessionDescriptor() {},
   };
-  assert.throws(
-    () => restoreAnalysisWindows(
+  await assert.rejects(
+    restoreAnalysisWindows(
       { analysisWindowManager: exactManager },
       {},
       {},
@@ -704,8 +884,8 @@ test('analysis-window session restore is terminal on invalid boundaries and mana
 
   const closeError = new Error('close failed');
   let restoreCalls = 0;
-  assert.throws(
-    () => restoreAnalysisWindows(
+  await assert.rejects(
+    restoreAnalysisWindows(
       {
         analysisWindowManager: {
           closeAll() {
@@ -725,8 +905,8 @@ test('analysis-window session restore is terminal on invalid boundaries and mana
 
   const restoreError = new Error('restore failed');
   restoreCalls = 0;
-  assert.throws(
-    () => restoreAnalysisWindows(
+  await assert.rejects(
+    restoreAnalysisWindows(
       {
         analysisWindowManager: {
           closeAll() {},
@@ -747,7 +927,10 @@ test('analysis-window session restore is terminal on invalid boundaries and mana
 function createSessionSerializer(contributors) {
   return new SessionSerializer({
     state: {
+      getDatasetGeneration: () => 0,
+      obsData: { fields: [] },
       pointCount: 3,
+      positionsArray: new Float32Array(9),
       varData: { fields: [] },
     },
     viewer: {},
@@ -1011,6 +1194,14 @@ test('correlation UI awaits each selected variable readiness before one compute 
 
 test('analysis previews invoke their required full-view modal owner', async () => {
   await withFakeDOM(async () => {
+    const originalGet = PlotRegistry.get;
+    const originalMergeOptions = PlotRegistry.mergeOptions;
+    PlotRegistry.get = () => ({
+      async render() {},
+    });
+    PlotRegistry.mergeOptions = (_plotType, options = {}) => (
+      structuredClone(options)
+    );
     const cases = [
       {
         label: 'Correlation',
@@ -1041,39 +1232,59 @@ test('analysis previews invoke their required full-view modal owner', async () =
       },
     ];
 
-    for (const modalCase of cases) {
-      let modalOpenCalls = 0;
-      const ui = Object.create(modalCase.prototype);
-      ui._resultContainer = new FakeElement('div');
-      ui._openExpandedView = () => {
-        modalOpenCalls += 1;
-      };
-      modalCase.configure(ui);
+    try {
+      for (const modalCase of cases) {
+        let modalOpenCalls = 0;
+        const ui = Object.create(modalCase.prototype);
+        ui._resultContainer = new FakeElement('div');
+        ui._analysisRequestTracker = createRequestIdTracker();
+        ui._activeAnalysisRequestId = null;
+        ui._analysisInvalidationOwner = null;
+        ui._isDestroyed = false;
+        ui._isLoading = false;
+        ui._createOwnedPlotSlot = (host, candidateClassName) => ({
+          async render() {
+            const candidate = new FakeElement('div');
+            candidate.className = candidateClassName;
+            host.appendChild(candidate);
+            return candidate;
+          },
+        });
+        ui._openExpandedView = async () => {
+          modalOpenCalls += 1;
+        };
+        modalCase.configure(ui);
 
-      await ui._showResult(modalCase.result);
+        const requestId = ui._startAnalysisRequest();
+        await ui._showResult(modalCase.result, requestId);
+        ui._finishAnalysisRequest(requestId);
 
-      let clickTarget = null;
-      const visit = element => {
-        if (
-          element.className
-            .split(/\s+/)
-            .includes(modalCase.clickClass)
-        ) {
-          clickTarget = element;
-        }
-        for (const child of element.children) visit(child);
-      };
-      visit(ui._resultContainer);
-      assert.ok(
-        clickTarget,
-        `${modalCase.label} must render its full-view control`,
-      );
-      clickTarget.click();
-      assert.equal(
-        modalOpenCalls,
-        1,
-        `${modalCase.label} full-view control must invoke the modal owner exactly once`,
-      );
+        let clickTarget = null;
+        const visit = element => {
+          if (
+            element.className
+              .split(/\s+/)
+              .includes(modalCase.clickClass)
+          ) {
+            clickTarget = element;
+          }
+          for (const child of element.children) visit(child);
+        };
+        visit(ui._resultContainer);
+        assert.ok(
+          clickTarget,
+          `${modalCase.label} must render its full-view control`,
+        );
+        clickTarget.click();
+        assert.equal(
+          modalOpenCalls,
+          1,
+          `${modalCase.label} full-view control must invoke the modal owner exactly once`,
+        );
+      }
+    } finally {
+      PlotRegistry.get = originalGet;
+      PlotRegistry.mergeOptions = originalMergeOptions;
     }
   });
 });

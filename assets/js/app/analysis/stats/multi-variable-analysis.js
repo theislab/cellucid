@@ -39,6 +39,69 @@ function cleanupPreservingAnalysisFailure(
   }
 }
 
+function requireCurrentPredicate(value, label) {
+  if (value === undefined) return () => true;
+  if (typeof value !== 'function') {
+    throw new TypeError(`${label} isCurrent must be a function when provided`);
+  }
+  return value;
+}
+
+function resolveRequestOwnership(options, label) {
+  const currentPredicate = options.isCurrent;
+  const isCurrent = requireCurrentPredicate(currentPredicate, label);
+  const registerInvalidationCleanup = options.registerInvalidationCleanup;
+  if (
+    registerInvalidationCleanup !== undefined &&
+    typeof registerInvalidationCleanup !== 'function'
+  ) {
+    throw new TypeError(
+      `${label} registerInvalidationCleanup must be a function when provided`
+    );
+  }
+  if (
+    currentPredicate !== undefined &&
+    registerInvalidationCleanup === undefined
+  ) {
+    throw new TypeError(
+      `${label} requires registerInvalidationCleanup with isCurrent`
+    );
+  }
+  return { isCurrent, registerInvalidationCleanup };
+}
+
+function createNotificationOwner({
+  notifications,
+  notificationId,
+  label,
+  registerInvalidationCleanup,
+}) {
+  let settled = false;
+  const settle = (operation, ...args) => {
+    if (settled) return false;
+    const handler = notifications?.[operation];
+    if (typeof handler !== 'function') {
+      throw new TypeError(
+        `${label} notifications must implement ${operation}()`
+      );
+    }
+    // Claim the terminal state before invoking external notification code.
+    // A throwing handler must never permit a second terminal transition.
+    settled = true;
+    handler.call(notifications, notificationId, ...args);
+    return true;
+  };
+  const owner = {
+    complete: message => settle('complete', message),
+    fail: message => settle('fail', message),
+    dismiss: () => settle('dismiss'),
+  };
+  if (registerInvalidationCleanup !== undefined) {
+    registerInvalidationCleanup(owner.dismiss);
+  }
+  return owner;
+}
+
 /**
  * Multi-Variable Analysis class
  */
@@ -82,7 +145,17 @@ export class MultiVariableAnalysis {
     if (!options || typeof options !== 'object' || Array.isArray(options)) {
       throw new TypeError('Correlation analysis options are required');
     }
-    const { varX, varY, pageIds, method = 'pearson', colorBy = null } = options;
+    const {
+      varX,
+      varY,
+      pageIds,
+      method = 'pearson',
+      colorBy = null
+    } = options;
+    const { isCurrent, registerInvalidationCleanup } = resolveRequestOwnership(
+      options,
+      'Correlation analysis'
+    );
 
     const allowedTypes = new Set([
       'categorical_obs',
@@ -126,62 +199,102 @@ export class MultiVariableAnalysis {
         throw new TypeError(`Unknown correlation method: ${String(method)}`);
       }
       if (colorBy !== null) requireVariable(colorBy, 'colorBy');
+      if (!isCurrent()) {
+        memScope.end({ stale: true });
+        return null;
+      }
     } catch (error) {
       memScope.end({ error: 'Invalid options' });
       throw error;
     }
 
+    const ownedVarX = { type: varX.type, key: varX.key };
+    const ownedVarY = { type: varY.type, key: varY.key };
+    const ownedColorBy = colorBy === null
+      ? null
+      : { type: colorBy.type, key: colorBy.key };
+    const ownedPageIds = [...pageIds];
     const notificationId = this._notifications.loading(
       `Computing ${method} correlation...`,
       { category: 'calculation' }
     );
+    const notification = createNotificationOwner({
+      notifications: this._notifications,
+      notificationId,
+      label: 'Correlation analysis',
+      registerInvalidationCleanup,
+    });
+    if (!isCurrent()) {
+      notification.dismiss();
+      memScope.end({ method, stale: true });
+      return null;
+    }
 
     try {
       // Fetch data for variables in parallel (including colorBy if specified)
       const fetchPromises = [
         this.dataLayer.getDataForPages({
-          type: varX.type,
-          variableKey: varX.key,
-          pageIds
+          type: ownedVarX.type,
+          variableKey: ownedVarX.key,
+          pageIds: ownedPageIds,
+          silent: true,
         }),
         this.dataLayer.getDataForPages({
-          type: varY.type,
-          variableKey: varY.key,
-          pageIds
+          type: ownedVarY.type,
+          variableKey: ownedVarY.key,
+          pageIds: ownedPageIds,
+          silent: true,
         })
       ];
 
       // Fetch color variable if specified
-      if (colorBy !== null) {
+      if (ownedColorBy !== null) {
         fetchPromises.push(
           this.dataLayer.getDataForPages({
-            type: colorBy.type,
-            variableKey: colorBy.key,
-            pageIds
+            type: ownedColorBy.type,
+            variableKey: ownedColorBy.key,
+            pageIds: ownedPageIds,
+            silent: true,
           })
         );
       }
 
       const [dataX, dataY, dataColor] = await Promise.all(fetchPromises);
+      if (!isCurrent()) {
+        notification.dismiss();
+        memScope.end({ method, stale: true });
+        return null;
+      }
 
       const results = [];
       const computeManager = await this._getComputeManager();
+      if (!isCurrent()) {
+        notification.dismiss();
+        memScope.end({ method, stale: true });
+        return null;
+      }
       const maxPlotPoints = 50000;
 
       // Compute correlation for each page
-      for (let i = 0; i < pageIds.length; i++) {
-        const pageX = dataX.find(d => d.pageId === pageIds[i]);
-        const pageY = dataY.find(d => d.pageId === pageIds[i]);
-        const pageColor = dataColor?.find(d => d.pageId === pageIds[i]);
+      for (let i = 0; i < ownedPageIds.length; i++) {
+        if (!isCurrent()) {
+          notification.dismiss();
+          memScope.end({ method, stale: true });
+          return null;
+        }
+        const pageId = ownedPageIds[i];
+        const pageX = dataX.find(d => d.pageId === pageId);
+        const pageY = dataY.find(d => d.pageId === pageId);
+        const pageColor = dataColor?.find(d => d.pageId === pageId);
 
         if (!pageX || !pageY) {
           throw new Error(
-            `Correlation page "${pageIds[i]}" is missing one or both selected variables`
+            `Correlation page "${pageId}" is missing one or both selected variables`
           );
         }
-        if (colorBy !== null && !pageColor) {
+        if (ownedColorBy !== null && !pageColor) {
           throw new Error(
-            `Correlation page "${pageIds[i]}" is missing the selected color variable`
+            `Correlation page "${pageId}" is missing the selected color variable`
           );
         }
 
@@ -194,7 +307,7 @@ export class MultiVariableAnalysis {
 
         if (xAligned.length < 3) {
           throw new RangeError(
-            `Correlation page "${pageIds[i]}" requires at least 3 paired values; ` +
+            `Correlation page "${pageId}" requires at least 3 paired values; ` +
             `received ${xAligned.length}`
           );
         }
@@ -207,36 +320,46 @@ export class MultiVariableAnalysis {
           { xValues: xAligned, yValues: yAligned, method },
           { transfer: sampled }
         );
+        if (!isCurrent()) {
+          notification.dismiss();
+          memScope.end({ method, stale: true });
+          return null;
+        }
 
         const result = {
-          pageId: pageIds[i],
+          pageId,
           pageName: pageX.pageName,
           ...correlation,
           xValues: xPlot,
           yValues: yPlot,
-          xVariable: varX.key,
-          yVariable: varY.key,
+          xVariable: ownedVarX.key,
+          yVariable: ownedVarY.key,
           sampled
         };
 
         // Include color data if available
-        if (colorBy !== null) {
+        if (ownedColorBy !== null) {
           result.colorValues = colorPlot;
-          result.colorVariable = colorBy.key;
+          result.colorVariable = ownedColorBy.key;
         }
 
         results.push(result);
       }
 
-      this._notifications.complete(notificationId,
+      notification.complete(
         `Correlation analysis complete (${method})`
       );
 
-      memScope.end({ pages: pageIds.length, method });
+      memScope.end({ pages: ownedPageIds.length, method });
       return results;
 
     } catch (error) {
-      this._notifications.fail(notificationId, `Correlation failed: ${error.message}`);
+      if (!isCurrent()) {
+        notification.dismiss();
+        memScope.end({ method, stale: true });
+        return null;
+      }
+      notification.fail(`Correlation failed: ${error.message}`);
       memScope.end({ method, error: error.message });
       throw error;
     }
@@ -432,6 +555,8 @@ export class MultiVariableAnalysis {
    * @param {number|'auto'} [options.parallelism='auto'] - Max concurrent genes in-flight (worker-backed)
    * @param {Object} [options.batchConfig] - Batch settings (preloadCount, memoryBudgetMB, networkConcurrency)
    * @param {Function} [options.onProgress] - Progress callback
+   * @param {Function} [options.isCurrent] - Exact request ownership predicate
+   * @param {Function} [options.registerInvalidationCleanup] - Required with isCurrent
    * @returns {Promise<Object>} Differential expression results
   */
   async differentialExpression(options) {
@@ -440,16 +565,36 @@ export class MultiVariableAnalysis {
       throw new TypeError('Differential expression options are required');
     }
     const {
-      pageA,
-      pageB,
-      geneList = null,
+      pageA: requestedPageA,
+      pageB: requestedPageB,
+      geneList: requestedGeneList = null,
       method = 'wilcox',
       minCells = 10,
       parallelism = 'auto',
       onProgress,
       // Batch configuration options for optimized loading
-      batchConfig = {}
+      batchConfig: requestedBatchConfig = {}
     } = options;
+    const { isCurrent, registerInvalidationCleanup } = resolveRequestOwnership(
+      options,
+      'Differential expression'
+    );
+    const pageA = requestedPageA;
+    const pageB = requestedPageB;
+    const geneList = Array.isArray(requestedGeneList)
+      ? [...requestedGeneList]
+      : requestedGeneList;
+    const batchConfig = (
+      requestedBatchConfig &&
+      typeof requestedBatchConfig === 'object' &&
+      !Array.isArray(requestedBatchConfig)
+    )
+      ? {
+        preloadCount: requestedBatchConfig.preloadCount,
+        memoryBudgetMB: requestedBatchConfig.memoryBudgetMB,
+        networkConcurrency: requestedBatchConfig.networkConcurrency,
+      }
+      : requestedBatchConfig;
 
     if (
       typeof pageA !== 'string' ||
@@ -468,8 +613,8 @@ export class MultiVariableAnalysis {
     if (!['wilcox', 'ttest'].includes(method)) {
       throw new TypeError(`Unknown differential expression method: ${String(method)}`);
     }
-    if (!Number.isSafeInteger(minCells) || minCells <= 0) {
-      throw new TypeError('minCells must be a positive safe integer');
+    if (!Number.isSafeInteger(minCells) || minCells < 2) {
+      throw new TypeError('minCells must be a safe integer of at least 2');
     }
     if (
       parallelism !== 'auto' &&
@@ -506,6 +651,10 @@ export class MultiVariableAnalysis {
       throw new TypeError(
         'geneList must be null or unique non-empty gene keys'
       );
+    }
+    if (!isCurrent()) {
+      memScope.end({ method, stale: true });
+      return null;
     }
 
     const startTime = performance.now();
@@ -593,7 +742,7 @@ export class MultiVariableAnalysis {
       phases: ['Loading & Computing', 'Multiple Testing Correction'],
       showNotification: false,
       onUpdate: (stats) => {
-        if (onProgress) {
+        if (isCurrent() && onProgress) {
           onProgress({
             phase: stats.phase,
             progress: stats.progress,
@@ -611,11 +760,27 @@ export class MultiVariableAnalysis {
 
     /** @type {import('../compute/compute-manager.js').ComputeManager|null} */
     let computeManager = null;
+    /** @type {StreamingGeneLoader|null} */
+    let geneLoader = null;
     let didStartHeavyCompute = false;
     let hasAnalysisFailure = false;
     let analysisFailure;
+    let invalidationCleanupClaimed = false;
+    if (registerInvalidationCleanup !== undefined) {
+      registerInvalidationCleanup(() => {
+        if (invalidationCleanupClaimed) return;
+        invalidationCleanupClaimed = true;
+        progressTracker.cancel();
+        geneLoader?.abort();
+      });
+    }
 
     try {
+      if (!isCurrent()) {
+        progressTracker.cancel();
+        memScope.end({ method, stale: true });
+        return null;
+      }
       const pageAInfo = this.dataLayer.getPageInfo(pageA);
       const pageBInfo = this.dataLayer.getPageInfo(pageB);
       for (const [pageId, pageInfo] of [
@@ -639,6 +804,32 @@ export class MultiVariableAnalysis {
        * @param {string} pageId
        * @returns {Object} Group specification
        */
+      const requireSortedUniqueIndices = (indices, owner) => {
+        if (
+          indices === null ||
+          indices === undefined ||
+          !Number.isSafeInteger(indices.length) ||
+          indices.length < 0
+        ) {
+          throw new TypeError(`${owner} must provide an array-like cell index set`);
+        }
+        let previous = -1;
+        for (let index = 0; index < indices.length; index++) {
+          const cellIndex = indices[index];
+          if (
+            !Number.isSafeInteger(cellIndex) ||
+            cellIndex < 0 ||
+            cellIndex >= pointCount ||
+            cellIndex <= previous
+          ) {
+            throw new RangeError(
+              `${owner} cell indices must be sorted, unique, and inside the dataset`
+            );
+          }
+          previous = cellIndex;
+        }
+        return indices;
+      };
       const buildGroupSpec = (pageId) => {
         const pageInfo = this.dataLayer.getPageInfo(pageId);
         if (
@@ -659,11 +850,17 @@ export class MultiVariableAnalysis {
               `Malformed rest-of page ID: ${pageId}`
             );
           }
-          const excludedCellIndices = this.dataLayer.getCellIndicesForPage(baseId);
+          const excludedCellIndices = requireSortedUniqueIndices(
+            this.dataLayer.getCellIndicesForPage(baseId),
+            `Rest-of page "${pageId}"`
+          );
           return { kind: 'rest_of', pageId, pageName, baseId, excludedCellIndices, isRestOf: true };
         }
 
-        const cellIndices = this.dataLayer.getCellIndicesForPage(pageId);
+        const cellIndices = requireSortedUniqueIndices(
+          this.dataLayer.getCellIndicesForPage(pageId),
+          `Page "${pageId}"`
+        );
         return { kind: 'explicit', pageId, pageName, cellIndices, isRestOf: false };
       };
 
@@ -684,6 +881,99 @@ export class MultiVariableAnalysis {
 
       const groupASize = getGroupSize(groupA, pointCount);
       const groupBSize = getGroupSize(groupB, pointCount);
+      const hasSortedIntersection = (left, right) => {
+        let leftIndex = 0;
+        let rightIndex = 0;
+        while (leftIndex < left.length && rightIndex < right.length) {
+          const leftCell = left[leftIndex];
+          const rightCell = right[rightIndex];
+          if (leftCell === rightCell) return true;
+          if (leftCell < rightCell) leftIndex++;
+          else rightIndex++;
+        }
+        return false;
+      };
+      const isSortedSubset = (candidate, owner) => {
+        let candidateIndex = 0;
+        let ownerIndex = 0;
+        while (
+          candidateIndex < candidate.length &&
+          ownerIndex < owner.length
+        ) {
+          const candidateCell = candidate[candidateIndex];
+          const ownerCell = owner[ownerIndex];
+          if (candidateCell === ownerCell) {
+            candidateIndex++;
+            ownerIndex++;
+          } else if (candidateCell > ownerCell) {
+            ownerIndex++;
+          } else {
+            return false;
+          }
+        }
+        return candidateIndex === candidate.length;
+      };
+      const sortedUnionSize = (left, right) => {
+        let leftIndex = 0;
+        let rightIndex = 0;
+        let size = 0;
+        while (leftIndex < left.length || rightIndex < right.length) {
+          if (leftIndex >= left.length) {
+            size += right.length - rightIndex;
+            break;
+          }
+          if (rightIndex >= right.length) {
+            size += left.length - leftIndex;
+            break;
+          }
+          const leftCell = left[leftIndex];
+          const rightCell = right[rightIndex];
+          size++;
+          if (leftCell === rightCell) {
+            leftIndex++;
+            rightIndex++;
+          } else if (leftCell < rightCell) {
+            leftIndex++;
+          } else {
+            rightIndex++;
+          }
+        }
+        return size;
+      };
+      let groupsOverlap;
+      if (groupA.kind === 'explicit' && groupB.kind === 'explicit') {
+        groupsOverlap = hasSortedIntersection(
+          groupA.cellIndices,
+          groupB.cellIndices
+        );
+      } else if (groupA.kind === 'explicit') {
+        groupsOverlap = !isSortedSubset(
+          groupA.cellIndices,
+          groupB.excludedCellIndices
+        );
+      } else if (groupB.kind === 'explicit') {
+        groupsOverlap = !isSortedSubset(
+          groupB.cellIndices,
+          groupA.excludedCellIndices
+        );
+      } else {
+        groupsOverlap = sortedUnionSize(
+          groupA.excludedCellIndices,
+          groupB.excludedCellIndices
+        ) < pointCount;
+      }
+      if (groupsOverlap) {
+        throw new RangeError(
+          'Differential expression comparison groups must be disjoint; ' +
+          'their cell memberships overlap'
+        );
+      }
+      if (groupASize < minCells || groupBSize < minCells) {
+        throw new RangeError(
+          `Differential expression requires at least ${minCells} cells per group; ` +
+          `received ${groupASize} and ${groupBSize}`
+        );
+      }
 
       progressTracker.setMessage(
         `${pageAInfo.name} (${groupASize.toLocaleString()}) vs ` +
@@ -691,6 +981,11 @@ export class MultiVariableAnalysis {
       );
 
       computeManager = await this._getComputeManager();
+      if (!isCurrent()) {
+        progressTracker.cancel();
+        memScope.end({ method, stale: true });
+        return null;
+      }
       const backend = computeManager.selectBackend(OperationType.COMPUTE_DIFFERENTIAL);
       didStartHeavyCompute = true;
 
@@ -722,7 +1017,7 @@ export class MultiVariableAnalysis {
       maxInFlightGenes = Math.max(1, Math.min(maxInFlightGenes, maxByMemory, poolSize, 8));
 
       // Create streaming gene loader with optimized prefetching
-      const geneLoader = new StreamingGeneLoader({
+      geneLoader = new StreamingGeneLoader({
         dataLayer: this.dataLayer,
         config: effectiveBatchConfig
         // Note: Progress is handled by progressTracker, not the loader
@@ -733,84 +1028,126 @@ export class MultiVariableAnalysis {
       /** @type {Set<Promise<void>>} */
       const inFlight = new Set();
       let executionError = null;
+      let stale = false;
+      let streamError = null;
 
       // Stream genes with optimized prefetching
       const geneKeys = genesToTest.map(g => g.key);
 
-      for await (const { gene, valuesA, valuesB, index } of
-        geneLoader.streamGenes(geneKeys, groupA, groupB)) {
-        await waitForAvailableSlot(inFlight, maxInFlightGenes);
-        if (executionError) throw executionError;
+      try {
+        for await (const { gene, valuesA, valuesB, index } of
+          geneLoader.streamGenes(geneKeys, groupA, groupB)) {
+          if (!isCurrent()) {
+            stale = true;
+            geneLoader.abort();
+            break;
+          }
+          await waitForAvailableSlot(inFlight, maxInFlightGenes);
+          if (!isCurrent()) {
+            stale = true;
+            geneLoader.abort();
+            break;
+          }
+          if (executionError) {
+            geneLoader.abort();
+            throw executionError;
+          }
 
-        const nA = valuesA.length;
-        const nB = valuesB.length;
+          const nA = valuesA.length;
+          const nB = valuesB.length;
 
-        if (nA < minCells || nB < minCells) {
-          resultsByIndex[index] = {
-            gene,
-            error: `Insufficient cells (A: ${nA}, B: ${nB})`,
-            meanA: nA > 0 ? mean(valuesA) : NaN,
-            meanB: nB > 0 ? mean(valuesB) : NaN,
-            log2FoldChange: NaN,
-            pValue: NaN,
-            nA,
-            nB,
-            method
-          };
-          progressTracker.itemComplete();
-          continue;
-        }
+          if (nA < minCells || nB < minCells) {
+            resultsByIndex[index] = {
+              gene,
+              error: `Insufficient cells (A: ${nA}, B: ${nB})`,
+              meanA: nA > 0 ? mean(valuesA) : NaN,
+              meanB: nB > 0 ? mean(valuesB) : NaN,
+              log2FoldChange: NaN,
+              pValue: NaN,
+              nA,
+              nB,
+              method
+            };
+            if (isCurrent()) progressTracker.itemComplete();
+            continue;
+          }
 
-        let taskPromise;
-        taskPromise = computeManager.execute(
-          OperationType.COMPUTE_DIFFERENTIAL,
-          { groupAValues: valuesA, groupBValues: valuesB, method },
-          { backend, timeout: 120000, transfer: true }
+          let taskPromise;
+          taskPromise = computeManager.execute(
+            OperationType.COMPUTE_DIFFERENTIAL,
+            { groupAValues: valuesA, groupBValues: valuesB, method },
+            { backend, timeout: 120000, transfer: true }
           )
-          .then((deResult) => {
-            if (
-              !deResult ||
-              !Number.isSafeInteger(deResult.nA) ||
-              !Number.isSafeInteger(deResult.nB) ||
-              deResult.nA < 0 ||
-              deResult.nB < 0
-            ) {
-              throw new TypeError(
-                `Differential expression backend returned invalid sample counts for "${gene}"`
-              );
-            }
-            if (deResult.nA < minCells || deResult.nB < minCells) {
-              resultsByIndex[index] = {
-                gene,
-                error: `Insufficient valid cells (A: ${deResult.nA}, B: ${deResult.nB})`,
-                meanA: deResult.meanA,
-                meanB: deResult.meanB,
-                log2FoldChange: NaN,
-                pValue: NaN,
-                statistic: NaN,
-                nA: deResult.nA,
-                nB: deResult.nB,
-                method
-              };
-              return;
-            }
-            resultsByIndex[index] = { gene, ...deResult };
-          })
-          .catch((error) => {
-            executionError ||= error;
-          })
-          .finally(() => {
-            inFlight.delete(taskPromise);
-            progressTracker.itemComplete();
-          });
+            .then((deResult) => {
+              if (!isCurrent()) return;
+              if (
+                !deResult ||
+                !Number.isSafeInteger(deResult.nA) ||
+                !Number.isSafeInteger(deResult.nB) ||
+                deResult.nA < 0 ||
+                deResult.nB < 0 ||
+                deResult.nA > nA ||
+                deResult.nB > nB
+              ) {
+                throw new TypeError(
+                  `Differential expression backend returned invalid sample counts for "${gene}"`
+                );
+              }
+              if (deResult.nA < minCells || deResult.nB < minCells) {
+                resultsByIndex[index] = {
+                  gene,
+                  error: `Insufficient valid cells (A: ${deResult.nA}, B: ${deResult.nB})`,
+                  meanA: deResult.meanA,
+                  meanB: deResult.meanB,
+                  log2FoldChange: NaN,
+                  pValue: NaN,
+                  statistic: NaN,
+                  nA: deResult.nA,
+                  nB: deResult.nB,
+                  method
+                };
+                return;
+              }
+              if (
+                deResult.method !== method ||
+                !Number.isFinite(deResult.meanA) ||
+                !Number.isFinite(deResult.meanB) ||
+                !Number.isFinite(deResult.log2FoldChange) ||
+                !Number.isFinite(deResult.statistic) ||
+                !Number.isFinite(deResult.pValue) ||
+                deResult.pValue < 0 ||
+                deResult.pValue > 1
+              ) {
+                throw new TypeError(
+                  `Differential expression backend returned invalid statistics for "${gene}"`
+                );
+              }
+              resultsByIndex[index] = { gene, ...deResult };
+            })
+            .catch((error) => {
+              executionError ||= error;
+            })
+            .finally(() => {
+              inFlight.delete(taskPromise);
+              if (isCurrent()) progressTracker.itemComplete();
+            });
 
-        inFlight.add(taskPromise);
+          inFlight.add(taskPromise);
+        }
+      } catch (error) {
+        streamError = error;
       }
 
       // Wait for all pending computations and propagate the first backend error.
       if (inFlight.size > 0) {
         await Promise.all(inFlight);
       }
+      if (stale || !isCurrent()) {
+        progressTracker.cancel();
+        memScope.end({ method, stale: true });
+        return null;
+      }
+      if (streamError) throw streamError;
       if (executionError) throw executionError;
 
       if (resultsByIndex.some(result => result === null)) {
@@ -820,6 +1157,11 @@ export class MultiVariableAnalysis {
 
       // Move to next phase
       progressTracker.nextPhase('Applying multiple testing correction...');
+      if (!isCurrent()) {
+        progressTracker.cancel();
+        memScope.end({ method, stale: true });
+        return null;
+      }
 
       // Apply multiple testing correction (Benjamini-Hochberg)
       const correctedResults = this._benjaminiHochberg(results);
@@ -884,6 +1226,11 @@ export class MultiVariableAnalysis {
       };
 
     } catch (error) {
+      if (!isCurrent()) {
+        progressTracker.cancel();
+        memScope.end({ method, stale: true });
+        return null;
+      }
       hasAnalysisFailure = true;
       analysisFailure = error;
       progressTracker.fail(`DE analysis failed: ${error.message}`);
@@ -894,7 +1241,8 @@ export class MultiVariableAnalysis {
         cleanupPreservingAnalysisFailure(
           () => cleanupAnalysisResources({
             dataLayer: this.dataLayer,
-            clearSourceCaches: true
+            clearSourceCaches: false,
+            dataLayerCleanup: 'expired'
           }),
           hasAnalysisFailure,
           analysisFailure
@@ -960,7 +1308,15 @@ export class MultiVariableAnalysis {
     if (!options || typeof options !== 'object' || Array.isArray(options)) {
       throw new TypeError('Signature scoring options are required');
     }
-    const { genes, pageIds, method = 'mean' } = options;
+    const {
+      genes,
+      pageIds,
+      method = 'mean'
+    } = options;
+    const { isCurrent, registerInvalidationCleanup } = resolveRequestOwnership(
+      options,
+      'Signature scoring'
+    );
 
     if (
       !Array.isArray(genes) ||
@@ -984,25 +1340,59 @@ export class MultiVariableAnalysis {
       memScope.end({ error: 'Invalid method' });
       throw new RangeError(`Unsupported signature scoring method: ${String(method)}`);
     }
+    if (!isCurrent()) {
+      memScope.end({ stale: true });
+      return null;
+    }
 
+    const ownedGenes = [...genes];
+    const ownedPageIds = [...pageIds];
     const notificationId = this._notifications.loading(
-      `Computing signature score (${genes.length} genes)...`,
+      `Computing signature score (${ownedGenes.length} genes)...`,
       { category: 'calculation' }
     );
+    const notification = createNotificationOwner({
+      notifications: this._notifications,
+      notificationId,
+      label: 'Signature scoring',
+      registerInvalidationCleanup,
+    });
     let hasAnalysisFailure = false;
     let analysisFailure;
+    if (!isCurrent()) {
+      notification.dismiss();
+      memScope.end({ method, stale: true });
+      return null;
+    }
 
     try {
       // Fetch gene expression for signature genes
-      const geneData = await this.dataLayer.getGeneExpressionSubset(genes, pageIds);
+      const geneData = await this.dataLayer.getGeneExpressionSubset(
+        ownedGenes,
+        ownedPageIds,
+        {
+          isCurrent: options.isCurrent,
+          registerInvalidationCleanup,
+        }
+      );
+      if (!isCurrent()) {
+        notification.dismiss();
+        memScope.end({ method, stale: true });
+        return null;
+      }
 
       const results = [];
 
-      for (const pageId of pageIds) {
-        const firstGeneData = geneData?.[genes[0]]?.[pageId];
+      for (const pageId of ownedPageIds) {
+        if (!isCurrent()) {
+          notification.dismiss();
+          memScope.end({ method, stale: true });
+          return null;
+        }
+        const firstGeneData = geneData?.[ownedGenes[0]]?.[pageId];
         if (!firstGeneData || !firstGeneData.values || !firstGeneData.cellIndices) {
           throw new Error(
-            `Signature data is missing for gene ${genes[0]} on page ${pageId}`
+            `Signature data is missing for gene ${ownedGenes[0]} on page ${pageId}`
           );
         }
         if (
@@ -1011,7 +1401,7 @@ export class MultiVariableAnalysis {
           firstGeneData.pageName.length === 0
         ) {
           throw new TypeError(
-            `Signature data for gene ${genes[0]} on page ${pageId} is malformed`
+            `Signature data for gene ${ownedGenes[0]} on page ${pageId} is malformed`
           );
         }
 
@@ -1019,8 +1409,12 @@ export class MultiVariableAnalysis {
         const scores = new Float32Array(cellCount);
         const validCounts = method === 'median'
           ? null
-          : (genes.length > 65535 ? new Uint32Array(cellCount) : new Uint16Array(cellCount));
-        const pageGeneData = genes.map(gene => {
+          : (
+            ownedGenes.length > 65535
+              ? new Uint32Array(cellCount)
+              : new Uint16Array(cellCount)
+          );
+        const pageGeneData = ownedGenes.map(gene => {
           const genePageData = geneData?.[gene]?.[pageId];
           if (!genePageData || !genePageData.values || !genePageData.cellIndices) {
             throw new Error(`Signature data is missing for gene ${gene} on page ${pageId}`);
@@ -1093,28 +1487,37 @@ export class MultiVariableAnalysis {
           scores,
           cellIndices: firstGeneData.cellIndices,
           statistics: stats,
-          genesUsed: genes.length,
+          genesUsed: ownedGenes.length,
           method
         });
       }
 
-      this._notifications.complete(notificationId, 'Signature score computed');
+      notification.complete('Signature score computed');
 
-      memScope.end({ genes: genes.length, pages: pageIds.length, method });
+      memScope.end({
+        genes: ownedGenes.length,
+        pages: ownedPageIds.length,
+        method,
+      });
       return results;
 
     } catch (error) {
       hasAnalysisFailure = true;
       analysisFailure = error;
-      this._notifications.fail(notificationId, `Signature scoring failed: ${error.message}`);
+      if (!isCurrent()) {
+        notification.dismiss();
+        memScope.end({ method, stale: true });
+        return null;
+      }
+      notification.fail(`Signature scoring failed: ${error.message}`);
       memScope.end({ method, error: error.message });
       throw error;
     } finally {
       cleanupPreservingAnalysisFailure(
         () => cleanupAnalysisResources({
           dataLayer: this.dataLayer,
-          clearSourceCaches: true,
-          dataLayerCleanup: 'bulk'
+          clearSourceCaches: false,
+          dataLayerCleanup: 'expired'
         }),
         hasAnalysisFailure,
         analysisFailure

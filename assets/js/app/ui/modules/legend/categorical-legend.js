@@ -30,6 +30,7 @@ const REQUIRED_STATE_METHODS = [
   'findHighlightGroupByCategory',
   'getActiveField',
   'getColorForCategory',
+  'getDatasetGeneration',
   'getFields',
   'getLegendModel',
   'hideAllCategories',
@@ -406,7 +407,83 @@ export function initCategoricalLegend(options) {
   }
   requireMethod(access, 'on', 'Community annotation access store');
   const lifecycle = new AbortController();
+  const transientClosers = new Set();
   let destroyed = false;
+
+  function readDatasetGeneration() {
+    const generation = state.getDatasetGeneration();
+    if (!Number.isSafeInteger(generation) || generation < 0) {
+      throw new TypeError(
+        'Categorical legend dataset generation must be a non-negative safe integer'
+      );
+    }
+    return generation;
+  }
+
+  function ownTransient(close) {
+    if (typeof close !== 'function') {
+      throw new TypeError(
+        'Categorical legend transient closer must be a function'
+      );
+    }
+    transientClosers.add(close);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      transientClosers.delete(close);
+    };
+  }
+
+  function closeTransientInteractions() {
+    const closers = [...transientClosers];
+    transientClosers.clear();
+    const failures = [];
+    for (const close of closers) {
+      try {
+        close();
+      } catch (error) {
+        failures.push(
+          error instanceof Error
+            ? error
+            : new TypeError(
+                'Categorical legend transient cleanup failed with a non-Error value'
+              )
+        );
+      }
+    }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) {
+      throw new AggregateError(
+        failures,
+        'Categorical legend transient cleanup failed'
+      );
+    }
+  }
+
+  function isCapturedCategoryCurrent({
+    categories,
+    datasetGeneration,
+    field,
+    fieldIndex
+  }) {
+    if (
+      destroyed
+      || readDatasetGeneration() !== datasetGeneration
+      || state.activeFieldSource !== FieldSource.OBS
+      || state.activeFieldIndex !== fieldIndex
+    ) {
+      return false;
+    }
+    const fields = state.getFields();
+    if (!Array.isArray(fields) || fields[fieldIndex] !== field) {
+      return false;
+    }
+    return categories.every(({ index, value }) => (
+      field.categories[index] === value
+    ));
+  }
+
   const isCommunityAnnotationUiEnabled = () => {
     const ctx = syncCommunityAnnotationCacheContext({ dataSourceManager });
     const connected = isAnnotationRepoConnected(ctx.datasetId, ctx.userKey);
@@ -552,6 +629,7 @@ export function initCategoricalLegend(options) {
       throw new Error('Categorical legend is destroyed');
     }
 
+    closeTransientInteractions();
     isRendering = true;
     try {
       const nextLegend = _doRenderCategoricalLegend(field, model);
@@ -876,9 +954,24 @@ export function initCategoricalLegend(options) {
         const currentLabel = formatCategoryLabel(
           currentField.categories[catIdx]
         );
+        const datasetGeneration = readDatasetGeneration();
+        const capturedCategories = [{
+          index: catIdx,
+          value: currentField.categories[catIdx]
+        }];
 
-        InlineEditor.create(labelSpan, currentLabel, {
+        let releaseTransient = () => {};
+        const editor = InlineEditor.create(labelSpan, currentLabel, {
           onSave: (newLabel) => {
+            releaseTransient();
+            if (!isCapturedCategoryCurrent({
+              categories: capturedCategories,
+              datasetGeneration,
+              field: currentField,
+              fieldIndex
+            })) {
+              return;
+            }
             const renamed = state.renameCategory(
               FieldSource.OBS,
               fieldIndex,
@@ -896,7 +989,18 @@ export function initCategoricalLegend(options) {
             }
             getNotificationCenter().success(`Category renamed to \"${newLabel}\"`, { category: 'filter', duration: 2000 });
           },
+          onCancel: () => {
+            releaseTransient();
+          },
           validate: validateCategoryLabel
+        });
+        if (!(editor instanceof view.HTMLInputElement)) {
+          throw new TypeError(
+            'Category rename must create one document-owned input'
+          );
+        }
+        releaseTransient = ownTransient(() => {
+          InlineEditor.cancel(editor);
         });
       };
 
@@ -930,8 +1034,15 @@ export function initCategoricalLegend(options) {
         const currentLabel = formatCategoryLabel(currentField.categories[catIdx]);
         const unassignedLabel = 'unassigned';
         const inPlace = currentField._isUserDefined === true;
+        const datasetGeneration = readDatasetGeneration();
+        const capturedCategories = [{
+          index: catIdx,
+          value: currentField.categories[catIdx]
+        }];
 
-        showConfirmDialog({
+        let releaseTransient = () => {};
+        let retired = false;
+        const closeDialog = showConfirmDialog({
           title: 'Delete category label',
           message:
             `Delete category \"${currentLabel}\"?\n\n` +
@@ -942,6 +1053,17 @@ export function initCategoricalLegend(options) {
                 `The previous column is moved to Deleted Fields for restore.`),
           confirmText: 'Delete category',
           onConfirm: () => {
+            const ownsInteraction = retired === false;
+            retired = true;
+            releaseTransient();
+            if (!ownsInteraction || !isCapturedCategoryCurrent({
+              categories: capturedCategories,
+              datasetGeneration,
+              field: currentField,
+              fieldIndex
+            })) {
+              return;
+            }
             try {
               const result = state.deleteCategoryToUnassigned(
                 fieldIndex,
@@ -962,7 +1084,15 @@ export function initCategoricalLegend(options) {
               if (!(error instanceof Error)) throw error;
               getNotificationCenter().error(error.message, { category: 'filter' });
             }
+          },
+          onCancel: () => {
+            retired = true;
+            releaseTransient();
           }
+        });
+        releaseTransient = ownTransient(() => {
+          retired = true;
+          closeDialog();
         });
       });
 
@@ -995,8 +1125,15 @@ export function initCategoricalLegend(options) {
         const fromLabel = formatCategoryLabel(currentField.categories[fromIdx]);
         const toLabel = formatCategoryLabel(currentField.categories[catIdx]);
         const inPlace = currentField._isUserDefined === true;
+        const datasetGeneration = readDatasetGeneration();
+        const capturedCategories = [
+          { index: fromIdx, value: currentField.categories[fromIdx] },
+          { index: catIdx, value: currentField.categories[catIdx] }
+        ];
 
-        showConfirmDialog({
+        let releaseTransient = () => {};
+        let retired = false;
+        const closeDialog = showConfirmDialog({
           title: 'Merge categories',
           message:
             `Merge category \"${fromLabel}\" into \"${toLabel}\"?\n\n` +
@@ -1006,6 +1143,17 @@ export function initCategoricalLegend(options) {
               : `This creates a new categorical column and moves the previous column to Deleted Fields for restore.`),
           confirmText: 'Merge',
           onConfirm: () => {
+            const ownsInteraction = retired === false;
+            retired = true;
+            releaseTransient();
+            if (!ownsInteraction || !isCapturedCategoryCurrent({
+              categories: capturedCategories,
+              datasetGeneration,
+              field: currentField,
+              fieldIndex
+            })) {
+              return;
+            }
             try {
               const result = state.mergeCategoriesToNewField(
                 fieldIndex,
@@ -1033,7 +1181,15 @@ export function initCategoricalLegend(options) {
               if (!(error instanceof Error)) throw error;
               getNotificationCenter().error(error.message, { category: 'filter' });
             }
+          },
+          onCancel: () => {
+            retired = true;
+            releaseTransient();
           }
+        });
+        releaseTransient = ownTransient(() => {
+          retired = true;
+          closeDialog();
         });
       });
 
@@ -1064,6 +1220,7 @@ export function initCategoricalLegend(options) {
       destroyed = true;
       const failures = [];
       for (const cleanup of [
+        closeTransientInteractions,
         () => lifecycle.abort(),
         unsubscribeAccess,
         unsubscribeAnnotation

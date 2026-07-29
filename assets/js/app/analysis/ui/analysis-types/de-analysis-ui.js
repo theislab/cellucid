@@ -118,6 +118,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       }
     }
     this._comparisonPages = [...pageIds];
+    this._handleFormInputIntent();
   }
 
   /**
@@ -241,7 +242,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
    * @param {Object} formValues - Form values
    * @returns {Promise<Object>} Analysis result
    */
-  async _runAnalysisImpl(formValues) {
+  async _runAnalysisImpl(formValues, requestId, progressTracker) {
     if (
       !Array.isArray(this._comparisonPages) ||
       this._comparisonPages.length !== 2
@@ -274,8 +275,21 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       method: formValues.method,
       parallelism: formValues.parallelism,
       batchConfig: formValues.batchConfig,
-      onProgress: (progress) => this._updateProgress(progress)
+      onProgress: (progress) => {
+        if (this._isCurrentAnalysisRequest(requestId)) {
+          this._updateProgress(progress, progressTracker);
+        }
+      },
+      isCurrent: () => this._isCurrentAnalysisRequest(requestId),
+      registerInvalidationCleanup: cleanup =>
+        this._registerAnalysisInvalidationCleanup(requestId, cleanup)
     });
+    if (
+      deResults === null ||
+      !this._isCurrentAnalysisRequest(requestId)
+    ) {
+      return null;
+    }
 
     // Use default thresholds - these can be adjusted dynamically in the results view
     return {
@@ -300,53 +314,82 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
   async _runAnalysis() {
     if (this._isDestroyed) return;
 
-    const formValues = this._getFormValues();
+    const formValues = structuredClone(this._getFormValues());
     const validation = this._validateForm(formValues);
     if (!validation.valid) {
+      this._invalidateAnalysisRequest();
       this._notifications.error(validation.error || 'Invalid form values');
       return;
     }
 
-    if (this._isLoading) return;
+    const requestId = this._startAnalysisRequest();
+    if (requestId === null) return;
 
     const runBtn = this._formContainer?.querySelector('.analysis-run-btn');
     const originalText = runBtn?.textContent;
+    let buttonRestored = false;
+    const restoreButton = () => {
+      if (!runBtn || buttonRestored) return;
+      runBtn.disabled = false;
+      runBtn.textContent = originalText;
+      buttonRestored = true;
+    };
     if (runBtn) {
       runBtn.disabled = true;
       runBtn.textContent = 'Running...';
     }
-    this._isLoading = true;
-
-    this._progressTracker = new ProgressTracker({
+    const progressTracker = new ProgressTracker({
       totalItems: 1,
       phases: ['Loading & Computing', 'Multiple Testing Correction'],
       title: 'Differential Expression',
       category: 'calculation',
       showNotification: true
     });
-    this._progressTracker.start();
+    this._progressTracker = progressTracker;
+    progressTracker.start();
+    let progressSettled = false;
+    this._registerAnalysisInvalidationCleanup(requestId, () => {
+      if (!progressSettled) {
+        progressTracker.cancel();
+        progressSettled = true;
+      }
+      if (this._progressTracker === progressTracker) {
+        this._progressTracker = null;
+      }
+      restoreButton();
+    });
 
     try {
-      const result = await this._runAnalysisImpl(formValues);
-      if (!result || this._isDestroyed) return;
+      const result = await this._runAnalysisImpl(
+        formValues,
+        requestId,
+        progressTracker
+      );
+      if (!result || !this._isCurrentAnalysisRequest(requestId)) return;
 
-      this._progressTracker.complete('Differential expression complete');
+      await this._showResult(result, requestId);
+      if (!this._isCurrentAnalysisRequest(requestId)) return;
 
       this._lastResult = result;
       this._currentPageData = result.data || result;
-      await this._showResult(result);
+      this._requestedPlotOptions = structuredClone(result.options || {});
+      progressTracker.complete('Differential expression complete');
+      progressSettled = true;
 
       if (this.onResultChange) this.onResultChange(result);
     } catch (error) {
+      if (!this._isCurrentAnalysisRequest(requestId)) return;
       console.error('[DEAnalysisUI] Analysis error:', error);
-      this._progressTracker?.fail(`Analysis failed: ${error.message}`);
+      progressTracker.fail(`Analysis failed: ${error.message}`);
+      progressSettled = true;
     } finally {
-      this._isLoading = false;
-      this._progressTracker = null;
-      if (runBtn) {
-        runBtn.disabled = false;
-        runBtn.textContent = originalText;
+      if (this._isCurrentAnalysisRequest(requestId)) {
+        if (this._progressTracker === progressTracker) {
+          this._progressTracker = null;
+        }
       }
+      this._finishAnalysisRequest(requestId);
+      if (!this._isLoading) restoreButton();
     }
   }
 
@@ -355,8 +398,8 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
    * @private
    * @param {{ phase: string, progress: number, loaded: number, total: number, message: string }} progress
    */
-  _updateProgress(progress) {
-    if (!this._progressTracker) return;
+  _updateProgress(progress, progressTracker = this._progressTracker) {
+    if (!progressTracker) return;
     if (!progress || typeof progress !== 'object' || Array.isArray(progress)) {
       throw new TypeError('Differential expression progress must be an object');
     }
@@ -376,10 +419,10 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     if (typeof message !== 'string' || message.length === 0) {
       throw new TypeError('Differential expression progress message must be non-empty text');
     }
-    this._progressTracker.setPhase(phase);
-    this._progressTracker.setTotalItems(total);
-    this._progressTracker.setCompletedItems(loaded);
-    this._progressTracker.setMessage(message);
+    progressTracker.setPhase(phase);
+    progressTracker.setTotalItems(total);
+    progressTracker.setCompletedItems(loaded);
+    progressTracker.setMessage(message);
   }
 
   // ===========================================================================
@@ -392,40 +435,17 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
    * Summary statistics and DE genes table are shown only in expanded modal view.
    * @param {Object} result - Analysis result
    */
-  async _showResult(result) {
-    this._resultContainer.classList.remove('hidden');
-    // Purge any existing plots to prevent WebGL memory leaks
-    purgePlot(this._resultContainer.querySelector('.analysis-preview-plot'));
-    this._resultContainer.innerHTML = '';
-
-    // Volcano plot container - directly under the run button, no header
-    const previewContainer = document.createElement('div');
-    previewContainer.className = 'analysis-preview-container';
-    this._resultContainer.appendChild(previewContainer);
-
-    const plotContainer = document.createElement('div');
-    plotContainer.className = 'analysis-preview-plot';
-    plotContainer.id = this._plotContainerIdBase;
-    this._plotContainerId = this._plotContainerIdBase;
-    previewContainer.appendChild(plotContainer);
-
-    // Render volcano plot
-    const plotDef = PlotRegistry.get(result.plotType);
-    if (plotDef) {
-      try {
-        const mergedOptions = PlotRegistry.mergeOptions(result.plotType, result.options || {});
-        await plotDef.render(result.data, mergedOptions, plotContainer, null);
-      } catch (err) {
-        console.error('[DEAnalysisUI] Volcano plot render error:', err);
-        plotContainer.innerHTML = '';
-        const errorEl = document.createElement('div');
-        errorEl.className = 'plot-error';
-        errorEl.textContent = `Failed to render plot: ${err?.message || err}`;
-        plotContainer.appendChild(errorEl);
-      }
-    }
-
+  async _showResult(result, requestId) {
+    const candidate = await this._renderPreviewPlot({
+      result,
+      requestId,
+      containerId: this._plotContainerIdBase
+    });
+    if (candidate === null || !this._isCurrentAnalysisRequest(requestId)) return;
     // Expand (modal) action - shows stats and DE genes table in expanded view
+    this._resultContainer
+      .querySelector('.analysis-actions')
+      ?.remove();
     const actionsContainer = document.createElement('div');
     actionsContainer.className = 'analysis-actions';
     actionsContainer.style.display = 'flex';

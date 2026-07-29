@@ -1691,7 +1691,11 @@ export async function loadObsManifest(url, options = {}) {
 export async function loadObsFieldData(manifestUrl, field, options = {}) {
   if (!field) throw new Error('No field metadata provided for obs field fetch.');
 
-  const { fetchInit } = options;
+  const {
+    fetchInit,
+    signal = fetchInit?.signal ?? null
+  } = options;
+  throwIfAborted(signal);
   const hasValues = Object.hasOwn(field, 'valuesPath');
   const hasCodes = Object.hasOwn(field, 'codesPath');
   if (hasValues === hasCodes) {
@@ -1715,6 +1719,7 @@ export async function loadObsFieldData(manifestUrl, field, options = {}) {
       manifestUrl,
       field.key
     );
+    throwIfAborted(signal);
     const outputs = { loaded: true };
 
     if (hasValues && anndataData.kind === 'continuous') {
@@ -1935,7 +1940,11 @@ export async function loadVarManifest(url, options = {}) {
 export async function loadVarFieldData(manifestUrl, field, options = {}) {
   if (!field) throw new Error('No field metadata provided for var field fetch.');
 
-  const { fetchInit } = options || {};
+  const {
+    fetchInit,
+    signal = fetchInit?.signal ?? null
+  } = options || {};
+  throwIfAborted(signal);
 
   // Handle AnnData source (h5ad or zarr) - unified handling
   if (shouldUseAnnData(manifestUrl)) {
@@ -1943,6 +1952,7 @@ export async function loadVarFieldData(manifestUrl, field, options = {}) {
       manifestUrl,
       field.key
     );
+    throwIfAborted(signal);
     return { loaded: true, values };
   }
 
@@ -1976,9 +1986,67 @@ export async function loadVarFieldData(manifestUrl, field, options = {}) {
 
 /**
  * @typedef {{
- *   fetchInit?: RequestInit
+ *   fetchInit?: RequestInit,
+ *   signal?: AbortSignal|null
  * }} FieldLoaderOptions
  */
+
+function mergeFieldLoaderOptions(baseOptions, runtimeOptions) {
+  const runtimeSignal = runtimeOptions?.signal ?? null;
+  if (
+    runtimeSignal !== null
+    && !(runtimeSignal instanceof AbortSignal)
+  ) {
+    throw new TypeError(
+      'Field loader runtime signal must be an AbortSignal or null.'
+    );
+  }
+  const baseFetchInit = baseOptions.fetchInit ?? {};
+  const configuredSignal = baseOptions.signal ?? null;
+  if (
+    configuredSignal !== null
+    && !(configuredSignal instanceof AbortSignal)
+  ) {
+    throw new TypeError(
+      'Field loader configured signal must be an AbortSignal or null.'
+    );
+  }
+  const configuredFetchSignal = baseFetchInit.signal ?? null;
+  if (
+    configuredFetchSignal !== null
+    && !(configuredFetchSignal instanceof AbortSignal)
+  ) {
+    throw new TypeError(
+      'Field loader configured fetch signal must be an AbortSignal or null.'
+    );
+  }
+  const signals = [
+    configuredSignal,
+    configuredFetchSignal,
+    runtimeSignal
+  ].filter((signal, index, owners) => (
+    signal !== null && owners.indexOf(signal) === index
+  ));
+  const signal = signals.length === 0
+    ? null
+    : (
+        signals.length === 1
+          ? signals[0]
+          : AbortSignal.any(signals)
+      );
+  const fetchInit = signal === null
+    ? baseFetchInit
+    : (
+        baseFetchInit.signal === signal
+          ? baseFetchInit
+          : { ...baseFetchInit, signal }
+      );
+  return {
+    ...baseOptions,
+    fetchInit,
+    signal
+  };
+}
 
 /**
  * Create a field loader closure with shared options (DRY).
@@ -1987,7 +2055,11 @@ export async function loadVarFieldData(manifestUrl, field, options = {}) {
  * @returns {(field: any) => Promise<any>}
  */
 export function createObsFieldLoader(manifestUrl, options = {}) {
-  return (field) => loadObsFieldData(manifestUrl, field, options);
+  return (field, runtimeOptions = {}) => loadObsFieldData(
+    manifestUrl,
+    field,
+    mergeFieldLoaderOptions(options, runtimeOptions)
+  );
 }
 
 /**
@@ -1997,7 +2069,11 @@ export function createObsFieldLoader(manifestUrl, options = {}) {
  * @returns {(field: any) => Promise<any>}
  */
 export function createVarFieldLoader(manifestUrl, options = {}) {
-  return (field) => loadVarFieldData(manifestUrl, field, options);
+  return (field, runtimeOptions = {}) => loadVarFieldData(
+    manifestUrl,
+    field,
+    mergeFieldLoaderOptions(options, runtimeOptions)
+  );
 }
 
 // ============================================================================

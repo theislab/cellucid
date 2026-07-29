@@ -15,6 +15,7 @@ export class OverlayManager {
   constructor(gl) {
     this.gl = gl;
     this._overlays = new Map(); // id -> overlay
+    this._pendingRetirements = new Set();
     this._sorted = [];
     this._dirtyOrder = false;
   }
@@ -44,7 +45,17 @@ export class OverlayManager {
         'OverlayManager.register requires boolean enabled and visible state.'
       );
     }
+    if (this._pendingRetirements.has(overlay)) {
+      throw new Error('OverlayManager cannot register an overlay pending retirement.');
+    }
     const id = overlay.id;
+    for (const pending of this._pendingRetirements) {
+      if (pending.id === id) {
+        throw new Error(
+          `OverlayManager cannot register "${id}" while its prior owner is pending retirement.`
+        );
+      }
+    }
     if (this._overlays.has(id)) {
       throw new Error(`OverlayManager already owns overlay "${id}".`);
     }
@@ -73,9 +84,43 @@ export class OverlayManager {
     if (!overlay) {
       throw new RangeError(`OverlayManager does not own overlay "${id}".`);
     }
-    overlay.dispose();
     this._overlays.delete(id);
     this._dirtyOrder = true;
+    this._pendingRetirements.add(overlay);
+    overlay.dispose();
+    this._pendingRetirements.delete(overlay);
+  }
+
+  /**
+   * Retry a detached overlay generation without disturbing active overlays.
+   * @param {string} id
+   * @returns {boolean} Whether a pending owner matched the ID.
+   */
+  retryRetirement(id) {
+    if (typeof id !== 'string' || id.length === 0) {
+      throw new TypeError(
+        'OverlayManager.retryRetirement requires a non-empty string id.'
+      );
+    }
+    const matching = Array.from(this._pendingRetirements).filter(
+      overlay => overlay.id === id
+    );
+    const failures = [];
+    for (const overlay of matching) {
+      try {
+        overlay.dispose();
+        this._pendingRetirements.delete(overlay);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        `OverlayManager could not finish retiring overlay "${id}".`
+      );
+    }
+    return matching.length > 0;
   }
 
   initAll() {
@@ -116,12 +161,27 @@ export class OverlayManager {
   }
 
   dispose() {
-    for (const overlay of this._overlays.values()) {
-      overlay.dispose();
-    }
+    const retiring = new Set([
+      ...this._pendingRetirements,
+      ...this._overlays.values(),
+    ]);
+    this._pendingRetirements = retiring;
     this._overlays.clear();
     this._sorted = [];
     this._dirtyOrder = false;
+
+    const failures = [];
+    for (const overlay of retiring) {
+      try {
+        overlay.dispose();
+        this._pendingRetirements.delete(overlay);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, 'OverlayManager failed to retire every overlay.');
+    }
   }
 
   _getSorted() {

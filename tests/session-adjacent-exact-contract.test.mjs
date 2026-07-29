@@ -278,7 +278,10 @@ async function rewriteSessionBundle(blob, mutate) {
 function makeSessionSerializer(contributors, pointCount = 3) {
   return new SessionSerializer({
     state: {
+      getDatasetGeneration: () => 0,
+      obsData: { fields: [] },
       pointCount,
+      positionsArray: new Float32Array(pointCount * 3),
       varData: { fields: [] },
     },
     viewer: {},
@@ -360,7 +363,10 @@ function categoricalSessionMeta(id, key) {
 
 function makeHighlightSessionState({ pages, activePageId, events }) {
   const state = Object.create(highlightStateMethods);
+  state.getDatasetGeneration = () => 0;
+  state.obsData = { fields: [] };
   state.pointCount = 4;
+  state.positionsArray = new Float32Array(12);
   state.varData = { fields: [] };
   state.highlightPages = pages;
   state.activePageId = activePageId;
@@ -1165,6 +1171,56 @@ test('active-field restore rejects an unavailable exact field before loading or 
   }
 });
 
+test('active-field restore threads cancellation through deferred field loading', async () => {
+  const field = {
+    key: 'cell_type',
+    kind: 'category',
+    _isDeleted: false,
+  };
+  const controller = new AbortController();
+  const exactAbort = new Error('exact active-field restore cancellation');
+  let receivedSignal = null;
+  let mutations = 0;
+  const state = {
+    getFields: () => [field],
+    getVarFields: () => [],
+    ensureFieldLoaded(_index, options) {
+      receivedSignal = options?.signal ?? null;
+      return new Promise((resolve, reject) => {
+        receivedSignal.addEventListener(
+          'abort',
+          () => reject(receivedSignal.reason),
+          { once: true },
+        );
+      });
+    },
+    async ensureVarFieldLoaded() {},
+    setActiveField() {
+      mutations++;
+      return { field };
+    },
+    setActiveVarField() {
+      mutations++;
+      return { field };
+    },
+  };
+
+  const restore = restoreActiveFields(
+    state,
+    {
+      activeFieldKey: 'cell_type',
+      activeFieldSource: 'obs',
+    },
+    { signal: controller.signal },
+  );
+  await Promise.resolve();
+  controller.abort(exactAbort);
+
+  await assert.rejects(restore, error => error === exactAbort);
+  assert.strictEqual(receivedSignal, controller.signal);
+  assert.equal(mutations, 0);
+});
+
 test('filter restore validates the closed candidate before any preload or batch mutation', async () => {
   let preloadCalls = 0;
   let batchCalls = 0;
@@ -1212,6 +1268,160 @@ test('filter restore validates the closed candidate before any preload or batch 
     /exact keys|legacyPalette/i,
   );
   assert.equal(preloadCalls, 0);
+  assert.equal(batchCalls, 0);
+});
+
+test('filter restore cancels every deferred preload before batch mutation', async () => {
+  const obsField = {
+    key: 'score',
+    kind: 'continuous',
+    _isDeleted: false,
+  };
+  const varField = {
+    key: 'GAPDH',
+    kind: 'continuous',
+    _isDeleted: false,
+  };
+  const controller = new AbortController();
+  const exactAbort = new Error('exact filter restore cancellation');
+  const receivedSignals = [];
+  let batchCalls = 0;
+  const waitForAbort = options => {
+    const signal = options?.signal ?? null;
+    receivedSignals.push(signal);
+    return new Promise((resolve, reject) => {
+      signal.addEventListener(
+        'abort',
+        () => reject(signal.reason),
+        { once: true },
+      );
+    });
+  };
+  const serializer = createFilterSerializer({
+    state: {
+      getFields: () => [obsField],
+      getVarFields: () => [varField],
+      ensureFieldLoaded: (_index, options) => waitForAbort(options),
+      ensureVarFieldLoaded: (_index, options) => waitForAbort(options),
+      beginBatch() {
+        batchCalls++;
+      },
+      endBatch() {
+        batchCalls++;
+      },
+    },
+  });
+
+  const restore = serializer.restoreFilters(
+    {
+      'obs:score': {
+        kind: 'continuous',
+        filterEnabled: false,
+        filter: null,
+        colorRange: null,
+        useLogScale: null,
+        useFilterColorRange: null,
+        outlierFilterEnabled: null,
+        outlierThreshold: null,
+        colormapId: null,
+      },
+      'var:GAPDH': {
+        kind: 'continuous',
+        filterEnabled: false,
+        filter: null,
+        colorRange: null,
+        useLogScale: null,
+        useFilterColorRange: null,
+        outlierFilterEnabled: null,
+        outlierThreshold: null,
+        colormapId: null,
+      },
+    },
+    { signal: controller.signal },
+  );
+  await Promise.resolve();
+  controller.abort(exactAbort);
+
+  await assert.rejects(restore, error => error === exactAbort);
+  assert.deepEqual(receivedSignals, [
+    controller.signal,
+    controller.signal,
+  ]);
+  assert.equal(batchCalls, 0);
+});
+
+test('filter restore retires and drains sibling preloads after one exact failure', async () => {
+  const obsField = {
+    key: 'score',
+    kind: 'continuous',
+    _isDeleted: false,
+  };
+  const varField = {
+    key: 'GAPDH',
+    kind: 'continuous',
+    _isDeleted: false,
+  };
+  const exactFailure = new Error('exact observation preload failure');
+  let siblingSignal = null;
+  let siblingSettled = false;
+  let batchCalls = 0;
+  const serializer = createFilterSerializer({
+    state: {
+      getFields: () => [obsField],
+      getVarFields: () => [varField],
+      ensureFieldLoaded: async () => {
+        throw exactFailure;
+      },
+      ensureVarFieldLoaded(_index, options) {
+        siblingSignal = options?.signal ?? null;
+        return new Promise((resolve, reject) => {
+          siblingSignal.addEventListener(
+            'abort',
+            () => {
+              siblingSettled = true;
+              reject(siblingSignal.reason);
+            },
+            { once: true },
+          );
+        });
+      },
+      beginBatch() {
+        batchCalls++;
+      },
+      endBatch() {
+        batchCalls++;
+      },
+    },
+  });
+
+  const restore = serializer.restoreFilters({
+    'obs:score': {
+      kind: 'continuous',
+      filterEnabled: false,
+      filter: null,
+      colorRange: null,
+      useLogScale: null,
+      useFilterColorRange: null,
+      outlierFilterEnabled: null,
+      outlierThreshold: null,
+      colormapId: null,
+    },
+    'var:GAPDH': {
+      kind: 'continuous',
+      filterEnabled: false,
+      filter: null,
+      colorRange: null,
+      useLogScale: null,
+      useFilterColorRange: null,
+      outlierFilterEnabled: null,
+      outlierThreshold: null,
+      colormapId: null,
+    },
+  });
+
+  await assert.rejects(restore, error => error === exactFailure);
+  assert.equal(siblingSignal instanceof AbortSignal, true);
+  assert.equal(siblingSettled, true);
   assert.equal(batchCalls, 0);
 });
 
@@ -2694,7 +2904,13 @@ test('generic restore rolls back cinematic state and analysis cache after a late
     restore: restoreAnalysisArtifact,
   };
   const sourceSerializer = new SessionSerializer({
-    state: { pointCount: 3, varData: { fields: [] } },
+    state: {
+      getDatasetGeneration: () => 0,
+      obsData: { fields: [] },
+      pointCount: 3,
+      positionsArray: new Float32Array(9),
+      varData: { fields: [] },
+    },
     viewer: {},
     sidebar: {},
     dataSourceManager: null,
@@ -2829,7 +3045,13 @@ test('generic empty analysis inventory replaces stale cache and cannot be omitte
     restore: restoreAnalysisArtifact,
   };
   const source = new SessionSerializer({
-    state: { pointCount: 3, varData: { fields: [] } },
+    state: {
+      getDatasetGeneration: () => 0,
+      obsData: { fields: [] },
+      pointCount: 3,
+      positionsArray: new Float32Array(9),
+      varData: { fields: [] },
+    },
     viewer: {},
     sidebar: {},
     dataSourceManager: null,

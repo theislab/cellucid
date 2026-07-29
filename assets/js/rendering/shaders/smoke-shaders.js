@@ -16,6 +16,8 @@
 // - Distance-based detail fading with smooth transitions
 // - Edge erosion for realistic wispy boundaries
 
+export const MAX_SMOKE_LIGHT_SAMPLES = 12;
+
 export const SMOKE_VS_SOURCE = `#version 300 es
 precision highp float;
 
@@ -58,7 +60,6 @@ uniform vec3 u_volumeMin;
 uniform vec3 u_volumeMax;
 
 // Colors and lighting
-uniform vec3 u_bgColor;
 uniform vec3 u_smokeColor;
 uniform vec3 u_lightDir;
 
@@ -282,7 +283,7 @@ float sampleLightTransmittance(vec3 pos, vec3 lightDir, float stepSize) {
   // Exponentially increasing step sizes (more samples near surface)
   float totalDist = 0.0;
 
-  for (int i = 1; i <= 8; i++) {
+  for (int i = 1; i <= ${MAX_SMOKE_LIGHT_SAMPLES}; i++) {
     if (i > numSamples) break;
 
     // Exponential distribution: small steps near surface, larger further out

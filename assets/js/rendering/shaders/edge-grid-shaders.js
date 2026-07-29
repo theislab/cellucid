@@ -35,7 +35,7 @@ uniform ivec2 u_edgeTexDims;
 uniform highp sampler2D u_positionTexture;
 uniform ivec2 u_posTexDims;
 
-// Visibility texture (R8 or R32F: 0.0 = hidden, 1.0 = visible)
+// Binary R8 visibility texture (normalized 0.0 = hidden, 1.0 = visible)
 uniform highp sampler2D u_visibilityTexture;
 
 // Transform uniforms

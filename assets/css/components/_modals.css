@@ -597,9 +597,11 @@
 }
 
 .analysis-modal-plot {
+  position: relative;
   flex: 1;
   min-height: 200px;
   background: var(--color-surface-elevated);
+  overflow: hidden;
 }
 
 /* =========================================================================

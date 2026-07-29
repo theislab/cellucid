@@ -6,6 +6,9 @@ import {
   initVelocityOverlayControls,
 } from '../assets/js/app/ui/modules/velocity-overlay-controls.js';
 import {
+  getNotificationCenter,
+} from '../assets/js/app/notification-center.js';
+import {
   validateVelocityOverlayConfig,
 } from '../assets/js/rendering/overlays/velocity/velocity-overlay.js';
 
@@ -360,6 +363,139 @@ test('dataset replacement clears the prior vector-field select inventory', () =>
       globalThis.document = previousDocument;
     }
   }
+});
+
+test('velocity enable failure settles visibly without an unhandled event rejection', async t => {
+  const previousDocument = globalThis.document;
+  globalThis.document = {
+    createElement() {
+      return makeElement();
+    },
+  };
+  t.after(() => {
+    if (previousDocument === undefined) {
+      delete globalThis.document;
+    } else {
+      globalThis.document = previousDocument;
+    }
+  });
+  let onEnabledChange = null;
+  const enabledCheckbox = makeElement();
+  enabledCheckbox.addEventListener = (event, handler) => {
+    if (event === 'change') onEnabledChange = handler;
+  };
+  const fieldSelect = makeSelectElement();
+  const dom = makeDom({
+    velocityEnabledCheckbox: enabledCheckbox,
+    velocityFieldSelect: fieldSelect,
+  });
+  const initializationFailure = new Error(
+    'synthetic transform-feedback initialization failure',
+  );
+  const notifications = getNotificationCenter();
+  const originalNotificationError = notifications.error;
+  const notificationEvents = [];
+  notifications.error = (message, options) => {
+    notificationEvents.push([message, options]);
+  };
+  t.after(() => {
+    notifications.error = originalNotificationError;
+  });
+  const controls = initVelocityOverlayControls({
+    dom,
+    state: makeState({
+      async ensureVectorField() {
+        throw initializationFailure;
+      },
+      getAvailableVectorFields: () => [{
+        id: 'velocity_umap',
+        label: 'Velocity (UMAP)',
+        availableDimensions: [2],
+        defaultDimension: 2,
+      }],
+      getDefaultVectorFieldId: () => 'velocity_umap',
+    }),
+    viewer: makeViewer(),
+  });
+  t.after(() => controls.destroy());
+
+  assert.equal(typeof onEnabledChange, 'function');
+  enabledCheckbox.checked = true;
+  await assert.doesNotReject(onEnabledChange());
+
+  assert.equal(enabledCheckbox.checked, false);
+  assert.equal(dom.velocitySettings.style.display, 'none');
+  assert.equal(dom.velocityInfo.textContent, 'Failed to load vector field.');
+  assert.deepEqual(notificationEvents, [[
+    initializationFailure.message,
+    { category: 'render' },
+  ]]);
+});
+
+test('runtime velocity failure settlement remains coherent when cleanup retry fails', t => {
+  const cleanupFailure = new Error('synthetic retained GPU deletion');
+  let cleanupCalls = 0;
+  let failCleanup = false;
+  const dom = makeDom();
+  const controls = initVelocityOverlayControls({
+    dom,
+    state: makeState(),
+    viewer: makeViewer({
+      setVectorFieldOverlayEnabled(enabled) {
+        assert.equal(enabled, false);
+        cleanupCalls++;
+        if (failCleanup) throw cleanupFailure;
+      },
+    }),
+  });
+  const notifications = getNotificationCenter();
+  const originalNotificationError = notifications.error;
+  const notificationEvents = [];
+  notifications.error = (message, options) => {
+    notificationEvents.push([message, options]);
+  };
+  t.after(() => {
+    notifications.error = originalNotificationError;
+    controls.destroy();
+  });
+  const originalConsoleError = console.error;
+  const diagnostics = [];
+  console.error = value => {
+    diagnostics.push(value);
+  };
+  t.after(() => {
+    console.error = originalConsoleError;
+  });
+
+  dom.velocityEnabledCheckbox.checked = true;
+  dom.velocitySettings.style.display = 'block';
+  failCleanup = true;
+  const renderFailure = new AggregateError(
+    [new Error('draw failed'), new Error('initial cleanup failed')],
+    'Velocity rendering failed and shutdown was incomplete.',
+  );
+
+  let diagnostic;
+  assert.doesNotThrow(() => {
+    diagnostic = controls.settleRenderFailure(renderFailure);
+  });
+
+  assert.equal(cleanupCalls, 1);
+  assert.equal(dom.velocityEnabledCheckbox.checked, false);
+  assert.equal(dom.velocitySettings.style.display, 'none');
+  assert.equal(dom.velocityInfo.textContent, 'Velocity rendering unavailable.');
+  assert.deepEqual(notificationEvents, [[
+    'Velocity rendering stopped: Velocity rendering failed and shutdown was incomplete.',
+    { category: 'render' },
+  ]]);
+  assert.equal(diagnostics.length, 1);
+  assert.equal(diagnostic, diagnostics[0]);
+  assert.ok(diagnostic instanceof AggregateError);
+  assert.deepEqual(diagnostic.errors, [renderFailure, cleanupFailure]);
+  assert.equal(
+    diagnostic.message,
+    'Velocity rendering stopped and failure settlement was incomplete.',
+  );
 });
 
 test('velocity controls expose no clamp, coercion, or first-field substitution path', async () => {

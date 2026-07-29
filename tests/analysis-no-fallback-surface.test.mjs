@@ -689,7 +689,7 @@ test('differential expression requires exact dataset and gene identities', async
     pageB: 'page-b',
     geneList: null,
     method: 'wilcox',
-    minCells: 1,
+    minCells: 2,
     parallelism: 'auto',
     batchConfig: {},
   };

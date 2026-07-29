@@ -347,6 +347,7 @@ function requireElement(idValue) {
 function requireRestoreDom() {
   const elements = {
     dimensionSelect: requireElement('dimension-select'),
+    renderModeSelect: requireElement('render-mode'),
     categoricalSelect: requireElement('categorical-field'),
     continuousSelect: requireElement('continuous-field'),
     geneSearch: requireElement('gene-expression-search'),
@@ -377,6 +378,30 @@ function assertSelectOption(select, value, context) {
   if (!hasOption) {
     throw new RangeError(`${context} option "${value}" is unavailable.`);
   }
+}
+
+function publishRenderModeControl(select, value) {
+  assertSelectOption(select, value, 'Render-mode selector');
+  if (select.value === value) return;
+  if (typeof select.dispatchEvent !== 'function') {
+    throw new TypeError('Render-mode selector must support event dispatch.');
+  }
+  select.value = value;
+  select.dispatchEvent(new Event('change', { bubbles: true }));
+  if (select.value !== value) {
+    throw new Error(`Render-mode selector rejected restored value "${value}".`);
+  }
+}
+
+function getSavedRenderMode(uiControls) {
+  if (!Object.hasOwn(uiControls, 'render-mode')) return null;
+  const value = uiControls['render-mode'].value;
+  if (value !== 'points' && value !== 'smoke') {
+    throw new TypeError(
+      'Core-state render-mode UI control must restore "points" or "smoke".'
+    );
+  }
+  return value;
 }
 
 function syncDomainControls(state, viewer, dom) {
@@ -446,7 +471,32 @@ async function applyCorePayload(ctx, payload, signalOverride) {
     'Live dimension selector'
   );
 
-  ui.restoreUIControls(sessionState.uiControls, { abortSignal: signal });
+  ui.validateUIControls(sessionState.uiControls);
+  const savedRenderMode = getSavedRenderMode(sessionState.uiControls);
+  if (
+    savedRenderMode === 'smoke'
+    && sessionState.multiview.snapshots.length > 0
+  ) {
+    throw new TypeError(
+      'A smoke-mode session cannot contain kept multiview snapshots.'
+    );
+  }
+
+  let restoreDeferredUiControls = () => {};
+  if (savedRenderMode === null) {
+    ui.restoreUIControls(sessionState.uiControls, { abortSignal: signal });
+  } else {
+    // Points is the neutral replay mode: it cannot allocate a smoke volume
+    // from retiring state and it permits the saved snapshot graph to rebuild.
+    publishRenderModeControl(dom.renderModeSelect, 'points');
+    restoreDeferredUiControls = ui.restoreUIControls(
+      sessionState.uiControls,
+      {
+        abortSignal: signal,
+        deferControlIds: ['render-mode']
+      }
+    );
+  }
   throwIfAborted(signal);
 
   const activeViewResult = state.setActiveView('live');
@@ -461,16 +511,27 @@ async function applyCorePayload(ctx, payload, signalOverride) {
   }
   throwIfAborted(signal);
 
-  await filters.restoreFilters(sessionState.filters);
+  await filters.restoreFilters(sessionState.filters, { signal });
   throwIfAborted(signal);
-  await restoreActiveFields(state, sessionState.activeFields);
+  await restoreActiveFields(
+    state,
+    sessionState.activeFields,
+    { signal }
+  );
   throwIfAborted(signal);
 
   await restoreMultiview({
     state,
     viewer,
-    restoreFilters: filters.restoreFilters,
-    restoreActiveFields: activeFields => restoreActiveFields(state, activeFields),
+    restoreFilters: snapshotFilters => filters.restoreFilters(
+      snapshotFilters,
+      { signal }
+    ),
+    restoreActiveFields: activeFields => restoreActiveFields(
+      state,
+      activeFields,
+      { signal }
+    ),
     pushViewerState: () => pushViewerState(state)
   }, sessionState.multiview);
   throwIfAborted(signal);
@@ -489,6 +550,9 @@ async function applyCorePayload(ctx, payload, signalOverride) {
   state._notifyVisibilityChange();
   state.updateFilteredCount();
   state.updateFilterSummary();
+  throwIfAborted(signal);
+  restoreDeferredUiControls();
+  throwIfAborted(signal);
 }
 
 function getFieldOverlayRollbackDependency(restoreTransaction) {

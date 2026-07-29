@@ -393,11 +393,10 @@ class NotificationCenter {
       return id;
     }
 
-    // Remove oldest if at max
-    if (this.notifications.size >= this.maxNotifications) {
-      const oldest = this.notifications.keys().next().value;
-      this.dismiss(oldest);
-    }
+    // Active loading/progress work owns its visible lifecycle. Make room by
+    // retiring the oldest non-active item first; if every published item is
+    // active, temporarily exceed the visual cap rather than orphan async IDs.
+    this._evictNonActiveUntil(this.maxNotifications - 1);
 
     // Create new notification
     const el = this._createNotificationElement(id, options);
@@ -632,6 +631,28 @@ class NotificationCenter {
       nextOptions.dismissible = true;
     }
     notif.options = nextOptions;
+    if (TERMINAL_NOTIFICATION_TYPES.has(nextType)) {
+      this._evictNonActiveUntil(this.maxNotifications);
+    }
+  }
+
+  _evictNonActiveUntil(maximumSize) {
+    if (!Number.isSafeInteger(maximumSize) || maximumSize < 0) {
+      throw new RangeError(
+        'Notification capacity target must be a non-negative safe integer.'
+      );
+    }
+    while (this.notifications.size > maximumSize) {
+      let candidateId = null;
+      for (const [id, notification] of this.notifications) {
+        if (!ACTIVE_NOTIFICATION_TYPES.has(notification.options.type)) {
+          candidateId = id;
+          break;
+        }
+      }
+      if (candidateId === null) return;
+      this.dismiss(candidateId);
+    }
   }
 
   /**
@@ -655,6 +676,16 @@ class NotificationCenter {
         this.dismiss(id);
       }
     }, duration);
+  }
+
+  /**
+   * Return whether this exact notification generation is still published.
+   * Async producers use this instead of coupling to the internal Map because
+   * capacity pressure and manual dismissal may retire progress IDs at any time.
+   */
+  hasNotification(id) {
+    requireNonEmptyString(id, 'Notification id');
+    return this.notifications.has(id);
   }
 
   /**

@@ -402,14 +402,21 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     requireCurrentInventory();
   }
 
-  function syncActiveViewToState() {
+  function syncActiveViewToState(notifyActiveView = true) {
+    if (typeof notifyActiveView !== 'boolean') {
+      throw new TypeError(
+        'Active-view UI notification ownership must be one exact boolean.'
+      );
+    }
     const publishedViewId = state.setActiveView(activeViewId);
     if (publishedViewId !== activeViewId) {
       throw new Error(
         `State published active view "${String(publishedViewId)}" instead of "${activeViewId}".`
       );
     }
-    callbacks.onActiveViewChanged(activeViewId);
+    if (notifyActiveView) {
+      callbacks.onActiveViewChanged(activeViewId);
+    }
   }
 
   function snapshotIds(snapshots = requireSnapshotInventory(viewer)) {
@@ -827,7 +834,57 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     cameraLockBtn.title = locked ? 'Cameras linked (click to unlink)' : 'Cameras independent (click to link)';
   }
 
-  function updateSplitViewUI() {
+  function syncRenderModeState(mode, publishLayout) {
+    const exactMode = requireRenderMode(mode);
+    if (typeof publishLayout !== 'boolean') {
+      throw new TypeError(
+        'Render-mode layout publication must be one exact boolean.'
+      );
+    }
+    if (renderModeSelect.value !== exactMode) {
+      throw new Error(
+        `Render-mode controls cannot publish "${exactMode}" while the selector owns ` +
+        `"${renderModeSelect.value}".`
+      );
+    }
+    const modeIsPoints = exactMode === 'points';
+    if (!modeIsPoints) {
+      if (publishLayout) {
+        if (liveViewHidden || activeViewId !== LIVE_VIEW_ID) {
+          throw new Error(
+            'Smoke render mode requires the visible live view to own focus.'
+          );
+        }
+        viewer.setViewLayout('single', LIVE_VIEW_ID);
+      }
+      viewLayoutMode = 'single';
+      viewLayoutModeSelect.value = 'single';
+    }
+    splitKeepViewBtn.disabled = !modeIsPoints;
+    splitKeepViewBtn.title = modeIsPoints
+      ? 'Freeze the current view as a panel'
+      : 'Switch to “Points” mode to keep views';
+    viewLayoutModeSelect.disabled = !modeIsPoints;
+  }
+
+  function syncRenderModeUI(mode) {
+    activeViewId = requireViewId(
+      state.getActiveViewId(),
+      'Render-mode active view id'
+    );
+    liveViewHidden = requireBoolean(
+      viewer.getLiveViewHidden(),
+      'Render-mode live-view visibility'
+    );
+    syncRenderModeState(mode, true);
+  }
+
+  function reconcileSplitViewUI(notifyActiveView) {
+    if (typeof notifyActiveView !== 'boolean') {
+      throw new TypeError(
+        'Split-view reconciliation notification ownership must be one exact boolean.'
+      );
+    }
     const renderMode = requireRenderMode(renderModeSelect.value);
     const modeIsPoints = renderMode === 'points';
     const snapshots = requireCurrentInventory();
@@ -838,10 +895,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     splitViewBadgesBox.style.display = hasMultipleViews ? '' : 'none';
     syncActiveViewSelectOptions();
 
-    splitKeepViewBtn.disabled = !modeIsPoints;
-    splitKeepViewBtn.title = modeIsPoints
-      ? 'Freeze the current view as a panel'
-      : 'Switch to “Points” mode to keep views';
+    syncRenderModeState(renderMode, false);
     splitClearBtn.disabled = !hasSnaps;
     cameraLockBtn.disabled = !hasMultipleViews;
     // Keep the button label/aria state in sync in case camera lock is toggled
@@ -864,10 +918,13 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     } else {
       viewLayoutMode = requireLayoutMode(viewLayoutModeSelect.value);
     }
-    viewLayoutModeSelect.disabled = !modeIsPoints;
 
-    syncActiveViewToState();
+    syncActiveViewToState(notifyActiveView);
     pushViewLayoutToViewer();
+  }
+
+  function updateSplitViewUI() {
+    reconcileSplitViewUI(true);
   }
 
   function handleKeepView() {
@@ -1088,11 +1145,12 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     );
     syncActiveViewSelectOptions();
     renderSplitViewBadges();
-    updateSplitViewUI();
+    reconcileSplitViewUI(false);
   }
 
   return {
     renderSplitViewBadges,
+    syncRenderModeUI,
     updateSplitViewUI,
     refreshUIForActiveView: () => callbacks.onActiveViewChanged(activeViewId),
     syncFromStateAndViewer,

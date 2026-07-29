@@ -445,6 +445,27 @@ test('required dataset reload reports failure before rejecting the original erro
   assert.deepEqual(events, ['failure-ui-and-analytics']);
 });
 
+test(
+  'required dataset reload preserves its primary error when failure reporting also rejects',
+  async () => {
+    const { reportRequiredDatasetReloadFailure } =
+      await import(outcomeModuleUrl);
+    const reloadError = new Error('exact required reload failure');
+    const reportingError = new Error('exact failure reporter rejection');
+
+    await assert.rejects(
+      reportRequiredDatasetReloadFailure(
+        reloadError,
+        async () => {
+          throw reportingError;
+        }
+      ),
+      error => error === reloadError
+    );
+    assert.equal(reloadError.cause, reportingError);
+  }
+);
+
 test('dataset positions must exactly match the canonical cell axis before publication', async () => {
   const { validateDatasetPositionPayload } =
     await import(outcomeModuleUrl);
@@ -747,6 +768,145 @@ test('dataset reload transactions reject stale commits across local selection ep
   repeated.assertCurrent();
 });
 
+test(
+  'publication continuation remains current until a newer runtime actually publishes',
+  async () => {
+    const {
+      createLatestDatasetPublicationContinuationOwner,
+      createLatestDatasetReloadCoordinator,
+      isDatasetReloadSupersededError
+    } = await import(outcomeModuleUrl);
+    const source = {};
+    let identity = {
+      baseUrl: 'zarr://first/',
+      datasetId: 'first',
+      selectionIdentity: 1,
+      source
+    };
+    const requests = createLatestDatasetReloadCoordinator(() => identity);
+    const publications =
+      createLatestDatasetPublicationContinuationOwner();
+    const requestA = requests.begin();
+    const publicationA = publications.publish({ kind: 'dataset-a' });
+    const continuationRelease = deferred();
+    const events = [];
+    const continuationA = (async () => {
+      await continuationRelease.promise;
+      publicationA.assertCurrent();
+      events.push('a:reconciled');
+    })();
+
+    identity = {
+      ...identity,
+      baseUrl: 'zarr://failed-b/',
+      datasetId: 'failed-b',
+      selectionIdentity: 2
+    };
+    const requestB = requests.begin();
+    assert.equal(requestA.signal.aborted, true);
+    assert.equal(requestB.isCurrent(), true);
+    assert.equal(publicationA.isCurrent(), true);
+    assert.equal(publicationA.signal.aborted, false);
+
+    // B fails before publication: its request can end without touching A's
+    // already-live continuation owner.
+    continuationRelease.resolve();
+    await continuationA;
+    assert.deepEqual(events, ['a:reconciled']);
+
+    // A same-identity synthetic publication is still a real replacement.
+    const publicationC = publications.publish({ kind: 'synthetic-c' });
+    assert.equal(publicationA.signal.aborted, true);
+    assert.equal(publicationA.isCurrent(), false);
+    assert.equal(publicationC.isCurrent(), true);
+    publicationC.assertCurrent();
+    assert.throws(
+      () => publicationA.assertCurrent(),
+      isDatasetReloadSupersededError
+    );
+    assert.equal(publicationC.generation, publicationA.generation + 1);
+  }
+);
+
+for (const runtimeKind of ['dataset', 'synthetic']) {
+  test(
+    `${runtimeKind} publication reconciles after a newer request fails before publication`,
+    async () => {
+      const {
+        createLatestDatasetPublicationContinuationOwner,
+        createLatestDatasetReloadCoordinator,
+        handleDatasetReloadFailure
+      } = await import(outcomeModuleUrl);
+      const source = {};
+      let identity = {
+        baseUrl: 'zarr://live-a/',
+        datasetId: 'live-a',
+        selectionIdentity: 1,
+        source
+      };
+      const requests = createLatestDatasetReloadCoordinator(
+        () => identity
+      );
+      const publications =
+        createLatestDatasetPublicationContinuationOwner();
+      requests.begin();
+      const publicationA = publications.publish({ runtimeKind });
+      const reconciliationRelease = deferred();
+      const events = [];
+      const reconciliation = (async () => {
+        await reconciliationRelease.promise;
+        publicationA.assertCurrent();
+        events.push('a:ui');
+        publicationA.assertCurrent();
+        events.push('a:state');
+        publicationA.assertCurrent();
+        events.push('a:terminal');
+      })();
+
+      if (runtimeKind === 'dataset') {
+        identity = {
+          ...identity,
+          baseUrl: 'zarr://failed-b/',
+          datasetId: 'failed-b',
+          selectionIdentity: 2
+        };
+      }
+      const requestB = requests.begin();
+      const stagingError = new Error(
+        `exact failed ${runtimeKind} replacement`
+      );
+      const reporterError = new Error(
+        `exact failed ${runtimeKind} reporter`
+      );
+      await assert.rejects(
+        handleDatasetReloadFailure({
+          error: stagingError,
+          transaction: requestB,
+          cancel() {
+            events.push('b:cancel');
+          },
+          reportFailure() {
+            events.push('b:failure');
+            throw reporterError;
+          }
+        }),
+        error => error === stagingError
+      );
+      assert.equal(stagingError.cause, reporterError);
+      assert.equal(publicationA.isCurrent(), true);
+
+      reconciliationRelease.resolve();
+      await reconciliation;
+      assert.deepEqual(events, [
+        'b:failure',
+        'a:ui',
+        'a:state',
+        'a:terminal'
+      ]);
+    }
+  );
+}
+
 test('dataset reload identity capture requires one exact explicit shape', async () => {
   const { createLatestDatasetReloadCoordinator } =
     await import(outcomeModuleUrl);
@@ -863,6 +1023,55 @@ test('reload owner suppresses stale failure reporting and cancels bookkeeping', 
   assert.deepEqual(cancelled, ['old-token']);
   assert.deepEqual(reported, []);
 });
+
+test(
+  'stale reload preserves exact supersession when bookkeeping cancellation fails',
+  async () => {
+    const {
+      createLatestDatasetReloadCoordinator,
+      handleDatasetReloadFailure,
+      isDatasetReloadSupersededError
+    } = await import(outcomeModuleUrl);
+    let identity = {
+      source: {},
+      baseUrl: 'zarr://first/',
+      datasetId: 'first',
+      selectionIdentity: 1
+    };
+    const coordinator = createLatestDatasetReloadCoordinator(() => identity);
+    const older = coordinator.begin();
+    identity = {
+      ...identity,
+      baseUrl: 'zarr://second/',
+      datasetId: 'second',
+      selectionIdentity: 2
+    };
+    coordinator.begin();
+    const cancelError = new Error('exact stale bookkeeping failure');
+    let reported = false;
+
+    let supersessionError = null;
+    await assert.rejects(
+      handleDatasetReloadFailure({
+        error: new Error('stale payload failure'),
+        transaction: older,
+        cancel() {
+          throw cancelError;
+        },
+        reportFailure() {
+          reported = true;
+        }
+      }),
+      error => {
+        supersessionError = error;
+        return isDatasetReloadSupersededError(error);
+      }
+    );
+
+    assert.equal(reported, false);
+    assert.equal(supersessionError.cause, cancelError);
+  }
+);
 
 test('published-state settlement gives superseded reloads one cancel and no success', async () => {
   const {
@@ -1129,7 +1338,7 @@ test('post-publication UI errors remain truthful ready outcomes', async () => {
   } =
     await import(outcomeModuleUrl);
   let readyFinalizations = 0;
-  const ready = settlePublishedDatasetUi({
+  const ready = await settlePublishedDatasetUi({
     synchronize() {},
     finalize() {
       readyFinalizations++;
@@ -1142,7 +1351,7 @@ test('post-publication UI errors remain truthful ready outcomes', async () => {
   const uiError = new Error('dimension selector render failed');
   const reported = [];
   let impairedFinalizations = 0;
-  const impaired = settlePublishedDatasetUi({
+  const impaired = await settlePublishedDatasetUi({
     synchronize() {
       throw uiError;
     },
@@ -1158,7 +1367,7 @@ test('post-publication UI errors remain truthful ready outcomes', async () => {
 
   const retirementError = new Error('coordinate cache release failed');
   const retirementReports = [];
-  const retirementImpaired = settlePublishedDatasetUi({
+  const retirementImpaired = await settlePublishedDatasetUi({
     synchronize() {},
     finalize() {
       throw retirementError;
@@ -1170,7 +1379,7 @@ test('post-publication UI errors remain truthful ready outcomes', async () => {
   assert.deepEqual(retirementReports, [retirementError]);
 
   const combinedReports = [];
-  const combined = settlePublishedDatasetUi({
+  const combined = await settlePublishedDatasetUi({
     synchronize() {
       throw uiError;
     },
@@ -1209,8 +1418,8 @@ test('post-publication UI errors remain truthful ready outcomes', async () => {
   assert.equal(retirementOwner.retire(failedResource), false);
   assert.equal(failedClears, 1);
 
-  assert.throws(
-    () => settlePublishedDatasetUi({
+  await assert.rejects(
+    settlePublishedDatasetUi({
       synchronize() {},
       finalize() {},
       reportFailure() {},
@@ -1219,6 +1428,64 @@ test('post-publication UI errors remain truthful ready outcomes', async () => {
     /unexpected key.*fallbackToOldUi/i
   );
 });
+
+test(
+  'superseded published UI synchronization finalizes silently without impaired-controls diagnostics',
+  async () => {
+    const {
+      createDatasetReloadSupersededError,
+      settlePublishedDatasetUi
+    } = await import(outcomeModuleUrl);
+    const events = [];
+    const outcome = await settlePublishedDatasetUi({
+      synchronize() {
+        throw createDatasetReloadSupersededError(
+          'Dataset reload was superseded by a newer selection.'
+        );
+      },
+      finalize() {
+        events.push('finalize');
+      },
+      reportFailure() {
+        events.push('report');
+      }
+    });
+
+    assert.deepEqual(outcome, { status: 'superseded' });
+    assert.deepEqual(events, ['finalize']);
+  }
+);
+
+test(
+  'superseded published UI synchronization preserves a finalization failure without reporting stale diagnostics',
+  async () => {
+    const {
+      createDatasetReloadSupersededError,
+      settlePublishedDatasetUi
+    } = await import(outcomeModuleUrl);
+    const finalizationError = new Error(
+      'exact stale publication finalization failure'
+    );
+    const reports = [];
+    const outcome = await settlePublishedDatasetUi({
+      synchronize() {
+        throw createDatasetReloadSupersededError(
+          'Dataset reload was superseded by a newer selection.'
+        );
+      },
+      finalize() {
+        throw finalizationError;
+      },
+      reportFailure(error) {
+        reports.push(error);
+      }
+    });
+
+    assert.equal(outcome.status, 'superseded');
+    assert.equal(outcome.finalizationError, finalizationError);
+    assert.deepEqual(reports, []);
+  }
+);
 
 test('dimension cache invalidation rejects delayed positions without republishing', async () => {
   const manager = new DimensionManager({
@@ -1923,8 +2190,8 @@ test('in-place reload stages one generation before reversible publication', asyn
     'commitDatasetRuntimeStage(runtimeStage)',
     managerCommitIndex
   );
-  const identityAdoptionIndex = reloadSource.indexOf(
-    'reloadTransaction.adoptCurrentIdentity()',
+  const publicationContinuationIndex = reloadSource.indexOf(
+    'let managerListenerError = null;',
     runtimeCommitIndex
   );
   const managerPublishIndex = reloadSource.indexOf(
@@ -1935,7 +2202,7 @@ test('in-place reload stages one generation before reversible publication', asyn
     'complete: () => completeDataLoadSuccess('
   );
   const uiSyncIndex = reloadSource.indexOf(
-    'const synchronizationOutcome = synchronizePublishedDatasetUi('
+    'const synchronizationOutcome = await synchronizePublishedDatasetUi('
   );
   const finalizationIndex = reloadSource.indexOf(
     'dataSourceManager.finalizeDatasetSelection(managerPublication)',
@@ -1953,13 +2220,17 @@ test('in-place reload stages one generation before reversible publication', asyn
     urlCommitIndex > stagingCatchEnd &&
     managerCommitIndex > urlCommitIndex &&
     runtimeCommitIndex > managerCommitIndex &&
-    identityAdoptionIndex > runtimeCommitIndex &&
-    managerPublishIndex > identityAdoptionIndex &&
+    publicationContinuationIndex > runtimeCommitIndex &&
+    managerPublishIndex > publicationContinuationIndex &&
     uiSyncIndex > managerPublishIndex &&
     finalizationIndex > uiSyncIndex &&
     stateRestoreIndex > finalizationIndex &&
     stateSettlementIndex > stateRestoreIndex &&
     successIndex > stateSettlementIndex
+  );
+  assert.doesNotMatch(
+    reloadSource.slice(runtimeCommitIndex),
+    /reloadTransaction\.adoptCurrentIdentity\(\)/
   );
   const managerPublicationCatch = reloadSource.slice(
     reloadSource.indexOf('} catch (error) {', urlCommitIndex),
@@ -1979,6 +2250,279 @@ test('in-place reload stages one generation before reversible publication', asyn
     /state\.(?:setDimensionManager|setFieldLoader|setVarFieldLoader|initVarData|initScene|setVectorFieldManager)/
   );
 });
+
+test(
+  'every post-await dataset continuation rechecks its exact publication owner',
+  async () => {
+    const mainSource = await readFile(
+      new URL('../assets/js/app/main.js', import.meta.url),
+      'utf8'
+    );
+    const slice = (startNeedle, endNeedle, from = 0) => {
+      const start = mainSource.indexOf(startNeedle, from);
+      const end = mainSource.indexOf(endNeedle, start);
+      assert.ok(start >= 0 && end > start);
+      return mainSource.slice(start, end);
+    };
+    const requireCheckAfter = (
+      source,
+      awaitNeedle,
+      checkNeedle,
+      from = 0
+    ) => {
+      const awaitIndex = source.indexOf(awaitNeedle, from);
+      const checkIndex = source.indexOf(checkNeedle, awaitIndex);
+      assert.ok(
+        awaitIndex >= 0 && checkIndex > awaitIndex,
+        `expected ${checkNeedle} after ${awaitNeedle}`
+      );
+      return checkIndex;
+    };
+    const requireBefore = (source, firstNeedle, secondNeedle, message) => {
+      const firstIndex = source.indexOf(firstNeedle);
+      const secondIndex = source.indexOf(secondNeedle);
+      assert.ok(
+        firstIndex >= 0 && secondIndex > firstIndex,
+        message
+      );
+    };
+
+    const emptyPublication = slice(
+      'function publishEmptyDatasetRuntime',
+      'async function stageDatasetRuntime'
+    );
+    assert.match(
+      emptyPublication,
+      /publishRuntimeContinuation\(\{ runtimeKind: 'empty' \}\)/
+    );
+    requireBefore(
+      emptyPublication,
+      'requireRestorablePublication(restorationPublication)',
+      'ui?.prepareDatasetReplacement?.()',
+      'empty-runtime restoration must reject a stale publication before mutation'
+    );
+    const datasetCommit = slice(
+      'function commitDatasetRuntimeStage',
+      'function commitSyntheticRuntimeStage'
+    );
+    requireBefore(
+      datasetCommit,
+      'requireRestorablePublication(restorationPublication)',
+      'ui?.prepareDatasetReplacement?.()',
+      'dataset restoration must reject a stale publication before mutation'
+    );
+    const syntheticCommit = slice(
+      'function commitSyntheticRuntimeStage',
+      'function restoreRuntimeStage'
+    );
+    requireBefore(
+      syntheticCommit,
+      'requireRestorablePublication(restorationPublication)',
+      'ui?.prepareDatasetReplacement?.()',
+      'synthetic restoration must reject a stale publication before mutation'
+    );
+    const publicationOwner = slice(
+      'function publishRuntimeContinuation',
+      'function requireRestorablePublication'
+    );
+    assert.match(
+      publicationOwner,
+      /datasetPublicationOwner\.publish\(details\)/
+    );
+    assert.match(
+      publicationOwner,
+      /datasetPublicationGeneration = publication\.generation/
+    );
+
+    const uiSynchronization = slice(
+      'async function synchronizePublishedDatasetUi',
+      'const hasInitialDataset ='
+    );
+    requireBefore(
+      uiSynchronization,
+      'retirePublishedDatasetSnapshotViews(publication)',
+      'await ui?.settleFieldInteractions?.()',
+      'published kept views must retire before the first asynchronous UI settlement'
+    );
+    const fieldSettlementCheck = requireCheckAfter(
+      uiSynchronization,
+      'await ui?.settleFieldInteractions?.()',
+      'assertCurrentDatasetPublication(publication)'
+    );
+    requireCheckAfter(
+      uiSynchronization,
+      'await ui?.settleFieldInteractions?.()',
+      'assertCurrentDatasetPublication(publication)'
+    );
+    requireCheckAfter(
+      uiSynchronization,
+      'await window._comparisonModule.resetForDatasetReload({',
+      'assertCurrentDatasetPublication(publication)',
+      fieldSettlementCheck + 1
+    );
+    assert.doesNotMatch(
+      uiSynchronization,
+      /transaction\.(?:assertCurrent|isCurrent|signal)/
+    );
+
+    const initialPublication = slice(
+      'if (hasInitialDataset) {',
+      '// Setup connectivity controls',
+      mainSource.indexOf('// Initialize Page Analysis / Comparison Module')
+    );
+    const initialSyncCheck = requireCheckAfter(
+      initialPublication,
+      'await synchronizePublishedDatasetUi(',
+      'assertCurrentDatasetPublication(initialPublication)'
+    );
+    requireCheckAfter(
+      initialPublication,
+      'await ui.activateField(-1)',
+      'assertCurrentDatasetPublication(initialPublication)',
+      initialSyncCheck + 1
+    );
+    assert.match(
+      initialPublication,
+      /restoreAdvertisedDatasetState\(\{\s*signal:\s*initialPublication\.signal/s
+    );
+    assert.match(
+      initialPublication,
+      /transaction:\s*initialPublication/
+    );
+
+    const reload = slice(
+      'async function reloadActiveDatasetInPlace',
+      'async function clearActiveDatasetInPlace'
+    );
+    const reloadUiCheck = requireCheckAfter(
+      reload,
+      'const synchronizationOutcome = await synchronizePublishedDatasetUi(',
+      'assertCurrentDatasetPublication(publication)'
+    );
+    const reloadManagerFinalization = reload.indexOf(
+      'dataSourceManager.finalizeDatasetSelection(managerPublication)'
+    );
+    assert.ok(
+      reloadManagerFinalization > reload.indexOf(
+        'const synchronizationOutcome = await synchronizePublishedDatasetUi('
+      ) &&
+      reloadUiCheck > reloadManagerFinalization,
+      'live publication must finalize its prior source before a stale continuation exits'
+    );
+    assert.match(
+      reload,
+      /restoreAdvertisedDatasetState\(\{\s*signal:\s*publication\.signal/s
+    );
+    assert.match(
+      reload,
+      /settlePublishedDatasetStateOutcome\(\{[\s\S]*transaction:\s*publication/
+    );
+    const reloadPublishedContinuation = reload.slice(
+      reload.indexOf('let managerListenerError = null;')
+    );
+    assert.doesNotMatch(
+      reloadPublishedContinuation,
+      /reloadTransaction\.(?:adoptCurrentIdentity|assertCurrent|isCurrent|signal)/
+    );
+
+    const clear = slice(
+      'async function clearActiveDatasetInPlace',
+      '// One-time helper to rebuild density'
+    );
+    assert.match(
+      clear,
+      /emptyPublication\s*=\s*publishEmptyDatasetRuntime\(\{ clearViews: true \}\)/
+    );
+    const clearUiSettlement = clear.indexOf(
+      'const synchronizationOutcome = await settlePublishedDatasetUi({'
+    );
+    requireCheckAfter(
+      clear,
+      'await ui?.settleFieldInteractions?.()',
+      'assertCurrentDatasetPublication(emptyPublication)'
+    );
+    requireCheckAfter(
+      clear,
+      'await window._comparisonModule.resetForDatasetReload({',
+      'assertCurrentDatasetPublication(emptyPublication)'
+    );
+    const clearManagerFinalization = clear.indexOf(
+      'dataSourceManager.finalizeDatasetSelection(managerPublication)'
+    );
+    const clearPostSettlementCheck = clear.indexOf(
+      'assertCurrentDatasetPublication(emptyPublication)',
+      clearManagerFinalization
+    );
+    assert.ok(
+      clear.indexOf(
+        'assertCurrentDatasetPublication(emptyPublication)',
+        clearManagerFinalization
+      ) > clearManagerFinalization
+    );
+    assert.ok(
+      clearManagerFinalization > clearUiSettlement &&
+      clearPostSettlementCheck > clearManagerFinalization,
+      'None publication must keep its previous source alive until field interaction settlement, then finalize it before stale exit'
+    );
+    const clearPublishedContinuation = clear.slice(
+      clear.indexOf('let managerListenerError = null;')
+    );
+    assert.doesNotMatch(
+      clearPublishedContinuation,
+      /reloadTransaction\.(?:adoptCurrentIdentity|assertCurrent|isCurrent|signal)/
+    );
+
+    const synthetic = slice(
+      'async function runBenchmark',
+      'async function generateSituationReport'
+    );
+    let syntheticSearch = requireCheckAfter(
+      synthetic,
+      'await ensureBenchmarkModule()',
+      'syntheticTransaction.isCurrent()'
+    );
+    syntheticSearch = requireCheckAfter(
+      synthetic,
+      'data = await SyntheticDataGenerator.fromGLBUrl(pointCount)',
+      'syntheticTransaction.isCurrent()',
+      syntheticSearch + 1
+    );
+    syntheticSearch = requireCheckAfter(
+      synthetic,
+      'await cancelPublishedDatasetStateAndWait()',
+      'syntheticTransaction.isCurrent()',
+      syntheticSearch + 1
+    );
+    const syntheticSettlement = synthetic.indexOf(
+      'const synchronizationOutcome = await settlePublishedDatasetUi({'
+    );
+    const syntheticFinalCheck = synthetic.indexOf(
+      'syntheticPublication.isCurrent()',
+      syntheticSettlement
+    );
+    const firstPostSettlementWrite = synthetic.indexOf(
+      'if (renderModeSelect',
+      syntheticSettlement
+    );
+    assert.ok(
+      syntheticSettlement >= 0 &&
+      syntheticFinalCheck > syntheticSettlement &&
+      firstPostSettlementWrite > syntheticFinalCheck
+    );
+    assert.match(
+      synthetic.slice(syntheticFinalCheck, firstPostSettlementWrite),
+      /dismissSupersededBenchmark\(\)/
+    );
+    assert.doesNotMatch(
+      synthetic.slice(syntheticSettlement),
+      /syntheticTransaction\.(?:assertCurrent|isCurrent|signal)/
+    );
+    assert.match(
+      synthetic,
+      /const dismissSupersededBenchmark[\s\S]*notifications\.dismiss\(benchNotifId\)/
+    );
+  }
+);
 
 test('scientific publication excludes fallible UI and global reset work', async () => {
   const mainSource = await readFile(

@@ -18,6 +18,9 @@ import {
 import { getFieldRegistry } from '../../../utils/field-registry.js';
 import { makeUniqueLabel } from '../../../utils/label-utils.js';
 import { getCategoryColor } from '../../../../data/palettes.js';
+import {
+  createDatasetFieldLoadSupersededError
+} from './loading.js';
 
 function requireSource(source) {
   if (source !== FieldSource.OBS && source !== FieldSource.VAR) {
@@ -188,6 +191,18 @@ function requireExactOptions(options, allowedKeys, label) {
     }
   }
   return options;
+}
+
+function readDatasetGeneration(owner) {
+  const generation = typeof owner.getDatasetGeneration === 'function'
+    ? owner.getDatasetGeneration()
+    : (owner._datasetGeneration ?? 0);
+  if (!Number.isSafeInteger(generation) || generation < 0) {
+    throw new TypeError(
+      'Field operation dataset generation must be a non-negative safe integer'
+    );
+  }
+  return generation;
 }
 
 export class FieldOverlayPublicMethods {
@@ -814,6 +829,8 @@ export class FieldOverlayPublicMethods {
   async duplicateField(source, fieldIndex, options = {}) {
     const src = requireSource(source);
     const { fields, field } = requireFieldAt(this, src, fieldIndex);
+    const datasetGeneration = readDatasetGeneration(this);
+    const pointCount = this.pointCount;
     requireExactOptions(
       options,
       new Set(['newKey']),
@@ -828,6 +845,15 @@ export class FieldOverlayPublicMethods {
       await this.ensureVarFieldLoaded(fieldIndex);
     } else {
       await this.ensureFieldLoaded(fieldIndex);
+    }
+    const currentFields = requireInventory(this, src);
+    if (
+      readDatasetGeneration(this) !== datasetGeneration
+      || this.pointCount !== pointCount
+      || currentFields !== fields
+      || currentFields[fieldIndex] !== field
+    ) {
+      throw createDatasetFieldLoadSupersededError();
     }
 
     const existingKeys = fields

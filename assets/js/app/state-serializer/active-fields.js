@@ -12,6 +12,23 @@ import {
 
 const ACTIVE_FIELD_KEYS = ['activeFieldKey', 'activeFieldSource'];
 
+function requireRestoreSignal(options) {
+  assertExactKeys(options, ['signal'], 'Active-field restore options');
+  const signal = options.signal;
+  if (signal !== null && !(signal instanceof AbortSignal)) {
+    throw new TypeError(
+      'Active-field restore signal must be an AbortSignal or null.'
+    );
+  }
+  return signal;
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted !== true) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  throw new DOMException('Active-field restore was aborted.', 'AbortError');
+}
+
 function assertFieldInventory(fields, context) {
   if (!Array.isArray(fields)) {
     throw new TypeError(`${context} must be an array.`);
@@ -118,9 +135,16 @@ export function serializeActiveFields(state) {
  * Restore one exact active field selection.
  * @param {object} state
  * @param {unknown} activeFields
+ * @param {{signal: AbortSignal|null}} [options]
  */
-export async function restoreActiveFields(state, activeFields) {
+export async function restoreActiveFields(
+  state,
+  activeFields,
+  options = { signal: null }
+) {
+  const signal = requireRestoreSignal(options);
   const plan = validateActiveFieldsForState(state, activeFields);
+  throwIfAborted(signal);
 
   if (plan.source === null) {
     state.clearActiveField();
@@ -128,7 +152,13 @@ export async function restoreActiveFields(state, activeFields) {
   }
 
   if (plan.source === 'obs') {
-    await state.ensureFieldLoaded(plan.fieldIndex);
+    await state.ensureFieldLoaded(plan.fieldIndex, { signal });
+    throwIfAborted(signal);
+    if (state.getFields()[plan.fieldIndex] !== plan.field) {
+      throw new Error(
+        'Active obs field restore was superseded by a replacement inventory.'
+      );
+    }
     const result = state.setActiveField(plan.fieldIndex);
     if (result === null) {
       throw new Error(`DataState rejected active obs field "${plan.field.key}".`);
@@ -136,7 +166,13 @@ export async function restoreActiveFields(state, activeFields) {
     return;
   }
 
-  await state.ensureVarFieldLoaded(plan.fieldIndex);
+  await state.ensureVarFieldLoaded(plan.fieldIndex, { signal });
+  throwIfAborted(signal);
+  if (state.getVarFields()[plan.fieldIndex] !== plan.field) {
+    throw new Error(
+      'Active var field restore was superseded by a replacement inventory.'
+    );
+  }
   const result = state.setActiveVarField(plan.fieldIndex);
   if (result === null) {
     throw new Error(`DataState rejected active var field "${plan.field.key}".`);

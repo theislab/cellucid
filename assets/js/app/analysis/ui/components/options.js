@@ -6,7 +6,6 @@
  */
 
 import { PlotRegistry } from '../../shared/plot-registry-utils.js';
-import { debounce } from '../../shared/dom-utils.js';
 
 // =============================================================================
 // PLOT OPTIONS RENDERING
@@ -208,19 +207,18 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
         valueDisplay.className = 'analysis-option-value';
         valueDisplay.textContent = `${value}`;
 
-        // Debounce the change handler to prevent memory issues on large datasets
-        const debouncedChange = debounce(() => {
+        const commitNumericChange = () => {
           const nextValue = input.valueAsNumber;
           if (!Number.isFinite(nextValue) || nextValue < def.min || nextValue > def.max) {
             throw new RangeError(`Numeric option ${key} produced an out-of-range value`);
           }
           onChange(key, nextValue);
-        }, 300);
+        };
 
         input.addEventListener('input', () => {
           valueDisplay.textContent = `${input.valueAsNumber}`;
         });
-        input.addEventListener('change', debouncedChange);
+        input.addEventListener('change', commitNumericChange);
 
         const rangeRow = document.createElement('div');
         rangeRow.className = 'slider-row';

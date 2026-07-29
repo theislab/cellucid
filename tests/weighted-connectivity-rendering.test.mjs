@@ -108,6 +108,10 @@ test('instanced edge shaders consume the aligned weight texture as alpha', async
   );
   assert.match(
     viewerSource,
-    /gl\.deleteTexture\(edgeWeightTextureV2\)/
+    /queueEdgeTextureRetirement\(retiredTexture\)/
+  );
+  assert.match(
+    viewerSource,
+    /gl\.deleteTexture\(texture\);\s*pending\.delete\(texture\)/
   );
 });

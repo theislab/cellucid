@@ -10,14 +10,80 @@ import {
 import {
   createDataSourceManager,
 } from '../assets/js/data/data-source-manager.js';
+import {
+  createJupyterHealthMonitor,
+  createJupyterPointerDelivery,
+} from '../assets/js/app/jupyter-pointer-delivery.js';
 
 function installWindow(search) {
   const href = `http://127.0.0.1:8765/viewer/${search}`;
+  const parent = {};
+  const listeners = new Map();
   globalThis.window = {
     location: new URL(href),
-    addEventListener() {},
-    removeEventListener() {},
+    parent,
+    addEventListener(type, callback) {
+      if (!listeners.has(type)) listeners.set(type, new Set());
+      listeners.get(type).add(callback);
+    },
+    removeEventListener(type, callback) {
+      listeners.get(type)?.delete(callback);
+    },
   };
+  return {
+    parent,
+    listeners,
+    dispatch(type, event) {
+      for (const callback of [...(listeners.get(type) ?? [])]) {
+        callback(event);
+      }
+    },
+  };
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
+}
+
+function hoverIntent(viewId, cellIndex, offset = 0) {
+  return {
+    viewId,
+    cellIndex,
+    position: {
+      x: cellIndex + offset,
+      y: cellIndex + offset + 0.25,
+      z: cellIndex + offset + 0.5,
+    },
+  };
+}
+
+async function nextTask() {
+  await new Promise(resolve => setImmediate(resolve));
+}
+
+async function waitFor(condition, label) {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    if (condition()) return;
+    await nextTask();
+  }
+  assert.fail(`Timed out waiting for ${label}.`);
+}
+
+function jupyterHealthResponse() {
+  return new Response(JSON.stringify({
+    status: 'ok',
+    type: 'exported',
+    version: '1.0.0',
+  }), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  });
 }
 
 const CURRENT_IDENTITY = JSON.parse(readFileSync(
@@ -125,7 +191,7 @@ test('Jupyter initialization validates both exact Python health variants', async
 test('Jupyter events carry exact token routing and propagate HTTP failure', async t => {
   installWindow('?jupyter=true&viewerId=viewer-1&viewerToken=secret-1');
   const source = new JupyterBridgeDataSource();
-  source._config = getJupyterConfig();
+  source._config = source._declaredConfig;
   source._connected = true;
 
   await t.test('authenticated success', async () => {
@@ -210,6 +276,52 @@ test('session bundle upload includes exact token query and rejects coercion', as
     );
   });
 
+  await t.test('upload owns one immutable call generation', async () => {
+    const bundle = deferred();
+    const mutableConfig = { ...config };
+    const mutableMessage = {
+      type: 'requestSessionBundle',
+      requestId: 'request-original',
+      viewerId: 'viewer-1',
+      viewerToken: 'secret-1',
+    };
+    let capturedUrl = null;
+    let replacementFetchCalls = 0;
+    const options = {
+      config: mutableConfig,
+      message: mutableMessage,
+      createSessionBundle: async () => bundle.promise,
+      fetchImpl: async url => {
+        capturedUrl = String(url);
+        return new Response(
+          JSON.stringify({ status: 'ok', bytes: 1 }),
+          { status: 200 },
+        );
+      },
+    };
+    const upload = uploadJupyterSessionBundle(options);
+
+    mutableConfig.viewerId = 'viewer-mutated';
+    mutableConfig.viewerToken = 'secret-mutated';
+    mutableMessage.requestId = 'request-mutated';
+    mutableMessage.viewerId = 'viewer-mutated';
+    mutableMessage.viewerToken = 'secret-mutated';
+    options.fetchImpl = async () => {
+      replacementFetchCalls += 1;
+      throw new Error('replacement fetch must not own the upload');
+    };
+    bundle.resolve(new Blob([Uint8Array.of(1)]));
+
+    await upload;
+    const url = new URL(capturedUrl);
+    assert.deepEqual([...url.searchParams.entries()], [
+      ['viewerId', 'viewer-1'],
+      ['viewerToken', 'secret-1'],
+      ['requestId', 'request-original'],
+    ]);
+    assert.equal(replacementFetchCalls, 0);
+  });
+
   await t.test('numeric request id', async () => {
     let bundleCalls = 0;
     let fetchCalls = 0;
@@ -284,6 +396,184 @@ test('Jupyter initialization accepts one exact current server health response', 
   assert.equal(await source.initialize(), true);
   assert.equal(source.isConnected(), true);
 });
+
+test(
+  'Jupyter initialization owns one immutable config and one live listener',
+  async () => {
+    const runtime = installWindow(
+      '?jupyter=true&viewerId=viewer-1&viewerToken=secret-1',
+    );
+    const config = getJupyterConfig();
+    const source = new JupyterBridgeDataSource(config);
+    assert.equal(runtime.listeners.get('message')?.size ?? 0, 0);
+
+    config.viewerId = 'mutated-viewer';
+    config.viewerToken = 'mutated-token';
+    window.location = new URL(
+      'http://127.0.0.1:9999/other/' +
+      '?jupyter=true&viewerId=viewer-2&viewerToken=secret-2',
+    );
+    const requested = [];
+    globalThis.fetch = async url => {
+      requested.push(String(url));
+      return jupyterHealthResponse();
+    };
+
+    assert.equal(await source.initialize(), true);
+    assert.deepEqual(requested, [
+      'http://127.0.0.1:8765/viewer/_cellucid/health',
+    ]);
+    assert.deepEqual(source.getConnectionInfo(), {
+      serverUrl: 'http://127.0.0.1:8765/viewer',
+      viewerId: 'viewer-1',
+      status: 'connected',
+    });
+    assert.equal(runtime.listeners.get('message')?.size ?? 0, 1);
+
+    source.disconnect();
+    assert.equal(runtime.listeners.get('message')?.size ?? 0, 0);
+  },
+);
+
+test('Jupyter deactivation keeps its authenticated transport reusable', async () => {
+  const runtime = installWindow(
+    '?jupyter=true&viewerId=viewer-1&viewerToken=secret-1',
+  );
+  globalThis.fetch = async () => jupyterHealthResponse();
+  const source = new JupyterBridgeDataSource(getJupyterConfig());
+  await source.initialize();
+  let calls = 0;
+  source.onMessage(() => {
+    calls += 1;
+  });
+
+  assert.equal(source.onDeactivate(), undefined);
+  assert.equal(source.isConnected(), true);
+  assert.equal(runtime.listeners.get('message')?.size ?? 0, 1);
+  runtime.dispatch('message', {
+    data: {
+      type: 'freeze',
+      viewerId: 'viewer-1',
+      viewerToken: 'secret-1',
+    },
+    origin: 'https://notebook.example',
+    source: runtime.parent,
+  });
+  assert.equal(calls, 1);
+
+  source.disconnect();
+  assert.equal(source.isConnected(), false);
+  assert.equal(runtime.listeners.get('message')?.size ?? 0, 0);
+});
+
+test(
+  'Jupyter initialization and disconnect fence every deferred health result',
+  async t => {
+    await t.test('newest initialization owns publication', async () => {
+      installWindow(
+        '?jupyter=true&viewerId=viewer-1&viewerToken=secret-1',
+      );
+      const firstHealth = deferred();
+      const secondHealth = deferred();
+      let healthCalls = 0;
+      globalThis.fetch = async () => {
+        healthCalls += 1;
+        return healthCalls === 1
+          ? firstHealth.promise
+          : secondHealth.promise;
+      };
+      const source = new JupyterBridgeDataSource(getJupyterConfig());
+      const first = source.initialize();
+      const firstRejection = assert.rejects(first, /superseded/i);
+      const second = source.initialize();
+
+      secondHealth.resolve(jupyterHealthResponse());
+      assert.equal(await second, true);
+      firstHealth.resolve(jupyterHealthResponse());
+      await firstRejection;
+      assert.equal(source.isConnected(), true);
+      source.disconnect();
+    });
+
+    await t.test('disconnect retires pending initialization', async () => {
+      const runtime = installWindow(
+        '?jupyter=true&viewerId=viewer-1&viewerToken=secret-1',
+      );
+      const health = deferred();
+      globalThis.fetch = async () => health.promise;
+      const source = new JupyterBridgeDataSource(getJupyterConfig());
+      const initialization = source.initialize();
+      const rejection = assert.rejects(initialization, /superseded/i);
+
+      source.disconnect();
+      health.resolve(jupyterHealthResponse());
+      await rejection;
+      assert.equal(source.isConnected(), false);
+      assert.equal(runtime.listeners.get('message')?.size ?? 0, 0);
+    });
+  },
+);
+
+test(
+  'Jupyter message dispatch pins the exact parent and observes async failure',
+  async () => {
+    const runtime = installWindow(
+      '?jupyter=true&viewerId=viewer-1&viewerToken=secret-1',
+    );
+    globalThis.fetch = async () => jupyterHealthResponse();
+    const source = new JupyterBridgeDataSource(getJupyterConfig());
+    await source.initialize();
+
+    let calls = 0;
+    source.onMessage(() => {
+      calls += 1;
+    });
+    const freeze = {
+      data: {
+        type: 'freeze',
+        viewerId: 'viewer-1',
+        viewerToken: 'secret-1',
+      },
+      origin: 'https://notebook.example',
+    };
+    source._handleMessage({
+      ...freeze,
+      source: {},
+    });
+    assert.equal(calls, 0);
+    assert.equal(source._parentOrigin, null);
+
+    source._handleMessage({
+      ...freeze,
+      source: runtime.parent,
+    });
+    assert.equal(calls, 1);
+
+    const failure = new Error('async notebook dispatch failed');
+    const reported = [];
+    source._reportMessageFailure = error => {
+      reported.push(error);
+    };
+    source.onMessage(message => (
+      message.type === 'requestSessionBundle'
+        ? Promise.reject(failure)
+        : undefined
+    ));
+    runtime.dispatch('message', {
+      data: {
+        type: 'requestSessionBundle',
+        requestId: 'request-1',
+        viewerId: 'viewer-1',
+        viewerToken: 'secret-1',
+      },
+      origin: 'https://notebook.example',
+      source: runtime.parent,
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(reported, [failure]);
+    source.disconnect();
+  },
+);
 
 test('Jupyter dataset listing rejects server and metadata failures atomically', async t => {
   installWindow('?jupyter=true&viewerId=viewer-1&viewerToken=secret-1');
@@ -396,6 +686,151 @@ test('Jupyter dataset listing publishes one complete exact generation', async ()
   );
 });
 
+test(
+  'Jupyter dataset listings cannot publish across reconnect or a newer listing',
+  async t => {
+    await t.test('reconnect retirement', async () => {
+      installWindow(
+        '?jupyter=true&viewerId=viewer-1&viewerToken=secret-1',
+      );
+      const source = new JupyterBridgeDataSource(getJupyterConfig());
+      globalThis.fetch = async () => jupyterHealthResponse();
+      await source.initialize();
+
+      const staleCatalog = deferred();
+      globalThis.fetch = async url => {
+        if (String(url).endsWith('/_cellucid/datasets')) {
+          return staleCatalog.promise;
+        }
+        throw new Error(`Unexpected stale-listing URL: ${String(url)}`);
+      };
+      const staleListing = source.listDatasets();
+      const staleRejection = assert.rejects(
+        staleListing,
+        /superseded|connection/i,
+      );
+
+      source.disconnect();
+      globalThis.fetch = async url => {
+        if (String(url).endsWith('/_cellucid/health')) {
+          return jupyterHealthResponse();
+        }
+        if (String(url).endsWith('/dataset_identity.json')) {
+          return new Response(JSON.stringify(CURRENT_IDENTITY), {
+            status: 200,
+          });
+        }
+        throw new Error(`Unexpected reconnected URL: ${String(url)}`);
+      };
+      assert.equal(await source.initialize(), true);
+
+      staleCatalog.resolve(new Response(JSON.stringify({
+        datasets: [{
+          id: CURRENT_IDENTITY.id,
+          path: '/current-ui-prepared/',
+          name: CURRENT_IDENTITY.name,
+        }],
+      }), { status: 200 }));
+      await staleRejection;
+      assert.deepEqual([...source._datasetPaths], []);
+      assert.deepEqual([...source._datasetCache], []);
+      source.disconnect();
+    });
+
+    await t.test('newest listing ownership', async () => {
+      installWindow(
+        '?jupyter=true&viewerId=viewer-1&viewerToken=secret-1',
+      );
+      const source = new JupyterBridgeDataSource(getJupyterConfig());
+      globalThis.fetch = async () => jupyterHealthResponse();
+      await source.initialize();
+
+      const firstCatalog = deferred();
+      const secondCatalog = deferred();
+      const firstIdentity = {
+        ...CURRENT_IDENTITY,
+        id: 'first',
+        name: 'First',
+      };
+      const secondIdentity = {
+        ...CURRENT_IDENTITY,
+        id: 'second',
+        name: 'Second',
+      };
+      let catalogCalls = 0;
+      globalThis.fetch = async url => {
+        const href = String(url);
+        if (href.endsWith('/_cellucid/datasets')) {
+          catalogCalls += 1;
+          return catalogCalls === 1
+            ? firstCatalog.promise
+            : secondCatalog.promise;
+        }
+        if (href.endsWith('/first/dataset_identity.json')) {
+          return new Response(JSON.stringify(firstIdentity), { status: 200 });
+        }
+        if (href.endsWith('/second/dataset_identity.json')) {
+          return new Response(JSON.stringify(secondIdentity), { status: 200 });
+        }
+        throw new Error(`Unexpected concurrent-listing URL: ${href}`);
+      };
+
+      const firstListing = source.listDatasets();
+      const firstRejection = assert.rejects(
+        firstListing,
+        /superseded/i,
+      );
+      const secondListing = source.listDatasets();
+      secondCatalog.resolve(new Response(JSON.stringify({
+        datasets: [{
+          id: 'second',
+          path: '/second/',
+          name: 'Second',
+        }],
+      }), { status: 200 }));
+      assert.deepEqual(await secondListing, [secondIdentity]);
+
+      firstCatalog.resolve(new Response(JSON.stringify({
+        datasets: [{
+          id: 'first',
+          path: '/first/',
+          name: 'First',
+        }],
+      }), { status: 200 }));
+      await firstRejection;
+      assert.deepEqual([...source._datasetPaths], [['second', '/second/']]);
+      assert.equal(source._datasetCache.get('second').id, 'second');
+      assert.equal(source._datasetCache.has('first'), false);
+      source.disconnect();
+    });
+
+    await t.test('metadata cache refresh retirement', async () => {
+      installWindow(
+        '?jupyter=true&viewerId=viewer-1&viewerToken=secret-1',
+      );
+      const source = new JupyterBridgeDataSource(getJupyterConfig());
+      globalThis.fetch = async () => jupyterHealthResponse();
+      await source.initialize();
+      source._datasetPaths.set(
+        CURRENT_IDENTITY.id,
+        '/current-ui-prepared/',
+      );
+
+      const identity = deferred();
+      globalThis.fetch = async () => identity.promise;
+      const metadata = source.getMetadata(CURRENT_IDENTITY.id);
+      const rejection = assert.rejects(metadata, /superseded/i);
+      source.refresh();
+      identity.resolve(new Response(JSON.stringify(CURRENT_IDENTITY), {
+        status: 200,
+      }));
+      await rejection;
+      assert.equal(source._datasetCache.has(CURRENT_IDENTITY.id), false);
+      source.disconnect();
+    });
+  },
+);
+
 test('Jupyter bridge has no unused frontend-to-parent request protocol', () => {
   installWindow('?jupyter=true&viewerId=viewer-1&viewerToken=secret-1');
   const source = new JupyterBridgeDataSource();
@@ -408,7 +843,8 @@ test('Jupyter bridge has no unused frontend-to-parent request protocol', () => {
 test('authenticated Jupyter messages require exact viewer identity and pinned origin', () => {
   installWindow('?jupyter=true&viewerId=viewer-1&viewerToken=secret-1');
   const source = new JupyterBridgeDataSource();
-  source._config = getJupyterConfig();
+  source._config = source._declaredConfig;
+  source._connected = true;
   let calls = 0;
   source.onMessage(() => {
     calls += 1;
@@ -418,6 +854,7 @@ test('authenticated Jupyter messages require exact viewer identity and pinned or
     () => source._handleMessage({
       data: { type: 'freeze', viewerToken: 'secret-1' },
       origin: 'https://notebook.example',
+      source: window.parent,
     }),
     /viewerId/i,
   );
@@ -430,6 +867,7 @@ test('authenticated Jupyter messages require exact viewer identity and pinned or
       viewerToken: 'secret-1',
     },
     origin: 'https://notebook.example',
+    source: window.parent,
   });
   assert.equal(calls, 1);
 
@@ -441,6 +879,7 @@ test('authenticated Jupyter messages require exact viewer identity and pinned or
         viewerToken: 'secret-1',
       },
       origin: 'https://other.example',
+      source: window.parent,
     }),
     /origin/i,
   );
@@ -450,7 +889,8 @@ test('authenticated Jupyter messages require exact viewer identity and pinned or
 test('Jupyter callback registration and delivery preserve the original failure', () => {
   installWindow('?jupyter=true&viewerId=viewer-1&viewerToken=secret-1');
   const source = new JupyterBridgeDataSource();
-  source._config = getJupyterConfig();
+  source._config = source._declaredConfig;
+  source._connected = true;
   assert.throws(() => source.onMessage(null), /callback.*function/i);
 
   const failure = new Error('notebook command failed');
@@ -465,6 +905,7 @@ test('Jupyter callback registration and delivery preserve the original failure',
         viewerToken: 'secret-1',
       },
       origin: 'https://notebook.example',
+      source: window.parent,
     }),
     error => error === failure,
   );
@@ -473,7 +914,8 @@ test('Jupyter callback registration and delivery preserve the original failure',
 test('Jupyter authenticated commands validate exact payloads and async delivery', async () => {
   installWindow('?jupyter=true&viewerId=viewer-1&viewerToken=secret-1');
   const source = new JupyterBridgeDataSource();
-  source._config = getJupyterConfig();
+  source._config = source._declaredConfig;
+  source._connected = true;
   let highlightCalls = 0;
   source.onHighlight(() => {
     highlightCalls += 1;
@@ -489,6 +931,7 @@ test('Jupyter authenticated commands validate exact payloads and async delivery'
         viewerToken: 'secret-1',
       },
       origin: 'https://notebook.example',
+      source: window.parent,
     }),
     /duplicate/i,
   );
@@ -503,6 +946,7 @@ test('Jupyter authenticated commands validate exact payloads and async delivery'
         viewerToken: 'secret-1',
       },
       origin: 'https://notebook.example',
+      source: window.parent,
     }),
     /non-empty/i,
   );
@@ -516,6 +960,7 @@ test('Jupyter authenticated commands validate exact payloads and async delivery'
       viewerToken: 'secret-1',
     },
     origin: 'https://notebook.example',
+    source: window.parent,
   });
   assert.equal(highlightCalls, 1);
 
@@ -528,6 +973,7 @@ test('Jupyter authenticated commands validate exact payloads and async delivery'
       viewerToken: 'unrelated-token',
     },
     origin: 'https://other.example',
+    source: window.parent,
   });
   assert.equal(highlightCalls, 1);
 
@@ -543,6 +989,7 @@ test('Jupyter authenticated commands validate exact payloads and async delivery'
         viewerToken: 'secret-1',
       },
       origin: 'https://notebook.example',
+      source: window.parent,
     }),
     error => error === failure,
   );
@@ -655,4 +1102,404 @@ test('Jupyter mode does not register or enumerate the unrelated demo catalog', a
   assert.equal(jupyterListingCalls, 1);
   assert.equal(manager.getSource('local-demo'), null);
   assert.notEqual(manager.getSource('github-repo'), null);
+});
+
+test('main binds bridge initialization and session upload to one captured config', () => {
+  const mainSource = readFileSync(
+    new URL('../assets/js/app/main.js', import.meta.url),
+    'utf8',
+  );
+  assert.match(
+    mainSource,
+    /const jupyterConfig = getJupyterConfig\(\);/,
+  );
+  assert.match(
+    mainSource,
+    /createJupyterBridgeDataSource\(jupyterConfig\)/,
+  );
+  assert.match(
+    mainSource,
+    /uploadJupyterSessionBundle\(\{[\s\S]*config:\s*jupyterConfig,/,
+  );
+});
+
+test('Jupyter health probes are single-flight and fence late lifecycle failures', async () => {
+  const probes = [];
+  const failures = [];
+  let activeProbeCount = 0;
+  let maximumActiveProbeCount = 0;
+  const monitor = createJupyterHealthMonitor({
+    checkHealth() {
+      activeProbeCount += 1;
+      maximumActiveProbeCount = Math.max(
+        maximumActiveProbeCount,
+        activeProbeCount,
+      );
+      const operation = deferred();
+      probes.push(operation);
+      return operation.promise.finally(() => {
+        activeProbeCount -= 1;
+      });
+    },
+    onFailure(error) {
+      failures.push(error);
+    },
+    intervalMs: 0,
+  });
+
+  assert.equal(monitor.start(), true);
+  assert.equal(monitor.start(), false);
+  await nextTask();
+  assert.equal(probes.length, 1);
+  assert.equal(monitor.isProbeInFlight(), true);
+  await nextTask();
+  assert.equal(probes.length, 1);
+
+  probes[0].resolve();
+  await waitFor(() => probes.length === 2, 'the second health probe');
+  assert.equal(probes.length, 2);
+  const terminalFailure = new Error('synthetic health failure');
+  probes[1].reject(terminalFailure);
+  await waitFor(() => monitor.isFrozen(), 'terminal health freeze');
+  assert.equal(monitor.isFrozen(), true);
+  assert.deepEqual(failures, [terminalFailure]);
+  assert.equal(maximumActiveProbeCount, 1);
+  await nextTask();
+  assert.equal(probes.length, 2);
+
+  const staleProbe = deferred();
+  const staleFailures = [];
+  const frozenMonitor = createJupyterHealthMonitor({
+    checkHealth: () => staleProbe.promise,
+    onFailure: error => {
+      staleFailures.push(error);
+    },
+    intervalMs: 0,
+  });
+  frozenMonitor.start();
+  await waitFor(
+    () => frozenMonitor.isProbeInFlight(),
+    'the stale health probe',
+  );
+  assert.equal(frozenMonitor.isProbeInFlight(), true);
+  assert.equal(frozenMonitor.freeze(), true);
+  staleProbe.reject(new Error('late retired health failure'));
+  await waitFor(
+    () => !frozenMonitor.isProbeInFlight(),
+    'retired health settlement',
+  );
+  assert.deepEqual(staleFailures, []);
+  assert.equal(frozenMonitor.isFrozen(), true);
+});
+
+test('Jupyter hover delivery serializes sends and coalesces to the latest intent', async () => {
+  const sends = [];
+  const pending = [];
+  let active = 0;
+  let maximumActive = 0;
+  const errors = [];
+  const delivery = createJupyterPointerDelivery({
+    notifyHover(cellIndex, position) {
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      sends.push({ cellIndex, position });
+      const operation = deferred();
+      pending.push(operation);
+      return operation.promise.finally(() => {
+        active -= 1;
+      });
+    },
+    notifyClick: async () => {},
+    reportError: (error, channel) => {
+      errors.push({ error, channel });
+    },
+  });
+
+  const first = hoverIntent('left', 1);
+  const intermediate = hoverIntent('right', 2);
+  const latest = hoverIntent('right', 3);
+  assert.equal(delivery.requestHover(first), true);
+  assert.equal(delivery.requestHover(intermediate), true);
+  assert.equal(delivery.requestHover(latest), true);
+  assert.equal(delivery.requestHover(latest), false);
+  assert.deepEqual(sends.map(send => send.cellIndex), [1]);
+
+  pending[0].resolve();
+  await nextTask();
+  assert.deepEqual(sends.map(send => send.cellIndex), [1, 3]);
+  pending[1].resolve();
+  await delivery.whenIdle();
+
+  assert.equal(maximumActive, 1);
+  assert.deepEqual(sends.map(send => send.cellIndex), [1, 3]);
+  assert.equal(delivery.requestHover(latest), false);
+  assert.deepEqual(errors, []);
+});
+
+test('Jupyter hover preserves a final leave while an older hover is in flight', async () => {
+  const sends = [];
+  const pending = [];
+  const delivery = createJupyterPointerDelivery({
+    notifyHover(cellIndex, position) {
+      sends.push({ cellIndex, position });
+      const operation = deferred();
+      pending.push(operation);
+      return operation.promise;
+    },
+    notifyClick: async () => {},
+    reportError: error => {
+      throw error;
+    },
+  });
+
+  delivery.requestHover(hoverIntent('pane', 8));
+  delivery.requestHover(hoverIntent('pane', 9));
+  delivery.requestHover(null);
+  assert.deepEqual(sends.map(send => send.cellIndex), [8]);
+  pending[0].resolve();
+  await nextTask();
+  assert.deepEqual(sends.map(send => send.cellIndex), [8, null]);
+  pending[1].resolve();
+  await delivery.whenIdle();
+  assert.deepEqual(sends.map(send => send.cellIndex), [8, null]);
+});
+
+test('a repeated in-flight Jupyter hover delivers exactly once after success', async () => {
+  const sends = [];
+  const operation = deferred();
+  const delivery = createJupyterPointerDelivery({
+    notifyHover(cellIndex) {
+      sends.push(cellIndex);
+      return operation.promise;
+    },
+    notifyClick: async () => {},
+    reportError: error => {
+      throw error;
+    },
+  });
+  const intent = hoverIntent('pane', 12);
+
+  assert.equal(delivery.requestHover(intent), true);
+  assert.equal(delivery.requestHover(intent), true);
+  assert.deepEqual(sends, [12]);
+  operation.resolve();
+  await delivery.whenIdle();
+  assert.deepEqual(sends, [12]);
+  assert.equal(delivery.requestHover(intent), false);
+});
+
+test('failed Jupyter hover remains retryable and commits deduplication only on success', async () => {
+  const attempts = [];
+  const errors = [];
+  const firstFailure = new Error('synthetic hover delivery failure');
+  const firstAttempt = deferred();
+  const retryAttempt = deferred();
+  const delivery = createJupyterPointerDelivery({
+    notifyHover(cellIndex) {
+      attempts.push(cellIndex);
+      return attempts.length === 1
+        ? firstAttempt.promise
+        : retryAttempt.promise;
+    },
+    notifyClick: async () => {},
+    reportError: (error, channel) => {
+      errors.push({ error, channel });
+    },
+  });
+  const intent = hoverIntent('pane', 5);
+
+  assert.equal(delivery.requestHover(intent), true);
+  // A duplicate arriving before settlement remains pending. Success would
+  // deduplicate it; failure must retry it.
+  assert.equal(delivery.requestHover(intent), true);
+  assert.deepEqual(attempts, [5]);
+  firstAttempt.reject(firstFailure);
+  await nextTask();
+  assert.deepEqual(attempts, [5, 5]);
+  retryAttempt.resolve();
+  await delivery.whenIdle();
+  assert.deepEqual(errors, [{
+    error: firstFailure,
+    channel: 'hover',
+  }]);
+
+  assert.deepEqual(attempts, [5, 5]);
+  assert.equal(delivery.requestHover(intent), false);
+});
+
+test('Jupyter click delivery preserves exact FIFO order across deferred sends', async () => {
+  const starts = [];
+  const pending = [];
+  const delivery = createJupyterPointerDelivery({
+    notifyHover: async () => {},
+    notifyClick(cellIndex, modifiers) {
+      starts.push({ cellIndex, modifiers });
+      const operation = deferred();
+      pending.push(operation);
+      return operation.promise;
+    },
+    reportError: error => {
+      throw error;
+    },
+  });
+
+  assert.throws(
+    () => delivery.requestClick({
+      cellIndex: 9,
+      button: 3,
+      shift: false,
+      ctrl: false,
+    }),
+    /button/i,
+  );
+  for (const cellIndex of [4, 2, 7]) {
+    assert.equal(delivery.requestClick({
+      cellIndex,
+      button: 0,
+      shift: cellIndex === 2,
+      ctrl: cellIndex === 7,
+    }), true);
+  }
+  assert.deepEqual(starts.map(entry => entry.cellIndex), [4]);
+  pending[0].resolve();
+  await nextTask();
+  assert.deepEqual(starts.map(entry => entry.cellIndex), [4, 2]);
+  pending[1].resolve();
+  await nextTask();
+  assert.deepEqual(starts.map(entry => entry.cellIndex), [4, 2, 7]);
+  pending[2].resolve();
+  await delivery.whenIdle();
+  assert.deepEqual(
+    starts.map(entry => entry.modifiers),
+    [
+      { button: 0, shift: false, ctrl: false },
+      { button: 0, shift: true, ctrl: false },
+      { button: 0, shift: false, ctrl: true },
+    ],
+  );
+});
+
+test('Jupyter pointer freeze fences queued and future lifecycle work', async () => {
+  const hoverStarts = [];
+  const clickStarts = [];
+  const hoverFirst = deferred();
+  const clickFirst = deferred();
+  const delivery = createJupyterPointerDelivery({
+    notifyHover(cellIndex) {
+      hoverStarts.push(cellIndex);
+      return hoverFirst.promise;
+    },
+    notifyClick(cellIndex) {
+      clickStarts.push(cellIndex);
+      return clickFirst.promise;
+    },
+    reportError: error => {
+      throw error;
+    },
+  });
+
+  delivery.requestHover(hoverIntent('pane', 1));
+  delivery.requestHover(hoverIntent('pane', 2));
+  delivery.requestClick({
+    cellIndex: 3,
+    button: 0,
+    shift: false,
+    ctrl: false,
+  });
+  delivery.requestClick({
+    cellIndex: 4,
+    button: 0,
+    shift: false,
+    ctrl: false,
+  });
+  assert.equal(delivery.freeze(), true);
+  assert.equal(delivery.freeze(), false);
+  assert.equal(delivery.isFrozen(), true);
+  assert.equal(delivery.requestHover(null), false);
+  assert.equal(delivery.requestClick({
+    cellIndex: 5,
+    button: 0,
+    shift: false,
+    ctrl: false,
+  }), false);
+
+  hoverFirst.resolve();
+  clickFirst.resolve();
+  await delivery.whenIdle();
+  assert.deepEqual(hoverStarts, [1]);
+  assert.deepEqual(clickStarts, [3]);
+});
+
+test('Jupyter pointer hooks use per-view pick records without changing wire payloads', () => {
+  const mainSource = readFileSync(
+    new URL('../assets/js/app/main.js', import.meta.url),
+    'utf8',
+  );
+  assert.match(
+    mainSource,
+    /viewer\.pickCellRecordAtScreen\(\s*event\.clientX,\s*event\.clientY\s*\)/,
+  );
+  assert.match(
+    mainSource,
+    /createJupyterPointerDelivery\(\{/,
+  );
+  assert.match(
+    mainSource,
+    /jupyterPointerDelivery\.requestHover\(pickRecord\)/,
+  );
+  assert.match(
+    mainSource,
+    /jupyterPointerDelivery\.requestClick\(\{\s*cellIndex:\s*pickRecord\.cellIndex,/,
+  );
+  assert.match(
+    mainSource,
+    /jupyterPointerDelivery\?\.freeze\(\)/,
+  );
+  assert.match(
+    mainSource,
+    /createJupyterHealthMonitor\(\{[\s\S]*checkHealth:\s*\(\)\s*=>\s*jupyterSource\.checkHealth\(\)/,
+  );
+  assert.doesNotMatch(
+    mainSource,
+    /setInterval\(\s*async\s*\(\)\s*=>[\s\S]*checkHealth/,
+  );
+  assert.doesNotMatch(
+    mainSource,
+    /getCellPosition\([^)]*,\s*['"]live['"]\)/,
+  );
+
+  const freezeStart = mainSource.indexOf(
+    'const freezeJupyterView = () => {',
+  );
+  const freezeEnd = mainSource.indexOf(
+    '\n      };',
+    freezeStart,
+  );
+  const freezeSource = mainSource.slice(freezeStart, freezeEnd);
+  assert.ok(freezeStart >= 0 && freezeEnd > freezeStart);
+  assert.ok(
+    freezeSource.indexOf('jupyterFrozen = true;') <
+      freezeSource.indexOf('retireJupyterPointerInputs()'),
+  );
+  assert.ok(
+    freezeSource.indexOf('jupyterFrozen = true;') <
+      freezeSource.indexOf('viewer.pause()'),
+  );
+
+  const healthFailureStart = mainSource.indexOf(
+    'onFailure: error => {',
+    freezeEnd,
+  );
+  const healthFailureEnd = mainSource.indexOf(
+    '\n        },',
+    healthFailureStart,
+  );
+  const healthFailureSource = mainSource.slice(
+    healthFailureStart,
+    healthFailureEnd,
+  );
+  assert.ok(
+    healthFailureSource.indexOf('freezeJupyterView();') <
+      healthFailureSource.indexOf('notifications.error('),
+  );
 });

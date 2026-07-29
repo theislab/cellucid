@@ -567,9 +567,13 @@ export class DataStateViewMethods {
       try {
         positionPublicationAttempted = true;
         if (isLiveView) {
-          this.viewer.updatePositions(positions3D);
+          this.viewer.updatePositions(positions3D, nextLevel);
         } else {
-          this.viewer.setViewPositions(targetViewId, positions3D);
+          this.viewer.setViewPositions(
+            targetViewId,
+            positions3D,
+            nextLevel
+          );
         }
 
         if (stagedCentroids !== null) {
@@ -617,7 +621,6 @@ export class DataStateViewMethods {
         }
         if (isActiveView) {
           this.activeDimensionLevel = nextLevel;
-          this._notifyDimensionChange();
         }
       } catch (error) {
         context.dimensionLevel = previousLevel;
@@ -645,11 +648,15 @@ export class DataStateViewMethods {
         if (positionPublicationAttempted) {
           restore(() => {
             if (isLiveView) {
-              this.viewer.updatePositions(previousPositions);
+              this.viewer.updatePositions(
+                previousPositions,
+                previousLevel
+              );
             } else {
               this.viewer.setViewPositions(
                 targetViewId,
-                previousPositions
+                previousPositions,
+                previousLevel
               );
             }
           });
@@ -698,6 +705,12 @@ export class DataStateViewMethods {
           );
         }
         throw error;
+      }
+      // Listeners observe an already committed generation. A listener failure
+      // must not drive the reversible renderer/manager publication backward
+      // after another listener may already have observed the new level.
+      if (isActiveView) {
+        this._notifyDimensionChange();
       }
     } finally {
       if (typeof unlockDimensionChange === 'function') {

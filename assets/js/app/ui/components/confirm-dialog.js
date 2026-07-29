@@ -7,6 +7,7 @@
 import { escapeHtml } from '../utils.js';
 
 let activeKeydownHandler = null;
+let activeDialogCancel = null;
 
 function createDomId(prefix = 'id') {
   const p = String(prefix || 'id').trim() || 'id';
@@ -31,7 +32,9 @@ export function showConfirmDialog({
   onConfirm,
   onCancel
 }) {
-  if (activeKeydownHandler) {
+  if (activeDialogCancel !== null) {
+    activeDialogCancel();
+  } else if (activeKeydownHandler) {
     document.removeEventListener('keydown', activeKeydownHandler);
     activeKeydownHandler = null;
   }
@@ -147,8 +150,11 @@ export function showConfirmDialog({
   const close = () => {
     if (closed) return;
     closed = true;
-    if (activeKeydownHandler) {
-      document.removeEventListener('keydown', activeKeydownHandler);
+    if (activeDialogCancel === cancel) {
+      activeDialogCancel = null;
+    }
+    if (activeKeydownHandler === onKeyDown) {
+      document.removeEventListener('keydown', onKeyDown);
       activeKeydownHandler = null;
     }
     try {
@@ -162,6 +168,11 @@ export function showConfirmDialog({
     } catch {
       // ignore
     }
+  };
+  const cancel = () => {
+    if (closed) return;
+    close();
+    onCancel?.();
   };
 
   const cancelBtn = overlay.querySelector('.confirm-dialog-cancel');
@@ -181,8 +192,7 @@ export function showConfirmDialog({
   }
 
   cancelBtn?.addEventListener('click', () => {
-    close();
-    onCancel?.();
+    cancel();
   });
   confirmBtn?.addEventListener('click', () => {
     const note = wantsInput ? String(textarea?.value || '') : null;
@@ -192,20 +202,20 @@ export function showConfirmDialog({
 
   overlay.addEventListener('click', (e) => {
     if (e.target === overlay) {
-      close();
-      onCancel?.();
+      cancel();
     }
   });
 
   const onKeyDown = (e) => {
     if (e.key !== 'Escape') return;
-    close();
-    onCancel?.();
+    cancel();
   };
+  activeDialogCancel = cancel;
   activeKeydownHandler = onKeyDown;
   document.addEventListener('keydown', onKeyDown);
 
   document.body.appendChild(overlay);
   if (wantsInput) textarea?.focus?.();
   else confirmBtn?.focus?.();
+  return cancel;
 }

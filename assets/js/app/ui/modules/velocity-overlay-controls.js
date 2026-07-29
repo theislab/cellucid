@@ -450,9 +450,13 @@ export function initVelocityOverlayControls(options) {
     infoEl.textContent = message;
   }
 
-  function disableOverlayUi() {
+  function syncDisabledOverlayUi() {
     enabledCheckbox.checked = false;
     settings.style.display = 'none';
+  }
+
+  function disableOverlayUi() {
+    syncDisabledOverlayUi();
     viewer.setVectorFieldOverlayEnabled(false);
   }
 
@@ -699,7 +703,11 @@ export function initVelocityOverlayControls(options) {
 
     if (!hasAny) {
       setInfo('');
-      disableOverlayUi();
+      if (enabledCheckbox.checked) {
+        disableOverlayUi();
+      } else {
+        syncDisabledOverlayUi();
+      }
       return;
     }
 
@@ -763,6 +771,7 @@ export function initVelocityOverlayControls(options) {
     enabling = true;
     enabledCheckbox.disabled = true;
     setInfo('Loading vector field…');
+    let failureInfo = null;
 
     try {
       await ensureFieldForActiveDim();
@@ -771,19 +780,20 @@ export function initVelocityOverlayControls(options) {
       updateSettingsVisibility();
       syncAvailability();
     } catch (error) {
-      if (!(error instanceof Error) || error.message.length === 0) {
-        throw new TypeError(
-          'Vector field overlay loading must reject with a non-empty Error.'
-        );
-      }
-      getNotificationCenter().error(error.message, { category: 'render' });
+      const exactError =
+        error instanceof Error && error.message.length > 0
+          ? error
+          : new TypeError(
+              'Vector field overlay loading failed with an invalid error.'
+            );
+      getNotificationCenter().error(exactError.message, { category: 'render' });
       disableOverlayUi();
-      setInfo('Failed to load vector field.');
-      throw error;
+      failureInfo = 'Failed to load vector field.';
     } finally {
       enabling = false;
       enabledCheckbox.disabled = false;
       syncAvailability();
+      if (failureInfo !== null) setInfo(failureInfo);
     }
   }
 
@@ -809,6 +819,7 @@ export function initVelocityOverlayControls(options) {
       return;
     }
 
+    let failureInfo = null;
     try {
       enabling = true;
       enabledCheckbox.disabled = true;
@@ -818,19 +829,20 @@ export function initVelocityOverlayControls(options) {
       applyConfigFromUi();
       syncAvailability();
     } catch (error) {
-      if (!(error instanceof Error) || error.message.length === 0) {
-        throw new TypeError(
-          'Vector field dimension loading must reject with a non-empty Error.'
-        );
-      }
-      getNotificationCenter().error(error.message, { category: 'render' });
+      const exactError =
+        error instanceof Error && error.message.length > 0
+          ? error
+          : new TypeError(
+              'Vector field dimension loading failed with an invalid error.'
+            );
+      getNotificationCenter().error(exactError.message, { category: 'render' });
       disableOverlayUi();
-      setInfo('Failed to load vector field.');
-      throw error;
+      failureInfo = 'Failed to load vector field.';
     } finally {
       enabling = false;
       enabledCheckbox.disabled = false;
       syncAvailability();
+      if (failureInfo !== null) setInfo(failureInfo);
     }
   }
 
@@ -844,25 +856,27 @@ export function initVelocityOverlayControls(options) {
     enabledCheckbox.disabled = true;
     fieldSelect.disabled = true;
     setInfo('Loading vector field…');
+    let failureInfo = null;
     try {
       await ensureFieldForActiveDim();
       applyConfigFromUi();
       syncAvailability();
     } catch (error) {
-      if (!(error instanceof Error) || error.message.length === 0) {
-        throw new TypeError(
-          'Vector field selection loading must reject with a non-empty Error.'
-        );
-      }
-      getNotificationCenter().error(error.message, { category: 'render' });
+      const exactError =
+        error instanceof Error && error.message.length > 0
+          ? error
+          : new TypeError(
+              'Vector field selection loading failed with an invalid error.'
+            );
+      getNotificationCenter().error(exactError.message, { category: 'render' });
       disableOverlayUi();
-      setInfo('Failed to load vector field.');
-      throw error;
+      failureInfo = 'Failed to load vector field.';
     } finally {
       enabling = false;
       enabledCheckbox.disabled = false;
       fieldSelect.disabled = false;
       syncAvailability();
+      if (failureInfo !== null) setInfo(failureInfo);
     }
   }
 
@@ -1031,6 +1045,78 @@ export function initVelocityOverlayControls(options) {
 
   return {
     syncAvailability,
+    settleRenderFailure(error) {
+      if (!(error instanceof Error) || error.message.length === 0) {
+        throw new TypeError(
+          'Velocity render failure settlement requires a non-empty Error.'
+        );
+      }
+      const secondaryFailures = [];
+      const collectFailure = (value, fallbackMessage) => {
+        secondaryFailures.push(
+          value instanceof Error ? value : new Error(fallbackMessage)
+        );
+      };
+
+      // The renderer has already switched the overlay off before reporting a
+      // runtime failure. Retry its pending cleanup once, but keep every UI and
+      // notification step independent so a repeated WebGL deletion failure
+      // cannot strand checked controls or suppress the terminal notice.
+      syncDisabledOverlayUi();
+      try {
+        viewer.setVectorFieldOverlayEnabled(false);
+      } catch (cleanupError) {
+        collectFailure(
+          cleanupError,
+          'Velocity overlay cleanup retry failed with a non-Error value.'
+        );
+      }
+      try {
+        syncAvailability();
+      } catch (syncError) {
+        collectFailure(
+          syncError,
+          'Velocity overlay availability sync failed with a non-Error value.'
+        );
+      }
+      // A failed availability sync must not be allowed to undo the terminal
+      // state owned by this settlement.
+      syncDisabledOverlayUi();
+      try {
+        setInfo('Velocity rendering unavailable.');
+      } catch (infoError) {
+        collectFailure(
+          infoError,
+          'Velocity overlay status update failed with a non-Error value.'
+        );
+      }
+      try {
+        getNotificationCenter().error(
+          `Velocity rendering stopped: ${error.message}`,
+          { category: 'render' }
+        );
+      } catch (notificationError) {
+        collectFailure(
+          notificationError,
+          'Velocity overlay failure notification failed with a non-Error value.'
+        );
+      }
+
+      if (secondaryFailures.length === 0) return error;
+      const diagnostic = new AggregateError(
+        [error, ...secondaryFailures],
+        'Velocity rendering stopped and failure settlement was incomplete.'
+      );
+      // This handler is itself the viewer's terminal observer. Throwing here
+      // would be re-queued as an unhandled observer failure, so retain the
+      // complete aggregate through the diagnostic channel without recursion.
+      try {
+        console.error(diagnostic);
+      } catch {
+        // Optional diagnostics cannot replace the settled UI state.
+      }
+      return diagnostic;
+    },
     destroy() {
       enabledCheckbox.removeEventListener('change', handleEnabledChange);
       fieldSelect.removeEventListener('change', handleFieldChanged);

@@ -40,6 +40,9 @@ export class DataState extends EventEmitter {
     this.varData = null;
     this._obsFieldDescriptors = Object.freeze([]);
     this._varFieldDescriptors = Object.freeze([]);
+    // Monotonic scientific dataset owner. Async field loads capture this value
+    // and may publish only while the exact generation remains current.
+    this._datasetGeneration = 0;
     this.activeFieldIndex = -1;
     this.activeVarFieldIndex = -1;
     this.activeFieldSource = null; // 'obs', 'var', or null

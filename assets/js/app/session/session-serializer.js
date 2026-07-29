@@ -222,6 +222,61 @@ function throwIfAborted(signal) {
   }
 }
 
+function captureSessionDatasetOwner(ctx) {
+  const state = ctx.state;
+  const getGeneration = requireMethod(
+    state,
+    'getDatasetGeneration',
+    'Session capture DataState'
+  );
+  const generation = assertSafeInteger(
+    getGeneration.call(state),
+    'Session capture dataset generation'
+  );
+  return Object.freeze({
+    fingerprint: Object.freeze(getDatasetFingerprint(ctx)),
+    generation,
+    obsData: state.obsData,
+    obsFields: state.obsData?.fields,
+    positionsArray: state.positionsArray,
+    state,
+    varData: state.varData,
+    varFields: state.varData?.fields
+  });
+}
+
+function assertSessionDatasetOwner(ctx, owner) {
+  const state = ctx.state;
+  const getGeneration = requireMethod(
+    state,
+    'getDatasetGeneration',
+    'Session capture DataState'
+  );
+  const generation = assertSafeInteger(
+    getGeneration.call(state),
+    'Session capture dataset generation'
+  );
+  if (
+    state !== owner.state
+    || generation !== owner.generation
+    || state.obsData !== owner.obsData
+    || state.obsData?.fields !== owner.obsFields
+    || state.positionsArray !== owner.positionsArray
+    || state.varData !== owner.varData
+    || state.varData?.fields !== owner.varFields
+    || !datasetFingerprintMatches(
+      owner.fingerprint,
+      getDatasetFingerprint(ctx)
+    )
+  ) {
+    const error = new Error(
+      'Session capture dataset generation changed before capture completed.'
+    );
+    error.code = 'SESSION_CAPTURE_DATASET_CHANGED';
+    throw error;
+  }
+}
+
 /**
  * Yield back to the browser so rendering stays responsive.
  * @returns {Promise<void>}
@@ -780,6 +835,12 @@ export class SessionSerializer {
     this._activeRestoreTask = null;
     /** @type {Promise<void>|null} */
     this._activeLazyTask = null;
+    /** @type {(() => Promise<void>|void)|null} */
+    this._captureSettlement = null;
+    /** @type {(() => Promise<void>|void)|null} */
+    this._restoreSettlement = null;
+    /** @type {Promise<void>} */
+    this._stateOperationTail = Promise.resolve();
   }
 
   /**
@@ -813,6 +874,112 @@ export class SessionSerializer {
       cinematicCamera,
       'Session cinematic camera'
     );
+  }
+
+  /**
+   * Bind the exact UI-mutation settlement required before contributors read
+   * session state. The UI owner is installed once after bootstrap.
+   *
+   * @param {() => Promise<void>|void} settle
+   */
+  setCaptureSettlement(settle) {
+    if (typeof settle !== 'function') {
+      throw new TypeError(
+        'Session capture settlement must be a function.'
+      );
+    }
+    if (
+      this._captureSettlement !== null
+      && this._captureSettlement !== settle
+    ) {
+      throw new Error(
+        'Session capture settlement is already owned.'
+      );
+    }
+    this._captureSettlement = settle;
+  }
+
+  /**
+   * Bind synchronous invalidation plus drainage required before any restore
+   * contributor snapshots or replaces current UI-backed state.
+   *
+   * @param {() => Promise<void>|void} settle
+   */
+  setRestoreSettlement(settle) {
+    if (typeof settle !== 'function') {
+      throw new TypeError(
+        'Session restore settlement must be a function.'
+      );
+    }
+    if (
+      this._restoreSettlement !== null
+      && this._restoreSettlement !== settle
+    ) {
+      throw new Error(
+        'Session restore settlement is already owned.'
+      );
+    }
+    this._restoreSettlement = settle;
+  }
+
+  /**
+   * Serialize every operation that reads or mutates contributor-backed state.
+   * The public task preserves the exact operation outcome while the internal
+   * tail always settles so one failure cannot poison later work.
+   *
+   * @template T
+   * @param {() => Promise<T>|T} operation
+   * @returns {Promise<T>}
+   */
+  _runExclusiveStateOperation(operation) {
+    if (typeof operation !== 'function') {
+      throw new TypeError(
+        'Session state operation must be a function.'
+      );
+    }
+    const task = this._stateOperationTail.then(operation);
+    this._stateOperationTail = task.then(
+      () => {},
+      () => {}
+    );
+    return task;
+  }
+
+  async _runSettlementLease(settle, label, operation) {
+    let release = null;
+    let failure = null;
+    let value;
+    try {
+      if (settle !== null) {
+        const candidate = await settle();
+        if (
+          candidate !== undefined
+          && typeof candidate !== 'function'
+        ) {
+          throw new TypeError(
+            `${label} must return a release function or undefined.`
+          );
+        }
+        release = candidate ?? null;
+      }
+      value = await operation();
+    } catch (error) {
+      failure = error;
+    }
+    if (release !== null) {
+      try {
+        await release();
+      } catch (releaseError) {
+        failure = failure === null
+          ? releaseError
+          : new AggregateError(
+              [failure, releaseError],
+              `${label} operation and release both failed.`
+            );
+      }
+    }
+    if (failure !== null) throw failure;
+    return value;
   }
 
   /**
@@ -889,7 +1056,7 @@ export class SessionSerializer {
       }
     }
 
-    const ownedTask = (async () => {
+    const ownedTask = this._runExclusiveStateOperation(async () => {
       if (previousTask !== null) {
         try {
           await previousTask;
@@ -898,7 +1065,19 @@ export class SessionSerializer {
         }
       }
       throwIfAborted(abortController.signal);
+      let releaseSettlement = null;
+      let failure = null;
       try {
+        if (this._restoreSettlement !== null) {
+          const release = await this._restoreSettlement();
+          if (release !== undefined && typeof release !== 'function') {
+            throw new TypeError(
+              'Session restore settlement must return a release function or undefined.'
+            );
+          }
+          releaseSettlement = release ?? null;
+          throwIfAborted(abortController.signal);
+        }
         await operation(abortController);
       } catch (error) {
         if (
@@ -912,11 +1091,25 @@ export class SessionSerializer {
             )
           )
         ) {
-          throw abortController.signal.reason;
+          failure = abortController.signal.reason;
+        } else {
+          failure = error;
         }
-        throw error;
       }
-    })();
+      if (releaseSettlement !== null) {
+        try {
+          await releaseSettlement();
+        } catch (releaseError) {
+          failure = failure === null
+            ? releaseError
+            : new AggregateError(
+                [failure, releaseError],
+                'Session restore and UI settlement release both failed.'
+              );
+        }
+      }
+      if (failure !== null) throw failure;
+    });
 
     this._activeRestoreAbort = abortController;
     this._activeRestoreTask = ownedTask;
@@ -936,17 +1129,34 @@ export class SessionSerializer {
    * Create a `.cellucid-session` bundle Blob.
    * @returns {Promise<Blob>}
    */
-  async createSessionBundle() {
+  createSessionBundle() {
+    return this._runExclusiveStateOperation(
+      () => this._createSessionBundle()
+    );
+  }
+
+  async _createSessionBundle() {
+    return this._runSettlementLease(
+      this._captureSettlement,
+      'Session capture settlement',
+      () => this._captureSessionBundlePayload()
+    );
+  }
+
+  async _captureSessionBundlePayload() {
     const ctx = buildSessionContext(this._base, {
       abortSignal: null,
       restoreTransaction: null
     });
+    const datasetOwner = captureSessionDatasetOwner(ctx);
 
     /** @type {SessionChunk[]} */
     const emittedChunks = [];
     const emittedChunkIds = new Set();
     for (const contributor of this._contributors) {
+      assertSessionDatasetOwner(ctx, datasetOwner);
       const produced = await contributor.capture(ctx);
+      assertSessionDatasetOwner(ctx, datasetOwner);
       if (!Array.isArray(produced)) {
         throw new TypeError(
           `Session contributor "${contributor.id}" capture() must return an array`
@@ -1016,7 +1226,7 @@ export class SessionSerializer {
 
     const manifest = {
       createdAt: new Date().toISOString(),
-      datasetFingerprint: getDatasetFingerprint(ctx),
+      datasetFingerprint: datasetOwner.fingerprint,
       chunks: manifestChunks
     };
 

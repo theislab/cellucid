@@ -83,16 +83,33 @@ export class GenesPanelController {
     /** @type {boolean} */
     this._initialized = false;
 
+    /** @type {Promise<void>|null} Exact shared initialization owner */
+    this._initPromise = null;
+
     /** @type {AbortController|null} Current operation abort controller */
     this._currentAbortController = null;
+
+    /** @type {Set<Promise<unknown>>} Public operations that still own cache state */
+    this._activeOperations = new Set();
+
+    /** @type {boolean} */
+    this._closed = false;
+
+    /** @type {boolean} */
+    this._cacheClosed = false;
+
+    /** @type {Promise<void>|null} */
+    this._closePromise = null;
   }
 
   /**
    * Initialize the controller and all engines
    * @returns {Promise<void>}
    */
-  async init() {
-    if (this._initialized) return;
+  init() {
+    this._assertOpen();
+    if (this._initialized) return Promise.resolve();
+    if (this._initPromise !== null) return this._initPromise;
 
     // Initialize engines
     this._discoveryEngine = new MarkerDiscoveryEngine({
@@ -116,8 +133,38 @@ export class GenesPanelController {
       cacheVersion: this._config.cacheVersion,
       datasetId: this._getDatasetId()
     });
-    await this._cache.init();
-    this._initialized = true;
+    const ownedCache = this._cache;
+
+    const initTask = (async () => {
+      try {
+        await ownedCache.init();
+        this._assertOpen();
+        this._initialized = true;
+      } catch (error) {
+        if (!this._closed && this._cache === ownedCache) {
+          let closeError;
+          try {
+            ownedCache.close();
+          } catch (candidate) {
+            closeError = candidate;
+          }
+          this._discoveryEngine = null;
+          this._matrixBuilder = null;
+          this._clusteringEngine = null;
+          this._cache = null;
+          this._initPromise = null;
+          if (closeError !== undefined) {
+            throw new AggregateError(
+              [error, closeError],
+              'Genes Panel initialization and cache cleanup both failed'
+            );
+          }
+        }
+        throw error;
+      }
+    })();
+    this._initPromise = initTask;
+    return initTask;
   }
 
   /**
@@ -142,69 +189,118 @@ export class GenesPanelController {
    * @param {Function} [options.onPartialResults] - Partial results callback
    * @returns {Promise<GenesPanelResult>} Complete analysis result
    */
-  async runAnalysis(options) {
-    await this.init();
-    this._syncCacheDatasetId();
+  runAnalysis(options) {
+    return this._trackPublicOperation(() => {
+      // Supersession ownership must be installed before the first await so an
+      // immediate abort/close can cancel the operation in the same turn.
+      this.abort();
+      const abortController = new AbortController();
+      this._currentAbortController = abortController;
+      return this._runAnalysis(options, abortController);
+    });
+  }
 
-    const {
-      obsCategory,
-      mode = 'clustered',
-      customGenes = null,
-      topNPerGroup = this._config.topNPerGroup,
-      method = this._config.method,
-      transform = this._config.transform,
-      distance = this._config.distance,
-      linkage = this._config.linkage,
-      clusterRows = this._config.clusterRows,
-      clusterCols = this._config.clusterCols,
-      pValueThreshold = this._config.pValueThreshold,
-      foldChangeThreshold = this._config.foldChangeThreshold,
-      useAdjustedPValue = this._config.useAdjustedPValue,
-      useCache = true,
-      parallelism = 'auto',
-      batchConfig = {},
-      onProgress,
-      onPartialResults
-    } = options;
-
-    // Cancel any previous operation
-    this.abort();
-    const abortController = new AbortController();
-    this._currentAbortController = abortController;
+  async _runAnalysis(options, abortController) {
     const signal = abortController.signal;
-
-    const startTime = performance.now();
+    const throwIfAborted = () => {
+      if (signal.aborted) {
+        throw signal.reason ??
+          new DOMException('Request aborted', 'AbortError');
+      }
+      this._assertOpen();
+    };
 
     try {
+      if (!options || typeof options !== 'object' || Array.isArray(options)) {
+        throw new TypeError('[GenesPanelController] analysis options must be an object');
+      }
+      const {
+        obsCategory,
+        mode = 'clustered',
+        customGenes: requestedCustomGenes = null,
+        topNPerGroup = this._config.topNPerGroup,
+        method = this._config.method,
+        transform = this._config.transform,
+        distance = this._config.distance,
+        linkage = this._config.linkage,
+        clusterRows = this._config.clusterRows,
+        clusterCols = this._config.clusterCols,
+        pValueThreshold = this._config.pValueThreshold,
+        foldChangeThreshold = this._config.foldChangeThreshold,
+        useAdjustedPValue = this._config.useAdjustedPValue,
+        useCache = true,
+        parallelism = 'auto',
+        batchConfig: requestedBatchConfig = {},
+        onProgress,
+        onPartialResults
+      } = options;
+      for (const [name, callback] of [
+        ['onProgress', onProgress],
+        ['onPartialResults', onPartialResults]
+      ]) {
+        if (callback !== undefined && typeof callback !== 'function') {
+          throw new TypeError(
+            `[GenesPanelController] ${name} must be a function when provided`
+          );
+        }
+      }
+      if (
+        requestedBatchConfig === null ||
+        typeof requestedBatchConfig !== 'object' ||
+        Array.isArray(requestedBatchConfig)
+      ) {
+        throw new TypeError(
+          '[GenesPanelController] batchConfig must be an object'
+        );
+      }
+      const customGenes = Array.isArray(requestedCustomGenes)
+        ? [...requestedCustomGenes]
+        : requestedCustomGenes;
+      const batchConfig = structuredClone(requestedBatchConfig);
+
+      await this.init();
+      throwIfAborted();
+      this._syncCacheDatasetId();
+
+      const reportProgress = onProgress === undefined
+        ? undefined
+        : update => {
+          if (!signal.aborted) onProgress(update);
+        };
+      const reportPartialResults = onPartialResults === undefined
+        ? undefined
+        : update => {
+          if (!signal.aborted) onPartialResults(update);
+        };
+
+      const startTime = performance.now();
+
       // Report init phase
-      if (onProgress) {
-        onProgress({
+      if (reportProgress) {
+        reportProgress({
           phase: ANALYSIS_PHASES.INIT,
           progress: 0,
           message: 'Initializing analysis...'
         });
       }
 
-      const throwIfAborted = () => {
-        if (signal?.aborted) {
-          throw new DOMException('Request aborted', 'AbortError');
-        }
-      };
-
       // Get groups from observation category
-      if (onProgress) {
-        onProgress({
+      if (reportProgress) {
+        reportProgress({
           phase: ANALYSIS_PHASES.INIT,
           progress: 5,
           message: `Loading groups for "${obsCategory}"...`
         });
       }
-      const { groups, obsCodes } = await this._getGroupsFromCategory(obsCategory, { onProgress, signal });
+      const { groups, obsCodes } = await this._getGroupsFromCategory(
+        obsCategory,
+        { onProgress: reportProgress, signal }
+      );
       throwIfAborted();
 
       // Handle custom mode
       if (mode === 'custom' && customGenes) {
-        return await this._runCustomAnalysis({
+        const customResult = await this._runCustomAnalysis({
           groups,
           genes: customGenes,
           transform,
@@ -212,13 +308,23 @@ export class GenesPanelController {
           linkage,
           clusterRows,
           clusterCols,
-          onProgress,
+          batchConfig,
+          onProgress: reportProgress,
           signal
         });
+        throwIfAborted();
+        return customResult;
       }
 
       // Check cache for markers
-      const cacheParams = { method, topNPerGroup, pValueThreshold, foldChangeThreshold };
+      const cacheParams = {
+        method,
+        topNPerGroup,
+        pValueThreshold,
+        foldChangeThreshold,
+        useAdjustedPValue,
+        minCells: this._config.minCells
+      };
       let markers = null;
       let cacheHit = false;
 
@@ -226,8 +332,8 @@ export class GenesPanelController {
         markers = await this._cache.get(obsCategory, cacheParams);
         if (markers) {
           cacheHit = true;
-          if (onProgress) {
-            onProgress({
+          if (reportProgress) {
+            reportProgress({
               phase: ANALYSIS_PHASES.DISCOVERY,
               progress: 100,
               message: 'Using cached markers'
@@ -250,8 +356,8 @@ export class GenesPanelController {
           useAdjustedPValue,
           parallelism,
           batchConfig,
-          onProgress,
-          onPartialResults,
+          onProgress: reportProgress,
+          onPartialResults: reportPartialResults,
           signal
         });
         throwIfAborted();
@@ -259,6 +365,7 @@ export class GenesPanelController {
         // Cache results
         if (useCache) {
           await this._cache.set(obsCategory, markers, cacheParams);
+          throwIfAborted();
         }
       }
 
@@ -283,7 +390,7 @@ export class GenesPanelController {
         groups,
         transform,
         batchConfig,
-        onProgress,
+        onProgress: reportProgress,
         signal
       });
       throwIfAborted();
@@ -299,7 +406,7 @@ export class GenesPanelController {
           clusterCols,
           distance,
           linkage,
-          onProgress,
+          onProgress: reportProgress,
           signal
         });
         throwIfAborted();
@@ -307,13 +414,14 @@ export class GenesPanelController {
       }
 
       // Report render phase
-      if (onProgress) {
-        onProgress({
+      if (reportProgress) {
+        reportProgress({
           phase: ANALYSIS_PHASES.RENDER,
           progress: 100,
           message: 'Analysis complete'
         });
       }
+      throwIfAborted();
 
       const duration = performance.now() - startTime;
 
@@ -362,9 +470,22 @@ export class GenesPanelController {
    * @param {{ onProgress?: Function, signal?: AbortSignal }} [options]
    * @returns {Promise<{ groups: any[], obsCodes: Uint16Array }>}
    */
-  async getGroupsAndCodes(obsCategory, options = {}) {
-    await this.init();
-    return this._getGroupsFromCategory(obsCategory, options);
+  getGroupsAndCodes(obsCategory, options = {}) {
+    return this._trackPublicOperation(() => {
+      const ownedOptions =
+        options !== null &&
+        typeof options === 'object' &&
+        !Array.isArray(options)
+          ? {
+              onProgress: options.onProgress,
+              signal: options.signal
+            }
+          : options;
+      return (async () => {
+        await this.init();
+        return this._getGroupsFromCategory(obsCategory, ownedOptions);
+      })();
+    });
   }
 
   /**
@@ -381,12 +502,49 @@ export class GenesPanelController {
    * @param {AbortSignal} [options.signal]
    * @returns {Promise<any>}
    */
-  async buildMatrixForGenes(options) {
-    await this.init();
-    if (!this._matrixBuilder) {
-      throw new Error('[GenesPanelController] Matrix builder not initialized');
-    }
-    return this._matrixBuilder.buildMatrix(options);
+  buildMatrixForGenes(options) {
+    return this._trackPublicOperation(() => {
+      let ownedOptions = options;
+      if (
+        options !== null &&
+        typeof options === 'object' &&
+        !Array.isArray(options)
+      ) {
+        const ownedGroups = Array.isArray(options.groups)
+          ? options.groups.map(group => (
+              group !== null &&
+              typeof group === 'object' &&
+              !Array.isArray(group)
+                ? { ...group }
+                : group
+            ))
+          : options.groups;
+        const ownedBatchConfig =
+          options.batchConfig !== null &&
+          typeof options.batchConfig === 'object' &&
+          !Array.isArray(options.batchConfig)
+            ? { ...options.batchConfig }
+            : options.batchConfig;
+        ownedOptions = {
+          genes: Array.isArray(options.genes)
+            ? [...options.genes]
+            : options.genes,
+          groups: ownedGroups,
+          transform: options.transform,
+          batchConfig: ownedBatchConfig,
+          onProgress: options.onProgress,
+          signal: options.signal
+        };
+      }
+
+      return (async () => {
+        await this.init();
+        if (!this._matrixBuilder) {
+          throw new Error('[GenesPanelController] Matrix builder not initialized');
+        }
+        return this._matrixBuilder.buildMatrix(ownedOptions);
+      })();
+    });
   }
 
   /**
@@ -400,41 +558,76 @@ export class GenesPanelController {
    * @param {boolean} [options.clusterCols]
    * @returns {Promise<GenesPanelResult>} Updated result
    */
-  async recluster(result, options) {
-    await this.init();
+  recluster(result, options) {
+    return this._trackPublicOperation(() => {
+      const {
+        distance = result.metadata?.distance || this._config.distance,
+        linkage = result.metadata?.linkage || this._config.linkage,
+        clusterRows = result.metadata?.clusterRows ?? this._config.clusterRows,
+        clusterCols = result.metadata?.clusterCols ?? this._config.clusterCols
+      } = options;
 
-    const {
-      distance = result.metadata?.distance || this._config.distance,
-      linkage = result.metadata?.linkage || this._config.linkage,
-      clusterRows = result.metadata?.clusterRows ?? this._config.clusterRows,
-      clusterCols = result.metadata?.clusterCols ?? this._config.clusterCols
-    } = options;
+      // Get original (unordered) matrix
+      const requestedMatrix = result.matrix;
+      const matrix =
+        requestedMatrix !== null &&
+        typeof requestedMatrix === 'object' &&
+        !Array.isArray(requestedMatrix)
+          ? {
+              ...requestedMatrix,
+              genes: Array.isArray(requestedMatrix.genes)
+                ? [...requestedMatrix.genes]
+                : requestedMatrix.genes,
+              groupIds: Array.isArray(requestedMatrix.groupIds)
+                ? [...requestedMatrix.groupIds]
+                : requestedMatrix.groupIds,
+              groupNames: Array.isArray(requestedMatrix.groupNames)
+                ? [...requestedMatrix.groupNames]
+                : requestedMatrix.groupNames,
+              groupColors: Array.isArray(requestedMatrix.groupColors)
+                ? [...requestedMatrix.groupColors]
+                : requestedMatrix.groupColors
+            }
+          : requestedMatrix;
+      const metadata =
+        result.metadata !== null &&
+        typeof result.metadata === 'object' &&
+        !Array.isArray(result.metadata)
+          ? { ...result.metadata }
+          : result.metadata;
+      const ownedResult = {
+        ...result,
+        matrix,
+        metadata
+      };
 
-    // Get original (unordered) matrix
-    const matrix = result.matrix;
+      return (async () => {
+        await this.init();
 
-    // Recluster
-    const clustering = await this._clusteringEngine.clusterMatrix({
-      matrix,
-      clusterRows,
-      clusterCols,
-      distance,
-      linkage
+        // Recluster
+        const clustering = await this._clusteringEngine.clusterMatrix({
+          matrix,
+          clusterRows,
+          clusterCols,
+          distance,
+          linkage
+        });
+
+        // Apply ordering
+        const orderedMatrix = this._clusteringEngine.applyOrdering(matrix, clustering);
+
+        return {
+          ...ownedResult,
+          matrix: orderedMatrix,
+          clustering,
+          metadata: {
+            ...metadata,
+            distance,
+            linkage
+          }
+        };
+      })();
     });
-
-    // Apply ordering
-    const orderedMatrix = this._clusteringEngine.applyOrdering(matrix, clustering);
-
-    return {
-      ...result,
-      matrix: orderedMatrix,
-      clustering,
-      metadata: {
-        ...result.metadata,
-        distance,
-        linkage
-      }
-    };
   }
 
   /**
@@ -445,6 +638,7 @@ export class GenesPanelController {
    * @returns {GenesPanelResult} Updated result
    */
   retransform(result, transform) {
+    this._assertOpen();
     const newMatrix = this._matrixBuilder.retransform(result.matrix, transform);
 
     return {
@@ -462,6 +656,7 @@ export class GenesPanelController {
    * @returns {string[]}
    */
   getAvailableCategories() {
+    this._assertOpen();
     return this.dataLayer.getAvailableVariables('categorical_obs').map(v => v.key);
   }
 
@@ -479,25 +674,76 @@ export class GenesPanelController {
    * Clear all caches
    * @returns {Promise<void>}
    */
-  async clearCache() {
-    if (this._cache) {
+  clearCache() {
+    return this._trackPublicOperation(async () => {
+      await this.init();
       await this._cache.clear();
-    }
+    });
   }
 
   /**
    * Close and cleanup
    */
   close() {
+    if (this._closePromise !== null) return this._closePromise;
+
+    this._closed = true;
     this.abort();
-    if (this._cache) {
-      this._cache.close();
+    const pending = [...this._activeOperations];
+    if (
+      !this._initialized &&
+      this._initPromise !== null &&
+      !pending.includes(this._initPromise)
+    ) {
+      pending.push(this._initPromise);
     }
+
+    if (pending.length === 0) {
+      if (!this._cacheClosed && this._cache !== null) {
+        this._cache.close();
+        this._cacheClosed = true;
+      }
+      this._closePromise = Promise.resolve();
+      return this._closePromise;
+    }
+
+    this._closePromise = Promise.allSettled(pending).then(() => {
+      if (this._cacheClosed || this._cache === null) return;
+      this._cache.close();
+      this._cacheClosed = true;
+    });
+    return this._closePromise;
   }
 
   // ===========================================================================
   // PRIVATE METHODS
   // ===========================================================================
+
+  _assertOpen() {
+    if (this._closed) {
+      throw new Error('[GenesPanelController] controller is closed');
+    }
+  }
+
+  _trackPublicOperation(operation) {
+    this._assertOpen();
+    if (typeof operation !== 'function') {
+      throw new TypeError('Tracked Genes Panel operation must be a function');
+    }
+
+    let task;
+    try {
+      task = Promise.resolve(operation());
+    } catch (error) {
+      task = Promise.reject(error);
+    }
+    this._activeOperations.add(task);
+    const release = () => {
+      this._activeOperations.delete(task);
+    };
+    task.then(release, release);
+    return task;
+  }
 
   /**
    * Get dataset identifier for cache keys
@@ -808,9 +1054,18 @@ export class GenesPanelController {
       linkage,
       clusterRows,
       clusterCols,
+      batchConfig,
       onProgress,
       signal
     } = options;
+    const throwIfAborted = () => {
+      if (signal?.aborted) {
+        throw signal.reason ??
+          new DOMException('Request aborted', 'AbortError');
+      }
+      this._assertOpen();
+    };
+    throwIfAborted();
 
     if (
       !Array.isArray(genes) ||
@@ -864,9 +1119,11 @@ export class GenesPanelController {
       genes: [...genes],
       groups,
       transform,
+      batchConfig,
       onProgress,
       signal
     });
+    throwIfAborted();
 
     // Cluster if requested
     let clustering = null;
@@ -882,9 +1139,11 @@ export class GenesPanelController {
         onProgress,
         signal
       });
+      throwIfAborted();
 
       orderedMatrix = this._clusteringEngine.applyOrdering(matrix, clustering);
     }
+    throwIfAborted();
 
     return {
       markers: null, // No marker discovery for custom genes

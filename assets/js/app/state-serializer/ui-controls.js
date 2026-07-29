@@ -237,16 +237,61 @@ function validateCompleteControls(controls, inventory) {
   }
 }
 
-function dispatchControlEvent(element, type) {
-  element.dispatchEvent(new Event(type, { bubbles: true }));
+function dispatchControlEvent(id, element, type) {
+  const ownerWindow = element?.ownerDocument?.defaultView ?? null;
+  if (
+    ownerWindow === null
+    || typeof ownerWindow.addEventListener !== 'function'
+    || typeof ownerWindow.removeEventListener !== 'function'
+  ) {
+    element.dispatchEvent(new Event(type, { bubbles: true }));
+    return;
+  }
+
+  let listenerFailure = null;
+  const captureListenerFailure = (event) => {
+    if (listenerFailure === null) {
+      listenerFailure = event.error instanceof Error
+        ? event.error
+        : new Error(
+          typeof event.message === 'string' && event.message.length > 0
+            ? event.message
+            : `Session UI control "${id}" listener failed.`,
+        );
+    }
+    if (event.cancelable) event.preventDefault();
+  };
+  ownerWindow.addEventListener('error', captureListenerFailure, true);
+  let dispatchFailure = null;
+  try {
+    const EventConstructor = typeof ownerWindow.Event === 'function'
+      ? ownerWindow.Event
+      : Event;
+    element.dispatchEvent(new EventConstructor(type, { bubbles: true }));
+  } catch (error) {
+    dispatchFailure = error instanceof Error
+      ? error
+      : new Error(
+        `Session UI control "${id}" dispatch failed with a non-Error value.`,
+      );
+  } finally {
+    ownerWindow.removeEventListener('error', captureListenerFailure, true);
+  }
+  if (dispatchFailure !== null) throw dispatchFailure;
+  if (listenerFailure !== null) throw listenerFailure;
 }
 
-function restoreValidatedControl(entry, data) {
+function restoreValidatedControl(id, entry, data) {
   const { element, type } = entry;
   if (type === 'checkbox') {
     if (element.checked !== data.checked) {
       element.checked = data.checked;
-      dispatchControlEvent(element, 'change');
+      dispatchControlEvent(id, element, 'change');
+      if (element.checked !== data.checked) {
+        throw new Error(
+          `Session UI control "${id}" rejected its restored checked state.`,
+        );
+      }
     }
     return;
   }
@@ -256,14 +301,28 @@ function restoreValidatedControl(entry, data) {
   }
   if (element.value === data.value) return;
   element.value = data.value;
-  dispatchControlEvent(element, type === 'select' ? 'change' : 'input');
+  dispatchControlEvent(
+    id,
+    element,
+    type === 'select' ? 'change' : 'input',
+  );
+  if (element.value !== data.value) {
+    throw new Error(
+      `Session UI control "${id}" rejected restored value "${data.value}".`,
+    );
+  }
 }
 
 function assertRestoreOptions(options) {
   assertPlainRecord(options, 'Session UI restore options');
+  const expectedKeys = [];
+  if (Object.hasOwn(options, 'abortSignal')) expectedKeys.push('abortSignal');
+  if (Object.hasOwn(options, 'deferControlIds')) {
+    expectedKeys.push('deferControlIds');
+  }
   assertExactKeys(
     options,
-    Object.hasOwn(options, 'abortSignal') ? ['abortSignal'] : [],
+    expectedKeys,
     'Session UI restore options',
   );
   if (
@@ -272,6 +331,21 @@ function assertRestoreOptions(options) {
     && typeof options.abortSignal?.aborted !== 'boolean'
   ) {
     throw new TypeError('Session UI abortSignal must expose a boolean aborted state.');
+  }
+  if (Object.hasOwn(options, 'deferControlIds')) {
+    if (!Array.isArray(options.deferControlIds)) {
+      throw new TypeError('Session UI deferControlIds must be an array.');
+    }
+    const ids = new Set();
+    for (const id of options.deferControlIds) {
+      assertStableId(id, 'Every deferred session UI control id');
+      if (ids.has(id)) {
+        throw new TypeError(
+          `Session UI deferControlIds contains duplicate id "${id}".`,
+        );
+      }
+      ids.add(id);
+    }
   }
 }
 
@@ -293,29 +367,58 @@ export function createUiControlSerializer({ sidebar }) {
     return controls;
   }
 
+  function validateUIControls(controls) {
+    const inventory = buildCurrentInventory(sidebar);
+    validateCompleteControls(controls, inventory);
+  }
+
   function restoreUIControls(controls, options = {}) {
     assertRestoreOptions(options);
     const abortSignal = Object.hasOwn(options, 'abortSignal')
       ? options.abortSignal
       : null;
+    const deferredIds = new Set(options.deferControlIds ?? []);
     if (abortSignal?.aborted) {
       throw new DOMException('Aborted', 'AbortError');
     }
 
     const inventory = buildCurrentInventory(sidebar);
     validateCompleteControls(controls, inventory);
-
-    const restoreOrder = ['details', 'checkbox', 'select', 'range', 'number', 'color', 'text'];
-    for (const type of restoreOrder) {
-      for (const [id, entry] of inventory) {
-        if (entry.type !== type) continue;
-        if (abortSignal?.aborted) {
-          throw new DOMException('Aborted', 'AbortError');
-        }
-        restoreValidatedControl(entry, controls[id]);
+    for (const id of deferredIds) {
+      if (!inventory.has(id)) {
+        throw new RangeError(
+          `Deferred session UI control "${id}" does not exist in the current interface.`,
+        );
       }
     }
+    const stagedControls = new Map();
+    for (const [id, entry] of inventory) {
+      stagedControls.set(id, {
+        entry,
+        data: { ...controls[id] },
+      });
+    }
+
+    const restoreOrder = ['details', 'checkbox', 'select', 'range', 'number', 'color', 'text'];
+    function restoreMatchingControls(restoreDeferred) {
+      for (const type of restoreOrder) {
+        for (const [id, staged] of stagedControls) {
+          if (staged.entry.type !== type) continue;
+          if (deferredIds.has(id) !== restoreDeferred) continue;
+          if (abortSignal?.aborted) {
+            throw new DOMException('Aborted', 'AbortError');
+          }
+          restoreValidatedControl(id, staged.entry, staged.data);
+        }
+      }
+    }
+    restoreMatchingControls(false);
+    return () => restoreMatchingControls(true);
   }
 
-  return { collectUIControls, restoreUIControls };
+  return {
+    collectUIControls,
+    restoreUIControls,
+    validateUIControls,
+  };
 }

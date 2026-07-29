@@ -16,7 +16,7 @@ import { TransformPipeline, createTransformPipeline } from './data/transform-pip
 import { createLayoutEngine } from './plots/layout-engine.js';
 import { createMultiVariableAnalysis } from './stats/multi-variable-analysis.js';
 import { runStatisticalTests as runStats } from './stats/statistical-tests.js';
-import { loadPlotly, purgePlot } from './plots/plotly-loader.js';
+import { loadPlotly } from './plots/plotly-loader.js';
 import { getNotificationCenter } from '../notification-center.js';
 import { getMemoryMonitor } from './shared/memory-monitor.js';
 import { clearActiveSourceCaches } from './shared/resource-cleanup.js';
@@ -92,6 +92,8 @@ export class ComparisonModule {
     this._currentPageData = null;
     this._datasetReloadResetCount = 0;
     this._lastDatasetReloadReset = null;
+    this._destroyPromise = null;
+    this._datasetResetPromise = null;
 
     // Current state (shared across analysis UIs)
     this.currentConfig = {
@@ -115,13 +117,15 @@ export class ComparisonModule {
 
     // Register with memory monitor for automatic cleanup
     this._memoryMonitor = getMemoryMonitor();
-    this._memoryMonitor.registerCleanupHandler('comparison-module', (reason) => {
+    this._memoryMonitor.registerCleanupHandler('comparison-module', async (reason) => {
       const cleanupErrors = [];
+      const cleanupTasks = [];
       const cleanup = operation => {
         try {
-          operation();
+          return operation();
         } catch (error) {
           cleanupErrors.push(error);
+          return undefined;
         }
       };
 
@@ -144,20 +148,19 @@ export class ComparisonModule {
           modals = document.querySelectorAll('.analysis-modal');
         });
         for (const modal of modals) {
-          cleanup(() => closeModal(modal));
-        }
-
-        let previewPlots = [];
-        cleanup(() => {
-          previewPlots = document.querySelectorAll(
-            '.analysis-preview-plot'
-          );
-        });
-        for (const plotEl of previewPlots) {
-          cleanup(() => purgePlot(plotEl));
+          const closeTask = cleanup(() => closeModal(modal));
+          if (closeTask && typeof closeTask.then === 'function') {
+            cleanupTasks.push(closeTask);
+          }
         }
       }
 
+      const outcomes = await Promise.allSettled(cleanupTasks);
+      cleanupErrors.push(
+        ...outcomes
+          .filter(outcome => outcome.status === 'rejected')
+          .map(outcome => outcome.reason)
+      );
       if (cleanupErrors.length === 1) throw cleanupErrors[0];
       if (cleanupErrors.length > 1) {
         throw new AggregateError(
@@ -288,15 +291,41 @@ export class ComparisonModule {
         const headerTitle = header?.querySelector?.('.analysis-accordion-title')?.textContent?.trim?.() || '';
         const headerDesc = header?.querySelector?.('.analysis-accordion-desc')?.textContent?.trim?.() || '';
 
-        this._analysisWindowManager?.copyFromEmbedded?.(mode, {
-          sourceRect,
-          preferredSize: {
-            width: sectionRect?.width ?? itemRect.width,
-            height: isExpanded ? itemRect.height : undefined
-          },
-          headerTitle,
-          headerDesc
-        });
+        try {
+          const creation = this._analysisWindowManager?.copyFromEmbedded?.(
+            mode,
+            {
+              sourceRect,
+              preferredSize: {
+                width: sectionRect?.width ?? itemRect.width,
+                height: isExpanded ? itemRect.height : undefined
+              },
+              headerTitle,
+              headerDesc
+            }
+          );
+          if (creation && typeof creation.then === 'function') {
+            void creation.catch(error => {
+              console.error(
+                '[ComparisonModule] Analysis window creation failed:',
+                error
+              );
+              this._notifications.error(
+                `Could not create the analysis window: ${error.message}`,
+                { category: 'analysis', title: 'Analysis Window Error' }
+              );
+            });
+          }
+        } catch (error) {
+          console.error(
+            '[ComparisonModule] Analysis window creation failed:',
+            error
+          );
+          this._notifications.error(
+            `Could not create the analysis window: ${error.message}`,
+            { category: 'analysis', title: 'Analysis Window Error' }
+          );
+        }
       });
     });
 
@@ -784,41 +813,121 @@ export class ComparisonModule {
 
   /**
    * Cleanup and destroy the module
+   * @returns {Promise<void>}
    */
   destroy() {
-    // Unregister from memory monitor
-    if (this._memoryMonitor) {
-      this._memoryMonitor.unregisterCleanupHandler('comparison-module');
+    if (this._destroyPromise != null) return this._destroyPromise;
+    const memoryMonitor = this._memoryMonitor;
+    const windowManager = this._analysisWindowManager;
+    const uiManager = this._uiManager;
+    const dataLayer = this.dataLayer;
+    const datasetResetTask = this._datasetResetPromise;
+
+    this._destroyPromise = Promise.resolve().then(async () => {
+      const errors = [];
+      let memoryHandlerDrain = null;
+      if (memoryMonitor !== null && memoryMonitor !== undefined) {
+        try {
+          memoryHandlerDrain = memoryMonitor.unregisterCleanupHandler(
+            'comparison-module'
+          );
+        } catch (error) {
+          errors.push(error);
+        }
+      }
       this._memoryMonitor = null;
-    }
 
-    // Close any floating analysis windows first (they may hold UI/WebGL resources).
-    if (this._analysisWindowManager) {
-      this._analysisWindowManager.closeAll();
+      if (memoryHandlerDrain !== null && memoryHandlerDrain !== undefined) {
+        try {
+          await memoryHandlerDrain;
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+
+      // A dataset reset owns both managers until it has fully settled. Retire
+      // those managers only after that owner releases them; otherwise destroy()
+      // can race reset-owned close/reset work on the same child instances.
+      if (datasetResetTask != null) {
+        try {
+          await datasetResetTask;
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+
+      const ownerTasks = [];
+      if (windowManager !== null && windowManager !== undefined) {
+        if (typeof windowManager.closeAll !== 'function') {
+          errors.push(
+            new TypeError(
+              'AnalysisWindowManager must implement closeAll()'
+            )
+          );
+        } else {
+          try {
+            ownerTasks.push(windowManager.closeAll());
+          } catch (error) {
+            errors.push(error);
+          }
+        }
+      }
+      if (uiManager !== null && uiManager !== undefined) {
+        if (typeof uiManager.destroy !== 'function') {
+          errors.push(
+            new TypeError('AnalysisUIManager must implement destroy()')
+          );
+        } else {
+          try {
+            ownerTasks.push(uiManager.destroy());
+          } catch (error) {
+            errors.push(error);
+          }
+        }
+      }
+      const ownerOutcomes = await Promise.allSettled(ownerTasks);
+      errors.push(
+        ...ownerOutcomes
+          .filter(outcome => outcome.status === 'rejected')
+          .map(outcome => outcome.reason)
+      );
+
+      if (dataLayer !== null && dataLayer !== undefined) {
+        if (typeof dataLayer.destroy !== 'function') {
+          errors.push(
+            new TypeError('Comparison DataLayer must implement destroy()')
+          );
+        } else {
+          try {
+            await dataLayer.destroy();
+          } catch (error) {
+            errors.push(error);
+          }
+        }
+      }
+
       this._analysisWindowManager = null;
-    }
-
-    // Destroy UI manager (handles all analysis UIs)
-    if (this._uiManager) {
-      this._uiManager.destroy();
       this._uiManager = null;
-    }
+      this.dataLayer = null;
+      this._hooks = { beforeRender: [], afterRender: [] };
+      this.layoutEngine = null;
+      this.transformPipeline = null;
+      this._multiVariableAnalysis = null;
+      this._lastStatResults = [];
+      this._lastStatResultsTimestamp = null;
+      this._currentPageData = null;
 
-    // Clear caches
-    if (this.dataLayer && this.dataLayer.clearAllCaches) {
-      this.dataLayer.clearAllCaches();
-    }
-
-    // Clear hooks
-    this._hooks = { beforeRender: [], afterRender: [] };
-
-    // Null out references to free memory
-    this.layoutEngine = null;
-    this._multiVariableAnalysis = null;
-    this._lastStatResults = [];
-    this._lastStatResultsTimestamp = null;
-    this._currentPageData = null;
-    this.dataLayer = null;
+      const exactErrors = [...new Set(errors)];
+      if (exactErrors.length === 1) throw exactErrors[0];
+      if (exactErrors.length > 1) {
+        throw new AggregateError(
+          exactErrors,
+          'Comparison module destruction failed'
+        );
+      }
+    });
+    void this._destroyPromise.catch(() => {});
+    return this._destroyPromise;
   }
 
   // =========================================================================
@@ -936,112 +1045,196 @@ export class ComparisonModule {
         'Dataset reload reset reason must be one exact non-empty string'
       );
     }
-
-    const errors = [];
-    const run = operation => {
-      try {
-        operation();
-      } catch (error) {
-        errors.push(error);
-      }
-    };
-
-    if (this._analysisWindowManager !== null) {
-      if (typeof this._analysisWindowManager?.closeAll !== 'function') {
-        errors.push(
-          new TypeError('AnalysisWindowManager must implement closeAll()')
-        );
-      } else {
-        run(() => this._analysisWindowManager.closeAll());
-      }
+    if (this._destroyPromise != null) {
+      throw new Error('Cannot reset a destroyed ComparisonModule');
     }
-
-    if (this._modeToggleContainer !== null) {
-      if (
-        typeof this._modeToggleContainer?.querySelectorAll !== 'function'
-      ) {
-        errors.push(
-          new TypeError('Analysis accordion must implement querySelectorAll()')
-        );
-      } else {
-        const items = this._modeToggleContainer.querySelectorAll(
-          '.analysis-accordion-item'
-        );
-        if (items === null || typeof items[Symbol.iterator] !== 'function') {
-          errors.push(
-            new TypeError('Analysis accordion query must return an iterable')
-          );
-        } else {
-          for (const item of items) {
-            run(() => {
-              item.classList.remove('open');
-              const header = item.querySelector('.analysis-accordion-header');
-              if (header !== null) {
-                header.setAttribute('aria-expanded', 'false');
-              }
-            });
-          }
-        }
-      }
+    if (this._datasetResetPromise != null) {
+      return this._datasetResetPromise;
     }
-
-    this._analysisMode = null;
-    if (this._uiManager !== null) {
-      if (
-        typeof this._uiManager?.clearActiveMode !== 'function' ||
-        typeof this._uiManager?.reset !== 'function'
-      ) {
-        errors.push(
-          new TypeError(
-            'AnalysisUIManager must implement clearActiveMode() and reset()'
-          )
-        );
-      } else {
-        run(() => this._uiManager.clearActiveMode());
-        run(() => this._uiManager.reset());
-      }
-    }
-
-    if (
-      this.dataLayer === null ||
-      typeof this.dataLayer?.resetForDatasetReload !== 'function'
-    ) {
-      errors.push(
-        new TypeError('Dataset reload requires DataLayer.resetForDatasetReload()')
-      );
-    } else {
-      run(() => this.dataLayer.resetForDatasetReload());
-    }
-
-    this._multiVariableAnalysis = null;
-    this._lastStatResults = [];
-    this._lastStatResultsTimestamp = null;
-    this._currentPageData = null;
-
-    if (typeof this.onPagesChanged !== 'function') {
-      errors.push(
-        new TypeError('ComparisonModule.onPagesChanged() is required')
-      );
-    } else {
-      run(() => this.onPagesChanged());
-    }
-
-    if (errors.length === 1) throw errors[0];
-    if (errors.length > 1) {
-      throw new AggregateError(
-        errors,
-        `Dataset reload analysis reset failed in ${errors.length} operations`
-      );
-    }
-
     if (!Number.isSafeInteger(this._datasetReloadResetCount)) {
       throw new TypeError('Dataset reload reset count must be a safe integer');
     }
-    this._datasetReloadResetCount += 1;
-    this._lastDatasetReloadReset = {
-      at: Date.now(),
-      reason,
+    const windowManager = this._analysisWindowManager;
+    const uiManager = this._uiManager;
+    const dataLayer = this.dataLayer;
+    if (
+      windowManager !== null &&
+      windowManager !== undefined &&
+      typeof windowManager.closeAll !== 'function'
+    ) {
+      throw new TypeError('AnalysisWindowManager must implement closeAll()');
+    }
+    if (
+      uiManager !== null &&
+      uiManager !== undefined &&
+      (
+        typeof uiManager.clearActiveMode !== 'function' ||
+        typeof uiManager.reset !== 'function'
+      )
+    ) {
+      throw new TypeError(
+        'AnalysisUIManager must implement clearActiveMode() and reset()'
+      );
+    }
+    if (
+      dataLayer === null ||
+      dataLayer === undefined ||
+      typeof dataLayer.resetForDatasetReload !== 'function'
+    ) {
+      throw new TypeError(
+        'Dataset reload requires DataLayer.resetForDatasetReload()'
+      );
+    }
+    if (typeof this.onPagesChanged !== 'function') {
+      throw new TypeError('ComparisonModule.onPagesChanged() is required');
+    }
+
+    // Publish the reset owner before touching any child or DOM surface.
+    // closeAll(), reset(), and even a classList implementation can reenter
+    // destroy(); that destruction must capture and drain this exact task.
+    let resolveOwnedReset;
+    let rejectOwnedReset;
+    const task = new Promise((resolve, reject) => {
+      resolveOwnedReset = resolve;
+      rejectOwnedReset = reject;
+    });
+    this._datasetResetPromise = task;
+    const releaseTask = () => {
+      if (this._datasetResetPromise === task) {
+        this._datasetResetPromise = null;
+      }
     };
+    void task.then(releaseTask, releaseTask);
+    void task.catch(() => {});
+
+    const errors = [];
+    const managerTasks = [];
+    const runSynchronous = operation => {
+      try {
+        return operation();
+      } catch (error) {
+        errors.push(error);
+        return undefined;
+      }
+    };
+
+    try {
+      if (this._modeToggleContainer !== null) {
+        if (
+          typeof this._modeToggleContainer?.querySelectorAll !== 'function'
+        ) {
+          errors.push(
+            new TypeError(
+              'Analysis accordion must implement querySelectorAll()'
+            )
+          );
+        } else {
+          const items = this._modeToggleContainer.querySelectorAll(
+            '.analysis-accordion-item'
+          );
+          if (
+            items === null ||
+            typeof items[Symbol.iterator] !== 'function'
+          ) {
+            errors.push(
+              new TypeError(
+                'Analysis accordion query must return an iterable'
+              )
+            );
+          } else {
+            for (const item of items) {
+              runSynchronous(() => {
+                item.classList.remove('open');
+                const header = item.querySelector(
+                  '.analysis-accordion-header'
+                );
+                if (header !== null) {
+                  header.setAttribute('aria-expanded', 'false');
+                }
+              });
+            }
+          }
+        }
+      }
+
+      if (windowManager !== null && windowManager !== undefined) {
+        const closeTask = runSynchronous(() => windowManager.closeAll());
+        if (closeTask && typeof closeTask.then === 'function') {
+          managerTasks.push(closeTask);
+        }
+      }
+      if (uiManager !== null && uiManager !== undefined) {
+        runSynchronous(() => uiManager.clearActiveMode());
+        const resetTask = runSynchronous(() => uiManager.reset());
+        if (resetTask && typeof resetTask.then === 'function') {
+          managerTasks.push(resetTask);
+        }
+      }
+    } catch (error) {
+      errors.push(error);
+    }
+
+    if (errors.length > 0) {
+      const exactErrors = [...new Set(errors)];
+      const setupError = exactErrors.length === 1
+        ? exactErrors[0]
+        : new AggregateError(
+            exactErrors,
+            `Dataset reload analysis reset failed in ` +
+              `${exactErrors.length} operations`
+          );
+      void Promise.allSettled(managerTasks).then(() => {
+        rejectOwnedReset(setupError);
+      });
+      // Preserve the existing synchronous setup-failure surface while the
+      // already-published owner remains available to a reentrant destroy().
+      throw setupError;
+    }
+
+    const lifecycleTask = Promise.resolve().then(async () => {
+      const lifecycleErrors = [];
+      const managerOutcomes = await Promise.allSettled(managerTasks);
+      lifecycleErrors.push(
+        ...managerOutcomes
+          .filter(outcome => outcome.status === 'rejected')
+          .map(outcome => outcome.reason)
+      );
+
+      try {
+        await dataLayer.resetForDatasetReload();
+      } catch (error) {
+        lifecycleErrors.push(error);
+      }
+
+      this._analysisMode = null;
+      this._multiVariableAnalysis = null;
+      this._lastStatResults = [];
+      this._lastStatResultsTimestamp = null;
+      this._currentPageData = null;
+
+      try {
+        await this.onPagesChanged();
+      } catch (error) {
+        lifecycleErrors.push(error);
+      }
+
+      const exactErrors = [...new Set(lifecycleErrors)];
+      if (exactErrors.length === 1) throw exactErrors[0];
+      if (exactErrors.length > 1) {
+        throw new AggregateError(
+          exactErrors,
+          'Dataset reload analysis reset failed'
+        );
+      }
+
+      this._datasetReloadResetCount += 1;
+      this._lastDatasetReloadReset = {
+        at: Date.now(),
+        reason,
+      };
+    });
+    void lifecycleTask.then(resolveOwnedReset, rejectOwnedReset);
+    return task;
   }
 
   /**

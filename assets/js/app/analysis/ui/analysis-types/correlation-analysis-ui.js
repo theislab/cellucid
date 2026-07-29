@@ -19,7 +19,6 @@ import {
 import { correlationResultsToCSV, downloadCSV } from '../../shared/analysis-utils.js';
 import { createVariableSelectorComponent } from '../shared/variable-selector.js';
 import { PageSelectorComponent } from '../shared/page-selector.js';
-import { purgePlot } from '../../plots/plotly-loader.js';
 import { isFiniteNumber } from '../../shared/number-utils.js';
 
 function requireCorrelationVariable(variable, label) {
@@ -217,36 +216,48 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
    * Override to run analysis automatically when inputs are valid
    * @override
    */
-  async _runAnalysisIfValid() {
+  async _runAnalysisIfValid(scheduledRequestId = null) {
     if (this._isDestroyed) return;
+    if (
+      scheduledRequestId !== null &&
+      !this._isCurrentAnalysisIntent(scheduledRequestId)
+    ) {
+      return;
+    }
     if (!this._canRunAnalysis()) {
-      this._hideResult();
+      this._invalidateAnalysisRequest();
+      await this._hideResult();
       return;
     }
 
     // Validate that X and Y are different
-    const formValues = this._getFormValues();
+    const formValues = structuredClone(this._getFormValues());
     if (formValues.variableX?.key === formValues.variableY?.key &&
         formValues.variableX?.type === formValues.variableY?.type) {
-      this._hideResult();
+      this._invalidateAnalysisRequest();
+      await this._hideResult();
       return;
     }
 
+    const requestId = this._startAnalysisRequest(scheduledRequestId);
+    if (requestId === null) return;
     try {
-      this._isLoading = true;
-      const result = await this._runAnalysisImpl(formValues);
+      const result = await this._runAnalysisImpl(formValues, requestId);
 
-      if (this._isDestroyed) return;
+      if (!this._isCurrentAnalysisRequest(requestId)) return;
       if (result) {
+        await this._showResult(result, requestId);
+        if (!this._isCurrentAnalysisRequest(requestId)) return;
         this._lastResult = result;
         this._currentPageData = result.data || result;
-        await this._showResult(result);
+        this._requestedPlotOptions = structuredClone(result.options || {});
       }
     } catch (err) {
+      if (!this._isCurrentAnalysisRequest(requestId)) return;
       console.error('[CorrelationAnalysisUI] Analysis failed:', err);
-      this._showError('Analysis failed: ' + err.message);
+      await this._showError('Analysis failed: ' + err.message, requestId);
     } finally {
-      this._isLoading = false;
+      this._finishAnalysisRequest(requestId);
     }
   }
 
@@ -254,27 +265,29 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
    * Hide result container
    */
   _hideResult() {
-    if (this._resultContainer) {
-      purgePlot(this._resultContainer.querySelector('.analysis-preview-plot'));
-      this._resultContainer.innerHTML = '';
-      this._resultContainer.classList.add('hidden');
-    }
-    this._lastResult = null;
+    return this._discardFormResult();
   }
 
   /**
    * Show error message
    */
-  _showError(message) {
+  async _showError(message, requestId = null) {
+    await this._discardFormResult();
+    if (
+      requestId !== null &&
+      !this._isCurrentAnalysisRequest(requestId)
+    ) {
+      return false;
+    }
     if (this._resultContainer) {
       this._resultContainer.classList.remove('hidden');
-      this._resultContainer.innerHTML = '';
       const errorEl = document.createElement('div');
       errorEl.className = 'analysis-error';
       errorEl.textContent = message;
       this._resultContainer.appendChild(errorEl);
     }
     this._notifications?.error?.(message, { category: 'analysis' });
+    return true;
   }
 
   // ===========================================================================
@@ -497,7 +510,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
    * Run the correlation analysis
    * @param {CorrelationFormValues} formValues
    */
-  async _runAnalysisImpl(formValues) {
+  async _runAnalysisImpl(formValues, requestId = null) {
     if (!this.multiVariableAnalysis?.correlationAnalysis) {
       throw new Error('Correlation analysis module not available');
     }
@@ -520,6 +533,9 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     }
 
     const pageIds = [...this._selectedPages];
+    const customColors = new Map(
+      this._pageSelector?.getCustomColors?.() || []
+    );
     const readinessRequests = [
       {
         type: formValues.variableX.type,
@@ -548,6 +564,12 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     // the analysis, and no alternate render or delayed second attempt is scheduled.
     for (const request of readinessRequests) {
       const readyPageData = await this.dataLayer.getDataForPages(request);
+      if (
+        requestId !== null &&
+        !this._isCurrentAnalysisRequest(requestId)
+      ) {
+        return null;
+      }
       requireReadyPageData(
         readyPageData,
         pageIds,
@@ -560,11 +582,23 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
       varY: formValues.variableY,
       pageIds,
       method: formValues.method,
-      colorBy: formValues.colorBy ? { type: 'categorical_obs', key: formValues.colorBy } : null
+      colorBy: formValues.colorBy ? { type: 'categorical_obs', key: formValues.colorBy } : null,
+      isCurrent: requestId === null
+        ? undefined
+        : () => this._isCurrentAnalysisRequest(requestId),
+      registerInvalidationCleanup: requestId === null
+        ? undefined
+        : cleanup =>
+          this._registerAnalysisInvalidationCleanup(requestId, cleanup)
     });
+    if (
+      requestId !== null &&
+      !this._isCurrentAnalysisRequest(requestId)
+    ) {
+      return null;
+    }
 
     // Pass custom page colors to results for proper coloring
-    const customColors = this._pageSelector?.getCustomColors() || new Map();
     if (customColors.size > 0) {
       for (const result of correlationResults) {
         if (result.pageId && customColors.has(result.pageId)) {
@@ -598,40 +632,13 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
   // Custom Result Rendering
   // ===========================================================================
 
-  async _showResult(result) {
-    this._resultContainer.classList.remove('hidden');
-    // Purge any existing plots to prevent WebGL memory leaks
-    purgePlot(this._resultContainer.querySelector('.analysis-preview-plot'));
-    this._resultContainer.innerHTML = '';
-
-    // Plot container only - clickable to open modal (like detailed mode)
-    const previewContainer = document.createElement('div');
-    previewContainer.className = 'analysis-preview-container';
-    previewContainer.style.cursor = 'pointer';
-    previewContainer.title = 'Click to open in full view with statistics and export options';
-    previewContainer.addEventListener('click', () => this._openExpandedView());
-    this._resultContainer.appendChild(previewContainer);
-
-    const plotContainer = document.createElement('div');
-    plotContainer.className = 'analysis-preview-plot';
-    plotContainer.id = this._plotContainerIdBase;
-    this._plotContainerId = this._plotContainerIdBase;
-    previewContainer.appendChild(plotContainer);
-
-    const plotDef = PlotRegistry.get(result.plotType);
-    if (plotDef) {
-      try {
-        const mergedOptions = PlotRegistry.mergeOptions(result.plotType, result.options || {});
-        await plotDef.render(result.data, mergedOptions, plotContainer, null);
-      } catch (err) {
-        console.error('[CorrelationAnalysisUI] Plot render error:', err);
-        plotContainer.innerHTML = '';
-        const errorEl = document.createElement('div');
-        errorEl.className = 'plot-error';
-        errorEl.textContent = `Failed to render plot: ${err?.message || err}`;
-        plotContainer.appendChild(errorEl);
-      }
-    }
+  async _showResult(result, requestId) {
+    return this._renderPreviewPlot({
+      result,
+      requestId,
+      containerId: this._plotContainerIdBase,
+      clickable: true
+    });
   }
 
   // ===========================================================================
@@ -825,16 +832,47 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
   }
 
   destroy() {
+    if (this._destroyPromise != null) return this._destroyPromise;
     this._isDestroyed = true;
-    this._xSelector?.destroy?.();
-    this._ySelector?.destroy?.();
-    this._pageSelector?.destroy();
+    const errors = [];
+    for (const [label, owner] of [
+      ['X variable selector', this._xSelector],
+      ['Y variable selector', this._ySelector],
+      ['page selector', this._pageSelector]
+    ]) {
+      if (owner === null || owner === undefined) continue;
+      if (typeof owner.destroy !== 'function') {
+        errors.push(new TypeError(`Correlation ${label} must implement destroy()`));
+        continue;
+      }
+      try {
+        owner.destroy();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
     this._xSelector = null;
     this._ySelector = null;
     this._pageSelector = null;
     this._pageSelectContainer = null;
     this._colorByVariable = null;
-    super.destroy();
+    const parentTask = super.destroy();
+    if (errors.length === 0) return parentTask;
+    const destruction = Promise.resolve(parentTask).then(
+      () => {
+        if (errors.length === 1) throw errors[0];
+        throw new AggregateError(errors, 'Correlation UI cleanup failed');
+      },
+      parentError => {
+        throw new AggregateError(
+          [...errors, parentError],
+          'Correlation UI cleanup failed'
+        );
+      }
+    );
+    this._destroyPromise = destruction;
+    void destruction.catch(() => {});
+    return destruction;
   }
 
   exportSettings() {

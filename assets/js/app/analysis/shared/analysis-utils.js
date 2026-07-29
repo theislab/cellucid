@@ -27,17 +27,19 @@ import {
  * Run an analysis with standard loading state management
  *
  * Handles:
- * - Setting _isLoading flag on component
  * - Disabling/enabling run button
  * - Showing loading notification
  * - Completing/failing notification
+ * - Suppressing terminal side effects after request invalidation
  *
  * @param {Object} options
- * @param {Object} options.component - The UI component (must have _isLoading, _notifications)
+ * @param {Object} options.component - The UI component (must have _notifications)
  * @param {HTMLButtonElement} [options.runButton] - The run button to disable
  * @param {string} options.loadingMessage - Loading notification message
  * @param {string} options.successMessage - Success notification message
  * @param {Function} options.analysisFunction - The async analysis function
+ * @param {Function} options.isCurrent - Exact request ownership predicate
+ * @param {Function} options.registerInvalidationCleanup - Register request-local cleanup
  * @param {string} [options.category='calculation'] - Notification category
  * @returns {Promise<any>} Analysis result or null if already loading
  *
@@ -57,15 +59,28 @@ export async function runAnalysisWithLoadingState(options) {
     loadingMessage,
     successMessage,
     analysisFunction,
+    isCurrent,
+    registerInvalidationCleanup,
     category = 'calculation'
   } = options;
 
-  // Prevent concurrent runs
-  if (component._isLoading) return null;
+  if (typeof isCurrent !== 'function') {
+    throw new TypeError(
+      'Analysis loading state requires an exact request ownership predicate'
+    );
+  }
+  if (!isCurrent()) return null;
+  if (typeof registerInvalidationCleanup !== 'function') {
+    throw new TypeError(
+      'Analysis loading state requires invalidation cleanup registration'
+    );
+  }
 
-  component._isLoading = true;
   const originalText = runButton?.textContent;
   const notifId = component._notifications?.loading(loadingMessage, { category });
+  let notificationSettled = false;
+  let buttonRestored = false;
+  let invalidated = false;
 
   // Update button state
   if (runButton) {
@@ -73,23 +88,66 @@ export async function runAnalysisWithLoadingState(options) {
     runButton.textContent = 'Running...';
   }
 
+  const restoreButton = () => {
+    if (!runButton || buttonRestored) return;
+    runButton.disabled = false;
+    runButton.textContent = originalText;
+    buttonRestored = true;
+  };
+  const dismissNotification = () => {
+    if (
+      notificationSettled ||
+      notifId === null ||
+      notifId === undefined
+    ) {
+      return;
+    }
+    if (typeof component._notifications?.dismiss !== 'function') {
+      throw new TypeError(
+        'Invalidated analysis loading state requires notification dismissal'
+      );
+    }
+    component._notifications.dismiss(notifId);
+    notificationSettled = true;
+  };
+  const invalidate = () => {
+    invalidated = true;
+    dismissNotification();
+    restoreButton();
+  };
+  registerInvalidationCleanup(invalidate);
+
   try {
     const result = await analysisFunction();
-    if (component._notifications && notifId) {
+    if (!isCurrent()) {
+      invalidate();
+      return null;
+    }
+    if (
+      component._notifications &&
+      notifId !== null &&
+      notifId !== undefined
+    ) {
       component._notifications.complete(notifId, successMessage);
+      notificationSettled = true;
     }
     return result;
   } catch (error) {
-    if (component._notifications && notifId) {
+    if (invalidated || !isCurrent()) {
+      invalidate();
+      return null;
+    }
+    if (
+      component._notifications &&
+      notifId !== null &&
+      notifId !== undefined
+    ) {
       component._notifications.fail(notifId, `Analysis failed: ${error.message}`);
+      notificationSettled = true;
     }
     throw error;
   } finally {
-    component._isLoading = false;
-    if (runButton) {
-      runButton.disabled = false;
-      runButton.textContent = originalText;
-    }
+    if (isCurrent()) restoreButton();
   }
 }
 

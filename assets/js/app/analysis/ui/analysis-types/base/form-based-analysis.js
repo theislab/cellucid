@@ -49,9 +49,9 @@ import {
   createExpandButton,
   renderPlotOptions
 } from '../../components/index.js';
-import { loadPlotly, downloadImage, purgePlot } from '../../../plots/plotly-loader.js';
+import { loadPlotly, downloadImage } from '../../../plots/plotly-loader.js';
 import { PlotRegistry } from '../../../shared/plot-registry-utils.js';
-import { renderOrUpdatePlot } from '../../../shared/plot-lifecycle.js';
+import { PlotlyRenderSlot } from '../../../shared/plotly-render-slot.js';
 
 function isPlainObject(value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
@@ -126,10 +126,17 @@ function requireFormControlSnapshot(snapshot) {
   }
 }
 
-function throwAfterModalCleanup(owner, modal, primaryError, context) {
+function combineErrors(errors, message) {
+  const present = [...new Set(errors.filter(Boolean))];
+  if (present.length === 0) return null;
+  if (present.length === 1) return present[0];
+  return new AggregateError(present, message);
+}
+
+async function throwAfterModalCleanup(owner, modal, primaryError, context) {
   if (owner._modal === modal) owner._modal = null;
   try {
-    closeModal(modal);
+    await closeModal(modal);
   } catch (cleanupError) {
     throw new AggregateError(
       [primaryError, cleanupError],
@@ -199,6 +206,13 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
 
     // Modal support - matching Detailed Analysis pattern
     this._modal = null;
+    this._modalPlotSlot = null;
+    this._previewPlotHost = null;
+    this._previewPlotSlot = null;
+    this._pendingModalCloseTasks = new Set();
+    this._formDestroyTasks = new Set();
+    this._destroyPromise = null;
+    this._requestedPlotOptions = null;
 
     // Bind methods
     this._openExpandedView = this._openExpandedView.bind(this);
@@ -513,9 +527,10 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * Run the analysis implementation
    * @abstract
    * @param {Object} formValues - Values from _getFormValues()
+   * @param {number} requestId - Current analysis request generation
    * @returns {Promise<Object>} Analysis result object
    */
-  async _runAnalysisImpl(formValues) {
+  async _runAnalysisImpl(formValues, requestId) {
     throw new Error('_runAnalysisImpl() must be implemented by subclass');
   }
 
@@ -573,9 +588,220 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * Show analysis result
    * @abstract
    * @param {Object} result - Analysis result from _runAnalysisImpl()
+   * @param {number} requestId - Current analysis request generation
    */
-  async _showResult(result) {
+  async _showResult(result, requestId) {
     throw new Error('_showResult() must be implemented by subclass');
+  }
+
+  _reportPlotResizeError(error) {
+    if (!(error instanceof Error)) {
+      error = new TypeError('Analysis plot resize failed with a non-Error value');
+    }
+    this._notifications.error(
+      `Plot resize failed: ${error.message}`,
+      { category: 'analysis', title: 'Analysis Error' }
+    );
+  }
+
+  _createOwnedPlotSlot(host, candidateClassName) {
+    return new PlotlyRenderSlot({
+      host,
+      candidateClassName,
+      onResizeError: error => this._reportPlotResizeError(error)
+    });
+  }
+
+  async _ensurePreviewPlotSlot({
+    containerId,
+    clickable = false,
+    height = null
+  }) {
+    if (!(this._resultContainer instanceof HTMLElement)) {
+      throw new TypeError(
+        'Analysis preview requires an initialized result container'
+      );
+    }
+    if (
+      typeof containerId !== 'string' ||
+      containerId.length === 0 ||
+      containerId.trim() !== containerId
+    ) {
+      throw new TypeError('Analysis preview container ID must be exact text');
+    }
+    if (height !== null && (!Number.isFinite(height) || height <= 0)) {
+      throw new RangeError('Analysis preview height must be positive');
+    }
+
+    if (
+      this._previewPlotSlot != null &&
+      this._previewPlotHost?.isConnected !== false &&
+      this._previewPlotHost?.parentNode?.parentNode === this._resultContainer
+    ) {
+      if (height !== null) {
+        this._previewPlotHost.style.height = `${height}px`;
+      }
+      return this._previewPlotSlot;
+    }
+
+    if (this._previewPlotSlot != null) {
+      await this._previewPlotSlot.destroy();
+      this._previewPlotSlot = null;
+      this._previewPlotHost = null;
+    }
+
+    this._resultContainer.innerHTML = '';
+    const previewContainer = document.createElement('div');
+    previewContainer.className = 'analysis-preview-container';
+    if (clickable) {
+      previewContainer.style.cursor = 'pointer';
+      previewContainer.title =
+        'Click to open in full view with statistics and export options';
+      previewContainer.addEventListener('click', () => {
+        this._trackInteractiveTask(
+          this._openExpandedView(),
+          'Expanded analysis view'
+        );
+      });
+    }
+
+    const host = document.createElement('div');
+    host.className = 'analysis-preview-plot-host';
+    host.id = containerId;
+    if (height !== null) host.style.height = `${height}px`;
+    previewContainer.appendChild(host);
+    this._resultContainer.appendChild(previewContainer);
+
+    const slot = this._createOwnedPlotSlot(host, 'analysis-preview-plot');
+    this._previewPlotHost = host;
+    this._previewPlotSlot = slot;
+    this._plotContainerId = containerId;
+    return slot;
+  }
+
+  async _renderPreviewPlot({
+    result,
+    requestId,
+    containerId,
+    clickable = false,
+    height = null,
+    onRendered
+  }) {
+    if (!this._isCurrentAnalysisRequest(requestId)) return null;
+    if (
+      result === null ||
+      typeof result !== 'object' ||
+      Array.isArray(result) ||
+      typeof result.plotType !== 'string' ||
+      result.plotType.length === 0
+    ) {
+      throw new TypeError(
+        'Analysis preview requires an exact result and plot type'
+      );
+    }
+    const plotDef = PlotRegistry.get(result.plotType);
+    if (!plotDef) {
+      throw new RangeError(`Unknown analysis plot type: ${result.plotType}`);
+    }
+    const mergedOptions = PlotRegistry.mergeOptions(
+      result.plotType,
+      structuredClone(result.options || {})
+    );
+    const slot = await this._ensurePreviewPlotSlot({
+      containerId,
+      clickable,
+      height
+    });
+    if (!this._isCurrentAnalysisRequest(requestId)) return null;
+
+    this._resultContainer.classList.remove('hidden');
+    const candidate = await slot.render(
+      {
+        render: async plotCandidate => {
+          await loadPlotly();
+          return plotDef.render(
+            result.data,
+            mergedOptions,
+            plotCandidate,
+            null
+          );
+        },
+        onRendered
+      },
+      {
+        isCurrent: () => this._isCurrentAnalysisRequest(requestId)
+      }
+    );
+    if (candidate === null) return null;
+    return candidate;
+  }
+
+  _trackModalCloseTask(task) {
+    if (!task || typeof task.then !== 'function') {
+      return Promise.resolve(task);
+    }
+    this._pendingModalCloseTasks ??= new Set();
+    this._pendingModalCloseTasks.add(task);
+    task.then(
+      () => this._pendingModalCloseTasks.delete(task),
+      () => this._pendingModalCloseTasks.delete(task)
+    );
+    return task;
+  }
+
+  _registerFormDestroyTask(task) {
+    if (!task || typeof task.then !== 'function') {
+      return Promise.resolve(task);
+    }
+    this._formDestroyTasks ??= new Set();
+    const ownedTask = Promise.resolve(task);
+    this._formDestroyTasks.add(ownedTask);
+    void ownedTask.catch(() => {});
+    return ownedTask;
+  }
+
+  _destroyModalPlotOwner(modal) {
+    const slot = modal?._analysisPlotSlot ?? null;
+    if (this._modal === modal) this._modal = null;
+    if (this._modalPlotSlot === slot) this._modalPlotSlot = null;
+    modal._analysisPlotSlot = null;
+    if (slot === null) return Promise.resolve();
+    const task = slot.destroy();
+    return this._trackModalCloseTask(task);
+  }
+
+  _ensureModalPlotSlot(modal) {
+    if (!(modal?._plotContainer instanceof HTMLElement)) {
+      throw new TypeError(
+        'Analysis modal must provide the _plotContainer element'
+      );
+    }
+    if (modal._analysisPlotSlot !== null &&
+        modal._analysisPlotSlot !== undefined) {
+      this._modalPlotSlot = modal._analysisPlotSlot;
+      return modal._analysisPlotSlot;
+    }
+    const slot = this._createOwnedPlotSlot(
+      modal._plotContainer,
+      'analysis-modal-plot-candidate'
+    );
+    modal._analysisPlotSlot = slot;
+    this._modalPlotSlot = slot;
+    return slot;
+  }
+
+  _createModalCloseErrorHandler() {
+    return error => {
+      if (!(error instanceof Error)) {
+        error = new TypeError(
+          'Analysis modal close failed with a non-Error value'
+        );
+      }
+      this._notifications.error(
+        `Expanded view cleanup failed: ${error.message}`,
+        { category: 'analysis', title: 'Analysis Cleanup Error' }
+      );
+    };
   }
 
   // ===========================================================================
@@ -588,7 +814,8 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * Subclasses can override the _renderModal* methods for custom content.
    */
   async _openExpandedView() {
-    if (!this._lastResult) {
+    const result = this._lastResult;
+    if (!result) {
       throw new Error(
         'Expanded analysis view requires a completed analysis result'
       );
@@ -596,12 +823,23 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
 
     let modal = null;
     modal = createAnalysisModal({
+      beforeClose: () => this._destroyModalPlotOwner(modal),
       onClose: () => {
         if (this._modal === modal) this._modal = null;
       },
-      onExportPNG: () => this._exportModalPNG(),
-      onExportSVG: () => this._exportModalSVG(),
-      onExportCSV: () => this._exportModalCSV()
+      onCloseError: this._createModalCloseErrorHandler(),
+      onExportPNG: () => this._trackInteractiveTask(
+        this._exportModalPNG(),
+        'PNG export'
+      ),
+      onExportSVG: () => this._trackInteractiveTask(
+        this._exportModalSVG(),
+        'SVG export'
+      ),
+      onExportCSV: () => this._trackInteractiveTask(
+        Promise.resolve().then(() => this._exportModalCSV()),
+        'CSV export'
+      )
     });
     this._modal = modal;
 
@@ -621,8 +859,8 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       }
 
       // Set modal title
-      const title = this._lastResult.title || this._getTitle();
-      const subtitle = this._lastResult.subtitle || '';
+      const title = result.title || this._getTitle();
+      const subtitle = result.subtitle || '';
       modal._title.textContent = subtitle ? `${title}: ${subtitle}` : title;
 
       // Render options panel (right side)
@@ -631,7 +869,20 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       openModal(modal);
 
       await loadPlotly();
-      await this._renderModalPlot(modal._plotContainer);
+      if (this._modal !== modal || this._lastResult !== result) {
+        await closeModal(modal);
+        return;
+      }
+      await this._renderModalPlot(modal._plotContainer, {
+        isCurrent: () => (
+          !this._isDestroyed &&
+          this._modal === modal &&
+          this._lastResult === result
+        ),
+        modal,
+        result
+      });
+      if (this._modal !== modal || this._lastResult !== result) return;
 
       // Render summary stats (bottom left)
       this._renderModalStats(modal._statsContent);
@@ -639,7 +890,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       // Render statistical annotations (bottom right)
       this._renderModalAnnotations(modal._annotationsContent);
     } catch (error) {
-      throwAfterModalCleanup(
+      await throwAfterModalCleanup(
         this,
         modal,
         error,
@@ -652,9 +903,15 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * Render plot in modal - Override for custom plot rendering
    * @param {HTMLElement} container - Modal plot container
    */
-  async _renderModalPlot(container) {
+  async _renderModalPlot(
+    container,
+    {
+      isCurrent = () => true,
+      modal = this._modal,
+      result = this._lastResult
+    } = {}
+  ) {
     // Default implementation - subclasses should override
-    const result = this._lastResult;
     if (!result?.plotType || !result?.data) {
       throw new Error('Modal plot rendering requires exact plotType and data');
     }
@@ -665,14 +922,18 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     }
 
     const mergedOptions = PlotRegistry.mergeOptions(result.plotType, result.options || {});
-    await renderOrUpdatePlot({
-      plotDef,
-      data: result.data,
-      options: mergedOptions,
-      container,
-      layoutEngine: null,
-      preferUpdate: false
-    });
+    const slot = this._ensureModalPlotSlot(modal);
+    return slot.render(
+      {
+        render: candidate => plotDef.render(
+          result.data,
+          mergedOptions,
+          candidate,
+          null
+        )
+      },
+      { isCurrent }
+    );
   }
 
   /**
@@ -699,37 +960,71 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
   }
 
   /**
-   * Handle plot option changes from the modal options panel.
-   * Keeps the result as source of truth and re-renders modal + preview.
+   * Publish one requested option intent without choosing how its dependent
+   * scientific state is recomputed. Specialized analyses can own that
+   * recomputation before starting a plot render.
    * @private
    * @param {string} key
    * @param {*} value
+   * @returns {{revision: number, requestedOptions: Object}|null}
    */
-  _handlePlotOptionChange(key, value) {
+  _preparePlotOptionChange(key, value) {
     if (!this._lastResult) return;
-    if (!this._lastResult.options) this._lastResult.options = {};
-
-    this._lastResult.options[key] = value;
+    const requestedOptions = {
+      ...(
+        this._requestedPlotOptions ??
+        this._lastResult.options ??
+        {}
+      ),
+      [key]: value
+    };
+    this._requestedPlotOptions = structuredClone(requestedOptions);
 
     // Re-render options panel to respect showWhen conditions
     if (this._modal?._optionsContent && this._lastResult.plotType) {
       renderPlotOptions(
         this._modal._optionsContent,
         this._lastResult.plotType,
-        this._lastResult.options,
+        requestedOptions,
         this._handlePlotOptionChange
       );
     }
 
     const revision = ++this._optionRenderRevision;
-    return this._rerenderAfterOptionChange(revision);
+    return {
+      revision,
+      requestedOptions: structuredClone(requestedOptions)
+    };
+  }
+
+  /**
+   * Handle plot option changes from the modal options panel.
+   * Keeps the result as source of truth and re-renders modal + preview.
+   * @private
+   * @param {string} key
+   * @param {*} value
+   * @returns {Promise<void>|undefined}
+   */
+  _handlePlotOptionChange(key, value) {
+    const prepared = this._preparePlotOptionChange(key, value);
+    if (prepared === null || prepared === undefined) return;
+    return this._trackInteractiveTask(
+      this._rerenderAfterOptionChange(
+        prepared.revision,
+        prepared.requestedOptions
+      ),
+      'Plot option update'
+    );
   }
 
   /**
    * Re-render plots and dependent panels after option changes.
    * @private
    */
-  async _rerenderAfterOptionChange(revision) {
+  async _rerenderAfterOptionChange(
+    revision,
+    requestedOptions = this._requestedPlotOptions
+  ) {
     if (this._isDestroyed) return;
     if (revision !== this._optionRenderRevision) return;
 
@@ -744,7 +1039,19 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       throw new Error(`Unknown plot option update type: ${result.plotType}`);
     }
 
-    const mergedOptions = PlotRegistry.mergeOptions(result.plotType, result.options || {});
+    if (requestedOptions === null || requestedOptions === undefined) {
+      requestedOptions = structuredClone(result.options || {});
+    }
+    if (
+      typeof requestedOptions !== 'object' ||
+      Array.isArray(requestedOptions)
+    ) {
+      throw new TypeError('Plot option update requires an exact options object');
+    }
+    const mergedOptions = PlotRegistry.mergeOptions(
+      result.plotType,
+      requestedOptions
+    );
 
     // Update modal plot (if open)
     if (this._modal !== null) {
@@ -756,14 +1063,26 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
         await loadPlotly();
         if (this._isDestroyed) return;
         if (revision !== this._optionRenderRevision) return;
-        await renderOrUpdatePlot({
-          plotDef,
-          data: result.data,
-          options: mergedOptions,
-          container: modal._plotContainer,
-          layoutEngine: null,
-          preferUpdate: true
-        });
+        const modalSlot = this._ensureModalPlotSlot(modal);
+        const committed = await modalSlot.render(
+          {
+            render: candidate => plotDef.render(
+              result.data,
+              mergedOptions,
+              candidate,
+              null
+            )
+          },
+          {
+            isCurrent: () => (
+              !this._isDestroyed &&
+              this._modal === modal &&
+              this._lastResult === result &&
+              revision === this._optionRenderRevision
+            )
+          }
+        );
+        if (committed === null) return;
         if (!(modal._statsContent instanceof HTMLElement)) {
           throw new TypeError('Analysis modal must provide the _statsContent element');
         }
@@ -773,7 +1092,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
         this._renderModalStats(modal._statsContent);
         this._renderModalAnnotations(modal._annotationsContent);
       } catch (error) {
-        throwAfterModalCleanup(
+        await throwAfterModalCleanup(
           this,
           modal,
           error,
@@ -783,23 +1102,45 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     }
 
     // Update inline/preview plot (if present)
-    const previewContainer = this._plotContainerId
-      ? document.getElementById(this._plotContainerId)
-      : null;
+    const previewHost = this._previewPlotHost ?? (
+      this._plotContainerId
+        ? document.getElementById(this._plotContainerId)
+        : null
+    );
 
-    if (previewContainer) {
+    if (previewHost) {
       await loadPlotly();
       if (this._isDestroyed) return;
       if (revision !== this._optionRenderRevision) return;
-      await renderOrUpdatePlot({
-        plotDef,
-        data: result.data,
-        options: mergedOptions,
-        container: previewContainer,
-        layoutEngine: null,
-        preferUpdate: true
-      });
+      if (this._previewPlotSlot == null) {
+        this._previewPlotHost = previewHost;
+        this._previewPlotSlot = this._createOwnedPlotSlot(
+          previewHost,
+          'analysis-preview-plot'
+        );
+      }
+      const previewCommitted = await this._previewPlotSlot.render(
+        {
+          render: candidate => plotDef.render(
+            result.data,
+            mergedOptions,
+            candidate,
+            null
+          )
+        },
+        {
+          isCurrent: () => (
+            !this._isDestroyed &&
+            this._lastResult === result &&
+            revision === this._optionRenderRevision
+          )
+        }
+      );
+      if (previewCommitted === null) return;
     }
+    if (revision !== this._optionRenderRevision) return;
+    result.options = structuredClone(requestedOptions);
+    this._requestedPlotOptions = structuredClone(requestedOptions);
   }
 
   /**
@@ -828,18 +1169,21 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * Export modal plot as PNG
    */
   async _exportModalPNG() {
-    const container = this._modal?._plotContainer;
-    if (!(container instanceof HTMLElement)) {
+    const modal = this._modal;
+    const slot = modal?._analysisPlotSlot ?? null;
+    if (!(modal?._plotContainer instanceof HTMLElement) || slot === null) {
       throw new Error('PNG export requires an open analysis modal plot');
     }
 
     try {
-      await downloadImage(container, {
-        format: 'png',
-        width: 1200,
-        height: 800,
-        filename: `${this._getClassName()}_analysis`
-      });
+      await slot.withCommittedPlot(candidate => (
+        downloadImage(candidate, {
+          format: 'png',
+          width: 1200,
+          height: 800,
+          filename: `${this._getClassName()}_analysis`
+        })
+      ));
     } catch (err) {
       throwAfterExportFailureNotification(this._notifications, err, 'PNG');
     }
@@ -850,18 +1194,21 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * Export modal plot as SVG
    */
   async _exportModalSVG() {
-    const container = this._modal?._plotContainer;
-    if (!(container instanceof HTMLElement)) {
+    const modal = this._modal;
+    const slot = modal?._analysisPlotSlot ?? null;
+    if (!(modal?._plotContainer instanceof HTMLElement) || slot === null) {
       throw new Error('SVG export requires an open analysis modal plot');
     }
 
     try {
-      await downloadImage(container, {
-        format: 'svg',
-        width: 1200,
-        height: 800,
-        filename: `${this._getClassName()}_analysis`
-      });
+      await slot.withCommittedPlot(candidate => (
+        downloadImage(candidate, {
+          format: 'svg',
+          width: 1200,
+          height: 800,
+          filename: `${this._getClassName()}_analysis`
+        })
+      ));
     } catch (err) {
       throwAfterExportFailureNotification(this._notifications, err, 'SVG');
     }
@@ -880,7 +1227,12 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * @returns {HTMLElement} Expand button element
    */
   _createExpandButton() {
-    return createExpandButton(this._openExpandedView);
+    return createExpandButton(() => {
+      this._trackInteractiveTask(
+        this._openExpandedView(),
+        'Expanded analysis view'
+      );
+    });
   }
 
   // ===========================================================================
@@ -958,6 +1310,9 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
 
     // Let subclass render form controls
     this._renderFormControls(wrapper);
+    const handleInputIntent = () => this._handleFormInputIntent();
+    wrapper.addEventListener('input', handleInputIntent);
+    wrapper.addEventListener('change', handleInputIntent);
 
     // Run button
     const runBtn = createFormButton(
@@ -976,7 +1331,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
   async _runAnalysis() {
     if (this._isDestroyed) return;
     // Get form values
-    const formValues = this._getFormValues();
+    const formValues = structuredClone(this._getFormValues());
 
     // Validate form
     const validation = this._validateForm(formValues);
@@ -988,51 +1343,124 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       ) {
         throw new TypeError('Invalid form validation requires an exact error message');
       }
+      this._invalidateAnalysisRequest();
       this._notifications.error(validation.error);
       return;
     }
 
+    const requestId = this._startAnalysisRequest();
+    if (requestId === null) return;
+    const discardTask = this._discardFormResult();
     // Get run button for state management
     const runBtn = this._formContainer.querySelector('.analysis-run-btn');
 
-    const result = await runAnalysisWithLoadingState({
-      component: this,
-      runButton: runBtn,
-      loadingMessage: this._getLoadingMessage(),
-      successMessage: this._getSuccessMessage(),
-      analysisFunction: () => this._runAnalysisImpl(formValues)
-    });
+    try {
+      const result = await runAnalysisWithLoadingState({
+        component: this,
+        runButton: runBtn,
+        loadingMessage: this._getLoadingMessage(),
+        successMessage: this._getSuccessMessage(),
+        analysisFunction: async () => {
+          if (discardTask && typeof discardTask.then === 'function') {
+            await discardTask;
+          }
+          if (!this._isCurrentAnalysisRequest(requestId)) return null;
+          return this._runAnalysisImpl(formValues, requestId);
+        },
+        isCurrent: () => this._isCurrentAnalysisRequest(requestId),
+        registerInvalidationCleanup: cleanup =>
+          this._registerAnalysisInvalidationCleanup(requestId, cleanup)
+      });
 
-    if (result !== null) {
-      if (!isPlainObject(result)) {
-        throw new TypeError('Form-based analysis must return an exact result object');
-      }
-      if (!Object.hasOwn(result, 'data')) {
-        throw new TypeError('Form-based analysis result must contain data');
-      }
-      if (this._isDestroyed) return;
-      // Store result
-      this._lastResult = result;
-
-      // Store for base class export
-      this._currentPageData = result.data;
-
-      // Show result
-      await this._showResult(result);
-
-      // Callback
-      if (this.onResultChange !== null && this.onResultChange !== undefined) {
-        if (typeof this.onResultChange !== 'function') {
-          throw new TypeError('onResultChange must be a function');
+      if (result !== null) {
+        if (!isPlainObject(result)) {
+          throw new TypeError('Form-based analysis must return an exact result object');
         }
-        this.onResultChange(result);
+        if (!Object.hasOwn(result, 'data')) {
+          throw new TypeError('Form-based analysis result must contain data');
+        }
+        if (!this._isCurrentAnalysisRequest(requestId)) return;
+        await this._showResult(result, requestId);
+        if (!this._isCurrentAnalysisRequest(requestId)) return;
+
+        // Publish result/data only after the owned render transaction commits.
+        this._lastResult = result;
+        this._currentPageData = result.data;
+        this._requestedPlotOptions = structuredClone(result.options || {});
+
+        // Callback
+        if (this.onResultChange !== null && this.onResultChange !== undefined) {
+          if (typeof this.onResultChange !== 'function') {
+            throw new TypeError('onResultChange must be a function');
+          }
+          this.onResultChange(result);
+        }
       }
+    } finally {
+      this._finishAnalysisRequest(requestId);
     }
   }
 
   // ===========================================================================
   // Page Selection
   // ===========================================================================
+
+  /**
+   * Invalidate a manual form request as soon as its displayed inputs change.
+   * @protected
+   */
+  _handleFormInputIntent() {
+    if (this._isDestroyed) return;
+    this._invalidateAnalysisRequest();
+    const cleanup = this._discardFormResult();
+    if (cleanup && typeof cleanup.then === 'function') {
+      void cleanup.catch(error => {
+        this._createModalCloseErrorHandler()(error);
+      });
+    }
+    return cleanup;
+  }
+
+  /**
+   * Remove result state and render owners that no longer match the form.
+   * @protected
+   */
+  _discardFormResult() {
+    this._optionRenderRevision += 1;
+    const cleanupTasks = [];
+    if (this._previewPlotSlot != null) {
+      cleanupTasks.push(this._previewPlotSlot.invalidate());
+    } else if (this._resultContainer) {
+      this._resultContainer.innerHTML = '';
+    }
+    if (this._resultContainer) {
+      const actions = this._resultContainer.querySelector?.(
+        '.analysis-actions'
+      );
+      if (actions) actions.remove();
+      this._resultContainer.classList.add('hidden');
+    }
+    if (this._modal) {
+      const modal = this._modal;
+      const closeTask = closeModal(modal);
+      if (closeTask && typeof closeTask.then === 'function') {
+        cleanupTasks.push(this._trackModalCloseTask(closeTask));
+      }
+    }
+    this._lastResult = null;
+    this._currentPageData = null;
+    this._requestedPlotOptions = null;
+    if (cleanupTasks.length === 0) return;
+    return Promise.allSettled(cleanupTasks).then(results => {
+      const failure = combineErrors(
+        results
+          .filter(result => result.status === 'rejected')
+          .map(result => result.reason),
+        'Analysis result cleanup failed'
+      );
+      if (failure) throw failure;
+    });
+  }
 
   /**
    * Update when page selection changes
@@ -1046,12 +1474,32 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     );
     this._selectedPages = [...pageIds];
     this._currentConfig.pages = this._selectedPages;
-    this._renderControls();
-
-    // Hide result when pages change
-    if (this._resultContainer) {
-      this._resultContainer.classList.add('hidden');
+    this._invalidateAnalysisRequest();
+    const cleanup = this._discardFormResult();
+    if (cleanup && typeof cleanup.then === 'function') {
+      void cleanup.catch(error => {
+        this._createModalCloseErrorHandler()(error);
+      });
     }
+    this._renderControls();
+    return cleanup;
+  }
+
+  /**
+   * Highlight membership is scientific input for every form-based analysis,
+   * including DE and Marker Genes whose config has no base dataSource field.
+   * @override
+   */
+  onHighlightChanged() {
+    this._updatePageSelectorCounts();
+    this._invalidateAnalysisRequest();
+    const cleanup = this._discardFormResult();
+    if (cleanup && typeof cleanup.then === 'function') {
+      void cleanup.catch(error => {
+        this._createModalCloseErrorHandler()(error);
+      });
+    }
+    return cleanup;
   }
 
   // ===========================================================================
@@ -1067,42 +1515,65 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * @override
    */
   destroy() {
+    if (this._destroyPromise != null) return this._destroyPromise;
     this._isDestroyed = true;
-    const errors = [];
-    const run = operation => {
+    this._invalidateAnalysisRequest();
+    this._optionRenderRevision += 1;
+
+    this._destroyPromise = Promise.resolve().then(async () => {
+      const errors = [];
+      const tasks = [
+        ...(this._formDestroyTasks ?? []),
+        ...(this._pendingModalCloseTasks ?? [])
+      ];
+      const previewSlot = this._previewPlotSlot;
+      if (previewSlot != null) {
+        try {
+          tasks.push(previewSlot.destroy());
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+
+      const modal = this._modal;
+      if (modal != null) {
+        try {
+          tasks.push(closeModal(modal));
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+
+      const outcomes = await Promise.allSettled(tasks);
+      errors.push(
+        ...outcomes
+          .filter(outcome => outcome.status === 'rejected')
+          .map(outcome => outcome.reason)
+      );
+
+      this._previewPlotSlot = null;
+      this._previewPlotHost = null;
+      this._modalPlotSlot = null;
+      this._modal = null;
+      this._formContainer = null;
+      this._resultContainer = null;
+      this._plotContainerId = null;
+      this._requestedPlotOptions = null;
+
       try {
-        operation();
+        await super.destroy();
       } catch (error) {
         errors.push(error);
       }
-    };
-    // Purge any preview plot to release Plotly/WebGL resources before DOM removal.
-    run(() => {
-      const plotEl = this._plotContainerId
-        ? document.getElementById(this._plotContainerId)
-        : this._container?.querySelector?.('.analysis-preview-plot');
-      if (plotEl) purgePlot(plotEl);
-    });
 
-    // Close modal if open
-    if (this._modal) {
-      run(() => closeModal(this._modal));
-      this._modal = null;
-    }
-    // Clear form-specific state
-    this._formContainer = null;
-    this._resultContainer = null;
-    this._plotContainerId = null;
-    // Base class handles _selectedPages, _lastResult, _isLoading
-    run(() => super.destroy());
-
-    if (errors.length === 1) throw errors[0];
-    if (errors.length > 1) {
-      throw new AggregateError(
+      const failure = combineErrors(
         errors,
-        `Form analysis teardown failed in ${errors.length} operations`
+        'Form analysis teardown failed'
       );
-    }
+      if (failure) throw failure;
+    });
+    void this._destroyPromise.catch(() => {});
+    return this._destroyPromise;
   }
 }
 

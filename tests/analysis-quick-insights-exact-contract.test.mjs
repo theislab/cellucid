@@ -5,6 +5,48 @@ import test from 'node:test';
 import {
   QuickInsights,
 } from '../assets/js/app/analysis/ui/analysis-types/quick-insights-ui.js';
+import {
+  AnalysisUIManager,
+} from '../assets/js/app/analysis/ui/analysis-ui-manager.js';
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
+}
+
+function quickInsightsOwnershipHarness({ isVisible = () => true } = {}) {
+  const computation = deferred();
+  const publications = [];
+  const pages = [
+    { id: 'page-1', name: 'Page 1', highlightedGroups: [] },
+    { id: 'page-2', name: 'Page 2', highlightedGroups: [] },
+  ];
+  const insights = new QuickInsights({
+    container: null,
+    dataLayer: {
+      getActiveHighlightPageId() {
+        return 'page-1';
+      },
+      getPages() {
+        return pages;
+      },
+    },
+  });
+
+  insights._isVisible = isVisible;
+  insights._computeInsights = () => computation.promise;
+  insights._renderEmpty = () => publications.push({ type: 'empty' });
+  insights._renderError = message => publications.push({ message, type: 'error' });
+  insights._renderInsights = result => publications.push({ result, type: 'insights' });
+  insights._renderLoading = () => publications.push({ type: 'loading' });
+
+  return { computation, insights, publications };
+}
 
 function quickInsightsHarness({
   categoricalFields = [{ key: 'cell_type', name: 'Cell type' }],
@@ -165,4 +207,98 @@ test('Quick Insights exposes only the current selected-pages and settings contra
   assert.doesNotMatch(source, /\bupdateForActivePage\b/);
   assert.doesNotMatch(source, /settings\.pageMode|settings\.manuallySelectedPages/);
   assert.doesNotMatch(source, /legacy method|legacy format|backwards compatibility/i);
+});
+
+test('Quick Insights publishes a new trigger generation before its debounce window', async t => {
+  t.mock.method(console, 'error', () => {});
+  const { computation, insights, publications } = quickInsightsOwnershipHarness();
+  const pending = insights.updateForSelectedPages();
+  publications.length = 0;
+  const previousRequestId = insights._currentRequestId;
+
+  insights._triggerUpdate();
+  const requestIdAfterTrigger = insights._currentRequestId;
+  computation.reject(new Error('older request failed after the newer intent'));
+  await pending;
+  insights.destroy();
+
+  assert.deepEqual(
+    {
+      publications,
+      requestGenerationAdvanced:
+        requestIdAfterTrigger === previousRequestId + 1,
+    },
+    {
+      publications: [],
+      requestGenerationAdvanced: true,
+    },
+  );
+});
+
+test('Quick Insights page, destroy, and dataset-reset intents own all later publication', async () => {
+  let visible = true;
+  const pageCase = quickInsightsOwnershipHarness({
+    isVisible: () => visible,
+  });
+  const pagePending = pageCase.insights.updateForSelectedPages();
+  pageCase.publications.length = 0;
+  pageCase.insights._pageSelector = {
+    destroy() {},
+    getSelectedPages() {
+      return ['page-2'];
+    },
+    isDynamicMode() {
+      return false;
+    },
+  };
+  const pageRequestId = pageCase.insights._currentRequestId;
+  visible = false;
+  pageCase.insights._handlePageChange(['page-2']);
+  const pageRequestIdAfterIntent = pageCase.insights._currentRequestId;
+  pageCase.computation.resolve({
+    pages: [{ cellCount: 1, id: 'page-1', name: 'Page 1' }],
+    totalCells: 1,
+  });
+  await pagePending;
+  pageCase.insights.destroy();
+
+  const destroyCase = quickInsightsOwnershipHarness();
+  const destroyPending = destroyCase.insights.updateForSelectedPages();
+  destroyCase.publications.length = 0;
+  destroyCase.insights.destroy();
+  destroyCase.computation.reject(
+    new Error('request failed after direct destruction'),
+  );
+  await destroyPending;
+
+  const datasetCase = quickInsightsOwnershipHarness();
+  const datasetPending = datasetCase.insights.updateForSelectedPages();
+  datasetCase.publications.length = 0;
+  const manager = Object.create(AnalysisUIManager.prototype);
+  manager._uis = new Map([
+    ['quick', { initialized: true, ui: datasetCase.insights }],
+  ]);
+  manager._activeMode = 'quick';
+  manager._currentPages = ['page-1'];
+  manager.reset();
+  datasetCase.computation.reject(
+    new Error('request failed after dataset-reset teardown'),
+  );
+  await datasetPending;
+
+  assert.deepEqual(
+    {
+      datasetReset: datasetCase.publications,
+      destroy: destroyCase.publications,
+      hiddenPageChange: pageCase.publications,
+      pageGenerationAdvanced:
+        pageRequestIdAfterIntent === pageRequestId + 1,
+    },
+    {
+      datasetReset: [],
+      destroy: [],
+      hiddenPageChange: [],
+      pageGenerationAdvanced: true,
+    },
+  );
 });

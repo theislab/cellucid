@@ -170,6 +170,24 @@ function requireJupyterRuntimeConfig(config) {
   return config;
 }
 
+function captureJupyterRuntimeConfig(config) {
+  const exactConfig = requireJupyterRuntimeConfig(config);
+  return Object.freeze({
+    serverUrl: exactConfig.serverUrl,
+    viewerId: exactConfig.viewerId,
+    viewerToken: exactConfig.viewerToken
+  });
+}
+
+function createJupyterLifecycleSupersededError(label) {
+  const error = new Error(
+    `${label} was superseded by a newer Jupyter lifecycle.`
+  );
+  error.name = 'AbortError';
+  error.code = 'CELLUCID_JUPYTER_LIFECYCLE_SUPERSEDED';
+  return error;
+}
+
 function requireJupyterSuccessPayload(payload, label) {
   if (
     payload === null ||
@@ -480,7 +498,7 @@ export async function uploadJupyterSessionBundle(options) {
       'Session upload options must contain exactly config, message, createSessionBundle, and fetchImpl'
     );
   }
-  const config = requireJupyterRuntimeConfig(options.config);
+  const config = captureJupyterRuntimeConfig(options.config);
   const message = options.message;
   if (
     message === null ||
@@ -510,16 +528,18 @@ export async function uploadJupyterSessionBundle(options) {
     throw new TypeError('fetchImpl must be a function');
   }
 
-  const blob = await options.createSessionBundle();
+  const requestId = message.requestId;
+  const createSessionBundle = options.createSessionBundle;
+  const fetchImpl = options.fetchImpl;
+  const blob = await createSessionBundle();
   if (!(blob instanceof Blob) || blob.size <= 0) {
     throw new TypeError('Session serializer must produce one non-empty Blob');
   }
   const query = new URLSearchParams([
     ['viewerId', config.viewerId],
     ['viewerToken', config.viewerToken],
-    ['requestId', message.requestId],
+    ['requestId', requestId],
   ]);
-  const fetchImpl = options.fetchImpl;
   const response = await fetchImpl(
     `${config.serverUrl}/_cellucid/session_bundle?${query.toString()}`,
     {
@@ -546,9 +566,16 @@ export async function uploadJupyterSessionBundle(options) {
  * Data source for Jupyter notebook integration
  */
 export class JupyterBridgeDataSource {
-  constructor() {
+  constructor(config = getJupyterConfig()) {
+    /** @type {JupyterConfig|null} */
+    this._declaredConfig = config === null
+      ? null
+      : captureJupyterRuntimeConfig(config);
+
     /** @type {JupyterConfig|null} */
     this._config = null;
+
+    this._parentWindow = window.parent;
 
     /**
      * Captured parent origin for outgoing postMessage.
@@ -572,11 +599,97 @@ export class JupyterBridgeDataSource {
     /** @type {Set<Function>} */
     this._highlightCallbacks = new Set();
 
+    this._lifecycleRevision = 0;
+    this._catalogRevision = 0;
+    this._destroyed = false;
+    this._listenerInstalled = false;
+
     this.type = 'jupyter';
 
-    // Set up message listener
-    this._boundMessageHandler = this._handleMessage.bind(this);
+    this._boundMessageHandler = event => {
+      this._observeMessage(event);
+    };
+  }
+
+  _assertAlive() {
+    if (this._destroyed) {
+      throw new Error('Jupyter source has been destroyed.');
+    }
+  }
+
+  _installMessageListener() {
+    if (this._listenerInstalled) return;
     window.addEventListener('message', this._boundMessageHandler);
+    this._listenerInstalled = true;
+  }
+
+  _removeMessageListener() {
+    if (!this._listenerInstalled) return;
+    window.removeEventListener('message', this._boundMessageHandler);
+    this._listenerInstalled = false;
+  }
+
+  _reportMessageFailure(error) {
+    console.error('[JupyterBridge] Authenticated message failed:', error);
+  }
+
+  _observeMessage(event) {
+    let result;
+    try {
+      result = this._handleMessage(event);
+    } catch (error) {
+      this._reportMessageFailure(error);
+      return;
+    }
+    if (
+      result !== null &&
+      (
+        typeof result === 'object' ||
+        typeof result === 'function'
+      ) &&
+      typeof result.then === 'function'
+    ) {
+      void Promise.resolve(result).catch(error => {
+        this._reportMessageFailure(error);
+      });
+    }
+  }
+
+  _assertLifecycle(revision, label) {
+    if (
+      this._destroyed ||
+      revision !== this._lifecycleRevision
+    ) {
+      throw createJupyterLifecycleSupersededError(label);
+    }
+  }
+
+  _captureConnection(label) {
+    this._assertAlive();
+    if (!this._connected || this._config === null) {
+      throw new Error(`${label} requires an initialized connection.`);
+    }
+    return {
+      config: this._config,
+      lifecycleRevision: this._lifecycleRevision
+    };
+  }
+
+  _assertConnection(owner, label) {
+    this._assertLifecycle(owner.lifecycleRevision, label);
+    if (
+      !this._connected ||
+      this._config !== owner.config
+    ) {
+      throw createJupyterLifecycleSupersededError(label);
+    }
+  }
+
+  _assertCatalog(owner, label) {
+    this._assertConnection(owner, label);
+    if (owner.catalogRevision !== this._catalogRevision) {
+      throw createJupyterLifecycleSupersededError(label);
+    }
   }
 
   /**
@@ -592,7 +705,7 @@ export class JupyterBridgeDataSource {
    * @returns {Promise<boolean>}
    */
   async isAvailable() {
-    return isJupyterContext() && this._connected;
+    return this._declaredConfig !== null && this._connected;
   }
 
   /**
@@ -600,16 +713,36 @@ export class JupyterBridgeDataSource {
    * @returns {Promise<boolean>} True if successfully initialized
    */
   async initialize() {
-    const config = getJupyterConfig();
-    if (!config) {
+    this._assertAlive();
+    const config = this._declaredConfig;
+    if (config === null) {
       return false;
     }
 
-    await requestJupyterHealth(config);
-
-    this._config = config;
-    this._connected = true;
-    return true;
+    const revision = ++this._lifecycleRevision;
+    this._catalogRevision += 1;
+    this._removeMessageListener();
+    this._connected = false;
+    this._config = null;
+    this._parentOrigin = null;
+    this._datasetCache.clear();
+    this._datasetPaths.clear();
+    try {
+      await requestJupyterHealth(config);
+      this._assertLifecycle(revision, 'Jupyter initialization');
+      this._config = config;
+      this._connected = true;
+      this._installMessageListener();
+      return true;
+    } catch (error) {
+      if (revision === this._lifecycleRevision) {
+        this._removeMessageListener();
+        this._connected = false;
+        this._config = null;
+        this._parentOrigin = null;
+      }
+      throw error;
+    }
   }
 
   /**
@@ -617,10 +750,10 @@ export class JupyterBridgeDataSource {
    * @returns {Promise<Object>}
    */
   async checkHealth() {
-    if (!this._connected) {
-      throw new Error('Jupyter health check requires an initialized connection');
-    }
-    return requestJupyterHealth(this._config);
+    const owner = this._captureConnection('Jupyter health check');
+    const payload = await requestJupyterHealth(owner.config);
+    this._assertConnection(owner, 'Jupyter health check');
+    return payload;
   }
 
   /**
@@ -629,13 +762,15 @@ export class JupyterBridgeDataSource {
    * @private
    */
   _handleMessage(event) {
+    if (!this._connected || this._config === null) return;
+    if (event?.source !== this._parentWindow) return;
     const data = event.data;
     if (!isPlainRecord(data)) return;
 
     const config = requireJupyterRuntimeConfig(this._config);
 
     // Messages without this viewer's secret are unrelated window traffic.
-    if (data.viewerToken !== this._config.viewerToken) return;
+    if (data.viewerToken !== config.viewerToken) return;
 
     if (data.viewerId !== config.viewerId) {
       throw new TypeError(
@@ -839,7 +974,8 @@ export class JupyterBridgeDataSource {
    * @private
    */
   async _postEventToPython(event) {
-    const config = requireJupyterRuntimeConfig(this._config);
+    const owner = this._captureConnection('Jupyter event delivery');
+    const config = owner.config;
     if (
       !isPlainRecord(event) ||
       typeof event.type !== 'string' ||
@@ -866,6 +1002,7 @@ export class JupyterBridgeDataSource {
       }),
       keepalive: true
     });
+    this._assertConnection(owner, 'Jupyter event delivery');
     if (!(response instanceof Response)) {
       throw new TypeError('Jupyter event fetch must return a Response');
     }
@@ -874,10 +1011,9 @@ export class JupyterBridgeDataSource {
         `Jupyter event delivery failed with HTTP ${response.status}`
       );
     }
-    requireJupyterSuccessPayload(
-      await response.json(),
-      'Jupyter event delivery'
-    );
+    const payload = await response.json();
+    this._assertConnection(owner, 'Jupyter event delivery');
+    requireJupyterSuccessPayload(payload, 'Jupyter event delivery');
   }
 
   // =========================================================================
@@ -1095,10 +1231,16 @@ export class JupyterBridgeDataSource {
         this.type
       );
     }
+    const owner = {
+      config: this._config,
+      lifecycleRevision: this._lifecycleRevision,
+      catalogRevision: ++this._catalogRevision
+    };
 
     const response = await fetch(
-      `${this._config.serverUrl}/_cellucid/datasets`
+      `${owner.config.serverUrl}/_cellucid/datasets`
     );
+    this._assertCatalog(owner, 'Jupyter dataset listing');
     if (!(response instanceof Response)) {
       throw new TypeError(
         'Jupyter dataset listing fetch must return a Response'
@@ -1110,14 +1252,16 @@ export class JupyterBridgeDataSource {
       );
     }
 
-    const datasetList = requireDatasetCatalogPayload(await response.json());
+    const catalogPayload = await response.json();
+    this._assertCatalog(owner, 'Jupyter dataset listing');
+    const datasetList = requireDatasetCatalogPayload(catalogPayload);
     const stagedPaths = new Map(
       datasetList.map(dataset => [dataset.id, dataset.path])
     );
     const stagedMetadataEntries = await Promise.all(
       datasetList.map(async dataset => {
         const metadata = await loadDatasetMetadata(
-          `${this._config.serverUrl}${dataset.path}`,
+          `${owner.config.serverUrl}${dataset.path}`,
           dataset.id,
           this.type
         );
@@ -1125,6 +1269,7 @@ export class JupyterBridgeDataSource {
       })
     );
     const stagedCache = new Map(stagedMetadataEntries);
+    this._assertCatalog(owner, 'Jupyter dataset listing');
 
     this._datasetPaths = stagedPaths;
     this._datasetCache = stagedCache;
@@ -1194,12 +1339,23 @@ export class JupyterBridgeDataSource {
       return this._datasetCache.get(id);
     }
 
+    const owner = {
+      config: this._config,
+      lifecycleRevision: this._lifecycleRevision,
+      catalogRevision: this._catalogRevision
+    };
     const datasetPath = this._requireDeclaredDatasetPath(id);
     const metadata = await loadDatasetMetadata(
-      `${this._config.serverUrl}${datasetPath}`,
+      `${owner.config.serverUrl}${datasetPath}`,
       id,
       this.type
     );
+    this._assertCatalog(owner, 'Jupyter dataset metadata');
+    if (this._datasetPaths.get(id) !== datasetPath) {
+      throw createJupyterLifecycleSupersededError(
+        'Jupyter dataset metadata'
+      );
+    }
     this._datasetCache.set(id, metadata);
     return metadata;
   }
@@ -1321,6 +1477,7 @@ export class JupyterBridgeDataSource {
    * Refresh cached data
    */
   refresh() {
+    this._catalogRevision += 1;
     this._datasetCache.clear();
   }
 
@@ -1328,6 +1485,9 @@ export class JupyterBridgeDataSource {
    * Cleanup on deactivation
    */
   onDeactivate() {
+    // Keep the authenticated notebook transport reusable when another
+    // registered data source is selected. Explicit disconnect/destroy owns
+    // terminal listener and callback cleanup.
     return undefined;
   }
 
@@ -1335,7 +1495,9 @@ export class JupyterBridgeDataSource {
    * Cleanup and disconnect
    */
   disconnect() {
-    window.removeEventListener('message', this._boundMessageHandler);
+    this._lifecycleRevision += 1;
+    this._catalogRevision += 1;
+    this._removeMessageListener();
     this._connected = false;
     this._config = null;
     this._parentOrigin = null;
@@ -1344,12 +1506,21 @@ export class JupyterBridgeDataSource {
     this._messageCallbacks.clear();
     this._highlightCallbacks.clear();
   }
+
+  destroy() {
+    if (this._destroyed) return;
+    this.disconnect();
+    this._destroyed = true;
+  }
 }
 
 /**
  * Create a JupyterBridgeDataSource instance
+ * @param {JupyterConfig|null} [config]
  * @returns {JupyterBridgeDataSource}
  */
-export function createJupyterBridgeDataSource() {
-  return new JupyterBridgeDataSource();
+export function createJupyterBridgeDataSource(
+  config = getJupyterConfig()
+) {
+  return new JupyterBridgeDataSource(config);
 }

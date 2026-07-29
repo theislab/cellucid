@@ -35,9 +35,10 @@ const identity = {
     n_edges: null,
   },
   embeddings: {
-    available_dimensions: [3],
+    available_dimensions: [2, 3],
     default_dimension: 3,
     files: {
+      '2d': 'points_2d.bin',
       '3d': 'points_3d.bin',
     },
   },
@@ -89,6 +90,23 @@ function createDeterministic3dPositions() {
   return buffer;
 }
 
+function createDeterministic2dPositions() {
+  const positions3d = createDeterministic3dPositions();
+  const positions2d = Buffer.alloc(
+    CELL_COUNT * 2 * Float32Array.BYTES_PER_ELEMENT,
+  );
+  for (let index = 0; index < CELL_COUNT; index++) {
+    for (let axis = 0; axis < 2; axis++) {
+      positions2d.writeFloatLE(
+        positions3d.readFloatLE(((index * 3) + axis) * 4),
+        ((index * 2) + axis) * 4,
+      );
+    }
+  }
+  return positions2d;
+}
+
+const position2dBytes = createDeterministic2dPositions();
 const positionBytes = createDeterministic3dPositions();
 
 function observeProductErrors(page) {
@@ -130,6 +148,13 @@ async function installSynthetic3dFixture(page) {
       {
         body: Buffer.from(JSON.stringify(obsManifest)),
         contentType: 'application/json; charset=utf-8',
+      },
+    ],
+    [
+      `/tests/browser/fixtures/generated-3d/${DATASET_ID}/points_2d.bin`,
+      {
+        body: position2dBytes,
+        contentType: 'application/octet-stream',
       },
     ],
     [
@@ -277,6 +302,113 @@ test('a fresh deterministic 3-D dataset selects dimension 3 and Orbit', async ({
   expect(productErrors).toEqual([]);
 });
 
+test('snapshot dimension switches publish one exact geometry generation', async ({
+  page,
+}) => {
+  const productErrors = observeProductErrors(page);
+  await installSynthetic3dFixture(page);
+
+  await page.goto(
+    `/?exportsBaseUrl=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
+      `&dataset=${DATASET_ID}&acceptance=snapshot-dimension-generation`,
+    { waitUntil: 'domcontentloaded' },
+  );
+  await dismissWelcome(page);
+  await expect(page.locator('#dataset-name')).toHaveText(
+    'Deterministic 3-D orbit fixture',
+  );
+
+  const snapshotId = await keepCurrentViewThroughUi(page);
+  const result = await page.evaluate(async (viewId) => {
+    const state = window._cellucidState;
+    const viewer = window._cellucidViewer;
+    const publish = async dimensionLevel => {
+      await state.setDimensionLevel(dimensionLevel, { viewId });
+      await new Promise(resolve => {
+        requestAnimationFrame(() => requestAnimationFrame(resolve));
+      });
+      return {
+        state: state.getViewDimensionLevel(viewId),
+        viewer: viewer.getViewDimension(viewId),
+      };
+    };
+    return {
+      twoDimensional: await publish(2),
+      threeDimensional: await publish(3),
+      webglError: viewer.getGLContext().getError(),
+    };
+  }, snapshotId);
+
+  expect(result).toEqual({
+    twoDimensional: {
+      state: 2,
+      viewer: 2,
+    },
+    threeDimensional: {
+      state: 3,
+      viewer: 3,
+    },
+    webglError: 0,
+  });
+  expect(productErrors).toEqual([]);
+});
+
+test('a navigation observer failure cannot enter dimension rollback', async ({
+  page,
+}) => {
+  await installSynthetic3dFixture(page);
+
+  await page.goto(
+    `/?exportsBaseUrl=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
+      `&dataset=${DATASET_ID}&acceptance=dimension-observer-boundary`,
+    { waitUntil: 'domcontentloaded' },
+  );
+  await dismissWelcome(page);
+  await expect(page.locator('#dataset-name')).toHaveText(
+    'Deterministic 3-D orbit fixture',
+  );
+
+  const result = await page.evaluate(async () => {
+    const state = window._cellucidState;
+    const viewer = window._cellucidViewer;
+    const marker = 'synthetic navigation observer failure';
+    const observedErrors = [];
+    const onError = event => {
+      observedErrors.push(event.error?.message ?? event.message);
+      event.preventDefault();
+    };
+    window.addEventListener('error', onError);
+    viewer.setNavigationModeChangeHandler(() => {
+      throw new Error(marker);
+    });
+
+    let rejection = null;
+    try {
+      await state.setDimensionLevel(2, { viewId: 'live' });
+    } catch (error) {
+      rejection = error instanceof Error ? error.message : String(error);
+    }
+    await new Promise(resolve => setTimeout(resolve, 0));
+    window.removeEventListener('error', onError);
+
+    return {
+      observedErrors,
+      rejection,
+      navigationMode: viewer.getNavigationMode(),
+      stateDimension: state.getViewDimensionLevel('live'),
+      viewerDimension: viewer.getViewDimension('live'),
+    };
+  });
+
+  expect(result).toEqual({
+    observedErrors: ['synthetic navigation observer failure'],
+    rejection: null,
+    navigationMode: 'planar',
+    stateDimension: 2,
+    viewerDimension: 2,
+  });
+});
+
 test('Orbit and Planar targets follow the sidebar-aware visual center', async ({
   page,
 }) => {
@@ -355,7 +487,25 @@ test('Orbit and Planar targets follow the sidebar-aware visual center', async ({
   });
   expect(singlePick).toBeGreaterThanOrEqual(0);
 
-  await keepCurrentViewThroughUi(page);
+  const snapshotId = await keepCurrentViewThroughUi(page);
+  const snapshotPosition = await page.evaluate(({ id, cellIndex }) => {
+    const viewer = window._cellucidViewer;
+    const snapshotPositions = viewer.getPositions();
+    const offset = cellIndex * 3;
+    snapshotPositions[offset] += 0.005;
+    snapshotPositions[offset + 1] += 0.004;
+    snapshotPositions[offset + 2] += 0.003;
+    viewer.setViewPositions(
+      id,
+      snapshotPositions,
+      viewer.getViewDimension(id),
+    );
+    return {
+      x: snapshotPositions[offset],
+      y: snapshotPositions[offset + 1],
+      z: snapshotPositions[offset + 2],
+    };
+  }, { id: snapshotId, cellIndex: singlePick });
   const interactionProof = await page.evaluate(() => {
     const viewer = window._cellucidViewer;
     const canvas = document.getElementById('glcanvas');
@@ -366,21 +516,73 @@ test('Orbit and Planar targets follow the sidebar-aware visual center', async ({
     const paneWidth = canvasRect.width / 2;
     const leftPaneRight = canvasRect.left + paneWidth;
     const rightPaneLeft = leftPaneRight;
+    const leftX =
+      (Math.max(canvasRect.left, sidebarRight) + leftPaneRight) / 2;
+    const rightX =
+      (rightPaneLeft + canvasRect.right) / 2;
+    const leftRecord = viewer.pickCellRecordAtScreen(leftX, centerY);
+    const rightRecord = viewer.pickCellRecordAtScreen(rightX, centerY);
     return {
-      leftPick: viewer.pickCellAtScreen(
-        (Math.max(canvasRect.left, sidebarRight) + leftPaneRight) / 2,
-        centerY,
-      ),
-      rightPick: viewer.pickCellAtScreen(
-        (rightPaneLeft + canvasRect.right) / 2,
-        centerY,
-      ),
+      leftPick: viewer.pickCellAtScreen(leftX, centerY),
+      rightPick: viewer.pickCellAtScreen(rightX, centerY),
+      leftRecord,
+      rightRecord,
+      leftRecordFrozen: Object.isFrozen(leftRecord),
+      rightRecordFrozen: Object.isFrozen(rightRecord),
+      rightPositionFrozen: Object.isFrozen(rightRecord?.position),
       webglError: viewer.getGLContext().getError(),
     };
   });
   expect(interactionProof.leftPick).toBe(singlePick);
   expect(interactionProof.rightPick).toBe(singlePick);
+  expect(interactionProof.leftRecord).toEqual({
+    viewId: 'live',
+    cellIndex: singlePick,
+    position: await page.evaluate(
+      cellIndex => window._cellucidViewer.getCellPosition(cellIndex, 'live'),
+      singlePick,
+    ),
+  });
+  expect(interactionProof.rightRecord).toEqual({
+    viewId: snapshotId,
+    cellIndex: singlePick,
+    position: snapshotPosition,
+  });
+  expect(interactionProof.leftRecordFrozen).toBe(true);
+  expect(interactionProof.rightRecordFrozen).toBe(true);
+  expect(interactionProof.rightPositionFrozen).toBe(true);
   expect(interactionProof.webglError).toBe(0);
+
+  const paneTargetRadiusProof = await page.evaluate(id => {
+    const viewer = window._cellucidViewer;
+    viewer.setCamerasLocked(false);
+    const snapshotCamera = viewer.getViewCameraState(id);
+    snapshotCamera.orbit.targetRadius = 0.001;
+    viewer.setViewCameraState(id, snapshotCamera);
+
+    const canvas = document.getElementById('glcanvas');
+    const sidebar = document.getElementById('sidebar');
+    const canvasRect = canvas.getBoundingClientRect();
+    const sidebarRight = sidebar.offsetLeft + sidebar.offsetWidth;
+    const centerY = (canvasRect.top + canvasRect.bottom) / 2;
+    const paneWidth = canvasRect.width / 2;
+    const leftPaneRight = canvasRect.left + paneWidth;
+    const rightPaneLeft = leftPaneRight;
+    const liveRecord = viewer.pickCellRecordAtScreen(
+      (Math.max(canvasRect.left, sidebarRight) + leftPaneRight) / 2,
+      centerY,
+    );
+    const snapshotRecord = viewer.pickCellRecordAtScreen(
+      (rightPaneLeft + canvasRect.right) / 2,
+      centerY,
+    );
+    return {
+      liveCell: liveRecord?.cellIndex ?? -1,
+      snapshotCell: snapshotRecord?.cellIndex ?? -1,
+    };
+  }, snapshotId);
+  expect(paneTargetRadiusProof.liveCell).toBe(singlePick);
+  expect(paneTargetRadiusProof.snapshotCell).toBe(-1);
 
   expect(productErrors).toEqual([]);
 });

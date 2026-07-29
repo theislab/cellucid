@@ -9,7 +9,23 @@
  * - Styling is handled by CSS (`.inline-rename-input`).
  */
 
+const activeEditorCancelers = new WeakMap();
+const activeTargetCancelers = new WeakMap();
+
 export class InlineEditor {
+  /**
+   * Cancel one exact active editor without invoking its save callback.
+   *
+   * @param {HTMLInputElement} input
+   * @returns {boolean} Whether the input still owned an active editor
+   */
+  static cancel(input) {
+    const cancel = activeEditorCancelers.get(input);
+    if (cancel === undefined) return false;
+    cancel();
+    return true;
+  }
+
   /**
    * @param {HTMLElement} targetEl
    * @param {string} currentValue
@@ -25,6 +41,11 @@ export class InlineEditor {
     const { onSave, onCancel, validate, minWidth = 120 } = options || {};
     if (typeof onSave !== 'function') return null;
 
+    const previousCancel = activeTargetCancelers.get(targetEl);
+    if (previousCancel !== undefined) {
+      previousCancel();
+    }
+
     const rect = targetEl.getBoundingClientRect?.() || { width: minWidth };
     const input = document.createElement('input');
     input.type = 'text';
@@ -37,10 +58,30 @@ export class InlineEditor {
     targetEl.parentNode?.insertBefore(input, targetEl.nextSibling);
 
     let finished = false;
+    let cancelEditor = null;
 
     const cleanup = () => {
-      input.remove();
-      targetEl.style.display = originalDisplay || '';
+      activeEditorCancelers.delete(input);
+      if (activeTargetCancelers.get(targetEl) === cancelEditor) {
+        activeTargetCancelers.delete(targetEl);
+      }
+      let failure = null;
+      try {
+        input.remove();
+      } catch (error) {
+        failure = error;
+      }
+      try {
+        targetEl.style.display = originalDisplay || '';
+      } catch (error) {
+        failure = failure === null
+          ? error
+          : new AggregateError(
+              [failure, error],
+              'Inline editor DOM cleanup failed.'
+            );
+      }
+      if (failure !== null) throw failure;
     };
 
     const finish = (shouldSave) => {
@@ -48,25 +89,45 @@ export class InlineEditor {
       finished = true;
 
       const nextValue = input.value.trim();
-
-      if (shouldSave && nextValue && nextValue !== String(currentValue ?? '').trim()) {
-        if (validate) {
-          const result = validate(nextValue);
-          if (result !== true) {
-            input.classList.add('error');
-            input.title = typeof result === 'string' ? result : 'Invalid value';
-            finished = false;
-            input.focus();
-            return;
+      let callbackFailure = null;
+      try {
+        if (shouldSave && nextValue && nextValue !== String(currentValue ?? '').trim()) {
+          if (validate) {
+            const result = validate(nextValue);
+            if (result !== true) {
+              input.classList.add('error');
+              input.title = typeof result === 'string' ? result : 'Invalid value';
+              finished = false;
+              input.focus();
+              return;
+            }
           }
+          onSave(nextValue);
+        } else {
+          onCancel?.();
         }
-        onSave(nextValue);
-      } else {
-        onCancel?.();
+      } catch (error) {
+        callbackFailure = error;
       }
 
-      cleanup();
+      let cleanupFailure = null;
+      try {
+        cleanup();
+      } catch (error) {
+        cleanupFailure = error;
+      }
+      if (callbackFailure !== null && cleanupFailure !== null) {
+        throw new AggregateError(
+          [callbackFailure, cleanupFailure],
+          'Inline editor callback and cleanup both failed.'
+        );
+      }
+      if (callbackFailure !== null) throw callbackFailure;
+      if (cleanupFailure !== null) throw cleanupFailure;
     };
+    cancelEditor = () => finish(false);
+    activeEditorCancelers.set(input, cancelEditor);
+    activeTargetCancelers.set(targetEl, cancelEditor);
 
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
@@ -84,6 +145,7 @@ export class InlineEditor {
     });
 
     requestAnimationFrame(() => {
+      if (finished) return;
       input.focus();
       input.select();
     });
@@ -91,4 +153,3 @@ export class InlineEditor {
     return input;
   }
 }
-

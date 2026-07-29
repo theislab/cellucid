@@ -1,4 +1,21 @@
 // WebGL helpers for shader/program creation and data normalization.
+function asError(value, fallbackMessage) {
+  return value instanceof Error ? value : new Error(fallbackMessage);
+}
+
+function attemptCleanup(failures, cleanup, fallbackMessage) {
+  try {
+    cleanup();
+  } catch (error) {
+    failures.push(asError(error, fallbackMessage));
+  }
+}
+
+function throwTransactionFailure(failures, message) {
+  if (failures.length === 1) throw failures[0];
+  throw new AggregateError(failures, message);
+}
+
 export function createRequiredTexture(gl, role) {
   if (!gl || typeof gl.createTexture !== 'function') {
     throw new TypeError(
@@ -18,32 +35,134 @@ export function createRequiredTexture(gl, role) {
 }
 
 export function createShader(gl, type, source) {
-  const shader = gl.createShader(type);
-  gl.shaderSource(shader, source);
-  gl.compileShader(shader);
-  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-    const info = gl.getShaderInfoLog(shader);
-    gl.deleteShader(shader);
-    throw new Error('Could not compile shader:\n' + info);
+  let shader = null;
+  try {
+    shader = gl.createShader(type);
+    if (!shader) {
+      throw new Error('Required WebGL shader allocation failed.');
+    }
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      const info = gl.getShaderInfoLog(shader);
+      throw new Error('Could not compile shader:\n' + info);
+    }
+    return shader;
+  } catch (error) {
+    const failures = [
+      asError(error, 'WebGL shader creation failed with a non-Error value.')
+    ];
+    if (shader) {
+      attemptCleanup(
+        failures,
+        () => gl.deleteShader(shader),
+        'WebGL shader rollback failed with a non-Error value.'
+      );
+    }
+    throwTransactionFailure(
+      failures,
+      'WebGL shader creation and rollback failed.'
+    );
   }
-  return shader;
+}
+
+function createLinkedProgram(
+  gl,
+  vsSource,
+  fsSource,
+  configureProgram,
+  linkFailurePrefix
+) {
+  let vs = null;
+  let fs = null;
+  let program = null;
+  try {
+    vs = createShader(gl, gl.VERTEX_SHADER, vsSource);
+    fs = createShader(gl, gl.FRAGMENT_SHADER, fsSource);
+    program = gl.createProgram();
+    if (!program) {
+      throw new Error('Could not allocate the required WebGL program.');
+    }
+    gl.attachShader(program, vs);
+    gl.attachShader(program, fs);
+    configureProgram(program);
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      const info = gl.getProgramInfoLog(program);
+      throw new Error(`${linkFailurePrefix}:\n${info}`);
+    }
+
+    const cleanupFailures = [];
+    const ownedVs = vs;
+    vs = null;
+    attemptCleanup(
+      cleanupFailures,
+      () => gl.deleteShader(ownedVs),
+      'WebGL vertex-shader cleanup failed with a non-Error value.'
+    );
+    const ownedFs = fs;
+    fs = null;
+    attemptCleanup(
+      cleanupFailures,
+      () => gl.deleteShader(ownedFs),
+      'WebGL fragment-shader cleanup failed with a non-Error value.'
+    );
+    if (cleanupFailures.length > 0) {
+      const ownedProgram = program;
+      program = null;
+      attemptCleanup(
+        cleanupFailures,
+        () => gl.deleteProgram(ownedProgram),
+        'WebGL program rollback failed with a non-Error value.'
+      );
+      throwTransactionFailure(
+        cleanupFailures,
+        'WebGL program linked but shader cleanup failed.'
+      );
+    }
+    const result = program;
+    program = null;
+    return result;
+  } catch (error) {
+    const failures = [
+      asError(error, 'WebGL program creation failed with a non-Error value.')
+    ];
+    if (program) {
+      attemptCleanup(
+        failures,
+        () => gl.deleteProgram(program),
+        'WebGL program rollback failed with a non-Error value.'
+      );
+    }
+    if (fs) {
+      attemptCleanup(
+        failures,
+        () => gl.deleteShader(fs),
+        'WebGL fragment-shader rollback failed with a non-Error value.'
+      );
+    }
+    if (vs) {
+      attemptCleanup(
+        failures,
+        () => gl.deleteShader(vs),
+        'WebGL vertex-shader rollback failed with a non-Error value.'
+      );
+    }
+    throwTransactionFailure(
+      failures,
+      'WebGL program creation and rollback failed.'
+    );
+  }
 }
 
 export function createProgram(gl, vsSource, fsSource) {
-  const vs = createShader(gl, gl.VERTEX_SHADER, vsSource);
-  const fs = createShader(gl, gl.FRAGMENT_SHADER, fsSource);
-  const program = gl.createProgram();
-  gl.attachShader(program, vs);
-  gl.attachShader(program, fs);
-  gl.linkProgram(program);
-  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-    const info = gl.getProgramInfoLog(program);
-    gl.deleteProgram(program);
-    throw new Error('Could not link program:\n' + info);
-  }
-  gl.deleteShader(vs);
-  gl.deleteShader(fs);
-  return program;
+  return createLinkedProgram(
+    gl,
+    vsSource,
+    fsSource,
+    () => {},
+    'Could not link program'
+  );
 }
 
 /**
@@ -67,24 +186,14 @@ export function createTransformFeedbackProgram(
   varyings,
   bufferMode = undefined
 ) {
-  const vs = createShader(gl, gl.VERTEX_SHADER, vsSource);
-  const fs = createShader(gl, gl.FRAGMENT_SHADER, fsSource);
-  const program = gl.createProgram();
-  gl.attachShader(program, vs);
-  gl.attachShader(program, fs);
-
   const mode = bufferMode ?? gl.INTERLEAVED_ATTRIBS;
-  gl.transformFeedbackVaryings(program, varyings, mode);
-  gl.linkProgram(program);
-
-  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-    const info = gl.getProgramInfoLog(program);
-    gl.deleteProgram(program);
-    throw new Error('Could not link transform feedback program:\n' + info);
-  }
-  gl.deleteShader(vs);
-  gl.deleteShader(fs);
-  return program;
+  return createLinkedProgram(
+    gl,
+    vsSource,
+    fsSource,
+    program => gl.transformFeedbackVaryings(program, varyings, mode),
+    'Could not link transform feedback program'
+  );
 }
 
 /**

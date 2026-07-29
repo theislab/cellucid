@@ -137,6 +137,26 @@ test('renderer statistics publish only after an exact per-view render update', (
   assert.equal(renderer.getStats('live').visiblePoints, 6);
 });
 
+test('per-view state rejects a null GPU index-buffer allocation before publication', () => {
+  const renderer = Object.assign(
+    Object.create(HighPerfRenderer.prototype),
+    {
+      gl: {
+        createBuffer() {
+          return null;
+        },
+      },
+      _perViewState: new Map(),
+    },
+  );
+
+  assert.throws(
+    () => renderer._getViewState('allocation-failure'),
+    /could not allocate.*per-view index buffer/i,
+  );
+  assert.equal(renderer._perViewState.size, 0);
+});
+
 test('performance tracking distinguishes slow visible frames from suspension gaps', () => {
   const tracker = new PerformanceTracker({ warmupFrames: 0 });
   tracker.start();
@@ -222,7 +242,11 @@ test('snapshot buffers publish owned bounds before live position identity can ch
   const rendererSource = await source('high-perf-renderer.js');
   assert.match(
     rendererSource,
-    /const snapshotBounds = HighPerfRenderer\.computeBoundsFromPositions\(positions\)/
+    /snapshotBounds\s*=\s*HighPerfRenderer\.computeBoundsFromPositions\(positions\)/
+  );
+  assert.match(
+    rendererSource,
+    /positions:\s*new Float32Array\(sourcePositions\)/
   );
   assert.match(rendererSource, /bounds:\s*snapshotBounds/);
   assert.doesNotMatch(
@@ -266,6 +290,500 @@ test('an exact empty scene publishes empty alpha state without a synthetic textu
   assert.equal(renderer._useAlphaTexture, false);
   assert.equal(renderer._alphaTexture, null);
   assert.equal(cacheInvalidations, 1);
+});
+
+test('recoloring preserves the exact alpha generation through a position publication', () => {
+  const alphas = Float32Array.from([0, 0.75]);
+  const nextColors = Uint8Array.from([
+    10, 20, 30, 255,
+    40, 50, 60, 255,
+  ]);
+  const nextPositions = Float32Array.from([
+    -1, 0, 0,
+    1, 0, 0,
+  ]);
+  let cacheInvalidations = 0;
+  let published = null;
+  const renderer = Object.assign(Object.create(HighPerfRenderer.prototype), {
+    pointCount: 2,
+    _colors: Uint8Array.from([
+      1, 2, 3, 255,
+      4, 5, 6, 255,
+    ]),
+    _currentAlphas: alphas,
+    _alphaTexture: { id: 'alpha-texture' },
+    _alphaTexWidth: 2,
+    _useAlphaTexture: true,
+    _bufferDirty: false,
+    _dirtyLodDimensions: new Set(),
+    lodBuffersByDimension: new Map(),
+    spatialIndices: new Map(),
+    invalidateLodVisibilityCache() {
+      cacheInvalidations += 1;
+    },
+    _needsSpatialIndex() {
+      return false;
+    },
+    loadData(positions, colors, options) {
+      published = { colors, options, positions };
+    },
+  });
+
+  renderer.updateColors(nextColors);
+
+  assert.strictEqual(renderer.getCurrentAlphas(), alphas);
+  assert.equal(renderer.isAlphaTextureActive(), true);
+  assert.equal(cacheInvalidations, 0);
+
+  renderer.updatePositions(nextPositions, 3);
+
+  assert.strictEqual(published.positions, nextPositions);
+  assert.strictEqual(published.colors, nextColors);
+  assert.strictEqual(published.options.alphaValues, alphas);
+  assert.equal(published.options.dimensionLevel, 3);
+});
+
+test('a recolor flushes each resident dimension only when that dimension renders', () => {
+  let boundBuffer = null;
+  let rejectedBuffer = null;
+  let webglError = 0;
+  const uploads = [];
+  const gl = {
+    ARRAY_BUFFER: 0x8892,
+    DYNAMIC_DRAW: 0x88e8,
+    INVALID_OPERATION: 0x0502,
+    NO_ERROR: 0,
+    bindBuffer(target, buffer) {
+      assert.equal(target, this.ARRAY_BUFFER);
+      boundBuffer = buffer;
+    },
+    bufferData(target, data, usage) {
+      assert.equal(target, this.ARRAY_BUFFER);
+      assert.equal(usage, this.DYNAMIC_DRAW);
+      if (boundBuffer === rejectedBuffer) {
+        webglError = this.INVALID_OPERATION;
+        return;
+      }
+      const bytes = data instanceof ArrayBuffer
+        ? new Uint8Array(data)
+        : new Uint8Array(
+          data.buffer,
+          data.byteOffset,
+          data.byteLength,
+        );
+      const floats = new Float32Array(
+        bytes.buffer,
+        bytes.byteOffset,
+        bytes.byteLength / Float32Array.BYTES_PER_ELEMENT,
+      );
+      const positions = [];
+      const rgba = [];
+      for (let index = 0; index < bytes.length / 16; index++) {
+        positions.push(Array.from(floats.subarray(index * 4, index * 4 + 3)));
+        const byteOffset = index * 16 + 12;
+        rgba.push(Array.from(bytes.subarray(byteOffset, byteOffset + 4)));
+      }
+      uploads.push({ buffer: boundBuffer, positions, rgba });
+    },
+    getError() {
+      const error = webglError;
+      webglError = this.NO_ERROR;
+      return error;
+    },
+  };
+  const colors = Uint8Array.from([
+    10, 11, 12, 13,
+    20, 21, 22, 23,
+    30, 31, 32, 33,
+  ]);
+  const makeLevel = indices => ({
+    indices: Uint32Array.from(indices),
+    isFullDetail: false,
+    pointCount: indices.length,
+  });
+  const positions = Float32Array.from([
+    2, 0, 0,
+    0, 0, 1,
+    -2, 0, 0,
+  ]);
+  const makeSpatialIndex = (dimensionLevel, indices) => {
+    const reduced = makeLevel(indices);
+    return {
+      dimensionLevel,
+      pointCount: 3,
+      positions,
+      lodLevels: [
+        reduced,
+        {
+          isFullDetail: true,
+          pointCount: 3,
+          positions,
+        },
+      ],
+    };
+  };
+  const buffer2d = { id: 'lod-2d' };
+  const buffer3d = { id: 'lod-3d' };
+  const vao2d = { id: 'vao-2d' };
+  const vao3d = { id: 'vao-3d' };
+  const ebo2d = { id: 'ebo-2d' };
+  const ebo3d = { id: 'ebo-3d' };
+  const spatial2d = makeSpatialIndex(2, [2, 0]);
+  const spatial3d = makeSpatialIndex(3, [1]);
+  const token2d = Object.freeze({});
+  const token3d = Object.freeze({});
+  const makeMetadata = (
+    spatialIndex,
+    buffer,
+    vao,
+    ebo,
+    generationToken,
+  ) => [
+    {
+      buffer,
+      generationToken,
+      isFullDetail: false,
+      originalIndexBuffer: ebo,
+      originalIndexCount:
+        spatialIndex.lodLevels[0].pointCount,
+      pointCount: spatialIndex.lodLevels[0].pointCount,
+      vao,
+    },
+    {
+      isFullDetail: true,
+      originalIndexBuffer: null,
+      originalIndexCount: 0,
+      pointCount: 3,
+    },
+  ];
+  const makeOwner = (
+    spatialIndex,
+    buffer,
+    vao,
+    ebo,
+    generationToken,
+  ) => ({
+    compactBuffer: buffer,
+    compactByteLength:
+      spatialIndex.lodLevels[0].pointCount * 16,
+    compactVao: vao,
+    generationToken,
+    gpuByteLength: 0,
+    liveGeometryGeneration: undefined,
+    maximumIndices: spatialIndex.lodLevels[0].indices,
+    pointCount: 3,
+    spatialIndex,
+    topologyOwner: {
+      originalIndexBuffer: ebo,
+    },
+  });
+  const renderer = Object.assign(Object.create(HighPerfRenderer.prototype), {
+    gl,
+    pointCount: 3,
+    currentDimensionLevel: 3,
+    _positions: positions,
+    _colors: new Uint8Array(colors.length),
+    _bufferDirty: false,
+    _dirtyLodDimensions: new Set(),
+    _lodArrayBuffers: null,
+    spatialIndices: new Map([
+      [2, spatial2d],
+      [3, spatial3d],
+    ]),
+    lodBuffersByDimension: new Map([
+      [2, makeMetadata(
+        spatial2d,
+        buffer2d,
+        vao2d,
+        ebo2d,
+        token2d,
+      )],
+      [3, makeMetadata(
+        spatial3d,
+        buffer3d,
+        vao3d,
+        ebo3d,
+        token3d,
+      )],
+    ]),
+    _lodResourceOwnersByDimension: new Map([
+      [2, makeOwner(
+        spatial2d,
+        buffer2d,
+        vao2d,
+        ebo2d,
+        token2d,
+      )],
+      [3, makeOwner(
+        spatial3d,
+        buffer3d,
+        vao3d,
+        ebo3d,
+        token3d,
+      )],
+    ]),
+  });
+
+  renderer.updateColors(colors);
+  assert.deepEqual([...renderer._dirtyLodDimensions], [2, 3]);
+  assert.equal(renderer._bufferDirty, true);
+  // This contract isolates per-dimension LOD publication. The full-detail
+  // generation has an independent sticky-WebGL-error regression below.
+  renderer._bufferDirty = false;
+
+  rejectedBuffer = buffer2d;
+  assert.throws(
+    () => renderer.flushBufferUpdates(2),
+    /WebGL error 0x502/,
+  );
+  assert.equal(renderer._dirtyLodDimensions.has(2), true);
+  assert.equal(renderer._dirtyLodDimensions.has(3), true);
+  assert.deepEqual(uploads, []);
+
+  rejectedBuffer = null;
+  renderer.flushBufferUpdates(2);
+
+  assert.deepEqual(uploads, [
+    {
+      buffer: buffer2d,
+      positions: [
+        [-2, 0, 0],
+        [2, 0, 0],
+      ],
+      rgba: [
+        [30, 31, 32, 33],
+        [10, 11, 12, 13],
+      ],
+    },
+  ]);
+  assert.equal(renderer._dirtyLodDimensions.has(2), false);
+  assert.equal(renderer._dirtyLodDimensions.has(3), true);
+
+  renderer.flushBufferUpdates(3);
+
+  assert.deepEqual(uploads, [
+    {
+      buffer: buffer2d,
+      positions: [
+        [-2, 0, 0],
+        [2, 0, 0],
+      ],
+      rgba: [
+        [30, 31, 32, 33],
+        [10, 11, 12, 13],
+      ],
+    },
+    {
+      buffer: buffer3d,
+      positions: [
+        [0, 0, 1],
+      ],
+      rgba: [
+        [20, 21, 22, 23],
+      ],
+    },
+  ]);
+  assert.equal(renderer._dirtyLodDimensions.size, 0);
+});
+
+test('full-detail recolor rejects sticky WebGL errors before O(N) packing', () => {
+  let bufferDataCalls = 0;
+  const gl = {
+    ARRAY_BUFFER: 0x8892,
+    DYNAMIC_DRAW: 0x88e8,
+    INVALID_OPERATION: 0x0502,
+    NO_ERROR: 0,
+    bindBuffer() {},
+    bufferData() {
+      bufferDataCalls += 1;
+    },
+    getError() {
+      return this.INVALID_OPERATION;
+    },
+  };
+  const renderer = Object.assign(Object.create(HighPerfRenderer.prototype), {
+    gl,
+    buffers: { interleaved: { id: 'full-detail' } },
+    pointCount: 2,
+    _positions: Float32Array.from([
+      -1, 0, 0,
+      1, 0, 0,
+    ]),
+    _colors: Uint8Array.from([
+      10, 11, 12, 13,
+      20, 21, 22, 23,
+    ]),
+    _interleavedArrayBuffer: null,
+    _interleavedPositionView: null,
+    _interleavedColorView: null,
+  });
+
+  assert.throws(
+    () => renderer._rebuildInterleavedBuffer(),
+    /WebGL error 0x502/,
+  );
+  assert.equal(renderer._interleavedArrayBuffer, null);
+  assert.equal(renderer._interleavedPositionView, null);
+  assert.equal(renderer._interleavedColorView, null);
+  assert.equal(bufferDataCalls, 0);
+});
+
+test('lazily created LOD buffers sample the latest renderer color generation', () => {
+  let nextId = 1;
+  let boundArrayBuffer = null;
+  let boundTexture = null;
+  const reducedUploads = [];
+  const gl = {
+    ARRAY_BUFFER: 0x8892,
+    CLAMP_TO_EDGE: 0x812f,
+    ELEMENT_ARRAY_BUFFER: 0x8893,
+    FLOAT: 0x1406,
+    MAX_TEXTURE_SIZE: 0x0d33,
+    NEAREST: 0x2600,
+    NO_ERROR: 0,
+    R32UI: 0x8236,
+    RED_INTEGER: 0x8d94,
+    STATIC_DRAW: 0x88e4,
+    TEXTURE_2D: 0x0de1,
+    TEXTURE_MAG_FILTER: 0x2800,
+    TEXTURE_MIN_FILTER: 0x2801,
+    TEXTURE_WRAP_S: 0x2802,
+    TEXTURE_WRAP_T: 0x2803,
+    UNSIGNED_BYTE: 0x1401,
+    UNSIGNED_INT: 0x1405,
+    bindBuffer(target, buffer) {
+      if (target === this.ARRAY_BUFFER) boundArrayBuffer = buffer;
+    },
+    bindTexture(target, texture) {
+      assert.equal(target, this.TEXTURE_2D);
+      boundTexture = texture;
+    },
+    bindVertexArray() {},
+    bufferData(target, data) {
+      if (
+        target === this.ARRAY_BUFFER &&
+        (
+          data instanceof ArrayBuffer ||
+          ArrayBuffer.isView(data)
+        ) &&
+        boundArrayBuffer?.kind === 'reduced'
+      ) {
+        const sourceBuffer = data instanceof ArrayBuffer
+          ? data
+          : data.buffer;
+        const sourceOffset = data instanceof ArrayBuffer
+          ? 0
+          : data.byteOffset;
+        const sourceLength = data.byteLength;
+        const bytes = new Uint8Array(
+          sourceBuffer,
+          sourceOffset,
+          sourceLength,
+        );
+        const floats = new Float32Array(
+          sourceBuffer,
+          sourceOffset,
+          sourceLength / Float32Array.BYTES_PER_ELEMENT,
+        );
+        reducedUploads.push({
+          position: Array.from(floats.subarray(0, 3)),
+          rgba: Array.from(bytes.subarray(12, 16)),
+        });
+      }
+    },
+    createBuffer() {
+      return { id: nextId++, kind: 'reduced' };
+    },
+    createTexture() {
+      return { id: nextId++, kind: 'texture' };
+    },
+    createVertexArray() {
+      return { id: nextId++, kind: 'vao' };
+    },
+    deleteBuffer() {},
+    deleteTexture() {},
+    deleteVertexArray() {},
+    enableVertexAttribArray() {},
+    getError() {
+      return this.NO_ERROR;
+    },
+    getParameter(parameter) {
+      assert.equal(parameter, this.MAX_TEXTURE_SIZE);
+      return 4096;
+    },
+    texImage2D() {
+      assert.ok(boundTexture);
+    },
+    texSubImage2D(
+      _target,
+      _level,
+      _x,
+      _y,
+      _width,
+      _height,
+      _format,
+      _type,
+      data,
+    ) {
+      assert.ok(boundTexture);
+      assert.ok(data instanceof Uint32Array);
+    },
+    texParameteri() {},
+    vertexAttribPointer() {},
+  };
+  const positions = Float32Array.from([
+    -1, 0, 0,
+    7, 8, 9,
+  ]);
+  const renderer = Object.assign(Object.create(HighPerfRenderer.prototype), {
+    gl,
+    pointCount: 2,
+    vao: { id: 'main-vao' },
+    buffers: {
+      interleaved: { id: 'main-buffer' },
+    },
+    _colors: Uint8Array.from([
+      10, 11, 12, 13,
+      20, 21, 22, 23,
+    ]),
+    _positions: positions,
+    _dirtyLodDimensions: new Set(),
+    _lodArrayBuffers: null,
+    _lodIndexTexturesByDimension: new Map(),
+    _pendingDataRetirements: new Set(),
+    _pendingSnapshotRetirements: new Set(),
+    lodBuffersByDimension: new Map(),
+    spatialIndices: new Map(),
+    stats: { gpuMemoryMB: 0 },
+  });
+  const spatialIndex = {
+    dimensionLevel: 2,
+    pointCount: 2,
+    positions,
+    lodLevels: [
+      {
+        depth: 0,
+        indices: Uint32Array.from([1]),
+        isFullDetail: false,
+        pointCount: 1,
+        sizeMultiplier: 1,
+      },
+      {
+        depth: 1,
+        isFullDetail: true,
+        pointCount: 2,
+        positions,
+      },
+    ],
+  };
+  renderer.spatialIndices.set(2, spatialIndex);
+
+  renderer._createLODResourcesForDimension(2, spatialIndex);
+
+  assert.deepEqual(reducedUploads, [{
+    position: [7, 8, 9],
+    rgba: [20, 21, 22, 23],
+  }]);
 });
 
 test('high-performance rendering has no legacy alpha or global-view path', async () => {
@@ -415,6 +933,96 @@ test('overlay registration requires the complete current lifecycle', () => {
   assert.throws(
     () => manager.register({ id: 'partial-overlay' }),
     /init.*update.*render.*dispose/i
+  );
+});
+
+test('overlay retirement detaches before cleanup and remains retryable', () => {
+  const manager = new OverlayManager({});
+  let disposeAttempts = 0;
+  const overlay = {
+    id: 'retryable-overlay',
+    priority: 0,
+    enabled: true,
+    visible: true,
+    init() {},
+    update() {},
+    render() {},
+    dispose() {
+      disposeAttempts += 1;
+      if (disposeAttempts === 1) {
+        throw new Error('synthetic overlay retirement failure');
+      }
+    },
+  };
+  manager.register(overlay);
+
+  assert.throws(
+    () => manager.unregister(overlay.id),
+    /synthetic overlay retirement failure/
+  );
+  assert.equal(
+    manager.get(overlay.id),
+    null,
+    'a half-retired overlay must never remain dispatchable'
+  );
+  assert.equal(manager.hasEnabledOverlays(), false);
+  assert.throws(
+    () => manager.register(overlay),
+    /pending retirement/i,
+    'the same retirement-pending instance cannot be republished'
+  );
+  assert.throws(
+    () => manager.register({
+      ...overlay,
+      dispose() {},
+    }),
+    /prior owner.*pending retirement/i,
+    'a logical ID cannot overlap its failed prior resource owner'
+  );
+
+  assert.equal(manager.retryRetirement(overlay.id), true);
+  assert.equal(disposeAttempts, 2);
+  assert.equal(manager.retryRetirement(overlay.id), false);
+});
+
+test('overlay manager disposal attempts every owner and retries only failures', () => {
+  const manager = new OverlayManager({});
+  const attempts = new Map();
+  for (const id of ['first', 'second']) {
+    manager.register({
+      id,
+      priority: 0,
+      enabled: true,
+      visible: true,
+      init() {},
+      update() {},
+      render() {},
+      dispose() {
+        const attempt = (attempts.get(id) ?? 0) + 1;
+        attempts.set(id, attempt);
+        if (id === 'first' && attempt === 1) {
+          throw new Error('synthetic first overlay failure');
+        }
+      },
+    });
+  }
+
+  assert.throws(
+    () => manager.dispose(),
+    error => (
+      error instanceof AggregateError
+      && error.errors.some(item => /synthetic first overlay failure/.test(item.message))
+    )
+  );
+  assert.equal(manager.get('first'), null);
+  assert.equal(manager.get('second'), null);
+  assert.deepEqual(Object.fromEntries(attempts), { first: 1, second: 1 });
+
+  manager.dispose();
+  assert.deepEqual(
+    Object.fromEntries(attempts),
+    { first: 2, second: 1 },
+    'successful retirements must not be deleted twice'
   );
 });
 

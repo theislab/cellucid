@@ -656,9 +656,16 @@
   z-index: 11;
 }
 
-.analysis-preview-plot {
+.analysis-preview-plot-host {
+  position: relative;
   width: 100%;
   min-height: 180px;
+  overflow: hidden;
+}
+
+.analysis-preview-plot {
+  width: 100%;
+  height: 100%;
 }
 
 /* =========================================================================

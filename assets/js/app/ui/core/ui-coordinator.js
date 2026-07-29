@@ -72,7 +72,11 @@ export function initUI({
     dom: dom.render,
     smoke
   });
-  initVelocityOverlayControls({ state, viewer, dom: dom.render });
+  const velocityOverlayControls = initVelocityOverlayControls({
+    state,
+    viewer,
+    dom: dom.render
+  });
   const cameraControls = initCameraControls({
     viewer,
     dom: dom.camera,
@@ -177,6 +181,22 @@ export function initUI({
       onActiveFieldChanged: handleActiveFieldChanged
     }
   });
+  if (sessionSerializer !== null) {
+    if (
+      typeof sessionSerializer.setCaptureSettlement !== 'function'
+      || typeof sessionSerializer.setRestoreSettlement !== 'function'
+    ) {
+      throw new TypeError(
+        'Session serializer must implement capture and restore settlement.'
+      );
+    }
+    sessionSerializer.setCaptureSettlement(
+      fieldSelector.acquireSessionCaptureOperation
+    );
+    sessionSerializer.setRestoreSettlement(
+      fieldSelector.acquireSessionRestoreOperation
+    );
+  }
 
   viewControls = initViewControls({
     state,
@@ -205,6 +225,15 @@ export function initUI({
       onNavigationUiSyncRequested: (viewId) => syncNavigationUiForView(viewId)
     }
   });
+  renderControls.setRenderModeChangeHandler((mode) => {
+    viewControls.syncRenderModeUI(mode);
+  });
+  viewer.setSmokeRenderFailureHandler((error) => {
+    renderControls.settleSmokeRenderFailure(error);
+  });
+  viewer.setVelocityRenderFailureHandler?.((error) => {
+    velocityOverlayControls.settleRenderFailure(error);
+  });
 
   function refreshUiAfterStateLoad() {
     viewControls?.syncFromStateAndViewer?.();
@@ -220,10 +249,7 @@ export function initUI({
     highlightControls.renderHighlightSummary?.();
     communityAnnotationControls.render?.();
     dimensionControls.updateDimensionSelectUI?.();
-    viewControls?.renderSplitViewBadges?.();
-    viewControls?.updateSplitViewUI?.();
     syncNavigationUiForView(state.getActiveViewId());
-    renderControls.markSmokeDirty?.();
   }
 
   const { showSessionStatus } = initSessionControls({
@@ -246,6 +272,7 @@ export function initUI({
       initGeneExpressionDropdown: fieldSelector.initGeneExpressionDropdown,
       clearGeneSelection: fieldSelector.clearGeneSelection,
       refreshUIForActiveView: () => {
+        viewControls?.syncFromStateAndViewer?.();
         fieldSelector.syncFromState?.();
         legend.render?.(state.getActiveField());
         legend.handleOutlierUI?.(state.getActiveField());
@@ -255,8 +282,6 @@ export function initUI({
         dimensionControls.updateDimensionSelectUI?.();
         syncNavigationUiForView(state.getActiveViewId());
         renderControls.markSmokeDirty?.();
-        viewControls?.renderSplitViewBadges?.();
-        viewControls?.updateSplitViewUI?.();
       },
       updateDimensionSelectUI: dimensionControls.updateDimensionSelectUI,
       showSessionStatus
@@ -319,9 +344,12 @@ export function initUI({
 
   return {
     activateField: fieldSelector.activateField,
+    applyRenderMode: renderControls.applyRenderMode,
+    prepareDatasetReplacement: fieldSelector.prepareDatasetReplacement,
     refreshUiAfterStateLoad,
     showSessionStatus,
     refreshDatasetUI,
+    settleFieldInteractions: fieldSelector.settleAllInteractions,
     datasetCatalogReady,
     cinematicCamera
   };

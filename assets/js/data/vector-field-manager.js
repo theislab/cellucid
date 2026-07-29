@@ -423,10 +423,10 @@ export class VectorFieldManager {
       );
     }
 
-    let maxMagnitude = 0;
+    let maxMagnitudeSquared = 0;
     for (let cellIndex = 0; cellIndex < cellCount; cellIndex++) {
       const offset = cellIndex * dimension;
-      const scaledComponents = [];
+      let magnitudeSquared = 0;
       for (let component = 0; component < dimension; component++) {
         const value = vectors[offset + component];
         if (!Number.isFinite(value)) {
@@ -441,18 +441,18 @@ export class VectorFieldManager {
             `VectorFieldManager.loadField: scaling field "${id}" overflowed at cell ${cellIndex}, component ${component}.`
           );
         }
-        scaledComponents.push(scaled);
+        magnitudeSquared += scaled * scaled;
       }
-      const magnitude = Math.hypot(...scaledComponents);
-      if (!Number.isFinite(magnitude)) {
+      if (!Number.isFinite(magnitudeSquared)) {
         throw new Error(
           `VectorFieldManager.loadField: field "${id}" produced a non-finite magnitude at cell ${cellIndex}.`
         );
       }
-      if (magnitude > maxMagnitude) {
-        maxMagnitude = magnitude;
+      if (magnitudeSquared > maxMagnitudeSquared) {
+        maxMagnitudeSquared = magnitudeSquared;
       }
     }
+    const maxMagnitude = Math.sqrt(maxMagnitudeSquared);
 
     return Object.freeze({
       vectors,

@@ -60,6 +60,7 @@ const DESIGN_PREFIXES = [
 
 const ALLOWED_NON_TOKEN_VARS = new Set([
   // Dynamic vars driven by JS (StyleManager).
+  '--sidebar-user-width',
   '--z-layer',
   '--pos-x',
   '--pos-y',

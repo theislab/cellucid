@@ -266,6 +266,16 @@ test('unlocked grid proximity owns the clicked pane plane and scale for the full
     viewMatrix: identityMatrix(),
     modelMatrix: identityMatrix(),
   };
+  const panePositions = Float32Array.from([0, 0, 0]);
+  const paneTransparency = Float32Array.of(1);
+  const paneOwner = {
+    viewId: 'non-focused-pane',
+    positions: panePositions,
+    publishedPositions: panePositions,
+    transparency: paneTransparency,
+    dimensionLevel: 3,
+    spatialIndex: null,
+  };
   const tools = Object.assign(Object.create(HighlightTools.prototype), {
     _unifiedCandidateSet: new Set([0]),
     _unifiedStepCount: 1,
@@ -274,7 +284,11 @@ test('unlocked grid proximity owns the clicked pane plane and scale for the full
     getRenderContext: () => focusedContext,
     getViewPositions: viewId => {
       assert.equal(viewId, 'non-focused-pane');
-      return Float32Array.from([0, 0, 0]);
+      return panePositions;
+    },
+    getSpatialQueryOwner: (viewId) => {
+      assert.equal(viewId, 'non-focused-pane');
+      return paneOwner;
     },
     getViewportInfoAtScreen: () => sourceViewport,
     highlightMode: 'none',
@@ -323,13 +337,16 @@ test('unlocked grid proximity owns the clicked pane plane and scale for the full
     [1, 0, 0]
   );
   assert.deepEqual(rayCalls[0].slice(0, 5), [25, 50, 100, 100, 1]);
-  assert.equal(rayCalls[0][5], clickedViewMatrix);
+  assert.notEqual(rayCalls[0][5], clickedViewMatrix);
+  assert.deepEqual([...rayCalls[0][5]], [...clickedViewMatrix]);
   assert.equal(rayCalls[0][6], -0.2);
 
   // Mutating the producer's object cannot alter the captured interaction.
   sourceViewport.projectionMatrix[12] = 0.8;
   sourceViewport.cameraForward.set([0, 1, 0]);
   sourceViewport.cameraTargetRadius = 800;
+  clickedViewMatrix[12] = 0.7;
+  focusedContext.modelMatrix[12] = 0.5;
 
   assert.equal(
     tools.handleMouseMove({
@@ -346,6 +363,182 @@ test('unlocked grid proximity owns the clicked pane plane and scale for the full
   assert.equal(tools.proximityCenter.viewport.cameraTargetRadius, 8);
   assertClose(lassoCtx.arcs[0].x, 140);
   assert.equal(lassoCtx.arcs[0].y, 50);
+});
+
+test('a stale lasso retires with one empty preview and no selection callback', t => {
+  installBrowserPixelRatio(t);
+  const positions = Float32Array.from([0, 0, 0]);
+  const firstTransparency = Float32Array.of(1);
+  const nextTransparency = Float32Array.of(1);
+  const firstOwner = {
+    viewId: 'pane',
+    positions,
+    publishedPositions: positions,
+    transparency: firstTransparency,
+    dimensionLevel: 3,
+    spatialIndex: null,
+  };
+  const nextOwner = {
+    ...firstOwner,
+    transparency: nextTransparency,
+  };
+  const canvas = createCanvas(100, 100);
+  const previewPayloads = [];
+  const tools = Object.assign(Object.create(HighlightTools.prototype), {
+    _lastPositionFingerprintMap: new Map(),
+    _lastTransparencyFingerprintMap: new Map(),
+    _lastUsedPositionsMap: new Map(),
+    _unifiedCandidateSet: new Set([7]),
+    _unifiedStepCount: 2,
+    _lassoPreviewPublished: true,
+    altKeyDown: true,
+    canvas,
+    getRenderContext: () => ({
+      viewMatrix: identityMatrix(),
+      modelMatrix: identityMatrix(),
+    }),
+    getNavigationState: () => ({
+      navigationMode: 'orbit',
+      isDragging: false,
+    }),
+    getSpatialQueryOwner: viewId => {
+      assert.equal(viewId, 'pane');
+      return nextOwner;
+    },
+    highlightMode: 'none',
+    highlightRenderer: {
+      clearViewBuffer() {},
+    },
+    isLassoing: true,
+    isProximityDragging: false,
+    knnEnabled: false,
+    lassoCtx: createDrawingContext(),
+    lassoEnabled: true,
+    lassoPath: [
+      { x: 40, y: 40 },
+      { x: 60, y: 40 },
+      { x: 60, y: 60 },
+    ],
+    lassoPreviewCallback: payload => {
+      previewPayloads.push(payload);
+    },
+    lassoViewContext: {
+      viewId: 'pane',
+      viewport: createViewport({
+        viewId: 'pane',
+        width: 100,
+        height: 100,
+        offsetX: 0,
+        projectionShift: 0,
+      }),
+      viewMatrix: identityMatrix(),
+      modelMatrix: identityMatrix(),
+      spatialOwner: firstOwner,
+    },
+    mat4: createExactMat4(),
+    proximityEnabled: false,
+  });
+
+  assert.equal(
+    tools.handleMouseMove({ clientX: 70, clientY: 70 }),
+    true,
+  );
+  assert.equal(tools.isLassoing, false);
+  assert.equal(tools.lassoViewContext, null);
+  assert.equal(previewPayloads.length, 1);
+  assert.deepEqual(previewPayloads[0].cellIndices, []);
+  assert.equal(previewPayloads[0].cellCount, 0);
+  assert.equal(previewPayloads[0].type, 'lasso-preview');
+  assert.deepEqual([...tools.lassoCandidateSet], [7]);
+  assert.equal(tools.lassoStepCount, 2);
+});
+
+test('snapshot proximity remains bound to its pane and retires only with that view', t => {
+  installBrowserPixelRatio(t);
+  const positions = Float32Array.from([0, 0, 0]);
+  const transparency = Float32Array.of(1);
+  const snapshotOwner = {
+    viewId: 'snapshot',
+    positions,
+    publishedPositions: positions,
+    transparency,
+    dimensionLevel: 3,
+    spatialIndex: null,
+  };
+  const viewport = createViewport({
+    viewId: 'snapshot',
+    width: 100,
+    height: 100,
+    offsetX: 100,
+    projectionShift: 0,
+    cameraTargetRadius: 5,
+  });
+  let previewPayload = null;
+  const tools = Object.assign(Object.create(HighlightTools.prototype), {
+    _lastPositionFingerprintMap: new Map(),
+    _lastTransparencyFingerprintMap: new Map(),
+    _lastUsedPositionsMap: new Map(),
+    _unifiedCandidateSet: null,
+    _unifiedStepCount: 0,
+    altKeyDown: true,
+    canvas: createCanvas(200, 100),
+    getRenderContext: () => ({
+      viewMatrix: identityMatrix(),
+      modelMatrix: identityMatrix(),
+    }),
+    getNavigationState: () => ({
+      navigationMode: 'orbit',
+      isDragging: false,
+    }),
+    getSpatialQueryOwner: viewId => {
+      assert.equal(viewId, 'snapshot');
+      return snapshotOwner;
+    },
+    highlightMode: 'none',
+    highlightRenderer: {
+      clearViewBuffer() {},
+    },
+    isLassoing: false,
+    isProximityDragging: true,
+    knnEnabled: false,
+    lassoCtx: createDrawingContext(),
+    lassoEnabled: false,
+    mat4: createExactMat4(),
+    proximityCenter: {
+      screenX: 150,
+      screenY: 50,
+      worldPos: [0, 0, 0],
+      cellIndex: 0,
+      mode: 'intersect',
+      viewport,
+      viewId: 'snapshot',
+      viewMatrix: identityMatrix(),
+      modelMatrix: identityMatrix(),
+      spatialOwner: snapshotOwner,
+    },
+    proximityCurrentRadius: 0,
+    proximityEnabled: true,
+    proximityPreviewCallback: payload => {
+      previewPayload = payload;
+    },
+  });
+
+  // An unrelated live-view retirement must not touch the snapshot gesture.
+  assert.equal(tools.retireSpatialInteractions('live'), false);
+  assert.equal(tools.isProximityDragging, true);
+  assert.equal(
+    tools.handleMouseMove({ clientX: 170, clientY: 50 }),
+    true,
+  );
+  assert.deepEqual(previewPayload.cellIndices, [0]);
+
+  tools.clearViewState('snapshot');
+  assert.equal(tools.isProximityDragging, false);
+  assert.equal(tools.proximityCenter, null);
+  assert.equal(tools.proximityCandidateSet, null);
+  assert.deepEqual(previewPayload.cellIndices, []);
+  assert.equal(previewPayload.cellCount, 0);
+  assert.equal(previewPayload.newCellCount, 0);
 });
 
 test('highlight viewport interactions reject absent pane camera ownership', t => {

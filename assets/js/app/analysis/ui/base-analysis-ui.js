@@ -53,6 +53,7 @@ import { PlotRegistry } from '../shared/plot-registry-utils.js';
 import { createPageSelectorComponent } from './shared/page-selector.js';
 import { createVariableSelectorComponent } from './shared/variable-selector.js';
 import { createFigureContainer } from './shared/figure-container.js';
+import { createRequestIdTracker } from '../shared/cancellable-operation.js';
 
 function cloneSettings(value) {
   return structuredClone(value);
@@ -152,6 +153,13 @@ function requireMatchingPages(selectedPages, configPages) {
   }
 }
 
+function combineLifecycleErrors(errors, message) {
+  const present = [...new Set(errors.filter(Boolean))];
+  if (present.length === 0) return null;
+  if (present.length === 1) return present[0];
+  return new AggregateError(present, message);
+}
+
 /**
  * Abstract base class for all analysis UI components
  */
@@ -211,6 +219,16 @@ export class BaseAnalysisUI {
 
     // Lifecycle guard (prevents async work from updating after teardown)
     this._isDestroyed = false;
+
+    // One monotonic owner for analysis intent, computation, and publication.
+    // Generations are deliberately used instead of worker AbortSignals because
+    // aborting one running task is terminal for the shared worker pool.
+    this._analysisRequestTracker = createRequestIdTracker();
+    this._activeAnalysisRequestId = null;
+    this._analysisInvalidationOwner = null;
+    this._interactiveTasks = new Set();
+    this._interactiveFailures = [];
+    this._baseDestroyPromise = null;
   }
 
   // ===========================================================================
@@ -530,29 +548,216 @@ export class BaseAnalysisUI {
    */
   _scheduleUpdate(delay = 300) {
     if (this._isDestroyed) return;
+    const requestId = this._beginAnalysisIntent();
     if (this._updateTimer) {
       clearTimeout(this._updateTimer);
     }
     this._updateTimer = setTimeout(() => {
-      this._runAnalysisIfValid();
+      this._updateTimer = null;
+      if (!this._isCurrentAnalysisIntent(requestId)) return;
+      this._trackInteractiveTask(
+        this._runAnalysisIfValid(requestId),
+        'Scheduled analysis update'
+      );
     }, delay);
+  }
+
+  /**
+   * Observe user-triggered asynchronous work without replacing the exact task
+   * returned to direct callers. Destruction drains every still-active task.
+   * @param {Promise<*>} task
+   * @param {string} context
+   * @returns {Promise<*>}
+   * @protected
+   */
+  _trackInteractiveTask(task, context) {
+    if (task === null || task === undefined || typeof task.then !== 'function') {
+      throw new TypeError(`${context} must return a Promise`);
+    }
+    this._interactiveTasks ??= new Set();
+    this._interactiveTasks.add(task);
+    const releaseTask = () => {
+      this._interactiveTasks.delete(task);
+    };
+    const observer = task.then(
+      releaseTask,
+      error => {
+        // Once destruction starts, the lifecycle owner must retain the rejected
+        // task until destroy() snapshots and settles it. Releasing here would
+        // lose an already-queued same-turn rejection.
+        if (this._isDestroyed) return;
+        releaseTask();
+        try {
+          this._notifications.error(
+            `${context} failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+            { category: 'analysis', title: 'Analysis Error' }
+          );
+        } catch (reportingError) {
+          this._interactiveFailures ??= [];
+          this._interactiveFailures.push(
+            combineLifecycleErrors(
+              [error, reportingError],
+              `${context} and failure reporting failed`
+            )
+          );
+        }
+      }
+    );
+    void Promise.resolve(observer).catch(() => {});
+    return task;
+  }
+
+  /**
+   * Publish a new input intent immediately, before any debounce delay.
+   * @returns {number}
+   * @protected
+   */
+  _beginAnalysisIntent() {
+    const invalidationOwner = this._analysisInvalidationOwner;
+    const requestId = this._analysisRequestTracker.next();
+    this._activeAnalysisRequestId = null;
+    this._analysisInvalidationOwner = null;
+    this._isLoading = false;
+
+    if (invalidationOwner !== null) {
+      const cleanupErrors = [];
+      for (const cleanup of invalidationOwner.cleanups) {
+        try {
+          cleanup();
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+      }
+      if (cleanupErrors.length === 1) throw cleanupErrors[0];
+      if (cleanupErrors.length > 1) {
+        throw new AggregateError(
+          cleanupErrors,
+          'Analysis request invalidation cleanup failed'
+        );
+      }
+    }
+    return requestId;
+  }
+
+  /**
+   * Start computation for either a scheduled intent or a direct invocation.
+   * @param {number|null} requestId
+   * @returns {number|null}
+   * @protected
+   */
+  _startAnalysisRequest(requestId = null) {
+    const ownedRequestId = requestId === null
+      ? this._beginAnalysisIntent()
+      : requestId;
+    if (!this._isCurrentAnalysisIntent(ownedRequestId)) return null;
+    this._activeAnalysisRequestId = ownedRequestId;
+    this._analysisInvalidationOwner = {
+      requestId: ownedRequestId,
+      cleanups: new Set()
+    };
+    this._isLoading = true;
+    return ownedRequestId;
+  }
+
+  /**
+   * Register an exact-request cleanup that runs synchronously on invalidation.
+   * Normal completion drops the cleanup without invoking it.
+   * @param {number} requestId
+   * @param {Function} cleanup
+   * @returns {boolean} Whether the cleanup was registered to a live request
+   * @protected
+   */
+  _registerAnalysisInvalidationCleanup(requestId, cleanup) {
+    if (typeof cleanup !== 'function') {
+      throw new TypeError(
+        'Analysis invalidation cleanup must be a function'
+      );
+    }
+    if (
+      !this._isCurrentAnalysisRequest(requestId) ||
+      this._analysisInvalidationOwner?.requestId !== requestId
+    ) {
+      cleanup();
+      return false;
+    }
+    this._analysisInvalidationOwner.cleanups.add(cleanup);
+    return true;
+  }
+
+  /**
+   * Invalidate every scheduled or active request.
+   * @returns {number} The new inert generation.
+   * @protected
+   */
+  _invalidateAnalysisRequest() {
+    return this._beginAnalysisIntent();
+  }
+
+  /**
+   * @param {number} requestId
+   * @returns {boolean}
+   * @protected
+   */
+  _isCurrentAnalysisIntent(requestId) {
+    return (
+      !this._isDestroyed &&
+      this._analysisRequestTracker.isCurrent(requestId)
+    );
+  }
+
+  /**
+   * @param {number} requestId
+   * @returns {boolean}
+   * @protected
+   */
+  _isCurrentAnalysisRequest(requestId) {
+    return (
+      this._activeAnalysisRequestId === requestId &&
+      this._isCurrentAnalysisIntent(requestId)
+    );
+  }
+
+  /**
+   * Release loading ownership only when this exact request still owns it.
+   * @param {number} requestId
+   * @protected
+   */
+  _finishAnalysisRequest(requestId) {
+    if (!this._isCurrentAnalysisRequest(requestId)) return;
+    this._activeAnalysisRequestId = null;
+    this._analysisInvalidationOwner = null;
+    this._isLoading = false;
   }
 
   /**
    * Run analysis if configuration is valid (override for custom logic)
    */
-  async _runAnalysisIfValid() {
+  async _runAnalysisIfValid(scheduledRequestId = null) {
     if (this._isDestroyed) return;
+    if (
+      scheduledRequestId !== null &&
+      !this._isCurrentAnalysisIntent(scheduledRequestId)
+    ) {
+      return;
+    }
     if (!this._canRunAnalysis()) {
-      this._hidePreview();
+      const invalidationRequestId = this._invalidateAnalysisRequest();
+      await this._hidePreview(invalidationRequestId);
       return;
     }
 
+    const requestId = this._startAnalysisRequest(scheduledRequestId);
+    if (requestId === null) return;
     try {
-      await this._runAnalysis();
+      await this._runAnalysis(requestId);
     } catch (err) {
+      if (!this._isCurrentAnalysisRequest(requestId)) return;
       console.error(`[${this.constructor.name}] Analysis failed:`, err);
-      this._showError('Analysis failed: ' + err.message);
+      await this._showError('Analysis failed: ' + err.message, requestId);
+    } finally {
+      this._finishAnalysisRequest(requestId);
     }
   }
 
@@ -697,11 +902,20 @@ export class BaseAnalysisUI {
   _createModal(config = {}) {
     this._modal = createAnalysisModal({
       onClose: () => { this._modal = null; },
-      onExportPNG: () => this._exportPNG(),
-      onExportSVG: () => this._exportSVG(),
-      onExportCSV: () => this._exportCSV(
-        this._currentPageData,
-        this._currentConfig.dataSource.variable
+      onExportPNG: () => this._trackInteractiveTask(
+        this._exportPNG(),
+        'PNG export'
+      ),
+      onExportSVG: () => this._trackInteractiveTask(
+        this._exportSVG(),
+        'SVG export'
+      ),
+      onExportCSV: () => this._trackInteractiveTask(
+        this._exportCSV(
+          this._currentPageData,
+          this._currentConfig.dataSource.variable
+        ),
+        'CSV export'
       ),
       ...config
     });
@@ -722,10 +936,11 @@ export class BaseAnalysisUI {
    * Close the modal
    */
   _closeModal() {
-    if (this._modal) {
-      closeModal(this._modal);
-      this._modal = null;
-    }
+    if (!this._modal) return Promise.resolve();
+    return this._trackInteractiveTask(
+      closeModal(this._modal),
+      'Analysis modal close'
+    );
   }
 
   // ===========================================================================
@@ -910,26 +1125,83 @@ export class BaseAnalysisUI {
    * Destroy and cleanup the component
    */
   destroy() {
+    if (this._baseDestroyPromise != null) {
+      return this._baseDestroyPromise;
+    }
+
+    let rejectDestroy;
+    let resolveDestroy;
+    const destroyTask = new Promise((resolve, reject) => {
+      resolveDestroy = resolve;
+      rejectDestroy = reject;
+    });
+    this._baseDestroyPromise = destroyTask;
+
+    const errors = [];
     this._isDestroyed = true;
+    try {
+      this._invalidateAnalysisRequest();
+    } catch (error) {
+      errors.push(error);
+    }
     if (this._updateTimer) {
-      clearTimeout(this._updateTimer);
+      try {
+        clearTimeout(this._updateTimer);
+      } catch (error) {
+        errors.push(error);
+      }
+      this._updateTimer = null;
     }
 
-    this._cleanupPreviousAnalysis();
+    void Promise.resolve().then(async () => {
+      const interactiveOutcomes = await Promise.allSettled([
+        ...(this._interactiveTasks ?? [])
+      ]);
+      errors.push(
+        ...interactiveOutcomes
+          .filter(outcome => outcome.status === 'rejected')
+          .map(outcome => outcome.reason)
+      );
+      errors.push(...(this._interactiveFailures ?? []));
+      this._interactiveTasks?.clear();
+      this._interactiveFailures = [];
+      try {
+        await this._cleanupPreviousAnalysis();
+      } catch (error) {
+        errors.push(error);
+      }
 
-    if (this._modal) {
-      closeModal(this._modal);
-      this._modal = null;
-    }
+      const modal = this._modal;
+      if (modal) {
+        try {
+          await closeModal(modal);
+        } catch (error) {
+          errors.push(error);
+        }
+        if (this._modal === modal) this._modal = null;
+      }
 
-    if (this._container) {
-      this._container.innerHTML = '';
-    }
+      if (this._container) {
+        try {
+          this._container.innerHTML = '';
+        } catch (error) {
+          errors.push(error);
+        }
+      }
 
-    // Clear state
-    this._selectedPages = [];
-    this._lastResult = null;
-    this._isLoading = false;
+      this._selectedPages = [];
+      this._lastResult = null;
+      this._currentPageData = null;
+      this._isLoading = false;
+
+      const failure = combineLifecycleErrors(
+        errors,
+        'Analysis UI destruction failed'
+      );
+      if (failure) throw failure;
+    }).then(resolveDestroy, rejectDestroy);
+    void destroyTask.catch(() => {});
+    return destroyTask;
   }
 }
 

@@ -194,6 +194,13 @@ test('prepared vectors retain exact finite values, scale, and zero magnitude', a
   }
 });
 
+test('vector normalization performs no per-cell temporary-array allocation', () => {
+  const source = VectorFieldManager.prototype._loadExactField.toString();
+  assert.doesNotMatch(source, /scaledComponents|Math\.hypot|\.\.\./);
+  assert.match(source, /magnitudeSquared \+= scaled \* scaled/);
+  assert.match(source, /Math\.sqrt\(maxMagnitudeSquared\)/);
+});
+
 test('non-finite vector payloads fail instead of being replaced', async () => {
   const dataSourceManager = getDataSourceManager();
   const previousSource = dataSourceManager.activeSource;

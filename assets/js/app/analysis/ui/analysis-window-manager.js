@@ -116,6 +116,57 @@ function requireSettings(settings) {
   return structuredClone(settings);
 }
 
+function isPromiseLike(value) {
+  return (
+    value !== null &&
+    (typeof value === 'object' || typeof value === 'function') &&
+    typeof value.then === 'function'
+  );
+}
+
+function createOwnedOperation(assign, operation) {
+  let rejectOperation;
+  let resolveOperation;
+  const task = new Promise((resolve, reject) => {
+    resolveOperation = resolve;
+    rejectOperation = reject;
+  });
+  assign(task);
+  void Promise.resolve()
+    .then(operation)
+    .then(resolveOperation, rejectOperation);
+  return task;
+}
+
+function appendRejectedOutcomes(errors, outcomes) {
+  for (const outcome of outcomes) {
+    if (outcome.status === 'rejected') {
+      errors.push(outcome.reason);
+    }
+  }
+}
+
+function throwLifecycleErrors(errors, message) {
+  const exactErrors = [...new Set(errors)];
+  if (exactErrors.length === 1) throw exactErrors[0];
+  if (exactErrors.length > 1) {
+    throw new AggregateError(exactErrors, message);
+  }
+}
+
+function observeWindowAction(action, context) {
+  try {
+    const result = action();
+    if (isPromiseLike(result)) {
+      void Promise.resolve(result).catch(error => {
+        console.error(`[AnalysisWindowManager] ${context} failed:`, error);
+      });
+    }
+  } catch (error) {
+    console.error(`[AnalysisWindowManager] ${context} failed:`, error);
+  }
+}
+
 export class AnalysisWindowManager {
   /**
    * @param {Object} options
@@ -146,6 +197,10 @@ export class AnalysisWindowManager {
     this._windows = new Map();
 
     this._counter = 0;
+    this._activeCreationTasks = new Set();
+    this._closeTasks = new Map();
+    this._activeCloseTasks = new Set();
+    this._closeAllPromise = null;
   }
 
   getWindowCount() {
@@ -210,9 +265,10 @@ export class AnalysisWindowManager {
    * Create a floating analysis window from a session restore descriptor.
    *
    * @param {{ modeId: string, rect: { left: number, top: number, width: number, height: number }, settings: Object, headerTitle: string, headerDesc: string }} descriptor
-   * @returns {string} windowId
+   * @returns {string|Promise<never>} windowId, or an awaitable failed rollback
    */
   createFromSessionDescriptor(descriptor) {
+    this._assertWindowCreationAvailable();
     requireExactKeys(
       descriptor,
       ['headerDesc', 'headerTitle', 'modeId', 'rect', 'settings'],
@@ -245,9 +301,10 @@ export class AnalysisWindowManager {
    * Create a floating copy from the embedded (sidebar) analysis mode instance.
    * @param {string} modeId
    * @param {{ sourceRect?: DOMRect, preferredSize?: { width?: number, height?: number }, constraints?: any, headerTitle?: string, headerDesc?: string }} [options]
-   * @returns {string} windowId
+   * @returns {string|Promise<never>} windowId, or an awaitable failed rollback
    */
   copyFromEmbedded(modeId, options = {}) {
+    this._assertWindowCreationAvailable();
     requireNonEmptyString(modeId, 'Analysis mode ID');
     if (typeof this._uiManager.getUI !== 'function') {
       throw new TypeError('Analysis UI manager must implement getUI()');
@@ -268,9 +325,10 @@ export class AnalysisWindowManager {
   /**
    * Create a floating copy from an existing floating window.
    * @param {string} windowId
-   * @returns {string}
+   * @returns {string|Promise<never>}
    */
   copyFromWindow(windowId) {
+    this._assertWindowCreationAvailable();
     requireNonEmptyString(windowId, 'Analysis window ID');
     const entry = this._windows.get(windowId);
     if (!entry) {
@@ -295,51 +353,101 @@ export class AnalysisWindowManager {
   /**
    * Close a floating analysis window and cleanup resources.
    * @param {string} windowId
+   * @returns {Promise<void>}
    */
   closeWindow(windowId) {
     requireNonEmptyString(windowId, 'Analysis window ID');
+    this._closeTasks ??= new Map();
+    this._activeCloseTasks ??= new Set();
+    const existingTask = this._closeTasks.get(windowId);
+    if (existingTask !== undefined) return existingTask;
     const entry = this._windows.get(windowId);
     if (!entry) {
       throw new Error(`Analysis window not found: ${windowId}`);
     }
     const dockable = requireDockableAccordions();
-    const errors = [];
-    try {
-      dockable.unregister(entry.details);
-    } catch (error) {
-      errors.push(error);
-    }
-    try {
-      entry.ui.destroy();
-    } catch (error) {
-      errors.push(error);
-    }
-    try {
-      entry.details.remove();
-    } catch (error) {
-      errors.push(error);
-    }
-    this._windows.delete(windowId);
-    if (errors.length > 0) {
-      throw new AggregateError(
-        errors,
-        `Failed to close analysis window "${windowId}"`
-      );
-    }
+    const task = createOwnedOperation(
+      ownedTask => {
+        this._closeTasks.set(windowId, ownedTask);
+        this._activeCloseTasks.add(ownedTask);
+        // Retire synchronously from every public registry surface. The
+        // container remains connected until its UI finishes asynchronous
+        // teardown, but it can no longer be copied, exported, or counted.
+        this._windows.delete(windowId);
+      },
+      async () => {
+        const errors = [];
+        try {
+          dockable.unregister(entry.details);
+        } catch (error) {
+          errors.push(error);
+        }
+
+        try {
+          await entry.ui.destroy();
+        } catch (error) {
+          errors.push(error);
+        }
+
+        try {
+          entry.details.remove();
+        } catch (error) {
+          errors.push(error);
+        }
+        throwLifecycleErrors(
+          errors,
+          `Failed to close analysis window "${windowId}"`
+        );
+      }
+    );
+    const releaseActiveTask = () => {
+      this._activeCloseTasks.delete(task);
+    };
+    void task.then(releaseActiveTask, releaseActiveTask);
+    return task;
   }
 
   closeAll() {
-    const errors = [];
-    for (const id of Array.from(this._windows.keys())) {
-      try {
-        this.closeWindow(id);
-      } catch (error) {
-        errors.push(error);
+    if (this._closeAllPromise !== null &&
+        this._closeAllPromise !== undefined) {
+      return this._closeAllPromise;
+    }
+    this._activeCloseTasks ??= new Set();
+    this._activeCreationTasks ??= new Set();
+    const task = createOwnedOperation(
+      ownedTask => {
+        this._closeAllPromise = ownedTask;
+      },
+      async () => {
+        const errors = [];
+        const closeTasks = new Set([
+          ...this._activeCreationTasks,
+          ...this._activeCloseTasks
+        ]);
+        for (const id of [...this._windows.keys()]) {
+          try {
+            closeTasks.add(this.closeWindow(id));
+          } catch (error) {
+            errors.push(error);
+          }
+        }
+        if (closeTasks.size > 0) {
+          const outcomes = await Promise.allSettled([...closeTasks]);
+          appendRejectedOutcomes(errors, outcomes);
+        }
+        throwLifecycleErrors(
+          errors,
+          'Failed to close all analysis windows'
+        );
       }
-    }
-    if (errors.length > 0) {
-      throw new AggregateError(errors, 'Failed to close all analysis windows');
-    }
+    );
+    const releaseTask = () => {
+      if (this._closeAllPromise === task) {
+        this._closeAllPromise = null;
+      }
+    };
+    void task.then(releaseTask, releaseTask);
+    return task;
   }
 
   /**
@@ -515,6 +623,15 @@ export class AnalysisWindowManager {
   }
 
   _createWindow(modeId, settings, options = {}) {
+    this._assertWindowCreationAvailable();
+    this._activeCreationTasks ??= new Set();
+    this._closeTasks ??= new Map();
+    this._activeCloseTasks ??= new Set();
+    for (const [closedId, closeTask] of this._closeTasks) {
+      if (!this._activeCloseTasks.has(closeTask)) {
+        this._closeTasks.delete(closedId);
+      }
+    }
     if (this._windows.size >= MAX_ANALYSIS_WINDOWS) {
       throw new RangeError(
         `Maximum of ${MAX_ANALYSIS_WINDOWS} analysis windows reached`
@@ -601,7 +718,10 @@ export class AnalysisWindowManager {
     copyBtn.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
-      this.copyFromWindow(windowId);
+      observeWindowAction(
+        () => this.copyFromWindow(windowId),
+        `copy of analysis window "${windowId}"`
+      );
     });
 
     const closeBtn = document.createElement('button');
@@ -612,7 +732,10 @@ export class AnalysisWindowManager {
     closeBtn.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
-      this.closeWindow(windowId);
+      observeWindowAction(
+        () => this.closeWindow(windowId),
+        `close of analysis window "${windowId}"`
+      );
     });
 
     summary.appendChild(copyBtn);
@@ -728,26 +851,72 @@ export class AnalysisWindowManager {
           cleanupErrors.push(cleanupError);
         }
       }
+      let destroyResult;
       if (ui && typeof ui.destroy === 'function') {
         try {
-          ui.destroy();
+          destroyResult = ui.destroy();
         } catch (cleanupError) {
           cleanupErrors.push(cleanupError);
         }
       }
+
+      const finishRollback = () => {
+        try {
+          details.remove();
+        } catch (cleanupError) {
+          cleanupErrors.push(cleanupError);
+        }
+        this._windows.delete(windowId);
+        if (cleanupErrors.length > 0) {
+          throw new AggregateError(
+            [error, ...cleanupErrors],
+            `Analysis window "${windowId}" creation and rollback failed`
+          );
+        }
+        throw error;
+      };
+
+      let destroyIsAsync = false;
       try {
-        details.remove();
+        destroyIsAsync = isPromiseLike(destroyResult);
       } catch (cleanupError) {
         cleanupErrors.push(cleanupError);
       }
-      this._windows.delete(windowId);
-      if (cleanupErrors.length > 0) {
-        throw new AggregateError(
-          [error, ...cleanupErrors],
-          `Analysis window "${windowId}" creation and rollback failed`
-        );
+      if (!destroyIsAsync) {
+        return finishRollback();
       }
-      throw error;
+      const rollbackTask = Promise.resolve(destroyResult)
+        .catch(cleanupError => {
+          cleanupErrors.push(cleanupError);
+        })
+        .then(finishRollback);
+      this._activeCreationTasks.add(rollbackTask);
+      const releaseRollback = () => {
+        this._activeCreationTasks.delete(rollbackTask);
+      };
+      void rollbackTask.then(releaseRollback, releaseRollback);
+      return rollbackTask;
+    }
+  }
+
+  _assertWindowCreationAvailable() {
+    if (
+      this._closeAllPromise !== null &&
+      this._closeAllPromise !== undefined
+    ) {
+      throw new Error(
+        'Cannot create an analysis window while closeAll() is in progress'
+      );
+    }
+    if (this._comparisonModule?._destroyPromise != null) {
+      throw new Error(
+        'Cannot create an analysis window while Comparison destruction is in progress'
+      );
+    }
+    if (this._comparisonModule?._datasetResetPromise != null) {
+      throw new Error(
+        'Cannot create an analysis window while a dataset reset is in progress'
+      );
     }
   }
 

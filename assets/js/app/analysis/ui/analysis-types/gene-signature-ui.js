@@ -23,7 +23,6 @@ import {
 } from '../../shared/analysis-utils.js';
 // renderGeneChips moved inline to modal annotations
 import { isFiniteNumber } from '../../shared/number-utils.js';
-import { purgePlot } from '../../plots/plotly-loader.js';
 import { PageSelectorComponent } from '../shared/page-selector.js';
 import { renderSummaryStats, renderStatisticalAnnotations } from '../components/stats-display.js';
 
@@ -81,29 +80,40 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
    * Override to run analysis automatically when inputs are valid
    * @override
    */
-  async _runAnalysisIfValid() {
+  async _runAnalysisIfValid(scheduledRequestId = null) {
     if (this._isDestroyed) return;
+    if (
+      scheduledRequestId !== null &&
+      !this._isCurrentAnalysisIntent(scheduledRequestId)
+    ) {
+      return;
+    }
     if (!this._canRunAnalysis()) {
-      this._hideResult();
+      this._invalidateAnalysisRequest();
+      await this._hideResult();
       return;
     }
 
+    const requestId = this._startAnalysisRequest(scheduledRequestId);
+    if (requestId === null) return;
     try {
-      this._isLoading = true;
-      const formValues = this._getFormValues();
-      const result = await this._runAnalysisImpl(formValues);
+      const formValues = structuredClone(this._getFormValues());
+      const result = await this._runAnalysisImpl(formValues, requestId);
 
-      if (this._isDestroyed) return;
+      if (!this._isCurrentAnalysisRequest(requestId)) return;
       if (result) {
+        await this._showResult(result, requestId);
+        if (!this._isCurrentAnalysisRequest(requestId)) return;
         this._lastResult = result;
         this._currentPageData = result.data || result;
-        await this._showResult(result);
+        this._requestedPlotOptions = structuredClone(result.options || {});
       }
     } catch (err) {
+      if (!this._isCurrentAnalysisRequest(requestId)) return;
       console.error('[GeneSignatureUI] Analysis failed:', err);
-      this._showError('Analysis failed: ' + err.message);
+      await this._showError('Analysis failed: ' + err.message, requestId);
     } finally {
-      this._isLoading = false;
+      this._finishAnalysisRequest(requestId);
     }
   }
 
@@ -111,27 +121,29 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
    * Hide result container
    */
   _hideResult() {
-    if (this._resultContainer) {
-      purgePlot(this._resultContainer.querySelector('.analysis-preview-plot'));
-      this._resultContainer.innerHTML = '';
-      this._resultContainer.classList.add('hidden');
-    }
-    this._lastResult = null;
+    return this._discardFormResult();
   }
 
   /**
    * Show error message
    */
-  _showError(message) {
+  async _showError(message, requestId = null) {
+    await this._discardFormResult();
+    if (
+      requestId !== null &&
+      !this._isCurrentAnalysisRequest(requestId)
+    ) {
+      return false;
+    }
     if (this._resultContainer) {
       this._resultContainer.classList.remove('hidden');
-      this._resultContainer.innerHTML = '';
       const errorEl = document.createElement('div');
       errorEl.className = 'analysis-error';
       errorEl.textContent = message;
       this._resultContainer.appendChild(errorEl);
     }
     this._notifications?.error?.(message, { category: 'analysis' });
+    return true;
   }
 
   /**
@@ -403,13 +415,27 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
    * @param {Object} formValues - Form values
    * @returns {Promise<Object>} Analysis result
    */
-  async _runAnalysisImpl(formValues) {
+  async _runAnalysisImpl(formValues, requestId = null) {
+    const pageIds = [...this._selectedPages];
     // Compute signature scores
     const signatureResults = await this.multiVariableAnalysis.computeSignatureScore({
       genes: formValues.genes,
-      pageIds: this._selectedPages,
-      method: formValues.method
+      pageIds,
+      method: formValues.method,
+      isCurrent: requestId === null
+        ? undefined
+        : () => this._isCurrentAnalysisRequest(requestId),
+      registerInvalidationCleanup: requestId === null
+        ? undefined
+        : cleanup =>
+          this._registerAnalysisInvalidationCleanup(requestId, cleanup)
     });
+    if (
+      requestId !== null &&
+      !this._isCurrentAnalysisRequest(requestId)
+    ) {
+      return null;
+    }
 
     // Apply normalization if requested
     if (formValues.normalize !== 'none') {
@@ -526,44 +552,19 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
    * Show analysis result with signature-specific visualization
    * @param {Object} result - Analysis result
    */
-  async _showResult(result) {
-    this._resultContainer.classList.remove('hidden');
-    // Purge any existing plots to prevent WebGL memory leaks
-    purgePlot(this._resultContainer.querySelector('.analysis-preview-plot'));
-    this._resultContainer.innerHTML = '';
-
-    // Plot container only - clickable to open modal
-    const previewContainer = document.createElement('div');
-    previewContainer.className = 'analysis-preview-container';
-    previewContainer.style.cursor = 'pointer';
-    previewContainer.title = 'Click to open in full view with statistics and export options';
-    previewContainer.addEventListener('click', () => this._openExpandedView());
-    this._resultContainer.appendChild(previewContainer);
-
-    const plotContainer = document.createElement('div');
-    plotContainer.className = 'analysis-preview-plot';
+  async _showResult(result, requestId) {
     const plotContainerId = this._instanceId ? `${this._instanceId}-signature-analysis-plot` : 'signature-analysis-plot';
-    plotContainer.id = plotContainerId;
-    this._plotContainerId = plotContainerId;
-    previewContainer.appendChild(plotContainer);
-
-    // Render plot
-    const plotDef = PlotRegistry.get(result.plotType);
-    if (plotDef) {
-      try {
-        const mergedOptions = PlotRegistry.mergeOptions(result.plotType, result.options || {});
-        await plotDef.render(result.data, mergedOptions, plotContainer, null);
-      } catch (err) {
-        console.error('[GeneSignatureUI] Plot render error:', err);
-        plotContainer.innerHTML = '';
-        const errorEl = document.createElement('div');
-        errorEl.className = 'plot-error';
-        errorEl.textContent = `Failed to render plot: ${err?.message || err}`;
-        plotContainer.appendChild(errorEl);
-      }
-    }
-
+    const candidate = await this._renderPreviewPlot({
+      result,
+      requestId,
+      containerId: plotContainerId,
+      clickable: true
+    });
+    if (candidate === null || !this._isCurrentAnalysisRequest(requestId)) return;
     // Expand (modal) action - consistent with DE mode
+    this._resultContainer
+      .querySelector('.analysis-actions')
+      ?.remove();
     const actionsContainer = document.createElement('div');
     actionsContainer.className = 'analysis-actions';
     actionsContainer.style.display = 'flex';
@@ -783,12 +784,42 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
   // ===========================================================================
 
   destroy() {
+    if (this._destroyPromise != null) return this._destroyPromise;
     this._isDestroyed = true;
-    this._pageSelector?.destroy();
+    const errors = [];
+    if (this._pageSelector !== null && this._pageSelector !== undefined) {
+      if (typeof this._pageSelector.destroy !== 'function') {
+        errors.push(
+          new TypeError('Gene Signature page selector must implement destroy()')
+        );
+      } else {
+        try {
+          this._pageSelector.destroy();
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+    }
     this._pageSelector = null;
     this._pageSelectContainer = null;
     this._savedGeneList = '';
-    super.destroy();
+    const parentTask = super.destroy();
+    if (errors.length === 0) return parentTask;
+    const destruction = Promise.resolve(parentTask).then(
+      () => {
+        if (errors.length === 1) throw errors[0];
+        throw new AggregateError(errors, 'Gene Signature UI cleanup failed');
+      },
+      parentError => {
+        throw new AggregateError(
+          [...errors, parentError],
+          'Gene Signature UI cleanup failed'
+        );
+      }
+    );
+    this._destroyPromise = destruction;
+    void destruction.catch(() => {});
+    return destruction;
   }
 }
 

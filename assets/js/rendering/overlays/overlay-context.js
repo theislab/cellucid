@@ -9,10 +9,39 @@
  * @module rendering/overlays/overlay-context
  */
 
+const REQUIRED_RENDERER_METHODS = Object.freeze([
+  'getAlphaTexture',
+  'getAlphaTextureWidth',
+  'isAlphaTextureActive',
+  'getFogNear',
+  'getFogFar',
+  'getCurrentLODLevel',
+  'getCurrentLodIndices'
+]);
+const MATRIX_KEYS = Object.freeze([
+  'mvpMatrix',
+  'viewMatrix',
+  'modelMatrix',
+  'projectionMatrix'
+]);
+const FINITE_RENDER_PARAM_KEYS = Object.freeze([
+  'viewportWidth',
+  'viewportHeight',
+  'fov',
+  'sizeAttenuation',
+  'fogDensity',
+  'cameraDistance'
+]);
+const VECTOR3_RENDER_PARAM_KEYS = Object.freeze([
+  'fogColor',
+  'cameraPosition'
+]);
+
 /**
  * @typedef {object} OverlayContext
  * @property {WebGL2RenderingContext} gl
  * @property {string} viewId
+ * @property {number} frameId
  * @property {number} time
  * @property {number} deltaTime
  * @property {boolean} isSnapshot
@@ -24,6 +53,10 @@
  * @property {Float32Array} projectionMatrix
  * @property {number} viewportWidth
  * @property {number} viewportHeight
+ * @property {number} viewportX
+ * @property {number} viewportY
+ * @property {boolean} scissorEnabled
+ * @property {WebGLFramebuffer|null} outputFramebuffer
  * @property {number} fov
  * @property {number} sizeAttenuation
  * @property {number} fogDensity
@@ -50,12 +83,17 @@
  * @param {object} options
  * @param {WebGL2RenderingContext} options.gl
  * @param {string} options.viewId
+ * @param {number} options.frameId
  * @param {object} options.renderParams - The object passed into HighPerfRenderer.render()
  * @param {number} options.timeSeconds
  * @param {number} options.deltaTimeSeconds
  * @param {boolean} options.isSnapshot
  * @param {number} options.dimensionLevel
  * @param {number} options.devicePixelRatio
+ * @param {number} options.viewportX
+ * @param {number} options.viewportY
+ * @param {boolean} options.scissorEnabled
+ * @param {WebGLFramebuffer|null} options.outputFramebuffer
  * @param {object} options.hpRenderer
  * @param {() => Float32Array|null} options.getViewPositions
  * @param {() => Float32Array|null} options.getViewTransparency
@@ -69,12 +107,17 @@ export function buildOverlayContext(options) {
   const {
     gl,
     viewId,
+    frameId,
     renderParams,
     timeSeconds,
     deltaTimeSeconds,
     isSnapshot,
     dimensionLevel,
     devicePixelRatio,
+    viewportX,
+    viewportY,
+    scissorEnabled,
+    outputFramebuffer,
     hpRenderer,
     getViewPositions,
     getViewTransparency,
@@ -88,6 +131,11 @@ export function buildOverlayContext(options) {
   }
   if (typeof viewId !== 'string' || viewId.length === 0) {
     throw new TypeError('Overlay context viewId must be a non-empty string.');
+  }
+  if (!Number.isSafeInteger(frameId) || frameId < 0) {
+    throw new RangeError(
+      'Overlay context frameId must be a non-negative safe integer.'
+    );
   }
   if (!gl || typeof gl !== 'object') {
     throw new TypeError('Overlay context WebGL2 state is required.');
@@ -109,21 +157,31 @@ export function buildOverlayContext(options) {
   if (!Number.isFinite(devicePixelRatio) || devicePixelRatio <= 0) {
     throw new RangeError('Overlay context devicePixelRatio must be a finite positive number.');
   }
+  if (
+    !Number.isSafeInteger(viewportX) ||
+    viewportX < 0 ||
+    !Number.isSafeInteger(viewportY) ||
+    viewportY < 0
+  ) {
+    throw new RangeError(
+      'Overlay context viewport origin must contain non-negative safe integers.'
+    );
+  }
+  if (typeof scissorEnabled !== 'boolean') {
+    throw new TypeError('Overlay context scissorEnabled must be a boolean.');
+  }
+  if (outputFramebuffer !== null && typeof outputFramebuffer !== 'object') {
+    throw new TypeError(
+      'Overlay context outputFramebuffer must be a WebGLFramebuffer or null.'
+    );
+  }
   if (!target || typeof target !== 'object' || Array.isArray(target)) {
     throw new TypeError('Overlay context target must be the exact stable per-view object.');
   }
   if (!hpRenderer || typeof hpRenderer !== 'object') {
     throw new TypeError('Overlay context hpRenderer is required.');
   }
-  for (const method of [
-    'getAlphaTexture',
-    'getAlphaTextureWidth',
-    'isAlphaTextureActive',
-    'getFogNear',
-    'getFogFar',
-    'getCurrentLODLevel',
-    'getCurrentLodIndices'
-  ]) {
+  for (const method of REQUIRED_RENDERER_METHODS) {
     if (typeof hpRenderer[method] !== 'function') {
       throw new TypeError(`Overlay context hpRenderer.${method}() is required.`);
     }
@@ -135,13 +193,7 @@ export function buildOverlayContext(options) {
     throw new TypeError('Overlay context getViewTransparency() is required.');
   }
 
-  const matrixKeys = [
-    'mvpMatrix',
-    'viewMatrix',
-    'modelMatrix',
-    'projectionMatrix'
-  ];
-  for (const key of matrixKeys) {
+  for (const key of MATRIX_KEYS) {
     const matrix = renderParams[key];
     if (!(matrix instanceof Float32Array) || matrix.length !== 16) {
       throw new TypeError(
@@ -149,14 +201,7 @@ export function buildOverlayContext(options) {
       );
     }
   }
-  for (const key of [
-    'viewportWidth',
-    'viewportHeight',
-    'fov',
-    'sizeAttenuation',
-    'fogDensity',
-    'cameraDistance'
-  ]) {
+  for (const key of FINITE_RENDER_PARAM_KEYS) {
     if (!Number.isFinite(renderParams[key])) {
       throw new TypeError(`Overlay context renderParams.${key} must be a finite number.`);
     }
@@ -166,12 +211,14 @@ export function buildOverlayContext(options) {
       'Overlay context renderParams.useAlphaTexture must be a boolean.'
     );
   }
-  for (const key of ['fogColor', 'cameraPosition']) {
+  for (const key of VECTOR3_RENDER_PARAM_KEYS) {
     const value = renderParams[key];
     if (
       !(Array.isArray(value) || value instanceof Float32Array) ||
       value.length !== 3 ||
-      Array.from(value).some((entry) => !Number.isFinite(entry))
+      !Number.isFinite(value[0]) ||
+      !Number.isFinite(value[1]) ||
+      !Number.isFinite(value[2])
     ) {
       throw new TypeError(
         `Overlay context renderParams.${key} must contain exactly three finite numbers.`
@@ -183,11 +230,16 @@ export function buildOverlayContext(options) {
 
   ctx.gl = gl;
   ctx.viewId = viewId;
+  ctx.frameId = frameId;
   ctx.time = timeSeconds;
   ctx.deltaTime = deltaTimeSeconds;
   ctx.isSnapshot = isSnapshot;
   ctx.dimensionLevel = dimensionLevel;
   ctx.devicePixelRatio = devicePixelRatio;
+  ctx.viewportX = viewportX;
+  ctx.viewportY = viewportY;
+  ctx.scissorEnabled = scissorEnabled;
+  ctx.outputFramebuffer = outputFramebuffer;
 
   ctx.mvpMatrix = renderParams.mvpMatrix;
   ctx.viewMatrix = renderParams.viewMatrix;

@@ -749,6 +749,9 @@ async function handleNoneDatasetSelection() {
     showSessionStatus('No dataset selected', false);
     return true;
   } catch (error) {
+    if (isDatasetReloadSupersededError(error)) {
+      throw error;
+    }
     const exactError = errorFromUnknown(error, 'Dataset clear');
     datasetInfo.classList.remove('loading');
     datasetInfo.classList.add('error');

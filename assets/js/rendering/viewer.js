@@ -36,11 +36,32 @@ import {
   applyHorizontalProjectionCenter,
   computePaneCenterNdcX
 } from './viewport-center.js';
+import { findRaySamplePick } from './picking.js';
 
 const VALID_DIMENSION_LEVELS = new Set([1, 2, 3]);
 const INITIAL_DIMENSION_LEVEL = 3;
 const VALID_VIEWER_BACKGROUNDS = new Set(['grid', 'grid-dark', 'white', 'black']);
 const VALID_RENDER_MODES = new Set(['points', 'smoke']);
+const VELOCITY_OVERLAY_ID = 'velocity';
+// Below this size, one direct interaction scan is cheaper than retaining a
+// tree. Large clicked panes build exactly one notified tree lazily so picking,
+// lasso previews, and proximity previews never rescan 10–30M points per move.
+export const INTERACTIVE_SPATIAL_INDEX_POINT_THRESHOLD = 250_000;
+// The raw GL/renderer getters remain available only so cleanup diagnostics can
+// inspect exact owners. Their returned objects are read-only by contract once
+// isDisposed() becomes true; normal renderer work must use a new viewer.
+const TERMINAL_SAFE_VIEWER_METHODS = new Set([
+  'dispose',
+  'getGLContext',
+  'getHPRenderer',
+  'isDisposed',
+  'isDisposalSettled',
+  'isPaused',
+  'isWebGL2',
+  'pause',
+  'resume',
+  'start'
+]);
 
 export {
   assertCameraState,
@@ -63,11 +84,73 @@ export function getDefaultNavigationMode(dimensionLevel) {
   return dimensionLevel === 3 ? 'orbit' : 'planar';
 }
 
+/**
+ * Return the exact binary visibility byte consumed by the edge shader.
+ * WebGL normalizes R8 bytes to [0, 1], so 0/255 preserves the shader's
+ * historical `visibility < 0.5` decision for every finite Float32 input in
+ * the documented [0, 1] contract.
+ *
+ * @param {number} value
+ * @param {number} [index=-1]
+ * @returns {0|255}
+ */
+export function encodeEdgeVisibilityByte(value, index = -1) {
+  const suffix = Number.isSafeInteger(index) && index >= 0
+    ? ` at index ${index}`
+    : '';
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new TypeError(
+      `Connectivity visibility${suffix} must be one finite Float32 value.`
+    );
+  }
+  if (value < 0 || value > 1) {
+    throw new RangeError(
+      `Connectivity visibility${suffix} must be between 0 and 1.`
+    );
+  }
+  return value < 0.5 ? 0 : 255;
+}
+
+/**
+ * Compute the square-ish texture layout shared by edge positions and
+ * visibility. Keeping this pure makes the exact allocation arithmetic
+ * independently testable at production-scale point counts.
+ *
+ * @param {number} count
+ * @param {number} maxTextureSize
+ * @returns {[number, number]}
+ */
+export function calculateEdgeTextureDimensions(count, maxTextureSize) {
+  if (!Number.isSafeInteger(count) || count < 0) {
+    throw new RangeError(
+      'Connectivity texture count must be one non-negative safe integer.'
+    );
+  }
+  if (!Number.isSafeInteger(maxTextureSize) || maxTextureSize <= 0) {
+    throw new RangeError(
+      'Connectivity maximum texture size must be one positive safe integer.'
+    );
+  }
+  if (count === 0) return [1, 1];
+  const width = Math.min(Math.ceil(Math.sqrt(count)), maxTextureSize);
+  const height = Math.ceil(count / width);
+  return [width, Math.min(height, maxTextureSize)];
+}
+
 function assertViewId(viewId) {
   if (typeof viewId !== 'string' || viewId.length === 0) {
     throw new TypeError('Renderer view id must be a non-empty string.');
   }
   return viewId;
+}
+
+function createViewerDisposedError(methodName) {
+  const error = new Error(
+    `Viewer method "${methodName}" is unavailable after dispose(); ` +
+    'create a new viewer instance.'
+  );
+  error.name = 'ViewerDisposedError';
+  return error;
 }
 
 function assertExactBoolean(value, label) {
@@ -105,12 +188,179 @@ function assertExactFunction(value, label) {
 }
 
 function assertNoWebGLError(gl, label) {
-  const errorCode = gl.getError();
-  if (errorCode !== gl.NO_ERROR) {
+  const errorCodes = [];
+  for (let attempt = 0; attempt < 32; attempt++) {
+    const errorCode = gl.getError();
+    if (errorCode === gl.NO_ERROR) break;
+    errorCodes.push(errorCode);
+  }
+  if (errorCodes.length > 0) {
+    const encodedErrors = errorCodes
+      .map(errorCode => `0x${errorCode.toString(16)}`)
+      .join(', ');
     throw new Error(
-      `${label} encountered WebGL error 0x${errorCode.toString(16)}.`
+      `${label} encountered WebGL error${errorCodes.length === 1 ? '' : 's'} ${encodedErrors}.`
     );
   }
+}
+
+/**
+ * Execute one ArrayBufferView texture publication against neutral WebGL2
+ * unpack state and restore every caller-owned binding/addressing parameter.
+ *
+ * @param {WebGL2RenderingContext|Object} gl
+ * @param {WebGLTexture|Object} texture
+ * @param {string} label
+ * @param {Function} upload
+ */
+export function runExactEdgeTextureUpload(
+  gl,
+  texture,
+  label,
+  upload
+) {
+  assertNoWebGLError(gl, `${label} preflight`);
+  const previousTexture = gl.getParameter(gl.TEXTURE_BINDING_2D);
+  const unpackParameters = [
+    gl.UNPACK_ALIGNMENT,
+    gl.UNPACK_ROW_LENGTH,
+    gl.UNPACK_IMAGE_HEIGHT,
+    gl.UNPACK_SKIP_PIXELS,
+    gl.UNPACK_SKIP_ROWS,
+    gl.UNPACK_SKIP_IMAGES,
+  ].filter(Number.isInteger);
+  const ownsPixelUnpackBufferState = (
+    Number.isInteger(gl.PIXEL_UNPACK_BUFFER) &&
+    Number.isInteger(gl.PIXEL_UNPACK_BUFFER_BINDING) &&
+    typeof gl.bindBuffer === 'function'
+  );
+  const previousPixelStore = unpackParameters.map(
+    parameter => gl.getParameter(parameter)
+  );
+  const previousPixelUnpackBuffer = ownsPixelUnpackBufferState
+    ? gl.getParameter(gl.PIXEL_UNPACK_BUFFER_BINDING)
+    : null;
+  let publicationError = null;
+  try {
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    if (ownsPixelUnpackBufferState) {
+      gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, null);
+    }
+    for (const parameter of unpackParameters) {
+      gl.pixelStorei(
+        parameter,
+        parameter === gl.UNPACK_ALIGNMENT ? 1 : 0
+      );
+    }
+    upload();
+    assertNoWebGLError(gl, label);
+  } catch (error) {
+    publicationError = error instanceof Error
+      ? error
+      : new Error(`${label} threw a non-Error value.`);
+  }
+
+  const restorationFailures = [];
+  const restorationOperations = [];
+  for (let index = 0; index < unpackParameters.length; index++) {
+    restorationOperations.push(
+      () => gl.pixelStorei(
+        unpackParameters[index],
+        previousPixelStore[index]
+      )
+    );
+  }
+  if (ownsPixelUnpackBufferState) {
+    restorationOperations.push(
+      () => gl.bindBuffer(
+        gl.PIXEL_UNPACK_BUFFER,
+        previousPixelUnpackBuffer
+      )
+    );
+  }
+  restorationOperations.push(
+    () => gl.bindTexture(gl.TEXTURE_2D, previousTexture)
+  );
+  for (const operation of restorationOperations) {
+    try {
+      operation();
+    } catch (error) {
+      restorationFailures.push(
+        error instanceof Error
+          ? error
+          : new Error(`${label} state restoration threw a non-Error value.`)
+      );
+    }
+  }
+  try {
+    assertNoWebGLError(gl, `${label} state restoration`);
+  } catch (error) {
+    restorationFailures.push(error);
+  }
+  if (publicationError !== null || restorationFailures.length > 0) {
+    const failures = publicationError === null
+      ? restorationFailures
+      : [publicationError, ...restorationFailures];
+    if (failures.length === 1) throw failures[0];
+    throw new AggregateError(
+      failures,
+      `${label} failed and WebGL state restoration was incomplete.`
+    );
+  }
+}
+
+/**
+ * Drain exact texture handles while distinguishing a pre-delete failure from
+ * a wrapper that threw after WebGL already accepted deletion.
+ *
+ * @param {WebGL2RenderingContext|Object} gl
+ * @param {Set<*>} pending
+ * @returns {Error[]}
+ */
+export function drainExactTextureRetirements(gl, pending) {
+  if (!(pending instanceof Set)) {
+    throw new TypeError(
+      'Texture retirement journal must be one exact Set.'
+    );
+  }
+  const failures = [];
+  for (const texture of Array.from(pending)) {
+    try {
+      gl.deleteTexture(texture);
+      pending.delete(texture);
+    } catch (error) {
+      const exactError = error instanceof Error
+        ? error
+        : new Error('Texture retirement threw a non-Error value.');
+      let definitelyRetired = false;
+      if (typeof gl.isTexture === 'function') {
+        try {
+          definitelyRetired = gl.isTexture(texture) === false;
+        } catch (livenessError) {
+          failures.push(
+            new AggregateError(
+              [
+                exactError,
+                livenessError instanceof Error
+                  ? livenessError
+                  : new Error(
+                    'Texture liveness check threw a non-Error value.'
+                  ),
+              ],
+              'Texture deletion and liveness verification both failed.'
+            )
+          );
+          continue;
+        }
+      }
+      if (definitelyRetired) {
+        pending.delete(texture);
+      } else {
+        failures.push(exactError);
+      }
+    }
+  }
+  return failures;
 }
 
 function assertNonEmptyTrimmedString(value, label) {
@@ -499,6 +749,10 @@ export function createNavigationModeOwnership() {
     },
     deleteView(viewId) {
       viewUserChoices.delete(assertViewId(viewId));
+    },
+    clear() {
+      sharedUserChoice = false;
+      viewUserChoices.clear();
     }
   });
 }
@@ -618,9 +872,55 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     return overlayManager;
   }
 
+  function reportVelocityRenderFailure(value) {
+    const exactError = value instanceof Error
+      ? value
+      : new Error('Velocity rendering failed with a non-Error value.');
+    if (velocityRenderFailureHandler === null) {
+      queueMicrotask(() => {
+        throw exactError;
+      });
+      return;
+    }
+    try {
+      velocityRenderFailureHandler(exactError);
+    } catch (observerError) {
+      queueMicrotask(() => {
+        throw observerError;
+      });
+    }
+  }
+
+  function settleVelocityRenderFailure(value) {
+    const renderError = value instanceof Error
+      ? value
+      : new Error('Velocity rendering failed with a non-Error value.');
+    let reportedError = renderError;
+    try {
+      vectorFieldOverlay?.setEnabled?.(false);
+    } catch (cleanupError) {
+      reportedError = new AggregateError(
+        [renderError, cleanupError],
+        'Velocity rendering failed and shutdown was incomplete.'
+      );
+    }
+    reportVelocityRenderFailure(reportedError);
+  }
+
+  function prepareVelocityFrame(viewIds) {
+    if (!vectorFieldOverlay?.enabled) return;
+    try {
+      vectorFieldOverlay.prepareFrame(viewIds);
+    } catch (error) {
+      settleVelocityRenderFailure(error);
+    }
+  }
+
   function ensureVectorFieldOverlay() {
     if (vectorFieldOverlay) return vectorFieldOverlay;
+    overlayManager?.retryRetirement(VELOCITY_OVERLAY_ID);
     const candidate = new VelocityOverlay(gl);
+    candidate.setFailureHandler(reportVelocityRenderFailure);
     try {
       candidate.init();
       ensureOverlayManager().register(candidate);
@@ -677,8 +977,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 
   // Per-view edge textures for multi-view/multi-dimension support
   // Each view can have different positions (embeddings) and visibility (filters/LOD)
-  const edgePositionTexturesV2 = new Map();   // viewId -> { texture, dims: [w, h], format }
+  // Exact renderer geometry generations share one immutable RGB32F texture.
+  // The view map intentionally points at the pooled entry itself so a frozen
+  // snapshot retains its old generation when the live view is republished.
+  const edgePositionTexturePoolV2 = new Map(); // generation -> pooled entry
+  const edgePositionTexturesV2 = new Map();   // viewId -> pooled entry
   const edgeVisibilityTexturesV2 = new Map(); // viewId -> { texture, dims: [w, h], scratchBuffer, format }
+  const pendingEdgeTextureRetirements = new Set();
 
   // Debug flag for edge rendering (set to true to enable verbose logging)
   let edgeDebugMode = false;
@@ -688,6 +993,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
   // Centroid snapshot buffers - pre-uploaded GPU buffers for each snapshot view
   // Eliminates per-frame CPU→GPU uploads in multiview mode
   const centroidSnapshotBuffers = new Map(); // viewId -> { vao, buffer, count }
+  const pendingCentroidSnapshotRetirements = new Set();
 
   // Grid plane buffers - 6 sides (complete box)
   const GRID_SIZE = 2.0;
@@ -760,11 +1066,14 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
   let defaultShowCentroidLabels = false;
   const viewCentroidFlags = new Map();
   const viewCentroidLabels = new Map();
+  const centroidLabelOwners = new WeakMap();
+  const pendingCentroidLabelRetirements = new Map();
 
   // Small-multiples / snapshot views
   const LIVE_VIEW_ID = 'live';
   const MAX_SNAPSHOTS = 3;
   let snapshotViews = [];
+  const pendingSnapshotCleanupIds = new Set();
   let nextSnapshotId = 1;
   let viewLayoutMode = 'grid';
   let focusedViewId = LIVE_VIEW_ID;
@@ -772,6 +1081,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
   let liveViewHidden = false; // Whether to hide live view from grid
   let viewFocusHandler = typeof onViewFocus === 'function' ? onViewFocus : null;
   let navigationModeChangeHandler = null;
+  let smokeRenderFailureHandler = null;
+  let velocityRenderFailureHandler = null;
 
   function assertKnownViewId(viewId) {
     const exactViewId = assertViewId(viewId);
@@ -871,6 +1182,101 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 		    return snapshot.transparency;
 		  }
 
+      function getSpatialQueryOwner(
+        viewId,
+        ensureLargeIndex = false
+      ) {
+        const exactViewId = assertKnownViewId(viewId);
+        if (typeof ensureLargeIndex !== 'boolean') {
+          throw new TypeError(
+            'Spatial-query index preparation state must be an exact boolean.'
+          );
+        }
+        const publishedPositions = getExactViewPositions(exactViewId);
+        const transparency = getExactViewTransparency(exactViewId);
+        const dimensionLevel =
+          getPublishedDimensionLevel(exactViewId);
+        const pointCountForView = publishedPositions.length / 3;
+        const resolveIndex = () => (
+          exactViewId === LIVE_VIEW_ID
+            ? hpRenderer.getSpatialIndex(dimensionLevel)
+            : hpRenderer.getSnapshotSpatialIndex(
+                exactViewId,
+                dimensionLevel
+              )
+        );
+        let spatialIndex = resolveIndex();
+
+        if (
+          ensureLargeIndex &&
+          spatialIndex === null &&
+          pointCountForView >=
+            INTERACTIVE_SPATIAL_INDEX_POINT_THRESHOLD
+        ) {
+          if (exactViewId === LIVE_VIEW_ID) {
+            hpRenderer.ensureSpatialIndex(dimensionLevel);
+          } else {
+            hpRenderer.rebuildSnapshotSpatialIndex(
+              exactViewId,
+              dimensionLevel,
+              false
+            );
+            // Snapshots sharing the current live geometry resolve the main
+            // generation's tree instead of owning a duplicate copy.
+            if (resolveIndex() === null) {
+              hpRenderer.ensureSpatialIndex(dimensionLevel);
+            }
+          }
+          spatialIndex = resolveIndex();
+          if (spatialIndex === null) {
+            throw new Error(
+              `Large view "${exactViewId}" did not publish its prepared spatial index.`
+            );
+          }
+        }
+
+        // Index construction is synchronous today, but verify all publication
+        // identities so a future yielding builder cannot return a mixed owner.
+        if (
+          getExactViewPositions(exactViewId) !== publishedPositions ||
+          getExactViewTransparency(exactViewId) !== transparency ||
+          getPublishedDimensionLevel(exactViewId) !== dimensionLevel
+        ) {
+          throw new Error(
+            `Spatial-query owner for view "${exactViewId}" changed during preparation.`
+          );
+        }
+        if (
+          spatialIndex !== null &&
+          (
+            spatialIndex.pointCount !== pointCountForView ||
+            spatialIndex.dimensionLevel !== dimensionLevel ||
+            typeof spatialIndex.visitRaySegmentCandidates !== 'function' ||
+            typeof spatialIndex.visitRadiusCandidates !== 'function' ||
+            typeof spatialIndex.visitProjectedRectCandidates !== 'function'
+          )
+        ) {
+          throw new Error(
+            `Spatial-query index does not match exact view "${exactViewId}".`
+          );
+        }
+        // A snapshot of the current live generation owns a frozen positions
+        // copy but may borrow the renderer-certified live tree. Query against
+        // that tree's exact coordinate owner while retaining the published
+        // snapshot identity below for mid-gesture generation checks.
+        const positions = spatialIndex === null
+          ? publishedPositions
+          : spatialIndex.positions;
+        return Object.freeze({
+          viewId: exactViewId,
+          positions,
+          publishedPositions,
+          transparency,
+          dimensionLevel,
+          spatialIndex,
+        });
+      }
+
 		  function requireSnapshotBufferId(viewId) {
 		    const exactId = assertViewId(viewId);
 		    if (exactId === LIVE_VIEW_ID) return null;
@@ -958,6 +1364,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 	  const _cameraLookTarget = vec3.create();
 	  // Preallocated array for render loop view list to avoid per-frame array allocation
 	  const _renderAllViews = [];
+	  const _renderVelocityViewIds = [];
 	  // Reused per-frame parameter objects (avoid per-view per-frame allocations in multiview mode)
 	  const _projectileDrawParams = {
 	    viewportHeight: 0,
@@ -1010,6 +1417,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     getNavigationState: () => ({ navigationMode, isDragging }),
     getViewPositions: getExactViewPositions,
     getViewTransparency: getExactViewTransparency,
+    getSpatialQueryOwner,
     startTime,
     shaderQuality: currentShaderQuality
   });
@@ -1078,6 +1486,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 	  let animationHandle = null;
 	  let renderPaused = false;
 	  let disposed = false;
+	  let disposalSettled = false;
+	  const completedDisposalSteps = new Set();
 
   // Navigation (orbit + free-fly + planar)
   let navigationMode = 'orbit';
@@ -1111,6 +1521,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
   let projectileBuildCompletion = null;
   let lookActive = false;
   let lastFrameTime = performance.now();
+  let renderFrameId = 0;
 
   let velocityTheta = 0;
   let velocityPhi = 0;
@@ -1172,8 +1583,14 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
   // === Event Listener Registry (for cleanup/dispose) ===
   const eventCleanupFns = [];
   function addEventListenerWithCleanup(target, event, handler, options) {
-    target.addEventListener(event, handler, options);
-    eventCleanupFns.push(() => target.removeEventListener(event, handler, options));
+    const guardedHandler = function viewerEventHandler(...args) {
+      if (disposed) return;
+      return Reflect.apply(handler, this, args);
+    };
+    target.addEventListener(event, guardedHandler, options);
+    eventCleanupFns.push(
+      () => target.removeEventListener(event, guardedHandler, options)
+    );
   }
 
   // === WebGL context loss handling (WebGL2-only policy) ===
@@ -1254,19 +1671,62 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     e.preventDefault();
     if (webglContextLost) return;
     webglContextLost = true;
-    smokeRenderer.handleContextLost();
+    const contextLossFailures = [];
+    const attemptContextLossStep = operation => {
+      try {
+        operation();
+      } catch (error) {
+        contextLossFailures.push(
+          error instanceof Error
+            ? error
+            : new Error('WebGL context-loss cleanup threw a non-Error value.')
+        );
+      }
+    };
 
-    // Stop animation loop immediately to avoid GL calls on a lost context.
-    if (animationHandle) {
-      cancelAnimationFrame(animationHandle);
-      animationHandle = null;
+    // Fence the scheduled frame before any fallible resource or DOM cleanup.
+    // A notification failure must never leave the RAF owner running against a
+    // lost context.
+    const scheduledAnimationHandle = animationHandle;
+    animationHandle = null;
+    if (scheduledAnimationHandle !== null) {
+      attemptContextLossStep(
+        () => cancelAnimationFrame(scheduledAnimationHandle)
+      );
     }
 
-    // Hide DOM overlays that assume a working render loop.
-    if (labelLayer) labelLayer.style.display = 'none';
-    if (viewTitleLayerEl) viewTitleLayerEl.style.display = 'none';
+    attemptContextLossStep(() => smokeRenderer.handleContextLost());
+    attemptContextLossStep(
+      () => vectorFieldOverlay?.handleContextLost?.()
+    );
 
-    showWebglContextOverlay('WebGL context lost. Reload required to continue.');
+    // Hide DOM overlays that assume a working render loop.
+    if (labelLayer) {
+      attemptContextLossStep(() => {
+        labelLayer.style.display = 'none';
+      });
+    }
+    if (viewTitleLayerEl) {
+      attemptContextLossStep(() => {
+        viewTitleLayerEl.style.display = 'none';
+      });
+    }
+
+    attemptContextLossStep(() => {
+      showWebglContextOverlay(
+        'WebGL context lost. Reload required to continue.'
+      );
+    });
+    if (contextLossFailures.length > 0) {
+      const cleanupError = new AggregateError(
+        contextLossFailures,
+        'WebGL context loss was fenced, but cleanup was incomplete.'
+      );
+      // Context loss is already a terminal viewer lifecycle. Surface cleanup
+      // defects without turning the expected DOM event into an uncaught
+      // pageerror that can obscure the reload recovery UI.
+      console.error('[Viewer] WebGL context-loss cleanup was incomplete.', cleanupError);
+    }
   });
 
   addEventListenerWithCleanup(canvas, 'webglcontextrestored', () => {
@@ -1673,7 +2133,20 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 
   function publishProjectileBuildResult(completion, status, message) {
     if (completion === null) return;
-    completion(Object.freeze({ status, message }));
+    try {
+      completion(Object.freeze({ status, message }));
+    } catch (error) {
+      // Completion callbacks observe an already committed/fenced generation.
+      // They cannot roll renderer or viewer ownership back.
+      try {
+        console.error(
+          '[Viewer] Projectile preparation observer failed.',
+          error
+        );
+      } catch {
+        // Optional diagnostics are never authoritative.
+      }
+    }
   }
 
   function cancelPendingProjectileBuild(message) {
@@ -2135,11 +2608,93 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
    * @returns {[number, number]} - [width, height]
    */
   function calcTextureDims(count) {
-    if (count === 0) return [1, 1];
     const maxSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
-    const width = Math.min(Math.ceil(Math.sqrt(count)), maxSize);
-    const height = Math.ceil(count / width);
-    return [width, Math.min(height, maxSize)];
+    return calculateEdgeTextureDimensions(count, maxSize);
+  }
+
+  function queueEdgeTextureRetirement(texture) {
+    if (texture !== null && texture !== undefined) {
+      pendingEdgeTextureRetirements.add(texture);
+    }
+  }
+
+  function drainEdgeTextureRetirements() {
+    return drainExactTextureRetirements(
+      gl,
+      pendingEdgeTextureRetirements
+    );
+  }
+
+  function reportCommittedRetirementFailures(failures, message) {
+    if (failures.length === 0) return;
+    const diagnostic = failures.length === 1
+      ? failures[0]
+      : new AggregateError(failures, message);
+    try {
+      console.error(`[Viewer] ${message}`, diagnostic);
+    } catch {
+      // Diagnostics cannot invalidate an already published GPU generation.
+    }
+  }
+
+  function throwEdgeTexturePublicationFailure(error, textures, message) {
+    const exactError = error instanceof Error
+      ? error
+      : new Error('Edge texture publication threw a non-Error value.');
+    for (const texture of textures) {
+      queueEdgeTextureRetirement(texture);
+    }
+    const cleanupFailures = drainEdgeTextureRetirements();
+    if (cleanupFailures.length > 0) {
+      throw new AggregateError(
+        [exactError, ...cleanupFailures],
+        message
+      );
+    }
+    throw exactError;
+  }
+
+  function runEdgeTextureUpload(texture, label, upload) {
+    return runExactEdgeTextureUpload(gl, texture, label, upload);
+  }
+
+  function createUploadedEdgeTexture(label, upload) {
+    assertNoWebGLError(gl, `${label} allocation preflight`);
+    const texture = createRequiredTexture(gl, label);
+    try {
+      runEdgeTextureUpload(texture, label, upload);
+    } catch (error) {
+      throwEdgeTexturePublicationFailure(
+        error,
+        [texture],
+        `${label} publication and cleanup were incomplete.`
+      );
+    }
+    return texture;
+  }
+
+  function publishEdgeTextureReplacements(replacements, message) {
+    const failures = [];
+    try {
+      const boundTexture = gl.getParameter(gl.TEXTURE_BINDING_2D);
+      if (replacements.has(boundTexture)) {
+        gl.bindTexture(
+          gl.TEXTURE_2D,
+          replacements.get(boundTexture)
+        );
+      }
+    } catch (error) {
+      failures.push(
+        error instanceof Error
+          ? error
+          : new Error('Edge texture binding replacement threw a non-Error value.')
+      );
+    }
+    for (const retiredTexture of replacements.keys()) {
+      queueEdgeTextureRetirement(retiredTexture);
+    }
+    failures.push(...drainEdgeTextureRetirements());
+    reportCommittedRetirementFailures(failures, message);
   }
 
   /**
@@ -2173,74 +2728,78 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     const weightData = new Float32Array(texelCount);
     weightData.set(renderWeights);
 
-    const nextTopologyTexture = createRequiredTexture(
-      gl,
-      'weighted connectivity topology'
-    );
+    let nextTopologyTexture = null;
     let nextWeightTexture = null;
 
     try {
-      nextWeightTexture = createRequiredTexture(
-        gl,
-        'weighted connectivity weights'
+      nextTopologyTexture = createUploadedEdgeTexture(
+        'weighted connectivity topology',
+        () => {
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG32UI, width, height, 0, gl.RG_INTEGER, gl.UNSIGNED_INT, topologyData);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        }
       );
-      gl.bindTexture(gl.TEXTURE_2D, nextTopologyTexture);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG32UI, width, height, 0, gl.RG_INTEGER, gl.UNSIGNED_INT, topologyData);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-
-      gl.bindTexture(gl.TEXTURE_2D, nextWeightTexture);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, width, height, 0, gl.RED, gl.FLOAT, weightData);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      nextWeightTexture = createUploadedEdgeTexture(
+        'weighted connectivity weights',
+        () => {
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, width, height, 0, gl.RED, gl.FLOAT, weightData);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        }
+      );
     } catch (error) {
-      gl.bindTexture(gl.TEXTURE_2D, null);
-      gl.deleteTexture(nextTopologyTexture);
-      if (nextWeightTexture !== null) {
-        gl.deleteTexture(nextWeightTexture);
-      }
-      throw error;
+      throwEdgeTexturePublicationFailure(
+        error,
+        [nextTopologyTexture, nextWeightTexture],
+        'Weighted connectivity texture publication and cleanup were incomplete.'
+      );
     }
-    gl.bindTexture(gl.TEXTURE_2D, null);
 
-    if (edgeTextureV2 !== null) {
-      gl.deleteTexture(edgeTextureV2);
-    }
-    if (edgeWeightTextureV2 !== null) {
-      gl.deleteTexture(edgeWeightTextureV2);
-    }
+    const previousTopologyTexture = edgeTextureV2;
+    const previousWeightTexture = edgeWeightTextureV2;
     edgeTextureV2 = nextTopologyTexture;
     edgeWeightTextureV2 = nextWeightTexture;
     edgeTexDimsV2 = nextDims;
     nEdgesV2 = nEdges;
+    const replacements = new Map();
+    if (previousTopologyTexture !== null) {
+      replacements.set(previousTopologyTexture, nextTopologyTexture);
+    }
+    if (previousWeightTexture !== null) {
+      replacements.set(previousWeightTexture, nextWeightTexture);
+    }
+    publishEdgeTextureReplacements(
+      replacements,
+      'Weighted connectivity prior-generation retirement was incomplete.'
+    );
     console.log(`[Viewer] Created weighted edge textures V2: ${nEdges} edges, ${width}x${height} textures`);
     return true;
   }
 
-  function clearEdgeResourcesV2() {
-    if (edgeTextureV2 !== null) {
-      gl.deleteTexture(edgeTextureV2);
-      edgeTextureV2 = null;
-    }
+  function detachEdgeResourcesV2() {
+    const retiringTextures = new Set(pendingEdgeTextureRetirements);
+    if (edgeTextureV2 !== null) retiringTextures.add(edgeTextureV2);
     if (edgeWeightTextureV2 !== null) {
-      gl.deleteTexture(edgeWeightTextureV2);
-      edgeWeightTextureV2 = null;
+      retiringTextures.add(edgeWeightTextureV2);
     }
-    for (const entry of edgePositionTexturesV2.values()) {
-      if (entry.texture) {
-        gl.deleteTexture(entry.texture);
-      }
+    for (const entry of edgePositionTexturePoolV2.values()) {
+      if (entry.texture) retiringTextures.add(entry.texture);
+      entry.refCount = 0;
     }
-    edgePositionTexturesV2.clear();
     for (const entry of edgeVisibilityTexturesV2.values()) {
-      if (entry.texture) {
-        gl.deleteTexture(entry.texture);
-      }
+      if (entry.texture) retiringTextures.add(entry.texture);
     }
+
+    // Detach the render inventory before any hostile deletion can fail.
+    edgeTextureV2 = null;
+    edgeWeightTextureV2 = null;
+    edgePositionTexturePoolV2.clear();
+    edgePositionTexturesV2.clear();
     edgeVisibilityTexturesV2.clear();
     edgeTexDimsV2 = [0, 0];
     nEdgesV2 = 0;
@@ -2248,6 +2807,33 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     hasEdgeDataV2 = false;
     useInstancedEdges = false;
     edgeLodLimit = 0;
+
+    if (retiringTextures.size === 0) return [];
+
+    const failures = [];
+    try {
+      const boundTexture = gl.getParameter(gl.TEXTURE_BINDING_2D);
+      if (retiringTextures.has(boundTexture)) {
+        gl.bindTexture(gl.TEXTURE_2D, null);
+      }
+    } catch (error) {
+      failures.push(error);
+    }
+    for (const texture of retiringTextures) {
+      queueEdgeTextureRetirement(texture);
+    }
+    failures.push(...drainEdgeTextureRetirements());
+    return failures;
+  }
+
+  function clearEdgeResourcesV2() {
+    const failures = detachEdgeResourcesV2();
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        'Connectivity resources were detached with pending texture retirement failures.'
+      );
+    }
   }
 
   // ========================================================================
@@ -2255,86 +2841,265 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
   // Enables multi-view edge rendering with different positions/visibility per view
   // ========================================================================
 
+  function getCertifiedEdgeGeometry(viewId) {
+    const vid = assertViewId(viewId);
+    const generationBefore =
+      hpRenderer.getViewGeometryGeneration(vid);
+    const positions = vid === LIVE_VIEW_ID
+      ? hpRenderer.getPositions()
+      : hpRenderer.getSnapshotPositions(vid);
+    const generationAfter =
+      hpRenderer.getViewGeometryGeneration(vid);
+    if (
+      generationBefore !== generationAfter ||
+      !Number.isSafeInteger(generationAfter) ||
+      generationAfter <= 0
+    ) {
+      throw new Error(
+        `Connectivity geometry certificate changed while reading view "${vid}".`
+      );
+    }
+    if (
+      !(positions instanceof Float32Array) ||
+      positions.length === 0 ||
+      positions.length % 3 !== 0
+    ) {
+      throw new Error(
+        `Renderer published invalid connectivity positions for view "${vid}".`
+      );
+    }
+    const nCells = positions.length / 3;
+    if (
+      !Number.isSafeInteger(nCells) ||
+      nCells <= 0 ||
+      (pointCount > 0 && nCells !== pointCount) ||
+      (nCellsV2 > 0 && nCells !== nCellsV2)
+    ) {
+      throw new RangeError(
+        `Renderer connectivity geometry for view "${vid}" has an incompatible cell count.`
+      );
+    }
+    return {
+      generation: generationAfter,
+      nCells,
+      positions,
+    };
+  }
+
+  function releaseEdgePositionPoolEntry(
+    entry,
+    replacementTexture,
+    replacements
+  ) {
+    if (!entry) return;
+    if (
+      !Number.isSafeInteger(entry.refCount) ||
+      entry.refCount <= 0 ||
+      edgePositionTexturePoolV2.get(entry.generation) !== entry
+    ) {
+      throw new Error(
+        'Connectivity position texture pool ownership is inconsistent.'
+      );
+    }
+    entry.refCount -= 1;
+    if (entry.refCount !== 0) return;
+    edgePositionTexturePoolV2.delete(entry.generation);
+    replacements.set(entry.texture, replacementTexture);
+  }
+
   /**
    * Create or update position texture for a specific view.
-   * Each view can have different positions (e.g., XY embedding vs XZ embedding).
+   * Exact renderer geometry generations share one immutable texture.
    * @param {string} viewId - View identifier
-   * @param {Float32Array} positions - Flat array of xyz positions (nCells * 3)
-   * @param {number} nCells - Number of cells
+   * @param {Float32Array|null} expectedPositions - Optional compatibility input
+   * @param {number|null} expectedNCells - Optional compatibility input
    * @returns {boolean} True if texture was created successfully
    */
-  function createPositionTextureV2ForView(viewId, positions, nCells) {
+  function createPositionTextureV2ForView(
+    viewId,
+    expectedPositions = null,
+    expectedNCells = null
+  ) {
     if (typeof viewId !== 'string' || viewId.length === 0) {
       return false;
     }
     const vid = viewId;
-
-    // Validate inputs
+    const geometry = getCertifiedEdgeGeometry(vid);
+    const { generation, nCells, positions } = geometry;
+    if (expectedPositions !== null) {
+      if (
+        !(expectedPositions instanceof Float32Array) ||
+        expectedPositions.length !== positions.length
+      ) {
+        throw new TypeError(
+          `Connectivity setup positions for view "${vid}" do not match the renderer publication.`
+        );
+      }
+      for (let index = 0; index < positions.length; index++) {
+        if (!Object.is(expectedPositions[index], positions[index])) {
+          throw new RangeError(
+            `Connectivity setup positions for view "${vid}" differ from ` +
+            `the certified renderer owner at coordinate ${index}.`
+          );
+        }
+      }
+    }
     if (
-      !(positions instanceof Float32Array) ||
-      !Number.isSafeInteger(nCells) ||
-      nCells <= 0 ||
-      positions.length !== nCells * 3
+      expectedNCells !== null &&
+      (
+        !Number.isSafeInteger(expectedNCells) ||
+        expectedNCells !== nCells
+      )
     ) {
-      console.warn(`[Viewer] Invalid positions for view ${vid}`);
-      return false;
+      throw new RangeError(
+        `Connectivity setup cell count for view "${vid}" does not match the renderer publication.`
+      );
     }
 
     const existing = edgePositionTexturesV2.get(vid);
     const newDims = calcTextureDims(nCells);
-
-    const dims = newDims;
-    const [width, height] = dims;
+    const [width, height] = newDims;
     const texelCount = width * height;
-
-    // Pack positions into RGB32F texture
-    const data = new Float32Array(texelCount * 3);
-    for (let i = 0; i < nCells; i++) {
-      data[i * 3] = positions[i * 3];
-      data[i * 3 + 1] = positions[i * 3 + 1];
-      data[i * 3 + 2] = positions[i * 3 + 2];
+    if (texelCount < nCells) {
+      throw new RangeError(
+        `Connectivity positions for view "${vid}" require ${nCells} texels, ` +
+        `but this WebGL2 implementation supports ${texelCount}.`
+      );
     }
 
-    const texture = createRequiredTexture(
-      gl,
-      `weighted connectivity positions for view "${vid}"`
-    );
-    try {
-      gl.bindTexture(gl.TEXTURE_2D, texture);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB32F, width, height, 0, gl.RGB, gl.FLOAT, data);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      gl.bindTexture(gl.TEXTURE_2D, null);
-    } catch (error) {
-      gl.bindTexture(gl.TEXTURE_2D, null);
-      gl.deleteTexture(texture);
-      throw error;
+    let pooledEntry = edgePositionTexturePoolV2.get(generation);
+    if (pooledEntry) {
+      if (
+        pooledEntry.nCells !== nCells ||
+        pooledEntry.dims[0] !== width ||
+        pooledEntry.dims[1] !== height ||
+        pooledEntry.format !== 'RGB32F' ||
+        !pooledEntry.texture
+      ) {
+        throw new Error(
+          `Connectivity position texture generation ${generation} is inconsistent.`
+        );
+      }
+    } else {
+      const texture = createUploadedEdgeTexture(
+        `weighted connectivity positions for view "${vid}"`,
+        () => {
+          gl.texParameteri(
+            gl.TEXTURE_2D,
+            gl.TEXTURE_MIN_FILTER,
+            gl.NEAREST
+          );
+          gl.texParameteri(
+            gl.TEXTURE_2D,
+            gl.TEXTURE_MAG_FILTER,
+            gl.NEAREST
+          );
+          gl.texParameteri(
+            gl.TEXTURE_2D,
+            gl.TEXTURE_WRAP_S,
+            gl.CLAMP_TO_EDGE
+          );
+          gl.texParameteri(
+            gl.TEXTURE_2D,
+            gl.TEXTURE_WRAP_T,
+            gl.CLAMP_TO_EDGE
+          );
+          // Allocate zero-initialized GPU storage, then stream directly from
+          // the exact renderer owner. This avoids a width*height*3 padded host
+          // duplicate at 10–30M cells.
+          gl.texImage2D(
+            gl.TEXTURE_2D,
+            0,
+            gl.RGB32F,
+            width,
+            height,
+            0,
+            gl.RGB,
+            gl.FLOAT,
+            null
+          );
+          const completeRows = Math.floor(nCells / width);
+          if (completeRows > 0) {
+            gl.texSubImage2D(
+              gl.TEXTURE_2D,
+              0,
+              0,
+              0,
+              width,
+              completeRows,
+              gl.RGB,
+              gl.FLOAT,
+              positions,
+              0
+            );
+          }
+          const tailLength = nCells - completeRows * width;
+          if (tailLength > 0) {
+            gl.texSubImage2D(
+              gl.TEXTURE_2D,
+              0,
+              0,
+              completeRows,
+              tailLength,
+              1,
+              gl.RGB,
+              gl.FLOAT,
+              positions,
+              completeRows * width * 3
+            );
+          }
+        }
+      );
+      pooledEntry = {
+        dims: newDims,
+        format: 'RGB32F',
+        generation,
+        nCells,
+        refCount: 0,
+        texture,
+      };
+      edgePositionTexturePoolV2.set(generation, pooledEntry);
     }
 
-    if (existing?.texture) {
-      gl.deleteTexture(existing.texture);
-      const dimsChanged =
+    if (existing === pooledEntry) {
+      if (vid === LIVE_VIEW_ID) nCellsV2 = nCells;
+      return true;
+    }
+
+    const replacements = new Map();
+    const dimsChanged =
+      existing?.texture &&
+      (
         !existing.dims ||
         existing.dims[0] !== newDims[0] ||
-        existing.dims[1] !== newDims[1];
-      if (dimsChanged) {
-        const visEntry = edgeVisibilityTexturesV2.get(vid);
-        if (visEntry?.texture) {
-          gl.deleteTexture(visEntry.texture);
-        }
-        edgeVisibilityTexturesV2.delete(vid);
+        existing.dims[1] !== newDims[1]
+      );
+
+    // Publish the new lookup/refcount before retiring the prior entry. No
+    // WebGL deletion is allowed to roll back this committed generation.
+    pooledEntry.refCount += 1;
+    edgePositionTexturesV2.set(vid, pooledEntry);
+    releaseEdgePositionPoolEntry(
+      existing,
+      pooledEntry.texture,
+      replacements
+    );
+    if (dimsChanged) {
+      const visEntry = edgeVisibilityTexturesV2.get(vid);
+      edgeVisibilityTexturesV2.delete(vid);
+      if (visEntry?.texture) {
+        replacements.set(visEntry.texture, null);
       }
     }
-
-    // Store with format tag for validation
-    edgePositionTexturesV2.set(vid, { texture, dims, nCells, format: 'RGB32F' });
 
     // Track cell count for debugging (use live view's count as the canonical value)
     if (vid === LIVE_VIEW_ID) {
       nCellsV2 = nCells;
     }
+    publishEdgeTextureReplacements(
+      replacements,
+      `Connectivity prior position generation for view "${vid}" could not be fully retired.`
+    );
 
     return true;
   }
@@ -2346,22 +3111,44 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
    * @param {Float32Array} visibility - Per-cell visibility (0-1)
    * @returns {boolean} True if texture was created/updated successfully
    */
-  function updateVisibilityTextureV2ForView(viewId, visibility) {
+  function updateVisibilityTextureV2ForView(
+    viewId,
+    visibility,
+    internalByteAt = null
+  ) {
     if (typeof viewId !== 'string' || viewId.length === 0) {
       return false;
     }
     const vid = viewId;
 
-    // Validate inputs
-    if (
-      !(visibility instanceof Float32Array) ||
-      visibility.length === 0
-    ) {
-      console.warn(`[Viewer] Invalid visibility for view ${vid}: visibility is empty or null`);
-      return false;
+    let nCells;
+    let readByte;
+    if (internalByteAt === null) {
+      if (
+        !(visibility instanceof Float32Array) ||
+        visibility.length === 0
+      ) {
+        console.warn(`[Viewer] Invalid visibility for view ${vid}: visibility is empty or null`);
+        return false;
+      }
+      nCells = visibility.length;
+      readByte = index => encodeEdgeVisibilityByte(
+        visibility[index],
+        index
+      );
+    } else {
+      if (
+        !Number.isSafeInteger(visibility) ||
+        visibility <= 0 ||
+        typeof internalByteAt !== 'function'
+      ) {
+        throw new TypeError(
+          'Internal connectivity visibility publication is invalid.'
+        );
+      }
+      nCells = visibility;
+      readByte = internalByteAt;
     }
-
-    const nCells = visibility.length;
 
     // Get position texture dims for this view (visibility must match position count)
     const posEntry = edgePositionTexturesV2.get(vid);
@@ -2369,7 +3156,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       console.warn(`[Viewer] Cannot update visibility for view ${vid}: no position texture`);
       return false;
     }
-    if (visibility.length !== posEntry.nCells) {
+    if (nCells !== posEntry.nCells) {
       return false;
     }
 
@@ -2384,114 +3171,186 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     if (visEntry?.texture && visEntry.dims) {
       const dimsMismatch = visEntry.dims[0] !== width || visEntry.dims[1] !== height;
       if (dimsMismatch) {
-        gl.deleteTexture(visEntry.texture);
         edgeVisibilityTexturesV2.delete(vid);
+        publishEdgeTextureReplacements(
+          new Map([[visEntry.texture, null]]),
+          `Connectivity mismatched visibility generation for view "${vid}" could not be fully retired.`
+        );
         visEntry = null;
       }
     }
 
-    // Reuse or create scratch buffer
+    // R8 is the exact shader contract: hidden=0, visible=255. The persistent
+    // comparison owner is therefore one byte per texel instead of four.
     let scratchBuffer = visEntry?.scratchBuffer;
-    const hadPreviousBuffer = scratchBuffer && scratchBuffer.length === texelCount;
+    const hadPreviousBuffer = (
+      scratchBuffer instanceof Uint8Array &&
+      scratchBuffer.length === texelCount
+    );
     if (!hadPreviousBuffer) {
-      scratchBuffer = new Float32Array(texelCount);
+      scratchBuffer = new Uint8Array(texelCount);
     }
 
-    // For subsequent updates, detect which rows changed to enable partial uploads
-    // This avoids full texture upload when only a few cells change (e.g., sparse filter updates)
-    let dirtyRowStart = 0;
-    let dirtyRowEnd = height;
-    let hasChanges = true;
-
-    if (hadPreviousBuffer && visEntry?.texture) {
-      // Compare with previous values to find dirty rows and detect if anything changed
-      hasChanges = false;
-      dirtyRowStart = height; // Will be updated to first dirty row
-      dirtyRowEnd = 0; // Will be updated to last dirty row + 1
-
-      for (let row = 0; row < height; row++) {
-        const rowStart = row * width;
-        const rowEnd = Math.min(rowStart + width, texelCount);
-        let rowDirty = false;
-
-        for (let i = rowStart; i < rowEnd; i++) {
-          const newVal = i < nCells ? visibility[i] : 0;
-          if (scratchBuffer[i] !== newVal) {
-            scratchBuffer[i] = newVal;
-            rowDirty = true;
-          }
-        }
-
-        if (rowDirty) {
-          hasChanges = true;
-          if (row < dirtyRowStart) dirtyRowStart = row;
-          dirtyRowEnd = row + 1;
-        }
+    // Validate the complete caller array before any GL mutation. Binary
+    // comparison means finite Float32 values on the same side of 0.5 do not
+    // cause redundant uploads.
+    let dirtyRowStart = height;
+    let dirtyRowEnd = 0;
+    for (let index = 0; index < nCells; index++) {
+      const nextByte = readByte(index);
+      if (nextByte !== 0 && nextByte !== 255) {
+        throw new RangeError(
+          `Internal connectivity visibility byte at index ${index} must be 0 or 255.`
+        );
       }
+      if (!hadPreviousBuffer || scratchBuffer[index] !== nextByte) {
+        const row = Math.floor(index / width);
+        if (row < dirtyRowStart) dirtyRowStart = row;
+        dirtyRowEnd = row + 1;
+      }
+    }
+    if (hadPreviousBuffer && dirtyRowEnd === 0) return true;
 
-      // Early exit if nothing changed
-      if (!hasChanges) {
-        return true;
-      }
-    } else {
-      // First time or buffer size changed: copy all data
-      for (let i = 0; i < texelCount; i++) {
-        scratchBuffer[i] = i < nCells ? visibility[i] : 0;
-      }
+    // Validation is now complete. Mutate only the scratch rows this
+    // publication owns, then upload that same Uint8 owner directly. If an
+    // in-place upload fails, the catch path detaches the texture and this
+    // scratch together, so no rollback copy or conversion staging is needed.
+    const encodeStart = hadPreviousBuffer
+      ? dirtyRowStart * width
+      : 0;
+    const encodeEnd = hadPreviousBuffer
+      ? Math.min(dirtyRowEnd * width, nCells)
+      : nCells;
+    for (let index = encodeStart; index < encodeEnd; index++) {
+      scratchBuffer[index] = readByte(index);
     }
 
     if (!visEntry?.texture) {
       // First time: create texture
-      const texture = createRequiredTexture(
-        gl,
-        `weighted connectivity visibility for view "${vid}"`
+      const texture = createUploadedEdgeTexture(
+        `weighted connectivity visibility for view "${vid}"`,
+        () => {
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+          gl.texImage2D(
+            gl.TEXTURE_2D,
+            0,
+            gl.R8,
+            width,
+            height,
+            0,
+            gl.RED,
+            gl.UNSIGNED_BYTE,
+            null
+          );
+          const completeRows = Math.floor(nCells / width);
+          if (completeRows > 0) {
+            gl.texSubImage2D(
+              gl.TEXTURE_2D,
+              0,
+              0,
+              0,
+              width,
+              completeRows,
+              gl.RED,
+              gl.UNSIGNED_BYTE,
+              scratchBuffer,
+              0
+            );
+          }
+          const tailLength = nCells - completeRows * width;
+          if (tailLength > 0) {
+            gl.texSubImage2D(
+              gl.TEXTURE_2D,
+              0,
+              0,
+              completeRows,
+              tailLength,
+              1,
+              gl.RED,
+              gl.UNSIGNED_BYTE,
+              scratchBuffer,
+              completeRows * width
+            );
+          }
+        }
       );
-      try {
-        gl.bindTexture(gl.TEXTURE_2D, texture);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, width, height, 0, gl.RED, gl.FLOAT, scratchBuffer);
-        gl.bindTexture(gl.TEXTURE_2D, null);
-      } catch (error) {
-        gl.bindTexture(gl.TEXTURE_2D, null);
-        gl.deleteTexture(texture);
-        throw error;
-      }
 
       // Store with format tag for validation
-      edgeVisibilityTexturesV2.set(vid, { texture, dims: [width, height], scratchBuffer, format: 'R32F' });
+      edgeVisibilityTexturesV2.set(vid, {
+        dims: [width, height],
+        format: 'R8',
+        scratchBuffer,
+        texture,
+      });
     } else {
       // Subsequent updates: use row-based partial upload if fewer than 50% of rows changed
       const dirtyRowCount = dirtyRowEnd - dirtyRowStart;
       const usePartialUpload = dirtyRowCount < height * 0.5 && dirtyRowCount > 0;
 
-      try {
-        gl.bindTexture(gl.TEXTURE_2D, visEntry.texture);
-
-        if (usePartialUpload) {
-          // Upload only the dirty rows using a subview of the scratch buffer
-          // texSubImage2D(target, level, xoffset, yoffset, width, height, format, type, srcData, srcOffset)
-          const srcOffset = dirtyRowStart * width;
+      const uploadRows = (startRow, endRow) => {
+        const completeRowCount = Math.floor(nCells / width);
+        const completeEnd = Math.min(endRow, completeRowCount);
+        if (startRow < completeEnd) {
           gl.texSubImage2D(
-            gl.TEXTURE_2D, 0, 0, dirtyRowStart, width, dirtyRowCount,
-            gl.RED, gl.FLOAT, scratchBuffer, srcOffset
+            gl.TEXTURE_2D,
+            0,
+            0,
+            startRow,
+            width,
+            completeEnd - startRow,
+            gl.RED,
+            gl.UNSIGNED_BYTE,
+            scratchBuffer,
+            startRow * width
           );
-        } else {
-          // Full texture upload
-          gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, width, height, gl.RED, gl.FLOAT, scratchBuffer);
         }
-
-        gl.bindTexture(gl.TEXTURE_2D, null);
+        const tailLength = nCells % width;
+        const tailRow = completeRowCount;
+        if (
+          tailLength > 0 &&
+          startRow <= tailRow &&
+          endRow > tailRow
+        ) {
+          const tailOffset = tailRow * width;
+          gl.texSubImage2D(
+            gl.TEXTURE_2D,
+            0,
+            0,
+            tailRow,
+            tailLength,
+            1,
+            gl.RED,
+            gl.UNSIGNED_BYTE,
+            scratchBuffer,
+            tailOffset
+          );
+        }
+      };
+      try {
+        runEdgeTextureUpload(
+          visEntry.texture,
+          `weighted connectivity visibility update for view "${vid}"`,
+          () => {
+            if (usePartialUpload) {
+              uploadRows(dirtyRowStart, dirtyRowEnd);
+            } else {
+              uploadRows(0, height);
+            }
+          }
+        );
       } catch (error) {
-        gl.bindTexture(gl.TEXTURE_2D, null);
-        gl.deleteTexture(visEntry.texture);
         edgeVisibilityTexturesV2.delete(vid);
-        throw error;
+        throwEdgeTexturePublicationFailure(
+          error,
+          [visEntry.texture],
+          `Connectivity visibility update for view "${vid}" failed and cleanup was incomplete.`
+        );
       }
 
-      // Update scratch buffer reference (it already holds the new values)
+      // The scratch owner and GPU texture now represent the same generation.
       visEntry.scratchBuffer = scratchBuffer;
     }
 
@@ -2510,26 +3369,48 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     const vid = viewId;
 
     const posEntry = edgePositionTexturesV2.get(vid);
-    if (posEntry?.texture) {
-      gl.deleteTexture(posEntry.texture);
-    }
     edgePositionTexturesV2.delete(vid);
 
     const visEntry = edgeVisibilityTexturesV2.get(vid);
-    if (visEntry?.texture) {
-      gl.deleteTexture(visEntry.texture);
-    }
     edgeVisibilityTexturesV2.delete(vid);
+
+    const replacements = new Map();
+    releaseEdgePositionPoolEntry(posEntry, null, replacements);
+    if (visEntry?.texture) {
+      replacements.set(visEntry.texture, null);
+    }
+    const failures = [];
+    try {
+      const boundTexture = gl.getParameter(gl.TEXTURE_BINDING_2D);
+      if (replacements.has(boundTexture)) {
+        gl.bindTexture(
+          gl.TEXTURE_2D,
+          replacements.get(boundTexture)
+        );
+      }
+    } catch (error) {
+      failures.push(error);
+    }
+    for (const texture of replacements.keys()) {
+      queueEdgeTextureRetirement(texture);
+    }
+    failures.push(...drainEdgeTextureRetirements());
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        `Connectivity textures for view "${vid}" were detached with pending retirement failures.`
+      );
+    }
     return true;
   }
 
   /**
-   * Validate that a texture entry has the expected format for float samplers.
+   * Validate that a texture entry has the expected shader-facing format.
    * @param {Object} entry - Texture entry with texture and format properties
-   * @param {string} expectedFormat - Expected format ('RGB32F' or 'R32F')
+   * @param {string} expectedFormat - Expected format ('RGB32F' or 'R8')
    * @returns {boolean} True if valid
    */
-  function isValidFloatTexture(entry, expectedFormat) {
+  function isValidEdgeTexture(entry, expectedFormat) {
     if (!entry?.texture) return false;
     // If format was tracked, verify it matches
     if (entry.format && entry.format !== expectedFormat) {
@@ -2556,11 +3437,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     // Helper to validate and return a texture set
     const validateAndReturn = (posEntry, visEntry, source) => {
       // Validate both textures exist and have correct formats
-      if (!isValidFloatTexture(posEntry, 'RGB32F')) {
+      if (!isValidEdgeTexture(posEntry, 'RGB32F')) {
         console.warn(`[Viewer] Invalid position texture for ${source}`);
         return null;
       }
-      if (!isValidFloatTexture(visEntry, 'R32F')) {
+      if (!isValidEdgeTexture(visEntry, 'R8')) {
         console.warn(`[Viewer] Invalid visibility texture for ${source}`);
         return null;
       }
@@ -2609,6 +3490,51 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     }
     return edgePositionTexturesV2.has(viewId) &&
       edgeVisibilityTexturesV2.has(viewId);
+  }
+
+  function getEdgeTextureStatsV2() {
+    const positionGenerations = Array.from(
+      edgePositionTexturePoolV2.values(),
+      entry => Object.freeze({
+        allocatedTexels: entry.dims[0] * entry.dims[1],
+        generation: entry.generation,
+        gpuBytes:
+          entry.dims[0] *
+          entry.dims[1] *
+          3 *
+          Float32Array.BYTES_PER_ELEMENT,
+        nCells: entry.nCells,
+        refCount: entry.refCount,
+      })
+    );
+    const positionViewGenerations = Array.from(
+      edgePositionTexturesV2,
+      ([viewId, entry]) => Object.freeze({
+        generation: entry.generation,
+        viewId,
+      })
+    );
+    const visibilityViews = Array.from(
+      edgeVisibilityTexturesV2,
+      ([viewId, entry]) => {
+        const allocatedTexels = entry.dims[0] * entry.dims[1];
+        return Object.freeze({
+          allocatedTexels,
+          cpuBytes: entry.scratchBuffer.byteLength,
+          format: entry.format,
+          gpuBytes: allocatedTexels,
+          viewId,
+        });
+      }
+    );
+    return Object.freeze({
+      pendingRetirements: pendingEdgeTextureRetirements.size,
+      positionGenerations: Object.freeze(positionGenerations),
+      positionViewGenerations: Object.freeze(
+        positionViewGenerations
+      ),
+      visibilityViews: Object.freeze(visibilityViews),
+    });
   }
 
   /**
@@ -2841,6 +3767,45 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
   // === CENTROID SNAPSHOT BUFFER MANAGEMENT ===
   // Pre-upload centroid data to GPU once per snapshot (eliminates per-frame uploads)
 
+  function queueCentroidSnapshotRetirement(record) {
+    const retirement = {
+      buffer: record?.buffer ?? null,
+      vao: record?.vao ?? null,
+    };
+    if (retirement.buffer !== null || retirement.vao !== null) {
+      pendingCentroidSnapshotRetirements.add(retirement);
+    }
+  }
+
+  function drainCentroidSnapshotRetirements() {
+    const failures = [];
+    for (
+      const retirement of
+      Array.from(pendingCentroidSnapshotRetirements)
+    ) {
+      if (retirement.vao !== null) {
+        try {
+          gl.deleteVertexArray(retirement.vao);
+          retirement.vao = null;
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      if (retirement.buffer !== null) {
+        try {
+          gl.deleteBuffer(retirement.buffer);
+          retirement.buffer = null;
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      if (retirement.vao === null && retirement.buffer === null) {
+        pendingCentroidSnapshotRetirements.delete(retirement);
+      }
+    }
+    return failures;
+  }
+
   /**
    * Create or update a centroid snapshot buffer for a view.
    * @param {string} viewId - View identifier
@@ -2861,9 +3826,21 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       );
     }
     const count = positions.length / 3;
-    if (count === 0) return false;
-
     const vid = viewId;
+    if (count === 0) {
+      const previous = centroidSnapshotBuffers.get(vid) ?? null;
+      centroidSnapshotBuffers.delete(vid);
+      if (previous !== null) {
+        queueCentroidSnapshotRetirement(previous);
+      }
+      const retirementFailures =
+        drainCentroidSnapshotRetirements();
+      reportCommittedRetirementFailures(
+        retirementFailures,
+        `Empty centroid snapshot for view "${vid}" committed with pending prior-generation retirement.`
+      );
+      return true;
+    }
 
     // Build interleaved buffer: 16 bytes per point (12 pos + 4 color)
     const STRIDE = 16;
@@ -2923,11 +3900,31 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       gl.bindBuffer(gl.ARRAY_BUFFER, null);
       assertNoWebGLError(gl, 'Candidate centroid snapshot publication');
     } catch (error) {
-      gl.bindVertexArray(null);
-      gl.bindBuffer(gl.ARRAY_BUFFER, null);
-      if (vao) gl.deleteVertexArray(vao);
-      if (glBuffer) gl.deleteBuffer(glBuffer);
-      gl.getError();
+      const rollbackFailures = [];
+      for (const operation of [
+        () => gl.bindVertexArray(null),
+        () => gl.bindBuffer(gl.ARRAY_BUFFER, null),
+        () => gl.getError(),
+      ]) {
+        try {
+          operation();
+        } catch (rollbackError) {
+          rollbackFailures.push(rollbackError);
+        }
+      }
+      queueCentroidSnapshotRetirement({
+        vao,
+        buffer: glBuffer,
+      });
+      rollbackFailures.push(
+        ...drainCentroidSnapshotRetirements()
+      );
+      if (rollbackFailures.length > 0) {
+        throw new AggregateError(
+          [error, ...rollbackFailures],
+          `Centroid snapshot "${vid}" publication failed and rollback was incomplete.`
+        );
+      }
       throw error;
     }
 
@@ -2941,8 +3938,15 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     const previous = centroidSnapshotBuffers.get(vid) || null;
     centroidSnapshotBuffers.set(vid, candidate);
     if (previous) {
-      gl.deleteVertexArray(previous.vao);
-      gl.deleteBuffer(previous.buffer);
+      queueCentroidSnapshotRetirement(previous);
+      const retirementFailures =
+        drainCentroidSnapshotRetirements();
+      if (retirementFailures.length > 0) {
+        reportCommittedRetirementFailures(
+          retirementFailures,
+          `Centroid snapshot prior generation for view "${vid}" could not be fully retired.`
+        );
+      }
     }
     return true;
   }
@@ -2965,9 +3969,15 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     const vid = String(viewId);
     const existing = centroidSnapshotBuffers.get(vid);
     if (existing) {
-      gl.deleteVertexArray(existing.vao);
-      gl.deleteBuffer(existing.buffer);
       centroidSnapshotBuffers.delete(vid);
+      queueCentroidSnapshotRetirement(existing);
+    }
+    const failures = drainCentroidSnapshotRetirements();
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        `Centroid snapshot "${vid}" was detached with pending retirement failures.`
+      );
     }
   }
 
@@ -3211,9 +4221,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     };
   }
 
-  function pickCellAtScreen(screenX, screenY) {
+  function pickCellRecordAtScreen(screenX, screenY) {
     const viewport = getViewportInfoAtScreen(screenX, screenY);
-    if (viewport === -1) return -1;
+    if (viewport === -1) return null;
     const {
       vpLocalX,
       vpLocalY,
@@ -3222,7 +4232,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       vpAspect,
       effectiveViewMatrix,
       projectionCenterNdcX,
-      viewId: clickedViewId
+      viewId: clickedViewId,
+      cameraTargetRadius
     } = viewport;
     const ray = screenToRay(
       vpLocalX,
@@ -3233,99 +4244,37 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       effectiveViewMatrix,
       projectionCenterNdcX
     );
-    if (!ray) return -1;
+    if (!ray) return null;
 
-    // Get view-specific positions for multi-dimensional support
-    // Different views may have different position data (e.g., 2D vs 3D embeddings)
-    const positions = getExactViewPositions(clickedViewId);
+    // Large panes lazily build one exact, notified spatial owner on first
+    // interaction. Small panes retain the lower-overhead direct scan.
+    const queryOwner = getSpatialQueryOwner(clickedViewId, true);
+    const positions = queryOwner.positions;
 
-    // Get the exact spatial index associated with this view when one is built.
-    // A direct query remains scientifically identical when the optional index is
-    // absent; it changes only lookup cost.
-    const viewDimLevel = getPublishedDimensionLevel(clickedViewId);
-    let spatialIndex = null;
-    if (clickedViewId !== LIVE_VIEW_ID) {
-      spatialIndex = hpRenderer.getSnapshotSpatialIndex(String(clickedViewId));
-    } else {
-      spatialIndex = hpRenderer.getSpatialIndex(viewDimLevel);
-    }
+    const pick = findRaySamplePick({
+      positions,
+      transparency: queryOwner.transparency,
+      ray,
+      maxDistance: Math.min(cameraTargetRadius * 4, 10),
+      spatialIndex: queryOwner.spatialIndex
+    });
+    if (pick.cellIndex === -1) return null;
 
-    const viewTransparencyArray = getExactViewTransparency(clickedViewId);
+    const positionOffset = pick.cellIndex * 3;
+    const position = Object.freeze({
+      x: positions[positionOffset],
+      y: positions[positionOffset + 1],
+      z: positions[positionOffset + 2]
+    });
+    return Object.freeze({
+      viewId: clickedViewId,
+      cellIndex: pick.cellIndex,
+      position
+    });
+  }
 
-    // Sample along the ray to find the nearest cell
-    // Limit iterations to prevent lag (max 500 samples)
-    const maxDistance = Math.min(radius * 4, 10); // Cap max distance
-    const sampleStep = Math.max(0.02, maxDistance / 500); // Adaptive step size
-    const searchRadius = 0.03; // Search radius around each sample point
-
-    let nearestCell = -1;
-    let nearestDist = Infinity;
-
-    const samplePoint = [0, 0, 0];
-    for (let t = 0; t < maxDistance; t += sampleStep) {
-      samplePoint[0] = ray.origin[0] + ray.direction[0] * t;
-      samplePoint[1] = ray.origin[1] + ray.direction[1] * t;
-      samplePoint[2] = ray.origin[2] + ray.direction[2] * t;
-
-      // Query cells near this point - increase limit for better coverage
-      let candidates;
-      if (spatialIndex) {
-        candidates = spatialIndex.queryRadius(samplePoint, searchRadius, 32);
-      } else {
-        // Exact direct query used when the optional acceleration index is absent.
-        candidates = [];
-        const r2 = searchRadius * searchRadius;
-        const n = positions.length / 3;
-        for (let i = 0; i < n && candidates.length < 32; i++) {
-          const dx = positions[i * 3] - samplePoint[0];
-          const dy = positions[i * 3 + 1] - samplePoint[1];
-          const dz = positions[i * 3 + 2] - samplePoint[2];
-          if (dx * dx + dy * dy + dz * dz <= r2) {
-            candidates.push(i);
-          }
-        }
-      }
-
-      // Find the cell closest to the ray (perpendicular distance)
-      for (const idx of candidates) {
-        // Cell is pickable only if visible (not filtered out in this view)
-        // Filtered-out cells cannot be interacted with, even if highlighted in another view
-        // Use view-specific transparency so each view's filters are respected
-        const isVisible = viewTransparencyArray[idx] > 0;
-        if (!isVisible) continue;
-
-        const px = positions[idx * 3];
-        const py = positions[idx * 3 + 1];
-        const pz = positions[idx * 3 + 2];
-
-        // Vector from ray origin to point
-        const opx = px - ray.origin[0];
-        const opy = py - ray.origin[1];
-        const opz = pz - ray.origin[2];
-
-        // Project onto ray direction to get closest point on ray
-        const tProj = opx * ray.direction[0] + opy * ray.direction[1] + opz * ray.direction[2];
-
-        // Skip if point is behind camera
-        if (tProj < 0) continue;
-
-        // Perpendicular distance from point to ray (cross product magnitude)
-        const crossX = opy * ray.direction[2] - opz * ray.direction[1];
-        const crossY = opz * ray.direction[0] - opx * ray.direction[2];
-        const crossZ = opx * ray.direction[1] - opy * ray.direction[0];
-        const perpDist = Math.sqrt(crossX * crossX + crossY * crossY + crossZ * crossZ);
-
-        if (perpDist < nearestDist) {
-          nearestDist = perpDist;
-          nearestCell = idx;
-        }
-      }
-
-      // If we found something, stop early
-      if (nearestCell >= 0) break;
-    }
-
-    return nearestCell;
+  function pickCellAtScreen(screenX, screenY) {
+    return pickCellRecordAtScreen(screenX, screenY)?.cellIndex ?? -1;
   }
 
   function getHighlightContext() {
@@ -3368,11 +4317,241 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     return viewCentroidLabels.get(assertViewId(viewId)) || [];
   }
 
+  function createOwnedCentroidLabel(item) {
+    const owned = {
+      el: item.el,
+      position: Object.freeze([...item.position])
+    };
+    if (Object.hasOwn(item, 'alpha')) {
+      owned.alpha = item.alpha;
+    }
+    return Object.freeze(owned);
+  }
+
+  function queueCentroidLabelRetirements(viewId, labels, excludedElements = null) {
+    const key = assertViewId(viewId);
+    const pending = pendingCentroidLabelRetirements.get(key) || [];
+    const queuedElements = new Set(pending.map(item => item.el));
+    for (const item of labels) {
+      const element = item?.el;
+      if (
+        !(element instanceof HTMLElement) ||
+        excludedElements?.has(element) ||
+        queuedElements.has(element)
+      ) {
+        continue;
+      }
+      pending.push(item);
+      queuedElements.add(element);
+      centroidLabelOwners.set(element, key);
+    }
+    if (pending.length > 0) {
+      pendingCentroidLabelRetirements.set(key, pending);
+    }
+  }
+
+  function cancelCentroidLabelRetirements(viewId, retainedElements) {
+    const key = assertViewId(viewId);
+    const pending = pendingCentroidLabelRetirements.get(key);
+    if (!pending) return;
+    const remaining = pending.filter(item => !retainedElements.has(item.el));
+    if (remaining.length > 0) {
+      pendingCentroidLabelRetirements.set(key, remaining);
+    } else {
+      pendingCentroidLabelRetirements.delete(key);
+    }
+  }
+
+  function viewOwnsCentroidLabelElement(viewId, element) {
+    const labels = viewCentroidLabels.get(assertViewId(viewId)) || [];
+    return labels.some(item => item.el === element);
+  }
+
+  function drainCentroidLabelRetirements(viewId) {
+    const key = assertViewId(viewId);
+    const pending = pendingCentroidLabelRetirements.get(key) || [];
+    pendingCentroidLabelRetirements.delete(key);
+    const failed = [];
+    const failures = [];
+    for (const item of pending) {
+      const element = item.el;
+      let retirementError = null;
+      const parent = element.parentNode;
+      if (parent !== null) {
+        try {
+          parent.removeChild(element);
+        } catch (error) {
+          // A hostile wrapper may throw after performing the removal. The
+          // observable ownership state, rather than the exception alone,
+          // determines whether this exact element still needs retirement.
+          if (element.parentNode !== null) {
+            retirementError = error instanceof Error
+              ? error
+              : new Error(
+                'Centroid label retirement threw a non-Error value.'
+              );
+          }
+        }
+      }
+      if (element.parentNode !== null && retirementError === null) {
+        retirementError = new Error(
+          'Centroid label retirement returned without detaching its element.'
+        );
+      }
+      if (element.parentNode !== null) {
+        try {
+          element.style.display = 'none';
+        } catch (error) {
+          failures.push(
+            error instanceof Error
+              ? error
+              : new Error(
+                'Centroid label retirement hiding threw a non-Error value.'
+              )
+          );
+        }
+        failed.push(item);
+        failures.push(retirementError);
+        continue;
+      }
+      if (
+        centroidLabelOwners.get(element) === key &&
+        !viewOwnsCentroidLabelElement(key, element)
+      ) {
+        centroidLabelOwners.delete(element);
+      }
+    }
+    if (failed.length > 0) {
+      pendingCentroidLabelRetirements.set(key, failed);
+    }
+    return failures;
+  }
+
   function removeLabelsForView(viewId) {
     const key = assertViewId(viewId);
     const labels = viewCentroidLabels.get(key) || [];
-    labels.forEach((item) => { if (item?.el?.parentElement) item.el.parentElement.removeChild(item.el); });
     viewCentroidLabels.delete(key);
+    queueCentroidLabelRetirements(key, labels);
+    const failures = drainCentroidLabelRetirements(key);
+    if (failures.length > 0) {
+      // Keep an empty publication sentinel so terminal/disposal retries that
+      // enumerate published view IDs cannot lose this pending DOM owner.
+      viewCentroidLabels.set(key, []);
+      throw new AggregateError(
+        failures,
+        `Centroid labels for view "${key}" could not be fully removed.`
+      );
+    }
+  }
+
+  function captureCentroidLabelDomState(item) {
+    const element = item.el;
+    return {
+      element,
+      parent: element.parentNode,
+      nextSibling: element.nextSibling,
+      hadViewId: element.hasAttribute('data-view-id'),
+      viewId: element.getAttribute('data-view-id'),
+      domAttempted: false,
+      datasetAttempted: false,
+      domError: null,
+      datasetError: null
+    };
+  }
+
+  function restoreCentroidLabelDomStates(states, viewId) {
+    const key = assertViewId(viewId);
+    for (let index = states.length - 1; index >= 0; index -= 1) {
+      const state = states[index];
+      if (state.datasetAttempted) {
+        try {
+          if (state.hadViewId) {
+            state.element.setAttribute('data-view-id', state.viewId);
+          } else {
+            state.element.removeAttribute('data-view-id');
+          }
+        } catch (error) {
+          state.datasetError = error;
+        }
+      }
+      if (state.domAttempted) {
+        try {
+          if (state.parent === null) {
+            state.element.parentNode?.removeChild(state.element);
+          } else if (state.nextSibling?.parentNode === state.parent) {
+            state.parent.insertBefore(state.element, state.nextSibling);
+          } else {
+            state.parent.appendChild(state.element);
+          }
+        } catch (error) {
+          state.domError = error;
+        }
+      }
+    }
+
+    const failures = [];
+    for (const state of states) {
+      const datasetRestored = (
+        state.element.hasAttribute('data-view-id') === state.hadViewId &&
+        (
+          !state.hadViewId ||
+          state.element.getAttribute('data-view-id') === state.viewId
+        )
+      );
+      if (!datasetRestored) {
+        failures.push(
+          state.datasetError instanceof Error
+            ? state.datasetError
+            : new Error(
+              'Centroid label rollback could not restore data-view-id.'
+            )
+        );
+      }
+
+      const domRestored = (
+        !state.domAttempted ||
+        (
+          state.element.parentNode === state.parent &&
+          state.element.nextSibling === state.nextSibling
+        )
+      );
+      if (!domRestored) {
+        failures.push(
+          state.domError instanceof Error
+            ? state.domError
+            : new Error(
+              'Centroid label rollback could not restore DOM ownership.'
+            )
+        );
+        if (
+          state.parent !== labelLayer &&
+          state.element.parentNode === labelLayer
+        ) {
+          try {
+            state.element.style.display = 'none';
+          } catch (error) {
+            failures.push(
+              error instanceof Error
+                ? error
+                : new Error(
+                  'Centroid label rollback hiding threw a non-Error value.'
+                )
+            );
+          }
+          const rollbackLabel = Object.freeze({
+            el: state.element,
+            position: Object.freeze([0, 0, 0]),
+            alpha: 0
+          });
+          centroidLabelOwners.set(state.element, key);
+          queueCentroidLabelRetirements(key, [rollbackLabel]);
+          if (!viewCentroidLabels.has(key)) {
+            viewCentroidLabels.set(key, []);
+          }
+        }
+      }
+    }
+    return failures;
   }
 
   function hideLabelsForView(viewId) {
@@ -3567,8 +4746,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
   }
 
   function render() {
-    if (webglContextLost || renderPaused) return;
+    if (disposed || webglContextLost || renderPaused) return;
     animationHandle = requestAnimationFrame(render);
+    renderFrameId = renderFrameId === Number.MAX_SAFE_INTEGER
+      ? 0
+      : renderFrameId + 1;
     const now = performance.now();
     const timeSeconds = now / 1000;
     const dt = Math.min(0.05, Math.max(0.001, (now - lastFrameTime) / 1000));
@@ -3603,6 +4785,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     const [width, height] = canvasResizeObserver.getSize();
 
     if (!pointCount) {
+      _renderVelocityViewIds.length = 0;
+      prepareVelocityFrame(_renderVelocityViewIds);
       gl.viewport(0, 0, width, height);
       gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
       return;
@@ -3614,6 +4798,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     mat4.multiply(mvpMatrix, mvpMatrix, modelMatrix);
 
 		    if (renderMode === 'smoke') {
+		      _renderVelocityViewIds.length = 0;
+		      prepareVelocityFrame(_renderVelocityViewIds);
 		      gl.viewport(0, 0, width, height);
 		      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 		      // Draw grid first as background reference (render during fade-out too)
@@ -3624,14 +4810,33 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       mat4.multiply(viewProjMatrix, projectionMatrix, viewMatrix);
       mat4.invert(invViewProjMatrix, viewProjMatrix);
       // Render smoke with alpha blending on top of grid
-      smokeRenderer.render({
-        invViewProjMatrix,
-        eye,
-        lightDir,
-        bgColor,
-        width,
-        height
-      });
+      try {
+        smokeRenderer.render({
+          invViewProjMatrix,
+          eye,
+          lightDir,
+          width,
+          height
+        });
+      } catch (error) {
+        renderMode = 'points';
+        const exactError = error instanceof Error
+          ? error
+          : new Error('Smoke rendering failed with a non-Error value.');
+        if (smokeRenderFailureHandler === null) {
+          queueMicrotask(() => {
+            throw exactError;
+          });
+        } else {
+          try {
+            smokeRenderFailureHandler(exactError);
+          } catch (observerError) {
+            queueMicrotask(() => {
+              throw observerError;
+            });
+          }
+        }
+      }
       return;
     }
 
@@ -3676,6 +4881,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       // If we have exactly one view (e.g., live hidden with 1 snapshot), load its data
       if (_renderAllViews.length === 1) {
         const view = _renderAllViews[0];
+        _renderVelocityViewIds.length = 0;
+        _renderVelocityViewIds.push(view.id);
+        prepareVelocityFrame(_renderVelocityViewIds);
 
         const snapshotId = requireSnapshotBufferId(view.id);
         renderSingleView(
@@ -3687,7 +4895,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
           snapshotId,
           dt,
           timeSeconds,
-          navigationMode
+          navigationMode,
+          0,
+          0,
+          false
         );
       } else {
         // The focused view must be part of the published render layout.
@@ -3697,6 +4908,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
             `Focused view "${focusedViewId}" is absent from the published render layout.`
           );
         }
+        _renderVelocityViewIds.length = 0;
+        _renderVelocityViewIds.push(view.id);
+        prepareVelocityFrame(_renderVelocityViewIds);
 
         // Create or recreate centroid snapshot buffer if needed
         const viewDimLevel = getPublishedDimensionLevel(view.id);
@@ -3714,7 +4928,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 	          snapshotId,
 	          dt,
 	          timeSeconds,
-	          navigationMode
+	          navigationMode,
+	          0,
+	          0,
+	          false
 	        );
 	      }
 	      hideViewTitles(); // No titles in single/fullscreen mode
@@ -3727,6 +4944,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
     const viewCount = _renderAllViews.length;
+    _renderVelocityViewIds.length = 0;
+    for (let index = 0; index < viewCount; index++) {
+      _renderVelocityViewIds.push(_renderAllViews[index].id);
+    }
+    prepareVelocityFrame(_renderVelocityViewIds);
     // Layout: 1=1x1, 2=2x1, 3=3x1, 4=2x2, 5+=grid
     const cols = viewCount <= 3 ? viewCount : Math.ceil(Math.sqrt(viewCount));
     const rows = Math.ceil(viewCount / cols);
@@ -3824,7 +5046,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
           snapshotId,
           dt,
           timeSeconds,
-          paneNavigationMode
+          paneNavigationMode,
+          vx,
+          vy,
+          true
         );
 
         gl.disable(gl.SCISSOR_TEST);
@@ -3852,12 +5077,26 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 		    snapshotBufferId = null,
 		    dtSeconds = 0.016,
 		    timeSeconds = 0,
-		    paneNavigationMode
+		    paneNavigationMode,
+		    viewportX,
+		    viewportY,
+		    scissorEnabled
 		  ) {
 		    const vid = assertViewId(viewId);
 		    const exactPaneNavigationMode = assertNavigationMode(
 		      paneNavigationMode
 		    );
+		    if (
+		      !Number.isSafeInteger(viewportX) ||
+		      viewportX < 0 ||
+		      !Number.isSafeInteger(viewportY) ||
+		      viewportY < 0 ||
+		      typeof scissorEnabled !== 'boolean'
+		    ) {
+		      throw new TypeError(
+		        `Viewport ownership for view "${vid}" is invalid.`
+		      );
+		    }
 		    if (!Number.isSafeInteger(overrideCentroidCount) || overrideCentroidCount < 0) {
 		      throw new TypeError(
 		        `Centroid count for view "${vid}" must be a non-negative safe integer.`
@@ -3959,12 +5198,17 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 		        overlayOpts = {
 		          gl,
 		          viewId: vid,
+		          frameId: renderFrameId,
 	          renderParams,
 	          timeSeconds,
 		          deltaTimeSeconds: dtSeconds,
 		          isSnapshot: Boolean(snapshotBufferId),
 		          dimensionLevel: dimLevel,
 		          devicePixelRatio: window.devicePixelRatio,
+		          viewportX,
+		          viewportY,
+		          scissorEnabled,
+		          outputFramebuffer: null,
 		          hpRenderer,
 		          getViewPositions,
 		          getViewTransparency,
@@ -3972,18 +5216,29 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 		        };
 	        overlayCtxOptionsByView.set(vid, overlayOpts);
 	      } else {
+	        overlayOpts.frameId = renderFrameId;
 	        overlayOpts.renderParams = renderParams;
 	        overlayOpts.timeSeconds = timeSeconds;
 		        overlayOpts.deltaTimeSeconds = dtSeconds;
 		        overlayOpts.isSnapshot = Boolean(snapshotBufferId);
 		        overlayOpts.dimensionLevel = dimLevel;
 		        overlayOpts.devicePixelRatio = window.devicePixelRatio;
-		        overlayOpts.target = overlayCtx;
+		        overlayOpts.viewportX = viewportX;
+		        overlayOpts.viewportY = viewportY;
+		        overlayOpts.scissorEnabled = scissorEnabled;
+		        overlayOpts.outputFramebuffer = null;
+		        if (overlayCtx !== null) {
+		          overlayOpts.target = overlayCtx;
+		        }
 	      }
-	      overlayCtx = buildOverlayContext(overlayOpts);
-	      overlayCtxByView.set(vid, overlayCtx);
-	      overlayManager.update(dtSeconds, overlayCtx);
-	      overlayManager.render(overlayCtx);
+	      try {
+	        overlayCtx = buildOverlayContext(overlayOpts);
+	        overlayCtxByView.set(vid, overlayCtx);
+	        overlayManager.update(dtSeconds, overlayCtx);
+	        overlayManager.render(overlayCtx);
+	      } catch (error) {
+	        settleVelocityRenderFailure(error);
+	      }
 	    }
 
     // Draw highlights (selection rings) on top of scatter points
@@ -4284,7 +5539,20 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     }
     applyViewNavigationMode(exactViewId, defaultMode);
     if (navigationMode !== previousMode) {
-      navigationModeChangeHandler?.(exactViewId, navigationMode);
+      const observer = navigationModeChangeHandler;
+      const publishedMode = navigationMode;
+      if (observer !== null) {
+        // UI synchronization remains synchronous on the normal path. It is an
+        // observer, not a publication veto, so only a thrown observer error is
+        // reported outside the caller's reversible dimension transaction.
+        try {
+          observer(exactViewId, publishedMode);
+        } catch (observerError) {
+          queueMicrotask(() => {
+            throw observerError;
+          });
+        }
+      }
     }
     return true;
   }
@@ -4582,7 +5850,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
   }
 
   // === Public API ===
-  return {
+  const publicApi = {
     setData(payload) {
       const {
         positions,
@@ -4598,6 +5866,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         dimensionLevel
       });
 
+      // The renderer generation is authoritative once loadData returns. Edge
+      // topology and every per-view derived texture belong to the superseded
+      // dataset, so detach their logical inventory before any later viewer
+      // work can render or throw. Hostile deletion remains journaled and
+      // diagnostic-only; it cannot make the committed data publication appear
+      // rolled back to this caller.
+      reportCommittedRetirementFailures(
+        detachEdgeResourcesV2(),
+        'Connectivity resources from the prior committed dataset generation could not be fully retired.'
+      );
+
+      highlightTools.retireSpatialInteractions(LIVE_VIEW_ID);
       cancelPendingProjectileBuild(
         'Projectile preparation was cancelled because the dataset changed.'
       );
@@ -4610,6 +5890,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       viewDimensionLevels.set(LIVE_VIEW_ID, dimensionLevel);
       viewPositionsCache.set(LIVE_VIEW_ID, positions);
       applyDimensionNavigationDefault(LIVE_VIEW_ID, dimensionLevel);
+      vectorFieldOverlay?.markGeometryDirty?.(LIVE_VIEW_ID);
     },
 
     updateColors(colors) {
@@ -4625,13 +5906,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         'Viewer live transparency'
       );
       hpRenderer.updateAlphas(alphaArray);
+      highlightTools.retireSpatialInteractions(LIVE_VIEW_ID);
       transparencyArray = alphaArray;
       // Let overlays (e.g., vector field particles) rebuild spawn sources lazily when visibility changes.
       if (vectorFieldOverlay?.enabled) {
         vectorFieldOverlay.markVisibilityDirty(LIVE_VIEW_ID);
-        for (const snap of snapshotViews) {
-          vectorFieldOverlay.markVisibilityDirty(snap.id);
-        }
       }
 
       highlightTools.handleTransparencyChange(LIVE_VIEW_ID);
@@ -4640,43 +5919,55 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     /**
      * Update positions for dimension switching (maintains same point count and indices)
      * Also updates edge position texture if edge rendering is enabled.
-    * @param {Float32Array} positions - New 3D positions array (n_points * 3)
+     * @param {Float32Array} positions - New 3D positions array (n_points * 3)
+     * @param {number} dimensionLevel - Dimension owned by this position generation.
      */
-    updatePositions(positions) {
+    updatePositions(positions, dimensionLevel) {
       assertFiniteFloat32Array(
         positions,
         pointCount * 3,
         'Viewer live positions'
       );
-      // Update HP renderer with new positions (keeps existing colors/transparency)
-      // Pass dimension level so the renderer can update for the correct dimension
-      const dimLevel = getPublishedDimensionLevel(LIVE_VIEW_ID);
+      getDefaultNavigationMode(dimensionLevel);
+      const previousDimensionLevel =
+        getPublishedDimensionLevel(LIVE_VIEW_ID);
       const previousPositions = positionsArray;
       let rendererPublished = false;
       try {
-        hpRenderer.updatePositions(positions, dimLevel);
+        hpRenderer.updatePositions(positions, dimensionLevel);
         rendererPublished = true;
 
         // The edge helper stages its texture and preserves the old texture if
         // upload fails. Only after both owners succeed is the position set
         // visible to the rest of the viewer.
         if (useInstancedEdges && nEdgesV2 > 0) {
-          createPositionTextureV2ForView(
-            LIVE_VIEW_ID,
-            positions,
-            pointCount
-          );
+          createPositionTextureV2ForView(LIVE_VIEW_ID);
         }
       } catch (publicationError) {
         if (rendererPublished) {
+          const restorationFailures = [];
           try {
             hpRenderer.loadData(previousPositions, colorsArray, {
               alphaValues: transparencyArray,
-              dimensionLevel: dimLevel
+              dimensionLevel: previousDimensionLevel
             });
           } catch (restorationError) {
+            restorationFailures.push(restorationError);
+          }
+          if (
+            restorationFailures.length === 0 &&
+            useInstancedEdges &&
+            nEdgesV2 > 0
+          ) {
+            try {
+              createPositionTextureV2ForView(LIVE_VIEW_ID);
+            } catch (edgeRestorationError) {
+              restorationFailures.push(edgeRestorationError);
+            }
+          }
+          if (restorationFailures.length > 0) {
             throw new AggregateError(
-              [publicationError, restorationError],
+              [publicationError, ...restorationFailures],
               'Viewer position publication and renderer restoration both failed.'
             );
           }
@@ -4684,25 +5975,57 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         throw publicationError;
       }
 
+      highlightTools.retireSpatialInteractions(LIVE_VIEW_ID);
       positionsArray = positions;
       viewPositionsCache.set(LIVE_VIEW_ID, positions);
       computePointBoundsFromPositions(positions);
+      vectorFieldOverlay?.markGeometryDirty?.(LIVE_VIEW_ID);
     },
 
     /**
-     * Get current positions array
+     * Get a caller-owned copy of the current positions array.
      * @returns {Float32Array|null}
      */
     getPositions() {
-      return positionsArray;
+      return positionsArray === null
+        ? null
+        : new Float32Array(positionsArray);
     },
 
     /**
-     * Get current packed RGBA colors for the live view.
+     * Get a caller-owned copy of the packed RGBA colors for the live view.
      * @returns {Uint8Array|null}
      */
     getColors() {
-      return colorsArray;
+      return colorsArray === null
+        ? null
+        : new Uint8Array(colorsArray);
+    },
+
+    /**
+     * Read one exact view coordinate without exposing the renderer's mutable
+     * large-array owner.
+     * @param {number} cellIndex
+     * @param {string} [viewId='live']
+     * @returns {{x: number, y: number, z: number}}
+     */
+    getCellPosition(cellIndex, viewId = LIVE_VIEW_ID) {
+      if (
+        !Number.isSafeInteger(cellIndex) ||
+        cellIndex < 0 ||
+        cellIndex >= pointCount
+      ) {
+        throw new RangeError(
+          `Cell position index must be an integer in [0, ${pointCount}).`
+        );
+      }
+      const positions = getExactViewPositions(assertKnownViewId(viewId));
+      const offset = cellIndex * 3;
+      return Object.freeze({
+        x: positions[offset],
+        y: positions[offset + 1],
+        z: positions[offset + 2]
+      });
     },
 
     /**
@@ -4728,27 +6051,33 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         );
         projectileSystem.setEnabled(false);
       }
-      viewDimensionLevels.set(vid, level);
-
-      // Also update the snapshot object if this is a snapshot view
       const snap = snapshotViews.find(s => s.id === vid);
-      if (snap) {
-        snap.dimensionLevel = level;
-      }
 
       // Invalidate per-view caches when dimension changes (LOD/frustum calculations differ)
       if (oldLevel !== level && hpRenderer) {
-        hpRenderer.clearViewState(vid);
-        // For live view, also update the renderer's dimension level
-        // This switches the renderer to use the appropriate spatial index (BinaryTree/Quadtree/Octree)
-        if (vid === LIVE_VIEW_ID && hpRenderer.setDimensionLevel) {
+        // Publish the renderer owner before exposing the dimension through
+        // viewer state. Snapshot metadata changes preserve their immutable
+        // geometry buffer and rebuild only a required custom spatial index.
+        if (snap) {
+          hpRenderer.setSnapshotDimensionLevel(vid, level);
+        } else {
           hpRenderer.setDimensionLevel(level);
         }
+        hpRenderer.invalidateViewState(vid);
+        highlightTools.retireSpatialInteractions(vid);
+      }
+
+      viewDimensionLevels.set(vid, level);
+      if (snap) {
+        snap.dimensionLevel = level;
       }
 
       // Invalidate cached view matrix since camera behavior may differ per dimension
       cachedViewMatrices.delete(vid);
       applyDimensionNavigationDefault(vid, level);
+      if (oldLevel !== level) {
+        vectorFieldOverlay?.markDimensionDirty?.(vid);
+      }
     },
 
     /**
@@ -4766,46 +6095,128 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
      * Also updates per-view edge position textures if edge rendering is enabled.
      * @param {string} viewId - View identifier
      * @param {Float32Array} positions - 3D positions array
+     * @param {number} dimensionLevel - Dimension owned by this position generation.
      */
-    setViewPositions(viewId, positions) {
+    setViewPositions(viewId, positions, dimensionLevel) {
       const vid = assertKnownViewId(viewId);
       assertFiniteFloat32Array(
         positions,
         pointCount * 3,
         `Positions for view "${vid}"`
       );
-      const dimLevel = getPublishedDimensionLevel(vid);
+      getDefaultNavigationMode(dimensionLevel);
+      let publishedPositions = positions;
+      const previousPositions = getExactViewPositions(vid);
+      const previousDimensionLevel = getPublishedDimensionLevel(vid);
+      let rendererPublished = false;
 
       // If this is the live view, update the main positions
       if (vid === LIVE_VIEW_ID) {
-        // Pass dimension level so the renderer can build the appropriate spatial index
-        hpRenderer.updatePositions(positions, dimLevel);
-        // Update edge position texture for live view if edges are enabled
-        if (useInstancedEdges && nEdgesV2 > 0) {
-          const nCells = positions.length / 3;
-          createPositionTextureV2ForView(vid, positions, nCells);
+        try {
+          hpRenderer.updatePositions(positions, dimensionLevel);
+          rendererPublished = true;
+          if (useInstancedEdges && nEdgesV2 > 0) {
+            createPositionTextureV2ForView(vid);
+          }
+        } catch (publicationError) {
+          if (rendererPublished) {
+            const restorationFailures = [];
+            try {
+              hpRenderer.loadData(previousPositions, colorsArray, {
+                alphaValues: transparencyArray,
+                dimensionLevel: previousDimensionLevel
+              });
+            } catch (restorationError) {
+              restorationFailures.push(restorationError);
+            }
+            if (
+              restorationFailures.length === 0 &&
+              useInstancedEdges &&
+              nEdgesV2 > 0
+            ) {
+              try {
+                createPositionTextureV2ForView(vid);
+              } catch (edgeRestorationError) {
+                restorationFailures.push(edgeRestorationError);
+              }
+            }
+            if (restorationFailures.length > 0) {
+              throw new AggregateError(
+                [publicationError, ...restorationFailures],
+                `View "${vid}" position publication and renderer restoration both failed.`
+              );
+            }
+          }
+          throw publicationError;
         }
+        highlightTools.retireSpatialInteractions(vid);
         positionsArray = positions;
         computePointBoundsFromPositions(positions);
       } else {
-        // For snapshot views, update the snapshot buffer positions
-        hpRenderer.updateSnapshotPositions(vid, positions, dimLevel);
-        // Update edge position texture for this snapshot if edges are enabled
-        if (useInstancedEdges && nEdgesV2 > 0) {
-          const nCells = positions.length / 3;
-          createPositionTextureV2ForView(vid, positions, nCells);
+        try {
+          hpRenderer.updateSnapshotPositions(
+            vid,
+            positions,
+            dimensionLevel
+          );
+          rendererPublished = true;
+          publishedPositions = hpRenderer.getSnapshotPositions(vid);
+          if (useInstancedEdges && nEdgesV2 > 0) {
+            createPositionTextureV2ForView(vid);
+          }
+        } catch (publicationError) {
+          if (rendererPublished) {
+            const restorationFailures = [];
+            try {
+              hpRenderer.updateSnapshotPositions(
+                vid,
+                previousPositions,
+                previousDimensionLevel
+              );
+              // updateSnapshotPositions publishes an immutable renderer-owned
+              // copy. Restore the cache to that exact owner, not the released
+              // pre-attempt array, so subsequent snapshot derivation can prove
+              // geometry-generation identity.
+              viewPositionsCache.set(
+                vid,
+                hpRenderer.getSnapshotPositions(vid)
+              );
+            } catch (restorationError) {
+              restorationFailures.push(restorationError);
+            }
+            if (
+              restorationFailures.length === 0 &&
+              useInstancedEdges &&
+              nEdgesV2 > 0
+            ) {
+              try {
+                createPositionTextureV2ForView(vid);
+              } catch (edgeRestorationError) {
+                restorationFailures.push(edgeRestorationError);
+              }
+            }
+            if (restorationFailures.length > 0) {
+              throw new AggregateError(
+                [publicationError, ...restorationFailures],
+                `Snapshot "${vid}" position publication and renderer restoration both failed.`
+              );
+            }
+          }
+          throw publicationError;
         }
+        highlightTools.retireSpatialInteractions(vid);
       }
-      viewPositionsCache.set(vid, positions);
+      viewPositionsCache.set(vid, publishedPositions);
+      vectorFieldOverlay?.markGeometryDirty?.(vid);
     },
 
     /**
-     * Get positions for a specific view
+     * Get a caller-owned positions copy for a specific view.
      * @param {string} viewId - View identifier
-     * @returns {Float32Array|null} Positions array or null
+     * @returns {Float32Array} Positions array
      */
     getViewPositions(viewId) {
-      return getExactViewPositions(viewId);
+      return new Float32Array(getExactViewPositions(viewId));
     },
 
     /**
@@ -4821,7 +6232,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         if (!(colorsArray instanceof Uint8Array)) {
           throw new Error('Colors are not published for view "live".');
         }
-        return colorsArray;
+        return new Uint8Array(colorsArray);
       }
       const snapshot = snapshotViews.find(s => s.id === vid);
       if (!snapshot) {
@@ -4830,7 +6241,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       if (!(snapshot.colors instanceof Uint8Array)) {
         throw new Error(`Colors are not published for view "${vid}".`);
       }
-      return snapshot.colors;
+      return new Uint8Array(snapshot.colors);
     },
 
     /**
@@ -4855,7 +6266,19 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       return highlightTools.getHighlightedCount();
     },
 
-    // Cell selection/picking API
+    /**
+     * Resolve one exact per-view pick.
+     * @returns {{
+     *   viewId: string,
+     *   cellIndex: number,
+     *   position: {x: number, y: number, z: number}
+     * }|null} Frozen record for a hit, otherwise null.
+     */
+    pickCellRecordAtScreen(screenX, screenY) {
+      return pickCellRecordAtScreen(screenX, screenY);
+    },
+
+    // Scalar convenience API for callers that need only the cell ID.
     pickCellAtScreen(screenX, screenY) {
       return pickCellAtScreen(screenX, screenY);
     },
@@ -5060,6 +6483,24 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       colors,
       count: nextCentroidCount
     } = assertCentroidPayload(payload);
+    if (nextCentroidCount === 0) {
+      const previousPositions = centroidPositionBuffer;
+      const previousColors = centroidColorBuffer;
+      centroidPositionBuffer = null;
+      centroidColorBuffer = null;
+      centroidCount = 0;
+      queueCentroidSnapshotRetirement({
+        buffer: previousPositions,
+      });
+      queueCentroidSnapshotRetirement({
+        buffer: previousColors,
+      });
+      reportCommittedRetirementFailures(
+        drainCentroidSnapshotRetirements(),
+        'Empty live centroid generation committed with pending prior-buffer retirement.'
+      );
+      return;
+    }
     assertNoWebGLError(gl, 'Viewer centroid publication');
     let candidatePositions = null;
     let candidateColors = null;
@@ -5078,10 +6519,32 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       gl.bindBuffer(gl.ARRAY_BUFFER, null);
       assertNoWebGLError(gl, 'Viewer candidate centroid publication');
     } catch (error) {
-      gl.bindBuffer(gl.ARRAY_BUFFER, null);
-      if (candidatePositions) gl.deleteBuffer(candidatePositions);
-      if (candidateColors) gl.deleteBuffer(candidateColors);
-      gl.getError();
+      const rollbackFailures = [];
+      for (const operation of [
+        () => gl.bindBuffer(gl.ARRAY_BUFFER, null),
+        () => gl.getError(),
+      ]) {
+        try {
+          operation();
+        } catch (rollbackError) {
+          rollbackFailures.push(rollbackError);
+        }
+      }
+      queueCentroidSnapshotRetirement({
+        buffer: candidatePositions,
+      });
+      queueCentroidSnapshotRetirement({
+        buffer: candidateColors,
+      });
+      rollbackFailures.push(
+        ...drainCentroidSnapshotRetirements()
+      );
+      if (rollbackFailures.length > 0) {
+        throw new AggregateError(
+          [error, ...rollbackFailures],
+          'Viewer centroid publication failed and rollback was incomplete.'
+        );
+      }
       throw error;
     }
 
@@ -5090,20 +6553,103 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     centroidPositionBuffer = candidatePositions;
     centroidColorBuffer = candidateColors;
     centroidCount = nextCentroidCount;
-    gl.deleteBuffer(previousPositions);
-    gl.deleteBuffer(previousColors);
+    queueCentroidSnapshotRetirement({
+      buffer: previousPositions,
+    });
+    queueCentroidSnapshotRetirement({
+      buffer: previousColors,
+    });
+    reportCommittedRetirementFailures(
+      drainCentroidSnapshotRetirements(),
+      'Live centroid prior generation could not be fully retired.'
+    );
   },
 
     setCentroidLabels(labels, viewId) {
       const targetId = assertKnownViewId(viewId);
-      const entries = assertCentroidLabelEntries(labels);
-      removeLabelsForView(targetId);
-      entries.forEach((item) => {
-        item.el.dataset.viewId = targetId;
-        if (item.el.parentElement !== labelLayer) labelLayer.appendChild(item.el);
-      });
-      viewCentroidLabels.set(targetId, entries);
-      updateLabelLayerVisibility();
+      const entries = [...assertCentroidLabelEntries(labels)];
+      if (entries.length > 0 && !labelLayer) {
+        throw new Error(
+          'Centroid labels require a label-layer element.'
+        );
+      }
+      const candidateElements = new Set();
+      for (const [index, item] of entries.entries()) {
+        const element = item.el;
+        if (candidateElements.has(element)) {
+          throw new TypeError(
+            `Centroid label ${index} aliases an element already present in this publication.`
+          );
+        }
+        if (
+          centroidLabelOwners.has(element) &&
+          centroidLabelOwners.get(element) !== targetId
+        ) {
+          throw new TypeError(
+            `Centroid label ${index} is already owned by view ` +
+            `"${centroidLabelOwners.get(element)}".`
+          );
+        }
+        candidateElements.add(element);
+      }
+
+      const domStates = entries.map(captureCentroidLabelDomState);
+      try {
+        for (const state of domStates) {
+          if (state.element.parentNode !== labelLayer) {
+            state.domAttempted = true;
+            labelLayer.appendChild(state.element);
+          }
+        }
+        for (const state of domStates) {
+          state.datasetAttempted = true;
+          state.element.setAttribute('data-view-id', targetId);
+        }
+      } catch (error) {
+        const rollbackFailures = restoreCentroidLabelDomStates(
+          domStates,
+          targetId
+        );
+        if (rollbackFailures.length > 0) {
+          throw new AggregateError(
+            [error, ...rollbackFailures],
+            `Centroid labels for view "${targetId}" were not published and rollback was incomplete.`
+          );
+        }
+        throw error;
+      }
+
+      const previousLabels = viewCentroidLabels.get(targetId) || [];
+      const ownedEntries = entries.map(createOwnedCentroidLabel);
+      cancelCentroidLabelRetirements(targetId, candidateElements);
+      viewCentroidLabels.set(targetId, ownedEntries);
+      for (const element of candidateElements) {
+        centroidLabelOwners.set(element, targetId);
+      }
+      queueCentroidLabelRetirements(
+        targetId,
+        previousLabels,
+        candidateElements
+      );
+
+      const settlementFailures = drainCentroidLabelRetirements(targetId);
+      try {
+        updateLabelLayerVisibility();
+      } catch (error) {
+        settlementFailures.push(
+          error instanceof Error
+            ? error
+            : new Error(
+              'Centroid label visibility reconciliation threw a non-Error value.'
+            )
+        );
+      }
+      if (settlementFailures.length > 0) {
+        throw new AggregateError(
+          settlementFailures,
+          `Centroid labels for view "${targetId}" were published, but prior-generation settlement was incomplete.`
+        );
+      }
     },
 
     setPointSize(size) {
@@ -5155,7 +6701,22 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       if (exactMode === 'smoke' && snapshotViews.length > 0) {
         throw new RangeError('Smoke render mode is unavailable while snapshots exist.');
       }
+      if (renderMode === 'smoke' && exactMode !== 'smoke') {
+        smokeRenderer.cancelNoiseGeneration();
+      }
       renderMode = exactMode;
+    },
+    setSmokeRenderFailureHandler(fn) {
+      smokeRenderFailureHandler = assertExactFunction(
+        fn,
+        'Smoke render failure handler'
+      );
+    },
+    setVelocityRenderFailureHandler(fn) {
+      velocityRenderFailureHandler = assertExactFunction(
+        fn,
+        'Velocity render failure handler'
+      );
     },
     setNavigationMode(mode) {
       const exactMode = assertNavigationMode(mode);
@@ -5348,6 +6909,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     setNoiseTextureResolution(size) { smokeRenderer.setNoiseTextureResolution(size); },
     getNoiseTextureResolution() { return smokeRenderer.getNoiseTextureResolution(); },
     getAdaptiveScaleFactor() { return smokeRenderer.getAdaptiveScaleFactor(); },
+    hasPendingSmokeNoiseGeneration() {
+      return smokeRenderer.hasPendingNoiseGeneration();
+    },
+    hasSmokeNoiseTextures() { return smokeRenderer.hasNoiseTextures(); },
 	    setSmokeQualityPreset(preset) { smokeRenderer.setQualityPreset(preset); },
 
     setShowConnectivity(show) {
@@ -5394,7 +6959,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
      * @param {Object} edgeData - Exact weighted edge payload
      * @param {Float32Array} positions - Cell positions (flat xyz array)
      */
-    setupEdgesV2(edgeData, positions) {
+    setupEdgesV2(edgeData, positions = null) {
       const {
         sources,
         destinations,
@@ -5414,13 +6979,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         sources.length !== nEdges ||
         destinations.length !== nEdges ||
         weights.length !== nEdges ||
-        !(positions instanceof Float32Array) ||
-        positions.length !== nCells * 3
+        (
+          positions !== null &&
+          (
+            !(positions instanceof Float32Array) ||
+            positions.length !== nCells * 3
+          )
+        )
       ) {
         throw new TypeError(
           'V2 edge setup requires exact edge summaries, matching ' +
-          'Uint32 endpoints and Float64 weights, and one Float32 XYZ ' +
-          'position per cell.'
+          'Uint32 endpoints and Float64 weights, and a renderer-published ' +
+          'Float32 XYZ geometry generation.'
         );
       }
 
@@ -5435,8 +7005,6 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
           nEdges
         );
 
-        const visibility = new Float32Array(nCells);
-        visibility.fill(1.0);
         if (
           !createPositionTextureV2ForView(
             LIVE_VIEW_ID,
@@ -5445,7 +7013,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
           ) ||
           !updateVisibilityTextureV2ForView(
             LIVE_VIEW_ID,
-            visibility
+            nCells,
+            () => 255
           )
         ) {
           clearEdgeResourcesV2();
@@ -5465,7 +7034,6 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 
     /**
      * Update visibility texture for V2 edges (live view).
-     * Also updates the per-view texture for the live view.
      * @param {Float32Array} visibility - Per-cell visibility (0-1)
      */
     updateEdgeVisibilityV2(visibility) {
@@ -5556,7 +7124,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
      * @param {Float32Array} positions - Cell positions (flat xyz array, nCells * 3)
      * @param {number} nCells - Number of cells
      */
-    setupEdgesV2ForView(viewId, positions, nCells) {
+    setupEdgesV2ForView(
+      viewId,
+      positions = null,
+      nCells = null
+    ) {
       if (!hasEdgeDataV2 || !useInstancedEdges) {
         console.warn('[Viewer] Cannot setup per-view edges: V2 edges not initialized');
         return false;
@@ -5564,23 +7136,37 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       if (
         typeof viewId !== 'string' ||
         viewId.length === 0 ||
-        !Number.isSafeInteger(nCells) ||
-        nCells <= 0 ||
-        nCells !== nCellsV2 ||
-        !(positions instanceof Float32Array) ||
-        positions.length !== nCells * 3
+        (
+          nCells !== null &&
+          (
+            !Number.isSafeInteger(nCells) ||
+            nCells <= 0 ||
+            nCells !== nCellsV2
+          )
+        ) ||
+        (
+          positions !== null &&
+          (
+            !(positions instanceof Float32Array) ||
+            positions.length !== nCellsV2 * 3
+          )
+        )
       ) {
         throw new TypeError(
-          'Per-view edge setup requires a non-empty view id, an exact ' +
-          'cell count, and one Float32 XYZ position per cell.'
+          'Per-view edge setup requires a non-empty view id and, when ' +
+          'provided, the exact published cell count and Float32 XYZ shape.'
         );
       }
       if (!createPositionTextureV2ForView(viewId, positions, nCells)) {
         return false;
       }
-      const visibility = new Float32Array(nCells);
-      visibility.fill(1.0);
-      if (!updateVisibilityTextureV2ForView(viewId, visibility)) {
+      if (
+        !updateVisibilityTextureV2ForView(
+          viewId,
+          nCellsV2,
+          () => 255
+        )
+      ) {
         deleteEdgeTexturesForView(viewId);
         return false;
       }
@@ -5634,6 +7220,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         return entry.nCells;
       }
       return 0;
+    },
+
+    getEdgeTextureStatsV2() {
+      return getEdgeTextureStatsV2();
     },
 
     /**
@@ -5820,6 +7410,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 
     // Snapshot API - stores view configs for multiview
     createSnapshotView(config) {
+      if (renderMode === 'smoke') {
+        throw new RangeError(
+          'Snapshot creation is unavailable in smoke render mode.'
+        );
+      }
       if (snapshotViews.length >= MAX_SNAPSHOTS) {
         throw new RangeError(`Viewer supports a maximum of ${MAX_SNAPSHOTS} snapshots.`);
       }
@@ -5858,6 +7453,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       let snapshotBufferAttempted = false;
       let centroidBufferAttempted = false;
       let edgeTexturesAttempted = false;
+      let snapshotPositions = null;
       try {
         // Stage every fallible renderer resource before publishing inventory or
         // consuming the next stable snapshot identity.
@@ -5867,8 +7463,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
           snapshot.colors,
           snapshot.transparency,
           sourcePositions,
-          initialDimLevel
+          initialDimLevel,
+          sourceViewId
         );
+        snapshotPositions = hpRenderer.getSnapshotPositions(id);
 
         if (snapshot.centroidPositions !== null) {
           centroidBufferAttempted = true;
@@ -5882,15 +7480,19 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 
         if (useInstancedEdges && nEdgesV2 > 0) {
           edgeTexturesAttempted = true;
-          const nCells = sourcePositions.length / 3;
-          if (!createPositionTextureV2ForView(id, sourcePositions, nCells)) {
+          const nCells = snapshotPositions.length / 3;
+          if (!createPositionTextureV2ForView(id)) {
             throw new Error(`Snapshot edge positions were not published for view "${id}".`);
           }
-          const visibility = new Float32Array(nCells);
-          for (let i = 0; i < nCells; i++) {
-            visibility[i] = snapshot.transparency[i] > 0.01 ? 1.0 : 0.0;
-          }
-          if (!updateVisibilityTextureV2ForView(id, visibility)) {
+          if (
+            !updateVisibilityTextureV2ForView(
+              id,
+              nCells,
+              index => (
+                snapshot.transparency[index] > 0.01 ? 255 : 0
+              )
+            )
+          ) {
             throw new Error(`Snapshot edge visibility was not published for view "${id}".`);
           }
         }
@@ -5929,7 +7531,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 
       snapshotViews.push(snapshot);
       viewDimensionLevels.set(id, initialDimLevel);
-      viewPositionsCache.set(id, sourcePositions);
+      viewPositionsCache.set(id, snapshotPositions);
       navigationModeOwnership.recordViewUserChoice(id, inheritedMode);
       nextSnapshotId += 1;
       return { id, label: snapshot.label };
@@ -6063,6 +7665,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         );
       }
 
+      if (transparencyChanged) {
+        highlightTools.retireSpatialInteractions(exactId);
+      }
       snap.colors = nextColors;
       snap.transparency = nextTransparency;
       snap.centroidPositions = nextCentroidPositions;
@@ -6093,87 +7698,158 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     removeSnapshotView(id) {
       const exactId = assertViewId(id);
       const idx = snapshotViews.findIndex(s => s.id === exactId);
-      if (idx >= 0) {
-        // Delete GPU buffer for this snapshot
-        if (hpRenderer) {
-          hpRenderer.deleteSnapshotBuffer(exactId);
-          hpRenderer.clearViewState(exactId);  // Clear per-view LOD/frustum culling state
+      if (idx < 0) {
+        // A prior detach may still own hostile cleanup failures. Repeating the
+        // exact removal is the explicit convergence path for those journals.
+        const retryFailures = [];
+        const retry = operation => {
+          try {
+            operation();
+          } catch (error) {
+            retryFailures.push(error);
+          }
+        };
+        retry(() => hpRenderer?.deleteSnapshotBuffer?.(exactId));
+        retry(() => hpRenderer?.clearViewState?.(exactId));
+        retry(() => highlightTools?.clearViewState?.(exactId));
+        retry(() => deleteCentroidSnapshotBuffer(exactId));
+        retry(() => deleteEdgeTexturesForView(exactId));
+        retry(() => orbitAnchorRenderer?.deleteViewState?.(exactId));
+        retry(() => vectorFieldOverlay?.disposeView?.(exactId));
+        if (viewCentroidLabels.has(exactId)) {
+          retry(() => removeLabelsForView(exactId));
         }
-        highlightTools.clearViewState(exactId);
-        // Delete centroid GPU buffer for this snapshot
-        deleteCentroidSnapshotBuffer(id);
-        // Delete per-view edge textures for this snapshot
-        deleteEdgeTexturesForView(id);
-	        // Clean up orbit anchor state for this view
-	        orbitAnchorRenderer.deleteViewState(id);
-	        // Clean up cached view matrix
-	        cachedViewMatrices.delete(id);
-	        renderParamsByView.delete(id);
-	        overlayCtxByView.delete(id);
-	        overlayCtxOptionsByView.delete(id);
-	        // Clean up per-view dimension state
-	        viewDimensionLevels.delete(id);
-	        viewPositionsCache.delete(id);
-	        publishedLodLevels.delete(id);
-	        vectorFieldOverlay?.disposeView?.(id);
-	        navigationModeOwnership.deleteView(String(id));
+        if (retryFailures.length > 0) {
+          pendingSnapshotCleanupIds.add(exactId);
+          throw new AggregateError(
+            retryFailures,
+            `Snapshot "${exactId}" retirement remains pending.`
+          );
+        }
+        pendingSnapshotCleanupIds.delete(exactId);
+        return;
+      }
+      if (idx >= 0) {
+        // Detach logical inventory first. Renderer retirement is also
+        // detach-first, so a cleanup error must not leave the viewer claiming
+        // that a no-longer-renderable snapshot still exists.
         snapshotViews.splice(idx, 1);
-        const key = String(id);
+        pendingSnapshotCleanupIds.add(exactId);
+        const cleanupFailures = [];
+        const cleanup = operation => {
+          try {
+            operation();
+          } catch (error) {
+            cleanupFailures.push(error);
+          }
+        };
+        if (hpRenderer) {
+          cleanup(() => hpRenderer.deleteSnapshotBuffer(exactId));
+          cleanup(() => hpRenderer.clearViewState(exactId));
+        }
+        cleanup(() => highlightTools.clearViewState(exactId));
+        cleanup(() => deleteCentroidSnapshotBuffer(exactId));
+        cleanup(() => deleteEdgeTexturesForView(exactId));
+        cleanup(() => orbitAnchorRenderer.deleteViewState(exactId));
+        cachedViewMatrices.delete(exactId);
+        renderParamsByView.delete(exactId);
+        overlayCtxByView.delete(exactId);
+        overlayCtxOptionsByView.delete(exactId);
+        viewDimensionLevels.delete(exactId);
+        viewPositionsCache.delete(exactId);
+        publishedLodLevels.delete(exactId);
+        cleanup(() => vectorFieldOverlay?.disposeView?.(exactId));
+        cleanup(() => navigationModeOwnership.deleteView(exactId));
+        const key = exactId;
         if (key !== LIVE_VIEW_ID) {
-          removeLabelsForView(key);
+          cleanup(() => removeLabelsForView(key));
           viewCentroidFlags.delete(key);
         }
-        if (focusedViewId === id) focusedViewId = LIVE_VIEW_ID;
-        // If no snapshots left and live was hidden, restore it
+        if (focusedViewId === exactId) focusedViewId = LIVE_VIEW_ID;
         if (snapshotViews.length === 0 && liveViewHidden) {
           liveViewHidden = false;
         }
-        updateLabelLayerVisibility();
+        cleanup(() => updateLabelLayerVisibility());
+        if (cleanupFailures.length > 0) {
+          throw new AggregateError(
+            cleanupFailures,
+            `Snapshot "${exactId}" was removed with ${cleanupFailures.length} cleanup error(s).`
+          );
+        }
+        pendingSnapshotCleanupIds.delete(exactId);
       }
     },
 
     clearSnapshotViews() {
-      // Delete all snapshot GPU buffers and per-view state (not live view)
-      if (hpRenderer) {
-        hpRenderer.deleteAllSnapshotBuffers();
-        // Clear per-view state for each snapshot individually (preserve live view state)
-        for (const snap of snapshotViews) {
-          hpRenderer.clearViewState(snap.id);
-          // Clean up orbit anchor state for this view
-          orbitAnchorRenderer.deleteViewState(snap.id);
-        }
+      const removedSnapshots = snapshotViews.splice(
+        0,
+        snapshotViews.length
+      );
+      for (const snapshot of removedSnapshots) {
+        pendingSnapshotCleanupIds.add(snapshot.id);
       }
-      // Delete all centroid snapshot GPU buffers (preserve live view)
-      for (const id of centroidSnapshotBuffers.keys()) {
-        if (String(id) !== LIVE_VIEW_ID) {
-          deleteCentroidSnapshotBuffer(id);
-        }
-      }
-      // Delete all per-view edge textures (preserve live view)
-      for (const id of edgePositionTexturesV2.keys()) {
-        if (String(id) !== LIVE_VIEW_ID) {
-          deleteEdgeTexturesForView(id);
-        }
-      }
-	      // Clean up cached view matrices and dimension state for snapshots (preserve live view)
-      for (const snap of snapshotViews) {
-        highlightTools.clearViewState(snap.id);
-        cachedViewMatrices.delete(snap.id);
-	        renderParamsByView.delete(snap.id);
-	        overlayCtxByView.delete(snap.id);
-	        overlayCtxOptionsByView.delete(snap.id);
-	        viewDimensionLevels.delete(snap.id);
-	        viewPositionsCache.delete(snap.id);
-	        publishedLodLevels.delete(snap.id);
-	        vectorFieldOverlay?.disposeView?.(snap.id);
-	        navigationModeOwnership.deleteView(String(snap.id));
-	      }
-      snapshotViews.length = 0;
+      const cleanupIds = Array.from(pendingSnapshotCleanupIds);
       focusedViewId = LIVE_VIEW_ID;
-      liveViewHidden = false; // Restore live view visibility
+      liveViewHidden = false;
+      const cleanupFailures = [];
+      const cleanup = operation => {
+        try {
+          operation();
+        } catch (error) {
+          cleanupFailures.push(error);
+        }
+      };
+
+      if (hpRenderer) {
+        cleanup(() => hpRenderer.deleteAllSnapshotBuffers());
+        for (const viewId of cleanupIds) {
+          cleanup(() => hpRenderer.clearViewState(viewId));
+          cleanup(() => orbitAnchorRenderer.deleteViewState(viewId));
+        }
+      }
+      for (const id of Array.from(centroidSnapshotBuffers.keys())) {
+        if (String(id) !== LIVE_VIEW_ID) {
+          cleanup(() => deleteCentroidSnapshotBuffer(id));
+        }
+      }
+      for (const id of Array.from(edgePositionTexturesV2.keys())) {
+        if (String(id) !== LIVE_VIEW_ID) {
+          cleanup(() => deleteEdgeTexturesForView(id));
+        }
+      }
+      cleanup(() => {
+        const failures = drainCentroidSnapshotRetirements();
+        if (failures.length > 0) {
+          throw new AggregateError(
+            failures,
+            'Pending centroid snapshot retirement remains incomplete.'
+          );
+        }
+      });
+      cleanup(() => {
+        const failures = drainEdgeTextureRetirements();
+        if (failures.length > 0) {
+          throw new AggregateError(
+            failures,
+            'Pending edge texture retirement remains incomplete.'
+          );
+        }
+      });
+      for (const viewId of cleanupIds) {
+        cleanup(() => highlightTools.clearViewState(viewId));
+        cachedViewMatrices.delete(viewId);
+        renderParamsByView.delete(viewId);
+        overlayCtxByView.delete(viewId);
+        overlayCtxOptionsByView.delete(viewId);
+        viewDimensionLevels.delete(viewId);
+        viewPositionsCache.delete(viewId);
+        publishedLodLevels.delete(viewId);
+        cleanup(() => vectorFieldOverlay?.disposeView?.(viewId));
+        cleanup(() => navigationModeOwnership.deleteView(viewId));
+      }
       for (const key of Array.from(viewCentroidLabels.keys())) {
         if (String(key) !== LIVE_VIEW_ID) {
-          removeLabelsForView(key);
+          cleanup(() => removeLabelsForView(key));
         }
       }
       for (const key of Array.from(viewCentroidFlags.keys())) {
@@ -6181,10 +7857,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
           viewCentroidFlags.delete(key);
         }
       }
-      updateLabelLayerVisibility();
-      // Restore live view data
-      if (colorsArray) hpRenderer.updateColors(colorsArray);
-      if (transparencyArray) hpRenderer.updateAlphas(transparencyArray);
+      cleanup(() => updateLabelLayerVisibility());
+      if (colorsArray) cleanup(() => hpRenderer.updateColors(colorsArray));
+      if (transparencyArray) {
+        cleanup(() => hpRenderer.updateAlphas(transparencyArray));
+      }
+      if (cleanupFailures.length > 0) {
+        throw new AggregateError(
+          cleanupFailures,
+          `All snapshots were cleared with ${cleanupFailures.length} cleanup error(s).`
+        );
+      }
+      pendingSnapshotCleanupIds.clear();
     },
 
     getSnapshotViews() {
@@ -6274,13 +7958,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       const on = assertExactBoolean(enabled, 'Vector field overlay visibility');
       if (!on && !vectorFieldOverlay) return;
       const overlay = ensureVectorFieldOverlay();
-      overlay.enabled = on;
-      if (on) {
-        overlay.markVisibilityDirty(LIVE_VIEW_ID);
-        for (const snap of snapshotViews) {
-          overlay.markVisibilityDirty(snap.id);
-        }
-      }
+      overlay.setEnabled(on);
     },
 
     setVectorFieldConfig(key, value) {
@@ -6312,7 +7990,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         );
         return;
       }
+      overlayManager?.retryRetirement(VELOCITY_OVERLAY_ID);
       const candidate = new VelocityOverlay(gl);
+      candidate.setFailureHandler(reportVelocityRenderFailure);
       try {
         candidate.setVectorFieldData(fieldId, dimensionLevel, fieldData);
         ensureOverlayManager().register(candidate);
@@ -6341,9 +8021,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     },
 
     resetVectorFieldOverlay() {
-      if (!vectorFieldOverlay) return;
-      overlayManager?.unregister?.(vectorFieldOverlay.id);
+      if (!vectorFieldOverlay) {
+        overlayManager?.retryRetirement(VELOCITY_OVERLAY_ID);
+        return;
+      }
+      const retiringOverlay = vectorFieldOverlay;
+      if (overlayManager === null) {
+        throw new Error(
+          'Velocity overlay ownership is published without its overlay manager.'
+        );
+      }
       vectorFieldOverlay = null;
+      overlayManager.unregister(retiringOverlay.id);
     },
 
     getRenderState() {
@@ -6555,12 +8244,15 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     },
 
     start() {
+      if (disposed) return;
       if (webglContextLost) {
         showWebglContextOverlay('WebGL context lost. Reload required to continue.');
         return;
       }
       if (renderPaused) return;
-      if (!animationHandle) animationHandle = requestAnimationFrame(render);
+      if (animationHandle === null) {
+        animationHandle = requestAnimationFrame(render);
+      }
     },
 
     /**
@@ -6571,7 +8263,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
      */
     pause() {
       renderPaused = true;
-      if (animationHandle) {
+      if (animationHandle !== null) {
         cancelAnimationFrame(animationHandle);
         animationHandle = null;
       }
@@ -6587,11 +8279,21 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         showWebglContextOverlay('WebGL context lost. Reload required to continue.');
         return;
       }
-      if (!animationHandle) animationHandle = requestAnimationFrame(render);
+      if (animationHandle === null) {
+        animationHandle = requestAnimationFrame(render);
+      }
     },
 
     isPaused() {
       return renderPaused;
+    },
+
+    isDisposed() {
+      return disposed;
+    },
+
+    isDisposalSettled() {
+      return disposalSettled;
     },
 
     /**
@@ -6599,112 +8301,319 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
      * Call this before recreating the viewer or when unmounting.
      */
 	    dispose() {
-	      if (disposed) return;
-	      disposed = true;
-      cancelPendingProjectileBuild(
-        'Projectile preparation was cancelled because the viewer was disposed.'
-      );
-      projectileSystem.setEnabled(false);
+	      if (disposalSettled) return;
+	      const failures = [];
+	      const normalizeFailure = (error, owner) => (
+	        error instanceof Error
+	          ? error
+	          : new Error(`${owner} threw a non-Error value.`)
+	      );
+	      const attempt = (key, operation) => {
+	        if (completedDisposalSteps.has(key)) return;
+	        try {
+	          operation();
+	          completedDisposalSteps.add(key);
+	        } catch (error) {
+	          failures.push(normalizeFailure(error, key));
+	        }
+	      };
 
-	      // Stop animation loop
-	      if (animationHandle) {
-	        cancelAnimationFrame(animationHandle);
+	      // Publish the terminal fence before any fallible observer or resource
+	      // cleanup. A callback that survives cancellation can only return at
+	      // the render guard and cannot reschedule or touch WebGL.
+	      if (!disposed) {
+	        disposed = true;
+	        renderPaused = true;
+	        const scheduledAnimationHandle = animationHandle;
 	        animationHandle = null;
+	        if (scheduledAnimationHandle !== null) {
+	          try {
+	            cancelAnimationFrame(scheduledAnimationHandle);
+	          } catch (error) {
+	            failures.push(
+	              normalizeFailure(error, 'viewer animation cancellation')
+	            );
+	          }
+	        }
+	        // The overlay manager becomes the sole retry owner immediately.
+	        vectorFieldOverlay = null;
 	      }
 
-      // Remove all registered event listeners
-      for (const cleanup of eventCleanupFns) {
-        cleanup();
-      }
-      eventCleanupFns.length = 0;
+	      attempt('projectile build cancellation', () => {
+	        cancelPendingProjectileBuild(
+	          'Projectile preparation was cancelled because the viewer was disposed.'
+	        );
+	      });
+	      attempt('pointer-lock retirement', () => {
+	        pointerLockRequestGeneration += 1;
+	        pointerLockRequestPending = false;
+	        pointerLockActive = false;
+	        pointerLockEnabled = false;
+	        lookActive = false;
+	        pendingShot = false;
+	        pendingShotViewportInfo = null;
+	        const pointerFailures = [];
+	        for (const operation of [
+	          () => projectileSystem.cancelCharging(),
+	          () => canvas.classList.remove('dragging', 'free-nav', 'planar-nav'),
+	          () => {
+	            canvas.style.cursor = '';
+	          },
+	          () => {
+	            if (
+	              document.pointerLockElement === canvas &&
+	              typeof document.exitPointerLock === 'function'
+	            ) {
+	              const result = document.exitPointerLock();
+	              if (result?.catch) {
+	                result.catch((error) => {
+	                  try {
+	                    console.error(
+	                      '[Viewer] Pointer-lock exit failed during disposal.',
+	                      error
+	                    );
+	                  } catch {
+	                    // Terminal state is already fenced.
+	                  }
+	                });
+	              }
+	            }
+	          },
+	          () => {
+	            const handler = pointerLockChangeHandler;
+	            pointerLockChangeHandler = null;
+	            handler?.(false, null);
+	          },
+	        ]) {
+	          try {
+	            operation();
+	          } catch (error) {
+	            pointerFailures.push(error);
+	          }
+	        }
+	        if (pointerFailures.length > 0) {
+	          throw new AggregateError(
+	            pointerFailures,
+	            'Pointer-lock retirement was incomplete.'
+	          );
+	        }
+	      });
+	      attempt('projectile activity fence', () => {
+	        projectileSystem.setEnabled(false);
+	      });
+	      attempt('event listener retirement', () => {
+	        const callbacks = eventCleanupFns.splice(
+	          0,
+	          eventCleanupFns.length
+	        );
+	        const failedCallbacks = [];
+	        const listenerFailures = [];
+	        for (const cleanup of callbacks) {
+	          try {
+	            cleanup();
+	          } catch (error) {
+	            failedCallbacks.push(cleanup);
+	            listenerFailures.push(error);
+	          }
+	        }
+	        eventCleanupFns.push(...failedCallbacks);
+	        if (listenerFailures.length > 0) {
+	          throw new AggregateError(
+	            listenerFailures,
+	            'Viewer event-listener retirement was incomplete.'
+	          );
+	        }
+	      });
+	      attempt('resize observer retirement', () => {
+	        canvasResizeObserver.disconnect();
+	      });
+	      attempt('context overlay retirement', () => {
+	        if (webglContextOverlay?.parentNode) {
+	          webglContextOverlay.parentNode.removeChild(
+	            webglContextOverlay
+	          );
+	        }
+	        webglContextOverlay = null;
+	        webglContextOverlayMessage = null;
+	      });
+	      attempt('view-title retirement', () => {
+	        const failedEntries = [];
+	        const titleFailures = [];
+	        for (const entry of viewTitleEntries) {
+	          try {
+	            entry.el?.remove();
+	          } catch (error) {
+	            failedEntries.push(entry);
+	            titleFailures.push(error);
+	          }
+	        }
+	        viewTitleEntries = failedEntries;
+	        lastTitleKey = '';
+	        if (titleFailures.length > 0) {
+	          throw new AggregateError(
+	            titleFailures,
+	            'Viewer title-chip retirement was incomplete.'
+	          );
+	        }
+	      });
+	      attempt('centroid-label retirement', () => {
+	        const labelFailures = [];
+	        const ownedViewIds = new Set([
+	          ...viewCentroidLabels.keys(),
+	          ...pendingCentroidLabelRetirements.keys(),
+	        ]);
+	        for (const viewId of ownedViewIds) {
+	          try {
+	            removeLabelsForView(viewId);
+	          } catch (error) {
+	            labelFailures.push(error);
+	          }
+	        }
+	        if (labelFailures.length > 0) {
+	          throw new AggregateError(
+	            labelFailures,
+	            'Viewer centroid-label retirement was incomplete.'
+	          );
+	        }
+	      });
+	      attempt('overlay manager retirement', () => {
+	        if (overlayManager !== null) {
+	          overlayManager.dispose();
+	          overlayManager = null;
+	        }
+	      });
 
-      // Disconnect resize observer
-      canvasResizeObserver.disconnect();
+	      attempt('projectile resource retirement', () => {
+	        projectileSystem.dispose();
+	      });
+	      attempt('orbit-anchor retirement', () => {
+	        orbitAnchorRenderer.dispose();
+	      });
+	      attempt('centroid snapshot retirement', () => {
+	        const centroidFailures = [];
+	        for (const viewId of Array.from(centroidSnapshotBuffers.keys())) {
+	          try {
+	            deleteCentroidSnapshotBuffer(viewId);
+	          } catch (error) {
+	            centroidFailures.push(error);
+	          }
+	        }
+	        centroidFailures.push(
+	          ...drainCentroidSnapshotRetirements()
+	        );
+	        if (centroidFailures.length > 0) {
+	          throw new AggregateError(
+	            centroidFailures,
+	            'Viewer centroid snapshot retirement was incomplete.'
+	          );
+	        }
+	      });
 
-      if (webglContextOverlay?.parentNode) {
-        webglContextOverlay.parentNode.removeChild(webglContextOverlay);
-      }
-      webglContextOverlay = null;
-      webglContextOverlayMessage = null;
+	      for (const key of Object.keys(gridPlaneBuffers)) {
+	        attempt(`grid buffer ${key}`, () => {
+	          const buffer = gridPlaneBuffers[key];
+	          if (buffer !== null) {
+	            gl.deleteBuffer(buffer);
+	            gridPlaneBuffers[key] = null;
+	          }
+	        });
+	      }
+	      attempt('edge texture retirement', () => {
+	        clearEdgeResourcesV2();
+	      });
+	      attempt('high-performance renderer retirement', () => {
+	        hpRenderer.dispose();
+	      });
+	      attempt('highlight tools retirement', () => {
+	        highlightTools?.dispose?.();
+	        highlightTools = null;
+	      });
+	      attempt('smoke renderer retirement', () => {
+	        smokeRenderer.dispose();
+	      });
 
-      // Clean up overlays (they can own significant GPU resources)
-      if (overlayManager?.dispose) {
-        overlayManager.dispose();
-      }
-      overlayManager = null;
-      vectorFieldOverlay = null;
+	      for (const [key, program] of [
+	        ['line program', lineInstancedProgram],
+	        ['grid program', gridProgram],
+	        ['centroid program', centroidProgram],
+	      ]) {
+	        attempt(key, () => {
+	          if (program) gl.deleteProgram(program);
+	        });
+	      }
+	      attempt('centroid position buffer', () => {
+	        if (centroidPositionBuffer) {
+	          gl.deleteBuffer(centroidPositionBuffer);
+	          centroidPositionBuffer = null;
+	        }
+	      });
+	      attempt('centroid color buffer', () => {
+	        if (centroidColorBuffer) {
+	          gl.deleteBuffer(centroidColorBuffer);
+	          centroidColorBuffer = null;
+	        }
+	      });
+	      attempt('edge quad buffer', () => {
+	        if (edgeQuadBuffer) gl.deleteBuffer(edgeQuadBuffer);
+	      });
+	      attempt('viewer cache retirement', () => {
+	        cachedViewMatrices.clear();
+	        renderParamsByView.clear();
+	        overlayCtxByView.clear();
+	        overlayCtxOptionsByView.clear();
+	        viewDimensionLevels.clear();
+	        viewPositionsCache.clear();
+	        viewCentroidFlags.clear();
+	        viewCentroidLabels.clear();
+	        publishedLodLevels.clear();
+	        lodChangeListeners.clear();
+	        cachedGridProjections.clear();
+	        activeKeys.clear();
+	        _renderAllViews.length = 0;
+	        _renderVelocityViewIds.length = 0;
+	        snapshotViews.length = 0;
+	        positionsArray = null;
+	        colorsArray = null;
+	        transparencyArray = null;
+	        pointCount = 0;
+	        centroidCount = 0;
+	        navigationModeOwnership.clear();
+	        viewFocusHandler = null;
+	        navigationModeChangeHandler = null;
+	        smokeRenderFailureHandler = null;
+	        velocityRenderFailureHandler = null;
+	        if (labelLayer) labelLayer.style.display = 'none';
+	        if (viewTitleLayerEl) {
+	          viewTitleLayerEl.style.display = 'none';
+	        }
+	      });
 
-      // Clean up projectiles (GPU buffers)
-      if (projectileSystem?.dispose) {
-        projectileSystem.dispose();
-      }
-
-      // Clean up orbit anchor (programs + per-view buffers)
-      if (orbitAnchorRenderer?.dispose) {
-        orbitAnchorRenderer.dispose();
-      }
-
-      // Clean up centroid snapshot buffers (includes live + snapshots)
-      for (const vid of Array.from(centroidSnapshotBuffers.keys())) {
-        deleteCentroidSnapshotBuffer(vid);
-      }
-
-      // Clean up grid plane buffers
-      for (const key of Object.keys(gridPlaneBuffers)) {
-        const buf = gridPlaneBuffers[key];
-        if (buf) gl.deleteBuffer(buf);
-        gridPlaneBuffers[key] = null;
-      }
-
-      // Clean up WebGL resources
-      for (const [, entry] of edgePositionTexturesV2) {
-        if (entry.texture) gl.deleteTexture(entry.texture);
-      }
-      edgePositionTexturesV2.clear();
-
-      for (const [, entry] of edgeVisibilityTexturesV2) {
-        if (entry.texture) gl.deleteTexture(entry.texture);
-      }
-      edgeVisibilityTexturesV2.clear();
-
-      // Clean up HP renderer
-      if (hpRenderer && typeof hpRenderer.dispose === 'function') {
-        hpRenderer.dispose();
-      }
-
-      // Clean up highlight tools
-      if (highlightTools && typeof highlightTools.dispose === 'function') {
-        highlightTools.dispose();
-      }
-
-      // Clean up smoke renderer
-      if (smokeRenderer && typeof smokeRenderer.dispose === 'function') {
-        smokeRenderer.dispose();
-      }
-
-      // Clean up viewer's own shader programs
-      if (lineInstancedProgram) gl.deleteProgram(lineInstancedProgram);
-      if (gridProgram) gl.deleteProgram(gridProgram);
-      if (centroidProgram) gl.deleteProgram(centroidProgram);
-
-      // Clean up viewer's own buffers
-      if (centroidPositionBuffer) gl.deleteBuffer(centroidPositionBuffer);
-      if (centroidColorBuffer) gl.deleteBuffer(centroidColorBuffer);
-      if (edgeQuadBuffer) gl.deleteBuffer(edgeQuadBuffer);
-
-	      // Clean up edge texture
-      if (edgeTextureV2) gl.deleteTexture(edgeTextureV2);
-      edgeTextureV2 = null;
-      if (edgeWeightTextureV2) gl.deleteTexture(edgeWeightTextureV2);
-      edgeWeightTextureV2 = null;
-
-      // Clear caches
-      cachedViewMatrices.clear();
-      renderParamsByView.clear();
-      overlayCtxByView.clear();
-      overlayCtxOptionsByView.clear();
-      viewDimensionLevels.clear();
-      viewPositionsCache.clear();
+	      if (failures.length > 0) {
+	        throw new AggregateError(
+	          failures,
+	          `Viewer disposal remains pending for ${failures.length} owner(s).`
+	        );
+	      }
+	      pendingSnapshotCleanupIds.clear();
+	      disposalSettled = true;
     }
   };
+
+  // Disposal is a terminal lifecycle boundary. Keep only the explicit
+  // diagnostics, retryable disposal, and inert loop controls callable after
+  // the first disposal attempt. Guarding the returned methods here prevents a
+  // stale callback from reaching any GPU/DOM owner, including owners whose
+  // first retirement attempt failed. The wrapper identities are created once
+  // and remain stable for the lifetime of this API object.
+  for (const [methodName, method] of Object.entries(publicApi)) {
+    if (TERMINAL_SAFE_VIEWER_METHODS.has(methodName)) continue;
+    publicApi[methodName] = function guardedViewerMethod(...args) {
+      if (disposed) {
+        throw createViewerDisposedError(methodName);
+      }
+      return Reflect.apply(method, publicApi, args);
+    };
+  }
+
+  return publicApi;
 }

@@ -24,6 +24,83 @@ const DB_NAME = 'cellucid_marker_cache';
 const DB_VERSION = 1;
 const STORE_NAME = 'markers';
 
+/**
+ * Copy the mutable marker-result ownership envelopes while retaining the large
+ * typed statistic buffers, which are read-only after discovery. This keeps the
+ * hot cache isolated from UI threshold rebuilds without duplicating the
+ * scientific arrays on every cache access.
+ *
+ * @param {any} data
+ * @returns {any}
+ */
+function cloneMarkerCacheData(data) {
+  if (
+    data === null ||
+    typeof data !== 'object' ||
+    Array.isArray(data) ||
+    ArrayBuffer.isView(data)
+  ) {
+    return data;
+  }
+  const prototype = Object.getPrototypeOf(data);
+  if (prototype !== Object.prototype && prototype !== null) {
+    return data;
+  }
+
+  const clone = { ...data };
+  if (
+    Object.hasOwn(data, 'groups') &&
+    data.groups !== null &&
+    typeof data.groups === 'object' &&
+    !Array.isArray(data.groups)
+  ) {
+    clone.groups = Object.fromEntries(
+      Object.entries(data.groups).map(([groupId, group]) => {
+        if (
+          group === null ||
+          typeof group !== 'object' ||
+          Array.isArray(group)
+        ) {
+          return [groupId, group];
+        }
+        const groupClone = { ...group };
+        if (Array.isArray(group.markers)) {
+          groupClone.markers = group.markers.map(marker => (
+            marker !== null &&
+            typeof marker === 'object' &&
+            !Array.isArray(marker)
+              ? { ...marker }
+              : marker
+          ));
+        }
+        return [groupId, groupClone];
+      })
+    );
+  }
+
+  if (
+    Object.hasOwn(data, 'stats') &&
+    data.stats !== null &&
+    typeof data.stats === 'object' &&
+    !Array.isArray(data.stats)
+  ) {
+    clone.stats = { ...data.stats };
+    for (const key of [
+      'genes',
+      'groupIds',
+      'pValuesByGroup',
+      'adjustedPValuesByGroup',
+      'log2FoldChangeByGroup'
+    ]) {
+      if (Array.isArray(data.stats[key])) {
+        clone.stats[key] = [...data.stats[key]];
+      }
+    }
+  }
+
+  return clone;
+}
+
 // =============================================================================
 // MARKER CACHE CLASS
 // =============================================================================
@@ -140,7 +217,7 @@ export class MarkerCache {
       // Move to end (LRU)
       this._hotCache.delete(cacheKey);
       this._hotCache.set(cacheKey, hotEntry);
-      return hotEntry.data;
+      return cloneMarkerCacheData(hotEntry.data);
     }
 
     // Check warm cache (IndexedDB)
@@ -148,8 +225,9 @@ export class MarkerCache {
       const warmEntry = await this._getFromIndexedDB(cacheKey);
       if (warmEntry !== null) {
         // Promote to hot cache
-        this._setHotCache(cacheKey, warmEntry);
-        return warmEntry;
+        const ownedEntry = cloneMarkerCacheData(warmEntry);
+        this._setHotCache(cacheKey, ownedEntry);
+        return cloneMarkerCacheData(ownedEntry);
       }
     }
 
@@ -169,13 +247,14 @@ export class MarkerCache {
       throw new TypeError('MarkerCache data must be defined');
     }
     const cacheKey = this._buildCacheKey(category, params);
+    const ownedData = cloneMarkerCacheData(data);
 
     // Store in hot cache
-    this._setHotCache(cacheKey, data);
+    this._setHotCache(cacheKey, ownedData);
 
     // Store in warm cache (IndexedDB)
     if (this._db) {
-      await this._setInIndexedDB(cacheKey, data);
+      await this._setInIndexedDB(cacheKey, ownedData);
     }
   }
 

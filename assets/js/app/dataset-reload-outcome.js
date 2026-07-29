@@ -10,6 +10,43 @@ export {
   isDatasetReloadSupersededError
 };
 
+function attachSecondaryFailure(primaryError, secondaryError) {
+  if (
+    secondaryError === undefined ||
+    secondaryError === null ||
+    (
+      (typeof primaryError !== 'object' || primaryError === null) &&
+      typeof primaryError !== 'function'
+    )
+  ) {
+    return primaryError;
+  }
+  try {
+    if (
+      !Object.hasOwn(primaryError, 'cause') ||
+      primaryError.cause === undefined
+    ) {
+      Object.defineProperty(primaryError, 'cause', {
+        configurable: true,
+        value: secondaryError,
+        writable: true
+      });
+      return primaryError;
+    }
+    const previous = Array.isArray(primaryError.secondaryErrors)
+      ? primaryError.secondaryErrors
+      : [];
+    Object.defineProperty(primaryError, 'secondaryErrors', {
+      configurable: true,
+      value: Object.freeze([...previous, secondaryError]),
+      writable: true
+    });
+  } catch {
+    // A frozen/host error still remains the exact primary rejection.
+  }
+  return primaryError;
+}
+
 /**
  * Report a required dataset reload failure, then preserve that same rejection
  * for callers that own the final ready/failed notification.
@@ -27,7 +64,11 @@ export async function reportRequiredDatasetReloadFailure(
       'Required dataset reload failure reporter must be a function.'
     );
   }
-  await reportFailure(error);
+  try {
+    await reportFailure(error);
+  } catch (reportingError) {
+    attachSecondaryFailure(error, reportingError);
+  }
   throw error;
 }
 
@@ -387,6 +428,97 @@ export function createLatestDatasetReloadCoordinator(captureIdentity) {
 }
 
 /**
+ * Own continuations for already-published runtimes independently from staging
+ * requests. Starting a newer request does not invalidate the live runtime;
+ * only a later successful publication advances this epoch.
+ *
+ * @returns {Readonly<{
+ *   readonly generation: number,
+ *   publish: (details?: object) => Readonly<object & {
+ *     generation: number,
+ *     signal: AbortSignal,
+ *     isCurrent: () => boolean,
+ *     assertCurrent: () => void
+ *   }>
+ * }>}
+ */
+export function createLatestDatasetPublicationContinuationOwner() {
+  let activeSlot = null;
+  let latestGeneration = 0;
+  const reservedKeys = new Set([
+    'assertCurrent',
+    'generation',
+    'isCurrent',
+    'signal'
+  ]);
+
+  const owner = {
+    get generation() {
+      return latestGeneration;
+    },
+    publish(details = {}) {
+      if (
+        details === null ||
+        typeof details !== 'object' ||
+        Array.isArray(details) ||
+        Object.getPrototypeOf(details) !== Object.prototype
+      ) {
+        throw new TypeError(
+          'Dataset publication continuation details must be an object.'
+        );
+      }
+      const detailKeys = Reflect.ownKeys(details);
+      if (
+        detailKeys.some(
+          key => typeof key !== 'string' || reservedKeys.has(key)
+        )
+      ) {
+        throw new Error(
+          'Dataset publication continuation details contain a reserved key.'
+        );
+      }
+      if (latestGeneration >= Number.MAX_SAFE_INTEGER) {
+        throw new RangeError(
+          'Dataset publication continuation generation is exhausted.'
+        );
+      }
+
+      const generation = latestGeneration + 1;
+      const controller = new AbortController();
+      let token;
+      token = Object.freeze({
+        ...details,
+        generation,
+        signal: controller.signal,
+        isCurrent() {
+          return (
+            activeSlot?.token === token &&
+            controller.signal.aborted === false
+          );
+        },
+        assertCurrent() {
+          if (
+            activeSlot?.token !== token ||
+            controller.signal.aborted
+          ) {
+            throw createDatasetReloadSupersededError(
+              'Dataset continuation was superseded by a newer runtime publication.'
+            );
+          }
+        }
+      });
+
+      const previousSlot = activeSlot;
+      latestGeneration = generation;
+      activeSlot = { controller, token };
+      previousSlot?.controller.abort();
+      return token;
+    }
+  };
+  return Object.freeze(owner);
+}
+
+/**
  * Own the failure boundary for an in-place reload. Superseded work publishes
  * its exact cancellation outcome; only a still-current reload may publish
  * failure UI/analytics.
@@ -427,14 +559,39 @@ export async function handleDatasetReloadFailure(options) {
     );
   }
   if (!transaction.isCurrent()) {
-    cancel();
-    transaction.assertCurrent();
-    throw createDatasetReloadSupersededError(
-      RELOAD_SUPERSEDED_MESSAGE
-    );
+    let cancellationError = null;
+    try {
+      cancel();
+    } catch (error) {
+      cancellationError = error;
+    }
+    let assertionError = null;
+    try {
+      transaction.assertCurrent();
+    } catch (error) {
+      assertionError = error;
+    }
+    const supersessionError =
+      isDatasetReloadSupersededError(assertionError)
+        ? assertionError
+        : createDatasetReloadSupersededError(
+            RELOAD_SUPERSEDED_MESSAGE
+          );
+    attachSecondaryFailure(supersessionError, cancellationError);
+    if (
+      assertionError !== null &&
+      assertionError !== supersessionError
+    ) {
+      attachSecondaryFailure(supersessionError, assertionError);
+    }
+    throw supersessionError;
   }
   if (isDatasetReloadSupersededError(error)) {
-    cancel();
+    try {
+      cancel();
+    } catch (cancellationError) {
+      attachSecondaryFailure(error, cancellationError);
+    }
     throw error;
   }
   return reportRequiredDatasetReloadFailure(error, reportFailure);
@@ -542,15 +699,16 @@ export async function settleInitialPublishedDatasetStateOutcome(options) {
  * reload.
  *
  * @param {object} options
- * @param {() => void} options.synchronize
- * @param {() => void} options.finalize
- * @param {(error: unknown) => void} options.reportFailure
- * @returns {
+ * @param {() => Promise<void>|void} options.synchronize
+ * @param {() => Promise<void>|void} options.finalize
+ * @param {(error: unknown) => Promise<void>|void} options.reportFailure
+ * @returns {Promise<
  *   {status: 'ready'} |
+ *   {status: 'superseded', finalizationError?: unknown} |
  *   {status: 'ready-ui-error', error: unknown}
- * }
+ * >}
  */
-export function settlePublishedDatasetUi(options) {
+export async function settlePublishedDatasetUi(options) {
   requireExactKeys(
     options,
     ['synchronize', 'finalize', 'reportFailure'],
@@ -568,23 +726,42 @@ export function settlePublishedDatasetUi(options) {
   }
   const errors = [];
   try {
-    synchronize();
+    await synchronize();
   } catch (error) {
     errors.push(error);
   }
   try {
-    finalize();
+    await finalize();
   } catch (error) {
     errors.push(error);
   }
   if (errors.length === 0) return { status: 'ready' };
+  const supersessionError = errors.find(
+    isDatasetReloadSupersededError
+  );
+  if (supersessionError !== undefined) {
+    const finalizationError = errors.find(
+      error => error !== supersessionError
+    );
+    return finalizationError === undefined
+      ? { status: 'superseded' }
+      : { status: 'superseded', finalizationError };
+  }
   const error = errors.length === 1
     ? errors[0]
     : new AggregateError(
         errors,
         'Dataset UI synchronization and resource retirement failed.'
       );
-  reportFailure(error);
+  try {
+    await reportFailure(error);
+  } catch (reportingError) {
+    if (reportingError === error) throw error;
+    throw new AggregateError(
+      [error, reportingError],
+      'Dataset UI settlement and failure reporting both failed.'
+    );
+  }
   return { status: 'ready-ui-error', error };
 }
 

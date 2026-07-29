@@ -19,6 +19,7 @@ import {
   createPlotTypeSelector,
   createAnalysisModal,
   openModal,
+  closeModal,
   renderPlotOptions,
   renderSummaryStats,
   renderStatisticalAnnotations,
@@ -26,8 +27,16 @@ import {
 } from '../components/index.js';
 import { createVariableSelectorComponent } from '../shared/variable-selector.js';
 import { PageSelectorComponent } from '../shared/page-selector.js';
-import { loadPlotly, purgePlot } from '../../plots/plotly-loader.js';
+import { loadPlotly } from '../../plots/plotly-loader.js';
 import { createLayoutEngine } from '../../plots/layout-engine.js';
+import { PlotlyRenderSlot } from '../../shared/plotly-render-slot.js';
+
+function combineErrors(errors, message) {
+  const present = [...new Set(errors.filter(Boolean))];
+  if (present.length === 0) return null;
+  if (present.length === 1) return present[0];
+  return new AggregateError(present, message);
+}
 
 function requireSavedPlotOptions(entries) {
   if (!Array.isArray(entries)) {
@@ -105,6 +114,11 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
 
     // Layout engine for plots
     this._layoutEngine = null;
+    this._previewPlotSlot = null;
+    this._modalPlotSlot = null;
+    this._pendingModalCloseTasks = new Set();
+    this._destroyPromise = null;
+    this._modalRenderGeneration = 0;
 
     // Bind methods
     this._handleVariableChange = this._handleVariableChange.bind(this);
@@ -173,7 +187,11 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       this._controlsContainer.innerHTML = `
         <div class="legend-help">Create highlight pages first using the Highlighted Cells section above.</div>
       `;
-      this._hidePreview();
+      const invalidationRequestId = this._invalidateAnalysisRequest();
+      this._trackInteractiveTask(
+        this._hidePreview(invalidationRequestId),
+        'Detailed preview cleanup'
+      );
       return;
     }
 
@@ -406,6 +424,85 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     }
   }
 
+  _reportPlotLifecycleError(context, error) {
+    if (!(error instanceof Error)) {
+      error = new TypeError(`${context} failed with a non-Error value`);
+    }
+    this._notifications.error(
+      `${context} failed: ${error.message}`,
+      { category: 'analysis', title: 'Analysis Error' }
+    );
+  }
+
+  _createPlotSlot(host, candidateClassName) {
+    return new PlotlyRenderSlot({
+      host,
+      candidateClassName,
+      onResizeError: error => {
+        this._reportPlotLifecycleError('Plot resize', error);
+      }
+    });
+  }
+
+  _ensurePreviewPlotSlot() {
+    if (this._previewPlotSlot !== null) return this._previewPlotSlot;
+    if (!(this._previewContainer instanceof HTMLElement)) {
+      throw new TypeError('Detailed preview requires an initialized container');
+    }
+    this._previewPlotSlot = this._createPlotSlot(
+      this._previewContainer,
+      'analysis-preview-plot'
+    );
+    return this._previewPlotSlot;
+  }
+
+  _trackModalCloseTask(task) {
+    if (!task || typeof task.then !== 'function') {
+      return Promise.resolve(task);
+    }
+    this._pendingModalCloseTasks ??= new Set();
+    this._pendingModalCloseTasks.add(task);
+    task.then(
+      () => this._pendingModalCloseTasks.delete(task),
+      () => this._pendingModalCloseTasks.delete(task)
+    );
+    return task;
+  }
+
+  _destroyModalPlotOwner(modal) {
+    const slot = modal?._analysisPlotSlot ?? null;
+    if (this._modal === modal) this._modal = null;
+    if (this._modalPlotSlot === slot) this._modalPlotSlot = null;
+    modal._analysisPlotSlot = null;
+    if (slot === null) return Promise.resolve();
+    return this._trackModalCloseTask(slot.destroy());
+  }
+
+  _ensureModalPlotSlot(modal) {
+    if (!(modal?._plotContainer instanceof HTMLElement)) {
+      throw new TypeError('Detailed modal requires an exact plot container');
+    }
+    if (modal._analysisPlotSlot != null) {
+      this._modalPlotSlot = modal._analysisPlotSlot;
+      return modal._analysisPlotSlot;
+    }
+    const slot = this._createPlotSlot(
+      modal._plotContainer,
+      'analysis-modal-plot-candidate'
+    );
+    modal._analysisPlotSlot = slot;
+    this._modalPlotSlot = slot;
+    if (modal._beforeClose == null) {
+      modal._beforeClose = () => this._destroyModalPlotOwner(modal);
+    }
+    return slot;
+  }
+
+  _scheduleUpdate(delay = 300) {
+    this._modalRenderGeneration += 1;
+    return super._scheduleUpdate(delay);
+  }
+
   // _canRunAnalysis(), _scheduleUpdate(), _runAnalysisIfValid() - inherited from BaseAnalysisUI
 
   // ===========================================================================
@@ -416,35 +513,36 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
    * Run the analysis (implements abstract method from BaseAnalysisUI)
    * @override
    */
-  async _runAnalysis() {
-    if (this._isDestroyed) return;
-    this._cleanupPreviousAnalysis();
+  async _runAnalysis(requestId) {
+    if (!this._isCurrentAnalysisRequest(requestId)) return;
+    const config = structuredClone(this._currentConfig);
+    const pageIds = [...this._selectedPages];
+    const customColors = new Map(
+      this._pageSelector?.getCustomColors?.() || []
+    );
 
-    if (this._isDestroyed) return;
+    if (!this._isCurrentAnalysisRequest(requestId)) return;
     this._previewContainer.classList.remove('empty');
     this._previewContainer.classList.add('loading');
 
     try {
       await loadPlotly();
-      if (this._isDestroyed) return;
+      if (!this._isCurrentAnalysisRequest(requestId)) return;
 
       // Fetch data
       const pageData = await this.dataLayer.getDataForPages({
-        type: this._currentConfig.dataSource.type,
-        variableKey: this._currentConfig.dataSource.variable,
-        pageIds: this._selectedPages
+        type: config.dataSource.type,
+        variableKey: config.dataSource.variable,
+        pageIds
       });
 
-      if (this._isDestroyed) return;
+      if (!this._isCurrentAnalysisRequest(requestId)) return;
       if (pageData.length === 0) {
         throw new Error('No data available for selected pages');
       }
 
-      this._currentPageData = pageData;
-
       // Create layout engine with custom colors from page selector
-      const customColors = this._pageSelector?.getCustomColors() || new Map();
-      this._layoutEngine = createLayoutEngine({
+      const layoutEngine = createLayoutEngine({
         pageCount: pageData.length,
         pageIds: pageData.map(pd => pd.pageId),
         pageNames: pageData.map(pd => pd.pageName),
@@ -454,68 +552,120 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       });
 
       // Get plot type
-      const plotType = PlotRegistry.get(this._currentConfig.plotType);
+      const plotType = PlotRegistry.get(config.plotType);
       if (!plotType) {
-        throw new Error(`Unknown plot type: ${this._currentConfig.plotType}`);
+        throw new Error(`Unknown plot type: ${config.plotType}`);
       }
 
       const mergedOptions = PlotRegistry.mergeOptions(
-        this._currentConfig.plotType,
-        this._currentConfig.plotOptions
+        config.plotType,
+        config.plotOptions
       );
 
-      if (this._isDestroyed) return;
-      // Render preview
+      if (!this._isCurrentAnalysisRequest(requestId)) return;
+      const previewSlot = this._ensurePreviewPlotSlot();
+      const previewPlotDiv = await previewSlot.render(
+        {
+          pageData,
+          variableName: config.dataSource.variable,
+          render: candidate => plotType.render(
+            pageData,
+            mergedOptions,
+            candidate,
+            layoutEngine
+          )
+        },
+        {
+          isCurrent: () => this._isCurrentAnalysisRequest(requestId)
+        }
+      );
+      if (previewPlotDiv === null) return;
+
       this._previewContainer.classList.remove('loading');
-      // Purge any existing plot to prevent WebGL memory leaks
-      const existingPlot = this._previewContainer.querySelector('.analysis-preview-plot');
-      if (existingPlot) purgePlot(existingPlot);
-      this._previewContainer.innerHTML = '';
-
-      const previewPlotDiv = document.createElement('div');
-      previewPlotDiv.className = 'analysis-preview-plot';
-      this._previewContainer.appendChild(previewPlotDiv);
-
-      await plotType.render(pageData, mergedOptions, previewPlotDiv, this._layoutEngine);
-      if (this._isDestroyed) return;
+      this._previewContainer.classList.remove('empty');
+      this._currentPageData = pageData;
+      this._layoutEngine = layoutEngine;
 
       // Show actions
       this._renderActions();
 
       // Update modal if open
       if (this._modal?._plotContainer) {
-        await this._updateModal(plotType, mergedOptions, pageData);
+        await this._updateModal(
+          plotType,
+          mergedOptions,
+          pageData,
+          layoutEngine,
+          config,
+          requestId
+        );
       }
 
     } catch (err) {
+      if (!this._isCurrentAnalysisRequest(requestId)) return;
       this._previewContainer.classList.remove('loading');
       this._previewContainer.classList.add('empty');
       throw err;
     }
   }
 
-  async _updateModal(plotType, options, pageData) {
-    if (this._isDestroyed) return;
+  async _updateModal(
+    plotType,
+    options,
+    pageData,
+    layoutEngine,
+    config,
+    requestId
+  ) {
+    if (!this._isCurrentAnalysisRequest(requestId)) return;
     const modal = this._modal;
     const plotContainer = modal?._plotContainer;
     if (!plotContainer) return;
 
-    purgePlot(plotContainer);
-    await plotType.render(pageData, options, plotContainer, this._layoutEngine);
-    if (this._isDestroyed) return;
+    const slot = this._ensureModalPlotSlot(modal);
+    await slot.waitForCommittedLeases();
+    if (
+      !this._isCurrentAnalysisRequest(requestId) ||
+      this._modal !== modal
+    ) {
+      return;
+    }
+    const candidate = await slot.render(
+      {
+        pageData,
+        variableName: config.dataSource.variable,
+        render: plotCandidate => plotType.render(
+          pageData,
+          options,
+          plotCandidate,
+          layoutEngine
+        )
+      },
+      {
+        isCurrent: () => (
+          this._isCurrentAnalysisRequest(requestId) &&
+          this._modal === modal
+        )
+      }
+    );
+    if (candidate === null) return;
 
     const modalAfter = this._modal;
     if (!modalAfter) return;
 
     if (modalAfter._statsContent) {
-      renderSummaryStats(modalAfter._statsContent, pageData, this._currentConfig.dataSource.variable);
+      renderSummaryStats(
+        modalAfter._statsContent,
+        pageData,
+        config.dataSource.variable
+      );
     }
 
     if (modalAfter._annotationsContent) {
       renderStatisticalAnnotations(
         modalAfter._annotationsContent,
         pageData,
-        this._currentConfig.dataSource.type
+        config.dataSource.type
       );
     }
   }
@@ -524,7 +674,102 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
   // Preview & Actions
   // ===========================================================================
 
-  // _hidePreview() and _showError() - inherited from BaseAnalysisUI
+  async _hidePreview(requestId = null) {
+    const publicationCurrent =
+      await this._cleanupPreviousAnalysis(requestId);
+    if (!publicationCurrent) return false;
+
+    if (this._previewContainer) {
+      for (const child of [...this._previewContainer.children]) {
+        if (
+          child.classList.contains('analysis-error') ||
+          child.classList.contains('analysis-empty-message')
+        ) {
+          child.remove();
+        }
+      }
+      this._previewContainer.classList.add('empty');
+      this._previewContainer.classList.remove('loading');
+    }
+    if (this._actionsContainer) {
+      this._actionsContainer.style.display = 'none';
+    }
+    return true;
+  }
+
+  async _showError(message, requestId = null) {
+    const publicationCurrent = await this._hidePreview(requestId);
+    if (
+      !publicationCurrent ||
+      (
+        requestId !== null &&
+        !this._isCurrentAnalysisRequest(requestId)
+      )
+    ) {
+      return false;
+    }
+    if (this._previewContainer) {
+      const errorEl = document.createElement('div');
+      errorEl.className = 'analysis-error';
+      errorEl.textContent = message ?? '';
+      this._previewContainer.appendChild(errorEl);
+    }
+    this._notifications.error(
+      message,
+      { category: 'data', title: 'Analysis Error' }
+    );
+    return true;
+  }
+
+  async _cleanupPreviousAnalysis(requestId = null) {
+    const modal = this._modal;
+    const tasks = [];
+    const errors = [];
+    for (const slot of [
+      this._previewPlotSlot,
+      modal?._analysisPlotSlot
+    ]) {
+      if (slot === null || slot === undefined) continue;
+      try {
+        tasks.push(slot.invalidate());
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    const outcomes = await Promise.allSettled(tasks);
+    errors.push(
+      ...outcomes
+        .filter(outcome => outcome.status === 'rejected')
+        .map(outcome => outcome.reason)
+    );
+    const publicationCurrent = (
+      requestId === null ||
+      this._isCurrentAnalysisIntent(requestId)
+    );
+    if (publicationCurrent) {
+      this._currentPageData = null;
+      this._layoutEngine = null;
+      if (this._modal === modal && modal !== null) {
+        for (const content of [
+          modal._statsContent,
+          modal._annotationsContent
+        ]) {
+          if (content === null || content === undefined) continue;
+          try {
+            content.innerHTML = '';
+          } catch (error) {
+            errors.push(error);
+          }
+        }
+      }
+    }
+    const failure = combineErrors(
+      errors,
+      'Detailed plot cleanup failed'
+    );
+    if (failure) throw failure;
+    return publicationCurrent;
+  }
 
   /**
    * Render action buttons (expand, etc.)
@@ -533,7 +778,12 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     this._actionsContainer.innerHTML = '';
     this._actionsContainer.style.display = 'flex';
 
-    const expandBtn = createExpandButton(this._openExpandedView);
+    const expandBtn = createExpandButton(() => {
+      this._trackInteractiveTask(
+        this._openExpandedView(),
+        'Expanded analysis view'
+      );
+    });
     this._actionsContainer.appendChild(expandBtn);
   }
 
@@ -544,68 +794,111 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
   async _openExpandedView() {
     if (!this._canRunAnalysis()) return;
 
-    this._modal = createAnalysisModal({
-      onClose: () => { this._modal = null; },
-      onExportPNG: () => this._exportPNG(),
-      onExportSVG: () => this._exportSVG(),
-      onExportCSV: () => this._exportCSV()
+    const pageData = this._currentPageData;
+    const layoutEngine = this._layoutEngine;
+    const config = structuredClone(this._currentConfig);
+    const generation = ++this._modalRenderGeneration;
+    let modal = null;
+    modal = createAnalysisModal({
+      beforeClose: () => this._destroyModalPlotOwner(modal),
+      onClose: () => {
+        if (this._modal === modal) this._modal = null;
+      },
+      onCloseError: error => {
+        this._reportPlotLifecycleError('Expanded view cleanup', error);
+      },
+      onExportPNG: () => this._trackInteractiveTask(
+        this._exportPNG(),
+        'PNG export'
+      ),
+      onExportSVG: () => this._trackInteractiveTask(
+        this._exportSVG(),
+        'SVG export'
+      ),
+      onExportCSV: () => this._trackInteractiveTask(
+        this._exportCSV(),
+        'CSV export'
+      )
     });
+    this._modal = modal;
 
-    if (this._modal._title) {
-      this._modal._title.textContent = `Comparing: ${this._currentConfig.dataSource.variable}`;
+    if (modal._title) {
+      modal._title.textContent = `Comparing: ${config.dataSource.variable}`;
     }
 
-    if (this._modal._optionsContent) {
+    if (modal._optionsContent) {
       renderPlotOptions(
-        this._modal._optionsContent,
-        this._currentConfig.plotType,
-        this._currentConfig.plotOptions,
+        modal._optionsContent,
+        config.plotType,
+        config.plotOptions,
         this._handlePlotOptionChange
       );
     }
 
-    openModal(this._modal);
+    openModal(modal);
 
-    if (this._currentPageData && this._modal._plotContainer) {
+    if (pageData && modal._plotContainer) {
       try {
         await loadPlotly();
 
-        const plotType = PlotRegistry.get(this._currentConfig.plotType);
+        const plotType = PlotRegistry.get(config.plotType);
+        if (!plotType) {
+          throw new RangeError(`Unknown plot type: ${config.plotType}`);
+        }
         const mergedOptions = PlotRegistry.mergeOptions(
-          this._currentConfig.plotType,
-          this._currentConfig.plotOptions
+          config.plotType,
+          config.plotOptions
         );
 
-        await plotType.render(
-          this._currentPageData,
-          mergedOptions,
-          this._modal._plotContainer,
-          this._layoutEngine
+        const slot = this._ensureModalPlotSlot(modal);
+        const candidate = await slot.render(
+          {
+            pageData,
+            variableName: config.dataSource.variable,
+            render: plotCandidate => plotType.render(
+              pageData,
+              mergedOptions,
+              plotCandidate,
+              layoutEngine
+            )
+          },
+          {
+            isCurrent: () => (
+              !this._isDestroyed &&
+              this._modal === modal &&
+              generation === this._modalRenderGeneration
+            )
+          }
         );
+        if (candidate === null) return;
 
-        if (this._modal._statsContent) {
+        if (modal._statsContent) {
           renderSummaryStats(
-            this._modal._statsContent,
-            this._currentPageData,
-            this._currentConfig.dataSource.variable
+            modal._statsContent,
+            pageData,
+            config.dataSource.variable
           );
         }
 
-        if (this._modal._annotationsContent) {
+        if (modal._annotationsContent) {
           renderStatisticalAnnotations(
-            this._modal._annotationsContent,
-            this._currentPageData,
-            this._currentConfig.dataSource.type
+            modal._annotationsContent,
+            pageData,
+            config.dataSource.type
           );
         }
       } catch (err) {
-        console.error('[DetailedAnalysisUI] Modal render failed:', err);
-        if (this._modal._plotContainer) {
-          this._modal._plotContainer.innerHTML = '';
+        if (
+          this._modal === modal &&
+          generation === this._modalRenderGeneration
+        ) {
+          console.error('[DetailedAnalysisUI] Modal render failed:', err);
+          await modal._analysisPlotSlot?.invalidate();
+          modal._plotContainer.innerHTML = '';
           const errorEl = document.createElement('div');
           errorEl.className = 'analysis-error';
           errorEl.textContent = `Failed to render: ${err?.message || err}`;
-          this._modal._plotContainer.appendChild(errorEl);
+          modal._plotContainer.appendChild(errorEl);
         }
       }
     }
@@ -615,12 +908,8 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
   // Export Functions - Override to use detailed-specific containers
   // ===========================================================================
 
-  /**
-   * Get the active plot container (modal or preview)
-   * @returns {HTMLElement|null}
-   */
-  _getActivePlotContainer() {
-    return this._modal?._plotContainer || this._previewContainer?.querySelector('.analysis-preview-plot');
+  _getActivePlotSlot() {
+    return this._modal?._analysisPlotSlot ?? this._previewPlotSlot;
   }
 
   /**
@@ -628,9 +917,11 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
    * @override
    */
   async _exportPNG() {
-    const container = this._getActivePlotContainer();
-    // Call base class method with specific container and options
-    await super._exportPNG(container, { filename: 'detailed-analysis' });
+    const slot = this._getActivePlotSlot();
+    if (slot == null) return;
+    await slot.withCommittedPlot(candidate => (
+      super._exportPNG(candidate, { filename: 'detailed-analysis' })
+    ));
   }
 
   /**
@@ -638,9 +929,11 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
    * @override
    */
   async _exportSVG() {
-    const container = this._getActivePlotContainer();
-    // Call base class method with specific container and options
-    await super._exportSVG(container, { filename: 'detailed-analysis' });
+    const slot = this._getActivePlotSlot();
+    if (slot == null) return;
+    await slot.withCommittedPlot(candidate => (
+      super._exportSVG(candidate, { filename: 'detailed-analysis' })
+    ));
   }
 
   /**
@@ -648,9 +941,25 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
    * @override
    */
   async _exportCSV() {
-    if (!this._currentConfig.dataSource.variable || !this._currentPageData) return;
-    // Call base class method with specific data
-    await super._exportCSV(this._currentPageData, this._currentConfig.dataSource.variable, 'detailed-analysis-data.csv');
+    const slot = this._getActivePlotSlot();
+    if (slot == null) return;
+    await slot.withCommittedPlot((_candidate, renderResult) => {
+      const payload = renderResult?.payload;
+      if (
+        !Array.isArray(payload?.pageData) ||
+        typeof payload.variableName !== 'string' ||
+        payload.variableName.length === 0
+      ) {
+        throw new Error(
+          'Detailed CSV export requires exact committed plot data'
+        );
+      }
+      return super._exportCSV(
+        payload.pageData,
+        payload.variableName,
+        'detailed-analysis-data.csv'
+      );
+    });
   }
 
   // ===========================================================================
@@ -695,22 +1004,112 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
    * @override
    */
   destroy() {
-    this._isDestroyed = true;
-    // Clean up variable selector
-    this._variableSelector?.destroy?.();
-    this._variableSelector = null;
+    if (this._destroyPromise != null) return this._destroyPromise;
 
-    // Clean up page selector
-    this._pageSelector?.destroy();
+    let rejectDestroy;
+    let resolveDestroy;
+    const destroyTask = new Promise((resolve, reject) => {
+      resolveDestroy = resolve;
+      rejectDestroy = reject;
+    });
+    this._destroyPromise = destroyTask;
+
+    const errors = [];
+    const selectorTasks = [];
+    this._isDestroyed = true;
+    this._modalRenderGeneration += 1;
+    try {
+      this._invalidateAnalysisRequest();
+    } catch (error) {
+      errors.push(error);
+    }
+    if (this._updateTimer) {
+      try {
+        clearTimeout(this._updateTimer);
+      } catch (error) {
+        errors.push(error);
+      }
+      this._updateTimer = null;
+    }
+    for (const [label, owner] of [
+      ['variable selector', this._variableSelector],
+      ['page selector', this._pageSelector]
+    ]) {
+      if (owner === null || owner === undefined) continue;
+      if (typeof owner.destroy !== 'function') {
+        errors.push(
+          new TypeError(`Detailed Analysis ${label} must implement destroy()`)
+        );
+        continue;
+      }
+      try {
+        const result = owner.destroy();
+        if (result !== null && result !== undefined &&
+            typeof result.then === 'function') {
+          selectorTasks.push(result);
+        }
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    this._variableSelector = null;
     this._pageSelector = null;
     this._pageSelectContainer = null;
 
     // Clean up detailed-specific state
     this._savedPlotOptions.clear();
-    this._layoutEngine = null;
-
-    // Call parent destroy
-    super.destroy();
+    const previewSlot = this._previewPlotSlot;
+    const modal = this._modal;
+    void Promise.resolve().then(async () => {
+      const cleanupTasks = [
+        ...selectorTasks,
+        ...(this._pendingModalCloseTasks ?? [])
+      ];
+      if (previewSlot !== null && previewSlot !== undefined) {
+        if (typeof previewSlot.destroy !== 'function') {
+          errors.push(
+            new TypeError(
+              'Detailed Analysis preview plot owner must implement destroy()'
+            )
+          );
+        } else {
+          try {
+            cleanupTasks.push(previewSlot.destroy());
+          } catch (error) {
+            errors.push(error);
+          }
+        }
+      }
+      if (modal !== null && modal !== undefined) {
+        try {
+          cleanupTasks.push(closeModal(modal));
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      const outcomes = await Promise.allSettled(cleanupTasks);
+      errors.push(
+        ...outcomes
+          .filter(outcome => outcome.status === 'rejected')
+          .map(outcome => outcome.reason)
+      );
+      this._previewPlotSlot = null;
+      this._modalPlotSlot = null;
+      this._modal = null;
+      this._layoutEngine = null;
+      try {
+        await super.destroy();
+      } catch (error) {
+        errors.push(error);
+      }
+      const failure = combineErrors(
+        errors,
+        'Detailed Analysis destruction failed'
+      );
+      if (failure) throw failure;
+    }).then(resolveDestroy, rejectDestroy);
+    void destroyTask.catch(() => {});
+    return destroyTask;
   }
 }
 

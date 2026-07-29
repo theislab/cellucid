@@ -93,7 +93,10 @@ function makeContributor(
 function makeSerializer(contributors) {
   return new SessionSerializer({
     state: {
+      getDatasetGeneration: () => 0,
+      obsData: { fields: [] },
       pointCount: 3,
+      positionsArray: new Float32Array(9),
       varData: { fields: [] },
     },
     viewer: {},
@@ -157,7 +160,12 @@ function createOverlayState(initialPayload) {
   );
   let applications = 0;
   const state = {
+    getDatasetGeneration() {
+      return 0;
+    },
+    obsData: { fields: [] },
     pointCount: 3,
+    positionsArray: new Float32Array(9),
     varData: { fields: [] },
     applyFieldOverlays() {
       applications += 1;
@@ -227,11 +235,35 @@ function cameraState(radius) {
 
 function createCoreHarness(t) {
   const previousDocument = globalThis.document;
+  let dimension = 3;
+  let viewerSnapshots = [];
+  let visibilityGeneration = 0;
+  const renderModeEvents = [];
+  const renderModeControl = {
+    id: 'render-mode',
+    tagName: 'SELECT',
+    value: 'points',
+    options: ['points', 'smoke'].map(value => ({ value })),
+    closest() {
+      return null;
+    },
+    dispatchEvent(event) {
+      renderModeEvents.push({
+        dimension,
+        snapshotCount: viewerSnapshots.length,
+        type: event.type,
+        value: this.value,
+        visibilityGeneration,
+      });
+      return true;
+    },
+  };
   const controls = new Map([
     ['dimension-select', {
       options: ['1', '2', '3'].map(value => ({ value })),
       value: '3',
     }],
+    ['render-mode', renderModeControl],
     ['categorical-field', { value: '-1' }],
     ['continuous-field', { value: '-1' }],
     ['gene-expression-search', { value: '' }],
@@ -255,7 +287,6 @@ function createCoreHarness(t) {
     else globalThis.document = previousDocument;
   });
 
-  let dimension = 3;
   let activeViewId = 'live';
   let abortOnTargetDimension = null;
   const state = {
@@ -318,7 +349,9 @@ function createCoreHarness(t) {
     updateFilterSummary() {},
     updateFilteredCount() {},
     updateOutlierQuantiles() {},
-    _notifyVisibilityChange() {},
+    _notifyVisibilityChange() {
+      visibilityGeneration += 1;
+    },
     _pushCentroidsToViewer() {},
     _pushColorsToViewer() {},
     _pushTransparencyToViewer() {},
@@ -332,7 +365,9 @@ function createCoreHarness(t) {
     liveViewHidden: false,
   };
   const viewer = {
-    clearSnapshotViews() {},
+    clearSnapshotViews() {
+      viewerSnapshots = [];
+    },
     createSnapshotView() {
       throw new Error('No snapshot view is expected.');
     },
@@ -343,7 +378,7 @@ function createCoreHarness(t) {
       return camerasLocked;
     },
     getSnapshotViews() {
-      return [];
+      return [...viewerSnapshots];
     },
     getViewCameraState() {
       return structuredClone(camera);
@@ -372,7 +407,8 @@ function createCoreHarness(t) {
     },
   };
   const sidebar = {
-    querySelectorAll() {
+    querySelectorAll(selector) {
+      if (selector === 'select[id]') return [renderModeControl];
       return [];
     },
   };
@@ -391,6 +427,18 @@ function createCoreHarness(t) {
       };
     },
     dimension: () => dimension,
+    renderMode: () => renderModeControl.value,
+    renderModeEvents: () => structuredClone(renderModeEvents),
+    seedViewerSnapshot() {
+      viewerSnapshots = [{
+        id: 'snap_1',
+        label: 'Existing view',
+      }];
+    },
+    setRenderMode(value) {
+      renderModeControl.value = value;
+    },
+    snapshotCount: () => viewerSnapshots.length,
     sidebar,
     state,
     viewer,
@@ -984,6 +1032,74 @@ test('real core state rolls back exact dimension and camera after commit failure
     await transaction.rollback();
     assert.equal(harness.dimension(), 3);
     assert.equal(harness.cameraRadius(), 3);
+  });
+});
+
+test('real core state replays in neutral points mode before publishing saved smoke', async t => {
+  async function captureTarget(harness) {
+    const [chunk] = captureCoreState({
+      sidebar: harness.sidebar,
+      state: harness.state,
+      viewer: harness.viewer,
+    });
+    const payload = structuredClone(chunk.payload);
+    payload.liveDimensionLevel = 2;
+    return payload;
+  }
+
+  await t.test('current smoke is retired before restored state mutates', async t => {
+    const harness = createCoreHarness(t);
+    harness.setRenderMode('smoke');
+    const payload = await captureTarget(harness);
+
+    await restoreCoreState(
+      harness.context(null, new AbortController().signal),
+      { id: 'core/state' },
+      payload,
+    );
+
+    assert.equal(harness.dimension(), 2);
+    assert.equal(harness.renderMode(), 'smoke');
+    assert.deepEqual(harness.renderModeEvents(), [
+      {
+        dimension: 3,
+        snapshotCount: 0,
+        type: 'change',
+        value: 'points',
+        visibilityGeneration: 0,
+      },
+      {
+        dimension: 2,
+        snapshotCount: 0,
+        type: 'change',
+        value: 'smoke',
+        visibilityGeneration: 1,
+      },
+    ]);
+  });
+
+  await t.test('saved smoke publishes only after current snapshots are cleared', async t => {
+    const harness = createCoreHarness(t);
+    const payload = await captureTarget(harness);
+    payload.uiControls['render-mode'].value = 'smoke';
+    harness.seedViewerSnapshot();
+
+    await restoreCoreState(
+      harness.context(null, new AbortController().signal),
+      { id: 'core/state' },
+      payload,
+    );
+
+    assert.equal(harness.dimension(), 2);
+    assert.equal(harness.snapshotCount(), 0);
+    assert.equal(harness.renderMode(), 'smoke');
+    assert.deepEqual(harness.renderModeEvents(), [{
+      dimension: 2,
+      snapshotCount: 0,
+      type: 'change',
+      value: 'smoke',
+      visibilityGeneration: 1,
+    }]);
   });
 });
 

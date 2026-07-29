@@ -22,6 +22,14 @@ import {
 } from '../../community-annotations/access-store.js';
 import { syncCommunityAnnotationCacheContext } from '../../community-annotations/runtime-context.js';
 import { ANNOTATION_CONNECTION_CHANGED_EVENT } from '../../community-annotations/connection-events.js';
+import {
+  createDatasetFieldLoadSupersededError,
+  isDatasetFieldLoadSupersededError
+} from '../../state/managers/field/loading.js';
+import {
+  createFieldInteractionOwner,
+  isFieldInteractionSupersededError
+} from './field-interaction-owner.js';
 
 const NONE_FIELD_VALUE = '-1';
 const INIT_KEYS = new Set(['state', 'dom', 'dataSourceManager', 'callbacks']);
@@ -52,6 +60,7 @@ const REQUIRED_STATE_METHODS = [
   'deleteField',
   'duplicateField',
   'ensureFieldLoaded',
+  'getDatasetGeneration',
   'getFields',
   'getVarFields',
   'getVisibleFields',
@@ -358,12 +367,24 @@ export function initFieldSelector(options) {
   }
 
   const lifecycle = new view.AbortController();
+  const interactionOwner = createFieldInteractionOwner();
   let destroyed = false;
+  let destroyPromise = null;
   let forceDisableFieldSelects = false;
   let hasCategoricalFields = false;
   let hasContinuousFields = false;
   let geneSelector;
   let categoryBuilder;
+  const transientClosers = new Set();
+  let adoptedDatasetGeneration = state.getDatasetGeneration();
+  if (
+    !Number.isSafeInteger(adoptedDatasetGeneration)
+    || adoptedDatasetGeneration < 0
+  ) {
+    throw new TypeError(
+      'Field selector dataset generation must be a non-negative safe integer'
+    );
+  }
 
   function resetFieldSelect(select, label) {
     if (typeof label !== 'string' || label.length === 0) {
@@ -393,6 +414,39 @@ export function initFieldSelector(options) {
     }
   }
 
+  function ownTransient(close) {
+    if (typeof close !== 'function') {
+      throw new TypeError('Field transient closer must be a function');
+    }
+    transientClosers.add(close);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      transientClosers.delete(close);
+    };
+  }
+
+  function closeTransientInteractions() {
+    const closers = [...transientClosers];
+    transientClosers.clear();
+    const errors = [];
+    for (const close of closers) {
+      try {
+        close();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) {
+      throw new AggregateError(
+        errors,
+        'Field transient interaction cleanup failed'
+      );
+    }
+  }
+
   function reportTaskFailure(task, prefix, category) {
     if (
       task === null
@@ -402,7 +456,14 @@ export function initFieldSelector(options) {
     ) {
       throw new TypeError('Field selector UI task must be a Promise');
     }
+    interactionOwner.track(task);
     task.catch((error) => {
+      if (
+        isFieldInteractionSupersededError(error)
+        || isDatasetFieldLoadSupersededError(error)
+      ) {
+        return;
+      }
       const exactError = requireError(error, 'Field selector UI task');
       console.error(exactError);
       getNotificationCenter().error(
@@ -410,6 +471,53 @@ export function initFieldSelector(options) {
         { category }
       );
     });
+  }
+
+  function readDatasetGeneration() {
+    const generation = state.getDatasetGeneration();
+    if (!Number.isSafeInteger(generation) || generation < 0) {
+      throw new TypeError(
+        'Field selector dataset generation must be a non-negative safe integer'
+      );
+    }
+    return generation;
+  }
+
+  function synchronizeDatasetGeneration() {
+    const generation = readDatasetGeneration();
+    if (generation !== adoptedDatasetGeneration) {
+      closeTransientInteractions();
+      interactionOwner.invalidate();
+      adoptedDatasetGeneration = generation;
+      forceDisableFieldSelects = false;
+    }
+    return generation;
+  }
+
+  function isCapturedFieldCurrent(
+    datasetGeneration,
+    source,
+    index,
+    field
+  ) {
+    if (
+      destroyed
+      || readDatasetGeneration() !== datasetGeneration
+    ) {
+      return false;
+    }
+    const fields = source === FieldSource.OBS
+      ? state.getFields()
+      : state.getVarFields();
+    return Array.isArray(fields) && fields[index] === field;
+  }
+
+  function isIntentionalInteractionRetirement(error, token) {
+    return (
+      interactionOwner.isCurrent(token) === false
+      || isFieldInteractionSupersededError(error)
+      || isDatasetFieldLoadSupersededError(error)
+    );
   }
 
   function isCommunityAnnotationUiEnabled() {
@@ -559,7 +667,8 @@ export function initFieldSelector(options) {
     if (!(targetEl instanceof view.HTMLElement)) {
       throw new TypeError('Field rename target must be an HTMLElement');
     }
-    const { fields, field, index } = getFieldForSource(source, fieldIndex);
+    const { field, index } = getFieldForSource(source, fieldIndex);
+    const datasetGeneration = readDatasetGeneration();
     if (
       isCommunityAnnotationUiEnabled()
       && source === FieldSource.OBS
@@ -573,8 +682,20 @@ export function initFieldSelector(options) {
       return;
     }
 
+    let releaseTransient = () => {};
     const editor = InlineEditor.create(targetEl, field.key, {
       onSave: (newName) => {
+        releaseTransient();
+        if (
+          !isCapturedFieldCurrent(
+            datasetGeneration,
+            source,
+            index,
+            field
+          )
+        ) {
+          return;
+        }
         const renamed = requireBoolean(
           state.renameField(source, index, newName),
           'Field rename result'
@@ -591,16 +712,38 @@ export function initFieldSelector(options) {
           { category: 'filter', duration: 2000 }
         );
       },
-      validate: name => validateUniqueFieldName(name, fields, index)
+      onCancel: () => {
+        releaseTransient();
+      },
+      validate: name => (
+        isCapturedFieldCurrent(
+          datasetGeneration,
+          source,
+          index,
+          field
+        )
+          ? validateUniqueFieldName(
+              name,
+              source === FieldSource.OBS
+                ? state.getFields()
+                : state.getVarFields(),
+              index
+            )
+          : 'The dataset changed; rename was canceled'
+      )
     });
     if (!(editor instanceof view.HTMLInputElement)) {
       throw new Error('Field rename editor failed to initialize');
     }
+    releaseTransient = ownTransient(
+      () => InlineEditor.cancel(editor)
+    );
   }
 
   function startFieldDelete(source, fieldIndex) {
     assertAlive();
     const { field, index } = getFieldForSource(source, fieldIndex);
+    const datasetGeneration = readDatasetGeneration();
     if (
       isCommunityAnnotationUiEnabled()
       && source === FieldSource.OBS
@@ -614,11 +757,23 @@ export function initFieldSelector(options) {
       return;
     }
 
-    showConfirmDialog({
+    let releaseTransient = () => {};
+    const closeDialog = showConfirmDialog({
       title: 'Delete field',
       message: `Delete "${field.key}"? You can restore it from Deleted Fields.`,
       confirmText: 'Delete',
       onConfirm: () => {
+        releaseTransient();
+        if (
+          !isCapturedFieldCurrent(
+            datasetGeneration,
+            source,
+            index,
+            field
+          )
+        ) {
+          return;
+        }
         const deleted = requireBoolean(
           state.deleteField(source, index),
           'Field deletion result'
@@ -634,8 +789,12 @@ export function initFieldSelector(options) {
           `Deleted "${field.key}"`,
           { category: 'filter', duration: 2500 }
         );
+      },
+      onCancel: () => {
+        releaseTransient();
       }
     });
+    releaseTransient = ownTransient(closeDialog);
   }
 
   function clearFieldSelections() {
@@ -705,6 +864,7 @@ export function initFieldSelector(options) {
 
   function syncFromState() {
     assertAlive();
+    synchronizeDatasetGeneration();
     const { source, obsIdx } = requireActiveState();
     if (source === FieldSource.OBS) {
       geneSelector.clearLocalSelectionUI();
@@ -722,6 +882,7 @@ export function initFieldSelector(options) {
 
   function renderFieldSelects() {
     assertAlive();
+    synchronizeDatasetGeneration();
     const ctx = syncCommunityAnnotationCacheContext({ dataSourceManager });
     const annotationUiEnabled = requireBoolean(
       isAnnotationRepoConnected(ctx.datasetId, ctx.userKey),
@@ -785,58 +946,80 @@ export function initFieldSelector(options) {
     }
   }
 
-  async function activateField(idx) {
+  function activateField(idx) {
     assertAlive();
     const index = requireSelectableIndex(idx, 'Field activation index');
-    syncCommunityAnnotationCacheContext({ dataSourceManager });
+    if (interactionOwner.isSuspended()) {
+      return Promise.resolve(null);
+    }
+    const datasetGeneration = synchronizeDatasetGeneration();
+    return interactionOwner.run(async token => {
+      syncCommunityAnnotationCacheContext({ dataSourceManager });
 
-    if (index === -1) {
-      const cleared = requireFieldInfo(
-        state.clearActiveField(),
-        null,
-        'Clear active field result'
-      );
-      clearFieldSelections();
+      if (index === -1) {
+        interactionOwner.assertCurrent(token);
+        const cleared = requireFieldInfo(
+          state.clearActiveField(),
+          null,
+          'Clear active field result'
+        );
+        forceDisableFieldSelects = false;
+        clearFieldSelections();
+        geneSelector.clearLocalSelectionUI();
+        geneSelector.updateGeneActionButtons(false);
+        updateFieldSelectDisabledStates();
+        callbacks.onActiveFieldChanged(cleared);
+        return cleared;
+      }
+
+      const { field } = getFieldForSource(FieldSource.OBS, index);
       geneSelector.clearLocalSelectionUI();
       geneSelector.updateGeneActionButtons(forceDisableFieldSelects);
+      forceDisableFieldSelects = true;
       updateFieldSelectDisabledStates();
-      callbacks.onActiveFieldChanged(cleared);
-      return cleared;
-    }
-
-    const { field } = getFieldForSource(FieldSource.OBS, index);
-    geneSelector.clearLocalSelectionUI();
-    geneSelector.updateGeneActionButtons(forceDisableFieldSelects);
-    forceDisableFieldSelects = true;
-    updateFieldSelectDisabledStates();
-    try {
-      await state.ensureFieldLoaded(index);
-      const info = requireFieldInfo(
-        state.setActiveField(index),
-        field,
-        'Activate obs field result'
-      );
-      syncSelectsForField(index);
-      callbacks.onActiveFieldChanged(info);
-      return info;
-    } catch (error) {
-      const activationError = requireError(error, 'Obs field activation');
       try {
-        syncFromState();
-      } catch (rollbackError) {
-        throw new AggregateError(
-          [
-            activationError,
-            requireError(rollbackError, 'Obs field activation rollback')
-          ],
-          'Obs field activation and UI rollback failed'
+        await state.ensureFieldLoaded(index, {
+          signal: token.signal
+        });
+        interactionOwner.assertCurrent(token);
+        if (
+          readDatasetGeneration() !== datasetGeneration
+          || state.getFields()?.[index] !== field
+        ) {
+          throw createDatasetFieldLoadSupersededError();
+        }
+        const info = requireFieldInfo(
+          state.setActiveField(index),
+          field,
+          'Activate obs field result'
         );
+        syncSelectsForField(index);
+        callbacks.onActiveFieldChanged(info);
+        return info;
+      } catch (error) {
+        if (isIntentionalInteractionRetirement(error, token)) {
+          return null;
+        }
+        const activationError = requireError(error, 'Obs field activation');
+        try {
+          syncFromState();
+        } catch (rollbackError) {
+          throw new AggregateError(
+            [
+              activationError,
+              requireError(rollbackError, 'Obs field activation rollback')
+            ],
+            'Obs field activation and UI rollback failed'
+          );
+        }
+        throw activationError;
+      } finally {
+        if (interactionOwner.isCurrent(token)) {
+          forceDisableFieldSelects = false;
+          updateFieldSelectDisabledStates();
+        }
       }
-      throw activationError;
-    } finally {
-      forceDisableFieldSelects = false;
-      updateFieldSelectDisabledStates();
-    }
+    });
   }
 
   async function duplicateSelectedField(select, expectedKind) {
@@ -851,6 +1034,7 @@ export function initFieldSelector(options) {
         `${expectedKind} duplicate action references the wrong field kind`
       );
     }
+    const intent = interactionOwner.beginIntent();
 
     const notifications = getNotificationCenter();
     const notificationId = notifications.loading(
@@ -863,6 +1047,7 @@ export function initFieldSelector(options) {
         FieldSource.OBS,
         state
       );
+      interactionOwner.assertIntentCurrent(intent);
       if (expectedKind === FieldKind.CATEGORY) {
         categoricalSelect.value = String(result.newFieldIndex);
         continuousSelect.value = NONE_FIELD_VALUE;
@@ -887,6 +1072,13 @@ export function initFieldSelector(options) {
         `Created "${result.newKey}"`
       );
     } catch (error) {
+      if (
+        isDatasetFieldLoadSupersededError(error)
+        || isFieldInteractionSupersededError(error)
+      ) {
+        notifications.dismiss(notificationId);
+        return;
+      }
       const exactError = requireError(error, 'Field duplication');
       console.error(exactError);
       notifications.fail(
@@ -898,6 +1090,7 @@ export function initFieldSelector(options) {
 
   geneSelector = initGeneExpressionSelector({
     state,
+    interactionOwner,
     dom: {
       geneContainer,
       geneSearch,
@@ -973,8 +1166,10 @@ export function initFieldSelector(options) {
         'Categorical annotation action references a non-categorical field'
       );
     }
+    const datasetGeneration = readDatasetGeneration();
     const enabled = readAnnotationFlag('isFieldAnnotated', field.key);
-    showConfirmDialog({
+    let releaseTransient = () => {};
+    const closeDialog = showConfirmDialog({
       title: enabled
         ? 'Disable community annotation'
         : 'Enable community annotation',
@@ -983,6 +1178,17 @@ export function initFieldSelector(options) {
         : `Enable annotation voting for "${field.key}"? You will see 🗳️ next to the field name and can click category labels to vote in a popup.`,
       confirmText: enabled ? 'Disable' : 'Enable',
       onConfirm: () => {
+        releaseTransient();
+        if (
+          !isCapturedFieldCurrent(
+            datasetGeneration,
+            FieldSource.OBS,
+            index,
+            field
+          )
+        ) {
+          return;
+        }
         const updated = requireBoolean(
           annotationSession.setFieldAnnotated(field.key, !enabled),
           'Community annotation field update'
@@ -997,8 +1203,12 @@ export function initFieldSelector(options) {
           { category: 'annotation', duration: 2400 }
         );
         renderFieldSelects();
+      },
+      onCancel: () => {
+        releaseTransient();
       }
     });
+    releaseTransient = ownTransient(closeDialog);
   }, { signal: lifecycle.signal });
 
   categoricalSelect.addEventListener('change', () => {
@@ -1149,9 +1359,18 @@ export function initFieldSelector(options) {
   categoryBuilderContainer.dataset.catBuilderInitialized = 'true';
 
   function destroy() {
-    if (destroyed) return;
+    if (destroyPromise !== null) return destroyPromise;
     destroyed = true;
+    let resolveDestruction;
+    let rejectDestruction;
+    destroyPromise = new Promise((resolve, reject) => {
+      resolveDestruction = resolve;
+      rejectDestruction = reject;
+    });
+    const interactionDestruction = interactionOwner.destroy();
+    const errors = [];
     const cleanups = [
+      () => closeTransientInteractions(),
       () => lifecycle.abort(),
       () => dataSourceManager.offDatasetChange(rerenderForExternalState),
       () => unsubscribeAccess(),
@@ -1163,7 +1382,99 @@ export function initFieldSelector(options) {
       () => geneSelector.destroy(),
       () => deletedFieldsPanel.destroy()
     ];
-    aggregateCleanup(cleanups, 'Field selector cleanup');
+    try {
+      aggregateCleanup(cleanups, 'Field selector cleanup');
+    } catch (error) {
+      errors.push(error);
+    }
+    void Promise.allSettled([interactionDestruction]).then(outcomes => {
+      for (const outcome of outcomes) {
+        if (outcome.status === 'rejected') {
+          errors.push(outcome.reason);
+        }
+      }
+      const exactErrors = [...new Set(errors)];
+      if (exactErrors.length === 0) {
+        resolveDestruction();
+      } else if (exactErrors.length === 1) {
+        rejectDestruction(exactErrors[0]);
+      } else {
+        rejectDestruction(
+          new AggregateError(
+            exactErrors,
+            'Field selector destruction failed'
+          )
+        );
+      }
+    });
+    void destroyPromise.catch(() => {});
+    return destroyPromise;
+  }
+
+  function prepareDatasetReplacement() {
+    assertAlive();
+    closeTransientInteractions();
+    interactionOwner.invalidate();
+    forceDisableFieldSelects = false;
+  }
+
+  function settleCurrentInteraction() {
+    assertAlive();
+    return interactionOwner.settleCurrent();
+  }
+
+  function settleAllInteractions() {
+    assertAlive();
+    return interactionOwner.settleAll();
+  }
+
+  async function acquireSessionOperation(retireCurrent) {
+    if (typeof retireCurrent !== 'boolean') {
+      throw new TypeError(
+        'Session field ownership requires an exact retirement choice'
+      );
+    }
+    assertAlive();
+    const releaseOwner = retireCurrent
+      ? interactionOwner.acquireRetiringSuspension()
+      : interactionOwner.acquireSuspension();
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      releaseOwner();
+      if (destroyed) return;
+      forceDisableFieldSelects = false;
+      geneSelector.updateGeneActionButtons(false);
+      syncFromState();
+      updateFieldSelectDisabledStates();
+    };
+    try {
+      closeTransientInteractions();
+      forceDisableFieldSelects = true;
+      geneSelector.updateGeneActionButtons(true);
+      updateFieldSelectDisabledStates();
+      await interactionOwner.settleAll();
+      return release;
+    } catch (error) {
+      try {
+        release();
+      } catch (releaseError) {
+        throw new AggregateError(
+          [error, releaseError],
+          'Field interaction suspension failed'
+        );
+      }
+      throw error;
+    }
+  }
+
+  function acquireSessionCaptureOperation() {
+    return acquireSessionOperation(false);
+  }
+
+  function acquireSessionRestoreOperation() {
+    return acquireSessionOperation(true);
   }
 
   function initGeneExpressionDropdown() {
@@ -1183,9 +1494,14 @@ export function initFieldSelector(options) {
   }
 
   return {
+    acquireSessionCaptureOperation,
+    acquireSessionRestoreOperation,
     destroy,
     activateField,
+    prepareDatasetReplacement,
     selectGene,
+    settleAllInteractions,
+    settleCurrentInteraction,
     syncFromState,
     renderFieldSelects,
     initGeneExpressionDropdown,

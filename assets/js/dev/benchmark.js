@@ -16,6 +16,25 @@ import { HighPerfRenderer, RendererConfig } from '../rendering/high-perf-rendere
 import { formatCellCount as formatNumber } from '../data/data-source.js';
 
 const glbBufferPromises = new Map();
+const MEBIBYTE = 1024 * 1024;
+const PRE_PUBLICATION_GPU_ESTIMATE_BYTES_PER_POINT = 28;
+
+function getExactGpuMemoryMB(rendererStats) {
+  const gpuMemoryMB = rendererStats?.gpuMemoryMB;
+  return Number.isFinite(gpuMemoryMB) && gpuMemoryMB >= 0
+    ? gpuMemoryMB
+    : null;
+}
+
+function estimatePrePublicationGpuMemoryMB(pointCount) {
+  return Number.isSafeInteger(pointCount) && pointCount >= 0
+    ? (
+      pointCount *
+      PRE_PUBLICATION_GPU_ESTIMATE_BYTES_PER_POINT /
+      MEBIBYTE
+    )
+    : null;
+}
 
 function requireSyntheticPointCount(count) {
   if (!Number.isSafeInteger(count) || count < 1) {
@@ -3386,7 +3405,7 @@ export class BottleneckAnalyzer {
             avgLodLevel: this._avg(rendererStats.map(s => s.lodLevel)),
             avgDrawCalls: this._avg(rendererStats.map(s => s.drawCalls)),
             avgCpuRenderTime: this._avg(rendererStats.map(s => s.cpuRenderTime)),
-            gpuMemoryMB: rendererStats[0]?.gpuMemoryMB || 0
+            gpuMemoryMB: getExactGpuMemoryMB(rendererStats[0])
           },
           rawFrameTimes: frameTimes
         };
@@ -3637,7 +3656,8 @@ export class BottleneckAnalyzer {
     const stats = this.renderer.getStats('benchmark');
     const gl = this.gl;
 
-    // Estimate memory usage
+    // Retain component heuristics for directional diagnostics. The renderer's
+    // managed total below is authoritative once it has been published.
     const pointCount = this.renderer._positions?.length / 3 || 0;
     const bytesPerPoint = 16; // interleaved: 12 bytes position + 4 bytes color
     const geometryMemory = pointCount * bytesPerPoint;
@@ -3651,7 +3671,17 @@ export class BottleneckAnalyzer {
     // Index buffer for frustum culling (4 bytes per point)
     const indexBufferMemory = pointCount * 4;
 
-    const totalEstimatedMemory = geometryMemory + lodMemoryEstimate + alphaTextureMemory + indexBufferMemory;
+    const heuristicGpuMemoryBytes =
+      geometryMemory +
+      lodMemoryEstimate +
+      alphaTextureMemory +
+      indexBufferMemory;
+    const reportedGpuMemoryMB = getExactGpuMemoryMB(stats);
+    const gpuMemoryEstimated = reportedGpuMemoryMB === null;
+    const totalGpuMemoryMB = gpuMemoryEstimated
+      ? heuristicGpuMemoryBytes / MEBIBYTE
+      : reportedGpuMemoryMB;
+    const totalGpuMemoryBytes = totalGpuMemoryMB * MEBIBYTE;
 
     // Get WebGL limits
     const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
@@ -3669,14 +3699,20 @@ export class BottleneckAnalyzer {
     return {
       pointCount,
       bytesPerPoint,
+      // Component estimates are retained for directional diagnostics only.
+      // The renderer owns the authoritative managed-total accounting.
       breakdown: {
-        geometryMB: geometryMemory / (1024 * 1024),
-        lodBuffersMB: lodMemoryEstimate / (1024 * 1024),
-        alphaTextureMB: alphaTextureMemory / (1024 * 1024),
-        indexBufferMB: indexBufferMemory / (1024 * 1024)
+        geometryMB: geometryMemory / MEBIBYTE,
+        lodBuffersMB: lodMemoryEstimate / MEBIBYTE,
+        alphaTextureMB: alphaTextureMemory / MEBIBYTE,
+        indexBufferMB: indexBufferMemory / MEBIBYTE
       },
-      totalEstimatedMB: totalEstimatedMemory / (1024 * 1024),
-      reportedGpuMemoryMB: stats.gpuMemoryMB,
+      breakdownEstimated: true,
+      // Preserve the established report field while making its source exact
+      // whenever the renderer has published managed GPU ownership.
+      totalEstimatedMB: totalGpuMemoryMB,
+      reportedGpuMemoryMB,
+      gpuMemoryEstimated,
       jsHeap: {
         usedMB: jsHeap,
         limitMB: jsHeapLimit,
@@ -3687,7 +3723,11 @@ export class BottleneckAnalyzer {
         maxVertexAttribs,
         maxUniformVectors
       },
-      memoryPressure: this._assessMemoryPressure(totalEstimatedMemory, jsHeap, jsHeapLimit)
+      memoryPressure: this._assessMemoryPressure(
+        totalGpuMemoryBytes,
+        jsHeap,
+        jsHeapLimit
+      )
     };
   }
 
@@ -4102,7 +4142,9 @@ export class BottleneckAnalyzer {
         category: 'Memory',
         title: 'Address memory pressure',
         actions: [
-          `Current GPU memory: ~${memoryAnalysis.totalEstimatedMB.toFixed(0)}MB`,
+          memoryAnalysis.gpuMemoryEstimated
+            ? `Estimated GPU memory: ~${memoryAnalysis.totalEstimatedMB.toFixed(0)}MB`
+            : `Managed GPU memory: ${memoryAnalysis.totalEstimatedMB.toFixed(0)}MB`,
           'Consider reducing dataset size or using streaming',
           'Clear unused buffers and textures',
           'Use more aggressive LOD to reduce active memory'
@@ -4213,7 +4255,8 @@ export class BottleneckAnalyzer {
         visiblePoints: baseline.rendererStats.avgVisiblePoints,
         lodLevel: baseline.rendererStats.avgLodLevel,
         drawCalls: baseline.rendererStats.avgDrawCalls,
-        gpuMemoryMB: memoryAnalysis.totalEstimatedMB.toFixed(1)
+        gpuMemoryMB: memoryAnalysis.totalEstimatedMB.toFixed(1),
+        gpuMemoryEstimated: memoryAnalysis.gpuMemoryEstimated
       },
       bottleneck: {
         primary: gpuAnalysis.available ? gpuAnalysis.boundBy : 'Unknown (no GPU timing)',
@@ -4428,6 +4471,9 @@ export class BottleneckAnalyzer {
     const r = this.results;
     const s = r.summary;
     const b = r.bottleneckType;
+    const gpuMemoryLabel = s.rendering.gpuMemoryEstimated
+      ? 'GPU Memory (estimate)'
+      : 'GPU Memory';
 
     const lines = [
       '╔══════════════════════════════════════════════════════════════════╗',
@@ -4444,7 +4490,7 @@ export class BottleneckAnalyzer {
       '┌─────────────────────────────────────────────────────────────────┐',
       '│ RENDERING STATS                                                │',
       '├─────────────────────────────────────────────────────────────────┤',
-      `│ Visible Points: ${this._formatNumber(s.rendering.visiblePoints).padStart(12)} │ GPU Memory: ${s.rendering.gpuMemoryMB.padStart(8)}MB │`,
+      `│ Visible Points: ${this._formatNumber(s.rendering.visiblePoints).padStart(12)} │ ${gpuMemoryLabel}: ${s.rendering.gpuMemoryMB.padStart(8)}MB │`,
       `│ LOD Level:      ${String(Math.round(s.rendering.lodLevel)).padStart(12)} │ Draw Calls: ${String(Math.round(s.rendering.drawCalls)).padStart(8)} │`,
       '└─────────────────────────────────────────────────────────────────┘',
       '',
@@ -4803,7 +4849,7 @@ export class BottleneckAnalyzer {
           <span class="metric-value">${Math.round(s.rendering.lodLevel)}</span>
         </div>
         <div class="metric-row">
-          <span class="metric-label">GPU Memory</span>
+          <span class="metric-label">GPU Memory${s.rendering.gpuMemoryEstimated ? ' (estimate)' : ''}</span>
           <span class="metric-value">${s.rendering.gpuMemoryMB}MB</span>
         </div>
         <div class="metric-row">
@@ -5976,10 +6022,17 @@ export class BenchmarkReporter {
     const frameTime = perfStats?.avgFrameTime ?? rendererStats?.lastFrameTime ?? null;
     const renderFrameMs = rendererStats?.lastFrameTime ?? null;
 
-    const estimatedMemoryMB = rendererStats?.gpuMemoryMB ??
-      (context.dataset && context.dataset.pointCount
-        ? (context.dataset.pointCount * 28) / (1024 * 1024)
-        : null);
+    const exactGpuMemoryMB = getExactGpuMemoryMB(rendererStats);
+    const prePublicationEstimateMB = exactGpuMemoryMB === null
+      ? estimatePrePublicationGpuMemoryMB(
+        context.dataset?.pointCount
+      )
+      : null;
+    const gpuMemoryMB =
+      exactGpuMemoryMB ?? prePublicationEstimateMB;
+    const gpuMemoryEstimated =
+      exactGpuMemoryMB === null &&
+      prePublicationEstimateMB !== null;
 
     return {
       fps,
@@ -5990,7 +6043,8 @@ export class BenchmarkReporter {
       rendererConfig,
       renderMode,
       viewport,
-      estimatedMemoryMB
+      gpuMemoryMB,
+      gpuMemoryEstimated
     };
   }
 
@@ -6118,16 +6172,21 @@ export class BenchmarkReporter {
     }
 
     // Memory issues
-    if (renderer.estimatedMemoryMB != null) {
-      if (renderer.estimatedMemoryMB > t.memory.critical) {
-        addIssue(S.CRITICAL, 'memory', `GPU memory ~${renderer.estimatedMemoryMB.toFixed(0)}MB exceeds safe limit`, {
-          current: renderer.estimatedMemoryMB,
+    if (renderer.gpuMemoryMB != null) {
+      const memoryDescription = renderer.gpuMemoryEstimated
+        ? `Estimated GPU memory ~${renderer.gpuMemoryMB.toFixed(0)}MB`
+        : `Managed GPU memory ${renderer.gpuMemoryMB.toFixed(0)}MB`;
+      if (renderer.gpuMemoryMB > t.memory.critical) {
+        addIssue(S.CRITICAL, 'memory', `${memoryDescription} exceeds safe limit`, {
+          current: renderer.gpuMemoryMB,
+          estimated: renderer.gpuMemoryEstimated,
           threshold: t.memory.critical,
           recommendation: 'Risk of driver eviction; reduce point count or resolution'
         });
-      } else if (renderer.estimatedMemoryMB > t.memory.warning) {
-        addIssue(S.WARNING, 'memory', `GPU memory ~${renderer.estimatedMemoryMB.toFixed(0)}MB is high`, {
-          current: renderer.estimatedMemoryMB,
+      } else if (renderer.gpuMemoryMB > t.memory.warning) {
+        addIssue(S.WARNING, 'memory', `${memoryDescription} is high`, {
+          current: renderer.gpuMemoryMB,
+          estimated: renderer.gpuMemoryEstimated,
           threshold: t.memory.warning
         });
       }
