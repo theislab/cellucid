@@ -92,6 +92,8 @@ export function createJupyterHealthMonitor({
   checkHealth,
   onFailure,
   intervalMs = 3000,
+  scheduleTimeout = globalThis.setTimeout,
+  cancelTimeout = globalThis.clearTimeout,
 }) {
   const probeHealth = requireFunction(
     checkHealth,
@@ -100,6 +102,14 @@ export function createJupyterHealthMonitor({
   const publishFailure = requireFunction(
     onFailure,
     'Jupyter health failure handler'
+  );
+  const scheduleProbeTimeout = requireFunction(
+    scheduleTimeout,
+    'Jupyter health timeout scheduler'
+  );
+  const cancelProbeTimeout = requireFunction(
+    cancelTimeout,
+    'Jupyter health timeout canceller'
   );
   if (!Number.isFinite(intervalMs) || intervalMs < 0) {
     throw new RangeError(
@@ -115,7 +125,7 @@ export function createJupyterHealthMonitor({
 
   const clearScheduledProbe = () => {
     if (timer !== null) {
-      clearTimeout(timer);
+      cancelProbeTimeout(timer);
       timer = null;
     }
   };
@@ -137,7 +147,7 @@ export function createJupyterHealthMonitor({
     ) {
       return;
     }
-    timer = setTimeout(() => {
+    timer = scheduleProbeTimeout(() => {
       timer = null;
       void runProbe(generation);
     }, intervalMs);

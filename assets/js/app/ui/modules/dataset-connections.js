@@ -213,9 +213,79 @@ export function initDatasetConnections(options) {
       'Dataset connections select must be a focusable DOM element.'
     );
   }
+  const lifecycleController = new AbortController();
+  const activeOperations = new Set();
+  const activeLoadingNotifications = new Set();
+  const connectionLossCleanups = new Set();
+  const connectionLossCleanupBySource = new Map();
+  const operationInvalidators = new Set();
+  let destroyed = false;
+  let destroyPromise = null;
+
+  function assertAlive() {
+    if (destroyed) {
+      throw createDatasetReloadSupersededError(
+        'Dataset connection controls were destroyed.'
+      );
+    }
+  }
+
+  function trackOperation(work) {
+    const promise = Promise.resolve(work);
+    activeOperations.add(promise);
+    const retire = () => activeOperations.delete(promise);
+    promise.then(retire, retire);
+    return promise;
+  }
+
+  function launchOperation(operation, label) {
+    let work;
+    try {
+      work = operation();
+    } catch (error) {
+      work = Promise.reject(error);
+    }
+    const promise = trackOperation(work);
+    void promise.catch(error => {
+      if (destroyed || isDatasetReloadSupersededError(error)) return;
+      debug.error(`[UI] ${label}:`, error);
+    });
+    return promise;
+  }
+
+  function listen(target, eventName, listener) {
+    requireMethod(target, 'addEventListener', 'Dataset connection control');
+    const guardedListener = (...args) => {
+      if (destroyed) return;
+      return listener(...args);
+    };
+    target.addEventListener(eventName, guardedListener, {
+      signal: lifecycleController.signal
+    });
+  }
+
+  function beginLoadingNotification(message, options) {
+    assertAlive();
+    const id = notifications.loading(message, options);
+    activeLoadingNotifications.add(id);
+    return id;
+  }
+
+  function settleLoadingNotification(method, id, message) {
+    if (destroyed) return;
+    activeLoadingNotifications.delete(id);
+    notifications[method](id, message);
+  }
+
+  function detachConnectionLoss(source) {
+    const cleanup = connectionLossCleanupBySource.get(source);
+    if (cleanup !== undefined) cleanup();
+  }
 
   async function populate() {
+    assertAlive();
     const outcome = await populateDatasetDropdown();
+    assertAlive();
     if (!isPlainObject(outcome)) {
       throw new TypeError(
         'Dataset catalog population must publish one exact outcome.'
@@ -253,6 +323,12 @@ export function initDatasetConnections(options) {
   }
 
   let localSelectionRevision = 0;
+  operationInvalidators.add(() => {
+    localSelectionRevision =
+      localSelectionRevision === Number.MAX_SAFE_INTEGER
+        ? 1
+        : localSelectionRevision + 1;
+  });
   async function loadLocalUserSelection(
     files,
     { loadMethod, loadingMessage, load }
@@ -260,7 +336,10 @@ export function initDatasetConnections(options) {
     if (!files || files.length === 0) return;
     const selectionRevision = ++localSelectionRevision;
     const assertCurrentSelection = () => {
-      if (selectionRevision !== localSelectionRevision) {
+      if (
+        destroyed ||
+        selectionRevision !== localSelectionRevision
+      ) {
         throw createDatasetReloadSupersededError(
           'Local dataset selection was superseded.'
         );
@@ -298,7 +377,7 @@ export function initDatasetConnections(options) {
       );
     }
 
-    const loadNotifId = notifications.loading(loadingMessage, {
+    const loadNotifId = beginLoadingNotification(loadingMessage, {
       category: 'data'
     });
     let candidatePublished = false;
@@ -325,19 +404,31 @@ export function initDatasetConnections(options) {
       candidatePublished = true;
       await populate();
       assertCurrentSelection();
-      notifications.complete(
+      settleLoadingNotification(
+        'complete',
         loadNotifId,
         `User data ready: ${formatDataNumber(metadata.stats.n_cells)} cells`
       );
     } catch (error) {
+      if (destroyed) {
+        const adopted =
+          dataSourceManager.getSource('local-user') === userSource;
+        if (!candidatePublished && !adopted) userSource.disconnect();
+        return;
+      }
       if (isDatasetReloadSupersededError(error)) {
         if (!candidatePublished) userSource.disconnect();
+        activeLoadingNotifications.delete(loadNotifId);
         notifications.dismiss(loadNotifId);
         return;
       }
       if (!candidatePublished) userSource.disconnect();
       debug.error('[UI] Failed to load user data:', error);
-      notifications.fail(loadNotifId, errorMessage(error));
+      settleLoadingNotification(
+        'fail',
+        loadNotifId,
+        errorMessage(error)
+      );
     }
   }
 
@@ -359,35 +450,41 @@ export function initDatasetConnections(options) {
 
   if (localPrepared !== null) {
     const { userDataBrowseBtn, userDataFileInput } = localPrepared;
-    userDataBrowseBtn.addEventListener(
+    listen(
+      userDataBrowseBtn,
       'click',
       () => userDataFileInput.click()
     );
-    userDataFileInput.addEventListener('change', async event => {
-      await loadLocalUserSelection(event.target.files, {
-        loadMethod: DATA_LOAD_METHODS.LOCAL_PREPARED,
-        loadingMessage: 'Loading prepared dataset...',
-        load: (source, files) => source.loadFromPreparedDirectory(files)
-      });
-      userDataFileInput.value = '';
+    listen(userDataFileInput, 'change', event => {
+      return launchOperation(async () => {
+        await loadLocalUserSelection(event.target.files, {
+          loadMethod: DATA_LOAD_METHODS.LOCAL_PREPARED,
+          loadingMessage: 'Loading prepared dataset...',
+          load: (source, files) => source.loadFromPreparedDirectory(files)
+        });
+        if (!destroyed) userDataFileInput.value = '';
+      }, 'Prepared-directory selection failed');
     });
   }
   if (localH5ad !== null) {
     const { userDataH5adBtn, userDataH5adInput } = localH5ad;
-    userDataH5adBtn.addEventListener(
+    listen(
+      userDataH5adBtn,
       'click',
       () => userDataH5adInput.click()
     );
-    userDataH5adInput.addEventListener('change', async event => {
-      await loadLocalUserSelection(event.target.files, {
-        loadMethod: DATA_LOAD_METHODS.LOCAL_H5AD,
-        loadingMessage: 'Loading h5ad file...',
-        load: (source, files) =>
-          source.loadFromH5adFile(
-            files.length === 1 ? files[0] : null
-          )
-      });
-      userDataH5adInput.value = '';
+    listen(userDataH5adInput, 'change', event => {
+      return launchOperation(async () => {
+        await loadLocalUserSelection(event.target.files, {
+          loadMethod: DATA_LOAD_METHODS.LOCAL_H5AD,
+          loadingMessage: 'Loading h5ad file...',
+          load: (source, files) =>
+            source.loadFromH5adFile(
+              files.length === 1 ? files[0] : null
+            )
+        });
+        if (!destroyed) userDataH5adInput.value = '';
+      }, 'H5AD selection failed');
     });
   }
   if (localZarr !== null) {
@@ -395,20 +492,23 @@ export function initDatasetConnections(options) {
       userDataZarrArchiveBtn,
       userDataZarrArchiveInput
     } = localZarr;
-    userDataZarrArchiveBtn.addEventListener(
+    listen(
+      userDataZarrArchiveBtn,
       'click',
       () => userDataZarrArchiveInput.click()
     );
-    userDataZarrArchiveInput.addEventListener('change', async event => {
-      await loadLocalUserSelection(event.target.files, {
-        loadMethod: DATA_LOAD_METHODS.LOCAL_ZARR_ZIP,
-        loadingMessage: 'Loading Zarr ZIP archive...',
-        load: (source, files) =>
-          source.loadFromZarrArchive(
-            files.length === 1 ? files[0] : null
-          )
-      });
-      userDataZarrArchiveInput.value = '';
+    listen(userDataZarrArchiveInput, 'change', event => {
+      return launchOperation(async () => {
+        await loadLocalUserSelection(event.target.files, {
+          loadMethod: DATA_LOAD_METHODS.LOCAL_ZARR_ZIP,
+          loadingMessage: 'Loading Zarr ZIP archive...',
+          load: (source, files) =>
+            source.loadFromZarrArchive(
+              files.length === 1 ? files[0] : null
+            )
+        });
+        if (!destroyed) userDataZarrArchiveInput.value = '';
+      }, 'Zarr ZIP selection failed');
     });
   }
 
@@ -429,9 +529,15 @@ export function initDatasetConnections(options) {
     );
     let recoveryBlocked = false;
     let operationRevision = 0;
+    operationInvalidators.add(() => {
+      operationRevision =
+        operationRevision === Number.MAX_SAFE_INTEGER
+          ? 1
+          : operationRevision + 1;
+    });
 
     function assertCurrentOperation(revision) {
-      if (revision !== operationRevision) {
+      if (destroyed || revision !== operationRevision) {
         throw createDatasetReloadSupersededError(
           `${inputLabel} operation was superseded.`
         );
@@ -457,6 +563,7 @@ export function initDatasetConnections(options) {
     }
 
     function updateConnectionUI(connected) {
+      assertAlive();
       if (typeof connected !== 'boolean') {
         throw new TypeError(
           `${inputLabel} UI state must be a boolean.`
@@ -481,10 +588,12 @@ export function initDatasetConnections(options) {
       );
     }
 
-    async function restorePriorSource(priorSource, candidate) {
+    async function restorePriorSource(priorSource, candidate, revision) {
+      assertCurrentOperation(revision);
       if (dataSourceManager.getSource(sourceType) === candidate) {
         dataSourceManager.registerSource(sourceType, priorSource);
         await populate();
+        assertCurrentOperation(revision);
       }
       source = priorSource;
       updateConnectionUI(sourceConnected(priorSource));
@@ -502,9 +611,11 @@ export function initDatasetConnections(options) {
         await populate();
         assertCurrentOperation(revision);
       } catch (error) {
+        if (destroyed) throw error;
         if (dataSourceManager.getSource(sourceType) === candidate) {
           dataSourceManager.registerSource(sourceType, priorSource);
           await populate();
+          assertCurrentOperation(revision);
         }
         throw error;
       }
@@ -514,6 +625,7 @@ export function initDatasetConnections(options) {
       datasetSelect.focus();
       let cleanupError = null;
       try {
+        detachConnectionLoss(priorSource);
         priorSource.disconnect();
       } catch (error) {
         cleanupError = error;
@@ -553,6 +665,7 @@ export function initDatasetConnections(options) {
       }
 
       assertCurrentOperation(revision);
+      detachConnectionLoss(lostSource);
       lostSource.disconnect();
       dataSourceManager.unregisterSource(sourceType);
       const disconnectedSource = lostSource.createConnectionCandidate();
@@ -580,15 +693,23 @@ export function initDatasetConnections(options) {
 
     function attachConnectionLoss(candidate) {
       if (sourceType !== 'remote') return;
+      if (connectionLossCleanupBySource.has(candidate)) return;
       requireMethod(
         candidate,
         'onConnectionLost',
         'Remote connection source'
       );
-      candidate.onConnectionLost(error => {
-        void recoverConnectionLoss(candidate, error).catch(
-          recoveryError => {
-            if (isDatasetReloadSupersededError(recoveryError)) return;
+      const handleConnectionLost = error => {
+        launchOperation(async () => {
+          try {
+            await recoverConnectionLoss(candidate, error);
+          } catch (recoveryError) {
+            if (
+              destroyed ||
+              isDatasetReloadSupersededError(recoveryError)
+            ) {
+              return;
+            }
             recoveryBlocked = true;
             connectButton.disabled = true;
             disconnectButton.disabled = true;
@@ -603,13 +724,23 @@ export function initDatasetConnections(options) {
               }
             );
           }
-        );
-      });
+        }, 'Remote connection recovery rejected');
+      };
+      candidate.onConnectionLost(handleConnectionLost);
+      const cleanup = () => {
+        if (typeof candidate.offConnectionLost === 'function') {
+          candidate.offConnectionLost(handleConnectionLost);
+        }
+        connectionLossCleanupBySource.delete(candidate);
+        connectionLossCleanups.delete(cleanup);
+      };
+      connectionLossCleanupBySource.set(candidate, cleanup);
+      connectionLossCleanups.add(cleanup);
     }
 
     attachConnectionLoss(source);
 
-    connectButton.addEventListener('click', async () => {
+    async function handleConnectClick() {
       if (dataSourceManager.getCurrentSourceType() === sourceType) {
         notifications.error(
           `${inputLabel} is the active dataset source. Disconnect it before reconnecting.`,
@@ -628,7 +759,7 @@ export function initDatasetConnections(options) {
 
       const priorSource = source;
       const revision = ++operationRevision;
-      const connectNotifId = notifications.loading(
+      const connectNotifId = beginLoadingNotification(
         `Connecting to ${inputLabel}: ${inputValue}...`,
         { category: 'connectivity' }
       );
@@ -647,6 +778,7 @@ export function initDatasetConnections(options) {
         }
         candidateDisconnectAttempted = true;
         try {
+          detachConnectionLoss(candidate);
           candidate.disconnect();
           return null;
         } catch (error) {
@@ -676,7 +808,8 @@ export function initDatasetConnections(options) {
           const cleanupError = disconnectCandidateOnce();
           if (cleanupError !== null) throw cleanupError;
           updateConnectionUI(sourceConnected(priorSource));
-          notifications.fail(
+          settleLoadingNotification(
+            'fail',
             connectNotifId,
             `Connected ${inputLabel} has no datasets. Add a valid export and reconnect.`
           );
@@ -707,9 +840,11 @@ export function initDatasetConnections(options) {
           source = candidate;
           updateConnectionUI(true);
           candidatePublished = true;
+          detachConnectionLoss(priorSource);
           await populate();
           assertCurrentOperation(revision);
-          notifications.complete(
+          settleLoadingNotification(
+            'complete',
             connectNotifId,
             `Connected - dataset "${datasets[0].name}" loaded`
           );
@@ -724,7 +859,8 @@ export function initDatasetConnections(options) {
         );
         candidatePublished = true;
         if (adoption.cleanupError !== null) {
-          notifications.fail(
+          settleLoadingNotification(
+            'fail',
             connectNotifId,
             `Connected - ${adoption.count} datasets found, but the prior ` +
             `connection could not be released: ` +
@@ -732,11 +868,23 @@ export function initDatasetConnections(options) {
           );
           return;
         }
-        notifications.complete(
+        settleLoadingNotification(
+          'complete',
           connectNotifId,
           `Connected - ${adoption.count} datasets found. Choose one from Sample datasets.`
         );
       } catch (error) {
+        if (destroyed) {
+          if (
+            candidate !== null &&
+            dataSourceManager.getSource(sourceType) === candidate
+          ) {
+            candidatePublished = true;
+            source = candidate;
+          }
+          disconnectCandidateOnce();
+          return;
+        }
         if (
           !candidatePublished &&
           candidate !== null &&
@@ -748,7 +896,8 @@ export function initDatasetConnections(options) {
           updateConnectionUI(true);
         }
         if (candidatePublished) {
-          notifications.fail(
+          settleLoadingNotification(
+            'fail',
             connectNotifId,
             `Dataset loaded, but the catalog could not be refreshed: ` +
             `${errorMessage(error)}`
@@ -768,7 +917,11 @@ export function initDatasetConnections(options) {
               dataSourceManager.getCurrentSourceType() !== sourceType
             ) {
               try {
-                await restorePriorSource(priorSource, candidate);
+                await restorePriorSource(
+                  priorSource,
+                  candidate,
+                  revision
+                );
               } catch (restorationError) {
                 failureErrors.push(restorationError);
               }
@@ -781,6 +934,7 @@ export function initDatasetConnections(options) {
           isDatasetReloadSupersededError(error) &&
           failureErrors.length === 1
         ) {
+          activeLoadingNotifications.delete(connectNotifId);
           notifications.dismiss(connectNotifId);
           return;
         }
@@ -795,19 +949,30 @@ export function initDatasetConnections(options) {
               failureErrors,
               `${inputLabel} connection recovery failed.`
             );
-        notifications.fail(
+        settleLoadingNotification(
+          'fail',
           connectNotifId,
           `Connection failed: ${errorMessage(exactError)}`
         );
         debug.error(`[UI] ${inputLabel} connection error:`, exactError);
       } finally {
-        if (revision === operationRevision && !recoveryBlocked) {
+        if (
+          !destroyed &&
+          revision === operationRevision &&
+          !recoveryBlocked
+        ) {
           connectButton.disabled = false;
         }
       }
+    }
+    listen(connectButton, 'click', () => {
+      return launchOperation(
+        handleConnectClick,
+        `${inputLabel} connection handler rejected`
+      );
     });
 
-    disconnectButton.addEventListener('click', async () => {
+    async function handleDisconnectClick() {
       const revision = ++operationRevision;
       const connectedSource = source;
       connectButton.disabled = true;
@@ -839,6 +1004,7 @@ export function initDatasetConnections(options) {
           sourceType,
           `${inputLabel} disconnected replacement`
         );
+        detachConnectionLoss(connectedSource);
         connectedSource.disconnect();
         dataSourceManager.unregisterSource(sourceType);
         dataSourceManager.registerSource(sourceType, disconnectedSource);
@@ -850,6 +1016,7 @@ export function initDatasetConnections(options) {
           category: 'connectivity'
         });
       } catch (error) {
+        if (destroyed) return;
         if (isDatasetReloadSupersededError(error)) return;
         recoveryBlocked = true;
         connectButton.disabled = true;
@@ -866,11 +1033,21 @@ export function initDatasetConnections(options) {
         );
         debug.error(`[UI] ${inputLabel} disconnect error:`, error);
       } finally {
-        if (revision === operationRevision && !recoveryBlocked) {
+        if (
+          !destroyed &&
+          revision === operationRevision &&
+          !recoveryBlocked
+        ) {
           connectButton.disabled = false;
           disconnectButton.disabled = false;
         }
       }
+    }
+    listen(disconnectButton, 'click', () => {
+      return launchOperation(
+        handleDisconnectClick,
+        `${inputLabel} disconnect handler rejected`
+      );
     });
 
     const initialConnected = sourceConnected(source);
@@ -929,4 +1106,52 @@ export function initDatasetConnections(options) {
       sourceType: 'github-repo'
     });
   }
+
+  function destroy() {
+    if (destroyPromise !== null) return destroyPromise;
+    destroyed = true;
+    const cleanupErrors = [];
+    try {
+      lifecycleController.abort();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    for (const invalidate of operationInvalidators) {
+      try {
+        invalidate();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+    operationInvalidators.clear();
+    for (const cleanup of [...connectionLossCleanups]) {
+      try {
+        cleanup();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+    for (const id of activeLoadingNotifications) {
+      try {
+        notifications.dismiss(id);
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+    activeLoadingNotifications.clear();
+    destroyPromise = Promise.allSettled(
+      [...activeOperations]
+    ).then(() => {
+      if (cleanupErrors.length === 1) throw cleanupErrors[0];
+      if (cleanupErrors.length > 1) {
+        throw new AggregateError(
+          cleanupErrors,
+          'Dataset connection controls could not release every owner.'
+        );
+      }
+    });
+    return destroyPromise;
+  }
+
+  return Object.freeze({ destroy });
 }

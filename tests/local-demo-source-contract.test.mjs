@@ -1003,7 +1003,9 @@ test('single-dimension adoption publishes the exact selector option', t => {
     getViewDimensionLevel() {
       return activeDimension;
     },
-    on() {},
+    on() {
+      return () => {};
+    },
     async setDimensionLevel() {},
   };
   const dimensionControls = Object.assign(new FakeHTMLElement(), {

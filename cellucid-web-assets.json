@@ -802,8 +802,8 @@
     },
     {
       "path": "assets/js/app/analysis/shared/dom-utils.js",
-      "sha256": "c7f084ff1b1bec49dd8a628f64f7d2c8b0e71ed2a1f7787e96b97fa6e9b68a83",
-      "bytes": 32184,
+      "sha256": "fe531753698129aa230a8aeb5ef248907ce3262a6fa7b7da0466b9b7a2519f29",
+      "bytes": 32450,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -1270,14 +1270,14 @@
     },
     {
       "path": "assets/js/app/jupyter-pointer-delivery.js",
-      "sha256": "52c2dcefc8b118e86305a35edc98d1a9354628edb2c509592ffa72be3912f573",
-      "bytes": 10360,
+      "sha256": "6a2f64755a97d5f873d21d22983ff99dafd6f9622626405bf74836532f27fcbf",
+      "bytes": 10684,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
       "path": "assets/js/app/main.js",
-      "sha256": "8baaae0e3404d46411a223c5661bb4f153145421ceaaf52411adc9318ed0e288",
-      "bytes": 160627,
+      "sha256": "3d348d95419d36a53646a3e129648bb7f5ec5ccce3103b106fd64a62e703ab35",
+      "bytes": 161117,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -1510,8 +1510,8 @@
     },
     {
       "path": "assets/js/app/state-serializer/multiview.js",
-      "sha256": "2bdcbc89a4c466443809ac816e0420f8b9cbd18b092ebb3b602316eb4305dcb6",
-      "bytes": 9639,
+      "sha256": "a00a3853731b3b9647023aa6e58fc3c200ecd4b7362990574049bfa26fabb3af",
+      "bytes": 13815,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -1618,8 +1618,8 @@
     },
     {
       "path": "assets/js/app/state/managers/view-context-core.js",
-      "sha256": "e9ef3d29784ab6858e0b8e28b08e3ccee8a2b44c1ddc0c0d8f3c29ce4bec5e27",
-      "bytes": 16051,
+      "sha256": "29be29e0c9c708c750dd591b581e90d5475338b22a347406aaa7a6754b715e2e",
+      "bytes": 26124,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -1630,8 +1630,8 @@
     },
     {
       "path": "assets/js/app/state/managers/view-manager.js",
-      "sha256": "49578f69e56a1e1543f85a9c003b2c3a2a610e61ca2082a83e00955798b83e43",
-      "bytes": 25318,
+      "sha256": "1e01ff2197be0f04fb84773ae4dc6e533dd0d973b1f6dada3824a16e22c42a71",
+      "bytes": 28787,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -1726,8 +1726,8 @@
     },
     {
       "path": "assets/js/app/ui/core/ui-coordinator.js",
-      "sha256": "96c4275874510a3aa668df73819237bbe00942ade013ade4e84814bc524ac8a0",
-      "bytes": 12029,
+      "sha256": "a3c7f70cc5026c1bb20dbe6863a4c549318438e90a82acba94657d5c0300efaf",
+      "bytes": 19524,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -1738,8 +1738,8 @@
     },
     {
       "path": "assets/js/app/ui/modules/camera-controls.js",
-      "sha256": "1e4a7aaaae9d616c288d91c289340f9591226b44e1df3054231f6aaa810f3b20",
-      "bytes": 9503,
+      "sha256": "0da6a4289e9438a5d6f996f29ef881723fa09095fab77ba910c4403cb235422c",
+      "bytes": 11666,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -1750,8 +1750,8 @@
     },
     {
       "path": "assets/js/app/ui/modules/cinematic-camera/index.js",
-      "sha256": "65de1c6bd8c83b40404fa57c90417eb892ffccae77d2cf8aef03c0bddd588ec1",
-      "bytes": 33643,
+      "sha256": "72065da8c5a62245d933730fbd762554366d0adce39d931934fa91dccd8e23b1",
+      "bytes": 36041,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -1768,8 +1768,8 @@
     },
     {
       "path": "assets/js/app/ui/modules/cinematic-camera/playback-controller.js",
-      "sha256": "2a8077e78d64bf8513f94f7d512c469aa657b645f8f8ce7c1eead52b88f43453",
-      "bytes": 8817,
+      "sha256": "03aff025e215b0df32a98ebeeb6c110f44a883fb99f8515158ae2e582ad4f43e",
+      "bytes": 9750,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -1804,20 +1804,20 @@
     },
     {
       "path": "assets/js/app/ui/modules/dataset-connections.js",
-      "sha256": "e18d6f6e864455c58f8b99e27e394291192ea4ab437dc14d98480653e7ae947a",
-      "bytes": 28528,
+      "sha256": "699b50f6a3d0b6a3e3d7bf276c9677ea05842147f29772d8c5c65d1fbce7fa09",
+      "bytes": 34959,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
       "path": "assets/js/app/ui/modules/dataset-controls.js",
-      "sha256": "a0ef136ab9415fae0acde8618eeecb550623a17541fe4a7c3c4166586ebce675",
-      "bytes": 33574,
+      "sha256": "0072559c7f8a15eed5f801d7c0a8b5ad70334c17b1e33faf30e6fb48589b8d22",
+      "bytes": 36746,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
       "path": "assets/js/app/ui/modules/dimension-controls.js",
-      "sha256": "029e96093f99c6394ec6590a798c84fd59a50f86f00ff94537073b150f10b0bb",
-      "bytes": 6467,
+      "sha256": "de1fd3152ed401648fc5d1f78ce14e0f24e6c59c9af8664d46fe220c41449b25",
+      "bytes": 9929,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -1900,8 +1900,8 @@
     },
     {
       "path": "assets/js/app/ui/modules/figure-export/figure-export-ui.js",
-      "sha256": "2ea6337591d1c752899e968290745c96351026f68beb9e6a25b8bdd5cdb50453",
-      "bytes": 113625,
+      "sha256": "d6251afda9f3159e29330e6b0c58ae68f1d1e769021c624dc25693d198601acb",
+      "bytes": 114280,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2026,26 +2026,26 @@
     },
     {
       "path": "assets/js/app/ui/modules/filter-controls.js",
-      "sha256": "7d8ee90643fbf713950d55514720c736752428249b051f4a8b01a24e2a029496",
-      "bytes": 3882,
+      "sha256": "e3f1b4ba2b3c4f8ed342bab50ad23f0e8f4877e0d6b492050136e9fa2596290e",
+      "bytes": 4407,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
       "path": "assets/js/app/ui/modules/highlight-controls.js",
-      "sha256": "b28a515b03b2f35889aee059ff6058c103c71f113204043549d1c7c5c25d300b",
-      "bytes": 5131,
+      "sha256": "c1a64e5b13418d0e75a59a0a606323be1691c866170aaf631b37dad1a0660e1f",
+      "bytes": 6457,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
       "path": "assets/js/app/ui/modules/highlight/annotation-selection.js",
-      "sha256": "92b1a7dc636d1bf1e619f91c9af3d39330ee06351743c6b7522d359e72523570",
-      "bytes": 19067,
+      "sha256": "26b5206376538ab7d5bbce03ed295450eff905de84424f5549250003a538d397",
+      "bytes": 20650,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
       "path": "assets/js/app/ui/modules/highlight/continuous-selection-preview.js",
-      "sha256": "996b243b3536ee47a02623e0885ceadc7b7439675bb8265ed0c609091b91edd6",
-      "bytes": 4736,
+      "sha256": "8f11d9784f1eea286b27488d97d1bf12938c500d77034689d172c217b73f8156",
+      "bytes": 5453,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2056,32 +2056,32 @@
     },
     {
       "path": "assets/js/app/ui/modules/highlight/highlight-pages-ui.js",
-      "sha256": "50cd7f05dd7e8e1c83131fc478295717f38144cc6c63328a2bba441c6367f2cf",
-      "bytes": 25387,
+      "sha256": "b26b616b247125514fcb3b36e823c709883b9978478419a5a9c657027d205dcf",
+      "bytes": 26376,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
       "path": "assets/js/app/ui/modules/highlight/highlight-selection-tools.js",
-      "sha256": "3086665cf103959387cb6ff58651812ef280c417c8a686ee02e1c5fbe9c71630",
-      "bytes": 5651,
+      "sha256": "f8aa03fcd77a6fc0d90d432deeddac567eba558b5f88db8f57a0a9264c7069bf",
+      "bytes": 6976,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
       "path": "assets/js/app/ui/modules/highlight/highlight-summary-ui.js",
-      "sha256": "b6ab9659ebdd7b1a9c7cf99a44dc21038a4ac42f94a3d4df9066f7c9f64bd884",
-      "bytes": 5076,
+      "sha256": "8ba18724f8fe71d60e9f68a1e6e396a8031edd3c7b415aecd41ce4d4985e81e4",
+      "bytes": 5481,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
       "path": "assets/js/app/ui/modules/highlight/knn-selection.js",
-      "sha256": "4b59e28285e532abc317a0fa780a37217b357c73b6c34f074b97c05e8b8fdca1",
-      "bytes": 12366,
+      "sha256": "4dc457fb5cc976a0bc25ffcc985e174d041687be2ebe3fd3aac8065311e8977a",
+      "bytes": 14083,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
       "path": "assets/js/app/ui/modules/highlight/lasso-selection.js",
-      "sha256": "fb6999d4a434aeddfd68336219cc7242687100d30b2c45b93d773446947a3235",
-      "bytes": 12246,
+      "sha256": "16431eef9dd389885bc54ffa0b292efe9ca9375b39d1cdf659e001857bdd4428",
+      "bytes": 13971,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2092,14 +2092,14 @@
     },
     {
       "path": "assets/js/app/ui/modules/highlight/mode-ui.js",
-      "sha256": "ca6fc82615f1f45700baa7a401aa9cabca5d70dc0174aea8626a836451fe30cb",
-      "bytes": 5040,
+      "sha256": "9941cf3b0e145a2528a2d003b086baadcab421e5a0176ea3c3f411d9e812418f",
+      "bytes": 5947,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
       "path": "assets/js/app/ui/modules/highlight/proximity-selection.js",
-      "sha256": "cbe5ec527bb9c911915bfc7b2f500b74782f5c17e310953840dd274b39d9c593",
-      "bytes": 13338,
+      "sha256": "9c38f86960fb77a049386dc12c7022198336a3295229a80881ae7cc58d3e451f",
+      "bytes": 15079,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2116,14 +2116,14 @@
     },
     {
       "path": "assets/js/app/ui/modules/highlight/selection-sync.js",
-      "sha256": "d99128dd60e47fe11ae911ed4a6d81290e7bec073b89bacba6526ec09e5665bb",
-      "bytes": 2513,
+      "sha256": "848bcd8f36236255359cd63389ce7c46e1c6849a3e56ebc8df8b5f69fb0842ef",
+      "bytes": 3088,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
       "path": "assets/js/app/ui/modules/legend-renderer.js",
-      "sha256": "366f7113235c2b7dccbd97e9e5f0b690d64c3f61ac83450d2fa620f5c1dc2e3a",
-      "bytes": 20024,
+      "sha256": "1a9331a55cf41ffdb29530036fdb13f37f4250042af4d834c5c94c9c98e55e3c",
+      "bytes": 21623,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2134,20 +2134,20 @@
     },
     {
       "path": "assets/js/app/ui/modules/render-controls.js",
-      "sha256": "efd4163731b25ab254ea1bc76f52c474d6949f13bc6d01cc9f7f88192aa59815",
-      "bytes": 27971,
+      "sha256": "56b39d70f34bb053ee4c98da32896d1da357990f1f8464e5387fc1d6653368a5",
+      "bytes": 29358,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
       "path": "assets/js/app/ui/modules/session-controls.js",
-      "sha256": "0acc73acb3500d664fbc0371a4c14576ab9b38b6295ed4a37788253a3ab69f2a",
-      "bytes": 1942,
+      "sha256": "a4d378459900f98fd5a96e46729574243b4997c55f1c6cb9c00457708dfd16d1",
+      "bytes": 3635,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
       "path": "assets/js/app/ui/modules/sidebar-controls.js",
-      "sha256": "4eb01d56d9c22d6e6ee4bbdeb9547b0e97894d74621264a6fccef99fbd42e5a2",
-      "bytes": 6295,
+      "sha256": "75117aeae7ada06a76e122bac3cc48295c564aab68b03abf334a59f9711e9f7a",
+      "bytes": 7385,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2158,20 +2158,20 @@
     },
     {
       "path": "assets/js/app/ui/modules/velocity-overlay-controls.js",
-      "sha256": "573bede02a1e3d47073b8dcee70592c87d3d82b2ed1d5647cb34bc170504e2c9",
-      "bytes": 37423,
+      "sha256": "22887676b734c1af174aef1249baba44be69ed9627545443de05a563d2083623",
+      "bytes": 40893,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
       "path": "assets/js/app/ui/modules/view-controls.js",
-      "sha256": "ffe8077100900c7b269e530a57c97f8cabc7e8b66a835e6540e33474def61506",
-      "bytes": 36794,
+      "sha256": "13f17da33c21d4c3eb38eb72b90a211bc2f5157096287ba0a7a889c207ee76ce",
+      "bytes": 40001,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
       "path": "assets/js/app/ui/modules/visualization-reset.js",
-      "sha256": "883b52156db731fe319bc6810805730e8d8da29b2fc67d4016d0781bb50a413c",
-      "bytes": 16634,
+      "sha256": "e2a3a35e07ce6dc6c06c5deaeb2a335d97840baf6f68568bf460ff7acc28c951",
+      "bytes": 17106,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2274,6 +2274,12 @@
       "path": "assets/js/app/utils/state-validator.js",
       "sha256": "4006838199965bc5397114ba20e2c8a1cd9a3b54d1422ad3f0a733f1fddd700b",
       "bytes": 8266,
+      "content_type": "application/javascript; charset=utf-8"
+    },
+    {
+      "path": "assets/js/app/view-snapshot-publication.js",
+      "sha256": "76c187a29926883c965d0577d9f201c65b34993dc629b3b0a1c1f5847cc8e441",
+      "bytes": 9574,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2541,6 +2547,12 @@
       "content_type": "application/javascript; charset=utf-8"
     },
     {
+      "path": "assets/js/rendering/presented-camera-settlement.js",
+      "sha256": "06f30e92417de0c9f9ff56f5694d79a3a2ec47affac27560213671daa5d88d5e",
+      "bytes": 2748,
+      "content_type": "application/javascript; charset=utf-8"
+    },
+    {
       "path": "assets/js/rendering/projectiles.js",
       "sha256": "10ee16d47b3fda914f440ede544d43e5a071206749b83175ad9b0673fb98bb03",
       "bytes": 39138,
@@ -2620,8 +2632,8 @@
     },
     {
       "path": "assets/js/rendering/viewer.js",
-      "sha256": "1ae197e41fdbca6fcdcc67d46fe1b71a018e6ff1f5f26edccc3482ddf6ec8369",
-      "bytes": 415982,
+      "sha256": "e2c5b4c15b61209fd03a2f2c016886ed84e062940d62b96b7d3e113769a9e49a",
+      "bytes": 416039,
       "content_type": "application/javascript; charset=utf-8"
     },
     {

@@ -85,8 +85,28 @@ export function initKnnSelection(options) {
     'KNN selection document',
     ['createElement', 'getElementById']
   );
+  const lifecycleController = new AbortController();
+  const pendingDeliveries = new Set();
+  let destroyed = false;
+  let destructionPromise = null;
+
+  function listen(target, eventName, listener) {
+    target.addEventListener(eventName, (...args) => {
+      if (destroyed) return;
+      listener(...args);
+    }, { signal: lifecycleController.signal });
+  }
+
+  function trackDelivery(delivery) {
+    pendingDeliveries.add(delivery);
+    void delivery.then(
+      () => pendingDeliveries.delete(delivery),
+      () => pendingDeliveries.delete(delivery)
+    );
+  }
 
   function handleKnnSelection(knnEvent) {
+    if (destroyed) return;
     requireCompletedSelectionEvent(knnEvent, 'knn');
 
     const stepsLabel = knnEvent.steps > 1 ? ` (${knnEvent.steps} selections)` : '';
@@ -103,12 +123,14 @@ export function initKnnSelection(options) {
     );
 
     debug.log(`[UI] KNN selected ${knnEvent.cellCount} cells from ${knnEvent.steps} selection(s)`);
-    void deliverSelectionToJupyter({
+    trackDelivery(deliverSelectionToJupyter({
       jupyterSource,
       cellIndices: knnEvent.cellIndices,
       source: 'knn',
-      onFailure: error => showSelectionDeliveryFailure(error, 'knn')
-    });
+      onFailure: error => {
+        if (!destroyed) showSelectionDeliveryFailure(error, 'knn');
+      }
+    }));
 
     selectionState.knnHistory = [];
     selectionState.knnRedoStack = [];
@@ -118,6 +140,7 @@ export function initKnnSelection(options) {
   }
 
   function handleKnnStep(stepEvent) {
+    if (destroyed) return;
     requireSelectionStepEvent(
       stepEvent,
       'knn',
@@ -165,6 +188,7 @@ export function initKnnSelection(options) {
   }
 
   function handleKnnUndo() {
+    if (destroyed) return;
     if (selectionState.knnHistory.length === 0) return;
 
     selectionState.knnRedoStack.push({
@@ -192,6 +216,7 @@ export function initKnnSelection(options) {
   }
 
   function handleKnnRedo() {
+    if (destroyed) return;
     if (selectionState.knnRedoStack.length === 0) return;
 
     selectionState.knnHistory.push({
@@ -219,6 +244,7 @@ export function initKnnSelection(options) {
   }
 
   function handleKnnPreview(previewEvent) {
+    if (destroyed) return;
     requireSelectionPreviewEvent(
       previewEvent,
       'knn',
@@ -280,13 +306,13 @@ export function initKnnSelection(options) {
       ['addEventListener']
     );
     if (created) {
-      undoButton.addEventListener('click', handleKnnUndo);
-      redoButton.addEventListener('click', handleKnnRedo);
-      confirmButton.addEventListener('click', () => {
+      listen(undoButton, 'click', handleKnnUndo);
+      listen(redoButton, 'click', handleKnnRedo);
+      listen(confirmButton, 'click', () => {
         viewer.confirmKnnSelection();
         state.clearPreviewHighlight();
       });
-      cancelButton.addEventListener('click', () => {
+      listen(cancelButton, 'click', () => {
         viewer.cancelKnnSelection();
       });
     }
@@ -294,6 +320,7 @@ export function initKnnSelection(options) {
   }
 
   function updateKnnUI(stepEvent) {
+    if (destroyed) return;
     if (!stepEvent || (stepEvent.step === 0 && !stepEvent.keepControls)) {
       highlightModeDescriptionEl.innerHTML = HIGHLIGHT_MODE_COPY.knn;
       const existingControls = documentOwner.getElementById('knn-step-controls');
@@ -339,6 +366,7 @@ export function initKnnSelection(options) {
   }
 
   function restoreKnnSelection(unifiedState) {
+    if (destroyed) return;
     requireUnifiedSelectionState(unifiedState);
     selectionState.knnHistory = [];
     selectionState.knnRedoStack = [];
@@ -368,5 +396,38 @@ export function initKnnSelection(options) {
   viewer.setKnnStepCallback(handleKnnStep);
   viewer.setKnnPreviewCallback(handleKnnPreview);
 
-  return { handleKnnStep, restoreKnnSelection };
+  return {
+    handleKnnStep,
+    restoreKnnSelection,
+    destroy() {
+      if (destructionPromise !== null) return destructionPromise;
+      destroyed = true;
+      const failures = [];
+      for (const operation of [
+        () => lifecycleController.abort(),
+        () => viewer.setKnnCallback(() => {}),
+        () => viewer.setKnnStepCallback(() => {}),
+        () => viewer.setKnnPreviewCallback(() => {})
+      ]) {
+        try {
+          operation();
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      destructionPromise = Promise.allSettled(
+        [...pendingDeliveries]
+      ).then(() => {
+        const exactFailures = [...new Set(failures)];
+        if (exactFailures.length === 1) throw exactFailures[0];
+        if (exactFailures.length > 1) {
+          throw new AggregateError(
+            exactFailures,
+            'KNN selection failed to release every owned resource.'
+          );
+        }
+      });
+      return destructionPromise;
+    }
+  };
 }

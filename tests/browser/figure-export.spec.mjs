@@ -430,6 +430,98 @@ test('figure-export UI teardown aborts a pending renderer without download or te
   expect(productErrors).toEqual([]);
 });
 
+test('figure-export UI teardown detaches and fences retained DOM handlers', async ({
+  page,
+}, testInfo) => {
+  const productErrors = observeProductErrors(page);
+  await page.addInitScript(() => {
+    const nativeAddEventListener =
+      EventTarget.prototype.addEventListener;
+    const retainedTitleInputHandlers = [];
+    Object.defineProperty(window, '__figureExportDomLifecycleProbe', {
+      configurable: false,
+      writable: false,
+      value: { retainedTitleInputHandlers },
+    });
+    EventTarget.prototype.addEventListener = function addEventListener(
+      type,
+      listener,
+      options,
+    ) {
+      if (
+        type === 'input' &&
+        typeof listener === 'function' &&
+        typeof Element === 'function' &&
+        this instanceof Element &&
+        this.id === 'figure-export-title'
+      ) {
+        retainedTitleInputHandlers.push(listener);
+      }
+      return nativeAddEventListener.call(
+        this,
+        type,
+        listener,
+        options,
+      );
+    };
+  });
+  await openFigureExport(
+    page,
+    `figure-export-dom-teardown-${testInfo.project.name}`,
+  );
+
+  const outcome = await page.evaluate(async () => {
+    const probe = window.__figureExportDomLifecycleProbe;
+    const title = document.querySelector('#figure-export-title');
+    const preview = document.querySelector(
+      '#figure-export-preview-enabled'
+    );
+    if (!(title instanceof HTMLInputElement)) {
+      throw new Error('Figure title input is unavailable.');
+    }
+    if (!(preview instanceof HTMLInputElement)) {
+      throw new Error('Figure preview toggle is unavailable.');
+    }
+    if (probe.retainedTitleInputHandlers.length < 2) {
+      throw new Error(
+        'Figure title handlers were not retained by the lifecycle probe.'
+      );
+    }
+
+    await window._cellucidUi.destroy();
+    preview.checked = true;
+    title.value = '';
+
+    const nativeSetTimeout = window.setTimeout;
+    let scheduledTimeouts = 0;
+    window.setTimeout = function observedSetTimeout(...args) {
+      scheduledTimeouts += 1;
+      return nativeSetTimeout.apply(this, args);
+    };
+    try {
+      title.dispatchEvent(new Event('input', { bubbles: true }));
+      for (const handler of probe.retainedTitleInputHandlers) {
+        handler.call(
+          title,
+          new Event('input', { bubbles: true })
+        );
+      }
+    } finally {
+      window.setTimeout = nativeSetTimeout;
+    }
+
+    return {
+      retainedHandlerCount:
+        probe.retainedTitleInputHandlers.length,
+      scheduledTimeouts,
+    };
+  });
+
+  expect(outcome.retainedHandlerCount).toBeGreaterThanOrEqual(2);
+  expect(outcome.scheduledTimeouts).toBe(0);
+  expect(productErrors).toEqual([]);
+});
+
 test('teardown during the download click cannot roll back a committed export', async ({
   page,
 }, testInfo) => {

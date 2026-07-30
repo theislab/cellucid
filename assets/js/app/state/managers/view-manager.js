@@ -13,6 +13,8 @@ import { getNotificationCenter } from '../../notification-center.js';
 import { isAnnDataActive } from '../../../data/anndata-provider.js';
 
 const SUPPORTED_DIMENSIONS = new Set([1, 2, 3]);
+export const DATASET_VIEW_LOAD_SUPERSEDED_CODE =
+  'CELLUCID_DATASET_VIEW_LOAD_SUPERSEDED';
 
 function requireDimensionLevel(level, label = 'Dimension') {
   if (!Number.isInteger(level) || !SUPPORTED_DIMENSIONS.has(level)) {
@@ -50,6 +52,79 @@ function requireMethod(owner, methodName, label) {
     typeof owner[methodName] !== 'function'
   ) {
     throw new TypeError(`${label} must provide ${methodName}().`);
+  }
+}
+
+function readDatasetGeneration(state) {
+  const generation = state._datasetGeneration ?? 0;
+  if (!Number.isSafeInteger(generation) || generation < 0) {
+    throw new TypeError(
+      'DataState dataset generation must be a non-negative safe integer.'
+    );
+  }
+  return generation;
+}
+
+function createDatasetViewLoadSupersededError(operation) {
+  const error = new Error(
+    `${operation} was superseded by a dataset or runtime-owner replacement.`
+  );
+  error.name = 'AbortError';
+  error.code = DATASET_VIEW_LOAD_SUPERSEDED_CODE;
+  return error;
+}
+
+export function isDatasetViewLoadSupersededError(error) {
+  return error?.code === DATASET_VIEW_LOAD_SUPERSEDED_CODE;
+}
+
+function viewerIsTerminal(viewer) {
+  if (typeof viewer.isDisposed !== 'function') return false;
+  return viewer.isDisposed() !== false;
+}
+
+function assertCurrentDimensionLoadOwner(state, owner) {
+  const ownerIsCurrent = (
+    readDatasetGeneration(state) === owner.datasetGeneration
+    && state.dimensionManager === owner.dimensionManager
+    && state.viewer === owner.viewer
+    && state.viewContexts === owner.viewContexts
+    && owner.viewContexts.get(owner.targetViewId) === owner.context
+    && state.pointCount === owner.pointCount
+    && state.activeViewId === owner.activeViewId
+    && owner.context.dimensionLevel === owner.previousLevel
+    && !viewerIsTerminal(owner.viewer)
+  );
+  let currentField = null;
+  if (ownerIsCurrent) {
+    try {
+      currentField = state.getFieldForView(owner.targetViewId);
+    } catch {
+      throw createDatasetViewLoadSupersededError(
+        'Dimension coordinate loading'
+      );
+    }
+  }
+  if (!ownerIsCurrent || currentField !== owner.field) {
+    throw createDatasetViewLoadSupersededError(
+      'Dimension coordinate loading'
+    );
+  }
+}
+
+function assertCurrentVectorLoadOwner(state, owner) {
+  if (
+    readDatasetGeneration(state) !== owner.datasetGeneration
+    || state.vectorFieldManager !== owner.vectorFieldManager
+    || state.viewer !== owner.viewer
+    || state.viewContexts !== owner.viewContexts
+    || owner.viewContexts.get('live') !== owner.liveContext
+    || state.pointCount !== owner.pointCount
+    || viewerIsTerminal(owner.viewer)
+  ) {
+    throw createDatasetViewLoadSupersededError(
+      'Vector-field loading'
+    );
   }
 }
 
@@ -289,33 +364,43 @@ export class DataStateViewMethods {
         'ensureVectorField options must contain exactly one boolean "silent".'
       );
     }
-    if (this.vectorFieldManager === null) {
+    const vectorFieldManager = this.vectorFieldManager;
+    const viewer = this.viewer;
+    if (vectorFieldManager === null) {
       throw new Error('No vector-field manager is active.');
     }
-    if (!this.vectorFieldManager.hasField(fieldId)) {
+    if (!vectorFieldManager.hasField(fieldId)) {
       throw new Error(`Unknown vector field "${fieldId}".`);
     }
-    if (!this.vectorFieldManager.hasFieldDimension(fieldId, level)) {
+    if (!vectorFieldManager.hasFieldDimension(fieldId, level)) {
       throw new Error(
         `Vector field "${fieldId}" does not declare ${level}D data.`
       );
     }
     if (
-      this.viewer === null ||
-      typeof this.viewer !== 'object' ||
-      typeof this.viewer.setVectorFieldData !== 'function' ||
-      typeof this.viewer.hasVectorFieldForDimension !== 'function'
+      viewer === null ||
+      typeof viewer !== 'object' ||
+      typeof viewer.setVectorFieldData !== 'function' ||
+      typeof viewer.hasVectorFieldForDimension !== 'function'
     ) {
       throw new TypeError(
         'The active viewer must provide vector-field upload and query methods.'
       );
     }
-    if (this.viewer.hasVectorFieldForDimension(fieldId, level)) return true;
+    if (viewer.hasVectorFieldForDimension(fieldId, level)) return true;
+    if (
+      !(this.viewContexts instanceof Map) ||
+      !this.viewContexts.has('live')
+    ) {
+      throw new TypeError(
+        'Vector-field loading requires the exact live view context.'
+      );
+    }
 
     const silent = options.silent;
     const needsLocalNotif = isAnnDataActive();
     const notifications = (!silent && needsLocalNotif) ? getNotificationCenter() : null;
-    const descriptor = this.vectorFieldManager
+    const descriptor = vectorFieldManager
       .getAvailableFields()
       .find((field) => field.id === fieldId);
     if (descriptor === undefined) {
@@ -330,23 +415,36 @@ export class DataStateViewMethods {
           { category: 'data' }
         );
 
+    const loadOwner = Object.freeze({
+      datasetGeneration: readDatasetGeneration(this),
+      liveContext: this.viewContexts.get('live'),
+      pointCount: this.pointCount,
+      vectorFieldManager,
+      viewer,
+      viewContexts: this.viewContexts,
+    });
     try {
-      const fieldData = await this.vectorFieldManager.loadField(
+      const fieldData = await vectorFieldManager.loadField(
         fieldId,
         level,
         { showProgress: !silent && !needsLocalNotif }
       );
-      this.viewer.setVectorFieldData(fieldId, level, fieldData);
+      assertCurrentVectorLoadOwner(this, loadOwner);
+      viewer.setVectorFieldData(fieldId, level, fieldData);
       if (notifications !== null) {
         notifications.complete(notifId, `Loaded ${level}D ${descriptor.label}`);
       }
       return true;
     } catch (error) {
       if (notifications !== null) {
-        const message = error instanceof Error
-          ? error.message
-          : `Vector field "${fieldId}" rejected with a non-Error value.`;
-        notifications.fail(notifId, message);
+        if (isDatasetViewLoadSupersededError(error)) {
+          notifications.dismiss(notifId);
+        } else {
+          const message = error instanceof Error
+            ? error.message
+            : `Vector field "${fieldId}" rejected with a non-Error value.`;
+          notifications.fail(notifId, message);
+        }
       }
       throw error;
     }
@@ -426,19 +524,21 @@ export class DataStateViewMethods {
     });
 
     try {
+      const dimensionManager = this.dimensionManager;
+      const viewer = this.viewer;
       for (const methodName of [
         'getPositions3D',
         'hasDimension',
         'setViewDimension',
       ]) {
         requireMethod(
-          this.dimensionManager,
+          dimensionManager,
           methodName,
           'Dimension manager'
         );
       }
       requireMethod(this, 'getFieldForView', 'DataState');
-      requireMethod(this.viewer, 'setViewDimension', 'Viewer');
+      requireMethod(viewer, 'setViewDimension', 'Viewer');
       if (!(this.viewContexts instanceof Map)) {
         throw new TypeError(
           'Dimension changes require the exact view-context map.'
@@ -470,7 +570,7 @@ export class DataStateViewMethods {
       if (previousLevel === nextLevel) {
         return;
       }
-      if (this.dimensionManager.hasDimension(nextLevel) !== true) {
+      if (dimensionManager.hasDimension(nextLevel) !== true) {
         throw new RangeError(
           `Dimension ${nextLevel}D is not available in this dataset.`
         );
@@ -478,10 +578,10 @@ export class DataStateViewMethods {
 
       const isLiveView = targetViewId === 'live';
       if (isLiveView) {
-        requireMethod(this.viewer, 'updatePositions', 'Viewer');
+        requireMethod(viewer, 'updatePositions', 'Viewer');
       } else {
-        requireMethod(this.viewer, 'getViewPositions', 'Viewer');
-        requireMethod(this.viewer, 'setViewPositions', 'Viewer');
+        requireMethod(viewer, 'getViewPositions', 'Viewer');
+        requireMethod(viewer, 'setViewPositions', 'Viewer');
       }
 
       const field = this.getFieldForView(targetViewId);
@@ -506,9 +606,9 @@ export class DataStateViewMethods {
           'DataState'
         );
         requireMethod(this, 'buildCentroidsForField', 'DataState');
-        requireMethod(this.viewer, 'setCentroidLabels', 'Viewer');
+        requireMethod(viewer, 'setCentroidLabels', 'Viewer');
         requireMethod(
-          this.viewer,
+          viewer,
           isLiveView ? 'setCentroids' : 'updateSnapshotAttributes',
           'Viewer'
         );
@@ -516,8 +616,21 @@ export class DataStateViewMethods {
 
       // Coordinates and derived centroid buffers are complete before any
       // dimension owner publishes the new level.
+      const loadOwner = Object.freeze({
+        activeViewId,
+        context,
+        datasetGeneration: readDatasetGeneration(this),
+        dimensionManager,
+        field,
+        pointCount: this.pointCount,
+        previousLevel,
+        targetViewId,
+        viewer,
+        viewContexts: this.viewContexts,
+      });
       const positions3D =
-        await this.dimensionManager.getPositions3D(nextLevel);
+        await dimensionManager.getPositions3D(nextLevel);
+      assertCurrentDimensionLoadOwner(this, loadOwner);
       if (
         !(positions3D instanceof Float32Array) ||
         positions3D.length !== this.pointCount * 3
@@ -529,7 +642,7 @@ export class DataStateViewMethods {
       }
       const previousPositions = isLiveView
         ? this.positionsArray
-        : this.viewer.getViewPositions(targetViewId);
+        : viewer.getViewPositions(targetViewId);
       if (
         !(previousPositions instanceof Float32Array) ||
         previousPositions.length !== this.pointCount * 3
@@ -559,6 +672,7 @@ export class DataStateViewMethods {
           this.centroidLabels = previousGlobalCentroids.labels;
         }
       }
+      assertCurrentDimensionLoadOwner(this, loadOwner);
 
       let positionPublicationAttempted = false;
       let centroidPublicationAttempted = false;
@@ -567,9 +681,9 @@ export class DataStateViewMethods {
       try {
         positionPublicationAttempted = true;
         if (isLiveView) {
-          this.viewer.updatePositions(positions3D, nextLevel);
+          viewer.updatePositions(positions3D, nextLevel);
         } else {
-          this.viewer.setViewPositions(
+          viewer.setViewPositions(
             targetViewId,
             positions3D,
             nextLevel
@@ -579,29 +693,29 @@ export class DataStateViewMethods {
         if (stagedCentroids !== null) {
           centroidPublicationAttempted = true;
           if (isLiveView) {
-            this.viewer.setCentroids({
+            viewer.setCentroids({
               positions: stagedCentroids.positions,
               colors: stagedCentroids.colors,
             });
           } else {
-            this.viewer.updateSnapshotAttributes(targetViewId, {
+            viewer.updateSnapshotAttributes(targetViewId, {
               centroidPositions: stagedCentroids.positions,
               centroidColors: stagedCentroids.colors,
             });
           }
-          this.viewer.setCentroidLabels(
+          viewer.setCentroidLabels(
             stagedCentroids.labels,
             targetViewId
           );
         }
 
         managerPublicationAttempted = true;
-        this.dimensionManager.setViewDimension(
+        dimensionManager.setViewDimension(
           targetViewId,
           nextLevel
         );
         viewerDimensionPublicationAttempted = true;
-        this.viewer.setViewDimension(targetViewId, nextLevel);
+        viewer.setViewDimension(targetViewId, nextLevel);
 
         if (isLiveView) {
           this.positionsArray = positions3D;
@@ -648,12 +762,12 @@ export class DataStateViewMethods {
         if (positionPublicationAttempted) {
           restore(() => {
             if (isLiveView) {
-              this.viewer.updatePositions(
+              viewer.updatePositions(
                 previousPositions,
                 previousLevel
               );
             } else {
-              this.viewer.setViewPositions(
+              viewer.setViewPositions(
                 targetViewId,
                 previousPositions,
                 previousLevel
@@ -664,18 +778,18 @@ export class DataStateViewMethods {
         if (centroidPublicationAttempted) {
           restore(() => {
             if (isLiveView) {
-              this.viewer.setCentroids({
+              viewer.setCentroids({
                 positions: previousContextCentroids.positions,
                 colors: previousContextCentroids.colors,
               });
             } else {
-              this.viewer.updateSnapshotAttributes(targetViewId, {
+              viewer.updateSnapshotAttributes(targetViewId, {
                 centroidPositions:
                   previousContextCentroids.positions,
                 centroidColors: previousContextCentroids.colors,
               });
             }
-            this.viewer.setCentroidLabels(
+            viewer.setCentroidLabels(
               previousContextCentroids.labels,
               targetViewId
             );
@@ -683,7 +797,7 @@ export class DataStateViewMethods {
         }
         if (managerPublicationAttempted) {
           restore(() => {
-            this.dimensionManager.setViewDimension(
+            dimensionManager.setViewDimension(
               targetViewId,
               previousLevel
             );
@@ -691,7 +805,7 @@ export class DataStateViewMethods {
         }
         if (viewerDimensionPublicationAttempted) {
           restore(() => {
-            this.viewer.setViewDimension(
+            viewer.setViewDimension(
               targetViewId,
               previousLevel
             );

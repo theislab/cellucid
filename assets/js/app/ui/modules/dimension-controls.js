@@ -58,10 +58,37 @@ export function initDimensionControls({ state, dom, callbacks }) {
   const dimensionControls = dom.controls;
   const dimensionSelect = dom.select;
   const ownerDocument = dimensionSelect.ownerDocument;
+  const lifecycleController = new AbortController();
 
+  let destroyed = false;
   let dimensionChangeBusy = false;
+  let operationGeneration = 0;
+  let activeNotification = null;
+  let destructionPromise = null;
+  const activeOperations = new Set();
+
+  function assertAlive() {
+    if (destroyed) {
+      throw new Error('Dimension controls are unavailable after destroy().');
+    }
+  }
+
+  function ownsOperation(generation) {
+    return !destroyed && generation === operationGeneration;
+  }
+
+  function trackOperation(operation) {
+    const tracked = Promise.resolve(operation);
+    activeOperations.add(tracked);
+    const retire = () => {
+      activeOperations.delete(tracked);
+    };
+    tracked.then(retire, retire);
+    return tracked;
+  }
 
   function updateDimensionSelectValue(activeDim) {
+    assertAlive();
     if (!SUPPORTED_DIMENSIONS.has(activeDim)) {
       throw new RangeError(
         'Dimension selector value must be exactly 1, 2, or 3.'
@@ -71,6 +98,7 @@ export function initDimensionControls({ state, dom, callbacks }) {
   }
 
   function updateDimensionSelectUI() {
+    assertAlive();
     const availableDimensions = state.getAvailableDimensions();
     if (
       !Array.isArray(availableDimensions) ||
@@ -117,7 +145,8 @@ export function initDimensionControls({ state, dom, callbacks }) {
     dimensionSelect.value = String(currentDim);
   }
 
-  async function handleDimensionChange(newLevel, targetViewId = null, options = {}) {
+  async function runDimensionChange(newLevel, targetViewId = null, options = {}) {
+    assertAlive();
     if (!SUPPORTED_DIMENSIONS.has(newLevel)) {
       throw new RangeError(
         `Dimension must be exactly 1, 2, or 3; received ${String(newLevel)}.`
@@ -157,6 +186,7 @@ export function initDimensionControls({ state, dom, callbacks }) {
     if (newLevel === currentDim) return;
 
     dimensionChangeBusy = true;
+    const generation = ++operationGeneration;
     const notifications = silent ? null : getNotificationCenter();
     const dimNotifId = notifications === null
       ? null
@@ -164,11 +194,15 @@ export function initDimensionControls({ state, dom, callbacks }) {
           `Switching to ${newLevel}D embedding...`,
           { category: 'dimension' }
         );
+    activeNotification = notifications === null
+      ? null
+      : Object.freeze({ generation, id: dimNotifId, notifications });
 
     updateDimensionSelectValue(newLevel);
 
     try {
       await state.setDimensionLevel(newLevel, { viewId });
+      if (!ownsOperation(generation)) return;
       callbacks.onViewBadgesMaybeChanged();
       if (notifications !== null) {
         notifications.complete(
@@ -177,6 +211,7 @@ export function initDimensionControls({ state, dom, callbacks }) {
         );
       }
     } catch (err) {
+      if (!ownsOperation(generation)) return;
       updateDimensionSelectValue(currentDim);
       if (notifications !== null) {
         const message = err instanceof Error
@@ -186,31 +221,113 @@ export function initDimensionControls({ state, dom, callbacks }) {
       }
       throw err;
     } finally {
-      dimensionChangeBusy = false;
+      if (generation === operationGeneration) {
+        dimensionChangeBusy = false;
+        activeNotification = null;
+      }
     }
   }
 
-  dimensionSelect.addEventListener('change', async event => {
+  function handleDimensionChange(
+    newLevel,
+    targetViewId = null,
+    options = {}
+  ) {
+    return trackOperation(
+      runDimensionChange(newLevel, targetViewId, options)
+    );
+  }
+
+  function handleDimensionSelectEvent(event) {
+    if (destroyed) return;
     const rawDimension = event.target.value;
     if (!['1', '2', '3'].includes(rawDimension)) {
       throw new RangeError(
         `Dimension selector requires exactly "1", "2", or "3"; received ${String(rawDimension)}.`
       );
     }
-    await handleDimensionChange(
+    void handleDimensionChange(
       Number(rawDimension),
       state.getActiveViewId(),
       { silent: false }
-    );
+    ).catch(error => {
+      if (destroyed) return;
+      // Direct callers receive the rejection from handleDimensionChange().
+      // DOM event dispatch has no promise consumer, so the notification is the
+      // terminal publication and the rejection must remain observed here.
+      console.error('[DimensionControls] Dimension change failed:', error);
+    });
+  }
+
+  dimensionSelect.addEventListener('change', handleDimensionSelectEvent, {
+    signal: lifecycleController.signal
   });
 
-  state.on('dimension:changed', (level) => {
+  const unsubscribeDimensionChanged = state.on('dimension:changed', (level) => {
+    if (destroyed) return;
     if (!dimensionChangeBusy) {
       updateDimensionSelectValue(level);
     }
   });
+  if (typeof unsubscribeDimensionChanged !== 'function') {
+    lifecycleController.abort();
+    throw new TypeError(
+      'Dimension controls require state.on() to return an unsubscribe function.'
+    );
+  }
 
   updateDimensionSelectUI();
 
-  return { updateDimensionSelectUI, handleDimensionChange };
+  function destroy() {
+    if (destructionPromise !== null) return destructionPromise;
+    let resolveDestruction;
+    let rejectDestruction;
+    destructionPromise = new Promise((resolve, reject) => {
+      resolveDestruction = resolve;
+      rejectDestruction = reject;
+    });
+    destroyed = true;
+    operationGeneration =
+      operationGeneration === Number.MAX_SAFE_INTEGER
+        ? 1
+        : operationGeneration + 1;
+    dimensionChangeBusy = false;
+    const cleanupErrors = [];
+    try {
+      lifecycleController.abort();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    try {
+      unsubscribeDimensionChanged();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    if (activeNotification !== null) {
+      try {
+        activeNotification.notifications.dismiss(activeNotification.id);
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+      activeNotification = null;
+    }
+    void Promise.allSettled([...activeOperations])
+      .then(() => {
+        if (cleanupErrors.length === 1) throw cleanupErrors[0];
+        if (cleanupErrors.length > 1) {
+          throw new AggregateError(
+            cleanupErrors,
+            'Dimension controls could not release every owner.'
+          );
+        }
+      })
+      .then(resolveDestruction, rejectDestruction);
+    return destructionPromise;
+  }
+
+  return {
+    destroy,
+    updateDimensionSelectUI,
+    handleDimensionChange
+  };
 }

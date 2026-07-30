@@ -41,7 +41,7 @@ jobs:
         run: npm run test:worker-bundle
 
   browsers:
-    name: ${{ matrix.os }} / ${{ matrix.browser }}
+    name: ${{ matrix.os }} / ${{ matrix.browser }} / shard ${{ matrix.shard }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -49,6 +49,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         browser: [chromium, firefox, webkit]
+        shard: ["1/2", "2/2"]
 
     steps:
       - name: Check out the exact source
@@ -71,12 +72,8 @@ jobs:
         if: runner.os != 'Linux'
         run: npx playwright install ${{ matrix.browser }}
 
-      - name: Load the current H5AD contract through the real UI
-        if: matrix.browser != 'firefox'
-        run: npm run test:browser -- --project=${{ matrix.browser }}
-
       - name: Verify Firefox WebGL2 through the Linux display server
-        if: matrix.browser == 'firefox' && runner.os == 'Linux'
+        if: matrix.browser == 'firefox' && runner.os == 'Linux' && matrix.shard == '1/2'
         run: >-
           xvfb-run --auto-servernum --
           npm run test:browser --
@@ -85,20 +82,24 @@ jobs:
           tests/browser/webgl2-runtime.spec.mjs
 
       - name: Verify Firefox WebGL2 on macOS and Windows
-        if: matrix.browser == 'firefox' && runner.os != 'Linux'
+        if: matrix.browser == 'firefox' && runner.os != 'Linux' && matrix.shard == '1/2'
         run: >-
           npm run test:browser --
           --project=firefox
           tests/browser/webgl2-runtime.spec.mjs
 
-      - name: Load the current H5AD contract through headed Firefox on Linux
+      - name: Run the selected headed Firefox browser shard on Linux
         if: matrix.browser == 'firefox' && runner.os == 'Linux'
         run: >-
           xvfb-run --auto-servernum --
           npm run test:browser --
           --project=firefox
           --headed
+          --shard=${{ matrix.shard }}
 
-      - name: Load the current H5AD contract through Firefox
-        if: matrix.browser == 'firefox' && runner.os != 'Linux'
-        run: npm run test:browser -- --project=firefox
+      - name: Run the selected browser shard
+        if: matrix.browser != 'firefox' || runner.os != 'Linux'
+        run: >-
+          npm run test:browser --
+          --project=${{ matrix.browser }}
+          --shard=${{ matrix.shard }}

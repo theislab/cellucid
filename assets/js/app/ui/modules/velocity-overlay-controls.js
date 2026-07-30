@@ -361,6 +361,73 @@ export function initVelocityOverlayControls(options) {
 
   let enabling = false;
   let suppressFieldChange = false;
+  let destroyed = false;
+  let operationGeneration = 0;
+  let destructionPromise = null;
+  const activeOperations = new Set();
+  const domLifecycle = new AbortController();
+
+  function acquireOperationOwner() {
+    if (destroyed) return null;
+    operationGeneration += 1;
+    return operationGeneration;
+  }
+
+  function isOperationOwnerCurrent(owner) {
+    return (
+      !destroyed &&
+      owner !== null &&
+      owner === operationGeneration
+    );
+  }
+
+  function trackOperation(operation) {
+    const tracked = Promise.resolve(operation);
+    activeOperations.add(tracked);
+    const retire = () => {
+      activeOperations.delete(tracked);
+    };
+    tracked.then(retire, retire);
+    return tracked;
+  }
+
+  function observeEventOperation(operation, eventName) {
+    void operation.catch(error => {
+      if (destroyed) return;
+      try {
+        console.error(
+          `[VelocityOverlayControls] ${eventName} handler failed:`,
+          error
+        );
+      } catch {
+        // Optional diagnostics cannot own event or teardown settlement.
+      }
+    });
+    return operation;
+  }
+
+  function listen(element, eventName, handler) {
+    const guardedHandler = (...args) => {
+      if (destroyed) return undefined;
+      const result = handler(...args);
+      if (
+        result !== null &&
+        (typeof result === 'object' || typeof result === 'function') &&
+        typeof result.then === 'function'
+      ) {
+        return observeEventOperation(
+          trackOperation(result),
+          eventName
+        );
+      }
+      return result;
+    };
+    element.addEventListener(
+      eventName,
+      guardedHandler,
+      { signal: domLifecycle.signal }
+    );
+  }
 
   const getActiveDim = () => {
     const level = state.getDimensionLevel();
@@ -692,6 +759,7 @@ export function initVelocityOverlayControls(options) {
   }
 
   function syncAvailability() {
+    if (destroyed) return;
     const unionDims = getUnionDims();
     const hasAny = unionDims.length > 0;
     const activeDim = getActiveDim();
@@ -702,6 +770,8 @@ export function initVelocityOverlayControls(options) {
     renderFieldSelectForActiveDim();
 
     if (!hasAny) {
+      enabledCheckbox.disabled = true;
+      fieldSelect.disabled = true;
       setInfo('');
       if (enabledCheckbox.checked) {
         disableOverlayUi();
@@ -737,7 +807,7 @@ export function initVelocityOverlayControls(options) {
     updateSettingsVisibility();
   }
 
-  async function ensureFieldForActiveDim() {
+  async function ensureFieldForActiveDim(owner) {
     const dim = getActiveDim();
     const fieldId = getSelectedFieldId();
     if (fieldId.length === 0) {
@@ -750,10 +820,14 @@ export function initVelocityOverlayControls(options) {
       dim,
       { silent: false }
     );
+    if (!isOperationOwnerCurrent(owner)) return false;
     viewer.setActiveVectorField(fieldId);
+    return true;
   }
 
   async function handleEnabledChange() {
+    const owner = acquireOperationOwner();
+    if (owner === null) return;
     if (!enabledCheckbox.checked) {
       disableOverlayUi();
       syncAvailability();
@@ -774,12 +848,14 @@ export function initVelocityOverlayControls(options) {
     let failureInfo = null;
 
     try {
-      await ensureFieldForActiveDim();
+      await ensureFieldForActiveDim(owner);
+      if (!isOperationOwnerCurrent(owner)) return;
       viewer.setVectorFieldOverlayEnabled(true);
       applyConfigFromUi();
       updateSettingsVisibility();
       syncAvailability();
     } catch (error) {
+      if (!isOperationOwnerCurrent(owner)) return;
       const exactError =
         error instanceof Error && error.message.length > 0
           ? error
@@ -790,6 +866,7 @@ export function initVelocityOverlayControls(options) {
       disableOverlayUi();
       failureInfo = 'Failed to load vector field.';
     } finally {
+      if (!isOperationOwnerCurrent(owner)) return;
       enabling = false;
       enabledCheckbox.disabled = false;
       syncAvailability();
@@ -798,6 +875,8 @@ export function initVelocityOverlayControls(options) {
   }
 
   async function handleDimensionChanged() {
+    const owner = acquireOperationOwner();
+    if (owner === null) return;
     const selectedFieldId = fieldSelect.value;
     if (
       selectedFieldId.length > 0 &&
@@ -824,11 +903,13 @@ export function initVelocityOverlayControls(options) {
       enabling = true;
       enabledCheckbox.disabled = true;
       setInfo('Loading vector field…');
-      await ensureFieldForActiveDim();
+      await ensureFieldForActiveDim(owner);
+      if (!isOperationOwnerCurrent(owner)) return;
       viewer.setVectorFieldOverlayEnabled(true);
       applyConfigFromUi();
       syncAvailability();
     } catch (error) {
+      if (!isOperationOwnerCurrent(owner)) return;
       const exactError =
         error instanceof Error && error.message.length > 0
           ? error
@@ -839,6 +920,7 @@ export function initVelocityOverlayControls(options) {
       disableOverlayUi();
       failureInfo = 'Failed to load vector field.';
     } finally {
+      if (!isOperationOwnerCurrent(owner)) return;
       enabling = false;
       enabledCheckbox.disabled = false;
       syncAvailability();
@@ -847,6 +929,8 @@ export function initVelocityOverlayControls(options) {
   }
 
   async function handleFieldChanged() {
+    const owner = acquireOperationOwner();
+    if (owner === null) return;
     if (suppressFieldChange) return;
     syncAvailability();
     if (!enabledCheckbox.checked) return;
@@ -858,10 +942,12 @@ export function initVelocityOverlayControls(options) {
     setInfo('Loading vector field…');
     let failureInfo = null;
     try {
-      await ensureFieldForActiveDim();
+      await ensureFieldForActiveDim(owner);
+      if (!isOperationOwnerCurrent(owner)) return;
       applyConfigFromUi();
       syncAvailability();
     } catch (error) {
+      if (!isOperationOwnerCurrent(owner)) return;
       const exactError =
         error instanceof Error && error.message.length > 0
           ? error
@@ -872,6 +958,7 @@ export function initVelocityOverlayControls(options) {
       disableOverlayUi();
       failureInfo = 'Failed to load vector field.';
     } finally {
+      if (!isOperationOwnerCurrent(owner)) return;
       enabling = false;
       enabledCheckbox.disabled = false;
       fieldSelect.disabled = false;
@@ -881,6 +968,11 @@ export function initVelocityOverlayControls(options) {
   }
 
   function handleVectorFieldsChanged() {
+    if (destroyed) return;
+    operationGeneration += 1;
+    enabling = false;
+    enabledCheckbox.disabled = false;
+    fieldSelect.disabled = false;
     // Dataset swap: reset toggle state so we don’t keep an overlay enabled across datasets.
     fieldSelect.value = '';
     disableOverlayUi();
@@ -891,112 +983,112 @@ export function initVelocityOverlayControls(options) {
   // DOM wiring
   // ---------------------------------------------------------------------------
 
-  enabledCheckbox.addEventListener('change', handleEnabledChange);
-  fieldSelect.addEventListener('change', handleFieldChanged);
+  listen(enabledCheckbox, 'change', handleEnabledChange);
+  listen(fieldSelect, 'change', handleFieldChanged);
 
-  densityInput.addEventListener('input', () => {
+  listen(densityInput, 'input', () => {
     const particles = updateDensityDisplay();
     if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('particleCount', particles);
   });
-  speedInput.addEventListener('input', () => {
+  listen(speedInput, 'input', () => {
     const speed = updateSpeedDisplay();
     if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('speedMultiplier', speed);
   });
-  lifetimeInput.addEventListener('input', () => {
+  listen(lifetimeInput, 'input', () => {
     const lifetime = updateLifetimeDisplay();
     if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('lifetime', lifetime);
   });
-  sizeInput.addEventListener('input', () => {
+  listen(sizeInput, 'input', () => {
     const size = updateSizeDisplay();
     if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('particleSize', size);
   });
-  opacityInput.addEventListener('input', () => {
+  listen(opacityInput, 'input', () => {
     const opacity = updateOpacityDisplay();
     if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('opacity', opacity);
   });
-  colormapSelect.addEventListener('change', () => {
+  listen(colormapSelect, 'change', () => {
     if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('colormapId', colormapSelect.value);
   });
-  syncLodCheckbox.addEventListener('change', () => {
+  listen(syncLodCheckbox, 'change', () => {
     if (enabledCheckbox.checked && !enabling) {
       viewer.setVectorFieldConfig('syncWithLOD', syncLodCheckbox.checked);
     }
   });
 
   // Advanced settings event listeners - Particle Rendering
-  intensityInput.addEventListener('input', () => {
+  listen(intensityInput, 'input', () => {
     const value = updateIntensityDisplay();
     if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('intensity', value);
   });
-  glowInput.addEventListener('input', () => {
+  listen(glowInput, 'input', () => {
     const value = updateGlowDisplay();
     if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('glowAmount', value);
   });
-  cometStretchInput.addEventListener('input', () => {
+  listen(cometStretchInput, 'input', () => {
     const value = updateCometStretchDisplay();
     if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('cometStretch', value);
   });
-  coreSharpnessInput.addEventListener('input', () => {
+  listen(coreSharpnessInput, 'input', () => {
     const value = updateCoreSharpnessDisplay();
     if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('coreSharpness', value);
   });
   // Trail settings
-  trailFadeInput.addEventListener('input', () => {
+  listen(trailFadeInput, 'input', () => {
     const value = updateTrailFadeDisplay();
     if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('trailFade', value);
   });
-  chromaticFadeInput.addEventListener('input', () => {
+  listen(chromaticFadeInput, 'input', () => {
     const value = updateChromaticFadeDisplay();
     if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('chromaticFade', value);
   });
-  turbulenceInput.addEventListener('input', () => {
+  listen(turbulenceInput, 'input', () => {
     const value = updateTurbulenceDisplay();
     if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('turbulence', value);
   });
   // HDR & Bloom
-  exposureInput.addEventListener('input', () => {
+  listen(exposureInput, 'input', () => {
     const value = updateExposureDisplay();
     if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('exposure', value);
   });
-  bloomStrengthInput.addEventListener('input', () => {
+  listen(bloomStrengthInput, 'input', () => {
     const value = updateBloomStrengthDisplay();
     if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('bloomStrength', value);
   });
-  bloomThresholdInput.addEventListener('input', () => {
+  listen(bloomThresholdInput, 'input', () => {
     const value = updateBloomThresholdDisplay();
     if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('bloomThreshold', value);
   });
-  anamorphicInput.addEventListener('input', () => {
+  listen(anamorphicInput, 'input', () => {
     const value = updateAnamorphicDisplay();
     if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('anamorphicRatio', value);
   });
   // Color Grading
-  saturationInput.addEventListener('input', () => {
+  listen(saturationInput, 'input', () => {
     const value = updateSaturationDisplay();
     if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('saturation', value);
   });
-  contrastInput.addEventListener('input', () => {
+  listen(contrastInput, 'input', () => {
     const value = updateContrastDisplay();
     if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('contrast', value);
   });
-  highlightsInput.addEventListener('input', () => {
+  listen(highlightsInput, 'input', () => {
     const value = updateHighlightsDisplay();
     if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('highlights', value);
   });
-  shadowsInput.addEventListener('input', () => {
+  listen(shadowsInput, 'input', () => {
     const value = updateShadowsDisplay();
     if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('shadows', value);
   });
   // Cinematic Effects
-  vignetteInput.addEventListener('input', () => {
+  listen(vignetteInput, 'input', () => {
     const value = updateVignetteDisplay();
     if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('vignette', value);
   });
-  filmGrainInput.addEventListener('input', () => {
+  listen(filmGrainInput, 'input', () => {
     const value = updateFilmGrainDisplay();
     if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('filmGrain', value);
   });
-  chromaticAberrationInput.addEventListener('input', () => {
+  listen(chromaticAberrationInput, 'input', () => {
     const value = updateChromaticAberrationDisplay();
     if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('chromaticAberration', value);
   });
@@ -1006,7 +1098,13 @@ export function initVelocityOverlayControls(options) {
   // ---------------------------------------------------------------------------
 
   const onVectorFieldsChanged = () => handleVectorFieldsChanged();
-  const onDimChanged = () => handleDimensionChanged();
+  const onDimChanged = () => {
+    if (destroyed) return undefined;
+    return observeEventOperation(
+      trackOperation(handleDimensionChanged()),
+      'dimension:changed'
+    );
+  };
 
   state.on('vectorFields:changed', onVectorFieldsChanged);
   state.on('dimension:changed', onDimChanged);
@@ -1043,6 +1141,44 @@ export function initVelocityOverlayControls(options) {
   updateSettingsVisibility();
   syncAvailability();
 
+  function destroy() {
+    if (destructionPromise !== null) return destructionPromise;
+    let resolveDestruction;
+    let rejectDestruction;
+    destructionPromise = new Promise((resolve, reject) => {
+      resolveDestruction = resolve;
+      rejectDestruction = reject;
+    });
+    destroyed = true;
+    operationGeneration += 1;
+
+    const cleanupErrors = [];
+    for (const cleanup of [
+      () => domLifecycle.abort(),
+      () => state.off('vectorFields:changed', onVectorFieldsChanged),
+      () => state.off('dimension:changed', onDimChanged),
+    ]) {
+      try {
+        cleanup();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+
+    void Promise.allSettled([...activeOperations])
+      .then(() => {
+        if (cleanupErrors.length === 1) throw cleanupErrors[0];
+        if (cleanupErrors.length > 1) {
+          throw new AggregateError(
+            cleanupErrors,
+            'Vector field overlay controls could not release every owner.'
+          );
+        }
+      })
+      .then(resolveDestruction, rejectDestruction);
+    return destructionPromise;
+  }
+
   return {
     syncAvailability,
     settleRenderFailure(error) {
@@ -1051,6 +1187,7 @@ export function initVelocityOverlayControls(options) {
           'Velocity render failure settlement requires a non-empty Error.'
         );
       }
+      if (destroyed) return error;
       const secondaryFailures = [];
       const collectFailure = (value, fallbackMessage) => {
         secondaryFailures.push(
@@ -1117,11 +1254,6 @@ export function initVelocityOverlayControls(options) {
       }
       return diagnostic;
     },
-    destroy() {
-      enabledCheckbox.removeEventListener('change', handleEnabledChange);
-      fieldSelect.removeEventListener('change', handleFieldChanged);
-      state.off('vectorFields:changed', onVectorFieldsChanged);
-      state.off('dimension:changed', onDimChanged);
-    }
+    destroy
   };
 }

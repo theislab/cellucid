@@ -41,14 +41,28 @@ function createElement({ value = '', checked = false, tagName = 'INPUT' } = {}) 
     checked,
     tagName,
     textContent: '',
-    addEventListener(type, listener) {
+    addEventListener(type, listener, options = {}) {
       if (!listeners.has(type)) {
         listeners.set(type, []);
       }
       listeners.get(type).push(listener);
+      if (options.signal) {
+        options.signal.addEventListener('abort', () => {
+          this.removeEventListener(type, listener);
+        }, { once: true });
+      }
+    },
+    removeEventListener(type, listener) {
+      listeners.set(
+        type,
+        (listeners.get(type) ?? []).filter(candidate => candidate !== listener)
+      );
+    },
+    getListeners(type) {
+      return [...(listeners.get(type) ?? [])];
     },
     dispatch(type, event = { target: null }) {
-      for (const listener of listeners.get(type) ?? []) {
+      for (const listener of [...(listeners.get(type) ?? [])]) {
         listener(event);
       }
     }
@@ -363,6 +377,54 @@ test('capturing invalid reset state fails visibly instead of repairing it', () =
       () => initVisualizationReset(resetOptions(nonBooleanHarness)),
       /invertLookCheckbox/
     );
+  } finally {
+    globalThis.document = previousDocument;
+  }
+});
+
+test('visualization reset destruction detaches and fences retained reset intents', () => {
+  const documentListeners = new Map();
+  const previousDocument = globalThis.document;
+  globalThis.document = {
+    addEventListener(type, listener, options = {}) {
+      if (!documentListeners.has(type)) documentListeners.set(type, []);
+      documentListeners.get(type).push(listener);
+      if (options.signal) {
+        options.signal.addEventListener('abort', () => {
+          this.removeEventListener(type, listener);
+        }, { once: true });
+      }
+    },
+    removeEventListener(type, listener) {
+      documentListeners.set(
+        type,
+        (documentListeners.get(type) ?? [])
+          .filter(candidate => candidate !== listener)
+      );
+    }
+  };
+
+  try {
+    const harness = createHarness();
+    const reset = initVisualizationReset(resetOptions(harness));
+    const retainedButtonListener =
+      harness.cameraDom.resetBtn.getListeners('click')[0];
+    const retainedDocumentListener = documentListeners.get('keydown')[0];
+
+    mutateControls(harness);
+    reset.destroy();
+    reset.destroy();
+
+    assert.equal(harness.cameraDom.resetBtn.getListeners('click').length, 0);
+    assert.equal(documentListeners.get('keydown').length, 0);
+    retainedButtonListener({ target: harness.cameraDom.resetBtn });
+    retainedDocumentListener({ key: 'r', target: { tagName: 'DIV' } });
+    reset.resetVisualizationToDefaults();
+    reset.captureInitialState();
+
+    assert.deepEqual(harness.calls, []);
+    assert.equal(harness.renderDom.backgroundSelect.value, 'black');
+    assert.equal(harness.cameraDom.navigationModeSelect.value, 'planar');
   } finally {
     globalThis.document = previousDocument;
   }

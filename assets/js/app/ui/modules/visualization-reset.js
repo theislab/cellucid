@@ -297,9 +297,19 @@ export function initVisualizationReset(options) {
     planarInvertAxesCheckbox
   } = cameraDom;
 
+  const lifecycleController = new AbortController();
+  let destroyed = false;
   let initialUIState;
 
+  function listen(target, eventName, listener) {
+    target.addEventListener(eventName, (...args) => {
+      if (destroyed) return;
+      listener(...args);
+    }, { signal: lifecycleController.signal });
+  }
+
   function captureInitialState() {
+    if (destroyed) return initialUIState;
     initialUIState = Object.freeze({
       background: assertChoice(
         backgroundSelect.value,
@@ -416,6 +426,7 @@ export function initVisualizationReset(options) {
   }
 
   function resetVisualizationToDefaults() {
+    if (destroyed) return;
     viewer.resetCamera();
 
     backgroundSelect.value = initialUIState.background;
@@ -551,8 +562,8 @@ export function initVisualizationReset(options) {
 
   captureInitialState();
 
-  resetCameraBtn.addEventListener('click', resetVisualizationToDefaults);
-  document.addEventListener('keydown', (event) => {
+  listen(resetCameraBtn, 'click', resetVisualizationToDefaults);
+  listen(document, 'keydown', (event) => {
     if (isTextEntryTarget(event.target)) {
       return;
     }
@@ -561,5 +572,15 @@ export function initVisualizationReset(options) {
     }
   });
 
-  return Object.freeze({ resetVisualizationToDefaults, captureInitialState });
+  function destroy() {
+    if (destroyed) return;
+    destroyed = true;
+    lifecycleController.abort();
+  }
+
+  return Object.freeze({
+    resetVisualizationToDefaults,
+    captureInitialState,
+    destroy
+  });
 }

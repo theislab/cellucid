@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { dispatchAppDrag } from './helpers/app-drag.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const DATASET_URL =
@@ -127,7 +128,19 @@ test('dataset replacement retires category merge confirmation ownership', async 
   await selectCellType(page);
 
   const labels = page.locator('.legend-label');
-  await labels.nth(0).dragTo(page.locator('.legend-item').nth(1));
+  expect(
+    await dispatchAppDrag(
+      labels.nth(0),
+      page.locator('.legend-item').nth(1),
+      {
+        expectedDataType: 'application/x-cellucid-category',
+      },
+    ),
+  ).toEqual({
+    dataTypes: ['application/x-cellucid-category'],
+    dragOverAccepted: true,
+    dropAccepted: true,
+  });
   await expect(page.locator('.confirm-dialog-title')).toHaveText(
     'Merge categories',
   );

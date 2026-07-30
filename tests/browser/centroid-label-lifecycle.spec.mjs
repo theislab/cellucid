@@ -22,11 +22,12 @@ test('centroid labels reject element aliasing and roll back hostile staging exac
   const proof = await page.evaluate(() => {
     const viewer = window._cellucidViewer;
     const state = window._cellucidState;
+    const ui = window._cellucidUi;
     const labelLayer = document.querySelector('#label-layer');
     viewer.setCentroidLabels([], 'live');
 
     const payload = state.getSnapshotPayload();
-    const snapshot = viewer.createSnapshotView({
+    const snapshot = ui.publishSnapshotView({
       label: 'Centroid label ownership',
       fieldKey: payload.fieldKey,
       fieldKind: payload.fieldKind,
@@ -170,7 +171,7 @@ test('centroid labels reject element aliasing and roll back hostile staging exac
       stagingError,
     };
     viewer.setCentroidLabels([], 'live');
-    viewer.removeSnapshotView(snapshot.id);
+    ui.retireSnapshotView(snapshot.id);
     externalParent.remove();
     return result;
   });

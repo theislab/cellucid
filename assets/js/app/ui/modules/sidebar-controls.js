@@ -55,6 +55,7 @@ export function initSidebarControls({ dom, onViewportOcclusionChange }) {
     throw new Error('Sidebar controls require ResizeObserver support.');
   }
   const responsiveResizeMedia = ownerWindow.matchMedia('(max-width: 900px)');
+  let destroyed = false;
   const occlusionGeometry = {
     canvasLeft: 0,
     canvasWidth: 0,
@@ -64,6 +65,7 @@ export function initSidebarControls({ dom, onViewportOcclusionChange }) {
   };
 
   const publishViewportOcclusion = () => {
+    if (destroyed) return;
     const canvasRect = canvas.getBoundingClientRect();
     occlusionGeometry.canvasLeft = canvasRect.left;
     occlusionGeometry.canvasWidth = canvasRect.width;
@@ -76,6 +78,7 @@ export function initSidebarControls({ dom, onViewportOcclusionChange }) {
   };
 
   const publishCachedViewportOcclusion = (sidebarWidth) => {
+    if (destroyed) return;
     occlusionGeometry.sidebarWidth = sidebarWidth;
     occlusionGeometry.sidebarVisible = !sidebar.classList.contains('hidden');
     onViewportOcclusionChange(
@@ -84,6 +87,7 @@ export function initSidebarControls({ dom, onViewportOcclusionChange }) {
   };
 
   const syncSidebarToggleState = () => {
+    if (destroyed) return;
     const isHidden = sidebar.classList.contains('hidden');
     sidebarToggle.classList.toggle('sidebar-open', !isHidden);
     sidebarToggle.textContent = isHidden ? '☰' : '✕';
@@ -105,11 +109,13 @@ export function initSidebarControls({ dom, onViewportOcclusionChange }) {
   syncSidebarToggleState();
   publishViewportOcclusion();
 
-  sidebarToggle.addEventListener('click', () => {
+  const handleSidebarToggle = () => {
+    if (destroyed) return;
     sidebar.classList.toggle('hidden');
     syncSidebarToggleState();
     publishViewportOcclusion();
-  });
+  };
+  sidebarToggle.addEventListener('click', handleSidebarToggle);
 
   let isResizing = false;
   let startX = 0;
@@ -135,7 +141,8 @@ export function initSidebarControls({ dom, onViewportOcclusionChange }) {
     publishCachedViewportOcclusion(clampedWidth);
   };
 
-  sidebarResizeHandle.addEventListener('mousedown', (event) => {
+  const handleSidebarResizeStart = (event) => {
+    if (destroyed) return;
     if (!(event instanceof MouseEvent)) {
       throw new TypeError('Sidebar resize start requires a MouseEvent.');
     }
@@ -153,21 +160,32 @@ export function initSidebarControls({ dom, onViewportOcclusionChange }) {
     ownerDocument.body.style.cursor = 'ew-resize';
     ownerDocument.body.style.userSelect = 'none';
     event.preventDefault();
-  });
+  };
+  sidebarResizeHandle.addEventListener(
+    'mousedown',
+    handleSidebarResizeStart
+  );
 
-  ownerDocument.addEventListener('mousemove', (event) => {
+  const handleSidebarResizeMove = (event) => {
+    if (destroyed) return;
     if (!isResizing) return;
     if (responsiveResizeMedia.matches) {
       finishSidebarResize();
       return;
     }
     updateSidebarWidth(startWidth + event.clientX - startX);
-  });
+  };
+  ownerDocument.addEventListener('mousemove', handleSidebarResizeMove);
 
   ownerDocument.addEventListener('mouseup', finishSidebarResize);
-  responsiveResizeMedia.addEventListener('change', event => {
+  const handleResponsiveResizeChange = event => {
+    if (destroyed) return;
     if (event.matches) finishSidebarResize();
-  });
+  };
+  responsiveResizeMedia.addEventListener(
+    'change',
+    handleResponsiveResizeChange
+  );
 
   const geometryObserver = new ResizeObserver(publishViewportOcclusion);
   geometryObserver.observe(sidebar);
@@ -176,6 +194,26 @@ export function initSidebarControls({ dom, onViewportOcclusionChange }) {
   return {
     syncSidebarToggleState,
     disconnectGeometryObserver() {
+      geometryObserver.disconnect();
+    },
+    destroy() {
+      if (destroyed) return;
+      destroyed = true;
+      finishSidebarResize();
+      sidebarToggle.removeEventListener('click', handleSidebarToggle);
+      sidebarResizeHandle.removeEventListener(
+        'mousedown',
+        handleSidebarResizeStart
+      );
+      ownerDocument.removeEventListener(
+        'mousemove',
+        handleSidebarResizeMove
+      );
+      ownerDocument.removeEventListener('mouseup', finishSidebarResize);
+      responsiveResizeMedia.removeEventListener(
+        'change',
+        handleResponsiveResizeChange
+      );
       geometryObserver.disconnect();
     },
   };

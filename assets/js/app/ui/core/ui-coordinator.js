@@ -29,7 +29,111 @@ import { initVisualizationReset } from '../modules/visualization-reset.js';
 import { initFigureExport } from '../modules/figure-export/index.js';
 import { initCinematicCamera } from '../modules/cinematic-camera/index.js';
 import { initInfoPopovers } from '../components/info-popovers.js';
+import {
+  clearPublishedSnapshotViews,
+  publishSnapshotView,
+  retireSnapshotView,
+} from '../../view-snapshot-publication.js';
 import { debug } from '../../../utils/debug.js';
+
+/**
+ * Build one terminal cleanup owner whose Promise identity is stable even when
+ * a child cleanup synchronously re-enters the returned destroy function.
+ *
+ * @param {object} options
+ * @param {() => void} options.closeAdmission
+ * @param {() => Array<() => unknown>} options.getOperations
+ * @param {string} options.failureMessage
+ * @returns {() => Promise<void>}
+ */
+export function createStableTerminalDestroy({
+  closeAdmission,
+  getOperations,
+  failureMessage,
+}) {
+  if (typeof closeAdmission !== 'function') {
+    throw new TypeError(
+      'Terminal cleanup requires a synchronous admission closer.'
+    );
+  }
+  if (typeof getOperations !== 'function') {
+    throw new TypeError(
+      'Terminal cleanup requires an operation-list owner.'
+    );
+  }
+  if (typeof failureMessage !== 'string' || failureMessage.length === 0) {
+    throw new TypeError(
+      'Terminal cleanup requires a non-empty aggregate failure message.'
+    );
+  }
+
+  let terminalPromise = null;
+  return function destroy() {
+    if (terminalPromise !== null) return terminalPromise;
+
+    let resolveTerminal;
+    let rejectTerminal;
+    terminalPromise = new Promise((resolve, reject) => {
+      resolveTerminal = resolve;
+      rejectTerminal = reject;
+    });
+
+    const failures = [];
+    const pending = [];
+    const cleanup = operation => {
+      try {
+        const result = operation();
+        if (result !== null && typeof result?.then === 'function') {
+          pending.push(result);
+        }
+      } catch (error) {
+        failures.push(error);
+      }
+    };
+
+    cleanup(closeAdmission);
+    let operations = [];
+    try {
+      operations = getOperations();
+      if (
+        !Array.isArray(operations)
+        || operations.some(operation => typeof operation !== 'function')
+      ) {
+        throw new TypeError(
+          'Terminal cleanup operations must be an array of functions.'
+        );
+      }
+    } catch (error) {
+      failures.push(error);
+      operations = [];
+    }
+    for (const operation of operations) cleanup(operation);
+
+    void Promise.allSettled(pending).then(outcomes => {
+      try {
+        for (const outcome of outcomes) {
+          if (outcome.status === 'rejected') failures.push(outcome.reason);
+        }
+        const exactFailures = [...new Set(failures)];
+        if (exactFailures.length === 1) {
+          rejectTerminal(exactFailures[0]);
+          return;
+        }
+        if (exactFailures.length > 1) {
+          rejectTerminal(new AggregateError(
+            exactFailures,
+            failureMessage
+          ));
+          return;
+        }
+        resolveTerminal();
+      } catch (error) {
+        rejectTerminal(error);
+      }
+    });
+    return terminalPromise;
+  };
+}
 
 /**
  * Initialize the full app UI.
@@ -60,8 +164,9 @@ export function initUI({
   const infoPopovers = initInfoPopovers({ root: document });
   let viewControls = null;
   let cinematicCamera = null;
+  let destroyed = false;
 
-  initSidebarControls({
+  const sidebarControls = initSidebarControls({
     dom: dom.sidebar,
     onViewportOcclusionChange: viewer.setViewportLeftOcclusionRatio,
   });
@@ -113,13 +218,16 @@ export function initUI({
   const scheduleFrame = typeof requestAnimationFrame === 'function'
     ? requestAnimationFrame
     : (fn) => setTimeout(fn, 0);
-  let visibilityUiScheduled = false;
+  const cancelFrame = typeof cancelAnimationFrame === 'function'
+    ? cancelAnimationFrame
+    : clearTimeout;
+  let visibilityUiFrame = null;
 
   function scheduleVisibilityUiUpdate() {
-    if (visibilityUiScheduled) return;
-    visibilityUiScheduled = true;
-    scheduleFrame(() => {
-      visibilityUiScheduled = false;
+    if (destroyed || visibilityUiFrame !== null) return;
+    visibilityUiFrame = scheduleFrame(() => {
+      visibilityUiFrame = null;
+      if (destroyed) return;
       // Field activation publishes visibility before the selector can commit
       // the replacement legend. Refreshing counts in the same frame keeps the
       // DOM and active model in one completed UI generation.
@@ -144,6 +252,7 @@ export function initUI({
   }
 
   function syncNavigationUiForView(viewId) {
+    if (destroyed) return;
     const navSelect = dom.camera.navigationModeSelect;
     const mode = viewer.getViewNavigationMode(viewId);
 
@@ -252,16 +361,14 @@ export function initUI({
     syncNavigationUiForView(state.getActiveViewId());
   }
 
-  const { showSessionStatus } = initSessionControls({
+  const sessionControls = initSessionControls({
     dom: dom.session,
     sessionSerializer,
     onAfterLoad: refreshUiAfterStateLoad
   });
+  const { showSessionStatus } = sessionControls;
 
-  const {
-    catalogReady: datasetCatalogReady,
-    refreshDatasetUI
-  } = initDatasetControls({
+  const datasetControls = initDatasetControls({
     dom: dom.dataset,
     dataSourceManager,
     clearDataset: clearActiveDataset,
@@ -287,8 +394,12 @@ export function initUI({
       showSessionStatus
     }
   });
+  const {
+    catalogReady: datasetCatalogReady,
+    refreshDatasetUI
+  } = datasetControls;
 
-  initFigureExport({
+  const figureExportControls = initFigureExport({
     state,
     viewer,
     dom: dom.figureExport,
@@ -302,7 +413,7 @@ export function initUI({
   });
   syncNavigationUiForView(state.getActiveViewId());
 
-  initVisualizationReset({
+  const visualizationReset = initVisualizationReset({
     viewer,
     renderDom: dom.render,
     cameraDom: dom.camera,
@@ -311,8 +422,11 @@ export function initUI({
   });
 
   // State change wiring
-  state.on('visibility:changed', handleVisibilityChange);
-  state.on('field:changed', () => {
+  const unsubscribeVisibility = state.on(
+    'visibility:changed',
+    handleVisibilityChange
+  );
+  const handleFieldChanged = () => {
     fieldSelector.renderFieldSelects?.();
     fieldSelector.renderDeletedFieldsSection?.();
     fieldSelector.initGeneExpressionDropdown?.();
@@ -322,11 +436,19 @@ export function initUI({
     highlightControls.updateHighlightMode?.();
     communityAnnotationControls.render?.();
     handleVisibilityChange();
-  });
-  state.on('dimension:changed', () => {
+  };
+  const unsubscribeField = state.on(
+    'field:changed',
+    handleFieldChanged
+  );
+  const handleDimensionChanged = () => {
     statsDisplay.updateStats?.(buildStatsInfoFromState());
     viewControls?.renderSplitViewBadges?.();
-  });
+  };
+  const unsubscribeDimension = state.on(
+    'dimension:changed',
+    handleDimensionChanged
+  );
 
   // Initial render pass
   fieldSelector.renderFieldSelects?.();
@@ -342,6 +464,138 @@ export function initUI({
   handleActiveFieldChanged(buildStatsInfoFromState());
   syncNavigationUiForView(state.getActiveViewId());
 
+  function assertAlive() {
+    if (destroyed) {
+      throw new Error('The application UI is unavailable after destroy().');
+    }
+  }
+
+  function publishOwnedSnapshot(config) {
+    assertAlive();
+    const created = publishSnapshotView({ state, viewer, config });
+    try {
+      viewControls.syncFromStateAndViewer();
+      return created;
+    } catch (error) {
+      const rollbackFailures = [];
+      try {
+        retireSnapshotView({
+          state,
+          viewer,
+          snapshotId: created.id,
+        });
+      } catch (rollbackError) {
+        rollbackFailures.push(rollbackError);
+      }
+      try {
+        viewControls.syncFromStateAndViewer();
+      } catch (reconciliationError) {
+        rollbackFailures.push(reconciliationError);
+      }
+      if (rollbackFailures.length > 0) {
+        throw new AggregateError(
+          [error, ...rollbackFailures],
+          'Snapshot publication succeeded but UI synchronization and rollback reconciliation failed.'
+        );
+      }
+      throw error;
+    }
+  }
+
+  function retireOwnedSnapshot(snapshotId) {
+    assertAlive();
+    let remaining;
+    let retirementError = null;
+    try {
+      remaining = retireSnapshotView({
+        state,
+        viewer,
+        snapshotId,
+      });
+    } catch (error) {
+      retirementError = error;
+    }
+    try {
+      viewControls.syncFromStateAndViewer();
+    } catch (reconciliationError) {
+      if (retirementError !== null) {
+        throw new AggregateError(
+          [retirementError, reconciliationError],
+          `Snapshot "${snapshotId}" retirement failed and its UI could not be reconciled.`
+        );
+      }
+      throw reconciliationError;
+    }
+    if (retirementError !== null) throw retirementError;
+    return remaining;
+  }
+
+  function clearOwnedSnapshots() {
+    assertAlive();
+    let remaining;
+    let clearingError = null;
+    try {
+      remaining = clearPublishedSnapshotViews({ state, viewer });
+    } catch (error) {
+      clearingError = error;
+    }
+    try {
+      viewControls.syncFromStateAndViewer();
+    } catch (reconciliationError) {
+      if (clearingError !== null) {
+        throw new AggregateError(
+          [clearingError, reconciliationError],
+          'Snapshot clearing failed and its UI could not be reconciled.'
+        );
+      }
+      throw reconciliationError;
+    }
+    if (clearingError !== null) throw clearingError;
+    return remaining;
+  }
+
+  const destroy = createStableTerminalDestroy({
+    closeAdmission: () => {
+      destroyed = true;
+      if (visibilityUiFrame !== null) {
+        cancelFrame(visibilityUiFrame);
+        visibilityUiFrame = null;
+      }
+    },
+    getOperations: () => [
+      unsubscribeVisibility,
+      unsubscribeField,
+      unsubscribeDimension,
+      () => renderControls.destroy(),
+      () => cameraControls.destroy(),
+      () => legend.destroy(),
+      () => filterControls.destroy(),
+      () => highlightControls.destroy(),
+      () => sessionControls.destroy(),
+      () => visualizationReset.destroy(),
+      () => viewer.setNavigationModeChangeHandler(() => {}),
+      () => viewer.setSmokeRenderFailureHandler(() => {}),
+      () => viewer.setVelocityRenderFailureHandler?.(() => {}),
+      () => viewer.setPointerLockChangeHandler(() => {}),
+      () => viewer.setViewFocusHandler(() => {}),
+      () => velocityOverlayControls.destroy(),
+      () => dimensionControls.destroy(),
+      () => datasetControls.destroy(),
+      () => {
+        if (typeof figureExportControls.destroy === 'function') {
+          return figureExportControls.destroy();
+        }
+      },
+      () => sidebarControls.destroy(),
+      () => viewControls.destroy(),
+      () => cinematicCamera?.destroy?.(),
+      () => communityAnnotationControls.destroy?.(),
+      () => infoPopovers.destroy(),
+      () => fieldSelector.destroy(),
+    ],
+    failureMessage: 'Application UI teardown was incomplete.',
+  });
+
   return {
     activateField: fieldSelector.activateField,
     applyRenderMode: renderControls.applyRenderMode,
@@ -351,6 +605,10 @@ export function initUI({
     refreshDatasetUI,
     settleFieldInteractions: fieldSelector.settleAllInteractions,
     datasetCatalogReady,
-    cinematicCamera
+    cinematicCamera,
+    publishSnapshotView: publishOwnedSnapshot,
+    retireSnapshotView: retireOwnedSnapshot,
+    clearSnapshotViews: clearOwnedSnapshots,
+    destroy,
   };
 }

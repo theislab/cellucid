@@ -205,17 +205,34 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   let previewDisposed = false;
   let exportInFlight = false;
   let activeExportAbortController = null;
+  const domLifecycle = new AbortController();
   const previewEpochFence = createFigurePreviewEpochFence();
+  function listen(target, eventName, handler) {
+    const fencedHandler = event => {
+      if (cleanupComplete) return;
+      return handler(event);
+    };
+    target.addEventListener(
+      eventName,
+      fencedHandler,
+      { signal: domLifecycle.signal }
+    );
+  }
   cleanupFns.push(() => {
     activeExportAbortController?.abort();
     activeExportAbortController = null;
     exportInFlight = false;
   });
-  container.__cellucidCleanup = () => {
+  const destroy = () => {
     if (cleanupComplete) return;
     cleanupComplete = true;
     container.__cellucidCleanup = () => {};
     const failures = [];
+    try {
+      domLifecycle.abort();
+    } catch (error) {
+      failures.push(error);
+    }
     for (const fn of cleanupFns.splice(0)) {
       try {
         fn();
@@ -230,6 +247,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       );
     }
   };
+  container.__cellucidCleanup = destroy;
 
   const presets = [
     { label: 'Screen (half)', value: 'screen-half' },
@@ -545,8 +563,8 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     axisLabelSettings.style.display = includeAxesCheckbox.checked ? 'grid' : 'none';
     legendSettingsRow.style.display = includeLegendCheckbox.checked ? 'flex' : 'none';
   }
-  includeAxesCheckbox.addEventListener('change', syncAnnotationUi);
-  includeLegendCheckbox.addEventListener('change', syncAnnotationUi);
+  listen(includeAxesCheckbox, 'change', syncAnnotationUi);
+  listen(includeLegendCheckbox, 'change', syncAnnotationUi);
   syncAnnotationUi();
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -730,27 +748,29 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   }
 
   function reportPreviewFailure(context, error) {
-    if (previewDisposed) return;
+    if (cleanupComplete || previewDisposed) return;
     previewStatus.textContent =
       'Preview unavailable. Refresh after the view settles.';
     console.error(`[FigureExport] ${context} failed:`, error);
   }
 
   async function runPreviewUiAction(context, action) {
+    if (cleanupComplete || previewDisposed) return false;
     try {
-      return await action();
+      const result = await action();
+      return cleanupComplete || previewDisposed ? false : result;
     } catch (error) {
       reportPreviewFailure(context, error);
       return false;
     }
   }
 
-  backgroundSelect.addEventListener('change', syncFormatDependentUi);
-  emphasizeSelectionCheckbox.addEventListener('change', syncFormatDependentUi);
-  downloadSelect.addEventListener('change', syncFormatDependentUi);
-  dpiSelect.addEventListener('change', syncFormatDependentUi);
-  strategySelect.addEventListener('change', syncFormatDependentUi);
-  previewEnabledCheckbox.addEventListener('change', () => {
+  listen(backgroundSelect, 'change', syncFormatDependentUi);
+  listen(emphasizeSelectionCheckbox, 'change', syncFormatDependentUi);
+  listen(downloadSelect, 'change', syncFormatDependentUi);
+  listen(dpiSelect, 'change', syncFormatDependentUi);
+  listen(strategySelect, 'change', syncFormatDependentUi);
+  listen(previewEnabledCheckbox, 'change', () => {
     void runPreviewUiAction('Preview toggle', async () => {
       if (!previewEnabledCheckbox.checked) {
         previewFramingMode = 'edit';
@@ -790,7 +810,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     });
   });
 
-  previewRefreshBtn.addEventListener('click', () => {
+  listen(previewRefreshBtn, 'click', () => {
     void runPreviewUiAction('Preview refresh', async () => {
       if (!previewEnabledCheckbox.checked) return false;
       const needsCropPreview =
@@ -804,7 +824,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     });
   });
 
-  previewModeSelect.addEventListener('change', schedulePreviewDraw);
+  listen(previewModeSelect, 'change', schedulePreviewDraw);
 
   // Redraw preview on option changes (no sample rebuild).
   const previewInputs = [
@@ -832,11 +852,11 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     cropEnabledCheckbox,
   ];
   for (const el of previewInputs) {
-    el.addEventListener('change', schedulePreviewDraw);
-    el.addEventListener('input', schedulePreviewDraw);
+    listen(el, 'change', schedulePreviewDraw);
+    listen(el, 'input', schedulePreviewDraw);
   }
 
-  cropEnabledCheckbox.addEventListener('change', () => {
+  listen(cropEnabledCheckbox, 'change', () => {
     if (cropEnabledCheckbox.checked) {
       cropEnabled = true;
       previewFramingMode = 'edit';
@@ -855,7 +875,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     schedulePreviewDraw();
   });
 
-  cropResetBtn.addEventListener('click', () => {
+  listen(cropResetBtn, 'click', () => {
     cropEnabled = true;
     cropEnabledCheckbox.checked = true;
     previewFramingMode = 'edit';
@@ -865,7 +885,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     schedulePreviewDraw();
   });
 
-  lockAspectBtn.addEventListener('click', () => {
+  listen(lockAspectBtn, 'click', () => {
     if (!cropEnabled) return;
     cropLockCheckbox.checked = !cropLockCheckbox.checked;
     lockAspectBtn.setAttribute('aria-pressed', cropLockCheckbox.checked ? 'true' : 'false');
@@ -876,7 +896,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     schedulePreviewDraw();
   });
 
-  cropConfirmBtn.addEventListener('click', () => {
+  listen(cropConfirmBtn, 'click', () => {
     void runPreviewUiAction('Preview framing', async () => {
       if (!cropEnabled) return false;
       if (previewFramingMode === 'applied') {
@@ -926,7 +946,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     });
   });
 
-  cropFitPlotBtn.addEventListener('click', () => {
+  listen(cropFitPlotBtn, 'click', () => {
     if (!cropEnabled) return;
     const viewId = getActiveViewIdForPreview();
     const rs = getPreviewRenderStateForView(viewId);
@@ -1007,7 +1027,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     if (centroidPx != null) centroidLabelFontSizeInput.value = String(centroidPx);
   }
 
-  autoTextSizingCheckbox.addEventListener('change', () => {
+  listen(autoTextSizingCheckbox, 'change', () => {
     syncTextSizingUi();
     schedulePreviewDraw();
   });
@@ -1022,8 +1042,8 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     schedulePreviewDraw();
   };
   for (const el of aspectInputs) {
-    el.addEventListener('input', onPlotSizeAspectChange);
-    el.addEventListener('change', onPlotSizeAspectChange);
+    listen(el, 'input', onPlotSizeAspectChange);
+    listen(el, 'change', onPlotSizeAspectChange);
   }
 
   function readSizePreset() {
@@ -1038,7 +1058,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     heightInput.value = String(nextH);
   }
 
-  presetSelect.addEventListener('change', () => {
+  listen(presetSelect, 'change', () => {
     const value = presetSelect.value;
     if (value === 'screen' || value === 'screen-half') {
       readSizePreset();
@@ -1103,6 +1123,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   }
 
   function syncAutoTitle() {
+    if (cleanupComplete || previewDisposed) return;
     if (!titleAutofillEnabled) return;
     const next = buildAutoTitle();
     if (!next) {
@@ -1122,7 +1143,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     schedulePreviewDraw();
   }
 
-  titleInput.addEventListener('input', (evt) => {
+  listen(titleInput, 'input', (evt) => {
     if (settingAutoTitle) return;
     const isTrusted = evt?.isTrusted === true;
     const value = String(titleInput.value || '').trim();
@@ -1137,7 +1158,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       }
       previewTitleTimer = setTimeout(() => {
         previewTitleTimer = null;
-        if (!previewDisposed) syncAutoTitle();
+        if (!cleanupComplete && !previewDisposed) syncAutoTitle();
       }, 0);
       return;
     }
@@ -1314,7 +1335,9 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   }
 
   function waitForPreviewFrame() {
-    if (previewDisposed) return Promise.resolve(false);
+    if (cleanupComplete || previewDisposed) {
+      return Promise.resolve(false);
+    }
     cancelPendingPreviewFrame();
     return new Promise((resolve) => {
       const owner = {
@@ -1327,7 +1350,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
           return;
         }
         previewPendingFrame = null;
-        resolve(!previewDisposed);
+        resolve(!cleanupComplete && !previewDisposed);
       });
       previewPendingFrame = owner;
     });
@@ -1335,6 +1358,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
 
   function queuePreviewRebuild(delayMs = 0) {
     if (
+      cleanupComplete ||
       previewDisposed ||
       !previewEnabledCheckbox.checked
     ) {
@@ -1346,7 +1370,13 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     }
     previewRebuildTimer = setTimeout(() => {
       previewRebuildTimer = null;
-      if (previewDisposed || !previewEnabledCheckbox.checked) return;
+      if (
+        cleanupComplete ||
+        previewDisposed ||
+        !previewEnabledCheckbox.checked
+      ) {
+        return;
+      }
       const mode =
         cropEnabled && previewFramingMode === 'applied'
           ? 'crop'
@@ -1366,6 +1396,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     rebuild = true,
     rebuildDelayMs = 0,
   } = {}) {
+    if (cleanupComplete || previewDisposed) return;
     previewEpochFence.invalidate();
     previewBuildToken++;
     cancelPendingPreviewFrame();
@@ -1744,7 +1775,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
    * @returns {Promise<boolean>} Whether this invocation committed the newest sample.
    */
   async function buildPreviewSample({ force = false, mode = 'full' } = {}) {
-    if (previewDisposed) return false;
+    if (cleanupComplete || previewDisposed) return false;
     const wantsCrop = mode === 'crop';
     const existing =
       wantsCrop ? previewSampleCrop : previewSampleFull;
@@ -1935,6 +1966,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
 
   function schedulePreviewDraw() {
     if (
+      cleanupComplete ||
       previewDisposed ||
       !previewEnabledCheckbox.checked
     ) {
@@ -1945,7 +1977,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     }
     previewDrawTimer = setTimeout(() => {
       previewDrawTimer = null;
-      if (!previewDisposed) drawPreview();
+      if (!cleanupComplete && !previewDisposed) drawPreview();
     }, 80);
   }
 
@@ -2650,7 +2682,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     return true;
   }
 
-  previewCanvas.addEventListener('pointerdown', (evt) => {
+  listen(previewCanvas, 'pointerdown', (evt) => {
     if (!previewEnabledCheckbox.checked || !cropEnabled) return;
     if (previewFramingMode !== 'edit') return;
     if (
@@ -2691,7 +2723,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     evt.preventDefault();
   });
 
-  previewCanvas.addEventListener('pointermove', (evt) => {
+  listen(previewCanvas, 'pointermove', (evt) => {
     if (!previewEnabledCheckbox.checked || !cropEnabled) return;
     if (previewFramingMode !== 'edit') return;
     if (
@@ -2766,10 +2798,10 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     updateCropCursor(null);
   }
 
-  previewCanvas.addEventListener('pointerup', endCropDrag);
-  previewCanvas.addEventListener('pointercancel', endCropDrag);
-  previewCanvas.addEventListener('lostpointercapture', endCropDrag);
-  previewCanvas.addEventListener('dblclick', () => {
+  listen(previewCanvas, 'pointerup', endCropDrag);
+  listen(previewCanvas, 'pointercancel', endCropDrag);
+  listen(previewCanvas, 'lostpointercapture', endCropDrag);
+  listen(previewCanvas, 'dblclick', () => {
     if (!cropEnabled) return;
     previewFramingMode = 'edit';
     previewSampleCrop = null;
@@ -2777,7 +2809,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     syncCropUi();
     schedulePreviewDraw();
   });
-  previewCanvas.addEventListener('keydown', (evt) => {
+  listen(previewCanvas, 'keydown', (evt) => {
     if (
       !previewEnabledCheckbox.checked ||
       !cropEnabled ||
@@ -2863,7 +2895,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     return value;
   }
 
-  exportBtn.addEventListener('click', () => {
+  listen(exportBtn, 'click', () => {
     void handleFigureExportClick();
   });
 
@@ -3074,7 +3106,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       ]
     );
     const panel = createElement('div', { className: 'analysis-accordion-content', id: contentId }, content);
-    toggle.addEventListener('click', () => {
+    listen(toggle, 'click', () => {
       const next = !item.classList.contains('open');
       if (next) {
         const parent = item.parentElement;
@@ -3132,5 +3164,5 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   syncFormatDependentUi();
   syncCropUi();
 
-  return {};
+  return { destroy };
 }

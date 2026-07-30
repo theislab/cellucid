@@ -67,6 +67,34 @@ async function nextTask() {
   await new Promise(resolve => setImmediate(resolve));
 }
 
+function createDeterministicTimeoutClock() {
+  let nextId = 1;
+  const pending = new Map();
+  return Object.freeze({
+    schedule(callback, delay) {
+      assert.equal(typeof callback, 'function');
+      assert.equal(Number.isFinite(delay) && delay >= 0, true);
+      const id = nextId;
+      nextId += 1;
+      pending.set(id, callback);
+      return id;
+    },
+    cancel(id) {
+      pending.delete(id);
+    },
+    get pendingCount() {
+      return pending.size;
+    },
+    runNext() {
+      const entry = pending.entries().next();
+      assert.equal(entry.done, false, 'Expected one scheduled timeout.');
+      const [id, callback] = entry.value;
+      pending.delete(id);
+      callback();
+    },
+  });
+}
+
 async function waitFor(condition, label) {
   for (let attempt = 0; attempt < 50; attempt++) {
     if (condition()) return;
@@ -1314,6 +1342,7 @@ test('main binds bridge initialization and session upload to one captured config
 test('Jupyter health probes are single-flight and fence late lifecycle failures', async () => {
   const probes = [];
   const failures = [];
+  const clock = createDeterministicTimeoutClock();
   let activeProbeCount = 0;
   let maximumActiveProbeCount = 0;
   const monitor = createJupyterHealthMonitor({
@@ -1333,54 +1362,58 @@ test('Jupyter health probes are single-flight and fence late lifecycle failures'
       failures.push(error);
     },
     intervalMs: 0,
+    scheduleTimeout: clock.schedule,
+    cancelTimeout: clock.cancel,
   });
 
   assert.equal(monitor.start(), true);
   assert.equal(monitor.start(), false);
-  await waitFor(
-    () => probes.length === 1,
-    'the initial health probe',
-  );
+  assert.equal(clock.pendingCount, 1);
+  clock.runNext();
   assert.equal(probes.length, 1);
   assert.equal(monitor.isProbeInFlight(), true);
   await nextTask();
   assert.equal(probes.length, 1);
+  assert.equal(clock.pendingCount, 0);
 
   probes[0].resolve();
-  await waitFor(() => probes.length === 2, 'the second health probe');
+  await nextTask();
+  assert.equal(clock.pendingCount, 1);
+  clock.runNext();
   assert.equal(probes.length, 2);
   const terminalFailure = new Error('synthetic health failure');
   probes[1].reject(terminalFailure);
-  await waitFor(() => monitor.isFrozen(), 'terminal health freeze');
+  await nextTask();
   assert.equal(monitor.isFrozen(), true);
   assert.deepEqual(failures, [terminalFailure]);
   assert.equal(maximumActiveProbeCount, 1);
   await nextTask();
   assert.equal(probes.length, 2);
+  assert.equal(clock.pendingCount, 0);
 
   const staleProbe = deferred();
   const staleFailures = [];
+  const staleClock = createDeterministicTimeoutClock();
   const frozenMonitor = createJupyterHealthMonitor({
     checkHealth: () => staleProbe.promise,
     onFailure: error => {
       staleFailures.push(error);
     },
     intervalMs: 0,
+    scheduleTimeout: staleClock.schedule,
+    cancelTimeout: staleClock.cancel,
   });
   frozenMonitor.start();
-  await waitFor(
-    () => frozenMonitor.isProbeInFlight(),
-    'the stale health probe',
-  );
+  assert.equal(staleClock.pendingCount, 1);
+  staleClock.runNext();
   assert.equal(frozenMonitor.isProbeInFlight(), true);
   assert.equal(frozenMonitor.freeze(), true);
   staleProbe.reject(new Error('late retired health failure'));
-  await waitFor(
-    () => !frozenMonitor.isProbeInFlight(),
-    'retired health settlement',
-  );
+  await nextTask();
+  assert.equal(frozenMonitor.isProbeInFlight(), false);
   assert.deepEqual(staleFailures, []);
   assert.equal(frozenMonitor.isFrozen(), true);
+  assert.equal(staleClock.pendingCount, 0);
 });
 
 test('Jupyter hover delivery serializes sends and coalesces to the latest intent', async () => {
@@ -1657,6 +1690,14 @@ test('Jupyter pointer hooks use per-view pick records without changing wire payl
   assert.doesNotMatch(
     mainSource,
     /getCellPosition\([^)]*,\s*['"]live['"]\)/,
+  );
+  assert.match(
+    mainSource,
+    /const retireJupyterView = event => \{\s*if \(event\.persisted === true\) return;\s*window\.removeEventListener\('pagehide', retireJupyterView\);\s*freezeJupyterView\(\);\s*\};\s*window\.addEventListener\('pagehide', retireJupyterView\);/,
+  );
+  assert.doesNotMatch(
+    mainSource,
+    /freezeJupyterView\(\);\s*\},\s*\{ once: true \}/,
   );
 
   const freezeStart = mainSource.indexOf(

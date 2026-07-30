@@ -45,6 +45,9 @@ import {
   computePaneCenterNdcX
 } from './viewport-center.js';
 import { findRaySamplePick } from './picking.js';
+import {
+  PresentedCameraSettlementTracker
+} from './presented-camera-settlement.js';
 
 const VALID_DIMENSION_LEVELS = new Set([1, 2, 3]);
 const INITIAL_DIMENSION_LEVEL = 3;
@@ -2860,11 +2863,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 	  const publishedLodCertificates = new Map();
 	  const presentedViewStateListeners = new Set();
 	  let presentedViewStateGeneration = 0;
-	  const PRESENTED_CAMERA_SETTLE_MS = 120;
+	  const presentedCameraSettlement =
+	    new PresentedCameraSettlementTracker();
 	  const presentedFrameState = {
 	    initialized: false,
-	    pending: false,
-	    lastChangeTime: 0,
 	    canvasHeight: 0,
 	    canvasWidth: 0,
 	    navigationMode: null,
@@ -2933,7 +2935,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 	    // duplicate trailing event for the same change.
 	    if (resetFrameBaseline) {
 	      presentedFrameState.initialized = false;
-	      presentedFrameState.pending = false;
+	      presentedCameraSettlement.reset();
 	    }
 	    if (presentedViewStateListeners.size === 0) return;
 	    presentedViewStateGeneration =
@@ -2965,7 +2967,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 	  function trackPresentedFrameState(now, canvasWidth, canvasHeight) {
 	    if (presentedViewStateListeners.size === 0) {
 	      presentedFrameState.initialized = false;
-	      presentedFrameState.pending = false;
+	      presentedCameraSettlement.reset();
 	      return;
 	    }
 	    const state = presentedFrameState;
@@ -3003,28 +3005,28 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 	      state.freeflyZ = freeflyPosition[2];
 	      state.freeflyYaw = freeflyYaw;
 	      state.freeflyPitch = freeflyPitch;
-	      if (wasInitialized) {
-	        const startsBurst = !state.pending;
-	        state.pending = true;
-	        state.lastChangeTime = now;
-	        if (startsBurst) {
-	          publishPresentedViewStateChange(
-	            'camera-changing',
-	            focusedViewId,
-	            false
-	          );
-	        }
+	      const transition = presentedCameraSettlement.observeFrame(
+	        true,
+	        now,
+	        wasInitialized
+	      );
+	      if (transition === 'camera-changing') {
+	        publishPresentedViewStateChange(
+	          transition,
+	          focusedViewId,
+	          false
+	        );
 	      }
 	      return;
 	    }
-	    if (
-	      state.pending &&
-	      now - state.lastChangeTime >=
-	        PRESENTED_CAMERA_SETTLE_MS
-	    ) {
-	      state.pending = false;
+	    const transition = presentedCameraSettlement.observeFrame(
+	      false,
+	      now,
+	      true
+	    );
+	    if (transition === 'camera-settled') {
 	      publishPresentedViewStateChange(
-	        'camera-settled',
+	        transition,
 	        focusedViewId
 	      );
 	    }

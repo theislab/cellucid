@@ -29,14 +29,30 @@ class FakeElement {
     };
   }
 
-  addEventListener(type, listener) {
+  addEventListener(type, listener, options = {}) {
+    if (options.signal?.aborted) return;
     const listeners = this.listeners.get(type) ?? [];
     listeners.push(listener);
     this.listeners.set(type, listeners);
+    if (options.signal) {
+      options.signal.addEventListener(
+        'abort',
+        () => this.removeEventListener(type, listener),
+        { once: true },
+      );
+    }
+  }
+
+  removeEventListener(type, listener) {
+    const listeners = this.listeners.get(type) ?? [];
+    this.listeners.set(
+      type,
+      listeners.filter(candidate => candidate !== listener),
+    );
   }
 
   dispatch(type) {
-    for (const listener of this.listeners.get(type) ?? []) {
+    for (const listener of [...(this.listeners.get(type) ?? [])]) {
       listener({ target: this });
     }
   }
@@ -605,6 +621,168 @@ test('committed smoke changes coalesce and rebuild after one paint generation', 
   assert.equal(frameCallbacks.length, 1);
   frameCallbacks.shift()(2);
   assert.deepEqual(smokeCalls, [currentGridSize]);
+});
+
+test('render-control destroy cancels and fences debounce and first-frame owners', t => {
+  const restore = installDocument();
+  t.after(restore);
+  const priorSetTimeout = globalThis.setTimeout;
+  const priorClearTimeout = globalThis.clearTimeout;
+  const priorRequestAnimationFrame = Object.getOwnPropertyDescriptor(
+    globalThis,
+    'requestAnimationFrame',
+  );
+  const priorCancelAnimationFrame = Object.getOwnPropertyDescriptor(
+    globalThis,
+    'cancelAnimationFrame',
+  );
+  let nextOwnerId = 1;
+  const timeoutCallbacks = new Map();
+  const frameCallbacks = new Map();
+  const cancelledTimeouts = [];
+  const cancelledFrames = [];
+  globalThis.setTimeout = callback => {
+    const id = nextOwnerId++;
+    timeoutCallbacks.set(id, callback);
+    return id;
+  };
+  globalThis.clearTimeout = id => {
+    cancelledTimeouts.push(id);
+  };
+  Object.defineProperty(globalThis, 'requestAnimationFrame', {
+    configurable: true,
+    writable: true,
+    value(callback) {
+      const id = nextOwnerId++;
+      frameCallbacks.set(id, callback);
+      return id;
+    },
+  });
+  Object.defineProperty(globalThis, 'cancelAnimationFrame', {
+    configurable: true,
+    writable: true,
+    value(id) {
+      cancelledFrames.push(id);
+    },
+  });
+  t.after(() => {
+    globalThis.setTimeout = priorSetTimeout;
+    globalThis.clearTimeout = priorClearTimeout;
+    if (priorRequestAnimationFrame === undefined) {
+      delete globalThis.requestAnimationFrame;
+    } else {
+      Object.defineProperty(
+        globalThis,
+        'requestAnimationFrame',
+        priorRequestAnimationFrame,
+      );
+    }
+    if (priorCancelAnimationFrame === undefined) {
+      delete globalThis.cancelAnimationFrame;
+    } else {
+      Object.defineProperty(
+        globalThis,
+        'cancelAnimationFrame',
+        priorCancelAnimationFrame,
+      );
+    }
+  });
+
+  const { viewer, dom, smoke, smokeCalls } = makeOptions();
+  const controls = initRenderControls({ viewer, dom, smoke });
+  controls.applyRenderMode('smoke');
+  smokeCalls.length = 0;
+
+  dom.smokeGridInput.value = '0';
+  dom.smokeGridInput.dispatch('input');
+  const timeoutOwner = [...timeoutCallbacks.keys()][0];
+  assert.equal(Number.isInteger(timeoutOwner), true);
+
+  controls.markSmokeDirty();
+  const firstFrameOwner = [...frameCallbacks.keys()][0];
+  assert.deepEqual(cancelledTimeouts, [timeoutOwner]);
+  assert.equal(Number.isInteger(firstFrameOwner), true);
+
+  controls.destroy();
+  controls.destroy();
+
+  assert.deepEqual(cancelledFrames, [firstFrameOwner]);
+  const viewerCallCount = viewer.calls.length;
+  dom.pointSizeInput.value = '50';
+  dom.pointSizeInput.dispatch('input');
+  assert.equal(viewer.calls.length, viewerCallCount);
+
+  timeoutCallbacks.get(timeoutOwner)();
+  frameCallbacks.get(firstFrameOwner)(1);
+  assert.deepEqual(smokeCalls, []);
+  assert.equal(frameCallbacks.size, 1);
+});
+
+test('render-control destroy cancels and fences the nested rebuild frame', t => {
+  const restore = installDocument();
+  t.after(restore);
+  const priorRequestAnimationFrame = Object.getOwnPropertyDescriptor(
+    globalThis,
+    'requestAnimationFrame',
+  );
+  const priorCancelAnimationFrame = Object.getOwnPropertyDescriptor(
+    globalThis,
+    'cancelAnimationFrame',
+  );
+  let nextFrameId = 1;
+  const frameCallbacks = new Map();
+  const cancelledFrames = [];
+  Object.defineProperty(globalThis, 'requestAnimationFrame', {
+    configurable: true,
+    writable: true,
+    value(callback) {
+      const id = nextFrameId++;
+      frameCallbacks.set(id, callback);
+      return id;
+    },
+  });
+  Object.defineProperty(globalThis, 'cancelAnimationFrame', {
+    configurable: true,
+    writable: true,
+    value(id) {
+      cancelledFrames.push(id);
+    },
+  });
+  t.after(() => {
+    if (priorRequestAnimationFrame === undefined) {
+      delete globalThis.requestAnimationFrame;
+    } else {
+      Object.defineProperty(
+        globalThis,
+        'requestAnimationFrame',
+        priorRequestAnimationFrame,
+      );
+    }
+    if (priorCancelAnimationFrame === undefined) {
+      delete globalThis.cancelAnimationFrame;
+    } else {
+      Object.defineProperty(
+        globalThis,
+        'cancelAnimationFrame',
+        priorCancelAnimationFrame,
+      );
+    }
+  });
+
+  const { viewer, dom, smoke, smokeCalls } = makeOptions();
+  const controls = initRenderControls({ viewer, dom, smoke });
+  controls.applyRenderMode('smoke');
+  smokeCalls.length = 0;
+  controls.markSmokeDirty();
+
+  frameCallbacks.get(1)(1);
+  assert.equal(frameCallbacks.has(2), true);
+  controls.destroy();
+  controls.destroy();
+  assert.deepEqual(cancelledFrames, [2]);
+
+  frameCallbacks.get(2)(2);
+  assert.deepEqual(smokeCalls, []);
 });
 
 test('a failed committed smoke rebuild settles inside its frame owner', t => {

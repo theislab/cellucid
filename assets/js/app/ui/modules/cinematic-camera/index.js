@@ -280,9 +280,43 @@ export function initCinematicCamera({
   }
 
   const keyframeStore = createKeyframeStore();
+  const lifecycleController = new AbortController();
+  const renderFrameIds = new Set();
+  let destroyed = false;
   let loopBackKeyframeId = null;
   let suppressTransportReveal = false;
   let pathWasReady = false;
+
+  function requireCinematicActive(operation) {
+    if (destroyed) {
+      throw new Error(`Camera Path cannot ${operation} after destruction.`);
+    }
+  }
+
+  function listen(target, eventName, listener, options = {}) {
+    const ownedListener = (...args) => {
+      if (destroyed) return;
+      return listener(...args);
+    };
+    target.addEventListener(
+      eventName,
+      ownedListener,
+      { ...options, signal: lifecycleController.signal }
+    );
+    return ownedListener;
+  }
+
+  function scheduleRenderFrame(listener) {
+    let completedSynchronously = false;
+    let frameId = null;
+    frameId = requestAnimationFrame(timestamp => {
+      completedSynchronously = true;
+      if (frameId !== null) renderFrameIds.delete(frameId);
+      if (destroyed) return;
+      listener(timestamp);
+    });
+    if (!completedSynchronously) renderFrameIds.add(frameId);
+  }
 
   function hasLoopBackKeyframe() {
     return Boolean(loopBackKeyframeId && keyframeStore.getById(loopBackKeyframeId));
@@ -306,6 +340,7 @@ export function initCinematicCamera({
   }
 
   function setLoopBackEnabled(enabled) {
+    if (destroyed) return;
     const loopBackActive = hasLoopBackKeyframe();
     if (!enabled) {
       if (!loopBackActive) return;
@@ -338,19 +373,21 @@ export function initCinematicCamera({
   // =========================================================================
 
   function toggleNavigationPanels(mode) {
+    if (destroyed) return;
     dom.freeflyControls.style.display = mode === 'free' ? 'block' : 'none';
     dom.orbitControls.style.display = mode === 'orbit' ? 'block' : 'none';
     dom.planarControls.style.display = mode === 'planar' ? 'block' : 'none';
   }
 
   function syncNavigationMode(mode) {
+    if (destroyed) return;
     assertNavigationMode(mode);
     dom.navModeSelect.value = mode;
     toggleNavigationPanels(mode);
   }
 
   // Sync dropdown → viewer on change
-  dom.navModeSelect.addEventListener('change', () => {
+  listen(dom.navModeSelect, 'change', () => {
     viewer.setNavigationMode(dom.navModeSelect.value);
     const mode = dom.navModeSelect.value;
     syncNavigationMode(mode);
@@ -363,6 +400,7 @@ export function initCinematicCamera({
   // ---- Orbit controls ----
 
   function updateOrbitKeySpeed() {
+    if (destroyed) return;
     const rawValue = parseRangeInput(dom.orbitKeySpeedInput.value, {
       minimum: 1,
       maximum: 100,
@@ -374,21 +412,22 @@ export function initCinematicCamera({
   }
 
   updateOrbitKeySpeed();
-  dom.orbitKeySpeedInput.addEventListener('input', updateOrbitKeySpeed);
+  listen(dom.orbitKeySpeedInput, 'input', updateOrbitKeySpeed);
 
   viewer.setOrbitInvertRotation(dom.orbitReverseCheckbox.checked);
-  dom.orbitReverseCheckbox.addEventListener('change', () => {
+  listen(dom.orbitReverseCheckbox, 'change', () => {
     viewer.setOrbitInvertRotation(dom.orbitReverseCheckbox.checked);
   });
 
   viewer.setShowOrbitAnchor(dom.showOrbitAnchorCheckbox.checked);
-  dom.showOrbitAnchorCheckbox.addEventListener('change', () => {
+  listen(dom.showOrbitAnchorCheckbox, 'change', () => {
     viewer.setShowOrbitAnchor(dom.showOrbitAnchorCheckbox.checked);
   });
 
   // ---- Planar controls ----
 
   function updatePlanarPanSpeed() {
+    if (destroyed) return;
     const rawValue = parseRangeInput(dom.planarPanSpeedInput.value, {
       minimum: 1,
       maximum: 100,
@@ -401,21 +440,22 @@ export function initCinematicCamera({
   }
 
   updatePlanarPanSpeed();
-  dom.planarPanSpeedInput.addEventListener('input', updatePlanarPanSpeed);
+  listen(dom.planarPanSpeedInput, 'input', updatePlanarPanSpeed);
 
   viewer.setPlanarZoomToCursor(dom.planarZoomToCursorCheckbox.checked);
-  dom.planarZoomToCursorCheckbox.addEventListener('change', () => {
+  listen(dom.planarZoomToCursorCheckbox, 'change', () => {
     viewer.setPlanarZoomToCursor(dom.planarZoomToCursorCheckbox.checked);
   });
 
   viewer.setPlanarInvertAxes(dom.planarInvertAxesCheckbox.checked);
-  dom.planarInvertAxesCheckbox.addEventListener('change', () => {
+  listen(dom.planarInvertAxesCheckbox, 'change', () => {
     viewer.setPlanarInvertAxes(dom.planarInvertAxesCheckbox.checked);
   });
 
   // ---- Free-fly controls ----
 
   function updateLookSensitivity() {
+    if (destroyed) return;
     const v = parseRangeInput(dom.lookSensitivityInput.value, {
       minimum: 1,
       maximum: 30,
@@ -427,6 +467,7 @@ export function initCinematicCamera({
   }
 
   function updateMoveSpeed() {
+    if (destroyed) return;
     const v = parseRangeInput(dom.moveSpeedInput.value, {
       minimum: 1,
       maximum: 500,
@@ -438,22 +479,23 @@ export function initCinematicCamera({
   }
 
   updateLookSensitivity();
-  dom.lookSensitivityInput.addEventListener('input', updateLookSensitivity);
+  listen(dom.lookSensitivityInput, 'input', updateLookSensitivity);
 
   updateMoveSpeed();
-  dom.moveSpeedInput.addEventListener('input', updateMoveSpeed);
+  listen(dom.moveSpeedInput, 'input', updateMoveSpeed);
 
   const applyInvertLook = (value) => {
+    if (destroyed) return;
     viewer.setInvertLookY(value);
     viewer.setInvertLookX(value);
   };
   applyInvertLook(dom.invertLookCheckbox.checked);
-  dom.invertLookCheckbox.addEventListener('change', () => {
+  listen(dom.invertLookCheckbox, 'change', () => {
     applyInvertLook(dom.invertLookCheckbox.checked);
   });
 
   dom.pointerLockCheckbox.checked = false;
-  dom.pointerLockCheckbox.addEventListener('change', () => {
+  listen(dom.pointerLockCheckbox, 'change', () => {
     const mode = dom.navModeSelect.value;
     if (mode !== 'free') {
       dom.pointerLockCheckbox.checked = false;
@@ -469,6 +511,7 @@ export function initCinematicCamera({
   let autoPaceSpeed = sliderToAutoPaceSpeed(dom.defaultSpeedInput.value);
 
   function updateDefaultSpeedDisplay() {
+    if (destroyed) return;
     const raw = parseRangeInput(dom.defaultSpeedInput.value, {
       minimum: 1,
       maximum: 100,
@@ -479,7 +522,7 @@ export function initCinematicCamera({
   }
 
   updateDefaultSpeedDisplay();
-  dom.defaultSpeedInput.addEventListener('input', updateDefaultSpeedDisplay);
+  listen(dom.defaultSpeedInput, 'input', updateDefaultSpeedDisplay);
 
   // =========================================================================
   // Interpolation options reader
@@ -514,12 +557,14 @@ export function initCinematicCamera({
   // Keep the nav mode UI in sync when playback changes modes (cross-mode paths)
   // or when playback stops (which jumps to the first keyframe's mode).
   playbackController.on('stateChange', (newState) => {
+    if (destroyed) return;
     if (newState === 'STOPPED' && dom.navModeSelect) {
       syncNavigationMode(viewer.getNavigationMode());
     }
   });
 
   function startAutoplay() {
+    if (destroyed) return false;
     if (!dom.autoplayCheckbox.checked || !isCameraPathReady(keyframeStore.getAll())) {
       return false;
     }
@@ -532,12 +577,14 @@ export function initCinematicCamera({
   }
 
   function stopAutoplay() {
+    if (destroyed) return;
     if (playbackController.getState() !== 'STOPPED') {
       playbackController.stop({ resetCamera: false });
     }
   }
 
   function capturePlaybackSnapshot() {
+    requireCinematicActive('capture playback');
     if (typeof viewer.getCameraState !== 'function') {
       throw new TypeError(
         'Camera Path playback snapshot requires viewer.getCameraState().'
@@ -554,6 +601,7 @@ export function initCinematicCamera({
   }
 
   function restorePlaybackSnapshot(snapshot) {
+    if (destroyed) return;
     const exact = assertCameraPathPlaybackSnapshot(snapshot);
     stopAutoplay();
     if (exact.state !== 'STOPPED') {
@@ -575,7 +623,7 @@ export function initCinematicCamera({
     );
   }
 
-  dom.autoplayCheckbox.addEventListener('change', () => {
+  listen(dom.autoplayCheckbox, 'change', () => {
     if (dom.autoplayCheckbox.checked) {
       startAutoplay();
     }
@@ -585,7 +633,7 @@ export function initCinematicCamera({
   // Save Position
   // =========================================================================
 
-  dom.saveBtn.addEventListener('click', () => {
+  listen(dom.saveBtn, 'click', () => {
     const loopBackWasActive = hasLoopBackKeyframe();
     if (keyframeStore.getCount() >= keyframeStore.MAX_KEYFRAMES) {
       getNotificationCenter().warning(
@@ -606,7 +654,7 @@ export function initCinematicCamera({
   // Clear All
   // =========================================================================
 
-  dom.clearBtn.addEventListener('click', () => {
+  listen(dom.clearBtn, 'click', () => {
     if (keyframeStore.getCount() === 0) return;
     playbackController.stop({ resetCamera: true });
     keyframeStore.clear();
@@ -616,7 +664,7 @@ export function initCinematicCamera({
   // Set All Timing
   // =========================================================================
 
-  dom.setAllBtn.addEventListener('click', () => {
+  listen(dom.setAllBtn, 'click', () => {
     const raw = dom.setAllDuration.value;
     const value = raw === ''
       ? null
@@ -633,6 +681,7 @@ export function initCinematicCamera({
   // =========================================================================
 
   function renderKeyframeList() {
+    if (destroyed) return;
     const listEl = dom.keyframeList;
     if (!listEl) return;
 
@@ -691,7 +740,7 @@ export function initCinematicCamera({
     }
 
     // Toggle scroll-fade mask only when content overflows
-    requestAnimationFrame(() => {
+    scheduleRenderFrame(() => {
       listEl.classList.toggle('is-scrollable', listEl.scrollHeight > listEl.clientHeight);
     });
   }
@@ -701,7 +750,7 @@ export function initCinematicCamera({
   // =========================================================================
 
   if (dom.keyframeList) {
-    dom.keyframeList.addEventListener('click', (e) => {
+    listen(dom.keyframeList, 'click', (e) => {
       const item = e.target.closest('.cinematic-keyframe-item');
       if (!item) return;
       const id = item.dataset.id;
@@ -743,7 +792,7 @@ export function initCinematicCamera({
     });
 
     // Timing input changes (event delegation on the same list)
-    dom.keyframeList.addEventListener('change', (e) => {
+    listen(dom.keyframeList, 'change', (e) => {
       const loopBackToggle = e.target.closest('.cinematic-loopback-list-toggle');
       if (loopBackToggle) {
         setLoopBackEnabled(loopBackToggle.checked);
@@ -776,6 +825,7 @@ export function initCinematicCamera({
   // =========================================================================
 
   function startInlineRename(itemEl, kfId, labelEl) {
+    if (destroyed) return;
     if (itemEl.querySelector('.cinematic-keyframe-rename')) return;
 
     const kf = keyframeStore.getById(kfId);
@@ -802,15 +852,15 @@ export function initCinematicCamera({
       }
     };
 
-    input.addEventListener('blur', commit, { once: true });
-    input.addEventListener('keydown', (e) => {
+    const ownedCommit = listen(input, 'blur', commit, { once: true });
+    listen(input, 'keydown', (e) => {
       if (e.key === 'Enter') {
         e.preventDefault();
         input.blur();
       } else if (e.key === 'Escape') {
         e.preventDefault();
         labelEl.style.display = '';
-        input.removeEventListener('blur', commit);
+        input.removeEventListener('blur', ownedCommit);
         input.remove();
       }
     });
@@ -821,6 +871,7 @@ export function initCinematicCamera({
   // =========================================================================
 
   function handleKeyframeStoreChange() {
+    if (destroyed) return;
     if (!syncLoopBackState()) return;
     const pathIsReady = isCameraPathReady(keyframeStore.getAll());
     renderKeyframeList();
@@ -849,6 +900,7 @@ export function initCinematicCamera({
   // Camera paths belong to the dataset that was active when they were made.
   // A replacement must never retain or execute coordinates from the old data.
   function resetCameraPath() {
+    if (destroyed) return;
     playbackController.stop({ resetCamera: false });
     loopBackKeyframeId = null;
     if (keyframeStore.getCount() > 0) {
@@ -871,6 +923,7 @@ export function initCinematicCamera({
    * @returns {object}
    */
   function exportSessionState() {
+    requireCinematicActive('export session state');
     return {
       ...keyframeStore.exportAll(),
       loopBackKeyframeId,
@@ -901,6 +954,7 @@ export function initCinematicCamera({
    * @param {object} data
    */
   function restoreSessionState(data) {
+    if (destroyed) return;
     assertCameraPathSessionState(data);
     playbackController.stop({ resetCamera: false });
 
@@ -961,18 +1015,51 @@ export function initCinematicCamera({
   }
 
   function destroy() {
-    keyframeStore.off('changed', handleKeyframeStoreChange);
-    dataSourceManager.offDatasetChange(handleDatasetChange);
-    transportBar.destroy();
-    playbackController.destroy();
+    if (destroyed) return;
+    destroyed = true;
+    const failures = [];
+    const cleanup = operation => {
+      try {
+        operation();
+      } catch (error) {
+        failures.push(error);
+      }
+    };
+    cleanup(() => lifecycleController.abort());
+    for (const frameId of renderFrameIds) {
+      cleanup(() => cancelAnimationFrame(frameId));
+    }
+    renderFrameIds.clear();
+    cleanup(() => keyframeStore.off('changed', handleKeyframeStoreChange));
+    cleanup(() => dataSourceManager.offDatasetChange(handleDatasetChange));
+    cleanup(() => transportBar.destroy());
+    cleanup(() => playbackController.destroy());
+
+    const exactFailures = [...new Set(failures)];
+    if (exactFailures.length === 1) throw exactFailures[0];
+    if (exactFailures.length > 1) {
+      throw new AggregateError(
+        exactFailures,
+        'Camera Path failed to release every owned resource.'
+      );
+    }
   }
 
   return {
-    getKeyframeStore: () => keyframeStore,
-    getPlaybackController: () => playbackController,
+    getKeyframeStore: () => {
+      requireCinematicActive('publish its keyframe store');
+      return keyframeStore;
+    },
+    getPlaybackController: () => {
+      requireCinematicActive('publish its playback controller');
+      return playbackController;
+    },
     exportSessionState,
     capturePlaybackSnapshot,
-    getNavigationMode: () => viewer.getNavigationMode(),
+    getNavigationMode: () => {
+      requireCinematicActive('read navigation mode');
+      return viewer.getNavigationMode();
+    },
     restoreSessionState,
     restorePlaybackSnapshot,
     startAutoplay,

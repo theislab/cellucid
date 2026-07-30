@@ -391,6 +391,7 @@ test('highlight OOM is report-once, pane-local, and recovers on a semantic gener
   const proof = await page.evaluate(async () => {
     const viewer = window._cellucidViewer;
     const state = window._cellucidState;
+    const ui = window._cellucidUi;
     const audit = window.__cellucidHighlightUploadAudit;
     const payload = state.getSnapshotPayload();
     const reports = [];
@@ -413,7 +414,7 @@ test('highlight OOM is report-once, pane-local, and recovers on a semantic gener
     viewer.setAdaptiveLOD(false);
     viewer.setForceLOD(0);
     viewer.setFrustumCulling(false);
-    const snapshot = viewer.createSnapshotView({
+    const snapshot = ui.publishSnapshotView({
       label: 'Highlight OOM later pane',
       fieldKey: payload.fieldKey,
       fieldKind: payload.fieldKind,

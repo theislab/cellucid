@@ -100,6 +100,25 @@ export function initAnnotationSelection(options) {
     'Annotation selection document',
     ['createElement', 'getElementById']
   );
+  const lifecycleController = new AbortController();
+  const pendingDeliveries = new Set();
+  let destroyed = false;
+  let destructionPromise = null;
+
+  function listen(target, eventName, listener) {
+    target.addEventListener(eventName, (...args) => {
+      if (destroyed) return;
+      listener(...args);
+    }, { signal: lifecycleController.signal });
+  }
+
+  function trackDelivery(delivery) {
+    pendingDeliveries.add(delivery);
+    void delivery.then(
+      () => pendingDeliveries.delete(delivery),
+      () => pendingDeliveries.delete(delivery)
+    );
+  }
 
   function computeAnnotationCellIndices(selectionEvent, viewTransparency) {
     const activeField = state.getActiveField();
@@ -184,6 +203,7 @@ export function initAnnotationSelection(options) {
   }
 
   function handleAnnotationStep(stepEvent) {
+    if (destroyed) return;
     requireAnnotationStepEvent(stepEvent);
     if (stepEvent.cancelled) {
       selectionState.annotationCandidateSet = null;
@@ -283,6 +303,7 @@ export function initAnnotationSelection(options) {
   }
 
   function handleAnnotationConfirm() {
+    if (destroyed) return;
     if (!selectionState.annotationCandidateSet || selectionState.annotationCandidateSet.size === 0) {
       debug.log('[UI] Annotation selection empty');
       selectionState.annotationCandidateSet = null;
@@ -308,12 +329,14 @@ export function initAnnotationSelection(options) {
       'Saved annotation highlight group'
     );
 
-    void deliverSelectionToJupyter({
+    trackDelivery(deliverSelectionToJupyter({
       jupyterSource,
       cellIndices,
       source: 'annotation',
-      onFailure: error => showSelectionDeliveryFailure(error, 'annotation')
-    });
+      onFailure: error => {
+        if (!destroyed) showSelectionDeliveryFailure(error, 'annotation');
+      }
+    }));
 
     debug.log(`[UI] Annotation selected ${cellIndices.length} cells from ${selectionState.annotationStepCount} step(s)`);
 
@@ -328,6 +351,7 @@ export function initAnnotationSelection(options) {
   }
 
   function handleAnnotationUndo() {
+    if (destroyed) return;
     if (selectionState.annotationHistory.length === 0) return;
 
     const prevState =
@@ -367,6 +391,7 @@ export function initAnnotationSelection(options) {
   }
 
   function handleAnnotationRedo() {
+    if (destroyed) return;
     if (selectionState.annotationRedoStack.length === 0) return;
 
     const redoState =
@@ -441,10 +466,10 @@ export function initAnnotationSelection(options) {
       ['addEventListener']
     );
     if (created) {
-      undoButton.addEventListener('click', handleAnnotationUndo);
-      redoButton.addEventListener('click', handleAnnotationRedo);
-      confirmButton.addEventListener('click', handleAnnotationConfirm);
-      cancelButton.addEventListener('click', () => {
+      listen(undoButton, 'click', handleAnnotationUndo);
+      listen(redoButton, 'click', handleAnnotationRedo);
+      listen(confirmButton, 'click', handleAnnotationConfirm);
+      listen(cancelButton, 'click', () => {
         viewer.cancelAnnotationSelection();
       });
     }
@@ -452,6 +477,7 @@ export function initAnnotationSelection(options) {
   }
 
   function updateAnnotationUI(stepEvent) {
+    if (destroyed) return;
     const activeField = state.getActiveField();
     const isCategorical =
       activeField !== null && activeField.kind === 'category';
@@ -516,6 +542,7 @@ export function initAnnotationSelection(options) {
   }
 
   function restoreAnnotationSelection(unifiedState) {
+    if (destroyed) return;
     requireUnifiedSelectionState(unifiedState);
     selectionState.annotationHistory = [];
     selectionState.annotationRedoStack = [];
@@ -542,5 +569,36 @@ export function initAnnotationSelection(options) {
 
   viewer.setSelectionStepCallback(handleAnnotationStep);
 
-  return { handleAnnotationStep, restoreAnnotationSelection };
+  return {
+    handleAnnotationStep,
+    restoreAnnotationSelection,
+    destroy() {
+      if (destructionPromise !== null) return destructionPromise;
+      destroyed = true;
+      const failures = [];
+      try {
+        lifecycleController.abort();
+      } catch (error) {
+        failures.push(error);
+      }
+      try {
+        viewer.setSelectionStepCallback(() => {});
+      } catch (error) {
+        failures.push(error);
+      }
+      destructionPromise = Promise.allSettled(
+        [...pendingDeliveries]
+      ).then(() => {
+        const exactFailures = [...new Set(failures)];
+        if (exactFailures.length === 1) throw exactFailures[0];
+        if (exactFailures.length > 1) {
+          throw new AggregateError(
+            exactFailures,
+            'Annotation selection failed to release every owned resource.'
+          );
+        }
+      });
+      return destructionPromise;
+    }
+  };
 }

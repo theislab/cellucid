@@ -67,6 +67,15 @@ export function initHighlightSummaryUI(options) {
     'Highlight summary document',
     ['createElement']
   );
+  const lifecycleController = new AbortController();
+  let destroyed = false;
+
+  function listen(target, eventName, listener) {
+    target.addEventListener(eventName, (...args) => {
+      if (destroyed) return;
+      listener(...args);
+    }, { signal: lifecycleController.signal });
+  }
 
   function requireStateOperation(result, label) {
     if (result !== true) {
@@ -75,6 +84,7 @@ export function initHighlightSummaryUI(options) {
   }
 
   function renderHighlightSummary() {
+    if (destroyed) return;
     const groups = state.getHighlightedGroups();
     if (!Array.isArray(groups)) {
       throw new TypeError('Highlighted groups must be an array.');
@@ -129,7 +139,7 @@ export function initHighlightSummaryUI(options) {
       checkbox.className = 'highlight-checkbox';
       checkbox.checked = enabled;
       checkbox.title = enabled ? 'Disable this highlight' : 'Enable this highlight';
-      checkbox.addEventListener('change', () => {
+      listen(checkbox, 'change', () => {
         requireStateOperation(
           state.toggleHighlightEnabled(group.id, checkbox.checked),
           'Highlight toggle'
@@ -146,7 +156,7 @@ export function initHighlightSummaryUI(options) {
       removeBtn.className = 'highlight-remove-btn';
       removeBtn.innerHTML = '×';
       removeBtn.title = 'Remove this highlight';
-      removeBtn.addEventListener('click', (e) => {
+      listen(removeBtn, 'click', (e) => {
         e.stopPropagation();
         requireStateOperation(
           state.removeHighlightGroup(group.id),
@@ -161,9 +171,16 @@ export function initHighlightSummaryUI(options) {
     });
   }
 
-  clearAllHighlightsBtn.addEventListener('click', () => {
+  listen(clearAllHighlightsBtn, 'click', () => {
     state.clearAllHighlights();
   });
 
-  return { renderHighlightSummary };
+  return {
+    renderHighlightSummary,
+    destroy() {
+      if (destroyed) return;
+      destroyed = true;
+      lifecycleController.abort();
+    }
+  };
 }

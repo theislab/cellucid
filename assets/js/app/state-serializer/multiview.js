@@ -6,6 +6,10 @@
 
 import { assertCameraState } from '../../rendering/camera-state-contract.js';
 import {
+  clearPublishedSnapshotViews,
+  publishSnapshotView
+} from '../view-snapshot-publication.js';
+import {
   assertActiveFieldsState,
   validateActiveFieldsForState
 } from './active-fields.js';
@@ -61,6 +65,26 @@ function assertSnapshotMeta(meta, context) {
       throw new TypeError(`${context} filtersText entries must be strings.`);
     }
   }
+}
+
+function exactCameraStatesEqual(left, right) {
+  const exactLeft = assertCameraState(left, 'Restored camera state');
+  const exactRight = assertCameraState(right, 'Saved camera state');
+  return (
+    exactLeft.navigationMode === exactRight.navigationMode
+    && exactLeft.orbit.radius === exactRight.orbit.radius
+    && exactLeft.orbit.targetRadius === exactRight.orbit.targetRadius
+    && exactLeft.orbit.theta === exactRight.orbit.theta
+    && exactLeft.orbit.phi === exactRight.orbit.phi
+    && exactLeft.orbit.target.every(
+      (value, index) => value === exactRight.orbit.target[index]
+    )
+    && exactLeft.freefly.position.every(
+      (value, index) => value === exactRight.freefly.position[index]
+    )
+    && exactLeft.freefly.yaw === exactRight.freefly.yaw
+    && exactLeft.freefly.pitch === exactRight.freefly.pitch
+  );
 }
 
 export function assertMultiviewState(state, multiview) {
@@ -137,27 +161,34 @@ function requireRestoreOwners({
     throw new TypeError('Multiview restore requires the current viewer owner.');
   }
   for (const method of [
-    'clearSnapshotViews',
+    'applySnapshotConfigToView',
     'captureCurrentContext',
-    'restoreContext',
-    'getSnapshotPayload',
+    'createViewFromSource',
     'getActiveViewId',
-    'createViewFromActive',
+    'getDimensionManager',
+    'getSnapshotPayload',
+    'getViewDimensionLevel',
+    'removeView',
+    'restoreContext',
+    'setActiveView',
     'setDimensionLevel',
-    'setActiveView'
+    'syncSnapshotContexts'
   ]) {
     requireMethod(state, method, 'Multiview DataState owner');
   }
   for (const method of [
     'clearSnapshotViews',
-    'setCamerasLocked',
-    'setViewCameraState',
     'createSnapshotView',
+    'getCamerasLocked',
+    'getSnapshotViews',
+    'getViewCameraState',
+    'getViewDimension',
+    'removeSnapshotView',
+    'setCameraState',
+    'setCamerasLocked',
     'setLiveViewHidden',
     'setViewLayout',
-    'getCamerasLocked',
-    'getViewCameraState',
-    'setCameraState'
+    'setViewCameraState'
   ]) {
     requireMethod(viewer, method, 'Multiview viewer owner');
   }
@@ -182,9 +213,14 @@ export async function restoreMultiview(owners, multiview) {
     restoreActiveFields,
     pushViewerState
   } = owners;
+  const dimensionManager = state.getDimensionManager();
+  requireMethod(
+    dimensionManager,
+    'getViewDimension',
+    'Multiview dimension owner'
+  );
 
-  viewer.clearSnapshotViews();
-  state.clearSnapshotViews();
+  clearPublishedSnapshotViews({ state, viewer });
   viewer.setCamerasLocked(multiview.camerasLocked);
   if (!multiview.camerasLocked) {
     viewer.setViewCameraState('live', multiview.liveCameraState);
@@ -195,14 +231,81 @@ export async function restoreMultiview(owners, multiview) {
   if (baseContext === null || typeof baseContext !== 'object') {
     throw new TypeError('Multiview captureCurrentContext() must return an object.');
   }
+  const baseDimension = assertDimensionLevel(
+    baseContext.dimensionLevel,
+    'Captured live view dimension'
+  );
   const idMap = new Map();
   const createdIds = new Set();
 
+  async function restoreBaseContext() {
+    if (state.getActiveViewId() !== 'live') {
+      const activeResult = state.setActiveView('live');
+      if (activeResult !== 'live') {
+        throw new Error(
+          'Multiview base-context restoration could not reactivate the live view.'
+        );
+      }
+    }
+    if (state.getViewDimensionLevel('live') !== baseDimension) {
+      await state.setDimensionLevel(baseDimension, {
+        viewId: 'live'
+      });
+    }
+    state.restoreContext(baseContext);
+    if (state.getActiveViewId() !== 'live') {
+      throw new Error(
+        'Multiview base-context restoration must reactivate the live view.'
+      );
+    }
+    const restoredDimensions = [
+      state.getViewDimensionLevel('live'),
+      dimensionManager.getViewDimension('live'),
+      viewer.getViewDimension('live')
+    ];
+    if (
+      restoredDimensions.some(
+        dimension => dimension !== baseDimension
+      )
+    ) {
+      throw new Error(
+        'Multiview base-context restoration did not restore the exact ' +
+        'DataState, dimension-manager, and viewer dimension generation.'
+      );
+    }
+  }
+
+  function restoreSavedLiveCamera() {
+    viewer.setViewCameraState('live', multiview.liveCameraState);
+    if (
+      !exactCameraStatesEqual(
+        viewer.getViewCameraState('live'),
+        multiview.liveCameraState
+      )
+    ) {
+      throw new Error(
+        'Multiview restoration did not preserve the exact saved live camera.'
+      );
+    }
+  }
+
+  let replayError = null;
   try {
     for (const snapshot of multiview.snapshots) {
-      state.restoreContext(baseContext);
+      await restoreBaseContext();
       await restoreFilters(snapshot.filters);
       await restoreActiveFields(snapshot.activeFields);
+      await state.setDimensionLevel(snapshot.dimensionLevel, {
+        viewId: 'live'
+      });
+      if (
+        state.getViewDimensionLevel('live') !==
+        snapshot.dimensionLevel
+      ) {
+        throw new Error(
+          `Replayed snapshot "${snapshot.id}" did not restore its exact dimension.`
+        );
+      }
       pushViewerState();
 
       const sourceViewId = state.getActiveViewId();
@@ -217,9 +320,10 @@ export async function restoreMultiview(owners, multiview) {
         payload.fieldKey !== snapshot.fieldKey
         || payload.fieldKind !== snapshot.fieldKind
         || payload.label !== snapshot.label
+        || payload.dimensionLevel !== snapshot.dimensionLevel
       ) {
         throw new Error(
-          `Replayed snapshot "${snapshot.id}" does not match its saved field/label descriptor.`
+          `Replayed snapshot "${snapshot.id}" does not match its saved descriptor.`
         );
       }
       assertArray(payload.filtersText, `Replayed snapshot "${snapshot.id}" filtersText`);
@@ -232,56 +336,96 @@ export async function restoreMultiview(owners, multiview) {
         throw new Error(`Replayed snapshot "${snapshot.id}" filter summary does not match.`);
       }
 
-      const created = viewer.createSnapshotView({
-        label: snapshot.label,
-        fieldKey: snapshot.fieldKey,
-        fieldKind: snapshot.fieldKind,
-        colors: payload.colors,
-        transparency: payload.transparency,
-        centroidPositions: payload.centroidPositions,
-        centroidColors: payload.centroidColors,
-        sourceViewId,
-        meta: {
-          filtersText: [...snapshot.meta.filtersText]
-        },
-        dimensionLevel: snapshot.dimensionLevel,
-        cameraState: snapshot.cameraState
+      const created = publishSnapshotView({
+        state,
+        viewer,
+        config: {
+          label: snapshot.label,
+          fieldKey: snapshot.fieldKey,
+          fieldKind: snapshot.fieldKind,
+          colors: payload.colors,
+          transparency: payload.transparency,
+          centroidPositions: payload.centroidPositions,
+          centroidColors: payload.centroidColors,
+          sourceViewId,
+          meta: {
+            filtersText: [...snapshot.meta.filtersText]
+          },
+          dimensionLevel: snapshot.dimensionLevel,
+          cameraState: snapshot.cameraState
+        }
       });
       const newId = assertSnapshotId(created.id, 'Created multiview snapshot id');
       if (createdIds.has(newId)) {
         throw new TypeError(`Viewer created duplicate snapshot id "${newId}".`);
       }
       createdIds.add(newId);
-      state.createViewFromActive(newId);
       idMap.set(snapshot.id, newId);
-      await state.setDimensionLevel(snapshot.dimensionLevel, {
-        viewId: newId
-      });
     }
-  } finally {
-    state.restoreContext(baseContext);
+  } catch (error) {
+    replayError = error;
   }
 
-  const savedActiveId = multiview.layout.activeId;
-  const resolvedActiveId = savedActiveId === 'live'
-    ? 'live'
-    : idMap.get(savedActiveId);
-  if (resolvedActiveId === undefined) {
-    throw new Error(`Multiview active snapshot "${savedActiveId}" was not created.`);
+  async function rollbackRestoredGraph(error) {
+    const cleanupFailures = [];
+    try {
+      clearPublishedSnapshotViews({ state, viewer });
+    } catch (cleanupError) {
+      cleanupFailures.push(cleanupError);
+    }
+    try {
+      await restoreBaseContext();
+    } catch (cleanupError) {
+      cleanupFailures.push(cleanupError);
+    }
+    try {
+      restoreSavedLiveCamera();
+    } catch (cleanupError) {
+      cleanupFailures.push(cleanupError);
+    }
+    if (cleanupFailures.length > 0) {
+      throw new AggregateError(
+        [error, ...cleanupFailures],
+        'Multiview restoration failed and graph rollback was incomplete.'
+      );
+    }
+    throw error;
+  }
+  if (replayError !== null) {
+    await rollbackRestoredGraph(replayError);
   }
 
-  viewer.setViewLayout(multiview.layout.mode, resolvedActiveId);
-  viewer.setLiveViewHidden(multiview.layout.liveViewHidden);
-  const activeResult = state.setActiveView(resolvedActiveId);
-  if (activeResult !== resolvedActiveId) {
-    throw new Error(`DataState rejected restored active view "${resolvedActiveId}".`);
-  }
+  try {
+    await restoreBaseContext();
+    restoreSavedLiveCamera();
 
-  if (!viewer.getCamerasLocked()) {
-    const activeCamera = assertCameraState(
-      viewer.getViewCameraState(resolvedActiveId),
-      `Restored active camera for "${resolvedActiveId}"`
-    );
-    viewer.setCameraState(activeCamera);
+    const savedActiveId = multiview.layout.activeId;
+    const resolvedActiveId = savedActiveId === 'live'
+      ? 'live'
+      : idMap.get(savedActiveId);
+    if (resolvedActiveId === undefined) {
+      throw new Error(
+        `Multiview active snapshot "${savedActiveId}" was not created.`
+      );
+    }
+
+    viewer.setViewLayout(multiview.layout.mode, resolvedActiveId);
+    viewer.setLiveViewHidden(multiview.layout.liveViewHidden);
+    const activeResult = state.setActiveView(resolvedActiveId);
+    if (activeResult !== resolvedActiveId) {
+      throw new Error(
+        `DataState rejected restored active view "${resolvedActiveId}".`
+      );
+    }
+
+    if (!viewer.getCamerasLocked()) {
+      const activeCamera = assertCameraState(
+        viewer.getViewCameraState(resolvedActiveId),
+        `Restored active camera for "${resolvedActiveId}"`
+      );
+      viewer.setCameraState(activeCamera);
+    }
+  } catch (error) {
+    await rollbackRestoredGraph(error);
   }
 }

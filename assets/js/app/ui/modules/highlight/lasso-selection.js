@@ -84,8 +84,28 @@ export function initLassoSelection(options) {
     'Lasso selection document',
     ['createElement', 'getElementById']
   );
+  const lifecycleController = new AbortController();
+  const pendingDeliveries = new Set();
+  let destroyed = false;
+  let destructionPromise = null;
+
+  function listen(target, eventName, listener) {
+    target.addEventListener(eventName, (...args) => {
+      if (destroyed) return;
+      listener(...args);
+    }, { signal: lifecycleController.signal });
+  }
+
+  function trackDelivery(delivery) {
+    pendingDeliveries.add(delivery);
+    void delivery.then(
+      () => pendingDeliveries.delete(delivery),
+      () => pendingDeliveries.delete(delivery)
+    );
+  }
 
   function handleLassoSelection(lassoEvent) {
+    if (destroyed) return;
     requireCompletedSelectionEvent(lassoEvent, 'lasso');
 
     const stepsLabel = lassoEvent.steps > 1 ? ` (${lassoEvent.steps} views)` : '';
@@ -102,12 +122,14 @@ export function initLassoSelection(options) {
     );
 
     debug.log(`[UI] Lasso selected ${lassoEvent.cellCount} cells from ${lassoEvent.steps} view(s)`);
-    void deliverSelectionToJupyter({
+    trackDelivery(deliverSelectionToJupyter({
       jupyterSource,
       cellIndices: lassoEvent.cellIndices,
       source: 'lasso',
-      onFailure: error => showSelectionDeliveryFailure(error, 'lasso')
-    });
+      onFailure: error => {
+        if (!destroyed) showSelectionDeliveryFailure(error, 'lasso');
+      }
+    }));
 
     selectionState.lassoHistory = [];
     selectionState.lassoRedoStack = [];
@@ -117,6 +139,7 @@ export function initLassoSelection(options) {
   }
 
   function handleLassoStep(stepEvent) {
+    if (destroyed) return;
     requireSelectionStepEvent(stepEvent, 'lasso');
     if (stepEvent.cancelled) {
       selectionState.lassoHistory = [];
@@ -152,6 +175,7 @@ export function initLassoSelection(options) {
   }
 
   function handleLassoUndo() {
+    if (destroyed) return;
     if (selectionState.lassoHistory.length === 0) return;
 
     selectionState.lassoRedoStack.push({
@@ -179,6 +203,7 @@ export function initLassoSelection(options) {
   }
 
   function handleLassoRedo() {
+    if (destroyed) return;
     if (selectionState.lassoRedoStack.length === 0) return;
 
     selectionState.lassoHistory.push({
@@ -206,6 +231,7 @@ export function initLassoSelection(options) {
   }
 
   function handleLassoPreview(previewEvent) {
+    if (destroyed) return;
     requireSelectionPreviewEvent(
       previewEvent,
       'lasso',
@@ -265,13 +291,13 @@ export function initLassoSelection(options) {
       ['addEventListener']
     );
     if (created) {
-      undoButton.addEventListener('click', handleLassoUndo);
-      redoButton.addEventListener('click', handleLassoRedo);
-      confirmButton.addEventListener('click', () => {
+      listen(undoButton, 'click', handleLassoUndo);
+      listen(redoButton, 'click', handleLassoRedo);
+      listen(confirmButton, 'click', () => {
         viewer.confirmLassoSelection();
         state.clearPreviewHighlight();
       });
-      cancelButton.addEventListener('click', () => {
+      listen(cancelButton, 'click', () => {
         viewer.cancelLassoSelection();
       });
     }
@@ -279,6 +305,7 @@ export function initLassoSelection(options) {
   }
 
   function updateLassoUI(stepEvent) {
+    if (destroyed) return;
     if (!stepEvent || (stepEvent.step === 0 && !stepEvent.keepControls)) {
       highlightModeDescriptionEl.innerHTML = HIGHLIGHT_MODE_COPY.lasso;
       const existingControls = documentOwner.getElementById('lasso-step-controls');
@@ -321,6 +348,7 @@ export function initLassoSelection(options) {
   }
 
   function restoreLassoSelection(unifiedState) {
+    if (destroyed) return;
     requireUnifiedSelectionState(unifiedState);
     selectionState.lassoHistory = [];
     selectionState.lassoRedoStack = [];
@@ -350,5 +378,38 @@ export function initLassoSelection(options) {
   viewer.setLassoPreviewCallback(handleLassoPreview);
   viewer.setLassoStepCallback(handleLassoStep);
 
-  return { handleLassoStep, restoreLassoSelection };
+  return {
+    handleLassoStep,
+    restoreLassoSelection,
+    destroy() {
+      if (destructionPromise !== null) return destructionPromise;
+      destroyed = true;
+      const failures = [];
+      for (const operation of [
+        () => lifecycleController.abort(),
+        () => viewer.setLassoCallback(() => {}),
+        () => viewer.setLassoPreviewCallback(() => {}),
+        () => viewer.setLassoStepCallback(() => {})
+      ]) {
+        try {
+          operation();
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      destructionPromise = Promise.allSettled(
+        [...pendingDeliveries]
+      ).then(() => {
+        const exactFailures = [...new Set(failures)];
+        if (exactFailures.length === 1) throw exactFailures[0];
+        if (exactFailures.length > 1) {
+          throw new AggregateError(
+            exactFailures,
+            'Lasso selection failed to release every owned resource.'
+          );
+        }
+      });
+      return destructionPromise;
+    }
+  };
 }

@@ -42,8 +42,15 @@ class FakeElement {
     this.value = '';
   }
 
-  addEventListener(type, listener) {
+  addEventListener(type, listener, options = {}) {
     this.listeners.set(type, listener);
+    if (options.signal !== undefined) {
+      options.signal.addEventListener('abort', () => {
+        if (this.listeners.get(type) === listener) {
+          this.listeners.delete(type);
+        }
+      }, { once: true });
+    }
   }
 
   appendChild(child) {
@@ -216,6 +223,12 @@ class FakeDatasetManager {
 
   onDatasetChange(listener) {
     this.datasetListeners.push(listener);
+  }
+
+  offDatasetChange(listener) {
+    this.datasetListeners = this.datasetListeners.filter(
+      candidate => candidate !== listener
+    );
   }
 
   onSourcesChange(listener) {
@@ -430,6 +443,62 @@ function captureDatasetUi(harness) {
     value: harness.select.value
   };
 }
+
+test('dataset teardown drains a rejected reload without publishing stale UI', async t => {
+  const current = makeIdentity('current', 'Current', 12);
+  const target = makeIdentity('target', 'Target', 24);
+  const harness = makeHarness([
+    {
+      sourceType: 'local-user',
+      datasets: [current, target]
+    }
+  ]);
+  t.after(harness.browser.restore);
+  harness.manager.activeDatasetId = current.id;
+  harness.manager.activeSourceType = 'local-user';
+  harness.manager.activeMetadata = current;
+
+  const reload = createDeferred();
+  const { initDatasetControls } = await import(moduleUrl);
+  const controls = initDatasetControls({
+    dom: harness.dom,
+    dataSourceManager: harness.manager,
+    clearDataset: harness.clearDataset,
+    reloadDataset: () => reload.promise,
+    callbacks: harness.callbacks
+  });
+  assert.deepEqual(await controls.catalogReady, { status: 'ready' });
+
+  dispatchDatasetSelection(
+    harness,
+    'dataset:local-user:target'
+  );
+  assert.equal(harness.dom.info.classList.contains('loading'), true);
+  const terminalUi = captureDatasetUi(harness);
+  const terminalCallbacks = [...harness.callbackCalls];
+
+  const destroyPromise = controls.destroy();
+  assert.equal(controls.destroy(), destroyPromise);
+  assert.equal(harness.manager.datasetListeners.length, 0);
+  assert.equal(harness.select.listeners.has('change'), false);
+
+  let drained = false;
+  void destroyPromise.then(() => {
+    drained = true;
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(drained, false);
+
+  reload.reject(new Error('reload rejected after UI disposal'));
+  await assert.doesNotReject(destroyPromise);
+  assert.equal(drained, true);
+  assert.deepEqual(captureDatasetUi(harness), terminalUi);
+  assert.deepEqual(harness.callbackCalls, terminalCallbacks);
+  await assert.rejects(
+    controls.selectDataset('target', 'local-user'),
+    /unavailable after destroy/
+  );
+});
 
 test('dataset controls contain no dev global, reload, or guessed-source path', () => {
   assert.doesNotMatch(moduleSource, /__CELLUCID_DEV__/);

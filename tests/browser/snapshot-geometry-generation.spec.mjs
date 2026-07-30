@@ -35,6 +35,7 @@ test('same-reference live publication preserves immutable kept-view geometry', a
   const publication = await page.evaluate(async () => {
     const viewer = window._cellucidViewer;
     const state = window._cellucidState;
+    const ui = window._cellucidUi;
     const renderer = viewer.getHPRenderer();
     const payload = state.getSnapshotPayload();
     const makeConfig = label => ({
@@ -51,8 +52,8 @@ test('same-reference live publication preserves immutable kept-view geometry', a
       cameraState: viewer.getViewCameraState('live'),
     });
 
-    const first = viewer.createSnapshotView(makeConfig('Frozen 1'));
-    const second = viewer.createSnapshotView(makeConfig('Frozen 2'));
+    const first = ui.publishSnapshotView(makeConfig('Frozen 1'));
+    const second = ui.publishSnapshotView(makeConfig('Frozen 2'));
     const firstSnapshot = renderer.snapshotBuffers.get(first.id);
     const secondSnapshot = renderer.snapshotBuffers.get(second.id);
     const frozenGeneration =
@@ -254,9 +255,10 @@ test('snapshot cleanup errors cannot leave viewer inventory half-published', asy
     'Current UI prepared fixture',
   );
 
-  const outcome = await page.evaluate(() => {
+  const outcome = await page.evaluate(async () => {
     const viewer = window._cellucidViewer;
     const state = window._cellucidState;
+    const ui = window._cellucidUi;
     const renderer = viewer.getHPRenderer();
     const payload = state.getSnapshotPayload();
     const makeConfig = label => ({
@@ -272,8 +274,8 @@ test('snapshot cleanup errors cannot leave viewer inventory half-published', asy
       meta: { filtersText: payload.filtersText },
       cameraState: viewer.getViewCameraState('live'),
     });
-    const first = viewer.createSnapshotView(makeConfig('Cleanup 1'));
-    const second = viewer.createSnapshotView(makeConfig('Cleanup 2'));
+    const first = ui.publishSnapshotView(makeConfig('Cleanup 1'));
+    const second = ui.publishSnapshotView(makeConfig('Cleanup 2'));
     viewer.setViewLayout('grid', first.id);
 
     const originalDelete = renderer.deleteSnapshotBuffer.bind(renderer);
@@ -325,7 +327,7 @@ test('snapshot cleanup errors cannot leave viewer inventory half-published', asy
       renderer.deleteAllSnapshotBuffers = originalDeleteAll;
     }
 
-    return {
+    const result = {
       firstId: first.id,
       secondId: second.id,
       removeError,
@@ -344,6 +346,10 @@ test('snapshot cleanup errors cannot leave viewer inventory half-published', asy
       })(),
       finalLayout: viewer.getViewLayout(),
     };
+    // The raw viewer retirements above deliberately exercise renderer cleanup
+    // failure contracts. Reconcile application ownership after recording them.
+    ui.clearSnapshotViews();
+    return result;
   });
 
   expect(outcome.removeError).toEqual({
@@ -367,5 +373,112 @@ test('snapshot cleanup errors cannot leave viewer inventory half-published', asy
     activeId: 'live',
     liveViewHidden: false,
   });
+  expect(browserErrors).toEqual([]);
+});
+
+test('public retirement repairs hidden-live focus to a surviving snapshot', async ({ page }) => {
+  const browserErrors = [];
+  page.on('pageerror', error => browserErrors.push(error.message));
+  await page.goto(
+    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=snapshot-public-retirement-focus-ci',
+    { waitUntil: 'domcontentloaded' },
+  );
+  await dismissWelcome(page);
+  await expect(page.locator('#dataset-name')).toHaveText(
+    'Current UI prepared fixture',
+  );
+
+  const outcome = await page.evaluate(async () => {
+    const viewer = window._cellucidViewer;
+    const state = window._cellucidState;
+    const ui = window._cellucidUi;
+    const payload = state.getSnapshotPayload();
+    const makeConfig = label => ({
+      label,
+      fieldKey: payload.fieldKey,
+      fieldKind: payload.fieldKind,
+      colors: payload.colors,
+      transparency: payload.transparency,
+      centroidPositions: payload.centroidPositions,
+      centroidColors: payload.centroidColors,
+      dimensionLevel: payload.dimensionLevel,
+      sourceViewId: 'live',
+      meta: { filtersText: payload.filtersText },
+      cameraState: viewer.getViewCameraState('live'),
+    });
+    const first = ui.publishSnapshotView(makeConfig('Retire active'));
+    const second = ui.publishSnapshotView(makeConfig('Survivor'));
+    state.setActiveView(first.id);
+    viewer.setViewLayout('grid', first.id);
+    const categoryFieldIndex = state
+      .getFields()
+      .findIndex(field => field.kind === 'category');
+    if (categoryFieldIndex < 0) {
+      throw new Error(
+        'Retirement focus fixture requires one loaded category field.',
+      );
+    }
+    await state.ensureFieldLoaded(categoryFieldIndex);
+    state.setActiveField(categoryFieldIndex);
+    ui.refreshUiAfterStateLoad();
+    const beforeControls = {
+      categorical: document.querySelector('#categorical-field').value,
+      continuous: document.querySelector('#continuous-field').value,
+      activeFieldKind: state.getActiveField()?.kind ?? null,
+    };
+    viewer.setLiveViewHidden(true);
+
+    const remaining = ui.retireSnapshotView(first.id);
+    const activeBadges = Array.from(
+      document.querySelectorAll('.split-badge.active'),
+      badge => badge.textContent,
+    );
+    return {
+      firstId: first.id,
+      secondId: second.id,
+      remaining: remaining.map(snapshot => snapshot.id),
+      stateActive: state.getActiveViewId(),
+      layout: viewer.getViewLayout(),
+      activeBadges,
+      beforeControls,
+      afterControls: {
+        categorical: document.querySelector('#categorical-field').value,
+        continuous: document.querySelector('#continuous-field').value,
+        activeFieldKind: state.getActiveField()?.kind ?? null,
+      },
+      stateHasFirst: state.viewContexts.has(first.id),
+      stateHasSecond: state.viewContexts.has(second.id),
+      firstDimensionRetired: (() => {
+        try {
+          state.getDimensionManager().getViewDimension(first.id);
+          return false;
+        } catch {
+          return true;
+        }
+      })(),
+      secondDimension: state
+        .getDimensionManager()
+        .getViewDimension(second.id),
+    };
+  });
+
+  expect(outcome.remaining).toEqual([outcome.secondId]);
+  expect(outcome.stateActive).toBe(outcome.secondId);
+  expect(outcome.layout).toEqual({
+    mode: 'grid',
+    activeId: outcome.secondId,
+    liveViewHidden: true,
+  });
+  expect(outcome.activeBadges).toHaveLength(1);
+  expect(outcome.beforeControls.activeFieldKind).toBe('category');
+  expect(outcome.beforeControls.categorical).not.toBe('-1');
+  expect(outcome.beforeControls.continuous).toBe('-1');
+  expect(outcome.afterControls.activeFieldKind).toBe(null);
+  expect(outcome.afterControls.categorical).toBe('-1');
+  expect(outcome.afterControls.continuous).toBe('-1');
+  expect(outcome.stateHasFirst).toBe(false);
+  expect(outcome.stateHasSecond).toBe(true);
+  expect(outcome.firstDimensionRetired).toBe(true);
+  expect(outcome.secondDimension).toBe(2);
   expect(browserErrors).toEqual([]);
 });

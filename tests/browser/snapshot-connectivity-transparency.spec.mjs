@@ -36,6 +36,7 @@ test('direct snapshot transparency keeps connectivity exact and retryable', asyn
   const proof = await page.evaluate(async () => {
     const viewer = window._cellucidViewer;
     const state = window._cellucidState;
+    const ui = window._cellucidUi;
     const gl = viewer.getGLContext();
     viewer.setAdaptiveLOD(false);
     await new Promise(resolve => {
@@ -129,7 +130,7 @@ test('direct snapshot transparency keeps connectivity exact and retryable', asyn
       let liveTexture = r8Allocations.at(-1);
 
       const payload = state.getSnapshotPayload();
-      const snapshot = viewer.createSnapshotView({
+      const snapshot = ui.publishSnapshotView({
         label: 'Direct transparency',
         fieldKey: payload.fieldKey,
         fieldKind: payload.fieldKind,

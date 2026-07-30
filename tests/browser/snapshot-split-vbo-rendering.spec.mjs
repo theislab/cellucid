@@ -44,6 +44,49 @@ test('production split snapshot VBOs match interleaved pixels and indexed draws'
       };
     }
 
+    // Track the actual attribute-publication calls instead of querying VAO
+    // internals. WebKit on Windows renders these VAOs correctly but reports
+    // non-portable null/zero values from getVertexAttrib* introspection.
+    const attributePublications = new Map();
+    let boundArrayBuffer = null;
+    let boundVertexArray = null;
+    let pointerCallCount = 0;
+    const nativeBindBuffer = gl.bindBuffer;
+    const nativeBindVertexArray = gl.bindVertexArray;
+    const nativeVertexAttribPointer = gl.vertexAttribPointer;
+    gl.bindBuffer = function bindBuffer(target, buffer) {
+      if (target === gl.ARRAY_BUFFER) boundArrayBuffer = buffer;
+      return Reflect.apply(nativeBindBuffer, gl, arguments);
+    };
+    gl.bindVertexArray = function bindVertexArray(vao) {
+      boundVertexArray = vao;
+      return Reflect.apply(nativeBindVertexArray, gl, arguments);
+    };
+    gl.vertexAttribPointer = function vertexAttribPointer(
+      index,
+      size,
+      type,
+      normalized,
+      stride,
+      offset,
+    ) {
+      pointerCallCount += 1;
+      let attributes = attributePublications.get(boundVertexArray);
+      if (attributes === undefined) {
+        attributes = new Map();
+        attributePublications.set(boundVertexArray, attributes);
+      }
+      attributes.set(index, {
+        buffer: boundArrayBuffer,
+        normalized,
+        offset,
+        size,
+        stride,
+        type,
+      });
+      return Reflect.apply(nativeVertexAttribPointer, gl, arguments);
+    };
+
     const {
       HighPerfRenderer,
     } = await import(
@@ -519,27 +562,35 @@ test('production split snapshot VBOs match interleaved pixels and indexed draws'
           )
         : null;
 
-    const inspectAttributes = vao => {
-      gl.bindVertexArray(vao);
-      const attributes = [0, 1].map(index => ({
-        buffer: gl.getVertexAttrib(
-          index,
-          gl.VERTEX_ATTRIB_ARRAY_BUFFER_BINDING,
-        ),
-        offset: gl.getVertexAttribOffset(
-          index,
-          gl.VERTEX_ATTRIB_ARRAY_POINTER,
-        ),
-        stride: gl.getVertexAttrib(
-          index,
-          gl.VERTEX_ATTRIB_ARRAY_STRIDE,
-        ),
-      }));
-      gl.bindVertexArray(null);
-      return attributes;
+    const requireTrackedAttribute = (vao, index, label) => {
+      const attribute = attributePublications.get(vao)?.get(index);
+      if (attribute === undefined) {
+        throw new Error(
+          `${label} attribute ${index} was not published through a tracked GL call.`,
+        );
+      }
+      return attribute;
     };
-    const splitAttributes = inspectAttributes(first.vao);
-    const interleavedAttributes = inspectAttributes(renderer.vao);
+    const splitPositionAttribute = requireTrackedAttribute(
+      first.vao,
+      0,
+      'Split snapshot',
+    );
+    const splitColorAttribute = requireTrackedAttribute(
+      first.vao,
+      1,
+      'Split snapshot',
+    );
+    const interleavedPositionAttribute = requireTrackedAttribute(
+      renderer.vao,
+      0,
+      'Live interleaved',
+    );
+    const interleavedColorAttribute = requireTrackedAttribute(
+      renderer.vao,
+      1,
+      'Live interleaved',
+    );
     const debugInfo =
       gl.getExtension('WEBGL_debug_renderer_info');
     const runtime = {
@@ -606,31 +657,50 @@ test('production split snapshot VBOs match interleaved pixels and indexed draws'
         owned: first.alphaTexture !== null,
       },
       bindings: {
+        trackedPointerCallCount: pointerCallCount,
         interleavedSharesOneBuffer:
-          interleavedAttributes[0].buffer ===
-          interleavedAttributes[1].buffer,
+          interleavedPositionAttribute.buffer ===
+            interleavedColorAttribute.buffer &&
+          interleavedPositionAttribute.buffer ===
+            renderer.buffers.interleaved,
         interleavedPosition: {
-          offset: interleavedAttributes[0].offset,
-          stride: interleavedAttributes[0].stride,
+          normalized: interleavedPositionAttribute.normalized,
+          offset: interleavedPositionAttribute.offset,
+          size: interleavedPositionAttribute.size,
+          stride: interleavedPositionAttribute.stride,
+          typeIsFloat:
+            interleavedPositionAttribute.type === gl.FLOAT,
         },
         interleavedColor: {
-          offset: interleavedAttributes[1].offset,
-          stride: interleavedAttributes[1].stride,
+          normalized: interleavedColorAttribute.normalized,
+          offset: interleavedColorAttribute.offset,
+          size: interleavedColorAttribute.size,
+          stride: interleavedColorAttribute.stride,
+          typeIsUnsignedByte:
+            interleavedColorAttribute.type === gl.UNSIGNED_BYTE,
         },
         splitPositionIsPooled:
-          splitAttributes[0].buffer === geometry.positionBuffer,
+          splitPositionAttribute.buffer === geometry.positionBuffer,
         splitColorIsPerSnapshot:
-          splitAttributes[1].buffer === first.buffer,
+          splitColorAttribute.buffer === first.buffer,
         sameGenerationPositionShared:
           geometry.positionBuffer !== null &&
           first.geometryGeneration === second.geometryGeneration,
         splitPosition: {
-          offset: splitAttributes[0].offset,
-          stride: splitAttributes[0].stride,
+          normalized: splitPositionAttribute.normalized,
+          offset: splitPositionAttribute.offset,
+          size: splitPositionAttribute.size,
+          stride: splitPositionAttribute.stride,
+          typeIsFloat:
+            splitPositionAttribute.type === gl.FLOAT,
         },
         splitColor: {
-          offset: splitAttributes[1].offset,
-          stride: splitAttributes[1].stride,
+          normalized: splitColorAttribute.normalized,
+          offset: splitColorAttribute.offset,
+          size: splitColorAttribute.size,
+          stride: splitColorAttribute.stride,
+          typeIsUnsignedByte:
+            splitColorAttribute.type === gl.UNSIGNED_BYTE,
         },
       },
       glError: gl.getError(),
@@ -671,16 +741,43 @@ test('production split snapshot VBOs match interleaved pixels and indexed draws'
     expectedByteLength: result.snapshotAlpha.expectedByteLength,
     owned: true,
   });
-  expect(result.bindings).toEqual({
+  expect(result.bindings).toMatchObject({
     interleavedSharesOneBuffer: true,
-    interleavedPosition: { offset: 0, stride: 16 },
-    interleavedColor: { offset: 12, stride: 16 },
+    interleavedPosition: {
+      normalized: false,
+      offset: 0,
+      size: 3,
+      stride: 16,
+      typeIsFloat: true,
+    },
+    interleavedColor: {
+      normalized: true,
+      offset: 12,
+      size: 4,
+      stride: 16,
+      typeIsUnsignedByte: true,
+    },
     splitPositionIsPooled: true,
     splitColorIsPerSnapshot: true,
     sameGenerationPositionShared: true,
-    splitPosition: { offset: 0, stride: 12 },
-    splitColor: { offset: 0, stride: 3 },
+    splitPosition: {
+      normalized: false,
+      offset: 0,
+      size: 3,
+      stride: 12,
+      typeIsFloat: true,
+    },
+    splitColor: {
+      normalized: true,
+      offset: 0,
+      size: 3,
+      stride: 3,
+      typeIsUnsignedByte: true,
+    },
   });
+  expect(result.bindings.trackedPointerCallCount).toBeGreaterThanOrEqual(
+    6,
+  );
   for (const value of Object.values(result.medians)) {
     expect(Number.isFinite(value)).toBe(true);
     // Some automated browser clocks quantize a completed GPU fence to 0 ms;

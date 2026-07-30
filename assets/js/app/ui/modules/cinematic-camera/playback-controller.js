@@ -49,6 +49,7 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
   let pauseElapsed = 0;    // seconds elapsed at pause
   let totalDuration = 0;   // seconds for full path
   let rafId = null;
+  let destroyed = false;
 
   // Lightweight event emitter
   const listeners = { stateChange: new Set(), timeUpdate: new Set() };
@@ -57,7 +58,16 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
     return assertCameraPathOptions(getInterpolationOptions());
   }
 
+  function requireActive(operation) {
+    if (destroyed) {
+      throw new Error(
+        `Camera path playback cannot ${operation} after destruction.`
+      );
+    }
+  }
+
   function on(event, fn) {
+    requireActive('register listeners');
     if (!Object.hasOwn(listeners, event)) {
       throw new RangeError(`Unsupported camera playback event: ${String(event)}.`);
     }
@@ -74,6 +84,7 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
     if (typeof fn !== 'function') {
       throw new TypeError('Camera playback listeners must be functions.');
     }
+    if (destroyed) return;
     listeners[event].delete(fn);
   }
 
@@ -95,7 +106,7 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
   // ---- Frame tick ----
 
   function tick() {
-    if (state !== PLAYING) return;
+    if (destroyed || state !== PLAYING) return;
 
     const keyframes = keyframeStore.getAll();
     if (!isCameraPathReady(keyframes)) {
@@ -136,6 +147,7 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
   // ---- Public API ----
 
   function play() {
+    requireActive('play');
     const keyframes = keyframeStore.getAll();
     if (!isCameraPathReady(keyframes)) {
       throw new Error('Camera path playback requires at least two valid keyframes.');
@@ -166,6 +178,7 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
   }
 
   function pause() {
+    requireActive('pause');
     if (state !== PLAYING) {
       throw new Error('Camera path playback can pause only while it is playing.');
     }
@@ -178,6 +191,7 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
   }
 
   function stop(options) {
+    requireActive('stop');
     const resetCamera = readCameraBooleanOption(
       options,
       'resetCamera',
@@ -208,6 +222,7 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
    * @param {number} globalT  0 = start, 1 = end.
    */
   function seekTo(globalT) {
+    requireActive('seek');
     const keyframes = keyframeStore.getAll();
     if (!isCameraPathReady(keyframes)) {
       throw new Error('Camera path seeking requires at least two valid keyframes.');
@@ -264,6 +279,7 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
   }
 
   function onKeyframeChange() {
+    if (destroyed) return;
     // Any edit invalidates timing/interpolation cached when playback started.
     // Stop in place so mutations never continue along stale path geometry.
     if (state !== STOPPED) {
@@ -274,12 +290,33 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
   keyframeStore.on('changed', onKeyframeChange);
 
   function destroy() {
-    if (rafId != null) cancelAnimationFrame(rafId);
+    if (destroyed) return;
+    destroyed = true;
+    const failures = [];
+    if (rafId != null) {
+      try {
+        cancelAnimationFrame(rafId);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
     rafId = null;
     state = STOPPED;
-    keyframeStore.off('changed', onKeyframeChange);
+    try {
+      keyframeStore.off('changed', onKeyframeChange);
+    } catch (error) {
+      failures.push(error);
+    }
     listeners.stateChange.clear();
     listeners.timeUpdate.clear();
+    const exactFailures = [...new Set(failures)];
+    if (exactFailures.length === 1) throw exactFailures[0];
+    if (exactFailures.length > 1) {
+      throw new AggregateError(
+        exactFailures,
+        'Camera path playback failed to release every owned resource.'
+      );
+    }
   }
 
   return {

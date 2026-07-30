@@ -14,6 +14,11 @@
  */
 
 import { getNotificationCenter } from '../../notification-center.js';
+import {
+  clearPublishedSnapshotViews,
+  publishSnapshotView,
+  retireSnapshotView,
+} from '../../view-snapshot-publication.js';
 
 const LIVE_VIEW_ID = 'live';
 const VIEW_LAYOUT_MODES = new Set(['grid', 'single']);
@@ -265,7 +270,7 @@ function requireSnapshotInventory(viewer) {
 export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
   for (const methodName of [
     'clearSnapshotViews',
-    'createViewFromActive',
+    'createViewFromSource',
     'getActiveViewId',
     'getAvailableDimensions',
     'getDimensionManager',
@@ -358,6 +363,10 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     viewer.getLiveViewHidden(),
     'Viewer live-view visibility'
   );
+  let destroyed = false;
+  let lifecycleGeneration = 0;
+  let destructionPromise = null;
+  const pendingDimensionBadgeTasks = new Set();
 
   function reportUiFailure(action, error) {
     getNotificationCenter().error(
@@ -367,10 +376,20 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
   }
 
   function runUiAction(action, operation) {
+    if (destroyed) return false;
     try {
       return operation();
     } catch (error) {
-      reportUiFailure(action, error);
+      let reportedError = error;
+      try {
+        syncFromStateAndViewer(true);
+      } catch (reconciliationError) {
+        reportedError = new AggregateError(
+          [error, reconciliationError],
+          `${action} failed and the view UI could not be reconciled.`
+        );
+      }
+      reportUiFailure(action, reportedError);
       return false;
     }
   }
@@ -428,18 +447,24 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
   }
 
   function removeSnapshot(snapshotId) {
-    const exactId = requireViewId(snapshotId, 'Removed snapshot id');
-    const before = requireSnapshotInventory(viewer);
-    if (!before.some(snapshot => snapshot.id === exactId)) {
-      throw new RangeError(`Snapshot "${exactId}" does not exist.`);
+    let after;
+    try {
+      after = retireSnapshotView({
+        state,
+        viewer,
+        snapshotId,
+      });
+    } catch (error) {
+      try {
+        syncFromStateAndViewer();
+      } catch (reconciliationError) {
+        throw new AggregateError(
+          [error, reconciliationError],
+          `Snapshot "${snapshotId}" removal failed and its UI could not be reconciled.`
+        );
+      }
+      throw error;
     }
-    viewer.removeSnapshotView(exactId);
-    const after = requireSnapshotInventory(viewer);
-    if (after.some(snapshot => snapshot.id === exactId)) {
-      throw new Error(`Viewer did not remove snapshot "${exactId}".`);
-    }
-    state.removeView(exactId);
-    state.syncSnapshotContexts(snapshotIds(after));
     liveViewHidden = requireBoolean(
       viewer.getLiveViewHidden(),
       'Viewer live-view visibility'
@@ -481,6 +506,8 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     dimIndicator.setAttribute('tabindex', '0');
 
     const cycleDimension = async (e) => {
+      if (destroyed) return;
+      const ownerGeneration = lifecycleGeneration;
       e.preventDefault();
       e.stopPropagation();
       if (dimensionBadgeBusy) return;
@@ -507,27 +534,54 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
       dimIndicator.setAttribute('aria-disabled', 'true');
       try {
         await callbacks.onCycleViewDimension(targetViewId, nextDim);
+        if (
+          destroyed ||
+          ownerGeneration !== lifecycleGeneration
+        ) {
+          return;
+        }
         dimIndicator.removeAttribute('aria-invalid');
         renderSplitViewBadges();
       } catch (error) {
+        if (
+          destroyed ||
+          ownerGeneration !== lifecycleGeneration
+        ) {
+          return;
+        }
         dimIndicator.setAttribute('aria-invalid', 'true');
         dimIndicator.title =
           `Dimension change failed: ${describeError(error)}`;
       } finally {
         dimensionBadgeBusy = false;
-        dimIndicator.removeAttribute('aria-disabled');
+        if (
+          !destroyed &&
+          ownerGeneration === lifecycleGeneration
+        ) {
+          dimIndicator.removeAttribute('aria-disabled');
+        }
       }
     };
+    const startDimensionCycle = event => {
+      if (destroyed) return;
+      let task;
+      task = cycleDimension(event)
+        .catch(error => {
+          if (!destroyed) {
+            reportUiFailure('Dimension change failed', error);
+          }
+        })
+        .finally(() => {
+          pendingDimensionBadgeTasks.delete(task);
+        });
+      pendingDimensionBadgeTasks.add(task);
+    };
     dimIndicator.addEventListener('click', event => {
-      void cycleDimension(event).catch(error => {
-        reportUiFailure('Dimension change failed', error);
-      });
+      startDimensionCycle(event);
     });
     dimIndicator.addEventListener('keydown', event => {
       if (event.key === 'Enter' || event.key === ' ') {
-        void cycleDimension(event).catch(error => {
-          reportUiFailure('Dimension change failed', error);
-        });
+        startDimensionCycle(event);
       }
     });
 
@@ -597,6 +651,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
   }
 
   function renderSplitViewBadges() {
+    if (destroyed) return false;
     splitViewBadges.innerHTML = '';
     const snapshots = requireCurrentInventory();
 
@@ -868,6 +923,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
   }
 
   function syncRenderModeUI(mode) {
+    if (destroyed) return false;
     activeViewId = requireViewId(
       state.getActiveViewId(),
       'Render-mode active view id'
@@ -924,6 +980,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
   }
 
   function updateSplitViewUI() {
+    if (destroyed) return false;
     reconcileSplitViewUI(true);
   }
 
@@ -934,14 +991,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     const sourceViewId = activeViewId;
     const sourceLayoutMode = viewLayoutMode;
     const payload = requireSnapshotPayload(state.getSnapshotPayload());
-    const dimensionManager = state.getDimensionManager();
-    requireMethod(
-      dimensionManager,
-      'copyViewDimension',
-      'Dimension manager'
-    );
     let createdId = null;
-    let stateContextCreated = false;
     try {
       const snapshotConfig = {
         label: payload.label,
@@ -957,45 +1007,12 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
         cameraState: viewer.getViewCameraState(sourceViewId),
       };
 
-      const created = viewer.createSnapshotView(snapshotConfig);
-      if (
-        created === null ||
-        typeof created !== 'object' ||
-        Array.isArray(created)
-      ) {
-        throw new TypeError(
-          'Viewer snapshot creation must return an identity record.'
-        );
-      }
+      const created = publishSnapshotView({
+        state,
+        viewer,
+        config: snapshotConfig,
+      });
       createdId = requireViewId(created.id, 'Created snapshot id');
-      const createdLabel = requireNonEmptyText(
-        created.label,
-        'Created snapshot label'
-      );
-      if (createdLabel !== payload.label) {
-        throw new Error(
-          'Viewer changed the exact snapshot label during publication.'
-        );
-      }
-      const publishedSnapshot = requireSnapshotInventory(viewer)
-        .find(snapshot => snapshot.id === createdId);
-      if (publishedSnapshot === undefined) {
-        throw new Error(
-          `Viewer did not publish created snapshot "${createdId}".`
-        );
-      }
-
-      state.createViewFromActive(createdId);
-      stateContextCreated = true;
-      dimensionManager.copyViewDimension(sourceViewId, createdId);
-      if (
-        state.getViewDimensionLevel(createdId) !== payload.dimensionLevel
-      ) {
-        throw new Error(
-          `State published the wrong dimension for snapshot "${createdId}".`
-        );
-      }
-      syncSnapshotContexts();
       activeViewId = createdId;
       viewLayoutMode = 'grid';
       viewLayoutModeSelect.value = 'grid';
@@ -1014,18 +1031,11 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
         }
       };
       if (createdId !== null) {
-        if (stateContextCreated) {
-          rollback(() => state.removeView(createdId));
-        }
-        let snapshotStillPublished = false;
-        rollback(() => {
-          snapshotStillPublished = requireSnapshotInventory(viewer)
-            .some(snapshot => snapshot.id === createdId);
-        });
-        if (snapshotStillPublished) {
-          rollback(() => viewer.removeSnapshotView(createdId));
-        }
-        rollback(() => syncSnapshotContexts());
+        rollback(() => retireSnapshotView({
+          state,
+          viewer,
+          snapshotId: createdId,
+        }));
       }
       activeViewId = sourceViewId;
       viewLayoutMode = sourceLayoutMode;
@@ -1039,6 +1049,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
         }
       });
       rollback(() => viewer.setViewLayout(sourceLayoutMode, sourceViewId));
+      rollback(() => syncFromStateAndViewer(true));
       const reportedError = rollbackFailures.length === 0
         ? error
         : new AggregateError(
@@ -1051,12 +1062,23 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
   }
 
   function handleClearViews() {
+    try {
+      clearPublishedSnapshotViews({ state, viewer });
+    } catch (error) {
+      try {
+        syncFromStateAndViewer();
+      } catch (reconciliationError) {
+        throw new AggregateError(
+          [error, reconciliationError],
+          'Snapshot clearing failed and its UI could not be reconciled.'
+        );
+      }
+      throw error;
+    }
     activeViewId = LIVE_VIEW_ID;
     liveViewHidden = false;
     viewLayoutMode = 'grid';
     viewLayoutModeSelect.value = 'grid';
-    viewer.clearSnapshotViews();
-    state.clearSnapshotViews();
     syncActiveViewToState();
     renderSplitViewBadges();
     updateSplitViewUI();
@@ -1096,20 +1118,21 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     }
   }
 
-  viewer.setViewFocusHandler((viewId) => {
+  const handleViewFocus = viewId => {
     runUiAction(
       'View focus failed',
       () => focusViewFromOverlay(viewId)
     );
-  });
+  };
+  viewer.setViewFocusHandler(handleViewFocus);
 
-  splitKeepViewBtn.addEventListener('click', () => {
+  const handleKeepViewClick = () => {
     runUiAction('Keep view failed', handleKeepView);
-  });
-  splitClearBtn.addEventListener('click', () => {
+  };
+  const handleClearViewsClick = () => {
     runUiAction('Clear views failed', handleClearViews);
-  });
-  cameraLockBtn.addEventListener('click', () => {
+  };
+  const handleCameraLockClick = () => {
     runUiAction('Camera lock change failed', () => {
       const newLocked = !requireBoolean(
         viewer.getCamerasLocked(),
@@ -1120,22 +1143,42 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
       renderSplitViewBadges();
       callbacks.onNavigationUiSyncRequested(activeViewId);
     });
-  });
+  };
+  splitKeepViewBtn.addEventListener('click', handleKeepViewClick);
+  splitClearBtn.addEventListener('click', handleClearViewsClick);
+  cameraLockBtn.addEventListener('click', handleCameraLockClick);
   updateCameraLockUI();
-  viewLayoutModeSelect.addEventListener('change', () => {
+  const handleLayoutModeChange = () => {
     runUiAction('View layout change failed', () => {
       viewLayoutMode = requireLayoutMode(viewLayoutModeSelect.value);
       pushViewLayoutToViewer();
       renderSplitViewBadges();
       updateSplitViewUI();
     });
-  });
+  };
+  viewLayoutModeSelect.addEventListener(
+    'change',
+    handleLayoutModeChange
+  );
 
   renderSplitViewBadges();
   updateSplitViewUI();
 
-  function syncFromStateAndViewer() {
-    activeViewId = requireViewId(
+  function syncFromStateAndViewer(forceActiveViewNotification = false) {
+    if (destroyed) {
+      throw new Error('View controls are unavailable after destroy().');
+    }
+    if (typeof forceActiveViewNotification !== 'boolean') {
+      throw new TypeError(
+        'View reconciliation notification ownership must be one exact boolean.'
+      );
+    }
+    const previousActiveViewId = activeViewId;
+    const snapshots = requireSnapshotInventory(viewer);
+    const snapshotIdSet = new Set(
+      snapshots.map(snapshot => snapshot.id)
+    );
+    let nextActiveViewId = requireViewId(
       state.getActiveViewId(),
       'Active view id'
     );
@@ -1143,18 +1186,96 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
       viewer.getLiveViewHidden(),
       'Viewer live-view visibility'
     );
-    syncActiveViewSelectOptions();
-    renderSplitViewBadges();
+    const activeViewExists =
+      nextActiveViewId === LIVE_VIEW_ID ||
+      snapshotIdSet.has(nextActiveViewId);
+    if (
+      !activeViewExists ||
+      (liveViewHidden && nextActiveViewId === LIVE_VIEW_ID)
+    ) {
+      nextActiveViewId =
+        liveViewHidden && snapshots.length > 0
+          ? snapshots[0].id
+          : LIVE_VIEW_ID;
+      const publishedViewId = state.setActiveView(nextActiveViewId);
+      if (publishedViewId !== nextActiveViewId) {
+        throw new Error(
+          `State did not reconcile active view "${nextActiveViewId}".`
+        );
+      }
+    }
+    activeViewId = nextActiveViewId;
     reconcileSplitViewUI(false);
+    // Reconciliation publishes the corrected focus/layout first so badges
+    // cannot retain a camera marker for a snapshot that was just retired.
+    renderSplitViewBadges();
+    if (
+      forceActiveViewNotification ||
+      activeViewId !== previousActiveViewId
+    ) {
+      callbacks.onActiveViewChanged(activeViewId);
+    }
   }
 
   return {
     renderSplitViewBadges,
     syncRenderModeUI,
     updateSplitViewUI,
-    refreshUIForActiveView: () => callbacks.onActiveViewChanged(activeViewId),
+    refreshUIForActiveView: () => {
+      if (destroyed) return false;
+      callbacks.onActiveViewChanged(activeViewId);
+      return true;
+    },
     syncFromStateAndViewer,
     getActiveViewId: () => activeViewId,
     getLayoutMode: () => viewLayoutMode,
+    destroy() {
+      if (destructionPromise !== null) return destructionPromise;
+      destroyed = true;
+      lifecycleGeneration += 1;
+      const failures = [];
+      const cleanup = operation => {
+        try {
+          operation();
+        } catch (error) {
+          failures.push(error);
+        }
+      };
+      cleanup(() => {
+        splitKeepViewBtn.removeEventListener('click', handleKeepViewClick);
+      });
+      cleanup(() => {
+        splitClearBtn.removeEventListener('click', handleClearViewsClick);
+      });
+      cleanup(() => {
+        cameraLockBtn.removeEventListener('click', handleCameraLockClick);
+      });
+      cleanup(() => {
+        viewLayoutModeSelect.removeEventListener(
+          'change',
+          handleLayoutModeChange
+        );
+      });
+      cleanup(() => splitViewBadges.replaceChildren());
+      cleanup(() => viewer.setViewFocusHandler(() => {}));
+      destructionPromise = Promise
+        .allSettled([...pendingDimensionBadgeTasks])
+        .then(outcomes => {
+          for (const outcome of outcomes) {
+            if (outcome.status === 'rejected') {
+              failures.push(outcome.reason);
+            }
+          }
+          const exactFailures = [...new Set(failures)];
+          if (exactFailures.length === 1) throw exactFailures[0];
+          if (exactFailures.length > 1) {
+            throw new AggregateError(
+              exactFailures,
+              'View-control teardown was incomplete.'
+            );
+          }
+        });
+      return destructionPromise;
+    },
   };
 }

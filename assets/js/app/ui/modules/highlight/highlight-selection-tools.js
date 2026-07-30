@@ -178,7 +178,7 @@ export function initHighlightSelectionTools(options) {
     ui: { modeDescriptionEl: ui.modeDescriptionEl }
   });
 
-  initContinuousSelectionPreview({
+  const continuousPreview = initContinuousSelectionPreview({
     state,
     viewer,
     selectionState,
@@ -207,11 +207,50 @@ export function initHighlightSelectionTools(options) {
     }
   });
 
+  let destructionPromise = null;
   return {
     selectionState,
     modeUi,
     destroy: () => {
-      sync.destroy();
+      if (destructionPromise !== null) return destructionPromise;
+      const failures = [];
+      const pending = [];
+      for (const operation of [
+        () => sync.destroy(),
+        () => modeUi.destroy(),
+        () => continuousPreview.destroy(),
+        () => annotation.destroy(),
+        () => lasso.destroy(),
+        () => proximity.destroy(),
+        () => knn.destroy()
+      ]) {
+        try {
+          const result = operation();
+          if (
+            result !== null
+            && typeof result === 'object'
+            && typeof result.then === 'function'
+          ) {
+            pending.push(result);
+          }
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      destructionPromise = Promise.allSettled(pending).then(outcomes => {
+        for (const outcome of outcomes) {
+          if (outcome.status === 'rejected') failures.push(outcome.reason);
+        }
+        const exactFailures = [...new Set(failures)];
+        if (exactFailures.length === 1) throw exactFailures[0];
+        if (exactFailures.length > 1) {
+          throw new AggregateError(
+            exactFailures,
+            'Highlight selection tools failed to release every owned resource.'
+          );
+        }
+      });
+      return destructionPromise;
     }
   };
 }

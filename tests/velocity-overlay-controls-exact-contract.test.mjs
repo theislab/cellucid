@@ -432,6 +432,154 @@ test('velocity enable failure settles visibly without an unhandled event rejecti
   ]]);
 });
 
+test('velocity control destruction fences an in-flight field load before viewer publication', async t => {
+  const previousDocument = globalThis.document;
+  globalThis.document = {
+    createElement() {
+      return makeElement();
+    },
+  };
+  t.after(() => {
+    if (previousDocument === undefined) {
+      delete globalThis.document;
+    } else {
+      globalThis.document = previousDocument;
+    }
+  });
+
+  let handleEnabledChange = null;
+  const enabledCheckbox = makeElement();
+  enabledCheckbox.addEventListener = (event, handler) => {
+    if (event === 'change') handleEnabledChange = handler;
+  };
+  let finishFieldLoad;
+  const fieldLoad = new Promise(resolve => {
+    finishFieldLoad = resolve;
+  });
+  const viewerCalls = [];
+  const controls = initVelocityOverlayControls({
+    dom: makeDom({
+      velocityEnabledCheckbox: enabledCheckbox,
+      velocityFieldSelect: makeSelectElement(),
+    }),
+    state: makeState({
+      ensureVectorField: () => fieldLoad,
+      getAvailableVectorFields: () => [{
+        id: 'velocity_umap',
+        label: 'Velocity (UMAP)',
+        availableDimensions: [2],
+        defaultDimension: 2,
+      }],
+      getDefaultVectorFieldId: () => 'velocity_umap',
+    }),
+    viewer: makeViewer({
+      setActiveVectorField(fieldId) {
+        viewerCalls.push(['field', fieldId]);
+      },
+      setVectorFieldConfig(key, value) {
+        viewerCalls.push(['config', key, value]);
+      },
+      setVectorFieldOverlayEnabled(enabled) {
+        viewerCalls.push(['enabled', enabled]);
+      },
+    }),
+  });
+
+  assert.equal(typeof handleEnabledChange, 'function');
+  enabledCheckbox.checked = true;
+  const enabling = handleEnabledChange();
+  await Promise.resolve();
+  const destruction = controls.destroy();
+  assert.equal(controls.destroy(), destruction);
+  let destructionSettled = false;
+  void destruction.then(() => {
+    destructionSettled = true;
+  });
+  await Promise.resolve();
+  assert.equal(destructionSettled, false);
+  finishFieldLoad(true);
+  await enabling;
+  await destruction;
+  assert.equal(destructionSettled, true);
+
+  assert.deepEqual(viewerCalls, []);
+  assert.doesNotThrow(() => handleEnabledChange());
+  assert.deepEqual(viewerCalls, []);
+});
+
+test('dataset replacement releases an invalidated in-flight velocity enable owner', async t => {
+  const previousDocument = globalThis.document;
+  globalThis.document = {
+    createElement() {
+      return makeElement();
+    },
+  };
+  t.after(() => {
+    if (previousDocument === undefined) {
+      delete globalThis.document;
+    } else {
+      globalThis.document = previousDocument;
+    }
+  });
+
+  let handleEnabledChange = null;
+  const enabledCheckbox = makeElement();
+  enabledCheckbox.addEventListener = (event, handler) => {
+    if (event === 'change') handleEnabledChange = handler;
+  };
+  const listeners = new Map();
+  let fields = [{
+    id: 'velocity_umap',
+    label: 'Velocity (UMAP)',
+    availableDimensions: [2],
+    defaultDimension: 2,
+  }];
+  let finishFieldLoad;
+  const fieldLoad = new Promise(resolve => {
+    finishFieldLoad = resolve;
+  });
+  const fieldSelect = makeSelectElement();
+  const viewerCalls = [];
+  const controls = initVelocityOverlayControls({
+    dom: makeDom({
+      velocityEnabledCheckbox: enabledCheckbox,
+      velocityFieldSelect: fieldSelect,
+    }),
+    state: makeState({
+      ensureVectorField: () => fieldLoad,
+      getAvailableVectorFields: () => fields,
+      getDefaultVectorFieldId: () => 'velocity_umap',
+      on(name, listener) {
+        listeners.set(name, listener);
+      },
+    }),
+    viewer: makeViewer({
+      setActiveVectorField(fieldId) {
+        viewerCalls.push(['field', fieldId]);
+      },
+      setVectorFieldOverlayEnabled(enabled) {
+        viewerCalls.push(['enabled', enabled]);
+      },
+    }),
+  });
+  t.after(() => controls.destroy());
+
+  enabledCheckbox.checked = true;
+  const enabling = handleEnabledChange();
+  await Promise.resolve();
+  assert.equal(enabledCheckbox.disabled, true);
+
+  fields = [];
+  listeners.get('vectorFields:changed')();
+  assert.equal(enabledCheckbox.checked, false);
+  assert.equal(enabledCheckbox.disabled, true);
+  assert.equal(fieldSelect.disabled, true);
+
+  finishFieldLoad(true);
+  await enabling;
+  assert.deepEqual(viewerCalls, [['enabled', false]]);
+});
+
 test('runtime velocity failure settlement remains coherent when cleanup retry fails', t => {
   const cleanupFailure = new Error('synthetic retained GPU deletion');
   let cleanupCalls = 0;

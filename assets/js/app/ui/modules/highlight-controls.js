@@ -146,7 +146,7 @@ export function initHighlightControls(options) {
     ['appendChild']
   );
 
-  const { renderHighlightSummary } = initHighlightSummaryUI({
+  const summaryUi = initHighlightSummaryUI({
     state,
     dom: {
       countEl: highlightCountEl,
@@ -155,7 +155,7 @@ export function initHighlightControls(options) {
     }
   });
 
-  const { renderHighlightPages } = initHighlightPagesUI({
+  const pagesUi = initHighlightPagesUI({
     state,
     dom: {
       pagesTabsEl: highlightPagesTabsEl,
@@ -163,7 +163,9 @@ export function initHighlightControls(options) {
     }
   });
 
-  initHighlightSelectionTools({
+  const { renderHighlightSummary } = summaryUi;
+  const { renderHighlightPages } = pagesUi;
+  const selectionTools = initHighlightSelectionTools({
     state,
     viewer,
     jupyterSource,
@@ -175,7 +177,10 @@ export function initHighlightControls(options) {
     renderHighlightPages
   });
 
+  let destroyed = false;
+  let destructionPromise = null;
   function updateHighlightMode() {
+    if (destroyed) return;
     const activeField = state.getActiveField();
     if (activeField === null) {
       viewer.setHighlightMode('none');
@@ -194,5 +199,49 @@ export function initHighlightControls(options) {
     );
   }
 
-  return { renderHighlightSummary, renderHighlightPages, updateHighlightMode };
+  function destroy() {
+    if (destructionPromise !== null) return destructionPromise;
+    destroyed = true;
+    const failures = [];
+    const pending = [];
+    for (const operation of [
+      () => selectionTools.destroy(),
+      () => pagesUi.destroy(),
+      () => summaryUi.destroy()
+    ]) {
+      try {
+        const result = operation();
+        if (
+          result !== null
+          && typeof result === 'object'
+          && typeof result.then === 'function'
+        ) {
+          pending.push(result);
+        }
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    destructionPromise = Promise.allSettled(pending).then(outcomes => {
+      for (const outcome of outcomes) {
+        if (outcome.status === 'rejected') failures.push(outcome.reason);
+      }
+      const exactFailures = [...new Set(failures)];
+      if (exactFailures.length === 1) throw exactFailures[0];
+      if (exactFailures.length > 1) {
+        throw new AggregateError(
+          exactFailures,
+          'Highlight controls failed to release every owned resource.'
+        );
+      }
+    });
+    return destructionPromise;
+  }
+
+  return {
+    renderHighlightSummary,
+    renderHighlightPages,
+    updateHighlightMode,
+    destroy
+  };
 }

@@ -30,9 +30,10 @@ test('a thrown grid pane releases scissor before the next scheduled full-frame c
   const result = await page.evaluate(async () => {
     const viewer = window._cellucidViewer;
     const state = window._cellucidState;
+    const ui = window._cellucidUi;
     const renderer = viewer.getHPRenderer();
     const payload = state.getSnapshotPayload();
-    const snapshot = viewer.createSnapshotView({
+    const snapshot = ui.publishSnapshotView({
       cameraState: viewer.getViewCameraState('live'),
       centroidColors: payload.centroidColors,
       centroidPositions: payload.centroidPositions,
@@ -158,7 +159,7 @@ test('a thrown grid pane releases scissor before the next scheduled full-frame c
       renderer.renderWithSnapshot =
         originalSnapshotRender;
       prototype.clear = originalClear;
-      viewer.removeSnapshotView(snapshot.id);
+      ui.retireSnapshotView(snapshot.id);
     }
   });
 

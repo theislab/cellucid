@@ -333,6 +333,11 @@ function createLifecycleSourceFactory(
       onConnectionLost(callback) {
         this.connectionLostHandler = callback;
       },
+      offConnectionLost(callback) {
+        if (this.connectionLostHandler === callback) {
+          this.connectionLostHandler = null;
+        }
+      },
       loseConnection(error = new Error('transport lost')) {
         assert.equal(typeof this.connectionLostHandler, 'function');
         this.connected = false;
@@ -345,6 +350,7 @@ function createLifecycleSourceFactory(
 
   const registered = {
     connected: false,
+    connectionLostHandler: null,
     createCandidateCalls: 0,
     disconnectCalls: 0,
     async connect() {
@@ -376,7 +382,14 @@ function createLifecycleSourceFactory(
     async listDatasets() {
       throw new Error('Disconnected source has no dataset inventory.');
     },
-    onConnectionLost() {},
+    onConnectionLost(callback) {
+      this.connectionLostHandler = callback;
+    },
+    offConnectionLost(callback) {
+      if (this.connectionLostHandler === callback) {
+        this.connectionLostHandler = null;
+      }
+    },
   };
 
   return {
@@ -475,7 +488,7 @@ function makeLifecycleHarness(
   const clearCalls = [];
   const populationCalls = [];
 
-  initDatasetConnections({
+  const connectionControls = initDatasetConnections({
     activateDataset: async (
       datasetId,
       sourceType,
@@ -546,6 +559,7 @@ function makeLifecycleHarness(
       type === 'remote'
         ? dom.remoteDisconnectBtn
         : dom.githubDisconnectBtn,
+    connectionControls,
     dom,
     factory,
     manager,
@@ -1253,4 +1267,28 @@ test('disconnect failures are contained in a deterministic blocked state', async
       true
     );
   });
+});
+
+test('connection teardown unregisters transport listeners and disables DOM owners', async t => {
+  const harness = makeLifecycleHarness(t, 'remote', 1);
+  assert.equal(
+    typeof harness.factory.registered.connectionLostHandler,
+    'function'
+  );
+  assert.equal(harness.factory.creationCount, 0);
+
+  const firstDestroy = harness.connectionControls.destroy();
+  assert.equal(harness.connectionControls.destroy(), firstDestroy);
+  await firstDestroy;
+
+  assert.equal(
+    harness.factory.registered.connectionLostHandler,
+    null
+  );
+  await harness.connectButton.activate();
+  await harness.disconnectButton.activate();
+  assert.equal(harness.factory.creationCount, 0);
+  assert.deepEqual(harness.activations, []);
+  assert.deepEqual(harness.clearCalls, []);
+  assert.deepEqual(harness.populationCalls, []);
 });

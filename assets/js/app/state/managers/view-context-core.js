@@ -9,6 +9,108 @@
 
 import { FieldSource } from '../../utils/field-constants.js';
 import { getFieldRegistry } from '../../utils/field-registry.js';
+import {
+  POINT_VISIBILITY_THRESHOLD,
+} from '../../../rendering/alpha-visibility.js';
+
+function cloneSnapshotPointAttributes(config, pointCount) {
+  if (
+    config === null ||
+    typeof config !== 'object' ||
+    Array.isArray(config)
+  ) {
+    throw new TypeError(
+      'Snapshot context attributes require one configuration object.'
+    );
+  }
+  if (
+    !(config.colors instanceof Uint8Array) ||
+    config.colors.length !== pointCount * 4
+  ) {
+    throw new TypeError(
+      'Snapshot context colors must be an exact dataset-length Uint8 RGBA array.'
+    );
+  }
+  if (
+    !(config.transparency instanceof Float32Array) ||
+    config.transparency.length !== pointCount
+  ) {
+    throw new TypeError(
+      'Snapshot context transparency must be an exact dataset-length Float32 array.'
+    );
+  }
+  for (let index = 0; index < config.transparency.length; index += 1) {
+    const alpha = config.transparency[index];
+    if (!Number.isFinite(alpha) || alpha < 0 || alpha > 1) {
+      throw new RangeError(
+        `Snapshot context transparency ${index} must be finite and in [0, 1].`
+      );
+    }
+  }
+
+  const hasCentroidPositions = config.centroidPositions !== null;
+  const hasCentroidColors = config.centroidColors !== null;
+  if (hasCentroidPositions !== hasCentroidColors) {
+    throw new TypeError(
+      'Snapshot context centroid positions and colors must be published together.'
+    );
+  }
+  let centroidPositions = null;
+  let centroidColors = null;
+  if (hasCentroidPositions) {
+    if (
+      !(config.centroidPositions instanceof Float32Array) ||
+      config.centroidPositions.length % 3 !== 0
+    ) {
+      throw new TypeError(
+        'Snapshot context centroids must contain complete Float32 XYZ triples.'
+      );
+    }
+    const centroidCount = config.centroidPositions.length / 3;
+    if (
+      !(config.centroidColors instanceof Uint8Array) ||
+      config.centroidColors.length !== centroidCount * 4
+    ) {
+      throw new TypeError(
+        'Snapshot context centroid colors must contain one Uint8 RGBA value per centroid.'
+      );
+    }
+    for (
+      let index = 0;
+      index < config.centroidPositions.length;
+      index += 1
+    ) {
+      if (!Number.isFinite(config.centroidPositions[index])) {
+        throw new RangeError(
+          `Snapshot context centroid position ${index} must be finite.`
+        );
+      }
+    }
+    centroidPositions = new Float32Array(config.centroidPositions);
+    centroidColors = new Uint8Array(config.centroidColors);
+  }
+  return {
+    colors: new Uint8Array(config.colors),
+    transparency: new Float32Array(config.transparency),
+    centroidPositions,
+    centroidColors,
+  };
+}
+
+function exactTypedArrayEqual(left, right) {
+  if (
+    !ArrayBuffer.isView(left) ||
+    !ArrayBuffer.isView(right) ||
+    left?.constructor !== right?.constructor ||
+    left.length !== right.length
+  ) {
+    return left === right;
+  }
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
 
 export const viewContextCoreMethods = {
   _removeLabelsForView(viewId) {
@@ -87,6 +189,65 @@ export const viewContextCoreMethods = {
       ? { ...this.filteredCount }
       : { shown: this.pointCount, total: this.pointCount };
     return ctx;
+  },
+
+  _cloneViewContext(source, id, { cloneArrays = true } = {}) {
+    if (
+      source === null ||
+      typeof source !== 'object' ||
+      Array.isArray(source) ||
+      typeof source.id !== 'string' ||
+      source.id.length === 0 ||
+      source.id.trim() !== source.id
+    ) {
+      throw new TypeError(
+        'View-context cloning requires one exact published source context.'
+      );
+    }
+    const wrapFloat32 = value => {
+      if (value === null || value === undefined) return null;
+      if (!(value instanceof Float32Array)) {
+        throw new TypeError(
+          `View "${source.id}" contains a non-Float32 numeric context buffer.`
+        );
+      }
+      return cloneArrays ? new Float32Array(value) : value;
+    };
+    const wrapUint8 = value => {
+      if (value === null || value === undefined) return null;
+      if (!(value instanceof Uint8Array)) {
+        throw new TypeError(
+          `View "${source.id}" contains a non-Uint8 color context buffer.`
+        );
+      }
+      return cloneArrays ? new Uint8Array(value) : value;
+    };
+    return {
+      id,
+      obsData: this._cloneObsData(source.obsData),
+      varData: this._cloneVarData(source.varData),
+      activeFieldIndex: source.activeFieldIndex,
+      activeVarFieldIndex: source.activeVarFieldIndex,
+      activeFieldSource: source.activeFieldSource,
+      dimensionLevel: source.dimensionLevel,
+      colorsArray: wrapUint8(source.colorsArray),
+      categoryTransparency: wrapFloat32(source.categoryTransparency),
+      cellVisibilityMask: wrapFloat32(source.cellVisibilityMask),
+      outlierQuantilesArray: wrapFloat32(source.outlierQuantilesArray),
+      centroidPositions: wrapFloat32(source.centroidPositions),
+      centroidColors: wrapUint8(source.centroidColors),
+      centroidOutliers: wrapFloat32(source.centroidOutliers),
+      centroidLabels: Array.isArray(source.centroidLabels)
+        ? source.centroidLabels.map(label => (
+            label === null || label === undefined
+              ? label
+              : { ...label }
+          ))
+        : [],
+      filteredCount: source.filteredCount
+        ? { ...source.filteredCount }
+        : { shown: this.pointCount, total: this.pointCount },
+    };
   },
 
   captureCurrentContext() {
@@ -340,35 +501,212 @@ export const viewContextCoreMethods = {
     }
   },
 
+  createViewFromSource(sourceViewId, viewId) {
+    for (const [label, value] of [
+      ['Snapshot source view id', sourceViewId],
+      ['Snapshot view id', viewId],
+    ]) {
+      if (
+        typeof value !== 'string' ||
+        value.length === 0 ||
+        value.trim() !== value
+      ) {
+        throw new TypeError(
+          `${label} must be a non-empty, exactly trimmed string.`
+        );
+      }
+    }
+    if (!(this.viewContexts instanceof Map)) {
+      throw new TypeError(
+        'Snapshot context publication requires the exact view-context map.'
+      );
+    }
+    if (viewId === 'live') {
+      throw new RangeError('A snapshot context cannot replace the live view.');
+    }
+    if (this.viewContexts.has(viewId)) {
+      throw new RangeError(`View context "${viewId}" already exists.`);
+    }
+    const source = this.viewContexts.get(sourceViewId);
+    if (
+      source === null ||
+      typeof source !== 'object' ||
+      source.id !== sourceViewId
+    ) {
+      throw new RangeError(
+        `Snapshot source view "${sourceViewId}" does not exist.`
+      );
+    }
+    const ctx = viewContextCoreMethods._cloneViewContext.call(
+      this,
+      source,
+      viewId,
+      { cloneArrays: true }
+    );
+    this.viewContexts.set(viewId, ctx);
+    return ctx;
+  },
+
   createViewFromActive(viewId) {
-    const ctx = this._buildContextFromCurrent(viewId, { cloneArrays: true });
-    this.viewContexts.set(String(viewId), ctx);
+    return viewContextCoreMethods.createViewFromSource.call(
+      this,
+      String(this.activeViewId),
+      viewId
+    );
+  },
+
+  applySnapshotConfigToView(viewId, config) {
+    if (
+      typeof viewId !== 'string' ||
+      viewId.length === 0 ||
+      viewId.trim() !== viewId ||
+      viewId === 'live'
+    ) {
+      throw new TypeError(
+        'Snapshot context configuration requires one exact snapshot id.'
+      );
+    }
+    const context = this.viewContexts.get(viewId);
+    if (
+      context === null ||
+      typeof context !== 'object' ||
+      context.id !== viewId
+    ) {
+      throw new RangeError(
+        `Snapshot context "${viewId}" does not exist.`
+      );
+    }
+    if (
+      !Number.isSafeInteger(this.pointCount) ||
+      this.pointCount < 0
+    ) {
+      throw new RangeError(
+        'Snapshot context publication requires a non-negative point count.'
+      );
+    }
+    const attributes = cloneSnapshotPointAttributes(
+      config,
+      this.pointCount
+    );
+    const centroidsUnchanged =
+      exactTypedArrayEqual(
+        context.centroidPositions,
+        attributes.centroidPositions
+      ) &&
+      exactTypedArrayEqual(
+        context.centroidColors,
+        attributes.centroidColors
+      );
+
+    context.colorsArray = attributes.colors;
+    context.categoryTransparency = attributes.transparency;
+    let shown = 0;
+    for (let index = 0; index < this.pointCount; index += 1) {
+      const visible =
+        attributes.transparency[index] >= POINT_VISIBILITY_THRESHOLD;
+      if (visible) shown += 1;
+    }
+    context.centroidPositions = attributes.centroidPositions;
+    context.centroidColors = attributes.centroidColors;
+    if (!centroidsUnchanged) {
+      const centroidCount =
+        attributes.centroidPositions === null
+          ? 0
+          : attributes.centroidPositions.length / 3;
+      context.centroidOutliers = new Float32Array(centroidCount);
+      context.centroidOutliers.fill(-1);
+      context.centroidLabels = [];
+    }
+    context.filteredCount = {
+      shown,
+      total: this.pointCount,
+    };
+    return context;
   },
 
   removeView(viewId) {
-    const key = String(viewId);
-    if (String(this.activeViewId) === key) {
-      this.setActiveView('live');
+    if (
+      typeof viewId !== 'string' ||
+      viewId.length === 0 ||
+      viewId.trim() !== viewId
+    ) {
+      throw new TypeError(
+        'Removed view id must be a non-empty, exactly trimmed string.'
+      );
     }
-    this.viewContexts.delete(key);
+    const key = viewId;
+    if (key === 'live') {
+      throw new RangeError('The live view context cannot be removed.');
+    }
+    const failures = [];
+    const attempt = operation => {
+      try {
+        return operation();
+      } catch (error) {
+        failures.push(error);
+        return undefined;
+      }
+    };
+    if (this.activeViewId === key) {
+      attempt(() => this.setActiveView('live'));
+    }
+    const dimensionManager = this.dimensionManager;
+    if (dimensionManager !== null && dimensionManager !== undefined) {
+      if (typeof dimensionManager.removeView !== 'function') {
+        failures.push(
+          new TypeError(
+            'View removal requires DimensionManager.removeView().'
+          )
+        );
+      } else {
+        attempt(() => dimensionManager.removeView(key));
+      }
+    }
+    let contextRemoved = false;
+    attempt(() => {
+      contextRemoved = this.viewContexts.delete(key);
+    });
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) {
+      throw new AggregateError(
+        failures,
+        `View "${key}" retirement was incomplete.`
+      );
+    }
+    return contextRemoved;
   },
 
   clearSnapshotViews() {
-    this.setActiveView('live');
-    const liveCtx = this.viewContexts.get('live');
-    this.viewContexts.clear();
-    this.viewContexts.set('live', liveCtx);
+    viewContextCoreMethods.syncSnapshotContexts.call(this, []);
   },
 
   syncSnapshotContexts(snapshotIds) {
     const keep = new Set((snapshotIds || []).map((id) => String(id)));
+    const failures = [];
     if (!keep.has(String(this.activeViewId)) && this.activeViewId !== 'live') {
-      this.setActiveView('live');
+      try {
+        this.setActiveView('live');
+      } catch (error) {
+        failures.push(error);
+      }
     }
     const keys = Array.from(this.viewContexts.keys());
     for (const key of keys) {
       if (key === 'live') continue;
-      if (!keep.has(String(key))) this.viewContexts.delete(key);
+      if (!keep.has(String(key))) {
+        try {
+          viewContextCoreMethods.removeView.call(this, key);
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+    }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) {
+      throw new AggregateError(
+        failures,
+        'Snapshot context reconciliation was incomplete.'
+      );
     }
   },
 

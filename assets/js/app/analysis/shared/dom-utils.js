@@ -996,12 +996,22 @@ export function debounce(fn, delay) {
  * @returns {Function} Throttled function
  */
 export function throttle(fn, limit) {
-  let inThrottle;
-  return function (...args) {
+  let inThrottle = false;
+  let releaseTimer = null;
+  const throttled = function (...args) {
     if (!inThrottle) {
       fn.apply(this, args);
       inThrottle = true;
-      setTimeout(() => { inThrottle = false; }, limit);
+      releaseTimer = setTimeout(() => {
+        releaseTimer = null;
+        inThrottle = false;
+      }, limit);
     }
   };
+  throttled.cancel = () => {
+    if (releaseTimer !== null) clearTimeout(releaseTimer);
+    releaseTimer = null;
+    inThrottle = false;
+  };
+  return throttled;
 }

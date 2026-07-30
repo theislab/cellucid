@@ -11,6 +11,19 @@ test.beforeEach(async ({ page }) => {
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture',
   );
+  await page.evaluate(async () => {
+    const ui = window._cellucidUi;
+    if (
+      ui === null ||
+      typeof ui !== 'object' ||
+      typeof ui.destroy !== 'function'
+    ) {
+      throw new Error(
+        'Viewer terminal tests require the application UI teardown owner.'
+      );
+    }
+    await ui.destroy();
+  });
 });
 
 test('real WebGL loss is a permanent owner fence with no restoration or disposal GL work', async ({

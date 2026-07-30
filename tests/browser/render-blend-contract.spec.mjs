@@ -167,6 +167,7 @@ test('grid multiview scatter, highlight, connectivity, and centroid draws own ex
   const setup = await page.evaluate(() => {
     const viewer = window._cellucidViewer;
     const state = window._cellucidState;
+    const ui = window._cellucidUi;
     const pointCount = viewer.getPointCount();
     const highlightIndices = [0, 1, 2, 3, 4];
     const highlightData = new Uint8Array(pointCount);
@@ -194,7 +195,7 @@ test('grid multiview scatter, highlight, connectivity, and centroid draws own ex
       colors: centroidColors,
     });
     viewer.setShowCentroidPoints(true, 'live');
-    const snapshot = viewer.createSnapshotView({
+    const snapshot = ui.publishSnapshotView({
       label: 'Blend contract',
       fieldKey: payload.fieldKey,
       fieldKind: payload.fieldKind,

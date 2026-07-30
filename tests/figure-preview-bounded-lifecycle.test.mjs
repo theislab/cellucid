@@ -503,7 +503,12 @@ test('preview UI borrows N-sized data and fences every retained lifecycle owner'
     source,
     /cropDrag !== null[\s\S]*evt\.pointerId !== cropDrag\.pointerId/
   );
-  assert.match(source, /previewCanvas\.addEventListener\('lostpointercapture'/);
+  assert.match(source, /listen\(previewCanvas, 'lostpointercapture'/);
+  assert.equal(
+    source.match(/\.addEventListener\(/g)?.length,
+    1,
+    'Every figure-export DOM listener must use the shared lifecycle owner'
+  );
   assert.match(
     source,
     /if \(cleanupComplete \|\| exportInFlight\) return;[\s\S]*setBusy\(true\);[\s\S]*await exportFigureFromUi\(abortController\.signal\)/
@@ -524,4 +529,21 @@ test('preview UI borrows N-sized data and fences every retained lifecycle owner'
     source,
     /Figure preview axes require at least one visible point/
   );
+});
+
+test('figure-export UI exposes its stable idempotent cleanup owner', async () => {
+  const source = await readFile(
+    new URL(
+      '../assets/js/app/ui/modules/figure-export/figure-export-ui.js',
+      import.meta.url
+    ),
+    'utf8'
+  );
+
+  assert.match(
+    source,
+    /const destroy = \(\) => \{\s*if \(cleanupComplete\) return;/
+  );
+  assert.match(source, /container\.__cellucidCleanup = destroy;/);
+  assert.match(source, /return \{ destroy \};\s*\n\}/);
 });

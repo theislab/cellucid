@@ -84,6 +84,10 @@ export function initCameraControls({ viewer, dom, callbacks }) {
     );
   }
   const notifications = getNotificationCenter();
+  const lifecycleController = new AbortController();
+  let destroyed = false;
+  let operationGeneration = 0;
+  let projectileNotificationId = null;
 
   const {
     navigationModeSelect,
@@ -107,7 +111,19 @@ export function initCameraControls({ viewer, dom, callbacks }) {
     planarInvertAxesCheckbox
   } = dom;
 
+  function listen(target, eventName, listener) {
+    target.addEventListener(eventName, (...args) => {
+      if (destroyed) return;
+      listener(...args);
+    }, { signal: lifecycleController.signal });
+  }
+
+  function ownsOperation(generation) {
+    return !destroyed && generation === operationGeneration;
+  }
+
   function toggleNavigationPanels(mode) {
+    if (destroyed) return;
     freeflyControls.style.display = mode === 'free' ? 'block' : 'none';
     orbitControls.style.display = mode === 'orbit' ? 'block' : 'none';
     planarControls.style.display = mode === 'planar' ? 'block' : 'none';
@@ -132,6 +148,7 @@ export function initCameraControls({ viewer, dom, callbacks }) {
   }
 
   function updateLookSensitivity() {
+    if (destroyed) return;
     const rawValue = parseRangeInput(lookSensitivityInput.value, {
       minimum: 1,
       maximum: 30,
@@ -143,6 +160,7 @@ export function initCameraControls({ viewer, dom, callbacks }) {
   }
 
   function updateMoveSpeed() {
+    if (destroyed) return;
     const speed = sliderToMoveSpeed(moveSpeedInput.value);
     moveSpeedDisplay.textContent = speed.toFixed(2) + ' u/s';
     viewer.setMoveSpeed(speed);
@@ -150,6 +168,7 @@ export function initCameraControls({ viewer, dom, callbacks }) {
 
   // Keyboard navigation speed sliders for orbit and planar modes
   function updateOrbitKeySpeed() {
+    if (destroyed) return;
     const rawValue = parseRangeInput(orbitKeySpeedInput.value, {
       minimum: 1,
       maximum: 100,
@@ -161,6 +180,7 @@ export function initCameraControls({ viewer, dom, callbacks }) {
   }
 
   function updatePlanarPanSpeed() {
+    if (destroyed) return;
     const rawValue = parseRangeInput(planarPanSpeedInput.value, {
       minimum: 1,
       maximum: 100,
@@ -173,6 +193,7 @@ export function initCameraControls({ viewer, dom, callbacks }) {
   }
 
   const applyPointerLock = (checked) => {
+    if (destroyed) return;
     const mode = navigationModeSelect.value;
     if (mode !== 'free') {
       pointerLockCheckbox.checked = false;
@@ -181,7 +202,7 @@ export function initCameraControls({ viewer, dom, callbacks }) {
     viewer.setPointerLockEnabled(checked);
   };
 
-  navigationModeSelect.addEventListener('change', () => {
+  listen(navigationModeSelect, 'change', () => {
     viewer.setNavigationMode(navigationModeSelect.value);
     const mode = navigationModeSelect.value;
 
@@ -200,36 +221,45 @@ export function initCameraControls({ viewer, dom, callbacks }) {
   });
 
   updateLookSensitivity();
-  lookSensitivityInput.addEventListener('input', updateLookSensitivity);
+  listen(lookSensitivityInput, 'input', updateLookSensitivity);
 
   updateMoveSpeed();
-  moveSpeedInput.addEventListener('input', updateMoveSpeed);
+  listen(moveSpeedInput, 'input', updateMoveSpeed);
 
   updateOrbitKeySpeed();
-  orbitKeySpeedInput.addEventListener('input', updateOrbitKeySpeed);
+  listen(orbitKeySpeedInput, 'input', updateOrbitKeySpeed);
 
   updatePlanarPanSpeed();
-  planarPanSpeedInput.addEventListener('input', updatePlanarPanSpeed);
+  listen(planarPanSpeedInput, 'input', updatePlanarPanSpeed);
 
   const applyInvertLook = (value) => {
+    if (destroyed) return;
     viewer.setInvertLookY(value);
     viewer.setInvertLookX(value);
   };
   applyInvertLook(invertLookCheckbox.checked);
-  invertLookCheckbox.addEventListener('change', () => {
+  listen(invertLookCheckbox, 'change', () => {
     applyInvertLook(invertLookCheckbox.checked);
     invertLookCheckbox.blur();
   });
 
   projectilesEnabledCheckbox.checked = false;
   viewer.setProjectilesEnabled(false);
-  projectilesEnabledCheckbox.addEventListener('change', () => {
+  listen(projectilesEnabledCheckbox, 'change', () => {
     const enabled = projectilesEnabledCheckbox.checked;
 
     if (enabled && !viewer.isProjectileSpatialIndexReady()) {
+      if (projectileNotificationId !== null) {
+        notifications.dismiss(projectileNotificationId);
+        projectileNotificationId = null;
+      }
+      const generation = ++operationGeneration;
       const readyNotifId = notifications.loading('Preparing projectile collision system...', { category: 'spatial' });
+      projectileNotificationId = readyNotifId;
       viewer.setProjectilesEnabled(true, (rawResult) => {
+        if (!ownsOperation(generation)) return;
         const result = assertProjectileBuildResult(rawResult);
+        projectileNotificationId = null;
         if (result.status === 'ready') {
           notifications.complete(
             readyNotifId,
@@ -245,18 +275,24 @@ export function initCameraControls({ viewer, dom, callbacks }) {
         notifications.fail(readyNotifId, result.message);
       });
     } else {
+      operationGeneration += 1;
+      if (projectileNotificationId !== null) {
+        notifications.dismiss(projectileNotificationId);
+        projectileNotificationId = null;
+      }
       viewer.setProjectilesEnabled(enabled);
     }
     projectilesEnabledCheckbox.blur();
   });
 
   pointerLockCheckbox.checked = false;
-  pointerLockCheckbox.addEventListener('change', () => {
+  listen(pointerLockCheckbox, 'change', () => {
     applyPointerLock(pointerLockCheckbox.checked);
     pointerLockCheckbox.blur();
   });
 
   viewer.setPointerLockChangeHandler((active, errorMessage) => {
+    if (destroyed) return;
     if (typeof active !== 'boolean') {
       throw new TypeError('Pointer-lock state must be an exact boolean.');
     }
@@ -279,22 +315,22 @@ export function initCameraControls({ viewer, dom, callbacks }) {
   });
 
   viewer.setOrbitInvertRotation(orbitReverseCheckbox.checked);
-  orbitReverseCheckbox.addEventListener('change', () => {
+  listen(orbitReverseCheckbox, 'change', () => {
     viewer.setOrbitInvertRotation(orbitReverseCheckbox.checked);
   });
 
   viewer.setPlanarZoomToCursor(planarZoomToCursorCheckbox.checked);
-  planarZoomToCursorCheckbox.addEventListener('change', () => {
+  listen(planarZoomToCursorCheckbox, 'change', () => {
     viewer.setPlanarZoomToCursor(planarZoomToCursorCheckbox.checked);
   });
 
   viewer.setPlanarInvertAxes(planarInvertAxesCheckbox.checked);
-  planarInvertAxesCheckbox.addEventListener('change', () => {
+  listen(planarInvertAxesCheckbox, 'change', () => {
     viewer.setPlanarInvertAxes(planarInvertAxesCheckbox.checked);
   });
 
   viewer.setShowOrbitAnchor(showOrbitAnchorCheckbox.checked);
-  showOrbitAnchorCheckbox.addEventListener('change', () => {
+  listen(showOrbitAnchorCheckbox, 'change', () => {
     viewer.setShowOrbitAnchor(showOrbitAnchorCheckbox.checked);
   });
 
@@ -303,11 +339,47 @@ export function initCameraControls({ viewer, dom, callbacks }) {
   navigationModeSelect.value = startingNavMode;
   toggleNavigationPanels(startingNavMode);
 
+  function destroy() {
+    if (destroyed) return;
+    destroyed = true;
+    operationGeneration += 1;
+    lifecycleController.abort();
+
+    const failures = [];
+    const cleanup = operation => {
+      try {
+        operation();
+      } catch (error) {
+        failures.push(error);
+      }
+    };
+    cleanup(() => viewer.setPointerLockChangeHandler(() => {}));
+    cleanup(() => viewer.setPointerLockEnabled(false));
+    cleanup(() => viewer.setProjectilesEnabled(false));
+    if (projectileNotificationId !== null) {
+      const notificationId = projectileNotificationId;
+      projectileNotificationId = null;
+      cleanup(() => notifications.dismiss(notificationId));
+    }
+    pointerLockCheckbox.checked = false;
+    projectilesEnabledCheckbox.checked = false;
+
+    const exactFailures = [...new Set(failures)];
+    if (exactFailures.length === 1) throw exactFailures[0];
+    if (exactFailures.length > 1) {
+      throw new AggregateError(
+        exactFailures,
+        'Camera controls failed to release every owned resource.'
+      );
+    }
+  }
+
   return {
     toggleNavigationPanels,
     updateLookSensitivity,
     updateMoveSpeed,
     updateOrbitKeySpeed,
-    updatePlanarPanSpeed
+    updatePlanarPanSpeed,
+    destroy
   };
 }

@@ -254,6 +254,7 @@ export function initDatasetControls(options) {
     'getCurrentMetadata',
     'getCurrentSourceType',
     'getSource',
+    'offDatasetChange',
     'onDatasetChange',
     'registerSource',
     'unregisterSource'
@@ -317,12 +318,45 @@ export function initDatasetControls(options) {
     throw new TypeError('Dataset select must provide an ownerDocument.');
   }
   const datasetOptionsByKey = new Map();
+  const lifecycleController = new AbortController();
+  const activeWork = new Set();
   let noneDatasetOption = null;
   let catalogGeneration = 0;
   let datasetSelectionIntentGeneration = 0;
   let activeDatasetSelectionIntent = null;
+  let datasetConnections = null;
+  let destroyed = false;
+  let destroyPromise = null;
+
+  function assertAlive() {
+    if (destroyed) {
+      throw new Error('Dataset controls are unavailable after destroy().');
+    }
+  }
+
+  function trackWork(work) {
+    const promise = Promise.resolve(work);
+    activeWork.add(promise);
+    const retire = () => activeWork.delete(promise);
+    promise.then(retire, retire);
+    return promise;
+  }
+
+  function invokeTracked(operation) {
+    try {
+      assertAlive();
+      return trackWork(operation());
+    } catch (error) {
+      return trackWork(Promise.reject(error));
+    }
+  }
+
+  function ownsCatalogGeneration(generation) {
+    return !destroyed && generation === catalogGeneration;
+  }
 
   function beginDatasetSelectionIntent() {
+    assertAlive();
     datasetSelectionIntentGeneration =
       datasetSelectionIntentGeneration === Number.MAX_SAFE_INTEGER
         ? 1
@@ -334,7 +368,7 @@ export function initDatasetControls(options) {
   }
 
   function ownsDatasetSelectionIntent(owner) {
-    return owner === activeDatasetSelectionIntent;
+    return !destroyed && owner === activeDatasetSelectionIntent;
   }
 
   function createNoneDatasetOption() {
@@ -446,6 +480,7 @@ function updateDatasetInfo(metadata, sourceTypeOverride = null) {
  * @param {Object|null} metadata - Dataset metadata
  */
 function refreshDatasetUI(metadata) {
+  assertAlive();
   renderFieldSelects();
   renderDeletedFieldsSection();
   initGeneExpressionDropdown();
@@ -466,6 +501,7 @@ function refreshDatasetUI(metadata) {
  * Populate the dataset dropdown with available datasets from all sources
  */
 async function populateDatasetDropdown() {
+  assertAlive();
   const generation = ++catalogGeneration;
   debug.log('[UI] populateDatasetDropdown called', { datasetSelect, dataSourceManager });
 
@@ -481,10 +517,10 @@ async function populateDatasetDropdown() {
 
   try {
     debug.log('[UI] Calling getAllDatasets...');
-    const allSourceDatasets = requireCatalog(
-      await dataSourceManager.getAllDatasets()
-    );
-    if (generation !== catalogGeneration) {
+    const allSourceDatasets = requireCatalog(await trackWork(
+      dataSourceManager.getAllDatasets()
+    ));
+    if (!ownsCatalogGeneration(generation)) {
       return Object.freeze({ status: 'superseded' });
     }
 
@@ -600,7 +636,7 @@ async function populateDatasetDropdown() {
     datasetSelect.disabled = false;
     return Object.freeze({ status: 'ready' });
   } catch (error) {
-    if (generation !== catalogGeneration) {
+    if (!ownsCatalogGeneration(generation)) {
       return Object.freeze({ status: 'superseded' });
     }
     const exactError = errorFromUnknown(error, 'Dataset catalog');
@@ -667,12 +703,15 @@ async function handleDatasetChangeForIntent(
         `Dataset source "${sourceType}" is not registered or staged.`
       );
     }
-    const ready = await reloadDataset({
-      datasetId,
-      loadMethod,
-      source,
-      sourceType
-    });
+    const ready = await trackWork(reloadDataset({
+        datasetId,
+        loadMethod,
+        source,
+        sourceType
+      }));
+    if (!ownsDatasetSelectionIntent(intentOwner)) {
+      return ready === true;
+    }
     if (ready !== true) {
       throw new Error(
         'Dataset activation did not publish one ready generation.'
@@ -773,7 +812,10 @@ async function handleNoneDatasetSelectionForIntent(intentOwner) {
     datasetInfo.classList.add('loading');
     showSessionStatus('Clearing dataset...', false);
 
-    const cleared = await clearDataset();
+    const cleared = await trackWork(clearDataset());
+    if (!ownsDatasetSelectionIntent(intentOwner)) {
+      return cleared === true;
+    }
     if (cleared !== true) {
       throw new Error(
         'Dataset clear did not publish one ready None generation.'
@@ -827,6 +869,7 @@ function handleNoneDatasetSelection() {
 }
 
 function synchronizeDatasetEvent(rawEvent) {
+  if (destroyed) return;
   const event = requireDatasetEvent(rawEvent);
   if (
     (event.previousDatasetId === null) !==
@@ -1055,26 +1098,90 @@ async function handleDatasetSelectEvent(event) {
     updateDatasetInfo(initialMetadata, initialSourceType);
   }
 
-  const catalogReady = populateDatasetDropdown();
+  const catalogReady = trackWork(populateDatasetDropdown());
 
-dataSourceManager.onDatasetChange(synchronizeDatasetEvent);
-datasetSelect.addEventListener('change', event => {
-  void handleDatasetSelectEvent(event);
-});
-  initDatasetConnections({
-    activateDataset: handleDatasetChange,
-    clearDataset: handleNoneDatasetSelection,
+  dataSourceManager.onDatasetChange(synchronizeDatasetEvent);
+  function handleDatasetSelectDomEvent(event) {
+    if (destroyed) return;
+    void invokeTracked(() => handleDatasetSelectEvent(event));
+  }
+  datasetSelect.addEventListener(
+    'change',
+    handleDatasetSelectDomEvent,
+    { signal: lifecycleController.signal }
+  );
+  datasetConnections = initDatasetConnections({
+    activateDataset: (...args) =>
+      invokeTracked(() => handleDatasetChange(...args)),
+    clearDataset: () =>
+      invokeTracked(() => handleNoneDatasetSelection()),
     dom,
     dataSourceManager,
-    populateDatasetDropdown,
+    populateDatasetDropdown: () =>
+      invokeTracked(() => populateDatasetDropdown()),
     noneDatasetValue: NONE_DATASET_VALUE
   });
 
+  function destroy() {
+    if (destroyPromise !== null) return destroyPromise;
+    destroyed = true;
+    catalogGeneration =
+      catalogGeneration === Number.MAX_SAFE_INTEGER
+        ? 1
+        : catalogGeneration + 1;
+    datasetSelectionIntentGeneration =
+      datasetSelectionIntentGeneration === Number.MAX_SAFE_INTEGER
+        ? 1
+        : datasetSelectionIntentGeneration + 1;
+    activeDatasetSelectionIntent = null;
+    const cleanupErrors = [];
+    try {
+      lifecycleController.abort();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    try {
+      dataSourceManager.offDatasetChange(synchronizeDatasetEvent);
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+
+    let connectionDrain;
+    try {
+      connectionDrain = datasetConnections.destroy();
+    } catch (error) {
+      cleanupErrors.push(error);
+      connectionDrain = Promise.resolve();
+    }
+    const operationDrain = Promise.allSettled([...activeWork]);
+    destroyPromise = Promise.allSettled([
+      operationDrain,
+      connectionDrain
+    ]).then(results => {
+      const connectionResult = results[1];
+      if (connectionResult.status === 'rejected') {
+        cleanupErrors.push(connectionResult.reason);
+      }
+      if (cleanupErrors.length === 1) throw cleanupErrors[0];
+      if (cleanupErrors.length > 1) {
+        throw new AggregateError(
+          cleanupErrors,
+          'Dataset controls could not release every owner.'
+        );
+      }
+    });
+    return destroyPromise;
+  }
+
   return {
     catalogReady,
-    clearDataset: handleNoneDatasetSelection,
-    populateDatasetDropdown,
+    clearDataset: () =>
+      invokeTracked(() => handleNoneDatasetSelection()),
+    destroy,
+    populateDatasetDropdown: () =>
+      invokeTracked(() => populateDatasetDropdown()),
     refreshDatasetUI,
-    selectDataset: handleDatasetChange
+    selectDataset: (...args) =>
+      invokeTracked(() => handleDatasetChange(...args))
   };
 }

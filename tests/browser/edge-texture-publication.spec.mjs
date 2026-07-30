@@ -39,6 +39,7 @@ test('edge generations preserve exact GL state and rollback/retry ownership', as
   const proof = await page.evaluate(async () => {
     const viewer = window._cellucidViewer;
     const state = window._cellucidState;
+    const ui = window._cellucidUi;
     const gl = viewer.getGLContext();
     const positions = viewer.getViewPositions('live');
     const nCells = viewer.getPointCount();
@@ -88,7 +89,7 @@ test('edge generations preserve exact GL state and rollback/retry ownership', as
       meta: { filtersText: payload.filtersText },
       cameraState: viewer.getViewCameraState(sourceViewId),
     });
-    const parent = viewer.createSnapshotView(
+    const parent = ui.publishSnapshotView(
       makeConfig('Edge parent', 'live'),
     );
     const parentBefore = viewer.getViewPositions(parent.id);
@@ -138,7 +139,7 @@ test('edge generations preserve exact GL state and rollback/retry ownership', as
     );
     // This child creation requires the viewer cache to reference the exact
     // renderer-owned geometry copy published by snapshot rollback.
-    const child = viewer.createSnapshotView(
+    const child = ui.publishSnapshotView(
       makeConfig('Edge child', parent.id),
     );
 
@@ -257,6 +258,7 @@ test('edge texture pooling, streamed tails, and binary visibility stay exact', a
   const proof = await page.evaluate(async () => {
     const viewer = window._cellucidViewer;
     const state = window._cellucidState;
+    const ui = window._cellucidUi;
     const renderer = viewer.getHPRenderer();
     const gl = viewer.getGLContext();
     viewer.pause();
@@ -530,10 +532,10 @@ test('edge texture pooling, streamed tails, and binary visibility stay exact', a
         meta: { filtersText: payload.filtersText },
         cameraState: viewer.getViewCameraState(sourceViewId),
       });
-      const parent = viewer.createSnapshotView(
+      const parent = ui.publishSnapshotView(
         makeConfig('Pool parent', 'live'),
       );
-      const child = viewer.createSnapshotView(
+      const child = ui.publishSnapshotView(
         makeConfig('Pool child', parent.id),
       );
       const sharedStats = viewer.getEdgeTextureStatsV2();
@@ -608,13 +610,13 @@ test('edge texture pooling, streamed tails, and binary visibility stay exact', a
       const oldDeletesBeforeParent = deletedTextures.filter(
         texture => texture === oldTexture,
       ).length;
-      viewer.removeSnapshotView(parent.id);
+      ui.retireSnapshotView(parent.id);
       const afterParentRemoval = viewer.getEdgeTextureStatsV2();
       const oldDeletesAfterParent = deletedTextures.filter(
         texture => texture === oldTexture,
       ).length;
       gl.bindTexture(gl.TEXTURE_2D, oldTexture);
-      viewer.removeSnapshotView(child.id);
+      ui.retireSnapshotView(child.id);
       const boundAfterFinalSharedRelease =
         gl.getParameter(gl.TEXTURE_BINDING_2D);
       const afterChildRemoval = viewer.getEdgeTextureStatsV2();
@@ -794,6 +796,7 @@ test('per-view edge prefixes remain exact across focus, R8 failure, and retireme
   const proof = await page.evaluate(async () => {
     const viewer = window._cellucidViewer;
     const state = window._cellucidState;
+    const ui = window._cellucidUi;
     const gl = viewer.getGLContext();
     const prototype = WebGL2RenderingContext.prototype;
     const nCells = viewer.getPointCount();
@@ -834,7 +837,7 @@ test('per-view edge prefixes remain exact across focus, R8 failure, and retireme
       nCells,
     }, viewer.getViewPositions('live'));
     const payload = state.getSnapshotPayload();
-    const snapshot = viewer.createSnapshotView({
+    const snapshot = ui.publishSnapshotView({
       label: 'Opposite edge visibility',
       fieldKey: payload.fieldKey,
       fieldKind: payload.fieldKind,
@@ -1206,7 +1209,7 @@ test('per-view edge prefixes remain exact across focus, R8 failure, and retireme
     const refreshedSnapshotTargetPrefix =
       viewer.getEdgePrefixStatsForView(snapshot.id);
 
-    viewer.removeSnapshotView(snapshot.id);
+    ui.retireSnapshotView(snapshot.id);
     const retiredSnapshotPrefix =
       viewer.getEdgePrefixStatsForView(snapshot.id);
     const retiredStats = viewer.getEdgeTextureStatsV2();
@@ -1478,6 +1481,7 @@ test('committed setData detaches every prior edge generation before retryable cl
   const proof = await page.evaluate(() => {
     const viewer = window._cellucidViewer;
     const state = window._cellucidState;
+    const ui = window._cellucidUi;
     const renderer = viewer.getHPRenderer();
     const nCells = viewer.getPointCount();
     viewer.pause();
@@ -1503,10 +1507,10 @@ test('committed setData detaches every prior edge generation before retryable cl
       meta: { filtersText: snapshotPayload.filtersText },
       cameraState: viewer.getViewCameraState(sourceViewId),
     });
-    const parent = viewer.createSnapshotView(
+    const parent = ui.publishSnapshotView(
       makeConfig('setData parent', 'live'),
     );
-    const child = viewer.createSnapshotView(
+    const child = ui.publishSnapshotView(
       makeConfig('setData child', parent.id),
     );
     const before = viewer.getEdgeTextureStatsV2();
@@ -1576,7 +1580,7 @@ test('committed setData detaches every prior edge generation before retryable cl
     }
     const afterRetry = viewer.getEdgeTextureStatsV2();
 
-    return {
+    const result = {
       afterCommit,
       afterRetry,
       before,
@@ -1592,6 +1596,10 @@ test('committed setData detaches every prior edge generation before retryable cl
       retryError,
       setDataError,
     };
+    // setData() is intentionally exercised as a low-level viewer transaction.
+    // Reconcile the application-owned snapshot contexts after recording it.
+    ui.clearSnapshotViews();
+    return result;
   });
 
   expect(proof.before.positionGenerations).toHaveLength(1);

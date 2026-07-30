@@ -26,8 +26,20 @@
 export function initFilterControls({ state, viewer, dom, callbacks = {} }) {
   const filterCountEl = dom?.countEl || null;
   const activeFiltersEl = dom?.activeFiltersEl || null;
+  let renderLifecycleController = new AbortController();
+  let destroyed = false;
+
+  function listen(target, eventName, listener) {
+    target.addEventListener(eventName, (...args) => {
+      if (destroyed) return;
+      listener(...args);
+    }, { signal: renderLifecycleController.signal });
+  }
 
   function render() {
+    if (destroyed) return;
+    renderLifecycleController.abort();
+    renderLifecycleController = new AbortController();
     if (!activeFiltersEl || !filterCountEl) return;
 
     const filters = state.getActiveFiltersStructured ? state.getActiveFiltersStructured() : [];
@@ -49,7 +61,7 @@ export function initFilterControls({ state, viewer, dom, callbacks = {} }) {
         checkbox.className = 'filter-checkbox';
         checkbox.checked = filter.enabled;
         checkbox.title = filter.enabled ? 'Disable this filter' : 'Enable this filter';
-        checkbox.addEventListener('change', () => {
+        listen(checkbox, 'change', () => {
           const enabled = checkbox.checked;
           state.toggleFilterEnabled?.(filter.id, enabled);
           callbacks.onFiltersChanged?.();
@@ -72,7 +84,7 @@ export function initFilterControls({ state, viewer, dom, callbacks = {} }) {
         removeBtn.className = 'filter-remove-btn';
         removeBtn.innerHTML = '×';
         removeBtn.title = 'Remove this filter';
-        removeBtn.addEventListener('click', (e) => {
+        listen(removeBtn, 'click', (e) => {
           e.stopPropagation();
           state.removeFilter?.(filter.id);
           callbacks.onFiltersChanged?.();
@@ -100,6 +112,11 @@ export function initFilterControls({ state, viewer, dom, callbacks = {} }) {
     }
   }
 
-  return { render };
-}
+  function destroy() {
+    if (destroyed) return;
+    destroyed = true;
+    renderLifecycleController.abort();
+  }
 
+  return { render, destroy };
+}

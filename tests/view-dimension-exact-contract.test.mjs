@@ -2,11 +2,87 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  DATASET_VIEW_LOAD_SUPERSEDED_CODE,
   DataStateViewMethods,
 } from '../assets/js/app/state/managers/view-manager.js';
 import {
   createDataState,
 } from '../assets/js/app/state/core/data-state.js';
+
+function createDeferred() {
+  let reject;
+  let resolve;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    reject = rejectPromise;
+    resolve = resolvePromise;
+  });
+  return { promise, reject, resolve };
+}
+
+function createRuntimeViewer() {
+  const calls = {
+    dimensionPublications: [],
+    positionPublications: [],
+    vectorPublications: [],
+  };
+  let disposed = false;
+  const viewer = {
+    hasVectorFieldForDimension() {
+      return false;
+    },
+    isDisposed() {
+      return disposed;
+    },
+    resetVectorFieldOverlay() {},
+    setCentroidLabels() {},
+    setCentroids() {},
+    setData() {},
+    setVectorFieldData(fieldId, level, data) {
+      calls.vectorPublications.push({ data, fieldId, level });
+    },
+    setViewDimension(viewId, level) {
+      calls.dimensionPublications.push([viewId, level]);
+    },
+    updatePositions(positions, level) {
+      calls.positionPublications.push({ level, positions });
+    },
+  };
+  return {
+    calls,
+    dispose() {
+      disposed = true;
+    },
+    viewer,
+  };
+}
+
+function createDimensionManager({
+  deferredPositions = null,
+  defaultDimension = 2,
+} = {}) {
+  const publications = [];
+  return {
+    publications,
+    getAvailableDimensions() {
+      return [2, 3];
+    },
+    getDefaultDimension() {
+      return defaultDimension;
+    },
+    getPositions3D(level) {
+      if (deferredPositions !== null && level === 3) {
+        return deferredPositions.promise;
+      }
+      return Promise.resolve(new Float32Array(6));
+    },
+    hasDimension(level) {
+      return level === 2 || level === 3;
+    },
+    setViewDimension(viewId, level) {
+      publications.push([viewId, level]);
+    },
+  };
+}
 
 function createDimensionState({
   availableDimensions = [2, 3],
@@ -316,4 +392,144 @@ test('failed snapshot dimension publication restores positions under the prior g
     ['snapshot-1', 2],
   ]);
   assert.deepEqual(calls.notifications, []);
+});
+
+test('real DataState rejects deferred coordinates after dataset-owner replacement', async () => {
+  const runtime = createRuntimeViewer();
+  const deferredPositions = createDeferred();
+  const priorManager = createDimensionManager({ deferredPositions });
+  const state = createDataState({
+    viewer: runtime.viewer,
+    labelLayer: null,
+  });
+  state.setDimensionManager(priorManager);
+  const priorPositions = Float32Array.from([
+    -1, -1, 0,
+    1, 1, 0,
+  ]);
+  state.initScene(priorPositions, { fields: [] });
+
+  const dimensionChange = state.setDimensionLevel(3, {
+    viewId: 'live',
+  });
+  const replacementManager = createDimensionManager();
+  const replacementPositions = Float32Array.from([
+    -0.25, -0.25, 0,
+    0.25, 0.25, 0,
+  ]);
+  state.setDimensionManager(replacementManager);
+  state.initScene(replacementPositions, { fields: [] });
+
+  deferredPositions.resolve(Float32Array.from([
+    -2, -2, -2,
+    2, 2, 2,
+  ]));
+  await assert.rejects(
+    dimensionChange,
+    error => error?.code === DATASET_VIEW_LOAD_SUPERSEDED_CODE,
+  );
+  assert.strictEqual(state.dimensionManager, replacementManager);
+  assert.strictEqual(state.positionsArray, replacementPositions);
+  assert.equal(state.pointCount, 2);
+  assert.deepEqual(runtime.calls.positionPublications, []);
+  assert.deepEqual(runtime.calls.dimensionPublications, []);
+  assert.equal(
+    priorManager.publications.some(
+      ([viewId, level]) => viewId === 'live' && level === 3
+    ),
+    false,
+  );
+});
+
+test('real DataState rejects deferred coordinates after terminal viewer disposal', async () => {
+  const runtime = createRuntimeViewer();
+  const deferredPositions = createDeferred();
+  const manager = createDimensionManager({ deferredPositions });
+  const state = createDataState({
+    viewer: runtime.viewer,
+    labelLayer: null,
+  });
+  state.setDimensionManager(manager);
+  state.initScene(new Float32Array(6), { fields: [] });
+
+  const dimensionChange = state.setDimensionLevel(3, {
+    viewId: 'live',
+  });
+  runtime.dispose();
+  deferredPositions.resolve(new Float32Array(6));
+
+  await assert.rejects(
+    dimensionChange,
+    error => error?.code === DATASET_VIEW_LOAD_SUPERSEDED_CODE,
+  );
+  assert.deepEqual(runtime.calls.positionPublications, []);
+  assert.deepEqual(runtime.calls.dimensionPublications, []);
+  assert.equal(state.getViewDimensionLevel('live'), 2);
+});
+
+test('real DataState rejects deferred vectors after manager and dataset replacement', async () => {
+  const runtime = createRuntimeViewer();
+  const dimensionManager = createDimensionManager();
+  const state = createDataState({
+    viewer: runtime.viewer,
+    labelLayer: null,
+  });
+  state.setDimensionManager(dimensionManager);
+  state.initScene(new Float32Array(6), { fields: [] });
+
+  const deferredField = createDeferred();
+  const priorVectorManager = {
+    getAvailableFields() {
+      return [{
+        id: 'velocity',
+        label: 'Velocity',
+        availableDimensions: [2],
+        defaultDimension: 2,
+      }];
+    },
+    getDefaultFieldId() {
+      return 'velocity';
+    },
+    hasAny() {
+      return true;
+    },
+    hasField(fieldId) {
+      return fieldId === 'velocity';
+    },
+    hasFieldDimension(fieldId, level) {
+      return fieldId === 'velocity' && level === 2;
+    },
+    loadField() {
+      return deferredField.promise;
+    },
+  };
+  const replacementVectorManager = {
+    ...priorVectorManager,
+    loadField() {
+      throw new Error('Replacement vector manager was not requested.');
+    },
+  };
+  state.setVectorFieldManager(priorVectorManager);
+  const vectorLoad = state.ensureVectorField(
+    'velocity',
+    2,
+    { silent: true },
+  );
+
+  state.initScene(new Float32Array(6), { fields: [] });
+  state.setVectorFieldManager(replacementVectorManager);
+  deferredField.resolve(Float32Array.from([
+    1, 0,
+    0, 1,
+  ]));
+
+  await assert.rejects(
+    vectorLoad,
+    error => error?.code === DATASET_VIEW_LOAD_SUPERSEDED_CODE,
+  );
+  assert.strictEqual(
+    state.getVectorFieldManager(),
+    replacementVectorManager,
+  );
+  assert.deepEqual(runtime.calls.vectorPublications, []);
 });

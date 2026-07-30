@@ -520,13 +520,12 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           jupyterSource.notifyClick(cellIndex, modifiers),
         reportError: reportJupyterPointerError,
       });
-      window.addEventListener(
-        'pagehide',
-        () => {
-          freezeJupyterView();
-        },
-        { once: true }
-      );
+      const retireJupyterView = event => {
+        if (event.persisted === true) return;
+        window.removeEventListener('pagehide', retireJupyterView);
+        freezeJupyterView();
+      };
+      window.addEventListener('pagehide', retireJupyterView);
 
       let pendingHoverClientX = 0;
       let pendingHoverClientY = 0;
@@ -2250,6 +2249,15 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       dataSourceManager,
       jupyterSource
     });
+    window._cellucidUi = ui;
+    const retireApplicationUi = event => {
+      if (event.persisted === true) return;
+      window.removeEventListener('pagehide', retireApplicationUi);
+      void ui.destroy().catch(error => {
+        console.error('[Main] Application UI teardown failed:', error);
+      });
+    };
+    window.addEventListener('pagehide', retireApplicationUi);
     datasetCatalogReady = ui.datasetCatalogReady;
     fulfillDatasetSelectFocusRequest();
 

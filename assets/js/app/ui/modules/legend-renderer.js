@@ -32,13 +32,35 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
     renderCategoricalLegend,
     destroy: destroyCategoricalLegend
   } = initCategoricalLegend({ state, legendEl, dataSourceManager });
+  const lifecycleController = new AbortController();
+  let renderLifecycleController = new AbortController();
+  let throttledStateUpdate = null;
+  let destroyed = false;
+
+  function listen(
+    target,
+    eventName,
+    listener,
+    signal = lifecycleController.signal,
+    options = {}
+  ) {
+    target.addEventListener(eventName, (...args) => {
+      if (destroyed) return;
+      listener(...args);
+    }, { ...options, signal });
+  }
 
   function setDisplayOptionsVisibility(field) {
+    if (destroyed) return;
     if (!displayOptionsContainer) return;
     displayOptionsContainer.style.display = field ? 'block' : 'none';
   }
 
   function render(field) {
+    if (destroyed) return;
+    renderLifecycleController.abort();
+    renderLifecycleController = new AbortController();
+    const renderSignal = renderLifecycleController.signal;
     if (!legendEl) return;
     setDisplayOptionsVisibility(field);
     if (!field) {
@@ -110,14 +132,14 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
           name.textContent = cm.label;
           option.appendChild(preview);
           option.appendChild(name);
-          option.addEventListener('click', (e) => {
+          listen(option, 'click', (e) => {
             e.stopPropagation();
             colormapMenu.classList.remove('visible');
             if (cm.id !== activeId) {
               state.setContinuousColormap(state.activeFieldIndex, cm.id);
               render(state.getActiveField());
             }
-          });
+          }, renderSignal);
           colormapMenu.appendChild(option);
         });
       }
@@ -130,17 +152,28 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
         if (!colorBarWrapper.contains(evt.target)) closeColormapMenu();
       }
 
-      gradientBar.addEventListener('click', (e) => {
+      listen(gradientBar, 'click', (e) => {
         e.stopPropagation();
         const willOpen = !colormapMenu.classList.contains('visible');
         if (willOpen) {
           colormapMenu.classList.add('visible');
-          document.addEventListener('click', handleOutsideClick, { once: true });
+          listen(
+            document,
+            'click',
+            handleOutsideClick,
+            renderSignal,
+            { once: true }
+          );
         } else {
           closeColormapMenu();
         }
-      });
-      colormapMenu.addEventListener('click', (e) => e.stopPropagation());
+      }, renderSignal);
+      listen(
+        colormapMenu,
+        'click',
+        (e) => e.stopPropagation(),
+        renderSignal
+      );
 
       colorBarWrapper.appendChild(gradientBar);
       colorBarWrapper.appendChild(colormapMenu);
@@ -210,12 +243,12 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
 
       setLogToggle(Boolean(model.logEnabled));
       setRescaleToggle(Boolean(model.colorbar?.usingFilter));
-      logToggle.addEventListener('click', () => {
+      listen(logToggle, 'click', () => {
         const next = logToggle.getAttribute('aria-pressed') !== 'true';
         state.setContinuousLogScale(state.activeFieldIndex, next);
         refreshColorbarLabels();
-      });
-      rescaleToggle.addEventListener('click', () => {
+      }, renderSignal);
+      listen(rescaleToggle, 'click', () => {
         const next = rescaleToggle.getAttribute('aria-pressed') !== 'true';
         state.setContinuousColorRescale(state.activeFieldIndex, next);
         if (next) {
@@ -223,7 +256,7 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
           state.setContinuousColorRange(state.activeFieldIndex, newMin, newMax);
         }
         refreshColorbarLabels();
-      });
+      }, renderSignal);
 
       const rescaleHint = document.createElement('div');
       rescaleHint.className = 'legend-help';
@@ -282,11 +315,11 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
         }
       }
 
-      liveToggle.addEventListener('click', () => {
+      listen(liveToggle, 'click', () => {
         const next = liveToggle.getAttribute('aria-pressed') !== 'true';
         setLiveToggleUI(next);
         if (next) applyFilterFromSliders();
-      });
+      }, renderSignal);
 
       liveRow.appendChild(liveLabel);
       liveRow.appendChild(liveToggle);
@@ -381,30 +414,30 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
         state.applyContinuousFilter(state.activeFieldIndex, newMin, newMax);
       }
 
-      minSlider.addEventListener('input', () => {
+      listen(minSlider, 'input', () => {
         if (parseFloat(minSlider.value) > parseFloat(maxSlider.value)) {
           maxSlider.value = minSlider.value;
         }
         updateDisplayFromSliders();
         if (liveFilteringEnabled) applyFilterFromSliders();
-      });
-      maxSlider.addEventListener('input', () => {
+      }, renderSignal);
+      listen(maxSlider, 'input', () => {
         if (parseFloat(maxSlider.value) < parseFloat(minSlider.value)) {
           minSlider.value = maxSlider.value;
         }
         updateDisplayFromSliders();
         if (liveFilteringEnabled) applyFilterFromSliders();
-      });
-      filterBtn.addEventListener('click', () => {
+      }, renderSignal);
+      listen(filterBtn, 'click', () => {
         applyFilterFromSliders();
-      });
-      resetBtn.addEventListener('click', () => {
+      }, renderSignal);
+      listen(resetBtn, 'click', () => {
         minSlider.value = '0';
         maxSlider.value = '100';
         updateDisplayFromSliders();
         state.resetContinuousFilter(state.activeFieldIndex);
         if (liveFilteringEnabled) applyFilterFromSliders();
-      });
+      }, renderSignal);
       setLiveToggleUI(true);
       updateDisplayFromSliders();
       if (liveFilteringEnabled) applyFilterFromSliders();
@@ -412,6 +445,7 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
   }
 
   function handleOutlierUI(field) {
+    if (destroyed) return;
     const hasOutliers = field && field.outlierQuantiles && field.outlierQuantiles.length > 0;
     if (outlierFilterContainer) {
       if (hasOutliers) {
@@ -444,11 +478,12 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
 
   if (outlierFilterInput) {
     // Throttle the expensive state update (visibility recomputation) while keeping display update immediate
-    const throttledStateUpdate = throttle((threshold) => {
+    throttledStateUpdate = throttle((threshold) => {
+      if (destroyed) return;
       state.setOutlierThresholdForActive(threshold);
     }, 50); // ~20 updates/sec max
 
-    outlierFilterInput.addEventListener('input', () => {
+    listen(outlierFilterInput, 'input', () => {
       const sliderValue = parseFloat(outlierFilterInput.value);
       const threshold = sliderValue / 100.0;
       // Update display immediately for smooth visual feedback
@@ -458,7 +493,7 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
     });
 
     // Ensure final value is applied when user releases slider
-    outlierFilterInput.addEventListener('change', () => {
+    listen(outlierFilterInput, 'change', () => {
       const sliderValue = parseFloat(outlierFilterInput.value);
       const threshold = sliderValue / 100.0;
       state.setOutlierThresholdForActive(threshold);
@@ -467,7 +502,7 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
 
   // Centroid visibility toggles
   if (centroidPointsCheckbox && viewer) {
-    centroidPointsCheckbox.addEventListener('change', () => {
+    listen(centroidPointsCheckbox, 'change', () => {
       const show = centroidPointsCheckbox.checked;
       const activeViewId = state.getActiveViewId?.() || 'live';
       viewer.setShowCentroidPoints?.(show, activeViewId);
@@ -475,7 +510,7 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
   }
 
   if (centroidLabelsCheckbox && viewer) {
-    centroidLabelsCheckbox.addEventListener('change', () => {
+    listen(centroidLabelsCheckbox, 'change', () => {
       const show = centroidLabelsCheckbox.checked;
       const activeViewId = state.getActiveViewId?.() || 'live';
       viewer.setShowCentroidLabels?.(show, activeViewId);
@@ -484,10 +519,40 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
 
   setDisplayOptionsVisibility(null);
 
+  function destroy() {
+    if (destroyed) return;
+    destroyed = true;
+    const failures = [];
+    for (const cleanup of [
+      () => renderLifecycleController.abort(),
+      () => lifecycleController.abort(),
+      () => {
+        if (throttledStateUpdate !== null) throttledStateUpdate.cancel();
+      },
+      destroyCategoricalLegend
+    ]) {
+      try {
+        cleanup();
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    const exactFailures = [...new Set(failures)];
+    if (exactFailures.length === 1) throw exactFailures[0];
+    if (exactFailures.length > 1) {
+      throw new AggregateError(
+        exactFailures,
+        'Legend renderer failed to release every owned resource.'
+      );
+    }
+  }
+
   return {
     render,
-    refreshCategoryCounts,
+    refreshCategoryCounts: () => {
+      if (!destroyed) refreshCategoryCounts();
+    },
     handleOutlierUI,
-    destroy: destroyCategoricalLegend,
+    destroy,
   };
 }

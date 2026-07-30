@@ -353,6 +353,95 @@ test('snapshot dimension switches publish one exact geometry generation', async 
   expect(productErrors).toEqual([]);
 });
 
+test('UI teardown drains and fences an in-flight dimension badge task', async ({
+  page,
+}) => {
+  const productErrors = observeProductErrors(page);
+  await installSynthetic3dFixture(page);
+
+  await page.goto(
+    `/?exportsBaseUrl=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
+      `&dataset=${DATASET_ID}&acceptance=dimension-badge-terminal-owner`,
+    { waitUntil: 'domcontentloaded' },
+  );
+  await dismissWelcome(page);
+  await expect(page.locator('#dataset-name')).toHaveText(
+    'Deterministic 3-D orbit fixture',
+  );
+  await keepCurrentViewThroughUi(page);
+
+  const result = await page.evaluate(async () => {
+    const state = window._cellucidState;
+    const viewer = window._cellucidViewer;
+    const ui = window._cellucidUi;
+    const originalSetDimensionLevel =
+      state.setDimensionLevel.bind(state);
+    let releaseDimension;
+    let markStarted;
+    const started = new Promise(resolve => {
+      markStarted = resolve;
+    });
+    const release = new Promise(resolve => {
+      releaseDimension = resolve;
+    });
+    state.setDimensionLevel = async (...args) => {
+      markStarted();
+      await release;
+      return originalSetDimensionLevel(...args);
+    };
+
+    const indicator = document.querySelector(
+      '.split-badge.active .split-badge-dim',
+    );
+    if (!(indicator instanceof HTMLElement)) {
+      throw new Error(
+        'Dimension terminal regression requires an active dimension badge.',
+      );
+    }
+    indicator.dispatchEvent(new MouseEvent('click', {
+      bubbles: true,
+      cancelable: true,
+    }));
+    await started;
+    const destroying = ui.destroy();
+    const resolvedBeforeRelease = await Promise.race([
+      destroying.then(() => true),
+      new Promise(resolve => setTimeout(() => resolve(false), 0)),
+    ]);
+    const badgeCountAtFence = document.querySelectorAll(
+      '#split-view-badges-list .split-badge',
+    ).length;
+    const retainedDisabledAtFence =
+      indicator.getAttribute('aria-disabled');
+
+    releaseDimension();
+    await destroying;
+    const outcome = {
+      badgeCountAfterDrain: document.querySelectorAll(
+        '#split-view-badges-list .split-badge',
+      ).length,
+      badgeCountAtFence,
+      retainedDisabledAfterDrain:
+        indicator.getAttribute('aria-disabled'),
+      retainedDisabledAtFence,
+      resolvedBeforeRelease,
+      snapshotDimension: viewer.getViewDimension('snap_1'),
+    };
+    viewer.dispose();
+    return outcome;
+  });
+
+  expect(result).toEqual({
+    badgeCountAfterDrain: 0,
+    badgeCountAtFence: 0,
+    retainedDisabledAfterDrain: 'true',
+    retainedDisabledAtFence: 'true',
+    resolvedBeforeRelease: false,
+    snapshotDimension: 2,
+  });
+  expect(productErrors).toEqual([]);
+});
+
 test('a navigation observer failure cannot enter dimension rollback', async ({
   page,
 }) => {
@@ -637,6 +726,7 @@ test('coarse LOD picking follows the rendered live and snapshot prefixes', async
 
     const state = window._cellucidState;
     const viewer = window._cellucidViewer;
+    const ui = window._cellucidUi;
     state.initSyntheticScene({
       colors,
       dimensionLevel: 3,
@@ -698,7 +788,7 @@ test('coarse LOD picking follows the rendered live and snapshot prefixes', async
     );
 
     const payload = state.getSnapshotPayload();
-    const snapshot = viewer.createSnapshotView({
+    const snapshot = ui.publishSnapshotView({
       label: 'Coarse LOD picking snapshot',
       fieldKey: payload.fieldKey,
       fieldKind: payload.fieldKind,

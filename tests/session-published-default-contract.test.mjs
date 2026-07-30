@@ -289,6 +289,14 @@ function createCoreHarness(t) {
 
   let activeViewId = 'live';
   let abortOnTargetDimension = null;
+  const dimensionManager = {
+    copyViewDimension() {
+      throw new Error('No snapshot dimension copy is expected.');
+    },
+    getViewDimension() {
+      return dimension;
+    },
+  };
   const state = {
     pointCount: 3,
     obsData: { fields: [] },
@@ -297,9 +305,12 @@ function createCoreHarness(t) {
     activeVarFieldIndex: -1,
     activeFieldSource: null,
     viewContexts: new Map([['live', { id: 'live' }]]),
+    applySnapshotConfigToView() {
+      throw new Error('No snapshot state publication is expected.');
+    },
     beginBatch() {},
     captureCurrentContext() {
-      return {};
+      return { dimensionLevel: dimension };
     },
     clearActiveField() {
       this.activeFieldIndex = -1;
@@ -308,6 +319,9 @@ function createCoreHarness(t) {
     },
     clearSnapshotViews() {},
     computeGlobalVisibility() {},
+    createViewFromSource() {
+      throw new Error('No snapshot state publication is expected.');
+    },
     createViewFromActive() {},
     endBatch() {},
     async ensureFieldLoaded() {},
@@ -317,6 +331,9 @@ function createCoreHarness(t) {
     },
     getCurrentOutlierThreshold() {
       return 1;
+    },
+    getDimensionManager() {
+      return dimensionManager;
     },
     getFields() {
       return this.obsData.fields;
@@ -331,6 +348,7 @@ function createCoreHarness(t) {
       return dimension;
     },
     restoreContext() {},
+    removeView() {},
     setActiveView(viewId) {
       activeViewId = viewId;
       return viewId;
@@ -346,6 +364,7 @@ function createCoreHarness(t) {
         abort();
       }
     },
+    syncSnapshotContexts() {},
     updateFilterSummary() {},
     updateFilteredCount() {},
     updateOutlierQuantiles() {},
@@ -383,8 +402,14 @@ function createCoreHarness(t) {
     getViewCameraState() {
       return structuredClone(camera);
     },
+    getViewDimension() {
+      return dimension;
+    },
     getViewLayout() {
       return { ...layout };
+    },
+    removeSnapshotView() {
+      throw new Error('Snapshot clearing must use the viewer clear owner.');
     },
     setCameraState(nextCamera) {
       camera = structuredClone(nextCamera);

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
+import { getNotificationCenter } from '../assets/js/app/notification-center.js';
 import { initHighlightControls } from '../assets/js/app/ui/modules/highlight-controls.js';
 import { initAnnotationSelection } from '../assets/js/app/ui/modules/highlight/annotation-selection.js';
 import { initContinuousSelectionPreview } from '../assets/js/app/ui/modules/highlight/continuous-selection-preview.js';
@@ -72,9 +73,28 @@ function createModeButton(mode, pressed = false) {
   const attributes = new Map([
     ['aria-pressed', pressed ? 'true' : 'false']
   ]);
+  const listeners = new Map();
   return {
     dataset: { mode },
-    addEventListener() {},
+    addEventListener(type, listener, options = {}) {
+      if (!listeners.has(type)) listeners.set(type, []);
+      listeners.get(type).push(listener);
+      if (options.signal) {
+        options.signal.addEventListener('abort', () => {
+          const remaining = (listeners.get(type) ?? [])
+            .filter(candidate => candidate !== listener);
+          listeners.set(type, remaining);
+        }, { once: true });
+      }
+    },
+    dispatch(type) {
+      for (const listener of [...(listeners.get(type) ?? [])]) {
+        listener({ target: this });
+      }
+    },
+    listeners(type) {
+      return [...(listeners.get(type) ?? [])];
+    },
     getAttribute(name) {
       return attributes.get(name) ?? null;
     },
@@ -422,6 +442,207 @@ test('highlight synchronization follows exact active-view LOD events and unsubsc
     unsubscribed.sort(),
     ['highlight:changed', 'lod', 'page:changed']
   );
+});
+
+test('selection-tool destruction retires subscriptions and fences retained callbacks', () => {
+  const stateListeners = new Map();
+  const viewerCallbacks = new Map();
+  const unsubscribeCalls = [];
+  const mutations = [];
+  const state = {
+    activeFieldIndex: -1,
+    activeFieldSource: null,
+    activeVarFieldIndex: -1,
+    addHighlightDirect() {
+      mutations.push('add');
+      return null;
+    },
+    clearPreviewHighlight() {
+      mutations.push('clear');
+    },
+    getActiveField() {
+      return null;
+    },
+    getActiveViewId() {
+      return 'live';
+    },
+    getCategoryForCell() {
+      return 0;
+    },
+    getCellIndicesForCategory() {
+      return [];
+    },
+    getCellIndicesForRange() {
+      return [];
+    },
+    getHighlightedGroups() {
+      return [];
+    },
+    getValueForCell() {
+      return Number.NaN;
+    },
+    on(eventName, listener) {
+      stateListeners.set(eventName, listener);
+      return () => unsubscribeCalls.push(eventName);
+    },
+    setPreviewHighlightFromIndices() {
+      mutations.push('preview');
+    }
+  };
+  const viewer = {
+    cancelAnnotationSelection() {
+      mutations.push('cancelAnnotation');
+    },
+    cancelKnnSelection() {
+      mutations.push('cancelKnn');
+    },
+    cancelLassoSelection() {
+      mutations.push('cancelLasso');
+    },
+    cancelProximitySelection() {
+      mutations.push('cancelProximity');
+    },
+    cancelUnifiedSelection() {
+      mutations.push('cancelUnified');
+    },
+    confirmAnnotationSelection() {
+      mutations.push('confirmAnnotation');
+    },
+    confirmKnnSelection() {
+      mutations.push('confirmKnn');
+    },
+    confirmLassoSelection() {
+      mutations.push('confirmLasso');
+    },
+    confirmProximitySelection() {
+      mutations.push('confirmProximity');
+    },
+    getUnifiedSelectionState() {
+      return {
+        inProgress: false,
+        stepCount: 0,
+        candidateCount: 0,
+        candidates: []
+      };
+    },
+    getViewTransparency() {
+      return new Float32Array();
+    },
+    onLodChanged(listener) {
+      viewerCallbacks.set('lod', listener);
+      return () => unsubscribeCalls.push('lod');
+    },
+    restoreKnnState() {},
+    restoreLassoState() {},
+    restoreProximityState() {},
+    restoreUnifiedState() {},
+    setKnnCallback(listener) {
+      viewerCallbacks.set('knn', listener);
+    },
+    setKnnEnabled() {
+      mutations.push('knnMode');
+    },
+    setKnnPreviewCallback(listener) {
+      viewerCallbacks.set('knnPreview', listener);
+    },
+    setKnnStepCallback(listener) {
+      viewerCallbacks.set('knnStep', listener);
+    },
+    setLassoCallback(listener) {
+      viewerCallbacks.set('lasso', listener);
+    },
+    setLassoEnabled() {
+      mutations.push('lassoMode');
+    },
+    setLassoPreviewCallback(listener) {
+      viewerCallbacks.set('lassoPreview', listener);
+    },
+    setLassoStepCallback(listener) {
+      viewerCallbacks.set('lassoStep', listener);
+    },
+    setProximityCallback(listener) {
+      viewerCallbacks.set('proximity', listener);
+    },
+    setProximityEnabled() {
+      mutations.push('proximityMode');
+    },
+    setProximityPreviewCallback(listener) {
+      viewerCallbacks.set('proximityPreview', listener);
+    },
+    setProximityStepCallback(listener) {
+      viewerCallbacks.set('proximityStep', listener);
+    },
+    setSelectionPreviewCallback(listener) {
+      viewerCallbacks.set('continuousPreview', listener);
+    },
+    setSelectionStepCallback(listener) {
+      viewerCallbacks.set('annotationStep', listener);
+    },
+    updateHighlight() {}
+  };
+  const buttons = [
+    createModeButton('annotation', true),
+    createModeButton('knn'),
+    createModeButton('proximity'),
+    createModeButton('lasso')
+  ];
+  let summaryRenders = 0;
+  let pageRenders = 0;
+
+  withDocument(createDocumentStub(), () => {
+    const tools = initHighlightSelectionTools({
+      state,
+      viewer,
+      jupyterSource: null,
+      dom: {
+        modeButtons: buttons,
+        modeDescription: {
+          innerHTML: '',
+          parentElement: { appendChild() {} },
+          style: {},
+          textContent: ''
+        }
+      },
+      renderHighlightSummary() {
+        summaryRenders += 1;
+      },
+      renderHighlightPages() {
+        pageRenders += 1;
+      }
+    });
+    const retained = new Map(viewerCallbacks);
+    const retainedModeListener = buttons[1].listeners('click')[0];
+    mutations.length = 0;
+
+    tools.destroy();
+    tools.destroy();
+
+    assert.deepEqual(
+      unsubscribeCalls.sort(),
+      ['highlight:changed', 'lod', 'page:changed']
+    );
+    assert.equal(buttons[1].listeners('click').length, 0);
+
+    stateListeners.get('highlight:changed')();
+    stateListeners.get('page:changed')();
+    retained.get('lod')({ malformed: true });
+    retained.get('annotationStep')({ malformed: true });
+    retained.get('continuousPreview')({ malformed: true });
+    retained.get('lasso')({ malformed: true });
+    retained.get('lassoPreview')({ malformed: true });
+    retained.get('lassoStep')({ malformed: true });
+    retained.get('proximity')({ malformed: true });
+    retained.get('proximityPreview')({ malformed: true });
+    retained.get('proximityStep')({ malformed: true });
+    retained.get('knn')({ malformed: true });
+    retained.get('knnPreview')({ malformed: true });
+    retained.get('knnStep')({ malformed: true });
+    retainedModeListener();
+
+    assert.deepEqual(mutations, []);
+    assert.equal(summaryRenders, 0);
+    assert.equal(pageRenders, 0);
+  });
 });
 
 test('active-view switches invalidate visible-highlight counts for the new transparency scope', () => {
@@ -901,6 +1122,90 @@ test('malformed lasso events fail before history or permanent highlight mutation
     );
     assert.deepEqual(calls, ['add']);
   });
+});
+
+test('selection destruction drains Jupyter delivery and suppresses late failure UI', async () => {
+  let rejectDelivery;
+  const delivery = new Promise((_resolve, reject) => {
+    rejectDelivery = reject;
+  });
+  let selectionCallback = null;
+  const viewer = {
+    cancelLassoSelection() {},
+    confirmLassoSelection() {},
+    restoreLassoState() {},
+    setLassoCallback(callback) {
+      selectionCallback = callback;
+    },
+    setLassoPreviewCallback() {},
+    setLassoStepCallback() {}
+  };
+  const state = {
+    addHighlightDirect({ cellIndices }) {
+      return {
+        id: 'highlight_1',
+        type: 'lasso',
+        label: 'Lasso',
+        enabled: true,
+        cellIndices,
+        cellCount: cellIndices.length
+      };
+    },
+    clearPreviewHighlight() {},
+    setPreviewHighlightFromIndices() {}
+  };
+  const notifications = getNotificationCenter();
+  const originalError = notifications.error;
+  const notificationCalls = [];
+  notifications.error = (...args) => notificationCalls.push(args);
+  const originalConsoleError = console.error;
+  const consoleErrors = [];
+  console.error = (...args) => consoleErrors.push(args);
+
+  try {
+    await withDocument(createDocumentStub(), async () => {
+      const selection = initLassoSelection({
+        state,
+        viewer,
+        jupyterSource: {
+          notifySelection() {
+            return delivery;
+          }
+        },
+        selectionState: createHighlightSelectionState(),
+        ui: {
+          modeDescriptionEl: {
+            innerHTML: '',
+            parentElement: { appendChild() {} }
+          }
+        }
+      });
+      selectionCallback({
+        type: 'lasso',
+        cellIndices: [3],
+        cellCount: 1,
+        steps: 1
+      });
+
+      const destruction = selection.destroy();
+      assert.equal(selection.destroy(), destruction);
+      let settled = false;
+      void destruction.then(() => {
+        settled = true;
+      });
+      await Promise.resolve();
+      assert.equal(settled, false);
+
+      rejectDelivery(new Error('late delivery failure'));
+      await destruction;
+      assert.equal(settled, true);
+      assert.deepEqual(notificationCalls, []);
+      assert.deepEqual(consoleErrors, []);
+    });
+  } finally {
+    notifications.error = originalError;
+    console.error = originalConsoleError;
+  }
 });
 
 test('annotation undo republishes the exact candidate state to the unified renderer', () => {

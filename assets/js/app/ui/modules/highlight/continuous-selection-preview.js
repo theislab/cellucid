@@ -63,8 +63,10 @@ export function initContinuousSelectionPreview(options) {
   );
   requireHighlightSelectionState(selectionState);
   const { showRangeLabel, hideRangeLabel } = ui;
+  let destroyed = false;
 
   function handleSelectionPreview(previewEvent) {
+    if (destroyed) return;
     requireContinuousPreviewEvent(previewEvent);
     const activeField = state.getActiveField();
     if (activeField === null || activeField.kind !== 'continuous') {
@@ -143,4 +145,30 @@ export function initContinuousSelectionPreview(options) {
   }
 
   viewer.setSelectionPreviewCallback(handleSelectionPreview);
+
+  return {
+    destroy() {
+      if (destroyed) return;
+      destroyed = true;
+      const failures = [];
+      for (const cleanup of [
+        () => viewer.setSelectionPreviewCallback(() => {}),
+        hideRangeLabel
+      ]) {
+        try {
+          cleanup();
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      const exactFailures = [...new Set(failures)];
+      if (exactFailures.length === 1) throw exactFailures[0];
+      if (exactFailures.length > 1) {
+        throw new AggregateError(
+          exactFailures,
+          'Continuous selection preview failed to release every owned resource.'
+        );
+      }
+    }
+  };
 }

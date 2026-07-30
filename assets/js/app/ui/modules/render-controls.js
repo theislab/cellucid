@@ -334,14 +334,27 @@ export function initRenderControls(options) {
   let smokeBuiltOnce = false;
   let smokeGridSize = 128;
   let noiseResolutionScale = assertAdaptiveScale(viewer.getAdaptiveScaleFactor());
+  let destroyed = false;
+  const domLifecycle = new AbortController();
+
+  function listen(control, eventName, handler) {
+    control.addEventListener(
+      eventName,
+      handler,
+      { signal: domLifecycle.signal }
+    );
+  }
 
   // Slider input remains debounced. A committed visibility generation first
   // gets one paint opportunity, then starts density work in the following
   // frame so a large build cannot hide the newly published UI state.
   let smokeRebuildTimeout = null;
   let committedSmokeRebuildQueued = false;
+  let smokePaintFrame = null;
+  let smokeBuildFrame = null;
 
   function rebuildDirtySmokeIfActive() {
+    if (destroyed) return;
     if (renderModeSelect.value !== 'smoke' || !smokeDirty) return;
     try {
       rebuildSmokeDensity(smokeGridSize);
@@ -352,15 +365,18 @@ export function initRenderControls(options) {
   }
 
   function scheduleSliderSmokeRebuild() {
+    if (destroyed) return;
     if (smokeRebuildTimeout !== null) clearTimeout(smokeRebuildTimeout);
     smokeDirty = true;
     smokeRebuildTimeout = setTimeout(() => {
       smokeRebuildTimeout = null;
+      if (destroyed) return;
       rebuildDirtySmokeIfActive();
     }, 300);
   }
 
   function markSmokeDirty() {
+    if (destroyed) return;
     smokeDirty = true;
     if (renderModeSelect.value !== 'smoke' || committedSmokeRebuildQueued) return;
     if (smokeRebuildTimeout !== null) {
@@ -368,15 +384,23 @@ export function initRenderControls(options) {
       smokeRebuildTimeout = null;
     }
     committedSmokeRebuildQueued = true;
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
+    smokePaintFrame = requestAnimationFrame(() => {
+      smokePaintFrame = null;
+      if (destroyed) {
         committedSmokeRebuildQueued = false;
+        return;
+      }
+      smokeBuildFrame = requestAnimationFrame(() => {
+        smokeBuildFrame = null;
+        committedSmokeRebuildQueued = false;
+        if (destroyed) return;
         rebuildDirtySmokeIfActive();
       });
     });
   }
 
   function markSmokeClean() {
+    if (destroyed) return;
     smokeDirty = false;
     smokeBuiltOnce = true;
     if (smokeRebuildTimeout !== null) {
@@ -428,6 +452,7 @@ export function initRenderControls(options) {
   let renderModeChangeHandler = null;
 
   function notifyRenderModeChange(mode) {
+    if (destroyed) return;
     const observer = renderModeChangeHandler;
     if (observer === null) return;
     try {
@@ -463,6 +488,7 @@ export function initRenderControls(options) {
     const exactError = error instanceof Error
       ? error
       : new Error('Smoke rendering failed with a non-Error value.');
+    if (destroyed) return exactError;
     smokeDirty = true;
     syncRenderModeUi('points');
     notifyRenderModeChange('points');
@@ -473,6 +499,7 @@ export function initRenderControls(options) {
   }
 
   function settleSmokeBuildFailure(error) {
+    if (destroyed) return;
     smokeDirty = true;
     if (!(error instanceof SmokeDensityBuildError)) {
       const message = error instanceof Error
@@ -487,6 +514,7 @@ export function initRenderControls(options) {
   }
 
   function applyRenderMode(mode) {
+    if (destroyed) return false;
     const exactMode = assertRenderMode(mode);
     if (exactMode === 'smoke' && viewer.hasSnapshots()) {
       throw new RangeError('Smoke render mode is unavailable while snapshots exist.');
@@ -636,23 +664,23 @@ export function initRenderControls(options) {
   }
 
   updateSmokeStepSlider();
-  smokeStepsInput.addEventListener('input', updateSmokeStepSlider);
+  listen(smokeStepsInput, 'input', updateSmokeStepSlider);
   updateSmokeDensitySlider();
-  smokeDensityInput.addEventListener('input', updateSmokeDensitySlider);
+  listen(smokeDensityInput, 'input', updateSmokeDensitySlider);
   updateSmokeSpeedSlider();
-  smokeSpeedInput.addEventListener('input', updateSmokeSpeedSlider);
+  listen(smokeSpeedInput, 'input', updateSmokeSpeedSlider);
   updateSmokeDetailSlider();
-  smokeDetailInput.addEventListener('input', updateSmokeDetailSlider);
+  listen(smokeDetailInput, 'input', updateSmokeDetailSlider);
   updateSmokeWarpSlider();
-  smokeWarpInput.addEventListener('input', updateSmokeWarpSlider);
+  listen(smokeWarpInput, 'input', updateSmokeWarpSlider);
   updateSmokeAbsorptionSlider();
-  smokeAbsorptionInput.addEventListener('input', updateSmokeAbsorptionSlider);
+  listen(smokeAbsorptionInput, 'input', updateSmokeAbsorptionSlider);
   updateSmokeScatterSlider();
-  smokeScatterInput.addEventListener('input', updateSmokeScatterSlider);
+  listen(smokeScatterInput, 'input', updateSmokeScatterSlider);
   updateSmokeEdgeSlider();
-  smokeEdgeInput.addEventListener('input', updateSmokeEdgeSlider);
+  listen(smokeEdgeInput, 'input', updateSmokeEdgeSlider);
   updateSmokeDirectLightSlider();
-  smokeDirectLightInput.addEventListener('input', updateSmokeDirectLightSlider);
+  listen(smokeDirectLightInput, 'input', updateSmokeDirectLightSlider);
 
   function sliderToGridSize(sliderValue) {
     if (!isFiniteNumber(sliderValue) || sliderValue < 0 || sliderValue > 100) {
@@ -690,7 +718,7 @@ export function initRenderControls(options) {
     readExactRange(smokeGridInput, 'Smoke grid density', '1')
   );
   smokeGridDisplay.textContent = smokeGridSize + '³';
-  smokeGridInput.addEventListener('input', updateSmokeGridSlider);
+  listen(smokeGridInput, 'input', updateSmokeGridSlider);
 
   function updateCloudResolutionSlider() {
     const raw = readExactRange(
@@ -726,20 +754,20 @@ export function initRenderControls(options) {
   }
 
   updateCloudResolutionSlider();
-  cloudResolutionInput.addEventListener('input', updateCloudResolutionSlider);
+  listen(cloudResolutionInput, 'input', updateCloudResolutionSlider);
   updateNoiseResolutionSlider();
-  noiseResolutionInput.addEventListener('input', updateNoiseResolutionSlider);
+  listen(noiseResolutionInput, 'input', updateNoiseResolutionSlider);
 
   // ---------------------------------------------------------------------------
   // Non-smoke visualization controls
   // ---------------------------------------------------------------------------
 
-  pointSizeInput.addEventListener('input', applyPointSizeFromSlider);
+  listen(pointSizeInput, 'input', applyPointSizeFromSlider);
 
   let currentBackground = initialBackground;
   backgroundSelect.value = initialBackground;
   viewer.setBackground(initialBackground);
-  backgroundSelect.addEventListener('change', () => {
+  listen(backgroundSelect, 'change', () => {
     let preferencePublished = false;
     let viewerPublished = false;
     try {
@@ -808,12 +836,12 @@ export function initRenderControls(options) {
     sizeAttenuationDisplay.textContent = sizeAttenuationInput.value;
   }
 
-  lightingStrengthInput.addEventListener('input', updateLightingStrength);
-  fogDensityInput.addEventListener('input', updateFogDensity);
-  sizeAttenuationInput.addEventListener('input', updateSizeAttenuation);
+  listen(lightingStrengthInput, 'input', updateLightingStrength);
+  listen(fogDensityInput, 'input', updateFogDensity);
+  listen(sizeAttenuationInput, 'input', updateSizeAttenuation);
 
   applyRenderMode(renderModeSelect.value);
-  renderModeSelect.addEventListener('change', () => {
+  listen(renderModeSelect, 'change', () => {
     const requested = assertRenderMode(renderModeSelect.value);
     if (requested === 'smoke' && viewer.hasSnapshots()) {
       renderModeSelect.value = currentRenderMode;
@@ -858,6 +886,30 @@ export function initRenderControls(options) {
     updateSmokeDirectLightSlider,
     updateSmokeGridSlider,
     updateCloudResolutionSlider,
-    updateNoiseResolutionSlider
+    updateNoiseResolutionSlider,
+    destroy() {
+      if (destroyed) return;
+      destroyed = true;
+      renderModeChangeHandler = null;
+      domLifecycle.abort();
+      smokeDirty = false;
+      committedSmokeRebuildQueued = false;
+      if (smokeRebuildTimeout !== null) {
+        clearTimeout(smokeRebuildTimeout);
+        smokeRebuildTimeout = null;
+      }
+      if (smokePaintFrame !== null) {
+        if (typeof globalThis.cancelAnimationFrame === 'function') {
+          globalThis.cancelAnimationFrame(smokePaintFrame);
+        }
+        smokePaintFrame = null;
+      }
+      if (smokeBuildFrame !== null) {
+        if (typeof globalThis.cancelAnimationFrame === 'function') {
+          globalThis.cancelAnimationFrame(smokeBuildFrame);
+        }
+        smokeBuildFrame = null;
+      }
+    }
   };
 }

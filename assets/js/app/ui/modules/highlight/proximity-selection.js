@@ -86,8 +86,28 @@ export function initProximitySelection(options) {
     'Proximity selection document',
     ['createElement', 'getElementById']
   );
+  const lifecycleController = new AbortController();
+  const pendingDeliveries = new Set();
+  let destroyed = false;
+  let destructionPromise = null;
+
+  function listen(target, eventName, listener) {
+    target.addEventListener(eventName, (...args) => {
+      if (destroyed) return;
+      listener(...args);
+    }, { signal: lifecycleController.signal });
+  }
+
+  function trackDelivery(delivery) {
+    pendingDeliveries.add(delivery);
+    void delivery.then(
+      () => pendingDeliveries.delete(delivery),
+      () => pendingDeliveries.delete(delivery)
+    );
+  }
 
   function handleProximitySelection(proximityEvent) {
+    if (destroyed) return;
     requireCompletedSelectionEvent(proximityEvent, 'proximity');
 
     const stepsLabel = proximityEvent.steps > 1 ? ` (${proximityEvent.steps} drags)` : '';
@@ -104,12 +124,14 @@ export function initProximitySelection(options) {
     );
 
     debug.log(`[UI] Proximity selected ${proximityEvent.cellCount} cells from ${proximityEvent.steps} drag(s)`);
-    void deliverSelectionToJupyter({
+    trackDelivery(deliverSelectionToJupyter({
       jupyterSource,
       cellIndices: proximityEvent.cellIndices,
       source: 'proximity',
-      onFailure: error => showSelectionDeliveryFailure(error, 'proximity')
-    });
+      onFailure: error => {
+        if (!destroyed) showSelectionDeliveryFailure(error, 'proximity');
+      }
+    }));
 
     selectionState.proximityHistory = [];
     selectionState.proximityRedoStack = [];
@@ -119,6 +141,7 @@ export function initProximitySelection(options) {
   }
 
   function handleProximityStep(stepEvent) {
+    if (destroyed) return;
     requireSelectionStepEvent(
       stepEvent,
       'proximity',
@@ -169,6 +192,7 @@ export function initProximitySelection(options) {
   }
 
   function handleProximityUndo() {
+    if (destroyed) return;
     if (selectionState.proximityHistory.length === 0) return;
 
     selectionState.proximityRedoStack.push({
@@ -196,6 +220,7 @@ export function initProximitySelection(options) {
   }
 
   function handleProximityRedo() {
+    if (destroyed) return;
     if (selectionState.proximityRedoStack.length === 0) return;
 
     selectionState.proximityHistory.push({
@@ -223,6 +248,7 @@ export function initProximitySelection(options) {
   }
 
   function handleProximityPreview(previewEvent) {
+    if (destroyed) return;
     requireSelectionPreviewEvent(
       previewEvent,
       'proximity',
@@ -287,13 +313,13 @@ export function initProximitySelection(options) {
       ['addEventListener']
     );
     if (created) {
-      undoButton.addEventListener('click', handleProximityUndo);
-      redoButton.addEventListener('click', handleProximityRedo);
-      confirmButton.addEventListener('click', () => {
+      listen(undoButton, 'click', handleProximityUndo);
+      listen(redoButton, 'click', handleProximityRedo);
+      listen(confirmButton, 'click', () => {
         viewer.confirmProximitySelection();
         state.clearPreviewHighlight();
       });
-      cancelButton.addEventListener('click', () => {
+      listen(cancelButton, 'click', () => {
         viewer.cancelProximitySelection();
       });
     }
@@ -301,6 +327,7 @@ export function initProximitySelection(options) {
   }
 
   function updateProximityUI(stepEvent) {
+    if (destroyed) return;
     if (!stepEvent || (stepEvent.step === 0 && !stepEvent.keepControls)) {
       highlightModeDescriptionEl.innerHTML = HIGHLIGHT_MODE_COPY.proximity;
       const existingControls = documentOwner.getElementById('proximity-step-controls');
@@ -351,6 +378,7 @@ export function initProximitySelection(options) {
   }
 
   function restoreProximitySelection(unifiedState) {
+    if (destroyed) return;
     requireUnifiedSelectionState(unifiedState);
     selectionState.proximityHistory = [];
     selectionState.proximityRedoStack = [];
@@ -380,5 +408,38 @@ export function initProximitySelection(options) {
   viewer.setProximityStepCallback(handleProximityStep);
   viewer.setProximityPreviewCallback(handleProximityPreview);
 
-  return { handleProximityStep, restoreProximitySelection };
+  return {
+    handleProximityStep,
+    restoreProximitySelection,
+    destroy() {
+      if (destructionPromise !== null) return destructionPromise;
+      destroyed = true;
+      const failures = [];
+      for (const operation of [
+        () => lifecycleController.abort(),
+        () => viewer.setProximityCallback(() => {}),
+        () => viewer.setProximityStepCallback(() => {}),
+        () => viewer.setProximityPreviewCallback(() => {})
+      ]) {
+        try {
+          operation();
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      destructionPromise = Promise.allSettled(
+        [...pendingDeliveries]
+      ).then(() => {
+        const exactFailures = [...new Set(failures)];
+        if (exactFailures.length === 1) throw exactFailures[0];
+        if (exactFailures.length > 1) {
+          throw new AggregateError(
+            exactFailures,
+            'Proximity selection failed to release every owned resource.'
+          );
+        }
+      });
+      return destructionPromise;
+    }
+  };
 }

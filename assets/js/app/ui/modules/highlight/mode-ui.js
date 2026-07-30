@@ -104,7 +104,16 @@ export function initHighlightModeUI(options) {
       'Pressed highlight mode must match selectionState.activeMode.'
     );
   }
+  const lifecycleController = new AbortController();
+  let destroyed = false;
   let activeHighlightMode = pressedMode;
+
+  function listen(target, eventName, listener) {
+    target.addEventListener(eventName, (...args) => {
+      if (destroyed) return;
+      listener(...args);
+    }, { signal: lifecycleController.signal });
+  }
 
   function removeStepControls() {
     for (const id of [
@@ -130,6 +139,7 @@ export function initHighlightModeUI(options) {
   }
 
   function setHighlightModeUI(mode) {
+    if (destroyed) return;
     const exactMode = requireHighlightSelectionMode(mode);
     const previousMode = activeHighlightMode;
 
@@ -174,14 +184,39 @@ export function initHighlightModeUI(options) {
   }
 
   for (const button of highlightModeButtonsList) {
-    button.addEventListener('click', () => {
+    listen(button, 'click', () => {
       setHighlightModeUI(button.dataset.mode);
     });
   }
   setHighlightModeUI(pressedMode);
 
+  function destroy() {
+    if (destroyed) return;
+    destroyed = true;
+    const failures = [];
+    for (const cleanup of [
+      () => lifecycleController.abort(),
+      removeStepControls
+    ]) {
+      try {
+        cleanup();
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    const exactFailures = [...new Set(failures)];
+    if (exactFailures.length === 1) throw exactFailures[0];
+    if (exactFailures.length > 1) {
+      throw new AggregateError(
+        exactFailures,
+        'Highlight mode UI failed to release every owned resource.'
+      );
+    }
+  }
+
   return {
     setHighlightModeUI,
-    getActiveMode: () => activeHighlightMode
+    getActiveMode: () => activeHighlightMode,
+    destroy
   };
 }

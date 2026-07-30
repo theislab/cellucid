@@ -78,9 +78,18 @@ export function initHighlightPagesUI(options) {
     ['appendChild']
   );
 
+  const lifecycleController = new AbortController();
+  let destroyed = false;
   let draggedPageId = null;
   let lastPageIds = [];
   let closeActiveCombineMenu = null;
+
+  function listen(target, eventName, listener) {
+    target.addEventListener(eventName, (...args) => {
+      if (destroyed) return;
+      listener(...args);
+    }, { signal: lifecycleController.signal });
+  }
 
   highlightPagesTabsEl.setAttribute('aria-label', 'Highlight pages');
   highlightPagesTabsEl.setAttribute('aria-orientation', 'horizontal');
@@ -125,6 +134,7 @@ export function initHighlightPagesUI(options) {
   }
 
   function focusPageTab(pageId) {
+    if (destroyed) return false;
     const tabs = highlightPagesTabsEl.querySelectorAll('.highlight-page-tab');
     for (const tab of tabs) {
       if (tab.dataset.pageId !== pageId) continue;
@@ -147,6 +157,7 @@ export function initHighlightPagesUI(options) {
     x,
     y
   }) {
+    if (destroyed) return;
     if (closeActiveCombineMenu !== null) {
       closeActiveCombineMenu({ restoreFocus: false });
     }
@@ -204,7 +215,7 @@ export function initHighlightPagesUI(options) {
         operationButton.title = isIntersection
           ? `Create a page with cells in both ${sourcePage.name} and ${targetPage.name}`
           : `Create a page with cells in either ${sourcePage.name} or ${targetPage.name}`;
-        operationButton.addEventListener('click', () => {
+        listen(operationButton, 'click', () => {
           combineWithPage(targetPage, operation);
         });
         menu.appendChild(operationButton);
@@ -311,6 +322,7 @@ export function initHighlightPagesUI(options) {
   }
 
   function startPageRename(tabEl, page) {
+    if (destroyed) return;
     const nameSpan = tabEl.querySelector('.highlight-page-tab-name');
     const activation = tabEl.querySelector('.highlight-page-tab-activate');
     if (nameSpan === null) {
@@ -352,8 +364,8 @@ export function initHighlightPagesUI(options) {
       activation.focus();
     };
 
-    input.addEventListener('blur', () => finishRename({ commit: true }));
-    input.addEventListener('keydown', (e) => {
+    listen(input, 'blur', () => finishRename({ commit: true }));
+    listen(input, 'keydown', (e) => {
       if (e.key === 'Enter') {
         e.preventDefault();
         finishRename({ commit: true });
@@ -368,6 +380,7 @@ export function initHighlightPagesUI(options) {
   }
 
   function renderHighlightPages() {
+    if (destroyed) return;
     if (closeActiveCombineMenu !== null) {
       closeActiveCombineMenu({ restoreFocus: false });
     }
@@ -524,14 +537,14 @@ export function initHighlightPagesUI(options) {
 
       tab.draggable = true;
 
-      tab.addEventListener('dragstart', (e) => {
+      listen(tab, 'dragstart', (e) => {
         draggedPageId = page.id;
         tab.classList.add('dragging');
         e.dataTransfer.effectAllowed = 'move';
         e.dataTransfer.setData('application/x-highlight-page', page.id);
       });
 
-      tab.addEventListener('dragend', () => {
+      listen(tab, 'dragend', () => {
         tab.classList.remove('dragging');
         highlightPagesTabsEl.querySelectorAll('.highlight-page-tab').forEach((t) => {
           t.classList.remove('drag-over');
@@ -539,23 +552,23 @@ export function initHighlightPagesUI(options) {
         draggedPageId = null;
       });
 
-      tab.addEventListener('dragover', (e) => {
+      listen(tab, 'dragover', (e) => {
         e.preventDefault();
         e.dataTransfer.dropEffect = 'move';
       });
 
-      tab.addEventListener('dragenter', (e) => {
+      listen(tab, 'dragenter', (e) => {
         e.preventDefault();
         if (draggedPageId && draggedPageId !== page.id) {
           tab.classList.add('drag-over');
         }
       });
 
-      tab.addEventListener('dragleave', () => {
+      listen(tab, 'dragleave', () => {
         tab.classList.remove('drag-over');
       });
 
-      tab.addEventListener('drop', (e) => {
+      listen(tab, 'drop', (e) => {
         e.preventDefault();
         tab.classList.remove('drag-over');
         if (draggedPageId && draggedPageId !== page.id) {
@@ -587,7 +600,7 @@ export function initHighlightPagesUI(options) {
         `Highlight color for ${page.name}`
       );
 
-      colorInput.addEventListener('input', () => {
+      listen(colorInput, 'input', () => {
         const newColor = colorInput.value;
         requirePageOperation(
           state.setHighlightPageColor(page.id, newColor),
@@ -599,7 +612,7 @@ export function initHighlightPagesUI(options) {
           newColor
         );
       });
-      colorInput.addEventListener('click', (e) => {
+      listen(colorInput, 'click', (e) => {
         e.stopPropagation();
       });
 
@@ -618,7 +631,7 @@ export function initHighlightPagesUI(options) {
       nameSpan.textContent = page.name;
       nameSpan.title = page.name;
 
-      nameSpan.addEventListener('dblclick', (e) => {
+      listen(nameSpan, 'dblclick', (e) => {
         e.preventDefault();
         e.stopPropagation();
         if (state.getActivePageId() !== page.id) {
@@ -642,13 +655,13 @@ export function initHighlightPagesUI(options) {
         `${count === 1 ? 'cell' : 'cells'}`
       );
       activation.appendChild(countSpan);
-      activation.addEventListener('click', () => {
+      listen(activation, 'click', () => {
         requirePageOperation(
           state.switchToPage(page.id),
           'Highlight page switch'
         );
       });
-      activation.addEventListener('keydown', (e) => {
+      listen(activation, 'keydown', (e) => {
         const pageIndex = pages.findIndex(
           candidate => candidate.id === page.id
         );
@@ -725,7 +738,7 @@ export function initHighlightPagesUI(options) {
           'aria-label',
           `Combine ${page.name} with another page`
         );
-        combineBtn.addEventListener('click', (e) => {
+        listen(combineBtn, 'click', (e) => {
           e.stopPropagation();
           const rect = combineBtn.getBoundingClientRect();
           showPageCombineMenu({
@@ -745,7 +758,7 @@ export function initHighlightPagesUI(options) {
         deleteBtn.innerHTML = '×';
         deleteBtn.title = 'Delete this page';
         deleteBtn.setAttribute('aria-label', `Delete ${page.name}`);
-        deleteBtn.addEventListener('click', (e) => {
+        listen(deleteBtn, 'click', (e) => {
           e.stopPropagation();
           requirePageOperation(
             state.deleteHighlightPage(page.id),
@@ -769,7 +782,7 @@ export function initHighlightPagesUI(options) {
   state.ensureHighlightPage();
   renderHighlightPages();
 
-  addHighlightPageBtn.addEventListener('click', () => {
+  listen(addHighlightPageBtn, 'click', () => {
     const newPage = requirePage(
       state.createHighlightPage(),
       'Created highlight page'
@@ -781,5 +794,33 @@ export function initHighlightPagesUI(options) {
     focusPageTab(newPage.id);
   });
 
-  return { renderHighlightPages };
+  return {
+    renderHighlightPages,
+    destroy() {
+      if (destroyed) return;
+      destroyed = true;
+      draggedPageId = null;
+      const failures = [];
+      if (closeActiveCombineMenu !== null) {
+        try {
+          closeActiveCombineMenu({ restoreFocus: false });
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      try {
+        lifecycleController.abort();
+      } catch (error) {
+        failures.push(error);
+      }
+      const exactFailures = [...new Set(failures)];
+      if (exactFailures.length === 1) throw exactFailures[0];
+      if (exactFailures.length > 1) {
+        throw new AggregateError(
+          exactFailures,
+          'Highlight pages failed to release every owned resource.'
+        );
+      }
+    }
+  };
 }

@@ -598,22 +598,47 @@ test('presented state owns renderer-equivalent layout, camera, fog, and LOD cert
 });
 
 test('presented-state observers stay semantic and allocation-bounded at frame cadence', async () => {
-  const source = await readFile(
-    new URL('../assets/js/rendering/viewer.js', import.meta.url),
-    'utf8',
-  );
+  const [source, settlementSource] = await Promise.all([
+    readFile(
+      new URL('../assets/js/rendering/viewer.js', import.meta.url),
+      'utf8',
+    ),
+    readFile(
+      new URL(
+        '../assets/js/rendering/presented-camera-settlement.js',
+        import.meta.url,
+      ),
+      'utf8',
+    ),
+  ]);
   const trackerSource = extractSourceRange(
     source,
     'function trackPresentedFrameState(now, canvasWidth, canvasHeight)',
     'function publishViewDataGeneration(viewId)',
   );
   assert.match(
-    source,
-    /const PRESENTED_CAMERA_SETTLE_MS = 120;/,
+    settlementSource,
+    /const DEFAULT_SETTLE_MILLISECONDS = 120;/,
+  );
+  assert.match(
+    settlementSource,
+    /const MINIMUM_UNCHANGED_FRAMES = 2;/,
+  );
+  assert.match(
+    settlementSource,
+    /const MAXIMUM_UNCHANGED_FRAMES = 12;/,
+  );
+  assert.match(
+    settlementSource,
+    /this\._unchangedFrameCount < MINIMUM_UNCHANGED_FRAMES[\s\S]*now - this\._lastChangeTime < DEFAULT_SETTLE_MILLISECONDS[\s\S]*this\._unchangedFrameCount < MAXIMUM_UNCHANGED_FRAMES/,
   );
   assert.match(
     trackerSource,
-    /const startsBurst = !state\.pending;/,
+    /presentedCameraSettlement\.observeFrame\(\s*true,\s*now,\s*wasInitialized\s*\)/,
+  );
+  assert.match(
+    trackerSource,
+    /presentedCameraSettlement\.observeFrame\(\s*false,\s*now,\s*true\s*\)/,
   );
   assert.match(trackerSource, /'camera-changing'/);
   assert.match(trackerSource, /'camera-settled'/);

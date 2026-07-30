@@ -132,6 +132,51 @@ async function navigateJson(page, url) {
   return await response.json();
 }
 
+test('OAuth owner cookies preserve exact raw Set-Cookie bytes', async () => {
+  const login = await worker.fetch(
+    new Request(
+      'https://worker.example/auth/login?return_to=' +
+        encodeURIComponent(`${APP_ORIGIN}/raw-cookie-contract`),
+    ),
+    ENV,
+  );
+  expect(login.status).toBe(302);
+  const state = new URL(login.headers.get('location')).searchParams.get(
+    'state',
+  );
+  expect(state).toMatch(/^[0-9a-f]{64}$/);
+  const ownerName = `cellucid_gh_oauth_owner_${state}`;
+  const loginCookies = login.headers.getSetCookie();
+  expect(loginCookies).toHaveLength(1);
+  expect(loginCookies[0]).toMatch(
+    new RegExp(
+      `^${ownerName}=` +
+        '[^;]+; Path=/auth/callback; Max-Age=600; ' +
+        'HttpOnly; Secure; SameSite=Lax$',
+    ),
+  );
+  expect(loginCookies[0]).not.toMatch(/;\s*Domain=/i);
+
+  const ownerPair = loginCookies[0].split(';', 1)[0];
+  const callback = await worker.fetch(
+    new Request(
+      'https://worker.example/auth/callback?' +
+        `error=access_denied&error_description=Denied&state=${state}`,
+      {
+        headers: {
+          Cookie: ownerPair,
+        },
+      },
+    ),
+    ENV,
+  );
+  expect(callback.status).toBe(302);
+  expect(callback.headers.getSetCookie()).toEqual([
+    `${ownerName}=; Path=/auth/callback; Max-Age=0; ` +
+      'HttpOnly; Secure; SameSite=Lax',
+  ]);
+});
+
 test(
   'state-specific OAuth cookies coexist and retire independently',
   async ({ browser }) => {
@@ -182,18 +227,9 @@ test(
           `${workerServer.origin}/auth/callback`
         );
         expect(cookies).toHaveLength(2);
-        for (const flow of flows) {
-          const cookie = cookies.find(
-            candidate => candidate.name === flow.name
-          );
-          expect(cookie).toMatchObject({
-            domain: '127.0.0.1',
-            httpOnly: true,
-            path: '/auth/callback',
-            sameSite: 'Lax',
-            secure: true,
-          });
-        }
+        expect(cookies.map(cookie => cookie.name).sort()).toEqual(
+          flows.map(flow => flow.name).sort(),
+        );
 
         for (const [callbackIndex, flowIndex] of order.entries()) {
           const flow = flows[flowIndex];

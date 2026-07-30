@@ -9,6 +9,10 @@ const PREPARED_FIXTURE_ROOT = new URL(
   './fixtures/exports/current-ui-prepared/',
   import.meta.url,
 );
+const PREPARED_CATALOG_URL = new URL(
+  './fixtures/exports/datasets.json',
+  import.meta.url,
+);
 const PREPARED_DATASET_URL =
   `/?exportsBaseUrl=${encodeURIComponent(EXPORTS_ROOT)}` +
   '&dataset=current-ui-prepared&acceptance=dataset-kept-view-lifecycle';
@@ -24,6 +28,35 @@ const ALTERNATE_CATEGORY_LABELS = Object.freeze([
   'epsilon',
   'zeta',
 ]);
+
+async function readPreparedCatalog() {
+  const body = await readFile(PREPARED_CATALOG_URL);
+  const catalog = JSON.parse(body.toString('utf8'));
+  if (
+    catalog === null ||
+    typeof catalog !== 'object' ||
+    !Array.isArray(catalog.datasets)
+  ) {
+    throw new TypeError(
+      'Prepared fixture catalog must publish a datasets array.'
+    );
+  }
+  return catalog;
+}
+
+async function readPreparedArtifact(relativePath) {
+  if (
+    typeof relativePath !== 'string' ||
+    relativePath.length === 0 ||
+    relativePath.startsWith('/') ||
+    relativePath.split('/').some(part => part === '..')
+  ) {
+    throw new TypeError(
+      'Prepared fixture requests require one safe relative path.'
+    );
+  }
+  return readFile(new URL(relativePath, PREPARED_FIXTURE_ROOT));
+}
 
 function observeProductErrors(page) {
   const errors = [];
@@ -211,34 +244,32 @@ async function createAlternatePreparedArtifacts() {
 }
 
 async function installAlternatePreparedDataset(page) {
-  const artifacts = await createAlternatePreparedArtifacts();
+  const [artifacts, catalog] = await Promise.all([
+    createAlternatePreparedArtifacts(),
+    readPreparedCatalog(),
+  ]);
   const requestedPaths = [];
+  const source = catalog.datasets.find(
+    dataset => dataset.id === 'current-ui-prepared',
+  );
+  if (source === undefined) {
+    throw new Error('Prepared fixture is missing from its dataset catalog.');
+  }
+  catalog.datasets.push({
+    ...source,
+    id: ALTERNATE_DATASET_ID,
+    name: ALTERNATE_DATASET_NAME,
+    path: `${ALTERNATE_DATASET_ID}/`,
+  });
   await page.route(
     '**/tests/browser/fixtures/exports/datasets.json',
-    async route => {
-      const response = await route.fetch();
-      const catalog = await response.json();
-      const source = catalog.datasets.find(
-        dataset => dataset.id === 'current-ui-prepared',
-      );
-      if (source === undefined) {
-        throw new Error('Prepared fixture is missing from its dataset catalog.');
-      }
-      catalog.datasets.push({
-        ...source,
-        id: ALTERNATE_DATASET_ID,
-        name: ALTERNATE_DATASET_NAME,
-        path: `${ALTERNATE_DATASET_ID}/`,
-      });
-      await route.fulfill({ response, json: catalog });
-    },
+    route => route.fulfill({ status: 200, json: catalog }),
   );
 
   await page.route(
     `**/tests/browser/fixtures/exports/${ALTERNATE_DATASET_ID}/**`,
     async route => {
       const alternateUrl = new URL(route.request().url());
-      const preparedUrl = new URL(alternateUrl);
       const alternatePrefix =
         `/tests/browser/fixtures/exports/${ALTERNATE_DATASET_ID}/`;
       if (!alternateUrl.pathname.startsWith(alternatePrefix)) {
@@ -260,11 +291,14 @@ async function installAlternatePreparedDataset(page) {
         });
         return;
       }
-      preparedUrl.pathname =
-        '/tests/browser/fixtures/exports/current-ui-prepared/' +
-        relativePath;
-      const response = await route.fetch({ url: preparedUrl.href });
-      await route.fulfill({ response });
+      const canonicalArtifact = await readPreparedArtifact(relativePath);
+      await route.fulfill({
+        status: 200,
+        contentType: relativePath.endsWith('.json')
+          ? 'application/json'
+          : 'application/octet-stream',
+        body: canonicalArtifact,
+      });
     },
   );
   return requestedPaths;
@@ -272,11 +306,12 @@ async function installAlternatePreparedDataset(page) {
 
 async function installZeroCellPreparedDataset(page) {
   const requestedPaths = [];
-  const [identityBody, obsManifestBody, varManifestBody] =
+  const [identityBody, obsManifestBody, varManifestBody, catalog] =
     await Promise.all([
       readFile(new URL('dataset_identity.json', PREPARED_FIXTURE_ROOT)),
       readFile(new URL('obs_manifest.json', PREPARED_FIXTURE_ROOT)),
       readFile(new URL('var_manifest.json', PREPARED_FIXTURE_ROOT)),
+      readPreparedCatalog(),
     ]);
   const identity = JSON.parse(identityBody.toString('utf8'));
   identity.id = ZERO_DATASET_ID;
@@ -293,27 +328,23 @@ async function installZeroCellPreparedDataset(page) {
   }
   const varManifest = JSON.parse(varManifestBody.toString('utf8'));
   varManifest.n_points = 0;
+  const source = catalog.datasets.find(
+    dataset => dataset.id === 'current-ui-prepared',
+  );
+  if (source === undefined) {
+    throw new Error('Prepared fixture is missing from its dataset catalog.');
+  }
+  catalog.datasets.push({
+    ...source,
+    id: ZERO_DATASET_ID,
+    name: ZERO_DATASET_NAME,
+    path: `${ZERO_DATASET_ID}/`,
+    n_cells: 0,
+  });
 
   await page.route(
     '**/tests/browser/fixtures/exports/datasets.json',
-    async route => {
-      const response = await route.fetch();
-      const catalog = await response.json();
-      const source = catalog.datasets.find(
-        dataset => dataset.id === 'current-ui-prepared',
-      );
-      if (source === undefined) {
-        throw new Error('Prepared fixture is missing from its dataset catalog.');
-      }
-      catalog.datasets.push({
-        ...source,
-        id: ZERO_DATASET_ID,
-        name: ZERO_DATASET_NAME,
-        path: `${ZERO_DATASET_ID}/`,
-        n_cells: 0,
-      });
-      await route.fulfill({ response, json: catalog });
-    },
+    route => route.fulfill({ status: 200, json: catalog }),
   );
 
   await page.route(
